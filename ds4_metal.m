@@ -181,7 +181,7 @@ static int g_model_streaming;
 
 #define DS4_METAL_MAX_MODEL_VIEWS 16
 #define DS4_METAL_MAX_STREAM_VIEWS 64
-#define DS4_METAL_MAX_COMPACT_EXPERT_CACHE 512
+#define DS4_METAL_MAX_COMPACT_EXPERT_CACHE 8192
 #define DS4_METAL_MODEL_MAX_TENSOR_BYTES 704643072ull
 #define DS4_METAL_STREAM_DEFAULT_CACHE 4u
 #define DS4_METAL_STREAM_DEFAULT_WINDOW_BYTES (768ull * 1024ull * 1024ull)
@@ -540,16 +540,6 @@ static void ds4_metal_compact_expert_cache_clear(void) {
     g_compact_expert_cache_live_bytes = 0;
 }
 
-static int ds4_metal_compact_ids_match(
-        const int32_t *a,
-        const int32_t *b,
-        uint32_t       n_expert) {
-    for (uint32_t i = 0; i < n_expert; i++) {
-        if (a[i] != b[i]) return 0;
-    }
-    return 1;
-}
-
 static void ds4_metal_compact_ids_sort(int32_t *ids, uint32_t n_expert) {
     for (uint32_t i = 1; i < n_expert; i++) {
         int32_t v = ids[i];
@@ -796,6 +786,21 @@ static id<MTLBuffer> ds4_metal_new_transient_buffer(NSUInteger bytes, const char
      * A local ObjC strong variable is not enough when the encoder function
      * returns before the caller commits the command buffer.
      */
+    [g_transient_buffers addObject:buffer];
+    return buffer;
+}
+
+static id<MTLBuffer> ds4_metal_new_transient_private_buffer(NSUInteger bytes, const char *label) {
+    if (bytes == 0) bytes = 1;
+
+    id<MTLBuffer> buffer = [g_device newBufferWithLength:bytes
+                                                 options:MTLResourceStorageModePrivate];
+    if (!buffer) {
+        fprintf(stderr, "ds4: failed to allocate Metal private transient buffer %s (%llu bytes)\n",
+                label ? label : "(unnamed)", (unsigned long long)bytes);
+        return nil;
+    }
+    if (label) buffer.label = [NSString stringWithUTF8String:label];
     [g_transient_buffers addObject:buffer];
     return buffer;
 }
@@ -4903,47 +4908,80 @@ static bool ds4_metal_compact_stream_experts_enabled(void) {
            getenv("DS4_METAL_DISABLE_COMPACT_EXPERTS") == NULL;
 }
 
-static id<MTLBuffer> ds4_metal_compact_expert_buffer_uncached(
-        const void    *model_map,
-        uint64_t       model_size,
-        uint64_t       tensor_offset,
-        uint64_t       expert_bytes,
-        uint32_t       n_expert,
-        const int32_t *selected_ids,
-        const char    *label,
-        bool           transient) {
-    if (!model_map || !selected_ids || expert_bytes == 0 || n_expert == 0 ||
-        n_expert > 6 || expert_bytes > UINT64_MAX / n_expert) {
+static id<MTLBuffer> ds4_metal_cached_expert_slice_buffer_blit(
+        id<MTLBlitCommandEncoder> blit,
+        const void                *model_map,
+        uint64_t                   model_size,
+        uint64_t                   tensor_offset,
+        uint64_t                   expert_bytes,
+        int32_t                    expert_id,
+        const char                *label) {
+    const uint64_t budget = ds4_metal_compact_expert_cache_budget_bytes();
+    if (!blit || budget == 0 || expert_bytes == 0 || expert_bytes > budget ||
+        expert_id < 0 || expert_id >= 256) {
+        return nil;
+    }
+    const uint64_t expert_offset = tensor_offset + (uint64_t)expert_id * expert_bytes;
+    if (expert_offset > model_size || expert_bytes > model_size - expert_offset) {
+        fprintf(stderr, "ds4: routed MoE selected expert range is outside the mapped model\n");
         return nil;
     }
 
-    const uint64_t compact_bytes = expert_bytes * n_expert;
-    if (compact_bytes > (uint64_t)NSUIntegerMax) return nil;
-    id<MTLBuffer> compact = transient ?
-        ds4_metal_new_transient_buffer((NSUInteger)compact_bytes, label) :
-        [g_device newBufferWithLength:(NSUInteger)compact_bytes
-                              options:MTLResourceStorageModeShared];
-    if (!compact) return nil;
-    if (!transient && label) compact.label = [NSString stringWithUTF8String:label];
-
-    uint8_t *dst = (uint8_t *)[compact contents];
-    const uint8_t *src = (const uint8_t *)model_map;
-    for (uint32_t i = 0; i < n_expert; i++) {
-        const int32_t id = selected_ids[i];
-        if (id < 0 || id >= 256) {
-            fprintf(stderr, "ds4: routed MoE selected invalid expert id %d\n", id);
-            return nil;
+    for (uint32_t i = 0; i < g_compact_expert_cache_count; i++) {
+        ds4_metal_compact_expert_cache_entry *entry = &g_compact_expert_cache[i];
+        if (entry->buffer &&
+            entry->model_map == model_map &&
+            entry->model_size == model_size &&
+            entry->tensor_offset == tensor_offset &&
+            entry->expert_bytes == expert_bytes &&
+            entry->n_expert == 1 &&
+            entry->selected_ids[0] == expert_id) {
+            entry->last_used = ++g_compact_expert_cache_clock;
+            g_compact_expert_cache_hit_count++;
+            return entry->buffer;
         }
-        const uint64_t expert_offset = tensor_offset + (uint64_t)id * expert_bytes;
-        if (expert_offset > model_size || expert_bytes > model_size - expert_offset) {
-            fprintf(stderr, "ds4: routed MoE selected expert range is outside the mapped model\n");
-            return nil;
-        }
-        memcpy(dst + (uint64_t)i * expert_bytes,
-               src + expert_offset,
-               (size_t)expert_bytes);
     }
-    return compact;
+
+    g_compact_expert_cache_miss_count++;
+    ds4_metal_compact_expert_cache_trim(expert_bytes);
+    if (g_compact_expert_cache_count >= DS4_METAL_MAX_COMPACT_EXPERT_CACHE ||
+        g_compact_expert_cache_live_bytes > budget - expert_bytes) {
+        return nil;
+    }
+
+    id<MTLBuffer> slice = [g_device newBufferWithLength:(NSUInteger)expert_bytes
+                                                options:MTLResourceStorageModePrivate];
+    if (!slice) return nil;
+    if (label) slice.label = [NSString stringWithUTF8String:label];
+
+    uint64_t source_inner = 0;
+    id<MTLBuffer> source = ds4_metal_wrap_model_range(model_map, model_size,
+                                                      expert_offset,
+                                                      expert_bytes,
+                                                      &source_inner);
+    if (!source) return nil;
+    [blit copyFromBuffer:source
+            sourceOffset:(NSUInteger)source_inner
+                toBuffer:slice
+       destinationOffset:0
+                    size:(NSUInteger)expert_bytes];
+
+    ds4_metal_compact_expert_cache_entry *entry =
+        &g_compact_expert_cache[g_compact_expert_cache_count++];
+    entry->buffer = slice;
+    entry->model_map = model_map;
+    entry->model_size = model_size;
+    entry->tensor_offset = tensor_offset;
+    entry->expert_bytes = expert_bytes;
+    entry->bytes = expert_bytes;
+    entry->last_used = ++g_compact_expert_cache_clock;
+    entry->n_expert = 1;
+    entry->selected_ids[0] = expert_id;
+    g_compact_expert_cache_live_bytes += expert_bytes;
+    if (g_compact_expert_cache_live_bytes > g_compact_expert_cache_peak_bytes) {
+        g_compact_expert_cache_peak_bytes = g_compact_expert_cache_live_bytes;
+    }
+    return slice;
 }
 
 static id<MTLBuffer> ds4_metal_compact_expert_buffer(
@@ -4958,62 +4996,79 @@ static id<MTLBuffer> ds4_metal_compact_expert_buffer(
         return nil;
     }
     const uint64_t compact_bytes = expert_bytes * n_expert;
-    const uint64_t budget = ds4_metal_compact_expert_cache_budget_bytes();
-    if (budget == 0 || compact_bytes == 0 || compact_bytes > budget) {
-        if (budget != 0) g_compact_expert_cache_miss_count++;
-        return ds4_metal_compact_expert_buffer_uncached(model_map, model_size,
-                                                        tensor_offset, expert_bytes,
-                                                        n_expert, selected_ids,
-                                                        label, true);
-    }
-
-    for (uint32_t i = 0; i < g_compact_expert_cache_count; i++) {
-        ds4_metal_compact_expert_cache_entry *entry = &g_compact_expert_cache[i];
-        if (entry->buffer &&
-            entry->model_map == model_map &&
-            entry->model_size == model_size &&
-            entry->tensor_offset == tensor_offset &&
-            entry->expert_bytes == expert_bytes &&
-            entry->n_expert == n_expert &&
-            ds4_metal_compact_ids_match(entry->selected_ids, selected_ids, n_expert)) {
-            entry->last_used = ++g_compact_expert_cache_clock;
-            g_compact_expert_cache_hit_count++;
-            return entry->buffer;
-        }
-    }
-
-    g_compact_expert_cache_miss_count++;
-    ds4_metal_compact_expert_cache_trim(compact_bytes);
-    if (g_compact_expert_cache_count >= DS4_METAL_MAX_COMPACT_EXPERT_CACHE ||
-        compact_bytes > budget ||
-        g_compact_expert_cache_live_bytes > budget - compact_bytes) {
-        return ds4_metal_compact_expert_buffer_uncached(model_map, model_size,
-                                                        tensor_offset, expert_bytes,
-                                                        n_expert, selected_ids,
-                                                        label, true);
-    }
-
-    id<MTLBuffer> compact =
-        ds4_metal_compact_expert_buffer_uncached(model_map, model_size,
-                                                 tensor_offset, expert_bytes,
-                                                 n_expert, selected_ids,
-                                                 label, false);
+    if (compact_bytes == 0) return nil;
+    id<MTLBuffer> compact = ds4_metal_new_transient_buffer((NSUInteger)compact_bytes, label);
     if (!compact) return nil;
 
-    ds4_metal_compact_expert_cache_entry *entry =
-        &g_compact_expert_cache[g_compact_expert_cache_count++];
-    entry->buffer = compact;
-    entry->model_map = model_map;
-    entry->model_size = model_size;
-    entry->tensor_offset = tensor_offset;
-    entry->expert_bytes = expert_bytes;
-    entry->bytes = compact_bytes;
-    entry->last_used = ++g_compact_expert_cache_clock;
-    entry->n_expert = n_expert;
-    for (uint32_t i = 0; i < n_expert; i++) entry->selected_ids[i] = selected_ids[i];
-    g_compact_expert_cache_live_bytes += compact_bytes;
-    if (g_compact_expert_cache_live_bytes > g_compact_expert_cache_peak_bytes) {
-        g_compact_expert_cache_peak_bytes = g_compact_expert_cache_live_bytes;
+    uint8_t *dst = (uint8_t *)[compact contents];
+    const uint8_t *src = (const uint8_t *)model_map;
+    for (uint32_t i = 0; i < n_expert; i++) {
+        const int32_t expert_id = selected_ids[i];
+        if (expert_id < 0 || expert_id >= 256) {
+            fprintf(stderr, "ds4: routed MoE selected invalid expert id %d\n", expert_id);
+            return nil;
+        }
+        const uint64_t expert_offset = tensor_offset + (uint64_t)expert_id * expert_bytes;
+        if (expert_offset > model_size || expert_bytes > model_size - expert_offset) {
+            fprintf(stderr, "ds4: routed MoE selected expert range is outside the mapped model\n");
+            return nil;
+        }
+        memcpy(dst + (uint64_t)i * expert_bytes,
+               src + expert_offset,
+               (size_t)expert_bytes);
+    }
+    return compact;
+}
+
+static id<MTLBuffer> ds4_metal_compact_expert_buffer_blit(
+        id<MTLBlitCommandEncoder> blit,
+        const void                *model_map,
+        uint64_t                   model_size,
+        uint64_t                   tensor_offset,
+        uint64_t                   expert_bytes,
+        uint32_t                   n_expert,
+        const int32_t             *selected_ids,
+        const char                *label) {
+    if (!blit || !model_map || !selected_ids || expert_bytes == 0 ||
+        n_expert == 0 || n_expert > 6 || expert_bytes > UINT64_MAX / n_expert) {
+        return nil;
+    }
+
+    const uint64_t compact_bytes = expert_bytes * n_expert;
+    if (compact_bytes > (uint64_t)NSUIntegerMax) return nil;
+    id<MTLBuffer> compact =
+        getenv("DS4_METAL_COMPACT_EXPERT_SHARED") != NULL ?
+        ds4_metal_new_transient_buffer((NSUInteger)compact_bytes, label) :
+        ds4_metal_new_transient_private_buffer((NSUInteger)compact_bytes, label);
+    if (!compact) return nil;
+
+    for (uint32_t i = 0; i < n_expert; i++) {
+        const int32_t expert_id = selected_ids[i];
+        if (expert_id < 0 || expert_id >= 256) {
+            fprintf(stderr, "ds4: routed MoE selected invalid expert id %d\n", expert_id);
+            return nil;
+        }
+        const uint64_t expert_offset = tensor_offset + (uint64_t)expert_id * expert_bytes;
+        uint64_t source_inner = 0;
+        id<MTLBuffer> source =
+            ds4_metal_cached_expert_slice_buffer_blit(blit,
+                                                      model_map, model_size,
+                                                      tensor_offset, expert_bytes,
+                                                      expert_id, label);
+        if (!source) {
+            source = ds4_metal_wrap_model_range(model_map, model_size,
+                                                expert_offset,
+                                                expert_bytes,
+                                                &source_inner);
+        }
+        if (!source) {
+            return nil;
+        }
+        [blit copyFromBuffer:source
+                sourceOffset:(NSUInteger)source_inner
+                    toBuffer:compact
+           destinationOffset:(NSUInteger)((uint64_t)i * expert_bytes)
+                         size:(NSUInteger)expert_bytes];
     }
     return compact;
 }
@@ -13320,27 +13375,62 @@ int ds4_metal_routed_moe_one_tensor(
         id<MTLBuffer> gate_buf = nil;
         id<MTLBuffer> up_buf = nil;
         id<MTLBuffer> down_buf = nil;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = nil;
         if (compact_stream_experts) {
-            int32_t compact_ids[6];
+            int32_t selected_ids_copy[6];
             const int32_t *selected_ids =
                 (const int32_t *)((const uint8_t *)[selectedbuf contents] + selected_offset);
-            for (uint32_t i = 0; i < n_expert; i++) compact_ids[i] = selected_ids[i];
+            for (uint32_t i = 0; i < n_expert; i++) {
+                selected_ids_copy[i] = selected_ids[i];
+                if (selected_ids_copy[i] < 0 || selected_ids_copy[i] >= 256) {
+                    fprintf(stderr, "ds4: routed MoE selected invalid expert id %d\n",
+                            selected_ids_copy[i]);
+                    return 0;
+                }
+            }
+            int32_t compact_ids[6];
+            for (uint32_t i = 0; i < n_expert; i++) compact_ids[i] = selected_ids_copy[i];
             ds4_metal_compact_ids_sort(compact_ids, n_expert);
-            gate_buf = ds4_metal_compact_expert_buffer(model_map, model_size, gate_offset,
-                                                       gate_expert_bytes, n_expert,
-                                                       compact_ids, "ds4_moe_gate_compact");
-            up_buf = ds4_metal_compact_expert_buffer(model_map, model_size, up_offset,
-                                                     gate_expert_bytes, n_expert,
-                                                     compact_ids, "ds4_moe_up_compact");
-            down_buf = ds4_metal_compact_expert_buffer(model_map, model_size, down_offset,
-                                                       down_expert_bytes, n_expert,
-                                                       compact_ids, "ds4_moe_down_compact");
+            if (getenv("DS4_METAL_COMPACT_EXPERT_CPU_COPY") == NULL) {
+                cb = ds4_metal_command_buffer(&owned);
+                if (!cb) return 0;
+                ds4_metal_close_batch_encoder();
+                id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+                if (!blit) return 0;
+                gate_buf = ds4_metal_compact_expert_buffer_blit(blit,
+                                                                model_map, model_size,
+                                                                gate_offset, gate_expert_bytes,
+                                                                n_expert, compact_ids,
+                                                                "ds4_moe_gate_compact_blit");
+                up_buf = ds4_metal_compact_expert_buffer_blit(blit,
+                                                              model_map, model_size,
+                                                              up_offset, gate_expert_bytes,
+                                                              n_expert, compact_ids,
+                                                              "ds4_moe_up_compact_blit");
+                down_buf = ds4_metal_compact_expert_buffer_blit(blit,
+                                                                model_map, model_size,
+                                                                down_offset, down_expert_bytes,
+                                                                n_expert, compact_ids,
+                                                                "ds4_moe_down_compact_blit");
+                [blit endEncoding];
+            } else {
+                gate_buf = ds4_metal_compact_expert_buffer(model_map, model_size, gate_offset,
+                                                           gate_expert_bytes, n_expert,
+                                                           compact_ids, "ds4_moe_gate_compact");
+                up_buf = ds4_metal_compact_expert_buffer(model_map, model_size, up_offset,
+                                                         gate_expert_bytes, n_expert,
+                                                         compact_ids, "ds4_moe_up_compact");
+                down_buf = ds4_metal_compact_expert_buffer(model_map, model_size, down_offset,
+                                                           down_expert_bytes, n_expert,
+                                                           compact_ids, "ds4_moe_down_compact");
+            }
             selectedbuf = ds4_metal_compact_selected_id_buffer(n_expert,
-                                                               selected_ids,
+                                                               selected_ids_copy,
                                                                compact_ids,
                                                                "ds4_moe_selected_compact");
-            selected_offset = 0;
             src0_experts = n_expert;
+            selected_offset = 0;
         } else {
             gate_buf = ds4_metal_wrap_model_range(model_map, model_size, gate_offset, gate_tensor_bytes, &gate_inner);
             up_buf = ds4_metal_wrap_model_range(model_map, model_size, up_offset, gate_tensor_bytes, &up_inner);
@@ -13378,8 +13468,7 @@ int ds4_metal_routed_moe_one_tensor(
                                           down_row_bytes, down_expert_bytes,
                                           n_expert, n_expert, n_tokens, down_nr0);
 
-        int owned = 0;
-        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+        if (!cb) cb = ds4_metal_command_buffer(&owned);
         if (!cb) return 0;
 
         const NSUInteger gate_smem = ds4_metal_routed_mv_smem(gate_type);
