@@ -85,6 +85,7 @@ make
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 `./ds4-server --help` for the full flag list.
 
+
 ## Speed
 
 These are single-run Metal CLI numbers with `--ctx 32768`, `--nothink`, greedy
