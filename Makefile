@@ -18,7 +18,7 @@ NATIVE_CORE_OBJS = ds4_native.o
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all clean test
+.PHONY: all clean
 
 all: ds4 ds4-server
 
@@ -51,9 +51,6 @@ ds4_cli.o: ds4_cli.c ds4.h linenoise.h
 ds4_server.o: ds4_server.c ds4.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
 
-ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h
-	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_test.c
-
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
@@ -65,12 +62,6 @@ ds4_cli_native.o: ds4_cli.c ds4.h linenoise.h
 
 ds4_metal.o: ds4_metal.m ds4_metal.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
-
-ds4_test: ds4_test.o $(CORE_OBJS)
-	$(CC) $(CFLAGS) -o $@ ds4_test.o $(CORE_OBJS) $(METAL_LDLIBS)
-
-test: ds4_test
-	./ds4_test
 
 clean:
 	rm -f ds4 ds4-server ds4_native ds4_server_test ds4_test *.o

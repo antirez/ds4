@@ -6169,6 +6169,8 @@ static void usage(FILE *fp) {
         "      Bind port. Default: 8000\n"
         "  --trace FILE\n"
         "      Write a human-readable session trace: prompts, cache decisions, output, tool calls.\n"
+        "  --stream-weights\n"
+        "      Wrap Metal model weights on demand instead of mapping the whole tensor range up front.\n"
         "\n"
         "Thinking and sampling:\n"
         "  DeepSeek-compatible chat requests default to thinking mode with high effort.\n"
@@ -6274,6 +6276,8 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
+        } else if (!strcmp(arg, "--stream-weights")) {
+            c.engine.stream_weights = true;
         } else if (!strcmp(arg, "--cpu") || !strcmp(arg, "--backend")) {
             server_log(DS4_LOG_DEFAULT, "ds4-server: server mode is Metal-only");
             exit(2);

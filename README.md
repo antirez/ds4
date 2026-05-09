@@ -6,6 +6,17 @@ runtime, and not a framework. The main path is a DeepSeek V4 Flash-specific
 Metal graph executor with DS4-specific loading, prompt rendering, KV state, and
 server API glue.
 
+This is an experimental version incorporating `mlx-flash` for those of us with
+smaller gadget budgets and Macs with <128GB RAM. The `feature/mlx-flash` branch
+keeps the C/Metal implementation only and adds experimental streamed Metal
+weight views, so we can try to make DeepSeek V4 Flash work on smaller Macs. Use
+`--stream-weights` or set
+`DS4_METAL_STREAM_WEIGHTS=1`; tune `DS4_METAL_STREAM_CACHE` and
+`DS4_METAL_STREAM_WINDOW_MB` if the default streaming window/cache need to be
+smaller for a machine. Streamed weights also honor
+`DS4_METAL_STREAM_RAM_MB`, which defaults to `16384`, as a soft cap for
+in-flight mmap-backed Metal weight windows.
+
 This project would not exist without **llama.cpp and GGML**, make sure to read
 the acknowledgements section, a big thank you to Georgi Gerganov and all the
 other contributors.

@@ -10274,7 +10274,8 @@ static bool metal_graph_encode_token_raw_swa(
      * point where the prefix is large enough to hide useful work without
      * starving the second command buffer.
      */
-    uint32_t split_after_layers = 4;
+    const bool stream_commands = ds4_metal_model_streaming_enabled() != 0;
+    uint32_t split_after_layers = stream_commands ? 1u : 4u;
     const char *split_env = getenv("DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS");
     if (split_env && split_env[0]) {
         char *end = NULL;
@@ -10296,8 +10297,18 @@ static bool metal_graph_encode_token_raw_swa(
         ds4_metal_tensor *tmp = g->cur_hc;
         g->cur_hc = g->after_ffn_hc;
         g->after_ffn_hc = tmp;
-        if (ok && allow_split_flush && split_after_layers != 0 && il + 1u == split_after_layers) {
-            ok = ds4_metal_flush_commands() != 0;
+        if (ok && allow_split_flush && split_after_layers != 0 && il + 1u < DS4_N_LAYER) {
+            const bool split_here = stream_commands ?
+                ((il + 1u) % split_after_layers == 0) :
+                (il + 1u == split_after_layers);
+            if (split_here) {
+                if (stream_commands) {
+                    ok = ds4_metal_end_commands() != 0;
+                    if (ok) ok = ds4_metal_begin_commands() != 0;
+                } else {
+                    ok = ds4_metal_flush_commands() != 0;
+                }
+            }
         }
     }
 
@@ -12386,7 +12397,8 @@ static bool metal_graph_prefill_layer_major(
      * low overhead, but submit long prompts layer by layer so the display
      * server gets regular scheduling points.
      */
-    const bool split_commands = split_profile || n_tokens > 2048;
+    const bool stream_commands = ds4_metal_model_streaming_enabled() != 0;
+    const bool split_commands = split_profile || stream_commands || n_tokens > 2048;
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL || split_profile;
     const double t0 = profile ? now_sec() : 0.0;
     double encode_s = 0.0;
@@ -12494,7 +12506,7 @@ static bool metal_graph_prefill_layer_major(
     }
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        if (split_profile) {
+        if (split_profile || stream_commands) {
             const double t_attn0 = now_sec();
             ok = ds4_metal_begin_commands() != 0;
             if (ok) ok = metal_graph_encode_layer_attention_batch(g,
@@ -12526,13 +12538,15 @@ static bool metal_graph_prefill_layer_major(
 
             encode_s += (t_attn_encoded - t_attn0) + (t_ffn_encoded - t_ffn0);
             execute_s += (t_attn_done - t_attn_encoded) + (t_ffn_done - t_ffn_encoded);
-            fprintf(stderr,
-                    "ds4: metal layer-major prefill layer %u attn encode=%.3f execute=%.3f ms ffn encode=%.3f execute=%.3f ms\n",
-                    il,
-                    (t_attn_encoded - t_attn0) * 1000.0,
-                    (t_attn_done - t_attn_encoded) * 1000.0,
-                    (t_ffn_encoded - t_ffn0) * 1000.0,
-                    (t_ffn_done - t_ffn_encoded) * 1000.0);
+            if (split_profile) {
+                fprintf(stderr,
+                        "ds4: metal layer-major prefill layer %u attn encode=%.3f execute=%.3f ms ffn encode=%.3f execute=%.3f ms\n",
+                        il,
+                        (t_attn_encoded - t_attn0) * 1000.0,
+                        (t_attn_done - t_attn_encoded) * 1000.0,
+                        (t_ffn_encoded - t_ffn0) * 1000.0,
+                        (t_ffn_done - t_ffn_encoded) * 1000.0);
+            }
         } else {
             const double t_chunk0 = profile ? now_sec() : 0.0;
             ok = ds4_metal_begin_commands() != 0;
@@ -15704,6 +15718,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 
 #ifndef DS4_NO_METAL
     if (e->backend == DS4_BACKEND_METAL) {
+        bool stream_weights = opt->stream_weights || getenv("DS4_METAL_STREAM_WEIGHTS") != NULL;
         e->metal_ready = ds4_metal_init() != 0;
         if (!e->metal_ready) {
             fprintf(stderr, "ds4: Metal backend unavailable; aborting startup\n");
@@ -15712,17 +15727,30 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             return 1;
         }
         ds4_metal_set_quality(e->quality);
+        ds4_metal_set_model_streaming(stream_weights);
         if (!ds4_metal_set_model_map_range(e->model.map,
                                            e->model.size,
                                            e->model.tensor_data_pos,
                                            e->model.size - e->model.tensor_data_pos))
         {
-            fprintf(stderr,
-                    "ds4: Metal failed to map model views; aborting startup. "
-                    "This is commonly caused by insufficient memory or Metal VM budget.\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
+            if (!stream_weights) {
+                fprintf(stderr,
+                        "ds4: Metal full model view mapping failed; retrying with streamed weight views\n");
+                stream_weights = true;
+                ds4_metal_set_model_streaming(true);
+            }
+            if (!ds4_metal_set_model_map_range(e->model.map,
+                                               e->model.size,
+                                               e->model.tensor_data_pos,
+                                               e->model.size - e->model.tensor_data_pos))
+            {
+                fprintf(stderr,
+                        "ds4: Metal failed to map model weights; aborting startup. "
+                        "This is commonly caused by insufficient memory or Metal VM budget.\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
         }
         if (e->mtp_ready &&
             !ds4_metal_set_model_map_range(e->mtp_model.map,
@@ -15730,14 +15758,27 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                                            e->mtp_model.tensor_data_pos,
                                            e->mtp_model.size - e->mtp_model.tensor_data_pos))
         {
-            fprintf(stderr,
-                    "ds4: Metal failed to map MTP model views; aborting startup. "
-                    "This is commonly caused by insufficient memory or Metal VM budget.\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
+            if (!stream_weights) {
+                fprintf(stderr,
+                        "ds4: Metal full MTP model view mapping failed; retrying with streamed weight views\n");
+                stream_weights = true;
+                ds4_metal_set_model_streaming(true);
+            }
+            if (!ds4_metal_set_model_map_range(e->mtp_model.map,
+                                               e->mtp_model.size,
+                                               e->mtp_model.tensor_data_pos,
+                                               e->mtp_model.size - e->mtp_model.tensor_data_pos))
+            {
+                fprintf(stderr,
+                        "ds4: Metal failed to map MTP model weights; aborting startup. "
+                        "This is commonly caused by insufficient memory or Metal VM budget.\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
         }
-        fprintf(stderr, "ds4: Metal backend initialized for graph diagnostics\n");
+        fprintf(stderr, "ds4: Metal backend initialized for graph diagnostics%s\n",
+                stream_weights ? " (streamed weights)" : "");
     }
 #else
     if (e->backend == DS4_BACKEND_METAL) {

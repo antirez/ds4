@@ -99,6 +99,8 @@ static void usage(FILE *fp) {
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before generation. Slower startup, fewer first-use stalls.\n"
+        "  --stream-weights\n"
+        "      Wrap model weights for Metal on demand instead of mapping the whole tensor range up front.\n"
         "\n"
         "Prompt and generation:\n"
         "  -p, --prompt TEXT\n"
@@ -1251,6 +1253,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.inspect = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
+        } else if (!strcmp(arg, "--stream-weights")) {
+            c.engine.stream_weights = true;
         } else if (!strcmp(arg, "--server")) {
             fprintf(stderr, "ds4: use ds4-server for the HTTP server\n");
             exit(2);

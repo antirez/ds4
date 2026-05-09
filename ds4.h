@@ -62,6 +62,7 @@ typedef struct {
     int mtp_draft_tokens;
     float mtp_margin;
     bool warm_weights;
+    bool stream_weights;
     bool quality;
 } ds4_engine_options;
 

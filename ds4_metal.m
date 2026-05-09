@@ -9,6 +9,7 @@
 #include <float.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/mman.h>
 
 #include "ds4.h"
 #include "ds4_metal.h"
@@ -139,6 +140,10 @@ static uint64_t g_model_wrap_count;
 static uint64_t g_model_wrap_bytes;
 static uint64_t g_model_wrap_max_bytes;
 static uint64_t g_model_residency_count;
+static uint64_t g_model_stream_hit_count;
+static uint64_t g_model_stream_evict_count;
+static uint64_t g_model_stream_live_bytes;
+static uint64_t g_model_stream_peak_bytes;
 static NSUInteger g_flash_attn_mask_bytes;
 static NSUInteger g_flash_attn_pad_bytes;
 static NSUInteger g_flash_attn_tmp_bytes;
@@ -166,9 +171,15 @@ static NSUInteger g_moe_id_map_bytes;
 static NSUInteger g_attn_out_group_ids_bytes;
 static int g_initialized;
 static int g_quality_mode;
+static int g_model_streaming;
 
 #define DS4_METAL_MAX_MODEL_VIEWS 16
+#define DS4_METAL_MAX_STREAM_VIEWS 16
 #define DS4_METAL_MODEL_MAX_TENSOR_BYTES 704643072ull
+#define DS4_METAL_STREAM_DEFAULT_CACHE 4u
+#define DS4_METAL_STREAM_DEFAULT_WINDOW_BYTES (768ull * 1024ull * 1024ull)
+#define DS4_METAL_STREAM_DEFAULT_RAM_BYTES (16ull * 1024ull * 1024ull * 1024ull)
+#define DS4_METAL_MAX_PENDING_STREAM_ADVISE 8192u
 
 typedef struct {
     __strong id<MTLBuffer> buffer;
@@ -180,6 +191,33 @@ typedef struct {
 
 static ds4_metal_model_view g_model_views[DS4_METAL_MAX_MODEL_VIEWS];
 static uint32_t g_model_view_count;
+
+typedef struct {
+    __strong id<MTLBuffer> buffer;
+    const void *model_map;
+    uint64_t model_size;
+    uint64_t model_offset;
+    uint64_t bytes;
+    uint64_t last_used;
+} ds4_metal_stream_view;
+
+static ds4_metal_stream_view g_stream_views[DS4_METAL_MAX_STREAM_VIEWS];
+static uint32_t g_stream_view_count;
+static uint64_t g_stream_view_clock;
+
+typedef struct {
+    const void *model_map;
+    uint64_t model_offset;
+    uint64_t bytes;
+} ds4_metal_stream_advise_range;
+
+static ds4_metal_stream_advise_range g_stream_advise[DS4_METAL_MAX_PENDING_STREAM_ADVISE];
+static uint32_t g_stream_advise_count;
+static uint64_t g_model_stream_pending_advise_bytes;
+static uint64_t g_model_stream_advised_bytes;
+
+static void ds4_metal_stream_queue_advise(const void *model_map, uint64_t model_offset, uint64_t bytes);
+static void ds4_metal_stream_drain_advise(void);
 
 @interface DS4MetalTensor : NSObject
 @property(nonatomic, strong) id<MTLBuffer> buffer;
@@ -266,6 +304,7 @@ static int ds4_metal_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, c
     int ok = ds4_metal_wait_pending_command_buffers(label);
     if (!ds4_metal_wait_command_buffer(cb, label)) ok = 0;
     [g_transient_buffers removeAllObjects];
+    ds4_metal_stream_drain_advise();
     return ok;
 }
 
@@ -334,6 +373,100 @@ static void ds4_metal_model_views_clear(void) {
         g_model_views[i].bytes = 0;
     }
     g_model_view_count = 0;
+}
+
+static void ds4_metal_stream_views_clear(void) {
+    for (uint32_t i = 0; i < g_stream_view_count; i++) {
+        ds4_metal_stream_queue_advise(g_stream_views[i].model_map,
+                                      g_stream_views[i].model_offset,
+                                      g_stream_views[i].bytes);
+        g_stream_views[i].buffer = nil;
+        g_stream_views[i].model_map = NULL;
+        g_stream_views[i].model_size = 0;
+        g_stream_views[i].model_offset = 0;
+        g_stream_views[i].bytes = 0;
+        g_stream_views[i].last_used = 0;
+    }
+    g_stream_view_count = 0;
+    g_model_stream_live_bytes = 0;
+}
+
+static uint64_t ds4_metal_env_u64(const char *name, uint64_t fallback, uint64_t min_value, uint64_t max_value) {
+    const char *s = getenv(name);
+    if (!s || !s[0]) return fallback;
+    char *end = NULL;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (end == s || v < min_value) return fallback;
+    if (v > max_value) return max_value;
+    return (uint64_t)v;
+}
+
+static uint32_t ds4_metal_stream_cache_limit(void) {
+    return (uint32_t)ds4_metal_env_u64("DS4_METAL_STREAM_CACHE",
+                                       DS4_METAL_STREAM_DEFAULT_CACHE,
+                                       1,
+                                       DS4_METAL_MAX_STREAM_VIEWS);
+}
+
+static uint64_t ds4_metal_stream_ram_budget_bytes(void) {
+    const uint64_t mb = ds4_metal_env_u64("DS4_METAL_STREAM_RAM_MB",
+                                          DS4_METAL_STREAM_DEFAULT_RAM_BYTES / (1024ull * 1024ull),
+                                          256,
+                                          1024ull * 1024ull);
+    return mb * 1024ull * 1024ull;
+}
+
+static uint64_t ds4_metal_stream_window_bytes(uint64_t required_bytes) {
+    const uint64_t mb = ds4_metal_env_u64("DS4_METAL_STREAM_WINDOW_MB",
+                                          DS4_METAL_STREAM_DEFAULT_WINDOW_BYTES / (1024ull * 1024ull),
+                                          1,
+                                          16384);
+    uint64_t window = mb * 1024ull * 1024ull;
+    if (window < required_bytes) window = required_bytes;
+    return window;
+}
+
+static void ds4_metal_stream_advise_dontneed(const void *model_map, uint64_t model_offset, uint64_t bytes) {
+    if (!model_map || bytes == 0) return;
+#if defined(POSIX_MADV_DONTNEED)
+    (void)posix_madvise((void *)((const uint8_t *)model_map + model_offset),
+                        (size_t)bytes,
+                        POSIX_MADV_DONTNEED);
+#elif defined(MADV_DONTNEED)
+    (void)madvise((void *)((const uint8_t *)model_map + model_offset),
+                  (size_t)bytes,
+                  MADV_DONTNEED);
+#endif
+}
+
+static void ds4_metal_stream_queue_advise(const void *model_map, uint64_t model_offset, uint64_t bytes) {
+    if (!model_map || bytes == 0) return;
+    if (g_stream_advise_count != 0) {
+        ds4_metal_stream_advise_range *last = &g_stream_advise[g_stream_advise_count - 1];
+        if (last->model_map == model_map && last->model_offset + last->bytes == model_offset) {
+            last->bytes += bytes;
+            g_model_stream_pending_advise_bytes += bytes;
+            return;
+        }
+    }
+    if (g_stream_advise_count >= DS4_METAL_MAX_PENDING_STREAM_ADVISE) return;
+    g_stream_advise[g_stream_advise_count++] = (ds4_metal_stream_advise_range) {
+        .model_map = model_map,
+        .model_offset = model_offset,
+        .bytes = bytes,
+    };
+    g_model_stream_pending_advise_bytes += bytes;
+}
+
+static void ds4_metal_stream_drain_advise(void) {
+    for (uint32_t i = 0; i < g_stream_advise_count; i++) {
+        ds4_metal_stream_advise_dontneed(g_stream_advise[i].model_map,
+                                         g_stream_advise[i].model_offset,
+                                         g_stream_advise[i].bytes);
+        g_model_stream_advised_bytes += g_stream_advise[i].bytes;
+    }
+    g_stream_advise_count = 0;
+    g_model_stream_pending_advise_bytes = 0;
 }
 
 static void ds4_metal_model_residency_clear(void) {
@@ -1084,11 +1217,25 @@ void ds4_metal_print_memory_report(const char *label) {
             "ds4:   runtime tensors live %.2f MiB peak %.2f MiB\n",
             ds4_metal_mib(g_tensor_alloc_live_bytes),
             ds4_metal_mib(g_tensor_alloc_peak_bytes));
-    fprintf(stderr,
-            "ds4:   mmap model wrapper spans %llu buffers %.2f GiB total, %.2f GiB max (not copied)\n",
-            (unsigned long long)g_model_wrap_count,
-            ds4_metal_gib(g_model_wrap_bytes),
-            ds4_metal_gib(g_model_wrap_max_bytes));
+    if (g_model_streaming) {
+        fprintf(stderr,
+                "ds4:   streamed mmap model wrappers %llu created, %.2f GiB cumulative, %.2f MiB live, %.2f MiB peak, %.2f MiB pending advise, %.2f GiB advised, hits %llu, evictions %llu (not copied, budget %.2f GiB)\n",
+                (unsigned long long)g_model_wrap_count,
+                ds4_metal_gib(g_model_wrap_bytes),
+                ds4_metal_mib(g_model_stream_live_bytes),
+                ds4_metal_mib(g_model_stream_peak_bytes),
+                ds4_metal_mib(g_model_stream_pending_advise_bytes),
+                ds4_metal_gib(g_model_stream_advised_bytes),
+                (unsigned long long)g_model_stream_hit_count,
+                (unsigned long long)g_model_stream_evict_count,
+                ds4_metal_gib(ds4_metal_stream_ram_budget_bytes()));
+    } else {
+        fprintf(stderr,
+                "ds4:   mmap model wrapper spans %llu buffers %.2f GiB total, %.2f GiB max (not copied)\n",
+                (unsigned long long)g_model_wrap_count,
+                ds4_metal_gib(g_model_wrap_bytes),
+                ds4_metal_gib(g_model_wrap_max_bytes));
+    }
     fprintf(stderr,
             "ds4:   model residency requests %llu%s\n",
             (unsigned long long)g_model_residency_count,
@@ -3893,6 +4040,7 @@ int ds4_metal_flush_commands(void) {
     if (!g_batch_cb) {
         (void)ds4_metal_wait_pending_command_buffers("command batch");
         [g_transient_buffers removeAllObjects];
+        ds4_metal_stream_drain_advise();
         return 0;
     }
     return 1;
@@ -3912,6 +4060,7 @@ int ds4_metal_synchronize(void) {
     if ([g_pending_cbs count] != 0) {
         int ok = ds4_metal_wait_pending_command_buffers("synchronize");
         [g_transient_buffers removeAllObjects];
+        ds4_metal_stream_drain_advise();
         return ok;
     }
 
@@ -3932,6 +4081,7 @@ void ds4_metal_cleanup(void) {
         }
         (void)ds4_metal_wait_pending_command_buffers("cleanup");
         [g_transient_buffers removeAllObjects];
+        ds4_metal_stream_drain_advise();
         g_set_rows_f32_i32_pipeline = nil;
         g_get_rows_f32_pipeline = nil;
         g_get_rows_f16_pipeline = nil;
@@ -4055,8 +4205,18 @@ void ds4_metal_cleanup(void) {
         g_model_wrap_count = 0;
         g_model_wrap_bytes = 0;
         g_model_wrap_max_bytes = 0;
+        g_model_stream_hit_count = 0;
+        g_model_stream_evict_count = 0;
+        g_model_stream_live_bytes = 0;
+        g_model_stream_peak_bytes = 0;
+        g_model_stream_pending_advise_bytes = 0;
+        g_model_stream_advised_bytes = 0;
+        g_stream_advise_count = 0;
+        g_model_streaming = 0;
         ds4_metal_model_residency_clear();
         ds4_metal_model_views_clear();
+        ds4_metal_stream_views_clear();
+        ds4_metal_stream_drain_advise();
         [g_pipeline_cache removeAllObjects];
         g_pipeline_cache = nil;
         [g_model_buffer_cache removeAllObjects];
@@ -4343,6 +4503,26 @@ int ds4_metal_set_model_map_range(const void *model_map, uint64_t model_size, ui
     if (map_offset > model_size || map_size == 0 || map_size > model_size - map_offset) return 0;
 
     @autoreleasepool {
+        if (g_model_streaming) {
+            ds4_metal_model_residency_clear();
+            ds4_metal_model_views_clear();
+#if defined(POSIX_MADV_RANDOM)
+            (void)posix_madvise((void *)((const uint8_t *)model_map + map_offset),
+                                (size_t)map_size,
+                                POSIX_MADV_RANDOM);
+#endif
+            g_model_map_ptr = model_map;
+            g_model_map_size = model_size;
+            g_model_mapped_offset = map_offset;
+            g_model_mapped_size = map_size;
+            fprintf(stderr,
+                    "ds4: Metal streaming model weights on demand (cache=%u windows, window=%llu MiB, budget=%llu MiB)\n",
+                    ds4_metal_stream_cache_limit(),
+                    (unsigned long long)(ds4_metal_stream_window_bytes(1) / (1024ull * 1024ull)),
+                    (unsigned long long)(ds4_metal_stream_ram_budget_bytes() / (1024ull * 1024ull)));
+            return 1;
+        }
+
         for (uint32_t i = 0; i < g_model_view_count; i++) {
             if (g_model_views[i].model_map == model_map &&
                 g_model_views[i].model_size == model_size &&
@@ -4372,16 +4552,156 @@ int ds4_metal_set_model_map(const void *model_map, uint64_t model_size) {
     return ds4_metal_set_model_map_range(model_map, model_size, 0, model_size);
 }
 
+void ds4_metal_set_model_streaming(bool enabled) {
+    if (g_model_streaming == (enabled ? 1 : 0)) return;
+    g_model_streaming = enabled ? 1 : 0;
+    ds4_metal_model_residency_clear();
+    ds4_metal_model_views_clear();
+    ds4_metal_stream_views_clear();
+}
+
+int ds4_metal_model_streaming_enabled(void) {
+    return g_model_streaming != 0;
+}
+
+static id<MTLBuffer> ds4_metal_stream_model_range(
+        const void *model_map,
+        uint64_t    model_size,
+        uint64_t    offset,
+        uint64_t    len,
+        uint64_t   *inner_offset) {
+    if (!model_map || model_size == 0 || offset > model_size || len > model_size - offset) {
+        fprintf(stderr, "ds4: Metal streamed model range is outside the mapped model\n");
+        return nil;
+    }
+
+    const uint64_t end = offset + len;
+    for (uint32_t i = 0; i < g_stream_view_count; i++) {
+        if (g_stream_views[i].model_map != model_map ||
+            g_stream_views[i].model_size != model_size) {
+            continue;
+        }
+        const uint64_t view_start = g_stream_views[i].model_offset;
+        const uint64_t view_end = view_start + g_stream_views[i].bytes;
+        if (offset >= view_start && end <= view_end) {
+            g_stream_views[i].last_used = ++g_stream_view_clock;
+            *inner_offset = offset - view_start;
+            g_model_stream_hit_count++;
+            [g_transient_buffers addObject:g_stream_views[i].buffer];
+            return g_stream_views[i].buffer;
+        }
+    }
+
+    const uint64_t page = (uint64_t)getpagesize();
+    const uintptr_t model_addr = (uintptr_t)model_map;
+    if ((model_addr & (uintptr_t)(page - 1)) != 0) {
+        fprintf(stderr, "ds4: Metal model mmap base is not page aligned\n");
+        return nil;
+    }
+
+    uint64_t max_buffer = (uint64_t)[g_device maxBufferLength];
+    max_buffer &= ~(page - 1);
+    const uint64_t required = round_up_u64((offset & (page - 1)) + len, page);
+    if (required == 0 || required > max_buffer) {
+        fprintf(stderr, "ds4: Metal streamed model range is larger than maxBufferLength\n");
+        return nil;
+    }
+
+    uint64_t view_offset = offset & ~(page - 1);
+    uint64_t view_bytes = round_up_u64(ds4_metal_stream_window_bytes(required), page);
+    if (view_bytes > max_buffer) view_bytes = max_buffer;
+    if (view_bytes < required) view_bytes = required;
+    if (view_offset + view_bytes > model_size) {
+        view_bytes = round_up_u64(model_size - view_offset, page);
+        if (view_offset + view_bytes > model_size) view_bytes = model_size - view_offset;
+    }
+
+    const uint64_t budget = ds4_metal_stream_ram_budget_bytes();
+    const uint64_t outstanding = g_model_stream_live_bytes + g_model_stream_pending_advise_bytes;
+    if (view_bytes > budget || outstanding > budget - view_bytes) {
+        fprintf(stderr,
+                "ds4: Metal streamed model view would exceed DS4_METAL_STREAM_RAM_MB (%.2f GiB outstanding + %.2f MiB new > %.2f GiB budget)\n",
+                ds4_metal_gib(outstanding),
+                ds4_metal_mib(view_bytes),
+                ds4_metal_gib(budget));
+        return nil;
+    }
+
+    uint32_t slot = g_stream_view_count;
+    const uint32_t limit = ds4_metal_stream_cache_limit();
+    if (slot >= limit) {
+        slot = 0;
+        for (uint32_t i = 1; i < g_stream_view_count; i++) {
+            if (g_stream_views[i].last_used < g_stream_views[slot].last_used) slot = i;
+        }
+        if (g_stream_views[slot].bytes <= g_model_stream_live_bytes) {
+            g_model_stream_live_bytes -= g_stream_views[slot].bytes;
+        } else {
+            g_model_stream_live_bytes = 0;
+        }
+        ds4_metal_stream_queue_advise(g_stream_views[slot].model_map,
+                                      g_stream_views[slot].model_offset,
+                                      g_stream_views[slot].bytes);
+        g_stream_views[slot].buffer = nil;
+        g_model_stream_evict_count++;
+    } else {
+        g_stream_view_count++;
+    }
+
+#if defined(POSIX_MADV_WILLNEED)
+    if (getenv("DS4_METAL_STREAM_WILLNEED") != NULL) {
+        (void)posix_madvise((void *)((const uint8_t *)model_map + view_offset),
+                            (size_t)view_bytes,
+                            POSIX_MADV_WILLNEED);
+    }
+#endif
+
+    id<MTLBuffer> buffer = [g_device newBufferWithBytesNoCopy:(void *)(model_addr + view_offset)
+                                                       length:(NSUInteger)view_bytes
+                                                      options:MTLResourceStorageModeShared
+                                                  deallocator:nil];
+    if (!buffer) {
+        fprintf(stderr,
+                "ds4: Metal could not wrap streamed model view at %.2f GiB, size %.2f MiB\n",
+                ds4_metal_gib(view_offset),
+                ds4_metal_mib(view_bytes));
+        return nil;
+    }
+    buffer.label = [NSString stringWithFormat:@"ds4_model_stream_%u", slot];
+
+    g_stream_views[slot].buffer = buffer;
+    g_stream_views[slot].model_map = model_map;
+    g_stream_views[slot].model_size = model_size;
+    g_stream_views[slot].model_offset = view_offset;
+    g_stream_views[slot].bytes = view_bytes;
+    g_stream_views[slot].last_used = ++g_stream_view_clock;
+
+    g_model_stream_live_bytes += view_bytes;
+    if (g_model_stream_live_bytes > g_model_stream_peak_bytes) {
+        g_model_stream_peak_bytes = g_model_stream_live_bytes;
+    }
+    g_model_wrap_count++;
+    g_model_wrap_bytes += view_bytes;
+    if (view_bytes > g_model_wrap_max_bytes) g_model_wrap_max_bytes = view_bytes;
+
+    *inner_offset = offset - view_offset;
+    [g_transient_buffers addObject:buffer];
+    return buffer;
+}
+
 static id<MTLBuffer> ds4_metal_wrap_model_range(
         const void *model_map,
         uint64_t    model_size,
         uint64_t    offset,
         uint64_t    len,
         uint64_t   *inner_offset) {
-    (void)model_map;
     if (model_size == 0 || offset > model_size || len > model_size - offset) {
         fprintf(stderr, "ds4: Metal model range is outside the mapped model\n");
         return nil;
+    }
+
+    if (g_model_streaming) {
+        return ds4_metal_stream_model_range(model_map, model_size, offset, len, inner_offset);
     }
 
     const uint64_t end = offset + len;
