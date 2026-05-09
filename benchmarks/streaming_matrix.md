@@ -30,6 +30,9 @@ with:
 | Conservative 4-token | 4 | 1 | 1 | 0 | `Hello! How can` | 0.27 | 57.22 | 1010.02 | 3.38 | 29.3% | n/a |
 | Tuned + compact tuple cache | 4 | 16 | 8 | 2048 | `Hello! How can` | 0.23 | 60.44 | 1911.64 | 4.65 | 44.7% | 1.6% |
 | Conservative + compact tuple cache | 2 | 1 | 1 | 2048 | `Hello!` | 0.19 | 55.11 | 1010.02 | 2.28 | 27.7% | 0.0% |
+| No-copy selected span | 2 | 16 | 8 | 0 | `Hello!` | 0.06 | 75.07 | 1911.64 | 0.05 | 41.4% | n/a |
+| Per-expert slice cache, 512-entry cap | 4 | 16 | 8 | 8192 | `Hello! How can` | 0.21 | 63.70 | 1911.64 | 3.90 | 44.7% | 0.0% |
+| Per-expert slice cache, 8192-entry cap | 4 | 16 | 8 | 8192 | `Hello! How can` | 0.21 | 61.94 | 1911.64 | 4.85 | 44.7% | 35.0% |
 
 ## Notes
 
@@ -39,8 +42,15 @@ with:
   current short tests are too dominated by prefill and one-token decode overhead
   to prove a large generation-rate gain.
 - The tuned default stays well below the 16 GiB envelope. The highest observed
-  RSS in this matrix is 4.65 GiB with the compact tuple cache enabled, which is
-  why that cache is opt-in instead of the default.
+  RSS in this matrix is 4.85 GiB with the 8192-entry per-expert slice cache
+  enabled, which is why that cache is still opt-in instead of the default.
+- A no-copy selected-expert span is a clear regression. It avoids CPU copy work,
+  but the min-to-max expert span pulls too much mmap-backed model data and drops
+  generation to 0.06 tok/s.
+- Per-expert slice caching can produce hits once the entry cap is high enough,
+  but the current CPU copy and cache lookup path still does not improve tok/s.
+  It needs a GPU-side gather or a different representation before it is worth
+  making default.
 
 ## Columns
 
