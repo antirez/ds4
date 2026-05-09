@@ -1,6 +1,10 @@
 CC ?= cc
+ifeq ($(UNAME_S),Darwin)
 CFLAGS ?= -O3 -ffast-math -mcpu=native -Wall -Wextra -std=c99
 OBJCFLAGS ?= -O3 -ffast-math -mcpu=native -Wall -Wextra -fobjc-arc
+else
+CFLAGS ?= -O3 -fno-finite-math-only -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE
+endif
 
 LDLIBS ?= -lm -pthread
 UNAME_S := $(shell uname -s)
