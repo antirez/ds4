@@ -3,6 +3,12 @@
 This file tracks constrained mlx-flash runs from `make test-constrained-ram`.
 The raw data lives in `benchmarks/streaming_matrix.csv`.
 
+`generation_tps` is the primary speed metric. It comes from the `ds4:
+generation:` timing line, not from `/usr/bin/time`; process `real_s` is kept
+only as a secondary end-to-end cost that includes startup, mmap setup, hot-range
+planning, prefill, and shutdown. For steady-state decode comparisons, measure
+from first token onward and avoid treating `real_s` as tok/s.
+
 ## Current Default
 
 The current default constrained test is:
@@ -14,38 +20,70 @@ make test-constrained-ram
 with:
 
 - `RAM_TEST_MB=16384`
+- `RAM_TEST_RESIDENT_HOT_MB=8192`
 - `RAM_TEST_STREAM_CACHE=32`
 - `RAM_TEST_STREAM_WINDOW_MB=8`
+- `RAM_TEST_STREAM_CACHE_RAM_MB=4096`
 - `RAM_TEST_PIN_MAX_MB=1`
 - `RAM_TEST_COMPACT_CACHE_MB=4096`
 - `RAM_TEST_CTX=256`
 - `RAM_TEST_TOKENS=2`
 
+The largest local test envelope we currently allow is:
+
+```sh
+make test-constrained-ram-24gb
+```
+
+with `RAM_TEST_MB=24576`, `RAM_TEST_RESIDENT_HOT_MB=9216`,
+`RAM_TEST_STREAM_CACHE_RAM_MB=7168`, and `RAM_TEST_COMPACT_CACHE_MB=8192`.
+
 ## Snapshot
 
-| Run | Tokens | Cache | Window MiB | Compact Cache MiB | Output | Gen tok/s | Real s | Stream Peak MiB | Max RSS GiB | Stream Hit Rate | Compact Hit Rate |
-|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|
-| Default tuned smoke | 2 | 16 | 8 | 0 | `Hello!` | 0.21 | 52.17 | 1911.64 | 1.76 | 43.5% | n/a |
-| Tuned 4-token | 4 | 16 | 8 | 0 | `Hello! How can` | 0.26 | 56.88 | 1911.64 | 3.39 | 44.7% | n/a |
-| Conservative 4-token | 4 | 1 | 1 | 0 | `Hello! How can` | 0.27 | 57.22 | 1010.02 | 3.38 | 29.3% | n/a |
-| Tuned + compact tuple cache | 4 | 16 | 8 | 2048 | `Hello! How can` | 0.23 | 60.44 | 1911.64 | 4.65 | 44.7% | 1.6% |
-| Conservative + compact tuple cache | 2 | 1 | 1 | 2048 | `Hello!` | 0.19 | 55.11 | 1010.02 | 2.28 | 27.7% | 0.0% |
-| No-copy selected span | 2 | 16 | 8 | 0 | `Hello!` | 0.06 | 75.07 | 1911.64 | 0.05 | 41.4% | n/a |
-| Per-expert slice cache, 512-entry cap | 4 | 16 | 8 | 8192 | `Hello! How can` | 0.21 | 63.70 | 1911.64 | 3.90 | 44.7% | 0.0% |
-| Per-expert slice cache, 8192-entry cap | 4 | 16 | 8 | 8192 | `Hello! How can` | 0.21 | 61.94 | 1911.64 | 4.85 | 44.7% | 35.0% |
-| GPU blit gather | 2 | 16 | 8 | 0 | `Hello!` | 0.30 | 48.49 | 1911.64 | 0.05 | 34.0% | n/a |
-| GPU blit gather | 4 | 16 | 8 | 0 | `Hello! How can` | 0.35 | 52.21 | 1911.64 | 0.05 | 31.1% | n/a |
-| Private one-encoder blit gather | 2 | 16 | 8 | 0 | `Hello!` | 0.29 | 48.65 | 1911.64 | 0.05 | 34.2% | n/a |
-| Larger stream window | 2 | 16 | 64 | 0 | `Hello!` | 0.10 | 54.75 | 4096.09 | 0.05 | 69.1% | n/a |
-| More small stream windows | 2 | 32 | 8 | 0 | `Hello!` | 0.34 | 47.41 | 3849.30 | 0.05 | 34.6% | n/a |
-| More small stream windows | 4 | 32 | 8 | 0 | `Hello! How can` | 0.36 | 49.31 | 3849.30 | 0.05 | 31.4% | n/a |
-| More small stream windows | 2 | 48 | 8 | 0 | `Hello!` | 0.32 | 41.80 | 5742.97 | 0.05 | 35.1% | n/a |
-| GPU slice cache | 2 | 32 | 8 | 4096 | `Hello!` | 0.36 | 40.19 | 3849.30 | 0.05 | 34.6% | 0.0% |
-| GPU slice cache | 4 | 32 | 8 | 4096 | `Hello! How can` | 0.36 | 46.86 | 3849.30 | 0.05 | 35.0% | 35.0% |
-| GPU slice cache | 8 | 32 | 8 | 4096 | `Hello! How can I assist you today` | 0.37 | 59.43 | 3849.30 | 0.05 | 35.2% | 47.5% |
-| GPU slice cache | 8 | 32 | 8 | 8192 | `Hello! How can I assist you today` | 0.38 | 61.45 | 3849.30 | 0.05 | 35.6% | 49.8% |
-| GPU slice cache repeat | 2 | 32 | 8 | 4096 | `Hello!` | 0.37 | 39.45 | 3849.30 | 0.05 | 34.6% | 0.0% |
-| Cleaned default smoke | 2 | 32 | 8 | 4096 | `Hello!` | 0.33 | 42.87 | 3849.30 | 0.05 | 34.6% | 0.0% |
+Representative rows only. The CSV keeps the full exploration history.
+
+| Run | RAM MiB | Hot MiB | Stream MiB | Compact MiB | Tokens | Gen tok/s | Max RSS GiB | Stream Evict | Compact Evict | Notes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| Early no-hot baseline | 16384 | 0 | 3849 peak | 4096 | 8 | 0.37 | 4.29 | 7767 | 1024 | GPU slice cache before planned hot residency. |
+| 16 GiB default, first-token basis | 16384 | 8192 | 4096 | 4096 | 8 | 0.74 | 7.72 | 2871 | 1024 | Current conservative split; hot ranges do the main work. |
+| 16 GiB more compact | 16384 | 8192 | 2048 | 6144 | 8 | 0.77 | 7.72 | 2751 | 0 | Compact evictions disappear, stream churn remains. |
+| 24 GiB balanced | 24576 | 9216 | 7168 | 8192 | 8 | 0.77 | 8.25 | 2743 | 0 | All non-expert hot ranges fit; extra compact budget is unused. |
+| 24 GiB stream-heavy | 24576 | 9216 | 9216 | 6144 | 8 | 0.72 | 8.25 | 2743 | 0 | More stream budget does not improve reuse. |
+
+## Conclusions
+
+**Hot Residency**
+
+Planned hot residency is the largest confirmed improvement. Moving frequently
+used non-expert tensors into hot mmap-backed Metal views raises the 8-token
+first-token-basis run from the earlier 0.37 tok/s baseline to 0.74 tok/s. The
+current planner needs about 8.20 GiB to cover all selected non-expert hot ranges,
+so setting hot residency much above 9 GiB will not help unless the planner starts
+selecting another tensor class.
+
+**Compact Expert Cache**
+
+The compact expert cache is useful, but only up to the active expert working set.
+At 4 GiB it still evicts 1024 entries in the 8-token run. At 6 GiB it removes
+compact evictions and improves generation from 0.74 to 0.77 tok/s. Raising it
+to 8 GiB does not help this prompt because the observed compact live set tops
+out at about 6.12 GiB.
+
+**Stream-View Cache**
+
+The stream-view cache is still the main churn signal. Even with 7-9 GiB of
+stream-view budget, final stream evictions stay around 2740 and stream hits stay
+around 75. That means larger stream residency alone is not turning into reuse;
+the remaining cost is likely repeated per-token wrapping, blit/gather work, and
+page churn for ranges that are not naturally reused by the current cache shape.
+
+**24 GiB Envelope**
+
+The 24 GiB ceiling is safe in the tested splits, but it is not yet a speed win.
+The best 24 GiB split tested here ties the 16 GiB `8 + 2 + 6` split at 0.77
+tok/s, while the stream-heavy 24 GiB split regresses to 0.72 tok/s. The current
+default should stay conservative until we change what is cached, not just how
+much is cached.
 
 ## Failed Configurations
 
@@ -55,63 +93,30 @@ with:
 
 ## Notes
 
-- The persistent compact expert tuple cache is currently not a win. It adds RSS
-  and memcpy pressure while producing very few hits on these short prompts.
-- A wider stream cache/window reduces wrapper churn and evictions, but the
-  current short tests are too dominated by prefill and one-token decode overhead
-  to prove a large generation-rate gain.
-- The tuned default stays well below the 16 GiB envelope. The highest observed
-  RSS in this matrix is 4.85 GiB with the 8192-entry per-expert slice cache
-  enabled, which is why that cache is still opt-in instead of the default.
-- A no-copy selected-expert span is a clear regression. It avoids CPU copy work,
-  but the min-to-max expert span pulls too much mmap-backed model data and drops
-  generation to 0.06 tok/s.
-- Per-expert slice caching can produce hits once the entry cap is high enough,
-  but the current CPU copy and cache lookup path still does not improve tok/s.
-  It needs a GPU-side gather or a different representation before it is worth
-  making default.
-- GPU blit gather for selected expert compact buffers is the first clear win:
-  the 2-token smoke improved from 0.21 to 0.30 tok/s and the 4-token comparison
-  improved from 0.27 to 0.35 tok/s while keeping RSS tiny. It increases wrapper
-  churn, but the CPU-copy removal more than pays for it on short decode runs.
-- Collapsing the three routed expert blit encoders into one and making compact
-  buffers private was safe under the cap, but did not improve the 2-token smoke
-  run. This suggests the remaining cost is not encoder setup or shared-buffer
-  CPU visibility alone.
-- A 64 MiB stream window with 64 cache slots is too wide for the 16 GiB cap.
-  The budget guard caught it during prefill at 16.0 GiB live stream views. Any
-  wider-window test needs a smaller cache or earlier eviction.
-- A 64 MiB window with 16 cache slots is safe and improves stream hit rate, but
-  decode gets slower. Larger view ranges reduce wrapper churn while increasing
-  eviction/advice and page-touch cost, so the current default stays at 8 MiB.
-- Doubling the 8 MiB stream cache from 16 to 32 improves both the 2-token smoke
-  and the 4-token comparison while remaining well inside the 16 GiB envelope.
-  The constrained Makefile default now uses 32 stream windows.
-- Increasing the 8 MiB stream cache to 48 stays well under the 16 GiB cap and
-  lowers 2-token wall time, but generation tok/s does not beat 32 windows.
-- A GPU-private per-expert slice cache with a 4 GiB budget improves the 2-token
-  smoke and keeps total footprint under the 16 GiB cap. The first short run had
-  no compact-cache hits, so this needs a longer run before making it default.
-- At 4 tokens, the GPU-private slice cache gets the same 35% expert hit rate as
-  the earlier CPU-copy slice cache but avoids the CPU-copy regression. It lowers
-  wall time and wrapper churn while keeping generation tok/s tied with the best
-  no-cache run.
-- At 8 tokens, the 4 GiB GPU slice cache reaches a 47.5% hit rate but starts
-  evicting. Generation improves only slightly to 0.37 tok/s, so the next check
-  is whether an 8 GiB cache reduces churn without harming the cap.
-- The 8 GiB GPU slice cache removes compact-cache evictions and reaches the
-  best generation tok/s so far, but wall time regresses and peak footprint grows
-  to about 6.27 GiB. It is still inside the 16 GiB envelope, but not an obvious
-  default.
-- Repeating the 2-token 4 GiB GPU-cache smoke produced 0.37 tok/s, confirming
-  short-run noise but also confirming the setting is consistently ahead of the
-  pre-cache baseline.
-- The constrained Makefile default now uses the 4 GiB GPU slice cache. It is
-  faster than no cache in the repeated smoke and does not pay the wall-time
-  penalty seen with the 8 GiB cache.
-- After removing the regressed span and CPU-copy cache experiments from the
-  executable code, the default constrained smoke still passes under the cap.
-  The 2-token result landed at 0.33 tok/s, within the noisy short-run band.
+- Planned hot residency is the major win so far. The first-token-basis 8-token
+  run is 0.74 tok/s with hot ranges, versus 0.37 tok/s before hot residency.
+- The 16 GiB conservative default is `8 GiB hot + 4 GiB compact + 4 GiB stream`.
+  It stays well under the 16 GiB envelope in observed RSS, but still reports
+  2871 stream evictions and 1024 compact expert evictions on the 8-token run.
+- Moving 2 GiB from stream views to compact experts eliminates compact-cache
+  evictions and improves generation slightly to 0.77 tok/s, but stream evictions
+  remain high.
+- The useful 24 GiB ceiling does not currently translate into a clear speed win.
+  A `9 GiB hot + 8 GiB compact + 7 GiB stream` split also lands at 0.77 tok/s.
+  A stream-heavy `9 + 6 + 9` split regresses to 0.72 tok/s.
+- The hot planner can cover all currently selected non-expert ranges with about
+  8.20 GiB resident. Raising hot residency beyond 9 GiB will not help unless the
+  planner starts selecting routed expert ranges or another hot tensor class.
+- Stream-view eviction is tracked and remains the clearest churn signal. Larger
+  stream budgets reduce peak budget pressure, but they have not improved reuse:
+  stream hits stay around 75-78 on these 8-token runs while final stream
+  evictions remain around 2740-2870.
+- Compact expert eviction is also tracked. A 6 GiB compact expert budget is
+  enough for this prompt; 8 GiB leaves unused budget.
+- The next likely speed path is reducing per-token streaming/blit work, not just
+  increasing cache sizes. Candidate work: cache or batch the routed expert
+  gather by layer/token, fuse more route/gather/compute work on GPU, or extend
+  residency planning to selected expert slices when expert reuse is predictable.
 
 ## Columns
 
@@ -121,6 +126,13 @@ with:
   this size avoid LRU eviction while an unpinned view is available.
 - `compact_cache_mb`: `DS4_METAL_COMPACT_EXPERT_CACHE_MB`; set to `0` to keep
   compact expert buffers transient.
+- Hot residency is tracked in run notes for now: `DS4_METAL_RESIDENT_HOT_MB`
+  selects planned non-expert model ranges, and `DS4_METAL_STREAM_CACHE_RAM_MB`
+  caps the remaining transient mmap-backed stream-view cache.
+- `generation_tps`: primary decode-speed metric from the program timing line.
+  Do not derive tok/s from `real_s`.
+- `real_s`: `/usr/bin/time -l` process wall time; useful for regressions in
+  setup/prefill/shutdown, not for steady-state decode speed.
 - `prefill_*`: counters at the post-prefill memory report.
 - `final_*`: counters at the final memory report.
 

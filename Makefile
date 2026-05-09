@@ -7,6 +7,8 @@ UNAME_S := $(shell uname -s)
 NATIVE_LDLIBS := $(LDLIBS)
 METAL_SRCS := $(wildcard metal/*.metal)
 RAM_TEST_MB ?= 16384
+RAM_TEST_RESIDENT_HOT_MB ?= 8192
+RAM_TEST_STREAM_CACHE_RAM_MB ?= 4096
 RAM_TEST_STREAM_CACHE ?= 32
 RAM_TEST_STREAM_WINDOW_MB ?= 8
 RAM_TEST_PIN_MAX_MB ?= 1
@@ -27,7 +29,7 @@ NATIVE_CORE_OBJS = ds4_native.o
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all clean test-constrained-ram test-constrained-ram-matrix
+.PHONY: all clean test-constrained-ram test-constrained-ram-24gb test-constrained-ram-matrix
 
 all: ds4 ds4-server
 
@@ -77,6 +79,8 @@ test-constrained-ram: ds4
 	    DS4_METAL_STREAM_CACHE=$(RAM_TEST_STREAM_CACHE) \
 	    DS4_METAL_STREAM_WINDOW_MB=$(RAM_TEST_STREAM_WINDOW_MB) \
 	    DS4_METAL_STREAM_RAM_MB=$(RAM_TEST_MB) \
+	    DS4_METAL_RESIDENT_HOT_MB=$(RAM_TEST_RESIDENT_HOT_MB) \
+	    DS4_METAL_STREAM_CACHE_RAM_MB=$(RAM_TEST_STREAM_CACHE_RAM_MB) \
 	    DS4_METAL_STREAM_PIN_MAX_MB=$(RAM_TEST_PIN_MAX_MB) \
 	    DS4_METAL_COMPACT_EXPERT_CACHE_MB=$(RAM_TEST_COMPACT_CACHE_MB) \
 	    DS4_METAL_NO_RESIDENCY=1 \
@@ -85,6 +89,13 @@ test-constrained-ram: ds4
 	        --ctx $(RAM_TEST_CTX) \
 	        --tokens $(RAM_TEST_TOKENS) \
 	        -p '$(RAM_TEST_PROMPT)'
+
+test-constrained-ram-24gb:
+	$(MAKE) test-constrained-ram \
+	    RAM_TEST_MB=24576 \
+	    RAM_TEST_RESIDENT_HOT_MB=9216 \
+	    RAM_TEST_STREAM_CACHE_RAM_MB=7168 \
+	    RAM_TEST_COMPACT_CACHE_MB=8192
 
 test-constrained-ram-matrix: ds4
 	@for cache in 1 8 16; do \

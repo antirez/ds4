@@ -468,7 +468,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     int generated = 0;
-    const double t_decode0 = cli_now_sec();
+    double t_first_token = 0.0;
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token = ds4_session_sample(session, cfg->gen.temperature, 0, cfg->gen.top_p, 0.0f, &rng);
         if (token == ds4_token_eos(engine)) break;
@@ -511,6 +511,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             token_printer_write_text(&printer, piece, piece_len);
             fflush(stdout);
             free(piece);
+            if (generated == 0) t_first_token = cli_now_sec();
             generated++;
             if (generated >= max_tokens) break;
         }
@@ -521,12 +522,13 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     if (cli_interrupt_requested()) cli_interrupt_clear();
 
     const double prefill_s = t_prefill1 - t_prefill0;
-    const double decode_s = t_decode1 - t_decode0;
+    const double decode_s = generated > 1 ? t_decode1 - t_first_token : 0.0;
+    const double decode_tokens = generated > 1 ? (double)(generated - 1) : 0.0;
     ds4_log(stderr,
             DS4_LOG_TIMING,
             "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
-            decode_s > 0.0 ? (double)generated / decode_s : 0.0);
+            decode_s > 0.0 ? decode_tokens / decode_s : 0.0);
 
     ds4_session_free(session);
     return 0;
@@ -925,7 +927,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     int generated = 0;
-    const double t_decode0 = cli_now_sec();
+    double t_first_token = 0.0;
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token = ds4_session_sample(chat->session,
                                        cfg->gen.temperature,
@@ -972,6 +974,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
             token_printer_write_text(&printer, piece, piece_len);
             fflush(stdout);
             free(piece);
+            if (generated == 0) t_first_token = cli_now_sec();
             generated++;
             if (generated >= max_tokens) break;
         }
@@ -989,13 +992,14 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     }
 
     const double prefill_s = t_prefill1 - t_prefill0;
-    const double decode_s = t_decode1 - t_decode0;
+    const double decode_s = generated > 1 ? t_decode1 - t_first_token : 0.0;
+    const double decode_tokens = generated > 1 ? (double)(generated - 1) : 0.0;
     if (interrupted) cli_interrupt_clear();
     ds4_log(stderr,
             DS4_LOG_TIMING,
             "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)suffix / prefill_s : 0.0,
-            decode_s > 0.0 ? (double)generated / decode_s : 0.0);
+            decode_s > 0.0 ? decode_tokens / decode_s : 0.0);
     return 0;
 }
 

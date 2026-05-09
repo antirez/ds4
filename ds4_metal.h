@@ -15,6 +15,13 @@
  */
 typedef struct ds4_metal_tensor ds4_metal_tensor;
 
+typedef struct {
+    uint64_t offset;
+    uint64_t bytes;
+} ds4_metal_model_range;
+
+#define DS4_METAL_MAX_HOT_MODEL_RANGES 2048u
+
 int ds4_metal_init(void);
 void ds4_metal_cleanup(void);
 
@@ -36,6 +43,8 @@ int ds4_metal_synchronize(void);
 
 int ds4_metal_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_metal_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
+int ds4_metal_set_hot_model_ranges(const void *model_map, uint64_t model_size,
+                                   const ds4_metal_model_range *ranges, uint32_t n_ranges);
 void ds4_metal_set_model_streaming(bool enabled);
 int ds4_metal_model_streaming_enabled(void);
 void ds4_metal_set_quality(bool quality);

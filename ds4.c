@@ -2486,6 +2486,180 @@ static void weights_bind(ds4_weights *w, const ds4_model *m) {
     weights_validate_layout(w);
 }
 
+#ifndef DS4_NO_METAL
+typedef struct {
+    ds4_metal_model_range ranges[DS4_METAL_MAX_HOT_MODEL_RANGES];
+    uint32_t count;
+    uint32_t skipped_count;
+    uint64_t selected_bytes;
+    uint64_t skipped_bytes;
+} ds4_hot_residency_plan;
+
+static uint64_t ds4_env_mb_bytes(const char *name, uint64_t fallback_mb) {
+    const char *s = getenv(name);
+    if (!s || !s[0]) return fallback_mb * 1024ull * 1024ull;
+    char *end = NULL;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (end == s) return fallback_mb * 1024ull * 1024ull;
+    return (uint64_t)v * 1024ull * 1024ull;
+}
+
+static uint64_t hot_residency_budget_bytes(void) {
+    return ds4_env_mb_bytes("DS4_METAL_RESIDENT_HOT_MB", 8192);
+}
+
+static int hot_range_cmp(const void *a, const void *b) {
+    const ds4_metal_model_range *ra = a;
+    const ds4_metal_model_range *rb = b;
+    if (ra->offset < rb->offset) return -1;
+    if (ra->offset > rb->offset) return 1;
+    if (ra->bytes < rb->bytes) return -1;
+    if (ra->bytes > rb->bytes) return 1;
+    return 0;
+}
+
+static void hot_plan_merge(ds4_hot_residency_plan *p);
+
+static void hot_plan_add_tensor(ds4_hot_residency_plan *p,
+                                const ds4_tensor *t,
+                                uint64_t budget,
+                                uint64_t page) {
+    if (!p || !t || t->bytes == 0 || budget == 0) return;
+    const uint64_t view_offset = t->abs_offset & ~(page - 1);
+    const uint64_t leading = t->abs_offset - view_offset;
+    const uint64_t view_bytes = align_up(leading + t->bytes, page);
+
+    for (uint32_t i = 0; i < p->count; i++) {
+        if (p->ranges[i].offset == view_offset && p->ranges[i].bytes == view_bytes) return;
+    }
+    if (p->count >= DS4_METAL_MAX_HOT_MODEL_RANGES || view_bytes > budget) {
+        p->skipped_count++;
+        p->skipped_bytes += view_bytes;
+        return;
+    }
+    if (p->selected_bytes > budget - view_bytes) {
+        hot_plan_merge(p);
+    }
+    if (p->selected_bytes > budget - view_bytes) {
+        p->skipped_count++;
+        p->skipped_bytes += view_bytes;
+        return;
+    }
+
+    p->ranges[p->count++] = (ds4_metal_model_range) {
+        .offset = view_offset,
+        .bytes = view_bytes,
+    };
+    p->selected_bytes += view_bytes;
+}
+
+static void hot_plan_merge(ds4_hot_residency_plan *p) {
+    if (!p || p->count < 2) return;
+    qsort(p->ranges, p->count, sizeof(p->ranges[0]), hot_range_cmp);
+
+    uint32_t out = 0;
+    uint64_t merged_bytes = 0;
+    for (uint32_t i = 0; i < p->count; i++) {
+        ds4_metal_model_range r = p->ranges[i];
+        if (r.bytes == 0) continue;
+        if (out != 0) {
+            ds4_metal_model_range *last = &p->ranges[out - 1];
+            const uint64_t last_end = last->offset + last->bytes;
+            const uint64_t r_end = r.offset + r.bytes;
+            if (r.offset <= last_end) {
+                if (r_end > last_end) last->bytes = r_end - last->offset;
+                continue;
+            }
+        }
+        p->ranges[out++] = r;
+    }
+    for (uint32_t i = 0; i < out; i++) merged_bytes += p->ranges[i].bytes;
+    p->count = out;
+    p->selected_bytes = merged_bytes;
+}
+
+static void hot_plan_add_layer(ds4_hot_residency_plan *p,
+                               const ds4_layer_weights *l,
+                               uint64_t budget,
+                               uint64_t page) {
+    hot_plan_add_tensor(p, l->hc_attn_fn, budget, page);
+    hot_plan_add_tensor(p, l->hc_attn_scale, budget, page);
+    hot_plan_add_tensor(p, l->hc_attn_base, budget, page);
+    hot_plan_add_tensor(p, l->attn_norm, budget, page);
+    hot_plan_add_tensor(p, l->attn_q_a, budget, page);
+    hot_plan_add_tensor(p, l->attn_q_a_norm, budget, page);
+    hot_plan_add_tensor(p, l->attn_q_b, budget, page);
+    hot_plan_add_tensor(p, l->attn_kv, budget, page);
+    hot_plan_add_tensor(p, l->attn_kv_a_norm, budget, page);
+    hot_plan_add_tensor(p, l->attn_sinks, budget, page);
+    hot_plan_add_tensor(p, l->attn_output_a, budget, page);
+    hot_plan_add_tensor(p, l->attn_output_b, budget, page);
+    hot_plan_add_tensor(p, l->attn_compressor_ape, budget, page);
+    hot_plan_add_tensor(p, l->attn_compressor_kv, budget, page);
+    hot_plan_add_tensor(p, l->attn_compressor_gate, budget, page);
+    hot_plan_add_tensor(p, l->attn_compressor_norm, budget, page);
+    hot_plan_add_tensor(p, l->indexer_attn_q_b, budget, page);
+    hot_plan_add_tensor(p, l->indexer_proj, budget, page);
+    hot_plan_add_tensor(p, l->indexer_compressor_ape, budget, page);
+    hot_plan_add_tensor(p, l->indexer_compressor_kv, budget, page);
+    hot_plan_add_tensor(p, l->indexer_compressor_gate, budget, page);
+    hot_plan_add_tensor(p, l->indexer_compressor_norm, budget, page);
+    hot_plan_add_tensor(p, l->hc_ffn_fn, budget, page);
+    hot_plan_add_tensor(p, l->hc_ffn_scale, budget, page);
+    hot_plan_add_tensor(p, l->hc_ffn_base, budget, page);
+    hot_plan_add_tensor(p, l->ffn_norm, budget, page);
+    hot_plan_add_tensor(p, l->ffn_gate_tid2eid, budget, page);
+    hot_plan_add_tensor(p, l->ffn_gate_inp, budget, page);
+    hot_plan_add_tensor(p, l->ffn_exp_probs_b, budget, page);
+    hot_plan_add_tensor(p, l->ffn_gate_shexp, budget, page);
+    hot_plan_add_tensor(p, l->ffn_up_shexp, budget, page);
+    hot_plan_add_tensor(p, l->ffn_down_shexp, budget, page);
+}
+
+static ds4_hot_residency_plan hot_residency_plan_build(const ds4_weights *w) {
+    ds4_hot_residency_plan p;
+    memset(&p, 0, sizeof(p));
+    const uint64_t budget = hot_residency_budget_bytes();
+    const uint64_t page = (uint64_t)getpagesize();
+    if (budget == 0) return p;
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        hot_plan_add_layer(&p, &w->layer[il], budget, page);
+    }
+    hot_plan_add_tensor(&p, w->token_embd, budget, page);
+    hot_plan_add_tensor(&p, w->output_hc_base, budget, page);
+    hot_plan_add_tensor(&p, w->output_hc_fn, budget, page);
+    hot_plan_add_tensor(&p, w->output_hc_scale, budget, page);
+    hot_plan_add_tensor(&p, w->output_norm, budget, page);
+    hot_plan_add_tensor(&p, w->output, budget, page);
+    hot_plan_merge(&p);
+    return p;
+}
+
+static int configure_hot_residency_plan(const ds4_model *m, const ds4_weights *w) {
+    const ds4_hot_residency_plan p = hot_residency_plan_build(w);
+    fprintf(stderr,
+            "ds4: hot residency plan selected %u ranges, %.2f GiB (skipped %u ranges, %.2f GiB; budget %.2f GiB)\n",
+            p.count,
+            (double)p.selected_bytes / (1024.0 * 1024.0 * 1024.0),
+            p.skipped_count,
+            (double)p.skipped_bytes / (1024.0 * 1024.0 * 1024.0),
+            (double)hot_residency_budget_bytes() / (1024.0 * 1024.0 * 1024.0));
+    if (getenv("DS4_METAL_RESIDENCY_PLAN_DUMP") != NULL) {
+        for (uint32_t i = 0; i < p.count; i++) {
+            fprintf(stderr,
+                    "ds4:   hot range %4u %.3f..%.3f GiB (%.2f MiB)\n",
+                    i,
+                    (double)p.ranges[i].offset / (1024.0 * 1024.0 * 1024.0),
+                    (double)(p.ranges[i].offset + p.ranges[i].bytes) /
+                        (1024.0 * 1024.0 * 1024.0),
+                    (double)p.ranges[i].bytes / (1024.0 * 1024.0));
+        }
+    }
+    return ds4_metal_set_hot_model_ranges(m->map, m->size, p.ranges, p.count);
+}
+#endif
+
 static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
     memset(w, 0, sizeof(*w));
 
@@ -14486,7 +14660,7 @@ static int generate_raw_swa_cpu(
     int n_generated = 0;
     int n_decode_eval = 0;
     const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
-    const double t_decode0 = now_sec();
+    double t_first_token = 0.0;
     ds4_alloc_guard_begin("CPU token generation");
     for (int i = 0; i < n_predict && pos < ctx_size; i++) {
         if (trace_top) {
@@ -14499,6 +14673,7 @@ static int generate_raw_swa_cpu(
         if (token == vocab->eos_id) break;
 
         if (emit) emit(emit_ud, token);
+        if (n_generated == 0) t_first_token = now_sec();
         n_generated++;
 
         if (i == n_predict - 1 || pos + 1 >= ctx_size) {
@@ -14521,12 +14696,13 @@ static int generate_raw_swa_cpu(
     if (done) done(emit_ud);
 
     const double prefill_s = t_prefill1 - t_prefill0;
-    const double decode_s = t_decode1 - t_decode0;
+    const double decode_s = n_generated > 1 ? t_decode1 - t_first_token : 0.0;
+    const double decode_tokens = n_generated > 1 ? (double)(n_generated - 1) : 0.0;
     ds4_log(stderr,
             DS4_LOG_TIMING,
             "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
-            decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
+            decode_s > 0.0 ? decode_tokens / decode_s : 0.0);
 
     free(logits);
     cpu_decode_scratch_free(&decode_scratch);
@@ -14607,7 +14783,7 @@ static int generate_metal_graph_raw_swa(
     int pos = prompt->len;
     int n_generated = 0;
     int n_decode_eval = 0;
-    const double t_decode0 = now_sec();
+    double t_first_token = 0.0;
     for (int i = 0; i < n_predict && pos < ctx_size; i++) {
         if (trace_top) {
             char label[64];
@@ -14619,6 +14795,7 @@ static int generate_metal_graph_raw_swa(
         if (token == vocab->eos_id) break;
 
         if (emit) emit(emit_ud, token);
+        if (n_generated == 0) t_first_token = now_sec();
         n_generated++;
 
         if (i == n_predict - 1 || pos + 1 >= ctx_size) {
@@ -14645,12 +14822,13 @@ static int generate_metal_graph_raw_swa(
     if (done) done(emit_ud);
 
     const double prefill_s = t_prefill1 - t_prefill0;
-    const double decode_s = t_decode1 - t_decode0;
+    const double decode_s = n_generated > 1 ? t_decode1 - t_first_token : 0.0;
+    const double decode_tokens = n_generated > 1 ? (double)(n_generated - 1) : 0.0;
     ds4_log(stderr,
             DS4_LOG_TIMING,
             "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
-            decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
+            decode_s > 0.0 ? decode_tokens / decode_s : 0.0);
 
     if (memory_report) ds4_metal_print_memory_report("before graph free");
     free(logits);
@@ -15782,6 +15960,12 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 *out = NULL;
                 return 1;
             }
+        }
+        if (stream_weights && !configure_hot_residency_plan(&e->model, &e->weights)) {
+            fprintf(stderr, "ds4: Metal hot residency plan failed; aborting startup\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
         }
         fprintf(stderr, "ds4: Metal backend initialized for graph diagnostics%s\n",
                 stream_weights ? " (streamed weights)" : "");

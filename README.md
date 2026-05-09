@@ -14,8 +14,15 @@ weight views, so we can try to make DeepSeek V4 Flash work on smaller Macs. Use
 `DS4_METAL_STREAM_WEIGHTS=1`; tune `DS4_METAL_STREAM_CACHE` and
 `DS4_METAL_STREAM_WINDOW_MB` if the default streaming window/cache need to be
 smaller for a machine. Streamed weights also honor
-`DS4_METAL_STREAM_RAM_MB`, which defaults to `16384`, as a soft cap for
-in-flight mmap-backed Metal weight windows.
+`DS4_METAL_STREAM_RAM_MB`, which defaults to `16384`, as the overall streamed
+weight envelope. The current experimental split assumes
+`DS4_METAL_RESIDENT_HOT_MB=8192` for planned always-hot model ranges,
+`DS4_METAL_COMPACT_EXPERT_CACHE_MB=4096` for GPU-private routed expert slices,
+and `DS4_METAL_STREAM_CACHE_RAM_MB=4096` for transient mmap-backed Metal weight
+windows. Treat 24 GiB (`DS4_METAL_STREAM_RAM_MB=24576`) as the current hard
+local test ceiling; anything above that is intentionally out of scope for this
+branch. Set `DS4_METAL_RESIDENCY_PLAN_DUMP=1` to print the selected permanent
+hot ranges at startup.
 
 This project would not exist without **llama.cpp and GGML**, make sure to read
 the acknowledgements section, a big thank you to Georgi Gerganov and all the
