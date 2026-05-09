@@ -144,6 +144,12 @@ static uint64_t g_model_stream_hit_count;
 static uint64_t g_model_stream_evict_count;
 static uint64_t g_model_stream_live_bytes;
 static uint64_t g_model_stream_peak_bytes;
+static uint64_t g_model_stream_pinned_count;
+static uint64_t g_compact_expert_cache_hit_count;
+static uint64_t g_compact_expert_cache_miss_count;
+static uint64_t g_compact_expert_cache_evict_count;
+static uint64_t g_compact_expert_cache_live_bytes;
+static uint64_t g_compact_expert_cache_peak_bytes;
 static NSUInteger g_flash_attn_mask_bytes;
 static NSUInteger g_flash_attn_pad_bytes;
 static NSUInteger g_flash_attn_tmp_bytes;
@@ -174,11 +180,13 @@ static int g_quality_mode;
 static int g_model_streaming;
 
 #define DS4_METAL_MAX_MODEL_VIEWS 16
-#define DS4_METAL_MAX_STREAM_VIEWS 16
+#define DS4_METAL_MAX_STREAM_VIEWS 64
+#define DS4_METAL_MAX_COMPACT_EXPERT_CACHE 512
 #define DS4_METAL_MODEL_MAX_TENSOR_BYTES 704643072ull
 #define DS4_METAL_STREAM_DEFAULT_CACHE 4u
 #define DS4_METAL_STREAM_DEFAULT_WINDOW_BYTES (768ull * 1024ull * 1024ull)
 #define DS4_METAL_STREAM_DEFAULT_RAM_BYTES (16ull * 1024ull * 1024ull * 1024ull)
+#define DS4_METAL_COMPACT_EXPERT_DEFAULT_CACHE_BYTES (2048ull * 1024ull * 1024ull)
 #define DS4_METAL_MAX_PENDING_STREAM_ADVISE 8192u
 
 typedef struct {
@@ -199,6 +207,7 @@ typedef struct {
     uint64_t model_offset;
     uint64_t bytes;
     uint64_t last_used;
+    bool pinned;
 } ds4_metal_stream_view;
 
 static ds4_metal_stream_view g_stream_views[DS4_METAL_MAX_STREAM_VIEWS];
@@ -216,8 +225,26 @@ static uint32_t g_stream_advise_count;
 static uint64_t g_model_stream_pending_advise_bytes;
 static uint64_t g_model_stream_advised_bytes;
 
+typedef struct {
+    __strong id<MTLBuffer> buffer;
+    const void *model_map;
+    uint64_t model_size;
+    uint64_t tensor_offset;
+    uint64_t expert_bytes;
+    uint64_t bytes;
+    uint64_t last_used;
+    uint32_t n_expert;
+    int32_t selected_ids[6];
+} ds4_metal_compact_expert_cache_entry;
+
+static ds4_metal_compact_expert_cache_entry
+    g_compact_expert_cache[DS4_METAL_MAX_COMPACT_EXPERT_CACHE];
+static uint32_t g_compact_expert_cache_count;
+static uint64_t g_compact_expert_cache_clock;
+
 static void ds4_metal_stream_queue_advise(const void *model_map, uint64_t model_offset, uint64_t bytes);
 static void ds4_metal_stream_drain_advise(void);
+static void ds4_metal_compact_expert_cache_clear(void);
 
 @interface DS4MetalTensor : NSObject
 @property(nonatomic, strong) id<MTLBuffer> buffer;
@@ -386,6 +413,7 @@ static void ds4_metal_stream_views_clear(void) {
         g_stream_views[i].model_offset = 0;
         g_stream_views[i].bytes = 0;
         g_stream_views[i].last_used = 0;
+        g_stream_views[i].pinned = false;
     }
     g_stream_view_count = 0;
     g_model_stream_live_bytes = 0;
@@ -413,6 +441,24 @@ static uint64_t ds4_metal_stream_ram_budget_bytes(void) {
                                           DS4_METAL_STREAM_DEFAULT_RAM_BYTES / (1024ull * 1024ull),
                                           256,
                                           1024ull * 1024ull);
+    return mb * 1024ull * 1024ull;
+}
+
+static uint64_t ds4_metal_stream_pin_max_bytes(void) {
+    const uint64_t mb = ds4_metal_env_u64("DS4_METAL_STREAM_PIN_MAX_MB",
+                                          0,
+                                          0,
+                                          1024ull);
+    return mb * 1024ull * 1024ull;
+}
+
+static uint64_t ds4_metal_compact_expert_cache_budget_bytes(void) {
+    const uint64_t max_mb = ds4_metal_stream_ram_budget_bytes() / (1024ull * 1024ull);
+    const uint64_t mb = ds4_metal_env_u64("DS4_METAL_COMPACT_EXPERT_CACHE_MB",
+                                          DS4_METAL_COMPACT_EXPERT_DEFAULT_CACHE_BYTES /
+                                              (1024ull * 1024ull),
+                                          0,
+                                          max_mb);
     return mb * 1024ull * 1024ull;
 }
 
@@ -467,6 +513,95 @@ static void ds4_metal_stream_drain_advise(void) {
     }
     g_stream_advise_count = 0;
     g_model_stream_pending_advise_bytes = 0;
+}
+
+static uint64_t ds4_metal_stream_pinned_live_bytes(void) {
+    uint64_t bytes = 0;
+    for (uint32_t i = 0; i < g_stream_view_count; i++) {
+        if (g_stream_views[i].pinned) bytes += g_stream_views[i].bytes;
+    }
+    return bytes;
+}
+
+static void ds4_metal_compact_expert_cache_clear(void) {
+    for (uint32_t i = 0; i < g_compact_expert_cache_count; i++) {
+        g_compact_expert_cache[i].buffer = nil;
+        g_compact_expert_cache[i].model_map = NULL;
+        g_compact_expert_cache[i].model_size = 0;
+        g_compact_expert_cache[i].tensor_offset = 0;
+        g_compact_expert_cache[i].expert_bytes = 0;
+        g_compact_expert_cache[i].bytes = 0;
+        g_compact_expert_cache[i].last_used = 0;
+        g_compact_expert_cache[i].n_expert = 0;
+        memset(g_compact_expert_cache[i].selected_ids, 0,
+               sizeof(g_compact_expert_cache[i].selected_ids));
+    }
+    g_compact_expert_cache_count = 0;
+    g_compact_expert_cache_live_bytes = 0;
+}
+
+static int ds4_metal_compact_ids_match(
+        const int32_t *a,
+        const int32_t *b,
+        uint32_t       n_expert) {
+    for (uint32_t i = 0; i < n_expert; i++) {
+        if (a[i] != b[i]) return 0;
+    }
+    return 1;
+}
+
+static void ds4_metal_compact_ids_sort(int32_t *ids, uint32_t n_expert) {
+    for (uint32_t i = 1; i < n_expert; i++) {
+        int32_t v = ids[i];
+        uint32_t j = i;
+        while (j > 0 && ids[j - 1] > v) {
+            ids[j] = ids[j - 1];
+            j--;
+        }
+        ids[j] = v;
+    }
+}
+
+static void ds4_metal_compact_expert_cache_drop(uint32_t slot) {
+    if (slot >= g_compact_expert_cache_count) return;
+    ds4_metal_compact_expert_cache_entry *entry = &g_compact_expert_cache[slot];
+    if (entry->bytes <= g_compact_expert_cache_live_bytes) {
+        g_compact_expert_cache_live_bytes -= entry->bytes;
+    } else {
+        g_compact_expert_cache_live_bytes = 0;
+    }
+    entry->buffer = nil;
+    g_compact_expert_cache_evict_count++;
+    const uint32_t last = g_compact_expert_cache_count - 1;
+    if (slot != last) g_compact_expert_cache[slot] = g_compact_expert_cache[last];
+    g_compact_expert_cache[last].buffer = nil;
+    g_compact_expert_cache[last].model_map = NULL;
+    g_compact_expert_cache[last].model_size = 0;
+    g_compact_expert_cache[last].tensor_offset = 0;
+    g_compact_expert_cache[last].expert_bytes = 0;
+    g_compact_expert_cache[last].bytes = 0;
+    g_compact_expert_cache[last].last_used = 0;
+    g_compact_expert_cache[last].n_expert = 0;
+    memset(g_compact_expert_cache[last].selected_ids, 0,
+           sizeof(g_compact_expert_cache[last].selected_ids));
+    g_compact_expert_cache_count--;
+}
+
+static void ds4_metal_compact_expert_cache_trim(uint64_t needed_bytes) {
+    const uint64_t budget = ds4_metal_compact_expert_cache_budget_bytes();
+    while (g_compact_expert_cache_count != 0 &&
+           (g_compact_expert_cache_count >= DS4_METAL_MAX_COMPACT_EXPERT_CACHE ||
+            needed_bytes > budget ||
+            g_compact_expert_cache_live_bytes > budget - needed_bytes)) {
+        uint32_t slot = 0;
+        for (uint32_t i = 1; i < g_compact_expert_cache_count; i++) {
+            if (g_compact_expert_cache[i].last_used <
+                g_compact_expert_cache[slot].last_used) {
+                slot = i;
+            }
+        }
+        ds4_metal_compact_expert_cache_drop(slot);
+    }
 }
 
 static void ds4_metal_model_residency_clear(void) {
@@ -1219,16 +1354,26 @@ void ds4_metal_print_memory_report(const char *label) {
             ds4_metal_mib(g_tensor_alloc_peak_bytes));
     if (g_model_streaming) {
         fprintf(stderr,
-                "ds4:   streamed mmap model wrappers %llu created, %.2f GiB cumulative, %.2f MiB live, %.2f MiB peak, %.2f MiB pending advise, %.2f GiB advised, hits %llu, evictions %llu (not copied, budget %.2f GiB)\n",
+                "ds4:   streamed mmap model wrappers %llu created, %.2f GiB cumulative, %.2f MiB live (%.2f MiB pinned), %.2f MiB peak, %.2f MiB pending advise, %.2f GiB advised, hits %llu, evictions %llu, pinned %llu (not copied, budget %.2f GiB)\n",
                 (unsigned long long)g_model_wrap_count,
                 ds4_metal_gib(g_model_wrap_bytes),
                 ds4_metal_mib(g_model_stream_live_bytes),
+                ds4_metal_mib(ds4_metal_stream_pinned_live_bytes()),
                 ds4_metal_mib(g_model_stream_peak_bytes),
                 ds4_metal_mib(g_model_stream_pending_advise_bytes),
                 ds4_metal_gib(g_model_stream_advised_bytes),
                 (unsigned long long)g_model_stream_hit_count,
                 (unsigned long long)g_model_stream_evict_count,
+                (unsigned long long)g_model_stream_pinned_count,
                 ds4_metal_gib(ds4_metal_stream_ram_budget_bytes()));
+        fprintf(stderr,
+                "ds4:   compact expert cache %.2f MiB live, %.2f MiB peak, hits %llu, misses %llu, evictions %llu (budget %.2f MiB)\n",
+                ds4_metal_mib(g_compact_expert_cache_live_bytes),
+                ds4_metal_mib(g_compact_expert_cache_peak_bytes),
+                (unsigned long long)g_compact_expert_cache_hit_count,
+                (unsigned long long)g_compact_expert_cache_miss_count,
+                (unsigned long long)g_compact_expert_cache_evict_count,
+                ds4_metal_mib(ds4_metal_compact_expert_cache_budget_bytes()));
     } else {
         fprintf(stderr,
                 "ds4:   mmap model wrapper spans %llu buffers %.2f GiB total, %.2f GiB max (not copied)\n",
@@ -4209,6 +4354,12 @@ void ds4_metal_cleanup(void) {
         g_model_stream_evict_count = 0;
         g_model_stream_live_bytes = 0;
         g_model_stream_peak_bytes = 0;
+        g_model_stream_pinned_count = 0;
+        g_compact_expert_cache_hit_count = 0;
+        g_compact_expert_cache_miss_count = 0;
+        g_compact_expert_cache_evict_count = 0;
+        g_compact_expert_cache_live_bytes = 0;
+        g_compact_expert_cache_peak_bytes = 0;
         g_model_stream_pending_advise_bytes = 0;
         g_model_stream_advised_bytes = 0;
         g_stream_advise_count = 0;
@@ -4216,6 +4367,7 @@ void ds4_metal_cleanup(void) {
         ds4_metal_model_residency_clear();
         ds4_metal_model_views_clear();
         ds4_metal_stream_views_clear();
+        ds4_metal_compact_expert_cache_clear();
         ds4_metal_stream_drain_advise();
         [g_pipeline_cache removeAllObjects];
         g_pipeline_cache = nil;
@@ -4506,6 +4658,8 @@ int ds4_metal_set_model_map_range(const void *model_map, uint64_t model_size, ui
         if (g_model_streaming) {
             ds4_metal_model_residency_clear();
             ds4_metal_model_views_clear();
+            ds4_metal_stream_views_clear();
+            ds4_metal_compact_expert_cache_clear();
 #if defined(POSIX_MADV_RANDOM)
             (void)posix_madvise((void *)((const uint8_t *)model_map + map_offset),
                                 (size_t)map_size,
@@ -4516,10 +4670,12 @@ int ds4_metal_set_model_map_range(const void *model_map, uint64_t model_size, ui
             g_model_mapped_offset = map_offset;
             g_model_mapped_size = map_size;
             fprintf(stderr,
-                    "ds4: Metal streaming model weights on demand (cache=%u windows, window=%llu MiB, budget=%llu MiB)\n",
+                    "ds4: Metal streaming model weights on demand (cache=%u windows, window=%llu MiB, budget=%llu MiB, pin<=%llu MiB, compact-cache=%llu MiB)\n",
                     ds4_metal_stream_cache_limit(),
                     (unsigned long long)(ds4_metal_stream_window_bytes(1) / (1024ull * 1024ull)),
-                    (unsigned long long)(ds4_metal_stream_ram_budget_bytes() / (1024ull * 1024ull)));
+                    (unsigned long long)(ds4_metal_stream_ram_budget_bytes() / (1024ull * 1024ull)),
+                    (unsigned long long)(ds4_metal_stream_pin_max_bytes() / (1024ull * 1024ull)),
+                    (unsigned long long)(ds4_metal_compact_expert_cache_budget_bytes() / (1024ull * 1024ull)));
             return 1;
         }
 
@@ -4558,6 +4714,7 @@ void ds4_metal_set_model_streaming(bool enabled) {
     ds4_metal_model_residency_clear();
     ds4_metal_model_views_clear();
     ds4_metal_stream_views_clear();
+    ds4_metal_compact_expert_cache_clear();
 }
 
 int ds4_metal_model_streaming_enabled(void) {
@@ -4630,9 +4787,20 @@ static id<MTLBuffer> ds4_metal_stream_model_range(
     uint32_t slot = g_stream_view_count;
     const uint32_t limit = ds4_metal_stream_cache_limit();
     if (slot >= limit) {
-        slot = 0;
-        for (uint32_t i = 1; i < g_stream_view_count; i++) {
-            if (g_stream_views[i].last_used < g_stream_views[slot].last_used) slot = i;
+        bool found_unpinned = false;
+        for (uint32_t i = 0; i < g_stream_view_count; i++) {
+            if (g_stream_views[i].pinned) continue;
+            if (!found_unpinned ||
+                g_stream_views[i].last_used < g_stream_views[slot].last_used) {
+                slot = i;
+                found_unpinned = true;
+            }
+        }
+        if (!found_unpinned) {
+            slot = 0;
+            for (uint32_t i = 1; i < g_stream_view_count; i++) {
+                if (g_stream_views[i].last_used < g_stream_views[slot].last_used) slot = i;
+            }
         }
         if (g_stream_views[slot].bytes <= g_model_stream_live_bytes) {
             g_model_stream_live_bytes -= g_stream_views[slot].bytes;
@@ -4643,6 +4811,7 @@ static id<MTLBuffer> ds4_metal_stream_model_range(
                                       g_stream_views[slot].model_offset,
                                       g_stream_views[slot].bytes);
         g_stream_views[slot].buffer = nil;
+        g_stream_views[slot].pinned = false;
         g_model_stream_evict_count++;
     } else {
         g_stream_view_count++;
@@ -4675,6 +4844,10 @@ static id<MTLBuffer> ds4_metal_stream_model_range(
     g_stream_views[slot].model_offset = view_offset;
     g_stream_views[slot].bytes = view_bytes;
     g_stream_views[slot].last_used = ++g_stream_view_clock;
+    g_stream_views[slot].pinned =
+        ds4_metal_stream_pin_max_bytes() != 0 &&
+        required <= ds4_metal_stream_pin_max_bytes();
+    if (g_stream_views[slot].pinned) g_model_stream_pinned_count++;
 
     g_model_stream_live_bytes += view_bytes;
     if (g_model_stream_live_bytes > g_model_stream_peak_bytes) {
@@ -4730,14 +4903,15 @@ static bool ds4_metal_compact_stream_experts_enabled(void) {
            getenv("DS4_METAL_DISABLE_COMPACT_EXPERTS") == NULL;
 }
 
-static id<MTLBuffer> ds4_metal_compact_expert_buffer(
+static id<MTLBuffer> ds4_metal_compact_expert_buffer_uncached(
         const void    *model_map,
         uint64_t       model_size,
         uint64_t       tensor_offset,
         uint64_t       expert_bytes,
         uint32_t       n_expert,
         const int32_t *selected_ids,
-        const char    *label) {
+        const char    *label,
+        bool           transient) {
     if (!model_map || !selected_ids || expert_bytes == 0 || n_expert == 0 ||
         n_expert > 6 || expert_bytes > UINT64_MAX / n_expert) {
         return nil;
@@ -4745,8 +4919,12 @@ static id<MTLBuffer> ds4_metal_compact_expert_buffer(
 
     const uint64_t compact_bytes = expert_bytes * n_expert;
     if (compact_bytes > (uint64_t)NSUIntegerMax) return nil;
-    id<MTLBuffer> compact = ds4_metal_new_transient_buffer((NSUInteger)compact_bytes, label);
+    id<MTLBuffer> compact = transient ?
+        ds4_metal_new_transient_buffer((NSUInteger)compact_bytes, label) :
+        [g_device newBufferWithLength:(NSUInteger)compact_bytes
+                              options:MTLResourceStorageModeShared];
     if (!compact) return nil;
+    if (!transient && label) compact.label = [NSString stringWithUTF8String:label];
 
     uint8_t *dst = (uint8_t *)[compact contents];
     const uint8_t *src = (const uint8_t *)model_map;
@@ -4768,14 +4946,97 @@ static id<MTLBuffer> ds4_metal_compact_expert_buffer(
     return compact;
 }
 
+static id<MTLBuffer> ds4_metal_compact_expert_buffer(
+        const void    *model_map,
+        uint64_t       model_size,
+        uint64_t       tensor_offset,
+        uint64_t       expert_bytes,
+        uint32_t       n_expert,
+        const int32_t *selected_ids,
+        const char    *label) {
+    if (n_expert == 0 || n_expert > 6 || expert_bytes > UINT64_MAX / n_expert) {
+        return nil;
+    }
+    const uint64_t compact_bytes = expert_bytes * n_expert;
+    const uint64_t budget = ds4_metal_compact_expert_cache_budget_bytes();
+    if (budget == 0 || compact_bytes == 0 || compact_bytes > budget) {
+        if (budget != 0) g_compact_expert_cache_miss_count++;
+        return ds4_metal_compact_expert_buffer_uncached(model_map, model_size,
+                                                        tensor_offset, expert_bytes,
+                                                        n_expert, selected_ids,
+                                                        label, true);
+    }
+
+    for (uint32_t i = 0; i < g_compact_expert_cache_count; i++) {
+        ds4_metal_compact_expert_cache_entry *entry = &g_compact_expert_cache[i];
+        if (entry->buffer &&
+            entry->model_map == model_map &&
+            entry->model_size == model_size &&
+            entry->tensor_offset == tensor_offset &&
+            entry->expert_bytes == expert_bytes &&
+            entry->n_expert == n_expert &&
+            ds4_metal_compact_ids_match(entry->selected_ids, selected_ids, n_expert)) {
+            entry->last_used = ++g_compact_expert_cache_clock;
+            g_compact_expert_cache_hit_count++;
+            return entry->buffer;
+        }
+    }
+
+    g_compact_expert_cache_miss_count++;
+    ds4_metal_compact_expert_cache_trim(compact_bytes);
+    if (g_compact_expert_cache_count >= DS4_METAL_MAX_COMPACT_EXPERT_CACHE ||
+        compact_bytes > budget ||
+        g_compact_expert_cache_live_bytes > budget - compact_bytes) {
+        return ds4_metal_compact_expert_buffer_uncached(model_map, model_size,
+                                                        tensor_offset, expert_bytes,
+                                                        n_expert, selected_ids,
+                                                        label, true);
+    }
+
+    id<MTLBuffer> compact =
+        ds4_metal_compact_expert_buffer_uncached(model_map, model_size,
+                                                 tensor_offset, expert_bytes,
+                                                 n_expert, selected_ids,
+                                                 label, false);
+    if (!compact) return nil;
+
+    ds4_metal_compact_expert_cache_entry *entry =
+        &g_compact_expert_cache[g_compact_expert_cache_count++];
+    entry->buffer = compact;
+    entry->model_map = model_map;
+    entry->model_size = model_size;
+    entry->tensor_offset = tensor_offset;
+    entry->expert_bytes = expert_bytes;
+    entry->bytes = compact_bytes;
+    entry->last_used = ++g_compact_expert_cache_clock;
+    entry->n_expert = n_expert;
+    for (uint32_t i = 0; i < n_expert; i++) entry->selected_ids[i] = selected_ids[i];
+    g_compact_expert_cache_live_bytes += compact_bytes;
+    if (g_compact_expert_cache_live_bytes > g_compact_expert_cache_peak_bytes) {
+        g_compact_expert_cache_peak_bytes = g_compact_expert_cache_live_bytes;
+    }
+    return compact;
+}
+
 static id<MTLBuffer> ds4_metal_compact_selected_id_buffer(
         uint32_t n_expert,
+        const int32_t *selected_ids,
+        const int32_t *compact_ids,
         const char *label) {
-    if (n_expert == 0 || n_expert > 6) return nil;
+    if (n_expert == 0 || n_expert > 6 || !selected_ids || !compact_ids) return nil;
     id<MTLBuffer> compact = ds4_metal_new_transient_buffer((NSUInteger)n_expert * sizeof(int32_t), label);
     if (!compact) return nil;
     int32_t *ids = (int32_t *)[compact contents];
-    for (uint32_t i = 0; i < n_expert; i++) ids[i] = (int32_t)i;
+    for (uint32_t i = 0; i < n_expert; i++) {
+        ids[i] = -1;
+        for (uint32_t j = 0; j < n_expert; j++) {
+            if (selected_ids[i] == compact_ids[j]) {
+                ids[i] = (int32_t)j;
+                break;
+            }
+        }
+        if (ids[i] < 0) return nil;
+    }
     return compact;
 }
 
@@ -13064,6 +13325,7 @@ int ds4_metal_routed_moe_one_tensor(
             const int32_t *selected_ids =
                 (const int32_t *)((const uint8_t *)[selectedbuf contents] + selected_offset);
             for (uint32_t i = 0; i < n_expert; i++) compact_ids[i] = selected_ids[i];
+            ds4_metal_compact_ids_sort(compact_ids, n_expert);
             gate_buf = ds4_metal_compact_expert_buffer(model_map, model_size, gate_offset,
                                                        gate_expert_bytes, n_expert,
                                                        compact_ids, "ds4_moe_gate_compact");
@@ -13073,7 +13335,10 @@ int ds4_metal_routed_moe_one_tensor(
             down_buf = ds4_metal_compact_expert_buffer(model_map, model_size, down_offset,
                                                        down_expert_bytes, n_expert,
                                                        compact_ids, "ds4_moe_down_compact");
-            selectedbuf = ds4_metal_compact_selected_id_buffer(n_expert, "ds4_moe_selected_compact");
+            selectedbuf = ds4_metal_compact_selected_id_buffer(n_expert,
+                                                               selected_ids,
+                                                               compact_ids,
+                                                               "ds4_moe_selected_compact");
             selected_offset = 0;
             src0_experts = n_expert;
         } else {
