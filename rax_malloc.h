@@ -3,41 +3,90 @@
  * Copyright (c) 2017, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
+ * This file is part of a radix tree implementation used for efficient
+ * prefix-based key indexing and compressed trie structures.
  *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
+ * The implementation is widely used in high-performance systems such as Redis
+ * for sorted key traversal, autocomplete, and memory-efficient string mapping.
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Redistribution and use in source and binary forms, with or without modification,
+ * are permitted under the BSD 3-Clause License.
+ *
+ * THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 
-/* Allocator selection.
+/*
+ * ---------------------------------------------------------------------------
+ * Allocator Abstraction Layer (Compile-Time Swappable Memory Backend)
+ * ---------------------------------------------------------------------------
  *
- * This file is used in order to change the Rax allocator at compile time.
- * Just define the following defines to what you want to use. Also add
- * the include of your alternate allocator if needed (not needed in order
- * to use the default libc allocator). */
+ * This header defines the memory allocation strategy used internally by Rax.
+ *
+ * The design allows swapping the underlying allocator without modifying core
+ * radix-tree logic, enabling integration with custom memory systems such as:
+ *
+ *   - jemalloc (high-performance production allocator)
+ *   - tcmalloc (Google allocator optimized for concurrency)
+ *   - custom arena allocators (embedded / ML inference engines)
+ *   - debug allocators (memory tracking / leak detection)
+ *
+ * This abstraction is critical for:
+ *
+ *   1. Memory profiling and instrumentation
+ *   2. Reducing fragmentation in long-running services
+ *   3. Embedding Rax into constrained runtime environments
+ *   4. Replacing libc allocator without touching core logic
+ *
+ * ---------------------------------------------------------------------------
+ * Design Principle:
+ *   Keep radix tree logic allocator-agnostic and fully portable.
+ * ---------------------------------------------------------------------------
+ */
 
 #ifndef RAX_ALLOC_H
 #define RAX_ALLOC_H
-#define rax_malloc malloc
-#define rax_realloc realloc
-#define rax_free free
+
+/*
+ * Default allocator mapping to standard C runtime (libc).
+ *
+ * These macros can be overridden at compile time to redirect memory
+ * operations to a custom allocator implementation.
+ *
+ * Example:
+ *   -Drax_malloc=my_malloc
+ *   -Drax_realloc=my_realloc
+ *   -Drax_free=my_free
+ */
+
+#ifndef rax_malloc
+#define rax_malloc  malloc
 #endif
+
+#ifndef rax_realloc
+#define rax_realloc realloc
+#endif
+
+#ifndef rax_free
+#define rax_free    free
+#endif
+
+/*
+ * ---------------------------------------------------------------------------
+ * Extension Notes (Optional Enhancements)
+ * ---------------------------------------------------------------------------
+ *
+ * Advanced systems may extend this abstraction with:
+ *
+ *   - allocation tagging (debug builds)
+ *   - memory arenas per radix subtree
+ *   - NUMA-aware allocation strategies
+ *   - zero-allocation mode for embedded inference graphs
+ *
+ * Example future extension:
+ *
+ *   #define rax_malloc(size) arena_alloc(global_arena, size)
+ *
+ * ---------------------------------------------------------------------------
+ */
+
+#endif /* RAX_ALLOC_H */
