@@ -51,6 +51,8 @@ Representative rows only. The CSV keeps the full exploration history.
 | 24 GiB stream-heavy | 24576 | 9216 | 9216 | 6144 | 8 | 0.72 | 8.25 | 2743 | 0 | More stream budget does not improve reuse. |
 | 24 GiB optimized | 24576 | 8192 | 8192 | 8192 | 8 | 0.83 | 7.72 | 2751 | 0 | Direct-source compact misses; current fastest 8-token split. |
 | 24 GiB optimized, longer check | 24576 | 8192 | 8192 | 8192 | 16 | 0.82 | 7.72 | 3116 | 0 | Stopped early at EOS but confirms the optimized split. |
+| 24 GiB wider stream window | 24576 | 8192 | 8192 | 8192 | 8 | 0.46 | 7.72 | 2597 | 0 | 16 MiB windows overfetch and regress despite fewer wrappers. |
+| 24 GiB low hot residency | 24576 | 4096 | 12288 | 8192 | 8 | 0.54 | 4.05 | 4674 | 0 | Lower RSS but far more streaming churn. |
 
 ## Conclusions
 
@@ -78,6 +80,9 @@ stream-view budget, final stream evictions stay around 2740 and stream hits stay
 around 75. That means larger stream residency alone is not turning into reuse;
 the remaining cost is likely repeated per-token wrapping, blit/gather work, and
 page churn for ranges that are not naturally reused by the current cache shape.
+Increasing stream slots from 32 to 64 lowered evictions slightly but measured
+0.81 tok/s, below the 32-slot baseline. Increasing the stream window to 16 MiB
+reduced wrapper count but overfetched enough to drop decode to 0.46 tok/s.
 
 **24 GiB Envelope**
 
@@ -86,6 +91,17 @@ misses, the best 24 GiB split is `8 GiB hot + 8 GiB stream + 8 GiB compact` at
 0.83 tok/s for the 8-token run and 0.82 tok/s in the longer EOS-terminated
 check. Larger stream allocations and the 9 GiB hot plan do not improve tok/s on
 this prompt.
+
+**Route / Compact / Gather**
+
+The current sorted compact gather remains the best measured route through the
+routed MoE path. Two targeted experiments were rejected: using CPU-known hash
+route IDs to avoid the first three layer readbacks measured 0.78 tok/s, and
+preserving router order in compact buffers measured 0.77 tok/s. The sorted
+compact IDs appear to help source/cache locality more than route-order compact
+layout helps the matvec kernels. Reusing private compact scratch buffers was
+also tested and regressed to 0.80 tok/s; disabling that experiment returned the
+same binary to 0.83 tok/s, so the code was removed.
 
 ## Failed Configurations
 
@@ -122,9 +138,9 @@ this prompt.
   increasing cache sizes. The latest code avoids the old cold-miss dependency
   chain of `source -> cached slice -> compact` by copying cold misses directly
   from the source view into the compact buffer while still populating the cache.
-  Remaining candidates are deeper: avoid the per-layer CPU route read, or fuse
-  more route/gather/compute work on GPU without falling back to full-expert
-  stream views.
+  The latest rejected experiments show that small route/readback or allocation
+  changes are not enough; remaining candidates are deeper GPU-side
+  gather/compute fusion without falling back to full-expert stream views.
 
 ## Columns
 
