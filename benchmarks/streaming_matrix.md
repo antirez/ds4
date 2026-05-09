@@ -35,8 +35,8 @@ The largest local test envelope we currently allow is:
 make test-constrained-ram-24gb
 ```
 
-with `RAM_TEST_MB=24576`, `RAM_TEST_RESIDENT_HOT_MB=9216`,
-`RAM_TEST_STREAM_CACHE_RAM_MB=7168`, and `RAM_TEST_COMPACT_CACHE_MB=8192`.
+with `RAM_TEST_MB=24576`, `RAM_TEST_RESIDENT_HOT_MB=8192`,
+`RAM_TEST_STREAM_CACHE_RAM_MB=8192`, and `RAM_TEST_COMPACT_CACHE_MB=8192`.
 
 ## Snapshot
 
@@ -49,6 +49,8 @@ Representative rows only. The CSV keeps the full exploration history.
 | 16 GiB more compact | 16384 | 8192 | 2048 | 6144 | 8 | 0.77 | 7.72 | 2751 | 0 | Compact evictions disappear, stream churn remains. |
 | 24 GiB balanced | 24576 | 9216 | 7168 | 8192 | 8 | 0.77 | 8.25 | 2743 | 0 | All non-expert hot ranges fit; extra compact budget is unused. |
 | 24 GiB stream-heavy | 24576 | 9216 | 9216 | 6144 | 8 | 0.72 | 8.25 | 2743 | 0 | More stream budget does not improve reuse. |
+| 24 GiB optimized | 24576 | 8192 | 8192 | 8192 | 8 | 0.83 | 7.72 | 2751 | 0 | Direct-source compact misses; current fastest 8-token split. |
+| 24 GiB optimized, longer check | 24576 | 8192 | 8192 | 8192 | 16 | 0.82 | 7.72 | 3116 | 0 | Stopped early at EOS but confirms the optimized split. |
 
 ## Conclusions
 
@@ -65,9 +67,9 @@ selecting another tensor class.
 
 The compact expert cache is useful, but only up to the active expert working set.
 At 4 GiB it still evicts 1024 entries in the 8-token run. At 6 GiB it removes
-compact evictions and improves generation from 0.74 to 0.77 tok/s. Raising it
-to 8 GiB does not help this prompt because the observed compact live set tops
-out at about 6.12 GiB.
+compact evictions and improves generation from 0.74 to 0.77 tok/s. An 8 GiB
+budget leaves headroom for slightly longer or different prompts; the 16-token
+optimized check reaches 6.79 GiB compact live.
 
 **Stream-View Cache**
 
@@ -79,11 +81,11 @@ page churn for ranges that are not naturally reused by the current cache shape.
 
 **24 GiB Envelope**
 
-The 24 GiB ceiling is safe in the tested splits, but it is not yet a speed win.
-The best 24 GiB split tested here ties the 16 GiB `8 + 2 + 6` split at 0.77
-tok/s, while the stream-heavy 24 GiB split regresses to 0.72 tok/s. The current
-default should stay conservative until we change what is cached, not just how
-much is cached.
+The 24 GiB ceiling is safe in the tested splits. After optimizing compact-cache
+misses, the best 24 GiB split is `8 GiB hot + 8 GiB stream + 8 GiB compact` at
+0.83 tok/s for the 8-token run and 0.82 tok/s in the longer EOS-terminated
+check. Larger stream allocations and the 9 GiB hot plan do not improve tok/s on
+this prompt.
 
 ## Failed Configurations
 
@@ -101,9 +103,11 @@ much is cached.
 - Moving 2 GiB from stream views to compact experts eliminates compact-cache
   evictions and improves generation slightly to 0.77 tok/s, but stream evictions
   remain high.
-- The useful 24 GiB ceiling does not currently translate into a clear speed win.
-  A `9 GiB hot + 8 GiB compact + 7 GiB stream` split also lands at 0.77 tok/s.
-  A stream-heavy `9 + 6 + 9` split regresses to 0.72 tok/s.
+- The useful 24 GiB ceiling now provides a modest speed win after the
+  direct-source compact miss optimization. The representative 24 GiB split is
+  `8 GiB hot + 8 GiB compact + 8 GiB stream`, which reaches 0.83 tok/s. A
+  stream-heavy `8 + 6 + 10` split ties on this prompt but leaves less compact
+  headroom.
 - The hot planner can cover all currently selected non-expert ranges with about
   8.20 GiB resident. Raising hot residency beyond 9 GiB will not help unless the
   planner starts selecting routed expert ranges or another hot tensor class.
@@ -112,11 +116,15 @@ much is cached.
   stream hits stay around 75-78 on these 8-token runs while final stream
   evictions remain around 2740-2870.
 - Compact expert eviction is also tracked. A 6 GiB compact expert budget is
-  enough for this prompt; 8 GiB leaves unused budget.
+  enough for the 8-token prompt, but 8 GiB is the safer 24 GiB setting because
+  the longer check reaches 6.79 GiB compact live.
 - The next likely speed path is reducing per-token streaming/blit work, not just
-  increasing cache sizes. Candidate work: cache or batch the routed expert
-  gather by layer/token, fuse more route/gather/compute work on GPU, or extend
-  residency planning to selected expert slices when expert reuse is predictable.
+  increasing cache sizes. The latest code avoids the old cold-miss dependency
+  chain of `source -> cached slice -> compact` by copying cold misses directly
+  from the source view into the compact buffer while still populating the cache.
+  Remaining candidates are deeper: avoid the per-layer CPU route read, or fuse
+  more route/gather/compute work on GPU without falling back to full-expert
+  stream views.
 
 ## Columns
 

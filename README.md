@@ -21,8 +21,10 @@ weight envelope. The current experimental split assumes
 and `DS4_METAL_STREAM_CACHE_RAM_MB=4096` for transient mmap-backed Metal weight
 windows. Treat 24 GiB (`DS4_METAL_STREAM_RAM_MB=24576`) as the current hard
 local test ceiling; anything above that is intentionally out of scope for this
-branch. Set `DS4_METAL_RESIDENCY_PLAN_DUMP=1` to print the selected permanent
-hot ranges at startup.
+branch. The current 24 GiB test target uses an even `8192/8192/8192` split
+across hot ranges, compact experts, and transient stream views. Set
+`DS4_METAL_RESIDENCY_PLAN_DUMP=1` to print the selected permanent hot ranges at
+startup.
 
 This project would not exist without **llama.cpp and GGML**, make sure to read
 the acknowledgements section, a big thank you to Georgi Gerganov and all the

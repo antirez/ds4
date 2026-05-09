@@ -17,6 +17,7 @@ RAM_TEST_CTX ?= 256
 RAM_TEST_TOKENS ?= 2
 RAM_TEST_PROMPT ?= Hi
 RAM_TEST_ARGS ?= --stream-weights --nothink --temp 0
+RAM_TEST_EXTRA_ENV ?=
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
@@ -85,7 +86,7 @@ test-constrained-ram: ds4
 	    DS4_METAL_COMPACT_EXPERT_CACHE_MB=$(RAM_TEST_COMPACT_CACHE_MB) \
 	    DS4_METAL_NO_RESIDENCY=1 \
 	    DS4_METAL_MEMORY_REPORT=1 \
-	    /usr/bin/time -l ./ds4 $(RAM_TEST_ARGS) \
+	    $(RAM_TEST_EXTRA_ENV) /usr/bin/time -l ./ds4 $(RAM_TEST_ARGS) \
 	        --ctx $(RAM_TEST_CTX) \
 	        --tokens $(RAM_TEST_TOKENS) \
 	        -p '$(RAM_TEST_PROMPT)'
@@ -93,8 +94,8 @@ test-constrained-ram: ds4
 test-constrained-ram-24gb:
 	$(MAKE) test-constrained-ram \
 	    RAM_TEST_MB=24576 \
-	    RAM_TEST_RESIDENT_HOT_MB=9216 \
-	    RAM_TEST_STREAM_CACHE_RAM_MB=7168 \
+	    RAM_TEST_RESIDENT_HOT_MB=8192 \
+	    RAM_TEST_STREAM_CACHE_RAM_MB=8192 \
 	    RAM_TEST_COMPACT_CACHE_MB=8192
 
 test-constrained-ram-matrix: ds4

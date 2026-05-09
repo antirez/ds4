@@ -5133,7 +5133,9 @@ static id<MTLBuffer> ds4_metal_cached_expert_slice_buffer_blit(
         uint64_t                   tensor_offset,
         uint64_t                   expert_bytes,
         int32_t                    expert_id,
-        const char                *label) {
+        const char                *label,
+        uint64_t                  *source_inner_out) {
+    if (source_inner_out) *source_inner_out = 0;
     const uint64_t budget = ds4_metal_compact_expert_cache_budget_bytes();
     if (!blit || budget == 0 || expert_bytes == 0 || expert_bytes > budget ||
         expert_id < 0 || expert_id >= 256) {
@@ -5183,6 +5185,7 @@ static id<MTLBuffer> ds4_metal_cached_expert_slice_buffer_blit(
                 toBuffer:slice
        destinationOffset:0
                     size:(NSUInteger)expert_bytes];
+    if (source_inner_out) *source_inner_out = source_inner;
 
     ds4_metal_compact_expert_cache_entry *entry =
         &g_compact_expert_cache[g_compact_expert_cache_count++];
@@ -5199,7 +5202,7 @@ static id<MTLBuffer> ds4_metal_cached_expert_slice_buffer_blit(
     if (g_compact_expert_cache_live_bytes > g_compact_expert_cache_peak_bytes) {
         g_compact_expert_cache_peak_bytes = g_compact_expert_cache_live_bytes;
     }
-    return slice;
+    return source;
 }
 
 static id<MTLBuffer> ds4_metal_compact_expert_buffer_blit(
@@ -5236,7 +5239,8 @@ static id<MTLBuffer> ds4_metal_compact_expert_buffer_blit(
             ds4_metal_cached_expert_slice_buffer_blit(blit,
                                                       model_map, model_size,
                                                       tensor_offset, expert_bytes,
-                                                      expert_id, label);
+                                                      expert_id, label,
+                                                      &source_inner);
         if (!source) {
             source = ds4_metal_wrap_model_range(model_map, model_size,
                                                 expert_offset,
