@@ -36,6 +36,7 @@
 
 static volatile sig_atomic_t g_stop_requested = 0;
 static volatile sig_atomic_t g_listen_fd = -1;
+static bool g_cors_enabled = false;
 
 #define DS4_SERVER_IO_TIMEOUT_SEC 10
 #define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
@@ -2539,6 +2540,39 @@ static bool send_all(int fd, const void *p, size_t n) {
     return true;
 }
 
+static bool cors_request_headers_safe(const char *headers) {
+    if (!headers || !headers[0]) return false;
+    for (const unsigned char *p = (const unsigned char *)headers; *p; p++) {
+        if (isalnum(*p) || *p == ' ' || *p == '\t' || *p == ',' ||
+            *p == '!' || *p == '#' || *p == '$' || *p == '%' ||
+            *p == '&' || *p == '\'' || *p == '*' || *p == '+' ||
+            *p == '-' || *p == '.' || *p == '^' || *p == '_' ||
+            *p == '`' || *p == '|' || *p == '~') {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+static const char *cors_allow_headers(const char *request_headers) {
+    if (cors_request_headers_safe(request_headers)) return request_headers;
+    return "Authorization, Content-Type, Accept, Origin, Anthropic-Version, "
+           "Anthropic-Beta, X-Api-Key, X-Requested-With";
+}
+
+static void append_cors_headers(buf *h, const char *request_headers) {
+    if (!g_cors_enabled) return;
+    buf_puts(h,
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        "Access-Control-Allow-Private-Network: true\r\n"
+        "Access-Control-Max-Age: 86400\r\n"
+        "Access-Control-Allow-Headers: ");
+    buf_puts(h, cors_allow_headers(request_headers));
+    buf_puts(h, "\r\n");
+}
+
 static void json_escape(buf *b, const char *s) {
     buf_putc(b, '"');
     for (; *s; s++) {
@@ -2913,17 +2947,34 @@ static void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const 
 
 static bool http_response(int fd, int code, const char *type, const char *body) {
     const char *reason = code == 200 ? "OK" :
+                         code == 204 ? "No Content" :
                          code == 400 ? "Bad Request" :
                          code == 404 ? "Not Found" :
-                         code == 500 ? "Internal Server Error" : "Error";
+                         code == 500 ? "Internal Server Error" :
+                         code == 503 ? "Service Unavailable" : "Error";
     buf h = {0};
     buf_printf(&h,
         "HTTP/1.1 %d %s\r\n"
-        "Content-Type: %s\r\n"
+        "Content-Type: %s\r\n",
+        code, reason, type);
+    append_cors_headers(&h, NULL);
+    buf_printf(&h,
         "Content-Length: %zu\r\n"
         "Connection: close\r\n\r\n",
-        code, reason, type, strlen(body));
+        strlen(body));
     bool ok = send_all(fd, h.ptr, h.len) && send_all(fd, body, strlen(body));
+    buf_free(&h);
+    return ok;
+}
+
+static bool http_preflight_response(int fd, const char *request_headers) {
+    buf h = {0};
+    buf_puts(&h, "HTTP/1.1 204 No Content\r\n");
+    append_cors_headers(&h, request_headers);
+    buf_puts(&h,
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n\r\n");
+    bool ok = send_all(fd, h.ptr, h.len);
     buf_free(&h);
     return ok;
 }
@@ -2942,12 +2993,16 @@ static bool http_error(int fd, int code, const char *msg) {
  * may produce <think> and DSML tool blocks; clients should receive those as
  * protocol-native reasoning/tool deltas, never as visible assistant text. */
 static bool sse_headers(int fd) {
-    const char *h =
+    buf h = {0};
+    buf_puts(&h,
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/event-stream\r\n"
-        "Cache-Control: no-cache\r\n"
-        "Connection: close\r\n\r\n";
-    return send_all(fd, h, strlen(h));
+        "Cache-Control: no-cache\r\n");
+    append_cors_headers(&h, NULL);
+    buf_puts(&h, "Connection: close\r\n\r\n");
+    bool ok = send_all(fd, h.ptr, h.len);
+    buf_free(&h);
+    return ok;
 }
 
 static bool sse_chunk(int fd, const request *r, const char *id, const char *text, const char *finish) {
@@ -6649,11 +6704,13 @@ static void *worker_main(void *arg) {
 typedef struct {
     char method[8];
     char path[256];
+    char *access_control_request_headers;
     char *body;
     size_t body_len;
 } http_request;
 
 static void http_request_free(http_request *r) {
+    free(r->access_control_request_headers);
     free(r->body);
     memset(r, 0, sizeof(*r));
 }
@@ -6683,6 +6740,27 @@ static long content_length(const char *h, size_t n) {
         if (p < end) p++;
     }
     return 0;
+}
+
+static char *http_header_value_dup(const char *h, size_t n, const char *name) {
+    const size_t name_len = strlen(name);
+    const char *p = h, *end = h + n;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len > name_len && line[name_len] == ':' &&
+            strncasecmp(line, name, name_len) == 0) {
+            const char *v = line + name_len + 1;
+            const char *e = line + len;
+            while (v < e && isspace((unsigned char)*v)) v++;
+            while (e > v && isspace((unsigned char)e[-1])) e--;
+            return xstrndup(v, (size_t)(e - v));
+        }
+        if (p < end) p++;
+    }
+    return NULL;
 }
 
 static bool read_http_request(int fd, http_request *r) {
@@ -6726,6 +6804,8 @@ static bool read_http_request(int fd, http_request *r) {
     r->body = xmalloc(r->body_len + 1);
     memcpy(r->body, b.ptr + hend, r->body_len);
     r->body[r->body_len] = '\0';
+    r->access_control_request_headers =
+        http_header_value_dup(b.ptr, (size_t)hend, "Access-Control-Request-Headers");
     buf_free(&b);
     return true;
 fail:
@@ -6809,6 +6889,12 @@ static void *client_main(void *arg) {
     http_request hr = {0};
     if (!read_http_request(fd, &hr)) {
         http_error(fd, 400, "bad HTTP request");
+        goto done;
+    }
+
+    if (g_cors_enabled && !strcmp(hr.method, "OPTIONS")) {
+        http_preflight_response(fd, hr.access_control_request_headers);
+        http_request_free(&hr);
         goto done;
     }
 
@@ -6933,6 +7019,7 @@ typedef struct {
     bool kv_cache_reject_different_quant;
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
+    bool enable_cors;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -7033,6 +7120,8 @@ static void usage(FILE *fp) {
         "      Bind port. Default: 8000\n"
         "  --trace FILE\n"
         "      Write a human-readable session trace: prompts, cache decisions, output, tool calls.\n"
+        "  --cors\n"
+        "      Enable permissive CORS headers and OPTIONS preflight responses for browser clients.\n"
         "\n"
         "Thinking and sampling:\n"
         "  DeepSeek-compatible chat requests default to thinking mode with high effort.\n"
@@ -7123,6 +7212,8 @@ static server_config parse_options(int argc, char **argv) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--cors")) {
+            c.enable_cors = true;
         } else if (!strcmp(arg, "--kv-disk-dir")) {
             c.kv_disk_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
@@ -7177,6 +7268,7 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
 
     server_config cfg = parse_options(argc, argv);
+    g_cors_enabled = cfg.enable_cors;
 
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
@@ -7370,6 +7462,145 @@ static char *read_socket_text(int fd) {
         buf_append(&b, tmp, (size_t)n);
     }
     return buf_take(&b);
+}
+
+static void test_parse_options_cors_flag(void) {
+    char *argv_default[] = {"ds4-server"};
+    server_config c = parse_options(1, argv_default);
+    TEST_ASSERT(!c.enable_cors);
+
+    char *argv_cors[] = {"ds4-server", "--cors"};
+    c = parse_options(2, argv_cors);
+    TEST_ASSERT(c.enable_cors);
+}
+
+static void test_http_cors_disabled_by_default(void) {
+    bool old_cors_enabled = g_cors_enabled;
+    g_cors_enabled = false;
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        g_cors_enabled = old_cors_enabled;
+        return;
+    }
+    TEST_ASSERT(http_response(sv[0], 200, "application/json", "{}\n"));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "Access-Control-Allow-Origin:") == NULL);
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        g_cors_enabled = old_cors_enabled;
+        return;
+    }
+    TEST_ASSERT(sse_headers(sv[0]));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "Access-Control-Allow-Origin:") == NULL);
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    g_cors_enabled = old_cors_enabled;
+}
+
+static void test_http_cors_headers_when_enabled(void) {
+    bool old_cors_enabled = g_cors_enabled;
+    g_cors_enabled = true;
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        g_cors_enabled = old_cors_enabled;
+        return;
+    }
+    TEST_ASSERT(http_response(sv[0], 200, "application/json", "{}\n"));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "Access-Control-Allow-Origin: *\r\n") != NULL);
+    TEST_ASSERT(strstr(out, "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n") != NULL);
+    TEST_ASSERT(strstr(out, "Access-Control-Allow-Headers: Authorization, Content-Type") != NULL);
+    TEST_ASSERT(strstr(out, "Content-Length: 3\r\n") != NULL);
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        g_cors_enabled = old_cors_enabled;
+        return;
+    }
+    TEST_ASSERT(http_preflight_response(sv[0], "authorization, content-type, x-custom"));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "HTTP/1.1 204 No Content\r\n") != NULL);
+    TEST_ASSERT(strstr(out, "Access-Control-Allow-Headers: authorization, content-type, x-custom\r\n") != NULL);
+    TEST_ASSERT(strstr(out, "Content-Length: 0\r\n") != NULL);
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        g_cors_enabled = old_cors_enabled;
+        return;
+    }
+    TEST_ASSERT(http_preflight_response(sv[0], "x-custom\r\nInjected: nope"));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "Injected: nope") == NULL);
+    TEST_ASSERT(strstr(out, "Access-Control-Allow-Headers: Authorization, Content-Type") != NULL);
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        g_cors_enabled = old_cors_enabled;
+        return;
+    }
+    TEST_ASSERT(sse_headers(sv[0]));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "Content-Type: text/event-stream\r\n") != NULL);
+    TEST_ASSERT(strstr(out, "Access-Control-Allow-Origin: *\r\n") != NULL);
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    g_cors_enabled = old_cors_enabled;
+}
+
+static void test_http_request_parses_cors_preflight_headers(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    const char *req =
+        "OPTIONS /v1/chat/completions HTTP/1.1\r\n"
+        "Host: 127.0.0.1:8000\r\n"
+        "Origin: http://localhost:5173\r\n"
+        "Access-Control-Request-Method: POST\r\n"
+        "Access-Control-Request-Headers: authorization, content-type, x-custom\r\n"
+        "\r\n";
+    TEST_ASSERT(send_all(sv[0], req, strlen(req)));
+    shutdown(sv[0], SHUT_WR);
+
+    http_request hr = {0};
+    TEST_ASSERT(read_http_request(sv[1], &hr));
+    TEST_ASSERT(!strcmp(hr.method, "OPTIONS"));
+    TEST_ASSERT(!strcmp(hr.path, "/v1/chat/completions"));
+    TEST_ASSERT(hr.access_control_request_headers != NULL);
+    TEST_ASSERT(hr.access_control_request_headers &&
+                !strcmp(hr.access_control_request_headers,
+                        "authorization, content-type, x-custom"));
+    http_request_free(&hr);
+    close(sv[0]);
+    close(sv[1]);
 }
 
 static void test_anthropic_live_stream_sends_incremental_blocks(void) {
@@ -8889,6 +9120,10 @@ static void ds4_server_unit_tests_run(void) {
     test_stop_list_streaming_holds_and_trims_stop_text();
     test_json_skip_has_nesting_limit();
     test_model_metadata_clamps_completion_to_context();
+    test_parse_options_cors_flag();
+    test_http_cors_disabled_by_default();
+    test_http_cors_headers_when_enabled();
+    test_http_request_parses_cors_preflight_headers();
     test_client_socket_nonblocking_flag();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_tool_marker_state_ignores_orphan_end();

@@ -142,6 +142,9 @@ The server is Metal-only. It keeps one mutable graph/KV checkpoint in memory,
 so stateless clients that resend a longer version of the same prompt can reuse
 the shared prefix instead of pre-filling from token zero.
 
+Pass `--cors` to enable permissive CORS headers and browser preflight responses
+for local web clients.
+
 Request parsing and sockets run in client threads, but inference itself is
 serialized through one Metal worker. The current server does not batch multiple
 independent requests together; concurrent requests wait their turn on the single
