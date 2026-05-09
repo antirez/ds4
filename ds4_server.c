@@ -6666,7 +6666,14 @@ static long content_length(const char *h, size_t n) {
         if (len >= 15 && strncasecmp(line, "Content-Length:", 15) == 0) {
             const char *v = line + 15;
             while (v < line + len && isspace((unsigned char)*v)) v++;
-            return strtol(v, NULL, 10);
+            if (v == line + len) return -1;
+            errno = 0;
+            char *tail = NULL;
+            long value = strtol(v, &tail, 10);
+            if (tail == v || errno == ERANGE) return -1;
+            while (tail < line + len && isspace((unsigned char)*tail)) tail++;
+            if (tail != line + len) return -1;
+            return value;
         }
         if (p < end) p++;
     }
@@ -8495,6 +8502,22 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 }
 
+static void test_content_length_requires_strict_decimal(void) {
+    const char *valid = "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 42\r\n\r\n";
+    const char *valid_ws = "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: \t42 \r\n\r\n";
+    const char *missing = "GET /v1/models HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const char *empty = "POST /v1/chat/completions HTTP/1.1\r\nContent-Length:\r\n\r\n";
+    const char *junk = "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 42x\r\n\r\n";
+    const char *nondigit = "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: nope\r\n\r\n";
+
+    TEST_ASSERT(content_length(valid, strlen(valid)) == 42);
+    TEST_ASSERT(content_length(valid_ws, strlen(valid_ws)) == 42);
+    TEST_ASSERT(content_length(missing, strlen(missing)) == 0);
+    TEST_ASSERT(content_length(empty, strlen(empty)) == -1);
+    TEST_ASSERT(content_length(junk, strlen(junk)) == -1);
+    TEST_ASSERT(content_length(nondigit, strlen(nondigit)) == -1);
+}
+
 static void test_client_socket_nonblocking_flag(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -8855,6 +8878,7 @@ static void ds4_server_unit_tests_run(void) {
     test_stop_list_parses_all_sequences();
     test_stop_list_streaming_holds_and_trims_stop_text();
     test_model_metadata_clamps_completion_to_context();
+    test_content_length_requires_strict_decimal();
     test_client_socket_nonblocking_flag();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_tool_marker_state_ignores_orphan_end();
