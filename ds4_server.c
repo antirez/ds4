@@ -1,0 +1,7676 @@
+#include "ds4.h"
+
+/* OpenAI/Anthropic compatible local server.
+ *
+ * HTTP is intentionally simple: each client connection is handled by a small
+ * blocking thread that parses one request, then queues a job to the single
+ * Metal worker.  The worker owns the ds4_session and therefore owns all live KV
+ * cache state.  That keeps session reuse, disk checkpointing, and future
+ * batching decisions in one place instead of spreading graph mutations across
+ * client threads. */
+
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+
+static volatile sig_atomic_t g_stop_requested = 0;
+static volatile sig_atomic_t g_listen_fd = -1;
+
+#define DS4_SERVER_IO_TIMEOUT_SEC 10
+#define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
+
+static void stop_signal_handler(int sig) {
+    (void)sig;
+    if (g_stop_requested) _exit(130);
+    g_stop_requested = 1;
+    if (g_listen_fd >= 0) {
+        int fd = (int)g_listen_fd;
+        g_listen_fd = -1;
+        close(fd);
+    }
+}
+
+typedef struct {
+    char *ptr;
+    size_t len;
+    size_t cap;
+} buf;
+
+static void die(const char *msg) {
+    fprintf(stderr, "ds4-server: %s\n", msg);
+    exit(1);
+}
+
+static void *xmalloc(size_t n) {
+    void *p = malloc(n ? n : 1);
+    if (!p) die("out of memory");
+    return p;
+}
+
+static void *xrealloc(void *p, size_t n) {
+    p = realloc(p, n ? n : 1);
+    if (!p) die("out of memory");
+    return p;
+}
+
+static char *xstrdup(const char *s) {
+    size_t n = strlen(s);
+    char *p = xmalloc(n + 1);
+    memcpy(p, s, n + 1);
+    return p;
+}
+
+static char *xstrndup(const char *s, size_t n) {
+    char *p = xmalloc(n + 1);
+    memcpy(p, s, n);
+    p[n] = '\0';
+    return p;
+}
+
+static void buf_reserve(buf *b, size_t add) {
+    if (add > SIZE_MAX - b->len - 1) die("buffer overflow");
+    size_t need = b->len + add + 1;
+    if (need <= b->cap) return;
+    size_t cap = b->cap ? b->cap * 2 : 256;
+    while (cap < need) cap *= 2;
+    b->ptr = xrealloc(b->ptr, cap);
+    b->cap = cap;
+}
+
+static void buf_append(buf *b, const void *p, size_t n) {
+    buf_reserve(b, n);
+    memcpy(b->ptr + b->len, p, n);
+    b->len += n;
+    b->ptr[b->len] = '\0';
+}
+
+static void buf_putc(buf *b, char c) {
+    buf_append(b, &c, 1);
+}
+
+static void buf_puts(buf *b, const char *s) {
+    buf_append(b, s, strlen(s));
+}
+
+static void buf_printf(buf *b, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    va_list ap2;
+    va_copy(ap2, ap);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (n < 0) die("vsnprintf failed");
+    buf_reserve(b, (size_t)n);
+    vsnprintf(b->ptr + b->len, b->cap - b->len, fmt, ap2);
+    va_end(ap2);
+    b->len += (size_t)n;
+}
+
+static char *buf_take(buf *b) {
+    if (!b->ptr) return xstrdup("");
+    char *p = b->ptr;
+    memset(b, 0, sizeof(*b));
+    return p;
+}
+
+static void buf_free(buf *b) {
+    free(b->ptr);
+    memset(b, 0, sizeof(*b));
+}
+
+static void json_ws(const char **p) {
+    while (**p && isspace((unsigned char)**p)) (*p)++;
+}
+
+static bool json_lit(const char **p, const char *lit) {
+    size_t n = strlen(lit);
+    if (strncmp(*p, lit, n) != 0) return false;
+    *p += n;
+    return true;
+}
+
+static int json_hex(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+    if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+    return -1;
+}
+
+static void utf8_put(buf *b, uint32_t cp) {
+    if (cp <= 0x7f) {
+        buf_putc(b, (char)cp);
+    } else if (cp <= 0x7ff) {
+        buf_putc(b, (char)(0xc0 | (cp >> 6)));
+        buf_putc(b, (char)(0x80 | (cp & 0x3f)));
+    } else if (cp <= 0xffff) {
+        buf_putc(b, (char)(0xe0 | (cp >> 12)));
+        buf_putc(b, (char)(0x80 | ((cp >> 6) & 0x3f)));
+        buf_putc(b, (char)(0x80 | (cp & 0x3f)));
+    } else {
+        buf_putc(b, (char)(0xf0 | (cp >> 18)));
+        buf_putc(b, (char)(0x80 | ((cp >> 12) & 0x3f)));
+        buf_putc(b, (char)(0x80 | ((cp >> 6) & 0x3f)));
+        buf_putc(b, (char)(0x80 | (cp & 0x3f)));
+    }
+}
+
+static bool json_u16(const char **p, uint32_t *out) {
+    if ((*p)[0] != '\\' || (*p)[1] != 'u') return false;
+    uint32_t cp = 0;
+    for (int i = 0; i < 4; i++) {
+        int h = json_hex((*p)[2 + i]);
+        if (h < 0) return false;
+        cp = (cp << 4) | (uint32_t)h;
+    }
+    *p += 6;
+    *out = cp;
+    return true;
+}
+
+static bool json_string(const char **p, char **out) {
+    json_ws(p);
+    if (**p != '"') return false;
+    (*p)++;
+    buf b = {0};
+    while (**p && **p != '"') {
+        unsigned char c = (unsigned char)*(*p)++;
+        if (c != '\\') {
+            buf_putc(&b, (char)c);
+            continue;
+        }
+        c = (unsigned char)*(*p)++;
+        switch (c) {
+        case '"': buf_putc(&b, '"'); break;
+        case '\\': buf_putc(&b, '\\'); break;
+        case '/': buf_putc(&b, '/'); break;
+        case 'b': buf_putc(&b, '\b'); break;
+        case 'f': buf_putc(&b, '\f'); break;
+        case 'n': buf_putc(&b, '\n'); break;
+        case 'r': buf_putc(&b, '\r'); break;
+        case 't': buf_putc(&b, '\t'); break;
+        case 'u': {
+            *p -= 2;
+            uint32_t cp = 0, lo = 0;
+            if (!json_u16(p, &cp)) goto fail;
+            if (cp >= 0xd800 && cp <= 0xdbff && json_u16(p, &lo) && lo >= 0xdc00 && lo <= 0xdfff) {
+                cp = 0x10000u + ((cp - 0xd800u) << 10) + (lo - 0xdc00u);
+            }
+            utf8_put(&b, cp);
+            break;
+        }
+        default:
+            goto fail;
+        }
+    }
+    if (**p != '"') goto fail;
+    (*p)++;
+    *out = buf_take(&b);
+    return true;
+fail:
+    buf_free(&b);
+    return false;
+}
+
+static bool json_number(const char **p, double *out) {
+    json_ws(p);
+    char *end = NULL;
+    double v = strtod(*p, &end);
+    if (end == *p) return false;
+    *p = end;
+    *out = v;
+    return true;
+}
+
+static bool json_int(const char **p, int *out) {
+    double v = 0.0;
+    if (!json_number(p, &v)) return false;
+    if (v < 0) v = 0;
+    if (v > INT_MAX) v = INT_MAX;
+    *out = (int)v;
+    return true;
+}
+
+static bool json_bool(const char **p, bool *out) {
+    json_ws(p);
+    if (json_lit(p, "true")) {
+        *out = true;
+        return true;
+    }
+    if (json_lit(p, "false")) {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
+static bool json_skip_value(const char **p);
+
+static bool json_skip_array(const char **p) {
+    json_ws(p);
+    if (**p != '[') return false;
+    (*p)++;
+    json_ws(p);
+    if (**p == ']') {
+        (*p)++;
+        return true;
+    }
+    for (;;) {
+        if (!json_skip_value(p)) return false;
+        json_ws(p);
+        if (**p == ']') {
+            (*p)++;
+            return true;
+        }
+        if (**p != ',') return false;
+        (*p)++;
+    }
+}
+
+static bool json_skip_object(const char **p) {
+    json_ws(p);
+    if (**p != '{') return false;
+    (*p)++;
+    json_ws(p);
+    if (**p == '}') {
+        (*p)++;
+        return true;
+    }
+    for (;;) {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        free(key);
+        json_ws(p);
+        if (**p != ':') return false;
+        (*p)++;
+        if (!json_skip_value(p)) return false;
+        json_ws(p);
+        if (**p == '}') {
+            (*p)++;
+            return true;
+        }
+        if (**p != ',') return false;
+        (*p)++;
+    }
+}
+
+static bool json_skip_value(const char **p) {
+    json_ws(p);
+    if (**p == '"') {
+        char *s = NULL;
+        bool ok = json_string(p, &s);
+        free(s);
+        return ok;
+    }
+    if (**p == '{') return json_skip_object(p);
+    if (**p == '[') return json_skip_array(p);
+    if (json_lit(p, "true") || json_lit(p, "false") || json_lit(p, "null")) return true;
+    double v = 0.0;
+    return json_number(p, &v);
+}
+
+static bool json_raw_value(const char **p, char **out) {
+    json_ws(p);
+    const char *start = *p;
+    if (!json_skip_value(p)) return false;
+    size_t n = (size_t)(*p - start);
+    char *s = xmalloc(n + 1);
+    memcpy(s, start, n);
+    s[n] = '\0';
+    *out = s;
+    return true;
+}
+
+static char *json_minify_raw_value(const char *json) {
+    const char *p = json ? json : "null";
+    json_ws(&p);
+    const char *start = p;
+    if (!json_skip_value(&p)) return xstrdup(json ? json : "null");
+    const char *end = p;
+
+    buf b = {0};
+    bool in_string = false;
+    bool escape = false;
+    for (const char *s = start; s < end; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (in_string) {
+            buf_putc(&b, (char)c);
+            if (escape) escape = false;
+            else if (c == '\\') escape = true;
+            else if (c == '"') in_string = false;
+        } else if (c == '"') {
+            in_string = true;
+            buf_putc(&b, (char)c);
+        } else if (!isspace(c)) {
+            buf_putc(&b, (char)c);
+        }
+    }
+    return buf_take(&b);
+}
+
+static bool json_content(const char **p, char **out) {
+    json_ws(p);
+    if (**p == '"') return json_string(p, out);
+    if (json_lit(p, "null")) {
+        *out = xstrdup("");
+        return true;
+    }
+    if (**p != '[') {
+        if (!json_skip_value(p)) return false;
+        *out = xstrdup("");
+        return true;
+    }
+
+    (*p)++;
+    buf b = {0};
+    json_ws(p);
+    while (**p && **p != ']') {
+        if (**p == '"') {
+            char *s = NULL;
+            if (!json_string(p, &s)) goto fail;
+            buf_puts(&b, s);
+            free(s);
+        } else if (**p == '{') {
+            (*p)++;
+            json_ws(p);
+            while (**p && **p != '}') {
+                char *key = NULL;
+                if (!json_string(p, &key)) goto fail;
+                json_ws(p);
+                if (**p != ':') {
+                    free(key);
+                    goto fail;
+                }
+                (*p)++;
+                if (!strcmp(key, "text")) {
+                    char *s = NULL;
+                    if (!json_string(p, &s)) {
+                        free(key);
+                        goto fail;
+                    }
+                    buf_puts(&b, s);
+                    free(s);
+                } else if (!json_skip_value(p)) {
+                    free(key);
+                    goto fail;
+                }
+                free(key);
+                json_ws(p);
+                if (**p == ',') (*p)++;
+                json_ws(p);
+            }
+            if (**p != '}') goto fail;
+            (*p)++;
+        } else if (!json_skip_value(p)) {
+            goto fail;
+        }
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != ']') goto fail;
+    (*p)++;
+    *out = buf_take(&b);
+    return true;
+fail:
+    buf_free(&b);
+    return false;
+}
+
+typedef enum {
+    REQ_CHAT,
+    REQ_COMPLETION,
+} req_kind;
+
+typedef enum {
+    API_OPENAI,
+    API_ANTHROPIC,
+} api_style;
+
+typedef struct {
+    char *id;
+    char *name;
+    char *arguments;
+} tool_call;
+
+typedef struct {
+    tool_call *v;
+    int len;
+    int cap;
+} tool_calls;
+
+typedef struct {
+    char *name;
+    char **prop;
+    int len;
+    int cap;
+} tool_schema_order;
+
+typedef struct {
+    tool_schema_order *v;
+    int len;
+    int cap;
+} tool_schema_orders;
+
+typedef struct {
+    char *role;
+    char *content;
+    char *reasoning;
+    char *tool_call_id;
+    tool_calls calls;
+} chat_msg;
+
+typedef struct {
+    chat_msg *v;
+    int len;
+    int cap;
+} chat_msgs;
+
+typedef struct {
+    char **v;
+    int len;
+    int cap;
+    size_t max_len;
+} stop_list;
+
+typedef struct {
+    req_kind kind;
+    api_style api;
+    ds4_tokens prompt;
+    char *model;
+    stop_list stops;
+    char *raw_body;
+    char *prompt_text;
+    tool_schema_orders tool_orders;
+    int max_tokens;
+    int top_k;
+    float temperature;
+    float top_p;
+    float min_p;
+    uint64_t seed;
+    bool stream;
+    bool stream_include_usage;
+    ds4_think_mode think_mode;
+    bool has_tools;
+} request;
+
+static void tool_call_free(tool_call *tc) {
+    free(tc->id);
+    free(tc->name);
+    free(tc->arguments);
+    memset(tc, 0, sizeof(*tc));
+}
+
+static void tool_calls_free(tool_calls *calls) {
+    for (int i = 0; i < calls->len; i++) tool_call_free(&calls->v[i]);
+    free(calls->v);
+    memset(calls, 0, sizeof(*calls));
+}
+
+static void tool_calls_push(tool_calls *calls, tool_call tc) {
+    if (calls->len == calls->cap) {
+        calls->cap = calls->cap ? calls->cap * 2 : 4;
+        calls->v = xrealloc(calls->v, (size_t)calls->cap * sizeof(calls->v[0]));
+    }
+    calls->v[calls->len++] = tc;
+}
+
+static void chat_msg_free(chat_msg *m) {
+    free(m->role);
+    free(m->content);
+    free(m->reasoning);
+    free(m->tool_call_id);
+    tool_calls_free(&m->calls);
+    memset(m, 0, sizeof(*m));
+}
+
+static void chat_msgs_free(chat_msgs *msgs) {
+    for (int i = 0; i < msgs->len; i++) chat_msg_free(&msgs->v[i]);
+    free(msgs->v);
+    memset(msgs, 0, sizeof(*msgs));
+}
+
+static void chat_msgs_push(chat_msgs *msgs, chat_msg msg) {
+    if (msgs->len == msgs->cap) {
+        msgs->cap = msgs->cap ? msgs->cap * 2 : 8;
+        msgs->v = xrealloc(msgs->v, (size_t)msgs->cap * sizeof(msgs->v[0]));
+    }
+    msgs->v[msgs->len++] = msg;
+}
+
+static void tool_schema_order_free(tool_schema_order *o) {
+    free(o->name);
+    for (int i = 0; i < o->len; i++) free(o->prop[i]);
+    free(o->prop);
+    memset(o, 0, sizeof(*o));
+}
+
+static void tool_schema_orders_free(tool_schema_orders *orders) {
+    for (int i = 0; i < orders->len; i++) tool_schema_order_free(&orders->v[i]);
+    free(orders->v);
+    memset(orders, 0, sizeof(*orders));
+}
+
+static void tool_schema_order_prop_push(tool_schema_order *o, char *prop) {
+    if (o->len == o->cap) {
+        o->cap = o->cap ? o->cap * 2 : 8;
+        o->prop = xrealloc(o->prop, (size_t)o->cap * sizeof(o->prop[0]));
+    }
+    o->prop[o->len++] = prop;
+}
+
+static int tool_schema_orders_find_index(const tool_schema_orders *orders, const char *name) {
+    if (!orders || !name) return -1;
+    for (int i = 0; i < orders->len; i++) {
+        if (orders->v[i].name && !strcmp(orders->v[i].name, name)) return i;
+    }
+    return -1;
+}
+
+static const tool_schema_order *tool_schema_orders_find(const tool_schema_orders *orders, const char *name) {
+    int idx = tool_schema_orders_find_index(orders, name);
+    return idx >= 0 ? &orders->v[idx] : NULL;
+}
+
+static void tool_schema_orders_push(tool_schema_orders *orders, tool_schema_order order) {
+    int idx = tool_schema_orders_find_index(orders, order.name);
+    if (idx >= 0) {
+        tool_schema_order_free(&orders->v[idx]);
+        orders->v[idx] = order;
+        return;
+    }
+    if (orders->len == orders->cap) {
+        orders->cap = orders->cap ? orders->cap * 2 : 8;
+        orders->v = xrealloc(orders->v, (size_t)orders->cap * sizeof(orders->v[0]));
+    }
+    orders->v[orders->len++] = order;
+}
+
+static void request_init(request *r, req_kind kind, int max_tokens) {
+    memset(r, 0, sizeof(*r));
+    r->kind = kind;
+    r->api = API_OPENAI;
+    r->model = xstrdup("deepseek-v4-flash");
+    r->max_tokens = max_tokens;
+    r->top_k = 0;
+    r->temperature = 1.0f;
+    r->top_p = 1.0f;
+    r->min_p = 0.0f;
+    r->think_mode = DS4_THINK_HIGH;
+}
+
+static void request_free(request *r) {
+    ds4_tokens_free(&r->prompt);
+    free(r->model);
+    for (int i = 0; i < r->stops.len; i++) free(r->stops.v[i]);
+    free(r->stops.v);
+    free(r->raw_body);
+    free(r->prompt_text);
+    tool_schema_orders_free(&r->tool_orders);
+    memset(r, 0, sizeof(*r));
+}
+
+static ds4_think_mode think_mode_from_enabled(bool enabled, ds4_think_mode effort) {
+    if (!enabled) return DS4_THINK_NONE;
+    return effort == DS4_THINK_MAX ? DS4_THINK_MAX : DS4_THINK_HIGH;
+}
+
+static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
+    if (!s) return false;
+    if (!strcmp(s, "max")) {
+        *out = DS4_THINK_MAX;
+        return true;
+    }
+    if (!strcmp(s, "xhigh") || !strcmp(s, "high") ||
+        !strcmp(s, "medium") || !strcmp(s, "low"))
+    {
+        *out = DS4_THINK_HIGH;
+        return true;
+    }
+    return false;
+}
+
+static bool parse_reasoning_effort_value(const char **p, ds4_think_mode *out) {
+    json_ws(p);
+    if (json_lit(p, "null")) return true;
+    char *effort = NULL;
+    if (!json_string(p, &effort)) return false;
+    bool ok = parse_reasoning_effort_name(effort, out);
+    free(effort);
+    return ok;
+}
+
+static bool parse_thinking_control_value(const char **p, bool *thinking_enabled) {
+    json_ws(p);
+    if (json_lit(p, "null")) return true;
+    if (**p == 't' || **p == 'f') return json_bool(p, thinking_enabled);
+    if (**p != '{') return json_skip_value(p);
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        if (!strcmp(key, "type")) {
+            char *type = NULL;
+            if (!json_string(p, &type)) {
+                free(key);
+                return false;
+            }
+            if (!strcmp(type, "enabled")) *thinking_enabled = true;
+            else if (!strcmp(type, "disabled")) *thinking_enabled = false;
+            free(type);
+        } else if (!json_skip_value(p)) {
+            free(key);
+            return false;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+
+static bool parse_output_config_effort(const char **p, ds4_think_mode *effort) {
+    json_ws(p);
+    if (json_lit(p, "null")) return true;
+    if (**p != '{') return json_skip_value(p);
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        if (!strcmp(key, "effort")) {
+            if (!parse_reasoning_effort_value(p, effort)) {
+                free(key);
+                return false;
+            }
+        } else if (!json_skip_value(p)) {
+            free(key);
+            return false;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+
+static bool model_alias_disables_thinking(const char *model) {
+    return model && !strcmp(model, "deepseek-chat");
+}
+
+static bool model_alias_enables_thinking(const char *model) {
+    return model && !strcmp(model, "deepseek-reasoner");
+}
+
+static void stop_list_clear(stop_list *stops) {
+    for (int i = 0; i < stops->len; i++) free(stops->v[i]);
+    stops->len = 0;
+    stops->max_len = 0;
+}
+
+static void stop_list_push(stop_list *stops, char *s) {
+    if (!s || !s[0]) {
+        free(s);
+        return;
+    }
+    if (stops->len == stops->cap) {
+        stops->cap = stops->cap ? stops->cap * 2 : 4;
+        stops->v = xrealloc(stops->v, (size_t)stops->cap * sizeof(stops->v[0]));
+    }
+    size_t n = strlen(s);
+    if (n > stops->max_len) stops->max_len = n;
+    stops->v[stops->len++] = s;
+}
+
+static bool parse_stop(const char **p, stop_list *out) {
+    json_ws(p);
+    stop_list_clear(out);
+    if (**p == '"') {
+        char *s = NULL;
+        if (!json_string(p, &s)) return false;
+        stop_list_push(out, s);
+        return true;
+    }
+    if (**p != '[') return json_skip_value(p);
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != ']') {
+        if (**p == '"') {
+            char *s = NULL;
+            if (!json_string(p, &s)) return false;
+            stop_list_push(out, s);
+        } else if (!json_skip_value(p)) {
+            return false;
+        }
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != ']') return false;
+    (*p)++;
+    return true;
+}
+
+static bool stop_list_find_from(const stop_list *stops, const char *text,
+                                size_t from, size_t *pos, size_t *len) {
+    if (!stops->len || !text) return false;
+    bool found = false;
+    size_t best_pos = 0, best_len = 0;
+    for (int i = 0; i < stops->len; i++) {
+        char *p = strstr(text + from, stops->v[i]);
+        if (!p) continue;
+        size_t ppos = (size_t)(p - text);
+        size_t plen = strlen(stops->v[i]);
+        if (!found || ppos < best_pos) {
+            found = true;
+            best_pos = ppos;
+            best_len = plen;
+        }
+    }
+    if (!found) return false;
+    *pos = best_pos;
+    *len = best_len;
+    return true;
+}
+
+static size_t stop_list_stream_safe_len(const stop_list *stops, size_t text_len) {
+    /* Streaming cannot emit the last max_stop_len-1 bytes yet: a stop sequence
+     * may start there and finish in the next token.  The final flush releases
+     * this small tail once generation ends without a stop hit. */
+    if (!stops->len || stops->max_len <= 1) return text_len;
+    const size_t hold = stops->max_len - 1;
+    return text_len > hold ? text_len - hold : 0;
+}
+
+static int utf8_expected_len(unsigned char c) {
+    if (c < 0x80) return 1;
+    if (c >= 0xc2 && c <= 0xdf) return 2;
+    if (c >= 0xe0 && c <= 0xef) return 3;
+    if (c >= 0xf0 && c <= 0xf4) return 4;
+    return 1;
+}
+
+/* Tokenizers can split a multi-byte UTF-8 character across two tokens.  If an
+ * SSE delta ends at that boundary, some clients replace the incomplete byte
+ * sequence with U+FFFD and later send the corrupted text back, destroying KV
+ * cache prefix matches.  Hold only the trailing incomplete character; the next
+ * generated token will complete it. */
+static size_t utf8_stream_safe_len(const char *s, size_t start,
+                                   size_t limit, bool final) {
+    if (final || !s || limit <= start) return limit;
+
+    size_t p = limit;
+    int cont = 0;
+    while (p > start && cont < 4 &&
+           (((unsigned char)s[p - 1] & 0xc0) == 0x80))
+    {
+        p--;
+        cont++;
+    }
+
+    if (p == limit) {
+        return utf8_expected_len((unsigned char)s[limit - 1]) > 1 ?
+               limit - 1 : limit;
+    }
+    if (p == start && (((unsigned char)s[p] & 0xc0) == 0x80)) return start;
+
+    size_t lead = p - 1;
+    int need = utf8_expected_len((unsigned char)s[lead]);
+    return (limit - lead) < (size_t)need ? lead : limit;
+}
+
+static bool parse_stream_options(const char **p, bool *include_usage) {
+    json_ws(p);
+    if (**p != '{') return json_skip_value(p);
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        if (!strcmp(key, "include_usage")) {
+            if (!json_bool(p, include_usage)) {
+                free(key);
+                return false;
+            }
+        } else if (!json_skip_value(p)) {
+            free(key);
+            return false;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+
+static bool parse_function_call(const char **p, tool_call *tc) {
+    json_ws(p);
+    if (**p != '{') return false;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) goto bad;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            goto bad;
+        }
+        (*p)++;
+        if (!strcmp(key, "name")) {
+            free(tc->name);
+            if (!json_string(p, &tc->name)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "arguments")) {
+            free(tc->arguments);
+            json_ws(p);
+            if (**p == '"') {
+                if (!json_string(p, &tc->arguments)) {
+                    free(key);
+                    goto bad;
+                }
+            } else if (!json_raw_value(p, &tc->arguments)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!json_skip_value(p)) {
+            free(key);
+            goto bad;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') goto bad;
+    (*p)++;
+    return true;
+bad:
+    return false;
+}
+
+static bool parse_tool_calls_value(const char **p, tool_calls *calls) {
+    json_ws(p);
+    if (json_lit(p, "null")) return true;
+    if (**p != '[') return false;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != ']') {
+        if (**p != '{') return false;
+        (*p)++;
+        tool_call tc = {0};
+        json_ws(p);
+        while (**p && **p != '}') {
+            char *key = NULL;
+            if (!json_string(p, &key)) goto bad;
+            json_ws(p);
+            if (**p != ':') {
+                free(key);
+                goto bad;
+            }
+            (*p)++;
+            if (!strcmp(key, "id")) {
+                free(tc.id);
+                if (!json_string(p, &tc.id)) {
+                    free(key);
+                    goto bad;
+                }
+            } else if (!strcmp(key, "function")) {
+                if (!parse_function_call(p, &tc)) {
+                    free(key);
+                    goto bad;
+                }
+            } else if (!json_skip_value(p)) {
+                free(key);
+                goto bad;
+            }
+            free(key);
+            json_ws(p);
+            if (**p == ',') (*p)++;
+            json_ws(p);
+        }
+        if (**p != '}') goto bad;
+        (*p)++;
+        if (tc.name && tc.arguments) {
+            tool_calls_push(calls, tc);
+            memset(&tc, 0, sizeof(tc));
+        }
+        tool_call_free(&tc);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+        continue;
+bad:
+        tool_call_free(&tc);
+        return false;
+    }
+    if (**p != ']') return false;
+    (*p)++;
+    return true;
+}
+
+static void append_raw_json_line(buf *b, const char *json) {
+    if (!json || !json[0]) return;
+    if (b->len) buf_putc(b, '\n');
+    buf_puts(b, json);
+}
+
+static char *openai_function_schema_from_tool(const char *raw) {
+    const char *p = raw;
+    json_ws(&p);
+    if (*p != '{') return NULL;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        char *value = NULL;
+        if (!json_string(&p, &key)) return NULL;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            return NULL;
+        }
+        p++;
+        if (!strcmp(key, "function")) {
+            free(key);
+            if (!json_raw_value(&p, &value)) return NULL;
+            return value;
+        }
+        free(key);
+        if (!json_skip_value(&p)) return NULL;
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    return NULL;
+}
+
+static bool parse_schema_properties(const char *json, tool_schema_order *order) {
+    const char *p = json;
+    json_ws(&p);
+    if (*p != '{') return false;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) return false;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            return false;
+        }
+        p++;
+        if (!strcmp(key, "properties")) {
+            free(key);
+            json_ws(&p);
+            if (*p != '{') return false;
+            p++;
+            json_ws(&p);
+            while (*p && *p != '}') {
+                char *prop = NULL;
+                if (!json_string(&p, &prop)) return false;
+                json_ws(&p);
+                if (*p != ':') {
+                    free(prop);
+                    return false;
+                }
+                p++;
+                tool_schema_order_prop_push(order, prop);
+                if (!json_skip_value(&p)) return false;
+                json_ws(&p);
+                if (*p == ',') p++;
+                json_ws(&p);
+            }
+            if (*p != '}') return false;
+            p++;
+        } else {
+            free(key);
+            if (!json_skip_value(&p)) return false;
+        }
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    return *p == '}';
+}
+
+static void tool_schema_orders_add_json(tool_schema_orders *orders, const char *json) {
+    if (!orders || !json) return;
+    const char *p = json;
+    json_ws(&p);
+    if (*p != '{') return;
+    p++;
+    tool_schema_order order = {0};
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto done;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto done;
+        }
+        p++;
+        if (!strcmp(key, "name")) {
+            free(order.name);
+            if (!json_string(&p, &order.name)) {
+                free(key);
+                goto done;
+            }
+        } else if (!strcmp(key, "input_schema") || !strcmp(key, "parameters")) {
+            char *schema = NULL;
+            if (!json_raw_value(&p, &schema)) {
+                free(key);
+                goto done;
+            }
+            parse_schema_properties(schema, &order);
+            free(schema);
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            goto done;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    if (order.name && order.len > 0) {
+        tool_schema_orders_push(orders, order);
+        memset(&order, 0, sizeof(order));
+    }
+done:
+    tool_schema_order_free(&order);
+}
+
+/* OpenAI wraps tools as {"type":"function","function":{...}}. Anthropic sends
+ * the function schema directly as {"name":...,"input_schema":...}. The DS4
+ * prompt wants one raw function schema per line, so unwrap OpenAI tools and keep
+ * already-direct schemas unchanged. */
+static bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders) {
+    json_ws(p);
+    if (json_lit(p, "null")) {
+        *out = xstrdup("");
+        return true;
+    }
+    if (**p != '[') return false;
+    (*p)++;
+    buf schemas = {0};
+
+    json_ws(p);
+    while (**p && **p != ']') {
+        char *raw = NULL;
+        if (!json_raw_value(p, &raw)) goto bad;
+        char *function = openai_function_schema_from_tool(raw);
+        const char *schema = function ? function : raw;
+        append_raw_json_line(&schemas, schema);
+        tool_schema_orders_add_json(orders, schema);
+        free(function);
+        free(raw);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != ']') goto bad;
+    (*p)++;
+    *out = buf_take(&schemas);
+    return true;
+bad:
+    buf_free(&schemas);
+    return false;
+}
+
+static bool parse_messages(const char **p, chat_msgs *msgs) {
+    json_ws(p);
+    if (**p != '[') return false;
+    (*p)++;
+
+    json_ws(p);
+    while (**p && **p != ']') {
+        if (**p != '{') return false;
+        (*p)++;
+        chat_msg msg = {0};
+        json_ws(p);
+        while (**p && **p != '}') {
+            char *key = NULL;
+            if (!json_string(p, &key)) goto fail;
+            json_ws(p);
+            if (**p != ':') {
+                free(key);
+                goto fail;
+            }
+            (*p)++;
+            if (!strcmp(key, "role")) {
+                free(msg.role);
+                if (!json_string(p, &msg.role)) {
+                    free(key);
+                    goto fail;
+                }
+            } else if (!strcmp(key, "content")) {
+                free(msg.content);
+                if (!json_content(p, &msg.content)) {
+                    free(key);
+                    goto fail;
+                }
+            } else if (!strcmp(key, "reasoning_content")) {
+                free(msg.reasoning);
+                if (!json_content(p, &msg.reasoning)) {
+                    free(key);
+                    goto fail;
+                }
+            } else if (!strcmp(key, "tool_call_id")) {
+                free(msg.tool_call_id);
+                if (!json_string(p, &msg.tool_call_id)) {
+                    free(key);
+                    goto fail;
+                }
+            } else if (!strcmp(key, "tool_calls")) {
+                tool_calls_free(&msg.calls);
+                if (!parse_tool_calls_value(p, &msg.calls)) {
+                    free(key);
+                    goto fail;
+                }
+            } else if (!json_skip_value(p)) {
+                free(key);
+                goto fail;
+            }
+            free(key);
+            json_ws(p);
+            if (**p == ',') (*p)++;
+            json_ws(p);
+        }
+        if (**p != '}') goto fail;
+        (*p)++;
+        if (!msg.role) msg.role = xstrdup("user");
+        if (!msg.content) msg.content = xstrdup("");
+        chat_msgs_push(msgs, msg);
+        memset(&msg, 0, sizeof(msg));
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+        continue;
+fail:
+        chat_msg_free(&msg);
+        return false;
+    }
+    if (**p != ']') return false;
+    (*p)++;
+    return true;
+}
+
+static void append_dsml_text_escaped(buf *b, const char *s);
+
+static bool append_anthropic_block_content(buf *dst, const char *text) {
+    if (!text || !text[0]) return true;
+    buf_puts(dst, text);
+    return true;
+}
+
+/* Anthropic content is block-structured, while the engine consumes one compact
+ * chat_msg per role.  Parsing collapses text/thinking into strings, converts
+ * assistant tool_use blocks to tool_calls, and keeps tool_result blocks as
+ * escaped text because DS4 sees tool results in its chat template. */
+static bool parse_anthropic_content_block(const char **p, const char *role, chat_msg *msg) {
+    if (**p != '{') return false;
+    (*p)++;
+    char *type = NULL;
+    char *text = NULL;
+    char *thinking = NULL;
+    char *id = NULL;
+    char *name = NULL;
+    char *input = NULL;
+    char *tool_result = NULL;
+
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) goto bad;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            goto bad;
+        }
+        (*p)++;
+        if (!strcmp(key, "type")) {
+            free(type);
+            if (!json_string(p, &type)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "text")) {
+            free(text);
+            if (!json_content(p, &text)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "thinking")) {
+            free(thinking);
+            if (!json_content(p, &thinking)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "id") || !strcmp(key, "tool_use_id")) {
+            free(id);
+            if (!json_string(p, &id)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "name")) {
+            free(name);
+            if (!json_string(p, &name)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "input")) {
+            free(input);
+            if (!json_raw_value(p, &input)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "content")) {
+            free(tool_result);
+            if (!json_content(p, &tool_result)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!json_skip_value(p)) {
+            free(key);
+            goto bad;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') goto bad;
+    (*p)++;
+
+    if (type && !strcmp(type, "tool_use") && !strcmp(role, "assistant")) {
+        tool_call tc = {0};
+        tc.id = id ? xstrdup(id) : NULL;
+        tc.name = name ? xstrdup(name) : xstrdup("");
+        tc.arguments = input ? xstrdup(input) : xstrdup("{}");
+        tool_calls_push(&msg->calls, tc);
+    } else if (type && !strcmp(type, "tool_result")) {
+        buf b = {0};
+        buf_puts(&b, msg->content ? msg->content : "");
+        buf_puts(&b, "<tool_result>");
+        append_dsml_text_escaped(&b, tool_result);
+        buf_puts(&b, "</tool_result>");
+        free(msg->content);
+        msg->content = buf_take(&b);
+    } else {
+        if (text) {
+            buf b = {0};
+            buf_puts(&b, msg->content ? msg->content : "");
+            append_anthropic_block_content(&b, text);
+            free(msg->content);
+            msg->content = buf_take(&b);
+        }
+        if (thinking) {
+            buf b = {0};
+            buf_puts(&b, msg->reasoning ? msg->reasoning : "");
+            append_anthropic_block_content(&b, thinking);
+            free(msg->reasoning);
+            msg->reasoning = buf_take(&b);
+        }
+    }
+
+    free(type);
+    free(text);
+    free(thinking);
+    free(id);
+    free(name);
+    free(input);
+    free(tool_result);
+    return true;
+bad:
+    free(type);
+    free(text);
+    free(thinking);
+    free(id);
+    free(name);
+    free(input);
+    free(tool_result);
+    return false;
+}
+
+static bool parse_anthropic_content(const char **p, chat_msg *msg) {
+    json_ws(p);
+    if (**p == '"') return json_string(p, &msg->content);
+    if (json_lit(p, "null")) {
+        msg->content = xstrdup("");
+        return true;
+    }
+    if (**p != '[') return json_skip_value(p);
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != ']') {
+        if (**p == '"') {
+            char *s = NULL;
+            if (!json_string(p, &s)) return false;
+            buf b = {0};
+            buf_puts(&b, msg->content ? msg->content : "");
+            buf_puts(&b, s);
+            free(msg->content);
+            msg->content = buf_take(&b);
+            free(s);
+        } else if (**p == '{') {
+            if (!parse_anthropic_content_block(p, msg->role ? msg->role : "", msg)) return false;
+        } else if (!json_skip_value(p)) {
+            return false;
+        }
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != ']') return false;
+    (*p)++;
+    if (!msg->content) msg->content = xstrdup("");
+    return true;
+}
+
+static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
+    json_ws(p);
+    if (**p != '[') return false;
+    (*p)++;
+
+    json_ws(p);
+    while (**p && **p != ']') {
+        if (**p != '{') return false;
+        (*p)++;
+        chat_msg msg = {0};
+        json_ws(p);
+        while (**p && **p != '}') {
+            char *key = NULL;
+            if (!json_string(p, &key)) goto fail;
+            json_ws(p);
+            if (**p != ':') {
+                free(key);
+                goto fail;
+            }
+            (*p)++;
+            if (!strcmp(key, "role")) {
+                free(msg.role);
+                if (!json_string(p, &msg.role)) {
+                    free(key);
+                    goto fail;
+                }
+            } else if (!strcmp(key, "content")) {
+                free(msg.content);
+                msg.content = NULL;
+                if (!parse_anthropic_content(p, &msg)) {
+                    free(key);
+                    goto fail;
+                }
+            } else if (!json_skip_value(p)) {
+                free(key);
+                goto fail;
+            }
+            free(key);
+            json_ws(p);
+            if (**p == ',') (*p)++;
+            json_ws(p);
+        }
+        if (**p != '}') goto fail;
+        (*p)++;
+        if (!msg.role) msg.role = xstrdup("user");
+        if (!msg.content) msg.content = xstrdup("");
+        chat_msgs_push(msgs, msg);
+        memset(&msg, 0, sizeof(msg));
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+        continue;
+fail:
+        chat_msg_free(&msg);
+        return false;
+    }
+    if (**p != ']') return false;
+    (*p)++;
+    return true;
+}
+
+static bool anthropic_system_part_is_private(const char *s) {
+    return s && !strncmp(s, "x-anthropic-", 12);
+}
+
+static void append_anthropic_system_part(buf *b, const char *s) {
+    if (!s || !s[0] || anthropic_system_part_is_private(s)) return;
+    if (b->len && b->ptr[b->len - 1] != '\n') buf_putc(b, '\n');
+    buf_puts(b, s);
+}
+
+static bool parse_anthropic_system_object(const char **p, buf *out) {
+    if (**p != '{') return false;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        if (!strcmp(key, "text")) {
+            char *text = NULL;
+            if (!json_string(p, &text)) {
+                free(key);
+                return false;
+            }
+            append_anthropic_system_part(out, text);
+            free(text);
+        } else if (!json_skip_value(p)) {
+            free(key);
+            return false;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+
+static bool parse_anthropic_system(const char **p, char **out) {
+    json_ws(p);
+    buf b = {0};
+    if (**p == '"') {
+        char *text = NULL;
+        if (!json_string(p, &text)) return false;
+        append_anthropic_system_part(&b, text);
+        free(text);
+        *out = buf_take(&b);
+        return true;
+    }
+    if (json_lit(p, "null")) {
+        *out = xstrdup("");
+        return true;
+    }
+    if (**p != '[') {
+        if (!json_skip_value(p)) return false;
+        *out = xstrdup("");
+        return true;
+    }
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != ']') {
+        if (**p == '"') {
+            char *text = NULL;
+            if (!json_string(p, &text)) goto bad;
+            append_anthropic_system_part(&b, text);
+            free(text);
+        } else if (**p == '{') {
+            if (!parse_anthropic_system_object(p, &b)) goto bad;
+        } else if (!json_skip_value(p)) {
+            goto bad;
+        }
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != ']') goto bad;
+    (*p)++;
+    *out = buf_take(&b);
+    return true;
+bad:
+    buf_free(&b);
+    return false;
+}
+
+static void append_tools_prompt_text(buf *b, const char *tool_schemas) {
+    if (!tool_schemas || !tool_schemas[0]) return;
+    buf_puts(b,
+        "## Tools\n\n"
+        "You have access to a set of tools to help answer the user question. "
+        "You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n"
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"$TOOL_NAME\">\n"
+        "<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n"
+        "...\n"
+        "</｜DSML｜invoke>\n"
+        "<｜DSML｜invoke name=\"$TOOL_NAME2\">\n"
+        "...\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>\n\n"
+        "String parameters should be specified as is and set `string=\"true\"`. "
+        "For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n"
+        "If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\n"
+        "Otherwise, output directly after </think> with tool calls or final response.\n\n"
+        "### Available Tool Schemas\n\n");
+    buf_puts(b, tool_schemas);
+    buf_puts(b, "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls. "
+                "Emit parameters in the same order as each tool's input_schema.properties or parameters.properties object.");
+}
+
+static void json_escape(buf *b, const char *s);
+
+typedef struct {
+    char *key;
+    char *value;
+    bool is_string;
+    bool used;
+} json_arg;
+
+typedef struct {
+    json_arg *v;
+    int len;
+    int cap;
+} json_args;
+
+static void json_args_free(json_args *args) {
+    for (int i = 0; i < args->len; i++) {
+        free(args->v[i].key);
+        free(args->v[i].value);
+    }
+    free(args->v);
+    memset(args, 0, sizeof(*args));
+}
+
+static void json_args_push(json_args *args, json_arg arg) {
+    if (args->len == args->cap) {
+        args->cap = args->cap ? args->cap * 2 : 8;
+        args->v = xrealloc(args->v, (size_t)args->cap * sizeof(args->v[0]));
+    }
+    args->v[args->len++] = arg;
+}
+
+static int json_args_find_unused(json_args *args, const char *key) {
+    if (!key) return -1;
+    for (int i = 0; i < args->len; i++) {
+        if (!args->v[i].used && args->v[i].key && !strcmp(args->v[i].key, key)) return i;
+    }
+    return -1;
+}
+
+static bool json_args_parse(const char *json, json_args *args) {
+    const char *p = json ? json : "";
+    json_ws(&p);
+    if (*p != '{') return false;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        bool is_string = false;
+        char *key = NULL;
+        char *value = NULL;
+        if (!json_string(&p, &key)) goto bad;
+        json_ws(&p);
+        if (*p != ':') goto bad;
+        p++;
+        json_ws(&p);
+        if (*p == '"') {
+            is_string = true;
+            if (!json_string(&p, &value)) goto bad;
+        } else {
+            char *raw = NULL;
+            if (!json_raw_value(&p, &raw)) goto bad;
+            value = json_minify_raw_value(raw);
+            free(raw);
+        }
+
+        json_arg arg = {.key = key, .value = value, .is_string = is_string};
+        json_args_push(args, arg);
+        key = value = NULL;
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+        continue;
+bad:
+        free(key);
+        free(value);
+        json_args_free(args);
+        return false;
+    }
+    if (*p != '}') {
+        json_args_free(args);
+        return false;
+    }
+    return true;
+}
+
+static void append_dsml_attr_escaped(buf *b, const char *s) {
+    for (s = s ? s : ""; *s; s++) {
+        if (*s == '&') buf_puts(b, "&amp;");
+        else if (*s == '<') buf_puts(b, "&lt;");
+        else if (*s == '>') buf_puts(b, "&gt;");
+        else if (*s == '"') buf_puts(b, "&quot;");
+        else buf_putc(b, *s);
+    }
+}
+
+static void append_dsml_text_escaped(buf *b, const char *s) {
+    for (s = s ? s : ""; *s; s++) {
+        if (*s == '&') buf_puts(b, "&amp;");
+        else if (*s == '<') buf_puts(b, "&lt;");
+        else if (*s == '>') buf_puts(b, "&gt;");
+        else buf_putc(b, *s);
+    }
+}
+
+static void append_dsml_json_literal_escaped(buf *b, const char *s) {
+    for (s = s ? s : ""; *s; s++) {
+        if (*s == '<') buf_puts(b, "\\u003c");
+        else if (*s == '>') buf_puts(b, "\\u003e");
+        else if (*s == '&') buf_puts(b, "\\u0026");
+        else buf_putc(b, *s);
+    }
+}
+
+static void append_dsml_arg(buf *b, const json_arg *arg) {
+    buf_puts(b, "<｜DSML｜parameter name=\"");
+    append_dsml_attr_escaped(b, arg->key);
+    buf_puts(b, "\" string=\"");
+    buf_puts(b, arg->is_string ? "true" : "false");
+    buf_puts(b, "\">");
+    if (arg->is_string) append_dsml_text_escaped(b, arg->value);
+    else append_dsml_json_literal_escaped(b, arg->value);
+    buf_puts(b, "</｜DSML｜parameter>\n");
+}
+
+static bool append_dsml_arguments_from_json(buf *b, const char *json, const tool_schema_order *order) {
+    json_args args = {0};
+    if (!json_args_parse(json, &args)) return false;
+    if (order) {
+        for (int i = 0; i < order->len; i++) {
+            int idx = json_args_find_unused(&args, order->prop[i]);
+            if (idx < 0) continue;
+            append_dsml_arg(b, &args.v[idx]);
+            args.v[idx].used = true;
+        }
+    }
+    for (int i = 0; i < args.len; i++) {
+        if (args.v[i].used) continue;
+        append_dsml_arg(b, &args.v[i]);
+    }
+    json_args_free(&args);
+    return true;
+}
+
+static void append_json_arg_pair(buf *b, const json_arg *arg) {
+    json_escape(b, arg->key);
+    buf_puts(b, ":");
+    if (arg->is_string) json_escape(b, arg->value);
+    else buf_puts(b, arg->value);
+}
+
+static void append_json_object_ordered_or_empty(buf *b, const char *json, const tool_schema_order *order) {
+    json_args args = {0};
+    if (!json_args_parse(json, &args)) {
+        buf_puts(b, "{}");
+        return;
+    }
+    buf_putc(b, '{');
+    bool wrote = false;
+    if (order) {
+        for (int i = 0; i < order->len; i++) {
+            int idx = json_args_find_unused(&args, order->prop[i]);
+            if (idx < 0) continue;
+            if (wrote) buf_putc(b, ',');
+            append_json_arg_pair(b, &args.v[idx]);
+            args.v[idx].used = true;
+            wrote = true;
+        }
+    }
+    for (int i = 0; i < args.len; i++) {
+        if (args.v[i].used) continue;
+        if (wrote) buf_putc(b, ',');
+        append_json_arg_pair(b, &args.v[i]);
+        wrote = true;
+    }
+    buf_putc(b, '}');
+    json_args_free(&args);
+}
+
+static void append_dsml_tool_calls_text(buf *b, const tool_calls *calls, const tool_schema_orders *orders) {
+    if (!calls || calls->len == 0) return;
+    buf_puts(b, "\n\n<｜DSML｜tool_calls>\n");
+    for (int i = 0; i < calls->len; i++) {
+        const tool_call *tc = &calls->v[i];
+        const tool_schema_order *order = tool_schema_orders_find(orders, tc->name);
+        buf_puts(b, "<｜DSML｜invoke name=\"");
+        append_dsml_attr_escaped(b, tc->name);
+        buf_puts(b, "\">\n");
+        if (!append_dsml_arguments_from_json(b, tc->arguments, order)) {
+            buf_puts(b, "<｜DSML｜parameter name=\"arguments\" string=\"true\">");
+            append_dsml_text_escaped(b, tc->arguments);
+            buf_puts(b, "</｜DSML｜parameter>\n");
+        }
+        buf_puts(b, "</｜DSML｜invoke>\n");
+    }
+    buf_puts(b, "</｜DSML｜tool_calls>");
+}
+
+static bool role_is_system(const char *role) {
+    return !strcmp(role, "system") || !strcmp(role, "developer");
+}
+
+static bool role_is_user_like(const char *role) {
+    return !strcmp(role, "user") || !strcmp(role, "tool") || !strcmp(role, "function");
+}
+
+static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
+                                     const tool_schema_orders *tool_orders,
+                                     ds4_think_mode think_mode) {
+    const bool think = ds4_think_mode_enabled(think_mode);
+    bool tool_context = tool_schemas && tool_schemas[0];
+    int last_user_idx = -1;
+    buf system = {0};
+    for (int i = 0; i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (!role_is_system(m->role)) continue;
+        if (system.len) buf_puts(&system, "\n\n");
+        buf_puts(&system, m->content ? m->content : "");
+    }
+    for (int i = 0; i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_user_like(m->role)) last_user_idx = i;
+        if ((!strcmp(m->role, "assistant") && m->calls.len > 0) ||
+            !strcmp(m->role, "tool") || !strcmp(m->role, "function"))
+        {
+            tool_context = true;
+        }
+    }
+
+    if (tool_schemas && tool_schemas[0]) {
+        if (system.len) buf_puts(&system, "\n\n");
+        append_tools_prompt_text(&system, tool_schemas);
+    }
+
+    buf out = {0};
+    buf_puts(&out, "<｜begin▁of▁sentence｜>");
+    if (think_mode == DS4_THINK_MAX) buf_puts(&out, ds4_think_max_prefix());
+    buf_puts(&out, system.ptr ? system.ptr : "");
+
+    bool pending_assistant = false;
+    bool pending_tool_result = false;
+    for (int i = 0; i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_system(m->role)) {
+            continue;
+        } else if (!strcmp(m->role, "user")) {
+            buf_puts(&out, "<｜User｜>");
+            buf_puts(&out, m->content ? m->content : "");
+            pending_assistant = true;
+            pending_tool_result = false;
+        } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
+            if (!pending_tool_result) buf_puts(&out, "<｜User｜>");
+            buf_puts(&out, "<tool_result>");
+            append_dsml_text_escaped(&out, m->content);
+            buf_puts(&out, "</tool_result>");
+            pending_assistant = true;
+            pending_tool_result = true;
+        } else if (!strcmp(m->role, "assistant")) {
+            if (pending_assistant) {
+                buf_puts(&out, "<｜Assistant｜>");
+                if (think) {
+                    if (tool_context || i > last_user_idx) {
+                        buf_puts(&out, "<think>");
+                        buf_puts(&out, m->reasoning ? m->reasoning : "");
+                        buf_puts(&out, "</think>");
+                    } else {
+                        buf_puts(&out, "</think>");
+                    }
+                } else {
+                    buf_puts(&out, "</think>");
+                }
+            }
+            buf_puts(&out, m->content ? m->content : "");
+            append_dsml_tool_calls_text(&out, &m->calls, tool_orders);
+            buf_puts(&out, "<｜end▁of▁sentence｜>");
+            pending_assistant = false;
+            pending_tool_result = false;
+        }
+    }
+
+    if (pending_assistant) {
+        buf_puts(&out, "<｜Assistant｜>");
+        buf_puts(&out, think ? "<think>" : "</think>");
+    }
+
+    buf_free(&system);
+    return buf_take(&out);
+}
+
+/* The API parsers are intentionally selective JSON parsers: they keep only
+ * fields that affect model semantics, rendering, streaming, or cache keys, and
+ * skip extension fields.  The output is always a rendered DS4 chat/completion
+ * prompt plus the small amount of protocol state needed to translate the reply. */
+static bool parse_chat_request(ds4_engine *e, const char *body, int def_tokens,
+                               int ctx_size, request *r, char *err, size_t errlen) {
+    request_init(r, REQ_CHAT, def_tokens);
+    const char *p = body;
+    bool got_messages = false;
+    bool tool_choice_none = false;
+    bool got_thinking = false;
+    bool thinking_enabled = true;
+    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    chat_msgs msgs = {0};
+    char *tool_schemas = NULL;
+
+    json_ws(&p);
+    if (*p != '{') goto bad;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto bad;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto bad;
+        }
+        p++;
+        if (!strcmp(key, "messages")) {
+            chat_msgs_free(&msgs);
+            if (!parse_messages(&p, &msgs)) {
+                free(key);
+                goto bad;
+            }
+            got_messages = true;
+        } else if (!strcmp(key, "tools")) {
+            free(tool_schemas);
+            tool_schemas = NULL;
+            if (!parse_tools_value(&p, &tool_schemas, &r->tool_orders)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "tool_choice")) {
+            json_ws(&p);
+            if (*p == '"') {
+                char *choice = NULL;
+                if (!json_string(&p, &choice)) {
+                    free(key);
+                    goto bad;
+                }
+                tool_choice_none = !strcmp(choice, "none");
+                free(choice);
+            } else if (!json_skip_value(&p)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "model")) {
+            free(r->model);
+            if (!json_string(&p, &r->model)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "max_tokens") || !strcmp(key, "max_completion_tokens")) {
+            if (!json_int(&p, &r->max_tokens)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "temperature")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->temperature = (float)v;
+        } else if (!strcmp(key, "top_p")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->top_p = (float)v;
+        } else if (!strcmp(key, "min_p")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->min_p = (float)v;
+        } else if (!strcmp(key, "top_k")) {
+            if (!json_int(&p, &r->top_k)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "seed")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->seed = v > 0.0 ? (uint64_t)v : 0;
+        } else if (!strcmp(key, "stream")) {
+            if (!json_bool(&p, &r->stream)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "stream_options")) {
+            if (!parse_stream_options(&p, &r->stream_include_usage)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "thinking")) {
+            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+                free(key);
+                goto bad;
+            }
+            got_thinking = true;
+        } else if (!strcmp(key, "reasoning_effort")) {
+            if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "think")) {
+            if (!json_bool(&p, &thinking_enabled)) {
+                free(key);
+                goto bad;
+            }
+            got_thinking = true;
+        } else if (!strcmp(key, "stop")) {
+            if (!parse_stop(&p, &r->stops)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            goto bad;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    if (*p != '}') goto bad;
+    if (!got_messages) {
+        snprintf(err, errlen, "missing messages");
+        chat_msgs_free(&msgs);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
+    r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
+    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
+    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    r->think_mode = ds4_think_mode_for_context(
+        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    r->prompt_text = render_chat_prompt_text(&msgs, r->has_tools ? tool_schemas : NULL,
+                                             &r->tool_orders, r->think_mode);
+    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    chat_msgs_free(&msgs);
+    free(tool_schemas);
+    return true;
+bad:
+    chat_msgs_free(&msgs);
+    free(tool_schemas);
+    snprintf(err, errlen, "invalid JSON request");
+    request_free(r);
+    return false;
+}
+
+static bool parse_anthropic_request(ds4_engine *e, const char *body, int def_tokens,
+                                    int ctx_size, request *r, char *err, size_t errlen) {
+    request_init(r, REQ_CHAT, def_tokens);
+    r->api = API_ANTHROPIC;
+    const char *p = body;
+    bool got_messages = false;
+    bool tool_choice_none = false;
+    bool got_thinking = false;
+    bool thinking_enabled = true;
+    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    chat_msgs msgs = {0};
+    char *system = NULL;
+    char *tool_schemas = NULL;
+
+    json_ws(&p);
+    if (*p != '{') goto bad;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto bad;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto bad;
+        }
+        p++;
+        if (!strcmp(key, "messages")) {
+            chat_msgs_free(&msgs);
+            if (!parse_anthropic_messages(&p, &msgs)) {
+                free(key);
+                goto bad;
+            }
+            got_messages = true;
+        } else if (!strcmp(key, "system")) {
+            free(system);
+            if (!parse_anthropic_system(&p, &system)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "tools")) {
+            free(tool_schemas);
+            tool_schemas = NULL;
+            if (!parse_tools_value(&p, &tool_schemas, &r->tool_orders)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "tool_choice")) {
+            json_ws(&p);
+            if (*p == '{') {
+                p++;
+                json_ws(&p);
+                while (*p && *p != '}') {
+                    char *ckey = NULL;
+                    if (!json_string(&p, &ckey)) {
+                        free(key);
+                        goto bad;
+                    }
+                    json_ws(&p);
+                    if (*p != ':') {
+                        free(ckey);
+                        free(key);
+                        goto bad;
+                    }
+                    p++;
+                    if (!strcmp(ckey, "type")) {
+                        char *choice = NULL;
+                        if (!json_string(&p, &choice)) {
+                            free(ckey);
+                            free(key);
+                            goto bad;
+                        }
+                        tool_choice_none = !strcmp(choice, "none");
+                        free(choice);
+                    } else if (!json_skip_value(&p)) {
+                        free(ckey);
+                        free(key);
+                        goto bad;
+                    }
+                    free(ckey);
+                    json_ws(&p);
+                    if (*p == ',') p++;
+                    json_ws(&p);
+                }
+                if (*p != '}') {
+                    free(key);
+                    goto bad;
+                }
+                p++;
+            } else if (!json_skip_value(&p)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "model")) {
+            free(r->model);
+            if (!json_string(&p, &r->model)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "max_tokens")) {
+            if (!json_int(&p, &r->max_tokens)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "temperature")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->temperature = (float)v;
+        } else if (!strcmp(key, "top_p")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->top_p = (float)v;
+        } else if (!strcmp(key, "top_k")) {
+            if (!json_int(&p, &r->top_k)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "stream")) {
+            if (!json_bool(&p, &r->stream)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "stop_sequences")) {
+            if (!parse_stop(&p, &r->stops)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "thinking")) {
+            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+                free(key);
+                goto bad;
+            }
+            got_thinking = true;
+        } else if (!strcmp(key, "output_config")) {
+            if (!parse_output_config_effort(&p, &reasoning_effort)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "reasoning_effort")) {
+            if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            goto bad;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    if (*p != '}') goto bad;
+    if (!got_messages) {
+        snprintf(err, errlen, "missing messages");
+        chat_msgs_free(&msgs);
+        free(system);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
+    if (system && system[0]) {
+        chat_msg msg = {0};
+        msg.role = xstrdup("system");
+        msg.content = system;
+        system = NULL;
+        chat_msgs_push(&msgs, msg);
+    }
+    r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
+    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
+    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    r->think_mode = ds4_think_mode_for_context(
+        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    r->prompt_text = render_chat_prompt_text(&msgs, r->has_tools ? tool_schemas : NULL,
+                                             &r->tool_orders, r->think_mode);
+    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    chat_msgs_free(&msgs);
+    free(system);
+    free(tool_schemas);
+    return true;
+bad:
+    chat_msgs_free(&msgs);
+    free(system);
+    free(tool_schemas);
+    snprintf(err, errlen, "invalid JSON request");
+    request_free(r);
+    return false;
+}
+
+static bool parse_prompt(const char **p, char **out) {
+    json_ws(p);
+    if (**p == '"') return json_string(p, out);
+    if (**p != '[') {
+        if (!json_skip_value(p)) return false;
+        *out = xstrdup("");
+        return true;
+    }
+    (*p)++;
+    json_ws(p);
+    if (**p == '"') {
+        if (!json_string(p, out)) return false;
+    } else {
+        *out = xstrdup("");
+        if (**p && **p != ']' && !json_skip_value(p)) return false;
+    }
+    while (**p && **p != ']') {
+        json_ws(p);
+        if (**p == ',') {
+            (*p)++;
+            if (!json_skip_value(p)) return false;
+        } else {
+            break;
+        }
+    }
+    if (**p != ']') return false;
+    (*p)++;
+    return true;
+}
+
+static bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
+                                     int ctx_size, request *r, char *err, size_t errlen) {
+    request_init(r, REQ_COMPLETION, def_tokens);
+    const char *p = body;
+    char *prompt = NULL;
+    bool got_thinking = false;
+    bool thinking_enabled = true;
+    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+
+    json_ws(&p);
+    if (*p != '{') goto bad;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto bad;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto bad;
+        }
+        p++;
+        if (!strcmp(key, "prompt")) {
+            free(prompt);
+            if (!parse_prompt(&p, &prompt)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "model")) {
+            free(r->model);
+            if (!json_string(&p, &r->model)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "max_tokens")) {
+            if (!json_int(&p, &r->max_tokens)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "temperature")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->temperature = (float)v;
+        } else if (!strcmp(key, "top_p")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->top_p = (float)v;
+        } else if (!strcmp(key, "min_p")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->min_p = (float)v;
+        } else if (!strcmp(key, "top_k")) {
+            if (!json_int(&p, &r->top_k)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "seed")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->seed = v > 0.0 ? (uint64_t)v : 0;
+        } else if (!strcmp(key, "stream")) {
+            if (!json_bool(&p, &r->stream)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "stream_options")) {
+            if (!parse_stream_options(&p, &r->stream_include_usage)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "thinking")) {
+            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+                free(key);
+                goto bad;
+            }
+            got_thinking = true;
+        } else if (!strcmp(key, "reasoning_effort")) {
+            if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "think")) {
+            if (!json_bool(&p, &thinking_enabled)) {
+                free(key);
+                goto bad;
+            }
+            got_thinking = true;
+        } else if (!strcmp(key, "stop")) {
+            if (!parse_stop(&p, &r->stops)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            goto bad;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    if (*p != '}') goto bad;
+    if (!prompt) {
+        snprintf(err, errlen, "missing prompt");
+        request_free(r);
+        return false;
+    }
+    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
+    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    r->think_mode = ds4_think_mode_for_context(
+        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    buf rendered = {0};
+    buf_puts(&rendered, "<｜begin▁of▁sentence｜>");
+    if (r->think_mode == DS4_THINK_MAX) buf_puts(&rendered, ds4_think_max_prefix());
+    buf_puts(&rendered, "You are a helpful assistant<｜User｜>");
+    buf_puts(&rendered, prompt);
+    buf_puts(&rendered, "<｜Assistant｜>");
+    buf_puts(&rendered, ds4_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
+    r->prompt_text = buf_take(&rendered);
+    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    free(prompt);
+    return true;
+bad:
+    free(prompt);
+    snprintf(err, errlen, "invalid JSON request");
+    request_free(r);
+    return false;
+}
+
+static long long wall_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+static bool send_all(int fd, const void *p, size_t n) {
+    const char *s = p;
+    long long deadline = wall_ms() + DS4_SERVER_SEND_STALL_TIMEOUT_MS;
+    while (n) {
+        if (g_stop_requested) return false;
+        ssize_t w = send(fd, s, n, 0);
+        if (w < 0 && errno == EINTR) continue;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            long long remaining = deadline - wall_ms();
+            if (remaining <= 0) return false;
+            struct pollfd pfd = {.fd = fd, .events = POLLOUT};
+            int timeout = remaining > 50 ? 50 : (int)remaining;
+            int rc;
+            do {
+                rc = poll(&pfd, 1, timeout);
+            } while (rc < 0 && errno == EINTR);
+            if (rc < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) return false;
+            continue;
+        }
+        if (w <= 0) return false;
+        s += w;
+        n -= (size_t)w;
+        deadline = wall_ms() + DS4_SERVER_SEND_STALL_TIMEOUT_MS;
+    }
+    return true;
+}
+
+static void json_escape(buf *b, const char *s) {
+    buf_putc(b, '"');
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') {
+            buf_putc(b, '\\');
+            buf_putc(b, (char)c);
+        } else if (c == '\n') {
+            buf_puts(b, "\\n");
+        } else if (c == '\r') {
+            buf_puts(b, "\\r");
+        } else if (c == '\t') {
+            buf_puts(b, "\\t");
+        } else if (c < 0x20) {
+            buf_printf(b, "\\u%04x", (unsigned)c);
+        } else {
+            buf_putc(b, (char)c);
+        }
+    }
+    buf_putc(b, '"');
+}
+
+static void json_escape_n(buf *b, const char *s, size_t n) {
+    char *tmp = xstrndup(s ? s : "", n);
+    json_escape(b, tmp);
+    free(tmp);
+}
+
+static void json_escape_fragment_n(buf *b, const char *s, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '"' || c == '\\') {
+            buf_putc(b, '\\');
+            buf_putc(b, (char)c);
+        } else if (c == '\n') {
+            buf_puts(b, "\\n");
+        } else if (c == '\r') {
+            buf_puts(b, "\\r");
+        } else if (c == '\t') {
+            buf_puts(b, "\\t");
+        } else if (c < 0x20) {
+            buf_printf(b, "\\u%04x", (unsigned)c);
+        } else {
+            buf_putc(b, (char)c);
+        }
+    }
+}
+
+#define DS4_DSML "｜DSML｜"
+#define DS4_DSML_SHORT "DSML｜"
+#define DS4_TOOL_CALLS_START "<" DS4_DSML "tool_calls>"
+#define DS4_TOOL_CALLS_END "</" DS4_DSML "tool_calls>"
+#define DS4_INVOKE_START "<" DS4_DSML "invoke"
+#define DS4_INVOKE_END "</" DS4_DSML "invoke>"
+#define DS4_PARAM_START "<" DS4_DSML "parameter"
+#define DS4_PARAM_END "</" DS4_DSML "parameter>"
+#define DS4_TOOL_CALLS_START_SHORT "<" DS4_DSML_SHORT "tool_calls>"
+#define DS4_TOOL_CALLS_END_SHORT "</" DS4_DSML_SHORT "tool_calls>"
+#define DS4_INVOKE_START_SHORT "<" DS4_DSML_SHORT "invoke"
+#define DS4_INVOKE_END_SHORT "</" DS4_DSML_SHORT "invoke>"
+#define DS4_PARAM_START_SHORT "<" DS4_DSML_SHORT "parameter"
+#define DS4_PARAM_END_SHORT "</" DS4_DSML_SHORT "parameter>"
+
+static bool tool_calls_started(const char *text) {
+    return text && (strstr(text, DS4_TOOL_CALLS_START) ||
+                    strstr(text, DS4_TOOL_CALLS_START_SHORT) ||
+                    strstr(text, "<tool_calls>"));
+}
+
+static bool tool_calls_finished(const char *text) {
+    return text && (strstr(text, DS4_TOOL_CALLS_END) ||
+                    strstr(text, DS4_TOOL_CALLS_END_SHORT) ||
+                    strstr(text, "</tool_calls>"));
+}
+
+static size_t trim_tool_separator_ws(const char *raw, size_t start, size_t limit) {
+    while (limit > start && isspace((unsigned char)raw[limit - 1])) limit--;
+    return limit;
+}
+
+static const char *skip_ascii_ws(const char *p) {
+    while (*p && isspace((unsigned char)*p)) p++;
+    return p;
+}
+
+/* The prompt renderer escapes DSML text so a tool argument can safely contain
+ * shell operators or closing tags.  The generated-DSML parser must undo exactly
+ * those entities before it turns parameters back into JSON; otherwise
+ * parse->render is not a stable cache key. */
+static char *dsml_unescape_text(const char *s) {
+    buf b = {0};
+    for (s = s ? s : ""; *s; s++) {
+        if (*s != '&') {
+            buf_putc(&b, *s);
+        } else if (!strncmp(s, "&amp;", 5)) {
+            buf_putc(&b, '&');
+            s += 4;
+        } else if (!strncmp(s, "&lt;", 4)) {
+            buf_putc(&b, '<');
+            s += 3;
+        } else if (!strncmp(s, "&gt;", 4)) {
+            buf_putc(&b, '>');
+            s += 3;
+        } else if (!strncmp(s, "&quot;", 6)) {
+            buf_putc(&b, '"');
+            s += 5;
+        } else if (!strncmp(s, "&apos;", 6)) {
+            buf_putc(&b, '\'');
+            s += 5;
+        } else {
+            buf_putc(&b, '&');
+        }
+    }
+    return buf_take(&b);
+}
+
+static char *dsml_attr(const char *tag, const char *name) {
+    char pat[64];
+    snprintf(pat, sizeof(pat), "%s=\"", name);
+    const char *p = strstr(tag, pat);
+    if (!p) return NULL;
+    p += strlen(pat);
+    const char *q = strchr(p, '"');
+    if (!q) return NULL;
+    char *raw = xstrndup(p, (size_t)(q - p));
+    char *decoded = dsml_unescape_text(raw);
+    free(raw);
+    return decoded;
+}
+
+static void tool_call_json_args_add(buf *args, const char *name, const char *value, const char *is_string) {
+    if (args->len) buf_puts(args, ", ");
+    json_escape(args, name ? name : "");
+    buf_puts(args, ": ");
+    if (is_string && !strcmp(is_string, "true")) {
+        json_escape(args, value ? value : "");
+    } else {
+        char *min = json_minify_raw_value(value ? value : "null");
+        buf_puts(args, min && min[0] ? min : "null");
+        free(min);
+    }
+}
+
+static void split_reasoning_content(const char *text, size_t n, char **content_out, char **reasoning_out) {
+    char *s = xstrndup(text ? text : "", n);
+    char *body = s;
+    if (!strncmp(body, "<think>", 7)) body += 7;
+
+    char *think_end = strstr(body, "</think>");
+    if (think_end) {
+        *think_end = '\0';
+        *reasoning_out = xstrdup(body);
+        *content_out = xstrdup(think_end + 8);
+    } else {
+        *reasoning_out = NULL;
+        *content_out = xstrdup(s);
+    }
+    free(s);
+}
+
+static bool parse_generated_message(const char *text, char **content_out,
+                                    char **reasoning_out, tool_calls *calls) {
+    const char *start = strstr(text, "\n\n" DS4_TOOL_CALLS_START);
+    int style = 0; /* 0: DSML, 1: plain XML, 2: DSML with the first vertical bar omitted. */
+    if (!start) start = strstr(text, DS4_TOOL_CALLS_START);
+    if (!start) {
+        start = strstr(text, "\n\n" DS4_TOOL_CALLS_START_SHORT);
+        style = start ? 2 : style;
+    }
+    if (!start) {
+        start = strstr(text, DS4_TOOL_CALLS_START_SHORT);
+        style = start ? 2 : style;
+    }
+    if (!start) {
+        start = strstr(text, "\n\n<tool_calls>");
+        style = start ? 1 : style;
+    }
+    if (!start) {
+        start = strstr(text, "<tool_calls>");
+        style = start ? 1 : style;
+    }
+    if (!start) {
+        split_reasoning_content(text, text ? strlen(text) : 0, content_out, reasoning_out);
+        return true;
+    }
+
+    size_t content_len = trim_tool_separator_ws(text, 0, (size_t)(start - text));
+    const char *tool_calls_start = DS4_TOOL_CALLS_START;
+    const char *tool_calls_end = DS4_TOOL_CALLS_END;
+    const char *invoke_start = DS4_INVOKE_START;
+    const char *invoke_end = DS4_INVOKE_END;
+    const char *param_start = DS4_PARAM_START;
+    const char *param_end = DS4_PARAM_END;
+    if (style == 1) {
+        tool_calls_start = "<tool_calls>";
+        tool_calls_end = "</tool_calls>";
+        invoke_start = "<invoke";
+        invoke_end = "</invoke>";
+        param_start = "<parameter";
+        param_end = "</parameter>";
+    } else if (style == 2) {
+        tool_calls_start = DS4_TOOL_CALLS_START_SHORT;
+        tool_calls_end = DS4_TOOL_CALLS_END_SHORT;
+        invoke_start = DS4_INVOKE_START_SHORT;
+        invoke_end = DS4_INVOKE_END_SHORT;
+        param_start = DS4_PARAM_START_SHORT;
+        param_end = DS4_PARAM_END_SHORT;
+    }
+
+    const char *p = strstr(start, tool_calls_start);
+    if (!p) return false;
+    p += strlen(tool_calls_start);
+
+    for (;;) {
+        p = skip_ascii_ws(p);
+        if (!strncmp(p, tool_calls_end, strlen(tool_calls_end))) {
+            split_reasoning_content(text, content_len, content_out, reasoning_out);
+            return true;
+        }
+        if (strncmp(p, invoke_start, strlen(invoke_start)) != 0) return false;
+        const char *tag_end = strchr(p, '>');
+        if (!tag_end) return false;
+        char *tag = xstrndup(p, (size_t)(tag_end - p + 1));
+        char *name = dsml_attr(tag, "name");
+        free(tag);
+        if (!name) return false;
+        p = tag_end + 1;
+
+        buf args = {0};
+        while (true) {
+            p = skip_ascii_ws(p);
+            if (!strncmp(p, invoke_end, strlen(invoke_end))) {
+                p += strlen(invoke_end);
+                break;
+            }
+            if (strncmp(p, param_start, strlen(param_start)) != 0) {
+                free(name);
+                buf_free(&args);
+                return false;
+            }
+            tag_end = strchr(p, '>');
+            if (!tag_end) {
+                free(name);
+                buf_free(&args);
+                return false;
+            }
+            tag = xstrndup(p, (size_t)(tag_end - p + 1));
+            char *param_name = dsml_attr(tag, "name");
+            char *param_is_string = dsml_attr(tag, "string");
+            free(tag);
+            if (!param_name || !param_is_string) {
+                free(name);
+                free(param_name);
+                free(param_is_string);
+                buf_free(&args);
+                return false;
+            }
+            const char *value_start = tag_end + 1;
+            const char *value_end = strstr(value_start, param_end);
+            if (!value_end) {
+                free(name);
+                free(param_name);
+                free(param_is_string);
+                buf_free(&args);
+                return false;
+            }
+            char *raw_value = xstrndup(value_start, (size_t)(value_end - value_start));
+            char *value = param_is_string && !strcmp(param_is_string, "true") ?
+                dsml_unescape_text(raw_value) : xstrdup(raw_value);
+            tool_call_json_args_add(&args, param_name, value, param_is_string);
+            free(param_name);
+            free(param_is_string);
+            free(raw_value);
+            free(value);
+            p = value_end + strlen(param_end);
+        }
+
+        tool_call tc = {0};
+        tc.name = name;
+        buf wrapped = {0};
+        buf_putc(&wrapped, '{');
+        buf_puts(&wrapped, args.ptr ? args.ptr : "");
+        buf_putc(&wrapped, '}');
+        tc.arguments = buf_take(&wrapped);
+        tool_calls_push(calls, tc);
+        buf_free(&args);
+    }
+}
+
+static void append_ordered_json_string(buf *b, const char *json, const tool_schema_order *order) {
+    buf tmp = {0};
+    append_json_object_ordered_or_empty(&tmp, json, order);
+    json_escape(b, tmp.ptr ? tmp.ptr : "{}");
+    buf_free(&tmp);
+}
+
+static void append_tool_calls_json(buf *b, const tool_calls *calls, const char *id_prefix,
+                                   const tool_schema_orders *orders) {
+    buf_putc(b, '[');
+    for (int i = 0; i < calls->len; i++) {
+        const tool_call *tc = &calls->v[i];
+        const tool_schema_order *order = tool_schema_orders_find(orders, tc->name);
+        if (i) buf_putc(b, ',');
+        char idbuf[128];
+        snprintf(idbuf, sizeof(idbuf), "%s_tool_%d", id_prefix, i);
+        buf_puts(b, "{\"id\":");
+        json_escape(b, tc->id ? tc->id : idbuf);
+        buf_puts(b, ",\"type\":\"function\",\"function\":{\"name\":");
+        json_escape(b, tc->name ? tc->name : "");
+        buf_puts(b, ",\"arguments\":");
+        append_ordered_json_string(b, tc->arguments, order);
+        buf_puts(b, "}}");
+    }
+    buf_putc(b, ']');
+}
+
+static void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const char *id_prefix,
+                                         const tool_schema_orders *orders) {
+    buf_putc(b, '[');
+    for (int i = 0; i < calls->len; i++) {
+        const tool_call *tc = &calls->v[i];
+        const tool_schema_order *order = tool_schema_orders_find(orders, tc->name);
+        if (i) buf_putc(b, ',');
+        char idbuf[128];
+        snprintf(idbuf, sizeof(idbuf), "%s_tool_%d", id_prefix, i);
+        buf_puts(b, "{\"index\":");
+        buf_printf(b, "%d", i);
+        buf_puts(b, ",\"id\":");
+        json_escape(b, tc->id ? tc->id : idbuf);
+        buf_puts(b, ",\"type\":\"function\",\"function\":{\"name\":");
+        json_escape(b, tc->name ? tc->name : "");
+        buf_puts(b, ",\"arguments\":");
+        append_ordered_json_string(b, tc->arguments, order);
+        buf_puts(b, "}}");
+    }
+    buf_putc(b, ']');
+}
+
+static bool http_response(int fd, int code, const char *type, const char *body) {
+    const char *reason = code == 200 ? "OK" :
+                         code == 400 ? "Bad Request" :
+                         code == 404 ? "Not Found" :
+                         code == 500 ? "Internal Server Error" : "Error";
+    buf h = {0};
+    buf_printf(&h,
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n\r\n",
+        code, reason, type, strlen(body));
+    bool ok = send_all(fd, h.ptr, h.len) && send_all(fd, body, strlen(body));
+    buf_free(&h);
+    return ok;
+}
+
+static bool http_error(int fd, int code, const char *msg) {
+    buf b = {0};
+    buf_puts(&b, "{\"error\":{\"message\":");
+    json_escape(&b, msg);
+    buf_puts(&b, ",\"type\":\"invalid_request_error\"}}\n");
+    bool ok = http_response(fd, code, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+/* Streaming is a translation state machine over the raw DS4 text.  The model
+ * may produce <think> and DSML tool blocks; clients should receive those as
+ * protocol-native reasoning/tool deltas, never as visible assistant text. */
+static bool sse_headers(int fd) {
+    const char *h =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/event-stream\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: close\r\n\r\n";
+    return send_all(fd, h, strlen(h));
+}
+
+static bool sse_chunk(int fd, const request *r, const char *id, const char *text, const char *finish) {
+    buf b = {0};
+    long now = (long)time(NULL);
+    if (r->kind == REQ_CHAT) {
+        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+        json_escape(&b, r->model);
+        buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":");
+        if (text) {
+            buf_puts(&b, "{\"content\":");
+            json_escape(&b, text);
+            buf_putc(&b, '}');
+        } else {
+            buf_puts(&b, finish ? "{}" : "{\"role\":\"assistant\"}");
+        }
+        buf_puts(&b, ",\"finish_reason\":");
+        if (finish) json_escape(&b, finish); else buf_puts(&b, "null");
+        buf_puts(&b, "}]}\n\n");
+    } else {
+        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":", id, now);
+        json_escape(&b, r->model);
+        buf_puts(&b, ",\"choices\":[{\"text\":");
+        json_escape(&b, text ? text : "");
+        buf_puts(&b, ",\"index\":0,\"finish_reason\":");
+        if (finish) json_escape(&b, finish); else buf_puts(&b, "null");
+        buf_puts(&b, "}]}\n\n");
+    }
+    bool ok = send_all(fd, b.ptr, b.len);
+    buf_free(&b);
+    return ok;
+}
+
+static bool sse_usage_chunk(int fd, const request *r, const char *id,
+                            int prompt_tokens, int completion_tokens) {
+    if (!r->stream_include_usage) return true;
+
+    buf b = {0};
+    long now = (long)time(NULL);
+    if (r->kind == REQ_CHAT) {
+        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+        json_escape(&b, r->model);
+        buf_puts(&b, ",\"choices\":[],\"usage\":");
+    } else {
+        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":", id, now);
+        json_escape(&b, r->model);
+        buf_puts(&b, ",\"choices\":[],\"usage\":");
+    }
+    buf_printf(&b,
+               "{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}\n\n",
+               prompt_tokens, completion_tokens, prompt_tokens + completion_tokens);
+
+    bool ok = send_all(fd, b.ptr, b.len);
+    buf_free(&b);
+    return ok;
+}
+
+static bool sse_done(int fd, const request *r, const char *id,
+                     int prompt_tokens, int completion_tokens) {
+    return sse_usage_chunk(fd, r, id, prompt_tokens, completion_tokens) &&
+           send_all(fd, "data: [DONE]\n\n", 14);
+}
+
+static bool sse_chat_finish(int fd, const request *r, const char *id, const char *content,
+                            const char *reasoning, const tool_calls *calls, const char *finish,
+                            int prompt_tokens, int completion_tokens) {
+    if (!sse_chunk(fd, r, id, NULL, NULL)) return false;
+
+    buf b = {0};
+    long now = (long)time(NULL);
+    if (reasoning && reasoning[0]) {
+        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+        json_escape(&b, r->model);
+        buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":");
+        json_escape(&b, reasoning);
+        buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
+    }
+    if (content && content[0]) {
+        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+        json_escape(&b, r->model);
+        buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"content\":");
+        json_escape(&b, content);
+        buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
+    }
+    if (calls && calls->len) {
+        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+        json_escape(&b, r->model);
+        buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
+        append_tool_call_deltas_json(&b, calls, id, &r->tool_orders);
+        buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
+    }
+    buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+    json_escape(&b, r->model);
+    buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":");
+    json_escape(&b, finish);
+    buf_puts(&b, "}]}\n\n");
+
+    bool ok = send_all(fd, b.ptr, b.len) &&
+              sse_done(fd, r, id, prompt_tokens, completion_tokens);
+    buf_free(&b);
+    return ok;
+}
+
+typedef enum {
+    OPENAI_STREAM_THINKING,
+    OPENAI_STREAM_TEXT,
+    OPENAI_STREAM_TOOL,
+    OPENAI_STREAM_SUPPRESS,
+} openai_stream_mode;
+
+typedef enum {
+    OPENAI_TOOL_BETWEEN_INVOKES,
+    OPENAI_TOOL_BETWEEN_PARAMS,
+    OPENAI_TOOL_PARAM_VALUE,
+    OPENAI_TOOL_DONE,
+    OPENAI_TOOL_ERROR,
+} openai_tool_stream_state;
+
+typedef struct {
+    openai_tool_stream_state state;
+    const char *tool_calls_end;
+    const char *invoke_start;
+    const char *invoke_end;
+    const char *param_start;
+    const char *param_end;
+    size_t parse_pos;
+    int index;
+    bool active;
+    bool emitted_any;
+    bool args_open;
+    bool first_param;
+    bool param_is_string;
+} openai_tool_stream;
+
+typedef struct {
+    openai_stream_mode mode;
+    size_t emit_pos;
+    bool active;
+    bool checked_think_prefix;
+    bool sent_reasoning;
+    bool sent_content;
+    openai_tool_stream tool;
+} openai_stream;
+
+static void openai_stream_start(const request *r, openai_stream *st) {
+    memset(st, 0, sizeof(*st));
+    st->active = true;
+    st->mode = ds4_think_mode_enabled(r->think_mode) ? OPENAI_STREAM_THINKING : OPENAI_STREAM_TEXT;
+}
+
+static const char *find_any_tool_start(const char *s);
+static size_t text_stream_safe_limit(const char *raw, size_t start,
+                                     size_t raw_len, bool has_tools,
+                                     bool final);
+
+static bool sse_chat_delta_n(int fd, const request *r, const char *id,
+                             const char *field, const char *text, size_t len) {
+    if (len == 0) return true;
+    buf b = {0};
+    long now = (long)time(NULL);
+    buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+    json_escape(&b, r->model);
+    buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{");
+    json_escape(&b, field);
+    buf_putc(&b, ':');
+    json_escape_n(&b, text, len);
+    buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
+    bool ok = send_all(fd, b.ptr, b.len);
+    buf_free(&b);
+    return ok;
+}
+
+/* OpenAI clients can consume function.arguments as a stream of JSON text
+ * fragments.  DS4 generates XML-ish DSML instead, so this parser switches to a
+ * hidden tool mode at <...tool_calls>, emits the tool header once the invoke tag
+ * is complete, then translates each parameter body into argument deltas while
+ * holding only tiny tails for partial closing tags, UTF-8, and DSML entities. */
+static bool sse_chat_tool_call_start_delta(int fd, const request *r, const char *id,
+                                           int index, const char *name) {
+    buf b = {0};
+    char tool_id[128];
+    long now = (long)time(NULL);
+    snprintf(tool_id, sizeof(tool_id), "%s_tool_%d", id, index);
+    buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+    json_escape(&b, r->model);
+    buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":");
+    buf_printf(&b, "%d", index);
+    buf_puts(&b, ",\"id\":");
+    json_escape(&b, tool_id);
+    buf_puts(&b, ",\"type\":\"function\",\"function\":{\"name\":");
+    json_escape(&b, name ? name : "");
+    buf_puts(&b, ",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n");
+    bool ok = send_all(fd, b.ptr, b.len);
+    buf_free(&b);
+    return ok;
+}
+
+static bool sse_chat_tool_call_args_delta_n(int fd, const request *r, const char *id,
+                                            int index, const char *text, size_t len) {
+    if (len == 0) return true;
+    buf b = {0};
+    long now = (long)time(NULL);
+    buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+    json_escape(&b, r->model);
+    buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":");
+    buf_printf(&b, "%d", index);
+    buf_puts(&b, ",\"function\":{\"arguments\":");
+    json_escape_n(&b, text, len);
+    buf_puts(&b, "}}]},\"finish_reason\":null}]}\n\n");
+    bool ok = send_all(fd, b.ptr, b.len);
+    buf_free(&b);
+    return ok;
+}
+
+static bool raw_full_lit(const char *raw, size_t raw_len, size_t pos, const char *lit) {
+    size_t n = strlen(lit);
+    return pos <= raw_len && raw_len - pos >= n && !memcmp(raw + pos, lit, n);
+}
+
+static bool raw_partial_lit(const char *raw, size_t raw_len, size_t pos, const char *lit) {
+    size_t n = strlen(lit);
+    if (pos > raw_len || raw_len - pos >= n) return false;
+    return !memcmp(raw + pos, lit, raw_len - pos);
+}
+
+static bool raw_partial_any(const char *raw, size_t raw_len, size_t pos,
+                            const char *a, const char *b) {
+    return raw_partial_lit(raw, raw_len, pos, a) || raw_partial_lit(raw, raw_len, pos, b);
+}
+
+static const char *find_lit_bounded(const char *s, size_t n, const char *lit) {
+    size_t m = strlen(lit);
+    if (m == 0) return s;
+    if (n < m) return NULL;
+    for (size_t i = 0; i <= n - m; i++) {
+        if (!memcmp(s + i, lit, m)) return s + i;
+    }
+    return NULL;
+}
+
+static size_t dsml_entity_stream_safe_len(const char *raw, size_t start, size_t limit) {
+    static const char *ents[] = {"&amp;", "&lt;", "&gt;", "&quot;", "&apos;"};
+    const size_t max_ent = 6;
+    size_t scan = limit > start + max_ent ? limit - max_ent : start;
+    for (size_t i = limit; i > scan; i--) {
+        if (raw[i - 1] != '&') continue;
+        size_t amp = i - 1;
+        size_t tail = limit - amp;
+        for (size_t ei = 0; ei < sizeof(ents) / sizeof(ents[0]); ei++) {
+            size_t elen = strlen(ents[ei]);
+            if (tail < elen && !memcmp(raw + amp, ents[ei], tail)) return amp;
+        }
+        break;
+    }
+    return limit;
+}
+
+static size_t tool_param_value_stream_safe_len(const char *raw, size_t start,
+                                               size_t raw_len, const char *param_end,
+                                               bool is_string) {
+    size_t limit = raw_len;
+    size_t end_len = strlen(param_end);
+    size_t scan = raw_len > start + end_len ? raw_len - end_len : start;
+    for (size_t i = raw_len; i > scan; i--) {
+        if (raw[i - 1] != '<') continue;
+        size_t marker = i - 1;
+        size_t tail = raw_len - marker;
+        if (tail < end_len && !memcmp(raw + marker, param_end, tail)) limit = marker;
+        break;
+    }
+    if (is_string) limit = dsml_entity_stream_safe_len(raw, start, limit);
+    return utf8_stream_safe_len(raw, start, limit, false);
+}
+
+static bool openai_tool_emit_args_fragment(int fd, const request *r, const char *id,
+                                           openai_tool_stream *ts,
+                                           const char *text, size_t len) {
+    return sse_chat_tool_call_args_delta_n(fd, r, id, ts->index, text, len);
+}
+
+static bool openai_tool_emit_string_value(int fd, const request *r, const char *id,
+                                          openai_tool_stream *ts,
+                                          const char *text, size_t len) {
+    if (len == 0) return true;
+    char *raw = xstrndup(text, len);
+    char *unescaped = dsml_unescape_text(raw);
+    buf frag = {0};
+    json_escape_fragment_n(&frag, unescaped, strlen(unescaped));
+    bool ok = openai_tool_emit_args_fragment(fd, r, id, ts, frag.ptr ? frag.ptr : "", frag.len);
+    buf_free(&frag);
+    free(unescaped);
+    free(raw);
+    return ok;
+}
+
+static bool openai_tool_emit_param_prefix(int fd, const request *r, const char *id,
+                                          openai_tool_stream *ts,
+                                          const char *name, bool is_string) {
+    buf frag = {0};
+    if (ts->first_param) ts->first_param = false;
+    else buf_putc(&frag, ',');
+    json_escape(&frag, name ? name : "");
+    buf_putc(&frag, ':');
+    if (is_string) buf_putc(&frag, '"');
+    bool ok = openai_tool_emit_args_fragment(fd, r, id, ts, frag.ptr ? frag.ptr : "", frag.len);
+    buf_free(&frag);
+    return ok;
+}
+
+static bool openai_tool_stream_init(openai_tool_stream *ts, const char *raw,
+                                    size_t raw_len, size_t pos) {
+    memset(ts, 0, sizeof(*ts));
+    ts->active = true;
+    ts->state = OPENAI_TOOL_BETWEEN_INVOKES;
+    ts->parse_pos = pos;
+    if (raw_full_lit(raw, raw_len, pos, DS4_TOOL_CALLS_START)) {
+        ts->parse_pos += strlen(DS4_TOOL_CALLS_START);
+        ts->tool_calls_end = DS4_TOOL_CALLS_END;
+        ts->invoke_start = DS4_INVOKE_START;
+        ts->invoke_end = DS4_INVOKE_END;
+        ts->param_start = DS4_PARAM_START;
+        ts->param_end = DS4_PARAM_END;
+    } else if (raw_full_lit(raw, raw_len, pos, DS4_TOOL_CALLS_START_SHORT)) {
+        ts->parse_pos += strlen(DS4_TOOL_CALLS_START_SHORT);
+        ts->tool_calls_end = DS4_TOOL_CALLS_END_SHORT;
+        ts->invoke_start = DS4_INVOKE_START_SHORT;
+        ts->invoke_end = DS4_INVOKE_END_SHORT;
+        ts->param_start = DS4_PARAM_START_SHORT;
+        ts->param_end = DS4_PARAM_END_SHORT;
+    } else if (raw_full_lit(raw, raw_len, pos, "<tool_calls>")) {
+        ts->parse_pos += strlen("<tool_calls>");
+        ts->tool_calls_end = "</tool_calls>";
+        ts->invoke_start = "<invoke";
+        ts->invoke_end = "</invoke>";
+        ts->param_start = "<parameter";
+        ts->param_end = "</parameter>";
+    } else {
+        ts->active = false;
+        ts->state = OPENAI_TOOL_ERROR;
+        return false;
+    }
+    return true;
+}
+
+static bool openai_tool_stream_fail(openai_tool_stream *ts) {
+    ts->active = false;
+    ts->state = OPENAI_TOOL_ERROR;
+    return true;
+}
+
+static bool openai_tool_start_invoke(int fd, const request *r, const char *id,
+                                     openai_tool_stream *ts,
+                                     const char *raw, size_t raw_len) {
+    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+    if (!tag_end) return true;
+    char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
+    char *name = dsml_attr(tag, "name");
+    free(tag);
+    if (!name) return openai_tool_stream_fail(ts);
+
+    bool ok = sse_chat_tool_call_start_delta(fd, r, id, ts->index, name) &&
+              openai_tool_emit_args_fragment(fd, r, id, ts, "{", 1);
+    free(name);
+    if (!ok) return false;
+
+    ts->emitted_any = true;
+    ts->args_open = true;
+    ts->first_param = true;
+    ts->parse_pos = (size_t)(tag_end - raw) + 1;
+    ts->state = OPENAI_TOOL_BETWEEN_PARAMS;
+    return true;
+}
+
+static bool openai_tool_start_param(int fd, const request *r, const char *id,
+                                    openai_tool_stream *ts,
+                                    const char *raw, size_t raw_len) {
+    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+    if (!tag_end) return true;
+    char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
+    char *name = dsml_attr(tag, "name");
+    char *is_string = dsml_attr(tag, "string");
+    free(tag);
+    if (!name || !is_string) {
+        free(name);
+        free(is_string);
+        return openai_tool_stream_fail(ts);
+    }
+    bool string_value = !strcmp(is_string, "true");
+    bool ok = openai_tool_emit_param_prefix(fd, r, id, ts, name, string_value);
+    free(name);
+    free(is_string);
+    if (!ok) return false;
+
+    ts->param_is_string = string_value;
+    ts->parse_pos = (size_t)(tag_end - raw) + 1;
+    ts->state = OPENAI_TOOL_PARAM_VALUE;
+    return true;
+}
+
+static bool openai_tool_finish_param(int fd, const request *r, const char *id,
+                                     openai_tool_stream *ts,
+                                     const char *raw, size_t value_end) {
+    if (value_end > ts->parse_pos) {
+        bool ok = ts->param_is_string ?
+            openai_tool_emit_string_value(fd, r, id, ts, raw + ts->parse_pos,
+                                          value_end - ts->parse_pos) :
+            openai_tool_emit_args_fragment(fd, r, id, ts, raw + ts->parse_pos,
+                                           value_end - ts->parse_pos);
+        if (!ok) return false;
+    }
+    if (ts->param_is_string &&
+        !openai_tool_emit_args_fragment(fd, r, id, ts, "\"", 1)) return false;
+    ts->parse_pos = value_end + strlen(ts->param_end);
+    ts->state = OPENAI_TOOL_BETWEEN_PARAMS;
+    return true;
+}
+
+static bool openai_tool_stream_update(int fd, const request *r, const char *id,
+                                      openai_tool_stream *ts,
+                                      const char *raw, size_t raw_len) {
+    while (ts->active && ts->parse_pos < raw_len) {
+        if (ts->state == OPENAI_TOOL_BETWEEN_INVOKES) {
+            while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
+            if (ts->parse_pos >= raw_len) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->tool_calls_end)) {
+                ts->parse_pos += strlen(ts->tool_calls_end);
+                ts->active = false;
+                ts->state = OPENAI_TOOL_DONE;
+                return true;
+            }
+            if (raw_partial_any(raw, raw_len, ts->parse_pos, ts->tool_calls_end, ts->invoke_start)) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->invoke_start)) {
+                size_t before_pos = ts->parse_pos;
+                openai_tool_stream_state before_state = ts->state;
+                if (!openai_tool_start_invoke(fd, r, id, ts, raw, raw_len)) return false;
+                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
+                continue;
+            }
+            return openai_tool_stream_fail(ts);
+        }
+
+        if (ts->state == OPENAI_TOOL_BETWEEN_PARAMS) {
+            while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
+            if (ts->parse_pos >= raw_len) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->invoke_end)) {
+                if (ts->args_open &&
+                    !openai_tool_emit_args_fragment(fd, r, id, ts, "}", 1)) return false;
+                ts->args_open = false;
+                ts->parse_pos += strlen(ts->invoke_end);
+                ts->index++;
+                ts->state = OPENAI_TOOL_BETWEEN_INVOKES;
+                continue;
+            }
+            if (raw_partial_any(raw, raw_len, ts->parse_pos, ts->invoke_end, ts->param_start)) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->param_start)) {
+                size_t before_pos = ts->parse_pos;
+                openai_tool_stream_state before_state = ts->state;
+                if (!openai_tool_start_param(fd, r, id, ts, raw, raw_len)) return false;
+                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
+                continue;
+            }
+            return openai_tool_stream_fail(ts);
+        }
+
+        if (ts->state == OPENAI_TOOL_PARAM_VALUE) {
+            const char *end = find_lit_bounded(raw + ts->parse_pos,
+                                               raw_len - ts->parse_pos,
+                                               ts->param_end);
+            if (end) {
+                if (!openai_tool_finish_param(fd, r, id, ts, raw,
+                                              (size_t)(end - raw))) return false;
+                continue;
+            }
+            size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos,
+                                                            raw_len, ts->param_end,
+                                                            ts->param_is_string);
+            if (limit > ts->parse_pos) {
+                bool ok = ts->param_is_string ?
+                    openai_tool_emit_string_value(fd, r, id, ts, raw + ts->parse_pos,
+                                                  limit - ts->parse_pos) :
+                    openai_tool_emit_args_fragment(fd, r, id, ts, raw + ts->parse_pos,
+                                                   limit - ts->parse_pos);
+                if (!ok) return false;
+                ts->parse_pos = limit;
+            }
+            return true;
+        }
+
+        return true;
+    }
+    return true;
+}
+
+static bool openai_sse_stream_update(int fd, const request *r, const char *id,
+                                     openai_stream *st,
+                                     const char *raw, size_t raw_len,
+                                     bool final) {
+    if (!st->active || !raw) return true;
+
+    if (st->mode == OPENAI_STREAM_THINKING) {
+        if (!st->checked_think_prefix) {
+            const char *open = "<think>";
+            const size_t open_len = strlen(open);
+            if (raw_len < open_len && !strncmp(raw, open, raw_len) && !final) {
+                return true;
+            }
+            if (raw_len >= open_len && !strncmp(raw, open, open_len)) {
+                st->emit_pos = open_len;
+            }
+            st->checked_think_prefix = true;
+        }
+
+        const char *close = strstr(raw + st->emit_pos, "</think>");
+        size_t limit;
+        if (close) {
+            limit = (size_t)(close - raw);
+        } else if (final) {
+            limit = raw_len;
+        } else {
+            const size_t hold = strlen("</think>") - 1;
+            limit = raw_len > hold ? raw_len - hold : st->emit_pos;
+            limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
+        }
+
+        if (limit > st->emit_pos) {
+            if (!sse_chat_delta_n(fd, r, id, "reasoning_content",
+                                  raw + st->emit_pos,
+                                  limit - st->emit_pos)) return false;
+            st->sent_reasoning = true;
+            st->emit_pos = limit;
+        }
+
+        if (close) {
+            st->emit_pos = (size_t)(close - raw) + strlen("</think>");
+            st->mode = OPENAI_STREAM_TEXT;
+        } else if (final) {
+            st->mode = OPENAI_STREAM_SUPPRESS;
+            return true;
+        } else {
+            return true;
+        }
+    }
+
+    if (st->mode == OPENAI_STREAM_TEXT) {
+        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
+        size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
+                                              r->has_tools, final);
+
+        if (limit > st->emit_pos) {
+            if (!sse_chat_delta_n(fd, r, id, "content",
+                                  raw + st->emit_pos,
+                                  limit - st->emit_pos)) return false;
+            st->sent_content = true;
+            st->emit_pos = limit;
+        }
+
+        if (tool) {
+            st->emit_pos = (size_t)(tool - raw);
+            if (openai_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
+                st->mode = OPENAI_STREAM_TOOL;
+            } else {
+                st->mode = OPENAI_STREAM_SUPPRESS;
+            }
+        } else if (final) {
+            st->mode = OPENAI_STREAM_SUPPRESS;
+        }
+    }
+
+    if (st->mode == OPENAI_STREAM_TOOL) {
+        if (!openai_tool_stream_update(fd, r, id, &st->tool, raw, raw_len)) return false;
+        if (!st->tool.active) st->mode = OPENAI_STREAM_SUPPRESS;
+    }
+    return true;
+}
+
+static bool openai_sse_finish_live(int fd, const request *r, const char *id,
+                                   openai_stream *st, const char *raw,
+                                   size_t raw_len, const tool_calls *calls,
+                                   const char *finish, int prompt_tokens,
+                                   int completion_tokens) {
+    if (!openai_sse_stream_update(fd, r, id, st, raw, raw_len, true)) return false;
+
+    buf b = {0};
+    long now = (long)time(NULL);
+    if (calls && calls->len && !st->tool.emitted_any) {
+        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+        json_escape(&b, r->model);
+        buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
+        append_tool_call_deltas_json(&b, calls, id, &r->tool_orders);
+        buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
+    }
+    buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+    json_escape(&b, r->model);
+    buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":");
+    json_escape(&b, finish);
+    buf_puts(&b, "}]}\n\n");
+
+    bool ok = send_all(fd, b.ptr, b.len) &&
+              sse_done(fd, r, id, prompt_tokens, completion_tokens);
+    buf_free(&b);
+    return ok;
+}
+
+static bool request_uses_openai_live_stream(const request *r) {
+    return r->stream && r->api == API_OPENAI && r->kind == REQ_CHAT;
+}
+
+static bool request_uses_structured_stream(const request *r) {
+    return r->stream && (r->api == API_ANTHROPIC ||
+                         request_uses_openai_live_stream(r));
+}
+
+static bool final_response(int fd, const request *r, const char *id, const char *text,
+                           const char *reasoning, const tool_calls *calls, const char *finish,
+                           int prompt_tokens, int completion_tokens) {
+    buf b = {0};
+    long now = (long)time(NULL);
+    if (r->kind == REQ_CHAT) {
+        buf_printf(&b, "{\"id\":\"%s\",\"object\":\"chat.completion\",\"created\":%ld,\"model\":", id, now);
+        json_escape(&b, r->model);
+        buf_puts(&b, ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":");
+        json_escape(&b, text ? text : "");
+        if (reasoning && reasoning[0]) {
+            buf_puts(&b, ",\"reasoning_content\":");
+            json_escape(&b, reasoning);
+        }
+        if (calls && calls->len) {
+            buf_puts(&b, ",\"tool_calls\":");
+            append_tool_calls_json(&b, calls, id, &r->tool_orders);
+        }
+        buf_puts(&b, "},\"finish_reason\":");
+        json_escape(&b, finish);
+        buf_puts(&b, "}],\"usage\":");
+    } else {
+        buf_printf(&b, "{\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":", id, now);
+        json_escape(&b, r->model);
+        buf_puts(&b, ",\"choices\":[{\"text\":");
+        json_escape(&b, text);
+        buf_puts(&b, ",\"index\":0,\"finish_reason\":");
+        json_escape(&b, finish);
+        buf_puts(&b, "}],\"usage\":");
+    }
+    buf_printf(&b, "{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}\n",
+               prompt_tokens, completion_tokens, prompt_tokens + completion_tokens);
+    bool ok = http_response(fd, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static const char *anthropic_stop_reason(const char *finish) {
+    if (finish && !strcmp(finish, "tool_calls")) return "tool_use";
+    if (finish && !strcmp(finish, "length")) return "max_tokens";
+    return "end_turn";
+}
+
+static void append_anthropic_tool_use(buf *b, const tool_call *tc, const char *id_prefix, int i,
+                                      const tool_schema_orders *orders) {
+    const tool_schema_order *order = tool_schema_orders_find(orders, tc->name);
+    char idbuf[128];
+    snprintf(idbuf, sizeof(idbuf), "toolu_%s_%d", id_prefix, i);
+    buf_puts(b, "{\"type\":\"tool_use\",\"id\":");
+    json_escape(b, tc->id && tc->id[0] ? tc->id : idbuf);
+    buf_puts(b, ",\"name\":");
+    json_escape(b, tc->name ? tc->name : "");
+    buf_puts(b, ",\"input\":");
+    append_json_object_ordered_or_empty(b, tc->arguments, order);
+    buf_putc(b, '}');
+}
+
+static void append_anthropic_thinking(buf *b, const char *reasoning, const char *signature) {
+    buf_puts(b, "{\"type\":\"thinking\",\"thinking\":");
+    json_escape(b, reasoning ? reasoning : "");
+    buf_puts(b, ",\"signature\":");
+    json_escape(b, signature ? signature : "");
+    buf_putc(b, '}');
+}
+
+static void append_anthropic_content(buf *b, const char *text, const char *reasoning,
+                                     const tool_calls *calls, const char *id_prefix,
+                                     const tool_schema_orders *orders) {
+    buf_putc(b, '[');
+    bool wrote = false;
+    bool wrote_after_thinking = false;
+    if (reasoning && reasoning[0]) {
+        append_anthropic_thinking(b, reasoning, id_prefix);
+        wrote = true;
+    }
+    if (text && text[0]) {
+        if (wrote) buf_putc(b, ',');
+        buf_puts(b, "{\"type\":\"text\",\"text\":");
+        json_escape(b, text);
+        buf_putc(b, '}');
+        wrote = true;
+        wrote_after_thinking = true;
+    }
+    if (calls) {
+        for (int i = 0; i < calls->len; i++) {
+            if (wrote) buf_putc(b, ',');
+            append_anthropic_tool_use(b, &calls->v[i], id_prefix, i, orders);
+            wrote = true;
+            wrote_after_thinking = true;
+        }
+    }
+    if (!wrote || ((reasoning && reasoning[0]) && !wrote_after_thinking)) {
+        if (wrote) buf_putc(b, ',');
+        buf_puts(b, "{\"type\":\"text\",\"text\":\"\"}");
+    }
+    buf_putc(b, ']');
+}
+
+static bool anthropic_final_response(int fd, const request *r, const char *id, const char *text,
+                                     const char *reasoning, const tool_calls *calls, const char *finish,
+                                     int prompt_tokens, int completion_tokens) {
+    buf b = {0};
+    buf_printf(&b, "{\"id\":\"%s\",\"type\":\"message\",\"role\":\"assistant\",\"model\":", id);
+    json_escape(&b, r->model);
+    buf_puts(&b, ",\"content\":");
+    append_anthropic_content(&b, text, reasoning, calls, id, &r->tool_orders);
+    buf_puts(&b, ",\"stop_reason\":");
+    json_escape(&b, anthropic_stop_reason(finish));
+    buf_puts(&b, ",\"stop_sequence\":null,\"usage\":");
+    buf_printf(&b, "{\"input_tokens\":%d,\"output_tokens\":%d}}\n",
+               prompt_tokens, completion_tokens);
+    bool ok = http_response(fd, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool sse_event(int fd, const char *event, const char *data) {
+    buf b = {0};
+    buf_puts(&b, "event: ");
+    buf_puts(&b, event);
+    buf_puts(&b, "\ndata: ");
+    buf_puts(&b, data);
+    buf_puts(&b, "\n\n");
+    bool ok = send_all(fd, b.ptr, b.len);
+    buf_free(&b);
+    return ok;
+}
+
+typedef enum {
+    ANTH_STREAM_THINKING,
+    ANTH_STREAM_TEXT,
+    ANTH_STREAM_SUPPRESS,
+} anthropic_stream_mode;
+
+typedef enum {
+    ANTH_BLOCK_NONE,
+    ANTH_BLOCK_THINKING,
+    ANTH_BLOCK_TEXT,
+} anthropic_block_type;
+
+typedef struct {
+    anthropic_stream_mode mode;
+    anthropic_block_type open_block;
+    int next_index;
+    size_t emit_pos;
+    bool active;
+    bool checked_think_prefix;
+    bool sent_thinking;
+    bool sent_text;
+} anthropic_stream;
+
+static bool anthropic_sse_start_live(int fd, const request *r, const char *id,
+                                     int prompt_tokens, anthropic_stream *st) {
+    buf b = {0};
+    json_escape(&b, r->model);
+    char *model_json = buf_take(&b);
+
+    buf_printf(&b,
+        "{\"type\":\"message_start\",\"message\":{\"id\":\"%s\",\"type\":\"message\","
+        "\"role\":\"assistant\",\"model\":%s,\"content\":[],\"stop_reason\":null,"
+        "\"stop_sequence\":null,\"usage\":{\"input_tokens\":%d,\"output_tokens\":0}}}",
+        id, model_json, prompt_tokens);
+    bool ok = sse_event(fd, "message_start", b.ptr);
+    buf_free(&b);
+    free(model_json);
+
+    memset(st, 0, sizeof(*st));
+    st->active = ok;
+    st->mode = ds4_think_mode_enabled(r->think_mode) ? ANTH_STREAM_THINKING : ANTH_STREAM_TEXT;
+    return ok;
+}
+
+static bool anthropic_sse_open_block(int fd, anthropic_stream *st,
+                                     anthropic_block_type type) {
+    if (st->open_block == type) return true;
+    if (st->open_block != ANTH_BLOCK_NONE) return false;
+
+    buf b = {0};
+    if (type == ANTH_BLOCK_THINKING) {
+        buf_printf(&b,
+                   "{\"type\":\"content_block_start\",\"index\":%d,"
+                   "\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\","
+                   "\"signature\":\"\"}}",
+                   st->next_index);
+    } else {
+        buf_printf(&b,
+                   "{\"type\":\"content_block_start\",\"index\":%d,"
+                   "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+                   st->next_index);
+    }
+    bool ok = sse_event(fd, "content_block_start", b.ptr);
+    buf_free(&b);
+    if (ok) st->open_block = type;
+    return ok;
+}
+
+static bool anthropic_sse_delta_live(int fd, const anthropic_stream *st,
+                                     anthropic_block_type type,
+                                     const char *text, size_t len) {
+    if (len == 0) return true;
+    buf b = {0};
+    if (type == ANTH_BLOCK_THINKING) {
+        buf_printf(&b,
+                   "{\"type\":\"content_block_delta\",\"index\":%d,"
+                   "\"delta\":{\"type\":\"thinking_delta\",\"thinking\":",
+                   st->next_index);
+        json_escape_n(&b, text, len);
+        buf_puts(&b, "}}");
+    } else {
+        buf_printf(&b,
+                   "{\"type\":\"content_block_delta\",\"index\":%d,"
+                   "\"delta\":{\"type\":\"text_delta\",\"text\":",
+                   st->next_index);
+        json_escape_n(&b, text, len);
+        buf_puts(&b, "}}");
+    }
+    bool ok = sse_event(fd, "content_block_delta", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool anthropic_sse_close_block_live(int fd, const char *id,
+                                           anthropic_stream *st) {
+    if (st->open_block == ANTH_BLOCK_NONE) return true;
+
+    buf b = {0};
+    bool ok = true;
+    if (st->open_block == ANTH_BLOCK_THINKING) {
+        buf_printf(&b,
+                   "{\"type\":\"content_block_delta\",\"index\":%d,"
+                   "\"delta\":{\"type\":\"signature_delta\",\"signature\":",
+                   st->next_index);
+        json_escape(&b, id);
+        buf_puts(&b, "}}");
+        ok = sse_event(fd, "content_block_delta", b.ptr);
+        buf_free(&b);
+    }
+    if (ok) {
+        buf_printf(&b, "{\"type\":\"content_block_stop\",\"index\":%d}",
+                   st->next_index);
+        ok = sse_event(fd, "content_block_stop", b.ptr);
+        buf_free(&b);
+    }
+    if (ok) {
+        st->open_block = ANTH_BLOCK_NONE;
+        st->next_index++;
+    }
+    return ok;
+}
+
+static const char *find_any_tool_start(const char *s) {
+    const char *best = NULL;
+    const char *candidates[] = {
+        strstr(s, DS4_TOOL_CALLS_START),
+        strstr(s, DS4_TOOL_CALLS_START_SHORT),
+        strstr(s, "<tool_calls>"),
+    };
+    for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
+        if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
+    }
+    return best;
+}
+
+static size_t text_stream_safe_limit(const char *raw, size_t start,
+                                     size_t raw_len, bool has_tools,
+                                     bool final) {
+    if (raw_len <= start) return raw_len;
+
+    size_t limit = raw_len;
+    if (has_tools) {
+        const char *tool = find_any_tool_start(raw + start);
+        if (tool) {
+            limit = trim_tool_separator_ws(raw, start, (size_t)(tool - raw));
+            return utf8_stream_safe_len(raw, start, limit, true);
+        }
+
+        if (!final) {
+            /* Tool calls are hidden from the API client and returned as
+             * structured tool_use/tool_calls blocks.  The whitespace just
+             * before the DSML marker is syntax too: if we stream it as
+             * assistant text, the next client request sends it back and our
+             * renderer adds the canonical "\n\n" separator again.  Hold
+             * trailing whitespace until a following non-whitespace byte proves
+             * it is ordinary text, or until a tool marker proves it should be
+             * dropped. */
+            while (limit > start && isspace((unsigned char)raw[limit - 1])) limit--;
+
+            /* Also hold a partial '<...tool_calls...' marker that may be split
+             * across generated tokens. */
+            const size_t max_marker = 80;
+            size_t scan = raw_len - start > max_marker ? raw_len - max_marker : start;
+            for (size_t i = raw_len; i > scan; i--) {
+                if (raw[i - 1] == '<') {
+                    size_t marker = i - 1;
+                    if (marker < limit) limit = marker;
+                    break;
+                }
+            }
+            limit = trim_tool_separator_ws(raw, start, limit);
+        }
+    }
+    return utf8_stream_safe_len(raw, start, limit, final);
+}
+
+static bool anthropic_sse_stream_update(int fd, const request *r, const char *id,
+                                        anthropic_stream *st,
+                                        const char *raw, size_t raw_len,
+                                        bool final) {
+    if (!st->active || !raw) return true;
+
+    if (st->mode == ANTH_STREAM_THINKING) {
+        if (!st->checked_think_prefix) {
+            const char *open = "<think>";
+            const size_t open_len = strlen(open);
+            if (raw_len < open_len && !strncmp(raw, open, raw_len) && !final) {
+                return true;
+            }
+            if (raw_len >= open_len && !strncmp(raw, open, open_len)) {
+                st->emit_pos = open_len;
+            }
+            st->checked_think_prefix = true;
+        }
+
+        const char *close = strstr(raw + st->emit_pos, "</think>");
+        size_t limit;
+        if (close) {
+            limit = (size_t)(close - raw);
+        } else if (final) {
+            limit = raw_len;
+        } else {
+            const size_t hold = strlen("</think>") - 1;
+            limit = raw_len > hold ? raw_len - hold : st->emit_pos;
+            limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
+        }
+
+        if (limit > st->emit_pos) {
+            if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_THINKING)) return false;
+            if (!anthropic_sse_delta_live(fd, st, ANTH_BLOCK_THINKING,
+                                          raw + st->emit_pos,
+                                          limit - st->emit_pos)) return false;
+            st->sent_thinking = true;
+            st->emit_pos = limit;
+        }
+
+        if (close || final) {
+            if (!anthropic_sse_close_block_live(fd, id, st)) return false;
+            if (close) {
+                st->emit_pos = (size_t)(close - raw) + strlen("</think>");
+                st->mode = ANTH_STREAM_TEXT;
+            } else {
+                st->mode = ANTH_STREAM_SUPPRESS;
+                return true;
+            }
+        } else {
+            return true;
+        }
+    }
+
+    if (st->mode == ANTH_STREAM_TEXT) {
+        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
+        size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
+                                              r->has_tools, final);
+
+        if (limit > st->emit_pos) {
+            if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_TEXT)) return false;
+            if (!anthropic_sse_delta_live(fd, st, ANTH_BLOCK_TEXT,
+                                          raw + st->emit_pos,
+                                          limit - st->emit_pos)) return false;
+            st->sent_text = true;
+            st->emit_pos = limit;
+        }
+
+        if (tool) {
+            if (!anthropic_sse_close_block_live(fd, id, st)) return false;
+            st->emit_pos = (size_t)(tool - raw);
+            st->mode = ANTH_STREAM_SUPPRESS;
+        } else if (final) {
+            if (!anthropic_sse_close_block_live(fd, id, st)) return false;
+            st->mode = ANTH_STREAM_SUPPRESS;
+        }
+    }
+    return true;
+}
+
+static bool anthropic_sse_tool_blocks_live(int fd, const request *r, const char *id,
+                                           anthropic_stream *st,
+                                           const tool_calls *calls) {
+    if (!calls) return true;
+
+    buf b = {0};
+    for (int i = 0; i < calls->len; i++, st->next_index++) {
+        const tool_call *tc = &calls->v[i];
+        const tool_schema_order *order = tool_schema_orders_find(&r->tool_orders, tc->name);
+        char idbuf[128];
+        snprintf(idbuf, sizeof(idbuf), "toolu_%s_%d", id, i);
+        buf_printf(&b,
+                   "{\"type\":\"content_block_start\",\"index\":%d,"
+                   "\"content_block\":{\"type\":\"tool_use\",\"id\":",
+                   st->next_index);
+        json_escape(&b, tc->id && tc->id[0] ? tc->id : idbuf);
+        buf_puts(&b, ",\"name\":");
+        json_escape(&b, tc->name ? tc->name : "");
+        buf_puts(&b, ",\"input\":{}}}");
+        bool ok = sse_event(fd, "content_block_start", b.ptr);
+        buf_free(&b);
+        if (!ok) return false;
+
+        buf_printf(&b,
+                   "{\"type\":\"content_block_delta\",\"index\":%d,"
+                   "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":",
+                   st->next_index);
+        append_ordered_json_string(&b, tc->arguments, order);
+        buf_puts(&b, "}}");
+        ok = sse_event(fd, "content_block_delta", b.ptr);
+        buf_free(&b);
+        if (!ok) return false;
+
+        buf_printf(&b, "{\"type\":\"content_block_stop\",\"index\":%d}",
+                   st->next_index);
+        ok = sse_event(fd, "content_block_stop", b.ptr);
+        buf_free(&b);
+        if (!ok) return false;
+    }
+    return true;
+}
+
+static bool anthropic_sse_stop_live(int fd, const char *finish,
+                                    int completion_tokens) {
+    buf b = {0};
+    buf_puts(&b, "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":");
+    json_escape(&b, anthropic_stop_reason(finish));
+    buf_puts(&b, ",\"stop_sequence\":null},\"usage\":{\"output_tokens\":");
+    buf_printf(&b, "%d}}", completion_tokens);
+    bool ok = sse_event(fd, "message_delta", b.ptr);
+    buf_free(&b);
+    if (ok) ok = sse_event(fd, "message_stop", "{\"type\":\"message_stop\"}");
+    return ok;
+}
+
+static bool anthropic_sse_finish_live(int fd, const request *r, const char *id,
+                                      anthropic_stream *st, const char *raw,
+                                      size_t raw_len, const tool_calls *calls,
+                                      const char *finish, int completion_tokens) {
+    if (!anthropic_sse_stream_update(fd, r, id, st, raw, raw_len, true)) return false;
+
+    if (st->sent_thinking && !st->sent_text && (!calls || calls->len == 0)) {
+        if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_TEXT)) return false;
+        if (!anthropic_sse_close_block_live(fd, id, st)) return false;
+    }
+
+    if (!anthropic_sse_tool_blocks_live(fd, r, id, st, calls)) return false;
+    return anthropic_sse_stop_live(fd, finish, completion_tokens);
+}
+
+static double now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static void server_log(ds4_log_type type, const char *fmt, ...) {
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    char ts[16];
+    strftime(ts, sizeof(ts), "%m%d %H:%M:%S", &tm);
+
+    va_list ap;
+    va_start(ap, fmt);
+    va_list copy;
+    va_copy(copy, ap);
+    int n = vsnprintf(NULL, 0, fmt, copy);
+    va_end(copy);
+
+    fprintf(stderr, "%s ", ts);
+    if (n < 0) {
+        ds4_log(stderr, type, "%s", fmt);
+    } else {
+        char *line = xmalloc((size_t)n + 1);
+        vsnprintf(line, (size_t)n + 1, fmt, ap);
+        ds4_log(stderr, type, "%s", line);
+        free(line);
+    }
+    va_end(ap);
+    fputc('\n', stderr);
+}
+
+typedef struct job job;
+
+typedef struct {
+    char sha[41];
+    char *path;
+    uint8_t quant_bits;
+    uint8_t reason;
+    uint32_t tokens;
+    uint32_t hits;
+    uint32_t ctx_size;
+    uint64_t created_at;
+    uint64_t last_used;
+    uint64_t payload_bytes;
+    uint64_t text_bytes;
+    uint64_t file_size;
+} kv_entry;
+
+typedef struct {
+    int min_tokens;
+    int cold_max_tokens;
+    int continued_interval_tokens;
+    int boundary_trim_tokens;
+    int boundary_align_tokens;
+} kv_cache_options;
+
+typedef struct {
+    bool enabled;
+    char *dir;
+    uint64_t budget_bytes;
+    bool reject_different_quant;
+    kv_cache_options opt;
+    int continued_last_store_tokens;
+    kv_entry *entry;
+    int len;
+    int cap;
+} kv_disk_cache;
+
+typedef struct {
+    ds4_engine *engine;
+    ds4_session *session;
+    int default_tokens;
+    kv_disk_cache kv;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    pthread_cond_t clients_cv;
+    job *head;
+    job *tail;
+    bool stopping;
+    int clients;
+    uint64_t seq;
+    FILE *trace;
+    pthread_mutex_t trace_mu;
+    uint64_t trace_seq;
+} server;
+
+/* Jobs are stack-owned by the client thread.  The worker signals completion
+ * after the response has been written, so request data and the socket remain
+ * valid without heap-allocating per-request job objects. */
+struct job {
+    int fd;
+    request req;
+    bool done;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    job *next;
+};
+
+/* =========================================================================
+ * Disk KV Cache.
+ * =========================================================================
+ *
+ * The server has one live Metal session.  We persist reusable DS4 session
+ * snapshots when a cold prompt reaches a useful prefix, when a long continued
+ * conversation has grown far enough, and when a request evicts the live session.
+ * The cache key is the SHA1 of the token IDs, not text: chat templates, JSON
+ * formatting, and UTF-8 spelling are all irrelevant after tokenization.
+ *
+ * Files are loaded with plain read/write I/O into the existing graph tensors;
+ * mmap is deliberately avoided here so cache restore cannot add more VM
+ * mappings to a process that already maps a very large GGUF.
+ *
+ * Stores are created only when the live graph is already at the checkpoint we
+ * want to persist.  For long cold prompts this means prefill reaches the stable
+ * boundary first, writes that prefix, and then continues with the suffix.  We
+ * never roll the session backward just to build a disk cache entry: that would
+ * turn cache population into a second hidden prefill.
+ *
+ * File layout:
+ *
+ *   "KVC" version
+ *   quant bits, save reason, token count, hit count, context size
+ *   creation time, last-used time, payload byte count
+ *   rendered text byte count + rendered text for human inspection
+ *   DS4 engine payload written by ds4_session_save_payload()
+ *
+ * The filename is SHA1(token ids), not SHA1(text).  The text field is only for
+ * observability when looking at a cache directory.
+ */
+
+#define KV_CACHE_MAGIC0 'K'
+#define KV_CACHE_MAGIC1 'V'
+#define KV_CACHE_MAGIC2 'C'
+#define KV_CACHE_VERSION 1u
+#define KV_CACHE_FIXED_HEADER 48u
+#define KV_CACHE_DEFAULT_MIN_TOKENS 512
+#define KV_CACHE_DEFAULT_COLD_MAX_TOKENS 30000
+/* Tokenizers may merge text across the prompt boundary.  Trimming a small tail
+ * makes the persisted prefix more likely to remain a token prefix after more
+ * user text is appended.  The 2048 alignment also matches the Metal prefill
+ * chunk schedule, which keeps compressor row finalization identical to a cold
+ * full prompt. */
+#define KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS 32
+#define KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS 2048
+#define KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS 10000
+#define KV_CACHE_DEFAULT_MB 4096
+
+typedef enum {
+    KV_REASON_UNKNOWN   = 0,
+    KV_REASON_COLD      = 1,
+    KV_REASON_CONTINUED = 2,
+    KV_REASON_EVICT     = 3,
+    KV_REASON_SHUTDOWN  = 4,
+} kv_cache_reason;
+
+static uint8_t kv_reason_code(const char *reason) {
+    if (!reason) return KV_REASON_UNKNOWN;
+    if (!strcmp(reason, "cold")) return KV_REASON_COLD;
+    if (!strcmp(reason, "continued")) return KV_REASON_CONTINUED;
+    if (!strcmp(reason, "evict")) return KV_REASON_EVICT;
+    if (!strcmp(reason, "shutdown")) return KV_REASON_SHUTDOWN;
+    return KV_REASON_UNKNOWN;
+}
+
+static kv_cache_options kv_cache_default_options(void) {
+    return (kv_cache_options){
+        .min_tokens = KV_CACHE_DEFAULT_MIN_TOKENS,
+        .cold_max_tokens = KV_CACHE_DEFAULT_COLD_MAX_TOKENS,
+        .continued_interval_tokens = KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS,
+        .boundary_trim_tokens = KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS,
+        .boundary_align_tokens = KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS,
+    };
+}
+
+static void le_put32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+static void le_put64(uint8_t *p, uint64_t v) {
+    for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+
+static uint32_t le_get32(const uint8_t *p) {
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static uint64_t le_get64(const uint8_t *p) {
+    uint64_t v = 0;
+    for (int i = 7; i >= 0; i--) v = (v << 8) | p[i];
+    return v;
+}
+
+typedef struct {
+    uint32_t h[5];
+    uint64_t bytes;
+    uint8_t block[64];
+    size_t used;
+} sha1_ctx;
+
+static uint32_t rol32(uint32_t v, int n) {
+    return (v << n) | (v >> (32 - n));
+}
+
+static void sha1_transform(sha1_ctx *c, const uint8_t block[64]) {
+    uint32_t w[80];
+    for (int i = 0; i < 16; i++) {
+        w[i] = ((uint32_t)block[i * 4] << 24) |
+               ((uint32_t)block[i * 4 + 1] << 16) |
+               ((uint32_t)block[i * 4 + 2] << 8) |
+               (uint32_t)block[i * 4 + 3];
+    }
+    for (int i = 16; i < 80; i++) w[i] = rol32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+
+    uint32_t a = c->h[0], b = c->h[1], d = c->h[3], e = c->h[4];
+    uint32_t cc = c->h[2];
+    for (int i = 0; i < 80; i++) {
+        uint32_t f, k;
+        if (i < 20) {
+            f = (b & cc) | ((~b) & d);
+            k = 0x5a827999u;
+        } else if (i < 40) {
+            f = b ^ cc ^ d;
+            k = 0x6ed9eba1u;
+        } else if (i < 60) {
+            f = (b & cc) | (b & d) | (cc & d);
+            k = 0x8f1bbcdcu;
+        } else {
+            f = b ^ cc ^ d;
+            k = 0xca62c1d6u;
+        }
+        uint32_t tmp = rol32(a, 5) + f + e + k + w[i];
+        e = d;
+        d = cc;
+        cc = rol32(b, 30);
+        b = a;
+        a = tmp;
+    }
+    c->h[0] += a;
+    c->h[1] += b;
+    c->h[2] += cc;
+    c->h[3] += d;
+    c->h[4] += e;
+}
+
+static void sha1_init(sha1_ctx *c) {
+    c->h[0] = 0x67452301u;
+    c->h[1] = 0xefcdab89u;
+    c->h[2] = 0x98badcfeu;
+    c->h[3] = 0x10325476u;
+    c->h[4] = 0xc3d2e1f0u;
+    c->bytes = 0;
+    c->used = 0;
+}
+
+static void sha1_update(sha1_ctx *c, const void *ptr, size_t len) {
+    const uint8_t *p = ptr;
+    c->bytes += len;
+    while (len != 0) {
+        size_t n = 64 - c->used;
+        if (n > len) n = len;
+        memcpy(c->block + c->used, p, n);
+        c->used += n;
+        p += n;
+        len -= n;
+        if (c->used == 64) {
+            sha1_transform(c, c->block);
+            c->used = 0;
+        }
+    }
+}
+
+static void sha1_final(sha1_ctx *c, uint8_t out[20]) {
+    uint64_t bits = c->bytes * 8;
+    uint8_t one = 0x80;
+    uint8_t zero = 0;
+    sha1_update(c, &one, 1);
+    while (c->used != 56) sha1_update(c, &zero, 1);
+    uint8_t len[8];
+    for (int i = 0; i < 8; i++) len[7 - i] = (uint8_t)(bits >> (8 * i));
+    sha1_update(c, len, sizeof(len));
+    for (int i = 0; i < 5; i++) {
+        out[i * 4] = (uint8_t)(c->h[i] >> 24);
+        out[i * 4 + 1] = (uint8_t)(c->h[i] >> 16);
+        out[i * 4 + 2] = (uint8_t)(c->h[i] >> 8);
+        out[i * 4 + 3] = (uint8_t)c->h[i];
+    }
+}
+
+static void hex20(const uint8_t in[20], char out[41]) {
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < 20; i++) {
+        out[i * 2] = hex[in[i] >> 4];
+        out[i * 2 + 1] = hex[in[i] & 15];
+    }
+    out[40] = '\0';
+}
+
+static void sha1_tokens_hex(const ds4_tokens *tokens, int n, char out[41]) {
+    sha1_ctx c;
+    sha1_init(&c);
+    for (int i = 0; i < n; i++) {
+        uint8_t b[4];
+        le_put32(b, (uint32_t)tokens->v[i]);
+        sha1_update(&c, b, sizeof(b));
+    }
+    uint8_t digest[20];
+    sha1_final(&c, digest);
+    hex20(digest, out);
+}
+
+static bool sha_hex_name(const char *name, char sha[41]) {
+    if (strlen(name) != 43 || strcmp(name + 40, ".kv")) return false;
+    for (int i = 0; i < 40; i++) {
+        if (!isxdigit((unsigned char)name[i])) return false;
+        sha[i] = (char)tolower((unsigned char)name[i]);
+    }
+    sha[40] = '\0';
+    return true;
+}
+
+static char *path_join(const char *dir, const char *name) {
+    buf b = {0};
+    buf_puts(&b, dir);
+    if (b.len == 0 || b.ptr[b.len - 1] != '/') buf_putc(&b, '/');
+    buf_puts(&b, name);
+    return buf_take(&b);
+}
+
+static char *kv_path_for_sha(kv_disk_cache *kc, const char sha[41]) {
+    char name[44];
+    memcpy(name, sha, 40);
+    memcpy(name + 40, ".kv", 4);
+    return path_join(kc->dir, name);
+}
+
+static bool mkdir_p(const char *path) {
+    if (!path || !path[0]) return false;
+    char *tmp = xstrdup(path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = '\0';
+        if (mkdir(tmp, 0700) != 0 && errno != EEXIST) {
+            free(tmp);
+            return false;
+        }
+        *p = '/';
+    }
+    bool ok = mkdir(tmp, 0700) == 0 || errno == EEXIST;
+    free(tmp);
+    return ok;
+}
+
+static void kv_entry_free(kv_entry *e) {
+    free(e->path);
+    memset(e, 0, sizeof(*e));
+}
+
+static void kv_cache_clear(kv_disk_cache *kc) {
+    for (int i = 0; i < kc->len; i++) kv_entry_free(&kc->entry[i]);
+    free(kc->entry);
+    kc->entry = NULL;
+    kc->len = 0;
+    kc->cap = 0;
+}
+
+static void kv_cache_push(kv_disk_cache *kc, kv_entry e) {
+    if (kc->len == kc->cap) {
+        kc->cap = kc->cap ? kc->cap * 2 : 16;
+        kc->entry = xrealloc(kc->entry, (size_t)kc->cap * sizeof(kc->entry[0]));
+    }
+    kc->entry[kc->len++] = e;
+}
+
+static void kv_fill_header(uint8_t h[KV_CACHE_FIXED_HEADER], uint8_t quant_bits,
+                           uint8_t reason, uint32_t tokens, uint32_t hits, uint32_t ctx_size,
+                           uint64_t created_at, uint64_t last_used,
+                           uint64_t payload_bytes) {
+    memset(h, 0, KV_CACHE_FIXED_HEADER);
+    h[0] = KV_CACHE_MAGIC0;
+    h[1] = KV_CACHE_MAGIC1;
+    h[2] = KV_CACHE_MAGIC2;
+    h[3] = KV_CACHE_VERSION;
+    h[4] = quant_bits;
+    h[5] = reason;
+    le_put32(h + 8, tokens);
+    le_put32(h + 12, hits);
+    le_put32(h + 16, ctx_size);
+    le_put64(h + 24, created_at);
+    le_put64(h + 32, last_used);
+    le_put64(h + 40, payload_bytes);
+}
+
+static bool kv_read_header(FILE *fp, kv_entry *e, uint32_t *text_bytes) {
+    uint8_t h[KV_CACHE_FIXED_HEADER];
+    if (fread(h, 1, sizeof(h), fp) != sizeof(h)) return false;
+    if (h[0] != KV_CACHE_MAGIC0 || h[1] != KV_CACHE_MAGIC1 ||
+        h[2] != KV_CACHE_MAGIC2 || h[3] != KV_CACHE_VERSION) return false;
+    e->quant_bits = h[4];
+    e->reason = h[5] <= KV_REASON_SHUTDOWN ? h[5] : KV_REASON_UNKNOWN;
+    e->tokens = le_get32(h + 8);
+    e->hits = le_get32(h + 12);
+    e->ctx_size = le_get32(h + 16);
+    e->created_at = le_get64(h + 24);
+    e->last_used = le_get64(h + 32);
+    e->payload_bytes = le_get64(h + 40);
+    uint8_t tb[4];
+    if (fread(tb, 1, sizeof(tb), fp) != sizeof(tb)) return false;
+    *text_bytes = le_get32(tb);
+    e->text_bytes = *text_bytes;
+    return e->tokens != 0 && (e->quant_bits == 2 || e->quant_bits == 4);
+}
+
+static bool kv_read_entry_file(const char *path, const char sha[41], kv_entry *out) {
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size < (off_t)(KV_CACHE_FIXED_HEADER + 4)) return false;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return false;
+    kv_entry e = {0};
+    uint32_t text_bytes = 0;
+    bool ok = kv_read_header(fp, &e, &text_bytes);
+    fclose(fp);
+    if (!ok) return false;
+    const uint64_t fixed = KV_CACHE_FIXED_HEADER + 4ull;
+    if (UINT64_MAX - fixed < (uint64_t)text_bytes ||
+        UINT64_MAX - fixed - (uint64_t)text_bytes < e.payload_bytes) return false;
+    const uint64_t expected = fixed + (uint64_t)text_bytes + e.payload_bytes;
+    if ((uint64_t)st.st_size != expected) return false;
+    memcpy(e.sha, sha, 41);
+    e.path = xstrdup(path);
+    e.file_size = expected;
+    *out = e;
+    return true;
+}
+
+static void kv_cache_refresh(kv_disk_cache *kc) {
+    if (!kc->enabled) return;
+    kv_cache_clear(kc);
+    DIR *d = opendir(kc->dir);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        char sha[41];
+        if (!sha_hex_name(de->d_name, sha)) continue;
+        char *path = path_join(kc->dir, de->d_name);
+        kv_entry e = {0};
+        if (kv_read_entry_file(path, sha, &e)) kv_cache_push(kc, e);
+        free(path);
+    }
+    closedir(d);
+}
+
+static bool kv_cache_touch_file(const char *path, uint32_t hits) {
+    FILE *fp = fopen(path, "r+b");
+    if (!fp) return false;
+    kv_entry e = {0};
+    uint32_t text_bytes = 0;
+    bool ok = kv_read_header(fp, &e, &text_bytes);
+    if (ok) {
+        uint8_t h[KV_CACHE_FIXED_HEADER];
+        uint64_t now = (uint64_t)time(NULL);
+        kv_fill_header(h, e.quant_bits, e.reason, e.tokens, hits, e.ctx_size,
+                       e.created_at, now, e.payload_bytes);
+        ok = fseek(fp, 0, SEEK_SET) == 0 &&
+             fwrite(h, 1, sizeof(h), fp) == sizeof(h);
+    }
+    fclose(fp);
+    return ok;
+}
+
+static bool kv_entry_is_live_continued_prefix(const kv_entry *e, const ds4_tokens *live) {
+    if (!e || e->reason != KV_REASON_CONTINUED) return false;
+    if (!live || (int)e->tokens >= live->len) return false;
+    char sha[41];
+    sha1_tokens_hex(live, (int)e->tokens, sha);
+    return !strcmp(sha, e->sha);
+}
+
+static double kv_entry_eviction_score(const kv_entry *e, const ds4_tokens *live) {
+    if (!e || e->file_size == 0) return 0.0;
+    /*
+     * Hits count successful disk reuses, but a fresh snapshot is still useful:
+     * it may be the only copy of the session that is about to be evicted from
+     * RAM.  Use hits+1 for eviction value so a just-written checkpoint does not
+     * get deleted immediately just because its persisted hit counter is still 0.
+     */
+    double score = ((double)e->hits + 1.0) * (double)e->tokens / (double)e->file_size;
+    if (kv_entry_is_live_continued_prefix(e, live)) {
+        /* A continued checkpoint that is already a strict prefix of the live
+         * RAM session is only a crash fallback.  Under pressure, cold prefixes
+         * and non-dominated branch points are more valuable. */
+        double depth = (double)e->tokens / (double)live->len;
+        score *= e->hits ? 0.25 : 0.02;
+        score *= depth;
+    }
+    return score;
+}
+
+static void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live) {
+    if (!kc->enabled || kc->budget_bytes == 0) return;
+    kv_cache_refresh(kc);
+    uint64_t total = 0;
+    for (int i = 0; i < kc->len; i++) total += kc->entry[i].file_size;
+    while (total > kc->budget_bytes && kc->len > 0) {
+        int victim = 0;
+        double victim_score = kv_entry_eviction_score(&kc->entry[0], live);
+        for (int i = 1; i < kc->len; i++) {
+            double score = kv_entry_eviction_score(&kc->entry[i], live);
+            if (score < victim_score ||
+                (score == victim_score && kc->entry[i].last_used < kc->entry[victim].last_used))
+            {
+                victim = i;
+                victim_score = score;
+            }
+        }
+        kv_entry e = kc->entry[victim];
+        if (unlink(e.path) == 0) {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: kv cache evicted tokens=%u hits=%u size=%.2f MiB",
+                       e.tokens, e.hits, (double)e.file_size / (1024.0 * 1024.0));
+            if (total >= e.file_size) total -= e.file_size;
+            else total = 0;
+        } else {
+            total = 0;
+        }
+        kv_entry_free(&e);
+        memmove(kc->entry + victim, kc->entry + victim + 1,
+                (size_t)(kc->len - victim - 1) * sizeof(kc->entry[0]));
+        kc->len--;
+    }
+}
+
+static bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb,
+                          bool reject_different_quant, kv_cache_options opt) {
+    memset(kc, 0, sizeof(*kc));
+    if (!dir) return false;
+    if (!mkdir_p(dir)) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create KV cache directory %s: %s", dir, strerror(errno));
+        return false;
+    }
+    kc->enabled = true;
+    kc->dir = xstrdup(dir);
+    if (budget_mb == 0) budget_mb = KV_CACHE_DEFAULT_MB;
+    kc->budget_bytes = budget_mb * 1024ull * 1024ull;
+    kc->reject_different_quant = reject_different_quant;
+    kc->opt = opt;
+    kv_cache_evict(kc, NULL);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d)",
+               kc->dir,
+               (unsigned long long)(kc->budget_bytes / (1024ull * 1024ull)),
+               reject_different_quant ? "reject" : "accept",
+               kc->opt.min_tokens,
+               kc->opt.cold_max_tokens,
+               kc->opt.continued_interval_tokens,
+               kc->opt.boundary_trim_tokens,
+               kc->opt.boundary_align_tokens);
+    return true;
+}
+
+static void kv_cache_close(kv_disk_cache *kc) {
+    kv_cache_clear(kc);
+    free(kc->dir);
+    memset(kc, 0, sizeof(*kc));
+}
+
+static char *render_tokens_text(ds4_engine *engine, const ds4_tokens *tokens, size_t *out_len) {
+    buf b = {0};
+    for (int i = 0; i < tokens->len; i++) {
+        size_t len = 0;
+        char *piece = ds4_token_text(engine, tokens->v[i], &len);
+        buf_append(&b, piece, len);
+        free(piece);
+    }
+    if (out_len) *out_len = b.len;
+    return buf_take(&b);
+}
+
+static void tokens_copy_prefix(ds4_tokens *dst, const ds4_tokens *src, int n) {
+    dst->len = 0;
+    if (n > src->len) n = src->len;
+    for (int i = 0; i < n; i++) ds4_tokens_push(dst, src->v[i]);
+}
+
+static int kv_cache_store_len(const kv_disk_cache *kc, int tokens) {
+    const int trim = kc->opt.boundary_trim_tokens;
+    const int align = kc->opt.boundary_align_tokens;
+    if (tokens > kc->opt.min_tokens + trim) {
+        int stable = tokens - trim;
+        if (align > 0) stable -= stable % align;
+        if (stable >= kc->opt.min_tokens) return stable;
+    }
+    return tokens;
+}
+
+/* A same-token file can be reused by a larger context, but not by a smaller
+ * one: the payload was validated against the context capacity recorded in the
+ * file.  If the existing file cannot be used by this server, replace it so this
+ * context can still populate its own cache. */
+static bool kv_cache_existing_compatible(kv_disk_cache *kc, const char *path, int quant_bits, int ctx_size) {
+    if (access(path, F_OK) != 0) return false;
+    kv_entry e = {0};
+    char dummy_sha[41] = "0000000000000000000000000000000000000000";
+    if (!kv_read_entry_file(path, dummy_sha, &e)) return false;
+    bool compatible = (!kc->reject_different_quant || e.quant_bits == (uint8_t)quant_bits) &&
+                      e.ctx_size <= (uint32_t)ctx_size;
+    kv_entry_free(&e);
+    if (!compatible) {
+        if (unlink(path) == 0) {
+            server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache replaced incompatible file %s", path);
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
+                                       int store_len, const char *reason) {
+    kv_disk_cache *kc = &s->kv;
+    if (!kc->enabled) return false;
+    if (!tokens || store_len < kc->opt.min_tokens) return false;
+    const int original_len = tokens->len;
+
+    ds4_tokens store_tokens = {0};
+    tokens_copy_prefix(&store_tokens, tokens, store_len);
+
+    char sha[41];
+    sha1_tokens_hex(&store_tokens, store_tokens.len, sha);
+    char *path = kv_path_for_sha(kc, sha);
+    const int quant_bits = ds4_engine_routed_quant_bits(s->engine);
+    if (quant_bits != 2 && quant_bits != 4) {
+        free(path);
+        ds4_tokens_free(&store_tokens);
+        return false;
+    }
+    if (kv_cache_existing_compatible(kc, path, quant_bits, ds4_session_ctx(s->session))) {
+        free(path);
+        ds4_tokens_free(&store_tokens);
+        return true;
+    }
+
+    char err[160] = {0};
+    /* Disk cache persistence must observe the graph exactly as-is.  If callers
+     * want a shorter prefix, they first prefill to that prefix and only then call
+     * this function.  This keeps cache population from doing hidden inference. */
+    const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
+    if (!live_tokens ||
+        live_tokens->len != store_tokens.len ||
+        !ds4_tokens_starts_with(live_tokens, &store_tokens))
+    {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv cache skipped tokens=%d reason=%s because live checkpoint is at %d",
+                   store_tokens.len,
+                   reason,
+                   live_tokens ? live_tokens->len : -1);
+        free(path);
+        ds4_tokens_free(&store_tokens);
+        return false;
+    }
+
+    uint64_t payload_bytes = ds4_session_payload_bytes(s->session);
+    if (payload_bytes == 0) {
+        free(path);
+        ds4_tokens_free(&store_tokens);
+        return false;
+    }
+
+    size_t text_len = 0;
+    char *text = render_tokens_text(s->engine, &store_tokens, &text_len);
+    if (text_len > UINT32_MAX) {
+        server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache skipped tokens=%d because rendered text is too large", store_tokens.len);
+        free(text);
+        free(path);
+        ds4_tokens_free(&store_tokens);
+        return false;
+    }
+
+    buf tmpb = {0};
+    buf_printf(&tmpb, "%s.tmp.%ld", path, (long)getpid());
+    char *tmp = buf_take(&tmpb);
+    const double save_t0 = now_sec();
+    FILE *fp = fopen(tmp, "wb");
+    if (!fp) {
+        server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache failed to create %s: %s save=%.1f ms",
+                   tmp, strerror(errno), (now_sec() - save_t0) * 1000.0);
+        free(tmp);
+        free(text);
+        free(path);
+        ds4_tokens_free(&store_tokens);
+        return false;
+    }
+
+    const uint64_t now = (uint64_t)time(NULL);
+    uint8_t h[KV_CACHE_FIXED_HEADER];
+    kv_fill_header(h, (uint8_t)quant_bits, kv_reason_code(reason), (uint32_t)store_tokens.len, 0,
+                   (uint32_t)ds4_session_ctx(s->session), now, now, payload_bytes);
+    uint8_t tb[4];
+    le_put32(tb, (uint32_t)text_len);
+    errno = 0;
+    bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
+              fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
+              fwrite(text, 1, text_len, fp) == text_len &&
+              ds4_session_save_payload(s->session, fp, err, sizeof(err)) == 0 &&
+              fflush(fp) == 0;
+    int saved_errno = errno;
+    if (fclose(fp) != 0) {
+        if (!saved_errno) saved_errno = errno;
+        ok = false;
+    }
+    if (ok && rename(tmp, path) != 0) {
+        saved_errno = errno;
+        ok = false;
+    }
+    const double save_ms = (now_sec() - save_t0) * 1000.0;
+    if (!ok) {
+        server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache store failed (%s): %s save=%.1f ms",
+                   reason,
+                   saved_errno ? strerror(saved_errno) : (err[0] ? err : "unknown error"),
+                   save_ms);
+        unlink(tmp);
+    } else {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv cache stored tokens=%d trimmed=%d reason=%s size=%.2f MiB save=%.1f ms",
+                   store_tokens.len,
+                   original_len - store_tokens.len,
+                   reason,
+                   (double)(KV_CACHE_FIXED_HEADER + 4ull + text_len + payload_bytes) / (1024.0 * 1024.0),
+                   save_ms);
+        kv_cache_evict(kc, live_tokens);
+    }
+    free(tmp);
+    free(text);
+    free(path);
+    ds4_tokens_free(&store_tokens);
+    return ok;
+}
+
+static void kv_cache_store_current(server *s, const char *reason) {
+    const ds4_tokens *tokens = ds4_session_tokens(s->session);
+    if (tokens) kv_cache_store_live_prefix(s, tokens, tokens->len, reason);
+}
+
+static void kv_cache_note_store(kv_disk_cache *kc, int tokens) {
+    if (tokens > kc->continued_last_store_tokens) {
+        kc->continued_last_store_tokens = tokens;
+    }
+}
+
+static void kv_cache_maybe_store_continued(server *s) {
+    kv_disk_cache *kc = &s->kv;
+    if (!kc->enabled || kc->opt.continued_interval_tokens <= 0) return;
+    const ds4_tokens *tokens = ds4_session_tokens(s->session);
+    if (!tokens || tokens->len < kc->opt.min_tokens) return;
+    if (tokens->len - kc->continued_last_store_tokens < kc->opt.continued_interval_tokens) return;
+    if (kv_cache_store_live_prefix(s, tokens, tokens->len, "continued")) {
+        kv_cache_note_store(kc, tokens->len);
+    }
+}
+
+static int kv_cache_find_prefix(kv_disk_cache *kc, const ds4_tokens *prompt, int quant_bits, int ctx_size) {
+    kv_cache_refresh(kc);
+    int best = -1;
+    for (int i = 0; i < kc->len; i++) {
+        kv_entry *e = &kc->entry[i];
+        if ((int)e->tokens > prompt->len) continue;
+        if ((int)e->tokens < kc->opt.min_tokens) continue;
+        if ((uint32_t)ctx_size < e->ctx_size) continue;
+        if (kc->reject_different_quant && e->quant_bits != (uint8_t)quant_bits) continue;
+        if (best >= 0 && e->tokens <= kc->entry[best].tokens) continue;
+        char sha[41];
+        sha1_tokens_hex(prompt, (int)e->tokens, sha);
+        if (!strcmp(sha, e->sha)) best = i;
+    }
+    return best;
+}
+
+static int kv_cache_try_load(server *s, const request *req, char **loaded_path_out) {
+    if (loaded_path_out) *loaded_path_out = NULL;
+    kv_disk_cache *kc = &s->kv;
+    if (!kc->enabled) return 0;
+    const int quant_bits = ds4_engine_routed_quant_bits(s->engine);
+    if (quant_bits != 2 && quant_bits != 4) return 0;
+    int idx = kv_cache_find_prefix(kc, &req->prompt, quant_bits, ds4_session_ctx(s->session));
+    if (idx < 0) return 0;
+
+    kv_entry e = kc->entry[idx];
+    char *path = xstrdup(e.path);
+    const double load_t0 = now_sec();
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        free(path);
+        return 0;
+    }
+    uint32_t text_bytes = 0;
+    kv_entry hdr = {0};
+    bool header_ok = kv_read_header(fp, &hdr, &text_bytes);
+    if (header_ok && fseeko(fp, (off_t)text_bytes, SEEK_CUR) != 0) header_ok = false;
+    char err[160];
+    int loaded = 0;
+    if (header_ok && ds4_session_load_payload(s->session, fp, hdr.payload_bytes, err, sizeof(err)) == 0) {
+        const ds4_tokens *loaded_tokens = ds4_session_tokens(s->session);
+        if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens &&
+            ds4_tokens_starts_with(&req->prompt, loaded_tokens))
+        {
+            loaded = (int)hdr.tokens;
+        } else {
+            ds4_session_invalidate(s->session);
+            unlink(path);
+            server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache discarded corrupt token prefix %s", path);
+        }
+    } else {
+        ds4_session_invalidate(s->session);
+        server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache load failed %s: %s load=%.1f ms",
+                   path,
+                   header_ok ? err : "invalid header",
+                   (now_sec() - load_t0) * 1000.0);
+    }
+    fclose(fp);
+
+    if (loaded > 0) {
+        const double load_ms = (now_sec() - load_t0) * 1000.0;
+        if (loaded_path_out) *loaded_path_out = xstrdup(path);
+        kc->continued_last_store_tokens = loaded;
+        if (kc->opt.cold_max_tokens > 0 && loaded > kc->opt.cold_max_tokens) {
+            unlink(path);
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: kv cache hit tokens=%d quant=%u load=%.1f ms consumed file=%s",
+                       loaded, hdr.quant_bits, load_ms, path);
+        } else {
+            kv_cache_touch_file(path, hdr.hits + 1);
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: kv cache hit tokens=%d quant=%u load=%.1f ms file=%s",
+                       loaded, hdr.quant_bits, load_ms, path);
+        }
+    }
+    free(path);
+    return loaded;
+}
+
+/* =========================================================================
+ * Trace Diagnostics.
+ * =========================================================================
+ *
+ * The human transcript is not enough to debug prompt-cache misses.  The model
+ * may generate text that is semantically accepted as a tool call, while the
+ * next OpenAI request re-renders a slightly different canonical DSML block.
+ * That creates a token mismatch even if the conversation "looks" continuous.
+ *
+ * When --trace is enabled we therefore record the exact cache decision and a
+ * small token window around the first mismatch between the live KV checkpoint
+ * and the incoming prompt.  Normal server logs stay compact; trace files get
+ * enough data to diagnose tokenizer-boundary and canonicalization problems.
+ */
+
+#define TRACE_CACHE_BEFORE 8
+#define TRACE_CACHE_AFTER  8
+#define TRACE_CACHE_WINDOW (TRACE_CACHE_BEFORE + 1 + TRACE_CACHE_AFTER)
+
+typedef struct {
+    bool valid;
+    int old_pos;
+    int prompt_len;
+    int common;
+    int start;
+    int count;
+    int live_id[TRACE_CACHE_WINDOW];
+    int prompt_id[TRACE_CACHE_WINDOW];
+} trace_cache_diag;
+
+static void trace_cache_capture(
+        trace_cache_diag *d,
+        const ds4_tokens *live,
+        const ds4_tokens *prompt,
+        int old_pos,
+        int common)
+{
+    memset(d, 0, sizeof(*d));
+    d->valid = true;
+    d->old_pos = old_pos;
+    d->prompt_len = prompt ? prompt->len : 0;
+    d->common = common;
+
+    const int live_len = live ? live->len : 0;
+    const int prompt_len = prompt ? prompt->len : 0;
+    int max_len = live_len > prompt_len ? live_len : prompt_len;
+    int start = common - TRACE_CACHE_BEFORE;
+    if (start < 0) start = 0;
+    int end = common + TRACE_CACHE_AFTER + 1;
+    if (end > max_len) end = max_len;
+    if (end < start) end = start;
+
+    d->start = start;
+    d->count = end - start;
+    if (d->count > TRACE_CACHE_WINDOW) d->count = TRACE_CACHE_WINDOW;
+    for (int i = 0; i < d->count; i++) {
+        int pos = start + i;
+        d->live_id[i] = live && pos < live->len ? live->v[pos] : -1;
+        d->prompt_id[i] = prompt && pos < prompt->len ? prompt->v[pos] : -1;
+    }
+}
+
+static const char *trace_cache_miss_reason(const trace_cache_diag *d) {
+    if (!d || !d->valid) return "unknown";
+    if (d->old_pos == 0) return "no-live-checkpoint";
+    if (d->common != d->old_pos) return "token-mismatch";
+    if (d->prompt_len < d->old_pos) return "incoming-prompt-shorter-than-live-checkpoint";
+    return "live-prefix-match";
+}
+
+static void trace_write_escaped_bytes(FILE *fp, const char *p, size_t len) {
+    static const char hex[] = "0123456789abcdef";
+    fputc('"', fp);
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)p[i];
+        if (c == '"' || c == '\\') {
+            fputc('\\', fp);
+            fputc((char)c, fp);
+        } else if (c == '\n') {
+            fputs("\\n", fp);
+        } else if (c == '\r') {
+            fputs("\\r", fp);
+        } else if (c == '\t') {
+            fputs("\\t", fp);
+        } else if (c < 0x20 || c == 0x7f) {
+            fputs("\\x", fp);
+            fputc(hex[c >> 4], fp);
+            fputc(hex[c & 15], fp);
+        } else {
+            fputc((char)c, fp);
+        }
+    }
+    fputc('"', fp);
+}
+
+static void trace_write_token(FILE *fp, ds4_engine *engine, int token) {
+    if (token < 0) {
+        fputs("- <none>", fp);
+        return;
+    }
+    size_t len = 0;
+    char *piece = ds4_token_text(engine, token, &len);
+    fprintf(fp, "%d ", token);
+    trace_write_escaped_bytes(fp, piece, len);
+    free(piece);
+}
+
+static void trace_write_cache_diag(
+        server *s,
+        const trace_cache_diag *d,
+        int cached,
+        const char *cache_source,
+        int disk_cached,
+        const char *disk_path)
+{
+    fprintf(s->trace,
+            "\n--- cache decision ---\n"
+            "live_tokens_before: %d\n"
+            "prompt_tokens: %d\n"
+            "live_prompt_common: %d\n"
+            "memory_reusable: %d\n"
+            "memory_miss_reason: %s\n"
+            "cache_source: %s\n"
+            "cached_tokens: %d\n"
+            "disk_cached_tokens: %d\n",
+            d && d->valid ? d->old_pos : 0,
+            d && d->valid ? d->prompt_len : 0,
+            d && d->valid ? d->common : 0,
+            d && d->valid && d->old_pos > 0 &&
+                d->common == d->old_pos && d->prompt_len >= d->old_pos ? 1 : 0,
+            trace_cache_miss_reason(d),
+            cache_source ? cache_source : "none",
+            cached,
+            disk_cached);
+    if (disk_path && disk_path[0]) fprintf(s->trace, "disk_cache_file: %s\n", disk_path);
+
+    if (!d || !d->valid || d->old_pos == 0 ||
+        (d->common == d->old_pos && d->prompt_len >= d->old_pos))
+    {
+        return;
+    }
+
+    fprintf(s->trace,
+            "\nfirst_mismatch_token: %d\n"
+            "token_window: [%d..%d)\n",
+            d->common,
+            d->start,
+            d->start + d->count);
+    for (int i = 0; i < d->count; i++) {
+        int pos = d->start + i;
+        int live = d->live_id[i];
+        int prompt = d->prompt_id[i];
+        const char *mark;
+        if (live < 0) mark = "prompt-only";
+        else if (prompt < 0) mark = "live-only";
+        else mark = live == prompt ? "==" : "!=";
+
+        fprintf(s->trace, "%7d %-11s live ", pos, mark);
+        trace_write_token(s->trace, s->engine, live);
+        fputs(" | prompt ", s->trace);
+        trace_write_token(s->trace, s->engine, prompt);
+        fputc('\n', s->trace);
+    }
+}
+
+static void trace_time(FILE *fp) {
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+    fputs(buf, fp);
+}
+
+static uint64_t trace_begin(
+        server *s,
+        const job *j,
+        int cached,
+        const trace_cache_diag *cache_diag,
+        const char *cache_source,
+        int disk_cached,
+        const char *disk_path) {
+    if (!s->trace) return 0;
+
+    pthread_mutex_lock(&s->trace_mu);
+    uint64_t id = ++s->trace_seq;
+    fprintf(s->trace, "\n===== request %llu ", (unsigned long long)id);
+    trace_time(s->trace);
+    fprintf(s->trace,
+            " =====\nkind: %s\nmodel: %s\nstream: %d\ntools: %d\nthink_mode: %s\nprompt_tokens: %d\ncached_tokens: %d\nmax_tokens: %d\ntemperature: %.3f\ntop_k: %d\ntop_p: %.3f\nmin_p: %.3f\nseed: %llu\n",
+            j->req.kind == REQ_CHAT ? "chat" : "completion",
+            j->req.model ? j->req.model : "",
+            j->req.stream ? 1 : 0,
+            j->req.has_tools ? 1 : 0,
+            ds4_think_mode_name(j->req.think_mode),
+            j->req.prompt.len,
+            cached,
+            j->req.max_tokens,
+            j->req.temperature,
+            j->req.top_k,
+            j->req.top_p,
+            j->req.min_p,
+            (unsigned long long)j->req.seed);
+    fprintf(s->trace, "stream_include_usage: %d\n",
+            j->req.stream_include_usage ? 1 : 0);
+    trace_write_cache_diag(s, cache_diag, cached, cache_source, disk_cached, disk_path);
+    if (j->req.raw_body) {
+        fputs("\n--- raw request json ---\n", s->trace);
+        fputs(j->req.raw_body, s->trace);
+        if (!j->req.raw_body[0] || j->req.raw_body[strlen(j->req.raw_body) - 1] != '\n') {
+            fputc('\n', s->trace);
+        }
+    }
+    if (j->req.prompt_text) {
+        fputs("\n--- rendered prompt ---\n", s->trace);
+        fputs(j->req.prompt_text, s->trace);
+        if (!j->req.prompt_text[0] || j->req.prompt_text[strlen(j->req.prompt_text) - 1] != '\n') {
+            fputc('\n', s->trace);
+        }
+    }
+    fputs("\n--- generated text ---\n", s->trace);
+    fflush(s->trace);
+    pthread_mutex_unlock(&s->trace_mu);
+    return id;
+}
+
+static void trace_piece(server *s, uint64_t id, const char *piece, size_t len) {
+    if (!s->trace || !id || !piece || !len) return;
+    pthread_mutex_lock(&s->trace_mu);
+    fwrite(piece, 1, len, s->trace);
+    fflush(s->trace);
+    pthread_mutex_unlock(&s->trace_mu);
+}
+
+static void trace_event(server *s, uint64_t id, const char *fmt, ...) {
+    if (!s->trace || !id) return;
+    pthread_mutex_lock(&s->trace_mu);
+    fputs("\n\n--- trace: ", s->trace);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(s->trace, fmt, ap);
+    va_end(ap);
+    fputs(" ---\n\n", s->trace);
+    fflush(s->trace);
+    pthread_mutex_unlock(&s->trace_mu);
+}
+
+static void trace_finish(
+        server *s,
+        uint64_t id,
+        const request *r,
+        const char *final_finish,
+        int completion,
+        bool saw_tool_start,
+        bool saw_tool_end,
+        const char *parsed_content,
+        const char *parsed_reasoning,
+        const tool_calls *parsed_calls,
+        double elapsed) {
+    if (!s->trace || !id) return;
+
+    pthread_mutex_lock(&s->trace_mu);
+    fprintf(s->trace,
+            "\n\n--- parsed message ---\nfinish: %s\ngenerated_tokens: %d\ndsml_start: %d\ndsml_end: %d\nelapsed_sec: %.3f\n",
+            final_finish,
+            completion,
+            saw_tool_start ? 1 : 0,
+            saw_tool_end ? 1 : 0,
+            elapsed);
+    if (r->kind == REQ_CHAT) {
+        if (parsed_reasoning && parsed_reasoning[0]) {
+            fputs("\nreasoning:\n", s->trace);
+            fputs(parsed_reasoning, s->trace);
+            fputc('\n', s->trace);
+        }
+        if (parsed_content && parsed_content[0]) {
+            fputs("\ncontent:\n", s->trace);
+            fputs(parsed_content, s->trace);
+            fputc('\n', s->trace);
+        }
+        for (int i = 0; i < parsed_calls->len; i++) {
+            const tool_call *tc = &parsed_calls->v[i];
+            fprintf(s->trace, "\ntool_call[%d]:\nid: %s\nname: %s\narguments:\n%s\n",
+                    i,
+                    tc->id ? tc->id : "",
+                    tc->name ? tc->name : "",
+                    tc->arguments ? tc->arguments : "");
+        }
+    }
+    fprintf(s->trace, "\n===== end request %llu =====\n", (unsigned long long)id);
+    fflush(s->trace);
+    pthread_mutex_unlock(&s->trace_mu);
+}
+
+typedef struct {
+    server *srv;
+    req_kind kind;
+    int prompt_tokens;
+    int cached_tokens;
+    char ctx[48];
+    bool has_tools;
+    double t0;
+    double last_t;
+    int last_current;
+    bool seen;
+} server_prefill_progress;
+
+static void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
+    int suffix = prompt - cached;
+    if (suffix < 0) suffix = 0;
+    snprintf(buf, len, "%d..%d:%d", cached, prompt, suffix);
+}
+
+static void log_flags(char *buf, size_t len, bool tools, bool thinking,
+                      bool dsml_start, bool dsml_end) {
+    size_t used = 0;
+    buf[0] = '\0';
+#define ADD_FLAG(name) do { \
+    int n = snprintf(buf + used, used < len ? len - used : 0, "%s%s", used ? " " : "", name); \
+    if (n > 0) used += (size_t)n; \
+} while (0)
+    if (tools) ADD_FLAG("TOOLS");
+    if (thinking) ADD_FLAG("THINKING");
+    if (dsml_start) ADD_FLAG("DSML_START");
+    if (dsml_end) ADD_FLAG("DSML_END");
+#undef ADD_FLAG
+}
+
+static void log_decode_progress(req_kind kind, const char *ctx, int completion,
+                                bool tools, bool thinking,
+                                bool dsml_start, bool dsml_end,
+                                double decode_t0,
+                                double *last_t, int *last_completion) {
+    const double now = now_sec();
+    const double elapsed = now - decode_t0;
+    const double interval_s = now - *last_t;
+    const int interval_tokens = completion - *last_completion;
+    const double chunk_tps = interval_s > 0.0 ? (double)interval_tokens / interval_s : 0.0;
+    const double avg_tps = elapsed > 0.0 ? (double)completion / elapsed : 0.0;
+    char flags[80];
+    log_flags(flags, sizeof(flags), tools, thinking, dsml_start, dsml_end);
+    server_log(DS4_LOG_GENERATION,
+               "ds4-server: %s ctx=%s gen=%d%s%s decoding chunk=%.2f t/s avg=%.2f t/s %.3fs",
+               kind == REQ_CHAT ? "chat" : "completion",
+               ctx,
+               completion,
+               flags[0] ? " " : "",
+               flags,
+               chunk_tps,
+               avg_tps,
+               elapsed);
+    *last_t = now;
+    *last_completion = completion;
+}
+
+typedef struct {
+    bool inside;
+    char tail[8]; /* Long enough for "</think>". */
+    int tail_len;
+} thinking_state;
+
+static bool thinking_tail_ends_with(const thinking_state *st, const char *s) {
+    int n = (int)strlen(s);
+    return st->tail_len >= n && !memcmp(st->tail + st->tail_len - n, s, (size_t)n);
+}
+
+static void thinking_state_feed(thinking_state *st, const char *p, size_t len) {
+    if (!st || !p) return;
+    for (size_t i = 0; i < len; i++) {
+        if (st->tail_len == (int)sizeof(st->tail)) {
+            memmove(st->tail, st->tail + 1, sizeof(st->tail) - 1);
+            st->tail_len--;
+        }
+        st->tail[st->tail_len++] = p[i];
+        if (thinking_tail_ends_with(st, "<think>")) st->inside = true;
+        else if (thinking_tail_ends_with(st, "</think>")) st->inside = false;
+    }
+}
+
+static thinking_state thinking_state_from_prompt(const request *r) {
+    thinking_state st = {0};
+    if (r && r->prompt_text) {
+        thinking_state_feed(&st, r->prompt_text, strlen(r->prompt_text));
+    } else if (r && ds4_think_mode_enabled(r->think_mode)) {
+        st.inside = true;
+    }
+    return st;
+}
+
+static void log_tool_calls_summary(const char *ctx, const tool_calls *calls) {
+    if (!calls || calls->len == 0) return;
+    buf names = {0};
+    for (int i = 0; i < calls->len; i++) {
+        if (i) buf_putc(&names, ',');
+        buf_puts(&names, calls->v[i].name ? calls->v[i].name : "?");
+    }
+    server_log(DS4_LOG_TOOL,
+               "ds4-server: tool calls ctx=%s n=%d names=[%s]",
+               ctx,
+               calls->len,
+               names.ptr ? names.ptr : "");
+    buf_free(&names);
+}
+
+static void server_progress_cb(void *ud, const char *event, int current, int total) {
+    server_prefill_progress *p = ud;
+    if (!p || !event || strcmp(event, "prefill_chunk")) return;
+
+    double now = now_sec();
+    double elapsed = now - p->t0;
+    if (p->seen && current == p->last_current) {
+        if (p->srv && current > p->cached_tokens) kv_cache_maybe_store_continued(p->srv);
+        return;
+    }
+    int display_total = p->prompt_tokens > total ? p->prompt_tokens : total;
+    double pct = display_total > 0 ? 100.0 * (double)current / (double)display_total : 100.0;
+    if (pct > 100.0) pct = 100.0;
+    int processed = current - p->cached_tokens;
+    if (processed < 0) processed = current;
+    int suffix = p->prompt_tokens - p->cached_tokens;
+    if (suffix > 0 && processed > suffix) processed = suffix;
+    double avg_tps = elapsed > 0.0 ? (double)processed / elapsed : 0.0;
+    int interval_tokens = p->seen ? current - p->last_current : 0;
+    if (interval_tokens < 0) interval_tokens = 0;
+    double interval_s = p->seen ? now - p->last_t : 0.0;
+    double chunk_tps = interval_s > 0.0 ? (double)interval_tokens / interval_s : 0.0;
+    p->last_current = current;
+    p->last_t = now;
+    p->seen = true;
+    char flags[64];
+    log_flags(flags, sizeof(flags), p->has_tools, false, false, false);
+    server_log(DS4_LOG_PREFILL,
+               "ds4-server: %s ctx=%s%s%s prefill chunk %d/%d (%.1f%%) chunk=%.2f t/s avg=%.2f t/s %.3fs",
+               p->kind == REQ_CHAT ? "chat" : "completion",
+               p->ctx,
+               flags[0] ? " " : "",
+               flags,
+               current,
+               display_total,
+               pct,
+               chunk_tps,
+               avg_tps,
+               elapsed);
+    if (p->srv && current > p->cached_tokens) kv_cache_maybe_store_continued(p->srv);
+}
+
+static char *build_tool_checkpoint_suffix(const request *r, const char *content,
+                                          const char *reasoning, const tool_calls *calls) {
+    buf suffix = {0};
+    if (ds4_think_mode_enabled(r->think_mode)) {
+        buf_puts(&suffix, reasoning ? reasoning : "");
+        buf_puts(&suffix, "</think>");
+    }
+    buf_puts(&suffix, content ? content : "");
+    append_dsml_tool_calls_text(&suffix, calls, &r->tool_orders);
+    buf_puts(&suffix, "<｜end▁of▁sentence｜>");
+    return buf_take(&suffix);
+}
+
+/* Tool calls have two textual forms: the model's raw DSML text and the
+ * canonical JSON/schema ordering the client will send back on the next turn.
+ * After a successful tool-call finish, adjust the live checkpoint to the
+ * canonical form when it is a continuation of the prompt.  This prevents a
+ * later request from missing the memory cache only because field ordering or
+ * DSML formatting changed. */
+static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ctx,
+                                         uint64_t trace_id, const char *content,
+                                         const char *reasoning, const tool_calls *calls) {
+    if (!calls || calls->len == 0 || !j->req.prompt_text) return;
+
+    char *suffix_text = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
+
+    buf rendered = {0};
+    buf_puts(&rendered, j->req.prompt_text);
+    buf_puts(&rendered, suffix_text);
+
+    ds4_tokens canonical = {0};
+    ds4_tokenize_rendered_chat(s->engine, rendered.ptr ? rendered.ptr : "", &canonical);
+    const int live_len = ds4_session_pos(s->session);
+    const int common = ds4_session_common_prefix(s->session, &canonical);
+    if (common == live_len && canonical.len == live_len) goto done;
+    if (common < j->req.prompt.len) {
+        trace_event(s, trace_id,
+                    "tool checkpoint canonicalization skipped: common=%d prompt=%d live=%d canonical=%d",
+                    common, j->req.prompt.len, live_len, canonical.len);
+        goto done;
+    }
+
+    char err[160];
+    ds4_session_rewind(s->session, common);
+    if (ds4_session_sync(s->session, &canonical, err, sizeof(err)) == 0) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: tool checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d",
+                   ctx, common, live_len, canonical.len);
+        trace_event(s, trace_id,
+                    "tool checkpoint canonicalized: common=%d live=%d canonical=%d",
+                    common, live_len, canonical.len);
+    } else {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: tool checkpoint canonicalization failed ctx=%s common=%d live=%d canonical=%d error=\"%s\"",
+                   ctx, common, live_len, canonical.len, err);
+        trace_event(s, trace_id, "tool checkpoint canonicalization failed: %s", err);
+    }
+
+done:
+    ds4_tokens_free(&canonical);
+    buf_free(&rendered);
+    free(suffix_text);
+}
+
+/* Execute one request on the worker-owned session.
+ *
+ * Clients resend full prompts.  The worker first tries the in-memory checkpoint,
+ * then the disk KV index, then a cold prefill.  Cold prompt caching is handled
+ * before generation: if the stable checkpoint is shorter than the full prompt,
+ * we prefill to that boundary, store it, and immediately continue to the real
+ * prompt.  The live graph therefore always moves forward. */
+static void generate_job(server *s, job *j) {
+    char err[160];
+    err[0] = '\0';
+    const int old_pos = ds4_session_pos(s->session);
+    const int common = ds4_session_common_prefix(s->session, &j->req.prompt);
+    trace_cache_diag cache_diag = {0};
+    if (s->trace) {
+        trace_cache_capture(&cache_diag, ds4_session_tokens(s->session),
+                            &j->req.prompt, old_pos, common);
+    }
+    int cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
+    const char *cache_source = cached > 0 ? "memory" : "none";
+    int disk_cached = 0;
+    char *disk_cache_path = NULL;
+    if (cached == 0) s->kv.continued_last_store_tokens = 0;
+    if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
+        /* Loading a disk snapshot replaces the live Metal session.  Persist the
+         * current checkpoint first, otherwise a cache hit for an older prefix
+         * would silently discard the newer conversation state. */
+        kv_cache_store_current(s, "evict");
+    }
+    if (cached == 0) {
+        disk_cached = kv_cache_try_load(s, &j->req, &disk_cache_path);
+        if (disk_cached > 0) {
+            cached = disk_cached;
+            cache_source = "disk";
+        }
+    }
+    const double t0 = now_sec();
+    uint64_t trace_id = trace_begin(s, j, cached, &cache_diag, cache_source,
+                                    disk_cached, disk_cache_path);
+    free(disk_cache_path);
+    char ctx_span[48];
+    request_ctx_span(ctx_span, sizeof(ctx_span), cached, j->req.prompt.len);
+    server_prefill_progress progress = {
+        .srv = s,
+        .kind = j->req.kind,
+        .prompt_tokens = j->req.prompt.len,
+        .cached_tokens = cached,
+        .has_tools = j->req.has_tools,
+        .t0 = t0,
+    };
+    snprintf(progress.ctx, sizeof(progress.ctx), "%s", ctx_span);
+    char req_flags[64];
+    log_flags(req_flags, sizeof(req_flags), j->req.has_tools, false, false, false);
+    server_log(DS4_LOG_PREFILL,
+               "ds4-server: %s ctx=%s%s%s prompt start",
+               j->req.kind == REQ_CHAT ? "chat" : "completion",
+               ctx_span,
+               req_flags[0] ? " " : "",
+               req_flags);
+    ds4_session_set_progress(s->session, server_progress_cb, &progress);
+
+    int cold_store_len = 0;
+    if (cached == 0 &&
+        s->kv.enabled &&
+        j->req.prompt.len >= s->kv.opt.min_tokens &&
+        s->kv.opt.cold_max_tokens > 0 &&
+        j->req.prompt.len <= s->kv.opt.cold_max_tokens)
+    {
+        cold_store_len = kv_cache_store_len(&s->kv, j->req.prompt.len);
+    }
+
+    if (s->kv.enabled &&
+        cold_store_len >= s->kv.opt.min_tokens &&
+        cold_store_len < j->req.prompt.len)
+    {
+        ds4_tokens prefix = {0};
+        tokens_copy_prefix(&prefix, &j->req.prompt, cold_store_len);
+        if (ds4_session_sync(s->session, &prefix, err, sizeof(err)) != 0) {
+            ds4_tokens_free(&prefix);
+            ds4_session_set_progress(s->session, NULL, NULL);
+            trace_event(s, trace_id, "prefill failed: %s", err);
+            http_error(j->fd, 500, err);
+            return;
+        }
+        if (kv_cache_store_live_prefix(s, &j->req.prompt, cold_store_len, "cold")) {
+            kv_cache_note_store(&s->kv, cold_store_len);
+        }
+        ds4_tokens_free(&prefix);
+    }
+
+    if (ds4_session_sync(s->session, &j->req.prompt, err, sizeof(err)) != 0) {
+        ds4_session_set_progress(s->session, NULL, NULL);
+        trace_event(s, trace_id, "prefill failed: %s", err);
+        http_error(j->fd, 500, err);
+        return;
+    }
+    ds4_session_set_progress(s->session, NULL, NULL);
+    server_log(DS4_LOG_PREFILL,
+               "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
+               j->req.kind == REQ_CHAT ? "chat" : "completion",
+               ctx_span,
+               req_flags[0] ? " " : "",
+               req_flags,
+               now_sec() - t0);
+    if (cold_store_len == j->req.prompt.len) {
+        if (kv_cache_store_live_prefix(s, &j->req.prompt, cold_store_len, "cold")) {
+            kv_cache_note_store(&s->kv, cold_store_len);
+        }
+    }
+    char id[96];
+    snprintf(id, sizeof(id), "%s-%llu",
+             j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
+             (unsigned long long)++s->seq);
+
+    bool structured_stream = request_uses_structured_stream(&j->req);
+    anthropic_stream anthropic_live = {0};
+    openai_stream openai_live = {0};
+    const bool openai_live_chat = request_uses_openai_live_stream(&j->req);
+    if (j->req.stream) {
+        if (!sse_headers(j->fd)) {
+            server_log(DS4_LOG_GENERATION, "ds4-server: %s ctx=%s sse headers failed", j->req.kind == REQ_CHAT ? "chat" : "completion", ctx_span);
+            return;
+        }
+        if (j->req.api == API_ANTHROPIC &&
+            !anthropic_sse_start_live(j->fd, &j->req, id,
+                                      j->req.prompt.len, &anthropic_live)) {
+            server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
+            return;
+        }
+        if (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT &&
+            !sse_chunk(j->fd, &j->req, id, NULL, NULL)) {
+            server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s openai role chunk failed", ctx_span);
+            return;
+        }
+        if (openai_live_chat) openai_stream_start(&j->req, &openai_live);
+    }
+
+    buf text = {0};
+    size_t plain_stream_pos = 0;
+    size_t stop_scan_from = 0;
+    const char *finish = "length";
+    int completion = 0;
+    int max_tokens = j->req.max_tokens;
+    int room = ds4_session_ctx(s->session) - ds4_session_pos(s->session);
+    bool saw_tool_start = false;
+    bool saw_tool_end = false;
+    size_t tool_scan_from = 0;
+    int next_tool_progress = 128;
+    int next_decode_log = 50;
+    uint64_t rng = j->req.seed ? j->req.seed :
+        (((uint64_t)time(NULL) << 32) ^ ((uint64_t)s->seq << 1) ^ (uint64_t)(uintptr_t)j);
+    if (max_tokens < 0) max_tokens = 0;
+    if (max_tokens > room) max_tokens = room;
+    trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
+    const double decode_t0 = now_sec();
+    double last_decode_log_t = decode_t0;
+    int last_decode_log_completion = 0;
+    thinking_state thinking = thinking_state_from_prompt(&j->req);
+
+    while (!g_stop_requested && completion < max_tokens &&
+           ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
+        const bool in_tool_call = j->req.kind == REQ_CHAT && j->req.has_tools &&
+                                  saw_tool_start && !saw_tool_end;
+        float temperature = j->req.temperature;
+        int top_k = j->req.top_k;
+        float top_p = j->req.top_p;
+        float min_p = j->req.min_p;
+        if (ds4_think_mode_enabled(j->req.think_mode)) {
+            temperature = 1.0f;
+            top_k = 0;
+            top_p = 1.0f;
+            min_p = 0.0f;
+        }
+        if (in_tool_call) temperature = 0.0f;
+        int token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
+        if (token == ds4_token_eos(s->engine)) {
+            finish = "stop";
+            break;
+        }
+
+        int toks[17];
+        int ntok = 0;
+        if (temperature <= 0.0f &&
+            ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+            getenv("DS4_MTP_SPEC_DISABLE") == NULL)
+        {
+            ntok = ds4_session_eval_speculative_argmax(s->session,
+                                                       token,
+                                                       max_tokens - completion,
+                                                       ds4_token_eos(s->engine),
+                                                       toks,
+                                                       (int)(sizeof(toks) / sizeof(toks[0])),
+                                                       err,
+                                                       sizeof(err));
+            if (ntok < 0) {
+                finish = "error";
+                break;
+            }
+        } else {
+            if (ds4_session_eval(s->session, token, err, sizeof(err)) != 0) {
+                finish = "error";
+                break;
+            }
+            toks[0] = token;
+            ntok = 1;
+        }
+
+        bool stop_decode = false;
+        for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
+            token = toks[ti];
+            if (token == ds4_token_eos(s->engine)) {
+                finish = "stop";
+                stop_decode = true;
+                break;
+            }
+
+            size_t piece_len = 0;
+            char *piece = ds4_token_text(s->engine, token, &piece_len);
+            completion++;
+
+            trace_piece(s, trace_id, piece, piece_len);
+            buf_append(&text, piece, piece_len);
+            thinking_state_feed(&thinking, piece, piece_len);
+
+            size_t stop_pos = 0, stop_len = 0;
+            bool hit_stop = stop_list_find_from(&j->req.stops, text.ptr,
+                                                stop_scan_from,
+                                                &stop_pos, &stop_len);
+            size_t stream_len = hit_stop ?
+                stop_pos : stop_list_stream_safe_len(&j->req.stops, text.len);
+            if (stream_len > text.len) stream_len = text.len;
+            stream_len = utf8_stream_safe_len(text.ptr, plain_stream_pos,
+                                              stream_len, hit_stop);
+            if (!hit_stop && j->req.stops.max_len > 1) {
+                const size_t hold = j->req.stops.max_len - 1;
+                stop_scan_from = text.len > hold ? text.len - hold : 0;
+            }
+
+            if (j->req.stream && !structured_stream && stream_len > plain_stream_pos) {
+                char *delta = xstrndup(text.ptr + plain_stream_pos, stream_len - plain_stream_pos);
+                bool ok = sse_chunk(j->fd, &j->req, id, delta, NULL);
+                free(delta);
+                if (!ok) {
+                    finish = "error";
+                    snprintf(err, sizeof(err), "client stream write failed");
+                    free(piece);
+                    stop_decode = true;
+                    break;
+                }
+                plain_stream_pos = stream_len;
+            }
+            if (j->req.stream && j->req.api == API_ANTHROPIC &&
+                !anthropic_sse_stream_update(j->fd, &j->req, id,
+                                             &anthropic_live, text.ptr, stream_len,
+                                             false)) {
+                finish = "error";
+                snprintf(err, sizeof(err), "client stream write failed");
+                free(piece);
+                stop_decode = true;
+                break;
+            }
+            if (openai_live_chat &&
+                !openai_sse_stream_update(j->fd, &j->req, id,
+                                          &openai_live, text.ptr, stream_len,
+                                          false)) {
+                finish = "error";
+                snprintf(err, sizeof(err), "client stream write failed");
+                free(piece);
+                stop_decode = true;
+                break;
+            }
+            free(piece);
+
+            if (j->req.kind == REQ_CHAT && j->req.has_tools) {
+                const char *tool_scan = text.ptr ? text.ptr + tool_scan_from : "";
+                bool now_start = saw_tool_start || tool_calls_started(tool_scan);
+                bool now_end = saw_tool_end || tool_calls_finished(tool_scan);
+                if (now_start && !saw_tool_start) {
+                    saw_tool_start = true;
+                    trace_event(s, trace_id, "entered tool-call block after %d generated tokens", completion);
+                }
+                if (now_end && !saw_tool_end) {
+                    saw_tool_end = true;
+                    trace_event(s, trace_id, "closed tool-call block after %d generated tokens", completion);
+                }
+                const size_t marker_hold = 80;
+                tool_scan_from = text.len > marker_hold ? text.len - marker_hold : 0;
+                if (s->trace && completion >= next_tool_progress) {
+                    trace_event(s, trace_id,
+                                "progress gen=%d dsml_start=%d dsml_end=%d",
+                                completion, saw_tool_start ? 1 : 0, saw_tool_end ? 1 : 0);
+                    next_tool_progress += 128;
+                }
+            }
+
+            if (completion >= next_decode_log) {
+                log_decode_progress(j->req.kind, ctx_span, completion,
+                                    j->req.has_tools,
+                                    thinking.inside,
+                                    saw_tool_start,
+                                    saw_tool_end,
+                                    decode_t0,
+                                    &last_decode_log_t,
+                                    &last_decode_log_completion);
+                next_decode_log += 50;
+                kv_cache_maybe_store_continued(s);
+            }
+
+            if (hit_stop) {
+                (void)stop_len;
+                finish = "stop";
+                text.len = stop_pos;
+                text.ptr[text.len] = '\0';
+                ds4_session_invalidate(s->session);
+                stop_decode = true;
+                break;
+            }
+
+            if (j->req.kind == REQ_CHAT && j->req.has_tools && saw_tool_end) {
+                finish = "tool_calls";
+                stop_decode = true;
+                break;
+            }
+        }
+        if (stop_decode) break;
+    }
+
+    if (g_stop_requested && strcmp(finish, "error") != 0) {
+        finish = "error";
+        snprintf(err, sizeof(err), "shutdown requested");
+    }
+
+    if (j->req.kind == REQ_CHAT && j->req.has_tools &&
+        saw_tool_start && !saw_tool_end && strcmp(finish, "error") != 0)
+    {
+        /* A partial streamed tool call cannot be retracted.  If the model ends
+         * before closing the DSML block, fail the turn instead of letting clients
+         * execute an incomplete `{}` or partially parsed argument object. */
+        finish = "error";
+        snprintf(err, sizeof(err), "unterminated tool call");
+    }
+
+    if (completion > last_decode_log_completion) {
+        log_decode_progress(j->req.kind, ctx_span, completion,
+                            j->req.has_tools,
+                            thinking.inside,
+                            saw_tool_start,
+                            saw_tool_end,
+                            decode_t0,
+                            &last_decode_log_t,
+                            &last_decode_log_completion);
+        if (strcmp(finish, "error") != 0) kv_cache_maybe_store_continued(s);
+    }
+
+    if (j->req.stream && !structured_stream && text.len > plain_stream_pos) {
+        char *tail = xstrndup(text.ptr + plain_stream_pos, text.len - plain_stream_pos);
+        if (!sse_chunk(j->fd, &j->req, id, tail, NULL)) finish = "error";
+        free(tail);
+    }
+
+    tool_calls parsed_calls = {0};
+    char *parsed_content = NULL;
+    char *parsed_reasoning = NULL;
+    const char *final_finish = finish;
+    if (j->req.kind == REQ_CHAT) {
+        bool parsed_ok = parse_generated_message(text.ptr ? text.ptr : "", &parsed_content,
+                                                 &parsed_reasoning, &parsed_calls);
+        if (!parsed_ok) {
+            free(parsed_content);
+            free(parsed_reasoning);
+            parsed_content = xstrdup(text.ptr ? text.ptr : "");
+            parsed_reasoning = NULL;
+            tool_calls_free(&parsed_calls);
+            if (j->req.has_tools && saw_tool_start && strcmp(final_finish, "error") != 0) {
+                final_finish = "error";
+                snprintf(err, sizeof(err), "invalid tool call");
+            }
+        }
+        if (parsed_calls.len) final_finish = "tool_calls";
+    }
+    log_tool_calls_summary(ctx_span, &parsed_calls);
+
+    trace_finish(s, trace_id, &j->req, final_finish, completion,
+                 saw_tool_start, saw_tool_end,
+                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+                 parsed_reasoning, &parsed_calls, now_sec() - t0);
+
+    if (j->req.kind == REQ_CHAT && parsed_calls.len) {
+        canonicalize_tool_checkpoint(s, j, ctx_span, trace_id,
+                                     parsed_content ? parsed_content : "",
+                                     parsed_reasoning, &parsed_calls);
+    }
+
+    if (j->req.stream) {
+        bool response_ok = true;
+        if (j->req.api == API_ANTHROPIC) {
+            response_ok = anthropic_sse_finish_live(j->fd, &j->req, id, &anthropic_live,
+                                                    text.ptr ? text.ptr : "", text.len,
+                                                    &parsed_calls, final_finish, completion);
+        } else if (openai_live_chat) {
+            response_ok = openai_sse_finish_live(j->fd, &j->req, id, &openai_live,
+                                                 text.ptr ? text.ptr : "", text.len,
+                                                 &parsed_calls, final_finish,
+                                                 j->req.prompt.len, completion);
+        } else if (structured_stream) {
+            response_ok = sse_chat_finish(j->fd, &j->req, id,
+                                          parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+                                          parsed_reasoning,
+                                          &parsed_calls, final_finish,
+                                          j->req.prompt.len, completion);
+        } else {
+            response_ok = sse_chunk(j->fd, &j->req, id, NULL, final_finish) &&
+                          sse_done(j->fd, &j->req, id, j->req.prompt.len, completion);
+        }
+        if (!response_ok) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: %s ctx=%s final stream failed",
+                       j->req.kind == REQ_CHAT ? "chat" : "completion",
+                       ctx_span);
+        }
+    } else if (j->req.api == API_ANTHROPIC) {
+        anthropic_final_response(j->fd, &j->req, id,
+                                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+                                 parsed_reasoning,
+                                 &parsed_calls, final_finish,
+                                 j->req.prompt.len, completion);
+    } else {
+        final_response(j->fd, &j->req, id,
+                       parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+                       parsed_reasoning,
+                       &parsed_calls, final_finish,
+                       j->req.prompt.len, completion);
+    }
+    if (j->req.kind == REQ_CHAT && j->req.has_tools) {
+        char flags[80];
+        log_flags(flags, sizeof(flags),
+                  true,
+                  thinking.inside,
+                  saw_tool_start,
+                  saw_tool_end);
+        if (!strcmp(final_finish, "error") && err[0]) {
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: chat ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
+                       ctx_span,
+                       completion,
+                       flags[0] ? " " : "",
+                       flags,
+                       final_finish,
+                       err,
+                       now_sec() - t0);
+        } else {
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: chat ctx=%s gen=%d%s%s finish=%s %.3fs",
+                       ctx_span,
+                       completion,
+                       flags[0] ? " " : "",
+                       flags,
+                       final_finish,
+                       now_sec() - t0);
+        }
+    } else {
+        char flags[80];
+        log_flags(flags, sizeof(flags),
+                  j->req.has_tools,
+                  thinking.inside,
+                  false,
+                  false);
+        if (!strcmp(final_finish, "error") && err[0]) {
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: %s ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
+                       j->req.kind == REQ_CHAT ? "chat" : "completion",
+                       ctx_span,
+                       completion,
+                       flags[0] ? " " : "",
+                       flags,
+                       final_finish,
+                       err,
+                       now_sec() - t0);
+        } else {
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: %s ctx=%s gen=%d%s%s finish=%s %.3fs",
+                       j->req.kind == REQ_CHAT ? "chat" : "completion",
+                       ctx_span,
+                       completion,
+                       flags[0] ? " " : "",
+                       flags,
+                       final_finish,
+                       now_sec() - t0);
+        }
+    }
+    if (strcmp(final_finish, "error") != 0) kv_cache_maybe_store_continued(s);
+    free(parsed_content);
+    free(parsed_reasoning);
+    tool_calls_free(&parsed_calls);
+    buf_free(&text);
+}
+
+static bool enqueue(server *s, job *j) {
+    pthread_mutex_lock(&s->mu);
+    if (s->stopping) {
+        pthread_mutex_unlock(&s->mu);
+        return false;
+    }
+    if (s->tail) s->tail->next = j; else s->head = j;
+    s->tail = j;
+    pthread_cond_signal(&s->cv);
+    pthread_mutex_unlock(&s->mu);
+    return true;
+}
+
+static job *dequeue(server *s) {
+    pthread_mutex_lock(&s->mu);
+    while (!s->head && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
+    if (!s->head) {
+        pthread_mutex_unlock(&s->mu);
+        return NULL;
+    }
+    job *j = s->head;
+    s->head = j->next;
+    if (!s->head) s->tail = NULL;
+    pthread_mutex_unlock(&s->mu);
+    j->next = NULL;
+    return j;
+}
+
+static void *worker_main(void *arg) {
+    server *s = arg;
+    for (;;) {
+        job *j = dequeue(s);
+        if (!j) break;
+        generate_job(s, j);
+        pthread_mutex_lock(&j->mu);
+        j->done = true;
+        pthread_cond_signal(&j->cv);
+        pthread_mutex_unlock(&j->mu);
+    }
+    return NULL;
+}
+
+typedef struct {
+    char method[8];
+    char path[256];
+    char *body;
+    size_t body_len;
+} http_request;
+
+static void http_request_free(http_request *r) {
+    free(r->body);
+    memset(r, 0, sizeof(*r));
+}
+
+static ssize_t header_end(const char *p, size_t n) {
+    for (size_t i = 3; i < n; i++) {
+        if (p[i - 3] == '\r' && p[i - 2] == '\n' && p[i - 1] == '\r' && p[i] == '\n') return (ssize_t)(i + 1);
+    }
+    for (size_t i = 1; i < n; i++) {
+        if (p[i - 1] == '\n' && p[i] == '\n') return (ssize_t)(i + 1);
+    }
+    return -1;
+}
+
+static long content_length(const char *h, size_t n) {
+    const char *p = h, *end = h + n;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len >= 15 && strncasecmp(line, "Content-Length:", 15) == 0) {
+            const char *v = line + 15;
+            while (v < line + len && isspace((unsigned char)*v)) v++;
+            return strtol(v, NULL, 10);
+        }
+        if (p < end) p++;
+    }
+    return 0;
+}
+
+static bool read_http_request(int fd, http_request *r) {
+    buf b = {0};
+    ssize_t hend = -1;
+    const size_t max_header = 64 * 1024;
+    const size_t max_body = 64 * 1024 * 1024;
+
+    while (hend < 0 && b.len < max_header) {
+        char tmp[4096];
+        ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) goto fail;
+        buf_append(&b, tmp, (size_t)n);
+        hend = header_end(b.ptr, b.len);
+    }
+    if (hend < 0) goto fail;
+
+    char line[512];
+    size_t i = 0;
+    while (i < b.len && b.ptr[i] != '\n' && i + 1 < sizeof(line)) {
+        line[i] = b.ptr[i];
+        i++;
+    }
+    line[i] = '\0';
+    if (sscanf(line, "%7s %255s", r->method, r->path) != 2) goto fail;
+    char *q = strchr(r->path, '?');
+    if (q) *q = '\0';
+
+    long clen = content_length(b.ptr, (size_t)hend);
+    if (clen < 0 || (size_t)clen > max_body) goto fail;
+    while (b.len < (size_t)hend + (size_t)clen) {
+        char tmp[8192];
+        ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) goto fail;
+        buf_append(&b, tmp, (size_t)n);
+    }
+
+    r->body_len = (size_t)clen;
+    r->body = xmalloc(r->body_len + 1);
+    memcpy(r->body, b.ptr + hend, r->body_len);
+    r->body[r->body_len] = '\0';
+    buf_free(&b);
+    return true;
+fail:
+    buf_free(&b);
+    return false;
+}
+
+typedef struct {
+    server *srv;
+    int fd;
+} client_arg;
+
+static void append_model_json_values(buf *b, int ctx, int default_tokens) {
+    const int max_completion = default_tokens < ctx ? default_tokens : ctx;
+    buf_printf(b,
+        "{\"id\":\"deepseek-v4-flash\","
+        "\"object\":\"model\","
+        "\"created\":1767225600,"
+        "\"owned_by\":\"ds4.c\","
+        "\"name\":\"DeepSeek V4 Flash\","
+        "\"context_length\":%d,"
+        "\"top_provider\":{"
+            "\"context_length\":%d,"
+            "\"max_completion_tokens\":%d,"
+            "\"is_moderated\":false},"
+        "\"supported_parameters\":["
+            "\"tools\","
+            "\"tool_choice\","
+            "\"max_tokens\","
+            "\"temperature\","
+            "\"top_p\","
+            "\"top_k\","
+            "\"min_p\","
+            "\"stop\","
+            "\"seed\","
+            "\"stream\","
+            "\"reasoning_effort\"]}",
+        ctx,
+        ctx,
+        max_completion);
+}
+
+static void append_model_json(buf *b, const server *s) {
+    append_model_json_values(b, ds4_session_ctx(s->session), s->default_tokens);
+}
+
+static bool send_model(server *s, int fd) {
+    buf b = {0};
+    append_model_json(&b, s);
+    buf_putc(&b, '\n');
+    bool ok = http_response(fd, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool send_models(server *s, int fd) {
+    buf b = {0};
+    buf_puts(&b, "{\"object\":\"list\",\"data\":[");
+    append_model_json(&b, s);
+    buf_puts(&b, "]}\n");
+    bool ok = http_response(fd, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static void client_done(server *s) {
+    pthread_mutex_lock(&s->mu);
+    if (s->clients > 0) s->clients--;
+    pthread_cond_broadcast(&s->clients_cv);
+    pthread_mutex_unlock(&s->mu);
+}
+
+static void set_client_socket_nonblocking(int fd);
+
+static void *client_main(void *arg) {
+    client_arg *ca = arg;
+    server *s = ca->srv;
+    int fd = ca->fd;
+    free(ca);
+
+    http_request hr = {0};
+    if (!read_http_request(fd, &hr)) {
+        http_error(fd, 400, "bad HTTP request");
+        goto done;
+    }
+
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
+        send_models(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models/deepseek-v4-flash")) {
+        send_model(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+
+    request req;
+    char err[160];
+    bool ok = false;
+    const int ctx_size = ds4_session_ctx(s->session);
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
+        ok = parse_anthropic_request(s->engine, hr.body, s->default_tokens,
+                                     ctx_size, &req, err, sizeof(err));
+    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {
+        ok = parse_chat_request(s->engine, hr.body, s->default_tokens,
+                                ctx_size, &req, err, sizeof(err));
+    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/completions")) {
+        ok = parse_completion_request(s->engine, hr.body, s->default_tokens,
+                                      ctx_size, &req, err, sizeof(err));
+    } else {
+        http_error(fd, 404, "unknown endpoint");
+        http_request_free(&hr);
+        goto done;
+    }
+    if (ok) req.raw_body = xstrndup(hr.body, hr.body_len);
+    http_request_free(&hr);
+    if (!ok) {
+        http_error(fd, 400, err);
+        goto done;
+    }
+
+    set_client_socket_nonblocking(fd);
+    job j;
+    memset(&j, 0, sizeof(j));
+    j.fd = fd;
+    j.req = req;
+    pthread_mutex_init(&j.mu, NULL);
+    pthread_cond_init(&j.cv, NULL);
+
+    pthread_mutex_lock(&j.mu);
+    if (!enqueue(s, &j)) {
+        pthread_mutex_unlock(&j.mu);
+        http_error(fd, 503, "server shutting down");
+        pthread_cond_destroy(&j.cv);
+        pthread_mutex_destroy(&j.mu);
+        request_free(&j.req);
+        goto done;
+    }
+    while (!j.done) pthread_cond_wait(&j.cv, &j.mu);
+    pthread_mutex_unlock(&j.mu);
+
+    pthread_cond_destroy(&j.cv);
+    pthread_mutex_destroy(&j.mu);
+    request_free(&j.req);
+done:
+    close(fd);
+    client_done(s);
+    return NULL;
+}
+
+static int listen_on(const char *host, int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    if (!strcmp(host, "localhost")) host = "127.0.0.1";
+    if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
+        close(fd);
+        errno = EINVAL;
+        return -1;
+    }
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, 128) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static void configure_client_socket(int fd) {
+    struct timeval tv;
+    tv.tv_sec = DS4_SERVER_IO_TIMEOUT_SEC;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+static void set_client_socket_nonblocking(int fd) {
+    /* The inference worker writes streaming responses itself.  Once a request is
+     * queued, a blocked socket would block every other request too, so slow
+     * clients are failed instead of back-pressuring the model session. */
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+typedef struct {
+    ds4_engine_options engine;
+    const char *host;
+    int port;
+    int ctx_size;
+    int default_tokens;
+    const char *trace_path;
+    const char *kv_disk_dir;
+    uint64_t kv_disk_space_mb;
+    kv_cache_options kv_cache;
+    bool kv_cache_reject_different_quant;
+} server_config;
+
+static int parse_int_arg(const char *s, const char *opt) {
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (!s[0] || *end || v <= 0 || v > INT_MAX) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: invalid value for %s: %s", opt, s);
+        exit(2);
+    }
+    return (int)v;
+}
+
+static int parse_nonneg_int_arg(const char *s, const char *opt) {
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (!s[0] || *end || v < 0 || v > INT_MAX) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: invalid value for %s: %s", opt, s);
+        exit(2);
+    }
+    return (int)v;
+}
+
+static float parse_float_arg(const char *s, const char *opt, float minv, float maxv) {
+    char *end = NULL;
+    float v = strtof(s, &end);
+    if (!s[0] || *end || v < minv || v > maxv) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: invalid value for %s: %s", opt, s);
+        exit(2);
+    }
+    return v;
+}
+
+static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
+    if (*i + 1 >= argc) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: missing value for %s", opt);
+        exit(2);
+    }
+    return argv[++(*i)];
+}
+
+static void log_context_memory(ds4_backend backend, int ctx_size) {
+    ds4_context_memory m = ds4_context_memory_estimate(backend, ctx_size);
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)",
+               (double)m.total_bytes / (1024.0 * 1024.0),
+               ctx_size,
+               ds4_backend_name(backend),
+               m.prefill_cap,
+               m.raw_cap,
+               m.comp_cap);
+}
+
+static void server_close_resources(server *s) {
+    if (s->trace) {
+        fclose(s->trace);
+        s->trace = NULL;
+    }
+    kv_cache_close(&s->kv);
+    pthread_mutex_destroy(&s->trace_mu);
+    pthread_cond_destroy(&s->clients_cv);
+    pthread_cond_destroy(&s->cv);
+    pthread_mutex_destroy(&s->mu);
+    ds4_session_free(s->session);
+    ds4_engine_close(s->engine);
+    memset(s, 0, sizeof(*s));
+}
+
+static void usage(FILE *fp) {
+    fprintf(fp,
+        "Usage: ds4-server [options]\n"
+        "\n"
+        "Model and runtime:\n"
+        "  -m, --model FILE\n"
+        "      GGUF model path. Default: ds4flash.gguf\n"
+        "  --mtp FILE\n"
+        "      Optional MTP support GGUF used for draft-token probes.\n"
+        "  --mtp-draft N\n"
+        "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
+        "  --mtp-margin F\n"
+        "      Minimum recursive-draft confidence for the fast N=2 verifier. Default: 3\n"
+        "  -c, --ctx N\n"
+        "      Context size allocated at startup. Default: 32768\n"
+        "  -n, --tokens N\n"
+        "      Default max output tokens when the client omits a limit. Default: 393216 (384K)\n"
+        "  -t, --threads N\n"
+        "      CPU helper threads for lightweight host-side work.\n"
+        "  --quality\n"
+        "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
+        "  --warm-weights\n"
+        "      Touch mapped tensor pages before serving. Slower startup, fewer first-use stalls.\n"
+        "\n"
+        "HTTP API:\n"
+        "  --host HOST\n"
+        "      Bind address. Default: 127.0.0.1\n"
+        "  --port N\n"
+        "      Bind port. Default: 8000\n"
+        "  --trace FILE\n"
+        "      Write a human-readable session trace: prompts, cache decisions, output, tool calls.\n"
+        "  --stream-weights\n"
+        "      Wrap Metal model weights on demand instead of mapping the whole tensor range up front.\n"
+        "\n"
+        "Thinking and sampling:\n"
+        "  DeepSeek-compatible chat requests default to thinking mode with high effort.\n"
+        "  Only reasoning_effort=max or output_config.effort=max requests Think Max.\n"
+        "  Think Max is applied only when --ctx is at least 393216 tokens; smaller contexts use high.\n"
+        "  thinking={type:disabled}, think=false, or model=deepseek-chat selects non-thinking mode.\n"
+        "  API defaults are temperature=1, top_p=1, min_p=0, and no top-k cap.\n"
+        "  In thinking mode, client sampling knobs are ignored like the official API.\n"
+        "\n"
+        "Disk KV cache:\n"
+        "  --kv-disk-dir DIR\n"
+        "      Enable disk KV checkpoints in DIR. The directory is created if needed.\n"
+        "  --kv-disk-space-mb N\n"
+        "      Disk budget for checkpoint files. Default when enabled: 4096\n"
+        "  --kv-cache-min-tokens N\n"
+        "      Do not save or load checkpoints shorter than N tokens. Default: 512\n"
+        "  --kv-cache-cold-max-tokens N\n"
+        "      Cold first prompts in [min,N] are saved automatically. 0 disables cold saves. Default: 30000\n"
+        "  --kv-cache-continued-interval-tokens N\n"
+        "      Save the live conversation after it grows N tokens past the last saved point. 0 disables. Default: 10000\n"
+        "  --kv-cache-boundary-trim-tokens N\n"
+        "      Trim this many tail tokens before cold boundary saves to avoid tokenizer boundary merges. Default: 32\n"
+        "  --kv-cache-boundary-align-tokens N\n"
+        "      Align cold boundary saves down to this token multiple. 0 disables alignment. Default: 2048\n"
+        "  --kv-cache-reject-different-quant\n"
+        "      Refuse checkpoints written by the same model with a different routed-expert quantization.\n"
+        "\n"
+        "  Cache triggers:\n"
+        "      cold       save a stable prefix of a long first prompt before generation starts\n"
+        "      continued  save the active conversation after it grows by the configured interval\n"
+        "      evict      save the live conversation before another request replaces it\n"
+        "      shutdown   save the live conversation when the server exits cleanly\n"
+        "\n"
+        "Normal server command:\n"
+        "  ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192\n"
+        "\n"
+        "Notes:\n"
+        "  The server is Metal-only. Use /v1/chat/completions, /v1/completions, or /v1/messages.\n"
+        "  Larger --ctx values allocate more KV memory at startup; the startup log prints the estimate.\n"
+        "  Disk KV caching is best for agents that resend long prompts with stable prefixes.\n"
+        "\n"
+        "  -h, --help\n"
+        "      Show this help.\n");
+}
+
+static server_config parse_options(int argc, char **argv) {
+    server_config c = {
+        .engine = {
+            .model_path = "ds4flash.gguf",
+            .backend = DS4_BACKEND_METAL,
+            .mtp_draft_tokens = 1,
+            .mtp_margin = 3.0f,
+        },
+        .host = "127.0.0.1",
+        .port = 8000,
+        .ctx_size = 32768,
+        .default_tokens = 393216,
+    };
+    c.kv_cache = kv_cache_default_options();
+
+    for (int i = 1; i < argc; i++) {
+        const char *arg = argv[i];
+        if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
+            usage(stdout);
+            exit(0);
+        } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
+            c.engine.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp")) {
+            c.engine.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp-draft")) {
+            c.engine.mtp_draft_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--mtp-margin")) {
+            c.engine.mtp_margin = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
+        } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
+            c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
+            c.default_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
+            c.engine.n_threads = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--host")) {
+            c.host = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--port")) {
+            c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--trace")) {
+            c.trace_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--kv-disk-dir")) {
+            c.kv_disk_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--kv-disk-space-mb")) {
+            c.kv_disk_space_mb = (uint64_t)parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-cache-min-tokens")) {
+            c.kv_cache.min_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-cache-cold-max-tokens")) {
+            c.kv_cache.cold_max_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-cache-continued-interval-tokens")) {
+            c.kv_cache.continued_interval_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-cache-boundary-trim-tokens")) {
+            c.kv_cache.boundary_trim_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-cache-boundary-align-tokens")) {
+            c.kv_cache.boundary_align_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-cache-reject-different-quant")) {
+            c.kv_cache_reject_different_quant = true;
+        } else if (!strcmp(arg, "--quality")) {
+            c.engine.quality = true;
+        } else if (!strcmp(arg, "--warm-weights")) {
+            c.engine.warm_weights = true;
+        } else if (!strcmp(arg, "--stream-weights")) {
+            c.engine.stream_weights = true;
+        } else if (!strcmp(arg, "--cpu") || !strcmp(arg, "--backend")) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: server mode is Metal-only");
+            exit(2);
+        } else {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: unknown option: %s", arg);
+            usage(stderr);
+            exit(2);
+        }
+    }
+    if (c.kv_cache.cold_max_tokens > 0 &&
+        c.kv_cache.cold_max_tokens < c.kv_cache.min_tokens)
+    {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: --kv-cache-cold-max-tokens must be 0 or >= --kv-cache-min-tokens");
+        exit(2);
+    }
+    return c;
+}
+
+#ifndef DS4_SERVER_TEST
+int main(int argc, char **argv) {
+    signal(SIGPIPE, SIG_IGN);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = stop_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    server_config cfg = parse_options(argc, argv);
+
+    ds4_engine *engine = NULL;
+    if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
+
+    log_context_memory(cfg.engine.backend, cfg.ctx_size);
+
+    ds4_session *session = NULL;
+    if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create Metal session");
+        ds4_engine_close(engine);
+        return 1;
+    }
+
+    server s;
+    memset(&s, 0, sizeof(s));
+    s.engine = engine;
+    s.session = session;
+    s.default_tokens = cfg.default_tokens;
+    if (cfg.kv_disk_dir) {
+        kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
+                      cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+    }
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_cond_init(&s.cv, NULL);
+    pthread_cond_init(&s.clients_cv, NULL);
+    pthread_mutex_init(&s.trace_mu, NULL);
+    if (cfg.trace_path) {
+        s.trace = fopen(cfg.trace_path, "w");
+        if (!s.trace) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: failed to open trace file %s: %s",
+                       cfg.trace_path, strerror(errno));
+            server_close_resources(&s);
+            return 1;
+        }
+        setvbuf(s.trace, NULL, _IONBF, 0);
+        server_log(DS4_LOG_DEFAULT, "ds4-server: tracing session to %s", cfg.trace_path);
+    }
+
+    pthread_t worker;
+    if (pthread_create(&worker, NULL, worker_main, &s) != 0) die("failed to start worker");
+
+    int lfd = listen_on(cfg.host, cfg.port);
+    if (lfd < 0) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to listen on %s:%d: %s", cfg.host, cfg.port, strerror(errno));
+        pthread_mutex_lock(&s.mu);
+        s.stopping = true;
+        pthread_cond_broadcast(&s.cv);
+        pthread_mutex_unlock(&s.mu);
+        pthread_join(worker, NULL);
+        server_close_resources(&s);
+        return 1;
+    }
+    g_listen_fd = lfd;
+    server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
+
+    while (!g_stop_requested) {
+        int fd = accept(lfd, NULL, NULL);
+        if (fd < 0) {
+            if (g_stop_requested) break;
+            if (errno == EINTR) continue;
+            server_log(DS4_LOG_DEFAULT, "ds4-server: accept failed: %s", strerror(errno));
+            continue;
+        }
+        if (g_stop_requested) {
+            close(fd);
+            break;
+        }
+
+        configure_client_socket(fd);
+        client_arg *ca = xmalloc(sizeof(*ca));
+        ca->srv = &s;
+        ca->fd = fd;
+        pthread_mutex_lock(&s.mu);
+        s.clients++;
+        pthread_mutex_unlock(&s.mu);
+        pthread_t th;
+        if (pthread_create(&th, NULL, client_main, ca) != 0) {
+            pthread_mutex_lock(&s.mu);
+            s.clients--;
+            pthread_cond_broadcast(&s.clients_cv);
+            pthread_mutex_unlock(&s.mu);
+            free(ca);
+            close(fd);
+            continue;
+        }
+        pthread_detach(th);
+    }
+    if (g_listen_fd >= 0) {
+        close(lfd);
+        g_listen_fd = -1;
+    }
+
+    server_log(DS4_LOG_DEFAULT, "ds4-server: shutdown requested, draining requests");
+    pthread_mutex_lock(&s.mu);
+    s.stopping = true;
+    pthread_cond_broadcast(&s.cv);
+    pthread_mutex_unlock(&s.mu);
+    pthread_join(worker, NULL);
+    pthread_mutex_lock(&s.mu);
+    while (s.clients > 0) pthread_cond_wait(&s.clients_cv, &s.mu);
+    pthread_mutex_unlock(&s.mu);
+
+    const ds4_tokens *tokens = ds4_session_tokens(s.session);
+    if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: persisting current KV cache before shutdown tokens=%d",
+                   tokens->len);
+        kv_cache_store_current(&s, "shutdown");
+    }
+    server_close_resources(&s);
+    return 0;
+}
+#else
+
+static int test_failures = 0;
+
+static void test_assert(bool cond, const char *file, int line, const char *expr) {
+    if (cond) return;
+    fprintf(stderr, "%s:%d: assertion failed: %s\n", file, line, expr);
+    test_failures++;
+}
+
+#define TEST_ASSERT(expr) test_assert((expr), __FILE__, __LINE__, #expr)
+
+static void test_tool_schema_order_from_anthropic_schema(void) {
+    tool_schema_orders orders = {0};
+    tool_schema_orders_add_json(&orders,
+        "{\"name\":\"bash\",\"input_schema\":{\"type\":\"object\",\"properties\":{"
+        "\"command\":{\"type\":\"string\"},"
+        "\"description\":{\"type\":\"string\"}}}}");
+    const tool_schema_order *order = tool_schema_orders_find(&orders, "bash");
+    TEST_ASSERT(order != NULL);
+    TEST_ASSERT(order && order->len == 2);
+    TEST_ASSERT(order && !strcmp(order->prop[0], "command"));
+    TEST_ASSERT(order && !strcmp(order->prop[1], "description"));
+    tool_schema_orders_free(&orders);
+}
+
+static void test_tool_schema_order_from_openai_tools(void) {
+    const char *json =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"edit\",\"parameters\":{"
+        "\"type\":\"object\",\"properties\":{"
+        "\"filePath\":{\"type\":\"string\"},"
+        "\"oldString\":{\"type\":\"string\"},"
+        "\"newString\":{\"type\":\"string\"}}}}}]";
+    const char *p = json;
+    char *schemas = NULL;
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_tools_value(&p, &schemas, &orders));
+    TEST_ASSERT(schemas && strstr(schemas, "\"name\":\"edit\""));
+    const tool_schema_order *order = tool_schema_orders_find(&orders, "edit");
+    TEST_ASSERT(order != NULL);
+    TEST_ASSERT(order && order->len == 3);
+    TEST_ASSERT(order && !strcmp(order->prop[0], "filePath"));
+    TEST_ASSERT(order && !strcmp(order->prop[1], "oldString"));
+    TEST_ASSERT(order && !strcmp(order->prop[2], "newString"));
+    free(schemas);
+    tool_schema_orders_free(&orders);
+}
+
+static tool_calls make_swapped_bash_call(void) {
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"description\":\"list files\",\"command\":\"ls -la\",\"timeout\":10}");
+    tool_calls_push(&calls, tc);
+    return calls;
+}
+
+static tool_schema_orders make_bash_order(void) {
+    tool_schema_orders orders = {0};
+    tool_schema_orders_add_json(&orders,
+        "{\"name\":\"bash\",\"input_schema\":{\"type\":\"object\",\"properties\":{"
+        "\"command\":{\"type\":\"string\"},"
+        "\"description\":{\"type\":\"string\"}}}}");
+    return orders;
+}
+
+static char *read_socket_text(int fd) {
+    buf b = {0};
+    char tmp[1024];
+    ssize_t n;
+    while ((n = read(fd, tmp, sizeof(tmp))) > 0) {
+        buf_append(&b, tmp, (size_t)n);
+    }
+    return buf_take(&b);
+}
+
+static void test_anthropic_live_stream_sends_incremental_blocks(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+    r.tool_orders = make_bash_order();
+
+    anthropic_stream st;
+    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_test", 10, &st));
+    const char *raw1 = "need a tool</think>Hello.\n\n";
+    TEST_ASSERT(anthropic_sse_stream_update(sv[0], &r, "msg_test", &st,
+                                            raw1, strlen(raw1), false));
+
+    const char *raw =
+        "need a tool</think>Hello.\n\n"
+        DS4_TOOL_CALLS_START "\n";
+    TEST_ASSERT(anthropic_sse_stream_update(sv[0], &r, "msg_test", &st,
+                                            raw, strlen(raw), false));
+
+    tool_calls calls = make_swapped_bash_call();
+    TEST_ASSERT(anthropic_sse_finish_live(sv[0], &r, "msg_test", &st,
+                                          raw, strlen(raw), &calls,
+                                          "tool_calls", 8));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    const char *msg_start = strstr(out, "event: message_start");
+    const char *thinking = strstr(out, "\"thinking\":\"need a tool\"");
+    const char *signature = strstr(out, "\"type\":\"signature_delta\"");
+    const char *text = strstr(out, "\"text\":\"Hello.\"");
+    const char *tool = strstr(out, "\"type\":\"tool_use\"");
+    const char *stop = strstr(out, "event: message_stop");
+    TEST_ASSERT(msg_start != NULL);
+    TEST_ASSERT(thinking != NULL);
+    TEST_ASSERT(signature != NULL);
+    TEST_ASSERT(text != NULL);
+    TEST_ASSERT(tool != NULL);
+    TEST_ASSERT(stop != NULL);
+    TEST_ASSERT(msg_start < thinking);
+    TEST_ASSERT(thinking < signature);
+    TEST_ASSERT(signature < text);
+    TEST_ASSERT(text < tool);
+    TEST_ASSERT(tool < stop);
+    TEST_ASSERT(strstr(out, DS4_TOOL_CALLS_START) == NULL);
+
+    free(out);
+    tool_calls_free(&calls);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_tool_stream_sends_incremental_text(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+    r.tool_orders = make_bash_order();
+
+    TEST_ASSERT(sse_chunk(sv[0], &r, "chatcmpl_test", NULL, NULL));
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw1 = "<think>need a tool</think>Hello.\n\n";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_test", &st,
+                                         raw1, strlen(raw1), false));
+
+    const char *raw =
+        "<think>need a tool</think>Hello.\n\n"
+        DS4_TOOL_CALLS_START "\n";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_test", &st,
+                                         raw, strlen(raw), false));
+
+    tool_calls calls = make_swapped_bash_call();
+    TEST_ASSERT(openai_sse_finish_live(sv[0], &r, "chatcmpl_test", &st,
+                                       raw, strlen(raw), &calls,
+                                       "tool_calls", 10, 8));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    const char *role = strstr(out, "\"role\":\"assistant\"");
+    const char *thinking = strstr(out, "\"reasoning_content\":\"need a tool\"");
+    const char *text = strstr(out, "\"content\":\"Hello.\"");
+    const char *tool = strstr(out, "\"tool_calls\"");
+    const char *done = strstr(out, "data: [DONE]");
+    TEST_ASSERT(role != NULL);
+    TEST_ASSERT(thinking != NULL);
+    TEST_ASSERT(text != NULL);
+    TEST_ASSERT(tool != NULL);
+    TEST_ASSERT(done != NULL);
+    TEST_ASSERT(role < thinking);
+    TEST_ASSERT(thinking < text);
+    TEST_ASSERT(text < tool);
+    TEST_ASSERT(tool < done);
+    TEST_ASSERT(strstr(out, DS4_TOOL_CALLS_START) == NULL);
+    TEST_ASSERT(strstr(out, "<think>") == NULL);
+
+    free(out);
+    tool_calls_free(&calls);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = false;
+
+    TEST_ASSERT(request_uses_structured_stream(&r));
+    TEST_ASSERT(request_uses_openai_live_stream(&r));
+    TEST_ASSERT(sse_chunk(sv[0], &r, "chatcmpl_title", NULL, NULL));
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw1 = "We need to generate a title";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_title", &st,
+                                         raw1, strlen(raw1), false));
+
+    const char *raw2 =
+        "We need to generate a title</think>Free disk space check";
+    TEST_ASSERT(openai_sse_finish_live(sv[0], &r, "chatcmpl_title", &st,
+                                       raw2, strlen(raw2), NULL,
+                                       "stop", 12, 8));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    const char *role = strstr(out, "\"role\":\"assistant\"");
+    const char *reasoning1 = strstr(out, "\"reasoning_content\":\"We need to generate \"");
+    const char *reasoning2 = strstr(out, "\"reasoning_content\":\"a title\"");
+    const char *content = strstr(out, "\"content\":\"Free disk space check\"");
+    const char *done = strstr(out, "data: [DONE]");
+    TEST_ASSERT(role != NULL);
+    TEST_ASSERT(reasoning1 != NULL);
+    TEST_ASSERT(reasoning2 != NULL);
+    TEST_ASSERT(content != NULL);
+    TEST_ASSERT(done != NULL);
+    TEST_ASSERT(role < reasoning1);
+    TEST_ASSERT(reasoning1 < reasoning2);
+    TEST_ASSERT(reasoning2 < content);
+    TEST_ASSERT(content < done);
+    TEST_ASSERT(strstr(out, "\"content\":\"We need to generate a title") == NULL);
+    TEST_ASSERT(strstr(out, "</think>") == NULL);
+
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_tool_stream_sends_partial_arguments(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.tool_orders = make_bash_order();
+
+    TEST_ASSERT(sse_chunk(sv[0], &r, "chatcmpl_partial_tool", NULL, NULL));
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw =
+        "Before.\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">echo partial";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_partial_tool", &st,
+                                         raw, strlen(raw), false));
+
+    const char *raw_complete =
+        "Before.\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">echo partial done" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END;
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_partial_tool", &st,
+                                         raw_complete, strlen(raw_complete), false));
+
+    char *parsed_content = NULL;
+    char *parsed_reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message(raw_complete, &parsed_content, &parsed_reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(openai_sse_finish_live(sv[0], &r, "chatcmpl_partial_tool", &st,
+                                       raw_complete, strlen(raw_complete), &calls,
+                                       "tool_calls", 10, 4));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    const char *text = strstr(out, "\"content\":\"Before.\"");
+    const char *tool = strstr(out, "\"tool_calls\"");
+    const char *key = strstr(out, "\\\"command\\\":\\\"");
+    const char *partial = strstr(out, "\"arguments\":\"echo partial\"");
+    const char *rest = strstr(out, "\"arguments\":\" done\"");
+    int tool_id_count = 0;
+    for (const char *p = out; (p = strstr(p, "chatcmpl_partial_tool_tool_0")) != NULL; p++) tool_id_count++;
+    TEST_ASSERT(text != NULL);
+    TEST_ASSERT(tool != NULL);
+    TEST_ASSERT(key != NULL);
+    TEST_ASSERT(partial != NULL);
+    TEST_ASSERT(rest != NULL);
+    TEST_ASSERT(text < tool);
+    TEST_ASSERT(tool < partial);
+    TEST_ASSERT(partial < rest);
+    TEST_ASSERT(tool_id_count == 1);
+    TEST_ASSERT(strstr(out, DS4_TOOL_CALLS_START) == NULL);
+    TEST_ASSERT(strstr(out, DS4_PARAM_START) == NULL);
+
+    free(out);
+    free(parsed_content);
+    free(parsed_reasoning);
+    tool_calls_free(&calls);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_tool_stream_waits_for_incomplete_tool_tags(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw_invoke = DS4_TOOL_CALLS_START "\n" DS4_INVOKE_START;
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_incomplete_tool", &st,
+                                         raw_invoke, strlen(raw_invoke), false));
+    TEST_ASSERT(st.mode == OPENAI_STREAM_TOOL);
+    TEST_ASSERT(st.tool.state == OPENAI_TOOL_BETWEEN_INVOKES);
+
+    const char *raw_param =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START;
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_incomplete_tool", &st,
+                                         raw_param, strlen(raw_param), false));
+    TEST_ASSERT(st.mode == OPENAI_STREAM_TOOL);
+    TEST_ASSERT(st.tool.state == OPENAI_TOOL_BETWEEN_PARAMS);
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"name\":\"bash\"") != NULL);
+    TEST_ASSERT(strstr(out, DS4_PARAM_START) == NULL);
+
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_tool_stream_sends_partial_raw_arguments(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"edit\">\n"
+        DS4_PARAM_START " name=\"edits\" string=\"false\">[1,2,3";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_raw_tool", &st,
+                                         raw, strlen(raw), false));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"name\":\"edit\"") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"edits\\\":") != NULL);
+    TEST_ASSERT(strstr(out, "\"arguments\":\"[1,2,3\"") != NULL);
+    TEST_ASSERT(strstr(out, DS4_TOOL_CALLS_START) == NULL);
+
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_tool_stream_holds_partial_dsml_entities(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw_partial =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">echo &amp";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_entity_tool", &st,
+                                         raw_partial, strlen(raw_partial), false));
+
+    const char *raw_complete =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">echo &amp; done" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END;
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_entity_tool", &st,
+                                         raw_complete, strlen(raw_complete), false));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"arguments\":\"echo \"") != NULL);
+    TEST_ASSERT(strstr(out, "\"arguments\":\"& done\"") != NULL);
+    TEST_ASSERT(strstr(out, "&amp") == NULL);
+
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_tool_stream_holds_partial_utf8_arguments(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char prefix[] =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"write\">\n"
+        DS4_PARAM_START " name=\"content\" string=\"true\">flag ";
+    const char suffix[] =
+        " done" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END;
+    const char flag_utf8[] = {(char)0xf0, (char)0x9f, (char)0x9a, (char)0xa9, 0};
+    const char replacement[] = {(char)0xef, (char)0xbf, (char)0xbd, 0};
+
+    buf partial = {0};
+    buf_append(&partial, prefix, strlen(prefix));
+    buf_putc(&partial, (char)0xf0);
+    buf_putc(&partial, (char)0x9f);
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_utf8_tool", &st,
+                                         partial.ptr, partial.len, false));
+
+    buf complete = {0};
+    buf_append(&complete, prefix, strlen(prefix));
+    buf_append(&complete, flag_utf8, 4);
+    buf_append(&complete, suffix, strlen(suffix));
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_utf8_tool", &st,
+                                         complete.ptr, complete.len, false));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"arguments\":\"flag \"") != NULL);
+    TEST_ASSERT(strstr(out, flag_utf8) != NULL);
+    TEST_ASSERT(strstr(out, replacement) == NULL);
+
+    free(out);
+    buf_free(&partial);
+    buf_free(&complete);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_tool_stream_handles_multiple_calls(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"read\">\n"
+        DS4_PARAM_START " name=\"path\" string=\"true\">a.c" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">wc -l a.c" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END;
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_multi_tool", &st,
+                                         raw, strlen(raw), false));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "chatcmpl_multi_tool_tool_0") != NULL);
+    TEST_ASSERT(strstr(out, "chatcmpl_multi_tool_tool_1") != NULL);
+    TEST_ASSERT(strstr(out, "\"name\":\"read\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"name\":\"bash\"") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"path\\\":") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"command\\\":") != NULL);
+
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_streaming_holds_partial_utf8(void) {
+    const char partial[] = {'A', ' ', (char)0xf0, (char)0x9f, 0};
+    const char complete[] = {'A', ' ', (char)0xf0, (char)0x9f,
+                             (char)0x9a, (char)0xa9, ' ', 'd', 'o', 'n', 'e', 0};
+    const char flag_done[] = {(char)0xf0, (char)0x9f,
+                              (char)0x9a, (char)0xa9, ' ', 'd', 'o', 'n', 'e', 0};
+    const char replacement[] = {(char)0xef, (char)0xbf, (char)0xbd, 0};
+
+    TEST_ASSERT(utf8_stream_safe_len(partial, 0, strlen(partial), false) == 2);
+    TEST_ASSERT(utf8_stream_safe_len(complete, 0, strlen(complete), false) == strlen(complete));
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_utf8", &st,
+                                         partial, strlen(partial), false));
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_utf8", &st,
+                                         complete, strlen(complete), false));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"content\":\"A \"") != NULL);
+    TEST_ASSERT(strstr(out, flag_done) != NULL);
+    TEST_ASSERT(strstr(out, replacement) == NULL);
+
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_request_defaults_match_deepseek_api(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    TEST_ASSERT(r.think_mode == DS4_THINK_HIGH);
+    TEST_ASSERT(r.temperature == 1.0f);
+    TEST_ASSERT(r.top_p == 1.0f);
+    TEST_ASSERT(r.top_k == 0);
+    TEST_ASSERT(r.min_p == 0.0f);
+    request_free(&r);
+}
+
+static void test_reasoning_effort_mapping(void) {
+    ds4_think_mode mode = DS4_THINK_NONE;
+    TEST_ASSERT(parse_reasoning_effort_name("low", &mode) && mode == DS4_THINK_HIGH);
+    TEST_ASSERT(parse_reasoning_effort_name("medium", &mode) && mode == DS4_THINK_HIGH);
+    TEST_ASSERT(parse_reasoning_effort_name("high", &mode) && mode == DS4_THINK_HIGH);
+    TEST_ASSERT(parse_reasoning_effort_name("xhigh", &mode) && mode == DS4_THINK_HIGH);
+    TEST_ASSERT(parse_reasoning_effort_name("max", &mode) && mode == DS4_THINK_MAX);
+    TEST_ASSERT(!parse_reasoning_effort_name("banana", &mode));
+    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX, 32768) == DS4_THINK_HIGH);
+    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX,
+                                           (int)ds4_think_max_min_context()) == DS4_THINK_MAX);
+}
+
+static void test_api_thinking_controls_parse(void) {
+    bool enabled = true;
+    const char *thinking = "{\"type\":\"disabled\",\"budget_tokens\":1024}";
+    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled));
+    TEST_ASSERT(!enabled);
+    thinking = "true";
+    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled));
+    TEST_ASSERT(enabled);
+
+    ds4_think_mode mode = DS4_THINK_HIGH;
+    const char *anth_effort = "{\"effort\":\"max\",\"other\":true}";
+    TEST_ASSERT(parse_output_config_effort(&anth_effort, &mode));
+    TEST_ASSERT(mode == DS4_THINK_MAX);
+
+    const char *openai_effort = "\"xhigh\"";
+    mode = DS4_THINK_HIGH;
+    TEST_ASSERT(parse_reasoning_effort_value(&openai_effort, &mode));
+    TEST_ASSERT(mode == DS4_THINK_HIGH);
+}
+
+static void test_render_think_max_prompt_prefix(void) {
+    chat_msgs msgs = {0};
+    chat_msg sys = {0};
+    sys.role = xstrdup("system");
+    sys.content = xstrdup("You are terse.");
+    chat_msgs_push(&msgs, sys);
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Hello");
+    chat_msgs_push(&msgs, user);
+
+    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_MAX);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(!strncmp(prompt, "<｜begin▁of▁sentence｜>", strlen("<｜begin▁of▁sentence｜>")));
+    TEST_ASSERT(strstr(prompt, ds4_think_max_prefix()) != NULL);
+    TEST_ASSERT(strstr(prompt, "You are terse.<｜User｜>Hello<｜Assistant｜><think>") != NULL);
+    TEST_ASSERT(strstr(prompt, "</think>") == NULL);
+
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+static void test_render_non_thinking_prompt_closes_think(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Hello");
+    chat_msgs_push(&msgs, user);
+
+    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_NONE);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, ds4_think_max_prefix()) == NULL);
+    TEST_ASSERT(strstr(prompt, "<｜User｜>Hello<｜Assistant｜></think>") != NULL);
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+static void test_render_drops_old_reasoning_without_tools(void) {
+    chat_msgs msgs = {0};
+    chat_msg user1 = {0};
+    user1.role = xstrdup("user");
+    user1.content = xstrdup("first");
+    chat_msgs_push(&msgs, user1);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.reasoning = xstrdup("old hidden reasoning");
+    assistant.content = xstrdup("first answer");
+    chat_msgs_push(&msgs, assistant);
+    chat_msg user2 = {0};
+    user2.role = xstrdup("user");
+    user2.content = xstrdup("second");
+    chat_msgs_push(&msgs, user2);
+
+    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "old hidden reasoning") == NULL);
+    TEST_ASSERT(strstr(prompt, "<｜Assistant｜></think>first answer") != NULL);
+    TEST_ASSERT(strstr(prompt, "<｜User｜>second<｜Assistant｜><think>") != NULL);
+
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+static void test_render_preserves_reasoning_with_tools(void) {
+    chat_msgs msgs = {0};
+    chat_msg user1 = {0};
+    user1.role = xstrdup("user");
+    user1.content = xstrdup("first");
+    chat_msgs_push(&msgs, user1);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.reasoning = xstrdup("tool reasoning");
+    assistant.content = xstrdup("");
+    tool_call tc = {0};
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\":\"pwd\"}");
+    tool_calls_push(&assistant.calls, tc);
+    chat_msgs_push(&msgs, assistant);
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.content = xstrdup("/tmp");
+    chat_msgs_push(&msgs, tool);
+
+    char *prompt = render_chat_prompt_text(&msgs, "{}", NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "<think>tool reasoning</think>") != NULL);
+    TEST_ASSERT(strstr(prompt, "<tool_result>/tmp</tool_result>") != NULL);
+
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+static void test_dsml_tool_args_are_schema_ordered(void) {
+    tool_schema_orders orders = make_bash_order();
+    tool_calls calls = make_swapped_bash_call();
+    buf b = {0};
+    append_dsml_tool_calls_text(&b, &calls, &orders);
+    const char *command = strstr(b.ptr, "name=\"command\"");
+    const char *description = strstr(b.ptr, "name=\"description\"");
+    const char *timeout = strstr(b.ptr, "name=\"timeout\"");
+    TEST_ASSERT(command != NULL);
+    TEST_ASSERT(description != NULL);
+    TEST_ASSERT(timeout != NULL);
+    TEST_ASSERT(command < description);
+    TEST_ASSERT(description < timeout);
+    buf_free(&b);
+    tool_calls_free(&calls);
+    tool_schema_orders_free(&orders);
+}
+
+static void test_openai_tool_args_are_schema_ordered(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.tool_orders = make_bash_order();
+    tool_calls calls = make_swapped_bash_call();
+    buf b = {0};
+    append_tool_calls_json(&b, &calls, "test", &r.tool_orders);
+    const char *command = strstr(b.ptr, "\\\"command\\\"");
+    const char *description = strstr(b.ptr, "\\\"description\\\"");
+    const char *timeout = strstr(b.ptr, "\\\"timeout\\\"");
+    TEST_ASSERT(command != NULL);
+    TEST_ASSERT(description != NULL);
+    TEST_ASSERT(timeout != NULL);
+    TEST_ASSERT(command < description);
+    TEST_ASSERT(description < timeout);
+    buf_free(&b);
+    tool_calls_free(&calls);
+    request_free(&r);
+}
+
+static void test_anthropic_thinking_and_tool_args_are_schema_ordered(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.tool_orders = make_bash_order();
+    tool_calls calls = make_swapped_bash_call();
+    buf b = {0};
+    append_anthropic_content(&b, "done", "thinking text", &calls, "msg_1", &r.tool_orders);
+    const char *thinking = strstr(b.ptr, "\"type\":\"thinking\"");
+    const char *text = strstr(b.ptr, "\"type\":\"text\"");
+    const char *tool = strstr(b.ptr, "\"type\":\"tool_use\"");
+    const char *command = strstr(b.ptr, "\"command\"");
+    const char *description = strstr(b.ptr, "\"description\"");
+    TEST_ASSERT(thinking != NULL);
+    TEST_ASSERT(text != NULL);
+    TEST_ASSERT(tool != NULL);
+    TEST_ASSERT(thinking < text);
+    TEST_ASSERT(text < tool);
+    TEST_ASSERT(command != NULL);
+    TEST_ASSERT(description != NULL);
+    TEST_ASSERT(command < description);
+    buf_free(&b);
+    tool_calls_free(&calls);
+    request_free(&r);
+}
+
+static void test_parse_short_dsml_and_canonical_suffix(void) {
+    const char *generated =
+        "<think>need a tool</think>"
+        "<DSML｜tool_calls>\n"
+        "<DSML｜invoke name=\"bash\">\n"
+        "<DSML｜parameter name=\"description\" string=\"true\">list files</DSML｜parameter>\n"
+        "<DSML｜parameter name=\"command\" string=\"true\">ls -la</DSML｜parameter>\n"
+        "</DSML｜invoke>\n"
+        "</DSML｜tool_calls>";
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message(generated, &content, &reasoning, &calls));
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "need a tool"));
+    TEST_ASSERT(content && content[0] == '\0');
+    TEST_ASSERT(calls.len == 1);
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.think_mode = DS4_THINK_HIGH;
+    r.tool_orders = make_bash_order();
+    char *suffix = build_tool_checkpoint_suffix(&r, content, reasoning, &calls);
+    const char *command = strstr(suffix, "name=\"command\"");
+    const char *description = strstr(suffix, "name=\"description\"");
+    TEST_ASSERT(command != NULL);
+    TEST_ASSERT(description != NULL);
+    TEST_ASSERT(command < description);
+    TEST_ASSERT(strstr(suffix, "</think>") != NULL);
+    TEST_ASSERT(strstr(suffix, "<｜end▁of▁sentence｜>") != NULL);
+
+    free(suffix);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+    request_free(&r);
+}
+
+static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
+    tool_schema_orders orders = make_bash_order();
+    const char *tool_schemas =
+        "{\"name\":\"bash\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"command\":{},\"description\":{},\"timeout\":{}}}}";
+
+    chat_msgs prefix_msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("inspect");
+    chat_msgs_push(&prefix_msgs, user);
+    char *prompt_text = render_chat_prompt_text(&prefix_msgs, tool_schemas,
+                                                &orders, DS4_THINK_HIGH);
+
+    const char *generated =
+        "need a tool</think>\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">cd /tmp &amp;&amp; git diff 2&gt;/dev/null</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"timeout\" string=\"false\">10</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message(generated, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "cd /tmp && git diff 2>/dev/null") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "&amp;&amp;") == NULL);
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.think_mode = DS4_THINK_HIGH;
+    r.tool_orders = orders;
+    memset(&orders, 0, sizeof(orders));
+    char *suffix = build_tool_checkpoint_suffix(&r, content, reasoning, &calls);
+    buf canonical = {0};
+    buf_puts(&canonical, prompt_text);
+    buf_puts(&canonical, suffix);
+
+    chat_msgs history_msgs = {0};
+    chat_msg user2 = {0};
+    user2.role = xstrdup("user");
+    user2.content = xstrdup("inspect");
+    chat_msgs_push(&history_msgs, user2);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.reasoning = xstrdup(reasoning ? reasoning : "");
+    assistant.content = xstrdup(content ? content : "");
+    assistant.calls = calls;
+    memset(&calls, 0, sizeof(calls));
+    chat_msgs_push(&history_msgs, assistant);
+    char *future_prompt = render_chat_prompt_text(&history_msgs, tool_schemas,
+                                                  &r.tool_orders, DS4_THINK_HIGH);
+
+    TEST_ASSERT(!strcmp(canonical.ptr, future_prompt));
+
+    free(future_prompt);
+    buf_free(&canonical);
+    free(suffix);
+    free(prompt_text);
+    free(content);
+    free(reasoning);
+    chat_msgs_free(&history_msgs);
+    chat_msgs_free(&prefix_msgs);
+    tool_calls_free(&calls);
+    request_free(&r);
+    tool_schema_orders_free(&orders);
+}
+
+static void test_tool_checkpoint_minifies_json_parameters(void) {
+    tool_schema_orders orders = {0};
+    tool_schema_orders_add_json(&orders,
+        "{\"name\":\"edit\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"path\":{},\"edits\":{}}}}");
+    const char *tool_schemas =
+        "{\"name\":\"edit\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"path\":{},\"edits\":{}}}}";
+
+    chat_msgs prefix_msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("edit");
+    chat_msgs_push(&prefix_msgs, user);
+    char *prompt_text = render_chat_prompt_text(&prefix_msgs, tool_schemas,
+                                                &orders, DS4_THINK_HIGH);
+
+    const char *generated =
+        "need edit</think>\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        "<｜DSML｜invoke name=\"edit\">\n"
+        "<｜DSML｜parameter name=\"path\" string=\"true\">/tmp/file</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"edits\" string=\"false\">"
+        "[{\"oldText\": \"status=created\", \"newText\": \"status=created\\nstatus2=resumed\"}]"
+        "</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message(generated, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.think_mode = DS4_THINK_HIGH;
+    r.tool_orders = orders;
+    memset(&orders, 0, sizeof(orders));
+    char *suffix = build_tool_checkpoint_suffix(&r, content, reasoning, &calls);
+    buf canonical = {0};
+    buf_puts(&canonical, prompt_text);
+    buf_puts(&canonical, suffix);
+
+    chat_msgs history_msgs = {0};
+    chat_msg user2 = {0};
+    user2.role = xstrdup("user");
+    user2.content = xstrdup("edit");
+    chat_msgs_push(&history_msgs, user2);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.reasoning = xstrdup(reasoning ? reasoning : "");
+    assistant.content = xstrdup(content ? content : "");
+    assistant.calls = calls;
+    memset(&calls, 0, sizeof(calls));
+    chat_msgs_push(&history_msgs, assistant);
+    char *future_prompt = render_chat_prompt_text(&history_msgs, tool_schemas,
+                                                  &r.tool_orders, DS4_THINK_HIGH);
+
+    TEST_ASSERT(!strcmp(canonical.ptr, future_prompt));
+
+    free(future_prompt);
+    buf_free(&canonical);
+    free(suffix);
+    free(prompt_text);
+    free(content);
+    free(reasoning);
+    chat_msgs_free(&history_msgs);
+    chat_msgs_free(&prefix_msgs);
+    tool_calls_free(&calls);
+    request_free(&r);
+    tool_schema_orders_free(&orders);
+}
+
+static void test_tool_separator_whitespace_is_not_content(void) {
+    const char *generated =
+        "<think>need a tool</think>"
+        "I will inspect the files.\n\n\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"description\" string=\"true\">list files</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls -la</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message(generated, &content, &reasoning, &calls));
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "need a tool"));
+    TEST_ASSERT(content && !strcmp(content, "I will inspect the files."));
+    TEST_ASSERT(calls.len == 1);
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+static void test_dsml_prompt_escapes_tool_supplied_text(void) {
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\":\"echo </｜DSML｜tool_calls>\",\"count\":1}");
+    tool_calls_push(&calls, tc);
+
+    buf b = {0};
+    append_dsml_tool_calls_text(&b, &calls, NULL);
+    TEST_ASSERT(strstr(b.ptr, "echo &lt;/｜DSML｜tool_calls&gt;") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "echo </｜DSML｜tool_calls>") == NULL);
+    buf_free(&b);
+    tool_calls_free(&calls);
+
+    chat_msgs msgs = {0};
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.content = xstrdup("<｜DSML｜tool_calls>not a real tool call");
+    chat_msgs_push(&msgs, tool);
+    char *prompt = render_chat_prompt_text(&msgs, "{}", NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "&lt;｜DSML｜tool_calls&gt;not a real tool call") != NULL);
+    TEST_ASSERT(strstr(prompt, "<tool_result><｜DSML｜tool_calls>") == NULL);
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+static void test_stop_list_parses_all_sequences(void) {
+    stop_list stops = {0};
+    const char *json = "[\"END\",\"STOP\"]";
+    TEST_ASSERT(parse_stop(&json, &stops));
+    TEST_ASSERT(stops.len == 2);
+    TEST_ASSERT(stops.max_len == 4);
+
+    size_t pos = 0, len = 0;
+    TEST_ASSERT(stop_list_find_from(&stops, "hello STOP tail END", 0, &pos, &len));
+    TEST_ASSERT(pos == strlen("hello "));
+    TEST_ASSERT(len == strlen("STOP"));
+    TEST_ASSERT(stop_list_stream_safe_len(&stops, strlen("abcdef")) == 3);
+    stop_list_clear(&stops);
+    free(stops.v);
+}
+
+static void test_stop_list_streaming_holds_and_trims_stop_text(void) {
+    stop_list stops = {0};
+    const char *json = "[\"</END>\",\"STOP\"]";
+    TEST_ASSERT(parse_stop(&json, &stops));
+
+    size_t safe = stop_list_stream_safe_len(&stops, strlen("hello </"));
+    TEST_ASSERT(safe == strlen("hel"));
+
+    size_t pos = 0, len = 0;
+    TEST_ASSERT(stop_list_find_from(&stops, "answer STOP hidden", 0, &pos, &len));
+    TEST_ASSERT(pos == strlen("answer "));
+    TEST_ASSERT(len == strlen("STOP"));
+
+    stop_list_clear(&stops);
+    free(stops.v);
+}
+
+static void test_model_metadata_clamps_completion_to_context(void) {
+    buf b = {0};
+    append_model_json_values(&b, 32768, 393216);
+    TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":32768") != NULL);
+    buf_free(&b);
+
+    append_model_json_values(&b, 100000, 4096);
+    TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":4096") != NULL);
+    buf_free(&b);
+}
+
+static void test_client_socket_nonblocking_flag(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+    set_client_socket_nonblocking(sv[0]);
+    int flags = fcntl(sv[0], F_GETFL, 0);
+    TEST_ASSERT(flags >= 0);
+    TEST_ASSERT((flags & O_NONBLOCK) != 0);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = xstrdup("<｜Assistant｜><think>");
+    thinking_state st = thinking_state_from_prompt(&r);
+    TEST_ASSERT(st.inside == true);
+    thinking_state_feed(&st, "reasoning body", strlen("reasoning body"));
+    TEST_ASSERT(st.inside == true);
+    thinking_state_feed(&st, "</thi", strlen("</thi"));
+    TEST_ASSERT(st.inside == true);
+    thinking_state_feed(&st, "nk>answer", strlen("nk>answer"));
+    TEST_ASSERT(st.inside == false);
+    thinking_state_feed(&st, "<thi", strlen("<thi"));
+    TEST_ASSERT(st.inside == false);
+    thinking_state_feed(&st, "nk>more", strlen("nk>more"));
+    TEST_ASSERT(st.inside == true);
+    request_free(&r);
+
+    request_init(&r, REQ_CHAT, 128);
+    r.think_mode = DS4_THINK_NONE;
+    r.prompt_text = xstrdup("<｜Assistant｜></think>");
+    st = thinking_state_from_prompt(&r);
+    TEST_ASSERT(st.inside == false);
+    request_free(&r);
+}
+
+static void test_kv_cache_store_len_uses_configured_boundary(void) {
+    kv_disk_cache kc = {0};
+    kc.opt = kv_cache_default_options();
+    TEST_ASSERT(kv_cache_store_len(&kc, 11011) == 10240);
+    TEST_ASSERT(kv_cache_store_len(&kc, 1695) == 1695);
+
+    kc.opt.boundary_trim_tokens = 0;
+    kc.opt.boundary_align_tokens = 1000;
+    TEST_ASSERT(kv_cache_store_len(&kc, 3500) == 3000);
+
+    kc.opt.boundary_align_tokens = 0;
+    TEST_ASSERT(kv_cache_store_len(&kc, 3500) == 3500);
+}
+
+static void test_kv_stub_file(const char *dir, const char *sha,
+                              uint8_t reason, uint32_t tokens, uint32_t hits,
+                              uint64_t last_used, uint64_t payload_bytes) {
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (!fp) {
+        free(path);
+        return;
+    }
+
+    uint8_t h[KV_CACHE_FIXED_HEADER];
+    kv_fill_header(h, 2, reason, tokens, hits, 32768, 100, last_used, payload_bytes);
+    uint8_t text_len[4] = {0};
+    TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
+    TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
+    for (uint64_t i = 0; i < payload_bytes; i++) {
+        TEST_ASSERT(fputc(0, fp) != EOF);
+    }
+    TEST_ASSERT(fclose(fp) == 0);
+    free(path);
+}
+
+static void test_kv_cache_eviction_values_fresh_snapshots(void) {
+    char tmpl[] = "/tmp/ds4-kv-evict-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *old_sha = "1111111111111111111111111111111111111111";
+    const char *new_sha = "2222222222222222222222222222222222222222";
+    test_kv_stub_file(dir, old_sha, KV_REASON_UNKNOWN, 512, 0, 100, 4096);
+    test_kv_stub_file(dir, new_sha, KV_REASON_UNKNOWN, 2048, 0, 200, 2048);
+
+    char old_name[44], new_name[44];
+    snprintf(old_name, sizeof(old_name), "%.40s.kv", old_sha);
+    snprintf(new_name, sizeof(new_name), "%.40s.kv", new_sha);
+    char *old_path = path_join(dir, old_name);
+    char *new_path = path_join(dir, new_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
+    kv_cache_evict(&kc, NULL);
+
+    TEST_ASSERT(access(old_path, F_OK) != 0);
+    TEST_ASSERT(access(new_path, F_OK) == 0);
+
+    kv_cache_close(&kc);
+    unlink(old_path);
+    unlink(new_path);
+    free(old_path);
+    free(new_path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_eviction_penalizes_live_continued_prefixes(void) {
+    char tmpl[] = "/tmp/ds4-kv-live-prefix-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    ds4_tokens live = {0};
+    for (int i = 0; i < 4096; i++) ds4_tokens_push(&live, i);
+
+    char cold_sha[41], continued_sha[41];
+    sha1_tokens_hex(&live, 512, cold_sha);
+    sha1_tokens_hex(&live, 2048, continued_sha);
+    test_kv_stub_file(dir, cold_sha, KV_REASON_COLD, 512, 0, 200, 2048);
+    test_kv_stub_file(dir, continued_sha, KV_REASON_CONTINUED, 2048, 0, 300, 2048);
+
+    char cold_name[44], continued_name[44];
+    snprintf(cold_name, sizeof(cold_name), "%.40s.kv", cold_sha);
+    snprintf(continued_name, sizeof(continued_name), "%.40s.kv", continued_sha);
+    char *cold_path = path_join(dir, cold_name);
+    char *continued_path = path_join(dir, continued_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
+    kv_cache_evict(&kc, &live);
+
+    TEST_ASSERT(access(continued_path, F_OK) != 0);
+    TEST_ASSERT(access(cold_path, F_OK) == 0);
+
+    kv_cache_close(&kc);
+    unlink(cold_path);
+    unlink(continued_path);
+    free(cold_path);
+    free(continued_path);
+    ds4_tokens_free(&live);
+    rmdir(dir);
+}
+
+static void ds4_server_unit_tests_run(void) {
+    test_request_defaults_match_deepseek_api();
+    test_reasoning_effort_mapping();
+    test_api_thinking_controls_parse();
+    test_render_think_max_prompt_prefix();
+    test_render_non_thinking_prompt_closes_think();
+    test_render_drops_old_reasoning_without_tools();
+    test_render_preserves_reasoning_with_tools();
+    test_tool_schema_order_from_anthropic_schema();
+    test_tool_schema_order_from_openai_tools();
+    test_dsml_tool_args_are_schema_ordered();
+    test_openai_tool_args_are_schema_ordered();
+    test_anthropic_thinking_and_tool_args_are_schema_ordered();
+    test_anthropic_live_stream_sends_incremental_blocks();
+    test_openai_tool_stream_sends_incremental_text();
+    test_openai_chat_stream_splits_reasoning_without_tools();
+    test_openai_tool_stream_sends_partial_arguments();
+    test_openai_tool_stream_waits_for_incomplete_tool_tags();
+    test_openai_tool_stream_sends_partial_raw_arguments();
+    test_openai_tool_stream_holds_partial_dsml_entities();
+    test_openai_tool_stream_holds_partial_utf8_arguments();
+    test_openai_tool_stream_handles_multiple_calls();
+    test_streaming_holds_partial_utf8();
+    test_parse_short_dsml_and_canonical_suffix();
+    test_tool_checkpoint_suffix_is_future_prompt_canonical();
+    test_tool_checkpoint_minifies_json_parameters();
+    test_tool_separator_whitespace_is_not_content();
+    test_dsml_prompt_escapes_tool_supplied_text();
+    test_stop_list_parses_all_sequences();
+    test_stop_list_streaming_holds_and_trims_stop_text();
+    test_model_metadata_clamps_completion_to_context();
+    test_client_socket_nonblocking_flag();
+    test_thinking_state_tracks_prompt_and_generated_tags();
+    test_kv_cache_store_len_uses_configured_boundary();
+    test_kv_cache_eviction_values_fresh_snapshots();
+    test_kv_cache_eviction_penalizes_live_continued_prefixes();
+}
+
+#ifndef DS4_SERVER_TEST_NO_MAIN
+int main(void) {
+    ds4_server_unit_tests_run();
+    if (test_failures) {
+        fprintf(stderr, "ds4-server tests: %d failure(s)\n", test_failures);
+        return 1;
+    }
+    puts("ds4-server tests: ok");
+    return 0;
+}
+#endif
+
+#endif
