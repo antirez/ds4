@@ -476,6 +476,7 @@ typedef struct {
     char *content;
     char *reasoning;
     char *tool_call_id;
+    char *task;
     tool_calls calls;
 } chat_msg;
 
@@ -539,6 +540,7 @@ static void chat_msg_free(chat_msg *m) {
     free(m->content);
     free(m->reasoning);
     free(m->tool_call_id);
+    free(m->task);
     tool_calls_free(&m->calls);
     memset(m, 0, sizeof(*m));
 }
@@ -1218,6 +1220,12 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
                     free(key);
                     goto fail;
                 }
+            } else if (!strcmp(key, "task")) {
+                free(msg.task);
+                if (!json_string(p, &msg.task)) {
+                    free(key);
+                    goto fail;
+                }
             } else if (!json_skip_value(p)) {
                 free(key);
                 goto fail;
@@ -1448,6 +1456,12 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
                 free(msg.content);
                 msg.content = NULL;
                 if (!parse_anthropic_content(p, &msg)) {
+                    free(key);
+                    goto fail;
+                }
+            } else if (!strcmp(key, "task")) {
+                free(msg.task);
+                if (!json_string(p, &msg.task)) {
                     free(key);
                     goto fail;
                 }
@@ -1842,7 +1856,26 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
         } else if (!strcmp(m->role, "user")) {
             buf_puts(&out, "<｜User｜>");
             buf_puts(&out, m->content ? m->content : "");
-            pending_assistant = true;
+            if (m->task && m->task[0]) {
+                if (!strcmp(m->task, "action")) {
+                    buf_puts(&out, "<｜Assistant｜>");
+                    buf_puts(&out, think ? "<think>" : "</think>");
+                    buf_puts(&out, "<｜action｜>");
+                } else if (!strcmp(m->task, "title")) {
+                    buf_puts(&out, "<｜title｜>");
+                } else if (!strcmp(m->task, "query")) {
+                    buf_puts(&out, "<｜query｜>");
+                } else if (!strcmp(m->task, "authority")) {
+                    buf_puts(&out, "<｜authority｜>");
+                } else if (!strcmp(m->task, "domain")) {
+                    buf_puts(&out, "<｜domain｜>");
+                } else if (!strcmp(m->task, "read_url")) {
+                    buf_puts(&out, "<｜read_url｜>");
+                }
+                pending_assistant = false;
+            } else {
+                pending_assistant = true;
+            }
             pending_tool_result = false;
         } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
             if (!pending_tool_result) buf_puts(&out, "<｜User｜>");

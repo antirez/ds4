@@ -13525,6 +13525,12 @@ struct ds4_vocab {
     int think_start_id;
     int think_end_id;
     int dsml_id;
+    int task_action_id;
+    int task_query_id;
+    int task_authority_id;
+    int task_domain_id;
+    int task_title_id;
+    int task_read_url_id;
     str_i32_table token_to_id;
     str_i32_table merge_rank;
 };
@@ -13925,6 +13931,12 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     vocab->think_start_id = vocab_lookup(vocab, "<think>");
     vocab->think_end_id = vocab_lookup(vocab, "</think>");
     vocab->dsml_id = vocab_lookup(vocab, "｜DSML｜");
+    vocab->task_action_id    = vocab_lookup(vocab, "<｜action｜>");
+    vocab->task_query_id     = vocab_lookup(vocab, "<｜query｜>");
+    vocab->task_authority_id = vocab_lookup(vocab, "<｜authority｜>");
+    vocab->task_domain_id    = vocab_lookup(vocab, "<｜domain｜>");
+    vocab->task_title_id     = vocab_lookup(vocab, "<｜title｜>");
+    vocab->task_read_url_id  = vocab_lookup(vocab, "<｜read_url｜>");
 }
 
 static void vocab_free(ds4_vocab *vocab) {
@@ -13976,6 +13988,12 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
         {"<think>",                vocab->think_start_id},
         {"</think>",               vocab->think_end_id},
         {"｜DSML｜",                vocab->dsml_id},
+        {"<｜action｜>",            vocab->task_action_id},
+        {"<｜query｜>",             vocab->task_query_id},
+        {"<｜authority｜>",         vocab->task_authority_id},
+        {"<｜domain｜>",            vocab->task_domain_id},
+        {"<｜title｜>",             vocab->task_title_id},
+        {"<｜read_url｜>",          vocab->task_read_url_id},
     };
 
     for (size_t i = 0; i < sizeof(specials) / sizeof(specials[0]); i++) {
