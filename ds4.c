@@ -9300,6 +9300,12 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", g->router_selected, DS4_N_EXPERT_USED, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
     }
+    if (ok &&
+        ds4_metal_model_streaming_enabled() != 0 &&
+        getenv("DS4_METAL_DISABLE_COMPACT_EXPERTS") == NULL) {
+        ok = ds4_metal_end_commands() != 0;
+        if (ok) ok = ds4_metal_begin_commands() != 0;
+    }
     if (ok) ok = ds4_metal_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
                                                  g->routed_up,

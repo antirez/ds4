@@ -6,6 +6,11 @@ LDLIBS ?= -lm -pthread
 UNAME_S := $(shell uname -s)
 NATIVE_LDLIBS := $(LDLIBS)
 METAL_SRCS := $(wildcard metal/*.metal)
+RAM_TEST_MB ?= 16384
+RAM_TEST_CTX ?= 256
+RAM_TEST_TOKENS ?= 2
+RAM_TEST_PROMPT ?= Hi
+RAM_TEST_ARGS ?= --stream-weights --nothink --temp 0
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
@@ -18,7 +23,7 @@ NATIVE_CORE_OBJS = ds4_native.o
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all clean
+.PHONY: all clean test-constrained-ram
 
 all: ds4 ds4-server
 
@@ -62,6 +67,18 @@ ds4_cli_native.o: ds4_cli.c ds4.h linenoise.h
 
 ds4_metal.o: ds4_metal.m ds4_metal.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
+
+test-constrained-ram: ds4
+	env DS4_METAL_STREAM_WEIGHTS=1 \
+	    DS4_METAL_STREAM_CACHE=1 \
+	    DS4_METAL_STREAM_WINDOW_MB=1 \
+	    DS4_METAL_STREAM_RAM_MB=$(RAM_TEST_MB) \
+	    DS4_METAL_NO_RESIDENCY=1 \
+	    DS4_METAL_MEMORY_REPORT=1 \
+	    /usr/bin/time -l ./ds4 $(RAM_TEST_ARGS) \
+	        --ctx $(RAM_TEST_CTX) \
+	        --tokens $(RAM_TEST_TOKENS) \
+	        -p '$(RAM_TEST_PROMPT)'
 
 clean:
 	rm -f ds4 ds4-server ds4_native ds4_server_test ds4_test *.o
