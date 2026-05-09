@@ -34,6 +34,7 @@ with:
 | Per-expert slice cache, 512-entry cap | 4 | 16 | 8 | 8192 | `Hello! How can` | 0.21 | 63.70 | 1911.64 | 3.90 | 44.7% | 0.0% |
 | Per-expert slice cache, 8192-entry cap | 4 | 16 | 8 | 8192 | `Hello! How can` | 0.21 | 61.94 | 1911.64 | 4.85 | 44.7% | 35.0% |
 | GPU blit gather | 2 | 16 | 8 | 0 | `Hello!` | 0.30 | 48.49 | 1911.64 | 0.05 | 34.0% | n/a |
+| GPU blit gather | 4 | 16 | 8 | 0 | `Hello! How can` | 0.35 | 52.21 | 1911.64 | 0.05 | 31.1% | n/a |
 
 ## Notes
 
@@ -53,9 +54,9 @@ with:
   It needs a GPU-side gather or a different representation before it is worth
   making default.
 - GPU blit gather for selected expert compact buffers is the first clear win:
-  the 2-token smoke improved from 0.21 to 0.30 tok/s while keeping RSS tiny.
-  It still increases wrapper churn, so longer runs need to prove whether the
-  decode gain survives beyond one generated token.
+  the 2-token smoke improved from 0.21 to 0.30 tok/s and the 4-token comparison
+  improved from 0.27 to 0.35 tok/s while keeping RSS tiny. It increases wrapper
+  churn, but the CPU-copy removal more than pays for it on short decode runs.
 
 ## Columns
 
