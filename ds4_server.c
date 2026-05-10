@@ -7489,6 +7489,7 @@ typedef struct {
     int continued_interval_tokens;
     int boundary_trim_tokens;
     int boundary_align_tokens;
+    bool anchor_user_enabled;
 } kv_cache_options;
 
 typedef struct {
@@ -7498,6 +7499,7 @@ typedef struct {
     bool reject_different_quant;
     kv_cache_options opt;
     int continued_last_store_tokens;
+    int user_token_id;
     kv_entry *entry;
     int len;
     int cap;
@@ -8189,6 +8191,7 @@ static kv_cache_options kv_cache_default_options(void) {
         .continued_interval_tokens = KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS,
         .boundary_trim_tokens = KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS,
         .boundary_align_tokens = KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS,
+        .anchor_user_enabled = false,
     };
 }
 
@@ -8854,9 +8857,10 @@ static bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb
     kc->budget_bytes = budget_mb * 1024ull * 1024ull;
     kc->reject_different_quant = reject_different_quant;
     kc->opt = opt;
+    kc->user_token_id = -1;
     kv_cache_evict(kc, NULL, NULL);
     server_log(DS4_LOG_KVCACHE,
-               "ds4-server: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus)",
+               "ds4-server: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus, anchor_user=%s)",
                kc->dir,
                (unsigned long long)(kc->budget_bytes / (1024ull * 1024ull)),
                reject_different_quant ? "reject" : "accept",
@@ -8865,7 +8869,8 @@ static bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb
                kc->opt.continued_interval_tokens,
                kc->opt.boundary_trim_tokens,
                kc->opt.boundary_align_tokens,
-               (unsigned long long)KV_CACHE_HIT_HALF_LIFE_SECONDS);
+               (unsigned long long)KV_CACHE_HIT_HALF_LIFE_SECONDS,
+               kc->opt.anchor_user_enabled ? "on" : "off");
     return true;
 }
 
@@ -8935,6 +8940,43 @@ static int kv_cache_store_len(const kv_disk_cache *kc, int tokens) {
         if (stable >= kc->opt.min_tokens) return stable;
     }
     return tokens;
+}
+
+/* The chat template separates the system text from the first user message
+ * with a single special <｜User｜> token at a fixed vocabulary boundary.
+ * For workloads that resend the same system prompt with different user
+ * content, storing the prefix up to that anchor produces a cache key over
+ * just the stable portion, so every subsequent request hits regardless of
+ * how the user message varies.
+ *
+ * When boundary_trim_tokens is large enough to leave headroom over
+ * min_tokens, trim+align is applied to the anchor position the same way
+ * kv_cache_store_len applies it to the full prompt length.  This lets
+ * agents whose system prompt has a small dynamic tail (e.g. a timestamp
+ * near the user marker) move the cut safely below the variable region
+ * without disabling the anchor.
+ *
+ * Returns -1 when no usable anchor exists, letting the caller fall back to
+ * length-based alignment for tool-using prompts or prompts without a
+ * <|User|> token (e.g. raw /v1/completions). */
+static int kv_cache_anchor_pos(const kv_disk_cache *kc, const ds4_tokens *prompt) {
+    if (!kc->opt.anchor_user_enabled) return -1;
+    if (kc->user_token_id < 0) return -1;
+    if (!prompt) return -1;
+    for (int i = 0; i < prompt->len; i++) {
+        if (prompt->v[i] == kc->user_token_id) {
+            const int anchor = i;
+            const int trim = kc->opt.boundary_trim_tokens;
+            const int align = kc->opt.boundary_align_tokens;
+            if (anchor > kc->opt.min_tokens + trim) {
+                int stable = anchor - trim;
+                if (align > 0) stable -= stable % align;
+                if (stable >= kc->opt.min_tokens) return stable;
+            }
+            return anchor >= kc->opt.min_tokens ? anchor : -1;
+        }
+    }
+    return -1;
 }
 
 static int kv_cache_continued_step(const kv_disk_cache *kc) {
@@ -10623,7 +10665,9 @@ static void generate_job(server *s, job *j) {
         s->kv.opt.cold_max_tokens > 0 &&
         prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
     {
-        cold_store_len = kv_cache_store_len(&s->kv, prompt_for_sync->len);
+        const int anchor = kv_cache_anchor_pos(&s->kv, prompt_for_sync);
+        if (anchor > 0) cold_store_len = anchor;
+        else cold_store_len = kv_cache_store_len(&s->kv, prompt_for_sync->len);
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
@@ -11711,6 +11755,14 @@ static void usage(FILE *fp) {
         "      Trim this many tail tokens before cold boundary saves to avoid tokenizer boundary merges. Default: 32\n"
         "  --kv-cache-boundary-align-tokens N\n"
         "      Align cold boundary saves down to this token multiple. 0 disables alignment. Default: 2048\n"
+        "  --kv-cache-anchor-user\n"
+        "      Enable the system-prompt anchor. Cold cache stores cut at the first <|User|>\n"
+        "      token so the system prefix is reused across requests whose user content\n"
+        "      differs. Off by default; the server otherwise uses the length-based\n"
+        "      alignment heuristic. Composes with --kv-cache-boundary-trim-tokens and\n"
+        "      --kv-cache-boundary-align-tokens: if the anchor position exceeds the\n"
+        "      min+trim threshold, trim+align is applied to the anchor position to push\n"
+        "      the cut below any dynamic tail in the system prompt.\n"
         "  --kv-cache-reject-different-quant\n"
         "      Refuse checkpoints written by the same model with a different routed-expert quantization.\n"
         "  --disable-exact-dsml-tool-replay\n"
@@ -11813,6 +11865,8 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_cache.boundary_align_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-reject-different-quant")) {
             c.kv_cache_reject_different_quant = true;
+        } else if (!strcmp(arg, "--kv-cache-anchor-user")) {
+            c.kv_cache.anchor_user_enabled = true;
         } else if (!strcmp(arg, "--disable-exact-dsml-tool-replay")) {
             c.disable_exact_dsml_tool_replay = true;
         } else if (!strcmp(arg, "--tool-memory-max-ids")) {
@@ -11891,6 +11945,7 @@ int main(int argc, char **argv) {
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+        s.kv.user_token_id = ds4_token_user(engine);
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
@@ -14474,6 +14529,120 @@ static void test_sha1_bytes_hex_matches_known_vector(void) {
     TEST_ASSERT(!strcmp(sha, "a9993e364706816aba3e25717850c26c9cd0d89d"));
 }
 
+static void test_kv_cache_anchor_pos_finds_first_user_token(void) {
+    kv_disk_cache kc = {0};
+    kc.opt = kv_cache_default_options();
+    kc.opt.anchor_user_enabled = true;
+    kc.user_token_id = 999;
+
+    ds4_tokens prompt = {0};
+    for (int i = 0; i < 600; i++) ds4_tokens_push(&prompt, 100);
+    ds4_tokens_push(&prompt, 999);
+    for (int i = 0; i < 200; i++) ds4_tokens_push(&prompt, 100);
+    ds4_tokens_push(&prompt, 999);  /* multi-turn second <|User|>; ignored */
+    TEST_ASSERT(kv_cache_anchor_pos(&kc, &prompt) == 600);
+
+    ds4_tokens short_prompt = {0};
+    for (int i = 0; i < 100; i++) ds4_tokens_push(&short_prompt, 100);
+    ds4_tokens_push(&short_prompt, 999);
+    TEST_ASSERT(kv_cache_anchor_pos(&kc, &short_prompt) == -1);
+
+    kc.opt.anchor_user_enabled = false;
+    TEST_ASSERT(kv_cache_anchor_pos(&kc, &prompt) == -1);
+
+    kc.opt.anchor_user_enabled = true;
+    kc.user_token_id = -1;
+    TEST_ASSERT(kv_cache_anchor_pos(&kc, &prompt) == -1);
+
+    ds4_tokens no_user = {0};
+    for (int i = 0; i < 800; i++) ds4_tokens_push(&no_user, 100);
+    kc.user_token_id = 999;
+    TEST_ASSERT(kv_cache_anchor_pos(&kc, &no_user) == -1);
+
+    ds4_tokens_free(&prompt);
+    ds4_tokens_free(&short_prompt);
+    ds4_tokens_free(&no_user);
+}
+
+static void test_kv_cache_anchor_pos_applies_trim_and_align(void) {
+    kv_disk_cache kc = {0};
+    kc.opt = kv_cache_default_options();
+    kc.opt.anchor_user_enabled = true;
+    kc.opt.min_tokens = 512;
+    kc.opt.boundary_trim_tokens = 1000;
+    kc.opt.boundary_align_tokens = 256;
+    kc.user_token_id = 999;
+
+    /* Long-anchor case: anchor at 16023, min+trim=1512, anchor exceeds threshold.
+     * stable = 16023 - 1000 = 15023, 15023 % 256 = 175, expect 14848. */
+    ds4_tokens big = {0};
+    for (int i = 0; i < 16023; i++) ds4_tokens_push(&big, 100);
+    ds4_tokens_push(&big, 999);
+    for (int i = 0; i < 1500; i++) ds4_tokens_push(&big, 100);
+    TEST_ASSERT(kv_cache_anchor_pos(&kc, &big) == 14848);
+
+    /* Short-anchor case: anchor at 870 is below min+trim=1512, trim does not
+     * apply; expect anchor unchanged. */
+    ds4_tokens small = {0};
+    for (int i = 0; i < 870; i++) ds4_tokens_push(&small, 100);
+    ds4_tokens_push(&small, 999);
+    for (int i = 0; i < 90; i++) ds4_tokens_push(&small, 100);
+    TEST_ASSERT(kv_cache_anchor_pos(&kc, &small) == 870);
+
+    /* Disabling alignment leaves the trimmed-but-unaligned position. */
+    kc.opt.boundary_align_tokens = 0;
+    TEST_ASSERT(kv_cache_anchor_pos(&kc, &big) == 15023);
+
+    ds4_tokens_free(&big);
+    ds4_tokens_free(&small);
+}
+
+static void test_kv_cache_anchor_pos_boundary_threshold(void) {
+    /* The trim+align branch fires when anchor > min_tokens + trim.  Exercise
+     * the three points around that threshold so future refactors do not flip
+     * the comparison operator silently. */
+    kv_disk_cache kc = {0};
+    kc.opt = kv_cache_default_options();
+    kc.opt.anchor_user_enabled = true;
+    kc.opt.min_tokens = 512;
+    kc.opt.boundary_trim_tokens = 1000;
+    kc.opt.boundary_align_tokens = 256;
+    kc.user_token_id = 999;
+
+    /* anchor = 1500 (below threshold 1512): trim does not apply, anchor used. */
+    ds4_tokens below = {0};
+    for (int i = 0; i < 1500; i++) ds4_tokens_push(&below, 100);
+    ds4_tokens_push(&below, 999);
+    TEST_ASSERT(kv_cache_anchor_pos(&kc, &below) == 1500);
+
+    /* anchor = 1512 (exactly at threshold): condition is strict >, not >=, so
+     * trim still does not apply.  Anchor returned unchanged. */
+    ds4_tokens at = {0};
+    for (int i = 0; i < 1512; i++) ds4_tokens_push(&at, 100);
+    ds4_tokens_push(&at, 999);
+    TEST_ASSERT(kv_cache_anchor_pos(&kc, &at) == 1512);
+
+    /* anchor = 1513 (just above threshold): trim applies.
+     * stable = 513, 513 % 256 = 1, aligned = 512.  Returns the min-tokens
+     * floor; smaller would have fallen back to the unaligned anchor. */
+    ds4_tokens above = {0};
+    for (int i = 0; i < 1513; i++) ds4_tokens_push(&above, 100);
+    ds4_tokens_push(&above, 999);
+    TEST_ASSERT(kv_cache_anchor_pos(&kc, &above) == 512);
+
+    /* anchor = 2000 (comfortably above): trim+align produce a meaningful cut.
+     * stable = 1000, 1000 % 256 = 232, aligned = 768. */
+    ds4_tokens comfortable = {0};
+    for (int i = 0; i < 2000; i++) ds4_tokens_push(&comfortable, 100);
+    ds4_tokens_push(&comfortable, 999);
+    TEST_ASSERT(kv_cache_anchor_pos(&kc, &comfortable) == 768);
+
+    ds4_tokens_free(&below);
+    ds4_tokens_free(&at);
+    ds4_tokens_free(&above);
+    ds4_tokens_free(&comfortable);
+}
+
 static void test_kv_stub_file(const char *dir, const char *sha,
                               uint8_t reason, uint32_t tokens, uint32_t hits,
                               uint64_t last_used, uint64_t payload_bytes) {
@@ -15244,6 +15413,9 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
     test_kv_cache_lookup_uses_longest_text_prefix();
+    test_kv_cache_anchor_pos_finds_first_user_token();
+    test_kv_cache_anchor_pos_applies_trim_and_align();
+    test_kv_cache_anchor_pos_boundary_threshold();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_protects_current_store();
     test_kv_cache_eviction_does_not_protect_oversize_current_store();
