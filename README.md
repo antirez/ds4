@@ -69,7 +69,7 @@ Download one main model:
 
 ```sh
 ./download_model.sh q2   # 128 GB RAM machines
-./download_model.sh q4   # >= 256 GB RAM machines
+./download_model.sh q4   # >= 256 GB RAM machines, or 192 GB with the Metal setup below
 ```
 
 The script downloads from `https://huggingface.co/antirez/deepseek-v4-gguf`,
@@ -94,12 +94,25 @@ make
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 `./ds4-server --help` for the full flag list.
 
+### Q4 on 192 GB Macs
+
+On 192 GB Apple Silicon machines, the q4 model needs a higher wired-memory
+limit than the macOS default before Metal can keep the model and runtime
+buffers resident. Set it after each reboot before starting `ds4` or
+`ds4-server`:
+
+```sh
+sudo sysctl iogpu.wired_limit_mb=188000
+```
+
 ## Speed
 
-These are single-run Metal CLI numbers with `--ctx 32768`, `--nothink`, greedy
-decoding, and `-n 256`. The short prompt is a normal small Italian story
-prompt. The long prompts exercise chunked prefill plus long-context decode.
-Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
+These are single-run Metal CLI numbers with `--ctx 32768`, `--nothink`,
+`-sys ""`, greedy decoding, and `-n 256`. The short prompt is a normal small
+Italian story prompt. The M2 Ultra long prompt uses
+`tests/test-vectors/prompts/long_code_audit.txt`, which reports 3844 prompt
+tokens and exercises chunked prefill plus long-context decode. Q4 requires the
+larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 
 | Machine | Quant | Prompt | Prefill | Generation |
 | --- | ---: | ---: | ---: | ---: |
@@ -107,6 +120,8 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 | MacBook Pro M3 Max, 128 GB | q2 | 11709 tokens | 250.11 t/s | 21.47 t/s |
 | MacBook Pro M3 Max, 128 GB | q4 | short | N/A | N/A |
 | MacBook Pro M3 Max, 128 GB | q4 | long | N/A | N/A |
+| Mac Studio M2 Ultra, 192 GB | q4 | short | 50.42 t/s | 29.88 t/s |
+| Mac Studio M2 Ultra, 192 GB | q4 | 3844 tokens | 394.66 t/s | 21.69 t/s |
 | Mac Studio M3 Ultra, 512 GB | q2 | short | 84.43 t/s | 36.86 t/s |
 | Mac Studio M3 Ultra, 512 GB | q2 | 11709 tokens | 468.03 t/s | 27.39 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | short | 78.95 t/s | 35.50 t/s |
