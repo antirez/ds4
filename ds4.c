@@ -12652,6 +12652,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                    DS4_N_EXPERT_USED,
                                                    DS4_SWIGLU_CLAMP_EXP,
                                                    g->batch_ffn_norm,
+                                                   il,
                                                    n_tokens,
                                                    &g->batch_routed_mid_is_f16) != 0;
     if (ok) {
