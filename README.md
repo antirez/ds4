@@ -158,6 +158,8 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 | MacBook Pro M3 Max, 128 GB | q2 | 11709 tokens | 250.11 t/s | 21.47 t/s |
 | MacBook Pro M3 Max, 128 GB | q4 | short | N/A | N/A |
 | MacBook Pro M3 Max, 128 GB | q4 | long | N/A | N/A |
+| MacBook Pro M5 Max, 128 GB | q2 | short | 87.25 t/s | 34.27 t/s |
+| MacBook Pro M5 Max, 128 GB | q2 | 11707 tokens | 463.44 t/s | 25.90 t/s |
 | Mac Studio M3 Ultra, 512 GB | q2 | short | 84.43 t/s | 36.86 t/s |
 | Mac Studio M3 Ultra, 512 GB | q2 | 11709 tokens | 468.03 t/s | 27.39 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | short | 78.95 t/s | 35.50 t/s |
@@ -257,6 +259,56 @@ kernel, quantization, prompt-rendering, KV-cache, or tool-streaming change, does
 DeepSeek V4 Flash still solve a representative mix of hard science, broad
 knowledge, exact math, and security-code problems while using the same inference
 path users run?
+
+## Metal 4 and M5 Neural Accelerators
+
+The current production path is still hand-written Metal compute kernels over
+`MTLBuffer` storage. That is intentional: DS4's hot path is dominated by
+quantized routed-MoE matvec/matmul, sparse compressed attention, and mmap-backed
+model views, which do not map cleanly to a whole-model Core ML package.
+
+Metal 4 is the right next target, but it should be introduced as a feature-gated
+kernel backend rather than a rewrite. On macOS 26+ with `MTLGPUFamilyMetal4`,
+Apple exposes tensor resources and Metal 4 command infrastructure that can run
+machine-learning work on the same GPU timeline as compute work. On M5 hardware,
+Apple describes the per-GPU-core Neural Accelerators as available to developers
+through the Metal 4 Tensor APIs. `DS4_METAL_MEMORY_REPORT=1` now reports the
+device, Metal 4 family support, MTL4 queue availability, and whether the device
+looks like an M5 Neural Accelerator target.
+
+The implementation follows the same conservative shape used by llama.cpp's
+current Metal backend: the tensor API is disabled by default on pre-M5/pre-A19
+devices, can be forced with `DS4_METAL_TENSOR_ENABLE=1`, and can always be
+disabled with `DS4_METAL_TENSOR_DISABLE=1`. At startup ds4 compiles a tiny MPP
+tensor matmul probe before it lets the main Metal shader source see
+`DS4_METAL_HAS_TENSOR`, so unsupported SDK/device combinations fall back to the
+legacy kernels.
+
+The Q8_0 prefill MPP route is enabled automatically on M5/M6/A19/A20-class
+Metal 4 tensor targets and can be forced with
+`DS4_METAL_MPP_ENABLE=1 ./ds4 --prompt-file README.md`. It only affects prompt
+batches larger than eight tokens, falls back to the legacy kernel if the Metal 4
+tensor path is unavailable, and is covered by the isolated
+`./ds4_test --metal-kernels` numeric regression. It has also passed the
+long-context and official logprob-vector regressions on M5. Set
+`DS4_METAL_MPP_DISABLE=1` to compare or temporarily disable the MPP route.
+
+The routed-MoE projections also use MPP by default on M5-class Metal 4 tensor
+targets for staged prefill layers: the down projection starts at layer 2, the
+gate and up projections start at layer 13. This constrained route has passed
+the long-context and official logprob-vector regressions. Starting down at
+layer 1, or gate/up together at layer 12, fails the long-context regression,
+so the boundaries are intentionally conservative.
+
+For the common six-routed-expert prefill shape, the down-projection expert
+outputs are summed with a single Metal kernel instead of five chained add
+passes. Set `DS4_METAL_MOE_SUM6_DISABLE=1` to compare or temporarily disable
+that fused sum route.
+
+The attention-output low-projection also uses MPP by default on Metal 4 tensor
+targets for full 32-token tiles, falling back to the existing indexed simdgroup
+kernel for partial tiles. Set `DS4_METAL_MPP_ATTN_OUT_DISABLE=1` to isolate or
+temporarily disable this route.
 
 ## CLI
 
