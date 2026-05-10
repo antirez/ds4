@@ -103,7 +103,9 @@ static void usage(FILE *fp) {
         "  -t, --threads N\n"
         "      CPU helper threads for host-side or reference work.\n"
         "  --quality\n"
-        "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
+        "      Prefer exact kernels where faster approximate paths exist; disables Metal 4 MPP routes; MTP uses strict verification.\n"
+        "  --mpp MODE\n"
+        "      Metal 4 MPP policy: auto, on, or off. Default: auto. Auto enables validated safe routes; 'on' is a route diagnostic and may change output.\n"
         "  --dir-steering-file FILE\n"
         "      Load one f32 direction vector per layer for directional steering.\n"
         "  --dir-steering-ffn F\n"
@@ -241,6 +243,15 @@ static ds4_backend default_backend(void) {
 #else
     return DS4_BACKEND_CUDA;
 #endif
+}
+
+static ds4_mpp_mode parse_mpp_mode(const char *s) {
+    if (!strcmp(s, "auto")) return DS4_MPP_AUTO;
+    if (!strcmp(s, "on")) return DS4_MPP_ON;
+    if (!strcmp(s, "off")) return DS4_MPP_OFF;
+    fprintf(stderr, "ds4: invalid MPP mode: %s\n", s);
+    fprintf(stderr, "ds4: valid MPP modes are: auto, on, off\n");
+    exit(2);
 }
 
 static void log_context_memory(ds4_backend backend, int ctx_size) {
@@ -1251,6 +1262,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
+        } else if (!strcmp(arg, "--mpp")) {
+            c.engine.mpp_mode = parse_mpp_mode(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--dir-steering-file")) {
             c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dir-steering-ffn")) {

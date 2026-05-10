@@ -11728,6 +11728,15 @@ static float parse_float_arg(const char *s, const char *opt, float minv, float m
     return v;
 }
 
+static ds4_mpp_mode parse_mpp_mode_arg(const char *s) {
+    if (!strcmp(s, "auto")) return DS4_MPP_AUTO;
+    if (!strcmp(s, "on")) return DS4_MPP_ON;
+    if (!strcmp(s, "off")) return DS4_MPP_OFF;
+    server_log(DS4_LOG_DEFAULT, "ds4-server: invalid MPP mode: %s", s);
+    server_log(DS4_LOG_DEFAULT, "ds4-server: valid MPP modes are: auto, on, off");
+    exit(2);
+}
+
 static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
     if (*i + 1 >= argc) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: missing value for %s", opt);
@@ -11790,7 +11799,9 @@ static void usage(FILE *fp) {
         "  --chdir DIR\n"
         "      Change working directory before loading the model or runtime assets.\n"
         "  --quality\n"
-        "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
+        "      Prefer exact kernels where faster approximate paths exist; disables Metal 4 MPP routes; MTP uses strict verification.\n"
+        "  --mpp MODE\n"
+        "      Metal 4 MPP policy: auto, on, or off. Default: auto. Auto enables validated safe routes; 'on' is a route diagnostic and may change output.\n"
         "  --dir-steering-file FILE\n"
         "      Load one f32 direction vector per layer for directional steering.\n"
         "  --dir-steering-ffn F\n"
@@ -11917,6 +11928,8 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.n_threads = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--chdir")) {
             c.chdir_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mpp")) {
+            c.engine.mpp_mode = parse_mpp_mode_arg(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--host")) {
             c.host = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--port")) {

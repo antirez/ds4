@@ -284,31 +284,156 @@ tensor matmul probe before it lets the main Metal shader source see
 `DS4_METAL_HAS_TENSOR`, so unsupported SDK/device combinations fall back to the
 legacy kernels.
 
-The Q8_0 prefill MPP route is enabled automatically on M5/M6/A19/A20-class
-Metal 4 tensor targets and can be forced with
-`DS4_METAL_MPP_ENABLE=1 ./ds4 --prompt-file README.md`. It only affects prompt
-batches larger than eight tokens, falls back to the legacy kernel if the Metal 4
-tensor path is unavailable, and is covered by the isolated
-`./ds4_test --metal-kernels` numeric regression. It has also passed the
-long-context and official logprob-vector regressions on M5. Set
-`DS4_METAL_MPP_DISABLE=1` to compare or temporarily disable the MPP route.
+MPP policy is explicit and correctness-first. Use `--mpp auto` for the default
+route policy, `--mpp on` to force MPP routes where the Metal 4 tensor path is
+available, and `--mpp off` for the legacy Metal reference path. Auto currently
+enables only the validated late-layer safe windows that pass full-model
+equivalence and clear the benchmark gate; early-layer and all-layer MPP routes
+remain opt-in diagnostics. The environment controls
+`DS4_METAL_MPP_ENABLE` and `DS4_METAL_MPP_DISABLE` accept `1/true/yes/on` and
+`0/false/no/off`; `DS4_METAL_MPP_ENABLE=0` disables MPP instead of enabling it
+by mere presence. Passing `--quality` also disables MPP routes so strict/debug
+runs stay on the legacy Metal kernels. Set `DS4_METAL_MPP_FAST=1` to opt into
+the current same-top1/same-greedy fast profile: it widens Q8_0 and
+attention-output MPP to all layers, enables Q8_0 partial token tiles, and uses
+earlier routed-MoE MPP windows. This profile is not the default because its
+whole-vocab and top-k drift are much larger than the correctness-first auto
+profile.
+Set `DS4_METAL_MPP_DIRECT_RHS=1` only for diagnostics of the first-PR MPP
+direct-RHS tensor layout; it is not part of the correctness-first default. Q8_0
+and attention-output direct-RHS diagnostics support both 32-token and 64-token
+MPP tiles, so they can be combined with `DS4_METAL_MPP_Q8_0_TILE_N=64` and
+`DS4_METAL_MPP_ATTN_OUT_TILE_N=64` for M5 throughput experiments. The
+route-specific `DS4_METAL_MPP_Q8_0_DIRECT_RHS=1`,
+`DS4_METAL_MPP_F16_DIRECT_RHS=1`, and
+`DS4_METAL_MPP_ATTN_OUT_DIRECT_RHS=1` switches isolate that diagnostic layout
+without turning on every direct-RHS route at once.
 
-The routed-MoE projections also use MPP by default on M5-class Metal 4 tensor
-targets for staged prefill layers: the down projection starts at layer 2, the
-gate and up projections start at layer 13. This constrained route has passed
-the long-context and official logprob-vector regressions. Starting down at
-layer 1, or gate/up together at layer 12, fails the long-context regression,
-so the boundaries are intentionally conservative.
+The Q8_0 prefill MPP route can be isolated with
+`DS4_METAL_MPP_Q8_0_ENABLE=1` or `DS4_METAL_MPP_Q8_0_DISABLE=1`. It only
+affects prompt batches larger than eight tokens and is limited by default to
+the late full-model-safe layer window 38..42, plus the `attn_q_b` projection in
+layers 32..37. It uses only full 32-token tiles by default and falls back to the
+legacy kernel for partial token tiles or when the Metal 4 tensor path is
+unavailable. Set
+`DS4_METAL_MPP_Q8_0_PARTIAL_ENABLE=1` to reproduce or localize partial-tile
+drift while debugging. Set `DS4_METAL_MPP_Q8_0_FILTER=all` to reproduce the
+unsafe all-layer Q8 route, `DS4_METAL_MPP_Q8_0_FILTER=late_safe` to request the
+default safe window explicitly, or
+`DS4_METAL_MPP_Q8_0_FILTER=<substring[,substring...]>` to force named
+full-graph Q8 modules such as `attn_q_a`, `attn_kv`, `attn_q_b`, `attn_out`,
+`shared_gate`, `shared_up`, or `shared_down`. Use
+`<substring>@layer=A..B` to test one module family only in a layer window, for
+example `shared_up@layer=30..37`. Set
+`DS4_METAL_MPP_Q8_0_TILE_N=64` to test the experimental wider MPP token tile
+for performance against the default `32`. The isolated
+`./ds4_test --metal-kernels` regression reports small/medium/model-ish kernel
+deltas; the full-model
+`./ds4_test --metal-mpp-equivalence` diagnostic compares default auto against
+`--mpp off`. Set `DS4_TEST_MPP_EQ_FORCE_ON=1` to compare forced MPP against
+`--mpp off` while working on a route. `DS4_TEST_MPP_EQ_CASE=<case-id-substring>`
+limits the diagnostic to one prompt, and `DS4_TEST_MPP_EQ_MATRIX=1` prints
+separate auto, fast-profile, Q8-only, attention-output-only, MoE gate/up/down-only,
+and full-forced summary rows. The equivalence gate requires finite logits, the
+same top-1 token, and matching greedy continuation; it also reports top-5/top-20
+overlap, top-20 rank displacement, top-20 logit deltas, and whole-vocab RMS/max
+drift so route changes can be judged beyond pass/fail.
+
+Full-graph route localization is available with
+`DS4_METAL_MPP_COMPARE_ROUTE=q8|attn_out|moe_gate|moe_up|moe_down` and optional
+`DS4_METAL_MPP_COMPARE_MAX=N`. The comparator snapshots the candidate MPP
+output, runs the legacy Metal route on the same tensor input, and reports the
+first comparison that exceeds the kernel target, including module/layer context,
+shape, max absolute error, RMS, and the largest element deltas. Set
+`DS4_METAL_MPP_COMPARE_VERBOSE=1` to print passing comparisons as well.
+
+Current MPP route status is intentionally conservative: `auto` enables Q8_0
+prefill, F16 compressor, attention-output low projection, and routed-MoE MPP
+only in the full-model-safe windows. Attention-output low projection now uses
+layers 32..42 by default, while Q8_0 keeps one narrower `attn_q_b` extension
+for layers 32..37. The Q8_0 and attention-output low MPP
+kernels stage activation tiles through half to match the legacy Metal matmul
+input path, which brings the isolated model-ish Q8_0 regression under the
+strict kernel target and removes the first attention-output comparator breach.
+Most Q8_0 projection families stay restricted to layers 38..42 because earlier
+layers can amplify small local differences through normalization/attention
+enough to fail prompt-logit equivalence. The `attn_q_b` 32..37 extension is
+kept because it is query-side only for full prompt tiles in the current
+validation path, passes prompt-logit equivalence, and improves prefill
+throughput. The F16 compressor route did not introduce measurable drift in the
+current prompt set.
+
+The `DS4_METAL_MPP_FAST=1` profile is the measured high-throughput diagnostic
+profile under the relaxed same-top1/same-greedy gate. In the current prompt
+suite it keeps top-1 and greedy continuations stable, but reports much larger
+distribution drift than auto (`worst_rms ~= 0.761`,
+`worst_top20_max_abs ~= 2.28`, minimum top-20 overlap `18/20`). On the
+long-code prefill benchmark it sampled around `360 t/s` in the same window
+where auto sampled around `318 t/s`; benchmark variance is high when the
+desktop is active. The more aggressive direct-RHS 64-token diagnostic
+(`DS4_METAL_MPP_FAST=1 DS4_METAL_MPP_DIRECT_RHS=1
+DS4_METAL_MPP_Q8_0_TILE_N=64 DS4_METAL_MPP_ATTN_OUT_TILE_N=64`) passed the
+relaxed top-1/greedy gate and `--logprob-vectors`, and in Automatic power mode
+sampled around `324 t/s` versus `289 t/s` for auto in the same short benchmark
+window. It remains diagnostic-only because its full-suite drift is higher
+(`worst_rms ~= 0.846`, `worst_top20_max_abs ~= 2.07`, minimum top-20 overlap
+`16/20`).
+
+The routed-MoE MPP projections are staged when forced and are limited to a
+late full-model-safe layer window by default: gate/down start at layer 28, and
+up starts at layer 30. For route isolation, use
+`DS4_METAL_MPP_MOE_GATE_ENABLE/DISABLE`,
+`DS4_METAL_MPP_MOE_UP_ENABLE/DISABLE`, and
+`DS4_METAL_MPP_MOE_DOWN_ENABLE/DISABLE`; `DS4_METAL_MPP_MOE_DISABLE=1`
+disables all routed-MoE MPP projections. Set the common
+`DS4_METAL_MPP_MOE_FILTER` or route-specific
+`DS4_METAL_MPP_MOE_GATE_FILTER`, `DS4_METAL_MPP_MOE_UP_FILTER`, and
+`DS4_METAL_MPP_MOE_DOWN_FILTER` to `all`, `late_safe`, `none`, or
+comma-separated full-graph context substrings to localize safe layer windows.
+Use `layer=N` for an exact layer match or `layer=A..B` for an inclusive layer
+range when testing sparse MPP windows. The same `<substring>@layer=A..B`
+syntax can restrict a context substring to a layer window.
+Set `DS4_METAL_MPP_MOE_TILE_N=64` to test the experimental wider routed-MoE
+MPP token tile for performance against the default `32`. Set
+`DS4_METAL_MPP_MOE_FAST_LAYOUT=1` to test the old first-PR routed-MoE MPP
+threadgroup tensor layout as an explicit performance diagnostic. Set
+`DS4_METAL_MPP_MOE_START_LAYER=N`, or the route-specific
+`DS4_METAL_MPP_MOE_GATE_START_LAYER`,
+`DS4_METAL_MPP_MOE_UP_START_LAYER`, and
+`DS4_METAL_MPP_MOE_DOWN_START_LAYER`, to test earlier routed-MoE MPP start
+layers before changing the conservative defaults. Set
+`DS4_METAL_MPP_MOE_PAIR_GATE_UP=1` only to profile the experimental fused
+gate/up MPP dispatch; it passes the current equivalence gate but is not a
+default path because it is slower than separate gate and up dispatches.
 
 For the common six-routed-expert prefill shape, the down-projection expert
 outputs are summed with a single Metal kernel instead of five chained add
 passes. Set `DS4_METAL_MOE_SUM6_DISABLE=1` to compare or temporarily disable
 that fused sum route.
 
-The attention-output low-projection also uses MPP by default on Metal 4 tensor
-targets for full 32-token tiles, falling back to the existing indexed simdgroup
-kernel for partial tiles. Set `DS4_METAL_MPP_ATTN_OUT_DISABLE=1` to isolate or
-temporarily disable this route.
+The attention-output low-projection MPP route applies to full 32-token tiles
+in the default safe window, falling back to the existing indexed simdgroup
+kernel for partial tiles. Attention-output MPP is limited to the measured
+full-model-safe layer window 32..42 by default. Set
+`DS4_METAL_MPP_ATTN_OUT_ENABLE=1` or `DS4_METAL_MPP_ATTN_OUT_DISABLE=1` to
+isolate this route. Set `DS4_METAL_MPP_ATTN_OUT_FILTER=all`, `late_safe`,
+`none`, or a comma-separated list of full-graph context substrings such as
+`layer=42` to localize full-model-safe layer windows. Layer filters are exact,
+and `layer=A..B` matches an inclusive range. Set
+`DS4_METAL_MPP_ATTN_OUT_TILE_N=64` to test the experimental wider MPP token
+tile for performance against the default `32`. The all-layer
+attention-output MPP route still fails long-prompt full-model equivalence
+despite per-layer low-projection differences below the current kernel target.
+The ratio-2 F16 compressor route can similarly be controlled with
+`DS4_METAL_MPP_F16_ENABLE=1` or `DS4_METAL_MPP_F16_DISABLE=1`.
+`DS4_METAL_MPP_F16_PAIR=1` tests a paired KV/gate compressor dispatch that keeps
+the standard simdgroup F16 matmul accumulation shape. It passes the current
+full-model equivalence gate, but the measured long-code prefill change was
+within noise (`~0.4%`), so it remains opt-in. `DS4_METAL_MPP_F16_WIDE=1` tests
+wider 512/1024-column compressor MPP, including the paired MPP route when both
+variables are set. The wide route is diagnostic only: the current long-code
+prompt fails full-model equivalence with wide F16 MPP (`rms ~= 0.569`,
+`top20_max_abs ~= 1.48`), so it is not enabled by `auto`.
 
 ## CLI
 
@@ -862,6 +987,7 @@ All project tests are driven by the C runner:
 ```sh
 make test                  # ./ds4_test --all
 ./ds4_test --logprob-vectors
+./ds4_test --metal-mpp-equivalence
 ./ds4_test --server
 ```
 
