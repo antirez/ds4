@@ -180,6 +180,17 @@ static int parse_int(const char *s, const char *opt) {
     return (int)v;
 }
 
+static bool parse_int_repl(const char *s, const char *opt, int *out) {
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (s[0] == '\0' || *end != '\0' || v <= 0 || v > INT32_MAX) {
+        fprintf(stderr, "ds4: invalid value for %s: %s\n", opt, s);
+        return false;
+    }
+    *out = (int)v;
+    return true;
+}
+
 static uint64_t parse_u64(const char *s, const char *opt) {
     char *end = NULL;
     unsigned long long v = strtoull(s, &end, 10);
@@ -1057,17 +1068,20 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
             if (!arg[0]) {
                 fprintf(stderr, "ds4: /ctx needs a positive integer\n");
             } else {
-                cfg->gen.ctx_size = parse_int(arg, "/ctx");
-                log_context_memory(cfg->engine.backend, cfg->gen.ctx_size);
-                rc = repl_chat_set_ctx(engine, &chat, cfg->gen.ctx_size);
-                if (rc != 0) {
-                    linenoiseFree(line);
-                    break;
+                int new_ctx;
+                if (parse_int_repl(arg, "/ctx", &new_ctx)) {
+                    cfg->gen.ctx_size = new_ctx;
+                    log_context_memory(cfg->engine.backend, cfg->gen.ctx_size);
+                    rc = repl_chat_set_ctx(engine, &chat, cfg->gen.ctx_size);
+                    if (rc != 0) {
+                        linenoiseFree(line);
+                        break;
+                    }
+                    bool active = ds4_think_mode_for_context(cfg->gen.think_mode,
+                                                             chat.ctx_size) == DS4_THINK_MAX;
+                    repl_chat_apply_max_prefix(engine, &chat, active);
+                    cli_warn_think_max_downgraded(&cfg->gen, "/ctx");
                 }
-                bool active = ds4_think_mode_for_context(cfg->gen.think_mode,
-                                                         chat.ctx_size) == DS4_THINK_MAX;
-                repl_chat_apply_max_prefix(engine, &chat, active);
-                cli_warn_think_max_downgraded(&cfg->gen, "/ctx");
             }
         } else if (!strcmp(cmd, "/quit") || !strcmp(cmd, "/exit")) {
             linenoiseFree(line);
