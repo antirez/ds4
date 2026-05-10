@@ -4482,6 +4482,8 @@ typedef struct {
     uint64_t payload_bytes;
     uint64_t text_bytes;
     uint64_t file_size;
+    int *tokens_ids; // NEW: actual token IDs for 'tree' system matching
+    uint8_t version; // NEW: file version for 'tree' system
 } kv_entry;
 
 typedef struct {
@@ -4502,6 +4504,9 @@ typedef struct {
     kv_entry *entry;
     int len;
     int cap;
+    rax *tree; // NEW: Radix tree for fast prefix matching ('tree' system)
+    /* Note for study: This rax tree is an in-memory Patricia trie. 
+     * For persistent storage like RocksDB, we would map token sequences to file paths here. */
 } kv_disk_cache;
 
 typedef enum {
@@ -5198,12 +5203,15 @@ static bool mkdir_p(const char *path) {
 
 static void kv_entry_free(kv_entry *e) {
     free(e->path);
+    free(e->tokens_ids); // Free 'tree' system token IDs
     memset(e, 0, sizeof(*e));
 }
 
 static void kv_cache_clear(kv_disk_cache *kc) {
     for (int i = 0; i < kc->len; i++) kv_entry_free(&kc->entry[i]);
     free(kc->entry);
+    if (kc->tree) raxFree(kc->tree); // Free 'tree' system radix tree
+    kc->tree = raxNew(); // Reset 'tree' system radix tree
     kc->entry = NULL;
     kc->len = 0;
     kc->cap = 0;
@@ -5215,6 +5223,12 @@ static void kv_cache_push(kv_disk_cache *kc, kv_entry e) {
         kc->entry = xrealloc(kc->entry, (size_t)kc->cap * sizeof(kc->entry[0]));
     }
     kc->entry[kc->len++] = e;
+
+    // Insert into 'tree' system for fast prefix lookup
+    if (kc->tree && e.tokens_ids && e.tokens > 0) {
+        raxInsert(kc->tree, (unsigned char *)e.tokens_ids,
+                  (size_t)e.tokens * sizeof(int), (void *)(uintptr_t)(kc->len - 1), NULL);
+    }
 }
 
 static const char *find_next_dsml_tool_block(const char *p, const char **end_out) {
@@ -5581,6 +5595,8 @@ static bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb
     kc->budget_bytes = budget_mb * 1024ull * 1024ull;
     kc->reject_different_quant = reject_different_quant;
     kc->opt = opt;
+    kc->tree = raxNew(); // Initialize 'tree' system radix tree
+    if (!kc->tree) die("out of memory");
     kv_cache_evict(kc, NULL);
     server_log(DS4_LOG_KVCACHE,
                "ds4-server: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d)",
@@ -5597,6 +5613,7 @@ static bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb
 
 static void kv_cache_close(kv_disk_cache *kc) {
     kv_cache_clear(kc);
+    if (kc->tree) raxFree(kc->tree); // Final cleanup of 'tree' system
     free(kc->dir);
     memset(kc, 0, sizeof(*kc));
 }
@@ -5832,6 +5849,23 @@ static void kv_cache_maybe_store_continued(server *s) {
 
 static int kv_cache_find_prefix(kv_disk_cache *kc, const ds4_tokens *prompt, int quant_bits, int ctx_size) {
     kv_cache_refresh(kc);
+    
+    // Efficient lookup using 'tree' system (Radix Tree / Patricia Trie)
+    if (kc->tree && raxSize(kc->tree) > 0) {
+        for (int len = prompt->len; len >= kc->opt.min_tokens; len--) {
+            void *v = raxFind(kc->tree, (unsigned char *)prompt->v, (size_t)len * sizeof(int));
+            if (v != raxNotFound) {
+                int idx = (int)(uintptr_t)v;
+                kv_entry *e = &kc->entry[idx];
+                if ((uint32_t)ctx_size >= e->ctx_size &&
+                    (!kc->reject_different_quant || e->quant_bits == (uint8_t)quant_bits))
+                {
+                    return idx;
+                }
+            }
+        }
+    }
+
     int best = -1;
     for (int i = 0; i < kc->len; i++) {
         kv_entry *e = &kc->entry[i];
