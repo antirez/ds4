@@ -2044,9 +2044,8 @@ typedef decltype(kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, ha
 typedef decltype(kernel_mul_mm_id<64, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>) mul_mm_id_f16_rhs_n64;
 
 #ifdef DS4_METAL_HAS_TENSOR
-// Diagnostic-only old MPP tensor layout from the first Metal 4 PR.  It is kept
-// behind DS4_METAL_MPP_MOE_FAST_LAYOUT so we can measure whether the old kernel
-// shape can be recovered for routes that already pass full-model equivalence.
+// Faster routed-MoE MPP tensor layout from the first Metal 4 PR.  The host keeps
+// it inside the active route windows that pass full-model checks.
 template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
 kernel void kernel_mul_mm_id_mpp_fast_layout(
         constant ds4_metal_args_mul_mm_id & args,

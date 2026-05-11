@@ -6194,8 +6194,8 @@ static uint32_t ds4_default_prefill_cap_for_prompt(int prompt_len) {
             if (v <= 0) return cap;
             cap = (uint32_t)v;
         }
-    } else if (prompt_len > 2048) {
-        cap = 2048u;
+    } else if (prompt_len > 4096) {
+        cap = 4096u;
     }
 
     if (cap == 0) cap = 1;
@@ -9071,9 +9071,81 @@ static bool metal_graph_capture_prefix1_index_state(ds4_gpu_graph *g, uint32_t i
                                  g->layer_index_state_score[il], 0, bytes) != 0;
 }
 
+static bool metal_graph_decode_indexer_top_k_override(uint32_t *value) {
+    static int parsed = -1;
+    static uint32_t cached = 0;
+    if (parsed >= 0) {
+        if (parsed > 0 && value) *value = cached;
+        return parsed > 0;
+    }
+
+    parsed = 0;
+    const char *env = getenv("DS4_METAL_DECODE_INDEXER_TOP_K");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(env, &end, 10);
+        while (end && isspace((unsigned char)*end)) end++;
+        if (end != env && end && *end == '\0' &&
+            (v == 64ul || v == 128ul || v == 256ul || v == 512ul) &&
+            v <= DS4_N_INDEXER_TOP_K) {
+            cached = (uint32_t)v;
+            parsed = 1;
+        } else {
+            fprintf(stderr,
+                    "ds4: invalid DS4_METAL_DECODE_INDEXER_TOP_K=%s; "
+                    "expected 64, 128, 256, or 512\n",
+                    env);
+        }
+    }
+    if (parsed > 0 && value) *value = cached;
+    return parsed > 0;
+}
+
 static uint32_t metal_graph_decode_indexer_top_k(const ds4_gpu_graph *g) {
+    uint32_t value = 0;
+    if (metal_graph_decode_indexer_top_k_override(&value)) return value;
+
+    const uint32_t speed_default =
+        DS4_N_INDEXER_TOP_K < 256u ? DS4_N_INDEXER_TOP_K : 256u;
+    return (g && g->quality) ? DS4_N_INDEXER_TOP_K : speed_default;
+}
+
+static uint32_t metal_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph *g) {
     (void)g;
-    return DS4_N_INDEXER_TOP_K;
+    static int parsed = -1;
+    static uint32_t cached = 0;
+    if (parsed < 0) {
+        parsed = 0;
+        const char *env = getenv("DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD");
+        if (env && env[0]) {
+            char *end = NULL;
+            unsigned long v = strtoul(env, &end, 10);
+            while (end && isspace((unsigned char)*end)) end++;
+            if (end != env && end && *end == '\0' &&
+                (v == 64ul || v == 128ul || v == 256ul || v == 512ul ||
+                 v == 1024ul || v == 2048ul || v == 4096ul)) {
+                cached = (uint32_t)v;
+                parsed = 1;
+            } else {
+                fprintf(stderr,
+                        "ds4: invalid DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD=%s; "
+                        "expected 64, 128, 256, 512, 1024, 2048, or 4096\n",
+                        env);
+            }
+        }
+    }
+    if (parsed > 0) return cached;
+
+    uint32_t value = 0;
+    if (metal_graph_decode_indexer_top_k_override(&value)) return value;
+
+    /* Keep dense attention longer than the legacy 512-row window by default.
+     * Around the 2K frontier the sparse path's score/top-k setup dominates
+     * the smaller attention scan, while larger contexts benefit from sparse
+     * indexed attention.  The speed default
+     * selects fewer rows only after decode has enough compressed rows for the
+     * sparse indexed path to pay for its score/top-k overhead. */
+    return 1024u;
 }
 
 /* =========================================================================
@@ -9562,7 +9634,9 @@ static bool metal_graph_encode_decode_layer(
             }
             if (ok && emit) g->layer_n_index_comp[il]++;
             const uint32_t decode_top_k = metal_graph_decode_indexer_top_k(g);
-            if (ok && g->layer_n_comp[il] > decode_top_k) {
+            const uint32_t decode_sparse_threshold =
+                metal_graph_decode_indexer_sparse_threshold(g);
+            if (ok && g->layer_n_comp[il] > decode_sparse_threshold) {
                 const uint64_t indexer_q_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
                 if (!layer->indexer_attn_q_b ||
                     layer->indexer_attn_q_b->type != DS4_TENSOR_F16 ||
@@ -13358,16 +13432,19 @@ static bool metal_graph_prefill_layer_major(
         const ds4_model       *model,
         const ds4_weights     *weights,
         const token_vec       *prompt,
-        int                    n_tokens,
+        uint32_t               start,
+        uint32_t               n_tokens,
         float                 *logits,
         bool                   show_progress,
         ds4_imatrix_collector *imatrix) {
-    if (n_tokens <= 0 || n_tokens > prompt->len || (uint32_t)n_tokens > g->prefill_cap) return false;
+    if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
+    if (start > (uint32_t)prompt->len) return false;
+    if (n_tokens > (uint32_t)prompt->len - start) return false;
 
-    bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, 0, (uint32_t)n_tokens);
+    bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
     if (!ok) return false;
 
-    if (!metal_graph_warmup_prefill_kernels(g, model, weights, (uint32_t)n_tokens)) return false;
+    if (!metal_graph_warmup_prefill_kernels(g, model, weights, n_tokens)) return false;
 
     const bool split_profile = getenv("DS4_METAL_GRAPH_PREFILL_SPLIT_PROFILE") != NULL;
     /*
@@ -13388,16 +13465,16 @@ static bool metal_graph_prefill_layer_major(
                                                      model,
                                                      weights,
                                                      prompt,
-                                                     0,
-                                                     (uint32_t)n_tokens);
+                                                     start,
+                                                     n_tokens);
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
             ok = metal_graph_encode_layer_batch(g,
                                                 model,
                                                 &weights->layer[il],
                                                 il,
-                                                0,
-                                                (uint32_t)n_tokens);
+                                                start,
+                                                n_tokens);
             if (show_progress) {
                 fprintf(stderr, "ds4: gpu prefill layer %u/%u\r", il + 1, (uint32_t)DS4_N_LAYER);
                 fflush(stderr);
@@ -13415,13 +13492,13 @@ static bool metal_graph_prefill_layer_major(
                 output_row = (uint32_t)v;
             }
         }
-        ds4_gpu_tensor *last_hc = NULL;
         ds4_gpu_tensor *saved_cur = g->cur_hc;
-        if (ok) {
+        ds4_gpu_tensor *last_hc = NULL;
+        if (ok && logits) {
             last_hc = metal_graph_tensor_row_view(g->batch_cur_hc, output_row, hc_dim);
             ok = last_hc != NULL;
         }
-        if (ok) {
+        if (ok && logits) {
             g->cur_hc = last_hc;
             ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
             g->cur_hc = saved_cur;
@@ -13446,7 +13523,7 @@ static bool metal_graph_prefill_layer_major(
         if (profile) {
             const double t_read = now_sec();
             fprintf(stderr,
-                    "ds4: gpu graph prefill total tokens=%d encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms\n",
+                    "ds4: gpu graph prefill total tokens=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms\n",
                     n_tokens,
                     (t_encoded - t0) * 1000.0,
                     (t_done - t_encoded) * 1000.0,
@@ -13462,8 +13539,8 @@ static bool metal_graph_prefill_layer_major(
                                                  model,
                                                  weights,
                                                  prompt,
-                                                 0,
-                                                 (uint32_t)n_tokens);
+                                                 start,
+                                                 n_tokens);
     const double t_embed_encoded = profile ? now_sec() : 0.0;
     const double t_embed_done = profile ? now_sec() : 0.0;
     if (profile) {
@@ -13491,8 +13568,8 @@ static bool metal_graph_prefill_layer_major(
                                                                   model,
                                                                   &weights->layer[il],
                                                                   il,
-                                                                  0,
-                                                                  (uint32_t)n_tokens);
+                                                                  start,
+                                                                  n_tokens);
             const double t_attn_encoded = now_sec();
             if (ok) ok = ds4_gpu_end_commands() != 0;
             const double t_attn_done = now_sec();
@@ -13503,8 +13580,8 @@ static bool metal_graph_prefill_layer_major(
                                                             model,
                                                             &weights->layer[il],
                                                             il,
-                                                            0,
-                                                            (uint32_t)n_tokens);
+                                                            start,
+                                                            n_tokens);
             if (ok) {
                 ds4_gpu_tensor *tmp = g->batch_cur_hc;
                 g->batch_cur_hc = g->batch_next_hc;
@@ -13531,8 +13608,8 @@ static bool metal_graph_prefill_layer_major(
                                                         model,
                                                         &weights->layer[il],
                                                         il,
-                                                        0,
-                                                        (uint32_t)n_tokens);
+                                                        start,
+                                                        n_tokens);
             const double t_encoded = profile ? now_sec() : 0.0;
             if (ok) ok = ds4_gpu_end_commands() != 0;
             const double t_done = profile ? now_sec() : 0.0;
@@ -13570,21 +13647,26 @@ static bool metal_graph_prefill_layer_major(
             output_row = (uint32_t)v;
         }
     }
-    ds4_gpu_tensor *last_hc = metal_graph_tensor_row_view(g->batch_cur_hc,
-                                                            output_row,
-                                                            hc_dim);
-    if (!last_hc) return false;
     ds4_gpu_tensor *saved_cur = g->cur_hc;
-    g->cur_hc = last_hc;
+    ds4_gpu_tensor *last_hc = NULL;
 
     const double t_head0 = profile ? now_sec() : 0.0;
-    ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+    if (logits) {
+        last_hc = metal_graph_tensor_row_view(g->batch_cur_hc,
+                                              output_row,
+                                              hc_dim);
+        ok = last_hc != NULL;
+    }
+    if (ok && logits) {
+        g->cur_hc = last_hc;
+        ok = ds4_gpu_begin_commands() != 0;
+    }
+    if (ok && logits) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
     const double t_head_encoded = profile ? now_sec() : 0.0;
-    if (ok) ok = ds4_gpu_end_commands() != 0;
+    if (ok && logits) ok = ds4_gpu_end_commands() != 0;
     const double t_head_done = profile ? now_sec() : 0.0;
     g->cur_hc = saved_cur;
-    ds4_gpu_tensor_free(last_hc);
+    if (last_hc) ds4_gpu_tensor_free(last_hc);
     if (!ok) return false;
 
     const double t_before_read = profile ? now_sec() : 0.0;
@@ -13602,7 +13684,7 @@ static bool metal_graph_prefill_layer_major(
                     (t_head_done - t_head_encoded) * 1000.0);
         }
         fprintf(stderr,
-                "ds4: gpu layer-major prefill total tokens=%d encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms\n",
+                "ds4: gpu layer-major prefill total tokens=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms\n",
                 n_tokens,
                 encode_s * 1000.0,
                 execute_s * 1000.0,
@@ -13622,32 +13704,15 @@ static bool metal_graph_prefill_raw_swa(
         bool                   show_progress) {
     if (n_tokens <= 0 || n_tokens > prompt->len) return false;
     if ((uint32_t)n_tokens > g->prefill_cap) return false;
-    return metal_graph_prefill_layer_major(g, model, weights, prompt, n_tokens, logits, show_progress, NULL);
-}
-
-static bool metal_graph_prefill_batch_row_logits(
-        ds4_gpu_graph *g,
-        const ds4_model   *model,
-        const ds4_weights *weights,
-        uint32_t           batch_row,
-        float             *logits) {
-    if (!logits) return true;
-    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    ds4_gpu_tensor *last_hc = metal_graph_tensor_row_view(g->batch_cur_hc,
-                                                            batch_row,
-                                                            hc_dim);
-    if (!last_hc) return false;
-    ds4_gpu_tensor *saved_cur = g->cur_hc;
-    g->cur_hc = last_hc;
-    bool ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    else (void)ds4_gpu_synchronize();
-    g->cur_hc = saved_cur;
-    ds4_gpu_tensor_free(last_hc);
-    if (!ok) return false;
-    return ds4_gpu_tensor_read(g->logits, 0, logits,
-                                 (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    return metal_graph_prefill_layer_major(g,
+                                           model,
+                                           weights,
+                                           prompt,
+                                           0,
+                                           (uint32_t)n_tokens,
+                                           logits,
+                                           show_progress,
+                                           NULL);
 }
 
 /* Prefill a contiguous token range in fixed-size chunks.
@@ -13678,21 +13743,8 @@ static bool metal_graph_prefill_chunked_range(
     if (start != 0 && chunk_cap > g->raw_cap) chunk_cap = g->raw_cap;
     if (chunk_cap == 0) return false;
 
-    uint32_t first_chunk = n_tokens < chunk_cap ? n_tokens : chunk_cap;
-    if (start != 0 && g->prefill_cap != 0) {
-        const uint32_t mod = start % g->prefill_cap;
-        if (mod != 0) {
-            const uint32_t to_boundary = g->prefill_cap - mod;
-            if (to_boundary < first_chunk) first_chunk = to_boundary;
-        }
-    }
-    if (!metal_graph_warmup_prefill_kernels(g, model, weights, first_chunk)) return false;
-
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
-    double encode_s = 0.0;
-    double execute_s = 0.0;
-    uint32_t last_chunk_tokens = 0;
     const uint32_t end = start + n_tokens;
 
     if (progress) {
@@ -13710,109 +13762,39 @@ static bool metal_graph_prefill_chunked_range(
             }
         }
         const uint32_t chunk = remaining < local_cap ? remaining : local_cap;
-        last_chunk_tokens = chunk;
-
-        bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, pos0, chunk);
-        if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
-                                                             g->prefill_tokens,
-                                                             model,
-                                                             weights,
-                                                             prompt,
-                                                             pos0,
-                                                             chunk);
-        if (!ok) return false;
-
-        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-            const double t_layer0 = profile ? now_sec() : 0.0;
-            ok = ds4_gpu_begin_commands() != 0;
-            if (ok) ok = metal_graph_encode_layer_batch(g,
-                                                        model,
-                                                        &weights->layer[il],
-                                                        il,
-                                                        pos0,
-                                                        chunk);
-            const double t_encoded = profile ? now_sec() : 0.0;
-            if (ok) ok = ds4_gpu_end_commands() != 0;
-            const double t_done = profile ? now_sec() : 0.0;
-            if (ok && imatrix) ok = imatrix_collect_layer_batch(imatrix, g, il, chunk);
-            if (profile) {
-                encode_s += t_encoded - t_layer0;
-                execute_s += t_done - t_encoded;
-                fprintf(stderr,
-                        "ds4: gpu chunked prefill pos=%u tokens=%u layer %u encode=%.3f ms execute=%.3f ms\n",
-                        pos0,
-                        chunk,
-                        il,
-                        (t_encoded - t_layer0) * 1000.0,
-                        (t_done - t_encoded) * 1000.0);
-            }
-            if (show_progress) {
-                fprintf(stderr,
-                        "ds4: gpu prefill token %u/%u layer %u/%u\r",
-                        pos0 + chunk,
-                        (uint32_t)prompt->len,
-                        il + 1,
-                        (uint32_t)DS4_N_LAYER);
-                fflush(stderr);
-            }
-        }
+        const uint32_t chunk_end = pos0 + chunk;
+        float *chunk_logits = (progress || chunk_end == end) ? logits : NULL;
+        bool ok = metal_graph_prefill_layer_major(g,
+                                                  model,
+                                                  weights,
+                                                  prompt,
+                                                  pos0,
+                                                  chunk,
+                                                  chunk_logits,
+                                                  show_progress,
+                                                  imatrix);
         if (!ok) {
             if (ds4_gpu_synchronize() == 0) {
                 fprintf(stderr, "ds4: Metal synchronize after chunked prefill failure also failed\n");
             }
             return false;
         }
-        if (progress && !metal_graph_prefill_batch_row_logits(g, model, weights,
-                                                              chunk - 1u,
-                                                              logits))
-        {
-            return false;
-        }
         if (progress) {
-            progress(progress_ud, "prefill_chunk", (int)(pos0 + chunk), prompt->len);
+            progress(progress_ud, "prefill_chunk", (int)chunk_end, prompt->len);
         }
-        pos0 += chunk;
+        pos0 = chunk_end;
     }
     if (show_progress) fputc('\n', stderr);
-    if (last_chunk_tokens == 0) return false;
-
-    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    ds4_gpu_tensor *last_hc = metal_graph_tensor_row_view(g->batch_cur_hc,
-                                                            last_chunk_tokens - 1u,
-                                                            hc_dim);
-    if (!last_hc) return false;
-    ds4_gpu_tensor *saved_cur = g->cur_hc;
-    g->cur_hc = last_hc;
-
-    const double t_head0 = profile ? now_sec() : 0.0;
-    bool ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
-    const double t_head_encoded = profile ? now_sec() : 0.0;
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    const double t_head_done = profile ? now_sec() : 0.0;
-    g->cur_hc = saved_cur;
-    ds4_gpu_tensor_free(last_hc);
-    if (!ok) return false;
-
-    const double t_before_read = profile ? now_sec() : 0.0;
-    if (logits) {
-        ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
-    }
     if (profile) {
         const double t_read = now_sec();
-        encode_s += t_head_encoded - t_head0;
-        execute_s += t_head_done - t_head_encoded;
         fprintf(stderr,
-                "ds4: gpu chunked prefill start=%u tokens=%u chunk=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms\n",
+                "ds4: gpu chunked prefill start=%u tokens=%u chunk=%u total=%.3f ms\n",
                 start,
                 n_tokens,
                 chunk_cap,
-                encode_s * 1000.0,
-                execute_s * 1000.0,
-                (t_read - t_before_read) * 1000.0,
                 (t_read - t0) * 1000.0);
     }
-    return ok;
+    return true;
 }
 
 /* Long prompts are prefetched in fixed-size chunks.  Chunks bound transient
@@ -14110,7 +14092,7 @@ static uint32_t metal_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_c
 }
 
 /* Choose the prefill ubatch size.  Whole-batch is fastest for normal prompts;
- * long prompts default to 2048-token chunks. */
+ * long prompts default to 4096-token chunks. */
 static uint32_t metal_graph_prefill_cap_for_prompt(int prompt_len) {
     return ds4_default_prefill_cap_for_prompt(prompt_len);
 }
@@ -17024,7 +17006,8 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                                                            &collector);
                 } else {
                     ok = metal_graph_prefill_layer_major(&g, model, weights,
-                                                         &prompt, prompt.len,
+                                                         &prompt, 0,
+                                                         (uint32_t)prompt.len,
                                                          NULL, false,
                                                          &collector);
                 }
