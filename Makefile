@@ -1,11 +1,22 @@
 CC ?= cc
-CFLAGS ?= -O3 -ffast-math -mcpu=native -Wall -Wextra -std=c99
-OBJCFLAGS ?= -O3 -ffast-math -mcpu=native -Wall -Wextra -fobjc-arc
+UNAME_S := $(shell uname -s)
+
+ifeq ($(UNAME_S),Darwin)
+NATIVE_CPU_FLAG ?= -mcpu=native
+else
+NATIVE_CPU_FLAG ?= -march=native
+endif
+
+CFLAGS ?= -O3 -ffast-math $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
+OBJCFLAGS ?= -O3 -ffast-math $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc
 
 LDLIBS ?= -lm -pthread
-UNAME_S := $(shell uname -s)
 NATIVE_LDLIBS := $(LDLIBS)
 METAL_SRCS := $(wildcard metal/*.metal)
+
+ifeq ($(UNAME_S),Linux)
+CFLAGS += -D_GNU_SOURCE
+endif
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal

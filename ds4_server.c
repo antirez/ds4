@@ -8040,6 +8040,13 @@ int main(int argc, char **argv) {
 
     server_config cfg = parse_options(argc, argv);
 
+#ifdef DS4_NO_METAL
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: this build has no Metal support; server mode is unavailable");
+    (void)cfg;
+    return 1;
+#endif
+
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
 
