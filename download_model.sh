@@ -2,8 +2,10 @@
 set -e
 
 REPO="antirez/deepseek-v4-gguf"
+Q1_REPO="adis-b/ds4-64gb-gguf"
 Q2_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf"
 Q4_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf"
+Q1_FILE="DeepSeek-V4-Flash-IQ1S-routed-experts.gguf"
 MTP_FILE="DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -19,11 +21,17 @@ usage() {
 DeepSeek V4 Flash GGUF downloader
 
 Usage:
+  ./download_model.sh q1 [--token TOKEN]
   ./download_model.sh q2 [--token TOKEN]
   ./download_model.sh q4 [--token TOKEN]
   ./download_model.sh mtp [--token TOKEN]
 
 Targets:
+  q1   IQ1_S routed experts (gate, up, down), about 63 GB on disk.
+       Experimental 64 GB-target build. The hosted file may not exist
+       yet; see the "64 GB Target" section in README.md to build it
+       locally from the q2 GGUF using llama.cpp.
+
   q2   2-bit routed experts, about 81 GB on disk.
        Main model for 128 GB RAM machines.
 
@@ -63,9 +71,10 @@ MODEL=$1
 shift
 
 case "$MODEL" in
-    q2) MODEL_FILE=$Q2_FILE ;;
-    q4) MODEL_FILE=$Q4_FILE ;;
-    mtp) MODEL_FILE=$MTP_FILE ;;
+    q1) MODEL_FILE=$Q1_FILE; SRC_REPO=$Q1_REPO ;;
+    q2) MODEL_FILE=$Q2_FILE; SRC_REPO=$REPO ;;
+    q4) MODEL_FILE=$Q4_FILE; SRC_REPO=$REPO ;;
+    mtp) MODEL_FILE=$MTP_FILE; SRC_REPO=$REPO ;;
     -h|--help|help)
         usage
         exit 0
@@ -102,10 +111,11 @@ fi
 
 download_one() {
     file=$1
+    repo=$2
     out="$OUT_DIR/$file"
     part="$out.part"
     aria2_part="$out.aria2"
-    url="https://huggingface.co/$REPO/resolve/main/$file"
+    url="https://huggingface.co/$repo/resolve/main/$file"
 
     mkdir -p "$OUT_DIR"
 
@@ -121,7 +131,7 @@ download_one() {
     fi
 
     echo "Downloading $file"
-    echo "from https://huggingface.co/$REPO"
+    echo "from https://huggingface.co/$repo"
 
     if [ -n "$TOKEN" ]; then
         curl -fL --progress-meter -C - -H "Authorization: Bearer $TOKEN" -o "$part" "$url"
@@ -132,7 +142,7 @@ download_one() {
     mv "$part" "$out"
 }
 
-download_one "$MODEL_FILE"
+download_one "$MODEL_FILE" "$SRC_REPO"
 
 if [ "$MODEL" = "mtp" ]; then
     echo

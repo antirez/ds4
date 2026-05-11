@@ -28,9 +28,17 @@ CPU_CORE_OBJS = ds4_cpu.o
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all clean test cpu
+.PHONY: all clean test cpu metal-smoke
 
 all: ds4 ds4-server ds4-bench
+
+ifeq ($(UNAME_S),Darwin)
+metal-smoke: tools/metal_smoke.o ds4.o ds4_metal.o
+	$(CC) $(CFLAGS) -o $@ tools/metal_smoke.o ds4.o ds4_metal.o $(METAL_LDLIBS)
+
+tools/metal_smoke.o: tools/metal_smoke.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tools/metal_smoke.c
+endif
 
 ifeq ($(UNAME_S),Darwin)
 ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
@@ -112,4 +120,4 @@ test: ds4_test
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4_cpu ds4_native ds4_server_test ds4_test *.o
+	rm -f ds4 ds4-server ds4_cpu ds4_native ds4_server_test ds4_test metal-smoke *.o tools/*.o
