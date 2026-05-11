@@ -132,6 +132,10 @@ static id<MTLBuffer> g_moe_id_map_buffer;
 static id<MTLBuffer> g_attn_out_group_ids_buffer;
 static const void *g_model_map_ptr;
 static uint64_t g_model_map_size;
+
+/* Low-memory streaming buffers for layer-sequential weight loading */
+static id<MTLBuffer> g_stream_buf[4];
+static void *g_stream_mem[4];
 static uint64_t g_model_mapped_offset;
 static uint64_t g_model_mapped_size;
 static uint64_t g_tensor_alloc_live_bytes;
@@ -3940,6 +3944,101 @@ int ds4_metal_synchronize(void) {
     return ds4_metal_finish_command_buffer(cb, 1, "synchronize");
 }
 
+/* Low-memory streaming buffer allocation for layer-sequential weight loading */
+int ds4_metal_stream_buf_alloc(void) {
+    if (!g_device) return 1;  /* Metal not initialized */
+
+    @autoreleasepool {
+        /* Allocate buffers 0, 1 (expert streaming) with DS4_STREAM_BUF_BYTES size */
+        for (int i = 0; i < 2; i++) {
+            int ret = posix_memalign(&g_stream_mem[i], 16384, DS4_STREAM_BUF_BYTES);
+            if (ret != 0) {
+                fprintf(stderr, "ds4: posix_memalign failed for stream buffer %d: %s\n",
+                        i, strerror(ret));
+                return 1;
+            }
+
+            g_stream_buf[i] = [g_device newBufferWithBytesNoCopy:g_stream_mem[i]
+                                                           length:DS4_STREAM_BUF_BYTES
+                                                          options:MTLResourceStorageModeShared
+                                                       deallocator:nil];
+            if (!g_stream_buf[i]) {
+                fprintf(stderr, "ds4: failed to create MTLBuffer for stream buffer %d\n", i);
+                return 1;
+            }
+
+            /* Register stream buffer as a Metal model view so Metal kernels can look it up */
+            ds4_metal_set_model_map_range(g_stream_mem[i], DS4_STREAM_BUF_BYTES, 0, DS4_STREAM_BUF_BYTES);
+        }
+
+        /* Allocate buffer 2 (attention weights) with DS4_STREAM_BUF_BYTES size */
+        int ret = posix_memalign(&g_stream_mem[2], 16384, DS4_STREAM_BUF_BYTES);
+        if (ret != 0) {
+            fprintf(stderr, "ds4: posix_memalign failed for stream buffer 2: %s\n", strerror(ret));
+            return 1;
+        }
+        g_stream_buf[2] = [g_device newBufferWithBytesNoCopy:g_stream_mem[2]
+                                                       length:DS4_STREAM_BUF_BYTES
+                                                      options:MTLResourceStorageModeShared
+                                                   deallocator:nil];
+        if (!g_stream_buf[2]) {
+            fprintf(stderr, "ds4: failed to create MTLBuffer for stream buffer 2\n");
+            return 1;
+        }
+        ds4_metal_set_model_map_range(g_stream_mem[2], DS4_STREAM_BUF_BYTES, 0, DS4_STREAM_BUF_BYTES);
+
+        /* Allocate buffer 3 (lm_head) with DS4_LMHEAD_BUF_BYTES size */
+        ret = posix_memalign(&g_stream_mem[3], 16384, DS4_LMHEAD_BUF_BYTES);
+        if (ret != 0) {
+            fprintf(stderr, "ds4: posix_memalign failed for stream buffer 3: %s\n", strerror(ret));
+            return 1;
+        }
+        g_stream_buf[3] = [g_device newBufferWithBytesNoCopy:g_stream_mem[3]
+                                                       length:DS4_LMHEAD_BUF_BYTES
+                                                      options:MTLResourceStorageModeShared
+                                                   deallocator:nil];
+        if (!g_stream_buf[3]) {
+            fprintf(stderr, "ds4: failed to create MTLBuffer for stream buffer 3\n");
+            return 1;
+        }
+        ds4_metal_set_model_map_range(g_stream_mem[3], DS4_LMHEAD_BUF_BYTES, 0, DS4_LMHEAD_BUF_BYTES);
+    }
+    return 0;
+}
+
+void *ds4_metal_stream_mem(int buf_idx) {
+    if (buf_idx < 0 || buf_idx >= 4) return NULL;
+    return g_stream_mem[buf_idx];
+}
+
+void ds4_metal_stream_fill(int buf_idx, const void *src, size_t offset, size_t n) {
+    if (buf_idx < 0 || buf_idx >= 4 || !g_stream_mem[buf_idx] || !src) return;
+    size_t capacity = (buf_idx == DS4_LMHEAD_BUF_IDX) ? DS4_LMHEAD_BUF_BYTES : DS4_STREAM_BUF_BYTES;
+    if (offset + n > capacity) {
+        fprintf(stderr, "ds4: stream buffer overflow: buf_idx=%d, offset=%zu, n=%zu, capacity=%zu\n",
+                buf_idx, offset, n, capacity);
+        return;
+    }
+    memcpy((char *)g_stream_mem[buf_idx] + offset, src, n);
+}
+
+/* Get MTLBuffer from stream buffer, setting inner_offset for indexing */
+static id<MTLBuffer> ds4_metal_wrap_stream_range(
+        int     buf_idx,
+        uint64_t offset,
+        uint64_t len,
+        uint64_t *inner_offset) {
+    if (buf_idx < 0 || buf_idx >= 4 || !g_stream_buf[buf_idx]) return nil;
+    uint64_t capacity = (buf_idx == DS4_LMHEAD_BUF_IDX) ? DS4_LMHEAD_BUF_BYTES : DS4_STREAM_BUF_BYTES;
+    if (len > capacity || offset > capacity - len) {
+        fprintf(stderr, "ds4: stream buffer range out of bounds: buf_idx=%d, offset=%llu, len=%llu, capacity=%llu\n",
+                buf_idx, offset, len, capacity);
+        return nil;
+    }
+    *inner_offset = offset;
+    return g_stream_buf[buf_idx];
+}
+
 void ds4_metal_cleanup(void) {
     if (!g_initialized) return;
 
@@ -4042,6 +4141,13 @@ void ds4_metal_cleanup(void) {
         g_moe_id_map_buffer = nil;
         g_attn_out_group_ids_buffer = nil;
         g_model_map_ptr = NULL;
+        for (int i = 0; i < 4; i++) {
+            g_stream_buf[i] = nil;
+            if (g_stream_mem[i]) {
+                free(g_stream_mem[i]);
+                g_stream_mem[i] = NULL;
+            }
+        }
         g_model_map_size = 0;
         g_model_mapped_offset = 0;
         g_model_mapped_size = 0;

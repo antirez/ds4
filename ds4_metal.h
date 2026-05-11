@@ -39,6 +39,15 @@ int ds4_metal_set_model_map_range(const void *model_map, uint64_t model_size, ui
 void ds4_metal_set_quality(bool quality);
 void ds4_metal_print_memory_report(const char *label);
 
+/* Low-memory streaming buffer pool for weight loading from disk */
+#define DS4_STREAM_BUF_BYTES (210 * 1024 * 1024)
+#define DS4_ATTN_BUF_IDX 2
+#define DS4_LMHEAD_BUF_IDX 3
+#define DS4_LMHEAD_BUF_BYTES (600 * 1024 * 1024)
+int ds4_metal_stream_buf_alloc(void);
+void *ds4_metal_stream_mem(int buf_idx);
+void ds4_metal_stream_fill(int buf_idx, const void *src, size_t offset, size_t n);
+
 /* =========================================================================
  * Embeddings and Indexer Helpers.
  * =========================================================================

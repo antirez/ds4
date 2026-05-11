@@ -1,3 +1,4 @@
+#define _XOPEN_SOURCE 600
 #include "ds4.h"
 #include "linenoise.h"
 
@@ -99,6 +100,8 @@ static void usage(FILE *fp) {
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before generation. Slower startup, fewer first-use stalls.\n"
+        "  --low-mem\n"
+        "      Stream weights from disk for 8GB RAM operation. Expect ~2-3 s/token. Requires NVMe.\n"
         "\n"
         "Prompt and generation:\n"
         "  -p, --prompt TEXT\n"
@@ -1251,6 +1254,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.inspect = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
+        } else if (!strcmp(arg, "--low-mem")) {
+            c.engine.low_mem = true;
         } else if (!strcmp(arg, "--server")) {
             fprintf(stderr, "ds4: use ds4-server for the HTTP server\n");
             exit(2);

@@ -63,6 +63,7 @@ typedef struct {
     float mtp_margin;
     bool warm_weights;
     bool quality;
+    bool low_mem;  /* enable low-memory streaming mode for 8GB RAM operation */
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);

@@ -1,3 +1,4 @@
+#define _XOPEN_SOURCE 600
 #include "ds4.h"
 #include "rax.h"
 
@@ -7417,6 +7418,8 @@ static void usage(FILE *fp) {
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before serving. Slower startup, fewer first-use stalls.\n"
+        "  --low-mem\n"
+        "      Stream weights from disk for 8GB RAM operation. Expect ~2-3 s/token. Requires NVMe.\n"
         "\n"
         "HTTP API:\n"
         "  --host HOST\n"
@@ -7539,6 +7542,8 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
+        } else if (!strcmp(arg, "--low-mem")) {
+            c.engine.low_mem = true;
         } else if (!strcmp(arg, "--cpu") || !strcmp(arg, "--backend")) {
             server_log(DS4_LOG_DEFAULT, "ds4-server: server mode is Metal-only");
             exit(2);
