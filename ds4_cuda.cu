@@ -1,7 +1,17 @@
+#ifdef __HIP_PLATFORM_AMD__
+#include "ds4_rocm.h"
+
+#define FULL_WARP_MASK 0xFFFFFFFFFFFFFFFFULL
+#define MASK_T uint64_t
+#else
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <cublas_v2.h>
+
+#define FULL_WARP_MASK 0xFFFFFFFFu
+#define MASK_T uint32_t
+#endif
 
 #include <stdint.h>
 #include <errno.h>
@@ -1722,14 +1732,14 @@ __global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n
 
 __device__ static float warp_sum_f32(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(0xffffffffu, v, offset);
+        v += __shfl_down_sync(FULL_WARP_MASK, v, offset);
     }
     return v;
 }
 
 __device__ static float warp_max_f32(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
-        v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, offset));
+        v = fmaxf(v, __shfl_down_sync(FULL_WARP_MASK, v, offset));
     }
     return v;
 }
@@ -2846,7 +2856,7 @@ __global__ static void attention_decode_mixed_kernel(
                     for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
                     const uint32_t mask = 0xffu << (threadIdx.x & 24u);
                     for (uint32_t off = 4u; off > 0u; off >>= 1u) {
-                        dot += __shfl_down_sync(mask, dot, off, 8);
+                        dot += __shfl_down_sync(static_cast<MASK_T>(mask), dot, off, 8);
                     }
                     s = dot * scale + add;
                 }
@@ -3008,7 +3018,7 @@ __global__ static void attention_indexed_mixed_kernel(
                 for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
                 const uint32_t mask = 0xffu << (threadIdx.x & 24u);
                 for (uint32_t off = 4u; off > 0u; off >>= 1u) {
-                    dot += __shfl_down_sync(mask, dot, off, 8);
+                    dot += __shfl_down_sync(static_cast<MASK_T>(mask), dot, off, 8);
                 }
                 if (qlane == 0) scores[row] = dot * scale;
             }
@@ -3189,7 +3199,7 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
         const float *score_row = scores + warp * 768u;
         for (uint32_t i = lane; i < n_score; i += 32u) max_s = fmaxf(max_s, score_row[i]);
         max_s = warp_max_f32(max_s);
-        max_s = __shfl_sync(0xffffffffu, max_s, 0);
+        max_s = __shfl_sync(FULL_WARP_MASK, max_s, 0);
     }
     float den = 0.0f;
     if (valid_head) {
@@ -3201,7 +3211,7 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
         }
         den = warp_sum_f32(den);
         den += expf(sinks[head] - max_s);
-        den = __shfl_sync(0xffffffffu, den, 0);
+        den = __shfl_sync(FULL_WARP_MASK, den, 0);
     }
 
     float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -3361,7 +3371,7 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
                               dot4_f32(q2, k2) +
                               dot4_f32(q3, k3);
                 score = warp_sum_f32(score) * scale;
-                score = __shfl_sync(0xffffffffu, score, 0);
+                score = __shfl_sync(FULL_WARP_MASK, score, 0);
 
                 const float new_m = fmaxf(max_s, score);
                 const float old_scale = expf(max_s - new_m);
@@ -3485,7 +3495,7 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
                               dot4_f32(q2, k2) +
                               dot4_f32(q3, k3);
                 score = warp_sum_f32(score) * scale;
-                score = __shfl_sync(0xffffffffu, score, 0);
+                score = __shfl_sync(FULL_WARP_MASK, score, 0);
 
                 const float new_m = fmaxf(max_s, score);
                 const float old_scale = expf(max_s - new_m);
@@ -3650,7 +3660,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
                               dot4_f32(q2, k2) +
                               dot4_f32(q3, k3);
                 score = warp_sum_f32(score) * scale;
-                score = __shfl_sync(0xffffffffu, score, 0);
+                score = __shfl_sync(FULL_WARP_MASK, score, 0);
 
                 const float new_m = fmaxf(max_s, score);
                 const float old_scale = expf(max_s - new_m);
@@ -4268,9 +4278,9 @@ __global__ static void router_select_warp_topk_kernel(
         }
         #pragma unroll
         for (uint32_t mask = 16u; mask > 0u; mask >>= 1u) {
-            const float other_score = __shfl_xor_sync(0xffffffffu, best_score, mask);
-            const float other_prob = __shfl_xor_sync(0xffffffffu, best_prob, mask);
-            const uint32_t other_idx = __shfl_xor_sync(0xffffffffu, best_idx, mask);
+            const float other_score = __shfl_xor_sync(FULL_WARP_MASK, best_score, mask);
+            const float other_prob = __shfl_xor_sync(FULL_WARP_MASK, best_prob, mask);
+            const uint32_t other_idx = __shfl_xor_sync(FULL_WARP_MASK, best_idx, mask);
             if (router_score_better(other_score, other_idx, best_score, best_idx)) {
                 best_score = other_score;
                 best_prob = other_prob;
@@ -5198,7 +5208,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                                              out->ptr,
                                              CUDA_R_32F,
                                              (int)out_dim,
-                                             CUDA_R_32F,
+                                             CUBLAS_COMPUTE_32F,
                                              CUBLAS_GEMM_DEFAULT);
             if (st == CUBLAS_STATUS_SUCCESS) return 1;
             fprintf(stderr, "ds4: cuBLAS q8 f16 matmul failed: status %d\n", (int)st);
@@ -5440,7 +5450,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
                                          out->ptr,
                                          CUDA_R_32F,
                                          (int)out_dim,
-                                         CUDA_R_32F,
+                                         CUBLAS_COMPUTE_32F,
                                          CUBLAS_GEMM_DEFAULT);
         return cublas_ok(st, "f16 matmul");
     }
@@ -6733,7 +6743,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                                                        (int)rank,
                                                        (long long)rank * n_tokens,
                                                        (int)n_groups,
-                                                       CUDA_R_32F,
+                                                       CUBLAS_COMPUTE_32F,
                                                        CUBLAS_GEMM_DEFAULT);
         if (!cublas_ok(st, "attention output a gemm")) return 0;
         attention_unpack_group_low_kernel<<<(low_tmp_count + 255) / 256, 256>>>(
@@ -7395,7 +7405,7 @@ __device__ static void dev_dot_q2_K_q8_K_block8(
 __device__ static float half_warp_sum_f32(float v, uint32_t lane16) {
     uint32_t mask = 0xffffu << (threadIdx.x & 16u);
     for (int offset = 8; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(mask, v, offset, 16);
+        v += __shfl_down_sync(static_cast<MASK_T>(mask), v, offset, 16);
     }
     (void)lane16;
     return v;
@@ -7404,7 +7414,7 @@ __device__ static float half_warp_sum_f32(float v, uint32_t lane16) {
 __device__ static float quarter_warp_sum_f32(float v, uint32_t lane8) {
     uint32_t mask = 0xffu << (threadIdx.x & 24u);
     for (int offset = 4; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(mask, v, offset, 8);
+        v += __shfl_down_sync(static_cast<MASK_T>(mask), v, offset, 8);
     }
     (void)lane8;
     return v;
