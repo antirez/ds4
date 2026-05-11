@@ -18,7 +18,23 @@ METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 CORE_OBJS = ds4.o ds4_metal.o
 CPU_CORE_OBJS = ds4_cpu.o
 else
+
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
+
+ifeq ($(GPU_BACKEND),rocm)
+ROCM_PATH ?= /opt/rocm
+GPU_CC = $(ROCM_PATH)/bin/hipcc
+ROCM_ARCH ?= gfx1151
+
+GPU_CFLAGS ?= -O3 -ffast-math -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
+GPU_LDLIBS = -lm -pthread -L$(ROCM_PATH)/lib -lhipblas
+
+@echo "ROCM_ARCH: $(ROCM_ARCH)"
+
+EXTRA_DEPS = ds4_rocm.h
+
+else
+
 CUDA_HOME ?= /usr/local/cuda
 NVCC ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?=
@@ -27,9 +43,18 @@ NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
+
+GPU_CC = $(NVCC)
+GPU_CFLAGS = $(NVCCFLAGS)
+GPU_LDLIBS = $(CUDA_LDLIBS)
+
+endif
+
 CORE_OBJS = ds4.o ds4_cuda.o
+EXTRA_DEPS =
 CPU_CORE_OBJS = ds4_cpu.o
 METAL_LDLIBS := $(LDLIBS)
+
 endif
 
 .PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression
@@ -69,6 +94,7 @@ help:
 	@echo "  make cuda-generic        Build CUDA for a generic local CUDA GPU"
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, and ./ds4-bench"
+	@echo "  make rocm                Build ROCm"
 	@echo "  make test                Build and run tests"
 	@echo "  make clean               Remove build outputs"
 
@@ -86,14 +112,22 @@ cuda:
 	fi
 	$(MAKE) ds4 ds4-server ds4-bench CUDA_ARCH="$(CUDA_ARCH)"
 
+rocm:
+	@if [ -z "$(strip $(ROCM_ARCH))" ]; then \
+		echo "error: specify ROCM_ARCH, for example: make rocm ROCM_ARCH=gfx1151"; \
+		exit 2; \
+	fi
+	$(MAKE) ds4 ds4-server ds4-bench ds4_test GPU_BACKEND=rocm ROCM_ARCH=$(ROCM_ARCH)
+
+
 ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+	$(GPU_CC) $(GPU_CFLAGS) -o $@ $^ $(GPU_LDLIBS)
 
 ds4-server: ds4_server.o rax.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+	$(GPU_CC) $(GPU_CFLAGS) -o $@ $^ $(GPU_LDLIBS)
 
 ds4-bench: ds4_bench.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+	$(GPU_CC) $(GPU_CFLAGS) -o $@ $^ $(GPU_LDLIBS)
 
 cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o linenoise.o rax.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
@@ -143,17 +177,17 @@ ds4_bench_cpu.o: ds4_bench.c ds4.h
 ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc
-	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
+ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc $(EXTRA_DEPS)
+	$(GPU_CC) $(GPU_CFLAGS) -c -o $@ ds4_cuda.cu
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+	$(GPU_CC) $(GPU_CFLAGS) -o $@ $^ $(GPU_LDLIBS)
 
 ds4_test: ds4_test.o rax.o $(CORE_OBJS)
 ifeq ($(UNAME_S),Darwin)
 	$(CC) $(CFLAGS) -o $@ ds4_test.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
 else
-	$(NVCC) $(NVCCFLAGS) -o $@ ds4_test.o rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
+	$(GPU_CC) $(GPU_CFLAGS) -o $@ ds4_test.o rax.o $(CORE_OBJS) $(GPU_LDLIBS)
 endif
 
 test: ds4_test
@@ -161,3 +195,4 @@ test: ds4_test
 
 clean:
 	rm -f ds4 ds4-server ds4-bench ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+
