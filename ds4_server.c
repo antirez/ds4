@@ -3087,6 +3087,9 @@ static bool http_response(int fd, int code, const char *type, const char *body) 
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %zu\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        "Access-Control-Allow-Headers: *\r\n"
         "Connection: close\r\n\r\n",
         code, reason, type, strlen(body));
     bool ok = send_all(fd, h.ptr, h.len) && send_all(fd, body, strlen(body));
@@ -3112,6 +3115,9 @@ static bool sse_headers(int fd) {
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/event-stream\r\n"
         "Cache-Control: no-cache\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        "Access-Control-Allow-Headers: *\r\n"
         "Connection: close\r\n\r\n";
     return send_all(fd, h, strlen(h));
 }
@@ -7671,6 +7677,12 @@ static void *client_main(void *arg) {
     http_request hr = {0};
     if (!read_http_request(fd, &hr)) {
         http_error(fd, 400, "bad HTTP request");
+        goto done;
+    }
+
+    if (!strcmp(hr.method, "OPTIONS")) {
+        http_response(fd, 200, "text/plain", "");
+        http_request_free(&hr);
         goto done;
     }
 
