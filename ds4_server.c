@@ -7795,6 +7795,7 @@ typedef struct {
     bool kv_cache_reject_different_quant;
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
+    const char *quant; /* --quant q2|q4, NULL if unspecified */
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -7870,7 +7871,14 @@ static void usage(FILE *fp) {
         "\n"
         "Model and runtime:\n"
         "  -m, --model FILE\n"
-        "      GGUF model path. Default: ds4flash.gguf\n"
+        "      GGUF model path. Wins over --quant. Default: auto-detect Q2 or Q4\n"
+        "      in ./gguf/, preferring Q2 if both are present; fall back to\n"
+        "      ds4flash.gguf when neither is found.\n"
+        "  --quant Q\n"
+        "      Pick the canonical Q2 or Q4 file in ./gguf/ by name. Use 'q2'\n"
+        "      for the 128 GB-friendly 86 GB model; use 'q4' only if you have\n"
+        "      >=256 GB or are running pipeline-parallel with --rpc-peer.\n"
+        "      Ignored when -m is also given.\n"
         "  --mtp FILE\n"
         "      Optional MTP support GGUF used for draft-token probes.\n"
         "  --mtp-draft N\n"
@@ -7947,7 +7955,7 @@ static void usage(FILE *fp) {
 static server_config parse_options(int argc, char **argv) {
     server_config c = {
         .engine = {
-            .model_path = "ds4flash.gguf",
+            .model_path = NULL, /* resolved after parsing via ds4_resolve_model_path */
             .backend = DS4_BACKEND_METAL,
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
@@ -7967,6 +7975,8 @@ static server_config parse_options(int argc, char **argv) {
             exit(0);
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--quant")) {
+            c.quant = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
@@ -8009,6 +8019,37 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
+        } else if (!strcmp(arg, "--rpc-peer")) {
+            /* Pipeline-parallel: ship the second half of layers to a tail
+             * worker reachable at host:port (default port 46434).  Use with
+             * --rpc-split to set the boundary. */
+            if (++i >= argc) {
+                server_log(DS4_LOG_DEFAULT, "ds4-server: --rpc-peer needs a value");
+                exit(2);
+            }
+            const char *spec = argv[i];
+            const char *colon = strrchr(spec, ':');
+            if (colon && colon != spec) {
+                size_t host_len = (size_t)(colon - spec);
+                char *host = (char *)malloc(host_len + 1);
+                if (!host) {
+                    server_log(DS4_LOG_DEFAULT, "ds4-server: oom parsing --rpc-peer");
+                    exit(2);
+                }
+                memcpy(host, spec, host_len);
+                host[host_len] = '\0';
+                c.engine.rpc_peer_host = host;
+                c.engine.rpc_peer_port = (int)strtol(colon + 1, NULL, 10);
+            } else {
+                c.engine.rpc_peer_host = spec;
+                c.engine.rpc_peer_port = 46434;
+            }
+        } else if (!strcmp(arg, "--rpc-split")) {
+            if (++i >= argc) {
+                server_log(DS4_LOG_DEFAULT, "ds4-server: --rpc-split needs a value");
+                exit(2);
+            }
+            c.engine.n_layer_end = parse_int_arg(argv[i], arg);
         } else if (!strcmp(arg, "--cpu") || !strcmp(arg, "--backend")) {
             server_log(DS4_LOG_DEFAULT, "ds4-server: server mode is Metal-only");
             exit(2);
@@ -8025,6 +8066,25 @@ static server_config parse_options(int argc, char **argv) {
                    "ds4-server: --kv-cache-cold-max-tokens must be 0 or >= --kv-cache-min-tokens");
         exit(2);
     }
+
+    /* Final model-path resolution.  Priority: -m wins, then --quant, then
+     * filesystem probe of the canonical Q2/Q4 paths (preferring Q2), then
+     * the historical ds4flash.gguf symlink fallback.  On a 128 GB Mac Q4 is
+     * too big to load on its own and can kernel-panic macOS, so the probe
+     * defaults to Q2 when both files are present. */
+    {
+        char resolve_err[256] = {0};
+        const char *resolved = ds4_resolve_model_path(c.engine.model_path,
+                                                      c.quant,
+                                                      resolve_err, sizeof(resolve_err));
+        if (!resolved) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: %s", resolve_err);
+            exit(2);
+        }
+        if (resolve_err[0]) server_log(DS4_LOG_DEFAULT, "ds4-server: %s", resolve_err);
+        c.engine.model_path = resolved;
+    }
+
     return c;
 }
 

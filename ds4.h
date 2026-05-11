@@ -63,6 +63,23 @@ typedef struct {
     float mtp_margin;
     bool warm_weights;
     bool quality;
+    /* Pipeline-parallel layer range.  Defaults (0, 0) select the full model
+     * [0, DS4_N_LAYER): n_layer_end <= 0 normalizes to DS4_N_LAYER.  Partition
+     * the model across a head process (e.g. [0, 22)) and a tail RPC worker
+     * (e.g. [22, 43)) by setting these.  Single-host operation uses the
+     * default and remains bit-identical to pre-RPC behavior. */
+    int n_layer_start;
+    int n_layer_end;
+
+    /* Optional RPC peer.  When rpc_peer_host is set, the engine acts as the
+     * head: after this engine's local slice runs (layers [n_layer_start,
+     * n_layer_end)), the residual is shipped to the configured peer over
+     * TCP, and the peer's logits reply replaces local sampling input.  The
+     * peer must run ds4-rpc-worker with --layer-start equal to n_layer_end
+     * and --layer-end DS4_N_LAYER.  Unused on the worker side.  When unset
+     * the engine is fully self-sufficient. */
+    const char *rpc_peer_host;
+    int         rpc_peer_port;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
@@ -169,5 +186,50 @@ const ds4_tokens *ds4_session_tokens(ds4_session *s);
 uint64_t ds4_session_payload_bytes(ds4_session *s);
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen);
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
+
+/* Pipeline-parallel residual stream transfer (the cur_hc tensor: hyper-
+ * connection slots times embedding width, in floats).  The returned size is
+ * model-fixed.  Export reads the residual that comes out of this engine's
+ * last owned layer; import installs an incoming residual ahead of the next
+ * forward pass.  Both are no-ops for engines that own the full layer range,
+ * but the API works in all cases so single-host and pipeline code paths can
+ * share call sites.  Metal backend only; CPU returns an error string. */
+uint64_t ds4_residual_hc_floats(void);
+int ds4_session_export_residual_hc(ds4_session *s, float *out, uint64_t n_floats,
+                                   char *err, size_t errlen);
+int ds4_session_import_residual_hc(ds4_session *s, const float *in, uint64_t n_floats,
+                                   char *err, size_t errlen);
+
+/* Shape accessors so the RPC transport and worker don't have to duplicate
+ * DS4_N_* compile-time constants in their own code.  All four values are
+ * model-fixed today; if a future DS4 variant changes them they will become
+ * engine-derived and these accessors will keep callers stable. */
+uint32_t ds4_model_n_layer(void);
+uint32_t ds4_model_n_embd(void);
+uint32_t ds4_model_n_hc(void);
+uint32_t ds4_model_n_vocab(void);
+
+/* Resolve the GGUF model path for a CLI/server launch.  Priority:
+ *   1. If explicit_path is non-NULL/non-empty, return it unchanged.
+ *   2. Else if quant ("q2" or "q4") is non-NULL, return the canonical
+ *      path for that quant.  If the file is missing, fail.
+ *   3. Else probe ./gguf/ for the canonical Q2 and Q4 files.  If both
+ *      are present, prefer Q2 (the smaller / safer-for-128GB default).
+ *      If only one is present, return it.  If neither, return
+ *      "ds4flash.gguf" so the historical symlink mechanism still works.
+ *
+ * Returned pointer is either the caller's explicit_path or static
+ * storage; do not free.  Returns NULL on error with a human-readable
+ * reason in err. */
+const char *ds4_resolve_model_path(const char *explicit_path,
+                                   const char *quant,
+                                   char *err, size_t errlen);
+
+/* Read-only view of the last logits produced by ds4_session_eval or the
+ * tail of ds4_session_sync.  Length is ds4_model_n_vocab() floats.  Returns
+ * NULL if the session has not yet produced logits.  The RPC worker uses
+ * this to ship a full logit vector back to the head without copying through
+ * top_logprobs. */
+const float *ds4_session_logits(const ds4_session *s);
 
 #endif

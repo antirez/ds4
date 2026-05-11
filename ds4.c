@@ -35,6 +35,7 @@
 #include <unistd.h>
 
 #include "ds4.h"
+#include "ds4_rpc.h"
 
 #ifndef DS4_NO_METAL
 #include "ds4_metal.h"
@@ -105,6 +106,7 @@ enum {
 };
 
 static int g_ds4_lock_fd = -1;
+static int g_ds4_lock_refcount = 0;
 
 #if defined(__GNUC__) || defined(__clang__)
 #define DS4_MAYBE_UNUSED __attribute__((unused))
@@ -1877,6 +1879,12 @@ typedef struct {
 } ds4_layer_weights;
 
 typedef struct {
+    /* Pipeline-parallel layer range owned by this engine instance.  The full
+     * range [0, DS4_N_LAYER) is the single-host default; partial ranges leave
+     * out-of-range layer pointers (and the corresponding global tensors) null.
+     * The head owns token_embd; the tail owns the output_* stack. */
+    uint32_t n_layer_start;
+    uint32_t n_layer_end;
     ds4_tensor *token_embd;
     ds4_tensor *output_hc_base;
     ds4_tensor *output_hc_fn;
@@ -2142,14 +2150,21 @@ static void weights_validate_layout(const ds4_weights *w) {
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t out_low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
 
-    tensor_expect_layout(w->token_embd,      DS4_TENSOR_F16,  2, DS4_N_EMBD, DS4_N_VOCAB, 0);
-    tensor_expect_layout(w->output_hc_base,  DS4_TENSOR_F32,  1, DS4_N_HC, 0, 0);
-    tensor_expect_layout(w->output_hc_fn,    DS4_TENSOR_F16,  2, hc_dim, DS4_N_HC, 0);
-    tensor_expect_layout(w->output_hc_scale, DS4_TENSOR_F32,  1, 1, 0, 0);
-    tensor_expect_layout(w->output_norm,     DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-    tensor_expect_layout(w->output,          DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    /* Globals are validated only on the side of the pipeline that owns them:
+     * token_embd on the head (n_layer_start == 0), the output_* stack on the
+     * tail (n_layer_end == DS4_N_LAYER).  Single-host engines own both. */
+    if (w->n_layer_start == 0) {
+        tensor_expect_layout(w->token_embd,  DS4_TENSOR_F16,  2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    }
+    if (w->n_layer_end == DS4_N_LAYER) {
+        tensor_expect_layout(w->output_hc_base,  DS4_TENSOR_F32,  1, DS4_N_HC, 0, 0);
+        tensor_expect_layout(w->output_hc_fn,    DS4_TENSOR_F16,  2, hc_dim, DS4_N_HC, 0);
+        tensor_expect_layout(w->output_hc_scale, DS4_TENSOR_F32,  1, 1, 0, 0);
+        tensor_expect_layout(w->output_norm,     DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
+        tensor_expect_layout(w->output,          DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    }
 
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    for (uint32_t il = w->n_layer_start; il < w->n_layer_end; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         const uint32_t ratio = ds4_layer_compress_ratio(il);
 
@@ -2429,16 +2444,28 @@ static void config_validate_model(const ds4_model *m) {
 
 /* Bind tensor names once into the fixed DS4 layer layout.  This is the point
  * where stringly GGUF metadata becomes direct model-specific pointers. */
-static void weights_bind(ds4_weights *w, const ds4_model *m) {
+static void weights_bind(ds4_weights *w, const ds4_model *m,
+                         uint32_t n_layer_start, uint32_t n_layer_end) {
     memset(w, 0, sizeof(*w));
-    w->token_embd       = required_tensor(m, "token_embd.weight");
-    w->output_hc_base   = required_tensor(m, "output_hc_base.weight");
-    w->output_hc_fn     = required_tensor(m, "output_hc_fn.weight");
-    w->output_hc_scale  = required_tensor(m, "output_hc_scale.weight");
-    w->output_norm      = required_tensor(m, "output_norm.weight");
-    w->output           = required_tensor(m, "output.weight");
+    w->n_layer_start = n_layer_start;
+    w->n_layer_end   = n_layer_end;
 
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    /* The head owns the input embedding; the tail owns the output projection
+     * stack.  Single-host engines own both because the range covers all
+     * layers.  Skipping unused globals keeps tail workers from requiring the
+     * head's tensors and vice versa. */
+    if (n_layer_start == 0) {
+        w->token_embd   = required_tensor(m, "token_embd.weight");
+    }
+    if (n_layer_end == DS4_N_LAYER) {
+        w->output_hc_base   = required_tensor(m, "output_hc_base.weight");
+        w->output_hc_fn     = required_tensor(m, "output_hc_fn.weight");
+        w->output_hc_scale  = required_tensor(m, "output_hc_scale.weight");
+        w->output_norm      = required_tensor(m, "output_norm.weight");
+        w->output           = required_tensor(m, "output.weight");
+    }
+
+    for (uint32_t il = n_layer_start; il < n_layer_end; il++) {
         ds4_layer_weights *l = &w->layer[il];
         const uint32_t compress_ratio = ds4_layer_compress_ratio(il);
 
@@ -7391,10 +7418,12 @@ static void forward_token_raw_swa_cpu_decode_scratch(
     float *cur = scratch->cur;
     float *next = scratch->next;
 
-    embed_token_f16(model, weights, token, scratch->plain);
-    hc_from_plain_embedding(cur, scratch->plain, DS4_N_EMBD, DS4_N_HC);
+    if (weights->n_layer_start == 0) {
+        embed_token_f16(model, weights, token, scratch->plain);
+        hc_from_plain_embedding(cur, scratch->plain, DS4_N_EMBD, DS4_N_HC);
+    }
 
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    for (uint32_t il = weights->n_layer_start; il < weights->n_layer_end; il++) {
         layer_forward_raw_swa_one(next, model, &weights->layer[il], &cache->layer[il],
                                   cur, il, pos, token, scratch);
         float *tmp = cur;
@@ -7402,7 +7431,7 @@ static void forward_token_raw_swa_cpu_decode_scratch(
         next = tmp;
     }
 
-    if (logits) {
+    if (logits && weights->n_layer_end == DS4_N_LAYER) {
         output_logits_one_decode_scratch(logits, model, weights, cur, scratch);
     }
 }
@@ -7457,15 +7486,19 @@ static void prefill_layer_major_cpu(
         if (v > 0 && v < 4096) ffn_batch = (uint32_t)v;
     }
 
-    for (uint64_t t = 0; t < n_tok; t++) {
-        embed_token_f16(model, weights, prompt->v[t], plain);
-        hc_from_plain_embedding(cur + t * hc_dim, plain, DS4_N_EMBD, DS4_N_HC);
+    if (weights->n_layer_start == 0) {
+        for (uint64_t t = 0; t < n_tok; t++) {
+            embed_token_f16(model, weights, prompt->v[t], plain);
+            hc_from_plain_embedding(cur + t * hc_dim, plain, DS4_N_EMBD, DS4_N_HC);
+        }
     }
 
     free(plain);
 
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        fprintf(stderr, "ds4: prefill layer %u/%u\r", il + 1, (uint32_t)DS4_N_LAYER);
+    const uint32_t n_owned_layers = weights->n_layer_end - weights->n_layer_start;
+    for (uint32_t il = weights->n_layer_start; il < weights->n_layer_end; il++) {
+        fprintf(stderr, "ds4: prefill layer %u/%u\r",
+                il + 1 - weights->n_layer_start, n_owned_layers);
         fflush(stderr);
 
         if (batched_attn) {
@@ -7562,7 +7595,7 @@ static void prefill_layer_major_cpu(
 
     kv_cache_finish_prefill_states(cache, (uint32_t)n_tok);
 
-    if (logits) {
+    if (logits && weights->n_layer_end == DS4_N_LAYER) {
         output_logits_one(logits, model, weights, cur + (n_tok - 1) * hc_dim);
     }
 
@@ -10261,14 +10294,20 @@ static bool metal_graph_encode_token_raw_swa(
     const uint32_t raw_row = pos % g->raw_cap;
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
 
-    bool ok = ds4_metal_embed_token_hc_tensor(g->cur_hc,
-                                              model->map,
-                                              model->size,
-                                              weights->token_embd->abs_offset,
-                                              (uint32_t)weights->token_embd->dim[1],
-                                              (uint32_t)token,
-                                              DS4_N_EMBD,
-                                              DS4_N_HC) != 0;
+    /* Head ownership: only the engine that owns layer 0 embeds the input
+     * token.  Tail/middle engines expect cur_hc to already hold an imported
+     * residual stream from the previous slice. */
+    bool ok = true;
+    if (weights->n_layer_start == 0) {
+        ok = ds4_metal_embed_token_hc_tensor(g->cur_hc,
+                                             model->map,
+                                             model->size,
+                                             weights->token_embd->abs_offset,
+                                             (uint32_t)weights->token_embd->dim[1],
+                                             (uint32_t)token,
+                                             DS4_N_EMBD,
+                                             DS4_N_HC) != 0;
+    }
 
     /*
      * Start executing the prefix of the decode graph while the CPU is still
@@ -10285,7 +10324,12 @@ static bool metal_graph_encode_token_raw_swa(
         if (end != split_env && v <= DS4_N_LAYER) split_after_layers = (uint32_t)v;
     }
 
-    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+    /* The flush is measured in layers encoded by this engine, not absolute
+     * layer index, so partial-range engines still get the same overlap. */
+    const uint32_t split_after_abs =
+        weights->n_layer_start + split_after_layers;
+
+    for (uint32_t il = weights->n_layer_start; ok && il < weights->n_layer_end; il++) {
         ok = metal_graph_encode_decode_layer(g,
                                              model,
                                              &weights->layer[il],
@@ -10299,12 +10343,14 @@ static bool metal_graph_encode_token_raw_swa(
         ds4_metal_tensor *tmp = g->cur_hc;
         g->cur_hc = g->after_ffn_hc;
         g->after_ffn_hc = tmp;
-        if (ok && allow_split_flush && split_after_layers != 0 && il + 1u == split_after_layers) {
+        if (ok && allow_split_flush && split_after_layers != 0 && il + 1u == split_after_abs) {
             ok = ds4_metal_flush_commands() != 0;
         }
     }
 
-    if (ok && need_logits) {
+    /* Tail ownership: only the engine that owns the last layer runs the
+     * output projection.  Head/middle engines export cur_hc instead. */
+    if (ok && need_logits && weights->n_layer_end == DS4_N_LAYER) {
         ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
     }
     return ok;
@@ -12159,13 +12205,16 @@ static bool metal_graph_eval_token_raw_swa(
     const bool profile = getenv("DS4_METAL_GRAPH_TOKEN_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
 
+    const bool tail_owns_output = weights->n_layer_end == DS4_N_LAYER;
+    const bool produce_logits = logits != NULL && tail_owns_output;
+
     bool ok = ds4_metal_begin_commands() != 0;
-    if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL, true);
+    if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, produce_logits, true);
     const double t_encoded = profile ? now_sec() : 0.0;
     if (ok) ok = ds4_metal_end_commands() != 0;
     const double t_done = profile ? now_sec() : 0.0;
 
-    if (ok && logits) {
+    if (ok && produce_logits) {
         ok = ds4_metal_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
     if (profile) {
@@ -12395,16 +12444,22 @@ static bool metal_graph_prefill_layer_major(
     double encode_s = 0.0;
     double execute_s = 0.0;
 
+    const uint32_t n_owned_layers = weights->n_layer_end - weights->n_layer_start;
+    const bool head_owns_embed = (weights->n_layer_start == 0);
+    const bool tail_owns_output = (weights->n_layer_end == DS4_N_LAYER);
+
     if (!split_commands) {
-        ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
-                                                     g->prefill_tokens,
-                                                     model,
-                                                     weights,
-                                                     prompt,
-                                                     0,
-                                                     (uint32_t)n_tokens);
+        if (head_owns_embed) {
+            ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
+                                                         g->prefill_tokens,
+                                                         model,
+                                                         weights,
+                                                         prompt,
+                                                         0,
+                                                         (uint32_t)n_tokens);
+        }
         if (ok) ok = ds4_metal_begin_commands() != 0;
-        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        for (uint32_t il = weights->n_layer_start; ok && il < weights->n_layer_end; il++) {
             ok = metal_graph_encode_layer_batch(g,
                                                 model,
                                                 &weights->layer[il],
@@ -12412,7 +12467,8 @@ static bool metal_graph_prefill_layer_major(
                                                 0,
                                                 (uint32_t)n_tokens);
             if (show_progress) {
-                fprintf(stderr, "ds4: metal prefill layer %u/%u\r", il + 1, (uint32_t)DS4_N_LAYER);
+                fprintf(stderr, "ds4: metal prefill layer %u/%u\r",
+                        il + 1 - weights->n_layer_start, n_owned_layers);
                 fflush(stderr);
             }
         }
@@ -12430,11 +12486,11 @@ static bool metal_graph_prefill_layer_major(
         }
         ds4_metal_tensor *last_hc = NULL;
         ds4_metal_tensor *saved_cur = g->cur_hc;
-        if (ok) {
+        if (ok && tail_owns_output) {
             last_hc = metal_graph_tensor_row_view(g->batch_cur_hc, output_row, hc_dim);
             ok = last_hc != NULL;
         }
-        if (ok) {
+        if (ok && tail_owns_output) {
             g->cur_hc = last_hc;
             ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
             g->cur_hc = saved_cur;
@@ -12453,7 +12509,7 @@ static bool metal_graph_prefill_layer_major(
         }
 
         const double t_before_read = profile ? now_sec() : 0.0;
-        if (logits) {
+        if (logits && tail_owns_output) {
             ok = ds4_metal_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
         }
         if (profile) {
@@ -12470,13 +12526,15 @@ static bool metal_graph_prefill_layer_major(
     }
 
     double t_layer0 = profile ? now_sec() : 0.0;
-    ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
-                                                 g->prefill_tokens,
-                                                 model,
-                                                 weights,
-                                                 prompt,
-                                                 0,
-                                                 (uint32_t)n_tokens);
+    if (head_owns_embed) {
+        ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
+                                                     g->prefill_tokens,
+                                                     model,
+                                                     weights,
+                                                     prompt,
+                                                     0,
+                                                     (uint32_t)n_tokens);
+    }
     const double t_embed_encoded = profile ? now_sec() : 0.0;
     const double t_embed_done = profile ? now_sec() : 0.0;
     if (profile) {
@@ -12496,7 +12554,7 @@ static bool metal_graph_prefill_layer_major(
         return false;
     }
 
-    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+    for (uint32_t il = weights->n_layer_start; ok && il < weights->n_layer_end; il++) {
         if (split_profile) {
             const double t_attn0 = now_sec();
             ok = ds4_metal_begin_commands() != 0;
@@ -12565,48 +12623,55 @@ static bool metal_graph_prefill_layer_major(
             return false;
         }
         if (show_progress) {
-            fprintf(stderr, "ds4: metal prefill layer %u/%u\r", il + 1, (uint32_t)DS4_N_LAYER);
+            fprintf(stderr, "ds4: metal prefill layer %u/%u\r",
+                    il + 1 - weights->n_layer_start, n_owned_layers);
             fflush(stderr);
         }
     }
     if (show_progress) fputc('\n', stderr);
 
-    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    uint32_t output_row = (uint32_t)n_tokens - 1u;
-    const char *output_row_env = getenv("DS4_METAL_GRAPH_OUTPUT_ROW");
-    if (output_row_env && output_row_env[0]) {
-        char *end = NULL;
-        unsigned long v = strtoul(output_row_env, &end, 10);
-        if (end != output_row_env && v < (unsigned long)n_tokens) {
-            output_row = (uint32_t)v;
+    double t_head0 = 0.0, t_head_encoded = 0.0, t_head_done = 0.0, t_before_read = 0.0;
+
+    if (tail_owns_output) {
+        const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+        uint32_t output_row = (uint32_t)n_tokens - 1u;
+        const char *output_row_env = getenv("DS4_METAL_GRAPH_OUTPUT_ROW");
+        if (output_row_env && output_row_env[0]) {
+            char *end = NULL;
+            unsigned long v = strtoul(output_row_env, &end, 10);
+            if (end != output_row_env && v < (unsigned long)n_tokens) {
+                output_row = (uint32_t)v;
+            }
         }
+        ds4_metal_tensor *last_hc = metal_graph_tensor_row_view(g->batch_cur_hc,
+                                                                output_row,
+                                                                hc_dim);
+        if (!last_hc) return false;
+        ds4_metal_tensor *saved_cur = g->cur_hc;
+        g->cur_hc = last_hc;
+
+        t_head0 = profile ? now_sec() : 0.0;
+        ok = ds4_metal_begin_commands() != 0;
+        if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+        t_head_encoded = profile ? now_sec() : 0.0;
+        if (ok) ok = ds4_metal_end_commands() != 0;
+        t_head_done = profile ? now_sec() : 0.0;
+        g->cur_hc = saved_cur;
+        ds4_metal_tensor_free(last_hc);
+        if (!ok) return false;
     }
-    ds4_metal_tensor *last_hc = metal_graph_tensor_row_view(g->batch_cur_hc,
-                                                            output_row,
-                                                            hc_dim);
-    if (!last_hc) return false;
-    ds4_metal_tensor *saved_cur = g->cur_hc;
-    g->cur_hc = last_hc;
 
-    const double t_head0 = profile ? now_sec() : 0.0;
-    ok = ds4_metal_begin_commands() != 0;
-    if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
-    const double t_head_encoded = profile ? now_sec() : 0.0;
-    if (ok) ok = ds4_metal_end_commands() != 0;
-    const double t_head_done = profile ? now_sec() : 0.0;
-    g->cur_hc = saved_cur;
-    ds4_metal_tensor_free(last_hc);
-    if (!ok) return false;
-
-    const double t_before_read = profile ? now_sec() : 0.0;
-    if (logits) {
+    t_before_read = profile ? now_sec() : 0.0;
+    if (logits && tail_owns_output) {
         ok = ds4_metal_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
     if (profile) {
         const double t_read = now_sec();
-        encode_s += t_head_encoded - t_head0;
-        execute_s += t_head_done - t_head_encoded;
-        if (split_profile) {
+        if (tail_owns_output) {
+            encode_s += t_head_encoded - t_head0;
+            execute_s += t_head_done - t_head_encoded;
+        }
+        if (split_profile && tail_owns_output) {
             fprintf(stderr,
                     "ds4: metal layer-major prefill head encode=%.3f ms execute=%.3f ms\n",
                     (t_head_encoded - t_head0) * 1000.0,
@@ -13544,6 +13609,13 @@ struct ds4_engine {
     bool quality;
     bool metal_ready;
     bool mtp_ready;
+    uint32_t n_layer_start;
+    uint32_t n_layer_end;
+    /* Pipeline-parallel head state.  When set, this engine owns [0, n_layer_end)
+     * and the connected peer owns [n_layer_end, DS4_N_LAYER).  Decode and
+     * (eventually) prefill ship the residual stream to the peer for the
+     * remaining layers and receive logits back. */
+    struct ds4_rpc_handle *rpc_peer;
 };
 
 static void utf8_put(char **p, uint32_t cp) {
@@ -14726,15 +14798,24 @@ ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size) {
 }
 
 static void ds4_release_instance_lock(void) {
-    if (g_ds4_lock_fd >= 0) {
+    if (g_ds4_lock_refcount > 0) g_ds4_lock_refcount--;
+    if (g_ds4_lock_refcount == 0 && g_ds4_lock_fd >= 0) {
         close(g_ds4_lock_fd);
         g_ds4_lock_fd = -1;
     }
 }
 
-/* Refuse to start a second ds4 process.  The model can map tens of GiB, so a
- * stale accidental second run is more dangerous than a normal CLI error. */
+/* Refuse to start a second ds4 *process*.  The model can map tens of GiB, so a
+ * stale accidental second run is more dangerous than a normal CLI error.
+ * Multiple engines inside one process (e.g. a pipeline-parallel daisy-chain
+ * test, or the head engine plus an MTP draft engine) cooperate via the same
+ * GPU and Metal stack, so they share one refcounted lock. */
 static void ds4_acquire_instance_lock(void) {
+    if (g_ds4_lock_refcount > 0) {
+        g_ds4_lock_refcount++;
+        return;
+    }
+
     const char *path = getenv("DS4_LOCK_FILE");
     if (!path || !path[0]) path = "/tmp/ds4.lock";
 
@@ -14775,7 +14856,12 @@ static void ds4_acquire_instance_lock(void) {
     }
     dprintf(fd, "%ld\n", (long)getpid());
     g_ds4_lock_fd = fd;
-    atexit(ds4_release_instance_lock);
+    g_ds4_lock_refcount = 1;
+    static bool atexit_registered = false;
+    if (!atexit_registered) {
+        atexit(ds4_release_instance_lock);
+        atexit_registered = true;
+    }
 }
 
 struct ds4_session {
@@ -15117,6 +15203,138 @@ static bool spec_frontier_commit_prefix1(ds4_session *s) {
     return ok;
 }
 #endif
+
+/* The residual stream exchanged at a pipeline-parallel split is always the
+ * full cur_hc tensor: DS4_N_HC slots times DS4_N_EMBD lanes.  It is a fixed
+ * model constant; the helper exists so RPC and test code can size buffers
+ * without reaching into model-private headers. */
+uint64_t ds4_residual_hc_floats(void) {
+    return (uint64_t)DS4_N_HC * DS4_N_EMBD;
+}
+
+uint32_t ds4_model_n_layer(void) { return DS4_N_LAYER; }
+uint32_t ds4_model_n_embd(void)  { return DS4_N_EMBD;  }
+uint32_t ds4_model_n_hc(void)    { return DS4_N_HC;    }
+uint32_t ds4_model_n_vocab(void) { return DS4_N_VOCAB; }
+
+/* Canonical filenames downloaded by download_model.sh.  Keep these in sync
+ * with the script; both binaries use this table to refuse loading Q4 on a
+ * 128 GB Mac by accident, which can kernel-panic macOS (see README). */
+static const char *const DS4_QUANT_Q2_PATH =
+    "gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf";
+static const char *const DS4_QUANT_Q4_PATH =
+    "gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf";
+
+static bool ds4_path_is_regular_file(const char *path) {
+    struct stat st;
+    return path && stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+const char *ds4_resolve_model_path(const char *explicit_path,
+                                   const char *quant,
+                                   char *err, size_t errlen) {
+    if (explicit_path && explicit_path[0]) {
+        if (quant && quant[0] && errlen) {
+            /* Not an error -- just tell the operator which one won. */
+            snprintf(err, errlen,
+                     "note: -m %s overrides --quant %s", explicit_path, quant);
+        }
+        return explicit_path;
+    }
+
+    if (quant && quant[0]) {
+        const char *path = NULL;
+        if (!strcmp(quant, "q2") || !strcmp(quant, "Q2")) path = DS4_QUANT_Q2_PATH;
+        else if (!strcmp(quant, "q4") || !strcmp(quant, "Q4")) path = DS4_QUANT_Q4_PATH;
+        else {
+            if (errlen) snprintf(err, errlen,
+                                 "--quant '%s' is not recognized; expected q2 or q4",
+                                 quant);
+            return NULL;
+        }
+        if (!ds4_path_is_regular_file(path)) {
+            if (errlen) snprintf(err, errlen,
+                                 "--quant %s requested but file not found: %s "
+                                 "(run ./download_model.sh %s)",
+                                 quant, path, quant);
+            return NULL;
+        }
+        return path;
+    }
+
+    /* No explicit path, no quant hint: probe the filesystem.  Prefer Q2 if
+     * both are present -- on a 128 GB Mac Q4 would not fit in unified
+     * memory and trying to load it can kernel-panic the OS. */
+    const bool q2_present = ds4_path_is_regular_file(DS4_QUANT_Q2_PATH);
+    const bool q4_present = ds4_path_is_regular_file(DS4_QUANT_Q4_PATH);
+    if (q2_present) return DS4_QUANT_Q2_PATH;
+    if (q4_present) return DS4_QUANT_Q4_PATH;
+    return "ds4flash.gguf";
+}
+
+const float *ds4_session_logits(const ds4_session *s) {
+    return s ? s->logits : NULL;
+}
+
+int ds4_session_export_residual_hc(ds4_session *s, float *out, uint64_t n_floats,
+                                   char *err, size_t errlen) {
+#ifdef DS4_NO_METAL
+    (void)s; (void)out; (void)n_floats;
+    if (errlen) snprintf(err, errlen, "residual export requires the Metal backend");
+    return 1;
+#else
+    if (!s || !out) {
+        if (errlen) snprintf(err, errlen, "null session or buffer");
+        return 1;
+    }
+    const uint64_t need = ds4_residual_hc_floats();
+    if (n_floats < need) {
+        if (errlen) snprintf(err, errlen,
+                             "residual export buffer too small: have %llu floats, need %llu",
+                             (unsigned long long)n_floats, (unsigned long long)need);
+        return 1;
+    }
+    if (!s->graph.cur_hc) {
+        if (errlen) snprintf(err, errlen, "session has no live cur_hc tensor");
+        return 1;
+    }
+    if (ds4_metal_tensor_read(s->graph.cur_hc, 0, out, need * sizeof(float)) == 0) {
+        if (errlen) snprintf(err, errlen, "ds4_metal_tensor_read failed for cur_hc");
+        return 1;
+    }
+    return 0;
+#endif
+}
+
+int ds4_session_import_residual_hc(ds4_session *s, const float *in, uint64_t n_floats,
+                                   char *err, size_t errlen) {
+#ifdef DS4_NO_METAL
+    (void)s; (void)in; (void)n_floats;
+    if (errlen) snprintf(err, errlen, "residual import requires the Metal backend");
+    return 1;
+#else
+    if (!s || !in) {
+        if (errlen) snprintf(err, errlen, "null session or buffer");
+        return 1;
+    }
+    const uint64_t need = ds4_residual_hc_floats();
+    if (n_floats < need) {
+        if (errlen) snprintf(err, errlen,
+                             "residual import buffer too small: have %llu floats, need %llu",
+                             (unsigned long long)n_floats, (unsigned long long)need);
+        return 1;
+    }
+    if (!s->graph.cur_hc) {
+        if (errlen) snprintf(err, errlen, "session has no live cur_hc tensor");
+        return 1;
+    }
+    if (ds4_metal_tensor_write(s->graph.cur_hc, 0, in, need * sizeof(float)) == 0) {
+        if (errlen) snprintf(err, errlen, "ds4_metal_tensor_write failed for cur_hc");
+        return 1;
+    }
+    return 0;
+#endif
+}
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
 #ifdef DS4_NO_METAL
@@ -15704,6 +15922,23 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
     return 0;
 }
 
+/* Open the GGUF just enough to compute the cheap handshake fingerprint: file
+ * size and the first 32 bytes (the GGUF magic and version, which differ
+ * across model variants).  Both head and worker compute this independently;
+ * a mismatch fails the handshake with a clear error. */
+static int rpc_compute_model_fingerprint(const char *path,
+                                         uint64_t *out_bytes,
+                                         uint8_t out_sample[32]) {
+    struct stat st;
+    if (stat(path, &st) != 0) return 1;
+    *out_bytes = (uint64_t)st.st_size;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 1;
+    ssize_t r = read(fd, out_sample, 32);
+    close(fd);
+    return r == 32 ? 0 : 1;
+}
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
@@ -15713,6 +15948,20 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
     e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
+    {
+        int ls = opt->n_layer_start;
+        int le = opt->n_layer_end <= 0 ? DS4_N_LAYER : opt->n_layer_end;
+        if (ls < 0 || ls >= le || le > DS4_N_LAYER) {
+            fprintf(stderr,
+                    "ds4: invalid layer range [%d, %d); must satisfy 0 <= start < end <= %d\n",
+                    opt->n_layer_start, opt->n_layer_end, DS4_N_LAYER);
+            free(e);
+            *out = NULL;
+            return 1;
+        }
+        e->n_layer_start = (uint32_t)ls;
+        e->n_layer_end = (uint32_t)le;
+    }
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     ds4_acquire_instance_lock();
 
@@ -15721,7 +15970,12 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (opt->warm_weights) model_warm_weights(&e->model);
     vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
-    weights_bind(&e->weights, &e->model);
+    weights_bind(&e->weights, &e->model, e->n_layer_start, e->n_layer_end);
+    if (e->n_layer_start != 0 || e->n_layer_end != DS4_N_LAYER) {
+        fprintf(stderr,
+                "ds4: pipeline-parallel weight binding active, layer range [%u, %u) of %u\n",
+                e->n_layer_start, e->n_layer_end, DS4_N_LAYER);
+    }
     if (opt->mtp_path && opt->mtp_path[0]) {
         model_open(&e->mtp_model, opt->mtp_path,
                    opt->backend == DS4_BACKEND_METAL, true);
@@ -15778,6 +16032,69 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
 #endif
 
+    /* Optional pipeline-parallel head: dial the configured tail worker over
+     * TCP, exchange a config handshake, and stash the connection so decode
+     * paths can ship residuals.  Failure here aborts startup since proceeding
+     * without the second machine would silently produce wrong output. */
+    if (opt->rpc_peer_host && opt->rpc_peer_host[0]) {
+        if (e->n_layer_end == DS4_N_LAYER) {
+            fprintf(stderr,
+                    "ds4: --rpc-peer is set but this engine owns all %u layers; "
+                    "set n_layer_end (e.g. 22) so the peer can own the rest\n",
+                    (unsigned)DS4_N_LAYER);
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+
+        uint64_t model_bytes = 0;
+        uint8_t  model_sample[32] = {0};
+        if (rpc_compute_model_fingerprint(opt->model_path, &model_bytes, model_sample) != 0) {
+            fprintf(stderr, "ds4: failed to fingerprint model file for RPC handshake: %s\n",
+                    strerror(errno));
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+
+        ds4_rpc_config cfg = {
+            .version           = DS4_RPC_VERSION,
+            .n_layer_total     = DS4_N_LAYER,
+            .n_embd            = DS4_N_EMBD,
+            .n_hc              = DS4_N_HC,
+            .n_vocab           = DS4_N_VOCAB,
+            .routed_quant_bits = (uint32_t)ds4_engine_routed_quant_bits(e),
+            .tail_layer_start  = e->n_layer_end,
+            .tail_layer_end    = DS4_N_LAYER,
+            .model_file_bytes  = model_bytes,
+        };
+        memcpy(cfg.model_sample, model_sample, 32);
+
+        const uint16_t port = (opt->rpc_peer_port > 0 && opt->rpc_peer_port < 65536)
+            ? (uint16_t)opt->rpc_peer_port : 46434u;
+
+        char rpc_err[512] = {0};
+        if (ds4_rpc_dial(opt->rpc_peer_host, port, &e->rpc_peer,
+                         rpc_err, sizeof(rpc_err)) != 0) {
+            fprintf(stderr, "ds4: rpc dial %s:%u failed: %s\n",
+                    opt->rpc_peer_host, (unsigned)port, rpc_err);
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (ds4_rpc_handshake_client(e->rpc_peer, &cfg, rpc_err, sizeof(rpc_err)) != 0) {
+            fprintf(stderr, "ds4: rpc handshake with %s:%u failed: %s\n",
+                    opt->rpc_peer_host, (unsigned)port, rpc_err);
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        fprintf(stderr,
+                "ds4: pipeline-parallel head connected to %s:%u, peer owns layers [%u, %u)\n",
+                opt->rpc_peer_host, (unsigned)port,
+                (unsigned)e->n_layer_end, (unsigned)DS4_N_LAYER);
+    }
+
     *out = e;
     return 0;
 }
@@ -15788,6 +16105,11 @@ void ds4_engine_summary(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+    if (e->rpc_peer) {
+        (void)ds4_rpc_shutdown_send(e->rpc_peer);
+        ds4_rpc_close(e->rpc_peer);
+        e->rpc_peer = NULL;
+    }
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
@@ -15882,6 +16204,10 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
  *
  * A non-matching prompt discards the checkpoint and prefills from token zero.
  */
+static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
+                                     char *err, size_t errlen);
+static void rpc_propagate_reset(ds4_session *s, const char *origin);
+
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
 #ifdef DS4_NO_METAL
     (void)s;
@@ -15895,6 +16221,15 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         return 1;
     }
 
+    /* Pipeline-parallel prefill is not in the wire protocol yet (it would
+     * need to ship the full batch_cur_hc tensor, not just a single residual
+     * row).  As a correct-but-slower fallback we always go through the
+     * per-token decode loop when the head has an RPC peer.  This makes
+     * prefill O(n_tokens) round trips of ~64 KB each; with TB4 the bandwidth
+     * is fine and only RTT*n_tokens latency is added.  Phase 5 follow-up:
+     * batch prefill over RPC. */
+    const bool use_per_token = (e->rpc_peer != NULL);
+
     if (s->checkpoint_valid &&
         prompt->len >= s->checkpoint.len &&
         ds4_tokens_starts_with(prompt, &s->checkpoint))
@@ -15902,7 +16237,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         s->mtp_draft_valid = false;
         const int suffix = prompt->len - s->checkpoint.len;
         const uint32_t resume_min = metal_graph_resume_prefill_min_tokens();
-        if (suffix > 0 && (uint32_t)suffix >= resume_min) {
+        if (!use_per_token && suffix > 0 && (uint32_t)suffix >= resume_min) {
             ds4_sync_progress progress = {
                 .session = s,
                 .prompt = prompt,
@@ -15932,17 +16267,42 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         }
 
         for (int i = s->checkpoint.len; i < prompt->len; i++) {
-            if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
-                                                (uint32_t)prompt->v[i],
-                                                (uint32_t)s->checkpoint.len,
-                                                s->logits))
-            {
-                snprintf(err, errlen, "Metal decode failed while extending checkpoint");
-                s->checkpoint_valid = false;
+            if (use_per_token) {
+                if (ds4_session_eval_internal(s, prompt->v[i], false,
+                                              err, errlen) != 0) {
+                    return 1;
+                }
+            } else {
+                if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
+                                                    (uint32_t)prompt->v[i],
+                                                    (uint32_t)s->checkpoint.len,
+                                                    s->logits))
+                {
+                    snprintf(err, errlen, "Metal decode failed while extending checkpoint");
+                    s->checkpoint_valid = false;
+                    return 1;
+                }
+                token_vec_push(&s->checkpoint, prompt->v[i]);
+            }
+        }
+        s->checkpoint_valid = true;
+        return 0;
+    }
+
+    if (use_per_token) {
+        /* Cold path under RPC: reset tail KV (in case prior session left
+         * dirty state) and then walk the whole prompt through the same
+         * per-token RPC eval as the suffix-extension path above. */
+        rpc_propagate_reset(s, "sync cold path");
+        s->checkpoint.len = 0;
+        for (int i = 0; i < prompt->len; i++) {
+            if (ds4_session_eval_internal(s, prompt->v[i], false,
+                                          err, errlen) != 0) {
                 return 1;
             }
-            token_vec_push(&s->checkpoint, prompt->v[i]);
         }
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
         return 0;
     }
 
@@ -16108,8 +16468,10 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
 #else
     ds4_engine *e = s->engine;
     const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
+    /* MTP is disabled under RPC for now: the draft path spans all layers and
+     * we have not extended the wire protocol to cooperate.  Phase 4 follow-up. */
     const bool mtp_should_draft =
-        probe_mtp && e->mtp_ready && s->mtp_logits &&
+        probe_mtp && e->mtp_ready && s->mtp_logits && e->rpc_peer == NULL &&
         (e->mtp_draft_tokens > 1 || mtp_probe_log);
     if (probe_mtp && s->mtp_draft_valid) {
         if (mtp_probe_log) {
@@ -16133,6 +16495,42 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         s->checkpoint_valid = false;
         return 1;
     }
+
+    /* Pipeline-parallel head: the local encode produced a residual in cur_hc
+     * but no logits (we own only a prefix of the layers).  Ship the residual
+     * to the tail worker and let it run the remaining layers + output head;
+     * the returned logits land in s->logits exactly as if we had run the
+     * full graph locally. */
+    if (e->rpc_peer) {
+        const uint64_t n_residual = ds4_residual_hc_floats();
+        float *residual = (float *)malloc((size_t)(n_residual * sizeof(float)));
+        if (!residual) {
+            snprintf(err, errlen, "rpc: residual alloc failed");
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        char rpc_err[512] = {0};
+        if (ds4_session_export_residual_hc(s, residual, n_residual,
+                                           rpc_err, sizeof(rpc_err)) != 0) {
+            free(residual);
+            snprintf(err, errlen, "rpc: export residual: %s", rpc_err);
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        if (ds4_rpc_decode_request(e->rpc_peer,
+                                   (uint32_t)token,
+                                   (uint32_t)s->checkpoint.len,
+                                   residual, n_residual,
+                                   s->logits, DS4_N_VOCAB,
+                                   rpc_err, sizeof(rpc_err)) != 0) {
+            free(residual);
+            snprintf(err, errlen, "rpc: decode request to tail: %s", rpc_err);
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        free(residual);
+    }
+
     token_vec_push(&s->checkpoint, token);
     if (mtp_should_draft) {
         int mtp_top = -1;
@@ -16753,17 +17151,42 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 #endif
 }
 
+/* Tell the connected tail worker to drop its session.  Best-effort: if the
+ * RPC fails we log and continue so the head's local state remains valid; the
+ * caller will discover divergence on the next decode if it really matters. */
+static void rpc_propagate_reset(ds4_session *s, const char *origin) {
+    if (!s || !s->engine || !s->engine->rpc_peer) return;
+    char rpc_err[256] = {0};
+    if (ds4_rpc_reset(s->engine->rpc_peer, rpc_err, sizeof(rpc_err)) != 0) {
+        fprintf(stderr,
+                "ds4: rpc reset from %s failed: %s; tail KV state may be stale\n",
+                origin, rpc_err);
+    }
+}
+
 void ds4_session_invalidate(ds4_session *s) {
+    if (!s) return;
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
+    rpc_propagate_reset(s, "invalidate");
 }
 
 void ds4_session_rewind(ds4_session *s, int pos) {
+    if (!s) return;
     if (pos < 0) pos = 0;
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;
     s->mtp_draft_valid = false;
+    /* The wire protocol has no partial-rewind op yet, so under RPC we drop
+     * the tail's KV entirely and require the caller to re-prefill from pos.
+     * For purely-local engines this is a cheap counter update; under RPC it
+     * makes rewind a heavyweight operation.  Phase 5 follow-up. */
+    if (s->engine && s->engine->rpc_peer) {
+        rpc_propagate_reset(s, "rewind");
+        s->checkpoint.len = 0;
+        s->checkpoint_valid = false;
+    }
 }
 
 int ds4_session_pos(ds4_session *s) {

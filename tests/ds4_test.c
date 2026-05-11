@@ -560,6 +560,155 @@ static void test_tool_call_quality(void) {
 
 #endif
 
+#ifndef DS4_NO_METAL
+/* Pipeline-parallel correctness gate: a single-host engine [0, 43) and a
+ * daisy chain of head [0, L_mid) + tail [L_mid, 43) should produce the same
+ * top-k logprobs for the same first token.  Bit-identical isn't guaranteed
+ * because Metal command-buffer split points differ and GPU reductions are
+ * not commutative under reorder, so we assert top-3 token agreement and a
+ * tight tolerance on logit values.  All three engines coexist in this same
+ * process under the refcounted instance lock. */
+static void test_pipeline_daisy_chain(void) {
+    const char *model = test_model_path();
+    const int ctx_size = 4096;
+    char err[512];
+
+    /* 1. Reference: full-range single-host engine, tokenize "Hello" to get
+     * a deterministic first token, eval one step, snapshot top logprobs. */
+    ds4_engine_options opt_full = {
+        .model_path = model,
+        .backend = DS4_BACKEND_METAL,
+    };
+    ds4_engine *e_full = NULL;
+    TEST_ASSERT(ds4_engine_open(&e_full, &opt_full) == 0);
+    if (!e_full) return;
+
+    ds4_tokens tokens = {0};
+    ds4_tokenize_text(e_full, "Hello", &tokens);
+    TEST_ASSERT(tokens.len > 0);
+    if (tokens.len == 0) {
+        ds4_engine_close(e_full);
+        return;
+    }
+    const int token = tokens.v[0];
+    ds4_tokens_free(&tokens);
+
+    ds4_session *s_full = NULL;
+    TEST_ASSERT(ds4_session_create(&s_full, e_full, ctx_size) == 0);
+    if (!s_full) { ds4_engine_close(e_full); return; }
+
+    err[0] = '\0';
+    TEST_ASSERT(ds4_session_eval(s_full, token, err, sizeof(err)) == 0);
+    if (err[0]) fprintf(stderr, "pipeline daisy chain (full eval): %s\n", err);
+
+    ds4_token_score top_full[16];
+    const int k_full = ds4_session_top_logprobs(s_full, top_full, 16);
+    TEST_ASSERT(k_full > 0);
+
+    ds4_session_free(s_full);
+    ds4_engine_close(e_full);
+
+    /* 2. Head engine: [0, L_mid). */
+    const int L_mid = 21;
+
+    ds4_engine_options opt_head = {
+        .model_path = model,
+        .backend = DS4_BACKEND_METAL,
+        .n_layer_start = 0,
+        .n_layer_end = L_mid,
+    };
+    ds4_engine *e_head = NULL;
+    TEST_ASSERT(ds4_engine_open(&e_head, &opt_head) == 0);
+    if (!e_head) return;
+
+    ds4_session *s_head = NULL;
+    TEST_ASSERT(ds4_session_create(&s_head, e_head, ctx_size) == 0);
+    if (!s_head) { ds4_engine_close(e_head); return; }
+
+    err[0] = '\0';
+    TEST_ASSERT(ds4_session_eval(s_head, token, err, sizeof(err)) == 0);
+    if (err[0]) fprintf(stderr, "pipeline daisy chain (head eval): %s\n", err);
+
+    const uint64_t n = ds4_residual_hc_floats();
+    float *residual = malloc((size_t)n * sizeof(float));
+    TEST_ASSERT(residual != NULL);
+    if (!residual) {
+        ds4_session_free(s_head);
+        ds4_engine_close(e_head);
+        return;
+    }
+
+    err[0] = '\0';
+    TEST_ASSERT(ds4_session_export_residual_hc(s_head, residual, n, err, sizeof(err)) == 0);
+    if (err[0]) fprintf(stderr, "pipeline daisy chain (export): %s\n", err);
+
+    ds4_session_free(s_head);
+    ds4_engine_close(e_head);
+
+    /* 3. Tail engine: [L_mid, DS4_N_LAYER).  Import head's residual, then
+     * eval one step: encode skips embed (n_layer_start > 0), runs the
+     * remaining layers, and applies the output projection (n_layer_end ==
+     * DS4_N_LAYER), so s_tail->logits ends up as the daisy-chain logits. */
+    ds4_engine_options opt_tail = {
+        .model_path = model,
+        .backend = DS4_BACKEND_METAL,
+        .n_layer_start = L_mid,
+        .n_layer_end = 43,
+    };
+    ds4_engine *e_tail = NULL;
+    TEST_ASSERT(ds4_engine_open(&e_tail, &opt_tail) == 0);
+    if (!e_tail) { free(residual); return; }
+
+    ds4_session *s_tail = NULL;
+    TEST_ASSERT(ds4_session_create(&s_tail, e_tail, ctx_size) == 0);
+    if (!s_tail) {
+        free(residual);
+        ds4_engine_close(e_tail);
+        return;
+    }
+
+    err[0] = '\0';
+    TEST_ASSERT(ds4_session_import_residual_hc(s_tail, residual, n, err, sizeof(err)) == 0);
+    if (err[0]) fprintf(stderr, "pipeline daisy chain (import): %s\n", err);
+
+    err[0] = '\0';
+    TEST_ASSERT(ds4_session_eval(s_tail, token, err, sizeof(err)) == 0);
+    if (err[0]) fprintf(stderr, "pipeline daisy chain (tail eval): %s\n", err);
+
+    ds4_token_score top_tail[16];
+    const int k_tail = ds4_session_top_logprobs(s_tail, top_tail, 16);
+    TEST_ASSERT(k_tail > 0);
+
+    /* 4. Compare.  Bit-exact reductions across distinct command-buffer
+     * shapes are not guaranteed; require top-3 token agreement and a small
+     * logit tolerance for the wider window. */
+    const int k = k_full < k_tail ? k_full : k_tail;
+    int mismatches = 0;
+    float max_logit_diff = 0.0f;
+    for (int i = 0; i < k; i++) {
+        if (i < 3 && top_full[i].id != top_tail[i].id) {
+            mismatches++;
+            fprintf(stderr,
+                    "pipeline daisy chain: top-%d token mismatch full=%d tail=%d "
+                    "(logits %g vs %g)\n",
+                    i, top_full[i].id, top_tail[i].id,
+                    (double)top_full[i].logit, (double)top_tail[i].logit);
+        }
+        const float d = fabsf(top_full[i].logit - top_tail[i].logit);
+        if (d > max_logit_diff) max_logit_diff = d;
+    }
+    fprintf(stderr,
+            "pipeline daisy chain: token=%d split_at=%d compared=%d top3_mismatches=%d max_diff=%g\n",
+            token, L_mid, k, mismatches, (double)max_logit_diff);
+    TEST_ASSERT(mismatches == 0);
+    TEST_ASSERT(max_logit_diff < 1.0e-1f);
+
+    free(residual);
+    ds4_session_free(s_tail);
+    ds4_engine_close(e_tail);
+}
+#endif
+
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
@@ -578,6 +727,7 @@ static const ds4_test_entry test_entries[] = {
     {"--long-context", "long-context", "long Metal continuation regression", test_long_security_continuation},
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison", test_official_logprob_vectors},
+    {"--pipeline-daisy-chain", "pipeline-daisy-chain", "head/tail split produces matching top logprobs", test_pipeline_daisy_chain},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_f16_matvec_fast_nr0_4},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},

@@ -46,6 +46,7 @@ typedef struct {
     ds4_engine_options engine;
     cli_generation_options gen;
     char *prompt_owned;
+    const char *quant;          /* --quant q2|q4, NULL if unspecified */
     bool inspect;
 } cli_config;
 
@@ -78,7 +79,14 @@ static void usage(FILE *fp) {
         "\n"
         "Model and runtime:\n"
         "  -m, --model FILE\n"
-        "      GGUF model path. Default: ds4flash.gguf\n"
+        "      GGUF model path. Wins over --quant. Default: auto-detect Q2 or Q4\n"
+        "      in ./gguf/, preferring Q2 if both are present; fall back to\n"
+        "      ds4flash.gguf when neither is found.\n"
+        "  --quant Q\n"
+        "      Pick the canonical Q2 or Q4 file in ./gguf/ by name. Use 'q2'\n"
+        "      for the 128 GB-friendly 86 GB model; use 'q4' only if you have\n"
+        "      >=256 GB or are running pipeline-parallel with --rpc-peer.\n"
+        "      Ignored when -m is also given.\n"
         "  --mtp FILE\n"
         "      Optional MTP support GGUF used for draft-token probes.\n"
         "  --mtp-draft N\n"
@@ -1154,7 +1162,7 @@ static char *read_prompt_file(const char *path, bool fatal) {
 static cli_config parse_options(int argc, char **argv) {
     cli_config c = {
         .engine = {
-            .model_path = "ds4flash.gguf",
+            .model_path = NULL, /* resolved after parsing via ds4_resolve_model_path */
             .backend = DS4_BACKEND_METAL,
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
@@ -1193,6 +1201,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--quant")) {
+            c.quant = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
@@ -1251,6 +1261,26 @@ static cli_config parse_options(int argc, char **argv) {
             c.inspect = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
+        } else if (!strcmp(arg, "--rpc-peer")) {
+            /* Pipeline-parallel: ship the second half of layers to a tail
+             * worker reachable at host:port (default port 46434).  Use with
+             * --rpc-split to set the boundary. */
+            const char *spec = need_arg(&i, argc, argv, arg);
+            const char *colon = strrchr(spec, ':');
+            if (colon && colon != spec) {
+                size_t host_len = (size_t)(colon - spec);
+                char *host = (char *)malloc(host_len + 1);
+                if (!host) { fprintf(stderr, "ds4: oom\n"); exit(2); }
+                memcpy(host, spec, host_len);
+                host[host_len] = '\0';
+                c.engine.rpc_peer_host = host;
+                c.engine.rpc_peer_port = (int)strtol(colon + 1, NULL, 10);
+            } else {
+                c.engine.rpc_peer_host = spec;
+                c.engine.rpc_peer_port = 46434;
+            }
+        } else if (!strcmp(arg, "--rpc-split")) {
+            c.engine.n_layer_end = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--server")) {
             fprintf(stderr, "ds4: use ds4-server for the HTTP server\n");
             exit(2);
@@ -1259,6 +1289,22 @@ static cli_config parse_options(int argc, char **argv) {
             usage(stderr);
             exit(2);
         }
+    }
+
+    /* Final model-path resolution.  Priority: -m wins, then --quant, then
+     * filesystem probe of the canonical Q2/Q4 paths (preferring Q2), then
+     * the historical ds4flash.gguf symlink fallback. */
+    {
+        char resolve_err[256] = {0};
+        const char *resolved = ds4_resolve_model_path(c.engine.model_path,
+                                                      c.quant,
+                                                      resolve_err, sizeof(resolve_err));
+        if (!resolved) {
+            fprintf(stderr, "ds4: %s\n", resolve_err);
+            exit(2);
+        }
+        if (resolve_err[0]) fprintf(stderr, "ds4: %s\n", resolve_err);
+        c.engine.model_path = resolved;
     }
 
     return c;
