@@ -3814,6 +3814,36 @@ static const uint8_t *tensor_expert_bytes(
     return (const uint8_t *)tensor_data(m, w) + (uint64_t)expert * expert_bytes;
 }
 
+/* Gate/up paired dot. Uses the fused IQ2_XXS pair when both sides are
+ * IQ2_XXS; otherwise per-side dispatch. */
+static inline bool tensor_is_routed_pair_type(uint32_t type) {
+    return type == DS4_TENSOR_IQ2_XXS || type == DS4_TENSOR_IQ1_S;
+}
+
+static inline void dot_one_routed_pair_side(uint32_t type, int n, float *s, const void *row, const block_q8_K *y) {
+    if (type == DS4_TENSOR_IQ2_XXS) {
+        ds4_vec_dot_iq2_xxs_q8_K(n, s, (const block_iq2_xxs *)row, y);
+    } else if (type == DS4_TENSOR_IQ1_S) {
+        ds4_vec_dot_iq1_s_q8_K(n, s, (const block_iq1_s *)row, y);
+    } else {
+        ds4_die("unsupported routed gate/up quant type");
+    }
+}
+
+static inline void dot_routed_pair_q8_K(uint32_t gate_type, uint32_t up_type, int n,
+                                        float *s_gate, float *s_up,
+                                        const void *gate_row, const void *up_row,
+                                        const block_q8_K *xq) {
+    if (gate_type == DS4_TENSOR_IQ2_XXS && up_type == DS4_TENSOR_IQ2_XXS) {
+        ds4_vec_dot_iq2_xxs_pair_q8_K(n, s_gate, s_up,
+                                      (const block_iq2_xxs *)gate_row,
+                                      (const block_iq2_xxs *)up_row, xq);
+        return;
+    }
+    dot_one_routed_pair_side(gate_type, n, s_gate, gate_row, xq);
+    dot_one_routed_pair_side(up_type, n, s_up, up_row, xq);
+}
+
 typedef struct {
     float *out0;
     float *out1;
@@ -3823,19 +3853,22 @@ typedef struct {
     uint64_t in_dim;
     uint64_t row_bytes0;
     uint64_t row_bytes1;
+    uint32_t type0;
+    uint32_t type1;
 } matvec_iq2_xxs_pair_ctx;
 
 static void matvec_iq2_xxs_pair_worker(void *vctx, uint64_t row0, uint64_t row1) {
     matvec_iq2_xxs_pair_ctx *ctx = vctx;
     for (uint64_t row = row0; row < row1; row++) {
-        const block_iq2_xxs *br0 = (const block_iq2_xxs *)(ctx->base0 + row * ctx->row_bytes0);
-        const block_iq2_xxs *br1 = (const block_iq2_xxs *)(ctx->base1 + row * ctx->row_bytes1);
-        ds4_vec_dot_iq2_xxs_pair_q8_K((int)ctx->in_dim, &ctx->out0[row], &ctx->out1[row], br0, br1, ctx->xq);
+        dot_routed_pair_q8_K(ctx->type0, ctx->type1, (int)ctx->in_dim,
+                             &ctx->out0[row], &ctx->out1[row],
+                             ctx->base0 + row * ctx->row_bytes0,
+                             ctx->base1 + row * ctx->row_bytes1,
+                             ctx->xq);
     }
 }
 
-/* Project one routed expert's gate and up matrices.  Both are IQ2_XXS and
- * share the same Q8_K activation. */
+/* Project one routed expert's gate and up matrices. */
 static void matvec_iq2_xxs_expert_pair_prequant(
         float            *out0,
         float            *out1,
@@ -3844,14 +3877,16 @@ static void matvec_iq2_xxs_expert_pair_prequant(
         const ds4_tensor *w1,
         const block_q8_K *xq,
         uint32_t          expert) {
-    if (w0->type != 16 || w1->type != 16) ds4_die("expected IQ2_XXS expert tensors");
+    if (!tensor_is_routed_pair_type(w0->type) || !tensor_is_routed_pair_type(w1->type)) {
+        ds4_die("expected IQ2_XXS or IQ1_S expert tensors");
+    }
 
     uint64_t in_dim0, out_dim0, row_bytes0;
     uint64_t in_dim1, out_dim1, row_bytes1;
     const uint8_t *base0 = tensor_expert_bytes(m, w0, expert, &in_dim0, &out_dim0, &row_bytes0);
     const uint8_t *base1 = tensor_expert_bytes(m, w1, expert, &in_dim1, &out_dim1, &row_bytes1);
-    if (in_dim0 != in_dim1 || out_dim0 != out_dim1) ds4_die("paired IQ2_XXS expert tensors do not match");
-    if (in_dim0 % QK_K != 0) ds4_die("IQ2_XXS expert row is not QK_K aligned");
+    if (in_dim0 != in_dim1 || out_dim0 != out_dim1) ds4_die("paired routed expert tensors do not match");
+    if (in_dim0 % QK_K != 0) ds4_die("routed expert row is not QK_K aligned");
 
     matvec_iq2_xxs_pair_ctx ctx = {
         .out0 = out0,
@@ -3862,6 +3897,8 @@ static void matvec_iq2_xxs_expert_pair_prequant(
         .in_dim = in_dim0,
         .row_bytes0 = row_bytes0,
         .row_bytes1 = row_bytes1,
+        .type0 = w0->type,
+        .type1 = w1->type,
     };
     ds4_parallel_for(out_dim0, matvec_iq2_xxs_pair_worker, &ctx);
 }
@@ -3880,6 +3917,8 @@ typedef struct {
     uint64_t gate_row_bytes[DS4_N_EXPERT_USED];
     uint64_t up_row_bytes[DS4_N_EXPERT_USED];
     int n_expert;
+    uint32_t gate_type;
+    uint32_t up_type;
 } matvec_iq2_xxs_mid_ctx;
 
 static void matvec_iq2_xxs_mid_worker(void *vctx, uint64_t row0, uint64_t row1) {
@@ -3891,9 +3930,11 @@ static void matvec_iq2_xxs_mid_worker(void *vctx, uint64_t row0, uint64_t row1) 
         float gate = 0.0f;
         float up = 0.0f;
 
-        const block_iq2_xxs *gate_row = (const block_iq2_xxs *)(ctx->gate_base[slot] + row * ctx->gate_row_bytes[slot]);
-        const block_iq2_xxs *up_row = (const block_iq2_xxs *)(ctx->up_base[slot] + row * ctx->up_row_bytes[slot]);
-        ds4_vec_dot_iq2_xxs_pair_q8_K((int)ctx->in_dim, &gate, &up, gate_row, up_row, ctx->xq);
+        dot_routed_pair_q8_K(ctx->gate_type, ctx->up_type, (int)ctx->in_dim,
+                             &gate, &up,
+                             ctx->gate_base[slot] + row * ctx->gate_row_bytes[slot],
+                             ctx->up_base[slot] + row * ctx->up_row_bytes[slot],
+                             ctx->xq);
 
         if (ctx->clamp > 1.0e-6f) {
             if (gate > ctx->clamp) gate = ctx->clamp;
@@ -3904,8 +3945,8 @@ static void matvec_iq2_xxs_mid_worker(void *vctx, uint64_t row0, uint64_t row1) 
     }
 }
 
-/* Build all selected expert hidden vectors: IQ2_XXS gate/up, clamp, SwiGLU,
- * and router weight.  The down projection runs later on the quantized mids. */
+/* Build all selected expert hidden vectors: gate/up, clamp, SwiGLU, and
+ * router weight. Down projection runs later on the quantized mids. */
 static void matvec_iq2_xxs_experts_mid_prequant(
         float            *mid,
         const ds4_model  *m,
@@ -3916,7 +3957,9 @@ static void matvec_iq2_xxs_experts_mid_prequant(
         const float      *expert_weight,
         int               n_expert,
         float             clamp) {
-    if (gate_w->type != 16 || up_w->type != 16) ds4_die("expected IQ2_XXS expert tensors");
+    if (!tensor_is_routed_pair_type(gate_w->type) || !tensor_is_routed_pair_type(up_w->type)) {
+        ds4_die("expected IQ2_XXS or IQ1_S expert tensors");
+    }
     if (n_expert < 1 || n_expert > DS4_N_EXPERT_USED) ds4_die("unexpected routed expert count");
 
     uint64_t in_dim0 = 0;
@@ -3926,6 +3969,8 @@ static void matvec_iq2_xxs_experts_mid_prequant(
         .xq = xq,
         .clamp = clamp,
         .n_expert = n_expert,
+        .gate_type = gate_w->type,
+        .up_type = up_w->type,
     };
 
     for (int i = 0; i < n_expert; i++) {
@@ -3936,17 +3981,17 @@ static void matvec_iq2_xxs_experts_mid_prequant(
         ctx.up_base[i] = tensor_expert_bytes(m, up_w, (uint32_t)selected[i],
                                              &up_in_dim, &up_out_dim, &ctx.up_row_bytes[i]);
         if (gate_in_dim != up_in_dim || gate_out_dim != up_out_dim) {
-            ds4_die("paired IQ2_XXS expert tensors do not match");
+            ds4_die("paired routed expert tensors do not match");
         }
         if (i == 0) {
             in_dim0 = gate_in_dim;
             out_dim0 = gate_out_dim;
         } else if (gate_in_dim != in_dim0 || gate_out_dim != out_dim0) {
-            ds4_die("IQ2_XXS expert tensors do not share a layout");
+            ds4_die("routed expert tensors do not share a layout");
         }
         ctx.expert_weight[i] = expert_weight[i];
     }
-    if (in_dim0 % QK_K != 0) ds4_die("IQ2_XXS expert row is not QK_K aligned");
+    if (in_dim0 % QK_K != 0) ds4_die("routed expert row is not QK_K aligned");
 
     ctx.in_dim = in_dim0;
     ctx.out_dim = out_dim0;
@@ -4105,6 +4150,8 @@ typedef struct {
     uint64_t gate_row_bytes[DS4_N_EXPERT];
     uint64_t up_row_bytes[DS4_N_EXPERT];
     uint64_t xq_blocks;
+    uint32_t gate_type;
+    uint32_t up_type;
 } matvec_iq2_xxs_batch_mid_ctx;
 
 static void matvec_iq2_xxs_batch_mid_worker(void *vctx, uint64_t task0, uint64_t task1) {
@@ -4117,8 +4164,8 @@ static void matvec_iq2_xxs_batch_mid_worker(void *vctx, uint64_t task0, uint64_t
         const uint32_t begin = ctx->expert_offset[expert];
         const uint32_t end = ctx->expert_offset[expert + 1];
 
-        const block_iq2_xxs *gate_row = (const block_iq2_xxs *)(ctx->gate_base[expert] + row * ctx->gate_row_bytes[expert]);
-        const block_iq2_xxs *up_row = (const block_iq2_xxs *)(ctx->up_base[expert] + row * ctx->up_row_bytes[expert]);
+        const uint8_t *gate_row = ctx->gate_base[expert] + row * ctx->gate_row_bytes[expert];
+        const uint8_t *up_row = ctx->up_base[expert] + row * ctx->up_row_bytes[expert];
 
         for (uint32_t i = begin; i < end; i++) {
             const uint32_t pair_id = ctx->pair_ids[i];
@@ -4127,7 +4174,8 @@ static void matvec_iq2_xxs_batch_mid_worker(void *vctx, uint64_t task0, uint64_t
             float gate = 0.0f;
             float up = 0.0f;
 
-            ds4_vec_dot_iq2_xxs_pair_q8_K((int)ctx->in_dim, &gate, &up, gate_row, up_row, xq);
+            dot_routed_pair_q8_K(ctx->gate_type, ctx->up_type, (int)ctx->in_dim,
+                                 &gate, &up, gate_row, up_row, xq);
 
             if (ctx->clamp > 1.0e-6f) {
                 if (gate > ctx->clamp) gate = ctx->clamp;
@@ -5589,6 +5637,8 @@ static void layer_routed_moe_batch(
         .in_dim = expert_in_dim,
         .out_dim = expert_out_dim,
         .xq_blocks = xq_blocks,
+        .gate_type = layer->ffn_gate_exps->type,
+        .up_type = layer->ffn_up_exps->type,
     };
 
     for (uint32_t ai = 0; ai < n_active; ai++) {
