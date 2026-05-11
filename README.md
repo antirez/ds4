@@ -94,6 +94,63 @@ make
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 `./ds4-server --help` for the full flag list.
 
+## 64 GB Target (experimental)
+
+The `q2` GGUF above is 86.7 GB and is sized for 128 GB-class machines. This
+fork adds engine-side support for `IQ1_S` (1.5625 bpw) on the routed-MoE
+gate/up/down tensors, both on CPU and on Metal:
+
+- Decode: new `kernel_mul_mv_id_iq1_s_f32` Metal kernel and matching CPU dot.
+- Prefill: new `kernel_mul_mm_id_iq1_s_f32` and `_f16` MM templates that reuse
+  the existing routed-MoE machinery.
+- The 2048-entry codebook lives in a single file (`iq1s_grid.inc`) that is
+  `#include`d by `ds4.c` and injected into the Metal source at runtime by
+  `ds4_metal.m`, so C and Metal stay in sync.
+- Run `make metal-smoke` to compile the Metal source without loading a model;
+  it surfaces MSL errors before you wait on a multi-GB download.
+
+The first prototype GGUF is meant to flip all routed-expert tensors to IQ1_S:
+
+| Tensor          | q2 (current) | q1 (this branch) |
+| ---             | ---          | ---              |
+| ffn_gate_exps   | IQ2_XXS      | IQ1_S            |
+| ffn_up_exps     | IQ2_XXS      | IQ1_S            |
+| ffn_down_exps   | Q2_K         | IQ1_S            |
+| everything else | unchanged    | unchanged        |
+
+Projected file size: ~63 GB on disk (~24 GB saved versus q2). That fits
+comfortably on 96 GB Mac Studios and barely on 64 GB MacBooks once you account
+for KV cache and OS overhead at moderate context (32k–128k). Reaching a
+comfortable 64 GB fit will likely need either a more aggressive quant (TQ1_0
+ternary) or sparse residency for cold experts; both are out of scope for this
+branch.
+
+To build the GGUF from the existing q2 file using `llama.cpp` (untested
+end-to-end with this engine; please file an issue if you try it):
+
+```sh
+# Once: get llama-quantize built somewhere on PATH.
+git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp && cmake -B build && cmake --build build -j
+
+# Convert routed expert tensors only; keep everything else.
+./build/bin/llama-quantize \
+  --allow-requantize \
+  --tensor-type 'blk\.\d+\.ffn_(gate|up|down)_exps\.weight=IQ1_S' \
+  ../ds4-64gb/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf \
+  ../ds4-64gb/gguf/DeepSeek-V4-Flash-IQ1S-routed-experts.gguf \
+  COPY
+```
+
+Then point `ds4` at the new file:
+
+```sh
+./ds4 -m gguf/DeepSeek-V4-Flash-IQ1S-routed-experts.gguf --ctx 32768 -p "Hi"
+```
+
+`./download_model.sh q1` is a placeholder for a future hosted version of the
+same file; it currently points at `adis-b/ds4-64gb-gguf` which is empty until
+someone uploads a tested artifact.
+
 ## Speed
 
 These are single-run Metal CLI numbers with `--ctx 32768`, `--nothink`, greedy
