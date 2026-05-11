@@ -1678,16 +1678,14 @@ static void ds4_quantize_row_q8_K(const float *x, block_q8_K *y, int64_t k) {
         }
 
         const float iscale = -127.0f / max;
+        /* Initialize bsums to zero so we can accumulate inline */
+        memset(y[b].bsums, 0, sizeof(y[b].bsums)); 
         for (int j = 0; j < QK_K; j++) {
             int v = (int)lrintf(iscale * x[j]);
             if (v > 127) v = 127;
             if (v < -128) v = -128;
             y[b].qs[j] = (int8_t)v;
-        }
-        for (int j = 0; j < QK_K / 16; j++) {
-            int sum = 0;
-            for (int i = 0; i < 16; i++) sum += y[b].qs[j * 16 + i];
-            y[b].bsums[j] = (int16_t)sum;
+            y[b].bsums[j >> 4] += v;
         }
         y[b].d = 1.0f / iscale;
         x += QK_K;
