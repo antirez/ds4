@@ -542,29 +542,23 @@ int ds4_rpc_handshake_server(ds4_rpc_handle *h, const ds4_rpc_config *cfg,
  * Drafts come first because their length is a small fixed integer; logits come
  * after so the receiver can stream-read them straight into the caller's buffer.
  */
-int ds4_rpc_decode_request(ds4_rpc_handle *h,
-                           uint32_t token, uint32_t pos,
-                           bool want_drafts,
-                           const float *residual_hc, uint64_t n_residual_floats,
-                           float *out_logits, uint64_t n_logit_floats,
-                           uint32_t *out_drafts, uint32_t max_drafts,
-                           uint32_t *out_n_drafts,
-                           char *err, size_t errlen) {
-    if (!h || !residual_hc || !out_logits) {
-        rpc_set_err(err, errlen, "decode_request: null arg");
+int ds4_rpc_decode_send(ds4_rpc_handle *h,
+                        uint32_t token, uint32_t pos,
+                        bool want_drafts,
+                        const float *residual_hc, uint64_t n_residual_floats,
+                        char *err, size_t errlen) {
+    if (!h || !residual_hc) {
+        rpc_set_err(err, errlen, "decode_send: null arg");
         return 1;
     }
-    if (out_n_drafts) *out_n_drafts = 0;
-
     const uint64_t residual_bytes = n_residual_floats * sizeof(float);
     const uint64_t total = 4u + 4u + 4u + 4u + 8u + residual_bytes;
     if (total > UINT32_MAX) {
-        rpc_set_err(err, errlen, "decode_request: residual too large");
+        rpc_set_err(err, errlen, "decode_send: residual too large");
         return 1;
     }
-
     uint8_t *buf = (uint8_t *)malloc((size_t)total);
-    if (!buf) { rpc_set_err(err, errlen, "decode_request: oom"); return 1; }
+    if (!buf) { rpc_set_err(err, errlen, "decode_send: oom"); return 1; }
     uint8_t *p = buf;
     put_u32_le(p, token);                  p += 4;
     put_u32_le(p, pos);                    p += 4;
@@ -574,17 +568,29 @@ int ds4_rpc_decode_request(ds4_rpc_handle *h,
     memcpy(p, residual_hc, (size_t)residual_bytes);
     int rc = frame_write(h->fd, DS4_RPC_OP_DECODE_REQ, buf, (uint32_t)total, err, errlen);
     free(buf);
-    if (rc) return 1;
+    return rc;
+}
+
+int ds4_rpc_decode_recv_reply(ds4_rpc_handle *h,
+                              float *out_logits, uint64_t n_logit_floats,
+                              uint32_t *out_drafts, uint32_t max_drafts,
+                              uint32_t *out_n_drafts,
+                              char *err, size_t errlen) {
+    if (!h || !out_logits) {
+        rpc_set_err(err, errlen, "decode_recv_reply: null arg");
+        return 1;
+    }
+    if (out_n_drafts) *out_n_drafts = 0;
 
     uint8_t op = 0;
     uint32_t reply_bytes = 0;
     if (frame_read_header(h->fd, &op, &reply_bytes, err, errlen)) return 1;
     if (op != DS4_RPC_OP_DECODE_REPLY) {
-        rpc_set_err(err, errlen, "decode_request: expected DECODE_REPLY, got op=%u", op);
+        rpc_set_err(err, errlen, "decode_recv_reply: expected DECODE_REPLY, got op=%u", op);
         return 1;
     }
     if (reply_bytes < 16u) {
-        rpc_set_err(err, errlen, "decode_request: reply header truncated (%u bytes)", reply_bytes);
+        rpc_set_err(err, errlen, "decode_recv_reply: reply header truncated (%u bytes)", reply_bytes);
         return 1;
     }
     uint8_t hdr[16];
@@ -596,14 +602,13 @@ int ds4_rpc_decode_request(ds4_rpc_handle *h,
         (uint64_t)n_drafts * sizeof(uint32_t) + got_floats * sizeof(float);
     if (reply_bytes - 16u != expect_payload) {
         rpc_set_err(err, errlen,
-                    "decode_request: reply payload size %u, expected %llu "
+                    "decode_recv_reply: reply payload size %u, expected %llu "
                     "(n_drafts=%u, n_logits=%llu)",
                     reply_bytes - 16u, (unsigned long long)expect_payload,
                     n_drafts, (unsigned long long)got_floats);
         return 1;
     }
     if (status != 0) {
-        /* Drain payload so the connection stays in sync. */
         uint8_t tmp[4096];
         uint64_t remaining = expect_payload;
         while (remaining > 0) {
@@ -611,24 +616,21 @@ int ds4_rpc_decode_request(ds4_rpc_handle *h,
             if (io_read_full(h->fd, tmp, (size_t)chunk, NULL, 0)) break;
             remaining -= chunk;
         }
-        rpc_set_err(err, errlen, "decode_request: tail returned error status %u", status);
+        rpc_set_err(err, errlen, "decode_recv_reply: tail returned error status %u", status);
         return 1;
     }
     if (got_floats != n_logit_floats) {
-        rpc_set_err(err, errlen, "decode_request: tail sent %llu floats, expected %llu",
+        rpc_set_err(err, errlen, "decode_recv_reply: tail sent %llu floats, expected %llu",
                     (unsigned long long)got_floats, (unsigned long long)n_logit_floats);
         return 1;
     }
-
-    /* Read draft tokens first.  If the caller doesn't want them (out_drafts
-     * is NULL or max_drafts is 0), drain into a scratch buffer. */
     if (n_drafts > 0) {
         const uint64_t draft_bytes = (uint64_t)n_drafts * sizeof(uint32_t);
         if (out_drafts && max_drafts > 0) {
             const uint32_t accept = n_drafts < max_drafts ? n_drafts : max_drafts;
             uint8_t drafts_buf[DS4_RPC_MAX_DRAFTS * sizeof(uint32_t)];
             if (draft_bytes > sizeof(drafts_buf)) {
-                rpc_set_err(err, errlen, "decode_request: too many drafts (%u)", n_drafts);
+                rpc_set_err(err, errlen, "decode_recv_reply: too many drafts (%u)", n_drafts);
                 return 1;
             }
             if (io_read_full(h->fd, drafts_buf, (size_t)draft_bytes, err, errlen)) return 1;
@@ -639,14 +641,30 @@ int ds4_rpc_decode_request(ds4_rpc_handle *h,
         } else {
             uint8_t tmp[DS4_RPC_MAX_DRAFTS * sizeof(uint32_t)];
             if (draft_bytes > sizeof(tmp)) {
-                rpc_set_err(err, errlen, "decode_request: too many drafts (%u) to drain", n_drafts);
+                rpc_set_err(err, errlen, "decode_recv_reply: too many drafts (%u) to drain", n_drafts);
                 return 1;
             }
             if (io_read_full(h->fd, tmp, (size_t)draft_bytes, err, errlen)) return 1;
         }
     }
-
     return io_read_full(h->fd, out_logits, (size_t)(n_logit_floats * sizeof(float)), err, errlen);
+}
+
+int ds4_rpc_decode_request(ds4_rpc_handle *h,
+                           uint32_t token, uint32_t pos,
+                           bool want_drafts,
+                           const float *residual_hc, uint64_t n_residual_floats,
+                           float *out_logits, uint64_t n_logit_floats,
+                           uint32_t *out_drafts, uint32_t max_drafts,
+                           uint32_t *out_n_drafts,
+                           char *err, size_t errlen) {
+    if (ds4_rpc_decode_send(h, token, pos, want_drafts,
+                            residual_hc, n_residual_floats, err, errlen) != 0) {
+        return 1;
+    }
+    return ds4_rpc_decode_recv_reply(h, out_logits, n_logit_floats,
+                                     out_drafts, max_drafts, out_n_drafts,
+                                     err, errlen);
 }
 
 int ds4_rpc_decode_recv(ds4_rpc_handle *h,

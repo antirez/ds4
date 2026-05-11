@@ -110,6 +110,21 @@ int ds4_rpc_decode_request(ds4_rpc_handle *h,
                            uint32_t *out_n_drafts,
                            char *err, size_t errlen);
 
+/* Split halves of decode_request for pipelined operation: the head can ship
+ * the request, do work, then collect the reply later.  Reply ordering on the
+ * socket is strict FIFO (tail processes serially); the head must call
+ * _recv_reply() once per outstanding _send(). */
+int ds4_rpc_decode_send(ds4_rpc_handle *h,
+                        uint32_t token, uint32_t pos,
+                        bool want_drafts,
+                        const float *residual_hc, uint64_t n_residual_floats,
+                        char *err, size_t errlen);
+int ds4_rpc_decode_recv_reply(ds4_rpc_handle *h,
+                              float *out_logits, uint64_t n_logit_floats,
+                              uint32_t *out_drafts, uint32_t max_drafts,
+                              uint32_t *out_n_drafts,
+                              char *err, size_t errlen);
+
 /* Tail-side: receive one decode request (residual + metadata) and emit one
  * decode reply (logits + optional MTP drafts).  The two halves run in the
  * worker's serve loop. */

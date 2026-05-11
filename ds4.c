@@ -15054,6 +15054,14 @@ static void ds4_acquire_instance_lock(void) {
     }
 }
 
+#ifndef DS4_NO_METAL
+typedef struct {
+    uint32_t n_comp[DS4_N_LAYER];
+    uint32_t n_index_comp[DS4_N_LAYER];
+    uint32_t mtp_n_raw;
+} ds4_spec_frontier;
+#endif
+
 struct ds4_session {
     ds4_engine *engine;
 #ifndef DS4_NO_METAL
@@ -15074,6 +15082,20 @@ struct ds4_session {
     int mtp_draft_token;
     uint64_t mtp_probe_total;
     uint64_t mtp_probe_hit;
+    /* Phase 6 head-side speculative prefetch.  When true, after the previous
+     * decode reply the head ran L0-L20 for `spec_predicted_token` (= prev
+     * reply's drafts[0]) and shipped the request to the tail; we still owe
+     * one decode_recv_reply.  `spec_snapshot` is the head KV state captured
+     * BEFORE the speculative L0-L20 so a mispredict can roll back. */
+    bool rpc_spec_in_flight;
+    uint32_t rpc_spec_predicted_token;
+    uint32_t rpc_spec_pos;
+#ifndef DS4_NO_METAL
+    ds4_spec_frontier rpc_spec_snapshot;
+#endif
+    /* Aggregate counters for phase 6 hit/miss telemetry. */
+    uint64_t rpc_spec_hit;
+    uint64_t rpc_spec_miss;
     ds4_session_progress_fn progress;
     void *progress_ud;
     uint32_t prefill_cap;
@@ -15313,12 +15335,6 @@ const ds4_tokens *ds4_session_tokens(ds4_session *s) {
 }
 
 #ifndef DS4_NO_METAL
-typedef struct {
-    uint32_t n_comp[DS4_N_LAYER];
-    uint32_t n_index_comp[DS4_N_LAYER];
-    uint32_t mtp_n_raw;
-} ds4_spec_frontier;
-
 static void spec_frontier_free(ds4_spec_frontier *f) {
     if (!f) return;
     memset(f, 0, sizeof(*f));
@@ -17241,6 +17257,56 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     return k;
 }
 
+#ifndef DS4_NO_METAL
+/* Phase 6 head-side speculative prefetch: drain a stale in-flight reply,
+ * rewind the tail past the speculative token, and restore head KV from the
+ * snapshot taken before the speculative L0-L20.  Used on mispredict and on
+ * any session boundary (invalidate / rewind / shutdown) that needs to clear
+ * the speculative state before doing other RPC work.
+ *
+ * Returns 0 on success.  On failure the connection is closed and
+ * `rpc_peer` is NULL-ed; rpc_spec_in_flight is always cleared. */
+static int rpc_spec_abort(ds4_session *s, char *err, size_t errlen) {
+    if (!s || !s->rpc_spec_in_flight) return 0;
+    ds4_engine *e = s->engine;
+    if (!e || !e->rpc_peer) {
+        spec_frontier_free(&s->rpc_spec_snapshot);
+        s->rpc_spec_in_flight = false;
+        return 0;
+    }
+    s->rpc_spec_miss++;
+    char rpc_err[256] = {0};
+    int rc = 0;
+    if (ds4_rpc_decode_recv_reply(e->rpc_peer,
+                                  s->logits, DS4_N_VOCAB,
+                                  NULL, 0, NULL,
+                                  rpc_err, sizeof(rpc_err)) != 0) {
+        if (err && errlen) {
+            snprintf(err, errlen, "rpc-spec: drain reply: %s", rpc_err);
+        }
+        ds4_rpc_close(e->rpc_peer);
+        e->rpc_peer = NULL;
+        rc = 1;
+    } else if (ds4_rpc_rewind(e->rpc_peer, s->rpc_spec_pos,
+                              rpc_err, sizeof(rpc_err)) != 0) {
+        if (err && errlen) {
+            snprintf(err, errlen, "rpc-spec: rewind tail: %s", rpc_err);
+        }
+        ds4_rpc_close(e->rpc_peer);
+        e->rpc_peer = NULL;
+        rc = 1;
+    } else if (!spec_frontier_restore(&s->rpc_spec_snapshot, s)) {
+        if (err && errlen) {
+            snprintf(err, errlen, "rpc-spec: restore head KV failed");
+        }
+        rc = 1;
+    }
+    spec_frontier_free(&s->rpc_spec_snapshot);
+    s->rpc_spec_in_flight = false;
+    return rc;
+}
+#endif
+
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
 #ifdef DS4_NO_METAL
@@ -17270,22 +17336,32 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         }
         s->mtp_draft_valid = false;
     }
-    if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
-                                        (uint32_t)token,
-                                        (uint32_t)s->checkpoint.len,
-                                        s->logits))
-    {
-        snprintf(err, errlen, "Metal decode failed");
-        s->checkpoint_valid = false;
-        return 1;
-    }
-
-    /* Pipeline-parallel head: the local encode produced a residual in cur_hc
-     * but no logits (we own only a prefix of the layers).  Ship the residual
-     * to the tail worker and let it run the remaining layers + output head;
-     * the returned logits land in s->logits exactly as if we had run the
-     * full graph locally. */
-    if (e->rpc_peer) {
+    /* Single-host path: head owns all layers, so just eval and produce
+     * logits locally.  Under RPC the eval is interleaved with ship/recv and
+     * gated by the prefetch hit/miss state below. */
+    if (!e->rpc_peer) {
+        if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
+                                            (uint32_t)token,
+                                            (uint32_t)s->checkpoint.len,
+                                            s->logits))
+        {
+            snprintf(err, errlen, "Metal decode failed");
+            s->checkpoint_valid = false;
+            return 1;
+        }
+    } else {
+        /* Pipeline-parallel head: ship the residual to the tail worker and
+         * let it run the remaining layers + output head; the returned logits
+         * land in s->logits exactly as if we had run the full graph locally.
+         *
+         * Phase 6 prefetch (DS4_RPC_PREFETCH=1):
+         *   - hit:    prev call already shipped this token speculatively;
+         *             head KV is already advanced -- skip L0-L20 and just
+         *             collect the pending reply.
+         *   - miss:   prev call shipped a different token speculatively;
+         *             drain that reply, rewind tail, restore head KV, then
+         *             run the normal sync ship/recv.
+         *   - none:   no spec in flight; normal sync ship/recv. */
         const uint64_t n_residual = ds4_residual_hc_floats();
         float *residual = s->rpc_residual_scratch;
         if (!residual) {
@@ -17293,45 +17369,136 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             s->checkpoint_valid = false;
             return 1;
         }
-        char rpc_err[512] = {0};
-        if (ds4_session_export_residual_hc(s, residual, n_residual,
-                                           rpc_err, sizeof(rpc_err)) != 0) {
-            snprintf(err, errlen, "rpc: export residual: %s", rpc_err);
-            s->checkpoint_valid = false;
-            return 1;
-        }
-        /* Ask the tail for MTP drafts iff the head is open to drafting on
-         * this eval (probe_mtp) and the peer reports MTP available. */
         const bool ask_drafts = probe_mtp && e->rpc_tail_has_mtp &&
                                 e->mtp_draft_tokens > 0;
+        const bool prefetch_on = ask_drafts && getenv("DS4_RPC_PREFETCH") != NULL;
+        char rpc_err[512] = {0};
         uint32_t drafts_buf[DS4_RPC_MAX_DRAFTS] = {0};
         uint32_t n_drafts_returned = 0;
-        if (ds4_rpc_decode_request(e->rpc_peer,
-                                   (uint32_t)token,
-                                   (uint32_t)s->checkpoint.len,
-                                   ask_drafts,
-                                   residual, n_residual,
-                                   s->logits, DS4_N_VOCAB,
-                                   ask_drafts ? drafts_buf : NULL,
-                                   ask_drafts ? DS4_RPC_MAX_DRAFTS : 0u,
-                                   ask_drafts ? &n_drafts_returned : NULL,
-                                   rpc_err, sizeof(rpc_err)) != 0) {
-            ds4_rpc_close(e->rpc_peer);
-            e->rpc_peer = NULL;
-            snprintf(err, errlen, "rpc: decode request to tail: %s "
-                                  "(connection dropped)", rpc_err);
-            s->checkpoint_valid = false;
-            return 1;
+
+        const bool spec_hit = s->rpc_spec_in_flight &&
+                              s->rpc_spec_predicted_token == (uint32_t)token &&
+                              s->rpc_spec_pos == (uint32_t)s->checkpoint.len;
+
+        if (spec_hit) {
+            /* HIT: head KV already advanced through this token in the prev
+             * eval's speculative L0-L20.  Just collect the spec reply. */
+            s->rpc_spec_hit++;
+            if (ds4_rpc_decode_recv_reply(e->rpc_peer,
+                                          s->logits, DS4_N_VOCAB,
+                                          ask_drafts ? drafts_buf : NULL,
+                                          ask_drafts ? DS4_RPC_MAX_DRAFTS : 0u,
+                                          ask_drafts ? &n_drafts_returned : NULL,
+                                          rpc_err, sizeof(rpc_err)) != 0) {
+                ds4_rpc_close(e->rpc_peer);
+                e->rpc_peer = NULL;
+                spec_frontier_free(&s->rpc_spec_snapshot);
+                s->rpc_spec_in_flight = false;
+                snprintf(err, errlen, "rpc-spec: hit recv_reply: %s "
+                                      "(connection dropped)", rpc_err);
+                s->checkpoint_valid = false;
+                return 1;
+            }
+            spec_frontier_free(&s->rpc_spec_snapshot);
+            s->rpc_spec_in_flight = false;
+        } else {
+            /* MISS path: abort any in-flight spec, then sync ship/recv. */
+            if (s->rpc_spec_in_flight) {
+                char abort_err[256] = {0};
+                if (rpc_spec_abort(s, abort_err, sizeof(abort_err)) != 0) {
+                    snprintf(err, errlen, "rpc-spec: abort on miss: %s",
+                             abort_err);
+                    s->checkpoint_valid = false;
+                    return 1;
+                }
+            }
+            if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
+                                                (uint32_t)token,
+                                                (uint32_t)s->checkpoint.len,
+                                                s->logits))
+            {
+                snprintf(err, errlen, "Metal decode failed");
+                s->checkpoint_valid = false;
+                return 1;
+            }
+            if (ds4_session_export_residual_hc(s, residual, n_residual,
+                                               rpc_err, sizeof(rpc_err)) != 0) {
+                snprintf(err, errlen, "rpc: export residual: %s", rpc_err);
+                s->checkpoint_valid = false;
+                return 1;
+            }
+            if (ds4_rpc_decode_request(e->rpc_peer,
+                                       (uint32_t)token,
+                                       (uint32_t)s->checkpoint.len,
+                                       ask_drafts,
+                                       residual, n_residual,
+                                       s->logits, DS4_N_VOCAB,
+                                       ask_drafts ? drafts_buf : NULL,
+                                       ask_drafts ? DS4_RPC_MAX_DRAFTS : 0u,
+                                       ask_drafts ? &n_drafts_returned : NULL,
+                                       rpc_err, sizeof(rpc_err)) != 0) {
+                ds4_rpc_close(e->rpc_peer);
+                e->rpc_peer = NULL;
+                snprintf(err, errlen, "rpc: decode request to tail: %s "
+                                      "(connection dropped)", rpc_err);
+                s->checkpoint_valid = false;
+                return 1;
+            }
         }
-        /* Store the first draft so speculative_argmax (and the existing
-         * mtp_draft_token plumbing) sees it after this eval.  Additional
-         * drafts go in s->rpc_extra_drafts for the verification loop. */
+
+        /* Store drafts (same shape as before; speculative_argmax reads
+         * them).  Under prefetch, the batched-verify path in
+         * speculative_argmax must be disabled or it will replay the spec
+         * work — handled in Phase 6.4. */
         if (ask_drafts && n_drafts_returned > 0) {
             s->mtp_draft_token = (int)drafts_buf[0];
             s->mtp_draft_valid = true;
             s->rpc_n_extra_drafts = n_drafts_returned > 1 ? n_drafts_returned - 1 : 0;
             for (uint32_t i = 1; i < n_drafts_returned && i - 1 < DS4_RPC_MAX_DRAFTS; i++) {
                 s->rpc_extra_drafts[i - 1] = drafts_buf[i];
+            }
+        }
+
+        /* Phase 6 prefetch START: if we just got drafts and don't already
+         * have a spec in flight, snapshot head KV, run L0-L20 on drafts[0]
+         * speculatively, and ship the request.  The next eval call will
+         * either hit (token matches drafts[0]) or miss (abort + sync). */
+        if (prefetch_on && !s->rpc_spec_in_flight && n_drafts_returned > 0) {
+            const uint32_t pred = drafts_buf[0];
+            const uint32_t spec_pos = (uint32_t)(s->checkpoint.len + 1);
+            if (spec_pos < (uint32_t)s->ctx_size &&
+                spec_frontier_snapshot(&s->rpc_spec_snapshot, s))
+            {
+                bool ok = metal_graph_eval_token_raw_swa(&s->graph, &e->model,
+                                                        &e->weights,
+                                                        pred, spec_pos,
+                                                        s->logits);
+                if (ok) {
+                    ok = ds4_session_export_residual_hc(s, residual, n_residual,
+                                                        rpc_err, sizeof(rpc_err)) == 0;
+                }
+                if (ok) {
+                    ok = ds4_rpc_decode_send(e->rpc_peer, pred, spec_pos,
+                                             true,
+                                             residual, n_residual,
+                                             rpc_err, sizeof(rpc_err)) == 0;
+                }
+                if (ok) {
+                    s->rpc_spec_in_flight = true;
+                    s->rpc_spec_predicted_token = pred;
+                    s->rpc_spec_pos = spec_pos;
+                } else {
+                    /* Best-effort: roll back head KV and skip prefetch this
+                     * round.  Connection may be broken if send failed. */
+                    (void)spec_frontier_restore(&s->rpc_spec_snapshot, s);
+                    spec_frontier_free(&s->rpc_spec_snapshot);
+                    if (e->rpc_peer == NULL) {
+                        /* send-failed close already happened in
+                         * decode_send's error path? No — decode_send
+                         * doesn't close.  Leave peer alone and surface
+                         * on next call. */
+                    }
+                }
             }
         }
     }
@@ -17485,7 +17652,17 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
      * roundtrip instead of N, and the tail amortizes layer setup across
      * the batch -- the same speedup pattern as the single-host batched
      * verifiers. */
-    if (e->rpc_peer && e->rpc_tail_has_mtp && s->mtp_draft_valid &&
+    /* Phase 6 prefetch already consumed the prediction in
+     * ds4_session_eval_internal (it ran L0-L20 on drafts[0] and shipped
+     * before this function was even called).  Running the batched-verify
+     * path here would re-snapshot the same spec_* buffers and re-do the
+     * head's L0-L20 work, producing redundant load and clobbering the
+     * pending in-flight reply.  Disable batched-verify when prefetch is
+     * on; the prefetch hit/miss path provides the speedup. */
+    const bool rpc_prefetch_on = (e->rpc_peer && e->rpc_tail_has_mtp &&
+                                  getenv("DS4_RPC_PREFETCH") != NULL);
+    if (!rpc_prefetch_on &&
+        e->rpc_peer && e->rpc_tail_has_mtp && s->mtp_draft_valid &&
         e->mtp_draft_tokens > 1)
     {
         int draft_n = (int)s->rpc_n_extra_drafts + 1; /* +1 for draft 0 */
@@ -18222,6 +18399,12 @@ static void rpc_propagate_reset(ds4_session *s, const char *origin) {
 
 void ds4_session_invalidate(ds4_session *s) {
     if (!s) return;
+#ifndef DS4_NO_METAL
+    if (s->rpc_spec_in_flight) {
+        char err[256] = {0};
+        (void)rpc_spec_abort(s, err, sizeof(err));
+    }
+#endif
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
@@ -18232,6 +18415,12 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (!s) return;
     if (pos < 0) pos = 0;
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
+#ifndef DS4_NO_METAL
+    if (s->rpc_spec_in_flight) {
+        char err[256] = {0};
+        (void)rpc_spec_abort(s, err, sizeof(err));
+    }
+#endif
     s->checkpoint.len = pos;
     s->mtp_draft_valid = false;
     /* Under RPC, tell the tail to truncate its checkpoint to the same
