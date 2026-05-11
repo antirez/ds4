@@ -4,6 +4,7 @@
 /ds4_server_test
 /ds4_test
 /ds4flash.gguf
+/metal-smoke
 /TODO.md
 /gguf/
 *.o

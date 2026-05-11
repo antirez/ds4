@@ -29,6 +29,7 @@ enum {
     DS4_METAL_TENSOR_Q2_K    = 10,
     DS4_METAL_TENSOR_Q4_K    = 12,
     DS4_METAL_TENSOR_IQ2_XXS = 16,
+    DS4_METAL_TENSOR_IQ1_S   = 19,
 };
 
 static id<MTLDevice> g_device;
@@ -76,8 +77,10 @@ static id<MTLComputePipelineState> g_moe_mul_mv_id_q4_k_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_q4_k_pair_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_q4_k_pair_swiglu_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_q4_k_sum6_pipeline;
+static id<MTLComputePipelineState> g_moe_mul_mv_id_iq1_s_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mm_id_iq2_xxs_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mm_id_q2_k_pipeline;
+static id<MTLComputePipelineState> g_moe_mul_mm_id_iq1_s_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mm_id_q4_k_pipeline;
 static id<MTLComputePipelineState> g_rope_tail_batch_pipeline;
 static id<MTLComputePipelineState> g_dsv4_fp8_kv_quantize_pipeline;
@@ -1261,6 +1264,31 @@ static NSString *ds4_gpu_full_source(void) {
         }
         [source appendFormat:@"\n// appended %@\n%@\n", loaded_path, loaded];
     }
+
+    // Inject the IQ1_S codebook (single source of truth: iq1s_grid.inc, also
+    // #included by ds4.c). Replaces the placeholder marker that moe.metal puts
+    // inside ds4_metal_iq1s_grid[2048].
+    NSString *grid_path = nil;
+    for (NSString *p in @[@"iq1s_grid.inc", @"./iq1s_grid.inc"]) {
+        if ([fm fileExistsAtPath:p]) { grid_path = p; break; }
+    }
+    if (!grid_path) {
+        fprintf(stderr, "ds4: iq1s_grid.inc not found (required by Metal IQ1_S kernel)\n");
+        return nil;
+    }
+    NSError *grid_err = nil;
+    NSString *grid_data = [NSString stringWithContentsOfFile:grid_path
+                                                    encoding:NSUTF8StringEncoding
+                                                       error:&grid_err];
+    if (!grid_data) {
+        fprintf(stderr, "ds4: failed to read %s: %s\n",
+                [grid_path UTF8String], [[grid_err localizedDescription] UTF8String]);
+        return nil;
+    }
+    [source replaceOccurrencesOfString:@"/*IQ1S_GRID_PLACEHOLDER*/ 0"
+                            withString:grid_data
+                               options:0
+                                 range:NSMakeRange(0, [source length])];
     return source;
 }
 
@@ -3183,6 +3211,26 @@ int ds4_gpu_init(void) {
         }
 
         error = nil;
+        fn = [library newFunctionWithName:@"kernel_mul_mv_id_iq1_s_f32"
+                           constantValues:moe_mv_id_constants
+                                    error:&error];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_mul_mv_id_iq1_s_f32 function not found: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_moe_mul_mv_id_iq1_s_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_moe_mul_mv_id_iq1_s_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_mul_mv_id_iq1_s_f32 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        error = nil;
         fn = [library newFunctionWithName:@"kernel_mul_mv_id_q2_K_sum6_f32"
                            constantValues:moe_mv_id_constants
                                     error:&error];
@@ -3983,6 +4031,8 @@ void ds4_gpu_cleanup(void) {
         g_hc_weighted_sum_pipeline = nil;
         g_hc_expand_pipeline = nil;
         g_moe_mul_mv_id_iq2_xxs_pipeline = nil;
+        g_moe_mul_mv_id_iq1_s_pipeline = nil;
+        g_moe_mul_mm_id_iq1_s_pipeline = nil;
         g_moe_mul_mv_id_iq2_xxs_pair_pipeline = nil;
         g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline = nil;
         g_moe_mul_mv_id_q2_k_pipeline = nil;
@@ -11561,7 +11611,8 @@ static uint32_t ds4_gpu_routed_mv_nr0(uint32_t type) {
     switch (type) {
     case DS4_METAL_TENSOR_Q4_K:    return 2;
     case DS4_METAL_TENSOR_Q2_K:
-    case DS4_METAL_TENSOR_IQ2_XXS: return 4;
+    case DS4_METAL_TENSOR_IQ2_XXS:
+    case DS4_METAL_TENSOR_IQ1_S:   return 4;
     default:                       return 0;
     }
 }
@@ -11578,6 +11629,7 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mv_pipeline(uint32_t type) {
     case DS4_METAL_TENSOR_IQ2_XXS: return g_moe_mul_mv_id_iq2_xxs_pipeline;
     case DS4_METAL_TENSOR_Q2_K:    return g_moe_mul_mv_id_q2_k_pipeline;
     case DS4_METAL_TENSOR_Q4_K:    return g_moe_mul_mv_id_q4_k_pipeline;
+    case DS4_METAL_TENSOR_IQ1_S:   return g_moe_mul_mv_id_iq1_s_pipeline;
     default:                       return nil;
     }
 }
@@ -11602,6 +11654,12 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_pipeline(uint32_t type) {
                 ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32", false);
         }
         return g_moe_mul_mm_id_q4_k_pipeline;
+    case DS4_METAL_TENSOR_IQ1_S:
+        if (!g_moe_mul_mm_id_iq1_s_pipeline) {
+            g_moe_mul_mm_id_iq1_s_pipeline =
+                ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq1_s_f32", false);
+        }
+        return g_moe_mul_mm_id_iq1_s_pipeline;
     default:
         return nil;
     }
@@ -11615,6 +11673,8 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_f16_rhs_pipeline(uint32_t t
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f16", false);
     case DS4_METAL_TENSOR_Q4_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f16", false);
+    case DS4_METAL_TENSOR_IQ1_S:
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq1_s_f16", false);
     default:
         return nil;
     }
