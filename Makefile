@@ -7,6 +7,10 @@ UNAME_S := $(shell uname -s)
 NATIVE_LDLIBS := $(LDLIBS)
 METAL_SRCS := $(wildcard metal/*.metal)
 
+ifeq ($(UNAME_S),Linux)
+CFLAGS += -D_GNU_SOURCE
+endif
+
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 CORE_OBJS = ds4.o ds4_metal.o

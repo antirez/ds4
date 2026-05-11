@@ -65,6 +65,11 @@ static void cli_interrupt_clear(void) {
 }
 
 static void usage(FILE *fp) {
+#ifdef DS4_NO_METAL
+    const char *default_backend = "cpu";
+#else
+    const char *default_backend = "metal";
+#endif
     fprintf(fp,
         "Usage: ds4 [(-p PROMPT | --prompt-file FILE)] [options]\n"
         "\n"
@@ -88,11 +93,11 @@ static void usage(FILE *fp) {
         "  -c, --ctx N\n"
         "      Context size allocated for the session. Default: 32768\n"
         "  --metal\n"
-        "      Use the Metal graph backend. This is the normal fast path and the default.\n"
+        "      Use the Metal graph backend. This is the normal fast path.\n"
         "  --cpu\n"
         "      Use the CPU reference/debug backend. Not recommended for normal inference.\n"
         "  --backend NAME\n"
-        "      Select backend explicitly: metal or cpu. Default: metal\n"
+        "      Select backend explicitly: metal or cpu. Default: %s\n"
         "  -t, --threads N\n"
         "      CPU helper threads for host-side or reference work.\n"
         "  --quality\n"
@@ -163,11 +168,13 @@ static void usage(FILE *fp) {
         "\n"
         "Notes:\n"
         "  The CLI keeps KV cache state across interactive turns on the Metal backend.\n"
+        "  Non-Metal builds support one-shot CPU generation and diagnostics, not interactive chat.\n"
         "  Long added input is processed with batched prefill; short continuations use decode.\n"
         "  Startup prints the extra context-buffer memory for the selected context size.\n"
         "\n"
         "  -h, --help\n"
-        "      Show this help.\n");
+        "      Show this help.\n",
+        default_backend);
 }
 
 static int parse_int(const char *s, const char *opt) {
@@ -722,9 +729,13 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
             fprintf(stderr, "ds4: diagnostic run completed on the native %s path.\n",
                     ds4_backend_name(cfg->engine.backend));
         }
-    } else if (cfg->gen.temperature > 0.0f || ds4_engine_mtp_draft_tokens(engine) > 1) {
+    } else if (cfg->engine.backend == DS4_BACKEND_METAL &&
+               (cfg->gen.temperature > 0.0f || ds4_engine_mtp_draft_tokens(engine) > 1)) {
         rc = run_sampled_generation(engine, cfg, &prompt);
     } else {
+        if (cfg->engine.backend == DS4_BACKEND_CPU && cfg->gen.temperature > 0.0f) {
+            fprintf(stderr, "ds4: CPU backend uses greedy argmax generation; sampling requires Metal\n");
+        }
         token_printer printer = {
             .engine = engine,
             .fp = stdout,
@@ -1155,7 +1166,11 @@ static cli_config parse_options(int argc, char **argv) {
     cli_config c = {
         .engine = {
             .model_path = "ds4flash.gguf",
+#ifdef DS4_NO_METAL
+            .backend = DS4_BACKEND_CPU,
+#else
             .backend = DS4_BACKEND_METAL,
+#endif
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
         },
@@ -1291,6 +1306,12 @@ int main(int argc, char **argv) {
     if (cfg.inspect) {
         ds4_engine_summary(engine);
     } else if (cfg.gen.prompt == NULL) {
+        if (cfg.engine.backend != DS4_BACKEND_METAL) {
+            fprintf(stderr, "ds4: interactive chat requires the Metal session backend; use -p for one-shot CPU generation\n");
+            ds4_engine_close(engine);
+            free(cfg.prompt_owned);
+            return 1;
+        }
         rc = run_repl(engine, &cfg);
     } else {
         rc = run_generation(engine, &cfg);

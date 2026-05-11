@@ -7,7 +7,11 @@ Q4_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Sh
 MTP_FILE="DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-OUT_DIR="$ROOT/gguf"
+OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
+case "$OUT_DIR" in
+    /*) ;;
+    *) OUT_DIR="$ROOT/$OUT_DIR" ;;
+esac
 TOKEN=${HF_TOKEN:-}
 
 usage() {
@@ -34,8 +38,12 @@ Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
                  cache is used if present.
 
+Environment:
+  DS4_GGUF_DIR   Directory used for downloaded GGUF files.
+                 Default: ./gguf
+
 After q2/q4 downloads the script updates:
-  ./ds4flash.gguf -> gguf/<selected model>
+  ./ds4flash.gguf -> <download directory>/<selected model>
 
 Then the default commands work:
   ./ds4 -p "Hello"
@@ -126,8 +134,8 @@ if [ "$MODEL" = "mtp" ]; then
     echo "  ./ds4 --mtp gguf/$MTP_FILE --mtp-draft 2"
 else
     cd "$ROOT"
-    ln -sfn "gguf/$MODEL_FILE" ds4flash.gguf
-    echo "Linked ./ds4flash.gguf -> gguf/$MODEL_FILE"
+    ln -sfn "$OUT_DIR/$MODEL_FILE" ds4flash.gguf
+    echo "Linked ./ds4flash.gguf -> $OUT_DIR/$MODEL_FILE"
 fi
 
 echo
