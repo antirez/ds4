@@ -5922,6 +5922,10 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
                                        int store_len, const char *reason) {
     kv_disk_cache *kc = &s->kv;
     if (!kc->enabled) return false;
+    /* Under pipeline-parallel RPC the head engine only owns half the layers,
+     * so a snapshot would cover an incomplete graph -- useless for resume
+     * and confusing for the load path which expects full state. */
+    if (ds4_engine_has_rpc_peer(s->engine)) return false;
     if (!tokens || store_len < kc->opt.min_tokens) return false;
     const int original_len = tokens->len;
 
@@ -7978,7 +7982,14 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--quant")) {
             c.quant = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
-            c.engine.mtp_path = need_arg(&i, argc, argv, arg);
+            /* Accept either "--mtp PATH" or bare "--mtp" (resolves to the
+             * canonical MTP GGUF in ./gguf/). */
+            const char *next = (i + 1 < argc) ? argv[i + 1] : NULL;
+            if (next && next[0] && next[0] != '-') {
+                c.engine.mtp_path = next; i++;
+            } else {
+                c.engine.mtp_path = "auto";
+            }
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
@@ -8084,6 +8095,18 @@ static server_config parse_options(int argc, char **argv) {
         if (resolve_err[0]) server_log(DS4_LOG_DEFAULT, "ds4-server: %s", resolve_err);
         c.engine.model_path = resolved;
     }
+    if (c.engine.mtp_path) {
+        char resolve_err[256] = {0};
+        const char *resolved = ds4_resolve_mtp_path(c.engine.mtp_path,
+                                                    resolve_err, sizeof(resolve_err));
+        if (!resolved) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: %s",
+                       resolve_err[0] ? resolve_err :
+                       "--mtp requested but no MTP GGUF found in ./gguf/");
+            exit(2);
+        }
+        c.engine.mtp_path = resolved;
+    }
 
     return c;
 }
@@ -8100,6 +8123,9 @@ int main(int argc, char **argv) {
 
     server_config cfg = parse_options(argc, argv);
 
+    /* Propagate --ctx into the engine so the RPC handshake can assert
+     * head and tail agree on KV window size.  No-op for single-host. */
+    cfg.engine.rpc_ctx_size = cfg.ctx_size;
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
 

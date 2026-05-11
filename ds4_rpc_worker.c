@@ -35,6 +35,9 @@
 typedef struct {
     const char *model_path;
     const char *quant;                 /* --quant q2|q4, NULL if unspecified */
+    const char *mtp_path;              /* optional MTP GGUF for speculative drafting */
+    int         mtp_draft_tokens;      /* max drafts per speculative step */
+    float       mtp_margin;            /* confidence margin for fast verifier */
     const char *bind_host;
     uint16_t    port;
     int         layer_start;
@@ -66,6 +69,14 @@ static void worker_usage(const char *prog) {
             "  --ctx N                Context size for session.  Default: %u\n"
             "  --routed-quant-bits N  2 or 4; declared in handshake so the head\n"
             "                         can refuse if it mixed q2 and q4 weights.\n"
+            "  --mtp [FILE]           Enable MTP for speculative decoding.  With\n"
+            "                         a FILE argument, load that GGUF; bare --mtp\n"
+            "                         resolves to the canonical MTP path in\n"
+            "                         ./gguf/ (from ./download_model.sh mtp).\n"
+            "                         When set, the worker runs MTP drafts after\n"
+            "                         each decode and ships them to the head.\n"
+            "  --mtp-draft N          Max draft tokens per speculative step (1-16).\n"
+            "  --mtp-margin F         Confidence margin for the fast verifier.\n"
             "  -h, --help             This help.\n",
             prog, WORKER_DEFAULT_PORT, WORKER_DEFAULT_CTX);
 }
@@ -94,6 +105,9 @@ static int parse_args(int argc, char **argv, worker_opts *o) {
     o->layer_end = -1;
     o->ctx_size = WORKER_DEFAULT_CTX;
     o->routed_quant_bits = 0;
+    o->mtp_path = NULL;
+    o->mtp_draft_tokens = 1;
+    o->mtp_margin = 0.0f;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -127,6 +141,29 @@ static int parse_args(int argc, char **argv, worker_opts *o) {
         } else if (!strcmp(a, "--routed-quant-bits")) {
             if (parse_int_arg(a, next, &o->routed_quant_bits)) return 1;
             i++;
+        } else if (!strcmp(a, "--mtp")) {
+            /* Accept either "--mtp PATH" or bare "--mtp" (resolves to the
+             * canonical MTP GGUF in ./gguf/ via ds4_resolve_mtp_path). */
+            if (next && next[0] && next[0] != '-') {
+                o->mtp_path = next; i++;
+            } else {
+                o->mtp_path = "auto";
+            }
+        } else if (!strcmp(a, "--mtp-draft")) {
+            if (parse_int_arg(a, next, &o->mtp_draft_tokens)) return 1;
+            if (o->mtp_draft_tokens < 1) o->mtp_draft_tokens = 1;
+            if (o->mtp_draft_tokens > 16) o->mtp_draft_tokens = 16;
+            i++;
+        } else if (!strcmp(a, "--mtp-margin")) {
+            if (!next) { fprintf(stderr, "%s needs a value\n", a); return 1; }
+            char *endp = NULL;
+            float v = strtof(next, &endp);
+            if (endp == next) {
+                fprintf(stderr, "ds4-rpc-worker: --mtp-margin not a float: %s\n", next);
+                return 1;
+            }
+            o->mtp_margin = v;
+            i++;
         } else {
             fprintf(stderr, "ds4-rpc-worker: unknown argument: %s\n", a);
             worker_usage(argv[0]);
@@ -158,6 +195,23 @@ static int parse_args(int argc, char **argv, worker_opts *o) {
         }
         if (resolve_err[0]) fprintf(stderr, "ds4-rpc-worker: %s\n", resolve_err);
         o->model_path = resolved;
+    }
+    /* MTP path: same pattern.  If --mtp wasn't passed, mtp_path stays NULL
+     * and the engine just won't load MTP.  If --mtp was passed (with or
+     * without an explicit path), resolve to either the explicit path or
+     * the canonical gguf/<MTP>.gguf. */
+    if (o->mtp_path) {
+        char resolve_err[256] = {0};
+        const char *resolved = ds4_resolve_mtp_path(o->mtp_path,
+                                                    resolve_err, sizeof(resolve_err));
+        if (!resolved) {
+            fprintf(stderr, "ds4-rpc-worker: %s\n",
+                    resolve_err[0] ? resolve_err :
+                    "--mtp requested but no MTP GGUF found in ./gguf/");
+            return 1;
+        }
+        o->mtp_path = resolved;
+        fprintf(stderr, "ds4-rpc-worker: MTP path resolved to %s\n", resolved);
     }
     return 0;
 }
@@ -204,10 +258,11 @@ int main(int argc, char **argv) {
      * is gated to match. */
     ds4_engine_options eopt = {
         .model_path = opts.model_path,
+        .mtp_path = opts.mtp_path,
         .backend = DS4_BACKEND_METAL,
         .n_threads = 0,
-        .mtp_draft_tokens = 1,
-        .mtp_margin = 0.0f,
+        .mtp_draft_tokens = opts.mtp_draft_tokens,
+        .mtp_margin = opts.mtp_margin,
         .warm_weights = false,
         .quality = true,
         .n_layer_start = opts.layer_start,
@@ -231,17 +286,26 @@ int main(int argc, char **argv) {
         ? opts.routed_quant_bits
         : ds4_engine_routed_quant_bits(engine);
 
+    const bool has_mtp = ds4_engine_has_mtp(engine);
     ds4_rpc_config cfg = {
-        .version           = DS4_RPC_VERSION,
-        .n_layer_total     = ds4_model_n_layer(),
-        .n_embd            = ds4_model_n_embd(),
-        .n_hc              = ds4_model_n_hc(),
-        .n_vocab           = ds4_model_n_vocab(),
-        .routed_quant_bits = (uint32_t)quant_bits,
-        .tail_layer_start  = (uint32_t)opts.layer_start,
-        .tail_layer_end    = (uint32_t)opts.layer_end,
-        .model_file_bytes  = model_bytes,
+        .version                 = DS4_RPC_VERSION,
+        .n_layer_total           = ds4_model_n_layer(),
+        .n_embd                  = ds4_model_n_embd(),
+        .n_hc                    = ds4_model_n_hc(),
+        .n_vocab                 = ds4_model_n_vocab(),
+        .routed_quant_bits       = (uint32_t)quant_bits,
+        .tail_layer_start        = (uint32_t)opts.layer_start,
+        .tail_layer_end          = (uint32_t)opts.layer_end,
+        .ctx_size                = (uint32_t)opts.ctx_size,
+        .tail_has_mtp            = has_mtp ? 1u : 0u,
+        .tail_mtp_draft_tokens   = has_mtp ? (uint32_t)opts.mtp_draft_tokens : 0u,
+        .model_file_bytes        = model_bytes,
     };
+    if (has_mtp) {
+        fprintf(stderr,
+                "ds4-rpc-worker: MTP enabled (max drafts/step = %d, margin=%.3f)\n",
+                opts.mtp_draft_tokens, (double)opts.mtp_margin);
+    }
     memcpy(cfg.model_sample, model_sample, 32);
 
     /* Listen for the head; accept one connection. */
@@ -273,16 +337,23 @@ int main(int argc, char **argv) {
 
     const uint64_t n_residual = ds4_residual_hc_floats();
     const uint64_t n_vocab = (uint64_t)cfg.n_vocab;
+    const uint32_t prefill_cap = ds4_session_prefill_cap(session);
+    const uint64_t batch_residual_floats = (uint64_t)prefill_cap * n_residual;
     float *residual = (float *)malloc((size_t)(n_residual * sizeof(float)));
     float *logits = (float *)malloc((size_t)(n_vocab * sizeof(float)));
-    if (!residual || !logits) {
+    float *batch_residual = (float *)malloc((size_t)(batch_residual_floats * sizeof(float)));
+    if (!residual || !logits || !batch_residual) {
         fprintf(stderr, "ds4-rpc-worker: alloc failed\n");
-        free(residual); free(logits);
+        free(residual); free(logits); free(batch_residual);
         ds4_session_free(session);
         ds4_rpc_close(rpc);
         ds4_engine_close(engine);
         return 1;
     }
+    fprintf(stderr,
+            "ds4-rpc-worker: prefill scratch %.2f MiB (prefill_cap=%u tokens)\n",
+            (double)(batch_residual_floats * sizeof(float)) / (1024.0 * 1024.0),
+            prefill_cap);
 
     /* Serve loop. */
     int rc = 0;
@@ -298,7 +369,9 @@ int main(int argc, char **argv) {
         switch (op) {
         case DS4_RPC_OP_DECODE_REQ: {
             uint32_t token = 0, pos = 0;
-            if (ds4_rpc_decode_recv(rpc, &token, &pos, residual, n_residual,
+            bool want_drafts = false;
+            if (ds4_rpc_decode_recv(rpc, &token, &pos, &want_drafts,
+                                    residual, n_residual,
                                     err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-rpc-worker: decode recv: %s\n", err);
                 rc = 1; running = false; break;
@@ -307,29 +380,146 @@ int main(int argc, char **argv) {
             if (ds4_session_import_residual_hc(session, residual, n_residual,
                                                err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-rpc-worker: import residual: %s\n", err);
-                (void)ds4_rpc_decode_reply(rpc, NULL, n_vocab, NULL, 0);
+                (void)ds4_rpc_decode_reply(rpc, NULL, n_vocab, NULL, 0, NULL, 0);
                 rc = 1; running = false; break;
             }
 
-            if (ds4_session_eval(session, (int)token, err, sizeof(err)) != 0) {
+            const int eval_rc = want_drafts
+                ? ds4_session_eval(session, (int)token, err, sizeof(err))
+                : ds4_session_eval_no_draft(session, (int)token, err, sizeof(err));
+            if (eval_rc != 0) {
                 fprintf(stderr, "ds4-rpc-worker: session eval: %s\n", err);
-                (void)ds4_rpc_decode_reply(rpc, NULL, n_vocab, NULL, 0);
+                (void)ds4_rpc_decode_reply(rpc, NULL, n_vocab, NULL, 0, NULL, 0);
                 rc = 1; running = false; break;
             }
 
             const float *src = ds4_session_logits(session);
             if (!src) {
                 fprintf(stderr, "ds4-rpc-worker: session has no logits after eval\n");
-                (void)ds4_rpc_decode_reply(rpc, NULL, n_vocab, NULL, 0);
+                (void)ds4_rpc_decode_reply(rpc, NULL, n_vocab, NULL, 0, NULL, 0);
                 rc = 1; running = false; break;
             }
             memcpy(logits, src, (size_t)(n_vocab * sizeof(float)));
 
-            if (ds4_rpc_decode_reply(rpc, logits, n_vocab, err, sizeof(err)) != 0) {
+            uint32_t drafts[DS4_RPC_MAX_DRAFTS] = {0};
+            uint32_t n_drafts = 0;
+            if (want_drafts && ds4_engine_has_mtp(engine)) {
+                int produced = ds4_session_mtp_drafts_after_eval(
+                    session, drafts, opts.mtp_draft_tokens,
+                    err, sizeof(err));
+                if (produced > 0) n_drafts = (uint32_t)produced;
+                else if (err[0]) {
+                    fprintf(stderr, "ds4-rpc-worker: mtp drafts: %s\n", err);
+                }
+            }
+
+            if (ds4_rpc_decode_reply(rpc, logits, n_vocab,
+                                     n_drafts > 0 ? drafts : NULL, n_drafts,
+                                     err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-rpc-worker: reply: %s\n", err);
                 rc = 1; running = false; break;
             }
             served++;
+            break;
+        }
+
+        case DS4_RPC_OP_VERIFY_BATCH: {
+            uint32_t v_n_tokens = 0, v_pos_start = 0, v_n_expected = 0;
+            uint64_t v_n_residual = 0;
+            uint32_t expected[16] = {0};
+            if (ds4_rpc_verify_batch_recv(rpc, &v_n_tokens, &v_pos_start,
+                                          batch_residual, batch_residual_floats,
+                                          &v_n_residual,
+                                          expected, 16, &v_n_expected,
+                                          err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4-rpc-worker: verify_batch recv: %s\n", err);
+                rc = 1; running = false; break;
+            }
+            uint32_t n_accepted = 0;
+            if (ds4_session_verify_batch_imported_hc(session, batch_residual,
+                                                     v_n_tokens, v_pos_start,
+                                                     expected, v_n_expected,
+                                                     &n_accepted,
+                                                     logits, n_vocab,
+                                                     err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4-rpc-worker: verify_batch eval: %s\n", err);
+                (void)ds4_rpc_verify_batch_reply(rpc, 0, NULL, 0, NULL, 0);
+                rc = 1; running = false; break;
+            }
+            if (ds4_rpc_verify_batch_reply(rpc, n_accepted,
+                                           n_accepted > 0 ? logits : NULL,
+                                           n_accepted > 0 ? n_vocab : 0,
+                                           err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4-rpc-worker: verify_batch reply: %s\n", err);
+                rc = 1; running = false; break;
+            }
+            break;
+        }
+
+        case DS4_RPC_OP_MTP_TRIM: {
+            uint32_t accepted = 0;
+            if (ds4_rpc_mtp_trim_recv(rpc, &accepted, err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4-rpc-worker: mtp_trim recv: %s\n", err);
+                rc = 1; running = false; break;
+            }
+            ds4_session_mtp_trim_drafts(session, accepted);
+            if (ds4_rpc_mtp_trim_reply(rpc, err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4-rpc-worker: mtp_trim reply: %s\n", err);
+                rc = 1; running = false; break;
+            }
+            break;
+        }
+
+        case DS4_RPC_OP_PREFILL_REQ: {
+            uint32_t n_tok = 0, pos_start = 0;
+            bool want_logits = false;
+            uint64_t n_recv_floats = 0;
+            if (ds4_rpc_prefill_recv(rpc, &n_tok, &pos_start, &want_logits,
+                                     batch_residual, batch_residual_floats,
+                                     &n_recv_floats,
+                                     err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4-rpc-worker: prefill recv: %s\n", err);
+                rc = 1; running = false; break;
+            }
+
+            if (ds4_session_eval_batch_imported_hc(session, batch_residual,
+                                                   n_tok, pos_start, want_logits,
+                                                   err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4-rpc-worker: prefill eval: %s\n", err);
+                (void)ds4_rpc_prefill_reply(rpc, false, NULL, 0, NULL, 0);
+                rc = 1; running = false; break;
+            }
+
+            const float *src = want_logits ? ds4_session_logits(session) : NULL;
+            if (want_logits && !src) {
+                fprintf(stderr, "ds4-rpc-worker: prefill eval produced no logits\n");
+                (void)ds4_rpc_prefill_reply(rpc, false, NULL, 0, NULL, 0);
+                rc = 1; running = false; break;
+            }
+            if (want_logits) {
+                memcpy(logits, src, (size_t)(n_vocab * sizeof(float)));
+            }
+            if (ds4_rpc_prefill_reply(rpc, want_logits,
+                                      want_logits ? logits : NULL,
+                                      want_logits ? n_vocab : 0,
+                                      err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4-rpc-worker: prefill reply: %s\n", err);
+                rc = 1; running = false; break;
+            }
+            break;
+        }
+
+        case DS4_RPC_OP_REWIND: {
+            uint32_t target = 0;
+            if (ds4_rpc_rewind_recv(rpc, &target, err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4-rpc-worker: rewind recv: %s\n", err);
+                rc = 1; running = false; break;
+            }
+            ds4_session_rewind(session, (int)target);
+            if (ds4_rpc_rewind_reply(rpc, err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4-rpc-worker: rewind reply: %s\n", err);
+                rc = 1; running = false; break;
+            }
             break;
         }
 
@@ -369,6 +559,7 @@ int main(int argc, char **argv) {
 
     free(residual);
     free(logits);
+    free(batch_residual);
     if (session) ds4_session_free(session);
     ds4_rpc_close(rpc);
     ds4_engine_close(engine);

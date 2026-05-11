@@ -1204,7 +1204,14 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--quant")) {
             c.quant = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
-            c.engine.mtp_path = need_arg(&i, argc, argv, arg);
+            /* Accept either "--mtp PATH" or bare "--mtp" (resolves to the
+             * canonical MTP GGUF in ./gguf/). */
+            const char *next = (i + 1 < argc) ? argv[i + 1] : NULL;
+            if (next && next[0] && next[0] != '-') {
+                c.engine.mtp_path = next; i++;
+            } else {
+                c.engine.mtp_path = "auto";
+            }
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
@@ -1306,6 +1313,18 @@ static cli_config parse_options(int argc, char **argv) {
         if (resolve_err[0]) fprintf(stderr, "ds4: %s\n", resolve_err);
         c.engine.model_path = resolved;
     }
+    if (c.engine.mtp_path) {
+        char resolve_err[256] = {0};
+        const char *resolved = ds4_resolve_mtp_path(c.engine.mtp_path,
+                                                    resolve_err, sizeof(resolve_err));
+        if (!resolved) {
+            fprintf(stderr, "ds4: %s\n",
+                    resolve_err[0] ? resolve_err :
+                    "--mtp requested but no MTP GGUF found in ./gguf/");
+            exit(2);
+        }
+        c.engine.mtp_path = resolved;
+    }
 
     return c;
 }
@@ -1328,6 +1347,9 @@ int main(int argc, char **argv) {
         log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
         cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
     }
+    /* Propagate --ctx into the engine so the RPC handshake can assert
+     * head and tail agree on KV window size.  No-op for single-host. */
+    cfg.engine.rpc_ctx_size = cfg.gen.ctx_size;
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) {
         free(cfg.prompt_owned);

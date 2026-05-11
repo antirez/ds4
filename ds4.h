@@ -80,6 +80,10 @@ typedef struct {
      * the engine is fully self-sufficient. */
     const char *rpc_peer_host;
     int         rpc_peer_port;
+    /* Context size advertised in the RPC handshake.  Must match the worker's
+     * --ctx so the tail's KV cache is sized for the same window.  Required
+     * when rpc_peer_host is set; ignored otherwise. */
+    int         rpc_ctx_size;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
@@ -168,6 +172,26 @@ int ds4_session_argmax(ds4_session *s);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
+/* Eval one token without probing MTP for drafts.  Used by the RPC head
+ * during speculative verification, where the head ships want_drafts=0 so
+ * the tail doesn't waste MTP cycles on tokens that exist solely to verify
+ * a previously-received draft. */
+int ds4_session_eval_no_draft(ds4_session *s, int token, char *err, size_t errlen);
+
+/* Produce up to max_drafts MTP draft tokens by recursive drafting against
+ * the current MTP cache state.  Returns the number of drafts written into
+ * out_drafts (0..max_drafts).  Requires that an immediately-preceding
+ * ds4_session_eval has populated s->mtp_draft_token; that becomes drafts[0]
+ * and the function fills the rest.  Worker uses this to ship a full draft
+ * batch in DECODE_REPLY when the head asks for them. */
+int ds4_session_mtp_drafts_after_eval(ds4_session *s,
+                                      uint32_t *out_drafts, int max_drafts,
+                                      char *err, size_t errlen);
+
+/* Reset the MTP cache row counter so the next decode starts MTP drafting
+ * from a clean state.  Used on the tail when the head sends OP_MTP_TRIM
+ * with accepted_drafts == 0 (no drafts kept). */
+void ds4_session_mtp_trim_drafts(ds4_session *s, uint32_t keep_drafts);
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
@@ -176,9 +200,11 @@ void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
+uint32_t ds4_session_prefill_cap(ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
+bool ds4_engine_has_rpc_peer(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 
 /* Disk KV cache payload helpers.  The server owns the outer file header and
@@ -199,6 +225,34 @@ int ds4_session_export_residual_hc(ds4_session *s, float *out, uint64_t n_floats
                                    char *err, size_t errlen);
 int ds4_session_import_residual_hc(ds4_session *s, const float *in, uint64_t n_floats,
                                    char *err, size_t errlen);
+
+/* Batched versions used by pipeline-parallel prefill.  The head exports its
+ * batch_cur_hc tensor after running its layers' prefill on a chunk; the
+ * tail runs ds4_session_eval_batch_imported_hc to install the residual,
+ * run its own layers (and on the final chunk, the output projection), and
+ * advance its session position by n_tokens.  pos_start must equal the
+ * tail's current ds4_session_pos. */
+int ds4_session_export_batch_residual_hc(ds4_session *s, float *out,
+                                         uint64_t n_tokens, char *err, size_t errlen);
+int ds4_session_eval_batch_imported_hc(ds4_session *s, const float *in,
+                                       uint64_t n_tokens, uint32_t pos_start,
+                                       bool want_logits, char *err, size_t errlen);
+
+/* Batched all-or-nothing speculative verification on the tail.  Imports
+ * n_tokens residuals into batch_cur_hc, snapshots KV state, runs prefill
+ * across all rows, then for each row i in [0, n_expected) compares the
+ * argmax of that row's output to expected_next[i].  If all match, advances
+ * the session checkpoint by n_tokens, writes final-row logits, and returns
+ * *out_n_accepted = n_tokens.  If any mismatch (or any error), restores the
+ * snapshot and returns *out_n_accepted = 0 leaving the session untouched. */
+int ds4_session_verify_batch_imported_hc(ds4_session *s,
+                                         const float *batch_residual,
+                                         uint64_t n_tokens, uint32_t pos_start,
+                                         const uint32_t *expected_next,
+                                         uint32_t n_expected,
+                                         uint32_t *out_n_accepted,
+                                         float *final_logits, uint64_t n_logit_floats,
+                                         char *err, size_t errlen);
 
 /* Shape accessors so the RPC transport and worker don't have to duplicate
  * DS4_N_* compile-time constants in their own code.  All four values are
@@ -224,6 +278,20 @@ uint32_t ds4_model_n_vocab(void);
 const char *ds4_resolve_model_path(const char *explicit_path,
                                    const char *quant,
                                    char *err, size_t errlen);
+
+/* Resolve the MTP support GGUF path.  Priority:
+ *   1. explicit_path non-NULL/non-empty and not the sentinel "auto" -> return it.
+ *   2. Probe ./gguf/ for the canonical MTP file (the one fetched by
+ *      ./download_model.sh mtp).  If present, return it.
+ *   3. Return NULL.
+ *
+ * Returned pointer is either the caller's explicit_path or static storage;
+ * do not free.  On miss (no file found and no explicit path), err is left
+ * empty -- callers that require MTP should treat NULL as their own error.
+ * The sentinel "auto" lets command-line parsers accept "--mtp" with no
+ * argument and still go through this resolver. */
+const char *ds4_resolve_mtp_path(const char *explicit_path,
+                                 char *err, size_t errlen);
 
 /* Read-only view of the last logits produced by ds4_session_eval or the
  * tail of ds4_session_sync.  Length is ds4_model_n_vocab() floats.  Returns

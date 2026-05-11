@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -130,6 +131,19 @@ static int set_low_latency(int fd) {
     int one = 1;
     (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     (void)setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+    /* 5-minute read timeout.  Prefill of a 30k-token prompt can legitimately
+     * take several minutes on TB but never hours, so a stuck peer surfaces
+     * as EAGAIN/ETIMEDOUT instead of an indefinite hang.  Tunable via
+     * DS4_RPC_RECV_TIMEOUT_SECS for debugging. */
+    long recv_timeout = 300;
+    const char *env = getenv("DS4_RPC_RECV_TIMEOUT_SECS");
+    if (env && env[0]) {
+        char *endp = NULL;
+        long v = strtol(env, &endp, 10);
+        if (endp != env && v > 0) recv_timeout = v;
+    }
+    struct timeval tv = { .tv_sec = recv_timeout, .tv_usec = 0 };
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     return 0;
 }
 
@@ -268,34 +282,42 @@ int ds4_rpc_fd(const ds4_rpc_handle *h) {
 }
 
 /* Config (de)serialization. */
-#define RPC_CFG_BYTES (4u * 8u + 8u + 32u)
+#define RPC_CFG_BYTES (12u * 4u + 8u + 32u)
 
 static void pack_config(uint8_t out[RPC_CFG_BYTES], const ds4_rpc_config *c) {
     uint8_t *p = out;
-    put_u32_le(p, c->version);            p += 4;
-    put_u32_le(p, c->n_layer_total);      p += 4;
-    put_u32_le(p, c->n_embd);             p += 4;
-    put_u32_le(p, c->n_hc);               p += 4;
-    put_u32_le(p, c->n_vocab);            p += 4;
-    put_u32_le(p, c->routed_quant_bits);  p += 4;
-    put_u32_le(p, c->tail_layer_start);   p += 4;
-    put_u32_le(p, c->tail_layer_end);     p += 4;
-    put_u64_le(p, c->model_file_bytes);   p += 8;
-    memcpy(p, c->model_sample, 32);       p += 32;
+    put_u32_le(p, c->version);                  p += 4;
+    put_u32_le(p, c->n_layer_total);            p += 4;
+    put_u32_le(p, c->n_embd);                   p += 4;
+    put_u32_le(p, c->n_hc);                     p += 4;
+    put_u32_le(p, c->n_vocab);                  p += 4;
+    put_u32_le(p, c->routed_quant_bits);        p += 4;
+    put_u32_le(p, c->tail_layer_start);         p += 4;
+    put_u32_le(p, c->tail_layer_end);           p += 4;
+    put_u32_le(p, c->ctx_size);                 p += 4;
+    put_u32_le(p, c->tail_has_mtp);             p += 4;
+    put_u32_le(p, c->tail_mtp_draft_tokens);    p += 4;
+    put_u32_le(p, c->reserved0);                p += 4;
+    put_u64_le(p, c->model_file_bytes);         p += 8;
+    memcpy(p, c->model_sample, 32);             p += 32;
     (void)p;
 }
 
 static void unpack_config(ds4_rpc_config *c, const uint8_t in[RPC_CFG_BYTES]) {
     const uint8_t *p = in;
-    c->version            = get_u32_le(p); p += 4;
-    c->n_layer_total      = get_u32_le(p); p += 4;
-    c->n_embd             = get_u32_le(p); p += 4;
-    c->n_hc               = get_u32_le(p); p += 4;
-    c->n_vocab            = get_u32_le(p); p += 4;
-    c->routed_quant_bits  = get_u32_le(p); p += 4;
-    c->tail_layer_start   = get_u32_le(p); p += 4;
-    c->tail_layer_end     = get_u32_le(p); p += 4;
-    c->model_file_bytes   = get_u64_le(p); p += 8;
+    c->version                = get_u32_le(p); p += 4;
+    c->n_layer_total          = get_u32_le(p); p += 4;
+    c->n_embd                 = get_u32_le(p); p += 4;
+    c->n_hc                   = get_u32_le(p); p += 4;
+    c->n_vocab                = get_u32_le(p); p += 4;
+    c->routed_quant_bits      = get_u32_le(p); p += 4;
+    c->tail_layer_start       = get_u32_le(p); p += 4;
+    c->tail_layer_end         = get_u32_le(p); p += 4;
+    c->ctx_size               = get_u32_le(p); p += 4;
+    c->tail_has_mtp           = get_u32_le(p); p += 4;
+    c->tail_mtp_draft_tokens  = get_u32_le(p); p += 4;
+    c->reserved0              = get_u32_le(p); p += 4;
+    c->model_file_bytes       = get_u64_le(p); p += 8;
     memcpy(c->model_sample, p, 32);
 }
 
@@ -308,8 +330,11 @@ static bool configs_match(const ds4_rpc_config *a, const ds4_rpc_config *b) {
     if (a->routed_quant_bits != b->routed_quant_bits) return false;
     if (a->tail_layer_start  != b->tail_layer_start) return false;
     if (a->tail_layer_end    != b->tail_layer_end)   return false;
+    if (a->ctx_size          != b->ctx_size)         return false;
     if (a->model_file_bytes  != b->model_file_bytes) return false;
     if (memcmp(a->model_sample, b->model_sample, 32) != 0) return false;
+    /* tail_has_mtp and tail_mtp_draft_tokens are tail-side capabilities the
+     * head learns from peer-returned config; not matched here. */
     return true;
 }
 
@@ -340,8 +365,20 @@ static int read_magic(int fd, char *err, size_t errlen) {
     return 0;
 }
 
+int ds4_rpc_handshake_client_peer(ds4_rpc_handle *h,
+                                  const ds4_rpc_config *cfg,
+                                  ds4_rpc_config *out_peer,
+                                  char *err, size_t errlen);
+
 int ds4_rpc_handshake_client(ds4_rpc_handle *h, const ds4_rpc_config *cfg,
                              char *err, size_t errlen) {
+    return ds4_rpc_handshake_client_peer(h, cfg, NULL, err, errlen);
+}
+
+int ds4_rpc_handshake_client_peer(ds4_rpc_handle *h,
+                                  const ds4_rpc_config *cfg,
+                                  ds4_rpc_config *out_peer,
+                                  char *err, size_t errlen) {
     if (!h || !cfg) { rpc_set_err(err, errlen, "handshake: null arg"); return 1; }
     if (write_magic(h->fd, err, errlen)) return 1;
 
@@ -356,17 +393,24 @@ int ds4_rpc_handshake_client(ds4_rpc_handle *h, const ds4_rpc_config *cfg,
         rpc_set_err(err, errlen, "handshake: server replied op=%u, expected HELLO_SERVER", op);
         return 1;
     }
-    if (payload_bytes < 4) {
-        rpc_set_err(err, errlen, "handshake: server reply too short (%u bytes)", payload_bytes);
+    if (payload_bytes < 4u + RPC_CFG_BYTES) {
+        rpc_set_err(err, errlen,
+                    "handshake: server reply too short (%u bytes, need >= %u)",
+                    payload_bytes, 4u + (uint32_t)RPC_CFG_BYTES);
         return 1;
     }
     uint8_t status_buf[4];
     if (io_read_full(h->fd, status_buf, sizeof(status_buf), err, errlen)) return 1;
     const uint32_t status = get_u32_le(status_buf);
 
+    uint8_t peer_buf[RPC_CFG_BYTES];
+    if (io_read_full(h->fd, peer_buf, sizeof(peer_buf), err, errlen)) return 1;
+    if (out_peer) unpack_config(out_peer, peer_buf);
+
+    const uint32_t msg_bytes = payload_bytes - 4u - (uint32_t)RPC_CFG_BYTES;
+
     if (status != 0) {
         char *msg = NULL;
-        const uint32_t msg_bytes = payload_bytes - 4u;
         if (msg_bytes > 0 && msg_bytes < 4096) {
             msg = (char *)malloc((size_t)msg_bytes + 1u);
             if (msg) {
@@ -378,7 +422,6 @@ int ds4_rpc_handshake_client(ds4_rpc_handle *h, const ds4_rpc_config *cfg,
                 return 1;
             }
         }
-        /* Drain any leftover bytes silently so the caller's error is clean. */
         uint8_t tmp[256];
         uint32_t remaining = msg_bytes;
         while (remaining > 0) {
@@ -388,6 +431,16 @@ int ds4_rpc_handshake_client(ds4_rpc_handle *h, const ds4_rpc_config *cfg,
         }
         rpc_set_err(err, errlen, "rpc: server rejected handshake (status=%u)", status);
         return 1;
+    }
+    /* status == 0: no error_msg present, drain any leftover defensively. */
+    if (msg_bytes > 0) {
+        uint8_t tmp[256];
+        uint32_t remaining = msg_bytes;
+        while (remaining > 0) {
+            uint32_t chunk = remaining < sizeof(tmp) ? remaining : (uint32_t)sizeof(tmp);
+            if (io_read_full(h->fd, tmp, chunk, NULL, 0)) break;
+            remaining -= chunk;
+        }
     }
     return 0;
 }
@@ -443,6 +496,11 @@ int ds4_rpc_handshake_server(ds4_rpc_handle *h, const ds4_rpc_config *cfg,
                      "split mismatch: head expects tail [%u, %u), worker owns [%u, %u)",
                      got.tail_layer_start, got.tail_layer_end,
                      cfg->tail_layer_start, cfg->tail_layer_end);
+        } else if (got.ctx_size != cfg->ctx_size) {
+            snprintf(reject_msg, sizeof(reject_msg),
+                     "ctx mismatch: head ctx=%u, worker ctx=%u "
+                     "(start the worker with --ctx %u to match)",
+                     got.ctx_size, cfg->ctx_size, got.ctx_size);
         } else if (got.model_file_bytes != cfg->model_file_bytes ||
                    memcmp(got.model_sample, cfg->model_sample, 32) != 0) {
             snprintf(reject_msg, sizeof(reject_msg),
@@ -454,14 +512,15 @@ int ds4_rpc_handshake_server(ds4_rpc_handle *h, const ds4_rpc_config *cfg,
 
     const uint32_t status = reject_msg[0] ? 1u : 0u;
     const uint32_t msg_bytes = (uint32_t)strlen(reject_msg);
-    const uint32_t reply_bytes = 4u + msg_bytes;
+    const uint32_t reply_bytes = 4u + (uint32_t)RPC_CFG_BYTES + msg_bytes;
     uint8_t *reply = (uint8_t *)malloc(reply_bytes);
     if (!reply) {
         rpc_set_err(err, errlen, "handshake: out of memory");
         return 1;
     }
     put_u32_le(reply, status);
-    if (msg_bytes) memcpy(reply + 4, reject_msg, msg_bytes);
+    pack_config(reply + 4, cfg);
+    if (msg_bytes) memcpy(reply + 4 + RPC_CFG_BYTES, reject_msg, msg_bytes);
     int rc = frame_write(h->fd, DS4_RPC_OP_HELLO_SERVER, reply, reply_bytes, err, errlen);
     free(reply);
     if (rc) return 1;
@@ -475,17 +534,30 @@ int ds4_rpc_handshake_server(ds4_rpc_handle *h, const ds4_rpc_config *cfg,
 
 /* Decode request/reply. */
 
+/* Decode reply header layout (16 bytes):
+ *   u32 status
+ *   u32 n_drafts            (always present; 0 means no MTP attached)
+ *   u64 n_logit_floats
+ * Then n_drafts * sizeof(u32) of draft tokens, then n_logit_floats * sizeof(float).
+ * Drafts come first because their length is a small fixed integer; logits come
+ * after so the receiver can stream-read them straight into the caller's buffer.
+ */
 int ds4_rpc_decode_request(ds4_rpc_handle *h,
                            uint32_t token, uint32_t pos,
+                           bool want_drafts,
                            const float *residual_hc, uint64_t n_residual_floats,
                            float *out_logits, uint64_t n_logit_floats,
+                           uint32_t *out_drafts, uint32_t max_drafts,
+                           uint32_t *out_n_drafts,
                            char *err, size_t errlen) {
     if (!h || !residual_hc || !out_logits) {
         rpc_set_err(err, errlen, "decode_request: null arg");
         return 1;
     }
+    if (out_n_drafts) *out_n_drafts = 0;
+
     const uint64_t residual_bytes = n_residual_floats * sizeof(float);
-    const uint64_t total = 4u + 4u + 8u + residual_bytes;
+    const uint64_t total = 4u + 4u + 4u + 4u + 8u + residual_bytes;
     if (total > UINT32_MAX) {
         rpc_set_err(err, errlen, "decode_request: residual too large");
         return 1;
@@ -496,6 +568,8 @@ int ds4_rpc_decode_request(ds4_rpc_handle *h,
     uint8_t *p = buf;
     put_u32_le(p, token);                  p += 4;
     put_u32_le(p, pos);                    p += 4;
+    put_u32_le(p, want_drafts ? 1u : 0u);  p += 4;
+    put_u32_le(p, 0u);                     p += 4; /* reserved */
     put_u64_le(p, n_residual_floats);      p += 8;
     memcpy(p, residual_hc, (size_t)residual_bytes);
     int rc = frame_write(h->fd, DS4_RPC_OP_DECODE_REQ, buf, (uint32_t)total, err, errlen);
@@ -509,27 +583,35 @@ int ds4_rpc_decode_request(ds4_rpc_handle *h,
         rpc_set_err(err, errlen, "decode_request: expected DECODE_REPLY, got op=%u", op);
         return 1;
     }
-    const uint64_t expect_bytes = 4u + 8u + n_logit_floats * sizeof(float);
-    if (reply_bytes != expect_bytes) {
-        rpc_set_err(err, errlen,
-                    "decode_request: reply size mismatch (got %u, expected %llu)",
-                    reply_bytes, (unsigned long long)expect_bytes);
+    if (reply_bytes < 16u) {
+        rpc_set_err(err, errlen, "decode_request: reply header truncated (%u bytes)", reply_bytes);
         return 1;
     }
-    uint8_t hdr[12];
+    uint8_t hdr[16];
     if (io_read_full(h->fd, hdr, sizeof(hdr), err, errlen)) return 1;
-    const uint32_t status = get_u32_le(hdr);
-    const uint64_t got_floats = get_u64_le(hdr + 4);
+    const uint32_t status      = get_u32_le(hdr);
+    const uint32_t n_drafts    = get_u32_le(hdr + 4);
+    const uint64_t got_floats  = get_u64_le(hdr + 8);
+    const uint64_t expect_payload =
+        (uint64_t)n_drafts * sizeof(uint32_t) + got_floats * sizeof(float);
+    if (reply_bytes - 16u != expect_payload) {
+        rpc_set_err(err, errlen,
+                    "decode_request: reply payload size %u, expected %llu "
+                    "(n_drafts=%u, n_logits=%llu)",
+                    reply_bytes - 16u, (unsigned long long)expect_payload,
+                    n_drafts, (unsigned long long)got_floats);
+        return 1;
+    }
     if (status != 0) {
-        rpc_set_err(err, errlen, "decode_request: tail returned error status %u", status);
-        /* Drain logits region so the connection stays in sync. */
+        /* Drain payload so the connection stays in sync. */
         uint8_t tmp[4096];
-        uint64_t remaining = got_floats * sizeof(float);
+        uint64_t remaining = expect_payload;
         while (remaining > 0) {
             uint64_t chunk = remaining < sizeof(tmp) ? remaining : sizeof(tmp);
             if (io_read_full(h->fd, tmp, (size_t)chunk, NULL, 0)) break;
             remaining -= chunk;
         }
+        rpc_set_err(err, errlen, "decode_request: tail returned error status %u", status);
         return 1;
     }
     if (got_floats != n_logit_floats) {
@@ -537,14 +619,42 @@ int ds4_rpc_decode_request(ds4_rpc_handle *h,
                     (unsigned long long)got_floats, (unsigned long long)n_logit_floats);
         return 1;
     }
+
+    /* Read draft tokens first.  If the caller doesn't want them (out_drafts
+     * is NULL or max_drafts is 0), drain into a scratch buffer. */
+    if (n_drafts > 0) {
+        const uint64_t draft_bytes = (uint64_t)n_drafts * sizeof(uint32_t);
+        if (out_drafts && max_drafts > 0) {
+            const uint32_t accept = n_drafts < max_drafts ? n_drafts : max_drafts;
+            uint8_t drafts_buf[DS4_RPC_MAX_DRAFTS * sizeof(uint32_t)];
+            if (draft_bytes > sizeof(drafts_buf)) {
+                rpc_set_err(err, errlen, "decode_request: too many drafts (%u)", n_drafts);
+                return 1;
+            }
+            if (io_read_full(h->fd, drafts_buf, (size_t)draft_bytes, err, errlen)) return 1;
+            for (uint32_t i = 0; i < accept; i++) {
+                out_drafts[i] = get_u32_le(drafts_buf + i * 4);
+            }
+            if (out_n_drafts) *out_n_drafts = accept;
+        } else {
+            uint8_t tmp[DS4_RPC_MAX_DRAFTS * sizeof(uint32_t)];
+            if (draft_bytes > sizeof(tmp)) {
+                rpc_set_err(err, errlen, "decode_request: too many drafts (%u) to drain", n_drafts);
+                return 1;
+            }
+            if (io_read_full(h->fd, tmp, (size_t)draft_bytes, err, errlen)) return 1;
+        }
+    }
+
     return io_read_full(h->fd, out_logits, (size_t)(n_logit_floats * sizeof(float)), err, errlen);
 }
 
 int ds4_rpc_decode_recv(ds4_rpc_handle *h,
                         uint32_t *token, uint32_t *pos,
+                        bool *want_drafts,
                         float *residual_hc, uint64_t n_residual_floats,
                         char *err, size_t errlen) {
-    if (!h || !token || !pos || !residual_hc) {
+    if (!h || !token || !pos || !want_drafts || !residual_hc) {
         rpc_set_err(err, errlen, "decode_recv: null arg");
         return 1;
     }
@@ -555,18 +665,20 @@ int ds4_rpc_decode_recv(ds4_rpc_handle *h,
         rpc_set_err(err, errlen, "decode_recv: expected DECODE_REQ, got op=%u", op);
         return 1;
     }
-    const uint64_t expect = 4u + 4u + 8u + n_residual_floats * sizeof(float);
+    const uint64_t expect = 4u + 4u + 4u + 4u + 8u + n_residual_floats * sizeof(float);
     if (payload_bytes != expect) {
         rpc_set_err(err, errlen,
                     "decode_recv: payload %u bytes, expected %llu",
                     payload_bytes, (unsigned long long)expect);
         return 1;
     }
-    uint8_t hdr[16];
+    uint8_t hdr[24];
     if (io_read_full(h->fd, hdr, sizeof(hdr), err, errlen)) return 1;
-    *token = get_u32_le(hdr);
-    *pos   = get_u32_le(hdr + 4);
-    const uint64_t got_floats = get_u64_le(hdr + 8);
+    *token       = get_u32_le(hdr);
+    *pos         = get_u32_le(hdr + 4);
+    *want_drafts = get_u32_le(hdr + 8) != 0;
+    /* hdr+12..16 reserved */
+    const uint64_t got_floats = get_u64_le(hdr + 16);
     if (got_floats != n_residual_floats) {
         rpc_set_err(err, errlen,
                     "decode_recv: residual size mismatch (got %llu, expected %llu)",
@@ -579,22 +691,469 @@ int ds4_rpc_decode_recv(ds4_rpc_handle *h,
 
 int ds4_rpc_decode_reply(ds4_rpc_handle *h,
                          const float *logits, uint64_t n_logit_floats,
+                         const uint32_t *drafts, uint32_t n_drafts,
                          char *err, size_t errlen) {
     if (!h) { rpc_set_err(err, errlen, "decode_reply: null arg"); return 1; }
+    if (n_drafts > DS4_RPC_MAX_DRAFTS) {
+        rpc_set_err(err, errlen, "decode_reply: %u drafts exceeds max %u",
+                    n_drafts, DS4_RPC_MAX_DRAFTS);
+        return 1;
+    }
+    if (n_drafts > 0 && !drafts) {
+        rpc_set_err(err, errlen, "decode_reply: n_drafts>0 but drafts is NULL");
+        return 1;
+    }
     const uint64_t logit_bytes = n_logit_floats * sizeof(float);
-    const uint64_t total = 4u + 8u + logit_bytes;
+    const uint64_t draft_bytes = (uint64_t)n_drafts * sizeof(uint32_t);
+    const uint64_t total = 4u + 4u + 8u + draft_bytes + logit_bytes;
     if (total > UINT32_MAX) {
-        rpc_set_err(err, errlen, "decode_reply: logits too large");
+        rpc_set_err(err, errlen, "decode_reply: payload too large");
         return 1;
     }
     uint8_t *buf = (uint8_t *)malloc((size_t)total);
     if (!buf) { rpc_set_err(err, errlen, "decode_reply: oom"); return 1; }
     uint8_t *p = buf;
-    put_u32_le(p, logits ? 0u : 1u);   p += 4;
-    put_u64_le(p, n_logit_floats);     p += 8;
+    put_u32_le(p, logits ? 0u : 1u);                     p += 4; /* status */
+    put_u32_le(p, n_drafts);                             p += 4;
+    put_u64_le(p, n_logit_floats);                       p += 8;
+    for (uint32_t i = 0; i < n_drafts; i++) {
+        put_u32_le(p, drafts[i]);                        p += 4;
+    }
     if (logits) memcpy(p, logits, (size_t)logit_bytes);
-    else memset(p, 0, (size_t)logit_bytes);
+    else        memset(p, 0, (size_t)logit_bytes);
     int rc = frame_write(h->fd, DS4_RPC_OP_DECODE_REPLY, buf, (uint32_t)total, err, errlen);
+    free(buf);
+    return rc;
+}
+
+int ds4_rpc_mtp_trim(ds4_rpc_handle *h, uint32_t accepted_drafts,
+                     char *err, size_t errlen) {
+    if (!h) { rpc_set_err(err, errlen, "mtp_trim: null"); return 1; }
+    uint8_t payload[4];
+    put_u32_le(payload, accepted_drafts);
+    if (frame_write(h->fd, DS4_RPC_OP_MTP_TRIM, payload, sizeof(payload),
+                    err, errlen)) return 1;
+    uint8_t op = 0;
+    uint32_t bytes = 0;
+    if (frame_read_header(h->fd, &op, &bytes, err, errlen)) return 1;
+    if (op != DS4_RPC_OP_MTP_TRIM_REPLY || bytes != 0) {
+        rpc_set_err(err, errlen, "mtp_trim: unexpected reply op=%u bytes=%u", op, bytes);
+        return 1;
+    }
+    return 0;
+}
+
+int ds4_rpc_mtp_trim_recv(ds4_rpc_handle *h, uint32_t *accepted_drafts,
+                          char *err, size_t errlen) {
+    if (!h || !accepted_drafts) {
+        rpc_set_err(err, errlen, "mtp_trim_recv: null");
+        return 1;
+    }
+    uint8_t op = 0;
+    uint32_t bytes = 0;
+    if (frame_read_header(h->fd, &op, &bytes, err, errlen)) return 1;
+    if (op != DS4_RPC_OP_MTP_TRIM || bytes != 4) {
+        rpc_set_err(err, errlen, "mtp_trim_recv: unexpected op=%u bytes=%u", op, bytes);
+        return 1;
+    }
+    uint8_t buf[4];
+    if (io_read_full(h->fd, buf, sizeof(buf), err, errlen)) return 1;
+    *accepted_drafts = get_u32_le(buf);
+    return 0;
+}
+
+int ds4_rpc_mtp_trim_reply(ds4_rpc_handle *h, char *err, size_t errlen) {
+    if (!h) { rpc_set_err(err, errlen, "mtp_trim_reply: null"); return 1; }
+    return frame_write(h->fd, DS4_RPC_OP_MTP_TRIM_REPLY, NULL, 0, err, errlen);
+}
+
+/* Verify-batch wire format.  Request layout:
+ *   u32 n_tokens
+ *   u32 pos_start
+ *   u32 n_expected   (= n_tokens - 1; the drafts head wants verified)
+ *   u32 reserved
+ *   u64 n_residual_floats
+ *   float32[n_residual_floats]   batch_cur_hc rows
+ *   u32[n_expected]              expected_next tokens
+ *
+ * Reply layout:
+ *   u32 status
+ *   u32 n_accepted   (0 = miss + KV reverted, n_tokens = full accept)
+ *   u32 reserved
+ *   u32 reserved
+ *   u64 n_logit_floats
+ *   float32[n_logit_floats]      logits (only meaningful when n_accepted > 0)
+ */
+int ds4_rpc_verify_batch_request(ds4_rpc_handle *h,
+                                 uint32_t n_tokens, uint32_t pos_start,
+                                 const float *batch_residual,
+                                 uint64_t n_residual_floats,
+                                 const uint32_t *expected_next,
+                                 uint32_t n_expected,
+                                 uint32_t *out_n_accepted,
+                                 float *out_logits, uint64_t n_logit_floats,
+                                 char *err, size_t errlen) {
+    if (!h || !batch_residual || !out_n_accepted || !out_logits) {
+        rpc_set_err(err, errlen, "verify_batch_request: null arg");
+        return 1;
+    }
+    if (n_expected > 0 && !expected_next) {
+        rpc_set_err(err, errlen, "verify_batch_request: n_expected>0 but null buffer");
+        return 1;
+    }
+    *out_n_accepted = 0;
+
+    const uint64_t residual_bytes = n_residual_floats * sizeof(float);
+    const uint64_t expected_bytes = (uint64_t)n_expected * sizeof(uint32_t);
+    const uint64_t total = 4u + 4u + 4u + 4u + 8u + residual_bytes + expected_bytes;
+    if (total > UINT32_MAX) {
+        rpc_set_err(err, errlen, "verify_batch_request: payload too large");
+        return 1;
+    }
+    uint8_t *buf = (uint8_t *)malloc((size_t)total);
+    if (!buf) { rpc_set_err(err, errlen, "verify_batch_request: oom"); return 1; }
+    uint8_t *p = buf;
+    put_u32_le(p, n_tokens);              p += 4;
+    put_u32_le(p, pos_start);             p += 4;
+    put_u32_le(p, n_expected);            p += 4;
+    put_u32_le(p, 0u);                    p += 4;
+    put_u64_le(p, n_residual_floats);     p += 8;
+    memcpy(p, batch_residual, (size_t)residual_bytes); p += residual_bytes;
+    for (uint32_t i = 0; i < n_expected; i++) {
+        put_u32_le(p, expected_next[i]);  p += 4;
+    }
+    int rc = frame_write(h->fd, DS4_RPC_OP_VERIFY_BATCH, buf, (uint32_t)total,
+                         err, errlen);
+    free(buf);
+    if (rc) return 1;
+
+    uint8_t op = 0;
+    uint32_t reply_bytes = 0;
+    if (frame_read_header(h->fd, &op, &reply_bytes, err, errlen)) return 1;
+    if (op != DS4_RPC_OP_VERIFY_BATCH_REPLY) {
+        rpc_set_err(err, errlen, "verify_batch_request: expected reply op=%u, got %u",
+                    DS4_RPC_OP_VERIFY_BATCH_REPLY, op);
+        return 1;
+    }
+    const uint64_t reply_min = 4u + 4u + 4u + 4u + 8u;
+    if (reply_bytes < reply_min) {
+        rpc_set_err(err, errlen, "verify_batch_request: reply truncated (%u bytes)", reply_bytes);
+        return 1;
+    }
+    uint8_t hdr[24];
+    if (io_read_full(h->fd, hdr, sizeof(hdr), err, errlen)) return 1;
+    const uint32_t status     = get_u32_le(hdr);
+    const uint32_t n_accepted = get_u32_le(hdr + 4);
+    const uint64_t got_floats = get_u64_le(hdr + 16);
+    const uint64_t remaining  = reply_bytes - 24u;
+
+    if (status != 0) {
+        uint8_t tmp[4096];
+        uint64_t left = remaining;
+        while (left > 0) {
+            uint64_t chunk = left < sizeof(tmp) ? left : sizeof(tmp);
+            if (io_read_full(h->fd, tmp, (size_t)chunk, NULL, 0)) break;
+            left -= chunk;
+        }
+        rpc_set_err(err, errlen, "verify_batch_request: tail status %u", status);
+        return 1;
+    }
+
+    *out_n_accepted = n_accepted;
+    if (remaining != got_floats * sizeof(float)) {
+        rpc_set_err(err, errlen,
+                    "verify_batch_request: reply payload %llu, expected %llu",
+                    (unsigned long long)remaining,
+                    (unsigned long long)(got_floats * sizeof(float)));
+        return 1;
+    }
+    if (got_floats == 0) return 0;
+    if (got_floats != n_logit_floats) {
+        rpc_set_err(err, errlen,
+                    "verify_batch_request: tail sent %llu floats, expected %llu",
+                    (unsigned long long)got_floats,
+                    (unsigned long long)n_logit_floats);
+        return 1;
+    }
+    return io_read_full(h->fd, out_logits, (size_t)remaining, err, errlen);
+}
+
+int ds4_rpc_verify_batch_recv(ds4_rpc_handle *h,
+                              uint32_t *n_tokens, uint32_t *pos_start,
+                              float *batch_residual, uint64_t max_residual_floats,
+                              uint64_t *out_n_residual_floats,
+                              uint32_t *expected_next, uint32_t max_expected,
+                              uint32_t *out_n_expected,
+                              char *err, size_t errlen) {
+    if (!h || !n_tokens || !pos_start || !batch_residual ||
+        !out_n_residual_floats || !expected_next || !out_n_expected) {
+        rpc_set_err(err, errlen, "verify_batch_recv: null arg");
+        return 1;
+    }
+    uint8_t op = 0;
+    uint32_t payload_bytes = 0;
+    if (frame_read_header(h->fd, &op, &payload_bytes, err, errlen)) return 1;
+    if (op != DS4_RPC_OP_VERIFY_BATCH) {
+        rpc_set_err(err, errlen, "verify_batch_recv: expected VERIFY_BATCH, got op=%u", op);
+        return 1;
+    }
+    if (payload_bytes < 24u) {
+        rpc_set_err(err, errlen, "verify_batch_recv: payload truncated (%u bytes)", payload_bytes);
+        return 1;
+    }
+    uint8_t hdr[24];
+    if (io_read_full(h->fd, hdr, sizeof(hdr), err, errlen)) return 1;
+    *n_tokens   = get_u32_le(hdr);
+    *pos_start  = get_u32_le(hdr + 4);
+    const uint32_t n_expected_in = get_u32_le(hdr + 8);
+    const uint64_t n_floats      = get_u64_le(hdr + 16);
+    const uint64_t expected_bytes = (uint64_t)n_expected_in * sizeof(uint32_t);
+    const uint64_t want_bytes     = n_floats * sizeof(float);
+    if (payload_bytes - 24u != want_bytes + expected_bytes) {
+        rpc_set_err(err, errlen,
+                    "verify_batch_recv: payload size mismatch (got %u, expected %llu + %llu)",
+                    payload_bytes - 24u,
+                    (unsigned long long)want_bytes,
+                    (unsigned long long)expected_bytes);
+        return 1;
+    }
+    if (n_floats > max_residual_floats) {
+        rpc_set_err(err, errlen,
+                    "verify_batch_recv: residual %llu floats exceeds buffer %llu",
+                    (unsigned long long)n_floats,
+                    (unsigned long long)max_residual_floats);
+        return 1;
+    }
+    if (n_expected_in > max_expected) {
+        rpc_set_err(err, errlen,
+                    "verify_batch_recv: %u expected exceeds buffer %u",
+                    n_expected_in, max_expected);
+        return 1;
+    }
+    *out_n_residual_floats = n_floats;
+    *out_n_expected = n_expected_in;
+    if (io_read_full(h->fd, batch_residual, (size_t)want_bytes, err, errlen)) return 1;
+    if (n_expected_in > 0) {
+        uint8_t tmp[16 * 4];
+        if (expected_bytes > sizeof(tmp)) {
+            rpc_set_err(err, errlen, "verify_batch_recv: %u expected too many",
+                        n_expected_in);
+            return 1;
+        }
+        if (io_read_full(h->fd, tmp, (size_t)expected_bytes, err, errlen)) return 1;
+        for (uint32_t i = 0; i < n_expected_in; i++) {
+            expected_next[i] = get_u32_le(tmp + i * 4);
+        }
+    }
+    return 0;
+}
+
+int ds4_rpc_verify_batch_reply(ds4_rpc_handle *h,
+                               uint32_t n_accepted,
+                               const float *logits, uint64_t n_logit_floats,
+                               char *err, size_t errlen) {
+    if (!h) { rpc_set_err(err, errlen, "verify_batch_reply: null"); return 1; }
+    const bool has_logits = (logits != NULL && n_logit_floats > 0);
+    const uint64_t logit_bytes = has_logits ? n_logit_floats * sizeof(float) : 0u;
+    const uint64_t total = 4u + 4u + 4u + 4u + 8u + logit_bytes;
+    if (total > UINT32_MAX) {
+        rpc_set_err(err, errlen, "verify_batch_reply: payload too large");
+        return 1;
+    }
+    uint8_t *buf = (uint8_t *)malloc((size_t)total);
+    if (!buf) { rpc_set_err(err, errlen, "verify_batch_reply: oom"); return 1; }
+    uint8_t *p = buf;
+    put_u32_le(p, 0u);                              p += 4; /* status */
+    put_u32_le(p, n_accepted);                      p += 4;
+    put_u32_le(p, 0u);                              p += 4;
+    put_u32_le(p, 0u);                              p += 4;
+    put_u64_le(p, has_logits ? n_logit_floats : 0u); p += 8;
+    if (has_logits) memcpy(p, logits, (size_t)logit_bytes);
+    int rc = frame_write(h->fd, DS4_RPC_OP_VERIFY_BATCH_REPLY, buf, (uint32_t)total,
+                         err, errlen);
+    free(buf);
+    return rc;
+}
+
+/* Prefill request: one chunk of the prompt's batch_cur_hc, sized
+ * (n_tokens * DS4_N_HC * DS4_N_EMBD) floats.  Reply is empty if
+ * !want_logits, otherwise carries one DS4_N_VOCAB-sized logits vector.
+ * Frame layout for the request:
+ *   u32 n_tokens
+ *   u32 pos_start
+ *   u32 want_logits  (0 or 1)
+ *   u32 reserved
+ *   u64 n_residual_floats
+ *   float32[n_residual_floats] batch residual data
+ * Frame layout for the reply:
+ *   u32 status (0 = ok, !=0 = error)
+ *   u32 has_logits (0 or 1; on error always 0)
+ *   u64 n_logit_floats (matches has_logits)
+ *   float32[n_logit_floats] logits */
+int ds4_rpc_prefill_request(ds4_rpc_handle *h,
+                            uint32_t n_tokens, uint32_t pos_start,
+                            bool want_logits,
+                            const float *batch_residual_hc,
+                            uint64_t n_residual_floats,
+                            float *out_logits, uint64_t n_logit_floats,
+                            char *err, size_t errlen) {
+    if (!h || !batch_residual_hc) {
+        rpc_set_err(err, errlen, "prefill_request: null arg");
+        return 1;
+    }
+    if (want_logits && (!out_logits || n_logit_floats == 0)) {
+        rpc_set_err(err, errlen, "prefill_request: want_logits set but no output buffer");
+        return 1;
+    }
+    const uint64_t residual_bytes = n_residual_floats * sizeof(float);
+    const uint64_t payload_bytes = 4u + 4u + 4u + 4u + 8u + residual_bytes;
+    if (payload_bytes > UINT32_MAX) {
+        rpc_set_err(err, errlen, "prefill_request: chunk too large to frame");
+        return 1;
+    }
+
+    uint8_t *buf = (uint8_t *)malloc((size_t)payload_bytes);
+    if (!buf) { rpc_set_err(err, errlen, "prefill_request: oom"); return 1; }
+    uint8_t *p = buf;
+    put_u32_le(p, n_tokens);                   p += 4;
+    put_u32_le(p, pos_start);                  p += 4;
+    put_u32_le(p, want_logits ? 1u : 0u);      p += 4;
+    put_u32_le(p, 0u);                         p += 4;
+    put_u64_le(p, n_residual_floats);          p += 8;
+    memcpy(p, batch_residual_hc, (size_t)residual_bytes);
+    int rc = frame_write(h->fd, DS4_RPC_OP_PREFILL_REQ, buf, (uint32_t)payload_bytes,
+                         err, errlen);
+    free(buf);
+    if (rc) return 1;
+
+    uint8_t op = 0;
+    uint32_t reply_bytes = 0;
+    if (frame_read_header(h->fd, &op, &reply_bytes, err, errlen)) return 1;
+    if (op != DS4_RPC_OP_PREFILL_REPLY) {
+        rpc_set_err(err, errlen, "prefill_request: expected PREFILL_REPLY, got op=%u", op);
+        return 1;
+    }
+    if (reply_bytes < 4u + 4u + 8u) {
+        rpc_set_err(err, errlen, "prefill_request: reply header truncated (%u bytes)", reply_bytes);
+        return 1;
+    }
+    uint8_t hdr[16];
+    if (io_read_full(h->fd, hdr, sizeof(hdr), err, errlen)) return 1;
+    const uint32_t status     = get_u32_le(hdr);
+    const uint32_t has_logits = get_u32_le(hdr + 4);
+    const uint64_t got_floats = get_u64_le(hdr + 8);
+    const uint64_t remaining  = reply_bytes - 16u;
+
+    if (status != 0) {
+        /* Drain any payload bytes so the connection stays in sync. */
+        uint8_t tmp[4096];
+        uint64_t left = remaining;
+        while (left > 0) {
+            uint64_t chunk = left < sizeof(tmp) ? left : sizeof(tmp);
+            if (io_read_full(h->fd, tmp, (size_t)chunk, NULL, 0)) break;
+            left -= chunk;
+        }
+        rpc_set_err(err, errlen, "prefill_request: tail returned error status %u", status);
+        return 1;
+    }
+    if (!want_logits) {
+        if (has_logits || got_floats != 0 || remaining != 0) {
+            rpc_set_err(err, errlen, "prefill_request: tail returned logits we did not request");
+            return 1;
+        }
+        return 0;
+    }
+    if (!has_logits || got_floats != n_logit_floats) {
+        rpc_set_err(err, errlen,
+                    "prefill_request: tail returned %llu floats (has=%u), expected %llu (has=1)",
+                    (unsigned long long)got_floats, has_logits,
+                    (unsigned long long)n_logit_floats);
+        return 1;
+    }
+    if (remaining != n_logit_floats * sizeof(float)) {
+        rpc_set_err(err, errlen,
+                    "prefill_request: reply payload size mismatch (%llu vs %llu)",
+                    (unsigned long long)remaining,
+                    (unsigned long long)(n_logit_floats * sizeof(float)));
+        return 1;
+    }
+    return io_read_full(h->fd, out_logits, (size_t)remaining, err, errlen);
+}
+
+int ds4_rpc_prefill_recv(ds4_rpc_handle *h,
+                         uint32_t *n_tokens, uint32_t *pos_start,
+                         bool *want_logits,
+                         float *batch_residual_hc, uint64_t max_residual_floats,
+                         uint64_t *out_n_residual_floats,
+                         char *err, size_t errlen) {
+    if (!h || !n_tokens || !pos_start || !want_logits || !batch_residual_hc ||
+        !out_n_residual_floats) {
+        rpc_set_err(err, errlen, "prefill_recv: null arg");
+        return 1;
+    }
+    uint8_t op = 0;
+    uint32_t payload_bytes = 0;
+    if (frame_read_header(h->fd, &op, &payload_bytes, err, errlen)) return 1;
+    if (op != DS4_RPC_OP_PREFILL_REQ) {
+        rpc_set_err(err, errlen, "prefill_recv: expected PREFILL_REQ, got op=%u", op);
+        return 1;
+    }
+    if (payload_bytes < 4u + 4u + 4u + 4u + 8u) {
+        rpc_set_err(err, errlen, "prefill_recv: payload truncated (%u bytes)", payload_bytes);
+        return 1;
+    }
+    uint8_t hdr[24];
+    if (io_read_full(h->fd, hdr, sizeof(hdr), err, errlen)) return 1;
+    *n_tokens                  = get_u32_le(hdr);
+    *pos_start                 = get_u32_le(hdr + 4);
+    *want_logits               = get_u32_le(hdr + 8) != 0;
+    /* hdr+12..16 reserved */
+    const uint64_t n_floats    = get_u64_le(hdr + 16);
+    const uint64_t want_bytes  = n_floats * sizeof(float);
+    if (payload_bytes - 24u != want_bytes) {
+        rpc_set_err(err, errlen,
+                    "prefill_recv: residual size mismatch (header says %llu floats = %llu bytes, "
+                    "frame has %llu bytes of payload after header)",
+                    (unsigned long long)n_floats,
+                    (unsigned long long)want_bytes,
+                    (unsigned long long)(payload_bytes - 24u));
+        return 1;
+    }
+    if (n_floats > max_residual_floats) {
+        rpc_set_err(err, errlen,
+                    "prefill_recv: chunk needs %llu residual floats but caller buffer holds only %llu",
+                    (unsigned long long)n_floats,
+                    (unsigned long long)max_residual_floats);
+        return 1;
+    }
+    *out_n_residual_floats = n_floats;
+    return io_read_full(h->fd, batch_residual_hc, (size_t)want_bytes, err, errlen);
+}
+
+int ds4_rpc_prefill_reply(ds4_rpc_handle *h,
+                          bool has_logits,
+                          const float *logits, uint64_t n_logit_floats,
+                          char *err, size_t errlen) {
+    if (!h) { rpc_set_err(err, errlen, "prefill_reply: null arg"); return 1; }
+    if (has_logits && (!logits || n_logit_floats == 0)) {
+        rpc_set_err(err, errlen, "prefill_reply: has_logits set but no logits provided");
+        return 1;
+    }
+    const uint64_t logit_bytes = has_logits ? n_logit_floats * sizeof(float) : 0u;
+    const uint64_t payload_bytes = 4u + 4u + 8u + logit_bytes;
+    if (payload_bytes > UINT32_MAX) {
+        rpc_set_err(err, errlen, "prefill_reply: logits too large to frame");
+        return 1;
+    }
+    uint8_t *buf = (uint8_t *)malloc((size_t)payload_bytes);
+    if (!buf) { rpc_set_err(err, errlen, "prefill_reply: oom"); return 1; }
+    uint8_t *p = buf;
+    put_u32_le(p, 0u);                                   p += 4; /* status = ok */
+    put_u32_le(p, has_logits ? 1u : 0u);                 p += 4;
+    put_u64_le(p, has_logits ? n_logit_floats : 0u);     p += 8;
+    if (has_logits) memcpy(p, logits, (size_t)logit_bytes);
+    int rc = frame_write(h->fd, DS4_RPC_OP_PREFILL_REPLY, buf, (uint32_t)payload_bytes,
+                         err, errlen);
     free(buf);
     return rc;
 }
@@ -671,4 +1230,42 @@ int ds4_rpc_shutdown_send(ds4_rpc_handle *h) {
     if (!h) return 1;
     char err[64];
     return frame_write(h->fd, DS4_RPC_OP_SHUTDOWN, NULL, 0, err, sizeof(err));
+}
+
+int ds4_rpc_rewind(ds4_rpc_handle *h, uint32_t target_pos,
+                   char *err, size_t errlen) {
+    if (!h) { rpc_set_err(err, errlen, "rewind: null"); return 1; }
+    uint8_t payload[4];
+    put_u32_le(payload, target_pos);
+    if (frame_write(h->fd, DS4_RPC_OP_REWIND, payload, sizeof(payload),
+                    err, errlen)) return 1;
+    uint8_t op = 0;
+    uint32_t bytes = 0;
+    if (frame_read_header(h->fd, &op, &bytes, err, errlen)) return 1;
+    if (op != DS4_RPC_OP_REWIND_REPLY || bytes != 0) {
+        rpc_set_err(err, errlen, "rewind: unexpected reply op=%u bytes=%u", op, bytes);
+        return 1;
+    }
+    return 0;
+}
+
+int ds4_rpc_rewind_recv(ds4_rpc_handle *h, uint32_t *target_pos,
+                        char *err, size_t errlen) {
+    if (!h || !target_pos) { rpc_set_err(err, errlen, "rewind_recv: null"); return 1; }
+    uint8_t op = 0;
+    uint32_t bytes = 0;
+    if (frame_read_header(h->fd, &op, &bytes, err, errlen)) return 1;
+    if (op != DS4_RPC_OP_REWIND || bytes != 4) {
+        rpc_set_err(err, errlen, "rewind_recv: unexpected op=%u bytes=%u", op, bytes);
+        return 1;
+    }
+    uint8_t buf[4];
+    if (io_read_full(h->fd, buf, sizeof(buf), err, errlen)) return 1;
+    *target_pos = get_u32_le(buf);
+    return 0;
+}
+
+int ds4_rpc_rewind_reply(ds4_rpc_handle *h, char *err, size_t errlen) {
+    if (!h) { rpc_set_err(err, errlen, "rewind_reply: null"); return 1; }
+    return frame_write(h->fd, DS4_RPC_OP_REWIND_REPLY, NULL, 0, err, errlen);
 }

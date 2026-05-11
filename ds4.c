@@ -2152,9 +2152,11 @@ static void weights_validate_layout(const ds4_weights *w) {
     const uint64_t out_low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
 
     /* Globals are validated only on the side of the pipeline that owns them:
-     * token_embd on the head (n_layer_start == 0), the output_* stack on the
-     * tail (n_layer_end == DS4_N_LAYER).  Single-host engines own both. */
-    if (w->n_layer_start == 0) {
+     * token_embd on the head (n_layer_start == 0) -- or on the tail when
+     * MTP is loaded, since MTP draft generation needs it.  The output_*
+     * stack always lives on the tail (n_layer_end == DS4_N_LAYER).  Single-
+     * host engines own both. */
+    if (w->token_embd) {
         tensor_expect_layout(w->token_embd,  DS4_TENSOR_F16,  2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
     if (w->n_layer_end == DS4_N_LAYER) {
@@ -2446,7 +2448,8 @@ static void config_validate_model(const ds4_model *m) {
 /* Bind tensor names once into the fixed DS4 layer layout.  This is the point
  * where stringly GGUF metadata becomes direct model-specific pointers. */
 static void weights_bind(ds4_weights *w, const ds4_model *m,
-                         uint32_t n_layer_start, uint32_t n_layer_end) {
+                         uint32_t n_layer_start, uint32_t n_layer_end,
+                         bool need_token_embd_for_mtp) {
     memset(w, 0, sizeof(*w));
     w->n_layer_start = n_layer_start;
     w->n_layer_end   = n_layer_end;
@@ -2454,8 +2457,11 @@ static void weights_bind(ds4_weights *w, const ds4_model *m,
     /* The head owns the input embedding; the tail owns the output projection
      * stack.  Single-host engines own both because the range covers all
      * layers.  Skipping unused globals keeps tail workers from requiring the
-     * head's tensors and vice versa. */
-    if (n_layer_start == 0) {
+     * head's tensors and vice versa.  Exception: when MTP is loaded on a
+     * tail engine, the MTP draft step calls ds4_metal_embed_token_hc_tensor
+     * with weights->token_embd to embed the predicted next-token; without
+     * binding token_embd on the tail that dereference segfaults. */
+    if (n_layer_start == 0 || need_token_embd_for_mtp) {
         w->token_embd   = required_tensor(m, "token_embd.weight");
     }
     if (n_layer_end == DS4_N_LAYER) {
@@ -8060,6 +8066,13 @@ typedef struct {
     ds4_metal_tensor *mtp_next_hc;
     ds4_metal_tensor *mtp_raw_cache;
     uint32_t mtp_n_raw;
+    /* MTP draft round bookkeeping for pipeline-parallel: the worker captures
+     * mtp_n_raw before producing a batch of drafts, and remembers how many
+     * drafts it actually wrote.  When the head later sends OP_MTP_TRIM with
+     * the count of accepted drafts, the worker reconstructs the right
+     * mtp_n_raw via mtp_draft_round_base_raw + keep. */
+    uint32_t mtp_draft_round_base_raw;
+    uint32_t mtp_draft_round_n;
     uint32_t prefill_cap;
     uint32_t raw_window;
 
@@ -10679,12 +10692,23 @@ static bool metal_graph_warmup_prefill_kernels(
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
 
+    /* Use the first OWNED layer's hc_attn_fn as the warmup pipeline source.
+     * Hardcoding layer[0] crashed on pipeline-parallel tail engines that
+     * don't bind it.  Any owned layer's tensor of the same shape works for
+     * one-time pipeline compilation. */
+    const uint32_t warm_il = weights->n_layer_start < DS4_N_LAYER
+        ? weights->n_layer_start : 0;
+    const ds4_tensor *warm_t = weights->layer[warm_il].hc_attn_fn;
+    if (!warm_t) {
+        fprintf(stderr, "ds4: prefill warmup: no bound hc_attn_fn for layer %u\n", warm_il);
+        return false;
+    }
     bool ok = ds4_metal_begin_commands() != 0;
     if (ok) {
         ok = ds4_metal_matmul_f16_tensor(g->batch_hc_mix,
                                          model->map,
                                          model->size,
-                                         weights->layer[0].hc_attn_fn->abs_offset,
+                                         warm_t->abs_offset,
                                          hc_dim,
                                          mix_hc,
                                          g->batch_flat_hc,
@@ -12869,6 +12893,16 @@ static bool metal_graph_prefill_batch_row_logits(
  * compression windows and row finalization follow the same schedule after the
  * cached prefix.
  */
+/* Optional per-chunk callback used by the pipeline-parallel head: after this
+ * engine's owned layers have run on each chunk, the hook fires with the
+ * chunk's position and token count.  Returns 0 on success, !=0 to abort.
+ * Single-host callers pass NULL. */
+typedef int (*ds4_prefill_chunk_hook_fn)(void *user,
+                                         ds4_metal_graph *g,
+                                         uint32_t pos0,
+                                         uint32_t n_chunk_tokens,
+                                         bool is_last_chunk);
+
 static bool metal_graph_prefill_chunked_range(
         ds4_metal_graph *g,
         const ds4_model       *model,
@@ -12879,7 +12913,9 @@ static bool metal_graph_prefill_chunked_range(
         float                 *logits,
         bool                   show_progress,
         ds4_session_progress_fn progress,
-        void                  *progress_ud) {
+        void                  *progress_ud,
+        ds4_prefill_chunk_hook_fn chunk_hook,
+        void                  *chunk_hook_ud) {
     if (n_tokens == 0 || g->prefill_cap == 0) return false;
     if (start > (uint32_t)prompt->len) return false;
     if (n_tokens > (uint32_t)prompt->len - start) return false;
@@ -12909,6 +12945,9 @@ static bool metal_graph_prefill_chunked_range(
         progress(progress_ud, "prefill_chunk", (int)start, prompt->len);
     }
 
+    const bool head_owns_embed = (weights->n_layer_start == 0);
+    const bool tail_owns_output = (weights->n_layer_end == DS4_N_LAYER);
+
     for (uint32_t pos0 = start; pos0 < end; ) {
         const uint32_t remaining = end - pos0;
         uint32_t local_cap = chunk_cap;
@@ -12921,18 +12960,21 @@ static bool metal_graph_prefill_chunked_range(
         }
         const uint32_t chunk = remaining < local_cap ? remaining : local_cap;
         last_chunk_tokens = chunk;
+        const bool is_last_chunk = (pos0 + chunk >= end);
 
         bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, pos0, chunk);
-        if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
-                                                             g->prefill_tokens,
-                                                             model,
-                                                             weights,
-                                                             prompt,
-                                                             pos0,
-                                                             chunk);
+        if (ok && head_owns_embed) {
+            ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
+                                                         g->prefill_tokens,
+                                                         model,
+                                                         weights,
+                                                         prompt,
+                                                         pos0,
+                                                         chunk);
+        }
         if (!ok) return false;
 
-        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        for (uint32_t il = weights->n_layer_start; ok && il < weights->n_layer_end; il++) {
             const double t_layer0 = profile ? now_sec() : 0.0;
             ok = ds4_metal_begin_commands() != 0;
             if (ok) ok = metal_graph_encode_layer_batch(g,
@@ -12971,19 +13013,29 @@ static bool metal_graph_prefill_chunked_range(
             }
             return false;
         }
-        if (progress && !metal_graph_prefill_batch_row_logits(g, model, weights,
-                                                              chunk - 1u,
-                                                              logits))
+        if (progress && tail_owns_output &&
+            !metal_graph_prefill_batch_row_logits(g, model, weights,
+                                                  chunk - 1u, logits))
         {
             return false;
         }
         if (progress) {
             progress(progress_ud, "prefill_chunk", (int)(pos0 + chunk), prompt->len);
         }
+        if (chunk_hook) {
+            if (chunk_hook(chunk_hook_ud, g, pos0, chunk, is_last_chunk) != 0) {
+                return false;
+            }
+        }
         pos0 += chunk;
     }
     if (show_progress) fputc('\n', stderr);
     if (last_chunk_tokens == 0) return false;
+
+    /* Skip the output projection when this engine doesn't own the tail.
+     * For pipeline-parallel heads the chunk hook has already shipped the
+     * residual to the tail, which runs output_head on its side. */
+    if (!tail_owns_output) return true;
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     ds4_metal_tensor *last_hc = metal_graph_tensor_row_view(g->batch_cur_hc,
@@ -13046,7 +13098,8 @@ static bool metal_graph_prefill_chunked(
                                              logits,
                                              show_progress,
                                              progress,
-                                             progress_ud);
+                                             progress_ud,
+                                             NULL, NULL);
 }
 
 /* Layer-major speculative target verifier for tiny MTP suffixes.
@@ -13751,6 +13804,8 @@ struct ds4_engine {
      * (eventually) prefill ship the residual stream to the peer for the
      * remaining layers and receive logits back. */
     struct ds4_rpc_handle *rpc_peer;
+    bool rpc_tail_has_mtp;          /* peer reported MTP available in handshake */
+    uint32_t rpc_tail_mtp_drafts;   /* peer's --mtp-draft cap */
 };
 
 static void utf8_put(char **p, uint32_t cp) {
@@ -15007,6 +15062,15 @@ struct ds4_session {
     token_vec checkpoint;
     float *logits;
     float *mtp_logits;
+    /* Pre-allocated single-token residual buffer for the RPC head's per-
+     * decode tensor_read out of cur_hc.  Sized to ds4_residual_hc_floats().
+     * NULL on non-RPC engines. */
+    float *rpc_residual_scratch;
+    /* Extra MTP drafts received from the tail (drafts 1..n_drafts-1; draft 0
+     * lands in s->mtp_draft_token as on single-host).  speculative_argmax
+     * uses these to drive verification under RPC. */
+    uint32_t rpc_extra_drafts[16];
+    uint32_t rpc_n_extra_drafts;
     int mtp_draft_token;
     uint64_t mtp_probe_total;
     uint64_t mtp_probe_hit;
@@ -15226,11 +15290,22 @@ int ds4_engine_routed_quant_bits(ds4_engine *e) {
 }
 
 bool ds4_engine_has_mtp(ds4_engine *e) {
-    return e && e->mtp_ready;
+    if (!e) return false;
+    /* MTP is "available" either locally (single-host has the weights) or
+     * remotely via an RPC peer that loaded --mtp.  ds4-server's generate
+     * loop checks this to decide whether to call speculative_argmax. */
+    return e->mtp_ready || e->rpc_tail_has_mtp;
+}
+
+bool ds4_engine_has_rpc_peer(ds4_engine *e) {
+    return e && e->rpc_peer != NULL;
 }
 
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
-    return e && e->mtp_ready ? e->mtp_draft_tokens : 0;
+    if (!e) return 0;
+    if (e->mtp_ready) return e->mtp_draft_tokens;
+    if (e->rpc_tail_has_mtp) return (int)e->rpc_tail_mtp_drafts;
+    return 0;
 }
 
 const ds4_tokens *ds4_session_tokens(ds4_session *s) {
@@ -15365,6 +15440,8 @@ static const char *const DS4_QUANT_Q2_PATH =
     "gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf";
 static const char *const DS4_QUANT_Q4_PATH =
     "gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf";
+static const char *const DS4_MTP_PATH =
+    "gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf";
 
 static bool ds4_path_is_regular_file(const char *path) {
     struct stat st;
@@ -15411,6 +15488,27 @@ const char *ds4_resolve_model_path(const char *explicit_path,
     if (q2_present) return DS4_QUANT_Q2_PATH;
     if (q4_present) return DS4_QUANT_Q4_PATH;
     return "ds4flash.gguf";
+}
+
+const char *ds4_resolve_mtp_path(const char *explicit_path,
+                                 char *err, size_t errlen) {
+    if (explicit_path && explicit_path[0] &&
+        strcmp(explicit_path, "auto") != 0 &&
+        strcmp(explicit_path, "default") != 0)
+    {
+        return explicit_path;
+    }
+    if (ds4_path_is_regular_file(DS4_MTP_PATH)) return DS4_MTP_PATH;
+    if (errlen && explicit_path &&
+        (strcmp(explicit_path, "auto") == 0 ||
+         strcmp(explicit_path, "default") == 0))
+    {
+        snprintf(err, errlen,
+                 "--mtp auto requested but %s not found "
+                 "(run ./download_model.sh mtp)",
+                 DS4_MTP_PATH);
+    }
+    return NULL;
 }
 
 const float *ds4_session_logits(const ds4_session *s) {
@@ -15476,6 +15574,292 @@ int ds4_session_import_residual_hc(ds4_session *s, const float *in, uint64_t n_f
     return 0;
 #endif
 }
+
+/* Batch versions of the residual transfer used by pipeline-parallel prefill.
+ * The head runs its layers' prefill which leaves `n_tokens * hc_dim` floats
+ * in `batch_cur_hc`; export copies them out.  The tail's batch eval starts
+ * by writing those floats back into its own `batch_cur_hc` before running
+ * the rest of the layers. */
+int ds4_session_export_batch_residual_hc(ds4_session *s, float *out,
+                                         uint64_t n_tokens, char *err, size_t errlen) {
+#ifdef DS4_NO_METAL
+    (void)s; (void)out; (void)n_tokens;
+    if (errlen) snprintf(err, errlen, "batch residual export requires the Metal backend");
+    return 1;
+#else
+    if (!s || !out || n_tokens == 0) {
+        if (errlen) snprintf(err, errlen, "null session/buffer or empty batch");
+        return 1;
+    }
+    if (n_tokens > s->prefill_cap) {
+        if (errlen) snprintf(err, errlen,
+                             "batch residual export: n_tokens %llu exceeds prefill_cap %u",
+                             (unsigned long long)n_tokens, s->prefill_cap);
+        return 1;
+    }
+    const uint64_t per_token = ds4_residual_hc_floats();
+    const uint64_t total = n_tokens * per_token;
+    if (!s->graph.batch_cur_hc) {
+        if (errlen) snprintf(err, errlen, "session has no live batch_cur_hc tensor");
+        return 1;
+    }
+    if (ds4_metal_tensor_read(s->graph.batch_cur_hc, 0, out,
+                              total * sizeof(float)) == 0) {
+        if (errlen) snprintf(err, errlen, "ds4_metal_tensor_read failed for batch_cur_hc");
+        return 1;
+    }
+    return 0;
+#endif
+}
+
+#ifndef DS4_NO_METAL
+/* Tail-side: pre-populate batch_cur_hc from an imported residual, then run
+ * the tail's prefill layers (and on the final chunk, the output projection)
+ * over the chunk.  Advances s->checkpoint.len by n_tokens so the tail's
+ * notion of session position stays in sync with the head's.  Uses a zero-
+ * filled dummy prompt: the layers in [n_layer_start, DS4_N_LAYER) never
+ * read prompt tokens (hash-routed FFNs only exist in the first
+ * DS4_N_HASH_LAYER layers, all of which the head owns). */
+int ds4_session_eval_batch_imported_hc(ds4_session *s, const float *in,
+                                       uint64_t n_tokens, uint32_t pos_start,
+                                       bool want_logits, char *err, size_t errlen) {
+    if (!s || !in || n_tokens == 0) {
+        if (errlen) snprintf(err, errlen, "null arg or empty batch");
+        return 1;
+    }
+    if (n_tokens > s->prefill_cap) {
+        if (errlen) snprintf(err, errlen,
+                             "eval_batch_imported: n_tokens %llu exceeds prefill_cap %u",
+                             (unsigned long long)n_tokens, s->prefill_cap);
+        return 1;
+    }
+    if (pos_start != (uint32_t)s->checkpoint.len) {
+        if (errlen) snprintf(err, errlen,
+                             "eval_batch_imported: pos_start=%u but session at %d "
+                             "(call RESET first if you mean to start over)",
+                             pos_start, s->checkpoint.len);
+        return 1;
+    }
+    if (!s->graph.batch_cur_hc) {
+        if (errlen) snprintf(err, errlen, "session has no live batch_cur_hc tensor");
+        return 1;
+    }
+
+    const uint64_t per_token = ds4_residual_hc_floats();
+    const uint64_t total = n_tokens * per_token;
+    if (ds4_metal_tensor_write(s->graph.batch_cur_hc, 0, in,
+                               total * sizeof(float)) == 0) {
+        if (errlen) snprintf(err, errlen, "ds4_metal_tensor_write failed for batch_cur_hc");
+        return 1;
+    }
+
+    /* Build a dummy token vec of size pos_start + n_tokens.  Layers in the
+     * tail range don't read the token IDs (hash-routed FFNs only exist in
+     * the first DS4_N_HASH_LAYER layers, all owned by the head), but we
+     * need a vec large enough that metal_graph_prefill_chunked_range's
+     * bounds check (start + n_tokens <= prompt->len) passes. */
+    const uint64_t dummy_len = (uint64_t)pos_start + n_tokens;
+    if (dummy_len > INT_MAX) {
+        if (errlen) snprintf(err, errlen, "eval_batch_imported: pos_start+n_tokens overflows int");
+        return 1;
+    }
+    int *dummy_tokens = (int *)calloc((size_t)dummy_len, sizeof(int));
+    if (!dummy_tokens) {
+        if (errlen) snprintf(err, errlen, "eval_batch_imported: alloc failed");
+        return 1;
+    }
+    token_vec dummy_prompt = {
+        .v = dummy_tokens,
+        .len = (int)dummy_len,
+        .cap = (int)dummy_len,
+    };
+
+    ds4_engine *e = s->engine;
+    float *logits_dest = want_logits ? s->logits : NULL;
+    /* Use chunked_range so KV writes go to absolute position pos_start, not
+     * 0.  prefill_layer_major hardcodes pos_start=0; that overwrote chunks
+     * 2..N on top of chunk 1 in early Phase 5a testing, producing logits
+     * that only saw the final chunk's worth of context.  chunked_range
+     * with n_tokens <= prefill_cap runs exactly one internal chunk
+     * iteration. */
+    bool ok = metal_graph_prefill_chunked_range(&s->graph, &e->model, &e->weights,
+                                                &dummy_prompt,
+                                                pos_start, n_tokens,
+                                                logits_dest, false,
+                                                NULL, NULL,
+                                                NULL, NULL);
+    free(dummy_tokens);
+    if (!ok) {
+        if (errlen) snprintf(err, errlen, "Metal prefill failed in eval_batch_imported");
+        s->checkpoint_valid = false;
+        return 1;
+    }
+
+    /* Advance the tail's notion of checkpoint length so subsequent chunks
+     * pass the pos_start sanity check above.  We don't store the actual
+     * tokens -- the tail never reasons about them. */
+    for (uint64_t i = 0; i < n_tokens; i++) {
+        token_vec_push(&s->checkpoint, 0);
+    }
+    s->checkpoint_valid = true;
+    return 0;
+}
+
+int ds4_session_verify_batch_imported_hc(ds4_session *s,
+                                         const float *batch_residual,
+                                         uint64_t n_tokens, uint32_t pos_start,
+                                         const uint32_t *expected_next,
+                                         uint32_t n_expected,
+                                         uint32_t *out_n_accepted,
+                                         float *final_logits, uint64_t n_logit_floats,
+                                         char *err, size_t errlen) {
+    if (!s || !batch_residual || n_tokens == 0 || !out_n_accepted || !final_logits) {
+        if (errlen) snprintf(err, errlen, "verify_batch: null arg or empty batch");
+        return 1;
+    }
+    *out_n_accepted = 0;
+    if (n_expected >= n_tokens) {
+        if (errlen) snprintf(err, errlen,
+                             "verify_batch: n_expected %u must be < n_tokens %llu",
+                             n_expected, (unsigned long long)n_tokens);
+        return 1;
+    }
+    if (n_logit_floats < DS4_N_VOCAB) {
+        if (errlen) snprintf(err, errlen, "verify_batch: logit buffer too small");
+        return 1;
+    }
+    if (n_tokens > s->prefill_cap) {
+        if (errlen) snprintf(err, errlen,
+                             "verify_batch: n_tokens %llu exceeds prefill_cap %u",
+                             (unsigned long long)n_tokens, s->prefill_cap);
+        return 1;
+    }
+    if (pos_start != (uint32_t)s->checkpoint.len) {
+        if (errlen) snprintf(err, errlen,
+                             "verify_batch: pos_start=%u but session at %d",
+                             pos_start, s->checkpoint.len);
+        return 1;
+    }
+
+    ds4_engine *e = s->engine;
+
+    /* Snapshot KV state so we can roll back on any miss.  spec_frontier_*
+     * covers compressor frontiers, mtp_n_raw, and per-layer compressed cache
+     * state -- everything that would be left stale by a rejected prefill. */
+    ds4_spec_frontier frontier;
+    memset(&frontier, 0, sizeof(frontier));
+    if (!spec_frontier_snapshot(&frontier, s)) {
+        if (errlen) snprintf(err, errlen, "verify_batch: spec_frontier_snapshot failed");
+        return 1;
+    }
+
+    /* Write the imported residuals into batch_cur_hc, then run prefill via
+     * the chunked-range function so its layer-range gating and embed/output
+     * skipping all work (we pass NULL for logits and no chunk hook; the
+     * output head only runs if this engine owns it, which the tail does). */
+    const uint64_t per_token = ds4_residual_hc_floats();
+    const uint64_t total_floats = (uint64_t)n_tokens * per_token;
+    if (ds4_metal_tensor_write(s->graph.batch_cur_hc, 0, batch_residual,
+                               total_floats * sizeof(float)) == 0) {
+        if (errlen) snprintf(err, errlen,
+                             "verify_batch: tensor_write batch_cur_hc failed");
+        spec_frontier_restore(&frontier, s);
+        spec_frontier_free(&frontier);
+        return 1;
+    }
+
+    const uint64_t dummy_len = (uint64_t)pos_start + n_tokens;
+    if (dummy_len > INT_MAX) {
+        if (errlen) snprintf(err, errlen, "verify_batch: pos+n overflows int");
+        spec_frontier_restore(&frontier, s);
+        spec_frontier_free(&frontier);
+        return 1;
+    }
+    int *dummy_tokens = (int *)calloc((size_t)dummy_len, sizeof(int));
+    if (!dummy_tokens) {
+        if (errlen) snprintf(err, errlen, "verify_batch: alloc failed");
+        spec_frontier_restore(&frontier, s);
+        spec_frontier_free(&frontier);
+        return 1;
+    }
+    token_vec dummy_prompt = {
+        .v = dummy_tokens,
+        .len = (int)dummy_len,
+        .cap = (int)dummy_len,
+    };
+
+    bool ok = metal_graph_prefill_chunked_range(&s->graph, &e->model, &e->weights,
+                                                &dummy_prompt,
+                                                pos_start, (uint32_t)n_tokens,
+                                                /* logits = */ NULL,
+                                                false, NULL, NULL, NULL, NULL);
+    free(dummy_tokens);
+    if (!ok) {
+        if (errlen) snprintf(err, errlen, "verify_batch: prefill failed");
+        spec_frontier_restore(&frontier, s);
+        spec_frontier_free(&frontier);
+        return 1;
+    }
+
+    /* Now batch_cur_hc has post-layer hidden state for n_tokens rows.  Run
+     * the output head per-row to get logits, compute argmax, compare to
+     * expected_next.  Stop at first miss.  Row n_expected (i.e., the last
+     * position) holds the logits we return on full acceptance for the head
+     * to sample the next-after-accepted token. */
+    bool all_match = true;
+    float *row_logits = (float *)malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    if (!row_logits) {
+        if (errlen) snprintf(err, errlen, "verify_batch: row buffer alloc failed");
+        spec_frontier_restore(&frontier, s);
+        spec_frontier_free(&frontier);
+        return 1;
+    }
+    for (uint32_t i = 0; i < n_expected; i++) {
+        if (!metal_graph_prefill_batch_row_logits(&s->graph, &e->model, &e->weights,
+                                                  i, row_logits))
+        {
+            all_match = false;
+            break;
+        }
+        const int top = sample_argmax(row_logits, DS4_N_VOCAB);
+        if (top != (int)expected_next[i]) {
+            all_match = false;
+            break;
+        }
+    }
+
+    if (!all_match) {
+        free(row_logits);
+        spec_frontier_restore(&frontier, s);
+        spec_frontier_free(&frontier);
+        *out_n_accepted = 0;
+        return 0;
+    }
+
+    /* Full accept: read the last row's logits (the prediction for the token
+     * right AFTER all accepted drafts), advance the checkpoint, and free
+     * the snapshot. */
+    if (!metal_graph_prefill_batch_row_logits(&s->graph, &e->model, &e->weights,
+                                              (uint32_t)(n_tokens - 1u), row_logits))
+    {
+        free(row_logits);
+        spec_frontier_restore(&frontier, s);
+        spec_frontier_free(&frontier);
+        if (errlen) snprintf(err, errlen, "verify_batch: final row logits failed");
+        return 1;
+    }
+    memcpy(final_logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    free(row_logits);
+
+    for (uint64_t i = 0; i < n_tokens; i++) {
+        token_vec_push(&s->checkpoint, 0);
+    }
+    s->checkpoint_valid = true;
+    spec_frontier_free(&frontier);
+    *out_n_accepted = (uint32_t)n_tokens;
+    return 0;
+}
+#endif
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
 #ifdef DS4_NO_METAL
@@ -16111,7 +16495,15 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (opt->warm_weights) model_warm_weights(&e->model);
     vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
-    weights_bind(&e->weights, &e->model, e->n_layer_start, e->n_layer_end);
+    {
+        /* Tail engines need token_embd bound iff they'll run MTP drafting
+         * (the draft step embeds the predicted token via that tensor).
+         * Single-host and head engines already own it via n_layer_start==0. */
+        const bool mtp_token_embd =
+            (opt->mtp_path != NULL && opt->mtp_path[0] != '\0');
+        weights_bind(&e->weights, &e->model, e->n_layer_start, e->n_layer_end,
+                     mtp_token_embd);
+    }
     if (e->n_layer_start != 0 || e->n_layer_end != DS4_N_LAYER) {
         fprintf(stderr,
                 "ds4: pipeline-parallel weight binding active, layer range [%u, %u) of %u\n",
@@ -16296,6 +16688,14 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             return 1;
         }
 
+        if (opt->rpc_ctx_size <= 0) {
+            fprintf(stderr,
+                    "ds4: --rpc-peer is set but rpc_ctx_size is 0; "
+                    "pass --ctx to the head and propagate it via engine options\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
         ds4_rpc_config cfg = {
             .version           = DS4_RPC_VERSION,
             .n_layer_total     = DS4_N_LAYER,
@@ -16305,6 +16705,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             .routed_quant_bits = (uint32_t)ds4_engine_routed_quant_bits(e),
             .tail_layer_start  = e->n_layer_end,
             .tail_layer_end    = DS4_N_LAYER,
+            .ctx_size          = (uint32_t)opt->rpc_ctx_size,
             .model_file_bytes  = model_bytes,
         };
         memcpy(cfg.model_sample, model_sample, 32);
@@ -16321,17 +16722,27 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        if (ds4_rpc_handshake_client(e->rpc_peer, &cfg, rpc_err, sizeof(rpc_err)) != 0) {
+        ds4_rpc_config peer_cfg = {0};
+        if (ds4_rpc_handshake_client_peer(e->rpc_peer, &cfg, &peer_cfg,
+                                          rpc_err, sizeof(rpc_err)) != 0) {
             fprintf(stderr, "ds4: rpc handshake with %s:%u failed: %s\n",
                     opt->rpc_peer_host, (unsigned)port, rpc_err);
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
+        e->rpc_tail_has_mtp = peer_cfg.tail_has_mtp != 0;
+        e->rpc_tail_mtp_drafts = peer_cfg.tail_mtp_draft_tokens;
+        /* If the peer offers MTP, adopt its draft count as our effective
+         * mtp_draft_tokens (the head uses this in speculative_argmax). */
+        if (e->rpc_tail_has_mtp && e->mtp_draft_tokens < (int)e->rpc_tail_mtp_drafts) {
+            e->mtp_draft_tokens = (int)e->rpc_tail_mtp_drafts;
+        }
         fprintf(stderr,
-                "ds4: pipeline-parallel head connected to %s:%u, peer owns layers [%u, %u)\n",
+                "ds4: pipeline-parallel head connected to %s:%u, peer owns layers [%u, %u)%s\n",
                 opt->rpc_peer_host, (unsigned)port,
-                (unsigned)e->n_layer_end, (unsigned)DS4_N_LAYER);
+                (unsigned)e->n_layer_end, (unsigned)DS4_N_LAYER,
+                e->rpc_tail_has_mtp ? " (MTP available)" : "");
     }
 
     *out = e;
@@ -16380,8 +16791,12 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
      * `layer->attn_q_a->dim[1]` dereference. */
     const uint32_t probe_il = e->weights.n_layer_start < DS4_N_LAYER
         ? e->weights.n_layer_start : 0;
+    /* Head under RPC needs spec_* buffers to snapshot/restore the residual
+     * stream around a batched verify, even though it doesn't hold the MTP
+     * weights itself — the tail does. */
+    const bool need_mtp_buffers = e->mtp_ready || e->rpc_tail_has_mtp;
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[probe_il],
-                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready))
+                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap, need_mtp_buffers))
     {
         free(s);
         return 1;
@@ -16391,6 +16806,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (e->mtp_ready) {
         s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
         s->mtp_draft_token = -1;
+    }
+    if (e->rpc_peer) {
+        s->rpc_residual_scratch = xmalloc((size_t)ds4_residual_hc_floats() *
+                                          sizeof(s->rpc_residual_scratch[0]));
     }
     *out = s;
     return 0;
@@ -16405,6 +16824,7 @@ void ds4_session_free(ds4_session *s) {
     token_vec_free(&s->checkpoint);
     free(s->logits);
     free(s->mtp_logits);
+    free(s->rpc_residual_scratch);
     free(s);
 }
 
@@ -16452,6 +16872,122 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen);
 static void rpc_propagate_reset(ds4_session *s, const char *origin);
 
+#ifndef DS4_NO_METAL
+/* Per-chunk hook for pipeline-parallel prefill on the head.  Reads the
+ * batch_cur_hc tensor for the just-finished chunk, ships it to the tail
+ * via OP_PREFILL_REQ, and (on the last chunk) writes the returned logits
+ * into the session's logits buffer.  Returns 0 on success, 1 on error so
+ * metal_graph_prefill_chunked_range can abort cleanly. */
+typedef struct {
+    ds4_session *session;
+    float       *scratch;        /* batch_cur_hc readback buffer */
+    uint64_t     scratch_floats; /* capacity of scratch in floats */
+    int          rc;             /* preserved error code across chunks */
+    char        *err;
+    size_t       errlen;
+} rpc_chunk_state;
+
+static int rpc_chunk_hook(void *user, ds4_metal_graph *g,
+                          uint32_t pos0, uint32_t n_chunk_tokens,
+                          bool is_last_chunk) {
+    rpc_chunk_state *st = (rpc_chunk_state *)user;
+    ds4_session *s = st->session;
+    ds4_engine  *e = s->engine;
+    if (!e->rpc_peer) {
+        if (st->errlen) snprintf(st->err, st->errlen,
+                                 "rpc chunk hook fired without an attached peer");
+        st->rc = 1;
+        return 1;
+    }
+    const uint64_t per_token = ds4_residual_hc_floats();
+    const uint64_t chunk_floats = (uint64_t)n_chunk_tokens * per_token;
+    if (chunk_floats > st->scratch_floats) {
+        if (st->errlen) snprintf(st->err, st->errlen,
+                                 "rpc chunk hook: chunk %u tokens exceeds scratch %llu floats",
+                                 n_chunk_tokens, (unsigned long long)st->scratch_floats);
+        st->rc = 1;
+        return 1;
+    }
+    if (ds4_metal_tensor_read(g->batch_cur_hc, 0, st->scratch,
+                              chunk_floats * sizeof(float)) == 0) {
+        if (st->errlen) snprintf(st->err, st->errlen,
+                                 "rpc chunk hook: tensor_read batch_cur_hc failed");
+        st->rc = 1;
+        return 1;
+    }
+
+    float *out_logits = is_last_chunk ? s->logits : NULL;
+    const uint64_t out_floats = is_last_chunk ? (uint64_t)DS4_N_VOCAB : 0u;
+
+    char rpc_err[512] = {0};
+    if (ds4_rpc_prefill_request(e->rpc_peer,
+                                n_chunk_tokens, pos0, is_last_chunk,
+                                st->scratch, chunk_floats,
+                                out_logits, out_floats,
+                                rpc_err, sizeof(rpc_err)) != 0) {
+        /* Drop the dead peer so subsequent ops fail fast.  See same pattern
+         * in ds4_session_eval_internal's decode path. */
+        ds4_rpc_close(e->rpc_peer);
+        e->rpc_peer = NULL;
+        if (st->errlen) snprintf(st->err, st->errlen,
+                                 "rpc prefill chunk at pos=%u: %s "
+                                 "(connection dropped)", pos0, rpc_err);
+        st->rc = 1;
+        return 1;
+    }
+    return 0;
+}
+
+/* Top-level RPC-aware chunked prefill.  Resets the tail's session state
+ * first, then drives metal_graph_prefill_chunked_range with the RPC hook
+ * so each chunk's residual streams across as it's produced.  The whole
+ * prompt is processed in chunks of g->prefill_cap tokens. */
+static int rpc_batched_prefill(ds4_session *s, const token_vec *prompt,
+                               uint32_t start, uint32_t n_tokens,
+                               char *err, size_t errlen) {
+    ds4_engine *e = s->engine;
+    if (!e->rpc_peer) {
+        snprintf(err, errlen, "rpc_batched_prefill: no peer attached");
+        return 1;
+    }
+    if (n_tokens == 0) return 0;
+
+    const uint64_t per_token = ds4_residual_hc_floats();
+    const uint64_t scratch_floats = (uint64_t)s->graph.prefill_cap * per_token;
+    float *scratch = (float *)malloc((size_t)(scratch_floats * sizeof(float)));
+    if (!scratch) {
+        snprintf(err, errlen, "rpc_batched_prefill: scratch alloc (%llu floats) failed",
+                 (unsigned long long)scratch_floats);
+        return 1;
+    }
+
+    rpc_chunk_state st = {
+        .session = s,
+        .scratch = scratch,
+        .scratch_floats = scratch_floats,
+        .rc = 0,
+        .err = err,
+        .errlen = errlen,
+    };
+
+    bool ok = metal_graph_prefill_chunked_range(&s->graph, &e->model, &e->weights,
+                                                prompt, start, n_tokens,
+                                                /* logits */ NULL,
+                                                /* show_progress */ false,
+                                                /* progress */ NULL, NULL,
+                                                rpc_chunk_hook, &st);
+    free(scratch);
+    if (!ok) {
+        if (st.rc == 0 && errlen) {
+            snprintf(err, errlen,
+                     "rpc_batched_prefill: head prefill failed before/after RPC ship");
+        }
+        return st.rc != 0 ? st.rc : 1;
+    }
+    return 0;
+}
+#endif
+
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
 #ifdef DS4_NO_METAL
     (void)s;
@@ -16465,14 +17001,12 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         return 1;
     }
 
-    /* Pipeline-parallel prefill is not in the wire protocol yet (it would
-     * need to ship the full batch_cur_hc tensor, not just a single residual
-     * row).  As a correct-but-slower fallback we always go through the
-     * per-token decode loop when the head has an RPC peer.  This makes
-     * prefill O(n_tokens) round trips of ~64 KB each; with TB4 the bandwidth
-     * is fine and only RTT*n_tokens latency is added.  Phase 5 follow-up:
-     * batch prefill over RPC. */
-    const bool use_per_token = (e->rpc_peer != NULL);
+    /* Pipeline-parallel prefill ships batch_cur_hc to the tail per chunk
+     * via OP_PREFILL_REQ.  For small extensions (the suffix-extension path
+     * below) it is sometimes cheaper to fall back to per-token decode RPCs
+     * than to spin up batch machinery, but that thresholding is a future
+     * polish item; for now any RPC engine uses the batched path. */
+    const bool use_batched_rpc = (e->rpc_peer != NULL);
 
     if (s->checkpoint_valid &&
         prompt->len >= s->checkpoint.len &&
@@ -16480,8 +17014,20 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     {
         s->mtp_draft_valid = false;
         const int suffix = prompt->len - s->checkpoint.len;
+        if (use_batched_rpc && suffix > 0) {
+            if (rpc_batched_prefill(s, prompt,
+                                    (uint32_t)s->checkpoint.len,
+                                    (uint32_t)suffix,
+                                    err, errlen) != 0) {
+                s->checkpoint_valid = false;
+                return 1;
+            }
+            ds4_tokens_copy(&s->checkpoint, prompt);
+            s->checkpoint_valid = true;
+            return 0;
+        }
         const uint32_t resume_min = metal_graph_resume_prefill_min_tokens();
-        if (!use_per_token && suffix > 0 && (uint32_t)suffix >= resume_min) {
+        if (!use_batched_rpc && suffix > 0 && (uint32_t)suffix >= resume_min) {
             ds4_sync_progress progress = {
                 .session = s,
                 .prompt = prompt,
@@ -16499,7 +17045,8 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                                         s->logits,
                                                         false,
                                                         progress_fn,
-                                                        progress_fn ? &progress : NULL);
+                                                        progress_fn ? &progress : NULL,
+                                                        NULL, NULL);
             if (!ok) {
                 snprintf(err, errlen, "Metal resumed prefill failed while extending checkpoint");
                 s->checkpoint_valid = false;
@@ -16511,40 +17058,33 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         }
 
         for (int i = s->checkpoint.len; i < prompt->len; i++) {
-            if (use_per_token) {
-                if (ds4_session_eval_internal(s, prompt->v[i], false,
-                                              err, errlen) != 0) {
-                    return 1;
-                }
-            } else {
-                if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
-                                                    (uint32_t)prompt->v[i],
-                                                    (uint32_t)s->checkpoint.len,
-                                                    s->logits))
-                {
-                    snprintf(err, errlen, "Metal decode failed while extending checkpoint");
-                    s->checkpoint_valid = false;
-                    return 1;
-                }
-                token_vec_push(&s->checkpoint, prompt->v[i]);
+            if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
+                                                (uint32_t)prompt->v[i],
+                                                (uint32_t)s->checkpoint.len,
+                                                s->logits))
+            {
+                snprintf(err, errlen, "Metal decode failed while extending checkpoint");
+                s->checkpoint_valid = false;
+                return 1;
             }
+            token_vec_push(&s->checkpoint, prompt->v[i]);
         }
         s->checkpoint_valid = true;
         return 0;
     }
 
-    if (use_per_token) {
-        /* Cold path under RPC: reset tail KV (in case prior session left
-         * dirty state) and then walk the whole prompt through the same
-         * per-token RPC eval as the suffix-extension path above. */
+    if (use_batched_rpc) {
+        /* Cold path under RPC: reset tail KV (so its checkpoint counter
+         * starts at 0, matching pos_start=0 below) and drive the head
+         * through chunked prefill with the RPC hook shipping each chunk. */
         rpc_propagate_reset(s, "sync cold path");
         s->checkpoint.len = 0;
-        for (int i = 0; i < prompt->len; i++) {
-            if (ds4_session_eval_internal(s, prompt->v[i], false,
-                                          err, errlen) != 0) {
-                return 1;
-            }
+        if (rpc_batched_prefill(s, prompt, 0, (uint32_t)prompt->len,
+                                err, errlen) != 0) {
+            s->checkpoint_valid = false;
+            return 1;
         }
+        ds4_tokens_copy(&s->checkpoint, prompt);
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
         return 0;
@@ -16747,32 +17287,53 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
      * full graph locally. */
     if (e->rpc_peer) {
         const uint64_t n_residual = ds4_residual_hc_floats();
-        float *residual = (float *)malloc((size_t)(n_residual * sizeof(float)));
+        float *residual = s->rpc_residual_scratch;
         if (!residual) {
-            snprintf(err, errlen, "rpc: residual alloc failed");
+            snprintf(err, errlen, "rpc: residual scratch missing on session");
             s->checkpoint_valid = false;
             return 1;
         }
         char rpc_err[512] = {0};
         if (ds4_session_export_residual_hc(s, residual, n_residual,
                                            rpc_err, sizeof(rpc_err)) != 0) {
-            free(residual);
             snprintf(err, errlen, "rpc: export residual: %s", rpc_err);
             s->checkpoint_valid = false;
             return 1;
         }
+        /* Ask the tail for MTP drafts iff the head is open to drafting on
+         * this eval (probe_mtp) and the peer reports MTP available. */
+        const bool ask_drafts = probe_mtp && e->rpc_tail_has_mtp &&
+                                e->mtp_draft_tokens > 0;
+        uint32_t drafts_buf[DS4_RPC_MAX_DRAFTS] = {0};
+        uint32_t n_drafts_returned = 0;
         if (ds4_rpc_decode_request(e->rpc_peer,
                                    (uint32_t)token,
                                    (uint32_t)s->checkpoint.len,
+                                   ask_drafts,
                                    residual, n_residual,
                                    s->logits, DS4_N_VOCAB,
+                                   ask_drafts ? drafts_buf : NULL,
+                                   ask_drafts ? DS4_RPC_MAX_DRAFTS : 0u,
+                                   ask_drafts ? &n_drafts_returned : NULL,
                                    rpc_err, sizeof(rpc_err)) != 0) {
-            free(residual);
-            snprintf(err, errlen, "rpc: decode request to tail: %s", rpc_err);
+            ds4_rpc_close(e->rpc_peer);
+            e->rpc_peer = NULL;
+            snprintf(err, errlen, "rpc: decode request to tail: %s "
+                                  "(connection dropped)", rpc_err);
             s->checkpoint_valid = false;
             return 1;
         }
-        free(residual);
+        /* Store the first draft so speculative_argmax (and the existing
+         * mtp_draft_token plumbing) sees it after this eval.  Additional
+         * drafts go in s->rpc_extra_drafts for the verification loop. */
+        if (ask_drafts && n_drafts_returned > 0) {
+            s->mtp_draft_token = (int)drafts_buf[0];
+            s->mtp_draft_valid = true;
+            s->rpc_n_extra_drafts = n_drafts_returned > 1 ? n_drafts_returned - 1 : 0;
+            for (uint32_t i = 1; i < n_drafts_returned && i - 1 < DS4_RPC_MAX_DRAFTS; i++) {
+                s->rpc_extra_drafts[i - 1] = drafts_buf[i];
+            }
+        }
     }
 
     token_vec_push(&s->checkpoint, token);
@@ -16800,6 +17361,78 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     return ds4_session_eval_internal(s, token, true, err, errlen);
 }
+
+int ds4_session_eval_no_draft(ds4_session *s, int token, char *err, size_t errlen) {
+    return ds4_session_eval_internal(s, token, false, err, errlen);
+}
+
+#ifndef DS4_NO_METAL
+int ds4_session_mtp_drafts_after_eval(ds4_session *s,
+                                      uint32_t *out_drafts, int max_drafts,
+                                      char *err, size_t errlen) {
+    if (!s || !out_drafts || max_drafts <= 0) {
+        if (errlen) snprintf(err, errlen, "mtp_drafts: null arg or zero max");
+        return 0;
+    }
+    ds4_engine *e = s->engine;
+    if (!e->mtp_ready || !s->mtp_logits) {
+        if (errlen) snprintf(err, errlen, "mtp_drafts: MTP not loaded on this engine");
+        return 0;
+    }
+    if (!s->mtp_draft_valid) {
+        /* No pending draft -- prior eval skipped MTP probing. */
+        return 0;
+    }
+
+    int draft_n = 0;
+    out_drafts[draft_n++] = (uint32_t)s->mtp_draft_token;
+    s->mtp_draft_valid = false;
+
+    int cap = e->mtp_draft_tokens;
+    if (cap > max_drafts) cap = max_drafts;
+    if (cap > 16) cap = 16;
+    const int room = s->ctx_size - s->checkpoint.len;
+    if (cap > room - 1) cap = room - 1;
+    if (cap <= 1) return draft_n;
+
+    /* Record the cache base so a later trim can compute the new mtp_n_raw
+     * from "drafts in this round" minus "drafts accepted". */
+    s->graph.mtp_draft_round_base_raw = s->graph.mtp_n_raw - 1u; /* the eval just added 1 */
+
+    for (; draft_n < cap; draft_n++) {
+        ds4_metal_tensor *prev_hc = (draft_n & 1) ? s->graph.mtp_state_hc : s->graph.mtp_next_hc;
+        ds4_metal_tensor *out_hc  = (draft_n & 1) ? s->graph.mtp_next_hc  : s->graph.mtp_state_hc;
+        int mtp_top = -1;
+        if (!metal_graph_eval_mtp_draft_from_hc(&s->graph,
+                                                &e->model, &e->weights,
+                                                &e->mtp_model, &e->mtp_weights,
+                                                prev_hc, out_hc,
+                                                (int)out_drafts[draft_n - 1],
+                                                (uint32_t)(s->checkpoint.len + draft_n - 1),
+                                                /* logits = */ NULL,
+                                                &mtp_top))
+        {
+            break;
+        }
+        out_drafts[draft_n] = (uint32_t)(mtp_top >= 0 ? mtp_top : 0);
+    }
+    s->graph.mtp_draft_round_n = (uint32_t)draft_n;
+    return draft_n;
+}
+
+void ds4_session_mtp_trim_drafts(ds4_session *s, uint32_t keep_drafts) {
+    if (!s || !s->engine->mtp_ready) return;
+    /* The worker captured mtp_n_raw before drafting (mtp_draft_round_base_raw)
+     * and the count of drafts produced (mtp_draft_round_n).  Truncate the
+     * cache to base + keep, clamped to round_n so callers can't grow it. */
+    uint32_t keep = keep_drafts;
+    if (keep > s->graph.mtp_draft_round_n) keep = s->graph.mtp_draft_round_n;
+    uint32_t new_n_raw = s->graph.mtp_draft_round_base_raw + keep;
+    if (new_n_raw > s->graph.raw_window) new_n_raw = s->graph.raw_window;
+    s->graph.mtp_n_raw = new_n_raw;
+    s->mtp_draft_valid = false;
+}
+#endif
 
 /* Speculative decode state machine:
  * 1. commit the normal target token and use its logits to validate draft[0];
@@ -16833,6 +17466,185 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     int n_accept = 0;
     accepted[n_accept++] = first_token;
     if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
+
+    /* Pipeline-parallel head: tail produces MTP drafts post-decode; we
+     * learned them via DECODE_REPLY into s->mtp_draft_token (draft 0) and
+     * s->rpc_extra_drafts (drafts 1..N-1).
+     *
+     * Verification is all-or-nothing under RPC: we check drafts[0] locally
+     * for free against s->logits (the just-evaluated target prediction);
+     * if that misses we commit only first_token.  If drafts[0] hits we
+     * batch-verify drafts[0..N-1] in a single VERIFY_BATCH RPC: head runs
+     * its layers' prefill for those N tokens, exports the resulting
+     * batch_cur_hc, snapshots its KV state, ships the batch to the tail
+     * which runs its own prefill + per-row argmax against expected drafts.
+     * Tail returns accepted = N (full) or 0 (any miss, KV restored).  Head
+     * mirrors: full accept commits all drafts and adopts the returned
+     * logits as s->logits; miss restores its KV snapshot and falls through
+     * to commit only first_token.  Verification of the cycle takes one RPC
+     * roundtrip instead of N, and the tail amortizes layer setup across
+     * the batch -- the same speedup pattern as the single-host batched
+     * verifiers. */
+    if (e->rpc_peer && e->rpc_tail_has_mtp && s->mtp_draft_valid &&
+        e->mtp_draft_tokens > 1)
+    {
+        int draft_n = (int)s->rpc_n_extra_drafts + 1; /* +1 for draft 0 */
+        if (draft_n > 16) draft_n = 16;
+        int draft_cap = e->mtp_draft_tokens;
+        if (draft_cap > max_tokens - n_accept) draft_cap = max_tokens - n_accept;
+        if (draft_cap > accepted_cap - n_accept) draft_cap = accepted_cap - n_accept;
+        const int room = s->ctx_size - s->checkpoint.len;
+        if (draft_cap > room) draft_cap = room;
+        if (draft_n > draft_cap) draft_n = draft_cap;
+
+        int drafts[16];
+        drafts[0] = s->mtp_draft_token;
+        for (int i = 1; i < draft_n; i++) {
+            drafts[i] = (int)s->rpc_extra_drafts[i - 1];
+        }
+        s->mtp_draft_valid = false;
+
+        const bool spec_log = getenv("DS4_MTP_SPEC_LOG") != NULL;
+
+        /* Free local verification of drafts[0]: argmax of the prediction we
+         * already have.  Cheap miss path -- no RPC needed. */
+        if (sample_argmax(s->logits, DS4_N_VOCAB) != drafts[0]) {
+            if (spec_log) {
+                fprintf(stderr, "ds4: rpc-mtp miss draft0=%d, no batch sent\n", drafts[0]);
+            }
+            char trim_err[160] = {0};
+            (void)ds4_rpc_mtp_trim(e->rpc_peer, 0, trim_err, sizeof(trim_err));
+            return n_accept;
+        }
+
+        /* Snapshot head's KV state before running drafts through head's
+         * layers; on any tail miss we restore and bail out. */
+        ds4_spec_frontier head_frontier;
+        memset(&head_frontier, 0, sizeof(head_frontier));
+        if (!spec_frontier_snapshot(&head_frontier, s)) {
+            snprintf(err, errlen, "rpc-mtp: head spec_frontier_snapshot failed");
+            return -1;
+        }
+        const uint32_t pre_pos = (uint32_t)s->checkpoint.len;
+
+        /* Run head's slice as a batched prefill over the drafts, starting
+         * at the current session position.  metal_graph_prefill_chunked_range
+         * reads prompt->v[start..start+n) and writes KV at the same absolute
+         * positions, so the prompt vec needs to be padded with zeros up to
+         * pre_pos and then the drafts. */
+        const uint64_t batch_prompt_len = (uint64_t)pre_pos + (uint64_t)draft_n;
+        if (batch_prompt_len > INT_MAX) {
+            spec_frontier_restore(&head_frontier, s);
+            spec_frontier_free(&head_frontier);
+            snprintf(err, errlen, "rpc-mtp: pos+draft overflows int");
+            return -1;
+        }
+        int *batch_tokens = (int *)calloc((size_t)batch_prompt_len, sizeof(int));
+        if (!batch_tokens) {
+            spec_frontier_restore(&head_frontier, s);
+            spec_frontier_free(&head_frontier);
+            snprintf(err, errlen, "rpc-mtp: batch prompt alloc failed");
+            return -1;
+        }
+        for (int i = 0; i < draft_n; i++) {
+            batch_tokens[pre_pos + i] = drafts[i];
+        }
+        token_vec batch_prompt = {
+            .v = batch_tokens,
+            .len = (int)batch_prompt_len,
+            .cap = (int)batch_prompt_len,
+        };
+        bool ok = metal_graph_prefill_chunked_range(&s->graph, &e->model, &e->weights,
+                                                    &batch_prompt,
+                                                    pre_pos, (uint32_t)draft_n,
+                                                    /* logits */ NULL,
+                                                    false, NULL, NULL, NULL, NULL);
+        free(batch_tokens);
+        if (!ok) {
+            spec_frontier_restore(&head_frontier, s);
+            spec_frontier_free(&head_frontier);
+            snprintf(err, errlen, "rpc-mtp: head batch prefill failed");
+            return -1;
+        }
+
+        /* Export head's batch_cur_hc and ship to the tail along with the
+         * expected drafts[1..draft_n-1] for per-row verification. */
+        const uint64_t per_token = ds4_residual_hc_floats();
+        const uint64_t total_floats = (uint64_t)draft_n * per_token;
+        float *batch_buf = (float *)malloc((size_t)(total_floats * sizeof(float)));
+        if (!batch_buf) {
+            spec_frontier_restore(&head_frontier, s);
+            spec_frontier_free(&head_frontier);
+            snprintf(err, errlen, "rpc-mtp: batch buffer alloc failed");
+            return -1;
+        }
+        if (ds4_metal_tensor_read(s->graph.batch_cur_hc, 0, batch_buf,
+                                  total_floats * sizeof(float)) == 0) {
+            free(batch_buf);
+            spec_frontier_restore(&head_frontier, s);
+            spec_frontier_free(&head_frontier);
+            snprintf(err, errlen, "rpc-mtp: read batch_cur_hc failed");
+            return -1;
+        }
+
+        uint32_t expected_buf[16] = {0};
+        for (int i = 1; i < draft_n; i++) expected_buf[i - 1] = (uint32_t)drafts[i];
+
+        uint32_t n_accepted = 0;
+        char rpc_err[256] = {0};
+        if (ds4_rpc_verify_batch_request(e->rpc_peer,
+                                         (uint32_t)draft_n, pre_pos,
+                                         batch_buf, total_floats,
+                                         draft_n > 1 ? expected_buf : NULL,
+                                         (uint32_t)(draft_n - 1),
+                                         &n_accepted,
+                                         s->logits, DS4_N_VOCAB,
+                                         rpc_err, sizeof(rpc_err)) != 0) {
+            free(batch_buf);
+            spec_frontier_restore(&head_frontier, s);
+            spec_frontier_free(&head_frontier);
+            ds4_rpc_close(e->rpc_peer);
+            e->rpc_peer = NULL;
+            snprintf(err, errlen, "rpc-mtp: verify_batch RPC failed: %s "
+                                  "(connection dropped)", rpc_err);
+            return -1;
+        }
+        free(batch_buf);
+
+        if (n_accepted == 0) {
+            /* Tail rejected -- restore head's KV state so it matches the
+             * tail's (which the tail already restored from its own
+             * snapshot). */
+            spec_frontier_restore(&head_frontier, s);
+            spec_frontier_free(&head_frontier);
+            char trim_err[160] = {0};
+            (void)ds4_rpc_mtp_trim(e->rpc_peer, 0, trim_err, sizeof(trim_err));
+            if (spec_log) {
+                fprintf(stderr, "ds4: rpc-mtp batch miss, drafted=%d accepted=0\n", draft_n);
+            }
+            return n_accept;
+        }
+
+        /* Full accept: commit drafts and advance the checkpoint to match. */
+        spec_frontier_free(&head_frontier);
+        for (int i = 0; i < draft_n; i++) {
+            if (n_accept >= accepted_cap) break;
+            accepted[n_accept++] = drafts[i];
+            token_vec_push(&s->checkpoint, drafts[i]);
+            if (drafts[i] == eos_token) break;
+            if (n_accept >= max_tokens) break;
+        }
+        s->checkpoint_valid = true;
+
+        char trim_err[160] = {0};
+        (void)ds4_rpc_mtp_trim(e->rpc_peer, (uint32_t)draft_n,
+                               trim_err, sizeof(trim_err));
+        if (spec_log) {
+            fprintf(stderr, "ds4: rpc-mtp batch accepted, drafted=%d accepted=%d\n",
+                    draft_n, draft_n);
+        }
+        return n_accept;
+    }
 
     if (!e->mtp_ready || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) return n_accept;
 
@@ -17422,14 +18234,17 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;
     s->mtp_draft_valid = false;
-    /* The wire protocol has no partial-rewind op yet, so under RPC we drop
-     * the tail's KV entirely and require the caller to re-prefill from pos.
-     * For purely-local engines this is a cheap counter update; under RPC it
-     * makes rewind a heavyweight operation.  Phase 5 follow-up. */
+    /* Under RPC, tell the tail to truncate its checkpoint to the same
+     * position.  Best-effort: on failure the next decode will surface a
+     * pos mismatch and the caller can re-prefill from scratch. */
     if (s->engine && s->engine->rpc_peer) {
-        rpc_propagate_reset(s, "rewind");
-        s->checkpoint.len = 0;
-        s->checkpoint_valid = false;
+        char rpc_err[256] = {0};
+        if (ds4_rpc_rewind(s->engine->rpc_peer, (uint32_t)pos,
+                           rpc_err, sizeof(rpc_err)) != 0) {
+            fprintf(stderr,
+                    "ds4: rpc rewind to pos=%d failed: %s; tail state may be stale\n",
+                    pos, rpc_err);
+        }
     }
 }
 
@@ -17439,4 +18254,8 @@ int ds4_session_pos(ds4_session *s) {
 
 int ds4_session_ctx(ds4_session *s) {
     return s->ctx_size;
+}
+
+uint32_t ds4_session_prefill_cap(ds4_session *s) {
+    return s ? s->prefill_cap : 0u;
 }
