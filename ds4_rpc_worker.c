@@ -34,6 +34,7 @@
 
 typedef struct {
     const char *model_path;
+    const char *quant;                 /* --quant q2|q4, NULL if unspecified */
     const char *bind_host;
     uint16_t    port;
     int         layer_start;
@@ -55,7 +56,11 @@ static void worker_usage(const char *prog) {
             "  --layer-end M          Last layer owned (exclusive).  Typical: 43.\n"
             "\n"
             "Common:\n"
-            "  -m, --model FILE       GGUF path.  Default: ds4flash.gguf\n"
+            "  -m, --model FILE       GGUF path.  Wins over --quant.  Default:\n"
+            "                         auto-detect Q2 or Q4 in ./gguf/ (prefers Q2).\n"
+            "  --quant Q              Pick canonical 'q2' or 'q4' file in ./gguf/.\n"
+            "                         Must match the head's --quant for the\n"
+            "                         handshake fingerprint to succeed.\n"
             "  --listen HOST          Bind address.  Default: 0.0.0.0\n"
             "  --port N               TCP port.  Default: %u\n"
             "  --ctx N                Context size for session.  Default: %u\n"
@@ -81,7 +86,8 @@ static int parse_int_arg(const char *flag, const char *val, int *out) {
 }
 
 static int parse_args(int argc, char **argv, worker_opts *o) {
-    o->model_path = "ds4flash.gguf";
+    o->model_path = NULL; /* resolved after parsing via ds4_resolve_model_path */
+    o->quant = NULL;
     o->bind_host = "0.0.0.0";
     o->port = WORKER_DEFAULT_PORT;
     o->layer_start = -1;
@@ -98,6 +104,9 @@ static int parse_args(int argc, char **argv, worker_opts *o) {
         } else if (!strcmp(a, "-m") || !strcmp(a, "--model")) {
             if (!next) { fprintf(stderr, "%s needs a value\n", a); return 1; }
             o->model_path = next; i++;
+        } else if (!strcmp(a, "--quant")) {
+            if (!next) { fprintf(stderr, "%s needs a value\n", a); return 1; }
+            o->quant = next; i++;
         } else if (!strcmp(a, "--listen")) {
             if (!next) { fprintf(stderr, "%s needs a value\n", a); return 1; }
             o->bind_host = next; i++;
@@ -133,6 +142,22 @@ static int parse_args(int argc, char **argv, worker_opts *o) {
         fprintf(stderr, "ds4-rpc-worker: empty layer range [%d, %d)\n",
                 o->layer_start, o->layer_end);
         return 1;
+    }
+
+    /* Final model-path resolution: -m wins, else --quant, else filesystem
+     * probe (Q2 preferred), else fall back to ds4flash.gguf symlink.  The
+     * resolved path must match what the head ships in its handshake config
+     * for the fingerprint check to pass. */
+    {
+        char resolve_err[256] = {0};
+        const char *resolved = ds4_resolve_model_path(o->model_path, o->quant,
+                                                      resolve_err, sizeof(resolve_err));
+        if (!resolved) {
+            fprintf(stderr, "ds4-rpc-worker: %s\n", resolve_err);
+            return 1;
+        }
+        if (resolve_err[0]) fprintf(stderr, "ds4-rpc-worker: %s\n", resolve_err);
+        o->model_path = resolved;
     }
     return 0;
 }
