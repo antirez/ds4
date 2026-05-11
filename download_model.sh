@@ -104,9 +104,16 @@ download_one() {
     file=$1
     out="$OUT_DIR/$file"
     part="$out.part"
+    aria2_part="$out.aria2"
     url="https://huggingface.co/$REPO/resolve/main/$file"
 
     mkdir -p "$OUT_DIR"
+
+    if [ -e "$aria2_part" ]; then
+        echo "Found incomplete aria2 download sidecar: $aria2_part" >&2
+        echo "Finish or remove that partial download before using this curl downloader." >&2
+        exit 1
+    fi
 
     if [ -s "$out" ]; then
         echo "Already downloaded: $out"
