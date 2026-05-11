@@ -16306,6 +16306,74 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
 #endif
 }
 
+int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen) {
+    if (!s || !snap) {
+        payload_set_err(err, errlen, "invalid session snapshot save");
+        return 1;
+    }
+    const uint64_t bytes = ds4_session_payload_bytes(s);
+    if (bytes == 0) {
+        payload_set_err(err, errlen, "session has no valid checkpoint to snapshot");
+        return 1;
+    }
+    if (bytes > (uint64_t)SIZE_MAX) {
+        payload_set_err(err, errlen, "session snapshot is too large for this platform");
+        return 1;
+    }
+    if (snap->cap < bytes) {
+        uint8_t *p = realloc(snap->ptr, (size_t)bytes);
+        if (!p) {
+            payload_set_err(err, errlen, "out of memory while allocating session snapshot");
+            return 1;
+        }
+        snap->ptr = p;
+        snap->cap = bytes;
+    }
+
+    FILE *fp = fmemopen(snap->ptr, (size_t)bytes, "wb");
+    if (!fp) {
+        payload_set_err(err, errlen, "failed to open memory stream for session snapshot");
+        return 1;
+    }
+    const int rc = ds4_session_save_payload(s, fp, err, errlen);
+    if (fclose(fp) != 0 && rc == 0) {
+        payload_set_err(err, errlen, "failed to finalize memory session snapshot");
+        return 1;
+    }
+    if (rc != 0) return 1;
+    snap->len = bytes;
+    return 0;
+}
+
+int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen) {
+    if (!s || !snap || !snap->ptr || snap->len == 0) {
+        payload_set_err(err, errlen, "invalid session snapshot load");
+        return 1;
+    }
+    if (snap->len > (uint64_t)SIZE_MAX) {
+        payload_set_err(err, errlen, "session snapshot is too large for this platform");
+        return 1;
+    }
+
+    FILE *fp = fmemopen((void *)snap->ptr, (size_t)snap->len, "rb");
+    if (!fp) {
+        payload_set_err(err, errlen, "failed to open memory stream for session snapshot restore");
+        return 1;
+    }
+    const int rc = ds4_session_load_payload(s, fp, snap->len, err, errlen);
+    if (fclose(fp) != 0 && rc == 0) {
+        payload_set_err(err, errlen, "failed to close memory session snapshot");
+        return 1;
+    }
+    return rc;
+}
+
+void ds4_session_snapshot_free(ds4_session_snapshot *snap) {
+    if (!snap) return;
+    free(snap->ptr);
+    memset(snap, 0, sizeof(*snap));
+}
+
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens) {
     dump_tokens(&e->vocab, tokens);
 }
@@ -17011,6 +17079,21 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
 
 int ds4_session_argmax(ds4_session *s) {
     return sample_argmax(s->logits, DS4_N_VOCAB);
+}
+
+int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
+    if (!s || !s->logits) return -1;
+    int best = -1;
+    float best_logit = DS4_NEG_INF;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        if ((int)i == excluded_id) continue;
+        const float v = s->logits[i];
+        if (best < 0 || v > best_logit) {
+            best = (int)i;
+            best_logit = v;
+        }
+    }
+    return best;
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
