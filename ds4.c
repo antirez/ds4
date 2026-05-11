@@ -19,6 +19,7 @@
 #include <float.h>
 #include <inttypes.h>
 #include <ctype.h>
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -33,6 +34,10 @@
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
+
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 
 #include "ds4.h"
 
@@ -506,6 +511,85 @@ static void *xmalloc_zeroed(size_t n, size_t size) {
      */
     memset(p, 0, total);
     return p;
+}
+
+static char *xstrdup(const char *s) {
+    size_t n = strlen(s);
+    char *p = xmalloc(n + 1);
+    memcpy(p, s, n + 1);
+    return p;
+}
+
+static bool path_is_absolute(const char *path) {
+    return path && path[0] == '/';
+}
+
+static bool path_is_readable(const char *path) {
+    return path && access(path, R_OK) == 0;
+}
+
+static char *path_join_dup(const char *dir, const char *path) {
+    size_t dlen = strlen(dir);
+    size_t plen = strlen(path);
+    bool slash = dlen > 0 && dir[dlen - 1] == '/';
+    if (dlen > SIZE_MAX - plen - (slash ? 1u : 2u)) ds4_die("path length overflow");
+    char *out = xmalloc(dlen + (slash ? 0u : 1u) + plen + 1u);
+    memcpy(out, dir, dlen);
+    size_t pos = dlen;
+    if (!slash) out[pos++] = '/';
+    memcpy(out + pos, path, plen + 1u);
+    return out;
+}
+
+static char *executable_dir(void) {
+#if defined(__APPLE__)
+    char stack_path[PATH_MAX];
+    uint32_t size = sizeof(stack_path);
+    char *path = stack_path;
+    if (_NSGetExecutablePath(stack_path, &size) != 0) {
+        path = xmalloc(size);
+        if (_NSGetExecutablePath(path, &size) != 0) {
+            free(path);
+            return NULL;
+        }
+    }
+    char *resolved = realpath(path, NULL);
+    char *owned = resolved ? resolved : xstrdup(path);
+    if (path != stack_path) free(path);
+#elif defined(__linux__)
+    char stack_path[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", stack_path, sizeof(stack_path) - 1u);
+    if (n <= 0 || (size_t)n >= sizeof(stack_path)) return NULL;
+    stack_path[n] = '\0';
+    char *resolved = realpath(stack_path, NULL);
+    char *owned = resolved ? resolved : xstrdup(stack_path);
+#else
+    return NULL;
+#endif
+    char *slash = strrchr(owned, '/');
+    if (!slash) {
+        free(owned);
+        return NULL;
+    }
+    if (slash == owned) {
+        slash[1] = '\0';
+    } else {
+        *slash = '\0';
+    }
+    return owned;
+}
+
+static char *resolve_runtime_path(const char *path) {
+    if (!path || !path[0]) return xstrdup(path ? path : "");
+    if (path_is_absolute(path) || path_is_readable(path)) return xstrdup(path);
+
+    char *dir = executable_dir();
+    if (!dir) return xstrdup(path);
+    char *candidate = path_join_dup(dir, path);
+    free(dir);
+    if (path_is_readable(candidate)) return candidate;
+    free(candidate);
+    return xstrdup(path);
 }
 
 static double now_sec(void) {
@@ -16514,7 +16598,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_acquire_instance_lock();
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
-    model_open(&e->model, opt->model_path, graph_backend, true);
+    char *model_path = resolve_runtime_path(opt->model_path);
+    model_open(&e->model, model_path, graph_backend, true);
+    free(model_path);
     if (opt->warm_weights) model_warm_weights(&e->model);
     vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
@@ -16525,12 +16611,14 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         return 1;
     }
     if (opt->mtp_path && opt->mtp_path[0]) {
-        model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
+        char *mtp_path = resolve_runtime_path(opt->mtp_path);
+        model_open(&e->mtp_model, mtp_path, graph_backend, true);
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
         e->mtp_ready = true;
         fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
-                opt->mtp_path,
+                mtp_path,
                 e->mtp_draft_tokens);
+        free(mtp_path);
     }
 
 #ifndef DS4_NO_GPU

@@ -189,11 +189,18 @@ live graph/session.
 
 Supported endpoints:
 
+- `GET /health`
 - `GET /v1/models`
 - `GET /v1/models/deepseek-v4-flash`
 - `POST /v1/chat/completions`
 - `POST /v1/completions`
 - `POST /v1/messages`
+
+`/health` is a lightweight liveness endpoint for process managers and model
+routers. Relative model and Metal source paths are resolved from the current
+working directory first, then from the `ds4` / `ds4-server` executable
+directory, so external launchers can run `/path/to/ds4-server` without `cd` when
+the normal repo layout is next to the binary.
 
 `/v1/chat/completions` accepts the usual OpenAI-style `messages`,
 `max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, `top_k`, `min_p`,
