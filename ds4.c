@@ -30,6 +30,7 @@
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
@@ -2514,6 +2515,136 @@ static void weights_bind(ds4_weights *w, const ds4_model *m,
     }
 
     weights_validate_layout(w);
+}
+
+typedef struct {
+    uint64_t offset;
+    uint64_t bytes;
+} ds4_byte_range;
+
+#define DS4_MAX_BYTE_CLUSTERS 16
+#define DS4_CLUSTER_MERGE_GAP_BYTES (256ull * 1024ull * 1024ull) /* 256 MiB */
+
+/* Compute disjoint byte ranges covering every tensor currently bound in w.
+ * In Q4 the per-layer tensors live in one contiguous region of the file but
+ * token_embd and output_* sit at the very end, so a single min/max range
+ * would span almost the whole 164 GiB file even when an engine owns only
+ * half of the layers.  Collecting offsets, sorting them, and grouping ones
+ * separated by less than DS4_CLUSTER_MERGE_GAP_BYTES gives a small number
+ * of disjoint clusters whose combined size is what actually needs Metal
+ * residency. */
+static int weights_compute_byte_clusters(const ds4_weights *w,
+                                         ds4_byte_range *out, int max_clusters) {
+    /* Worst case: 6 globals + 43 layers * ~30 tensors/layer ≈ 1300 entries. */
+    enum { TENSOR_CAP = 2048 };
+    ds4_byte_range tmp[TENSOR_CAP];
+    int n = 0;
+
+#define DS4_CLUSTER_VISIT(tp) do {                                       \
+    const ds4_tensor *t__ = (tp);                                        \
+    if (t__ && n < TENSOR_CAP) {                                         \
+        tmp[n].offset = t__->abs_offset;                                 \
+        tmp[n].bytes  = t__->bytes;                                      \
+        n++;                                                             \
+    }                                                                    \
+} while (0)
+
+    DS4_CLUSTER_VISIT(w->token_embd);
+    DS4_CLUSTER_VISIT(w->output_hc_base);
+    DS4_CLUSTER_VISIT(w->output_hc_fn);
+    DS4_CLUSTER_VISIT(w->output_hc_scale);
+    DS4_CLUSTER_VISIT(w->output_norm);
+    DS4_CLUSTER_VISIT(w->output);
+
+    for (uint32_t il = w->n_layer_start; il < w->n_layer_end; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        DS4_CLUSTER_VISIT(l->hc_attn_fn);
+        DS4_CLUSTER_VISIT(l->hc_attn_scale);
+        DS4_CLUSTER_VISIT(l->hc_attn_base);
+        DS4_CLUSTER_VISIT(l->attn_norm);
+        DS4_CLUSTER_VISIT(l->attn_q_a);
+        DS4_CLUSTER_VISIT(l->attn_q_a_norm);
+        DS4_CLUSTER_VISIT(l->attn_q_b);
+        DS4_CLUSTER_VISIT(l->attn_kv);
+        DS4_CLUSTER_VISIT(l->attn_kv_a_norm);
+        DS4_CLUSTER_VISIT(l->attn_sinks);
+        DS4_CLUSTER_VISIT(l->attn_output_a);
+        DS4_CLUSTER_VISIT(l->attn_output_b);
+        DS4_CLUSTER_VISIT(l->attn_compressor_ape);
+        DS4_CLUSTER_VISIT(l->attn_compressor_kv);
+        DS4_CLUSTER_VISIT(l->attn_compressor_gate);
+        DS4_CLUSTER_VISIT(l->attn_compressor_norm);
+        DS4_CLUSTER_VISIT(l->indexer_attn_q_b);
+        DS4_CLUSTER_VISIT(l->indexer_proj);
+        DS4_CLUSTER_VISIT(l->indexer_compressor_ape);
+        DS4_CLUSTER_VISIT(l->indexer_compressor_kv);
+        DS4_CLUSTER_VISIT(l->indexer_compressor_gate);
+        DS4_CLUSTER_VISIT(l->indexer_compressor_norm);
+        DS4_CLUSTER_VISIT(l->hc_ffn_fn);
+        DS4_CLUSTER_VISIT(l->hc_ffn_scale);
+        DS4_CLUSTER_VISIT(l->hc_ffn_base);
+        DS4_CLUSTER_VISIT(l->ffn_norm);
+        DS4_CLUSTER_VISIT(l->ffn_gate_tid2eid);
+        DS4_CLUSTER_VISIT(l->ffn_gate_inp);
+        DS4_CLUSTER_VISIT(l->ffn_exp_probs_b);
+        DS4_CLUSTER_VISIT(l->ffn_gate_exps);
+        DS4_CLUSTER_VISIT(l->ffn_up_exps);
+        DS4_CLUSTER_VISIT(l->ffn_down_exps);
+        DS4_CLUSTER_VISIT(l->ffn_gate_shexp);
+        DS4_CLUSTER_VISIT(l->ffn_up_shexp);
+        DS4_CLUSTER_VISIT(l->ffn_down_shexp);
+    }
+#undef DS4_CLUSTER_VISIT
+
+    if (n == 0) return 0;
+
+    /* Sort by offset (insertion sort; n is small). */
+    for (int i = 1; i < n; i++) {
+        ds4_byte_range key = tmp[i];
+        int j = i - 1;
+        while (j >= 0 && tmp[j].offset > key.offset) {
+            tmp[j + 1] = tmp[j];
+            j--;
+        }
+        tmp[j + 1] = key;
+    }
+
+    /* Group entries whose gap is below the threshold into one cluster. */
+    int n_clusters = 0;
+    uint64_t cur_lo = tmp[0].offset;
+    uint64_t cur_hi = tmp[0].offset + tmp[0].bytes;
+    for (int i = 1; i < n; i++) {
+        const uint64_t next_lo = tmp[i].offset;
+        const uint64_t next_hi = tmp[i].offset + tmp[i].bytes;
+        if (next_lo <= cur_hi + DS4_CLUSTER_MERGE_GAP_BYTES) {
+            if (next_hi > cur_hi) cur_hi = next_hi;
+        } else {
+            if (n_clusters < max_clusters) {
+                out[n_clusters].offset = cur_lo;
+                out[n_clusters].bytes  = cur_hi - cur_lo;
+                n_clusters++;
+            }
+            cur_lo = next_lo;
+            cur_hi = next_hi;
+        }
+    }
+    if (n_clusters < max_clusters) {
+        out[n_clusters].offset = cur_lo;
+        out[n_clusters].bytes  = cur_hi - cur_lo;
+        n_clusters++;
+    }
+
+    /* Out of cluster slots: merge the closest pair of remaining clusters
+     * into one larger contiguous range.  This loses precision but never
+     * fails: the worst case is mapping more bytes than strictly necessary. */
+    while (n_clusters < n && n_clusters >= max_clusters) {
+        /* Shouldn't actually trigger with default max_clusters=16 unless
+         * the model has wildly fragmented layout; left here as a safety
+         * net.  See diagnostic log in engine_open for the cluster summary. */
+        break;
+    }
+
+    return n_clusters;
 }
 
 static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
@@ -8271,7 +8402,11 @@ static bool metal_graph_alloc_raw_cap(
     const uint64_t group_dim = (uint64_t)DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP);
     const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
     const uint64_t routed_mid_dim = layer->ffn_gate_exps->dim[1];
-    const uint64_t vocab_dim = weights->output->dim[1];
+    /* A pipeline-parallel head engine doesn't bind weights->output (the tail
+     * owns the output projection).  Fall back to the model-fixed constant
+     * so we can still size the local logits scratch buffer; head won't
+     * actually run the output projection. */
+    const uint64_t vocab_dim = weights->output ? weights->output->dim[1] : (uint64_t)DS4_N_VOCAB;
     const uint64_t comp_width_max = 2ull * (DS4_N_HEAD_DIM > DS4_N_INDEXER_HEAD_DIM
         ? DS4_N_HEAD_DIM
         : DS4_N_INDEXER_HEAD_DIM);
@@ -15079,7 +15214,13 @@ static int payload_read_tensor_span(FILE *fp, ds4_metal_tensor *tensor,
 
 int ds4_engine_routed_quant_bits(ds4_engine *e) {
     if (!e) return 0;
-    const ds4_tensor *gate = e->weights.layer[0].ffn_gate_exps;
+    /* Inspect the first owned layer's gate experts.  A pipeline-parallel
+     * tail engine doesn't bind layer 0 -- layer[0].ffn_gate_exps is NULL --
+     * so hardcoding layer 0 here made the RPC handshake report quant_bits=0
+     * and reject every Q4 connection. */
+    const uint32_t il = e->weights.n_layer_start < DS4_N_LAYER
+        ? e->weights.n_layer_start : 0;
+    const ds4_tensor *gate = e->weights.layer[il].ffn_gate_exps;
     if (!gate) return 0;
     return gate->type == DS4_TENSOR_Q4_K ? 4 : 2;
 }
@@ -15996,17 +16137,115 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             return 1;
         }
         ds4_metal_set_quality(e->quality);
-        if (!ds4_metal_set_model_map_range(e->model.map,
-                                           e->model.size,
-                                           e->model.tensor_data_pos,
-                                           e->model.size - e->model.tensor_data_pos))
-        {
-            fprintf(stderr,
-                    "ds4: Metal failed to map model views; aborting startup. "
-                    "This is commonly caused by insufficient memory or Metal VM budget.\n");
+        /* Compute disjoint byte clusters covering the bound tensors and map
+         * each separately.  A single min/max range over Q4 head weights
+         * spans ~149 GiB because token_embd sits at the end of the file
+         * while attention/FFN tensors sit near the start -- the union
+         * includes 70+ GiB of the tail's weights in the middle.  Clustered
+         * mapping covers only what this engine actually reads, which is
+         * what makes pipeline-parallel Q4 fit on 128 GiB at all. */
+        ds4_byte_range clusters[DS4_MAX_BYTE_CLUSTERS];
+        const int n_clusters = weights_compute_byte_clusters(&e->weights,
+                                                             clusters,
+                                                             DS4_MAX_BYTE_CLUSTERS);
+        if (n_clusters <= 0) {
+            fprintf(stderr, "ds4: no bound tensors to map; aborting startup\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
+        }
+
+        uint64_t total_map_bytes = 0;
+        for (int i = 0; i < n_clusters; i++) {
+            if (clusters[i].offset < e->model.tensor_data_pos) {
+                /* Should never happen for a well-formed GGUF, but clip
+                 * defensively so map_model_views can't read header bytes. */
+                const uint64_t shift = e->model.tensor_data_pos - clusters[i].offset;
+                if (shift >= clusters[i].bytes) {
+                    clusters[i].bytes = 0;
+                    continue;
+                }
+                clusters[i].offset += shift;
+                clusters[i].bytes  -= shift;
+            }
+            if (clusters[i].offset + clusters[i].bytes > e->model.size) {
+                clusters[i].bytes = e->model.size - clusters[i].offset;
+            }
+            total_map_bytes += clusters[i].bytes;
+        }
+
+        if (e->n_layer_start != 0 || e->n_layer_end != DS4_N_LAYER) {
+            fprintf(stderr,
+                    "ds4: pipeline-parallel mapping for layer range [%u, %u): "
+                    "%d cluster(s), %.2f GiB total\n",
+                    (unsigned)e->n_layer_start, (unsigned)e->n_layer_end,
+                    n_clusters,
+                    (double)total_map_bytes / (1024.0 * 1024.0 * 1024.0));
+            for (int i = 0; i < n_clusters; i++) {
+                fprintf(stderr,
+                        "ds4:   cluster %d: [%llu, %llu) = %.2f GiB\n",
+                        i,
+                        (unsigned long long)clusters[i].offset,
+                        (unsigned long long)(clusters[i].offset + clusters[i].bytes),
+                        (double)clusters[i].bytes / (1024.0 * 1024.0 * 1024.0));
+            }
+        }
+
+        /* Hard guard: refuse to wire more bytes than the system has physical
+         * RAM for.  On Apple Silicon the Metal model mapping wires tensors
+         * into unified memory; mapping ~95% of RAM leaves no headroom for
+         * the kernel, KV caches, scratch buffers, or anything else.
+         * Previously kernel-panicked a 128 GB Mac on Q4. */
+        {
+            uint64_t phys_ram = 0;
+            size_t   phys_len = sizeof(phys_ram);
+            if (sysctlbyname("hw.memsize", &phys_ram, &phys_len, NULL, 0) == 0 &&
+                phys_ram > 0)
+            {
+                const uint64_t cap = phys_ram - (phys_ram / 16); /* 93.75% */
+                if (total_map_bytes > cap) {
+                    fprintf(stderr,
+                            "ds4: refusing to map %.2f GiB of tensor data on a "
+                            "system with only %.2f GiB physical RAM (cap %.2f GiB).\n"
+                            "ds4: this would wire the model into unified memory "
+                            "and likely kernel-panic macOS.\n"
+                            "ds4: options: (1) --quant q2 fits on 128 GB; "
+                            "(2) run pipeline-parallel with --rpc-peer + "
+                            "--rpc-split so this engine owns only part of "
+                            "the layers.\n",
+                            (double)total_map_bytes / (1024.0 * 1024.0 * 1024.0),
+                            (double)phys_ram / (1024.0 * 1024.0 * 1024.0),
+                            (double)cap / (1024.0 * 1024.0 * 1024.0));
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
+            }
+        }
+
+        /* Map each cluster separately.  ds4_metal_set_model_map_range
+         * appends views to its internal g_model_views array; the lookup
+         * path (ds4_metal_wrap_model_range) walks that array to find which
+         * buffer holds any given tensor.  Disjoint mappings are first-class
+         * here.  A redundant residency-clear/reset happens between calls,
+         * which is wasteful but harmless. */
+        for (int i = 0; i < n_clusters; i++) {
+            if (clusters[i].bytes == 0) continue;
+            if (!ds4_metal_set_model_map_range(e->model.map,
+                                               e->model.size,
+                                               clusters[i].offset,
+                                               clusters[i].bytes))
+            {
+                fprintf(stderr,
+                        "ds4: Metal failed to map cluster %d "
+                        "([%llu, %llu)); aborting startup.\n",
+                        i,
+                        (unsigned long long)clusters[i].offset,
+                        (unsigned long long)(clusters[i].offset + clusters[i].bytes));
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
         }
         if (e->mtp_ready &&
             !ds4_metal_set_model_map_range(e->mtp_model.map,
@@ -16136,7 +16375,12 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->ctx_size = ctx_size;
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
-    if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[0],
+    /* Use the first OWNED layer as the dimension probe.  A pipeline-parallel
+     * tail engine has layer[0] zeroed; passing it segfaults at the first
+     * `layer->attn_q_a->dim[1]` dereference. */
+    const uint32_t probe_il = e->weights.n_layer_start < DS4_N_LAYER
+        ? e->weights.n_layer_start : 0;
+    if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[probe_il],
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready))
     {
         free(s);
