@@ -1081,33 +1081,35 @@ static int ds4_gpu_use_mpp_q8_0_matmul(void) {
 
 static int ds4_gpu_mpp_q8_0_partial_tiles_enabled(void) {
     if (ds4_gpu_mpp_fast_profile()) return 1;
-    return ds4_gpu_env_bool("DS4_METAL_MPP_Q8_0_PARTIAL_ENABLE") > 0;
+    const int enabled = ds4_gpu_env_bool("DS4_METAL_MPP_Q8_0_PARTIAL_ENABLE");
+    if (enabled >= 0) return enabled > 0;
+    return 1;
 }
 
-static uint32_t ds4_gpu_mpp_tile_n_env(const char *name) {
+static uint32_t ds4_gpu_mpp_tile_n_env(const char *name, uint32_t fallback) {
     const char *env = getenv(name);
-    if (!env || !env[0]) return 32;
+    if (!env || !env[0]) return fallback;
     char *end = NULL;
     long v = strtol(env, &end, 10);
     while (end && isspace((unsigned char)*end)) end++;
     if (end && *end == '\0' && v == 64) return 64;
     if (end && *end == '\0' && v == 32) return 32;
     fprintf(stderr,
-            "ds4: invalid %s=%s; expected 32 or 64, using 32\n",
-            name, env);
-    return 32;
+            "ds4: invalid %s=%s; expected 32 or 64, using %u\n",
+            name, env, fallback);
+    return fallback;
 }
 
 static uint32_t ds4_gpu_mpp_q8_0_tile_n(void) {
-    return ds4_gpu_mpp_tile_n_env("DS4_METAL_MPP_Q8_0_TILE_N");
+    return ds4_gpu_mpp_tile_n_env("DS4_METAL_MPP_Q8_0_TILE_N", 64);
 }
 
 static uint32_t ds4_gpu_mpp_attn_out_tile_n(void) {
-    return ds4_gpu_mpp_tile_n_env("DS4_METAL_MPP_ATTN_OUT_TILE_N");
+    return ds4_gpu_mpp_tile_n_env("DS4_METAL_MPP_ATTN_OUT_TILE_N", 64);
 }
 
 static uint32_t ds4_gpu_mpp_moe_tile_n(void) {
-    return ds4_gpu_mpp_tile_n_env("DS4_METAL_MPP_MOE_TILE_N");
+    return ds4_gpu_mpp_tile_n_env("DS4_METAL_MPP_MOE_TILE_N", 32);
 }
 
 static int ds4_gpu_mpp_moe_fast_layout(void) {
@@ -1119,7 +1121,9 @@ static int ds4_gpu_mpp_moe_pair_gate_up(void) {
 }
 
 static int ds4_gpu_mpp_direct_rhs(void) {
-    return ds4_gpu_env_bool("DS4_METAL_MPP_DIRECT_RHS") > 0;
+    const int enabled = ds4_gpu_env_bool("DS4_METAL_MPP_DIRECT_RHS");
+    if (enabled >= 0) return enabled > 0;
+    return 1;
 }
 
 static int ds4_gpu_mpp_q8_0_direct_rhs(void) {

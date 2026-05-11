@@ -295,38 +295,37 @@ remain opt-in diagnostics. The environment controls
 by mere presence. Passing `--quality` also disables MPP routes so strict/debug
 runs stay on the legacy Metal kernels. Set `DS4_METAL_MPP_FAST=1` to opt into
 the current same-top1/same-greedy fast profile: it widens Q8_0 and
-attention-output MPP to all layers, enables Q8_0 partial token tiles, and uses
-earlier routed-MoE MPP windows. This profile is not the default because its
-whole-vocab and top-k drift are much larger than the correctness-first auto
-profile.
-Set `DS4_METAL_MPP_DIRECT_RHS=1` only for diagnostics of the first-PR MPP
-direct-RHS tensor layout; it is not part of the correctness-first default. Q8_0
-and attention-output direct-RHS diagnostics support both 32-token and 64-token
-MPP tiles, so they can be combined with `DS4_METAL_MPP_Q8_0_TILE_N=64` and
-`DS4_METAL_MPP_ATTN_OUT_TILE_N=64` for M5 throughput experiments. The
+attention-output MPP to all layers and uses earlier routed-MoE MPP windows.
+This profile is not the default because its whole-vocab and top-k drift are
+much larger than the correctness-first auto profile.
+The default safe-window policy uses the direct-RHS tensor layout for MPP routes;
+set `DS4_METAL_MPP_DIRECT_RHS=0` to compare against the older staged-RHS
+layout. Q8_0 and attention-output direct-RHS routes support both 32-token and
+64-token MPP tiles. Auto defaults those two routes to 64-token tiles for M5
+throughput; set `DS4_METAL_MPP_Q8_0_TILE_N=32` or
+`DS4_METAL_MPP_ATTN_OUT_TILE_N=32` to compare the narrower layout. The
 route-specific `DS4_METAL_MPP_Q8_0_DIRECT_RHS=1`,
 `DS4_METAL_MPP_F16_DIRECT_RHS=1`, and
-`DS4_METAL_MPP_ATTN_OUT_DIRECT_RHS=1` switches isolate that diagnostic layout
-without turning on every direct-RHS route at once.
+`DS4_METAL_MPP_ATTN_OUT_DIRECT_RHS=1` switches isolate that layout without
+turning on every direct-RHS route at once when the global
+`DS4_METAL_MPP_DIRECT_RHS=0` override is set.
 
 The Q8_0 prefill MPP route can be isolated with
 `DS4_METAL_MPP_Q8_0_ENABLE=1` or `DS4_METAL_MPP_Q8_0_DISABLE=1`. It only
 affects prompt batches larger than eight tokens and is limited by default to
 the late full-model-safe layer window 38..42, plus the `attn_q_b` projection in
-layers 32..37. It uses only full 32-token tiles by default and falls back to the
-legacy kernel for partial token tiles or when the Metal 4 tensor path is
-unavailable. Set
-`DS4_METAL_MPP_Q8_0_PARTIAL_ENABLE=1` to reproduce or localize partial-tile
-drift while debugging. Set `DS4_METAL_MPP_Q8_0_FILTER=all` to reproduce the
+layers 32..37. It uses 64-token tiles by default, accepts partial token tails,
+and falls back to the legacy kernel when the Metal 4 tensor path is unavailable.
+Set `DS4_METAL_MPP_Q8_0_PARTIAL_ENABLE=0` to force the old partial-tail
+fallback while debugging. Set `DS4_METAL_MPP_Q8_0_FILTER=all` to reproduce the
 unsafe all-layer Q8 route, `DS4_METAL_MPP_Q8_0_FILTER=late_safe` to request the
 default safe window explicitly, or
 `DS4_METAL_MPP_Q8_0_FILTER=<substring[,substring...]>` to force named
 full-graph Q8 modules such as `attn_q_a`, `attn_kv`, `attn_q_b`, `attn_out`,
 `shared_gate`, `shared_up`, or `shared_down`. Use
 `<substring>@layer=A..B` to test one module family only in a layer window, for
-example `shared_up@layer=30..37`. Set
-`DS4_METAL_MPP_Q8_0_TILE_N=64` to test the experimental wider MPP token tile
-for performance against the default `32`. The isolated
+example `shared_up@layer=30..37`. Set `DS4_METAL_MPP_Q8_0_TILE_N=32` to
+compare against the narrower MPP token tile. The isolated
 `./ds4_test --metal-kernels` regression reports small/medium/model-ish kernel
 deltas; the full-model
 `./ds4_test --metal-mpp-equivalence` diagnostic compares default auto against
@@ -360,24 +359,19 @@ layers can amplify small local differences through normalization/attention
 enough to fail prompt-logit equivalence. The `attn_q_b` 32..37 extension is
 kept because it is query-side only for full prompt tiles in the current
 validation path, passes prompt-logit equivalence, and improves prefill
-throughput. The F16 compressor route did not introduce measurable drift in the
-current prompt set.
+throughput. The current auto policy also uses Q8_0 partial tails, direct-RHS MPP
+inputs, and 64-token tiles for Q8_0 and attention-output low projections; on
+M5 Max the long-code audit prompt sampled around `395 t/s` in a run where MPP
+off sampled around `354 t/s`, with visible desktop-load variance. The F16
+compressor route did not introduce measurable drift in the current prompt set.
 
 The `DS4_METAL_MPP_FAST=1` profile is the measured high-throughput diagnostic
 profile under the relaxed same-top1/same-greedy gate. In the current prompt
 suite it keeps top-1 and greedy continuations stable, but reports much larger
 distribution drift than auto (`worst_rms ~= 0.761`,
-`worst_top20_max_abs ~= 2.28`, minimum top-20 overlap `18/20`). On the
-long-code prefill benchmark it sampled around `360 t/s` in the same window
-where auto sampled around `318 t/s`; benchmark variance is high when the
-desktop is active. The more aggressive direct-RHS 64-token diagnostic
-(`DS4_METAL_MPP_FAST=1 DS4_METAL_MPP_DIRECT_RHS=1
-DS4_METAL_MPP_Q8_0_TILE_N=64 DS4_METAL_MPP_ATTN_OUT_TILE_N=64`) passed the
-relaxed top-1/greedy gate and `--logprob-vectors`, and in Automatic power mode
-sampled around `324 t/s` versus `289 t/s` for auto in the same short benchmark
-window. It remains diagnostic-only because its full-suite drift is higher
-(`worst_rms ~= 0.846`, `worst_top20_max_abs ~= 2.07`, minimum top-20 overlap
-`16/20`).
+`worst_top20_max_abs ~= 2.28`, minimum top-20 overlap `18/20`). It remains
+diagnostic-only because it widens the route windows that produce the largest
+full-suite drift.
 
 The routed-MoE MPP projections are staged when forced and are limited to a
 late full-model-safe layer window by default: gate/down start at layer 28, and
@@ -411,17 +405,18 @@ outputs are summed with a single Metal kernel instead of five chained add
 passes. Set `DS4_METAL_MOE_SUM6_DISABLE=1` to compare or temporarily disable
 that fused sum route.
 
-The attention-output low-projection MPP route applies to full 32-token tiles
-in the default safe window, falling back to the existing indexed simdgroup
-kernel for partial tiles. Attention-output MPP is limited to the measured
-full-model-safe layer window 32..42 by default. Set
+The attention-output low-projection MPP route applies to full 32-token multiples
+in the default safe window, using a 64-token MPP tile by default and falling
+back to the existing indexed simdgroup kernel for shorter or non-32-multiple
+tails. Attention-output MPP is limited to the measured full-model-safe layer
+window 32..42 by default. Set
 `DS4_METAL_MPP_ATTN_OUT_ENABLE=1` or `DS4_METAL_MPP_ATTN_OUT_DISABLE=1` to
 isolate this route. Set `DS4_METAL_MPP_ATTN_OUT_FILTER=all`, `late_safe`,
 `none`, or a comma-separated list of full-graph context substrings such as
 `layer=42` to localize full-model-safe layer windows. Layer filters are exact,
 and `layer=A..B` matches an inclusive range. Set
-`DS4_METAL_MPP_ATTN_OUT_TILE_N=64` to test the experimental wider MPP token
-tile for performance against the default `32`. The all-layer
+`DS4_METAL_MPP_ATTN_OUT_TILE_N=32` to compare against the narrower MPP token
+tile. The all-layer
 attention-output MPP route still fails long-prompt full-model equivalence
 despite per-layer low-projection differences below the current kernel target.
 The ratio-2 F16 compressor route can similarly be controlled with
