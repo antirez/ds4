@@ -84,6 +84,11 @@ static const void *g_model_fd_host_base;
 static int g_model_direct_fd = -1;
 static uint64_t g_model_direct_align = 1;
 static uint64_t g_model_file_size;
+// Tracks which model_map owns g_model_fd. Set on the first set_model_map call
+// after set_model_fd. fd-based weight caching is refused for any other map
+// (e.g. a separately-mmap'd model registered via a second set_model_map_range
+// call would otherwise read bytes from g_model_fd at the wrong offsets).
+static const void *g_model_fd_host_base;
 static int g_model_cache_full;
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
@@ -1012,7 +1017,13 @@ static const char *cuda_model_range_ptr_from_fd(
         uint64_t bytes,
         const char *what) {
     if (g_model_fd < 0 || bytes == 0) return NULL;
-    if (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base) return NULL;
+    // fd-cache reads from g_model_fd at `offset`. The fd belongs to the model
+    // that was registered first via set_model_map after set_model_fd; using it
+    // for any other model_map would read bytes from the wrong file. Refuse and
+    // let the caller fall through to the cudaMemcpy path (which dereferences
+    // `model_map + offset` directly, the correct host pointer for any
+    // registered mmap).
+    if (g_model_fd_host_base && model_map != g_model_fd_host_base) return NULL;
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
         if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
@@ -1413,7 +1424,12 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     g_model_range_mapping_supported = 1;
     g_model_hmm_direct = 0;
     g_model_cache_full = 0;
-    if (g_model_fd >= 0 && g_model_fd_host_base == NULL) {
+    // Bind g_model_fd to this model on first registration. set_model_fd is
+    // called once for the main model before the first set_model_map call;
+    // subsequent set_model_map calls (e.g. for an auxiliary model like an MTP
+    // draft GGUF) must not take over the fd association, even though they
+    // overwrite g_model_host_base.
+    if (g_model_fd >= 0 && !g_model_fd_host_base) {
         g_model_fd_host_base = model_map;
     }
 
