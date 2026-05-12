@@ -8352,10 +8352,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
 }
 
 static bool metal_tensor_fill_f32(ds4_gpu_tensor *t, float v, uint64_t n) {
-    float *p = ds4_gpu_tensor_contents(t);
-    if (!p || ds4_gpu_tensor_bytes(t) < n * sizeof(float)) return false;
-    for (uint64_t i = 0; i < n; i++) p[i] = v;
-    return true;
+    return ds4_gpu_tensor_fill_f32(t, v, n) != 0;
 }
 
 /* =========================================================================

@@ -3848,6 +3848,14 @@ void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
     return (uint8_t *)[obj.buffer contents] + obj.offset;
 }
 
+int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {
+    if (!tensor || count > ds4_gpu_tensor_bytes(tensor) / sizeof(float)) return 0;
+    float *p = ds4_gpu_tensor_contents(tensor);
+    if (!p && count != 0) return 0;
+    for (uint64_t i = 0; i < count; i++) p[i] = value;
+    return 1;
+}
+
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || (!data && bytes != 0)) return 0;
     DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);

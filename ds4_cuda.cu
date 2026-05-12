@@ -1286,11 +1286,13 @@ extern "C" void ds4_gpu_cleanup(void) {
     }
 }
 
+__global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
+
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
-    if (!cuda_ok(cudaMallocManaged(&t->ptr, (size_t)bytes), "tensor alloc")) {
+    if (!cuda_ok(cudaMalloc(&t->ptr, (size_t)bytes), "tensor alloc")) {
         free(t);
         return NULL;
     }
@@ -1323,6 +1325,13 @@ extern "C" void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
     if (!tensor) return NULL;
     (void)cudaDeviceSynchronize();
     return tensor->ptr;
+}
+
+extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {
+    if (!tensor || count > tensor->bytes / sizeof(float)) return 0;
+    if (count == 0) return 1;
+    fill_f32_kernel<<<(count + 255u) / 256u, 256>>>((float *)tensor->ptr, count, value);
+    return cuda_ok(cudaGetLastError(), "tensor fill f32 launch");
 }
 
 extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
