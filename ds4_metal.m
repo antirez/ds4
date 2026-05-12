@@ -1009,6 +1009,32 @@ static int ds4_gpu_env_bool(const char *name) {
     return 1;
 }
 
+static int ds4_gpu_mpp_low_power_profile(void) {
+    const int disabled = ds4_gpu_env_bool("DS4_METAL_MPP_LOW_POWER_DISABLE");
+    if (disabled > 0) return 0;
+
+    const int enabled = ds4_gpu_env_bool("DS4_METAL_MPP_LOW_POWER_ENABLE");
+    if (enabled >= 0) return enabled > 0;
+
+    static int detected = -1;
+    static int reported;
+    if (detected < 0) {
+        detected = 0;
+        @autoreleasepool {
+            NSProcessInfo *info = [NSProcessInfo processInfo];
+            if ([info respondsToSelector:@selector(isLowPowerModeEnabled)]) {
+                detected = [info isLowPowerModeEnabled] ? 1 : 0;
+            }
+        }
+    }
+    if (detected && !reported) {
+        fprintf(stderr,
+                "ds4: Metal low-power MPP profile active; widening Q8_0 prefill route\n");
+        reported = 1;
+    }
+    return detected;
+}
+
 static int ds4_gpu_use_indexed_attention_rb4(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -1307,9 +1333,13 @@ static int ds4_gpu_mpp_context_matches_filter(
 }
 
 static int ds4_gpu_mpp_q8_0_context_matches_filter(uint64_t n_tok) {
-    const int default_match = ds4_gpu_mpp_fast_profile()
-        ? 1
-        : ds4_gpu_mpp_q8_0_default_context(n_tok);
+    const char *filter = getenv("DS4_METAL_MPP_Q8_0_FILTER");
+    const int filter_set = filter && filter[0];
+    const int default_match =
+        (ds4_gpu_mpp_fast_profile() ||
+         (!filter_set && ds4_gpu_mpp_low_power_profile()))
+            ? 1
+            : ds4_gpu_mpp_q8_0_default_context(n_tok);
     return ds4_gpu_mpp_context_matches_filter("DS4_METAL_MPP_Q8_0_FILTER",
                                                 default_match,
                                                 ds4_gpu_mpp_q8_0_late_safe_context());
