@@ -19,12 +19,21 @@ int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_typed(uint64_t elems, uint8_t elem_bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
+uint8_t ds4_gpu_tensor_elem_bytes(const ds4_gpu_tensor *tensor);
+
+/* Returns the native element size used for raw KV cache tensors on this backend.
+   CUDA returns 2 (FP16), Metal returns 4 (FP32). Used by ds4.c to allocate
+   raw/comp KV tensors with the right size without knowing the backend type. */
+uint8_t ds4_gpu_kv_elem_bytes(void);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
+/* Read n_elems elements from offset 0, converting FP16 to float if needed. */
+int ds4_gpu_tensor_read_f32(const ds4_gpu_tensor *tensor, float *out, uint64_t n_elems);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);

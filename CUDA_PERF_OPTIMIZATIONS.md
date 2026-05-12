@@ -124,6 +124,22 @@ are already near the bandwidth ceiling.
 
 `make cuda-regression` passes on all three incremental steps.
 
+### KV FP16 mixed-cache A/B (post-fix)
+
+After the mixed-dtype safety fix (`raw_kv=FP16`, `comp_kv=FP32` handled via
+on-the-fly comp conversion to FP16 in CUDA attention paths), H200 benchmarks
+show a stable generation gain with `DS4_CUDA_KV_FP16=1`.
+
+| ctx_tokens | Default KV (FP32) | `DS4_CUDA_KV_FP16=1` | Delta |
+|------------|-------------------|----------------------|-------|
+| 2048       | 30.76             | **33.19**            | +7.9% |
+| 12288      | 29.28             | **31.09**            | +6.2% |
+| 24576      | 27.58             | **28.80**            | +4.4% |
+| 32768      | 27.01             | **28.15**            | +4.2% |
+
+Prefill stays roughly aligned (small noise-level differences), while decode
+improves consistently across context frontiers.
+
 ---
 
 ## Testing

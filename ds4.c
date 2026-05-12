@@ -8633,7 +8633,8 @@ static bool metal_graph_alloc_raw_cap(
     g->kv = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     bool state_init_ok = true;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        g->layer_raw_cache[il] = ds4_gpu_tensor_alloc((uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
+        const uint8_t kv_elem = ds4_gpu_kv_elem_bytes();
+        g->layer_raw_cache[il] = ds4_gpu_tensor_alloc_typed((uint64_t)raw_cap * DS4_N_HEAD_DIM, kv_elem);
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio != 0) {
             const uint32_t coff = ratio == 4 ? 2u : 1u;
@@ -8729,7 +8730,7 @@ static bool metal_graph_alloc_raw_cap(
         g->mtp_input_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
         g->mtp_state_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
         g->mtp_next_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-        g->mtp_raw_cache = ds4_gpu_tensor_alloc((uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
+        g->mtp_raw_cache = ds4_gpu_tensor_alloc_typed((uint64_t)raw_cap * DS4_N_HEAD_DIM, ds4_gpu_kv_elem_bytes());
         g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
         g->mtp_n_raw = 0;
     }
@@ -10388,7 +10389,7 @@ static int metal_graph_decode_test(
              ds4_gpu_tensor_read(g.attn_norm, 0, gpu_attn_norm, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
              ds4_gpu_tensor_read(g.q, 0, gpu_q, q_dim * sizeof(float)) != 0 &&
              ds4_gpu_tensor_read(g.kv, 0, gpu_kv, (uint64_t)DS4_N_HEAD_DIM * sizeof(float)) != 0 &&
-             ds4_gpu_tensor_read(g.layer_raw_cache[0], 0, gpu_raw, (uint64_t)DS4_N_HEAD_DIM * sizeof(float)) != 0 &&
+             ds4_gpu_tensor_read_f32(g.layer_raw_cache[0], gpu_raw, DS4_N_HEAD_DIM) != 0 &&
              ds4_gpu_tensor_read(g.attn_out, 0, gpu_attn_out, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
              ds4_gpu_tensor_read(g.after_attn_hc, 0, gpu_after_attn_hc, hc_dim * sizeof(float)) != 0 &&
              ds4_gpu_tensor_read(g.ffn_cur, 0, gpu_ffn_cur, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
@@ -13186,7 +13187,7 @@ static bool metal_graph_prefill_chunked_range(
         }
         if (!ok) {
             if (ds4_gpu_synchronize() == 0) {
-                fprintf(stderr, "ds4: Metal synchronize after chunked prefill failure also failed\n");
+                fprintf(stderr, "ds4: GPU synchronize after chunked prefill failure also failed\n");
             }
             return false;
         }
@@ -13707,7 +13708,7 @@ static int metal_graph_prompt_logits_test(
                     const uint32_t raw_start = n_raw < raw_cap ? 0u : ((uint32_t)n_test % raw_cap);
                     float *gpu_raw_phys = xmalloc((size_t)raw_phys_n * sizeof(float));
                     float *gpu_raw_logical = xmalloc((size_t)raw_logical_n * sizeof(float));
-                    if (ds4_gpu_tensor_read(g.layer_raw_cache[il], 0, gpu_raw_phys, raw_phys_n * sizeof(float)) != 0) {
+                    if (ds4_gpu_tensor_read_f32(g.layer_raw_cache[il], gpu_raw_phys, raw_phys_n) != 0) {
                         for (uint32_t r = 0; r < n_raw; r++) {
                             const uint32_t phys = (raw_start + r) % raw_cap;
                             memcpy(gpu_raw_logical + (uint64_t)r * DS4_N_HEAD_DIM,
@@ -15413,8 +15414,9 @@ static uint32_t session_raw_live_rows(const ds4_gpu_graph *g, uint32_t checkpoin
 static uint64_t session_payload_live_tensor_bytes(const ds4_gpu_graph *g, uint32_t checkpoint_len) {
     uint64_t bytes = 0;
     const uint32_t raw_live = session_raw_live_rows(g, checkpoint_len);
+    const uint8_t raw_eb = (uint8_t)ds4_gpu_kv_elem_bytes();
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        bytes += (uint64_t)raw_live * DS4_N_HEAD_DIM * sizeof(float);
+        bytes += (uint64_t)raw_live * DS4_N_HEAD_DIM * raw_eb;
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
         bytes += (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM * sizeof(float);
@@ -15800,14 +15802,16 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
         /* Write the raw ring in logical position order.  The file does not care
          * where the rows happened to live physically in the source graph. */
+        const uint8_t raw_eb = (uint8_t)ds4_gpu_tensor_elem_bytes(g->layer_raw_cache[il]);
+        const uint64_t raw_row_bytes = (uint64_t)DS4_N_HEAD_DIM * raw_eb;
         const uint32_t raw_first = (uint32_t)s->checkpoint.len - raw_live;
         for (uint32_t r = 0; rc == 0 && r < raw_live; r++) {
             const uint32_t pos = raw_first + r;
             const uint32_t phys = pos % g->raw_cap;
             rc = payload_write_tensor_span(fp,
                                            g->layer_raw_cache[il],
-                                           (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
-                                           (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
+                                           (uint64_t)phys * raw_row_bytes,
+                                           raw_row_bytes,
                                            buf,
                                            DS4_SESSION_IO_CHUNK,
                                            err,
@@ -16109,14 +16113,16 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         /* Rebuild the physical raw ring expected by the current graph.  This is
          * why the file stores rows in logical order instead of dumping bytes from
          * the old ring layout. */
+        const uint8_t raw_eb = (uint8_t)ds4_gpu_tensor_elem_bytes(g->layer_raw_cache[il]);
+        const uint64_t raw_row_bytes = (uint64_t)DS4_N_HEAD_DIM * raw_eb;
         const uint32_t raw_first = saved_tokens - saved_raw_live;
         for (uint32_t r = 0; rc == 0 && r < saved_raw_live; r++) {
             const uint32_t pos = raw_first + r;
             const uint32_t phys = pos % g->raw_cap;
             rc = payload_read_tensor_span(fp,
                                           g->layer_raw_cache[il],
-                                          (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
-                                          (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
+                                          (uint64_t)phys * raw_row_bytes,
+                                          raw_row_bytes,
                                           buf,
                                           DS4_SESSION_IO_CHUNK,
                                           &remaining,
@@ -16855,7 +16861,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                                         progress_fn,
                                                         progress_fn ? &progress : NULL);
             if (!ok) {
-                snprintf(err, errlen, "Metal resumed prefill failed while extending checkpoint");
+                snprintf(err, errlen, "GPU resumed prefill failed while extending checkpoint");
                 s->checkpoint_valid = false;
                 return 1;
             }
@@ -16870,7 +16876,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                                 (uint32_t)s->checkpoint.len,
                                                 s->logits))
             {
-                snprintf(err, errlen, "Metal decode failed while extending checkpoint");
+                snprintf(err, errlen, "GPU decode failed while extending checkpoint");
                 s->checkpoint_valid = false;
                 return 1;
             }
@@ -16897,7 +16903,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                          prompt, prompt->len, s->logits, false);
     }
     if (!ok) {
-        snprintf(err, errlen, "Metal prefill failed");
+        snprintf(err, errlen, "GPU prefill failed");
         s->checkpoint_valid = false;
         return 1;
     }

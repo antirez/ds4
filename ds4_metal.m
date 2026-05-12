@@ -205,6 +205,7 @@ static uint32_t g_model_view_count;
 @property(nonatomic, assign) uint64_t offset;
 @property(nonatomic, assign) uint64_t bytes;
 @property(nonatomic, assign) uint8_t owner;
+@property(nonatomic, assign) uint8_t elem_bytes;
 @end
 
 @implementation DS4MetalTensor
@@ -3778,6 +3779,7 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
         tensor.offset = 0;
         tensor.bytes = bytes;
         tensor.owner = 1;
+        tensor.elem_bytes = 4;
         g_tensor_alloc_live_bytes += bytes;
         if (g_tensor_alloc_live_bytes > g_tensor_alloc_peak_bytes) {
             g_tensor_alloc_peak_bytes = g_tensor_alloc_live_bytes;
@@ -3842,6 +3844,26 @@ uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
     return obj.bytes;
 }
 
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_typed(uint64_t elems, uint8_t elem_bytes) {
+    if (elem_bytes == 0) elem_bytes = 4;
+    ds4_gpu_tensor *t = ds4_gpu_tensor_alloc(elems * (uint64_t)elem_bytes);
+    if (t) {
+        DS4MetalTensor *obj = ds4_gpu_tensor_obj(t);
+        obj.elem_bytes = elem_bytes;
+    }
+    return t;
+}
+
+uint8_t ds4_gpu_tensor_elem_bytes(const ds4_gpu_tensor *tensor) {
+    if (!tensor) return 4;
+    const DS4MetalTensor *obj = ds4_gpu_tensor_const_obj(tensor);
+    return obj.elem_bytes != 0 ? obj.elem_bytes : 4;
+}
+
+uint8_t ds4_gpu_kv_elem_bytes(void) {
+    return 4; /* Metal keeps FP32 KV — Metal shaders read float */
+}
+
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
     if (!tensor) return NULL;
     DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
@@ -3866,6 +3888,11 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
         memcpy(data, (const uint8_t *)[obj.buffer contents] + obj.offset + offset, (size_t)bytes);
     }
     return 1;
+}
+
+int ds4_gpu_tensor_read_f32(const ds4_gpu_tensor *tensor, float *out, uint64_t n_elems) {
+    /* Metal KV always FP32; elem_bytes == 4. Simple memcpy suffices. */
+    return ds4_gpu_tensor_read(tensor, 0, out, n_elems * sizeof(float));
 }
 
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
