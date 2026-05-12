@@ -2590,6 +2590,63 @@ __global__ static void matmul_q8_0_preq_warp8_kernel(
     if (lane == 0) out[row] = acc;
 }
 
+/* Single-output-per-CTA pair GEMV: 1 CTA per (gate, up) row, 8 warps × 32
+ * lanes. Warps 0-3 cooperate on out0, warps 4-7 cooperate on out1, each
+ * warp handling BLOCKS/4 blocks (= 32 blocks for BLOCKS=128). Each lane
+ * reads exactly one block — no inner b-loop iteration, matching the
+ * per-lane work density of `matmul_q8_0_preq_warp8_kernel` on shapes with
+ * blocks=32 (which is q_b's shape and achieves ~192 GB/s).
+ *
+ * Hypothesis: shared_gate_up at BLOCKS=128 was stuck at ~131 GB/s because
+ * the 8-output/CTA layout only produced ~512 CTAs (~1.5 waves on 22 SMs);
+ * splitting each row to its own CTA gives 4× the CTA count and better
+ * memory-latency hiding. Disable via DS4_CUDA_Q8_PAIR_NO_WARP1_QUAD=1. */
+template <uint32_t BLOCKS>
+__global__ static void matmul_q8_0_pair_preq_warp1_quad_kernel(
+        float *out0,
+        float *out1,
+        const unsigned char *w0,
+        const unsigned char *w1,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        int use_dp4a) {
+    static_assert(BLOCKS % 4u == 0u, "BLOCKS must be divisible by 4");
+    static_assert(BLOCKS / 4u <= 32u, "BLOCKS/4 must fit in one warp's 32 lanes");
+    const uint64_t row = (uint64_t)blockIdx.x;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warpId = threadIdx.x >> 5u;
+    const uint32_t which_out = warpId >> 2u;       /* 0 for warps 0-3, 1 for 4-7 */
+    const uint32_t warp_in_out = warpId & 3u;       /* 0..3 within the output */
+    const bool has = which_out ? (row < out1_dim) : (row < out0_dim);
+
+    float acc = 0.0f;
+    if (has) {
+        const unsigned char *wr = which_out
+            ? (w1 + row * BLOCKS * 34)
+            : (w0 + row * BLOCKS * 34);
+        const uint32_t b = warp_in_out * (BLOCKS / 4u) + lane;
+        if (lane < (BLOCKS / 4u) && b < BLOCKS) {
+            const __half *scale_h = (const __half *)(wr + b * 34);
+            const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+            const int8_t *xqb = xq + b * 32;
+            const int dot = dot_i8_block(qs, xqb, 32u, use_dp4a);
+            acc = __half2float(*scale_h) * xscale[b] * (float)dot;
+        }
+    }
+    acc = warp_sum_f32(acc);
+
+    __shared__ float sh[8];
+    if (lane == 0) sh[warpId] = acc;
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        if (row < out0_dim) out0[row] = sh[0] + sh[1] + sh[2] + sh[3];
+        if (row < out1_dim) out1[row] = sh[4] + sh[5] + sh[6] + sh[7];
+    }
+}
+
 __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
         float *out0,
         float *out1,
@@ -2632,6 +2689,82 @@ __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
     if (lane == 0) {
         if (row < out0_dim) out0[row] = acc0;
         if (row < out1_dim) out1[row] = acc1;
+    }
+}
+
+/* Single-output-per-CTA hc_expand variant with WARPS_PER_OUT warps cooperating
+ * on the same row's matmul. Same hypothesis as
+ * matmul_q8_0_pair_preq_warp1_quad_kernel above: shared_down_hc (BLOCKS=64,
+ * out_dim=4096) and attn_output_b (BLOCKS=256, out_dim=4096) both produce
+ * only ~512 CTAs in the 8-output-per-CTA layout, leaving GB10 SMs under-
+ * occupied. Going to 1 output per CTA gives 4096 CTAs.
+ *
+ * For BLOCKS=64:  WARPS_PER_OUT=2,  64 threads/CTA.
+ * For BLOCKS=256: WARPS_PER_OUT=8, 256 threads/CTA.
+ *
+ * The HC post-row work (per-output `for dst_hc` loop) still runs once per
+ * row, on warp 0 lane 0 after the cross-warp reduction. Bit-equivalent up
+ * to a minor reduction-order diff (cross-warp sum is now a single-pass
+ * accumulate vs the original single-warp warp_sum_f32).
+ *
+ * Disable via DS4_CUDA_Q8_HC_EXPAND_NO_WARP1=1. */
+template <uint32_t BLOCKS, uint32_t WARPS_PER_OUT>
+__global__ static void matmul_q8_0_hc_expand_preq_warp1_kernel(
+        float *out_hc,
+        float *block_out,
+        const float *block_add,
+        const float *residual_hc,
+        const float *split,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t out_dim,
+        uint32_t n_embd,
+        uint32_t n_hc,
+        int has_add,
+        int use_dp4a) {
+    static_assert(BLOCKS == WARPS_PER_OUT * 32u,
+                  "matmul_q8_0_hc_expand_preq_warp1_kernel: BLOCKS must equal WARPS_PER_OUT * 32");
+    const uint64_t row = (uint64_t)blockIdx.x;
+    if (row >= out_dim) return;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warpId = threadIdx.x >> 5u;
+
+    const unsigned char *wr = w + row * BLOCKS * 34;
+    const uint32_t b = warpId * 32u + lane;
+    float acc = 0.0f;
+    if (b < BLOCKS) {
+        const __half *scale_h = (const __half *)(wr + b * 34);
+        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+        const int8_t *xqb = xq + b * 32;
+        const int dot = dot_i8_block(qs, xqb, 32u, use_dp4a);
+        acc = __half2float(*scale_h) * xscale[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+
+    __shared__ float sh[WARPS_PER_OUT];
+    if (lane == 0) sh[warpId] = acc;
+    __syncthreads();
+
+    if (warpId == 0 && lane == 0) {
+        float total = 0.0f;
+        #pragma unroll
+        for (uint32_t i = 0; i < WARPS_PER_OUT; i++) total += sh[i];
+        const uint32_t d = (uint32_t)row;
+        block_out[d] = total;
+        float block_v = total;
+        if (has_add) block_v += block_add[d];
+        const float *post = split + n_hc;
+        const float *comb = split + 2u * n_hc;
+        for (uint32_t dst_hc = 0; dst_hc < n_hc; dst_hc++) {
+            float hc_acc = block_v * post[dst_hc];
+            for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
+                const float comb_v = comb[dst_hc + (uint64_t)src_hc * n_hc];
+                const float res_v = residual_hc[(uint64_t)src_hc * n_embd + d];
+                hc_acc += comb_v * res_v;
+            }
+            out_hc[(uint64_t)dst_hc * n_embd + d] = hc_acc;
+        }
     }
 }
 
@@ -6095,6 +6228,23 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair quantize launch")) return 0;
     const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
+    /* For BLOCKS=128 (shared_gate_up at in_dim=4096, attn_q_a/kv pair at
+     * in_dim=4096), the 8-output/CTA layout only produces ~max_out/8 CTAs,
+     * leaving GB10 SMs under-occupied. Switch to 1-output-per-CTA × 4-warps-
+     * per-output so each lane processes exactly one block (matches q_b's
+     * pattern that achieves ~192 GB/s vs the warp8 path's ~131 GB/s on
+     * shared FFN). Disable via DS4_CUDA_Q8_PAIR_NO_WARP1_QUAD=1. */
+    const bool use_warp1_quad = (in_dim % 32u == 0u) &&
+                                getenv("DS4_CUDA_Q8_PAIR_NO_WARP1_QUAD") == NULL;
+    if (use_warp1_quad && blocks == 128u) {
+        matmul_q8_0_pair_preq_warp1_quad_kernel<128><<<(unsigned)max_out, 256>>>(
+                (float *)out0->ptr, (float *)out1->ptr,
+                reinterpret_cast<const unsigned char *>(w0),
+                reinterpret_cast<const unsigned char *>(w1),
+                xq, xscale,
+                out0_dim, out1_dim, use_dp4a);
+        return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair warp1_quad<128> launch");
+    }
     matmul_q8_0_pair_preq_warp8_kernel<<<((unsigned)max_out + 7u) / 8u, 256>>>(
             (float *)out0->ptr,
             (float *)out1->ptr,
@@ -6161,10 +6311,35 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
      * shapes: attn_output_b (in_dim=8192, blocks=256) and shared_down_hc
      * (in_dim=2048, blocks=64). Same math as the generic kernel; the
      * compiler unrolls the b-loop because BLOCKS is compile-time constant.
-     * Disable via DS4_CUDA_HC_EXPAND_NO_UNROLL=1. */
+     * Disable via DS4_CUDA_HC_EXPAND_NO_UNROLL=1.
+     *
+     * The `warp1` variants below split each row to its own CTA with
+     * WARPS_PER_OUT warps cooperating — 4096 CTAs instead of 512, much
+     * better SM occupancy on the BLOCKS=64/256 shapes. Disable via
+     * DS4_CUDA_Q8_HC_EXPAND_NO_WARP1=1. */
     const dim3 grid(((unsigned)out_dim + 7u) / 8u, 1, 1);
     const bool use_unroll = (in_dim % 32u == 0u) &&
                             getenv("DS4_CUDA_HC_EXPAND_NO_UNROLL") == NULL;
+    const bool use_warp1 = use_unroll &&
+                           getenv("DS4_CUDA_Q8_HC_EXPAND_NO_WARP1") == NULL;
+    if (use_warp1 && blocks == 256u) {
+        matmul_q8_0_hc_expand_preq_warp1_kernel<256, 8><<<(unsigned)out_dim, 256>>>(
+                (float *)out_hc->ptr, (float *)block_out->ptr,
+                block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr,
+                (const float *)residual_hc->ptr, (const float *)split->ptr,
+                reinterpret_cast<const unsigned char *>(wptr), xq, xscale,
+                out_dim, n_embd, n_hc, block_add ? 1 : 0, use_dp4a);
+        return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand warp1<256,8> launch");
+    }
+    if (use_warp1 && blocks == 64u) {
+        matmul_q8_0_hc_expand_preq_warp1_kernel<64, 2><<<(unsigned)out_dim, 64>>>(
+                (float *)out_hc->ptr, (float *)block_out->ptr,
+                block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr,
+                (const float *)residual_hc->ptr, (const float *)split->ptr,
+                reinterpret_cast<const unsigned char *>(wptr), xq, xscale,
+                out_dim, n_embd, n_hc, block_add ? 1 : 0, use_dp4a);
+        return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand warp1<64,2> launch");
+    }
     if (use_unroll && blocks == 256u) {
         matmul_q8_0_hc_expand_preq_warp8_unroll_kernel<256><<<grid, 256>>>(
                 (float *)out_hc->ptr, (float *)block_out->ptr,
@@ -7745,11 +7920,27 @@ extern "C" int ds4_gpu_attention_output_q8_fused_hc_tensor(
             group_dim, rank, n_groups, 1u, blocks_a, low_blocks, use_dp4a);
     if (!cuda_ok(cudaGetLastError(), "attention_output_ab_fused output_a launch")) return 0;
 
-    /* output_b + HC expand, reading Q8_0 `low` directly. Use the unroll
-     * specialization for BLOCKS=256 (the DS4-Flash attn_output_b shape). */
+    /* output_b + HC expand, reading Q8_0 `low` directly. Prefer the warp1
+     * (1-output-per-CTA, 8-warps-per-output) variant which gives 4096 CTAs
+     * vs the warp8 variant's 512; both gated on DS4_CUDA_HC_EXPAND_NO_UNROLL
+     * and DS4_CUDA_Q8_HC_EXPAND_NO_WARP1 for A/B testing. */
     const bool use_unroll = (low_dim % 32u == 0u) &&
                             getenv("DS4_CUDA_HC_EXPAND_NO_UNROLL") == NULL;
+    const bool use_warp1 = use_unroll &&
+                           getenv("DS4_CUDA_Q8_HC_EXPAND_NO_WARP1") == NULL;
     const dim3 grid_b(((unsigned)out_dim + 7u) / 8u, 1, 1);
+    if (use_warp1 && low_blocks == 256u) {
+        matmul_q8_0_hc_expand_preq_warp1_kernel<256, 8><<<(unsigned)out_dim, 256>>>(
+                (float *)out_hc->ptr,
+                (float *)attn_out->ptr,
+                (const float *)attn_out->ptr, /* block_add unused (has_add=0) */
+                (const float *)residual_hc->ptr,
+                (const float *)split->ptr,
+                out_b, low_xq, low_xscale,
+                out_dim, n_embd, n_hc,
+                /*has_add=*/0, use_dp4a);
+        return cuda_ok(cudaGetLastError(), "attention_output_ab_fused hc_expand warp1<256,8>");
+    }
     if (use_unroll && low_blocks == 256u) {
         matmul_q8_0_hc_expand_preq_warp8_unroll_kernel<256><<<grid_b, 256>>>(
                 (float *)out_hc->ptr,

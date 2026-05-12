@@ -1,23 +1,60 @@
 # Session handoff — DS4 GB10 CUDA decode optimization
 
-Last updated: 2026-05-12 (post-F16-vec8 session). Read this first.
+Last updated: 2026-05-12 (post-q8_0-warp1 session). Read this first.
 
 ## Where we are right now
 
 | Metric | Value |
 | --- | --- |
 | Active model | `fixed-imatrix-b0c3326/...-chat-v2-imatrix.gguf` (via `/home/cghart/ds4/ds4flash.gguf` symlink — still needs manual swap, see below) |
-| **Baseline gen tok/s @ ctx 7047** | **15.00** (no MTP, all session optimizations on) |
-| Session-start baseline (all this-session flags disabled) | 13.66 |
-| Session delta | **+1.34 tps, -6.09 ms/token total** |
+| **Baseline gen tok/s @ ctx 7047** | **15.16** (no MTP, all session optimizations on) |
+| Pre-session-1 baseline (all this-day's flags disabled) | 13.66 |
+| Two-session cumulative delta | **+1.50 tps, -6.93 ms/token total** |
 | `--logprob-vectors` against `local.vec` | **OK** |
 | `--bench-mtp-spec-source --bench-exact-replay-source --cuda-indexed-decode-heads8-source --decode-profile-source` | OK |
-| Source state | three uncommitted changes (out_a/b fuse + F16 pair vec8 + F16 single vec8), all gated on disable env flags |
+| Source state | two uncommitted changes from this afternoon's session (q8_0 pair warp1 + hc_expand warp1), gated on disable flags. Morning's session committed at 7fed170. |
 
-## What changed this session (2026-05-12 — F16-vec8)
+## What changed this afternoon's session (q8_0 warp1)
 
-Two evidence-backed kernel-level wins. Full breakdown in
-`docs/hardware/gb10-cuda-notes.md` under
+Investigative goal: pattern-match the morning's F16 vec8 win onto
+remaining q8_0 GEMVs. Outcome: **the F16 pattern was falsified for q8_0
+(34-byte block layout blocks 16-byte vector loads), but a different
+lever — CTA-parallelism — paid off.**
+
+### Lever: 1-output-per-CTA × N-warps-per-output
+
+Two new templated kernels:
+- `matmul_q8_0_pair_preq_warp1_quad_kernel<128>` — for shared_gate_up
+  and attn_q_a/kv pair. Splits each row to its own CTA with 8 warps
+  cooperating (4 per output of the pair).
+- `matmul_q8_0_hc_expand_preq_warp1_kernel<BLOCKS, WARPS_PER_OUT>` —
+  `<64, 2>` for shared_down, `<256, 8>` for attn_output_b.
+
+CTA count went from ~256-512 → 1024-4096 across affected shapes.
+Achieved bandwidth on shared_gate_up went from 131 → ~150 GB/s.
+
+Bench: 15.00 → 15.16 tps (+0.16). Per-substage:
+- attention: 33.85 → 32.62 ms (-1.23 ms)
+- shared_ffn: 8.79 → 8.51 ms (-0.28 ms)
+- total: 67.07 → 66.24 ms (-0.83 ms)
+
+Disable: `DS4_CUDA_Q8_PAIR_NO_WARP1_QUAD=1`,
+`DS4_CUDA_Q8_HC_EXPAND_NO_WARP1=1`.
+
+### What didn't work / probed-and-skipped
+
+- Naive uint4 vectorization on q8_0 weights — falsified. The 2-byte
+  scale at offset 0 of each 34-byte block breaks 16-byte alignment;
+  the dp4a inner loop already reads 4 bytes at a time.
+- Template-unroll-only on the pair kernel — null result, reverted.
+- Step 5 (compressor_update kernel review) — fragmented; ~2.2 ms of
+  uninstrumented compressor stage is split across 86 small launches/token.
+  No single lever ≥ 0.3 ms. Realistic path is fusion or CUDA Graphs.
+
+## What changed this morning's session (F16 vec8 + output fusion)
+
+Already committed at `7fed170`. Two evidence-backed kernel-level wins.
+Full breakdown in `docs/hardware/gb10-cuda-notes.md` under
 **"F16 GEMV vectorization wins (2026-05-12, post-q_a/kv-pair-fusion)"**.
 
 ### Lever 1: output_a/output_b/HC-expand sequential fuse — small, real

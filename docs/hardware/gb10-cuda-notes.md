@@ -2430,8 +2430,112 @@ DS4_CUDA_INDEXER_EVENT_PROFILE=1 DS4_CUDA_DECODE_EVENT_PROFILE=1 \
 | Item | Effort | Expected tok/s | Notes |
 | --- | --- | --- | --- |
 | **GPU-idle-window probe + CUDA Graphs** | 1-2 sessions | +0.1–0.3 tps | See "Step 3" above; verify gap exists before refactoring |
-| q8_0 GEMV vectorization audit (other Q8_0 paths) | 1 session | +0.0–0.3 tps | Same dp4a-via-larger-vector-load pattern as Q4_K had; check `matmul_q8_0_preq_warp8_kernel` family for analogous scalar loads |
-| Compressor_update kernel review (uninstrumented 4 ms) | 1 session | +0.0–0.5 tps | APE + norm + EMA + FP8; not yet split into substages |
+| Compressor_update kernel fusion (compressor_store + APE) | 1 session | +0.0–0.3 tps | After F16 vec8 + q8_0 warp1, the ~2.2 ms uninstrumented compressor stage is ~86 small launches/token. Either fuse compressor_store into the upstream pair matmul, or wrap with CUDA Graphs |
 | MoE rework via launch-pattern restructure | weeks | +0.0–1.0 tps | Bandwidth floor (~122 GB/s gather) holds; only structural redesign moves it |
 | MTP / verifier-bound speculation | weeks | unknown | Still gated by the verifier-sharing problem; see "MTP isn't the lever" in SESSION_HANDOFF.md |
+
+## q8_0 GEMV CTA-parallelism wins (2026-05-12 afternoon, post-F16-vec8)
+
+Investigative goal: pattern-match the F16 vec8 win onto remaining q8_0
+GEMVs. **The exact pattern was falsified (q8_0's 34-byte block layout
+breaks 16-byte vector loads), but a different lever — CTA-parallelism
+restructure — paid off.**
+
+Session baseline (= morning's end-state): **15.00 tps**.
+Session-end: **15.16 tps**. Delta: **+0.16 tps**, **-0.83 ms total_ms/token**.
+
+### Per-kernel achieved bandwidth attribution
+
+weight_bytes/token ÷ measured_ms:
+
+| Kernel | weight bytes/tok | ms/tok | Achieved GB/s | Note |
+| --- | --- | --- | --- | --- |
+| q_b (matmul_q8_0_preq_warp8) | 1530 MB | ~8.0 | **192** | already near sequential ceiling |
+| output_a fused | 1530 MB | ~7.2 | **213** | already near sequential ceiling |
+| shared_gate_up paired (pre-fix) | 768 MB | ~5.9 | **131** | between gather floor and sequential — green light |
+| shared_down hc_expand (pre-fix) | 384 MB | ~2.9 | **132** | same gap |
+| attn_q_a/kv paired (pre-fix) | 288 MB | ~2.2 | **131** | same kernel as shared_gate_up |
+
+The 192-213 GB/s kernels have 4096+ CTAs; the 131 GB/s ones have only
+~512 CTAs — 1.5 waves on 22 SMs. The bottleneck is **CTA-level
+parallelism**, not load width.
+
+### Falsification: F16-style uint4 vectorization doesn't translate to q8_0
+
+q8_0 block = 2-byte fp16 scale + 32 int8 = 34 bytes. Three consequences:
+
+1. The dp4a inner loop already reads 4 bytes at a time via
+   `load_i8x4_i32_aligned` — already 8× wider than F16's scalar `__half2float`.
+2. The 2-byte scale at offset 0 of every 34-byte block breaks 16-byte
+   alignment, so naive `uint4` loads would fault or fall back to slow paths.
+3. Repacking would either double weight memory (impractical at 80 GB) or
+   require startup re-layout.
+
+A template-unroll-only experiment on the pair kernel produced **null result**
+(-0.04 tps, within noise), confirming load-width isn't the lever here.
+
+### What did work: 1-output-per-CTA × N-warps-per-output
+
+Going from 8-outputs-per-CTA to 1-output-per-CTA with N warps cooperating
+(N×32 = BLOCKS) restored the per-lane work density that q_b's shape
+enjoys naturally (1 block per lane), plus 4-8× the CTA count for better
+SM occupancy.
+
+**New kernels** in `ds4_cuda.cu`:
+
+- `matmul_q8_0_pair_preq_warp1_quad_kernel<BLOCKS=128>` — 8 warps × 32
+  lanes per CTA, warps 0-3 → out0 (gate / q_a), warps 4-7 → out1
+  (up / kv). Each lane reads exactly one block; cross-warp reduction via
+  shared memory.
+- `matmul_q8_0_hc_expand_preq_warp1_kernel<BLOCKS, WARPS_PER_OUT>` —
+  same pattern for the HC-expand-fused matmuls.
+  - `<64, 2>` for shared_down (64 threads/CTA)
+  - `<256, 8>` for attn_output_b (256 threads/CTA)
+  - HC post-row work runs once on warp 0 lane 0 after the reduction.
+
+CTA count change:
+
+| Shape | Pre-fix CTAs | Post-fix CTAs |
+| --- | --- | --- |
+| shared_gate_up paired | 256 | 2048 |
+| attn_q_a/kv paired | 128 | 1024 |
+| shared_down hc_expand | 512 | 4096 |
+| attn_output_b hc_expand | 512 | 4096 |
+
+### Measured delta (3-run A/B per config, clean bench)
+
+| Config | gen_tps avg |
+| --- | --- |
+| All warp1 wins enabled (default) | **15.16** |
+| Pair-warp1 only (hc_expand warp1 disabled) | 15.09 |
+| Both warp1 disabled | 15.00 |
+
+Per-substage with both warp1 enabled (instrumented run):
+
+| Substage | Pre-fix ms/tok | Post-fix ms/tok | Δ |
+| --- | --- | --- | --- |
+| attention | 33.85 | 32.62 | **-1.23** |
+| q_proj | 9.51 | 9.30 | -0.21 |
+| output_proj | 14.40 | 14.17 | -0.23 |
+| shared_ffn | 8.79 | 8.51 | -0.28 |
+| **total** | **67.07** | **66.24** | **-0.83** |
+
+### Step 5 (compressor_update probe) — fragmented, no single lever
+
+After F16 vec8 + q8_0 warp1, the compressor_indexer stage is 6.5 ms/tok.
+Instrumented breakdown: compressor pair matmul 2.94 ms, indexer scores
+0.61, indexer topk 0.69 → 2.24 ms residual.
+
+The residual is ~86 small launches/token (compressor_store per layer,
+APE/norm/RoPE/shift only when emit). Per-launch overhead dominates over
+per-byte compute. No single kernel ≥ 0.3 ms. The realistic path forward
+is either fusing compressor_store into the upstream pair matmul or
+CUDA-Graph-ing the whole layer — both structural refactors.
+
+### Disable flags (this afternoon's adds)
+
+| Flag | Purpose |
+| --- | --- |
+| `DS4_CUDA_Q8_PAIR_NO_WARP1_QUAD=1` | Restore 8-output/CTA pair kernel |
+| `DS4_CUDA_Q8_HC_EXPAND_NO_WARP1=1` | Force the warp8-unroll hc_expand variant |
 
