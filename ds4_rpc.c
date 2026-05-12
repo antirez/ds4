@@ -388,7 +388,7 @@ int ds4_rpc_handshake_client_peer(ds4_rpc_handle *h,
 
     uint8_t op = 0;
     uint32_t payload_bytes = 0;
-    if (frame_read_header(h->fd, &op, &payload_bytes, err, errlen)) return 1;
+    if (frame_read_header(h->fd,&op, &payload_bytes, err, errlen)) return 1;
     if (op != DS4_RPC_OP_HELLO_SERVER) {
         rpc_set_err(err, errlen, "handshake: server replied op=%u, expected HELLO_SERVER", op);
         return 1;
@@ -400,11 +400,11 @@ int ds4_rpc_handshake_client_peer(ds4_rpc_handle *h,
         return 1;
     }
     uint8_t status_buf[4];
-    if (io_read_full(h->fd, status_buf, sizeof(status_buf), err, errlen)) return 1;
+    if (io_read_full(h->fd,status_buf, sizeof(status_buf), err, errlen)) return 1;
     const uint32_t status = get_u32_le(status_buf);
 
     uint8_t peer_buf[RPC_CFG_BYTES];
-    if (io_read_full(h->fd, peer_buf, sizeof(peer_buf), err, errlen)) return 1;
+    if (io_read_full(h->fd,peer_buf, sizeof(peer_buf), err, errlen)) return 1;
     if (out_peer) unpack_config(out_peer, peer_buf);
 
     const uint32_t msg_bytes = payload_bytes - 4u - (uint32_t)RPC_CFG_BYTES;
@@ -414,7 +414,7 @@ int ds4_rpc_handshake_client_peer(ds4_rpc_handle *h,
         if (msg_bytes > 0 && msg_bytes < 4096) {
             msg = (char *)malloc((size_t)msg_bytes + 1u);
             if (msg) {
-                if (io_read_full(h->fd, msg, msg_bytes, err, errlen) == 0) {
+                if (io_read_full(h->fd,msg, msg_bytes, err, errlen) == 0) {
                     msg[msg_bytes] = '\0';
                     rpc_set_err(err, errlen, "rpc: server rejected handshake: %s", msg);
                 }
@@ -426,7 +426,7 @@ int ds4_rpc_handshake_client_peer(ds4_rpc_handle *h,
         uint32_t remaining = msg_bytes;
         while (remaining > 0) {
             uint32_t chunk = remaining < sizeof(tmp) ? remaining : (uint32_t)sizeof(tmp);
-            if (io_read_full(h->fd, tmp, chunk, NULL, 0)) break;
+            if (io_read_full(h->fd,tmp, chunk, NULL, 0)) break;
             remaining -= chunk;
         }
         rpc_set_err(err, errlen, "rpc: server rejected handshake (status=%u)", status);
@@ -438,7 +438,7 @@ int ds4_rpc_handshake_client_peer(ds4_rpc_handle *h,
         uint32_t remaining = msg_bytes;
         while (remaining > 0) {
             uint32_t chunk = remaining < sizeof(tmp) ? remaining : (uint32_t)sizeof(tmp);
-            if (io_read_full(h->fd, tmp, chunk, NULL, 0)) break;
+            if (io_read_full(h->fd,tmp, chunk, NULL, 0)) break;
             remaining -= chunk;
         }
     }
@@ -452,7 +452,7 @@ int ds4_rpc_handshake_server(ds4_rpc_handle *h, const ds4_rpc_config *cfg,
 
     uint8_t op = 0;
     uint32_t payload_bytes = 0;
-    if (frame_read_header(h->fd, &op, &payload_bytes, err, errlen)) return 1;
+    if (frame_read_header(h->fd,&op, &payload_bytes, err, errlen)) return 1;
     if (op != DS4_RPC_OP_HELLO_CLIENT) {
         rpc_set_err(err, errlen, "handshake: client opened with op=%u, expected HELLO_CLIENT", op);
         return 1;
@@ -463,7 +463,7 @@ int ds4_rpc_handshake_server(ds4_rpc_handle *h, const ds4_rpc_config *cfg,
         return 1;
     }
     uint8_t cbuf[RPC_CFG_BYTES];
-    if (io_read_full(h->fd, cbuf, sizeof(cbuf), err, errlen)) return 1;
+    if (io_read_full(h->fd,cbuf, sizeof(cbuf), err, errlen)) return 1;
     ds4_rpc_config got = {0};
     unpack_config(&got, cbuf);
     if (peer) *peer = got;
@@ -584,7 +584,7 @@ int ds4_rpc_decode_recv_reply(ds4_rpc_handle *h,
 
     uint8_t op = 0;
     uint32_t reply_bytes = 0;
-    if (frame_read_header(h->fd, &op, &reply_bytes, err, errlen)) return 1;
+    if (frame_read_header(h->fd,&op, &reply_bytes, err, errlen)) return 1;
     if (op != DS4_RPC_OP_DECODE_REPLY) {
         rpc_set_err(err, errlen, "decode_recv_reply: expected DECODE_REPLY, got op=%u", op);
         return 1;
@@ -594,7 +594,7 @@ int ds4_rpc_decode_recv_reply(ds4_rpc_handle *h,
         return 1;
     }
     uint8_t hdr[16];
-    if (io_read_full(h->fd, hdr, sizeof(hdr), err, errlen)) return 1;
+    if (io_read_full(h->fd,hdr, sizeof(hdr), err, errlen)) return 1;
     const uint32_t status      = get_u32_le(hdr);
     const uint32_t n_drafts    = get_u32_le(hdr + 4);
     const uint64_t got_floats  = get_u64_le(hdr + 8);
@@ -613,7 +613,7 @@ int ds4_rpc_decode_recv_reply(ds4_rpc_handle *h,
         uint64_t remaining = expect_payload;
         while (remaining > 0) {
             uint64_t chunk = remaining < sizeof(tmp) ? remaining : sizeof(tmp);
-            if (io_read_full(h->fd, tmp, (size_t)chunk, NULL, 0)) break;
+            if (io_read_full(h->fd,tmp, (size_t)chunk, NULL, 0)) break;
             remaining -= chunk;
         }
         rpc_set_err(err, errlen, "decode_recv_reply: tail returned error status %u", status);
@@ -633,7 +633,7 @@ int ds4_rpc_decode_recv_reply(ds4_rpc_handle *h,
                 rpc_set_err(err, errlen, "decode_recv_reply: too many drafts (%u)", n_drafts);
                 return 1;
             }
-            if (io_read_full(h->fd, drafts_buf, (size_t)draft_bytes, err, errlen)) return 1;
+            if (io_read_full(h->fd,drafts_buf, (size_t)draft_bytes, err, errlen)) return 1;
             for (uint32_t i = 0; i < accept; i++) {
                 out_drafts[i] = get_u32_le(drafts_buf + i * 4);
             }
@@ -644,10 +644,10 @@ int ds4_rpc_decode_recv_reply(ds4_rpc_handle *h,
                 rpc_set_err(err, errlen, "decode_recv_reply: too many drafts (%u) to drain", n_drafts);
                 return 1;
             }
-            if (io_read_full(h->fd, tmp, (size_t)draft_bytes, err, errlen)) return 1;
+            if (io_read_full(h->fd,tmp, (size_t)draft_bytes, err, errlen)) return 1;
         }
     }
-    return io_read_full(h->fd, out_logits, (size_t)(n_logit_floats * sizeof(float)), err, errlen);
+    return io_read_full(h->fd,out_logits, (size_t)(n_logit_floats * sizeof(float)), err, errlen);
 }
 
 int ds4_rpc_decode_request(ds4_rpc_handle *h,
@@ -678,7 +678,7 @@ int ds4_rpc_decode_recv(ds4_rpc_handle *h,
     }
     uint8_t op = 0;
     uint32_t payload_bytes = 0;
-    if (frame_read_header(h->fd, &op, &payload_bytes, err, errlen)) return 1;
+    if (frame_read_header(h->fd,&op, &payload_bytes, err, errlen)) return 1;
     if (op != DS4_RPC_OP_DECODE_REQ) {
         rpc_set_err(err, errlen, "decode_recv: expected DECODE_REQ, got op=%u", op);
         return 1;
@@ -691,7 +691,7 @@ int ds4_rpc_decode_recv(ds4_rpc_handle *h,
         return 1;
     }
     uint8_t hdr[24];
-    if (io_read_full(h->fd, hdr, sizeof(hdr), err, errlen)) return 1;
+    if (io_read_full(h->fd,hdr, sizeof(hdr), err, errlen)) return 1;
     *token       = get_u32_le(hdr);
     *pos         = get_u32_le(hdr + 4);
     *want_drafts = get_u32_le(hdr + 8) != 0;
@@ -703,7 +703,7 @@ int ds4_rpc_decode_recv(ds4_rpc_handle *h,
                     (unsigned long long)got_floats, (unsigned long long)n_residual_floats);
         return 1;
     }
-    return io_read_full(h->fd, residual_hc,
+    return io_read_full(h->fd,residual_hc,
                         (size_t)(n_residual_floats * sizeof(float)), err, errlen);
 }
 
@@ -753,7 +753,7 @@ int ds4_rpc_mtp_trim(ds4_rpc_handle *h, uint32_t accepted_drafts,
                     err, errlen)) return 1;
     uint8_t op = 0;
     uint32_t bytes = 0;
-    if (frame_read_header(h->fd, &op, &bytes, err, errlen)) return 1;
+    if (frame_read_header(h->fd,&op, &bytes, err, errlen)) return 1;
     if (op != DS4_RPC_OP_MTP_TRIM_REPLY || bytes != 0) {
         rpc_set_err(err, errlen, "mtp_trim: unexpected reply op=%u bytes=%u", op, bytes);
         return 1;
@@ -769,13 +769,13 @@ int ds4_rpc_mtp_trim_recv(ds4_rpc_handle *h, uint32_t *accepted_drafts,
     }
     uint8_t op = 0;
     uint32_t bytes = 0;
-    if (frame_read_header(h->fd, &op, &bytes, err, errlen)) return 1;
+    if (frame_read_header(h->fd,&op, &bytes, err, errlen)) return 1;
     if (op != DS4_RPC_OP_MTP_TRIM || bytes != 4) {
         rpc_set_err(err, errlen, "mtp_trim_recv: unexpected op=%u bytes=%u", op, bytes);
         return 1;
     }
     uint8_t buf[4];
-    if (io_read_full(h->fd, buf, sizeof(buf), err, errlen)) return 1;
+    if (io_read_full(h->fd,buf, sizeof(buf), err, errlen)) return 1;
     *accepted_drafts = get_u32_le(buf);
     return 0;
 }
@@ -847,7 +847,7 @@ int ds4_rpc_verify_batch_request(ds4_rpc_handle *h,
 
     uint8_t op = 0;
     uint32_t reply_bytes = 0;
-    if (frame_read_header(h->fd, &op, &reply_bytes, err, errlen)) return 1;
+    if (frame_read_header(h->fd,&op, &reply_bytes, err, errlen)) return 1;
     if (op != DS4_RPC_OP_VERIFY_BATCH_REPLY) {
         rpc_set_err(err, errlen, "verify_batch_request: expected reply op=%u, got %u",
                     DS4_RPC_OP_VERIFY_BATCH_REPLY, op);
@@ -859,7 +859,7 @@ int ds4_rpc_verify_batch_request(ds4_rpc_handle *h,
         return 1;
     }
     uint8_t hdr[24];
-    if (io_read_full(h->fd, hdr, sizeof(hdr), err, errlen)) return 1;
+    if (io_read_full(h->fd,hdr, sizeof(hdr), err, errlen)) return 1;
     const uint32_t status     = get_u32_le(hdr);
     const uint32_t n_accepted = get_u32_le(hdr + 4);
     const uint64_t got_floats = get_u64_le(hdr + 16);
@@ -870,7 +870,7 @@ int ds4_rpc_verify_batch_request(ds4_rpc_handle *h,
         uint64_t left = remaining;
         while (left > 0) {
             uint64_t chunk = left < sizeof(tmp) ? left : sizeof(tmp);
-            if (io_read_full(h->fd, tmp, (size_t)chunk, NULL, 0)) break;
+            if (io_read_full(h->fd,tmp, (size_t)chunk, NULL, 0)) break;
             left -= chunk;
         }
         rpc_set_err(err, errlen, "verify_batch_request: tail status %u", status);
@@ -893,7 +893,7 @@ int ds4_rpc_verify_batch_request(ds4_rpc_handle *h,
                     (unsigned long long)n_logit_floats);
         return 1;
     }
-    return io_read_full(h->fd, out_logits, (size_t)remaining, err, errlen);
+    return io_read_full(h->fd,out_logits, (size_t)remaining, err, errlen);
 }
 
 int ds4_rpc_verify_batch_recv(ds4_rpc_handle *h,
@@ -910,7 +910,7 @@ int ds4_rpc_verify_batch_recv(ds4_rpc_handle *h,
     }
     uint8_t op = 0;
     uint32_t payload_bytes = 0;
-    if (frame_read_header(h->fd, &op, &payload_bytes, err, errlen)) return 1;
+    if (frame_read_header(h->fd,&op, &payload_bytes, err, errlen)) return 1;
     if (op != DS4_RPC_OP_VERIFY_BATCH) {
         rpc_set_err(err, errlen, "verify_batch_recv: expected VERIFY_BATCH, got op=%u", op);
         return 1;
@@ -920,7 +920,7 @@ int ds4_rpc_verify_batch_recv(ds4_rpc_handle *h,
         return 1;
     }
     uint8_t hdr[24];
-    if (io_read_full(h->fd, hdr, sizeof(hdr), err, errlen)) return 1;
+    if (io_read_full(h->fd,hdr, sizeof(hdr), err, errlen)) return 1;
     *n_tokens   = get_u32_le(hdr);
     *pos_start  = get_u32_le(hdr + 4);
     const uint32_t n_expected_in = get_u32_le(hdr + 8);
@@ -950,7 +950,7 @@ int ds4_rpc_verify_batch_recv(ds4_rpc_handle *h,
     }
     *out_n_residual_floats = n_floats;
     *out_n_expected = n_expected_in;
-    if (io_read_full(h->fd, batch_residual, (size_t)want_bytes, err, errlen)) return 1;
+    if (io_read_full(h->fd,batch_residual, (size_t)want_bytes, err, errlen)) return 1;
     if (n_expected_in > 0) {
         uint8_t tmp[16 * 4];
         if (expected_bytes > sizeof(tmp)) {
@@ -958,7 +958,7 @@ int ds4_rpc_verify_batch_recv(ds4_rpc_handle *h,
                         n_expected_in);
             return 1;
         }
-        if (io_read_full(h->fd, tmp, (size_t)expected_bytes, err, errlen)) return 1;
+        if (io_read_full(h->fd,tmp, (size_t)expected_bytes, err, errlen)) return 1;
         for (uint32_t i = 0; i < n_expected_in; i++) {
             expected_next[i] = get_u32_le(tmp + i * 4);
         }
@@ -1046,7 +1046,7 @@ int ds4_rpc_prefill_request(ds4_rpc_handle *h,
 
     uint8_t op = 0;
     uint32_t reply_bytes = 0;
-    if (frame_read_header(h->fd, &op, &reply_bytes, err, errlen)) return 1;
+    if (frame_read_header(h->fd,&op, &reply_bytes, err, errlen)) return 1;
     if (op != DS4_RPC_OP_PREFILL_REPLY) {
         rpc_set_err(err, errlen, "prefill_request: expected PREFILL_REPLY, got op=%u", op);
         return 1;
@@ -1056,7 +1056,7 @@ int ds4_rpc_prefill_request(ds4_rpc_handle *h,
         return 1;
     }
     uint8_t hdr[16];
-    if (io_read_full(h->fd, hdr, sizeof(hdr), err, errlen)) return 1;
+    if (io_read_full(h->fd,hdr, sizeof(hdr), err, errlen)) return 1;
     const uint32_t status     = get_u32_le(hdr);
     const uint32_t has_logits = get_u32_le(hdr + 4);
     const uint64_t got_floats = get_u64_le(hdr + 8);
@@ -1068,7 +1068,7 @@ int ds4_rpc_prefill_request(ds4_rpc_handle *h,
         uint64_t left = remaining;
         while (left > 0) {
             uint64_t chunk = left < sizeof(tmp) ? left : sizeof(tmp);
-            if (io_read_full(h->fd, tmp, (size_t)chunk, NULL, 0)) break;
+            if (io_read_full(h->fd,tmp, (size_t)chunk, NULL, 0)) break;
             left -= chunk;
         }
         rpc_set_err(err, errlen, "prefill_request: tail returned error status %u", status);
@@ -1095,7 +1095,7 @@ int ds4_rpc_prefill_request(ds4_rpc_handle *h,
                     (unsigned long long)(n_logit_floats * sizeof(float)));
         return 1;
     }
-    return io_read_full(h->fd, out_logits, (size_t)remaining, err, errlen);
+    return io_read_full(h->fd,out_logits, (size_t)remaining, err, errlen);
 }
 
 int ds4_rpc_prefill_recv(ds4_rpc_handle *h,
@@ -1111,7 +1111,7 @@ int ds4_rpc_prefill_recv(ds4_rpc_handle *h,
     }
     uint8_t op = 0;
     uint32_t payload_bytes = 0;
-    if (frame_read_header(h->fd, &op, &payload_bytes, err, errlen)) return 1;
+    if (frame_read_header(h->fd,&op, &payload_bytes, err, errlen)) return 1;
     if (op != DS4_RPC_OP_PREFILL_REQ) {
         rpc_set_err(err, errlen, "prefill_recv: expected PREFILL_REQ, got op=%u", op);
         return 1;
@@ -1121,7 +1121,7 @@ int ds4_rpc_prefill_recv(ds4_rpc_handle *h,
         return 1;
     }
     uint8_t hdr[24];
-    if (io_read_full(h->fd, hdr, sizeof(hdr), err, errlen)) return 1;
+    if (io_read_full(h->fd,hdr, sizeof(hdr), err, errlen)) return 1;
     *n_tokens                  = get_u32_le(hdr);
     *pos_start                 = get_u32_le(hdr + 4);
     *want_logits               = get_u32_le(hdr + 8) != 0;
@@ -1145,7 +1145,7 @@ int ds4_rpc_prefill_recv(ds4_rpc_handle *h,
         return 1;
     }
     *out_n_residual_floats = n_floats;
-    return io_read_full(h->fd, batch_residual_hc, (size_t)want_bytes, err, errlen);
+    return io_read_full(h->fd,batch_residual_hc, (size_t)want_bytes, err, errlen);
 }
 
 int ds4_rpc_prefill_reply(ds4_rpc_handle *h,
@@ -1181,7 +1181,7 @@ int ds4_rpc_reset(ds4_rpc_handle *h, char *err, size_t errlen) {
     if (frame_write(h->fd, DS4_RPC_OP_RESET, NULL, 0, err, errlen)) return 1;
     uint8_t op = 0;
     uint32_t bytes = 0;
-    if (frame_read_header(h->fd, &op, &bytes, err, errlen)) return 1;
+    if (frame_read_header(h->fd,&op, &bytes, err, errlen)) return 1;
     if (op != DS4_RPC_OP_RESET_REPLY || bytes != 0) {
         rpc_set_err(err, errlen, "reset: unexpected reply op=%u bytes=%u", op, bytes);
         return 1;
@@ -1259,7 +1259,7 @@ int ds4_rpc_rewind(ds4_rpc_handle *h, uint32_t target_pos,
                     err, errlen)) return 1;
     uint8_t op = 0;
     uint32_t bytes = 0;
-    if (frame_read_header(h->fd, &op, &bytes, err, errlen)) return 1;
+    if (frame_read_header(h->fd,&op, &bytes, err, errlen)) return 1;
     if (op != DS4_RPC_OP_REWIND_REPLY || bytes != 0) {
         rpc_set_err(err, errlen, "rewind: unexpected reply op=%u bytes=%u", op, bytes);
         return 1;
@@ -1272,13 +1272,13 @@ int ds4_rpc_rewind_recv(ds4_rpc_handle *h, uint32_t *target_pos,
     if (!h || !target_pos) { rpc_set_err(err, errlen, "rewind_recv: null"); return 1; }
     uint8_t op = 0;
     uint32_t bytes = 0;
-    if (frame_read_header(h->fd, &op, &bytes, err, errlen)) return 1;
+    if (frame_read_header(h->fd,&op, &bytes, err, errlen)) return 1;
     if (op != DS4_RPC_OP_REWIND || bytes != 4) {
         rpc_set_err(err, errlen, "rewind_recv: unexpected op=%u bytes=%u", op, bytes);
         return 1;
     }
     uint8_t buf[4];
-    if (io_read_full(h->fd, buf, sizeof(buf), err, errlen)) return 1;
+    if (io_read_full(h->fd,buf, sizeof(buf), err, errlen)) return 1;
     *target_pos = get_u32_le(buf);
     return 0;
 }

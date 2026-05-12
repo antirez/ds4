@@ -15096,6 +15096,15 @@ struct ds4_session {
     /* Aggregate counters for phase 6 hit/miss telemetry. */
     uint64_t rpc_spec_hit;
     uint64_t rpc_spec_miss;
+    /* Phase 6.7 adaptive prefetch: 32-cycle sliding window of hit/miss
+     * outcomes (bit 0 = newest).  When `rpc_spec_attempts` reaches 32 and
+     * the hit count is below the threshold, `rpc_spec_cooldown` is set to
+     * skip prefetch starts for N more cycles so we don't keep paying the
+     * miss tax during code-block / dense-logits stretches.  The in-flight
+     * spec from before cooldown is still drained normally. */
+    uint32_t rpc_spec_history;
+    uint32_t rpc_spec_attempts;
+    uint32_t rpc_spec_cooldown;
     ds4_session_progress_fn progress;
     void *progress_ud;
     uint32_t prefill_cap;
@@ -17394,10 +17403,33 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                               s->rpc_spec_pos == (uint32_t)s->checkpoint.len;
 
         if (spec_debug) {
-            fprintf(stderr, "ds4-spec: eval enter token=%d pos=%d in_flight=%d pred=%u spec_pos=%u hit=%d\n",
+            fprintf(stderr, "ds4-spec: eval enter token=%d pos=%d in_flight=%d pred=%u spec_pos=%u hit=%d cooldown=%u\n",
                     token, s->checkpoint.len, (int)s->rpc_spec_in_flight,
-                    s->rpc_spec_predicted_token, s->rpc_spec_pos, (int)spec_hit);
+                    s->rpc_spec_predicted_token, s->rpc_spec_pos, (int)spec_hit,
+                    s->rpc_spec_cooldown);
         }
+
+        /* Phase 6.7 adaptive: record this cycle's outcome (only for cycles
+         * that had a spec in flight to evaluate).  When the window fills,
+         * check the hit rate; if too low, enter cooldown. */
+        if (s->rpc_spec_in_flight) {
+            s->rpc_spec_history = (s->rpc_spec_history << 1) | (spec_hit ? 1u : 0u);
+            if (s->rpc_spec_attempts < 32u) s->rpc_spec_attempts++;
+            if (s->rpc_spec_attempts == 32u) {
+                const uint32_t hits = (uint32_t)__builtin_popcount(s->rpc_spec_history);
+                if (hits < 16u) {
+                    /* < 50% hit rate over 32 cycles: cool off for 32 cycles. */
+                    s->rpc_spec_cooldown = 32u;
+                    s->rpc_spec_history = 0;
+                    s->rpc_spec_attempts = 0;
+                    if (spec_debug) {
+                        fprintf(stderr, "ds4-spec: adaptive: hit rate %u/32 below threshold, "
+                                        "entering cooldown for 32 cycles\n", hits);
+                    }
+                }
+            }
+        }
+        if (s->rpc_spec_cooldown > 0) s->rpc_spec_cooldown--;
 
         if (spec_hit) {
             /* HIT: head KV already advanced through this token in the prev
@@ -17485,7 +17517,12 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
          * have a spec in flight, snapshot head KV, run L0-L20 on drafts[0]
          * speculatively, and ship the request.  The next eval call will
          * either hit (token matches drafts[0]) or miss (abort + sync). */
-        if (prefetch_on && !s->rpc_spec_in_flight && n_drafts_returned > 0) {
+        const bool adaptive_block = (s->rpc_spec_cooldown > 0);
+        if (prefetch_on && adaptive_block && spec_debug) {
+            fprintf(stderr, "ds4-spec: adaptive: skip prefetch start (cooldown=%u)\n",
+                    s->rpc_spec_cooldown);
+        }
+        if (prefetch_on && !adaptive_block && !s->rpc_spec_in_flight && n_drafts_returned > 0) {
             const uint32_t pred = drafts_buf[0];
             const uint32_t spec_pos = (uint32_t)(s->checkpoint.len + 1);
             if (spec_debug) {
