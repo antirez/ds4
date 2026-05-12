@@ -4644,10 +4644,21 @@ static bool http_response(int fd, int code, const char *type, const char *body) 
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %zu\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Methods: GET,HEAD,OPTIONS,POST,PUT\r\n"
+        "Access-Control-Allow-Headers: Access-Control-Allow-Headers, Origin, Accept, Content-Type, Access-Control-Request-Method, Access-Control-Request-Headers\r\n"
         "Connection: close\r\n\r\n",
         code, reason, type, strlen(body));
     bool ok = send_all(fd, h.ptr, h.len) && send_all(fd, body, strlen(body));
     buf_free(&h);
+    return ok;
+}
+
+static bool http_ok(int fd) {
+    buf b = {0};
+    buf_puts(&b, "OK");
+    bool ok = http_response(fd, 200, "text/plain", b.ptr);
+    buf_free(&b);
     return ok;
 }
 
@@ -4668,6 +4679,9 @@ static bool sse_headers(int fd) {
     const char *h =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/event-stream\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Methods: GET,HEAD,OPTIONS,POST,PUT\r\n"
+        "Access-Control-Allow-Headers: Access-Control-Allow-Headers, Origin, Accept, Content-Type, Access-Control-Request-Method, Access-Control-Request-Headers\r\n"
         "Cache-Control: no-cache\r\n"
         "Connection: close\r\n\r\n";
     return send_all(fd, h, strlen(h));
@@ -11116,6 +11130,11 @@ static void *client_main(void *arg) {
         goto done;
     }
 
+    if (!strcmp(hr.method, "OPTIONS")) {
+        http_ok(fd);
+        http_request_free(&hr);
+        goto done;
+    }
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
         http_request_free(&hr);
