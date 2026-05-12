@@ -290,11 +290,11 @@ static bool test_token_bytes_equal(ds4_engine *engine, int token,
 
 static bool test_long_prefill_progress(void *ud, const char *event, int current, int total) {
     (void)ud;
-    if (strcmp(event, "prefill_chunk")) return true;
+    if (!event || strcmp(event, "prefill_chunk")) return false;
     if (current == 0 || current == total || current % 8192 == 0) {
         fprintf(stderr, "ds4-test: long-context prefill %d/%d\n", current, total);
     }
-    return true;
+    return false;
 }
 
 static void test_long_story_fact_recall(void) {

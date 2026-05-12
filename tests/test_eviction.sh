@@ -189,14 +189,14 @@ else
     # The disk cache may not store if token count is below min_tokens threshold
     info "No KV files found on disk"
     info "This may be expected if prompt was below min_tokens threshold for disk caching"
-    
+
     # Check server log for disk cache activity
     if grep -qi "kv cache" "$LOGFILE" 2>/dev/null; then
         cache_logs=$(grep -i "kv cache" "$LOGFILE" | tail -3)
         info "Server KV cache log:"
         echo "$cache_logs" | while read -r line; do info "  $line"; done
     fi
-    
+
     # Not a hard failure — depends on min_tokens config
     pass "Disk eviction test completed (no files may be expected for short prompts)"
 fi

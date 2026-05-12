@@ -171,6 +171,7 @@ int ds4_pool_init(ds4_pool *pool, ds4_engine *engine, int n_slots, int ctx_size)
         }
         slot->active = false;
         slot->last_used_seq = 0;
+        slot->pos_snapshot = 0;
         slot->session_id[0] = '\0';
     }
 
@@ -291,6 +292,7 @@ static int prepare_fresh_slot(ds4_pool *pool, int idx, const char *session_id,
                               pool->slots[idx].session)) {
             disk_match = ds4_session_common_prefix(pool->slots[idx].session, prompt);
             pool->slots[idx].disk_pos = ds4_session_pos(pool->slots[idx].session);
+            pool->slots[idx].pos_snapshot = pool->slots[idx].disk_pos;
             disk_loaded = true;
         }
     }
@@ -303,6 +305,7 @@ static int prepare_fresh_slot(ds4_pool *pool, int idx, const char *session_id,
 
     /* Cold start — invalidate so sync() will full-prefill. */
     ds4_session_invalidate(pool->slots[idx].session);
+    pool->slots[idx].pos_snapshot = 0;
     return idx;
 }
 
@@ -376,6 +379,7 @@ strategy3:
 
         pool->slots[idx].session_id[0] = '\0';
         pool->slots[idx].active = false;
+        pool->slots[idx].pos_snapshot = 0;
         pool->last_acquire.hit_type = 3;
         pool->last_acquire.matched_slot = idx;
         pool->last_acquire.evicted_slot = idx;
@@ -394,6 +398,7 @@ void ds4_pool_touch(ds4_pool *pool, int slot_idx) {
     if (slot_idx < 0 || slot_idx >= pool->n_slots) return;
     pool->seq++;
     pool->slots[slot_idx].last_used_seq = pool->seq;
+    pool->slots[slot_idx].pos_snapshot = ds4_session_pos(pool->slots[slot_idx].session);
 }
 
 void ds4_pool_persist_slot(ds4_pool *pool, int slot_idx) {

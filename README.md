@@ -328,8 +328,8 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 By default the server keeps one live session. When multiple agents or context
 windows share a single server instance, switching between them forces a full KV
 re-prefill — often 10K–100K tokens. The session pool avoids this by keeping N
-Metal sessions resident in GPU memory simultaneously. Switching between them is
-a pointer swap: no GPU work, no disk I/O.
+backend sessions resident in GPU memory simultaneously. Switching between them
+is a pointer swap: no GPU work, no disk I/O.
 
 ```sh
 ./ds4-server --ctx 100000 --sessions 4 --kv-disk-dir /tmp/ds4-kv
@@ -403,15 +403,16 @@ request arrives.
 
 As a conversation grows, the client can send a `/warmup` request containing a
 *shorter* prompt — for example, one where older turns have been summarized or
-dropped.  The server detects that the new prompt diverges from the session's
-current KV state, rewinds to the common prefix, and prefills the compacted
-suffix.  The result is a session whose KV cache now reflects the shorter prompt.
+dropped.  If the compacted prompt is still an extension of the live session,
+the server reuses the prefix and prefills only the suffix. If compaction changes
+or removes earlier tokens, the server rebuilds that session in the background so
+the next user-visible request does not pay the rebuild cost.
 
 This is useful when the client performs context-window management (summarization,
-truncation, sliding window) between turns.  Without compaction, the session
-would hold stale KV from the old long prompt and the next real request would
-need a full rebuild.  With a proactive warmup, the compacted state is ready
-before the user's next message arrives — TTFT stays near zero.
+truncation, sliding window) between turns.  Without warmup, the next real request
+would need to rebuild the session after the prompt changed.  With proactive
+warmup, the compacted state is ready before the user's next message arrives —
+TTFT stays near zero.
 
 ```
 Turn 15 prompt (48K tokens) → session KV at 48K
@@ -423,10 +424,10 @@ Real request (23K tokens) → prefills only 1K new tokens, instant response
 
 The warmup returns `202 Accepted` immediately; the prefill happens on the
 worker thread.  If a generation request arrives before the warmup finishes,
-it queues behind it (Metal can only run one compute pass at a time).
+it queues behind it (the backend can only run one compute pass at a time).
 
-With `--sessions 1` (default) the server behaves identically to before — the
-pool code is not active.
+With `--sessions 1` (default) the session pool is not active; the server keeps a
+single live session as before.
 
 ### Agent Client Usage
 

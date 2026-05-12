@@ -30,6 +30,7 @@ typedef struct {
     uint64_t     last_used_seq;  /* monotonic counter for LRU */
     bool         active;         /* true if session is allocated */
     int          disk_pos;       /* token count last persisted to disk (avoid overwriting larger files) */
+    int          pos_snapshot;   /* last worker-published token position for diagnostics */
 } ds4_pool_slot;
 
 /* Pool stats populated on each ds4_pool_acquire() call. */

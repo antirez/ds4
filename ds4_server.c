@@ -2248,9 +2248,10 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
     const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
     int last_user_idx = -1;
     /* Split system messages: "leading" (before first non-system) go in the system
-     * prefix; "trailing" (after any user/assistant/tool) go after conversation.
-     * This keeps the prefix stable when dynamic content (MEMORY, daily log) is
-     * injected as trailing system messages by extensions. */
+     * prefix; "trailing" (after any user/assistant/tool) go after tools but
+     * before the conversation.  This keeps the base+tools prefix stable when
+     * dynamic content (memory, daily log) is injected as trailing system
+     * messages by extensions. */
     int first_nonsystem = -1;
     for (int i = 0; i < msgs->len; i++) {
         if (!role_is_system(msgs->v[i].role)) { first_nonsystem = i; break; }
@@ -2779,23 +2780,35 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                                              &r->tool_orders, r->think_mode);
 
     if (cached && cached->tokens.len > 0) {
-        /* Cache hit — splice: tokenize prefix, copy cached tools tokens, tokenize suffix. */
+        /* Cache hit — splice: tokenize prefix, copy cached tools tokens, tokenize suffix.
+         * BPE tokenization can merge across arbitrary byte boundaries, so validate
+         * the splice against full tokenization before using it. */
+        bool used_splice = false;
         char *tools_pos = strstr(r->prompt_text, cached->rendered_tools);
         if (tools_pos) {
             size_t tools_text_len = strlen(cached->rendered_tools);
-            /* Tokenize prefix (text before tools section) */
             char saved = *tools_pos;
             *tools_pos = '\0';
             ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
             *tools_pos = saved;
-            /* Append cached tools tokens */
             for (int i = 0; i < cached->tokens.len; i++)
                 ds4_tokens_push(&r->prompt, cached->tokens.v[i]);
-            /* Tokenize suffix (text after tools section) */
             ds4_tokenize_rendered_chat(e, tools_pos + tools_text_len, &r->prompt);
-        } else {
-            ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt); /* fallback */
+
+            ds4_tokens full = {0};
+            ds4_tokenize_rendered_chat(e, r->prompt_text, &full);
+            if (r->prompt.len == full.len &&
+                (r->prompt.len == 0 || !memcmp(r->prompt.v, full.v,
+                    (size_t)r->prompt.len * sizeof(r->prompt.v[0])))) {
+                used_splice = true;
+                ds4_tokens_free(&full);
+            } else {
+                ds4_tokens_free(&r->prompt);
+                r->prompt = full;
+            }
         }
+        if (!used_splice && r->prompt.len == 0)
+            ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     } else {
         /* Full tokenization (no cache hit) */
         ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
@@ -7196,8 +7209,8 @@ struct server {
     job *head;
     job *tail;
     int n_queued;
-    volatile bool abort_worker;  /* signal worker to abandon current job */
-    volatile int worker_slot;      /* slot the worker is currently using, -1 if none */
+    bool abort_worker;  /* protected by mu; signals worker to abandon current job */
+    int worker_slot;    /* protected by mu; slot the worker is currently using, -1 if none */
     bool stopping;
     int clients;
     uint64_t seq;
@@ -9519,12 +9532,54 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
     buf_free(&names);
 }
 
+static bool server_abort_requested(void *ud) {
+    server *s = ud;
+    if (!s) return false;
+    pthread_mutex_lock(&s->mu);
+    bool abort = s->abort_worker;
+    pthread_mutex_unlock(&s->mu);
+    return abort;
+}
+
+static void server_clear_worker_slot(server *s) {
+    pthread_mutex_lock(&s->mu);
+    s->worker_slot = -1;
+    s->abort_worker = false;
+    pthread_mutex_unlock(&s->mu);
+}
+
+static void server_publish_pool_slot_pos(server *s, int pool_slot) {
+    if (!s || !s->pool_enabled || pool_slot < 0 || pool_slot >= s->pool.n_slots) return;
+    pthread_mutex_lock(&s->mu);
+    ds4_pool_slot *slot = &s->pool.slots[pool_slot];
+    if (slot->active && slot->session) slot->pos_snapshot = ds4_session_pos(slot->session);
+    pthread_mutex_unlock(&s->mu);
+}
+
+static void server_drop_pool_slot_after_abort(server *s, int pool_slot) {
+    pthread_mutex_lock(&s->mu);
+    if (s->pool_enabled && pool_slot >= 0 && pool_slot < s->pool.n_slots) {
+        ds4_pool_slot *slot = &s->pool.slots[pool_slot];
+        if (slot->active) {
+            ds4_session_invalidate(slot->session);
+            slot->session_id[0] = '\0';
+            slot->active = false;
+            slot->last_used_seq = 0;
+            slot->pos_snapshot = 0;
+            if (s->pool.active_count > 0) s->pool.active_count--;
+        }
+    }
+    s->worker_slot = -1;
+    s->abort_worker = false;
+    pthread_mutex_unlock(&s->mu);
+}
+
 static bool server_progress_cb(void *ud, const char *event, int current, int total) {
     server_prefill_progress *p = ud;
     if (!p || !event || strcmp(event, "prefill_chunk")) return false;
 
     /* Check abort signal from DELETE /v1/pool/:slot */
-    if (p->srv && p->srv->abort_worker) return true;
+    if (p->srv && server_abort_requested(p->srv)) return true;
 
     double now = now_sec();
     double elapsed = now - p->t0;
@@ -9815,7 +9870,65 @@ static bool should_canonicalize_tool_checkpoint(const server *s, const tool_call
     return true;
 }
 
-/* ==================================================================
+    pthread_mutex_lock(&s->mu);
+    int slot = ds4_pool_warmup(&s->pool, j->req.session_id, &j->req.prompt);
+    if (slot >= 0) {
+        s->session = ds4_pool_session(&s->pool, slot);
+        s->worker_slot = slot;
+        s->abort_worker = false;
+        ds4_session_set_abort(s->session, server_abort_requested, s);
+    }
+    pthread_mutex_unlock(&s->mu);
+    if (slot < 0) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: warmup failed to acquire slot for %s",
+                   j->req.session_id);
+        goto cleanup;
+    }
+
+    /* Check if the slot already covers the prompt (already warm). */
+    ds4_session *sess = ds4_pool_session(&s->pool, slot);
+    int common = ds4_session_common_prefix(sess, &j->req.prompt);
+    int pos = ds4_session_pos(sess);
+    if (common == j->req.prompt.len && pos == j->req.prompt.len) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: warmup %s already warm (%d tokens)",
+                   j->req.session_id, pos);
+        server_clear_worker_slot(s);
+        goto cleanup;
+    }
+
+    /* Run the prefill.  This is the expensive Metal compute pass. */
+    s->session = sess;
+    const double t0 = now_sec();
+    if (ds4_session_sync(sess, &j->req.prompt, err, sizeof(err)) != 0) {
+        if (server_abort_requested(s)) {
+            server_drop_pool_slot_after_abort(s, slot);
+            server_log(DS4_LOG_PREFILL,
+                       "ds4-server: warmup %s aborted by pool slot kill",
+                       j->req.session_id);
+        } else {
+            server_log(DS4_LOG_PREFILL,
+                       "ds4-server: warmup %s prefill failed: %s",
+                       j->req.session_id, err);
+            server_clear_worker_slot(s);
+        }
+        goto cleanup;
+    }
+    pthread_mutex_lock(&s->mu);
+    ds4_pool_touch(&s->pool, slot);
+    pthread_mutex_unlock(&s->mu);
+    server_clear_worker_slot(s);
+
+    server_log(DS4_LOG_PREFILL,
+               "ds4-server: warmup %s done %d tokens %.3fs",
+               j->req.session_id, j->req.prompt.len, now_sec() - t0);
+
+cleanup:
+    request_free(&j->req);
+    pthread_mutex_destroy(&j->mu);
+    pthread_cond_destroy(&j->cv);
+    free(j);
 }
 
 /* Execute one request on the worker-owned session.
@@ -9840,11 +9953,18 @@ static void generate_job(server *s, job *j) {
      * effectively free (no disk I/O, no re-prefill of the shared prefix). */
     int pool_slot = -1;
     if (s->pool_enabled) {
+        pthread_mutex_lock(&s->mu);
         pool_slot = ds4_pool_acquire(&s->pool, j->req.session_id, &j->req.prompt);
         if (pool_slot >= 0) {
             s->session = ds4_pool_session(&s->pool, pool_slot);
             s->worker_slot = pool_slot;
-            ds4_session_set_abort(s->session, &s->abort_worker);
+            s->abort_worker = false;
+            ds4_session_set_abort(s->session, server_abort_requested, s);
+        }
+        pthread_mutex_unlock(&s->mu);
+        if (pool_slot < 0 || !s->session) {
+            http_error(j->fd, 503, "failed to acquire pool session");
+            return;
         }
     }
 
@@ -9877,6 +9997,7 @@ static void generate_job(server *s, job *j) {
                                            old_pos))
         {
             responses_live_match_ids = j->req.responses_live_call_ids.len;
+
         }
     }
     if (cached == 0) {
@@ -10080,22 +10201,14 @@ static void generate_job(server *s, job *j) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(s->session, NULL, NULL);
-            if (s->abort_worker) {
-                s->abort_worker = false;
-                ds4_session_invalidate(s->session);
-                if (pool_slot >= 0) {
-                    ds4_pool_slot *sl = &s->pool.slots[pool_slot];
-                    sl->session_id[0] = '\0';
-                    sl->active = false;
-                    sl->last_used_seq = 0;
-                    s->pool.active_count--;
-                }
-                s->worker_slot = -1;
+            if (server_abort_requested(s)) {
+                server_drop_pool_slot_after_abort(s, pool_slot);
                 server_log(DS4_LOG_PREFILL, "ds4-server: prefill aborted by pool slot kill");
                 http_error(j->fd, 503, "job aborted");
             } else {
                 trace_event(s, trace_id, "prefill failed: %s", err);
                 http_error(j->fd, 500, err);
+                server_clear_worker_slot(s);
             }
             return;
         }
@@ -10108,22 +10221,14 @@ static void generate_job(server *s, job *j) {
     if (ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err)) != 0) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(s->session, NULL, NULL);
-        if (s->abort_worker) {
-            s->abort_worker = false;
-            ds4_session_invalidate(s->session);
-            if (pool_slot >= 0) {
-                ds4_pool_slot *sl = &s->pool.slots[pool_slot];
-                sl->session_id[0] = '\0';
-                sl->active = false;
-                sl->last_used_seq = 0;
-                s->pool.active_count--;
-            }
-            s->worker_slot = -1;
+        if (server_abort_requested(s)) {
+            server_drop_pool_slot_after_abort(s, pool_slot);
             server_log(DS4_LOG_PREFILL, "ds4-server: prefill aborted by pool slot kill");
             http_error(j->fd, 503, "job aborted");
         } else {
             trace_event(s, trace_id, "prefill failed: %s", err);
             http_error(j->fd, 500, err);
+            server_clear_worker_slot(s);
         }
         return;
     }
@@ -10134,6 +10239,7 @@ static void generate_job(server *s, job *j) {
     if (!thinking_live_continuation) thinking_live_clear(s);
     ds4_session_set_progress(s->session, NULL, NULL);
     kv_cache_maybe_store_continued(s);
+    server_publish_pool_slot_pos(s, pool_slot);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -10168,6 +10274,7 @@ static void generate_job(server *s, job *j) {
                        req_flags[0] ? " " : "",
                        req_flags);
             ds4_tokens_free(&effective_prompt);
+            server_clear_worker_slot(s);
             return;
         }
         if (j->req.api == API_ANTHROPIC &&
@@ -10175,12 +10282,14 @@ static void generate_job(server *s, job *j) {
                                       prompt_tokens, &anthropic_live)) {
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
             ds4_tokens_free(&effective_prompt);
+            server_clear_worker_slot(s);
             return;
         }
         if (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT &&
             !sse_chunk(j->fd, &j->req, id, NULL, NULL)) {
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s openai role chunk failed", ctx_span);
             ds4_tokens_free(&effective_prompt);
+            server_clear_worker_slot(s);
             return;
         }
         if (openai_live_chat) openai_stream_start(&j->req, &openai_live);
@@ -10225,7 +10334,7 @@ static void generate_job(server *s, job *j) {
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
 
-    while (!g_stop_requested && !s->abort_worker && completion < max_tokens &&
+    while (!g_stop_requested && !server_abort_requested(s) && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
@@ -10452,17 +10561,8 @@ static void generate_job(server *s, job *j) {
     }
 
     /* If aborted via DELETE /v1/pool/:slot, bail out immediately. */
-    if (s->abort_worker) {
-        s->abort_worker = false;
-        ds4_session_invalidate(s->session);
-        if (pool_slot >= 0) {
-            ds4_pool_slot *slot = &s->pool.slots[pool_slot];
-            slot->session_id[0] = '\0';
-            slot->active = false;
-            slot->last_used_seq = 0;
-            s->pool.active_count--;
-        }
-        s->worker_slot = -1;
+    if (server_abort_requested(s)) {
+        server_drop_pool_slot_after_abort(s, pool_slot);
         buf_free(&text);
         openai_stream_free(&openai_live);
         server_log(DS4_LOG_PREFILL, "ds4-server: job aborted by pool slot kill");
@@ -10707,9 +10807,11 @@ static void generate_job(server *s, job *j) {
     /* Mark the pool slot as recently used after generation completes.
      * Persist to disk L2 so the session survives server restarts. */
     if (s->pool_enabled && pool_slot >= 0) {
+        pthread_mutex_lock(&s->mu);
         ds4_pool_touch(&s->pool, pool_slot);
+        pthread_mutex_unlock(&s->mu);
         ds4_pool_persist_slot(&s->pool, pool_slot);
-        s->worker_slot = -1;
+        server_clear_worker_slot(s);
     }
     ds4_tokens_free(&effective_prompt);
 }
@@ -10969,27 +11071,35 @@ static void *client_main(void *arg) {
         goto done;
     }
 
-    /* GET /v1/pool — pool status and per-slot diagnostics.
-     * Reads pool state directly from the client thread.  The pool is mutated
-     * only by the single worker thread; arm64 word reads are atomic so we get
-     * a consistent-enough snapshot for diagnostics.  Worst case: one field is
-     * from before an acquire and another from after — acceptable for monitoring. */
+    /* GET /v1/pool — pool status and per-slot diagnostics. */
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/pool")) {
         http_request_free(&hr);
         buf b = {0};
         if (!s->pool_enabled) {
             buf_puts(&b, "{\"enabled\":false}\n");
         } else {
+            pthread_mutex_lock(&s->prompt_cache.mu);
+            int pc_count = s->prompt_cache.count;
+            uint64_t pc_hits = s->prompt_cache.total_hits;
+            uint64_t pc_misses = s->prompt_cache.total_misses;
+            pthread_mutex_unlock(&s->prompt_cache.mu);
+
             pthread_mutex_lock(&s->mu);
             int queued = s->n_queued;
-            /* Walk queue to collect session_ids in FIFO order */
-            #define MAX_QUEUE_SNAP 32
-            char *queue_sids[MAX_QUEUE_SNAP];
+#define MAX_QUEUE_SNAP 32
+            char queue_sids[MAX_QUEUE_SNAP][64];
+            bool queue_sid_present[MAX_QUEUE_SNAP];
             int queue_snap_n = 0;
             for (job *qj = s->head; qj && queue_snap_n < MAX_QUEUE_SNAP; qj = qj->next) {
-                queue_sids[queue_snap_n++] = qj->req.session_id;
+                queue_sid_present[queue_snap_n] = qj->req.session_id && qj->req.session_id[0];
+                if (queue_sid_present[queue_snap_n]) {
+                    snprintf(queue_sids[queue_snap_n], sizeof(queue_sids[queue_snap_n]),
+                             "%s", qj->req.session_id);
+                } else {
+                    queue_sids[queue_snap_n][0] = '\0';
+                }
+                queue_snap_n++;
             }
-            pthread_mutex_unlock(&s->mu);
             buf_printf(&b, "{\"enabled\":true,\"n_slots\":%d,\"active\":%d,"
                        "\"seq\":%llu,\"queued\":%d,\"slots\":[",
                        s->pool.n_slots, s->pool.active_count,
@@ -11001,20 +11111,12 @@ static void *client_main(void *arg) {
                 buf_printf(&b, "{\"slot\":%d,\"active\":%s,"
                            "\"session_id\":", i,
                            slot->active ? "true" : "false");
-                if (slot->session_id[0]) {
-                    json_escape(&b, slot->session_id);
-                } else {
-                    buf_puts(&b, "null");
-                }
+                if (slot->session_id[0]) json_escape(&b, slot->session_id);
+                else buf_puts(&b, "null");
                 buf_printf(&b, ",\"pos\":%d,\"last_used_seq\":%llu}",
-                           slot->active ? ds4_session_pos(slot->session) : 0,
+                           slot->active ? slot->pos_snapshot : 0,
                            (unsigned long long)slot->last_used_seq);
             }
-            pthread_mutex_lock(&s->prompt_cache.mu);
-            int pc_count = s->prompt_cache.count;
-            uint64_t pc_hits = s->prompt_cache.total_hits;
-            uint64_t pc_misses = s->prompt_cache.total_misses;
-            pthread_mutex_unlock(&s->prompt_cache.mu);
             buf_printf(&b, "],\"last_acquire\":{\"hit_type\":%d,"
                        "\"matched_slot\":%d,\"evicted_slot\":%d},"
                        "\"prompt_cache\":{\"entries\":%d,"
@@ -11028,12 +11130,10 @@ static void *client_main(void *arg) {
                        (unsigned long long)pc_misses);
             for (int qi = 0; qi < queue_snap_n; qi++) {
                 if (qi > 0) buf_putc(&b, ',');
-                if (queue_sids[qi] && queue_sids[qi][0]) {
-                    json_escape(&b, queue_sids[qi]);
-                } else {
-                    buf_puts(&b, "null");
-                }
+                if (queue_sid_present[qi]) json_escape(&b, queue_sids[qi]);
+                else buf_puts(&b, "null");
             }
+            pthread_mutex_unlock(&s->mu);
             buf_puts(&b, "]}\n");
         }
         http_response(fd, 200, "application/json", b.ptr);
@@ -11046,35 +11146,46 @@ static void *client_main(void *arg) {
      * (worker will bail at next chunk boundary).  Otherwise, invalidates the
      * session directly and marks the slot available for reuse. */
     if (!strcmp(hr.method, "DELETE") && !strncmp(hr.path, "/v1/pool/", 9)) {
-        int slot_idx = atoi(hr.path + 9);
+        char *endp = NULL;
+        long parsed_slot = strtol(hr.path + 9, &endp, 10);
         http_request_free(&hr);
+        if (!endp || *endp != '\0' || parsed_slot < 0 || parsed_slot > INT_MAX) {
+            http_error(fd, 400, "invalid slot index");
+            goto done;
+        }
+        int slot_idx = (int)parsed_slot;
         if (!s->pool_enabled) {
             http_error(fd, 400, "pool not enabled");
             goto done;
         }
-        if (slot_idx < 0 || slot_idx >= s->pool.n_slots) {
+        pthread_mutex_lock(&s->mu);
+        if (slot_idx >= s->pool.n_slots) {
+            pthread_mutex_unlock(&s->mu);
             http_error(fd, 404, "slot index out of range");
             goto done;
         }
         ds4_pool_slot *slot = &s->pool.slots[slot_idx];
         if (!slot->active) {
+            pthread_mutex_unlock(&s->mu);
             http_error(fd, 404, "slot not active");
             goto done;
         }
+        bool aborted = false;
         if (s->worker_slot == slot_idx) {
-            /* Worker is actively using this slot — signal abort. */
             s->abort_worker = true;
+            aborted = true;
         } else {
-            /* Slot is idle — kill directly. */
             ds4_session_invalidate(slot->session);
             slot->session_id[0] = '\0';
             slot->active = false;
             slot->last_used_seq = 0;
-            s->pool.active_count--;
+            slot->pos_snapshot = 0;
+            if (s->pool.active_count > 0) s->pool.active_count--;
         }
+        pthread_mutex_unlock(&s->mu);
         buf b = {0};
         buf_printf(&b, "{\"killed\":true,\"slot\":%d,\"aborted\":%s}\n",
-                   slot_idx, s->abort_worker ? "true" : "false");
+                   slot_idx, aborted ? "true" : "false");
         http_response(fd, 200, "application/json", b.ptr);
         buf_free(&b);
         goto done;
@@ -11088,8 +11199,8 @@ static void *client_main(void *arg) {
      * because:
      *   - Warmup is only called proactively (clients send it at session start
      *     before the user types), so the queue is usually empty.
-     *   - Metal can only run one compute pass at a time anyway — there's no
-     *     way to parallelize prefill and decode.
+     *   - The backend can only run one compute pass at a time anyway — there's
+     *     no way to parallelize prefill and decode.
      *   - The alternative (priority queue or preemption) adds complexity
      *     for a scenario that rarely manifests in practice.
      * If starvation becomes a problem, the simplest fix is to limit warmup
@@ -11325,7 +11436,7 @@ static void server_close_resources(server *s) {
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mu);
-    ds4_session_free(s->session);
+    if (!s->pool_enabled) ds4_session_free(s->session);
     ds4_engine_close(s->engine);
     memset(s, 0, sizeof(*s));
 }
@@ -11380,7 +11491,7 @@ static void usage(FILE *fp) {
         "\n"
         "Session pool (multi-agent concurrency):\n"
         "  --sessions N\n"
-        "      Keep N Metal sessions in memory simultaneously. Default: 1 (legacy single-session).\n"
+        "      Keep N backend sessions in memory simultaneously. Default: 1 (legacy single-session).\n"
         "      Each session uses ~1.5 GB at 100K context. Switching between sessions is free.\n"
         "\n"
         "  Clients should include X-Session-Id: <id> header for session affinity.\n"
@@ -11570,11 +11681,13 @@ int main(int argc, char **argv) {
     log_context_memory(cfg.engine.backend, cfg.ctx_size);
 
     ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
-        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create %s session",
-                   ds4_backend_name(cfg.engine.backend));
-        ds4_engine_close(engine);
-        return 1;
+    if (cfg.n_sessions <= 1) {
+        if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create %s session",
+                       ds4_backend_name(cfg.engine.backend));
+            ds4_engine_close(engine);
+            return 1;
+        }
     }
 
     server s;
@@ -11590,7 +11703,6 @@ int main(int argc, char **argv) {
     if (cfg.n_sessions > 1) {
         if (ds4_pool_init(&s.pool, engine, cfg.n_sessions, cfg.ctx_size) != 0) {
             server_log(DS4_LOG_DEFAULT, "ds4-server: failed to initialize session pool");
-            ds4_session_free(session);
             ds4_engine_close(engine);
             return 1;
         }
@@ -11691,12 +11803,14 @@ int main(int argc, char **argv) {
     while (s.clients > 0) pthread_cond_wait(&s.clients_cv, &s.mu);
     pthread_mutex_unlock(&s.mu);
 
-    const ds4_tokens *tokens = ds4_session_tokens(s.session);
-    if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: persisting current KV cache before shutdown tokens=%d",
-                   tokens->len);
-        kv_cache_store_current(&s, "shutdown");
+    if (!s.pool_enabled) {
+        const ds4_tokens *tokens = ds4_session_tokens(s.session);
+        if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: persisting current KV cache before shutdown tokens=%d",
+                       tokens->len);
+            kv_cache_store_current(&s, "shutdown");
+        }
     }
     if (s.pool_enabled) {
         /* Persist all active slots on shutdown */
@@ -14353,7 +14467,46 @@ static void test_prompt_cache_hash_determinism(void) {
     TEST_ASSERT(ds4_prompt_cache_hash(NULL) == 14695981039346656037ULL); /* FNV offset basis */
 }
 
+static void test_prompt_cache_hit_matches_full_tokenization(void) {
+    ds4_engine *engine = test_get_engine(false);
+    ds4_prompt_cache cache;
+    ds4_prompt_cache_init(&cache);
+    const char *json =
+        "{"
+        "\"model\":\"deepseek-v4-flash\","
+        "\"messages\":["
+            "{\"role\":\"system\",\"content\":\"base instructions\"},"
+            "{\"role\":\"user\",\"content\":\"Use the tool.\"},"
+            "{\"role\":\"system\",\"content\":\"dynamic memory after the user turn\"}"
+        "],"
+        "\"tools\":[{\"type\":\"function\",\"function\":{"
+            "\"name\":\"list_files\","
+            "\"description\":\"List files in a directory.\","
+            "\"parameters\":{\"type\":\"object\",\"properties\":{"
+                "\"path\":{\"type\":\"string\"}"
+            "},\"required\":[\"path\"]}"
+        "}}],"
+        "\"max_tokens\":16"
+        "}";
 
+    request miss;
+    char err[160];
+    TEST_ASSERT(parse_chat_request(engine, NULL, json, 16, 4096, &cache, &miss, err, sizeof(err)));
+    request hit;
+    TEST_ASSERT(parse_chat_request(engine, NULL, json, 16, 4096, &cache, &hit, err, sizeof(err)));
+    request full;
+    TEST_ASSERT(parse_chat_request(engine, NULL, json, 16, 4096, NULL, &full, err, sizeof(err)));
+
+    TEST_ASSERT(hit.prompt.len == full.prompt.len);
+    TEST_ASSERT(hit.prompt.len == 0 || !memcmp(hit.prompt.v, full.prompt.v,
+        (size_t)hit.prompt.len * sizeof(hit.prompt.v[0])));
+    TEST_ASSERT(cache.total_hits == 1);
+
+    request_free(&miss);
+    request_free(&hit);
+    request_free(&full);
+    ds4_prompt_cache_free(&cache);
+}
 
 static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
     /* Simulate: user sends a single message, thinking mode on, no tools.
@@ -14698,6 +14851,7 @@ static void ds4_server_unit_tests_run(void) {
     test_prompt_cache_hit_and_miss();
     test_prompt_cache_full_rejects_insert();
     test_prompt_cache_hash_determinism();
+    test_prompt_cache_hit_matches_full_tokenization();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN
