@@ -16832,9 +16832,21 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 #endif
 }
 
+#ifndef DS4_NO_METAL
+static int rpc_spec_abort(ds4_session *s, char *err, size_t errlen);
+#endif
+
 void ds4_session_free(ds4_session *s) {
     if (!s) return;
 #ifndef DS4_NO_METAL
+    /* Drain any Phase 6 in-flight speculative reply before tearing down,
+     * otherwise the next session created on the same RPC connection will
+     * see the stale reply as its first frame.  We can't rewind the tail
+     * here since the session is going away; abort() does both anyway. */
+    if (s->rpc_spec_in_flight) {
+        char err[256] = {0};
+        (void)rpc_spec_abort(s, err, sizeof(err));
+    }
     metal_graph_free(&s->graph);
 #endif
     token_vec_free(&s->checkpoint);
@@ -17372,6 +17384,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         const bool ask_drafts = probe_mtp && e->rpc_tail_has_mtp &&
                                 e->mtp_draft_tokens > 0;
         const bool prefetch_on = ask_drafts && getenv("DS4_RPC_PREFETCH") != NULL;
+        const bool spec_debug = getenv("DS4_RPC_SPEC_DEBUG") != NULL;
         char rpc_err[512] = {0};
         uint32_t drafts_buf[DS4_RPC_MAX_DRAFTS] = {0};
         uint32_t n_drafts_returned = 0;
@@ -17380,10 +17393,17 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                               s->rpc_spec_predicted_token == (uint32_t)token &&
                               s->rpc_spec_pos == (uint32_t)s->checkpoint.len;
 
+        if (spec_debug) {
+            fprintf(stderr, "ds4-spec: eval enter token=%d pos=%d in_flight=%d pred=%u spec_pos=%u hit=%d\n",
+                    token, s->checkpoint.len, (int)s->rpc_spec_in_flight,
+                    s->rpc_spec_predicted_token, s->rpc_spec_pos, (int)spec_hit);
+        }
+
         if (spec_hit) {
             /* HIT: head KV already advanced through this token in the prev
              * eval's speculative L0-L20.  Just collect the spec reply. */
             s->rpc_spec_hit++;
+            if (spec_debug) fprintf(stderr, "ds4-spec: HIT path -- recv_reply\n");
             if (ds4_rpc_decode_recv_reply(e->rpc_peer,
                                           s->logits, DS4_N_VOCAB,
                                           ask_drafts ? drafts_buf : NULL,
@@ -17403,6 +17423,8 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             s->rpc_spec_in_flight = false;
         } else {
             /* MISS path: abort any in-flight spec, then sync ship/recv. */
+            if (spec_debug) fprintf(stderr, "ds4-spec: MISS/NORMAL path; in_flight=%d\n",
+                                    (int)s->rpc_spec_in_flight);
             if (s->rpc_spec_in_flight) {
                 char abort_err[256] = {0};
                 if (rpc_spec_abort(s, abort_err, sizeof(abort_err)) != 0) {
@@ -17466,44 +17488,52 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         if (prefetch_on && !s->rpc_spec_in_flight && n_drafts_returned > 0) {
             const uint32_t pred = drafts_buf[0];
             const uint32_t spec_pos = (uint32_t)(s->checkpoint.len + 1);
-            if (spec_pos < (uint32_t)s->ctx_size &&
-                spec_frontier_snapshot(&s->rpc_spec_snapshot, s))
-            {
+            if (spec_debug) {
+                fprintf(stderr, "ds4-spec: prefetch start pred=%u spec_pos=%u ctx_size=%d\n",
+                        pred, spec_pos, s->ctx_size);
+            }
+            if (spec_pos >= (uint32_t)s->ctx_size) {
+                if (spec_debug) fprintf(stderr, "ds4-spec: skip prefetch (ctx full)\n");
+            } else if (!spec_frontier_snapshot(&s->rpc_spec_snapshot, s)) {
+                if (spec_debug) fprintf(stderr, "ds4-spec: snapshot FAILED\n");
+            } else {
+                if (spec_debug) fprintf(stderr, "ds4-spec: snapshot ok; running spec L0-L20\n");
                 bool ok = metal_graph_eval_token_raw_swa(&s->graph, &e->model,
                                                         &e->weights,
                                                         pred, spec_pos,
                                                         s->logits);
+                if (spec_debug) fprintf(stderr, "ds4-spec: spec eval ok=%d\n", (int)ok);
                 if (ok) {
                     ok = ds4_session_export_residual_hc(s, residual, n_residual,
                                                         rpc_err, sizeof(rpc_err)) == 0;
+                    if (spec_debug) fprintf(stderr, "ds4-spec: export ok=%d err=%s\n", (int)ok, rpc_err);
                 }
                 if (ok) {
                     ok = ds4_rpc_decode_send(e->rpc_peer, pred, spec_pos,
                                              true,
                                              residual, n_residual,
                                              rpc_err, sizeof(rpc_err)) == 0;
+                    if (spec_debug) fprintf(stderr, "ds4-spec: send ok=%d err=%s\n", (int)ok, rpc_err);
                 }
                 if (ok) {
                     s->rpc_spec_in_flight = true;
                     s->rpc_spec_predicted_token = pred;
                     s->rpc_spec_pos = spec_pos;
+                    if (spec_debug) fprintf(stderr, "ds4-spec: prefetch armed in_flight=1\n");
                 } else {
-                    /* Best-effort: roll back head KV and skip prefetch this
-                     * round.  Connection may be broken if send failed. */
+                    if (spec_debug) fprintf(stderr, "ds4-spec: prefetch FAILED -- restoring\n");
                     (void)spec_frontier_restore(&s->rpc_spec_snapshot, s);
                     spec_frontier_free(&s->rpc_spec_snapshot);
-                    if (e->rpc_peer == NULL) {
-                        /* send-failed close already happened in
-                         * decode_send's error path? No — decode_send
-                         * doesn't close.  Leave peer alone and surface
-                         * on next call. */
-                    }
                 }
             }
         }
+        if (spec_debug) fprintf(stderr, "ds4-spec: end of rpc_peer block (about to push)\n");
     }
 
     token_vec_push(&s->checkpoint, token);
+    if (e && e->rpc_peer && getenv("DS4_RPC_SPEC_DEBUG")) {
+        fprintf(stderr, "ds4-spec: pushed token=%d new_len=%d\n", token, s->checkpoint.len);
+    }
     if (mtp_should_draft) {
         int mtp_top = -1;
         if (metal_graph_eval_mtp_draft(&s->graph,
@@ -17520,6 +17550,10 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         } else if (getenv("DS4_MTP_PROBE")) {
             fprintf(stderr, "ds4: mtp probe draft failed\n");
         }
+    }
+    if (e && e->rpc_peer && getenv("DS4_RPC_SPEC_DEBUG")) {
+        fprintf(stderr, "ds4-spec: eval_internal returning 0 (len=%d in_flight=%d)\n",
+                s->checkpoint.len, (int)s->rpc_spec_in_flight);
     }
     return 0;
 #endif
@@ -17629,10 +17663,16 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
      * several proposed positions together; running ordinary decode once per
      * draft token is correctness-safe but cannot be faster than baseline.
      */
+    const bool _sa_dbg = getenv("DS4_RPC_SPEC_DEBUG") != NULL && e && e->rpc_peer;
+    if (_sa_dbg) fprintf(stderr, "ds4-spec: SA: before eval first_token=%d\n", first_token);
     if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+    if (_sa_dbg) fprintf(stderr, "ds4-spec: SA: after eval; e=%p mtp_ready=%d mtp_draft_valid=%d mtp_draft_tokens=%d\n",
+                         (void*)e, (int)e->mtp_ready, (int)s->mtp_draft_valid, e->mtp_draft_tokens);
     int n_accept = 0;
     accepted[n_accept++] = first_token;
+    if (_sa_dbg) fprintf(stderr, "ds4-spec: SA: pushed accepted[0]=%d; checking early returns\n", first_token);
     if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
+    if (_sa_dbg) fprintf(stderr, "ds4-spec: SA: past early returns\n");
 
     /* Pipeline-parallel head: tail produces MTP drafts post-decode; we
      * learned them via DECODE_REPLY into s->mtp_draft_token (draft 0) and
@@ -17823,7 +17863,18 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         return n_accept;
     }
 
-    if (!e->mtp_ready || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) return n_accept;
+    if (_sa_dbg) fprintf(stderr, "ds4-spec: SA: past batched-verify gate; checking single-host MTP gate\n");
+    /* Phase 6: under prefetch the head has ALREADY consumed the prediction by
+     * running its L0-L20 speculatively at position N+1; running the single-
+     * host MTP draft path here on top of that would re-draft from a corrupted
+     * state and (if mtp_ready locally too) crash inside the draft kernel.
+     * Skip the single-host path entirely when prefetch is on -- the prefetch
+     * hit/miss path is the speculation. */
+    if (rpc_prefetch_on || !e->mtp_ready || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) {
+        if (_sa_dbg) fprintf(stderr, "ds4-spec: SA: returning n_accept=%d via single-host MTP gate (prefetch=%d)\n",
+                             n_accept, (int)rpc_prefetch_on);
+        return n_accept;
+    }
 
     int draft_cap = e->mtp_draft_tokens;
     if (draft_cap > max_tokens - n_accept) draft_cap = max_tokens - n_accept;
@@ -18389,6 +18440,18 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  * caller will discover divergence on the next decode if it really matters. */
 static void rpc_propagate_reset(ds4_session *s, const char *origin) {
     if (!s || !s->engine || !s->engine->rpc_peer) return;
+#ifndef DS4_NO_METAL
+    /* Drain any in-flight Phase 6 speculative request before issuing RESET,
+     * otherwise the next frame on the wire is a DECODE_REPLY and the head
+     * misreads it as RESET_REPLY (the bug seen at request boundaries on
+     * /tmp/long-bench-prompt.txt).  abort() drains the reply AND rewinds
+     * the tail; the RESET we're about to send then truncates everything
+     * else, so the rewind is wasted but harmless. */
+    if (s->rpc_spec_in_flight) {
+        char err[256] = {0};
+        (void)rpc_spec_abort(s, err, sizeof(err));
+    }
+#endif
     char rpc_err[256] = {0};
     if (ds4_rpc_reset(s->engine->rpc_peer, rpc_err, sizeof(rpc_err)) != 0) {
         fprintf(stderr,

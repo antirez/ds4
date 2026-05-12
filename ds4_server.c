@@ -7116,7 +7116,10 @@ static void generate_job(server *s, job *j) {
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
             temperature = 0.0f;
         }
+        const bool spec_debug = getenv("DS4_RPC_SPEC_DEBUG") != NULL;
+        if (spec_debug) fprintf(stderr, "ds4-spec: server: about to sample\n");
         int token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
+        if (spec_debug) fprintf(stderr, "ds4-spec: server: sampled token=%d\n", token);
         if (token == ds4_token_eos(s->engine)) {
             finish = "stop";
             break;
@@ -7128,6 +7131,7 @@ static void generate_job(server *s, job *j) {
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
+            if (spec_debug) fprintf(stderr, "ds4-spec: server: calling speculative_argmax(token=%d)\n", token);
             ntok = ds4_session_eval_speculative_argmax(s->session,
                                                        token,
                                                        max_tokens - completion,
@@ -7136,6 +7140,7 @@ static void generate_job(server *s, job *j) {
                                                        (int)(sizeof(toks) / sizeof(toks[0])),
                                                        err,
                                                        sizeof(err));
+            if (spec_debug) fprintf(stderr, "ds4-spec: server: speculative_argmax returned ntok=%d\n", ntok);
             if (ntok < 0) {
                 finish = "error";
                 break;
