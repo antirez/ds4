@@ -13331,7 +13331,8 @@ static bool metal_graph_prefill_chunked_range(
         bool                   show_progress,
         ds4_session_progress_fn progress,
         void                  *progress_ud,
-        ds4_imatrix_collector *imatrix) {
+        ds4_imatrix_collector *imatrix,
+        volatile bool         *abort) {
     if (n_tokens == 0 || g->prefill_cap == 0) return false;
     if (start > (uint32_t)prompt->len) return false;
     if (n_tokens > (uint32_t)prompt->len - start) return false;
@@ -13358,7 +13359,8 @@ static bool metal_graph_prefill_chunked_range(
     const uint32_t end = start + n_tokens;
 
     if (progress) {
-        progress(progress_ud, "prefill_chunk", (int)start, prompt->len);
+        if (progress(progress_ud, "prefill_chunk", (int)start, prompt->len))
+            return false;
     }
 
     for (uint32_t pos0 = start; pos0 < end; ) {
@@ -13385,6 +13387,7 @@ static bool metal_graph_prefill_chunked_range(
         if (!ok) return false;
 
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+            if (abort && *abort) return false;
             const double t_layer0 = profile ? now_sec() : 0.0;
             ok = ds4_gpu_begin_commands() != 0;
             if (ok) ok = metal_graph_encode_layer_batch(g,
@@ -13431,7 +13434,8 @@ static bool metal_graph_prefill_chunked_range(
             return false;
         }
         if (progress) {
-            progress(progress_ud, "prefill_chunk", (int)(pos0 + chunk), prompt->len);
+            if (progress(progress_ud, "prefill_chunk", (int)(pos0 + chunk), prompt->len))
+                return false;
         }
         pos0 += chunk;
     }
@@ -13500,6 +13504,7 @@ static bool metal_graph_prefill_chunked(
                                              show_progress,
                                              progress,
                                              progress_ud,
+                                             NULL,
                                              NULL);
 }
 
@@ -15513,6 +15518,7 @@ struct ds4_session {
     uint64_t mtp_probe_hit;
     ds4_session_progress_fn progress;
     void *progress_ud;
+    volatile bool *abort;   /* external abort signal — checked between layers */
     uint32_t prefill_cap;
     int ctx_size;
     bool checkpoint_valid;
@@ -16665,7 +16671,8 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                                                            (uint32_t)prompt.len,
                                                            NULL, false,
                                                            NULL, NULL,
-                                                           &collector);
+                                                           &collector,
+                                                           NULL);
                 } else {
                     ok = metal_graph_prefill_layer_major(&g, model, weights,
                                                          &prompt, prompt.len,
@@ -17162,6 +17169,11 @@ void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *
     s->progress_ud = ud;
 }
 
+void ds4_session_set_abort(ds4_session *s, volatile bool *flag) {
+    if (!s) return;
+    s->abort = flag;
+}
+
 #ifndef DS4_NO_GPU
 typedef struct {
     ds4_session *session;
@@ -17170,16 +17182,17 @@ typedef struct {
     void *user_ud;
 } ds4_sync_progress;
 
-static void ds4_session_note_prefill_progress(void *ud, const char *event, int current, int total) {
+static bool ds4_session_note_prefill_progress(void *ud, const char *event, int current, int total) {
     ds4_sync_progress *p = ud;
-    if (!p || !p->session || !p->prompt) return;
+    if (!p || !p->session || !p->prompt) return false;
     if (!strcmp(event, "prefill_chunk") && current > 0 && current <= p->prompt->len) {
         p->session->checkpoint.len = 0;
         for (int i = 0; i < current; i++) token_vec_push(&p->session->checkpoint, p->prompt->v[i]);
         p->session->checkpoint_valid = true;
         p->session->mtp_draft_valid = false;
     }
-    if (p->user) p->user(p->user_ud, event, current, total);
+    if (p->user) return p->user(p->user_ud, event, current, total);
+    return false;
 }
 #endif
 
@@ -17278,7 +17291,8 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                                         false,
                                                         progress_fn,
                                                         progress_fn ? &progress : NULL,
-                                                        NULL);
+                                                        NULL,
+                                                        s->abort);
             if (!ok) {
                 snprintf(err, errlen, "%s resumed prefill failed while extending checkpoint", backend_name);
                 s->checkpoint_valid = false;
@@ -17314,9 +17328,10 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         };
         ds4_session_progress_fn progress_fn =
             s->progress ? ds4_session_note_prefill_progress : NULL;
-        ok = metal_graph_prefill_chunked(&s->graph, &e->model, &e->weights,
-                                         prompt, prompt->len, s->logits, false,
-                                         progress_fn, progress_fn ? &progress : NULL);
+        ok = metal_graph_prefill_chunked_range(&s->graph, &e->model, &e->weights,
+                                         prompt, 0, (uint32_t)prompt->len, s->logits, false,
+                                         progress_fn, progress_fn ? &progress : NULL,
+                                         NULL, s->abort);
     } else {
         ok = metal_graph_prefill_raw_swa(&s->graph, &e->model, &e->weights,
                                          prompt, prompt->len, s->logits, false);
@@ -18186,4 +18201,8 @@ int ds4_session_pos(ds4_session *s) {
 
 int ds4_session_ctx(ds4_session *s) {
     return s->ctx_size;
+}
+
+bool ds4_session_checkpoint_valid(ds4_session *s) {
+    return s && s->checkpoint_valid;
 }

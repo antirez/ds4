@@ -231,12 +231,14 @@ Start a local OpenAI/Anthropic-compatible server:
 
 The server keeps one mutable backend/KV checkpoint in memory,
 so stateless clients that resend a longer version of the same prompt can reuse
-the shared prefix instead of pre-filling from token zero.
+the shared prefix instead of pre-filling from token zero. With `--sessions N`
+the server maintains multiple sessions in memory simultaneously for zero-cost
+switching between context windows (see [Session Pool](#session-pool)).
 
 Request parsing and sockets run in client threads, but inference itself is
 serialized through one graph worker. The current server does not batch multiple
 independent requests together; concurrent requests wait their turn on the single
-live graph/session.
+live graph.
 
 Supported endpoints:
 
@@ -321,6 +323,111 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
+### Session Pool
+
+By default the server keeps one live session. When multiple agents or context
+windows share a single server instance, switching between them forces a full KV
+re-prefill — often 10K–100K tokens. The session pool avoids this by keeping N
+Metal sessions resident in GPU memory simultaneously. Switching between them is
+a pointer swap: no GPU work, no disk I/O.
+
+```sh
+./ds4-server --ctx 100000 --sessions 4 --kv-disk-dir /tmp/ds4-kv
+```
+
+Each session costs roughly 1.5 GB at 100K context (DeepSeek V4 compressed KV).
+On a 128 GB M4 Max with the 81 GB q2 model, 4 sessions add 6 GB — well within
+headroom. Even 8 sessions (12 GB) is comfortable.
+
+The pool routes incoming requests by priority: first it checks if the request
+carries an `X-Session-Id` header matching an existing slot, then it looks for
+the best prefix match among active sessions, then it allocates an empty slot,
+and finally it evicts the least-recently-used slot (persisting it to disk if
+`--kv-disk-dir` is set). Clients should send `X-Session-Id: <unique-id>` on
+every request for stable routing. Without it the pool still works for multi-turn
+within one conversation (each turn extends the previous prompt and matches the
+cached prefix), but it cannot match across conversations that have different
+content before the shared tool prefix.
+
+#### Prompt Layout for KV Prefix Stability
+
+The server reorders the messages array to maximize KV cache reuse across
+sessions. System messages are split into two groups:
+
+- **Leading system** — system messages that appear before any user/assistant
+  message in the array. These form the base system prompt.
+- **Trailing system** — system messages that appear *after* the first
+  non-system message (e.g., dynamic context injected by extensions mid-array).
+
+The rendered prompt is assembled as:
+
+```
+BOS + [leading system] + [tools] + [trailing system] + [conversation]
+```
+
+This layout keeps the longest possible prefix stable across sessions:
+
+1. **Cross-session stability** — The `[leading system] + [tools]` prefix is
+   identical for all sessions sharing the same base prompt and tool set.
+   The disk KV cache can serve this prefix to any session without re-prefill.
+2. **Intra-session stability** — Trailing system content (memory, daily logs,
+   project context) is fixed within a single session, so extending the
+   conversation only appends new turns.
+3. **Tool canonicalization** — Tools are rendered in a deterministic order with
+   cached tokenization, ensuring byte-identical output regardless of the JSON
+   key ordering the client sends.
+
+Without this reordering, dynamic system messages injected between the base
+prompt and tools would break the prefix on every request, reducing disk KV hits
+from ~18K tokens to ~10K tokens in practice.
+
+Pool switching benchmarks (DeepSeek V4 Flash IQ2_XXS, `--ctx 100000 --sessions 4`):
+
+| System prompt | Cold prefill | Pool switch (TTFT) | Speedup |
+|---------------|-------------|--------------------|---------|
+| 1K tokens | 3.34s | 0.59s | 5.7x |
+| 10K tokens | 42.9s | 0.64s | 67x |
+| 25K tokens | 117.8s | 0.83s | 142x |
+| 50K tokens | 263.7s | 0.88s | 298x |
+| 60K tokens | 487.8s | 1.02s | 477x |
+
+Pool TTFT stays roughly constant (~1s) regardless of context size — only the
+new turn's tokens need prefill.  Without the pool, every agent switch re-prefills
+the entire conversation from scratch.
+
+`POST /v1/warmup` with an `X-Session-Id` header triggers background prefill for
+a session without blocking generation. The session is ready when the first real
+request arrives.
+
+#### Compaction via /warmup
+
+As a conversation grows, the client can send a `/warmup` request containing a
+*shorter* prompt — for example, one where older turns have been summarized or
+dropped.  The server detects that the new prompt diverges from the session's
+current KV state, rewinds to the common prefix, and prefills the compacted
+suffix.  The result is a session whose KV cache now reflects the shorter prompt.
+
+This is useful when the client performs context-window management (summarization,
+truncation, sliding window) between turns.  Without compaction, the session
+would hold stale KV from the old long prompt and the next real request would
+need a full rebuild.  With a proactive warmup, the compacted state is ready
+before the user's next message arrives — TTFT stays near zero.
+
+```
+Turn 15 prompt (48K tokens) → session KV at 48K
+   ↓ client summarizes old turns
+Warmup with compacted prompt (22K tokens) → session KV rebuilt to 22K (async)
+   ↓ user sends turn 16
+Real request (23K tokens) → prefills only 1K new tokens, instant response
+```
+
+The warmup returns `202 Accepted` immediately; the prefill happens on the
+worker thread.  If a generation request arrives before the warmup finishes,
+it queues behind it (Metal can only run one compute pass at a time).
+
+With `--sessions 1` (default) the server behaves identically to before — the
+pool code is not active.
+
 ### Agent Client Usage
 
 `ds4-server` can be used by local coding agents that speak OpenAI-compatible
@@ -379,7 +486,9 @@ For **opencode**, add a provider and agent entry to
 }
 ```
 
-For **Pi**, add a provider to `~/.pi/agent/models.json`:
+For **[pi](https://github.com/mariozechner/pi-coding-agent)**, add a provider to `~/.pi/agent/models.json`.  The
+`sendSessionAffinityHeaders` compat flag makes pi send its per-session UUID on
+every request, giving each session a dedicated pool slot automatically:
 
 ```json
 {
@@ -397,7 +506,8 @@ For **Pi**, add a provider to `~/.pi/agent/models.json`:
         "maxTokensField": "max_tokens",
         "supportsStrictMode": false,
         "thinkingFormat": "deepseek",
-        "requiresReasoningContentOnAssistantMessages": true
+        "requiresReasoningContentOnAssistantMessages": true,
+        "sendSessionAffinityHeaders": true
       },
       "models": [
         {
@@ -428,7 +538,7 @@ For **Pi**, add a provider to `~/.pi/agent/models.json`:
 }
 ```
 
-Optionally make it the default Pi model in `~/.pi/agent/settings.json`:
+Optionally make it the default pi model in `~/.pi/agent/settings.json`:
 
 ```json
 {
