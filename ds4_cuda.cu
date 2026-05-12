@@ -9366,7 +9366,7 @@ static int routed_moe_launch(
         const uint32_t use_down_tile16 = use_atomic_down && expert_tile_m == 8u &&
             n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_DOWN_TILE16") == NULL;
         const uint32_t use_down_block16 = use_down_tile16 && midq_blocks <= 8u &&
-            getenv("DS4_CUDA_MOE_NO_DOWN_BLOCK16") == NULL;
+            getenv("DS4_CUDA_MOE_DOWN_BLOCK16") != NULL;
         const uint32_t use_decode_lut_gate =
             n_tokens == 1u && xq_blocks <= 16u &&
             getenv("DS4_CUDA_MOE_NO_DECODE_LUT_GATE") == NULL;
