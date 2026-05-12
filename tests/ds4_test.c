@@ -564,6 +564,52 @@ static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
 
+static void test_binary_relative_path_resolution(void) {
+    char old_cwd[PATH_MAX] = {0};
+    TEST_ASSERT(getcwd(old_cwd, sizeof(old_cwd)) != NULL);
+    if (!old_cwd[0]) return;
+
+    char *repo_makefile = ds4_resolve_existing_path("Makefile");
+    TEST_ASSERT(repo_makefile != NULL);
+    TEST_ASSERT(repo_makefile && access(repo_makefile, F_OK) == 0);
+    free(repo_makefile);
+
+    char tmp_template[] = "/tmp/ds4-path-test-XXXXXX";
+    char *tmpdir = mkdtemp(tmp_template);
+    TEST_ASSERT(tmpdir != NULL);
+    if (!tmpdir) return;
+    int rc = chdir(tmpdir);
+    TEST_ASSERT(rc == 0);
+    if (rc != 0) {
+        (void)rmdir(tmpdir);
+        return;
+    }
+
+    const char *local_name = "ds4-local-path-test";
+    int fd = open(local_name, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    TEST_ASSERT(fd >= 0);
+    if (fd >= 0) close(fd);
+
+    char *local = ds4_resolve_existing_path(local_name);
+    TEST_ASSERT(local != NULL);
+    TEST_ASSERT(local && strcmp(local, local_name) == 0);
+    free(local);
+
+    char *fallback = ds4_resolve_existing_path("Makefile");
+    TEST_ASSERT(fallback != NULL);
+    TEST_ASSERT(fallback && fallback[0] == '/');
+    TEST_ASSERT(fallback && access(fallback, F_OK) == 0);
+    free(fallback);
+
+    char *missing = ds4_resolve_existing_path("ds4-missing-path-test");
+    TEST_ASSERT(missing == NULL);
+    free(missing);
+
+    TEST_ASSERT(unlink(local_name) == 0);
+    TEST_ASSERT(chdir(old_cwd) == 0);
+    TEST_ASSERT(rmdir(tmpdir) == 0);
+}
+
 typedef void (*test_fn)(void);
 
 typedef struct {
@@ -581,6 +627,7 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_f16_matvec_fast_nr0_4},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
+    {"--paths", "paths", "binary-relative path resolution unit tests", test_binary_relative_path_resolution},
 };
 
 static void test_print_help(const char *prog) {

@@ -1238,24 +1238,28 @@ static NSString *ds4_gpu_full_source(void) {
         NSString *loaded = nil;
         NSString *loaded_path = nil;
         for (NSString *path in paths) {
-            if (![fm fileExistsAtPath:path]) continue;
+            char *resolved_path = ds4_resolve_existing_path([path UTF8String]);
+            if (!resolved_path) continue;
+            NSString *read_path = [NSString stringWithUTF8String:resolved_path];
+            free(resolved_path);
+            if (![fm fileExistsAtPath:read_path]) continue;
 
             NSError *error = nil;
-            loaded = [NSString stringWithContentsOfFile:path
+            loaded = [NSString stringWithContentsOfFile:read_path
                                                encoding:NSUTF8StringEncoding
                                                   error:&error];
             if (!loaded) {
                 fprintf(stderr, "ds4: failed to read Metal source %s: %s\n",
-                        [path UTF8String], [[error localizedDescription] UTF8String]);
+                        [read_path UTF8String], [[error localizedDescription] UTF8String]);
                 return nil;
             }
-            loaded_path = path;
+            loaded_path = read_path;
             break;
         }
 
         if (!loaded) {
             fprintf(stderr,
-                    "ds4: Metal source %s not found (set %s to override)\n",
+                    "ds4: Metal source %s not found relative to cwd or executable (set %s to override)\n",
                     [spec[1] UTF8String], [spec[0] UTF8String]);
             return nil;
         }

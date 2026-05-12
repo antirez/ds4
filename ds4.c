@@ -19,6 +19,7 @@
 #include <float.h>
 #include <inttypes.h>
 #include <ctype.h>
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -35,6 +36,10 @@
 #include <unistd.h>
 
 #include "ds4.h"
+
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
@@ -481,6 +486,87 @@ static char *ds4_strdup(const char *s) {
     char *p = xmalloc(n + 1);
     memcpy(p, s, n + 1);
     return p;
+}
+
+static bool ds4_path_is_absolute(const char *path) {
+    return path && path[0] == '/';
+}
+
+static char *ds4_executable_path(void) {
+#ifdef __APPLE__
+    uint32_t size = 0;
+    (void)_NSGetExecutablePath(NULL, &size);
+    if (size == 0) return NULL;
+    char *buf = xmalloc((size_t)size + 1);
+    if (_NSGetExecutablePath(buf, &size) != 0) {
+        free(buf);
+        return NULL;
+    }
+    buf[size] = '\0';
+    char *resolved = realpath(buf, NULL);
+    if (resolved) {
+        free(buf);
+        return resolved;
+    }
+    return buf;
+#elif defined(__linux__)
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+    char buf[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n <= 0 || (size_t)n >= sizeof(buf) - 1) return NULL;
+    buf[n] = '\0';
+    return ds4_strdup(buf);
+#else
+    return NULL;
+#endif
+}
+
+static char *ds4_dirname_dup(const char *path) {
+    if (!path || !path[0]) return NULL;
+    const char *slash = strrchr(path, '/');
+    if (!slash) return ds4_strdup(".");
+    size_t n = slash == path ? 1u : (size_t)(slash - path);
+    char *dir = xmalloc(n + 1);
+    memcpy(dir, path, n);
+    dir[n] = '\0';
+    return dir;
+}
+
+static char *ds4_join_path(const char *dir, const char *rel) {
+    size_t dir_len = strlen(dir);
+    size_t rel_len = strlen(rel);
+    bool need_slash = dir_len > 0 && dir[dir_len - 1] != '/';
+    if (dir_len > SIZE_MAX - rel_len - (need_slash ? 2u : 1u)) {
+        ds4_die("path length overflow");
+    }
+    char *out = xmalloc(dir_len + rel_len + (need_slash ? 2u : 1u));
+    memcpy(out, dir, dir_len);
+    size_t pos = dir_len;
+    if (need_slash) out[pos++] = '/';
+    memcpy(out + pos, rel, rel_len + 1);
+    return out;
+}
+
+char *ds4_resolve_existing_path(const char *path) {
+    if (!path || !path[0]) return NULL;
+    if (ds4_path_is_absolute(path)) {
+        return access(path, F_OK) == 0 ? ds4_strdup(path) : NULL;
+    }
+    if (access(path, F_OK) == 0) return ds4_strdup(path);
+
+    char *exe = ds4_executable_path();
+    if (!exe) return NULL;
+    char *dir = ds4_dirname_dup(exe);
+    free(exe);
+    if (!dir) return NULL;
+
+    char *candidate = ds4_join_path(dir, path);
+    free(dir);
+    if (access(candidate, F_OK) == 0) return candidate;
+    free(candidate);
+    return NULL;
 }
 
 static void *xrealloc(void *ptr, size_t size) {
@@ -1198,11 +1284,13 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     memset(m, 0, sizeof(*m));
     m->fd = -1;
 
-    int fd = open(path, O_RDONLY);
-    if (fd == -1) ds4_die_errno("cannot open model", path);
+    char *resolved_path = ds4_resolve_existing_path(path);
+    const char *open_path = resolved_path ? resolved_path : path;
+    int fd = open(open_path, O_RDONLY);
+    if (fd == -1) ds4_die_errno("cannot open model", open_path);
 
     struct stat st;
-    if (fstat(fd, &st) == -1) ds4_die_errno("cannot stat model", path);
+    if (fstat(fd, &st) == -1) ds4_die_errno("cannot stat model", open_path);
     if (st.st_size < 32) ds4_die("model file is too small to be GGUF");
 
     /*
@@ -1219,7 +1307,8 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
      */
     const int mmap_flags = metal_mapping ? MAP_SHARED : MAP_PRIVATE;
     void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, mmap_flags, fd, 0);
-    if (map == MAP_FAILED) ds4_die_errno("cannot mmap model", path);
+    if (map == MAP_FAILED) ds4_die_errno("cannot mmap model", open_path);
+    free(resolved_path);
 
     m->fd = fd;
     m->map = map;

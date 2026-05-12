@@ -100,6 +100,9 @@ ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size);
 ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size);
 bool ds4_log_is_tty(FILE *fp);
 void ds4_log(FILE *fp, ds4_log_type type, const char *fmt, ...);
+/* Return a malloc-owned existing path for PATH. Relative paths are resolved
+ * against the current directory first, then against the executable directory. */
+char *ds4_resolve_existing_path(const char *path);
 int ds4_engine_generate_argmax(ds4_engine *e, const ds4_tokens *prompt,
                                int n_predict, int ctx_size,
                                ds4_token_emit_fn emit,
