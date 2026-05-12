@@ -19,7 +19,11 @@ static ds4_engine *test_get_engine(bool quality) {
 
     ds4_engine_options opt = {
         .model_path = test_model_path(),
+#ifdef __APPLE__
         .backend = DS4_BACKEND_METAL,
+#else
+        .backend = DS4_BACKEND_CUDA,
+#endif
         .quality = quality,
     };
     TEST_ASSERT(ds4_engine_open(slot, &opt) == 0);
@@ -183,6 +187,206 @@ static int test_count_substr(const char *s, const char *needle) {
         p += n;
     }
     return count;
+}
+
+static void test_decode_profile_source(void) {
+    char *source = test_read_file("ds4.c");
+    TEST_ASSERT(source != NULL);
+    if (!source) return;
+
+    TEST_ASSERT(strstr(source, "DS4_GPU_DECODE_STAGE_PROFILE") != NULL);
+    TEST_ASSERT(strstr(source, "DS4_GPU_DECODE_STAGE_PROFILE_LIMIT") != NULL);
+    TEST_ASSERT(strstr(source, "gpu decode stage profile") != NULL);
+    TEST_ASSERT(strstr(source, "output_logits") != NULL);
+    TEST_ASSERT(strstr(source, "logits_readback") != NULL);
+
+    free(source);
+
+    /* CUDA event-based decode profile (handoff plan Task 2). The event path
+     * provides a low-overhead alternative to Nsight Compute and a check that
+     * the host stage profile is not skewed by Python/CPU scheduling. */
+    char *cuda_source = test_read_file("ds4_cuda.cu");
+    TEST_ASSERT(cuda_source != NULL);
+    if (!cuda_source) return;
+
+    TEST_ASSERT(strstr(cuda_source, "DS4_CUDA_DECODE_EVENT_PROFILE") != NULL);
+    TEST_ASSERT(strstr(cuda_source, "cudaEventCreate") != NULL);
+    TEST_ASSERT(strstr(cuda_source, "cudaEventRecord") != NULL);
+    TEST_ASSERT(strstr(cuda_source, "cudaEventElapsedTime") != NULL);
+    TEST_ASSERT(strstr(cuda_source, "CUDA decode event profile") != NULL);
+    TEST_ASSERT(strstr(cuda_source, "attention_ms_per_token") != NULL);
+    TEST_ASSERT(strstr(cuda_source, "moe_ms_per_token") != NULL);
+    TEST_ASSERT(strstr(cuda_source, "compressor_indexer_ms_per_token") != NULL);
+    TEST_ASSERT(strstr(cuda_source, "shared_ffn_ms_per_token") != NULL);
+    TEST_ASSERT(strstr(cuda_source, "output_logits_ms_per_token") != NULL);
+
+    free(cuda_source);
+}
+
+static void test_bench_spec_probe_source(void) {
+    char *source = test_read_file("ds4_bench.c");
+    TEST_ASSERT(source != NULL);
+    if (!source) return;
+
+    TEST_ASSERT(strstr(source, "--spec-probe") != NULL);
+    TEST_ASSERT(strstr(source, "spec_probe_prefix_retrieval") != NULL);
+    TEST_ASSERT(strstr(source, "effective_tps_upper") != NULL);
+
+    free(source);
+}
+
+static void test_bench_mtp_spec_source(void) {
+    char *source = test_read_file("ds4_bench.c");
+    TEST_ASSERT(source != NULL);
+    if (!source) return;
+
+    TEST_ASSERT(strstr(source, "--mtp") != NULL);
+    TEST_ASSERT(strstr(source, "--mtp-draft") != NULL);
+    TEST_ASSERT(strstr(source, "target_cycles_per_sec") != NULL);
+    TEST_ASSERT(strstr(source, "avg_accepted_per_cycle") != NULL);
+    TEST_ASSERT(strstr(source, "rollback_partial_rate") != NULL);
+    TEST_ASSERT(strstr(source, "mtp_exact_match") != NULL);
+    TEST_ASSERT(strstr(source, "DS4_MTP_RESTORE_DRAFT_FRONTIER") != NULL);
+    TEST_ASSERT(strstr(source, "MTP comparison") != NULL);
+    TEST_ASSERT(strstr(source, "prefill to %d failed") != NULL);
+    TEST_ASSERT(strstr(source, "ds4_session_invalidate(session)") != NULL);
+    TEST_ASSERT(strstr(source, "MTP comparison snapshot restore") != NULL);
+    TEST_ASSERT(strstr(source, "ds4_session_load_snapshot(session, &snap") != NULL);
+
+    free(source);
+
+    char *engine_source = test_read_file("ds4.c");
+    TEST_ASSERT(engine_source != NULL);
+    if (!engine_source) return;
+    TEST_ASSERT(strstr(engine_source, "DS4_MTP_NO_SESSION_SCRATCH") != NULL);
+    TEST_ASSERT(strstr(engine_source, "DS4_MTP_NO_MODEL_MAP") != NULL);
+    TEST_ASSERT(strstr(engine_source, "mtp_session_scratch") != NULL);
+    free(engine_source);
+}
+
+static void test_bench_exact_replay_source(void) {
+    char *source = test_read_file("ds4_bench.c");
+    TEST_ASSERT(source != NULL);
+    if (!source) return;
+
+    TEST_ASSERT(strstr(source, "--exact-replay-probe") != NULL);
+    TEST_ASSERT(strstr(source, "--exact-replay-fresh-session") != NULL);
+    TEST_ASSERT(strstr(source, "--exact-replay-snapshot") != NULL);
+    TEST_ASSERT(strstr(source, "--exact-replay-snapshot-fresh-session") != NULL);
+    TEST_ASSERT(strstr(source, "--exact-replay-runs") != NULL);
+    TEST_ASSERT(strstr(source, "--exact-replay-topk") != NULL);
+    TEST_ASSERT(strstr(source, "--exact-replay-forced-logit-diff") != NULL);
+    TEST_ASSERT(strstr(source, "--exact-replay-snapshot-roundtrip") != NULL);
+    TEST_ASSERT(strstr(source, "--exact-dump-prefix") != NULL);
+    TEST_ASSERT(strstr(source, "--replay-dump-prefix") != NULL);
+    TEST_ASSERT(strstr(source, "ds4_session_load_snapshot(run_session, &snap") != NULL);
+    TEST_ASSERT(strstr(source, "ds4_session_copy_logits") != NULL);
+    TEST_ASSERT(strstr(source, "forced_logit_diff") != NULL);
+    TEST_ASSERT(strstr(source, "first_drift_step") != NULL);
+    TEST_ASSERT(strstr(source, "snapshot_roundtrip_match") != NULL);
+    TEST_ASSERT(strstr(source, "bench_set_dump_prefix") != NULL);
+    TEST_ASSERT(strstr(source, "bench_decode_exact_tokens") != NULL);
+    TEST_ASSERT(strstr(source, "exact_replay_match") != NULL);
+    TEST_ASSERT(strstr(source, "exact_replay_runs_completed") != NULL);
+    TEST_ASSERT(strstr(source, "exact_replay_mismatch_top") != NULL);
+    TEST_ASSERT(strstr(source, "exact_replay_mismatch_overlap") != NULL);
+    TEST_ASSERT(strstr(source, "ds4_session_top_logprobs") != NULL);
+    TEST_ASSERT(strstr(source, "exact replay prefill") != NULL);
+    TEST_ASSERT(strstr(source, "exact replay may load MTP") != NULL);
+    TEST_ASSERT(strstr(source, "ds4_session_invalidate(session)") != NULL);
+    TEST_ASSERT(strstr(source, "replay_session") != NULL);
+
+    free(source);
+
+    char *engine_source = test_read_file("ds4.c");
+    TEST_ASSERT(engine_source != NULL);
+    if (!engine_source) return;
+    TEST_ASSERT(strstr(engine_source, "DS4_SNAPSHOT_RAW_LIVE_ALL") != NULL);
+    TEST_ASSERT(strstr(engine_source, "session_raw_live_rows") != NULL);
+    TEST_ASSERT(strstr(engine_source, "decode_indexer_topk") != NULL);
+    TEST_ASSERT(strstr(engine_source, "decode_attn_comp_cache") != NULL);
+    TEST_ASSERT(strstr(engine_source, "DS4_CUDA_ATTENTION_DOUBLE_RUN_DIFF") != NULL);
+    TEST_ASSERT(strstr(engine_source, "metal_graph_reset_mutable_state") != NULL);
+    TEST_ASSERT(strstr(engine_source, "layer_n_comp[il] = 0") != NULL);
+    TEST_ASSERT(strstr(engine_source, "layer_n_index_comp[il] = 0") != NULL);
+    free(engine_source);
+
+    char *cuda_source = test_read_file("ds4_cuda.cu");
+    TEST_ASSERT(cuda_source != NULL);
+    if (!cuda_source) return;
+    TEST_ASSERT(strstr(cuda_source, "DS4_CUDA_ZERO_TENSOR_ALLOC") != NULL);
+    TEST_ASSERT(strstr(cuda_source, "DS4_CUDA_ZERO_TMP_ALLOC") != NULL);
+    TEST_ASSERT(strstr(cuda_source, "cudaMemset") != NULL);
+    free(cuda_source);
+}
+
+/* Phase 0c microbench: measure GB10 memory-floor bandwidth at the working-set
+ * size of the routed MoE active gate+up weight reads (~26 MiB at decode), the
+ * full attention output_a+b (~71 MiB per layer), and a tiny 4 MiB working set
+ * for an L2-fitting comparison. Reports achieved GB/s so the caller can
+ * compare against the measured per-kernel bandwidths. Does not assert; it is
+ * a diagnostic, gated by an env flag so it doesn't run by default. */
+static void test_cuda_memfloor_bench(void) {
+    if (!getenv("DS4_TEST_MEMFLOOR")) {
+        fprintf(stderr, "ds4-test: memfloor-bench: skipped (set DS4_TEST_MEMFLOOR=1 to run)\n");
+        return;
+    }
+    /* Need an initialised CUDA context before microbenching; opening the fast
+     * engine handles that and lets us share whatever the bench tool would
+     * see at decode time. */
+    (void)test_get_engine(false);
+    const struct {
+        const char *label;
+        uint64_t bytes;
+        int iters;
+    } cases[] = {
+        {"4 MiB (fits L2)",          4ull * 1024ull * 1024ull,  500},
+        {"26 MiB (~MoE gate+up/token)", 26ull * 1024ull * 1024ull, 200},
+        {"71 MiB (~attn out/layer)", 71ull * 1024ull * 1024ull, 100},
+        {"512 MiB (DRAM steady)",    512ull * 1024ull * 1024ull, 20},
+    };
+    for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
+        double gbps = ds4_gpu_memfloor_bench(cases[i].bytes, cases[i].iters);
+        fprintf(stderr,
+                "ds4-test: memfloor-bench size=%s achieved_gbps=%.2f\n",
+                cases[i].label, gbps);
+        TEST_ASSERT(gbps > 0.0);
+    }
+}
+
+static void test_cuda_indexed_decode_heads8_source(void) {
+    char *source = test_read_file("ds4_cuda.cu");
+    TEST_ASSERT(source != NULL);
+    if (!source) return;
+
+    TEST_ASSERT(strstr(source, "DS4_CUDA_INDEXED_DECODE_HEADS8") != NULL);
+    TEST_ASSERT(strstr(source, "use_indexed_heads8") != NULL);
+    TEST_ASSERT(strstr(source, "DS4_CUDA_DETERMINISTIC_INDEXER") != NULL);
+    TEST_ASSERT(strstr(source, "cuda_deterministic_indexer") != NULL);
+    TEST_ASSERT(strstr(source, "DS4_CUDA_DETERMINISTIC_ATTENTION") != NULL);
+    TEST_ASSERT(strstr(source, "cuda_deterministic_attention") != NULL);
+    TEST_ASSERT(strstr(source, "DS4_CUDA_DETERMINISTIC_TOPK_RANK") != NULL);
+    TEST_ASSERT(strstr(source, "indexer_topk_rank_kernel") != NULL);
+
+    /* MoE bandwidth event profile (handoff plan Task 4). Aggregates gate_up
+     * and down kernel ms per decode token plus achieved GB/s using the
+     * already-known per-expert weight byte counts. */
+    TEST_ASSERT(strstr(source, "DS4_CUDA_MOE_EVENT_PROFILE") != NULL);
+    TEST_ASSERT(strstr(source, "CUDA moe event profile") != NULL);
+    TEST_ASSERT(strstr(source, "gate_up_ms_per_token") != NULL);
+    TEST_ASSERT(strstr(source, "down_ms_per_token") != NULL);
+    TEST_ASSERT(strstr(source, "achieved_gbps") != NULL);
+
+    /* Indexer / compressor event profile (handoff plan Task 5). Times the
+     * three kernel families that dominate the compressor_indexer stage at
+     * long context, gated to single-token decode invocations. */
+    TEST_ASSERT(strstr(source, "DS4_CUDA_INDEXER_EVENT_PROFILE") != NULL);
+    TEST_ASSERT(strstr(source, "CUDA indexer event profile") != NULL);
+    TEST_ASSERT(strstr(source, "compressor_ms_per_token") != NULL);
+    TEST_ASSERT(strstr(source, "indexer_scores_ms_per_token") != NULL);
+    TEST_ASSERT(strstr(source, "indexer_topk_ms_per_token") != NULL);
+
+    free(source);
 }
 
 static int test_hex_digit(char c) {
@@ -579,6 +783,12 @@ static const ds4_test_entry test_entries[] = {
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison", test_official_logprob_vectors},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_f16_matvec_fast_nr0_4},
+    {"--decode-profile-source", "decode-profile-source", "decode stage profile source hooks", test_decode_profile_source},
+    {"--bench-spec-probe-source", "bench-spec-probe-source", "benchmark speculation probe source hooks", test_bench_spec_probe_source},
+    {"--bench-mtp-spec-source", "bench-mtp-spec-source", "benchmark MTP speculation source hooks", test_bench_mtp_spec_source},
+    {"--bench-exact-replay-source", "bench-exact-replay-source", "benchmark exact replay source hooks", test_bench_exact_replay_source},
+    {"--cuda-indexed-decode-heads8-source", "cuda-indexed-decode-heads8-source", "CUDA indexed decode heads8 source hooks", test_cuda_indexed_decode_heads8_source},
+    {"--memfloor-bench", "memfloor-bench", "GB10 memory-floor bandwidth microbench (set DS4_TEST_MEMFLOOR=1)", test_cuda_memfloor_bench},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };

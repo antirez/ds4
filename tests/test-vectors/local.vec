@@ -1,0 +1,59 @@
+# ds4-local-logprob-vectors-v1
+# Regenerated from local model output, not the cloud API.
+# See tests/test-vectors/regen_local_vectors.py.
+# model: /home/cghart/ds4/gguf/fixed-imatrix-b0c3326/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
+# case <id> <ctx> <steps> <prompt-file>
+# step <index> <selected-hex> <top-count>
+# top <token-hex> <local-logprob>
+
+case short_italian_fact 16384 4 tests/test-vectors/prompts/short_italian_fact.txt
+step 0 416461 1
+top 416461 -0.000134553
+step 1 204c6f76 1
+top 204c6f76 -0.00013519
+step 2 656c 1
+top 656c -1.32571e-07
+step 3 616365 1
+top 616365 -1.12236e-06
+end
+
+case short_code_completion 4096 4 tests/test-vectors/prompts/short_code_completion.txt
+step 0 606060 1
+top 606060 -0.070714
+step 1 63 1
+top 63 -0.0288561
+step 2 0a 1
+top 0a -0.00119877
+step 3 72657475726e 1
+top 72657475726e -0.0130491
+end
+
+case short_reasoning_plain 4096 2 tests/test-vectors/prompts/short_reasoning_plain.txt
+step 0 3136 1
+top 3136 -0.034467
+step 1 3cefbd9c656e64e296816f66e2968173656e74656e6365efbd9c3e 1
+top 3cefbd9c656e64e296816f66e2968173656e74656e6365efbd9c3e -3.09022e-05
+end
+
+case long_memory_archive 16384 4 tests/test-vectors/prompts/long_memory_archive.txt
+step 0 4261736564 1
+top 4261736564 -0.191016
+step 1 206f6e 1
+top 206f6e -0.00187247
+step 2 20746865 1
+top 20746865 -0.000401578
+step 3 207265706561746564 1
+top 207265706561746564 -0.132042
+end
+
+case long_code_audit 16384 4 tests/test-vectors/prompts/long_code_audit.txt
+step 0 546865 1
+top 546865 -0.0182034
+step 1 206d6f7374 1
+top 206d6f7374 -0.000258019
+step 2 20696d706f7274616e74 1
+top 20696d706f7274616e74 -2.40986e-05
+step 3 20636f6465 1
+top 20636f6465 -1.78449e-06
+end
+

@@ -34,6 +34,42 @@ int ds4_gpu_flush_commands(void);
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
+/* Optional CUDA event-based decode profile. Activated by
+ * DS4_CUDA_DECODE_EVENT_PROFILE=1. All entry points are fast no-ops when the
+ * env flag is unset, so callers can leave the mark sites in place.
+ *
+ * Usage sketch:
+ *   if (ds4_gpu_decode_event_profile_enabled()) {
+ *       ds4_gpu_decode_event_profile_begin_token();
+ *   }
+ *   ... decode boundary calls: ds4_gpu_decode_event_profile_mark("name") ...
+ *   ds4_gpu_decode_event_profile_finish_token();
+ *
+ * The aggregate per-stage report prints once at process exit via atexit. */
+int  ds4_gpu_decode_event_profile_enabled(void);
+void ds4_gpu_decode_event_profile_begin_token(void);
+void ds4_gpu_decode_event_profile_mark(const char *stage);
+void ds4_gpu_decode_event_profile_finish_token(void);
+
+/* DS4_CUDA_ATTENTION_EVENT_PROFILE companion predicate. Sharing the same event
+ * pool as the decode profile, this flag turns on a per-attention-substage
+ * breakdown at exit (HC pre, attn pre-norm, q_proj, kv_proj,
+ * compressor_indexer, attn_kernel, output_proj, HC post). Either flag (or
+ * both) activates the event-record machinery. */
+int  ds4_gpu_attn_event_profile_enabled(void);
+
+/* Memory-floor microbench. Allocates an N-byte device buffer, fills it with a
+ * benign pattern, then runs `iterations` passes of a vectorized read kernel
+ * timed with cudaEvent. Returns achieved GB/s averaged across passes (so the
+ * caller can compare against the GB10 LPDDR5x peak of ~273 GB/s and the
+ * observed kernel-specific bandwidths). Returns -1.0 on any error. */
+double ds4_gpu_memfloor_bench(uint64_t bytes, int iterations);
+
+/* Host-side NaN/Inf probe for a float tensor. No-op unless DS4_MTP_NAN_PROBE
+ * is set (forces a device sync + readback, only intended for one-shot
+ * debugging). Returns 1 on success, 0 on alloc/copy failure. */
+int ds4_gpu_check_nan(const ds4_gpu_tensor *t, uint64_t n_f32, const char *label);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
@@ -135,6 +171,22 @@ int ds4_gpu_matmul_q8_0_tensor(
         uint64_t                weight_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
+/* Fused pair variant: pre-quantizes x once and dispatches two q8_0 matmuls
+ * sharing that quantized input. out0_dim and out1_dim may differ. Falls back
+ * to two sequential ds4_gpu_matmul_q8_0_tensor calls when n_tok != 1. */
+int ds4_gpu_matmul_q8_0_pair_tensor(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *out1,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight0_offset,
+        uint64_t                weight1_offset,
+        uint64_t                in_dim,
+        uint64_t                out0_dim,
+        uint64_t                out1_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
@@ -549,6 +601,26 @@ int ds4_gpu_attention_output_low_q8_tensor(
         uint64_t                rank,
         uint32_t                n_groups,
         const ds4_gpu_tensor *heads);
+
+/* Fused attn_output_a + attn_output_b + HC expand for decode (n_tok=1).
+ * Skips materializing the float `low` intermediate; produces Q8_0 layout in
+ * shared scratch and feeds it directly to the hc_expand matmul. */
+int ds4_gpu_attention_output_q8_fused_hc_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *attn_out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
 
 /* =========================================================================
  * Router, Shared Expert, and Routed MoE.

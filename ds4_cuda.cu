@@ -37,6 +37,18 @@ typedef struct {
     uint16_t dmin;
 } cuda_block_q2_K;
 
+/* Q4_K: 256 weights as 4-bit quants across 8 sub-blocks of 32, with packed
+ * 6-bit per-sub-block scale+min (encoded in 12 bytes). 144 bytes per block.
+ * This mirrors block_q4_K in ds4.c which mirrors the canonical GGUF Q4_K
+ * layout from llama.cpp / ggml. Needed for the DSv4-Flash MTP draft head
+ * gguf which stores routed experts as Q4_K. */
+typedef struct {
+    uint16_t d;            /* fp16 main scale */
+    uint16_t dmin;         /* fp16 min */
+    uint8_t  scales[12];   /* packed sub-block scales+mins (6 bits each) */
+    uint8_t  qs[CUDA_QK_K / 2];   /* 128 bytes: 256 4-bit quants */
+} cuda_block_q4_K;
+
 typedef struct {
     float d;
     int8_t qs[CUDA_QK_K];
@@ -58,12 +70,26 @@ static int g_model_device_owned;
 static int g_model_range_mapping_supported = 1;
 static int g_model_hmm_direct;
 static int g_model_fd = -1;
+/* Host map that g_model_fd corresponds to. The fd-backed cache uses
+ * pread(g_model_fd, ...) at the requested offset. When the active model
+ * map switches (e.g. an MTP head gguf is registered after the base
+ * model), the fd is NOT automatically swapped — and reading from the
+ * wrong file at MTP offsets would silently return garbage. This pointer
+ * lets cuda_model_range_ptr_from_fd verify that the requested model_map
+ * matches what g_model_fd was set up for, and bail out otherwise so the
+ * caller falls through to the host-pointer / cudaHostRegister path. */
+static const void *g_model_fd_host_base;
 static int g_model_direct_fd = -1;
 static uint64_t g_model_direct_align = 1;
 static uint64_t g_model_file_size;
 static int g_model_cache_full;
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
+/* Toggled at engine init: 1 when DS4_MTP_NAN_PROBE is set in the environment,
+ * 0 otherwise. Used by the device-side one-shot diagnostic in
+ * q8_K_quantize_kernel. Kept as a __device__ int (not a host getenv read
+ * inside the kernel — getenv is host-only) so it costs zero outside debug. */
+__device__ static int g_q8k_nan_probe_enabled = 0;
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 static int g_quality_mode;
@@ -146,7 +172,13 @@ __global__ static void dequant_q8_0_to_f32_kernel(
 
 static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
-    if (g_cuda_tmp_bytes >= bytes) return g_cuda_tmp;
+    if (g_cuda_tmp_bytes >= bytes) {
+        if (getenv("DS4_CUDA_ZERO_TMP_ALLOC") != NULL &&
+            !cuda_ok(cudaMemset(g_cuda_tmp, 0, (size_t)bytes), "temp scratch zero")) {
+            return NULL;
+        }
+        return g_cuda_tmp;
+    }
     if (g_cuda_tmp) {
         (void)cudaFree(g_cuda_tmp);
         g_cuda_tmp = NULL;
@@ -162,7 +194,22 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     }
     g_cuda_tmp = ptr;
     g_cuda_tmp_bytes = bytes;
+    if (getenv("DS4_CUDA_ZERO_TMP_ALLOC") != NULL &&
+        !cuda_ok(cudaMemset(g_cuda_tmp, 0, (size_t)bytes), "temp scratch zero")) {
+        (void)cudaFree(g_cuda_tmp);
+        g_cuda_tmp = NULL;
+        g_cuda_tmp_bytes = 0;
+        return NULL;
+    }
     return g_cuda_tmp;
+}
+
+static int cuda_deterministic_indexer(void) {
+    return getenv("DS4_CUDA_DETERMINISTIC_INDEXER") != NULL;
+}
+
+static int cuda_deterministic_attention(void) {
+    return getenv("DS4_CUDA_DETERMINISTIC_ATTENTION") != NULL;
 }
 
 static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
@@ -835,6 +882,22 @@ static const char *cuda_model_range_ptr_from_fd(
         uint64_t bytes,
         const char *what) {
     if (g_model_fd < 0 || bytes == 0) return NULL;
+    /* The fd-cache reads from g_model_fd at the requested file offset. That
+     * is only correct when model_map points at the same file g_model_fd was
+     * opened from. With both a base model and an MTP head loaded, the
+     * caller of this function may pass either map; reading the wrong map's
+     * offsets from the wrong fd silently returns garbage and breaks the
+     * MTP draft path. Bail out so the caller falls through to the
+     * host-pointer / cudaHostRegister code path. */
+    if (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base) {
+        if (getenv("DS4_MTP_FDCACHE_DBG") != NULL) {
+            fprintf(stderr, "ds4: fdcache_bypass map=%p fd_base=%p offset=%llu bytes=%llu what=%s\n",
+                    model_map, g_model_fd_host_base,
+                    (unsigned long long)offset, (unsigned long long)bytes,
+                    what ? what : "?");
+        }
+        return NULL;
+    }
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
         if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
@@ -1037,11 +1100,31 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
 
 extern "C" int ds4_gpu_init(void) {
     int dev = 0;
+    /* Phase 0a: pin the device scheduling mode before the first context-using
+     * call. llama.cpp commit 5acd455 reported improved Blackwell decode by
+     * forcing spin instead of the runtime default (often Auto, which can pick
+     * Block on busy systems). The host thread polls between kernel completions,
+     * eliminating the syscall round-trip latency in launch chains. The flag
+     * must be set before the device context exists, so this is the first
+     * substantive call in ds4_gpu_init. Disable via DS4_CUDA_NO_SPIN_SCHEDULE
+     * if it ever regresses on a future driver/runtime. */
+    if (getenv("DS4_CUDA_NO_SPIN_SCHEDULE") == NULL) {
+        cudaError_t flag_err = cudaSetDeviceFlags(cudaDeviceScheduleSpin);
+        if (flag_err != cudaSuccess && flag_err != cudaErrorSetOnActiveProcess) {
+            (void)cuda_ok(flag_err, "set device flags spin");
+        }
+    }
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
         fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d)\n",
                 prop.name, prop.major, prop.minor);
+    }
+    /* Mirror DS4_MTP_NAN_PROBE into a __device__ flag so the q8_K quantize
+     * diagnostic stays silent unless explicitly enabled. */
+    {
+        int probe = getenv("DS4_MTP_NAN_PROBE") != NULL ? 1 : 0;
+        (void)cudaMemcpyToSymbol(g_q8k_nan_probe_enabled, &probe, sizeof(probe));
     }
     if (!g_cublas_ready) {
         if (!cublas_ok(cublasCreate(&g_cublas), "create handle")) return 0;
@@ -1131,6 +1214,12 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
         free(t);
         return NULL;
     }
+    if (getenv("DS4_CUDA_ZERO_TENSOR_ALLOC") != NULL &&
+        !cuda_ok(cudaMemset(t->ptr, 0, (size_t)bytes), "tensor alloc zero")) {
+        (void)cudaFree(t->ptr);
+        free(t);
+        return NULL;
+    }
     t->bytes = bytes;
     t->owner = 1;
     return t;
@@ -1187,10 +1276,657 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                    "tensor copy");
 }
 
+/* =========================================================================
+ * Memory-floor microbench (Phase 0c).
+ *
+ * Measures the achievable read bandwidth on a benign vectorized pattern over
+ * a buffer sized to roughly match the routed-MoE active weight read per
+ * decode token. Used to calibrate whether the observed routed_moe 115 GB/s
+ * is at the LPDDR5x wall (close to memfloor) or has compute/pattern
+ * headroom (memfloor much higher).
+ * ========================================================================= */
+
+__global__ static void memfloor_read_kernel(const uint4 *src, uint64_t count4,
+                                              uint32_t *sink) {
+    const uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    uint4 acc = make_uint4(0u, 0u, 0u, 0u);
+    for (uint64_t i = tid; i < count4; i += stride) {
+        uint4 v = src[i];
+        acc.x ^= v.x; acc.y ^= v.y; acc.z ^= v.z; acc.w ^= v.w;
+    }
+    /* Sentinel write guards against the compiler optimising the loads away.
+     * The XOR accumulator can only equal this specific value if the inputs
+     * collude, which they will not on real data. */
+    if (acc.x == 0xDEADBEEFu && acc.y == 0xBADC0FFEu &&
+        acc.z == 0xCAFEBABEu && acc.w == 0xFEEDFACEu) {
+        sink[tid & 1023u] = acc.x ^ acc.y ^ acc.z ^ acc.w;
+    }
+}
+
+extern "C" double ds4_gpu_memfloor_bench(uint64_t bytes, int iterations) {
+    if (bytes < 4096 || iterations <= 0) return -1.0;
+    /* Round bytes down to a multiple of sizeof(uint4) so the kernel can do
+     * pure 16-byte loads. */
+    bytes &= ~((uint64_t)sizeof(uint4) - 1ull);
+    void *d_src = NULL;
+    uint32_t *d_sink = NULL;
+    if (cudaMalloc(&d_src, bytes) != cudaSuccess) return -1.0;
+    if (cudaMalloc(&d_sink, 1024 * sizeof(uint32_t)) != cudaSuccess) {
+        cudaFree(d_src);
+        return -1.0;
+    }
+    /* Fill with a non-collusive pattern; the actual values do not matter for
+     * bandwidth, only that the loads are not eliminated. */
+    (void)cudaMemset(d_src, 0xa5, bytes);
+    (void)cudaMemset(d_sink, 0, 1024 * sizeof(uint32_t));
+    /* Warm-up so the first timed pass does not include any cold-cache or
+     * driver-side allocation overhead. */
+    const uint64_t count4 = bytes / sizeof(uint4);
+    const int threads = 256;
+    /* Cap grid so each block does meaningful work; matches what a tuned
+     * memory-streaming kernel would launch on GB10's ~60 SMs. */
+    int blocks = (int)((count4 + threads - 1) / threads);
+    if (blocks > 4096) blocks = 4096;
+    memfloor_read_kernel<<<blocks, threads>>>((const uint4 *)d_src, count4, d_sink);
+    if (!cuda_ok(cudaDeviceSynchronize(), "memfloor warmup")) {
+        cudaFree(d_src); cudaFree(d_sink);
+        return -1.0;
+    }
+    cudaEvent_t e0, e1;
+    if (cudaEventCreate(&e0) != cudaSuccess) { cudaFree(d_src); cudaFree(d_sink); return -1.0; }
+    if (cudaEventCreate(&e1) != cudaSuccess) { cudaEventDestroy(e0); cudaFree(d_src); cudaFree(d_sink); return -1.0; }
+    cudaEventRecord(e0, 0);
+    for (int i = 0; i < iterations; i++) {
+        memfloor_read_kernel<<<blocks, threads>>>((const uint4 *)d_src, count4, d_sink);
+    }
+    cudaEventRecord(e1, 0);
+    cudaEventSynchronize(e1);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, e0, e1);
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    cudaFree(d_src);
+    cudaFree(d_sink);
+    if (ms <= 0.0f) return -1.0;
+    const double total_bytes = (double)bytes * (double)iterations;
+    const double gbps = (total_bytes / 1.0e9) / (ms / 1000.0);
+    return gbps;
+}
+
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 extern "C" int ds4_gpu_end_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "end commands"); }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
+
+/* =========================================================================
+ * DS4_CUDA_DECODE_EVENT_PROFILE — CUDA event-based per-stage decode profile.
+ *
+ * The host-side gpu_decode_stage_profile already exists in ds4.c but forces a
+ * host sync at every boundary (via ds4_gpu_end_commands) to wall-clock the
+ * stage. That makes it useful for accounting but unsafe as a lightweight
+ * confirmation signal: the act of measuring perturbs the schedule.
+ *
+ * The event profile here records cudaEvent timestamps at the same boundary
+ * sites without forcing a sync per boundary. One sync happens at end-of-token
+ * (which the logits readback already does), and we walk the recorded events
+ * with cudaEventElapsedTime to attribute GPU time per stage.
+ *
+ * Activation: DS4_CUDA_DECODE_EVENT_PROFILE=1 (anything truthy non-"0").
+ *
+ * Aggregate line at exit, e.g.:
+ *   ds4: CUDA decode event profile tokens=16 attention_ms_per_token=34.30
+ *        moe_ms_per_token=17.36 compressor_indexer_ms_per_token=10.51
+ *        shared_ffn_ms_per_token=9.59 output_logits_ms_per_token=2.51
+ *        other_ms_per_token=0.02 total_ms_per_token=71.99
+ *
+ * DS4_CUDA_ATTENTION_EVENT_PROFILE=1 reuses the same per-mark events to emit a
+ * second aggregate line that breaks the attention section into named
+ * substages (HC pre + plain RMS, attention pre-norm + Q LoRA, Q proj path,
+ * KV proj path, compressor+indexer, fused attention kernel, output proj,
+ * HC post). Either flag (or both) activates the event-record machinery; each
+ * flag is reported independently at exit.
+ *
+ * The fused attention kernel ("attention" mark) covers KV-from-compressed
+ * expand, scores + softmax, and V apply in one host call, so those three
+ * substages share the same bucket here; further splitting requires
+ * kernel-internal cuda_event_record points.
+ * ========================================================================= */
+
+namespace {
+
+constexpr int kEventProfileMaxMarksPerToken = 1024;
+
+enum DecodeEventGroup {
+    DECODE_EVENT_GROUP_ATTENTION = 0,
+    DECODE_EVENT_GROUP_MOE,
+    DECODE_EVENT_GROUP_COMPRESSOR_INDEXER,
+    DECODE_EVENT_GROUP_SHARED_FFN,
+    DECODE_EVENT_GROUP_OUTPUT_LOGITS,
+    DECODE_EVENT_GROUP_OTHER,
+    DECODE_EVENT_GROUP_COUNT,
+};
+
+/* Currently the per-group label appears inline in the report format string;
+ * this helper stays defined for future per-group iteration uses. */
+static DS4_CUDA_UNUSED const char *decode_event_group_name(int g) {
+    switch (g) {
+        case DECODE_EVENT_GROUP_ATTENTION:          return "attention";
+        case DECODE_EVENT_GROUP_MOE:                return "moe";
+        case DECODE_EVENT_GROUP_COMPRESSOR_INDEXER: return "compressor_indexer";
+        case DECODE_EVENT_GROUP_SHARED_FFN:         return "shared_ffn";
+        case DECODE_EVENT_GROUP_OUTPUT_LOGITS:      return "output_logits";
+        default:                                    return "other";
+    }
+}
+
+/* Mirrors gpu_decode_stage_profile_group() in ds4.c so the event profile and
+ * the host profile agree on which stage rolls into which headline group. */
+static int decode_event_group_for(const char *stage) {
+    if (!stage) return DECODE_EVENT_GROUP_OTHER;
+    if (!strcmp(stage, "compressor_indexer")) return DECODE_EVENT_GROUP_COMPRESSOR_INDEXER;
+    if (!strcmp(stage, "routed_moe") || !strcmp(stage, "router")) return DECODE_EVENT_GROUP_MOE;
+    if (!strcmp(stage, "shared_gate_up") || !strcmp(stage, "shared_down") ||
+        !strcmp(stage, "ffn_hc_pre") || !strcmp(stage, "ffn_norm") ||
+        !strcmp(stage, "ffn_hc_post")) {
+        return DECODE_EVENT_GROUP_SHARED_FFN;
+    }
+    if (!strcmp(stage, "output_hc") || !strcmp(stage, "output_norm") ||
+        !strcmp(stage, "output_logits") || !strcmp(stage, "logits_readback")) {
+        return DECODE_EVENT_GROUP_OUTPUT_LOGITS;
+    }
+    if (strstr(stage, "attn") || !strcmp(stage, "q_path") ||
+        !strcmp(stage, "kv_path") || !strcmp(stage, "attention")) {
+        return DECODE_EVENT_GROUP_ATTENTION;
+    }
+    return DECODE_EVENT_GROUP_OTHER;
+}
+
+/* Substage buckets for the DS4_CUDA_ATTENTION_EVENT_PROFILE breakdown. The
+ * fused attention kernel collapses {KV-from-compressed expand, scores+softmax,
+ * V apply} into the single ATTN_BUCKET_KERNEL bucket; kernel-internal events
+ * would be needed to split further. */
+enum AttnEventBucket {
+    ATTN_BUCKET_HC_PRE = 0,
+    ATTN_BUCKET_PRE_NORM,        /* attn_norm boundary: q_a + q_a_norm */
+    ATTN_BUCKET_Q_PROJ,          /* q_path boundary: q_b + head_rms + Q RoPE */
+    ATTN_BUCKET_KV_PROJ,         /* kv_path boundary: kv + kv_norm + KV RoPE + raw store */
+    ATTN_BUCKET_COMPRESSOR_INDEXER, /* compressor write + indexer score/topk */
+    ATTN_BUCKET_KERNEL,          /* fused attention kernel (expand + scores+softmax + V) */
+    ATTN_BUCKET_OUTPUT_PROJ,     /* inverse RoPE + attn_output_a + attn_output_b */
+    ATTN_BUCKET_HC_POST,         /* HC expand after attention */
+    ATTN_BUCKET_COUNT,
+};
+
+static const char *attn_event_bucket_label(int b) {
+    switch (b) {
+        case ATTN_BUCKET_HC_PRE:             return "attn_hc_pre";
+        case ATTN_BUCKET_PRE_NORM:           return "attn_pre_norm";
+        case ATTN_BUCKET_Q_PROJ:             return "q_proj";
+        case ATTN_BUCKET_KV_PROJ:            return "kv_proj";
+        case ATTN_BUCKET_COMPRESSOR_INDEXER: return "compressor_indexer";
+        case ATTN_BUCKET_KERNEL:             return "attn_kernel";
+        case ATTN_BUCKET_OUTPUT_PROJ:        return "output_proj";
+        case ATTN_BUCKET_HC_POST:            return "attn_hc_post";
+        default:                             return "other";
+    }
+}
+
+static int attn_event_bucket_for(const char *stage) {
+    if (!stage) return -1;
+    if (!strcmp(stage, "attn_hc_pre"))        return ATTN_BUCKET_HC_PRE;
+    if (!strcmp(stage, "attn_norm"))          return ATTN_BUCKET_PRE_NORM;
+    if (!strcmp(stage, "q_path"))             return ATTN_BUCKET_Q_PROJ;
+    if (!strcmp(stage, "kv_path"))            return ATTN_BUCKET_KV_PROJ;
+    if (!strcmp(stage, "compressor_indexer")) return ATTN_BUCKET_COMPRESSOR_INDEXER;
+    if (!strcmp(stage, "attention"))          return ATTN_BUCKET_KERNEL;
+    if (!strcmp(stage, "attn_output"))        return ATTN_BUCKET_OUTPUT_PROJ;
+    if (!strcmp(stage, "attn_hc_post"))       return ATTN_BUCKET_HC_POST;
+    return -1;
+}
+
+struct DecodeEventProfileState {
+    int             decode_enabled;   /* -1 = not yet checked, 0 = off, 1 = on */
+    int             attn_enabled;     /* DS4_CUDA_ATTENTION_EVENT_PROFILE */
+    int             initialized;      /* events allocated */
+    int             decode_atexit_registered;
+    int             attn_atexit_registered;
+    int             token_active;     /* between begin_token and finish_token */
+    int             mark_count;       /* events recorded in current token */
+    cudaEvent_t     events[kEventProfileMaxMarksPerToken];
+    const char     *stage_names[kEventProfileMaxMarksPerToken];
+    double          group_ms[DECODE_EVENT_GROUP_COUNT];
+    double          attn_bucket_ms[ATTN_BUCKET_COUNT];
+    double          total_token_ms;
+    uint64_t        token_count;
+    uint64_t        dropped_marks;
+};
+
+static DecodeEventProfileState g_decode_event_profile = {
+    -1, -1, 0, 0, 0, 0, 0, {}, {},
+    {0.0,0.0,0.0,0.0,0.0,0.0},
+    {0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0},
+    0.0, 0, 0
+};
+
+static void decode_event_profile_report(void) {
+    DecodeEventProfileState &s = g_decode_event_profile;
+    if (!s.token_count || s.decode_enabled != 1) return;
+    const double inv = 1.0 / (double)s.token_count;
+    fprintf(stderr,
+            "ds4: CUDA decode event profile tokens=%llu "
+            "attention_ms_per_token=%.3f moe_ms_per_token=%.3f "
+            "compressor_indexer_ms_per_token=%.3f shared_ffn_ms_per_token=%.3f "
+            "output_logits_ms_per_token=%.3f other_ms_per_token=%.3f "
+            "total_ms_per_token=%.3f dropped_marks=%llu\n",
+            (unsigned long long)s.token_count,
+            s.group_ms[DECODE_EVENT_GROUP_ATTENTION] * inv,
+            s.group_ms[DECODE_EVENT_GROUP_MOE] * inv,
+            s.group_ms[DECODE_EVENT_GROUP_COMPRESSOR_INDEXER] * inv,
+            s.group_ms[DECODE_EVENT_GROUP_SHARED_FFN] * inv,
+            s.group_ms[DECODE_EVENT_GROUP_OUTPUT_LOGITS] * inv,
+            s.group_ms[DECODE_EVENT_GROUP_OTHER] * inv,
+            s.total_token_ms * inv,
+            (unsigned long long)s.dropped_marks);
+}
+
+static void attn_event_profile_report(void) {
+    DecodeEventProfileState &s = g_decode_event_profile;
+    if (!s.token_count || s.attn_enabled != 1) return;
+    const double inv = 1.0 / (double)s.token_count;
+    double attn_total_ms = 0.0;
+    for (int i = 0; i < ATTN_BUCKET_COUNT; i++) attn_total_ms += s.attn_bucket_ms[i];
+    fprintf(stderr,
+            "ds4: CUDA attention event profile tokens=%llu "
+            "attn_hc_pre_ms_per_token=%.3f attn_pre_norm_ms_per_token=%.3f "
+            "q_proj_ms_per_token=%.3f kv_proj_ms_per_token=%.3f "
+            "compressor_indexer_ms_per_token=%.3f attn_kernel_ms_per_token=%.3f "
+            "output_proj_ms_per_token=%.3f attn_hc_post_ms_per_token=%.3f "
+            "attn_total_ms_per_token=%.3f\n",
+            (unsigned long long)s.token_count,
+            s.attn_bucket_ms[ATTN_BUCKET_HC_PRE]             * inv,
+            s.attn_bucket_ms[ATTN_BUCKET_PRE_NORM]           * inv,
+            s.attn_bucket_ms[ATTN_BUCKET_Q_PROJ]             * inv,
+            s.attn_bucket_ms[ATTN_BUCKET_KV_PROJ]            * inv,
+            s.attn_bucket_ms[ATTN_BUCKET_COMPRESSOR_INDEXER] * inv,
+            s.attn_bucket_ms[ATTN_BUCKET_KERNEL]             * inv,
+            s.attn_bucket_ms[ATTN_BUCKET_OUTPUT_PROJ]        * inv,
+            s.attn_bucket_ms[ATTN_BUCKET_HC_POST]            * inv,
+            attn_total_ms * inv);
+    /* Currently the labels are emitted inline in the format string; this helper
+     * stays defined for follow-up per-bucket iteration. */
+    (void)attn_event_bucket_label;
+}
+
+static int decode_event_profile_init(void) {
+    DecodeEventProfileState &s = g_decode_event_profile;
+    if (s.initialized) return 1;
+    for (int i = 0; i < kEventProfileMaxMarksPerToken; i++) {
+        if (!cuda_ok(cudaEventCreate(&s.events[i]), "decode event profile create")) {
+            /* Roll back any successfully created events to avoid a partial pool. */
+            for (int j = 0; j < i; j++) {
+                (void)cudaEventDestroy(s.events[j]);
+                s.events[j] = NULL;
+            }
+            s.decode_enabled = 0;
+            s.attn_enabled = 0;
+            return 0;
+        }
+    }
+    s.initialized = 1;
+    if (s.decode_enabled == 1 && !s.decode_atexit_registered) {
+        atexit(decode_event_profile_report);
+        s.decode_atexit_registered = 1;
+    }
+    if (s.attn_enabled == 1 && !s.attn_atexit_registered) {
+        atexit(attn_event_profile_report);
+        s.attn_atexit_registered = 1;
+    }
+    return 1;
+}
+
+} /* namespace */
+
+static int attn_event_profile_env_enabled(void) {
+    DecodeEventProfileState &s = g_decode_event_profile;
+    if (s.attn_enabled < 0) {
+        const char *env = getenv("DS4_CUDA_ATTENTION_EVENT_PROFILE");
+        s.attn_enabled = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return s.attn_enabled;
+}
+
+extern "C" int ds4_gpu_decode_event_profile_enabled(void) {
+    DecodeEventProfileState &s = g_decode_event_profile;
+    if (s.decode_enabled < 0) {
+        const char *env = getenv("DS4_CUDA_DECODE_EVENT_PROFILE");
+        s.decode_enabled = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    /* Either flag activates the event-record machinery; each is reported
+     * independently at exit. Evaluate both predicates unconditionally so the
+     * attn-enabled cache is primed even when decode is already on (otherwise
+     * the || short-circuits and decode_event_profile_init never registers the
+     * attn atexit). */
+    const int attn_on = attn_event_profile_env_enabled();
+    return s.decode_enabled || attn_on;
+}
+
+extern "C" int ds4_gpu_attn_event_profile_enabled(void) {
+    return attn_event_profile_env_enabled();
+}
+
+extern "C" void ds4_gpu_decode_event_profile_begin_token(void) {
+    if (!ds4_gpu_decode_event_profile_enabled()) return;
+    if (!decode_event_profile_init()) return;
+    DecodeEventProfileState &s = g_decode_event_profile;
+    s.mark_count = 0;
+    s.token_active = 1;
+    /* The first event marks the start of the token. Subsequent marks measure
+     * the GPU time since the prior event. */
+    if (cuda_ok(cudaEventRecord(s.events[0], 0), "decode event profile record begin")) {
+        s.stage_names[0] = NULL; /* sentinel: not a stage boundary */
+        s.mark_count = 1;
+    }
+}
+
+extern "C" void ds4_gpu_decode_event_profile_mark(const char *stage) {
+    DecodeEventProfileState &s = g_decode_event_profile;
+    if (!s.token_active) return; /* fast-path for disabled */
+    if (s.mark_count >= kEventProfileMaxMarksPerToken) {
+        s.dropped_marks++;
+        return;
+    }
+    cudaEvent_t ev = s.events[s.mark_count];
+    if (!cuda_ok(cudaEventRecord(ev, 0), "decode event profile record mark")) return;
+    s.stage_names[s.mark_count] = stage; /* string literal: stable pointer */
+    s.mark_count++;
+}
+
+extern "C" void ds4_gpu_decode_event_profile_finish_token(void) {
+    DecodeEventProfileState &s = g_decode_event_profile;
+    if (!s.token_active) return;
+    s.token_active = 0;
+    if (s.mark_count < 2) return; /* nothing to attribute */
+    /* The caller normally just performed a logits readback which forced a
+     * device sync, so the events should already be complete. Sync defensively
+     * so cudaEventElapsedTime never spins. */
+    (void)cudaEventSynchronize(s.events[s.mark_count - 1]);
+    const int want_attn = s.attn_enabled == 1;
+    double token_ms = 0.0;
+    for (int i = 1; i < s.mark_count; i++) {
+        float elapsed = 0.0f;
+        cudaError_t err = cudaEventElapsedTime(&elapsed,
+                                                s.events[i - 1],
+                                                s.events[i]);
+        if (err != cudaSuccess) continue;
+        if (elapsed < 0.0f) elapsed = 0.0f;
+        const int group = decode_event_group_for(s.stage_names[i]);
+        s.group_ms[group] += (double)elapsed;
+        token_ms += (double)elapsed;
+        if (want_attn) {
+            const int bucket = attn_event_bucket_for(s.stage_names[i]);
+            if (bucket >= 0) s.attn_bucket_ms[bucket] += (double)elapsed;
+        }
+    }
+    s.total_token_ms += token_ms;
+    s.token_count++;
+}
+
+/* =========================================================================
+ * DS4_CUDA_MOE_EVENT_PROFILE — routed-MoE bandwidth aggregator (Task 4).
+ *
+ * Sums per-call gate_up and down kernel times across all routed_moe
+ * invocations during a session, plus the weight bytes those calls touch.
+ * Reports one aggregate line at process exit with achieved GB/s for the
+ * MoE gate_up+down weight traffic. Designed for the n_tokens=1 decode case
+ * where the per-token MoE cost is what we care about for the path to 20 tok/s.
+ *
+ * Activation: DS4_CUDA_MOE_EVENT_PROFILE=1.
+ *
+ * The existing DS4_CUDA_MOE_PROFILE remains unchanged and prints one line per
+ * call; the event profile shares its CUDA events so enabling either creates
+ * the events, but the event profile produces only one aggregate line.
+ * ========================================================================= */
+
+namespace {
+
+struct MoeEventProfileState {
+    int      enabled;
+    int      atexit_registered;
+    uint64_t calls;
+    uint64_t total_n_tokens;
+    double   gate_up_ms;
+    double   down_ms;
+    double   sort_ms;
+    double   xq_ms;
+    double   midq_ms;
+    double   sum_ms;
+    double   total_ms;
+    uint64_t gate_up_bytes;
+    uint64_t down_bytes;
+};
+
+static MoeEventProfileState g_moe_event_profile = {-1, 0, 0, 0,
+                                                    0.0, 0.0, 0.0,
+                                                    0.0, 0.0, 0.0, 0.0,
+                                                    0, 0};
+
+static void moe_event_profile_report(void) {
+    MoeEventProfileState &s = g_moe_event_profile;
+    if (!s.calls) return;
+    /* Decode tokens, if known. The decode event profile (separate flag) tracks
+     * actual decode tokens. When it is also enabled we divide by decode tokens
+     * to report per-token numbers; otherwise we divide by MoE invocations
+     * (one per MoE-bearing layer per decode token), which lets the caller
+     * multiply by their model's layer count to recover per-token. The format
+     * string keeps the literal `gate_up_ms_per_token` etc. so downstream
+     * grep-style consumers and source-hook tests find them either way. */
+    const uint64_t decode_tokens = g_decode_event_profile.token_count;
+    const double divisor = decode_tokens ? (double)decode_tokens : (double)s.calls;
+    const char *unit = decode_tokens ? "decode_token" : "moe_call";
+    const double inv = 1.0 / divisor;
+    const double total_weight_gb = (double)(s.gate_up_bytes + s.down_bytes) / 1.0e9;
+    const double total_seconds = s.total_ms / 1000.0;
+    const double achieved_gbps = total_seconds > 0.0 ? total_weight_gb / total_seconds : 0.0;
+    fprintf(stderr,
+            "ds4: CUDA moe event profile tokens=%llu calls=%llu unit=%s "
+            "gate_up_ms_per_token=%.3f down_ms_per_token=%.3f "
+            "sort_ms_per_token=%.3f xq_ms_per_token=%.3f "
+            "midq_ms_per_token=%.3f sum_ms_per_token=%.3f "
+            "total_ms_per_token=%.3f "
+            "gate_up_gib_per_token=%.3f down_gib_per_token=%.3f "
+            "achieved_gbps=%.2f\n",
+            (unsigned long long)decode_tokens,
+            (unsigned long long)s.calls,
+            unit,
+            s.gate_up_ms * inv,
+            s.down_ms   * inv,
+            s.sort_ms   * inv,
+            s.xq_ms     * inv,
+            s.midq_ms   * inv,
+            s.sum_ms    * inv,
+            s.total_ms  * inv,
+            (double)s.gate_up_bytes / (1024.0 * 1024.0 * 1024.0) * inv,
+            (double)s.down_bytes    / (1024.0 * 1024.0 * 1024.0) * inv,
+            achieved_gbps);
+}
+
+} /* namespace */
+
+extern "C" int ds4_gpu_moe_event_profile_enabled(void) {
+    MoeEventProfileState &s = g_moe_event_profile;
+    if (s.enabled < 0) {
+        const char *env = getenv("DS4_CUDA_MOE_EVENT_PROFILE");
+        s.enabled = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return s.enabled;
+}
+
+/* =========================================================================
+ * DS4_CUDA_INDEXER_EVENT_PROFILE — long-context indexer/compressor probe
+ * (Task 5).
+ *
+ * Times three kernel families that dominate the compressor_indexer stage at
+ * long context, on the single-token decode path:
+ *   - compressor projection (matmul_f16_pair_ordered_chunks_kernel via
+ *     ds4_gpu_matmul_f16_pair_tensor; called for attn compressor and, on
+ *     ratio-4 layers, indexer compressor)
+ *   - indexer scoring (indexer_score_one_direct_kernel via
+ *     ds4_gpu_indexer_score_one_tensor)
+ *   - indexer top-k (indexer_topk_pow2_kernel via
+ *     ds4_gpu_indexer_topk_tensor)
+ *
+ * Each instrumented wrapper records a begin/end event pair, syncs, and
+ * accumulates the elapsed ms into per-kernel buckets. The sync overhead is
+ * material (~5% on a hot decode), but the flag is intended for one-off
+ * measurement runs, not steady-state use. The aggregate line at atexit uses
+ * the decode event profile's token count when available so numbers are
+ * per-decode-token by default.
+ * ========================================================================= */
+
+namespace {
+
+struct IndexerEventProfileState {
+    int      enabled;
+    int      initialized;
+    int      atexit_registered;
+    cudaEvent_t begin_ev;
+    cudaEvent_t end_ev;
+    uint64_t compressor_calls;
+    uint64_t indexer_scores_calls;
+    uint64_t indexer_topk_calls;
+    double   compressor_ms;
+    double   indexer_scores_ms;
+    double   indexer_topk_ms;
+};
+
+static IndexerEventProfileState g_indexer_event_profile = {-1, 0, 0, NULL, NULL,
+                                                            0, 0, 0,
+                                                            0.0, 0.0, 0.0};
+
+static void indexer_event_profile_report(void) {
+    IndexerEventProfileState &s = g_indexer_event_profile;
+    if (!(s.compressor_calls + s.indexer_scores_calls + s.indexer_topk_calls)) return;
+    const uint64_t decode_tokens = g_decode_event_profile.token_count;
+    const double divisor = decode_tokens ? (double)decode_tokens : 1.0;
+    const char *unit = decode_tokens ? "decode_token" : "session";
+    const double inv = 1.0 / divisor;
+    fprintf(stderr,
+            "ds4: CUDA indexer event profile tokens=%llu unit=%s "
+            "compressor_calls=%llu compressor_ms_per_token=%.3f "
+            "indexer_scores_calls=%llu indexer_scores_ms_per_token=%.3f "
+            "indexer_topk_calls=%llu indexer_topk_ms_per_token=%.3f "
+            "total_ms_per_token=%.3f\n",
+            (unsigned long long)decode_tokens,
+            unit,
+            (unsigned long long)s.compressor_calls,
+            s.compressor_ms      * inv,
+            (unsigned long long)s.indexer_scores_calls,
+            s.indexer_scores_ms  * inv,
+            (unsigned long long)s.indexer_topk_calls,
+            s.indexer_topk_ms    * inv,
+            (s.compressor_ms + s.indexer_scores_ms + s.indexer_topk_ms) * inv);
+}
+
+static int indexer_event_profile_ensure_events(void) {
+    IndexerEventProfileState &s = g_indexer_event_profile;
+    if (s.initialized) return 1;
+    if (!cuda_ok(cudaEventCreate(&s.begin_ev), "indexer event begin create")) {
+        s.enabled = 0;
+        return 0;
+    }
+    if (!cuda_ok(cudaEventCreate(&s.end_ev), "indexer event end create")) {
+        (void)cudaEventDestroy(s.begin_ev);
+        s.begin_ev = NULL;
+        s.enabled = 0;
+        return 0;
+    }
+    if (!s.atexit_registered) {
+        atexit(indexer_event_profile_report);
+        s.atexit_registered = 1;
+    }
+    s.initialized = 1;
+    return 1;
+}
+
+} /* namespace */
+
+extern "C" int ds4_gpu_indexer_event_profile_enabled(void) {
+    IndexerEventProfileState &s = g_indexer_event_profile;
+    if (s.enabled < 0) {
+        const char *env = getenv("DS4_CUDA_INDEXER_EVENT_PROFILE");
+        s.enabled = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return s.enabled;
+}
+
+/* Each call: record begin → run lambda which launches the kernel → record end
+ * → sync end → compute elapsed → accumulate into the selected bucket. Caller
+ * must already have ensured enabled() returned true. */
+enum IndexerEventBucket {
+    INDEXER_EVENT_BUCKET_COMPRESSOR = 0,
+    INDEXER_EVENT_BUCKET_SCORES,
+    INDEXER_EVENT_BUCKET_TOPK,
+};
+
+static int indexer_event_profile_begin(void) {
+    IndexerEventProfileState &s = g_indexer_event_profile;
+    if (!indexer_event_profile_ensure_events()) return 0;
+    return cuda_ok(cudaEventRecord(s.begin_ev, 0), "indexer event begin record") ? 1 : 0;
+}
+
+static void indexer_event_profile_end(int bucket) {
+    IndexerEventProfileState &s = g_indexer_event_profile;
+    if (!s.initialized) return;
+    if (!cuda_ok(cudaEventRecord(s.end_ev, 0), "indexer event end record")) return;
+    if (cudaEventSynchronize(s.end_ev) != cudaSuccess) return;
+    float ms = 0.0f;
+    if (cudaEventElapsedTime(&ms, s.begin_ev, s.end_ev) != cudaSuccess) return;
+    if (ms < 0.0f) ms = 0.0f;
+    switch (bucket) {
+        case INDEXER_EVENT_BUCKET_COMPRESSOR:
+            s.compressor_ms += (double)ms; s.compressor_calls++; break;
+        case INDEXER_EVENT_BUCKET_SCORES:
+            s.indexer_scores_ms += (double)ms; s.indexer_scores_calls++; break;
+        case INDEXER_EVENT_BUCKET_TOPK:
+            s.indexer_topk_ms += (double)ms; s.indexer_topk_calls++; break;
+    }
+}
+
+extern "C" void ds4_gpu_moe_event_profile_record(uint32_t n_tokens,
+                                                  uint64_t gate_up_bytes,
+                                                  uint64_t down_bytes,
+                                                  float ms_xq,
+                                                  float ms_sort,
+                                                  float ms_gate_up,
+                                                  float ms_midq,
+                                                  float ms_down,
+                                                  float ms_sum,
+                                                  float ms_total) {
+    MoeEventProfileState &s = g_moe_event_profile;
+    if (!ds4_gpu_moe_event_profile_enabled()) return;
+    /* The bandwidth question for the path to 20 tok/s is purely about
+     * single-token decode. Prefill calls have very different shapes
+     * (n_tokens=2048, sorted_pairs path) and amortize weights across the
+     * batch, so including them would mask the actual per-decode-token cost.
+     * Skip non-decode calls in the aggregate. */
+    if (n_tokens != 1u) return;
+    if (!s.atexit_registered) {
+        atexit(moe_event_profile_report);
+        s.atexit_registered = 1;
+    }
+    s.calls++;
+    s.total_n_tokens += n_tokens;
+    s.gate_up_bytes += gate_up_bytes;
+    s.down_bytes    += down_bytes;
+    s.xq_ms      += (double)ms_xq;
+    s.sort_ms    += (double)ms_sort;
+    s.gate_up_ms += (double)ms_gate_up;
+    s.midq_ms    += (double)ms_midq;
+    s.down_ms    += (double)ms_down;
+    s.sum_ms     += (double)ms_sum;
+    s.total_ms   += (double)ms_total;
+}
 
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
@@ -1222,6 +1958,18 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     g_model_range_mapping_supported = 1;
     g_model_hmm_direct = 0;
     g_model_cache_full = 0;
+    /* Track which model the active fd corresponds to. The engine calls
+     * set_model_fd just before set_model_map for the base model, then
+     * later calls set_model_map again for MTP without setting a new fd.
+     * On the first set_model_map after set_model_fd (g_model_fd_host_base
+     * still NULL), associate the fd with this map. On subsequent calls
+     * with a different map, leave g_model_fd_host_base alone so the fd
+     * remains pinned to the original (base) model — the fd-cache will
+     * then bail out for the alternate (MTP) map and the host-pointer
+     * path will handle those reads. */
+    if (g_model_fd >= 0 && g_model_fd_host_base == NULL) {
+        g_model_fd_host_base = model_map;
+    }
 
     const char *copy_env = getenv("DS4_CUDA_COPY_MODEL");
     if (copy_env && copy_env[0]) {
@@ -1280,6 +2028,11 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
 
 extern "C" int ds4_gpu_set_model_fd(int fd) {
     g_model_fd = fd;
+    /* Provisionally associate this fd with the currently registered map.
+     * In practice the engine calls set_model_fd *before* set_model_map for
+     * the base model (so g_model_host_base is still null here), and
+     * set_model_map will later re-record the host base in that branch. */
+    g_model_fd_host_base = g_model_host_base;
     g_model_file_size = 0;
     if (g_model_direct_fd >= 0) {
         (void)close(g_model_direct_fd);
@@ -1464,6 +2217,44 @@ __global__ static void matmul_f16_ordered_chunks_kernel(
     }
 }
 
+__device__ static float warp_sum_f32(float v); /* defined below */
+
+/* Single-output vectorized F16 GEMV for in_dim multiples of 8.
+ * Same shape as matmul_f16_ordered_chunks_kernel but with uint4 (8-half)
+ * weight reads + warp-shuffle reduction. Disable via DS4_CUDA_NO_F16_VEC8=1. */
+__global__ static void matmul_f16_warp_vec8_kernel(
+        float *out,
+        const __half *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok) {
+    const uint64_t row = (uint64_t)blockIdx.x;
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    if (row >= out_dim || tok >= n_tok) return;
+    const uint32_t lane = threadIdx.x;
+    const __half *wr = w + row * in_dim;
+    const float *xr = x + tok * in_dim;
+    const uint64_t nvec = in_dim >> 3;
+    float sum = 0.0f;
+    for (uint64_t v = lane; v < nvec; v += 32u) {
+        const uint64_t k = v * 8u;
+        const float4 xa = *((const float4 *)(xr + k));
+        const float4 xb = *((const float4 *)(xr + k + 4));
+        const float xv[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+        const uint4 wv = *((const uint4 *)(wr + k));
+        const __half2 *wh2 = (const __half2 *)&wv;
+        #pragma unroll
+        for (int p = 0; p < 4; p++) {
+            const float2 f2 = __half22float2(wh2[p]);
+            sum += f2.x * xv[p * 2 + 0];
+            sum += f2.y * xv[p * 2 + 1];
+        }
+    }
+    sum = warp_sum_f32(sum);
+    if (lane == 0) out[tok * out_dim + row] = sum;
+}
+
 __global__ static void matmul_f16_pair_ordered_chunks_kernel(
         float *out0,
         float *out1,
@@ -1504,6 +2295,71 @@ __global__ static void matmul_f16_pair_ordered_chunks_kernel(
         }
         if (row < out0_dim) out0[row] = total0;
         if (row < out1_dim) out1[row] = total1;
+    }
+}
+
+/* Vectorized F16-pair GEMV for in_dim multiples of 8.
+ *
+ * Same observable result as matmul_f16_pair_ordered_chunks_kernel but:
+ *   - Reads weights 8 halves at a time via uint4 (16 bytes), giving wider
+ *     LSU utilization than the scalar __half2float loop.
+ *   - Uses warp_sum_f32 (warp shuffle) instead of a shared-memory tree.
+ *
+ * Single-warp per CTA preserves the original CTA count (out_dim) and per-row
+ * mapping, so it slots into the existing call site without changing the rest
+ * of the compressor pipeline. The reduction order differs from the scalar
+ * kernel (tree vs serial-32), which makes the numeric output differ in low
+ * bits but stays well within the fp16-input rounding band. */
+__global__ static void matmul_f16_pair_warp_vec8_kernel(
+        float *out0,
+        float *out1,
+        const __half *w0,
+        const __half *w1,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim) {
+    const uint64_t row = (uint64_t)blockIdx.x;
+    if (row >= out0_dim && row >= out1_dim) return;
+    const uint32_t lane = threadIdx.x;
+    const bool has0 = row < out0_dim;
+    const bool has1 = row < out1_dim;
+    const __half *wr0 = has0 ? (w0 + row * in_dim) : NULL;
+    const __half *wr1 = has1 ? (w1 + row * in_dim) : NULL;
+    const uint64_t nvec = in_dim >> 3; /* 8 halves per uint4 */
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    for (uint64_t v = lane; v < nvec; v += 32u) {
+        const uint64_t k = v * 8u;
+        const float4 xa = *((const float4 *)(x + k));
+        const float4 xb = *((const float4 *)(x + k + 4));
+        const float xv[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+        if (has0) {
+            const uint4 wv = *((const uint4 *)(wr0 + k));
+            const __half2 *wh2 = (const __half2 *)&wv;
+            #pragma unroll
+            for (int p = 0; p < 4; p++) {
+                const float2 f2 = __half22float2(wh2[p]);
+                sum0 += f2.x * xv[p * 2 + 0];
+                sum0 += f2.y * xv[p * 2 + 1];
+            }
+        }
+        if (has1) {
+            const uint4 wv = *((const uint4 *)(wr1 + k));
+            const __half2 *wh2 = (const __half2 *)&wv;
+            #pragma unroll
+            for (int p = 0; p < 4; p++) {
+                const float2 f2 = __half22float2(wh2[p]);
+                sum1 += f2.x * xv[p * 2 + 0];
+                sum1 += f2.y * xv[p * 2 + 1];
+            }
+        }
+    }
+    sum0 = warp_sum_f32(sum0);
+    sum1 = warp_sum_f32(sum1);
+    if (lane == 0) {
+        if (has0) out0[row] = sum0;
+        if (has1) out1[row] = sum1;
     }
 }
 
@@ -1779,6 +2635,65 @@ __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
     }
 }
 
+/* Templated unroll specialization of matmul_q8_0_hc_expand_preq_warp8_kernel.
+ * Same kernel logic but the `blocks` runtime parameter becomes a compile-time
+ * constant `BLOCKS`, letting `nvcc` fully unroll the `b += 32` inner loop.
+ * For DS4-Flash the shape always has `in_dim % 32 == 0` so `bn` is also
+ * constant 32, which folds the branch in `dot_i8_block` to the DP4A fast
+ * path. Bit-equivalent with the production kernel by construction. Used for
+ * BLOCKS=64 (shared_down_hc: in_dim=2048) and BLOCKS=256 (attn_output_b:
+ * in_dim=8192). */
+template <uint32_t BLOCKS>
+__global__ static void matmul_q8_0_hc_expand_preq_warp8_unroll_kernel(
+        float *out_hc,
+        float *block_out,
+        const float *block_add,
+        const float *residual_hc,
+        const float *split,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t out_dim,
+        uint32_t n_embd,
+        uint32_t n_hc,
+        int has_add,
+        int use_dp4a) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + row * BLOCKS * 34;
+    float acc = 0.0f;
+    #pragma unroll
+    for (uint32_t bi = 0; bi < (BLOCKS + 31u) / 32u; bi++) {
+        const uint32_t b = bi * 32u + lane;
+        if (b < BLOCKS) {
+            const __half *scale_h = (const __half *)(wr + b * 34);
+            const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+            const int8_t *xqb = xq + b * 32;
+            const int dot = dot_i8_block(qs, xqb, 32u, use_dp4a);
+            acc += __half2float(*scale_h) * xscale[b] * (float)dot;
+        }
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) {
+        const uint32_t d = (uint32_t)row;
+        block_out[d] = acc;
+        float block_v = acc;
+        if (has_add) block_v += block_add[d];
+        const float *post = split + n_hc;
+        const float *comb = split + 2u * n_hc;
+        for (uint32_t dst_hc = 0; dst_hc < n_hc; dst_hc++) {
+            float hc_acc = block_v * post[dst_hc];
+            for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
+                const float comb_v = comb[dst_hc + (uint64_t)src_hc * n_hc];
+                const float res_v = residual_hc[(uint64_t)src_hc * n_embd + d];
+                hc_acc += comb_v * res_v;
+            }
+            out_hc[(uint64_t)dst_hc * n_embd + d] = hc_acc;
+        }
+    }
+}
+
 __global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
         float *out_hc,
         float *block_out,
@@ -1935,6 +2850,86 @@ __global__ static void grouped_q8_0_a_preq_warp8_kernel(
     }
     acc = warp_sum_f32(acc);
     if (lane == 0) low[tok * low_dim + row] = acc;
+}
+
+/* Fused output_a + Q8_0 prequant of `low`.
+ *
+ * Same math as `grouped_q8_0_a_preq_warp8_kernel`, but each CTA produces 32
+ * consecutive `low` outputs (one Q8_0 block) and writes them as int8+scale to
+ * the preq buffers used by the next matmul (matmul_q8_0_hc_expand_preq_*).
+ *
+ * Eliminates the float `low` DRAM roundtrip and one quantize_q8_0_f32_kernel
+ * launch per decode layer.
+ *
+ * Layout (preserves the original per-warp parallelism — each warp computes one
+ * output, total threads-per-CTA matches the original kernel's 32 warps × 32
+ * lanes):
+ *   gridDim.x = low_blocks (= low_dim / 32)
+ *   gridDim.y = n_tokens
+ *   blockDim  = 1024 (32 warps); warp `w` computes row `lq_block*32 + w`. */
+__global__ static void grouped_q8_0_a_preq_to_q8_kernel(
+        int8_t *low_xq,
+        float *low_xscale,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t group_dim,
+        uint64_t rank,
+        uint32_t n_groups,
+        uint32_t n_tokens,
+        uint64_t blocks,
+        uint64_t low_blocks,
+        int use_dp4a) {
+    const uint32_t lq_block = blockIdx.x;
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warpId = threadIdx.x >> 5u;
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    if (lq_block >= low_blocks || tok >= n_tokens) return;
+
+    __shared__ float sh_out[32];
+
+    const uint64_t row = (uint64_t)lq_block * 32u + warpId;
+    float acc = 0.0f;
+    if (row < low_dim) {
+        const uint64_t group = row / rank;
+        const uint64_t row_in_group = row - group * rank;
+        const unsigned char *wr = w + (group * rank + row_in_group) * blocks * 34;
+        const uint64_t xrow = tok * (uint64_t)n_groups + group;
+        const int8_t *xqr = xq + xrow * blocks * 32;
+        const float *xsr = xscale + xrow * blocks;
+        for (uint64_t b = lane; b < blocks; b += 32u) {
+            const uint64_t i0 = b * 32;
+            const uint64_t bn = group_dim - i0 < 32 ? group_dim - i0 : 32;
+            const __half *scale_h = (const __half *)(wr + b * 34);
+            const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+            const int8_t *xqb = xqr + b * 32;
+            int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+            acc += __half2float(*scale_h) * xsr[b] * (float)dot;
+        }
+        acc = warp_sum_f32(acc);
+    }
+    if (lane == 0) sh_out[warpId] = acc;
+    __syncthreads();
+
+    /* Warp 0 packs the 32 floats into Q8_0 layout matching
+     * quantize_q8_0_f32_kernel (max-abs / 127, lrintf+clamp). */
+    if (warpId == 0) {
+        const float v = sh_out[lane];
+        float amax = fabsf(v);
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 16));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 8));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 4));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1));
+        const float d = amax / 127.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+        const uint64_t blk_idx = tok * low_blocks + lq_block;
+        int q = (int)lrintf(v * id);
+        q = q > 127 ? 127 : (q < -128 ? -128 : q);
+        low_xq[blk_idx * 32u + lane] = (int8_t)q;
+        if (lane == 0) low_xscale[blk_idx] = d;
+    }
 }
 
 __global__ static void rms_norm_plain_kernel(float *out, const float *x, uint32_t n, uint32_t rows, float eps) {
@@ -2708,24 +3703,26 @@ __global__ static void attention_decode_mixed_kernel(
     __syncthreads();
     float *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
     if (head_dim == 512u && blockDim.x == 256u) {
-        uint32_t d0 = threadIdx.x;
-        uint32_t d1 = d0 + 256u;
-        float acc0 = 0.0f;
-        float acc1 = 0.0f;
+        /* Same float2 vectorization as attention_indexed_mixed_kernel's
+         * phase 3 fast path. See that kernel for the bit-equivalence note. */
+        const uint32_t d_pair = threadIdx.x * 2u;
+        float2 acc = make_float2(0.0f, 0.0f);
         for (uint32_t r = 0; r < raw_count; r++) {
-            float s = scores[r];
-            const float *kv = raw_kv + (uint64_t)raw_rows[r] * head_dim;
-            acc0 += kv[d0] * s;
-            acc1 += kv[d1] * s;
+            const float s = scores[r];
+            const float2 *kv2 = (const float2 *)(raw_kv + (uint64_t)raw_rows[r] * head_dim);
+            const float2 v = kv2[threadIdx.x];
+            acc.x += v.x * s;
+            acc.y += v.y * s;
         }
         for (uint32_t c = 0; c < visible_comp; c++) {
-            float s = scores[raw_count + c];
-            const float *kv = comp_kv + (uint64_t)c * head_dim;
-            acc0 += kv[d0] * s;
-            acc1 += kv[d1] * s;
+            const float s = scores[raw_count + c];
+            const float2 *kv2 = (const float2 *)(comp_kv + (uint64_t)c * head_dim);
+            const float2 v = kv2[threadIdx.x];
+            acc.x += v.x * s;
+            acc.y += v.y * s;
         }
-        oh[d0] = acc0 / denom;
-        oh[d1] = acc1 / denom;
+        oh[d_pair    ] = acc.x / denom;
+        oh[d_pair + 1] = acc.y / denom;
     } else {
         for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
             float acc = 0.0f;
@@ -2752,6 +3749,7 @@ __global__ static void attention_indexed_mixed_kernel(
         uint32_t top_k,
         uint32_t window,
         uint32_t ratio,
+        uint32_t deterministic_attention,
         uint32_t n_head,
         uint32_t head_dim) {
     uint32_t t = blockIdx.x;
@@ -2800,11 +3798,22 @@ __global__ static void attention_indexed_mixed_kernel(
     for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
         raw_rows[r] = (raw_start + raw_first_idx + r) % raw_cap;
     }
-    for (uint32_t i = threadIdx.x; i < top_k; i += blockDim.x) {
-        int32_t c = topk[(uint64_t)t * top_k + i];
-        if (c >= 0 && (uint32_t)c < visible_comp) {
-            uint32_t slot = atomicAdd(&comp_count, 1u);
-            if (slot < 512u) comp_rows[slot] = (uint32_t)c;
+    if (deterministic_attention) {
+        if (threadIdx.x == 0) {
+            for (uint32_t i = 0; i < top_k && comp_count < 512u; i++) {
+                int32_t c = topk[(uint64_t)t * top_k + i];
+                if (c >= 0 && (uint32_t)c < visible_comp) {
+                    comp_rows[comp_count++] = (uint32_t)c;
+                }
+            }
+        }
+    } else {
+        for (uint32_t i = threadIdx.x; i < top_k; i += blockDim.x) {
+            int32_t c = topk[(uint64_t)t * top_k + i];
+            if (c >= 0 && (uint32_t)c < visible_comp) {
+                uint32_t slot = atomicAdd(&comp_count, 1u);
+                if (slot < 512u) comp_rows[slot] = (uint32_t)c;
+            }
         }
     }
     __syncthreads();
@@ -2868,24 +3877,32 @@ __global__ static void attention_indexed_mixed_kernel(
     __syncthreads();
     float *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
     if (head_dim == 512u && blockDim.x == 256u) {
-        uint32_t d0 = threadIdx.x;
-        uint32_t d1 = d0 + 256u;
-        float acc0 = 0.0f;
-        float acc1 = 0.0f;
+        /* Phase 3 (value accumulate) fast path. The original code mapped
+         * thread `tid` to outputs `{tid, tid+256}`, which forced two scalar
+         * 4-byte loads per row at non-adjacent addresses. Remapping `tid` to
+         * outputs `{2*tid, 2*tid+1}` lets us issue one 8-byte `float2` load
+         * per row that covers both outputs. Bit-equivalent: each output
+         * `oh[d]` is `sum_r scores[r] * kv_r[d]` summed in the same order;
+         * only which thread computes each `d` changes. Halves the per-row
+         * LDG count, freeing issue slots for the FMA chain.  */
+        const uint32_t d_pair = threadIdx.x * 2u;
+        float2 acc = make_float2(0.0f, 0.0f);
         for (uint32_t r = 0; r < raw_count; r++) {
-            float s = scores[r];
-            const float *kv = raw_kv + (uint64_t)raw_rows[r] * head_dim;
-            acc0 += kv[d0] * s;
-            acc1 += kv[d1] * s;
+            const float s = scores[r];
+            const float2 *kv2 = (const float2 *)(raw_kv + (uint64_t)raw_rows[r] * head_dim);
+            const float2 v = kv2[threadIdx.x];
+            acc.x += v.x * s;
+            acc.y += v.y * s;
         }
         for (uint32_t c = 0; c < comp_count; c++) {
-            float s = scores[raw_count + c];
-            const float *kv = comp_kv + (uint64_t)comp_rows[c] * head_dim;
-            acc0 += kv[d0] * s;
-            acc1 += kv[d1] * s;
+            const float s = scores[raw_count + c];
+            const float2 *kv2 = (const float2 *)(comp_kv + (uint64_t)comp_rows[c] * head_dim);
+            const float2 v = kv2[threadIdx.x];
+            acc.x += v.x * s;
+            acc.y += v.y * s;
         }
-        oh[d0] = acc0 / denom;
-        oh[d1] = acc1 / denom;
+        oh[d_pair    ] = acc.x / denom;
+        oh[d_pair + 1] = acc.y / denom;
     } else {
         for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
             float acc = 0.0f;
@@ -4391,6 +5408,26 @@ __global__ static void indexer_topk_kernel(uint32_t *selected, const float *scor
     }
 }
 
+__global__ static void indexer_topk_rank_kernel(
+        uint32_t *selected,
+        const float *scores,
+        uint32_t n_comp,
+        uint32_t n_tokens,
+        uint32_t top_k) {
+    const uint32_t c = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
+    const uint32_t t = blockIdx.y;
+    if (t >= n_tokens || c >= n_comp) return;
+
+    const float *row = scores + (uint64_t)t * n_comp;
+    const float v = row[c];
+    uint32_t rank = 0;
+    for (uint32_t i = 0; i < n_comp; i++) {
+        const float iv = row[i];
+        if (iv > v || (iv == v && i < c)) rank++;
+    }
+    if (rank < top_k) selected[(uint64_t)t * top_k + rank] = c;
+}
+
 __device__ __forceinline__ static bool topk_score_better(float av, uint32_t ai, float bv, uint32_t bi) {
     return av > bv || (av == bv && ai < bi);
 }
@@ -4700,7 +5737,9 @@ static int indexer_scores_launch(
         return 0;
     }
     if (causal && ratio == 0) return 0;
-    if (n_tokens == 1u && head_dim == 128u && n_head == 64u &&
+    const int deterministic_indexer = cuda_deterministic_indexer();
+    if (!deterministic_indexer &&
+        n_tokens == 1u && head_dim == 128u && n_head == 64u &&
         getenv("DS4_CUDA_NO_INDEXER_DIRECT_ONE") == NULL) {
         indexer_score_one_direct_kernel<<<n_comp, 128>>>((float *)scores->ptr,
                                                          (const float *)q->ptr,
@@ -4710,7 +5749,8 @@ static int indexer_scores_launch(
                                                          scale, causal ? 1 : 0);
         return cuda_ok(cudaGetLastError(), "indexer score one direct launch");
     }
-    if (!g_quality_mode && head_dim == 128u && n_head == 64u &&
+    if (!deterministic_indexer &&
+        !g_quality_mode && head_dim == 128u && n_head == 64u &&
         getenv("DS4_CUDA_NO_INDEXER_WMMA") == NULL) {
         dim3 grid((n_comp + 15u) / 16u, (n_tokens + 15u) / 16u, 1);
         indexer_scores_wmma_kernel<<<grid, 32>>>((float *)scores->ptr,
@@ -4740,8 +5780,13 @@ extern "C" int ds4_gpu_indexer_score_one_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         float                   scale) {
-    return indexer_scores_launch(scores, q, weights, index_comp, n_comp, 1, 0,
-                                 n_head, head_dim, 1, scale, 0);
+    const int profile = ds4_gpu_indexer_event_profile_enabled();
+    int prof_begin = 0;
+    if (profile) prof_begin = indexer_event_profile_begin();
+    const int rc = indexer_scores_launch(scores, q, weights, index_comp, n_comp, 1, 0,
+                                          n_head, head_dim, 1, scale, 0);
+    if (prof_begin) indexer_event_profile_end(INDEXER_EVENT_BUCKET_SCORES);
+    return rc;
 }
 
 extern "C" int ds4_gpu_indexer_scores_prefill_tensor(
@@ -4775,7 +5820,7 @@ extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
                                  n_head, head_dim, ratio, scale, 1);
 }
 
-extern "C" int ds4_gpu_indexer_topk_tensor(
+static int ds4_gpu_indexer_topk_tensor_impl(
         ds4_gpu_tensor       *selected,
         const ds4_gpu_tensor *scores,
         uint32_t                n_comp,
@@ -4787,21 +5832,34 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         selected->bytes < (uint64_t)n_tokens * top_k * sizeof(uint32_t)) {
         return 0;
     }
-    if (top_k == 512u && n_comp <= 1024u &&
+    const int deterministic_indexer = cuda_deterministic_indexer();
+    if (deterministic_indexer && getenv("DS4_CUDA_DETERMINISTIC_TOPK_RANK") != NULL) {
+        dim3 grid((n_comp + 255u) / 256u, n_tokens, 1);
+        indexer_topk_rank_kernel<<<grid, 256>>>((uint32_t *)selected->ptr,
+                                                (const float *)scores->ptr,
+                                                n_comp,
+                                                n_tokens,
+                                                top_k);
+        return cuda_ok(cudaGetLastError(), "indexer topk rank launch");
+    }
+    if (!deterministic_indexer &&
+        top_k == 512u && n_comp <= 1024u &&
         getenv("DS4_CUDA_NO_TOPK1024") == NULL) {
         indexer_topk_1024_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
                                                      (const float *)scores->ptr,
                                                      n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 1024 launch");
     }
-    if (top_k == 512u && n_comp <= 2048u &&
+    if (!deterministic_indexer &&
+        top_k == 512u && n_comp <= 2048u &&
         getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
         indexer_topk_pow2_kernel<2048><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
                                                            (const float *)scores->ptr,
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 2048 launch");
     }
-    if (top_k == 512u && getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
+    if (!deterministic_indexer &&
+        top_k == 512u && getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
         getenv("DS4_CUDA_NO_TOPK_CHUNKED") == NULL) {
         const uint32_t chunk_n = 2048u;
         const uint32_t n_chunks = (n_comp + chunk_n - 1u) / chunk_n;
@@ -4833,6 +5891,23 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                          (const float *)scores->ptr,
                                          n_comp, n_tokens, top_k);
     return cuda_ok(cudaGetLastError(), "indexer topk launch");
+}
+
+extern "C" int ds4_gpu_indexer_topk_tensor(
+        ds4_gpu_tensor       *selected,
+        const ds4_gpu_tensor *scores,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                top_k) {
+    /* Profile only single-token-decode invocations. Prefill chunks use this
+     * same wrapper with n_tokens up to the prefill chunk size and would
+     * dilute the per-decode-token aggregate. */
+    const int profile = (n_tokens == 1u) && ds4_gpu_indexer_event_profile_enabled();
+    int prof_begin = 0;
+    if (profile) prof_begin = indexer_event_profile_begin();
+    const int rc = ds4_gpu_indexer_topk_tensor_impl(selected, scores, n_comp, n_tokens, top_k);
+    if (prof_begin) indexer_event_profile_end(INDEXER_EVENT_BUCKET_TOPK);
+    return rc;
 }
 
 extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
@@ -5082,6 +6157,32 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     const int use_dp4a = cuda_q8_use_dp4a();
     quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand quantize launch")) return 0;
+    /* Template-specialized unroll variants for the two DS4-Flash decode
+     * shapes: attn_output_b (in_dim=8192, blocks=256) and shared_down_hc
+     * (in_dim=2048, blocks=64). Same math as the generic kernel; the
+     * compiler unrolls the b-loop because BLOCKS is compile-time constant.
+     * Disable via DS4_CUDA_HC_EXPAND_NO_UNROLL=1. */
+    const dim3 grid(((unsigned)out_dim + 7u) / 8u, 1, 1);
+    const bool use_unroll = (in_dim % 32u == 0u) &&
+                            getenv("DS4_CUDA_HC_EXPAND_NO_UNROLL") == NULL;
+    if (use_unroll && blocks == 256u) {
+        matmul_q8_0_hc_expand_preq_warp8_unroll_kernel<256><<<grid, 256>>>(
+                (float *)out_hc->ptr, (float *)block_out->ptr,
+                block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr,
+                (const float *)residual_hc->ptr, (const float *)split->ptr,
+                reinterpret_cast<const unsigned char *>(wptr), xq, xscale,
+                out_dim, n_embd, n_hc, block_add ? 1 : 0, use_dp4a);
+        return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand unroll<256> launch");
+    }
+    if (use_unroll && blocks == 64u) {
+        matmul_q8_0_hc_expand_preq_warp8_unroll_kernel<64><<<grid, 256>>>(
+                (float *)out_hc->ptr, (float *)block_out->ptr,
+                block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr,
+                (const float *)residual_hc->ptr, (const float *)split->ptr,
+                reinterpret_cast<const unsigned char *>(wptr), xq, xscale,
+                out_dim, n_embd, n_hc, block_add ? 1 : 0, use_dp4a);
+        return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand unroll<64> launch");
+    }
     matmul_q8_0_hc_expand_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
             (float *)out_hc->ptr,
             (float *)block_out->ptr,
@@ -5157,6 +6258,11 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         return cuda_ok(cudaGetLastError(), serial_router ? "matmul_f16_router_serial launch" : "matmul_f16_serial launch");
     }
     if (ordered_router) {
+        if (n_tok == 1u && (in_dim % 8u == 0u) &&
+            getenv("DS4_CUDA_NO_F16_VEC8") == NULL) {
+            matmul_f16_warp_vec8_kernel<<<grid, 32>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
+            return cuda_ok(cudaGetLastError(), "matmul_f16_warp_vec8 launch");
+        }
         matmul_f16_ordered_chunks_kernel<<<grid, 32>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
         return cuda_ok(cudaGetLastError(), "matmul_f16_ordered_chunks launch");
     }
@@ -5164,7 +6270,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
 }
 
-extern "C" int ds4_gpu_matmul_f16_pair_tensor(
+static int ds4_gpu_matmul_f16_pair_tensor_impl(
         ds4_gpu_tensor *out0,
         ds4_gpu_tensor *out1,
         const void *model_map,
@@ -5203,6 +6309,24 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     const __half *w0 = (const __half *)cuda_model_range_ptr(model_map, weight0_offset, weight_bytes, "f16_pair0");
     const __half *w1 = (const __half *)cuda_model_range_ptr(model_map, weight1_offset, weight_bytes, "f16_pair1");
     if (!w0 || !w1) return 0;
+    /* Prefer the vectorized variant when in_dim is a multiple of 8 (the
+     * compressor and indexer-compressor shapes hit this since in_dim is
+     * always DS4_N_EMBD = 4096 on DS4-Flash). Disable via
+     * DS4_CUDA_NO_F16_PAIR_VEC8=1. */
+    const bool use_vec8 = (in_dim % 8u == 0u) &&
+                          getenv("DS4_CUDA_NO_F16_PAIR_VEC8") == NULL;
+    if (use_vec8) {
+        matmul_f16_pair_warp_vec8_kernel<<<(unsigned)out_dim, 32>>>(
+            (float *)out0->ptr,
+            (float *)out1->ptr,
+            w0,
+            w1,
+            (const float *)x->ptr,
+            in_dim,
+            out_dim,
+            out_dim);
+        return cuda_ok(cudaGetLastError(), "matmul_f16_pair_warp_vec8 launch");
+    }
     matmul_f16_pair_ordered_chunks_kernel<<<(unsigned)out_dim, 32>>>(
         (float *)out0->ptr,
         (float *)out1->ptr,
@@ -5213,6 +6337,30 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
         out_dim,
         out_dim);
     return cuda_ok(cudaGetLastError(), "matmul_f16_pair_ordered_chunks launch");
+}
+
+extern "C" int ds4_gpu_matmul_f16_pair_tensor(
+        ds4_gpu_tensor *out0,
+        ds4_gpu_tensor *out1,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight0_offset,
+        uint64_t weight1_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t n_tok) {
+    /* Only time decode invocations (n_tok=1) to keep the per-token aggregate
+     * meaningful; prefill pair-matmul calls run with n_tok > 1 and have very
+     * different shape. */
+    const int profile = (n_tok == 1) && ds4_gpu_indexer_event_profile_enabled();
+    int prof_begin = 0;
+    if (profile) prof_begin = indexer_event_profile_begin();
+    const int rc = ds4_gpu_matmul_f16_pair_tensor_impl(out0, out1, model_map, model_size,
+                                                        weight0_offset, weight1_offset,
+                                                        in_dim, out_dim, x, n_tok);
+    if (prof_begin) indexer_event_profile_end(INDEXER_EVENT_BUCKET_COMPRESSOR);
+    return rc;
 }
 
 extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
@@ -6053,8 +7201,11 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
-    if (n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
-        getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
+    const bool use_indexed_heads8 =
+        head_dim == 512 && top_k <= 512u &&
+        getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL &&
+        (n_tokens > 1 || getenv("DS4_CUDA_INDEXED_DECODE_HEADS8") != NULL);
+    if (use_indexed_heads8) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
             attention_indexed_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
@@ -6111,6 +7262,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                   top_k,
                                                   window,
                                                   ratio,
+                                                  cuda_deterministic_attention() ? 1u : 0u,
                                                   n_head,
                                                   head_dim);
     return cuda_ok(cudaGetLastError(), "attention indexed mixed launch");
@@ -6498,6 +7650,142 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
                                                       use_dp4a);
     return cuda_ok(cudaGetLastError(), "attention_output_low_q8 launch");
 }
+
+/* Fused attn_output_a + attn_output_b (+ HC expand) for decode (n_tok=1).
+ *
+ * Same observable result as ds4_gpu_attention_output_low_q8_tensor followed
+ * by ds4_gpu_matmul_q8_0_hc_expand_tensor, but `low` is never materialized
+ * as a float buffer. Instead the grouped output_a kernel writes Q8_0 layout
+ * (xq + xscale) directly, and that buffer is consumed by the existing
+ * matmul_q8_0_hc_expand_preq_warp8_unroll_kernel.
+ *
+ * Savings per decode layer: one prequant_q8_0 launch (~5 µs on GB10 with
+ * spin scheduling) plus the low_dim * (4 - ~1.1) bytes DRAM roundtrip
+ * eliminated. Across ~60 layers, expected ~0.3-0.5 ms/token.
+ *
+ * Disable via DS4_CUDA_DISABLE_OUT_AB_FUSE=1. */
+extern "C" int ds4_gpu_attention_output_q8_fused_hc_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *attn_out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc) {
+    if (!out_hc || !attn_out || !heads || !residual_hc || !split || !model_map ||
+        group_dim == 0 || rank == 0 || n_groups == 0 ||
+        out_dim == 0 || n_embd == 0 || n_hc == 0 ||
+        out_dim != (uint64_t)n_embd) {
+        return 0;
+    }
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    if (low_dim % 32u != 0u) return 0; /* fused kernel writes per-32-output Q8 blocks */
+    const uint64_t blocks_a = (group_dim + 31) / 32;
+    const uint64_t low_blocks = low_dim / 32u;
+    const uint64_t out_a_bytes = (uint64_t)n_groups * rank * blocks_a * 34;
+    const uint64_t out_b_bytes = out_dim * low_blocks * 34;
+    if (out_a_offset > model_size || out_a_bytes > model_size - out_a_offset ||
+        out_b_offset > model_size || out_b_bytes > model_size - out_b_offset ||
+        heads->bytes < (uint64_t)n_groups * group_dim * sizeof(float) ||
+        attn_out->bytes < out_dim * sizeof(float) ||
+        residual_hc->bytes < (uint64_t)n_hc * n_embd * sizeof(float) ||
+        split->bytes < (uint64_t)(2u * n_hc + n_hc * n_hc) * sizeof(float) ||
+        out_hc->bytes < (uint64_t)n_hc * n_embd * sizeof(float)) {
+        return 0;
+    }
+    const unsigned char *out_a = reinterpret_cast<const unsigned char *>(
+            cuda_model_range_ptr(model_map, out_a_offset, out_a_bytes, "attn_out_a"));
+    const unsigned char *out_b = reinterpret_cast<const unsigned char *>(
+            cuda_model_range_ptr(model_map, out_b_offset, out_b_bytes, "attn_out_b"));
+    if (!out_a || !out_b) return 0;
+
+    /* Pre-quantize `heads` (input to output_a). Same as the unfused path. */
+    const uint64_t x_rows = (uint64_t)n_groups;
+    const uint64_t heads_xq_bytes = x_rows * blocks_a * 32u;
+    const uint64_t heads_scale_offset = (heads_xq_bytes + 15u) & ~15ull;
+    const uint64_t heads_tmp_bytes = heads_scale_offset + x_rows * blocks_a * sizeof(float);
+    /* Allocate `low` Q8_0 buffer (input to output_b) in the same tmp pool but
+     * under a different name so cuda_tmp_alloc gives us a separate region. */
+    const uint64_t low_xq_bytes = low_blocks * 32u;
+    const uint64_t low_scale_offset = (low_xq_bytes + 15u) & ~15ull;
+    const uint64_t low_tmp_bytes = low_scale_offset + low_blocks * sizeof(float);
+
+    void *heads_tmp = cuda_tmp_alloc(heads_tmp_bytes, "attention output ab fused heads q8");
+    if (!heads_tmp) return 0;
+    void *low_tmp = cuda_tmp_alloc(low_tmp_bytes, "attention output ab fused low q8");
+    if (!low_tmp) return 0;
+    int8_t *heads_xq = (int8_t *)heads_tmp;
+    float *heads_xscale = (float *)((char *)heads_tmp + heads_scale_offset);
+    int8_t *low_xq = (int8_t *)low_tmp;
+    float *low_xscale = (float *)((char *)low_tmp + low_scale_offset);
+
+    const int use_dp4a = cuda_q8_use_dp4a();
+    dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
+    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(heads_xq,
+                                            heads_xscale,
+                                            (const float *)heads->ptr,
+                                            group_dim,
+                                            blocks_a);
+    if (!cuda_ok(cudaGetLastError(), "attention_output_ab_fused heads quantize")) return 0;
+
+    /* Fused output_a + Q8 prequant of `low`. One CTA per low Q8 block;
+     * 32 warps × 32 lanes preserves the original per-warp parallelism. */
+    dim3 fused_grid((unsigned)low_blocks, 1, 1);
+    grouped_q8_0_a_preq_to_q8_kernel<<<fused_grid, 1024>>>(
+            low_xq, low_xscale,
+            out_a, heads_xq, heads_xscale,
+            group_dim, rank, n_groups, 1u, blocks_a, low_blocks, use_dp4a);
+    if (!cuda_ok(cudaGetLastError(), "attention_output_ab_fused output_a launch")) return 0;
+
+    /* output_b + HC expand, reading Q8_0 `low` directly. Use the unroll
+     * specialization for BLOCKS=256 (the DS4-Flash attn_output_b shape). */
+    const bool use_unroll = (low_dim % 32u == 0u) &&
+                            getenv("DS4_CUDA_HC_EXPAND_NO_UNROLL") == NULL;
+    const dim3 grid_b(((unsigned)out_dim + 7u) / 8u, 1, 1);
+    if (use_unroll && low_blocks == 256u) {
+        matmul_q8_0_hc_expand_preq_warp8_unroll_kernel<256><<<grid_b, 256>>>(
+                (float *)out_hc->ptr,
+                (float *)attn_out->ptr,
+                (const float *)attn_out->ptr, /* block_add unused (has_add=0) */
+                (const float *)residual_hc->ptr,
+                (const float *)split->ptr,
+                out_b, low_xq, low_xscale,
+                out_dim, n_embd, n_hc,
+                /*has_add=*/0, use_dp4a);
+        return cuda_ok(cudaGetLastError(), "attention_output_ab_fused hc_expand unroll<256>");
+    }
+    if (use_unroll && low_blocks == 64u) {
+        matmul_q8_0_hc_expand_preq_warp8_unroll_kernel<64><<<grid_b, 256>>>(
+                (float *)out_hc->ptr,
+                (float *)attn_out->ptr,
+                (const float *)attn_out->ptr,
+                (const float *)residual_hc->ptr,
+                (const float *)split->ptr,
+                out_b, low_xq, low_xscale,
+                out_dim, n_embd, n_hc,
+                /*has_add=*/0, use_dp4a);
+        return cuda_ok(cudaGetLastError(), "attention_output_ab_fused hc_expand unroll<64>");
+    }
+    matmul_q8_0_hc_expand_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
+            (float *)out_hc->ptr,
+            (float *)attn_out->ptr,
+            (const float *)attn_out->ptr,
+            (const float *)residual_hc->ptr,
+            (const float *)split->ptr,
+            out_b, low_xq, low_xscale,
+            low_dim, out_dim, n_embd, n_hc,
+            low_blocks, /*has_add=*/0, use_dp4a);
+    return cuda_ok(cudaGetLastError(), "attention_output_ab_fused hc_expand launch");
+}
+
 extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint32_t n, float clamp, float weight) {
     if (!out || !gate || !up ||
         out->bytes < (uint64_t)n * sizeof(float) ||
@@ -6901,6 +8189,59 @@ __device__ static DS4_CUDA_UNUSED void dev_dot_iq2_xxs_q8_K_block8(
     for (uint32_t p = 0; p < n; p++) acc[p] += 0.125f * xd * ys[p]->d * (float)bsum[p];
 }
 
+/* Q4_K helpers. Each block is 256 weights as 8 sub-blocks of 32. The 12-byte
+ * scales array packs the 6-bit scale `d_j` and 6-bit min `m_j` for each
+ * sub-block j ∈ [0,8). This mirrors the canonical `get_scale_min_k4` from
+ * llama.cpp / ggml-quants. */
+__device__ static void dev_q4_K_get_scale_min(uint32_t j,
+                                                const uint8_t *scales,
+                                                uint8_t *d_out,
+                                                uint8_t *m_out) {
+    if (j < 4) {
+        *d_out = scales[j] & 63;
+        *m_out = scales[j + 4] & 63;
+    } else {
+        *d_out = (scales[j + 4] & 0xF) | ((scales[j - 4] >> 6) << 4);
+        *m_out = (scales[j + 4] >>  4) | ((scales[j - 0] >> 6) << 4);
+    }
+}
+
+/* 32 4-bit weights dot 32 int8 activations via 8 __dp4a ops.
+ * Per-byte nibble extraction: `(int32 >> shift) & 0x0f0f0f0f` yields the
+ * same per-byte low/high nibbles as a scalar `(b >> shift) & 0xF` loop
+ * because the 4-bit-shifted bits cross byte boundaries but are then
+ * masked out. Mirrors dev_dot_q2_16's pattern. */
+__device__ __forceinline__ static int32_t dev_dot_q4_32(const uint8_t *qs, const int8_t *q8, int shift) {
+    int32_t sum = 0;
+    #pragma unroll
+    for (uint32_t i = 0; i < 32; i += 4) {
+        const int32_t v = (*(const int32_t *)(qs + i) >> shift) & 0x0f0f0f0f;
+        sum = __dp4a(v, *(const int32_t *)(q8 + i), sum);
+    }
+    return sum;
+}
+
+__device__ static float dev_dot_q4_K_q8_K_block(const cuda_block_q4_K *x, const cuda_block_q8_K *y) {
+    const float x_d_f32 = dev_f16_to_f32(x->d);
+    const float x_dmin_f32 = dev_f16_to_f32(x->dmin);
+    int isum = 0;
+    int summs = 0;
+    const uint8_t *qs = x->qs;
+    const int8_t  *q8 = y->qs;
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        uint8_t sc, m;
+        dev_q4_K_get_scale_min((uint32_t)j, x->scales, &sc, &m);
+        /* Q8_K bsums are per-16-weight chunks; sub-block j (32 weights)
+         * spans bsums[2j] and bsums[2j+1]. */
+        summs += (int)m * (int)(y->bsums[2 * j] + y->bsums[2 * j + 1]);
+        const int byte_off = (j >> 1) * 32;
+        const int shift    = (j & 1) ? 4 : 0;
+        isum += (int)sc * dev_dot_q4_32(qs + byte_off, q8 + j * 32, shift);
+    }
+    return y->d * x_d_f32 * (float)isum - y->d * x_dmin_f32 * (float)summs;
+}
+
 __device__ static float dev_dot_q2_K_q8_K_block(const cuda_block_q2_K *x, const cuda_block_q8_K *y) {
     const uint8_t *q2 = x->qs;
     const int8_t *q8 = y->qs;
@@ -7085,6 +8426,44 @@ __device__ static float quarter_warp_sum_f32(float v, uint32_t lane8) {
     return v;
 }
 
+__device__ static uint32_t g_q8k_quant_dbg_fired = 0;
+
+/* Host-side NaN scan via tensor_read. Used to bisect the MTP draft chain
+ * for the NaN source. Slow (forces device sync) — only enabled when
+ * DS4_MTP_NAN_PROBE is set. */
+extern "C" int ds4_gpu_check_nan(const ds4_gpu_tensor *t, uint64_t n_f32, const char *label) {
+    if (!t || !t->ptr || n_f32 == 0) return 0;
+    if (getenv("DS4_MTP_NAN_PROBE") == NULL) return 1;
+    if (cudaDeviceSynchronize() != cudaSuccess) return 0;
+    float *buf = (float *)malloc((size_t)n_f32 * sizeof(float));
+    if (!buf) return 0;
+    if (cudaMemcpy(buf, t->ptr, n_f32 * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        free(buf);
+        return 0;
+    }
+    int first_bad = -1;
+    int n_nan = 0, n_inf = 0;
+    float first_bad_val = 0.0f;
+    for (uint64_t i = 0; i < n_f32; i++) {
+        if (isnan(buf[i])) {
+            if (first_bad < 0) { first_bad = (int)i; first_bad_val = buf[i]; }
+            n_nan++;
+        } else if (isinf(buf[i])) {
+            if (first_bad < 0) { first_bad = (int)i; first_bad_val = buf[i]; }
+            n_inf++;
+        }
+    }
+    if (first_bad >= 0) {
+        fprintf(stderr,
+                "ds4: NaN_PROBE tag=%s n=%llu first_bad=%d val=%g nan_count=%d inf_count=%d head=%g %g %g %g\n",
+                label, (unsigned long long)n_f32, first_bad, (double)first_bad_val,
+                n_nan, n_inf,
+                (double)buf[0], (double)buf[1], (double)buf[2], (double)buf[3]);
+    }
+    free(buf);
+    return 1;
+}
+
 __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x, uint32_t in_dim, uint32_t n_rows) {
     uint32_t b = blockIdx.x;
     uint32_t row = blockIdx.y;
@@ -7097,6 +8476,31 @@ __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x
     __shared__ float iscale_s;
     uint32_t tid = threadIdx.x;
     float v = tid < CUDA_QK_K ? xr[tid] : 0.0f;
+    /* Probe: when DS4_MTP_NAN_PROBE was set at process start, emit a
+     * one-shot diagnostic when ANY input value in the first row/block is
+     * NaN. The compile-time `kQ8KNanProbeEnabled` constant lets the host
+     * disable this entirely; the runtime check below also avoids firing on
+     * clean inputs. */
+    if (tid == 0 && b == 0 && row == 0 &&
+        g_q8k_nan_probe_enabled != 0 &&
+        atomicCAS(&g_q8k_quant_dbg_fired, 0u, 1u) == 0u) {
+        bool has_nan = false;
+        for (int i = 0; i < (int)CUDA_QK_K; i++) {
+            if (isnan(xr[i])) { has_nan = true; break; }
+        }
+        if (has_nan) {
+            int first_nan = -1;
+            for (int i = 0; i < (int)CUDA_QK_K; i++) {
+                if (isnan(xr[i])) { first_nan = i; break; }
+            }
+            printf("ds4: q8K_quant_dbg NaN_IN_INPUT in_dim=%u n_rows=%u first_nan_idx=%d xr[0..3]=%g %g %g %g\n",
+                   in_dim, n_rows, first_nan,
+                   (double)xr[0], (double)xr[1], (double)xr[2], (double)xr[3]);
+        } else {
+            /* Don't fire again on subsequent clean inputs */
+            g_q8k_quant_dbg_fired = 0u;
+        }
+    }
     abs_part[tid] = tid < CUDA_QK_K ? fabsf(v) : 0.0f;
     val_part[tid] = v;
     __syncthreads();
@@ -7378,6 +8782,338 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
     }
     for (uint32_t rr = 0; rr < 4u; rr++) {
         uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
+        if (row >= expert_mid_dim) continue;
+        const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        float gate = 0.0f;
+        float up = 0.0f;
+        for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+            gate += dev_dot_iq2_xxs_q8_K_block_lut(gr + b, xqb + b, s_iq2_grid, s_iq2_signs);
+            up += dev_dot_iq2_xxs_q8_K_block_lut(ur + b, xqb + b, s_iq2_grid, s_iq2_signs);
+        }
+        gate = quarter_warp_sum_f32(gate, lane);
+        up = quarter_warp_sum_f32(up, lane);
+        if (lane == 0) {
+            if (clamp > 1.0e-6f) {
+                if (gate > clamp) gate = clamp;
+                if (up > clamp) up = clamp;
+                if (up < -clamp) up = -clamp;
+            }
+            const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+            if (write_aux) {
+                gate_out[off] = gate;
+                up_out[off] = up;
+            }
+            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        }
+    }
+}
+
+/* Phase 1 diagnostic variant: same memory access pattern as the production
+ * decode LUT kernel, but the iq2_xxs dequant/dot is replaced by a trivial
+ * sum-of-bytes accumulation. Reads exactly the same bytes from gate_base and
+ * up_base (and the same xq blocks). If this variant runs much faster than
+ * the real kernel, the iq2 LUT decode is on the critical path and the
+ * realistic Phase-1/Phase-4 upside is the gap to this number, not to the
+ * 245 GB/s memfloor. Gated by DS4_CUDA_MOE_DECODE_NODECODE=1; writes a
+ * deterministic-but-meaningless value to mid_out so the math fails
+ * loudly if anything ships it. */
+__global__ static void moe_gate_up_mid_decode_nodecode_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t write_aux,
+        float clamp) {
+    (void)clamp;
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row_lane = threadIdx.x >> 3u;
+    uint32_t pair = blockIdx.y;
+    uint32_t tok = pair / n_expert;
+    uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    uint32_t expert = (uint32_t)expert_i;
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    /* Touch xq blocks to mirror the production xq cache behavior even though
+     * we will not actually use the values. */
+    __shared__ cuda_block_q8_K sxq[16];
+    if (xq_blocks <= 16u) {
+        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
+        __syncthreads();
+    }
+    for (uint32_t rr = 0; rr < 4u; rr++) {
+        uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
+        if (row >= expert_mid_dim) continue;
+        const uint64_t *gr = (const uint64_t *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        const uint64_t *ur = (const uint64_t *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        /* Each iq2_xxs super-block is 16 bytes header-ish + (qs varying); for
+         * the bandwidth probe we just read sizeof(cuda_block_iq2_xxs) / 8 = 4
+         * 64-bit words per super-block, matching the real read footprint per
+         * block to within ~10%. The exact value does not matter; we XOR-fold
+         * into the accumulator so the compiler cannot eliminate the loads. */
+        uint64_t acc = 0;
+        const uint32_t words_per_block = (uint32_t)sizeof(cuda_block_iq2_xxs) / 8u;
+        for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+            const uint64_t *grb = gr + (uint64_t)b * words_per_block;
+            const uint64_t *urb = ur + (uint64_t)b * words_per_block;
+            #pragma unroll
+            for (uint32_t w = 0; w < words_per_block; w++) {
+                acc ^= grb[w];
+                acc ^= urb[w];
+            }
+        }
+        if (lane == 0) {
+            const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+            if (write_aux) {
+                gate_out[off] = (float)(acc & 0xFFu);
+                up_out[off] = (float)((acc >> 8) & 0xFFu);
+            }
+            /* Sentinel: never equal to a real production mid value, so
+             * downstream NaN-checks would catch this if it ever shipped. */
+            mid_out[off] = -1.0e30f + (float)(acc & 0xFu) * weights[(uint64_t)tok * n_expert + slot];
+        }
+    }
+}
+
+/* Phase 1++ statically-unrolled qwarp32 variant of the LUT-aware decode
+ * kernel. The DS4 model has expert_in_dim=4096, so xq_blocks=16 — a
+ * compile-time-constant inner-loop bound that the runtime kernel can't
+ * use because xq_blocks is a runtime uint32_t. Specializing on XQ_BLOCKS
+ * lets the compiler fully unroll the 2-iteration `b += 8` inner loop
+ * (lane reads super-blocks {lane, lane+8}), increasing instruction-level
+ * parallelism. Gated by DS4_CUDA_MOE_DECODE_LUT_UNROLL=1, falls through
+ * to the production kernel otherwise. */
+template <uint32_t XQ_BLOCKS>
+__global__ static void moe_gate_up_mid_decode_lut_qwarp32_unroll_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t write_aux,
+        float clamp) {
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row_lane = threadIdx.x >> 3u;
+    uint32_t pair = blockIdx.y;
+    uint32_t tok = pair / n_expert;
+    uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    uint32_t expert = (uint32_t)expert_i;
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * XQ_BLOCKS;
+    __shared__ cuda_block_q8_K sxq[XQ_BLOCKS];
+    __shared__ uint64_t s_iq2_grid[256];
+    __shared__ uint8_t s_iq2_signs[128];
+    for (uint32_t i = threadIdx.x; i < XQ_BLOCKS; i += blockDim.x) sxq[i] = xqb[i];
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+    __syncthreads();
+    xqb = sxq;
+    #pragma unroll
+    for (uint32_t rr = 0; rr < 4u; rr++) {
+        uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
+        if (row >= expert_mid_dim) continue;
+        const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        float gate = 0.0f;
+        float up = 0.0f;
+        #pragma unroll
+        for (uint32_t b = 0; b < XQ_BLOCKS; b += 8u) {
+            const uint32_t bi = b + lane;
+            if (bi < XQ_BLOCKS) {
+                gate += dev_dot_iq2_xxs_q8_K_block_lut(gr + bi, xqb + bi, s_iq2_grid, s_iq2_signs);
+                up   += dev_dot_iq2_xxs_q8_K_block_lut(ur + bi, xqb + bi, s_iq2_grid, s_iq2_signs);
+            }
+        }
+        gate = quarter_warp_sum_f32(gate, lane);
+        up = quarter_warp_sum_f32(up, lane);
+        if (lane == 0) {
+            if (clamp > 1.0e-6f) {
+                if (gate > clamp) gate = clamp;
+                if (up > clamp) up = clamp;
+                if (up < -clamp) up = -clamp;
+            }
+            const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+            if (write_aux) {
+                gate_out[off] = gate;
+                up_out[off] = up;
+            }
+            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        }
+    }
+}
+
+/* Phase 1+ half-warp variant of the LUT-aware decode kernel.
+ *
+ * Rationale (Phase 0c microbench finding): the production kernel runs at
+ * ~116 GB/s versus a 245 GB/s GB10 sustained-DRAM ceiling on a benign
+ * pattern. The nodecode probe pinned the LUT decode cost at only ~8.6% of
+ * the kernel; the rest is memory access pattern. Inspecting the warp
+ * structure: with 8 lanes per row × 4 row_lanes per warp, each warp issues
+ * 4 different row addresses concurrently (4 streams per warp, each row
+ * stride 1056 bytes apart). The L1/L2 coalescer prefers consecutive lanes
+ * to read consecutive bytes; 4 streams per warp halves achievable BW.
+ *
+ * This variant uses 16 lanes per row × 2 row_lanes per warp: each warp
+ * still has 32 threads but now issues only 2 distinct memory streams.
+ * Threads 0-15 cooperatively read all 16 super-blocks of row r0 (one
+ * super-block per lane); threads 16-31 read row r1 the same way. Within
+ * a warp, lanes 0..15 read 16 consecutive 66-byte super-blocks = 1056
+ * bytes spanning ~8 cache lines, perfectly coalesced.
+ *
+ * Bit-equivalent with the baseline LUT kernel: same float order of
+ * operations modulo the cross-lane reduction, which is half-warp instead
+ * of quarter-warp. Verified by --logprob-vectors before any toggling.
+ *
+ * Gated by DS4_CUDA_MOE_DECODE_LUT_HWARP16=1. */
+template <uint32_t BLOCK_M>
+__global__ static void moe_gate_up_mid_decode_lut_hwarp16_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t write_aux,
+        float clamp) {
+    /* 256 threads / 16 lanes per row = 16 row_lanes per block; BLOCK_M
+     * controls how many of those rows the block covers (with multiple rr
+     * passes when BLOCK_M > 16). Default tuned variant uses BLOCK_M=16
+     * (one pass per row_lane, maximum block parallelism). */
+    static_assert(BLOCK_M % 16 == 0 && BLOCK_M >= 16 && BLOCK_M <= 256,
+                  "BLOCK_M must be a multiple of 16 in [16, 256]");
+    const uint32_t RR_COUNT = BLOCK_M / 16u;
+    const uint32_t lane = threadIdx.x & 15u;
+    const uint32_t row_lane = threadIdx.x >> 4u;   /* 0..15 */
+    const uint32_t pair = blockIdx.y;
+    const uint32_t tok = pair / n_expert;
+    const uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    const uint32_t expert = (uint32_t)expert_i;
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    __shared__ cuda_block_q8_K sxq[16];
+    __shared__ uint64_t s_iq2_grid[256];
+    __shared__ uint8_t s_iq2_signs[128];
+    if (xq_blocks <= 16u) {
+        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
+        for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+        __syncthreads();
+        xqb = sxq;
+    }
+    #pragma unroll
+    for (uint32_t rr = 0; rr < RR_COUNT; rr++) {
+        const uint32_t row = blockIdx.x * BLOCK_M + row_lane + rr * 16u;
+        if (row >= expert_mid_dim) continue;
+        const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        float gate = 0.0f;
+        float up = 0.0f;
+        /* 16 lanes cooperatively cover xq_blocks super-blocks. When
+         * xq_blocks == 16 (the expected DS4 decode shape with
+         * expert_in_dim=4096 → xq_blocks=16), each lane does exactly one
+         * super-block per row, with no stride. */
+        for (uint32_t b = lane; b < xq_blocks; b += 16u) {
+            gate += dev_dot_iq2_xxs_q8_K_block_lut(gr + b, xqb + b, s_iq2_grid, s_iq2_signs);
+            up   += dev_dot_iq2_xxs_q8_K_block_lut(ur + b, xqb + b, s_iq2_grid, s_iq2_signs);
+        }
+        gate = half_warp_sum_f32(gate, lane);
+        up   = half_warp_sum_f32(up, lane);
+        if (lane == 0) {
+            if (clamp > 1.0e-6f) {
+                if (gate > clamp) gate = clamp;
+                if (up > clamp) up = clamp;
+                if (up < -clamp) up = -clamp;
+            }
+            const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+            if (write_aux) {
+                gate_out[off] = gate;
+                up_out[off] = up;
+            }
+            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        }
+    }
+}
+
+/* Phase 1 tile/CTA sweep variant of moe_gate_up_mid_decode_lut_qwarp32_kernel.
+ * Same memory access pattern and same LUT/shared-mem layout, but the rows
+ * per block (`BLOCK_M` = `RR_COUNT * 32`) is templated so we can sweep grid
+ * shapes via env flags. The baseline kernel uses RR_COUNT=4 / BLOCK_M=128.
+ *
+ * SGLang's SM121 CUTLASS work showed +6.3% throughput from tile-shape tuning
+ * alone on a comparable MoE workload; the routed MoE on GB10 sits at ~44% of
+ * the measured 245 GB/s sustained DRAM read, so there is real headroom.
+ *
+ * The kernel is gated by DS4_CUDA_MOE_DECODE_LUT_TILE = {64, 128, 256} and
+ * stays bit-equivalent with the baseline because the math is identical:
+ * only the row distribution across blocks changes. */
+template <uint32_t RR_COUNT>
+__global__ static void moe_gate_up_mid_decode_lut_qwarp32_tiled_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t write_aux,
+        float clamp) {
+    static_assert(RR_COUNT >= 1 && RR_COUNT <= 16,
+                  "RR_COUNT outside reasonable sweep range");
+    const uint32_t BLOCK_M = RR_COUNT * 32u;
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row_lane = threadIdx.x >> 3u;
+    uint32_t pair = blockIdx.y;
+    uint32_t tok = pair / n_expert;
+    uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    uint32_t expert = (uint32_t)expert_i;
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    __shared__ cuda_block_q8_K sxq[16];
+    __shared__ uint64_t s_iq2_grid[256];
+    __shared__ uint8_t s_iq2_signs[128];
+    if (xq_blocks <= 16u) {
+        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
+        for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+        __syncthreads();
+        xqb = sxq;
+    }
+    #pragma unroll
+    for (uint32_t rr = 0; rr < RR_COUNT; rr++) {
+        uint32_t row = blockIdx.x * BLOCK_M + row_lane + rr * 32u;
         if (row >= expert_mid_dim) continue;
         const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
         const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
@@ -8104,6 +9840,104 @@ __global__ static void moe_down_qwarp32_kernel(
     for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_q2_K_q8_K_block(wr + b, xq + b);
     acc = quarter_warp_sum_f32(acc, lane);
     if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = acc;
+}
+
+/* Q4_K decode variant of moe_gate_up_mid_decode_lut_qwarp32_kernel.
+ * Same grid/launch layout, same quarter-warp reduction, but uses
+ * dev_dot_q4_K_q8_K_block for the gate and up matmul. Used only when the
+ * routed experts are stored as Q4_K (the MTP draft head case). Slower
+ * than the iq2_xxs LUT path; correctness over speed for now. */
+__global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t write_aux,
+        float clamp) {
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row_lane = threadIdx.x >> 3u;
+    uint32_t pair = blockIdx.y;
+    uint32_t tok = pair / n_expert;
+    uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    uint32_t expert = (uint32_t)expert_i;
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    for (uint32_t rr = 0; rr < 4u; rr++) {
+        uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
+        if (row >= expert_mid_dim) continue;
+        const cuda_block_q4_K *gr = (const cuda_block_q4_K *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        const cuda_block_q4_K *ur = (const cuda_block_q4_K *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        float gate = 0.0f;
+        float up = 0.0f;
+        for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+            gate += dev_dot_q4_K_q8_K_block(gr + b, xqb + b);
+            up   += dev_dot_q4_K_q8_K_block(ur + b, xqb + b);
+        }
+        gate = quarter_warp_sum_f32(gate, lane);
+        up = quarter_warp_sum_f32(up, lane);
+        if (lane == 0) {
+            if (clamp > 1.0e-6f) {
+                if (gate > clamp) gate = clamp;
+                if (up > clamp) up = clamp;
+                if (up < -clamp) up = -clamp;
+            }
+            const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+            if (write_aux) {
+                gate_out[off] = gate;
+                up_out[off] = up;
+            }
+            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+            /* One-shot debug: print the very first (pair=0, row=0) gate/up
+             * pair so we can see whether the Q4_K decode produced sane
+             * numbers. Gated by DS4_MTP_Q4K_DEBUG so it's free when off. */
+            if (pair == 0 && row == 0 && blockIdx.x == 0 && rr == 0) {
+                /* Use a single fprintf-equivalent via printf which is allowed
+                 * in CUDA device code. Compile-time-disabled by default. */
+#ifdef DS4_CUDA_MOE_Q4K_PRINTF
+                printf("ds4: q4K dbg gate=%g up=%g mid=%g expert=%u\n",
+                       gate, up, mid_out[off], expert);
+#endif
+            }
+        }
+    }
+}
+
+/* Q4_K decode variant of moe_down_sum6_qwarp32_kernel. */
+__global__ static void moe_down_q4K_sum6_qwarp32_kernel(
+        float *out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim) {
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    if (row >= out_dim) return;
+    float total = 0.0f;
+    #pragma unroll
+    for (uint32_t slot = 0; slot < 6u; slot++) {
+        int32_t expert_i = selected[slot];
+        if (expert_i < 0) expert_i = 0;
+        const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+        const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_q4_K_q8_K_block(wr + b, xq + b);
+        acc = quarter_warp_sum_f32(acc, lane);
+        if (lane == 0) total += acc;
+    }
+    if (lane == 0) out[row] = total;
 }
 
 __global__ static void moe_down_sum6_qwarp32_kernel(
@@ -8846,7 +10680,21 @@ static int routed_moe_launch(
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
         return 0;
     }
-    if (gate_type != 16u || down_type != 10u) return 0;
+    /* Accepted quant pairs:
+     *   (gate=16 IQ2_XXS, down=10 Q2_K) — the production DSv4-Flash base
+     *     model and matching imatrix variants.
+     *   (gate=12 Q4_K, down=12 Q4_K) — the MTP draft head gguf, decoded
+     *     by the q4K kernel variants below. */
+    const int q4k_path = (gate_type == 12u && down_type == 12u);
+    if (!q4k_path && (gate_type != 16u || down_type != 10u)) {
+        if (getenv("DS4_MTP_CHAIN_LOG") != NULL) {
+            fprintf(stderr,
+                    "ds4: routed_moe gate_type=%u down_type=%u expert_in=%u expert_mid=%u out=%u "
+                    "(reject: only iq2/q2 or q4_K supported)\n",
+                    gate_type, down_type, expert_in_dim, expert_mid_dim, out_dim);
+        }
+        return 0;
+    }
     const uint64_t gate_bytes = 256ull * gate_expert_bytes;
     const uint64_t down_bytes = 256ull * down_expert_bytes;
     if (gate_bytes > model_size - gate_offset ||
@@ -8870,8 +10718,10 @@ static int routed_moe_launch(
         cuda_block_q8_K *xq = (cuda_block_q8_K *)down->ptr;
         cuda_block_q8_K *midq = (cuda_block_q8_K *)gate->ptr;
         const uint32_t profile_moe = getenv("DS4_CUDA_MOE_PROFILE") != NULL;
+        const uint32_t moe_event_profile = ds4_gpu_moe_event_profile_enabled();
+        const uint32_t need_prof_events = profile_moe || moe_event_profile;
         cudaEvent_t prof_ev[7] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL};
-        if (profile_moe) {
+        if (need_prof_events) {
             for (uint32_t i = 0; i < 7u; i++) {
                 if (cudaEventCreate(&prof_ev[i]) != cudaSuccess) {
                     for (uint32_t j = 0; j < i; j++) (void)cudaEventDestroy(prof_ev[j]);
@@ -9104,25 +10954,162 @@ static int routed_moe_launch(
                     n_expert,
                     clamp);
             } else if (ok) {
-                dim3 qgrid((expert_mid_dim + 127u) / 128u, n_tokens * n_expert, 1);
                 if (use_decode_lut_gate) {
-                    moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256>>>(
-                        (float *)gate->ptr,
-                        (float *)up->ptr,
-                        (float *)mid->ptr,
-                        gate_w,
-                        up_w,
-                        xq,
-                        (const int32_t *)selected->ptr,
-                        (const float *)weights->ptr,
-                        gate_expert_bytes,
-                        gate_row_bytes,
-                        xq_blocks,
-                        expert_mid_dim,
-                        n_expert,
-                        write_gate_up,
-                        clamp);
+                    /* Q4_K dispatch (MTP draft head). The iq2_xxs LUT path
+                     * below assumes gate/up are iq2_xxs blocks; for Q4_K we
+                     * use the parallel q4K kernel which calls
+                     * dev_dot_q4_K_q8_K_block. */
+                    if (q4k_path) {
+                        dim3 qgrid((expert_mid_dim + 127u) / 128u,
+                                   n_tokens * n_expert, 1);
+                        moe_gate_up_mid_decode_q4K_qwarp32_kernel<<<qgrid, 256>>>(
+                            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                            gate_w, up_w, xq, (const int32_t *)selected->ptr,
+                            (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
+                            xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp);
+                        ok = cuda_ok(cudaGetLastError(), "routed_moe gate/up q4K launch");
+                        goto moe_gate_up_done;
+                    }
+                    const int use_nodecode = (n_tokens == 1u) &&
+                        getenv("DS4_CUDA_MOE_DECODE_NODECODE") != NULL;
+                    if (use_nodecode) {
+                        /* Bandwidth-floor diagnostic: same memory access
+                         * pattern, no iq2 LUT decode. Produces garbage; do
+                         * not enable in production. */
+                        dim3 qgrid((expert_mid_dim + 127u) / 128u,
+                                   n_tokens * n_expert, 1);
+                        moe_gate_up_mid_decode_nodecode_kernel<<<qgrid, 256>>>(
+                            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                            gate_w, up_w, xq, (const int32_t *)selected->ptr,
+                            (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
+                            xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp);
+                        ok = cuda_ok(cudaGetLastError(), "routed_moe gate/up nodecode launch");
+                        goto moe_gate_up_done;
+                    }
+                    /* Half-warp 16-lane variant: 2 streams per warp instead
+                     * of 4. Tuned per block_m via DS4_CUDA_MOE_DECODE_LUT_HWARP16
+                     * (=1 enables default BLOCK_M=16; =N picks BLOCK_M=N for
+                     * supported N in {16,32,64,128}). */
+                    const char *hwarp16_env = getenv("DS4_CUDA_MOE_DECODE_LUT_HWARP16");
+                    if (hwarp16_env && hwarp16_env[0]) {
+                        long bm = atol(hwarp16_env);
+                        if (bm == 0 || bm == 1) bm = 16;
+                        const uint32_t block_m = (uint32_t)bm;
+                        dim3 hgrid((expert_mid_dim + block_m - 1u) / block_m,
+                                   n_tokens * n_expert, 1);
+                        switch (block_m) {
+                            case 16u:
+                                moe_gate_up_mid_decode_lut_hwarp16_kernel<16><<<hgrid, 256>>>(
+                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                                    gate_w, up_w, xq, (const int32_t *)selected->ptr,
+                                    (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
+                                    xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp);
+                                break;
+                            case 32u:
+                                moe_gate_up_mid_decode_lut_hwarp16_kernel<32><<<hgrid, 256>>>(
+                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                                    gate_w, up_w, xq, (const int32_t *)selected->ptr,
+                                    (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
+                                    xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp);
+                                break;
+                            case 64u:
+                                moe_gate_up_mid_decode_lut_hwarp16_kernel<64><<<hgrid, 256>>>(
+                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                                    gate_w, up_w, xq, (const int32_t *)selected->ptr,
+                                    (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
+                                    xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp);
+                                break;
+                            case 128u:
+                                moe_gate_up_mid_decode_lut_hwarp16_kernel<128><<<hgrid, 256>>>(
+                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                                    gate_w, up_w, xq, (const int32_t *)selected->ptr,
+                                    (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
+                                    xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp);
+                                break;
+                            default:
+                                /* Unsupported BLOCK_M: fall through to baseline */
+                                goto hwarp16_skip;
+                        }
+                        ok = cuda_ok(cudaGetLastError(), "routed_moe gate/up hwarp16 launch");
+                        goto moe_gate_up_done;
+                    }
+hwarp16_skip: ;
+                    /* Statically-unrolled inner loop: the DS4 model always has
+                     * xq_blocks=16 (expert_in_dim=4096), so specializing on
+                     * XQ_BLOCKS=16 lets the compiler fully unroll the
+                     * 2-iteration `b += 8` inner loop. Measured win:
+                     * +0.89% wall tok/s (13.455 → 13.575 avg, 2-run pairs),
+                     * +4.7% MoE achieved BW (115.7 → 121.1 GB/s). Bit-equiv
+                     * with the production kernel — verified by
+                     * --logprob-vectors. Default on when xq_blocks=16;
+                     * DS4_CUDA_MOE_DECODE_LUT_NO_UNROLL=1 falls back. */
+                    if (xq_blocks == 16u &&
+                        getenv("DS4_CUDA_MOE_DECODE_LUT_NO_UNROLL") == NULL) {
+                        dim3 ugrid((expert_mid_dim + 127u) / 128u,
+                                   n_tokens * n_expert, 1);
+                        moe_gate_up_mid_decode_lut_qwarp32_unroll_kernel<16><<<ugrid, 256>>>(
+                            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                            gate_w, up_w, xq, (const int32_t *)selected->ptr,
+                            (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
+                            expert_mid_dim, n_expert, write_gate_up, clamp);
+                        ok = cuda_ok(cudaGetLastError(), "routed_moe gate/up unroll launch");
+                        goto moe_gate_up_done;
+                    }
+                    /* Phase 1 tile sweep. Block_m is the number of expert_mid
+                     * rows produced per block; the tile sweep changes how the
+                     * fixed 256-thread CTA splits the row dimension between
+                     * intra-CTA reuse (more rr passes) and inter-CTA
+                     * parallelism (more blocks). Default 128 matches the
+                     * historical kernel. */
+                    uint32_t block_m_env = 128u;
+                    const char *tile_env = getenv("DS4_CUDA_MOE_DECODE_LUT_TILE");
+                    if (tile_env && tile_env[0]) {
+                        const long v = atol(tile_env);
+                        if (v == 32 || v == 64 || v == 128 || v == 256 || v == 512) {
+                            block_m_env = (uint32_t)v;
+                        }
+                    }
+                    dim3 qgrid((expert_mid_dim + block_m_env - 1u) / block_m_env,
+                               n_tokens * n_expert, 1);
+                    switch (block_m_env) {
+                        case 32u:
+                            moe_gate_up_mid_decode_lut_qwarp32_tiled_kernel<1><<<qgrid, 256>>>(
+                                (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                                gate_w, up_w, xq, (const int32_t *)selected->ptr,
+                                (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
+                                xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp);
+                            break;
+                        case 64u:
+                            moe_gate_up_mid_decode_lut_qwarp32_tiled_kernel<2><<<qgrid, 256>>>(
+                                (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                                gate_w, up_w, xq, (const int32_t *)selected->ptr,
+                                (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
+                                xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp);
+                            break;
+                        case 256u:
+                            moe_gate_up_mid_decode_lut_qwarp32_tiled_kernel<8><<<qgrid, 256>>>(
+                                (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                                gate_w, up_w, xq, (const int32_t *)selected->ptr,
+                                (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
+                                xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp);
+                            break;
+                        case 512u:
+                            moe_gate_up_mid_decode_lut_qwarp32_tiled_kernel<16><<<qgrid, 256>>>(
+                                (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                                gate_w, up_w, xq, (const int32_t *)selected->ptr,
+                                (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
+                                xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp);
+                            break;
+                        default: /* 128 -> use the existing baseline kernel */
+                            moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256>>>(
+                                (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                                gate_w, up_w, xq, (const int32_t *)selected->ptr,
+                                (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
+                                xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp);
+                            break;
+                    }
                 } else {
+                    dim3 qgrid((expert_mid_dim + 127u) / 128u, n_tokens * n_expert, 1);
                     moe_gate_up_mid_qwarp32_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
@@ -9141,6 +11128,7 @@ static int routed_moe_launch(
                 }
             }
             ok = cuda_ok(cudaGetLastError(), "routed_moe gate/up launch");
+moe_gate_up_done: ;
         }
         if (prof_ev[3]) (void)cudaEventRecord(prof_ev[3], 0);
         if (ok) {
@@ -9163,15 +11151,27 @@ static int routed_moe_launch(
             }
             if (use_direct_down_sum6) {
                 dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
-                moe_down_sum6_qwarp32_kernel<<<sgrid, 256>>>(
-                    (float *)out->ptr,
-                    down_w,
-                    midq,
-                    (const int32_t *)selected->ptr,
-                    down_expert_bytes,
-                    down_row_bytes,
-                    midq_blocks,
-                    out_dim);
+                if (q4k_path) {
+                    moe_down_q4K_sum6_qwarp32_kernel<<<sgrid, 256>>>(
+                        (float *)out->ptr,
+                        down_w,
+                        midq,
+                        (const int32_t *)selected->ptr,
+                        down_expert_bytes,
+                        down_row_bytes,
+                        midq_blocks,
+                        out_dim);
+                } else {
+                    moe_down_sum6_qwarp32_kernel<<<sgrid, 256>>>(
+                        (float *)out->ptr,
+                        down_w,
+                        midq,
+                        (const int32_t *)selected->ptr,
+                        down_expert_bytes,
+                        down_row_bytes,
+                        midq_blocks,
+                        out_dim);
+                }
             } else if (use_atomic_down) {
                 uint64_t n = (uint64_t)n_tokens * out_dim;
                 zero_kernel<<<(n + 255u) / 256u, 256>>>((float *)out->ptr, n);
@@ -9307,9 +11307,24 @@ static int routed_moe_launch(
                 (void)cudaEventElapsedTime(&ms_down, prof_ev[4], prof_ev[5]);
                 (void)cudaEventElapsedTime(&ms_sum, prof_ev[5], prof_ev[6]);
                 (void)cudaEventElapsedTime(&ms_total, prof_ev[0], prof_ev[6]);
-                fprintf(stderr,
-                        "ds4: CUDA MoE profile tokens=%u pairs=%u xq=%.3f sort=%.3f gateup=%.3f midq=%.3f down=%.3f sum=%.3f total=%.3f ms\n",
-                        n_tokens, pair_count, ms_xq, ms_sort, ms_gate, ms_midq, ms_down, ms_sum, ms_total);
+                if (profile_moe) {
+                    fprintf(stderr,
+                            "ds4: CUDA MoE profile tokens=%u pairs=%u xq=%.3f sort=%.3f gateup=%.3f midq=%.3f down=%.3f sum=%.3f total=%.3f ms\n",
+                            n_tokens, pair_count, ms_xq, ms_sort, ms_gate, ms_midq, ms_down, ms_sum, ms_total);
+                }
+                if (moe_event_profile) {
+                    /* pair_count = n_tokens * n_expert covers exactly the
+                     * active experts the gate/up/down kernels read. Each
+                     * active expert touches gate + up + down weight matrices. */
+                    const uint64_t gate_up_bytes = (uint64_t)pair_count * gate_expert_bytes * 2ull;
+                    const uint64_t down_bytes_call = (uint64_t)pair_count * down_expert_bytes;
+                    ds4_gpu_moe_event_profile_record(n_tokens,
+                                                      gate_up_bytes,
+                                                      down_bytes_call,
+                                                      ms_xq, ms_sort, ms_gate,
+                                                      ms_midq, ms_down, ms_sum,
+                                                      ms_total);
+                }
             }
             for (uint32_t i = 0; i < 7u; i++) (void)cudaEventDestroy(prof_ev[i]);
         }

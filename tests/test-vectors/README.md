@@ -38,3 +38,32 @@ To inspect a local top-logprob dump manually:
   --dump-logprobs /tmp/long_code_audit.ds4.json \
   --logprobs-top-k 20
 ```
+
+## Local regression fixture (`local.vec`)
+
+The cloud `official.vec` will drift across imatrix variants because the
+hosted API output is fixed while local quantization changes. When you swap
+the active model (e.g. a new imatrix build) and `official.vec` starts
+failing in places where the inference *code* is fine, regenerate a
+local-only fixture instead:
+
+```sh
+./tests/test-vectors/regen_local_vectors.py \
+  -m /home/cghart/ds4/ds4flash.gguf \
+  -o tests/test-vectors/local.vec
+```
+
+Then run the gate against the local fixture:
+
+```sh
+DS4_TEST_MODEL=/home/cghart/ds4/ds4flash.gguf \
+DS4_TEST_VECTOR_FILE=tests/test-vectors/local.vec \
+  ./ds4_test --logprob-vectors
+```
+
+`local.vec` is a strict argmax-only regression gate — it catches *changes
+in inference behavior* between ds4 versions against the same model, but
+it does not compare against the cloud API for quality. Keep
+`official.vec` as the cloud-quality reference and use `local.vec` for
+day-to-day code-regression CI when the active model is not the one
+`official.vec` was calibrated against.
