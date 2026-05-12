@@ -214,6 +214,14 @@ Start a local OpenAI/Anthropic-compatible server:
 ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
+To expose the OpenAI-compatible API to another machine on your LAN, bind to all
+interfaces and choose an explicit port:
+
+```sh
+./ds4-server --cuda --host 0.0.0.0 --port 18080 --ctx 32768 --tokens 2048
+curl http://SERVER_IP:18080/v1/models
+```
+
 The server keeps one mutable backend/KV checkpoint in memory,
 so stateless clients that resend a longer version of the same prompt can reuse
 the shared prefix instead of pre-filling from token zero.
@@ -646,6 +654,25 @@ Set `CUDA_ARCH` explicitly when cross-building or when you need a known target:
 ```sh
 make CUDA_ARCH=sm_120
 make CUDA_ARCH=        # old nvcc default target behavior
+```
+
+For Jetson Thor / Thor developer kits, build CUDA binaries for Blackwell
+`sm_110` explicitly:
+
+```sh
+make CUDA_ARCH=sm_110 ds4 ds4-server ds4-bench
+./ds4 --cuda -m ./ds4flash.gguf -p "Hello" --nothink
+```
+
+On Jetson systems, use the platform tools to select the desired power profile
+before benchmarking. The MAXN mode number can vary by Jetson release, so check
+the available modes first:
+
+```sh
+nvpmodel -q --verbose
+sudo nvpmodel -m MODE_ID_FOR_MAXN
+sudo jetson_clocks
+nvpmodel -q
 ```
 
 There is also a CPU reference/debug path:
