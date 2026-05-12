@@ -329,11 +329,16 @@ tokens use MPP for `attn_q_b` across layers, while larger batches use the
 late full-model-safe layer window 38..42 plus `attn_q_b` in layers 32..37. It
 uses 64-token tiles below 4096-token batches and 32-token tiles for larger
 prompt batches on M5, accepts partial token tails, and falls back to the legacy
-kernel when the Metal 4 tensor path is unavailable.
+kernel when the Metal 4 tensor path is unavailable. When macOS reports Low
+Power Mode, auto widens Q8_0 prefill to all Q8_0 contexts because that profile
+improves both prefill and generation speed in current M5 Max low-power sweeps.
+Set `DS4_METAL_MPP_LOW_POWER_DISABLE=1` to keep the normal guarded Q8_0
+profile, or `DS4_METAL_MPP_LOW_POWER_ENABLE=1` to force the low-power profile
+for comparison.
 Set `DS4_METAL_MPP_Q8_0_PARTIAL_ENABLE=0` to force the old partial-tail
 fallback while debugging. Set `DS4_METAL_MPP_Q8_0_FILTER=all` to reproduce the
-unsafe all-layer Q8 route, `DS4_METAL_MPP_Q8_0_FILTER=late_safe` to request the
-older conservative late window explicitly, or
+wider all-context Q8 route, `DS4_METAL_MPP_Q8_0_FILTER=late_safe` to request
+the older conservative late window explicitly, or
 `DS4_METAL_MPP_Q8_0_FILTER=<substring[,substring...]>` to force named
 full-graph Q8 modules such as `attn_q_a`, `attn_kv`, `attn_q_b`, `attn_out`,
 `shared_gate`, `shared_up`, or `shared_down`. Use
@@ -385,7 +390,12 @@ Q8_0 tile width, and 64-token tiles for attention-output low projections. In a
 local M5 Max `ds4-bench` sweep with 64 generated tokens, auto sampled about
 `443/459/522/486/465` prompt tokens/sec and
 `38.6/38.2/37.6/34.0/33.6` generation tokens/sec at the
-`0.5k/1k/2k/4k/8k` frontiers, with visible desktop-load variance. The F16
+`0.5k/1k/2k/4k/8k` frontiers, with visible desktop-load variance. In macOS Low
+Power Mode on the same M5 Max, the guarded default sampled about
+`133/119/131/118/186` prompt tokens/sec and
+`13.5/12.2/11.0/13.3/12.9` generation tokens/sec at those frontiers with 128
+generated tokens; the low-power Q8 profile sampled about
+`197/189/220/213/206` and `15.1/14.9/14.7/14.0/13.8` respectively. The F16
 compressor route did not introduce measurable drift in the current prompt set.
 
 The `DS4_METAL_MPP_FAST=1` profile is the measured high-throughput diagnostic
