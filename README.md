@@ -384,6 +384,31 @@ Optionally make it the default Pi model in `~/.pi/agent/settings.json`:
 }
 ```
 
+For **swival.dev**, point its generic OpenAI-compatible provider at the running server:
+
+```sh
+swival --provider generic \
+       --base-url http://127.0.0.1:8000/v1 \
+       --model deepseek-v4-flash \
+       --max-context-tokens 100000 \
+       --max-output-tokens 100000
+```
+
+`max-output-tokens` must be less than or equal to `max-context-tokens`.
+
+To toggle thinking mode, pass it through `--extra-body` rather than
+`--reasoning-effort` (ds4-server rejects swival's `none` and `minimal` levels
+and has no `max` choice in swival's enum):
+
+```sh
+swival --extra-body '{"thinking": false}' ...         # non-thinking
+swival --extra-body '{"thinking": true}' ...          # normal thinking (default)
+swival --extra-body '{"reasoning_effort": "max"}' ... # Think Max (server must be started with --ctx >= 393216, else it falls back to normal thinking)
+```
+
+Using `--model deepseek-chat` or `--model deepseek-reasoner` works as a
+shorthand for the first two.
+
 For **Claude Code**, use the Anthropic-compatible endpoint. A wrapper like this
 matches the local `~/bin/claude-ds4` setup:
 
