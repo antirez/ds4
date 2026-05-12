@@ -2664,6 +2664,14 @@ int ds4_gpu_init(void) {
     @autoreleasepool {
         g_device = MTLCreateSystemDefaultDevice();
         if (!g_device) {
+            NSArray<id<MTLDevice>> *devices = MTLCopyAllDevices();
+            if ([devices count] > 0) {
+                g_device = devices[0];
+                fprintf(stderr, "ds4: default Metal device unavailable; using enumerated device %s\n",
+                        g_device.name ? [g_device.name UTF8String] : "unknown Metal device");
+            }
+        }
+        if (!g_device) {
             fprintf(stderr, "ds4: Metal device not available\n");
             return 0;
         }
