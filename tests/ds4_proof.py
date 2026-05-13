@@ -662,6 +662,16 @@ def default_mtp_profiles() -> list[EngineProfile]:
             mtp_draft=3,
         ),
         EngineProfile(
+            "mtp-v2-active",
+            {
+                **FAST_MTP_ENV,
+                "DS4_MTP_VERIFY_V2": "1",
+                "DS4_MTP_TIMING": "1",
+            },
+            use_mtp=True,
+            mtp_draft=3,
+        ),
+        EngineProfile(
             "mtp-no-opt-output",
             {
                 "DS4_CUDA_MTP_TOP2": "1",

@@ -94,6 +94,12 @@ The currently useful CUDA MTP flags are:
   top-2 and row1 full-output work together. It is exact, but current GB10
   measurements favor the simpler no-opt schedule, so it is not part of the
   recommended fast baseline.
+- `DS4_MTP_VERIFY_V2_SHADOW=1`: opt-in diagnostic path for the fixed-depth
+  decode3 verifier primitive. It runs in addition to the authoritative verifier
+  and should only be used for proof runs.
+- `DS4_MTP_VERIFY_V2=1`: opt-in active decode3 suffix verifier for
+  `--mtp-draft 3`. It exercises selected-row output and prefix-depth commit
+  without changing the default `mtp-fast` path.
 
 The structural CUDA optimizations are default-on after this work:
 
