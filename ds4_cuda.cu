@@ -6168,7 +6168,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
         if (!tmp) return 0;
         float *scores = tmp;
         float *out_tmp = (float *)((char *)tmp + out_offset);
-        const float alpha = rsqrtf((float)head_dim);
+        const float alpha = 1.0f/sqrtf((float)head_dim);
         const float beta = 0.0f;
         cublasStatus_t st = cublasSgemmStridedBatched(g_cublas,
                                                       CUBLAS_OP_T,
@@ -6538,7 +6538,7 @@ static int attention_prefill_mixed_launch(
                 n_comp,
                 head_dim);
         if (!cuda_ok(cudaGetLastError(), "attention mixed kv pack launch")) return 0;
-        const float alpha = rsqrtf((float)head_dim);
+        const float alpha = 1.0f/sqrtf((float)head_dim);
         const float beta = 0.0f;
         cublasStatus_t st = cublasSgemmStridedBatched(g_cublas,
                                                       CUBLAS_OP_T,
