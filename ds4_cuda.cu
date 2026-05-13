@@ -10511,7 +10511,11 @@ static int routed_moe_launch(
             if (prof_ev[0]) (void)cudaEventRecord(prof_ev[0], 0);
         }
         const uint32_t pair_count = n_tokens * n_expert;
-        const uint32_t use_sorted_pairs = n_tokens > 1u;
+        const uint32_t use_direct_gate_up_n2 =
+            n_tokens == 2u && n_expert == 6u &&
+            xq_blocks <= 16u &&
+            getenv("DS4_CUDA_MOE_NO_GATE_UP_N2_LUT") == NULL;
+        const uint32_t use_sorted_pairs = n_tokens > 1u && !use_direct_gate_up_n2;
         const uint32_t use_expert_tiles = use_sorted_pairs && getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL;
         const uint32_t expert_tile_m = getenv("DS4_CUDA_MOE_TILE4") ? 4u : 8u;
         const uint32_t write_gate_up = getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL;
@@ -10753,7 +10757,7 @@ static int routed_moe_launch(
                         n_expert,
                         write_gate_up,
                         clamp);
-                } else if (use_decode_lut_gate) {
+                } else if (use_decode_lut_gate || use_direct_gate_up_n2) {
                     moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
