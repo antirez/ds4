@@ -16089,6 +16089,10 @@ typedef struct {
     bool have_logits;
 } ds4_mtp_verify_result;
 
+typedef struct {
+    uint32_t base_mtp_n_raw;
+} ds4_mtp_state_txn;
+
 static void mtp_verify_plan_init(ds4_mtp_verify_plan *p,
                                  uint32_t start,
                                  const int *tokens,
@@ -16128,6 +16132,18 @@ static void mtp_verify_result_decide_from_tops(ds4_mtp_verify_result *r,
         commit++;
     }
     mtp_verify_result_set_commit(r, commit);
+}
+
+static void mtp_state_txn_begin(ds4_mtp_state_txn *txn, const ds4_session *s) {
+    txn->base_mtp_n_raw = s->graph.mtp_n_raw;
+}
+
+static void mtp_state_txn_keep_accepted(ds4_session *s,
+                                        const ds4_mtp_state_txn *txn,
+                                        int accepted_tokens) {
+    uint32_t keep = txn->base_mtp_n_raw + (uint32_t)accepted_tokens;
+    if (keep > s->graph.raw_window) keep = s->graph.raw_window;
+    s->graph.mtp_n_raw = keep;
 }
 
 static void spec_frontier_free(ds4_spec_frontier *f) {
@@ -18195,19 +18211,14 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         return n_accept;
     }
     if (drafts[0] == eos_token) draft_cap = 1;
-    const uint32_t mtp_base_raw = s->graph.mtp_n_raw;
+    ds4_mtp_state_txn mtp_txn;
+    mtp_state_txn_begin(&mtp_txn, s);
     /*
      * MTP has its own raw SWA cache. Recursive drafting writes speculative
      * future rows into it; after verification, rows beyond the accepted prefix
      * must become invisible.  We do not copy/rollback the cache body because the
      * next draft attempt will overwrite future slots.  A counter is enough.
      */
-#define DS4_MTP_KEEP_ACCEPTED(n_) do { \
-        uint32_t keep_ = mtp_base_raw + (uint32_t)(n_); \
-        if (keep_ > s->graph.raw_window) keep_ = s->graph.raw_window; \
-        s->graph.mtp_n_raw = keep_; \
-    } while (0)
-
     for (; draft_n < draft_cap; draft_n++) {
         ds4_gpu_tensor *prev_hc = (draft_n & 1) ? s->graph.mtp_state_hc : s->graph.mtp_next_hc;
         ds4_gpu_tensor *out_hc = (draft_n & 1) ? s->graph.mtp_next_hc : s->graph.mtp_state_hc;
@@ -18275,7 +18286,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             accepted[n_accept++] = drafts[0];
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
-            DS4_MTP_KEEP_ACCEPTED(1);
+            mtp_state_txn_keep_accepted(s, &mtp_txn, 1);
             if (mtp_timing) {
                 const double done = now_sec();
                 fprintf(stderr,
@@ -18334,7 +18345,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             if (n_accept < accepted_cap) accepted[n_accept++] = drafts[1];
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
-            DS4_MTP_KEEP_ACCEPTED(2);
+            mtp_state_txn_keep_accepted(s, &mtp_txn, 2);
             if (mtp_timing) {
                 fprintf(stderr,
                         "ds4: mtp timing decode2 drafted=2 committed=2 target=%.3f ms draft=%.3f ms "
@@ -18362,7 +18373,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             accepted[n_accept++] = drafts[0];
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
-            DS4_MTP_KEEP_ACCEPTED(1);
+            mtp_state_txn_keep_accepted(s, &mtp_txn, 1);
             if (mtp_timing) {
                 const double replay_done = now_sec();
                 fprintf(stderr,
@@ -18636,7 +18647,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                         }
                         s->checkpoint_valid = true;
                         s->mtp_draft_valid = false;
-                        DS4_MTP_KEEP_ACCEPTED(replayed);
+                        mtp_state_txn_keep_accepted(s, &mtp_txn, replayed);
                         spec_frontier_free(&frontier);
                         free(row_logits);
                         free(shadow_logits);
@@ -18660,7 +18671,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     }
                     s->checkpoint_valid = true;
                     s->mtp_draft_valid = false;
-                    DS4_MTP_KEEP_ACCEPTED(draft_n);
+                    mtp_state_txn_keep_accepted(s, &mtp_txn, draft_n);
                     if (mtp_timing) {
                         fprintf(stderr,
                                 "ds4: mtp timing micro drafted=%d committed=%d target=%.3f ms draft=%.3f ms "
@@ -18693,7 +18704,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     accepted[n_accept++] = drafts[0];
                     s->checkpoint_valid = true;
                     s->mtp_draft_valid = false;
-                    DS4_MTP_KEEP_ACCEPTED(1);
+                    mtp_state_txn_keep_accepted(s, &mtp_txn, 1);
                     token_vec_push(&s->checkpoint, drafts[0]);
                     if (mtp_timing) {
                         fprintf(stderr,
@@ -18731,7 +18742,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     accepted[n_accept++] = drafts[0];
                     s->checkpoint_valid = true;
                     s->mtp_draft_valid = false;
-                    DS4_MTP_KEEP_ACCEPTED(1);
+                    mtp_state_txn_keep_accepted(s, &mtp_txn, 1);
                     token_vec_push(&s->checkpoint, drafts[0]);
                     if (mtp_timing) {
                         const double replay_done = now_sec();
@@ -18777,7 +18788,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     }
                     s->checkpoint_valid = true;
                     s->mtp_draft_valid = false;
-                    DS4_MTP_KEEP_ACCEPTED(commit_drafts);
+                    mtp_state_txn_keep_accepted(s, &mtp_txn, commit_drafts);
                     if (mtp_timing) {
                         const double replay_done = now_sec();
                         fprintf(stderr,
@@ -18810,7 +18821,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         } else {
             snprintf(err, errlen, "MTP verifier failed");
             s->checkpoint_valid = false;
-            DS4_MTP_KEEP_ACCEPTED(0);
+            mtp_state_txn_keep_accepted(s, &mtp_txn, 0);
             spec_frontier_free(&frontier);
             free(row_logits);
             free(shadow_logits);
@@ -18880,8 +18891,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         logits_on_host = true;
     }
     (void)logits_on_host;
-    DS4_MTP_KEEP_ACCEPTED(verified);
-#undef DS4_MTP_KEEP_ACCEPTED
+    mtp_state_txn_keep_accepted(s, &mtp_txn, verified);
     if (mtp_timing) {
         fprintf(stderr,
                 "ds4: mtp timing seq drafted=%d verified=%d target=%.3f ms draft=%.3f ms "
