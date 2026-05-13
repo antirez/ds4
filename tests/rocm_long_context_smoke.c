@@ -63,8 +63,8 @@ static int check_large_topk(void) {
         }
     }
     if (rc == 0) {
-        const double max_seconds = getenv_seconds("DS4_CUDA_TOPK_REGRESSION_SEC", 2.0);
-        fprintf(stderr, "cuda-regression: top-k n_comp=%u n_tokens=%u elapsed=%.3fs\n",
+        const double max_seconds = getenv_seconds("DS4_ROCM_TOPK_REGRESSION_SEC", 2.0);
+        fprintf(stderr, "rocm-regression: top-k n_comp=%u n_tokens=%u elapsed=%.3fs\n",
                 n_comp, n_tokens, elapsed);
         if (elapsed > max_seconds) {
             fprintf(stderr, "top-k regression: %.3fs exceeds %.3fs\n", elapsed, max_seconds);
@@ -153,6 +153,6 @@ int main(void) {
     int rc = check_large_topk();
     if (check_decode_attention_overflow_path() != 0) rc = 1;
     ds4_gpu_cleanup();
-    if (rc == 0) puts("cuda long-context regression: OK");
+    if (rc == 0) puts("rocm long-context regression: OK");
     return rc;
 }

@@ -71,7 +71,7 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
 #define DS4_THINK_MAX_MIN_CONTEXT 393216u
 
 static bool ds4_backend_uses_graph(ds4_backend backend) {
-    return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA;
+    return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA || backend == DS4_BACKEND_ROCM;
 }
 
 /* =========================================================================
@@ -15177,6 +15177,7 @@ const char *ds4_backend_name(ds4_backend backend) {
     switch (backend) {
     case DS4_BACKEND_METAL: return "metal";
     case DS4_BACKEND_CUDA:  return "cuda";
+    case DS4_BACKEND_ROCM:  return "rocm";
     case DS4_BACKEND_CPU:   return "cpu";
     }
     return "unknown";

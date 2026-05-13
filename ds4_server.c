@@ -7906,8 +7906,8 @@ static void usage(FILE *fp) {
         "      Apply steering after attention outputs. Default: 0\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before serving. Slower startup, fewer first-use stalls.\n"
-        "  --metal | --cuda | --cpu | --backend NAME\n"
-        "      Select backend explicitly. Defaults to Metal on macOS and CUDA on CUDA builds.\n"
+        "  --metal | --cuda | --rocm | --cpu | --backend NAME\n"
+        "      Select backend explicitly. Defaults to Metal on macOS and ROCm on ROCm builds.\n"
         "\n"
         "HTTP API:\n"
         "  --host HOST\n"
@@ -7968,9 +7968,10 @@ static void usage(FILE *fp) {
 static ds4_backend parse_backend_arg(const char *s, const char *arg) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
+    if (!strcmp(s, "rocm")) return DS4_BACKEND_ROCM;
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     server_log(DS4_LOG_DEFAULT, "ds4-server: invalid %s value: %s", arg, s);
-    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, cuda, cpu");
+    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, cuda, rocm, cpu");
     exit(2);
 }
 
@@ -7979,6 +7980,8 @@ static ds4_backend default_server_backend(void) {
     return DS4_BACKEND_CPU;
 #elif defined(__APPLE__)
     return DS4_BACKEND_METAL;
+#elif defined(DS4_HAVE_ROCM)
+    return DS4_BACKEND_ROCM;
 #else
     return DS4_BACKEND_CUDA;
 #endif
@@ -8062,6 +8065,8 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--rocm")) {
+            c.engine.backend = DS4_BACKEND_ROCM;
         } else if (!strcmp(arg, "--backend")) {
             c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cpu")) {
