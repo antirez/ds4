@@ -29,7 +29,7 @@ That said, a few important things about this project:
 * This software is developed with **strong assistance from GPT 5.5** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
 * This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache is actually a first-class disk citizen**.
 * Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. This inference engine only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is just alpha quality code, so probably we are not still there.
-* The optimized graph path targets **Metal on macOS** and **CUDA on Linux**. The CPU path is only for correctness checks and model/tokenizer diagnostics. For CPU-only Linux builds, use `make cpu`; it builds the normal `./ds4` and `./ds4-server` binaries without CUDA or Metal. On macOS, **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. It was not possible to fix the CPU inference to avoid crashing, since each time you have to restart the computer, which is not funny. Help us, if you have the guts.
+* The optimized graph path targets **Metal on macOS**, **CUDA on Linux**, and **ROCm/HIP on Linux (AMD)**. The CPU path is only for correctness checks and model/tokenizer diagnostics. For CPU-only Linux builds, use `make cpu`; it builds the normal `./ds4` and `./ds4-server` binaries without CUDA or Metal. On macOS, **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. It was not possible to fix the CPU inference to avoid crashing, since each time you have to restart the computer, which is not funny. Help us, if you have the guts.
 
 ## Acknowledgements to llama.cpp and GGML
 
@@ -97,12 +97,51 @@ slight speedup, not a meaningful generation-speed win.
 Then build:
 
 ```sh
-make
+make              # Defaults to CUDA on Linux or Metal on macOS
+./build.sh        # Recommended for AMD ROCm/HIP builds
 ```
 
 `./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 `./ds4-server --help` for the full flag list.
+
+## AMD ROCm / HIP Support (Linux)
+
+For AMD GPUs (like the Strix Halo / Radeon Graphics), DwarfStar 4 supports the ROCm backend via HIP.
+
+### Building
+
+Use the provided build script to compile with ROCm support:
+
+```sh
+./build.sh
+```
+
+This script performs a clean build using `BACKEND=rocm` and the `hipcc` compiler.
+
+### Starting the Server
+
+The project includes a unified startup script that cleans up stale processes, flushes system memory caches, and launches the server with optimized ROCm flags:
+
+```sh
+./rocm_start_server.sh
+```
+
+This script is specifically tuned for hardware like the **AMD Strix Halo**, unsetting `DS4_HIP_COPY_MODEL` to enable **Zero-Copy HSA access**, which allows the GPU to read model weights directly from system RAM without duplication.
+
+### Testing
+
+Once the server is listening, you can verify it with a `curl` request:
+
+```sh
+curl -X POST http://127.0.0.1:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "ds4flash",
+        "messages": [{"role": "user", "content": "Hello, how are you?"}],
+        "max_tokens": 50
+    }'
+```
 
 ## Speed
 

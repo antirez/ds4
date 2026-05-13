@@ -225,7 +225,7 @@ static void *hip_tmp_alloc(uint64_t bytes, const char *what) {
     void *ptr = NULL;
     hipError_t err = hipMalloc(&ptr, (size_t)bytes);
     if (err != hipSuccess) {
-        fprintf(stderr, "ds4: CUDA temp alloc failed for %s (%.2f MiB): %s\n",
+        fprintf(stderr, "ds4: ROCm temp alloc failed for %s (%.2f MiB): %s\n",
                 what ? what : "scratch", (double)bytes / 1048576.0, hipGetErrorString(err));
         (void)hipGetLastError();
         return NULL;
@@ -302,13 +302,13 @@ static const char *hip_model_range_ptr(const void *model_map, uint64_t offset, u
                 g_model_ranges.push_back({model_map, offset, bytes, dev_ptr, (void *)reg_addr, (char *)reg_dev, reg_bytes, 1, 0});
                 g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
                 if (getenv("DS4_HIP_WEIGHT_CACHE_VERBOSE")) {
-                    fprintf(stderr, "ds4: CUDA mapped %s %.2f MiB\n",
+                    fprintf(stderr, "ds4: ROCm mapped %s %.2f MiB\n",
                             what ? what : "weights",
                             (double)bytes / 1048576.0);
                 }
                 return dev_ptr;
             }
-            fprintf(stderr, "ds4: CUDA model range map pointer failed for %s: %s\n",
+            fprintf(stderr, "ds4: ROCm model range map pointer failed for %s: %s\n",
                     what ? what : "weights", hipGetErrorString(err));
             (void)hipHostUnregister((void *)reg_addr);
             (void)hipGetLastError();
@@ -322,7 +322,7 @@ static const char *hip_model_range_ptr(const void *model_map, uint64_t offset, u
     err = hipMalloc(&dev, (size_t)bytes);
     if (err != hipSuccess) {
         (void)hipGetLastError();
-        fprintf(stderr, "ds4: CUDA model range alloc failed for %s (%.2f MiB): %s\n",
+        fprintf(stderr, "ds4: ROCm model range alloc failed for %s (%.2f MiB): %s\n",
                 what ? what : "weights", (double)bytes / 1048576.0, hipGetErrorString(err));
         return NULL;
     }
@@ -333,7 +333,7 @@ static const char *hip_model_range_ptr(const void *model_map, uint64_t offset, u
         uint64_t n = bytes - done < chunk ? bytes - done : chunk;
         err = hipMemcpy((char *)dev + done, src + done, (size_t)n, hipMemcpyHostToDevice);
         if (err != hipSuccess) {
-            fprintf(stderr, "ds4: CUDA model range copy failed for %s at %.2f/%.2f MiB: %s\n",
+            fprintf(stderr, "ds4: ROCm model range copy failed for %s at %.2f/%.2f MiB: %s\n",
                     what ? what : "weights",
                     (double)done / 1048576.0,
                     (double)bytes / 1048576.0,
@@ -347,7 +347,7 @@ static const char *hip_model_range_ptr(const void *model_map, uint64_t offset, u
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
     if (getenv("DS4_HIP_WEIGHT_CACHE_VERBOSE")) {
-        fprintf(stderr, "ds4: CUDA cached %s %.2f MiB (total %.2f GiB)\n",
+        fprintf(stderr, "ds4: ROCm cached %s %.2f MiB (total %.2f GiB)\n",
                 what ? what : "weights",
                 (double)bytes / 1048576.0,
                 (double)g_model_range_bytes / 1073741824.0);
@@ -433,7 +433,7 @@ static void hip_q8_f16_cache_budget_notice(
     g_q8_f16_budget_notice_printed = 1;
     if (limit_bytes != UINT64_MAX && free_bytes == 0 && total_bytes == 0 && reserve_bytes == 0) {
         fprintf(stderr,
-                "ds4: CUDA q8 fp16 cache %s; using q8 kernels "
+                "ds4: ROCm q8 fp16 cache %s; using q8 kernels "
                 "(request=%.2f MiB cached=%.2f GiB limit=%.2f GiB)\n",
                 reason,
                 (double)request_bytes / 1048576.0,
@@ -441,7 +441,7 @@ static void hip_q8_f16_cache_budget_notice(
                 (double)limit_bytes / 1073741824.0);
     } else if (limit_bytes == UINT64_MAX) {
         fprintf(stderr,
-                "ds4: CUDA q8 fp16 cache %s; using q8 kernels "
+                "ds4: ROCm q8 fp16 cache %s; using q8 kernels "
                 "(request=%.2f MiB cached=%.2f GiB free=%.2f GiB reserve=%.2f GiB total=%.2f GiB)\n",
                 reason,
                 (double)request_bytes / 1048576.0,
@@ -451,7 +451,7 @@ static void hip_q8_f16_cache_budget_notice(
                 (double)total_bytes / 1073741824.0);
     } else {
         fprintf(stderr,
-                "ds4: CUDA q8 fp16 cache %s; using q8 kernels "
+                "ds4: ROCm q8 fp16 cache %s; using q8 kernels "
                 "(request=%.2f MiB cached=%.2f GiB limit=%.2f GiB free=%.2f GiB reserve=%.2f GiB total=%.2f GiB)\n",
                 reason,
                 (double)request_bytes / 1048576.0,
@@ -476,7 +476,7 @@ static int hip_q8_f16_cache_has_budget(uint64_t request_bytes, const char *label
     size_t total_b = 0;
     hipError_t err = hipMemGetInfo(&free_b, &total_b);
     if (err != hipSuccess) {
-        fprintf(stderr, "ds4: CUDA q8 fp16 cache memory query failed: %s; using q8 kernels\n",
+        fprintf(stderr, "ds4: ROCm q8 fp16 cache memory query failed: %s; using q8 kernels\n",
                 hipGetErrorString(err));
         (void)hipGetLastError();
         return 0;
@@ -498,7 +498,7 @@ static int hip_q8_f16_cache_has_budget(uint64_t request_bytes, const char *label
 static void hip_q8_f16_cache_disable_after_failure(const char *what, uint64_t request_bytes) {
     if (!g_q8_f16_disabled_after_oom) {
         fprintf(stderr,
-                "ds4: CUDA q8 fp16 cache disabled after %s "
+                "ds4: ROCm q8 fp16 cache disabled after %s "
                 "(request=%.2f MiB cached=%.2f GiB); using q8 kernels\n",
                 what ? what : "allocation failure",
                 (double)request_bytes / 1048576.0,
@@ -599,7 +599,7 @@ static const __half *hip_q8_f16_ptr(
     __half *dev = NULL;
     hipError_t err = hipMalloc(&dev, (size_t)out_bytes);
     if (err != hipSuccess) {
-        fprintf(stderr, "ds4: CUDA q8 fp16 cache alloc failed (%.2f MiB): %s\n",
+        fprintf(stderr, "ds4: ROCm q8 fp16 cache alloc failed (%.2f MiB): %s\n",
                 (double)out_bytes / 1048576.0, hipGetErrorString(err));
         hip_q8_f16_cache_disable_after_failure("allocation failure", out_bytes);
         return NULL;
@@ -620,7 +620,7 @@ static const __half *hip_q8_f16_ptr(
     g_q8_f16_by_offset[offset] = g_q8_f16_ranges.size() - 1u;
     g_q8_f16_bytes += out_bytes;
     if (getenv("DS4_HIP_WEIGHT_CACHE_VERBOSE")) {
-        fprintf(stderr, "ds4: CUDA cached q8 fp16 %.2f MiB (total %.2f GiB)\n",
+        fprintf(stderr, "ds4: ROCm cached q8 fp16 %.2f MiB (total %.2f GiB)\n",
                 (double)out_bytes / 1048576.0,
                 (double)g_q8_f16_bytes / 1073741824.0);
     }
@@ -651,7 +651,7 @@ static float *hip_q8_f32_ptr(
     float *dev = NULL;
     hipError_t err = hipMalloc(&dev, (size_t)out_bytes);
     if (err != hipSuccess) {
-        fprintf(stderr, "ds4: CUDA q8 fp32 cache alloc failed (%.2f MiB): %s\n",
+        fprintf(stderr, "ds4: ROCm q8 fp32 cache alloc failed (%.2f MiB): %s\n",
                 (double)out_bytes / 1048576.0, hipGetErrorString(err));
         (void)hipGetLastError();
         return NULL;
@@ -671,7 +671,7 @@ static float *hip_q8_f32_ptr(
     g_q8_f32_by_offset[offset] = g_q8_f32_ranges.size() - 1u;
     g_q8_f32_bytes += out_bytes;
     if (getenv("DS4_HIP_WEIGHT_CACHE_VERBOSE")) {
-        fprintf(stderr, "ds4: CUDA cached q8 fp32 %.2f MiB (total %.2f GiB)\n",
+        fprintf(stderr, "ds4: ROCm cached q8 fp32 %.2f MiB (total %.2f GiB)\n",
                 (double)out_bytes / 1048576.0,
                 (double)g_q8_f32_bytes / 1073741824.0);
     }
@@ -680,7 +680,7 @@ static float *hip_q8_f32_ptr(
 
 static int hip_ok(hipError_t err, const char *what) {
     if (err == hipSuccess) return 1;
-    fprintf(stderr, "ds4: CUDA %s failed: %s\n", what, hipGetErrorString(err));
+    fprintf(stderr, "ds4: ROCm %s failed: %s\n", what, hipGetErrorString(err));
     return 0;
 }
 
@@ -713,9 +713,9 @@ static void hip_model_load_progress_note(uint64_t cached_bytes) {
                                      1024ull * 1024ull * 1024ull;
         g_model_load_progress_last = now;
         if (g_model_load_progress_tty) {
-            fprintf(stderr, "ds4: CUDA loading model tensors into device cache: 0.00 GiB");
+            fprintf(stderr, "ds4: ROCm loading model tensors into device cache: 0.00 GiB");
         } else {
-            fprintf(stderr, "ds4: CUDA loading model tensors into device cache\n");
+            fprintf(stderr, "ds4: ROCm loading model tensors into device cache\n");
         }
     }
 
@@ -725,10 +725,10 @@ static void hip_model_load_progress_note(uint64_t cached_bytes) {
     }
 
     if (g_model_load_progress_tty) {
-        fprintf(stderr, "\rds4: CUDA loading model tensors into device cache: %.2f GiB",
+        fprintf(stderr, "\rds4: ROCm loading model tensors into device cache: %.2f GiB",
                 (double)cached_bytes / 1073741824.0);
     } else {
-        fprintf(stderr, "ds4: CUDA loading model tensors %.2f GiB cached\n",
+        fprintf(stderr, "ds4: ROCm loading model tensors %.2f GiB cached\n",
                 (double)cached_bytes / 1073741824.0);
     }
     fflush(stderr);
@@ -777,13 +777,13 @@ static int hip_model_prefetch_range(const void *model_map, uint64_t model_size, 
     const double t0 = hip_wall_sec();
     err = hipMemAdvise_v2(pre_ptr, (size_t)pre_bytes, hipMemAdviseSetReadMostly, loc);
     if (err != hipSuccess) {
-        fprintf(stderr, "ds4: CUDA model read-mostly advise skipped: %s\n", hipGetErrorString(err));
+        fprintf(stderr, "ds4: ROCm model read-mostly advise skipped: %s\n", hipGetErrorString(err));
         (void)hipGetLastError();
         return 0;
     }
     err = hipMemAdvise_v2(pre_ptr, (size_t)pre_bytes, hipMemAdviseSetPreferredLocation, loc);
     if (err != hipSuccess) {
-        fprintf(stderr, "ds4: CUDA model preferred-location advise skipped: %s\n", hipGetErrorString(err));
+        fprintf(stderr, "ds4: ROCm model preferred-location advise skipped: %s\n", hipGetErrorString(err));
         (void)hipGetLastError();
         return 0;
     }
@@ -791,7 +791,7 @@ static int hip_model_prefetch_range(const void *model_map, uint64_t model_size, 
     if (!g_model_prefetch_stream) {
         err = hipStreamCreateWithFlags(&g_model_prefetch_stream, hipStreamNonBlocking);
         if (err != hipSuccess) {
-            fprintf(stderr, "ds4: CUDA model prefetch stream creation skipped: %s\n", hipGetErrorString(err));
+            fprintf(stderr, "ds4: ROCm model prefetch stream creation skipped: %s\n", hipGetErrorString(err));
             (void)hipGetLastError();
             return 0;
         }
@@ -799,21 +799,21 @@ static int hip_model_prefetch_range(const void *model_map, uint64_t model_size, 
 
     err = hipMemPrefetchAsync_v2(pre_ptr, (size_t)pre_bytes, loc, 0, g_model_prefetch_stream);
     if (err != hipSuccess) {
-        fprintf(stderr, "ds4: CUDA model prefetch skipped: %s\n", hipGetErrorString(err));
+        fprintf(stderr, "ds4: ROCm model prefetch skipped: %s\n", hipGetErrorString(err));
         (void)hipGetLastError();
         return 0;
     }
     if (getenv("DS4_HIP_MODEL_PREFETCH_SYNC") != NULL) {
         err = hipStreamSynchronize(g_model_prefetch_stream);
         if (err != hipSuccess) {
-            fprintf(stderr, "ds4: CUDA model prefetch sync failed: %s\n", hipGetErrorString(err));
+            fprintf(stderr, "ds4: ROCm model prefetch sync failed: %s\n", hipGetErrorString(err));
             (void)hipGetLastError();
             return 0;
         }
     }
     const double t1 = hip_wall_sec();
     fprintf(stderr,
-            "ds4: CUDA ATS/HMM prefetch queued %.2f GiB of model tensors in %.3fs\n",
+            "ds4: ROCm ATS/HMM prefetch queued %.2f GiB of model tensors in %.3fs\n",
             (double)map_size / 1073741824.0,
             t1 - t0);
     g_model_hmm_direct = 1;
@@ -897,7 +897,7 @@ static int hip_model_stage_pool_alloc(uint64_t bytes) {
     if (!g_model_upload_stream) {
         hipError_t err = hipStreamCreateWithFlags(&g_model_upload_stream, hipStreamNonBlocking);
         if (err != hipSuccess) {
-            fprintf(stderr, "ds4: CUDA model upload stream creation failed: %s\n", hipGetErrorString(err));
+            fprintf(stderr, "ds4: ROCm model upload stream creation failed: %s\n", hipGetErrorString(err));
             (void)hipGetLastError();
             return 0;
         }
@@ -905,14 +905,14 @@ static int hip_model_stage_pool_alloc(uint64_t bytes) {
     for (size_t i = 0; i < 4; i++) {
         hipError_t err = hipHostMalloc(&g_model_stage_raw[i], (size_t)bytes);
         if (err != hipSuccess) {
-            fprintf(stderr, "ds4: CUDA pinned model staging allocation failed: %s\n", hipGetErrorString(err));
+            fprintf(stderr, "ds4: ROCm pinned model staging allocation failed: %s\n", hipGetErrorString(err));
             (void)hipGetLastError();
             return 0;
         }
         g_model_stage[i] = hip_align_ptr(g_model_stage_raw[i], g_model_direct_align);
         err = hipEventCreateWithFlags(&g_model_stage_event[i], hipEventDisableTiming);
         if (err != hipSuccess) {
-            fprintf(stderr, "ds4: CUDA model staging event creation failed: %s\n", hipGetErrorString(err));
+            fprintf(stderr, "ds4: ROCm model staging event creation failed: %s\n", hipGetErrorString(err));
             (void)hipGetLastError();
             return 0;
         }
@@ -958,7 +958,7 @@ static int hip_model_stage_read(void *stage, uint64_t stage_bytes,
             const int direct_errno = errno;
             if (direct_errno == EINVAL || direct_errno == EFAULT || direct_errno == ENOTSUP || direct_errno == EOPNOTSUPP) {
                 if (getenv("DS4_HIP_WEIGHT_CACHE_VERBOSE")) {
-                    fprintf(stderr, "ds4: CUDA direct model read disabled: %s\n", strerror(direct_errno));
+                    fprintf(stderr, "ds4: ROCm direct model read disabled: %s\n", strerror(direct_errno));
                 }
                 (void)close(g_model_direct_fd);
                 g_model_direct_fd = -1;
@@ -1025,7 +1025,7 @@ static char *hip_model_arena_alloc(uint64_t bytes, const char *what) {
     void *dev = NULL;
     hipError_t err = hipMalloc(&dev, (size_t)chunk);
     if (err != hipSuccess) {
-        fprintf(stderr, "ds4: CUDA model arena alloc failed for %s (%.2f MiB chunk): %s\n",
+        fprintf(stderr, "ds4: ROCm model arena alloc failed for %s (%.2f MiB chunk): %s\n",
                 what ? what : "weights",
                 (double)chunk / 1048576.0,
                 hipGetErrorString(err));
@@ -1037,7 +1037,7 @@ static char *hip_model_arena_alloc(uint64_t bytes, const char *what) {
     if (getenv("DS4_HIP_WEIGHT_CACHE_VERBOSE")) {
         uint64_t arena_bytes = 0;
         for (const hip_model_arena &a : g_model_arenas) arena_bytes += a.bytes;
-        fprintf(stderr, "ds4: CUDA model arena allocated %.2f MiB (arenas %.2f GiB)\n",
+        fprintf(stderr, "ds4: ROCm model arena allocated %.2f MiB (arenas %.2f GiB)\n",
                 (double)chunk / 1048576.0,
                 (double)arena_bytes / 1073741824.0);
     }
@@ -1053,7 +1053,7 @@ static const char *hip_model_range_ptr_from_fd(
     const uint64_t limit = hip_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
         if (getenv("DS4_HIP_WEIGHT_CACHE_VERBOSE")) {
-            fprintf(stderr, "ds4: CUDA direct %s %.2f MiB (cache budget %.2f GiB exhausted)\n",
+            fprintf(stderr, "ds4: ROCm direct %s %.2f MiB (cache budget %.2f GiB exhausted)\n",
                     what ? what : "weights",
                     (double)bytes / 1048576.0,
                     (double)limit / 1073741824.0);
@@ -1080,7 +1080,7 @@ static const char *hip_model_range_ptr_from_fd(
         if (chunk_idx >= 4u) {
             err = hipEventSynchronize(g_model_stage_event[bi]);
             if (err != hipSuccess) {
-                fprintf(stderr, "ds4: CUDA model staging wait failed for %s: %s\n",
+                fprintf(stderr, "ds4: ROCm model staging wait failed for %s: %s\n",
                         what ? what : "weights", hipGetErrorString(err));
                 (void)hipGetLastError();
                 return NULL;
@@ -1089,7 +1089,7 @@ static const char *hip_model_range_ptr_from_fd(
         const char *payload = NULL;
         if (!hip_model_stage_read(g_model_stage[bi], g_model_stage_bytes,
                                    offset + copied, n, &payload)) {
-            fprintf(stderr, "ds4: CUDA model range read failed for %s at %.2f MiB: %s\n",
+            fprintf(stderr, "ds4: ROCm model range read failed for %s at %.2f MiB: %s\n",
                     what ? what : "weights",
                     (double)copied / 1048576.0,
                     strerror(errno));
@@ -1098,7 +1098,7 @@ static const char *hip_model_range_ptr_from_fd(
         err = hipMemcpyAsync(dev + copied, payload, (size_t)n,
                               hipMemcpyHostToDevice, g_model_upload_stream);
         if (err != hipSuccess) {
-            fprintf(stderr, "ds4: CUDA model range copy failed for %s at %.2f MiB: %s\n",
+            fprintf(stderr, "ds4: ROCm model range copy failed for %s at %.2f MiB: %s\n",
                     what ? what : "weights",
                     (double)copied / 1048576.0,
                     hipGetErrorString(err));
@@ -1107,7 +1107,7 @@ static const char *hip_model_range_ptr_from_fd(
         }
         err = hipEventRecord(g_model_stage_event[bi], g_model_upload_stream);
         if (err != hipSuccess) {
-            fprintf(stderr, "ds4: CUDA model staging record failed for %s: %s\n",
+            fprintf(stderr, "ds4: ROCm model staging record failed for %s: %s\n",
                     what ? what : "weights", hipGetErrorString(err));
             (void)hipGetLastError();
             return NULL;
@@ -1120,7 +1120,7 @@ static const char *hip_model_range_ptr_from_fd(
     }
     err = hipStreamSynchronize(g_model_upload_stream);
     if (err != hipSuccess) {
-        fprintf(stderr, "ds4: CUDA model range upload sync failed for %s: %s\n",
+        fprintf(stderr, "ds4: ROCm model range upload sync failed for %s: %s\n",
                 what ? what : "weights", hipGetErrorString(err));
         (void)hipGetLastError();
         return NULL;
@@ -1131,7 +1131,7 @@ static const char *hip_model_range_ptr_from_fd(
     g_model_range_bytes += bytes;
     hip_model_load_progress_note(g_model_range_bytes);
     if (getenv("DS4_HIP_WEIGHT_CACHE_VERBOSE")) {
-        fprintf(stderr, "ds4: CUDA fd-cached %s %.2f MiB (total %.2f GiB)\n",
+        fprintf(stderr, "ds4: ROCm fd-cached %s %.2f MiB (total %.2f GiB)\n",
                 what ? what : "weights",
                 (double)bytes / 1048576.0,
                 (double)g_model_range_bytes / 1073741824.0);
@@ -1153,19 +1153,19 @@ static int hip_model_copy_chunked(const void *model_map, uint64_t model_size, ui
     const double t0 = hip_wall_sec();
     hipError_t err = hipMalloc(&dev, (size_t)model_size);
     if (err != hipSuccess) {
-        fprintf(stderr, "ds4: CUDA model allocation skipped: %s\n", hipGetErrorString(err));
+        fprintf(stderr, "ds4: ROCm model allocation skipped: %s\n", hipGetErrorString(err));
         (void)hipGetLastError();
         return 0;
     }
 
-    fprintf(stderr, "ds4: CUDA chunk-copying %.2f GiB model image\n",
+    fprintf(stderr, "ds4: ROCm chunk-copying %.2f GiB model image\n",
             (double)model_size / 1073741824.0);
 
     const uint64_t chunk = hip_model_copy_chunk_bytes();
     void *stage = NULL;
     err = hipHostMalloc(&stage, (size_t)chunk);
     if (err != hipSuccess) {
-        fprintf(stderr, "ds4: CUDA pinned model staging allocation failed: %s\n", hipGetErrorString(err));
+        fprintf(stderr, "ds4: ROCm pinned model staging allocation failed: %s\n", hipGetErrorString(err));
         (void)hipFree(dev);
         (void)hipGetLastError();
         return 0;
@@ -1178,7 +1178,7 @@ static int hip_model_copy_chunked(const void *model_map, uint64_t model_size, ui
             memcpy(stage, (const char *)model_map + copied_header, (size_t)n);
             err = hipMemcpy((char *)dev + copied_header, stage, (size_t)n, hipMemcpyHostToDevice);
             if (err != hipSuccess) {
-                fprintf(stderr, "ds4: CUDA model header copy failed: %s\n", hipGetErrorString(err));
+                fprintf(stderr, "ds4: ROCm model header copy failed: %s\n", hipGetErrorString(err));
                 (void)hipHostFree(stage);
                 (void)hipFree(dev);
                 (void)hipGetLastError();
@@ -1196,7 +1196,7 @@ static int hip_model_copy_chunked(const void *model_map, uint64_t model_size, ui
         memcpy(stage, (const char *)model_map + off, (size_t)n);
         err = hipMemcpy((char *)dev + off, stage, (size_t)n, hipMemcpyHostToDevice);
         if (err != hipSuccess) {
-            fprintf(stderr, "ds4: CUDA model chunk copy failed at %.2f GiB: %s\n",
+            fprintf(stderr, "ds4: ROCm model chunk copy failed at %.2f GiB: %s\n",
                     (double)copied / 1073741824.0, hipGetErrorString(err));
             (void)hipHostFree(stage);
             (void)hipFree(dev);
@@ -1207,7 +1207,7 @@ static int hip_model_copy_chunked(const void *model_map, uint64_t model_size, ui
         copied += n;
         const double now = hip_wall_sec();
         if (getenv("DS4_HIP_MODEL_COPY_VERBOSE") != NULL && now - last_report >= 2.0) {
-            fprintf(stderr, "ds4: CUDA model chunk copy %.2f/%.2f GiB\n",
+            fprintf(stderr, "ds4: ROCm model chunk copy %.2f/%.2f GiB\n",
                     (double)copied / 1073741824.0,
                     (double)map_size / 1073741824.0);
             last_report = now;
@@ -1220,7 +1220,7 @@ static int hip_model_copy_chunked(const void *model_map, uint64_t model_size, ui
     g_model_hmm_direct = 0;
     const double t1 = hip_wall_sec();
     fprintf(stderr,
-            "ds4: CUDA model chunk copy complete in %.3fs (%.2f GiB tensors)\n",
+            "ds4: ROCm model chunk copy complete in %.3fs (%.2f GiB tensors)\n",
             t1 - t0,
             (double)map_size / 1073741824.0);
     return 1;
@@ -1438,21 +1438,21 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         const double t0 = clock() / (double)CLOCKS_PER_SEC;
         hipError_t err = hipMalloc(&dev, (size_t)model_size);
         if (err == hipSuccess) {
-            fprintf(stderr, "ds4: CUDA copying %.2f GiB model to device memory\n",
+            fprintf(stderr, "ds4: ROCm copying %.2f GiB model to device memory\n",
                     (double)model_size / 1073741824.0);
             err = hipMemcpy(dev, model_map, (size_t)model_size, hipMemcpyHostToDevice);
             if (err == hipSuccess) {
                 g_model_device_base = (const char *)dev;
                 g_model_device_owned = 1;
                 const double t1 = clock() / (double)CLOCKS_PER_SEC;
-                fprintf(stderr, "ds4: CUDA model copy complete in %.3fs\n", t1 - t0);
+                fprintf(stderr, "ds4: ROCm model copy complete in %.3fs\n", t1 - t0);
                 return 1;
             }
-            fprintf(stderr, "ds4: CUDA model copy failed: %s\n", hipGetErrorString(err));
+            fprintf(stderr, "ds4: ROCm model copy failed: %s\n", hipGetErrorString(err));
             (void)hipFree(dev);
             (void)hipGetLastError();
         } else {
-            fprintf(stderr, "ds4: CUDA model allocation skipped: %s\n", hipGetErrorString(err));
+            fprintf(stderr, "ds4: ROCm model allocation skipped: %s\n", hipGetErrorString(err));
             (void)hipGetLastError();
         }
     }
@@ -1476,14 +1476,14 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
             (void)hipGetDevice(&dev_id);
             (void)hipMemAdvise((void *)model_map, (size_t)model_size, hipMemAdviseSetReadMostly, dev_id);
             (void)hipMemAdvise((void *)model_map, (size_t)model_size, hipMemAdviseSetCoarseGrain, dev_id);
-            fprintf(stderr, "ds4: CUDA registered %.2f GiB model mapping (cached coarse-grained) for device access\n",
+            fprintf(stderr, "ds4: ROCm registered %.2f GiB model mapping (cached coarse-grained) for device access\n",
                     (double)model_size / 1073741824.0);
         } else {
-            fprintf(stderr, "ds4: CUDA host registration pointer lookup failed: %s\n", hipGetErrorString(err));
+            fprintf(stderr, "ds4: ROCm host registration pointer lookup failed: %s\n", hipGetErrorString(err));
             (void)hipGetLastError();
         }
     } else {
-        fprintf(stderr, "ds4: CUDA host registration skipped: %s\n", hipGetErrorString(err));
+        fprintf(stderr, "ds4: ROCm host registration skipped: %s\n", hipGetErrorString(err));
         (void)hipGetLastError();
         /* On HSA unified memory (e.g., Strix Halo), the CPU mapping is already
          * device-accessible without prior registration.  Try the pointer lookup
@@ -1538,11 +1538,11 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
                 g_model_direct_fd = direct_fd;
                 if (g_model_direct_align < 512) g_model_direct_align = 512;
                 if (getenv("DS4_HIP_WEIGHT_CACHE_VERBOSE")) {
-                    fprintf(stderr, "ds4: CUDA model direct I/O enabled (align=%llu)\n",
+                    fprintf(stderr, "ds4: ROCm model direct I/O enabled (align=%llu)\n",
                             (unsigned long long)g_model_direct_align);
                 }
             } else if (getenv("DS4_HIP_WEIGHT_CACHE_VERBOSE")) {
-                fprintf(stderr, "ds4: CUDA model direct I/O unavailable: %s\n", strerror(errno));
+                fprintf(stderr, "ds4: ROCm model direct I/O unavailable: %s\n", strerror(errno));
             }
         }
 #endif
@@ -1578,7 +1578,7 @@ extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_
 extern "C" void ds4_gpu_print_memory_report(const char *label) {
     size_t free_b = 0, total_b = 0;
     (void)hipMemGetInfo(&free_b, &total_b);
-    fprintf(stderr, "ds4: CUDA memory report %s: free %.2f MiB total %.2f MiB\n",
+    fprintf(stderr, "ds4: ROCm memory report %s: free %.2f MiB total %.2f MiB\n",
             label ? label : "", (double)free_b / 1048576.0, (double)total_b / 1048576.0);
 }
 
@@ -6181,7 +6181,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                                               head_dim);
             return hip_ok(hipGetLastError(), "attention decode online launch");
         }
-        fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
+        fprintf(stderr, "ds4: ROCm attention score buffer too small for %u compressed rows\n", n_comp);
         return 0;
     }
     dim3 grid(1, n_head, 1);
@@ -6223,7 +6223,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
         return hip_ok(hipGetLastError(), "attention raw window launch");
     }
     if (g_hipblas_ready && n_tokens > 1 &&
-        getenv("DS4_HIP_NO_CUBLAS_ATTENTION") == NULL) {
+        getenv("DS4_HIP_NO_HIPBLAS_ATTENTION") == NULL) {
         const uint32_t n_keys = n_tokens;
         const uint64_t score_count = (uint64_t)n_head * n_tokens * n_keys;
         const uint64_t out_count = (uint64_t)n_head * n_tokens * head_dim;
@@ -6351,7 +6351,7 @@ static int attention_decode_batch_launch(
                                                                               head_dim);
             return hip_ok(hipGetLastError(), "attention decode online launch");
         }
-        fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
+        fprintf(stderr, "ds4: ROCm attention score buffer too small for %u compressed rows\n", n_comp);
         return 0;
     }
     if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
@@ -6581,7 +6581,7 @@ static int attention_prefill_mixed_launch(
         return hip_ok(hipGetLastError(), "attention mixed window launch");
     }
     if (g_hipblas_ready && n_tokens > 1 && head_dim == 512 &&
-        getenv("DS4_HIP_NO_CUBLAS_ATTENTION") == NULL) {
+        getenv("DS4_HIP_NO_HIPBLAS_ATTENTION") == NULL) {
         const uint32_t n_keys = n_tokens + n_comp;
         const uint64_t kv_count = (uint64_t)n_keys * head_dim;
         const uint64_t score_count = (uint64_t)n_head * n_tokens * n_keys;
@@ -6757,7 +6757,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
 
     const __half *out_a_f16 = NULL;
     uint32_t out_a_hipblas_min_tokens = 2u;
-    const char *out_a_min_env = getenv("DS4_HIP_ATTENTION_OUTPUT_A_CUBLAS_MIN");
+    const char *out_a_min_env = getenv("DS4_HIP_ATTENTION_OUTPUT_A_HIPBLAS_MIN");
     if (out_a_min_env && out_a_min_env[0]) {
         char *endp = NULL;
         long v = strtol(out_a_min_env, &endp, 10);
@@ -6766,7 +6766,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
     if (!g_quality_mode &&
         g_hipblas_ready &&
         n_tokens >= out_a_hipblas_min_tokens &&
-        getenv("DS4_HIP_NO_CUBLAS_ATTENTION_OUTPUT_A") == NULL) {
+        getenv("DS4_HIP_NO_HIPBLAS_ATTENTION_OUTPUT_A") == NULL) {
         out_a_f16 = hip_q8_f16_ptr(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, "attn_output_a");
     }
     if (out_a_f16) {
@@ -9746,7 +9746,7 @@ static int routed_moe_launch(
                 (void)hipEventElapsedTime(&ms_sum, prof_ev[5], prof_ev[6]);
                 (void)hipEventElapsedTime(&ms_total, prof_ev[0], prof_ev[6]);
                 fprintf(stderr,
-                        "ds4: CUDA MoE profile tokens=%u pairs=%u xq=%.3f sort=%.3f gateup=%.3f midq=%.3f down=%.3f sum=%.3f total=%.3f ms\n",
+                        "ds4: ROCm MoE profile tokens=%u pairs=%u xq=%.3f sort=%.3f gateup=%.3f midq=%.3f down=%.3f sum=%.3f total=%.3f ms\n",
                         n_tokens, pair_count, ms_xq, ms_sort, ms_gate, ms_midq, ms_down, ms_sum, ms_total);
             }
             for (uint32_t i = 0; i < 7u; i++) (void)hipEventDestroy(prof_ev[i]);
