@@ -100,6 +100,19 @@ The currently useful CUDA MTP flags are:
 - `DS4_MTP_VERIFY_V2=1`: opt-in active decode3 suffix verifier for
   `--mtp-draft 3`. It exercises selected-row output and prefix-depth commit
   without changing the default `mtp-fast` path.
+- `DS4_MTP_BATCH_FIRST=1`: experimental purpose-built verifier probe. It tries
+  to reuse a previously seeded MTP prediction as the first token of a three-row
+  target verifier and automatically falls back through the V2 verifier when the
+  proof-safe margin gate fails. The default mode does not seed from batched
+  target rows, preserving exact comparison against the current fast stream in
+  the proof harness.
+- `DS4_MTP_BATCH_FIRST_MIN_MARGIN=N`: margin gate for the batch-first probe.
+  The default inherits the normal MTP margin. Higher values force more fallback
+  to the current verifier.
+- `DS4_MTP_BATCH_FIRST_SEED_BATCH_ROWS=1`: research-only mode that seeds the
+  next MTP prediction from batched verifier hidden rows. This improves
+  batch-first residency, but current GB10 proof runs show it can change greedy
+  prose output, so it is not a verified optimization.
 
 The structural CUDA optimizations are default-on after this work:
 
