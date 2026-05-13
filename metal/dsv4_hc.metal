@@ -77,6 +77,24 @@ struct ds4_metal_args_dsv4_hc_expand {
     int32_t  has_add;
 };
 
+// Numerically stable sigmoid. The naive form 1/(1+exp(-z)) overflows for large
+// negative z (exp(-z) blows up); replacing it with the 0.5*(tanh(z/2)+1) identity
+// keeps the value bounded in [0, 1] across the entire float range. Gated by
+// DS4_METAL_HC_STABLE so we can A/B vs the historical form on M5 Max where the
+// faster ALU is more likely to push HC mixer inputs into the unstable regime.
+#ifdef DS4_METAL_HC_STABLE
+static inline float  ds4_hc_sigmoid(float  z)  { return 0.5f * tanh(0.5f * z) + 0.5f; }
+static inline float4 ds4_hc_sigmoid(float4 z)  { return 0.5f * tanh(0.5f * z) + 0.5f; }
+// 2 * sigmoid(z) == 1 + tanh(z/2).
+static inline float  ds4_hc_twice_sigmoid(float  z) { return 1.0f + tanh(0.5f * z); }
+static inline float4 ds4_hc_twice_sigmoid(float4 z) { return 1.0f + tanh(0.5f * z); }
+#else
+static inline float  ds4_hc_sigmoid(float  z)  { return 1.0f / (1.0f + exp(-z)); }
+static inline float4 ds4_hc_sigmoid(float4 z)  { return 1.0f / (1.0f + exp(-z)); }
+static inline float  ds4_hc_twice_sigmoid(float  z) { return 2.0f / (1.0f + exp(-z)); }
+static inline float4 ds4_hc_twice_sigmoid(float4 z) { return 2.0f / (1.0f + exp(-z)); }
+#endif
+
 // Splits an HC mixer row into pre weights, post gates, and the HC-to-HC
 // combination matrix. The 4-channel path is specialized because DS4 Flash uses
 // HC=4 in normal inference, while the scalar fallback keeps diagnostics usable.
@@ -109,12 +127,12 @@ kernel void kernel_dsv4_hc_split_sinkhorn(
         const float4 pre_z =
             *((device const float4 *) mix) * pre_scale +
             *((device const float4 *) base);
-        *((device float4 *) out) = 1.0f / (1.0f + exp(-pre_z)) + epsv;
+        *((device float4 *) out) = ds4_hc_sigmoid(pre_z) + epsv;
 
         const float4 post_z =
             *((device const float4 *) (mix  + 4)) * post_scale +
             *((device const float4 *) (base + 4));
-        *((device float4 *) (out + 4)) = 2.0f / (1.0f + exp(-post_z));
+        *((device float4 *) (out + 4)) = ds4_hc_twice_sigmoid(post_z);
 
         float4 r0 =
             *((device const float4 *) (mix  +  8)) * comb_scale +
@@ -172,13 +190,13 @@ kernel void kernel_dsv4_hc_split_sinkhorn(
 
     for (int i = 0; i < HC; ++i) {
         const float z = mix[i] * pre_scale + base[i];
-        out[i] = 1.0f / (1.0f + exp(-z)) + epsv;
+        out[i] = ds4_hc_sigmoid(z) + epsv;
     }
 
     for (int i = 0; i < HC; ++i) {
         const int off = HC + i;
         const float z = mix[off] * post_scale + base[off];
-        out[off] = 2.0f / (1.0f + exp(-z));
+        out[off] = ds4_hc_twice_sigmoid(z);
     }
 
     float c[HC_MAX*HC_MAX];
