@@ -16184,6 +16184,81 @@ static bool spec_frontier_commit_prefix1(ds4_session *s) {
     else (void)ds4_gpu_synchronize();
     return ok;
 }
+
+static bool metal_graph_verify_decode3_top2_output(
+        ds4_gpu_graph              *g,
+        const ds4_model            *model,
+        const ds4_weights          *weights,
+        const token_vec            *prompt,
+        const ds4_mtp_verify_plan  *plan,
+        ds4_mtp_verify_result      *result,
+        float                      *row_logits) {
+    if (!g || !model || !weights || !prompt || !plan || !result) return false;
+    if (plan->n_tokens < 3 || plan->start > (uint32_t)prompt->len ||
+        3u > (uint32_t)prompt->len - plan->start) {
+        return false;
+    }
+
+    bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens,
+                                               prompt,
+                                               plan->start,
+                                               3u);
+    if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
+                                                         g->prefill_tokens,
+                                                         model,
+                                                         weights,
+                                                         prompt,
+                                                         plan->start,
+                                                         3u);
+    if (!ok) return false;
+
+    ok = ds4_gpu_begin_commands() != 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        ok = metal_graph_encode_layer_batch(g,
+                                            model,
+                                            &weights->layer[il],
+                                            il,
+                                            plan->start,
+                                            3u);
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (!ok) return false;
+
+    for (uint32_t row = 0; row < 2u; row++) {
+        ok = ds4_gpu_begin_commands() != 0;
+        if (ok) ok = metal_graph_encode_output_head_batch_row(g,
+                                                              model,
+                                                              weights,
+                                                              row,
+                                                              weights->output->dim[1],
+                                                              true);
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+        if (ok) ok = ds4_gpu_tensor_read(g->comp_selected,
+                                           0,
+                                           &result->row_top2[row],
+                                           sizeof(result->row_top2[row])) != 0;
+        if (!ok) return false;
+        result->row_top[row] = (int)result->row_top2[row].id0;
+    }
+
+    mtp_verify_result_decide_from_tops(result, plan);
+    if (!row_logits) return true;
+
+    ok = ds4_gpu_begin_commands() != 0;
+    if (ok) ok = metal_graph_encode_output_head_batch_row(g,
+                                                          model,
+                                                          weights,
+                                                          result->logits_row,
+                                                          weights->output->dim[1],
+                                                          false);
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (ok) ok = metal_graph_read_current_logits(g, row_logits);
+    if (ok) result->have_logits = true;
+    return ok;
+}
 #endif
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
@@ -18277,6 +18352,9 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             getenv("DS4_CUDA_MTP_SHADOW_B_N2_Q8") != NULL &&
             getenv("DS4_CUDA_MTP_VERIFY_TOP2") != NULL &&
             getenv("DS4_CUDA_MTP_TOP2") != NULL;
+        const bool shadow_v2_decode3 =
+            draft_n >= 3 &&
+            getenv("DS4_MTP_VERIFY_V2_SHADOW") != NULL;
         const bool snapshot_required =
             draft_n > 2 ||
             (draft_n == 2 && (!capture_prefix1 || exact_replay_debug)) ||
@@ -18307,6 +18385,30 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         if (ok) {
             for (int i = 0; i < draft_n; i++) token_vec_push(&s->checkpoint, drafts[i]);
             verifier_may_have_mutated = true;
+            if (shadow_v2_decode3 && have_frontier) {
+                ds4_mtp_verify_result v2_shadow;
+                mtp_verify_result_init(&v2_shadow);
+                bool v2_ok = metal_graph_verify_decode3_top2_output(&s->graph,
+                                                                     &e->model,
+                                                                     &e->weights,
+                                                                     &s->checkpoint,
+                                                                     &verify_plan,
+                                                                     &v2_shadow,
+                                                                     NULL);
+                fprintf(stderr,
+                        "ds4: mtp shadow verify_v2_decode3 ok=%d committed=%d row0=%d row1=%d "
+                        "draft1=%d draft2=%d margin0=%.6f margin1=%.6f\n",
+                        v2_ok ? 1 : 0,
+                        v2_shadow.commit_tokens,
+                        v2_shadow.row_top[0],
+                        v2_shadow.row_top[1],
+                        verify_plan.token[1],
+                        verify_plan.token[2],
+                        v2_shadow.row_top2[0].value0 - v2_shadow.row_top2[0].value1,
+                        v2_shadow.row_top2[1].value0 - v2_shadow.row_top2[1].value1);
+                s->checkpoint.len = start + draft_n;
+                ok = spec_frontier_restore(&frontier, s);
+            }
             if (shadow_b_n2_q8 && have_frontier) {
                 shadow_have = true;
                 ds4_gpu_set_attention_output_b_n2_q8_override(1);
