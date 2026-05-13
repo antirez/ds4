@@ -242,13 +242,25 @@ kernel void kernel_dsv4_kv_fp8_store_f32(
         if (off + (int)tid < n_nope) {
             const float q = dsv4_e4m3fn_dequant(clamp(v / fp8_scale, -448.0f, 448.0f)) * fp8_scale;
             kv[off + tid] = q;
+            // Diagnostic only: skip the FP16 round-trip that normally matches the
+            // half-typed FlashAttention KV buffer's precision. With this enabled the
+            // indexer will see higher-precision raw values than FlashAttention does,
+            // which is informative but not a production-ready setting.
+#ifdef DS4_METAL_KV_RAW_F32
+            raw[off + tid] = q;
+#else
             raw[off + tid] = (float)((half)q);
+#endif
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     for (int i = n_nope + tid; i < head_dim; i += 64) {
+#ifdef DS4_METAL_KV_RAW_F32
+        raw[i] = kv[i];
+#else
         raw[i] = (float)((half)kv[i]);
+#endif
     }
 }
 
