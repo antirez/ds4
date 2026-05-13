@@ -16,8 +16,11 @@
 #include <signal.h>
 #include <sys/file.h>
 #include <sys/mman.h>
+#include <sys/select.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 struct mapped_file {
@@ -56,6 +59,12 @@ struct vmm_support {
     int uva = 0;
     size_t granularity_min = 0;
     size_t granularity_recommended = 0;
+};
+
+struct fd_broker {
+    int listen_fd = -1;
+    std::string path;
+    uint64_t requests = 0;
 };
 
 static volatile sig_atomic_t g_stop;
@@ -804,7 +813,7 @@ static bool upload_model(const char *id, const char *path, uint64_t span_bytes,
 
 static bool write_manifest(const char *path, const std::vector<owned_range> &ranges,
                            int device, const char *scope, const char *lock_file,
-                           weight_backend backend) {
+                           weight_backend backend, const char *broker_path) {
     std::string tmp = std::string(path) + ".tmp";
     FILE *fp = fopen(tmp.c_str(), "w");
     if (!fp) {
@@ -818,6 +827,10 @@ static bool write_manifest(const char *path, const std::vector<owned_range> &ran
             device,
             scope ? scope : "both",
             (lock_file && lock_file[0]) ? lock_file : "-");
+    if (backend == WEIGHT_BACKEND_VMM) {
+        fprintf(fp, "# broker <unix-socket-path>\n");
+        fprintf(fp, "broker %s\n", broker_path ? broker_path : "");
+    }
     if (backend == WEIGHT_BACKEND_VMM) {
         fprintf(fp, "# alloc <alloc-id> <model-id> <model-size> <offset> <bytes> <alloc-bytes>\n");
     } else {
@@ -852,6 +865,134 @@ static bool write_manifest(const char *path, const std::vector<owned_range> &ran
     return true;
 }
 
+static bool export_vmm_fds(std::vector<owned_range> &ranges) {
+    uint64_t count = 0;
+    for (owned_range &r : ranges) {
+        if (r.backend != WEIGHT_BACKEND_VMM) continue;
+        int fd = -1;
+        if (!driver_ok(cuMemExportToShareableHandle(&fd,
+                                                    r.vmm_handle,
+                                                    CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+                                                    0),
+                       "VMM export POSIX FD")) {
+            return false;
+        }
+        r.exported_fd = fd;
+        count++;
+    }
+    fprintf(stderr, "ds4_weight_server: vmm exported %llu POSIX file descriptors\n",
+            (unsigned long long)count);
+    return true;
+}
+
+static bool fd_broker_start(fd_broker &broker, const char *path) {
+    if (!path || !path[0]) return false;
+    if (strlen(path) >= sizeof(sockaddr_un::sun_path)) {
+        fprintf(stderr, "ds4_weight_server: broker socket path is too long: %s\n", path);
+        return false;
+    }
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        fprintf(stderr, "ds4_weight_server: broker socket create failed: %s\n", strerror(errno));
+        return false;
+    }
+    sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1u);
+    (void)unlink(path);
+    if (bind(fd, (sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr, "ds4_weight_server: broker bind failed %s: %s\n", path, strerror(errno));
+        close(fd);
+        return false;
+    }
+    (void)chmod(path, 0600);
+    if (listen(fd, 16) != 0) {
+        fprintf(stderr, "ds4_weight_server: broker listen failed %s: %s\n", path, strerror(errno));
+        close(fd);
+        unlink(path);
+        return false;
+    }
+    broker.listen_fd = fd;
+    broker.path = path;
+    broker.requests = 0;
+    fprintf(stderr, "ds4_weight_server: broker listening %s\n", path);
+    return true;
+}
+
+static void fd_broker_stop(fd_broker &broker) {
+    if (broker.listen_fd >= 0) {
+        close(broker.listen_fd);
+        broker.listen_fd = -1;
+    }
+    if (!broker.path.empty()) {
+        unlink(broker.path.c_str());
+    }
+}
+
+static bool send_status_fd(int client_fd, const char *status, int fd_to_send) {
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    struct iovec iov;
+    iov.iov_base = (void *)status;
+    iov.iov_len = strlen(status);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    char control[CMSG_SPACE(sizeof(int))];
+    memset(control, 0, sizeof(control));
+    if (fd_to_send >= 0) {
+        msg.msg_control = control;
+        msg.msg_controllen = sizeof(control);
+        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type = SCM_RIGHTS;
+        cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(cmsg), &fd_to_send, sizeof(int));
+    }
+    return sendmsg(client_fd, &msg, 0) >= 0;
+}
+
+static void fd_broker_serve_once(fd_broker &broker, const std::vector<owned_range> &ranges) {
+    if (broker.listen_fd < 0) return;
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(broker.listen_fd, &rfds);
+    timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    int ready = select(broker.listen_fd + 1, &rfds, nullptr, nullptr, &tv);
+    if (ready <= 0 || !FD_ISSET(broker.listen_fd, &rfds)) return;
+    int client = accept(broker.listen_fd, nullptr, nullptr);
+    if (client < 0) return;
+    char buf[128];
+    ssize_t n = read(client, buf, sizeof(buf) - 1u);
+    if (n <= 0) {
+        close(client);
+        return;
+    }
+    buf[n] = '\0';
+    unsigned long long alloc_id = 0;
+    if (sscanf(buf, "GET %llu", &alloc_id) != 1 || alloc_id >= ranges.size() ||
+        ranges[(size_t)alloc_id].exported_fd < 0) {
+        (void)send_status_fd(client, "ERR invalid allocation\n", -1);
+        close(client);
+        return;
+    }
+    const owned_range &r = ranges[(size_t)alloc_id];
+    char status[128];
+    snprintf(status, sizeof(status), "OK %llu %llu\n",
+             alloc_id,
+             (unsigned long long)r.alloc_bytes);
+    if (send_status_fd(client, status, r.exported_fd)) {
+        broker.requests++;
+        fprintf(stderr, "ds4_weight_server: broker served alloc=%llu bytes=%llu requests=%llu\n",
+                alloc_id,
+                (unsigned long long)r.alloc_bytes,
+                (unsigned long long)broker.requests);
+    }
+    close(client);
+}
+
 static void usage(FILE *fp) {
     fprintf(fp,
             "Usage: ds4_weight_server --base FILE [--mtp FILE] --manifest FILE [options]\n"
@@ -860,6 +1001,7 @@ static void usage(FILE *fp) {
             "  --device N        CUDA device ordinal. Default: 0\n"
             "  --backend B       Weight sharing backend: ipc or vmm. Default: ipc\n"
             "  --scope S         Models to upload: both, base, or mtp. Default: both\n"
+            "  --broker-socket FILE Unix socket for VMM FD transfer. Default: <manifest>.sock\n"
             "  --exit-on-parent-pid N Exit if parent/orchestrator PID disappears\n"
             "  --lock-file FILE  Single-owner lock file. Default: /tmp/ds4_weight_server_cudaN.lock\n"
             "  --no-lock         Disable the single-owner lock\n"
@@ -875,6 +1017,7 @@ int main(int argc, char **argv) {
     const char *manifest = nullptr;
     const char *scope = "both";
     const char *backend_s = "ipc";
+    const char *broker_socket = nullptr;
     const char *lock_file = nullptr;
     pid_t exit_on_parent_pid = 0;
     int device = 0;
@@ -888,6 +1031,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--manifest") && i + 1 < argc) manifest = argv[++i];
         else if (!strcmp(argv[i], "--scope") && i + 1 < argc) scope = argv[++i];
         else if (!strcmp(argv[i], "--backend") && i + 1 < argc) backend_s = argv[++i];
+        else if (!strcmp(argv[i], "--broker-socket") && i + 1 < argc) broker_socket = argv[++i];
         else if (!strcmp(argv[i], "--exit-on-parent-pid") && i + 1 < argc) exit_on_parent_pid = (pid_t)strtol(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--lock-file") && i + 1 < argc) lock_file = argv[++i];
         else if (!strcmp(argv[i], "--no-lock")) lock_file = "";
@@ -997,7 +1141,17 @@ int main(int argc, char **argv) {
                                    backend, device, vmm_granularity)) return 1;
     if (want_mtp && !upload_model("mtp", mtp, span_bytes, copy_chunk_bytes, ranges,
                                   backend, device, vmm_granularity)) return 1;
-    if (!write_manifest(manifest, ranges, device, scope, lock_file, backend)) return 1;
+    std::string default_broker_socket;
+    fd_broker broker;
+    if (backend == WEIGHT_BACKEND_VMM) {
+        if (!export_vmm_fds(ranges)) return 1;
+        if (!broker_socket) {
+            default_broker_socket = std::string(manifest) + ".sock";
+            broker_socket = default_broker_socket.c_str();
+        }
+        if (!fd_broker_start(broker, broker_socket)) return 1;
+    }
+    if (!write_manifest(manifest, ranges, device, scope, lock_file, backend, broker_socket)) return 1;
 
     fprintf(stderr,
             "ds4_weight_server: ready manifest=%s ranges=%zu. Keep this process alive while workers run.\n",
@@ -1011,10 +1165,19 @@ int main(int argc, char **argv) {
                     (long)exit_on_parent_pid);
             break;
         }
-        sleep(1);
+        if (backend == WEIGHT_BACKEND_VMM) {
+            for (int i = 0; i < 10 && !g_stop; i++) {
+                fd_broker_serve_once(broker, ranges);
+                usleep(100000);
+            }
+        } else {
+            sleep(1);
+        }
     }
 
-    fprintf(stderr, "ds4_weight_server: shutting down\n");
+    fprintf(stderr, "ds4_weight_server: shutting down broker_requests=%llu\n",
+            (unsigned long long)broker.requests);
+    fd_broker_stop(broker);
     for (owned_range &r : ranges) {
         release_owned_range(r);
     }
