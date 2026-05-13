@@ -219,9 +219,13 @@ static void test_metal_q8_0_mpp_matmul_case(const char *label,
 
     TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_host, x_bytes) != 0);
     TEST_ASSERT(ds4_gpu_set_model_map(weights_raw, weight_alloc) != 0);
-    ds4_gpu_set_quality(false);
+    // Force quality mode ON so the reference dispatcher takes the legacy
+    // simdgroup path; otherwise ds4_gpu_matmul_q8_0_tensor() routes to the
+    // MPP variant on M5+ and the test compares two MPP outputs to each other.
+    ds4_gpu_set_quality(true);
     TEST_ASSERT(ds4_gpu_matmul_q8_0_tensor(out_ref, weights_raw, weight_alloc, 0,
                                              in_dim, out_dim, x, n_tok) != 0);
+    ds4_gpu_set_quality(false);
 
     int have_mpp = ds4_gpu_matmul_q8_0_mpp_tensor(
         out_mpp, weights_raw, weight_alloc, 0, in_dim, out_dim, x, n_tok);
