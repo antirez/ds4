@@ -18502,8 +18502,9 @@ static uint32_t ds4_env_u32_default(const char *name, uint32_t fallback) {
 }
 
 static bool ds4_mtp_accept_gate_enabled(void) {
-    return getenv("DS4_MTP_ACCEPT_GATE") != NULL &&
-           getenv("DS4_MTP_NO_ACCEPT_GATE") == NULL;
+    if (getenv("DS4_MTP_NO_ACCEPT_GATE") != NULL) return false;
+    if (getenv("DS4_MTP_ACCEPT_GATE") != NULL) return true;
+    return getenv("DS4_MTP_NONEXACT_FAST") == NULL;
 }
 
 static bool ds4_mtp_accept_gate_should_skip(ds4_session *s) {
@@ -18524,7 +18525,7 @@ static bool ds4_mtp_accept_gate_should_skip(ds4_session *s) {
     const uint32_t warmup = ds4_env_u32_default("DS4_MTP_ACCEPT_GATE_WARMUP", 8u);
     if (s->mtp_accept_samples < warmup) return false;
 
-    const float min_accept = ds4_env_float_default("DS4_MTP_ACCEPT_GATE_MIN", 0.50f);
+    const float min_accept = ds4_env_float_default("DS4_MTP_ACCEPT_GATE_MIN", 0.90f);
     if (s->mtp_accept_ewma >= (double)min_accept) return false;
 
     const uint32_t cooldown = ds4_env_u32_default("DS4_MTP_ACCEPT_GATE_COOLDOWN", 8u);
