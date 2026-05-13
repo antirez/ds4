@@ -13722,6 +13722,43 @@ static bool metal_graph_verify_decode2_top2_output(
 
     ds4_gpu_top2_result top2;
     memset(&top2, 0, sizeof(top2));
+    if (getenv("DS4_CUDA_MTP_VERIFY_OPT_OUTPUT") != NULL) {
+        ok = ds4_gpu_begin_commands() != 0;
+        if (ok) ok = metal_graph_encode_output_head_batch_row(g,
+                                                              model,
+                                                              weights,
+                                                              0u,
+                                                              weights->output->dim[1],
+                                                              true);
+        if (ok) ok = metal_graph_encode_output_head_batch_row(g,
+                                                              model,
+                                                              weights,
+                                                              1u,
+                                                              weights->output->dim[1],
+                                                              false);
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+        if (ok) ok = ds4_gpu_tensor_read(g->comp_selected, 0, &top2, sizeof(top2)) != 0;
+        if (ok) ok = metal_graph_read_current_logits(g, row_logits);
+        if (!ok) return false;
+
+        *row0_top = (int)top2.id0;
+        *commit_drafts = (*row0_top == draft1) ? 2 : 1;
+        if (*commit_drafts == 2) return true;
+
+        ok = ds4_gpu_begin_commands() != 0;
+        if (ok) ok = metal_graph_encode_output_head_batch_row(g,
+                                                              model,
+                                                              weights,
+                                                              0u,
+                                                              weights->output->dim[1],
+                                                              false);
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+        if (ok) ok = metal_graph_read_current_logits(g, row_logits);
+        return ok;
+    }
+
     ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = metal_graph_encode_output_head_batch_row(g,
                                                           model,
