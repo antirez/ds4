@@ -326,9 +326,14 @@ turning on every direct-RHS route at once when the global
 
 The Q8_0 prefill Tensor route can be isolated with
 `DS4_METAL_MPP_Q8_0_ENABLE=1` or `DS4_METAL_MPP_Q8_0_DISABLE=1`. It only
-affects prompt batches larger than eight tokens. By default, Q8_0 uses the late
-full-model-safe layer window 38..42 plus `attn_q_b` in layers 32..37 for all
-prompt batch sizes. It
+affects prompt batches larger than eight tokens. **On M5 the Q8_0 Tensor
+route is default-off**: bisection on M5 Max showed it was the sole source
+of the M5-only `-mt auto` vs `-mt off` logit drift while the other Tensor
+routes (F16 compressor, attention-output, MoE) stayed bit-clean on short
+prompts. Set `DS4_METAL_MPP_Q8_0_ENABLE=1` to opt back in. On non-M5
+devices Q8_0 stays default-on and uses the late full-model-safe layer
+window 38..42 plus `attn_q_b` in layers 32..37 for all prompt batch
+sizes. It
 uses 64-token tiles below 4096-token batches and 32-token tiles for larger
 prompt batches on M5, accepts partial token tails, and falls back to the legacy
 kernel when the Metal 4 tensor path is unavailable. When macOS reports Low
@@ -368,16 +373,23 @@ shape, max absolute error, RMS, and the largest element deltas. Set
 `DS4_METAL_MPP_COMPARE_VERBOSE=1` to print passing comparisons as well.
 
 Current Tensor route status balances drift with prefill throughput: `auto` enables
-Q8_0 prefill, F16 compressor, attention-output low projection, and routed-MoE
-Tensor. Attention-output low projection now uses layers 32..42 by default, while
-Q8_0 uses the narrower `attn_q_b` 32..37 plus all-Q8 38..42 window by default.
-Routed-MoE Tensor now uses the lower-drift conservative default window:
-gate/up from layer 20 and down from layer 22. This gives up some of the
-all-layer prefill speedup to avoid the larger drift seen with the previous
-broader Q8_0 and layer-0 routed-MoE Tensor windows. The current auto suite
-reports same-top1/same-greedy agreement with minimum top-5 overlap `5/5`,
-minimum top-20 overlap `19/20`, `worst_rms ~= 0.170`, and
-`worst_top20_max_abs ~= 0.342`. The Q8_0 and attention-output low Tensor
+F16 compressor, attention-output low projection, and routed-MoE Tensor. The
+Q8_0 prefill Tensor route is enabled by default on pre-M5 devices and
+**default-off on M5**, where bisection traced the entire `-mt auto` vs
+`-mt off` drift to that single route; opt back in with
+`DS4_METAL_MPP_Q8_0_ENABLE=1`. Attention-output low projection uses layers
+32..42 by default, Q8_0 (when enabled) uses the narrower `attn_q_b` 32..37
+plus all-Q8 38..42 window by default, and routed-MoE Tensor uses the
+lower-drift conservative default window: gate/up from layer 20 and down
+from layer 22. This gives up some of the all-layer prefill speedup to
+avoid the larger drift seen with the previous broader Q8_0 and layer-0
+routed-MoE Tensor windows. The current auto suite on M5 reports
+same-top1/same-greedy agreement on all five fixtures with minimum top-5
+overlap `5/5`, minimum top-20 overlap `20/20`, `worst_rms ~= 0.169`, and
+`worst_top20_max_abs ~= 0.306` (three short fixtures are bit-exact;
+residual drift is concentrated on the two long-context fixtures and
+comes from the still-enabled F16/attn-out/MoE Tensor routes compounding
+through 43 layers). The Q8_0 and attention-output low Tensor
 kernels stage activation tiles through half to match the legacy Metal matmul
 input path, which brings the isolated model-ish Q8_0 regression under the
 strict kernel target and removes the first attention-output comparator breach.
