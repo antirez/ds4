@@ -9870,6 +9870,28 @@ static bool should_canonicalize_tool_checkpoint(const server *s, const tool_call
     return true;
 }
 
+/* =========================================================================
+ * Warmup Job.
+ *
+ * Pre-warms a pool slot by acquiring it and prefilling the prompt.  Produces
+ * no output — the HTTP 202 was already sent before this runs.  The job struct
+ * is heap-allocated and freed here since the client thread doesn’t wait.
+ * ========================================================================= */
+static void warmup_job(server *s, job *j) {
+    char err[160];
+    err[0] = '\0';
+
+    if (!s->pool_enabled) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: warmup skipped (pool disabled)");
+        goto cleanup;
+    }
+    if (!j->req.session_id || !j->req.session_id[0]) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: warmup skipped (no session_id)");
+        goto cleanup;
+    }
+
     pthread_mutex_lock(&s->mu);
     int slot = ds4_pool_warmup(&s->pool, j->req.session_id, &j->req.prompt);
     if (slot >= 0) {
@@ -11261,7 +11283,7 @@ static void *client_main(void *arg) {
                                      ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {
         ok = parse_chat_request(s->engine, s, hr.body, s->default_tokens,
-                                ctx_size, &req, err, sizeof(err));
+                                ctx_size, &s->prompt_cache, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/responses")) {
         ok = parse_responses_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
