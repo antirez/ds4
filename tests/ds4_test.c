@@ -226,7 +226,7 @@ static void test_metal_q8_0_mpp_matmul_case(const char *label,
     int have_mpp = ds4_gpu_matmul_q8_0_mpp_tensor(
         out_mpp, weights_raw, weight_alloc, 0, in_dim, out_dim, x, n_tok);
     if (!have_mpp) {
-        fprintf(stderr, "ds4-test: skipping MPP Q8_0 matmul %s; Metal 4 tensor API unavailable\n",
+        fprintf(stderr, "ds4-test: skipping Tensor Q8_0 matmul %s; Metal 4 tensor API unavailable\n",
                 label);
         free(x_host);
         free(ref_host);
@@ -255,7 +255,7 @@ static void test_metal_q8_0_mpp_matmul_case(const char *label,
     const float rms = (float)sqrt(sumsq / (double)((uint64_t)n_tok * out_dim));
     if (max_abs >= 0.10f) {
         fprintf(stderr,
-                "ds4-test: MPP Q8_0 matmul %s in=%u out=%u tok=%u max_abs=%f rms=%f at token=%llu out=%llu ref=%f mpp=%f\n",
+                "ds4-test: Tensor Q8_0 matmul %s in=%u out=%u tok=%u max_abs=%f rms=%f at token=%llu out=%llu ref=%f tensor=%f\n",
                 label, in_dim, out_dim, n_tok, max_abs, rms,
                 (unsigned long long)(max_index / out_dim),
                 (unsigned long long)(max_index % out_dim),
@@ -869,12 +869,12 @@ static test_mpp_eq_result test_compare_mpp_logits(const test_mpp_eq_case *tc,
     };
 
     fprintf(stderr,
-            "ds4-test: MPP equivalence %s top1 ref=%d cand=%d top5_overlap=%d/%d overlap=%d/%d max_rank_delta=%d rms=%g max_abs=%g top20_max_abs=%g\n",
+            "ds4-test: Tensor equivalence %s top1 ref=%d cand=%d top5_overlap=%d/%d overlap=%d/%d max_rank_delta=%d rms=%g max_abs=%g top20_max_abs=%g\n",
             tc->id, ref_top[0], cand_top[0],
             top5_overlap, TEST_MPP_EQ_TOP5,
             overlap, TEST_MPP_EQ_TOPK,
             max_rank_delta, rms, max_abs, top_abs);
-    fprintf(stderr, "ds4-test: MPP equivalence %s largest deltas:", tc->id);
+    fprintf(stderr, "ds4-test: Tensor equivalence %s largest deltas:", tc->id);
     for (int i = 0; i < TEST_MPP_EQ_DELTAS && delta_ids[i] >= 0; i++) {
         fprintf(stderr, " id=%d ref=%g cand=%g abs=%g",
                 delta_ids[i], delta_ref[i], delta_cand[i], delta_abs[i]);
@@ -997,7 +997,7 @@ static void test_mpp_summary_note_logits(test_mpp_eq_summary *summary,
 
 static void test_mpp_summary_print(const test_mpp_eq_summary *summary) {
     fprintf(stderr,
-            "ds4-test: MPP summary route=%s cases=%d capture_fail=%d logits_fail=%d greedy_fail=%d top1_mismatch=%d min_top5_overlap=%d/%d min_overlap=%d/%d worst_rank_delta=%d worst_rms=%g worst_max_abs=%g worst_top20_max_abs=%g\n",
+            "ds4-test: Tensor summary route=%s cases=%d capture_fail=%d logits_fail=%d greedy_fail=%d top1_mismatch=%d min_top5_overlap=%d/%d min_overlap=%d/%d worst_rank_delta=%d worst_rms=%g worst_max_abs=%g worst_top20_max_abs=%g\n",
             summary->label,
             summary->cases,
             summary->capture_failures,
@@ -1018,7 +1018,7 @@ static void test_run_mpp_candidate(const char *label,
                                    ds4_mpp_mode mode,
                                    test_mpp_eq_case *cases,
                                    int ncase) {
-    fprintf(stderr, "ds4-test: MPP equivalence candidate route=%s mode=%s\n",
+    fprintf(stderr, "ds4-test: Tensor equivalence candidate route=%s mode=%s\n",
             label, ds4_mpp_mode_name(mode));
     test_mpp_eq_summary summary;
     test_mpp_summary_init(&summary, label);
@@ -1045,7 +1045,7 @@ static void test_run_mpp_candidate(const char *label,
                 for (int j = 0; j < tc->ref_gen_len && j < cand_gen_len; j++) {
                     if (cand_gen[j] != tc->ref_gen[j]) {
                         fprintf(stderr,
-                                "ds4-test: MPP equivalence %s greedy token mismatch step=%d ref=%d cand=%d\n",
+                                "ds4-test: Tensor equivalence %s greedy token mismatch step=%d ref=%d cand=%d\n",
                                 tc->id, j, tc->ref_gen[j], cand_gen[j]);
                         summary.greedy_failures++;
                     }
@@ -1343,7 +1343,7 @@ static const ds4_test_entry test_entries[] = {
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison", test_official_logprob_vectors},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
-    {"--metal-mpp-equivalence", "metal-mpp-equivalence", "Metal MPP off/on prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
+    {"--metal-mpp-equivalence", "metal-mpp-equivalence", "Metal Tensor off/on prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
@@ -1364,9 +1364,9 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_MODEL=FILE        Model path. Default: ds4flash.gguf");
     puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");
     puts("  DS4_TEST_VECTOR_FILE=FILE  Simple official-vector fixture.");
-    puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only MPP equivalence cases whose id contains NAME.");
-    puts("  DS4_TEST_MPP_EQ_FORCE_ON=1 Compare --mpp off against forced --mpp on instead of auto.");
-    puts("  DS4_TEST_MPP_EQ_MATRIX=1   Run auto and isolated forced MPP route rows.");
+    puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
+    puts("  DS4_TEST_MPP_EQ_FORCE_ON=1 Compare -mt off against forced -mt on instead of auto.");
+    puts("  DS4_TEST_MPP_EQ_MATRIX=1   Run auto and isolated forced Tensor route rows.");
 }
 
 static const ds4_test_entry *test_find_entry(const char *arg) {

@@ -33,6 +33,7 @@ typedef struct {
     float min_p;
     uint64_t seed;
     bool dump_tokens;
+    const char *dump_logits_path;
     const char *dump_logprobs_path;
     int dump_logprobs_top_k;
     const char *imatrix_dataset_path;
@@ -103,9 +104,10 @@ static void usage(FILE *fp) {
         "  -t, --threads N\n"
         "      CPU helper threads for host-side or reference work.\n"
         "  --quality\n"
-        "      Prefer exact kernels where faster approximate paths exist; disables Metal 4 MPP routes; MTP uses strict verification.\n"
-        "  --mpp MODE\n"
-        "      Metal 4 MPP policy: auto, on, or off. Default: auto. Auto enables validated safe routes; 'on' is a route diagnostic and may change output.\n"
+        "      Prefer exact kernels where faster approximate paths exist; disables Metal Tensor routes; MTP uses strict verification.\n"
+        "  -mt MODE, --mt MODE\n"
+        "      Metal Tensor policy: auto, on, or off. Default: auto. Auto enables validated safe routes; 'on' is a route diagnostic and may change output.\n"
+        "      Legacy alias: --mpp MODE.\n"
         "  --dir-steering-file FILE\n"
         "      Load one f32 direction vector per layer for directional steering.\n"
         "  --dir-steering-ffn F\n"
@@ -158,6 +160,8 @@ static void usage(FILE *fp) {
         "      Load the model and print a summary only.\n"
         "  --dump-tokens\n"
         "      Tokenize -p/--prompt-file exactly as written, then exit without inference.\n"
+        "  --dump-logits FILE\n"
+        "      Write full next-token logits as JSON after prompt prefill, then exit.\n"
         "  --dump-logprobs FILE\n"
         "      Write greedy continuation top-logprobs as JSON without printing text.\n"
         "  --logprobs-top-k N\n"
@@ -249,8 +253,8 @@ static ds4_mpp_mode parse_mpp_mode(const char *s) {
     if (!strcmp(s, "auto")) return DS4_MPP_AUTO;
     if (!strcmp(s, "on")) return DS4_MPP_ON;
     if (!strcmp(s, "off")) return DS4_MPP_OFF;
-    fprintf(stderr, "ds4: invalid MPP mode: %s\n", s);
-    fprintf(stderr, "ds4: valid MPP modes are: auto, on, off\n");
+    fprintf(stderr, "ds4: invalid Metal Tensor mode: %s\n", s);
+    fprintf(stderr, "ds4: valid Metal Tensor modes are: auto, on, off\n");
     exit(2);
 }
 
@@ -644,6 +648,86 @@ static void json_write_token(FILE *fp, ds4_engine *engine, int token) {
     free(text);
 }
 
+static int run_logits_dump(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
+    ds4_session *session = NULL;
+    if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
+        fprintf(stderr, "ds4: --dump-logits requires a graph session backend\n");
+        return 1;
+    }
+
+    char err[160];
+    cli_prefill_progress progress = {
+        .base_tokens = 0,
+        .input_tokens = prompt->len,
+        .use_color = ds4_log_is_tty(stderr),
+    };
+    ds4_session_set_progress(session, cli_prefill_progress_cb, &progress);
+    if (ds4_session_sync(session, prompt, err, sizeof(err)) != 0) {
+        ds4_session_set_progress(session, NULL, NULL);
+        fprintf(stderr, "ds4: prompt processing failed: %s\n", err);
+        ds4_session_free(session);
+        return 1;
+    }
+    ds4_session_set_progress(session, NULL, NULL);
+
+    const int vocab = ds4_engine_vocab_size(engine);
+    float *logits = malloc((size_t)vocab * sizeof(logits[0]));
+    if (!logits) {
+        ds4_session_free(session);
+        return 1;
+    }
+    if (ds4_session_copy_logits(session, logits, vocab) != vocab) {
+        fprintf(stderr, "ds4: failed to copy session logits\n");
+        free(logits);
+        ds4_session_free(session);
+        return 1;
+    }
+
+    FILE *fp = fopen(cfg->gen.dump_logits_path, "wb");
+    if (!fp) {
+        fprintf(stderr, "ds4: failed to open --dump-logits file: %s\n", cfg->gen.dump_logits_path);
+        free(logits);
+        ds4_session_free(session);
+        return 1;
+    }
+
+    fprintf(fp, "{\n  \"source\":\"ds4\",\n  \"model\":");
+    json_write_string(fp, cfg->engine.model_path, strlen(cfg->engine.model_path));
+    fprintf(fp,
+            ",\n  \"backend\":\"%s\",\n  \"mt\":\"%s\",\n  \"quant_bits\":%d,\n"
+            "  \"prompt_tokens\":%d,\n  \"ctx\":%d,\n  \"vocab\":%d,\n",
+            ds4_backend_name(cfg->engine.backend),
+            ds4_mpp_mode_name(cfg->engine.mpp_mode),
+            ds4_engine_routed_quant_bits(engine),
+            prompt->len,
+            cfg->gen.ctx_size,
+            vocab);
+    const int argmax = ds4_session_argmax(session);
+    fputs("  \"argmax_token\":", fp);
+    json_write_token(fp, engine, argmax);
+    fprintf(fp, ",\n  \"argmax_logit\":%.9g,\n  \"logits\":[", logits[argmax]);
+    for (int i = 0; i < vocab; i++) {
+        if (i) fputc(',', fp);
+        if ((i % 8) == 0) fputs("\n    ", fp);
+        if (isfinite(logits[i])) {
+            fprintf(fp, "%.9g", logits[i]);
+        } else {
+            fputs("null", fp);
+        }
+    }
+    fputs("\n  ]\n}\n", fp);
+    if (fclose(fp) != 0) {
+        fprintf(stderr, "ds4: failed to close --dump-logits file: %s\n", cfg->gen.dump_logits_path);
+        free(logits);
+        ds4_session_free(session);
+        return 1;
+    }
+
+    free(logits);
+    ds4_session_free(session);
+    return 0;
+}
+
 static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
@@ -742,6 +826,11 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
     }
     if (cfg->gen.metal_graph_prompt_test) {
         rc = ds4_engine_metal_graph_prompt_test(engine, &prompt, cfg->gen.ctx_size);
+        ds4_tokens_free(&prompt);
+        return rc;
+    }
+    if (cfg->gen.dump_logits_path) {
+        rc = run_logits_dump(engine, cfg, &prompt);
         ds4_tokens_free(&prompt);
         return rc;
     }
@@ -1262,7 +1351,7 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
-        } else if (!strcmp(arg, "--mpp")) {
+        } else if (!strcmp(arg, "-mt") || !strcmp(arg, "--mt") || !strcmp(arg, "--mpp")) {
             c.engine.mpp_mode = parse_mpp_mode(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--dir-steering-file")) {
             c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
@@ -1284,6 +1373,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_CUDA;
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
+        } else if (!strcmp(arg, "--dump-logits")) {
+            c.gen.dump_logits_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-logprobs")) {
             c.gen.dump_logprobs_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--logprobs-top-k")) {
