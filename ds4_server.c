@@ -583,6 +583,64 @@ typedef struct {
     tool_replay_stats tool_replay;
 } request;
 
+static void stable_tool_id_hash_bytes(uint64_t *h1, uint64_t *h2,
+                                      const void *ptr, size_t len) {
+    const unsigned char *p = ptr;
+    for (size_t i = 0; i < len; i++) {
+        *h1 ^= (uint64_t)p[i];
+        *h1 *= 1099511628211ULL;
+        *h2 ^= (uint64_t)p[i] + 0x9e3779b97f4a7c15ULL + (*h2 << 6) + (*h2 >> 2);
+    }
+}
+
+static void stable_tool_id_hash_field(uint64_t *h1, uint64_t *h2,
+                                      const char *value) {
+    if (value && value[0]) stable_tool_id_hash_bytes(h1, h2, value, strlen(value));
+    unsigned char sep = 0xff;
+    stable_tool_id_hash_bytes(h1, h2, &sep, 1);
+}
+
+static void stable_tool_id_hash_u64(uint64_t *h1, uint64_t *h2,
+                                    uint64_t value) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%llu", (unsigned long long)value);
+    stable_tool_id_hash_field(h1, h2, buf);
+}
+
+static void stable_tool_id_hash_float(uint64_t *h1, uint64_t *h2,
+                                      float value) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.9g", (double)value);
+    stable_tool_id_hash_field(h1, h2, buf);
+}
+
+static void deterministic_tool_id(char *dst, size_t dstlen,
+                                  const request *r, api_style api,
+                                  int index, const char *name,
+                                  int attempt) {
+    const char *prefix = api == API_ANTHROPIC ? "toolu_" : "call_";
+    uint64_t h1 = 1469598103934665603ULL;
+    uint64_t h2 = 0x84222325cbf29ce4ULL;
+
+    stable_tool_id_hash_field(&h1, &h2, "ds4-tool-id-v1");
+    stable_tool_id_hash_field(&h1, &h2, api == API_ANTHROPIC ? "anthropic" : "openai");
+    stable_tool_id_hash_u64(&h1, &h2, r ? r->seed : 0);
+    stable_tool_id_hash_field(&h1, &h2, r ? r->model : NULL);
+    stable_tool_id_hash_field(&h1, &h2, r ? r->prompt_text : NULL);
+    stable_tool_id_hash_u64(&h1, &h2, r ? (uint64_t)r->max_tokens : 0);
+    stable_tool_id_hash_u64(&h1, &h2, r ? (uint64_t)r->top_k : 0);
+    stable_tool_id_hash_float(&h1, &h2, r ? r->temperature : 0.0f);
+    stable_tool_id_hash_float(&h1, &h2, r ? r->top_p : 0.0f);
+    stable_tool_id_hash_float(&h1, &h2, r ? r->min_p : 0.0f);
+    stable_tool_id_hash_u64(&h1, &h2, r ? (uint64_t)r->think_mode : 0);
+    stable_tool_id_hash_u64(&h1, &h2, (uint64_t)index);
+    stable_tool_id_hash_u64(&h1, &h2, (uint64_t)attempt);
+    stable_tool_id_hash_field(&h1, &h2, name);
+
+    snprintf(dst, dstlen, "%s%016llx%016llx",
+             prefix, (unsigned long long)h1, (unsigned long long)h2);
+}
+
 static void tool_call_free(tool_call *tc) {
     free(tc->id);
     free(tc->name);
@@ -3289,8 +3347,9 @@ static bool openai_tool_stream_has_id(const openai_tool_stream *ts,
     return false;
 }
 
-static const char *openai_tool_stream_id(server *s, openai_tool_stream *ts,
-                                         int index) {
+static const char *openai_tool_stream_id(server *s, const request *r,
+                                         openai_tool_stream *ts,
+                                         int index, const char *name) {
     if (!ts || index < 0) return "";
     if (index >= ts->ids_cap) {
         int old = ts->ids_cap;
@@ -3302,10 +3361,17 @@ static const char *openai_tool_stream_id(server *s, openai_tool_stream *ts,
     }
     if (!ts->ids[index]) {
         char id[64];
-        for (;;) {
-            random_tool_id(id, sizeof(id), API_OPENAI);
-            if (!openai_tool_stream_has_id(ts, id, index) &&
-                !tool_memory_has_id(s, id)) break;
+        if (r && r->seed) {
+            for (int attempt = 0;; attempt++) {
+                deterministic_tool_id(id, sizeof(id), r, API_OPENAI, index, name, attempt);
+                if (!openai_tool_stream_has_id(ts, id, index)) break;
+            }
+        } else {
+            for (;;) {
+                random_tool_id(id, sizeof(id), API_OPENAI);
+                if (!openai_tool_stream_has_id(ts, id, index) &&
+                    !tool_memory_has_id(s, id)) break;
+            }
         }
         ts->ids[index] = xstrdup(id);
     }
@@ -3905,7 +3971,7 @@ static bool openai_tool_start_invoke(int fd, server *s, const request *r, const 
     free(tag);
     if (!name) return openai_tool_stream_fail(ts);
 
-    const char *tool_id = openai_tool_stream_id(s, ts, ts->index);
+    const char *tool_id = openai_tool_stream_id(s, r, ts, ts->index, name);
     bool ok = sse_chat_tool_call_start_delta(fd, r, id, ts->index, tool_id, name) &&
               openai_tool_emit_args_fragment(fd, r, id, ts, "{", 1);
     free(name);
@@ -5044,14 +5110,22 @@ static bool tool_calls_contains_id(const tool_calls *calls, const char *id, int 
     return false;
 }
 
-static void assign_tool_call_ids(server *s, tool_calls *calls, api_style api) {
+static void assign_tool_call_ids(server *s, const request *r,
+                                 tool_calls *calls, api_style api) {
     if (!calls) return;
     for (int i = 0; i < calls->len; i++) {
         if (calls->v[i].id && calls->v[i].id[0]) continue;
         char id[64];
-        for (;;) {
-            random_tool_id(id, sizeof(id), api);
-            if (!tool_calls_contains_id(calls, id, i) && !tool_memory_has_id(s, id)) break;
+        if (r && r->seed) {
+            for (int attempt = 0;; attempt++) {
+                deterministic_tool_id(id, sizeof(id), r, api, i, calls->v[i].name, attempt);
+                if (!tool_calls_contains_id(calls, id, i)) break;
+            }
+        } else {
+            for (;;) {
+                random_tool_id(id, sizeof(id), api);
+                if (!tool_calls_contains_id(calls, id, i) && !tool_memory_has_id(s, id)) break;
+            }
         }
         calls->v[i].id = xstrdup(id);
     }
@@ -7352,7 +7426,7 @@ static void generate_job(server *s, job *j) {
         }
         if (parsed_calls.len) {
             if (openai_live_chat) apply_openai_stream_tool_ids(&parsed_calls, &openai_live);
-            assign_tool_call_ids(s, &parsed_calls, j->req.api);
+            assign_tool_call_ids(s, &j->req, &parsed_calls, j->req.api);
             tool_memory_remember(s, &parsed_calls);
             final_finish = "tool_calls";
         }
@@ -9275,7 +9349,7 @@ static void test_tool_memory_replays_sampled_dsml(void) {
     server s;
     memset(&s, 0, sizeof(s));
     pthread_mutex_init(&s.tool_mu, NULL);
-    assign_tool_call_ids(&s, &sampled, API_OPENAI);
+    assign_tool_call_ids(&s, NULL, &sampled, API_OPENAI);
     TEST_ASSERT(sampled.v[0].id != NULL);
     TEST_ASSERT(!strncmp(sampled.v[0].id, "call_", 5));
     tool_memory_remember(&s, &sampled);
@@ -9315,6 +9389,72 @@ static void test_tool_memory_replays_sampled_dsml(void) {
     free(reasoning);
     tool_calls_free(&sampled);
     tool_memory_free(&s.tool_mem);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
+static void test_seeded_tool_ids_are_deterministic(void) {
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.tool_mu, NULL);
+
+    request r = {0};
+    r.api = API_OPENAI;
+    r.seed = 42;
+    r.model = "deepseek-v4-flash";
+    r.prompt_text = "prompt A";
+    r.max_tokens = 64;
+    r.top_k = 40;
+    r.temperature = 0.6f;
+    r.top_p = 0.95f;
+    r.min_p = 0.0f;
+    r.think_mode = DS4_THINK_HIGH;
+
+    tool_calls a = make_swapped_bash_call();
+    tool_calls b = make_swapped_bash_call();
+    assign_tool_call_ids(&s, &r, &a, API_OPENAI);
+    assign_tool_call_ids(&s, &r, &b, API_OPENAI);
+    TEST_ASSERT(a.v[0].id != NULL);
+    TEST_ASSERT(b.v[0].id != NULL);
+    TEST_ASSERT(!strcmp(a.v[0].id, b.v[0].id));
+    TEST_ASSERT(!strncmp(a.v[0].id, "call_", 5));
+
+    tool_calls c = make_swapped_bash_call();
+    r.prompt_text = "prompt B";
+    assign_tool_call_ids(&s, &r, &c, API_OPENAI);
+    TEST_ASSERT(c.v[0].id != NULL);
+    TEST_ASSERT(strcmp(a.v[0].id, c.v[0].id));
+
+    tool_calls d = make_swapped_bash_call();
+    r.prompt_text = "prompt A";
+    r.api = API_ANTHROPIC;
+    assign_tool_call_ids(&s, &r, &d, API_ANTHROPIC);
+    TEST_ASSERT(d.v[0].id != NULL);
+    TEST_ASSERT(!strncmp(d.v[0].id, "toolu_", 6));
+
+    r.api = API_OPENAI;
+    openai_stream st1, st2, st3;
+    openai_stream_start(&r, &st1);
+    openai_stream_start(&r, &st2);
+    const char *sid1 = openai_tool_stream_id(&s, &r, &st1.tool, 0, "bash");
+    const char *sid2 = openai_tool_stream_id(&s, &r, &st2.tool, 0, "bash");
+    TEST_ASSERT(sid1 != NULL);
+    TEST_ASSERT(sid2 != NULL);
+    TEST_ASSERT(!strcmp(sid1, sid2));
+    TEST_ASSERT(!strcmp(sid1, a.v[0].id));
+
+    r.seed = 43;
+    openai_stream_start(&r, &st3);
+    const char *sid3 = openai_tool_stream_id(&s, &r, &st3.tool, 0, "bash");
+    TEST_ASSERT(sid3 != NULL);
+    TEST_ASSERT(strcmp(sid1, sid3));
+
+    openai_stream_free(&st1);
+    openai_stream_free(&st2);
+    openai_stream_free(&st3);
+    tool_calls_free(&a);
+    tool_calls_free(&b);
+    tool_calls_free(&c);
+    tool_calls_free(&d);
     pthread_mutex_destroy(&s.tool_mu);
 }
 
@@ -10305,6 +10445,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();
+    test_seeded_tool_ids_are_deterministic();
     test_exact_dsml_tool_replay_can_be_disabled();
     test_dsml_decode_state_separates_structure_and_payload();
     test_tool_memory_max_ids_prunes_oldest();
