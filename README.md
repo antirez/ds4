@@ -607,34 +607,83 @@ the kv cache files include the verbatim prompt cached.
 
 ## Backends
 
-The default graph backend is Metal on macOS and CUDA on Linux CUDA builds:
+The default graph backend is Metal on macOS and CUDA/ROCm on Linux:
 
 ```sh
-./ds4 -p "Hello" --metal
-./ds4 -p "Hello" --cuda
+./ds4 -p "Hello" --metal   # macOS
+./ds4 -p "Hello" --cuda    # Linux (NVIDIA CUDA or AMD ROCm/HIP)
 ```
 
-CUDA builds default to `CUDA_ARCH=native`, so `nvcc` targets the visible GPU.
-Set `CUDA_ARCH` explicitly when cross-building or when you need a known target:
+### Building for ROCm (AMD GPU, Linux)
+
+The Linux build automatically uses ROCm/HIP when `/opt/rocm` is present —
+no separate target is needed:
+
+```sh
+make          # detects ROCm automatically; builds ds4, ds4-server, ds4-bench
+```
+
+**Prerequisites:** ROCm 7.x (`/opt/rocm/bin/hipcc` must exist). Check your GPU architecture with:
+
+```sh
+/opt/rocm/bin/hipcc --version
+rocminfo | grep "Name:.*gfx"
+```
+
+The Makefile picks up the GPU architecture automatically with `HIP_ARCH=native`. For specific AMD architectures (like **Strix Halo** or **RDNA3**), you can override it:
+
+```sh
+make HIP_ARCH=gfx1151     # AMD Strix Halo / Radeon 8060S
+make HIP_ARCH=gfx1100     # RX 7900 XTX
+make HIP_ARCH=gfx1030     # RX 6800/6900 (RDNA2)
+```
+
+**Performance Tuning for APUs (Strix Halo):**
+The ROCm backend is optimized for the unified memory architecture of the Strix Halo:
+- **Memory Advisories**: The model uses `hipMemAdviseSetCoarseGrain` to allow the GPU to cache system-mapped weights effectively, drastically improving TPS on APUs.
+- **Hardware Dot-Products**: Q2 quantization uses native RDNA3/3.5 `v_dot4_i32_i8` instructions for peak math throughput.
+- **Coalesced Access**: GEMV kernels are tuned for RDNA3 wavefront sizes to saturate the 180+ GB/s memory bus.
+
+**First-run kernel compilation:** On the first inference after a rebuild, ROCm may JIT-compile GPU kernels via COMGR. This can take a few minutes. Subsequent runs load from cache and start immediately.
+
+**Strix Halo / APU notes (gfx1151):**
+- **Always clean system cache before start**: On APUs with shared memory, the Linux PageCache can fragment the unified address space. It is highly recommended to flush caches before starting the server to ensure the 83GB model can be mapped/copied efficiently.
+  ```sh
+  sudo sync; echo 3 | sudo tee /proc/sys/vm/drop_caches
+  ```
+- ROCm sees only GTT (system RAM) — the BIOS UMA carveout is not exposed for
+  compute. Use a small UMA carveout (e.g. 512 MB in BIOS) and rely on GTT for
+  the model and KV cache.
+- The 84 GB IQ2 model maps as `cached coarse-grained` over GTT, which gives
+  the GPU direct access without explicit copies.
+- Use `--backend cuda` (the flag name is unchanged; it maps to HIP internally).
+
+```sh
+./ds4-server --backend cuda --ctx 32768 \
+  --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
+```
+
+### Building for NVIDIA CUDA (Linux)
+
+Same `make` command — the Makefile uses `nvcc` when `/opt/rocm` is absent.
+Set `CUDA_ARCH` if needed:
 
 ```sh
 make CUDA_ARCH=sm_120
 make CUDA_ARCH=        # old nvcc default target behavior
 ```
 
-There is also a CPU reference/debug path:
+### CPU reference build
 
 ```sh
 ./ds4 -p "Hello" --cpu
 make cpu
-./ds4
-./ds4 -p "Hello"
 ```
 
 Do not treat the CPU path as the production target. The CLI and `ds4-server`
 support the CPU backend for reference/debug use and share the same KV session
 and snapshot format as Metal and CUDA, but normal inference should use Metal or
-CUDA.
+CUDA/ROCm.
 
 ## Steering
 

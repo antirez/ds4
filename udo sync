@@ -1,0 +1,564 @@
+[33mcommit ab92ae1a335d107d4e2e04150e452c05b18d73c9[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m
+Author: chihmin <chihmin@localhost>
+Date:   Wed May 13 16:17:04 2026 +0800
+
+    Push to ds4-rocm-strix-halo
+
+[33mcommit 432fb8a5b48fff73b6835736f39be7bffea0a98f[m
+Author: chihmin <chihmin@localhost>
+Date:   Wed May 13 01:10:22 2026 +0800
+
+    Optimize ROCm performance for Strix Halo: memory coalescing, coarse-grained advisories, and MoE caching
+
+[33mcommit 244390220e1f5db5e1ee4d5bb8227c07a2507903[m
+Author: chihmin <chihmin@localhost>
+Date:   Wed May 13 00:17:29 2026 +0800
+
+    Vectorize F16/F32 GEMV kernels and fix hipHostRegister fallback
+    
+    - matmul_f16_ordered_chunks_kernel: replace scalar half loads with half2
+      vectorized reads and shared-memory reduction with wave32 warp shuffles;
+      same for the pair variant.  Generation throughput: 9.16 → 11.36 t/s.
+    - matmul_f32_kernel: use warp-shuffle intra-warp reduction to cut
+      shared-memory barrier rounds from 8 to 1.
+    - ds4_gpu_set_model_map: fall back to plain hipHostRegisterMapped when
+      hipHostRegisterReadOnly returns hipErrorInvalidValue/NotSupported.
+      ROCm 7.2.2 on Strix Halo rejects the ReadOnly flag after repeated
+      process crashes; the plain-mapped registration succeeds and restores
+      the zero-copy model access path.
+    
+
+[33mcommit 5483fd427055aebed3a69ed8040af2d9c4fe27bc[m
+Author: chihmin <chihmin@localhost>
+Date:   Wed May 13 00:00:35 2026 +0800
+
+    Add compiled test binaries for hip smoke and unit tests
+    
+
+[33mcommit 155a8193b98fb70344b6ec602df99cf94d579865[m
+Author: chihmin <chihmin@localhost>
+Date:   Tue May 12 23:56:35 2026 +0800
+
+    Replace scalar CPU fallbacks with AMD GPU hardware intrinsics
+    
+    - __dp4a: was scalar loop, now uses amd_mixed_dot(char4,char4,int,false)
+      which maps to __ockl_sdot4 → v_dot4_i32_i8 hardware instruction on gfx11+.
+      Prefill throughput: 9 t/s → 17.6 t/s (~2x) on gfx1151.
+    
+    - __vsub4 / __vcmpne4: byte-parallel ops; compiler lowers the unrolled
+      byte-lane loop to v_pk_sub_u8 / byte-compare VALU instructions on RDNA3.
+    
+    - Retain scalar fallback in the host-compilation pass (hipcc parses device
+      code in both passes; the host path is never actually executed).
+    
+    All 18 unit tests still pass, inference output unchanged.
+    
+
+[33mcommit 8f088a787eff00ef94601b1910e0b328bc19a39f[m
+Author: chihmin <chihmin@localhost>
+Date:   Tue May 12 23:45:43 2026 +0800
+
+    Migrate Linux GPU backend from CUDA to ROCm/HIP (gfx1151 Strix Halo)
+    
+    - New files: ds4_hip.cpp (from ds4_cuda.cu), ds4_iq2_tables_hip.inc,
+      tests/hip_long_context_smoke.c, tests/hip_unit_test.cpp
+    - Makefile: Linux branch now uses hipcc --offload-arch=gfx1151 with
+      libhipblas + libamdhip64 instead of nvcc/cublas
+    - ~110 CUDA→HIP symbol substitutions (cuda*→hip*, cublas*→hipblas*)
+    - hipblasGemmEx/StridedBatchedEx: compute type CUDA_R_32F→HIPBLAS_COMPUTE_32F
+    - hipMemAdvise/PrefetchAsync: use _v2 variants for hipMemLocation signature
+    - __shfl_*_sync masks widened to uint64_t (HIP requires 64-bit masks)
+    - __dp4a / __vsub4 / __vcmpne4 shimmed as portable device functions
+    - rocwmma enabled (DS4_HAVE_ROCWMMA=1): gfx1151 confirmed in config.hpp
+      with WAVE32 mode; indexer scoring kernel uses rocwmma instead of scalar
+    - hip-unit-test target: 18/18 kernel tests pass on gfx1151
+    - Performance: ~9 t/s decode on Radeon 890M with Q2-imatrix model
+    
+
+[33mcommit a97e7a3989c7825dbc4b49395aeeee800389ad70[m
+Author: antirez <antirez@gmail.com>
+Date:   Tue May 12 13:57:46 2026 +0200
+
+    Guard CUDA q8 fp16 cache memory use
+    
+    The CUDA Q8->F16 expansion cache is only an acceleration path, but on memory-constrained cards it could consume enough VRAM to make later allocations or cuBLAS calls fail. Add a budget check before expanding weights, keeping a default reserve of max(4 GiB, 5% VRAM), and fall back to native Q8 kernels when the cache is capped or memory is tight.
+    
+    Expose DS4_CUDA_Q8_F16_CACHE_MB to disable or cap the cache and DS4_CUDA_Q8_F16_CACHE_RESERVE_MB to override the reserve. If allocation, dequantization, or cuBLAS use of the cached path fails, release/disable the optional cache and continue through the Q8 kernel path instead of failing the request.
+    
+    Fixes #78
+
+[33mcommit 3630e64ea2aadb4d069a30dc3369f2b2950d6cb3[m
+Merge: e801b2b d9e2317
+Author: Salvatore Sanfilippo <antirez@gmail.com>
+Date:   Tue May 12 12:19:56 2026 +0200
+
+    Merge pull request #88 from timtan/bench-m2-ultra
+    
+    Add M2 Ultra (192 GB) benchmark
+
+[33mcommit d9e2317075c32816cd35c775c09e52314c312dd5[m
+Author: timtan <tim.yellow@gmail.com>
+Date:   Tue May 12 18:08:39 2026 +0800
+
+    Add M2 Ultra (192 GB) benchmark.
+    
+
+[33mcommit e801b2b60a1ba5b3e0ff9147cee4a634f51649c4[m
+Author: antirez <antirez@gmail.com>
+Date:   Tue May 12 11:37:17 2026 +0200
+
+    Renamed bench to speed-bench, since LLM benchmarking means something different.
+
+[33mcommit ef75c30c2edafa1a3e531a0d23ea517fd7a6a9d6[m
+Author: antirez <antirez@gmail.com>
+Date:   Tue May 12 11:15:53 2026 +0200
+
+    Benchmark CSV to SVG rendering Python script added.
+
+[33mcommit 9e41f3608de6d76748415c4ecb6a9efcd0e77668[m
+Author: antirez <antirez@gmail.com>
+Date:   Tue May 12 11:05:24 2026 +0200
+
+    Use a single directory for benchmark CSV files.
+
+[33mcommit 5193a0851fd63743a06f31c267a7e553d902a512[m
+Author: antirez <antirez@gmail.com>
+Date:   Tue May 12 10:59:38 2026 +0200
+
+    Delete no longer useful python test.
+
+[33mcommit b7efbb6d5e3690e2c1ba2df5dceb3c9bdaf14e73[m
+Merge: 0c41d58 da8f18b
+Author: Salvatore Sanfilippo <antirez@gmail.com>
+Date:   Tue May 12 10:59:54 2026 +0200
+
+    Merge pull request #87 from VadimDu/main
+    
+    Added new benchmarks for Mac Studio M4 Max 128gb
+
+[33mcommit da8f18b9206246807fcf5ce65a6a6581d060169c[m
+Author: Vadim (Dani) Dubinsky <dani.dubinsky@gmail.com>
+Date:   Tue May 12 11:31:13 2026 +0300
+
+    Add files via upload
+
+[33mcommit bd987ee6503811ddd2cfc740fdfd6f5a1eee4cc7[m
+Author: Vadim (Dani) Dubinsky <dani.dubinsky@gmail.com>
+Date:   Tue May 12 11:30:32 2026 +0300
+
+    Create README.md
+    
+    Run the official promessi-sposi benchmark prompt.
+    
+    Mac Studio M4 Max 128 gb results.
+
+[33mcommit 0c41d58c0cfa09e00ec72c38a36a9134dd677de3[m
+Author: antirez <antirez@gmail.com>
+Date:   Tue May 12 10:23:58 2026 +0200
+
+    Add CUDA long-context regression test
+
+[33mcommit 320b7793bdfa3928750050df58406aac6ac8015d[m
+Author: Andrew Yourtchenko <ayourtch@gmail.com>
+Date:   Tue May 12 09:49:50 2026 +0200
+
+    Import CUDA long-context fixes
+    
+    Credit: adapted from Andrew Yourtchenko
+
+[33mcommit ed5d30dba0a1ef0f7fb863270df8f11df13653a4[m
+Author: antirez <antirez@gmail.com>
+Date:   Tue May 12 08:56:09 2026 +0200
+
+    q4 imatrix file in the download script.
+
+[33mcommit 920f9872ec98602e899c1f0bfec9f2f0f6103017[m
+Author: antirez <antirez@gmail.com>
+Date:   Mon May 11 23:35:53 2026 +0200
+
+    Document that it runs well with 96GB of system memory.
+
+[33mcommit 99a5c13ba82e05bd2e47a90cdf4825fc7840cf96[m
+Merge: 579edb8 5161bc9
+Author: antirez <antirez@gmail.com>
+Date:   Mon May 11 19:37:32 2026 +0200
+
+    Merge commit '5161bc9493a3bde31d0fc8a8dce002662d6e2d16'
+
+[33mcommit 579edb8d56a761083d92c9bd7a23e2e5a27fb1a2[m
+Author: antirez <antirez@gmail.com>
+Date:   Mon May 11 19:13:56 2026 +0200
+
+    Ignore .DS_Store files.
+
+[33mcommit 66afd654bdab12ec217f925cfcbf70f7cb369802[m
+Author: antirez <antirez@gmail.com>
+Date:   Mon May 11 19:11:29 2026 +0200
+
+    Add CUDA architecture build knob
+
+[33mcommit 412bae1149dbc66a45eca2ad35c34a5431da7617[m
+Author: antirez <antirez@gmail.com>
+Date:   Mon May 11 18:51:30 2026 +0200
+
+    Report server prefill progress by suffix
+
+[33mcommit cdf8040b2320a15942773ce0bb2b72aaedfb3f06[m
+Merge: ae302c2 b1ed832
+Author: Salvatore Sanfilippo <antirez@gmail.com>
+Date:   Mon May 11 18:53:55 2026 +0200
+
+    Merge pull request #77 from ivanfioravanti/codex/server-thinking-checkpoint-gate
+    
+    Fix thinking checkpoint rebuild on length stop
+
+[33mcommit b1ed832d786bb28c33c5d18786fc1d45252399c8[m
+Author: Ivan Fioravanti <ivan.fioravanti@gmail.com>
+Date:   Mon May 11 18:34:50 2026 +0200
+
+    Fix thinking checkpoint rebuild on length stop
+    
+    Length-stopped chat/thinking requests were synchronously rebuilding the
+    thinking checkpoint before returning the response. Skip canonicalization for
+    incomplete thinking turns so client wall time reflects the sampled response.
+    
+    Client results before the patch:
+    
+    Context | Prompt TPS | Gen TPS | Gen Tokens | Total Time
+    --------|------------|---------|------------|------------
+       0.5k |      230.0 |    23.6 |        128 |       7.3s
+         1k |      296.5 |    20.4 |        128 |       9.0s
+         2k |      366.3 |    12.4 |        128 |      15.7s
+         4k |      308.2 |     7.4 |        128 |      30.0s
+    
+    Client results after the patch:
+    
+    Context | Prompt TPS | Gen TPS | Gen Tokens | Total Time
+    --------|------------|---------|------------|------------
+       0.5k |      239.1 |    38.8 |        128 |       5.2s
+         1k |      295.3 |    38.6 |        128 |       6.0s
+         2k |      357.3 |    33.2 |        128 |       9.4s
+         4k |      307.9 |    31.0 |        128 |      17.1s
+    
+    Tested with:
+    make all ds4_test && make test
+
+[33mcommit 5161bc9493a3bde31d0fc8a8dce002662d6e2d16[m
+Author: antirez <antirez@gmail.com>
+Date:   Mon May 11 13:38:11 2026 +0200
+
+    q2-imatrix weights added to download script.
+
+[33mcommit ae302c2fa18cc6d9aefc021d0f27ae03c9ad2fc0[m
+Author: antirez <antirez@gmail.com>
+Date:   Mon May 11 13:12:38 2026 +0200
+
+    Project renamed to DwarfStar 4.
+
+[33mcommit 0c1c0232ad7cd45e84eb9c4524653ef358223614[m
+Author: antirez <antirez@gmail.com>
+Date:   Mon May 11 13:10:50 2026 +0200
+
+    Add incremental throughput benchmark
+
+[33mcommit 9deabad750f7662b7dd7a63eec2ea75f0d9e0118[m
+Author: antirez <antirez@gmail.com>
+Date:   Mon May 11 10:50:39 2026 +0200
+
+    Add verbosity steering example
+
+[33mcommit 0ac5df3e65fbc6d8ad4ce21bf66bd1d790a718a6[m
+Author: antirez <antirez@gmail.com>
+Date:   Mon May 11 10:18:31 2026 +0200
+
+    Different backends refactoring
+
+[33mcommit f5f414d6cb508a2e7678855c7ed4e5866f31ad4f[m
+Author: Codex <codex@localhost>
+Date:   Mon May 11 07:27:36 2026 +0000
+
+    CPU support improved
+
+[33mcommit 48beef81a017a3785fd449a6f3cb34eb849b0e1f[m
+Author: Codex <codex@localhost>
+Date:   Mon May 11 07:27:22 2026 +0000
+
+    CUDA support
+
+[33mcommit 3f7e5c93ed46f47fc15d80d69f48763d50418149[m
+Author: antirez <antirez@gmail.com>
+Date:   Mon May 11 08:22:15 2026 +0200
+
+    Add directional steering pipeline
+
+[33mcommit e88a51fdac110ca5c0e0da06f1a27d4c0313b563[m
+Author: antirez <antirez@gmail.com>
+Date:   Sun May 10 22:56:16 2026 +0200
+
+    README: project status.
+
+[33mcommit 0e79ceeab2746165e03289003baa6426e6404783[m
+Author: antirez <antirez@gmail.com>
+Date:   Sun May 10 22:48:48 2026 +0200
+
+    Return recoverable output for malformed tool calls
+
+[33mcommit fe0d26b151d389db507ae204f816214fed7c3db4[m
+Merge: 3222caf 091e502
+Author: antirez <antirez@gmail.com>
+Date:   Sun May 10 22:48:04 2026 +0200
+
+    Merge PR #56: canonicalize toolless thinking checkpoints
+
+[33mcommit 3222caf19aec7f330194789add69f999feecd765[m
+Author: antirez <antirez@gmail.com>
+Date:   Sun May 10 22:29:11 2026 +0200
+
+    Recover loose nested DSML tool parameters
+
+[33mcommit 28cbb956d39b36ad6fc22b8d81db421795de858c[m
+Author: antirez <antirez@gmail.com>
+Date:   Sun May 10 19:10:25 2026 +0200
+
+    Use rendered text prefixes for KV cache reuse
+    
+    Close #62
+
+[33mcommit 1a5ce45d4abd2ef5b24364e69220180eb20e227e[m
+Author: antirez <antirez@gmail.com>
+Date:   Sun May 10 18:34:06 2026 +0200
+
+    Make continued KV checkpoints aligned frontiers
+
+[33mcommit 22ca6abd732ecc59f87378e022b9e5850c9fa377[m
+Author: antirez <antirez@gmail.com>
+Date:   Sun May 10 13:14:26 2026 +0200
+
+    Fix DSML payload sampling repetition
+
+[33mcommit 7120b85ecb8a92c7bfbbde09f83b7413a3f49bf9[m
+Author: antirez <antirez@gmail.com>
+Date:   Sun May 10 10:45:13 2026 +0200
+
+    Print Metal hardware at startup
+
+[33mcommit 091e50264f2852748fbb38f1544c4c916e8aadca[m
+Author: Pradeep Elankumaran <pradeepe@gmail.com>
+Date:   Sat May 9 23:52:10 2026 -0700
+
+    fix: session cache miss on every turn in toolless thinking mode
+    
+    In thinking mode without tools, the session cache misses on every turn
+    because the checkpoint diverges from what the next request produces.
+    
+    Root cause: DeepSeek's chat template drops reasoning from prior assistant
+    turns when no tools are present. The checkpoint has
+    [think_start][reasoning][think_end][content] but re-tokenization produces
+    [think_end][content][eos] — diverging at the first token after <|Assistant|>.
+    
+    Fix: after generation, canonicalize the checkpoint by rewinding to the
+    divergence point and prefilling the short canonical suffix:
+      strip trailing <think>, append </think> + content + <eos>
+    
+    Cost: ~20-100 tokens of prefill per generation (the content portion).
+    Savings: avoids re-prefilling the entire session (10K-100K tokens).
+    
+    Before: ctx=0..407:407  (full re-prefill every turn)
+    After:  ctx=397..407:10 (10-token suffix, cache hit)
+    
+    Note: the production path (thinking + tools) is unaffected — when tools
+    are present, reasoning is preserved in re-render and BPE round-trip is
+    already lossless.
+
+[33mcommit cb7feea6980e0dabaec433a0d43bb08cb2c6728b[m
+Author: antirez <antirez@gmail.com>
+Date:   Sat May 9 23:12:40 2026 +0200
+
+    Document tool streaming behavior
+
+[33mcommit d3fd981726cc43a8eead8109002f069456e40a1f[m
+Author: antirez <antirez@gmail.com>
+Date:   Sat May 9 23:09:21 2026 +0200
+
+    Document KV tool replay map format
+
+[33mcommit 8e7575be0ef44bd97c5ebaccf49ef85e05048b7b[m
+Author: antirez <antirez@gmail.com>
+Date:   Sat May 9 22:48:08 2026 +0200
+
+    Fix JSON parser nesting DoS
+    
+    Limit recursive JSON skipping for ignored request fields so a deeply nested unused value cannot exhaust the server stack before the request is rejected. Add a unit test for the nesting ceiling.\n\nFixes #43.
+
+[33mcommit 809cdbd04b9c3830706940f53564a75184417116[m
+Merge: baa0844 f9e8715
+Author: Salvatore Sanfilippo <antirez@gmail.com>
+Date:   Sat May 9 22:38:12 2026 +0200
+
+    Merge pull request #39 from mitsuhiko/fix-metal-debug
+    
+    Satisfy debug-layer buffer validation
+
+[33mcommit f9e8715421bc31a5c9250bf5c338b91f89a3b344[m
+Author: Armin Ronacher <armin.ronacher@active-4.com>
+Date:   Sat May 9 19:36:36 2026 +0200
+
+    fix(metal): satisfy debug-layer buffer validation
+    
+    Use typed char pointers for get_rows/set_rows sources so Metal reflects read-only access correctly, and bind dummy values for inactive router finalize arguments required by API validation.
+
+[33mcommit baa084482020263a17a3b33a238f6f0809b425fd[m
+Merge: d967f63 8284994
+Author: Salvatore Sanfilippo <antirez@gmail.com>
+Date:   Sat May 9 14:10:40 2026 +0200
+
+    Merge pull request #7 from enigma/aa/typos
+    
+    fix README typos
+
+[33mcommit d967f63e738865935430658a202174d1990ffa51[m
+Author: antirez <antirez@gmail.com>
+Date:   Sat May 9 13:29:48 2026 +0200
+
+    Use rax for exact DSML replay memory
+
+[33mcommit 52f8b95bd45eae665fe162bd0be3e497b3418743[m
+Author: antirez <antirez@gmail.com>
+Date:   Sat May 9 13:14:00 2026 +0200
+
+    Add exact DSML tool replay memory
+
+[33mcommit c18449999740b9e92e5cb41eb3d999b2cfb65d8f[m
+Author: antirez <antirez@gmail.com>
+Date:   Sat May 9 10:26:12 2026 +0200
+
+    Harden DSML tool-call checkpoint recovery
+
+[33mcommit 9c0e6acc965b9518236649680abc2df1427f3f72[m
+Author: antirez <antirez@gmail.com>
+Date:   Sat May 9 09:59:34 2026 +0200
+
+    Add backend-independent token dump debugging
+
+[33mcommit d615ab08c8bce9b8242963ecece5aed6b5a79367[m
+Author: Armin Ronacher <armin.ronacher@active-4.com>
+Date:   Fri May 8 10:16:16 2026 +0200
+
+    Show curl progress while downloading models
+    
+    Taken from mitsuhiko/ds4 pi-polish.
+
+[33mcommit b43a0bc536fcafa0d03ad9d262d17a8f1399b3b6[m
+Author: antirez <antirez@gmail.com>
+Date:   Fri May 8 08:23:58 2026 +0200
+
+    Fix OpenAI thinking stream routing
+
+[33mcommit 28e5c859717e978867422755eb7230cac6ec643c[m
+Author: antirez <antirez@gmail.com>
+Date:   Fri May 8 08:11:50 2026 +0200
+
+    Test OpenAI tool argument streaming edges
+
+[33mcommit 404f0a1b9757def69be5f98ecd33ea93adfeecd6[m
+Author: Armin Ronacher <armin.ronacher@active-4.com>
+Date:   Thu May 7 23:35:15 2026 +0200
+
+    fix(server): reject incomplete streamed tool calls
+
+[33mcommit a1e6945c70e11c82dd6929a54251d6be3b6f5554[m
+Author: Armin Ronacher <armin.ronacher@active-4.com>
+Date:   Thu May 7 23:07:30 2026 +0200
+
+    feat(server): stream OpenAI tool arguments
+
+[33mcommit 8284994dbdcda890d8a5b89f856f20a2ca4959dd[m
+Author: Andrea Ambu <andreambu@gmail.com>
+Date:   Thu May 7 23:24:57 2026 +0100
+
+    fix README typos
+
+[33mcommit ab64b9c798d42169485ed5ff61e090edb4d68ca8[m
+Author: user <user@studio1.l0st.space>
+Date:   Thu May 7 22:54:15 2026 +0200
+
+    Document Q4 benchmark results
+
+[33mcommit d57c6cd4126ec2fcee6372061578926012676982[m
+Author: antirez <antirez@gmail.com>
+Date:   Thu May 7 18:29:25 2026 +0200
+
+    Improve terminal diagnostics
+
+[33mcommit faf764780fe59156d525a795f9224a2890e4846a[m
+Merge: b8973e2 c39962f
+Author: Salvatore Sanfilippo <antirez@gmail.com>
+Date:   Thu May 7 20:14:33 2026 +0200
+
+    Merge pull request #1 from enilsen16/fix/readme-typos
+    
+    Fix spelling typos in README
+
+[33mcommit b8973e229a232c967b84f1551ecaf9f9b299551b[m
+Merge: 13ee2fb a0510c2
+Author: Salvatore Sanfilippo <antirez@gmail.com>
+Date:   Thu May 7 20:13:59 2026 +0200
+
+    Merge pull request #3 from matteobaccan/main
+    
+    Fix typos
+
+[33mcommit 13ee2fb017096daa8f87adafb95f0cbcded40ab2[m
+Merge: d997b56 efce64b
+Author: Salvatore Sanfilippo <antirez@gmail.com>
+Date:   Thu May 7 20:13:35 2026 +0200
+
+    Merge pull request #5 from laudney/fix/mtp-ffn-gate-inp-f32
+    
+    fix: accept F32 ffn_gate_inp in MTP validator
+
+[33mcommit efce64bf870dfd213af5cdb4573eeebe79f234fd[m
+Author: L.B.R. <lbr@mmonad.com>
+Date:   Thu May 7 18:52:00 2026 +0100
+
+    fix: accept F32 ffn_gate_inp in MTP validator
+    
+    The MTP weights validator strictly required `mtp.0.ffn_gate_inp.weight`
+    to be F16, but the bundled MTP GGUF (DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32)
+    ships this tensor as F32.  The runtime kernel that actually consumes
+    the tensor (`metal_graph_matmul_plain_tensor`, reached via the shared
+    `metal_graph_encode_decode_layer` from the MTP draft eval path) already
+    dispatches to either `ds4_metal_matmul_f16_tensor` or
+    `ds4_metal_matmul_f32_tensor` based on `w->type`, so the validator was
+    gratuitously stricter than the kernel.
+    
+    Switch the check to `tensor_expect_plain_layout`, mirroring the same
+    relaxation already applied to `hc_head_fn`, `hc_attn_fn`, and
+    `hc_ffn_fn` a few lines above.  The base-model layer validator is left
+    strict because the prefill batch path uses the F16-only kernel
+    `ds4_metal_matmul_f16_tensor` directly and would silently break with
+    F32 weights; MTP never reaches that path.
+    
+    Fixes #4
+
+[33mcommit a0510c2ac2bec2cbffe730fa728fb7d3880f93ec[m
+Author: matteo baccan <m.baccan@rdigitale.eu>
+Date:   Thu May 7 18:57:58 2026 +0200
+
+    Fix typos in comments for clarity in linenoise.c and linenoise.h
+
+[33mcommit c39962fb1af6165a8717b76eb42a7d37190b816d[m
+Author: Erik Nilsen <enilsen16@live.com>
+Date:   Thu May 7 09:24:42 2026 -0700
+
+    Fix spelling typos in README
+    
+    - thsi -> this
+    - virutal -> virtual
+    - Remeber -> Remember
+
+[33mcommit d997b56c151184bcff469dd8302ed97f23481024[m
+Author: antirez <antirez@gmail.com>
+Date:   Thu May 7 16:44:28 2026 +0200
+
+    DS4 initial release
