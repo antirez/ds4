@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
+#include <string>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -97,6 +98,7 @@ struct cuda_model_range {
     uint64_t registered_bytes;
     int host_registered;
     int arena_allocated;
+    int imported_ipc;
 };
 
 struct cuda_model_arena {
@@ -197,23 +199,16 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
 
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
-    if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
-    if (g_model_hmm_direct &&
-        getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
-        getenv("DS4_CUDA_WEIGHT_PRELOAD") == NULL) {
-        return cuda_model_ptr(model_map, offset);
-    }
-    const char *direct_env = getenv("DS4_CUDA_DIRECT_MODEL");
-    if (direct_env && direct_env[0]) return cuda_model_ptr(model_map, offset);
-
     const uint64_t end = offset + bytes;
+    if (end < offset) return NULL;
+
     auto exact = g_model_range_by_offset.find(offset);
     if (exact != g_model_range_by_offset.end()) {
         const cuda_model_range &r = g_model_ranges[exact->second];
-        if (r.host_base == model_map && end >= offset && bytes <= r.bytes) return r.device_ptr;
+        if (r.host_base == model_map && bytes <= r.bytes) return r.device_ptr;
     }
     for (const cuda_model_range &r : g_model_ranges) {
-        if (r.host_base == model_map && offset >= r.offset && end >= offset && end <= r.offset + r.bytes) {
+        if (r.host_base == model_map && offset >= r.offset && end <= r.offset + r.bytes) {
             return r.device_ptr + (offset - r.offset);
         }
         if (r.host_base == model_map && r.host_registered && r.registered_base && r.registered_device_base) {
@@ -224,6 +219,15 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             if (h1 >= h0 && h0 >= r0 && h1 <= r1) return r.registered_device_base + (h0 - r0);
         }
     }
+
+    if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
+    if (g_model_hmm_direct &&
+        getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
+        getenv("DS4_CUDA_WEIGHT_PRELOAD") == NULL) {
+        return cuda_model_ptr(model_map, offset);
+    }
+    const char *direct_env = getenv("DS4_CUDA_DIRECT_MODEL");
+    if (direct_env && direct_env[0]) return cuda_model_ptr(model_map, offset);
 
     if (getenv("DS4_CUDA_NO_FD_CACHE") == NULL) {
         const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
@@ -246,7 +250,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             err = cudaHostGetDevicePointer(&reg_dev, (void *)reg_addr, 0);
             if (err == cudaSuccess && reg_dev) {
                 char *dev_ptr = (char *)reg_dev + reg_delta;
-                g_model_ranges.push_back({model_map, offset, bytes, dev_ptr, (void *)reg_addr, (char *)reg_dev, reg_bytes, 1, 0});
+                g_model_ranges.push_back({model_map, offset, bytes, dev_ptr, (void *)reg_addr, (char *)reg_dev, reg_bytes, 1, 0, 0});
                 g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
                 if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
                     fprintf(stderr, "ds4: CUDA mapped %s %.2f MiB\n",
@@ -290,7 +294,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             return NULL;
         }
     }
-    g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
+    g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0, 0});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
@@ -1078,7 +1082,7 @@ static const char *cuda_model_range_ptr_from_fd(
         return NULL;
     }
 
-    g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1});
+    g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1, 0});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
     cuda_model_load_progress_note(g_model_range_bytes);
@@ -1182,6 +1186,8 @@ static void cuda_model_range_release_all(void) {
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_registered && r.registered_base) {
             (void)cudaHostUnregister(r.registered_base);
+        } else if (r.imported_ipc && r.device_ptr) {
+            (void)cudaIpcCloseMemHandle(r.device_ptr);
         } else if (r.device_ptr && !r.arena_allocated) {
             (void)cudaFree(r.device_ptr);
         }
@@ -1484,6 +1490,141 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
         }
 #endif
     }
+    return 1;
+}
+
+static int cuda_hex_value(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int cuda_hex_decode(const char *hex, void *out, size_t out_bytes) {
+    if (!hex || !out) return 0;
+    const size_t nhex = strlen(hex);
+    if (nhex != out_bytes * 2u) return 0;
+    unsigned char *dst = (unsigned char *)out;
+    for (size_t i = 0; i < out_bytes; i++) {
+        const int hi = cuda_hex_value(hex[2u * i]);
+        const int lo = cuda_hex_value(hex[2u * i + 1u]);
+        if (hi < 0 || lo < 0) return 0;
+        dst[i] = (unsigned char)((hi << 4) | lo);
+    }
+    return 1;
+}
+
+extern "C" int ds4_gpu_import_model_ipc_manifest(
+        const void *model_map,
+        uint64_t model_size,
+        const char *manifest_path,
+        const char *model_id) {
+    if (!model_map || model_size == 0 || !manifest_path || !manifest_path[0] ||
+        !model_id || !model_id[0]) {
+        return 0;
+    }
+    FILE *fp = fopen(manifest_path, "r");
+    if (!fp) {
+        fprintf(stderr, "ds4: CUDA shared weight manifest open failed: %s: %s\n",
+                manifest_path, strerror(errno));
+        return 0;
+    }
+
+    char line[4096];
+    uint64_t imported_bytes = 0;
+    uint64_t imported_ranges = 0;
+    int saw_header = 0;
+    int ok = 1;
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\n' || *p == '\0') continue;
+        if (!strncmp(p, "DS4_WEIGHT_SERVER_IPC_V1", 24) ||
+            !strncmp(p, "DS4_WEIGHTD_IPC_V1", 18)) {
+            saw_header = 1;
+            continue;
+        }
+
+        char rec[32] = {0};
+        char id[64] = {0};
+        char hex[256] = {0};
+        unsigned long long file_size = 0;
+        unsigned long long off = 0;
+        unsigned long long bytes = 0;
+        if (sscanf(p, "%31s %63s %llu %llu %llu %255s",
+                   rec, id, &file_size, &off, &bytes, hex) != 6) {
+            continue;
+        }
+        if (strcmp(rec, "range") != 0 || strcmp(id, model_id) != 0) continue;
+        if ((uint64_t)file_size != model_size ||
+            (uint64_t)off > model_size ||
+            (uint64_t)bytes > model_size - (uint64_t)off ||
+            bytes == 0) {
+            fprintf(stderr,
+                    "ds4: CUDA shared weight manifest range rejected for %s "
+                    "(manifest size=%llu local size=%llu off=%llu bytes=%llu)\n",
+                    model_id,
+                    file_size,
+                    (unsigned long long)model_size,
+                    off,
+                    bytes);
+            ok = 0;
+            break;
+        }
+
+        cudaIpcMemHandle_t handle;
+        memset(&handle, 0, sizeof(handle));
+        if (!cuda_hex_decode(hex, &handle, sizeof(handle))) {
+            fprintf(stderr, "ds4: CUDA shared weight manifest has invalid IPC handle for %s\n", model_id);
+            ok = 0;
+            break;
+        }
+        void *dev = NULL;
+        cudaError_t err = cudaIpcOpenMemHandle(&dev, handle, cudaIpcMemLazyEnablePeerAccess);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA shared weight IPC import failed for %s off=%llu bytes=%.2f MiB: %s\n",
+                    model_id,
+                    off,
+                    (double)bytes / 1048576.0,
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            ok = 0;
+            break;
+        }
+        g_model_ranges.push_back({
+            model_map,
+            (uint64_t)off,
+            (uint64_t)bytes,
+            (char *)dev,
+            NULL,
+            NULL,
+            0,
+            0,
+            0,
+            1,
+        });
+        g_model_range_by_offset[(uint64_t)off] = g_model_ranges.size() - 1u;
+        g_model_range_bytes += (uint64_t)bytes;
+        imported_bytes += (uint64_t)bytes;
+        imported_ranges++;
+    }
+    fclose(fp);
+    if (!saw_header) {
+        fprintf(stderr, "ds4: CUDA shared weight manifest missing DS4_WEIGHT_SERVER_IPC_V1 header: %s\n",
+                manifest_path);
+        return 0;
+    }
+    if (!ok) return 0;
+    if (imported_ranges == 0) {
+        fprintf(stderr, "ds4: CUDA shared weight manifest had no ranges for model id %s\n", model_id);
+        return 0;
+    }
+    fprintf(stderr,
+            "ds4: CUDA imported shared weight cache for %s: %.2f GiB across %llu ranges\n",
+            model_id,
+            (double)imported_bytes / 1073741824.0,
+            (unsigned long long)imported_ranges);
     return 1;
 }
 

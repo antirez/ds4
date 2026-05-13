@@ -17047,6 +17047,49 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
+#ifndef __APPLE__
+        const char *weight_ipc_manifest = getenv("DS4_CUDA_WEIGHT_IPC_MANIFEST");
+        if (weight_ipc_manifest && weight_ipc_manifest[0]) {
+            int weight_ipc_base = 1;
+            int weight_ipc_mtp = 1;
+            const char *weight_ipc_scope = getenv("DS4_CUDA_WEIGHT_IPC_SCOPE");
+            if (weight_ipc_scope && weight_ipc_scope[0]) {
+                if (!strcmp(weight_ipc_scope, "base")) {
+                    weight_ipc_mtp = 0;
+                } else if (!strcmp(weight_ipc_scope, "mtp")) {
+                    weight_ipc_base = 0;
+                } else if (strcmp(weight_ipc_scope, "both")) {
+                    fprintf(stderr, "ds4: invalid DS4_CUDA_WEIGHT_IPC_SCOPE=%s\n", weight_ipc_scope);
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
+            }
+            if (weight_ipc_base &&
+                !ds4_gpu_import_model_ipc_manifest(e->model.map,
+                                                   e->model.size,
+                                                   weight_ipc_manifest,
+                                                   "base"))
+            {
+                fprintf(stderr, "ds4: CUDA failed to import shared base weight cache\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            if (weight_ipc_mtp &&
+                e->mtp_ready &&
+                !ds4_gpu_import_model_ipc_manifest(e->mtp_model.map,
+                                                   e->mtp_model.size,
+                                                   weight_ipc_manifest,
+                                                   "mtp"))
+            {
+                fprintf(stderr, "ds4: CUDA failed to import shared MTP weight cache\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+        }
+#endif
         if (!e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->model)) {
             fprintf(stderr, "ds4: %s failed to prepare startup model cache\n",
                     ds4_backend_name(e->backend));

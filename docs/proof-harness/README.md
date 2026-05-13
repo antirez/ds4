@@ -43,6 +43,75 @@ tests/cuda_mtp_proof_matrix.py --tokens 96
 That command now delegates to the generalized runner with
 `--suite mtp_speculative`.
 
+## CUDA Weight Server
+
+`ds4_weight_server` is an opt-in CUDA weight owner for proof runs. It uploads raw
+GGUF tensor spans once, exports CUDA IPC handles, writes a manifest, and stays
+alive while proof workers import those shared allocations.
+
+This path is experimental. On unified-memory systems, do not start it while
+other large DS4 processes are resident. The owner keeps its CUDA allocations
+alive for the lifetime of the process, so stop it immediately after the proof
+run.
+
+First size the run without allocating:
+
+```sh
+./ds4_weight_server \
+  --base "$BASE" \
+  --mtp "$MTP" \
+  --dry-run
+```
+
+The proof runner can own the server lifecycle. This is the preferred mode for
+proof runs because it stops the server even when a profile fails:
+
+```sh
+DS4_PROOF_BASE="$BASE" \
+DS4_PROOF_MTP="$MTP" \
+tests/ds4_proof.py \
+  --suite mtp_speculative \
+  --tokens 512 \
+  --start-weight-server \
+  --json-report /tmp/ds4_proof/report.json
+```
+
+The JSON report includes `weight_server` with the command, manifest path, log
+path, dry-run preflight result, startup time, readiness, and cleanup result.
+The runner performs a short-lived `ds4_weight_server --dry-run` before launching
+the persistent owner unless `--no-weight-server-preflight` is set.
+
+Manual startup is still available when running several proof commands against
+one owner. Start it only after the dry-run plan and memory preflight look sane:
+
+```sh
+./ds4_weight_server \
+  --base "$BASE" \
+  --mtp "$MTP" \
+  --manifest /tmp/ds4_weight_server.ipc
+```
+
+Then point the proof runner at the manifest:
+
+```sh
+DS4_PROOF_BASE="$BASE" \
+DS4_PROOF_MTP="$MTP" \
+tests/ds4_proof.py \
+  --suite mtp_speculative \
+  --tokens 512 \
+  --weight-ipc-manifest /tmp/ds4_weight_server.ipc \
+  --json-report /tmp/ds4_proof/report.json
+```
+
+The owner process must remain alive while workers run. If it exits, imported
+CUDA IPC mappings are no longer a valid basis for proof. This first
+implementation shares raw tensor spans only; derived Q8 F16/F32 cache sharing
+is intentionally deferred.
+
+By default the server refuses to start unless the CUDA allocator reports enough
+free memory for the full raw-span upload plus a 32 GiB reserve. Use
+`--reserve-gb N` to adjust that reserve explicitly for controlled runs.
+
 ## JSON Plans
 
 For broader work, use a plan file:
@@ -109,5 +178,5 @@ emits a structured report containing:
 - `exact_bytes` is the only implemented contract.
 - Engine telemetry is still partly log-derived. A typed proof stats API is the
   next correctness and ergonomics improvement.
-- CUDA shared-weight ownership is not implemented yet; it should be added as an
-  optional acceleration layer under CUDA profiles.
+- CUDA shared-weight ownership currently uses legacy CUDA IPC raw-span sharing.
+  The Driver VMM/read-only implementation remains the intended hardening path.
