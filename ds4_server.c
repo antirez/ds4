@@ -6534,8 +6534,10 @@ typedef struct {
     req_kind kind;
     int prompt_tokens;
     int cached_tokens;
+    int fd;
     char ctx[48];
     bool has_tools;
+    bool is_cancelled;
     double t0;
     double last_t;
     int last_current;
@@ -6650,6 +6652,28 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls) {
     buf_free(&names);
 }
 
+static void server_prefill_check_client(server_prefill_progress *p) {
+    if (!p || p->is_cancelled || p->fd < 0) return;
+    struct pollfd pfd = {.fd = p->fd, .events = POLLIN};
+    int rc;
+    do {
+        rc = poll(&pfd, 1, 0);
+    } while (rc < 0 && errno == EINTR);
+    bool is_gone = rc > 0 && (pfd.revents & (POLLHUP | POLLERR | POLLNVAL));
+    if (!is_gone && rc > 0 && (pfd.revents & POLLIN)) {
+        char c;
+        ssize_t n = recv(p->fd, &c, 1, MSG_PEEK);
+        is_gone = n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR);
+    }
+    if (!is_gone) return;
+    p->is_cancelled = true;
+    if (p->srv) ds4_session_cancel(p->srv->session);
+    server_log(DS4_LOG_PREFILL,
+               "ds4-server: %s ctx=%s prefill cancelled: client disconnected",
+               p->kind == REQ_CHAT ? "chat" : "completion",
+               p->ctx);
+}
+
 static void server_progress_cb(void *ud, const char *event, int current, int total) {
     server_prefill_progress *p = ud;
     if (!p || !event || strcmp(event, "prefill_chunk")) return;
@@ -6658,6 +6682,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
         if (p->srv && current > p->cached_tokens) kv_cache_maybe_store_continued(p->srv);
+        server_prefill_check_client(p);
         return;
     }
     int display_start = p->cached_tokens;
@@ -6694,6 +6719,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                avg_tps,
                elapsed);
     if (p->srv && current > p->cached_tokens) kv_cache_maybe_store_continued(p->srv);
+    server_prefill_check_client(p);
 }
 
 static char *build_tool_checkpoint_suffix(const request *r, const char *content,
@@ -6986,6 +7012,7 @@ static void generate_job(server *s, job *j) {
         .kind = j->req.kind,
         .prompt_tokens = prompt_tokens,
         .cached_tokens = cached,
+        .fd = j->fd,
         .has_tools = j->req.has_tools,
         .t0 = t0,
     };
