@@ -3802,7 +3802,10 @@ int ds4_gpu_init(void) {
             // Recompile without DS4_METAL_HAS_TENSOR so the cooperative-tensor
             // matmul branches are excluded from this build, isolating the
             // simdgroup_float8x8 path for an A/B vs the Tensor matmul on M5.
+            // Also flip g_metal4_tensor_api_enabled so the host dispatch
+            // skips _mpp kernel lookups that are no longer compiled.
             [macros removeObjectForKey:@"DS4_METAL_HAS_TENSOR"];
+            g_metal4_tensor_api_enabled = 0;
             fprintf(stderr, "ds4: Metal 4 cooperative-tensor matmul disabled by DS4_METAL_TENSOR_MATMUL_DISABLE\n");
         }
         fprintf(stderr,
