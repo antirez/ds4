@@ -18432,6 +18432,9 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         const bool shadow_v2_decode3 =
             draft_n >= 3 &&
             getenv("DS4_MTP_VERIFY_V2_SHADOW") != NULL;
+        const bool verify_v2_decode3 =
+            draft_n == 3 &&
+            getenv("DS4_MTP_VERIFY_V2") != NULL;
         const bool snapshot_required =
             draft_n > 2 ||
             (draft_n == 2 && (!capture_prefix1 || exact_replay_debug)) ||
@@ -18508,7 +18511,20 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                 s->checkpoint.len = start + draft_n;
                 ok = spec_frontier_restore(&frontier, s);
             }
-            if (ok && draft_n == 2 &&
+            if (ok && verify_v2_decode3) {
+                ok = metal_graph_verify_decode3_top2_output(&s->graph,
+                                                            &e->model,
+                                                            &e->weights,
+                                                            &s->checkpoint,
+                                                            &verify_plan,
+                                                            &verify_result,
+                                                            row_logits);
+                if (ok) {
+                    for (int i = 0; i < 2; i++) row_tops[i] = verify_result.row_top[i];
+                    precomputed_commit_drafts = verify_result.commit_tokens;
+                    have_precomputed_logits = verify_result.have_logits;
+                }
+            } else if (ok && draft_n == 2 &&
                 getenv("DS4_CUDA_MTP_VERIFY_TOP2") != NULL &&
                 getenv("DS4_CUDA_MTP_TOP2") != NULL) {
                 int row0_top = -1;
@@ -18680,6 +18696,47 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                 (mtp_t_after_draft - mtp_t0) * 1000.0,
                                 (snapshot_done - snapshot_t0) * 1000.0,
                                 (micro_verify_done - snapshot_done) * 1000.0,
+                                (now_sec() - mtp_t0) * 1000.0,
+                                (now_sec() - cycle_t0) * 1000.0);
+                    }
+                    spec_frontier_free(&frontier);
+                    free(row_logits);
+                    free(shadow_logits);
+                    free(row_tops);
+                    return n_accept;
+                }
+            }
+
+            if (verify_v2_decode3 &&
+                have_precomputed_logits &&
+                commit_drafts > 0 &&
+                commit_drafts < draft_n &&
+                commit_drafts <= 2) {
+                s->checkpoint.len = start;
+                const double prefix_t0 = mtp_timing ? now_sec() : 0.0;
+                ok = spec_frontier_commit_prefix(s, (uint32_t)commit_drafts);
+                const double prefix_done = mtp_timing ? now_sec() : 0.0;
+                if (ok) {
+                    memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+                    for (int i = 0; i < commit_drafts && n_accept < accepted_cap; i++) {
+                        accepted[n_accept++] = drafts[i];
+                        if (drafts[i] == eos_token) break;
+                    }
+                    s->checkpoint_valid = true;
+                    s->mtp_draft_valid = false;
+                    mtp_state_txn_keep_accepted(s, &mtp_txn, commit_drafts);
+                    for (int i = 0; i < commit_drafts; i++) token_vec_push(&s->checkpoint, drafts[i]);
+                    if (mtp_timing) {
+                        fprintf(stderr,
+                                "ds4: mtp timing verify_v2_decode3 drafted=%d committed=%d target=%.3f ms draft=%.3f ms "
+                                "snapshot=%.3f ms verify=%.3f ms prefix=%.3f ms spec=%.3f ms total=%.3f ms\n",
+                                draft_n,
+                                commit_drafts,
+                                (target_done - cycle_t0) * 1000.0,
+                                (mtp_t_after_draft - mtp_t0) * 1000.0,
+                                (snapshot_done - snapshot_t0) * 1000.0,
+                                (micro_verify_done - snapshot_done) * 1000.0,
+                                (prefix_done - prefix_t0) * 1000.0,
                                 (now_sec() - mtp_t0) * 1000.0,
                                 (now_sec() - cycle_t0) * 1000.0);
                     }
