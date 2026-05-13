@@ -3798,8 +3798,31 @@ int ds4_gpu_init(void) {
         const int drift_norm_unify       = ds4_gpu_env_bool("DS4_METAL_NORM_RSQRT_DISABLE") != 0; // default ON
         const int drift_kv_raw_f32       = ds4_gpu_env_bool("DS4_METAL_KV_RAW_F32")         >  0; // default OFF
         const int drift_rope_exp2_log2   = ds4_gpu_env_bool("DS4_METAL_ROPE_EXP2_LOG2")     >  0; // default OFF
+        const int drift_math_safe        = ds4_gpu_env_bool("DS4_METAL_MATH_SAFE")          >  0; // default OFF
         const int drift_tensor_matmul_off = g_metal4_tensor_api_enabled &&
                                             ds4_gpu_env_bool("DS4_METAL_TENSOR_MATMUL_DISABLE") > 0;
+
+        if (drift_math_safe) {
+            // MTLCompileOptions.fastMathEnabled defaults to YES and Apple's
+            // headers explicitly say this "may violate the IEEE 754 standard".
+            // Different fast-math optimizations get applied across the
+            // matmul2d cooperative-tensor path and the legacy
+            // simdgroup_multiply_accumulate path on M5, amplifying the
+            // mismatch. MTLMathModeSafe pins the entire library to strict
+            // IEEE-754 semantics. Diagnostic-only: it also moves the
+            // -mt off output away from the fast-math reference, so this is
+            // useful to localize drift sources but not to ship as a default.
+            if (@available(macOS 15.0, *)) {
+                options.mathMode = MTLMathModeSafe;
+                fprintf(stderr, "ds4: Metal shader library math mode = safe (strict IEEE-754) by DS4_METAL_MATH_SAFE\n");
+            } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                options.fastMathEnabled = NO;
+#pragma clang diagnostic pop
+                fprintf(stderr, "ds4: Metal shader library fast-math disabled by DS4_METAL_MATH_SAFE (pre-macOS 15)\n");
+            }
+        }
 
         if (drift_hc_stable)      macros[@"DS4_METAL_HC_STABLE"]          = @"1";
         if (drift_norm_unify)     macros[@"DS4_METAL_NORM_RSQRT_DISABLE"] = @"1";
@@ -3816,11 +3839,12 @@ int ds4_gpu_init(void) {
             fprintf(stderr, "ds4: Metal 4 cooperative-tensor matmul disabled by DS4_METAL_TENSOR_MATMUL_DISABLE\n");
         }
         fprintf(stderr,
-                "ds4: drift-patch flags hc_stable=%s norm_unify=%s kv_raw_f32=%s rope_exp2_log2=%s tensor_matmul=%s\n",
+                "ds4: drift-patch flags hc_stable=%s norm_unify=%s kv_raw_f32=%s rope_exp2_log2=%s math_safe=%s tensor_matmul=%s\n",
                 drift_hc_stable      ? "on"  : "off",
                 drift_norm_unify     ? "on"  : "off",
                 drift_kv_raw_f32     ? "on"  : "off",
                 drift_rope_exp2_log2 ? "on"  : "off",
+                drift_math_safe      ? "on"  : "off",
                 (g_metal4_tensor_api_enabled && !drift_tensor_matmul_off) ? "on" : "off");
         options.preprocessorMacros = macros;
         id<MTLLibrary> library = [g_device newLibraryWithSource:source options:options error:&error];
