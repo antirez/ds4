@@ -31,6 +31,7 @@ DEFAULT_PROMPTS = [
 FAST_MTP_ENV = {
     "DS4_CUDA_MTP_TOP2": "1",
     "DS4_CUDA_MTP_VERIFY_TOP2": "1",
+    "DS4_MTP_NONEXACT_FAST": "1",
 }
 
 SHADOW_RE = re.compile(

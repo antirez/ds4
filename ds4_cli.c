@@ -498,6 +498,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     int generated = 0;
+    const bool token_trace = getenv("DS4_TOKEN_TRACE") != NULL;
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token = ds4_session_sample(session, cfg->gen.temperature, 0, cfg->gen.top_p, 0.0f, &rng);
@@ -531,10 +532,18 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         }
 
         bool stop = false;
+        const int accepted_start_pos = ds4_session_pos(session) - ntok;
         for (int j = 0; j < ntok; j++) {
             if (toks[j] == ds4_token_eos(engine)) {
                 stop = true;
                 break;
+            }
+            if (token_trace) {
+                fprintf(stderr,
+                        "ds4: token trace generated=%d pos=%d token=%d\n",
+                        generated,
+                        accepted_start_pos + j,
+                        toks[j]);
             }
             size_t piece_len = 0;
             char *piece = ds4_token_text(engine, toks[j], &piece_len);
