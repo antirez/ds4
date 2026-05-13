@@ -969,10 +969,18 @@ static int ds4_gpu_mpp_q8_0_default_target(void) {
     // The Metal 4 cooperative-tensor Q8_0 matmul on M5 Max produces logprob
     // drift versus the legacy simdgroup_multiply_accumulate path (measured
     // rms=0.150, max_abs=0.75 on the short reasoning prompt; bit-exact match
-    // recovered by disabling just this route). All other Tensor routes
+    // recovered by disabling just this route). The other Tensor routes
     // (F16 compressor, attention-output, MoE) are bit-clean. Default the
     // Q8_0 Tensor matmul to OFF on M5; opt back in with DS4_METAL_MPP_Q8_0_ENABLE=1.
     if (ds4_gpu_device_name_contains("M5")) return 0;
+    return 1;
+}
+
+// F16 compressor Tensor matmul default. Bit-clean on M5 vs the legacy
+// simdgroup path, so this stays default-on independent of device.
+// Kept as a separate helper to avoid coupling the F16 default to the
+// Q8_0 carve-out above.
+static int ds4_gpu_mpp_f16_default_target(void) {
     return 1;
 }
 
@@ -1361,7 +1369,7 @@ static int ds4_gpu_can_use_mpp_q8_0_matmul(uint64_t n_tok) {
 }
 
 static int ds4_gpu_use_mpp_f16_compressor_matmul(void) {
-    const int enabled = ds4_gpu_mpp_route_enabled(ds4_gpu_mpp_q8_0_default_target(),
+    const int enabled = ds4_gpu_mpp_route_enabled(ds4_gpu_mpp_f16_default_target(),
                                                     "DS4_METAL_MPP_F16_ENABLE",
                                                     "DS4_METAL_MPP_F16_DISABLE");
     if (enabled && !g_mpp_f16_reported) {
@@ -2100,7 +2108,7 @@ void ds4_gpu_print_memory_report(const char *label) {
                 (g_metal4_tensor_api_compile_supported ? "available" : "disabled"),
             g_metal4_m5_neural_accelerators_hint ? "likely" : "not detected");
     const int mpp_q8 = ds4_gpu_mpp_q8_0_policy_enabled();
-    const int mpp_f16 = ds4_gpu_mpp_route_enabled(ds4_gpu_mpp_q8_0_default_target(),
+    const int mpp_f16 = ds4_gpu_mpp_route_enabled(ds4_gpu_mpp_f16_default_target(),
                                                     "DS4_METAL_MPP_F16_ENABLE",
                                                     "DS4_METAL_MPP_F16_DISABLE");
     const int mpp_attn_out = ds4_gpu_mpp_route_enabled(0,
