@@ -672,6 +672,16 @@ def default_mtp_profiles() -> list[EngineProfile]:
             mtp_draft=3,
         ),
         EngineProfile(
+            "mtp-batch-first",
+            {
+                **FAST_MTP_ENV,
+                "DS4_MTP_BATCH_FIRST": "1",
+                "DS4_MTP_TIMING": "1",
+            },
+            use_mtp=True,
+            mtp_draft=3,
+        ),
+        EngineProfile(
             "mtp-no-opt-output",
             {
                 "DS4_CUDA_MTP_TOP2": "1",
