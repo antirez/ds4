@@ -1226,6 +1226,13 @@ static NSString *ds4_gpu_full_source(void) {
     ];
 
     NSMutableString *source = [NSMutableString stringWithString:base];
+    NSString *exe_path = [[NSBundle mainBundle] executablePath];
+    NSString *exe_dir = [exe_path length] ? [exe_path stringByDeletingLastPathComponent] : nil;
+    NSString *resolved_exe_dir = nil;
+    if ([exe_path length]) {
+        NSString *resolved = [exe_path stringByResolvingSymlinksInPath];
+        resolved_exe_dir = [resolved length] ? [resolved stringByDeletingLastPathComponent] : nil;
+    }
     for (NSArray<NSString *> *spec in required_sources) {
         const char *override_path = getenv([spec[0] UTF8String]);
         NSMutableArray<NSString *> *paths = [NSMutableArray array];
@@ -1234,6 +1241,12 @@ static NSString *ds4_gpu_full_source(void) {
         }
         [paths addObject:spec[1]];
         [paths addObject:[@"./" stringByAppendingString:spec[1]]];
+        if (exe_dir) {
+            [paths addObject:[exe_dir stringByAppendingPathComponent:spec[1]]];
+        }
+        if (resolved_exe_dir && ![resolved_exe_dir isEqualToString:exe_dir]) {
+            [paths addObject:[resolved_exe_dir stringByAppendingPathComponent:spec[1]]];
+        }
 
         NSString *loaded = nil;
         NSString *loaded_path = nil;

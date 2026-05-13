@@ -7666,6 +7666,18 @@ static bool send_models(server *s, int fd) {
     return ok;
 }
 
+static void append_health_json(buf *b) {
+    buf_puts(b, "{\"status\":\"ok\"}\n");
+}
+
+static bool send_health(int fd) {
+    buf b = {0};
+    append_health_json(&b);
+    bool ok = http_response(fd, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
 static void client_done(server *s) {
     pthread_mutex_lock(&s->mu);
     if (s->clients > 0) s->clients--;
@@ -7687,6 +7699,11 @@ static void *client_main(void *arg) {
         goto done;
     }
 
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/health")) {
+        send_health(fd);
+        http_request_free(&hr);
+        goto done;
+    }
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
         http_request_free(&hr);
@@ -7957,7 +7974,8 @@ static void usage(FILE *fp) {
         "  ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192\n"
         "\n"
         "Notes:\n"
-        "  Use /v1/chat/completions, /v1/completions, or /v1/messages.\n"
+        "  Use /health for liveness checks.\n"
+        "  Use /v1/chat/completions, /v1/completions, or /v1/messages for inference.\n"
         "  Larger --ctx values allocate more KV memory at startup; the startup log prints the estimate.\n"
         "  Disk KV caching is best for agents that resend long prompts with stable prefixes.\n"
         "\n"
@@ -9582,6 +9600,13 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 }
 
+static void test_health_response_json(void) {
+    buf b = {0};
+    append_health_json(&b);
+    TEST_ASSERT(!strcmp(b.ptr, "{\"status\":\"ok\"}\n"));
+    buf_free(&b);
+}
+
 static void test_client_socket_nonblocking_flag(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -10321,6 +10346,7 @@ static void ds4_server_unit_tests_run(void) {
     test_stop_list_streaming_holds_and_trims_stop_text();
     test_json_skip_has_nesting_limit();
     test_model_metadata_clamps_completion_to_context();
+    test_health_response_json();
     test_client_socket_nonblocking_flag();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_canonicalization_gate();
