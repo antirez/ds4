@@ -13987,7 +13987,49 @@ static bool metal_graph_verify_decode2_exact(
     g->cur_hc = saved_cur;
     g->after_ffn_hc = saved_after;
 
-    if (ok) {
+    const bool exact_decode2_top2_head =
+        getenv("DS4_MTP_NO_EXACT_DECODE2_TOP2_HEAD") == NULL;
+    if (ok && exact_decode2_top2_head) {
+        g->cur_hc = cur0;
+        ok = ds4_gpu_begin_commands() != 0;
+        if (ok) ok = metal_graph_encode_output_head_impl(g,
+                                                         model,
+                                                         weights,
+                                                         weights->output->dim[1],
+                                                         true);
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+        g->cur_hc = saved_cur;
+        if (ok) ok = ds4_gpu_tensor_read(g->comp_selected, 0, top0, sizeof(*top0)) != 0;
+
+        if (ok && *top0 == token1) {
+            g->cur_hc = cur1;
+            ok = ds4_gpu_begin_commands() != 0;
+            if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+            if (ok) ok = ds4_gpu_end_commands() != 0;
+            else (void)ds4_gpu_synchronize();
+            g->cur_hc = saved_cur;
+            if (ok) {
+                ok = ds4_gpu_tensor_read(g->logits,
+                                           0,
+                                           logits1,
+                                           (uint64_t)DS4_N_VOCAB * sizeof(logits1[0])) != 0;
+            }
+        } else if (ok && logits0) {
+            g->cur_hc = cur0;
+            ok = ds4_gpu_begin_commands() != 0;
+            if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+            if (ok) ok = ds4_gpu_end_commands() != 0;
+            else (void)ds4_gpu_synchronize();
+            g->cur_hc = saved_cur;
+            if (ok) {
+                ok = ds4_gpu_tensor_read(g->logits,
+                                           0,
+                                           logits0,
+                                           (uint64_t)DS4_N_VOCAB * sizeof(logits0[0])) != 0;
+            }
+        }
+    } else if (ok) {
         g->cur_hc = cur0;
         ok = ds4_gpu_begin_commands() != 0;
         if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
@@ -14008,7 +14050,7 @@ static bool metal_graph_verify_decode2_exact(
         }
     }
 
-    if (ok) {
+    if (ok && !exact_decode2_top2_head) {
         g->cur_hc = cur1;
         ok = ds4_gpu_begin_commands() != 0;
         if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
