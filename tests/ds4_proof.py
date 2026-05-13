@@ -39,6 +39,12 @@ SHADOW_RE = re.compile(
     r"logit_max_abs=(?P<max_abs>[-+0-9.eE]+).*?"
     r"logit_rms=(?P<rms>[-+0-9.eE]+)"
 )
+VERIFY_V2_SHADOW_RE = re.compile(
+    r"mtp shadow verify_v2_decode3 ok=(?P<ok>[01]) committed=(?P<committed>\d+) "
+    r"row0=(?P<row0>-?\d+) row1=(?P<row1>-?\d+) "
+    r"draft1=(?P<draft1>-?\d+) draft2=(?P<draft2>-?\d+) "
+    r"margin0=(?P<margin0>[-+0-9.eE]+) margin1=(?P<margin1>[-+0-9.eE]+)"
+)
 WEIGHT_PLAN_RE = re.compile(
     r"ds4_weight_server: (?P<model>\w+) plan model=(?P<model_gib>[-+0-9.eE]+) GiB "
     r"raw_tensor_ranges=(?P<raw_gib>[-+0-9.eE]+) GiB ranges=(?P<ranges>\d+)"
@@ -401,6 +407,13 @@ def parse_shadow(log_text: str) -> dict[str, Any]:
     logit_bad = 0
     max_abs = 0.0
     max_rms = 0.0
+    v2_checks = 0
+    v2_failed = 0
+    v2_accept3 = 0
+    v2_accept2 = 0
+    v2_accept1 = 0
+    v2_max_margin0 = 0.0
+    v2_max_margin1 = 0.0
     for m in SHADOW_RE.finditer(log_text):
         checks += 1
         if m.group("agree") != "1":
@@ -409,12 +422,32 @@ def parse_shadow(log_text: str) -> dict[str, Any]:
             logit_bad += 1
         max_abs = max(max_abs, float(m.group("max_abs")))
         max_rms = max(max_rms, float(m.group("rms")))
+    for m in VERIFY_V2_SHADOW_RE.finditer(log_text):
+        v2_checks += 1
+        if m.group("ok") != "1":
+            v2_failed += 1
+        committed = int(m.group("committed"))
+        if committed >= 3:
+            v2_accept3 += 1
+        elif committed == 2:
+            v2_accept2 += 1
+        else:
+            v2_accept1 += 1
+        v2_max_margin0 = max(v2_max_margin0, abs(float(m.group("margin0"))))
+        v2_max_margin1 = max(v2_max_margin1, abs(float(m.group("margin1"))))
     return {
         "checks": checks,
         "decision_bad": decision_bad,
         "logit_bad": logit_bad,
         "max_abs": max_abs,
         "max_rms": max_rms,
+        "verify_v2_checks": v2_checks,
+        "verify_v2_failed": v2_failed,
+        "verify_v2_accept1": v2_accept1,
+        "verify_v2_accept2": v2_accept2,
+        "verify_v2_accept3": v2_accept3,
+        "verify_v2_max_margin0": v2_max_margin0,
+        "verify_v2_max_margin1": v2_max_margin1,
     }
 
 
@@ -617,6 +650,16 @@ def default_mtp_profiles() -> list[EngineProfile]:
                 "DS4_MTP_TIMING": "1",
             },
             use_mtp=True,
+        ),
+        EngineProfile(
+            "mtp-v2-shadow",
+            {
+                **FAST_MTP_ENV,
+                "DS4_MTP_VERIFY_V2_SHADOW": "1",
+                "DS4_MTP_TIMING": "1",
+            },
+            use_mtp=True,
+            mtp_draft=3,
         ),
         EngineProfile(
             "mtp-no-opt-output",
@@ -993,6 +1036,12 @@ def print_run_line(result: RunResult) -> None:
             f"logit_bad={shadow['logit_bad']} max_abs={shadow['max_abs']:.6g} "
             f"rms={shadow['max_rms']:.6g}"
         )
+    if shadow.get("verify_v2_checks"):
+        shadow_text += (
+            f" v2 checks={shadow['verify_v2_checks']} failed={shadow['verify_v2_failed']} "
+            f"a1={shadow['verify_v2_accept1']} a2={shadow['verify_v2_accept2']} "
+            f"a3={shadow['verify_v2_accept3']}"
+        )
     status = "OK" if result.rc == 0 else f"FAILED rc={result.rc}"
     print(
         f"{result.profile:28s} {status:12s} sha={result.stdout_sha256 or '-'} "
@@ -1233,6 +1282,8 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 shadow = result.shadow
                 if shadow.get("decision_bad") or shadow.get("logit_bad"):
+                    failures += 1
+                if shadow.get("verify_v2_failed"):
                     failures += 1
     finally:
         if weight_server:
