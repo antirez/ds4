@@ -85,6 +85,7 @@ static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
+static int g_cuda_sm_major;
 static int g_quality_mode;
 
 struct cuda_model_range {
@@ -502,6 +503,16 @@ static int cuda_q8_label_is_attention_output(const char *label) {
 
 static int cuda_q8_use_dp4a(void) {
     return getenv("DS4_CUDA_NO_Q8_DP4A") == NULL;
+}
+
+static int cuda_skip_ordered_f16_matmul(void) {
+    if (getenv("DS4_CUDA_FORCE_ORDERED_F16_MATMUL") != NULL) return 0;
+    if (getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") != NULL) return 1;
+    /* Blackwell-class GPUs measured so far (Thor sm_110 and GB10 sm_121) run
+     * the regular 256-thread reduction faster than the ordered 32-thread decode
+     * path. Keep older architectures on the existing default unless explicitly
+     * overridden. */
+    return g_cuda_sm_major >= 11;
 }
 
 static int cuda_q8_f16_preload_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
@@ -1207,6 +1218,7 @@ extern "C" int ds4_gpu_init(void) {
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
+        g_cuda_sm_major = prop.major;
         fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d)\n",
                 prop.name, prop.major, prop.minor);
     }
@@ -5986,7 +5998,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         !serial_f16 &&
         !serial_router &&
         n_tok == 1u &&
-        getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") == NULL;
+        !cuda_skip_ordered_f16_matmul();
     if (!serial_f16 && g_cublas_ready && n_tok > 1) {
         const uint64_t xh_count = n_tok * in_dim;
         __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");
@@ -6047,7 +6059,7 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
         getenv("DS4_CUDA_NO_F16_PAIR_MATMUL") != NULL ||
         getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
         getenv("DS4_CUDA_SERIAL_ROUTER") != NULL ||
-        getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") != NULL) {
+        cuda_skip_ordered_f16_matmul()) {
         return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
                                            in_dim, out_dim, x, n_tok) &&
                ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
