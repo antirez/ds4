@@ -16028,6 +16028,61 @@ typedef struct {
     uint32_t mtp_n_raw;
 } ds4_spec_frontier;
 
+typedef struct {
+    uint32_t start;
+    int token[16];
+    int n_tokens;
+} ds4_mtp_verify_plan;
+
+typedef struct {
+    int row_top[16];
+    ds4_gpu_top2_result row_top2[16];
+    int commit_tokens;
+    uint32_t logits_row;
+    bool have_logits;
+} ds4_mtp_verify_result;
+
+static void mtp_verify_plan_init(ds4_mtp_verify_plan *p,
+                                 uint32_t start,
+                                 const int *tokens,
+                                 int n_tokens) {
+    memset(p, 0, sizeof(*p));
+    p->start = start;
+    if (n_tokens > (int)(sizeof(p->token) / sizeof(p->token[0]))) {
+        n_tokens = (int)(sizeof(p->token) / sizeof(p->token[0]));
+    }
+    p->n_tokens = n_tokens;
+    for (int i = 0; i < n_tokens; i++) p->token[i] = tokens[i];
+}
+
+static void mtp_verify_result_init(ds4_mtp_verify_result *r) {
+    memset(r, 0, sizeof(*r));
+    for (uint32_t i = 0; i < sizeof(r->row_top) / sizeof(r->row_top[0]); i++) {
+        r->row_top[i] = -1;
+        r->row_top2[i].id0 = UINT32_MAX;
+        r->row_top2[i].id1 = UINT32_MAX;
+    }
+}
+
+static void mtp_verify_result_set_commit(ds4_mtp_verify_result *r, int commit_tokens) {
+    if (commit_tokens < 1) commit_tokens = 1;
+    if (commit_tokens > (int)(sizeof(r->row_top) / sizeof(r->row_top[0]))) {
+        commit_tokens = (int)(sizeof(r->row_top) / sizeof(r->row_top[0]));
+    }
+    r->commit_tokens = commit_tokens;
+    r->logits_row = (uint32_t)(commit_tokens - 1);
+}
+
+static void mtp_verify_result_decide_from_tops(ds4_mtp_verify_result *r,
+                                               const ds4_mtp_verify_plan *p) {
+    int commit = 1;
+    for (int i = 1; i < p->n_tokens; i++) {
+        if (r->row_top[i - 1] != p->token[i]) break;
+        commit++;
+    }
+    mtp_verify_result_set_commit(r, commit);
+}
+
 static void spec_frontier_free(ds4_spec_frontier *f) {
     if (!f) return;
     memset(f, 0, sizeof(*f));
@@ -18200,6 +18255,10 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         int *row_tops = xmalloc((size_t)draft_n * sizeof(row_tops[0]));
         float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
         const int start = s->checkpoint.len;
+        ds4_mtp_verify_plan verify_plan;
+        ds4_mtp_verify_result verify_result;
+        mtp_verify_plan_init(&verify_plan, (uint32_t)start, drafts, draft_n);
+        mtp_verify_result_init(&verify_result);
         /*
          * The production MTP depth is two.  Prefix-1 capture makes partial
          * accepts cheap, but it copies per-layer compressor frontiers even when
@@ -18285,7 +18344,12 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                             &exact_top2);
                 if (ok) {
                     row_tops[0] = row0_top;
+                    verify_result.row_top[0] = row0_top;
+                    verify_result.row_top2[0] = exact_top2;
+                    mtp_verify_result_set_commit(&verify_result,
+                                                 precomputed_commit_drafts);
                     have_precomputed_logits = true;
+                    verify_result.have_logits = true;
                 }
             } else {
                 ok = metal_graph_verify_suffix_tops(&s->graph,
@@ -18301,14 +18365,13 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         }
         const double micro_verify_done = mtp_timing ? now_sec() : 0.0;
         if (ok) {
-            int commit_drafts = precomputed_commit_drafts;
-            if (commit_drafts <= 0) {
-                commit_drafts = 1;
-                for (int i = 1; i < draft_n; i++) {
-                    if (row_tops[i - 1] != drafts[i]) break;
-                    commit_drafts++;
+            if (verify_result.commit_tokens <= 0) {
+                for (int i = 0; i + 1 < draft_n && i < (int)(sizeof(verify_result.row_top) / sizeof(verify_result.row_top[0])); i++) {
+                    verify_result.row_top[i] = row_tops[i];
                 }
+                mtp_verify_result_decide_from_tops(&verify_result, &verify_plan);
             }
+            int commit_drafts = verify_result.commit_tokens;
             if (shadow_have) {
                 static uint64_t shadow_checks = 0;
                 static uint64_t shadow_disagreements = 0;
