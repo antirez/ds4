@@ -966,6 +966,13 @@ static int ds4_gpu_use_compressor_pair_nr4(void) {
 static int ds4_gpu_device_name_contains(const char *needle);
 
 static int ds4_gpu_mpp_q8_0_default_target(void) {
+    // The Metal 4 cooperative-tensor Q8_0 matmul on M5 Max produces logprob
+    // drift versus the legacy simdgroup_multiply_accumulate path (measured
+    // rms=0.150, max_abs=0.75 on the short reasoning prompt; bit-exact match
+    // recovered by disabling just this route). All other Tensor routes
+    // (F16 compressor, attention-output, MoE) are bit-clean. Default the
+    // Q8_0 Tensor matmul to OFF on M5; opt back in with DS4_METAL_MPP_Q8_0_ENABLE=1.
+    if (ds4_gpu_device_name_contains("M5")) return 0;
     return 1;
 }
 
