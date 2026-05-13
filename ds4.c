@@ -18540,10 +18540,38 @@ static bool ds4_mtp_accept_gate_should_skip(ds4_session *s) {
     return true;
 }
 
+static bool ds4_mtp_exact_policy_use_seq(ds4_session *s) {
+    if (getenv("DS4_MTP_EXACT_DECODE2") != NULL) return false;
+    if (getenv("DS4_MTP_EXACT_SEQ_VERIFY") != NULL) return true;
+    if (getenv("DS4_MTP_NO_EXACT_ADAPTIVE") != NULL) return true;
+    if (!s) return true;
+
+    const uint32_t warmup = ds4_env_u32_default("DS4_MTP_EXACT_DECODE2_WARMUP", 8u);
+    if (s->mtp_accept_samples < warmup) return true;
+
+    /*
+     * Decode2 wins only when two-draft acceptance is very high: it avoids the
+     * second sequential target pass on full accepts, but wastes row1 work on
+     * partial accepts.  Keep the default conservative so low-acceptance prose
+     * stays on the cheaper sequential exact verifier.
+     */
+    const float min_accept = ds4_env_float_default("DS4_MTP_EXACT_DECODE2_MIN_ACCEPT", 0.90f);
+    const bool use_seq = s->mtp_accept_ewma < (double)min_accept;
+    if (getenv("DS4_MTP_EXACT_POLICY_LOG")) {
+        fprintf(stderr,
+                "ds4: mtp exact policy verifier=%s ewma=%.3f min_decode2=%.3f samples=%u\n",
+                use_seq ? "seq" : "decode2",
+                s->mtp_accept_ewma,
+                min_accept,
+                s->mtp_accept_samples);
+    }
+    return use_seq;
+}
+
 static void ds4_mtp_accept_gate_record(ds4_session *s,
                                        int accepted_drafts,
                                        int proposed_drafts) {
-    if (!s || !ds4_mtp_accept_gate_enabled() || proposed_drafts <= 0) return;
+    if (!s || proposed_drafts <= 0) return;
     if (accepted_drafts < 0) accepted_drafts = 0;
     if (accepted_drafts > proposed_drafts) accepted_drafts = proposed_drafts;
 
@@ -18556,9 +18584,9 @@ static void ds4_mtp_accept_gate_record(ds4_session *s,
     else s->mtp_accept_ewma = s->mtp_accept_ewma * (1.0 - alpha) + sample * alpha;
     s->mtp_accept_samples++;
 
-    if (getenv("DS4_MTP_ACCEPT_GATE_LOG")) {
+    if (getenv("DS4_MTP_ACCEPT_GATE_LOG") || getenv("DS4_MTP_EXACT_POLICY_LOG")) {
         fprintf(stderr,
-                "ds4: mtp accept gate record accepted=%d proposed=%d sample=%.3f ewma=%.3f samples=%u\n",
+                "ds4: mtp accept stats accepted=%d proposed=%d sample=%.3f ewma=%.3f samples=%u\n",
                 accepted_drafts,
                 proposed_drafts,
                 sample,
@@ -18884,19 +18912,19 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     }
 
     /*
-     * The default exact verifier replays accepted suffix tokens through the
-     * ordinary one-token target path.  That cannot outperform no-MTP in the
-     * limit, but it is currently faster than the exact decode2 transaction
-     * because it avoids broad prefix snapshots and skips row1 work on partial
-     * accepts.  DS4_MTP_EXACT_DECODE2 keeps the two-row exact verifier
-     * available for profiling and future kernel work.
+     * The default exact verifier policy chooses between two exact target
+     * verifiers.  Sequential replay is cheaper on partial accepts because it
+     * stops after one accepted suffix token; decode2 is cheaper only when
+     * two-token acceptance is consistently high enough to amortize row1 work.
+     * DS4_MTP_EXACT_DECODE2 and DS4_MTP_EXACT_SEQ_VERIFY keep both policies
+     * force-selectable for profiling.
      */
-    const bool force_decode2_exact = getenv("DS4_MTP_EXACT_DECODE2") != NULL;
+    const bool exact_policy_use_seq = ds4_mtp_exact_policy_use_seq(s);
     const bool use_exact_seq =
         draft_n == 2 &&
         strict_mtp &&
         getenv("DS4_MTP_BATCH_VERIFY") == NULL &&
-        !force_decode2_exact;
+        exact_policy_use_seq;
     const bool use_decode2_exact =
         draft_n == 2 &&
         strict_mtp &&
