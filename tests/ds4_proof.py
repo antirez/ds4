@@ -56,6 +56,23 @@ WEIGHT_READY_RE = re.compile(
     r"ds4_weight_server: ready manifest=(?P<manifest>\S+) ranges=(?P<ranges>\d+)"
 )
 WEIGHT_LOCK_RE = re.compile(r"ds4_weight_server: acquired lock (?P<path>\S+)")
+WEIGHT_VMM_SUPPORT_RE = re.compile(
+    r"ds4_weight_server: vmm support vmm=(?P<vmm>\d+) posix_fd=(?P<posix_fd>\d+) "
+    r"uva=(?P<uva>\d+) gran_min=(?P<gran_min>\d+) gran_rec=(?P<gran_rec>\d+)"
+)
+WEIGHT_VMM_PLAN_RE = re.compile(
+    r"ds4_weight_server: (?P<model>\w+) vmm plan logical=(?P<logical_gib>[-+0-9.eE]+) GiB "
+    r"allocated=(?P<allocated_gib>[-+0-9.eE]+) GiB granularity=(?P<granularity>\d+)"
+)
+WEIGHT_BACKEND_RE = re.compile(
+    r"ds4_weight_server: backend=(?P<backend>\w+) logical_upload=(?P<logical_gib>[-+0-9.eE]+) GiB "
+    r"allocation_plan=(?P<allocated_gib>[-+0-9.eE]+) GiB"
+)
+WEIGHT_BROKER_RE = re.compile(r"ds4_weight_server: broker listening (?P<path>\S+)")
+WEIGHT_BROKER_SERVED_RE = re.compile(
+    r"ds4_weight_server: broker served alloc=(?P<alloc>\d+) bytes=(?P<bytes>\d+) requests=(?P<requests>\d+)"
+)
+WEIGHT_SHUTDOWN_RE = re.compile(r"ds4_weight_server: shutting down(?: broker_requests=(?P<requests>\d+))?")
 
 
 @dataclass(frozen=True)
@@ -118,6 +135,7 @@ class WeightServerState:
     owned: bool = False
     bin_path: str = ""
     scope: str = "both"
+    backend: str = "ipc"
     manifest_path: str = ""
     log_path: str = ""
     cmd: list[str] = field(default_factory=list)
@@ -150,6 +168,7 @@ class WeightServer:
         extra_args: list[str],
         preflight_timeout_s: float,
         scope: str,
+        backend: str,
     ) -> None:
         self.bin_path = bin_path
         self.base_model = base_model
@@ -163,6 +182,7 @@ class WeightServer:
         self.extra_args = extra_args
         self.preflight_timeout_s = preflight_timeout_s
         self.scope = scope
+        self.backend = backend
         self.proc: subprocess.Popen[bytes] | None = None
         self.log_f: Any = None
         self.state = WeightServerState(
@@ -170,6 +190,7 @@ class WeightServer:
             owned=True,
             bin_path=bin_path,
             scope=scope,
+            backend=backend,
             manifest_path=str(manifest_path),
             log_path=str(log_path),
             preflight_log_path=str(log_path.with_suffix(".preflight.log")),
@@ -184,6 +205,8 @@ class WeightServer:
             str(self.manifest_path),
             "--scope",
             self.scope,
+            "--backend",
+            self.backend,
             "--exit-on-parent-pid",
             str(os.getpid()),
             "--reserve-gb",
@@ -398,9 +421,14 @@ def parse_shadow(log_text: str) -> dict[str, Any]:
 
 def parse_weight_server_log(log_text: str) -> dict[str, Any]:
     plans: dict[str, Any] = {}
+    vmm_plans: dict[str, Any] = {}
     uploads: dict[str, Any] = {}
     memory: dict[str, float] = {}
     ready: dict[str, Any] = {}
+    vmm_support: dict[str, Any] = {}
+    backend: dict[str, Any] = {}
+    broker_served = 0
+    broker_requests = 0
     for m in WEIGHT_PLAN_RE.finditer(log_text):
         plans[m.group("model")] = {
             "model_gib": float(m.group("model_gib")),
@@ -415,6 +443,28 @@ def parse_weight_server_log(log_text: str) -> dict[str, Any]:
             "free_gib": float(mem.group("free_gib")),
             "total_gib": float(mem.group("total_gib")),
         }
+    support_m = WEIGHT_VMM_SUPPORT_RE.search(log_text)
+    if support_m:
+        vmm_support = {
+            "vmm": int(support_m.group("vmm")),
+            "posix_fd": int(support_m.group("posix_fd")),
+            "uva": int(support_m.group("uva")),
+            "granularity_min": int(support_m.group("gran_min")),
+            "granularity_recommended": int(support_m.group("gran_rec")),
+        }
+    for m in WEIGHT_VMM_PLAN_RE.finditer(log_text):
+        vmm_plans[m.group("model")] = {
+            "logical_gib": float(m.group("logical_gib")),
+            "allocated_gib": float(m.group("allocated_gib")),
+            "granularity": int(m.group("granularity")),
+        }
+    backend_m = WEIGHT_BACKEND_RE.search(log_text)
+    if backend_m:
+        backend = {
+            "name": backend_m.group("backend"),
+            "logical_gib": float(backend_m.group("logical_gib")),
+            "allocated_gib": float(backend_m.group("allocated_gib")),
+        }
     for m in WEIGHT_UPLOAD_RE.finditer(log_text):
         uploads[m.group("model")] = {
             "uploaded_gib": float(m.group("gib")),
@@ -427,13 +477,28 @@ def parse_weight_server_log(log_text: str) -> dict[str, Any]:
             "ranges": int(ready_m.group("ranges")),
         }
     lock_m = WEIGHT_LOCK_RE.search(log_text)
+    broker_m = WEIGHT_BROKER_RE.search(log_text)
+    for served_m in WEIGHT_BROKER_SERVED_RE.finditer(log_text):
+        broker_served += 1
+        broker_requests = max(broker_requests, int(served_m.group("requests")))
+    shutdown_m = None
+    for shutdown_m in WEIGHT_SHUTDOWN_RE.finditer(log_text):
+        pass
+    if shutdown_m and shutdown_m.group("requests") is not None:
+        broker_requests = max(broker_requests, int(shutdown_m.group("requests")))
     return {
         "plans": plans,
+        "vmm_plans": vmm_plans,
         "memory": memory,
         "uploads": uploads,
         "ready": ready,
+        "vmm_support": vmm_support,
+        "backend": backend,
+        "broker_path": broker_m.group("path") if broker_m else "",
+        "broker_served": broker_served,
+        "broker_requests": broker_requests,
         "lock_path": lock_m.group("path") if lock_m else "",
-        "shutdown": "ds4_weight_server: shutting down" in log_text,
+        "shutdown": shutdown_m is not None,
         "lock_busy": "another weight server owns lock" in log_text,
         "refused_upload": "refusing upload" in log_text,
     }
@@ -449,6 +514,7 @@ def weight_server_validation(
     state: WeightServerState,
     *,
     scope: str,
+    backend: str,
     preflight_required: bool,
 ) -> dict[str, Any]:
     checks: dict[str, bool] = {}
@@ -459,9 +525,15 @@ def weight_server_validation(
     checks["ready"] = state.ready
     checks["manifest_path"] = bool(state.manifest_path)
     checks["scope_matches"] = state.scope == scope
+    checks["backend_matches"] = state.backend == backend
     if preflight_required:
         checks["preflight_rc_zero"] = state.preflight_rc == 0
         checks["preflight_not_refused"] = not state.preflight_telemetry.get("refused_upload", False)
+        if backend == "vmm":
+            support = state.preflight_telemetry.get("vmm_support", {})
+            checks["preflight_vmm_supported"] = (
+                support.get("vmm") == 1 and support.get("posix_fd") == 1 and support.get("uva") == 1
+            )
 
     if state.owned:
         telemetry = state.telemetry
@@ -475,14 +547,23 @@ def weight_server_validation(
         checks["lock_not_busy"] = not telemetry.get("lock_busy", False)
         if "--no-lock" not in cmd:
             checks["lock_recorded"] = bool(telemetry.get("lock_path"))
+        if backend == "vmm":
+            checks["vmm_backend_telemetry"] = telemetry.get("backend", {}).get("name") == "vmm"
+            checks["vmm_broker_listening"] = bool(telemetry.get("broker_path"))
+            checks["vmm_broker_requests"] = int(telemetry.get("broker_requests", 0)) > 0
         for model_id in weight_server_expected_models(scope):
             checks[f"uploaded_{model_id}"] = model_id in uploads and int(uploads[model_id].get("ranges", 0)) > 0
+            if backend == "vmm":
+                checks[f"vmm_plan_{model_id}"] = model_id in telemetry.get("vmm_plans", {})
     else:
         manifest = state.telemetry.get("manifest", {})
         owner = manifest.get("owner", {})
         ranges = manifest.get("ranges", {})
         checks["external_manifest"] = state.cleanup == "external"
         checks["external_owner"] = bool(owner.get("pid")) and owner.get("scope") == scope
+        checks["external_backend"] = manifest.get("backend", "ipc") == backend
+        if backend == "vmm":
+            checks["external_broker"] = bool(manifest.get("broker_path"))
         for model_id in weight_server_expected_models(scope):
             checks[f"manifest_ranges_{model_id}"] = int(ranges.get(model_id, 0)) > 0
 
@@ -784,6 +865,8 @@ def validate_weight_manifest(path: Path, base_model: str, mtp_model: str | None,
         raise ValueError(f"weight manifest scope {scope!r} has no expected models")
     seen: dict[str, list[tuple[int, int]]] = {k: [] for k in expected}
     saw_header = False
+    backend = ""
+    broker_path = ""
     owner: dict[str, Any] = {}
     for lineno, raw in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
         line = raw.strip()
@@ -791,8 +874,18 @@ def validate_weight_manifest(path: Path, base_model: str, mtp_model: str | None,
             continue
         if line in {"DS4_WEIGHT_SERVER_IPC_V1", "DS4_WEIGHTD_IPC_V1"}:
             saw_header = True
+            backend = "ipc"
+            continue
+        if line == "DS4_WEIGHT_SERVER_VMM_V1":
+            saw_header = True
+            backend = "vmm"
             continue
         parts = line.split()
+        if parts and parts[0] == "broker":
+            if backend != "vmm" or len(parts) != 2:
+                raise ValueError(f"invalid weight manifest broker line {lineno}: {raw}")
+            broker_path = parts[1]
+            continue
         if parts and parts[0] == "owner":
             if len(parts) != 5:
                 raise ValueError(f"invalid weight manifest owner line {lineno}: {raw}")
@@ -819,6 +912,28 @@ def validate_weight_manifest(path: Path, base_model: str, mtp_model: str | None,
                 "lock_file": "" if parts[4] == "-" else parts[4],
             }
             continue
+        if backend == "vmm":
+            if len(parts) != 7 or parts[0] != "alloc":
+                raise ValueError(f"invalid VMM weight manifest line {lineno}: {raw}")
+            _, alloc_id_s, model_id, model_size_s, off_s, bytes_s, alloc_bytes_s = parts
+            if model_id not in expected:
+                raise ValueError(f"unexpected weight manifest model id {model_id!r} on line {lineno}")
+            try:
+                int(alloc_id_s)
+                model_size = int(model_size_s)
+                off = int(off_s)
+                n = int(bytes_s)
+                alloc_n = int(alloc_bytes_s)
+            except ValueError as e:
+                raise ValueError(f"non-integer VMM weight manifest allocation on line {lineno}") from e
+            if model_size != expected[model_id]:
+                raise ValueError(
+                    f"weight manifest size mismatch for {model_id}: manifest={model_size} local={expected[model_id]}"
+                )
+            if off < 0 or n <= 0 or off > model_size or n > model_size - off or alloc_n < n:
+                raise ValueError(f"invalid VMM weight manifest allocation bounds on line {lineno}")
+            seen[model_id].append((off, off + n))
+            continue
         if len(parts) != 6 or parts[0] != "range":
             raise ValueError(f"invalid weight manifest line {lineno}: {raw}")
         _, model_id, model_size_s, off_s, bytes_s, handle_hex = parts
@@ -841,6 +956,8 @@ def validate_weight_manifest(path: Path, base_model: str, mtp_model: str | None,
         seen[model_id].append((off, off + n))
     if not saw_header:
         raise ValueError(f"weight manifest missing DS4_WEIGHT_SERVER_IPC_V1 header: {path}")
+    if backend == "vmm" and not broker_path:
+        raise ValueError(f"VMM weight manifest missing broker record: {path}")
     for model_id, ranges in seen.items():
         if not ranges:
             raise ValueError(f"weight manifest has no ranges for {model_id}")
@@ -852,7 +969,12 @@ def validate_weight_manifest(path: Path, base_model: str, mtp_model: str | None,
             prev_end = end
     if not owner:
         raise ValueError(f"weight manifest missing live owner record: {path}")
-    return {"owner": owner, "ranges": {k: len(v) for k, v in seen.items()}}
+    return {
+        "backend": backend or "ipc",
+        "owner": owner,
+        "broker_path": broker_path,
+        "ranges": {k: len(v) for k, v in seen.items()},
+    }
 
 
 def print_run_line(result: RunResult) -> None:
@@ -905,6 +1027,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--start-weight-server", action="store_true",
                     help="Start ds4_weight_server for this proof run and clean it up on exit.")
     ap.add_argument("--weight-server-bin", default=os.environ.get("DS4_WEIGHT_SERVER_BIN", "./ds4_weight_server"))
+    ap.add_argument("--weight-server-backend", choices=["ipc", "vmm"], default="ipc",
+                    help="ds4_weight_server sharing backend. Default: ipc.")
     ap.add_argument("--weight-server-manifest", type=Path,
                     help="Manifest path for --start-weight-server. Defaults under --work-dir.")
     ap.add_argument("--weight-server-ready-timeout", type=float, default=1800.0,
@@ -1003,6 +1127,7 @@ def main(argv: list[str] | None = None) -> int:
         enabled=bool(args.weight_ipc_manifest or args.start_weight_server),
         owned=False,
         scope=weight_server_scope,
+        backend=args.weight_server_backend,
         manifest_path=args.weight_ipc_manifest or "",
     )
     if args.weight_ipc_manifest:
@@ -1026,6 +1151,7 @@ def main(argv: list[str] | None = None) -> int:
             extra_args=args.weight_server_arg,
             preflight_timeout_s=args.weight_server_preflight_timeout,
             scope=weight_server_scope,
+            backend=args.weight_server_backend,
         )
         if not args.no_weight_server_preflight:
             print(f"preflighting ds4_weight_server log={weight_server.state.preflight_log_path}")
@@ -1110,6 +1236,7 @@ def main(argv: list[str] | None = None) -> int:
     weight_server_verdict = weight_server_validation(
         weight_server_state,
         scope=weight_server_scope,
+        backend=args.weight_server_backend,
         preflight_required=args.start_weight_server and not args.no_weight_server_preflight,
     )
     if weight_server_verdict["enabled"] and not weight_server_verdict["passed"]:
@@ -1127,6 +1254,7 @@ def main(argv: list[str] | None = None) -> int:
         "work_dir": str(work_dir),
         "weight_ipc_manifest": weight_ipc_manifest,
         "weight_ipc_scope": weight_server_scope,
+        "weight_server_backend": args.weight_server_backend,
         "weight_server": dataclass_dict(weight_server_state),
         "weight_server_validation": weight_server_verdict,
         "profiles": [dataclass_dict(p) for p in profiles],
