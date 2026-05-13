@@ -31,7 +31,6 @@ DEFAULT_PROMPTS = [
 FAST_MTP_ENV = {
     "DS4_CUDA_MTP_TOP2": "1",
     "DS4_CUDA_MTP_VERIFY_TOP2": "1",
-    "DS4_CUDA_MTP_VERIFY_OPT_OUTPUT": "1",
 }
 
 SHADOW_RE = re.compile(
@@ -624,6 +623,14 @@ def default_mtp_profiles() -> list[EngineProfile]:
             {
                 "DS4_CUDA_MTP_TOP2": "1",
                 "DS4_CUDA_MTP_VERIFY_TOP2": "1",
+            },
+            use_mtp=True,
+        ),
+        EngineProfile(
+            "mtp-opt-output",
+            {
+                **FAST_MTP_ENV,
+                "DS4_CUDA_MTP_VERIFY_OPT_OUTPUT": "1",
             },
             use_mtp=True,
         ),

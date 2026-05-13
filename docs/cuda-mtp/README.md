@@ -71,7 +71,6 @@ Optimized CUDA MTP, draft depth 2:
 ```sh
 DS4_CUDA_MTP_TOP2=1 \
 DS4_CUDA_MTP_VERIFY_TOP2=1 \
-DS4_CUDA_MTP_VERIFY_OPT_OUTPUT=1 \
 ./ds4 --cuda \
   -m ./gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf \
   --mtp ./gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf \
@@ -91,8 +90,10 @@ The currently useful CUDA MTP flags are:
 - `DS4_CUDA_MTP_TOP2=1`: use the CUDA top-2 output path for MTP draft decisions.
 - `DS4_CUDA_MTP_VERIFY_TOP2=1`: use top-2/top-1 verifier shortcuts where full
   logits are not needed.
-- `DS4_CUDA_MTP_VERIFY_OPT_OUTPUT=1`: schedule verifier output work to avoid an
-  avoidable readback/command break on full accepts.
+- `DS4_CUDA_MTP_VERIFY_OPT_OUTPUT=1`: optional A/B switch that schedules row0
+  top-2 and row1 full-output work together. It is exact, but current GB10
+  measurements favor the simpler no-opt schedule, so it is not part of the
+  recommended fast baseline.
 
 The structural CUDA optimizations are default-on after this work:
 
@@ -127,7 +128,6 @@ PROMPT="List 500 prime numbers, comma-separated, just numbers."
 
 DS4_CUDA_MTP_TOP2=1 \
 DS4_CUDA_MTP_VERIFY_TOP2=1 \
-DS4_CUDA_MTP_VERIFY_OPT_OUTPUT=1 \
 DS4_MTP_TIMING=1 \
 ./ds4 --cuda -m "$BASE" --mtp "$MTP" --mtp-draft 2 \
   --temp 0 --nothink -n 256 -p "$PROMPT" \
@@ -162,7 +162,6 @@ For a rollback comparison:
 ```sh
 DS4_CUDA_MTP_TOP2=1 \
 DS4_CUDA_MTP_VERIFY_TOP2=1 \
-DS4_CUDA_MTP_VERIFY_OPT_OUTPUT=1 \
 DS4_CUDA_NO_BATCH_Q8_PAIR=1 \
 DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6_N2=1 \
 DS4_CUDA_NO_DECODE_Q8_PAIR=1 \
@@ -205,7 +204,6 @@ For stage attribution, use the graph stage profiler plus MTP timing:
 ```sh
 DS4_CUDA_MTP_TOP2=1 \
 DS4_CUDA_MTP_VERIFY_TOP2=1 \
-DS4_CUDA_MTP_VERIFY_OPT_OUTPUT=1 \
 DS4_MTP_TIMING=1 \
 DS4_METAL_LAYER_STAGE_PROFILE=1 \
 DS4_CUDA_MOE_PROFILE=1 \
