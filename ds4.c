@@ -17896,6 +17896,9 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
     ds4_engine *e = s->engine;
 
+    const bool mtp_timing = getenv("DS4_MTP_TIMING") != NULL;
+    const double cycle_t0 = mtp_timing ? now_sec() : 0.0;
+
     /*
      * MTP in DeepSeek V4 is a speculative drafter, not a replacement sampler.
      * The target model still defines the exact output stream.  A cycle starts
@@ -17905,18 +17908,46 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
      * draft token is correctness-safe but cannot be faster than baseline.
      */
     if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+    const double target_done = mtp_timing ? now_sec() : 0.0;
     int n_accept = 0;
     accepted[n_accept++] = first_token;
-    if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
+    if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) {
+        if (mtp_timing) {
+            fprintf(stderr,
+                    "ds4: mtp timing cycle path=base-only reason=limit-or-eos committed=1 "
+                    "target=%.3f ms total=%.3f ms\n",
+                    (target_done - cycle_t0) * 1000.0,
+                    (now_sec() - cycle_t0) * 1000.0);
+        }
+        return n_accept;
+    }
 
-    if (!e->mtp_ready || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) return n_accept;
+    if (!e->mtp_ready || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) {
+        if (mtp_timing) {
+            fprintf(stderr,
+                    "ds4: mtp timing cycle path=base-only reason=mtp-unavailable committed=1 "
+                    "target=%.3f ms total=%.3f ms\n",
+                    (target_done - cycle_t0) * 1000.0,
+                    (now_sec() - cycle_t0) * 1000.0);
+        }
+        return n_accept;
+    }
 
     int draft_cap = e->mtp_draft_tokens;
     if (draft_cap > max_tokens - n_accept) draft_cap = max_tokens - n_accept;
     if (draft_cap > accepted_cap - n_accept) draft_cap = accepted_cap - n_accept;
     int room = s->ctx_size - s->checkpoint.len;
     if (draft_cap > room - 1) draft_cap = room - 1;
-    if (draft_cap <= 0) return n_accept;
+    if (draft_cap <= 0) {
+        if (mtp_timing) {
+            fprintf(stderr,
+                    "ds4: mtp timing cycle path=base-only reason=no-draft-room committed=1 "
+                    "target=%.3f ms total=%.3f ms\n",
+                    (target_done - cycle_t0) * 1000.0,
+                    (now_sec() - cycle_t0) * 1000.0);
+        }
+        return n_accept;
+    }
 
     int drafts[16];
     int draft_n = 1;
@@ -17930,7 +17961,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         float v = strtof(mtp_margin_env, &end);
         if (end != mtp_margin_env && v >= 0.0f) mtp_margin_threshold = v;
     }
-    const bool mtp_timing = getenv("DS4_MTP_TIMING") != NULL;
     const bool mtp_conf_log = getenv("DS4_MTP_CONF_LOG") != NULL;
     const bool mtp_fast_top2 =
         getenv("DS4_CUDA_MTP_TOP2") != NULL &&
@@ -17954,6 +17984,13 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     if (sample_argmax(s->logits, DS4_N_VOCAB) != drafts[0]) {
         if (getenv("DS4_MTP_SPEC_LOG")) {
             fprintf(stderr, "ds4: mtp spec miss first draft=%d\n", drafts[0]);
+        }
+        if (mtp_timing) {
+            fprintf(stderr,
+                    "ds4: mtp timing cycle path=first-miss drafted=1 committed=1 "
+                    "target=%.3f ms total=%.3f ms\n",
+                    (target_done - cycle_t0) * 1000.0,
+                    (now_sec() - cycle_t0) * 1000.0);
         }
         return n_accept;
     }
@@ -18042,12 +18079,15 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             if (mtp_timing) {
                 const double done = now_sec();
                 fprintf(stderr,
-                        "ds4: mtp timing margin-skip drafted=2 committed=1 margin=%.3f threshold=%.3f draft=%.3f ms verify=%.3f ms total=%.3f ms\n",
+                        "ds4: mtp timing margin-skip drafted=2 committed=1 margin=%.3f threshold=%.3f "
+                        "target=%.3f ms draft=%.3f ms verify=%.3f ms spec=%.3f ms total=%.3f ms\n",
                         mtp_last_margin,
                         mtp_margin_threshold,
+                        (target_done - cycle_t0) * 1000.0,
                         (mtp_t_after_draft - mtp_t0) * 1000.0,
                         (done - verify_t0) * 1000.0,
-                        (done - mtp_t0) * 1000.0);
+                        (done - mtp_t0) * 1000.0,
+                        (done - cycle_t0) * 1000.0);
             }
             return n_accept;
         }
@@ -18097,11 +18137,14 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             DS4_MTP_KEEP_ACCEPTED(2);
             if (mtp_timing) {
                 fprintf(stderr,
-                        "ds4: mtp timing decode2 drafted=2 committed=2 draft=%.3f ms snapshot=%.3f ms verify=%.3f ms total=%.3f ms\n",
+                        "ds4: mtp timing decode2 drafted=2 committed=2 target=%.3f ms draft=%.3f ms "
+                        "snapshot=%.3f ms verify=%.3f ms spec=%.3f ms total=%.3f ms\n",
+                        (target_done - cycle_t0) * 1000.0,
                         (mtp_t_after_draft - mtp_t0) * 1000.0,
                         (snapshot_done - snapshot_t0) * 1000.0,
                         (verify_done - snapshot_done) * 1000.0,
-                        (now_sec() - mtp_t0) * 1000.0);
+                        (now_sec() - mtp_t0) * 1000.0,
+                        (now_sec() - cycle_t0) * 1000.0);
             }
             spec_frontier_free(&frontier);
             free(row0_logits);
@@ -18123,12 +18166,15 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             if (mtp_timing) {
                 const double replay_done = now_sec();
                 fprintf(stderr,
-                        "ds4: mtp timing decode2 drafted=2 committed=1 draft=%.3f ms snapshot=%.3f ms verify=%.3f ms prefix=%.3f ms total=%.3f ms\n",
+                        "ds4: mtp timing decode2 drafted=2 committed=1 target=%.3f ms draft=%.3f ms "
+                        "snapshot=%.3f ms verify=%.3f ms prefix=%.3f ms spec=%.3f ms total=%.3f ms\n",
+                        (target_done - cycle_t0) * 1000.0,
                         (mtp_t_after_draft - mtp_t0) * 1000.0,
                         (snapshot_done - snapshot_t0) * 1000.0,
                         (verify_done - snapshot_done) * 1000.0,
                         (replay_done - verify_done) * 1000.0,
-                        (replay_done - mtp_t0) * 1000.0);
+                        (replay_done - mtp_t0) * 1000.0,
+                        (replay_done - cycle_t0) * 1000.0);
             }
             spec_frontier_free(&frontier);
             free(row0_logits);
@@ -18382,13 +18428,16 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     DS4_MTP_KEEP_ACCEPTED(draft_n);
                     if (mtp_timing) {
                         fprintf(stderr,
-                                "ds4: mtp timing micro drafted=%d committed=%d draft=%.3f ms snapshot=%.3f ms verify=%.3f ms total=%.3f ms\n",
+                                "ds4: mtp timing micro drafted=%d committed=%d target=%.3f ms draft=%.3f ms "
+                                "snapshot=%.3f ms verify=%.3f ms spec=%.3f ms total=%.3f ms\n",
                                 draft_n,
                                 draft_n,
+                                (target_done - cycle_t0) * 1000.0,
                                 (mtp_t_after_draft - mtp_t0) * 1000.0,
                                 (snapshot_done - snapshot_t0) * 1000.0,
                                 (micro_verify_done - snapshot_done) * 1000.0,
-                                (now_sec() - mtp_t0) * 1000.0);
+                                (now_sec() - mtp_t0) * 1000.0,
+                                (now_sec() - cycle_t0) * 1000.0);
                     }
                     spec_frontier_free(&frontier);
                     free(row_logits);
@@ -18413,14 +18462,17 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     token_vec_push(&s->checkpoint, drafts[0]);
                     if (mtp_timing) {
                         fprintf(stderr,
-                                "ds4: mtp timing micro drafted=%d committed=%d draft=%.3f ms snapshot=%.3f ms verify=%.3f ms prefix=%.3f ms total=%.3f ms noreplay=1\n",
+                                "ds4: mtp timing micro drafted=%d committed=%d target=%.3f ms draft=%.3f ms "
+                                "snapshot=%.3f ms verify=%.3f ms prefix=%.3f ms spec=%.3f ms total=%.3f ms noreplay=1\n",
                                 draft_n,
                                 commit_drafts,
+                                (target_done - cycle_t0) * 1000.0,
                                 (mtp_t_after_draft - mtp_t0) * 1000.0,
                                 (snapshot_done - snapshot_t0) * 1000.0,
                                 (micro_verify_done - snapshot_done) * 1000.0,
                                 (prefix_done - prefix_t0) * 1000.0,
-                                (now_sec() - mtp_t0) * 1000.0);
+                                (now_sec() - mtp_t0) * 1000.0,
+                                (now_sec() - cycle_t0) * 1000.0);
                     }
                     spec_frontier_free(&frontier);
                     free(row_logits);
@@ -18449,14 +18501,17 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     if (mtp_timing) {
                         const double replay_done = now_sec();
                         fprintf(stderr,
-                                "ds4: mtp timing micro drafted=%d committed=%d draft=%.3f ms snapshot=%.3f ms verify=%.3f ms exact_replay=%.3f ms total=%.3f ms\n",
+                                "ds4: mtp timing micro drafted=%d committed=%d target=%.3f ms draft=%.3f ms "
+                                "snapshot=%.3f ms verify=%.3f ms exact_replay=%.3f ms spec=%.3f ms total=%.3f ms\n",
                                 draft_n,
                                 commit_drafts,
+                                (target_done - cycle_t0) * 1000.0,
                                 (mtp_t_after_draft - mtp_t0) * 1000.0,
                                 (snapshot_done - snapshot_t0) * 1000.0,
                                 (micro_verify_done - snapshot_done) * 1000.0,
                                 (replay_done - micro_verify_done) * 1000.0,
-                                (replay_done - mtp_t0) * 1000.0);
+                                (replay_done - mtp_t0) * 1000.0,
+                                (replay_done - cycle_t0) * 1000.0);
                     }
                     spec_frontier_free(&frontier);
                     free(row_logits);
@@ -18491,14 +18546,17 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     if (mtp_timing) {
                         const double replay_done = now_sec();
                         fprintf(stderr,
-                                "ds4: mtp timing micro drafted=%d committed=%d draft=%.3f ms snapshot=%.3f ms verify=%.3f ms replay=%.3f ms total=%.3f ms\n",
+                                "ds4: mtp timing micro drafted=%d committed=%d target=%.3f ms draft=%.3f ms "
+                                "snapshot=%.3f ms verify=%.3f ms replay=%.3f ms spec=%.3f ms total=%.3f ms\n",
                                 draft_n,
                                 commit_drafts,
+                                (target_done - cycle_t0) * 1000.0,
                                 (mtp_t_after_draft - mtp_t0) * 1000.0,
                                 (snapshot_done - snapshot_t0) * 1000.0,
                                 (micro_verify_done - snapshot_done) * 1000.0,
                                 (replay_done - micro_verify_done) * 1000.0,
-                                (replay_done - mtp_t0) * 1000.0);
+                                (replay_done - mtp_t0) * 1000.0,
+                                (replay_done - cycle_t0) * 1000.0);
                     }
                     spec_frontier_free(&frontier);
                     free(row_logits);
@@ -18591,12 +18649,15 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 #undef DS4_MTP_KEEP_ACCEPTED
     if (mtp_timing) {
         fprintf(stderr,
-                "ds4: mtp timing seq drafted=%d verified=%d draft=%.3f ms verify=%.3f ms total=%.3f ms\n",
+                "ds4: mtp timing seq drafted=%d verified=%d target=%.3f ms draft=%.3f ms "
+                "verify=%.3f ms spec=%.3f ms total=%.3f ms\n",
                 draft_n,
                 verified,
+                (target_done - cycle_t0) * 1000.0,
                 (mtp_t_after_draft - mtp_t0) * 1000.0,
                 (now_sec() - seq_t0) * 1000.0,
-                (now_sec() - mtp_t0) * 1000.0);
+                (now_sec() - mtp_t0) * 1000.0,
+                (now_sec() - cycle_t0) * 1000.0);
     }
     if (getenv("DS4_MTP_SPEC_LOG")) {
         if (verified == draft_n) {

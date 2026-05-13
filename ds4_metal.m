@@ -277,6 +277,10 @@ static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *labe
     return 1;
 }
 
+void ds4_gpu_set_attention_output_b_n2_q8_override(int enabled) {
+    (void)enabled;
+}
+
 static int ds4_gpu_wait_pending_command_buffers(const char *label) {
     int ok = 1;
     for (id<MTLCommandBuffer> pending in g_pending_cbs) {
