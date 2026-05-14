@@ -16,6 +16,10 @@ using MASK_T = uint32_t;
 
 #endif
 
+#define FULL_WARP_MASK 0xFFFFFFFFu
+#define MASK_T uint32_t
+#endif
+
 #include <stdint.h>
 #include <errno.h>
 #include <limits.h>
