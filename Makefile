@@ -26,7 +26,7 @@ ROCM_PATH ?= /opt/rocm
 GPU_CC = $(ROCM_PATH)/bin/hipcc
 ROCM_ARCH ?= gfx1151
 
-GPU_CFLAGS ?= -O3 -ffast-math -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
+GPU_CFLAGS ?= -O3 -fno-trapping-math -fno-math-errno -fno-signed-zeros -pthread -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
 GPU_LDLIBS = -lm -pthread -L$(ROCM_PATH)/lib -lhipblas
 
 @echo "ROCM_ARCH: $(ROCM_ARCH)"
@@ -47,11 +47,11 @@ CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$
 GPU_CC = $(NVCC)
 GPU_CFLAGS = $(NVCCFLAGS)
 GPU_LDLIBS = $(CUDA_LDLIBS)
+EXTRA_DEPS =
 
 endif
 
 CORE_OBJS = ds4.o ds4_cuda.o
-EXTRA_DEPS =
 CPU_CORE_OBJS = ds4_cpu.o
 METAL_LDLIBS := $(LDLIBS)
 

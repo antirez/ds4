@@ -944,7 +944,7 @@ static bool stop_list_find_from(const stop_list *stops, const char *text,
     bool found = false;
     size_t best_pos = 0, best_len = 0;
     for (int i = 0; i < stops->len; i++) {
-        char *p = strstr(text + from, stops->v[i]);
+        const char *p = strstr(text + from, stops->v[i]);
         if (!p) continue;
         size_t ppos = (size_t)(p - text);
         size_t plen = strlen(stops->v[i]);

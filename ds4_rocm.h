@@ -1,13 +1,16 @@
 #pragma once
 
 #include <hip/hip_runtime.h>
+
+#include <rocwmma/rocwmma.hpp>
+
 #include <hipblas/hipblas.h>
 #include <hip/hip_fp16.h>
-#include <rocwmma/rocwmma-version.hpp>
 
 #include <hipcub/block/block_radix_sort.hpp>
 
 namespace cub = hipcub;
+namespace wmma = rocwmma;
 
 #define cudaError_t hipError_t
 #define cudaStream_t hipStream_t
@@ -79,8 +82,9 @@ namespace cub = hipcub;
 #define CUBLAS_DEFAULT_MATH HIPBLAS_DEFAULT_MATH
 #define CUBLAS_COMPUTE_32F HIPBLAS_COMPUTE_32F
 #define CUBLAS_TF32_TENSOR_OP_MATH HIPBLAS_TF32_TENSOR_OP_MATH
-#define CUDA_R_16F HIPBLAS_R_16F
-#define CUDA_R_32F HIPBLAS_R_32F
+
+#define CUDA_R_16F HIP_R_16F
+#define CUDA_R_32F HIP_R_32F
 
 #define cublasCreate hipblasCreate
 #define cublasDestroy hipblasDestroy
@@ -89,6 +93,12 @@ namespace cub = hipcub;
 #define cublasSgemmStridedBatched hipblasSgemmStridedBatched
 #define cublasGemmEx hipblasGemmEx
 #define cublasGemmStridedBatchedEx hipblasGemmStridedBatchedEx
+
+#define __shfl_sync(mask, var, laneMask, width) __shfl_sync(static_cast<uint64_t>(mask), var, laneMask, width)
+#define __shfl_down_sync(mask, var, laneMask, width) __shfl_down_sync(static_cast<uint64_t>(mask), var, laneMask, width)
+#define __shfl_up_sync(mask, var, laneMask, width) __shfl_up_sync(static_cast<uint64_t>(mask), var, laneMask, width)
+#define __shfl_xor_sync(mask, var, laneMask, width) __shfl_xor_sync(static_cast<uint64_t>(mask), var, laneMask, width)
+
 
 template<typename T1, typename T2, typename T3>
 __forceinline__ decltype(auto) myHipFuncSetAttribute(T1&& p1, T2&& p2, T3&& p3) {
@@ -108,14 +118,19 @@ __forceinline__ decltype(auto) myHipMemPrefetchAsync(T1&& p1, T2&& p2, T3&& p3, 
 }
 #define cudaMemPrefetchAsync myHipMemPrefetchAsync
 
-static __device__ __forceinline__ int32_t __vcmpne4(uint32_t a, uint32_t b) {
-    // For each byte: 0xFF if a != b, 0x00 if a == b
-    uint32_t diff = a ^ b;
-    // Spread any set bit in each byte to fill the whole byte
-    diff |= (diff >> 1); diff |= (diff >> 2); diff |= (diff >> 4);
-    diff &= 0x01010101u;
-    diff *= 0xFFu; // 0x01 -> 0xFF per byte
-    return (int32_t)diff;
+typedef int8_t int8x4_t __attribute__((ext_vector_type(4)));
+typedef uint8_t uint8x4_t __attribute__((ext_vector_type(4)));
+
+static __device__ __forceinline__ unsigned int __vcmpne4(unsigned int a, unsigned int b) {
+    const uint8x4_t& va = reinterpret_cast<const uint8x4_t&>(a);
+    const uint8x4_t& vb = reinterpret_cast<const uint8x4_t&>(b);
+    unsigned int c;
+    uint8x4_t& vc = reinterpret_cast<uint8x4_t&>(c);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        vc[i] = va[i] == vb[i] ? 0x00 : 0xff;
+    }
+    return c;
 }
 
 static __device__ __forceinline__ int32_t __vsub4(int32_t a, int32_t b) {
@@ -134,5 +149,14 @@ static __device__ __forceinline__ int32_t __dp4a(int32_t a, int32_t b, int32_t c
              + (int32_t)a_bytes[1] * b_bytes[1]
              + (int32_t)a_bytes[2] * b_bytes[2]
              + (int32_t)a_bytes[3] * b_bytes[3];
+}
+
+static __device__ __forceinline__ uint32_t __dp4a(uint32_t a, uint32_t b, uint32_t c) {
+    const uint8_t *a_bytes = reinterpret_cast<const uint8_t*>(&a);
+    const uint8_t *b_bytes = reinterpret_cast<const uint8_t*>(&b);
+    return c + (uint32_t)a_bytes[0] * b_bytes[0]
+             + (uint32_t)a_bytes[1] * b_bytes[1]
+             + (uint32_t)a_bytes[2] * b_bytes[2]
+             + (uint32_t)a_bytes[3] * b_bytes[3];
 }
 
