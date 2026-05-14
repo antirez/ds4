@@ -8059,6 +8059,8 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
  * tensor names follow the model stages rather than generic graph nodes.
  */
 
+#define DS4_OUTPUT_CERT_GROUPS 16u
+
 typedef struct {
     /* One-token decode tensors.  These stay allocated for the life of a
      * session; a generated token enters as an embedding in cur_hc and leaves as
@@ -8163,7 +8165,9 @@ typedef struct {
     ds4_gpu_tensor *output_norm;
     ds4_gpu_tensor *logits;
     ds4_gpu_tensor *output_candidate_ids;
-    ds4_gpu_tensor *output_candidate_logits;
+    ds4_gpu_tensor *output_cert_group_norms;
+    ds4_gpu_tensor *output_cert_result;
+    bool output_cert_group_norms_ready;
 
     /* Optional MTP model state.  It has its own raw cache because the drafter
      * runs on speculative future tokens; target KV state is updated only after
@@ -8279,8 +8283,9 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->batch_next_hc);
     ds4_gpu_tensor_free(g->batch_cur_hc);
     ds4_gpu_tensor_free(g->prefill_tokens);
-    ds4_gpu_tensor_free(g->output_candidate_logits);
     ds4_gpu_tensor_free(g->output_candidate_ids);
+    ds4_gpu_tensor_free(g->output_cert_result);
+    ds4_gpu_tensor_free(g->output_cert_group_norms);
     ds4_gpu_tensor_free(g->logits);
     ds4_gpu_tensor_free(g->spec_cur_hc);
     ds4_gpu_tensor_free(g->spec_mtp_raw_cache);
@@ -8746,7 +8751,6 @@ static bool metal_graph_alloc_raw_cap(
     g->output_norm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->logits = ds4_gpu_tensor_alloc(vocab_dim * sizeof(float));
     g->output_candidate_ids = ds4_gpu_tensor_alloc(8u * sizeof(uint32_t));
-    g->output_candidate_logits = ds4_gpu_tensor_alloc(8u * sizeof(float));
     /*
      * MTP is deliberately outside the normal graph footprint.  A session that
      * does not opt in with --mtp must allocate and execute exactly the same
@@ -8859,7 +8863,7 @@ static bool metal_graph_alloc_raw_cap(
                     g->after_ffn_hc &&
                     g->output_pre && g->output_weights && g->output_embd &&
                     g->output_norm && g->logits &&
-                    g->output_candidate_ids && g->output_candidate_logits &&
+                    g->output_candidate_ids &&
                     (!enable_mtp ||
                      (g->mtp_embed && g->mtp_enorm && g->mtp_eproj &&
                       g->mtp_eproj_hc && g->mtp_hnorm_hc && g->mtp_hproj_hc &&
@@ -9966,13 +9970,11 @@ static bool metal_graph_encode_decode2_layer_exact(
     return ok;
 }
 
-/* Encode the final HC collapse, output norm, and vocab projection on Metal. */
-static bool metal_graph_encode_output_head_impl(
+/* Encode the final HC collapse and output norm before the vocab projection. */
+static bool metal_graph_encode_output_head_norm(
         ds4_gpu_graph *g,
         const ds4_model       *model,
-        const ds4_weights     *weights,
-        uint64_t               vocab_dim,
-        bool                   top2_only) {
+        const ds4_weights     *weights) {
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     bool ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     if (ok) ok = ds4_gpu_matmul_f16_tensor(g->output_pre,
@@ -10015,6 +10017,17 @@ static bool metal_graph_encode_output_head_impl(
     if (ok) {
         metal_graph_debug_dump_tensor("result_norm", g->output_norm, DS4_N_EMBD, DS4_N_LAYER, 0);
     }
+    return ok;
+}
+
+/* Encode the final HC collapse, output norm, and vocab projection on Metal. */
+static bool metal_graph_encode_output_head_impl(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        uint64_t               vocab_dim,
+        bool                   top2_only) {
+    bool ok = metal_graph_encode_output_head_norm(g, model, weights);
     if (ok && top2_only) {
         ok = ds4_gpu_matmul_q8_0_top2_tensor(g->comp_selected,
                                              model->map,
@@ -10047,25 +10060,55 @@ static bool metal_graph_encode_output_head(
     return metal_graph_encode_output_head_impl(g, model, weights, vocab_dim, false);
 }
 
-static bool metal_graph_encode_output_candidate_logits(
+static bool metal_graph_prepare_output_certifier(
         ds4_gpu_graph *g,
         const ds4_model       *model,
         const ds4_weights     *weights,
-        uint64_t               vocab_dim,
-        uint32_t               candidate_count) {
-    if (!g || !g->output_candidate_ids || !g->output_candidate_logits ||
-        candidate_count == 0 || candidate_count > 8u) {
+        uint64_t               vocab_dim) {
+    if (!g || !model || !weights || vocab_dim == 0) return false;
+    if (!g->output_cert_group_norms) {
+        g->output_cert_group_norms =
+            ds4_gpu_tensor_alloc(vocab_dim * DS4_OUTPUT_CERT_GROUPS * sizeof(float));
+        g->output_cert_group_norms_ready = false;
+    }
+    if (!g->output_cert_result) {
+        g->output_cert_result = ds4_gpu_tensor_alloc(sizeof(ds4_gpu_candidate_cert_result));
+    }
+    if (!g->output_cert_group_norms || !g->output_cert_result) return false;
+    if (!g->output_cert_group_norms_ready) {
+        if (ds4_gpu_q8_0_row_group_norms_tensor(g->output_cert_group_norms,
+                                                model->map,
+                                                model->size,
+                                                weights->output->abs_offset,
+                                                DS4_N_EMBD,
+                                                vocab_dim,
+                                                DS4_OUTPUT_CERT_GROUPS) == 0) {
+            return false;
+        }
+        g->output_cert_group_norms_ready = true;
+    }
+    return true;
+}
+
+static bool metal_graph_encode_output_candidate_cert(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        uint64_t               vocab_dim) {
+    if (!g || !g->output_cert_group_norms || !g->output_cert_result ||
+        !g->output_candidate_ids) {
         return false;
     }
-    return ds4_gpu_matmul_q8_0_candidates_tensor(g->output_candidate_logits,
-                                                 g->output_candidate_ids,
-                                                 candidate_count,
-                                                 model->map,
-                                                 model->size,
-                                                 weights->output->abs_offset,
-                                                 DS4_N_EMBD,
-                                                 vocab_dim,
-                                                 g->output_norm) != 0;
+    return ds4_gpu_matmul_q8_0_candidate_certify_tensor(g->output_cert_result,
+                                                        g->output_cert_group_norms,
+                                                        g->output_candidate_ids,
+                                                        model->map,
+                                                        model->size,
+                                                        weights->output->abs_offset,
+                                                        DS4_N_EMBD,
+                                                        vocab_dim,
+                                                        g->output_norm,
+                                                        DS4_OUTPUT_CERT_GROUPS) != 0;
 }
 
 static bool metal_graph_encode_output_head_batch_row(
@@ -14127,73 +14170,137 @@ static bool metal_graph_verify_decode2_exact(
         getenv("DS4_MTP_NO_EXACT_DECODE2_TOP2_HEAD") == NULL;
     if (ok && exact_decode2_top2_head) {
         const bool cert_shadow = getenv("DS4_MTP_CERT_LOGITS_SHADOW") != NULL;
+        const bool cert_active = !cert_shadow &&
+            getenv("DS4_MTP_CERT_LOGITS") != NULL &&
+            getenv("DS4_MTP_NO_CERT_LOGITS") == NULL;
+        const bool cert_enabled = cert_shadow || cert_active;
         uint32_t cert_candidate = token1 >= 0 ? (uint32_t)token1 : UINT32_MAX;
-        if (cert_shadow) {
+        if (cert_enabled) {
+            ok = metal_graph_prepare_output_certifier(g, model, weights, weights->output->dim[1]);
+        }
+        if (ok && cert_enabled) {
             ok = ds4_gpu_tensor_write(g->output_candidate_ids,
                                       0,
                                       &cert_candidate,
                                       sizeof(cert_candidate)) != 0;
         }
-        g->cur_hc = cur0;
-        ok = ds4_gpu_begin_commands() != 0;
-        if (ok) ok = metal_graph_encode_output_head_impl(g,
-                                                         model,
-                                                         weights,
-                                                         weights->output->dim[1],
-                                                         true);
-        if (ok && cert_shadow) {
-            ok = metal_graph_encode_output_candidate_logits(g,
-                                                            model,
-                                                            weights,
-                                                            weights->output->dim[1],
-                                                            1u);
-        }
-        if (ok) ok = ds4_gpu_end_commands() != 0;
-        else (void)ds4_gpu_synchronize();
-        g->cur_hc = saved_cur;
         ds4_gpu_top2_result row0_top2;
         memset(&row0_top2, 0, sizeof(row0_top2));
-        if (ok) ok = ds4_gpu_tensor_read(g->comp_selected, 0, &row0_top2, sizeof(row0_top2)) != 0;
-        if (ok) *top0 = (int)row0_top2.id0;
+        ds4_gpu_candidate_cert_result cert_result;
+        memset(&cert_result, 0, sizeof(cert_result));
+        bool have_row0_top = false;
+
+        if (ok && cert_active) {
+            g->cur_hc = cur0;
+            ok = ds4_gpu_begin_commands() != 0;
+            if (ok) ok = metal_graph_encode_output_head_norm(g, model, weights);
+            if (ok) ok = metal_graph_encode_output_candidate_cert(g,
+                                                                  model,
+                                                                  weights,
+                                                                  weights->output->dim[1]);
+            if (ok) ok = ds4_gpu_end_commands() != 0;
+            else (void)ds4_gpu_synchronize();
+            g->cur_hc = saved_cur;
+            if (ok) {
+                ok = ds4_gpu_tensor_read(g->output_cert_result,
+                                         0,
+                                         &cert_result,
+                                         sizeof(cert_result)) != 0;
+            }
+            if (ok) {
+                static uint64_t active_n = 0;
+                static uint64_t active_certified = 0;
+                active_n++;
+                if (cert_result.certified) active_certified++;
+                if (getenv("DS4_MTP_CERT_LOGITS_LOG") != NULL ||
+                    (active_n & (active_n - 1u)) == 0u) {
+                    fprintf(stderr,
+                            "ds4: MTP cert-logits active n=%llu cand=%u cand_logit=%g bound=%g bound_id=%u certified=%u certified_hits=%llu\n",
+                            (unsigned long long)active_n,
+                            cert_result.candidate_id,
+                            cert_result.candidate_logit,
+                            cert_result.max_bound,
+                            cert_result.bound_id,
+                            cert_result.certified,
+                            (unsigned long long)active_certified);
+                }
+            }
+            if (ok && cert_result.certified) {
+                row0_top2.id0 = cert_candidate;
+                row0_top2.id1 = cert_result.bound_id;
+                row0_top2.value0 = cert_result.candidate_logit;
+                row0_top2.value1 = cert_result.max_bound;
+                *top0 = (int)cert_candidate;
+                have_row0_top = true;
+            }
+        }
+
+        if (ok && !have_row0_top) {
+            g->cur_hc = cur0;
+            ok = ds4_gpu_begin_commands() != 0;
+            if (ok) ok = metal_graph_encode_output_head_impl(g,
+                                                             model,
+                                                             weights,
+                                                             weights->output->dim[1],
+                                                             true);
+            if (ok && cert_shadow) {
+                ok = metal_graph_encode_output_candidate_cert(g,
+                                                              model,
+                                                              weights,
+                                                              weights->output->dim[1]);
+            }
+            if (ok) ok = ds4_gpu_end_commands() != 0;
+            else (void)ds4_gpu_synchronize();
+            g->cur_hc = saved_cur;
+            if (ok) ok = ds4_gpu_tensor_read(g->comp_selected, 0, &row0_top2, sizeof(row0_top2)) != 0;
+            if (ok) *top0 = (int)row0_top2.id0;
+        }
+        if (ok && cert_shadow) {
+            ok = ds4_gpu_tensor_read(g->output_cert_result,
+                                     0,
+                                     &cert_result,
+                                     sizeof(cert_result)) != 0;
+        }
         if (ok && cert_shadow) {
             static uint64_t shadow_n = 0;
             static uint64_t shadow_mismatch = 0;
             static uint64_t shadow_candidate_top0 = 0;
             static uint64_t shadow_candidate_top1 = 0;
-            float candidate_logit = -FLT_MAX;
-            ok = ds4_gpu_tensor_read(g->output_candidate_logits,
-                                     0,
-                                     &candidate_logit,
-                                     sizeof(candidate_logit)) != 0;
-            if (ok) {
-                shadow_n++;
-                const bool is_top0 = row0_top2.id0 == cert_candidate;
-                const bool is_top1 = row0_top2.id1 == cert_candidate;
-                if (is_top0) shadow_candidate_top0++;
-                if (is_top1) shadow_candidate_top1++;
-                float expected = is_top0 ? row0_top2.value0 : (is_top1 ? row0_top2.value1 : row0_top2.value1);
-                const float diff = fabsf(candidate_logit - expected);
-                const bool agrees =
-                    is_top0 || is_top1
-                        ? diff <= 1.0e-4f
-                        : candidate_logit <= row0_top2.value1 + 1.0e-4f;
-                if (!agrees) shadow_mismatch++;
-                if (getenv("DS4_MTP_CERT_LOGITS_LOG") != NULL || !agrees ||
-                    (shadow_n & (shadow_n - 1u)) == 0u) {
-                    fprintf(stderr,
-                            "ds4: MTP cert-logits shadow n=%llu cand=%u cand_logit=%g top0=%u top0_logit=%g top1=%u top1_logit=%g match=%d top0_hits=%llu top1_hits=%llu mismatches=%llu\n",
-                            (unsigned long long)shadow_n,
-                            cert_candidate,
-                            candidate_logit,
-                            row0_top2.id0,
-                            row0_top2.value0,
-                            row0_top2.id1,
-                            row0_top2.value1,
-                            agrees ? 1 : 0,
-                            (unsigned long long)shadow_candidate_top0,
-                            (unsigned long long)shadow_candidate_top1,
-                            (unsigned long long)shadow_mismatch);
-                }
+            static uint64_t shadow_certified = 0;
+            shadow_n++;
+            const bool is_top0 = row0_top2.id0 == cert_candidate;
+            const bool is_top1 = row0_top2.id1 == cert_candidate;
+            if (is_top0) shadow_candidate_top0++;
+            if (is_top1) shadow_candidate_top1++;
+            if (cert_result.certified) shadow_certified++;
+            float expected = is_top0 ? row0_top2.value0 : (is_top1 ? row0_top2.value1 : row0_top2.value1);
+            const float diff = fabsf(cert_result.candidate_logit - expected);
+            const bool agrees =
+                is_top0 || is_top1
+                    ? diff <= 1.0e-4f
+                    : cert_result.candidate_logit <= row0_top2.value1 + 1.0e-4f;
+            const bool false_cert = cert_result.certified && !is_top0;
+            if (!agrees || false_cert) shadow_mismatch++;
+            if (getenv("DS4_MTP_CERT_LOGITS_LOG") != NULL || !agrees || false_cert ||
+                (shadow_n & (shadow_n - 1u)) == 0u) {
+                fprintf(stderr,
+                        "ds4: MTP cert-logits shadow n=%llu cand=%u cand_logit=%g top0=%u top0_logit=%g top1=%u top1_logit=%g bound=%g bound_id=%u certified=%u false_cert=%d match=%d top0_hits=%llu top1_hits=%llu certified_hits=%llu mismatches=%llu\n",
+                        (unsigned long long)shadow_n,
+                        cert_candidate,
+                        cert_result.candidate_logit,
+                        row0_top2.id0,
+                        row0_top2.value0,
+                        row0_top2.id1,
+                        row0_top2.value1,
+                        cert_result.max_bound,
+                        cert_result.bound_id,
+                        cert_result.certified,
+                        false_cert ? 1 : 0,
+                        agrees ? 1 : 0,
+                        (unsigned long long)shadow_candidate_top0,
+                        (unsigned long long)shadow_candidate_top1,
+                        (unsigned long long)shadow_certified,
+                        (unsigned long long)shadow_mismatch);
             }
         }
 
