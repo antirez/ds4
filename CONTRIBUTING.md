@@ -29,6 +29,7 @@ Useful narrower checks:
 
 ```sh
 ./ds4_test --server
+./ds4_test --launch
 ./ds4_test --logprob-vectors
 ./ds4_test --long-context
 ./ds4_test --tool-call-quality
@@ -40,6 +41,9 @@ What they cover:
 - `--server`: request parsing, chat rendering, streaming, tool-call parsing,
   thinking controls, KV disk-cache bookkeeping, and other server-side logic.
   This is the best quick check for API and prompt-rendering changes.
+- `--launch`: `ds4-launch` tool-name parsing, server-option parsing, DS4 lock
+  pid extraction, and `lsof` listener-port extraction. This is the quick check
+  for launcher changes and does not start a model server.
 - `--logprob-vectors`: compares local token bytes and top-logprob slices against
   official DeepSeek V4 Flash continuation vectors. This catches tokenizer,
   template, attention, and logits regressions.

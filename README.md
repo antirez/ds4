@@ -344,6 +344,22 @@ The `384000` output limit below avoids token caps since the model is able
 to generate very long replies otherwise (up to 384k tokens). The server
 still stops when the configured context window is full.
 
+`ds4-launch` can configure and start common local agent clients for you. The
+first argument selects the tool, and the remaining arguments are passed to
+`ds4-server` when a new server is needed:
+
+```sh
+./ds4-launch pi --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
+./ds4-launch copilot --port 9000
+./ds4-launch opencode
+```
+
+If a DS4 server is already running, the launcher reuses it instead of trying to
+load a second model process: it reads the lock-owner pid, discovers the listening
+port with `lsof`, prints the pid/port it found, configures the selected client,
+and then gives the terminal to that client. The launched clients see the model
+as `DeepSeek V4 Flash (ds4.c local)`.
+
 For **opencode**, add a provider and agent entry to
 `~/.config/opencode/opencode.json`:
 

@@ -632,8 +632,14 @@ static void test_tool_call_quality(void) {
 
 #endif
 
+int ds4_launch_unit_tests_run(void);
+
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
+}
+
+static void test_launch_unit_group(void) {
+    TEST_ASSERT(ds4_launch_unit_tests_run() == 0);
 }
 
 typedef void (*test_fn)(void);
@@ -653,6 +659,7 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_f16_matvec_fast_nr0_4},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
+    {"--launch", "launch", "ds4-launch parser and discovery unit tests", test_launch_unit_group},
 };
 
 static void test_print_help(const char *prog) {
