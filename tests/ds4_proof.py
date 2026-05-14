@@ -46,6 +46,11 @@ VERIFY_V2_SHADOW_RE = re.compile(
     r"draft1=(?P<draft1>-?\d+) draft2=(?P<draft2>-?\d+) "
     r"margin0=(?P<margin0>[-+0-9.eE]+) margin1=(?P<margin1>[-+0-9.eE]+)"
 )
+GEN_STEP_PROFILE_RE = re.compile(
+    r"ds4: gen step profile cycle=(?P<cycle>\d+) pos=(?P<pos>\d+) mtp=(?P<mtp>[01]) "
+    r"accepted=(?P<accepted>\d+) eval_ms=(?P<eval_ms>[-+0-9.eE]+) "
+    r"generated_before=(?P<generated_before>\d+)"
+)
 WEIGHT_PLAN_RE = re.compile(
     r"ds4_weight_server: (?P<model>\w+) plan model=(?P<model_gib>[-+0-9.eE]+) GiB "
     r"raw_tensor_ranges=(?P<raw_gib>[-+0-9.eE]+) GiB ranges=(?P<ranges>\d+)"
@@ -415,6 +420,7 @@ def parse_shadow(log_text: str) -> dict[str, Any]:
     v2_accept1 = 0
     v2_max_margin0 = 0.0
     v2_max_margin1 = 0.0
+    gen_steps: list[dict[str, Any]] = []
     for m in SHADOW_RE.finditer(log_text):
         checks += 1
         if m.group("agree") != "1":
@@ -436,6 +442,43 @@ def parse_shadow(log_text: str) -> dict[str, Any]:
             v2_accept1 += 1
         v2_max_margin0 = max(v2_max_margin0, abs(float(m.group("margin0"))))
         v2_max_margin1 = max(v2_max_margin1, abs(float(m.group("margin1"))))
+    for m in GEN_STEP_PROFILE_RE.finditer(log_text):
+        gen_steps.append({
+            "cycle": int(m.group("cycle")),
+            "pos": int(m.group("pos")),
+            "mtp": int(m.group("mtp")),
+            "accepted": int(m.group("accepted")),
+            "eval_ms": float(m.group("eval_ms")),
+            "generated_before": int(m.group("generated_before")),
+        })
+
+    def gen_step_metric(skip_cycles: int = 0, skip_tokens: int = 0) -> dict[str, Any]:
+        accepted = 0
+        eval_ms = 0.0
+        cycles = 0
+        for step in gen_steps:
+            if step["cycle"] < skip_cycles:
+                continue
+            if step["generated_before"] < skip_tokens:
+                continue
+            accepted += step["accepted"]
+            eval_ms += step["eval_ms"]
+            cycles += 1
+        return {
+            "cycles": cycles,
+            "accepted": accepted,
+            "eval_ms": eval_ms,
+            "tps": (accepted * 1000.0 / eval_ms) if eval_ms > 0.0 else 0.0,
+            "ms_per_token": (eval_ms / accepted) if accepted > 0 else 0.0,
+        }
+
+    gen_step_profile = {
+        "steps": len(gen_steps),
+        "total": gen_step_metric(),
+        "skip_cycles_1": gen_step_metric(skip_cycles=1),
+        "skip_cycles_4": gen_step_metric(skip_cycles=4),
+        "skip_tokens_32": gen_step_metric(skip_tokens=32),
+    }
     return {
         "checks": checks,
         "decision_bad": decision_bad,
@@ -449,6 +492,7 @@ def parse_shadow(log_text: str) -> dict[str, Any]:
         "verify_v2_accept3": v2_accept3,
         "verify_v2_max_margin0": v2_max_margin0,
         "verify_v2_max_margin1": v2_max_margin1,
+        "gen_step_profile": gen_step_profile,
     }
 
 
@@ -1062,6 +1106,16 @@ def print_run_line(result: RunResult) -> None:
             f" v2 checks={shadow['verify_v2_checks']} failed={shadow['verify_v2_failed']} "
             f"a1={shadow['verify_v2_accept1']} a2={shadow['verify_v2_accept2']} "
             f"a3={shadow['verify_v2_accept3']}"
+        )
+    gen_step = shadow.get("gen_step_profile", {})
+    if gen_step.get("steps"):
+        total = gen_step["total"]
+        skip1 = gen_step["skip_cycles_1"]
+        skip32 = gen_step["skip_tokens_32"]
+        shadow_text += (
+            f" steady total={total['tps']:.2f}t/s"
+            f" skip1={skip1['tps']:.2f}t/s"
+            f" skip32tok={skip32['tps']:.2f}t/s"
         )
     status = "OK" if result.rc == 0 else f"FAILED rc={result.rc}"
     print(

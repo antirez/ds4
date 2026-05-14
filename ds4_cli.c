@@ -499,6 +499,8 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     int generated = 0;
     const bool token_trace = getenv("DS4_TOKEN_TRACE") != NULL;
+    const bool gen_step_profile = getenv("DS4_GEN_STEP_PROFILE") != NULL;
+    int gen_step_cycle = 0;
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token = ds4_session_sample(session, cfg->gen.temperature, 0, cfg->gen.top_p, 0.0f, &rng);
@@ -506,8 +508,12 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+        const bool use_mtp_eval =
+            cfg->gen.temperature <= 0.0f &&
+            ds4_engine_mtp_draft_tokens(engine) > 1 &&
+            getenv("DS4_MTP_SPEC_DISABLE") == NULL;
+        const double t_eval0 = gen_step_profile ? cli_now_sec() : 0.0;
+        if (use_mtp_eval) {
             ntok = ds4_session_eval_speculative_argmax(session,
                                                        token,
                                                        max_tokens - generated,
@@ -530,9 +536,26 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             toks[0] = token;
             ntok = 1;
         }
+        const double t_eval1 = gen_step_profile ? cli_now_sec() : 0.0;
 
         bool stop = false;
         const int accepted_start_pos = ds4_session_pos(session) - ntok;
+        if (gen_step_profile) {
+            int measured_accept = 0;
+            for (int j = 0; j < ntok && generated + measured_accept < max_tokens; j++) {
+                if (toks[j] == ds4_token_eos(engine)) break;
+                measured_accept++;
+            }
+            fprintf(stderr,
+                    "ds4: gen step profile cycle=%d pos=%d mtp=%d accepted=%d eval_ms=%.3f generated_before=%d\n",
+                    gen_step_cycle,
+                    accepted_start_pos,
+                    use_mtp_eval ? 1 : 0,
+                    measured_accept,
+                    (t_eval1 - t_eval0) * 1000.0,
+                    generated);
+            gen_step_cycle++;
+        }
         for (int j = 0; j < ntok; j++) {
             if (toks[j] == ds4_token_eos(engine)) {
                 stop = true;
