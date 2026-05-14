@@ -13,7 +13,7 @@ Run:
 
 ```sh
 python3 speed-bench/run_quality_drift_gate.py \
-  --out-dir /tmp/ds4-quality-drift-gate-default-moe-19-19-20
+  --out-dir speed-bench/local-runs/20260514-1215-default-moe-19-19-19-quality-drift
 ```
 
 Fixtures:
@@ -30,7 +30,7 @@ Summary:
 | --- | ---: | ---: | ---: | ---: |
 | standard vs quality | 0 | 1 | 0.618172 | 2.24006 |
 | tensor vs quality | 0 | 1 | 0.618172 | 2.24006 |
-| tensor vs standard | 0 | 0 | 0.066747 | 0.191437 |
+| tensor vs standard | 0 | 0 | 0.136143 | 0.315292 |
 
 Gate status: OK.
 
@@ -40,8 +40,8 @@ The direct equivalence test also passed:
 ./ds4_test --metal-mpp-equivalence
 ```
 
-Result: `top1_mismatch=0`, `greedy_fail=0`, `worst_rms=0.066747`,
-`worst_top20_max_abs=0.191437`.
+Result: `top1_mismatch=0`, `greedy_fail=0`, `worst_rms=0.136143`,
+`worst_top20_max_abs=0.315292`.
 
 ## HC Stable Sigmoid Scope
 
@@ -99,21 +99,21 @@ the fused math unchanged and documents this scope near the helper definitions.
 Run shape:
 
 ```sh
-./ds4-bench -mt auto \
-  --prompt-file speed-bench/promessi_sposi.txt \
-  --ctx-start 512 --ctx-max 8192 --step-mul 2 \
-  --gen-tokens 16 --csv /tmp/ds4-prefill-tensor-default-restored-8192.csv
+CTX_MAX=8192 GEN_TOKENS=16 \
+  OUT_DIR=speed-bench/local-runs/20260514-1235-default-19-19-19-compact \
+  OPEN_CHART=0 \
+  speed-bench/run_metal_tensor_bench.sh
 ```
 
-Original 20/20/22 Tensor default vs standard Metal:
+Current 19/19/19 Tensor default vs standard Metal:
 
 | ctx | standard prefill t/s | tensor prefill t/s | tensor gain | standard gen t/s | tensor gen t/s |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 512 | 261.93 | 329.37 | 25.7% | 37.67 | 38.25 |
-| 1024 | 268.78 | 339.38 | 26.3% | 37.49 | 37.89 |
-| 2048 | 325.15 | 400.24 | 23.1% | 37.00 | 37.03 |
-| 4096 | 335.33 | 395.34 | 17.9% | 33.97 | 33.97 |
-| 8192 | 345.89 | 400.21 | 15.7% | 33.01 | 33.28 |
+| 512 | 267.21 | 334.64 | 25.2% | 38.15 | 38.22 |
+| 1024 | 272.68 | 337.80 | 23.9% | 37.94 | 37.05 |
+| 2048 | 330.41 | 393.48 | 19.1% | 37.40 | 36.94 |
+| 4096 | 341.26 | 386.55 | 13.3% | 34.31 | 34.11 |
+| 8192 | 356.22 | 397.82 | 11.7% | 33.56 | 32.95 |
 
 This keeps the plan focused on prefill. Generation is essentially unchanged.
 
@@ -125,13 +125,15 @@ These were evaluated as env-only candidates and not promoted.
 | --- | --- | --- | --- |
 | `DS4_METAL_MPP_MOE_GATE_START_LAYER=18` plus `DS4_METAL_MPP_MOE_UP_START_LAYER=18` | One run showed +2.2% to +5.7% over Tensor auto, but an immediate control run favored the old layer-20 default by 8.7% to 17.1%. | Five-fixture gate passed with `tensor_vs_standard` worst RMS `0.139912` and worst top20 abs `0.316128`. | Not promoted because the speed win was not stable. |
 | `DS4_METAL_MPP_MOE_GATE_START_LAYER=18` plus `DS4_METAL_MPP_MOE_UP_START_LAYER=18` plus `DS4_METAL_MPP_MOE_DOWN_START_LAYER=20` | Slower than the promoted Tensor auto default by 0.1% to 3.6% in two-repeat median timing. | Not run. | Reject before drift gate. |
-| `DS4_METAL_MPP_MOE_GATE_START_LAYER=19` plus `DS4_METAL_MPP_MOE_UP_START_LAYER=19` plus `DS4_METAL_MPP_MOE_DOWN_START_LAYER=19` | Two-repeat median vs 19/19/20 Tensor auto: +0.3% at 512, +0.8% at 1024, then -0.1%, -1.1%, and -1.0% from 2048..8192. | Not run. | Reject before drift gate. |
+| `DS4_METAL_MPP_MOE_GATE_START_LAYER=18` plus `DS4_METAL_MPP_MOE_UP_START_LAYER=18` with down defaulting to 19 | Two-repeat median vs 19/19/19 Tensor auto: +0.1% at 512, then -0.7%, -1.9%, -3.0%, and -1.3% from 1024..8192. Generation was within -0.9%..+0.6%. | Not run. | Reject before drift gate because it is slower at most measured contexts. |
 | `DS4_METAL_MPP_MOE_TILE_N=64` | Slower than default by 3.3% to 15.6%. | Not run. | Reject before drift gate. |
+| `DS4_METAL_MPP_MOE_DOWN_START_LAYER=18` with gate/up/down defaulting to 19/19/19 | Two-repeat median vs 19/19/19 Tensor auto: -2.1% at 512, -3.1% at 1024, -3.3% at 2048, -0.7% at 4096, and +1.7% at 8192. Generation was within -1.2%..+0.4%. | Not run. | Reject before drift gate because it is slower at most measured contexts. |
 | `DS4_METAL_MPP_F16_PAIR=1` | Slower than default by 0.9% to 8.6%. | Previously known safe, but not rerun here. | Keep opt-in. |
 | `DS4_METAL_MPP_ATTN_OUT_TILE_N=32` | Slower than default by 1.1% to 16.4%. | Not run. | Keep default tile 64. |
 | `DS4_METAL_MPP_ATTN_OUT_FILTER=layer=31..42` | Two-repeat median vs 32..42 Tensor auto: flat at 512, then slower by 0.3% to 1.4% from 1024..8192. | Not run. | Reject before drift gate; keep attention-output at 32..42. |
+| `DS4_METAL_MPP_MOE_PAIR_GATE_UP=1` with gate/up/down defaulting to 19/19/19 | Two-repeat median vs 19/19/19 Tensor auto: -6.2% at 512, -3.4% at 1024, -2.7% at 2048, -2.5% at 4096, and -2.1% at 8192. Generation was within -0.2%..+1.2%. | Not run. | Reject before drift gate because the paired dispatch is consistently slower. |
 | `DS4_METAL_EXPERIMENTAL_MOE_MATMUL=1` plus `DS4_METAL_EXPERIMENTAL_MOE_MATMUL_START_LAYER=10` | Two-repeat median vs current Tensor auto: +7.5% at 512, +8.4% at 1024, +6.0% at 2048, +3.8% at 4096, +4.8% at 8192. Generation was -2.8%, -1.0%, +1.3%, +1.1%, +0.7%. | Failed the five-fixture gate: `long_memory_archive` top-1 changed and greedy differed at step 0; `tensor_vs_standard` also had one top-1 and one greedy mismatch. | Reject despite the speed because it violates the no-new-top1/no-new-greedy rule. |
-| `DS4_METAL_EXPERIMENTAL_MOE_MATMUL=1` plus `DS4_METAL_EXPERIMENTAL_MOE_MATMUL_START_LAYER=12` | Two-repeat median vs current Tensor auto: +12.2% at 512, +8.5% at 1024, +8.3% at 2048, +3.2% at 4096, +1.1% at 8192. Generation was +3.4%, -0.2%, +1.5%, -4.6%, -3.6%. | Full `./ds4_test --metal-mpp-equivalence` passed with no top-1 or greedy mismatch, but drift rose to worst RMS `0.300474` and worst top20 abs `1.00957`. | Reject before the full quality gate: long-context speed is weak and drift is much worse than the current `19/19/20` default. |
+| `DS4_METAL_EXPERIMENTAL_MOE_MATMUL=1` plus `DS4_METAL_EXPERIMENTAL_MOE_MATMUL_START_LAYER=12` | Two-repeat median vs current Tensor auto: +12.2% at 512, +8.5% at 1024, +8.3% at 2048, +3.2% at 4096, +1.1% at 8192. Generation was +3.4%, -0.2%, +1.5%, -4.6%, -3.6%. | Full `./ds4_test --metal-mpp-equivalence` passed with no top-1 or greedy mismatch, but drift rose to worst RMS `0.300474` and worst top20 abs `1.00957`. | Reject before the full quality gate: long-context speed is weak and drift is much worse than the current conservative default. |
 | `DS4_METAL_EXPERIMENTAL_MOE_MATMUL=1` plus `DS4_METAL_EXPERIMENTAL_MOE_MATMUL_START_LAYER=15` | Two-repeat median vs current Tensor auto: +2.3% at 512, +2.0% at 1024, +1.5% at 2048, +2.6% at 4096, +2.0% at 8192. Generation was -2.7%, +0.0%, -1.8%, +1.1%, +1.4%. | Full `./ds4_test --metal-mpp-equivalence` passed with no top-1 or greedy mismatch, but drift rose to worst RMS `0.229322` and worst top20 abs `0.511806`. | Reject before the full quality gate: speed is marginal and drift is still worse than default. |
 | `DS4_METAL_EXPERIMENTAL_MOE_MATMUL=1` plus `DS4_METAL_EXPERIMENTAL_MOE_MATMUL_START_LAYER=17` | Two-repeat median vs current Tensor auto: +2.2% at 512, +0.5% at 1024, +0.8% at 2048, +1.2% at 4096, +0.7% at 8192. Generation was within -1.7%..+0.5%. | Full `./ds4_test --metal-mpp-equivalence` passed with no top-1 or greedy mismatch, but drift rose to worst RMS `0.190587` and worst top20 abs `0.560192`. | Reject before the full quality gate: speed is within noise and drift is worse than default. |
 
@@ -139,14 +141,15 @@ These were evaluated as env-only candidates and not promoted.
 
 | Candidate | Speed result | Drift result | Decision |
 | --- | --- | --- | --- |
-| `DS4_METAL_MPP_MOE_GATE_START_LAYER=19` plus `DS4_METAL_MPP_MOE_UP_START_LAYER=19` plus `DS4_METAL_MPP_MOE_DOWN_START_LAYER=21` | Two-repeat median vs current Tensor auto: +0.6% at 512, +0.8% at 1024, +2.3% at 2048, +2.0% at 4096, +1.6% at 8192. Generation was within -1.4%..+0.5%. | Five-fixture gate passed, first as env candidate and again as the env-free default after promotion. `tensor_vs_quality`: top1 mismatches `0`, greedy mismatches `1` matching standard-vs-quality, worst RMS `0.618172`, worst top20 abs `2.24006`. `tensor_vs_standard`: top1 mismatches `0`, greedy mismatches `0`, worst RMS `0.176030`, worst top20 abs `0.360397`. | Promoted, then superseded by the lower-drift 19/19/20 window. |
-| `DS4_METAL_MPP_MOE_GATE_START_LAYER=19` plus `DS4_METAL_MPP_MOE_UP_START_LAYER=19` plus `DS4_METAL_MPP_MOE_DOWN_START_LAYER=20` | Two-repeat median vs 19/19/21 Tensor auto: +0.3% at 512, +1.2% at 1024, +0.9% at 2048, +0.4% at 4096, +0.2% at 8192. Generation was within -0.9%..+1.0%. | Five-fixture gate passed, first as env candidate and again as the env-free default after promotion. `tensor_vs_quality`: top1 mismatches `0`, greedy mismatches `1` matching standard-vs-quality, worst RMS `0.618172`, worst top20 abs `2.24006`. `tensor_vs_standard`: top1 mismatches `0`, greedy mismatches `0`, worst RMS `0.066747`, worst top20 abs `0.191437`. | Promoted as the new routed-MoE default window: gate/up from layer 19, down from layer 20. |
+| `DS4_METAL_MPP_MOE_GATE_START_LAYER=19` plus `DS4_METAL_MPP_MOE_UP_START_LAYER=19` plus `DS4_METAL_MPP_MOE_DOWN_START_LAYER=21` | Two-repeat median vs current Tensor auto: +0.6% at 512, +0.8% at 1024, +2.3% at 2048, +2.0% at 4096, +1.6% at 8192. Generation was within -1.4%..+0.5%. | Five-fixture gate passed, first as env candidate and again as the env-free default after promotion. `tensor_vs_quality`: top1 mismatches `0`, greedy mismatches `1` matching standard-vs-quality, worst RMS `0.618172`, worst top20 abs `2.24006`. `tensor_vs_standard`: top1 mismatches `0`, greedy mismatches `0`, worst RMS `0.176030`, worst top20 abs `0.360397`. | Promoted, then superseded by the lower-drift 19/19/20 window and the faster 19/19/19 window. |
+| `DS4_METAL_MPP_MOE_GATE_START_LAYER=19` plus `DS4_METAL_MPP_MOE_UP_START_LAYER=19` plus `DS4_METAL_MPP_MOE_DOWN_START_LAYER=20` | Two-repeat median vs 19/19/21 Tensor auto: +0.3% at 512, +1.2% at 1024, +0.9% at 2048, +0.4% at 4096, +0.2% at 8192. Generation was within -0.9%..+1.0%. | Five-fixture gate passed, first as env candidate and again as the env-free default after promotion. `tensor_vs_quality`: top1 mismatches `0`, greedy mismatches `1` matching standard-vs-quality, worst RMS `0.618172`, worst top20 abs `2.24006`. `tensor_vs_standard`: top1 mismatches `0`, greedy mismatches `0`, worst RMS `0.066747`, worst top20 abs `0.191437`. | Promoted, then superseded by the slightly faster 19/19/19 window. |
+| `DS4_METAL_MPP_MOE_DOWN_START_LAYER=19` with gate/up unchanged at 19 | Two-repeat median vs 19/19/20 Tensor auto: +0.9% at 512, +1.2% at 1024, +1.1% at 2048, +0.4% at 4096, +0.9% at 8192. Generation was within -1.0%..+1.4%. | Five-fixture env-candidate gate passed. `tensor_vs_quality`: top1 mismatches `0`, greedy mismatches `1` matching standard-vs-quality, worst RMS `0.618172`, worst top20 abs `2.24006`. `tensor_vs_standard`: top1 mismatches `0`, greedy mismatches `0`, worst RMS `0.136143`, worst top20 abs `0.315292`. | Promoted as the next routed-MoE default window: gate/up/down from layer 19. |
 
 ## Default-Off Candidates
 
 | Candidate | Speed result | Drift result | Decision |
 | --- | --- | --- | --- |
-| `DS4_METAL_EXPERIMENTAL_MOE_MATMUL=1` | Two-repeat median vs current Tensor auto: +15.9% at 512, +19.7% at 1024, +12.5% at 2048, +6.8% at 4096, +11.7% at 8192. Generation was -4.9%, -1.5%, -3.5%, -0.9%, -1.7%. | Five-fixture gate passed. `tensor_vs_quality` stayed inside the current standard-vs-quality envelope with top1 mismatches `0`, greedy mismatches `1`, worst RMS `0.618172`, and worst top20 abs `2.24006`. `tensor_vs_standard` had no top1 or greedy mismatch, but drift increased to worst RMS `0.669241` and worst top20 abs `1.30664`. | Keep default-off until an eval confirms the larger Tensor-vs-standard logit movement is acceptable. This is the best prefill candidate so far, but not yet promoted over the lower-drift 19/19/20 default. |
+| `DS4_METAL_EXPERIMENTAL_MOE_MATMUL=1` | Two-repeat median vs current Tensor auto: +15.9% at 512, +19.7% at 1024, +12.5% at 2048, +6.8% at 4096, +11.7% at 8192. Generation was -4.9%, -1.5%, -3.5%, -0.9%, -1.7%. | Five-fixture gate passed. `tensor_vs_quality` stayed inside the current standard-vs-quality envelope with top1 mismatches `0`, greedy mismatches `1`, worst RMS `0.618172`, and worst top20 abs `2.24006`. `tensor_vs_standard` had no top1 or greedy mismatch, but drift increased to worst RMS `0.669241` and worst top20 abs `1.30664`. | Keep default-off until an eval confirms the larger Tensor-vs-standard logit movement is acceptable. This is the best prefill candidate so far, but not yet promoted over the lower-drift conservative default. |
 
 ## Profile Signal
 

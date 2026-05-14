@@ -376,7 +376,7 @@ Current Tensor route status balances drift with prefill throughput: `auto`
 enables F16 compressor, attention-output low projection, and routed-MoE Tensor.
 Attention-output low projection uses layers 32..42 by default, and routed-MoE
 Tensor uses the lower-drift conservative default window: gate/up from layer 19
-and down from layer 20. This gives up some of the all-layer prefill speedup to
+and down from layer 19. This gives up some of the all-layer prefill speedup to
 avoid the larger drift seen with layer-0 routed-MoE Tensor windows while keeping
 the dense Q8_0 prefill route on the legacy kernel. The attention-output low
 Tensor kernels stage activation tiles through half to match the legacy Metal
