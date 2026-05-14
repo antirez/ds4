@@ -916,6 +916,7 @@ template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_5")]] kernel mul_mv_ext_q4_f
 
 constant bool FC_mul_mm_bc_inp [[function_constant(FC_MUL_MM + 0)]];
 constant bool FC_mul_mm_bc_out [[function_constant(FC_MUL_MM + 1)]];
+constant bool FC_mul_mm_m5_sgmatrix [[function_constant(FC_MUL_MM_M5_SGMATRIX)]];
 
 // Tiled matrix-matrix kernel used for prompt batches larger than 8. DS4 uses
 // this to turn prefill into large simdgroup matrix operations; each block_q
@@ -1054,20 +1055,21 @@ kernel void kernel_mul_mm(
         threadgroup const S0 * lsma = (sa + 4*64*(sgitg%2));
         threadgroup const S1 * lsmb = (sb + 2*64*(sgitg/2));
 
+        // M5 compiles this as a tighter simdgroup_matrix load/MMA chain without no-op barriers.
         FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
-            simdgroup_barrier(mem_flags::mem_none);
+            if (!FC_mul_mm_m5_sgmatrix) simdgroup_barrier(mem_flags::mem_none);
 
             FOR_UNROLL (short i = 0; i < 4; i++) {
                 simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
             }
 
-            simdgroup_barrier(mem_flags::mem_none);
+            if (!FC_mul_mm_m5_sgmatrix) simdgroup_barrier(mem_flags::mem_none);
 
             FOR_UNROLL (short i = 0; i < 2; i++) {
                 simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
             }
 
-            simdgroup_barrier(mem_flags::mem_none);
+            if (!FC_mul_mm_m5_sgmatrix) simdgroup_barrier(mem_flags::mem_none);
 
             FOR_UNROLL (short i = 0; i < 8; i++){
                 simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
