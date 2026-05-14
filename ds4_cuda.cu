@@ -96,6 +96,7 @@ static int g_cuda_serial_f16_matmul;
 static int g_cuda_serial_router;
 static int g_cuda_no_f16_pair_matmul;
 static int g_cuda_no_q8_batch_warp;
+static int g_cuda_q8_cache_x;
 static int g_cuda_disable_shared_gate_up_pair;
 static int g_cuda_no_warp_router_select;
 static int g_cuda_no_parallel_router_select;
@@ -1238,6 +1239,7 @@ extern "C" int ds4_gpu_init(void) {
     g_cuda_serial_router = getenv("DS4_CUDA_SERIAL_ROUTER") != NULL;
     g_cuda_no_f16_pair_matmul = getenv("DS4_CUDA_NO_F16_PAIR_MATMUL") != NULL;
     g_cuda_no_q8_batch_warp = getenv("DS4_CUDA_NO_Q8_BATCH_WARP") != NULL;
+    g_cuda_q8_cache_x = getenv("DS4_CUDA_Q8_CACHE_X") != NULL;
     g_cuda_disable_shared_gate_up_pair = getenv("DS4_CUDA_DISABLE_SHARED_GATE_UP_PAIR") != NULL;
     g_cuda_no_warp_router_select = getenv("DS4_CUDA_NO_WARP_ROUTER_SELECT") != NULL;
     g_cuda_no_parallel_router_select = getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") != NULL;
@@ -1248,6 +1250,10 @@ extern "C" int ds4_gpu_init(void) {
         g_cuda_sm_major = prop.major;
         g_cuda_sm_minor = prop.minor;
         g_cuda_gb10_device = strstr(prop.name, "GB10") != NULL;
+        if ((g_cuda_gb10_device || (prop.major == 12 && prop.minor == 1)) &&
+            getenv("DS4_CUDA_NO_Q8_CACHE_X") == NULL) {
+            g_cuda_q8_cache_x = 1;
+        }
         fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d)\n",
                 prop.name, prop.major, prop.minor);
         if (cuda_use_ordered_f16_matmul() == 0 &&
@@ -1987,6 +1993,44 @@ __global__ static void matmul_q8_0_preq_warp8_kernel(
         const int8_t *xqb = xq + b * 32;
         int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
         acc += __half2float(*scale_h) * xscale[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) out[row] = acc;
+}
+
+__global__ static void matmul_q8_0_preq_warp8_cached_x_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks,
+        int use_dp4a) {
+    extern __shared__ unsigned char smem[];
+    int8_t *sxq = (int8_t *)smem;
+    float *sxscale = (float *)(smem + blocks * 32u);
+    for (uint64_t i = threadIdx.x; i < blocks * 32u; i += blockDim.x) {
+        sxq[i] = xq[i];
+    }
+    for (uint64_t i = threadIdx.x; i < blocks; i += blockDim.x) {
+        sxscale[i] = xscale[i];
+    }
+    __syncthreads();
+
+    uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + row * blocks * 34;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        uint64_t i0 = b * 32;
+        uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
+        const __half *scale_h = (const __half *)(wr + b * 34);
+        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+        const int8_t *xqb = sxq + b * 32;
+        int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+        acc += __half2float(*scale_h) * sxscale[b] * (float)dot;
     }
     acc = warp_sum_f32(acc);
     if (lane == 0) out[row] = acc;
@@ -5877,6 +5921,19 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
     if (n_tok == 1) {
+        if (g_cuda_q8_cache_x && out_dim >= 1024u && blocks <= 256u) {
+            const uint64_t smem_bytes = blocks * 32u + blocks * sizeof(float);
+            matmul_q8_0_preq_warp8_cached_x_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, (unsigned)smem_bytes>>>(
+                    (float *)out->ptr,
+                    reinterpret_cast<const unsigned char *>(wptr),
+                    xq,
+                    xscale,
+                    in_dim,
+                    out_dim,
+                    blocks,
+                    use_dp4a);
+            return cuda_ok(cudaGetLastError(), "matmul_q8_0 cached-x warp launch");
+        }
         matmul_q8_0_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),

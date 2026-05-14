@@ -96,6 +96,31 @@ half, 20 t/s is realistic; without that class of change, the measured ceiling of
 the current design is closer to the mid/high 16 t/s range in the interactive
 CLI and mid 14 t/s in the conservative 8k/64 bench.
 
+## Experimental graph-decode branch
+
+The `gx10-cuda-graph-decode` branch starts from the stable tuning branch and is
+reserved for heavier CUDA decode work. The first accepted experiment is a
+GB10-only cached-input variant of the one-token Q8 matvec for wide projections
+(`out_dim >= 1024`). It copies the already-quantized activation row and scales
+to shared memory once per CUDA block, then lets the eight row warps reuse that
+block-local copy. This targets repeated `xq` traffic in `attn_q_a`, `attn_q_b`,
+and the output logits projection without touching Metal or batched prefill.
+
+Local 8k/64 checks measured:
+
+- cached wide Q8 default on GB10: 14.49-14.53 t/s generation
+- disabled with `DS4_CUDA_NO_Q8_CACHE_X=1`: 14.42-14.46 t/s generation
+
+Rejected variants from the same pass:
+
+- applying cached `xq` to the Q8 pair matvec used by shared gate/up; it measured
+  14.42 t/s versus 14.46 t/s for the existing pair path
+- applying cached `xq` to the HC-expand Q8 path; it was effectively neutral
+- a 16-row half-warp Q8 matvec variant; it measured 14.43 t/s and 16.08 t/s in
+  the CLI check, both below the existing warp-per-row path
+- a session sampling scratch buffer to avoid recomputing default `top_p=1`
+  probabilities; it did not move the sampled CLI throughput enough to keep
+
 ## Fork scan
 
 The relevant fork ideas were:
