@@ -121,6 +121,39 @@ Rejected variants from the same pass:
 - a session sampling scratch buffer to avoid recomputing default `top_p=1`
   probabilities; it did not move the sampled CLI throughput enough to keep
 
+The second accepted experiment ports and narrows several CUDA-only decode
+fast-paths from the fork scan:
+
+- HC pre + output norm fusion for the attention and FFN HC transitions. This
+  replaces the decode sequence `rms_norm_plain -> F16 24-row matmul ->
+  hc_split_weighted_sum_norm` with a two-launch CUDA helper. It is enabled by
+  default on non-Apple builds and can be disabled with
+  `DS4_CUDA_NO_FUSED_HC_PRE=1`.
+- Q head RMS norm + RoPE fusion. This removes one launch in the Q path while
+  preserving the old path for `Qnorm` diagnostics. Disable with
+  `DS4_CUDA_NO_Q_NORM_ROPE_FUSED=1`.
+- KV RoPE + FP8 no-PE quantization + raw-cache store fusion. This keeps the
+  reference path for `DS4_METAL_DISABLE_KV_FUSION=1` and `KVrope` diagnostics.
+  Disable with `DS4_CUDA_NO_KV_ROPE_STORE_FUSED=1`.
+- Attention-output low projection prequantization with inverse RoPE applied
+  on the fly. This is used only when the existing attention-output/HC fusion is
+  active and no `kqv_back` diagnostic dump is requested. Disable with
+  `DS4_CUDA_NO_ATTN_OUTPUT_ROPE_LOW_FUSED=1`.
+- Decode diagnostic dump environment lookups are cached, avoiding repeated
+  `getenv()` calls in the release hot path when dumps are disabled.
+
+Local 8k/64 checks after these changes measured:
+
+- all decode fast-paths enabled: 15.49 t/s generation, 392.53 t/s prefill
+- HC pre fusion disabled only: 14.56 t/s generation
+- Q/KV/attention-output micro-fusions disabled together: 14.47 t/s generation
+
+`DS4_METAL_GRAPH_TOKEN_PROFILE=1` on a six-token 8k run now reports steady
+decode tokens around 63-65 ms: encode/enqueue is about 19-20 ms on most tokens,
+GPU drain/synchronize is about 44-45 ms, and logits readback remains about
+0.02 ms. The branch has therefore removed several milliseconds of host encode
+work, but the GPU side is still too large for a reliable 20 t/s decode rate.
+
 ## Fork scan
 
 The relevant fork ideas were:
