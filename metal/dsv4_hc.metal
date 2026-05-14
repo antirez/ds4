@@ -77,11 +77,17 @@ struct ds4_metal_args_dsv4_hc_expand {
     int32_t  has_add;
 };
 
-// Numerically stable sigmoid. The naive form 1/(1+exp(-z)) overflows for large
-// negative z (exp(-z) blows up); replacing it with the 0.5*(tanh(z/2)+1) identity
-// keeps the value bounded in [0, 1] across the entire float range. Gated by
-// DS4_METAL_HC_STABLE so we can A/B vs the historical form on M5 Max where the
-// faster ALU is more likely to push HC mixer inputs into the unstable regime.
+// Numerically stable sigmoid for the standalone split/sinkhorn path. The naive
+// form 1/(1+exp(-z)) overflows for large negative z (exp(-z) blows up);
+// replacing it with the 0.5*(tanh(z/2)+1) identity keeps the value bounded in
+// [0, 1] across the entire float range. Gated by DS4_METAL_HC_STABLE so we can
+// A/B vs the historical form on M5 Max where the faster ALU is more likely to
+// push HC mixer inputs into the unstable regime.
+//
+// Do not automatically use these helpers in the fused HC decode kernels below:
+// routing the fused vector sites through the tanh form produced non-finite
+// logits on M5 Max, while the historical inline exp form remains finite and is
+// the decode throughput baseline.
 #ifdef DS4_METAL_HC_STABLE
 static inline float  ds4_hc_sigmoid(float  z)  { return 0.5f * tanh(0.5f * z) + 0.5f; }
 static inline float4 ds4_hc_sigmoid(float4 z)  { return 0.5f * tanh(0.5f * z) + 0.5f; }

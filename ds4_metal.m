@@ -176,8 +176,6 @@ static NSUInteger g_attn_out_group_ids_bytes;
 static int g_initialized;
 static int g_quality_mode;
 static ds4_mpp_mode g_mpp_mode = DS4_MPP_AUTO;
-static int g_mpp_q8_reported;
-static int g_mpp_q8_partial_skip_reported;
 static int g_mpp_f16_reported;
 static int g_mpp_f16_pair_reported;
 static int g_mpp_attn_out_reported;
@@ -965,21 +963,8 @@ static int ds4_gpu_use_compressor_pair_nr4(void) {
 
 static int ds4_gpu_device_name_contains(const char *needle);
 
-static int ds4_gpu_mpp_q8_0_default_target(void) {
-    // The Metal 4 cooperative-tensor Q8_0 matmul on M5 Max produces logprob
-    // drift versus the legacy simdgroup_multiply_accumulate path (measured
-    // rms=0.150, max_abs=0.75 on the short reasoning prompt; bit-exact match
-    // recovered by disabling just this route). The other Tensor routes
-    // (F16 compressor, attention-output, MoE) are bit-clean. Default the
-    // Q8_0 Tensor matmul to OFF on M5; opt back in with DS4_METAL_MPP_Q8_0_ENABLE=1.
-    if (ds4_gpu_device_name_contains("M5")) return 0;
-    return 1;
-}
-
 // F16 compressor Tensor matmul default. Bit-clean on M5 vs the legacy
 // simdgroup path, so this stays default-on independent of device.
-// Kept as a separate helper to avoid coupling the F16 default to the
-// Q8_0 carve-out above.
 static int ds4_gpu_mpp_f16_default_target(void) {
     return 1;
 }
@@ -1022,32 +1007,6 @@ static int ds4_gpu_env_bool(const char *name) {
         g_mpp_invalid_env_reported = 1;
     }
     return 1;
-}
-
-static int ds4_gpu_mpp_low_power_profile(void) {
-    const int disabled = ds4_gpu_env_bool("DS4_METAL_MPP_LOW_POWER_DISABLE");
-    if (disabled > 0) return 0;
-
-    const int enabled = ds4_gpu_env_bool("DS4_METAL_MPP_LOW_POWER_ENABLE");
-    if (enabled >= 0) return enabled > 0;
-
-    static int detected = -1;
-    static int reported;
-    if (detected < 0) {
-        detected = 0;
-        @autoreleasepool {
-            NSProcessInfo *info = [NSProcessInfo processInfo];
-            if ([info respondsToSelector:@selector(isLowPowerModeEnabled)]) {
-                detected = [info isLowPowerModeEnabled] ? 1 : 0;
-            }
-        }
-    }
-    if (detected && !reported) {
-        fprintf(stderr,
-                "ds4: Metal low-power Tensor profile active; widening Q8_0 prefill route\n");
-        reported = 1;
-    }
-    return detected;
 }
 
 static int ds4_gpu_use_indexed_attention_rb4(void) {
@@ -1113,29 +1072,6 @@ static const char *ds4_gpu_mpp_enabled_reason(void) {
     return " by default";
 }
 
-static int ds4_gpu_mpp_q8_0_policy_enabled(void) {
-    return ds4_gpu_mpp_route_enabled(ds4_gpu_mpp_q8_0_default_target(),
-                                       "DS4_METAL_MPP_Q8_0_ENABLE",
-                                       "DS4_METAL_MPP_Q8_0_DISABLE");
-}
-
-static int ds4_gpu_use_mpp_q8_0_matmul(void) {
-    const int enabled = ds4_gpu_mpp_q8_0_policy_enabled();
-    if (enabled && !g_mpp_q8_reported) {
-        fprintf(stderr, "ds4: Metal Tensor Q8_0 prefill matmul enabled%s\n",
-                ds4_gpu_mpp_enabled_reason());
-        g_mpp_q8_reported = 1;
-    }
-    return enabled;
-}
-
-static int ds4_gpu_mpp_q8_0_partial_tiles_enabled(void) {
-    if (ds4_gpu_mpp_fast_profile()) return 1;
-    const int enabled = ds4_gpu_env_bool("DS4_METAL_MPP_Q8_0_PARTIAL_ENABLE");
-    if (enabled >= 0) return enabled > 0;
-    return 1;
-}
-
 static uint32_t ds4_gpu_mpp_tile_n_env(const char *name, uint32_t fallback) {
     const char *env = getenv(name);
     if (!env || !env[0]) return fallback;
@@ -1150,22 +1086,16 @@ static uint32_t ds4_gpu_mpp_tile_n_env(const char *name, uint32_t fallback) {
     return fallback;
 }
 
-static uint32_t ds4_gpu_mpp_q8_0_tile_n(void) {
-    return ds4_gpu_mpp_tile_n_env("DS4_METAL_MPP_Q8_0_TILE_N", 64);
-}
-
-static uint32_t ds4_gpu_mpp_q8_0_tile_n_for_tokens(uint64_t n_tok) {
-    const char *env = getenv("DS4_METAL_MPP_Q8_0_TILE_N");
-    if (env && env[0]) return ds4_gpu_mpp_q8_0_tile_n();
-    return n_tok >= 4096u ? 32u : 64u;
-}
-
 static uint32_t ds4_gpu_mpp_attn_out_tile_n(void) {
     return ds4_gpu_mpp_tile_n_env("DS4_METAL_MPP_ATTN_OUT_TILE_N", 64);
 }
 
 static uint32_t ds4_gpu_mpp_moe_tile_n(void) {
     return ds4_gpu_mpp_tile_n_env("DS4_METAL_MPP_MOE_TILE_N", 32);
+}
+
+static int ds4_gpu_mpp_experimental_moe_matmul(void) {
+    return ds4_gpu_env_bool("DS4_METAL_EXPERIMENTAL_MOE_MATMUL") > 0;
 }
 
 static int ds4_gpu_mpp_moe_fast_layout(void) {
@@ -1182,11 +1112,6 @@ static int ds4_gpu_mpp_direct_rhs(void) {
     const int enabled = ds4_gpu_env_bool("DS4_METAL_MPP_DIRECT_RHS");
     if (enabled >= 0) return enabled > 0;
     return 1;
-}
-
-static int ds4_gpu_mpp_q8_0_direct_rhs(void) {
-    return ds4_gpu_mpp_direct_rhs() ||
-           ds4_gpu_env_bool("DS4_METAL_MPP_Q8_0_DIRECT_RHS") > 0;
 }
 
 static int ds4_gpu_mpp_f16_direct_rhs(void) {
@@ -1230,16 +1155,6 @@ static int ds4_gpu_mpp_context_layer(void) {
 static int ds4_gpu_mpp_late_safe_context_range(int first_layer) {
     const int layer = ds4_gpu_mpp_context_layer();
     return layer >= first_layer && layer <= 42;
-}
-
-static int ds4_gpu_mpp_q8_0_late_safe_context(void) {
-    const int layer = ds4_gpu_mpp_context_layer();
-    if (layer >= 38 && layer <= 42) return 1;
-    if (layer >= 32 && layer <= 37 &&
-        strstr(g_mpp_compare_context, "attn_q_b") != NULL) {
-        return 1;
-    }
-    return 0;
 }
 
 static int ds4_gpu_mpp_attn_out_late_safe_context(void) {
@@ -1339,35 +1254,6 @@ static int ds4_gpu_mpp_context_matches_filter(
     return 0;
 }
 
-static int ds4_gpu_mpp_q8_0_context_matches_filter(uint64_t n_tok) {
-    (void)n_tok;
-    const char *filter = getenv("DS4_METAL_MPP_Q8_0_FILTER");
-    const int filter_set = filter && filter[0];
-    const int default_match =
-        (ds4_gpu_mpp_fast_profile() ||
-         (!filter_set && ds4_gpu_mpp_low_power_profile()))
-            ? 1
-            : ds4_gpu_mpp_q8_0_late_safe_context();
-    return ds4_gpu_mpp_context_matches_filter("DS4_METAL_MPP_Q8_0_FILTER",
-                                                default_match,
-                                                ds4_gpu_mpp_q8_0_late_safe_context());
-}
-
-static int ds4_gpu_can_use_mpp_q8_0_matmul(uint64_t n_tok) {
-    if (n_tok <= 8) return 0;
-    if (!ds4_gpu_use_mpp_q8_0_matmul()) return 0;
-    if (!ds4_gpu_mpp_q8_0_context_matches_filter(n_tok)) return 0;
-    if ((n_tok % 32u) == 0 || ds4_gpu_mpp_q8_0_partial_tiles_enabled()) return 1;
-
-    if (!g_mpp_q8_partial_skip_reported) {
-        fprintf(stderr,
-                "ds4: Metal Tensor Q8_0 prefill matmul skipping partial token tiles; "
-                "set DS4_METAL_MPP_Q8_0_PARTIAL_ENABLE=1 to test them\n");
-        g_mpp_q8_partial_skip_reported = 1;
-    }
-    return 0;
-}
-
 static int ds4_gpu_use_mpp_f16_compressor_matmul(void) {
     const int enabled = ds4_gpu_mpp_route_enabled(ds4_gpu_mpp_f16_default_target(),
                                                     "DS4_METAL_MPP_F16_ENABLE",
@@ -1404,9 +1290,9 @@ enum {
     DS4_METAL_MOE_MPP_UP   = 1 << 1,
     DS4_METAL_MOE_MPP_DOWN = 1 << 2,
 
-    DS4_METAL_MOE_MPP_DEFAULT_GATE_LAYER = 20,
-    DS4_METAL_MOE_MPP_DEFAULT_UP_LAYER   = 20,
-    DS4_METAL_MOE_MPP_DEFAULT_DOWN_LAYER = 22,
+    DS4_METAL_MOE_MPP_DEFAULT_GATE_LAYER = 19,
+    DS4_METAL_MOE_MPP_DEFAULT_UP_LAYER   = 19,
+    DS4_METAL_MOE_MPP_DEFAULT_DOWN_LAYER = 20,
     DS4_METAL_MOE_MPP_FAST_GATE_LAYER    = 0,
     DS4_METAL_MOE_MPP_FAST_UP_LAYER      = 0,
     DS4_METAL_MOE_MPP_FAST_DOWN_LAYER    = 0,
@@ -1490,13 +1376,17 @@ static int ds4_gpu_mpp_routed_moe_mask_for_layer(uint32_t layer_index) {
 
     if (ds4_gpu_mpp_routed_moe_default_policy()) {
         const int fast_profile = ds4_gpu_mpp_fast_profile();
-        const int down_fallback = fast_profile ?
+        const int experimental_moe_matmul = ds4_gpu_mpp_experimental_moe_matmul();
+        const int experimental_start = ds4_gpu_mpp_layer_env(
+                "DS4_METAL_EXPERIMENTAL_MOE_MATMUL_START_LAYER",
+                0);
+        const int down_fallback = experimental_moe_matmul ? experimental_start : fast_profile ?
             DS4_METAL_MOE_MPP_FAST_DOWN_LAYER :
             DS4_METAL_MOE_MPP_DEFAULT_DOWN_LAYER;
-        const int up_fallback = fast_profile ?
+        const int up_fallback = experimental_moe_matmul ? experimental_start : fast_profile ?
             DS4_METAL_MOE_MPP_FAST_UP_LAYER :
             DS4_METAL_MOE_MPP_DEFAULT_UP_LAYER;
-        const int gate_fallback = fast_profile ?
+        const int gate_fallback = experimental_moe_matmul ? experimental_start : fast_profile ?
             DS4_METAL_MOE_MPP_FAST_GATE_LAYER :
             DS4_METAL_MOE_MPP_DEFAULT_GATE_LAYER;
         const int down_start = ds4_gpu_mpp_moe_start_layer(
@@ -1510,7 +1400,8 @@ static int ds4_gpu_mpp_routed_moe_mask_for_layer(uint32_t layer_index) {
                 gate_fallback);
         if (!g_mpp_moe_ranges_reported) {
             fprintf(stderr,
-                    "ds4: Metal Tensor routed MoE default ranges down=%d..end up=%d..end gate=%d..end\n",
+                    "ds4: Metal Tensor routed MoE %s ranges down=%d..end up=%d..end gate=%d..end\n",
+                    experimental_moe_matmul ? "experimental matmul" : "default",
                     down_start,
                     up_start,
                     gate_start);
@@ -2107,7 +1998,6 @@ void ds4_gpu_print_memory_report(const char *label) {
             g_metal4_tensor_api_enabled ? "enabled" :
                 (g_metal4_tensor_api_compile_supported ? "available" : "disabled"),
             g_metal4_m5_neural_accelerators_hint ? "likely" : "not detected");
-    const int mpp_q8 = ds4_gpu_mpp_q8_0_policy_enabled();
     const int mpp_f16 = ds4_gpu_mpp_route_enabled(ds4_gpu_mpp_f16_default_target(),
                                                     "DS4_METAL_MPP_F16_ENABLE",
                                                     "DS4_METAL_MPP_F16_DISABLE");
@@ -2121,8 +2011,7 @@ void ds4_gpu_print_memory_report(const char *label) {
             g_quality_mode ? " (disabled by --quality)" : "",
             !g_metal4_tensor_api_enabled ? " (tensor API unavailable)" : "");
     fprintf(stderr,
-            "ds4:   Metal Tensor routes q8_0=%s f16_compressor=%s attn_out=%s moe_gate=%s moe_up=%s moe_down=%s\n",
-            mpp_q8 ? "on" : "off",
+            "ds4:   Metal Tensor routes f16_compressor=%s attn_out=%s moe_gate=%s moe_up=%s moe_down=%s\n",
             mpp_f16 ? "on" : "off",
             mpp_attn_out ? "on" : "off",
             (mpp_moe & DS4_METAL_MOE_MPP_GATE) ? "on" : "off",
@@ -2158,8 +2047,6 @@ void ds4_gpu_print_memory_report(const char *label) {
 }
 
 static void ds4_gpu_mpp_reset_reports(void) {
-    g_mpp_q8_reported = 0;
-    g_mpp_q8_partial_skip_reported = 0;
     g_mpp_f16_reported = 0;
     g_mpp_f16_pair_reported = 0;
     g_mpp_attn_out_reported = 0;
@@ -6256,51 +6143,6 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
     return 1;
 }
 
-static void ds4_gpu_mpp_compare_q8_0_matmul(
-        ds4_gpu_tensor       *out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        uint64_t                n_tok) {
-    if (!ds4_gpu_mpp_compare_route_matches("q8")) return;
-    const uint64_t out_bytes = n_tok * out_dim * sizeof(float);
-    ds4_gpu_tensor *ref = ds4_gpu_tensor_alloc(out_bytes);
-    ds4_gpu_tensor *cand = ds4_gpu_mpp_compare_snapshot_buffer(ds4_gpu_tensor_buffer(out),
-                                                                   ds4_gpu_tensor_offset(out),
-                                                                   out_bytes);
-    if (!ref || !cand) {
-        ds4_gpu_tensor_free(ref);
-        ds4_gpu_tensor_free(cand);
-        return;
-    }
-
-    if (ds4_gpu_matmul_q8_0_legacy_tensor(ref, model_map, model_size,
-                                            weight_offset, in_dim, out_dim,
-                                            x, n_tok)) {
-        char fallback[128];
-        snprintf(fallback, sizeof(fallback),
-                 "q8 weight_off=%llu in=%llu out=%llu tok=%llu",
-                 (unsigned long long)weight_offset,
-                 (unsigned long long)in_dim,
-                 (unsigned long long)out_dim,
-                 (unsigned long long)n_tok);
-        ds4_gpu_mpp_compare_register("q8",
-                                       fallback,
-                                       ref,
-                                       cand,
-                                       n_tok * out_dim,
-                                       n_tok,
-                                       out_dim,
-                                       in_dim);
-        if (!g_batch_cb) ds4_gpu_mpp_compare_drain("q8 compare");
-    }
-    ds4_gpu_tensor_free(cand);
-    ds4_gpu_tensor_free(ref);
-}
-
 int ds4_gpu_matmul_q8_0_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -6316,102 +6158,58 @@ int ds4_gpu_matmul_q8_0_tensor(
         return 0;
     }
 
-    if (ds4_gpu_can_use_mpp_q8_0_matmul(n_tok)) {
-        if (ds4_gpu_matmul_q8_0_mpp_tensor(out, model_map, model_size, weight_offset,
-                                             in_dim, out_dim, x, n_tok)) {
-            ds4_gpu_mpp_compare_q8_0_matmul(out, model_map, model_size,
-                                              weight_offset, in_dim, out_dim,
-                                              x, n_tok);
-            return 1;
+    const int profile_requested =
+        n_tok > 8u && ds4_gpu_env_bool("DS4_METAL_Q8_PREFILL_PROFILE") > 0;
+    int profile_prefill = 0;
+    int split_batch_for_profile = 0;
+    const char *profile_label = NULL;
+    char profile_label_buf[128];
+    char profile_fallback[128];
+    if (profile_requested) {
+        snprintf(profile_fallback, sizeof(profile_fallback),
+                 "q8 weight_off=%llu in=%llu out=%llu tok=%llu",
+                 (unsigned long long)weight_offset,
+                 (unsigned long long)in_dim,
+                 (unsigned long long)out_dim,
+                 (unsigned long long)n_tok);
+        profile_label = ds4_gpu_mpp_compare_label(profile_fallback,
+                                                    profile_label_buf,
+                                                    sizeof(profile_label_buf));
+        const char *profile_filter = getenv("DS4_METAL_Q8_PREFILL_PROFILE_FILTER");
+        profile_prefill =
+            !profile_filter || !profile_filter[0] ||
+            strstr(profile_label, profile_filter) != NULL;
+    }
+    if (profile_prefill) {
+        if (g_batch_cb) {
+            if (ds4_gpu_end_commands() == 0 || ds4_gpu_begin_commands() == 0) {
+                return 0;
+            }
+            split_batch_for_profile = 1;
         }
-        ds4_gpu_warn_mpp_fallback();
     }
 
-    return ds4_gpu_matmul_q8_0_legacy_tensor(out, model_map, model_size,
-                                               weight_offset, in_dim, out_dim,
-                                               x, n_tok);
-}
-
-int ds4_gpu_matmul_q8_0_mpp_tensor(
-        ds4_gpu_tensor       *out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        uint64_t                n_tok) {
-    if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (!g_metal4_tensor_api_enabled) return 0;
-    if ((in_dim & 31u) != 0 || n_tok <= 8 ||
-        in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) {
-        return 0;
-    }
-
-    @autoreleasepool {
-        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
-        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
-        const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
-        const uint64_t out_bytes = n_tok * out_dim * sizeof(float);
-        if (!xbuf || !outbuf ||
-            ds4_gpu_tensor_bytes(x) < x_bytes ||
-            ds4_gpu_tensor_bytes(out) < out_bytes) {
-            fprintf(stderr, "ds4: Metal Tensor Q8_0 matmul received undersized activation buffers\n");
-            return 0;
+    const double profile_t0 = profile_prefill ? ds4_gpu_now_ms() : 0.0;
+    int ok = ds4_gpu_matmul_q8_0_legacy_tensor(out, model_map, model_size,
+                                                weight_offset, in_dim, out_dim,
+                                                x, n_tok);
+    if (profile_prefill) {
+        if (split_batch_for_profile && ds4_gpu_end_commands() == 0) {
+            ok = 0;
         }
-
-        const uint64_t blocks = in_dim / 32;
-        const uint64_t row_bytes = blocks * 34;
-        const uint64_t weight_bytes = out_dim * row_bytes;
-        if (weight_offset > model_size || weight_bytes > model_size - weight_offset) {
-            fprintf(stderr, "ds4: Metal Tensor Q8_0 matmul range is outside the mapped model\n");
-            return 0;
+        const double elapsed_ms = ds4_gpu_now_ms() - profile_t0;
+        fprintf(stderr,
+                "ds4: Metal Q8_0 prefill profile %s in=%llu out=%llu tok=%llu %.3f ms\n",
+                profile_label ? profile_label : profile_fallback,
+                (unsigned long long)in_dim,
+                (unsigned long long)out_dim,
+                (unsigned long long)n_tok,
+                elapsed_ms);
+        if (split_batch_for_profile && ds4_gpu_begin_commands() == 0) {
+            ok = 0;
         }
-
-        uint64_t inner_offset = 0;
-        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map, model_size, weight_offset, weight_bytes, &inner_offset);
-        if (!wbuf) return 0;
-
-        const uint32_t tile_n = ds4_gpu_mpp_q8_0_tile_n_for_tokens(n_tok);
-        const bool direct_rhs =
-            (tile_n == 32u || tile_n == 64u) &&
-            ds4_gpu_mpp_q8_0_direct_rhs();
-        const bool bc_inp = (in_dim % 32u) != 0;
-        const bool bc_out = (out_dim % 64u) != 0 || (n_tok % tile_n) != 0;
-        const char *pipeline_name = direct_rhs ?
-            (tile_n == 64u ?
-             "kernel_mul_mm_q8_0_f32_mpp_direct_rhs_n64" :
-             "kernel_mul_mm_q8_0_f32_mpp_direct_rhs") :
-            (tile_n == 64u ?
-             "kernel_mul_mm_q8_0_f32_mpp_n64" :
-             "kernel_mul_mm_q8_0_f32_mpp");
-        id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mm_pipeline(pipeline_name, bc_inp, bc_out);
-        if (!pipeline) return 0;
-
-        int owned = 0;
-        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
-        if (!cb) return 0;
-
-        ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
-
-        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:pipeline];
-        [enc setBytes:&args length:sizeof(args) atIndex:0];
-        [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
-        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
-        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-        [enc setThreadgroupMemoryLength:(direct_rhs ? 4096u : (tile_n == 64 ? 8192u : 6144u)) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + (NSUInteger)tile_n - 1u) / (NSUInteger)tile_n,
-                                              ((NSUInteger)out_dim + 63u) / 64u,
-                                              1)
-             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-        ds4_gpu_end_compute_encoder(cb, enc);
-
-        if (!ds4_gpu_finish_command_buffer(cb, owned, "Metal Tensor Q8_0 matmul")) return 0;
     }
-
-    return 1;
+    return ok;
 }
 
 int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
@@ -13262,6 +13060,15 @@ static uint32_t ds4_gpu_routed_mv_nr0(uint32_t type) {
     }
 }
 
+static const char *ds4_gpu_metal_tensor_type_name(uint32_t type) {
+    switch (type) {
+    case DS4_METAL_TENSOR_IQ2_XXS: return "iq2_xxs";
+    case DS4_METAL_TENSOR_Q2_K:    return "q2_k";
+    case DS4_METAL_TENSOR_Q4_K:    return "q4_k";
+    default:                       return "unknown";
+    }
+}
+
 static NSUInteger ds4_gpu_routed_mv_smem(uint32_t type) {
     if (type == DS4_METAL_TENSOR_IQ2_XXS) {
         return 256u * sizeof(uint64_t) + 128u * sizeof(uint8_t);
@@ -15170,6 +14977,10 @@ int ds4_gpu_routed_moe_batch_tensor(
         if (!cb) return 0;
         const bool moe_stage_profile =
             getenv("DS4_METAL_MOE_STAGE_PROFILE") != NULL && g_batch_cb != nil;
+        const char *moe_stage_filter = getenv("DS4_METAL_MOE_STAGE_PROFILE_FILTER");
+        const char *moe_path =
+            use_mm_id ? (use_gate_up_pair_mpp ? "mm_id_pair_mpp" : "mm_id") :
+            (use_tiny_pair_mv ? "tiny_pair_mv" : "mv");
         double moe_stage_t0 = moe_stage_profile ? ds4_gpu_now_ms() : 0.0;
         if (moe_stage_profile) {
             if (ds4_gpu_end_commands() == 0 || ds4_gpu_begin_commands() == 0) {
@@ -15184,10 +14995,27 @@ int ds4_gpu_routed_moe_batch_tensor(
                 if (ds4_gpu_end_commands() == 0) { \
                     ok = 0; \
                 } else { \
+                    const char *stage_name = (name); \
                     const double now_ms = ds4_gpu_now_ms(); \
-                    fprintf(stderr, \
-                            "ds4: Metal routed MoE stage tokens=%u pairs=%u %s=%.3f ms\n", \
-                            n_tokens, pair_rows, (name), now_ms - moe_stage_t0); \
+                    const int print_stage = \
+                        !moe_stage_filter || !moe_stage_filter[0] || \
+                        strstr(stage_name, moe_stage_filter) != NULL || \
+                        strstr(g_mpp_compare_context, moe_stage_filter) != NULL; \
+                    if (print_stage) { \
+                        fprintf(stderr, \
+                                "ds4: Metal routed MoE stage layer=%u tokens=%u pairs=%u experts=%u " \
+                                "gate=%s down=%s path=%s mpp=%u/%u/%u tile=%u/%u/%u mid=%s %s=%.3f ms\n", \
+                                layer_index, n_tokens, pair_rows, n_expert, \
+                                ds4_gpu_metal_tensor_type_name(gate_type), \
+                                ds4_gpu_metal_tensor_type_name(down_type), \
+                                moe_path, \
+                                (moe_mpp_mask & DS4_METAL_MOE_MPP_GATE) ? 1u : 0u, \
+                                (moe_mpp_mask & DS4_METAL_MOE_MPP_UP) ? 1u : 0u, \
+                                (moe_mpp_mask & DS4_METAL_MOE_MPP_DOWN) ? 1u : 0u, \
+                                gate_mm_tile_n, up_mm_tile_n, down_mm_tile_n, \
+                                request_mid_f16 ? "f16" : "f32", \
+                                stage_name, now_ms - moe_stage_t0); \
+                    } \
                     moe_stage_t0 = now_ms; \
                     if (ds4_gpu_begin_commands() == 0) { \
                         ok = 0; \

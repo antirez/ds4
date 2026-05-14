@@ -5,10 +5,10 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 PROMPT_FILE="${PROMPT_FILE:-speed-bench/promessi_sposi.txt}"
 CTX_START="${CTX_START:-512}"
-CTX_MAX="${CTX_MAX:-8192}"
+CTX_MAX="${CTX_MAX:-65536}"
 STEP_MUL="${STEP_MUL:-2}"
 GEN_TOKENS="${GEN_TOKENS:-128}"
-OUT_DIR="${OUT_DIR:-/tmp}"
+OUT_DIR="${OUT_DIR:-/tmp/ds4-bench-runs}"
 PYTHON="${PYTHON:-python3}"
 OPEN_CHART="${OPEN_CHART:-1}"
 
@@ -31,10 +31,10 @@ echo "1/3 Quality Metal -> $QUALITY_CSV"
 ./ds4-bench --quality "${COMMON_ARGS[@]}" --csv "$QUALITY_CSV"
 
 echo "2/3 Standard Metal -> $STANDARD_CSV"
-DS4_METAL_MPP_DISABLE=1 ./ds4-bench "${COMMON_ARGS[@]}" --csv "$STANDARD_CSV"
+./ds4-bench -mt off "${COMMON_ARGS[@]}" --csv "$STANDARD_CSV"
 
 echo "3/3 Tensor Metal -> $TENSOR_CSV"
-./ds4-bench "${COMMON_ARGS[@]}" --csv "$TENSOR_CSV"
+./ds4-bench -mt auto "${COMMON_ARGS[@]}" --csv "$TENSOR_CSV"
 
 echo "Comparing runs -> $CHART"
 "$PYTHON" speed-bench/compare_bench.py \

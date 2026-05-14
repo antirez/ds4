@@ -41,7 +41,9 @@ def dump_label(data: dict[str, Any]) -> str:
     model = Path(str(data.get("model", data.get("_path", "dump")))).name
     quant = data.get("quant_bits", "?")
     mt = data.get("mt", "?")
-    return f"{model}:q{quant}:mt={mt}"
+    quality = data.get("quality")
+    suffix = f":quality={quality}" if isinstance(quality, bool) else ""
+    return f"{model}:q{quant}:mt={mt}{suffix}"
 
 
 def finite_indices(logits: list[float]) -> list[int]:
