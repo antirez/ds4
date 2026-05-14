@@ -101,6 +101,8 @@ const char *ds4_think_mode_name(ds4_think_mode mode);
 const char *ds4_think_max_prefix(void);
 uint32_t ds4_think_max_min_context(void);
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size);
+uint32_t ds4_backend_default_prefill_chunk(ds4_backend backend);
+uint32_t ds4_backend_default_kv_boundary_align_tokens(ds4_backend backend);
 ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size);
 bool ds4_log_is_tty(FILE *fp);
 void ds4_log(FILE *fp, ds4_log_type type, const char *fmt, ...);
