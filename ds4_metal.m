@@ -83,6 +83,10 @@ static id<MTLComputePipelineState> g_rope_tail_batch_pipeline;
 static id<MTLComputePipelineState> g_dsv4_fp8_kv_quantize_pipeline;
 static id<MTLComputePipelineState> g_dsv4_kv_fp8_store_pipeline;
 static id<MTLComputePipelineState> g_dsv4_ratio4_shift_pipeline;
+static id<MTLComputePipelineState> g_turbo3_quantize_pipeline;
+static id<MTLComputePipelineState> g_turbo4_quantize_pipeline;
+static id<MTLComputePipelineState> g_turbo3_dequant_f32_pipeline;
+static id<MTLComputePipelineState> g_turbo4_dequant_f32_pipeline;
 static id<MTLComputePipelineState> g_dsv4_softmax_pool_pipeline;
 static id<MTLComputePipelineState> g_soft_max_f32_pipeline;
 static id<MTLComputePipelineState> g_soft_max_f32_4_pipeline;
@@ -1231,6 +1235,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_NORM_SOURCE",       @"metal/norm.metal"],
         @[@"DS4_METAL_BIN_SOURCE",        @"metal/bin.metal"],
         @[@"DS4_METAL_SET_ROWS_SOURCE",   @"metal/set_rows.metal"],
+        @[@"DS4_METAL_TURBO_QUANT_SOURCE", @"metal/turbo_quant.metal"],
     ];
 
     NSMutableString *source = [NSMutableString stringWithString:base];
@@ -2488,6 +2493,41 @@ typedef struct {
 } ds4_gpu_dsv4_compressor_store_one_args;
 
 typedef struct {
+    int32_t ne00;
+    int32_t ne01;
+    int32_t ne02;
+    int32_t ne03;
+    int32_t n_rot;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ds4_metal_args_turbo_quantize;
+
+typedef struct {
+    int32_t n_blocks;
+    int32_t n_rot;
+    int32_t n_rows;
+    uint64_t src_stride;
+    uint64_t dst_stride;
+} ds4_metal_args_turbo_dequant;
+
+typedef struct {
+    int32_t n_blocks;
+    int32_t n_rot;
+    int32_t n_comp;
+    int32_t top_k;
+    int32_t n_tokens;
+    uint64_t src_stride;
+    uint64_t dst_stride;
+    uint64_t topk_token_stride;
+} ds4_metal_args_turbo_select_dequant;
+
+typedef struct {
     int64_t  ne00;
     int64_t  ne01;
     int64_t  ne02;
@@ -2634,6 +2674,8 @@ typedef struct {
     uint64_t dst_token_stride;
     uint64_t dst_head_stride;
     float    scale;
+    uint32_t turbo_n_blocks;
+    uint32_t turbo_n_rot;
 } ds4_gpu_dsv4_indexed_attention_args;
 
 typedef struct {
@@ -2911,6 +2953,70 @@ int ds4_gpu_init(void) {
         g_dsv4_ratio4_shift_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
         if (!g_dsv4_ratio4_shift_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_ratio4_shift_f32 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        fn = [library newFunctionWithName:@"kernel_turbo3_quantize_f32"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_turbo3_quantize_f32 function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_turbo3_quantize_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_turbo3_quantize_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_turbo3_quantize_f32 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        fn = [library newFunctionWithName:@"kernel_turbo4_quantize_f32"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_turbo4_quantize_f32 function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_turbo4_quantize_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_turbo4_quantize_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_turbo4_quantize_f32 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        fn = [library newFunctionWithName:@"kernel_turbo3_dequant_f32"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_turbo3_dequant_f32 function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_turbo3_dequant_f32_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_turbo3_dequant_f32_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_turbo3_dequant_f32 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        fn = [library newFunctionWithName:@"kernel_turbo4_dequant_f32"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_turbo4_dequant_f32 function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_turbo4_dequant_f32_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_turbo4_dequant_f32_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_turbo4_dequant_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
             g_queue = nil;
             g_device = nil;
@@ -4014,6 +4120,10 @@ void ds4_gpu_cleanup(void) {
         g_dsv4_fp8_kv_quantize_pipeline = nil;
         g_dsv4_kv_fp8_store_pipeline = nil;
         g_dsv4_ratio4_shift_pipeline = nil;
+        g_turbo3_quantize_pipeline = nil;
+        g_turbo4_quantize_pipeline = nil;
+        g_turbo3_dequant_f32_pipeline = nil;
+        g_turbo4_dequant_f32_pipeline = nil;
         g_dsv4_softmax_pool_pipeline = nil;
         g_soft_max_f32_pipeline = nil;
         g_soft_max_f32_4_pipeline = nil;
@@ -5815,6 +5925,361 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
     }
 
     return 1;
+}
+
+/* =========================================================================
+ * TurboQuant dispatch functions.
+ * ========================================================================= */
+
+int ds4_gpu_turbo3_kv_quantize_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_tok,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                n_rot) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!x || !out || n_tok == 0 || n_head == 0 || head_dim == 0 || n_rot >= head_dim) return 0;
+
+    const int32_t n_nope   = (int32_t)head_dim - (int32_t)n_rot;
+    const int32_t n_blocks = n_nope / 32;
+    if ((n_nope % 32) != 0) return 0;
+    if (n_blocks == 0) return 1;
+
+    @autoreleasepool {
+        id<MTLBuffer> srcbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> dstbuf = ds4_gpu_tensor_buffer(out);
+        const uint64_t src_bytes = (uint64_t)n_tok * n_head * head_dim * sizeof(float);
+        const uint64_t dst_bytes = (uint64_t)n_tok * n_head *
+                                   ((uint64_t)n_blocks * DS4_TURBO3_BLOCK_BYTES + (uint64_t)n_rot * sizeof(float));
+        if (!srcbuf || ds4_gpu_tensor_bytes(x) < src_bytes) {
+            fprintf(stderr, "ds4: Metal turbo3 quantize undersized source buffer\n");
+            return 0;
+        }
+        if (!dstbuf || ds4_gpu_tensor_bytes(out) < dst_bytes) {
+            fprintf(stderr, "ds4: Metal turbo3 quantize undersized dest buffer (%llu < %llu)\n",
+                    dstbuf ? ds4_gpu_tensor_bytes(out) : 0ULL, dst_bytes);
+            return 0;
+        }
+
+        ds4_metal_args_turbo_quantize args = {
+            .ne00  = (int32_t)head_dim,
+            .ne01  = (int32_t)n_tok,
+            .ne02  = (int32_t)n_head,
+            .ne03  = 1,
+            .n_rot = (int32_t)n_rot,
+            .nb00  = sizeof(float),
+            .nb01  = (uint64_t)n_head * head_dim * sizeof(float),
+            .nb02  = (uint64_t)head_dim * sizeof(float),
+            .nb03  = (uint64_t)n_tok * n_head * head_dim * sizeof(float),
+            .nb0   = DS4_TURBO3_BLOCK_BYTES,
+            .nb1   = (uint64_t)n_blocks * DS4_TURBO3_BLOCK_BYTES + (uint64_t)n_rot * sizeof(float),
+            .nb2   = (uint64_t)n_tok * ((uint64_t)n_blocks * DS4_TURBO3_BLOCK_BYTES + (uint64_t)n_rot * sizeof(float)),
+            .nb3   = (uint64_t)n_tok * n_head * ((uint64_t)n_blocks * DS4_TURBO3_BLOCK_BYTES + (uint64_t)n_rot * sizeof(float)),
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_turbo3_quantize_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:srcbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
+        [enc setBuffer:dstbuf offset:ds4_gpu_tensor_offset(out) atIndex:2];
+        [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
+
+        const NSUInteger total_blocks = (NSUInteger)n_tok * n_head * n_blocks;
+        [enc dispatchThreadgroups:MTLSizeMake(total_blocks, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Turbo3 KV quantize")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_turbo4_kv_quantize_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_tok,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                n_rot) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!x || !out || n_tok == 0 || n_head == 0 || head_dim == 0 || n_rot >= head_dim) return 0;
+
+    const int32_t n_nope   = (int32_t)head_dim - (int32_t)n_rot;
+    const int32_t n_blocks = n_nope / 32;
+    if ((n_nope % 32) != 0) return 0;
+    if (n_blocks == 0) return 1;
+
+    @autoreleasepool {
+        id<MTLBuffer> srcbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> dstbuf = ds4_gpu_tensor_buffer(out);
+        const uint64_t src_bytes = (uint64_t)n_tok * n_head * head_dim * sizeof(float);
+        const uint64_t dst_bytes = (uint64_t)n_tok * n_head *
+                                   ((uint64_t)n_blocks * DS4_TURBO4_BLOCK_BYTES + (uint64_t)n_rot * sizeof(float));
+        if (!srcbuf || ds4_gpu_tensor_bytes(x) < src_bytes) {
+            fprintf(stderr, "ds4: Metal turbo4 quantize undersized source buffer\n");
+            return 0;
+        }
+        if (!dstbuf || ds4_gpu_tensor_bytes(out) < dst_bytes) {
+            fprintf(stderr, "ds4: Metal turbo4 quantize undersized dest buffer\n");
+            return 0;
+        }
+
+        ds4_metal_args_turbo_quantize args = {
+            .ne00  = (int32_t)head_dim,
+            .ne01  = (int32_t)n_tok,
+            .ne02  = (int32_t)n_head,
+            .ne03  = 1,
+            .n_rot = (int32_t)n_rot,
+            .nb00  = sizeof(float),
+            .nb01  = (uint64_t)n_head * head_dim * sizeof(float),
+            .nb02  = (uint64_t)head_dim * sizeof(float),
+            .nb03  = (uint64_t)n_tok * n_head * head_dim * sizeof(float),
+            .nb0   = DS4_TURBO4_BLOCK_BYTES,
+            .nb1   = (uint64_t)n_blocks * DS4_TURBO4_BLOCK_BYTES + (uint64_t)n_rot * sizeof(float),
+            .nb2   = (uint64_t)n_tok * ((uint64_t)n_blocks * DS4_TURBO4_BLOCK_BYTES + (uint64_t)n_rot * sizeof(float)),
+            .nb3   = (uint64_t)n_tok * n_head * ((uint64_t)n_blocks * DS4_TURBO4_BLOCK_BYTES + (uint64_t)n_rot * sizeof(float)),
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_turbo4_quantize_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:srcbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
+        [enc setBuffer:dstbuf offset:ds4_gpu_tensor_offset(out) atIndex:2];
+        [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
+
+        const NSUInteger total_blocks = (NSUInteger)n_tok * n_head * n_blocks;
+        [enc dispatchThreadgroups:MTLSizeMake(total_blocks, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Turbo4 KV quantize")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_turbo3_dequant_f32_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_blocks,
+        uint32_t                n_rot,
+        uint32_t                n_rows) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!x || !out || n_rows == 0 || n_blocks == 0) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> srcbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> dstbuf = ds4_gpu_tensor_buffer(out);
+        const uint64_t src_row_bytes = (uint64_t)n_blocks * DS4_TURBO3_BLOCK_BYTES + (uint64_t)n_rot * sizeof(float);
+        const uint64_t dst_row_bytes = (uint64_t)(n_blocks * 32 + n_rot) * sizeof(float);
+        const uint64_t src_bytes = (uint64_t)n_rows * src_row_bytes;
+        const uint64_t dst_bytes = (uint64_t)n_rows * dst_row_bytes;
+        if (!srcbuf || ds4_gpu_tensor_bytes(x) < src_bytes) return 0;
+        if (!dstbuf || ds4_gpu_tensor_bytes(out) < dst_bytes) return 0;
+
+        ds4_metal_args_turbo_dequant args = {
+            .n_blocks   = (int32_t)n_blocks,
+            .n_rot      = (int32_t)n_rot,
+            .n_rows     = (int32_t)n_rows,
+            .src_stride = src_row_bytes,
+            .dst_stride = dst_row_bytes,
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_turbo3_dequant_f32_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:srcbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
+        [enc setBuffer:dstbuf offset:ds4_gpu_tensor_offset(out) atIndex:2];
+        [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
+
+        const NSUInteger total_blocks = (NSUInteger)n_rows * n_blocks;
+        [enc dispatchThreadgroups:MTLSizeMake(total_blocks, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Turbo3 dequant f32")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_turbo4_dequant_f32_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_blocks,
+        uint32_t                n_rot,
+        uint32_t                n_rows) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!x || !out || n_rows == 0 || n_blocks == 0) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> srcbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> dstbuf = ds4_gpu_tensor_buffer(out);
+        const uint64_t src_row_bytes = (uint64_t)n_blocks * DS4_TURBO4_BLOCK_BYTES + (uint64_t)n_rot * sizeof(float);
+        const uint64_t dst_row_bytes = (uint64_t)(n_blocks * 32 + n_rot) * sizeof(float);
+        const uint64_t src_bytes = (uint64_t)n_rows * src_row_bytes;
+        const uint64_t dst_bytes = (uint64_t)n_rows * dst_row_bytes;
+        if (!srcbuf || ds4_gpu_tensor_bytes(x) < src_bytes) return 0;
+        if (!dstbuf || ds4_gpu_tensor_bytes(out) < dst_bytes) return 0;
+
+        ds4_metal_args_turbo_dequant args = {
+            .n_blocks   = (int32_t)n_blocks,
+            .n_rot      = (int32_t)n_rot,
+            .n_rows     = (int32_t)n_rows,
+            .src_stride = src_row_bytes,
+            .dst_stride = dst_row_bytes,
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_turbo4_dequant_f32_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:srcbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
+        [enc setBuffer:dstbuf offset:ds4_gpu_tensor_offset(out) atIndex:2];
+        [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
+
+        const NSUInteger total_blocks = (NSUInteger)n_rows * n_blocks;
+        [enc dispatchThreadgroups:MTLSizeMake(total_blocks, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Turbo4 dequant f32")) return 0;
+    }
+    return 1;
+}
+
+static int ds4_gpu_turbo_dequant_selected_f32_tensor(
+        const char           *kernel_name,
+        uint32_t              block_bytes,
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *identity_topk,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *topk,
+        uint32_t              n_blocks,
+        uint32_t              n_rot,
+        uint32_t              n_comp,
+        uint32_t              top_k,
+        uint32_t              n_tokens) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !identity_topk || !x || !topk ||
+        n_blocks == 0 || top_k == 0 || n_tokens == 0 || n_comp < top_k) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> srcbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> topkbuf = ds4_gpu_tensor_buffer(topk);
+        id<MTLBuffer> dstbuf = ds4_gpu_tensor_buffer(out);
+        id<MTLBuffer> idbuf = ds4_gpu_tensor_buffer(identity_topk);
+        const uint64_t src_row_bytes = (uint64_t)n_blocks * block_bytes + (uint64_t)n_rot * sizeof(float);
+        const uint64_t dst_row_bytes = (uint64_t)(n_blocks * 32u + n_rot) * sizeof(float);
+        const uint64_t src_bytes = (uint64_t)n_comp * src_row_bytes;
+        const uint64_t dst_bytes = (uint64_t)n_tokens * top_k * dst_row_bytes;
+        const uint64_t topk_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
+        if (!srcbuf || !topkbuf || !dstbuf || !idbuf ||
+            ds4_gpu_tensor_bytes(x) < src_bytes ||
+            ds4_gpu_tensor_bytes(topk) < topk_bytes ||
+            ds4_gpu_tensor_bytes(out) < dst_bytes ||
+            ds4_gpu_tensor_bytes(identity_topk) < topk_bytes) {
+            fprintf(stderr, "ds4: Metal turbo selected dequant received undersized buffers\n");
+            return 0;
+        }
+
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(kernel_name);
+        if (!pipeline) return 0;
+
+        ds4_metal_args_turbo_select_dequant args = {
+            .n_blocks = (int32_t)n_blocks,
+            .n_rot = (int32_t)n_rot,
+            .n_comp = (int32_t)n_comp,
+            .top_k = (int32_t)top_k,
+            .n_tokens = (int32_t)n_tokens,
+            .src_stride = src_row_bytes,
+            .dst_stride = dst_row_bytes,
+            .topk_token_stride = (uint64_t)top_k * sizeof(int32_t),
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:srcbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
+        [enc setBuffer:topkbuf offset:ds4_gpu_tensor_offset(topk) atIndex:2];
+        [enc setBuffer:dstbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setBuffer:idbuf offset:ds4_gpu_tensor_offset(identity_topk) atIndex:4];
+        [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
+
+        const NSUInteger total_blocks = (NSUInteger)n_tokens * top_k * n_blocks;
+        [enc dispatchThreadgroups:MTLSizeMake(total_blocks, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Turbo selected dequant f32")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_turbo3_dequant_selected_f32_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *identity_topk,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *topk,
+        uint32_t                n_blocks,
+        uint32_t                n_rot,
+        uint32_t                n_comp,
+        uint32_t                top_k,
+        uint32_t                n_tokens) {
+    return ds4_gpu_turbo_dequant_selected_f32_tensor("kernel_turbo3_dequant_selected_f32",
+                                                     DS4_TURBO3_BLOCK_BYTES,
+                                                     out,
+                                                     identity_topk,
+                                                     x,
+                                                     topk,
+                                                     n_blocks,
+                                                     n_rot,
+                                                     n_comp,
+                                                     top_k,
+                                                     n_tokens);
+}
+
+int ds4_gpu_turbo4_dequant_selected_f32_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *identity_topk,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *topk,
+        uint32_t                n_blocks,
+        uint32_t                n_rot,
+        uint32_t                n_comp,
+        uint32_t                top_k,
+        uint32_t                n_tokens) {
+    return ds4_gpu_turbo_dequant_selected_f32_tensor("kernel_turbo4_dequant_selected_f32",
+                                                     DS4_TURBO4_BLOCK_BYTES,
+                                                     out,
+                                                     identity_topk,
+                                                     x,
+                                                     topk,
+                                                     n_blocks,
+                                                     n_rot,
+                                                     n_comp,
+                                                     top_k,
+                                                     n_tokens);
 }
 
 static void ds4_gpu_set_rows_thread_shape(
@@ -10914,6 +11379,180 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         ds4_gpu_end_compute_encoder(cb, enc);
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "graph indexed mixed attention heads")) return 0;
+    }
+
+    return 1;
+}
+
+int ds4_gpu_attention_indexed_mixed_turbo_batch_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_turbo_kv,
+        const ds4_gpu_tensor *topk,
+        uint32_t                kv_quant_type,
+        uint32_t                n_blocks,
+        uint32_t                n_rot,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_comp,
+        uint32_t                top_k,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!heads || !model_map || !q || !raw_kv || !comp_turbo_kv || !topk ||
+        n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
+        n_comp == 0 || top_k == 0 || top_k > n_comp || (top_k & (top_k - 1u)) != 0 ||
+        ratio == 0 || n_head == 0 || head_dim != 512 || n_rot >= head_dim ||
+        n_blocks == 0 || n_blocks * 32u + n_rot != head_dim ||
+        (kv_quant_type != DS4_KV_QUANT_TURBO3 && kv_quant_type != DS4_KV_QUANT_TURBO4)) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        if (sinks_offset > model_size || (uint64_t)n_head * sizeof(float) > model_size - sinks_offset) {
+            fprintf(stderr, "ds4: Metal indexed turbo attention sinks range is outside the mapped model\n");
+            return 0;
+        }
+
+        const uint64_t row_bytes = (uint64_t)head_dim * sizeof(float);
+        const uint64_t turbo_block_bytes = kv_quant_type == DS4_KV_QUANT_TURBO3
+            ? DS4_TURBO3_BLOCK_BYTES
+            : DS4_TURBO4_BLOCK_BYTES;
+        const uint64_t turbo_row_bytes =
+            (uint64_t)n_blocks * turbo_block_bytes + (uint64_t)n_rot * sizeof(float);
+        const uint64_t q_bytes = (uint64_t)n_tokens * n_head * row_bytes;
+        const uint64_t raw_bytes = (uint64_t)raw_cap * row_bytes;
+        const uint64_t comp_bytes = (uint64_t)n_comp * turbo_row_bytes;
+        const uint64_t topk_bytes = (uint64_t)top_k * n_tokens * sizeof(int32_t);
+        id<MTLBuffer> qbuf = ds4_gpu_tensor_buffer(q);
+        id<MTLBuffer> rawbuf = ds4_gpu_tensor_buffer(raw_kv);
+        id<MTLBuffer> compbuf = ds4_gpu_tensor_buffer(comp_turbo_kv);
+        id<MTLBuffer> topkbuf = ds4_gpu_tensor_buffer(topk);
+        id<MTLBuffer> headsbuf = ds4_gpu_tensor_buffer(heads);
+        if (!qbuf || !rawbuf || !compbuf || !topkbuf || !headsbuf ||
+            ds4_gpu_tensor_bytes(q) < q_bytes ||
+            ds4_gpu_tensor_bytes(raw_kv) < raw_bytes ||
+            ds4_gpu_tensor_bytes(comp_turbo_kv) < comp_bytes ||
+            ds4_gpu_tensor_bytes(topk) < topk_bytes ||
+            ds4_gpu_tensor_bytes(heads) < q_bytes) {
+            fprintf(stderr, "ds4: Metal indexed mixed turbo attention received undersized buffers\n");
+            return 0;
+        }
+
+        uint64_t sinks_inner = 0;
+        id<MTLBuffer> sinks_buf = ds4_gpu_wrap_model_range(model_map, model_size,
+                                                             sinks_offset,
+                                                             (uint64_t)n_head * sizeof(float),
+                                                             &sinks_inner);
+        if (!sinks_buf) return 0;
+
+        id<MTLComputePipelineState> sort_pipeline =
+            ds4_gpu_hot_pipeline(g_dsv4_sort_i32_rows_asc_pipeline,
+                                    "kernel_dsv4_sort_i32_rows_asc");
+        const bool decode_one_token = n_tokens == 1u;
+        const bool turbo4 = kv_quant_type == DS4_KV_QUANT_TURBO4;
+        const char *attn_name = decode_one_token
+            ? (turbo4
+                ? "kernel_dsv4_indexed_mixed_attention_heads8_rb4_turbo4"
+                : "kernel_dsv4_indexed_mixed_attention_heads8_rb4_turbo3")
+            : (turbo4
+                ? "kernel_dsv4_indexed_mixed_attention_heads8_turbo4"
+                : "kernel_dsv4_indexed_mixed_attention_heads8_turbo3");
+        id<MTLComputePipelineState> attn_pipeline = ds4_gpu_get_pipeline(attn_name);
+        if (!sort_pipeline || !attn_pipeline) return 0;
+        if ((NSUInteger)top_k > sort_pipeline.maxTotalThreadsPerThreadgroup) {
+            fprintf(stderr, "ds4: Metal indexed turbo attention top-k exceeds sort threadgroup limit\n");
+            return 0;
+        }
+
+        const bool skip_decode_sort = !g_quality_mode && decode_one_token;
+        if (!skip_decode_sort &&
+            !ds4_gpu_ensure_scratch_buffer(&g_indexed_topk_buffer,
+                                             &g_indexed_topk_bytes,
+                                             (NSUInteger)topk_bytes,
+                                             "ds4_indexed_topk_sorted")) {
+            return 0;
+        }
+
+        ds4_gpu_dsv4_topk_mask_args sort_args = {
+            .ne00 = (int64_t)top_k,
+            .ne01 = (int64_t)n_tokens,
+            .nb00 = sizeof(int32_t),
+            .nb01 = (uint64_t)top_k * sizeof(int32_t),
+            .ne0 = (int64_t)top_k,
+            .ne1 = (int64_t)n_tokens,
+            .nb0 = sizeof(int32_t),
+            .nb1 = (uint64_t)top_k * sizeof(int32_t),
+        };
+        ds4_gpu_dsv4_indexed_attention_args attn_args = {
+            .n_tokens = n_tokens,
+            .n_head = n_head,
+            .n_raw = n_raw,
+            .raw_cap = raw_cap,
+            .raw_start = raw_start,
+            .n_comp = n_comp,
+            .top_k = top_k,
+            .pos0 = pos0,
+            .window = window,
+            .ratio = ratio,
+            .q_token_stride = (uint64_t)n_head * row_bytes,
+            .q_head_stride = row_bytes,
+            .raw_row_stride = row_bytes,
+            .comp_row_stride = turbo_row_bytes,
+            .topk_token_stride = (uint64_t)top_k * sizeof(int32_t),
+            .dst_token_stride = (uint64_t)n_head * row_bytes,
+            .dst_head_stride = row_bytes,
+            .scale = 1.0f / sqrtf((float)head_dim),
+            .turbo_n_blocks = n_blocks,
+            .turbo_n_rot = n_rot,
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = nil;
+        if (!skip_decode_sort) {
+            enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:sort_pipeline];
+            [enc setBytes:&sort_args length:sizeof(sort_args) atIndex:0];
+            [enc setBuffer:topkbuf offset:ds4_gpu_tensor_offset(topk) atIndex:1];
+            [enc setBuffer:g_indexed_topk_buffer offset:0 atIndex:2];
+            [enc setThreadgroupMemoryLength:(NSUInteger)top_k * sizeof(int32_t) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(top_k, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+        }
+
+        const NSUInteger staged_rows = decode_one_token ? 4u : 1u;
+        const NSUInteger shared_bytes =
+            staged_rows * 128u * 4u * sizeof(float) + 8u * 32u * sizeof(float);
+        enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:attn_pipeline];
+        [enc setBytes:&attn_args length:sizeof(attn_args) atIndex:0];
+        [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
+        [enc setBuffer:rawbuf offset:ds4_gpu_tensor_offset(raw_kv) atIndex:2];
+        [enc setBuffer:compbuf offset:ds4_gpu_tensor_offset(comp_turbo_kv) atIndex:3];
+        [enc setBuffer:skip_decode_sort ? topkbuf : g_indexed_topk_buffer
+              offset:skip_decode_sort ? ds4_gpu_tensor_offset(topk) : 0
+             atIndex:4];
+        [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner atIndex:5];
+        [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:6];
+        [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, ((NSUInteger)n_head + 7u) / 8u, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "graph indexed mixed turbo attention heads")) return 0;
     }
 
     return 1;

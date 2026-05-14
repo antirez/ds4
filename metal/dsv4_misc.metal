@@ -62,6 +62,8 @@ struct ds4_metal_args_dsv4_indexed_attention {
     uint64_t dst_token_stride;
     uint64_t dst_head_stride;
     float    scale;
+    uint32_t turbo_n_blocks;
+    uint32_t turbo_n_rot;
 };
 
 struct ds4_metal_args_dsv4_indexer_scores_fused {

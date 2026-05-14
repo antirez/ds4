@@ -248,6 +248,82 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot);
 
+/* =========================================================================
+ * TurboQuant KV Cache Compression.
+ * =========================================================================
+ *
+ * TurboQuant (arXiv 2504.19874) compresses KV cache rows with PolarQuant +
+ * Walsh-Hadamard rotation. 3-bit (turbo3) and 4-bit (turbo4) formats are
+ * supported.  The Metal integration stores compressed rows in per-layer turbo
+ * caches and dequantizes them back to float32 scratch before passing them to
+ * the existing attention kernels.
+ */
+
+/* TurboQuant types for kv_quant_type configuration. */
+#define DS4_KV_QUANT_FP8    0
+#define DS4_KV_QUANT_TURBO3 1
+#define DS4_KV_QUANT_TURBO4 2
+
+/* Block sizes (bytes) for buffer allocation. */
+#define DS4_TURBO3_BLOCK_BYTES 14   /* sizeof(block_turbo3_0): qs[8] + signs[4] + norm(2) */
+#define DS4_TURBO4_BLOCK_BYTES 18   /* sizeof(block_turbo4_0): qs[16] + norm(2) */
+
+/* Quantize a float32 KV tensor to TurboQuant blocks. The input tensor is laid
+ * out as [n_tok, n_head, head_dim].  The output receives packed blocks for the
+ * non-RoPE prefix, followed by the RoPE tail as raw float32. */
+int ds4_gpu_turbo3_kv_quantize_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_tok,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                n_rot);
+
+int ds4_gpu_turbo4_kv_quantize_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_tok,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                n_rot);
+
+/* Dequantize TurboQuant KV blocks to float32 for flash attention. */
+int ds4_gpu_turbo3_dequant_f32_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_blocks,
+        uint32_t                n_rot,
+        uint32_t                n_rows);
+
+int ds4_gpu_turbo4_dequant_f32_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_blocks,
+        uint32_t                n_rot,
+        uint32_t                n_rows);
+
+int ds4_gpu_turbo3_dequant_selected_f32_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *identity_topk,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *topk,
+        uint32_t                n_blocks,
+        uint32_t                n_rot,
+        uint32_t                n_comp,
+        uint32_t                top_k,
+        uint32_t                n_tokens);
+
+int ds4_gpu_turbo4_dequant_selected_f32_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *identity_topk,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *topk,
+        uint32_t                n_blocks,
+        uint32_t                n_rot,
+        uint32_t                n_comp,
+        uint32_t                top_k,
+        uint32_t                n_tokens);
+
 int ds4_gpu_rope_tail_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_tok,
@@ -482,6 +558,30 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
         const ds4_gpu_tensor *topk,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_comp,
+        uint32_t                top_k,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim);
+
+int ds4_gpu_attention_indexed_mixed_turbo_batch_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_turbo_kv,
+        const ds4_gpu_tensor *topk,
+        uint32_t                kv_quant_type,
+        uint32_t                n_blocks,
+        uint32_t                n_rot,
         uint32_t                n_tokens,
         uint32_t                pos0,
         uint32_t                n_raw,
