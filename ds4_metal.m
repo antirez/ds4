@@ -5102,6 +5102,48 @@ int ds4_gpu_matmul_q8_0_candidates_tensor(
     return 0;
 }
 
+int ds4_gpu_q8_0_row_group_norms_tensor(
+        ds4_gpu_tensor       *row_group_norms,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        uint32_t                group_count) {
+    (void)row_group_norms;
+    (void)model_map;
+    (void)model_size;
+    (void)weight_offset;
+    (void)in_dim;
+    (void)out_dim;
+    (void)group_count;
+    return 0;
+}
+
+int ds4_gpu_matmul_q8_0_candidate_certify_tensor(
+        ds4_gpu_tensor       *result,
+        const ds4_gpu_tensor *row_group_norms,
+        const ds4_gpu_tensor *candidate_ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t                group_count) {
+    (void)result;
+    (void)row_group_norms;
+    (void)candidate_ids;
+    (void)model_map;
+    (void)model_size;
+    (void)weight_offset;
+    (void)in_dim;
+    (void)out_dim;
+    (void)x;
+    (void)group_count;
+    return 0;
+}
+
 int ds4_gpu_matmul_q8_0_pair_tensor(
         ds4_gpu_tensor       *out0,
         ds4_gpu_tensor       *out1,

@@ -22,6 +22,14 @@ typedef struct ds4_gpu_top2_result {
     float    value1;
 } ds4_gpu_top2_result;
 
+typedef struct ds4_gpu_candidate_cert_result {
+    uint32_t candidate_id;
+    uint32_t certified;
+    uint32_t bound_id;
+    float    candidate_logit;
+    float    max_bound;
+} ds4_gpu_candidate_cert_result;
+
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
 
@@ -167,6 +175,27 @@ int ds4_gpu_matmul_q8_0_candidates_tensor(
         uint64_t                in_dim,
         uint64_t                out_dim,
         const ds4_gpu_tensor *x);
+
+int ds4_gpu_q8_0_row_group_norms_tensor(
+        ds4_gpu_tensor       *row_group_norms,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        uint32_t                group_count);
+
+int ds4_gpu_matmul_q8_0_candidate_certify_tensor(
+        ds4_gpu_tensor       *result,
+        const ds4_gpu_tensor *row_group_norms,
+        const ds4_gpu_tensor *candidate_ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t                group_count);
 
 int ds4_gpu_matmul_q8_0_pair_tensor(
         ds4_gpu_tensor       *out0,

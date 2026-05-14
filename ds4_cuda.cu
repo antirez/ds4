@@ -52,6 +52,14 @@ typedef struct ds4_gpu_top2_result {
     float    value1;
 } ds4_gpu_top2_result;
 
+typedef struct ds4_gpu_candidate_cert_result {
+    uint32_t candidate_id;
+    uint32_t certified;
+    uint32_t bound_id;
+    float    candidate_logit;
+    float    max_bound;
+} ds4_gpu_candidate_cert_result;
+
 typedef struct {
     uint8_t scales[CUDA_QK_K / 16];
     uint8_t qs[CUDA_QK_K / 4];
@@ -2265,6 +2273,199 @@ __global__ static void matmul_q8_0_candidates_warp8_kernel(
         acc = warp_sum_f32(acc);
     }
     if (lane == 0) out[cand] = acc;
+}
+
+__global__ static void q8_0_row_group_norms_warp_kernel(
+        float *row_group_norms,
+        const unsigned char *w,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks,
+        uint32_t group_count) {
+    const uint64_t row = (uint64_t)blockIdx.x;
+    const uint32_t group = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim || group >= group_count) return;
+
+    const uint64_t group_start = ((uint64_t)group * in_dim) / group_count;
+    const uint64_t group_end = ((uint64_t)(group + 1u) * in_dim) / group_count;
+    const uint64_t block_start = group_start / 32u;
+    const uint64_t block_end = (group_end + 31u) / 32u;
+    const unsigned char *wr = w + row * blocks * 34;
+    float sum = 0.0f;
+    for (uint64_t b = block_start; b < block_end; b++) {
+        const uint64_t i0 = b * 32u;
+        const uint64_t lo = group_start > i0 ? group_start - i0 : 0u;
+        const uint64_t hi0 = group_end < i0 + 32u ? group_end - i0 : 32u;
+        const __half *scale_h = (const __half *)(wr + b * 34);
+        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+        const float scale = __half2float(*scale_h);
+        for (uint64_t i = lo + lane; i < hi0; i += 32u) {
+            const float v = scale * (float)qs[i];
+            sum += v * v;
+        }
+    }
+    sum = warp_sum_f32(sum);
+    if (lane == 0) row_group_norms[row * group_count + group] = sqrtf(sum);
+}
+
+__global__ static void q8_0_x_group_norms_kernel(
+        float *x_group_norms,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t blocks,
+        uint32_t group_count) {
+    const uint32_t group = (uint32_t)blockIdx.x;
+    if (group >= group_count) return;
+    const uint64_t group_start = ((uint64_t)group * in_dim) / group_count;
+    const uint64_t group_end = ((uint64_t)(group + 1u) * in_dim) / group_count;
+    const uint64_t block_start = group_start / 32u;
+    const uint64_t block_end = (group_end + 31u) / 32u;
+    float sum = 0.0f;
+    for (uint64_t b = block_start; b < block_end; b++) {
+        const uint64_t i0 = b * 32u;
+        const uint64_t lo = group_start > i0 ? group_start - i0 : 0u;
+        const uint64_t hi0 = group_end < i0 + 32u ? group_end - i0 : 32u;
+        const float scale = xscale[b];
+        const int8_t *xqb = xq + b * 32u;
+        for (uint64_t i = lo + threadIdx.x; i < hi0; i += blockDim.x) {
+            const float v = scale * (float)xqb[i];
+            sum += v * v;
+        }
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) x_group_norms[group] = sqrtf(partial[0]);
+}
+
+__global__ static void q8_0_candidate_certify_prune_warp8_kernel(
+        ds4_gpu_top2_result *candidates,
+        const float *candidate_logits,
+        const uint32_t *candidate_ids,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        const float *row_group_norms,
+        const float *x_group_norms,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks,
+        uint32_t group_count,
+        int use_dp4a) {
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + warp;
+    const uint32_t candidate = candidate_ids[0];
+    const float threshold = candidate_logits[0] - 1.0e-4f;
+
+    float row_bound = -INFINITY;
+    uint32_t row_id = UINT32_MAX;
+    if (row < out_dim && (uint32_t)row != candidate) {
+        const float *rn = row_group_norms + row * group_count;
+        float residual = 0.0f;
+        for (uint32_t g = lane; g < group_count; g += 32u) {
+            residual += rn[g] * x_group_norms[g];
+        }
+        residual = warp_sum_f32(residual);
+        residual = __shfl_sync(0xffffffffu, residual, 0);
+
+        const unsigned char *wr = w + row * blocks * 34;
+        float acc = 0.0f;
+        for (uint32_t g = 0; g < group_count; g++) {
+            const float group_bound = rn[g] * x_group_norms[g];
+            residual -= group_bound;
+
+            const uint64_t group_start = ((uint64_t)g * in_dim) / group_count;
+            const uint64_t group_end = ((uint64_t)(g + 1u) * in_dim) / group_count;
+            const uint64_t block_start = group_start / 32u;
+            const uint64_t block_end = (group_end + 31u) / 32u;
+            float part = 0.0f;
+            for (uint64_t b = block_start + lane; b < block_end; b += 32u) {
+                const uint64_t i0 = b * 32u;
+                const uint64_t bn = in_dim - i0 < 32u ? in_dim - i0 : 32u;
+                const __half *scale_h = (const __half *)(wr + b * 34);
+                const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+                const int8_t *xqb = xq + b * 32u;
+                int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+                part += __half2float(*scale_h) * xscale[b] * (float)dot;
+            }
+            part = warp_sum_f32(part);
+            part = __shfl_sync(0xffffffffu, part, 0);
+            acc += part;
+            row_bound = acc + residual;
+            if (row_bound < threshold) break;
+        }
+        row_id = (uint32_t)row;
+    }
+
+    __shared__ float vals[8];
+    __shared__ uint32_t ids[8];
+    if (lane == 0) {
+        vals[warp] = row_bound;
+        ids[warp] = row_id;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float v0 = -INFINITY;
+        uint32_t id0 = UINT32_MAX;
+        for (uint32_t i = 0; i < 8u; i++) {
+            if (ids[i] != UINT32_MAX &&
+                (vals[i] > v0 || (vals[i] == v0 && ids[i] < id0))) {
+                v0 = vals[i];
+                id0 = ids[i];
+            }
+        }
+        candidates[blockIdx.x] = {id0, UINT32_MAX, v0, -INFINITY};
+    }
+}
+
+__global__ static void q8_0_candidate_certify_merge_kernel(
+        ds4_gpu_candidate_cert_result *result,
+        const ds4_gpu_top2_result *candidates,
+        uint32_t n_candidates,
+        const float *candidate_logits,
+        const uint32_t *candidate_ids) {
+    const uint32_t tid = threadIdx.x;
+    float best = -INFINITY;
+    uint32_t best_id = UINT32_MAX;
+    for (uint32_t i = tid; i < n_candidates; i += blockDim.x) {
+        ds4_gpu_top2_result c = candidates[i];
+        if (c.id0 != UINT32_MAX &&
+            (c.value0 > best || (c.value0 == best && c.id0 < best_id))) {
+            best = c.value0;
+            best_id = c.id0;
+        }
+    }
+
+    __shared__ float sbest[1024];
+    __shared__ uint32_t sid[1024];
+    sbest[tid] = best;
+    sid[tid] = best_id;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            const float ov = sbest[tid + stride];
+            const uint32_t oi = sid[tid + stride];
+            if (ov > sbest[tid] || (ov == sbest[tid] && oi < sid[tid])) {
+                sbest[tid] = ov;
+                sid[tid] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        const uint32_t candidate = candidate_ids[0];
+        const float candidate_logit = candidate_logits[0];
+        const uint32_t certified = sbest[0] < candidate_logit - 1.0e-4f ? 1u : 0u;
+        result[0] = {candidate, certified, sid[0], candidate_logit, sbest[0]};
+    }
 }
 
 __global__ static void q8_0_top2_merge_kernel(
@@ -6596,6 +6797,125 @@ extern "C" int ds4_gpu_matmul_q8_0_candidates_tensor(
             blocks,
             cuda_q8_use_dp4a());
     return cuda_ok(cudaGetLastError(), "q8_0 candidates matmul launch");
+}
+
+extern "C" int ds4_gpu_q8_0_row_group_norms_tensor(
+        ds4_gpu_tensor *row_group_norms,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint32_t group_count) {
+    if (!row_group_norms || !model_map || in_dim == 0 || out_dim == 0 ||
+        group_count == 0 || group_count > 16u) {
+        return 0;
+    }
+    if (row_group_norms->bytes < (uint64_t)out_dim * group_count * sizeof(float)) return 0;
+    const uint64_t blocks = (in_dim + 31) / 32;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34)) return 0;
+    const uint64_t weight_bytes = out_dim * blocks * 34;
+    if (weight_bytes > model_size - weight_offset) return 0;
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "q8_0 row group norms");
+    if (!wptr) return 0;
+
+    q8_0_row_group_norms_warp_kernel<<<(unsigned)out_dim, 512>>>(
+            (float *)row_group_norms->ptr,
+            reinterpret_cast<const unsigned char *>(wptr),
+            in_dim,
+            out_dim,
+            blocks,
+            group_count);
+    return cuda_ok(cudaGetLastError(), "q8_0 row group norms launch");
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_candidate_certify_tensor(
+        ds4_gpu_tensor *result,
+        const ds4_gpu_tensor *row_group_norms,
+        const ds4_gpu_tensor *candidate_ids,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t group_count) {
+    if (!result || !row_group_norms || !candidate_ids || !x || !model_map ||
+        in_dim == 0 || out_dim == 0 || group_count == 0 || group_count > 16u) {
+        return 0;
+    }
+    if (result->bytes < sizeof(ds4_gpu_candidate_cert_result) ||
+        row_group_norms->bytes < (uint64_t)out_dim * group_count * sizeof(float) ||
+        candidate_ids->bytes < sizeof(uint32_t) ||
+        x->bytes < in_dim * sizeof(float)) {
+        return 0;
+    }
+    const uint64_t blocks = (in_dim + 31) / 32;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34)) return 0;
+    const uint64_t weight_bytes = out_dim * blocks * 34;
+    if (weight_bytes > model_size - weight_offset) return 0;
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "q8_0 candidate certify");
+    if (!wptr) return 0;
+
+    const uint64_t xq_bytes = blocks * 32u;
+    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+    const uint64_t x_group_offset = (scale_offset + blocks * sizeof(float) + 15u) & ~15ull;
+    const uint64_t cand_logit_offset = (x_group_offset + group_count * sizeof(float) + 15u) & ~15ull;
+    const uint64_t candidate_count = (out_dim + 7u) / 8u;
+    const uint64_t candidates_offset = (cand_logit_offset + sizeof(float) + 15u) & ~15ull;
+    if (candidate_count > UINT64_MAX / sizeof(ds4_gpu_top2_result)) return 0;
+    const uint64_t tmp_bytes = candidates_offset + candidate_count * sizeof(ds4_gpu_top2_result);
+    void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 candidate cert");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_offset);
+    float *x_group_norms = (float *)((char *)tmp + x_group_offset);
+    float *candidate_logits = (float *)((char *)tmp + cand_logit_offset);
+    ds4_gpu_top2_result *cert_candidates = (ds4_gpu_top2_result *)((char *)tmp + candidates_offset);
+
+    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    if (!cuda_ok(cudaGetLastError(), "q8_0 cert quantize launch")) return 0;
+    q8_0_x_group_norms_kernel<<<group_count, 256>>>(x_group_norms,
+                                                    xq,
+                                                    xscale,
+                                                    in_dim,
+                                                    blocks,
+                                                    group_count);
+    if (!cuda_ok(cudaGetLastError(), "q8_0 cert x norms launch")) return 0;
+    matmul_q8_0_candidates_warp8_kernel<<<1, 256>>>(
+            candidate_logits,
+            (const uint32_t *)candidate_ids->ptr,
+            1u,
+            reinterpret_cast<const unsigned char *>(wptr),
+            xq,
+            xscale,
+            in_dim,
+            out_dim,
+            blocks,
+            cuda_q8_use_dp4a());
+    if (!cuda_ok(cudaGetLastError(), "q8_0 cert candidate launch")) return 0;
+    q8_0_candidate_certify_prune_warp8_kernel<<<(unsigned)candidate_count, 256>>>(
+            cert_candidates,
+            candidate_logits,
+            (const uint32_t *)candidate_ids->ptr,
+            reinterpret_cast<const unsigned char *>(wptr),
+            xq,
+            xscale,
+            (const float *)row_group_norms->ptr,
+            x_group_norms,
+            in_dim,
+            out_dim,
+            blocks,
+            group_count,
+            cuda_q8_use_dp4a());
+    if (!cuda_ok(cudaGetLastError(), "q8_0 cert prune launch")) return 0;
+    q8_0_candidate_certify_merge_kernel<<<1, 1024>>>(
+            (ds4_gpu_candidate_cert_result *)result->ptr,
+            cert_candidates,
+            (uint32_t)candidate_count,
+            candidate_logits,
+            (const uint32_t *)candidate_ids->ptr);
+    return cuda_ok(cudaGetLastError(), "q8_0 cert merge launch");
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
