@@ -5080,6 +5080,28 @@ int ds4_gpu_matmul_q8_0_top2_tensor(
     return 0;
 }
 
+int ds4_gpu_matmul_q8_0_candidates_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *candidate_ids,
+        uint32_t                candidate_count,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x) {
+    (void)out;
+    (void)candidate_ids;
+    (void)candidate_count;
+    (void)model_map;
+    (void)model_size;
+    (void)weight_offset;
+    (void)in_dim;
+    (void)out_dim;
+    (void)x;
+    return 0;
+}
+
 int ds4_gpu_matmul_q8_0_pair_tensor(
         ds4_gpu_tensor       *out0,
         ds4_gpu_tensor       *out1,
