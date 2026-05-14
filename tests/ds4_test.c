@@ -150,143 +150,8 @@ static void test_metal_f16_matvec_fast_nr0_4(void) {
     free(weights_raw);
 }
 
-static void test_metal_q8_0_mpp_matmul_case(const char *label,
-                                            uint32_t in_dim,
-                                            uint32_t out_dim,
-                                            uint32_t n_tok) {
-    const uint64_t blocks = in_dim / 32;
-    const uint64_t row_bytes = blocks * 34;
-    const uint64_t weight_bytes = (uint64_t)out_dim * row_bytes;
-    const uint64_t weight_alloc = test_round_up_u64(weight_bytes, (uint64_t)getpagesize());
-
-    void *weights_raw = NULL;
-    TEST_ASSERT(posix_memalign(&weights_raw, (size_t)getpagesize(), (size_t)weight_alloc) == 0);
-    if (!weights_raw) return;
-
-    uint8_t *weights = weights_raw;
-    memset(weights, 0, (size_t)weight_alloc);
-    for (uint32_t o = 0; o < out_dim; o++) {
-        for (uint32_t b = 0; b < blocks; b++) {
-            uint8_t *block = weights + (uint64_t)o * row_bytes + (uint64_t)b * 34u;
-            uint16_t d = test_float_to_f16((float)((o + b) % 5u + 1u) / 128.0f);
-            memcpy(block, &d, sizeof(d));
-            int8_t *qs = (int8_t *)(block + 2);
-            for (uint32_t i = 0; i < 32; i++) {
-                qs[i] = (int8_t)((int)((o * 5u + b * 7u + i * 3u) % 63u) - 31);
-            }
-        }
-    }
-
-    const uint64_t x_bytes = (uint64_t)n_tok * in_dim * sizeof(float);
-    const uint64_t out_bytes = (uint64_t)n_tok * out_dim * sizeof(float);
-    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_bytes);
-    ds4_gpu_tensor *out_ref = ds4_gpu_tensor_alloc(out_bytes);
-    ds4_gpu_tensor *out_mpp = ds4_gpu_tensor_alloc(out_bytes);
-    TEST_ASSERT(x != NULL);
-    TEST_ASSERT(out_ref != NULL);
-    TEST_ASSERT(out_mpp != NULL);
-    if (!x || !out_ref || !out_mpp) {
-        ds4_gpu_tensor_free(x);
-        ds4_gpu_tensor_free(out_ref);
-        ds4_gpu_tensor_free(out_mpp);
-        free(weights_raw);
-        return;
-    }
-
-    float *x_host = malloc((size_t)x_bytes);
-    float *ref_host = malloc((size_t)out_bytes);
-    float *mpp_host = malloc((size_t)out_bytes);
-    TEST_ASSERT(x_host != NULL);
-    TEST_ASSERT(ref_host != NULL);
-    TEST_ASSERT(mpp_host != NULL);
-    if (!x_host || !ref_host || !mpp_host) {
-        free(x_host);
-        free(ref_host);
-        free(mpp_host);
-        ds4_gpu_tensor_free(x);
-        ds4_gpu_tensor_free(out_ref);
-        ds4_gpu_tensor_free(out_mpp);
-        free(weights_raw);
-        return;
-    }
-
-    for (uint32_t t = 0; t < n_tok; t++) {
-        for (uint32_t i = 0; i < in_dim; i++) {
-            x_host[(uint64_t)t * in_dim + i] =
-                (float)((int)((t * 19u + i * 23u) % 53u) - 26) / 80.0f;
-        }
-    }
-
-    TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_host, x_bytes) != 0);
-    TEST_ASSERT(ds4_gpu_set_model_map(weights_raw, weight_alloc) != 0);
-    // Force quality mode ON so the reference dispatcher takes the legacy
-    // simdgroup path; otherwise ds4_gpu_matmul_q8_0_tensor() routes to the
-    // MPP variant on M5+ and the test compares two MPP outputs to each other.
-    ds4_gpu_set_quality(true);
-    TEST_ASSERT(ds4_gpu_matmul_q8_0_tensor(out_ref, weights_raw, weight_alloc, 0,
-                                             in_dim, out_dim, x, n_tok) != 0);
-    ds4_gpu_set_quality(false);
-
-    int have_mpp = ds4_gpu_matmul_q8_0_mpp_tensor(
-        out_mpp, weights_raw, weight_alloc, 0, in_dim, out_dim, x, n_tok);
-    if (!have_mpp) {
-        fprintf(stderr, "ds4-test: skipping Tensor Q8_0 matmul %s; Metal 4 tensor API unavailable\n",
-                label);
-        free(x_host);
-        free(ref_host);
-        free(mpp_host);
-        ds4_gpu_tensor_free(x);
-        ds4_gpu_tensor_free(out_ref);
-        ds4_gpu_tensor_free(out_mpp);
-        free(weights_raw);
-        return;
-    }
-
-    TEST_ASSERT(ds4_gpu_tensor_read(out_ref, 0, ref_host, out_bytes) != 0);
-    TEST_ASSERT(ds4_gpu_tensor_read(out_mpp, 0, mpp_host, out_bytes) != 0);
-
-    float max_abs = 0.0f;
-    double sumsq = 0.0;
-    uint64_t max_index = 0;
-    for (uint64_t i = 0; i < (uint64_t)n_tok * out_dim; i++) {
-        const float err = fabsf(mpp_host[i] - ref_host[i]);
-        sumsq += (double)err * (double)err;
-        if (err > max_abs) {
-            max_abs = err;
-            max_index = i;
-        }
-    }
-    const float rms = (float)sqrt(sumsq / (double)((uint64_t)n_tok * out_dim));
-    if (max_abs >= 0.10f) {
-        fprintf(stderr,
-                "ds4-test: Tensor Q8_0 matmul %s in=%u out=%u tok=%u max_abs=%f rms=%f at token=%llu out=%llu ref=%f tensor=%f\n",
-                label, in_dim, out_dim, n_tok, max_abs, rms,
-                (unsigned long long)(max_index / out_dim),
-                (unsigned long long)(max_index % out_dim),
-                ref_host[max_index],
-                mpp_host[max_index]);
-    }
-    TEST_ASSERT(max_abs < 0.10f);
-
-    free(x_host);
-    free(ref_host);
-    free(mpp_host);
-    ds4_gpu_tensor_free(x);
-    ds4_gpu_tensor_free(out_ref);
-    ds4_gpu_tensor_free(out_mpp);
-    free(weights_raw);
-}
-
-static void test_metal_q8_0_mpp_matmul(void) {
-    test_metal_q8_0_mpp_matmul_case("small_partial48", 128, 96, 48);
-    test_metal_q8_0_mpp_matmul_case("medium_partial48", 512, 256, 48);
-    test_metal_q8_0_mpp_matmul_case("modelish_full32", 4096, 256, 32);
-    test_metal_q8_0_mpp_matmul_case("modelish_partial48", 4096, 256, 48);
-}
-
 static void test_metal_kernel_group(void) {
     test_metal_f16_matvec_fast_nr0_4();
-    test_metal_q8_0_mpp_matmul();
 }
 
 static char *test_read_file(const char *path) {
@@ -1068,12 +933,6 @@ static const char *const test_mpp_route_envs[] = {
     "DS4_METAL_MPP_DISABLE",
     "DS4_METAL_MPP_FAST",
     "DS4_METAL_MPP_DIRECT_RHS",
-    "DS4_METAL_MPP_Q8_0_ENABLE",
-    "DS4_METAL_MPP_Q8_0_DISABLE",
-    "DS4_METAL_MPP_Q8_0_DIRECT_RHS",
-    "DS4_METAL_MPP_Q8_0_PARTIAL_ENABLE",
-    "DS4_METAL_MPP_Q8_0_FILTER",
-    "DS4_METAL_MPP_Q8_0_TILE_N",
     "DS4_METAL_MPP_F16_ENABLE",
     "DS4_METAL_MPP_F16_DISABLE",
     "DS4_METAL_MPP_F16_DIRECT_RHS",
@@ -1091,6 +950,8 @@ static const char *const test_mpp_route_envs[] = {
     "DS4_METAL_MPP_MOE_FAST_LAYOUT",
     "DS4_METAL_MPP_MOE_PAIR_GATE_UP",
     "DS4_METAL_MPP_MOE_START_LAYER",
+    "DS4_METAL_EXPERIMENTAL_MOE_MATMUL",
+    "DS4_METAL_EXPERIMENTAL_MOE_MATMUL_START_LAYER",
     "DS4_METAL_MPP_MOE_GATE_ENABLE",
     "DS4_METAL_MPP_MOE_GATE_DISABLE",
     "DS4_METAL_MPP_MOE_GATE_FILTER",
@@ -1158,20 +1019,12 @@ static void test_run_mpp_matrix(test_mpp_eq_case *cases, int ncase) {
             "DS4_METAL_MPP_FAST",
             NULL
         } },
-        { "q8_only", DS4_MPP_ON, {
-            "DS4_METAL_MPP_F16_DISABLE",
-            "DS4_METAL_MPP_ATTN_OUT_DISABLE",
-            "DS4_METAL_MPP_MOE_DISABLE",
-            NULL
-        } },
         { "attn_out_only", DS4_MPP_ON, {
-            "DS4_METAL_MPP_Q8_0_DISABLE",
             "DS4_METAL_MPP_F16_DISABLE",
             "DS4_METAL_MPP_MOE_DISABLE",
             NULL
         } },
         { "moe_gate_only", DS4_MPP_ON, {
-            "DS4_METAL_MPP_Q8_0_DISABLE",
             "DS4_METAL_MPP_F16_DISABLE",
             "DS4_METAL_MPP_ATTN_OUT_DISABLE",
             "DS4_METAL_MPP_MOE_UP_DISABLE",
@@ -1179,7 +1032,6 @@ static void test_run_mpp_matrix(test_mpp_eq_case *cases, int ncase) {
             NULL
         } },
         { "moe_up_only", DS4_MPP_ON, {
-            "DS4_METAL_MPP_Q8_0_DISABLE",
             "DS4_METAL_MPP_F16_DISABLE",
             "DS4_METAL_MPP_ATTN_OUT_DISABLE",
             "DS4_METAL_MPP_MOE_GATE_DISABLE",
@@ -1187,7 +1039,6 @@ static void test_run_mpp_matrix(test_mpp_eq_case *cases, int ncase) {
             NULL
         } },
         { "moe_down_only", DS4_MPP_ON, {
-            "DS4_METAL_MPP_Q8_0_DISABLE",
             "DS4_METAL_MPP_F16_DISABLE",
             "DS4_METAL_MPP_ATTN_OUT_DISABLE",
             "DS4_METAL_MPP_MOE_GATE_DISABLE",

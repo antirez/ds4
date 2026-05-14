@@ -1034,11 +1034,8 @@ kernel void kernel_mul_mm_mpp(
 }
 
 typedef decltype(kernel_mul_mm_mpp<64, 32, half, half4x4, float4x4, 1, dequantize_f32, float, float4x4, float>) mul_mm_mpp_t;
-typedef decltype(kernel_mul_mm_mpp<64, 64, half, half4x4, block_q8_0, 2, dequantize_q8_0, float, float4x4, float>) mul_mm_mpp_q8_n64_t;
 
 template [[host_name("kernel_mul_mm_f16_f32_mpp")]]  kernel mul_mm_mpp_t kernel_mul_mm_mpp<64, 32, half, half4x4, half4x4, 1, dequantize_f16,  half,  half4x4,  float>;
-template [[host_name("kernel_mul_mm_q8_0_f32_mpp")]] kernel mul_mm_mpp_t kernel_mul_mm_mpp<64, 32, half, half4x4, block_q8_0, 2, dequantize_q8_0, float, float4x4, float>;
-template [[host_name("kernel_mul_mm_q8_0_f32_mpp_n64")]] kernel mul_mm_mpp_q8_n64_t kernel_mul_mm_mpp<64, 64, half, half4x4, block_q8_0, 2, dequantize_q8_0, float, float4x4, float>;
 
 kernel void kernel_mul_mm_f16_f32_pair_mpp(
         constant ds4_metal_args_mul_mm & args,
@@ -1258,11 +1255,8 @@ kernel void kernel_mul_mm_mpp_direct_rhs(
 }
 
 typedef decltype(kernel_mul_mm_mpp_direct_rhs<32, half, half4x4, float4x4, 1, dequantize_f32, float, float4x4, float>) mul_mm_mpp_direct_rhs_t;
-typedef decltype(kernel_mul_mm_mpp_direct_rhs<64, half, half4x4, block_q8_0, 2, dequantize_q8_0, float, float4x4, float>) mul_mm_mpp_direct_rhs_q8_n64_t;
 
 template [[host_name("kernel_mul_mm_f16_f32_mpp_direct_rhs")]]  kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<32, half, half4x4, half4x4, 1, dequantize_f16,  half,  half4x4,  float>;
-template [[host_name("kernel_mul_mm_q8_0_f32_mpp_direct_rhs")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<32, half, half4x4, block_q8_0, 2, dequantize_q8_0, float, float4x4, float>;
-template [[host_name("kernel_mul_mm_q8_0_f32_mpp_direct_rhs_n64")]] kernel mul_mm_mpp_direct_rhs_q8_n64_t kernel_mul_mm_mpp_direct_rhs<64, half, half4x4, block_q8_0, 2, dequantize_q8_0, float, float4x4, float>;
 #endif
 
 // Tiled matrix-matrix kernel used for prompt batches larger than 8. DS4 uses
