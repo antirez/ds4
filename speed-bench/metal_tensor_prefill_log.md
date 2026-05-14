@@ -135,10 +135,13 @@ These were evaluated as env-only candidates and not promoted.
 | `DS4_METAL_MPP_MOE_GATE_START_LAYER=18` plus `DS4_METAL_MPP_MOE_UP_START_LAYER=18` with down defaulting to 19 | Two-repeat median vs 19/19/19 Tensor auto: +0.1% at 512, then -0.7%, -1.9%, -3.0%, and -1.3% from 1024..8192. Generation was within -0.9%..+0.6%. | Not run. | Reject before drift gate because it is slower at most measured contexts. |
 | `DS4_METAL_MPP_MOE_GATE_START_LAYER=18` plus `DS4_METAL_MPP_MOE_UP_START_LAYER=18` with down defaulting to 12 | Two-repeat median vs down-12 Tensor auto: -2.2% at 512, -2.8% at 1024, -2.7% at 2048, -0.1% at 4096, and +1.5% at 8192. Generation was within -0.7%..+1.5%. | Not run. | Reject before drift gate because it is slower at most measured contexts. |
 | `DS4_METAL_MPP_MOE_GATE_START_LAYER=14` plus `DS4_METAL_MPP_MOE_UP_START_LAYER=14` with down defaulting to 12 | Two-repeat median vs down-12 Tensor auto: +2.7% at 512, +2.9% at 1024, +2.2% at 2048, +1.1% at 4096, but -0.8% at 8192. Generation was -3.2% at 8192. | Not run. | Reject before drift gate because it regresses the long-context point and generation more than the layer-15 window. |
+| `DS4_METAL_MPP_MOE_GATE_START_LAYER=14` with down defaulting to 12 and up defaulting to 15 | Two-repeat median vs current Tensor auto: -2.2% at 512, -1.7% at 1024, -0.4% at 2048, +1.0% at 4096, and +2.1% at 8192. Generation was down by 0.4%..1.9%. | Not run. | Reject before drift gate because it is a tradeoff, not a clear prefill win. |
+| `DS4_METAL_MPP_MOE_UP_START_LAYER=14` with down defaulting to 12 and gate defaulting to 15 | Two-repeat median vs current Tensor auto: -3.4% at 512, -6.4% at 1024, -4.9% at 2048, -6.2% at 4096, and -5.1% at 8192. | Not run. | Reject before drift gate because it is consistently slower. |
 | `DS4_METAL_MPP_MOE_TILE_N=64` | Slower than default by 3.3% to 15.6%. | Not run. | Reject before drift gate. |
 | `DS4_METAL_MPP_MOE_DOWN_START_LAYER=9` with gate/up unchanged at 19 | Two-repeat median vs down-12 Tensor auto: +0.3% at 512, +0.1% at 1024, -1.4% at 2048, -0.4% at 4096, and -0.5% at 8192. Generation was within -0.7%..+0.5%. | Not run. | Reject before drift gate because it is slower at most measured contexts. |
 | `DS4_METAL_MPP_MOE_DOWN_START_LAYER=10` with gate/up unchanged at 19 | Two-repeat median vs 19/19/19 Tensor auto: +0.8% at 512, flat at 1024, +0.8% at 2048, +2.6% at 4096, and +2.8% at 8192. Generation was within -1.7%..+1.4%. | Five-fixture gate and `./ds4_test --metal-mpp-equivalence` passed, but `tensor_vs_standard` drift rose to worst RMS `0.314905` and worst top20 abs `0.780825`. | Not promoted because layer 12 kept useful speed with lower drift. |
 | `DS4_METAL_MPP_MOE_DOWN_START_LAYER=11` with gate/up unchanged at 19 | Two-repeat median vs 19/19/19 Tensor auto: +1.7% at 512, +1.7% at 1024, +3.5% at 2048, +1.7% at 4096, and +1.2% at 8192. Generation was within -1.4%..-0.3%. | Five-fixture gate passed, but `tensor_vs_standard` drift rose to worst RMS `0.314275` and worst top20 abs `0.725578`. | Not promoted because layer 12 had a better drift balance. |
+| `DS4_METAL_MPP_MOE_DOWN_START_LAYER=11` with gate/up defaulting to 15 | Two-repeat median vs current Tensor auto: +0.3% at 512, -0.1% at 1024, +0.2% at 2048, +0.5% at 4096, and -2.8% at 8192. Generation was within -1.3%..+0.2%. | Not run. | Reject before drift gate because the new gate/up window removes most of the earlier speed upside and the long-context point regresses. |
 | `DS4_METAL_MPP_MOE_DOWN_START_LAYER=18` with gate/up/down defaulting to 19/19/19 | Two-repeat median vs 19/19/19 Tensor auto: -2.1% at 512, -3.1% at 1024, -3.3% at 2048, -0.7% at 4096, and +1.7% at 8192. Generation was within -1.2%..+0.4%. | Not run. | Reject before drift gate because it is slower at most measured contexts. |
 | `DS4_METAL_MPP_F16_PAIR=1` | Slower than default by 0.9% to 8.6%. | Previously known safe, but not rerun here. | Keep opt-in. |
 | `DS4_METAL_MPP_ATTN_OUT_TILE_N=32` | Slower than default by 1.1% to 16.4%. | Not run. | Keep default tile 64. |
@@ -176,24 +179,29 @@ Representative profile:
 env DS4_METAL_GRAPH_TOKEN_PROFILE=1 \
     DS4_METAL_LAYER_STAGE_PROFILE=1 \
     DS4_METAL_MOE_STAGE_PROFILE=1 \
-    DS4_METAL_MOE_STAGE_PROFILE_FILTER=gate \
     DS4_METAL_ATTN_OUT_STAGE_PROFILE=1 \
+    DS4_METAL_Q8_PREFILL_PROFILE=1 \
+    DS4_METAL_Q8_PREFILL_PROFILE_FILTER=attn_ \
     ./ds4 --metal -mt auto \
       --prompt-file tests/test-vectors/prompts/long_code_audit.txt \
       -c 8192 -n 1 --system "" --nothink --temp 0
 ```
 
-Result: `prefill: 407.88 t/s`.
+Current default result: `prefill: 423.95 t/s`.
 
 Important stage timings at `tokens=3844`:
 
-- Early routed MoE before Tensor MoE window: about `99-125 ms/layer`.
-- Routed MoE after gate/up Tensor starts at layer 20 in the original baseline:
-  about `64 ms/layer`.
-- Routed MoE after down Tensor starts at layer 22 in the original baseline:
-  about `44 ms/layer`.
-- Attention `q_path`: about `25 ms/layer`.
-- Attention output projection: about `37 ms/layer`.
+- Layers 0..11 use legacy routed-MoE projections (`mpp=0/0/0`): median gate
+  `32.615 ms`, up `32.579 ms`, down `32.356 ms`.
+- Layers 12..14 use Tensor down only (`mpp=0/0/1`): median gate `32.531 ms`,
+  up `32.523 ms`, down `13.383 ms`.
+- Layers 15..42 use Tensor gate/up/down (`mpp=1/1/1`): median gate
+  `13.875 ms`, up `13.859 ms`, down `13.518 ms`.
+- Dense attention Q8_0 medians are `attn_q_b=18.069 ms` and
+  `attn_out=18.366 ms`.
+- The attention output projection stage remains about `37.246 ms/layer`;
+  inside the Tensor-enabled late layers the low and output projections are each
+  about `18.5-18.7 ms`.
 
 The routed-MoE stage profiler now prints layer, token/pair counts, expert
 count, gate/down quant types, `mm_id` vs `mm_id_pair_mpp` path, active Tensor
@@ -204,12 +212,9 @@ preserving stage flushes for timing correctness.
 Long-shape routed-MoE profile on `long_code_audit`, `tok=3844`,
 `pairs=23064`, `experts=6`, `gate=iq2_xxs`, `down=q2_k`:
 
-- `FILTER=gate`: layers 0..19 use legacy `mm_id` (`mpp=0/0/0`) and gate is
-  about `32-37 ms`; layers 20..42 use Tensor gate/up (`mpp=1/1/0` or
-  `1/1/1`) and gate is about `13.6-14.3 ms`.
-- `FILTER=down`: layers 0..21 use legacy down (`mpp=0/0/0` or `1/1/0`) and
-  down is about `32-39 ms`; layers 22..42 use Tensor down (`mpp=1/1/1`) and
-  down is about `13.0-13.9 ms`.
+- Layers before the current conservative Tensor window are still the largest
+  remaining routed-MoE opportunity, but the latest one-layer route-window tests
+  did not produce a clean prefill win.
 
 This confirms the highest-value routed-MoE target is still the pre-window
 specialized `mm_id` path, not the generic dense Q8_0 wrapper. The dense
