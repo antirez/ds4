@@ -170,6 +170,7 @@ These were evaluated as env-only candidates and not promoted.
 | Candidate | Speed result | Drift result | Decision |
 | --- | --- | --- | --- |
 | `DS4_METAL_EXPERIMENTAL_MOE_MATMUL=1` | Two-repeat median vs current Tensor auto: +15.9% at 512, +19.7% at 1024, +12.5% at 2048, +6.8% at 4096, +11.7% at 8192. Generation was -4.9%, -1.5%, -3.5%, -0.9%, -1.7%. | Five-fixture gate passed. `tensor_vs_quality` stayed inside the current standard-vs-quality envelope with top1 mismatches `0`, greedy mismatches `1`, worst RMS `0.618172`, and worst top20 abs `2.24006`. `tensor_vs_standard` had no top1 or greedy mismatch, but drift increased to worst RMS `0.669241` and worst top20 abs `1.30664`. | Keep default-off until an eval confirms the larger Tensor-vs-standard logit movement is acceptable. This is the best prefill candidate so far, but not yet promoted over the lower-drift conservative default. |
+| `DS4_METAL_EXPERIMENTAL_MOE_MATMUL=1` plus `DS4_METAL_MPP_MOE_FAST_LAYOUT=0` | Two-repeat median vs current Tensor auto: +8.4% at 512, +12.3% at 1024, +0.4% at 2048, +1.2% at 4096, and +4.3% at 8192. Generation was -4.2% at 1024, -3.2% at 2048, -4.4% at 4096, and near flat at 512/8192. | Five-fixture gate passed, but `tensor_vs_standard` was unchanged from the faster experimental layout: top1 mismatches `0`, greedy mismatches `0`, worst RMS `0.669241`, and worst top20 abs `1.30664`. | Reject as the preferred experimental layout because it gives up speed without reducing the larger Tensor-vs-standard movement. |
 
 ## Profile Signal
 
@@ -219,6 +220,24 @@ Long-shape routed-MoE profile on `long_code_audit`, `tok=3844`,
 This confirms the highest-value routed-MoE target is still the pre-window
 specialized `mm_id` path, not the generic dense Q8_0 wrapper. The dense
 attention target remains `attn_q_b in=1024 out=32768`.
+
+Comparator check on the all-layer experimental routed-MoE Tensor path:
+
+```sh
+env DS4_METAL_EXPERIMENTAL_MOE_MATMUL=1 \
+    DS4_METAL_MPP_COMPARE_ROUTE=all \
+    DS4_METAL_MPP_COMPARE_MAX=12 \
+    DS4_METAL_MPP_COMPARE_VERBOSE=1 \
+    ./ds4 --metal -mt auto \
+      --prompt-file tests/test-vectors/prompts/long_code_audit.txt \
+      -c 8192 -n 1 --system "" --nothink --temp 0
+```
+
+The first 12 local projection comparisons, covering `moe_gate`, `moe_up`, and
+`moe_down` in layers 0..3, stayed far inside the local comparator target. The
+largest observed max abs was about `3.8e-5`, and RMS was about `1e-7` or lower.
+That points to accumulated full-model movement from enabling more Tensor
+layers, not an obvious single routed-MoE projection breach.
 
 For the next matmul kernel iteration, enable filtered Q8_0 prefill-level timing
 with:
