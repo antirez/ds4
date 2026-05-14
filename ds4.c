@@ -9867,6 +9867,25 @@ static bool metal_graph_encode_decode_layer(
     return ok;
 }
 
+static bool metal_graph_decode2_layer_profile_boundary(
+        const char *stage,
+        uint32_t    il,
+        uint32_t    pos0,
+        double      total_t0,
+        double     *stage_t0) {
+    if (ds4_gpu_end_commands() == 0) return false;
+    const double now = now_sec();
+    fprintf(stderr,
+            "ds4: mtp decode2 layer layer=%u pos=%u %s=%.3f ms total=%.3f ms\n",
+            il,
+            pos0,
+            stage,
+            (now - *stage_t0) * 1000.0,
+            (now - total_t0) * 1000.0);
+    *stage_t0 = now;
+    return ds4_gpu_begin_commands() != 0;
+}
+
 static bool metal_graph_encode_decode2_layer_exact(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -9886,6 +9905,9 @@ static bool metal_graph_encode_decode2_layer_exact(
     ds4_gpu_tensor *cur1 = *cur1_io;
     ds4_gpu_tensor *next1 = *next1_io;
     if (!cur0 || !next0 || !cur1 || !next1 || g->raw_cap == 0) return false;
+    const bool profile = getenv("DS4_MTP_EXACT_DECODE2_LAYER_PROFILE") != NULL;
+    const double total_t0 = profile ? now_sec() : 0.0;
+    double stage_t0 = total_t0;
 
     g->cur_hc = cur0;
     g->after_ffn_hc = next0;
@@ -9899,9 +9921,15 @@ static bool metal_graph_encode_decode2_layer_exact(
                                                pos0 % g->raw_cap,
                                                metal_graph_raw_span_for_batch(g, pos0, 1),
                                                token0);
+    if (ok && profile) {
+        ok = metal_graph_decode2_layer_profile_boundary("row0", il, pos0, total_t0, &stage_t0);
+    }
     if (ok) {
         ok = metal_graph_capture_prefix_attn_state(g, il, 1) &&
              metal_graph_capture_prefix_index_state(g, il, 1);
+    }
+    if (ok && profile) {
+        ok = metal_graph_decode2_layer_profile_boundary("capture_prefix", il, pos0, total_t0, &stage_t0);
     }
     if (ok) {
         g->cur_hc = cur1;
@@ -9916,6 +9944,9 @@ static bool metal_graph_encode_decode2_layer_exact(
                                              pos1 % g->raw_cap,
                                              metal_graph_raw_span_for_batch(g, pos1, 1),
                                              token1);
+    }
+    if (ok && profile) {
+        ok = metal_graph_decode2_layer_profile_boundary("row1", il, pos0, total_t0, &stage_t0);
     }
     if (ok) {
         ds4_gpu_tensor *tmp = cur0; cur0 = next0; next0 = tmp;
