@@ -763,7 +763,9 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
             fprintf(stderr, "ds4: diagnostic run completed on the native %s path.\n",
                     ds4_backend_name(cfg->engine.backend));
         }
-    } else if (cfg->gen.temperature > 0.0f || ds4_engine_mtp_draft_tokens(engine) > 1) {
+    } else if (cfg->gen.temperature > 0.0f ||
+               ds4_engine_mtp_draft_tokens(engine) > 1 ||
+               getenv("DS4_FORCE_SESSION_GENERATION") != NULL) {
         rc = run_sampled_generation(engine, cfg, &prompt);
     } else {
         token_printer printer = {
