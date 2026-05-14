@@ -8451,18 +8451,35 @@ static bool metal_graph_apply_directional_steering_ffn(
  * the command batch, so it is intentionally isolated here.
  */
 
-static bool metal_graph_debug_wants(const char *name, uint32_t il, uint32_t pos) {
-    const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
-    if (!prefix || !prefix[0]) return false;
+static const char *metal_graph_debug_dump_prefix(void) {
+    static int init = 0;
+    static const char *prefix = NULL;
+    if (!init) {
+        prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
+        init = 1;
+    }
+    return prefix && prefix[0] ? prefix : NULL;
+}
 
-    const char *name_env = getenv("DS4_METAL_GRAPH_DUMP_NAME");
+static bool metal_graph_debug_wants(const char *name, uint32_t il, uint32_t pos) {
+    if (!metal_graph_debug_dump_prefix()) return false;
+
+    static int init = 0;
+    static const char *name_env = NULL;
+    static const char *layer_env = NULL;
+    static const char *pos_env = NULL;
+    if (!init) {
+        name_env = getenv("DS4_METAL_GRAPH_DUMP_NAME");
+        layer_env = getenv("DS4_METAL_GRAPH_DUMP_LAYER");
+        pos_env = getenv("DS4_METAL_GRAPH_DUMP_POS");
+        init = 1;
+    }
+
     if (name_env && name_env[0] && strstr(name_env, name) == NULL) return false;
 
-    const char *layer_env = getenv("DS4_METAL_GRAPH_DUMP_LAYER");
     if (layer_env && layer_env[0] && strcmp(layer_env, "all") != 0 &&
         (uint32_t)strtoul(layer_env, NULL, 10) != il) return false;
 
-    const char *pos_env = getenv("DS4_METAL_GRAPH_DUMP_POS");
     if (pos_env && pos_env[0] && (uint32_t)strtoul(pos_env, NULL, 10) != pos) return false;
 
     return true;
@@ -8474,8 +8491,8 @@ static void metal_graph_debug_dump_tensor(
         uint64_t          n_f32,
         uint32_t          il,
         uint32_t          pos) {
-    const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
-    if (!t || n_f32 == 0 || !metal_graph_debug_wants(name, il, pos)) return;
+    const char *prefix = metal_graph_debug_dump_prefix();
+    if (!prefix || !t || n_f32 == 0 || !metal_graph_debug_wants(name, il, pos)) return;
 
     if (ds4_gpu_synchronize() == 0) {
         fprintf(stderr, "ds4: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
@@ -8503,8 +8520,8 @@ static void metal_graph_debug_dump_i32_tensor(
         uint64_t          n_i32,
         uint32_t          il,
         uint32_t          pos) {
-    const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
-    if (!t || n_i32 == 0 || !metal_graph_debug_wants(name, il, pos)) return;
+    const char *prefix = metal_graph_debug_dump_prefix();
+    if (!prefix || !t || n_i32 == 0 || !metal_graph_debug_wants(name, il, pos)) return;
 
     if (ds4_gpu_synchronize() == 0) {
         fprintf(stderr, "ds4: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
@@ -8967,6 +8984,26 @@ static bool metal_graph_use_reference_attn_out_hc(void) {
     return metal_graph_env_flag("DS4_METAL_DISABLE_ATTN_OUT_HC_FUSION", &cache);
 }
 
+static bool cuda_no_q_norm_rope_fused(void) {
+    static int cache = -1;
+    return metal_graph_env_flag("DS4_CUDA_NO_Q_NORM_ROPE_FUSED", &cache);
+}
+
+static bool cuda_no_fused_hc_pre(void) {
+    static int cache = -1;
+    return metal_graph_env_flag("DS4_CUDA_NO_FUSED_HC_PRE", &cache);
+}
+
+static bool cuda_no_kv_rope_store_fused(void) {
+    static int cache = -1;
+    return metal_graph_env_flag("DS4_CUDA_NO_KV_ROPE_STORE_FUSED", &cache);
+}
+
+static bool cuda_no_attn_output_rope_low_fused(void) {
+    static int cache = -1;
+    return metal_graph_env_flag("DS4_CUDA_NO_ATTN_OUTPUT_ROPE_LOW_FUSED", &cache);
+}
+
 static bool metal_graph_decode_hc_pre(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *split,
@@ -9092,13 +9129,42 @@ static bool metal_graph_encode_decode_layer(
             ok = metal_graph_layer_stage_profile_boundary("decode", (name), il, pos, 1, &decode_stage_t0); \
         } \
     } while (0)
-    if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
-    if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_attn_fn,
-                                                 hc_dim, mix_hc, g->flat_hc, 1);
     const bool fuse_hc_norm =
         !metal_graph_use_reference_hc_decode() &&
         !metal_graph_use_reference_hc_norm_decode();
-    if (ok && fuse_hc_norm) {
+#ifndef __APPLE__
+    const bool cuda_fuse_hc_pre = fuse_hc_norm && !cuda_no_fused_hc_pre();
+    if (ok && cuda_fuse_hc_pre) {
+        ok = ds4_gpu_hc_decode_pre_norm_fused_tensor(g->attn_cur,
+                                                       g->attn_norm,
+                                                       g->hc_split,
+                                                       g->hc_mix,
+                                                       g->cur_hc,
+                                                       model->map,
+                                                       model->size,
+                                                       layer->hc_attn_fn->abs_offset,
+                                                       layer->hc_attn_scale->abs_offset,
+                                                       layer->hc_attn_base->abs_offset,
+                                                       layer->attn_norm->abs_offset,
+                                                       DS4_N_EMBD,
+                                                       DS4_N_HC,
+                                                       DS4_N_HC_SINKHORN_ITER,
+                                                       DS4_HC_EPS,
+                                                       DS4_RMS_EPS) != 0;
+    }
+    if (ok && !cuda_fuse_hc_pre) {
+#else
+    if (ok) {
+#endif
+        ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
+        if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_attn_fn,
+                                                     hc_dim, mix_hc, g->flat_hc, 1);
+    }
+    if (ok && fuse_hc_norm
+#ifndef __APPLE__
+        && !cuda_fuse_hc_pre
+#endif
+    ) {
         ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(g->attn_cur,
                                                          g->attn_norm,
                                                          g->hc_split,
@@ -9114,7 +9180,7 @@ static bool metal_graph_encode_decode_layer(
                                                          DS4_N_HC_SINKHORN_ITER,
                                                          DS4_HC_EPS,
                                                          DS4_RMS_EPS) != 0;
-    } else if (ok) {
+    } else if (ok && !fuse_hc_norm) {
         ok = metal_graph_decode_hc_pre(g->attn_cur,
                                        g->hc_split,
                                        g->hc_mix,
@@ -9187,15 +9253,28 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("Qraw", g->q, q_dim, il, pos);
     }
-    if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
-    if (ok) {
-        metal_graph_debug_dump_tensor("Qnorm", g->q, q_dim, il, pos);
+#ifndef __APPLE__
+    const bool dump_qnorm = metal_graph_debug_wants("Qnorm", il, pos);
+    if (ok && !dump_qnorm && !cuda_no_q_norm_rope_fused()) {
+        ok = ds4_gpu_head_rms_norm_rope_tail_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM,
+                                                     DS4_N_ROT, pos,
+                                                     compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                     false, freq_base, freq_scale, ext_factor, attn_factor,
+                                                     DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW,
+                                                     DS4_RMS_EPS) != 0;
+    } else
+#endif
+    {
+        if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
+        if (ok) {
+            metal_graph_debug_dump_tensor("Qnorm", g->q, q_dim, il, pos);
+        }
+        if (ok) ok = ds4_gpu_rope_tail_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM,
+                                                DS4_N_ROT, pos,
+                                                compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                false, freq_base, freq_scale, ext_factor, attn_factor,
+                                                DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
     }
-    if (ok) ok = ds4_gpu_rope_tail_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM,
-                                            DS4_N_ROT, pos,
-                                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                            false, freq_base, freq_scale, ext_factor, attn_factor,
-                                            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
     DS4_METAL_PROFILE_DECODE_STAGE("q_path");
     if (ok) {
         metal_graph_debug_dump_tensor("Qcur", g->q, q_dim, il, pos);
@@ -9216,18 +9295,47 @@ static bool metal_graph_encode_decode_layer(
             metal_graph_debug_dump_tensor("KVnorm", g->kv, DS4_N_HEAD_DIM, il, pos);
         }
     }
-    if (ok) ok = ds4_gpu_rope_tail_tensor(g->kv, 1, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
-                                            DS4_N_ROT, pos,
-                                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                            false, freq_base, freq_scale, ext_factor, attn_factor,
-                                            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+#ifndef __APPLE__
+    const bool dump_kv_rope = metal_graph_debug_wants("KVrope", il, pos);
+    const bool fuse_kv_rope_store =
+        ok &&
+        !dump_kv_rope &&
+        !cuda_no_kv_rope_store_fused() &&
+        !metal_graph_use_reference_kv_decode();
+    if (fuse_kv_rope_store) {
+        ok = ds4_gpu_kv_rope_fp8_store_raw_tensor(g->kv,
+                                                   raw_cache,
+                                                   raw_cap,
+                                                   raw_row,
+                                                   DS4_N_HEAD_DIM,
+                                                   DS4_N_ROT,
+                                                   pos,
+                                                   compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                   freq_base,
+                                                   freq_scale,
+                                                   ext_factor,
+                                                   attn_factor,
+                                                   DS4_ROPE_YARN_BETA_FAST,
+                                                   DS4_ROPE_YARN_BETA_SLOW) != 0;
+    }
+    if (ok && !fuse_kv_rope_store) {
+#endif
+        ok = ds4_gpu_rope_tail_tensor(g->kv, 1, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+                                        DS4_N_ROT, pos,
+                                        compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                        false, freq_base, freq_scale, ext_factor, attn_factor,
+                                        DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+#ifndef __APPLE__
+    }
+#endif
     if (ok) {
         metal_graph_debug_dump_tensor("KVrope", g->kv, DS4_N_HEAD_DIM, il, pos);
     }
-    /* RoPE stays as the exact standalone kernel above.  The decode fusion
-     * starts after that, where FP8 KV quantization and raw-cache storage can
-     * share one pass without changing the trigonometric path. */
-    if (ok) ok = metal_graph_decode_kv_store(g->kv, raw_cache, raw_cap, raw_row);
+    if (ok
+#ifndef __APPLE__
+        && !fuse_kv_rope_store
+#endif
+    ) ok = metal_graph_decode_kv_store(g->kv, raw_cache, raw_cap, raw_row);
     DS4_METAL_PROFILE_DECODE_STAGE("kv_path");
     if (ok) {
         metal_graph_debug_dump_tensor("KVcur", g->kv, DS4_N_HEAD_DIM, il, pos);
@@ -9533,32 +9641,68 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("kqv_out", g->heads, q_dim, il, pos);
     }
-    if (ok) ok = ds4_gpu_rope_tail_tensor(g->heads,
-                                            1, DS4_N_HEAD, DS4_N_HEAD_DIM,
-                                            DS4_N_ROT, pos,
-                                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                            true,
-                                            freq_base,
-                                            freq_scale,
-                                            ext_factor,
-                                            attn_factor,
-                                            DS4_ROPE_YARN_BETA_FAST,
-                                            DS4_ROPE_YARN_BETA_SLOW) != 0;
-    if (ok) {
-        metal_graph_debug_dump_tensor("kqv_back", g->heads, q_dim, il, pos);
-    }
     const bool fuse_attn_out_hc =
         !metal_graph_directional_steering_attn_enabled(g) &&
         !metal_graph_use_reference_attn_out_hc();
+#ifndef __APPLE__
+    const bool dump_kqv_back = metal_graph_debug_wants("kqv_back", il, pos);
+    const bool fuse_attn_out_rope_low =
+        ok &&
+        fuse_attn_out_hc &&
+        !cuda_no_attn_output_rope_low_fused() &&
+        !dump_kqv_back;
+    if (ok && !fuse_attn_out_rope_low) {
+#endif
+        ok = ds4_gpu_rope_tail_tensor(g->heads,
+                                        1, DS4_N_HEAD, DS4_N_HEAD_DIM,
+                                        DS4_N_ROT, pos,
+                                        compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                        true,
+                                        freq_base,
+                                        freq_scale,
+                                        ext_factor,
+                                        attn_factor,
+                                        DS4_ROPE_YARN_BETA_FAST,
+                                        DS4_ROPE_YARN_BETA_SLOW) != 0;
+#ifndef __APPLE__
+    }
+#endif
+    if (ok) {
+        metal_graph_debug_dump_tensor("kqv_back", g->heads, q_dim, il, pos);
+    }
     if (ok && fuse_attn_out_hc) {
-        ok = ds4_gpu_attention_output_low_q8_tensor(g->attn_low,
-                                                      model->map,
-                                                      model->size,
-                                                      layer->attn_output_a->abs_offset,
-                                                      group_dim,
-                                                      rank,
-                                                      n_groups,
-                                                      g->heads) != 0;
+#ifndef __APPLE__
+        if (fuse_attn_out_rope_low) {
+            ok = ds4_gpu_attention_output_low_q8_rope_tensor(g->attn_low,
+                                                               model->map,
+                                                               model->size,
+                                                               layer->attn_output_a->abs_offset,
+                                                               group_dim,
+                                                               rank,
+                                                               n_groups,
+                                                               g->heads,
+                                                               DS4_N_HEAD_DIM,
+                                                               DS4_N_ROT,
+                                                               pos,
+                                                               compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                               freq_base,
+                                                               freq_scale,
+                                                               ext_factor,
+                                                               attn_factor,
+                                                               DS4_ROPE_YARN_BETA_FAST,
+                                                               DS4_ROPE_YARN_BETA_SLOW) != 0;
+        } else
+#endif
+        {
+            ok = ds4_gpu_attention_output_low_q8_tensor(g->attn_low,
+                                                          model->map,
+                                                          model->size,
+                                                          layer->attn_output_a->abs_offset,
+                                                          group_dim,
+                                                          rank,
+                                                          n_groups,
+                                                          g->heads) != 0;
+        }
         if (ok) {
             ok = ds4_gpu_matmul_q8_0_hc_expand_tensor(g->after_attn_hc,
                                                         g->attn_out,
@@ -9604,10 +9748,38 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("hc_attn_post", g->after_attn_hc, hc_dim, il, pos);
     }
-    if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->after_attn_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
-    if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_ffn_fn,
-                                                 hc_dim, mix_hc, g->flat_hc, 1);
-    if (ok && fuse_hc_norm) {
+#ifndef __APPLE__
+    if (ok && cuda_fuse_hc_pre) {
+        ok = ds4_gpu_hc_decode_pre_norm_fused_tensor(g->ffn_cur,
+                                                       g->ffn_norm,
+                                                       g->hc_split,
+                                                       g->hc_mix,
+                                                       g->after_attn_hc,
+                                                       model->map,
+                                                       model->size,
+                                                       layer->hc_ffn_fn->abs_offset,
+                                                       layer->hc_ffn_scale->abs_offset,
+                                                       layer->hc_ffn_base->abs_offset,
+                                                       layer->ffn_norm->abs_offset,
+                                                       DS4_N_EMBD,
+                                                       DS4_N_HC,
+                                                       DS4_N_HC_SINKHORN_ITER,
+                                                       DS4_HC_EPS,
+                                                       DS4_RMS_EPS) != 0;
+    }
+    if (ok && !cuda_fuse_hc_pre) {
+#else
+    if (ok) {
+#endif
+        ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->after_attn_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
+        if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_ffn_fn,
+                                                     hc_dim, mix_hc, g->flat_hc, 1);
+    }
+    if (ok && fuse_hc_norm
+#ifndef __APPLE__
+        && !cuda_fuse_hc_pre
+#endif
+    ) {
         ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(g->ffn_cur,
                                                          g->ffn_norm,
                                                          g->hc_split,
@@ -9623,7 +9795,7 @@ static bool metal_graph_encode_decode_layer(
                                                          DS4_N_HC_SINKHORN_ITER,
                                                          DS4_HC_EPS,
                                                          DS4_RMS_EPS) != 0;
-    } else if (ok) {
+    } else if (ok && !fuse_hc_norm) {
         ok = metal_graph_decode_hc_pre(g->ffn_cur,
                                        g->hc_split,
                                        g->hc_mix,

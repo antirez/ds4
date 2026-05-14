@@ -2470,6 +2470,89 @@ __global__ static void rope_tail_kernel(
     tail[i + 1] = x0 * s + x1 * c;
 }
 
+__global__ static void quantize_group_heads_inverse_rope_q8_0_kernel(
+        int8_t *xq,
+        float *xscale,
+        const float *x,
+        uint32_t group_dim,
+        uint32_t n_groups,
+        uint32_t blocks,
+        uint32_t head_dim,
+        uint32_t n_rot,
+        uint32_t pos,
+        uint32_t n_ctx_orig,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow) {
+    uint32_t b = blockIdx.x;
+    uint32_t group = blockIdx.y;
+    if (b >= blocks || group >= n_groups) return;
+    const uint32_t group_heads = group_dim / head_dim;
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint32_t i0 = b * 32u;
+    const uint32_t bn = group_dim - i0 < 32u ? group_dim - i0 : 32u;
+    const uint32_t idx = i0 + threadIdx.x;
+    float v = 0.0f;
+    if (threadIdx.x < bn) {
+        const uint32_t local_head = idx / head_dim;
+        const uint32_t d = idx - local_head * head_dim;
+        const uint32_t head = group * group_heads + local_head;
+        const float *hr = x + (uint64_t)head * head_dim;
+        v = hr[d];
+        if (d >= n_nope && n_rot != 0) {
+            const uint32_t j = d - n_nope;
+            const uint32_t pair_i = j & ~1u;
+            float corr0 = 0.0f;
+            float corr1 = 0.0f;
+            if (ext_factor != 0.0f) {
+                const float denom = 2.0f * logf(freq_base);
+                corr0 = floorf((float)n_rot * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom);
+                corr1 = ceilf((float)n_rot * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom);
+                corr0 = fmaxf(0.0f, corr0);
+                corr1 = fminf((float)(n_rot - 1u), corr1);
+            }
+            const float theta_extrap = (float)pos * powf(freq_base, -((float)pair_i) / (float)n_rot);
+            const float theta_interp = freq_scale * theta_extrap;
+            float theta = theta_interp;
+            float mscale = attn_factor;
+            if (ext_factor != 0.0f) {
+                const float ramp_mix = rope_yarn_ramp_dev(corr0, corr1, (int)pair_i) * ext_factor;
+                theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+                mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+            }
+            const float c = cosf(theta) * mscale;
+            const float s = -sinf(theta) * mscale;
+            const float x0 = hr[n_nope + pair_i];
+            const float x1 = hr[n_nope + pair_i + 1u];
+            v = (j & 1u) ? (x0 * s + x1 * c) : (x0 * c - x1 * s);
+        }
+    }
+
+    const float a = threadIdx.x < bn ? fabsf(v) : 0.0f;
+    __shared__ float vals[32];
+    vals[threadIdx.x] = a;
+    __syncthreads();
+    for (uint32_t stride = 16u; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) vals[threadIdx.x] = fmaxf(vals[threadIdx.x], vals[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    const float dscale = vals[0] / 127.0f;
+    const float id = dscale != 0.0f ? 1.0f / dscale : 0.0f;
+    const uint64_t qb = (uint64_t)group * blocks + b;
+    if (threadIdx.x == 0) xscale[qb] = dscale;
+    int8_t *dst = xq + qb * 32u;
+    if (threadIdx.x < bn) {
+        int q = (int)lrintf(v * id);
+        q = q > 127 ? 127 : (q < -128 ? -128 : q);
+        dst[threadIdx.x] = (int8_t)q;
+    } else {
+        dst[threadIdx.x] = 0;
+    }
+}
+
 __device__ static float dsv4_e4m3fn_value_dev(int i) {
     int exp = (i >> 3) & 15;
     int mant = i & 7;
@@ -2554,6 +2637,78 @@ __global__ static void fp8_kv_quantize_kernel(float *x, uint32_t n_tok, uint32_t
             xr[off + tid] = q;
         }
         __syncthreads();
+    }
+}
+
+__global__ static void kv_rope_fp8_store_raw_kernel(
+        float *kv,
+        float *raw,
+        uint32_t raw_cap,
+        uint32_t raw_row,
+        uint32_t head_dim,
+        uint32_t n_rot,
+        uint32_t pos,
+        uint32_t n_ctx_orig,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow) {
+    const uint32_t tid = threadIdx.x;
+    const uint32_t n_nope = head_dim - n_rot;
+    __shared__ float scratch[64];
+
+    float corr0 = 0.0f;
+    float corr1 = 0.0f;
+    if (ext_factor != 0.0f) {
+        const float denom = 2.0f * logf(freq_base);
+        corr0 = floorf((float)n_rot * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom);
+        corr1 = ceilf((float)n_rot * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom);
+        corr0 = fmaxf(0.0f, corr0);
+        corr1 = fminf((float)(n_rot - 1u), corr1);
+    }
+    for (uint32_t pair = tid; pair < n_rot / 2u; pair += blockDim.x) {
+        const uint32_t i = pair * 2u;
+        const float theta_extrap = (float)pos * powf(freq_base, -((float)i) / (float)n_rot);
+        const float theta_interp = freq_scale * theta_extrap;
+        float theta = theta_interp;
+        float mscale = attn_factor;
+        if (ext_factor != 0.0f) {
+            const float ramp_mix = rope_yarn_ramp_dev(corr0, corr1, (int)i) * ext_factor;
+            theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+            mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+        }
+        const float c = cosf(theta) * mscale;
+        const float s = sinf(theta) * mscale;
+        float *tail = kv + n_nope;
+        const float x0 = tail[i];
+        const float x1 = tail[i + 1u];
+        tail[i] = x0 * c - x1 * s;
+        tail[i + 1u] = x0 * s + x1 * c;
+    }
+    __syncthreads();
+
+    for (uint32_t off = 0; off < n_nope; off += 64u) {
+        float v = 0.0f;
+        if (off + tid < n_nope) v = kv[off + tid];
+        scratch[tid] = off + tid < n_nope ? fabsf(v) : 0.0f;
+        __syncthreads();
+        for (uint32_t stride = 32u; stride > 0; stride >>= 1) {
+            if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+            __syncthreads();
+        }
+        const float scale = exp2f(ceilf(log2f(fmaxf(scratch[0], 1.0e-4f) / 448.0f)));
+        if (off + tid < n_nope) {
+            const float q = dsv4_e4m3fn_dequant_dev(fminf(448.0f, fmaxf(-448.0f, v / scale))) * scale;
+            kv[off + tid] = q;
+        }
+        __syncthreads();
+    }
+
+    const uint32_t row = raw_row % raw_cap;
+    for (uint32_t d = tid; d < head_dim; d += blockDim.x) {
+        raw[(uint64_t)row * head_dim + d] = __half2float(__float2half(kv[d]));
     }
 }
 
@@ -4000,6 +4155,82 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
     for (uint32_t col = d; col < n_embd; col += blockDim.x) {
         const float v = out[(uint64_t)t * n_embd + col];
         norm_out[(uint64_t)t * n_embd + col] = v * norm_scale * norm_w[col];
+    }
+}
+
+__global__ static void hc_decode_pre_mix_parallel_kernel(
+        float *__restrict__ mix_out,
+        const float *__restrict__ residual_hc,
+        const __half *__restrict__ w,
+        float norm_eps) {
+    const uint32_t tid = threadIdx.x;
+    const uint32_t row = blockIdx.x;
+    const uint32_t n_embd = 4096u;
+    const uint32_t hc_dim = 4u * n_embd;
+    if (row >= 24u) return;
+    float ss = 0.0f;
+    float dot = 0.0f;
+    const __half *wr = w + (uint64_t)row * hc_dim;
+    for (uint32_t i = tid; i < hc_dim; i += blockDim.x) {
+        const float v = residual_hc[i];
+        ss += v * v;
+        dot += __half2float(wr[i]) * v;
+    }
+    __shared__ float partial_ss[1024];
+    __shared__ float partial_dot[1024];
+    partial_ss[tid] = ss;
+    partial_dot[tid] = dot;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partial_ss[tid] += partial_ss[tid + stride];
+            partial_dot[tid] += partial_dot[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        const float in_norm = rsqrtf(partial_ss[0] / (float)hc_dim + norm_eps);
+        mix_out[row] = partial_dot[0] * in_norm;
+    }
+}
+
+__global__ static void hc_decode_pre_finish_kernel(
+        float *__restrict__ out,
+        float *__restrict__ norm_out,
+        float *__restrict__ split,
+        const float *__restrict__ mix,
+        const float *__restrict__ residual_hc,
+        const float *__restrict__ scale,
+        const float *__restrict__ base,
+        const float *__restrict__ norm_w,
+        uint32_t sinkhorn_iters,
+        float epsv,
+        float norm_eps) {
+    const uint32_t tid = threadIdx.x;
+    const uint32_t n_embd = 4096u;
+    if (tid == 0) hc4_split_one(split, mix, scale, base, sinkhorn_iters, epsv);
+    __syncthreads();
+
+    float os = 0.0f;
+    for (uint32_t col = tid; col < n_embd; col += blockDim.x) {
+        float acc = 0.0f;
+        acc += residual_hc[col] * split[0];
+        acc += residual_hc[n_embd + col] * split[1];
+        acc += residual_hc[2u * n_embd + col] * split[2];
+        acc += residual_hc[3u * n_embd + col] * split[3];
+        out[col] = acc;
+        os += acc * acc;
+    }
+    __shared__ float partial[1024];
+    partial[tid] = os;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float out_norm = rsqrtf(partial[0] / (float)n_embd + norm_eps);
+    for (uint32_t col = tid; col < n_embd; col += blockDim.x) {
+        norm_out[col] = out[col] * out_norm * norm_w[col];
     }
 }
 
@@ -6384,6 +6615,41 @@ extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint3
     return cuda_ok(cudaGetLastError(), "rope_tail launch");
 }
 extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim);
+extern "C" int ds4_gpu_kv_rope_fp8_store_raw_tensor(
+        ds4_gpu_tensor *kv,
+        ds4_gpu_tensor *raw_cache,
+        uint32_t          raw_cap,
+        uint32_t          raw_row,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        uint32_t          pos,
+        uint32_t          n_ctx_orig,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow) {
+    if (!kv || !raw_cache || raw_cap == 0 || n_rot > head_dim || (n_rot & 1u) ||
+        kv->bytes < (uint64_t)head_dim * sizeof(float) ||
+        raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float)) return 0;
+    kv_rope_fp8_store_raw_kernel<<<1, 64>>>((float *)kv->ptr,
+                                            (float *)raw_cache->ptr,
+                                            raw_cap,
+                                            raw_row,
+                                            head_dim,
+                                            n_rot,
+                                            pos,
+                                            n_ctx_orig,
+                                            freq_base,
+                                            freq_scale,
+                                            ext_factor,
+                                            attn_factor,
+                                            beta_fast,
+                                            beta_slow);
+    return cuda_ok(cudaGetLastError(), "kv_rope_fp8_store_raw launch");
+}
+
 extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
         ds4_gpu_tensor *kv,
         ds4_gpu_tensor *raw_cache,
@@ -7573,6 +7839,84 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
                                                       use_dp4a);
     return cuda_ok(cudaGetLastError(), "attention_output_low_q8 launch");
 }
+
+extern "C" int ds4_gpu_attention_output_low_q8_rope_tensor(
+        ds4_gpu_tensor       *low,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        const ds4_gpu_tensor *heads,
+        uint32_t                head_dim,
+        uint32_t                n_rot,
+        uint32_t                pos,
+        uint32_t                n_ctx_orig,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow) {
+    if (!low || !heads || !model_map || group_dim == 0 || rank == 0 || n_groups == 0 ||
+        head_dim == 0 || group_dim % head_dim != 0 || n_rot > head_dim) {
+        return 0;
+    }
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    const uint64_t blocks_a = (group_dim + 31) / 32;
+    const uint64_t out_a_bytes = (uint64_t)n_groups * rank * blocks_a * 34;
+    if (out_a_offset > model_size ||
+        out_a_bytes > model_size - out_a_offset ||
+        heads->bytes < (uint64_t)n_groups * group_dim * sizeof(float) ||
+        low->bytes < low_dim * sizeof(float)) {
+        return 0;
+    }
+    const unsigned char *out_a = reinterpret_cast<const unsigned char *>(
+            cuda_model_range_ptr(model_map, out_a_offset, out_a_bytes, "attn_out_a"));
+    if (!out_a) return 0;
+
+    const uint64_t x_rows = (uint64_t)n_groups;
+    const uint64_t xq_bytes = x_rows * blocks_a * 32u;
+    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+    const uint64_t tmp_bytes = scale_offset + x_rows * blocks_a * sizeof(float);
+    void *tmp = cuda_tmp_alloc(tmp_bytes, "attention output low rope q8 prequant");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_offset);
+    const int use_dp4a = cuda_q8_use_dp4a();
+    dim3 qgrid((unsigned)blocks_a, (unsigned)n_groups, 1);
+    quantize_group_heads_inverse_rope_q8_0_kernel<<<qgrid, 32>>>(xq,
+                                                                 xscale,
+                                                                 (const float *)heads->ptr,
+                                                                 (uint32_t)group_dim,
+                                                                 n_groups,
+                                                                 (uint32_t)blocks_a,
+                                                                 head_dim,
+                                                                 n_rot,
+                                                                 pos,
+                                                                 n_ctx_orig,
+                                                                 freq_base,
+                                                                 freq_scale,
+                                                                 ext_factor,
+                                                                 attn_factor,
+                                                                 beta_fast,
+                                                                 beta_slow);
+    if (!cuda_ok(cudaGetLastError(), "attention_output_low_q8_rope prequant launch")) return 0;
+    dim3 grid_a(((unsigned)low_dim + 7u) / 8u, 1, 1);
+    grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256>>>((float *)low->ptr,
+                                                      out_a,
+                                                      xq,
+                                                      xscale,
+                                                      group_dim,
+                                                      rank,
+                                                      n_groups,
+                                                      1,
+                                                      blocks_a,
+                                                      use_dp4a);
+    return cuda_ok(cudaGetLastError(), "attention_output_low_q8_rope launch");
+}
+
 extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint32_t n, float clamp, float weight) {
     if (!out || !gate || !up ||
         out->bytes < (uint64_t)n * sizeof(float) ||
@@ -10526,6 +10870,66 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_tensor(
             n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps);
     return cuda_ok(cudaGetLastError(), "hc split weighted sum launch");
 }
+extern "C" int ds4_gpu_hc_decode_pre_norm_fused_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *split,
+        ds4_gpu_tensor       *mix_out,
+        const ds4_gpu_tensor *residual_hc,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                fn_weight_offset,
+        uint64_t                scale_offset,
+        uint64_t                base_offset,
+        uint64_t                norm_weight_offset,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                sinkhorn_iters,
+        float                   eps,
+        float                   norm_eps) {
+    if (!out || !norm_out || !split || !mix_out || !residual_hc || !model_map ||
+        n_embd != 4096u || n_hc != 4u ||
+        out->bytes < (uint64_t)n_embd * sizeof(float) ||
+        norm_out->bytes < (uint64_t)n_embd * sizeof(float) ||
+        split->bytes < 24u * sizeof(float) ||
+        mix_out->bytes < 24u * sizeof(float) ||
+        residual_hc->bytes < 4ull * n_embd * sizeof(float)) {
+        return 0;
+    }
+    const uint64_t hc_dim = 4ull * n_embd;
+    const uint64_t fn_bytes = 24ull * hc_dim * sizeof(uint16_t);
+    if (fn_weight_offset > model_size || fn_bytes > model_size - fn_weight_offset ||
+        scale_offset > model_size || 3ull * sizeof(float) > model_size - scale_offset ||
+        base_offset > model_size || 24ull * sizeof(float) > model_size - base_offset ||
+        norm_weight_offset > model_size || (uint64_t)n_embd * sizeof(float) > model_size - norm_weight_offset) {
+        return 0;
+    }
+    const __half *fn = (const __half *)cuda_model_range_ptr(model_map, fn_weight_offset, fn_bytes, "hc_pre_fn");
+    const float *scale = (const float *)cuda_model_range_ptr(model_map, scale_offset, 3ull * sizeof(float), "hc_scale");
+    const float *base = (const float *)cuda_model_range_ptr(model_map, base_offset, 24ull * sizeof(float), "hc_base");
+    const float *norm_w = (const float *)cuda_model_range_ptr(model_map, norm_weight_offset,
+                                                               (uint64_t)n_embd * sizeof(float), "hc_norm_weight");
+    if (!fn || !scale || !base || !norm_w) return 0;
+
+    hc_decode_pre_mix_parallel_kernel<<<24, 1024>>>((float *)mix_out->ptr,
+                                                   (const float *)residual_hc->ptr,
+                                                   fn,
+                                                   norm_eps);
+    if (!cuda_ok(cudaGetLastError(), "hc_decode_pre_mix_parallel launch")) return 0;
+    hc_decode_pre_finish_kernel<<<1, 1024>>>((float *)out->ptr,
+                                            (float *)norm_out->ptr,
+                                            (float *)split->ptr,
+                                            (const float *)mix_out->ptr,
+                                            (const float *)residual_hc->ptr,
+                                            scale,
+                                            base,
+                                            norm_w,
+                                            sinkhorn_iters,
+                                            eps,
+                                            norm_eps);
+    return cuda_ok(cudaGetLastError(), "hc_decode_pre_finish launch");
+}
+
 extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *norm_out,
