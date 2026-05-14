@@ -40,6 +40,10 @@ def write_fake_tools(tmp: Path) -> tuple[Path, Path, Path, Path]:
         fake_engine,
         """
         #!/usr/bin/env python3
+        import sys
+        print("ds4: gen step profile cycle=0 pos=1 mtp=1 accepted=1 eval_ms=10.0 generated_before=0", file=sys.stderr)
+        print("ds4: gen step profile cycle=1 pos=2 mtp=1 accepted=2 eval_ms=20.0 generated_before=1", file=sys.stderr)
+        print("ds4: gen step profile cycle=2 pos=4 mtp=1 accepted=32 eval_ms=160.0 generated_before=32", file=sys.stderr)
         print("fake engine output")
         """,
     )
@@ -126,9 +130,25 @@ def run_proof(cmd: list[str]) -> dict[str, Any]:
 def assert_true(report: dict[str, Any], path: str) -> None:
     cur: Any = report
     for part in path.split("."):
-        cur = cur[part]
+        cur = cur[int(part)] if isinstance(cur, list) else cur[part]
     if cur is not True:
         raise AssertionError(f"{path} is not true: {cur!r}")
+
+
+def assert_equal(report: dict[str, Any], path: str, expected: Any) -> None:
+    cur: Any = report
+    for part in path.split("."):
+        cur = cur[int(part)] if isinstance(cur, list) else cur[part]
+    if cur != expected:
+        raise AssertionError(f"{path} expected {expected!r}: {cur!r}")
+
+
+def assert_gt(report: dict[str, Any], path: str, minimum: float) -> None:
+    cur: Any = report
+    for part in path.split("."):
+        cur = cur[int(part)] if isinstance(cur, list) else cur[part]
+    if not cur > minimum:
+        raise AssertionError(f"{path} expected > {minimum!r}: {cur!r}")
 
 
 def run_owned_lifecycle(tmp: Path, base: Path, mtp: Path, fake_engine: Path, fake_weight_server: Path) -> None:
@@ -177,6 +197,38 @@ def run_owned_lifecycle(tmp: Path, base: Path, mtp: Path, fake_engine: Path, fak
         "uploaded_mtp",
     ]:
         assert_true(report, f"weight_server_validation.checks.{check}")
+    assert_gt(report, "results.0.timing.steady_state.skip_first_32_tokens.tps", 0.0)
+
+
+def run_budget_preset(tmp: Path, base: Path, mtp: Path, fake_engine: Path) -> None:
+    report = run_proof(
+        [
+            sys.executable,
+            str(DS4_PROOF),
+            "--bin",
+            str(fake_engine),
+            "--base",
+            str(base),
+            "--mtp",
+            str(mtp),
+            "--budget",
+            "candidate",
+            "--only",
+            "mtp-fast",
+            "--work-dir",
+            str(tmp / "budget-work"),
+            "--json-report",
+            str(tmp / "budget-report.json"),
+        ]
+    )
+    if report["failures"] != 0:
+        raise AssertionError(f"budget proof failures={report['failures']}")
+    assert_equal(report, "budget.name", "candidate")
+    assert_equal(report, "budget.tokens", 512)
+    assert_equal(report, "budget.prompt_count", 4)
+    assert_equal(report, "tokens", 512)
+    assert_equal(report, "results.0.timing.decode_accepted_tokens", 35)
+    assert_gt(report, "results.0.timing.steady_state.skip_first_cycle.tps", 0.0)
 
 
 def run_external_manifest(tmp: Path, base: Path, mtp: Path, fake_engine: Path) -> None:
@@ -267,6 +319,7 @@ def main() -> int:
         tmp = Path(raw_tmp)
         base, mtp, fake_engine, fake_weight_server = write_fake_tools(tmp)
         run_owned_lifecycle(tmp, base, mtp, fake_engine, fake_weight_server)
+        run_budget_preset(tmp, base, mtp, fake_engine)
         run_external_manifest(tmp, base, mtp, fake_engine)
         run_base_only_default_scope(tmp, base, fake_engine, fake_weight_server)
     print("ds4_weight_server_harness_smoke: OK")

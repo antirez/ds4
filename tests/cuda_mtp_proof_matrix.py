@@ -19,10 +19,33 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-DEFAULT_PROMPTS = [
+DEFAULT_PROOF_PROMPTS = [
     "List 100 prime numbers, comma-separated, just numbers.",
     "Write a concise explanation of how speculative decoding works, then give three caveats.",
+    "Write a short C function that returns the maximum value in an int array.",
+    "Summarize why GPU kernel launch overhead matters for small decode batches.",
+    "Give eight terse bullet points about deterministic testing for inference engines.",
+    "Continue this sequence with one item per line: alpha, beta, gamma, delta.",
+    "Explain the tradeoff between exact speculative decoding and approximate draft acceptance.",
+    "Write a compact JSON object with keys name, purpose, risks, and validation.",
 ]
+
+DEFAULT_PROMPTS = DEFAULT_PROOF_PROMPTS[:2]
+
+
+@dataclass(frozen=True)
+class BudgetPreset:
+    name: str
+    tokens: int
+    prompt_count: int
+
+
+BUDGET_PRESETS = {
+    "smoke": BudgetPreset("smoke", tokens=64, prompt_count=2),
+    "candidate": BudgetPreset("candidate", tokens=512, prompt_count=4),
+    "default-on": BudgetPreset("default-on", tokens=1024, prompt_count=8),
+    "nightly": BudgetPreset("nightly", tokens=2048, prompt_count=8),
+}
 
 
 @dataclass(frozen=True)
@@ -181,7 +204,9 @@ def main() -> int:
     ap.add_argument("--bin", default=os.environ.get("DS4_PROOF_BIN", "./ds4"))
     ap.add_argument("--base", default=os.environ.get("DS4_PROOF_BASE"))
     ap.add_argument("--mtp", default=os.environ.get("DS4_PROOF_MTP"))
-    ap.add_argument("--tokens", type=int, default=96)
+    ap.add_argument("--budget", choices=sorted(BUDGET_PRESETS),
+                    help="Named proof budget. --tokens overrides the preset token count.")
+    ap.add_argument("--tokens", type=int)
     ap.add_argument("--work-dir", default="/tmp/ds4_mtp_proof")
     ap.add_argument("--prompt", action="append", dest="prompts")
     ap.add_argument(
@@ -202,7 +227,11 @@ def main() -> int:
     if not args.base or not args.mtp:
         ap.error("provide --base/--mtp or DS4_PROOF_BASE/DS4_PROOF_MTP")
 
-    prompts = args.prompts or DEFAULT_PROMPTS
+    budget = BUDGET_PRESETS.get(args.budget) if args.budget else None
+    tokens = args.tokens
+    if tokens is None:
+        tokens = budget.tokens if budget else 96
+    prompts = args.prompts or DEFAULT_PROOF_PROMPTS[:budget.prompt_count if budget else len(DEFAULT_PROMPTS)]
     custom_variants = [
         Variant(v.name, {**VARIANTS[0].env, **v.env}, use_mtp=v.use_mtp)
         for v in args.custom
@@ -217,6 +246,11 @@ def main() -> int:
     work = Path(args.work_dir)
     work.mkdir(parents=True, exist_ok=True)
 
+    print(
+        f"cuda-mtp-proof variants={len(variants)} prompts={len(prompts)} "
+        f"tokens={tokens} budget={args.budget or '-'}"
+    )
+
     failures = 0
     for pi, prompt in enumerate(prompts):
         print(f"\n=== prompt[{pi}] {prompt[:80]!r}")
@@ -228,7 +262,7 @@ def main() -> int:
             base_model=args.base,
             mtp_model=args.mtp,
             prompt=prompt,
-            tokens=args.tokens,
+            tokens=tokens,
             variant=nomtp,
             out_path=base_out,
             log_path=base_log,
@@ -247,7 +281,7 @@ def main() -> int:
                 base_model=args.base,
                 mtp_model=args.mtp,
                 prompt=prompt,
-                tokens=args.tokens,
+                tokens=tokens,
                 variant=variant,
                 out_path=out,
                 log_path=log,

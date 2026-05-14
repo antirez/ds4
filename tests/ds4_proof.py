@@ -23,10 +23,54 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_PROMPTS = [
+DEFAULT_PROOF_PROMPTS = [
     "List 100 prime numbers, comma-separated, just numbers.",
     "Write a concise explanation of how speculative decoding works, then give three caveats.",
+    "Write a short C function that returns the maximum value in an int array.",
+    "Summarize why GPU kernel launch overhead matters for small decode batches.",
+    "Give eight terse bullet points about deterministic testing for inference engines.",
+    "Continue this sequence with one item per line: alpha, beta, gamma, delta.",
+    "Explain the tradeoff between exact speculative decoding and approximate draft acceptance.",
+    "Write a compact JSON object with keys name, purpose, risks, and validation.",
 ]
+
+DEFAULT_PROMPTS = DEFAULT_PROOF_PROMPTS[:2]
+
+
+@dataclass(frozen=True)
+class BudgetPreset:
+    name: str
+    tokens: int
+    prompt_count: int
+    description: str
+
+
+BUDGET_PRESETS = {
+    "smoke": BudgetPreset(
+        "smoke",
+        tokens=64,
+        prompt_count=2,
+        description="Fast crash and obvious drift check.",
+    ),
+    "candidate": BudgetPreset(
+        "candidate",
+        tokens=512,
+        prompt_count=4,
+        description="Default optimization proof loop beyond the load-dominated region.",
+    ),
+    "default-on": BudgetPreset(
+        "default-on",
+        tokens=1024,
+        prompt_count=8,
+        description="Stronger bar before making an optimization default-on.",
+    ),
+    "nightly": BudgetPreset(
+        "nightly",
+        tokens=2048,
+        prompt_count=8,
+        description="Expensive pre-PR confidence run across the built-in prompt suite.",
+    ),
+}
 
 FAST_MTP_ENV = {
     "DS4_CUDA_MTP_TOP2": "1",
@@ -123,6 +167,7 @@ class RunResult:
     stdout_sha256: str | None = None
     stdout_bytes: int = 0
     wall_ms: float = 0.0
+    timing: dict[str, Any] = field(default_factory=dict)
     shadow: dict[str, Any] = field(default_factory=dict)
 
 
@@ -493,6 +538,31 @@ def parse_shadow(log_text: str) -> dict[str, Any]:
         "verify_v2_max_margin0": v2_max_margin0,
         "verify_v2_max_margin1": v2_max_margin1,
         "gen_step_profile": gen_step_profile,
+    }
+
+
+def profile_timing_summary(*, wall_ms: float, shadow: dict[str, Any]) -> dict[str, Any]:
+    """Return stable timing fields for reports without hiding raw parsed data."""
+    gen_step = shadow.get("gen_step_profile", {})
+    total = gen_step.get("total", {})
+    skip1 = gen_step.get("skip_cycles_1", {})
+    skip4 = gen_step.get("skip_cycles_4", {})
+    skip32 = gen_step.get("skip_tokens_32", {})
+    accepted = int(total.get("accepted", 0) or 0)
+    eval_ms = float(total.get("eval_ms", 0.0) or 0.0)
+    return {
+        "wall_ms": wall_ms,
+        "gen_step_samples": int(gen_step.get("steps", 0) or 0),
+        "decode_eval_ms": eval_ms,
+        "decode_accepted_tokens": accepted,
+        "decode_tps": float(total.get("tps", 0.0) or 0.0),
+        "decode_ms_per_token": float(total.get("ms_per_token", 0.0) or 0.0),
+        "steady_state": {
+            "all": total,
+            "skip_first_cycle": skip1,
+            "skip_first_4_cycles": skip4,
+            "skip_first_32_tokens": skip32,
+        },
     }
 
 
@@ -895,6 +965,7 @@ def run_profile(
         result.stdout_sha256, result.stdout_bytes = sha256_file(out_path)
     if log_path.exists():
         result.shadow = parse_shadow(log_path.read_text(errors="replace"))
+    result.timing = profile_timing_summary(wall_ms=result.wall_ms, shadow=result.shadow)
     return result
 
 
@@ -1146,7 +1217,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--bin", default=os.environ.get("DS4_PROOF_BIN", "./ds4"))
     ap.add_argument("--base", default=os.environ.get("DS4_PROOF_BASE"))
     ap.add_argument("--mtp", default=os.environ.get("DS4_PROOF_MTP"))
-    ap.add_argument("--tokens", type=int, default=96)
+    ap.add_argument("--budget", choices=sorted(BUDGET_PRESETS),
+                    help="Named proof budget. --tokens overrides the preset token count.")
+    ap.add_argument("--tokens", type=int)
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--work-dir", default="/tmp/ds4_proof")
     ap.add_argument("--json-report", type=Path)
@@ -1223,6 +1296,18 @@ def main(argv: list[str] | None = None) -> int:
         for name, env in args.custom_profile
     )
 
+    budget_preset = BUDGET_PRESETS.get(args.budget) if args.budget else None
+    tokens = args.tokens
+    token_source = "cli"
+    if tokens is None:
+        if budget_preset:
+            tokens = budget_preset.tokens
+            token_source = f"budget:{budget_preset.name}"
+        else:
+            tokens = 96
+            token_source = "default"
+
+    prompt_source = "builtin-default"
     if args.prompts or args.prompt_files:
         prompts: list[PromptCase] = []
         for i, prompt in enumerate(args.prompts or []):
@@ -1230,10 +1315,18 @@ def main(argv: list[str] | None = None) -> int:
         base_i = len(prompts)
         for j, path in enumerate(args.prompt_files or []):
             prompts.append(PromptCase(path.stem or f"p{base_i + j:02d}", path.read_text()))
+        prompt_source = "cli"
     elif plan_prompts:
         prompts = plan_prompts
+        prompt_source = "plan"
     else:
-        prompts = [PromptCase(f"p{i:02d}", p) for i, p in enumerate(DEFAULT_PROMPTS)]
+        default_count = budget_preset.prompt_count if budget_preset else len(DEFAULT_PROMPTS)
+        prompts = [
+            PromptCase(f"p{i:02d}", p)
+            for i, p in enumerate(DEFAULT_PROOF_PROMPTS[:default_count])
+        ]
+        if budget_preset:
+            prompt_source = f"budget:{budget_preset.name}"
 
     selected = set(args.only_profiles or [p.name for p in profiles])
     known = {p.name for p in profiles}
@@ -1304,7 +1397,10 @@ def main(argv: list[str] | None = None) -> int:
             f"wall={weight_server_state.start_wall_ms:.0f}ms"
         )
 
-    print(f"ds4-proof suite={args.suite} profiles={len(profiles)} prompts={len(prompts)} tokens={args.tokens}")
+    print(
+        f"ds4-proof suite={args.suite} profiles={len(profiles)} prompts={len(prompts)} "
+        f"tokens={tokens} budget={args.budget or '-'}"
+    )
     results: dict[tuple[str, str], RunResult] = {}
     comparisons: list[ComparisonResult] = []
     failures = 0
@@ -1324,7 +1420,7 @@ def main(argv: list[str] | None = None) -> int:
                         mtp_model=args.mtp,
                         suite=args.suite,
                         prompt_case=prompt_case,
-                        tokens=args.tokens,
+                        tokens=tokens,
                         temperature=args.temperature,
                         nothink=not args.no_nothink,
                         profile=profile,
@@ -1382,7 +1478,16 @@ def main(argv: list[str] | None = None) -> int:
     report = {
         "schema": "ds4-proof-report-v1",
         "suite": args.suite,
-        "tokens": args.tokens,
+        "tokens": tokens,
+        "budget": {
+            "name": args.budget or "",
+            "tokens": tokens,
+            "token_source": token_source,
+            "prompt_source": prompt_source,
+            "prompt_count": len(prompts),
+            "preset_prompt_count": budget_preset.prompt_count if budget_preset else 0,
+            "description": budget_preset.description if budget_preset else "",
+        },
         "temperature": args.temperature,
         "work_dir": str(work_dir),
         "weight_ipc_manifest": weight_ipc_manifest,

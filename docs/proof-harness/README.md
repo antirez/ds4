@@ -27,7 +27,7 @@ For a non-MTP engine optimization smoke run:
 DS4_PROOF_BASE="$BASE" \
 tests/ds4_proof.py \
   --suite argmax_generation \
-  --tokens 64 \
+  --budget smoke \
   --custom-profile candidate:DS4_EXPERIMENTAL_FLAG=1 \
   --json-report /tmp/ds4_proof/report.json
 ```
@@ -37,11 +37,27 @@ For CUDA MTP proof, the compatibility entry point remains available:
 ```sh
 DS4_PROOF_BASE="$BASE" \
 DS4_PROOF_MTP="$MTP" \
-tests/cuda_mtp_proof_matrix.py --tokens 96
+tests/cuda_mtp_proof_matrix.py --budget smoke
 ```
 
-That command now delegates to the generalized runner with
-`--suite mtp_speculative`.
+That compatibility entry point supports the same budget names as the
+generalized runner.
+
+## Budgets
+
+Named budgets make proof runs comparable across optimization work:
+
+| Budget | Tokens | Built-in prompts | Purpose |
+| --- | ---: | ---: | --- |
+| `smoke` | 64 | 2 | Fast crash and obvious drift check. |
+| `candidate` | 512 | 4 | Default edit/proof loop beyond the load-dominated region. |
+| `default-on` | 1024 | 8 | Stronger bar before making an optimization default-on. |
+| `nightly` | 2048 | 8 | Expensive pre-PR confidence run. |
+
+Use `--budget NAME` to select a budget. `--tokens N` overrides the preset token
+count while preserving the selected budget label in the JSON report. Explicit
+`--prompt`, `--prompt-file`, and plan-file prompts always take precedence over
+the budget's built-in prompt count.
 
 ## CUDA Weight Server
 
@@ -73,7 +89,7 @@ DS4_PROOF_BASE="$BASE" \
 DS4_PROOF_MTP="$MTP" \
 tests/ds4_proof.py \
   --suite mtp_speculative \
-  --tokens 512 \
+  --budget candidate \
   --start-weight-server \
   --weight-server-backend vmm \
   --weight-server-scope mtp \
@@ -125,7 +141,7 @@ DS4_PROOF_BASE="$BASE" \
 DS4_PROOF_MTP="$MTP" \
 tests/ds4_proof.py \
   --suite mtp_speculative \
-  --tokens 512 \
+  --budget candidate \
   --weight-ipc-manifest /tmp/ds4_weight_server.ipc \
   --weight-server-backend vmm \
   --weight-server-scope mtp \
@@ -212,9 +228,14 @@ The text output is optimized for interactive investigation. `--json-report`
 emits a structured report containing:
 
 - selected profiles and prompts;
+- selected budget, effective token count, token source, and prompt source;
 - contracts;
 - per-profile command, output path, log path, wall time, output hash, and byte
   count;
+- normalized per-profile timing fields, including generation-step steady-state
+  throughput after all samples, after the first cycle, after the first four
+  cycles, and after the first 32 generated tokens when those samples are
+  available;
 - parsed shadow verifier stats when present;
 - comparison pass/fail records and first-diff snippets.
 
