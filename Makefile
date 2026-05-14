@@ -27,7 +27,7 @@ ROCM_PATH ?= /opt/rocm
 GPU_CC = $(ROCM_PATH)/bin/hipcc
 ROCM_ARCH ?= gfx1151
 
-GPU_CFLAGS ?= -O3 -ffast-math -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
+GPU_CFLAGS ?= -O3 -ffast-math -fno-finite-math-only -pthread -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
 GPU_LDLIBS = -lm -pthread -L$(ROCM_PATH)/lib -lhipblas
 
 @echo "ROCM_ARCH: $(ROCM_ARCH)"
@@ -49,11 +49,11 @@ CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$
 GPU_CC = $(NVCC)
 GPU_CFLAGS = $(NVCCFLAGS)
 GPU_LDLIBS = $(CUDA_LDLIBS)
+EXTRA_DEPS =
 
 endif
 
 CORE_OBJS = ds4.o ds4_distributed.o ds4_cuda.o
-EXTRA_DEPS =
 CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o
 METAL_LDLIBS := $(LDLIBS)
 
@@ -127,7 +127,7 @@ rocm:
 		echo "error: specify ROCM_ARCH, for example: make rocm ROCM_ARCH=gfx1151"; \
 		exit 2; \
 	fi
-	$(MAKE) ds4 ds4-server ds4-bench ds4_test GPU_BACKEND=rocm ROCM_ARCH=$(ROCM_ARCH)
+	$(MAKE) ds4 ds4-server ds4-bench ds4_test ds4-eval GPU_BACKEND=rocm ROCM_ARCH=$(ROCM_ARCH)
 
 
 ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
@@ -140,7 +140,7 @@ ds4-bench: ds4_bench.o $(CORE_OBJS)
 	$(GPU_CC) $(GPU_CFLAGS) -o $@ $^ $(GPU_LDLIBS)
 
 ds4-eval: ds4_eval.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+	$(GPU_CC) $(GPU_CFLAGS) -o $@ $^ $(GPU_LDLIBS)
 
 ds4-agent: ds4_agent.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
