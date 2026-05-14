@@ -80,8 +80,9 @@ setup. With `sd-server` stopped, a short CLI run measured about 16.3 t/s and
 That makes full-logit readback and sampling irrelevant for throughput. It also
 means kernel-local changes must remove about 10 ms/token to reach 20 t/s, while
 the largest individual CUDA hot spots are spread across routed MoE,
-attention-output projection, Q path, and the generic Q8 matvecs. The local
-attempts above did not find a safe kernel-level change with that scale of gain.
+attention-output projection, Q path, and the generic Q8 matvecs. The later
+experimental branch did find one safe, material fast path in HC pre fusion, but
+that still does not close the whole gap to 20 t/s.
 
 The plausible route to 20 t/s is reducing per-token launch/enqueue overhead,
 most likely with CUDA Graph replay or an equivalent persistent decode executor.
@@ -91,10 +92,10 @@ and pointer-swapped HC buffers as host-side control state, and compressed
 layers change behavior at ratio frontiers. A graph implementation would need to
 move those dynamic values into device-resident parameter/state buffers, or
 maintain a small set of graph variants for HC-buffer parity and compression
-frontiers. If that work can cut the 21-26 ms encode/enqueue component roughly in
-half, 20 t/s is realistic; without that class of change, the measured ceiling of
-the current design is closer to the mid/high 16 t/s range in the interactive
-CLI and mid 14 t/s in the conservative 8k/64 bench.
+frontiers. The current experimental branch has pushed the measured ceiling to
+17.21 t/s in the interactive CLI and 15.49 t/s in the conservative 8k/64
+Promessi Sposi bench. Reaching 20 t/s still likely needs another large decode
+change, probably deeper routed-MoE/attention-output work or CUDA Graph replay.
 
 ## Experimental graph-decode branch
 
@@ -147,6 +148,14 @@ Local 8k/64 checks after these changes measured:
 - all decode fast-paths enabled: 15.49 t/s generation, 392.53 t/s prefill
 - HC pre fusion disabled only: 14.56 t/s generation
 - Q/KV/attention-output micro-fusions disabled together: 14.47 t/s generation
+
+The user's usual interactive CLI prompt after these changes measured:
+
+- prefill: 33.86 t/s
+- generation: 17.21 t/s
+
+This is not directly comparable to the fixed 8k/64 bench, but it is the best
+observed interactive no-MTP result on this branch.
 
 `DS4_METAL_GRAPH_TOKEN_PROFILE=1` on a six-token 8k run now reports steady
 decode tokens around 63-65 ms: encode/enqueue is about 19-20 ms on most tokens,
