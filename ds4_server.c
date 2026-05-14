@@ -7701,8 +7701,19 @@ static void *client_main(void *arg) {
     request req;
     char err[160];
     bool ok = false;
+    bool count_tokens_only = false;
     const int ctx_size = ds4_session_ctx(s->session);
-    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages/count_tokens")) {
+        /* Anthropic's count_tokens endpoint takes the same request shape as
+         * /v1/messages but only returns the prompt token total — no inference
+         * runs, so we short-circuit before the worker queue. Pass a NULL
+         * server so parse_anthropic_request skips the tool-memory and
+         * KV-cache lookups it would normally do; both helpers no-op cleanly
+         * on NULL, leaving shared state untouched for a read-only count. */
+        ok = parse_anthropic_request(s->engine, NULL, hr.body, s->default_tokens,
+                                     ctx_size, &req, err, sizeof(err));
+        if (ok) count_tokens_only = true;
+    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {
@@ -7720,6 +7731,14 @@ static void *client_main(void *arg) {
     http_request_free(&hr);
     if (!ok) {
         http_error(fd, 400, err);
+        goto done;
+    }
+
+    if (count_tokens_only) {
+        char body[64];
+        snprintf(body, sizeof(body), "{\"input_tokens\":%d}", req.prompt.len);
+        http_response(fd, 200, "application/json", body);
+        request_free(&req);
         goto done;
     }
 
@@ -7957,7 +7976,7 @@ static void usage(FILE *fp) {
         "  ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192\n"
         "\n"
         "Notes:\n"
-        "  Use /v1/chat/completions, /v1/completions, or /v1/messages.\n"
+        "  Use /v1/chat/completions, /v1/completions, /v1/messages, or /v1/messages/count_tokens.\n"
         "  Larger --ctx values allocate more KV memory at startup; the startup log prints the estimate.\n"
         "  Disk KV caching is best for agents that resend long prompts with stable prefixes.\n"
         "\n"
