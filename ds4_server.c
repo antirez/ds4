@@ -7357,11 +7357,16 @@ typedef struct {
     char sha[41];
     char *path;
     uint8_t quant_bits;
+    uint8_t format_version;
     uint8_t reason;
     uint32_t tokens;
     uint32_t hits;
     uint32_t ctx_size;
     uint8_t ext_flags;
+    uint32_t header_bytes;
+    uint32_t text_crc32c;
+    uint32_t payload_crc32c;
+    uint32_t tool_map_crc32c;
     uint64_t created_at;
     uint64_t last_used;
     uint64_t payload_bytes;
@@ -7999,9 +8004,10 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
  *
  * File layout:
  *
- *   "KVC" version
+ *   "KVC" version (v1 is a 48-byte header, v2 is a 64-byte CRC32C header)
  *   quant bits, save reason, token count, hit count, context size
  *   creation time, last-used time, payload byte count
+ *   v2 CRC32C values for header metadata, text, payload, and tool map
  *   rendered text byte count + rendered text for human inspection
  *   DS4 engine payload written by ds4_session_save_payload()
  *   optional tool-id map section
@@ -8020,8 +8026,14 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
 #define KV_CACHE_MAGIC0 'K'
 #define KV_CACHE_MAGIC1 'V'
 #define KV_CACHE_MAGIC2 'C'
-#define KV_CACHE_VERSION 1u
-#define KV_CACHE_FIXED_HEADER 48u
+#define KV_CACHE_VERSION_V1 1u
+#define KV_CACHE_VERSION_V2 2u
+#define KV_CACHE_V1_HEADER 48u
+#define KV_CACHE_V2_HEADER 64u
+#define KV_CACHE_CRC_HEADER_OFFSET 48u
+#define KV_CACHE_CRC_TEXT_OFFSET 52u
+#define KV_CACHE_CRC_PAYLOAD_OFFSET 56u
+#define KV_CACHE_CRC_TOOL_MAP_OFFSET 60u
 #define KV_CACHE_DEFAULT_MIN_TOKENS 512
 #define KV_CACHE_DEFAULT_COLD_MAX_TOKENS 30000
 /* Tokenizers may merge text across the prompt boundary.  Trimming a small tail
@@ -8092,6 +8104,33 @@ static uint64_t le_get64(const uint8_t *p) {
     uint64_t v = 0;
     for (int i = 7; i >= 0; i--) v = (v << 8) | p[i];
     return v;
+}
+
+static uint32_t crc32c_table[256];
+static pthread_once_t crc32c_once = PTHREAD_ONCE_INIT;
+
+static void crc32c_init_table(void) {
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int bit = 0; bit < 8; bit++) {
+            c = (c >> 1) ^ (0x82f63b78u & (uint32_t)-(int32_t)(c & 1u));
+        }
+        crc32c_table[i] = c;
+    }
+}
+
+static uint32_t crc32c_update(uint32_t crc, const void *ptr, size_t len) {
+    pthread_once(&crc32c_once, crc32c_init_table);
+    const uint8_t *p = ptr;
+    crc = ~crc;
+    for (size_t i = 0; i < len; i++) {
+        crc = crc32c_table[(crc ^ p[i]) & 0xffu] ^ (crc >> 8);
+    }
+    return ~crc;
+}
+
+static uint32_t crc32c_bytes(const void *ptr, size_t len) {
+    return crc32c_update(0, ptr, len);
 }
 
 typedef struct {
@@ -8456,16 +8495,46 @@ static int kv_tool_map_load_from_pos(server *s, FILE *fp, const stop_list *wante
     return loaded;
 }
 
-static void kv_fill_header(uint8_t h[KV_CACHE_FIXED_HEADER], uint8_t quant_bits,
-                           uint8_t reason, uint8_t ext_flags,
-                           uint32_t tokens, uint32_t hits, uint32_t ctx_size,
-                           uint64_t created_at, uint64_t last_used,
-                           uint64_t payload_bytes) {
-    memset(h, 0, KV_CACHE_FIXED_HEADER);
+static bool kv_add_u64(uint64_t a, uint64_t b, uint64_t *out) {
+    if (UINT64_MAX - a < b) return false;
+    *out = a + b;
+    return true;
+}
+
+static bool kv_payload_offset(const kv_entry *e, uint32_t text_bytes, uint64_t *out) {
+    uint64_t off = 0;
+    return e && e->header_bytes != 0 &&
+           kv_add_u64((uint64_t)e->header_bytes, 4u, &off) &&
+           kv_add_u64(off, (uint64_t)text_bytes, out);
+}
+
+static bool kv_tool_map_offset(const kv_entry *e, uint32_t text_bytes, uint64_t *out) {
+    uint64_t off = 0;
+    return kv_payload_offset(e, text_bytes, &off) &&
+           kv_add_u64(off, e->payload_bytes, out);
+}
+
+static uint32_t kv_header_crc32c(const uint8_t h[KV_CACHE_V2_HEADER],
+                                 uint32_t text_bytes) {
+    uint8_t tmp[KV_CACHE_V2_HEADER];
+    memcpy(tmp, h, sizeof(tmp));
+    le_put32(tmp + KV_CACHE_CRC_HEADER_OFFSET, 0);
+    uint8_t tb[4];
+    le_put32(tb, text_bytes);
+    uint32_t crc = crc32c_update(0, tmp, sizeof(tmp));
+    return crc32c_update(crc, tb, sizeof(tb));
+}
+
+static void kv_fill_header_base(uint8_t *h, size_t header_bytes, uint8_t version,
+                                uint8_t quant_bits, uint8_t reason, uint8_t ext_flags,
+                                uint32_t tokens, uint32_t hits, uint32_t ctx_size,
+                                uint64_t created_at, uint64_t last_used,
+                                uint64_t payload_bytes) {
+    memset(h, 0, header_bytes);
     h[0] = KV_CACHE_MAGIC0;
     h[1] = KV_CACHE_MAGIC1;
     h[2] = KV_CACHE_MAGIC2;
-    h[3] = KV_CACHE_VERSION;
+    h[3] = version;
     h[4] = quant_bits;
     h[5] = reason;
     h[6] = ext_flags;
@@ -8477,11 +8546,148 @@ static void kv_fill_header(uint8_t h[KV_CACHE_FIXED_HEADER], uint8_t quant_bits,
     le_put64(h + 40, payload_bytes);
 }
 
-static bool kv_read_header(FILE *fp, kv_entry *e, uint32_t *text_bytes) {
-    uint8_t h[KV_CACHE_FIXED_HEADER];
-    if (fread(h, 1, sizeof(h), fp) != sizeof(h)) return false;
+static void kv_fill_header_v1(uint8_t h[KV_CACHE_V1_HEADER], uint8_t quant_bits,
+                              uint8_t reason, uint8_t ext_flags,
+                              uint32_t tokens, uint32_t hits, uint32_t ctx_size,
+                              uint64_t created_at, uint64_t last_used,
+                              uint64_t payload_bytes) {
+    kv_fill_header_base(h, KV_CACHE_V1_HEADER, KV_CACHE_VERSION_V1,
+                        quant_bits, reason, ext_flags, tokens, hits, ctx_size,
+                        created_at, last_used, payload_bytes);
+}
+
+static void kv_fill_header_v2(uint8_t h[KV_CACHE_V2_HEADER], uint8_t quant_bits,
+                              uint8_t reason, uint8_t ext_flags,
+                              uint32_t tokens, uint32_t hits, uint32_t ctx_size,
+                              uint64_t created_at, uint64_t last_used,
+                              uint64_t payload_bytes, uint32_t text_bytes,
+                              uint32_t text_crc32c, uint32_t payload_crc32c,
+                              uint32_t tool_map_crc32c) {
+    kv_fill_header_base(h, KV_CACHE_V2_HEADER, KV_CACHE_VERSION_V2,
+                        quant_bits, reason, ext_flags, tokens, hits, ctx_size,
+                        created_at, last_used, payload_bytes);
+    le_put32(h + KV_CACHE_CRC_HEADER_OFFSET, 0);
+    le_put32(h + KV_CACHE_CRC_TEXT_OFFSET, text_crc32c);
+    le_put32(h + KV_CACHE_CRC_PAYLOAD_OFFSET, payload_crc32c);
+    le_put32(h + KV_CACHE_CRC_TOOL_MAP_OFFSET, tool_map_crc32c);
+    le_put32(h + KV_CACHE_CRC_HEADER_OFFSET, kv_header_crc32c(h, text_bytes));
+}
+
+static bool kv_crc32c_file_slice(FILE *fp, uint64_t offset, uint64_t len,
+                                 uint32_t *out) {
+    if (out) *out = 0;
+    if (!fp || !out) return false;
+    if (len == 0) return true;
+    if (offset > (uint64_t)INT64_MAX ||
+        fseeko(fp, (off_t)offset, SEEK_SET) != 0) return false;
+    uint8_t buf[64 * 1024];
+    uint32_t crc = 0;
+    while (len != 0) {
+        size_t n = len > sizeof(buf) ? sizeof(buf) : (size_t)len;
+        if (fread(buf, 1, n, fp) != n) return false;
+        crc = crc32c_update(crc, buf, n);
+        len -= n;
+    }
+    *out = crc;
+    return true;
+}
+
+static bool kv_validate_entry_crc(FILE *fp, const kv_entry *e,
+                                  const void *text, uint32_t text_bytes,
+                                  uint64_t file_size, const char **fail_reason) {
+    if (!e || e->format_version != KV_CACHE_VERSION_V2) return true;
+
+    uint64_t payload_off = 0, tool_map_off = 0;
+    if (!kv_payload_offset(e, text_bytes, &payload_off) ||
+        !kv_tool_map_offset(e, text_bytes, &tool_map_off) ||
+        file_size < tool_map_off)
+    {
+        if (fail_reason) *fail_reason = "truncated cache file";
+        return false;
+    }
+
+    off_t saved = ftello(fp);
+    uint32_t crc = text ? crc32c_bytes(text, text_bytes) : 0;
+    bool ok = text || kv_crc32c_file_slice(fp, (uint64_t)e->header_bytes + 4u,
+                                           text_bytes, &crc);
+    if (!ok) {
+        if (fail_reason) *fail_reason = "failed to read cache bytes";
+    } else if (crc != e->text_crc32c) {
+        if (fail_reason) *fail_reason = "text crc32c mismatch";
+        ok = false;
+    }
+    if (ok && !kv_crc32c_file_slice(fp, payload_off, e->payload_bytes, &crc)) {
+        if (fail_reason) *fail_reason = "failed to read cache bytes";
+        ok = false;
+    }
+    if (ok && crc != e->payload_crc32c) {
+        if (fail_reason) *fail_reason = "payload crc32c mismatch";
+        ok = false;
+    }
+    const uint64_t tool_map_bytes = file_size - tool_map_off;
+    if (ok && !kv_crc32c_file_slice(fp, tool_map_off, tool_map_bytes, &crc)) {
+        if (fail_reason) *fail_reason = "failed to read cache bytes";
+        ok = false;
+    }
+    if (ok && crc != e->tool_map_crc32c) {
+        if (fail_reason) *fail_reason = "tool-map crc32c mismatch";
+        ok = false;
+    }
+    if (saved >= 0) (void)fseeko(fp, saved, SEEK_SET);
+    return ok;
+}
+
+static bool kv_read_header(FILE *fp, kv_entry *e, uint32_t *text_bytes,
+                           const char **fail_reason) {
+    if (!fp || !e || !text_bytes) {
+        if (fail_reason) *fail_reason = "invalid header";
+        return false;
+    }
+    memset(e, 0, sizeof(*e));
+    uint8_t h[KV_CACHE_V2_HEADER] = {0};
+    if (fread(h, 1, KV_CACHE_V1_HEADER, fp) != KV_CACHE_V1_HEADER) {
+        if (fail_reason) *fail_reason = "truncated header";
+        return false;
+    }
     if (h[0] != KV_CACHE_MAGIC0 || h[1] != KV_CACHE_MAGIC1 ||
-        h[2] != KV_CACHE_MAGIC2 || h[3] != KV_CACHE_VERSION) return false;
+        h[2] != KV_CACHE_MAGIC2)
+    {
+        if (fail_reason) *fail_reason = "invalid header";
+        return false;
+    }
+    if (h[3] != KV_CACHE_VERSION_V1 && h[3] != KV_CACHE_VERSION_V2) {
+        if (fail_reason) *fail_reason = "unsupported cache version";
+        return false;
+    }
+    const uint8_t version = h[3];
+    const uint32_t header_bytes =
+        version == KV_CACHE_VERSION_V2 ? KV_CACHE_V2_HEADER : KV_CACHE_V1_HEADER;
+    if (version == KV_CACHE_VERSION_V2 &&
+        fread(h + KV_CACHE_V1_HEADER, 1, KV_CACHE_V2_HEADER - KV_CACHE_V1_HEADER, fp) !=
+            KV_CACHE_V2_HEADER - KV_CACHE_V1_HEADER)
+    {
+        if (fail_reason) *fail_reason = "truncated header";
+        return false;
+    }
+    uint8_t tb[4];
+    if (fread(tb, 1, sizeof(tb), fp) != sizeof(tb)) {
+        if (fail_reason) *fail_reason = "truncated header";
+        return false;
+    }
+    *text_bytes = le_get32(tb);
+    if (version == KV_CACHE_VERSION_V2) {
+        uint32_t want = le_get32(h + KV_CACHE_CRC_HEADER_OFFSET);
+        uint32_t got = kv_header_crc32c(h, *text_bytes);
+        if (got != want) {
+            if (fail_reason) *fail_reason = "header crc32c mismatch";
+            return false;
+        }
+        e->text_crc32c = le_get32(h + KV_CACHE_CRC_TEXT_OFFSET);
+        e->payload_crc32c = le_get32(h + KV_CACHE_CRC_PAYLOAD_OFFSET);
+        e->tool_map_crc32c = le_get32(h + KV_CACHE_CRC_TOOL_MAP_OFFSET);
+    }
+    e->format_version = version;
+    e->header_bytes = header_bytes;
     e->quant_bits = h[4];
     e->reason = h[5] <= KV_REASON_SHUTDOWN ? h[5] : KV_REASON_UNKNOWN;
     e->ext_flags = h[6];
@@ -8491,27 +8697,26 @@ static bool kv_read_header(FILE *fp, kv_entry *e, uint32_t *text_bytes) {
     e->created_at = le_get64(h + 24);
     e->last_used = le_get64(h + 32);
     e->payload_bytes = le_get64(h + 40);
-    uint8_t tb[4];
-    if (fread(tb, 1, sizeof(tb), fp) != sizeof(tb)) return false;
-    *text_bytes = le_get32(tb);
     e->text_bytes = *text_bytes;
-    return e->tokens != 0 && (e->quant_bits == 2 || e->quant_bits == 4);
+    if (e->tokens == 0 || (e->quant_bits != 2 && e->quant_bits != 4)) {
+        if (fail_reason) *fail_reason = "invalid header";
+        return false;
+    }
+    return true;
 }
 
 static bool kv_read_entry_file(const char *path, const char sha[41], kv_entry *out) {
     struct stat st;
-    if (stat(path, &st) != 0 || st.st_size < (off_t)(KV_CACHE_FIXED_HEADER + 4)) return false;
+    if (stat(path, &st) != 0 || st.st_size < (off_t)(KV_CACHE_V1_HEADER + 4)) return false;
     FILE *fp = fopen(path, "rb");
     if (!fp) return false;
     kv_entry e = {0};
     uint32_t text_bytes = 0;
-    bool ok = kv_read_header(fp, &e, &text_bytes);
+    bool ok = kv_read_header(fp, &e, &text_bytes, NULL);
     fclose(fp);
     if (!ok) return false;
-    const uint64_t fixed = KV_CACHE_FIXED_HEADER + 4ull;
-    if (UINT64_MAX - fixed < (uint64_t)text_bytes ||
-        UINT64_MAX - fixed - (uint64_t)text_bytes < e.payload_bytes) return false;
-    const uint64_t expected = fixed + (uint64_t)text_bytes + e.payload_bytes;
+    uint64_t expected = 0;
+    if (!kv_tool_map_offset(&e, text_bytes, &expected)) return false;
     if ((uint64_t)st.st_size < expected) return false;
     memcpy(e.sha, sha, 41);
     e.path = xstrdup(path);
@@ -8542,16 +8747,29 @@ static bool kv_cache_touch_file(const char *path, uint32_t hits) {
     if (!fp) return false;
     kv_entry e = {0};
     uint32_t text_bytes = 0;
-    bool ok = kv_read_header(fp, &e, &text_bytes);
+    bool ok = kv_read_header(fp, &e, &text_bytes, NULL);
     if (ok) {
-        uint8_t h[KV_CACHE_FIXED_HEADER];
         uint64_t now = (uint64_t)time(NULL);
-        kv_fill_header(h, e.quant_bits, e.reason, e.ext_flags, e.tokens, hits, e.ctx_size,
-                       e.created_at, now, e.payload_bytes);
-        ok = fseek(fp, 0, SEEK_SET) == 0 &&
-             fwrite(h, 1, sizeof(h), fp) == sizeof(h);
+        if (e.format_version == KV_CACHE_VERSION_V2) {
+            uint8_t h[KV_CACHE_V2_HEADER];
+            kv_fill_header_v2(h, e.quant_bits, e.reason, e.ext_flags,
+                              e.tokens, hits, e.ctx_size,
+                              e.created_at, now, e.payload_bytes, text_bytes,
+                              e.text_crc32c, e.payload_crc32c, e.tool_map_crc32c);
+            ok = fseeko(fp, 0, SEEK_SET) == 0 &&
+                 fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
+                 fflush(fp) == 0;
+        } else {
+            uint8_t h[KV_CACHE_V1_HEADER];
+            kv_fill_header_v1(h, e.quant_bits, e.reason, e.ext_flags,
+                              e.tokens, hits, e.ctx_size,
+                              e.created_at, now, e.payload_bytes);
+            ok = fseeko(fp, 0, SEEK_SET) == 0 &&
+                 fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
+                 fflush(fp) == 0;
+        }
     }
-    fclose(fp);
+    if (fclose(fp) != 0) ok = false;
     return ok;
 }
 
@@ -8578,11 +8796,21 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
 
         kv_entry hdr = {0};
         uint32_t text_bytes = 0;
-        bool ok = kv_read_header(fp, &hdr, &text_bytes);
-        uint64_t skip = (uint64_t)text_bytes + hdr.payload_bytes;
+        bool ok = kv_read_header(fp, &hdr, &text_bytes, NULL);
+        uint64_t tool_map_off = 0;
+        if (ok && !kv_tool_map_offset(&hdr, text_bytes, &tool_map_off)) ok = false;
+        if (ok && hdr.format_version == KV_CACHE_VERSION_V2) {
+            struct stat st;
+            uint32_t crc = 0;
+            ok = fstat(fileno(fp), &st) == 0 &&
+                 (uint64_t)st.st_size >= tool_map_off &&
+                 kv_crc32c_file_slice(fp, tool_map_off,
+                                      (uint64_t)st.st_size - tool_map_off, &crc) &&
+                 crc == hdr.tool_map_crc32c;
+        }
         if (ok && (hdr.ext_flags & KV_EXT_TOOL_MAP) &&
-            skip <= (uint64_t)INT64_MAX &&
-            fseeko(fp, (off_t)skip, SEEK_CUR) == 0)
+            tool_map_off <= (uint64_t)INT64_MAX &&
+            fseeko(fp, (off_t)tool_map_off, SEEK_SET) == 0)
         {
             kv_tool_map_load_from_pos(s, fp, &wanted);
         }
@@ -8776,15 +9004,15 @@ static bool kv_cache_file_text_matches(const char *path, const char sha[41],
 
     kv_entry hdr = {0};
     uint32_t text_bytes = 0;
-    bool ok = kv_read_header(fp, &hdr, &text_bytes) &&
+    bool ok = kv_read_header(fp, &hdr, &text_bytes, NULL) &&
               text_bytes == (uint32_t)text_len;
     char *stored = NULL;
     if (ok) {
         stored = xmalloc((size_t)text_bytes + 1);
         ok = fread(stored, 1, text_bytes, fp) == text_bytes;
     }
-    fclose(fp);
     if (!ok) {
+        fclose(fp);
         free(stored);
         return false;
     }
@@ -8793,6 +9021,13 @@ static bool kv_cache_file_text_matches(const char *path, const char sha[41],
     sha1_bytes_hex(stored, text_bytes, stored_sha);
     ok = !strcmp(stored_sha, sha) &&
          (text_len == 0 || memcmp(stored, text, text_len) == 0);
+    if (ok && hdr.format_version == KV_CACHE_VERSION_V2) {
+        struct stat st;
+        ok = fstat(fileno(fp), &st) == 0 &&
+             kv_validate_entry_crc(fp, &hdr, stored, text_bytes,
+                                   (uint64_t)st.st_size, NULL);
+    }
+    fclose(fp);
     free(stored);
     return ok;
 }
@@ -8823,24 +9058,42 @@ static void kv_cache_rewrite_tool_map(server *s, const char *path, const char *t
     if (!fp) return;
     kv_entry hdr = {0};
     uint32_t text_bytes = 0;
-    bool ok = kv_read_header(fp, &hdr, &text_bytes);
-    uint64_t end = KV_CACHE_FIXED_HEADER + 4ull + (uint64_t)text_bytes + hdr.payload_bytes;
+    bool ok = kv_read_header(fp, &hdr, &text_bytes, NULL);
+    uint64_t end = 0;
+    if (ok) ok = kv_tool_map_offset(&hdr, text_bytes, &end);
     if (ok && end <= (uint64_t)INT64_MAX &&
         fseeko(fp, (off_t)end, SEEK_SET) == 0 &&
         ftruncate(fileno(fp), (off_t)end) == 0)
     {
-        uint64_t ignored = 0;
-        ok = kv_tool_map_write(s, fp, text, &ignored) && fflush(fp) == 0;
-        if (ok && ignored > 0) {
-            uint8_t h[KV_CACHE_FIXED_HEADER];
+        uint64_t tool_map_bytes = 0;
+        ok = kv_tool_map_write(s, fp, text, &tool_map_bytes) && fflush(fp) == 0;
+        if (ok) {
             uint64_t now = (uint64_t)time(NULL);
-            kv_fill_header(h, hdr.quant_bits, hdr.reason,
-                           (uint8_t)(hdr.ext_flags | KV_EXT_TOOL_MAP),
-                           hdr.tokens, hdr.hits, hdr.ctx_size,
-                           hdr.created_at, now, hdr.payload_bytes);
-            ok = fseeko(fp, 0, SEEK_SET) == 0 &&
-                 fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
-                 fflush(fp) == 0;
+            const uint8_t ext_flags = tool_map_bytes > 0
+                ? (uint8_t)(hdr.ext_flags | KV_EXT_TOOL_MAP)
+                : (uint8_t)(hdr.ext_flags & ~KV_EXT_TOOL_MAP);
+            if (hdr.format_version == KV_CACHE_VERSION_V2) {
+                uint8_t h[KV_CACHE_V2_HEADER];
+                uint32_t tool_crc32c = 0;
+                ok = kv_crc32c_file_slice(fp, end, tool_map_bytes, &tool_crc32c);
+                if (ok) {
+                    kv_fill_header_v2(h, hdr.quant_bits, hdr.reason, ext_flags,
+                                      hdr.tokens, hdr.hits, hdr.ctx_size,
+                                      hdr.created_at, now, hdr.payload_bytes, text_bytes,
+                                      hdr.text_crc32c, hdr.payload_crc32c, tool_crc32c);
+                    ok = fseeko(fp, 0, SEEK_SET) == 0 &&
+                         fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
+                         fflush(fp) == 0;
+                }
+            } else {
+                uint8_t h[KV_CACHE_V1_HEADER];
+                kv_fill_header_v1(h, hdr.quant_bits, hdr.reason, ext_flags,
+                                  hdr.tokens, hdr.hits, hdr.ctx_size,
+                                  hdr.created_at, now, hdr.payload_bytes);
+                ok = fseeko(fp, 0, SEEK_SET) == 0 &&
+                     fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
+                     fflush(fp) == 0;
+            }
         }
     }
     fclose(fp);
@@ -8922,7 +9175,7 @@ static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
     buf_printf(&tmpb, "%s.tmp.%ld", path, (long)getpid());
     char *tmp = buf_take(&tmpb);
     const double save_t0 = now_sec();
-    FILE *fp = fopen(tmp, "wb");
+    FILE *fp = fopen(tmp, "w+b");
     if (!fp) {
         server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache failed to create %s: %s save=%.1f ms",
                    tmp, strerror(errno), (now_sec() - save_t0) * 1000.0);
@@ -8934,12 +9187,13 @@ static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
     }
 
     const uint64_t now = (uint64_t)time(NULL);
-    uint8_t h[KV_CACHE_FIXED_HEADER];
+    uint8_t h[KV_CACHE_V2_HEADER];
     uint8_t ext_flags = tool_memory_count_dsml_in_text(s, text) > 0 ? KV_EXT_TOOL_MAP : 0;
     if (text_override) ext_flags |= cache_text_ext;
-    kv_fill_header(h, (uint8_t)quant_bits, kv_reason_code(reason), ext_flags,
-                   (uint32_t)store_tokens.len, 0,
-                   (uint32_t)ds4_session_ctx(s->session), now, now, payload_bytes);
+    kv_fill_header_v2(h, (uint8_t)quant_bits, kv_reason_code(reason), ext_flags,
+                      (uint32_t)store_tokens.len, 0,
+                      (uint32_t)ds4_session_ctx(s->session), now, now,
+                      payload_bytes, (uint32_t)text_len, 0, 0, 0);
     uint8_t tb[4];
     le_put32(tb, (uint32_t)text_len);
     uint64_t tool_map_bytes = 0;
@@ -8950,6 +9204,28 @@ static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
               ds4_session_save_payload(s->session, fp, err, sizeof(err)) == 0 &&
               kv_tool_map_write(s, fp, text, &tool_map_bytes) &&
               fflush(fp) == 0;
+    if (ok) {
+        uint64_t payload_off = 0, tool_map_off = 0;
+        uint32_t text_crc32c = crc32c_bytes(text, text_len);
+        uint32_t payload_crc32c = 0;
+        uint32_t tool_map_crc32c = 0;
+        ok = kv_add_u64(KV_CACHE_V2_HEADER + 4ull, (uint64_t)text_len, &payload_off) &&
+             kv_add_u64(payload_off, payload_bytes, &tool_map_off) &&
+             kv_crc32c_file_slice(fp, payload_off, payload_bytes, &payload_crc32c) &&
+             kv_crc32c_file_slice(fp, tool_map_off, tool_map_bytes, &tool_map_crc32c);
+        if (!ok && !err[0]) snprintf(err, sizeof(err), "failed to checksum cache file");
+        if (ok) {
+            if (tool_map_bytes == 0) ext_flags = (uint8_t)(ext_flags & ~KV_EXT_TOOL_MAP);
+            kv_fill_header_v2(h, (uint8_t)quant_bits, kv_reason_code(reason), ext_flags,
+                              (uint32_t)store_tokens.len, 0,
+                              (uint32_t)ds4_session_ctx(s->session), now, now,
+                              payload_bytes, (uint32_t)text_len,
+                              text_crc32c, payload_crc32c, tool_map_crc32c);
+            ok = fseeko(fp, 0, SEEK_SET) == 0 &&
+                 fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
+                 fflush(fp) == 0;
+        }
+    }
     int saved_errno = errno;
     if (fclose(fp) != 0) {
         if (!saved_errno) saved_errno = errno;
@@ -8973,7 +9249,7 @@ static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
                    original_len - store_tokens.len,
                    reason,
                    text_override ? (cache_text_key ? cache_text_key : "visible-transcript") : "token-text",
-                   (double)(KV_CACHE_FIXED_HEADER + 4ull + text_len + payload_bytes + tool_map_bytes) / (1024.0 * 1024.0),
+                   (double)(KV_CACHE_V2_HEADER + 4ull + text_len + payload_bytes + tool_map_bytes) / (1024.0 * 1024.0),
                    save_ms);
         kv_cache_evict(kc, live_tokens);
     }
@@ -9100,7 +9376,8 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
     uint32_t text_bytes = 0;
     kv_entry hdr = {0};
     const char *fail_reason = "invalid header";
-    bool header_ok = kv_read_header(fp, &hdr, &text_bytes);
+    bool header_ok = kv_read_header(fp, &hdr, &text_bytes, &fail_reason);
+    bool unlink_bad = !header_ok && fail_reason && !strcmp(fail_reason, "header crc32c mismatch");
     char *cached_text = NULL;
     if (header_ok) {
         if ((uint64_t)text_bytes > prompt_bytes) {
@@ -9114,17 +9391,34 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
             } else {
                 cached_text[text_bytes] = '\0';
                 char text_sha[41];
-                sha1_bytes_hex(cached_text, text_bytes, text_sha);
-                if (strcmp(text_sha, e.sha)) {
+                if (!kv_validate_entry_crc(fp, &hdr, cached_text, text_bytes,
+                                           e.file_size, &fail_reason)) {
                     header_ok = false;
-                    fail_reason = "cached text hash mismatch";
-                } else if (!byte_prefix_match(prompt_text, prompt_bytes,
-                                              cached_text, text_bytes)) {
-                    header_ok = false;
-                    fail_reason = "cached text prefix mismatch";
+                    if (hdr.format_version == KV_CACHE_VERSION_V2) unlink_bad = true;
+                } else {
+                    sha1_bytes_hex(cached_text, text_bytes, text_sha);
+                }
+                if (header_ok) {
+                    if (strcmp(text_sha, e.sha)) {
+                        header_ok = false;
+                        fail_reason = "cached text hash mismatch";
+                    } else if (!byte_prefix_match(prompt_text, prompt_bytes,
+                                                  cached_text, text_bytes)) {
+                        header_ok = false;
+                        fail_reason = "cached text prefix mismatch";
+                    }
                 }
             }
         }
+    }
+    uint64_t payload_off = 0;
+    if (header_ok &&
+        (!kv_payload_offset(&hdr, text_bytes, &payload_off) ||
+         payload_off > (uint64_t)INT64_MAX ||
+         fseeko(fp, (off_t)payload_off, SEEK_SET) != 0))
+    {
+        header_ok = false;
+        fail_reason = "failed to seek cache payload";
     }
     char err[160] = {0};
     int loaded = 0;
@@ -9162,6 +9456,7 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
                    (now_sec() - load_t0) * 1000.0);
     }
     fclose(fp);
+    if (unlink_bad) unlink(path);
 
     if (loaded > 0) {
         const double load_ms = (now_sec() - load_t0) * 1000.0;
@@ -13849,6 +14144,10 @@ static void test_sha1_bytes_hex_matches_known_vector(void) {
     TEST_ASSERT(!strcmp(sha, "a9993e364706816aba3e25717850c26c9cd0d89d"));
 }
 
+static void test_crc32c_known_vector(void) {
+    TEST_ASSERT(crc32c_bytes("123456789", 9) == 0xe3069283u);
+}
+
 static void test_kv_stub_file(const char *dir, const char *sha,
                               uint8_t reason, uint32_t tokens, uint32_t hits,
                               uint64_t last_used, uint64_t payload_bytes) {
@@ -13862,8 +14161,8 @@ static void test_kv_stub_file(const char *dir, const char *sha,
         return;
     }
 
-    uint8_t h[KV_CACHE_FIXED_HEADER];
-    kv_fill_header(h, 2, reason, 0, tokens, hits, 32768, 100, last_used, payload_bytes);
+    uint8_t h[KV_CACHE_V1_HEADER];
+    kv_fill_header_v1(h, 2, reason, 0, tokens, hits, 32768, 100, last_used, payload_bytes);
     uint8_t text_len[4] = {0};
     TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
     TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
@@ -13872,6 +14171,143 @@ static void test_kv_stub_file(const char *dir, const char *sha,
     }
     TEST_ASSERT(fclose(fp) == 0);
     free(path);
+}
+
+static char *test_kv_v2_stub_file(const char *dir, const char *text,
+                                  const uint8_t *payload, uint32_t payload_bytes,
+                                  uint32_t hits, char sha_out[41]) {
+    char sha[41];
+    sha1_bytes_hex(text, strlen(text), sha);
+    if (sha_out) memcpy(sha_out, sha, sizeof(sha));
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (!fp) return path;
+
+    const uint32_t text_bytes = (uint32_t)strlen(text);
+    uint8_t h[KV_CACHE_V2_HEADER];
+    kv_fill_header_v2(h, 2, KV_REASON_COLD, 0, 512, hits, 32768,
+                      100, 100, payload_bytes, text_bytes,
+                      crc32c_bytes(text, text_bytes),
+                      crc32c_bytes(payload, payload_bytes), 0);
+    uint8_t text_len[4];
+    le_put32(text_len, text_bytes);
+    TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
+    TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
+    TEST_ASSERT(fwrite(text, 1, text_bytes, fp) == text_bytes);
+    if (payload_bytes > 0) {
+        TEST_ASSERT(fwrite(payload, 1, payload_bytes, fp) == payload_bytes);
+    }
+    TEST_ASSERT(fclose(fp) == 0);
+    return path;
+}
+
+static bool test_kv_validate_file_crc(const char *path, const char **reason_out) {
+    if (reason_out) *reason_out = NULL;
+    struct stat st;
+    if (stat(path, &st) != 0) return false;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return false;
+    kv_entry hdr = {0};
+    uint32_t text_bytes = 0;
+    const char *reason = NULL;
+    bool ok = kv_read_header(fp, &hdr, &text_bytes, &reason) &&
+              kv_validate_entry_crc(fp, &hdr, NULL, text_bytes,
+                                    (uint64_t)st.st_size, &reason);
+    fclose(fp);
+    if (reason_out) *reason_out = reason;
+    return ok;
+}
+
+static void test_kv_cache_v2_crc_rejects_payload_corruption(void) {
+    char tmpl[] = "/tmp/ds4-kv-v2-crc-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *text = "v2 crc text";
+    uint8_t payload[] = {0x10, 0x20, 0x30, 0x40, 0x50};
+    char *path = test_kv_v2_stub_file(dir, text, payload, sizeof(payload), 0, NULL);
+
+    const char *reason = NULL;
+    TEST_ASSERT(test_kv_validate_file_crc(path, &reason));
+    TEST_ASSERT(reason == NULL);
+
+    FILE *fp = fopen(path, "r+b");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        const uint64_t payload_off = KV_CACHE_V2_HEADER + 4ull + strlen(text);
+        TEST_ASSERT(fseeko(fp, (off_t)(payload_off + 2u), SEEK_SET) == 0);
+        int c = fgetc(fp);
+        TEST_ASSERT(c != EOF);
+        TEST_ASSERT(fseeko(fp, (off_t)(payload_off + 2u), SEEK_SET) == 0);
+        TEST_ASSERT(fputc(c ^ 0xff, fp) != EOF);
+        TEST_ASSERT(fclose(fp) == 0);
+    }
+
+    reason = NULL;
+    TEST_ASSERT(!test_kv_validate_file_crc(path, &reason));
+    TEST_ASSERT(reason && strstr(reason, "crc32c mismatch") != NULL);
+
+    unlink(path);
+    free(path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_existing_compatible_rejects_v2_crc_mismatch(void) {
+    char tmpl[] = "/tmp/ds4-kv-v2-compatible-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *text = "v2 compatible text";
+    uint8_t payload[] = {0x11, 0x22, 0x33};
+    char sha[41];
+    char *path = test_kv_v2_stub_file(dir, text, payload, sizeof(payload), 0, sha);
+
+    FILE *fp = fopen(path, "r+b");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        const uint64_t payload_off = KV_CACHE_V2_HEADER + 4ull + strlen(text);
+        TEST_ASSERT(fseeko(fp, (off_t)payload_off, SEEK_SET) == 0);
+        TEST_ASSERT(fputc(0xee, fp) != EOF);
+        TEST_ASSERT(fclose(fp) == 0);
+    }
+
+    kv_disk_cache kc = {0};
+    TEST_ASSERT(!kv_cache_existing_compatible(&kc, path, sha, text, strlen(text), 2, 32768));
+    TEST_ASSERT(access(path, F_OK) != 0);
+
+    unlink(path);
+    free(path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_touch_preserves_v2_header_crc(void) {
+    char tmpl[] = "/tmp/ds4-kv-v2-touch-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *text = "v2 touch text";
+    uint8_t payload[] = {0x01, 0x02, 0x03};
+    char sha[41];
+    char *path = test_kv_v2_stub_file(dir, text, payload, sizeof(payload), 3, sha);
+
+    TEST_ASSERT(kv_cache_touch_file(path, 9));
+    kv_entry e = {0};
+    TEST_ASSERT(kv_read_entry_file(path, sha, &e));
+    TEST_ASSERT(e.format_version == KV_CACHE_VERSION_V2);
+    TEST_ASSERT(e.header_bytes == KV_CACHE_V2_HEADER);
+    TEST_ASSERT(e.hits == 9);
+    kv_entry_free(&e);
+    TEST_ASSERT(test_kv_validate_file_crc(path, NULL));
+
+    unlink(path);
+    free(path);
+    rmdir(dir);
 }
 
 static void test_kv_text_stub_file(const char *dir, const char *text,
@@ -13888,8 +14324,8 @@ static void test_kv_text_stub_file(const char *dir, const char *text,
         return;
     }
 
-    uint8_t h[KV_CACHE_FIXED_HEADER];
-    kv_fill_header(h, 2, KV_REASON_COLD, 0, tokens, 0, 32768, 100, 100, payload_bytes);
+    uint8_t h[KV_CACHE_V1_HEADER];
+    kv_fill_header_v1(h, 2, KV_REASON_COLD, 0, tokens, 0, 32768, 100, 100, payload_bytes);
     uint8_t text_len[4];
     le_put32(text_len, (uint32_t)strlen(text));
     TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
@@ -14024,8 +14460,8 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
     FILE *fp = fopen(path, "wb");
     TEST_ASSERT(fp != NULL);
     if (fp) {
-        uint8_t h[KV_CACHE_FIXED_HEADER];
-        kv_fill_header(h, 2, KV_REASON_CONTINUED, KV_EXT_TOOL_MAP, 512, 0, 32768, 100, 100, 0);
+        uint8_t h[KV_CACHE_V1_HEADER];
+        kv_fill_header_v1(h, 2, KV_REASON_CONTINUED, KV_EXT_TOOL_MAP, 512, 0, 32768, 100, 100, 0);
         uint8_t text_len[4];
         le_put32(text_len, (uint32_t)strlen(text));
         TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
@@ -14095,7 +14531,7 @@ static void test_kv_cache_eviction_values_fresh_snapshots(void) {
     kc.enabled = true;
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
-    kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
+    kc.budget_bytes = (KV_CACHE_V1_HEADER + 4u + 2048u) + 16u;
     kv_cache_evict(&kc, NULL);
 
     TEST_ASSERT(access(old_path, F_OK) != 0);
@@ -14130,7 +14566,7 @@ static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
     kc.enabled = true;
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
-    kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
+    kc.budget_bytes = (KV_CACHE_V1_HEADER + 4u + 2048u) + 16u;
     kv_cache_evict(&kc, NULL);
 
     TEST_ASSERT(access(cold_path, F_OK) != 0);
@@ -14476,6 +14912,10 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_store_len_uses_configured_boundary();
     test_kv_cache_continued_uses_aligned_frontiers();
     test_sha1_bytes_hex_matches_known_vector();
+    test_crc32c_known_vector();
+    test_kv_cache_v2_crc_rejects_payload_corruption();
+    test_kv_cache_existing_compatible_rejects_v2_crc_mismatch();
+    test_kv_cache_touch_preserves_v2_header_crc();
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
