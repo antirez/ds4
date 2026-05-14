@@ -680,6 +680,34 @@ support the CPU backend for reference/debug use and share the same KV session
 and snapshot format as Metal and CUDA, but normal inference should use Metal or
 CUDA.
 
+### Metal TurboQuant KV cache
+
+The Metal graph can store compressed attention KV rows with the TurboQuant
+PolarQuant/WHT formats instead of the default FP8 rows:
+
+```sh
+DS4_KV_TURBO=4 ./ds4-server --ctx 384000 ...
+DS4_KV_TURBO=3 ./ds4-server --ctx 384000 ...
+```
+
+`DS4_KV_TURBO=4` is the preferred quality/speed mode. `DS4_KV_TURBO=3`
+uses a smaller 3-bit cache and is mainly useful when memory pressure is the
+first constraint. Unset `DS4_KV_TURBO`, or set it to `0`, to keep the FP8
+path.
+
+For ratio-4 indexed decode, the default compressed-row top-k remains 512.
+Fast non-quality runs can lower it with `DS4_METAL_DECODE_INDEXER_TOP_K`;
+values are capped at 512 and rounded down to a power of two:
+
+```sh
+DS4_KV_TURBO=4 DS4_METAL_DECODE_INDEXER_TOP_K=128 ./ds4-server --ctx 384000 ...
+```
+
+`--quality` keeps the 512-row path. The diagnostic switches
+`DS4_METAL_DISABLE_TURBO_DIRECT_ATTN=1` and
+`DS4_METAL_DISABLE_TURBO_SELECTED_F16=1` restore the older materialized
+attention paths for comparisons.
+
 ## Steering
 
 This project supports steering with single-vector activation directions; see the

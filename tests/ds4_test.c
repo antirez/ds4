@@ -150,6 +150,314 @@ static void test_metal_f16_matvec_fast_nr0_4(void) {
     free(weights_raw);
 }
 
+static void test_metal_turbo_quant_roundtrip_one(bool turbo4) {
+    const uint32_t n_tok = 3;
+    const uint32_t n_head = 2;
+    const uint32_t n_rows = n_tok * n_head;
+    const uint32_t head_dim = 96;
+    const uint32_t n_rot = 32;
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint32_t n_blocks = n_nope / 32;
+    const uint64_t block_bytes = turbo4 ? DS4_TURBO4_BLOCK_BYTES : DS4_TURBO3_BLOCK_BYTES;
+    const uint64_t row_bytes = (uint64_t)n_blocks * block_bytes + (uint64_t)n_rot * sizeof(float);
+    const uint64_t src_bytes = (uint64_t)n_rows * head_dim * sizeof(float);
+    const uint64_t q_bytes = (uint64_t)n_rows * row_bytes;
+
+    ds4_gpu_tensor *src = ds4_gpu_tensor_alloc(src_bytes);
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_bytes);
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(src_bytes);
+    TEST_ASSERT(src != NULL);
+    TEST_ASSERT(q != NULL);
+    TEST_ASSERT(out != NULL);
+    if (!src || !q || !out) {
+        ds4_gpu_tensor_free(out);
+        ds4_gpu_tensor_free(q);
+        ds4_gpu_tensor_free(src);
+        return;
+    }
+
+    float *src_host = malloc((size_t)src_bytes);
+    float *out_host = malloc((size_t)src_bytes);
+    TEST_ASSERT(src_host != NULL);
+    TEST_ASSERT(out_host != NULL);
+    if (!src_host || !out_host) {
+        free(out_host);
+        free(src_host);
+        ds4_gpu_tensor_free(out);
+        ds4_gpu_tensor_free(q);
+        ds4_gpu_tensor_free(src);
+        return;
+    }
+
+    for (uint32_t r = 0; r < n_rows; r++) {
+        for (uint32_t i = 0; i < head_dim; i++) {
+            float v = (float)((int)((r * 17u + i * 13u) % 41u) - 20) / 21.0f;
+            if (i >= n_nope) v = 1000.0f + (float)(r * 100u + i);
+            src_host[(uint64_t)r * head_dim + i] = v;
+        }
+    }
+
+    TEST_ASSERT(ds4_gpu_tensor_write(src, 0, src_host, src_bytes) != 0);
+    if (turbo4) {
+        TEST_ASSERT(ds4_gpu_turbo4_kv_quantize_tensor(q, src, n_tok, n_head, head_dim, n_rot) != 0);
+        TEST_ASSERT(ds4_gpu_turbo4_dequant_f32_tensor(out, q, n_blocks, n_rot, n_rows) != 0);
+    } else {
+        TEST_ASSERT(ds4_gpu_turbo3_kv_quantize_tensor(q, src, n_tok, n_head, head_dim, n_rot) != 0);
+        TEST_ASSERT(ds4_gpu_turbo3_dequant_f32_tensor(out, q, n_blocks, n_rot, n_rows) != 0);
+    }
+    TEST_ASSERT(ds4_gpu_tensor_read(out, 0, out_host, src_bytes) != 0);
+
+    double prefix_ss = 0.0;
+    double err_ss = 0.0;
+    float max_tail = 0.0f;
+    for (uint32_t r = 0; r < n_rows; r++) {
+        for (uint32_t i = 0; i < head_dim; i++) {
+            const uint64_t off = (uint64_t)r * head_dim + i;
+            TEST_ASSERT(isfinite(out_host[off]));
+            if (i < n_nope) {
+                const double d = (double)out_host[off] - (double)src_host[off];
+                err_ss += d * d;
+                prefix_ss += (double)src_host[off] * (double)src_host[off];
+            } else {
+                const float err = fabsf(out_host[off] - src_host[off]);
+                if (err > max_tail) max_tail = err;
+            }
+        }
+    }
+    const double rel_rms = sqrt(err_ss / prefix_ss);
+    TEST_ASSERT(max_tail == 0.0f);
+    TEST_ASSERT(rel_rms < (turbo4 ? 0.55 : 0.75));
+
+    free(out_host);
+    free(src_host);
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(q);
+    ds4_gpu_tensor_free(src);
+}
+
+static void test_metal_turbo_quant_roundtrip(void) {
+    test_metal_turbo_quant_roundtrip_one(false);
+    test_metal_turbo_quant_roundtrip_one(true);
+}
+
+static void test_metal_turbo_indexed_attention_one(bool turbo4) {
+    const uint32_t n_tokens = 1;
+    const uint32_t n_head = 8;
+    const uint32_t head_dim = 512;
+    const uint32_t n_rot = 64;
+    const uint32_t n_blocks = (head_dim - n_rot) / 32;
+    const uint32_t n_raw = 4;
+    const uint32_t raw_cap = 4;
+    const uint32_t n_comp = 8;
+    const uint32_t top_k = 4;
+    const uint64_t row_bytes = (uint64_t)head_dim * sizeof(float);
+    const uint64_t q_bytes = (uint64_t)n_tokens * n_head * row_bytes;
+    const uint64_t raw_bytes = (uint64_t)raw_cap * row_bytes;
+    const uint64_t comp_bytes = (uint64_t)n_comp * row_bytes;
+    const uint64_t turbo_block_bytes = turbo4 ? DS4_TURBO4_BLOCK_BYTES : DS4_TURBO3_BLOCK_BYTES;
+    const uint64_t turbo_row_bytes = (uint64_t)n_blocks * turbo_block_bytes + (uint64_t)n_rot * sizeof(float);
+    const uint64_t turbo_bytes = (uint64_t)n_comp * turbo_row_bytes;
+    const uint64_t selected_f16_bytes = (uint64_t)top_k * head_dim * sizeof(uint16_t);
+    const uint64_t heads_bytes = q_bytes;
+    const uint64_t sinks_alloc = test_round_up_u64((uint64_t)n_head * sizeof(float),
+                                                   (uint64_t)getpagesize());
+
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_bytes);
+    ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(raw_bytes);
+    ds4_gpu_tensor *comp_src = ds4_gpu_tensor_alloc(comp_bytes);
+    ds4_gpu_tensor *comp_deq = ds4_gpu_tensor_alloc(comp_bytes);
+    ds4_gpu_tensor *comp_turbo = ds4_gpu_tensor_alloc(turbo_bytes);
+    ds4_gpu_tensor *comp_selected_deq = ds4_gpu_tensor_alloc((uint64_t)top_k * row_bytes);
+    ds4_gpu_tensor *comp_selected_deq_f16 = ds4_gpu_tensor_alloc(selected_f16_bytes);
+    ds4_gpu_tensor *topk = ds4_gpu_tensor_alloc((uint64_t)top_k * sizeof(int32_t));
+    ds4_gpu_tensor *identity_topk = ds4_gpu_tensor_alloc((uint64_t)top_k * sizeof(int32_t));
+    ds4_gpu_tensor *heads_ref = ds4_gpu_tensor_alloc(heads_bytes);
+    ds4_gpu_tensor *heads_turbo = ds4_gpu_tensor_alloc(heads_bytes);
+    ds4_gpu_tensor *heads_selected = ds4_gpu_tensor_alloc(heads_bytes);
+    ds4_gpu_tensor *heads_selected_f16 = ds4_gpu_tensor_alloc(heads_bytes);
+    TEST_ASSERT(q && raw && comp_src && comp_deq && comp_turbo && comp_selected_deq &&
+                comp_selected_deq_f16 && topk && identity_topk && heads_ref &&
+                heads_turbo && heads_selected && heads_selected_f16);
+
+    float *q_host = malloc((size_t)q_bytes);
+    float *raw_host = malloc((size_t)raw_bytes);
+    float *comp_host = malloc((size_t)comp_bytes);
+    float *ref_host = malloc((size_t)heads_bytes);
+    float *turbo_host = malloc((size_t)heads_bytes);
+    void *sinks_raw = NULL;
+    TEST_ASSERT(q_host && raw_host && comp_host && ref_host && turbo_host);
+    TEST_ASSERT(posix_memalign(&sinks_raw, (size_t)getpagesize(), (size_t)sinks_alloc) == 0);
+    TEST_ASSERT(sinks_raw != NULL);
+
+    if (q && raw && comp_src && comp_deq && comp_turbo && comp_selected_deq &&
+        comp_selected_deq_f16 && topk && identity_topk && heads_ref &&
+        heads_turbo && heads_selected && heads_selected_f16 &&
+        q_host && raw_host && comp_host && ref_host && turbo_host && sinks_raw) {
+        for (uint32_t h = 0; h < n_head; h++) {
+            for (uint32_t i = 0; i < head_dim; i++) {
+                q_host[(uint64_t)h * head_dim + i] =
+                    0.25f * sinf((float)((h + 1u) * (i + 3u)) * 0.013f);
+            }
+        }
+        for (uint32_t r = 0; r < raw_cap; r++) {
+            for (uint32_t i = 0; i < head_dim; i++) {
+                raw_host[(uint64_t)r * head_dim + i] =
+                    0.20f * cosf((float)((r + 2u) * (i + 5u)) * 0.011f);
+            }
+        }
+        for (uint32_t r = 0; r < n_comp; r++) {
+            for (uint32_t i = 0; i < head_dim; i++) {
+                comp_host[(uint64_t)r * head_dim + i] =
+                    0.18f * sinf((float)((r + 4u) * (i + 7u)) * 0.009f);
+            }
+        }
+        float *sinks = (float *)sinks_raw;
+        memset(sinks, 0, (size_t)sinks_alloc);
+        for (uint32_t h = 0; h < n_head; h++) {
+            sinks[h] = -0.35f + 0.01f * (float)h;
+        }
+        const int32_t topk_host[4] = { 7, 3, 1, 5 };
+
+        TEST_ASSERT(ds4_gpu_tensor_write(q, 0, q_host, q_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(raw, 0, raw_host, raw_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(comp_src, 0, comp_host, comp_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(topk, 0, topk_host, sizeof(topk_host)) != 0);
+        TEST_ASSERT(ds4_gpu_set_model_map(sinks_raw, sinks_alloc) != 0);
+        ds4_gpu_set_quality(false);
+
+        if (turbo4) {
+            TEST_ASSERT(ds4_gpu_turbo4_kv_quantize_tensor(comp_turbo, comp_src,
+                                                           n_comp, 1, head_dim, n_rot) != 0);
+            TEST_ASSERT(ds4_gpu_turbo4_dequant_f32_tensor(comp_deq, comp_turbo,
+                                                          n_blocks, n_rot, n_comp) != 0);
+            TEST_ASSERT(ds4_gpu_turbo4_dequant_selected_f32_tensor(comp_selected_deq,
+                                                                    identity_topk,
+                                                                    comp_turbo,
+                                                                    topk,
+                                                                    n_blocks,
+                                                                    n_rot,
+                                                                    n_comp,
+                                                                    top_k,
+                                                                    n_tokens) != 0);
+            TEST_ASSERT(ds4_gpu_turbo4_dequant_selected_f16_tensor(comp_selected_deq_f16,
+                                                                    identity_topk,
+                                                                    comp_turbo,
+                                                                    topk,
+                                                                    n_blocks,
+                                                                    n_rot,
+                                                                    n_comp,
+                                                                    top_k,
+                                                                    n_tokens) != 0);
+        } else {
+            TEST_ASSERT(ds4_gpu_turbo3_kv_quantize_tensor(comp_turbo, comp_src,
+                                                           n_comp, 1, head_dim, n_rot) != 0);
+            TEST_ASSERT(ds4_gpu_turbo3_dequant_f32_tensor(comp_deq, comp_turbo,
+                                                          n_blocks, n_rot, n_comp) != 0);
+            TEST_ASSERT(ds4_gpu_turbo3_dequant_selected_f32_tensor(comp_selected_deq,
+                                                                    identity_topk,
+                                                                    comp_turbo,
+                                                                    topk,
+                                                                    n_blocks,
+                                                                    n_rot,
+                                                                    n_comp,
+                                                                    top_k,
+                                                                    n_tokens) != 0);
+            TEST_ASSERT(ds4_gpu_turbo3_dequant_selected_f16_tensor(comp_selected_deq_f16,
+                                                                    identity_topk,
+                                                                    comp_turbo,
+                                                                    topk,
+                                                                    n_blocks,
+                                                                    n_rot,
+                                                                    n_comp,
+                                                                    top_k,
+                                                                    n_tokens) != 0);
+        }
+
+        TEST_ASSERT(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+                        heads_ref, sinks_raw, sinks_alloc, 0,
+                        q, raw, comp_deq, topk,
+                        n_tokens, 31, n_raw, raw_cap, 0, n_comp, top_k, 128, 4,
+                        n_head, head_dim) != 0);
+        TEST_ASSERT(ds4_gpu_attention_indexed_mixed_turbo_batch_heads_tensor(
+                        heads_turbo, sinks_raw, sinks_alloc, 0,
+                        q, raw, comp_turbo, topk,
+                        turbo4 ? DS4_KV_QUANT_TURBO4 : DS4_KV_QUANT_TURBO3,
+                        n_blocks, n_rot,
+                        n_tokens, 31, n_raw, raw_cap, 0, n_comp, top_k, 128, 4,
+                        n_head, head_dim) != 0);
+        TEST_ASSERT(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+                        heads_selected, sinks_raw, sinks_alloc, 0,
+                        q, raw, comp_selected_deq, identity_topk,
+                        n_tokens, 31, n_raw, raw_cap, 0, top_k, top_k, 128, 4,
+                        n_head, head_dim) != 0);
+        TEST_ASSERT(ds4_gpu_attention_indexed_mixed_comp_f16_batch_heads_tensor(
+                        heads_selected_f16, sinks_raw, sinks_alloc, 0,
+                        q, raw, comp_selected_deq_f16, identity_topk,
+                        n_tokens, 31, n_raw, raw_cap, 0, top_k, top_k, 128, 4,
+                        n_head, head_dim) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(heads_ref, 0, ref_host, heads_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(heads_turbo, 0, turbo_host, heads_bytes) != 0);
+
+        float max_abs = 0.0f;
+        for (uint64_t i = 0; i < heads_bytes / sizeof(float); i++) {
+            TEST_ASSERT(isfinite(ref_host[i]));
+            TEST_ASSERT(isfinite(turbo_host[i]));
+            const float err = fabsf(ref_host[i] - turbo_host[i]);
+            if (err > max_abs) max_abs = err;
+        }
+        TEST_ASSERT(max_abs < 2.0e-4f);
+
+        TEST_ASSERT(ds4_gpu_tensor_read(heads_selected, 0, turbo_host, heads_bytes) != 0);
+        max_abs = 0.0f;
+        for (uint64_t i = 0; i < heads_bytes / sizeof(float); i++) {
+            TEST_ASSERT(isfinite(turbo_host[i]));
+            const float err = fabsf(ref_host[i] - turbo_host[i]);
+            if (err > max_abs) max_abs = err;
+        }
+        TEST_ASSERT(max_abs < 2.0e-4f);
+
+        TEST_ASSERT(ds4_gpu_tensor_read(heads_selected_f16, 0, turbo_host, heads_bytes) != 0);
+        max_abs = 0.0f;
+        for (uint64_t i = 0; i < heads_bytes / sizeof(float); i++) {
+            TEST_ASSERT(isfinite(turbo_host[i]));
+            const float err = fabsf(ref_host[i] - turbo_host[i]);
+            if (err > max_abs) max_abs = err;
+        }
+        TEST_ASSERT(max_abs < 2.0e-4f);
+    }
+
+    free(sinks_raw);
+    free(turbo_host);
+    free(ref_host);
+    free(comp_host);
+    free(raw_host);
+    free(q_host);
+    ds4_gpu_tensor_free(heads_turbo);
+    ds4_gpu_tensor_free(heads_selected);
+    ds4_gpu_tensor_free(heads_selected_f16);
+    ds4_gpu_tensor_free(heads_ref);
+    ds4_gpu_tensor_free(identity_topk);
+    ds4_gpu_tensor_free(topk);
+    ds4_gpu_tensor_free(comp_selected_deq_f16);
+    ds4_gpu_tensor_free(comp_selected_deq);
+    ds4_gpu_tensor_free(comp_turbo);
+    ds4_gpu_tensor_free(comp_deq);
+    ds4_gpu_tensor_free(comp_src);
+    ds4_gpu_tensor_free(raw);
+    ds4_gpu_tensor_free(q);
+}
+
+static void test_metal_turbo_indexed_attention(void) {
+    test_metal_turbo_indexed_attention_one(false);
+    test_metal_turbo_indexed_attention_one(true);
+}
+
+static void test_metal_kernels(void) {
+    test_metal_f16_matvec_fast_nr0_4();
+    test_metal_turbo_quant_roundtrip();
+    test_metal_turbo_indexed_attention();
+}
+
 static char *test_read_file(const char *path) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return NULL;
@@ -650,7 +958,7 @@ static const ds4_test_entry test_entries[] = {
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison", test_official_logprob_vectors},
-    {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_f16_matvec_fast_nr0_4},
+    {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernels},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
