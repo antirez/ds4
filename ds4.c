@@ -8080,6 +8080,7 @@ typedef struct {
     ds4_gpu_tensor *layer_attn_comp_cache[DS4_N_LAYER];
     ds4_gpu_tensor *layer_attn_turbo_cache[DS4_N_LAYER];  /* turbo-compressed comp cache */
     ds4_gpu_tensor *attn_comp_scratch;                    /* shared f32 dequant/output scratch in turbo mode */
+    ds4_gpu_tensor *attn_comp_selected_f16;                /* shared f16 selected-row scratch in turbo decode */
     ds4_gpu_tensor *layer_attn_state_kv[DS4_N_LAYER];
     ds4_gpu_tensor *layer_attn_state_score[DS4_N_LAYER];
     ds4_gpu_tensor *layer_index_comp_cache[DS4_N_LAYER];
@@ -8318,6 +8319,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->layer_attn_turbo_cache[il]);
     }
     ds4_gpu_tensor_free(g->attn_comp_scratch);
+    ds4_gpu_tensor_free(g->attn_comp_selected_f16);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_attn_state_kv[il]);
     }
@@ -8664,6 +8666,8 @@ static bool metal_graph_alloc_raw_cap(
     g->kv = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     if (metal_graph_turbo_enabled(g)) {
         g->attn_comp_scratch = ds4_gpu_tensor_alloc((uint64_t)g->comp_cap * DS4_N_HEAD_DIM * sizeof(float));
+        g->attn_comp_selected_f16 = ds4_gpu_tensor_alloc((uint64_t)DS4_N_INDEXER_TOP_K *
+                                                         DS4_N_HEAD_DIM * sizeof(uint16_t));
     }
     bool state_init_ok = true;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -8820,7 +8824,9 @@ static bool metal_graph_alloc_raw_cap(
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (layer_cache_ok && ratio != 0) {
             const bool have_attn_cache = metal_graph_turbo_enabled(g)
-                ? (g->attn_comp_scratch != NULL && g->layer_attn_turbo_cache[il] != NULL)
+                ? (g->attn_comp_scratch != NULL &&
+                   g->attn_comp_selected_f16 != NULL &&
+                   g->layer_attn_turbo_cache[il] != NULL)
                 : (g->layer_attn_comp_cache[il] != NULL);
             layer_cache_ok = have_attn_cache &&
                              g->layer_attn_state_kv[il] != NULL &&
@@ -9017,45 +9023,80 @@ static bool metal_graph_turbo_direct_attention_enabled(const ds4_gpu_graph *g) {
            getenv("DS4_METAL_DISABLE_TURBO_DIRECT_ATTN") == NULL;
 }
 
+static bool metal_graph_turbo_selected_f16_enabled(const ds4_gpu_graph *g) {
+    return metal_graph_turbo_direct_attention_enabled(g) &&
+           getenv("DS4_METAL_DISABLE_TURBO_SELECTED_F16") == NULL;
+}
+
 static bool metal_graph_turbo_selected_dequant(
         ds4_gpu_graph       *g,
         uint32_t             il,
         const ds4_gpu_tensor *topk,
         uint32_t             n_comp,
         uint32_t             top_k,
-        uint32_t             n_tokens) {
-    if (!metal_graph_turbo_enabled(g) || !g->attn_comp_scratch ||
+        uint32_t             n_tokens,
+        bool                 f16_dst) {
+    if (!metal_graph_turbo_enabled(g) ||
         !g->comp_selected_identity || !g->layer_attn_turbo_cache[il] ||
         !topk || n_comp == 0 || top_k == 0 || n_tokens == 0 || top_k > n_comp) {
         return false;
     }
+    if (f16_dst) {
+        if (!g->attn_comp_selected_f16 || n_tokens != 1u) return false;
+    } else {
+        if (!g->attn_comp_scratch) return false;
+    }
 #ifdef __APPLE__
     const uint32_t n_blocks = metal_graph_turbo_n_blocks();
-    const int ok = g->kv_quant_type == DS4_KV_QUANT_TURBO3
-        ? ds4_gpu_turbo3_dequant_selected_f32_tensor(g->attn_comp_scratch,
-                                                     g->comp_selected_identity,
-                                                     g->layer_attn_turbo_cache[il],
-                                                     topk,
-                                                     n_blocks,
-                                                     DS4_N_ROT,
-                                                     n_comp,
-                                                     top_k,
-                                                     n_tokens)
-        : ds4_gpu_turbo4_dequant_selected_f32_tensor(g->attn_comp_scratch,
-                                                     g->comp_selected_identity,
-                                                     g->layer_attn_turbo_cache[il],
-                                                     topk,
-                                                     n_blocks,
-                                                     DS4_N_ROT,
-                                                     n_comp,
-                                                     top_k,
-                                                     n_tokens);
+    int ok = 0;
+    if (f16_dst) {
+        ok = g->kv_quant_type == DS4_KV_QUANT_TURBO3
+            ? ds4_gpu_turbo3_dequant_selected_f16_tensor(g->attn_comp_selected_f16,
+                                                         g->comp_selected_identity,
+                                                         g->layer_attn_turbo_cache[il],
+                                                         topk,
+                                                         n_blocks,
+                                                         DS4_N_ROT,
+                                                         n_comp,
+                                                         top_k,
+                                                         n_tokens)
+            : ds4_gpu_turbo4_dequant_selected_f16_tensor(g->attn_comp_selected_f16,
+                                                         g->comp_selected_identity,
+                                                         g->layer_attn_turbo_cache[il],
+                                                         topk,
+                                                         n_blocks,
+                                                         DS4_N_ROT,
+                                                         n_comp,
+                                                         top_k,
+                                                         n_tokens);
+    } else {
+        ok = g->kv_quant_type == DS4_KV_QUANT_TURBO3
+            ? ds4_gpu_turbo3_dequant_selected_f32_tensor(g->attn_comp_scratch,
+                                                         g->comp_selected_identity,
+                                                         g->layer_attn_turbo_cache[il],
+                                                         topk,
+                                                         n_blocks,
+                                                         DS4_N_ROT,
+                                                         n_comp,
+                                                         top_k,
+                                                         n_tokens)
+            : ds4_gpu_turbo4_dequant_selected_f32_tensor(g->attn_comp_scratch,
+                                                         g->comp_selected_identity,
+                                                         g->layer_attn_turbo_cache[il],
+                                                         topk,
+                                                         n_blocks,
+                                                         DS4_N_ROT,
+                                                         n_comp,
+                                                         top_k,
+                                                         n_tokens);
+    }
     return ok != 0;
 #else
     (void)il;
     (void)n_comp;
     (void)top_k;
     (void)n_tokens;
+    (void)f16_dst;
     return false;
 #endif
 }
@@ -9095,8 +9136,39 @@ static bool metal_graph_capture_prefix1_index_state(ds4_gpu_graph *g, uint32_t i
 }
 
 static uint32_t metal_graph_decode_indexer_top_k(const ds4_gpu_graph *g) {
-    (void)g;
-    return DS4_N_INDEXER_TOP_K;
+    if (g && g->quality) return DS4_N_INDEXER_TOP_K;
+
+    static int initialized;
+    static uint32_t cached;
+    if (!initialized) {
+        cached = DS4_N_INDEXER_TOP_K;
+        const char *env = getenv("DS4_METAL_DECODE_INDEXER_TOP_K");
+        if (env && env[0]) {
+            char *end = NULL;
+            errno = 0;
+            unsigned long requested = strtoul(env, &end, 10);
+            if (errno == 0 && end != env && requested != 0) {
+                uint32_t k = requested > DS4_N_INDEXER_TOP_K
+                    ? DS4_N_INDEXER_TOP_K
+                    : (uint32_t)requested;
+                uint32_t rounded = 1u;
+                while ((rounded << 1u) != 0 && (rounded << 1u) <= k) {
+                    rounded <<= 1u;
+                }
+                cached = rounded;
+                if ((unsigned long)cached != requested) {
+                    fprintf(stderr,
+                            "ds4: DS4_METAL_DECODE_INDEXER_TOP_K=%lu using %u "
+                            "(power-of-two cap %u)\n",
+                            requested,
+                            cached,
+                            (uint32_t)DS4_N_INDEXER_TOP_K);
+                }
+            }
+        }
+        initialized = 1;
+    }
+    return cached;
 }
 
 /* =========================================================================
@@ -9681,13 +9753,36 @@ static bool metal_graph_encode_decode_layer(
         const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
         if (n_comp != 0 && comp_selected != NULL && n_selected != 0) {
             if (metal_graph_turbo_direct_attention_enabled(g) && !g->quality) {
+                const bool use_selected_f16 = metal_graph_turbo_selected_f16_enabled(g);
                 ok = metal_graph_turbo_selected_dequant(g,
                                                         il,
                                                         comp_selected,
                                                         n_comp,
                                                         n_selected,
-                                                        1);
-                if (ok) {
+                                                        1,
+                                                        use_selected_f16);
+                if (ok && use_selected_f16) {
+                    ok = ds4_gpu_attention_indexed_mixed_comp_f16_batch_heads_tensor(
+                        g->heads,
+                        model->map,
+                        model->size,
+                        layer->attn_sinks->abs_offset,
+                        g->q,
+                        raw_cache,
+                        g->attn_comp_selected_f16,
+                        g->comp_selected_identity,
+                        1,
+                        pos,
+                        n_raw,
+                        raw_cap,
+                        raw_start,
+                        n_selected,
+                        n_selected,
+                        g->raw_window,
+                        ds4_layer_compress_ratio(il),
+                        DS4_N_HEAD,
+                        DS4_N_HEAD_DIM) != 0;
+                } else if (ok) {
                     ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                         g->heads,
                         model->map,

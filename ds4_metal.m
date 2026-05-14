@@ -6162,9 +6162,10 @@ int ds4_gpu_turbo4_dequant_f32_tensor(
     return 1;
 }
 
-static int ds4_gpu_turbo_dequant_selected_f32_tensor(
+static int ds4_gpu_turbo_dequant_selected_tensor(
         const char           *kernel_name,
         uint32_t              block_bytes,
+        uint32_t              dst_value_bytes,
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *identity_topk,
         const ds4_gpu_tensor *x,
@@ -6186,7 +6187,7 @@ static int ds4_gpu_turbo_dequant_selected_f32_tensor(
         id<MTLBuffer> dstbuf = ds4_gpu_tensor_buffer(out);
         id<MTLBuffer> idbuf = ds4_gpu_tensor_buffer(identity_topk);
         const uint64_t src_row_bytes = (uint64_t)n_blocks * block_bytes + (uint64_t)n_rot * sizeof(float);
-        const uint64_t dst_row_bytes = (uint64_t)(n_blocks * 32u + n_rot) * sizeof(float);
+        const uint64_t dst_row_bytes = (uint64_t)(n_blocks * 32u + n_rot) * dst_value_bytes;
         const uint64_t src_bytes = (uint64_t)n_comp * src_row_bytes;
         const uint64_t dst_bytes = (uint64_t)n_tokens * top_k * dst_row_bytes;
         const uint64_t topk_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
@@ -6231,7 +6232,7 @@ static int ds4_gpu_turbo_dequant_selected_f32_tensor(
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
-        if (!ds4_gpu_finish_command_buffer(cb, owned, "Turbo selected dequant f32")) return 0;
+        if (!ds4_gpu_finish_command_buffer(cb, owned, kernel_name)) return 0;
     }
     return 1;
 }
@@ -6246,17 +6247,18 @@ int ds4_gpu_turbo3_dequant_selected_f32_tensor(
         uint32_t                n_comp,
         uint32_t                top_k,
         uint32_t                n_tokens) {
-    return ds4_gpu_turbo_dequant_selected_f32_tensor("kernel_turbo3_dequant_selected_f32",
-                                                     DS4_TURBO3_BLOCK_BYTES,
-                                                     out,
-                                                     identity_topk,
-                                                     x,
-                                                     topk,
-                                                     n_blocks,
-                                                     n_rot,
-                                                     n_comp,
-                                                     top_k,
-                                                     n_tokens);
+    return ds4_gpu_turbo_dequant_selected_tensor("kernel_turbo3_dequant_selected_f32",
+                                                 DS4_TURBO3_BLOCK_BYTES,
+                                                 sizeof(float),
+                                                 out,
+                                                 identity_topk,
+                                                 x,
+                                                 topk,
+                                                 n_blocks,
+                                                 n_rot,
+                                                 n_comp,
+                                                 top_k,
+                                                 n_tokens);
 }
 
 int ds4_gpu_turbo4_dequant_selected_f32_tensor(
@@ -6269,17 +6271,66 @@ int ds4_gpu_turbo4_dequant_selected_f32_tensor(
         uint32_t                n_comp,
         uint32_t                top_k,
         uint32_t                n_tokens) {
-    return ds4_gpu_turbo_dequant_selected_f32_tensor("kernel_turbo4_dequant_selected_f32",
-                                                     DS4_TURBO4_BLOCK_BYTES,
-                                                     out,
-                                                     identity_topk,
-                                                     x,
-                                                     topk,
-                                                     n_blocks,
-                                                     n_rot,
-                                                     n_comp,
-                                                     top_k,
-                                                     n_tokens);
+    return ds4_gpu_turbo_dequant_selected_tensor("kernel_turbo4_dequant_selected_f32",
+                                                 DS4_TURBO4_BLOCK_BYTES,
+                                                 sizeof(float),
+                                                 out,
+                                                 identity_topk,
+                                                 x,
+                                                 topk,
+                                                 n_blocks,
+                                                 n_rot,
+                                                 n_comp,
+                                                 top_k,
+                                                 n_tokens);
+}
+
+int ds4_gpu_turbo3_dequant_selected_f16_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *identity_topk,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *topk,
+        uint32_t                n_blocks,
+        uint32_t                n_rot,
+        uint32_t                n_comp,
+        uint32_t                top_k,
+        uint32_t                n_tokens) {
+    return ds4_gpu_turbo_dequant_selected_tensor("kernel_turbo3_dequant_selected_f16",
+                                                 DS4_TURBO3_BLOCK_BYTES,
+                                                 sizeof(uint16_t),
+                                                 out,
+                                                 identity_topk,
+                                                 x,
+                                                 topk,
+                                                 n_blocks,
+                                                 n_rot,
+                                                 n_comp,
+                                                 top_k,
+                                                 n_tokens);
+}
+
+int ds4_gpu_turbo4_dequant_selected_f16_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *identity_topk,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *topk,
+        uint32_t                n_blocks,
+        uint32_t                n_rot,
+        uint32_t                n_comp,
+        uint32_t                top_k,
+        uint32_t                n_tokens) {
+    return ds4_gpu_turbo_dequant_selected_tensor("kernel_turbo4_dequant_selected_f16",
+                                                 DS4_TURBO4_BLOCK_BYTES,
+                                                 sizeof(uint16_t),
+                                                 out,
+                                                 identity_topk,
+                                                 x,
+                                                 topk,
+                                                 n_blocks,
+                                                 n_rot,
+                                                 n_comp,
+                                                 top_k,
+                                                 n_tokens);
 }
 
 static void ds4_gpu_set_rows_thread_shape(
@@ -11223,7 +11274,7 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
     return 1;
 }
 
-int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+static int ds4_gpu_attention_indexed_mixed_batch_heads_impl(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
@@ -11242,7 +11293,8 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim) {
+        uint32_t                head_dim,
+        bool                    comp_f16) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!heads || !model_map || !q || !raw_kv || !comp_kv || !topk ||
         n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
@@ -11258,9 +11310,12 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         }
 
         const uint64_t row_bytes = (uint64_t)head_dim * sizeof(float);
+        const uint64_t comp_row_bytes = comp_f16
+            ? (uint64_t)head_dim * sizeof(uint16_t)
+            : row_bytes;
         const uint64_t q_bytes = (uint64_t)n_tokens * n_head * row_bytes;
         const uint64_t raw_bytes = (uint64_t)raw_cap * row_bytes;
-        const uint64_t comp_bytes = (uint64_t)n_comp * row_bytes;
+        const uint64_t comp_bytes = (uint64_t)n_comp * comp_row_bytes;
         const uint64_t topk_bytes = (uint64_t)top_k * n_tokens * sizeof(int32_t);
         id<MTLBuffer> qbuf = ds4_gpu_tensor_buffer(q);
         id<MTLBuffer> rawbuf = ds4_gpu_tensor_buffer(raw_kv);
@@ -11288,12 +11343,18 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             ds4_gpu_hot_pipeline(g_dsv4_sort_i32_rows_asc_pipeline,
                                     "kernel_dsv4_sort_i32_rows_asc");
         const bool decode_one_token = n_tokens == 1u;
-        id<MTLComputePipelineState> attn_pipeline =
-            decode_one_token ?
-            ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads8_rb4_pipeline,
-                                   "kernel_dsv4_indexed_mixed_attention_heads8_rb4") :
-            ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads8_pipeline,
-                                   "kernel_dsv4_indexed_mixed_attention_heads8");
+        id<MTLComputePipelineState> attn_pipeline = nil;
+        if (comp_f16) {
+            attn_pipeline = ds4_gpu_get_pipeline(decode_one_token
+                ? "kernel_dsv4_indexed_mixed_attention_heads8_rb4_comp_f16"
+                : "kernel_dsv4_indexed_mixed_attention_heads8_comp_f16");
+        } else {
+            attn_pipeline = decode_one_token ?
+                ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads8_rb4_pipeline,
+                                       "kernel_dsv4_indexed_mixed_attention_heads8_rb4") :
+                ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads8_pipeline,
+                                       "kernel_dsv4_indexed_mixed_attention_heads8");
+        }
         if (!sort_pipeline || !attn_pipeline) return 0;
         if ((NSUInteger)top_k > sort_pipeline.maxTotalThreadsPerThreadgroup) {
             fprintf(stderr, "ds4: Metal indexed attention top-k exceeds sort threadgroup limit\n");
@@ -11337,7 +11398,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             .q_token_stride = (uint64_t)n_head * row_bytes,
             .q_head_stride = row_bytes,
             .raw_row_stride = row_bytes,
-            .comp_row_stride = row_bytes,
+            .comp_row_stride = comp_row_bytes,
             .topk_token_stride = (uint64_t)top_k * sizeof(int32_t),
             .dst_token_stride = (uint64_t)n_head * row_bytes,
             .dst_head_stride = row_bytes,
@@ -11378,10 +11439,98 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
              threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
-        if (!ds4_gpu_finish_command_buffer(cb, owned, "graph indexed mixed attention heads")) return 0;
+        if (!ds4_gpu_finish_command_buffer(cb, owned, comp_f16
+                ? "graph indexed mixed comp-f16 attention heads"
+                : "graph indexed mixed attention heads")) {
+            return 0;
+        }
     }
 
     return 1;
+}
+
+int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        const ds4_gpu_tensor *topk,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_comp,
+        uint32_t                top_k,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    return ds4_gpu_attention_indexed_mixed_batch_heads_impl(heads,
+                                                            model_map,
+                                                            model_size,
+                                                            sinks_offset,
+                                                            q,
+                                                            raw_kv,
+                                                            comp_kv,
+                                                            topk,
+                                                            n_tokens,
+                                                            pos0,
+                                                            n_raw,
+                                                            raw_cap,
+                                                            raw_start,
+                                                            n_comp,
+                                                            top_k,
+                                                            window,
+                                                            ratio,
+                                                            n_head,
+                                                            head_dim,
+                                                            false);
+}
+
+int ds4_gpu_attention_indexed_mixed_comp_f16_batch_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        const ds4_gpu_tensor *topk,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_comp,
+        uint32_t                top_k,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    return ds4_gpu_attention_indexed_mixed_batch_heads_impl(heads,
+                                                            model_map,
+                                                            model_size,
+                                                            sinks_offset,
+                                                            q,
+                                                            raw_kv,
+                                                            comp_kv,
+                                                            topk,
+                                                            n_tokens,
+                                                            pos0,
+                                                            n_raw,
+                                                            raw_cap,
+                                                            raw_start,
+                                                            n_comp,
+                                                            top_k,
+                                                            window,
+                                                            ratio,
+                                                            n_head,
+                                                            head_dim,
+                                                            true);
 }
 
 int ds4_gpu_attention_indexed_mixed_turbo_batch_heads_tensor(
