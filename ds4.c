@@ -9867,6 +9867,67 @@ static bool metal_graph_encode_decode_layer(
     return ok;
 }
 
+static bool metal_graph_encode_decode2_layer_exact(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_weights      *weights,
+        uint32_t                il,
+        uint32_t                pos0,
+        int                     token0,
+        int                     token1,
+        ds4_gpu_tensor        **cur0_io,
+        ds4_gpu_tensor        **next0_io,
+        ds4_gpu_tensor        **cur1_io,
+        ds4_gpu_tensor        **next1_io) {
+    if (!g || !model || !weights || !cur0_io || !next0_io || !cur1_io || !next1_io) return false;
+    const uint32_t pos1 = pos0 + 1u;
+    ds4_gpu_tensor *cur0 = *cur0_io;
+    ds4_gpu_tensor *next0 = *next0_io;
+    ds4_gpu_tensor *cur1 = *cur1_io;
+    ds4_gpu_tensor *next1 = *next1_io;
+    if (!cur0 || !next0 || !cur1 || !next1 || g->raw_cap == 0) return false;
+
+    g->cur_hc = cur0;
+    g->after_ffn_hc = next0;
+    bool ok = metal_graph_encode_decode_layer(g,
+                                               model,
+                                               &weights->layer[il],
+                                               il,
+                                               pos0,
+                                               g->layer_raw_cache[il],
+                                               g->raw_cap,
+                                               pos0 % g->raw_cap,
+                                               metal_graph_raw_span_for_batch(g, pos0, 1),
+                                               token0);
+    if (ok) {
+        ok = metal_graph_capture_prefix_attn_state(g, il, 1) &&
+             metal_graph_capture_prefix_index_state(g, il, 1);
+    }
+    if (ok) {
+        g->cur_hc = cur1;
+        g->after_ffn_hc = next1;
+        ok = metal_graph_encode_decode_layer(g,
+                                             model,
+                                             &weights->layer[il],
+                                             il,
+                                             pos1,
+                                             g->layer_raw_cache[il],
+                                             g->raw_cap,
+                                             pos1 % g->raw_cap,
+                                             metal_graph_raw_span_for_batch(g, pos1, 1),
+                                             token1);
+    }
+    if (ok) {
+        ds4_gpu_tensor *tmp = cur0; cur0 = next0; next0 = tmp;
+        tmp = cur1; cur1 = next1; next1 = tmp;
+        *cur0_io = cur0;
+        *next0_io = next0;
+        *cur1_io = cur1;
+        *next1_io = next1;
+    }
+    return ok;
+}
+
 /* Encode the final HC collapse, output norm, and vocab projection on Metal. */
 static bool metal_graph_encode_output_head_impl(
         ds4_gpu_graph *g,
@@ -13942,9 +14003,25 @@ static bool metal_graph_verify_decode2_exact(
     g->spec_capture_prefix1 = true;
     g->spec_capture_prefix_depth = 1u;
     if (ok) ok = ds4_gpu_begin_commands() != 0;
+    const bool exact_decode2_layer = getenv("DS4_MTP_NO_EXACT_DECODE2_LAYER") == NULL;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const uint32_t pos0 = start;
         const uint32_t pos1 = start + 1u;
+
+        if (exact_decode2_layer) {
+            ok = metal_graph_encode_decode2_layer_exact(g,
+                                                        model,
+                                                        weights,
+                                                        il,
+                                                        pos0,
+                                                        token0,
+                                                        token1,
+                                                        &cur0,
+                                                        &next0,
+                                                        &cur1,
+                                                        &next1);
+            continue;
+        }
 
         g->cur_hc = cur0;
         g->after_ffn_hc = next0;
