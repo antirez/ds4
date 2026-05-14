@@ -694,6 +694,32 @@ make cuda CUDA_ARCH=sm_120
 make cuda CUDA_ARCH=native
 ```
 
+### CUDA direct-model partial weight cache
+
+For GPUs that cannot hold the full GGUF weight image in VRAM, use direct-model
+mode with the partial weight cache:
+
+```sh
+DS4_CUDA_DIRECT_MODEL=1 \
+DS4_CUDA_PARTIAL_WEIGHT_CACHE=1 \
+DS4_CUDA_WEIGHT_CACHE_LIMIT_GB=16 \
+./ds4 --cuda -p "Hello"
+```
+
+The partial cache selects high-benefit DS4 weights at startup and keeps
+uncached weights on the direct-model path. This is intended for cards such as
+24 GB RTX 4090-class GPUs where full model copy/cache would exceed VRAM.
+
+Useful controls:
+
+* `DS4_CUDA_WEIGHT_CACHE_LIMIT_GB` or `DS4_CUDA_WEIGHT_CACHE_LIMIT_MB`
+* `DS4_CUDA_WEIGHT_CACHE_RESERVE_MB`
+* `DS4_CUDA_WEIGHT_CACHE_VERBOSE=1`
+* `DS4_CUDA_STRICT_WEIGHT_CACHE=1`
+
+Without `DS4_CUDA_PARTIAL_WEIGHT_CACHE=1`, existing CUDA full-cache/direct-model
+behavior is unchanged.
+
 There is also a CPU reference/debug path:
 
 ```sh

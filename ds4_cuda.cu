@@ -131,6 +131,8 @@ static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
 static std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
 static uint64_t g_model_range_bytes;
+static uint64_t g_model_auto_cache_limit_bytes;
+static int g_model_auto_cache_limit_ready;
 static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
 static int g_q8_f16_disabled_after_oom;
@@ -151,7 +153,8 @@ static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
         uint64_t bytes,
-        const char *what);
+        const char *what,
+        int allow_direct_fallback);
 __global__ static void dequant_q8_0_to_f16_kernel(
         __half *out,
         const unsigned char *w,
@@ -195,25 +198,42 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
     return (const char *)model_map + offset;
 }
 
-static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
-    if (bytes == 0) return cuda_model_ptr(model_map, offset);
-    if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
-    if (g_model_hmm_direct &&
-        getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
-        getenv("DS4_CUDA_WEIGHT_PRELOAD") == NULL) {
+static int cuda_env_enabled(const char *name) {
+    const char *env = getenv(name);
+    return env && env[0] && !(env[0] == '0' && env[1] == '\0');
+}
+
+static int cuda_partial_weight_cache_enabled(void) {
+    return cuda_env_enabled("DS4_CUDA_PARTIAL_WEIGHT_CACHE");
+}
+
+static int cuda_direct_model_enabled(void) {
+    return cuda_env_enabled("DS4_CUDA_DIRECT_MODEL");
+}
+
+static const char *cuda_model_range_lookup_cached(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t bytes) {
+    if (!model_map || bytes == 0) return NULL;
+    if (model_map == g_model_host_base && (g_model_device_owned || g_model_registered)) {
         return cuda_model_ptr(model_map, offset);
     }
-    const char *direct_env = getenv("DS4_CUDA_DIRECT_MODEL");
-    if (direct_env && direct_env[0]) return cuda_model_ptr(model_map, offset);
 
     const uint64_t end = offset + bytes;
+    if (end < offset) return NULL;
+
     auto exact = g_model_range_by_offset.find(offset);
     if (exact != g_model_range_by_offset.end()) {
         const cuda_model_range &r = g_model_ranges[exact->second];
-        if (r.host_base == model_map && end >= offset && bytes <= r.bytes) return r.device_ptr;
+        const uint64_t rend = r.offset + r.bytes;
+        if (r.host_base == model_map && rend >= r.offset && end <= rend) return r.device_ptr;
     }
+
     for (const cuda_model_range &r : g_model_ranges) {
-        if (r.host_base == model_map && offset >= r.offset && end >= offset && end <= r.offset + r.bytes) {
+        const uint64_t rend = r.offset + r.bytes;
+        if (r.host_base == model_map && rend >= r.offset &&
+            offset >= r.offset && end <= rend) {
             return r.device_ptr + (offset - r.offset);
         }
         if (r.host_base == model_map && r.host_registered && r.registered_base && r.registered_device_base) {
@@ -224,9 +244,33 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             if (h1 >= h0 && h0 >= r0 && h1 <= r1) return r.registered_device_base + (h0 - r0);
         }
     }
+    return NULL;
+}
+
+static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
+    if (bytes == 0) return cuda_model_ptr(model_map, offset);
+    if (model_map == g_model_host_base && (g_model_device_owned || g_model_registered)) {
+        return cuda_model_ptr(model_map, offset);
+    }
+
+    const char *cached = cuda_model_range_lookup_cached(model_map, offset, bytes);
+    if (cached) return cached;
+
+    if (cuda_partial_weight_cache_enabled() &&
+        (cuda_direct_model_enabled() || g_model_hmm_direct)) {
+        return cuda_model_ptr(model_map, offset);
+    }
+
+    if (g_model_hmm_direct &&
+        getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
+        getenv("DS4_CUDA_WEIGHT_PRELOAD") == NULL) {
+        return cuda_model_ptr(model_map, offset);
+    }
+
+    if (cuda_direct_model_enabled()) return cuda_model_ptr(model_map, offset);
 
     if (getenv("DS4_CUDA_NO_FD_CACHE") == NULL) {
-        const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
+        const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what, 1);
         if (fd_ptr) return fd_ptr;
     }
 
@@ -304,28 +348,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
 
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
     if (bytes == 0) return 1;
-    if (g_model_device_owned || g_model_registered) return 1;
-
-    const uint64_t end = offset + bytes;
-    if (end < offset) return 0;
-    for (const cuda_model_range &r : g_model_ranges) {
-        if (r.host_base == model_map &&
-            offset >= r.offset &&
-            end <= r.offset + r.bytes) {
-            return 1;
-        }
-        if (r.host_base == model_map &&
-            r.host_registered &&
-            r.registered_base &&
-            r.registered_device_base) {
-            const uintptr_t h0 = (uintptr_t)((const char *)model_map + offset);
-            const uintptr_t h1 = h0 + bytes;
-            const uintptr_t r0 = (uintptr_t)r.registered_base;
-            const uintptr_t r1 = r0 + r.registered_bytes;
-            if (h1 >= h0 && h0 >= r0 && h1 <= r1) return 1;
-        }
-    }
-    return 0;
+    return cuda_model_range_lookup_cached(model_map, offset, bytes) != NULL;
 }
 
 static void cuda_q8_f16_cache_release_all(void) {
@@ -539,6 +562,10 @@ static const __half *cuda_q8_f16_ptr(
         }
     }
     if (!cuda_q8_f16_cache_allowed(label, in_dim, out_dim)) return NULL;
+    if (cuda_partial_weight_cache_enabled() && cuda_direct_model_enabled() &&
+        !cuda_model_range_is_cached(model_map, offset, weight_bytes)) {
+        return NULL;
+    }
 
     const char *q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, "q8_0");
     if (!q8) return NULL;
@@ -594,6 +621,10 @@ static float *cuda_q8_f32_ptr(
         }
     }
     if (!cuda_q8_f32_cache_allowed(label, in_dim, out_dim)) return NULL;
+    if (cuda_partial_weight_cache_enabled() && cuda_direct_model_enabled() &&
+        !cuda_model_range_is_cached(model_map, offset, weight_bytes)) {
+        return NULL;
+    }
 
     const char *q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, label ? label : "q8_0");
     if (!q8) return NULL;
@@ -925,15 +956,71 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
 }
 
 static uint64_t cuda_model_cache_limit_bytes(void) {
-    uint64_t gb = 0;
+    int mb_present = 0;
+    const uint64_t mb_limit = cuda_parse_mib_env("DS4_CUDA_WEIGHT_CACHE_LIMIT_MB", &mb_present);
+    if (mb_present) return mb_limit;
+
     const char *env = getenv("DS4_CUDA_WEIGHT_CACHE_LIMIT_GB");
     if (env && env[0]) {
         char *end = NULL;
         unsigned long long v = strtoull(env, &end, 10);
-        if (end != env) gb = (uint64_t)v;
+        if (end != env) {
+            if (v == 0) return UINT64_MAX;
+            if (v > UINT64_MAX / 1073741824ull) return UINT64_MAX;
+            return (uint64_t)v * 1073741824ull;
+        }
     }
-    if (gb == 0) return UINT64_MAX;
-    return gb * 1073741824ull;
+
+    if (cuda_partial_weight_cache_enabled()) {
+        if (!g_model_auto_cache_limit_ready) {
+            size_t free_b = 0;
+            size_t total_b = 0;
+            cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "ds4: CUDA model cache memory query failed: %s\n",
+                        cudaGetErrorString(err));
+                (void)cudaGetLastError();
+                g_model_auto_cache_limit_bytes = 0;
+            } else {
+                const uint64_t total = (uint64_t)total_b;
+                int reserve_present = 0;
+                uint64_t reserve = cuda_parse_mib_env("DS4_CUDA_WEIGHT_CACHE_RESERVE_MB", &reserve_present);
+                if (!reserve_present) {
+                    if (total <= 32ull * 1073741824ull) {
+                        reserve = 6144ull * 1048576ull;
+                    } else {
+                        const uint64_t pct = total / 10u;
+                        reserve = pct > 4096ull * 1048576ull ? pct : 4096ull * 1048576ull;
+                    }
+                }
+                const uint64_t free_bytes = (uint64_t)free_b;
+                g_model_auto_cache_limit_bytes = free_bytes > reserve ? free_bytes - reserve : 0;
+                if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+                    fprintf(stderr,
+                            "ds4: CUDA partial model cache auto limit %.2f GiB "
+                            "(free %.2f GiB reserve %.2f GiB total %.2f GiB)\n",
+                            (double)g_model_auto_cache_limit_bytes / 1073741824.0,
+                            (double)free_bytes / 1073741824.0,
+                            (double)reserve / 1073741824.0,
+                            (double)total / 1073741824.0);
+                }
+            }
+            g_model_auto_cache_limit_ready = 1;
+        }
+        return g_model_auto_cache_limit_bytes;
+    }
+
+    return UINT64_MAX;
+}
+
+static uint64_t cuda_model_cache_reserve_bytes(uint64_t total_bytes) {
+    int reserve_present = 0;
+    const uint64_t reserve = cuda_parse_mib_env("DS4_CUDA_WEIGHT_CACHE_RESERVE_MB", &reserve_present);
+    if (reserve_present) return reserve;
+    if (total_bytes <= 32ull * 1073741824ull) return 6144ull * 1048576ull;
+    const uint64_t pct = total_bytes / 10u;
+    const uint64_t min_reserve = 4096ull * 1048576ull;
+    return pct > min_reserve ? pct : min_reserve;
 }
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
@@ -958,7 +1045,13 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     if (g_model_cache_full) return NULL;
     const uint64_t align = 256u;
+    if (bytes > UINT64_MAX - (align - 1u)) return NULL;
     const uint64_t aligned = (bytes + align - 1u) & ~(align - 1u);
+
+    const uint64_t limit = cuda_model_cache_limit_bytes();
+    if (g_model_range_bytes > limit) return NULL;
+    uint64_t remaining = limit - g_model_range_bytes;
+    if (aligned > remaining) return NULL;
 
     for (cuda_model_arena &a : g_model_arenas) {
         const uint64_t used = (a.used + align - 1u) & ~(align - 1u);
@@ -969,10 +1062,36 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
         }
     }
 
-    const uint64_t limit = cuda_model_cache_limit_bytes();
-    if (g_model_range_bytes > limit || aligned > limit - g_model_range_bytes) return NULL;
-
-    const uint64_t chunk = cuda_model_arena_chunk_bytes(aligned);
+    uint64_t chunk = cuda_model_arena_chunk_bytes(aligned);
+    if (limit != UINT64_MAX && chunk > remaining) chunk = remaining;
+    if (chunk < aligned) return NULL;
+    if (cuda_partial_weight_cache_enabled()) {
+        size_t free_b = 0;
+        size_t total_b = 0;
+        cudaError_t mem_err = cudaMemGetInfo(&free_b, &total_b);
+        if (mem_err != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA model cache memory query failed: %s\n",
+                    cudaGetErrorString(mem_err));
+            (void)cudaGetLastError();
+            g_model_cache_full = 1;
+            return NULL;
+        }
+        const uint64_t free_bytes = (uint64_t)free_b;
+        const uint64_t reserve = cuda_model_cache_reserve_bytes((uint64_t)total_b);
+        if (free_bytes <= reserve || chunk > free_bytes - reserve) {
+            g_model_cache_full = 1;
+            if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+                fprintf(stderr,
+                        "ds4: CUDA partial model cache stopped before %s "
+                        "(request %.2f MiB free %.2f GiB reserve %.2f GiB)\n",
+                        what ? what : "weights",
+                        (double)chunk / 1048576.0,
+                        (double)free_bytes / 1073741824.0,
+                        (double)reserve / 1073741824.0);
+            }
+            return NULL;
+        }
+    }
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
     if (err != cudaSuccess) {
@@ -999,7 +1118,8 @@ static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
         uint64_t bytes,
-        const char *what) {
+        const char *what,
+        int allow_direct_fallback) {
     if (g_model_fd < 0 || bytes == 0) return NULL;
     if (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base) return NULL;
     const uint64_t limit = cuda_model_cache_limit_bytes();
@@ -1010,12 +1130,13 @@ static const char *cuda_model_range_ptr_from_fd(
                     (double)bytes / 1048576.0,
                     (double)limit / 1073741824.0);
         }
+        if (!allow_direct_fallback || getenv("DS4_CUDA_STRICT_WEIGHT_CACHE") != NULL) return NULL;
         return cuda_model_ptr(model_map, offset);
     }
 
     char *dev = cuda_model_arena_alloc(bytes, what);
     if (!dev) {
-        if (getenv("DS4_CUDA_STRICT_WEIGHT_CACHE") != NULL) return NULL;
+        if (!allow_direct_fallback || getenv("DS4_CUDA_STRICT_WEIGHT_CACHE") != NULL) return NULL;
         return cuda_model_ptr(model_map, offset);
     }
     cudaError_t err = cudaSuccess;
@@ -1091,6 +1212,63 @@ static const char *cuda_model_range_ptr_from_fd(
     return (const char *)dev;
 }
 
+static const char *cuda_model_range_cache_device(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t offset,
+        uint64_t bytes,
+        const char *what) {
+    if (!model_map || bytes == 0) return NULL;
+    if (offset > model_size || bytes > model_size - offset) return NULL;
+    if (model_map == g_model_host_base && (g_model_device_owned || g_model_registered)) {
+        return cuda_model_ptr(model_map, offset);
+    }
+
+    const char *cached = cuda_model_range_lookup_cached(model_map, offset, bytes);
+    if (cached) return cached;
+
+    if (getenv("DS4_CUDA_NO_FD_CACHE") == NULL) {
+        const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what, 0);
+        if (fd_ptr) {
+            cached = cuda_model_range_lookup_cached(model_map, offset, bytes);
+            if (cached) return cached;
+        }
+    }
+
+    char *dev = cuda_model_arena_alloc(bytes, what);
+    if (!dev) return NULL;
+
+    const char *src = (const char *)model_map + offset;
+    const uint64_t chunk = cuda_model_copy_chunk_bytes();
+    for (uint64_t done = 0; done < bytes; done += chunk) {
+        const uint64_t n = bytes - done < chunk ? bytes - done : chunk;
+        cudaError_t err = cudaMemcpy(dev + done, src + done, (size_t)n, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA model forced cache copy failed for %s at %.2f/%.2f MiB: %s\n",
+                    what ? what : "weights",
+                    (double)done / 1048576.0,
+                    (double)bytes / 1048576.0,
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            g_model_cache_full = 1;
+            return NULL;
+        }
+    }
+
+    g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1});
+    g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
+    g_model_range_bytes += bytes;
+    cuda_model_load_progress_note(g_model_range_bytes);
+    cuda_model_discard_source_pages(model_map, model_size, offset, bytes);
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+        fprintf(stderr, "ds4: CUDA cached %s %.2f MiB (total %.2f GiB)\n",
+                what ? what : "weights",
+                (double)bytes / 1048576.0,
+                (double)g_model_range_bytes / 1073741824.0);
+    }
+    return dev;
+}
+
 static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
     if (!model_map || model_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
     if (getenv("DS4_CUDA_NO_MODEL_COPY") != NULL ||
@@ -1099,7 +1277,7 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
         getenv("DS4_CUDA_WEIGHT_PRELOAD") != NULL) {
         return 0;
     }
-    if (g_model_device_owned || g_model_registered) return 1;
+    if (model_map == g_model_host_base && (g_model_device_owned || g_model_registered)) return 1;
 
     void *dev = NULL;
     const double t0 = cuda_wall_sec();
@@ -1193,6 +1371,8 @@ static void cuda_model_range_release_all(void) {
     g_model_ranges.clear();
     g_model_range_by_offset.clear();
     g_model_range_bytes = 0;
+    g_model_auto_cache_limit_bytes = 0;
+    g_model_auto_cache_limit_ready = 0;
     cuda_model_load_progress_reset();
 }
 
@@ -1281,6 +1461,8 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_direct_align = 1;
     g_model_file_size = 0;
     g_model_cache_full = 0;
+    g_model_auto_cache_limit_bytes = 0;
+    g_model_auto_cache_limit_ready = 0;
     if (g_model_prefetch_stream) {
         (void)cudaStreamDestroy(g_model_prefetch_stream);
         g_model_prefetch_stream = NULL;
@@ -1539,7 +1721,14 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
 extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
-    if (!cuda_model_range_ptr(model_map, offset, bytes, label ? label : "model_tensor")) return 0;
+    const char *cache_label = label ? label : "model_tensor";
+    const char *ptr = NULL;
+    if (cuda_partial_weight_cache_enabled() || cuda_direct_model_enabled()) {
+        ptr = cuda_model_range_cache_device(model_map, model_size, offset, bytes, cache_label);
+    } else {
+        ptr = cuda_model_range_ptr(model_map, offset, bytes, cache_label);
+    }
+    if (!ptr) return 0;
     return cuda_model_range_is_cached(model_map, offset, bytes);
 }
 
@@ -1564,8 +1753,18 @@ extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_
 extern "C" void ds4_gpu_print_memory_report(const char *label) {
     size_t free_b = 0, total_b = 0;
     (void)cudaMemGetInfo(&free_b, &total_b);
-    fprintf(stderr, "ds4: CUDA memory report %s: free %.2f MiB total %.2f MiB\n",
-            label ? label : "", (double)free_b / 1048576.0, (double)total_b / 1048576.0);
+    uint64_t arena_bytes = 0;
+    for (const cuda_model_arena &a : g_model_arenas) arena_bytes += a.bytes;
+    fprintf(stderr,
+            "ds4: CUDA memory report %s: free %.2f MiB total %.2f MiB "
+            "model-cache %.2f GiB arenas %.2f GiB q8-f16 %.2f GiB q8-f32 %.2f GiB\n",
+            label ? label : "",
+            (double)free_b / 1048576.0,
+            (double)total_b / 1048576.0,
+            (double)g_model_range_bytes / 1073741824.0,
+            (double)arena_bytes / 1073741824.0,
+            (double)g_q8_f16_bytes / 1073741824.0,
+            (double)g_q8_f32_bytes / 1073741824.0);
 }
 
 extern "C" void ds4_gpu_set_quality(bool quality) {
