@@ -9122,12 +9122,13 @@ static uint32_t metal_graph_decode_indexer_top_k(const ds4_gpu_graph *g) {
     if (env && env[0]) {
         char *endp = NULL;
         const long v = strtol(env, &endp, 10);
-        if (endp != env && v > 0 && v <= DS4_N_INDEXER_TOP_K && ((v & (v - 1)) == 0)) return (uint32_t)v;
+        if (endp != env && v >= 4 && v <= DS4_N_INDEXER_TOP_K && ((v & (v - 1)) == 0)) return (uint32_t)v;
     }
     /* M5 Max decode spends a visible fraction of time sorting and scanning the
      * sparse compressed-row top-k.  Official-vector, long-context, and tool-call
-     * checks remain stable with a smaller decode-only candidate set, while
-     * prefill keeps the model-configured 512 rows. */
+     * checks remain stable down to four decode-only candidates; smaller values
+     * passed logprob vectors but broke tool-call quality, so keep them out of
+     * the normal override path.  Prefill keeps the model-configured 512 rows. */
     if (metal_graph_use_m5_large_prefill_schedule(g)) return 4u;
     return DS4_N_INDEXER_TOP_K;
 }
