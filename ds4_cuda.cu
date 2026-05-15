@@ -11780,7 +11780,25 @@ static int routed_moe_launch(
      *      legacy down layout (down[(tok * n_expert_used + slot), row]).
      *   5. moe_sum_kernel (unchanged): sum across the n_expert_used slot
      *      dim -> out, since router weights are already baked into mid. */
-    if (ds4_cuda_use_mmq() && !q4k_path && gate_type == 16u && down_type == 10u) {
+    /* Decode (n_tokens=1, top_k=6 -> 6 assignment rows) is handled faster
+     * by the legacy fused moe_gate_up_mid_decode_lut_qwarp32_kernel than by
+     * mmq's matrix-matrix code path, which has higher per-launch fixed cost
+     * at small batch sizes.  Default the mmq path on for n_tokens >= 2 only.
+     * DS4_CUDA_MMQ_MOE_MIN_TOKENS overrides the threshold (e.g. set to 1 to
+     * force mmq even for decode, or to a very large value to disable mmq
+     * for MoE entirely while keeping it for the dense path). */
+    static int mmq_moe_min_tokens_init = 0;
+    static uint32_t mmq_moe_min_tokens = 2;
+    if (!mmq_moe_min_tokens_init) {
+        mmq_moe_min_tokens_init = 1;
+        const char *s = getenv("DS4_CUDA_MMQ_MOE_MIN_TOKENS");
+        if (s && *s) {
+            long v = strtol(s, NULL, 10);
+            if (v >= 1 && v <= 0x10000) mmq_moe_min_tokens = (uint32_t)v;
+        }
+    }
+    if (ds4_cuda_use_mmq() && !q4k_path && gate_type == 16u && down_type == 10u &&
+        n_tokens >= mmq_moe_min_tokens) {
         const uint32_t n_expert_used = n_expert;   /* parameter name is a misnomer; this is top_k */
         const uint32_t n_experts_total = 256u;     /* matches the hardcoded constant at line 11437 */
         const uint64_t n_assignments = (uint64_t)n_tokens * n_expert_used;
