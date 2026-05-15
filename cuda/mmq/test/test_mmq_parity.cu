@@ -39,6 +39,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -442,6 +443,166 @@ bool run_iq2_xxs(int M, int N, int K, uint32_t seed, float abs_scale = 0.20f) {
     return ok;
 }
 
+// --------------------------------------------------------------------------
+// MoE parity runners.
+//
+// Generates per-expert weight slabs in the type-specific block format
+// stacked contiguously, a routing table [n_tokens, n_expert_used], and an
+// F32 activation [n_tokens, K].  Computes the reference by dequantizing
+// every expert's weights and running a naive per-(token, slot) GEMM.
+// Compares against ds4_mmq_*_moe.
+// --------------------------------------------------------------------------
+
+template <typename BlockT, typename DequantFn>
+bool run_moe_generic(
+        const char * tag, int blck_size,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        uint32_t seed, float abs_scale,
+        DequantFn gen_and_dequant,
+        int (*entry)(const void *, const float *, const int32_t *, float *,
+                     int, int, int, int, int, cudaStream_t)) {
+    fprintf(stderr, "=== %s   M=%d K=%d ntok=%d nexp=%d nused=%d  seed=%u ===\n",
+            tag, M, K, n_tokens, n_experts, n_expert_used, seed);
+
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+
+    const int blocks_per_row    = K / blck_size;
+    const int blocks_per_expert = M * blocks_per_row;
+
+    std::vector<BlockT> W_blk((size_t)n_experts * blocks_per_expert);
+    std::vector<float>  W_deq((size_t)n_experts * M * K);
+    gen_and_dequant(W_blk.data(), W_deq.data(), n_experts, M, K, blocks_per_expert, rng);
+
+    // Routing: distinct experts per token.
+    std::vector<int32_t> ids((size_t)n_tokens * n_expert_used);
+    std::uniform_int_distribution<int> uexp(0, n_experts - 1);
+    for (int t = 0; t < n_tokens; t++) {
+        std::vector<int> picked;
+        while ((int)picked.size() < n_expert_used) {
+            int e = uexp(rng);
+            if (std::find(picked.begin(), picked.end(), e) == picked.end()) picked.push_back(e);
+        }
+        for (int s = 0; s < n_expert_used; s++) ids[t * n_expert_used + s] = picked[s];
+    }
+
+    std::vector<float> X((size_t)n_tokens * K);
+    for (auto & v : X) v = nd(rng);
+
+    const int64_t ne_get_rows = (int64_t)n_tokens * n_expert_used;
+    std::vector<float> ref_out((size_t)M * ne_get_rows, 0.0f);
+    for (int t = 0; t < n_tokens; t++) {
+        for (int s = 0; s < n_expert_used; s++) {
+            const int e   = ids[t * n_expert_used + s];
+            const int col = t * n_expert_used + s;
+            const float * w_e = &W_deq[(size_t)e * M * K];
+            const float * x_t = &X[(size_t)t * K];
+            for (int row = 0; row < M; row++) {
+                float acc = 0.0f;
+                const float * w_row = w_e + (size_t)row * K;
+                for (int k = 0; k < K; k++) acc += w_row[k] * x_t[k];
+                ref_out[(size_t)col * M + row] = acc;
+            }
+        }
+    }
+
+    cudaStream_t stream; cudaStreamCreate(&stream);
+    void    * dW   = nullptr;
+    float   * dX   = nullptr;
+    int32_t * dIds = nullptr;
+    float   * dY   = nullptr;
+    cudaMalloc(&dW,   W_blk.size() * sizeof(BlockT));
+    cudaMalloc(&dX,   X.size() * sizeof(float));
+    cudaMalloc(&dIds, ids.size() * sizeof(int32_t));
+    cudaMalloc(&dY,   (size_t)M * ne_get_rows * sizeof(float));
+    cudaMemcpyAsync(dW,   W_blk.data(), W_blk.size() * sizeof(BlockT), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(dX,   X.data(),     X.size() * sizeof(float),       cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(dIds, ids.data(),   ids.size() * sizeof(int32_t),   cudaMemcpyHostToDevice, stream);
+    cudaMemsetAsync(dY, 0, (size_t)M * ne_get_rows * sizeof(float), stream);
+
+    int rc = entry(dW, dX, dIds, dY, M, K, n_tokens, n_experts, n_expert_used, stream);
+    if (rc != 0) { fprintf(stderr, "%s entry returned %d\n", tag, rc);
+                   cudaFree(dW); cudaFree(dX); cudaFree(dIds); cudaFree(dY); cudaStreamDestroy(stream);
+                   return false; }
+
+    std::vector<float> got_out((size_t)M * ne_get_rows, 0.0f);
+    cudaMemcpyAsync(got_out.data(), dY, got_out.size() * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    cudaFree(dW); cudaFree(dX); cudaFree(dIds); cudaFree(dY); cudaStreamDestroy(stream);
+
+    const float abs_tol = abs_scale * std::sqrt((float)K);
+    const bool ok = check_close(got_out, ref_out, abs_tol, 0.05f);
+    fprintf(stderr, "%s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+bool run_q8_0_moe(int M, int K, int nt, int ne, int nu, uint32_t seed) {
+    auto fn = [](cpu_block_q8_0 * blk, float * out,
+                 int n_experts, int M, int K, int blocks_per_expert,
+                 std::mt19937 & rng) {
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        const int blocks_per_row = K / QK8_0;
+        for (int e = 0; e < n_experts; e++) {
+            cpu_block_q8_0 * eblk = blk + (size_t)e * blocks_per_expert;
+            std::vector<float> src((size_t)M * K);
+            for (auto & v : src) v = nd(rng);
+            for (int row = 0; row < M; row++) {
+                quantize_row_q8_0_cpu(&src[(size_t)row * K], &eblk[row * blocks_per_row], K);
+                const cpu_block_q8_0 * rowblk = &eblk[row * blocks_per_row];
+                float * orow = out + ((size_t)e * M + row) * K;
+                for (int b = 0; b < blocks_per_row; b++) {
+                    const float d = fp16_to_float(rowblk[b].d);
+                    for (int j = 0; j < QK8_0; j++) {
+                        orow[b * QK8_0 + j] = d * rowblk[b].qs[j];
+                    }
+                }
+            }
+        }
+    };
+    return run_moe_generic<cpu_block_q8_0>(
+        "Q8_0/MOE", QK8_0, M, K, nt, ne, nu, seed, 0.05f, fn, ds4_mmq_q8_0_moe);
+}
+
+bool run_q2_K_moe(int M, int K, int nt, int ne, int nu, uint32_t seed) {
+    auto fn = [](block_q2_K * blk, float * out,
+                 int n_experts, int M, int K, int blocks_per_expert,
+                 std::mt19937 & rng) {
+        const int blocks_per_row = K / QK_K_LOCAL;
+        for (int e = 0; e < n_experts; e++) {
+            block_q2_K * eblk = blk + (size_t)e * blocks_per_expert;
+            for (int row = 0; row < M; row++) {
+                for (int b = 0; b < blocks_per_row; b++) {
+                    generate_random_block_q2_K(&eblk[row * blocks_per_row + b], rng);
+                }
+                dequantize_row_q2_K_cpu(&eblk[row * blocks_per_row],
+                                        out + ((size_t)e * M + row) * K, K);
+            }
+        }
+    };
+    return run_moe_generic<block_q2_K>(
+        "Q2_K/MOE", QK_K_LOCAL, M, K, nt, ne, nu, seed, 0.05f, fn, ds4_mmq_q2_K_moe);
+}
+
+bool run_iq2_xxs_moe(int M, int K, int nt, int ne, int nu, uint32_t seed) {
+    auto fn = [](block_iq2_xxs * blk, float * out,
+                 int n_experts, int M, int K, int blocks_per_expert,
+                 std::mt19937 & rng) {
+        const int blocks_per_row = K / QK_K_LOCAL;
+        for (int e = 0; e < n_experts; e++) {
+            block_iq2_xxs * eblk = blk + (size_t)e * blocks_per_expert;
+            for (int row = 0; row < M; row++) {
+                for (int b = 0; b < blocks_per_row; b++) {
+                    generate_random_block_iq2_xxs(&eblk[row * blocks_per_row + b], rng);
+                }
+                dequantize_row_iq2_xxs_cpu(&eblk[row * blocks_per_row],
+                                           out + ((size_t)e * M + row) * K, K);
+            }
+        }
+    };
+    return run_moe_generic<block_iq2_xxs>(
+        "IQ2_XXS/MOE", QK_K_LOCAL, M, K, nt, ne, nu, seed, 0.20f, fn, ds4_mmq_iq2_xxs_moe);
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -468,6 +629,22 @@ int main(int argc, char ** argv) {
     all_ok &= run_iq2_xxs(/*M=*/128,  /*N=*/8,   /*K=*/512,  0xCAFE3);
     all_ok &= run_iq2_xxs(/*M=*/256,  /*N=*/1,   /*K=*/4096, 0xCAFE4);
     all_ok &= run_iq2_xxs(/*M=*/2048, /*N=*/16,  /*K=*/4096, 0xCAFE5);
+
+    // MoE (_id) path.  Small expert counts + small shapes for fast verification.
+    // Per-token-distinct routing with top_k=2 or 6.
+    all_ok &= run_q8_0_moe   (/*M=*/64,   /*K=*/256,  /*nt=*/8,  /*nexp=*/4,   /*nused=*/2, 0xC0FE01);
+    all_ok &= run_q8_0_moe   (/*M=*/128,  /*K=*/512,  /*nt=*/16, /*nexp=*/8,   /*nused=*/2, 0xC0FE02);
+    all_ok &= run_q8_0_moe   (/*M=*/256,  /*K=*/256,  /*nt=*/4,  /*nexp=*/8,   /*nused=*/4, 0xC0FE03);
+    all_ok &= run_q2_K_moe   (/*M=*/64,   /*K=*/256,  /*nt=*/8,  /*nexp=*/4,   /*nused=*/2, 0xC0FE04);
+    all_ok &= run_q2_K_moe   (/*M=*/128,  /*K=*/512,  /*nt=*/16, /*nexp=*/8,   /*nused=*/2, 0xC0FE05);
+    all_ok &= run_iq2_xxs_moe(/*M=*/64,   /*K=*/256,  /*nt=*/8,  /*nexp=*/4,   /*nused=*/2, 0xC0FE06);
+    all_ok &= run_iq2_xxs_moe(/*M=*/128,  /*K=*/512,  /*nt=*/16, /*nexp=*/8,   /*nused=*/2, 0xC0FE07);
+    // V4 Flash-realistic top-6 routing (n_expert_used=6 hits the templated
+    // mm_ids_helper specialisation at mmid.cu:148).  Use a small expert
+    // population so the CPU reference stays fast.
+    all_ok &= run_q8_0_moe   (/*M=*/256,  /*K=*/256,  /*nt=*/8,  /*nexp=*/16,  /*nused=*/6, 0xC0FE08);
+    all_ok &= run_q2_K_moe   (/*M=*/256,  /*K=*/512,  /*nt=*/8,  /*nexp=*/16,  /*nused=*/6, 0xC0FE09);
+    all_ok &= run_iq2_xxs_moe(/*M=*/256,  /*K=*/512,  /*nt=*/8,  /*nexp=*/16,  /*nused=*/6, 0xC0FE0A);
 
     fprintf(stderr, "===================\n");
     fprintf(stderr, "%s\n", all_ok ? "ALL PASS" : "SOME FAILED");

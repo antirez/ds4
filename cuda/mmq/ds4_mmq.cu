@@ -284,6 +284,203 @@ extern "C" int ds4_mmq_iq2_xxs_dense(
     return ds4_mmq_dense_impl<GGML_TYPE_IQ2_XXS>("ds4_mmq_iq2_xxs_dense", W, X, out, M, N, K, stream);
 }
 
+// ----------------------------------------------------------------------------
+// MoE matmul implementation, shared across all three quant types.
+//
+// Mirrors upstream mmq.cu:163-222 (the ids != nullptr branch).  Caller
+// provides:
+//   - per-expert weights stacked contiguously
+//   - per-token activations [n_tokens, K]
+//   - routing table ids[t, s] = expert id
+// The wrapper invokes:
+//   1. ggml_cuda_launch_mm_ids_helper to build (ids_src1, ids_dst,
+//      expert_bounds) - permutations that sort assignments by expert.
+//   2. quantize_mmq_q8_1_cuda with ids_src1 - gathers and quantizes the
+//      activation into the expert-major flat layout.
+//   3. mul_mat_q_case<type> with ids_dst + expert_bounds - the matmul.
+// ----------------------------------------------------------------------------
+
+namespace {
+
+template <ggml_type type>
+int ds4_mmq_moe_impl(
+        const char    * tag,
+        const void    * W,
+        const float   * X_f32,
+        const int32_t * ids,
+        float         * out_f32,
+        int             M,
+        int             K,
+        int             n_tokens,
+        int             n_experts,
+        int             n_expert_used,
+        cudaStream_t    stream) {
+
+    if (!W || !X_f32 || !ids || !out_f32) {
+        fprintf(stderr, "%s: null pointer\n", tag);
+        return -1;
+    }
+    if (M <= 0 || K <= 0 || n_tokens <= 0 || n_experts <= 0 || n_expert_used <= 0) {
+        fprintf(stderr, "%s: bad shape M=%d K=%d ntok=%d nexp=%d nused=%d\n",
+                tag, M, K, n_tokens, n_experts, n_expert_used);
+        return -1;
+    }
+    if (K % 256 != 0) {
+        fprintf(stderr, "%s: K=%d must be a multiple of 256\n", tag, K);
+        return -1;
+    }
+    if (n_expert_used > n_experts) {
+        fprintf(stderr, "%s: n_expert_used=%d > n_experts=%d\n", tag, n_expert_used, n_experts);
+        return -1;
+    }
+
+    const int dev = ggml_cuda_get_device();
+    const int cc  = ggml_cuda_info().devices[dev].cc;
+
+    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+    if (!ctx) {
+        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
+        return -1;
+    }
+
+    const int64_t ne_get_rows  = (int64_t)n_tokens * n_expert_used;
+    const int64_t ne00         = K;
+    const int64_t ne10_padded  = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    const int64_t ne11         = 1;             // src1 rows per channel (one per token)
+    const int64_t ne12         = n_tokens;      // src1 channels (= tokens)
+    const int64_t blck         = ggml_blck_size(type);
+    const int64_t s01          = (int64_t)K / blck;
+    const int64_t s02          = (int64_t)M * s01;   // per-expert weight stride in blocks
+
+    // 1. Build the expert-major work map.
+    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx->pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx->pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx->pool(), n_experts + 1);
+
+    // si1 = stride between tokens in the ids tensor, in elements. Our ids is
+    // contiguous [n_tokens, n_expert_used] so si1 = n_expert_used.
+    // sis1 = stride between src1 channels in row-units. With ne11=1, sis1=1
+    //        means each "channel" of src1 is one row of K floats.
+    const int si1  = n_expert_used;
+    const int sis1 = 1;
+
+    ggml_cuda_launch_mm_ids_helper(
+        ids, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+        n_experts, n_tokens, n_expert_used, /*nchannels_y=*/(int)ne11, si1, sis1, stream);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: mm_ids_helper failed: %s\n", tag, cudaGetErrorString(err));
+        return -2;
+    }
+
+    // 2. Gather + quantize the activation into Q8_1.
+    const size_t nbytes_src1_q8_1 =
+        ne_get_rows * ne10_padded * sizeof(block_q8_1) / QK8_1 +
+        get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_src1_q8_1);
+
+    // src1 logical [K, ne11=1, ne12=n_tokens, ne13=1] - K innermost, then
+    // one row per channel, channels = tokens.
+    const int64_t s11_src = (int64_t)K;                                 // stride between rows of a channel
+    const int64_t s12_src = (int64_t)K * ne11;                          // stride between channels = K*1
+    const int64_t s13_src = (int64_t)K * ne11 * ne12;                   // stride between samples
+
+    quantize_mmq_q8_1_cuda(
+        X_f32, ids_src1.get(), (void *)src1_q8_1.get(),
+        type, /*ne00=*/K, s11_src, s12_src, s13_src,
+        /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
+        stream);
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: quantize_mmq_q8_1_cuda failed: %s\n", tag, cudaGetErrorString(err));
+        return -3;
+    }
+
+    // 3. Build mmq_args for the MoE path.
+    //
+    // dst layout convention matches upstream's MoE branch
+    // (mmq.cu:215-220): dst is interpreted as [M, n_expert_used, n_tokens]
+    // with M innermost and n_expert_used as the second dim that mmq writes
+    // through ids_dst.  s1 = M (the column stride in the flat dst buffer
+    // mmq writes into).  The output is column-major: out[col*M + row].
+    const int64_t s1            = (int64_t)M;
+    // stride_channel_y per upstream: ne11 * ne10_padded * sizeof(block_q8_1)
+    //                                     / (QK8_1 * sizeof(int))
+    // In MoE mode the kernel zeroes out the channel-stride contribution to
+    // offset_y after reading expert_bounds, so the value is permissive -
+    // but we set it consistently with upstream.
+    const int64_t s12_mmq = ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+    const int64_t s13_mmq = ne12 * s12_mmq;
+
+    const bool use_stream_k =
+        (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
+        GGML_CUDA_CC_IS_CDNA(cc);
+
+    const mmq_args args = {
+        /*x=*/(const char *)W,
+        /*type_x=*/type,
+        /*y=*/(const int *)src1_q8_1.get(),
+        /*ids_dst=*/ids_dst.get(),
+        /*expert_bounds=*/expert_bounds.get(),
+        /*dst=*/out_f32,
+        /*ncols_x=*/ne00,
+        /*nrows_x=*/(int64_t)M,
+        /*ncols_dst=*/ne_get_rows,
+        /*stride_row_x=*/s01,
+        /*ncols_y=*/ne_get_rows,
+        /*nrows_dst=*/s1,
+        /*nchannels_x=*/(int64_t)n_experts,
+        /*nchannels_y=*/(int64_t)n_experts,
+        /*stride_channel_x=*/s02,
+        /*stride_channel_y=*/s12_mmq,
+        /*stride_channel_dst=*/(int64_t)0,
+        /*nsamples_x=*/1,
+        /*nsamples_y=*/1,
+        /*stride_sample_x=*/0,
+        /*stride_sample_y=*/s13_mmq,
+        /*stride_sample_dst=*/0,
+        /*use_stream_k=*/use_stream_k,
+        /*ncols_max=*/(int64_t)n_tokens,
+    };
+
+    mul_mat_q_case<type>(*ctx, args, stream);
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: mul_mat_q_case (moe) launch failed: %s\n", tag, cudaGetErrorString(err));
+        return -4;
+    }
+    return 0;
+}
+
+} // anonymous namespace
+
+extern "C" int ds4_mmq_q8_0_moe(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    return ds4_mmq_moe_impl<GGML_TYPE_Q8_0>("ds4_mmq_q8_0_moe", W, X, ids, out, M, K,
+                                            n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_q2_K_moe(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    return ds4_mmq_moe_impl<GGML_TYPE_Q2_K>("ds4_mmq_q2_K_moe", W, X, ids, out, M, K,
+                                            n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_iq2_xxs_moe(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    return ds4_mmq_moe_impl<GGML_TYPE_IQ2_XXS>("ds4_mmq_iq2_xxs_moe", W, X, ids, out, M, K,
+                                               n_tokens, n_experts, n_expert_used, stream);
+}
+
 // Explicit instantiations. One per quant type the public API exposes.
 // Each instantiation drags in the load_tiles_<type> + vec_dot_<type>_*
 // device functions from mmq.cuh, so the .o objects below contain everything

@@ -88,6 +88,70 @@ int ds4_mmq_iq2_xxs_dense(
     int           K,
     cudaStream_t  stream);
 
+// MoE matmul entry points. For each (token, slot-within-token's-top-k) pair
+// the kernel computes:
+//
+//   out[col, row] = sum_k W[ids[token, slot], row, k] * X[token, k]
+//
+// where col = token * n_expert_used + slot, row in [0, M).  The caller is
+// responsible for any downstream sum-weighted-by-router-weights reduction
+// across the n_expert_used dimension (Phase 5 wires this into ds4's
+// existing moe_sum_kernel).
+//
+// Layouts:
+//   W:       device pointer, [n_experts, M rows, K cols] in the
+//            type-specific block format.  Per-expert slab is M*K/blck
+//            blocks stored contiguously; experts are stacked.
+//   X_f32:   device pointer, [n_tokens, K] F32 row-major (K innermost).
+//   ids:     device pointer, [n_tokens, n_expert_used] int32_t row-major.
+//            ids[t*n_expert_used + s] is the expert id for token t's
+//            s-th routing slot.  Values must be in [0, n_experts).
+//   out_f32: caller-allocated, M * n_tokens * n_expert_used floats.
+//            Column-major: out[col*M + row].
+//
+// K must be a multiple of 256.  n_expert_used must be one of the values
+// the vendored mm_ids_helper template specialises on: 2, 4, 6, 8, 16, 32
+// (or any other value, which falls back to the generic path).  For V4
+// Flash, n_expert_used = 6.
+//
+// Returns 0 on success, non-zero on validation or launch failure.
+
+int ds4_mmq_q8_0_moe(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+int ds4_mmq_q2_K_moe(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+int ds4_mmq_iq2_xxs_moe(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
