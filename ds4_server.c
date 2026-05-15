@@ -4652,6 +4652,7 @@ static void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const 
 
 static bool http_response(int fd, int code, const char *type, const char *body) {
     const char *reason = code == 200 ? "OK" :
+                         code == 401 ? "Unauthorized" :
                          code == 400 ? "Bad Request" :
                          code == 404 ? "Not Found" :
                          code == 409 ? "Conflict" :
@@ -7533,6 +7534,7 @@ struct server {
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
     bool disable_exact_dsml_tool_replay;
+    const char *api_key;
     pthread_mutex_t tool_mu;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -11201,10 +11203,12 @@ typedef struct {
     char path[256];
     char *body;
     size_t body_len;
+    char *auth_header;
 } http_request;
 
 static void http_request_free(http_request *r) {
     free(r->body);
+    free(r->auth_header);
     memset(r, 0, sizeof(*r));
 }
 
@@ -11261,6 +11265,38 @@ static bool read_http_request(int fd, http_request *r) {
     if (sscanf(line, "%7s %255s", r->method, r->path) != 2) goto fail;
     char *q = strchr(r->path, '?');
     if (q) *q = '\0';
+
+    /* Extract auth header for API key verification */
+    {
+        const char *hp = b.ptr, *h_end = b.ptr + (size_t)hend;
+        r->auth_header = NULL;
+        while (hp < h_end) {
+            const char *line_start = hp;
+            while (hp < h_end && *hp != '\n') hp++;
+            size_t line_len = (size_t)(hp - line_start);
+            if (line_len && line_start[line_len - 1] == '\r') line_len--;
+
+            if (line_len >= 21 && strncasecmp(line_start, "Authorization: Bearer ", 21) == 0) {
+                const char *v = line_start + 21;
+                while (v < line_start + line_len && isspace((unsigned char)*v)) v++;
+                size_t vlen = (size_t)(line_start + line_len - v);
+                if (vlen > 0) {
+                    r->auth_header = xstrndup(v, vlen);
+                    break;
+                }
+            }
+            if (line_len >= 11 && strncasecmp(line_start, "X-Api-Key: ", 11) == 0) {
+                const char *v = line_start + 11;
+                while (v < line_start + line_len && isspace((unsigned char)*v)) v++;
+                size_t vlen = (size_t)(line_start + line_len - v);
+                if (vlen > 0) {
+                    r->auth_header = xstrndup(v, vlen);
+                    break;
+                }
+            }
+            if (hp < h_end) hp++;
+        }
+    }
 
     long clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
@@ -11360,6 +11396,15 @@ static void *client_main(void *arg) {
     if (!read_http_request(fd, &hr)) {
         http_error(fd, 400, "bad HTTP request");
         goto done;
+    }
+
+    /* Check API key if configured */
+    if (s->api_key) {
+        if (!hr.auth_header || strcmp(s->api_key, hr.auth_header) != 0) {
+            http_error(fd, 401, "unauthorized");
+            http_request_free(&hr);
+            goto done;
+        }
     }
 
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
@@ -11481,6 +11526,7 @@ static void set_client_socket_nonblocking(int fd) {
 typedef struct {
     ds4_engine_options engine;
     const char *host;
+    const char *api_key;
     int port;
     int ctx_size;
     int default_tokens;
@@ -11600,6 +11646,9 @@ static void usage(FILE *fp) {
         "      Bind address. Default: 127.0.0.1\n"
         "  --port N\n"
         "      Bind port. Default: 8000\n"
+        "  --api-key KEY\n"
+        "      Require Authorization: Bearer KEY or X-Api-Key: KEY on every request.\n"
+        "      When unset, no authentication is required.\n"
         "  --trace FILE\n"
         "      Write a human-readable session trace: prompts, cache decisions, output, tool calls.\n"
         "\n"
@@ -11710,6 +11759,8 @@ static server_config parse_options(int argc, char **argv) {
             c.host = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--port")) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--api-key")) {
+            c.api_key = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-dir")) {
@@ -11802,6 +11853,7 @@ int main(int argc, char **argv) {
     s.session = session;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
+    s.api_key = cfg.api_key;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
