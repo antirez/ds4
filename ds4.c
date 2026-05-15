@@ -16419,6 +16419,326 @@ struct ds4_session {
     bool mtp_draft_valid;
 };
 
+#ifndef DS4_NO_GPU
+typedef enum {
+    DS4_OUTPUT_BENCH_TOP2,
+    DS4_OUTPUT_BENCH_FULL1,
+    DS4_OUTPUT_BENCH_FULL2,
+    DS4_OUTPUT_BENCH_PAIR_N2,
+    DS4_OUTPUT_BENCH_CANDIDATES2,
+    DS4_OUTPUT_BENCH_CERTIFY,
+} ds4_output_bench_kind;
+
+typedef struct {
+    ds4_gpu_graph *g;
+    const ds4_model *model;
+    const ds4_weights *weights;
+    ds4_gpu_tensor *full2_logits;
+    ds4_gpu_tensor *candidate_logits;
+    uint64_t vocab_dim;
+} ds4_output_bench_ctx;
+
+static void ds4_output_bench_set_err(char *err, size_t errlen, const char *msg) {
+    if (errlen != 0) snprintf(err, errlen, "%s", msg);
+}
+
+static bool ds4_output_bench_prepare_norms(ds4_output_bench_ctx *bc) {
+    ds4_gpu_graph *g = bc->g;
+    const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    ds4_gpu_tensor *row0 = ds4_gpu_tensor_view(g->batch_ffn_norm, 0, row_bytes);
+    ds4_gpu_tensor *row1 = ds4_gpu_tensor_view(g->batch_ffn_norm, row_bytes, row_bytes);
+    bool ok = row0 && row1;
+    if (ok) ok = ds4_gpu_begin_commands() != 0;
+    if (ok) ok = ds4_gpu_tensor_copy(row0, 0, g->output_norm, 0, row_bytes) != 0;
+    if (ok) ok = ds4_gpu_tensor_copy(row1, 0, g->output_norm, 0, row_bytes) != 0;
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    ds4_gpu_tensor_free(row1);
+    ds4_gpu_tensor_free(row0);
+    return ok;
+}
+
+static bool ds4_output_bench_encode(ds4_output_bench_ctx *bc, ds4_output_bench_kind kind) {
+    ds4_gpu_graph *g = bc->g;
+    const ds4_model *model = bc->model;
+    const ds4_weights *weights = bc->weights;
+    switch (kind) {
+    case DS4_OUTPUT_BENCH_TOP2:
+        return ds4_gpu_matmul_q8_0_top2_tensor(g->comp_selected,
+                                               model->map,
+                                               model->size,
+                                               weights->output->abs_offset,
+                                               DS4_N_EMBD,
+                                               bc->vocab_dim,
+                                               g->output_norm) != 0;
+    case DS4_OUTPUT_BENCH_FULL1:
+        return ds4_gpu_matmul_q8_0_tensor(g->logits,
+                                          model->map,
+                                          model->size,
+                                          weights->output->abs_offset,
+                                          DS4_N_EMBD,
+                                          bc->vocab_dim,
+                                          g->output_norm,
+                                          1) != 0;
+    case DS4_OUTPUT_BENCH_FULL2:
+        return ds4_gpu_matmul_q8_0_tensor(bc->full2_logits,
+                                          model->map,
+                                          model->size,
+                                          weights->output->abs_offset,
+                                          DS4_N_EMBD,
+                                          bc->vocab_dim,
+                                          g->batch_ffn_norm,
+                                          2) != 0;
+    case DS4_OUTPUT_BENCH_PAIR_N2:
+        return ds4_gpu_matmul_q8_0_top2_and_logits_n2_tensor(g->comp_selected,
+                                                             g->logits,
+                                                             model->map,
+                                                             model->size,
+                                                             weights->output->abs_offset,
+                                                             DS4_N_EMBD,
+                                                             bc->vocab_dim,
+                                                             g->batch_ffn_norm) != 0;
+    case DS4_OUTPUT_BENCH_CANDIDATES2:
+        return ds4_gpu_matmul_q8_0_candidates_tensor(bc->candidate_logits,
+                                                     g->output_candidate_ids,
+                                                     2,
+                                                     model->map,
+                                                     model->size,
+                                                     weights->output->abs_offset,
+                                                     DS4_N_EMBD,
+                                                     bc->vocab_dim,
+                                                     g->output_norm) != 0;
+    case DS4_OUTPUT_BENCH_CERTIFY:
+        return metal_graph_encode_output_candidate_cert(g, model, weights, bc->vocab_dim);
+    }
+    return false;
+}
+
+static bool ds4_output_bench_run_once(ds4_output_bench_ctx *bc, ds4_output_bench_kind kind) {
+    bool ok = ds4_gpu_begin_commands() != 0;
+    if (ok) ok = ds4_output_bench_encode(bc, kind);
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    return ok;
+}
+
+static double ds4_output_bench_time(ds4_output_bench_ctx *bc,
+                                    ds4_output_bench_kind kind,
+                                    int iters,
+                                    bool *ok_out) {
+    double total = 0.0;
+    const int warmup = iters < 4 ? 1 : 3;
+    for (int i = -warmup; i < iters; i++) {
+        const double t0 = i >= 0 ? now_sec() : 0.0;
+        if (!ds4_output_bench_run_once(bc, kind)) {
+            *ok_out = false;
+            return 0.0;
+        }
+        if (i >= 0) total += now_sec() - t0;
+    }
+    *ok_out = true;
+    return total / (double)iters;
+}
+
+static uint64_t ds4_output_q8_0_weight_bytes(uint64_t out_dim) {
+    const uint64_t blocks = ((uint64_t)DS4_N_EMBD + 31u) / 32u;
+    return out_dim * blocks * 34u;
+}
+
+static void ds4_output_bench_print_case(FILE *fp,
+                                        const char *name,
+                                        int iters,
+                                        double avg_sec,
+                                        uint64_t bytes,
+                                        const char *notes) {
+    const double avg_ms = avg_sec * 1000.0;
+    const double mib = (double)bytes / (1024.0 * 1024.0);
+    const double gbps = avg_sec > 0.0 ? (double)bytes / avg_sec / 1.0e9 : 0.0;
+    fprintf(fp,
+            "%s,%d,%.6f,%.3f,%.3f,%s\n",
+            name,
+            iters,
+            avg_ms,
+            mib,
+            gbps,
+            notes ? notes : "");
+}
+
+int ds4_session_output_head_bench(ds4_session *s, int iters, FILE *fp, char *err, size_t errlen) {
+    if (!s || !s->engine || !fp) {
+        ds4_output_bench_set_err(err, errlen, "invalid output-head bench arguments");
+        return 1;
+    }
+    if (iters <= 0) iters = 64;
+    ds4_engine *e = s->engine;
+    if (e->backend != DS4_BACKEND_CUDA) {
+        ds4_output_bench_set_err(err, errlen, "output-head bench is currently CUDA-only");
+        return 1;
+    }
+    if (!s->checkpoint_valid || s->checkpoint.len <= 0) {
+        ds4_output_bench_set_err(err, errlen, "output-head bench requires a synchronized session");
+        return 1;
+    }
+
+    ds4_gpu_graph *g = &s->graph;
+    const uint64_t vocab_dim = e->weights.output->dim[1];
+    if (!g->output_norm || !g->batch_ffn_norm || !g->logits || !g->comp_selected) {
+        ds4_output_bench_set_err(err, errlen, "output-head bench graph tensors are not allocated");
+        return 1;
+    }
+
+    ds4_output_bench_ctx bc = {
+        .g = g,
+        .model = &e->model,
+        .weights = &e->weights,
+        .vocab_dim = vocab_dim,
+    };
+    bc.full2_logits = ds4_gpu_tensor_alloc(2u * vocab_dim * sizeof(float));
+    bc.candidate_logits = ds4_gpu_tensor_alloc(2u * sizeof(float));
+    if (!bc.full2_logits || !bc.candidate_logits) {
+        ds4_gpu_tensor_free(bc.candidate_logits);
+        ds4_gpu_tensor_free(bc.full2_logits);
+        ds4_output_bench_set_err(err, errlen, "failed to allocate output-head bench tensors");
+        return 1;
+    }
+
+    bool ok = ds4_output_bench_prepare_norms(&bc);
+    if (!ok) {
+        ds4_gpu_tensor_free(bc.candidate_logits);
+        ds4_gpu_tensor_free(bc.full2_logits);
+        ds4_output_bench_set_err(err, errlen, "failed to prepare output-head benchmark norms");
+        return 1;
+    }
+
+    float *logits = xmalloc((size_t)vocab_dim * sizeof(logits[0]));
+    ok = ds4_output_bench_run_once(&bc, DS4_OUTPUT_BENCH_FULL1);
+    if (ok) {
+        ok = ds4_gpu_tensor_read(g->logits,
+                                 0,
+                                 logits,
+                                 vocab_dim * sizeof(logits[0])) != 0;
+    }
+    int top0 = -1, top1 = -1;
+    float top0_logit = 0.0f, top1_logit = 0.0f;
+    if (ok) logits_top2(logits, (uint32_t)vocab_dim, &top0, &top0_logit, &top1, &top1_logit);
+
+    ds4_gpu_top2_result top2;
+    memset(&top2, 0, sizeof(top2));
+    if (ok) ok = ds4_output_bench_run_once(&bc, DS4_OUTPUT_BENCH_TOP2);
+    if (ok) ok = ds4_gpu_tensor_read(g->comp_selected, 0, &top2, sizeof(top2)) != 0;
+    const bool top2_match = ok && (int)top2.id0 == top0 && (int)top2.id1 == top1;
+
+    ds4_gpu_top2_result pair_top2;
+    memset(&pair_top2, 0, sizeof(pair_top2));
+    if (ok) ok = ds4_output_bench_run_once(&bc, DS4_OUTPUT_BENCH_PAIR_N2);
+    if (ok) ok = ds4_gpu_tensor_read(g->comp_selected, 0, &pair_top2, sizeof(pair_top2)) != 0;
+    const bool pair_match = ok && (int)pair_top2.id0 == top0 && (int)pair_top2.id1 == top1;
+
+    uint32_t candidate_ids[2] = {
+        top0 >= 0 ? (uint32_t)top0 : 0u,
+        top1 >= 0 ? (uint32_t)top1 : 0u,
+    };
+    if (ok) {
+        ok = ds4_gpu_tensor_write(g->output_candidate_ids, 0, candidate_ids, sizeof(candidate_ids)) != 0;
+    }
+    float candidate_logits[2] = {0.0f, 0.0f};
+    if (ok) ok = ds4_output_bench_run_once(&bc, DS4_OUTPUT_BENCH_CANDIDATES2);
+    if (ok) {
+        ok = ds4_gpu_tensor_read(bc.candidate_logits,
+                                 0,
+                                 candidate_logits,
+                                 sizeof(candidate_logits)) != 0;
+    }
+    const float cand0_diff = ok ? fabsf(candidate_logits[0] - top0_logit) : 0.0f;
+    const float cand1_diff = ok ? fabsf(candidate_logits[1] - top1_logit) : 0.0f;
+    const bool candidates_match = ok && cand0_diff <= 1.0e-3f && cand1_diff <= 1.0e-3f;
+
+    const double cert_prepare_t0 = ok ? now_sec() : 0.0;
+    if (ok) ok = metal_graph_prepare_output_certifier(g, &e->model, &e->weights, vocab_dim);
+    const double cert_prepare_ms = ok ? (now_sec() - cert_prepare_t0) * 1000.0 : 0.0;
+    ds4_gpu_candidate_cert_result cert;
+    memset(&cert, 0, sizeof(cert));
+    if (ok) ok = ds4_output_bench_run_once(&bc, DS4_OUTPUT_BENCH_CERTIFY);
+    if (ok) {
+        ok = ds4_gpu_tensor_read(g->output_cert_result, 0, &cert, sizeof(cert)) != 0;
+    }
+    const bool false_cert = ok && cert.certified && (int)cert.candidate_id != top0;
+
+    if (!ok || !top2_match || !pair_match || !candidates_match || false_cert) {
+        free(logits);
+        ds4_gpu_tensor_free(bc.candidate_logits);
+        ds4_gpu_tensor_free(bc.full2_logits);
+        ds4_output_bench_set_err(err, errlen, "output-head benchmark validation failed");
+        return 1;
+    }
+
+    const uint64_t weight_bytes = ds4_output_q8_0_weight_bytes(vocab_dim);
+    const uint64_t input_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    const uint64_t logits_bytes = vocab_dim * sizeof(float);
+    const uint32_t cert_groups = g->output_cert_group_norms_groups ? g->output_cert_group_norms_groups : ds4_output_cert_groups();
+    const uint64_t cert_bound_bytes = vocab_dim * (uint64_t)cert_groups * sizeof(float);
+    const uint64_t cand2_weight_bytes = 2u * (((uint64_t)DS4_N_EMBD + 31u) / 32u) * 34u;
+
+    fprintf(fp, "# ds4 output-head projection microbenchmark\n");
+    fprintf(fp,
+            "# backend=%s ctx_tokens=%d iters=%d vocab=%llu embd=%u cert_groups=%u cert_prepare_ms=%.3f\n",
+            ds4_backend_name(e->backend),
+            s->checkpoint.len,
+            iters,
+            (unsigned long long)vocab_dim,
+            (unsigned)DS4_N_EMBD,
+            cert_groups,
+            cert_prepare_ms);
+    fprintf(fp,
+            "# validation top2=%u/%u logits_top2=%d/%d pair=%u/%u candidate_diff=%g/%g cert_candidate=%u certified=%u bound_id=%u false_cert=%d\n",
+            top2.id0,
+            top2.id1,
+            top0,
+            top1,
+            pair_top2.id0,
+            pair_top2.id1,
+            (double)cand0_diff,
+            (double)cand1_diff,
+            cert.candidate_id,
+            cert.certified,
+            cert.bound_id,
+            false_cert ? 1 : 0);
+    fprintf(fp, "path,iters,avg_ms,logical_bytes_mib,effective_gbps,notes\n");
+
+    bool timed_ok = true;
+    double avg = ds4_output_bench_time(&bc, DS4_OUTPUT_BENCH_TOP2, iters, &timed_ok);
+    if (timed_ok) ds4_output_bench_print_case(fp, "row0_top2_q8", iters, avg, weight_bytes + input_bytes, "logical Q8 read plus top2 reduction");
+    if (timed_ok) avg = ds4_output_bench_time(&bc, DS4_OUTPUT_BENCH_FULL1, iters, &timed_ok);
+    if (timed_ok) ds4_output_bench_print_case(fp, "row_logits_q8_n1", iters, avg, weight_bytes + input_bytes + logits_bytes, "one full vocab row");
+    if (timed_ok) avg = ds4_output_bench_time(&bc, DS4_OUTPUT_BENCH_FULL2, iters, &timed_ok);
+    if (timed_ok) ds4_output_bench_print_case(fp, "row_logits_q8_n2", iters, avg, 2u * (weight_bytes + input_bytes + logits_bytes), "generic n=2 full logits");
+    if (timed_ok) avg = ds4_output_bench_time(&bc, DS4_OUTPUT_BENCH_PAIR_N2, iters, &timed_ok);
+    if (timed_ok) ds4_output_bench_print_case(fp, "row0_top2_row1_logits_n2", iters, avg, weight_bytes + 2u * input_bytes + logits_bytes, "fused verifier projection");
+    if (timed_ok) avg = ds4_output_bench_time(&bc, DS4_OUTPUT_BENCH_CANDIDATES2, iters, &timed_ok);
+    if (timed_ok) ds4_output_bench_print_case(fp, "candidate_logits_2", iters, avg, cand2_weight_bytes + input_bytes + 2u * sizeof(float), "two explicit candidate rows");
+    if (timed_ok) avg = ds4_output_bench_time(&bc, DS4_OUTPUT_BENCH_CERTIFY, iters, &timed_ok);
+    if (timed_ok) ds4_output_bench_print_case(fp, "candidate_cert_top1", iters, avg, weight_bytes + input_bytes + cert_bound_bytes, "max-bound certifier logical upper bound");
+    fflush(fp);
+
+    free(logits);
+    ds4_gpu_tensor_free(bc.candidate_logits);
+    ds4_gpu_tensor_free(bc.full2_logits);
+    if (!timed_ok) {
+        ds4_output_bench_set_err(err, errlen, "output-head benchmark timing failed");
+        return 1;
+    }
+    return 0;
+}
+#else
+int ds4_session_output_head_bench(ds4_session *s, int iters, FILE *fp, char *err, size_t errlen) {
+    (void)s;
+    (void)iters;
+    (void)fp;
+    if (errlen != 0) snprintf(err, errlen, "%s", "output-head bench requires GPU support");
+    return 1;
+}
+#endif
+
 /* =========================================================================
  * Session Snapshot Payloads.
  * =========================================================================

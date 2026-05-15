@@ -35,6 +35,7 @@ typedef struct {
     int step_incr;
     int gen_tokens;
     int mtp_draft_tokens;
+    int output_head_bench_iters;
     float mtp_margin;
     double step_mul;
     bool warm_weights;
@@ -85,6 +86,7 @@ static void usage(FILE *fp) {
         "\n"
         "Output:\n"
         "  --csv FILE             Write CSV there instead of stdout.\n"
+        "  --output-head-bench N  Run the CUDA output-head verifier microbenchmark at --ctx-start and exit.\n"
         "  -h, --help             Show this help.\n");
 }
 
@@ -199,6 +201,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--output-head-bench")) {
+            c.output_head_bench_iters = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
             double v = parse_double_arg(need_arg(&i, argc, argv, arg), arg);
             if (v < 0.0 || v > 1000.0) {
@@ -263,13 +267,14 @@ static bench_config parse_options(int argc, char **argv) {
         fprintf(stderr, "ds4-bench: --step-incr must be positive when --step-mul is 1\n");
         exit(2);
     }
-    if (c.ctx_max > INT_MAX - c.gen_tokens - 1) {
+    const int max_live_ctx = c.output_head_bench_iters > 0 ? c.ctx_start : c.ctx_max;
+    if (max_live_ctx > INT_MAX - c.gen_tokens - 1) {
         fprintf(stderr, "ds4-bench: requested context is too large\n");
         exit(2);
     }
-    if (c.ctx_alloc == 0) c.ctx_alloc = c.ctx_max + c.gen_tokens + 1;
-    if (c.ctx_alloc <= c.ctx_max + c.gen_tokens) {
-        fprintf(stderr, "ds4-bench: --ctx-alloc must be greater than ctx-max + gen-tokens\n");
+    if (c.ctx_alloc == 0) c.ctx_alloc = max_live_ctx + c.gen_tokens + 1;
+    if (c.ctx_alloc <= max_live_ctx + c.gen_tokens) {
+        fprintf(stderr, "ds4-bench: --ctx-alloc must be greater than measured context + gen-tokens\n");
         exit(2);
     }
     return c;
@@ -328,11 +333,12 @@ int main(int argc, char **argv) {
     }
     free(text);
 
-    if (prompt.len < cfg.ctx_max) {
+    const int needed_prompt_tokens = cfg.output_head_bench_iters > 0 ? cfg.ctx_start : cfg.ctx_max;
+    if (prompt.len < needed_prompt_tokens) {
         fprintf(stderr,
-                "ds4-bench: prompt has %d tokens, need at least --ctx-max=%d\n",
+                "ds4-bench: prompt has %d tokens, need at least %d\n",
                 prompt.len,
-                cfg.ctx_max);
+                needed_prompt_tokens);
         ds4_tokens_free(&prompt);
         ds4_engine_close(engine);
         return 1;
@@ -357,6 +363,33 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+
+    if (cfg.output_head_bench_iters > 0) {
+        ds4_tokens prefix = {
+            .v = prompt.v,
+            .len = cfg.ctx_start,
+            .cap = cfg.ctx_start,
+        };
+        char err[256];
+        int rc = 0;
+        if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
+            fprintf(stderr, "ds4-bench: prefill to %d failed: %s\n", cfg.ctx_start, err);
+            rc = 1;
+        } else if (ds4_session_output_head_bench(session,
+                                                cfg.output_head_bench_iters,
+                                                out,
+                                                err,
+                                                sizeof(err)) != 0) {
+            fprintf(stderr, "ds4-bench: output-head bench failed: %s\n", err);
+            rc = 1;
+        }
+        if (out != stdout) fclose(out);
+        ds4_session_free(session);
+        ds4_tokens_free(&prompt);
+        ds4_engine_close(engine);
+        return rc;
+    }
+
     fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes\n");
     fflush(out);
 
