@@ -42,6 +42,12 @@ static volatile sig_atomic_t g_listen_fd = -1;
 #define DS4_SERVER_IO_TIMEOUT_SEC 10
 #define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
 
+/* Sampling defaults applied at request_init time and surfaced in /props.
+ * Most defaults live in ds4.h; only the server-specific top-k cap is here. */
+#define DS4_DEFAULT_TOP_K       0
+/* Structural temperature used during tool-call protocol encoding. */
+#define DS4_TOOL_STRUCTURAL_TEMPERATURE 0.0f
+
 static void stop_signal_handler(int sig) {
     (void)sig;
     if (g_stop_requested) _exit(130);
@@ -746,7 +752,7 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->api = API_OPENAI;
     r->model = xstrdup("deepseek-v4-flash");
     r->max_tokens = max_tokens;
-    r->top_k = 0;
+    r->top_k = DS4_DEFAULT_TOP_K;
     r->temperature = DS4_DEFAULT_TEMPERATURE;
     r->top_p = DS4_DEFAULT_TOP_P;
     r->min_p = DS4_DEFAULT_MIN_P;
@@ -7631,10 +7637,25 @@ typedef struct {
 static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
 
+typedef struct {
+    const char *model_path;
+    ds4_backend backend;
+    int ctx_size;
+    int default_tokens;
+    int n_threads;
+    int routed_quant_bits;
+    bool mtp_enabled;
+    int mtp_draft_tokens;
+    bool quality;
+    bool warm_weights;
+} server_runtime_config;
+
+
 struct server {
     ds4_engine *engine;
     ds4_session *session;
     int default_tokens;
+    server_runtime_config runtime;
     kv_disk_cache kv;
     tool_memory tool_mem;
     live_tool_state responses_live;
@@ -10883,12 +10904,12 @@ static void generate_job(server *s, job *j) {
         float min_p = j->req.min_p;
         if (ds4_think_mode_enabled(j->req.think_mode)) {
             temperature = DS4_DEFAULT_TEMPERATURE;
-            top_k = 0;
+            top_k = DS4_DEFAULT_TOP_K;
             top_p = DS4_DEFAULT_TOP_P;
             min_p = DS4_DEFAULT_MIN_P;
         }
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
-            temperature = 0.0f;
+            temperature = DS4_TOOL_STRUCTURAL_TEMPERATURE;
         }
         int token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
         if (token == ds4_token_eos(s->engine)) {
@@ -11485,8 +11506,46 @@ typedef struct {
     int fd;
 } client_arg;
 
-static void append_model_json_values(buf *b, int ctx, int default_tokens) {
-    const int max_completion = default_tokens < ctx ? default_tokens : ctx;
+static int effective_max_completion_tokens(int ctx, int default_tokens) {
+    return default_tokens < ctx ? default_tokens : ctx;
+}
+
+static void append_model_supported_parameters_json(buf *b) {
+    buf_puts(b,
+        "["
+            "\"tools\","
+            "\"tool_choice\","
+            "\"max_tokens\","
+            "\"temperature\","
+            "\"top_p\","
+            "\"top_k\","
+            "\"min_p\","
+            "\"stop\","
+            "\"seed\","
+            "\"stream\","
+            "\"reasoning_effort\"]");
+}
+
+static void append_model_meta_json(buf *b, const server_runtime_config *rt) {
+    buf_puts(b, "{\"backend\":");
+    json_escape(b, ds4_backend_name(rt->backend));
+    buf_puts(b, ",\"routed_expert_quant_bits\":");
+    if (rt->routed_quant_bits > 0) buf_printf(b, "%d", rt->routed_quant_bits);
+    else buf_puts(b, "null");
+    buf_printf(b,
+        ",\"mtp\":%s,"
+        "\"mtp_draft_tokens\":%d,"
+        "\"reasoning\":true,"
+        "\"reasoning_default\":\"high\","
+        "\"reasoning_max_min_context\":%u}",
+        rt->mtp_enabled ? "true" : "false",
+        rt->mtp_draft_tokens,
+        ds4_think_max_min_context());
+}
+
+static void append_model_json_values(buf *b, int ctx, int default_tokens,
+                                     const server_runtime_config *rt) {
+    const int max_completion = effective_max_completion_tokens(ctx, default_tokens);
     buf_printf(b,
         "{\"id\":\"deepseek-v4-flash\","
         "\"object\":\"model\","
@@ -11498,31 +11557,189 @@ static void append_model_json_values(buf *b, int ctx, int default_tokens) {
             "\"context_length\":%d,"
             "\"max_completion_tokens\":%d,"
             "\"is_moderated\":false},"
-        "\"supported_parameters\":["
-            "\"tools\","
-            "\"tool_choice\","
-            "\"max_tokens\","
-            "\"temperature\","
-            "\"top_p\","
-            "\"top_k\","
-            "\"min_p\","
-            "\"stop\","
-            "\"seed\","
-            "\"stream\","
-            "\"reasoning_effort\"]}",
+        "\"supported_parameters\":",
         ctx,
         ctx,
         max_completion);
+    append_model_supported_parameters_json(b);
+    buf_puts(b, ",\"meta\":");
+    append_model_meta_json(b, rt);
+    buf_putc(b, '}');
 }
 
 static void append_model_json(buf *b, const server *s) {
-    append_model_json_values(b, ds4_session_ctx(s->session), s->default_tokens);
+    append_model_json_values(b, ds4_session_ctx(s->session), s->default_tokens, &s->runtime);
+}
+
+static void append_nullable_string_json(buf *b, const char *s) {
+    if (s) json_escape(b, s);
+    else buf_puts(b, "null");
+}
+
+static void append_string_or_empty_json(buf *b, const char *s) {
+    json_escape(b, s ? s : "");
+}
+
+/* Emit /props introspection payload covering llama.cpp-compatible defaults,
+ * server identity, model, runtime config, reasoning, context memory estimates,
+ * KV disk cache, tool replay, and API surface. */
+static void append_props_json(buf *b, server *s) {
+    const server_runtime_config *rt = &s->runtime;
+    const int ctx = rt->ctx_size;
+    const int default_tokens = rt->default_tokens;
+    const int effective_tokens = effective_max_completion_tokens(ctx, default_tokens);
+    ds4_context_memory mem = ds4_context_memory_estimate(rt->backend, ctx);
+
+    int tool_ids = 0;
+    size_t tool_bytes = 0;
+    pthread_mutex_lock(&s->tool_mu);
+    tool_ids = s->tool_mem.entries;
+    tool_bytes = s->tool_mem.bytes;
+    pthread_mutex_unlock(&s->tool_mu);
+
+    buf_printf(b,
+        "{\"default_generation_settings\":{"
+            "\"n_ctx\":%d,"
+            "\"temperature\":%g,"
+            "\"top_p\":%g,"
+            "\"top_k\":%d,"
+            "\"min_p\":%g},"
+        "\"model_alias\":\"deepseek-v4-flash\","
+        "\"model_path\":",
+        ctx,
+        (double)DS4_DEFAULT_TEMPERATURE,
+        (double)DS4_DEFAULT_TOP_P,
+        DS4_DEFAULT_TOP_K,
+        (double)DS4_DEFAULT_MIN_P);
+    append_string_or_empty_json(b, rt->model_path);
+    buf_puts(b, ",\"build_info\":");
+    buf binfo = {0};
+    buf_printf(&binfo, "ds4-server (%s)", ds4_backend_name(rt->backend));
+    append_string_or_empty_json(b, binfo.ptr);
+    buf_free(&binfo);
+    buf_printf(b,
+        ",\"speculative_mode\":\"%s\","
+        "\"server\":{\"name\":\"ds4-server\"},"
+        "\"model\":{\"name\":\"DeepSeek V4 Flash\",",
+        rt->mtp_enabled ? "mtp" : "off");
+    buf_puts(b, "\"routed_expert_quant_bits\":");
+    if (rt->routed_quant_bits > 0) buf_printf(b, "%d", rt->routed_quant_bits);
+    else buf_puts(b, "null");
+    buf_printf(b, ",\"mtp\":%s,\"mtp_draft_tokens\":%d}",
+               rt->mtp_enabled ? "true" : "false",
+               rt->mtp_draft_tokens);
+
+    buf_puts(b, ",\"runtime\":{\"backend\":");
+    json_escape(b, ds4_backend_name(rt->backend));
+    buf_printf(b,
+        ",\"default_max_tokens\":%d,"
+        "\"effective_max_completion_tokens\":%d,"
+        "\"threads\":%d,"
+        "\"quality\":%s,"
+        "\"warm_weights\":%s}",
+        default_tokens,
+        effective_tokens,
+        rt->n_threads,
+        rt->quality ? "true" : "false",
+        rt->warm_weights ? "true" : "false");
+
+    buf_printf(b,
+        ",\"reasoning\":{"
+            "\"supported_efforts\":[\"low\",\"medium\",\"high\",\"xhigh\",\"max\"],"
+            "\"aliases\":{\"low\":\"high\",\"medium\":\"high\",\"xhigh\":\"high\"},"
+            "\"default\":\"high\","
+            "\"effective_default\":\"%s\","
+            "\"think_max_min_context\":%u}",
+        ds4_think_mode_name(ds4_think_mode_for_context(DS4_THINK_HIGH, ctx)),
+        ds4_think_max_min_context());
+
+    buf_printf(b,
+        ",\"sampling\":{"
+            "\"thinking_override\":{\"enabled\":true,\"temperature\":%g,\"top_p\":%g,\"top_k\":%d,\"min_p\":%g},"
+            "\"tool_protocol_sampling\":{\"structural_temperature\":%g}}",
+        (double)DS4_DEFAULT_TEMPERATURE, (double)DS4_DEFAULT_TOP_P,
+        DS4_DEFAULT_TOP_K, (double)DS4_DEFAULT_MIN_P,
+        (double)DS4_TOOL_STRUCTURAL_TEMPERATURE);
+
+    buf_printf(b,
+        ",\"context_memory\":{"
+            "\"total_bytes\":%llu,"
+            "\"raw_bytes\":%llu,"
+            "\"compressed_bytes\":%llu,"
+            "\"scratch_bytes\":%llu,"
+            "\"prefill_cap\":%u,"
+            "\"raw_cap\":%u,"
+            "\"comp_cap\":%u}",
+        (unsigned long long)mem.total_bytes,
+        (unsigned long long)mem.raw_bytes,
+        (unsigned long long)mem.compressed_bytes,
+        (unsigned long long)mem.scratch_bytes,
+        mem.prefill_cap,
+        mem.raw_cap,
+        mem.comp_cap);
+
+    /* kv.len is only mutated on the worker thread; lockless read here
+     * matches the rest of kv.* in this function. */
+    buf_puts(b, ",\"kv_disk_cache\":{");
+    buf_printf(b, "\"enabled\":%s,\"dir\":", s->kv.enabled ? "true" : "false");
+    append_nullable_string_json(b, s->kv.enabled ? s->kv.dir : NULL);
+    buf_printf(b,
+        ",\"budget_bytes\":%llu,"
+        "\"reject_different_quant\":%s,"
+        "\"policy\":{"
+            "\"min_tokens\":%d,"
+            "\"cold_max_tokens\":%d,"
+            "\"continued_interval_tokens\":%d,"
+            "\"boundary_trim_tokens\":%d,"
+            "\"boundary_align_tokens\":%d},"
+        "\"entries\":%d}",
+        (unsigned long long)(s->kv.enabled ? s->kv.budget_bytes : 0),
+        s->kv.reject_different_quant ? "true" : "false",
+        s->kv.opt.min_tokens,
+        s->kv.opt.cold_max_tokens,
+        s->kv.opt.continued_interval_tokens,
+        s->kv.opt.boundary_trim_tokens,
+        s->kv.opt.boundary_align_tokens,
+        s->kv.enabled ? s->kv.len : 0);
+
+    buf_printf(b,
+        ",\"tool_replay\":{"
+            "\"exact_dsml_replay_enabled\":%s,"
+            "\"max_ids\":%d,"
+            "\"current_ids\":%d,"
+            "\"current_bytes\":%llu}",
+        s->disable_exact_dsml_tool_replay ? "false" : "true",
+        s->tool_mem.max_entries,
+        tool_ids,
+        (unsigned long long)tool_bytes);
+
+    // Keep this list in sync with the GET/POST routing in client_main().
+    buf_puts(b,
+        ",\"api\":{"
+            "\"endpoints\":["
+                "\"GET /v1/models\","
+                "\"GET /v1/models/deepseek-v4-flash\","
+                "\"GET /props\","
+                "\"POST /v1/chat/completions\","
+                "\"POST /v1/completions\","
+                "\"POST /v1/messages\"],"
+            "\"supported_request_parameters\":");
+    append_model_supported_parameters_json(b);
+    buf_puts(b, "}}\n");
 }
 
 static bool send_model(server *s, int fd) {
     buf b = {0};
     append_model_json(&b, s);
     buf_putc(&b, '\n');
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool send_props(server *s, int fd) {
+    buf b = {0};
+    append_props_json(&b, s);
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
@@ -11572,6 +11789,11 @@ static void *client_main(void *arg) {
     }
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models/deepseek-v4-flash")) {
         send_model(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/props")) {
+        send_props(s, fd);
         http_request_free(&hr);
         goto done;
     }
@@ -12019,6 +12241,18 @@ int main(int argc, char **argv) {
     s.engine = engine;
     s.session = session;
     s.default_tokens = cfg.default_tokens;
+    s.runtime = (server_runtime_config){
+        .model_path = cfg.engine.model_path,
+        .backend = cfg.engine.backend,
+        .ctx_size = cfg.ctx_size,
+        .default_tokens = cfg.default_tokens,
+        .n_threads = cfg.engine.n_threads,
+        .routed_quant_bits = ds4_engine_routed_quant_bits(engine),
+        .mtp_enabled = ds4_engine_has_mtp(engine),
+        .mtp_draft_tokens = ds4_engine_mtp_draft_tokens(engine),
+        .quality = cfg.engine.quality,
+        .warm_weights = cfg.engine.warm_weights,
+    };
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
@@ -14534,16 +14768,135 @@ static void test_json_skip_has_nesting_limit(void) {
 }
 
 static void test_model_metadata_clamps_completion_to_context(void) {
+    server_runtime_config rt = {
+        .backend = DS4_BACKEND_CPU,
+        .routed_quant_bits = 2,
+        .mtp_enabled = false,
+        .mtp_draft_tokens = 1,
+    };
     buf b = {0};
-    append_model_json_values(&b, 32768, 393216);
+    append_model_json_values(&b, 32768, 393216, &rt);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":32768") != NULL);
     buf_free(&b);
 
-    append_model_json_values(&b, 100000, 4096);
+    append_model_json_values(&b, 100000, 4096, &rt);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":4096") != NULL);
     buf_free(&b);
+}
+
+static void test_model_metadata_contains_meta_fields(void) {
+    server_runtime_config rt = {
+        .backend = DS4_BACKEND_CPU,
+        .routed_quant_bits = 4,
+        .mtp_enabled = true,
+        .mtp_draft_tokens = 2,
+    };
+    buf b = {0};
+    append_model_json_values(&b, 32768, 393216, &rt);
+    TEST_ASSERT(strstr(b.ptr, "\"meta\":{") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"backend\":\"cpu\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"routed_expert_quant_bits\":4") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"mtp\":true") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"mtp_draft_tokens\":2") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"reasoning\":true") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"reasoning_default\":\"high\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"reasoning_max_min_context\":393216") != NULL);
+    buf_free(&b);
+}
+
+static void test_props_server_init(server *s) {
+    memset(s, 0, sizeof(*s));
+    s->default_tokens = 393216;
+    s->runtime = (server_runtime_config){
+        .model_path = "/tmp/ds4flash.gguf",
+        .backend = DS4_BACKEND_CPU,
+        .ctx_size = 32768,
+        .default_tokens = 393216,
+        .n_threads = 7,
+        .routed_quant_bits = 2,
+        .mtp_enabled = true,
+        .mtp_draft_tokens = 3,
+        .quality = true,
+        .warm_weights = true,
+    };
+    s->tool_mem.max_entries = 1234;
+    pthread_mutex_init(&s->tool_mu, NULL);
+}
+
+static void test_props_json_includes_runtime_and_api_metadata(void) {
+    server s;
+    test_props_server_init(&s);
+    s.kv.enabled = true;
+    s.kv.dir = xstrdup("/tmp/ds4-kv");
+    s.kv.budget_bytes = 8192;
+    s.kv.reject_different_quant = true;
+    s.kv.opt = kv_cache_default_options();
+    s.kv.len = 5;
+
+    buf b = {0};
+    append_props_json(&b, &s);
+    TEST_ASSERT(strstr(b.ptr, "\"default_generation_settings\":{") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"n_ctx\":32768") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"temperature\":1") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"top_p\":1") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"top_k\":0") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"min_p\":0") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"model_alias\":\"deepseek-v4-flash\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"model_path\":\"/tmp/ds4flash.gguf\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"build_info\":\"ds4-server (cpu)\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"speculative_mode\":\"mtp\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"server\":{\"name\":\"ds4-server\"}") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"model\":{\"name\":\"DeepSeek V4 Flash\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"backend\":\"cpu\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"default_max_tokens\":393216") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"effective_max_completion_tokens\":32768") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"threads\":7") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"quality\":true") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"warm_weights\":true") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"default\":\"high\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"think_max_min_context\":393216") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"context_memory\":{") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"total_bytes\":") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"raw_bytes\":") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"compressed_bytes\":") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"scratch_bytes\":") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"kv_disk_cache\":{") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"dir\":\"/tmp/ds4-kv\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"budget_bytes\":8192") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"entries\":5") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"exact_dsml_replay_enabled\":true") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"max_ids\":1234") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"GET /props\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"POST /v1/chat/completions\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"ctx_size\"") == NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"defaults\"") == NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") == NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"path\":\"/tmp/ds4flash.gguf\"") == NULL);
+
+    buf_free(&b);
+    free(s.kv.dir);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
+static void test_props_json_reports_disabled_disk_kv(void) {
+    server s;
+    test_props_server_init(&s);
+    s.runtime.mtp_enabled = false;
+    s.disable_exact_dsml_tool_replay = true;
+
+    buf b = {0};
+    append_props_json(&b, &s);
+    TEST_ASSERT(strstr(b.ptr, "\"speculative_mode\":\"off\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"kv_disk_cache\":{\"enabled\":false") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"dir\":null") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"budget_bytes\":0") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"entries\":0") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"exact_dsml_replay_enabled\":false") != NULL);
+
+    buf_free(&b);
+    pthread_mutex_destroy(&s.tool_mu);
 }
 
 static void test_client_socket_nonblocking_flag(void) {
@@ -15545,6 +15898,9 @@ static void ds4_server_unit_tests_run(void) {
     test_stop_list_streaming_holds_and_trims_stop_text();
     test_json_skip_has_nesting_limit();
     test_model_metadata_clamps_completion_to_context();
+    test_model_metadata_contains_meta_fields();
+    test_props_json_includes_runtime_and_api_metadata();
+    test_props_json_reports_disabled_disk_kv();
     test_client_socket_nonblocking_flag();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_remember_gate();
