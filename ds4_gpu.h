@@ -913,4 +913,19 @@ int ds4_gpu_matmul_q8_0_hc_expand_n2_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+int ds4_gpu_matmul_q8_0_hc_expand_n2_split_residual_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual0_hc,
+        const ds4_gpu_tensor *residual1_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
+
 #endif

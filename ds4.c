@@ -10379,8 +10379,10 @@ static bool metal_graph_decode2_batch_ffn_diff(
 static bool metal_graph_encode_decode2_pair_attention_output_exact(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
-        const ds4_layer_weights *layer) {
-    if (!g || !model || !layer) return false;
+        const ds4_layer_weights *layer,
+        const ds4_gpu_tensor    *residual0_hc,
+        const ds4_gpu_tensor    *residual1_hc) {
+    if (!g || !model || !layer || !residual0_hc || !residual1_hc) return false;
     const uint32_t n_groups = DS4_N_OUT_GROUP;
     const uint32_t group_heads = DS4_N_HEAD / n_groups;
     const uint32_t group_dim = DS4_N_HEAD_DIM * group_heads;
@@ -10396,18 +10398,20 @@ static bool metal_graph_encode_decode2_pair_attention_output_exact(
                                                            g->batch_heads,
                                                            2) != 0;
     if (ok) {
-        ok = ds4_gpu_matmul_q8_0_hc_expand_n2_tensor(g->batch_after_attn_hc,
-                                                     g->batch_attn_out,
-                                                     model->map,
-                                                     model->size,
-                                                     layer->attn_output_b->abs_offset,
-                                                     low_dim,
-                                                     DS4_N_EMBD,
-                                                     g->batch_attn_low,
-                                                     g->batch_cur_hc,
-                                                     g->batch_hc_split,
-                                                     DS4_N_EMBD,
-                                                     DS4_N_HC) != 0;
+        ok = ds4_gpu_matmul_q8_0_hc_expand_n2_split_residual_tensor(
+                g->batch_after_attn_hc,
+                g->batch_attn_out,
+                model->map,
+                model->size,
+                layer->attn_output_b->abs_offset,
+                low_dim,
+                DS4_N_EMBD,
+                g->batch_attn_low,
+                residual0_hc,
+                residual1_hc,
+                g->batch_hc_split,
+                DS4_N_EMBD,
+                DS4_N_HC) != 0;
     }
     return ok;
 }
@@ -10446,20 +10450,24 @@ static bool metal_graph_encode_decode2_layer_state_barrier_exact(
     ds4_gpu_tensor *heads1 = pair_attn_out ? metal_graph_tensor_row_view(g->batch_heads, 1, q_dim) : NULL;
     ds4_gpu_tensor *split0 = pair_attn_out ? metal_graph_tensor_row_view(g->batch_hc_split, 0, mix_hc) : NULL;
     ds4_gpu_tensor *split1 = pair_attn_out ? metal_graph_tensor_row_view(g->batch_hc_split, 1, mix_hc) : NULL;
-    ds4_gpu_tensor *batch_cur0 = pair_attn_out ? metal_graph_tensor_row_view(g->batch_cur_hc, 0, hc_dim) : NULL;
-    ds4_gpu_tensor *batch_cur1 = pair_attn_out ? metal_graph_tensor_row_view(g->batch_cur_hc, 1, hc_dim) : NULL;
     bool ok = after0 && after1 &&
-              (!pair_attn_out || (heads0 && heads1 && split0 && split1 && batch_cur0 && batch_cur1));
+              (!pair_attn_out || (heads0 && heads1 && split0 && split1));
 
     const bool profile = getenv("DS4_MTP_EXACT_DECODE2_LAYER_PROFILE") != NULL;
     const double total_t0 = profile ? now_sec() : 0.0;
     double stage_t0 = total_t0;
 
     ds4_gpu_tensor *saved_after_attn = g->after_attn_hc;
+    ds4_gpu_tensor *saved_heads = g->heads;
+    ds4_gpu_tensor *saved_hc_split = g->hc_split;
 
     if (ok) {
         g->cur_hc = cur0;
         g->after_attn_hc = after0;
+        if (pair_attn_out) {
+            g->heads = heads0;
+            g->hc_split = split0;
+        }
         ok = metal_graph_encode_decode_layer_impl(g,
                                                   model,
                                                   &weights->layer[il],
@@ -10473,11 +10481,6 @@ static bool metal_graph_encode_decode2_layer_state_barrier_exact(
                                                   pair_attn_out
                                                       ? METAL_GRAPH_DECODE_LAYER_BEFORE_ATTN_OUTPUT
                                                       : METAL_GRAPH_DECODE_LAYER_AFTER_ATTN);
-        if (ok && pair_attn_out) {
-            ok = ds4_gpu_tensor_copy(heads0, 0, g->heads, 0, q_dim * sizeof(float)) != 0 &&
-                 ds4_gpu_tensor_copy(split0, 0, g->hc_split, 0, mix_hc * sizeof(float)) != 0 &&
-                 ds4_gpu_tensor_copy(batch_cur0, 0, cur0, 0, hc_dim * sizeof(float)) != 0;
-        }
     }
     if (ok && profile) {
         ok = metal_graph_decode2_layer_profile_boundary(pair_attn_out ? "row0_attn_pre_output" : "row0_attn",
@@ -10496,6 +10499,10 @@ static bool metal_graph_encode_decode2_layer_state_barrier_exact(
     if (ok) {
         g->cur_hc = cur1;
         g->after_attn_hc = after1;
+        if (pair_attn_out) {
+            g->heads = heads1;
+            g->hc_split = split1;
+        }
         ok = metal_graph_encode_decode_layer_impl(g,
                                                   model,
                                                   &weights->layer[il],
@@ -10509,11 +10516,6 @@ static bool metal_graph_encode_decode2_layer_state_barrier_exact(
                                                   pair_attn_out
                                                       ? METAL_GRAPH_DECODE_LAYER_BEFORE_ATTN_OUTPUT
                                                       : METAL_GRAPH_DECODE_LAYER_AFTER_ATTN);
-        if (ok && pair_attn_out) {
-            ok = ds4_gpu_tensor_copy(heads1, 0, g->heads, 0, q_dim * sizeof(float)) != 0 &&
-                 ds4_gpu_tensor_copy(split1, 0, g->hc_split, 0, mix_hc * sizeof(float)) != 0 &&
-                 ds4_gpu_tensor_copy(batch_cur1, 0, cur1, 0, hc_dim * sizeof(float)) != 0;
-        }
     }
     if (ok && profile) {
         ok = metal_graph_decode2_layer_profile_boundary(pair_attn_out ? "row1_attn_pre_output" : "row1_attn",
@@ -10524,8 +10526,14 @@ static bool metal_graph_encode_decode2_layer_state_barrier_exact(
     }
 
     g->after_attn_hc = saved_after_attn;
+    g->heads = saved_heads;
+    g->hc_split = saved_hc_split;
     if (ok && pair_attn_out) {
-        ok = metal_graph_encode_decode2_pair_attention_output_exact(g, model, &weights->layer[il]);
+        ok = metal_graph_encode_decode2_pair_attention_output_exact(g,
+                                                                    model,
+                                                                    &weights->layer[il],
+                                                                    cur0,
+                                                                    cur1);
     }
     if (ok && profile && pair_attn_out) {
         ok = metal_graph_decode2_layer_profile_boundary("pair_attn_output", il, pos0, total_t0, &stage_t0);
@@ -10578,13 +10586,13 @@ static bool metal_graph_encode_decode2_layer_state_barrier_exact(
 
     ds4_gpu_tensor_free(after1);
     ds4_gpu_tensor_free(after0);
-    ds4_gpu_tensor_free(batch_cur1);
-    ds4_gpu_tensor_free(batch_cur0);
     ds4_gpu_tensor_free(split1);
     ds4_gpu_tensor_free(split0);
     ds4_gpu_tensor_free(heads1);
     ds4_gpu_tensor_free(heads0);
     g->after_attn_hc = saved_after_attn;
+    g->heads = saved_heads;
+    g->hc_split = saved_hc_split;
 
     if (ok) {
         ds4_gpu_tensor *tmp = cur0; cur0 = next0; next0 = tmp;

@@ -3250,7 +3250,8 @@ __global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
 __global__ static void matmul_q8_0_hc_expand_preq_n2_warp8_kernel(
         float *out_hc,
         float *block_out,
-        const float *residual_hc,
+        const float *residual0_hc,
+        const float *residual1_hc,
         const float *split,
         const unsigned char *w,
         const int8_t *xq,
@@ -3286,7 +3287,7 @@ __global__ static void matmul_q8_0_hc_expand_preq_n2_warp8_kernel(
         const uint64_t split_elems = (uint64_t)2u * n_hc + (uint64_t)n_hc * n_hc;
         float *block_row = block_out + tok * out_dim;
         float *out_row = out_hc + tok * hc_elems;
-        const float *res_row = residual_hc + tok * hc_elems;
+        const float *res_row = tok == 0 ? residual0_hc : residual1_hc;
         const float *split_row = split + tok * split_elems;
         const float *post = split_row + n_hc;
         const float *comb = split_row + 2u * n_hc;
@@ -7626,6 +7627,22 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand launch");
 }
 
+static int cuda_matmul_q8_0_hc_expand_n2_split_residual_tensor_labeled(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual0_hc,
+        const ds4_gpu_tensor *residual1_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        const char             *label);
+
 static int cuda_matmul_q8_0_hc_expand_n2_tensor_labeled(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *block_out,
@@ -7640,7 +7657,43 @@ static int cuda_matmul_q8_0_hc_expand_n2_tensor_labeled(
         uint32_t                n_embd,
         uint32_t                n_hc,
         const char             *label) {
-    if (!out_hc || !block_out || !x || !residual_hc || !split || !model_map ||
+    const uint64_t hc_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
+    if (!residual_hc || residual_hc->bytes < 2ull * hc_bytes) return 0;
+    ds4_gpu_tensor residual1 = *residual_hc;
+    residual1.ptr = (char *)residual_hc->ptr + hc_bytes;
+    residual1.bytes = residual_hc->bytes - hc_bytes;
+    return cuda_matmul_q8_0_hc_expand_n2_split_residual_tensor_labeled(out_hc,
+                                                                       block_out,
+                                                                       model_map,
+                                                                       model_size,
+                                                                       weight_offset,
+                                                                       in_dim,
+                                                                       out_dim,
+                                                                       x,
+                                                                       residual_hc,
+                                                                       &residual1,
+                                                                       split,
+                                                                       n_embd,
+                                                                       n_hc,
+                                                                       label);
+}
+
+static int cuda_matmul_q8_0_hc_expand_n2_split_residual_tensor_labeled(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual0_hc,
+        const ds4_gpu_tensor *residual1_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        const char             *label) {
+    if (!out_hc || !block_out || !x || !residual0_hc || !residual1_hc || !split || !model_map ||
         in_dim == 0 || out_dim == 0 || n_embd == 0 || n_hc == 0 ||
         out_dim != (uint64_t)n_embd) {
         return 0;
@@ -7648,14 +7701,15 @@ static int cuda_matmul_q8_0_hc_expand_n2_tensor_labeled(
     const uint64_t blocks = (in_dim + 31) / 32;
     if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34)) return 0;
     const uint64_t weight_bytes = out_dim * blocks * 34;
-    const uint64_t hc_bytes = 2ull * (uint64_t)n_hc * n_embd * sizeof(float);
+    const uint64_t hc_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
     const uint64_t split_bytes = 2ull * ((uint64_t)2u * n_hc + (uint64_t)n_hc * n_hc) * sizeof(float);
     if (weight_bytes > model_size - weight_offset ||
         x->bytes < 2ull * in_dim * sizeof(float) ||
         block_out->bytes < 2ull * out_dim * sizeof(float) ||
-        residual_hc->bytes < hc_bytes ||
+        residual0_hc->bytes < hc_bytes ||
+        residual1_hc->bytes < hc_bytes ||
         split->bytes < split_bytes ||
-        out_hc->bytes < hc_bytes) {
+        out_hc->bytes < 2ull * hc_bytes) {
         return 0;
     }
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, label ? label : "q8_0_hc_expand_n2");
@@ -7676,7 +7730,8 @@ static int cuda_matmul_q8_0_hc_expand_n2_tensor_labeled(
     matmul_q8_0_hc_expand_preq_n2_warp8_kernel<<<grid, 256>>>(
             (float *)out_hc->ptr,
             (float *)block_out->ptr,
-            (const float *)residual_hc->ptr,
+            (const float *)residual0_hc->ptr,
+            (const float *)residual1_hc->ptr,
             (const float *)split->ptr,
             reinterpret_cast<const unsigned char *>(wptr),
             xq,
@@ -12441,4 +12496,73 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_n2_tensor(
                                         weight_offset, in_dim, out_dim, x, 2) &&
            ds4_gpu_hc_expand_split_tensor(out_hc, block_out, residual_hc,
                                             split, n_embd, n_hc);
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_hc_expand_n2_split_residual_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual0_hc,
+        const ds4_gpu_tensor *residual1_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc) {
+    if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") == NULL) {
+        return cuda_matmul_q8_0_hc_expand_n2_split_residual_tensor_labeled(out_hc,
+                                                                           block_out,
+                                                                           model_map,
+                                                                           model_size,
+                                                                           weight_offset,
+                                                                           in_dim,
+                                                                           out_dim,
+                                                                           x,
+                                                                           residual0_hc,
+                                                                           residual1_hc,
+                                                                           split,
+                                                                           n_embd,
+                                                                           n_hc,
+                                                                           "q8_hc_expand_n2_split_residual");
+    }
+    if (!out_hc || !block_out || !x || !residual0_hc || !residual1_hc || !split) return 0;
+    const uint64_t hc_dim = (uint64_t)n_hc * n_embd;
+    const uint64_t split_dim = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+    int ok = 1;
+    for (uint32_t t = 0; ok && t < 2u; t++) {
+        ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(out_hc,
+                                                      (uint64_t)t * hc_dim * sizeof(float),
+                                                      hc_dim * sizeof(float));
+        ds4_gpu_tensor *block_row = ds4_gpu_tensor_view(block_out,
+                                                        (uint64_t)t * out_dim * sizeof(float),
+                                                        out_dim * sizeof(float));
+        ds4_gpu_tensor *x_row = ds4_gpu_tensor_view(x,
+                                                    (uint64_t)t * in_dim * sizeof(float),
+                                                    in_dim * sizeof(float));
+        ds4_gpu_tensor *split_row = ds4_gpu_tensor_view(split,
+                                                        (uint64_t)t * split_dim * sizeof(float),
+                                                        split_dim * sizeof(float));
+        const ds4_gpu_tensor *residual = t == 0 ? residual0_hc : residual1_hc;
+        ok = out_row && block_row && x_row && split_row &&
+             ds4_gpu_matmul_q8_0_hc_expand_tensor(out_row,
+                                                  block_row,
+                                                  model_map,
+                                                  model_size,
+                                                  weight_offset,
+                                                  in_dim,
+                                                  out_dim,
+                                                  x_row,
+                                                  residual,
+                                                  split_row,
+                                                  n_embd,
+                                                  n_hc) != 0;
+        ds4_gpu_tensor_free(split_row);
+        ds4_gpu_tensor_free(x_row);
+        ds4_gpu_tensor_free(block_row);
+        ds4_gpu_tensor_free(out_row);
+    }
+    return ok;
 }
