@@ -11269,39 +11269,32 @@ static int routed_moe_launch(
          * block above (lines 11427-11430).  Quant-pair dispatch: IQ2_XXS
          * gate/up + Q2_K down for the V4 Flash configuration, or Q4_K for
          * all three when a Q4_K MoE GGUF is loaded. */
+        /* Gate and up are two matmuls over the same activation X and the
+         * same routing map.  ds4_mmq_<type>_moe_pair fuses them so the
+         * Q8_1 quantize of X and the mm_ids_helper bookkeeping only run
+         * once per MoE block (saves 1 quantize + 1 helper launch per
+         * layer).  Step 3 of the optimization plan. */
         int rc = -1;
         if (q4k_path) {
-            rc = ds4_mmq_q4_K_moe(gate_w, (const float *)x->ptr, (const int32_t *)selected->ptr,
-                                  (float *)gate->ptr,
-                                  (int)expert_mid_dim, (int)expert_in_dim,
-                                  (int)n_tokens, (int)n_experts_total, (int)n_expert_used, /*stream=*/0);
+            rc = ds4_mmq_q4_K_moe_pair(gate_w, up_w, (const float *)x->ptr,
+                                       (const int32_t *)selected->ptr,
+                                       (float *)gate->ptr, (float *)up->ptr,
+                                       (int)expert_mid_dim, (int)expert_in_dim,
+                                       (int)n_tokens, (int)n_experts_total,
+                                       (int)n_expert_used, /*stream=*/0);
             if (rc != 0) {
-                fprintf(stderr, "ds4: ds4_mmq_q4_K_moe (gate) returned %d; falling back\n", rc);
-                goto mmq_moe_fallback;
-            }
-            rc = ds4_mmq_q4_K_moe(up_w, (const float *)x->ptr, (const int32_t *)selected->ptr,
-                                  (float *)up->ptr,
-                                  (int)expert_mid_dim, (int)expert_in_dim,
-                                  (int)n_tokens, (int)n_experts_total, (int)n_expert_used, /*stream=*/0);
-            if (rc != 0) {
-                fprintf(stderr, "ds4: ds4_mmq_q4_K_moe (up) returned %d; falling back\n", rc);
+                fprintf(stderr, "ds4: ds4_mmq_q4_K_moe_pair (gate+up) returned %d; falling back\n", rc);
                 goto mmq_moe_fallback;
             }
         } else {
-            rc = ds4_mmq_iq2_xxs_moe(gate_w, (const float *)x->ptr, (const int32_t *)selected->ptr,
-                                     (float *)gate->ptr,
-                                     (int)expert_mid_dim, (int)expert_in_dim,
-                                     (int)n_tokens, (int)n_experts_total, (int)n_expert_used, /*stream=*/0);
+            rc = ds4_mmq_iq2_xxs_moe_pair(gate_w, up_w, (const float *)x->ptr,
+                                          (const int32_t *)selected->ptr,
+                                          (float *)gate->ptr, (float *)up->ptr,
+                                          (int)expert_mid_dim, (int)expert_in_dim,
+                                          (int)n_tokens, (int)n_experts_total,
+                                          (int)n_expert_used, /*stream=*/0);
             if (rc != 0) {
-                fprintf(stderr, "ds4: ds4_mmq_iq2_xxs_moe (gate) returned %d; falling back\n", rc);
-                goto mmq_moe_fallback;
-            }
-            rc = ds4_mmq_iq2_xxs_moe(up_w, (const float *)x->ptr, (const int32_t *)selected->ptr,
-                                     (float *)up->ptr,
-                                     (int)expert_mid_dim, (int)expert_in_dim,
-                                     (int)n_tokens, (int)n_experts_total, (int)n_expert_used, /*stream=*/0);
-            if (rc != 0) {
-                fprintf(stderr, "ds4: ds4_mmq_iq2_xxs_moe (up) returned %d; falling back\n", rc);
+                fprintf(stderr, "ds4: ds4_mmq_iq2_xxs_moe_pair (gate+up) returned %d; falling back\n", rc);
                 goto mmq_moe_fallback;
             }
         }

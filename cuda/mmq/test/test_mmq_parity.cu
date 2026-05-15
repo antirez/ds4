@@ -703,6 +703,110 @@ bool run_iq2_xxs_moe(int M, int K, int nt, int ne, int nu, uint32_t seed) {
         "IQ2_XXS/MOE", QK_K_LOCAL, M, K, nt, ne, nu, seed, 0.20f, fn, ds4_mmq_iq2_xxs_moe);
 }
 
+// Pair-API verifier.  Compares ds4_mmq_<type>_moe_pair(W_a, W_b, X, ids)
+// against two back-to-back single-W ds4_mmq_<type>_moe(W_a, X, ids) and
+// ds4_mmq_<type>_moe(W_b, X, ids) calls.  Both paths share quantize +
+// helper internally; the pair API just fuses the two so the shared work
+// runs once.  Output should be bit-identical (same kernel, same Q8_1
+// buffer; only the second mul_mat_q_case launch is added).
+template <typename BlockT, typename DequantFn>
+bool run_moe_pair_generic(
+        const char * tag, int blck_size,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        uint32_t seed,
+        DequantFn gen_and_dequant,
+        int (*pair_entry)(const void *, const void *, const float *,
+                          const int32_t *, float *, float *,
+                          int, int, int, int, int, cudaStream_t),
+        int (*single_entry)(const void *, const float *, const int32_t *,
+                            float *, int, int, int, int, int, cudaStream_t)) {
+    fprintf(stderr, "=== %s/PAIR  M=%d K=%d ntok=%d nexp=%d nused=%d  seed=%u ===\n",
+            tag, M, K, n_tokens, n_experts, n_expert_used, seed);
+
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+
+    const int blocks_per_row    = K / blck_size;
+    const int blocks_per_expert = M * blocks_per_row;
+
+    // Generate two independent weight tensors of the same type+shape.
+    std::vector<BlockT> W_a((size_t)n_experts * blocks_per_expert);
+    std::vector<BlockT> W_b((size_t)n_experts * blocks_per_expert);
+    std::vector<float>  unused((size_t)n_experts * M * K);
+    gen_and_dequant(W_a.data(), unused.data(), n_experts, M, K, blocks_per_expert, rng);
+    gen_and_dequant(W_b.data(), unused.data(), n_experts, M, K, blocks_per_expert, rng);
+
+    std::vector<int32_t> ids((size_t)n_tokens * n_expert_used);
+    std::uniform_int_distribution<int> uexp(0, n_experts - 1);
+    for (int t = 0; t < n_tokens; t++) {
+        std::vector<int> picked;
+        while ((int)picked.size() < n_expert_used) {
+            int e = uexp(rng);
+            if (std::find(picked.begin(), picked.end(), e) == picked.end()) picked.push_back(e);
+        }
+        for (int s = 0; s < n_expert_used; s++) ids[t * n_expert_used + s] = picked[s];
+    }
+
+    std::vector<float> X((size_t)n_tokens * K);
+    for (auto & v : X) v = nd(rng);
+
+    const int64_t ne_get_rows = (int64_t)n_tokens * n_expert_used;
+    const size_t  out_count   = (size_t)M * ne_get_rows;
+
+    cudaStream_t stream; cudaStreamCreate(&stream);
+    void * dWa = nullptr; void * dWb = nullptr;
+    float * dX = nullptr; int32_t * dIds = nullptr;
+    float * dYa_single = nullptr; float * dYb_single = nullptr;
+    float * dYa_pair = nullptr;   float * dYb_pair = nullptr;
+    cudaMalloc(&dWa, W_a.size() * sizeof(BlockT));
+    cudaMalloc(&dWb, W_b.size() * sizeof(BlockT));
+    cudaMalloc(&dX,  X.size() * sizeof(float));
+    cudaMalloc(&dIds, ids.size() * sizeof(int32_t));
+    cudaMalloc(&dYa_single, out_count * sizeof(float));
+    cudaMalloc(&dYb_single, out_count * sizeof(float));
+    cudaMalloc(&dYa_pair,   out_count * sizeof(float));
+    cudaMalloc(&dYb_pair,   out_count * sizeof(float));
+    cudaMemcpyAsync(dWa, W_a.data(), W_a.size() * sizeof(BlockT), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(dWb, W_b.data(), W_b.size() * sizeof(BlockT), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(dX,  X.data(),   X.size()  * sizeof(float),   cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(dIds, ids.data(), ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream);
+    cudaMemsetAsync(dYa_single, 0, out_count * sizeof(float), stream);
+    cudaMemsetAsync(dYb_single, 0, out_count * sizeof(float), stream);
+    cudaMemsetAsync(dYa_pair,   0, out_count * sizeof(float), stream);
+    cudaMemsetAsync(dYb_pair,   0, out_count * sizeof(float), stream);
+
+    int rc_sa = single_entry(dWa, dX, dIds, dYa_single, M, K, n_tokens, n_experts, n_expert_used, stream);
+    int rc_sb = single_entry(dWb, dX, dIds, dYb_single, M, K, n_tokens, n_experts, n_expert_used, stream);
+    int rc_p  = pair_entry  (dWa, dWb, dX, dIds, dYa_pair, dYb_pair,
+                             M, K, n_tokens, n_experts, n_expert_used, stream);
+    if (rc_sa != 0 || rc_sb != 0 || rc_p != 0) {
+        fprintf(stderr, "%s pair entry: rc_sa=%d rc_sb=%d rc_p=%d\n", tag, rc_sa, rc_sb, rc_p);
+        cudaFree(dWa); cudaFree(dWb); cudaFree(dX); cudaFree(dIds);
+        cudaFree(dYa_single); cudaFree(dYb_single); cudaFree(dYa_pair); cudaFree(dYb_pair);
+        cudaStreamDestroy(stream);
+        return false;
+    }
+
+    std::vector<float> ya_single(out_count, 0.0f), yb_single(out_count, 0.0f);
+    std::vector<float> ya_pair  (out_count, 0.0f), yb_pair  (out_count, 0.0f);
+    cudaMemcpyAsync(ya_single.data(), dYa_single, out_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(yb_single.data(), dYb_single, out_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(ya_pair.data(),   dYa_pair,   out_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(yb_pair.data(),   dYb_pair,   out_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    cudaFree(dWa); cudaFree(dWb); cudaFree(dX); cudaFree(dIds);
+    cudaFree(dYa_single); cudaFree(dYb_single); cudaFree(dYa_pair); cudaFree(dYb_pair);
+    cudaStreamDestroy(stream);
+
+    // Both pair outputs should be bit-identical to their single counterparts -
+    // same kernel, same Q8_1 buffer.  Allow exactly zero abs/rel tolerance.
+    const bool ok_a = check_close(ya_pair, ya_single, 0.0f, 0.0f);
+    const bool ok_b = check_close(yb_pair, yb_single, 0.0f, 0.0f);
+    const bool ok   = ok_a && ok_b;
+    fprintf(stderr, "%s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 bool run_q4_K_moe(int M, int K, int nt, int ne, int nu, uint32_t seed) {
     auto fn = [](block_q4_K * blk, float * out,
                  int n_experts, int M, int K, int blocks_per_expert,
@@ -777,6 +881,49 @@ int main(int argc, char ** argv) {
     all_ok &= run_q4_K_moe   (/*M=*/64,   /*K=*/256,  /*nt=*/8,  /*nexp=*/4,   /*nused=*/2, 0xC4FE05);
     all_ok &= run_q4_K_moe   (/*M=*/128,  /*K=*/512,  /*nt=*/16, /*nexp=*/8,   /*nused=*/2, 0xC4FE06);
     all_ok &= run_q4_K_moe   (/*M=*/256,  /*K=*/512,  /*nt=*/8,  /*nexp=*/16,  /*nused=*/6, 0xC4FE07);
+
+    // Step 3 - paired MoE (one quantize, two matmuls).  Each call asserts
+    // bit-identity vs two back-to-back single-W moe calls over the same
+    // ids + activation.  Lambdas capture the same random-block generators
+    // used by run_*_moe above.
+    auto gen_iq2 = [](block_iq2_xxs * blk, float * out,
+                      int n_experts, int M, int K, int blocks_per_expert,
+                      std::mt19937 & rng) {
+        const int blocks_per_row = K / QK_K_LOCAL;
+        for (int e = 0; e < n_experts; e++) {
+            block_iq2_xxs * eblk = blk + (size_t)e * blocks_per_expert;
+            for (int row = 0; row < M; row++) {
+                for (int b = 0; b < blocks_per_row; b++) {
+                    generate_random_block_iq2_xxs(&eblk[row * blocks_per_row + b], rng);
+                }
+                dequantize_row_iq2_xxs_cpu(&eblk[row * blocks_per_row],
+                                           out + ((size_t)e * M + row) * K, K);
+            }
+        }
+    };
+    auto gen_q4k = [](block_q4_K * blk, float * out,
+                      int n_experts, int M, int K, int blocks_per_expert,
+                      std::mt19937 & rng) {
+        const int blocks_per_row = K / QK_K_LOCAL;
+        for (int e = 0; e < n_experts; e++) {
+            block_q4_K * eblk = blk + (size_t)e * blocks_per_expert;
+            for (int row = 0; row < M; row++) {
+                for (int b = 0; b < blocks_per_row; b++) {
+                    generate_random_block_q4_K(&eblk[row * blocks_per_row + b], rng);
+                }
+                dequantize_row_q4_K_cpu(&eblk[row * blocks_per_row],
+                                        out + ((size_t)e * M + row) * K, K);
+            }
+        }
+    };
+    all_ok &= run_moe_pair_generic<block_iq2_xxs>(
+        "IQ2_XXS", QK_K_LOCAL, /*M=*/256, /*K=*/512, /*nt=*/8,
+        /*ne=*/16, /*nu=*/6, 0xC0FE10, gen_iq2,
+        ds4_mmq_iq2_xxs_moe_pair, ds4_mmq_iq2_xxs_moe);
+    all_ok &= run_moe_pair_generic<block_q4_K>(
+        "Q4_K", QK_K_LOCAL, /*M=*/256, /*K=*/512, /*nt=*/8,
+        /*ne=*/16, /*nu=*/6, 0xC4FE10, gen_q4k,
+        ds4_mmq_q4_K_moe_pair, ds4_mmq_q4_K_moe);
 
     fprintf(stderr, "===================\n");
     fprintf(stderr, "%s\n", all_ok ? "ALL PASS" : "SOME FAILED");

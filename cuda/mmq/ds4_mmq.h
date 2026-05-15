@@ -173,6 +173,44 @@ int ds4_mmq_q4_K_moe(
     int             n_expert_used,
     cudaStream_t    stream);
 
+// Paired MoE entries. Compute gate AND up over the same activation in a
+// single call so the Q8_1 quantize of X (and the mm_ids_helper bookkeeping)
+// happens once instead of twice. Both weights must be the same quant type
+// and the same shape (M, K, n_experts); out_a / out_b have the same layout
+// as a single ds4_mmq_<type>_moe call. Saves one launch of
+// quantize_mmq_q8_1_cuda and one ggml_cuda_launch_mm_ids_helper per MoE
+// block. See ds4_mmq.cu / routed_moe_launch for the wiring.
+//
+// Returns 0 on success; on error neither output is guaranteed valid.
+
+int ds4_mmq_iq2_xxs_moe_pair(
+    const void    * W_a,
+    const void    * W_b,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_a,
+    float         * out_b,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+int ds4_mmq_q4_K_moe_pair(
+    const void    * W_a,
+    const void    * W_b,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_a,
+    float         * out_b,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
