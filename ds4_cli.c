@@ -93,12 +93,12 @@ static void usage(FILE *fp) {
         "      Context size allocated for the session. Default: 32768\n"
         "  --metal\n"
         "      Use the Metal graph backend. This is the normal fast path on macOS.\n"
-        "  --cuda\n"
-        "      Use the CUDA graph backend. This is the normal fast path on CUDA builds.\n"
+        "  " DS4_GPU_BACKEND_FLAG "\n"
+        "      Use the " DS4_GPU_BACKEND_DISPLAY " graph backend. This is the normal fast path on " DS4_GPU_BACKEND_DISPLAY " builds.\n"
         "  --cpu\n"
         "      Use the CPU reference/debug backend. Not recommended for normal inference.\n"
         "  --backend NAME\n"
-        "      Select backend explicitly: metal, cuda, or cpu.\n"
+        "      Select backend explicitly: " DS4_GPU_BACKEND_LIST ".\n"
         "  -t, --threads N\n"
         "      CPU helper threads for host-side or reference work.\n"
         "  --quality\n"
@@ -223,10 +223,13 @@ static float parse_float_range(const char *s, const char *opt, float min, float 
 
 static ds4_backend parse_backend(const char *s) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
+    if (!strcmp(s, DS4_GPU_BACKEND_CLI_NAME)) return DS4_BACKEND_CUDA;
+#ifdef DS4_ROCM_BUILD
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
+#endif
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     fprintf(stderr, "ds4: invalid backend: %s\n", s);
-    fprintf(stderr, "ds4: valid backends are: metal, cuda, cpu\n");
+    fprintf(stderr, "ds4: valid backends are: %s\n", DS4_GPU_BACKEND_LIST);
     exit(2);
 }
 
@@ -1260,7 +1263,7 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
-        } else if (!strcmp(arg, "--cuda")) {
+        } else if (!strcmp(arg, DS4_GPU_BACKEND_FLAG) || !strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;

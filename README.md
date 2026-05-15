@@ -136,6 +136,7 @@ Then build:
 make                  # macOS Metal
 make cuda-spark       # Linux CUDA, DGX Spark / GB10
 make cuda-generic     # Linux CUDA, other local CUDA GPUs
+make rocm ROCM_ARCH=gfx1151
 make cpu              # CPU-only diagnostics build
 ```
 
@@ -646,11 +647,13 @@ the kv cache files include the verbatim prompt cached.
 
 ## Backends
 
-The default graph backend is Metal on macOS and CUDA in CUDA builds:
+The default graph backend is Metal on macOS, CUDA in CUDA builds, and ROCm in
+ROCm builds:
 
 ```sh
 ./ds4 -p "Hello" --metal
 ./ds4 -p "Hello" --cuda
+./ds4 -p "Hello" --rocm
 ```
 
 On Linux, plain `make` prints the available build targets instead of selecting a
@@ -662,7 +665,12 @@ when cross-building or when you need a known target:
 ```sh
 make cuda CUDA_ARCH=sm_120
 make cuda CUDA_ARCH=native
+make rocm ROCM_ARCH=gfx1151
 ```
+
+In ROCm builds, `--rocm` and `--backend rocm` are the canonical runtime names.
+`--cuda` and `--backend cuda` remain accepted as compatibility aliases because
+the shared GPU implementation still uses the CUDA backend enum internally.
 
 There is also a CPU reference/debug path:
 
@@ -675,8 +683,8 @@ make cpu
 
 Do not treat the CPU path as the production target. The CLI and `ds4-server`
 support the CPU backend for reference/debug use and share the same KV session
-and snapshot format as Metal and CUDA, but normal inference should use Metal or
-CUDA.
+and snapshot format as Metal, CUDA, and ROCm, but normal inference should use
+Metal, CUDA, or ROCm.
 
 ## Steering
 

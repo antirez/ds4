@@ -63,8 +63,8 @@ static void usage(FILE *fp) {
         "\n"
         "Model and backend:\n"
         "  -m, --model FILE       GGUF model path. Default: ds4flash.gguf\n"
-        "  --metal | --cuda | --cpu | --backend NAME\n"
-        "      Select backend explicitly. Defaults to Metal on macOS, CUDA elsewhere.\n"
+        "  --metal | " DS4_GPU_BACKEND_FLAG " | --cpu | --backend NAME\n"
+        "      Select backend explicitly. Defaults to Metal on macOS, " DS4_GPU_BACKEND_DISPLAY " in " DS4_GPU_BACKEND_DISPLAY " builds, CUDA elsewhere.\n"
         "  -t, --threads N        CPU helper threads.\n"
         "  --quality              Prefer exact kernels where applicable.\n"
         "  --warm-weights         Touch mapped tensor pages before benchmarking.\n"
@@ -112,10 +112,13 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
 
 static ds4_backend parse_backend(const char *s, const char *opt) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
+    if (!strcmp(s, DS4_GPU_BACKEND_CLI_NAME)) return DS4_BACKEND_CUDA;
+#ifdef DS4_ROCM_BUILD
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
+#endif
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     fprintf(stderr, "ds4-bench: invalid value for %s: %s\n", opt, s);
-    fprintf(stderr, "ds4-bench: valid backends are: metal, cuda, cpu\n");
+    fprintf(stderr, "ds4-bench: valid backends are: %s\n", DS4_GPU_BACKEND_LIST);
     exit(2);
 }
 
@@ -213,7 +216,7 @@ static bench_config parse_options(int argc, char **argv) {
             c.backend = parse_backend(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--metal")) {
             c.backend = DS4_BACKEND_METAL;
-        } else if (!strcmp(arg, "--cuda")) {
+        } else if (!strcmp(arg, DS4_GPU_BACKEND_FLAG) || !strcmp(arg, "--cuda")) {
             c.backend = DS4_BACKEND_CUDA;
         } else if (!strcmp(arg, "--cpu")) {
             c.backend = DS4_BACKEND_CPU;

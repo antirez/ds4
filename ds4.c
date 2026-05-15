@@ -1453,7 +1453,7 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
         const double t1 = now_sec();
         if (ds4_log_is_tty(stderr)) fputc('\n', stderr);
         fprintf(stderr,
-                "ds4: CUDA startup model cache prepared %.2f GiB of tensor spans in %.3fs\n",
+                "ds4: " DS4_GPU_BACKEND_DISPLAY " startup model cache prepared %.2f GiB of tensor spans in %.3fs\n",
                 (double)cached / 1073741824.0,
                 t1 - t0);
     }
@@ -16995,7 +16995,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 #ifndef DS4_NO_GPU
     if (e->backend == DS4_BACKEND_CUDA) {
 #ifdef __APPLE__
-        fprintf(stderr, "ds4: CUDA backend requested but this build is linked with Metal, not CUDA\n");
+        fprintf(stderr, "ds4: %s backend requested but this build is linked with Metal, not %s\n",
+                DS4_GPU_BACKEND_DISPLAY, DS4_GPU_BACKEND_DISPLAY);
         ds4_engine_close(e);
         *out = NULL;
         return 1;
@@ -17003,7 +17004,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
     if (e->backend == DS4_BACKEND_METAL) {
 #ifndef __APPLE__
-        fprintf(stderr, "ds4: Metal backend requested but this build is linked with CUDA, not Metal\n");
+        fprintf(stderr, "ds4: Metal backend requested but this build is linked with %s, not Metal\n",
+                DS4_GPU_BACKEND_DISPLAY);
         ds4_engine_close(e);
         *out = NULL;
         return 1;
