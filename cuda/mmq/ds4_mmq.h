@@ -211,6 +211,133 @@ int ds4_mmq_q4_K_moe_pair(
     int             n_expert_used,
     cudaStream_t    stream);
 
+// MoE vector matmul entries (Step 6). Same signature and semantics as the
+// ds4_mmq_<type>_moe entries above, but route through llama.cpp's mmvq
+// kernels instead of mmq. mmvq is structurally optimised for small batch
+// counts (single-token decode, short prefill), where mmq's tile-based
+// approach wastes work on empty columns.
+//
+// Constraints:
+//   - n_tokens * something must fit under mmvq's per-arch batch cap
+//     (MMVQ_MAX_BATCH_SIZE = 8 on Blackwell). Specifically, ncols_dst as
+//     computed by the wrapper must be <= 8. The wrapper rejects with -1
+//     if the request is too large.
+//   - K must be a multiple of 256 (same as the mmq path).
+//
+// Unlike the mmq path, mmvq consumes a CANONICAL block_q8_1 buffer (not
+// the interleaved block_q8_1_mmq the mmq path uses). The wrapper builds
+// the canonical buffer internally; callers cannot reuse a Q8_1 buffer
+// previously built for the mmq path.
+//
+// Returns 0 on success, non-zero on validation or launch failure.
+
+int ds4_mmq_q8_0_moe_vec(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+int ds4_mmq_q2_K_moe_vec(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+int ds4_mmq_iq2_xxs_moe_vec(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+int ds4_mmq_q4_K_moe_vec(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+// Pair-fused MoE vector matmul entries (Step 6). Computes
+//
+//   out[col, row] = (W_a[ids, row, :] @ X[token, :])
+//                 * silu(W_b[ids, row, :] @ X[token, :])
+//
+// in a SINGLE mmvq launch via mmvq's built-in fusion (fusion.gate = W_b,
+// fusion.glu_op = GGML_GLU_OP_SWIGLU). The kernel applies silu to the
+// fusion.gate matmul and multiplies into the main matmul: pass the
+// SwiGLU "up" weights as W_a and the SwiGLU "gate" weights as W_b to
+// match ds4's expected silu(gate)*up semantics. The DeepSeek V4 clamp
+// and router-weight multiplication are NOT applied by the kernel - the
+// caller is expected to apply them as a small post-process (or to skip
+// clamp if clamp==0).
+//
+// Constraints:
+//   - n_tokens = 1 ONLY. mmvq supports fusion only at ncols_dst = 1.
+//   - K must be a multiple of 256.
+//
+// Returns 0 on success, non-zero on validation or launch failure.
+
+int ds4_mmq_iq2_xxs_moe_pair_vec(
+    const void    * W_a,
+    const void    * W_b,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_silu,
+    int             M,
+    int             K,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+int ds4_mmq_q4_K_moe_pair_vec(
+    const void    * W_a,
+    const void    * W_b,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_silu,
+    int             M,
+    int             K,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+// Dense vector matmul entry (Step 6). Same shape semantics as
+// ds4_mmq_q8_0_dense but routed through mmvq for batch counts that
+// favour the vec path (n_tokens <= 8 on Blackwell).
+//
+// Returns 0 on success, non-zero on validation or launch failure.
+
+int ds4_mmq_q8_0_dense_vec(
+    const void  * W_q8_0,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

@@ -664,6 +664,428 @@ extern "C" int ds4_mmq_q4_K_moe_pair(
         M, K, n_tokens, n_experts, n_expert_used, stream);
 }
 
+// ----------------------------------------------------------------------------
+// mmvq-backed entry points (Step 6 of the optimization plan).
+//
+// mmvq is upstream's matrix-vector matmul family, optimised for the
+// n_tokens <= MMVQ_MAX_BATCH_SIZE=8 regime. Unlike mmq it consumes the
+// CANONICAL block_q8_1 layout (via quantize_row_q8_1_cuda), not the
+// interleaved block_q8_1_mmq that quantize_mmq_q8_1_cuda produces.
+//
+// The single-W _moe_vec entries cover:
+//   - the down matmul at decode (treating [n_tokens=1, n_expert_used=6]
+//     as [n_tokens=6, n_expert_used=1])
+//   - dense attention projections at decode (n_tokens=1, no MoE)
+//   - any small-batch path where mmvq's per-token grid wins over mmq's
+//     tile-based approach
+//
+// The pair-fused _moe_pair_vec entries cover the gate+up matmuls at
+// decode using mmvq's built-in fusion. fusion.gate is the up_w pointer
+// and fusion.glu_op is GGML_GLU_OP_SWIGLU - the kernel computes
+// silu(gate@x) * (up@x) in a single launch. mmvq's fusion is supported
+// only at ncols_dst=1, so n_tokens=1 is the only valid case.
+// ----------------------------------------------------------------------------
+
+#include "mmvq.cuh"
+
+namespace {
+
+template <ggml_type type>
+int ds4_mmq_moe_vec_impl(
+        const char    * tag,
+        const void    * W,
+        const float   * X_f32,
+        const int32_t * ids,
+        float         * out_f32,
+        int             M,
+        int             K,
+        int             n_tokens,
+        int             n_experts,
+        int             n_expert_used,
+        cudaStream_t    stream) {
+
+    if (!W || !X_f32 || !ids || !out_f32) {
+        fprintf(stderr, "%s: null pointer\n", tag);
+        return -1;
+    }
+    if (M <= 0 || K <= 0 || n_tokens <= 0 || n_experts <= 0 || n_expert_used <= 0) {
+        fprintf(stderr, "%s: bad shape M=%d K=%d ntok=%d nexp=%d nused=%d\n",
+                tag, M, K, n_tokens, n_experts, n_expert_used);
+        return -1;
+    }
+    if (K % 256 != 0) {
+        fprintf(stderr, "%s: K=%d must be a multiple of 256\n", tag, K);
+        return -1;
+    }
+    if (n_expert_used > n_experts) {
+        fprintf(stderr, "%s: n_expert_used=%d > n_experts=%d\n", tag, n_expert_used, n_experts);
+        return -1;
+    }
+    // mmvq's per-arch batch cap. ncols_dst as computed below is
+    // max(n_tokens, n_expert_used) depending on which dim we route into.
+    // We follow upstream's convention: ne_y = n_tokens, ne_dst = n_expert_used.
+    // So ncols_dst = n_tokens and nchannels_dst = n_expert_used.
+    if (n_tokens > MMVQ_MAX_BATCH_SIZE) {
+        fprintf(stderr, "%s: n_tokens=%d exceeds MMVQ_MAX_BATCH_SIZE=%d\n",
+                tag, n_tokens, MMVQ_MAX_BATCH_SIZE);
+        return -1;
+    }
+
+    const int dev = ggml_cuda_get_device();
+    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+    if (!ctx) {
+        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
+        return -1;
+    }
+
+    // 1. Quantize X into CANONICAL Q8_1 (NOT the MMQ-interleaved variant).
+    //    Layout: [ne13=1, ne12=n_tokens, ne11=1, ne10_padded blocks].
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    const size_t  nbytes_q8_1 = (size_t)n_tokens * ne10_padded *
+                                sizeof(block_q8_1) / QK8_1;
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_q8_1);
+
+    // s11 = stride between rows of an src1 channel in source-float units.
+    //       Logical src1 [K, ne11=1, ne12=n_tokens, ne13=1] - K innermost.
+    // s12 = stride between channels = K * ne11 = K.
+    // s13 = stride between samples = K * ne11 * ne12 = K * n_tokens.
+    quantize_row_q8_1_cuda(
+        X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
+        type, /*ne00=*/K,
+        /*s11=*/(int64_t)K, /*s12=*/(int64_t)K, /*s13=*/(int64_t)K * n_tokens,
+        /*ne0=*/ne10_padded, /*ne1=*/1, /*ne2=*/n_tokens, /*ne3=*/1,
+        stream);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -2;
+    }
+
+    // 2. mmvq stride setup. Mirror upstream's ggml_cuda_mul_mat_vec_q
+    //    dispatch (mmvq.cu:1101-1136).
+    //
+    //    For MoE (ids != nullptr): per the dispatch math at line 1121-1130,
+    //      ncols_dst          = ne2  = n_tokens
+    //      nchannels_y        = ne11 = 1
+    //      nchannels_dst      = ne1  = n_expert_used
+    //      stride_col_y       = s12  = ne11 * (ne10_padded / QK8_1)
+    //      stride_col_dst     = s2   = M (column stride in dst)
+    //      stride_channel_y   = s11  = ne10_padded / QK8_1
+    //      stride_channel_dst = s1   = M (channel stride in dst)
+    //      ids_stride         = stride between rows of ids[] tensor
+    const int64_t blck      = ggml_blck_size(type);
+    const int64_t s01_row   = (int64_t)K / blck;            // weight row stride in blocks
+    const int64_t s02_chan  = (int64_t)M * s01_row;         // expert-stack stride
+    const int64_t s11_y     = ne10_padded / QK8_1;          // src1 channel stride in blocks
+    const int64_t s12_y     = (int64_t)1 * s11_y;           // ne11 * s11
+    const int64_t s1_dst    = (int64_t)M;                   // dst col stride
+
+    // ids_stride: stride between rows of the ids tensor in int32 elements.
+    // Caller passes ids[t * n_expert_used + s], so stride between tokens
+    // is n_expert_used.
+    const int ids_stride = n_expert_used;
+
+    ggml_cuda_mm_fusion_args_device fusion = {};
+
+    mul_mat_vec_q_switch_type(
+        /*vx=*/W, /*type_x=*/type,
+        /*vy=*/(const void *)src1_q8_1.get(),
+        /*ids=*/ids, /*fusion=*/fusion,
+        /*dst=*/out_f32,
+        /*ncols_x=*/K, /*nrows_x=*/M, /*ncols_dst=*/n_tokens,
+        /*stride_row_x=*/(int)s01_row,
+        /*stride_col_y=*/(int)s12_y,
+        /*stride_col_dst=*/(int)s1_dst,
+        /*nchannels_x=*/n_experts,
+        /*nchannels_y=*/1,
+        /*nchannels_dst=*/n_expert_used,
+        /*stride_channel_x=*/(int)s02_chan,
+        /*stride_channel_y=*/(int)s11_y,
+        /*stride_channel_dst=*/(int)s1_dst,
+        /*nsamples_x=*/1, /*nsamples_dst=*/1,
+        /*stride_sample_x=*/0, /*stride_sample_y=*/0, /*stride_sample_dst=*/0,
+        /*ids_stride=*/ids_stride, stream);
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: mul_mat_vec_q_switch_type launch failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -3;
+    }
+    return 0;
+}
+
+template <ggml_type type>
+int ds4_mmq_moe_pair_vec_impl(
+        const char    * tag,
+        const void    * W_a,
+        const void    * W_b,
+        const float   * X_f32,
+        const int32_t * ids,
+        float         * out_silu,
+        int             M,
+        int             K,
+        int             n_experts,
+        int             n_expert_used,
+        cudaStream_t    stream) {
+
+    if (!W_a || !W_b || !X_f32 || !ids || !out_silu) {
+        fprintf(stderr, "%s: null pointer\n", tag);
+        return -1;
+    }
+    if (M <= 0 || K <= 0 || n_experts <= 0 || n_expert_used <= 0) {
+        fprintf(stderr, "%s: bad shape M=%d K=%d nexp=%d nused=%d\n",
+                tag, M, K, n_experts, n_expert_used);
+        return -1;
+    }
+    if (K % 256 != 0) {
+        fprintf(stderr, "%s: K=%d must be a multiple of 256\n", tag, K);
+        return -1;
+    }
+    if (n_expert_used > n_experts) {
+        fprintf(stderr, "%s: n_expert_used=%d > n_experts=%d\n", tag, n_expert_used, n_experts);
+        return -1;
+    }
+
+    const int dev = ggml_cuda_get_device();
+    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+    if (!ctx) {
+        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
+        return -1;
+    }
+
+    const int n_tokens = 1;  // fusion only supported at ncols_dst=1.
+
+    // Quantize X (single token) into canonical Q8_1.
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    const size_t  nbytes_q8_1 = (size_t)n_tokens * ne10_padded *
+                                sizeof(block_q8_1) / QK8_1;
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_q8_1);
+
+    quantize_row_q8_1_cuda(
+        X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
+        type, /*ne00=*/K,
+        /*s11=*/(int64_t)K, /*s12=*/(int64_t)K, /*s13=*/(int64_t)K * n_tokens,
+        /*ne0=*/ne10_padded, /*ne1=*/1, /*ne2=*/n_tokens, /*ne3=*/1,
+        stream);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -2;
+    }
+
+    const int64_t blck      = ggml_blck_size(type);
+    const int64_t s01_row   = (int64_t)K / blck;
+    const int64_t s02_chan  = (int64_t)M * s01_row;
+    const int64_t s11_y     = ne10_padded / QK8_1;
+    const int64_t s12_y     = (int64_t)1 * s11_y;
+    const int64_t s1_dst    = (int64_t)M;
+    const int ids_stride    = n_expert_used;
+
+    // Configure fusion: gate=W_b (up weights), glu_op=SWIGLU.
+    // mmvq's kernel will compute, for each (channel_dst, row):
+    //   a = vec_dot(W_a, x); b = vec_dot(W_b, x);
+    //   dst = silu(a) * b
+    ggml_cuda_mm_fusion_args_device fusion = {};
+    fusion.gate   = W_b;
+    fusion.glu_op = GGML_GLU_OP_SWIGLU;
+
+    mul_mat_vec_q_switch_type(
+        /*vx=*/W_a, /*type_x=*/type,
+        /*vy=*/(const void *)src1_q8_1.get(),
+        /*ids=*/ids, /*fusion=*/fusion,
+        /*dst=*/out_silu,
+        /*ncols_x=*/K, /*nrows_x=*/M, /*ncols_dst=*/n_tokens,
+        /*stride_row_x=*/(int)s01_row,
+        /*stride_col_y=*/(int)s12_y,
+        /*stride_col_dst=*/(int)s1_dst,
+        /*nchannels_x=*/n_experts,
+        /*nchannels_y=*/1,
+        /*nchannels_dst=*/n_expert_used,
+        /*stride_channel_x=*/(int)s02_chan,
+        /*stride_channel_y=*/(int)s11_y,
+        /*stride_channel_dst=*/(int)s1_dst,
+        /*nsamples_x=*/1, /*nsamples_dst=*/1,
+        /*stride_sample_x=*/0, /*stride_sample_y=*/0, /*stride_sample_dst=*/0,
+        /*ids_stride=*/ids_stride, stream);
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: mul_mat_vec_q_switch_type (fused) launch failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -3;
+    }
+    return 0;
+}
+
+template <ggml_type type>
+int ds4_mmq_dense_vec_impl(
+        const char  * tag,
+        const void  * W,
+        const float * X_f32,
+        float       * out_f32,
+        int           M,
+        int           N,
+        int           K,
+        cudaStream_t  stream) {
+
+    if (!W || !X_f32 || !out_f32) {
+        fprintf(stderr, "%s: null pointer\n", tag);
+        return -1;
+    }
+    if (M <= 0 || N <= 0 || K <= 0) {
+        fprintf(stderr, "%s: bad shape M=%d N=%d K=%d\n", tag, M, N, K);
+        return -1;
+    }
+    if (K % 256 != 0) {
+        fprintf(stderr, "%s: K=%d must be a multiple of 256\n", tag, K);
+        return -1;
+    }
+    if (N > MMVQ_MAX_BATCH_SIZE) {
+        fprintf(stderr, "%s: N=%d exceeds MMVQ_MAX_BATCH_SIZE=%d\n",
+                tag, N, MMVQ_MAX_BATCH_SIZE);
+        return -1;
+    }
+
+    const int dev = ggml_cuda_get_device();
+    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+    if (!ctx) {
+        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
+        return -1;
+    }
+
+    // Dense: no MoE, ids=null. Layout [K, N, 1, 1] for src1.
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    const size_t  nbytes_q8_1 = (size_t)N * ne10_padded *
+                                sizeof(block_q8_1) / QK8_1;
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_q8_1);
+
+    // Dense src1 layout: K innermost, N next; ne11=N, ne12=1, ne13=1.
+    quantize_row_q8_1_cuda(
+        X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
+        type, /*ne00=*/K,
+        /*s11=*/(int64_t)K, /*s12=*/(int64_t)K * N, /*s13=*/(int64_t)K * N,
+        /*ne0=*/ne10_padded, /*ne1=*/N, /*ne2=*/1, /*ne3=*/1,
+        stream);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -2;
+    }
+
+    // Dense (no ids): per upstream dispatch (mmvq.cu:1121-1127),
+    //   ncols_dst          = ne1  = N
+    //   nchannels_y        = ne12 = 1
+    //   nchannels_dst      = ne2  = 1
+    //   stride_col_y       = s11  = ne10_padded / QK8_1
+    //   stride_channel_y   = s12  = N * (ne10_padded / QK8_1)
+    const int64_t blck      = ggml_blck_size(type);
+    const int64_t s01_row   = (int64_t)K / blck;
+    const int64_t s11_y     = ne10_padded / QK8_1;
+    const int64_t s12_y     = (int64_t)N * s11_y;
+    const int64_t s1_dst    = (int64_t)M;
+
+    ggml_cuda_mm_fusion_args_device fusion = {};
+
+    mul_mat_vec_q_switch_type(
+        /*vx=*/W, /*type_x=*/type,
+        /*vy=*/(const void *)src1_q8_1.get(),
+        /*ids=*/nullptr, /*fusion=*/fusion,
+        /*dst=*/out_f32,
+        /*ncols_x=*/K, /*nrows_x=*/M, /*ncols_dst=*/N,
+        /*stride_row_x=*/(int)s01_row,
+        /*stride_col_y=*/(int)s11_y,
+        /*stride_col_dst=*/(int)s1_dst,
+        /*nchannels_x=*/1,
+        /*nchannels_y=*/1,
+        /*nchannels_dst=*/1,
+        /*stride_channel_x=*/0,
+        /*stride_channel_y=*/(int)s12_y,
+        /*stride_channel_dst=*/0,
+        /*nsamples_x=*/1, /*nsamples_dst=*/1,
+        /*stride_sample_x=*/0, /*stride_sample_y=*/0, /*stride_sample_dst=*/0,
+        /*ids_stride=*/0, stream);
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: mul_mat_vec_q_switch_type (dense) launch failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -3;
+    }
+    return 0;
+}
+
+} // anonymous namespace
+
+extern "C" int ds4_mmq_q8_0_moe_vec(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    return ds4_mmq_moe_vec_impl<GGML_TYPE_Q8_0>(
+        "ds4_mmq_q8_0_moe_vec", W, X, ids, out, M, K,
+        n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_q2_K_moe_vec(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    return ds4_mmq_moe_vec_impl<GGML_TYPE_Q2_K>(
+        "ds4_mmq_q2_K_moe_vec", W, X, ids, out, M, K,
+        n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_iq2_xxs_moe_vec(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    return ds4_mmq_moe_vec_impl<GGML_TYPE_IQ2_XXS>(
+        "ds4_mmq_iq2_xxs_moe_vec", W, X, ids, out, M, K,
+        n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_q4_K_moe_vec(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    return ds4_mmq_moe_vec_impl<GGML_TYPE_Q4_K>(
+        "ds4_mmq_q4_K_moe_vec", W, X, ids, out, M, K,
+        n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_iq2_xxs_moe_pair_vec(
+        const void * W_a, const void * W_b,
+        const float * X, const int32_t * ids, float * out_silu,
+        int M, int K, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    return ds4_mmq_moe_pair_vec_impl<GGML_TYPE_IQ2_XXS>(
+        "ds4_mmq_iq2_xxs_moe_pair_vec", W_a, W_b, X, ids, out_silu,
+        M, K, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_q4_K_moe_pair_vec(
+        const void * W_a, const void * W_b,
+        const float * X, const int32_t * ids, float * out_silu,
+        int M, int K, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    return ds4_mmq_moe_pair_vec_impl<GGML_TYPE_Q4_K>(
+        "ds4_mmq_q4_K_moe_pair_vec", W_a, W_b, X, ids, out_silu,
+        M, K, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_q8_0_dense_vec(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_dense_vec_impl<GGML_TYPE_Q8_0>(
+        "ds4_mmq_q8_0_dense_vec", W, X, out, M, N, K, stream);
+}
+
 // Explicit instantiations. One per quant type the public API exposes.
 // Each instantiation drags in the load_tiles_<type> + vec_dot_<type>_*
 // device functions from mmq.cuh, so the .o objects below contain everything

@@ -829,6 +829,283 @@ bool run_q4_K_moe(int M, int K, int nt, int ne, int nu, uint32_t seed) {
         "Q4_K/MOE", QK_K_LOCAL, M, K, nt, ne, nu, seed, 0.20f, fn, ds4_mmq_q4_K_moe);
 }
 
+// --------------------------------------------------------------------------
+// Step 6 - mmvq vector matmul parity runners.
+//
+// The single-W _moe_vec entries match ds4_mmq_<type>_moe exactly in shape
+// and semantics (output is the dequantized W @ X matmul, no fusion); they
+// route through mmvq instead of mmq. Reuse run_moe_generic with the same
+// tolerance bounds.
+//
+// The pair-fused _moe_pair_vec entries produce silu(W_a @ X) * (W_b @ X)
+// in a single launch via mmvq's built-in fusion. The verifier runs two
+// back-to-back single-W _moe calls on the same activation and ids, applies
+// silu on the host, then compares the elementwise product against the
+// fused output. Tolerance is the sum-of-roundings bound.
+// --------------------------------------------------------------------------
+
+bool run_q8_0_moe_vec(int M, int K, int nt, int ne, int nu, uint32_t seed) {
+    auto fn = [](cpu_block_q8_0 * blk, float * out,
+                 int n_experts, int M, int K, int blocks_per_expert,
+                 std::mt19937 & rng) {
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        const int blocks_per_row = K / QK8_0;
+        for (int e = 0; e < n_experts; e++) {
+            cpu_block_q8_0 * eblk = blk + (size_t)e * blocks_per_expert;
+            std::vector<float> src((size_t)M * K);
+            for (auto & v : src) v = nd(rng);
+            for (int row = 0; row < M; row++) {
+                quantize_row_q8_0_cpu(&src[(size_t)row * K], &eblk[row * blocks_per_row], K);
+                const cpu_block_q8_0 * rowblk = &eblk[row * blocks_per_row];
+                float * orow = out + ((size_t)e * M + row) * K;
+                for (int b = 0; b < blocks_per_row; b++) {
+                    const float d = fp16_to_float(rowblk[b].d);
+                    for (int j = 0; j < QK8_0; j++) {
+                        orow[b * QK8_0 + j] = d * rowblk[b].qs[j];
+                    }
+                }
+            }
+        }
+    };
+    return run_moe_generic<cpu_block_q8_0>(
+        "Q8_0/MOE_VEC", QK8_0, M, K, nt, ne, nu, seed, 0.05f, fn, ds4_mmq_q8_0_moe_vec);
+}
+
+bool run_q2_K_moe_vec(int M, int K, int nt, int ne, int nu, uint32_t seed) {
+    auto fn = [](block_q2_K * blk, float * out,
+                 int n_experts, int M, int K, int blocks_per_expert,
+                 std::mt19937 & rng) {
+        const int blocks_per_row = K / QK_K_LOCAL;
+        for (int e = 0; e < n_experts; e++) {
+            block_q2_K * eblk = blk + (size_t)e * blocks_per_expert;
+            for (int row = 0; row < M; row++) {
+                for (int b = 0; b < blocks_per_row; b++) {
+                    generate_random_block_q2_K(&eblk[row * blocks_per_row + b], rng);
+                }
+                dequantize_row_q2_K_cpu(&eblk[row * blocks_per_row],
+                                        out + ((size_t)e * M + row) * K, K);
+            }
+        }
+    };
+    return run_moe_generic<block_q2_K>(
+        "Q2_K/MOE_VEC", QK_K_LOCAL, M, K, nt, ne, nu, seed, 0.05f, fn, ds4_mmq_q2_K_moe_vec);
+}
+
+bool run_iq2_xxs_moe_vec(int M, int K, int nt, int ne, int nu, uint32_t seed) {
+    auto fn = [](block_iq2_xxs * blk, float * out,
+                 int n_experts, int M, int K, int blocks_per_expert,
+                 std::mt19937 & rng) {
+        const int blocks_per_row = K / QK_K_LOCAL;
+        for (int e = 0; e < n_experts; e++) {
+            block_iq2_xxs * eblk = blk + (size_t)e * blocks_per_expert;
+            for (int row = 0; row < M; row++) {
+                for (int b = 0; b < blocks_per_row; b++) {
+                    generate_random_block_iq2_xxs(&eblk[row * blocks_per_row + b], rng);
+                }
+                dequantize_row_iq2_xxs_cpu(&eblk[row * blocks_per_row],
+                                           out + ((size_t)e * M + row) * K, K);
+            }
+        }
+    };
+    return run_moe_generic<block_iq2_xxs>(
+        "IQ2_XXS/MOE_VEC", QK_K_LOCAL, M, K, nt, ne, nu, seed, 0.20f, fn, ds4_mmq_iq2_xxs_moe_vec);
+}
+
+bool run_q4_K_moe_vec(int M, int K, int nt, int ne, int nu, uint32_t seed) {
+    auto fn = [](block_q4_K * blk, float * out,
+                 int n_experts, int M, int K, int blocks_per_expert,
+                 std::mt19937 & rng) {
+        const int blocks_per_row = K / QK_K_LOCAL;
+        for (int e = 0; e < n_experts; e++) {
+            block_q4_K * eblk = blk + (size_t)e * blocks_per_expert;
+            for (int row = 0; row < M; row++) {
+                for (int b = 0; b < blocks_per_row; b++) {
+                    generate_random_block_q4_K(&eblk[row * blocks_per_row + b], rng);
+                }
+                dequantize_row_q4_K_cpu(&eblk[row * blocks_per_row],
+                                        out + ((size_t)e * M + row) * K, K);
+            }
+        }
+    };
+    return run_moe_generic<block_q4_K>(
+        "Q4_K/MOE_VEC", QK_K_LOCAL, M, K, nt, ne, nu, seed, 0.20f, fn, ds4_mmq_q4_K_moe_vec);
+}
+
+// Pair-fused mmvq verifier. Runs two single-W _moe calls (reference) and
+// the fused pair_vec call (candidate). Compares
+//   silu(ref_a[t,s,row]) * ref_b[t,s,row]   vs   got[t,s,row]
+// elementwise. n_tokens fixed to 1 (fusion only supported at ncols_dst=1).
+template <typename BlockT, typename DequantFn>
+bool run_moe_pair_vec_generic(
+        const char * tag, int blck_size,
+        int M, int K, int n_experts, int n_expert_used,
+        uint32_t seed, float abs_scale, float rel_tol,
+        DequantFn gen_and_dequant,
+        int (*pair_vec_entry)(const void *, const void *, const float *,
+                              const int32_t *, float *,
+                              int, int, int, int, cudaStream_t),
+        int (*single_entry)(const void *, const float *, const int32_t *,
+                            float *, int, int, int, int, int, cudaStream_t)) {
+    const int n_tokens = 1;
+    fprintf(stderr, "=== %s/PAIR_VEC  M=%d K=%d nexp=%d nused=%d  seed=%u ===\n",
+            tag, M, K, n_experts, n_expert_used, seed);
+
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+
+    const int blocks_per_row    = K / blck_size;
+    const int blocks_per_expert = M * blocks_per_row;
+
+    std::vector<BlockT> W_a((size_t)n_experts * blocks_per_expert);
+    std::vector<BlockT> W_b((size_t)n_experts * blocks_per_expert);
+    std::vector<float>  unused((size_t)n_experts * M * K);
+    gen_and_dequant(W_a.data(), unused.data(), n_experts, M, K, blocks_per_expert, rng);
+    gen_and_dequant(W_b.data(), unused.data(), n_experts, M, K, blocks_per_expert, rng);
+
+    // Single-token routing: pick n_expert_used distinct experts.
+    std::vector<int32_t> ids((size_t)n_tokens * n_expert_used);
+    std::uniform_int_distribution<int> uexp(0, n_experts - 1);
+    for (int t = 0; t < n_tokens; t++) {
+        std::vector<int> picked;
+        while ((int)picked.size() < n_expert_used) {
+            int e = uexp(rng);
+            if (std::find(picked.begin(), picked.end(), e) == picked.end()) picked.push_back(e);
+        }
+        for (int s = 0; s < n_expert_used; s++) ids[t * n_expert_used + s] = picked[s];
+    }
+
+    std::vector<float> X((size_t)n_tokens * K);
+    for (auto & v : X) v = nd(rng);
+
+    const int64_t ne_get_rows = (int64_t)n_tokens * n_expert_used;
+    const size_t  out_count   = (size_t)M * ne_get_rows;
+
+    cudaStream_t stream; cudaStreamCreate(&stream);
+    void * dWa = nullptr; void * dWb = nullptr;
+    float * dX = nullptr; int32_t * dIds = nullptr;
+    float * dYa_ref = nullptr; float * dYb_ref = nullptr;
+    float * dYfused = nullptr;
+    cudaMalloc(&dWa, W_a.size() * sizeof(BlockT));
+    cudaMalloc(&dWb, W_b.size() * sizeof(BlockT));
+    cudaMalloc(&dX,  X.size() * sizeof(float));
+    cudaMalloc(&dIds, ids.size() * sizeof(int32_t));
+    cudaMalloc(&dYa_ref, out_count * sizeof(float));
+    cudaMalloc(&dYb_ref, out_count * sizeof(float));
+    cudaMalloc(&dYfused, out_count * sizeof(float));
+    cudaMemcpyAsync(dWa, W_a.data(), W_a.size() * sizeof(BlockT), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(dWb, W_b.data(), W_b.size() * sizeof(BlockT), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(dX,  X.data(),   X.size()  * sizeof(float),   cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(dIds, ids.data(), ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream);
+    cudaMemsetAsync(dYa_ref, 0, out_count * sizeof(float), stream);
+    cudaMemsetAsync(dYb_ref, 0, out_count * sizeof(float), stream);
+    cudaMemsetAsync(dYfused, 0, out_count * sizeof(float), stream);
+
+    // Reference: two single-W mmq calls.
+    int rc_sa = single_entry(dWa, dX, dIds, dYa_ref, M, K, n_tokens, n_experts, n_expert_used, stream);
+    int rc_sb = single_entry(dWb, dX, dIds, dYb_ref, M, K, n_tokens, n_experts, n_expert_used, stream);
+    // Candidate: fused pair-vec.
+    int rc_p  = pair_vec_entry(dWa, dWb, dX, dIds, dYfused,
+                               M, K, n_experts, n_expert_used, stream);
+    if (rc_sa != 0 || rc_sb != 0 || rc_p != 0) {
+        fprintf(stderr, "%s pair_vec entry: rc_sa=%d rc_sb=%d rc_p=%d\n", tag, rc_sa, rc_sb, rc_p);
+        cudaFree(dWa); cudaFree(dWb); cudaFree(dX); cudaFree(dIds);
+        cudaFree(dYa_ref); cudaFree(dYb_ref); cudaFree(dYfused);
+        cudaStreamDestroy(stream);
+        return false;
+    }
+
+    std::vector<float> ya_ref(out_count, 0.0f), yb_ref(out_count, 0.0f);
+    std::vector<float> yfused(out_count, 0.0f);
+    cudaMemcpyAsync(ya_ref.data(), dYa_ref, out_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(yb_ref.data(), dYb_ref, out_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(yfused.data(), dYfused, out_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    cudaFree(dWa); cudaFree(dWb); cudaFree(dX); cudaFree(dIds);
+    cudaFree(dYa_ref); cudaFree(dYb_ref); cudaFree(dYfused);
+    cudaStreamDestroy(stream);
+
+    // mmvq's fusion computes  out = main_matmul * silu(gate_matmul).
+    // With fusion.gate = W_b passed to pair_vec_entry, the kernel computes
+    //   out[i] = (W_a @ x)[i] * silu((W_b @ x)[i])
+    // i.e. W_a plays the role of "up" and W_b plays the role of "gate".
+    std::vector<float> expected(out_count, 0.0f);
+    for (size_t i = 0; i < out_count; i++) {
+        const float a = ya_ref[i];                   // W_a @ x
+        const float b = yb_ref[i];                   // W_b @ x
+        const float sb = b / (1.0f + std::exp(-b));  // silu(W_b @ x)
+        expected[i] = a * sb;
+    }
+
+    const float abs_tol = abs_scale * std::sqrt((float)K);
+    const bool ok = check_close(yfused, expected, abs_tol, rel_tol);
+    fprintf(stderr, "%s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+bool run_q8_0_dense_vec(int M, int N, int K, uint32_t seed) {
+    fprintf(stderr, "=== Q8_0/DENSE_VEC  M=%d N=%d K=%d  seed=%u ===\n", M, N, K, seed);
+
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+
+    const int blocks_per_row = K / QK8_0;
+    std::vector<cpu_block_q8_0> W_blk((size_t)M * blocks_per_row);
+    std::vector<float>          W_deq((size_t)M * K);
+    std::vector<float>          src((size_t)M * K);
+    for (auto & v : src) v = nd(rng);
+    for (int row = 0; row < M; row++) {
+        quantize_row_q8_0_cpu(&src[(size_t)row * K], &W_blk[(size_t)row * blocks_per_row], K);
+        for (int b = 0; b < blocks_per_row; b++) {
+            const float d = fp16_to_float(W_blk[(size_t)row * blocks_per_row + b].d);
+            for (int j = 0; j < QK8_0; j++) {
+                W_deq[(size_t)row * K + b * QK8_0 + j] =
+                    d * W_blk[(size_t)row * blocks_per_row + b].qs[j];
+            }
+        }
+    }
+
+    std::vector<float> X((size_t)N * K);
+    for (auto & v : X) v = nd(rng);
+
+    // Reference: naive GEMM with dequantized W. out[col*M + row] = W[row,:] . X[col,:]
+    std::vector<float> ref_out((size_t)M * N, 0.0f);
+    for (int col = 0; col < N; col++) {
+        for (int row = 0; row < M; row++) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++) {
+                acc += W_deq[(size_t)row * K + k] * X[(size_t)col * K + k];
+            }
+            ref_out[(size_t)col * M + row] = acc;
+        }
+    }
+
+    cudaStream_t stream; cudaStreamCreate(&stream);
+    void * dW = nullptr; float * dX = nullptr; float * dY = nullptr;
+    cudaMalloc(&dW, W_blk.size() * sizeof(cpu_block_q8_0));
+    cudaMalloc(&dX, X.size() * sizeof(float));
+    cudaMalloc(&dY, (size_t)M * N * sizeof(float));
+    cudaMemcpyAsync(dW, W_blk.data(), W_blk.size() * sizeof(cpu_block_q8_0), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(dX, X.data(),     X.size() * sizeof(float),              cudaMemcpyHostToDevice, stream);
+    cudaMemsetAsync(dY, 0, (size_t)M * N * sizeof(float), stream);
+
+    int rc = ds4_mmq_q8_0_dense_vec(dW, dX, dY, M, N, K, stream);
+    if (rc != 0) {
+        fprintf(stderr, "ds4_mmq_q8_0_dense_vec returned %d\n", rc);
+        cudaFree(dW); cudaFree(dX); cudaFree(dY); cudaStreamDestroy(stream);
+        return false;
+    }
+
+    std::vector<float> got_out((size_t)M * N, 0.0f);
+    cudaMemcpyAsync(got_out.data(), dY, got_out.size() * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    cudaFree(dW); cudaFree(dX); cudaFree(dY); cudaStreamDestroy(stream);
+
+    const float abs_tol = 0.05f * std::sqrt((float)K);
+    const bool ok = check_close(got_out, ref_out, abs_tol, 0.05f);
+    fprintf(stderr, "%s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -924,6 +1201,43 @@ int main(int argc, char ** argv) {
         "Q4_K", QK_K_LOCAL, /*M=*/256, /*K=*/512, /*nt=*/8,
         /*ne=*/16, /*nu=*/6, 0xC4FE10, gen_q4k,
         ds4_mmq_q4_K_moe_pair, ds4_mmq_q4_K_moe);
+
+    // Step 6 - mmvq vector matmul tests.
+    //
+    // Single-W _moe_vec tests. Two shape classes per type:
+    //   - Decode gate/up: n_tokens=1, n_expert_used=6
+    //   - Decode down  : n_tokens=6, n_expert_used=1 (reinterpretation
+    //                    used by routed_moe_launch's mmvq branch)
+    // The down reinterpretation hits mmvq's multi-token MoE kernel
+    // (mul_mat_vec_q_moe) which we want to exercise.
+    all_ok &= run_q8_0_moe_vec   (/*M=*/64,   /*K=*/256,  /*nt=*/1,  /*nexp=*/16,  /*nused=*/6, 0xC0FE20);
+    all_ok &= run_q8_0_moe_vec   (/*M=*/256,  /*K=*/256,  /*nt=*/6,  /*nexp=*/16,  /*nused=*/1, 0xC0FE21);
+    all_ok &= run_q2_K_moe_vec   (/*M=*/64,   /*K=*/256,  /*nt=*/1,  /*nexp=*/16,  /*nused=*/6, 0xC0FE22);
+    all_ok &= run_q2_K_moe_vec   (/*M=*/256,  /*K=*/512,  /*nt=*/6,  /*nexp=*/16,  /*nused=*/1, 0xC0FE23);
+    all_ok &= run_iq2_xxs_moe_vec(/*M=*/64,   /*K=*/256,  /*nt=*/1,  /*nexp=*/16,  /*nused=*/6, 0xC0FE24);
+    all_ok &= run_iq2_xxs_moe_vec(/*M=*/256,  /*K=*/512,  /*nt=*/6,  /*nexp=*/16,  /*nused=*/1, 0xC0FE25);
+    all_ok &= run_q4_K_moe_vec   (/*M=*/64,   /*K=*/256,  /*nt=*/1,  /*nexp=*/16,  /*nused=*/6, 0xC0FE26);
+    all_ok &= run_q4_K_moe_vec   (/*M=*/256,  /*K=*/512,  /*nt=*/6,  /*nexp=*/16,  /*nused=*/1, 0xC0FE27);
+
+    // Pair-fused mmvq tests. n_tokens=1 only (mmvq fusion is ncols_dst=1).
+    // rel_tol is loosened from 0.05 because silu near a sign change
+    // amplifies fp noise from the matmul accumulator: a small absolute
+    // difference in the gate matmul output can produce a large relative
+    // difference in silu(gate)*up when gate transitions sign.  Q4_K has
+    // higher dynamic range than IQ2_XXS so its envelope is wider.
+    all_ok &= run_moe_pair_vec_generic<block_iq2_xxs>(
+        "IQ2_XXS", QK_K_LOCAL, /*M=*/256, /*K=*/512,
+        /*ne=*/16, /*nu=*/6, 0xC0FE30, /*abs=*/0.30f, /*rel=*/0.10f, gen_iq2,
+        ds4_mmq_iq2_xxs_moe_pair_vec, ds4_mmq_iq2_xxs_moe);
+    all_ok &= run_moe_pair_vec_generic<block_q4_K>(
+        "Q4_K", QK_K_LOCAL, /*M=*/256, /*K=*/512,
+        /*ne=*/16, /*nu=*/6, 0xC4FE30, /*abs=*/0.30f, /*rel=*/0.40f, gen_q4k,
+        ds4_mmq_q4_K_moe_pair_vec, ds4_mmq_q4_K_moe);
+
+    // Dense Q8_0 mmvq (decode attention projection shape).
+    all_ok &= run_q8_0_dense_vec(/*M=*/64,   /*N=*/1, /*K=*/256,  0xC0FE40);
+    all_ok &= run_q8_0_dense_vec(/*M=*/256,  /*N=*/1, /*K=*/512,  0xC0FE41);
+    all_ok &= run_q8_0_dense_vec(/*M=*/1024, /*N=*/1, /*K=*/4096, 0xC0FE42);
 
     fprintf(stderr, "===================\n");
     fprintf(stderr, "%s\n", all_ok ? "ALL PASS" : "SOME FAILED");
