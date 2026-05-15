@@ -7906,8 +7906,8 @@ static void usage(FILE *fp) {
         "      Apply steering after attention outputs. Default: 0\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before serving. Slower startup, fewer first-use stalls.\n"
-        "  --metal | --cuda | --cpu | --backend NAME\n"
-        "      Select backend explicitly. Defaults to Metal on macOS and CUDA on CUDA builds.\n"
+        "  --metal | " DS4_GPU_BACKEND_FLAG " | --cpu | --backend NAME\n"
+        "      Select backend explicitly. Defaults to Metal on macOS, " DS4_GPU_BACKEND_DISPLAY " in " DS4_GPU_BACKEND_DISPLAY " builds, and CUDA otherwise.\n"
         "\n"
         "HTTP API:\n"
         "  --host HOST\n"
@@ -7967,10 +7967,13 @@ static void usage(FILE *fp) {
 
 static ds4_backend parse_backend_arg(const char *s, const char *arg) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
+    if (!strcmp(s, DS4_GPU_BACKEND_CLI_NAME)) return DS4_BACKEND_CUDA;
+#ifdef DS4_ROCM_BUILD
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
+#endif
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     server_log(DS4_LOG_DEFAULT, "ds4-server: invalid %s value: %s", arg, s);
-    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, cuda, cpu");
+    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: %s", DS4_GPU_BACKEND_LIST);
     exit(2);
 }
 
@@ -8060,7 +8063,7 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
-        } else if (!strcmp(arg, "--cuda")) {
+        } else if (!strcmp(arg, DS4_GPU_BACKEND_FLAG) || !strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
         } else if (!strcmp(arg, "--backend")) {
             c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg), arg);

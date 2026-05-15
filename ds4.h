@@ -20,6 +20,18 @@ typedef enum {
     DS4_BACKEND_CPU,
 } ds4_backend;
 
+#ifdef DS4_ROCM_BUILD
+#define DS4_GPU_BACKEND_CLI_NAME "rocm"
+#define DS4_GPU_BACKEND_FLAG "--rocm"
+#define DS4_GPU_BACKEND_DISPLAY "ROCm"
+#define DS4_GPU_BACKEND_LIST "metal, rocm, cuda, cpu"
+#else
+#define DS4_GPU_BACKEND_CLI_NAME "cuda"
+#define DS4_GPU_BACKEND_FLAG "--cuda"
+#define DS4_GPU_BACKEND_DISPLAY "CUDA"
+#define DS4_GPU_BACKEND_LIST "metal, cuda, cpu"
+#endif
+
 typedef enum {
     DS4_THINK_NONE,
     DS4_THINK_HIGH,
