@@ -95,6 +95,13 @@ GEN_STEP_PROFILE_RE = re.compile(
     r"accepted=(?P<accepted>\d+) eval_ms=(?P<eval_ms>[-+0-9.eE]+) "
     r"generated_before=(?P<generated_before>\d+)"
 )
+ACCEPT_TRACE_RE = re.compile(
+    r"ds4: mtp accept trace path=(?P<path>\S+) start=(?P<start>-?\d+) "
+    r"first=(?P<first>-?\d+) drafted=(?P<drafted>\d+) "
+    r"accepted=(?P<accepted>\d+) checkpoint=(?P<checkpoint>-?\d+) "
+    r"next_top=(?P<next_top>-?\d+) mtp_valid=(?P<mtp_valid>[01]) "
+    r"mtp_draft=(?P<mtp_draft>-?\d+) drafts=(?P<drafts>[^\n]*)"
+)
 WEIGHT_PLAN_RE = re.compile(
     r"ds4_weight_server: (?P<model>\w+) plan model=(?P<model_gib>[-+0-9.eE]+) GiB "
     r"raw_tensor_ranges=(?P<raw_gib>[-+0-9.eE]+) GiB ranges=(?P<ranges>\d+)"
@@ -452,6 +459,236 @@ def sha256_file(path: Path) -> tuple[str, int]:
     return h.hexdigest(), total
 
 
+def parse_accept_traces(log_text: str) -> list[dict[str, Any]]:
+    traces: list[dict[str, Any]] = []
+    for i, m in enumerate(ACCEPT_TRACE_RE.finditer(log_text)):
+        drafted = int(m.group("drafted"))
+        accepted_total = int(m.group("accepted"))
+        accepted_drafts = min(max(accepted_total - 1, 0), drafted)
+        drafts_raw = m.group("drafts").strip()
+        drafts = [] if drafts_raw == "-" else [
+            int(x) for x in drafts_raw.split(",") if x
+        ]
+        traces.append({
+            "cycle_index": i,
+            "path": m.group("path"),
+            "start": int(m.group("start")),
+            "first": int(m.group("first")),
+            "drafted": drafted,
+            "accepted_total": accepted_total,
+            "accepted_drafts": accepted_drafts,
+            "checkpoint": int(m.group("checkpoint")),
+            "next_top": int(m.group("next_top")),
+            "mtp_valid": int(m.group("mtp_valid")),
+            "mtp_draft": int(m.group("mtp_draft")),
+            "drafts": drafts,
+            "full_accept": drafted > 0 and accepted_drafts == drafted,
+            "partial_accept": drafted > 0 and 0 < accepted_drafts < drafted,
+            "reject": drafted > 0 and accepted_drafts == 0,
+        })
+    return traces
+
+
+def acceptance_empty_summary(alignment: str) -> dict[str, Any]:
+    return {
+        "alignment": alignment,
+        "steps": 0,
+        "cycles": 0,
+        "mtp_cycles": 0,
+        "non_mtp_cycles": 0,
+        "draft_cycles": 0,
+        "accepted_tokens_total": 0,
+        "eval_ms": 0.0,
+        "tps": 0.0,
+        "ms_per_accepted_token": 0.0,
+        "draft_tokens_proposed": 0,
+        "draft_tokens_accepted": 0,
+        "draft_accept_rate": 0.0,
+        "full_accept_cycles": 0,
+        "partial_accept_cycles": 0,
+        "reject_cycles": 0,
+        "cycle_full_accept_rate": 0.0,
+        "cycle_partial_accept_rate": 0.0,
+        "cycle_reject_rate": 0.0,
+        "mean_accepted_tokens_per_cycle": 0.0,
+        "mean_draft_tokens_proposed_per_mtp_cycle": 0.0,
+        "mean_draft_tokens_accepted_per_mtp_cycle": 0.0,
+        "by_path": {},
+        "by_accepted_drafts": {},
+    }
+
+
+def acceptance_bucket(acc: dict[str, Any]) -> dict[str, Any]:
+    accepted = int(acc["accepted_tokens_total"])
+    eval_ms = float(acc["eval_ms"])
+    proposed = int(acc["draft_tokens_proposed"])
+    accepted_drafts = int(acc["draft_tokens_accepted"])
+    cycles = int(acc["cycles"])
+    mtp_cycles = int(acc["mtp_cycles"])
+    draft_cycles = int(acc["draft_cycles"])
+    return {
+        "cycles": cycles,
+        "mtp_cycles": mtp_cycles,
+        "draft_cycles": draft_cycles,
+        "accepted_tokens_total": accepted,
+        "eval_ms": eval_ms,
+        "tps": (accepted * 1000.0 / eval_ms) if eval_ms > 0.0 else 0.0,
+        "ms_per_accepted_token": (eval_ms / accepted) if accepted > 0 else 0.0,
+        "draft_tokens_proposed": proposed,
+        "draft_tokens_accepted": accepted_drafts,
+        "draft_accept_rate": (accepted_drafts / proposed) if proposed > 0 else 0.0,
+        "full_accept_cycles": int(acc["full_accept_cycles"]),
+        "partial_accept_cycles": int(acc["partial_accept_cycles"]),
+        "reject_cycles": int(acc["reject_cycles"]),
+        "cycle_full_accept_rate": (int(acc["full_accept_cycles"]) / draft_cycles) if draft_cycles > 0 else 0.0,
+        "cycle_partial_accept_rate": (int(acc["partial_accept_cycles"]) / draft_cycles) if draft_cycles > 0 else 0.0,
+        "cycle_reject_rate": (int(acc["reject_cycles"]) / draft_cycles) if draft_cycles > 0 else 0.0,
+        "mean_accepted_tokens_per_cycle": (accepted / cycles) if cycles > 0 else 0.0,
+        "mean_draft_tokens_proposed_per_mtp_cycle": (proposed / mtp_cycles) if mtp_cycles > 0 else 0.0,
+        "mean_draft_tokens_accepted_per_mtp_cycle": (accepted_drafts / mtp_cycles) if mtp_cycles > 0 else 0.0,
+    }
+
+
+def summarize_acceptance(
+    gen_steps: list[dict[str, Any]],
+    accept_traces: list[dict[str, Any]],
+    *,
+    skip_cycles: int = 0,
+    skip_tokens: int = 0,
+) -> dict[str, Any]:
+    if accept_traces:
+        alignment = "aligned" if len(accept_traces) == len(gen_steps) else "count_mismatch"
+    else:
+        alignment = "no_accept_traces"
+
+    acc: dict[str, Any] = {
+        "steps": 0,
+        "cycles": 0,
+        "mtp_cycles": 0,
+        "non_mtp_cycles": 0,
+        "draft_cycles": 0,
+        "accepted_tokens_total": 0,
+        "eval_ms": 0.0,
+        "draft_tokens_proposed": 0,
+        "draft_tokens_accepted": 0,
+        "full_accept_cycles": 0,
+        "partial_accept_cycles": 0,
+        "reject_cycles": 0,
+    }
+    by_path: dict[str, dict[str, Any]] = {}
+    by_accepted_drafts: dict[str, dict[str, Any]] = {}
+
+    def zero_acc() -> dict[str, Any]:
+        return {
+            "cycles": 0,
+            "mtp_cycles": 0,
+            "draft_cycles": 0,
+            "accepted_tokens_total": 0,
+            "eval_ms": 0.0,
+            "draft_tokens_proposed": 0,
+            "draft_tokens_accepted": 0,
+            "full_accept_cycles": 0,
+            "partial_accept_cycles": 0,
+            "reject_cycles": 0,
+        }
+
+    def add_record(
+        *,
+        step: dict[str, Any] | None,
+        trace: dict[str, Any] | None,
+    ) -> None:
+        cycle = int(step["cycle"]) if step else int(trace["cycle_index"] if trace else 0)
+        if cycle < skip_cycles:
+            return
+        if skip_tokens > 0:
+            if not step:
+                return
+            if int(step["generated_before"]) < skip_tokens:
+                return
+
+        accepted_total = int(step["accepted"]) if step else int(trace["accepted_total"] if trace else 0)
+        eval_ms = float(step["eval_ms"]) if step else 0.0
+        mtp_cycle = bool(int(step["mtp"])) if step else bool(trace)
+        drafted = int(trace["drafted"]) if trace else 0
+        accepted_drafts = int(trace["accepted_drafts"]) if trace else 0
+        full = bool(trace and trace["full_accept"])
+        partial = bool(trace and trace["partial_accept"])
+        reject = bool(trace and trace["reject"])
+
+        acc["steps"] += 1
+        acc["cycles"] += 1
+        acc["accepted_tokens_total"] += accepted_total
+        acc["eval_ms"] += eval_ms
+        if mtp_cycle:
+            acc["mtp_cycles"] += 1
+        else:
+            acc["non_mtp_cycles"] += 1
+        if drafted > 0:
+            acc["draft_cycles"] += 1
+        acc["draft_tokens_proposed"] += drafted
+        acc["draft_tokens_accepted"] += accepted_drafts
+        if full:
+            acc["full_accept_cycles"] += 1
+        if partial:
+            acc["partial_accept_cycles"] += 1
+        if reject:
+            acc["reject_cycles"] += 1
+
+        path = str(trace["path"]) if trace else ("mtp" if mtp_cycle else "non_mtp")
+        path_acc = by_path.setdefault(path, zero_acc())
+        bucket_key = f"draft_accept_{accepted_drafts}" if trace and drafted > 0 else "non_mtp"
+        draft_acc = by_accepted_drafts.setdefault(bucket_key, zero_acc())
+        for target in (path_acc, draft_acc):
+            target["cycles"] += 1
+            target["accepted_tokens_total"] += accepted_total
+            target["eval_ms"] += eval_ms
+            if mtp_cycle:
+                target["mtp_cycles"] += 1
+            if drafted > 0:
+                target["draft_cycles"] += 1
+            target["draft_tokens_proposed"] += drafted
+            target["draft_tokens_accepted"] += accepted_drafts
+            if full:
+                target["full_accept_cycles"] += 1
+            if partial:
+                target["partial_accept_cycles"] += 1
+            if reject:
+                target["reject_cycles"] += 1
+
+    paired = min(len(gen_steps), len(accept_traces))
+    for i in range(paired):
+        add_record(step=gen_steps[i], trace=accept_traces[i])
+    for i in range(paired, len(accept_traces)):
+        add_record(step=None, trace=accept_traces[i])
+    if not accept_traces:
+        for step in gen_steps:
+            add_record(step=step, trace=None)
+
+    summary = acceptance_empty_summary(alignment)
+    summary.update(acceptance_bucket(acc))
+    summary["alignment"] = alignment
+    summary["steps"] = int(acc["steps"])
+    summary["non_mtp_cycles"] = int(acc["non_mtp_cycles"])
+    summary["by_path"] = {
+        name: acceptance_bucket(bucket)
+        for name, bucket in sorted(by_path.items())
+    }
+    summary["by_accepted_drafts"] = {
+        name: acceptance_bucket(bucket)
+        for name, bucket in sorted(by_accepted_drafts.items())
+    }
+    return summary
+
+
+def acceptance_profile(gen_steps: list[dict[str, Any]], accept_traces: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "all": summarize_acceptance(gen_steps, accept_traces),
+        "skip_first_cycle": summarize_acceptance(gen_steps, accept_traces, skip_cycles=1),
+        "skip_first_4_cycles": summarize_acceptance(gen_steps, accept_traces, skip_cycles=4),
+        "skip_first_32_tokens": summarize_acceptance(gen_steps, accept_traces, skip_tokens=32),
+    }
+
+
 def parse_shadow(log_text: str) -> dict[str, Any]:
     checks = 0
     decision_bad = 0
@@ -466,6 +703,7 @@ def parse_shadow(log_text: str) -> dict[str, Any]:
     v2_max_margin0 = 0.0
     v2_max_margin1 = 0.0
     gen_steps: list[dict[str, Any]] = []
+    accept_traces = parse_accept_traces(log_text)
     for m in SHADOW_RE.finditer(log_text):
         checks += 1
         if m.group("agree") != "1":
@@ -538,6 +776,8 @@ def parse_shadow(log_text: str) -> dict[str, Any]:
         "verify_v2_max_margin0": v2_max_margin0,
         "verify_v2_max_margin1": v2_max_margin1,
         "gen_step_profile": gen_step_profile,
+        "accept_trace": accept_traces,
+        "acceptance_profile": acceptance_profile(gen_steps, accept_traces),
     }
 
 
@@ -563,6 +803,7 @@ def profile_timing_summary(*, wall_ms: float, shadow: dict[str, Any]) -> dict[st
             "skip_first_4_cycles": skip4,
             "skip_first_32_tokens": skip32,
         },
+        "acceptance": shadow.get("acceptance_profile", {}),
     }
 
 
@@ -1252,6 +1493,16 @@ def print_run_line(result: RunResult) -> None:
             f" v2 checks={shadow['verify_v2_checks']} failed={shadow['verify_v2_failed']} "
             f"a1={shadow['verify_v2_accept1']} a2={shadow['verify_v2_accept2']} "
             f"a3={shadow['verify_v2_accept3']}"
+        )
+    acceptance = result.timing.get("acceptance", {}).get("all", {})
+    if acceptance.get("draft_tokens_proposed"):
+        shadow_text += (
+            f" acc draft={acceptance['draft_accept_rate']:.3f}"
+            f" full={acceptance['cycle_full_accept_rate']:.3f}"
+            f" partial={acceptance['cycle_partial_accept_rate']:.3f}"
+            f" reject={acceptance['cycle_reject_rate']:.3f}"
+            f" avg={acceptance['mean_draft_tokens_accepted_per_mtp_cycle']:.2f}/"
+            f"{acceptance['mean_draft_tokens_proposed_per_mtp_cycle']:.2f}"
         )
     gen_step = shadow.get("gen_step_profile", {})
     if gen_step.get("steps"):

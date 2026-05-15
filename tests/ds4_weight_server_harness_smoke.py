@@ -41,9 +41,12 @@ def write_fake_tools(tmp: Path) -> tuple[Path, Path, Path, Path]:
         """
         #!/usr/bin/env python3
         import sys
-        print("ds4: gen step profile cycle=0 pos=1 mtp=1 accepted=1 eval_ms=10.0 generated_before=0", file=sys.stderr)
+        print("ds4: mtp accept trace path=decode2 start=1 first=10 drafted=2 accepted=3 checkpoint=4 next_top=20 mtp_valid=1 mtp_draft=30 drafts=20,30", file=sys.stderr)
+        print("ds4: gen step profile cycle=0 pos=1 mtp=1 accepted=3 eval_ms=30.0 generated_before=0", file=sys.stderr)
+        print("ds4: mtp accept trace path=decode2 start=2 first=11 drafted=2 accepted=2 checkpoint=6 next_top=21 mtp_valid=1 mtp_draft=31 drafts=21,31", file=sys.stderr)
         print("ds4: gen step profile cycle=1 pos=2 mtp=1 accepted=2 eval_ms=20.0 generated_before=1", file=sys.stderr)
-        print("ds4: gen step profile cycle=2 pos=4 mtp=1 accepted=32 eval_ms=160.0 generated_before=32", file=sys.stderr)
+        print("ds4: mtp accept trace path=first-miss start=4 first=12 drafted=1 accepted=1 checkpoint=7 next_top=22 mtp_valid=0 mtp_draft=-1 drafts=22", file=sys.stderr)
+        print("ds4: gen step profile cycle=2 pos=4 mtp=1 accepted=1 eval_ms=10.0 generated_before=32", file=sys.stderr)
         print("fake engine output")
         """,
     )
@@ -221,6 +224,14 @@ def run_owned_lifecycle(tmp: Path, base: Path, mtp: Path, fake_engine: Path, fak
     ]:
         assert_true(report, f"weight_server_validation.checks.{check}")
     assert_gt(report, "results.0.timing.steady_state.skip_first_32_tokens.tps", 0.0)
+    assert_equal(report, "results.0.timing.acceptance.all.alignment", "aligned")
+    assert_equal(report, "results.0.timing.acceptance.all.draft_tokens_proposed", 5)
+    assert_equal(report, "results.0.timing.acceptance.all.draft_tokens_accepted", 3)
+    assert_equal(report, "results.0.timing.acceptance.all.full_accept_cycles", 1)
+    assert_equal(report, "results.0.timing.acceptance.all.partial_accept_cycles", 1)
+    assert_equal(report, "results.0.timing.acceptance.all.reject_cycles", 1)
+    assert_equal(report, "results.0.timing.acceptance.all.by_path.decode2.draft_tokens_proposed", 4)
+    assert_equal(report, "results.0.timing.acceptance.all.by_accepted_drafts.draft_accept_0.cycles", 1)
 
 
 def run_budget_preset(tmp: Path, base: Path, mtp: Path, fake_engine: Path) -> None:
@@ -250,7 +261,9 @@ def run_budget_preset(tmp: Path, base: Path, mtp: Path, fake_engine: Path) -> No
     assert_equal(report, "budget.tokens", 512)
     assert_equal(report, "budget.prompt_count", 4)
     assert_equal(report, "tokens", 512)
-    assert_equal(report, "results.0.timing.decode_accepted_tokens", 35)
+    assert_equal(report, "results.0.timing.decode_accepted_tokens", 6)
+    assert_equal(report, "results.0.shadow.accept_trace.0.path", "decode2")
+    assert_equal(report, "results.0.timing.acceptance.all.draft_tokens_accepted", 3)
     assert_gt(report, "results.0.timing.steady_state.skip_first_cycle.tps", 0.0)
 
 

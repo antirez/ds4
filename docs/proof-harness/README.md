@@ -153,8 +153,27 @@ CUDA mappings are no longer a valid basis for proof. Manifests therefore include
 an owner PID record, and the proof runner rejects external manifests whose owner
 is gone or whose owner scope differs from `--weight-server-scope`. VMM manifests
 also include a broker socket record and per-allocation logical/allocated byte
-records. This first implementation shares raw tensor spans only; derived Q8
-F16/F32 cache sharing is intentionally deferred.
+records.
+
+The runner can also ask the owner to build CUDA-ready derived artifacts before
+workers start:
+
+```sh
+tests/ds4_proof.py \
+  --start-weight-server \
+  --weight-server-backend vmm \
+  --weight-server-derive-output-certifier \
+  --weight-server-derive-group-count 8 \
+  --weight-server-derive-q8-f16 blk.0.attn_output_a.weight \
+  --weight-server-derive-q8-f32 blk.0.attn_q_b.weight \
+  --weight-server-derive-budget-gb 1 \
+  ...
+```
+
+Derived artifacts are opt-in and budgeted because large Q8 F16/F32 expansions
+can consume substantial device memory. The currently supported artifacts are
+output-head row-group norms for candidate certification and selected base Q8_0
+F16/F32 expanded layouts.
 
 By default the server refuses to start unless the CUDA allocator reports enough
 free memory for the full raw-span upload plus a 32 GiB reserve. Use
@@ -236,6 +255,12 @@ emits a structured report containing:
   throughput after all samples, after the first cycle, after the first four
   cycles, and after the first 32 generated tokens when those samples are
   available;
+- MTP acceptance metrics in `result.timing.acceptance` when
+  `DS4_MTP_ACCEPT_TRACE=1` or `DS4_TOKEN_TRACE=1` is enabled. These report
+  proposed draft tokens, accepted draft tokens, draft-token acceptance rate,
+  full/partial/reject cycle rates, path-specific buckets, and accepted-draft
+  count buckets for the same all/skip-first-cycle/skip-first-four-cycles/
+  skip-first-32-token windows as the steady-state timing fields;
 - parsed shadow verifier stats when present;
 - comparison pass/fail records and first-diff snippets.
 
@@ -246,5 +271,5 @@ emits a structured report containing:
 - `exact_bytes` is the only implemented contract.
 - Engine telemetry is still partly log-derived. A typed proof stats API is the
   next correctness and ergonomics improvement.
-- CUDA shared-weight ownership currently uses legacy CUDA IPC raw-span sharing.
-  The Driver VMM/read-only implementation remains the intended hardening path.
+- CUDA shared-weight ownership supports both legacy CUDA IPC and Driver VMM
+  ownership. VMM read-only permission hardening remains future work.

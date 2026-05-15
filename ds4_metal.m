@@ -5140,6 +5140,22 @@ int ds4_gpu_q8_0_row_group_norms_tensor(
     return 0;
 }
 
+ds4_gpu_tensor *ds4_gpu_imported_q8_0_row_group_norms_tensor(
+        const void *model_map,
+        uint64_t    model_size,
+        uint64_t    weight_offset,
+        uint64_t    in_dim,
+        uint64_t    out_dim,
+        uint32_t    group_count) {
+    (void)model_map;
+    (void)model_size;
+    (void)weight_offset;
+    (void)in_dim;
+    (void)out_dim;
+    (void)group_count;
+    return NULL;
+}
+
 int ds4_gpu_matmul_q8_0_candidate_certify_tensor(
         ds4_gpu_tensor       *result,
         const ds4_gpu_tensor *row_group_norms,
