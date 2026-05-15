@@ -11205,7 +11205,10 @@ static int routed_moe_launch(
     }
     const int q4k_path = (gate_type == 12u && down_type == 12u);
     if (!q4k_path && (gate_type != 16u || down_type != 10u)) return 0;
-    if (q4k_path && (n_tokens != 1u || n_expert != 6u)) return 0;
+    /* Q4_K with shapes other than (n_tokens=1, n_expert=6) is supported only
+     * through the mmq path added in Step 2 of the optimization plan.  Defer
+     * the legacy decode constraint to the fallback dispatch below; if mmq
+     * handles the call we never reach it. */
     const uint64_t gate_bytes = 256ull * gate_expert_bytes;
     const uint64_t down_bytes = 256ull * down_expert_bytes;
     if (gate_bytes > model_size - gate_offset ||
@@ -11218,19 +11221,20 @@ static int routed_moe_launch(
     const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
     if (!gate_w || !up_w || !down_w) return 0;
 
-    /* mmq routed-MoE fast path.  Gated on DS4_CUDA_USE_MMQ + V4-Flash quant
-     * config (IQ2_XXS gate/up + Q2_K down).  Q4_K (q4k_path) is not yet
-     * covered; falls through to the legacy dispatch below.
+    /* mmq routed-MoE fast path.  Gated on DS4_CUDA_USE_MMQ + n_tokens
+     * threshold.  Handles both the V4-Flash quant config (IQ2_XXS gate/up +
+     * Q2_K down) and Q4_K-only MoE GGUFs (gate/up/down all Q4_K, added in
+     * Step 2 of the optimization plan).
      *
-     * Pipeline:
-     *   1. ds4_mmq_iq2_xxs_moe(gate_w, x, selected) -> gate->ptr,
+     * Pipeline (per-row Q-type dispatched inside):
+     *   1. mmq_<gate_type>_moe(gate_w, x, selected) -> gate->ptr,
      *      shape [n_tokens * n_expert_used, expert_mid_dim] col-major =
      *      row-major same shape.
-     *   2. ds4_mmq_iq2_xxs_moe(up_w, x, selected)   -> up->ptr, same shape.
+     *   2. mmq_<gate_type>_moe(up_w, x, selected)   -> up->ptr, same shape.
      *   3. moe_mmq_swiglu_weighted_clamp_kernel: clamp + silu(gate) * up
      *      * router_weight[token, slot] -> mid->ptr, same shape.  Mirrors
      *      the inline math in moe_gate_up_mid_qwarp32_kernel.
-     *   4. ds4_mmq_q2_K_moe(down_w, mid->ptr, selected) -> down->ptr,
+     *   4. mmq_<down_type>_moe(down_w, mid->ptr, selected) -> down->ptr,
      *      treating each (token, slot) pair as one row of an
      *      [n_tokens * n_expert_used, 1] activation tensor; the same
      *      `selected` int32 buffer flat-indexes as the expert id for each
@@ -11255,31 +11259,51 @@ static int routed_moe_launch(
             if (v >= 1 && v <= 0x10000) mmq_moe_min_tokens = (uint32_t)v;
         }
     }
-    if (ds4_cuda_use_mmq() && !q4k_path && gate_type == 16u && down_type == 10u &&
-        n_tokens >= mmq_moe_min_tokens) {
+    if (ds4_cuda_use_mmq() && n_tokens >= mmq_moe_min_tokens) {
         const uint32_t n_expert_used = n_expert;   /* parameter name is a misnomer; this is top_k */
         const uint32_t n_experts_total = 256u;     /* matches the hardcoded constant at line 11437 */
         const uint64_t n_assignments = (uint64_t)n_tokens * n_expert_used;
 
         /* Reuse the caller-allocated buffers - all of gate/up/mid/down are
          * already sized to [n_tokens, n_expert_used, *].  See validation
-         * block above (lines 11427-11430). */
-        int rc;
-        rc = ds4_mmq_iq2_xxs_moe(gate_w, (const float *)x->ptr, (const int32_t *)selected->ptr,
-                                 (float *)gate->ptr,
-                                 (int)expert_mid_dim, (int)expert_in_dim,
-                                 (int)n_tokens, (int)n_experts_total, (int)n_expert_used, /*stream=*/0);
-        if (rc != 0) {
-            fprintf(stderr, "ds4: ds4_mmq_iq2_xxs_moe (gate) returned %d; falling back\n", rc);
-            goto mmq_moe_fallback;
-        }
-        rc = ds4_mmq_iq2_xxs_moe(up_w, (const float *)x->ptr, (const int32_t *)selected->ptr,
-                                 (float *)up->ptr,
-                                 (int)expert_mid_dim, (int)expert_in_dim,
-                                 (int)n_tokens, (int)n_experts_total, (int)n_expert_used, /*stream=*/0);
-        if (rc != 0) {
-            fprintf(stderr, "ds4: ds4_mmq_iq2_xxs_moe (up) returned %d; falling back\n", rc);
-            goto mmq_moe_fallback;
+         * block above (lines 11427-11430).  Quant-pair dispatch: IQ2_XXS
+         * gate/up + Q2_K down for the V4 Flash configuration, or Q4_K for
+         * all three when a Q4_K MoE GGUF is loaded. */
+        int rc = -1;
+        if (q4k_path) {
+            rc = ds4_mmq_q4_K_moe(gate_w, (const float *)x->ptr, (const int32_t *)selected->ptr,
+                                  (float *)gate->ptr,
+                                  (int)expert_mid_dim, (int)expert_in_dim,
+                                  (int)n_tokens, (int)n_experts_total, (int)n_expert_used, /*stream=*/0);
+            if (rc != 0) {
+                fprintf(stderr, "ds4: ds4_mmq_q4_K_moe (gate) returned %d; falling back\n", rc);
+                goto mmq_moe_fallback;
+            }
+            rc = ds4_mmq_q4_K_moe(up_w, (const float *)x->ptr, (const int32_t *)selected->ptr,
+                                  (float *)up->ptr,
+                                  (int)expert_mid_dim, (int)expert_in_dim,
+                                  (int)n_tokens, (int)n_experts_total, (int)n_expert_used, /*stream=*/0);
+            if (rc != 0) {
+                fprintf(stderr, "ds4: ds4_mmq_q4_K_moe (up) returned %d; falling back\n", rc);
+                goto mmq_moe_fallback;
+            }
+        } else {
+            rc = ds4_mmq_iq2_xxs_moe(gate_w, (const float *)x->ptr, (const int32_t *)selected->ptr,
+                                     (float *)gate->ptr,
+                                     (int)expert_mid_dim, (int)expert_in_dim,
+                                     (int)n_tokens, (int)n_experts_total, (int)n_expert_used, /*stream=*/0);
+            if (rc != 0) {
+                fprintf(stderr, "ds4: ds4_mmq_iq2_xxs_moe (gate) returned %d; falling back\n", rc);
+                goto mmq_moe_fallback;
+            }
+            rc = ds4_mmq_iq2_xxs_moe(up_w, (const float *)x->ptr, (const int32_t *)selected->ptr,
+                                     (float *)up->ptr,
+                                     (int)expert_mid_dim, (int)expert_in_dim,
+                                     (int)n_tokens, (int)n_experts_total, (int)n_expert_used, /*stream=*/0);
+            if (rc != 0) {
+                fprintf(stderr, "ds4: ds4_mmq_iq2_xxs_moe (up) returned %d; falling back\n", rc);
+                goto mmq_moe_fallback;
+            }
         }
         {
             const uint64_t mid_floats = n_assignments * expert_mid_dim;
@@ -11294,14 +11318,25 @@ static int routed_moe_launch(
          * "token" of length expert_mid_dim.  selected is contiguous int32
          * of length n_tokens * n_expert_used; reinterpreting it as
          * [n_assignments, 1] gives one expert id per row, which is exactly
-         * what ds4_mmq_q2_K_moe with n_expert_used=1 consumes. */
-        rc = ds4_mmq_q2_K_moe(down_w, (const float *)mid->ptr, (const int32_t *)selected->ptr,
-                              (float *)down->ptr,
-                              (int)out_dim, (int)expert_mid_dim,
-                              (int)n_assignments, (int)n_experts_total, /*n_expert_used=*/1, /*stream=*/0);
-        if (rc != 0) {
-            fprintf(stderr, "ds4: ds4_mmq_q2_K_moe (down) returned %d; falling back\n", rc);
-            goto mmq_moe_fallback;
+         * what ds4_mmq_*_moe with n_expert_used=1 consumes. */
+        if (q4k_path) {
+            rc = ds4_mmq_q4_K_moe(down_w, (const float *)mid->ptr, (const int32_t *)selected->ptr,
+                                  (float *)down->ptr,
+                                  (int)out_dim, (int)expert_mid_dim,
+                                  (int)n_assignments, (int)n_experts_total, /*n_expert_used=*/1, /*stream=*/0);
+            if (rc != 0) {
+                fprintf(stderr, "ds4: ds4_mmq_q4_K_moe (down) returned %d; falling back\n", rc);
+                goto mmq_moe_fallback;
+            }
+        } else {
+            rc = ds4_mmq_q2_K_moe(down_w, (const float *)mid->ptr, (const int32_t *)selected->ptr,
+                                  (float *)down->ptr,
+                                  (int)out_dim, (int)expert_mid_dim,
+                                  (int)n_assignments, (int)n_experts_total, /*n_expert_used=*/1, /*stream=*/0);
+            if (rc != 0) {
+                fprintf(stderr, "ds4: ds4_mmq_q2_K_moe (down) returned %d; falling back\n", rc);
+                goto mmq_moe_fallback;
+            }
         }
         {
             uint64_t n = (uint64_t)n_tokens * out_dim;
@@ -11312,7 +11347,12 @@ static int routed_moe_launch(
         }
         return 1;
     }
-mmq_moe_fallback: ;
+mmq_moe_fallback:
+    /* The legacy fallback dispatch handles Q4_K only for the V4-Flash decode
+     * shape (n_tokens=1, n_expert=6).  Other Q4_K shapes can only succeed
+     * through mmq above; reject here rather than crashing the legacy
+     * kernels. */
+    if (q4k_path && (n_tokens != 1u || n_expert != 6u)) return 0;
 
     int ok = 1;
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;

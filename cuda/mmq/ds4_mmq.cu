@@ -284,6 +284,12 @@ extern "C" int ds4_mmq_iq2_xxs_dense(
     return ds4_mmq_dense_impl<GGML_TYPE_IQ2_XXS>("ds4_mmq_iq2_xxs_dense", W, X, out, M, N, K, stream);
 }
 
+extern "C" int ds4_mmq_q4_K_dense(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_dense_impl<GGML_TYPE_Q4_K>("ds4_mmq_q4_K_dense", W, X, out, M, N, K, stream);
+}
+
 // ----------------------------------------------------------------------------
 // MoE matmul implementation, shared across all three quant types.
 //
@@ -481,6 +487,14 @@ extern "C" int ds4_mmq_iq2_xxs_moe(
                                                n_tokens, n_experts, n_expert_used, stream);
 }
 
+extern "C" int ds4_mmq_q4_K_moe(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    return ds4_mmq_moe_impl<GGML_TYPE_Q4_K>("ds4_mmq_q4_K_moe", W, X, ids, out, M, K,
+                                            n_tokens, n_experts, n_expert_used, stream);
+}
+
 // Explicit instantiations. One per quant type the public API exposes.
 // Each instantiation drags in the load_tiles_<type> + vec_dot_<type>_*
 // device functions from mmq.cuh, so the .o objects below contain everything
@@ -490,4 +504,6 @@ template void mul_mat_q_case<GGML_TYPE_Q8_0>(
 template void mul_mat_q_case<GGML_TYPE_Q2_K>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_IQ2_XXS>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_Q4_K>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);

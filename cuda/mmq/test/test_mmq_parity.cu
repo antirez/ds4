@@ -224,6 +224,65 @@ void generate_random_block_iq2_xxs(block_iq2_xxs * blk, std::mt19937 & rng) {
     set_half_from_u16(blk->d, float_to_fp16(ud(rng)));
 }
 
+// --------------------------------------------------------------------------
+// Q4_K random generator + CPU dequant.
+//
+// Layout (ggml-common.h:317):
+//   half d, dmin;                 // super-block scales
+//   uint8_t scales[K_SCALE_SIZE]; // 12 packed 6-bit scale/min nibbles
+//   uint8_t qs[QK_K/2];           // 128 bytes of 4-bit quants (256 quants)
+// Total: 144 bytes per 256-value super-block.
+// --------------------------------------------------------------------------
+
+void generate_random_block_q4_K(block_q4_K * blk, std::mt19937 & rng) {
+    std::uniform_int_distribution<int> u8(0, 255);
+    for (int i = 0; i < K_SCALE_SIZE; i++) {
+        blk->scales[i] = (uint8_t)u8(rng);
+    }
+    for (int i = 0; i < QK_K_LOCAL/2; i++) {
+        blk->qs[i] = (uint8_t)u8(rng);
+    }
+    // d/dmin chosen so dequanted values stay near unit variance: per-element
+    // value is roughly (d * sc) * q - (dmin * m) where sc <= 63 and q <= 15.
+    // Pick d, dmin ~ uniform(0.005, 0.02) so the dominant term peaks at ~12.
+    std::uniform_real_distribution<float> ud(0.005f, 0.020f);
+    set_half_from_u16(blk->data.d,    float_to_fp16(ud(rng)));
+    set_half_from_u16(blk->data.dmin, float_to_fp16(ud(rng)));
+}
+
+// 6-bit scale/min extraction. Mirrors get_scale_min_k4 in ggml-quants.c.
+static inline void get_scale_min_k4_cpu(int j, const uint8_t * q, uint8_t * d, uint8_t * m) {
+    if (j < 4) {
+        *d = q[j]     & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4);
+        *m = (q[j+4] >>  4) | ((q[j-0] >> 6) << 4);
+    }
+}
+
+// Port of dequantize_row_q4_K from ggml/src/ggml-quants.c.
+void dequantize_row_q4_K_cpu(const block_q4_K * x, float * y, int K) {
+    const int nb = K / QK_K_LOCAL;
+    for (int i = 0; i < nb; i++) {
+        const float d   = fp16_to_float(u16_from_half(x[i].data.d));
+        const float min = fp16_to_float(u16_from_half(x[i].data.dmin));
+        const uint8_t * q = x[i].qs;
+        int is = 0;
+        uint8_t sc, m;
+        for (int j = 0; j < QK_K_LOCAL; j += 64) {
+            (void)j;
+            get_scale_min_k4_cpu(is + 0, x[i].scales, &sc, &m);
+            const float d1 = d * sc; const float m1 = min * m;
+            get_scale_min_k4_cpu(is + 1, x[i].scales, &sc, &m);
+            const float d2 = d * sc; const float m2 = min * m;
+            for (int l = 0; l < 32; ++l) *y++ = d1 * (q[l] & 0xF) - m1;
+            for (int l = 0; l < 32; ++l) *y++ = d2 * (q[l]  >> 4) - m2;
+            q += 32; is += 2;
+        }
+    }
+}
+
 // Port of dequantize_row_iq2_xxs from ggml/src/ggml-quants.c:2412.  The
 // CPU-side lookup tables live in iq2_host_tables.h - generated from the
 // canonical bit-patterns in cuda/mmq/ggml-common.h.
@@ -385,6 +444,47 @@ bool run_q2_K(int M, int N, int K, uint32_t seed, float abs_scale = 0.05f) {
     cudaMemsetAsync(dY, 0, M * N * sizeof(float), stream);
     int rc = ds4_mmq_q2_K_dense(dW, dX, dY, M, N, K, stream);
     if (rc != 0) { fprintf(stderr, "ds4_mmq_q2_K_dense returned %d\n", rc); return false; }
+    std::vector<float> got_out(M * N, 0.0f);
+    cudaMemcpyAsync(got_out.data(), dY, M * N * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    cudaFree(dW); cudaFree(dX); cudaFree(dY); cudaStreamDestroy(stream);
+
+    const float abs_tol = abs_scale * std::sqrt((float)K);
+    const bool ok = check_close(got_out, ref_out, abs_tol, 0.05f);
+    fprintf(stderr, "%s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+bool run_q4_K(int M, int N, int K, uint32_t seed, float abs_scale = 0.20f) {
+    fprintf(stderr, "=== Q4_K   M=%d N=%d K=%d  seed=%u ===\n", M, N, K, seed);
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+
+    const int nb_per_row = K / QK_K_LOCAL;
+    std::vector<block_q4_K> W_q4(M * nb_per_row);
+    for (auto & blk : W_q4) generate_random_block_q4_K(&blk, rng);
+
+    std::vector<float> W_deq(M * K);
+    for (int row = 0; row < M; row++) {
+        dequantize_row_q4_K_cpu(&W_q4[row * nb_per_row], &W_deq[row * K], K);
+    }
+
+    std::vector<float> X_f32(K * N);
+    for (auto & v : X_f32) v = nd(rng);
+
+    std::vector<float> ref_out(M * N, 0.0f);
+    ref_matmul_f32(W_deq.data(), X_f32.data(), ref_out.data(), M, N, K);
+
+    cudaStream_t stream; cudaStreamCreate(&stream);
+    void * dW = nullptr; float * dX = nullptr; float * dY = nullptr;
+    cudaMalloc(&dW, W_q4.size() * sizeof(block_q4_K));
+    cudaMalloc(&dX, X_f32.size() * sizeof(float));
+    cudaMalloc(&dY, M * N * sizeof(float));
+    cudaMemcpyAsync(dW, W_q4.data(), W_q4.size() * sizeof(block_q4_K), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(dX, X_f32.data(), X_f32.size() * sizeof(float),    cudaMemcpyHostToDevice, stream);
+    cudaMemsetAsync(dY, 0, M * N * sizeof(float), stream);
+    int rc = ds4_mmq_q4_K_dense(dW, dX, dY, M, N, K, stream);
+    if (rc != 0) { fprintf(stderr, "ds4_mmq_q4_K_dense returned %d\n", rc); return false; }
     std::vector<float> got_out(M * N, 0.0f);
     cudaMemcpyAsync(got_out.data(), dY, M * N * sizeof(float), cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
@@ -603,6 +703,28 @@ bool run_iq2_xxs_moe(int M, int K, int nt, int ne, int nu, uint32_t seed) {
         "IQ2_XXS/MOE", QK_K_LOCAL, M, K, nt, ne, nu, seed, 0.20f, fn, ds4_mmq_iq2_xxs_moe);
 }
 
+bool run_q4_K_moe(int M, int K, int nt, int ne, int nu, uint32_t seed) {
+    auto fn = [](block_q4_K * blk, float * out,
+                 int n_experts, int M, int K, int blocks_per_expert,
+                 std::mt19937 & rng) {
+        const int blocks_per_row = K / QK_K_LOCAL;
+        for (int e = 0; e < n_experts; e++) {
+            block_q4_K * eblk = blk + (size_t)e * blocks_per_expert;
+            for (int row = 0; row < M; row++) {
+                for (int b = 0; b < blocks_per_row; b++) {
+                    generate_random_block_q4_K(&eblk[row * blocks_per_row + b], rng);
+                }
+                dequantize_row_q4_K_cpu(&eblk[row * blocks_per_row],
+                                        out + ((size_t)e * M + row) * K, K);
+            }
+        }
+    };
+    // Q4_K's 6-bit scale * 4-bit quant accumulator path agrees with the CPU
+    // reference to within ~0.20*sqrt(K), same envelope as IQ2_XXS.
+    return run_moe_generic<block_q4_K>(
+        "Q4_K/MOE", QK_K_LOCAL, M, K, nt, ne, nu, seed, 0.20f, fn, ds4_mmq_q4_K_moe);
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -630,6 +752,12 @@ int main(int argc, char ** argv) {
     all_ok &= run_iq2_xxs(/*M=*/256,  /*N=*/1,   /*K=*/4096, 0xCAFE4);
     all_ok &= run_iq2_xxs(/*M=*/2048, /*N=*/16,  /*K=*/4096, 0xCAFE5);
 
+    // Q4_K - covers gate/up + down shapes for hypothetical Q4_K MoE GGUFs.
+    all_ok &= run_q4_K(/*M=*/64,   /*N=*/4,   /*K=*/256,  0xC4FE1);
+    all_ok &= run_q4_K(/*M=*/128,  /*N=*/8,   /*K=*/512,  0xC4FE2);
+    all_ok &= run_q4_K(/*M=*/256,  /*N=*/1,   /*K=*/2048, 0xC4FE3);
+    all_ok &= run_q4_K(/*M=*/2048, /*N=*/16,  /*K=*/4096, 0xC4FE4);
+
     // MoE (_id) path.  Small expert counts + small shapes for fast verification.
     // Per-token-distinct routing with top_k=2 or 6.
     all_ok &= run_q8_0_moe   (/*M=*/64,   /*K=*/256,  /*nt=*/8,  /*nexp=*/4,   /*nused=*/2, 0xC0FE01);
@@ -645,6 +773,10 @@ int main(int argc, char ** argv) {
     all_ok &= run_q8_0_moe   (/*M=*/256,  /*K=*/256,  /*nt=*/8,  /*nexp=*/16,  /*nused=*/6, 0xC0FE08);
     all_ok &= run_q2_K_moe   (/*M=*/256,  /*K=*/512,  /*nt=*/8,  /*nexp=*/16,  /*nused=*/6, 0xC0FE09);
     all_ok &= run_iq2_xxs_moe(/*M=*/256,  /*K=*/512,  /*nt=*/8,  /*nexp=*/16,  /*nused=*/6, 0xC0FE0A);
+    // Q4_K MoE - new in Step 2. Three shapes mirror the IQ2_XXS coverage.
+    all_ok &= run_q4_K_moe   (/*M=*/64,   /*K=*/256,  /*nt=*/8,  /*nexp=*/4,   /*nused=*/2, 0xC4FE05);
+    all_ok &= run_q4_K_moe   (/*M=*/128,  /*K=*/512,  /*nt=*/16, /*nexp=*/8,   /*nused=*/2, 0xC4FE06);
+    all_ok &= run_q4_K_moe   (/*M=*/256,  /*K=*/512,  /*nt=*/8,  /*nexp=*/16,  /*nused=*/6, 0xC4FE07);
 
     fprintf(stderr, "===================\n");
     fprintf(stderr, "%s\n", all_ok ? "ALL PASS" : "SOME FAILED");
