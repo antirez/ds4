@@ -35,7 +35,7 @@
       }
     },
     {
-      "name": "mtp-exact-pair-output",
+      "name": "mtp-exact-no-pair-output",
       "use_mtp": true,
       "mtp_draft": 2,
       "env": {
@@ -45,7 +45,7 @@
         "DS4_MTP_ACCEPT_TRACE": "1",
         "DS4_MTP_NO_ACCEPT_GATE": "1",
         "DS4_MTP_EXACT_DECODE2": "1",
-        "DS4_MTP_VERIFY_PAIR_OUTPUT": "1",
+        "DS4_MTP_NO_VERIFY_PAIR_OUTPUT": "1",
         "DS4_MTP_NO_CERT_LOGITS": "1"
       }
     },
@@ -85,14 +85,14 @@
       "candidate": "mtp-exact-no-cert"
     },
     {
-      "name": "nomtp_vs_pair_output",
+      "name": "nomtp_vs_no_pair_output",
       "baseline": "nomtp-session",
-      "candidate": "mtp-exact-pair-output"
+      "candidate": "mtp-exact-no-pair-output"
     },
     {
-      "name": "no_cert_vs_pair_output",
-      "baseline": "mtp-exact-no-cert",
-      "candidate": "mtp-exact-pair-output"
+      "name": "no_pair_output_vs_no_cert",
+      "baseline": "mtp-exact-no-pair-output",
+      "candidate": "mtp-exact-no-cert"
     },
     {
       "name": "nomtp_vs_cert_active",

@@ -14291,7 +14291,6 @@ static bool metal_graph_verify_decode2_exact(
         const bool cert_enabled = cert_shadow || cert_active;
         const bool pair_output_active = cert_capable &&
             !cert_enabled &&
-            getenv("DS4_MTP_VERIFY_PAIR_OUTPUT") != NULL &&
             getenv("DS4_MTP_NO_VERIFY_PAIR_OUTPUT") == NULL;
         const bool cert_timing = getenv("DS4_MTP_OUTPUT_VERIFY_TIMING") != NULL;
         const double cert_total_t0 = cert_timing ? now_sec() : 0.0;

@@ -101,13 +101,13 @@ The currently useful CUDA MTP flags are:
   changing control flow and `DS4_MTP_OUTPUT_VERIFY_TIMING=1` for row0 output
   verifier timing. The certificate bound uses 8 output-vector groups by
   default; set `DS4_MTP_CERT_LOGITS_GROUPS=N` (`1..16`) for profiling.
-- `DS4_MTP_VERIFY_PAIR_OUTPUT=1`: opt-in exact CUDA decode2 output projection
-  path that stages row0/row1 normalized output activations together, then runs
-  one mixed Q8_0 output projection producing row0 top-2 and row1 full logits.
-  Rejected row0 fallbacks reuse the staged row0 normalized activation for full
-  logits. Use `DS4_MTP_NO_VERIFY_PAIR_OUTPUT=1` as an explicit escape hatch.
-  This remains default-off until GB10 steady-state proof runs show a durable
-  throughput win.
+- Pair output projection is default-on for exact CUDA decode2 when candidate
+  certification is not active. It stages row0/row1 normalized output
+  activations together, then runs one mixed Q8_0 output projection producing
+  row0 top-2 and row1 full logits. Rejected row0 fallbacks reuse the staged
+  row0 normalized activation for full logits. Use
+  `DS4_MTP_NO_VERIFY_PAIR_OUTPUT=1` to restore the older separate row0 top-2
+  plus continuation-logits schedule.
 - `DS4_MTP_VERIFY_V2_SHADOW=1`: opt-in diagnostic path for the fixed-depth
   decode3 verifier primitive. It runs in addition to the authoritative verifier
   and should only be used for proof runs.
