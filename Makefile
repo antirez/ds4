@@ -16,6 +16,7 @@ METAL_SRCS := $(wildcard metal/*.metal)
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 CORE_OBJS = ds4.o ds4_metal.o
+POOL_OBJS = ds4_session.o ds4_prompt_cache.o
 CPU_CORE_OBJS = ds4_cpu.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
@@ -28,6 +29,7 @@ endif
 NVCCFLAGS ?= -O3 --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 CORE_OBJS = ds4.o ds4_cuda.o
+POOL_OBJS = ds4_session.o ds4_prompt_cache.o
 CPU_CORE_OBJS = ds4_cpu.o
 METAL_LDLIBS := $(LDLIBS)
 endif
@@ -47,15 +49,15 @@ help:
 ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_cli.o linenoise.o $(CORE_OBJS) $(METAL_LDLIBS)
 
-ds4-server: ds4_server.o rax.o $(CORE_OBJS)
-	$(CC) $(CFLAGS) -o $@ ds4_server.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
+ds4-server: ds4_server.o rax.o $(CORE_OBJS) $(POOL_OBJS)
+	$(CC) $(CFLAGS) -o $@ ds4_server.o rax.o $(CORE_OBJS) $(POOL_OBJS) $(METAL_LDLIBS)
 
 ds4-bench: ds4_bench.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_bench.o $(CORE_OBJS) $(METAL_LDLIBS)
 
-cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o linenoise.o rax.o $(CPU_CORE_OBJS)
+cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o linenoise.o rax.o $(CPU_CORE_OBJS) $(POOL_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o rax.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o rax.o $(CPU_CORE_OBJS) $(POOL_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 
 cuda-regression:
@@ -89,15 +91,15 @@ cuda:
 ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ds4-server: ds4_server.o rax.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+ds4-server: ds4_server.o rax.o $(CORE_OBJS) $(POOL_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ ds4_server.o rax.o $(CORE_OBJS) $(POOL_OBJS) $(CUDA_LDLIBS)
 
 ds4-bench: ds4_bench.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o linenoise.o rax.o $(CPU_CORE_OBJS)
+cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o linenoise.o rax.o $(CPU_CORE_OBJS) $(POOL_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o rax.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o rax.o $(CPU_CORE_OBJS) $(POOL_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 
 cuda-regression: tests/cuda_long_context_smoke
@@ -110,13 +112,19 @@ ds4.o: ds4.c ds4.h ds4_gpu.h
 ds4_cli.o: ds4_cli.c ds4.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
 
-ds4_server.o: ds4_server.c ds4.h rax.h
+ds4_server.o: ds4_server.c ds4.h rax.h ds4_session.h ds4_prompt_cache.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
+
+ds4_session.o: ds4_session.c ds4_session.h ds4.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_session.c
+
+ds4_prompt_cache.o: ds4_prompt_cache.c ds4_prompt_cache.h ds4.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_prompt_cache.c
 
 ds4_bench.o: ds4_bench.c ds4.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_bench.c
 
-ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h rax.h
+ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h rax.h ds4_session.h ds4_prompt_cache.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_test.c
 
 tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c ds4_gpu.h
@@ -134,7 +142,7 @@ ds4_cpu.o: ds4.c ds4.h ds4_gpu.h
 ds4_cli_cpu.o: ds4_cli.c ds4.h linenoise.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_cli.c
 
-ds4_server_cpu.o: ds4_server.c ds4.h rax.h
+ds4_server_cpu.o: ds4_server.c ds4.h rax.h ds4_session.h ds4_prompt_cache.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_server.c
 
 ds4_bench_cpu.o: ds4_bench.c ds4.h
@@ -149,11 +157,11 @@ ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ds4_test: ds4_test.o rax.o $(CORE_OBJS)
+ds4_test: ds4_test.o rax.o $(CORE_OBJS) $(POOL_OBJS)
 ifeq ($(UNAME_S),Darwin)
-	$(CC) $(CFLAGS) -o $@ ds4_test.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
+	$(CC) $(CFLAGS) -o $@ ds4_test.o rax.o $(CORE_OBJS) $(POOL_OBJS) $(METAL_LDLIBS)
 else
-	$(NVCC) $(NVCCFLAGS) -o $@ ds4_test.o rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
+	$(NVCC) $(NVCCFLAGS) -o $@ ds4_test.o rax.o $(CORE_OBJS) $(POOL_OBJS) $(CUDA_LDLIBS)
 endif
 
 test: ds4_test

@@ -285,10 +285,10 @@ typedef struct {
     bool use_color;
 } cli_prefill_progress;
 
-static void cli_prefill_progress_cb(void *ud, const char *event, int current, int total) {
+static bool cli_prefill_progress_cb(void *ud, const char *event, int current, int total) {
     (void)total;
     cli_prefill_progress *p = ud;
-    if (!p || !event || strcmp(event, "prefill_chunk") || p->input_tokens <= 0) return;
+    if (!p || !event || strcmp(event, "prefill_chunk") || p->input_tokens <= 0) return false;
 
     int processed = current - p->base_tokens;
     if (processed < 0) processed = 0;
@@ -316,6 +316,7 @@ static void cli_prefill_progress_cb(void *ud, const char *event, int current, in
                 pct);
     }
     fflush(stderr);
+    return false;
 }
 
 static bool is_rendered_chat_prompt(const char *prompt) {

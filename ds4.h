@@ -53,7 +53,8 @@ typedef struct {
 typedef struct ds4_engine ds4_engine;
 typedef struct ds4_session ds4_session;
 
-typedef void (*ds4_session_progress_fn)(void *ud, const char *event, int current, int total);
+typedef bool (*ds4_session_progress_fn)(void *ud, const char *event, int current, int total);
+typedef bool (*ds4_session_abort_fn)(void *ud);
 
 typedef struct {
     const char *model_path;
@@ -145,6 +146,7 @@ int ds4_token_eos(ds4_engine *e);
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
+void ds4_session_set_abort(ds4_session *s, ds4_session_abort_fn fn, void *ud);
 
 typedef enum {
     DS4_SESSION_REWRITE_ERROR = -1,
@@ -177,6 +179,7 @@ void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
+bool ds4_session_checkpoint_valid(ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
