@@ -9115,8 +9115,20 @@ static bool metal_graph_capture_prefix1_index_state(ds4_gpu_graph *g, uint32_t i
                                  g->layer_index_state_score[il], 0, bytes) != 0;
 }
 
+static bool metal_graph_use_m5_large_prefill_schedule(const ds4_gpu_graph *g);
+
 static uint32_t metal_graph_decode_indexer_top_k(const ds4_gpu_graph *g) {
-    (void)g;
+    const char *env = getenv("DS4_METAL_DECODE_INDEXER_TOP_K");
+    if (env && env[0]) {
+        char *endp = NULL;
+        const long v = strtol(env, &endp, 10);
+        if (endp != env && v > 0 && v <= DS4_N_INDEXER_TOP_K && ((v & (v - 1)) == 0)) return (uint32_t)v;
+    }
+    /* M5 Max decode spends a visible fraction of time sorting and scanning the
+     * sparse compressed-row top-k.  Official-vector, long-context, and tool-call
+     * checks remain stable with a smaller decode-only candidate set, while
+     * prefill keeps the model-configured 512 rows. */
+    if (metal_graph_use_m5_large_prefill_schedule(g)) return 8u;
     return DS4_N_INDEXER_TOP_K;
 }
 
