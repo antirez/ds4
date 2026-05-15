@@ -1,0 +1,93 @@
+{
+  "suite": "mtp_exact_candidate_top2",
+  "prompts": [
+    {
+      "id": "prime-list",
+      "prompt": "List 300 prime numbers, comma-separated, just numbers."
+    },
+    {
+      "id": "verifier-explain",
+      "prompt": "Explain speculative decoding verifier costs in one concise paragraph."
+    }
+  ],
+  "profiles": [
+    {
+      "name": "nomtp-session",
+      "baseline": true,
+      "use_mtp": false,
+      "env": {
+        "DS4_FORCE_SESSION_GENERATION": "1",
+        "DS4_GEN_STEP_PROFILE": "1"
+      }
+    },
+    {
+      "name": "mtp-exact-no-cert",
+      "use_mtp": true,
+      "mtp_draft": 2,
+      "env": {
+        "DS4_GEN_STEP_PROFILE": "1",
+        "DS4_MTP_TIMING": "1",
+        "DS4_MTP_OUTPUT_VERIFY_TIMING": "1",
+        "DS4_MTP_ACCEPT_TRACE": "1",
+        "DS4_MTP_NO_ACCEPT_GATE": "1",
+        "DS4_MTP_EXACT_DECODE2": "1",
+        "DS4_MTP_NO_CERT_LOGITS": "1"
+      }
+    },
+    {
+      "name": "mtp-exact-cert-active",
+      "use_mtp": true,
+      "mtp_draft": 2,
+      "env": {
+        "DS4_GEN_STEP_PROFILE": "1",
+        "DS4_MTP_TIMING": "1",
+        "DS4_MTP_OUTPUT_VERIFY_TIMING": "1",
+        "DS4_MTP_ACCEPT_TRACE": "1",
+        "DS4_MTP_NO_ACCEPT_GATE": "1",
+        "DS4_MTP_EXACT_DECODE2": "1",
+        "DS4_MTP_CERT_LOGITS": "1"
+      }
+    },
+    {
+      "name": "mtp-exact-cert-shadow",
+      "use_mtp": true,
+      "mtp_draft": 2,
+      "env": {
+        "DS4_GEN_STEP_PROFILE": "1",
+        "DS4_MTP_TIMING": "1",
+        "DS4_MTP_OUTPUT_VERIFY_TIMING": "1",
+        "DS4_MTP_ACCEPT_TRACE": "1",
+        "DS4_MTP_NO_ACCEPT_GATE": "1",
+        "DS4_MTP_EXACT_DECODE2": "1",
+        "DS4_MTP_CERT_LOGITS_SHADOW": "1"
+      }
+    }
+  ],
+  "contracts": [
+    {
+      "name": "nomtp_vs_no_cert",
+      "baseline": "nomtp-session",
+      "candidate": "mtp-exact-no-cert"
+    },
+    {
+      "name": "nomtp_vs_cert_active",
+      "baseline": "nomtp-session",
+      "candidate": "mtp-exact-cert-active"
+    },
+    {
+      "name": "nomtp_vs_cert_shadow",
+      "baseline": "nomtp-session",
+      "candidate": "mtp-exact-cert-shadow"
+    },
+    {
+      "name": "no_cert_vs_cert_active",
+      "baseline": "mtp-exact-no-cert",
+      "candidate": "mtp-exact-cert-active"
+    },
+    {
+      "name": "no_cert_vs_cert_shadow",
+      "baseline": "mtp-exact-no-cert",
+      "candidate": "mtp-exact-cert-shadow"
+    }
+  ]
+}

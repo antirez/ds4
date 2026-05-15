@@ -94,6 +94,13 @@ The currently useful CUDA MTP flags are:
   top-2 and row1 full-output work together. It is exact, but current GB10
   measurements favor the simpler no-opt schedule, so it is not part of the
   recommended fast baseline.
+- `DS4_MTP_CERT_LOGITS=1`: opt-in exact candidate-certified row0 output
+  verifier for CUDA decode2. It proves the drafted row1 token is row0 argmax
+  before skipping the row0 top-2 scan; uncertified rows fall back to exact
+  top-2. Use `DS4_MTP_CERT_LOGITS_SHADOW=1` to validate the certificate without
+  changing control flow and `DS4_MTP_OUTPUT_VERIFY_TIMING=1` for row0 output
+  verifier timing. The certificate bound uses 8 output-vector groups by
+  default; set `DS4_MTP_CERT_LOGITS_GROUPS=N` (`1..16`) for profiling.
 - `DS4_MTP_VERIFY_V2_SHADOW=1`: opt-in diagnostic path for the fixed-depth
   decode3 verifier primitive. It runs in addition to the authoritative verifier
   and should only be used for proof runs.
