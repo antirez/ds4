@@ -9128,7 +9128,7 @@ static uint32_t metal_graph_decode_indexer_top_k(const ds4_gpu_graph *g) {
      * sparse compressed-row top-k.  Official-vector, long-context, and tool-call
      * checks remain stable with a smaller decode-only candidate set, while
      * prefill keeps the model-configured 512 rows. */
-    if (metal_graph_use_m5_large_prefill_schedule(g)) return 8u;
+    if (metal_graph_use_m5_large_prefill_schedule(g)) return 4u;
     return DS4_N_INDEXER_TOP_K;
 }
 
