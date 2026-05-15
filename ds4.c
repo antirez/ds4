@@ -1433,15 +1433,28 @@ static uint64_t accelerator_cuda_preload_span_bytes(void) {
 }
 
 typedef struct {
-    const ds4_tensor *tensor;
     uint64_t off;
     uint64_t end;
     uint64_t bytes;
     uint32_t priority;
     uint32_t layer;
     uint32_t group;
-    char label[128];
 } accelerator_weight_cache_candidate;
+
+enum {
+    ACCELERATOR_WEIGHT_CACHE_GLOBAL_STATE = 0,
+    ACCELERATOR_WEIGHT_CACHE_LAYER_STATE = 5,
+    ACCELERATOR_WEIGHT_CACHE_ATTENTION = 10,
+    ACCELERATOR_WEIGHT_CACHE_COMPRESSOR = 15,
+    ACCELERATOR_WEIGHT_CACHE_FFN_SHARED = 20,
+    ACCELERATOR_WEIGHT_CACHE_OUTPUT = 25,
+    ACCELERATOR_WEIGHT_CACHE_TOKEN_EMBD = 30,
+    ACCELERATOR_WEIGHT_CACHE_ROUTED_EXPERTS = 40,
+};
+
+/* Lower priorities are cached first: cover small global/layer state and dense
+ * per-token paths before spending the partial VRAM budget on large embeddings
+ * and routed expert matrices. */
 
 static bool accelerator_cuda_env_enabled(const char *name) {
     const char *env = getenv(name);
@@ -1488,8 +1501,7 @@ static bool accelerator_partial_cache_add(
         const ds4_tensor *t,
         uint32_t priority,
         uint32_t layer,
-        uint32_t group,
-        const char *role) {
+        uint32_t group) {
     if (!t || t->bytes == 0) return true;
     if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) {
         fprintf(stderr, "ds4: invalid CUDA cache candidate range for %.*s\n",
@@ -1501,19 +1513,12 @@ static bool accelerator_partial_cache_add(
         return false;
     }
     accelerator_weight_cache_candidate *c = &cands[*count];
-    c->tensor = t;
     c->off = t->abs_offset;
     c->bytes = t->bytes;
     c->end = t->abs_offset + t->bytes;
     c->priority = priority;
     c->layer = layer;
     c->group = group;
-    snprintf(c->label,
-             sizeof(c->label),
-             "%s:%.*s",
-             role ? role : "tensor",
-             (int)t->name.len,
-             t->name.ptr);
     (*count)++;
     return true;
 }
@@ -1524,68 +1529,68 @@ static bool accelerator_partial_cache_collect(
         uint32_t cap,
         const ds4_model *m,
         const ds4_weights *w) {
-#define ADD_GLOBAL(t_, p_, role_) \
+#define ADD_GLOBAL(t_, p_) \
     do { \
-        if (!accelerator_partial_cache_add(cands, count, cap, m, (t_), (p_), UINT32_MAX, 0, (role_))) return false; \
+        if (!accelerator_partial_cache_add(cands, count, cap, m, (t_), (p_), UINT32_MAX, 0)) return false; \
     } while (0)
-#define ADD_LAYER(t_, p_, role_) \
+#define ADD_LAYER(t_, p_) \
     do { \
-        if (!accelerator_partial_cache_add(cands, count, cap, m, (t_), (p_), il, 0, (role_))) return false; \
+        if (!accelerator_partial_cache_add(cands, count, cap, m, (t_), (p_), il, 0)) return false; \
     } while (0)
-#define ADD_LAYER_GROUP(t_, p_, group_, role_) \
+#define ADD_LAYER_GROUP(t_, p_, group_) \
     do { \
-        if (!accelerator_partial_cache_add(cands, count, cap, m, (t_), (p_), il, (group_), (role_))) return false; \
+        if (!accelerator_partial_cache_add(cands, count, cap, m, (t_), (p_), il, (group_))) return false; \
     } while (0)
 
-    ADD_GLOBAL(w->output_hc_base, 0, "output_hc_base");
-    ADD_GLOBAL(w->output_hc_scale, 0, "output_hc_scale");
-    ADD_GLOBAL(w->output_norm, 0, "output_norm");
-    ADD_GLOBAL(w->output_hc_fn, 0, "output_hc_fn");
-    ADD_GLOBAL(w->output, 25, "output");
-    ADD_GLOBAL(w->token_embd, 30, "token_embd");
+    ADD_GLOBAL(w->output_hc_base, ACCELERATOR_WEIGHT_CACHE_GLOBAL_STATE);
+    ADD_GLOBAL(w->output_hc_scale, ACCELERATOR_WEIGHT_CACHE_GLOBAL_STATE);
+    ADD_GLOBAL(w->output_norm, ACCELERATOR_WEIGHT_CACHE_GLOBAL_STATE);
+    ADD_GLOBAL(w->output_hc_fn, ACCELERATOR_WEIGHT_CACHE_GLOBAL_STATE);
+    ADD_GLOBAL(w->output, ACCELERATOR_WEIGHT_CACHE_OUTPUT);
+    ADD_GLOBAL(w->token_embd, ACCELERATOR_WEIGHT_CACHE_TOKEN_EMBD);
 
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
-        ADD_LAYER(l->hc_attn_scale, 5, "hc_attn_scale");
-        ADD_LAYER(l->hc_attn_base, 5, "hc_attn_base");
-        ADD_LAYER(l->attn_norm, 5, "attn_norm");
-        ADD_LAYER(l->attn_q_a_norm, 5, "attn_q_a_norm");
-        ADD_LAYER(l->attn_kv_a_norm, 5, "attn_kv_a_norm");
-        ADD_LAYER(l->attn_sinks, 5, "attn_sinks");
-        ADD_LAYER(l->attn_compressor_norm, 5, "attn_compressor_norm");
-        ADD_LAYER(l->indexer_compressor_norm, 5, "indexer_compressor_norm");
-        ADD_LAYER(l->hc_ffn_scale, 5, "hc_ffn_scale");
-        ADD_LAYER(l->hc_ffn_base, 5, "hc_ffn_base");
-        ADD_LAYER(l->ffn_norm, 5, "ffn_norm");
-        ADD_LAYER(l->ffn_exp_probs_b, 5, "ffn_exp_probs_b");
-        ADD_LAYER(l->ffn_gate_tid2eid, 5, "ffn_gate_tid2eid");
+        ADD_LAYER(l->hc_attn_scale, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
+        ADD_LAYER(l->hc_attn_base, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
+        ADD_LAYER(l->attn_norm, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
+        ADD_LAYER(l->attn_q_a_norm, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
+        ADD_LAYER(l->attn_kv_a_norm, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
+        ADD_LAYER(l->attn_sinks, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
+        ADD_LAYER(l->attn_compressor_norm, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
+        ADD_LAYER(l->indexer_compressor_norm, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
+        ADD_LAYER(l->hc_ffn_scale, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
+        ADD_LAYER(l->hc_ffn_base, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
+        ADD_LAYER(l->ffn_norm, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
+        ADD_LAYER(l->ffn_exp_probs_b, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
+        ADD_LAYER(l->ffn_gate_tid2eid, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
 
-        ADD_LAYER(l->hc_attn_fn, 10, "hc_attn_fn");
-        ADD_LAYER(l->attn_q_a, 10, "attn_q_a");
-        ADD_LAYER(l->attn_q_b, 10, "attn_q_b");
-        ADD_LAYER(l->attn_kv, 10, "attn_kv");
-        ADD_LAYER(l->attn_output_a, 10, "attn_output_a");
-        ADD_LAYER(l->attn_output_b, 10, "attn_output_b");
+        ADD_LAYER(l->hc_attn_fn, ACCELERATOR_WEIGHT_CACHE_ATTENTION);
+        ADD_LAYER(l->attn_q_a, ACCELERATOR_WEIGHT_CACHE_ATTENTION);
+        ADD_LAYER(l->attn_q_b, ACCELERATOR_WEIGHT_CACHE_ATTENTION);
+        ADD_LAYER(l->attn_kv, ACCELERATOR_WEIGHT_CACHE_ATTENTION);
+        ADD_LAYER(l->attn_output_a, ACCELERATOR_WEIGHT_CACHE_ATTENTION);
+        ADD_LAYER(l->attn_output_b, ACCELERATOR_WEIGHT_CACHE_ATTENTION);
 
-        ADD_LAYER(l->attn_compressor_ape, 15, "attn_compressor_ape");
-        ADD_LAYER(l->attn_compressor_kv, 15, "attn_compressor_kv");
-        ADD_LAYER(l->attn_compressor_gate, 15, "attn_compressor_gate");
-        ADD_LAYER(l->indexer_attn_q_b, 15, "indexer_attn_q_b");
-        ADD_LAYER(l->indexer_proj, 15, "indexer_proj");
-        ADD_LAYER(l->indexer_compressor_ape, 15, "indexer_compressor_ape");
-        ADD_LAYER(l->indexer_compressor_kv, 15, "indexer_compressor_kv");
-        ADD_LAYER(l->indexer_compressor_gate, 15, "indexer_compressor_gate");
+        ADD_LAYER(l->attn_compressor_ape, ACCELERATOR_WEIGHT_CACHE_COMPRESSOR);
+        ADD_LAYER(l->attn_compressor_kv, ACCELERATOR_WEIGHT_CACHE_COMPRESSOR);
+        ADD_LAYER(l->attn_compressor_gate, ACCELERATOR_WEIGHT_CACHE_COMPRESSOR);
+        ADD_LAYER(l->indexer_attn_q_b, ACCELERATOR_WEIGHT_CACHE_COMPRESSOR);
+        ADD_LAYER(l->indexer_proj, ACCELERATOR_WEIGHT_CACHE_COMPRESSOR);
+        ADD_LAYER(l->indexer_compressor_ape, ACCELERATOR_WEIGHT_CACHE_COMPRESSOR);
+        ADD_LAYER(l->indexer_compressor_kv, ACCELERATOR_WEIGHT_CACHE_COMPRESSOR);
+        ADD_LAYER(l->indexer_compressor_gate, ACCELERATOR_WEIGHT_CACHE_COMPRESSOR);
 
-        ADD_LAYER(l->hc_ffn_fn, 20, "hc_ffn_fn");
-        ADD_LAYER(l->ffn_gate_inp, 20, "ffn_gate_inp");
-        ADD_LAYER(l->ffn_gate_shexp, 20, "ffn_gate_shexp");
-        ADD_LAYER(l->ffn_up_shexp, 20, "ffn_up_shexp");
-        ADD_LAYER(l->ffn_down_shexp, 20, "ffn_down_shexp");
+        ADD_LAYER(l->hc_ffn_fn, ACCELERATOR_WEIGHT_CACHE_FFN_SHARED);
+        ADD_LAYER(l->ffn_gate_inp, ACCELERATOR_WEIGHT_CACHE_FFN_SHARED);
+        ADD_LAYER(l->ffn_gate_shexp, ACCELERATOR_WEIGHT_CACHE_FFN_SHARED);
+        ADD_LAYER(l->ffn_up_shexp, ACCELERATOR_WEIGHT_CACHE_FFN_SHARED);
+        ADD_LAYER(l->ffn_down_shexp, ACCELERATOR_WEIGHT_CACHE_FFN_SHARED);
 
         const uint32_t routed_group = 1000u + il;
-        ADD_LAYER_GROUP(l->ffn_gate_exps, 40, routed_group, "ffn_gate_exps");
-        ADD_LAYER_GROUP(l->ffn_up_exps, 40, routed_group, "ffn_up_exps");
-        ADD_LAYER_GROUP(l->ffn_down_exps, 40, routed_group, "ffn_down_exps");
+        ADD_LAYER_GROUP(l->ffn_gate_exps, ACCELERATOR_WEIGHT_CACHE_ROUTED_EXPERTS, routed_group);
+        ADD_LAYER_GROUP(l->ffn_up_exps, ACCELERATOR_WEIGHT_CACHE_ROUTED_EXPERTS, routed_group);
+        ADD_LAYER_GROUP(l->ffn_down_exps, ACCELERATOR_WEIGHT_CACHE_ROUTED_EXPERTS, routed_group);
     }
 
 #undef ADD_GLOBAL

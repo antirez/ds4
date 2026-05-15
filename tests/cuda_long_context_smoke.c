@@ -159,10 +159,9 @@ static int check_partial_direct_model_cache_precedence(void) {
     }
 
     const float rms_weight[4] = {2.0f, 3.0f, 4.0f, 5.0f};
-    const uint64_t model_size = sizeof(rms_weight);
-    float *host_model = (float *)malloc((size_t)model_size);
+    static float host_model[4];
+    const uint64_t model_size = sizeof(host_model);
     float out_host[4] = {0};
-    if (!host_model) return 1;
     for (uint32_t i = 0; i < 4; i++) host_model[i] = rms_weight[i];
 
     ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(sizeof(rms_weight));
@@ -171,29 +170,31 @@ static int check_partial_direct_model_cache_precedence(void) {
     const float x_host[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 
     if (x && out &&
+        ds4_gpu_set_model_map(host_model, model_size) &&
         ds4_gpu_tensor_write(x, 0, x_host, sizeof(x_host)) &&
-        ds4_gpu_cache_model_range(host_model, model_size, 0, model_size, "test_partial_rms") &&
-        ds4_gpu_rms_norm_weight_tensor(out, x, host_model, model_size, 0, 4, TEST_DS4_RMS_EPS) &&
-        ds4_gpu_synchronize() &&
-        ds4_gpu_tensor_read(out, 0, out_host, sizeof(out_host))) {
-        rc = 0;
-        const float scale = 1.0f / sqrtf(1.0f + TEST_DS4_RMS_EPS);
-        for (uint32_t i = 0; i < 4; i++) {
-            const float want = rms_weight[i] * scale;
-            if (fabsf(out_host[i] - want) > 1.0e-3f) {
-                fprintf(stderr,
-                        "partial direct cache rms mismatch index=%u got=%f expected=%f\n",
-                        i,
-                        (double)out_host[i],
-                        (double)want);
-                rc = 1;
+        ds4_gpu_cache_model_range(host_model, model_size, 0, model_size, "test_partial_rms")) {
+        for (uint32_t i = 0; i < 4; i++) host_model[i] = -100.0f - (float)i;
+        if (ds4_gpu_rms_norm_weight_tensor(out, x, host_model, model_size, 0, 4, TEST_DS4_RMS_EPS) &&
+            ds4_gpu_synchronize() &&
+            ds4_gpu_tensor_read(out, 0, out_host, sizeof(out_host))) {
+            rc = 0;
+            const float scale = 1.0f / sqrtf(1.0f + TEST_DS4_RMS_EPS);
+            for (uint32_t i = 0; i < 4; i++) {
+                const float want = rms_weight[i] * scale;
+                if (fabsf(out_host[i] - want) > 1.0e-3f) {
+                    fprintf(stderr,
+                            "partial direct cache rms mismatch index=%u got=%f expected=%f\n",
+                            i,
+                            (double)out_host[i],
+                            (double)want);
+                    rc = 1;
+                }
             }
         }
     }
 
     ds4_gpu_tensor_free(out);
     ds4_gpu_tensor_free(x);
-    free(host_model);
     return rc;
 }
 

@@ -211,12 +211,12 @@ static int cuda_direct_model_enabled(void) {
     return cuda_env_enabled("DS4_CUDA_DIRECT_MODEL");
 }
 
-static const char *cuda_model_range_lookup_cached(
+static const char *cuda_model_range_lookup_device_cached(
         const void *model_map,
         uint64_t offset,
         uint64_t bytes) {
     if (!model_map || bytes == 0) return NULL;
-    if (model_map == g_model_host_base && (g_model_device_owned || g_model_registered)) {
+    if (model_map == g_model_host_base && g_model_device_owned) {
         return cuda_model_ptr(model_map, offset);
     }
 
@@ -227,15 +227,48 @@ static const char *cuda_model_range_lookup_cached(
     if (exact != g_model_range_by_offset.end()) {
         const cuda_model_range &r = g_model_ranges[exact->second];
         const uint64_t rend = r.offset + r.bytes;
-        if (r.host_base == model_map && rend >= r.offset && end <= rend) return r.device_ptr;
+        if (r.host_base == model_map && !r.host_registered &&
+            rend >= r.offset && end <= rend) return r.device_ptr;
     }
 
     for (const cuda_model_range &r : g_model_ranges) {
         const uint64_t rend = r.offset + r.bytes;
-        if (r.host_base == model_map && rend >= r.offset &&
+        if (r.host_base == model_map && !r.host_registered && rend >= r.offset &&
             offset >= r.offset && end <= rend) {
             return r.device_ptr + (offset - r.offset);
         }
+    }
+    return NULL;
+}
+
+static const char *cuda_model_range_lookup_cached(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t bytes) {
+    const char *cached = cuda_model_range_lookup_device_cached(model_map, offset, bytes);
+    if (cached) return cached;
+    if (!model_map || bytes == 0) return NULL;
+
+    if (model_map == g_model_host_base && g_model_registered) {
+        return cuda_model_ptr(model_map, offset);
+    }
+
+    const uint64_t end = offset + bytes;
+    if (end < offset) return NULL;
+
+    auto exact = g_model_range_by_offset.find(offset);
+    if (exact != g_model_range_by_offset.end()) {
+        const cuda_model_range &r = g_model_ranges[exact->second];
+        if (r.host_base == model_map && r.host_registered && r.registered_base && r.registered_device_base) {
+            const uintptr_t h0 = (uintptr_t)((const char *)model_map + offset);
+            const uintptr_t h1 = h0 + bytes;
+            const uintptr_t r0 = (uintptr_t)r.registered_base;
+            const uintptr_t r1 = r0 + r.registered_bytes;
+            if (h1 >= h0 && h0 >= r0 && h1 <= r1) return r.registered_device_base + (h0 - r0);
+        }
+    }
+
+    for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_base == model_map && r.host_registered && r.registered_base && r.registered_device_base) {
             const uintptr_t h0 = (uintptr_t)((const char *)model_map + offset);
             const uintptr_t h1 = h0 + bytes;
@@ -247,11 +280,21 @@ static const char *cuda_model_range_lookup_cached(
     return NULL;
 }
 
+static int cuda_model_range_is_device_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
+    if (bytes == 0) return 1;
+    return cuda_model_range_lookup_device_cached(model_map, offset, bytes) != NULL;
+}
+
+static int cuda_partial_weight_cache_miss(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t bytes) {
+    return cuda_partial_weight_cache_enabled() &&
+           !cuda_model_range_is_device_cached(model_map, offset, bytes);
+}
+
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
-    if (model_map == g_model_host_base && (g_model_device_owned || g_model_registered)) {
-        return cuda_model_ptr(model_map, offset);
-    }
 
     const char *cached = cuda_model_range_lookup_cached(model_map, offset, bytes);
     if (cached) return cached;
@@ -344,11 +387,6 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
                 (double)g_model_range_bytes / 1073741824.0);
     }
     return (const char *)dev;
-}
-
-static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
-    if (bytes == 0) return 1;
-    return cuda_model_range_lookup_cached(model_map, offset, bytes) != NULL;
 }
 
 static void cuda_q8_f16_cache_release_all(void) {
@@ -562,8 +600,7 @@ static const __half *cuda_q8_f16_ptr(
         }
     }
     if (!cuda_q8_f16_cache_allowed(label, in_dim, out_dim)) return NULL;
-    if (cuda_partial_weight_cache_enabled() && cuda_direct_model_enabled() &&
-        !cuda_model_range_is_cached(model_map, offset, weight_bytes)) {
+    if (cuda_partial_weight_cache_miss(model_map, offset, weight_bytes)) {
         return NULL;
     }
 
@@ -621,8 +658,7 @@ static float *cuda_q8_f32_ptr(
         }
     }
     if (!cuda_q8_f32_cache_allowed(label, in_dim, out_dim)) return NULL;
-    if (cuda_partial_weight_cache_enabled() && cuda_direct_model_enabled() &&
-        !cuda_model_range_is_cached(model_map, offset, weight_bytes)) {
+    if (cuda_partial_weight_cache_miss(model_map, offset, weight_bytes)) {
         return NULL;
     }
 
@@ -1220,17 +1256,17 @@ static const char *cuda_model_range_cache_device(
         const char *what) {
     if (!model_map || bytes == 0) return NULL;
     if (offset > model_size || bytes > model_size - offset) return NULL;
-    if (model_map == g_model_host_base && (g_model_device_owned || g_model_registered)) {
+    if (model_map == g_model_host_base && g_model_device_owned) {
         return cuda_model_ptr(model_map, offset);
     }
 
-    const char *cached = cuda_model_range_lookup_cached(model_map, offset, bytes);
+    const char *cached = cuda_model_range_lookup_device_cached(model_map, offset, bytes);
     if (cached) return cached;
 
     if (getenv("DS4_CUDA_NO_FD_CACHE") == NULL) {
         const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what, 0);
         if (fd_ptr) {
-            cached = cuda_model_range_lookup_cached(model_map, offset, bytes);
+            cached = cuda_model_range_lookup_device_cached(model_map, offset, bytes);
             if (cached) return cached;
         }
     }
@@ -1723,13 +1759,15 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
     if (offset > model_size || bytes > model_size - offset) return 0;
     const char *cache_label = label ? label : "model_tensor";
     const char *ptr = NULL;
-    if (cuda_partial_weight_cache_enabled() || cuda_direct_model_enabled()) {
+    const int force_device_cache = cuda_partial_weight_cache_enabled() || cuda_direct_model_enabled();
+    if (force_device_cache) {
         ptr = cuda_model_range_cache_device(model_map, model_size, offset, bytes, cache_label);
     } else {
         ptr = cuda_model_range_ptr(model_map, offset, bytes, cache_label);
     }
     if (!ptr) return 0;
-    return cuda_model_range_is_cached(model_map, offset, bytes);
+    if (force_device_cache) return cuda_model_range_is_device_cached(model_map, offset, bytes);
+    return cuda_model_range_lookup_cached(model_map, offset, bytes) != NULL;
 }
 
 extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
