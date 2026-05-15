@@ -702,7 +702,7 @@ mode with the partial weight cache:
 ```sh
 DS4_CUDA_DIRECT_MODEL=1 \
 DS4_CUDA_PARTIAL_WEIGHT_CACHE=1 \
-DS4_CUDA_WEIGHT_CACHE_LIMIT_GB=16 \
+DS4_CUDA_WEIGHT_CACHE_LIMIT_GB=10 \
 ./ds4 --cuda -p "Hello"
 ```
 
