@@ -8469,6 +8469,47 @@ static bool metal_graph_apply_directional_steering_ffn(
     return metal_graph_apply_directional_steering(g, x, il, rows, g ? g->directional_steering_ffn_scale : 0.0f);
 }
 
+static uint64_t metal_graph_kv_cache_bytes_for_context(uint32_t ctx_size, uint32_t raw_cap) {
+    uint64_t bytes = (uint64_t)DS4_N_LAYER *
+                     raw_cap *
+                     DS4_N_HEAD_DIM *
+                     sizeof(float);
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint64_t comp_cap = (uint64_t)(ctx_size / ratio + 2u);
+        bytes += comp_cap * DS4_N_HEAD_DIM * sizeof(float);
+        if (ratio == 4) {
+            bytes += comp_cap * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+        }
+    }
+    return bytes;
+}
+
+static uint64_t metal_graph_context_bytes_for_kv_policy(
+        uint32_t  ctx_size,
+        uint32_t  raw_cap,
+        uint32_t  prefill_cap,
+        uint64_t *kv_cache_bytes_out) {
+    uint32_t min_ratio = UINT32_MAX;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
+    }
+    if (min_ratio == UINT32_MAX) min_ratio = ctx_size ? ctx_size : 1u;
+    uint64_t comp_cap = (uint64_t)(ctx_size / min_ratio + 2u);
+    if (comp_cap < 2u) comp_cap = 2u;
+
+    const uint64_t kv_cache_bytes = metal_graph_kv_cache_bytes_for_context(ctx_size, raw_cap);
+    if (kv_cache_bytes_out) *kv_cache_bytes_out = kv_cache_bytes;
+    return kv_cache_bytes + 2ull * comp_cap * prefill_cap * sizeof(float);
+}
+
+static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes) {
+    return managed ? ds4_gpu_tensor_alloc_managed(bytes) : ds4_gpu_tensor_alloc(bytes);
+}
+
 /* =========================================================================
  * Metal Diagnostic Dump Hooks.
  * =========================================================================
@@ -8637,6 +8678,28 @@ static bool metal_graph_alloc_raw_cap(
         : DS4_N_INDEXER_HEAD_DIM);
     const uint64_t indexer_q_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
     const uint64_t pc = prefill_cap;
+    uint64_t kv_cache_bytes = 0;
+    const uint64_t context_bytes =
+        metal_graph_context_bytes_for_kv_policy(ctx_size, raw_cap, prefill_cap, &kv_cache_bytes);
+    const bool managed_kv_cache =
+        ds4_gpu_should_use_managed_kv_cache(kv_cache_bytes, context_bytes) != 0;
+    if (managed_kv_cache) {
+        /*
+         * CUDA device allocations are fastest, but a million-token KV cache is
+         * large enough to starve DGX Spark's unified CPU/GPU memory once the
+         * model cache and driver allocations are present.  For this one
+         * long-lived cache class, managed memory restores the old demand-paged
+         * behavior.  It can be slower, but it keeps oversized contexts from
+         * turning memory pressure into a machine-wide lockup.
+         */
+        fprintf(stderr,
+                "ds4: CUDA using managed KV cache for ctx=%u "
+                "(kv cache %.2f GiB, context buffers %.2f GiB); "
+                "this may degrade performance but is needed for very large contexts\n",
+                ctx_size,
+                (double)kv_cache_bytes / 1073741824.0,
+                (double)context_bytes / 1073741824.0);
+    }
 
     g->cur_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
     g->flat_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
@@ -8658,13 +8721,17 @@ static bool metal_graph_alloc_raw_cap(
     g->kv = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     bool state_init_ok = true;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        g->layer_raw_cache[il] = ds4_gpu_tensor_alloc((uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
+        g->layer_raw_cache[il] = metal_graph_alloc_kv_cache_tensor(
+                managed_kv_cache,
+                (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio != 0) {
             const uint32_t coff = ratio == 4 ? 2u : 1u;
             const uint64_t attn_width = (uint64_t)coff * DS4_N_HEAD_DIM;
             const uint64_t attn_rows = (uint64_t)coff * ratio;
-            g->layer_attn_comp_cache[il] = ds4_gpu_tensor_alloc((uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM * sizeof(float));
+            g->layer_attn_comp_cache[il] = metal_graph_alloc_kv_cache_tensor(
+                    managed_kv_cache,
+                    (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM * sizeof(float));
             g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
             g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
             if (enable_mtp) {
@@ -8687,7 +8754,9 @@ static bool metal_graph_alloc_raw_cap(
             if (ratio == 4) {
                 const uint64_t index_width = (uint64_t)coff * DS4_N_INDEXER_HEAD_DIM;
                 const uint64_t index_rows = (uint64_t)coff * ratio;
-                g->layer_index_comp_cache[il] = ds4_gpu_tensor_alloc((uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+                g->layer_index_comp_cache[il] = metal_graph_alloc_kv_cache_tensor(
+                        managed_kv_cache,
+                        (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
                 g->layer_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                 g->layer_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                 if (enable_mtp) {
@@ -8759,10 +8828,18 @@ static bool metal_graph_alloc_raw_cap(
         g->mtp_input_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
         g->mtp_state_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
         g->mtp_next_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-        g->mtp_raw_cache = ds4_gpu_tensor_alloc((uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
+        g->mtp_raw_cache = metal_graph_alloc_kv_cache_tensor(
+                managed_kv_cache,
+                (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
+        /* Speculative frontier shadow buffers (proof-budget MTP). The HC state
+         * shadows are small fixed-size float arrays; the spec raw_cache shadow
+         * follows the managed-kv-cache policy because it is the same shape and
+         * lifetime as the primary mtp_raw_cache. */
         g->spec_mtp_state_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
         g->spec_mtp_next_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-        g->spec_mtp_raw_cache = ds4_gpu_tensor_alloc((uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
+        g->spec_mtp_raw_cache = metal_graph_alloc_kv_cache_tensor(
+                managed_kv_cache,
+                (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
         g->spec_cur_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
         g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
         g->mtp_n_raw = 0;

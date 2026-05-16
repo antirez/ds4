@@ -99,13 +99,9 @@ class Record:
 
 
 def escape_tool_result(text: str) -> str:
-    """Match ``append_dsml_text_escaped`` for tool result bodies."""
+    """Match ``append_tool_result_text`` for tool result bodies."""
 
-    return (
-        text.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
+    return text.replace("</tool_result>", "&lt;/tool_result>")
 
 
 def escape_dsml_parameter(text: str) -> str:

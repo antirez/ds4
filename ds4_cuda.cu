@@ -1088,6 +1088,55 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     return t;
 }
 
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
+    if (bytes == 0) bytes = 1;
+    ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
+    if (!t) return NULL;
+    if (!cuda_ok(cudaMallocManaged(&t->ptr, (size_t)bytes), "managed tensor alloc")) {
+        free(t);
+        return NULL;
+    }
+    t->bytes = bytes;
+    t->owner = 1;
+    return t;
+}
+
+static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
+    const uint64_t min_reserve = 8ull * 1073741824ull;
+    const uint64_t max_reserve = 40ull * 1073741824ull;
+    uint64_t reserve = total_bytes / 4u;
+    if (reserve < min_reserve) reserve = min_reserve;
+    if (reserve > max_reserve) reserve = max_reserve;
+    return reserve;
+}
+
+extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
+    if (kv_cache_bytes == 0) return 0;
+
+    /* Very large KV caches are where device-only cudaMalloc() can make a
+     * unified-memory machine unresponsive.  Managed memory restores the old
+     * demand-paged behavior for this one long-lived allocation class only. */
+    const uint64_t huge_kv = 8ull * 1073741824ull;
+    if (kv_cache_bytes >= huge_kv) return 1;
+
+    const uint64_t large_context = 8ull * 1073741824ull;
+    if (context_bytes < large_context) return 0;
+
+    size_t free_b = 0;
+    size_t total_b = 0;
+    cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    const uint64_t free_bytes = (uint64_t)free_b;
+    const uint64_t total_bytes = (uint64_t)total_b;
+    const uint64_t reserve_bytes = cuda_managed_kv_reserve_bytes(total_bytes);
+    if (context_bytes > free_bytes) return 1;
+    return free_bytes - context_bytes < reserve_bytes;
+}
+
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
     if (!base || offset > base->bytes || bytes > base->bytes - offset) return NULL;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
