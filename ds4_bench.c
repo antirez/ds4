@@ -35,6 +35,7 @@ typedef struct {
     int gen_tokens;
     double step_mul;
     ds4_mpp_mode mpp_mode;
+    const char *dump_frontier_logits_dir;
     bool warm_weights;
     bool quality;
 } bench_config;
@@ -82,6 +83,8 @@ static void usage(FILE *fp) {
         "\n"
         "Output:\n"
         "  --csv FILE             Write CSV there instead of stdout.\n"
+        "  --dump-frontier-logits-dir DIR\n"
+        "      Write one full-logit JSON file per measured frontier. DIR must exist.\n"
         "  -h, --help             Show this help.\n");
 }
 
@@ -220,6 +223,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.gen_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--csv")) {
             c.csv_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
+            c.dump_frontier_logits_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--backend")) {
@@ -269,6 +274,103 @@ static bench_config parse_options(int argc, char **argv) {
         exit(2);
     }
     return c;
+}
+
+static void json_write_string(FILE *fp, const char *s) {
+    fputc('"', fp);
+    if (s) {
+        for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+            switch (*p) {
+            case '"':  fputs("\\\"", fp); break;
+            case '\\': fputs("\\\\", fp); break;
+            case '\b': fputs("\\b", fp); break;
+            case '\f': fputs("\\f", fp); break;
+            case '\n': fputs("\\n", fp); break;
+            case '\r': fputs("\\r", fp); break;
+            case '\t': fputs("\\t", fp); break;
+            default:
+                if (*p < 0x20) fprintf(fp, "\\u%04x", (unsigned)*p);
+                else fputc((char)*p, fp);
+                break;
+            }
+        }
+    }
+    fputc('"', fp);
+}
+
+static int write_frontier_logits_json(
+        const bench_config *cfg,
+        ds4_engine         *engine,
+        ds4_session        *session,
+        int                 frontier,
+        int                 previous) {
+    if (!cfg->dump_frontier_logits_dir) return 0;
+
+    const int vocab = ds4_engine_vocab_size(engine);
+    float *logits = malloc((size_t)vocab * sizeof(logits[0]));
+    if (!logits) {
+        fprintf(stderr, "ds4-bench: out of memory copying frontier logits\n");
+        return 1;
+    }
+    if (ds4_session_copy_logits(session, logits, vocab) != vocab) {
+        fprintf(stderr, "ds4-bench: failed to copy frontier logits at %d\n", frontier);
+        free(logits);
+        return 1;
+    }
+
+    char path[PATH_MAX];
+    const int n = snprintf(path,
+                           sizeof(path),
+                           "%s/frontier_%06d.logits.json",
+                           cfg->dump_frontier_logits_dir,
+                           frontier);
+    if (n <= 0 || (size_t)n >= sizeof(path)) {
+        fprintf(stderr, "ds4-bench: frontier logits path is too long\n");
+        free(logits);
+        return 1;
+    }
+
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "ds4-bench: failed to open %s: %s\n", path, strerror(errno));
+        free(logits);
+        return 1;
+    }
+
+    const int argmax = ds4_session_argmax(session);
+    fprintf(fp, "{\n  \"source\":\"ds4-bench\",\n  \"model\":");
+    json_write_string(fp, cfg->model_path);
+    fprintf(fp,
+            ",\n  \"backend\":\"%s\",\n  \"mt\":\"%s\",\n  \"quality\":%s,\n"
+            "  \"quant_bits\":%d,\n  \"prompt_tokens\":%d,\n"
+            "  \"frontier_tokens\":%d,\n  \"prefill_tokens\":%d,\n"
+            "  \"ctx\":%d,\n  \"vocab\":%d,\n"
+            "  \"argmax_id\":%d,\n  \"argmax_logit\":%.9g,\n  \"logits\":[",
+            ds4_backend_name(cfg->backend),
+            ds4_mpp_mode_name(cfg->mpp_mode),
+            cfg->quality ? "true" : "false",
+            ds4_engine_routed_quant_bits(engine),
+            frontier,
+            frontier,
+            frontier - previous,
+            cfg->ctx_alloc,
+            vocab,
+            argmax,
+            logits[argmax]);
+    for (int i = 0; i < vocab; i++) {
+        if (i) fputc(',', fp);
+        if ((i % 8) == 0) fputs("\n    ", fp);
+        if (isfinite(logits[i])) fprintf(fp, "%.9g", logits[i]);
+        else fputs("null", fp);
+    }
+    fputs("\n  ]\n}\n", fp);
+    if (fclose(fp) != 0) {
+        fprintf(stderr, "ds4-bench: failed to close %s\n", path);
+        free(logits);
+        return 1;
+    }
+    free(logits);
+    return 0;
 }
 
 static int next_frontier(const bench_config *c, int cur) {
@@ -376,6 +478,11 @@ int main(int argc, char **argv) {
         const double prefill_t1 = bench_now_sec();
         const double prefill_sec = prefill_t1 - prefill_t0;
         const int prefill_tokens = frontier - previous;
+
+        if (write_frontier_logits_json(&cfg, engine, session, frontier, previous) != 0) {
+            rc = 1;
+            break;
+        }
 
         if (ds4_session_save_snapshot(session, &snap, err, sizeof(err)) != 0) {
             fprintf(stderr, "ds4-bench: snapshot at %d failed: %s\n", frontier, err);
