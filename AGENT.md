@@ -113,9 +113,8 @@ to opt in to the newer paths.
   range 0-8.  0 disables (same as `DS4_CUDA_NO_MMVQ_DECODE=1` for the
   MoE path).  Values 2-8 extend mmvq coverage to short-prefill batches
   but require n_tokens * n_expert_used &le; 8 for the down matmul.
-- `DS4_CUDA_MOE_GRAPHS` (default ON after 2026-05-16 determinism
-  validation - 10/10 greedy decode runs bit-identical to graphs-off
-  baseline): CUDA Graph capture+replay for the mmvq routed-MoE decode
+- `DS4_CUDA_MOE_GRAPHS` (**default OFF as of 2026-05-16-rev; previously
+  default ON**): CUDA Graph capture+replay for the mmvq routed-MoE decode
   block and (Step 8.2) for the n_tok=1 dense Q8_0 vec path used by
   attention projections.  Each kernel sequence is captured into a
   `cudaGraphExec_t` on first execution with a given
@@ -130,8 +129,20 @@ to opt in to the newer paths.
   `cudaMallocAsync` through the same stream via the thread-local
   `ds4_pool_set_stream()` so allocations don't invalidate capture.
   Each cache slot falls through cleanly to the un-captured path on
-  any capture error.  Opt-out: `DS4_CUDA_MOE_GRAPHS=0` (or `off`,
-  `no`, `false`).
+  any capture error.
+  
+  **Why default OFF:**  The original default-ON flip was validated only
+  by 10/10 bit-identical greedy decode against the graphs-OFF baseline
+  on the same branch.  That gate proves self-determinism but does NOT
+  prove exact-byte equivalence vs the legacy path
+  (`DS4_CUDA_USE_MMQ=0`).  External proof-harness validation on
+  GB10/Spark in May 2026 observed gross output corruption on a 32-token
+  smoke with graphs ON that disappears with graphs OFF, implying an
+  undeclared cross-stream dependency in the captured region (likely a
+  pool-allocated buffer touched by an uncaptured kernel on stream=0).
+  Re-enabling graphs as the default requires root-causing and fixing
+  that hazard.  Opt-in for experiments:  `DS4_CUDA_MOE_GRAPHS=1`
+  (or `on` / `yes` / `true`).
 
 ## Testing
 

@@ -6765,21 +6765,29 @@ static cudaStream_t ds4_cuda_moe_stream(void) {
 }
 
 static int ds4_cuda_moe_graphs_enabled(void) {
-    /* Default ON after determinism validation (10/10 greedy decode runs
-     * bit-identical vs graphs OFF, 2026-05-16).  Opt-out:
-     *   DS4_CUDA_MOE_GRAPHS=0  (or off / no / false) */
+    /* Default OFF as of 2026-05-16-rev: the earlier "10/10 bit-identical"
+     * validation only proved determinism vs the graphs-OFF baseline on the
+     * same branch.  It did NOT prove exact-byte equivalence vs the legacy
+     * path (DS4_CUDA_USE_MMQ=0).  External proof-harness validation on
+     * GB10/Spark observed gross output corruption on a 32-token smoke with
+     * graphs ON that disappears with graphs OFF, implying an undeclared
+     * cross-stream dependency in the captured region.  Re-enabling graphs
+     * requires bisecting that hazard (see local/docs).  Until then:
+     *   default: OFF
+     *   opt-in:  DS4_CUDA_MOE_GRAPHS=1  (or on / yes / true) */
     static int init = 0;
-    static int enabled = 1;
+    static int enabled = 0;
     if (!init) {
         init = 1;
         const char *s = getenv("DS4_CUDA_MOE_GRAPHS");
         if (s && *s &&
-            (strcmp(s, "0") == 0 ||
-             strcmp(s, "off") == 0 || strcmp(s, "OFF") == 0 ||
-             strcmp(s, "no") == 0 || strcmp(s, "NO") == 0 ||
-             strcmp(s, "false") == 0 || strcmp(s, "FALSE") == 0)) {
-            enabled = 0;
-            fprintf(stderr, "ds4: DS4_CUDA_MOE_GRAPHS=%s - graph capture disabled\n", s);
+            (strcmp(s, "1") == 0 ||
+             strcmp(s, "on") == 0 || strcmp(s, "ON") == 0 ||
+             strcmp(s, "yes") == 0 || strcmp(s, "YES") == 0 ||
+             strcmp(s, "true") == 0 || strcmp(s, "TRUE") == 0)) {
+            enabled = 1;
+            fprintf(stderr, "ds4: DS4_CUDA_MOE_GRAPHS=%s - graph capture enabled (experimental; "
+                            "may diverge from legacy decoded output)\n", s);
         }
     }
     return enabled;
