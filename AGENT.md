@@ -149,3 +149,54 @@ to opt in to the newer paths.
 Use `make` for build validation. Use `make test` for unit/regression tests when a
 model and Metal are available. Use live server tests only when intentionally
 testing the API surface.
+
+### Multi-process testing with the weight server
+
+For any test that spawns more than one `ds4` process against the same model
+- the proof harness (`tests/ds4_proof.py`)
+- multi-profile bench sweeps
+- MTP correctness work (loads base + MTP gguf into the same device)
+
+use the `ds4_weight_server` to share weights via CUDA VMM or IPC.  Without it,
+each process pays the full base-model upload cost (~67 s for V4 Flash Q2 on
+PRO 6000) and an MTP gguf alongside the base may OOM due to single-allocation
+fragmentation even when total free VRAM is sufficient.
+
+Two patterns:
+
+**Proof harness (recommended)** — let the harness manage lifecycle:
+```
+python3 tests/ds4_proof.py --plan PLAN.json --bin ./ds4 --base ds4flash.gguf \
+    --start-weight-server --weight-server-bin ./ds4_weight_server \
+    --weight-server-backend vmm --weight-server-scope base|mtp|both \
+    --weight-server-reserve-gb 8 \
+    --weight-server-manifest /tmp/ws_manifest.json
+```
+
+**Standalone** — long-lived server + multiple clients:
+```
+# launch (background; writes manifest when ready)
+./ds4_weight_server --base ds4flash.gguf --mtp gguf/...-MTP-*.gguf \
+    --manifest /tmp/ws_manifest.json --backend vmm --scope both \
+    --reserve-gb 8 &
+
+# every client process
+DS4_CUDA_WEIGHT_IPC_MANIFEST=/tmp/ws_manifest.json ./ds4-bench ...
+DS4_CUDA_WEIGHT_IPC_MANIFEST=/tmp/ws_manifest.json ./ds4 ...
+```
+
+Notes:
+- `--reserve-gb` must leave room for context buffers + transient allocs.
+  Empirically on PRO 6000 (96 GiB total, ~80.8 GiB model): `8` works,
+  `12` fails preflight.  On Spark / GB10 (128 GiB) the analyst-validated
+  setting is `--reserve-gb 24`.
+- `--backend vmm` uses CUDA managed memory and is the post-2026-05-16
+  default; `ipc` is the older path.
+- `--scope` controls which weights to upload: `base`, `mtp`, or `both`.
+  Use `base` for non-MTP work to save VRAM.
+- If the server crashed mid-run, clean up
+  `/tmp/ds4_weight_server_cuda*.lock` and any lingering processes
+  (`pkill -9 -f ds4_weight_server`) before retrying.
+- For a single one-shot `./ds4 -p ...` invocation the load cost is
+  amortized over generation and the weight server is not worth setting
+  up; use it for repeatable bench/proof workflows.
