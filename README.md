@@ -154,16 +154,22 @@ slight speedup, not a meaningful generation-speed win.
 Then build:
 
 ```sh
+# POSIX (macOS + Linux): use the Makefile
 make                  # macOS Metal
 make cuda-spark       # Linux CUDA, DGX Spark / GB10
 make cuda-generic     # Linux CUDA, other local CUDA GPUs
 make cpu              # CPU-only diagnostics build
+
+# Windows: use CMake + MSVC + CUDA (builds ds4-server, ds4-bench, ds4-eval)
+cmake -B build -G "Visual Studio 17 2022" -A x64 ^
+      -DCMAKE_CUDA_ARCHITECTURES=120
+cmake --build build --config Release
 ```
 
-On Windows the build uses CMake + MSVC + CUDA instead of the Makefile, and
-currently produces `ds4-server`, `ds4-bench`, and `ds4-eval` only. See the
-[Windows port (CUDA)](#windows-port-cuda) section below for the exact command
-and prerequisites.
+The Windows build requires Visual Studio 2022, CUDA Toolkit ≥ 12.8, CMake ≥
+3.24, and Windows 10 build 19041 or newer; the interactive `ds4` CLI is not
+yet built on Windows. See [Windows port (CUDA)](#windows-port-cuda) below for
+the full prerequisites and current limitations.
 
 `./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
