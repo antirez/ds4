@@ -136,8 +136,28 @@ struct cuda_model_arena {
     uint64_t used;
 };
 
+struct cuda_q8_f16_range {
+    const void *host_base;
+    uint64_t offset;
+    uint64_t weight_bytes;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    __half *device_ptr;
+};
+
+struct cuda_q8_f32_range {
+    const void *host_base;
+    uint64_t offset;
+    uint64_t weight_bytes;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    float *device_ptr;
+};
+
 enum cuda_derived_kind {
     CUDA_DERIVED_Q8_0_ROW_GROUP_NORMS = 1,
+    CUDA_DERIVED_Q8_0_F16_COLMAJOR = 2,
+    CUDA_DERIVED_Q8_0_F32_COLMAJOR = 3,
 };
 
 struct cuda_derived_range {
@@ -160,9 +180,17 @@ struct cuda_derived_range {
 static std::vector<cuda_model_range> g_model_ranges;
 static std::vector<cuda_model_arena> g_model_arenas;
 static std::unordered_map<uint64_t, size_t> g_model_range_by_offset;
+static std::vector<cuda_q8_f16_range> g_q8_f16_ranges;
+static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
+static std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
+static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
 static std::vector<cuda_derived_range> g_derived_ranges;
 static uint64_t g_model_range_bytes;
 static uint64_t g_derived_range_bytes;
+static uint64_t g_q8_f16_bytes;
+static uint64_t g_q8_f32_bytes;
+static int g_q8_f16_disabled_after_oom;
+static int g_q8_f16_budget_notice_printed;
 static uint64_t g_model_load_progress_next;
 static double g_model_load_progress_last;
 static int g_model_load_progress_started;
@@ -180,6 +208,18 @@ static const char *cuda_model_range_ptr_from_fd(
         uint64_t offset,
         uint64_t bytes,
         const char *what);
+__global__ static void dequant_q8_0_to_f16_kernel(
+        __half *out,
+        const unsigned char *w,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks);
+__global__ static void dequant_q8_0_to_f32_kernel(
+        float *out,
+        const unsigned char *w,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks);
 
 static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
@@ -381,6 +421,177 @@ static char *cuda_derived_weight_ptr(
     return NULL;
 }
 
+static void cuda_q8_f16_cache_release_all(void) {
+    for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
+        (void)cudaFree(r.device_ptr);
+    }
+    g_q8_f16_ranges.clear();
+    g_q8_f16_by_offset.clear();
+    g_q8_f16_bytes = 0;
+}
+
+static uint64_t cuda_parse_mib_env(const char *name, int *present) {
+    const char *env = getenv(name);
+    if (present) *present = 0;
+    if (!env || !env[0]) return 0;
+    char *end = NULL;
+    unsigned long long v = strtoull(env, &end, 10);
+    if (end == env || *end != '\0') return 0;
+    if (present) *present = 1;
+    if (v > UINT64_MAX / 1048576ull) return UINT64_MAX;
+    return (uint64_t)v * 1048576ull;
+}
+
+static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
+    int present = 0;
+    const uint64_t limit = cuda_parse_mib_env("DS4_CUDA_Q8_F16_CACHE_MB", &present);
+    return present ? limit : UINT64_MAX;
+}
+
+static uint64_t cuda_q8_f16_cache_reserve_bytes(uint64_t total_bytes) {
+    int present = 0;
+    const uint64_t reserve = cuda_parse_mib_env("DS4_CUDA_Q8_F16_CACHE_RESERVE_MB", &present);
+    if (present) return reserve;
+
+    if (total_bytes >= 112ull * 1024ull * 1024ull * 1024ull) {
+        return 512ull * 1048576ull;
+    }
+
+    /* The expanded Q8->F16 cache is only an acceleration path.  Keep enough
+     * device memory free for cuBLAS workspaces, transient graph buffers, and
+     * driver bookkeeping instead of letting optional cached weights consume the
+     * last few GiB on 96 GiB cards. */
+    const uint64_t min_reserve = 4096ull * 1048576ull;
+    const uint64_t pct_reserve = total_bytes / 20u; /* 5% */
+    return pct_reserve > min_reserve ? pct_reserve : min_reserve;
+}
+
+static void cuda_q8_f16_cache_budget_notice(
+        const char *reason,
+        uint64_t request_bytes,
+        uint64_t free_bytes,
+        uint64_t total_bytes,
+        uint64_t reserve_bytes,
+        uint64_t limit_bytes) {
+    if (g_q8_f16_budget_notice_printed && getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") == NULL) return;
+    g_q8_f16_budget_notice_printed = 1;
+    if (limit_bytes != UINT64_MAX && free_bytes == 0 && total_bytes == 0 && reserve_bytes == 0) {
+        fprintf(stderr,
+                "ds4: CUDA q8 fp16 cache %s; using q8 kernels "
+                "(request=%.2f MiB cached=%.2f GiB limit=%.2f GiB)\n",
+                reason,
+                (double)request_bytes / 1048576.0,
+                (double)g_q8_f16_bytes / 1073741824.0,
+                (double)limit_bytes / 1073741824.0);
+    } else if (limit_bytes == UINT64_MAX) {
+        fprintf(stderr,
+                "ds4: CUDA q8 fp16 cache %s; using q8 kernels "
+                "(request=%.2f MiB cached=%.2f GiB free=%.2f GiB reserve=%.2f GiB total=%.2f GiB)\n",
+                reason,
+                (double)request_bytes / 1048576.0,
+                (double)g_q8_f16_bytes / 1073741824.0,
+                (double)free_bytes / 1073741824.0,
+                (double)reserve_bytes / 1073741824.0,
+                (double)total_bytes / 1073741824.0);
+    } else {
+        fprintf(stderr,
+                "ds4: CUDA q8 fp16 cache %s; using q8 kernels "
+                "(request=%.2f MiB cached=%.2f GiB limit=%.2f GiB free=%.2f GiB reserve=%.2f GiB total=%.2f GiB)\n",
+                reason,
+                (double)request_bytes / 1048576.0,
+                (double)g_q8_f16_bytes / 1073741824.0,
+                (double)limit_bytes / 1073741824.0,
+                (double)free_bytes / 1073741824.0,
+                (double)reserve_bytes / 1073741824.0,
+                (double)total_bytes / 1073741824.0);
+    }
+}
+
+static int cuda_q8_f16_cache_has_budget(uint64_t request_bytes, const char *label) {
+    (void)label;
+    const uint64_t limit = cuda_q8_f16_cache_limit_bytes();
+    if (limit == 0) return 0;
+    if (g_q8_f16_bytes > limit || request_bytes > limit - g_q8_f16_bytes) {
+        cuda_q8_f16_cache_budget_notice("limit reached", request_bytes, 0, 0, 0, limit);
+        return 0;
+    }
+
+    size_t free_b = 0;
+    size_t total_b = 0;
+    cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA q8 fp16 cache memory query failed: %s; using q8 kernels\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    const uint64_t free_bytes = (uint64_t)free_b;
+    const uint64_t total_bytes = (uint64_t)total_b;
+    const uint64_t reserve_bytes = cuda_q8_f16_cache_reserve_bytes(total_bytes);
+    if (request_bytes > free_bytes ||
+        free_bytes - request_bytes < reserve_bytes) {
+        cuda_q8_f16_cache_budget_notice("budget exhausted", request_bytes,
+                                        free_bytes, total_bytes,
+                                        reserve_bytes, limit);
+        return 0;
+    }
+    return 1;
+}
+
+static void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t request_bytes) {
+    if (!g_q8_f16_disabled_after_oom) {
+        fprintf(stderr,
+                "ds4: CUDA q8 fp16 cache disabled after %s "
+                "(request=%.2f MiB cached=%.2f GiB); using q8 kernels\n",
+                what ? what : "allocation failure",
+                (double)request_bytes / 1048576.0,
+                (double)g_q8_f16_bytes / 1073741824.0);
+    }
+    g_q8_f16_disabled_after_oom = 1;
+    if (!g_q8_f16_ranges.empty()) {
+        (void)cudaDeviceSynchronize();
+        cuda_q8_f16_cache_release_all();
+    }
+    (void)cudaGetLastError();
+}
+
+static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
+    if (g_quality_mode) return 0;
+    if (g_q8_f16_disabled_after_oom) return 0;
+    if (getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL) return 0;
+    if (cuda_q8_f16_cache_limit_bytes() == 0) return 0;
+    if (getenv("DS4_CUDA_Q8_F16_ALL") != NULL) return 1;
+    if (!label) return 0;
+    if (strstr(label, "attn_output_a") != NULL ||
+        strstr(label, "attn_output_b") != NULL ||
+        strstr(label, "attention_output_a") != NULL ||
+        strstr(label, "attention_output_b") != NULL) {
+        return getenv("DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE") == NULL;
+    }
+    if (strstr(label, "attn_q_b") != NULL) {
+        return getenv("DS4_CUDA_NO_ATTN_Q_B_F16_CACHE") == NULL;
+    }
+    if (strstr(label, "ffn_gate_shexp") != NULL ||
+        strstr(label, "ffn_up_shexp") != NULL ||
+        strstr(label, "ffn_down_shexp") != NULL) {
+        return 1;
+    }
+    return (in_dim == 4096u && out_dim == 2048u) ||
+           (in_dim == 2048u && out_dim == 4096u) ||
+           (in_dim == 4096u && out_dim == 1024u) ||
+           (in_dim == 4096u && out_dim == 512u) ||
+           (getenv("DS4_CUDA_NO_ATTN_Q_B_F16_CACHE") == NULL &&
+            in_dim == 1024u && out_dim == 32768u);
+}
+
+static int cuda_q8_label_is_attention_output(const char *label) {
+    return label &&
+           (strstr(label, "attn_output_a") != NULL ||
+            strstr(label, "attn_output_b") != NULL ||
+            strstr(label, "attention_output_a") != NULL ||
+            strstr(label, "attention_output_b") != NULL);
+}
 
 static int cuda_q8_label_is_attention_output_b(const char *label) {
     return label &&
@@ -392,6 +603,151 @@ static int cuda_q8_use_dp4a(void) {
     return getenv("DS4_CUDA_NO_Q8_DP4A") == NULL;
 }
 
+static int cuda_q8_f16_preload_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
+    if (cuda_q8_label_is_attention_output(label) &&
+        getenv("DS4_CUDA_ATTENTION_OUTPUT_PRELOAD") == NULL &&
+        getenv("DS4_CUDA_Q8_F16_ALL") == NULL) {
+        return 0;
+    }
+    return cuda_q8_f16_cache_allowed(label, in_dim, out_dim);
+}
+
+static int cuda_q8_f32_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
+    if (getenv("DS4_CUDA_NO_Q8_F32_CACHE") != NULL) return 0;
+    if (getenv("DS4_CUDA_Q8_F32_ALL") != NULL) return 1;
+    if (label && strstr(label, "attn_q_b") != NULL) {
+        return getenv("DS4_CUDA_ATTN_Q_B_F32_CACHE") != NULL;
+    }
+    return getenv("DS4_CUDA_Q8_F32_LARGE") != NULL &&
+           in_dim == 1024u && out_dim == 32768u;
+}
+
+static const __half *cuda_q8_f16_ptr(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t weight_bytes,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const char *label) {
+    auto exact = g_q8_f16_by_offset.find(offset);
+    if (exact != g_q8_f16_by_offset.end()) {
+        const cuda_q8_f16_range &r = g_q8_f16_ranges[exact->second];
+        if (r.host_base == model_map && r.weight_bytes == weight_bytes &&
+            r.in_dim == in_dim && r.out_dim == out_dim) {
+            return r.device_ptr;
+        }
+    }
+    if (!cuda_q8_f16_cache_allowed(label, in_dim, out_dim)) return NULL;
+    if (in_dim != 0 && out_dim > UINT64_MAX / in_dim / sizeof(__half)) return NULL;
+    const uint64_t out_bytes = in_dim * out_dim * sizeof(__half);
+    char *derived = cuda_derived_weight_ptr(model_map,
+                                            offset,
+                                            weight_bytes,
+                                            CUDA_DERIVED_Q8_0_F16_COLMAJOR,
+                                            in_dim,
+                                            out_dim,
+                                            0,
+                                            out_bytes,
+                                            label ? label : "q8_0_f16");
+    if (derived) return (const __half *)derived;
+
+    const char *q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, "q8_0");
+    if (!q8) return NULL;
+
+    if (!cuda_q8_f16_cache_has_budget(out_bytes, label)) return NULL;
+
+    __half *dev = NULL;
+    cudaError_t err = cudaMalloc(&dev, (size_t)out_bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA q8 fp16 cache alloc failed (%.2f MiB): %s\n",
+                (double)out_bytes / 1048576.0, cudaGetErrorString(err));
+        cuda_q8_f16_cache_disable_after_failure("allocation failure", out_bytes);
+        return NULL;
+    }
+    const uint64_t blocks = (in_dim + 31) / 32;
+    const uint64_t n = in_dim * out_dim;
+    dequant_q8_0_to_f16_kernel<<<(n + 255) / 256, 256>>>(dev,
+                                                          (const unsigned char *)q8,
+                                                          in_dim,
+                                                          out_dim,
+                                                          blocks);
+    if (!cuda_ok(cudaGetLastError(), "q8 fp16 dequant launch")) {
+        (void)cudaFree(dev);
+        cuda_q8_f16_cache_disable_after_failure("dequant launch failure", out_bytes);
+        return NULL;
+    }
+    g_q8_f16_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev});
+    g_q8_f16_by_offset[offset] = g_q8_f16_ranges.size() - 1u;
+    g_q8_f16_bytes += out_bytes;
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+        fprintf(stderr, "ds4: CUDA cached q8 fp16 %.2f MiB (total %.2f GiB)\n",
+                (double)out_bytes / 1048576.0,
+                (double)g_q8_f16_bytes / 1073741824.0);
+    }
+    return dev;
+}
+
+static float *cuda_q8_f32_ptr(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t weight_bytes,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const char *label) {
+    auto exact = g_q8_f32_by_offset.find(offset);
+    if (exact != g_q8_f32_by_offset.end()) {
+        const cuda_q8_f32_range &r = g_q8_f32_ranges[exact->second];
+        if (r.host_base == model_map && r.weight_bytes == weight_bytes &&
+            r.in_dim == in_dim && r.out_dim == out_dim) {
+            return r.device_ptr;
+        }
+    }
+    if (!cuda_q8_f32_cache_allowed(label, in_dim, out_dim)) return NULL;
+    if (in_dim != 0 && out_dim > UINT64_MAX / in_dim / sizeof(float)) return NULL;
+    const uint64_t out_bytes = in_dim * out_dim * sizeof(float);
+    char *derived = cuda_derived_weight_ptr(model_map,
+                                            offset,
+                                            weight_bytes,
+                                            CUDA_DERIVED_Q8_0_F32_COLMAJOR,
+                                            in_dim,
+                                            out_dim,
+                                            0,
+                                            out_bytes,
+                                            label ? label : "q8_0_f32");
+    if (derived) return (float *)derived;
+
+    const char *q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, label ? label : "q8_0");
+    if (!q8) return NULL;
+
+    float *dev = NULL;
+    cudaError_t err = cudaMalloc(&dev, (size_t)out_bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA q8 fp32 cache alloc failed (%.2f MiB): %s\n",
+                (double)out_bytes / 1048576.0, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    const uint64_t blocks = (in_dim + 31) / 32;
+    const uint64_t n = in_dim * out_dim;
+    dequant_q8_0_to_f32_kernel<<<(n + 255) / 256, 256>>>(dev,
+                                                          (const unsigned char *)q8,
+                                                          in_dim,
+                                                          out_dim,
+                                                          blocks);
+    if (!cuda_ok(cudaGetLastError(), "q8 fp32 dequant launch")) {
+        (void)cudaFree(dev);
+        return NULL;
+    }
+    g_q8_f32_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev});
+    g_q8_f32_by_offset[offset] = g_q8_f32_ranges.size() - 1u;
+    g_q8_f32_bytes += out_bytes;
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+        fprintf(stderr, "ds4: CUDA cached q8 fp32 %.2f MiB (total %.2f GiB)\n",
+                (double)out_bytes / 1048576.0,
+                (double)g_q8_f32_bytes / 1073741824.0);
+    }
+    return dev;
+}
 
 static int cuda_ok(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
@@ -1025,6 +1381,15 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_cublas = NULL;
     }
     cuda_model_range_release_all();
+    cuda_q8_f16_cache_release_all();
+    g_q8_f16_disabled_after_oom = 0;
+    g_q8_f16_budget_notice_printed = 0;
+    for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
+        (void)cudaFree(r.device_ptr);
+    }
+    g_q8_f32_ranges.clear();
+    g_q8_f32_by_offset.clear();
+    g_q8_f32_bytes = 0;
     if (g_cuda_tmp) {
         (void)cudaFree(g_cuda_tmp);
         g_cuda_tmp = NULL;
@@ -1204,6 +1569,15 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
     cuda_model_range_release_all();
+    cuda_q8_f16_cache_release_all();
+    g_q8_f16_disabled_after_oom = 0;
+    g_q8_f16_budget_notice_printed = 0;
+    for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
+        (void)cudaFree(r.device_ptr);
+    }
+    g_q8_f32_ranges.clear();
+    g_q8_f32_by_offset.clear();
+    g_q8_f32_bytes = 0;
     if (g_model_device_owned && g_model_device_base) {
         (void)cudaFree((void *)g_model_device_base);
         g_model_device_owned = 0;
@@ -1959,6 +2333,24 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
     if (offset > model_size || bytes > model_size - offset) return 0;
     if (!cuda_model_range_ptr(model_map, offset, bytes, label ? label : "model_tensor")) return 0;
     return cuda_model_range_is_cached(model_map, offset, bytes);
+}
+
+extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
+    if (!model_map || bytes == 0) return 1;
+    if (offset > model_size || bytes > model_size - offset) return 0;
+    static int optional_q8_preload_disabled = 0;
+    if (optional_q8_preload_disabled) return 1;
+    const char *cache_label = label ? label : "q8_0";
+    if (getenv("DS4_CUDA_Q8_F32_PRELOAD") != NULL &&
+        cuda_q8_f32_cache_allowed(cache_label, in_dim, out_dim)) {
+        if (cuda_q8_f32_ptr(model_map, offset, bytes, in_dim, out_dim, cache_label)) return 1;
+        optional_q8_preload_disabled = 1;
+        return 1;
+    }
+    if (!cuda_q8_f16_preload_allowed(cache_label, in_dim, out_dim)) return 1;
+    if (cuda_q8_f16_ptr(model_map, offset, bytes, in_dim, out_dim, cache_label)) return 1;
+    optional_q8_preload_disabled = 1;
+    return 1;
 }
 
 extern "C" void ds4_gpu_print_memory_report(const char *label) {
@@ -3036,6 +3428,44 @@ __global__ static void matmul_q8_0_preq_n2_warp8_kernel(
     }
 }
 
+__global__ static void dequant_q8_0_to_f16_kernel(
+        __half *out,
+        const unsigned char *w,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n = in_dim * out_dim;
+    if (gid >= n) return;
+    uint64_t row = gid / in_dim;
+    uint64_t i = gid - row * in_dim;
+    uint64_t b = i / 32;
+    uint64_t j = i - b * 32;
+    const unsigned char *blk = w + (row * blocks + b) * 34;
+    const __half scale = *(const __half *)blk;
+    const int8_t q = *(const int8_t *)(blk + 2 + j);
+    out[gid] = __hmul(scale, __float2half((float)q));
+}
+
+__global__ static void dequant_q8_0_to_f32_kernel(
+        float *out,
+        const unsigned char *w,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n = in_dim * out_dim;
+    if (gid >= n) return;
+    uint64_t row = gid / in_dim;
+    uint64_t i = gid - row * in_dim;
+    uint64_t b = i / 32;
+    uint64_t j = i - b * 32;
+    const unsigned char *blk = w + (row * blocks + b) * 34;
+    const float scale = __half2float(*(const __half *)blk);
+    const int8_t q = *(const int8_t *)(blk + 2 + j);
+    out[gid] = scale * (float)q;
+}
+
 __global__ static void grouped_q8_0_a_preq_warp8_kernel(
         float *low,
         const unsigned char *w,
@@ -3670,6 +4100,22 @@ __global__ static void attention_prefill_unpack_heads_kernel(
     uint32_t h = q % n_head;
     uint32_t t = q / n_head;
     heads[gid] = tmp[((uint64_t)h * n_tokens + t) * head_dim + d];
+}
+
+__global__ static void attention_pack_group_heads_f16_kernel(
+        __half *dst,
+        const float *heads,
+        uint32_t n_tokens,
+        uint32_t n_groups,
+        uint32_t group_dim) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n = (uint64_t)n_groups * n_tokens * group_dim;
+    if (gid >= n) return;
+    uint32_t d = gid % group_dim;
+    uint64_t q = gid / group_dim;
+    uint32_t t = q % n_tokens;
+    uint32_t g = q / n_tokens;
+    dst[gid] = __float2half(heads[((uint64_t)t * n_groups + g) * group_dim + d]);
 }
 
 __global__ static void attention_decode_mixed_kernel(
@@ -6683,9 +7129,9 @@ extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
  * semantics.
  *
  * DS4_CUDA_USE_MMQ env var kill switch: set to "0" (or "off" / "false" /
- * "no") to disable and revert to the native Q8 warp kernels
- * (matmul_q8_0_preq_*_kernel family).  Any other value, or unset, leaves
- * mmq on.  Cached on first use. */
+ * "no") to disable and revert to the legacy cuda_q8_f16_ptr +
+ * cublasGemmEx pipeline.  Any other value, or unset, leaves mmq on.
+ * Cached on first use. */
 static int g_ds4_use_mmq_init = 0;
 static int g_ds4_use_mmq = 0;
 /* -----------------------------------------------------------------------
@@ -7041,13 +7487,71 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 rc, label ? label : "", (unsigned long long)in_dim, (unsigned long long)out_dim, (unsigned long long)n_tok);
     }
 
-    /* proof-budget MTP diagnostic: at n_tok=2, set DS4_CUDA_Q8_N2_WARP8 to
-     * force the n2 warp8 kernel over the default warp8-batch path.  Used to
-     * isolate exact-decode2 vs batched-prefill quantization differences. */
+    const int force_native_attention_output_b =
+        cuda_q8_label_is_attention_output_b(label) &&
+        n_tok == 2 &&
+        g_attention_output_b_n2_q8_override;
     const int force_n2_warp8 =
         n_tok == 2 &&
         getenv("DS4_CUDA_Q8_N2_WARP8") != NULL;
-
+    if (g_cublas_ready && n_tok > 1 && !force_native_attention_output_b && !force_n2_warp8) {
+        const float *w_f32 = cuda_q8_f32_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
+        if (w_f32) {
+            const float alpha = 1.0f;
+            const float beta = 0.0f;
+            cublasStatus_t st = cublasSgemm(g_cublas,
+                                            CUBLAS_OP_T,
+                                            CUBLAS_OP_N,
+                                            (int)out_dim,
+                                            (int)n_tok,
+                                            (int)in_dim,
+                                            &alpha,
+                                            w_f32,
+                                            (int)in_dim,
+                                            (const float *)x->ptr,
+                                            (int)in_dim,
+                                            &beta,
+                                            (float *)out->ptr,
+                                            (int)out_dim);
+            return cublas_ok(st, "q8 fp32 matmul");
+        }
+        const __half *w_f16 = cuda_q8_f16_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
+        if (w_f16) {
+            const uint64_t xh_count = n_tok * in_dim;
+            __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "q8 f16 gemm activations");
+            if (!xh) return 0;
+            f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
+            if (!cuda_ok(cudaGetLastError(), "q8 f16 activation convert launch")) return 0;
+            const float alpha = 1.0f;
+            const float beta = 0.0f;
+            cublasStatus_t st = cublasGemmEx(g_cublas,
+                                             CUBLAS_OP_T,
+                                             CUBLAS_OP_N,
+                                             (int)out_dim,
+                                             (int)n_tok,
+                                             (int)in_dim,
+                                             &alpha,
+                                             w_f16,
+                                             CUDA_R_16F,
+                                             (int)in_dim,
+                                             xh,
+                                             CUDA_R_16F,
+                                             (int)in_dim,
+                                             &beta,
+                                             out->ptr,
+                                             CUDA_R_32F,
+                                             (int)out_dim,
+                                             CUDA_R_32F,
+                                             CUBLAS_GEMM_DEFAULT);
+            if (st == CUBLAS_STATUS_SUCCESS) return 1;
+            fprintf(stderr, "ds4: cuBLAS q8 f16 matmul failed: status %d\n", (int)st);
+            cuda_q8_f16_cache_disable_after_failure("cuBLAS f16 matmul failure",
+                                                    in_dim * out_dim * sizeof(__half));
+            /* The F16 expansion cache is only an optimization.  If cuBLAS
+             * rejects the cached path under memory pressure, retry the same
+             * operation through the native Q8 kernels below. */
+        }
+    }
     const uint64_t xq_bytes = n_tok * blocks * 32u;
     const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
     const uint64_t tmp_bytes = scale_offset + n_tok * blocks * sizeof(float);
@@ -8991,7 +9495,61 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
             cuda_model_range_ptr(model_map, out_b_offset, out_b_bytes, "attn_out_b"));
     if (!out_a || !out_b) return 0;
 
-    {
+    const __half *out_a_f16 = NULL;
+    uint32_t out_a_cublas_min_tokens = 2u;
+    const char *out_a_min_env = getenv("DS4_CUDA_ATTENTION_OUTPUT_A_CUBLAS_MIN");
+    if (out_a_min_env && out_a_min_env[0]) {
+        char *endp = NULL;
+        long v = strtol(out_a_min_env, &endp, 10);
+        if (endp != out_a_min_env && v > 1 && v < 4096) out_a_cublas_min_tokens = (uint32_t)v;
+    }
+    if (!g_quality_mode &&
+        g_cublas_ready &&
+        n_tokens >= out_a_cublas_min_tokens &&
+        getenv("DS4_CUDA_NO_CUBLAS_ATTENTION_OUTPUT_A") == NULL) {
+        out_a_f16 = cuda_q8_f16_ptr(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, "attn_output_a");
+    }
+    if (out_a_f16) {
+        const uint64_t heads_h_count = (uint64_t)n_groups * n_tokens * group_dim;
+        const uint64_t heads_h_bytes = heads_h_count * sizeof(__half);
+        const uint64_t tmp_bytes = heads_h_bytes;
+        void *tmp = cuda_tmp_alloc(tmp_bytes, "attention output a cublas");
+        if (!tmp) return 0;
+        __half *heads_h = (__half *)tmp;
+        attention_pack_group_heads_f16_kernel<<<(heads_h_count + 255) / 256, 256>>>(
+                heads_h,
+                (const float *)heads->ptr,
+                n_tokens,
+                n_groups,
+                group_dim);
+        if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a pack launch")) return 0;
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        cublasStatus_t st = cublasGemmStridedBatchedEx(g_cublas,
+                                                       CUBLAS_OP_T,
+                                                       CUBLAS_OP_N,
+                                                       (int)rank,
+                                                       (int)n_tokens,
+                                                       (int)group_dim,
+                                                       &alpha,
+                                                       out_a_f16,
+                                                       CUDA_R_16F,
+                                                       (int)group_dim,
+                                                       (long long)rank * group_dim,
+                                                       heads_h,
+                                                       CUDA_R_16F,
+                                                       (int)group_dim,
+                                                       (long long)n_tokens * group_dim,
+                                                       &beta,
+                                                       low->ptr,
+                                                       CUDA_R_32F,
+                                                       (int)low_dim,
+                                                       (long long)rank,
+                                                       (int)n_groups,
+                                                       CUDA_R_32F,
+                                                       CUBLAS_GEMM_DEFAULT);
+        if (!cublas_ok(st, "attention output a gemm")) return 0;
+    } else {
         const uint64_t x_rows = (uint64_t)n_tokens * n_groups;
         const uint64_t xq_bytes = x_rows * blocks_a * 32u;
         const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;

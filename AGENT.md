@@ -71,15 +71,10 @@ to opt in to the newer paths.
   Q2_K for down (the V4 Flash configuration).  Other quant
   combinations fall through to the existing kernels.  Set
   `DS4_CUDA_USE_MMQ=0` (or `off` / `no` / `false`) to disable and
-  revert to the native Q8 warp kernels (the
-  `matmul_q8_0_preq_*_kernel` family).  The legacy Q8&rarr;FP16
-  expansion cache plus `cublasGemmEx` pipeline that previously sat
-  between mmq and the native kernels was deleted in Step 1 of the
-  optimization plan - mmq is fast enough that the cache was no longer
-  earning its complexity.  Validated on RTX PRO 6000 Blackwell
-  (sm_120, CUDA 13.0) against V4 Flash: prefill 357-1041 tok/s vs
-  357-373 baseline (sustained ~2.80x), gen within run-to-run
-  variance.
+  revert to the legacy `cuda_q8_f16_ptr` + `cublasGemmEx` pipeline.
+  Validated on RTX PRO 6000 Blackwell (sm_120, CUDA 13.0) against V4
+  Flash: prefill 357-1041 tok/s vs 357-373 baseline (sustained
+  ~2.80x), gen within run-to-run variance.
 - `DS4_CUDA_MMQ_MOE_MIN_TOKENS=N`: minimum `n_tokens` at which the
   routed-MoE mmq path activates.  Default 2.  At `n_tokens=1` mmq's
   matrix-matrix-shaped path has higher per-launch fixed cost than the
