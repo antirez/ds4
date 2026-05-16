@@ -14,27 +14,29 @@
  * no-copy MTLBuffers.
  */
 
+#include "ds4.h"
+
 #include <errno.h>
-#include <fcntl.h>
 #include <float.h>
 #include <inttypes.h>
 #include <ctype.h>
 #include <math.h>
-#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/file.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <stdarg.h>
 #include <time.h>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <pthread.h>
+#include <sys/file.h>
+#include <sys/mman.h>
 #include <unistd.h>
-
-#include "ds4.h"
+#endif
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
@@ -15527,14 +15529,27 @@ static void ds4_release_instance_lock(void) {
  * stale accidental second run is more dangerous than a normal CLI error. */
 static void ds4_acquire_instance_lock(void) {
     const char *path = getenv("DS4_LOCK_FILE");
+#ifdef _WIN32
+    char tmp_buf[512];
+    if (!path || !path[0]) {
+        path = ds4_win_tmp_path(tmp_buf, sizeof(tmp_buf), "ds4.lock");
+    }
+#else
     if (!path || !path[0]) path = "/tmp/ds4.lock";
+#endif
 
+#ifdef _WIN32
+    const int fd = open(path, O_RDWR | O_CREAT | O_BINARY, _S_IREAD | _S_IWRITE);
+#else
     const int fd = open(path, O_RDWR | O_CREAT, 0600);
+#endif
     if (fd < 0) {
         fprintf(stderr, "ds4: failed to open lock file %s: %s\n", path, strerror(errno));
         exit(2);
     }
+#ifndef _WIN32
     (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+#endif
 
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
         if (errno == EWOULDBLOCK) {
@@ -16536,6 +16551,28 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
         snap->cap = bytes;
     }
 
+#ifdef _WIN32
+    /* Windows lacks fmemopen.  Save the payload to a tmpfile, then copy the
+     * bytes into snap->ptr.  This is not a hot path (only called when KV cache
+     * snapshots are persisted), so the extra disk round-trip is acceptable. */
+    FILE *fp = tmpfile();
+    if (!fp) {
+        payload_set_err(err, errlen, "failed to create snapshot tmpfile");
+        return 1;
+    }
+    const int rc = ds4_session_save_payload(s, fp, err, errlen);
+    if (rc != 0) { fclose(fp); return 1; }
+    fflush(fp);
+    if (fseek(fp, 0, SEEK_SET) != 0 ||
+        fread(snap->ptr, 1, (size_t)bytes, fp) != (size_t)bytes) {
+        fclose(fp);
+        payload_set_err(err, errlen, "failed to read back session snapshot");
+        return 1;
+    }
+    fclose(fp);
+    snap->len = bytes;
+    return 0;
+#else
     FILE *fp = fmemopen(snap->ptr, (size_t)bytes, "wb");
     if (!fp) {
         payload_set_err(err, errlen, "failed to open memory stream for session snapshot");
@@ -16549,6 +16586,7 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
     if (rc != 0) return 1;
     snap->len = bytes;
     return 0;
+#endif
 }
 
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen) {
@@ -16561,6 +16599,27 @@ int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, 
         return 1;
     }
 
+#ifdef _WIN32
+    FILE *fp = tmpfile();
+    if (!fp) {
+        payload_set_err(err, errlen, "failed to create snapshot tmpfile for restore");
+        return 1;
+    }
+    if (fwrite(snap->ptr, 1, (size_t)snap->len, fp) != (size_t)snap->len) {
+        fclose(fp);
+        payload_set_err(err, errlen, "failed to seed snapshot tmpfile");
+        return 1;
+    }
+    fflush(fp);
+    if (fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        payload_set_err(err, errlen, "failed to rewind snapshot tmpfile");
+        return 1;
+    }
+    const int rc = ds4_session_load_payload(s, fp, snap->len, err, errlen);
+    fclose(fp);
+    return rc;
+#else
     FILE *fp = fmemopen((void *)snap->ptr, (size_t)snap->len, "rb");
     if (!fp) {
         payload_set_err(err, errlen, "failed to open memory stream for session snapshot restore");
@@ -16572,6 +16631,7 @@ int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, 
         return 1;
     }
     return rc;
+#endif
 }
 
 void ds4_session_snapshot_free(ds4_session_snapshot *snap) {

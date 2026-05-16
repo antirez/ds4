@@ -22,19 +22,21 @@
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
-#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#ifndef _WIN32
+#include <signal.h>
 #include <strings.h>
 #include <pthread.h>
 #include <sys/ioctl.h>
 #include <termios.h>
-#include <time.h>
 #include <unistd.h>
+#endif
 
 #define ANSI_RESET "\x1b[0m"
 #define ANSI_DIM "\x1b[90m"
@@ -1447,6 +1449,14 @@ static eval_config parse_options(int argc, char **argv) {
 }
 
 static int terminal_size(int *cols, int *rows) {
+#ifdef _WIN32
+    if (ds4_win_console_size(cols, rows) != 0) {
+        *cols = 80;
+        *rows = 24;
+        return -1;
+    }
+    return 0;
+#else
     struct winsize ws;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) != 0 || ws.ws_col == 0 || ws.ws_row == 0) {
         *cols = 80;
@@ -1456,6 +1466,7 @@ static int terminal_size(int *cols, int *rows) {
     *cols = ws.ws_col;
     *rows = ws.ws_row;
     return 0;
+#endif
 }
 
 static void term_move(int row, int col) {
@@ -1603,19 +1614,44 @@ static void *input_thread_main(void *arg) {
     return NULL;
 }
 
+static int tui_enter_raw(struct termios *saved) {
+#ifdef _WIN32
+    return ds4_win_console_enter_raw(saved);
+#else
+    if (tcgetattr(STDIN_FILENO, saved) != 0) return -1;
+    struct termios raw = *saved;
+    raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 1;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) return -1;
+    return 0;
+#endif
+}
+
+static void tui_leave_raw(const struct termios *saved) {
+#ifdef _WIN32
+    ds4_win_console_leave_raw(saved);
+#else
+    tcsetattr(STDIN_FILENO, TCSANOW, saved);
+#endif
+}
+
+static int tui_stdin_isatty(void) {
+#ifdef _WIN32
+    return GetFileType(GetStdHandle(STD_INPUT_HANDLE)) == FILE_TYPE_CHAR;
+#else
+    return isatty(STDIN_FILENO);
+#endif
+}
+
 static void tui_start_input(void) {
-    if (!isatty(STDIN_FILENO)) return;
-    if (tcgetattr(STDIN_FILENO, &global_input.orig_termios) != 0) return;
+    if (!tui_stdin_isatty()) return;
+    if (tui_enter_raw(&global_input.orig_termios) != 0) return;
 
     /* The input thread is intentionally boring: it never writes to the terminal,
      * it only queues arrow/Enter state.  Rendering remains owned by the main
      * thread and follows the same full-frame redraw path as the noninteractive
      * UI. Keep ISIG set so Ctrl-C still restores the alternate screen. */
-    struct termios raw = global_input.orig_termios;
-    raw.c_lflag &= ~(ICANON | ECHO);
-    raw.c_cc[VMIN] = 0;
-    raw.c_cc[VTIME] = 1;
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) return;
 
     pthread_mutex_lock(&global_input.mu);
     global_input.move_delta = 0;
@@ -1631,7 +1667,7 @@ static void tui_start_input(void) {
     } else {
         global_input.running = 0;
         global_input.enabled = false;
-        tcsetattr(STDIN_FILENO, TCSANOW, &global_input.orig_termios);
+        tui_leave_raw(&global_input.orig_termios);
         global_input.raw_mode = false;
     }
 }
@@ -1643,7 +1679,7 @@ static void tui_stop_input(void) {
         global_input.thread_started = false;
     }
     if (global_input.raw_mode) {
-        tcsetattr(STDIN_FILENO, TCSANOW, &global_input.orig_termios);
+        tui_leave_raw(&global_input.orig_termios);
         global_input.raw_mode = false;
     }
     global_input.enabled = false;
@@ -1704,16 +1740,27 @@ static void tui_signal_restore(int sig) {
     eval_ui *ui = global_ui;
     global_input.running = 0;
     if (global_input.raw_mode) {
-        tcsetattr(STDIN_FILENO, TCSANOW, &global_input.orig_termios);
+        tui_leave_raw(&global_input.orig_termios);
         global_input.raw_mode = false;
     }
     if (ui && ui->active) {
         const char restore[] = ANSI_RESET "\x1b[?25h\x1b[?1049l";
+#ifdef _WIN32
+        DWORD written;
+        WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), restore,
+                  (DWORD)(sizeof(restore) - 1), &written, NULL);
+#else
         (void)write(STDOUT_FILENO, restore, sizeof(restore) - 1);
+#endif
         ui->active = false;
     }
+#ifndef _WIN32
     signal(sig, SIG_DFL);
     raise(sig);
+#else
+    (void)sig;
+    ExitProcess(130);
+#endif
 }
 
 static void tui_draw_title(eval_ui *ui) {

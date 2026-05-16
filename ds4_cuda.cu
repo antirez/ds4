@@ -4,17 +4,24 @@
 #include <cublas_v2.h>
 #include <cub/block/block_radix_sort.cuh>
 
+#include "ds4_platform.h"
+
 #include <stdint.h>
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#ifdef _WIN32
+#include <io.h>
+#include <windows.h>
+#else
+#include <fcntl.h>
 #include <unistd.h>
+#endif
 #include <unordered_map>
 #include <vector>
 
@@ -23,7 +30,11 @@
 #endif
 
 #define CUDA_QK_K 256
+#ifdef _MSC_VER
+#define DS4_CUDA_UNUSED
+#else
 #define DS4_CUDA_UNUSED __attribute__((unused))
+#endif
 
 enum {
     /* attention_decode_mixed_kernel stores raw-window scores plus visible
@@ -785,7 +796,7 @@ static uint64_t cuda_model_copy_chunk_bytes(void) {
 }
 
 static void cuda_model_discard_source_pages(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes) {
-#if defined(POSIX_MADV_DONTNEED)
+#if !defined(_WIN32) && defined(POSIX_MADV_DONTNEED)
     if (getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL || !model_map || bytes == 0 || offset > model_size) return;
     if (bytes > model_size - offset) bytes = model_size - offset;
     const long page_sz_l = sysconf(_SC_PAGESIZE);
@@ -1513,7 +1524,9 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
         struct stat st;
         if (fstat(fd, &st) == 0 && st.st_size > 0) {
             g_model_file_size = (uint64_t)st.st_size;
+#ifndef _WIN32
             if (st.st_blksize > 1) g_model_direct_align = (uint64_t)st.st_blksize;
+#endif
         }
 #if defined(__linux__) && defined(O_DIRECT)
         if (getenv("DS4_CUDA_NO_DIRECT_IO") == NULL) {

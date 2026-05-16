@@ -10,46 +10,68 @@
  * batching decisions in one place instead of spreading graph mutations across
  * client threads. */
 
+/* On Windows, ds4.h has already pulled in winsock2.h + windows.h via
+ * ds4_platform.h, and our shim defines aliases for poll/pthread/etc.  On
+ * POSIX the same explicit headers as before. */
+#ifndef _WIN32
 #include <arpa/inet.h>
-#include <ctype.h>
 #include <dirent.h>
-#include <errno.h>
-#include <float.h>
 #include <fcntl.h>
-#include <limits.h>
-#include <math.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+#endif
+#include <ctype.h>
+#include <errno.h>
+#include <float.h>
+#include <limits.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/time.h>
 #include <sys/types.h>
 #include <time.h>
-#include <unistd.h>
 
 static volatile sig_atomic_t g_stop_requested = 0;
 static volatile sig_atomic_t g_listen_fd = -1;
+
+/* After every Winsock call that returns SOCKET_ERROR, errno is not updated;
+ * the actual code is in WSAGetLastError().  Call this once after a failed
+ * send/recv/poll on Windows so existing `errno == EAGAIN` checks behave the
+ * same way they do on POSIX.  On POSIX this is a no-op. */
+static inline void ds4_sync_socket_errno(void) {
+#ifdef _WIN32
+    int e = WSAGetLastError();
+    if (e == WSAEWOULDBLOCK) errno = EWOULDBLOCK;
+    else if (e == WSAEINTR)  errno = EINTR;
+    else                     errno = e;
+#endif
+}
 
 #define DS4_SERVER_IO_TIMEOUT_SEC 10
 #define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
 
 static void stop_signal_handler(int sig) {
     (void)sig;
+#ifdef _WIN32
+    if (g_stop_requested) ExitProcess(130);
+#else
     if (g_stop_requested) _exit(130);
+#endif
     g_stop_requested = 1;
     if (g_listen_fd >= 0) {
         int fd = (int)g_listen_fd;
         g_listen_fd = -1;
-        close(fd);
+        ds4_socket_close(fd);
     }
 }
 
@@ -85,6 +107,10 @@ static char *xstrdup(const char *s) {
 
 static bool random_bytes(void *dst, size_t len) {
     unsigned char *p = dst;
+#ifdef _WIN32
+    ds4_win_random_bytes(p, len);
+    return true;
+#else
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd < 0) return false;
     while (len) {
@@ -99,6 +125,7 @@ static bool random_bytes(void *dst, size_t len) {
     }
     close(fd);
     return true;
+#endif
 }
 
 static char *xstrndup(const char *s, size_t n) {
@@ -4110,6 +4137,7 @@ static bool send_all(int fd, const void *p, size_t n) {
     while (n) {
         if (g_stop_requested) return false;
         ssize_t w = send(fd, s, n, 0);
+        if (w < 0) ds4_sync_socket_errno();
         if (w < 0 && errno == EINTR) continue;
         if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             long long remaining = deadline - wall_ms();
@@ -4119,6 +4147,7 @@ static bool send_all(int fd, const void *p, size_t n) {
             int rc;
             do {
                 rc = poll(&pfd, 1, timeout);
+                if (rc < 0) ds4_sync_socket_errno();
             } while (rc < 0 && errno == EINTR);
             if (rc < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) return false;
             continue;
@@ -11329,6 +11358,7 @@ static bool read_http_request(int fd, http_request *r) {
     while (hend < 0 && b.len < max_header) {
         char tmp[4096];
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+        if (n < 0) ds4_sync_socket_errno();
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) goto fail;
         buf_append(&b, tmp, (size_t)n);
@@ -11352,6 +11382,7 @@ static bool read_http_request(int fd, http_request *r) {
     while (b.len < (size_t)hend + (size_t)clen) {
         char tmp[8192];
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+        if (n < 0) ds4_sync_socket_errno();
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) goto fail;
         buf_append(&b, tmp, (size_t)n);
@@ -11515,16 +11546,16 @@ static void *client_main(void *arg) {
     pthread_mutex_destroy(&j.mu);
     request_free(&j.req);
 done:
-    close(fd);
+    ds4_socket_close(fd);
     client_done(s);
     return NULL;
 }
 
 static int listen_on(const char *host, int port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = (int)socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     int yes = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
 
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof(sa));
@@ -11532,35 +11563,46 @@ static int listen_on(const char *host, int port) {
     sa.sin_port = htons((uint16_t)port);
     if (!strcmp(host, "localhost")) host = "127.0.0.1";
     if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
-        close(fd);
+        ds4_socket_close(fd);
         errno = EINVAL;
         return -1;
     }
     if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
-        close(fd);
+        ds4_socket_close(fd);
         return -1;
     }
     if (listen(fd, 128) != 0) {
-        close(fd);
+        ds4_socket_close(fd);
         return -1;
     }
     return fd;
 }
 
 static void configure_client_socket(int fd) {
+#ifdef _WIN32
+    /* Winsock setsockopt SO_RCVTIMEO/SO_SNDTIMEO takes a DWORD of ms. */
+    DWORD tv_ms = (DWORD)DS4_SERVER_IO_TIMEOUT_SEC * 1000u;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv_ms, sizeof(tv_ms));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv_ms, sizeof(tv_ms));
+#else
     struct timeval tv;
     tv.tv_sec = DS4_SERVER_IO_TIMEOUT_SEC;
     tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
 }
 
 static void set_client_socket_nonblocking(int fd) {
     /* The inference worker writes streaming responses itself.  Once a request is
      * queued, a blocked socket would block every other request too, so slow
      * clients are failed instead of back-pressuring the model session. */
+#ifdef _WIN32
+    (void)ds4_socket_set_nonblocking((SOCKET)fd);
+#else
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags >= 0) (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+#endif
 }
 
 typedef struct {
@@ -11857,7 +11899,23 @@ static server_config parse_options(int argc, char **argv) {
 }
 
 #ifndef DS4_SERVER_TEST
+#ifdef _WIN32
+static BOOL WINAPI win_console_ctrl_handler(DWORD type) {
+    if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT ||
+        type == CTRL_CLOSE_EVENT || type == CTRL_SHUTDOWN_EVENT) {
+        stop_signal_handler(2);
+        return TRUE;
+    }
+    return FALSE;
+}
+#endif
+
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    ds4_win_wsa_startup();
+    SetConsoleCtrlHandler(win_console_ctrl_handler, TRUE);
+    /* No SIGPIPE on Windows; broken-pipe writes return WSAECONNRESET. */
+#else
     signal(SIGPIPE, SIG_IGN);
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -11865,6 +11923,7 @@ int main(int argc, char **argv) {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+#endif
 
     server_config cfg = parse_options(argc, argv);
 
@@ -11934,12 +11993,13 @@ int main(int argc, char **argv) {
         int fd = accept(lfd, NULL, NULL);
         if (fd < 0) {
             if (g_stop_requested) break;
+            ds4_sync_socket_errno();
             if (errno == EINTR) continue;
             server_log(DS4_LOG_DEFAULT, "ds4-server: accept failed: %s", strerror(errno));
             continue;
         }
         if (g_stop_requested) {
-            close(fd);
+            ds4_socket_close(fd);
             break;
         }
 
@@ -11957,13 +12017,13 @@ int main(int argc, char **argv) {
             pthread_cond_broadcast(&s.clients_cv);
             pthread_mutex_unlock(&s.mu);
             free(ca);
-            close(fd);
+            ds4_socket_close(fd);
             continue;
         }
         pthread_detach(th);
     }
     if (g_listen_fd >= 0) {
-        close(lfd);
+        ds4_socket_close(lfd);
         g_listen_fd = -1;
     }
 

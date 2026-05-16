@@ -1,6 +1,11 @@
 #ifndef DS4_H
 #define DS4_H
 
+/* Platform abstraction must be included first so that Winsock2 wins over
+ * windows.h ordering when this header is pulled in by any .c file on
+ * Windows.  On POSIX it is a thin passthrough. */
+#include "ds4_platform.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
