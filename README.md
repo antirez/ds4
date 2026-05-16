@@ -1,5 +1,7 @@
 # DwarfStar 4
 
+*Read this in [Italiano](README.it.md).*
+
 DwarfStar 4 is a small native inference engine specific for **DeepSeek V4 Flash**. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
 runtime: it is completely self-contained. Other than running the model in a
@@ -140,6 +142,11 @@ make cuda-spark       # Linux CUDA, DGX Spark / GB10
 make cuda-generic     # Linux CUDA, other local CUDA GPUs
 make cpu              # CPU-only diagnostics build
 ```
+
+On Windows the build uses CMake + MSVC + CUDA instead of the Makefile, and
+currently produces `ds4-server`, `ds4-bench`, and `ds4-eval` only. See the
+[Windows port (CUDA)](#windows-port-cuda) section below for the exact command
+and prerequisites.
 
 `./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
@@ -755,6 +762,91 @@ Do not treat the CPU path as the production target. The CLI and `ds4-server`
 support the CPU backend for reference/debug use and share the same KV session
 and snapshot format as Metal and CUDA, but normal inference should use Metal or
 CUDA.
+
+## Windows port (CUDA)
+
+The Windows port adds a native MSVC + CUDA build path for `ds4-server`,
+`ds4-bench`, and `ds4-eval`. It is not an MSYS/MinGW or WSL build: the
+binaries are produced by the Visual Studio toolchain, link against the
+official CUDA Toolkit, and use Win32 APIs directly. Linux and macOS keep
+using the existing Makefile and are unchanged.
+
+### Prerequisites
+
+- Windows 10 build 19041 (version 2004) or newer, or Windows 11.
+- Visual Studio 2022 with the "Desktop development with C++" workload.
+- CUDA Toolkit ≥ 12.8 (required for `sm_120`, the Blackwell architecture
+  used by RTX 50-series and newer cards).
+- CMake ≥ 3.24.
+
+### Build command
+
+```sh
+cmake -B build -G "Visual Studio 17 2022" -A x64 ^
+      -DCMAKE_CUDA_ARCHITECTURES=120
+cmake --build build --config Release
+```
+
+The resulting `ds4-server.exe`, `ds4-bench.exe`, and `ds4-eval.exe` live
+in `build\Release\` and accept the same flags as the POSIX binaries.
+GGUF download still goes through `download_model.sh` from a POSIX shell
+(Git Bash works); the engine itself loads any compatible GGUF the
+Makefile build would.
+
+### How the port works
+
+The port is a thin platform abstraction layer instead of a per-call
+rewrite, so the ~200 mutex/socket/file-IO sites in `ds4_server.c`
+stayed untouched:
+
+- `ds4_platform.h` is a passthrough on POSIX and pulls in `winsock2.h`
+  before `windows.h` on Windows. It defines aliases that let the rest
+  of the codebase keep POSIX symbol names: `pthread_*`, `mmap`/`munmap`,
+  `poll`, `flock`, `clock_gettime`, `dprintf`, `pread`, `ftruncate`,
+  `fseeko`, `opendir`/`readdir`, termios, and `/tmp`.
+- `ds4_platform_win.c` contains the Windows implementations:
+  `mmap` is `CreateFileMapping` + `MapViewOfFile` tracked in a small
+  registry so `munmap` works the POSIX way; pthread maps to
+  `_beginthreadex` + `SRWLOCK` + `CONDITION_VARIABLE`; `/dev/urandom`
+  becomes `BCryptGenRandom`; the console raw mode in `ds4-eval` uses
+  `GetConsoleMode`/`SetConsoleMode`; `clock_gettime` uses
+  `QueryPerformanceCounter`; `opendir`/`readdir` are a `FindFirstFile`
+  shim.
+- All Windows-specific edits in `ds4.c`, `ds4_cuda.cu`, `ds4_server.c`,
+  and `ds4_eval.c` are gated by `#ifdef _WIN32`. The instance lock path
+  switches to `%TEMP%\ds4.lock`; the session snapshot save/load uses
+  `tmpfile()` because Windows lacks `fmemopen`; the CUDA backend's
+  `__attribute__((unused))` is replaced by an `_MSC_VER`-aware macro;
+  `ds4-server` calls `WSAStartup` and `SetConsoleCtrlHandler` in `main`
+  and routes socket close + errno sync through small helpers.
+
+The POSIX Makefile path on Linux and macOS is unchanged byte-for-byte
+(verified by full rebuild). If a future Windows-specific change wants
+to alter shared code, it must keep this invariant.
+
+### What is currently included
+
+- `ds4-server.exe` — full HTTP server with the same OpenAI, Anthropic,
+  and Responses endpoints, the same disk KV cache format, and the same
+  exact-DSML tool replay map.
+- `ds4-bench.exe` — speed benchmarking at context frontiers.
+- `ds4-eval.exe` — split-screen TUI capability evaluator.
+
+### What is deferred
+
+- The interactive `ds4` CLI is not built on Windows yet: it depends on
+  `linenoise`, which uses POSIX termios for line editing. A Console-API
+  port of `linenoise` is needed before the REPL can be shipped on
+  Windows.
+- The socketpair-based `ds4_test --server` regression is also deferred;
+  the other test suites build and run.
+
+### Status
+
+The Windows port is alpha, like the rest of the project. The CUDA graph,
+KV cache, and disk cache format are the same code as on Linux CUDA, so
+behavior parity should follow from the Linux CUDA path. Please report
+issues with a `--trace` log attached, same as on POSIX.
 
 ## Steering
 
