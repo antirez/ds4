@@ -19199,6 +19199,7 @@ static int ds4_session_eval_speculative_batch_first3(
     mtp_verify_result_init(&result);
     float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
     const double verify_t0 = mtp_timing ? now_sec() : 0.0;
+    ds4_gpu_set_mtp_verifier(1);  /* Bug 2 / Option D */
     ok = metal_graph_verify_decode3_top2_output(&s->graph,
                                                 &e->model,
                                                 &e->weights,
@@ -19206,6 +19207,7 @@ static int ds4_session_eval_speculative_batch_first3(
                                                 &plan,
                                                 &result,
                                                 row_logits);
+    ds4_gpu_set_mtp_verifier(0);
     const double verify_done = mtp_timing ? now_sec() : 0.0;
     if (!ok) {
         s->checkpoint.len = (int)start;
@@ -21557,6 +21559,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         bool ok = true;
         for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
             if (target_top != drafts[i]) break;
+            ds4_gpu_set_mtp_verifier(1);  /* Bug 2 / Option D */
             ok = metal_graph_eval_token_raw_swa_top(&s->graph,
                                                     &e->model,
                                                     &e->weights,
@@ -21564,6 +21567,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                     (uint32_t)s->checkpoint.len,
                                                     &target_top,
                                                     NULL);
+            ds4_gpu_set_mtp_verifier(0);
             if (!ok) break;
             token_vec_push(&s->checkpoint, drafts[i]);
             logits_on_host = false;
@@ -21621,6 +21625,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         const double snapshot_done = mtp_timing ? now_sec() : 0.0;
         bool ok = have_frontier;
         if (ok) {
+            ds4_gpu_set_mtp_verifier(1);  /* Bug 2 / Option D */
             ok = metal_graph_verify_decode2_exact(&s->graph,
                                                   &e->model,
                                                   &e->weights,
@@ -21631,6 +21636,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                   &row0_top,
                                                   row0_logits,
                                                   row_logits);
+            ds4_gpu_set_mtp_verifier(0);
         }
         const double verify_done = mtp_timing ? now_sec() : 0.0;
         if (ok && row0_top == drafts[1]) {
@@ -21794,6 +21800,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             if (shadow_v2_decode3 && have_frontier) {
                 ds4_mtp_verify_result v2_shadow;
                 mtp_verify_result_init(&v2_shadow);
+                ds4_gpu_set_mtp_verifier(1);  /* Bug 2 / Option D */
                 bool v2_ok = metal_graph_verify_decode3_top2_output(&s->graph,
                                                                      &e->model,
                                                                      &e->weights,
@@ -21801,6 +21808,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                                      &verify_plan,
                                                                      &v2_shadow,
                                                                      NULL);
+                ds4_gpu_set_mtp_verifier(0);
                 fprintf(stderr,
                         "ds4: mtp shadow verify_v2_decode3 ok=%d committed=%d row0=%d row1=%d "
                         "draft1=%d draft2=%d margin0=%.6f margin1=%.6f\n",
@@ -21818,6 +21826,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             if (shadow_b_n2_q8 && have_frontier) {
                 shadow_have = true;
                 ds4_gpu_set_attention_output_b_n2_q8_override(1);
+                ds4_gpu_set_mtp_verifier(1);  /* Bug 2 / Option D */
                 shadow_ok = metal_graph_verify_decode2_top2_output(&s->graph,
                                                                     &e->model,
                                                                     &e->weights,
@@ -21829,6 +21838,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                                     &shadow_commit_drafts,
                                                                     row_logits,
                                                                     &shadow_top2);
+                ds4_gpu_set_mtp_verifier(0);
                 if (shadow_ok && shadow_logits) {
                     memcpy(shadow_logits, row_logits,
                            (size_t)DS4_N_VOCAB * sizeof(shadow_logits[0]));
@@ -21839,6 +21849,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             }
             if (shadow_exact_decode2 && have_frontier) {
                 shadow_exact_have = true;
+                ds4_gpu_set_mtp_verifier(1);  /* Bug 2 / Option D */
                 shadow_exact_ok = metal_graph_verify_decode2_exact(&s->graph,
                                                                    &e->model,
                                                                    &e->weights,
@@ -21849,6 +21860,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                                    &shadow_exact_row0_top,
                                                                    shadow_exact_logits0,
                                                                    shadow_exact_logits1);
+                ds4_gpu_set_mtp_verifier(0);
                 if (shadow_exact_ok) {
                     shadow_exact_commit_drafts =
                         shadow_exact_row0_top == drafts[1] ? 2 : 1;
@@ -21865,6 +21877,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                 ok = spec_frontier_restore(&frontier, s);
             }
             if (ok && verify_v2_decode3) {
+                ds4_gpu_set_mtp_verifier(1);  /* Bug 2 / Option D */
                 ok = metal_graph_verify_decode3_top2_output(&s->graph,
                                                             &e->model,
                                                             &e->weights,
@@ -21872,6 +21885,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                             &verify_plan,
                                                             &verify_result,
                                                             row_logits);
+                ds4_gpu_set_mtp_verifier(0);
                 if (ok) {
                     for (int i = 0; i < 2; i++) row_tops[i] = verify_result.row_top[i];
                     precomputed_commit_drafts = verify_result.commit_tokens;
@@ -21881,6 +21895,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                 getenv("DS4_CUDA_MTP_VERIFY_TOP2") != NULL &&
                 getenv("DS4_CUDA_MTP_TOP2") != NULL) {
                 int row0_top = -1;
+                ds4_gpu_set_mtp_verifier(1);  /* Bug 2 / Option D */
                 ok = metal_graph_verify_decode2_top2_output(&s->graph,
                                                             &e->model,
                                                             &e->weights,
@@ -21892,6 +21907,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                             &precomputed_commit_drafts,
                                                             row_logits,
                                                             &exact_top2);
+                ds4_gpu_set_mtp_verifier(0);
                 if (ok) {
                     row_tops[0] = row0_top;
                     verify_result.row_top[0] = row0_top;
@@ -21902,6 +21918,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     verify_result.have_logits = true;
                 }
             } else {
+                ds4_gpu_set_mtp_verifier(1);  /* Bug 2 / Option D */
                 ok = metal_graph_verify_suffix_tops(&s->graph,
                                                     &e->model,
                                                     &e->weights,
@@ -21911,6 +21928,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                     capture_prefix1,
                                                     row_tops,
                                                     NULL);
+                ds4_gpu_set_mtp_verifier(0);
             }
         }
         const double micro_verify_done = mtp_timing ? now_sec() : 0.0;
@@ -22269,6 +22287,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             }
             if (ok) {
                 for (int i = 0; i < commit_drafts; i++) token_vec_push(&s->checkpoint, drafts[i]);
+                ds4_gpu_set_mtp_verifier(1);  /* Bug 2 / Option D */
                 ok = metal_graph_verify_suffix_tops(&s->graph,
                                                     &e->model,
                                                     &e->weights,
@@ -22278,6 +22297,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                     false,
                                                     row_tops,
                                                     NULL);
+                ds4_gpu_set_mtp_verifier(0);
                 if (ok) ok = metal_graph_read_spec_logits_row(&s->graph,
                                                               (uint32_t)(commit_drafts - 1),
                                                               row_logits);
@@ -22376,14 +22396,16 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             }
             break;
         }
-        if (!metal_graph_eval_token_raw_swa_top(&s->graph,
-                                                &e->model,
-                                                &e->weights,
-                                                drafts[i],
-                                                (uint32_t)s->checkpoint.len,
-                                                &target_top,
-                                                NULL))
-        {
+        ds4_gpu_set_mtp_verifier(1);  /* Bug 2 / Option D */
+        const bool _ver_raw_ok = metal_graph_eval_token_raw_swa_top(&s->graph,
+                                                                     &e->model,
+                                                                     &e->weights,
+                                                                     drafts[i],
+                                                                     (uint32_t)s->checkpoint.len,
+                                                                     &target_top,
+                                                                     NULL);
+        ds4_gpu_set_mtp_verifier(0);
+        if (!_ver_raw_ok) {
             snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
             s->checkpoint_valid = false;
             return -1;

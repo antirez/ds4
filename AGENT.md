@@ -143,6 +143,24 @@ to opt in to the newer paths.
   Re-enabling graphs as the default requires root-causing and fixing
   that hazard.  Opt-in for experiments:  `DS4_CUDA_MOE_GRAPHS=1`
   (or `on` / `yes` / `true`).
+- `DS4_CUDA_MTP_VERIFIER_USE_MMQ` (default unset, behaves as `0`):
+  repro switch for Bug 2.  By default, every MTP verifier call is
+  bracketed in `ds4.c` with `ds4_gpu_set_mtp_verifier(1)` /
+  `ds4_gpu_set_mtp_verifier(0)`; the CUDA backend honors this by
+  routing all Q8_0 dense matmuls (and the routed-MoE dispatch, via
+  the same `ds4_cuda_use_mmq()` gate) onto the legacy native kernels
+  for the duration of one verifier call.  This is the Option D
+  hybrid: mmq for prefill and non-MTP decode, legacy native kernels
+  inside the verifier.  Necessary because mmq's stream-k + MMA FP32
+  reduction order drifts ~1 ULP/layer from the legacy `warp8`
+  kernel; the MTP drafter is trained against legacy-style decoding,
+  so an mmq verifier flips tight-margin argmax tokens and collapses
+  draft acceptance (analyst measured 0/314 on GB10 with mmq verifier
+  active).  Set to `1` (or `on` / `yes` / `true`) to bypass the gate
+  and let mmq run inside the verifier &mdash; reproduces the broken
+  behavior, useful only for bisection.  See
+  `local/docs/ds4_mmq_mtp_correctness_plan.html` in the auto-round
+  companion repo for the full mechanism and validation plan.
 
 ## Testing
 

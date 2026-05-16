@@ -273,6 +273,14 @@ void ds4_gpu_set_attention_output_b_n2_q8_override(int enabled) {
     (void)enabled;
 }
 
+void ds4_gpu_set_mtp_verifier(int on) {
+    (void)on;
+}
+
+int ds4_gpu_in_mtp_verifier(void) {
+    return 0;
+}
+
 static int ds4_gpu_wait_pending_command_buffers(const char *label) {
     int ok = 1;
     for (id<MTLCommandBuffer> pending in g_pending_cbs) {

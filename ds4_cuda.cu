@@ -6848,7 +6848,46 @@ static struct dense_graph_entry *dense_graph_slot(const struct dense_graph_key *
     return &g_dense_graphs[dense_graph_hash(key) % DS4_DENSE_GRAPH_CACHE_SIZE];
 }
 
+/* Bug 2 / Option D gate.  See local/docs/ds4_mmq_mtp_correctness_plan.html
+ * in the auto-round companion repo for the full mechanism.  mmq's Q8_0 dense
+ * FP32 reduction order drifts ~1 ULP/layer vs the legacy warp8 kernel; the
+ * MTP drafter is trained against legacy-style decoding, so an mmq verifier
+ * produces tight-margin argmax flips and collapses draft acceptance (analyst
+ * measured 0/314 on GB10).  When set, this thread-local flag forces
+ * ds4_cuda_use_mmq() to report disabled, routing every Q8_0 dense matmul
+ * (attention projections, lm_head, attn_output_b) and the routed-MoE
+ * dispatch onto the legacy native kernels for the duration of one verifier
+ * call.  Non-verifier paths (prefill, non-MTP decode) are untouched.
+ *
+ * Repro override: DS4_CUDA_MTP_VERIFIER_USE_MMQ=1 keeps mmq active inside
+ * the verifier (today's broken behavior; for bisection only). */
+static __thread int g_in_mtp_verifier = 0;
+static int g_mtp_verifier_bypass_init = 0;
+static int g_mtp_verifier_bypass = 0;
+
+static int ds4_cuda_mtp_verifier_bypass(void) {
+    if (!g_mtp_verifier_bypass_init) {
+        g_mtp_verifier_bypass_init = 1;
+        const char *s = getenv("DS4_CUDA_MTP_VERIFIER_USE_MMQ");
+        if (s && *s && strcmp(s, "0") != 0) {
+            g_mtp_verifier_bypass = 1;
+            fprintf(stderr, "ds4: DS4_CUDA_MTP_VERIFIER_USE_MMQ=%s - mmq stays active in MTP verifier (Bug 2 repro mode)\n", s);
+        }
+    }
+    return g_mtp_verifier_bypass;
+}
+
+extern "C" void ds4_gpu_set_mtp_verifier(int on) {
+    if (ds4_cuda_mtp_verifier_bypass()) { g_in_mtp_verifier = 0; return; }
+    g_in_mtp_verifier = on ? 1 : 0;
+}
+
+extern "C" int ds4_gpu_in_mtp_verifier(void) {
+    return g_in_mtp_verifier;
+}
+
 static int ds4_cuda_use_mmq() {
+    if (g_in_mtp_verifier) return 0;  /* Bug 2 / Option D gate. */
     if (!g_ds4_use_mmq_init) {
         g_ds4_use_mmq_init = 1;
         const char *e = getenv("DS4_CUDA_USE_MMQ");

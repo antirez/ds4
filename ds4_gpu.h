@@ -61,6 +61,15 @@ void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_print_memory_report(const char *label);
 void ds4_gpu_set_attention_output_b_n2_q8_override(int enabled);
 
+/* Bug 2 / Option D: force matmuls to legacy native kernels for the duration
+ * of an MTP verifier call.  See local/docs/ds4_mmq_mtp_correctness_plan.html
+ * in the auto-round companion repo for the full mechanism.  Call sites wrap
+ * each metal_graph_verify_* (and the verifier-context callers of
+ * metal_graph_eval_token_raw_swa_top) with set(1)/.../set(0).  Backends
+ * other than CUDA implement these as no-ops. */
+void ds4_gpu_set_mtp_verifier(int on);
+int  ds4_gpu_in_mtp_verifier(void);
+
 /* =========================================================================
  * Embeddings and Indexer Helpers.
  * =========================================================================
