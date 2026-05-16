@@ -25,6 +25,11 @@ The C runner consumes `official.vec` directly:
 ./ds4_test --logprob-vectors
 ```
 
+The runner opens the standard Metal path and pins
+`DS4_METAL_PREFILL_CHUNK=2048` for this strict official-vector check.
+Tensor-route drift is covered separately by `./ds4_test --metal-tensor-equivalence`
+and the speed-bench drift gates.
+
 `official.vec` is intentionally trivial to parse from C: each case points to a
 prompt file and each expected token is hex-encoded by bytes. The official JSON
 files remain in the tree so the compact fixture can be audited against the raw

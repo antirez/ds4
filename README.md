@@ -199,9 +199,10 @@ interval tokens/sec, generation tokens/sec at that frontier, and
 
 Sessions prefill long prompts in 4096-token chunks by default. Set
 `DS4_METAL_PREFILL_CHUNK=N` to compare another chunk size, for example `2048`
-to reduce transient memory, or `DS4_METAL_PREFILL_CHUNK=0` to prefill a prompt
-as one whole batch when memory allows. Changing the chunk changes the KV
-checkpoint shape, so compare it as an explicit run configuration.
+to match the strict official-vector checkpoint path, or
+`DS4_METAL_PREFILL_CHUNK=0` to prefill a prompt as one whole batch when memory
+allows. Changing the chunk changes the KV checkpoint/logit path, so compare it
+as an explicit run configuration.
 Chunked Metal prefill reuses the same range-capable layer-major graph for each
 chunk, preserving absolute compressor/indexer boundaries while avoiding the old
 per-layer chunk dispatch path.
@@ -339,10 +340,12 @@ turning on every direct-RHS route at once when the global
 
 The isolated `./ds4_test --metal-kernels` regression reports
 small/medium/model-ish kernel deltas; the full-model
-`./ds4_test --metal-mpp-equivalence` diagnostic compares default auto against
-`-mt off`. Set `DS4_TEST_MPP_EQ_FORCE_ON=1` to compare forced Tensor against
-`-mt off` while working on a route. `DS4_TEST_MPP_EQ_CASE=<case-id-substring>`
-limits the diagnostic to one prompt, and `DS4_TEST_MPP_EQ_MATRIX=1` prints
+`./ds4_test --metal-tensor-equivalence` diagnostic compares default auto
+against `-mt off`. The old `--metal-mpp-equivalence` spelling remains accepted
+as a compatibility alias. Set `DS4_TEST_MPP_EQ_FORCE_ON=1` to compare forced
+Tensor against `-mt off` while working on a route.
+`DS4_TEST_MPP_EQ_CASE=<case-id-substring>` limits the diagnostic to one prompt,
+and `DS4_TEST_MPP_EQ_MATRIX=1` prints
 separate auto, fast-profile, attention-output-only, MoE gate/up/down-only, and
 full-forced summary rows. The equivalence gate requires finite logits, the same
 top-1 token, and matching greedy continuation; it also reports top-5/top-20
@@ -1042,14 +1045,17 @@ captured from the official DeepSeek V4 Flash API. The requests use
 `deepseek-v4-flash`, greedy decoding, thinking disabled, and the maximum
 `top_logprobs` slice exposed by the API. Local vectors are generated with
 `./ds4 --dump-logprobs` and compared by token bytes, so tokenizer/template or
-attention regressions show up before they become long generation failures.
+attention regressions show up before they become long generation failures. The
+C runner uses the standard Metal path and pins `DS4_METAL_PREFILL_CHUNK=2048`
+for this strict API-vector comparison; Tensor route drift is checked separately
+by `--metal-tensor-equivalence` and the five-fixture drift gate.
 
 All project tests are driven by the C runner:
 
 ```sh
 make test                  # ./ds4_test --all
 ./ds4_test --logprob-vectors
-./ds4_test --metal-mpp-equivalence
+./ds4_test --metal-tensor-equivalence
 ./ds4_test --server
 ```
 

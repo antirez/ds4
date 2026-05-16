@@ -13,10 +13,28 @@ static const char *test_model_path(void) {
     return (model_path && model_path[0]) ? model_path : "ds4flash.gguf";
 }
 
-static ds4_engine *test_get_engine(bool quality) {
-    ds4_engine **slot = quality ? &test_engine_quality : &test_engine_fast;
-    if (*slot) return *slot;
+static char *test_save_env(const char *name) {
+    const char *value = getenv(name);
+    if (!value) return NULL;
+    size_t len = strlen(value);
+    char *copy = malloc(len + 1);
+    TEST_ASSERT(copy != NULL);
+    if (!copy) return NULL;
+    memcpy(copy, value, len + 1);
+    return copy;
+}
 
+static void test_restore_env(const char *name, char *saved) {
+    if (saved) {
+        setenv(name, saved, 1);
+        free(saved);
+    } else {
+        unsetenv(name);
+    }
+}
+
+static ds4_engine *test_open_engine(bool quality, ds4_mpp_mode mpp_mode) {
+    ds4_engine *engine = NULL;
     ds4_engine_options opt = {
         .model_path = test_model_path(),
 #ifdef __APPLE__
@@ -25,8 +43,17 @@ static ds4_engine *test_get_engine(bool quality) {
         .backend = DS4_BACKEND_CUDA,
 #endif
         .quality = quality,
+        .mpp_mode = mpp_mode,
     };
-    TEST_ASSERT(ds4_engine_open(slot, &opt) == 0);
+    TEST_ASSERT(ds4_engine_open(&engine, &opt) == 0);
+    return engine;
+}
+
+static ds4_engine *test_get_engine(bool quality) {
+    ds4_engine **slot = quality ? &test_engine_quality : &test_engine_fast;
+    if (*slot) return *slot;
+
+    *slot = test_open_engine(quality, DS4_MPP_AUTO);
     return *slot;
 }
 
@@ -535,8 +562,11 @@ static void test_official_logprob_vectors(void) {
     TEST_ASSERT(fp != NULL);
     if (!fp) return;
 
-    ds4_engine *engine = test_get_engine(false);
+    char *saved_prefill_chunk = test_save_env("DS4_METAL_PREFILL_CHUNK");
+    setenv("DS4_METAL_PREFILL_CHUNK", "2048", 1);
+    ds4_engine *engine = test_open_engine(false, DS4_MPP_OFF);
     if (!engine) {
+        test_restore_env("DS4_METAL_PREFILL_CHUNK", saved_prefill_chunk);
         fclose(fp);
         return;
     }
@@ -547,6 +577,8 @@ static void test_official_logprob_vectors(void) {
         fprintf(stderr, "ds4-test: vector %s\n", vc.id);
         test_logprob_vector_case(engine, &vc);
     }
+    ds4_engine_close(engine);
+    test_restore_env("DS4_METAL_PREFILL_CHUNK", saved_prefill_chunk);
     fclose(fp);
 }
 
@@ -829,14 +861,7 @@ static int test_load_mpp_cases(ds4_engine *engine, test_mpp_eq_case *cases, int 
 }
 
 static ds4_engine *test_open_mpp_engine(ds4_mpp_mode mode) {
-    ds4_engine *engine = NULL;
-    ds4_engine_options opt = {
-        .model_path = test_model_path(),
-        .backend = DS4_BACKEND_METAL,
-        .mpp_mode = mode,
-    };
-    TEST_ASSERT(ds4_engine_open(&engine, &opt) == 0);
-    return engine;
+    return test_open_engine(false, mode);
 }
 
 static void test_mpp_summary_init(test_mpp_eq_summary *summary, const char *label) {
@@ -1196,9 +1221,9 @@ static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
-    {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison", test_official_logprob_vectors},
+    {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard Metal path", test_official_logprob_vectors},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
-    {"--metal-mpp-equivalence", "metal-mpp-equivalence", "Metal Tensor off/on prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
+    {"--metal-tensor-equivalence", "metal-tensor-equivalence", "Metal Tensor off/on prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
@@ -1213,6 +1238,10 @@ static void test_print_help(const char *prog) {
     }
     puts("  --list");
     puts("      Print test names only.");
+#ifndef DS4_NO_GPU
+    puts("  --metal-mpp-equivalence");
+    puts("      Compatibility alias for --metal-tensor-equivalence.");
+#endif
     puts("  -h, --help");
     puts("      Show this help.");
     puts("\nEnvironment:");
@@ -1225,6 +1254,11 @@ static void test_print_help(const char *prog) {
 }
 
 static const ds4_test_entry *test_find_entry(const char *arg) {
+#ifndef DS4_NO_GPU
+    if (!strcmp(arg, "--metal-mpp-equivalence")) {
+        arg = "--metal-tensor-equivalence";
+    }
+#endif
     for (size_t i = 0; i < sizeof(test_entries) / sizeof(test_entries[0]); i++) {
         if (!strcmp(arg, test_entries[i].flag)) return &test_entries[i];
     }
