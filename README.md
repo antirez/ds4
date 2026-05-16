@@ -81,8 +81,9 @@ next sections.
   how local GGUFs are scored against official DeepSeek V4 Flash continuations.
 - [dir-steering/README.md](dir-steering/README.md): directional steering data,
   vector generation, and usage.
-- [speed-bench/README.md](speed-bench/README.md): benchmark CSV files and graph
-  generation.
+- [speed-bench/README.md](speed-bench/README.md): benchmark charts, Metal
+  Tensor candidate gates, drift checks, comparator probes, and local artifact
+  indexing.
 - [tests/test-vectors/README.md](tests/test-vectors/README.md): official
   continuation vectors used for regression checks.
 
@@ -196,6 +197,15 @@ exponential sweeps. Output is CSV with one row per frontier: latest prefill
 interval tokens/sec, generation tokens/sec at that frontier, and
 `kvcache_bytes`.
 
+Sessions prefill long prompts in 4096-token chunks by default. Set
+`DS4_METAL_PREFILL_CHUNK=N` to compare another chunk size, for example `2048`
+to reduce transient memory, or `DS4_METAL_PREFILL_CHUNK=0` to prefill a prompt
+as one whole batch when memory allows. Changing the chunk changes the KV
+checkpoint shape, so compare it as an explicit run configuration.
+Chunked Metal prefill reuses the same range-capable layer-major graph for each
+chunk, preserving absolute compressor/indexer boundaries while avoiding the old
+per-layer chunk dispatch path.
+
 ## Capability Evaluation
 
 `ds4-eval` is a small real-model integration benchmark. It is not a leaderboard
@@ -260,15 +270,6 @@ DeepSeek V4 Flash still solve a representative mix of hard science, broad
 knowledge, exact math, and security-code problems while using the same inference
 path users run?
 
-Sessions prefill long prompts in 4096-token chunks by default. Set
-`DS4_METAL_PREFILL_CHUNK=N` to compare another chunk size, for example `2048`
-to reduce transient memory, or `DS4_METAL_PREFILL_CHUNK=0` to prefill a prompt
-as one whole batch when memory allows. Changing the chunk changes the KV
-checkpoint shape, so compare it as an explicit run configuration.
-Chunked Metal prefill reuses the same range-capable layer-major graph for each
-chunk, preserving absolute compressor/indexer boundaries while avoiding the old
-per-layer chunk dispatch path.
-
 ## Metal 4 and M5 Neural Accelerators
 
 The current production path is still hand-written Metal compute kernels over
@@ -300,12 +301,12 @@ Metal Tensor policy is explicit and guarded. Use `-mt auto` or `--mt auto` for
 the default route policy, `-mt on` to force Tensor routes where the Metal tensor
 path is available, and `-mt off` for the legacy Metal reference path. The old
 `--mpp` spelling remains accepted as a compatibility alias. Auto currently
-enables the F16 compressor Tensor path, keeps attention-output Tensor in the
-validated late-layer window, and runs routed-MoE Tensor only in its conservative
-layer window while preserving same-top1/same-greedy agreement. The dense Q8_0
-prefill path remains on the legacy hand-written Metal simdgroup kernel; the
-experimental Tensor Q8_0 route was removed after M5 drift bisection showed it
-was the drift-prone path.
+enables the F16 compressor Tensor path, enables attention-output low Tensor in
+all layers, and runs routed-MoE Tensor only in its conservative layer window
+while preserving same-top1/same-greedy agreement. The dense Q8_0 prefill path
+remains on the legacy hand-written Metal simdgroup kernel; the experimental
+Tensor Q8_0 route was removed after M5 drift bisection showed it was the
+drift-prone path.
 
 The next prefill optimization target is therefore not a re-enable of the removed
 Q8_0 Tensor route. It is a new, isolated quantized prefill matmul experiment
@@ -322,10 +323,9 @@ The environment controls `DS4_METAL_MPP_ENABLE` and
 `DS4_METAL_MPP_ENABLE=0` disables Tensor routes instead of enabling them by mere
 presence. Passing `--quality` also disables Tensor routes so strict/debug runs
 stay on the legacy Metal kernels. Set `DS4_METAL_MPP_FAST=1` to opt into the
-current throughput diagnostic profile: it widens attention-output Tensor to all
-layers and uses the routed-MoE all-layer diagnostic window. This profile is not
-the default because its top-k overlap is weaker than auto in the current
-full-model suite.
+current throughput diagnostic profile: it uses the routed-MoE all-layer
+diagnostic window. This profile is not the default because its top-k overlap is
+weaker than auto in the current full-model suite.
 
 The default safe-window policy uses the direct-RHS tensor layout for Tensor
 routes; set `DS4_METAL_MPP_DIRECT_RHS=0` to compare against the older staged-RHS
@@ -350,16 +350,28 @@ overlap, top-20 rank displacement, top-20 logit deltas, and whole-vocab RMS/max
 drift so route changes can be judged beyond pass/fail.
 
 Full-graph route localization is available with
-`DS4_METAL_MPP_COMPARE_ROUTE=attn_out|moe_gate|moe_up|moe_down` and optional
-`DS4_METAL_MPP_COMPARE_MAX=N`. The comparator snapshots the candidate Tensor
-output, runs the legacy Metal route on the same tensor input, and reports the
-first comparison that exceeds the kernel target, including module/layer context,
-shape, max absolute error, RMS, and the largest element deltas. Set
-`DS4_METAL_MPP_COMPARE_VERBOSE=1` to print passing comparisons as well.
+`DS4_METAL_MPP_COMPARE_ROUTE=attn_out|moe_gate|moe_up|moe_down|flash_attn`
+and optional `DS4_METAL_MPP_COMPARE_MAX=N`. The comparator snapshots the
+candidate Tensor output, runs the legacy Metal route on the same tensor input,
+and reports the first comparison that exceeds the kernel target, including
+module/layer context, shape, max absolute error, RMS, and the largest element
+deltas. Set `DS4_METAL_MPP_COMPARE_VERBOSE=1` to print passing comparisons as
+well.
 Set `DS4_METAL_Q8_PREFILL_PROFILE=1` while profiling a prompt to time the
 current legacy Q8_0 prefill matmul by module/layer context without changing the
 dispatch. Add `DS4_METAL_Q8_PREFILL_PROFILE_FILTER=<substring>` to limit the
 rows to dense Q8_0 contexts such as `attn_q_a`, `attn_kv`, or `attn_q_b`.
+Set `DS4_METAL_Q8_COMPARE=1` to run a local dense Q8_0 ref-vs-candidate
+comparison using the same comparator output format, and
+`DS4_METAL_Q8_COMPARE_FILTER=<substring>` to focus it on one context such as
+`attn_q_b` or `attn_out`. This is a diagnostic hook for future default-off Q8
+kernel prototypes; the current production path still uses the legacy Q8_0
+prefill kernel.
+Set `DS4_METAL_FLASH_ATTN_COMPARE=1` with
+`DS4_METAL_MPP_COMPARE_ROUTE=flash_attn` to compare static-mixed prefill head
+outputs against the existing generic masked FlashAttention path. Use
+`DS4_METAL_FLASH_ATTN_COMPARE_FILTER=<substring>` to limit the comparison by
+shape label before testing a default-off static-mixed attention kernel.
 Routed-MoE gate/up/down uses the specialized routed-MoE profiler below instead
 of this dense wrapper. Use both profilers to choose the first default-off Metal 4
 matmul prototype target; current profile data points first at early routed-MoE
@@ -374,23 +386,39 @@ route disables, comparator, and stage profiler still apply.
 
 Current Tensor route status balances drift with prefill throughput: `auto`
 enables F16 compressor, attention-output low projection, and routed-MoE Tensor.
-Attention-output low projection uses layers 32..42 by default, and routed-MoE
-Tensor uses the lower-drift conservative default window: down from layer 12 and
-gate/up from layer 15. This gives up some of the all-layer prefill speedup to
-avoid the larger drift seen with layer-0 routed-MoE Tensor windows while keeping
-the dense Q8_0 prefill route on the legacy kernel. The attention-output low
-Tensor kernels stage activation tiles through half to match the legacy Metal
-matmul input path, which removes the first attention-output comparator breach.
-The current auto policy uses direct-RHS Tensor inputs and 64-token tiles for
-attention-output low projections. The F16 compressor route did not introduce
-measurable drift in the current prompt set.
+Attention-output low projection is enabled for all layers by default, and
+routed-MoE Tensor uses the lower-drift conservative default window: down from
+layer 12 and gate/up from layer 15. This gives up some of the all-layer
+routed-MoE prefill speedup to avoid the larger drift seen with layer-0
+routed-MoE Tensor windows while keeping the dense Q8_0 prefill route on the
+legacy kernel. The attention-output low Tensor kernels stage activation tiles
+through half to match the legacy Metal matmul input path, which removes the
+first attention-output comparator breach. The current auto policy uses
+direct-RHS Tensor inputs and 64-token tiles for attention-output low projections.
+The F16 compressor route did not introduce measurable drift in the current
+prompt set.
 
 The `DS4_METAL_MPP_FAST=1` profile is the measured high-throughput diagnostic
 profile under the relaxed same-top1/same-greedy gate. In the current prompt
 suite it keeps top-1 and greedy continuations stable, but reports weaker top-k
-overlap than auto. It remains diagnostic-only because it widens the
-attention-output and routed-MoE route windows that produce the largest
-full-suite drift.
+overlap than auto. It remains diagnostic-only because it widens routed-MoE
+Tensor to layer 0, which produces the largest full-suite drift.
+The current fastest default-off eval candidate keeps the fast gate/up window but
+excludes the largest local `moe_down` comparator outliers:
+
+```
+DS4_METAL_MPP_FAST=1 \
+DS4_METAL_MPP_MOE_DOWN_FILTER=layer=0-25,layer=27-28,layer=31-42
+```
+
+If generation steadiness matters more than maximum short-context prefill, add
+`DS4_METAL_MOE_MID_F32=1` to the same env. That balanced variant still passes
+the five-fixture drift gate, keeps the same Tensor-vs-standard drift summary,
+and reduces the compact-generation timing swings seen in the fastest variant.
+In the 128-token long sweep it remains prefill-positive through 65k context,
+but gives up the strongest long-context prefill gains and has a -2.7%
+generation point at 65k. Neither variant is promoted to the default policy; use
+them only for explicit eval runs.
 
 The routed-MoE Tensor projections are enabled by default from layer 12 for down
 and layer 15 for gate/up. For route isolation, use
@@ -410,10 +438,14 @@ Set `DS4_METAL_MOE_STAGE_PROFILE=1` to split routed-MoE prefill into timed
 stages. Add `DS4_METAL_MOE_STAGE_PROFILE_FILTER=<substring>` to print only
 matching stages or layer context while still flushing every stage for correct
 timing.
+Set `DS4_METAL_FLASH_ATTN_STAGE_PROFILE=1` to split prefill FlashAttention into
+copy, mask, block-map, pad, attention, and reduce stages; add
+`DS4_METAL_FLASH_ATTN_STAGE_PROFILE_FILTER=<substring>` to limit printed rows
+while still flushing every stage.
 Set `DS4_METAL_MPP_MOE_TILE_N=64` to test the experimental wider routed-MoE
-Tensor token tile for performance against the default `32`. The routed-MoE Tensor
-path uses the faster first-PR threadgroup tensor layout by default inside the
-active routed-MoE windows; set `DS4_METAL_MPP_MOE_FAST_LAYOUT=0` to compare
+Tensor token tile for performance against the default `32`. The routed-MoE
+Tensor path uses the faster first-PR threadgroup tensor layout by default inside
+the active routed-MoE windows; set `DS4_METAL_MPP_MOE_FAST_LAYOUT=0` to compare
 against the newer staged layout. Set
 `DS4_METAL_MPP_MOE_START_LAYER=N`, or the route-specific
 `DS4_METAL_MPP_MOE_GATE_START_LAYER`,
@@ -442,20 +474,18 @@ attention. Set `DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD` to `64`, `128`,
 separately. `--quality` keeps the full `512` candidate path unless this
 environment override is set explicitly.
 
-The attention-output low-projection Tensor route applies to full 32-token multiples
-in the default safe window, using a 64-token Tensor tile by default and falling
-back to the existing indexed simdgroup kernel for shorter or non-32-multiple
-tails. Attention-output Tensor is limited to the measured full-model-safe layer
-window 32..42 by default. Set
+The attention-output low-projection Tensor route applies to full 32-token
+multiples in all layers by default, using a 64-token Tensor tile by default and
+falling back to the existing indexed simdgroup kernel for shorter or
+non-32-multiple tails. Set
 `DS4_METAL_MPP_ATTN_OUT_ENABLE=1` or `DS4_METAL_MPP_ATTN_OUT_DISABLE=1` to
 isolate this route. Set `DS4_METAL_MPP_ATTN_OUT_FILTER=all`, `late_safe`,
 `none`, or a comma-separated list of full-graph context substrings such as
-`layer=42` to localize full-model-safe layer windows. Layer filters are exact,
-and `layer=A..B` matches an inclusive range. Set
+`layer=42` to localize layer windows; `late_safe` keeps the old 32..42 default
+window for comparison. Layer filters are exact, and `layer=A..B` matches an
+inclusive range. Set
 `DS4_METAL_MPP_ATTN_OUT_TILE_N=32` to compare against the narrower Tensor token
-tile. The all-layer
-attention-output Tensor route still fails long-prompt full-model equivalence
-despite per-layer low-projection differences below the current kernel target.
+tile.
 The ratio-2 F16 compressor route can similarly be controlled with
 `DS4_METAL_MPP_F16_ENABLE=1` or `DS4_METAL_MPP_F16_DISABLE=1`.
 `DS4_METAL_MPP_F16_PAIR=1` tests a paired KV/gate compressor dispatch that keeps
