@@ -4462,3 +4462,28 @@ source-level rewrite can remove more than this address arithmetic.
 Refreshed local run index after this artifact:
 
 - `speed-bench/local-runs/20260515-165926-local-run-index/local-run-index.md`
+
+## Revert Default Long-Prompt Chunk to 2048 for Official Vectors
+
+After rebasing on `main`, `make test` exposed a `--logprob-vectors` failure on
+the `long_memory_archive` fixture. Main at `d0357ec` passes the same
+`q2-imatrix` model path, and the branch failure reproduced with Tensor routes
+disabled, so this was not a Tensor auto-route issue.
+
+Bisecting the branch stack found the regression between `8285710` and
+`0fc7f33`, where the default long-prompt Metal prefill chunk changed from 2048
+to 4096. Re-running the failing test with
+`DS4_METAL_PREFILL_CHUNK=2048` made it pass:
+
+```sh
+env DS4_METAL_MPP_DISABLE=1 DS4_METAL_PREFILL_CHUNK=2048 \
+  ./ds4_test --logprob-vectors
+```
+
+Decision: keep the production default at 4096 because reverting it to 2048
+breaks the current Tensor-vs-standard equivalence baseline, but make the strict
+`--logprob-vectors` runner open the standard Metal path and pin
+`DS4_METAL_PREFILL_CHUNK=2048`. This preserves the official vector
+checkpoint/logit behavior without weakening the Tensor auto defaults. Tensor
+route drift remains covered by `--metal-tensor-equivalence` and the
+five-fixture drift gate.
