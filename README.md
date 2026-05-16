@@ -65,6 +65,23 @@ However, we try to keep the project in a usable state, and we are making
 progresses. If you have issues, make sure to use `--trace` to log the
 sessions, and open issues including the full trace.
 
+## Changes in this fork
+
+This is a community fork (`SiNaPsEr0x/ds4`). The list below tracks the
+user-visible deltas relative to upstream `antirez/ds4`. The most recent
+change is on top.
+
+- **Native Windows + CUDA build path** for `ds4-server`, `ds4-bench`,
+  and `ds4-eval` via MSVC + CUDA Toolkit ≥ 12.8 (sm_120 Blackwell).
+  See [Windows port (CUDA)](#windows-port-cuda) below for prerequisites,
+  build commands, and current limitations (the `ds4` CLI is deferred).
+- **Italian README** ([`README.it.md`](README.it.md)) covering the full
+  contents of this file. Sub-READMEs remain English-only.
+- **`CLAUDE.md`** with build commands, architecture overview, and
+  project-specific constraints (no C++ in the main path, no GGML/llama.cpp
+  linkage, instance-lock invariants), to brief Claude Code sessions on
+  the project rules.
+
 ## More Documentation
 
 If you are looking for very specific things, we have other

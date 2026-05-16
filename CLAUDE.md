@@ -113,3 +113,7 @@ For DSML token boundaries: the close marker starts as two tokens: `</` and `｜D
 - **Do not run the CPU path on macOS for large inference** — there is a known kernel VM bug that can crash the system.
 - **The instance lock is intentional** (`/tmp/ds4.lock` on POSIX, `%TEMP%\ds4.lock` on Windows). Don't bypass it.
 - **Disk KV cache directory is disposable** — when behavior looks suspicious, stop the server and `rm -rf` it.
+
+## Fork changelog policy (this fork only)
+
+This is the `SiNaPsEr0x/ds4` fork. Whenever you make a user-visible change relative to upstream `antirez/ds4` — a new build path, a new documentation file, a new CLI flag, behavior change, new dependency — prepend a one-line entry to the **Changes in this fork** section of `README.md` **and** the **Modifiche su questo fork** section of `README.it.md` in the same commit. Keep both lists in sync; newest change goes on top. Internal-only changes (refactors, comment fixes, test plumbing that doesn't affect users or contributors) do not need an entry.
