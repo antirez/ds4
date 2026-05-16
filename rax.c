@@ -101,6 +101,11 @@ static inline void raxStackInit(raxStack *ts) {
 /* Push an item into the stack, returns 1 on success, 0 on out of memory. */
 static inline int raxStackPush(raxStack *ts, void *ptr) {
     if (ts->items == ts->maxitems) {
+        if (ts->maxitems > SIZE_MAX / sizeof(void*) / 2) {
+            ts->oom = 1;
+            errno = ENOMEM;
+            return 0;
+        }
         if (ts->stack == ts->static_items) {
             ts->stack = rax_malloc(sizeof(void*)*ts->maxitems*2);
             if (ts->stack == NULL) {
