@@ -9086,14 +9086,14 @@ static bool metal_graph_decode_indexer_top_k_override(uint32_t *value) {
         unsigned long v = strtoul(env, &end, 10);
         while (end && isspace((unsigned char)*end)) end++;
         if (end != env && end && *end == '\0' &&
-            (v == 64ul || v == 128ul || v == 256ul || v == 512ul) &&
-            v <= DS4_N_INDEXER_TOP_K) {
+            v >= 4ul && v <= DS4_N_INDEXER_TOP_K &&
+            (v & (v - 1ul)) == 0) {
             cached = (uint32_t)v;
             parsed = 1;
         } else {
             fprintf(stderr,
                     "ds4: invalid DS4_METAL_DECODE_INDEXER_TOP_K=%s; "
-                    "expected 64, 128, 256, or 512\n",
+                    "expected a power of two from 4 to 512\n",
                     env);
         }
     }
