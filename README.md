@@ -340,6 +340,12 @@ route-specific `DS4_METAL_MPP_F16_DIRECT_RHS=1` and
 turning on every direct-RHS route at once when the global
 `DS4_METAL_MPP_DIRECT_RHS=0` override is set.
 
+On M5 devices, GPU-only scratch buffers use private Metal storage by default so
+intermediate prefill buffers do not stay CPU-visible. CPU-filled mask and
+attention-output group-id buffers remain shared. Set
+`DS4_METAL_DISABLE_M5_PRIVATE_SCRATCH=1` to compare against the older shared
+scratch allocation path.
+
 The isolated `./ds4_test --metal-kernels` regression reports
 small/medium/model-ish kernel deltas; the full-model
 `./ds4_test --metal-tensor-equivalence` diagnostic compares default auto
