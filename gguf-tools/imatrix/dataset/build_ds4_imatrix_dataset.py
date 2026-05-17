@@ -3,8 +3,8 @@
 
 The quantizer needs activation statistics from prompts that look like the real
 workload.  This script creates deterministic DS4-rendered chat prompts from the
-repo itself, agent/tool conversations, multilingual translation tasks,
-programming prompts, and long-context code reviews.  The output is
+repo itself, agent/tool conversations, language and translation tasks,
+benchmark-reasoning prompts, programming prompts, and long-context code reviews.  The output is
 intentionally plain JSONL/text so the imatrix collector can consume it without
 depending on this script.
 
@@ -18,6 +18,7 @@ provider-neutral rather than tuned around a single client brand.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import random
@@ -230,11 +231,22 @@ def stable_id(category: str, source: str, mode: str, text: str) -> str:
     return f"{category}-{h.hexdigest()[:12]}"
 
 
+def normalize_rendered_text(text: str) -> str:
+    """Keep generated calibration files free of accidental trailing spaces.
+
+    Some imported benchmark questions include LaTeX/TikZ lines with trailing
+    blanks.  Those bytes do not carry useful calibration signal, and removing
+    them avoids churny generated files and whitespace-check failures.
+    """
+
+    return "\n".join(line.rstrip() for line in text.split("\n"))
+
+
 def add_record(records: list[Record], category: str, source: str,
                messages: list[dict], *, tools_schema: list[dict] | None = None,
                modes: Iterable[str] = ("nothink", "think")) -> None:
     for mode in modes:
-        rendered = render(messages, mode, tools_schema=tools_schema)
+        rendered = normalize_rendered_text(render(messages, mode, tools_schema=tools_schema))
         rid = stable_id(category, source, mode, rendered)
         records.append(Record(rid, category, mode, source, messages, rendered))
 
@@ -478,22 +490,792 @@ def make_translation_records(records: list[Record]) -> None:
         ])
 
 
+LANGUAGE_PASSAGES = [
+    (
+        "harbor-library",
+        "At seven each morning, Mira unlocked the little harbor library before "
+        "the fish market opened. The room smelled of salt, paper, and wet rope. "
+        "Retired captains came in to read newspapers, apprentices borrowed repair "
+        "manuals, and schoolchildren used the atlas to trace routes they hoped to "
+        "sail one day. When a storm damaged the pier, the library became the only "
+        "quiet place with a working radio, a kettle, and a table large enough for "
+        "the volunteers to spread their maps.",
+    ),
+    (
+        "city-heat",
+        "The city planted two thousand street trees after a summer in which the "
+        "hospital recorded an unusual rise in heat exhaustion. Sensors showed "
+        "that shaded sidewalks were often eight degrees cooler than exposed ones. "
+        "Shop owners first worried that construction would block their windows, "
+        "but many later said people lingered longer outside their stores. The "
+        "largest challenge was not planting the trees; it was watering them "
+        "during their first three dry seasons.",
+    ),
+    (
+        "museum-letter",
+        "The museum received a letter from a visitor who had recognized her "
+        "grandmother in the background of a 1934 photograph. Until then, the "
+        "archive listed the woman only as an unnamed station worker. The visitor "
+        "sent a copy of a diary page, a payroll stub, and a recipe card written "
+        "in the same hand. The curator updated the catalog entry, then wrote a "
+        "short exhibit label about how public memory can repair an incomplete "
+        "institutional record.",
+    ),
+    (
+        "clinic-schedule",
+        "A rural clinic changed its appointment schedule after noticing that "
+        "patients who worked in the fields missed morning visits twice as often "
+        "as afternoon ones. The new calendar reserved early slots for school "
+        "vaccinations and late slots for adults who could not leave work before "
+        "sunset. Missed appointments fell within a month, but the nurses also "
+        "found that reminder calls mattered most when they came from someone "
+        "who spoke the patient's first language.",
+    ),
+    (
+        "mountain-train",
+        "The mountain train was built to carry ore, not tourists. Its narrow "
+        "tracks followed the river, crossed three timber bridges, and climbed "
+        "through tunnels cut by hand. After the mine closed, the town nearly "
+        "removed the line, but teachers argued it was the clearest way to show "
+        "students how geography shaped local industry. Today the train runs "
+        "only on weekends, slowly enough for passengers to see the old signal "
+        "posts and the terraces where workers once kept vegetable gardens.",
+    ),
+    (
+        "software-release",
+        "The release note sounded simple: reduce startup time by warming fewer "
+        "buffers. In practice the change required a careful audit of which pages "
+        "were touched by the first request, which buffers were only needed after "
+        "a tool call, and which allocations could be delayed without moving a "
+        "latency spike into the user's first visible token. The team kept the "
+        "patch small, but the test plan became longer than the code.",
+    ),
+    (
+        "school-garden",
+        "The school garden began as a science project and became a language "
+        "project by accident. Students labeled the herbs in Arabic, Italian, "
+        "Mandarin, Spanish, and English because those were the languages spoken "
+        "at home. Parents started leaving recipes in a notebook by the gate. By "
+        "spring, the teacher used the garden to discuss migration, measurement, "
+        "soil chemistry, and why a word can carry a memory as well as a meaning.",
+    ),
+    (
+        "warehouse-robot",
+        "The warehouse robot failed only on rainy days. Engineers first blamed "
+        "the wheel encoders, then the floor markers, then the routing software. "
+        "A night-shift operator finally noticed that wet umbrellas left small "
+        "puddles near the entrance, and the robot slowed down whenever its front "
+        "sensor saw reflected ceiling lights. The fix was a mat, a hood over the "
+        "sensor, and a dashboard note that credited the operator by name.",
+    ),
+    (
+        "river-council",
+        "At the council meeting, the argument was not whether the river should "
+        "be cleaned, but how to measure success. Anglers wanted fish counts, "
+        "parents wanted safer banks, farmers wanted predictable irrigation, and "
+        "the budget office wanted milestones it could audit. The final plan used "
+        "four measures and a public map updated every quarter, which made the "
+        "project slower to announce but easier to defend.",
+    ),
+    (
+        "bakery-queue",
+        "The bakery changed its queue after the owner realized that customers "
+        "waiting for coffee blocked the bread shelves. A painted line on the "
+        "floor helped for a week, then failed during the Saturday rush. The best "
+        "solution was less decorative: move the sugar, cups, and lids away from "
+        "the register. Average waiting time fell, and the staff stopped having "
+        "to apologize for a problem that had never been caused by impatience.",
+    ),
+    (
+        "radio-weather",
+        "The weather bulletin was read in three languages because the fishing "
+        "boats did not all share the same crew language. The broadcaster learned "
+        "to keep numbers in the same order every time: wind direction, wind "
+        "speed, wave height, visibility, and warnings. Crews said the repeated "
+        "structure helped even when reception was poor, because a missing word "
+        "could often be inferred from its position in the sequence.",
+    ),
+    (
+        "archive-index",
+        "When the archive digitized its index cards, the scanner captured every "
+        "coffee stain and pencil mark. Some volunteers wanted to clean the "
+        "images automatically, but the archivist objected. The stains sometimes "
+        "showed which boxes had been handled during a flood, and the pencil "
+        "marks showed corrections made before the typed catalog existed. The "
+        "project therefore stored both a clean transcription and the original "
+        "image side by side.",
+    ),
+    (
+        "neighborhood-map",
+        "A neighborhood map drawn by residents looked inaccurate to professional "
+        "surveyors because distances were distorted. The bus stop, pharmacy, "
+        "laundromat, and playground appeared much larger than the courthouse or "
+        "bank. The planner kept the distortion because it revealed what official "
+        "maps often hide: the city experienced by walking with a stroller, "
+        "carrying groceries, or looking for shade is not the same city measured "
+        "from above.",
+    ),
+    (
+        "repair-cafe",
+        "At the repair cafe, people brought lamps, radios, torn jackets, and a "
+        "clock that had stopped after forty years. The volunteers did not promise "
+        "success. They promised to explain what they were trying, label the parts "
+        "they removed, and say when replacement would cost more than repair. The "
+        "most popular table was not electronics or sewing, but the one where "
+        "children took apart broken toys to see how gears and springs worked.",
+    ),
+    (
+        "forest-trail",
+        "The forest trail reopened with fewer signs than before. Rangers had "
+        "learned that visitors ignored crowded notice boards but noticed a single "
+        "clear instruction at the exact point where a decision was needed. The "
+        "new signs named the next landmark, the distance, and one safety warning. "
+        "Complaints about being lost dropped, and the trail looked less like a "
+        "corridor of rules.",
+    ),
+    (
+        "market-receipt",
+        "A market cooperative printed receipts that showed the farmer's name, "
+        "the distance traveled, and the date of harvest. Some customers found it "
+        "charming; others found it distracting. Sales data later showed that the "
+        "extra information mattered most for items people could not inspect "
+        "directly, such as flour, oil, and honey. For tomatoes and peaches, smell "
+        "still outweighed every sentence on the receipt.",
+    ),
+    (
+        "night-ferry",
+        "The night ferry crossed the lake even when the road around it was clear. "
+        "Commuters liked the twenty quiet minutes between phone calls and office "
+        "lights, and nurses used the benches to rest after long shifts. When the "
+        "transport agency proposed canceling the route, its spreadsheet counted "
+        "only tickets sold, not the ambulance trips avoided during winter, the "
+        "students who reached evening classes, or the small shops that opened "
+        "early because dock workers bought breakfast there.",
+    ),
+    (
+        "orchard-ledger",
+        "In the orchard ledger, every tree had a row for pruning, pests, harvest "
+        "weight, and weather notes. The oldest entries were written by a farmer "
+        "who never used abbreviations; later entries became shorter as the farm "
+        "grew. A new manager wanted to replace the ledger with a tablet form, but "
+        "kept one blank field labeled 'odd observations' after discovering that "
+        "several good decisions had started as remarks that did not fit any box.",
+    ),
+    (
+        "community-theater",
+        "The community theater sold out after it moved rehearsals into the front "
+        "room where passersby could hear the music. People who would never read a "
+        "poster stopped to ask about costumes, borrowed folding chairs, or offered "
+        "old curtains for the set. The director said the change worked because it "
+        "made preparation visible. The audience felt invited before anyone asked "
+        "them to buy a ticket.",
+    ),
+    (
+        "desert-well",
+        "The desert well was marked on maps as unreliable, but the older guides "
+        "still visited it after winter rains. They knew the water rose slowly "
+        "through cracked stone and disappeared before summer. A research team "
+        "installed a sensor and confirmed the pattern, yet the guides' calendar "
+        "was more useful than the graph because it included wind, animal tracks, "
+        "and stories about years when the rains arrived late.",
+    ),
+    (
+        "newspaper-correction",
+        "The newspaper correction was longer than the original mistake. It named "
+        "the incorrect statistic, explained how the reporter had misread the "
+        "table, printed the correct number, and described how future data stories "
+        "would be checked. Some readers mocked the length, but subscriptions rose "
+        "after the editor began treating corrections as public maintenance rather "
+        "than embarrassment.",
+    ),
+    (
+        "apartment-elevator",
+        "Residents complained that the apartment elevator was slow, but the repair "
+        "company found no mechanical fault. The building manager placed a mirror "
+        "beside the doors, then added a board with local notices and lost keys. "
+        "Complaints dropped because waiting felt shorter when people had something "
+        "useful to read. The elevator had not changed; the experience of waiting "
+        "had.",
+    ),
+    (
+        "field-notebook",
+        "A biologist's field notebook used color more than prose: blue dots for "
+        "water, green lines for moss, orange circles for nests. Her assistant "
+        "wanted to transcribe everything into sentences, but she kept the diagrams "
+        "because they showed proximity at a glance. Years later, the sketches "
+        "helped another team see that the birds nested near temporary pools only "
+        "after a particular moss appeared.",
+    ),
+    (
+        "town-clock",
+        "The town clock gained four minutes every week. For decades no one fixed "
+        "it because train schedules had moved to phones, and the clock remained "
+        "mostly ceremonial. Then the school used it for a lesson about measurement "
+        "error. Students logged the drift, predicted when it would be wrong by an "
+        "hour, and convinced the council that preservation sometimes means making "
+        "an old thing accurate again.",
+    ),
+    (
+        "kitchen-radio",
+        "In the restaurant kitchen, the radio was tuned low enough that customers "
+        "could not hear it and high enough that cooks could recognize the song. "
+        "The owner thought it was a distraction until a busy night when the radio "
+        "failed and the staff lost their rhythm. The music had been acting as a "
+        "shared clock, marking prep, service, cleanup, and the moment everyone "
+        "could finally sit down.",
+    ),
+    (
+        "wetland-boardwalk",
+        "The wetland boardwalk was raised by only twelve centimeters, but that was "
+        "enough to keep spring water from covering the planks. Visitors noticed "
+        "the new railings and benches, not the height. The maintenance crew "
+        "noticed something else: fewer people stepped off the path, so seedlings "
+        "returned near the edges. A small engineering change had become a habitat "
+        "change.",
+    ),
+    (
+        "festival-tickets",
+        "The festival changed ticket prices from three tiers to one suggested "
+        "price with a quiet option to pay less. Revenue stayed almost the same, "
+        "but attendance became more mixed by age and neighborhood. Volunteers "
+        "said the new wording mattered: people did not feel they were asking for "
+        "a discount; they felt they were choosing the price that let them attend "
+        "and still leave space for someone else.",
+    ),
+    (
+        "sewing-manual",
+        "The sewing manual used drawings instead of photographs because thread "
+        "and shadows confused beginners. Each drawing exaggerated the needle, "
+        "the fold, and the direction of tension. Advanced tailors found the pages "
+        "plain, but new learners made fewer mistakes. The designer concluded that "
+        "realism is not always the friend of instruction; sometimes the useful "
+        "picture is the one that lies about scale.",
+    ),
+    (
+        "island-power",
+        "The island power station added batteries before it added more solar "
+        "panels. Tourists expected the opposite, but engineers explained that "
+        "the island already produced enough midday electricity and lost too much "
+        "after sunset. The batteries did not make the photographs prettier, yet "
+        "they reduced diesel use more than another row of panels would have. The "
+        "best improvement was the least visible one.",
+    ),
+    (
+        "language-class",
+        "The language class stopped beginning with grammar charts and started "
+        "with lost-and-found objects: a glove, a ticket, a key, a cracked phone "
+        "case. Students described who might own each item and what had happened "
+        "before it was lost. Grammar still appeared, but as a tool for making "
+        "the story precise. Attendance improved because every lesson began with "
+        "a small mystery.",
+    ),
+    (
+        "bridge-inspection",
+        "The bridge inspection report listed no urgent danger, but it changed the "
+        "maintenance plan anyway. Hairline cracks near the drainage holes showed "
+        "that water was collecting where the original drawings assumed it would "
+        "flow away. The fix was inexpensive: clean the channels twice a year and "
+        "seal one joint. The important discovery was not damage, but the pattern "
+        "that would eventually create it.",
+    ),
+    (
+        "bookshop-window",
+        "The bookshop window once displayed bestsellers in perfect rows. A new "
+        "bookseller replaced them with pairs: a cookbook beside a travel memoir, "
+        "a history beside a novel, a children's atlas beside a book about birds. "
+        "Sales became less predictable but more varied. Customers said the window "
+        "felt like a conversation instead of a ranking.",
+    ),
+]
+
+
+LANGUAGE_TASKS = [
+    ("summary", "Summarize the passage in three concise bullet points."),
+    ("plain", "Rewrite the passage in plain English for a careful twelve-year-old reader."),
+    ("formal", "Rewrite the passage as a formal memo while preserving every factual detail."),
+    ("copyedit", "Copy-edit the passage for clarity. Keep the meaning, but improve flow and sentence rhythm."),
+    ("entities", "Extract people, places, organizations, problems, actions, and outcomes as compact JSON."),
+    ("tone", "Identify the tone, intended audience, and two implied assumptions in the passage."),
+    ("headline", "Write a headline, a one-sentence deck, and five search keywords for the passage."),
+    ("faq", "Turn the passage into a short FAQ with four questions and direct answers."),
+    ("compress", "Compress the passage to at most 90 words without losing the causal chain."),
+    ("compare", "Compare the passage with a similar situation from another field, making the analogy explicit."),
+    ("dialogue", "Turn the passage into a short dialogue between two people who disagree but listen carefully."),
+    ("critique", "Write a constructive critique of the decision or design described in the passage."),
+    ("abstract", "Write an academic-style abstract for the passage in 120 words or fewer."),
+    ("it", "Translate the passage into natural Italian, preserving names and concrete details."),
+    ("es", "Translate the passage into natural Spanish, preserving names and concrete details."),
+    ("zh", "Translate the passage into Simplified Chinese, preserving names and concrete details."),
+]
+
+
+def make_language_records(records: list[Record]) -> None:
+    """Add non-code prose tasks.
+
+    The passages above are original public-domain-compatible calibration text
+    written for this repository.  They cover summarization, rewriting, editing,
+    information extraction, and multilingual prose so the imatrix is not shaped
+    almost entirely by source-code and agent transcripts.
+    """
+
+    system = (
+        "You are a careful language assistant. Preserve meaning, names, numbers, "
+        "and causal relationships. Do not invent facts not supported by the text."
+    )
+    for source, passage in LANGUAGE_PASSAGES:
+        for label, instruction in LANGUAGE_TASKS:
+            add_record(records, "language", f"{source}:{label}", [
+                {"role": "system", "content": system},
+                {"role": "user", "content": f"{instruction}\n\nPassage:\n{passage}"},
+            ])
+
+
+def c_scan_string_end(text: str, pos: int) -> int:
+    """Return the index after a C string literal starting at ``pos``."""
+
+    assert text[pos] == '"'
+    pos += 1
+    while pos < len(text):
+        ch = text[pos]
+        if ch == "\\":
+            pos += 2
+            continue
+        if ch == '"':
+            return pos + 1
+        pos += 1
+    raise ValueError("unterminated C string literal")
+
+
+def c_string_value_at(text: str, pos: int) -> tuple[str, int]:
+    """Parse one or more adjacent C string literals.
+
+    ``ds4_eval.c`` uses ordinary escaped C strings for embedded questions.  We
+    reuse those definitions instead of duplicating 75 benchmark prompts in this
+    generator.  Python's literal parser handles the escaped newlines, quotes,
+    and backslashes used by these string initializers.
+    """
+
+    parts: list[str] = []
+    while True:
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        if pos >= len(text) or text[pos] != '"':
+            break
+        end = c_scan_string_end(text, pos)
+        parts.append(ast.literal_eval(text[pos:end]))
+        pos = end
+    if not parts:
+        raise ValueError("expected C string literal")
+    return "".join(parts), pos
+
+
+def eval_case_blocks(eval_source: str) -> list[str]:
+    marker = "static const eval_case eval_cases[]"
+    start = eval_source.find(marker)
+    if start < 0:
+        raise ValueError("missing eval_cases array")
+    pos = eval_source.find("{", start)
+    if pos < 0:
+        raise ValueError("missing eval_cases initializer")
+
+    blocks: list[str] = []
+    depth = 1
+    case_start: int | None = None
+    pos += 1
+    in_string = False
+    in_char = False
+    line_comment = False
+    block_comment = False
+    escape = False
+    while pos < len(eval_source):
+        ch = eval_source[pos]
+        nxt = eval_source[pos + 1] if pos + 1 < len(eval_source) else ""
+
+        if line_comment:
+            if ch == "\n":
+                line_comment = False
+            pos += 1
+            continue
+        if block_comment:
+            if ch == "*" and nxt == "/":
+                block_comment = False
+                pos += 2
+            else:
+                pos += 1
+            continue
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            pos += 1
+            continue
+        if in_char:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == "'":
+                in_char = False
+            pos += 1
+            continue
+
+        if ch == "/" and nxt == "/":
+            line_comment = True
+            pos += 2
+            continue
+        if ch == "/" and nxt == "*":
+            block_comment = True
+            pos += 2
+            continue
+        if ch == '"':
+            in_string = True
+            pos += 1
+            continue
+        if ch == "'":
+            in_char = True
+            pos += 1
+            continue
+        if ch == "{":
+            depth += 1
+            if depth == 2:
+                case_start = pos
+        elif ch == "}":
+            if depth == 2 and case_start is not None:
+                blocks.append(eval_source[case_start:pos + 1])
+                case_start = None
+            depth -= 1
+            if depth == 0:
+                break
+        pos += 1
+
+    return blocks
+
+
+def c_field_string(block: str, field: str) -> str:
+    m = re.search(rf"\.{re.escape(field)}\s*=", block)
+    if not m:
+        return ""
+    value, _ = c_string_value_at(block, m.end())
+    return value
+
+
+def c_choice_strings(block: str) -> list[str]:
+    choices: dict[int, str] = {}
+    for m in re.finditer(r"\.choice\[(\d+)\]\s*=", block):
+        value, _ = c_string_value_at(block, m.end())
+        choices[int(m.group(1))] = value
+    return [choices[i] for i in sorted(choices)]
+
+
+def build_eval_imatrix_prompt(case: dict) -> str:
+    out = [case["question"], ""]
+    choices = case["choices"]
+    if choices:
+        out.append("Choices:")
+        for i, choice in enumerate(choices):
+            out.append(f"{chr(ord('A') + i)}. {choice}")
+        out.append("")
+        out.append(
+            "Solve the question. At the end, write exactly one final line in "
+            "this format and do not write anything after it:"
+        )
+        out.append("Answer: <letter>")
+    else:
+        out.append(
+            "Solve the problem. At the end, write exactly one final line in "
+            "this format and do not write anything after it:"
+        )
+        out.append("Answer: <integer>")
+    return "\n".join(out)
+
+
+def make_eval_reasoning_records(root: Path, records: list[Record]) -> None:
+    """Include the exact benchmark prompt family used by ``ds4-eval``.
+
+    The benchmark cases are already embedded in ``ds4_eval.c`` with source
+    licensing notes.  This parser keeps the imatrix corpus synchronized with the
+    integration harness while excluding answer keys from model-visible text.
+    """
+
+    text = read_text(root / "ds4_eval.c")
+    system = (
+        "You are solving a hard benchmark question. Reason carefully. "
+        "The final answer must follow the requested format exactly."
+    )
+    for idx, block in enumerate(eval_case_blocks(text)):
+        case = {
+            "source": c_field_string(block, "source"),
+            "id": c_field_string(block, "id"),
+            "domain": c_field_string(block, "domain"),
+            "title": c_field_string(block, "title"),
+            "question": c_field_string(block, "question"),
+            "choices": c_choice_strings(block),
+        }
+        prompt = build_eval_imatrix_prompt(case)
+        source = f"{case['source']}:{case['id'] or idx}"
+        title = f"{case['source']} / {case['domain']} / {case['title']}"
+        add_record(records, "eval_reasoning", source, [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"{title}\n\n{prompt}"},
+        ])
+
+
 def make_long_context_records(root: Path, records: list[Record]) -> None:
+    """Add realistic long-context prompts.
+
+    These records are meant to expose routed FFNs to activations produced after
+    attention has integrated distant evidence.  They are not pure length padding:
+    every prompt asks the model to recover, compare, diagnose, or obey details
+    that occur far apart in the context.
+    """
+
     sources = [
         ("README.md", read_text(root / "README.md")),
         ("AGENT.md", read_text(root / "AGENT.md")),
         ("METAL.md", read_text(root / "METAL.md")),
+        ("gguf-tools/imatrix/README.md", read_text(root / "gguf-tools/imatrix/README.md")),
+        ("gguf-tools/imatrix/dataset/README.md", read_text(root / "gguf-tools/imatrix/dataset/README.md")),
+        ("gguf-tools/quality-testing/README.md", read_text(root / "gguf-tools/quality-testing/README.md")),
         ("ds4_server.c", read_text(root / "ds4_server.c")),
         ("ds4_metal.m", read_text(root / "ds4_metal.m")),
         ("metal/dsv4_hc.metal", read_text(root / "metal/dsv4_hc.metal")),
         ("metal/moe.metal", read_text(root / "metal/moe.metal")),
+        ("metal/dense.metal", read_text(root / "metal/dense.metal")),
     ]
-    blocks = []
+    by_name: dict[str, list[str]] = {}
     for name, text in sources:
-        for i, chunk in enumerate(chunk_text(text, size=5200, overlap=120)[:6]):
-            blocks.append(f"### {name} chunk {i}\n{chunk}")
+        chunks = chunk_text(text, size=3600, overlap=120)[:8]
+        if chunks:
+            by_name[name] = [f"### {name} chunk {i}\n{chunk}" for i, chunk in enumerate(chunks)]
+
+    def block(name: str, idx: int) -> str:
+        chunks = by_name.get(name) or []
+        if not chunks:
+            return f"### {name}\n(unavailable)"
+        return chunks[idx % len(chunks)]
+
+    def add_long(label: str, instruction: str, parts: list[str]) -> None:
+        body = "\n\n".join(p for p in parts if p)
+        add_record(records, "long_context", label, [
+            {"role": "system", "content": DEFAULT_SYSTEM},
+            {"role": "user", "content": instruction + "\n\n" + body},
+        ])
+
+    # Codebase synthesis: several distant implementation excerpts that require
+    # understanding cross-file contracts rather than a single local snippet.
+    add_long("codebase:sampling-cache", (
+        "Read these repository excerpts as one long context. Explain how prompt "
+        "rendering, KV disk-cache lookup, and tool replay interact. Identify two "
+        "ways a future patch could accidentally cause a useless re-prefill."
+    ), [
+        block("ds4_server.c", 1),
+        block("ds4_server.c", 4),
+        block("ds4.c", 2),
+        block("README.md", 1),
+    ])
+    add_long("codebase:metal-moe", (
+        "Read these long code excerpts and summarize the dataflow from routed "
+        "expert selection through MoE execution. Name the tensors whose value "
+        "distribution matters for imatrix collection."
+    ), [
+        block("ds4.c", 5),
+        block("ds4_metal.m", 3),
+        block("metal/moe.metal", 0),
+        block("metal/dsv4_hc.metal", 1),
+    ])
+    add_long("codebase:server-protocols", (
+        "Compare the protocol and server excerpts. What state must survive across "
+        "tool calls, process restarts, and client replay? Return a concise list of "
+        "invariants and the first log line you would add when debugging."
+    ), [
+        block("README.md", 0),
+        block("ds4_server.c", 0),
+        block("ds4_server.c", 3),
+        block("AGENT.md", 0),
+    ])
+    add_long("codebase:eval-imatrix", (
+        "Use the following excerpts to explain how the evaluation harness and the "
+        "imatrix dataset differ in purpose. Mention which parts affect model "
+        "quality measurement and which parts affect quantization calibration."
+    ), [
+        block("gguf-tools/imatrix/README.md", 0),
+        block("gguf-tools/imatrix/dataset/README.md", 0),
+        block("ds4.c", 6),
+        block("README.md", 2),
+    ])
+
+    # Agent transcript replay: the model must connect early user intent, later
+    # tool outputs, and repeated status/error text before deciding the next step.
+    transcript_a = "\n".join([
+        "USER: The server resumed an old coding session and got slower after a tool call.",
+        "ASSISTANT TOOL_CALL bash: rg -n \"canonicalization|responses replay|kv cache hit\" ds4_server.c",
+        "TOOL_RESULT:",
+        TOOL_RESULTS["grep-hit"],
+        "ASSISTANT: The first grep hit points to the renderer; I need logs next.",
+        "USER: Here is the trace excerpt. Do not change protocol semantics, only avoid useless rebuilds.",
+        "TRACE:",
+        "\n".join(f"0514 00:{30+i:02d}:14 ds4-server: chat ctx={12288+i*257}..{13000+i*257}:712 RESPPROTO TOOLS prefill chunk {i*128}/712 ({i*18}.0%) chunk=151.{i} t/s avg=149.{i} t/s" for i in range(6)),
+        "0514 00:36:37 ds4-server: tool checkpoint canonicalized ctx=13257..16846:3589 common=16846 live=16994 canonical=16937 via=rebuild",
+        "USER: What minimal next patch would you inspect first?",
+    ])
+    add_long("agent-transcript:responses-rebuild", (
+        "Read the long agent transcript and trace. Diagnose the likely source of "
+        "the wasted work and propose the next file/function to inspect first."
+    ), [transcript_a, block("ds4_server.c", 2), block("ds4_server.c", 5)])
+
+    transcript_b = "\n".join([
+        "USER: Please test CUDA on the remote machine, then check whether Metal has the same bug.",
+        "ASSISTANT TOOL_CALL bash: ssh 0.180 'cd ds4.c && make clean && make cuda && ./tests/cuda_long_context_smoke'",
+        "TOOL_RESULT:",
+        "nvcc -O3 --use_fast_math -o ds4-server ...\nlong_context_smoke: PASS tokens=81920 prefill=412.5s gen=128\n",
+        "ASSISTANT TOOL_CALL read_file: ds4_cuda.c lines 500..680",
+        "TOOL_RESULT:",
+        "cuda kernel uses kv_row_kind to branch raw/compressed writes; host path checks ctx rows before launch.\n",
+        "USER: Do not assume. Compare with Metal and tell me whether the issue exists there too.",
+        "ASSISTANT TOOL_CALL read_file: ds4_metal.m lines 900..1120",
+        "TOOL_RESULT:",
+        "Metal path stores raw and compressed KV through distinct command encoders and asserts the row range before dispatch.\n",
+        "USER: Summarize the conclusion and what regression test would catch this later.",
+    ])
+    add_long("agent-transcript:cuda-metal", (
+        "Read the long tool transcript. Produce a conclusion that distinguishes "
+        "confirmed facts from inferences, and name the regression test that would "
+        "make the issue findable in the future."
+    ), [transcript_b, block("ds4_metal.m", 2), block("metal/dense.metal", 0)])
+
+    transcript_c = "\n".join([
+        "USER: The benchmark TUI flickers after I press arrows.",
+        "ASSISTANT TOOL_CALL bash: git show 5b92e9b:ds4_eval.c | sed -n '1100,1260p'",
+        "TOOL_RESULT:",
+        "old renderer writes left panel only at safe boundaries and streams sampled bytes only in the right panel.\n",
+        "USER: Return to that model. Add raw mode and a stdin thread, but do not interleave writes.",
+        "ASSISTANT TOOL_CALL bash: ./ds4-eval --questions 2 --trace /tmp/eval.trace",
+        "TOOL_RESULT:",
+        "screen ok; arrows move selection; running case continues without left-panel corruption.\n",
+        "USER: Commit.",
+    ])
+    add_long("agent-transcript:tui-state", (
+        "Given this transcript and the code excerpts, explain the rendering state "
+        "model that avoids flicker and why input handling must be consumed only "
+        "at safe points."
+    ), [transcript_c, block("ds4.c", 0), block("ds4_server.c", 6)])
+
+    # Log/trace diagnosis: repeated operational logs with relevant details
+    # buried among normal progress lines.
+    cache_trace = "\n".join(
+        [f"0515 19:{10+i//6:02d}:{10+i%6*8:02d} ds4-server: chat ctx={20480+i*256}..{22528+i*256}:2048 TOOLS prefill chunk {min(2048, i*96)}/2048 ({min(100, i*4)}.0%) chunk={180-i%7*3}.12 t/s avg={176-i%5*2}.44 t/s" for i in range(28)] +
+        [
+            "0515 19:49:03 ds4-server: kv cache stored tokens=32768 trimmed=0 reason=continued key=token-text size=475.01 MiB save=83.4 ms",
+            "0515 19:49:04 ds4-server: kv cache evicted reason=disk-cache-full tokens=10240 hits=31 size=157.34 MiB file=/tmp/kvcache/old-hot.kv",
+            "0515 19:49:04 ds4-server: kv cache hit text tokens=32768 text=129332 quant=2 key=token-text load=41.7 ms file=/tmp/kvcache/new-frontier.kv",
+        ]
+    )
+    add_long("trace:kv-eviction", (
+        "Analyze this long cache trace. Explain whether eviction favored a useful "
+        "frontier or a stale once-hot file, and state which signal in the log "
+        "supports your conclusion."
+    ), [cache_trace])
+
+    tool_trace = "\n".join(
+        [f"0514 22:{16+i//10:02d}:{10+i%10*5:02d} ds4-server: chat ctx=13695..22840:9145 gen={5000+i*25} TOOLS DSML_START decoding chunk=16.{i%9}6 t/s avg=17.{i%5}0 t/s" for i in range(36)] +
+        [
+            "0514 22:17:06 ds4-server: chat ctx=13695..22840:9145 gen=6080 TOOLS DSML_START DSML_END finish=tool_calls",
+            "0514 22:17:06 ds4-server: tool parse recovered loose nested parameter name=write",
+            "0514 22:17:06 ds4-server: tool calls ctx=13695..22840:9145 n=1 names=[write]",
+        ]
+    )
+    add_long("trace:tool-recovery", (
+        "Read the long tool-call trace. Explain why returning a recoverable tool "
+        "result is better than failing the server request, and identify the first "
+        "line showing the model intended a tool call."
+    ), [tool_trace])
+
+    speed_trace = "\n".join(
+        [f"ctx_tokens={2048+i*2048},prefill_tps={232.4-i*2.1:.2f},gen_tps={19.0-i*0.08:.2f},kvcache_bytes={52184460+i*28188672}" for i in range(32)] +
+        ["note: one outlier at ctx=69632 has prefill_tps=124.32 and gen_tps=14.47"]
+    )
+    add_long("trace:speed-curve", (
+        "Given this long benchmark CSV excerpt, describe the trend without "
+        "overfitting to single-row noise. Name one plausible reason prefill and "
+        "generation slopes differ."
+    ), [speed_trace])
+
+    # Prose fact recovery: natural long story, not an artificial isolated
+    # needle, with facts spelled in words and requested later as structured data.
+    people = [
+        ("Alice", "fifty-two", 52, "kept the ferry accounts"),
+        ("Bruno", "seventeen", 17, "repaired the school roof"),
+        ("Caterina", "eighty-one", 81, "organized the archive"),
+        ("Diego", "thirty-four", 34, "mapped the old orchard"),
+        ("Elena", "sixty-eight", 68, "ran the clinic calendar"),
+        ("Farid", "twenty-nine", 29, "maintained the radio tower"),
+        ("Giulia", "ninety-three", 93, "cataloged the harbor tools"),
+        ("Hana", "forty-six", 46, "translated the notices"),
+        ("Ivan", "seventy-five", 75, "surveyed the river path"),
+        ("Marta", "eleven", 11, "tracked the bakery deliveries"),
+    ]
+    story_parts = []
+    for idx, (name, word, _num, job) in enumerate(people):
+        story_parts.append(
+            f"During week {idx + 1}, {name} {job}. The committee did not write "
+            f"{name}'s reference as digits; in the minutes it was spelled out as "
+            f"{word}, because the secretary wanted all assignments to look uniform."
+        )
+        story_parts.append(LANGUAGE_PASSAGES[idx % len(LANGUAGE_PASSAGES)][1])
+    add_long("story:assigned-numbers", (
+        "Read the long community story. Extract only the assignment references "
+        "for named people and return them as Name=number pairs, one per line."
+    ), ["\n\n".join(story_parts)])
+
+    # Document comparison: long policy/spec style context from multiple docs.
+    add_long("document-comparison:cache-eval-imatrix", (
+        "Compare these documents. Identify three tensions between benchmark "
+        "quality, imatrix representativeness, and disk-cache behavior, then "
+        "propose a practical compromise for each."
+    ), [
+        block("README.md", 3),
+        block("gguf-tools/imatrix/README.md", 0),
+        block("gguf-tools/quality-testing/README.md", 0),
+        block("AGENT.md", 1),
+    ])
+
+    # Needle-in-haystack: keep one small slice. The useful signal is the long
+    # context plus exact retrieval, not the artificial format by itself.
+    hay = []
+    for i in range(24):
+        hay.append(LANGUAGE_PASSAGES[(i * 5) % len(LANGUAGE_PASSAGES)][1])
+        if i == 17:
+            hay.append("Inspection note: the emergency calibration phrase is LANTERN-4827-CEDAR.")
+    add_long("needle:calibration-phrase", (
+        "Most of the following context is ordinary prose. Find the emergency "
+        "calibration phrase and quote it exactly, then explain where it appeared."
+    ), ["\n\n".join(hay)])
+
+    # Delayed constraint following: early requirements must survive a large body
+    # of intervening realistic context.
+    early_constraints = (
+        "Initial requirements, written before the long context: answer in exactly "
+        "four bullets; each bullet must start with SAFE:, FAST:, CLEAR:, or TEST:; "
+        "do not mention implementation details unless they appear in the context."
+    )
+    add_long("delayed-constraints:server-plan", (
+        "Follow the initial requirements after reading all context. Produce the "
+        "requested four-bullet plan and preserve the required prefixes."
+    ), [
+        early_constraints,
+        block("ds4_server.c", 1),
+        block("ds4_server.c", 5),
+        block("README.md", 4),
+        block("metal/moe.metal", 1),
+    ])
+
+    # Keep the older shuffled source-excerpt shape as a small background slice.
+    blocks = [chunk for chunks in by_name.values() for chunk in chunks[:4]]
     random.Random(7).shuffle(blocks)
-    for i in range(0, len(blocks), 4):
+    for i in range(0, min(len(blocks), 16), 4):
         group = blocks[i:i + 4]
         if len(group) < 2:
             continue
@@ -1388,7 +2170,7 @@ def write_outputs(outdir: Path, records: list[Record]) -> None:
 
     rendered_bytes = sum(len(r.rendered.encode("utf-8")) for r in records)
     manifest = {
-        "version": 3,
+        "version": 4,
         "purpose": "DeepSeek V4 Flash imatrix calibration prompts",
         "record_count": len(records),
         "rendered_utf8_bytes": rendered_bytes,
@@ -1422,7 +2204,9 @@ def main() -> None:
     make_general_records(records)
     make_programming_records(records)
     make_algorithm_records(records)
+    make_language_records(records)
     make_translation_records(records)
+    make_eval_reasoning_records(root, records)
     make_long_context_records(root, records)
     write_outputs(outdir, records)
 

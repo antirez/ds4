@@ -30,6 +30,7 @@ typedef struct {
     int ctx_size;
     float temperature;
     float top_p;
+    float min_p;
     uint64_t seed;
     bool dump_tokens;
     const char *dump_logprobs_path;
@@ -125,6 +126,8 @@ static void usage(FILE *fp) {
         "      Sampling temperature. 0 is greedy/deterministic. Default: 1\n"
         "  --top-p F\n"
         "      Nucleus sampling probability. Default: 1\n"
+        "  --min-p F\n"
+        "      Keep tokens scoring at least F times the top token. Default: 0.05\n"
         "  --seed N\n"
         "      Sampling seed for reproducible non-greedy runs. Default: time-based\n"
         "  --think\n"
@@ -500,7 +503,8 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     int generated = 0;
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
-        int token = ds4_session_sample(session, cfg->gen.temperature, 0, cfg->gen.top_p, 0.0f, &rng);
+        int token = ds4_session_sample(session, cfg->gen.temperature, 0,
+                                       cfg->gen.top_p, cfg->gen.min_p, &rng);
         if (token == ds4_token_eos(engine)) break;
 
         int toks[17];
@@ -961,7 +965,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                                        cfg->gen.temperature,
                                        0,
                                        cfg->gen.top_p,
-                                       0.0f,
+                                       cfg->gen.min_p,
                                        &rng);
         if (token == ds4_token_eos(engine)) break;
 
@@ -1196,8 +1200,9 @@ static cli_config parse_options(int argc, char **argv) {
             .system = "You are a helpful assistant",
             .n_predict = 50000,
             .ctx_size = 32768,
-            .temperature = 1.0f,
-            .top_p = 1.0f,
+            .temperature = DS4_DEFAULT_TEMPERATURE,
+            .top_p = DS4_DEFAULT_TOP_P,
+            .min_p = DS4_DEFAULT_MIN_P,
             .dump_logprobs_top_k = 20,
             .think_mode = DS4_THINK_HIGH,
         },
@@ -1240,6 +1245,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.temperature = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
         } else if (!strcmp(arg, "--top-p")) {
             c.gen.top_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
+        } else if (!strcmp(arg, "--min-p")) {
+            c.gen.min_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {

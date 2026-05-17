@@ -222,7 +222,9 @@ For local deployment, it recommends:
 - At least 384K context for Think Max
 
 These are deployment recommendations from the model card, not necessarily the
-same settings used for deterministic benchmarking.
+same settings used for deterministic benchmarking. DS4 keeps `top_p=1.0` but
+adds a local `min_p=0.05` default to avoid sampling tokens whose probability is
+far below the best token.
 
 ## Licensing
 
