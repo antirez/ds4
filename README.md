@@ -71,6 +71,12 @@ This is a community fork (`SiNaPsEr0x/ds4`). The list below tracks the
 user-visible deltas relative to upstream `antirez/ds4`. The most recent
 change is on top.
 
+- **Windows build fixes for CUDA 13.x + MSVC 14.4** — `/Zc:preprocessor`
+  for CCCL, `extern "C"` shim header for the CUDA TU, 64-bit `off_t`,
+  `SSIZE_MAX`, `__thread`, `gettimeofday`/`localtime_r`/`useconds_t`/
+  `_SC_NPROCESSORS_ONLN`/`F_OK` shims, plus `.gitignore` rules for the
+  `build/` tree and MSVC artifacts. The CMake build now produces
+  `ds4-server.exe`, `ds4-bench.exe`, `ds4-eval.exe` end-to-end.
 - **Native Windows + CUDA build path** for `ds4-server`, `ds4-bench`,
   and `ds4-eval` via MSVC + CUDA Toolkit ≥ 12.8 (sm_120 Blackwell).
   See [Windows port (CUDA)](#windows-port-cuda) below for prerequisites,

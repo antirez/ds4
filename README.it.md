@@ -117,6 +117,12 @@ Questo è un fork community (`SiNaPsEr0x/ds4`). L'elenco sotto traccia le
 modifiche user-visible rispetto a upstream `antirez/ds4`. La modifica più
 recente è in cima.
 
+- **Fix build Windows per CUDA 13.x + MSVC 14.4** — `/Zc:preprocessor`
+  per CCCL, blocco `extern "C"` nello shim header per la TU CUDA, `off_t`
+  64-bit, shim per `SSIZE_MAX`, `__thread`, `gettimeofday`, `localtime_r`,
+  `useconds_t`, `_SC_NPROCESSORS_ONLN`, `F_OK`, più regole `.gitignore`
+  per l'albero `build/` e gli artefatti MSVC. Il build CMake ora produce
+  `ds4-server.exe`, `ds4-bench.exe`, `ds4-eval.exe` end-to-end.
 - **Build nativa Windows + CUDA** per `ds4-server`, `ds4-bench` e
   `ds4-eval` tramite MSVC + CUDA Toolkit ≥ 12.8 (sm_120 Blackwell).
   Vedi [Port Windows (CUDA)](#port-windows-cuda) sotto per prerequisiti,

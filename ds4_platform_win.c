@@ -397,6 +397,11 @@ long ds4_win_sysconf(int name) {
         GetSystemInfo(&si);
         return (long)si.dwPageSize;
     }
+    if (name == _SC_NPROCESSORS_ONLN) {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        return (long)si.dwNumberOfProcessors;
+    }
     return -1;
 }
 
@@ -450,6 +455,21 @@ int ds4_win_clock_gettime(int clk, struct timespec *ts) {
     ts->tv_sec  = (time_t)(now.QuadPart / freq.QuadPart);
     long long rem = now.QuadPart % freq.QuadPart;
     ts->tv_nsec = (long)((rem * 1000000000LL) / freq.QuadPart);
+    return 0;
+}
+
+int ds4_win_gettimeofday(struct timeval *tv, void *tz) {
+    (void)tz;
+    if (!tv) return -1;
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER u;
+    u.LowPart  = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    const unsigned long long EPOCH_DIFF_100NS = 116444736000000000ULL;
+    unsigned long long ticks = u.QuadPart - EPOCH_DIFF_100NS;
+    tv->tv_sec  = (long)(ticks / 10000000ULL);
+    tv->tv_usec = (long)((ticks % 10000000ULL) / 10ULL);
     return 0;
 }
 

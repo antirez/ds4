@@ -90,6 +90,16 @@ static inline int ds4_socket_set_nonblocking(int fd) {
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 
+/* MSVC's <sys/types.h> defines off_t as 32-bit `long`, which is too narrow for
+ * the 64-bit file offsets DS4 passes around (model files routinely exceed 4
+ * GB).  Suppress the CRT's typedef so our own __int64 off_t below is the only
+ * one in scope. */
+#ifndef _OFF_T_DEFINED
+#define _OFF_T_DEFINED
+typedef __int64 _off_t;
+typedef __int64 off_t;
+#endif
+
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -106,6 +116,28 @@ static inline int ds4_socket_set_nonblocking(int fd) {
 #include <string.h>
 #include <time.h>
 #include <errno.h>
+#include <signal.h>
+
+/* POSIX access() mode constants — MSVC's <io.h> uses bare integer literals. */
+#ifndef F_OK
+#define F_OK 0
+#endif
+#ifndef X_OK
+#define X_OK 1 /* not really supported by _access; same as F_OK on MSVC */
+#endif
+#ifndef W_OK
+#define W_OK 2
+#endif
+#ifndef R_OK
+#define R_OK 4
+#endif
+
+/* Everything below is callable from both C (ds4.c, ds4_server.c, ...) and C++
+ * (ds4_cuda.cu).  Wrap declarations in extern "C" so the same .obj/.lib
+ * defined in ds4_platform_win.c links cleanly into both. */
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /* MSVC doesn't ship strings.h; the only thing the codebase uses from it is
  * strcasecmp/strncasecmp.  Map to MSVC's _stricmp/_strnicmp. */
@@ -118,9 +150,28 @@ static inline int ds4_socket_set_nonblocking(int fd) {
 typedef SSIZE_T ssize_t;
 #endif
 
+/* useconds_t: POSIX type used in <unistd.h>'s usleep prototype.  MSVC
+ * doesn't ship it.  ds4_eval.c casts pause_ms*1000 to (useconds_t); the
+ * actual usleep() inline is declared later, after windows.h is in scope. */
+#if defined(_MSC_VER) && !defined(useconds_t)
+typedef unsigned long useconds_t;
+#endif
+
+/* SSIZE_MAX is POSIX; MSVC doesn't define it.  On 64-bit Windows SSIZE_T is
+ * 64-bit so it matches LLONG_MAX. */
+#include <limits.h>
+#ifndef SSIZE_MAX
+#define SSIZE_MAX LLONG_MAX
+#endif
+
 /* Attribute macros: MSVC doesn't understand __attribute__ at all. */
 #define DS4_UNUSED
 #define DS4_NORETURN __declspec(noreturn)
+
+/* GCC/Clang's __thread storage qualifier maps to MSVC's __declspec(thread). */
+#if defined(_MSC_VER) && !defined(__thread)
+#define __thread __declspec(thread)
+#endif
 
 /* MinGW provides __attribute__ but we still want the unified macro names. */
 #ifdef __GNUC__
@@ -323,10 +374,26 @@ typedef int clockid_t;
 int ds4_win_clock_gettime(int clk, struct timespec *ts);
 #define clock_gettime(clk, ts) ds4_win_clock_gettime((int)(clk), ts)
 
+/* gettimeofday: POSIX has it in <sys/time.h>; not on MSVC.  Emulate via the
+ * same QueryPerformanceCounter-based path we use for clock_gettime.  struct
+ * timeval is already declared by winsock2.h, included above. */
+int ds4_win_gettimeofday(struct timeval *tv, void *tz);
+#define gettimeofday(tv, tz) ds4_win_gettimeofday(tv, tz)
+
+/* localtime_r: thread-safe variant.  MSVC's localtime_s has the result/tz
+ * arguments swapped relative to POSIX; wrap it. */
+static __inline struct tm *ds4_win_localtime_r(const time_t *t, struct tm *out) {
+    return (localtime_s(out, t) == 0) ? out : (struct tm *)0;
+}
+#define localtime_r(t, out) ds4_win_localtime_r(t, out)
+
 /* sysconf(_SC_PAGESIZE) is used by the CUDA backend to align mmap'd regions.
  * On Windows we map it to GetSystemInfo. */
 #ifndef _SC_PAGESIZE
 #define _SC_PAGESIZE 30
+#endif
+#ifndef _SC_NPROCESSORS_ONLN
+#define _SC_NPROCESSORS_ONLN 84
 #endif
 long ds4_win_sysconf(int name);
 #define sysconf(n) ds4_win_sysconf(n)
@@ -350,9 +417,7 @@ static inline int ds4_win_ftruncate(int fd, long long len) {
 #define fseeko(fp, off, whence) _fseeki64(fp, (__int64)(off), whence)
 #define ftello(fp)              _ftelli64(fp)
 typedef __int64 off64_t;
-#ifndef off_t
-typedef __int64 off_t;
-#endif
+/* off_t is already typedef'd to __int64 above (with _OFF_T_DEFINED guard). */
 
 /* dprintf(fd, fmt, ...) — POSIX-only.  Format into a buffer, then _write. */
 int ds4_win_dprintf(int fd, const char *fmt, ...);
@@ -391,6 +456,10 @@ int  ds4_win_console_input_ready(void);
 #ifndef TIOCGWINSZ
 #define TIOCGWINSZ 0x5413
 struct winsize { unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel; };
+#endif
+
+#ifdef __cplusplus
+} /* extern "C" */
 #endif
 
 #endif /* _WIN32 */

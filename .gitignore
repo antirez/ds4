@@ -13,3 +13,40 @@
 /misc/
 .*.swp
 .DS_Store
+
+# --- CMake out-of-source build (Windows + Linux generic) -------------------
+/build/
+/build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CMakeUserPresets.json
+
+# --- MSVC / Visual Studio toolchain artifacts ------------------------------
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.idb
+*.obj
+*.pch
+*.tlog
+*.suo
+*.sln
+*.vcxproj
+*.vcxproj.user
+*.vcxproj.filters
+*.sdf
+*.opensdf
+*.VC.db
+.vs/
+
+# --- Editor / IDE state ----------------------------------------------------
+.vscode/
+.idea/
+*.code-workspace
+
+# --- Claude Code agent state (private to each contributor) -----------------
+.claude/

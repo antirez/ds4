@@ -78,6 +78,8 @@ add_compile_options(
     $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/O2>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/fp:fast>
+    # CUDA 13.x CCCL headers refuse the MSVC traditional preprocessor.
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
     $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
 )
@@ -112,14 +114,7 @@ foreach(t ds4-server ds4-bench ds4-eval)
     set_target_properties(${t} PROPERTIES LINKER_LANGUAGE CUDA)
 endforeach()
 
-# Copy CUDA runtime DLLs next to the .exes so the binaries can be launched
-# from any working directory.  This is a no-op if the DLLs are already in
-# %PATH% (the default after a clean CUDA Toolkit install).
-foreach(t ds4-server ds4-bench ds4-eval)
-    add_custom_command(TARGET ${t} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_RUNTIME_DLLS:${t}>
-            $<TARGET_FILE_DIR:${t}>
-        COMMAND_EXPAND_LISTS
-    )
-endforeach()
+# CUDA runtime DLLs (cudart64_*.dll, cublas64_*.dll, …) are loaded from the
+# %PATH% that the CUDA Toolkit installer prepends.  We deliberately do NOT
+# copy them next to the .exe: TARGET_RUNTIME_DLLS is empty for our import
+# libs and the empty-list copy_if_different fails the post-build step.
