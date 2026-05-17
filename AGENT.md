@@ -91,11 +91,23 @@ promessi_sposi prompt, no weight server:
 | PRO 6000 Blackwell sm_120 (~1.8 TB/s GDDR7) | **1092** | 373   | 373   |
 | GB10 Spark sm_121 (~546 GB/s LPDDR5X)       | **458**  | 401   | 56    |
 
-With the proof-budget weight server backing the same bench on PRO 6000,
-mmq jumps to ~2200 prefill at ctx=2048 (2x of direct-load); cuBLAS and
-warp8 see comparable gains.  The weight server's VMM-mapped weights are
-faster across all three paths; use it for any multi-process bench or
-when reproducible peak prefill matters.
+As of the in-process VMM arena commit (`cuda: route fd-cache through the
+VMM arena when supported`), single-process runs on discrete GPUs also
+land in the ~2 MiB-page layout that the weight server uses: PRO 6000 mmq
+prefill at ctx=2048 went from 1076 (arena baseline) to 2196 with the
+in-process VMM allocator -- within 0.07% of the weight server's 2197
+ceiling. The win persists across the entire ctx sweep (1.87x at
+ctx=32768). See `local/docs/ds4_inprocess_vmm_plan.html` for the design
+and `local/docs/ds4_vmm_landing/pod_{arena,vmm}.csv` for the A/B.
+
+The weight server remains the right answer when more than one process
+holds the same model concurrently (proof harness, multi-profile sweeps,
+MTP correctness) -- it amortises the ~60 s base upload across N workers.
+For a single ds4-bench, ds4-server, or one-shot ./ds4 -p ..., the
+in-process allocator now gives the same prefill ceiling with no setup
+tax. Opt out via `DS4_CUDA_VMM_ARENA=0` (escape hatch for profiler
+quirks); auto-disabled when the worker is already importing weights
+from a weight server (`DS4_CUDA_WEIGHT_IPC_MANIFEST` set).
 
 The MTP verifier (Option D, `DS4_CUDA_MTP_VERIFIER_USE_MMQ`) forces
 warp8 inside the verifier regardless of the chosen strategy, because
@@ -212,6 +224,13 @@ each process pays the full base-model upload cost (~67 s for V4 Flash Q2 on
 PRO 6000) and an MTP gguf alongside the base may OOM due to single-allocation
 fragmentation even when total free VRAM is sufficient.
 
+For *single*-process runs the in-process VMM arena (auto-enabled wherever
+the driver supports `cuMemCreate`) already gives the same 2 MiB-page
+layout the weight server uses, so the prefill ceiling is reached without
+a sidecar -- no manifest, no broker socket, no lock file. The weight
+server is only worth the setup cost when N >= 2 processes share the
+same model on the same card.
+
 Two patterns:
 
 **Proof harness (recommended)** — let the harness manage lifecycle:
@@ -249,4 +268,19 @@ Notes:
   (`pkill -9 -f ds4_weight_server`) before retrying.
 - For a single one-shot `./ds4 -p ...` invocation the load cost is
   amortized over generation and the weight server is not worth setting
-  up; use it for repeatable bench/proof workflows.
+  up; the in-process VMM arena gives the same prefill ceiling with no
+  setup tax. Use the weight server only when more than one process
+  shares the model.
+
+In-process VMM arena env vars:
+- `DS4_CUDA_VMM_ARENA=0`: disable the in-process VMM allocator; fall
+  back to `cudaMalloc`-backed arena. Escape hatch for profiler quirks
+  with VMM-mapped ranges; unset (or any non-`0` value) enables.
+- `DS4_CUDA_VMM_ARENA_CHUNK_MB=N`: minimum chunk size per
+  `cuMemCreate`. Default 0 (chunk = request size, rounded up to
+  granularity; matches the weight server's per-range allocation).
+  Override only if the driver's per-process mapping count becomes a
+  concern.
+- Hard gated off when `DS4_CUDA_WEIGHT_IPC_MANIFEST` is set, because
+  the sidecar already provides identical VMM ranges and running both
+  would double-allocate the model.
