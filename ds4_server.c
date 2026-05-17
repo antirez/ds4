@@ -5055,8 +5055,9 @@ static bool sse_chat_delta_n(int fd, const request *r, const char *id,
 }
 
 /* Same as sse_chat_delta_n but also emits a token_ids array alongside the
- * content/reasoning_content delta.  Used when the client requested
- * return_token_ids=true and we have the model token IDs available. */
+ * content/reasoning_content delta.  token_ids is placed at the choice level
+ * (not inside delta) to match vLLM's convention, which is what llama-benchy
+ * and similar tools read (client.py:237: chunk['choices'][0].get('token_ids')). */
 static bool sse_chat_delta_n_with_tokens(int fd, const request *r, const char *id,
                                          const char *field, const char *text, size_t len,
                                          const int *token_ids, size_t n_token_ids) {
@@ -5072,12 +5073,12 @@ static bool sse_chat_delta_n_with_tokens(int fd, const request *r, const char *i
     json_escape(&b, field);
     buf_putc(&b, ':');
     json_escape_n(&b, text, len);
-    buf_puts(&b, ",\"token_ids\":[");
+    buf_puts(&b, "},\"token_ids\":[");
     for (size_t i = 0; i < n_token_ids; i++) {
         if (i) buf_putc(&b, ',');
         buf_printf(&b, "%d", token_ids[i]);
     }
-    buf_puts(&b, "]},\"finish_reason\":null}]}\n\n");
+    buf_puts(&b, "],\"finish_reason\":null}]}\n\n");
     bool ok = send_all(fd, b.ptr, b.len);
     buf_free(&b);
     return ok;
