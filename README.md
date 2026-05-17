@@ -1,6 +1,6 @@
 # DwarfStar 4
 
-DrawfStar 4 is a small native inference engine specific for **DeepSeek V4 Flash**. It is
+DwarfStar 4 is a small native inference engine specific for **DeepSeek V4 Flash**. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
 runtime: it is completely self-contained. Other than running the model in a
 correct and fast way, the project goal is to provide DS4 specific loading,
@@ -18,8 +18,10 @@ This project would not exist without **llama.cpp and GGML**, make sure to read
 the acknowledgements section, a big thank you to Georgi Gerganov and all the
 other contributors.
 
+## Motivations
+
 Now, back at this project. Why we believe DeepSeek v4 Flash to be a pretty special
-model deserving a stand alone engine? Because after comparing it with powerful smaller
+model deserving a standalone engine? Because after comparing it with powerful smaller
 dense models, we can report that:
 
 1. DeepSeek v4 Flash is faster because of less active parameters.
@@ -192,6 +194,70 @@ exponential sweeps. Output is CSV with one row per frontier: latest prefill
 interval tokens/sec, generation tokens/sec at that frontier, and
 `kvcache_bytes`.
 
+## Capability Evaluation
+
+`ds4-eval` is a small real-model integration benchmark. It is not a leaderboard
+runner and should not be reported as an official GPQA, SuperGPQA, AIME, or
+security benchmark score: the questions are an embedded 92-item subset chosen
+to make local regression testing useful and visually inspectable. The program
+loads the real GGUF,
+renders DS4 chat prompts, streams sampled tokens in a split-screen TUI, grades
+the final answer, and prints a per-question report with prompt tokens,
+generated tokens, pass/fail state, the model answer, and the correct answer.
+
+```sh
+./ds4-eval -m ds4flash.gguf --trace /tmp/ds4-eval.txt
+```
+
+The default run uses `--tokens 16000`, thinking mode enabled, and a soft/hard
+`</think>` budget cutoff so the model has room to produce a visible answer.
+`ds4-eval` sizes the context internally from the largest selected prompt plus
+the generation budget, and refuses runs that would need more than 1M context
+tokens. Press `p` to pause, `q` to exit and print the report, Up/Down to
+inspect or select another question, and Enter to run the selected question next.
+`--plain` disables the TUI.
+
+The first 75 embedded questions are interleaved as 25 GPQA Diamond, 25 audited
+SuperGPQA, and 25 AIME 2025 problems. The final 17 are an audited COMPSEC
+subset of reduced single-function C/C++ vulnerability-localization questions.
+The model is asked for the single best source line, or the smallest exact line
+set only when the bug cannot be localized to one line; the scorer accepts small
+audited ranges only when adjacent lines are equivalent locations for the same
+bug. The order is
+intentionally progressive: early questions are useful smoke tests, while later
+questions are hard enough that a strong reasoning model should still miss some
+of them. The SuperGPQA slice is curated rather than blind: upstream rows with
+wrong keys, missing figures, or underspecified prompts are replaced with cleaner
+rows.
+
+For a model like DeepSeek V4 Flash, the set should be treated as a hard
+capability regression suite rather than a pass/fail unit test:
+
+- **GPQA Diamond** contributes graduate-level science questions with
+  multiple-choice answers. DeepSeek's model card reports strong Flash results
+  on full GPQA Diamond in thinking mode, but individual items still require
+  careful physics, chemistry, or biology reasoning and are easy to lose with a
+  small prompt/rendering or sampling regression.
+- **SuperGPQA** contributes broad specialist knowledge and domain-transfer
+  questions. The model-card SuperGPQA number is much lower than GPQA Diamond,
+  so these items are expected to be uneven: some look mundane, others require
+  niche professional knowledge or exact interpretation of a translated-style
+  exam question.
+- **AIME 2025** contributes exact-answer contest math. These are often the most
+  unforgiving items in the set: no multiple-choice prior, no partial credit, and
+  a single arithmetic or algebraic slip changes the grade.
+- **COMPSEC** contributes single-function C/C++ security reasoning items
+  reduced from public CVE writeups. These are not exploit prompts: the task is
+  to identify the best source line where the defensive code flaw is introduced,
+  or return `0` for a safe function.
+
+In practice this means `ds4-eval` should not be expected to produce a perfect
+92/92 run. It is meant to answer a more useful engineering question: after a
+kernel, quantization, prompt-rendering, KV-cache, or tool-streaming change, does
+DeepSeek V4 Flash still solve a representative mix of hard science, broad
+knowledge, exact math, and security-code problems while using the same inference
+path users run?
+
 ## CLI
 
 One-shot prompt:
@@ -227,6 +293,9 @@ Start a local OpenAI/Anthropic-compatible server:
 ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
+Use `--chdir /path/to/ds4` when launching `ds4-server` from another directory,
+so relative runtime files such as `metal/*.metal` resolve from the project tree.
+
 The server keeps one mutable backend/KV checkpoint in memory,
 so stateless clients that resend a longer version of the same prompt can reuse
 the shared prefix instead of pre-filling from token zero.
@@ -241,6 +310,7 @@ Supported endpoints:
 - `GET /v1/models`
 - `GET /v1/models/deepseek-v4-flash`
 - `POST /v1/chat/completions`
+- `POST /v1/responses`
 - `POST /v1/completions`
 - `POST /v1/messages`
 
@@ -250,18 +320,39 @@ Supported endpoints:
 Tool schemas are rendered into DeepSeek's DSML tool format, and generated DSML
 tool calls are mapped back to OpenAI tool calls.
 
+`/v1/responses` accepts OpenAI Responses-style `input`, `instructions`,
+`tools`, `tool_choice`, `max_output_tokens`, `temperature`, `top_p`, `stream`,
+and `reasoning`. It is the preferred endpoint for Codex CLI. The server keeps
+Responses continuations bound to live state when possible, and can fall back to
+the same DSML rendering and KV prefix reuse used by chat completions.
+
 `/v1/messages` is the Anthropic-compatible endpoint used by Claude Code style
 clients. It accepts `system`, `messages`, `tools`, `tool_choice`, `max_tokens`,
 `temperature`, `top_p`, `top_k`, `stream`, `stop_sequences`, and thinking
 controls. Tool uses are returned as Anthropic `tool_use` blocks.
 
-Both APIs support SSE streaming. In thinking mode, reasoning is streamed in the
-native API shape instead of being mixed into final text. OpenAI chat streaming
+Default sampled API generation uses `temperature=1`, `top_p=1`, and
+`min_p=0.05`, so the default filter is relative probability rather than
+nucleus mass. In thinking mode DS4 uses those fixed sampling defaults and
+ignores client sampling knobs, matching DeepSeek's fixed-thinking API behavior.
+
+The chat, Responses, and Anthropic endpoints support SSE streaming. In thinking
+mode, reasoning is streamed in the native API shape instead of being mixed into
+final text. OpenAI chat streaming
 also streams tool calls as soon as the DSML invocation is recognized: the tool
 header is sent first, then parameter bytes are forwarded as
 `tool_calls[].function.arguments` deltas while generation continues. The
 Anthropic endpoint streams thinking and text live, then emits structured
 `tool_use` blocks when the generated tool block is complete.
+The Responses endpoint streams the Responses event lifecycle expected by Codex,
+including `response.output_text.delta`, function-call argument events, and
+terminal `response.completed` / `response.incomplete` / `response.failed`
+events.
+
+For browser JavaScript clients served from another origin, start the server with
+`--cors` to emit `Access-Control-Allow-*` headers. This only changes HTTP
+headers; it does not expose the server on the LAN. Use `--host 0.0.0.0`
+explicitly when remote machines should be able to connect.
 
 ### Tool call handling and canonicalization
 
@@ -421,6 +512,22 @@ Optionally make it the default Pi model in `~/.pi/agent/settings.json`:
   "defaultProvider": "ds4",
   "defaultModel": "deepseek-v4-flash"
 }
+```
+
+For **Codex CLI**, use the Responses wire API:
+
+```toml
+[model_providers.ds4]
+name = "DS4"
+base_url = "http://127.0.0.1:8000/v1"
+wire_api = "responses"
+stream_idle_timeout_ms = 1000000
+```
+
+Then run:
+
+```sh
+codex --model deepseek-v4-flash -c model_provider=ds4
 ```
 
 For **Claude Code**, use the Anthropic-compatible endpoint. A wrapper like this

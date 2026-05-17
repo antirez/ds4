@@ -178,15 +178,84 @@ static char *test_read_file(const char *path) {
     return s;
 }
 
-static int test_count_substr(const char *s, const char *needle) {
-    int count = 0;
-    size_t n = strlen(needle);
-    const char *p = s;
-    while ((p = strstr(p, needle)) != NULL) {
-        count++;
-        p += n;
+typedef struct {
+    const char *name;
+    int number;
+} test_long_fact;
+
+static const test_long_fact test_long_facts[] = {
+    {"Bob", 34},
+    {"Alice", 52},
+    {"Clara", 71},
+    {"Diego", 93},
+    {"Elena", 16},
+    {"Felix", 88},
+    {"Greta", 47},
+    {"Hugo", 29},
+    {"Iris", 64},
+    {"Jonas", 12},
+    {"Kira", 81},
+    {"Leo", 39},
+    {"Marta", 76},
+    {"Nadia", 23},
+    {"Owen", 58},
+    {"Priya", 97},
+};
+
+static bool test_is_name_boundary(char c) {
+    unsigned char uc = (unsigned char)c;
+    return c == '\0' || !(isalnum(uc) || c == '_');
+}
+
+static bool test_parse_assignment_value(const char *p, int *value) {
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '=') return false;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    if (!isdigit((unsigned char)*p)) return false;
+
+    int v = 0;
+    while (isdigit((unsigned char)*p)) {
+        v = v * 10 + (*p - '0');
+        p++;
     }
-    return count;
+    *value = v;
+    return true;
+}
+
+static bool test_output_has_fact(const char *text, const test_long_fact *fact) {
+    const size_t name_len = strlen(fact->name);
+    const char *p = text;
+    bool saw_wrong_assignment = false;
+    int wrong_value = -1;
+
+    while ((p = strstr(p, fact->name)) != NULL) {
+        const bool before_ok = p == text || test_is_name_boundary(p[-1]);
+        const bool after_ok = test_is_name_boundary(p[name_len]) ||
+                              p[name_len] == ' ' ||
+                              p[name_len] == '\t' ||
+                              p[name_len] == '=';
+        if (before_ok && after_ok) {
+            int value = 0;
+            if (test_parse_assignment_value(p + name_len, &value)) {
+                if (value == fact->number) return true;
+                saw_wrong_assignment = true;
+                wrong_value = value;
+            }
+        }
+        p += name_len;
+    }
+
+    if (saw_wrong_assignment) {
+        fprintf(stderr,
+                "ds4-test: long-context wrong assignment for %s: got %d expected %d\n",
+                fact->name, wrong_value, fact->number);
+    } else {
+        fprintf(stderr,
+                "ds4-test: long-context missing assignment for %s=%d\n",
+                fact->name, fact->number);
+    }
+    return false;
 }
 
 static int test_hex_digit(char c) {
@@ -227,10 +296,10 @@ static void test_long_prefill_progress(void *ud, const char *event, int current,
     }
 }
 
-static void test_long_security_continuation(void) {
+static void test_long_story_fact_recall(void) {
     const char *prompt_path = getenv("DS4_TEST_LONG_PROMPT");
     if (!prompt_path || !prompt_path[0]) {
-        prompt_path = "tests/long_context_security_prompt.txt";
+        prompt_path = "tests/long_context_story_prompt.txt";
     }
     char *prompt_text = test_read_file(prompt_path);
     TEST_ASSERT(prompt_text != NULL);
@@ -263,8 +332,8 @@ static void test_long_security_continuation(void) {
     uint64_t rng = 12345;
     int generated = 0;
     bool decode_ok = true;
-    for (; generated < 700; generated++) {
-        int token = ds4_session_sample(session, 0.8f, 40, 0.95f, 0.05f, &rng);
+    for (; generated < 350; generated++) {
+        int token = ds4_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
         if (token == ds4_token_eos(engine)) break;
 
         size_t piece_len = 0;
@@ -281,10 +350,9 @@ static void test_long_security_continuation(void) {
     const char *text = out.ptr ? out.ptr : "";
     TEST_ASSERT(decode_ok);
     TEST_ASSERT(generated > 0);
-    TEST_ASSERT(strstr(text, "</think>") != NULL);
-    TEST_ASSERT(test_count_substr(text, "</think>") == 1);
-    TEST_ASSERT(test_count_substr(text, "The most critical security issue") == 1);
-    TEST_ASSERT(strstr(text, "arbitrary file") != NULL);
+    for (size_t i = 0; i < sizeof(test_long_facts) / sizeof(test_long_facts[0]); i++) {
+        TEST_ASSERT(test_output_has_fact(text, &test_long_facts[i]));
+    }
 
     buf_free(&out);
     ds4_session_free(session);
@@ -538,8 +606,8 @@ static void test_tool_call_quality_one(bool quality) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls calls = {0};
-    bool parsed = parse_generated_message(text.ptr ? text.ptr : "",
-                                          &content, &reasoning, &calls);
+    bool parsed = parse_generated_message_ex(text.ptr ? text.ptr : "",
+                                             false, &content, &reasoning, &calls);
     TEST_ASSERT(decode_ok);
     TEST_ASSERT(parsed);
     TEST_ASSERT(calls.len > 0);
@@ -579,7 +647,7 @@ typedef struct {
 
 static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
-    {"--long-context", "long-context", "long Metal continuation regression", test_long_security_continuation},
+    {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison", test_official_logprob_vectors},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_f16_matvec_fast_nr0_4},
@@ -601,7 +669,7 @@ static void test_print_help(const char *prog) {
     puts("      Show this help.");
     puts("\nEnvironment:");
     puts("  DS4_TEST_MODEL=FILE        Model path. Default: ds4flash.gguf");
-    puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context regression prompt.");
+    puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");
     puts("  DS4_TEST_VECTOR_FILE=FILE  Simple official-vector fixture.");
 }
 

@@ -3793,6 +3793,16 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     }
 }
 
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
+    return ds4_gpu_tensor_alloc(bytes);
+}
+
+int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
+    (void)kv_cache_bytes;
+    (void)context_bytes;
+    return 0;
+}
+
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
     if (!base) return NULL;
     const DS4MetalTensor *base_obj = ds4_gpu_tensor_const_obj(base);

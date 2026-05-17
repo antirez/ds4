@@ -49,7 +49,11 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = model_path,
+#ifdef __APPLE__
         .backend = DS4_BACKEND_METAL,
+#else
+        .backend = DS4_BACKEND_CUDA,
+#endif
         .n_threads = 0,
         .warm_weights = false,
         .quality = false,

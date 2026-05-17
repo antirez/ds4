@@ -36,10 +36,11 @@ It contains DS4-rendered chat prompts, separated by visible
 - C/Metal source-review prompts from this repository.
 - Long-context snippets.
 - Agent/tool-call prompts using DS4's DSML syntax.
-- English and Italian prompts.
+- Language/prose rewriting, summarization, extraction, and translation prompts.
+- `ds4-eval` GPQA Diamond, SuperGPQA, and AIME2025 benchmark prompts.
 - Both thinking and non-thinking assistant prefixes.
 
-The current tracked dataset has 1952 rendered prompts and roughly 1.44M tokens
+The current tracked dataset has 4682 rendered prompts and roughly 2.91M tokens
 by the coarse bytes/4 estimate.  Check
 `gguf-tools/imatrix/dataset/manifest.json` for the exact generated-file
 summary.
