@@ -303,12 +303,13 @@ the default route policy, `-mt on` to force Tensor routes where the Metal tensor
 path is available, and `-mt off` for the legacy Metal reference path. The old
 `--mpp` spelling remains accepted as a compatibility alias. Auto currently
 enables the F16 compressor Tensor path, attention-output low Tensor in all
-layers, and routed-MoE Tensor only in the q1..q4-token-count-safe late window
-from layer 40 through layer 42. Wider routed-MoE windows caused deterministic
-`ds4-eval` generation drift, so earlier MoE Tensor layers stay behind explicit
-route opt-ins while they are being tuned. The dense Q8_0 prefill path remains on
-the legacy hand-written Metal simdgroup kernel; the experimental Tensor Q8_0
-route was removed after M5 drift bisection showed it was the drift-prone path.
+layers, and routed-MoE Tensor only in the q1..q4-token-count-safe late windows:
+gate/down from layer 35 and up from layer 36. Wider routed-MoE windows caused
+deterministic `ds4-eval` generation drift, so earlier MoE Tensor layers stay
+behind explicit route opt-ins while they are being tuned. The dense Q8_0 prefill
+path remains on the legacy hand-written Metal simdgroup kernel; the
+experimental Tensor Q8_0 route was removed after M5 drift bisection showed it
+was the drift-prone path.
 
 The next prefill optimization target is therefore not a re-enable of the removed
 Q8_0 Tensor route. It is a new, isolated quantized prefill matmul experiment
@@ -390,18 +391,18 @@ route disables, comparator, and stage profiler still apply.
 
 Current Tensor route status balances drift with prefill throughput: `auto`
 enables F16 compressor, attention-output low projection, and routed-MoE Tensor
-in the late layer 40..42 window. Attention-output low projection is enabled for
-all layers by default. The previous routed-MoE conservative window, down from
-layer 12 and gate/up from layer 15, remains available only through explicit MoE
-route enables or forced Tensor mode because it changes deterministic
-`ds4-eval` q1..q4 generation lengths. The late default window recovers part of
-the routed-MoE prefill speedup while keeping the normal decode path aligned with
-the q1..q4 token-count baseline. The attention-output low Tensor kernels stage
-activation tiles through half to match the legacy Metal matmul input path, which
-removes the first attention-output comparator breach. The current auto policy
-uses direct-RHS Tensor inputs and 64-token tiles for attention-output low
-projections. The F16 compressor route did not introduce measurable drift in the
-current prompt set.
+in late route-specific windows: gate/down from layer 35 and up from layer 36.
+Attention-output low projection is enabled for all layers by default. The
+previous routed-MoE conservative window, down from layer 12 and gate/up from
+layer 15, remains available only through explicit MoE route enables or forced
+Tensor mode because it changes deterministic `ds4-eval` q1..q4 generation
+lengths. The late default windows recover part of the routed-MoE prefill speedup
+while keeping the normal decode path aligned with the q1..q4 token-count
+baseline. The attention-output low Tensor kernels stage activation tiles through
+half to match the legacy Metal matmul input path, which removes the first
+attention-output comparator breach. The current auto policy uses direct-RHS
+Tensor inputs and 64-token tiles for attention-output low projections. The F16
+compressor route did not introduce measurable drift in the current prompt set.
 
 The `DS4_METAL_MPP_FAST=1` profile is the measured high-throughput diagnostic
 profile under the relaxed same-top1/same-greedy gate. In the current prompt
@@ -425,11 +426,12 @@ but gives up the strongest long-context prefill gains and has a -2.7%
 generation point at 65k. Neither variant is promoted to the default policy; use
 them only for explicit eval runs.
 
-The routed-MoE Tensor projections are enabled by default from layer 40 for gate,
-up, and down. Use `DS4_METAL_MPP_MOE_ENABLE=1`, route-specific enables,
-`DS4_METAL_MPP_FAST=1`, or `-mt on` to test wider windows; the previous
-conservative window starts at layer 12 for down and layer 15 for gate/up when
-routed-MoE Tensor is explicitly widened. For route isolation, use
+The routed-MoE Tensor projections are enabled by default from layer 35 for gate
+and down, and from layer 36 for up. Use `DS4_METAL_MPP_MOE_ENABLE=1`,
+route-specific enables, `DS4_METAL_MPP_FAST=1`, or `-mt on` to test wider
+windows; the previous conservative window starts at layer 12 for down and layer
+15 for gate/up when routed-MoE Tensor is explicitly widened. For route
+isolation, use
 `DS4_METAL_MPP_MOE_GATE_ENABLE/DISABLE`,
 `DS4_METAL_MPP_MOE_UP_ENABLE/DISABLE`, and
 `DS4_METAL_MPP_MOE_DOWN_ENABLE/DISABLE`; `DS4_METAL_MPP_MOE_DISABLE=1`
