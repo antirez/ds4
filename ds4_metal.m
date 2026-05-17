@@ -584,6 +584,25 @@ static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, con
     return ok;
 }
 
+static int ds4_gpu_device_name_contains(const char *needle);
+
+static int ds4_gpu_use_m5_private_scratch(void) {
+    static int initialized;
+    static int enabled;
+    if (!initialized) {
+        enabled = getenv("DS4_METAL_DISABLE_M5_PRIVATE_SCRATCH") == NULL &&
+                  ds4_gpu_device_name_contains("M5");
+        initialized = 1;
+    }
+    return enabled;
+}
+
+static int ds4_gpu_scratch_needs_cpu_access(const char *label) {
+    if (!label) return 0;
+    return strstr(label, "mask") != NULL ||
+           strcmp(label, "ds4_attention_output_group_ids") == 0;
+}
+
 static int ds4_gpu_ensure_scratch_buffer(
         id<MTLBuffer> __strong *buffer,
         NSUInteger    *capacity,
@@ -593,7 +612,21 @@ static int ds4_gpu_ensure_scratch_buffer(
     if (bytes == 0) bytes = 1;
     if (bytes > NSUIntegerMax) return 0;
 
-    *buffer = [g_device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    MTLResourceOptions options = MTLResourceStorageModeShared;
+    if (ds4_gpu_use_m5_private_scratch() &&
+        !ds4_gpu_scratch_needs_cpu_access(label)) {
+        /*
+         * M5 scratch buffers that only flow between Metal kernels do not need
+         * CPU-visible shared storage. Keep default hazard tracking because the
+         * graph reuses these buffers across dependent compute encoders.
+         */
+        options = MTLResourceStorageModePrivate;
+    }
+
+    *buffer = [g_device newBufferWithLength:bytes options:options];
+    if (!*buffer && options != MTLResourceStorageModeShared) {
+        *buffer = [g_device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    }
     if (!*buffer) {
         fprintf(stderr, "ds4: failed to allocate Metal scratch buffer %s (%llu bytes)\n",
                 label, (unsigned long long)bytes);
