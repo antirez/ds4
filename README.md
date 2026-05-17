@@ -455,7 +455,7 @@ generation point at 65k. Neither variant is promoted to the default policy; use
 them only for explicit eval runs.
 
 The routed-MoE Tensor projections are enabled by default from layer 35 for gate
-and down, and from layer 36 for up. Use `DS4_METAL_MPP_MOE_ENABLE=1`,
+and down, and from layer 37 for up. Use `DS4_METAL_MPP_MOE_ENABLE=1`,
 route-specific enables, `DS4_METAL_MPP_FAST=1`, or `-mt on` to test wider
 windows; the previous conservative window starts at layer 12 for down and layer
 15 for gate/up when routed-MoE Tensor is explicitly widened. For route
