@@ -12372,6 +12372,8 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.mpp_mode = parse_mpp_mode_arg(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--chdir")) {
             c.chdir_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "-mt") || !strcmp(arg, "--mt") || !strcmp(arg, "--mpp")) {
+            c.engine.mpp_mode = parse_mpp_mode_arg(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--host")) {
             c.host = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--port")) {
