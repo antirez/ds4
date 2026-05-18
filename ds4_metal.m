@@ -81,6 +81,7 @@ static id<MTLComputePipelineState> g_moe_mul_mm_id_q2_k_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mm_id_q4_k_pipeline;
 static id<MTLComputePipelineState> g_rope_tail_batch_pipeline;
 static id<MTLComputePipelineState> g_dsv4_fp8_kv_quantize_pipeline;
+static id<MTLComputePipelineState> g_dsv4_indexer_qat_pipeline;
 static id<MTLComputePipelineState> g_dsv4_kv_fp8_store_pipeline;
 static id<MTLComputePipelineState> g_dsv4_ratio4_shift_pipeline;
 static id<MTLComputePipelineState> g_dsv4_softmax_pool_pipeline;
@@ -2469,6 +2470,12 @@ typedef struct {
 } ds4_gpu_dsv4_kv_fp8_store_args;
 
 typedef struct {
+    uint32_t n_rows;
+    uint32_t head_dim;
+    uint64_t row_stride;
+} ds4_gpu_dsv4_indexer_qat_args;
+
+typedef struct {
     uint32_t width;
 } ds4_gpu_dsv4_ratio4_shift_args;
 
@@ -2871,6 +2878,22 @@ int ds4_gpu_init(void) {
         g_dsv4_fp8_kv_quantize_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
         if (!g_dsv4_fp8_kv_quantize_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_fp8_kv_quantize_f32 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        fn = [library newFunctionWithName:@"kernel_dsv4_indexer_hadamard_fp4_f32"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_indexer_hadamard_fp4_f32 function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_dsv4_indexer_qat_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_dsv4_indexer_qat_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_indexer_hadamard_fp4_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
             g_queue = nil;
             g_device = nil;
@@ -4014,6 +4037,7 @@ void ds4_gpu_cleanup(void) {
         g_moe_mul_mm_id_q4_k_pipeline = nil;
         g_rope_tail_batch_pipeline = nil;
         g_dsv4_fp8_kv_quantize_pipeline = nil;
+        g_dsv4_indexer_qat_pipeline = nil;
         g_dsv4_kv_fp8_store_pipeline = nil;
         g_dsv4_ratio4_shift_pipeline = nil;
         g_dsv4_softmax_pool_pipeline = nil;
@@ -5070,11 +5094,13 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         uint64_t                up_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
-        const ds4_gpu_tensor *x) {
+        const ds4_gpu_tensor *x,
+        float                   clamp) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!gate || !up || !mid || !x || !model_map ||
         (in_dim & 31u) != 0 ||
-        in_dim > UINT32_MAX || out_dim > UINT32_MAX) {
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
+        !isfinite(clamp) || clamp < 0.0f) {
         return 0;
     }
 
@@ -5132,6 +5158,7 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         [enc setBuffer:gatebuf offset:ds4_gpu_tensor_offset(gate) atIndex:4];
         [enc setBuffer:upbuf offset:ds4_gpu_tensor_offset(up) atIndex:5];
         [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:6];
+        [enc setBytes:&clamp length:sizeof(clamp) atIndex:7];
         [enc setThreadgroupMemoryLength:2u * mv_dispatch.smem atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) /
                                                   (NSUInteger)mv_dispatch.nr0,
@@ -5814,6 +5841,46 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
         ds4_gpu_end_compute_encoder(cb, enc);
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "DSV4 FP8 KV quantize")) return 0;
+    }
+
+    return 1;
+}
+
+int ds4_gpu_dsv4_indexer_qat_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          n_rows,
+        uint32_t          head_dim) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!x || n_rows == 0 || head_dim != 128u) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        const uint64_t bytes = (uint64_t)n_rows * head_dim * sizeof(float);
+        if (!xbuf || ds4_gpu_tensor_bytes(x) < bytes) {
+            fprintf(stderr, "ds4: Metal DSV4 indexer QAT received undersized activation buffer\n");
+            return 0;
+        }
+
+        ds4_gpu_dsv4_indexer_qat_args args = {
+            .n_rows = n_rows,
+            .head_dim = head_dim,
+            .row_stride = (uint64_t)head_dim * sizeof(float),
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_dsv4_indexer_qat_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
+        [enc setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(n_rows, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "DSV4 indexer Hadamard+FP4")) return 0;
     }
 
     return 1;
@@ -11160,10 +11227,7 @@ int ds4_gpu_swiglu_tensor(
         float                   weight) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !gate || !up || n == 0) return 0;
-    if (fabsf(clamp) > 1.0e-12f || fabsf(weight - 1.0f) > 1.0e-12f) {
-        fprintf(stderr, "ds4: Metal SwiGLU kernel does not support clamp/weight\n");
-        return 0;
-    }
+    if (!isfinite(clamp) || clamp < 0.0f || !isfinite(weight)) return 0;
 
     @autoreleasepool {
         id<MTLBuffer> gatebuf = ds4_gpu_tensor_buffer(gate);
@@ -11191,8 +11255,8 @@ int ds4_gpu_swiglu_tensor(
             .nb1 = (uint64_t)n * sizeof(float),
             .i00 = 0,
             .i10 = 0,
-            .alpha = 0.0f,
-            .limit = 0.0f,
+            .alpha = weight,
+            .limit = clamp,
         };
         NSUInteger nth = g_swiglu_pipeline.maxTotalThreadsPerThreadgroup;
         const NSUInteger ds4_nth = n > 1 ? (NSUInteger)n / 2u : 1u;
@@ -11990,7 +12054,7 @@ static int ds4_gpu_encode_swiglu_flat(
         .nb1 = (uint64_t)n * sizeof(float),
         .i00 = 0,
         .i10 = 0,
-        .alpha = 0.0f,
+        .alpha = 1.0f,
         .limit = 0.0f,
     };
     NSUInteger nth = g_swiglu_pipeline.maxTotalThreadsPerThreadgroup;
