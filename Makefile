@@ -12,6 +12,7 @@ OBJCFLAGS ?= -O3 -ffast-math $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc
 
 LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
+CUDA_EXTRA_BINS :=
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
@@ -25,11 +26,17 @@ CUDA_ARCH ?=
 ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
-NVCCFLAGS ?= -O3 --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
-CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
-CORE_OBJS = ds4.o ds4_cuda.o
+NVCCFLAGS ?= -O3 --use_fast_math -std=c++17 $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
+# Include path so cuda/mmq/*.cu can find its sibling vendored headers and
+# the ds4_ggml_stubs shim. The redirected ggml.h / ggml-impl.h / ggml-cuda.h
+# live alongside the vendored common.cuh.
+MMQ_INCLUDES := -Icuda/mmq
+CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcuda
+MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o
+CORE_OBJS = ds4.o ds4_cuda.o $(MMQ_OBJS)
 CPU_CORE_OBJS = ds4_cpu.o
 METAL_LDLIBS := $(LDLIBS)
+CUDA_EXTRA_BINS := ds4_weight_server
 endif
 
 .PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression
@@ -77,10 +84,10 @@ help:
 	@echo "  make clean               Remove build outputs"
 
 cuda-spark:
-	$(MAKE) ds4 ds4-server ds4-bench ds4-eval CUDA_ARCH=
+	$(MAKE) ds4 ds4-server ds4-bench ds4-eval $(CUDA_EXTRA_BINS) CUDA_ARCH=
 
 cuda-generic:
-	$(MAKE) ds4 ds4-server ds4-bench ds4-eval CUDA_ARCH=native
+	$(MAKE) ds4 ds4-server ds4-bench ds4-eval $(CUDA_EXTRA_BINS) CUDA_ARCH=native
 
 cuda:
 	@if [ -z "$(strip $(CUDA_ARCH))" ]; then \
@@ -88,7 +95,7 @@ cuda:
 		echo "       or use make cuda-spark / make cuda-generic"; \
 		exit 2; \
 	fi
-	$(MAKE) ds4 ds4-server ds4-bench ds4-eval CUDA_ARCH="$(CUDA_ARCH)"
+	$(MAKE) ds4 ds4-server ds4-bench ds4-eval $(CUDA_EXTRA_BINS) CUDA_ARCH="$(CUDA_ARCH)"
 
 ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
@@ -160,8 +167,28 @@ ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
-tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
+# Vendored mmq pieces. ds4_mmq.cu transitively pulls in mmq.cuh which has
+# heavy template instantiation - compile in its own TU and link in.
+cuda/mmq/ds4_ggml_stubs.o: cuda/mmq/ds4_ggml_stubs.cu cuda/mmq/ds4_ggml_stubs.h cuda/mmq/common.cuh
+	$(NVCC) $(NVCCFLAGS) $(MMQ_INCLUDES) -c -o $@ $<
+
+cuda/mmq/ds4_mmq.o: cuda/mmq/ds4_mmq.cu cuda/mmq/ds4_mmq.h cuda/mmq/mmq.cuh cuda/mmq/common.cuh cuda/mmq/quantize.cuh cuda/mmq/mmid.cuh cuda/mmq/vecdotq.cuh cuda/mmq/mma.cuh
+	$(NVCC) $(NVCCFLAGS) $(MMQ_INCLUDES) -c -o $@ $<
+
+cuda/mmq/quantize.o: cuda/mmq/quantize.cu cuda/mmq/quantize.cuh cuda/mmq/common.cuh cuda/mmq/mmq.cuh
+	$(NVCC) $(NVCCFLAGS) $(MMQ_INCLUDES) -c -o $@ $<
+
+cuda/mmq/mmid.o: cuda/mmq/mmid.cu cuda/mmq/mmid.cuh cuda/mmq/common.cuh
+	$(NVCC) $(NVCCFLAGS) $(MMQ_INCLUDES) -c -o $@ $<
+
+cuda/mmq/mmvq.o: cuda/mmq/mmvq.cu cuda/mmq/mmvq.cuh cuda/mmq/common.cuh cuda/mmq/quantize.cuh cuda/mmq/vecdotq.cuh cuda/mmq/unary.cuh
+	$(NVCC) $(NVCCFLAGS) $(MMQ_INCLUDES) -c -o $@ $<
+
+tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+ds4_weight_server: tools/ds4_weight_server.cu
+	$(NVCC) $(NVCCFLAGS) -o $@ $< $(CUDA_LDLIBS)
 
 ds4_test: ds4_test.o rax.o $(CORE_OBJS)
 ifeq ($(UNAME_S),Darwin)
@@ -174,4 +201,4 @@ test: ds4_test
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4_weight_server ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

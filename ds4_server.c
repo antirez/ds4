@@ -595,6 +595,7 @@ typedef struct {
     uint64_t seed;
     bool stream;
     bool stream_include_usage;
+    bool return_token_ids;
     int cache_read_tokens;
     int cache_write_tokens;
     ds4_think_mode think_mode;
@@ -2711,6 +2712,11 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "return_token_ids")) {
+            if (!json_bool(&p, &r->return_token_ids)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "thinking")) {
             if (!parse_thinking_control_value(&p, &thinking_enabled)) {
                 free(key);
@@ -4039,6 +4045,11 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "return_token_ids")) {
+            if (!json_bool(&p, &r->return_token_ids)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "thinking")) {
             if (!parse_thinking_control_value(&p, &thinking_enabled)) {
                 free(key);
@@ -4960,12 +4971,89 @@ typedef struct {
     bool sent_reasoning;
     bool sent_content;
     openai_tool_stream tool;
+    /* Pending token IDs whose piece text has been appended to the cumulative
+     * stream buffer but not yet flushed to the wire because of hold-back
+     * (e.g., the </think> close-tag lookahead).  Each entry records the model
+     * token id and the cumulative byte_end position of its piece in the raw
+     * buffer.  When sse_chat_delta_n emits up through byte position limit,
+     * entries with byte_end <= limit are flushed as the chunk's token_ids
+     * array and removed from the queue. */
+    int *pending_token_ids;
+    size_t *pending_token_byte_ends;
+    size_t pending_n;
+    size_t pending_cap;
+    bool return_token_ids;
 } openai_stream;
 
 static void openai_stream_start(const request *r, openai_stream *st) {
     memset(st, 0, sizeof(*st));
     st->active = true;
     st->mode = ds4_think_mode_enabled(r->think_mode) ? OPENAI_STREAM_THINKING : OPENAI_STREAM_TEXT;
+    st->return_token_ids = r->return_token_ids;
+}
+
+static void openai_stream_record_token(openai_stream *st, int token_id, size_t byte_end) {
+    if (!st || !st->return_token_ids) return;
+    if (st->pending_n == st->pending_cap) {
+        size_t new_cap = st->pending_cap ? st->pending_cap * 2 : 32;
+        int *new_ids = realloc(st->pending_token_ids, new_cap * sizeof(int));
+        size_t *new_ends = realloc(st->pending_token_byte_ends, new_cap * sizeof(size_t));
+        if (!new_ids || !new_ends) {
+            free(new_ids);
+            free(new_ends);
+            return;  /* best-effort; drop on OOM, llama-benchy still falls back */
+        }
+        st->pending_token_ids = new_ids;
+        st->pending_token_byte_ends = new_ends;
+        st->pending_cap = new_cap;
+    }
+    st->pending_token_ids[st->pending_n] = token_id;
+    st->pending_token_byte_ends[st->pending_n] = byte_end;
+    st->pending_n++;
+}
+
+/* Drain pending tokens whose byte_end <= limit.  *out_ids and *out_n receive
+ * a pointer into the queue buffer and the count; the caller must use them
+ * before the next record/drain, since drain shifts the remaining entries. */
+static void openai_stream_drain_tokens(openai_stream *st, size_t limit,
+                                       const int **out_ids, size_t *out_n) {
+    *out_ids = NULL;
+    *out_n = 0;
+    if (!st || !st->return_token_ids || st->pending_n == 0) return;
+    size_t k = 0;
+    while (k < st->pending_n && st->pending_token_byte_ends[k] <= limit) k++;
+    if (k == 0) return;
+    *out_ids = st->pending_token_ids;
+    *out_n = k;
+    /* Shift remaining entries down so the next call sees a clean prefix. */
+    if (k < st->pending_n) {
+        memmove(st->pending_token_ids, st->pending_token_ids + k,
+                (st->pending_n - k) * sizeof(int));
+        memmove(st->pending_token_byte_ends, st->pending_token_byte_ends + k,
+                (st->pending_n - k) * sizeof(size_t));
+    }
+    st->pending_n -= k;
+}
+
+/* When return_token_ids is on, snap an emission limit down to the largest
+ * pending token byte_end <= limit (token-aligned).  This guarantees the
+ * emitted chunk's text corresponds exactly to whole model tokens and that
+ * the drained token_ids array always covers all of that text.  Without this,
+ * the </think> hold-back can land mid-token and we'd emit text bytes with
+ * no token_ids attached, which forces llama-benchy back into local
+ * re-tokenization for the rest of the stream. */
+static size_t openai_stream_align_limit(const openai_stream *st, size_t emit_pos, size_t limit) {
+    if (!st || !st->return_token_ids) return limit;
+    if (st->pending_n == 0) return emit_pos;
+    size_t aligned = emit_pos;
+    for (size_t i = 0; i < st->pending_n; i++) {
+        if (st->pending_token_byte_ends[i] <= limit) {
+            aligned = st->pending_token_byte_ends[i];
+        } else {
+            break;  /* entries are in chronological/byte order */
+        }
+    }
+    return aligned;
 }
 
 static void openai_tool_stream_free(openai_tool_stream *ts) {
@@ -4979,6 +5067,12 @@ static void openai_tool_stream_free(openai_tool_stream *ts) {
 static void openai_stream_free(openai_stream *st) {
     if (!st) return;
     openai_tool_stream_free(&st->tool);
+    free(st->pending_token_ids);
+    free(st->pending_token_byte_ends);
+    st->pending_token_ids = NULL;
+    st->pending_token_byte_ends = NULL;
+    st->pending_n = 0;
+    st->pending_cap = 0;
 }
 
 static bool openai_tool_stream_has_id(const openai_tool_stream *ts,
@@ -5030,6 +5124,36 @@ static bool sse_chat_delta_n(int fd, const request *r, const char *id,
     buf_putc(&b, ':');
     json_escape_n(&b, text, len);
     buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
+    bool ok = send_all(fd, b.ptr, b.len);
+    buf_free(&b);
+    return ok;
+}
+
+/* Same as sse_chat_delta_n but also emits a token_ids array alongside the
+ * content/reasoning_content delta.  token_ids is placed at the choice level
+ * (not inside delta) to match vLLM's convention, which is what llama-benchy
+ * and similar tools read (client.py:237: chunk['choices'][0].get('token_ids')). */
+static bool sse_chat_delta_n_with_tokens(int fd, const request *r, const char *id,
+                                         const char *field, const char *text, size_t len,
+                                         const int *token_ids, size_t n_token_ids) {
+    if (len == 0) return true;
+    if (!token_ids || n_token_ids == 0) {
+        return sse_chat_delta_n(fd, r, id, field, text, len);
+    }
+    buf b = {0};
+    long now = (long)time(NULL);
+    buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+    json_escape(&b, r->model);
+    buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{");
+    json_escape(&b, field);
+    buf_putc(&b, ':');
+    json_escape_n(&b, text, len);
+    buf_puts(&b, "},\"token_ids\":[");
+    for (size_t i = 0; i < n_token_ids; i++) {
+        if (i) buf_putc(&b, ',');
+        buf_printf(&b, "%d", token_ids[i]);
+    }
+    buf_puts(&b, "],\"finish_reason\":null}]}\n\n");
     bool ok = send_all(fd, b.ptr, b.len);
     buf_free(&b);
     return ok;
@@ -5771,11 +5895,19 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
             limit = raw_len > hold ? raw_len - hold : st->emit_pos;
             limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
         }
+        /* Snap to the largest pending model-token boundary so every emitted
+         * chunk has a complete token_ids array.  No-op when return_token_ids
+         * is off. */
+        limit = openai_stream_align_limit(st, st->emit_pos, limit);
 
         if (limit > st->emit_pos) {
-            if (!sse_chat_delta_n(fd, r, id, "reasoning_content",
-                                  raw + st->emit_pos,
-                                  limit - st->emit_pos)) return false;
+            const int *tok_ids = NULL;
+            size_t n_tok_ids = 0;
+            openai_stream_drain_tokens(st, limit, &tok_ids, &n_tok_ids);
+            if (!sse_chat_delta_n_with_tokens(fd, r, id, "reasoning_content",
+                                              raw + st->emit_pos,
+                                              limit - st->emit_pos,
+                                              tok_ids, n_tok_ids)) return false;
             st->sent_reasoning = true;
             st->emit_pos = limit;
         }
@@ -5795,11 +5927,16 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
         const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
                                               r->has_tools, final);
+        limit = openai_stream_align_limit(st, st->emit_pos, limit);
 
         if (limit > st->emit_pos) {
-            if (!sse_chat_delta_n(fd, r, id, "content",
-                                  raw + st->emit_pos,
-                                  limit - st->emit_pos)) return false;
+            const int *tok_ids = NULL;
+            size_t n_tok_ids = 0;
+            openai_stream_drain_tokens(st, limit, &tok_ids, &n_tok_ids);
+            if (!sse_chat_delta_n_with_tokens(fd, r, id, "content",
+                                              raw + st->emit_pos,
+                                              limit - st->emit_pos,
+                                              tok_ids, n_tok_ids)) return false;
             st->sent_content = true;
             st->emit_pos = limit;
         }
@@ -10938,6 +11075,9 @@ static void generate_job(server *s, job *j) {
 
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
+            if (openai_live_chat) {
+                openai_stream_record_token(&openai_live, token, text.len);
+            }
             thinking_state_feed(&thinking, piece, piece_len);
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
                 dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);

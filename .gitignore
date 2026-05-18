@@ -8,6 +8,7 @@
 /ds4flash.gguf
 /TODO.md
 /gguf/
+/local/
 *.o
 *.dSYM/
 /misc/

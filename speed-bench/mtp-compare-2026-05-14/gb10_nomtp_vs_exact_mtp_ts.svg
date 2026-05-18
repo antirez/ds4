@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540">
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+.title { font-size: 26px; font-weight: 700; fill: #1f2933; }
+.axis-label { font-size: 14px; font-weight: 600; fill: #334155; }
+.tick { font-size: 12px; fill: #64748b; }
+.legend { font-size: 13px; font-weight: 600; fill: #1f2933; }
+</style>
+<rect width="960" height="540" fill="#ffffff"/>
+<text class="title" x="480.0" y="34" text-anchor="middle">GB10 No-MTP vs Exact MTP t/s</text>
+<line x1="82" y1="468.00" x2="878" y2="468.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="472.00" text-anchor="end">0</text>
+<line x1="82" y1="387.60" x2="878" y2="387.60" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="391.60" text-anchor="end">100</text>
+<line x1="82" y1="307.20" x2="878" y2="307.20" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="311.20" text-anchor="end">200</text>
+<line x1="82" y1="226.80" x2="878" y2="226.80" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="230.80" text-anchor="end">300</text>
+<line x1="82" y1="146.40" x2="878" y2="146.40" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="150.40" text-anchor="end">400</text>
+<line x1="82" y1="66.00" x2="878" y2="66.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="70.00" text-anchor="end">500</text>
+<text class="tick" x="890" y="472.00" text-anchor="start">0</text>
+<text class="tick" x="890" y="371.50" text-anchor="start">5</text>
+<text class="tick" x="890" y="271.00" text-anchor="start">10</text>
+<text class="tick" x="890" y="170.50" text-anchor="start">15</text>
+<text class="tick" x="890" y="70.00" text-anchor="start">20</text>
+<line x1="82.00" y1="66" x2="82.00" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="82.00" y="492" text-anchor="middle">0</text>
+<line x1="324.92" y1="66" x2="324.92" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="324.92" y="492" text-anchor="middle">20k</text>
+<line x1="567.84" y1="66" x2="567.84" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="567.84" y="492" text-anchor="middle">40k</text>
+<line x1="810.76" y1="66" x2="810.76" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="810.76" y="492" text-anchor="middle">60k</text>
+<line x1="82" y1="66" x2="82" y2="468" stroke="#334155" stroke-width="1.4"/>
+<line x1="878" y1="66" x2="878" y2="468" stroke="#334155" stroke-width="1.4"/>
+<line x1="82" y1="468" x2="878" y2="468" stroke="#334155" stroke-width="1.4"/>
+<text class="axis-label" x="480.0" y="520" text-anchor="middle">ctx size</text>
+<text class="axis-label" x="22" y="267.0" text-anchor="middle" transform="rotate(-90 22 267.0)">prefill t/s</text>
+<text class="axis-label" x="938" y="267.0" text-anchor="middle" transform="rotate(90 938 267.0)">generation t/s</text>
+<polyline fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="106.88,144.73 131.75,146.47 156.62,151.40 181.50,156.46 206.38,160.57 231.25,164.40 256.12,168.26 281.00,169.56 305.88,172.26 330.75,174.56 355.62,177.52 380.50,180.09 405.38,182.81 430.25,185.35 455.12,187.40 480.00,189.68 504.88,200.48 529.75,202.38 554.62,204.28 579.50,206.41 604.38,208.68 629.25,210.45 654.12,212.33 679.00,214.79 703.88,219.29 728.75,219.94 753.62,222.46 778.50,224.00 803.38,226.07 828.25,227.89 853.12,229.73 878.00,231.30"/>
+<polyline fill="none" stroke="#60a5fa" stroke-width="3" stroke-dasharray="8 6" stroke-linecap="round" stroke-linejoin="round" points="106.88,151.88 131.75,151.14 156.62,155.50 181.50,158.76 206.38,163.31 231.25,166.99 256.12,168.85 281.00,170.52 305.88,173.81 330.75,176.25 355.62,178.43 380.50,181.38 405.38,184.15 430.25,186.09 455.12,188.59 480.00,190.81 504.88,201.15 529.75,203.05 554.62,204.97 579.50,206.40 604.38,208.17 629.25,210.11 654.12,211.46 679.00,214.08 703.88,217.84 728.75,219.31 753.62,221.28 778.50,222.61 803.38,224.56 828.25,226.16 853.12,235.13 878.00,229.57"/>
+<polyline fill="none" stroke="#dc2626" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="106.88,186.60 131.75,190.02 156.62,191.22 181.50,195.04 206.38,197.05 231.25,198.26 256.12,199.46 281.00,198.86 305.88,200.67 330.75,201.47 355.62,202.48 380.50,204.49 405.38,205.69 430.25,207.71 455.12,209.11 480.00,216.55 504.88,217.55 529.75,218.96 554.62,219.97 579.50,220.57 604.38,221.98 629.25,222.58 654.12,223.99 679.00,224.39 703.88,226.40 728.75,227.60 753.62,228.81 778.50,229.81 803.38,230.62 828.25,232.23 853.12,232.83 878.00,234.24"/>
+<polyline fill="none" stroke="#16a34a" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="106.88,216.15 131.75,191.83 156.62,193.84 181.50,196.05 206.38,198.86 231.25,198.46 256.12,200.67 281.00,199.26 305.88,200.87 330.75,206.30 355.62,202.88 380.50,207.10 405.38,206.50 430.25,208.51 455.12,209.51 480.00,217.55 504.88,218.56 529.75,219.56 554.62,220.37 579.50,220.17 604.38,221.98 629.25,221.77 654.12,222.78 679.00,223.38 703.88,225.39 728.75,226.20 753.62,227.40 778.50,228.81 803.38,230.42 828.25,231.22 853.12,231.62 878.00,233.23"/>
+<rect x="644" y="66" width="226" height="116" rx="6" fill="#ffffff" stroke="#cbd5e1"/>
+<line x1="658" y1="84" x2="674" y2="84" stroke="#2563eb" stroke-width="4"/>
+<text class="legend" x="684" y="89">prefill no-MTP</text>
+<line x1="658" y1="110" x2="674" y2="110" stroke="#60a5fa" stroke-width="4" stroke-dasharray="8 6"/>
+<text class="legend" x="684" y="115">prefill exact MTP</text>
+<line x1="658" y1="136" x2="674" y2="136" stroke="#dc2626" stroke-width="4"/>
+<text class="legend" x="684" y="141">generation no-MTP</text>
+<line x1="658" y1="162" x2="674" y2="162" stroke="#16a34a" stroke-width="4"/>
+<text class="legend" x="684" y="167">generation exact MTP</text>
+</svg>

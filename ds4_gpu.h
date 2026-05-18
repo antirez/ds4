@@ -15,6 +15,21 @@
  */
 typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 
+typedef struct ds4_gpu_top2_result {
+    uint32_t id0;
+    uint32_t id1;
+    float    value0;
+    float    value1;
+} ds4_gpu_top2_result;
+
+typedef struct ds4_gpu_candidate_cert_result {
+    uint32_t candidate_id;
+    uint32_t certified;
+    uint32_t bound_id;
+    float    candidate_logit;
+    float    max_bound;
+} ds4_gpu_candidate_cert_result;
+
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
 
@@ -39,11 +54,22 @@ int ds4_gpu_synchronize(void);
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
+int ds4_gpu_import_model_ipc_manifest(const void *model_map, uint64_t model_size, const char *manifest_path, const char *model_id);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
 void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_print_memory_report(const char *label);
+void ds4_gpu_set_attention_output_b_n2_q8_override(int enabled);
+
+/* Bug 2 / Option D: force matmuls to legacy native kernels for the duration
+ * of an MTP verifier call.  See local/docs/ds4_mmq_mtp_correctness_plan.html
+ * in the auto-round companion repo for the full mechanism.  Call sites wrap
+ * each metal_graph_verify_* (and the verifier-context callers of
+ * metal_graph_eval_token_raw_swa_top) with set(1)/.../set(0).  Backends
+ * other than CUDA implement these as no-ops. */
+void ds4_gpu_set_mtp_verifier(int on);
+int  ds4_gpu_in_mtp_verifier(void);
 
 /* =========================================================================
  * Embeddings and Indexer Helpers.
@@ -138,6 +164,78 @@ int ds4_gpu_matmul_q8_0_tensor(
         uint64_t                weight_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
+int ds4_gpu_matmul_q8_0_top2_tensor(
+        ds4_gpu_tensor       *top2,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x);
+
+int ds4_gpu_matmul_q8_0_top2_and_logits_n2_tensor(
+        ds4_gpu_tensor       *row0_top2,
+        ds4_gpu_tensor       *row1_logits,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x2);
+
+int ds4_gpu_matmul_q8_0_candidates_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *candidate_ids,
+        uint32_t                candidate_count,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x);
+
+int ds4_gpu_q8_0_row_group_norms_tensor(
+        ds4_gpu_tensor       *row_group_norms,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        uint32_t                group_count);
+
+ds4_gpu_tensor *ds4_gpu_imported_q8_0_row_group_norms_tensor(
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        uint32_t                group_count);
+
+int ds4_gpu_matmul_q8_0_candidate_certify_tensor(
+        ds4_gpu_tensor       *result,
+        const ds4_gpu_tensor *row_group_norms,
+        const ds4_gpu_tensor *candidate_ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t                group_count);
+
+int ds4_gpu_matmul_q8_0_pair_tensor(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *out1,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight0_offset,
+        uint64_t                weight1_offset,
+        uint64_t                in_dim,
+        uint64_t                out0_dim,
+        uint64_t                out1_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
@@ -559,6 +657,17 @@ int ds4_gpu_attention_output_low_q8_tensor(
         uint32_t                n_groups,
         const ds4_gpu_tensor *heads);
 
+int ds4_gpu_attention_output_low_q8_batch_tensor(
+        ds4_gpu_tensor       *low,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens);
+
 /* =========================================================================
  * Router, Shared Expert, and Routed MoE.
  * =========================================================================
@@ -778,6 +887,16 @@ int ds4_gpu_hc_expand_add_split_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+int ds4_gpu_hc_expand_add_split_n2_rows_tensor(
+        ds4_gpu_tensor       *out0_hc,
+        ds4_gpu_tensor       *out1_hc,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
+
 int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *shared_out,
@@ -803,6 +922,35 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
+
+int ds4_gpu_matmul_q8_0_hc_expand_n2_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
+
+int ds4_gpu_matmul_q8_0_hc_expand_n2_split_residual_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual0_hc,
+        const ds4_gpu_tensor *residual1_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);

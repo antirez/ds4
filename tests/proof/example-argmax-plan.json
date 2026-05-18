@@ -1,0 +1,35 @@
+{
+  "suite": "argmax_generation",
+  "profiles": [
+    {
+      "name": "baseline",
+      "backend": "cuda",
+      "baseline": true
+    },
+    {
+      "name": "candidate",
+      "backend": "cuda",
+      "env": {
+        "DS4_EXPERIMENTAL_FLAG": "1"
+      }
+    }
+  ],
+  "prompts": [
+    {
+      "id": "prime-list",
+      "prompt": "List 100 prime numbers, comma-separated, just numbers."
+    },
+    {
+      "id": "specdecode-prose",
+      "prompt": "Write a concise explanation of how speculative decoding works, then give three caveats."
+    }
+  ],
+  "contracts": [
+    {
+      "name": "baseline_vs_candidate",
+      "baseline": "baseline",
+      "candidate": "candidate",
+      "kind": "exact_bytes"
+    }
+  ]
+}

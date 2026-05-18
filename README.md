@@ -29,7 +29,7 @@ dense models, we can report that:
 3. The model features a context window of **1 million tokens**.
 4. Being so large, it knows more things if you go sampling at the edge of knowledge. For instance asking about Italian show or political questions soon uncovers that 284B parameters are a lot more than 27B or 35B parameters.
 5. It writes much better English and Italian. It *feels* a quasi-frontier model.
-6. The KV cache is incredibly compressed, allowing long context inference on local computers and **on disk KV cache persistence**.
+6. The KV cache is incredibly compressed, allowing long context inference on local computers and **on disk KV cache persistence**. The compression isn't only about fitting in RAM: in our testing the model's speed survives deep contexts (>100k tokens) far better than similarly-sized recent peers like MiMo-V2.5, so long-context inference stays fast as the window fills.
 7. It works well with 2-bit quantization, if quantized in a special way (read later). This allows to run it in MacBooks with 128GB of RAM (and many people reported it working with 96GB as well, even at 250k context window!).
 8. We expect DeepSeek to release **updated versions of v4 Flash** in the future, even better than the current one.
 
@@ -81,6 +81,12 @@ next sections.
   how local GGUFs are scored against official DeepSeek V4 Flash continuations.
 - [dir-steering/README.md](dir-steering/README.md): directional steering data,
   vector generation, and usage.
+- [misc/cuda-env-vars.md](misc/cuda-env-vars.md): CUDA backend env-var
+  reference and Q8_0 dispatcher behavior.
+- [misc/cuda-mtp/README.md](misc/cuda-mtp/README.md): CUDA MTP enablement,
+  DGX Spark / GB10 notes, optimization flags, and benchmark method.
+- [misc/proof-harness/README.md](misc/proof-harness/README.md): generalized
+  engine proof harness and weight-server lifecycle.
 - [speed-bench/README.md](speed-bench/README.md): benchmark CSV files and graph
   generation.
 - [tests/test-vectors/README.md](tests/test-vectors/README.md): official
@@ -147,10 +153,11 @@ select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 
 ## Speed
 
-These are single-run Metal CLI numbers with `--ctx 32768`, `--nothink`, greedy
+These are single-run CLI numbers with `--ctx 32768`, `--nothink`, greedy
 decoding, and `-n 256`. The short prompt is a normal small Italian story
 prompt. The long prompts exercise chunked prefill plus long-context decode.
-Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
+Mac entries use Metal; NVIDIA entries use CUDA. Q4 requires the
+larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 
 | Machine | Quant | Prompt | Prefill | Generation |
 | --- | ---: | ---: | ---: | ---: |
@@ -162,7 +169,10 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 | Mac Studio M3 Ultra, 512 GB | q2 | 11709 tokens | 468.03 t/s | 27.39 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | short | 78.95 t/s | 35.50 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | 12018 tokens | 448.82 t/s | 26.62 t/s |
-| DGX Spark GB10, 128 GB | q2 | 7047 tokens | 343.81 t/s | 13.75 t/s |
+| RTX PRO 6000 Blackwell, 96 GB | q2 | short | 85.21 t/s | 53.28 t/s |
+| RTX PRO 6000 Blackwell, 96 GB | q2 | 12461 tokens | 1920.66 t/s | 41.10 t/s |
+| DGX Spark GB10, 128 GB | q2 | short | 48.53 t/s | 15.81 t/s |
+| DGX Spark GB10, 128 GB | q2 | 12461 tokens | 403.57 t/s | 13.56 t/s |
 
 ![M3 Max t/s](speed-bench/m3_max_ts.svg)
 
@@ -191,8 +201,14 @@ header and footer removed: <https://www.gutenberg.org/ebooks/45334>.
 
 Use `--step-incr N` for different linear spacing, or `--step-mul F` for
 exponential sweeps. Output is CSV with one row per frontier: latest prefill
-interval tokens/sec, generation tokens/sec at that frontier, and
-`kvcache_bytes`.
+interval tokens/sec, generation tokens/sec at that frontier, the
+steady-state generation throughput (`gen_tps_ss`, which excludes the
+first-token amortisation cost so the column compares apples-to-apples
+across short and long generations), the first-token latency, and
+`kvcache_bytes`. Committed sweeps live under `speed-bench/`; the included
+[pro6000_blackwell_ts.svg](speed-bench/pro6000_blackwell_ts.svg) and
+[gb10_spark_ts.svg](speed-bench/gb10_spark_ts.svg) are generated from
+those CSVs via `python3 speed-bench/plot_speed.py`.
 
 ## Capability Evaluation
 
@@ -348,6 +364,13 @@ The Responses endpoint streams the Responses event lifecycle expected by Codex,
 including `response.output_text.delta`, function-call argument events, and
 terminal `response.completed` / `response.incomplete` / `response.failed`
 events.
+
+Chat-completion SSE accepts a `return_token_ids: true` request field that
+adds per-token IDs to each streamed delta, placed at the choice level to
+match the wire shape vLLM and llama-benchy-style benchmark harnesses expect.
+The emission limit is snapped to token boundaries so partial UTF-8 never
+desynchronises the IDs from the text. Helpful when an external evaluation
+loop needs raw token IDs alongside the rendered text.
 
 For browser JavaScript clients served from another origin, start the server with
 `--cors` to emit `Access-Control-Allow-*` headers. This only changes HTTP

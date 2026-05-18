@@ -22,6 +22,7 @@
 
 typedef struct {
     const char *model_path;
+    const char *mtp_path;
     const char *prompt_path;
     const char *chat_prompt_path;
     const char *system;
@@ -33,6 +34,9 @@ typedef struct {
     int ctx_alloc;
     int step_incr;
     int gen_tokens;
+    int mtp_draft_tokens;
+    int output_head_bench_iters;
+    float mtp_margin;
     double step_mul;
     bool warm_weights;
     bool quality;
@@ -63,6 +67,9 @@ static void usage(FILE *fp) {
         "\n"
         "Model and backend:\n"
         "  -m, --model FILE       GGUF model path. Default: ds4flash.gguf\n"
+        "  --mtp FILE             Optional MTP draft GGUF for speculative decode.\n"
+        "  --mtp-draft N          Draft tokens per speculative cycle. Default: 1\n"
+        "  --mtp-margin F         Non-exact MTP margin. Default: 3.0\n"
         "  --metal | --cuda | --cpu | --backend NAME\n"
         "      Select backend explicitly. Defaults to Metal on macOS, CUDA elsewhere.\n"
         "  -t, --threads N        CPU helper threads.\n"
@@ -79,6 +86,7 @@ static void usage(FILE *fp) {
         "\n"
         "Output:\n"
         "  --csv FILE             Write CSV there instead of stdout.\n"
+        "  --output-head-bench N  Run the CUDA output-head verifier microbenchmark at --ctx-start and exit.\n"
         "  -h, --help             Show this help.\n");
 }
 
@@ -177,6 +185,8 @@ static bench_config parse_options(int argc, char **argv) {
         .ctx_max = 32768,
         .step_incr = 2048,
         .gen_tokens = 128,
+        .mtp_draft_tokens = 1,
+        .mtp_margin = 3.0f,
         .step_mul = 1.0,
     };
 
@@ -187,6 +197,19 @@ static bench_config parse_options(int argc, char **argv) {
             exit(0);
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp")) {
+            c.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp-draft")) {
+            c.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--output-head-bench")) {
+            c.output_head_bench_iters = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--mtp-margin")) {
+            double v = parse_double_arg(need_arg(&i, argc, argv, arg), arg);
+            if (v < 0.0 || v > 1000.0) {
+                fprintf(stderr, "ds4-bench: invalid value for %s: %.17g\n", arg, v);
+                exit(2);
+            }
+            c.mtp_margin = (float)v;
         } else if (!strcmp(arg, "--prompt-file")) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-prompt-file")) {
@@ -244,13 +267,14 @@ static bench_config parse_options(int argc, char **argv) {
         fprintf(stderr, "ds4-bench: --step-incr must be positive when --step-mul is 1\n");
         exit(2);
     }
-    if (c.ctx_max > INT_MAX - c.gen_tokens - 1) {
+    const int max_live_ctx = c.output_head_bench_iters > 0 ? c.ctx_start : c.ctx_max;
+    if (max_live_ctx > INT_MAX - c.gen_tokens - 1) {
         fprintf(stderr, "ds4-bench: requested context is too large\n");
         exit(2);
     }
-    if (c.ctx_alloc == 0) c.ctx_alloc = c.ctx_max + c.gen_tokens + 1;
-    if (c.ctx_alloc <= c.ctx_max + c.gen_tokens) {
-        fprintf(stderr, "ds4-bench: --ctx-alloc must be greater than ctx-max + gen-tokens\n");
+    if (c.ctx_alloc == 0) c.ctx_alloc = max_live_ctx + c.gen_tokens + 1;
+    if (c.ctx_alloc <= max_live_ctx + c.gen_tokens) {
+        fprintf(stderr, "ds4-bench: --ctx-alloc must be greater than measured context + gen-tokens\n");
         exit(2);
     }
     return c;
@@ -289,8 +313,11 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+        .mtp_path = cfg.mtp_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
+        .mtp_draft_tokens = cfg.mtp_draft_tokens,
+        .mtp_margin = cfg.mtp_margin,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
     };
@@ -306,11 +333,12 @@ int main(int argc, char **argv) {
     }
     free(text);
 
-    if (prompt.len < cfg.ctx_max) {
+    const int needed_prompt_tokens = cfg.output_head_bench_iters > 0 ? cfg.ctx_start : cfg.ctx_max;
+    if (prompt.len < needed_prompt_tokens) {
         fprintf(stderr,
-                "ds4-bench: prompt has %d tokens, need at least --ctx-max=%d\n",
+                "ds4-bench: prompt has %d tokens, need at least %d\n",
                 prompt.len,
-                cfg.ctx_max);
+                needed_prompt_tokens);
         ds4_tokens_free(&prompt);
         ds4_engine_close(engine);
         return 1;
@@ -335,7 +363,34 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes\n");
+
+    if (cfg.output_head_bench_iters > 0) {
+        ds4_tokens prefix = {
+            .v = prompt.v,
+            .len = cfg.ctx_start,
+            .cap = cfg.ctx_start,
+        };
+        char err[256];
+        int rc = 0;
+        if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
+            fprintf(stderr, "ds4-bench: prefill to %d failed: %s\n", cfg.ctx_start, err);
+            rc = 1;
+        } else if (ds4_session_output_head_bench(session,
+                                                cfg.output_head_bench_iters,
+                                                out,
+                                                err,
+                                                sizeof(err)) != 0) {
+            fprintf(stderr, "ds4-bench: output-head bench failed: %s\n", err);
+            rc = 1;
+        }
+        if (out != stdout) fclose(out);
+        ds4_session_free(session);
+        ds4_tokens_free(&prompt);
+        ds4_engine_close(engine);
+        return rc;
+    }
+
+    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_tps_ss,first_token_sec,kvcache_bytes\n");
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
@@ -368,7 +423,10 @@ int main(int argc, char **argv) {
         }
 
         const double gen_t0 = bench_now_sec();
-        for (int i = 0; i < cfg.gen_tokens; i++) {
+        int generated = 0;
+        double t_after_first = 0.0;
+        int first_call_tokens = 0;
+        while (generated < cfg.gen_tokens) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
                 rc = 1;
@@ -380,10 +438,38 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
-                fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
-                rc = 1;
-                break;
+            const bool use_mtp_eval =
+                ds4_engine_mtp_draft_tokens(engine) > 1 &&
+                getenv("DS4_MTP_SPEC_DISABLE") == NULL;
+            if (use_mtp_eval) {
+                int toks[17];
+                int ntok = ds4_session_eval_speculative_argmax(session,
+                                                               token,
+                                                               cfg.gen_tokens - generated,
+                                                               eos,
+                                                               toks,
+                                                               (int)(sizeof(toks) / sizeof(toks[0])),
+                                                               err,
+                                                               sizeof(err));
+                if (ntok < 0) {
+                    fprintf(stderr, "ds4-bench: speculative decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+                for (int j = 0; j < ntok && generated < cfg.gen_tokens; j++) {
+                    if (toks[j] != eos) generated++;
+                }
+            } else {
+                if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+                    fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+                generated++;
+            }
+            if (t_after_first == 0.0) {
+                t_after_first = bench_now_sec();
+                first_call_tokens = generated;
             }
         }
         const double gen_t1 = bench_now_sec();
@@ -396,13 +482,19 @@ int main(int argc, char **argv) {
         }
 
         const double gen_sec = gen_t1 - gen_t0;
+        const double first_token_sec = t_after_first > 0.0 ? t_after_first - gen_t0 : 0.0;
+        const double ss_sec = t_after_first > 0.0 ? gen_t1 - t_after_first : 0.0;
+        const int ss_tokens = cfg.gen_tokens - first_call_tokens;
+        const double gen_tps_ss = (ss_sec > 0.0 && ss_tokens > 0) ? (double)ss_tokens / ss_sec : 0.0;
         fprintf(out,
-                "%d,%d,%.2f,%d,%.2f,%llu\n",
+                "%d,%d,%.2f,%d,%.2f,%.2f,%.4f,%llu\n",
                 frontier,
                 prefill_tokens,
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
                 cfg.gen_tokens,
                 gen_sec > 0.0 ? (double)cfg.gen_tokens / gen_sec : 0.0,
+                gen_tps_ss,
+                first_token_sec,
                 (unsigned long long)snap.len);
         fflush(out);
 

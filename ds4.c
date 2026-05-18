@@ -8078,6 +8078,19 @@ static void output_logits_one_decode_scratch(
 
 #ifndef DS4_NO_GPU
 static int sample_argmax(const float *logits, uint32_t n_vocab);
+static void logits_top2(const float *logits, uint32_t n_vocab,
+                        int *top0, float *logit0,
+                        int *top1, float *logit1);
+static ds4_gpu_tensor *metal_graph_tensor_row_view(
+        ds4_gpu_tensor *base,
+        uint32_t        row,
+        uint64_t        row_elems);
+
+typedef enum metal_graph_decode_layer_stop {
+    METAL_GRAPH_DECODE_LAYER_FULL = 0,
+    METAL_GRAPH_DECODE_LAYER_AFTER_ATTN,
+    METAL_GRAPH_DECODE_LAYER_BEFORE_ATTN_OUTPUT
+} metal_graph_decode_layer_stop;
 
 /* =========================================================================
  * Metal Reference Comparison Helpers.
@@ -8141,6 +8154,9 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
  * tensor names follow the model stages rather than generic graph nodes.
  */
 
+#define DS4_OUTPUT_CERT_GROUPS_MAX 16u
+#define DS4_OUTPUT_CERT_GROUPS_DEFAULT 8u
+
 typedef struct {
     /* One-token decode tensors.  These stay allocated for the life of a
      * session; a generated token enters as an embedding in cur_hc and leaves as
@@ -8185,12 +8201,20 @@ typedef struct {
     ds4_gpu_tensor *spec_prefix1_attn_state_score[DS4_N_LAYER];
     ds4_gpu_tensor *spec_prefix1_index_state_kv[DS4_N_LAYER];
     ds4_gpu_tensor *spec_prefix1_index_state_score[DS4_N_LAYER];
+    ds4_gpu_tensor *spec_prefix2_attn_state_kv[DS4_N_LAYER];
+    ds4_gpu_tensor *spec_prefix2_attn_state_score[DS4_N_LAYER];
+    ds4_gpu_tensor *spec_prefix2_index_state_kv[DS4_N_LAYER];
+    ds4_gpu_tensor *spec_prefix2_index_state_score[DS4_N_LAYER];
+    ds4_gpu_tensor *spec_cur_hc;
     ds4_gpu_tensor *spec_logits;
     uint32_t layer_n_comp[DS4_N_LAYER];
     uint32_t layer_n_index_comp[DS4_N_LAYER];
     uint32_t spec_prefix1_n_comp[DS4_N_LAYER];
     uint32_t spec_prefix1_n_index_comp[DS4_N_LAYER];
+    uint32_t spec_prefix2_n_comp[DS4_N_LAYER];
+    uint32_t spec_prefix2_n_index_comp[DS4_N_LAYER];
     bool spec_capture_prefix1;
+    uint32_t spec_capture_prefix_depth;
     uint32_t raw_cap;
     /* Maximum compressed-row capacity across layers.  Shared work buffers use
      * this worst-case size because ratio-4 indexer layers can still reach it. */
@@ -8236,6 +8260,11 @@ typedef struct {
     ds4_gpu_tensor *output_embd;
     ds4_gpu_tensor *output_norm;
     ds4_gpu_tensor *logits;
+    ds4_gpu_tensor *output_candidate_ids;
+    ds4_gpu_tensor *output_cert_group_norms;
+    ds4_gpu_tensor *output_cert_result;
+    uint32_t output_cert_group_norms_groups;
+    bool output_cert_group_norms_ready;
 
     /* Optional MTP model state.  It has its own raw cache because the drafter
      * runs on speculative future tokens; target KV state is updated only after
@@ -8250,6 +8279,9 @@ typedef struct {
     ds4_gpu_tensor *mtp_state_hc;
     ds4_gpu_tensor *mtp_next_hc;
     ds4_gpu_tensor *mtp_raw_cache;
+    ds4_gpu_tensor *spec_mtp_state_hc;
+    ds4_gpu_tensor *spec_mtp_next_hc;
+    ds4_gpu_tensor *spec_mtp_raw_cache;
     uint32_t mtp_n_raw;
     uint32_t prefill_cap;
     uint32_t raw_window;
@@ -8348,7 +8380,14 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->batch_next_hc);
     ds4_gpu_tensor_free(g->batch_cur_hc);
     ds4_gpu_tensor_free(g->prefill_tokens);
+    ds4_gpu_tensor_free(g->output_candidate_ids);
+    ds4_gpu_tensor_free(g->output_cert_result);
+    ds4_gpu_tensor_free(g->output_cert_group_norms);
     ds4_gpu_tensor_free(g->logits);
+    ds4_gpu_tensor_free(g->spec_cur_hc);
+    ds4_gpu_tensor_free(g->spec_mtp_raw_cache);
+    ds4_gpu_tensor_free(g->spec_mtp_next_hc);
+    ds4_gpu_tensor_free(g->spec_mtp_state_hc);
     ds4_gpu_tensor_free(g->mtp_raw_cache);
     ds4_gpu_tensor_free(g->mtp_next_hc);
     ds4_gpu_tensor_free(g->mtp_state_hc);
@@ -8422,6 +8461,10 @@ static void metal_graph_free(ds4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->spec_prefix1_attn_state_score[il]);
         ds4_gpu_tensor_free(g->spec_prefix1_index_state_kv[il]);
         ds4_gpu_tensor_free(g->spec_prefix1_index_state_score[il]);
+        ds4_gpu_tensor_free(g->spec_prefix2_attn_state_kv[il]);
+        ds4_gpu_tensor_free(g->spec_prefix2_attn_state_score[il]);
+        ds4_gpu_tensor_free(g->spec_prefix2_index_state_kv[il]);
+        ds4_gpu_tensor_free(g->spec_prefix2_index_state_score[il]);
     }
     ds4_gpu_tensor_free(g->kv);
     ds4_gpu_tensor_free(g->kv_raw);
@@ -8801,6 +8844,8 @@ static bool metal_graph_alloc_raw_cap(
                 g->spec_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
                 g->spec_prefix1_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
                 g->spec_prefix1_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
+                g->spec_prefix2_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
+                g->spec_prefix2_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
             }
             if (g->layer_attn_state_kv[il]) {
                 state_init_ok = state_init_ok &&
@@ -8824,6 +8869,8 @@ static bool metal_graph_alloc_raw_cap(
                     g->spec_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                     g->spec_prefix1_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                     g->spec_prefix1_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
+                    g->spec_prefix2_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
+                    g->spec_prefix2_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                 }
                 if (g->layer_index_state_kv[il]) {
                     state_init_ok = state_init_ok &&
@@ -8869,6 +8916,7 @@ static bool metal_graph_alloc_raw_cap(
     g->output_embd = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->output_norm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->logits = ds4_gpu_tensor_alloc(vocab_dim * sizeof(float));
+    g->output_candidate_ids = ds4_gpu_tensor_alloc(8u * sizeof(uint32_t));
     /*
      * MTP is deliberately outside the normal graph footprint.  A session that
      * does not opt in with --mtp must allocate and execute exactly the same
@@ -8888,6 +8936,16 @@ static bool metal_graph_alloc_raw_cap(
         g->mtp_raw_cache = metal_graph_alloc_kv_cache_tensor(
                 managed_kv_cache,
                 (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
+        /* Speculative frontier shadow buffers (proof-budget MTP). The HC state
+         * shadows are small fixed-size float arrays; the spec raw_cache shadow
+         * follows the managed-kv-cache policy because it is the same shape and
+         * lifetime as the primary mtp_raw_cache. */
+        g->spec_mtp_state_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
+        g->spec_mtp_next_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
+        g->spec_mtp_raw_cache = metal_graph_alloc_kv_cache_tensor(
+                managed_kv_cache,
+                (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
+        g->spec_cur_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
         g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
         g->mtp_n_raw = 0;
     }
@@ -8943,7 +9001,9 @@ static bool metal_graph_alloc_raw_cap(
                               (g->spec_attn_state_kv[il] != NULL &&
                                g->spec_attn_state_score[il] != NULL &&
                                g->spec_prefix1_attn_state_kv[il] != NULL &&
-                               g->spec_prefix1_attn_state_score[il] != NULL));
+                               g->spec_prefix1_attn_state_score[il] != NULL &&
+                               g->spec_prefix2_attn_state_kv[il] != NULL &&
+                               g->spec_prefix2_attn_state_score[il] != NULL));
         }
         if (layer_cache_ok && ratio == 4) {
             layer_cache_ok = g->layer_index_comp_cache[il] != NULL &&
@@ -8953,7 +9013,9 @@ static bool metal_graph_alloc_raw_cap(
                               (g->spec_index_state_kv[il] != NULL &&
                                g->spec_index_state_score[il] != NULL &&
                                g->spec_prefix1_index_state_kv[il] != NULL &&
-                               g->spec_prefix1_index_state_score[il] != NULL));
+                               g->spec_prefix1_index_state_score[il] != NULL &&
+                               g->spec_prefix2_index_state_kv[il] != NULL &&
+                               g->spec_prefix2_index_state_score[il] != NULL));
         }
     }
 
@@ -8975,11 +9037,14 @@ static bool metal_graph_alloc_raw_cap(
                     g->after_ffn_hc &&
                     g->output_pre && g->output_weights && g->output_embd &&
                     g->output_norm && g->logits &&
+                    g->output_candidate_ids &&
                     (!enable_mtp ||
                      (g->mtp_embed && g->mtp_enorm && g->mtp_eproj &&
                       g->mtp_eproj_hc && g->mtp_hnorm_hc && g->mtp_hproj_hc &&
                       g->mtp_input_hc && g->mtp_state_hc && g->mtp_next_hc &&
-                      g->mtp_raw_cache && g->spec_logits)) &&
+                      g->mtp_raw_cache && g->spec_mtp_state_hc &&
+                      g->spec_mtp_next_hc && g->spec_mtp_raw_cache &&
+                      g->spec_cur_hc && g->spec_logits)) &&
                     g->prefill_tokens &&
                     g->batch_cur_hc && g->batch_next_hc && g->batch_flat_hc &&
                     g->batch_hc_mix && g->batch_hc_split &&
@@ -9050,23 +9115,37 @@ static uint32_t metal_graph_raw_start_for_span(
  * not evict visible raw rows.  If the raw cache is ever reduced to a strict
  * 128-row ring, speculative raw rows must become shadow rows and be copied
  * into the ring only on commit. */
-static bool metal_graph_capture_prefix1_attn_state(ds4_gpu_graph *g, uint32_t il) {
-    if (!g->spec_capture_prefix1 || !g->spec_prefix1_attn_state_kv[il]) return true;
+static bool metal_graph_capture_prefix_attn_state(ds4_gpu_graph *g, uint32_t il, uint32_t depth) {
+    if (g->spec_capture_prefix_depth < depth || depth == 0 || depth > 2) return true;
+    ds4_gpu_tensor *dst_kv = depth == 1 ? g->spec_prefix1_attn_state_kv[il]
+                                        : g->spec_prefix2_attn_state_kv[il];
+    ds4_gpu_tensor *dst_score = depth == 1 ? g->spec_prefix1_attn_state_score[il]
+                                           : g->spec_prefix2_attn_state_score[il];
+    uint32_t *dst_n_comp = depth == 1 ? g->spec_prefix1_n_comp
+                                      : g->spec_prefix2_n_comp;
+    if (!dst_kv) return true;
     const uint64_t bytes = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
-    g->spec_prefix1_n_comp[il] = g->layer_n_comp[il];
-    return ds4_gpu_tensor_copy(g->spec_prefix1_attn_state_kv[il], 0,
+    dst_n_comp[il] = g->layer_n_comp[il];
+    return ds4_gpu_tensor_copy(dst_kv, 0,
                                  g->layer_attn_state_kv[il], 0, bytes) != 0 &&
-           ds4_gpu_tensor_copy(g->spec_prefix1_attn_state_score[il], 0,
+           ds4_gpu_tensor_copy(dst_score, 0,
                                  g->layer_attn_state_score[il], 0, bytes) != 0;
 }
 
-static bool metal_graph_capture_prefix1_index_state(ds4_gpu_graph *g, uint32_t il) {
-    if (!g->spec_capture_prefix1 || !g->spec_prefix1_index_state_kv[il]) return true;
+static bool metal_graph_capture_prefix_index_state(ds4_gpu_graph *g, uint32_t il, uint32_t depth) {
+    if (g->spec_capture_prefix_depth < depth || depth == 0 || depth > 2) return true;
+    ds4_gpu_tensor *dst_kv = depth == 1 ? g->spec_prefix1_index_state_kv[il]
+                                        : g->spec_prefix2_index_state_kv[il];
+    ds4_gpu_tensor *dst_score = depth == 1 ? g->spec_prefix1_index_state_score[il]
+                                           : g->spec_prefix2_index_state_score[il];
+    uint32_t *dst_n_index_comp = depth == 1 ? g->spec_prefix1_n_index_comp
+                                            : g->spec_prefix2_n_index_comp;
+    if (!dst_kv) return true;
     const uint64_t bytes = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
-    g->spec_prefix1_n_index_comp[il] = g->layer_n_index_comp[il];
-    return ds4_gpu_tensor_copy(g->spec_prefix1_index_state_kv[il], 0,
+    dst_n_index_comp[il] = g->layer_n_index_comp[il];
+    return ds4_gpu_tensor_copy(dst_kv, 0,
                                  g->layer_index_state_kv[il], 0, bytes) != 0 &&
-           ds4_gpu_tensor_copy(g->spec_prefix1_index_state_score[il], 0,
+           ds4_gpu_tensor_copy(dst_score, 0,
                                  g->layer_index_state_score[il], 0, bytes) != 0;
 }
 
@@ -9210,7 +9289,7 @@ static bool metal_graph_matmul_plain_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
-static bool metal_graph_encode_decode_layer(
+static bool metal_graph_encode_decode_layer_impl(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
         const ds4_layer_weights *layer,
@@ -9220,7 +9299,8 @@ static bool metal_graph_encode_decode_layer(
         uint32_t                raw_cap,
         uint32_t                raw_row,
         uint32_t                n_raw,
-        int                     token) {
+        int                     token,
+        metal_graph_decode_layer_stop stop_at) {
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_rank = layer->attn_q_a->dim[1];
@@ -9243,6 +9323,7 @@ static bool metal_graph_encode_decode_layer(
         attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
     }
     const bool qkv_rms_fused = !metal_graph_use_reference_qkv_norm();
+    const bool decode_q8_pair = getenv("DS4_CUDA_NO_DECODE_Q8_PAIR") == NULL;
 
     bool ok = true;
     const bool decode_stage_profile = getenv("DS4_METAL_DECODE_STAGE_PROFILE") != NULL;
@@ -9301,18 +9382,32 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("attn_norm", g->attn_norm, DS4_N_EMBD, il, pos);
     }
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->qr, model->map, model->size,
-                                              layer->attn_q_a->abs_offset,
-                                              DS4_N_EMBD, q_rank,
-                                              g->attn_norm, 1) != 0;
+    if (ok && qkv_rms_fused && decode_q8_pair) {
+        ok = ds4_gpu_matmul_q8_0_pair_tensor(g->qr,
+                                             g->kv_raw,
+                                             model->map,
+                                             model->size,
+                                             layer->attn_q_a->abs_offset,
+                                             layer->attn_kv->abs_offset,
+                                             DS4_N_EMBD,
+                                             q_rank,
+                                             DS4_N_HEAD_DIM,
+                                             g->attn_norm,
+                                             1) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_matmul_q8_0_tensor(g->qr, model->map, model->size,
+                                          layer->attn_q_a->abs_offset,
+                                          DS4_N_EMBD, q_rank,
+                                          g->attn_norm, 1) != 0;
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("q_lora", g->qr, q_rank, il, pos);
     }
     if (qkv_rms_fused) {
-        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->kv_raw, model->map, model->size,
-                                                  layer->attn_kv->abs_offset,
-                                                  DS4_N_EMBD, DS4_N_HEAD_DIM,
-                                                  g->attn_norm, 1) != 0;
+        if (ok && !decode_q8_pair) ok = ds4_gpu_matmul_q8_0_tensor(g->kv_raw, model->map, model->size,
+                                                                     layer->attn_kv->abs_offset,
+                                                                     DS4_N_EMBD, DS4_N_HEAD_DIM,
+                                                                     g->attn_norm, 1) != 0;
         if (ok) {
             metal_graph_debug_dump_tensor("KVraw", g->kv_raw, DS4_N_HEAD_DIM, il, pos);
         }
@@ -9724,6 +9819,7 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("kqv_back", g->heads, q_dim, il, pos);
     }
+    if (stop_at == METAL_GRAPH_DECODE_LAYER_BEFORE_ATTN_OUTPUT) return ok;
     const bool fuse_attn_out_hc =
         !metal_graph_directional_steering_attn_enabled(g) &&
         !metal_graph_use_reference_attn_out_hc();
@@ -9781,6 +9877,7 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("hc_attn_post", g->after_attn_hc, hc_dim, il, pos);
     }
+    if (stop_at == METAL_GRAPH_DECODE_LAYER_AFTER_ATTN) return ok;
     if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->after_attn_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_ffn_fn,
                                                  hc_dim, mix_hc, g->flat_hc, 1);
@@ -9977,12 +10074,1706 @@ static bool metal_graph_encode_decode_layer(
     return ok;
 }
 
-/* Encode the final HC collapse, output norm, and vocab projection on Metal. */
-static bool metal_graph_encode_output_head(
+static bool metal_graph_encode_decode_layer(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        uint32_t                pos,
+        ds4_gpu_tensor       *raw_cache,
+        uint32_t                raw_cap,
+        uint32_t                raw_row,
+        uint32_t                n_raw,
+        int                     token) {
+    return metal_graph_encode_decode_layer_impl(g,
+                                                model,
+                                                layer,
+                                                il,
+                                                pos,
+                                                raw_cache,
+                                                raw_cap,
+                                                raw_row,
+                                                n_raw,
+                                                token,
+                                                METAL_GRAPH_DECODE_LAYER_FULL);
+}
+
+static bool metal_graph_encode_decode_ffn_half_exact(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        uint32_t                pos,
+        int                     token) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    const uint32_t shared_dim = (uint32_t)layer->ffn_gate_shexp->dim[1];
+    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
+    const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
+    const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
+    const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
+    const bool fuse_hc_norm =
+        !metal_graph_use_reference_hc_decode() &&
+        !metal_graph_use_reference_hc_norm_decode();
+    bool ok = true;
+    const bool decode_stage_profile = getenv("DS4_METAL_DECODE_STAGE_PROFILE") != NULL;
+    double decode_stage_t0 = decode_stage_profile ? now_sec() : 0.0;
+#define DS4_METAL_PROFILE_DECODE_FFN_STAGE(name) do { \
+        if (ok && decode_stage_profile) { \
+            ok = metal_graph_layer_stage_profile_boundary("decode", (name), il, pos, 1, &decode_stage_t0); \
+        } \
+    } while (0)
+
+    if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->after_attn_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
+    if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_ffn_fn,
+                                                 hc_dim, mix_hc, g->flat_hc, 1);
+    if (ok && fuse_hc_norm) {
+        ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(g->ffn_cur,
+                                                         g->ffn_norm,
+                                                         g->hc_split,
+                                                         g->hc_mix,
+                                                         g->after_attn_hc,
+                                                         model->map,
+                                                         model->size,
+                                                         layer->hc_ffn_scale->abs_offset,
+                                                         layer->hc_ffn_base->abs_offset,
+                                                         layer->ffn_norm->abs_offset,
+                                                         DS4_N_EMBD,
+                                                         DS4_N_HC,
+                                                         DS4_N_HC_SINKHORN_ITER,
+                                                         DS4_HC_EPS,
+                                                         DS4_RMS_EPS) != 0;
+    } else if (ok) {
+        ok = metal_graph_decode_hc_pre(g->ffn_cur,
+                                       g->hc_split,
+                                       g->hc_mix,
+                                       g->after_attn_hc,
+                                       model,
+                                       layer->hc_ffn_scale->abs_offset,
+                                       layer->hc_ffn_base->abs_offset);
+    }
+    DS4_METAL_PROFILE_DECODE_FFN_STAGE("ffn_hc_pre");
+    if (ok) {
+        metal_graph_debug_dump_tensor("hc_ffn_pre_mixes", g->hc_mix, mix_hc, il, pos);
+        metal_graph_debug_dump_tensor("hc_ffn_pre_weights", g->hc_pre, DS4_N_HC, il, pos);
+        metal_graph_debug_dump_tensor("hc_ffn_pre_post_weights", g->hc_post, DS4_N_HC, il, pos);
+        metal_graph_debug_dump_tensor("hc_ffn_pre_comb", g->hc_comb, (uint64_t)DS4_N_HC * DS4_N_HC, il, pos);
+    }
+    if (ok) {
+        metal_graph_debug_dump_tensor("hc_ffn_pre", g->ffn_cur, DS4_N_EMBD, il, pos);
+    }
+    if (ok && !fuse_hc_norm) ok = ds4_gpu_rms_norm_weight_tensor(g->ffn_norm, g->ffn_cur,
+                                                                   model->map, model->size,
+                                                                   layer->ffn_norm->abs_offset,
+                                                                   DS4_N_EMBD, DS4_RMS_EPS) != 0;
+    DS4_METAL_PROFILE_DECODE_FFN_STAGE("ffn_norm");
+    if (ok) {
+        metal_graph_debug_dump_tensor("ffn_norm", g->ffn_norm, DS4_N_EMBD, il, pos);
+    }
+    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
+    const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+    const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
+    if (ok) ok = metal_graph_matmul_plain_tensor(g->router_logits, model, layer->ffn_gate_inp,
+                                                 DS4_N_EMBD, DS4_N_EXPERT, g->ffn_norm, 1);
+    if (ok) ok = ds4_gpu_router_select_tensor(g->router_selected, g->router_weights, g->router_probs,
+                                                model->map, model->size,
+                                                layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
+                                                layer->ffn_gate_tid2eid ? layer->ffn_gate_tid2eid->abs_offset : 0,
+                                                layer->ffn_gate_tid2eid ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
+                                                (uint32_t)token,
+                                                0,
+                                                0,
+                                                layer->ffn_exp_probs_b != NULL,
+                                                layer->ffn_gate_tid2eid != NULL,
+                                                g->router_logits) != 0;
+    DS4_METAL_PROFILE_DECODE_FFN_STAGE("router");
+    if (ok) {
+        metal_graph_debug_dump_tensor("ffn_moe_logits", g->router_logits, DS4_N_EXPERT, il, pos);
+        metal_graph_debug_dump_tensor("ffn_moe_probs", g->router_probs, DS4_N_EXPERT, il, pos);
+        metal_graph_debug_dump_i32_tensor("ffn_moe_topk", g->router_selected, DS4_N_EXPERT_USED, il, pos);
+        metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
+    }
+    if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
+                                                 g->routed_gate,
+                                                 g->routed_up,
+                                                 g->routed_mid,
+                                                 g->routed_down,
+                                                 model->map, model->size,
+                                                 layer->ffn_gate_exps->abs_offset,
+                                                 layer->ffn_up_exps->abs_offset,
+                                                 layer->ffn_down_exps->abs_offset,
+                                                 layer->ffn_gate_exps->type,
+                                                 layer->ffn_down_exps->type,
+                                                 gate_expert_bytes, gate_row_bytes,
+                                                 down_expert_bytes, down_row_bytes,
+                                                 (uint32_t)expert_in_dim,
+                                                 (uint32_t)down_in_dim,
+                                                 (uint32_t)routed_out_dim,
+                                                 g->router_selected, g->router_weights,
+                                                 DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm) != 0;
+    DS4_METAL_PROFILE_DECODE_FFN_STAGE("routed_moe");
+    if (ok) {
+        metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
+                                      (uint64_t)DS4_N_EXPERT_USED * down_in_dim, il, pos);
+        metal_graph_debug_dump_tensor("ffn_moe_up_clamped", g->routed_up,
+                                      (uint64_t)DS4_N_EXPERT_USED * down_in_dim, il, pos);
+    }
+    if (ok) {
+        metal_graph_debug_dump_tensor("ffn_moe_weighted_swiglu", g->routed_mid,
+                                      (uint64_t)DS4_N_EXPERT_USED * down_in_dim, il, pos);
+        metal_graph_debug_dump_tensor("ffn_moe_down", g->routed_down,
+                                      (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD, il, pos);
+        metal_graph_debug_dump_tensor("ffn_moe_out", g->routed_out, DS4_N_EMBD, il, pos);
+    }
+    const bool fuse_shared_gate_up =
+        !g->quality &&
+        getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
+    if (ok && fuse_shared_gate_up) {
+        ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
+                                                         g->shared_up,
+                                                         g->shared_mid,
+                                                         model->map,
+                                                         model->size,
+                                                         layer->ffn_gate_shexp->abs_offset,
+                                                         layer->ffn_up_shexp->abs_offset,
+                                                         DS4_N_EMBD,
+                                                         shared_dim,
+                                                         g->ffn_norm,
+                                                         DS4_SWIGLU_CLAMP_EXP) != 0;
+    } else {
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_gate, model->map, model->size,
+                                                  layer->ffn_gate_shexp->abs_offset,
+                                                  DS4_N_EMBD, shared_dim,
+                                                  g->ffn_norm, 1) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_up, model->map, model->size,
+                                                  layer->ffn_up_shexp->abs_offset,
+                                                  DS4_N_EMBD, shared_dim,
+                                                  g->ffn_norm, 1) != 0;
+        if (ok) ok = ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up, shared_dim, 0.0f, 1.0f) != 0;
+    }
+    DS4_METAL_PROFILE_DECODE_FFN_STAGE("shared_gate_up");
+    const bool keep_ffn_out = metal_graph_needs_ffn_out(g, il, pos);
+    const bool fuse_shared_down_hc =
+        !keep_ffn_out && !metal_graph_use_reference_shared_down_hc();
+    if (ok && fuse_shared_down_hc) {
+        ok = ds4_gpu_shared_down_hc_expand_q8_0_tensor(g->after_ffn_hc,
+                                                         g->shared_out,
+                                                         model->map,
+                                                         model->size,
+                                                         layer->ffn_down_shexp->abs_offset,
+                                                         shared_dim,
+                                                         DS4_N_EMBD,
+                                                         g->shared_mid,
+                                                         g->routed_out,
+                                                         g->after_attn_hc,
+                                                         g->hc_split,
+                                                         DS4_N_EMBD,
+                                                         DS4_N_HC) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_matmul_q8_0_tensor(g->shared_out, model->map, model->size,
+                                          layer->ffn_down_shexp->abs_offset,
+                                          shared_dim, DS4_N_EMBD,
+                                          g->shared_mid, 1) != 0;
+    }
+    DS4_METAL_PROFILE_DECODE_FFN_STAGE("shared_down");
+    if (ok) {
+        metal_graph_debug_dump_tensor("ffn_shexp", g->shared_out, DS4_N_EMBD, il, pos);
+    }
+    if (ok && keep_ffn_out) {
+        ok = metal_graph_ensure_ffn_out(g) &&
+             ds4_gpu_add_tensor(g->ffn_out, g->shared_out, g->routed_out, DS4_N_EMBD) != 0;
+    }
+    if (ok && keep_ffn_out) {
+        metal_graph_debug_dump_tensor("ffn_out", g->ffn_out, DS4_N_EMBD, il, pos);
+    }
+    if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+        ok = metal_graph_apply_directional_steering_ffn(g, g->ffn_out, il, 1);
+    }
+    if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+        ok = ds4_gpu_hc_expand_tensor(g->after_ffn_hc,
+                                        g->ffn_out,
+                                        g->after_attn_hc,
+                                        g->hc_post,
+                                        g->hc_comb,
+                                        DS4_N_EMBD,
+                                        DS4_N_HC) != 0;
+    } else if (ok && !fuse_shared_down_hc) {
+        ok = ds4_gpu_hc_expand_add_split_tensor(g->after_ffn_hc,
+                                                  g->routed_out,
+                                                  g->shared_out,
+                                                  g->after_attn_hc,
+                                                  g->hc_split,
+                                                  DS4_N_EMBD,
+                                                  DS4_N_HC) != 0;
+    }
+    DS4_METAL_PROFILE_DECODE_FFN_STAGE("ffn_hc_post");
+#undef DS4_METAL_PROFILE_DECODE_FFN_STAGE
+    if (ok) {
+        metal_graph_debug_dump_tensor("hc_ffn_post", g->after_ffn_hc, hc_dim, il, pos);
+    }
+    return ok;
+}
+
+static bool metal_graph_encode_decode_ffn_prefix_exact(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        uint32_t                pos,
+        int                     token) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    const bool fuse_hc_norm =
+        !metal_graph_use_reference_hc_decode() &&
+        !metal_graph_use_reference_hc_norm_decode();
+    bool ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc,
+                                             g->after_attn_hc,
+                                             (uint32_t)hc_dim,
+                                             DS4_RMS_EPS) != 0;
+    if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix,
+                                                 model,
+                                                 layer->hc_ffn_fn,
+                                                 hc_dim,
+                                                 mix_hc,
+                                                 g->flat_hc,
+                                                 1);
+    if (ok && fuse_hc_norm) {
+        ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(g->ffn_cur,
+                                                         g->ffn_norm,
+                                                         g->hc_split,
+                                                         g->hc_mix,
+                                                         g->after_attn_hc,
+                                                         model->map,
+                                                         model->size,
+                                                         layer->hc_ffn_scale->abs_offset,
+                                                         layer->hc_ffn_base->abs_offset,
+                                                         layer->ffn_norm->abs_offset,
+                                                         DS4_N_EMBD,
+                                                         DS4_N_HC,
+                                                         DS4_N_HC_SINKHORN_ITER,
+                                                         DS4_HC_EPS,
+                                                         DS4_RMS_EPS) != 0;
+    } else if (ok) {
+        ok = metal_graph_decode_hc_pre(g->ffn_cur,
+                                       g->hc_split,
+                                       g->hc_mix,
+                                       g->after_attn_hc,
+                                       model,
+                                       layer->hc_ffn_scale->abs_offset,
+                                       layer->hc_ffn_base->abs_offset);
+    }
+    if (ok) {
+        metal_graph_debug_dump_tensor("hc_ffn_pre_mixes", g->hc_mix, mix_hc, il, pos);
+        metal_graph_debug_dump_tensor("hc_ffn_pre_weights", g->hc_pre, DS4_N_HC, il, pos);
+        metal_graph_debug_dump_tensor("hc_ffn_pre_post_weights", g->hc_post, DS4_N_HC, il, pos);
+        metal_graph_debug_dump_tensor("hc_ffn_pre_comb", g->hc_comb, (uint64_t)DS4_N_HC * DS4_N_HC, il, pos);
+        metal_graph_debug_dump_tensor("hc_ffn_pre", g->ffn_cur, DS4_N_EMBD, il, pos);
+    }
+    if (ok && !fuse_hc_norm) ok = ds4_gpu_rms_norm_weight_tensor(g->ffn_norm,
+                                                                   g->ffn_cur,
+                                                                   model->map,
+                                                                   model->size,
+                                                                   layer->ffn_norm->abs_offset,
+                                                                   DS4_N_EMBD,
+                                                                   DS4_RMS_EPS) != 0;
+    if (ok) {
+        metal_graph_debug_dump_tensor("ffn_norm", g->ffn_norm, DS4_N_EMBD, il, pos);
+    }
+    if (ok) ok = metal_graph_matmul_plain_tensor(g->router_logits,
+                                                 model,
+                                                 layer->ffn_gate_inp,
+                                                 DS4_N_EMBD,
+                                                 DS4_N_EXPERT,
+                                                 g->ffn_norm,
+                                                 1);
+    if (ok) ok = ds4_gpu_router_select_tensor(g->router_selected,
+                                                g->router_weights,
+                                                g->router_probs,
+                                                model->map,
+                                                model->size,
+                                                layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
+                                                layer->ffn_gate_tid2eid ? layer->ffn_gate_tid2eid->abs_offset : 0,
+                                                layer->ffn_gate_tid2eid ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
+                                                (uint32_t)token,
+                                                0,
+                                                0,
+                                                layer->ffn_exp_probs_b != NULL,
+                                                layer->ffn_gate_tid2eid != NULL,
+                                                g->router_logits) != 0;
+    if (ok) {
+        metal_graph_debug_dump_tensor("ffn_moe_logits", g->router_logits, DS4_N_EXPERT, il, pos);
+        metal_graph_debug_dump_tensor("ffn_moe_probs", g->router_probs, DS4_N_EXPERT, il, pos);
+        metal_graph_debug_dump_i32_tensor("ffn_moe_topk", g->router_selected, DS4_N_EXPERT_USED, il, pos);
+        metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
+    }
+    return ok;
+}
+
+static bool metal_graph_encode_decode_ffn_shared_post_exact(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        uint32_t                pos) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint32_t shared_dim = (uint32_t)layer->ffn_gate_shexp->dim[1];
+    const bool fuse_shared_gate_up =
+        !g->quality &&
+        getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
+    bool ok = true;
+    if (ok && fuse_shared_gate_up) {
+        ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
+                                                         g->shared_up,
+                                                         g->shared_mid,
+                                                         model->map,
+                                                         model->size,
+                                                         layer->ffn_gate_shexp->abs_offset,
+                                                         layer->ffn_up_shexp->abs_offset,
+                                                         DS4_N_EMBD,
+                                                         shared_dim,
+                                                         g->ffn_norm,
+                                                         DS4_SWIGLU_CLAMP_EXP) != 0;
+    } else {
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_gate,
+                                                  model->map,
+                                                  model->size,
+                                                  layer->ffn_gate_shexp->abs_offset,
+                                                  DS4_N_EMBD,
+                                                  shared_dim,
+                                                  g->ffn_norm,
+                                                  1) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_up,
+                                                  model->map,
+                                                  model->size,
+                                                  layer->ffn_up_shexp->abs_offset,
+                                                  DS4_N_EMBD,
+                                                  shared_dim,
+                                                  g->ffn_norm,
+                                                  1) != 0;
+        if (ok) ok = ds4_gpu_swiglu_tensor(g->shared_mid,
+                                             g->shared_gate,
+                                             g->shared_up,
+                                             shared_dim,
+                                             0.0f,
+                                             1.0f) != 0;
+    }
+    const bool keep_ffn_out = metal_graph_needs_ffn_out(g, il, pos);
+    const bool fuse_shared_down_hc =
+        !keep_ffn_out && !metal_graph_use_reference_shared_down_hc();
+    if (ok && fuse_shared_down_hc) {
+        ok = ds4_gpu_shared_down_hc_expand_q8_0_tensor(g->after_ffn_hc,
+                                                         g->shared_out,
+                                                         model->map,
+                                                         model->size,
+                                                         layer->ffn_down_shexp->abs_offset,
+                                                         shared_dim,
+                                                         DS4_N_EMBD,
+                                                         g->shared_mid,
+                                                         g->routed_out,
+                                                         g->after_attn_hc,
+                                                         g->hc_split,
+                                                         DS4_N_EMBD,
+                                                         DS4_N_HC) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_matmul_q8_0_tensor(g->shared_out,
+                                          model->map,
+                                          model->size,
+                                          layer->ffn_down_shexp->abs_offset,
+                                          shared_dim,
+                                          DS4_N_EMBD,
+                                          g->shared_mid,
+                                          1) != 0;
+    }
+    if (ok) {
+        metal_graph_debug_dump_tensor("ffn_shexp", g->shared_out, DS4_N_EMBD, il, pos);
+    }
+    if (ok && keep_ffn_out) {
+        ok = metal_graph_ensure_ffn_out(g) &&
+             ds4_gpu_add_tensor(g->ffn_out, g->shared_out, g->routed_out, DS4_N_EMBD) != 0;
+    }
+    if (ok && keep_ffn_out) {
+        metal_graph_debug_dump_tensor("ffn_out", g->ffn_out, DS4_N_EMBD, il, pos);
+    }
+    if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+        ok = metal_graph_apply_directional_steering_ffn(g, g->ffn_out, il, 1);
+    }
+    if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+        ok = ds4_gpu_hc_expand_tensor(g->after_ffn_hc,
+                                        g->ffn_out,
+                                        g->after_attn_hc,
+                                        g->hc_post,
+                                        g->hc_comb,
+                                        DS4_N_EMBD,
+                                        DS4_N_HC) != 0;
+    } else if (ok && !fuse_shared_down_hc) {
+        ok = ds4_gpu_hc_expand_add_split_tensor(g->after_ffn_hc,
+                                                  g->routed_out,
+                                                  g->shared_out,
+                                                  g->after_attn_hc,
+                                                  g->hc_split,
+                                                  DS4_N_EMBD,
+                                                  DS4_N_HC) != 0;
+    }
+    if (ok) {
+        metal_graph_debug_dump_tensor("hc_ffn_post", g->after_ffn_hc, hc_dim, il, pos);
+    }
+    return ok;
+}
+
+static bool metal_graph_decode2_layer_profile_boundary(
+        const char *stage,
+        uint32_t    il,
+        uint32_t    pos0,
+        double      total_t0,
+        double     *stage_t0) {
+    if (ds4_gpu_end_commands() == 0) return false;
+    const double now = now_sec();
+    fprintf(stderr,
+            "ds4: mtp decode2 layer layer=%u pos=%u %s=%.3f ms total=%.3f ms\n",
+            il,
+            pos0,
+            stage,
+            (now - *stage_t0) * 1000.0,
+            (now - total_t0) * 1000.0);
+    *stage_t0 = now;
+    return ds4_gpu_begin_commands() != 0;
+}
+
+static bool metal_graph_encode_layer_ffn_batch(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        uint32_t                pos0,
+        uint32_t                n_tokens);
+
+static bool metal_graph_encode_decode2_layer_exact(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_weights      *weights,
+        uint32_t                il,
+        uint32_t                pos0,
+        int                     token0,
+        int                     token1,
+        ds4_gpu_tensor        **cur0_io,
+        ds4_gpu_tensor        **next0_io,
+        ds4_gpu_tensor        **cur1_io,
+        ds4_gpu_tensor        **next1_io) {
+    if (!g || !model || !weights || !cur0_io || !next0_io || !cur1_io || !next1_io) return false;
+    const uint32_t pos1 = pos0 + 1u;
+    ds4_gpu_tensor *cur0 = *cur0_io;
+    ds4_gpu_tensor *next0 = *next0_io;
+    ds4_gpu_tensor *cur1 = *cur1_io;
+    ds4_gpu_tensor *next1 = *next1_io;
+    if (!cur0 || !next0 || !cur1 || !next1 || g->raw_cap == 0) return false;
+    const bool profile = getenv("DS4_MTP_EXACT_DECODE2_LAYER_PROFILE") != NULL;
+    const double total_t0 = profile ? now_sec() : 0.0;
+    double stage_t0 = total_t0;
+
+    g->cur_hc = cur0;
+    g->after_ffn_hc = next0;
+    bool ok = metal_graph_encode_decode_layer(g,
+                                               model,
+                                               &weights->layer[il],
+                                               il,
+                                               pos0,
+                                               g->layer_raw_cache[il],
+                                               g->raw_cap,
+                                               pos0 % g->raw_cap,
+                                               metal_graph_raw_span_for_batch(g, pos0, 1),
+                                               token0);
+    if (ok && profile) {
+        ok = metal_graph_decode2_layer_profile_boundary("row0", il, pos0, total_t0, &stage_t0);
+    }
+    if (ok) {
+        ok = metal_graph_capture_prefix_attn_state(g, il, 1) &&
+             metal_graph_capture_prefix_index_state(g, il, 1);
+    }
+    if (ok && profile) {
+        ok = metal_graph_decode2_layer_profile_boundary("capture_prefix", il, pos0, total_t0, &stage_t0);
+    }
+    if (ok) {
+        g->cur_hc = cur1;
+        g->after_ffn_hc = next1;
+        ok = metal_graph_encode_decode_layer(g,
+                                             model,
+                                             &weights->layer[il],
+                                             il,
+                                             pos1,
+                                             g->layer_raw_cache[il],
+                                             g->raw_cap,
+                                             pos1 % g->raw_cap,
+                                             metal_graph_raw_span_for_batch(g, pos1, 1),
+                                             token1);
+    }
+    if (ok && profile) {
+        ok = metal_graph_decode2_layer_profile_boundary("row1", il, pos0, total_t0, &stage_t0);
+    }
+    if (ok) {
+        ds4_gpu_tensor *tmp = cur0; cur0 = next0; next0 = tmp;
+        tmp = cur1; cur1 = next1; next1 = tmp;
+        *cur0_io = cur0;
+        *next0_io = next0;
+        *cur1_io = cur1;
+        *next1_io = next1;
+    }
+    return ok;
+}
+
+static bool metal_graph_decode2_batch_ffn_diff_layer(uint32_t il) {
+    if (getenv("DS4_MTP_DECODE2_BATCH_FFN_DIFF") == NULL) return false;
+    const char *layer_env = getenv("DS4_MTP_DECODE2_BATCH_FFN_DIFF_LAYER");
+    if (!layer_env || !layer_env[0] || strcmp(layer_env, "all") == 0) return true;
+    char *end = NULL;
+    unsigned long v = strtoul(layer_env, &end, 10);
+    return end != layer_env && v == (unsigned long)il;
+}
+
+static bool metal_graph_decode2_compare_f32_tensor(
+        const char       *stage,
+        uint32_t          il,
+        uint32_t          pos,
+        uint32_t          row,
+        const ds4_gpu_tensor *batch,
+        const ds4_gpu_tensor *scalar,
+        uint64_t          n_f32) {
+    if (!batch || !scalar || n_f32 == 0) return false;
+    if (ds4_gpu_synchronize() == 0) {
+        fprintf(stderr, "ds4: decode2 batch FFN diff synchronize failed stage=%s layer=%u row=%u\n",
+                stage, il, row);
+        return false;
+    }
+
+    float *batch_buf = xmalloc((size_t)n_f32 * sizeof(batch_buf[0]));
+    float *scalar_buf = xmalloc((size_t)n_f32 * sizeof(scalar_buf[0]));
+    const bool ok =
+        ds4_gpu_tensor_read(batch, 0, batch_buf, n_f32 * sizeof(batch_buf[0])) != 0 &&
+        ds4_gpu_tensor_read(scalar, 0, scalar_buf, n_f32 * sizeof(scalar_buf[0])) != 0;
+    if (ok) {
+        fprintf(stderr,
+                "ds4: decode2 batch FFN diff layer=%u pos=%u row=%u stage=%s max_abs=%g rms=%g\n",
+                il,
+                pos,
+                row,
+                stage,
+                max_abs_diff(batch_buf, scalar_buf, n_f32),
+                rms_abs_diff(batch_buf, scalar_buf, n_f32));
+    }
+    free(scalar_buf);
+    free(batch_buf);
+    if (!ok) return false;
+    if (ds4_gpu_begin_commands() == 0) {
+        fprintf(stderr, "ds4: decode2 batch FFN diff failed to resume commands stage=%s layer=%u row=%u\n",
+                stage, il, row);
+        return false;
+    }
+    return true;
+}
+
+static bool metal_graph_decode2_compare_batch_row(
+        const char       *stage,
+        uint32_t          il,
+        uint32_t          pos,
+        uint32_t          row,
+        ds4_gpu_tensor *batch_base,
+        uint64_t          row_values,
+        const ds4_gpu_tensor *scalar) {
+    ds4_gpu_tensor *batch_row = metal_graph_tensor_row_view(batch_base, row, row_values);
+    bool ok = batch_row != NULL;
+    if (ok) {
+        ok = metal_graph_decode2_compare_f32_tensor(stage,
+                                                    il,
+                                                    pos,
+                                                    row,
+                                                    batch_row,
+                                                    scalar,
+                                                    row_values);
+    }
+    ds4_gpu_tensor_free(batch_row);
+    return ok;
+}
+
+static bool metal_graph_decode2_batch_ffn_diff(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_weights      *weights,
+        uint32_t                il,
+        uint32_t                pos0,
+        int                     token0,
+        int                     token1,
+        ds4_gpu_tensor        *cur0,
+        ds4_gpu_tensor        *cur1,
+        ds4_gpu_tensor        *after0,
+        ds4_gpu_tensor        *after1) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    ds4_gpu_tensor *scalar_next = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
+    bool ok = scalar_next != NULL;
+    ds4_gpu_tensor *saved_cur = g->cur_hc;
+    ds4_gpu_tensor *saved_after_attn = g->after_attn_hc;
+    ds4_gpu_tensor *saved_after_ffn = g->after_ffn_hc;
+
+    for (uint32_t row = 0; ok && row < 2; row++) {
+        const uint32_t pos = pos0 + row;
+        g->cur_hc = row == 0 ? cur0 : cur1;
+        g->after_attn_hc = row == 0 ? after0 : after1;
+        g->after_ffn_hc = scalar_next;
+        ok = metal_graph_encode_decode_ffn_half_exact(g,
+                                                       model,
+                                                       &weights->layer[il],
+                                                       il,
+                                                       pos,
+                                                       row == 0 ? token0 : token1);
+        if (ok) ok = metal_graph_decode2_compare_batch_row("hc_ffn_pre",
+                                                           il,
+                                                           pos0,
+                                                           row,
+                                                           g->batch_ffn_cur,
+                                                           DS4_N_EMBD,
+                                                           g->ffn_cur);
+        if (ok) ok = metal_graph_decode2_compare_batch_row("ffn_norm",
+                                                           il,
+                                                           pos0,
+                                                           row,
+                                                           g->batch_ffn_norm,
+                                                           DS4_N_EMBD,
+                                                           g->ffn_norm);
+        if (ok) ok = metal_graph_decode2_compare_batch_row("routed_out",
+                                                           il,
+                                                           pos0,
+                                                           row,
+                                                           g->batch_routed_out,
+                                                           DS4_N_EMBD,
+                                                           g->routed_out);
+        if (ok) ok = metal_graph_decode2_compare_batch_row("shared_out",
+                                                           il,
+                                                           pos0,
+                                                           row,
+                                                           g->batch_shared_out,
+                                                           DS4_N_EMBD,
+                                                           g->shared_out);
+        if (ok) ok = metal_graph_decode2_compare_batch_row("hc_ffn_post",
+                                                           il,
+                                                           pos0,
+                                                           row,
+                                                           g->batch_next_hc,
+                                                           hc_dim,
+                                                           scalar_next);
+    }
+
+    g->cur_hc = saved_cur;
+    g->after_attn_hc = saved_after_attn;
+    g->after_ffn_hc = saved_after_ffn;
+    ds4_gpu_tensor_free(scalar_next);
+    return ok;
+}
+
+static bool metal_graph_decode2_routed_batch_diff_layer(uint32_t il) {
+    if (getenv("DS4_MTP_DECODE2_ROUTED_BATCH_DIFF") == NULL) return false;
+    const char *layer_env = getenv("DS4_MTP_DECODE2_ROUTED_BATCH_DIFF_LAYER");
+    if (!layer_env || !layer_env[0] || strcmp(layer_env, "all") == 0) return true;
+    char *end = NULL;
+    unsigned long v = strtoul(layer_env, &end, 10);
+    return end != layer_env && v == (unsigned long)il;
+}
+
+static bool metal_graph_decode2_batch_ffn_body_diff_layer(uint32_t il) {
+    if (getenv("DS4_MTP_DECODE2_BATCH_FFN_BODY_DIFF") == NULL) return false;
+    const char *layer_env = getenv("DS4_MTP_DECODE2_BATCH_FFN_BODY_DIFF_LAYER");
+    if (!layer_env || !layer_env[0] || strcmp(layer_env, "all") == 0) return true;
+    char *end = NULL;
+    unsigned long v = strtoul(layer_env, &end, 10);
+    return end != layer_env && v == (unsigned long)il;
+}
+
+static bool metal_graph_decode2_q_batch_diff_layer(uint32_t il) {
+    if (getenv("DS4_MTP_DECODE2_Q_BATCH_DIFF") == NULL) return false;
+    const char *layer_env = getenv("DS4_MTP_DECODE2_Q_BATCH_DIFF_LAYER");
+    if (!layer_env || !layer_env[0] || strcmp(layer_env, "all") == 0) return true;
+    char *end = NULL;
+    unsigned long v = strtoul(layer_env, &end, 10);
+    return end != layer_env && v == (unsigned long)il;
+}
+
+static bool metal_graph_decode2_q_batch_diff(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        uint32_t                pos0) {
+    if (!g || !model || !layer) return false;
+    const uint64_t q_rank = layer->attn_q_a->dim[1];
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const bool compressed = ds4_layer_compress_ratio(il) != 0;
+    const float freq_base = layer_rope_freq_base(il);
+    const float freq_scale = layer_rope_freq_scale(il);
+    const float ext_factor = compressed && DS4_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
+    float attn_factor = 1.0f;
+    if (ext_factor != 0.0f && freq_scale > 0.0f) {
+        attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    const bool qkv_rms_fused = !metal_graph_use_reference_qkv_norm();
+    const bool batch_q8_pair =
+        getenv("DS4_CUDA_NO_BATCH_Q8_PAIR") == NULL &&
+        getenv("DS4_CUDA_NO_DECODE_Q8_PAIR") == NULL;
+    bool ok = true;
+
+    if (ok && qkv_rms_fused && batch_q8_pair) {
+        ok = ds4_gpu_matmul_q8_0_pair_tensor(g->batch_qr,
+                                             g->batch_kv_raw,
+                                             model->map,
+                                             model->size,
+                                             layer->attn_q_a->abs_offset,
+                                             layer->attn_kv->abs_offset,
+                                             DS4_N_EMBD,
+                                             q_rank,
+                                             DS4_N_HEAD_DIM,
+                                             g->batch_attn_norm,
+                                             2) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_matmul_q8_0_tensor(g->batch_qr,
+                                          model->map,
+                                          model->size,
+                                          layer->attn_q_a->abs_offset,
+                                          DS4_N_EMBD,
+                                          q_rank,
+                                          g->batch_attn_norm,
+                                          2) != 0;
+        if (ok && qkv_rms_fused) {
+            ok = ds4_gpu_matmul_q8_0_tensor(g->batch_kv_raw,
+                                              model->map,
+                                              model->size,
+                                              layer->attn_kv->abs_offset,
+                                              DS4_N_EMBD,
+                                              DS4_N_HEAD_DIM,
+                                              g->batch_attn_norm,
+                                              2) != 0;
+        }
+    }
+    if (ok && qkv_rms_fused) {
+        ok = ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(g->batch_qr_norm,
+                                                   g->batch_qr,
+                                                   model->map,
+                                                   model->size,
+                                                   layer->attn_q_a_norm->abs_offset,
+                                                   (uint32_t)q_rank,
+                                                   g->batch_kv,
+                                                   g->batch_kv_raw,
+                                                   layer->attn_kv_a_norm->abs_offset,
+                                                   DS4_N_HEAD_DIM,
+                                                   2,
+                                                   DS4_RMS_EPS) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_qr_norm,
+                                                 g->batch_qr,
+                                                 model->map,
+                                                 model->size,
+                                                 layer->attn_q_a_norm->abs_offset,
+                                                 (uint32_t)q_rank,
+                                                 2,
+                                                 DS4_RMS_EPS) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_matmul_q8_0_tensor(g->batch_heads,
+                                        model->map,
+                                        model->size,
+                                        layer->attn_q_b->abs_offset,
+                                        q_rank,
+                                        q_dim,
+                                        g->batch_qr_norm,
+                                        2) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_head_rms_norm_tensor(g->batch_heads,
+                                          2,
+                                          DS4_N_HEAD,
+                                          DS4_N_HEAD_DIM,
+                                          DS4_RMS_EPS) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_rope_tail_tensor(g->batch_heads,
+                                      2,
+                                      DS4_N_HEAD,
+                                      DS4_N_HEAD_DIM,
+                                      DS4_N_ROT,
+                                      pos0,
+                                      compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                      false,
+                                      freq_base,
+                                      freq_scale,
+                                      ext_factor,
+                                      attn_factor,
+                                      DS4_ROPE_YARN_BETA_FAST,
+                                      DS4_ROPE_YARN_BETA_SLOW) != 0;
+    }
+    for (uint32_t row = 0; ok && row < 2; row++) {
+        ds4_gpu_tensor *scalar_q = metal_graph_tensor_row_view(g->batch_q, row, q_dim);
+        ok = scalar_q != NULL &&
+             metal_graph_decode2_compare_batch_row("q_batch_from_scalar_norm",
+                                                   il,
+                                                   pos0,
+                                                   row,
+                                                   g->batch_heads,
+                                                   q_dim,
+                                                   scalar_q);
+        ds4_gpu_tensor_free(scalar_q);
+    }
+    return ok;
+}
+
+static bool metal_graph_decode2_comp_proj_diff_layer(uint32_t il) {
+    if (getenv("DS4_MTP_DECODE2_COMP_PROJ_DIFF") == NULL) return false;
+    const char *layer_env = getenv("DS4_MTP_DECODE2_COMP_PROJ_DIFF_LAYER");
+    if (!layer_env || !layer_env[0] || strcmp(layer_env, "all") == 0) return true;
+    char *end = NULL;
+    unsigned long v = strtoul(layer_env, &end, 10);
+    return end != layer_env && v == (unsigned long)il;
+}
+
+static bool metal_graph_decode2_comp_proj_diff(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        uint32_t                pos0) {
+    if (!g || !model || !layer) return false;
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    if (ratio == 0) return true;
+    const uint32_t coff = ratio == 4 ? 2u : 1u;
+    const uint32_t width = ratio == 4
+        ? coff * DS4_N_INDEXER_HEAD_DIM
+        : coff * DS4_N_HEAD_DIM;
+    const ds4_tensor *kv_w = ratio == 4
+        ? layer->indexer_compressor_kv
+        : layer->attn_compressor_kv;
+    const ds4_tensor *gate_w = ratio == 4
+        ? layer->indexer_compressor_gate
+        : layer->attn_compressor_gate;
+    if (!kv_w || !gate_w) return true;
+
+    bool ok = ds4_gpu_matmul_f16_pair_tensor(g->batch_heads,
+                                             g->batch_q,
+                                             model->map,
+                                             model->size,
+                                             kv_w->abs_offset,
+                                             gate_w->abs_offset,
+                                             DS4_N_EMBD,
+                                             width,
+                                             g->batch_attn_norm,
+                                             2) != 0;
+    const uint64_t comp_width_max = 2ull * (DS4_N_HEAD_DIM > DS4_N_INDEXER_HEAD_DIM
+        ? DS4_N_HEAD_DIM
+        : DS4_N_INDEXER_HEAD_DIM);
+    for (uint32_t row = 0; ok && row < 2; row++) {
+        ds4_gpu_tensor *scalar_kv = metal_graph_tensor_row_view(g->batch_comp_kv, row, comp_width_max);
+        ds4_gpu_tensor *scalar_gate = metal_graph_tensor_row_view(g->batch_comp_sc, row, comp_width_max);
+        ok = scalar_kv && scalar_gate &&
+             metal_graph_decode2_compare_batch_row("comp_proj_kv_batch_from_scalar_norm",
+                                                   il,
+                                                   pos0,
+                                                   row,
+                                                   g->batch_heads,
+                                                   width,
+                                                   scalar_kv) &&
+             metal_graph_decode2_compare_batch_row("comp_proj_gate_batch_from_scalar_norm",
+                                                   il,
+                                                   pos0,
+                                                   row,
+                                                   g->batch_q,
+                                                   width,
+                                                   scalar_gate);
+        ds4_gpu_tensor_free(scalar_gate);
+        ds4_gpu_tensor_free(scalar_kv);
+    }
+    return ok;
+}
+
+static bool metal_graph_decode2_capture_ffn_prefix_scalar_row(
+        ds4_gpu_graph *g,
+        uint32_t       row) {
+    const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    ds4_gpu_tensor *split_row = metal_graph_tensor_row_view(g->batch_hc_split, row, mix_hc);
+    ds4_gpu_tensor *norm_row = metal_graph_tensor_row_view(g->batch_ffn_norm, row, DS4_N_EMBD);
+    ds4_gpu_tensor *selected_row = metal_graph_tensor_row_view(g->batch_router_selected, row, DS4_N_EXPERT_USED);
+    ds4_gpu_tensor *weights_row = metal_graph_tensor_row_view(g->batch_router_weights, row, DS4_N_EXPERT_USED);
+    bool ok = split_row && norm_row && selected_row && weights_row;
+    if (ok) {
+        ok = ds4_gpu_tensor_copy(split_row, 0, g->hc_split, 0,
+                                 mix_hc * sizeof(float)) != 0 &&
+             ds4_gpu_tensor_copy(norm_row, 0, g->ffn_norm, 0,
+                                 (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
+             ds4_gpu_tensor_copy(selected_row, 0, g->router_selected, 0,
+                                 (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t)) != 0 &&
+             ds4_gpu_tensor_copy(weights_row, 0, g->router_weights, 0,
+                                 (uint64_t)DS4_N_EXPERT_USED * sizeof(float)) != 0;
+    }
+    ds4_gpu_tensor_free(weights_row);
+    ds4_gpu_tensor_free(selected_row);
+    ds4_gpu_tensor_free(norm_row);
+    ds4_gpu_tensor_free(split_row);
+    return ok;
+}
+
+static bool metal_graph_decode2_capture_routed_scalar_row(
+        ds4_gpu_graph *g,
+        uint32_t       row) {
+    ds4_gpu_tensor *routed_row = metal_graph_tensor_row_view(g->batch_shared_out, row, DS4_N_EMBD);
+    ds4_gpu_tensor *shared_row = metal_graph_tensor_row_view(g->batch_ffn_cur, row, DS4_N_EMBD);
+    bool ok = routed_row && shared_row &&
+              metal_graph_decode2_capture_ffn_prefix_scalar_row(g, row);
+    if (ok) {
+        ok = ds4_gpu_tensor_copy(routed_row, 0, g->routed_out, 0,
+                                 (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
+             ds4_gpu_tensor_copy(shared_row, 0, g->shared_out, 0,
+                                 (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+    }
+    ds4_gpu_tensor_free(shared_row);
+    ds4_gpu_tensor_free(routed_row);
+    return ok;
+}
+
+static bool metal_graph_decode2_run_batch_ffn_body_from_scalar_prefix(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        ds4_gpu_tensor        *next0,
+        ds4_gpu_tensor        *next1) {
+    if (!g || !model || !layer) return false;
+    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
+    const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
+    const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
+    const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
+    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
+    const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+    const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
+    const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    const bool batch_q8_pair =
+        getenv("DS4_MTP_DECODE2_BATCH_FFN_BODY_Q8_PAIR") != NULL &&
+        getenv("DS4_MTP_DECODE2_BATCH_FFN_BODY_NO_Q8_PAIR") == NULL &&
+        getenv("DS4_CUDA_NO_BATCH_Q8_PAIR") == NULL;
+    ds4_gpu_tensor *next_hc_view = next0 || next1 ? NULL : ds4_gpu_tensor_view(
+            g->batch_next_hc, 0, 2ull * hc_dim * sizeof(float));
+    ds4_gpu_tensor *hc_split_view = ds4_gpu_tensor_view(
+            g->batch_hc_split, 0, 2ull * mix_hc * sizeof(float));
+    bool ok = hc_split_view && ((next0 && next1) || next_hc_view);
+    if (ok) {
+        ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
+                                             g->batch_routed_gate,
+                                             g->batch_routed_up,
+                                             g->batch_routed_mid,
+                                             g->batch_routed_down,
+                                             model->map,
+                                             model->size,
+                                             layer->ffn_gate_exps->abs_offset,
+                                             layer->ffn_up_exps->abs_offset,
+                                             layer->ffn_down_exps->abs_offset,
+                                             layer->ffn_gate_exps->type,
+                                             layer->ffn_down_exps->type,
+                                             gate_expert_bytes,
+                                             gate_row_bytes,
+                                             down_expert_bytes,
+                                             down_row_bytes,
+                                             (uint32_t)expert_in_dim,
+                                             (uint32_t)down_in_dim,
+                                             (uint32_t)routed_out_dim,
+                                             g->batch_router_selected,
+                                             g->batch_router_weights,
+                                             DS4_N_EXPERT_USED,
+                                             DS4_SWIGLU_CLAMP_EXP,
+                                             g->batch_ffn_norm,
+                                             2,
+                                             &g->batch_routed_mid_is_f16) != 0;
+    }
+    if (ok && batch_q8_pair) {
+        ok = ds4_gpu_matmul_q8_0_pair_tensor(g->batch_shared_gate,
+                                             g->batch_shared_up,
+                                             model->map,
+                                             model->size,
+                                             layer->ffn_gate_shexp->abs_offset,
+                                             layer->ffn_up_shexp->abs_offset,
+                                             DS4_N_EMBD,
+                                             shared_dim,
+                                             shared_dim,
+                                             g->batch_ffn_norm,
+                                             2) != 0;
+    } else {
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_shared_gate,
+                                                  model->map,
+                                                  model->size,
+                                                  layer->ffn_gate_shexp->abs_offset,
+                                                  DS4_N_EMBD,
+                                                  shared_dim,
+                                                  g->batch_ffn_norm,
+                                                  2) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_shared_up,
+                                                  model->map,
+                                                  model->size,
+                                                  layer->ffn_up_shexp->abs_offset,
+                                                  DS4_N_EMBD,
+                                                  shared_dim,
+                                                  g->batch_ffn_norm,
+                                                  2) != 0;
+    }
+    if (ok) ok = ds4_gpu_swiglu_tensor(g->batch_shared_mid,
+                                         g->batch_shared_gate,
+                                         g->batch_shared_up,
+                                         (uint32_t)(2ull * shared_dim),
+                                         0.0f,
+                                         1.0f) != 0;
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_shared_out,
+                                              model->map,
+                                              model->size,
+                                              layer->ffn_down_shexp->abs_offset,
+                                              shared_dim,
+                                              DS4_N_EMBD,
+                                              g->batch_shared_mid,
+                                              2) != 0;
+    if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+        ok = metal_graph_ensure_batch_ffn_out(g) &&
+             ds4_gpu_add_tensor(g->batch_ffn_out,
+                                  g->batch_shared_out,
+                                  g->batch_routed_out,
+                                  2u * DS4_N_EMBD) != 0;
+    }
+    if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+        ok = metal_graph_apply_directional_steering_ffn(g, g->batch_ffn_out, il, 2);
+    }
+    if (ok && metal_graph_directional_steering_ffn_enabled(g) && next_hc_view) {
+        ok = ds4_gpu_hc_expand_split_tensor(next_hc_view,
+                                              g->batch_ffn_out,
+                                              g->batch_after_attn_hc,
+                                              hc_split_view,
+                                              DS4_N_EMBD,
+                                              DS4_N_HC) != 0;
+    } else if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+        ok = false;
+    } else if (ok && next0 && next1) {
+        ok = ds4_gpu_hc_expand_add_split_n2_rows_tensor(next0,
+                                                         next1,
+                                                         g->batch_routed_out,
+                                                         g->batch_shared_out,
+                                                         g->batch_after_attn_hc,
+                                                         hc_split_view,
+                                                         DS4_N_EMBD,
+                                                         DS4_N_HC) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_hc_expand_add_split_tensor(next_hc_view,
+                                                  g->batch_routed_out,
+                                                  g->batch_shared_out,
+                                                  g->batch_after_attn_hc,
+                                                  hc_split_view,
+                                                  DS4_N_EMBD,
+                                                  DS4_N_HC) != 0;
+    }
+    ds4_gpu_tensor_free(hc_split_view);
+    ds4_gpu_tensor_free(next_hc_view);
+    return ok;
+}
+
+static bool metal_graph_decode2_run_batch_routed_from_scalar_prefix(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer) {
+    if (!g || !model || !layer) return false;
+    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
+    const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
+    const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
+    const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
+    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
+    const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+    const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
+    bool ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
+                                               g->batch_routed_gate,
+                                               g->batch_routed_up,
+                                               g->batch_routed_mid,
+                                               g->batch_routed_down,
+                                               model->map,
+                                               model->size,
+                                               layer->ffn_gate_exps->abs_offset,
+                                               layer->ffn_up_exps->abs_offset,
+                                               layer->ffn_down_exps->abs_offset,
+                                               layer->ffn_gate_exps->type,
+                                               layer->ffn_down_exps->type,
+                                               gate_expert_bytes,
+                                               gate_row_bytes,
+                                               down_expert_bytes,
+                                               down_row_bytes,
+                                               (uint32_t)expert_in_dim,
+                                               (uint32_t)down_in_dim,
+                                               (uint32_t)routed_out_dim,
+                                               g->batch_router_selected,
+                                               g->batch_router_weights,
+                                               DS4_N_EXPERT_USED,
+                                               DS4_SWIGLU_CLAMP_EXP,
+                                               g->batch_ffn_norm,
+                                               2,
+                                               &g->batch_routed_mid_is_f16) != 0;
+    return ok;
+}
+
+static bool metal_graph_decode2_routed_batch_diff(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        uint32_t                pos0) {
+    bool ok = metal_graph_decode2_run_batch_routed_from_scalar_prefix(g, model, layer);
+    for (uint32_t row = 0; ok && row < 2; row++) {
+        ds4_gpu_tensor *scalar_row = metal_graph_tensor_row_view(g->batch_shared_out, row, DS4_N_EMBD);
+        ok = scalar_row != NULL;
+        if (!ok) break;
+        ok = metal_graph_decode2_compare_batch_row("routed_batch_from_scalar_inputs",
+                                                   il,
+                                                   pos0,
+                                                   row,
+                                                   g->batch_routed_out,
+                                                   DS4_N_EMBD,
+                                                   scalar_row);
+        ds4_gpu_tensor_free(scalar_row);
+    }
+    return ok;
+}
+
+static bool metal_graph_decode2_batch_ffn_body_diff(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        uint32_t                pos0,
+        ds4_gpu_tensor        *next0,
+        ds4_gpu_tensor        *next1) {
+    if (!next0 || !next1) return false;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    bool ok = metal_graph_decode2_run_batch_ffn_body_from_scalar_prefix(g,
+                                                                        model,
+                                                                        layer,
+                                                                        il,
+                                                                        NULL,
+                                                                        NULL);
+    for (uint32_t row = 0; ok && row < 2; row++) {
+        ds4_gpu_tensor *scalar_shared = metal_graph_tensor_row_view(g->batch_ffn_cur, row, DS4_N_EMBD);
+        ok = scalar_shared != NULL;
+        if (!ok) break;
+        ok = metal_graph_decode2_compare_batch_row("shared_body_batch_from_scalar_prefix",
+                                                   il,
+                                                   pos0,
+                                                   row,
+                                                   g->batch_shared_out,
+                                                   DS4_N_EMBD,
+                                                   scalar_shared);
+        ds4_gpu_tensor_free(scalar_shared);
+    }
+    if (ok) ok = metal_graph_decode2_compare_batch_row("ffn_body_batch_from_scalar_prefix",
+                                                       il,
+                                                       pos0,
+                                                       0,
+                                                       g->batch_next_hc,
+                                                       hc_dim,
+                                                       next0);
+    if (ok) ok = metal_graph_decode2_compare_batch_row("ffn_body_batch_from_scalar_prefix",
+                                                       il,
+                                                       pos0,
+                                                       1,
+                                                       g->batch_next_hc,
+                                                       hc_dim,
+                                                       next1);
+    return ok;
+}
+
+static bool metal_graph_decode2_finish_ffn_shared_post_from_batch_row(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        uint32_t                pos,
+        uint32_t                row,
+        ds4_gpu_tensor        *after_attn,
+        ds4_gpu_tensor        *after_ffn) {
+    const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    ds4_gpu_tensor *norm_row = metal_graph_tensor_row_view(g->batch_ffn_norm, row, DS4_N_EMBD);
+    ds4_gpu_tensor *split_row = metal_graph_tensor_row_view(g->batch_hc_split, row, mix_hc);
+    ds4_gpu_tensor *routed_row = metal_graph_tensor_row_view(g->batch_routed_out, row, DS4_N_EMBD);
+    ds4_gpu_tensor *saved_norm = g->ffn_norm;
+    ds4_gpu_tensor *saved_split = g->hc_split;
+    ds4_gpu_tensor *saved_routed = g->routed_out;
+    ds4_gpu_tensor *saved_after_attn = g->after_attn_hc;
+    ds4_gpu_tensor *saved_after_ffn = g->after_ffn_hc;
+    bool ok = norm_row && split_row && routed_row && after_attn && after_ffn;
+    if (ok) {
+        g->ffn_norm = norm_row;
+        g->hc_split = split_row;
+        g->routed_out = routed_row;
+        g->after_attn_hc = after_attn;
+        g->after_ffn_hc = after_ffn;
+        ok = metal_graph_encode_decode_ffn_shared_post_exact(g, model, layer, il, pos);
+    }
+    g->after_ffn_hc = saved_after_ffn;
+    g->after_attn_hc = saved_after_attn;
+    g->routed_out = saved_routed;
+    g->hc_split = saved_split;
+    g->ffn_norm = saved_norm;
+    ds4_gpu_tensor_free(routed_row);
+    ds4_gpu_tensor_free(split_row);
+    ds4_gpu_tensor_free(norm_row);
+    return ok;
+}
+
+static bool metal_graph_decode2_run_ffn_prefix_into_batch_row(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        uint32_t                pos,
+        int                     token,
+        uint32_t                row,
+        ds4_gpu_tensor        *cur_hc,
+        ds4_gpu_tensor        *after_attn,
+        ds4_gpu_tensor        *after_ffn) {
+    const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    ds4_gpu_tensor *split_row = metal_graph_tensor_row_view(g->batch_hc_split, row, mix_hc);
+    ds4_gpu_tensor *norm_row = metal_graph_tensor_row_view(g->batch_ffn_norm, row, DS4_N_EMBD);
+    ds4_gpu_tensor *selected_row = metal_graph_tensor_row_view(g->batch_router_selected, row, DS4_N_EXPERT_USED);
+    ds4_gpu_tensor *weights_row = metal_graph_tensor_row_view(g->batch_router_weights, row, DS4_N_EXPERT_USED);
+    ds4_gpu_tensor *saved_cur = g->cur_hc;
+    ds4_gpu_tensor *saved_after_attn = g->after_attn_hc;
+    ds4_gpu_tensor *saved_after_ffn = g->after_ffn_hc;
+    ds4_gpu_tensor *saved_split = g->hc_split;
+    ds4_gpu_tensor *saved_norm = g->ffn_norm;
+    ds4_gpu_tensor *saved_selected = g->router_selected;
+    ds4_gpu_tensor *saved_weights = g->router_weights;
+    bool ok = split_row && norm_row && selected_row && weights_row;
+    if (ok) {
+        g->cur_hc = cur_hc;
+        g->after_attn_hc = after_attn;
+        g->after_ffn_hc = after_ffn;
+        g->hc_split = split_row;
+        g->ffn_norm = norm_row;
+        g->router_selected = selected_row;
+        g->router_weights = weights_row;
+        ok = metal_graph_encode_decode_ffn_prefix_exact(g, model, layer, il, pos, token);
+    }
+    g->router_weights = saved_weights;
+    g->router_selected = saved_selected;
+    g->ffn_norm = saved_norm;
+    g->hc_split = saved_split;
+    g->after_ffn_hc = saved_after_ffn;
+    g->after_attn_hc = saved_after_attn;
+    g->cur_hc = saved_cur;
+    ds4_gpu_tensor_free(weights_row);
+    ds4_gpu_tensor_free(selected_row);
+    ds4_gpu_tensor_free(norm_row);
+    ds4_gpu_tensor_free(split_row);
+    return ok;
+}
+
+static bool metal_graph_encode_decode2_pair_attention_output_exact(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        const ds4_gpu_tensor    *residual0_hc,
+        const ds4_gpu_tensor    *residual1_hc) {
+    if (!g || !model || !layer || !residual0_hc || !residual1_hc) return false;
+    const uint32_t n_groups = DS4_N_OUT_GROUP;
+    const uint32_t group_heads = DS4_N_HEAD / n_groups;
+    const uint32_t group_dim = DS4_N_HEAD_DIM * group_heads;
+    const uint32_t rank = DS4_N_LORA_O;
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    bool ok = ds4_gpu_attention_output_low_q8_batch_tensor(g->batch_attn_low,
+                                                           model->map,
+                                                           model->size,
+                                                           layer->attn_output_a->abs_offset,
+                                                           group_dim,
+                                                           rank,
+                                                           n_groups,
+                                                           g->batch_heads,
+                                                           2) != 0;
+    if (ok) {
+        ok = ds4_gpu_matmul_q8_0_hc_expand_n2_split_residual_tensor(
+                g->batch_after_attn_hc,
+                g->batch_attn_out,
+                model->map,
+                model->size,
+                layer->attn_output_b->abs_offset,
+                low_dim,
+                DS4_N_EMBD,
+                g->batch_attn_low,
+                residual0_hc,
+                residual1_hc,
+                g->batch_hc_split,
+                DS4_N_EMBD,
+                DS4_N_HC) != 0;
+    }
+    return ok;
+}
+
+static bool metal_graph_encode_decode2_layer_state_barrier_exact(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_weights      *weights,
+        uint32_t                il,
+        uint32_t                pos0,
+        int                     token0,
+        int                     token1,
+        ds4_gpu_tensor        **cur0_io,
+        ds4_gpu_tensor        **next0_io,
+        ds4_gpu_tensor        **cur1_io,
+        ds4_gpu_tensor        **next1_io,
+        bool                    batch_ffn) {
+    if (!g || !model || !weights || !cur0_io || !next0_io || !cur1_io || !next1_io) return false;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint32_t pos1 = pos0 + 1u;
+    ds4_gpu_tensor *cur0 = *cur0_io;
+    ds4_gpu_tensor *next0 = *next0_io;
+    ds4_gpu_tensor *cur1 = *cur1_io;
+    ds4_gpu_tensor *next1 = *next1_io;
+    if (!cur0 || !next0 || !cur1 || !next1 || g->raw_cap == 0) return false;
+
+    ds4_gpu_tensor *after0 = metal_graph_tensor_row_view(g->batch_after_attn_hc, 0, hc_dim);
+    ds4_gpu_tensor *after1 = metal_graph_tensor_row_view(g->batch_after_attn_hc, 1, hc_dim);
+    const bool pair_attn_out =
+        getenv("DS4_MTP_DECODE2_NO_PAIR_ATTN_OUT") == NULL &&
+        !metal_graph_directional_steering_attn_enabled(g) &&
+        !metal_graph_use_reference_attn_out_hc();
+    const bool q_batch_diff = metal_graph_decode2_q_batch_diff_layer(il);
+    const bool comp_proj_diff = metal_graph_decode2_comp_proj_diff_layer(il);
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    const uint64_t comp_width_max = 2ull * (DS4_N_HEAD_DIM > DS4_N_INDEXER_HEAD_DIM
+        ? DS4_N_HEAD_DIM
+        : DS4_N_INDEXER_HEAD_DIM);
+    ds4_gpu_tensor *heads0 = pair_attn_out ? metal_graph_tensor_row_view(g->batch_heads, 0, q_dim) : NULL;
+    ds4_gpu_tensor *heads1 = pair_attn_out ? metal_graph_tensor_row_view(g->batch_heads, 1, q_dim) : NULL;
+    ds4_gpu_tensor *split0 = pair_attn_out ? metal_graph_tensor_row_view(g->batch_hc_split, 0, mix_hc) : NULL;
+    ds4_gpu_tensor *split1 = pair_attn_out ? metal_graph_tensor_row_view(g->batch_hc_split, 1, mix_hc) : NULL;
+    const bool capture_attn_norm = q_batch_diff || comp_proj_diff;
+    ds4_gpu_tensor *attn_norm0 = capture_attn_norm ? metal_graph_tensor_row_view(g->batch_attn_norm, 0, DS4_N_EMBD) : NULL;
+    ds4_gpu_tensor *attn_norm1 = capture_attn_norm ? metal_graph_tensor_row_view(g->batch_attn_norm, 1, DS4_N_EMBD) : NULL;
+    ds4_gpu_tensor *q0 = q_batch_diff ? metal_graph_tensor_row_view(g->batch_q, 0, q_dim) : NULL;
+    ds4_gpu_tensor *q1 = q_batch_diff ? metal_graph_tensor_row_view(g->batch_q, 1, q_dim) : NULL;
+    ds4_gpu_tensor *comp_kv0 = comp_proj_diff ? metal_graph_tensor_row_view(g->batch_comp_kv, 0, comp_width_max) : NULL;
+    ds4_gpu_tensor *comp_kv1 = comp_proj_diff ? metal_graph_tensor_row_view(g->batch_comp_kv, 1, comp_width_max) : NULL;
+    ds4_gpu_tensor *comp_sc0 = comp_proj_diff ? metal_graph_tensor_row_view(g->batch_comp_sc, 0, comp_width_max) : NULL;
+    ds4_gpu_tensor *comp_sc1 = comp_proj_diff ? metal_graph_tensor_row_view(g->batch_comp_sc, 1, comp_width_max) : NULL;
+    bool ok = after0 && after1 &&
+              (!pair_attn_out || (heads0 && heads1 && split0 && split1)) &&
+              (!capture_attn_norm || (attn_norm0 && attn_norm1)) &&
+              (!q_batch_diff || (q0 && q1)) &&
+              (!comp_proj_diff || (comp_kv0 && comp_kv1 && comp_sc0 && comp_sc1));
+
+    const bool profile = getenv("DS4_MTP_EXACT_DECODE2_LAYER_PROFILE") != NULL;
+    const bool routed_batch_diff = metal_graph_decode2_routed_batch_diff_layer(il);
+    const bool batch_ffn_body_diff = metal_graph_decode2_batch_ffn_body_diff_layer(il);
+    const bool capture_ffn_body = routed_batch_diff || batch_ffn_body_diff;
+    const bool batch_ffn_body = getenv("DS4_MTP_DECODE2_BATCH_FFN_BODY") != NULL;
+    const bool batch_routed_body = getenv("DS4_MTP_DECODE2_BATCH_ROUTED_BODY") != NULL;
+    const double total_t0 = profile ? now_sec() : 0.0;
+    double stage_t0 = total_t0;
+
+    ds4_gpu_tensor *saved_after_attn = g->after_attn_hc;
+    ds4_gpu_tensor *saved_heads = g->heads;
+    ds4_gpu_tensor *saved_hc_split = g->hc_split;
+    ds4_gpu_tensor *saved_attn_norm = g->attn_norm;
+    ds4_gpu_tensor *saved_q = g->q;
+    ds4_gpu_tensor *saved_comp_kv = g->comp_kv_cur;
+    ds4_gpu_tensor *saved_comp_sc = g->comp_sc_cur;
+
+    if (ok) {
+        g->cur_hc = cur0;
+        g->after_attn_hc = after0;
+        if (pair_attn_out) {
+            g->heads = heads0;
+            g->hc_split = split0;
+        }
+        if (capture_attn_norm) {
+            g->attn_norm = attn_norm0;
+        }
+        if (q_batch_diff) {
+            g->q = q0;
+        }
+        if (comp_proj_diff) {
+            g->comp_kv_cur = comp_kv0;
+            g->comp_sc_cur = comp_sc0;
+        }
+        ok = metal_graph_encode_decode_layer_impl(g,
+                                                  model,
+                                                  &weights->layer[il],
+                                                  il,
+                                                  pos0,
+                                                  g->layer_raw_cache[il],
+                                                  g->raw_cap,
+                                                  pos0 % g->raw_cap,
+                                                  metal_graph_raw_span_for_batch(g, pos0, 1),
+                                                  token0,
+                                                  pair_attn_out
+                                                      ? METAL_GRAPH_DECODE_LAYER_BEFORE_ATTN_OUTPUT
+                                                      : METAL_GRAPH_DECODE_LAYER_AFTER_ATTN);
+    }
+    if (ok && profile) {
+        ok = metal_graph_decode2_layer_profile_boundary(pair_attn_out ? "row0_attn_pre_output" : "row0_attn",
+                                                        il,
+                                                        pos0,
+                                                        total_t0,
+                                                        &stage_t0);
+    }
+    if (ok) {
+        ok = metal_graph_capture_prefix_attn_state(g, il, 1) &&
+             metal_graph_capture_prefix_index_state(g, il, 1);
+    }
+    if (ok && profile) {
+        ok = metal_graph_decode2_layer_profile_boundary("capture_prefix", il, pos0, total_t0, &stage_t0);
+    }
+    if (ok) {
+        g->cur_hc = cur1;
+        g->after_attn_hc = after1;
+        if (pair_attn_out) {
+            g->heads = heads1;
+            g->hc_split = split1;
+        }
+        if (capture_attn_norm) {
+            g->attn_norm = attn_norm1;
+        }
+        if (q_batch_diff) {
+            g->q = q1;
+        }
+        if (comp_proj_diff) {
+            g->comp_kv_cur = comp_kv1;
+            g->comp_sc_cur = comp_sc1;
+        }
+        ok = metal_graph_encode_decode_layer_impl(g,
+                                                  model,
+                                                  &weights->layer[il],
+                                                  il,
+                                                  pos1,
+                                                  g->layer_raw_cache[il],
+                                                  g->raw_cap,
+                                                  pos1 % g->raw_cap,
+                                                  metal_graph_raw_span_for_batch(g, pos1, 1),
+                                                  token1,
+                                                  pair_attn_out
+                                                      ? METAL_GRAPH_DECODE_LAYER_BEFORE_ATTN_OUTPUT
+                                                      : METAL_GRAPH_DECODE_LAYER_AFTER_ATTN);
+    }
+    if (ok && profile) {
+        ok = metal_graph_decode2_layer_profile_boundary(pair_attn_out ? "row1_attn_pre_output" : "row1_attn",
+                                                        il,
+                                                        pos0,
+                                                        total_t0,
+                                                        &stage_t0);
+    }
+
+    g->after_attn_hc = saved_after_attn;
+    g->heads = saved_heads;
+    g->hc_split = saved_hc_split;
+    g->attn_norm = saved_attn_norm;
+    g->q = saved_q;
+    g->comp_kv_cur = saved_comp_kv;
+    g->comp_sc_cur = saved_comp_sc;
+    if (ok && pair_attn_out) {
+        ok = metal_graph_encode_decode2_pair_attention_output_exact(g,
+                                                                    model,
+                                                                    &weights->layer[il],
+                                                                    cur0,
+                                                                    cur1);
+    }
+    if (ok && profile && pair_attn_out) {
+        ok = metal_graph_decode2_layer_profile_boundary("pair_attn_output", il, pos0, total_t0, &stage_t0);
+    }
+    if (ok && q_batch_diff) {
+        ok = metal_graph_decode2_q_batch_diff(g,
+                                              model,
+                                              &weights->layer[il],
+                                              il,
+                                              pos0);
+    }
+    if (ok && comp_proj_diff) {
+        ok = metal_graph_decode2_comp_proj_diff(g,
+                                                model,
+                                                &weights->layer[il],
+                                                il,
+                                                pos0);
+    }
+    if (ok && batch_ffn) {
+        ok = metal_graph_encode_layer_ffn_batch(g, model, &weights->layer[il], il, pos0, 2);
+        if (ok && metal_graph_decode2_batch_ffn_diff_layer(il)) {
+            ok = metal_graph_decode2_batch_ffn_diff(g,
+                                                    model,
+                                                    weights,
+                                                    il,
+                                                    pos0,
+                                                    token0,
+                                                    token1,
+                                                    cur0,
+                                                    cur1,
+                                                    after0,
+                                                    after1);
+        }
+    } else if (ok && (batch_ffn_body || batch_routed_body)) {
+        ok = metal_graph_decode2_run_ffn_prefix_into_batch_row(g,
+                                                               model,
+                                                               &weights->layer[il],
+                                                               il,
+                                                               pos0,
+                                                               token0,
+                                                               0,
+                                                               cur0,
+                                                               after0,
+                                                               next0);
+        if (ok) {
+            ok = metal_graph_decode2_run_ffn_prefix_into_batch_row(g,
+                                                                   model,
+                                                                   &weights->layer[il],
+                                                                   il,
+                                                                   pos1,
+                                                                   token1,
+                                                                   1,
+                                                                   cur1,
+                                                                   after1,
+                                                                   next1);
+        }
+        if (ok && batch_ffn_body) {
+            ok = metal_graph_decode2_run_batch_ffn_body_from_scalar_prefix(g,
+                                                                           model,
+                                                                           &weights->layer[il],
+                                                                           il,
+                                                                           next0,
+                                                                           next1);
+        }
+        if (ok && !batch_ffn_body) {
+            ok = metal_graph_decode2_run_batch_routed_from_scalar_prefix(g,
+                                                                         model,
+                                                                         &weights->layer[il]);
+        }
+        if (ok && !batch_ffn_body) {
+            ok = metal_graph_decode2_finish_ffn_shared_post_from_batch_row(g,
+                                                                           model,
+                                                                           &weights->layer[il],
+                                                                           il,
+                                                                           pos0,
+                                                                           0,
+                                                                           after0,
+                                                                           next0);
+        }
+        if (ok && !batch_ffn_body) {
+            ok = metal_graph_decode2_finish_ffn_shared_post_from_batch_row(g,
+                                                                           model,
+                                                                           &weights->layer[il],
+                                                                           il,
+                                                                           pos1,
+                                                                           1,
+                                                                           after1,
+                                                                           next1);
+        }
+        if (ok && profile) {
+            ok = metal_graph_decode2_layer_profile_boundary(batch_ffn_body
+                                                            ? "batch_ffn_body"
+                                                            : "batch_routed_body_ffn",
+                                                            il,
+                                                            pos0,
+                                                            total_t0,
+                                                            &stage_t0);
+        }
+    } else if (ok) {
+        g->cur_hc = cur0;
+        g->after_attn_hc = after0;
+        g->after_ffn_hc = next0;
+        ok = metal_graph_encode_decode_ffn_half_exact(g,
+                                                       model,
+                                                       &weights->layer[il],
+                                                       il,
+                                                       pos0,
+                                                       token0);
+        if (ok && capture_ffn_body) {
+            ok = metal_graph_decode2_capture_routed_scalar_row(g, 0);
+        }
+        if (ok && profile) {
+            ok = metal_graph_decode2_layer_profile_boundary("row0_ffn", il, pos0, total_t0, &stage_t0);
+        }
+        if (ok) {
+            g->cur_hc = cur1;
+            g->after_attn_hc = after1;
+            g->after_ffn_hc = next1;
+            ok = metal_graph_encode_decode_ffn_half_exact(g,
+                                                          model,
+                                                          &weights->layer[il],
+                                                          il,
+                                                          pos1,
+                                                          token1);
+            if (ok && capture_ffn_body) {
+                ok = metal_graph_decode2_capture_routed_scalar_row(g, 1);
+            }
+        }
+        if (ok && routed_batch_diff) {
+            ok = metal_graph_decode2_routed_batch_diff(g,
+                                                       model,
+                                                       &weights->layer[il],
+                                                       il,
+                                                       pos0);
+        }
+        if (ok && batch_ffn_body_diff) {
+            ok = metal_graph_decode2_batch_ffn_body_diff(g,
+                                                         model,
+                                                         &weights->layer[il],
+                                                         il,
+                                                         pos0,
+                                                         next0,
+                                                         next1);
+        }
+    }
+    if (ok && profile && batch_ffn) {
+        ok = metal_graph_decode2_layer_profile_boundary("batch_ffn", il, pos0, total_t0, &stage_t0);
+    } else if (ok && profile) {
+        ok = metal_graph_decode2_layer_profile_boundary("row1_ffn", il, pos0, total_t0, &stage_t0);
+    }
+
+    ds4_gpu_tensor_free(after1);
+    ds4_gpu_tensor_free(after0);
+    ds4_gpu_tensor_free(q1);
+    ds4_gpu_tensor_free(q0);
+    ds4_gpu_tensor_free(attn_norm1);
+    ds4_gpu_tensor_free(attn_norm0);
+    ds4_gpu_tensor_free(comp_sc1);
+    ds4_gpu_tensor_free(comp_sc0);
+    ds4_gpu_tensor_free(comp_kv1);
+    ds4_gpu_tensor_free(comp_kv0);
+    ds4_gpu_tensor_free(split1);
+    ds4_gpu_tensor_free(split0);
+    ds4_gpu_tensor_free(heads1);
+    ds4_gpu_tensor_free(heads0);
+    g->after_attn_hc = saved_after_attn;
+    g->heads = saved_heads;
+    g->hc_split = saved_hc_split;
+    g->attn_norm = saved_attn_norm;
+    g->q = saved_q;
+    g->comp_kv_cur = saved_comp_kv;
+    g->comp_sc_cur = saved_comp_sc;
+
+    if (ok) {
+        ds4_gpu_tensor *tmp = cur0; cur0 = next0; next0 = tmp;
+        tmp = cur1; cur1 = next1; next1 = tmp;
+        *cur0_io = cur0;
+        *next0_io = next0;
+        *cur1_io = cur1;
+        *next1_io = next1;
+
+        if (batch_ffn) {
+            tmp = g->batch_cur_hc;
+            g->batch_cur_hc = g->batch_next_hc;
+            g->batch_next_hc = tmp;
+        }
+    }
+    return ok;
+}
+
+/* Encode the final HC collapse and output norm before the vocab projection. */
+static bool metal_graph_encode_output_head_norm(
         ds4_gpu_graph *g,
         const ds4_model       *model,
-        const ds4_weights     *weights,
-        uint64_t               vocab_dim) {
+        const ds4_weights     *weights) {
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     bool ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     if (ok) ok = ds4_gpu_matmul_f16_tensor(g->output_pre,
@@ -10025,17 +11816,236 @@ static bool metal_graph_encode_output_head(
     if (ok) {
         metal_graph_debug_dump_tensor("result_norm", g->output_norm, DS4_N_EMBD, DS4_N_LAYER, 0);
     }
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->logits,
+    return ok;
+}
+
+/* Encode the final HC collapse, output norm, and vocab projection on Metal. */
+static bool metal_graph_encode_output_head_impl(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        uint64_t               vocab_dim,
+        bool                   top2_only) {
+    bool ok = metal_graph_encode_output_head_norm(g, model, weights);
+    if (ok) {
+        ok = top2_only
+            ? ds4_gpu_matmul_q8_0_top2_tensor(g->comp_selected,
                                               model->map,
                                               model->size,
                                               weights->output->abs_offset,
                                               DS4_N_EMBD,
                                               vocab_dim,
-                                              g->output_norm,
-                                              1) != 0;
-    if (ok) {
+                                              g->output_norm) != 0
+            : ds4_gpu_matmul_q8_0_tensor(g->logits,
+                                         model->map,
+                                         model->size,
+                                         weights->output->abs_offset,
+                                         DS4_N_EMBD,
+                                         vocab_dim,
+                                         g->output_norm,
+                                         1) != 0;
+    }
+    if (ok && !top2_only) {
         metal_graph_debug_dump_tensor("result_output", g->logits, vocab_dim, DS4_N_LAYER, 0);
     }
+    return ok;
+}
+
+/* Project the normalized output-head activation already resident in
+ * g->output_norm.  This is used by the MTP row0 verifier so candidate
+ * certification, top2 fallback, and full-logit fallback do not repeat the HC
+ * collapse and output RMSNorm for the same row. */
+static bool metal_graph_encode_output_projection_from_norm(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        uint64_t               vocab_dim,
+        bool                   top2_only) {
+    if (!g || !model || !weights || !g->output_norm) return false;
+    if (top2_only) {
+        return ds4_gpu_matmul_q8_0_top2_tensor(g->comp_selected,
+                                               model->map,
+                                               model->size,
+                                               weights->output->abs_offset,
+                                               DS4_N_EMBD,
+                                               vocab_dim,
+                                               g->output_norm) != 0;
+    }
+    bool ok = ds4_gpu_matmul_q8_0_tensor(g->logits,
+                                         model->map,
+                                         model->size,
+                                         weights->output->abs_offset,
+                                         DS4_N_EMBD,
+                                         vocab_dim,
+                                         g->output_norm,
+                                         1) != 0;
+    if (ok) metal_graph_debug_dump_tensor("result_output", g->logits, vocab_dim, DS4_N_LAYER, 0);
+    return ok;
+}
+
+static bool metal_graph_encode_output_projection_from_tensor(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        ds4_gpu_tensor        *norm,
+        ds4_gpu_tensor        *logits,
+        uint64_t               vocab_dim,
+        bool                   top2_only) {
+    if (!g || !model || !weights || !norm) return false;
+    if (top2_only) {
+        return ds4_gpu_matmul_q8_0_top2_tensor(g->comp_selected,
+                                               model->map,
+                                               model->size,
+                                               weights->output->abs_offset,
+                                               DS4_N_EMBD,
+                                               vocab_dim,
+                                               norm) != 0;
+    }
+    if (!logits) logits = g->logits;
+    bool ok = ds4_gpu_matmul_q8_0_tensor(logits,
+                                         model->map,
+                                         model->size,
+                                         weights->output->abs_offset,
+                                         DS4_N_EMBD,
+                                         vocab_dim,
+                                         norm,
+                                         1) != 0;
+    if (ok && logits == g->logits) {
+        metal_graph_debug_dump_tensor("result_output", g->logits, vocab_dim, DS4_N_LAYER, 0);
+    }
+    return ok;
+}
+
+static bool metal_graph_encode_output_head_norm_to(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        ds4_gpu_tensor        *cur_hc,
+        ds4_gpu_tensor        *out_norm) {
+    if (!g || !cur_hc || !out_norm) return false;
+    ds4_gpu_tensor *saved_cur = g->cur_hc;
+    g->cur_hc = cur_hc;
+    bool ok = metal_graph_encode_output_head_norm(g, model, weights);
+    if (ok) {
+        ok = ds4_gpu_tensor_copy(out_norm,
+                                 0,
+                                 g->output_norm,
+                                 0,
+                                 (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+    }
+    g->cur_hc = saved_cur;
+    return ok;
+}
+
+static bool metal_graph_encode_output_head(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        uint64_t               vocab_dim) {
+    return metal_graph_encode_output_head_impl(g, model, weights, vocab_dim, false);
+}
+
+static uint32_t ds4_output_cert_groups(void) {
+    uint32_t groups = DS4_OUTPUT_CERT_GROUPS_DEFAULT;
+    const char *env = getenv("DS4_MTP_CERT_LOGITS_GROUPS");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(env, &end, 10);
+        if (end != env && v > 0 && v <= DS4_OUTPUT_CERT_GROUPS_MAX) {
+            groups = (uint32_t)v;
+        }
+    }
+    return groups;
+}
+
+static bool metal_graph_prepare_output_certifier(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        uint64_t               vocab_dim) {
+    if (!g || !model || !weights || vocab_dim == 0) return false;
+    const uint32_t group_count = ds4_output_cert_groups();
+    if (g->output_cert_group_norms &&
+        g->output_cert_group_norms_groups != 0 &&
+        g->output_cert_group_norms_groups != group_count) {
+        ds4_gpu_tensor_free(g->output_cert_group_norms);
+        g->output_cert_group_norms = NULL;
+        g->output_cert_group_norms_ready = false;
+    }
+    if (!g->output_cert_group_norms) {
+        g->output_cert_group_norms =
+            ds4_gpu_imported_q8_0_row_group_norms_tensor(model->map,
+                                                         model->size,
+                                                         weights->output->abs_offset,
+                                                         DS4_N_EMBD,
+                                                         vocab_dim,
+                                                         group_count);
+        if (g->output_cert_group_norms) {
+            g->output_cert_group_norms_groups = group_count;
+            g->output_cert_group_norms_ready = true;
+        } else {
+            g->output_cert_group_norms =
+                ds4_gpu_tensor_alloc(vocab_dim * group_count * sizeof(float));
+            g->output_cert_group_norms_groups = group_count;
+            g->output_cert_group_norms_ready = false;
+        }
+    }
+    if (!g->output_cert_result) {
+        g->output_cert_result = ds4_gpu_tensor_alloc(sizeof(ds4_gpu_candidate_cert_result));
+    }
+    if (!g->output_cert_group_norms || !g->output_cert_result) return false;
+    if (!g->output_cert_group_norms_ready) {
+        if (ds4_gpu_q8_0_row_group_norms_tensor(g->output_cert_group_norms,
+                                                model->map,
+                                                model->size,
+                                                weights->output->abs_offset,
+                                                DS4_N_EMBD,
+                                                vocab_dim,
+                                                group_count) == 0) {
+            return false;
+        }
+        g->output_cert_group_norms_ready = true;
+    }
+    return true;
+}
+
+static bool metal_graph_encode_output_candidate_cert(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        uint64_t               vocab_dim) {
+    if (!g || !g->output_cert_group_norms || !g->output_cert_result ||
+        !g->output_candidate_ids) {
+        return false;
+    }
+    return ds4_gpu_matmul_q8_0_candidate_certify_tensor(g->output_cert_result,
+                                                        g->output_cert_group_norms,
+                                                        g->output_candidate_ids,
+                                                        model->map,
+                                                        model->size,
+                                                        weights->output->abs_offset,
+                                                        DS4_N_EMBD,
+                                                        vocab_dim,
+                                                        g->output_norm,
+                                                        g->output_cert_group_norms_groups) != 0;
+}
+
+static bool metal_graph_encode_output_head_batch_row(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        uint32_t               row,
+        uint64_t               vocab_dim,
+        bool                   top2_only) {
+    if (!g || row >= g->prefill_cap) return false;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    ds4_gpu_tensor *row_hc = metal_graph_tensor_row_view(g->batch_cur_hc, row, hc_dim);
+    if (!row_hc) return false;
+    ds4_gpu_tensor *saved_cur = g->cur_hc;
+    g->cur_hc = row_hc;
+    bool ok = metal_graph_encode_output_head_impl(g, model, weights, vocab_dim, top2_only);
+    g->cur_hc = saved_cur;
+    ds4_gpu_tensor_free(row_hc);
     return ok;
 }
 
@@ -10157,7 +12167,8 @@ static bool metal_graph_encode_output_head_mtp(
         const ds4_weights     *base_weights,
         const ds4_model       *mtp_model,
         const ds4_mtp_weights *mtp,
-        uint64_t               vocab_dim) {
+        uint64_t               vocab_dim,
+        bool                   top2_only) {
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     bool ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     if (ok) ok = metal_graph_matmul_plain_tensor(g->output_pre, mtp_model, mtp->hc_head_fn,
@@ -10182,14 +12193,24 @@ static bool metal_graph_encode_output_head_mtp(
                                                   mtp->norm->abs_offset,
                                                   DS4_N_EMBD,
                                                   DS4_RMS_EPS) != 0;
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->logits,
-                                              base_model->map,
-                                              base_model->size,
-                                              base_weights->output->abs_offset,
-                                              DS4_N_EMBD,
-                                              vocab_dim,
-                                              g->output_norm,
-                                              1) != 0;
+    if (ok && top2_only) {
+        ok = ds4_gpu_matmul_q8_0_top2_tensor(g->comp_selected,
+                                             base_model->map,
+                                             base_model->size,
+                                             base_weights->output->abs_offset,
+                                             DS4_N_EMBD,
+                                             vocab_dim,
+                                             g->output_norm) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_matmul_q8_0_tensor(g->logits,
+                                          base_model->map,
+                                          base_model->size,
+                                          base_weights->output->abs_offset,
+                                          DS4_N_EMBD,
+                                          vocab_dim,
+                                          g->output_norm,
+                                          1) != 0;
+    }
     return ok;
 }
 
@@ -11172,6 +13193,8 @@ static bool metal_graph_encode_layer_attention_batch(
     const bool index_stage_profile = getenv("DS4_METAL_INDEXER_STAGE_PROFILE") != NULL;
     const bool layer_stage_profile = getenv("DS4_METAL_LAYER_STAGE_PROFILE") != NULL;
     const bool q_stage_profile = getenv("DS4_METAL_Q_STAGE_PROFILE") != NULL;
+    const bool batch_q8_pair =
+        n_tokens <= 2 && getenv("DS4_CUDA_NO_BATCH_Q8_PAIR") == NULL;
     double layer_stage_t0 = layer_stage_profile ? now_sec() : 0.0;
     double q_stage_t0 = q_stage_profile ? now_sec() : 0.0;
 #define DS4_METAL_PROFILE_ATTN_STAGE(name) do { \
@@ -11264,28 +13287,42 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     DS4_METAL_PROFILE_ATTN_STAGE("norm");
     DS4_METAL_PROFILE_Q_STAGE("pre_q");
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_qr,
-                                              model->map,
-                                              model->size,
-                                              layer->attn_q_a->abs_offset,
-                                              DS4_N_EMBD,
-                                              q_rank,
-                                              g->batch_attn_norm,
-                                              n_tokens) != 0;
+    if (ok && qkv_rms_fused && batch_q8_pair) {
+        ok = ds4_gpu_matmul_q8_0_pair_tensor(g->batch_qr,
+                                             g->batch_kv_raw,
+                                             model->map,
+                                             model->size,
+                                             layer->attn_q_a->abs_offset,
+                                             layer->attn_kv->abs_offset,
+                                             DS4_N_EMBD,
+                                             q_rank,
+                                             DS4_N_HEAD_DIM,
+                                             g->batch_attn_norm,
+                                             n_tokens) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_matmul_q8_0_tensor(g->batch_qr,
+                                          model->map,
+                                          model->size,
+                                          layer->attn_q_a->abs_offset,
+                                          DS4_N_EMBD,
+                                          q_rank,
+                                          g->batch_attn_norm,
+                                          n_tokens) != 0;
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("q_lora", g->batch_qr,
                                       (uint64_t)n_tokens * q_rank, il, pos0);
     }
     DS4_METAL_PROFILE_Q_STAGE("q_a");
     if (qkv_rms_fused) {
-        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_kv_raw,
-                                                  model->map,
-                                                  model->size,
-                                                  layer->attn_kv->abs_offset,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_HEAD_DIM,
-                                                  g->batch_attn_norm,
-                                                  n_tokens) != 0;
+        if (ok && !batch_q8_pair) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_kv_raw,
+                                                                    model->map,
+                                                                    model->size,
+                                                                    layer->attn_kv->abs_offset,
+                                                                    DS4_N_EMBD,
+                                                                    DS4_N_HEAD_DIM,
+                                                                    g->batch_attn_norm,
+                                                                    n_tokens) != 0;
         if (ok) {
             metal_graph_debug_dump_tensor("KVraw", g->batch_kv_raw,
                                           (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
@@ -11760,7 +13797,8 @@ static bool metal_graph_encode_layer_attention_batch(
                     }
                     if (ok && emit) g->layer_n_comp[il]++;
                     if (comp_counts) comp_counts[t] = g->layer_n_comp[il];
-                    if (ok && t == 0) ok = metal_graph_capture_prefix1_attn_state(g, il);
+                    if (ok && t == 0) ok = metal_graph_capture_prefix_attn_state(g, il, 1);
+                    if (ok && t == 1) ok = metal_graph_capture_prefix_attn_state(g, il, 2);
                     ds4_gpu_tensor_free(sc_view);
                     ds4_gpu_tensor_free(kv_view);
                 }
@@ -12048,7 +14086,8 @@ static bool metal_graph_encode_layer_attention_batch(
                         }
                         if (ok && emit) g->layer_n_index_comp[il]++;
                         if (index_counts) index_counts[t] = g->layer_n_index_comp[il];
-                        if (ok && t == 0) ok = metal_graph_capture_prefix1_index_state(g, il);
+                        if (ok && t == 0) ok = metal_graph_capture_prefix_index_state(g, il, 1);
+                        if (ok && t == 1) ok = metal_graph_capture_prefix_index_state(g, il, 2);
                         ds4_gpu_tensor_free(sc_view);
                         ds4_gpu_tensor_free(kv_view);
                     }
@@ -12516,6 +14555,8 @@ static bool metal_graph_encode_layer_ffn_batch(
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
     const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
     const bool layer_stage_profile = getenv("DS4_METAL_LAYER_STAGE_PROFILE") != NULL;
+    const bool batch_q8_pair =
+        n_tokens <= 2 && getenv("DS4_CUDA_NO_BATCH_Q8_PAIR") == NULL;
     double layer_stage_t0 = layer_stage_profile ? now_sec() : 0.0;
 #define DS4_METAL_PROFILE_FFN_STAGE(name) do { \
         if (ok && layer_stage_profile) { \
@@ -12673,22 +14714,36 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("routed_moe");
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_shared_gate,
-                                              model->map,
-                                              model->size,
-                                              layer->ffn_gate_shexp->abs_offset,
-                                              DS4_N_EMBD,
-                                              shared_dim,
-                                              g->batch_ffn_norm,
-                                              n_tokens) != 0;
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_shared_up,
-                                              model->map,
-                                              model->size,
-                                              layer->ffn_up_shexp->abs_offset,
-                                              DS4_N_EMBD,
-                                              shared_dim,
-                                              g->batch_ffn_norm,
-                                              n_tokens) != 0;
+    if (ok && batch_q8_pair) {
+        ok = ds4_gpu_matmul_q8_0_pair_tensor(g->batch_shared_gate,
+                                             g->batch_shared_up,
+                                             model->map,
+                                             model->size,
+                                             layer->ffn_gate_shexp->abs_offset,
+                                             layer->ffn_up_shexp->abs_offset,
+                                             DS4_N_EMBD,
+                                             shared_dim,
+                                             shared_dim,
+                                             g->batch_ffn_norm,
+                                             n_tokens) != 0;
+    } else {
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_shared_gate,
+                                                  model->map,
+                                                  model->size,
+                                                  layer->ffn_gate_shexp->abs_offset,
+                                                  DS4_N_EMBD,
+                                                  shared_dim,
+                                                  g->batch_ffn_norm,
+                                                  n_tokens) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_shared_up,
+                                                  model->map,
+                                                  model->size,
+                                                  layer->ffn_up_shexp->abs_offset,
+                                                  DS4_N_EMBD,
+                                                  shared_dim,
+                                                  g->batch_ffn_norm,
+                                                  n_tokens) != 0;
+    }
     DS4_METAL_PROFILE_FFN_STAGE("shared_gate_up");
     if (ok) ok = ds4_gpu_swiglu_tensor(g->batch_shared_mid,
                                          g->batch_shared_gate,
@@ -12860,8 +14915,11 @@ static bool metal_graph_eval_mtp_draft_from_hc(
         int                    token,
         uint32_t               pos,
         float                 *logits,
-        int                   *top_id) {
+        int                   *top_id,
+        ds4_gpu_top2_result   *top2) {
     if (!mtp || !mtp->block.attn_q_a || !g->mtp_raw_cache || !prev_hc || !out_hc) return false;
+    const bool top2_only =
+        top2 && top_id && !logits && getenv("DS4_CUDA_MTP_TOP2") != NULL;
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint32_t raw_row = pos % g->raw_cap;
@@ -12939,8 +14997,9 @@ static bool metal_graph_eval_mtp_draft_from_hc(
                                                     base_weights,
                                                     mtp_model,
                                                     mtp,
-                                                    base_weights->output->dim[1]);
-    if (ok && top_id) {
+                                                    base_weights->output->dim[1],
+                                                    top2_only);
+    if (ok && top_id && !top2_only) {
         ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
                                            g->logits,
                                            DS4_N_VOCAB,
@@ -12951,11 +15010,24 @@ static bool metal_graph_eval_mtp_draft_from_hc(
     g->cur_hc = saved_cur;
     g->after_ffn_hc = saved_after;
 
+    if (ok && top2_only) {
+        ok = ds4_gpu_tensor_read(g->comp_selected, 0, top2, sizeof(*top2)) != 0;
+        if (ok) *top_id = (int)top2->id0;
+    }
     if (ok && logits) {
         ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
-    if (ok && top_id) {
+    if (ok && top_id && !top2_only) {
         ok = ds4_gpu_tensor_read(g->comp_selected, 0, top_id, sizeof(*top_id)) != 0;
+    }
+    if (ok && top2 && !top2_only && logits) {
+        int top0 = -1, top1 = -1;
+        float v0 = 0.0f, v1 = 0.0f;
+        logits_top2(logits, DS4_N_VOCAB, &top0, &v0, &top1, &v1);
+        top2->id0 = (uint32_t)top0;
+        top2->id1 = (uint32_t)top1;
+        top2->value0 = v0;
+        top2->value1 = v1;
     }
     if (ok && g->mtp_n_raw < g->raw_window) g->mtp_n_raw++;
     if (!ok) {
@@ -12975,7 +15047,8 @@ static bool metal_graph_eval_mtp_draft(
         int                    token,
         uint32_t               pos,
         float                 *logits,
-        int                   *top_id) {
+        int                   *top_id,
+        ds4_gpu_top2_result   *top2) {
     return metal_graph_eval_mtp_draft_from_hc(g,
                                               base_model,
                                               base_weights,
@@ -12986,7 +15059,8 @@ static bool metal_graph_eval_mtp_draft(
                                               token,
                                               pos,
                                               logits,
-                                              top_id);
+                                              top_id,
+                                              top2);
 }
 
 /* =========================================================================
@@ -13745,7 +15819,9 @@ static bool metal_graph_verify_suffix_tops(
     if (!ok) return false;
 
     const bool saved_capture = g->spec_capture_prefix1;
+    const uint32_t saved_capture_depth = g->spec_capture_prefix_depth;
     g->spec_capture_prefix1 = capture_prefix1 && n_tokens == 2;
+    g->spec_capture_prefix_depth = g->spec_capture_prefix1 ? 1u : 0u;
 
     ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
@@ -13759,6 +15835,7 @@ static bool metal_graph_verify_suffix_tops(
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
     g->spec_capture_prefix1 = saved_capture;
+    g->spec_capture_prefix_depth = saved_capture_depth;
     if (!ok) return false;
 
     ok = ds4_gpu_begin_commands() != 0;
@@ -13802,6 +15879,129 @@ static bool metal_graph_read_spec_logits_row(ds4_gpu_graph *g, uint32_t row, flo
                                  row_bytes) != 0;
 }
 
+static bool metal_graph_read_current_logits(ds4_gpu_graph *g, float *logits) {
+    if (!g || !g->logits || !logits) return false;
+    return ds4_gpu_tensor_read(g->logits,
+                                 0,
+                                 logits,
+                                 (uint64_t)DS4_N_VOCAB * sizeof(logits[0])) != 0;
+}
+
+static bool metal_graph_verify_decode2_top2_output(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        const token_vec       *prompt,
+        uint32_t               start,
+        int                    draft1,
+        bool                   capture_prefix1,
+        int                   *row0_top,
+        int                   *commit_drafts,
+        float                 *row_logits,
+        ds4_gpu_top2_result   *row0_top2) {
+    if (!row0_top || !commit_drafts || !row_logits) return false;
+    if (!g || !prompt || start > (uint32_t)prompt->len || 2u > (uint32_t)prompt->len - start) return false;
+
+    bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, 2u);
+    if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
+                                                         g->prefill_tokens,
+                                                         model,
+                                                         weights,
+                                                         prompt,
+                                                         start,
+                                                         2u);
+    if (!ok) return false;
+
+    const bool saved_capture = g->spec_capture_prefix1;
+    const uint32_t saved_capture_depth = g->spec_capture_prefix_depth;
+    g->spec_capture_prefix1 = capture_prefix1;
+    g->spec_capture_prefix_depth = capture_prefix1 ? 1u : 0u;
+
+    ok = ds4_gpu_begin_commands() != 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        ok = metal_graph_encode_layer_batch(g,
+                                            model,
+                                            &weights->layer[il],
+                                            il,
+                                            start,
+                                            2u);
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    g->spec_capture_prefix1 = saved_capture;
+    g->spec_capture_prefix_depth = saved_capture_depth;
+    if (!ok) return false;
+
+    ds4_gpu_top2_result top2;
+    memset(&top2, 0, sizeof(top2));
+    if (getenv("DS4_CUDA_MTP_VERIFY_OPT_OUTPUT") != NULL) {
+        ok = ds4_gpu_begin_commands() != 0;
+        if (ok) ok = metal_graph_encode_output_head_batch_row(g,
+                                                              model,
+                                                              weights,
+                                                              0u,
+                                                              weights->output->dim[1],
+                                                              true);
+        if (ok) ok = metal_graph_encode_output_head_batch_row(g,
+                                                              model,
+                                                              weights,
+                                                              1u,
+                                                              weights->output->dim[1],
+                                                              false);
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+        if (ok) ok = ds4_gpu_tensor_read(g->comp_selected, 0, &top2, sizeof(top2)) != 0;
+        if (ok) ok = metal_graph_read_current_logits(g, row_logits);
+        if (!ok) return false;
+
+        if (row0_top2) *row0_top2 = top2;
+        *row0_top = (int)top2.id0;
+        *commit_drafts = (*row0_top == draft1) ? 2 : 1;
+        if (*commit_drafts == 2) return true;
+
+        ok = ds4_gpu_begin_commands() != 0;
+        if (ok) ok = metal_graph_encode_output_head_batch_row(g,
+                                                              model,
+                                                              weights,
+                                                              0u,
+                                                              weights->output->dim[1],
+                                                              false);
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+        if (ok) ok = metal_graph_read_current_logits(g, row_logits);
+        return ok;
+    }
+
+    ok = ds4_gpu_begin_commands() != 0;
+    if (ok) ok = metal_graph_encode_output_head_batch_row(g,
+                                                          model,
+                                                          weights,
+                                                          0u,
+                                                          weights->output->dim[1],
+                                                          true);
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (ok) ok = ds4_gpu_tensor_read(g->comp_selected, 0, &top2, sizeof(top2)) != 0;
+    if (!ok) return false;
+    if (row0_top2) *row0_top2 = top2;
+    *row0_top = (int)top2.id0;
+
+    *commit_drafts = (*row0_top == draft1) ? 2 : 1;
+    const uint32_t logits_row = *commit_drafts == 2 ? 1u : 0u;
+
+    ok = ds4_gpu_begin_commands() != 0;
+    if (ok) ok = metal_graph_encode_output_head_batch_row(g,
+                                                          model,
+                                                          weights,
+                                                          logits_row,
+                                                          weights->output->dim[1],
+                                                          false);
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (ok) ok = metal_graph_read_current_logits(g, row_logits);
+    return ok;
+}
+
 /* Exact N=2 target verifier for MTP.
  *
  * The generic batch prefill path is fast, but it is not a safe substitute for
@@ -13814,6 +16014,7 @@ static bool metal_graph_verify_decode2_exact(
         ds4_gpu_graph *g,
         const ds4_model       *model,
         const ds4_weights     *weights,
+        ds4_backend            backend,
         int                    token0,
         int                    token1,
         uint32_t               start,
@@ -13848,12 +16049,60 @@ static bool metal_graph_verify_decode2_exact(
 
     ds4_gpu_tensor *saved_cur = g->cur_hc;
     ds4_gpu_tensor *saved_after = g->after_ffn_hc;
+    ds4_gpu_tensor *saved_batch_cur = g->batch_cur_hc;
+    ds4_gpu_tensor *saved_batch_next = g->batch_next_hc;
     const bool saved_capture = g->spec_capture_prefix1;
+    const uint32_t saved_capture_depth = g->spec_capture_prefix_depth;
     g->spec_capture_prefix1 = true;
+    g->spec_capture_prefix_depth = 1u;
+    const bool exact_decode2_layer = getenv("DS4_MTP_NO_EXACT_DECODE2_LAYER") == NULL;
+    const bool decode2_state_barrier =
+        exact_decode2_layer &&
+        getenv("DS4_MTP_DECODE2_STATE_BARRIER") != NULL &&
+        getenv("DS4_MTP_DECODE2_NO_STATE_BARRIER") == NULL;
+    const bool decode2_batch_ffn =
+        decode2_state_barrier &&
+        getenv("DS4_MTP_DECODE2_BATCH_FFN") != NULL &&
+        getenv("DS4_MTP_DECODE2_NO_BATCH_FFN") == NULL;
+    if (ok && decode2_batch_ffn) {
+        const int32_t decode2_tokens[2] = { (int32_t)token0, (int32_t)token1 };
+        ok = ds4_gpu_tensor_write(g->prefill_tokens,
+                                  0,
+                                  decode2_tokens,
+                                  sizeof(decode2_tokens)) != 0;
+    }
     if (ok) ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const uint32_t pos0 = start;
         const uint32_t pos1 = start + 1u;
+
+        if (exact_decode2_layer) {
+            ok = decode2_state_barrier
+                ? metal_graph_encode_decode2_layer_state_barrier_exact(g,
+                                                                      model,
+                                                                      weights,
+                                                                      il,
+                                                                      pos0,
+                                                                      token0,
+                                                                      token1,
+                                                                      &cur0,
+                                                                      &next0,
+                                                                      &cur1,
+                                                                      &next1,
+                                                                      decode2_batch_ffn)
+                : metal_graph_encode_decode2_layer_exact(g,
+                                                         model,
+                                                         weights,
+                                                         il,
+                                                         pos0,
+                                                         token0,
+                                                         token1,
+                                                         &cur0,
+                                                         &next0,
+                                                         &cur1,
+                                                         &next1);
+            continue;
+        }
 
         g->cur_hc = cur0;
         g->after_ffn_hc = next0;
@@ -13868,8 +16117,8 @@ static bool metal_graph_verify_decode2_exact(
                                              metal_graph_raw_span_for_batch(g, pos0, 1),
                                              token0);
         if (!ok) break;
-        ok = metal_graph_capture_prefix1_attn_state(g, il) &&
-             metal_graph_capture_prefix1_index_state(g, il);
+        ok = metal_graph_capture_prefix_attn_state(g, il, 1) &&
+             metal_graph_capture_prefix_index_state(g, il, 1);
         if (!ok) break;
 
         g->cur_hc = cur1;
@@ -13892,10 +16141,299 @@ static bool metal_graph_verify_decode2_exact(
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
     g->spec_capture_prefix1 = saved_capture;
+    g->spec_capture_prefix_depth = saved_capture_depth;
     g->cur_hc = saved_cur;
     g->after_ffn_hc = saved_after;
+    g->batch_cur_hc = saved_batch_cur;
+    g->batch_next_hc = saved_batch_next;
 
-    if (ok) {
+    const bool exact_decode2_top2_head =
+        getenv("DS4_MTP_NO_EXACT_DECODE2_TOP2_HEAD") == NULL;
+    if (ok && exact_decode2_top2_head) {
+        const bool cert_capable = backend == DS4_BACKEND_CUDA;
+        const bool cert_shadow = cert_capable && getenv("DS4_MTP_CERT_LOGITS_SHADOW") != NULL;
+        const bool cert_active = cert_capable &&
+            !cert_shadow &&
+            getenv("DS4_MTP_CERT_LOGITS") != NULL &&
+            getenv("DS4_MTP_NO_CERT_LOGITS") == NULL;
+        const bool cert_enabled = cert_shadow || cert_active;
+        const bool pair_output_active = cert_capable &&
+            !cert_enabled &&
+            getenv("DS4_MTP_NO_VERIFY_PAIR_OUTPUT") == NULL;
+        const bool cert_timing = getenv("DS4_MTP_OUTPUT_VERIFY_TIMING") != NULL;
+        const double cert_total_t0 = cert_timing ? now_sec() : 0.0;
+        double cert_prepare_ms = 0.0;
+        double cert_ms = 0.0;
+        double pair_ms = 0.0;
+        double top2_ms = 0.0;
+        double row0_logits_ms = 0.0;
+        double row1_logits_ms = 0.0;
+        uint32_t cert_candidate = token1 >= 0 ? (uint32_t)token1 : UINT32_MAX;
+        if (cert_enabled) {
+            const double t0 = cert_timing ? now_sec() : 0.0;
+            ok = metal_graph_prepare_output_certifier(g, model, weights, weights->output->dim[1]);
+            if (cert_timing) cert_prepare_ms = (now_sec() - t0) * 1000.0;
+        }
+        if (ok && cert_enabled) {
+            ok = ds4_gpu_tensor_write(g->output_candidate_ids,
+                                      0,
+                                      &cert_candidate,
+                                      sizeof(cert_candidate)) != 0;
+        }
+        ds4_gpu_top2_result row0_top2;
+        memset(&row0_top2, 0, sizeof(row0_top2));
+        ds4_gpu_candidate_cert_result cert_result;
+        memset(&cert_result, 0, sizeof(cert_result));
+        bool have_row0_top = false;
+        bool have_pair_norms = false;
+        bool have_pair_row1_logits = false;
+
+        if (ok && cert_active) {
+            g->cur_hc = cur0;
+            const double t0 = cert_timing ? now_sec() : 0.0;
+            ok = ds4_gpu_begin_commands() != 0;
+            if (ok) ok = metal_graph_encode_output_head_norm(g, model, weights);
+            if (ok) ok = metal_graph_encode_output_candidate_cert(g,
+                                                                  model,
+                                                                  weights,
+                                                                  weights->output->dim[1]);
+            if (ok) ok = ds4_gpu_end_commands() != 0;
+            else (void)ds4_gpu_synchronize();
+            g->cur_hc = saved_cur;
+            if (ok) {
+                ok = ds4_gpu_tensor_read(g->output_cert_result,
+                                         0,
+                                         &cert_result,
+                                         sizeof(cert_result)) != 0;
+            }
+            if (cert_timing) cert_ms = (now_sec() - t0) * 1000.0;
+            if (ok) {
+                static uint64_t active_n = 0;
+                static uint64_t active_certified = 0;
+                active_n++;
+                if (cert_result.certified) active_certified++;
+                if (getenv("DS4_MTP_CERT_LOGITS_LOG") != NULL ||
+                    (active_n & (active_n - 1u)) == 0u) {
+                    fprintf(stderr,
+                            "ds4: MTP cert-logits active n=%llu cand=%u cand_logit=%g bound=%g bound_id=%u certified=%u certified_hits=%llu\n",
+                            (unsigned long long)active_n,
+                            cert_result.candidate_id,
+                            cert_result.candidate_logit,
+                            cert_result.max_bound,
+                            cert_result.bound_id,
+                            cert_result.certified,
+                            (unsigned long long)active_certified);
+                }
+            }
+            if (ok && cert_result.certified) {
+                row0_top2.id0 = cert_candidate;
+                row0_top2.id1 = cert_result.bound_id;
+                row0_top2.value0 = cert_result.candidate_logit;
+                row0_top2.value1 = cert_result.max_bound;
+                *top0 = (int)cert_candidate;
+                have_row0_top = true;
+            }
+        }
+
+        if (ok && !have_row0_top && pair_output_active) {
+            const double t0 = cert_timing ? now_sec() : 0.0;
+            ds4_gpu_tensor *row0_norm = ds4_gpu_tensor_view(g->batch_ffn_norm,
+                                                            0,
+                                                            (uint64_t)DS4_N_EMBD * sizeof(float));
+            ds4_gpu_tensor *row1_norm = ds4_gpu_tensor_view(g->batch_ffn_norm,
+                                                            (uint64_t)DS4_N_EMBD * sizeof(float),
+                                                            (uint64_t)DS4_N_EMBD * sizeof(float));
+            ok = row0_norm && row1_norm;
+            if (ok) ok = ds4_gpu_begin_commands() != 0;
+            if (ok) ok = metal_graph_encode_output_head_norm_to(g, model, weights, cur0, row0_norm);
+            if (ok) ok = metal_graph_encode_output_head_norm_to(g, model, weights, cur1, row1_norm);
+            if (ok) {
+                ok = ds4_gpu_matmul_q8_0_top2_and_logits_n2_tensor(g->comp_selected,
+                                                                   g->logits,
+                                                                   model->map,
+                                                                   model->size,
+                                                                   weights->output->abs_offset,
+                                                                   DS4_N_EMBD,
+                                                                   weights->output->dim[1],
+                                                                   g->batch_ffn_norm) != 0;
+            }
+            if (ok) ok = ds4_gpu_end_commands() != 0;
+            else (void)ds4_gpu_synchronize();
+            ds4_gpu_tensor_free(row1_norm);
+            ds4_gpu_tensor_free(row0_norm);
+            if (ok) ok = ds4_gpu_tensor_read(g->comp_selected, 0, &row0_top2, sizeof(row0_top2)) != 0;
+            if (ok) {
+                *top0 = (int)row0_top2.id0;
+                have_row0_top = true;
+                have_pair_norms = true;
+                have_pair_row1_logits = true;
+            }
+            if (cert_timing) pair_ms = (now_sec() - t0) * 1000.0;
+        }
+
+        if (ok && !have_row0_top) {
+            g->cur_hc = cur0;
+            const double t0 = cert_timing ? now_sec() : 0.0;
+            ok = ds4_gpu_begin_commands() != 0;
+            if (ok) {
+                ok = cert_active
+                    ? metal_graph_encode_output_projection_from_norm(g,
+                                                                     model,
+                                                                     weights,
+                                                                     weights->output->dim[1],
+                                                                     true)
+                    : metal_graph_encode_output_head_impl(g,
+                                                          model,
+                                                          weights,
+                                                          weights->output->dim[1],
+                                                          true);
+            }
+            if (ok && cert_shadow) {
+                ok = metal_graph_encode_output_candidate_cert(g,
+                                                              model,
+                                                              weights,
+                                                              weights->output->dim[1]);
+            }
+            if (ok) ok = ds4_gpu_end_commands() != 0;
+            else (void)ds4_gpu_synchronize();
+            g->cur_hc = saved_cur;
+            if (ok) ok = ds4_gpu_tensor_read(g->comp_selected, 0, &row0_top2, sizeof(row0_top2)) != 0;
+            if (ok) *top0 = (int)row0_top2.id0;
+            if (cert_timing) top2_ms = (now_sec() - t0) * 1000.0;
+        }
+        if (ok && cert_shadow) {
+            ok = ds4_gpu_tensor_read(g->output_cert_result,
+                                     0,
+                                     &cert_result,
+                                     sizeof(cert_result)) != 0;
+        }
+        if (ok && cert_shadow) {
+            static uint64_t shadow_n = 0;
+            static uint64_t shadow_mismatch = 0;
+            static uint64_t shadow_candidate_top0 = 0;
+            static uint64_t shadow_candidate_top1 = 0;
+            static uint64_t shadow_certified = 0;
+            shadow_n++;
+            const bool is_top0 = row0_top2.id0 == cert_candidate;
+            const bool is_top1 = row0_top2.id1 == cert_candidate;
+            if (is_top0) shadow_candidate_top0++;
+            if (is_top1) shadow_candidate_top1++;
+            if (cert_result.certified) shadow_certified++;
+            float expected = is_top0 ? row0_top2.value0 : (is_top1 ? row0_top2.value1 : row0_top2.value1);
+            const float diff = fabsf(cert_result.candidate_logit - expected);
+            const bool agrees =
+                is_top0 || is_top1
+                    ? diff <= 1.0e-4f
+                    : cert_result.candidate_logit <= row0_top2.value1 + 1.0e-4f;
+            const bool false_cert = cert_result.certified && !is_top0;
+            if (!agrees || false_cert) shadow_mismatch++;
+            if (getenv("DS4_MTP_CERT_LOGITS_LOG") != NULL || !agrees || false_cert ||
+                (shadow_n & (shadow_n - 1u)) == 0u) {
+                fprintf(stderr,
+                        "ds4: MTP cert-logits shadow n=%llu cand=%u cand_logit=%g top0=%u top0_logit=%g top1=%u top1_logit=%g bound=%g bound_id=%u certified=%u false_cert=%d match=%d top0_hits=%llu top1_hits=%llu certified_hits=%llu mismatches=%llu\n",
+                        (unsigned long long)shadow_n,
+                        cert_candidate,
+                        cert_result.candidate_logit,
+                        row0_top2.id0,
+                        row0_top2.value0,
+                        row0_top2.id1,
+                        row0_top2.value1,
+                        cert_result.max_bound,
+                        cert_result.bound_id,
+                        cert_result.certified,
+                        false_cert ? 1 : 0,
+                        agrees ? 1 : 0,
+                        (unsigned long long)shadow_candidate_top0,
+                        (unsigned long long)shadow_candidate_top1,
+                        (unsigned long long)shadow_certified,
+                        (unsigned long long)shadow_mismatch);
+            }
+        }
+
+        if (ok && *top0 == token1) {
+            const double t0 = cert_timing ? now_sec() : 0.0;
+            if (!have_pair_row1_logits) {
+                g->cur_hc = cur1;
+                ok = ds4_gpu_begin_commands() != 0;
+                if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+                if (ok) ok = ds4_gpu_end_commands() != 0;
+                else (void)ds4_gpu_synchronize();
+                g->cur_hc = saved_cur;
+            }
+            if (ok) {
+                ok = ds4_gpu_tensor_read(g->logits,
+                                           0,
+                                           logits1,
+                                           (uint64_t)DS4_N_VOCAB * sizeof(logits1[0])) != 0;
+            }
+            if (cert_timing) row1_logits_ms = (now_sec() - t0) * 1000.0;
+        } else if (ok && logits0) {
+            const double t0 = cert_timing ? now_sec() : 0.0;
+            if (pair_output_active && have_pair_norms) {
+                ds4_gpu_tensor *row0_norm = ds4_gpu_tensor_view(g->batch_ffn_norm,
+                                                                0,
+                                                                (uint64_t)DS4_N_EMBD * sizeof(float));
+                ok = row0_norm != NULL;
+                if (ok) ok = ds4_gpu_begin_commands() != 0;
+                if (ok) {
+                    ok = metal_graph_encode_output_projection_from_tensor(g,
+                                                                         model,
+                                                                         weights,
+                                                                         row0_norm,
+                                                                         g->logits,
+                                                                         weights->output->dim[1],
+                                                                         false);
+                }
+                if (ok) ok = ds4_gpu_end_commands() != 0;
+                else (void)ds4_gpu_synchronize();
+                ds4_gpu_tensor_free(row0_norm);
+            } else {
+                g->cur_hc = cur0;
+                ok = ds4_gpu_begin_commands() != 0;
+                if (ok) {
+                    ok = cert_active
+                        ? metal_graph_encode_output_projection_from_norm(g,
+                                                                         model,
+                                                                         weights,
+                                                                         weights->output->dim[1],
+                                                                         false)
+                        : metal_graph_encode_output_head(g,
+                                                         model,
+                                                         weights,
+                                                         weights->output->dim[1]);
+                }
+                if (ok) ok = ds4_gpu_end_commands() != 0;
+                else (void)ds4_gpu_synchronize();
+                g->cur_hc = saved_cur;
+            }
+            if (ok) {
+                ok = ds4_gpu_tensor_read(g->logits,
+                                           0,
+                                           logits0,
+                                           (uint64_t)DS4_N_VOCAB * sizeof(logits0[0])) != 0;
+            }
+            if (cert_timing) row0_logits_ms = (now_sec() - t0) * 1000.0;
+        }
+        if (cert_timing) {
+            fprintf(stderr,
+                    "ds4: mtp output verify timing backend=%s active=%d shadow=%d certified=%u "
+                    "top0=%d draft1=%d prepare=%.3f ms cert=%.3f ms pair=%.3f ms top2=%.3f ms "
+                    "row0_logits=%.3f ms row1_logits=%.3f ms total=%.3f ms\n",
+                    ds4_backend_name(backend),
+                    cert_active ? 1 : 0,
+                    cert_shadow ? 1 : 0,
+                    cert_result.certified,
+                    top0 ? *top0 : -1,
+                    token1,
+                    cert_prepare_ms,
+                    cert_ms,
+                    pair_ms,
+                    top2_ms,
+                    row0_logits_ms,
+                    row1_logits_ms,
+                    (now_sec() - cert_total_t0) * 1000.0);
+        }
+    } else if (ok) {
         g->cur_hc = cur0;
         ok = ds4_gpu_begin_commands() != 0;
         if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
@@ -13908,7 +16446,7 @@ static bool metal_graph_verify_decode2_exact(
         else (void)ds4_gpu_synchronize();
         g->cur_hc = saved_cur;
         if (ok) ok = ds4_gpu_tensor_read(g->comp_selected, 0, top0, sizeof(*top0)) != 0;
-        if (ok && logits0) {
+        if (ok && logits0 && *top0 != token1) {
             ok = ds4_gpu_tensor_read(g->logits,
                                        0,
                                        logits0,
@@ -13916,7 +16454,7 @@ static bool metal_graph_verify_decode2_exact(
         }
     }
 
-    if (ok) {
+    if (ok && !exact_decode2_top2_head) {
         g->cur_hc = cur1;
         ok = ds4_gpu_begin_commands() != 0;
         if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
@@ -13933,6 +16471,7 @@ static bool metal_graph_verify_decode2_exact(
     g->cur_hc = saved_cur;
     g->after_ffn_hc = saved_after;
     g->spec_capture_prefix1 = saved_capture;
+    g->spec_capture_prefix_depth = saved_capture_depth;
 
     ds4_gpu_tensor_free(next1);
     ds4_gpu_tensor_free(next0);
@@ -15498,6 +18037,7 @@ static int generate_metal_graph_raw_swa(
 
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
     const bool trace_top = getenv("DS4_TRACE_TOP") != NULL;
+    const bool token_trace = getenv("DS4_TOKEN_TRACE") != NULL;
     const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
 
     const double t_prefill0 = now_sec();
@@ -15539,6 +18079,13 @@ static int generate_metal_graph_raw_swa(
         if (token == vocab->eos_id) break;
 
         if (emit) emit(emit_ud, token);
+        if (token_trace) {
+            fprintf(stderr,
+                    "ds4: token trace generated=%d pos=%d token=%d\n",
+                    n_generated,
+                    pos,
+                    token);
+        }
         n_generated++;
 
         if (i == n_predict - 1 || pos + 1 >= ctx_size) {
@@ -15725,6 +18272,9 @@ struct ds4_session {
     int mtp_draft_token;
     uint64_t mtp_probe_total;
     uint64_t mtp_probe_hit;
+    double mtp_accept_ewma;
+    uint32_t mtp_accept_samples;
+    uint32_t mtp_accept_gate_skip;
     ds4_session_progress_fn progress;
     void *progress_ud;
     uint32_t prefill_cap;
@@ -15732,6 +18282,326 @@ struct ds4_session {
     bool checkpoint_valid;
     bool mtp_draft_valid;
 };
+
+#ifndef DS4_NO_GPU
+typedef enum {
+    DS4_OUTPUT_BENCH_TOP2,
+    DS4_OUTPUT_BENCH_FULL1,
+    DS4_OUTPUT_BENCH_FULL2,
+    DS4_OUTPUT_BENCH_PAIR_N2,
+    DS4_OUTPUT_BENCH_CANDIDATES2,
+    DS4_OUTPUT_BENCH_CERTIFY,
+} ds4_output_bench_kind;
+
+typedef struct {
+    ds4_gpu_graph *g;
+    const ds4_model *model;
+    const ds4_weights *weights;
+    ds4_gpu_tensor *full2_logits;
+    ds4_gpu_tensor *candidate_logits;
+    uint64_t vocab_dim;
+} ds4_output_bench_ctx;
+
+static void ds4_output_bench_set_err(char *err, size_t errlen, const char *msg) {
+    if (errlen != 0) snprintf(err, errlen, "%s", msg);
+}
+
+static bool ds4_output_bench_prepare_norms(ds4_output_bench_ctx *bc) {
+    ds4_gpu_graph *g = bc->g;
+    const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    ds4_gpu_tensor *row0 = ds4_gpu_tensor_view(g->batch_ffn_norm, 0, row_bytes);
+    ds4_gpu_tensor *row1 = ds4_gpu_tensor_view(g->batch_ffn_norm, row_bytes, row_bytes);
+    bool ok = row0 && row1;
+    if (ok) ok = ds4_gpu_begin_commands() != 0;
+    if (ok) ok = ds4_gpu_tensor_copy(row0, 0, g->output_norm, 0, row_bytes) != 0;
+    if (ok) ok = ds4_gpu_tensor_copy(row1, 0, g->output_norm, 0, row_bytes) != 0;
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    ds4_gpu_tensor_free(row1);
+    ds4_gpu_tensor_free(row0);
+    return ok;
+}
+
+static bool ds4_output_bench_encode(ds4_output_bench_ctx *bc, ds4_output_bench_kind kind) {
+    ds4_gpu_graph *g = bc->g;
+    const ds4_model *model = bc->model;
+    const ds4_weights *weights = bc->weights;
+    switch (kind) {
+    case DS4_OUTPUT_BENCH_TOP2:
+        return ds4_gpu_matmul_q8_0_top2_tensor(g->comp_selected,
+                                               model->map,
+                                               model->size,
+                                               weights->output->abs_offset,
+                                               DS4_N_EMBD,
+                                               bc->vocab_dim,
+                                               g->output_norm) != 0;
+    case DS4_OUTPUT_BENCH_FULL1:
+        return ds4_gpu_matmul_q8_0_tensor(g->logits,
+                                          model->map,
+                                          model->size,
+                                          weights->output->abs_offset,
+                                          DS4_N_EMBD,
+                                          bc->vocab_dim,
+                                          g->output_norm,
+                                          1) != 0;
+    case DS4_OUTPUT_BENCH_FULL2:
+        return ds4_gpu_matmul_q8_0_tensor(bc->full2_logits,
+                                          model->map,
+                                          model->size,
+                                          weights->output->abs_offset,
+                                          DS4_N_EMBD,
+                                          bc->vocab_dim,
+                                          g->batch_ffn_norm,
+                                          2) != 0;
+    case DS4_OUTPUT_BENCH_PAIR_N2:
+        return ds4_gpu_matmul_q8_0_top2_and_logits_n2_tensor(g->comp_selected,
+                                                             g->logits,
+                                                             model->map,
+                                                             model->size,
+                                                             weights->output->abs_offset,
+                                                             DS4_N_EMBD,
+                                                             bc->vocab_dim,
+                                                             g->batch_ffn_norm) != 0;
+    case DS4_OUTPUT_BENCH_CANDIDATES2:
+        return ds4_gpu_matmul_q8_0_candidates_tensor(bc->candidate_logits,
+                                                     g->output_candidate_ids,
+                                                     2,
+                                                     model->map,
+                                                     model->size,
+                                                     weights->output->abs_offset,
+                                                     DS4_N_EMBD,
+                                                     bc->vocab_dim,
+                                                     g->output_norm) != 0;
+    case DS4_OUTPUT_BENCH_CERTIFY:
+        return metal_graph_encode_output_candidate_cert(g, model, weights, bc->vocab_dim);
+    }
+    return false;
+}
+
+static bool ds4_output_bench_run_once(ds4_output_bench_ctx *bc, ds4_output_bench_kind kind) {
+    bool ok = ds4_gpu_begin_commands() != 0;
+    if (ok) ok = ds4_output_bench_encode(bc, kind);
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    return ok;
+}
+
+static double ds4_output_bench_time(ds4_output_bench_ctx *bc,
+                                    ds4_output_bench_kind kind,
+                                    int iters,
+                                    bool *ok_out) {
+    double total = 0.0;
+    const int warmup = iters < 4 ? 1 : 3;
+    for (int i = -warmup; i < iters; i++) {
+        const double t0 = i >= 0 ? now_sec() : 0.0;
+        if (!ds4_output_bench_run_once(bc, kind)) {
+            *ok_out = false;
+            return 0.0;
+        }
+        if (i >= 0) total += now_sec() - t0;
+    }
+    *ok_out = true;
+    return total / (double)iters;
+}
+
+static uint64_t ds4_output_q8_0_weight_bytes(uint64_t out_dim) {
+    const uint64_t blocks = ((uint64_t)DS4_N_EMBD + 31u) / 32u;
+    return out_dim * blocks * 34u;
+}
+
+static void ds4_output_bench_print_case(FILE *fp,
+                                        const char *name,
+                                        int iters,
+                                        double avg_sec,
+                                        uint64_t bytes,
+                                        const char *notes) {
+    const double avg_ms = avg_sec * 1000.0;
+    const double mib = (double)bytes / (1024.0 * 1024.0);
+    const double gbps = avg_sec > 0.0 ? (double)bytes / avg_sec / 1.0e9 : 0.0;
+    fprintf(fp,
+            "%s,%d,%.6f,%.3f,%.3f,%s\n",
+            name,
+            iters,
+            avg_ms,
+            mib,
+            gbps,
+            notes ? notes : "");
+}
+
+int ds4_session_output_head_bench(ds4_session *s, int iters, FILE *fp, char *err, size_t errlen) {
+    if (!s || !s->engine || !fp) {
+        ds4_output_bench_set_err(err, errlen, "invalid output-head bench arguments");
+        return 1;
+    }
+    if (iters <= 0) iters = 64;
+    ds4_engine *e = s->engine;
+    if (e->backend != DS4_BACKEND_CUDA) {
+        ds4_output_bench_set_err(err, errlen, "output-head bench is currently CUDA-only");
+        return 1;
+    }
+    if (!s->checkpoint_valid || s->checkpoint.len <= 0) {
+        ds4_output_bench_set_err(err, errlen, "output-head bench requires a synchronized session");
+        return 1;
+    }
+
+    ds4_gpu_graph *g = &s->graph;
+    const uint64_t vocab_dim = e->weights.output->dim[1];
+    if (!g->output_norm || !g->batch_ffn_norm || !g->logits || !g->comp_selected) {
+        ds4_output_bench_set_err(err, errlen, "output-head bench graph tensors are not allocated");
+        return 1;
+    }
+
+    ds4_output_bench_ctx bc = {
+        .g = g,
+        .model = &e->model,
+        .weights = &e->weights,
+        .vocab_dim = vocab_dim,
+    };
+    bc.full2_logits = ds4_gpu_tensor_alloc(2u * vocab_dim * sizeof(float));
+    bc.candidate_logits = ds4_gpu_tensor_alloc(2u * sizeof(float));
+    if (!bc.full2_logits || !bc.candidate_logits) {
+        ds4_gpu_tensor_free(bc.candidate_logits);
+        ds4_gpu_tensor_free(bc.full2_logits);
+        ds4_output_bench_set_err(err, errlen, "failed to allocate output-head bench tensors");
+        return 1;
+    }
+
+    bool ok = ds4_output_bench_prepare_norms(&bc);
+    if (!ok) {
+        ds4_gpu_tensor_free(bc.candidate_logits);
+        ds4_gpu_tensor_free(bc.full2_logits);
+        ds4_output_bench_set_err(err, errlen, "failed to prepare output-head benchmark norms");
+        return 1;
+    }
+
+    float *logits = xmalloc((size_t)vocab_dim * sizeof(logits[0]));
+    ok = ds4_output_bench_run_once(&bc, DS4_OUTPUT_BENCH_FULL1);
+    if (ok) {
+        ok = ds4_gpu_tensor_read(g->logits,
+                                 0,
+                                 logits,
+                                 vocab_dim * sizeof(logits[0])) != 0;
+    }
+    int top0 = -1, top1 = -1;
+    float top0_logit = 0.0f, top1_logit = 0.0f;
+    if (ok) logits_top2(logits, (uint32_t)vocab_dim, &top0, &top0_logit, &top1, &top1_logit);
+
+    ds4_gpu_top2_result top2;
+    memset(&top2, 0, sizeof(top2));
+    if (ok) ok = ds4_output_bench_run_once(&bc, DS4_OUTPUT_BENCH_TOP2);
+    if (ok) ok = ds4_gpu_tensor_read(g->comp_selected, 0, &top2, sizeof(top2)) != 0;
+    const bool top2_match = ok && (int)top2.id0 == top0 && (int)top2.id1 == top1;
+
+    ds4_gpu_top2_result pair_top2;
+    memset(&pair_top2, 0, sizeof(pair_top2));
+    if (ok) ok = ds4_output_bench_run_once(&bc, DS4_OUTPUT_BENCH_PAIR_N2);
+    if (ok) ok = ds4_gpu_tensor_read(g->comp_selected, 0, &pair_top2, sizeof(pair_top2)) != 0;
+    const bool pair_match = ok && (int)pair_top2.id0 == top0 && (int)pair_top2.id1 == top1;
+
+    uint32_t candidate_ids[2] = {
+        top0 >= 0 ? (uint32_t)top0 : 0u,
+        top1 >= 0 ? (uint32_t)top1 : 0u,
+    };
+    if (ok) {
+        ok = ds4_gpu_tensor_write(g->output_candidate_ids, 0, candidate_ids, sizeof(candidate_ids)) != 0;
+    }
+    float candidate_logits[2] = {0.0f, 0.0f};
+    if (ok) ok = ds4_output_bench_run_once(&bc, DS4_OUTPUT_BENCH_CANDIDATES2);
+    if (ok) {
+        ok = ds4_gpu_tensor_read(bc.candidate_logits,
+                                 0,
+                                 candidate_logits,
+                                 sizeof(candidate_logits)) != 0;
+    }
+    const float cand0_diff = ok ? fabsf(candidate_logits[0] - top0_logit) : 0.0f;
+    const float cand1_diff = ok ? fabsf(candidate_logits[1] - top1_logit) : 0.0f;
+    const bool candidates_match = ok && cand0_diff <= 1.0e-3f && cand1_diff <= 1.0e-3f;
+
+    const double cert_prepare_t0 = ok ? now_sec() : 0.0;
+    if (ok) ok = metal_graph_prepare_output_certifier(g, &e->model, &e->weights, vocab_dim);
+    const double cert_prepare_ms = ok ? (now_sec() - cert_prepare_t0) * 1000.0 : 0.0;
+    ds4_gpu_candidate_cert_result cert;
+    memset(&cert, 0, sizeof(cert));
+    if (ok) ok = ds4_output_bench_run_once(&bc, DS4_OUTPUT_BENCH_CERTIFY);
+    if (ok) {
+        ok = ds4_gpu_tensor_read(g->output_cert_result, 0, &cert, sizeof(cert)) != 0;
+    }
+    const bool false_cert = ok && cert.certified && (int)cert.candidate_id != top0;
+
+    if (!ok || !top2_match || !pair_match || !candidates_match || false_cert) {
+        free(logits);
+        ds4_gpu_tensor_free(bc.candidate_logits);
+        ds4_gpu_tensor_free(bc.full2_logits);
+        ds4_output_bench_set_err(err, errlen, "output-head benchmark validation failed");
+        return 1;
+    }
+
+    const uint64_t weight_bytes = ds4_output_q8_0_weight_bytes(vocab_dim);
+    const uint64_t input_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    const uint64_t logits_bytes = vocab_dim * sizeof(float);
+    const uint32_t cert_groups = g->output_cert_group_norms_groups ? g->output_cert_group_norms_groups : ds4_output_cert_groups();
+    const uint64_t cert_bound_bytes = vocab_dim * (uint64_t)cert_groups * sizeof(float);
+    const uint64_t cand2_weight_bytes = 2u * (((uint64_t)DS4_N_EMBD + 31u) / 32u) * 34u;
+
+    fprintf(fp, "# ds4 output-head projection microbenchmark\n");
+    fprintf(fp,
+            "# backend=%s ctx_tokens=%d iters=%d vocab=%llu embd=%u cert_groups=%u cert_prepare_ms=%.3f\n",
+            ds4_backend_name(e->backend),
+            s->checkpoint.len,
+            iters,
+            (unsigned long long)vocab_dim,
+            (unsigned)DS4_N_EMBD,
+            cert_groups,
+            cert_prepare_ms);
+    fprintf(fp,
+            "# validation top2=%u/%u logits_top2=%d/%d pair=%u/%u candidate_diff=%g/%g cert_candidate=%u certified=%u bound_id=%u false_cert=%d\n",
+            top2.id0,
+            top2.id1,
+            top0,
+            top1,
+            pair_top2.id0,
+            pair_top2.id1,
+            (double)cand0_diff,
+            (double)cand1_diff,
+            cert.candidate_id,
+            cert.certified,
+            cert.bound_id,
+            false_cert ? 1 : 0);
+    fprintf(fp, "path,iters,avg_ms,logical_bytes_mib,effective_gbps,notes\n");
+
+    bool timed_ok = true;
+    double avg = ds4_output_bench_time(&bc, DS4_OUTPUT_BENCH_TOP2, iters, &timed_ok);
+    if (timed_ok) ds4_output_bench_print_case(fp, "row0_top2_q8", iters, avg, weight_bytes + input_bytes, "logical Q8 read plus top2 reduction");
+    if (timed_ok) avg = ds4_output_bench_time(&bc, DS4_OUTPUT_BENCH_FULL1, iters, &timed_ok);
+    if (timed_ok) ds4_output_bench_print_case(fp, "row_logits_q8_n1", iters, avg, weight_bytes + input_bytes + logits_bytes, "one full vocab row");
+    if (timed_ok) avg = ds4_output_bench_time(&bc, DS4_OUTPUT_BENCH_FULL2, iters, &timed_ok);
+    if (timed_ok) ds4_output_bench_print_case(fp, "row_logits_q8_n2", iters, avg, 2u * (weight_bytes + input_bytes + logits_bytes), "generic n=2 full logits");
+    if (timed_ok) avg = ds4_output_bench_time(&bc, DS4_OUTPUT_BENCH_PAIR_N2, iters, &timed_ok);
+    if (timed_ok) ds4_output_bench_print_case(fp, "row0_top2_row1_logits_n2", iters, avg, weight_bytes + 2u * input_bytes + logits_bytes, "fused verifier projection");
+    if (timed_ok) avg = ds4_output_bench_time(&bc, DS4_OUTPUT_BENCH_CANDIDATES2, iters, &timed_ok);
+    if (timed_ok) ds4_output_bench_print_case(fp, "candidate_logits_2", iters, avg, cand2_weight_bytes + input_bytes + 2u * sizeof(float), "two explicit candidate rows");
+    if (timed_ok) avg = ds4_output_bench_time(&bc, DS4_OUTPUT_BENCH_CERTIFY, iters, &timed_ok);
+    if (timed_ok) ds4_output_bench_print_case(fp, "candidate_cert_top1", iters, avg, weight_bytes + input_bytes + cert_bound_bytes, "max-bound certifier logical upper bound");
+    fflush(fp);
+
+    free(logits);
+    ds4_gpu_tensor_free(bc.candidate_logits);
+    ds4_gpu_tensor_free(bc.full2_logits);
+    if (!timed_ok) {
+        ds4_output_bench_set_err(err, errlen, "output-head benchmark timing failed");
+        return 1;
+    }
+    return 0;
+}
+#else
+int ds4_session_output_head_bench(ds4_session *s, int iters, FILE *fp, char *err, size_t errlen) {
+    (void)s;
+    (void)iters;
+    (void)fp;
+    if (errlen != 0) snprintf(err, errlen, "%s", "output-head bench requires GPU support");
+    return 1;
+}
+#endif
 
 /* =========================================================================
  * Session Snapshot Payloads.
@@ -15755,8 +18625,12 @@ struct ds4_session {
  */
 
 #define DS4_SESSION_PAYLOAD_MAGIC UINT32_C(0x34565344) /* "DSV4" */
-#define DS4_SESSION_PAYLOAD_VERSION UINT32_C(1)
+/* Version 2 appends the MTP accept-gate trio (skip counter, EWMA, sample count)
+ * at the tail so per-frontier bench snapshots restore the gate's state, not just
+ * the KV cache. Older v1 payloads still load; the fields default to zero. */
+#define DS4_SESSION_PAYLOAD_VERSION UINT32_C(2)
 #define DS4_SESSION_PAYLOAD_U32_FIELDS 13u
+#define DS4_SESSION_PAYLOAD_MTP_TAIL_BYTES (uint64_t)(sizeof(uint32_t) + sizeof(double) + sizeof(uint32_t))
 #define DS4_SESSION_IO_CHUNK (8u * 1024u * 1024u)
 
 static void payload_set_err(char *err, size_t errlen, const char *msg) {
@@ -16002,6 +18876,196 @@ typedef struct {
     uint32_t mtp_n_raw;
 } ds4_spec_frontier;
 
+typedef struct {
+    uint32_t start;
+    int token[16];
+    int n_tokens;
+} ds4_mtp_verify_plan;
+
+typedef struct {
+    int row_top[16];
+    ds4_gpu_top2_result row_top2[16];
+    int commit_tokens;
+    uint32_t logits_row;
+    bool have_logits;
+} ds4_mtp_verify_result;
+
+typedef struct {
+    uint32_t base_mtp_n_raw;
+} ds4_mtp_state_txn;
+
+static void spec_frontier_free(ds4_spec_frontier *f);
+static bool spec_frontier_snapshot(ds4_spec_frontier *f, ds4_session *s);
+static bool spec_frontier_restore(ds4_spec_frontier *f, ds4_session *s);
+
+static void mtp_verify_plan_init(ds4_mtp_verify_plan *p,
+                                 uint32_t start,
+                                 const int *tokens,
+                                 int n_tokens) {
+    memset(p, 0, sizeof(*p));
+    p->start = start;
+    if (n_tokens > (int)(sizeof(p->token) / sizeof(p->token[0]))) {
+        n_tokens = (int)(sizeof(p->token) / sizeof(p->token[0]));
+    }
+    p->n_tokens = n_tokens;
+    for (int i = 0; i < n_tokens; i++) p->token[i] = tokens[i];
+}
+
+static void mtp_verify_result_init(ds4_mtp_verify_result *r) {
+    memset(r, 0, sizeof(*r));
+    for (uint32_t i = 0; i < sizeof(r->row_top) / sizeof(r->row_top[0]); i++) {
+        r->row_top[i] = -1;
+        r->row_top2[i].id0 = UINT32_MAX;
+        r->row_top2[i].id1 = UINT32_MAX;
+    }
+}
+
+static void mtp_verify_result_set_commit(ds4_mtp_verify_result *r, int commit_tokens) {
+    if (commit_tokens < 1) commit_tokens = 1;
+    if (commit_tokens > (int)(sizeof(r->row_top) / sizeof(r->row_top[0]))) {
+        commit_tokens = (int)(sizeof(r->row_top) / sizeof(r->row_top[0]));
+    }
+    r->commit_tokens = commit_tokens;
+    r->logits_row = (uint32_t)(commit_tokens - 1);
+}
+
+static void mtp_verify_result_decide_from_tops(ds4_mtp_verify_result *r,
+                                               const ds4_mtp_verify_plan *p) {
+    int commit = 1;
+    for (int i = 1; i < p->n_tokens; i++) {
+        if (r->row_top[i - 1] != p->token[i]) break;
+        commit++;
+    }
+    mtp_verify_result_set_commit(r, commit);
+}
+
+static void mtp_state_txn_begin(ds4_mtp_state_txn *txn, const ds4_session *s) {
+    txn->base_mtp_n_raw = s->graph.mtp_n_raw;
+}
+
+static void mtp_state_txn_keep_accepted(ds4_session *s,
+                                        const ds4_mtp_state_txn *txn,
+                                        int accepted_tokens) {
+    uint32_t keep = txn->base_mtp_n_raw + (uint32_t)accepted_tokens;
+    if (keep > s->graph.raw_window) keep = s->graph.raw_window;
+    s->graph.mtp_n_raw = keep;
+}
+
+static bool mtp_state_snapshot(ds4_session *s) {
+    if (!s) return false;
+    ds4_gpu_graph *g = &s->graph;
+    if (!g->mtp_state_hc || !g->mtp_next_hc || !g->mtp_raw_cache ||
+        !g->spec_mtp_state_hc || !g->spec_mtp_next_hc || !g->spec_mtp_raw_cache) {
+        return false;
+    }
+    bool ok = ds4_gpu_begin_commands() != 0;
+    if (ok) ok = ds4_gpu_tensor_copy(g->spec_mtp_state_hc, 0,
+                                      g->mtp_state_hc, 0,
+                                      ds4_gpu_tensor_bytes(g->mtp_state_hc)) != 0;
+    if (ok) ok = ds4_gpu_tensor_copy(g->spec_mtp_next_hc, 0,
+                                      g->mtp_next_hc, 0,
+                                      ds4_gpu_tensor_bytes(g->mtp_next_hc)) != 0;
+    if (ok) ok = ds4_gpu_tensor_copy(g->spec_mtp_raw_cache, 0,
+                                      g->mtp_raw_cache, 0,
+                                      ds4_gpu_tensor_bytes(g->mtp_raw_cache)) != 0;
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    return ok;
+}
+
+static bool mtp_state_restore(ds4_session *s) {
+    if (!s) return false;
+    ds4_gpu_graph *g = &s->graph;
+    if (!g->mtp_state_hc || !g->mtp_next_hc || !g->mtp_raw_cache ||
+        !g->spec_mtp_state_hc || !g->spec_mtp_next_hc || !g->spec_mtp_raw_cache) {
+        return false;
+    }
+    bool ok = ds4_gpu_begin_commands() != 0;
+    if (ok) ok = ds4_gpu_tensor_copy(g->mtp_state_hc, 0,
+                                      g->spec_mtp_state_hc, 0,
+                                      ds4_gpu_tensor_bytes(g->mtp_state_hc)) != 0;
+    if (ok) ok = ds4_gpu_tensor_copy(g->mtp_next_hc, 0,
+                                      g->spec_mtp_next_hc, 0,
+                                      ds4_gpu_tensor_bytes(g->mtp_next_hc)) != 0;
+    if (ok) ok = ds4_gpu_tensor_copy(g->mtp_raw_cache, 0,
+                                      g->spec_mtp_raw_cache, 0,
+                                      ds4_gpu_tensor_bytes(g->mtp_raw_cache)) != 0;
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    return ok;
+}
+
+static bool mtp_seed_next_from_target_hc(ds4_session *s,
+                                         ds4_gpu_tensor *target_hc,
+                                         int token,
+                                         uint32_t pos) {
+    if (!s || !s->engine || !target_hc || token < 0) return false;
+    ds4_engine *e = s->engine;
+    ds4_spec_frontier target_frontier;
+    memset(&target_frontier, 0, sizeof(target_frontier));
+    const bool preserve_target_frontier =
+        getenv("DS4_MTP_PRESERVE_TARGET_FRONTIER") != NULL;
+    bool have_target_frontier = false;
+    if (preserve_target_frontier) {
+        have_target_frontier = spec_frontier_snapshot(&target_frontier, s);
+        if (!have_target_frontier) return false;
+    }
+    int mtp_top = -1;
+    ds4_gpu_top2_result mtp_top2;
+    memset(&mtp_top2, 0, sizeof(mtp_top2));
+    bool ok = metal_graph_eval_mtp_draft_from_hc(&s->graph,
+                                                 &e->model,
+                                                 &e->weights,
+                                                 &e->mtp_model,
+                                                 &e->mtp_weights,
+                                                 target_hc,
+                                                 s->graph.mtp_state_hc,
+                                                 token,
+                                                 pos,
+                                                 NULL,
+                                                 &mtp_top,
+                                                 getenv("DS4_CUDA_MTP_TOP2") &&
+                                                 !getenv("DS4_MTP_FULL_LOGITS") ? &mtp_top2 : NULL);
+    bool restored = true;
+    if (preserve_target_frontier) {
+        const uint32_t mtp_n_raw_after = s->graph.mtp_n_raw;
+        restored = spec_frontier_restore(&target_frontier, s);
+        s->graph.mtp_n_raw = mtp_n_raw_after;
+        spec_frontier_free(&target_frontier);
+    }
+    if (!ok || !restored) {
+        s->mtp_draft_valid = false;
+        return false;
+    }
+    s->mtp_draft_token = mtp_top;
+    s->mtp_draft_valid = mtp_top >= 0;
+    return s->mtp_draft_valid;
+}
+
+static bool mtp_seed_next_from_batch_row(ds4_session *s,
+                                         uint32_t row,
+                                         int token,
+                                         uint32_t pos) {
+    if (!s) return false;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    ds4_gpu_tensor *row_hc = metal_graph_tensor_row_view(s->graph.batch_cur_hc,
+                                                         row,
+                                                         hc_dim);
+    if (!row_hc) {
+        s->mtp_draft_valid = false;
+        return false;
+    }
+    bool ok = mtp_seed_next_from_target_hc(s, row_hc, token, pos);
+    ds4_gpu_tensor_free(row_hc);
+    return ok;
+}
+
+static void mtp_state_txn_commit_suffix(ds4_session *s,
+                                        const ds4_mtp_state_txn *txn,
+                                        int committed) {
+    mtp_state_txn_keep_accepted(s, txn, committed);
+}
+
 static void spec_frontier_free(ds4_spec_frontier *f) {
     if (!f) return;
     memset(f, 0, sizeof(*f));
@@ -16012,7 +19076,11 @@ static bool spec_frontier_snapshot(ds4_spec_frontier *f, ds4_session *s) {
     ds4_gpu_graph *g = &s->graph;
     f->mtp_n_raw = g->mtp_n_raw;
 
+    if (!g->cur_hc || !g->spec_cur_hc) return false;
     bool ok = ds4_gpu_begin_commands() != 0;
+    if (ok) ok = ds4_gpu_tensor_copy(g->spec_cur_hc, 0,
+                                      g->cur_hc, 0,
+                                      ds4_gpu_tensor_bytes(g->cur_hc)) != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         f->n_comp[il] = g->layer_n_comp[il];
         f->n_index_comp[il] = g->layer_n_index_comp[il];
@@ -16042,8 +19110,12 @@ static bool spec_frontier_snapshot(ds4_spec_frontier *f, ds4_session *s) {
 
 static bool spec_frontier_restore(ds4_spec_frontier *f, ds4_session *s) {
     ds4_gpu_graph *g = &s->graph;
+    if (!g->cur_hc || !g->spec_cur_hc) return false;
     bool ok = ds4_gpu_begin_commands() != 0;
     g->mtp_n_raw = f->mtp_n_raw;
+    if (ok) ok = ds4_gpu_tensor_copy(g->cur_hc, 0,
+                                      g->spec_cur_hc, 0,
+                                      ds4_gpu_tensor_bytes(g->cur_hc)) != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         g->layer_n_comp[il] = f->n_comp[il];
         g->layer_n_index_comp[il] = f->n_index_comp[il];
@@ -16067,39 +19139,337 @@ static bool spec_frontier_restore(ds4_spec_frontier *f, ds4_session *s) {
     return ok;
 }
 
-/* Commit the prefix-1 state captured by the N=2 speculative verifier.
+/* Commit a captured speculative verifier prefix.
  *
- * The verifier has already advanced every layer through both draft tokens.  On
- * a one-token accept the append-only compressed caches can keep the second
- * speculative row as invisible garbage, but the compressor frontiers and row
- * counters must be rewound to the exact state after draft[0].  This is the
- * cheap partial-accept path: copy a few small per-layer frontiers instead of
- * restoring the whole prefix and replaying a one-token target decode. */
-static bool spec_frontier_commit_prefix1(ds4_session *s) {
+ * The verifier has already advanced every layer through speculative future
+ * tokens.  On a partial accept the append-only compressed caches can keep later
+ * speculative rows as invisible garbage, but the compressor frontiers and row
+ * counters must be rewound to the exact accepted prefix. */
+static bool spec_frontier_commit_prefix(ds4_session *s, uint32_t depth) {
+    if (depth < 1 || depth > 2) return false;
     ds4_gpu_graph *g = &s->graph;
     bool ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
 
-        g->layer_n_comp[il] = g->spec_prefix1_n_comp[il];
+        ds4_gpu_tensor *attn_kv = depth == 1 ? g->spec_prefix1_attn_state_kv[il]
+                                             : g->spec_prefix2_attn_state_kv[il];
+        ds4_gpu_tensor *attn_score = depth == 1 ? g->spec_prefix1_attn_state_score[il]
+                                                : g->spec_prefix2_attn_state_score[il];
+        ds4_gpu_tensor *index_kv = depth == 1 ? g->spec_prefix1_index_state_kv[il]
+                                              : g->spec_prefix2_index_state_kv[il];
+        ds4_gpu_tensor *index_score = depth == 1 ? g->spec_prefix1_index_state_score[il]
+                                                 : g->spec_prefix2_index_state_score[il];
+        uint32_t *n_comp = depth == 1 ? g->spec_prefix1_n_comp
+                                      : g->spec_prefix2_n_comp;
+        uint32_t *n_index_comp = depth == 1 ? g->spec_prefix1_n_index_comp
+                                            : g->spec_prefix2_n_index_comp;
+
+        g->layer_n_comp[il] = n_comp[il];
         const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
         ok = ds4_gpu_tensor_copy(g->layer_attn_state_kv[il], 0,
-                                   g->spec_prefix1_attn_state_kv[il], 0, ab) != 0 &&
+                                   attn_kv, 0, ab) != 0 &&
              ds4_gpu_tensor_copy(g->layer_attn_state_score[il], 0,
-                                   g->spec_prefix1_attn_state_score[il], 0, ab) != 0;
+                                   attn_score, 0, ab) != 0;
         if (ok && ratio == 4) {
-            g->layer_n_index_comp[il] = g->spec_prefix1_n_index_comp[il];
+            g->layer_n_index_comp[il] = n_index_comp[il];
             const uint64_t ib = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
             ok = ds4_gpu_tensor_copy(g->layer_index_state_kv[il], 0,
-                                       g->spec_prefix1_index_state_kv[il], 0, ib) != 0 &&
+                                       index_kv, 0, ib) != 0 &&
                  ds4_gpu_tensor_copy(g->layer_index_state_score[il], 0,
-                                       g->spec_prefix1_index_state_score[il], 0, ib) != 0;
+                                       index_score, 0, ib) != 0;
         }
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
     return ok;
+}
+
+static bool spec_frontier_commit_prefix1(ds4_session *s) {
+    return spec_frontier_commit_prefix(s, 1);
+}
+
+static bool metal_graph_verify_decode3_top2_output(
+        ds4_gpu_graph              *g,
+        const ds4_model            *model,
+        const ds4_weights          *weights,
+        const token_vec            *prompt,
+        const ds4_mtp_verify_plan  *plan,
+        ds4_mtp_verify_result      *result,
+        float                      *row_logits) {
+    if (!g || !model || !weights || !prompt || !plan || !result) return false;
+    if (plan->n_tokens < 3 || plan->start > (uint32_t)prompt->len ||
+        3u > (uint32_t)prompt->len - plan->start) {
+        return false;
+    }
+
+    bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens,
+                                               prompt,
+                                               plan->start,
+                                               3u);
+    if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
+                                                         g->prefill_tokens,
+                                                         model,
+                                                         weights,
+                                                         prompt,
+                                                         plan->start,
+                                                         3u);
+    if (!ok) return false;
+
+    const bool saved_capture = g->spec_capture_prefix1;
+    const uint32_t saved_capture_depth = g->spec_capture_prefix_depth;
+    g->spec_capture_prefix1 = true;
+    g->spec_capture_prefix_depth = 2u;
+
+    ok = ds4_gpu_begin_commands() != 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        ok = metal_graph_encode_layer_batch(g,
+                                            model,
+                                            &weights->layer[il],
+                                            il,
+                                            plan->start,
+                                            3u);
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    g->spec_capture_prefix1 = saved_capture;
+    g->spec_capture_prefix_depth = saved_capture_depth;
+    if (!ok) return false;
+
+    for (uint32_t row = 0; row < 2u; row++) {
+        ok = ds4_gpu_begin_commands() != 0;
+        if (ok) ok = metal_graph_encode_output_head_batch_row(g,
+                                                              model,
+                                                              weights,
+                                                              row,
+                                                              weights->output->dim[1],
+                                                              true);
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+        if (ok) ok = ds4_gpu_tensor_read(g->comp_selected,
+                                           0,
+                                           &result->row_top2[row],
+                                           sizeof(result->row_top2[row])) != 0;
+        if (!ok) return false;
+        result->row_top[row] = (int)result->row_top2[row].id0;
+    }
+
+    mtp_verify_result_decide_from_tops(result, plan);
+    if (!row_logits) return true;
+
+    ok = ds4_gpu_begin_commands() != 0;
+    if (ok) ok = metal_graph_encode_output_head_batch_row(g,
+                                                          model,
+                                                          weights,
+                                                          result->logits_row,
+                                                          weights->output->dim[1],
+                                                          false);
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (ok) ok = metal_graph_read_current_logits(g, row_logits);
+    if (ok) result->have_logits = true;
+    return ok;
+}
+
+enum {
+    DS4_MTP_BATCH_FIRST_FALLBACK_REUSE = -2
+};
+
+static int ds4_session_eval_speculative_batch_first3(
+        ds4_session *s,
+        int first_token,
+        int eos_token,
+        int *accepted,
+        int accepted_cap,
+        char *err,
+        size_t errlen,
+        double cycle_t0,
+        bool mtp_timing) {
+    ds4_engine *e = s->engine;
+    const uint32_t start = (uint32_t)s->checkpoint.len;
+    int drafts[3] = { first_token, -1, -1 };
+    const int seed_token = first_token;
+    ds4_mtp_state_txn mtp_txn;
+    mtp_state_txn_begin(&mtp_txn, s);
+
+    ds4_spec_frontier frontier;
+    memset(&frontier, 0, sizeof(frontier));
+    const double snapshot_t0 = mtp_timing ? now_sec() : 0.0;
+    bool ok = spec_frontier_snapshot(&frontier, s);
+    const double snapshot_done = mtp_timing ? now_sec() : 0.0;
+    if (!ok) {
+        spec_frontier_free(&frontier);
+        return 0;
+    }
+    bool have_mtp_snapshot = mtp_state_snapshot(s);
+    if (!have_mtp_snapshot) {
+        spec_frontier_free(&frontier);
+        return 0;
+    }
+
+    s->mtp_draft_valid = false;
+    const double draft_t0 = mtp_timing ? now_sec() : 0.0;
+    bool draft_mutated = false;
+    for (int i = 1; ok && i < 3; i++) {
+        ds4_gpu_tensor *prev_hc = (i & 1) ? s->graph.mtp_state_hc : s->graph.mtp_next_hc;
+        ds4_gpu_tensor *out_hc = (i & 1) ? s->graph.mtp_next_hc : s->graph.mtp_state_hc;
+        int mtp_top = -1;
+        ds4_gpu_top2_result mtp_top2;
+        memset(&mtp_top2, 0, sizeof(mtp_top2));
+        ok = metal_graph_eval_mtp_draft_from_hc(&s->graph,
+                                                &e->model,
+                                                &e->weights,
+                                                &e->mtp_model,
+                                                &e->mtp_weights,
+                                                prev_hc,
+                                                out_hc,
+                                                drafts[i - 1],
+                                                start + (uint32_t)(i - 1),
+                                                NULL,
+                                                &mtp_top,
+                                                getenv("DS4_CUDA_MTP_TOP2") &&
+                                                !getenv("DS4_MTP_FULL_LOGITS") ? &mtp_top2 : NULL);
+        if (ok) draft_mutated = true;
+        if (ok) drafts[i] = mtp_top;
+        if (ok && drafts[i] < 0) ok = false;
+    }
+    const double draft_done = mtp_timing ? now_sec() : 0.0;
+    const bool preserve_target_frontier =
+        getenv("DS4_MTP_PRESERVE_TARGET_FRONTIER") != NULL;
+    const uint32_t mtp_n_raw_after_draft = s->graph.mtp_n_raw;
+    if (ok && preserve_target_frontier) {
+        ok = spec_frontier_restore(&frontier, s);
+        s->graph.mtp_n_raw = mtp_n_raw_after_draft;
+    }
+    if (!ok) {
+        s->checkpoint.len = (int)start;
+        (void)spec_frontier_restore(&frontier, s);
+        (void)mtp_state_restore(s);
+        mtp_state_txn_keep_accepted(s, &mtp_txn, 0);
+        spec_frontier_free(&frontier);
+        if (draft_mutated) {
+            s->mtp_draft_token = seed_token;
+            s->mtp_draft_valid = true;
+            return DS4_MTP_BATCH_FIRST_FALLBACK_REUSE;
+        }
+        return 0;
+    }
+
+    for (int i = 0; i < 3; i++) token_vec_push(&s->checkpoint, drafts[i]);
+
+    ds4_mtp_verify_plan plan;
+    ds4_mtp_verify_result result;
+    mtp_verify_plan_init(&plan, start, drafts, 3);
+    mtp_verify_result_init(&result);
+    float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
+    const double verify_t0 = mtp_timing ? now_sec() : 0.0;
+    ds4_gpu_set_mtp_verifier(1);  /* Bug 2 / Option D */
+    ok = metal_graph_verify_decode3_top2_output(&s->graph,
+                                                &e->model,
+                                                &e->weights,
+                                                &s->checkpoint,
+                                                &plan,
+                                                &result,
+                                                row_logits);
+    ds4_gpu_set_mtp_verifier(0);
+    const double verify_done = mtp_timing ? now_sec() : 0.0;
+    if (!ok) {
+        s->checkpoint.len = (int)start;
+        (void)spec_frontier_restore(&frontier, s);
+        (void)mtp_state_restore(s);
+        mtp_state_txn_keep_accepted(s, &mtp_txn, 0);
+        spec_frontier_free(&frontier);
+        free(row_logits);
+        snprintf(err, errlen, "MTP batch-first verifier failed");
+        return -1;
+    }
+
+    const int commit_tokens = result.commit_tokens;
+    float min_margin = FLT_MAX;
+    for (int i = 0; i + 1 < commit_tokens && i < 2; i++) {
+        const float margin = result.row_top2[i].value0 - result.row_top2[i].value1;
+        if (margin < min_margin) min_margin = margin;
+    }
+    int logits_top0 = -1, logits_top1 = -1;
+    float logits_v0 = 0.0f, logits_v1 = 0.0f;
+    logits_top2(row_logits, DS4_N_VOCAB, &logits_top0, &logits_v0, &logits_top1, &logits_v1);
+    const float logits_margin = logits_v0 - logits_v1;
+    if (logits_margin < min_margin) min_margin = logits_margin;
+    float margin_threshold = e->mtp_margin;
+    const char *margin_env = getenv("DS4_MTP_BATCH_FIRST_MIN_MARGIN");
+    if (margin_env && margin_env[0]) {
+        char *end = NULL;
+        float v = strtof(margin_env, &end);
+        if (end != margin_env && v >= 0.0f) margin_threshold = v;
+    }
+    if (margin_threshold > 0.0f && min_margin < margin_threshold) {
+        s->checkpoint.len = (int)start;
+        (void)spec_frontier_restore(&frontier, s);
+        (void)mtp_state_restore(s);
+        mtp_state_txn_keep_accepted(s, &mtp_txn, 0);
+        if (mtp_timing) {
+            fprintf(stderr,
+                    "ds4: mtp timing batch_first3 fallback=low-margin drafted=3 "
+                    "candidate_commit=%d min_margin=%.3f threshold=%.3f total=%.3f ms\n",
+                    commit_tokens,
+                    min_margin,
+                    margin_threshold,
+                    (now_sec() - cycle_t0) * 1000.0);
+        }
+        spec_frontier_free(&frontier);
+        free(row_logits);
+        s->mtp_draft_token = seed_token;
+        s->mtp_draft_valid = true;
+        return DS4_MTP_BATCH_FIRST_FALLBACK_REUSE;
+    }
+    if (commit_tokens < 3) {
+        s->checkpoint.len = (int)start;
+        ok = spec_frontier_commit_prefix(s, (uint32_t)commit_tokens);
+    }
+    if (!ok) {
+        s->checkpoint.len = (int)start;
+        (void)spec_frontier_restore(&frontier, s);
+        (void)mtp_state_restore(s);
+        mtp_state_txn_keep_accepted(s, &mtp_txn, 0);
+        spec_frontier_free(&frontier);
+        free(row_logits);
+        snprintf(err, errlen, "MTP batch-first prefix commit failed");
+        return -1;
+    }
+
+    if (commit_tokens == 3) {
+        s->checkpoint.len = (int)start;
+    }
+    memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+    int n_accept = 0;
+    for (int i = 0; i < commit_tokens && n_accept < accepted_cap; i++) {
+        token_vec_push(&s->checkpoint, drafts[i]);
+        accepted[n_accept++] = drafts[i];
+        if (drafts[i] == eos_token) break;
+    }
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    mtp_state_txn_keep_accepted(s, &mtp_txn, n_accept > 0 ? n_accept - 1 : 0);
+    if (n_accept > 1 && getenv("DS4_MTP_BATCH_FIRST_SEED_BATCH_ROWS") != NULL) {
+        (void)mtp_seed_next_from_batch_row(s,
+                                           (uint32_t)(n_accept - 1),
+                                           drafts[n_accept - 1],
+                                           start + (uint32_t)(n_accept - 1));
+    }
+    if (mtp_timing) {
+        fprintf(stderr,
+                "ds4: mtp timing batch_first3 drafted=3 committed=%d snapshot=%.3f ms "
+                "draft=%.3f ms verify=%.3f ms total=%.3f ms\n",
+                n_accept,
+                (snapshot_done - snapshot_t0) * 1000.0,
+                (draft_done - draft_t0) * 1000.0,
+                (verify_done - verify_t0) * 1000.0,
+                (now_sec() - cycle_t0) * 1000.0);
+    }
+    spec_frontier_free(&frontier);
+    free(row_logits);
+    return n_accept;
 }
 #endif
 
@@ -16112,6 +19482,7 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
         bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
         bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
         bytes += session_cpu_payload_live_tensor_bytes(s);
+        bytes += DS4_SESSION_PAYLOAD_MTP_TAIL_BYTES;
         return bytes;
     }
 #ifdef DS4_NO_GPU
@@ -16124,6 +19495,7 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
     bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
     bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
     bytes += session_payload_live_tensor_bytes(g, (uint32_t)s->checkpoint.len);
+    bytes += DS4_SESSION_PAYLOAD_MTP_TAIL_BYTES;
     return bytes;
 #endif
 }
@@ -16196,6 +19568,9 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
                 if (payload_write_bytes(fp, layer->index_state_score, layer_index_state_bytes(ratio), err, errlen) != 0) return 1;
             }
         }
+        if (payload_write_u32(fp, s->mtp_accept_gate_skip, err, errlen) != 0) return 1;
+        if (payload_write_bytes(fp, &s->mtp_accept_ewma, sizeof(s->mtp_accept_ewma), err, errlen) != 0) return 1;
+        if (payload_write_u32(fp, s->mtp_accept_samples, err, errlen) != 0) return 1;
         return 0;
     }
 #ifdef DS4_NO_GPU
@@ -16319,7 +19694,11 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         }
     }
     free(buf);
-    return rc;
+    if (rc != 0) return rc;
+    if (payload_write_u32(fp, s->mtp_accept_gate_skip, err, errlen) != 0) return 1;
+    if (payload_write_bytes(fp, &s->mtp_accept_ewma, sizeof(s->mtp_accept_ewma), err, errlen) != 0) return 1;
+    if (payload_write_u32(fp, s->mtp_accept_samples, err, errlen) != 0) return 1;
+    return 0;
 #endif
 }
 
@@ -16333,10 +19712,11 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (payload_read_u32(fp, &h[i], &remaining, err, errlen) != 0) return 1;
     }
-    if (h[0] != DS4_SESSION_PAYLOAD_MAGIC || h[1] != DS4_SESSION_PAYLOAD_VERSION) {
+    if (h[0] != DS4_SESSION_PAYLOAD_MAGIC || h[1] == 0 || h[1] > DS4_SESSION_PAYLOAD_VERSION) {
         payload_set_err(err, errlen, "unsupported session payload version");
         return 1;
     }
+    const uint32_t payload_version = h[1];
     if (ds4_session_is_cpu(s)) {
         const uint32_t saved_ctx = h[2];
         const uint32_t saved_prefill_cap = h[3];
@@ -16460,6 +19840,18 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                 }
             }
         }
+        uint32_t mtp_gate_skip = 0;
+        double mtp_ewma = 0.0;
+        uint32_t mtp_samples = 0;
+        if (payload_version >= 2) {
+            if (payload_read_u32(fp, &mtp_gate_skip, &remaining, err, errlen) != 0 ||
+                payload_read_bytes(fp, &mtp_ewma, sizeof(mtp_ewma), &remaining, err, errlen) != 0 ||
+                payload_read_u32(fp, &mtp_samples, &remaining, err, errlen) != 0)
+            {
+                token_vec_free(&new_checkpoint);
+                return 1;
+            }
+        }
         if (remaining != 0) {
             token_vec_free(&new_checkpoint);
             payload_set_err(err, errlen, "KV checkpoint has trailing payload bytes");
@@ -16469,6 +19861,9 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         s->checkpoint = new_checkpoint;
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
+        s->mtp_accept_gate_skip = mtp_gate_skip;
+        s->mtp_accept_ewma = mtp_ewma;
+        s->mtp_accept_samples = mtp_samples;
         return 0;
     }
 #ifdef DS4_NO_GPU
@@ -16636,6 +20031,18 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         token_vec_free(&new_checkpoint);
         return 1;
     }
+    uint32_t mtp_gate_skip = 0;
+    double mtp_ewma = 0.0;
+    uint32_t mtp_samples = 0;
+    if (payload_version >= 2) {
+        if (payload_read_u32(fp, &mtp_gate_skip, &remaining, err, errlen) != 0 ||
+            payload_read_bytes(fp, &mtp_ewma, sizeof(mtp_ewma), &remaining, err, errlen) != 0 ||
+            payload_read_u32(fp, &mtp_samples, &remaining, err, errlen) != 0)
+        {
+            token_vec_free(&new_checkpoint);
+            return 1;
+        }
+    }
     if (remaining != 0) {
         token_vec_free(&new_checkpoint);
         payload_set_err(err, errlen, "KV checkpoint has trailing payload bytes");
@@ -16651,6 +20058,9 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
     g->mtp_n_raw = 0;
+    s->mtp_accept_gate_skip = mtp_gate_skip;
+    s->mtp_accept_ewma = mtp_ewma;
+    s->mtp_accept_samples = mtp_samples;
     return 0;
 #endif
 }
@@ -17261,8 +20671,65 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        if (!e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->model)) {
+#ifndef __APPLE__
+        const char *weight_ipc_manifest = getenv("DS4_CUDA_WEIGHT_IPC_MANIFEST");
+        if (weight_ipc_manifest && weight_ipc_manifest[0]) {
+            int weight_ipc_base = 1;
+            int weight_ipc_mtp = 1;
+            const char *weight_ipc_scope = getenv("DS4_CUDA_WEIGHT_IPC_SCOPE");
+            if (weight_ipc_scope && weight_ipc_scope[0]) {
+                if (!strcmp(weight_ipc_scope, "base")) {
+                    weight_ipc_mtp = 0;
+                } else if (!strcmp(weight_ipc_scope, "mtp")) {
+                    weight_ipc_base = 0;
+                } else if (strcmp(weight_ipc_scope, "both")) {
+                    fprintf(stderr, "ds4: invalid DS4_CUDA_WEIGHT_IPC_SCOPE=%s\n", weight_ipc_scope);
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
+            }
+            if (weight_ipc_base &&
+                !ds4_gpu_import_model_ipc_manifest(e->model.map,
+                                                   e->model.size,
+                                                   weight_ipc_manifest,
+                                                   "base"))
+            {
+                fprintf(stderr, "ds4: CUDA failed to import shared base weight cache\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            if (weight_ipc_mtp &&
+                e->mtp_ready &&
+                !ds4_gpu_import_model_ipc_manifest(e->mtp_model.map,
+                                                   e->mtp_model.size,
+                                                   weight_ipc_manifest,
+                                                   "mtp"))
+            {
+                fprintf(stderr, "ds4: CUDA failed to import shared MTP weight cache\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+        }
+#endif
+        // Pre-cache both main and MTP tensor spans into device memory at
+        // startup, so the first decode (or first MTP draft) doesn't pay a
+        // multi-second cudaMemcpy cost in the hot path.  The previous
+        // !e->mtp_ready guard skipped both pre-caches when MTP was loaded,
+        // which left the entire 3.6 GiB Q4_K MoE weight set to be copied
+        // synchronously on the first MTP routed_moe invocation.
+        if (!accelerator_cache_model_tensors(e->backend, &e->model)) {
             fprintf(stderr, "ds4: %s failed to prepare startup model cache\n",
+                    ds4_backend_name(e->backend));
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (e->mtp_ready &&
+            !accelerator_cache_model_tensors(e->backend, &e->mtp_model)) {
+            fprintf(stderr, "ds4: %s failed to prepare startup MTP model cache\n",
                     ds4_backend_name(e->backend));
             ds4_engine_close(e);
             *out = NULL;
@@ -17730,6 +21197,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
     const bool mtp_should_draft =
         probe_mtp && e->mtp_ready && s->mtp_logits &&
+        getenv("DS4_MTP_SPEC_DISABLE") == NULL &&
         (e->mtp_draft_tokens > 1 || mtp_probe_log);
     if (probe_mtp && s->mtp_draft_valid) {
         if (mtp_probe_log) {
@@ -17755,8 +21223,21 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     }
     token_vec_push(&s->checkpoint, token);
     if (mtp_should_draft) {
+        const bool preserve_target_frontier =
+            getenv("DS4_MTP_PRESERVE_TARGET_FRONTIER") != NULL;
+        ds4_spec_frontier target_frontier;
+        memset(&target_frontier, 0, sizeof(target_frontier));
+        bool have_target_frontier = false;
+        if (preserve_target_frontier) {
+            have_target_frontier = spec_frontier_snapshot(&target_frontier, s);
+        }
         int mtp_top = -1;
-        if (metal_graph_eval_mtp_draft(&s->graph,
+        ds4_gpu_top2_result mtp_top2;
+        memset(&mtp_top2, 0, sizeof(mtp_top2));
+        ds4_gpu_top2_result *mtp_top2_ptr =
+            getenv("DS4_CUDA_MTP_TOP2") && !getenv("DS4_MTP_FULL_LOGITS") ? &mtp_top2 : NULL;
+        bool draft_ok = (!preserve_target_frontier || have_target_frontier) &&
+            metal_graph_eval_mtp_draft(&s->graph,
                                        &e->model,
                                        &e->weights,
                                        &e->mtp_model,
@@ -17764,7 +21245,16 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                        token,
                                        (uint32_t)(s->checkpoint.len - 1),
                                        getenv("DS4_MTP_FULL_LOGITS") ? s->mtp_logits : NULL,
-                                       &mtp_top)) {
+                                       &mtp_top,
+                                       mtp_top2_ptr);
+        bool restored = !preserve_target_frontier;
+        if (preserve_target_frontier && have_target_frontier) {
+            const uint32_t mtp_n_raw_after = s->graph.mtp_n_raw;
+            restored = spec_frontier_restore(&target_frontier, s);
+            s->graph.mtp_n_raw = mtp_n_raw_after;
+            spec_frontier_free(&target_frontier);
+        }
+        if (draft_ok && restored) {
             s->mtp_draft_token = mtp_top >= 0 ? mtp_top : sample_argmax(s->mtp_logits, DS4_N_VOCAB);
             s->mtp_draft_valid = true;
         } else if (getenv("DS4_MTP_PROBE")) {
@@ -17778,6 +21268,164 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     return ds4_session_eval_internal(s, token, true, err, errlen);
 }
+
+/* MTP speculative-decoding helpers.  All callers live inside
+ * #ifndef DS4_NO_GPU regions (the CPU build stubs out
+ * ds4_session_eval_speculative_argmax to an empty body), so guard the
+ * helper definitions the same way to keep CPU builds warning-free. */
+#ifndef DS4_NO_GPU
+static void ds4_mtp_accept_trace(ds4_session *s,
+                                  const char *path,
+                                  int start,
+                                  int first_token,
+                                  const int *drafts,
+                                  int draft_n,
+                                  int accepted_total) {
+    if (getenv("DS4_MTP_ACCEPT_TRACE") == NULL &&
+        getenv("DS4_TOKEN_TRACE") == NULL) {
+        return;
+    }
+
+    const int next_top = s && s->logits ? sample_argmax(s->logits, DS4_N_VOCAB) : -1;
+    fprintf(stderr,
+            "ds4: mtp accept trace path=%s start=%d first=%d drafted=%d "
+            "accepted=%d checkpoint=%d next_top=%d mtp_valid=%d mtp_draft=%d drafts=",
+            path ? path : "?",
+            start,
+            first_token,
+            draft_n,
+            accepted_total,
+            s ? s->checkpoint.len : -1,
+            next_top,
+            s && s->mtp_draft_valid ? 1 : 0,
+            s ? s->mtp_draft_token : -1);
+    if (drafts && draft_n > 0) {
+        for (int i = 0; i < draft_n; i++) {
+            fprintf(stderr, "%s%d", i == 0 ? "" : ",", drafts[i]);
+        }
+    } else {
+        fprintf(stderr, "-");
+    }
+    fprintf(stderr, "\n");
+}
+
+static float ds4_env_float_default(const char *name, float fallback) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return fallback;
+    char *end = NULL;
+    float v = strtof(env, &end);
+    return end != env ? v : fallback;
+}
+
+static uint32_t ds4_env_u32_default(const char *name, uint32_t fallback) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return fallback;
+    char *end = NULL;
+    unsigned long v = strtoul(env, &end, 10);
+    if (end == env || v > UINT32_MAX) return fallback;
+    return (uint32_t)v;
+}
+
+static bool ds4_mtp_accept_gate_enabled(void) {
+    if (getenv("DS4_MTP_NO_ACCEPT_GATE") != NULL) return false;
+    if (getenv("DS4_MTP_ACCEPT_GATE") != NULL) return true;
+    return getenv("DS4_MTP_NONEXACT_FAST") == NULL;
+}
+
+static bool ds4_mtp_accept_gate_should_skip(ds4_session *s) {
+    if (!s || !ds4_mtp_accept_gate_enabled()) return false;
+
+    if (s->mtp_accept_gate_skip > 0) {
+        s->mtp_accept_gate_skip--;
+        if (getenv("DS4_MTP_ACCEPT_GATE_LOG")) {
+            fprintf(stderr,
+                    "ds4: mtp accept gate skip remaining=%u ewma=%.3f samples=%u\n",
+                    s->mtp_accept_gate_skip,
+                    s->mtp_accept_ewma,
+                    s->mtp_accept_samples);
+        }
+        return true;
+    }
+
+    const uint32_t warmup = ds4_env_u32_default("DS4_MTP_ACCEPT_GATE_WARMUP", 8u);
+    if (s->mtp_accept_samples < warmup) return false;
+
+    const float min_accept = ds4_env_float_default("DS4_MTP_ACCEPT_GATE_MIN", 0.90f);
+    if (s->mtp_accept_ewma >= (double)min_accept) return false;
+
+    const uint32_t cooldown = ds4_env_u32_default("DS4_MTP_ACCEPT_GATE_COOLDOWN", 8u);
+    s->mtp_accept_gate_skip = cooldown;
+    if (getenv("DS4_MTP_ACCEPT_GATE_LOG")) {
+        fprintf(stderr,
+                "ds4: mtp accept gate arm cooldown=%u ewma=%.3f min=%.3f samples=%u\n",
+                cooldown,
+                s->mtp_accept_ewma,
+                min_accept,
+                s->mtp_accept_samples);
+    }
+    return true;
+}
+
+static bool ds4_mtp_exact_policy_use_seq(ds4_session *s) {
+    if (getenv("DS4_MTP_EXACT_DECODE2") != NULL) return false;
+    if (getenv("DS4_MTP_EXACT_SEQ_VERIFY") != NULL) return true;
+    if (getenv("DS4_MTP_NO_EXACT_ADAPTIVE") != NULL) return true;
+    if (getenv("DS4_MTP_DECODE2_BATCH_FFN_BODY") != NULL &&
+        getenv("DS4_MTP_DECODE2_STATE_BARRIER") != NULL &&
+        getenv("DS4_MTP_DECODE2_NO_STATE_BARRIER") == NULL) {
+        return false;
+    }
+    if (!s) return true;
+
+    const uint32_t warmup = ds4_env_u32_default("DS4_MTP_EXACT_DECODE2_WARMUP", 8u);
+    if (s->mtp_accept_samples < warmup) return true;
+
+    /*
+     * Decode2 wins only when two-draft acceptance is very high: it avoids the
+     * second sequential target pass on full accepts, but wastes row1 work on
+     * partial accepts.  Keep the default conservative so low-acceptance prose
+     * stays on the cheaper sequential exact verifier.
+     */
+    const float min_accept = ds4_env_float_default("DS4_MTP_EXACT_DECODE2_MIN_ACCEPT", 0.90f);
+    const bool use_seq = s->mtp_accept_ewma < (double)min_accept;
+    if (getenv("DS4_MTP_EXACT_POLICY_LOG")) {
+        fprintf(stderr,
+                "ds4: mtp exact policy verifier=%s ewma=%.3f min_decode2=%.3f samples=%u\n",
+                use_seq ? "seq" : "decode2",
+                s->mtp_accept_ewma,
+                min_accept,
+                s->mtp_accept_samples);
+    }
+    return use_seq;
+}
+
+static void ds4_mtp_accept_gate_record(ds4_session *s,
+                                       int accepted_drafts,
+                                       int proposed_drafts) {
+    if (!s || proposed_drafts <= 0) return;
+    if (accepted_drafts < 0) accepted_drafts = 0;
+    if (accepted_drafts > proposed_drafts) accepted_drafts = proposed_drafts;
+
+    const double sample = (double)accepted_drafts / (double)proposed_drafts;
+    const float alpha_f = ds4_env_float_default("DS4_MTP_ACCEPT_GATE_ALPHA", 0.125f);
+    double alpha = (double)alpha_f;
+    if (alpha <= 0.0 || alpha > 1.0) alpha = 0.125;
+
+    if (s->mtp_accept_samples == 0) s->mtp_accept_ewma = sample;
+    else s->mtp_accept_ewma = s->mtp_accept_ewma * (1.0 - alpha) + sample * alpha;
+    s->mtp_accept_samples++;
+
+    if (getenv("DS4_MTP_ACCEPT_GATE_LOG") || getenv("DS4_MTP_EXACT_POLICY_LOG")) {
+        fprintf(stderr,
+                "ds4: mtp accept stats accepted=%d proposed=%d sample=%.3f ewma=%.3f samples=%u\n",
+                accepted_drafts,
+                proposed_drafts,
+                sample,
+                s->mtp_accept_ewma,
+                s->mtp_accept_samples);
+    }
+}
+#endif /* DS4_NO_GPU */
 
 /* Speculative decode state machine:
  * 1. commit the normal target token and use its logits to validate draft[0];
@@ -17807,6 +21455,53 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
     ds4_engine *e = s->engine;
 
+    const bool mtp_timing = getenv("DS4_MTP_TIMING") != NULL;
+    const double cycle_t0 = mtp_timing ? now_sec() : 0.0;
+    const bool batch_first_enabled = getenv("DS4_MTP_BATCH_FIRST") != NULL;
+    const bool batch_first_seed_batch_rows =
+        getenv("DS4_MTP_BATCH_FIRST_SEED_BATCH_ROWS") != NULL;
+    bool reuse_batch_first_seed = false;
+
+    if (ds4_mtp_accept_gate_should_skip(s)) {
+        const int cycle_start = s->checkpoint.len;
+        if (ds4_session_eval_internal(s, first_token, false, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        if (mtp_timing) {
+            fprintf(stderr,
+                    "ds4: mtp timing cycle path=base-only reason=accept-gate committed=1 "
+                    "target=%.3f ms total=%.3f ms\n",
+                    (now_sec() - cycle_t0) * 1000.0,
+                    (now_sec() - cycle_t0) * 1000.0);
+        }
+        ds4_mtp_accept_trace(s, "base-only:accept-gate", cycle_start,
+                             first_token, NULL, 0, 1);
+        return 1;
+    }
+
+    if (batch_first_enabled &&
+        e->mtp_ready &&
+        e->mtp_draft_tokens >= 3 &&
+        s->mtp_draft_valid &&
+        s->mtp_draft_token == first_token &&
+        first_token != eos_token &&
+        max_tokens >= 3 &&
+        accepted_cap >= 3 &&
+        s->ctx_size - s->checkpoint.len >= 3)
+    {
+        const int n = ds4_session_eval_speculative_batch_first3(s,
+                                                                first_token,
+                                                                eos_token,
+                                                                accepted,
+                                                                accepted_cap,
+                                                                err,
+                                                                errlen,
+                                                                cycle_t0,
+                                                                mtp_timing);
+        if (n > 0) return n;
+        if (n == DS4_MTP_BATCH_FIRST_FALLBACK_REUSE) reuse_batch_first_seed = true;
+        else if (n < 0) return n;
+    }
+
     /*
      * MTP in DeepSeek V4 is a speculative drafter, not a replacement sampler.
      * The target model still defines the exact output stream.  A cycle starts
@@ -17815,25 +21510,67 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
      * several proposed positions together; running ordinary decode once per
      * draft token is correctness-safe but cannot be faster than baseline.
      */
-    if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+    const int cycle_start = s->checkpoint.len;
+    if (ds4_session_eval_internal(s, first_token, !reuse_batch_first_seed, err, errlen) != 0) return -1;
+    const double target_done = mtp_timing ? now_sec() : 0.0;
     int n_accept = 0;
     accepted[n_accept++] = first_token;
-    if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
+    if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) {
+        if (mtp_timing) {
+            fprintf(stderr,
+                    "ds4: mtp timing cycle path=base-only reason=limit-or-eos committed=1 "
+                    "target=%.3f ms total=%.3f ms\n",
+                    (target_done - cycle_t0) * 1000.0,
+                    (now_sec() - cycle_t0) * 1000.0);
+        }
+        ds4_mtp_accept_trace(s, "base-only:limit-or-eos", cycle_start,
+                             first_token, NULL, 0, n_accept);
+        return n_accept;
+    }
 
-    if (!e->mtp_ready || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) return n_accept;
+    if (!e->mtp_ready || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) {
+        if (mtp_timing) {
+            fprintf(stderr,
+                    "ds4: mtp timing cycle path=base-only reason=mtp-unavailable committed=1 "
+                    "target=%.3f ms total=%.3f ms\n",
+                    (target_done - cycle_t0) * 1000.0,
+                    (now_sec() - cycle_t0) * 1000.0);
+        }
+        ds4_mtp_accept_trace(s, "base-only:mtp-unavailable", cycle_start,
+                             first_token, NULL, 0, n_accept);
+        return n_accept;
+    }
 
     int draft_cap = e->mtp_draft_tokens;
     if (draft_cap > max_tokens - n_accept) draft_cap = max_tokens - n_accept;
     if (draft_cap > accepted_cap - n_accept) draft_cap = accepted_cap - n_accept;
     int room = s->ctx_size - s->checkpoint.len;
     if (draft_cap > room - 1) draft_cap = room - 1;
-    if (draft_cap <= 0) return n_accept;
+    if (draft_cap <= 0) {
+        if (mtp_timing) {
+            fprintf(stderr,
+                    "ds4: mtp timing cycle path=base-only reason=no-draft-room committed=1 "
+                    "target=%.3f ms total=%.3f ms\n",
+                    (target_done - cycle_t0) * 1000.0,
+                    (now_sec() - cycle_t0) * 1000.0);
+        }
+        ds4_mtp_accept_trace(s, "base-only:no-draft-room", cycle_start,
+                             first_token, NULL, 0, n_accept);
+        return n_accept;
+    }
 
     int drafts[16];
     int draft_n = 1;
     drafts[0] = s->mtp_draft_token;
     s->mtp_draft_valid = false;
-    const bool strict_mtp = e->quality || getenv("DS4_MTP_STRICT") != NULL;
+    /* Default MTP must preserve the no-MTP greedy stream.  The old top2
+     * micro-verifier remains useful for profiling, but it can drift on prose
+     * prompts and therefore requires an explicit non-exact opt-in. */
+    const bool nonexact_fast_mtp = getenv("DS4_MTP_NONEXACT_FAST") != NULL;
+    const bool strict_mtp =
+        e->quality ||
+        getenv("DS4_MTP_STRICT") != NULL ||
+        !nonexact_fast_mtp;
     float mtp_margin_threshold = e->mtp_margin;
     const char *mtp_margin_env = getenv("DS4_MTP_MIN_MARGIN");
     if (mtp_margin_env && mtp_margin_env[0]) {
@@ -17841,15 +21578,19 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         float v = strtof(mtp_margin_env, &end);
         if (end != mtp_margin_env && v >= 0.0f) mtp_margin_threshold = v;
     }
-    const bool mtp_timing = getenv("DS4_MTP_TIMING") != NULL;
     const bool mtp_conf_log = getenv("DS4_MTP_CONF_LOG") != NULL;
-    const bool mtp_need_logits = mtp_conf_log ||
+    const bool mtp_fast_top2 =
+        getenv("DS4_CUDA_MTP_TOP2") != NULL &&
+        getenv("DS4_MTP_FULL_LOGITS") == NULL;
+    const bool mtp_need_logits = (!mtp_fast_top2 && mtp_conf_log) ||
         getenv("DS4_MTP_FULL_LOGITS") != NULL ||
-        (!strict_mtp && mtp_margin_threshold > 0.0f);
+        (!mtp_fast_top2 && !strict_mtp && mtp_margin_threshold > 0.0f);
     const double mtp_t0 = mtp_timing ? now_sec() : 0.0;
     double mtp_t_after_draft = mtp_t0;
     float mtp_last_margin = 0.0f;
     int mtp_last_top0 = -1, mtp_last_top1 = -1;
+    ds4_gpu_top2_result mtp_last_top2;
+    memset(&mtp_last_top2, 0, sizeof(mtp_last_top2));
 
     /*
      * The first proposed token is verified for free: ds4_session_eval() just
@@ -17861,26 +21602,42 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         if (getenv("DS4_MTP_SPEC_LOG")) {
             fprintf(stderr, "ds4: mtp spec miss first draft=%d\n", drafts[0]);
         }
+        if (mtp_timing) {
+            fprintf(stderr,
+                    "ds4: mtp timing cycle path=first-miss drafted=1 committed=1 "
+                    "target=%.3f ms total=%.3f ms\n",
+                    (target_done - cycle_t0) * 1000.0,
+                    (now_sec() - cycle_t0) * 1000.0);
+        }
+        ds4_mtp_accept_gate_record(s, 0, draft_n);
+        ds4_mtp_accept_trace(s, "first-miss", cycle_start,
+                             first_token, drafts, draft_n, n_accept);
         return n_accept;
     }
     if (drafts[0] == eos_token) draft_cap = 1;
-    const uint32_t mtp_base_raw = s->graph.mtp_n_raw;
+    ds4_mtp_state_txn mtp_txn;
+    mtp_state_txn_begin(&mtp_txn, s);
     /*
      * MTP has its own raw SWA cache. Recursive drafting writes speculative
      * future rows into it; after verification, rows beyond the accepted prefix
      * must become invisible.  We do not copy/rollback the cache body because the
      * next draft attempt will overwrite future slots.  A counter is enough.
      */
-#define DS4_MTP_KEEP_ACCEPTED(n_) do { \
-        uint32_t keep_ = mtp_base_raw + (uint32_t)(n_); \
-        if (keep_ > s->graph.raw_window) keep_ = s->graph.raw_window; \
-        s->graph.mtp_n_raw = keep_; \
-    } while (0)
-
+    ds4_spec_frontier draft_frontier;
+    memset(&draft_frontier, 0, sizeof(draft_frontier));
+    bool have_draft_frontier = false;
+    const bool preserve_target_frontier =
+        getenv("DS4_MTP_PRESERVE_TARGET_FRONTIER") != NULL;
+    if (preserve_target_frontier && draft_cap > 1) {
+        have_draft_frontier = spec_frontier_snapshot(&draft_frontier, s);
+        if (!have_draft_frontier) return n_accept;
+    }
     for (; draft_n < draft_cap; draft_n++) {
         ds4_gpu_tensor *prev_hc = (draft_n & 1) ? s->graph.mtp_state_hc : s->graph.mtp_next_hc;
         ds4_gpu_tensor *out_hc = (draft_n & 1) ? s->graph.mtp_next_hc : s->graph.mtp_state_hc;
         int mtp_top = -1;
+        ds4_gpu_top2_result mtp_top2;
+        memset(&mtp_top2, 0, sizeof(mtp_top2));
         if (!metal_graph_eval_mtp_draft_from_hc(&s->graph,
                                                 &e->model,
                                                 &e->weights,
@@ -17891,17 +21648,40 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                 drafts[draft_n - 1],
                                                 (uint32_t)(s->checkpoint.len + draft_n - 1),
                                                 mtp_need_logits ? s->mtp_logits : NULL,
-                                                &mtp_top))
+                                                &mtp_top,
+                                                mtp_fast_top2 ? &mtp_top2 : NULL))
         {
+            if (have_draft_frontier) {
+                const uint32_t mtp_n_raw_after_draft = s->graph.mtp_n_raw;
+                (void)spec_frontier_restore(&draft_frontier, s);
+                s->graph.mtp_n_raw = mtp_n_raw_after_draft;
+                spec_frontier_free(&draft_frontier);
+            }
             return n_accept;
         }
+        if (mtp_fast_top2) mtp_last_top2 = mtp_top2;
         drafts[draft_n] = mtp_top >= 0 ? mtp_top : sample_argmax(s->mtp_logits, DS4_N_VOCAB);
         if (drafts[draft_n] == eos_token) {
             draft_n++;
             break;
         }
     }
-    if (mtp_conf_log && draft_n > 1) {
+    if (have_draft_frontier) {
+        const uint32_t mtp_n_raw_after_draft = s->graph.mtp_n_raw;
+        if (!spec_frontier_restore(&draft_frontier, s)) {
+            spec_frontier_free(&draft_frontier);
+            snprintf(err, errlen, "MTP draft frontier restore failed");
+            s->checkpoint_valid = false;
+            return -1;
+        }
+        s->graph.mtp_n_raw = mtp_n_raw_after_draft;
+        spec_frontier_free(&draft_frontier);
+    }
+    if (mtp_fast_top2 && draft_n > 1 && mtp_last_top2.id0 != UINT32_MAX) {
+        mtp_last_top0 = (int)mtp_last_top2.id0;
+        mtp_last_top1 = (int)mtp_last_top2.id1;
+        mtp_last_margin = mtp_last_top2.value0 - mtp_last_top2.value1;
+    } else if (mtp_conf_log && draft_n > 1) {
         float v0 = 0.0f, v1 = 0.0f;
         logits_top2(s->mtp_logits, DS4_N_VOCAB, &mtp_last_top0, &v0, &mtp_last_top1, &v1);
         mtp_last_margin = v0 - v1;
@@ -17909,7 +21689,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     if (mtp_timing) mtp_t_after_draft = now_sec();
 
     if (!strict_mtp && draft_n == 2 && mtp_margin_threshold > 0.0f) {
-        if (!mtp_conf_log) {
+        if (!mtp_fast_top2 && !mtp_conf_log) {
             float v0 = 0.0f, v1 = 0.0f;
             logits_top2(s->mtp_logits, DS4_N_VOCAB, &mtp_last_top0, &v0, &mtp_last_top1, &v1);
             mtp_last_margin = v0 - v1;
@@ -17936,31 +21716,114 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             accepted[n_accept++] = drafts[0];
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
-            DS4_MTP_KEEP_ACCEPTED(1);
+            mtp_state_txn_commit_suffix(s, &mtp_txn, 1);
+            if (batch_first_enabled) {
+                (void)mtp_seed_next_from_target_hc(s,
+                                                   s->graph.cur_hc,
+                                                   drafts[0],
+                                                   (uint32_t)start);
+            }
             if (mtp_timing) {
                 const double done = now_sec();
                 fprintf(stderr,
-                        "ds4: mtp timing margin-skip drafted=2 committed=1 margin=%.3f threshold=%.3f draft=%.3f ms verify=%.3f ms total=%.3f ms\n",
+                        "ds4: mtp timing margin-skip drafted=2 committed=1 margin=%.3f threshold=%.3f "
+                        "target=%.3f ms draft=%.3f ms verify=%.3f ms spec=%.3f ms total=%.3f ms\n",
                         mtp_last_margin,
                         mtp_margin_threshold,
+                        (target_done - cycle_t0) * 1000.0,
                         (mtp_t_after_draft - mtp_t0) * 1000.0,
                         (done - verify_t0) * 1000.0,
-                        (done - mtp_t0) * 1000.0);
+                        (done - mtp_t0) * 1000.0,
+                        (done - cycle_t0) * 1000.0);
             }
+            ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n);
+            ds4_mtp_accept_trace(s, "margin-skip", cycle_start,
+                                 first_token, drafts, draft_n, n_accept);
             return n_accept;
         }
     }
 
     /*
-     * The useful N=2 verifier is the tiny batch path: it verifies two target
-     * positions in one layer-major pass and commits prefix-1 directly on a
-     * partial accept.  Like the rest of the non-quality Metal path, it may pick
-     * a different greedy token when batched reductions perturb nearly-tied
-     * logits.  --quality / DS4_MTP_STRICT selects the exact decode verifier,
-     * which preserves the one-token target stream but is not a speed win.
+     * The default exact verifier policy chooses between two exact target
+     * verifiers.  Sequential replay is cheaper on partial accepts because it
+     * stops after one accepted suffix token; decode2 is cheaper only when
+     * two-token acceptance is consistently high enough to amortize row1 work.
+     * DS4_MTP_EXACT_DECODE2 and DS4_MTP_EXACT_SEQ_VERIFY keep both policies
+     * force-selectable for profiling.
      */
+    const bool exact_policy_use_seq = ds4_mtp_exact_policy_use_seq(s);
+    const bool use_exact_seq =
+        draft_n == 2 &&
+        strict_mtp &&
+        getenv("DS4_MTP_BATCH_VERIFY") == NULL &&
+        exact_policy_use_seq;
     const bool use_decode2_exact =
-        draft_n == 2 && strict_mtp && getenv("DS4_MTP_BATCH_VERIFY") == NULL;
+        draft_n == 2 &&
+        strict_mtp &&
+        getenv("DS4_MTP_BATCH_VERIFY") == NULL &&
+        !use_exact_seq;
+    if (use_exact_seq) {
+        int verified = 0;
+        int target_top = sample_argmax(s->logits, DS4_N_VOCAB);
+        bool logits_on_host = true;
+        const double seq_t0 = mtp_timing ? now_sec() : 0.0;
+        bool ok = true;
+        for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
+            if (target_top != drafts[i]) break;
+            ds4_gpu_set_mtp_verifier(1);  /* Bug 2 / Option D */
+            ok = metal_graph_eval_token_raw_swa_top(&s->graph,
+                                                    &e->model,
+                                                    &e->weights,
+                                                    drafts[i],
+                                                    (uint32_t)s->checkpoint.len,
+                                                    &target_top,
+                                                    NULL);
+            ds4_gpu_set_mtp_verifier(0);
+            if (!ok) break;
+            token_vec_push(&s->checkpoint, drafts[i]);
+            logits_on_host = false;
+            accepted[n_accept++] = drafts[i];
+            verified++;
+            if (drafts[i] == eos_token) break;
+        }
+        if (ok && verified > 0 && !logits_on_host) {
+            ok = ds4_gpu_tensor_read(s->graph.logits,
+                                     0,
+                                     s->logits,
+                                     (uint64_t)DS4_N_VOCAB * sizeof(s->logits[0])) != 0;
+        }
+        if (!ok) {
+            snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
+            s->checkpoint_valid = false;
+            return -1;
+        }
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        mtp_state_txn_keep_accepted(s, &mtp_txn, verified);
+        if (batch_first_enabled && verified > 0) {
+            (void)mtp_seed_next_from_target_hc(s,
+                                               s->graph.cur_hc,
+                                               drafts[verified - 1],
+                                               (uint32_t)(s->checkpoint.len - 1));
+        }
+        if (mtp_timing) {
+            const double done = now_sec();
+            fprintf(stderr,
+                    "ds4: mtp timing exact_seq drafted=%d verified=%d target=%.3f ms draft=%.3f ms "
+                    "verify=%.3f ms spec=%.3f ms total=%.3f ms\n",
+                    draft_n,
+                    verified,
+                    (target_done - cycle_t0) * 1000.0,
+                    (mtp_t_after_draft - mtp_t0) * 1000.0,
+                    (done - seq_t0) * 1000.0,
+                    (done - mtp_t0) * 1000.0,
+                    (done - cycle_t0) * 1000.0);
+        }
+        ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n);
+        ds4_mtp_accept_trace(s, "exact-seq", cycle_start,
+                             first_token, drafts, draft_n, n_accept);
+        return n_accept;
+    }
     if (use_decode2_exact) {
         ds4_spec_frontier frontier;
         memset(&frontier, 0, sizeof(frontier));
@@ -17973,15 +21836,18 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         const double snapshot_done = mtp_timing ? now_sec() : 0.0;
         bool ok = have_frontier;
         if (ok) {
+            ds4_gpu_set_mtp_verifier(1);  /* Bug 2 / Option D */
             ok = metal_graph_verify_decode2_exact(&s->graph,
                                                   &e->model,
                                                   &e->weights,
+                                                  e->backend,
                                                   drafts[0],
                                                   drafts[1],
                                                   (uint32_t)start,
                                                   &row0_top,
                                                   row0_logits,
                                                   row_logits);
+            ds4_gpu_set_mtp_verifier(0);
         }
         const double verify_done = mtp_timing ? now_sec() : 0.0;
         if (ok && row0_top == drafts[1]) {
@@ -17992,18 +21858,27 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             if (n_accept < accepted_cap) accepted[n_accept++] = drafts[1];
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
-            DS4_MTP_KEEP_ACCEPTED(2);
+            mtp_state_txn_commit_suffix(s, &mtp_txn, 2);
+            if (batch_first_enabled && batch_first_seed_batch_rows) {
+                (void)mtp_seed_next_from_batch_row(s, 1u, drafts[1], (uint32_t)start + 1u);
+            }
             if (mtp_timing) {
                 fprintf(stderr,
-                        "ds4: mtp timing decode2 drafted=2 committed=2 draft=%.3f ms snapshot=%.3f ms verify=%.3f ms total=%.3f ms\n",
+                        "ds4: mtp timing decode2 drafted=2 committed=2 target=%.3f ms draft=%.3f ms "
+                        "snapshot=%.3f ms verify=%.3f ms spec=%.3f ms total=%.3f ms\n",
+                        (target_done - cycle_t0) * 1000.0,
                         (mtp_t_after_draft - mtp_t0) * 1000.0,
                         (snapshot_done - snapshot_t0) * 1000.0,
                         (verify_done - snapshot_done) * 1000.0,
-                        (now_sec() - mtp_t0) * 1000.0);
+                        (now_sec() - mtp_t0) * 1000.0,
+                        (now_sec() - cycle_t0) * 1000.0);
             }
             spec_frontier_free(&frontier);
             free(row0_logits);
             free(row_logits);
+            ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n);
+            ds4_mtp_accept_trace(s, "decode2", cycle_start,
+                                 first_token, drafts, draft_n, n_accept);
             return n_accept;
         }
 
@@ -18017,20 +21892,29 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             accepted[n_accept++] = drafts[0];
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
-            DS4_MTP_KEEP_ACCEPTED(1);
+            mtp_state_txn_commit_suffix(s, &mtp_txn, 1);
+            if (batch_first_enabled && batch_first_seed_batch_rows) {
+                (void)mtp_seed_next_from_batch_row(s, 0u, drafts[0], (uint32_t)start);
+            }
             if (mtp_timing) {
                 const double replay_done = now_sec();
                 fprintf(stderr,
-                        "ds4: mtp timing decode2 drafted=2 committed=1 draft=%.3f ms snapshot=%.3f ms verify=%.3f ms prefix=%.3f ms total=%.3f ms\n",
+                        "ds4: mtp timing decode2 drafted=2 committed=1 target=%.3f ms draft=%.3f ms "
+                        "snapshot=%.3f ms verify=%.3f ms prefix=%.3f ms spec=%.3f ms total=%.3f ms\n",
+                        (target_done - cycle_t0) * 1000.0,
                         (mtp_t_after_draft - mtp_t0) * 1000.0,
                         (snapshot_done - snapshot_t0) * 1000.0,
                         (verify_done - snapshot_done) * 1000.0,
                         (replay_done - verify_done) * 1000.0,
-                        (replay_done - mtp_t0) * 1000.0);
+                        (replay_done - mtp_t0) * 1000.0,
+                        (replay_done - cycle_t0) * 1000.0);
             }
             spec_frontier_free(&frontier);
             free(row0_logits);
             free(row_logits);
+            ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n);
+            ds4_mtp_accept_trace(s, "decode2", cycle_start,
+                                 first_token, drafts, draft_n, n_accept);
             return n_accept;
         }
         if (have_frontier) {
@@ -18052,6 +21936,10 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         int *row_tops = xmalloc((size_t)draft_n * sizeof(row_tops[0]));
         float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
         const int start = s->checkpoint.len;
+        ds4_mtp_verify_plan verify_plan;
+        ds4_mtp_verify_result verify_result;
+        mtp_verify_plan_init(&verify_plan, (uint32_t)start, drafts, draft_n);
+        mtp_verify_result_init(&verify_result);
         /*
          * The production MTP depth is two.  Prefix-1 capture makes partial
          * accepts cheap, but it copies per-layer compressor frontiers even when
@@ -18063,13 +21951,54 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         const bool capture_prefix1 =
             draft_n == 2 && (!strict_mtp || getenv("DS4_MTP_CAPTURE_PREFIX1") != NULL);
         const bool exact_replay_debug = getenv("DS4_MTP_EXACT_REPLAY") != NULL;
+        const bool shadow_b_n2_q8 =
+            draft_n == 2 &&
+            getenv("DS4_CUDA_MTP_SHADOW_B_N2_Q8") != NULL &&
+            getenv("DS4_CUDA_MTP_VERIFY_TOP2") != NULL &&
+            getenv("DS4_CUDA_MTP_TOP2") != NULL;
+        const bool shadow_exact_decode2 =
+            draft_n == 2 &&
+            getenv("DS4_MTP_SHADOW_EXACT_DECODE2") != NULL;
+        const bool shadow_v2_decode3 =
+            draft_n >= 3 &&
+            getenv("DS4_MTP_VERIFY_V2_SHADOW") != NULL;
+        const bool verify_v2_decode3 =
+            draft_n == 3 &&
+            (getenv("DS4_MTP_VERIFY_V2") != NULL || batch_first_enabled);
         const bool snapshot_required =
             draft_n > 2 ||
             (draft_n == 2 && (!capture_prefix1 || exact_replay_debug)) ||
+            shadow_b_n2_q8 ||
+            shadow_exact_decode2 ||
             getenv("DS4_MTP_FORCE_SNAPSHOT") != NULL;
         bool have_frontier = false;
         bool ok = true;
         bool verifier_may_have_mutated = false;
+        int precomputed_commit_drafts = 0;
+        bool have_precomputed_logits = false;
+        bool shadow_have = false;
+        bool shadow_ok = false;
+        int shadow_row0_top = -1;
+        int shadow_commit_drafts = 0;
+        ds4_gpu_top2_result shadow_top2;
+        memset(&shadow_top2, 0, sizeof(shadow_top2));
+        ds4_gpu_top2_result exact_top2;
+        memset(&exact_top2, 0, sizeof(exact_top2));
+        bool shadow_exact_have = false;
+        bool shadow_exact_ok = false;
+        int shadow_exact_row0_top = -1;
+        int shadow_exact_commit_drafts = 0;
+        int shadow_exact_logit_top = -1;
+        float shadow_exact_logit_margin = 0.0f;
+        float *shadow_logits = shadow_b_n2_q8
+            ? xmalloc((size_t)DS4_N_VOCAB * sizeof(shadow_logits[0]))
+            : NULL;
+        float *shadow_exact_logits0 = shadow_exact_decode2
+            ? xmalloc((size_t)DS4_N_VOCAB * sizeof(shadow_exact_logits0[0]))
+            : NULL;
+        float *shadow_exact_logits1 = shadow_exact_decode2
+            ? xmalloc((size_t)DS4_N_VOCAB * sizeof(shadow_exact_logits1[0]))
+            : NULL;
         const double snapshot_t0 = mtp_timing ? now_sec() : 0.0;
         if (snapshot_required) {
             have_frontier = spec_frontier_snapshot(&frontier, s);
@@ -18079,22 +22008,248 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         if (ok) {
             for (int i = 0; i < draft_n; i++) token_vec_push(&s->checkpoint, drafts[i]);
             verifier_may_have_mutated = true;
-            ok = metal_graph_verify_suffix_tops(&s->graph,
-                                                &e->model,
-                                                &e->weights,
-                                                &s->checkpoint,
-                                                (uint32_t)start,
-                                                (uint32_t)draft_n,
-                                                capture_prefix1,
-                                                row_tops,
-                                                NULL);
+            if (shadow_v2_decode3 && have_frontier) {
+                ds4_mtp_verify_result v2_shadow;
+                mtp_verify_result_init(&v2_shadow);
+                ds4_gpu_set_mtp_verifier(1);  /* Bug 2 / Option D */
+                bool v2_ok = metal_graph_verify_decode3_top2_output(&s->graph,
+                                                                     &e->model,
+                                                                     &e->weights,
+                                                                     &s->checkpoint,
+                                                                     &verify_plan,
+                                                                     &v2_shadow,
+                                                                     NULL);
+                ds4_gpu_set_mtp_verifier(0);
+                fprintf(stderr,
+                        "ds4: mtp shadow verify_v2_decode3 ok=%d committed=%d row0=%d row1=%d "
+                        "draft1=%d draft2=%d margin0=%.6f margin1=%.6f\n",
+                        v2_ok ? 1 : 0,
+                        v2_shadow.commit_tokens,
+                        v2_shadow.row_top[0],
+                        v2_shadow.row_top[1],
+                        verify_plan.token[1],
+                        verify_plan.token[2],
+                        v2_shadow.row_top2[0].value0 - v2_shadow.row_top2[0].value1,
+                        v2_shadow.row_top2[1].value0 - v2_shadow.row_top2[1].value1);
+                s->checkpoint.len = start + draft_n;
+                ok = spec_frontier_restore(&frontier, s);
+            }
+            if (shadow_b_n2_q8 && have_frontier) {
+                shadow_have = true;
+                ds4_gpu_set_attention_output_b_n2_q8_override(1);
+                ds4_gpu_set_mtp_verifier(1);  /* Bug 2 / Option D */
+                shadow_ok = metal_graph_verify_decode2_top2_output(&s->graph,
+                                                                    &e->model,
+                                                                    &e->weights,
+                                                                    &s->checkpoint,
+                                                                    (uint32_t)start,
+                                                                    drafts[1],
+                                                                    capture_prefix1,
+                                                                    &shadow_row0_top,
+                                                                    &shadow_commit_drafts,
+                                                                    row_logits,
+                                                                    &shadow_top2);
+                ds4_gpu_set_mtp_verifier(0);
+                if (shadow_ok && shadow_logits) {
+                    memcpy(shadow_logits, row_logits,
+                           (size_t)DS4_N_VOCAB * sizeof(shadow_logits[0]));
+                }
+                ds4_gpu_set_attention_output_b_n2_q8_override(0);
+                s->checkpoint.len = start + draft_n;
+                ok = spec_frontier_restore(&frontier, s);
+            }
+            if (shadow_exact_decode2 && have_frontier) {
+                shadow_exact_have = true;
+                ds4_gpu_set_mtp_verifier(1);  /* Bug 2 / Option D */
+                shadow_exact_ok = metal_graph_verify_decode2_exact(&s->graph,
+                                                                   &e->model,
+                                                                   &e->weights,
+                                                                   e->backend,
+                                                                   drafts[0],
+                                                                   drafts[1],
+                                                                   (uint32_t)start,
+                                                                   &shadow_exact_row0_top,
+                                                                   shadow_exact_logits0,
+                                                                   shadow_exact_logits1);
+                ds4_gpu_set_mtp_verifier(0);
+                if (shadow_exact_ok) {
+                    shadow_exact_commit_drafts =
+                        shadow_exact_row0_top == drafts[1] ? 2 : 1;
+                    float *exact_logits = shadow_exact_commit_drafts == 2
+                        ? shadow_exact_logits1
+                        : shadow_exact_logits0;
+                    int t0 = -1, t1 = -1;
+                    float v0 = 0.0f, v1 = 0.0f;
+                    logits_top2(exact_logits, DS4_N_VOCAB, &t0, &v0, &t1, &v1);
+                    shadow_exact_logit_top = t0;
+                    shadow_exact_logit_margin = v0 - v1;
+                }
+                s->checkpoint.len = start + draft_n;
+                ok = spec_frontier_restore(&frontier, s);
+            }
+            if (ok && verify_v2_decode3) {
+                ds4_gpu_set_mtp_verifier(1);  /* Bug 2 / Option D */
+                ok = metal_graph_verify_decode3_top2_output(&s->graph,
+                                                            &e->model,
+                                                            &e->weights,
+                                                            &s->checkpoint,
+                                                            &verify_plan,
+                                                            &verify_result,
+                                                            row_logits);
+                ds4_gpu_set_mtp_verifier(0);
+                if (ok) {
+                    for (int i = 0; i < 2; i++) row_tops[i] = verify_result.row_top[i];
+                    precomputed_commit_drafts = verify_result.commit_tokens;
+                    have_precomputed_logits = verify_result.have_logits;
+                }
+            } else if (ok && draft_n == 2 &&
+                getenv("DS4_CUDA_MTP_VERIFY_TOP2") != NULL &&
+                getenv("DS4_CUDA_MTP_TOP2") != NULL) {
+                int row0_top = -1;
+                ds4_gpu_set_mtp_verifier(1);  /* Bug 2 / Option D */
+                ok = metal_graph_verify_decode2_top2_output(&s->graph,
+                                                            &e->model,
+                                                            &e->weights,
+                                                            &s->checkpoint,
+                                                            (uint32_t)start,
+                                                            drafts[1],
+                                                            capture_prefix1,
+                                                            &row0_top,
+                                                            &precomputed_commit_drafts,
+                                                            row_logits,
+                                                            &exact_top2);
+                ds4_gpu_set_mtp_verifier(0);
+                if (ok) {
+                    row_tops[0] = row0_top;
+                    verify_result.row_top[0] = row0_top;
+                    verify_result.row_top2[0] = exact_top2;
+                    mtp_verify_result_set_commit(&verify_result,
+                                                 precomputed_commit_drafts);
+                    have_precomputed_logits = true;
+                    verify_result.have_logits = true;
+                }
+            } else {
+                ds4_gpu_set_mtp_verifier(1);  /* Bug 2 / Option D */
+                ok = metal_graph_verify_suffix_tops(&s->graph,
+                                                    &e->model,
+                                                    &e->weights,
+                                                    &s->checkpoint,
+                                                    (uint32_t)start,
+                                                    (uint32_t)draft_n,
+                                                    capture_prefix1,
+                                                    row_tops,
+                                                    NULL);
+                ds4_gpu_set_mtp_verifier(0);
+            }
         }
         const double micro_verify_done = mtp_timing ? now_sec() : 0.0;
         if (ok) {
-            int commit_drafts = 1;
-            for (int i = 1; i < draft_n; i++) {
-                if (row_tops[i - 1] != drafts[i]) break;
-                commit_drafts++;
+            if (verify_result.commit_tokens <= 0) {
+                for (int i = 0; i + 1 < draft_n && i < (int)(sizeof(verify_result.row_top) / sizeof(verify_result.row_top[0])); i++) {
+                    verify_result.row_top[i] = row_tops[i];
+                }
+                mtp_verify_result_decide_from_tops(&verify_result, &verify_plan);
+            }
+            int commit_drafts = verify_result.commit_tokens;
+            if (shadow_have) {
+                static uint64_t shadow_checks = 0;
+                static uint64_t shadow_disagreements = 0;
+                int exact_logit_top0 = -1, exact_logit_top1 = -1;
+                int shadow_logit_top0 = -1, shadow_logit_top1 = -1;
+                float exact_logit_v0 = 0.0f, exact_logit_v1 = 0.0f;
+                float shadow_logit_v0 = 0.0f, shadow_logit_v1 = 0.0f;
+                float logits_max_abs = 0.0f;
+                double logits_sumsq = 0.0;
+                if (shadow_ok && shadow_logits) {
+                    logits_top2(row_logits, DS4_N_VOCAB,
+                                &exact_logit_top0, &exact_logit_v0,
+                                &exact_logit_top1, &exact_logit_v1);
+                    logits_top2(shadow_logits, DS4_N_VOCAB,
+                                &shadow_logit_top0, &shadow_logit_v0,
+                                &shadow_logit_top1, &shadow_logit_v1);
+                    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+                        const float d = fabsf(row_logits[i] - shadow_logits[i]);
+                        if (d > logits_max_abs) logits_max_abs = d;
+                        logits_sumsq += (double)d * (double)d;
+                    }
+                }
+                const bool agree =
+                    shadow_ok &&
+                    shadow_row0_top == row_tops[0] &&
+                    shadow_commit_drafts == commit_drafts;
+                const bool logits_top_agree =
+                    shadow_ok &&
+                    shadow_logits &&
+                    shadow_commit_drafts == commit_drafts &&
+                    shadow_logit_top0 == exact_logit_top0;
+                shadow_checks++;
+                if (!agree || !logits_top_agree) shadow_disagreements++;
+                fprintf(stderr,
+                        "ds4: mtp shadow b_n2_q8 check=%llu disagree=%llu ok=%d agree=%d "
+                        "exact_commit=%d shadow_commit=%d exact_top=%d shadow_top=%d "
+                        "draft_next=%d exact_margin=%.6f shadow_margin=%.6f "
+                        "logit_agree=%d exact_logit_top=%d shadow_logit_top=%d "
+                        "exact_logit_margin=%.6f shadow_logit_margin=%.6f "
+                        "logit_max_abs=%.6f logit_rms=%.6f\n",
+                        (unsigned long long)shadow_checks,
+                        (unsigned long long)shadow_disagreements,
+                        shadow_ok ? 1 : 0,
+                        agree ? 1 : 0,
+                        commit_drafts,
+                        shadow_commit_drafts,
+                        row_tops[0],
+                        shadow_row0_top,
+                        draft_n > 1 ? drafts[1] : -1,
+                        exact_top2.value0 - exact_top2.value1,
+                        shadow_top2.value0 - shadow_top2.value1,
+                        logits_top_agree ? 1 : 0,
+                        exact_logit_top0,
+                        shadow_logit_top0,
+                        exact_logit_v0 - exact_logit_v1,
+                        shadow_logit_v0 - shadow_logit_v1,
+                        logits_max_abs,
+                        sqrt(logits_sumsq / (double)DS4_N_VOCAB));
+            }
+            if (shadow_exact_have) {
+                static uint64_t exact_checks = 0;
+                static uint64_t exact_disagreements = 0;
+                int fast_logit_top0 = -1, fast_logit_top1 = -1;
+                float fast_logit_v0 = 0.0f, fast_logit_v1 = 0.0f;
+                logits_top2(row_logits, DS4_N_VOCAB,
+                            &fast_logit_top0, &fast_logit_v0,
+                            &fast_logit_top1, &fast_logit_v1);
+                const bool decision_agree =
+                    shadow_exact_ok &&
+                    shadow_exact_row0_top == row_tops[0] &&
+                    shadow_exact_commit_drafts == commit_drafts;
+                const bool logit_agree =
+                    shadow_exact_ok &&
+                    shadow_exact_commit_drafts == commit_drafts &&
+                    shadow_exact_logit_top == fast_logit_top0;
+                exact_checks++;
+                if (!decision_agree || !logit_agree) exact_disagreements++;
+                fprintf(stderr,
+                        "ds4: mtp shadow exact_decode2 check=%llu disagree=%llu ok=%d "
+                        "decision_agree=%d logit_agree=%d start=%d draft0=%d draft1=%d "
+                        "fast_commit=%d exact_commit=%d fast_row0=%d exact_row0=%d "
+                        "fast_logit_top=%d exact_logit_top=%d fast_logit_margin=%.6f "
+                        "exact_logit_margin=%.6f\n",
+                        (unsigned long long)exact_checks,
+                        (unsigned long long)exact_disagreements,
+                        shadow_exact_ok ? 1 : 0,
+                        decision_agree ? 1 : 0,
+                        logit_agree ? 1 : 0,
+                        start,
+                        drafts[0],
+                        drafts[1],
+                        commit_drafts,
+                        shadow_exact_commit_drafts,
+                        row_tops[0],
+                        shadow_exact_row0_top,
+                        fast_logit_top0,
+                        shadow_exact_logit_top,
+                        fast_logit_v0 - fast_logit_v1,
+                        shadow_exact_logit_margin);
             }
             if (mtp_conf_log) {
                 fprintf(stderr,
@@ -18129,19 +22284,33 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                         }
                         s->checkpoint_valid = true;
                         s->mtp_draft_valid = false;
-                        DS4_MTP_KEEP_ACCEPTED(replayed);
+                        mtp_state_txn_commit_suffix(s, &mtp_txn, replayed);
+                        if (batch_first_enabled && replayed > 0) {
+                            (void)mtp_seed_next_from_target_hc(s,
+                                                               s->graph.cur_hc,
+                                                               drafts[replayed - 1],
+                                                               (uint32_t)(start + replayed - 1));
+                        }
                         spec_frontier_free(&frontier);
                         free(row_logits);
+                        free(shadow_logits);
+                        free(shadow_exact_logits0);
+                        free(shadow_exact_logits1);
                         free(row_tops);
+                        ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n);
+                        ds4_mtp_accept_trace(s, "micro-exact-replay-debug", cycle_start,
+                                             first_token, drafts, draft_n, n_accept);
                         return n_accept;
                     }
                 }
             }
 
             if (commit_drafts == draft_n) {
-                ok = metal_graph_read_spec_logits_row(&s->graph,
-                                                      (uint32_t)(draft_n - 1),
-                                                      row_logits);
+                if (!have_precomputed_logits) {
+                    ok = metal_graph_read_spec_logits_row(&s->graph,
+                                                          (uint32_t)(draft_n - 1),
+                                                          row_logits);
+                }
                 if (ok) {
                     memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
                     for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
@@ -18150,20 +22319,87 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     }
                     s->checkpoint_valid = true;
                     s->mtp_draft_valid = false;
-                    DS4_MTP_KEEP_ACCEPTED(draft_n);
+                    mtp_state_txn_commit_suffix(s, &mtp_txn, draft_n);
+                    if (batch_first_enabled && batch_first_seed_batch_rows && draft_n > 0) {
+                        (void)mtp_seed_next_from_batch_row(s,
+                                                           (uint32_t)(draft_n - 1),
+                                                           drafts[draft_n - 1],
+                                                           (uint32_t)(start + draft_n - 1));
+                    }
                     if (mtp_timing) {
                         fprintf(stderr,
-                                "ds4: mtp timing micro drafted=%d committed=%d draft=%.3f ms snapshot=%.3f ms verify=%.3f ms total=%.3f ms\n",
+                                "ds4: mtp timing micro drafted=%d committed=%d target=%.3f ms draft=%.3f ms "
+                                "snapshot=%.3f ms verify=%.3f ms spec=%.3f ms total=%.3f ms\n",
                                 draft_n,
                                 draft_n,
+                                (target_done - cycle_t0) * 1000.0,
                                 (mtp_t_after_draft - mtp_t0) * 1000.0,
                                 (snapshot_done - snapshot_t0) * 1000.0,
                                 (micro_verify_done - snapshot_done) * 1000.0,
-                                (now_sec() - mtp_t0) * 1000.0);
+                                (now_sec() - mtp_t0) * 1000.0,
+                                (now_sec() - cycle_t0) * 1000.0);
                     }
                     spec_frontier_free(&frontier);
                     free(row_logits);
+                    free(shadow_logits);
+                    free(shadow_exact_logits0);
+                    free(shadow_exact_logits1);
                     free(row_tops);
+                    ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n);
+                    ds4_mtp_accept_trace(s, "micro", cycle_start,
+                                         first_token, drafts, draft_n, n_accept);
+                    return n_accept;
+                }
+            }
+
+            if (verify_v2_decode3 &&
+                have_precomputed_logits &&
+                commit_drafts > 0 &&
+                commit_drafts < draft_n &&
+                commit_drafts <= 2) {
+                s->checkpoint.len = start;
+                const double prefix_t0 = mtp_timing ? now_sec() : 0.0;
+                ok = spec_frontier_commit_prefix(s, (uint32_t)commit_drafts);
+                const double prefix_done = mtp_timing ? now_sec() : 0.0;
+                if (ok) {
+                    memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+                    for (int i = 0; i < commit_drafts && n_accept < accepted_cap; i++) {
+                        accepted[n_accept++] = drafts[i];
+                        if (drafts[i] == eos_token) break;
+                    }
+                    s->checkpoint_valid = true;
+                    s->mtp_draft_valid = false;
+                    mtp_state_txn_commit_suffix(s, &mtp_txn, commit_drafts);
+                    if (batch_first_enabled && batch_first_seed_batch_rows && commit_drafts > 0) {
+                        (void)mtp_seed_next_from_batch_row(s,
+                                                           (uint32_t)(commit_drafts - 1),
+                                                           drafts[commit_drafts - 1],
+                                                           (uint32_t)(start + commit_drafts - 1));
+                    }
+                    for (int i = 0; i < commit_drafts; i++) token_vec_push(&s->checkpoint, drafts[i]);
+                    if (mtp_timing) {
+                        fprintf(stderr,
+                                "ds4: mtp timing verify_v2_decode3 drafted=%d committed=%d target=%.3f ms draft=%.3f ms "
+                                "snapshot=%.3f ms verify=%.3f ms prefix=%.3f ms spec=%.3f ms total=%.3f ms\n",
+                                draft_n,
+                                commit_drafts,
+                                (target_done - cycle_t0) * 1000.0,
+                                (mtp_t_after_draft - mtp_t0) * 1000.0,
+                                (snapshot_done - snapshot_t0) * 1000.0,
+                                (micro_verify_done - snapshot_done) * 1000.0,
+                                (prefix_done - prefix_t0) * 1000.0,
+                                (now_sec() - mtp_t0) * 1000.0,
+                                (now_sec() - cycle_t0) * 1000.0);
+                    }
+                    spec_frontier_free(&frontier);
+                    free(row_logits);
+                    free(shadow_logits);
+                    free(shadow_exact_logits0);
+                    free(shadow_exact_logits1);
+                    free(row_tops);
+                    ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n);
+                    ds4_mtp_accept_trace(s, "verify-v2-decode3", cycle_start,
+                                         first_token, drafts, draft_n, n_accept);
                     return n_accept;
                 }
             }
@@ -18173,28 +22409,40 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                 const double prefix_t0 = mtp_timing ? now_sec() : 0.0;
                 ok = spec_frontier_commit_prefix1(s);
                 const double prefix_done = mtp_timing ? now_sec() : 0.0;
-                if (ok) ok = metal_graph_read_spec_logits_row(&s->graph, 0, row_logits);
+                if (ok && !have_precomputed_logits) ok = metal_graph_read_spec_logits_row(&s->graph, 0, row_logits);
                 if (ok) {
                     memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
                     accepted[n_accept++] = drafts[0];
                     s->checkpoint_valid = true;
                     s->mtp_draft_valid = false;
-                    DS4_MTP_KEEP_ACCEPTED(1);
+                    mtp_state_txn_commit_suffix(s, &mtp_txn, 1);
+                    if (batch_first_enabled && batch_first_seed_batch_rows) {
+                        (void)mtp_seed_next_from_batch_row(s, 0u, drafts[0], (uint32_t)start);
+                    }
                     token_vec_push(&s->checkpoint, drafts[0]);
                     if (mtp_timing) {
                         fprintf(stderr,
-                                "ds4: mtp timing micro drafted=%d committed=%d draft=%.3f ms snapshot=%.3f ms verify=%.3f ms prefix=%.3f ms total=%.3f ms noreplay=1\n",
+                                "ds4: mtp timing micro drafted=%d committed=%d target=%.3f ms draft=%.3f ms "
+                                "snapshot=%.3f ms verify=%.3f ms prefix=%.3f ms spec=%.3f ms total=%.3f ms noreplay=1\n",
                                 draft_n,
                                 commit_drafts,
+                                (target_done - cycle_t0) * 1000.0,
                                 (mtp_t_after_draft - mtp_t0) * 1000.0,
                                 (snapshot_done - snapshot_t0) * 1000.0,
                                 (micro_verify_done - snapshot_done) * 1000.0,
                                 (prefix_done - prefix_t0) * 1000.0,
-                                (now_sec() - mtp_t0) * 1000.0);
+                                (now_sec() - mtp_t0) * 1000.0,
+                                (now_sec() - cycle_t0) * 1000.0);
                     }
                     spec_frontier_free(&frontier);
                     free(row_logits);
+                    free(shadow_logits);
+                    free(shadow_exact_logits0);
+                    free(shadow_exact_logits1);
                     free(row_tops);
+                    ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n);
+                    ds4_mtp_accept_trace(s, "micro-prefix", cycle_start,
+                                         first_token, drafts, draft_n, n_accept);
                     return n_accept;
                 }
             } else {
@@ -18213,28 +22461,44 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     accepted[n_accept++] = drafts[0];
                     s->checkpoint_valid = true;
                     s->mtp_draft_valid = false;
-                    DS4_MTP_KEEP_ACCEPTED(1);
+                    mtp_state_txn_commit_suffix(s, &mtp_txn, 1);
+                    if (batch_first_enabled) {
+                        (void)mtp_seed_next_from_target_hc(s,
+                                                           s->graph.cur_hc,
+                                                           drafts[0],
+                                                           (uint32_t)start);
+                    }
                     token_vec_push(&s->checkpoint, drafts[0]);
                     if (mtp_timing) {
                         const double replay_done = now_sec();
                         fprintf(stderr,
-                                "ds4: mtp timing micro drafted=%d committed=%d draft=%.3f ms snapshot=%.3f ms verify=%.3f ms exact_replay=%.3f ms total=%.3f ms\n",
+                                "ds4: mtp timing micro drafted=%d committed=%d target=%.3f ms draft=%.3f ms "
+                                "snapshot=%.3f ms verify=%.3f ms exact_replay=%.3f ms spec=%.3f ms total=%.3f ms\n",
                                 draft_n,
                                 commit_drafts,
+                                (target_done - cycle_t0) * 1000.0,
                                 (mtp_t_after_draft - mtp_t0) * 1000.0,
                                 (snapshot_done - snapshot_t0) * 1000.0,
                                 (micro_verify_done - snapshot_done) * 1000.0,
                                 (replay_done - micro_verify_done) * 1000.0,
-                                (replay_done - mtp_t0) * 1000.0);
+                                (replay_done - mtp_t0) * 1000.0,
+                                (replay_done - cycle_t0) * 1000.0);
                     }
                     spec_frontier_free(&frontier);
                     free(row_logits);
+                    free(shadow_logits);
+                    free(shadow_exact_logits0);
+                    free(shadow_exact_logits1);
                     free(row_tops);
+                    ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n);
+                    ds4_mtp_accept_trace(s, "micro-exact-replay", cycle_start,
+                                         first_token, drafts, draft_n, n_accept);
                     return n_accept;
                 }
             }
             if (ok) {
                 for (int i = 0; i < commit_drafts; i++) token_vec_push(&s->checkpoint, drafts[i]);
+                ds4_gpu_set_mtp_verifier(1);  /* Bug 2 / Option D */
                 ok = metal_graph_verify_suffix_tops(&s->graph,
                                                     &e->model,
                                                     &e->weights,
@@ -18244,6 +22508,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                     false,
                                                     row_tops,
                                                     NULL);
+                ds4_gpu_set_mtp_verifier(0);
                 if (ok) ok = metal_graph_read_spec_logits_row(&s->graph,
                                                               (uint32_t)(commit_drafts - 1),
                                                               row_logits);
@@ -18255,22 +22520,37 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     }
                     s->checkpoint_valid = true;
                     s->mtp_draft_valid = false;
-                    DS4_MTP_KEEP_ACCEPTED(commit_drafts);
+                    mtp_state_txn_commit_suffix(s, &mtp_txn, commit_drafts);
+                    if (batch_first_enabled && batch_first_seed_batch_rows && commit_drafts > 0) {
+                        (void)mtp_seed_next_from_batch_row(s,
+                                                           (uint32_t)(commit_drafts - 1),
+                                                           drafts[commit_drafts - 1],
+                                                           (uint32_t)(start + commit_drafts - 1));
+                    }
                     if (mtp_timing) {
                         const double replay_done = now_sec();
                         fprintf(stderr,
-                                "ds4: mtp timing micro drafted=%d committed=%d draft=%.3f ms snapshot=%.3f ms verify=%.3f ms replay=%.3f ms total=%.3f ms\n",
+                                "ds4: mtp timing micro drafted=%d committed=%d target=%.3f ms draft=%.3f ms "
+                                "snapshot=%.3f ms verify=%.3f ms replay=%.3f ms spec=%.3f ms total=%.3f ms\n",
                                 draft_n,
                                 commit_drafts,
+                                (target_done - cycle_t0) * 1000.0,
                                 (mtp_t_after_draft - mtp_t0) * 1000.0,
                                 (snapshot_done - snapshot_t0) * 1000.0,
                                 (micro_verify_done - snapshot_done) * 1000.0,
                                 (replay_done - micro_verify_done) * 1000.0,
-                                (replay_done - mtp_t0) * 1000.0);
+                                (replay_done - mtp_t0) * 1000.0,
+                                (replay_done - cycle_t0) * 1000.0);
                     }
                     spec_frontier_free(&frontier);
                     free(row_logits);
+                    free(shadow_logits);
+                    free(shadow_exact_logits0);
+                    free(shadow_exact_logits1);
                     free(row_tops);
+                    ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n);
+                    ds4_mtp_accept_trace(s, "micro-replay", cycle_start,
+                                         first_token, drafts, draft_n, n_accept);
                     return n_accept;
                 }
             }
@@ -18284,14 +22564,20 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         } else {
             snprintf(err, errlen, "MTP verifier failed");
             s->checkpoint_valid = false;
-            DS4_MTP_KEEP_ACCEPTED(0);
+            mtp_state_txn_keep_accepted(s, &mtp_txn, 0);
             spec_frontier_free(&frontier);
             free(row_logits);
+            free(shadow_logits);
+            free(shadow_exact_logits0);
+            free(shadow_exact_logits1);
             free(row_tops);
             return -1;
         }
         spec_frontier_free(&frontier);
         free(row_logits);
+        free(shadow_logits);
+        free(shadow_exact_logits0);
+        free(shadow_exact_logits1);
         free(row_tops);
         if (getenv("DS4_MTP_SPEC_LOG")) {
             fprintf(stderr, "ds4: mtp spec micro verifier failed, falling back to sequential\n");
@@ -18321,14 +22607,16 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             }
             break;
         }
-        if (!metal_graph_eval_token_raw_swa_top(&s->graph,
-                                                &e->model,
-                                                &e->weights,
-                                                drafts[i],
-                                                (uint32_t)s->checkpoint.len,
-                                                &target_top,
-                                                NULL))
-        {
+        ds4_gpu_set_mtp_verifier(1);  /* Bug 2 / Option D */
+        const bool _ver_raw_ok = metal_graph_eval_token_raw_swa_top(&s->graph,
+                                                                     &e->model,
+                                                                     &e->weights,
+                                                                     drafts[i],
+                                                                     (uint32_t)s->checkpoint.len,
+                                                                     &target_top,
+                                                                     NULL);
+        ds4_gpu_set_mtp_verifier(0);
+        if (!_ver_raw_ok) {
             snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
             s->checkpoint_valid = false;
             return -1;
@@ -18352,16 +22640,24 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         logits_on_host = true;
     }
     (void)logits_on_host;
-    DS4_MTP_KEEP_ACCEPTED(verified);
-#undef DS4_MTP_KEEP_ACCEPTED
+    mtp_state_txn_keep_accepted(s, &mtp_txn, verified);
+    if (batch_first_enabled && verified > 0) {
+        (void)mtp_seed_next_from_target_hc(s,
+                                           s->graph.cur_hc,
+                                           drafts[verified - 1],
+                                           (uint32_t)(s->checkpoint.len - 1));
+    }
     if (mtp_timing) {
         fprintf(stderr,
-                "ds4: mtp timing seq drafted=%d verified=%d draft=%.3f ms verify=%.3f ms total=%.3f ms\n",
+                "ds4: mtp timing seq drafted=%d verified=%d target=%.3f ms draft=%.3f ms "
+                "verify=%.3f ms spec=%.3f ms total=%.3f ms\n",
                 draft_n,
                 verified,
+                (target_done - cycle_t0) * 1000.0,
                 (mtp_t_after_draft - mtp_t0) * 1000.0,
                 (now_sec() - seq_t0) * 1000.0,
-                (now_sec() - mtp_t0) * 1000.0);
+                (now_sec() - mtp_t0) * 1000.0,
+                (now_sec() - cycle_t0) * 1000.0);
     }
     if (getenv("DS4_MTP_SPEC_LOG")) {
         if (verified == draft_n) {
@@ -18377,6 +22673,9 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     n_accept);
         }
     }
+    ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n);
+    ds4_mtp_accept_trace(s, "seq", cycle_start,
+                         first_token, drafts, draft_n, n_accept);
     return n_accept;
 #endif
 }

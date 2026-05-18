@@ -270,6 +270,18 @@ static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *labe
     return 1;
 }
 
+void ds4_gpu_set_attention_output_b_n2_q8_override(int enabled) {
+    (void)enabled;
+}
+
+void ds4_gpu_set_mtp_verifier(int on) {
+    (void)on;
+}
+
+int ds4_gpu_in_mtp_verifier(void) {
+    return 0;
+}
+
 static int ds4_gpu_wait_pending_command_buffers(const char *label) {
     int ok = 1;
     for (id<MTLCommandBuffer> pending in g_pending_cbs) {
@@ -5084,6 +5096,144 @@ int ds4_gpu_matmul_q8_0_tensor(
     return 1;
 }
 
+int ds4_gpu_matmul_q8_0_top2_tensor(
+        ds4_gpu_tensor       *top2,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x) {
+    (void)top2;
+    (void)model_map;
+    (void)model_size;
+    (void)weight_offset;
+    (void)in_dim;
+    (void)out_dim;
+    (void)x;
+    return 0;
+}
+
+int ds4_gpu_matmul_q8_0_top2_and_logits_n2_tensor(
+        ds4_gpu_tensor       *row0_top2,
+        ds4_gpu_tensor       *row1_logits,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x2) {
+    (void)row0_top2;
+    (void)row1_logits;
+    (void)model_map;
+    (void)model_size;
+    (void)weight_offset;
+    (void)in_dim;
+    (void)out_dim;
+    (void)x2;
+    return 0;
+}
+
+int ds4_gpu_matmul_q8_0_candidates_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *candidate_ids,
+        uint32_t                candidate_count,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x) {
+    (void)out;
+    (void)candidate_ids;
+    (void)candidate_count;
+    (void)model_map;
+    (void)model_size;
+    (void)weight_offset;
+    (void)in_dim;
+    (void)out_dim;
+    (void)x;
+    return 0;
+}
+
+int ds4_gpu_q8_0_row_group_norms_tensor(
+        ds4_gpu_tensor       *row_group_norms,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        uint32_t                group_count) {
+    (void)row_group_norms;
+    (void)model_map;
+    (void)model_size;
+    (void)weight_offset;
+    (void)in_dim;
+    (void)out_dim;
+    (void)group_count;
+    return 0;
+}
+
+ds4_gpu_tensor *ds4_gpu_imported_q8_0_row_group_norms_tensor(
+        const void *model_map,
+        uint64_t    model_size,
+        uint64_t    weight_offset,
+        uint64_t    in_dim,
+        uint64_t    out_dim,
+        uint32_t    group_count) {
+    (void)model_map;
+    (void)model_size;
+    (void)weight_offset;
+    (void)in_dim;
+    (void)out_dim;
+    (void)group_count;
+    return NULL;
+}
+
+int ds4_gpu_matmul_q8_0_candidate_certify_tensor(
+        ds4_gpu_tensor       *result,
+        const ds4_gpu_tensor *row_group_norms,
+        const ds4_gpu_tensor *candidate_ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t                group_count) {
+    (void)result;
+    (void)row_group_norms;
+    (void)candidate_ids;
+    (void)model_map;
+    (void)model_size;
+    (void)weight_offset;
+    (void)in_dim;
+    (void)out_dim;
+    (void)x;
+    (void)group_count;
+    return 0;
+}
+
+int ds4_gpu_matmul_q8_0_pair_tensor(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *out1,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight0_offset,
+        uint64_t                weight1_offset,
+        uint64_t                in_dim,
+        uint64_t                out0_dim,
+        uint64_t                out1_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok) {
+    return ds4_gpu_matmul_q8_0_tensor(out0, model_map, model_size,
+                                      weight0_offset, in_dim, out0_dim,
+                                      x, n_tok) &&
+           ds4_gpu_matmul_q8_0_tensor(out1, model_map, model_size,
+                                      weight1_offset, in_dim, out1_dim,
+                                      x, n_tok);
+}
+
 int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
@@ -8374,6 +8524,42 @@ int ds4_gpu_attention_output_low_q8_tensor(
         }
         return ok ? 1 : 0;
     }
+}
+
+int ds4_gpu_attention_output_low_q8_batch_tensor(
+        ds4_gpu_tensor       *low,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens) {
+    if (!low || !heads || n_tokens == 0) return 0;
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    const uint64_t head_dim = (uint64_t)n_groups * group_dim;
+    int ok = 1;
+    for (uint32_t t = 0; ok && t < n_tokens; t++) {
+        ds4_gpu_tensor *low_row = ds4_gpu_tensor_view(low,
+                                                      (uint64_t)t * low_dim * sizeof(float),
+                                                      low_dim * sizeof(float));
+        ds4_gpu_tensor *heads_row = ds4_gpu_tensor_view((ds4_gpu_tensor *)heads,
+                                                        (uint64_t)t * head_dim * sizeof(float),
+                                                        head_dim * sizeof(float));
+        ok = low_row && heads_row &&
+             ds4_gpu_attention_output_low_q8_tensor(low_row,
+                                                    model_map,
+                                                    model_size,
+                                                    out_a_offset,
+                                                    group_dim,
+                                                    rank,
+                                                    n_groups,
+                                                    heads_row) != 0;
+        ds4_gpu_tensor_free(heads_row);
+        ds4_gpu_tensor_free(low_row);
+    }
+    return ok;
 }
 
 static NSUInteger ds4_gpu_align_up_ns(NSUInteger value, NSUInteger align) {
@@ -14485,6 +14671,45 @@ int ds4_gpu_hc_expand_add_split_tensor(
     return 1;
 }
 
+int ds4_gpu_hc_expand_add_split_n2_rows_tensor(
+        ds4_gpu_tensor       *out0_hc,
+        ds4_gpu_tensor       *out1_hc,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc) {
+    if (!out0_hc || !out1_hc || !block_out || !block_add || !residual_hc || !split ||
+        n_embd == 0 || n_hc == 0) return 0;
+    const uint64_t row_bytes = (uint64_t)n_embd * sizeof(float);
+    const uint64_t hc_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
+    const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+    const uint64_t split_row_bytes = mix_hc * sizeof(float);
+    ds4_gpu_tensor *block0 = ds4_gpu_tensor_view(block_out, 0, row_bytes);
+    ds4_gpu_tensor *block1 = ds4_gpu_tensor_view(block_out, row_bytes, row_bytes);
+    ds4_gpu_tensor *add0 = ds4_gpu_tensor_view(block_add, 0, row_bytes);
+    ds4_gpu_tensor *add1 = ds4_gpu_tensor_view(block_add, row_bytes, row_bytes);
+    ds4_gpu_tensor *res0 = ds4_gpu_tensor_view(residual_hc, 0, hc_bytes);
+    ds4_gpu_tensor *res1 = ds4_gpu_tensor_view(residual_hc, hc_bytes, hc_bytes);
+    ds4_gpu_tensor *split0 = ds4_gpu_tensor_view(split, 0, split_row_bytes);
+    ds4_gpu_tensor *split1 = ds4_gpu_tensor_view(split, split_row_bytes, split_row_bytes);
+    bool ok = block0 && block1 && add0 && add1 && res0 && res1 && split0 && split1;
+    if (ok) {
+        ok = ds4_gpu_hc_expand_add_split_tensor(out0_hc, block0, add0, res0, split0, n_embd, n_hc) &&
+             ds4_gpu_hc_expand_add_split_tensor(out1_hc, block1, add1, res1, split1, n_embd, n_hc);
+    }
+    ds4_gpu_tensor_free(split1);
+    ds4_gpu_tensor_free(split0);
+    ds4_gpu_tensor_free(res1);
+    ds4_gpu_tensor_free(res0);
+    ds4_gpu_tensor_free(add1);
+    ds4_gpu_tensor_free(add0);
+    ds4_gpu_tensor_free(block1);
+    ds4_gpu_tensor_free(block0);
+    return ok ? 1 : 0;
+}
+
 int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *shared_out,
@@ -14718,4 +14943,112 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
     }
 
     return 1;
+}
+
+int ds4_gpu_matmul_q8_0_hc_expand_n2_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc) {
+    if (!out_hc || !block_out || !x || !residual_hc || !split) return 0;
+    const uint64_t hc_dim = (uint64_t)n_hc * n_embd;
+    const uint64_t split_dim = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+    int ok = 1;
+    for (uint32_t t = 0; ok && t < 2u; t++) {
+        ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(out_hc,
+                                                      (uint64_t)t * hc_dim * sizeof(float),
+                                                      hc_dim * sizeof(float));
+        ds4_gpu_tensor *block_row = ds4_gpu_tensor_view(block_out,
+                                                        (uint64_t)t * out_dim * sizeof(float),
+                                                        out_dim * sizeof(float));
+        ds4_gpu_tensor *x_row = ds4_gpu_tensor_view((ds4_gpu_tensor *)x,
+                                                    (uint64_t)t * in_dim * sizeof(float),
+                                                    in_dim * sizeof(float));
+        ds4_gpu_tensor *res_row = ds4_gpu_tensor_view((ds4_gpu_tensor *)residual_hc,
+                                                      (uint64_t)t * hc_dim * sizeof(float),
+                                                      hc_dim * sizeof(float));
+        ds4_gpu_tensor *split_row = ds4_gpu_tensor_view((ds4_gpu_tensor *)split,
+                                                        (uint64_t)t * split_dim * sizeof(float),
+                                                        split_dim * sizeof(float));
+        ok = out_row && block_row && x_row && res_row && split_row &&
+             ds4_gpu_matmul_q8_0_hc_expand_tensor(out_row,
+                                                  block_row,
+                                                  model_map,
+                                                  model_size,
+                                                  weight_offset,
+                                                  in_dim,
+                                                  out_dim,
+                                                  x_row,
+                                                  res_row,
+                                                  split_row,
+                                                  n_embd,
+                                                  n_hc) != 0;
+        ds4_gpu_tensor_free(split_row);
+        ds4_gpu_tensor_free(res_row);
+        ds4_gpu_tensor_free(x_row);
+        ds4_gpu_tensor_free(block_row);
+        ds4_gpu_tensor_free(out_row);
+    }
+    return ok;
+}
+
+int ds4_gpu_matmul_q8_0_hc_expand_n2_split_residual_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual0_hc,
+        const ds4_gpu_tensor *residual1_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc) {
+    if (!out_hc || !block_out || !x || !residual0_hc || !residual1_hc || !split) return 0;
+    const uint64_t hc_dim = (uint64_t)n_hc * n_embd;
+    const uint64_t split_dim = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+    int ok = 1;
+    for (uint32_t t = 0; ok && t < 2u; t++) {
+        ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(out_hc,
+                                                      (uint64_t)t * hc_dim * sizeof(float),
+                                                      hc_dim * sizeof(float));
+        ds4_gpu_tensor *block_row = ds4_gpu_tensor_view(block_out,
+                                                        (uint64_t)t * out_dim * sizeof(float),
+                                                        out_dim * sizeof(float));
+        ds4_gpu_tensor *x_row = ds4_gpu_tensor_view((ds4_gpu_tensor *)x,
+                                                    (uint64_t)t * in_dim * sizeof(float),
+                                                    in_dim * sizeof(float));
+        ds4_gpu_tensor *split_row = ds4_gpu_tensor_view((ds4_gpu_tensor *)split,
+                                                        (uint64_t)t * split_dim * sizeof(float),
+                                                        split_dim * sizeof(float));
+        const ds4_gpu_tensor *residual = t == 0 ? residual0_hc : residual1_hc;
+        ok = out_row && block_row && x_row && split_row &&
+             ds4_gpu_matmul_q8_0_hc_expand_tensor(out_row,
+                                                  block_row,
+                                                  model_map,
+                                                  model_size,
+                                                  weight_offset,
+                                                  in_dim,
+                                                  out_dim,
+                                                  x_row,
+                                                  residual,
+                                                  split_row,
+                                                  n_embd,
+                                                  n_hc) != 0;
+        ds4_gpu_tensor_free(split_row);
+        ds4_gpu_tensor_free(x_row);
+        ds4_gpu_tensor_free(block_row);
+        ds4_gpu_tensor_free(out_row);
+    }
+    return ok;
 }
