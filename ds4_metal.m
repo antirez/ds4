@@ -613,25 +613,6 @@ static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, con
     return ok;
 }
 
-static int ds4_gpu_device_name_contains(const char *needle);
-
-static int ds4_gpu_use_m5_private_scratch(void) {
-    static int initialized;
-    static int enabled;
-    if (!initialized) {
-        enabled = getenv("DS4_METAL_DISABLE_M5_PRIVATE_SCRATCH") == NULL &&
-                  ds4_gpu_device_name_contains("M5");
-        initialized = 1;
-    }
-    return enabled;
-}
-
-static int ds4_gpu_scratch_needs_cpu_access(const char *label) {
-    if (!label) return 0;
-    return strstr(label, "mask") != NULL ||
-           strcmp(label, "ds4_attention_output_group_ids") == 0;
-}
-
 static int ds4_gpu_ensure_scratch_buffer(
         id<MTLBuffer> __strong *buffer,
         NSUInteger    *capacity,
