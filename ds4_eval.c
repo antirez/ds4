@@ -1393,6 +1393,30 @@ static void buf_free(byte_buf *b) {
     memset(b, 0, sizeof(*b));
 }
 
+/* Would appending `next` to `hist[0..n-1]` complete three back-to-back
+ * identical L-token chunks (for some L in [Lmin, Lmax]) at the tail?
+ * Used by the sampler-level repetition guard: when yes, we ask the
+ * sampler for a token that excludes the offender, breaking the loop
+ * before any repetition is fully emitted to output.
+ *
+ * Cost: O((Lmax - Lmin + 1) * Lmax) per call.  For Lmax=30 that is
+ * ~810 token comparisons per generated token — negligible. */
+static bool would_close_token_repetition(int next, const int *hist, int n,
+                                         int Lmin, int Lmax) {
+    for (int L = Lmin; L <= Lmax; L++) {
+        if (n + 1 < 3 * L) continue;
+        bool match = true;
+        for (int k = 0; k < L && match; k++) {
+            int a = hist[n + 1 - 3 * L + k];
+            int b = hist[n + 1 - 2 * L + k];
+            int c = (k == L - 1) ? next : hist[n + 1 - L + k];
+            if (a != b || a != c) match = false;
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
 static void style_free(style_buf *b) {
     free(b->v);
     memset(b, 0, sizeof(*b));
@@ -2958,6 +2982,24 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     const int eos = ds4_token_eos(engine);
     double t0 = ui->phase_start_sec;
     int forced_close_pos = -1;
+    /* Sampler-level repetition guard.  When enabled
+     * (DS4_EVAL_REP_GUARD=1), before accepting a sampled token we check
+     * whether appending it would close a 3-back-to-back-identical
+     * L-token chunk pattern (for some L in [rep_guard_min,
+     * rep_guard_max]).  If yes, we ask the sampler for a new token that
+     * excludes the offender; if the alternative ALSO closes a
+     * repetition, we add it to the exclusion set and re-sample (capped
+     * at 8 attempts).  This breaks repetition loops AT THE SOURCE,
+     * before any 3rd repeat is ever emitted. */
+    const char *rep_guard_env = getenv("DS4_EVAL_REP_GUARD");
+    const bool rep_guard_enabled =
+        rep_guard_env && rep_guard_env[0] && rep_guard_env[0] != '0';
+    const int rep_guard_min = 4;
+    const int rep_guard_max = 30;
+    int rep_guard_swaps = 0;
+    int *tok_history = NULL;
+    int tok_history_count = 0;
+    int tok_history_cap = 0;
     for (int i = 0; i < generation_limit; i++) {
         if (tty) {
             tui_consume_input(ui);
@@ -2973,6 +3015,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                 free(question);
                 ds4_tokens_free(&think_close_tokens);
                 buf_free(&raw);
+                free(tok_history);
                 return EVAL_RUN_QUIT;
             }
             if (tui_has_switch_request(ui, idx)) {
@@ -2987,6 +3030,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                 free(question);
                 ds4_tokens_free(&think_close_tokens);
                 buf_free(&raw);
+                free(tok_history);
                 return EVAL_RUN_SWITCH;
             }
             double paused_sec = tui_wait_if_paused(ui, ui->in_think ? "thinking" : "answer");
@@ -3006,6 +3050,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                 free(question);
                 ds4_tokens_free(&think_close_tokens);
                 buf_free(&raw);
+                free(tok_history);
                 return EVAL_RUN_QUIT;
             }
             if (tui_has_switch_request(ui, idx)) {
@@ -3020,6 +3065,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                 free(question);
                 ds4_tokens_free(&think_close_tokens);
                 buf_free(&raw);
+                free(tok_history);
                 return EVAL_RUN_SWITCH;
             }
         }
@@ -3057,6 +3103,29 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
         if (token < 0)
             token = ds4_session_sample(session, cfg->temperature, 0,
                                        cfg->top_p, cfg->min_p, rng);
+        if (rep_guard_enabled && token >= 0 && token != eos &&
+            (think_close_tokens.len == 0 || token != think_close_tokens.v[0]) &&
+            would_close_token_repetition(token, tok_history, tok_history_count,
+                                         rep_guard_min, rep_guard_max)) {
+            /* Iterative exclusion: if the chosen alternative ALSO closes a
+             * repetition, exclude it too and re-sample.  Caps at 8 attempts
+             * to avoid unbounded work on a position the model is dead-set on. */
+            int excluded[8];
+            int n_excluded = 0;
+            while (n_excluded < (int)(sizeof(excluded) / sizeof(excluded[0]))) {
+                excluded[n_excluded++] = token;
+                int alt = ds4_session_sample_excluding(session, excluded, n_excluded,
+                                                       cfg->temperature, 0,
+                                                       cfg->top_p, cfg->min_p, rng);
+                if (alt < 0 || alt == token) break;
+                token = alt;
+                rep_guard_swaps++;
+                if (!would_close_token_repetition(token, tok_history, tok_history_count,
+                                                  rep_guard_min, rep_guard_max)) {
+                    break;
+                }
+            }
+        }
         if (token == eos) break;
         if (close_kind != EVAL_THINK_CLOSE_NONE &&
             think_close.kind == EVAL_THINK_CLOSE_NONE) {
@@ -3077,6 +3146,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
             free(question);
             ds4_tokens_free(&think_close_tokens);
             buf_free(&raw);
+            free(tok_history);
             return EVAL_RUN_ERROR;
         }
 
@@ -3085,6 +3155,17 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
         buf_append(&raw, text, len);
         ui->generated++;
         ui->generated_tokens[idx] = ui->generated;
+        if (rep_guard_enabled) {
+            if (tok_history_count == tok_history_cap) {
+                tok_history_cap = tok_history_cap ? tok_history_cap * 2 : 1024;
+                tok_history = realloc(tok_history,
+                                      (size_t)tok_history_cap * sizeof(int));
+                if (!tok_history) {
+                    fprintf(stderr, "ds4-eval: out of memory\n"); exit(1);
+                }
+            }
+            tok_history[tok_history_count++] = token;
+        }
         tui_run_clock_tick(ui);
         if (generation_in_think && raw.v && strstr(raw.v, "</think>")) {
             generation_in_think = false;
@@ -3141,9 +3222,14 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     }
 
     if (tty && cfg->pause_ms > 0) usleep((useconds_t)cfg->pause_ms * 1000);
+    if (rep_guard_enabled && rep_guard_swaps > 0) {
+        fprintf(stderr, "ds4-eval: rep-guard swapped top-1 -> top-2 %d times for %s\n",
+                rep_guard_swaps, tc->id);
+    }
     free(question);
     ds4_tokens_free(&think_close_tokens);
     buf_free(&raw);
+    free(tok_history);
     return EVAL_RUN_OK;
 }
 
