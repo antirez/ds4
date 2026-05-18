@@ -30,6 +30,9 @@
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
@@ -6181,7 +6184,35 @@ static uint32_t ds4_default_raw_cap(uint32_t ctx_size) {
     return raw_cap;
 }
 
-static uint32_t ds4_default_prefill_cap_for_prompt(int prompt_len) {
+static bool ds4_host_is_apple_m5_max(void) {
+#if defined(__APPLE__)
+    static int initialized;
+    static int is_m5_max;
+    if (!initialized) {
+        char brand[128];
+        size_t len = sizeof(brand);
+        if (sysctlbyname("machdep.cpu.brand_string", brand, &len, NULL, 0) == 0) {
+            brand[sizeof(brand) - 1] = '\0';
+            is_m5_max = strstr(brand, "Apple M5 Max") != NULL;
+        }
+        initialized = 1;
+    }
+    return is_m5_max != 0;
+#else
+    return false;
+#endif
+}
+
+uint32_t ds4_backend_default_prefill_chunk(ds4_backend backend) {
+    if (backend == DS4_BACKEND_METAL && ds4_host_is_apple_m5_max()) return 4096u;
+    return 2048u;
+}
+
+uint32_t ds4_backend_default_kv_boundary_align_tokens(ds4_backend backend) {
+    return ds4_backend_default_prefill_chunk(backend);
+}
+
+static uint32_t ds4_default_prefill_cap_for_prompt(int prompt_len, ds4_backend backend) {
     if (prompt_len <= 0) return 1;
     uint32_t cap = (uint32_t)prompt_len;
 
@@ -6192,9 +6223,23 @@ static uint32_t ds4_default_prefill_cap_for_prompt(int prompt_len) {
         if (endp != env) {
             if (v <= 0) return cap;
             cap = (uint32_t)v;
+            if (ds4_backend_default_prefill_chunk(backend) >= 4096u &&
+                cap > 4096u && getenv("DS4_METAL_ALLOW_UNSAFE_PREFILL_CHUNK") == NULL)
+            {
+                static int warned_large_prefill_chunk;
+                if (!warned_large_prefill_chunk) {
+                    fprintf(stderr,
+                            "ds4: DS4_METAL_PREFILL_CHUNK=%u exceeds the correctness-gated 4096-token limit; "
+                            "clamping to 4096 (set DS4_METAL_ALLOW_UNSAFE_PREFILL_CHUNK=1 to experiment)\n",
+                            cap);
+                    warned_large_prefill_chunk = 1;
+                }
+                cap = 4096u;
+            }
         }
-    } else if (prompt_len > 2048) {
-        cap = 2048u;
+    } else {
+        const uint32_t default_chunk = ds4_backend_default_prefill_chunk(backend);
+        if (prompt_len > (int)default_chunk) cap = default_chunk;
     }
 
     if (cap == 0) cap = 1;
@@ -11149,6 +11194,11 @@ static bool metal_graph_q_stage_profile_boundary(
     return ds4_gpu_begin_commands() != 0;
 }
 
+static bool metal_graph_use_m5_large_prefill_schedule(const ds4_gpu_graph *g) {
+    return g && g->prefill_cap >= 4096u &&
+           ds4_backend_default_prefill_chunk(DS4_BACKEND_METAL) >= 4096u;
+}
+
 static bool metal_graph_encode_layer_attention_batch(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -12192,7 +12242,16 @@ static bool metal_graph_encode_layer_attention_batch(
         }
 
         const bool topk_prefill_needed = ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K;
-        if (ok && zero_prefix && topk_prefill_needed && n_comp != 0) {
+        /* The all-at-once zero-prefix indexed attention path selects one top-k
+         * set per token from the complete compressed prefix. For very large
+         * first chunks, high-scoring future compressed rows can crowd out older
+         * visible rows before the attention kernel applies its causal `visible`
+         * cutoff, which breaks long-memory prompts. Keep the fast batched path
+         * for the correctness-gated 2048-token chunk size; larger experimental
+         * chunks fall through to the per-token indexed path below. */
+        if (ok && zero_prefix && topk_prefill_needed && n_comp != 0 &&
+            (!metal_graph_use_m5_large_prefill_schedule(g) || n_tokens <= 2048u))
+        {
             const float index_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
             double index_stage_t0 = 0.0;
             if (index_stage_profile) {
@@ -13480,6 +13539,19 @@ static bool metal_graph_prefill_layer_major(
     return ok;
 }
 
+static bool metal_graph_prefill_chunked_range(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        const token_vec       *prompt,
+        uint32_t               start,
+        uint32_t               n_tokens,
+        float                 *logits,
+        bool                   show_progress,
+        ds4_session_progress_fn progress,
+        void                  *progress_ud,
+        ds4_imatrix_collector *imatrix);
+
 static bool metal_graph_prefill_raw_swa(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -13490,6 +13562,19 @@ static bool metal_graph_prefill_raw_swa(
         bool                   show_progress) {
     if (n_tokens <= 0 || n_tokens > prompt->len) return false;
     if ((uint32_t)n_tokens > g->prefill_cap) return false;
+    if (metal_graph_use_m5_large_prefill_schedule(g) && n_tokens > 2048) {
+        return metal_graph_prefill_chunked_range(g,
+                                                 model,
+                                                 weights,
+                                                 prompt,
+                                                 0,
+                                                 (uint32_t)n_tokens,
+                                                 logits,
+                                                 show_progress,
+                                                 NULL,
+                                                 NULL,
+                                                 NULL);
+    }
     return metal_graph_prefill_layer_major(g, model, weights, prompt, n_tokens, logits, show_progress, NULL);
 }
 
@@ -13570,6 +13655,9 @@ static bool metal_graph_prefill_chunked_range(
     for (uint32_t pos0 = start; pos0 < end; ) {
         const uint32_t remaining = end - pos0;
         uint32_t local_cap = chunk_cap;
+        if (metal_graph_use_m5_large_prefill_schedule(g) && pos0 == 0 && local_cap > 2048u) {
+            local_cap = 2048u;
+        }
         if (start != 0 && g->prefill_cap != 0) {
             const uint32_t mod = pos0 % g->prefill_cap;
             if (mod != 0) {
@@ -13978,9 +14066,9 @@ static uint32_t metal_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_c
 }
 
 /* Choose the prefill ubatch size.  Whole-batch is fastest for normal prompts;
- * long prompts default to 2048-token chunks. */
+ * long prompts default to a backend-tuned chunk size. */
 static uint32_t metal_graph_prefill_cap_for_prompt(int prompt_len) {
-    return ds4_default_prefill_cap_for_prompt(prompt_len);
+    return ds4_default_prefill_cap_for_prompt(prompt_len, DS4_BACKEND_METAL);
 }
 
 /* When a server request shares a large prefix with the live checkpoint, extend
@@ -14004,7 +14092,7 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
 
     if (ds4_backend_uses_graph(backend)) {
-        m.prefill_cap = metal_graph_prefill_cap_for_prompt((int)ctx);
+        m.prefill_cap = ds4_default_prefill_cap_for_prompt((int)ctx, backend);
         m.raw_cap = metal_graph_raw_cap_for_context((int)ctx, m.prefill_cap);
 
         uint32_t min_ratio = UINT32_MAX;
@@ -17311,7 +17399,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         ds4_session *s = xcalloc(1, sizeof(*s));
         s->engine = e;
         s->ctx_size = ctx_size;
-        s->prefill_cap = ds4_default_prefill_cap_for_prompt(ctx_size);
+        s->prefill_cap = ds4_default_prefill_cap_for_prompt(ctx_size, e->backend);
         kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0);
         cpu_decode_scratch_init(&s->cpu_scratch, (uint32_t)ctx_size);
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));

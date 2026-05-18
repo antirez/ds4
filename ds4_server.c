@@ -8199,11 +8199,10 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
 /* Tokenizers may merge text across the prompt boundary.  Trimming a small tail
  * still improves the cheap token-prefix path, while text-prefix lookup handles
  * the cases where canonical prompt tokenization spells the same bytes
- * differently.  The 2048 alignment also matches the Metal prefill chunk
- * schedule, which keeps compressor row finalization identical to a cold full
- * prompt. */
+ * differently.  The alignment should match the backend prefill chunk schedule,
+ * which keeps compressor row finalization identical to a cold full prompt. */
 #define KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS 32
-#define KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS 2048
+#define KV_CACHE_FALLBACK_BOUNDARY_ALIGN_TOKENS 2048
 #define KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS 10000
 #define KV_CACHE_DEFAULT_MB 4096
 /* Disk-hit counts are evidence that a checkpoint was useful, but only while
@@ -8246,7 +8245,7 @@ static kv_cache_options kv_cache_default_options(void) {
         .cold_max_tokens = KV_CACHE_DEFAULT_COLD_MAX_TOKENS,
         .continued_interval_tokens = KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS,
         .boundary_trim_tokens = KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS,
-        .boundary_align_tokens = KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS,
+        .boundary_align_tokens = KV_CACHE_FALLBACK_BOUNDARY_ALIGN_TOKENS,
     };
 }
 
@@ -11834,7 +11833,7 @@ static void usage(FILE *fp) {
         "  --kv-cache-boundary-trim-tokens N\n"
         "      Trim this many tail tokens before cold boundary saves to avoid tokenizer boundary merges. Default: 32\n"
         "  --kv-cache-boundary-align-tokens N\n"
-        "      Align cold boundary saves down to this token multiple. 0 disables alignment. Default: 2048\n"
+        "      Align cold boundary saves down to this token multiple. 0 disables alignment. Default: backend prefill chunk (4096 on M5 Max Metal, otherwise 2048)\n"
         "  --kv-cache-reject-different-quant\n"
         "      Refuse checkpoints written by the same model with a different routed-expert quantization.\n"
         "  --disable-exact-dsml-tool-replay\n"
@@ -11896,6 +11895,7 @@ static server_config parse_options(int argc, char **argv) {
     c.kv_cache = kv_cache_default_options();
 
     bool directional_steering_scale_set = false;
+    bool kv_boundary_align_set = false;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
@@ -11939,6 +11939,7 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_cache.boundary_trim_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-boundary-align-tokens")) {
             c.kv_cache.boundary_align_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+            kv_boundary_align_set = true;
         } else if (!strcmp(arg, "--kv-cache-reject-different-quant")) {
             c.kv_cache_reject_different_quant = true;
         } else if (!strcmp(arg, "--disable-exact-dsml-tool-replay")) {
@@ -11970,6 +11971,9 @@ static server_config parse_options(int argc, char **argv) {
             usage(stderr);
             exit(2);
         }
+    }
+    if (!kv_boundary_align_set) {
+        c.kv_cache.boundary_align_tokens = ds4_backend_default_kv_boundary_align_tokens(c.engine.backend);
     }
     if (c.kv_cache.cold_max_tokens > 0 &&
         c.kv_cache.cold_max_tokens < c.kv_cache.min_tokens)
