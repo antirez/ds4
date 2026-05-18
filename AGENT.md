@@ -6,7 +6,8 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
 
 ## Goals
 
-- Keep the production path as whole-model Metal graph inference.
+- Keep the production path as whole-model GPU graph inference
+  (Metal on macOS, CUDA on Linux).
 - Keep model loading mmap-backed; do not eagerly copy the full GGUF.
 - Keep the CPU backend CPU-only and use it only as reference/debug code.
 - Preserve correctness before speed. Do not keep a faster path with unexplained
@@ -32,7 +33,8 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
   kernel VM failures with very large mappings.
 - Do not run multiple huge model processes concurrently. The instance lock is
   intentional.
-- Prefer short Metal smoke tests for build verification.
+- Prefer short GPU smoke tests for build verification
+  (Metal on macOS, CUDA on Linux).
 
 ## Layout
 
@@ -58,8 +60,8 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
 ## Testing
 
 Use `make` for build validation. Use `make test` for unit/regression tests when a
-model and Metal are available. Use live server tests only when intentionally
-testing the API surface.
+model and a GPU backend are available. Use live server tests only when
+intentionally testing the API surface.
 
 Multi-process testing (proof harness, multi-profile sweeps, MTP correctness
 work that loads base + MTP gguf into the same device) goes through
