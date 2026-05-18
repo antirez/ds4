@@ -1410,8 +1410,18 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
 }
 
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
-extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
-extern "C" int ds4_gpu_end_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "end commands"); }
+extern "C" int ds4_gpu_flush_commands_labeled(const char *label) {
+    return cuda_ok(cudaDeviceSynchronize(), label && label[0] ? label : "flush");
+}
+extern "C" int ds4_gpu_flush_commands(void) {
+    return ds4_gpu_flush_commands_labeled("flush");
+}
+extern "C" int ds4_gpu_end_commands_labeled(const char *label) {
+    return cuda_ok(cudaDeviceSynchronize(), label && label[0] ? label : "end commands");
+}
+extern "C" int ds4_gpu_end_commands(void) {
+    return ds4_gpu_end_commands_labeled("end commands");
+}
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {

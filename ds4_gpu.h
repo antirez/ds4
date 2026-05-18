@@ -33,7 +33,9 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
 
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
+int ds4_gpu_flush_commands_labeled(const char *label);
 int ds4_gpu_end_commands(void);
+int ds4_gpu_end_commands_labeled(const char *label);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
