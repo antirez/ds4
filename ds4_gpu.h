@@ -20,9 +20,14 @@ void ds4_gpu_cleanup(void);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
+ds4_gpu_tensor *ds4_gpu_kv_cache_alloc(uint64_t rows, uint32_t head_dim, int managed);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
+ds4_gpu_tensor *ds4_gpu_kv_cache_view(const ds4_gpu_tensor *base, uint64_t row0, uint64_t rows, uint32_t head_dim);
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
+uint64_t ds4_gpu_kv_cache_row_bytes(uint32_t head_dim);
+uint64_t ds4_gpu_kv_cache_bytes(uint64_t rows, uint32_t head_dim);
+const char *ds4_gpu_kv_cache_type_name(void);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
