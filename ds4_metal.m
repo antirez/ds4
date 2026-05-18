@@ -6449,20 +6449,123 @@ int ds4_gpu_matmul_q8_0_tensor(
         return 0;
     }
 
+    const int profile_requested =
+        n_tok > 8u && ds4_gpu_env_bool("DS4_METAL_Q8_PREFILL_PROFILE") > 0;
+    const int compare_requested =
+        n_tok > 8u &&
+        ds4_gpu_env_bool("DS4_METAL_Q8_COMPARE") > 0 &&
+        ds4_gpu_mpp_compare_route_matches("q8");
+    int profile_prefill = 0;
+    int compare_prefill = 0;
+    int split_batch_for_profile = 0;
+    const char *profile_label = NULL;
+    char profile_label_buf[128];
+    char profile_fallback[128];
+    if (profile_requested || compare_requested) {
+        snprintf(profile_fallback, sizeof(profile_fallback),
+                 "q8 weight_off=%llu in=%llu out=%llu tok=%llu",
+                 (unsigned long long)weight_offset,
+                 (unsigned long long)in_dim,
+                 (unsigned long long)out_dim,
+                 (unsigned long long)n_tok);
+        profile_label = ds4_gpu_mpp_compare_label(profile_fallback,
+                                                    profile_label_buf,
+                                                    sizeof(profile_label_buf));
+        const char *profile_filter = getenv("DS4_METAL_Q8_PREFILL_PROFILE_FILTER");
+        profile_prefill =
+            profile_requested &&
+            (!profile_filter || !profile_filter[0] ||
+             strstr(profile_label, profile_filter) != NULL);
+        const char *compare_filter = getenv("DS4_METAL_Q8_COMPARE_FILTER");
+        compare_prefill =
+            compare_requested &&
+            (!compare_filter || !compare_filter[0] ||
+             strstr(profile_label, compare_filter) != NULL);
+    }
+    if (profile_prefill && g_batch_cb) {
+        if (ds4_gpu_end_commands() == 0 || ds4_gpu_begin_commands() == 0) {
+            return 0;
+        }
+        split_batch_for_profile = 1;
+    }
+
+    const double profile_t0 = profile_prefill ? ds4_gpu_now_ms() : 0.0;
+
+    int ok = 0;
     if (ds4_gpu_can_use_mpp_q8_0_matmul(n_tok)) {
         if (ds4_gpu_matmul_q8_0_mpp_tensor(out, model_map, model_size, weight_offset,
                                              in_dim, out_dim, x, n_tok)) {
             ds4_gpu_mpp_compare_q8_0_matmul(out, model_map, model_size,
                                               weight_offset, in_dim, out_dim,
                                               x, n_tok);
-            return 1;
+            ok = 1;
+        } else {
+            ds4_gpu_warn_mpp_fallback();
         }
-        ds4_gpu_warn_mpp_fallback();
+    }
+    if (!ok) {
+        ok = ds4_gpu_matmul_q8_0_legacy_tensor(out, model_map, model_size,
+                                                 weight_offset, in_dim, out_dim,
+                                                 x, n_tok);
     }
 
-    return ds4_gpu_matmul_q8_0_legacy_tensor(out, model_map, model_size,
-                                               weight_offset, in_dim, out_dim,
-                                               x, n_tok);
+    if (ok && compare_prefill) {
+        if (out_dim != 0 && n_tok > UINT64_MAX / out_dim) {
+            ok = 0;
+        }
+        const uint64_t out_elements = ok ? n_tok * out_dim : 0;
+        if (ok && out_elements > UINT64_MAX / sizeof(float)) {
+            ok = 0;
+        }
+        ds4_gpu_tensor *cand_snapshot = NULL;
+        ds4_gpu_tensor *ref = NULL;
+        if (ok) {
+            cand_snapshot = ds4_gpu_mpp_compare_snapshot_buffer(ds4_gpu_tensor_buffer(out),
+                                                                 ds4_gpu_tensor_offset(out),
+                                                                 out_elements * sizeof(float));
+            ref = ds4_gpu_tensor_alloc(out_elements * sizeof(float));
+            if (!cand_snapshot || !ref) {
+                ok = 0;
+            }
+        }
+        if (ok) {
+            ok = ds4_gpu_matmul_q8_0_legacy_tensor(ref, model_map, model_size,
+                                                    weight_offset, in_dim, out_dim,
+                                                    x, n_tok);
+        }
+        if (ok) {
+            ds4_gpu_mpp_compare_register("q8",
+                                           profile_label ? profile_label : profile_fallback,
+                                           ref,
+                                           cand_snapshot,
+                                           out_elements,
+                                           out_dim,
+                                           n_tok,
+                                           in_dim);
+            if (!g_batch_cb) {
+                ds4_gpu_mpp_compare_drain("Q8_0 tensor compare");
+            }
+        }
+        ds4_gpu_tensor_free(cand_snapshot);
+        ds4_gpu_tensor_free(ref);
+    }
+    if (profile_prefill) {
+        if (split_batch_for_profile && ds4_gpu_end_commands() == 0) {
+            ok = 0;
+        }
+        const double elapsed_ms = ds4_gpu_now_ms() - profile_t0;
+        fprintf(stderr,
+                "ds4: Metal Q8_0 prefill profile %s in=%llu out=%llu tok=%llu %.3f ms\n",
+                profile_label ? profile_label : profile_fallback,
+                (unsigned long long)in_dim,
+                (unsigned long long)out_dim,
+                (unsigned long long)n_tok,
+                elapsed_ms);
+        if (split_batch_for_profile && ds4_gpu_begin_commands() == 0) {
+            ok = 0;
+        }
+    }
+    return ok;
 }
 
 int ds4_gpu_matmul_q8_0_mpp_tensor(
