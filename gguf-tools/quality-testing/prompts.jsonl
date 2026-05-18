@@ -1,0 +1,100 @@
+{"id": "case_000", "prompt": "Explain B-tree insertion, including splits and the root special case."}
+{"id": "case_001", "prompt": "Write a concise design for a TCP echo server that handles slow clients."}
+{"id": "case_002", "prompt": "Compare mmaped model weights with copying all weights into private buffers on macOS."}
+{"id": "case_003", "prompt": "Derive why RMSNorm needs a sum of squares and a scaling pass."}
+{"id": "case_004", "prompt": "Explain why KV cache checkpointing helps agentic sessions."}
+{"id": "case_005", "prompt": "Give pseudocode for a binary heap push operation."}
+{"id": "case_006", "prompt": "What are the tradeoffs between top-p sampling and temperature zero decoding?"}
+{"id": "case_007", "prompt": "Summarize how speculative decoding preserves exact greedy output."}
+{"id": "case_008", "prompt": "Explain why a GPU prefill path can be faster than single-token decode."}
+{"id": "case_009", "prompt": "Write three invariants for a tokenizer special-token table."}
+{"id": "case_010", "prompt": "Spiega come funziona l'inserimento in un B-tree, inclusi split e radice."}
+{"id": "case_011", "prompt": "Scrivi un progetto conciso per un server TCP echo con client lenti."}
+{"id": "case_012", "prompt": "Confronta mmap dei pesi e copia completa dei pesi su macOS."}
+{"id": "case_013", "prompt": "Deriva perche RMSNorm richiede somma dei quadrati e riscalamento."}
+{"id": "case_014", "prompt": "Spiega perche la cache KV su disco aiuta nelle sessioni agentiche."}
+{"id": "case_015", "prompt": "Scrivi pseudocodice per inserire un elemento in un heap binario."}
+{"id": "case_016", "prompt": "Quali sono i pro e contro di top-p rispetto a temperatura zero?"}
+{"id": "case_017", "prompt": "Riassumi perche la decodifica speculativa puo mantenere l'output esatto."}
+{"id": "case_018", "prompt": "Spiega perche il prefill GPU puo essere piu veloce del decode token singolo."}
+{"id": "case_019", "prompt": "Scrivi tre invarianti per una tabella di token speciali."}
+{"id": "case_020", "prompt": "Given a sorted array, describe how binary search finds the insertion point."}
+{"id": "case_021", "prompt": "Write a short C function that clamps an integer to a range."}
+{"id": "case_022", "prompt": "Explain the difference between a mutex and an atomic counter."}
+{"id": "case_023", "prompt": "What does backpressure mean in a network server?"}
+{"id": "case_024", "prompt": "Describe a safe format for storing a model checkpoint header."}
+{"id": "case_025", "prompt": "Explain how a ring buffer wraps and how to avoid overwriting unread data."}
+{"id": "case_026", "prompt": "Write a brief plan for testing long-context prompt chunking."}
+{"id": "case_027", "prompt": "What is an importance matrix in low-bit quantization?"}
+{"id": "case_028", "prompt": "Explain why grouped MoE expert execution can improve prefill."}
+{"id": "case_029", "prompt": "Describe how to compare two model quantizations without relying on one answer."}
+{"id": "case_030", "prompt": "Data una lista ordinata, descrivi la ricerca binaria del punto di inserimento."}
+{"id": "case_031", "prompt": "Scrivi una breve funzione C che limita un intero a un intervallo."}
+{"id": "case_032", "prompt": "Spiega la differenza tra mutex e contatore atomico."}
+{"id": "case_033", "prompt": "Che cosa significa backpressure in un server di rete?"}
+{"id": "case_034", "prompt": "Descrivi un formato sicuro per salvare l'header di un checkpoint modello."}
+{"id": "case_035", "prompt": "Spiega come funziona un ring buffer e come evitare sovrascritture."}
+{"id": "case_036", "prompt": "Scrivi un piano breve per testare il chunking di prompt lunghi."}
+{"id": "case_037", "prompt": "Che cos'e una matrice di importanza nella quantizzazione low-bit?"}
+{"id": "case_038", "prompt": "Spiega perche raggruppare gli esperti MoE puo accelerare il prefill."}
+{"id": "case_039", "prompt": "Descrivi come confrontare due quantizzazioni senza fidarsi di una sola risposta."}
+{"id": "case_040", "prompt": "A user reports generation slows at long context. List the first five measurements to take."}
+{"id": "case_041", "prompt": "Why can small logit differences change a greedy continuation?"}
+{"id": "case_042", "prompt": "Explain online softmax in attention using simple variables."}
+{"id": "case_043", "prompt": "Give a minimal JSON schema for a tool call with name and arguments."}
+{"id": "case_044", "prompt": "How would you test that a file-backed mmap is not repeatedly remapped?"}
+{"id": "case_045", "prompt": "Explain why one large Metal buffer can be worse than multiple overlapping views."}
+{"id": "case_046", "prompt": "What is the role of a router in a mixture-of-experts layer?"}
+{"id": "case_047", "prompt": "Describe the difference between raw KV rows and compressed KV rows."}
+{"id": "case_048", "prompt": "Write a checklist for validating that a quantized model still follows instructions."}
+{"id": "case_049", "prompt": "Explain why evaluating 50 prompts is more informative than one favorite prompt."}
+{"id": "case_050", "prompt": "Un utente segnala decode lento a contesto lungo. Elenca cinque misure iniziali."}
+{"id": "case_051", "prompt": "Perche piccole differenze nei logit possono cambiare una continuazione greedy?"}
+{"id": "case_052", "prompt": "Spiega online softmax nell'attenzione con variabili semplici."}
+{"id": "case_053", "prompt": "Dai uno schema JSON minimo per una tool call con nome e argomenti."}
+{"id": "case_054", "prompt": "Come testeresti che un mmap su file non venga rimappato ripetutamente?"}
+{"id": "case_055", "prompt": "Spiega perche un grande buffer Metal puo essere peggiore di viste sovrapposte."}
+{"id": "case_056", "prompt": "Qual e il ruolo del router in un layer mixture-of-experts?"}
+{"id": "case_057", "prompt": "Descrivi la differenza tra righe KV raw e righe KV compresse."}
+{"id": "case_058", "prompt": "Scrivi una checklist per validare che un modello quantizzato segua ancora le istruzioni."}
+{"id": "case_059", "prompt": "Perche valutare 50 prompt e piu utile di un singolo prompt preferito?"}
+{"id": "case_060", "prompt": "Write a tiny Python function that returns the median of three numbers."}
+{"id": "case_061", "prompt": "Explain why sorted arrays make membership tests faster with binary search."}
+{"id": "case_062", "prompt": "What does eventual consistency mean in a distributed database?"}
+{"id": "case_063", "prompt": "Give a short example of a race condition in C."}
+{"id": "case_064", "prompt": "Explain the difference between latency and throughput."}
+{"id": "case_065", "prompt": "How does a trie represent a set of strings?"}
+{"id": "case_066", "prompt": "Describe how to test a command-line parser with edge cases."}
+{"id": "case_067", "prompt": "Why can mmap page residency differ from virtual address space size?"}
+{"id": "case_068", "prompt": "Explain why quantization error can affect rare experts more than common experts."}
+{"id": "case_069", "prompt": "Write a short checklist for reviewing a pull request that touches memory lifetimes."}
+{"id": "case_070", "prompt": "Scrivi una piccola funzione Python che restituisce la mediana di tre numeri."}
+{"id": "case_071", "prompt": "Spiega perche array ordinati rendono piu veloce la ricerca di appartenenza."}
+{"id": "case_072", "prompt": "Che cosa significa consistenza eventuale in un database distribuito?"}
+{"id": "case_073", "prompt": "Fai un breve esempio di race condition in C."}
+{"id": "case_074", "prompt": "Spiega la differenza tra latenza e throughput."}
+{"id": "case_075", "prompt": "Come rappresenta un trie un insieme di stringhe?"}
+{"id": "case_076", "prompt": "Descrivi come testare un parser da riga di comando con casi limite."}
+{"id": "case_077", "prompt": "Perche la residenza delle pagine mmap puo differire dalla dimensione virtuale?"}
+{"id": "case_078", "prompt": "Spiega perche l'errore di quantizzazione puo colpire piu gli esperti rari."}
+{"id": "case_079", "prompt": "Scrivi una breve checklist per revisionare lifetime di memoria in una PR."}
+{"id": "case_080", "prompt": "Complete this sentence: A good benchmark should measure"}
+{"id": "case_081", "prompt": "Complete this C comment: /* This lock protects"}
+{"id": "case_082", "prompt": "Complete this Italian sentence: Il vantaggio principale della cache e"}
+{"id": "case_083", "prompt": "Translate to Italian: The model should answer only after reading the whole prompt."}
+{"id": "case_084", "prompt": "Translate to English: La quantizzazione riduce memoria ma puo alterare i logit."}
+{"id": "case_085", "prompt": "In one paragraph, explain how a compiler uses an abstract syntax tree."}
+{"id": "case_086", "prompt": "In one paragraph, explain why checksums catch accidental corruption."}
+{"id": "case_087", "prompt": "Give three examples of useful server metrics."}
+{"id": "case_088", "prompt": "Why should a tokenizer treat special tags carefully?"}
+{"id": "case_089", "prompt": "Explain how a hash table handles collisions."}
+{"id": "case_090", "prompt": "Describe the role of calibration data when quantizing a neural network."}
+{"id": "case_091", "prompt": "What is a confidence interval, in plain language?"}
+{"id": "case_092", "prompt": "Write a simple SQL query that counts rows per category."}
+{"id": "case_093", "prompt": "Explain why a page cache can make a second file read faster."}
+{"id": "case_094", "prompt": "Give a short answer: what is the capital of Japan?"}
+{"id": "case_095", "prompt": "Give a short answer: what is the derivative of x squared?"}
+{"id": "case_096", "prompt": "Give a short answer: who wrote The Divine Comedy?"}
+{"id": "case_097", "prompt": "Rispondi brevemente: qual e la capitale del Giappone?"}
+{"id": "case_098", "prompt": "Rispondi brevemente: quanto fa 17 per 23?"}
+{"id": "case_099", "prompt": "Rispondi brevemente: chi ha scritto la Divina Commedia?"}

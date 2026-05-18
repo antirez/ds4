@@ -192,7 +192,7 @@ kernel void kernel_mul_mv_q8_0_f32(
 
 // Decode shared-expert gate/up projections followed by SwiGLU:
 //
-//     mid = silu(gate) * up
+//     mid = silu(min(gate, limit)) * clamp(up, -limit, limit)
 //
 // DS4's shared expert uses two Q8_0 matrices with the same input row.  This
 // kernel preserves the exact Q8_0 dot-product reduction shape for both
@@ -209,6 +209,7 @@ kernel void kernel_dsv4_shared_gate_up_swiglu_q8_0(
         device       char * dst_gate,
         device       char * dst_up,
         device       char * dst_mid,
+        constant     float &clamp_value,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
@@ -309,8 +310,14 @@ kernel void kernel_dsv4_shared_gate_up_swiglu_q8_0(
             const uint out_row = r0 + row;
             gate_f32[out_row] = gate;
             up_f32[out_row] = up;
-            const float silu = gate / (1.0f + exp(-gate));
-            mid_f32[out_row] = silu * up;
+            float g = gate;
+            float u = up;
+            if (clamp_value > 1.0e-6f) {
+                g = min(g, clamp_value);
+                u = clamp(u, -clamp_value, clamp_value);
+            }
+            const float silu = g / (1.0f + exp(-g));
+            mid_f32[out_row] = silu * u;
         }
     }
 }
