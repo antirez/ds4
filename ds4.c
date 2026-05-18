@@ -1652,6 +1652,78 @@ static void dsv4_fp8_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim, ui
     }
 }
 
+static float dsv4_e2m1fn_value_cpu(int i) {
+    static const float values[8] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    };
+    return values[i & 7];
+}
+
+static float dsv4_e2m1fn_dequant_cpu(float x) {
+    const float sign = x < 0.0f ? -1.0f : 1.0f;
+    const float ax = fminf(fabsf(x), 6.0f);
+    int best = 0;
+    float best_diff = fabsf(ax - dsv4_e2m1fn_value_cpu(0));
+    for (int i = 1; i < 8; i++) {
+        const float diff = fabsf(ax - dsv4_e2m1fn_value_cpu(i));
+        if (diff < best_diff || (diff == best_diff && (i & 1) == 0 && (best & 1) != 0)) {
+            best = i;
+            best_diff = diff;
+        }
+    }
+    return sign * dsv4_e2m1fn_value_cpu(best);
+}
+
+static void dsv4_hadamard128_inplace_cpu(float *x) {
+    for (uint32_t stride = 1; stride < 128; stride <<= 1) {
+        for (uint32_t base = 0; base < 128; base += 2u * stride) {
+            for (uint32_t i = 0; i < stride; i++) {
+                const float a = x[base + i];
+                const float b = x[base + stride + i];
+                x[base + i] = a + b;
+                x[base + stride + i] = a - b;
+            }
+        }
+    }
+    for (uint32_t i = 0; i < 128; i++) x[i] *= 0.08838834764831845f;
+}
+
+static void dsv4_fp4_act_quantize_row_inplace_cpu(float *x, uint32_t n) {
+    if ((n % 32u) != 0) ds4_die("DSV4 FP4 activation quantization requires 32-aligned rows");
+    for (uint32_t off = 0; off < n; off += 32) {
+        float amax = 0.0f;
+        for (uint32_t i = 0; i < 32; i++) {
+            const float av = fabsf(x[off + i]);
+            if (av > amax) amax = av;
+        }
+
+        if (amax < 7.052966104933725e-38f) amax = 7.052966104933725e-38f;
+        const float scale = ldexpf(1.0f, (int)ceilf(log2f(amax / 6.0f)));
+        for (uint32_t i = 0; i < 32; i++) {
+            float v = x[off + i] / scale;
+            if (v > 6.0f) v = 6.0f;
+            if (v < -6.0f) v = -6.0f;
+            x[off + i] = dsv4_e2m1fn_dequant_cpu(v) * scale;
+        }
+    }
+}
+
+/* The official DeepSeek V4 graph rotates indexer activations with a 128-wide
+ * Hadamard transform and immediately runs the FP4 activation-simulation
+ * round trip. This applies to both indexer Q and the indexer compressor KV;
+ * without it, the top-k compressed-row selection is not the model's graph. */
+static void dsv4_indexer_qat_row_inplace_cpu(float *x, uint32_t head_dim) {
+    if (head_dim != 128) ds4_die("DSV4 indexer QAT expects 128-wide indexer rows");
+    dsv4_hadamard128_inplace_cpu(x);
+    dsv4_fp4_act_quantize_row_inplace_cpu(x, head_dim);
+}
+
+static void dsv4_indexer_qat_rows_inplace_cpu(float *x, uint32_t rows, uint32_t head_dim) {
+    for (uint32_t r = 0; r < rows; r++) {
+        dsv4_indexer_qat_row_inplace_cpu(x + (uint64_t)r * head_dim, head_dim);
+    }
+}
+
 /* Quantize a float activation into Q8_K blocks so GGUF Q2_K/IQ2_XXS expert
  * kernels can reuse the same activation for many expert rows. */
 static void ds4_quantize_row_q8_K(const float *x, block_q8_K *y, int64_t k) {
@@ -5019,9 +5091,16 @@ static float softplus_stable(float x) {
     return log1pf(expf(x));
 }
 
-static void swiglu(float *out, const float *gate, const float *up, uint64_t n) {
+static void swiglu(float *out, const float *gate, const float *up, uint64_t n, float clamp) {
     for (uint64_t i = 0; i < n; i++) {
-        out[i] = silu(gate[i]) * up[i];
+        float g = gate[i];
+        float u = up[i];
+        if (clamp > 1.0e-6f) {
+            if (g > clamp) g = clamp;
+            if (u > clamp) u = clamp;
+            if (u < -clamp) u = -clamp;
+        }
+        out[i] = silu(g) * u;
     }
 }
 
@@ -5050,7 +5129,7 @@ static void layer_shared_ffn_one(
                               layer->ffn_gate_shexp,
                               layer->ffn_up_shexp,
                               xq, xscale);
-    swiglu(mid, gate, up, DS4_N_FF_EXP);
+    swiglu(mid, gate, up, DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP);
     matvec_q8_0(out, model, layer->ffn_down_shexp, mid);
 
     free(xscale);
@@ -5080,7 +5159,8 @@ static void layer_shared_ffn_one_decode_scratch(
                                     layer->ffn_up_shexp,
                                     x,
                                     scratch);
-    swiglu(scratch->shared_mid, scratch->shared_gate, scratch->shared_up, DS4_N_FF_EXP);
+    swiglu(scratch->shared_mid, scratch->shared_gate, scratch->shared_up, DS4_N_FF_EXP,
+           DS4_SWIGLU_CLAMP_EXP);
     matvec_q8_0_decode_scratch(out, model, layer->ffn_down_shexp, scratch->shared_mid, scratch);
 }
 
@@ -5089,6 +5169,7 @@ typedef struct {
     const float *gate;
     const float *up;
     uint64_t n;
+    float clamp;
 } swiglu_batch_ctx;
 
 static void swiglu_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
@@ -5097,7 +5178,8 @@ static void swiglu_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
         swiglu(ctx->mid + t * ctx->n,
                ctx->gate + t * ctx->n,
                ctx->up + t * ctx->n,
-               ctx->n);
+               ctx->n,
+               ctx->clamp);
     }
 }
 
@@ -5134,6 +5216,7 @@ static void layer_shared_ffn_batch(
         .gate = gate,
         .up = up,
         .n = hidden,
+        .clamp = DS4_SWIGLU_CLAMP_EXP,
     };
     ds4_parallel_for(n_tok, swiglu_batch_worker, &swiglu_ctx);
 
@@ -6498,6 +6581,8 @@ static bool compressor_decode_one(
     rope_tail_layer_inplace(out_comp, 1, head_dim, DS4_N_ROT, comp_pos, il, false);
     if (head_dim == DS4_N_HEAD_DIM) {
         dsv4_fp8_kv_quantize_row_inplace_cpu(out_comp, head_dim, DS4_N_ROT);
+    } else if (head_dim == DS4_N_INDEXER_HEAD_DIM) {
+        dsv4_indexer_qat_row_inplace_cpu(out_comp, head_dim);
     }
 
     if (compress_ratio == 4) {
@@ -6584,6 +6669,8 @@ static bool compressor_decode_one_decode_scratch(
     rope_tail_layer_inplace(out_comp, 1, head_dim, DS4_N_ROT, comp_pos, il, false);
     if (head_dim == DS4_N_HEAD_DIM) {
         dsv4_fp8_kv_quantize_row_inplace_cpu(out_comp, head_dim, DS4_N_ROT);
+    } else if (head_dim == DS4_N_INDEXER_HEAD_DIM) {
+        dsv4_indexer_qat_row_inplace_cpu(out_comp, head_dim);
     }
 
     if (compress_ratio == 4) {
@@ -6879,6 +6966,7 @@ static bool *indexer_allowed_decode_one(
 
     matvec_any(q, model, layer->indexer_attn_q_b, qr_norm);
     rope_tail_layer_inplace(q, n_head, head_dim, DS4_N_ROT, pos, il, false);
+    dsv4_indexer_qat_rows_inplace_cpu(q, n_head, head_dim);
 
     matvec_any(weights, model, layer->indexer_proj, cur);
     const float scale = 1.0f / sqrtf((float)(head_dim * n_head));
@@ -6944,6 +7032,7 @@ static bool *indexer_allowed_decode_one_decode_scratch(
 
     matvec_any_decode_scratch(q, model, layer->indexer_attn_q_b, qr_norm, scratch);
     rope_tail_layer_inplace(q, n_head, head_dim, DS4_N_ROT, pos, il, false);
+    dsv4_indexer_qat_rows_inplace_cpu(q, n_head, head_dim);
 
     matvec_any_decode_scratch(weights, model, layer->indexer_proj, cur, scratch);
     const float scale = 1.0f / sqrtf((float)(head_dim * n_head));
@@ -9456,6 +9545,20 @@ static bool metal_graph_encode_decode_layer(
                                                             DS4_ROPE_YARN_BETA_FAST,
                                                             DS4_ROPE_YARN_BETA_SLOW,
                                                             DS4_RMS_EPS) != 0;
+            if (ok && emit) {
+                ds4_gpu_tensor *index_row_view = ds4_gpu_tensor_view(
+                        g->layer_index_comp_cache[il],
+                        (uint64_t)index_row * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                        (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+                if (!index_row_view) {
+                    ok = false;
+                } else {
+                    ok = ds4_gpu_dsv4_indexer_qat_tensor(index_row_view,
+                                                          1,
+                                                          DS4_N_INDEXER_HEAD_DIM) != 0;
+                    ds4_gpu_tensor_free(index_row_view);
+                }
+            }
             if (ok && emit) g->layer_n_index_comp[il]++;
             const uint32_t decode_top_k = metal_graph_decode_indexer_top_k(g);
             if (ok && g->layer_n_comp[il] > decode_top_k) {
@@ -9491,6 +9594,9 @@ static bool metal_graph_encode_decode_layer(
                                                         attn_factor,
                                                         DS4_ROPE_YARN_BETA_FAST,
                                                         DS4_ROPE_YARN_BETA_SLOW) != 0;
+                if (ok) ok = ds4_gpu_dsv4_indexer_qat_tensor(g->indexer_q,
+                                                              DS4_N_INDEXER_HEAD,
+                                                              DS4_N_INDEXER_HEAD_DIM) != 0;
                 if (ok) ok = ds4_gpu_matmul_f16_tensor(g->indexer_weights, model->map, model->size,
                                                          layer->indexer_proj->abs_offset,
                                                          DS4_N_EMBD, DS4_N_INDEXER_HEAD,
@@ -9794,7 +9900,8 @@ static bool metal_graph_encode_decode_layer(
                                                          layer->ffn_up_shexp->abs_offset,
                                                          DS4_N_EMBD,
                                                          shared_dim,
-                                                         g->ffn_norm) != 0;
+                                                         g->ffn_norm,
+                                                         DS4_SWIGLU_CLAMP_EXP) != 0;
     } else {
         if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_gate, model->map, model->size,
                                                   layer->ffn_gate_shexp->abs_offset,
@@ -9804,7 +9911,8 @@ static bool metal_graph_encode_decode_layer(
                                                   layer->ffn_up_shexp->abs_offset,
                                                   DS4_N_EMBD, shared_dim,
                                                   g->ffn_norm, 1) != 0;
-        if (ok) ok = ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up, shared_dim, 0.0f, 1.0f) != 0;
+        if (ok) ok = ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
+                                           shared_dim, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
     const bool keep_ffn_out = metal_graph_needs_ffn_out(g, il, pos);
@@ -10169,7 +10277,7 @@ static void metal_graph_trace_layer_stages(
                               layer->ffn_up_shexp,
                               shared_xq,
                               shared_xscale);
-    swiglu(cpu_shared_mid, cpu_shared_gate, cpu_shared_up, shared_dim);
+    swiglu(cpu_shared_mid, cpu_shared_gate, cpu_shared_up, shared_dim, DS4_SWIGLU_CLAMP_EXP);
     matvec_q8_0(cpu_shared, model, layer->ffn_down_shexp, cpu_shared_mid);
     layer_routed_moe_one_prealloc(cpu_routed,
                                   model,
@@ -11717,6 +11825,9 @@ static bool metal_graph_encode_layer_attention_batch(
                                                     attn_factor,
                                                     DS4_ROPE_YARN_BETA_FAST,
                                                     DS4_ROPE_YARN_BETA_SLOW) != 0;
+            if (ok) ok = ds4_gpu_dsv4_indexer_qat_tensor(g->batch_indexer_q,
+                                                          n_tokens * DS4_N_INDEXER_HEAD,
+                                                          DS4_N_INDEXER_HEAD_DIM) != 0;
             if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_indexer_weights,
                                                      model->map,
                                                      model->size,
@@ -11756,6 +11867,11 @@ static bool metal_graph_encode_layer_attention_batch(
                                                              DS4_ROPE_YARN_BETA_FAST,
                                                              DS4_ROPE_YARN_BETA_SLOW,
                                                              DS4_RMS_EPS) != 0;
+                }
+                if (ok && n_comp != 0) {
+                    ok = ds4_gpu_dsv4_indexer_qat_tensor(g->layer_index_comp_cache[il],
+                                                          n_comp,
+                                                          DS4_N_INDEXER_HEAD_DIM) != 0;
                 }
                 if (ok) {
                     ok = metal_graph_refresh_ratio4_compressor_state(g,
@@ -11837,6 +11953,11 @@ static bool metal_graph_encode_layer_attention_batch(
                                 DS4_ROPE_YARN_BETA_SLOW,
                                 DS4_RMS_EPS) != 0;
                     }
+                    if (ok && index_chunk != 0) {
+                        ok = ds4_gpu_dsv4_indexer_qat_tensor(index_view,
+                                                              index_chunk,
+                                                              DS4_N_INDEXER_HEAD_DIM) != 0;
+                    }
                     if (ok) {
                         ok = metal_graph_refresh_ratio4_compressor_state(g,
                                                                          model,
@@ -11911,6 +12032,20 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                 DS4_ROPE_YARN_BETA_FAST,
                                                                 DS4_ROPE_YARN_BETA_SLOW,
                                                                 DS4_RMS_EPS) != 0;
+                        if (ok && emit) {
+                            ds4_gpu_tensor *index_row_view = ds4_gpu_tensor_view(
+                                    g->layer_index_comp_cache[il],
+                                    (uint64_t)index_row * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                                    (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+                            if (!index_row_view) {
+                                ok = false;
+                            } else {
+                                ok = ds4_gpu_dsv4_indexer_qat_tensor(index_row_view,
+                                                                      1,
+                                                                      DS4_N_INDEXER_HEAD_DIM) != 0;
+                                ds4_gpu_tensor_free(index_row_view);
+                            }
+                        }
                         if (ok && emit) g->layer_n_index_comp[il]++;
                         if (index_counts) index_counts[t] = g->layer_n_index_comp[il];
                         if (ok && t == 0) ok = metal_graph_capture_prefix1_index_state(g, il);
@@ -12559,7 +12694,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                          g->batch_shared_gate,
                                          g->batch_shared_up,
                                          (uint32_t)((uint64_t)n_tokens * shared_dim),
-                                         0.0f,
+                                         DS4_SWIGLU_CLAMP_EXP,
                                          1.0f) != 0;
     if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_shared_out,
                                               model->map,
@@ -14940,6 +15075,14 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
 
 int ds4_token_eos(ds4_engine *e) {
     return e->vocab.eos_id;
+}
+
+int ds4_token_user(ds4_engine *e) {
+    return e->vocab.user_id;
+}
+
+int ds4_token_assistant(ds4_engine *e) {
+    return e->vocab.assistant_id;
 }
 
 static int sample_argmax(const float *logits, uint32_t n_vocab) {

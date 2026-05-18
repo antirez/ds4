@@ -151,7 +151,8 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         uint64_t                up_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
-        const ds4_gpu_tensor *x);
+        const ds4_gpu_tensor *x,
+        float                   clamp);
 
 int ds4_gpu_matmul_f16_tensor(
         ds4_gpu_tensor       *out,
@@ -249,6 +250,11 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
         uint32_t          n_tok,
         uint32_t          head_dim,
         uint32_t          n_rot);
+
+int ds4_gpu_dsv4_indexer_qat_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          n_rows,
+        uint32_t          head_dim);
 
 int ds4_gpu_rope_tail_tensor(
         ds4_gpu_tensor *x,
