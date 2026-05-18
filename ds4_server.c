@@ -8935,6 +8935,10 @@ static void kv_cache_close(kv_disk_cache *kc) {
 
 static char *render_tokens_text(ds4_engine *engine, const ds4_tokens *tokens, size_t *out_len) {
     buf b = {0};
+    if (!engine || !tokens) {
+        if (out_len) *out_len = 0;
+        return buf_take(&b);
+    }
     for (int i = 0; i < tokens->len; i++) {
         size_t len = 0;
         char *piece = ds4_token_text(engine, tokens->v[i], &len);

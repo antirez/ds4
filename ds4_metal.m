@@ -260,11 +260,19 @@ static void ds4_gpu_close_batch_encoder(void) {
     g_batch_enc = nil;
 }
 
+static void ds4_gpu_label_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
+    if (!cb || !label || !label[0]) return;
+    cb.label = [NSString stringWithUTF8String:label];
+}
+
 static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
     [cb waitUntilCompleted];
     if (cb.status == MTLCommandBufferStatusError) {
+        NSString *cb_label = cb.label;
+        const char *use_label = cb_label ? [cb_label UTF8String] : label;
         fprintf(stderr, "ds4: Metal %s failed: %s\n",
-                label, [[cb.error localizedDescription] UTF8String]);
+                use_label && use_label[0] ? use_label : "command batch",
+                [[cb.error localizedDescription] UTF8String]);
         return 0;
     }
     return 1;
@@ -282,6 +290,7 @@ static int ds4_gpu_wait_pending_command_buffers(const char *label) {
 static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, const char *label) {
     if (!owned) return 1;
 
+    ds4_gpu_label_command_buffer(cb, label);
     [cb commit];
     int ok = ds4_gpu_wait_pending_command_buffers(label);
     if (!ds4_gpu_wait_command_buffer(cb, label)) ok = 0;
@@ -3940,13 +3949,14 @@ int ds4_gpu_begin_commands(void) {
     return g_batch_cb != nil;
 }
 
-int ds4_gpu_flush_commands(void) {
+int ds4_gpu_flush_commands_labeled(const char *label) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!g_batch_cb) return 0;
 
     ds4_gpu_close_batch_encoder();
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
+    ds4_gpu_label_command_buffer(cb, label);
     [cb commit];
     [g_pending_cbs addObject:cb];
 
@@ -3959,12 +3969,20 @@ int ds4_gpu_flush_commands(void) {
     return 1;
 }
 
-int ds4_gpu_end_commands(void) {
+int ds4_gpu_flush_commands(void) {
+    return ds4_gpu_flush_commands_labeled("command batch");
+}
+
+int ds4_gpu_end_commands_labeled(const char *label) {
     if (!g_batch_cb) return 0;
     ds4_gpu_close_batch_encoder();
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
-    return ds4_gpu_finish_command_buffer(cb, 1, "command batch");
+    return ds4_gpu_finish_command_buffer(cb, 1, label && label[0] ? label : "command batch");
+}
+
+int ds4_gpu_end_commands(void) {
+    return ds4_gpu_end_commands_labeled("command batch");
 }
 
 int ds4_gpu_synchronize(void) {
