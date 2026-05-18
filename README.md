@@ -29,7 +29,7 @@ dense models, we can report that:
 3. The model features a context window of **1 million tokens**.
 4. Being so large, it knows more things if you go sampling at the edge of knowledge. For instance asking about Italian show or political questions soon uncovers that 284B parameters are a lot more than 27B or 35B parameters.
 5. It writes much better English and Italian. It *feels* a quasi-frontier model.
-6. The KV cache is incredibly compressed, allowing long context inference on local computers and **on disk KV cache persistence**.
+6. The KV cache is incredibly compressed, allowing long context inference on local computers and **on disk KV cache persistence**. The compression isn't only about fitting in RAM: in our testing the model's speed survives deep contexts (>100k tokens) far better than similarly-sized recent peers like MiMo-V2.5, so long-context inference stays fast as the window fills.
 7. It works well with 2-bit quantization, if quantized in a special way (read later). This allows to run it in MacBooks with 128GB of RAM (and many people reported it working with 96GB as well, even at 250k context window!).
 8. We expect DeepSeek to release **updated versions of v4 Flash** in the future, even better than the current one.
 
