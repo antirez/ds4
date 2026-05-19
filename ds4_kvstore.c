@@ -560,6 +560,55 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
     }
 }
 
+/* Walk the on-disk index and unlink any continued snapshot whose rendered
+ * text is a strict prefix of the new snapshot's rendered text.  Continued
+ * snapshots are intermediate restart frontiers (see the comment in
+ * ds4_kvstore_entry_eviction_score above); once a longer same-prefix
+ * snapshot exists, the shorter continued entry serves no further purpose
+ * because the longer one dominates it on every prefix lookup.
+ * Cold/evict/shutdown entries on disk are explicit checkpoints (for
+ * example the anchor cold cut at the chat-task boundary) and are left
+ * alone so that workloads which diverge past their length can still hit
+ * them.  Skips the new entry itself.
+ *
+ * Only invoke this when the new store represents a freshly validated
+ * in-progress prefix (continued or cold).  Evict and shutdown stores save
+ * a live state at the moment it has just diverged from an incoming
+ * request, so the saved content may include post-divergence tokens that
+ * no future prompt will match; in that case the shorter continued
+ * snapshots are strict pre-divergence prefixes and remain useful, and the
+ * caller must not call this function.
+ *
+ * The caller is expected to follow up with ds4_kvstore_evict, whose
+ * refresh will rebuild the in-memory index from the post-prune directory
+ * state. */
+void ds4_kvstore_prune_supersedes(ds4_kvstore *kc,
+                                  const char *new_text,
+                                  size_t new_text_len,
+                                  const char *new_sha) {
+    if (!kc->enabled || !new_text || new_text_len == 0 || !new_sha) return;
+    kv_cache_refresh(kc);
+    for (int i = 0; i < kc->len; i++) {
+        const ds4_kvstore_entry *e = &kc->entry[i];
+        if (e->reason != DS4_KVSTORE_REASON_CONTINUED) continue;
+        if (e->text_bytes == 0 || (size_t)e->text_bytes >= new_text_len) continue;
+        if (!strcmp(e->sha, new_sha)) continue;
+        char prefix_sha[41];
+        ds4_kvstore_sha1_bytes_hex(new_text, (size_t)e->text_bytes, prefix_sha);
+        if (strcmp(prefix_sha, e->sha) != 0) continue;
+        if (unlink(e->path) == 0) {
+            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                    "%s: kv cache evicted reason=superseded tokens=%u hits=%u size=%.2f MiB file=%s by=%s",
+                    kv_log_name(kc),
+                    e->tokens,
+                    e->hits,
+                    (double)e->file_size / (1024.0 * 1024.0),
+                    e->path ? e->path : "?",
+                    new_sha);
+        }
+    }
+}
+
 bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
                       bool reject_different_quant, ds4_kvstore_options opt,
                       const char *log_name,
@@ -1069,6 +1118,16 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                 text_override ? (cache_text_key ? cache_text_key : "visible-transcript") : "token-text",
                 (double)(DS4_KVSTORE_FIXED_HEADER + 4ull + text_len + payload_bytes + trailer_bytes) / (1024.0 * 1024.0),
                 save_ms);
+        /* Evict and shutdown stores save a live state that has just diverged
+         * from the next incoming request (or that is about to be discarded);
+         * their full content may include post-divergence tokens that no
+         * future prompt will match.  Shorter same-session continued
+         * snapshots are strict pre-divergence prefixes and remain valuable.
+         * Only run the strict-prefix prune for continued and cold stores,
+         * where the new entry truly dominates its shorter siblings. */
+        if (strcmp(reason, "evict") != 0 && strcmp(reason, "shutdown") != 0) {
+            ds4_kvstore_prune_supersedes(kc, text, text_len, sha);
+        }
         ds4_kvstore_evict(kc, live_tokens, sha);
     }
     free(tmp);
