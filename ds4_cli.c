@@ -280,6 +280,11 @@ static double cli_now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
+static bool cli_mtp_spec_enabled(ds4_engine *engine) {
+    return ds4_engine_mtp_draft_tokens(engine) > 1 &&
+           getenv("DS4_MTP_SPEC_DISABLE") == NULL;
+}
+
 static char *read_prompt_file(const char *path, bool fatal);
 
 typedef struct {
@@ -509,8 +514,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+        if (cfg->gen.temperature <= 0.0f && cli_mtp_spec_enabled(engine)) {
             ntok = ds4_session_eval_speculative_argmax(session,
                                                        token,
                                                        max_tokens - generated,
@@ -758,7 +762,7 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
             fprintf(stderr, "ds4: diagnostic run completed on the native %s path.\n",
                     ds4_backend_name(cfg->engine.backend));
         }
-    } else if (cfg->gen.temperature > 0.0f || ds4_engine_mtp_draft_tokens(engine) > 1) {
+    } else if (cfg->gen.temperature > 0.0f || cli_mtp_spec_enabled(engine)) {
         rc = run_sampled_generation(engine, cfg, &prompt);
     } else {
         token_printer printer = {
@@ -971,8 +975,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+        if (cfg->gen.temperature <= 0.0f && cli_mtp_spec_enabled(engine)) {
             ntok = ds4_session_eval_speculative_argmax(chat->session,
                                                        token,
                                                        max_tokens - generated,
