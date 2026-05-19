@@ -4698,6 +4698,7 @@ static bool http_response(int fd, bool enable_cors, int code, const char *type, 
     const char *reason = code == 200 ? "OK" :
                          code == 204 ? "No Content" :
                          code == 400 ? "Bad Request" :
+                         code == 401 ? "Unauthorized" :
                          code == 404 ? "Not Found" :
                          code == 409 ? "Conflict" :
                          code == 500 ? "Internal Server Error" : "Error";
@@ -7635,6 +7636,7 @@ struct server {
     ds4_engine *engine;
     ds4_session *session;
     int default_tokens;
+    const char *api_key;
     kv_disk_cache kv;
     tool_memory tool_mem;
     live_tool_state responses_live;
@@ -11396,11 +11398,14 @@ static void *worker_main(void *arg) {
 typedef struct {
     char method[8];
     char path[256];
+    char *headers;
+    size_t headers_len;
     char *body;
     size_t body_len;
 } http_request;
 
 static void http_request_free(http_request *r) {
+    free(r->headers);
     free(r->body);
     memset(r, 0, sizeof(*r));
 }
@@ -11430,6 +11435,69 @@ static long content_length(const char *h, size_t n) {
         if (p < end) p++;
     }
     return 0;
+}
+
+static bool constant_time_str_eq(const char *a, size_t alen, const char *b) {
+    size_t blen = strlen(b);
+    size_t max = alen > blen ? alen : blen;
+    size_t diff = alen ^ blen;
+    for (size_t i = 0; i < max; i++) {
+        unsigned char ca = i < alen ? (unsigned char)a[i] : 0;
+        unsigned char cb = i < blen ? (unsigned char)b[i] : 0;
+        diff |= ca ^ cb;
+    }
+    return diff == 0;
+}
+
+static bool header_value_matches_api_key(const char *value, size_t len, const char *api_key) {
+    while (len && isspace((unsigned char)value[0])) {
+        value++;
+        len--;
+    }
+    while (len && isspace((unsigned char)value[len - 1])) len--;
+    return constant_time_str_eq(value, len, api_key);
+}
+
+static int api_key_auth_status(const http_request *r, const char *api_key) {
+    if (!api_key) return 200;
+    if (!r->headers) return 401;
+
+    const char *p = r->headers;
+    const char *end = r->headers + r->headers_len;
+
+    while (p < end && *p != '\n') p++;
+    if (p < end) p++;
+
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len == 0) break;
+
+        const char *colon = memchr(line, ':', len);
+        if (colon) {
+            size_t name_len = (size_t)(colon - line);
+            const char *value = colon + 1;
+            size_t value_len = len - name_len - 1;
+            if (name_len == 13 && strncasecmp(line, "Authorization", 13) == 0) {
+                while (value_len && isspace((unsigned char)value[0])) {
+                    value++;
+                    value_len--;
+                }
+                if (value_len >= 7 && !memcmp(value, "Bearer ", 7) &&
+                    header_value_matches_api_key(value + 7, value_len - 7, api_key))
+                {
+                    return 200;
+                }
+            } else if (name_len == 7 && strncasecmp(line, "api-key", 7) == 0) {
+                if (header_value_matches_api_key(value, value_len, api_key)) return 200;
+            }
+        }
+        if (p < end) p++;
+    }
+
+    return 401;
 }
 
 static bool read_http_request(int fd, http_request *r) {
@@ -11469,6 +11537,10 @@ static bool read_http_request(int fd, http_request *r) {
         buf_append(&b, tmp, (size_t)n);
     }
 
+    r->headers_len = (size_t)hend;
+    r->headers = xmalloc(r->headers_len + 1);
+    memcpy(r->headers, b.ptr, r->headers_len);
+    r->headers[r->headers_len] = '\0';
     r->body_len = (size_t)clen;
     r->body = xmalloc(r->body_len + 1);
     memcpy(r->body, b.ptr + hend, r->body_len);
@@ -11556,6 +11628,12 @@ static void *client_main(void *arg) {
     http_request hr = {0};
     if (!read_http_request(fd, &hr)) {
         http_error(fd, s->enable_cors, 400, "bad HTTP request");
+        goto done;
+    }
+
+    if (api_key_auth_status(&hr, s->api_key) != 200) {
+        http_error(fd, s->enable_cors, 401, "unauthorized");
+        http_request_free(&hr);
         goto done;
     }
 
@@ -11689,6 +11767,7 @@ typedef struct {
     int default_tokens;
     const char *chdir_path;
     const char *trace_path;
+    const char *api_key;
     const char *kv_disk_dir;
     uint64_t kv_disk_space_mb;
     kv_cache_options kv_cache;
@@ -11807,6 +11886,8 @@ static void usage(FILE *fp) {
         "      Bind address. Default: 127.0.0.1\n"
         "  --port N\n"
         "      Bind port. Default: 8000\n"
+        "  --api-key KEY\n"
+        "      Require Authorization: Bearer KEY or api-key: KEY on every HTTP request.\n"
         "  --cors\n"
         "      Add Access-Control-Allow-* headers for browser JS clients. Does not change --host.\n"
         "  --trace FILE\n"
@@ -11921,6 +12002,8 @@ static server_config parse_options(int argc, char **argv) {
             c.host = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--port")) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--api-key")) {
+            c.api_key = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
         } else if (!strcmp(arg, "--trace")) {
@@ -12019,6 +12102,7 @@ int main(int argc, char **argv) {
     s.engine = engine;
     s.session = session;
     s.default_tokens = cfg.default_tokens;
+    s.api_key = cfg.api_key;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
@@ -12500,6 +12584,51 @@ static void test_cors_headers_are_opt_in(void) {
         close(sv[0]);
         close(sv[1]);
     }
+}
+
+static http_request test_http_request_with_headers(const char *headers) {
+    http_request r = {0};
+    r.headers = (char *)headers;
+    r.headers_len = strlen(headers);
+    return r;
+}
+
+static void test_server_api_key_accepts_matching_bearer(void) {
+    http_request r = test_http_request_with_headers(
+        "GET /v1/models HTTP/1.1\r\n"
+        "Authorization: Bearer correct\r\n"
+        "\r\n");
+    TEST_ASSERT(api_key_auth_status(&r, "correct") == 200);
+}
+
+static void test_server_api_key_accepts_matching_legacy_header(void) {
+    http_request r = test_http_request_with_headers(
+        "GET /v1/models HTTP/1.1\r\n"
+        "api-key: correct\r\n"
+        "\r\n");
+    TEST_ASSERT(api_key_auth_status(&r, "correct") == 200);
+}
+
+static void test_server_api_key_rejects_missing_header(void) {
+    http_request r = test_http_request_with_headers(
+        "GET /v1/models HTTP/1.1\r\n"
+        "\r\n");
+    TEST_ASSERT(api_key_auth_status(&r, "correct") == 401);
+}
+
+static void test_server_api_key_rejects_wrong_value(void) {
+    http_request r = test_http_request_with_headers(
+        "GET /v1/models HTTP/1.1\r\n"
+        "Authorization: Bearer wrong\r\n"
+        "\r\n");
+    TEST_ASSERT(api_key_auth_status(&r, "correct") == 401);
+}
+
+static void test_server_api_key_disabled_when_unset(void) {
+    http_request r = test_http_request_with_headers(
+        "GET /v1/models HTTP/1.1\r\n"
+        "\r\n");
+    TEST_ASSERT(api_key_auth_status(&r, NULL) == 200);
 }
 
 static void test_cors_preflight_response_is_no_content(void) {
@@ -15495,6 +15624,11 @@ static void ds4_server_unit_tests_run(void) {
     test_anthropic_thinking_and_tool_args_preserve_call_order();
     test_context_length_error_uses_protocol_standard_shape();
     test_cors_headers_are_opt_in();
+    test_server_api_key_accepts_matching_bearer();
+    test_server_api_key_accepts_matching_legacy_header();
+    test_server_api_key_rejects_missing_header();
+    test_server_api_key_rejects_wrong_value();
+    test_server_api_key_disabled_when_unset();
     test_cors_preflight_response_is_no_content();
     test_cors_sse_headers();
     test_anthropic_live_stream_sends_incremental_blocks();

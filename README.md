@@ -352,7 +352,8 @@ events.
 For browser JavaScript clients served from another origin, start the server with
 `--cors` to emit `Access-Control-Allow-*` headers. This only changes HTTP
 headers; it does not expose the server on the LAN. Use `--host 0.0.0.0`
-explicitly when remote machines should be able to connect.
+explicitly when remote machines should be able to connect. When binding beyond
+localhost, use `--api-key` to require bearer-token access.
 
 ### Tool call handling and canonicalization
 
