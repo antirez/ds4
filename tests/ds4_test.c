@@ -531,7 +531,7 @@ static void test_official_logprob_vectors(void) {
     TEST_ASSERT(fp != NULL);
     if (!fp) return;
 
-    ds4_engine *engine = test_get_engine(false);
+    ds4_engine *engine = test_get_engine(true);
     if (!engine) {
         fclose(fp);
         return;

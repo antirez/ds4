@@ -33,7 +33,7 @@ API response.
 To inspect a local top-logprob dump manually:
 
 ```sh
-./ds4 --metal --nothink -sys "" --temp 0 -n 4 --ctx 16384 \
+./ds4 --metal --quality --nothink -sys "" --temp 0 -n 4 --ctx 16384 \
   --prompt-file tests/test-vectors/prompts/long_code_audit.txt \
   --dump-logprobs /tmp/long_code_audit.ds4.json \
   --logprobs-top-k 20
