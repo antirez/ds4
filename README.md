@@ -458,6 +458,10 @@ For **opencode**, add a provider and agent entry to
 
 For **Pi**, add a provider to `~/.pi/agent/models.json`:
 
+This uses the OpenAI completions API because it is currently the most exercised
+path in `ds4-server`; Responses and Anthropic Messages support will be hardened
+after inference is stabilized.
+
 ```json
 {
   "providers": {
