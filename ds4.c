@@ -14451,7 +14451,10 @@ static void cpu_directional_steering_project_rows(
     }
 }
 
-static bool cpu_load_directional_steering(ds4_engine *e) {
+/* Read every active steering slot's .f32 file into the engine's host buffer.
+ * Backend-agnostic: the host copy is used directly by the CPU reference path
+ * and uploaded to GPU tensors by metal_graph_load_directional_steering. */
+static bool load_directional_steering_slots(ds4_engine *e) {
     if (!e || e->steering_slots_count == 0) return true;
 
     const uint64_t n = (uint64_t)DS4_N_LAYER * DS4_N_EMBD;
@@ -14470,7 +14473,7 @@ static bool cpu_load_directional_steering(ds4_engine *e) {
             fprintf(stderr, "ds4: failed to load directional steering vectors from %s\n", slot->file);
             return false;
         }
-        fprintf(stderr, "ds4: CPU directional steering enabled (slot %d): %s attn=%g ffn=%g\n",
+        fprintf(stderr, "ds4: directional steering slot %d loaded: %s attn=%g ffn=%g\n",
                 k, slot->file,
                 (double)slot->attn_scale, (double)slot->ffn_scale);
     }
@@ -17255,7 +17258,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
-    if (e->backend == DS4_BACKEND_CPU && !cpu_load_directional_steering(e)) {
+    if (!load_directional_steering_slots(e)) {
         ds4_engine_close(e);
         *out = NULL;
         return 1;
