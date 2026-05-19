@@ -8156,6 +8156,7 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
 
 #define KV_CACHE_FIXED_HEADER DS4_KVSTORE_FIXED_HEADER
 #define KV_CACHE_HIT_HALF_LIFE_SECONDS DS4_KVSTORE_HIT_HALF_LIFE_SECONDS
+#define KV_CACHE_CHECKPOINT_BASE_HITS DS4_KVSTORE_CHECKPOINT_BASE_HITS
 #define KV_EXT_TOOL_MAP DS4_KVSTORE_EXT_TOOL_MAP
 #define KV_EXT_RESPONSES_VISIBLE DS4_KVSTORE_EXT_RESPONSES_VISIBLE
 #define KV_EXT_THINKING_VISIBLE DS4_KVSTORE_EXT_THINKING_VISIBLE
@@ -14236,6 +14237,84 @@ static void test_kv_cache_eviction_does_not_protect_oversize_current_store(void)
     rmdir(dir);
 }
 
+static void test_kv_cache_eviction_boosts_cold_over_continued(void) {
+    char tmpl[] = "/tmp/ds4-kv-boost-cold-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    /* Two same-size files, both freshly stored with hits=0.  The cold file
+     * has fewer tokens per byte (lower raw density), so without the boost it
+     * would lose the eviction race to the continued.  With the boost it
+     * survives. */
+    const char *cold_sha = "1111111111111111111111111111111111111111";
+    const char *cont_sha = "2222222222222222222222222222222222222222";
+    uint64_t now = (uint64_t)time(NULL);
+    test_kv_stub_file(dir, cold_sha, KV_REASON_COLD,      1024, 0, now, 4096);
+    test_kv_stub_file(dir, cont_sha, KV_REASON_CONTINUED, 1200, 0, now, 4096);
+
+    char cold_name[44], cont_name[44];
+    snprintf(cold_name, sizeof(cold_name), "%.40s.kv", cold_sha);
+    snprintf(cont_name, sizeof(cont_name), "%.40s.kv", cont_sha);
+    char *cold_path = path_join(dir, cold_name);
+    char *cont_path = path_join(dir, cont_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 4096u) + 16u;
+    kv_cache_evict(&kc, NULL, NULL);
+
+    TEST_ASSERT(access(cold_path, F_OK) == 0);
+    TEST_ASSERT(access(cont_path, F_OK) != 0);
+
+    kv_cache_close(&kc);
+    unlink(cold_path);
+    unlink(cont_path);
+    free(cold_path);
+    free(cont_path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_eviction_boosts_evict_over_continued(void) {
+    char tmpl[] = "/tmp/ds4-kv-boost-evict-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    /* Same shape as the cold test but with KV_REASON_EVICT.  Live-miss saves
+     * should get the same protection as end-of-prefill cold checkpoints. */
+    const char *evict_sha = "1111111111111111111111111111111111111111";
+    const char *cont_sha  = "2222222222222222222222222222222222222222";
+    uint64_t now = (uint64_t)time(NULL);
+    test_kv_stub_file(dir, evict_sha, KV_REASON_EVICT,     1024, 0, now, 4096);
+    test_kv_stub_file(dir, cont_sha,  KV_REASON_CONTINUED, 1200, 0, now, 4096);
+
+    char evict_name[44], cont_name[44];
+    snprintf(evict_name, sizeof(evict_name), "%.40s.kv", evict_sha);
+    snprintf(cont_name,  sizeof(cont_name),  "%.40s.kv", cont_sha);
+    char *evict_path = path_join(dir, evict_name);
+    char *cont_path  = path_join(dir, cont_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 4096u) + 16u;
+    kv_cache_evict(&kc, NULL, NULL);
+
+    TEST_ASSERT(access(evict_path, F_OK) == 0);
+    TEST_ASSERT(access(cont_path, F_OK) != 0);
+
+    kv_cache_close(&kc);
+    unlink(evict_path);
+    unlink(cont_path);
+    free(evict_path);
+    free(cont_path);
+    rmdir(dir);
+}
+
 static void test_kv_cache_eviction_score_decays_stale_hits(void) {
     /* stale: lower tokens-per-byte (e.g. tool-heavy prompt) but boosted by
      * 10 hits well in the past.  fresh: higher tokens-per-byte and zero hits,
@@ -14680,6 +14759,8 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_protects_current_store();
     test_kv_cache_eviction_does_not_protect_oversize_current_store();
+    test_kv_cache_eviction_boosts_cold_over_continued();
+    test_kv_cache_eviction_boosts_evict_over_continued();
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
