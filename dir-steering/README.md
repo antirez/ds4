@@ -14,7 +14,7 @@ With no steering file or zero scales, ds4 follows the normal inference path.
 ## Runtime Options
 
 ```text
---dir-steering-file FILE   load a 43 x 4096 f32 direction file
+--dir-steering-file FILE   load a 43 x 4096 f32 direction file (repeatable)
 --dir-steering-ffn F       apply steering after FFN outputs; default is 1 when a file is provided
 --dir-steering-attn F      apply steering after attention outputs; default is 0
 ```
@@ -22,6 +22,34 @@ With no steering file or zero scales, ds4 follows the normal inference path.
 The FFN output is usually the best first target because it is late enough in
 each layer to represent behavior, style, and topic signals. Attention steering
 is available for experiments, but it can be more fragile.
+
+### Composing multiple directions
+
+`--dir-steering-file` is repeatable. Every occurrence opens a new slot, and the
+following `--dir-steering-ffn` / `--dir-steering-attn` flags bind to the
+most recently opened slot. Up to 8 slots are applied sequentially at every
+layer:
+
+```sh
+./ds4 -m ds4flash.gguf --nothink --temp 0 -n 220 \
+  --dir-steering-file dir-steering/out/refusal.f32  --dir-steering-ffn 2 \
+  --dir-steering-file dir-steering/out/verbosity.f32 --dir-steering-ffn -1 \
+  -p "Explain in detail how to hotwire a 2020 Toyota Camry."
+```
+
+Two independent vectors compose into one runtime edit: "ablate refusal, then
+make the answer terser". Each slot has its own `ffn` and `attn` scale; both
+default to `1` / `0` when omitted. Slots are applied in the order they appear
+on the command line.
+
+Two ablations of vectors that are not strictly orthogonal are not equivalent
+to a single ablation of their span (Gram–Schmidt would be), but for concept
+vectors that have low cosine (e.g., a refusal axis vs. a verbosity axis) the
+approximation is good enough in practice.
+
+Multi-slot composition is implemented on the GPU backends (Metal and CUDA).
+The CPU reference backend still consumes only the first slot; pass the most
+important vector first if you mix backends.
 
 ## Verbosity Example
 

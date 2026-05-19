@@ -59,6 +59,16 @@ typedef struct ds4_session ds4_session;
 
 typedef void (*ds4_session_progress_fn)(void *ud, const char *event, int current, int total);
 
+#ifndef DS4_MAX_STEERING_SLOTS
+#define DS4_MAX_STEERING_SLOTS 8
+#endif
+
+typedef struct {
+    const char *file;
+    float ffn;
+    float attn;
+} ds4_steering_slot;
+
 typedef struct {
     const char *model_path;
     const char *mtp_path;
@@ -66,9 +76,16 @@ typedef struct {
     int n_threads;
     int mtp_draft_tokens;
     float mtp_margin;
+    /* Legacy single-slot fields. If steering_slots_count == 0 and a file is
+     * set here, the engine synthesizes one slot from these. Otherwise these
+     * fields are ignored in favor of the array below. */
     const char *directional_steering_file;
     float directional_steering_attn;
     float directional_steering_ffn;
+    /* Multi-slot directional steering. When count > 0, each slot is loaded
+     * independently and applied sequentially at every layer. */
+    int steering_slots_count;
+    ds4_steering_slot steering_slots[DS4_MAX_STEERING_SLOTS];
     bool warm_weights;
     bool quality;
 } ds4_engine_options;

@@ -23,6 +23,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#define DS4_STRINGIFY_(x) #x
+#define DS4_STRINGIFY(x) DS4_STRINGIFY_(x)
+
 typedef struct {
     const char *prompt;
     const char *system;
@@ -106,10 +109,14 @@ static void usage(FILE *fp) {
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
         "  --dir-steering-file FILE\n"
         "      Load one f32 direction vector per layer for directional steering.\n"
+        "      Repeatable: every additional --dir-steering-file opens a new slot.\n"
+        "      Up to " DS4_STRINGIFY(DS4_MAX_STEERING_SLOTS) " slots are applied in order at every layer.\n"
         "  --dir-steering-ffn F\n"
-        "      Apply steering after FFN outputs: y -= F*v*dot(v,y). Default with file: 1\n"
+        "      Apply steering after FFN outputs: y -= F*v*dot(v,y). Default with file: 1.\n"
+        "      Applies to the most recently opened --dir-steering-file slot.\n"
         "  --dir-steering-attn F\n"
-        "      Apply steering after attention outputs. Default: 0\n"
+        "      Apply steering after attention outputs. Default: 0.\n"
+        "      Applies to the most recently opened --dir-steering-file slot.\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before generation. Slower startup, fewer first-use stalls.\n"
         "\n"
@@ -1208,7 +1215,7 @@ static cli_config parse_options(int argc, char **argv) {
         },
     };
 
-    bool directional_steering_scale_set = false;
+    int dir_steering_slot = -1;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
@@ -1252,13 +1259,32 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--dir-steering-file")) {
-            c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
+            if (c.engine.steering_slots_count >= DS4_MAX_STEERING_SLOTS) {
+                fprintf(stderr,
+                        "ds4: too many --dir-steering-file directives (max %d)\n",
+                        DS4_MAX_STEERING_SLOTS);
+                exit(2);
+            }
+            dir_steering_slot = c.engine.steering_slots_count++;
+            c.engine.steering_slots[dir_steering_slot].file = need_arg(&i, argc, argv, arg);
+            c.engine.steering_slots[dir_steering_slot].ffn = 1.0f;
+            c.engine.steering_slots[dir_steering_slot].attn = 0.0f;
         } else if (!strcmp(arg, "--dir-steering-ffn")) {
-            c.engine.directional_steering_ffn = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
-            directional_steering_scale_set = true;
+            const float v = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
+            if (dir_steering_slot < 0) {
+                fprintf(stderr,
+                        "ds4: --dir-steering-ffn must come after a --dir-steering-file\n");
+                exit(2);
+            }
+            c.engine.steering_slots[dir_steering_slot].ffn = v;
         } else if (!strcmp(arg, "--dir-steering-attn")) {
-            c.engine.directional_steering_attn = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
-            directional_steering_scale_set = true;
+            const float v = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
+            if (dir_steering_slot < 0) {
+                fprintf(stderr,
+                        "ds4: --dir-steering-attn must come after a --dir-steering-file\n");
+                exit(2);
+            }
+            c.engine.steering_slots[dir_steering_slot].attn = v;
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--backend")) {
@@ -1320,9 +1346,7 @@ static cli_config parse_options(int argc, char **argv) {
         }
     }
 
-    if (c.engine.directional_steering_file && !directional_steering_scale_set) {
-        c.engine.directional_steering_ffn = 1.0f;
-    }
+    (void)dir_steering_slot;
     if (c.gen.imatrix_output_path && !c.gen.imatrix_dataset_path) {
         fprintf(stderr, "ds4: --imatrix-out requires --imatrix-dataset\n");
         exit(2);

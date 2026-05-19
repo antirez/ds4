@@ -1,6 +1,9 @@
 #include "ds4.h"
 #include "rax.h"
 
+#define DS4_SERVER_STRINGIFY_(x) #x
+#define DS4_SERVER_STRINGIFY(x) DS4_SERVER_STRINGIFY_(x)
+
 /* OpenAI/Anthropic compatible local server.
  *
  * HTTP is intentionally simple: each client connection is handled by a small
@@ -11793,10 +11796,14 @@ static void usage(FILE *fp) {
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
         "  --dir-steering-file FILE\n"
         "      Load one f32 direction vector per layer for directional steering.\n"
+        "      Repeatable: every additional --dir-steering-file opens a new slot.\n"
+        "      Up to " DS4_SERVER_STRINGIFY(DS4_MAX_STEERING_SLOTS) " slots are applied in order at every layer.\n"
         "  --dir-steering-ffn F\n"
-        "      Apply steering after FFN outputs: y -= F*v*dot(v,y). Default with file: 1\n"
+        "      Apply steering after FFN outputs: y -= F*v*dot(v,y). Default with file: 1.\n"
+        "      Applies to the most recently opened --dir-steering-file slot.\n"
         "  --dir-steering-attn F\n"
-        "      Apply steering after attention outputs. Default: 0\n"
+        "      Apply steering after attention outputs. Default: 0.\n"
+        "      Applies to the most recently opened --dir-steering-file slot.\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before serving. Slower startup, fewer first-use stalls.\n"
         "  --metal | --cuda | --cpu | --backend NAME\n"
@@ -11895,7 +11902,7 @@ static server_config parse_options(int argc, char **argv) {
     };
     c.kv_cache = kv_cache_default_options();
 
-    bool directional_steering_scale_set = false;
+    int dir_steering_slot = -1;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
@@ -11948,13 +11955,32 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--dir-steering-file")) {
-            c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
+            if (c.engine.steering_slots_count >= DS4_MAX_STEERING_SLOTS) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: too many --dir-steering-file directives (max %d)",
+                           DS4_MAX_STEERING_SLOTS);
+                exit(2);
+            }
+            dir_steering_slot = c.engine.steering_slots_count++;
+            c.engine.steering_slots[dir_steering_slot].file = need_arg(&i, argc, argv, arg);
+            c.engine.steering_slots[dir_steering_slot].ffn = 1.0f;
+            c.engine.steering_slots[dir_steering_slot].attn = 0.0f;
         } else if (!strcmp(arg, "--dir-steering-ffn")) {
-            c.engine.directional_steering_ffn = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
-            directional_steering_scale_set = true;
+            const float v = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
+            if (dir_steering_slot < 0) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --dir-steering-ffn must come after a --dir-steering-file");
+                exit(2);
+            }
+            c.engine.steering_slots[dir_steering_slot].ffn = v;
         } else if (!strcmp(arg, "--dir-steering-attn")) {
-            c.engine.directional_steering_attn = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
-            directional_steering_scale_set = true;
+            const float v = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
+            if (dir_steering_slot < 0) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --dir-steering-attn must come after a --dir-steering-file");
+                exit(2);
+            }
+            c.engine.steering_slots[dir_steering_slot].attn = v;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--metal")) {
@@ -11978,9 +12004,7 @@ static server_config parse_options(int argc, char **argv) {
                    "ds4-server: --kv-cache-cold-max-tokens must be 0 or >= --kv-cache-min-tokens");
         exit(2);
     }
-    if (c.engine.directional_steering_file && !directional_steering_scale_set) {
-        c.engine.directional_steering_ffn = 1.0f;
-    }
+    (void)dir_steering_slot;
     return c;
 }
 
