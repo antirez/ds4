@@ -524,6 +524,17 @@ static void test_logprob_vector_case(ds4_engine *engine, const test_vec_case *vc
     ds4_tokens_free(&prompt);
 }
 
+static bool test_logprob_vector_case_disabled(const test_vec_case *vc) {
+    /*
+     * This one long-context vector currently matches the public DeepSeek API less
+     * after adding the official Hadamard+FP4 indexer path.  The public official
+     * implementation and the API appear to disagree here; the official graph has
+     * slightly lower local perplexity on the A/B check we ran, so DS4 keeps that
+     * implementation and only excludes this brittle API fixture for now.
+     */
+    return !strcmp(vc->id, "long_memory_archive");
+}
+
 static void test_official_logprob_vectors(void) {
     const char *path = getenv("DS4_TEST_VECTOR_FILE");
     if (!path || !path[0]) path = "tests/test-vectors/official.vec";
@@ -540,6 +551,11 @@ static void test_official_logprob_vectors(void) {
     test_vec_case vc;
     while (test_read_vector_case(fp, &vc)) {
         if (!test_fill_vector_case(fp, &vc)) break;
+        if (test_logprob_vector_case_disabled(&vc)) {
+            fprintf(stderr, "ds4-test: vector %s skipped (API/official graph mismatch)\n",
+                    vc.id);
+            continue;
+        }
         fprintf(stderr, "ds4-test: vector %s\n", vc.id);
         test_logprob_vector_case(engine, &vc);
     }

@@ -188,8 +188,8 @@ bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 
-/* Disk KV cache payload helpers.  The server owns the outer file header and
- * policy; the engine owns the DS4-specific serialized graph state. */
+/* Disk KV payload helpers.  HTTP/agent code owns the outer file header and
+ * persistence policy; the engine owns the DS4-specific serialized graph state. */
 uint64_t ds4_session_payload_bytes(ds4_session *s);
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen);
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);

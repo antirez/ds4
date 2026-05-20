@@ -4,10 +4,10 @@ DwarfStar 4 is a small native inference engine specific for **DeepSeek V4 Flash*
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
 runtime: it is completely self-contained. Other than running the model in a
 correct and fast way, the project goal is to provide DS4 specific loading,
-prompt rendering, tool calling, KV state handling (RAM and on-disk), and server
-API, all ready to work with coding agents or with the provided CLI interface.
-There are also tools for GGUF and imatrix generation, and for quality and
-speed testing.
+prompt rendering, tool calling, KV state handling (RAM and on-disk), server
+API and integrated coding agent, all ready to work with coding agents or with
+the provided CLI interface. There are also tools for GGUF and imatrix generation,
+and for quality and speed testing.
 
 We support the following backends:
 * **Metal** is our primary target. Starting from MacBooks with 96GB of RAM.
@@ -38,7 +38,7 @@ That said, a few important things about this project:
 * The local inference landscape contains many excellent projects, but new models are released continuously, and the attention immediately gets captured by the next model to implement. This project takes a deliberately narrow bet: one model at a time, official-vector validation (logits obtained with the official implementation), long-context tests, and enough agent integration to know if it really works. The exact model may change as the landscape evolves, but the constraint remains: local inference credible on high end personal machines or Mac Studios, starting from 96/128GB of memory.
 * This software is developed with **strong assistance from GPT 5.5** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
 * This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache is actually a first-class disk citizen**.
-* Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. This inference engine only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is just alpha quality code, so probably we are not still there.
+* Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. This inference engine only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is beta quality code, so probably we are not still there.
 * The optimized graph path targets **Metal on macOS** and **CUDA on Linux**. The CPU path is only for correctness checks and model/tokenizer diagnostics. For CPU-only Linux builds, use `make cpu`; it builds the normal `./ds4` and `./ds4-server` binaries without CUDA or Metal. On macOS, **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. It was not possible to fix the CPU inference to avoid crashing, since each time you have to restart the computer, which is not funny. Help us, if you have the guts.
 
 ## Acknowledgements to llama.cpp and GGML
@@ -56,12 +56,14 @@ notice in our `LICENSE` file.
 
 ## Status
 
-The code and GGUF files are to be considered of **alpha quality** because
+The code and GGUF files are to be considered of **beta quality** because
 inference and model serving is a complicated matter and all this exists
 only for a few days. It will take months to reach a more stable form.
 However, we try to keep the project in a usable state, and we are making
-progresses. If you have issues, make sure to use `--trace` to log the
+progress. If you have issues, make sure to use `--trace` to log the
 sessions, and open issues including the full trace.
+
+The `ds4-agent` is alpha quality, the project was later added.
 
 ## More Documentation
 
@@ -170,6 +172,27 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 | DGX Spark GB10, 128 GB | q2 | 7047 tokens | 343.81 t/s | 13.75 t/s |
 
 ![M3 Max t/s](speed-bench/m3_max_ts.svg)
+
+## Native agent
+
+DwarfStar 4 features a native coding agent that works in a different way
+than most other systems: the inference is controlled from within the agent
+itself, without socket/API boundaries, so the session is represented
+by the on-disk KV cache itself. Moreover the tools and the system prompt
+are all designed vertically for DeepSeek v4 Flash. This provides a
+few advantages:
+
+* Low latency experience, bounded mainly by the prefill speed limits. Displaying of generated text, tool calling, start of a new session are always instantaneous.
+* Live progress bar during prefill time.
+* No DSML tool calling conversion, the tools are handled natively in the LLM format.
+* KV cache mismatch are impossible by construction, the current state is always the truth.
+* Everything is tuned for this model.
+* Ability to switch session with `/list` and `/switch` without any prefill stage.
+
+However while the system already works, there is a lot of work to do
+in order to make it ready for prime time. When finally the agent will reach
+the wanted shape, we will *likely* split the server and the client creating a stateful
+session-based protocol that can recreate all that in a client-server way.
 
 ## Benchmarking
 
