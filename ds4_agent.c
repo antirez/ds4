@@ -4211,6 +4211,7 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
 
     char load_err[160] = {0};
     if (ok && hdr.payload_bytes == 0) {
+        /* Empty-payload session (transcript only, no live KV state). */
         ds4_tokens rebuilt = {0};
         ds4_tokenize_rendered_chat(w->engine, text, &rebuilt);
         expected_tokens = (uint32_t)rebuilt.len;
@@ -4219,13 +4220,30 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
             ok = false;
         }
         ds4_tokens_free(&rebuilt);
-    } else if (ok &&
-               ds4_session_load_payload(w->session, fp, hdr.payload_bytes,
-                                        load_err, sizeof(load_err)) != 0)
-    {
-        snprintf(err, err_len, "%s", load_err[0] ? load_err : "failed to load KV payload");
-        ds4_session_invalidate(w->session);
-        ok = false;
+    } else if (ok) {
+        int rc = 1;
+        if (hdr.codec == DS4_KVSTORE_CODEC_LZ4) {
+            uint64_t uncompressed_total = 0;
+            const int n_workers = ds4_kvstore_default_options().compression_threads;
+            FILE *cr = kv_lz4_reader_open(fp, hdr.payload_bytes, hdr.chunk_size,
+                                          n_workers > 0 ? n_workers : 1,
+                                          &uncompressed_total);
+            if (!cr) {
+                snprintf(load_err, sizeof(load_err), "failed to open lz4 reader");
+            } else {
+                rc = ds4_session_load_payload(w->session, cr, uncompressed_total,
+                                              load_err, sizeof(load_err));
+                fclose(cr);
+            }
+        } else {
+            rc = ds4_session_load_payload(w->session, fp, hdr.payload_bytes,
+                                          load_err, sizeof(load_err));
+        }
+        if (rc != 0) {
+            snprintf(err, err_len, "%s", load_err[0] ? load_err : "failed to load KV payload");
+            ds4_session_invalidate(w->session);
+            ok = false;
+        }
     }
     fclose(fp);
 
@@ -4334,9 +4352,13 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     }
 
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
+    /* Stamp codec=NONE, chunk_size_log2=0 now; the actual codec is patched
+     * back after the payload region is written below.  ext_flags drives the
+     * session-title trailer that lives after the payload. */
+    const uint8_t ext_flags = session_identity ? DS4_KVSTORE_EXT_SESSION_TITLE : 0;
     ds4_kvstore_fill_header(h, (uint8_t)model_id, (uint8_t)quant_bits,
                             ds4_kvstore_reason_code(reason),
-                            session_identity ? DS4_KVSTORE_EXT_SESSION_TITLE : 0,
+                            ext_flags, DS4_KVSTORE_CODEC_NONE, 0,
                             (uint32_t)tokens->len, 0,
                             (uint32_t)ds4_session_ctx(w->session),
                             created_at, now, payload_bytes);
@@ -4344,15 +4366,59 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     ds4_kvstore_le_put32(tb, (uint32_t)text_len);
 
     errno = 0;
+    const int n_workers = ds4_kvstore_default_options().compression_threads;
+    const uint32_t chunk_bytes = DS4_KVSTORE_DEFAULT_CHUNK_BYTES;
+    uint8_t codec = DS4_KVSTORE_CODEC_NONE;
+    uint64_t on_disk_payload = 0;
     bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
               fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
-              fwrite(text, 1, text_len, fp) == text_len &&
-              ds4_session_write_staged_payload(&staged, fp,
-                                               save_err, sizeof(save_err)) == 0 &&
-              (!session_identity ||
-               agent_kv_write_title_trailer(fp, session_title,
-                                            save_err, sizeof(save_err))) &&
-              fflush(fp) == 0;
+              fwrite(text, 1, text_len, fp) == text_len;
+    if (ok) {
+        const off_t payload_start = ftello(fp);
+        if (payload_start < 0) {
+            ok = false;
+        } else if (n_workers == 0) {
+            ok = ds4_session_write_staged_payload(&staged, fp,
+                                                  save_err, sizeof(save_err)) == 0;
+        } else {
+            FILE *cw = kv_lz4_writer_open(fp, chunk_bytes, n_workers);
+            if (!cw) {
+                ok = false;
+            } else {
+                ok = ds4_session_write_staged_payload(&staged, cw,
+                                                      save_err, sizeof(save_err)) == 0;
+                if (fclose(cw) != 0) ok = false;
+                if (ok) codec = DS4_KVSTORE_CODEC_LZ4;
+            }
+        }
+        const off_t payload_end = ftello(fp);
+        if (ok && payload_end < 0) ok = false;
+        if (ok) on_disk_payload = (uint64_t)(payload_end - payload_start);
+    }
+    if (ok && session_identity) {
+        ok = agent_kv_write_title_trailer(fp, session_title,
+                                          save_err, sizeof(save_err));
+    }
+    if (ok) ok = fflush(fp) == 0;
+    if (ok) {
+        uint8_t patched[DS4_KVSTORE_FIXED_HEADER];
+        const uint8_t chunk_log2 =
+            (codec == DS4_KVSTORE_CODEC_LZ4)
+                ? (uint8_t)(__builtin_ctz(chunk_bytes))
+                : 0u;
+        ds4_kvstore_fill_header(patched, (uint8_t)model_id, (uint8_t)quant_bits,
+                                ds4_kvstore_reason_code(reason),
+                                ext_flags, codec, chunk_log2,
+                                (uint32_t)tokens->len, 0,
+                                (uint32_t)ds4_session_ctx(w->session),
+                                created_at, now, on_disk_payload);
+        if (fseeko(fp, 0, SEEK_SET) != 0 ||
+            fwrite(patched, 1, sizeof(patched), fp) != sizeof(patched) ||
+            fflush(fp) != 0)
+        {
+            ok = false;
+        }
+    }
     int saved_errno = errno;
     if (fclose(fp) != 0) {
         if (!saved_errno) saved_errno = errno;
@@ -5724,7 +5790,10 @@ static bool agent_worker_strip_session(agent_worker *w, const char *prefix,
 
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
     uint64_t now = (uint64_t)time(NULL);
-    ds4_kvstore_fill_header(h, hdr.model_id, hdr.quant_bits, hdr.reason, hdr.ext_flags,
+    /* Payload-less stripped session file: codec=NONE, chunk_size_log2=0. */
+    ds4_kvstore_fill_header(h, hdr.model_id, hdr.quant_bits,
+                            hdr.reason, hdr.ext_flags,
+                            DS4_KVSTORE_CODEC_NONE, 0,
                             stripped_token_count, hdr.hits, hdr.ctx_size,
                             hdr.created_at, now, 0);
     uint8_t tb[4];
