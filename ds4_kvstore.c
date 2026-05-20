@@ -1,4 +1,5 @@
 #include "ds4_kvstore.h"
+#include "lz4.h"
 
 /* Shared disk KV checkpoint file support.
  *
@@ -14,7 +15,9 @@
 #include <errno.h>
 #include <float.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,7 +29,11 @@
 #define KV_CACHE_MAGIC0 'K'
 #define KV_CACHE_MAGIC1 'V'
 #define KV_CACHE_MAGIC2 'C'
-#define KV_CACHE_VERSION 1u
+/* v1 was uncompressed.  v2 adds an in-place codec byte at header offset 7
+ * (formerly reserved) and a chunk_size u32 at offset 20 (formerly reserved).
+ * Older builds reject v2 files at read_header and the existing "replaced
+ * incompatible file" path retires them; the cache directory is disposable. */
+#define KV_CACHE_VERSION 2u
 #define KV_CACHE_DEFAULT_MIN_TOKENS 512
 #define KV_CACHE_DEFAULT_COLD_MAX_TOKENS 30000
 /* Tokenizers may merge text across the prompt boundary. Trimming a small tail
@@ -147,6 +154,527 @@ static void kv_logf(ds4_kvstore *kc, ds4_kvstore_log_type type,
     free(msg);
 }
 
+/* Forward declarations: the lz4 streaming block below uses these helpers,
+ * whose canonical definitions live further down. */
+static void kv_le_put64(uint8_t *p, uint64_t v);
+static uint64_t kv_le_get64(const uint8_t *p);
+
+/* Cap at 8 so a save cannot monopolise cores that should still be running
+ * inference.  Env override honoured for parity with DS4_THREADS;
+ * --kv-cache-compression-threads overrides both. */
+static int kv_cache_default_compression_threads(void) {
+    const char *env = getenv("DS4_KV_CACHE_COMPRESSION_THREADS");
+    if (env && env[0]) {
+        char *end = NULL;
+        long v = strtol(env, &end, 10);
+        if (end && !*end && v >= 0 && v <= 64) return (int)v;
+    }
+    long online = sysconf(_SC_NPROCESSORS_ONLN);
+    if (online < 1) online = 1;
+    if (online > 8) online = 8;
+    return (int)online;
+}
+
+/* ---------------------- KV Cache LZ4 streaming -----------------------------
+ *
+ * Wrap the engine's ds4_session_save_payload(fp) / load_payload(fp) FILE *
+ * with a cookie FILE that compresses or decompresses chunks of the payload
+ * region in parallel.  Engine signatures are unchanged.
+ *
+ * Payload framing on disk, when DS4_KVSTORE_CODEC_LZ4 is set in the KVC header:
+ *
+ *   u64 uncompressed_total
+ *   u32 chunk_count
+ *   for i in 0..chunk_count:
+ *       u32 raw_size      (= chunk_size for all but possibly the last)
+ *       u32 comp_size
+ *       u8[comp_size]     LZ4_compress_default output
+ *
+ * DS4_KVSTORE_CODEC_NONE skips the framing and writes raw bytes.
+ * See misc/COMPRESSED_KV_CACHE.md for design rationale.
+ * --------------------------------------------------------------------------- */
+
+/* fopencookie (glibc) and funopen (Darwin) take different callback shapes.
+ * We hide both behind kv_lz4_fwrap_open() which always returns a FILE *
+ * tied to a void cookie plus our write/read/close callbacks.  We never call
+ * fseek on the wrapper, so no seek callback is required.  Closing the
+ * wrapper does NOT close the underlying outer FILE: the caller owns that. */
+#if defined(__APPLE__)
+typedef int    kv_lz4_io_ssize_t;
+typedef int    kv_lz4_io_size_t;
+#else
+typedef ssize_t kv_lz4_io_ssize_t;
+typedef size_t  kv_lz4_io_size_t;
+#endif
+
+typedef kv_lz4_io_ssize_t (*kv_lz4_write_fn)(void *cookie, const char *buf, kv_lz4_io_size_t n);
+typedef kv_lz4_io_ssize_t (*kv_lz4_read_fn)(void *cookie, char *buf, kv_lz4_io_size_t n);
+typedef int (*kv_lz4_close_fn)(void *cookie);
+
+static FILE *kv_lz4_fwrap_open(void *cookie, const char *mode,
+                               kv_lz4_write_fn writefn,
+                               kv_lz4_read_fn readfn,
+                               kv_lz4_close_fn closefn)
+{
+    (void)mode;
+#if defined(__APPLE__)
+    return funopen(cookie, readfn, writefn, NULL, closefn);
+#elif defined(__GLIBC__)
+    cookie_io_functions_t io = (cookie_io_functions_t){
+        .read = readfn,
+        .write = writefn,
+        .seek = NULL,
+        .close = closefn,
+    };
+    return fopencookie(cookie, mode, io);
+#else
+    (void)cookie; (void)writefn; (void)readfn; (void)closefn;
+    return NULL;
+#endif
+}
+
+/* One compressor or decompressor job.  raw_size is set by the caller; the
+ * worker fills comp_size on the write side or copies raw_size bytes on the
+ * read side.  ok stays true unless lz4 returns an error. */
+typedef struct {
+    const uint8_t *src;
+    uint8_t *dst;
+    int src_size;
+    int dst_capacity;
+    int out_size;
+    bool ok;
+} kv_lz4_job;
+
+static void *kv_lz4_compress_worker(void *arg) {
+    kv_lz4_job *j = arg;
+    j->out_size = LZ4_compress_default((const char *)j->src,
+                                       (char *)j->dst,
+                                       j->src_size,
+                                       j->dst_capacity);
+    j->ok = j->out_size > 0;
+    return NULL;
+}
+
+static void *kv_lz4_decompress_worker(void *arg) {
+    kv_lz4_job *j = arg;
+    j->out_size = LZ4_decompress_safe((const char *)j->src,
+                                      (char *)j->dst,
+                                      j->src_size,
+                                      j->dst_capacity);
+    j->ok = j->out_size == j->dst_capacity;
+    return NULL;
+}
+
+/* Run up to n_workers jobs in parallel and join them.  n_workers == 1 runs
+ * inline on the calling thread; the pthread fork is just dead overhead for
+ * a single job. */
+static void kv_lz4_run_batch(kv_lz4_job *jobs, int n_jobs, int n_workers,
+                             void *(*worker)(void *)) {
+    if (n_jobs <= 0) return;
+    if (n_jobs == 1 || n_workers <= 1) {
+        for (int i = 0; i < n_jobs; i++) worker(&jobs[i]);
+        return;
+    }
+    pthread_t tids[64];
+    if (n_jobs > 64) n_jobs = 64;  /* compile-time sanity; we cap threads at 64 */
+    for (int i = 0; i < n_jobs; i++) {
+        if (pthread_create(&tids[i], NULL, worker, &jobs[i]) != 0) {
+            /* Fall back to running this and the rest inline. */
+            for (int j = i; j < n_jobs; j++) worker(&jobs[j]);
+            for (int j = 0; j < i; j++) pthread_join(tids[j], NULL);
+            return;
+        }
+    }
+    for (int i = 0; i < n_jobs; i++) pthread_join(tids[i], NULL);
+}
+
+/* Writer cookie state.  Lives only for the duration of one
+ * kv_lz4_writer_open / _close pair.  raw[] holds the per-batch raw chunk
+ * scratch; comp[] holds the per-batch compressed output.  current_filled
+ * tracks how many bytes are in raw[batch_n] so far. */
+typedef struct {
+    FILE *out;
+    uint32_t chunk_size;
+    int n_workers;
+    int batch_cap;           /* number of slots allocated; == n_workers */
+    uint8_t **raw;
+    uint8_t **comp;
+    uint32_t *raw_sizes;     /* raw bytes in slot[i]; chunk_size or partial */
+    int comp_capacity;       /* per-slot LZ4_compressBound(chunk_size) */
+    int batch_n;             /* slots fully filled in this batch */
+    uint32_t current_filled; /* bytes in slot[batch_n], the partially-filled head */
+    uint64_t uncompressed_total;
+    uint64_t on_disk_total;  /* payload bytes written, excluding framing header */
+    uint32_t chunk_count;    /* number of chunks written so far */
+    bool framing_written;
+    bool err;
+} kv_lz4_writer;
+
+/* Drain the current batch: compress all filled slots in parallel, then write
+ * each (raw_size, comp_size, comp_bytes) record in slot order.  Each slot's
+ * raw byte count was recorded in raw_sizes[i] when the slot was filled, so
+ * close-time partial chunks travel through here the same way as full chunks
+ * from the write callback. */
+static void kv_lz4_writer_flush_batch(kv_lz4_writer *w) {
+    if (w->err || w->batch_n == 0) return;
+    kv_lz4_job jobs[64];
+    for (int i = 0; i < w->batch_n; i++) {
+        jobs[i] = (kv_lz4_job){
+            .src = w->raw[i],
+            .dst = w->comp[i],
+            .src_size = (int)w->raw_sizes[i],
+            .dst_capacity = w->comp_capacity,
+            .out_size = 0,
+            .ok = false,
+        };
+    }
+    kv_lz4_run_batch(jobs, w->batch_n, w->n_workers, kv_lz4_compress_worker);
+    for (int i = 0; i < w->batch_n; i++) {
+        if (!jobs[i].ok) { w->err = true; return; }
+        uint8_t hdr[8];
+        ds4_kvstore_le_put32(hdr, (uint32_t)jobs[i].src_size);
+        ds4_kvstore_le_put32(hdr + 4, (uint32_t)jobs[i].out_size);
+        if (fwrite(hdr, 1, sizeof(hdr), w->out) != sizeof(hdr) ||
+            fwrite(jobs[i].dst, 1, (size_t)jobs[i].out_size, w->out) != (size_t)jobs[i].out_size)
+        {
+            w->err = true;
+            return;
+        }
+        w->uncompressed_total += (uint64_t)jobs[i].src_size;
+        w->on_disk_total += (uint64_t)sizeof(hdr) + (uint64_t)jobs[i].out_size;
+        w->chunk_count++;
+    }
+    w->batch_n = 0;
+}
+
+/* Cookie write callback.  Append n bytes into the current raw slot, advance
+ * to the next slot when this one fills, run a batch when all slots are full.
+ * We do not pre-write the framing header here; we patch the payload region
+ * upfront with zero placeholders and rewrite them in kv_lz4_writer_close. */
+static kv_lz4_io_ssize_t kv_lz4_writer_write(void *cookie, const char *buf, kv_lz4_io_size_t n_in) {
+    kv_lz4_writer *w = cookie;
+    const size_t n = (size_t)n_in;
+    if (w->err) return -1;
+    if (!w->framing_written) {
+        /* uncompressed_total (u64) and chunk_count (u32) are patched in close. */
+        uint8_t zero[12] = {0};
+        if (fwrite(zero, 1, sizeof(zero), w->out) != sizeof(zero)) {
+            w->err = true; return -1;
+        }
+        w->framing_written = true;
+    }
+    const char *p = buf;
+    size_t left = n;
+    while (left > 0) {
+        if (w->batch_n >= w->batch_cap) {
+            kv_lz4_writer_flush_batch(w);
+            if (w->err) return -1;
+        }
+        /* batch_n is the index of the slot we are currently filling.  Filled
+         * slots live at indices < batch_n, and their byte counts are in
+         * raw_sizes[]. */
+        uint8_t *slot = w->raw[w->batch_n];
+        uint32_t room = w->chunk_size - w->current_filled;
+        uint32_t take = left < room ? (uint32_t)left : room;
+        memcpy(slot + w->current_filled, p, take);
+        w->current_filled += take;
+        p += take;
+        left -= take;
+        if (w->current_filled == w->chunk_size) {
+            w->raw_sizes[w->batch_n] = w->chunk_size;
+            w->batch_n++;
+            w->current_filled = 0;
+            if (w->batch_n == w->batch_cap) {
+                kv_lz4_writer_flush_batch(w);
+                if (w->err) return -1;
+            }
+        }
+    }
+    return (kv_lz4_io_ssize_t)n;
+}
+
+/* Cookie close callback.  Flush any partial trailing chunk through the same
+ * batch path, then patch the payload-region framing header with the actual
+ * uncompressed_total and chunk_count we observed.  Does NOT close w->out;
+ * the caller owns the outer file. */
+static int kv_lz4_writer_close(void *cookie) {
+    kv_lz4_writer *w = cookie;
+    /* Promote the partially-filled trailing chunk to a full slot so flush
+     * counts it.  The slot's actual raw size is current_filled, not
+     * chunk_size; record that in raw_sizes before promoting. */
+    if (w->current_filled > 0) {
+        w->raw_sizes[w->batch_n] = w->current_filled;
+        w->batch_n++;
+        w->current_filled = 0;
+    }
+    kv_lz4_writer_flush_batch(w);
+
+    if (!w->err && w->framing_written) {
+        /* The framing header begins 12 bytes before the chunk records, i.e. at
+         * (cur - on_disk_total - 12). */
+        const off_t after = ftello(w->out);
+        const off_t framing_start = after - (off_t)w->on_disk_total - 12;
+        if (after < 0 || framing_start < 0 ||
+            fseeko(w->out, framing_start, SEEK_SET) != 0)
+        {
+            w->err = true;
+        } else {
+            uint8_t hdr[12];
+            kv_le_put64(hdr, w->uncompressed_total);
+            ds4_kvstore_le_put32(hdr + 8, w->chunk_count);
+            if (fwrite(hdr, 1, sizeof(hdr), w->out) != sizeof(hdr) ||
+                fseeko(w->out, 0, SEEK_END) != 0)
+            {
+                w->err = true;
+            }
+        }
+    }
+    int rc = w->err ? -1 : 0;
+    for (int i = 0; i < w->batch_cap; i++) { free(w->raw[i]); free(w->comp[i]); }
+    free(w->raw);
+    free(w->comp);
+    free(w->raw_sizes);
+    free(w);
+    return rc;
+}
+
+/* Public entry: wrap `out` so subsequent writes are chunked and lz4-encoded.
+ * The returned FILE * must be fclose()d; fclose calls our close callback,
+ * which patches the framing header in `out`.  `out` remains owned by the
+ * caller; the caller measures the on-disk payload size with ftell before
+ * opening the wrapper and again after fclose. */
+FILE *kv_lz4_writer_open(FILE *out, uint32_t chunk_size, int n_workers) {
+    if (n_workers < 1) n_workers = 1;
+    if (n_workers > 64) n_workers = 64;
+    int comp_bound = LZ4_compressBound((int)chunk_size);
+    if (comp_bound <= 0) return NULL;
+
+    kv_lz4_writer *w = calloc(1, sizeof(*w));
+    if (!w) return NULL;
+    w->out = out;
+    w->chunk_size = chunk_size;
+    w->n_workers = n_workers;
+    w->batch_cap = n_workers;
+    w->comp_capacity = comp_bound;
+    w->raw = calloc((size_t)n_workers, sizeof(uint8_t *));
+    w->comp = calloc((size_t)n_workers, sizeof(uint8_t *));
+    w->raw_sizes = calloc((size_t)n_workers, sizeof(uint32_t));
+    if (!w->raw || !w->comp || !w->raw_sizes) goto fail;
+    for (int i = 0; i < n_workers; i++) {
+        w->raw[i] = malloc(chunk_size);
+        w->comp[i] = malloc((size_t)comp_bound);
+        if (!w->raw[i] || !w->comp[i]) goto fail;
+    }
+    FILE *fp = kv_lz4_fwrap_open(w, "wb",
+                                 kv_lz4_writer_write, NULL, kv_lz4_writer_close);
+    if (!fp) goto fail;
+    return fp;
+fail:
+    if (w) {
+        if (w->raw) { for (int i = 0; i < n_workers; i++) free(w->raw[i]); free(w->raw); }
+        if (w->comp) { for (int i = 0; i < n_workers; i++) free(w->comp[i]); free(w->comp); }
+        free(w->raw_sizes);
+        free(w);
+    }
+    return NULL;
+}
+
+/* Reader cookie state.  We read one chunk at a time, decompress it, and
+ * hand bytes out through kv_lz4_reader_read until the slot is drained.
+ * The first call lazily reads the 12-byte framing header so kv_lz4_reader_open
+ * can be called before payload bytes are known. */
+typedef struct {
+    FILE *in;
+    uint32_t chunk_size;
+    int n_workers;
+    int batch_cap;
+    uint8_t **raw;          /* per-slot decompressed scratch */
+    uint8_t **comp;         /* per-slot compressed input scratch */
+    int comp_capacity;
+    uint32_t *raw_sizes;    /* per-slot uncompressed size for the current batch */
+    uint32_t *comp_sizes;   /* per-slot compressed size for the current batch */
+
+    uint64_t payload_bytes; /* on-disk payload budget remaining (compressed) */
+    uint64_t uncompressed_total;
+    uint32_t chunk_count;
+    uint32_t chunks_consumed;
+    bool framing_read;
+
+    int batch_n;            /* slots filled by the most recent read-batch */
+    int batch_pos;          /* next slot to hand out from the current batch */
+    uint32_t pos_in_slot;   /* offset within raw[batch_pos] */
+    bool err;
+} kv_lz4_reader;
+
+/* Read the 12-byte framing header (uncompressed_total, chunk_count) at the
+ * start of the payload region.  Called lazily on the first read.
+ * Validates that chunk_count matches ceil(uncompressed_total / chunk_size) so
+ * a tampered or truncated framing header is rejected before we allocate. */
+static bool kv_lz4_reader_read_framing(kv_lz4_reader *r) {
+    uint8_t hdr[12];
+    if (r->payload_bytes < sizeof(hdr)) { r->err = true; return false; }
+    if (fread(hdr, 1, sizeof(hdr), r->in) != sizeof(hdr)) { r->err = true; return false; }
+    r->uncompressed_total = kv_le_get64(hdr);
+    r->chunk_count = ds4_kvstore_le_get32(hdr + 8);
+    r->payload_bytes -= sizeof(hdr);
+    const uint64_t q = r->uncompressed_total / (uint64_t)r->chunk_size;
+    const uint64_t rem = r->uncompressed_total % (uint64_t)r->chunk_size;
+    const uint64_t expected = q + (rem ? 1u : 0u);
+    if ((uint64_t)r->chunk_count != expected) { r->err = true; return false; }
+    r->framing_read = true;
+    return true;
+}
+
+/* Read the next batch of up to batch_cap chunks, decompress them in parallel,
+ * leave them in raw[0..batch_n) for kv_lz4_reader_read to hand out in order. */
+static void kv_lz4_reader_fill_batch(kv_lz4_reader *r) {
+    r->batch_n = 0;
+    r->batch_pos = 0;
+    r->pos_in_slot = 0;
+    int n = 0;
+    while (n < r->batch_cap && r->chunks_consumed + (uint32_t)n < r->chunk_count) {
+        uint8_t lens[8];
+        if (r->payload_bytes < sizeof(lens) ||
+            fread(lens, 1, sizeof(lens), r->in) != sizeof(lens))
+        {
+            r->err = true;
+            return;
+        }
+        uint32_t raw = ds4_kvstore_le_get32(lens);
+        uint32_t comp = ds4_kvstore_le_get32(lens + 4);
+        if (raw == 0 || raw > r->chunk_size || comp == 0 ||
+            comp > (uint32_t)r->comp_capacity ||
+            r->payload_bytes < sizeof(lens) + (uint64_t)comp ||
+            fread(r->comp[n], 1, comp, r->in) != comp)
+        {
+            r->err = true;
+            return;
+        }
+        r->payload_bytes -= sizeof(lens) + (uint64_t)comp;
+        r->raw_sizes[n] = raw;
+        r->comp_sizes[n] = comp;
+        n++;
+    }
+    /* After the final chunk we must have consumed exactly the declared
+     * compressed payload region.  Any leftover bytes mean the file's
+     * payload_bytes header was lying about its size, or chunk records do
+     * not pack tightly as the writer claims. */
+    if (r->chunks_consumed + (uint32_t)n == r->chunk_count && r->payload_bytes != 0) {
+        r->err = true;
+        return;
+    }
+    if (n == 0) return;
+    kv_lz4_job jobs[64];
+    for (int i = 0; i < n; i++) {
+        jobs[i] = (kv_lz4_job){
+            .src = r->comp[i],
+            .dst = r->raw[i],
+            .src_size = (int)r->comp_sizes[i],
+            .dst_capacity = (int)r->raw_sizes[i],
+            .out_size = 0,
+            .ok = false,
+        };
+    }
+    kv_lz4_run_batch(jobs, n, r->n_workers, kv_lz4_decompress_worker);
+    for (int i = 0; i < n; i++) {
+        if (!jobs[i].ok) { r->err = true; return; }
+    }
+    r->batch_n = n;
+}
+
+/* Cookie read callback.  Hand out bytes from the current decompressed batch;
+ * pull a new batch when the current one is drained. */
+static kv_lz4_io_ssize_t kv_lz4_reader_read(void *cookie, char *buf, kv_lz4_io_size_t n_in) {
+    kv_lz4_reader *r = cookie;
+    if (r->err) return -1;
+    if (!r->framing_read && !kv_lz4_reader_read_framing(r)) return -1;
+    const size_t n = (size_t)n_in;
+    size_t produced = 0;
+    while (produced < n) {
+        if (r->chunks_consumed >= r->chunk_count && r->batch_pos >= r->batch_n) break;
+        if (r->batch_pos >= r->batch_n) {
+            kv_lz4_reader_fill_batch(r);
+            if (r->err) return -1;
+            if (r->batch_n == 0) break;
+        }
+        uint32_t slot_size = r->raw_sizes[r->batch_pos];
+        uint32_t avail = slot_size - r->pos_in_slot;
+        size_t take = n - produced < avail ? n - produced : avail;
+        memcpy(buf + produced, r->raw[r->batch_pos] + r->pos_in_slot, take);
+        produced += take;
+        r->pos_in_slot += (uint32_t)take;
+        if (r->pos_in_slot == slot_size) {
+            r->pos_in_slot = 0;
+            r->batch_pos++;
+            r->chunks_consumed++;
+        }
+    }
+    return (kv_lz4_io_ssize_t)produced;
+}
+
+static int kv_lz4_reader_close(void *cookie) {
+    kv_lz4_reader *r = cookie;
+    for (int i = 0; i < r->batch_cap; i++) { free(r->raw[i]); free(r->comp[i]); }
+    free(r->raw);
+    free(r->comp);
+    free(r->raw_sizes);
+    free(r->comp_sizes);
+    free(r);
+    return 0;
+}
+
+/* Public entry: wrap `in` so subsequent reads transparently decompress.
+ * payload_bytes is the on-disk payload byte count from the KVC header
+ * (covers framing + all chunks).  chunk_size is also from the header.
+ * If uncompressed_total_out != NULL, the framing header is read eagerly
+ * so the caller learns the uncompressed payload size before reading.
+ * The returned FILE * must be fclose()d when the caller is done. */
+FILE *kv_lz4_reader_open(FILE *in, uint64_t payload_bytes,
+                                uint32_t chunk_size, int n_workers,
+                                uint64_t *uncompressed_total_out) {
+    if (n_workers < 1) n_workers = 1;
+    if (n_workers > 64) n_workers = 64;
+    if (chunk_size == 0 || chunk_size > DS4_KVSTORE_MAX_CHUNK_BYTES) return NULL;
+    int comp_bound = LZ4_compressBound((int)chunk_size);
+    if (comp_bound <= 0) return NULL;
+
+    kv_lz4_reader *r = calloc(1, sizeof(*r));
+    if (!r) return NULL;
+    r->in = in;
+    r->chunk_size = chunk_size;
+    r->n_workers = n_workers;
+    r->batch_cap = n_workers;
+    r->comp_capacity = comp_bound;
+    r->payload_bytes = payload_bytes;
+    r->raw = calloc((size_t)n_workers, sizeof(uint8_t *));
+    r->comp = calloc((size_t)n_workers, sizeof(uint8_t *));
+    r->raw_sizes = calloc((size_t)n_workers, sizeof(uint32_t));
+    r->comp_sizes = calloc((size_t)n_workers, sizeof(uint32_t));
+    if (!r->raw || !r->comp || !r->raw_sizes || !r->comp_sizes) goto fail;
+    for (int i = 0; i < n_workers; i++) {
+        r->raw[i] = malloc(chunk_size);
+        r->comp[i] = malloc((size_t)comp_bound);
+        if (!r->raw[i] || !r->comp[i]) goto fail;
+    }
+    if (uncompressed_total_out) {
+        if (!kv_lz4_reader_read_framing(r)) goto fail;
+        *uncompressed_total_out = r->uncompressed_total;
+    }
+    FILE *fp = kv_lz4_fwrap_open(r, "rb",
+                                 NULL, kv_lz4_reader_read, kv_lz4_reader_close);
+    if (!fp) goto fail;
+    return fp;
+fail:
+    if (r) {
+        if (r->raw) { for (int i = 0; i < n_workers; i++) free(r->raw[i]); free(r->raw); }
+        if (r->comp) { for (int i = 0; i < n_workers; i++) free(r->comp[i]); free(r->comp); }
+        free(r->raw_sizes);
+        free(r->comp_sizes);
+        free(r);
+    }
+    return NULL;
+}
+
 ds4_kvstore_options ds4_kvstore_default_options(void) {
     return (ds4_kvstore_options){
         .min_tokens = KV_CACHE_DEFAULT_MIN_TOKENS,
@@ -154,6 +682,7 @@ ds4_kvstore_options ds4_kvstore_default_options(void) {
         .continued_interval_tokens = KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS,
         .boundary_trim_tokens = KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS,
         .boundary_align_tokens = KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS,
+        .compression_threads = kv_cache_default_compression_threads(),
     };
 }
 
@@ -378,7 +907,8 @@ static void kv_cache_push(ds4_kvstore *kc, ds4_kvstore_entry e) {
 
 void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
                              uint8_t quant_bits, uint8_t reason,
-                             uint8_t ext_flags, uint32_t tokens,
+                             uint8_t ext_flags, uint8_t codec,
+                             uint32_t chunk_size, uint32_t tokens,
                              uint32_t hits, uint32_t ctx_size,
                              uint64_t created_at, uint64_t last_used,
                              uint64_t payload_bytes) {
@@ -390,9 +920,11 @@ void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
     h[4] = quant_bits;
     h[5] = reason;
     h[6] = ext_flags;
+    h[7] = codec;
     ds4_kvstore_le_put32(h + 8, tokens);
     ds4_kvstore_le_put32(h + 12, hits);
     ds4_kvstore_le_put32(h + 16, ctx_size);
+    ds4_kvstore_le_put32(h + 20, chunk_size);
     kv_le_put64(h + 24, created_at);
     kv_le_put64(h + 32, last_used);
     kv_le_put64(h + 40, payload_bytes);
@@ -403,11 +935,23 @@ bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
     if (fread(h, 1, sizeof(h), fp) != sizeof(h)) return false;
     if (h[0] != KV_CACHE_MAGIC0 || h[1] != KV_CACHE_MAGIC1 ||
-        h[2] != KV_CACHE_MAGIC2 || h[3] != KV_CACHE_VERSION) return false;
+        h[2] != KV_CACHE_MAGIC2) return false;
+    /* Accept v1 (uncompressed; codec/chunk_size were reserved) and v2 (codec
+     * byte at offset 7, chunk_size at offset 20).  For v1 we synthesise
+     * codec=NONE and chunk_size=0 so the rest of the load path can branch
+     * uniformly on entry->codec without caring which version produced it. */
+    if (h[3] != 1u && h[3] != KV_CACHE_VERSION) return false;
     e->quant_bits = h[4];
     e->reason = h[5] <= DS4_KVSTORE_REASON_AGENT_SESSION ? h[5] :
                 DS4_KVSTORE_REASON_UNKNOWN;
     e->ext_flags = h[6];
+    if (h[3] == KV_CACHE_VERSION) {
+        e->codec = h[7];
+        e->chunk_size = ds4_kvstore_le_get32(h + 20);
+    } else {
+        e->codec = DS4_KVSTORE_CODEC_NONE;
+        e->chunk_size = 0;
+    }
     e->tokens = ds4_kvstore_le_get32(h + 8);
     e->hits = ds4_kvstore_le_get32(h + 12);
     e->ctx_size = ds4_kvstore_le_get32(h + 16);
@@ -418,7 +962,11 @@ bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
     if (fread(tb, 1, sizeof(tb), fp) != sizeof(tb)) return false;
     *text_bytes = ds4_kvstore_le_get32(tb);
     e->text_bytes = *text_bytes;
-    return e->tokens != 0 && (e->quant_bits == 2 || e->quant_bits == 4);
+    return e->tokens != 0 && (e->quant_bits == 2 || e->quant_bits == 4) &&
+           (e->codec == DS4_KVSTORE_CODEC_NONE ||
+            (e->codec == DS4_KVSTORE_CODEC_LZ4 &&
+             e->chunk_size > 0 &&
+             e->chunk_size <= DS4_KVSTORE_MAX_CHUNK_BYTES));
 }
 
 bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
@@ -474,6 +1022,7 @@ bool ds4_kvstore_touch_file(const char *path, uint32_t hits) {
         uint8_t h[DS4_KVSTORE_FIXED_HEADER];
         uint64_t now = (uint64_t)time(NULL);
         ds4_kvstore_fill_header(h, e.quant_bits, e.reason, e.ext_flags,
+                                e.codec, e.chunk_size,
                                 e.tokens, hits, e.ctx_size,
                                 e.created_at, now, e.payload_bytes);
         ok = fseek(fp, 0, SEEK_SET) == 0 &&
@@ -584,7 +1133,7 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
     kc->opt = opt;
     ds4_kvstore_evict(kc, NULL, NULL);
     kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-            "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus)",
+            "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus, codec=%s threads=%d chunk=%uK)",
             kv_log_name(kc),
             kc->dir,
             (unsigned long long)(kc->budget_bytes / (1024ull * 1024ull)),
@@ -594,7 +1143,10 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
             kc->opt.continued_interval_tokens,
             kc->opt.boundary_trim_tokens,
             kc->opt.boundary_align_tokens,
-            (unsigned long long)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
+            (unsigned long long)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS,
+            kc->opt.compression_threads > 0 ? "lz4" : "none",
+            kc->opt.compression_threads,
+            (unsigned int)(DS4_KVSTORE_DEFAULT_CHUNK_BYTES / 1024u));
     return true;
 }
 
@@ -861,6 +1413,7 @@ static void kv_cache_rewrite_trailer(ds4_kvstore *kc, const char *path,
             uint64_t now = (uint64_t)time(NULL);
             ds4_kvstore_fill_header(h, hdr.quant_bits, hdr.reason,
                                     (uint8_t)(hdr.ext_flags | hooks->ext_flag),
+                                    hdr.codec, hdr.chunk_size,
                                     hdr.tokens, hdr.hits, hdr.ctx_size,
                                     hdr.created_at, now, hdr.payload_bytes);
             ok = fseeko(fp, 0, SEEK_SET) == 0 &&
@@ -998,8 +1551,13 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
     uint8_t ext_flags = trailer_est_bytes > 0 && hooks ? hooks->ext_flag : 0;
     if (text_override) ext_flags |= cache_text_ext;
+    /* Codec, chunk_size, and final payload_bytes are filled in after the
+     * payload region is written below.  Stamp NONE/0 here so a partially-
+     * written file is at least readable as uncompressed v2 if the patch-back
+     * step fails for some reason. */
     ds4_kvstore_fill_header(h, (uint8_t)quant_bits,
                             ds4_kvstore_reason_code(reason), ext_flags,
+                            DS4_KVSTORE_CODEC_NONE, 0,
                             (uint32_t)store_tokens.len, 0,
                             (uint32_t)ds4_session_ctx(session),
                             now, now, payload_bytes);
@@ -1007,12 +1565,59 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     ds4_kvstore_le_put32(tb, (uint32_t)text_len);
     uint64_t trailer_bytes = 0;
     errno = 0;
+    const int n_workers = kc->opt.compression_threads;
+    const uint32_t chunk_bytes = DS4_KVSTORE_DEFAULT_CHUNK_BYTES;
+    uint8_t codec = DS4_KVSTORE_CODEC_NONE;
+    uint64_t on_disk_payload = 0;
     bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
               fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
-              fwrite(text, 1, text_len, fp) == text_len &&
-              ds4_session_save_payload(session, fp, save_err, sizeof(save_err)) == 0 &&
-              kv_trailer_write(hooks, fp, text, &trailer_bytes) &&
-              fflush(fp) == 0;
+              fwrite(text, 1, text_len, fp) == text_len;
+    if (ok) {
+        const off_t payload_start = ftello(fp);
+        if (payload_start < 0) {
+            ok = false;
+        } else if (n_workers == 0) {
+            ok = ds4_session_save_payload(session, fp, save_err, sizeof(save_err)) == 0;
+        } else {
+            FILE *cw = kv_lz4_writer_open(fp, chunk_bytes, n_workers);
+            if (!cw) {
+                ok = false;
+            } else {
+                ok = ds4_session_save_payload(session, cw, save_err, sizeof(save_err)) == 0;
+                /* fclose on the cookie patches the framing header in fp and
+                 * does NOT close fp.  Any cookie-side write error sets the
+                 * close return value. */
+                if (fclose(cw) != 0) ok = false;
+                if (ok) codec = DS4_KVSTORE_CODEC_LZ4;
+            }
+        }
+        const off_t payload_end = ftello(fp);
+        if (ok && payload_end < 0) ok = false;
+        if (ok) on_disk_payload = (uint64_t)(payload_end - payload_start);
+    }
+    if (ok) {
+        ok = kv_trailer_write(hooks, fp, text, &trailer_bytes) &&
+             fflush(fp) == 0;
+    }
+    /* Patch the KVC header in place with the actual codec, chunk_size, and
+     * on-disk payload byte count.  This is the only field rewrite; the rest
+     * of the header was already correct. */
+    if (ok) {
+        uint8_t patched[DS4_KVSTORE_FIXED_HEADER];
+        ds4_kvstore_fill_header(patched, (uint8_t)quant_bits,
+                                ds4_kvstore_reason_code(reason),
+                                ext_flags, codec,
+                                codec == DS4_KVSTORE_CODEC_LZ4 ? chunk_bytes : 0,
+                                (uint32_t)store_tokens.len, 0,
+                                (uint32_t)ds4_session_ctx(session),
+                                now, now, on_disk_payload);
+        if (fseeko(fp, 0, SEEK_SET) != 0 ||
+            fwrite(patched, 1, sizeof(patched), fp) != sizeof(patched) ||
+            fflush(fp) != 0)
+        {
+            ok = false;
+        }
+    }
     int saved_errno = errno;
     if (fclose(fp) != 0) {
         if (!saved_errno) saved_errno = errno;
@@ -1020,7 +1625,9 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     }
     uint64_t final_file_bytes = 0, final_required_bytes = 0;
     bool final_size_over_budget = false;
-    if (ok && !ds4_kvstore_file_size_fits(kc, (uint64_t)text_len, payload_bytes,
+    /* Use the real on-disk payload size — generally smaller than the
+     * uncompressed estimate, never larger. */
+    if (ok && !ds4_kvstore_file_size_fits(kc, (uint64_t)text_len, on_disk_payload,
                                           trailer_bytes,
                                           &final_file_bytes,
                                           &final_required_bytes))
@@ -1060,15 +1667,29 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         }
         unlink(tmp);
     } else {
-        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                "%s: kv cache stored tokens=%d trimmed=%d reason=%s key=%s size=%.2f MiB save=%.1f ms",
-                kv_log_name(kc),
-                store_tokens.len,
-                original_len - store_tokens.len,
-                reason,
-                text_override ? (cache_text_key ? cache_text_key : "visible-transcript") : "token-text",
-                (double)(DS4_KVSTORE_FIXED_HEADER + 4ull + text_len + payload_bytes + trailer_bytes) / (1024.0 * 1024.0),
-                save_ms);
+        const double size_mib = (double)on_disk_payload / (1024.0 * 1024.0);
+        if (codec == DS4_KVSTORE_CODEC_LZ4) {
+            const double ratio = on_disk_payload ?
+                (double)payload_bytes / (double)on_disk_payload : 0.0;
+            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                    "%s: kv cache stored tokens=%d trimmed=%d reason=%s key=%s codec=lz4 size=%.2f MiB comp=%.2fx save=%.1f ms",
+                    kv_log_name(kc),
+                    store_tokens.len,
+                    original_len - store_tokens.len,
+                    reason,
+                    text_override ? (cache_text_key ? cache_text_key : "visible-transcript") : "token-text",
+                    size_mib, ratio, save_ms);
+        } else {
+            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                    "%s: kv cache stored tokens=%d trimmed=%d reason=%s key=%s size=%.2f MiB save=%.1f ms",
+                    kv_log_name(kc),
+                    store_tokens.len,
+                    original_len - store_tokens.len,
+                    reason,
+                    text_override ? (cache_text_key ? cache_text_key : "visible-transcript") : "token-text",
+                    (double)(DS4_KVSTORE_FIXED_HEADER + 4ull + text_len + on_disk_payload + trailer_bytes) / (1024.0 * 1024.0),
+                    save_ms);
+        }
         ds4_kvstore_evict(kc, live_tokens, sha);
     }
     free(tmp);
@@ -1192,9 +1813,38 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     }
     char err[160] = {0};
     int loaded = 0;
-    if (header_ok &&
-        ds4_session_load_payload(session, fp, hdr.payload_bytes, err, sizeof(err)) == 0)
-    {
+    int load_rc = 1;
+    if (header_ok) {
+        if (hdr.codec == DS4_KVSTORE_CODEC_LZ4) {
+            const off_t payload_start = ftello(fp);
+            /* The engine reads UNCOMPRESSED bytes from cr and requires the
+             * "remaining" budget to be exactly the uncompressed payload size
+             * (it errors on both shortfall and trailing bytes).  Have the
+             * reader peek the framing header eagerly so we know the
+             * uncompressed total before handing the wrapper to the engine. */
+            uint64_t uncompressed_total = 0;
+            FILE *cr = kv_lz4_reader_open(fp, hdr.payload_bytes, hdr.chunk_size,
+                                          kc->opt.compression_threads > 0 ? kc->opt.compression_threads : 1,
+                                          &uncompressed_total);
+            if (!cr) {
+                load_rc = 1;
+                snprintf(err, sizeof(err), "failed to open lz4 reader");
+            } else {
+                load_rc = ds4_session_load_payload(session, cr, uncompressed_total,
+                                                   err, sizeof(err));
+                fclose(cr);
+                /* Skip the outer fp past the payload region so the trailer
+                 * load lands at the right place. */
+                if (payload_start >= 0) {
+                    (void)fseeko(fp, payload_start + (off_t)hdr.payload_bytes, SEEK_SET);
+                }
+            }
+        } else {
+            load_rc = ds4_session_load_payload(session, fp, hdr.payload_bytes,
+                                               err, sizeof(err));
+        }
+    }
+    if (load_rc == 0) {
         const ds4_tokens *loaded_tokens = ds4_session_tokens(session);
         if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens) {
             loaded = (int)hdr.tokens;

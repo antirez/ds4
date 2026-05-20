@@ -2244,13 +2244,30 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
     }
 
     char load_err[160] = {0};
-    if (ok &&
-        ds4_session_load_payload(w->session, fp, hdr.payload_bytes,
-                                 load_err, sizeof(load_err)) != 0)
-    {
-        snprintf(err, err_len, "%s", load_err[0] ? load_err : "failed to load KV payload");
-        ds4_session_invalidate(w->session);
-        ok = false;
+    if (ok) {
+        int rc = 1;
+        if (hdr.codec == DS4_KVSTORE_CODEC_LZ4) {
+            uint64_t uncompressed_total = 0;
+            const int n_workers = ds4_kvstore_default_options().compression_threads;
+            FILE *cr = kv_lz4_reader_open(fp, hdr.payload_bytes, hdr.chunk_size,
+                                          n_workers > 0 ? n_workers : 1,
+                                          &uncompressed_total);
+            if (!cr) {
+                snprintf(load_err, sizeof(load_err), "failed to open lz4 reader");
+            } else {
+                rc = ds4_session_load_payload(w->session, cr, uncompressed_total,
+                                              load_err, sizeof(load_err));
+                fclose(cr);
+            }
+        } else {
+            rc = ds4_session_load_payload(w->session, fp, hdr.payload_bytes,
+                                          load_err, sizeof(load_err));
+        }
+        if (rc != 0) {
+            snprintf(err, err_len, "%s", load_err[0] ? load_err : "failed to load KV payload");
+            ds4_session_invalidate(w->session);
+            ok = false;
+        }
     }
     fclose(fp);
 
@@ -2333,9 +2350,12 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
 
     const uint64_t now = (uint64_t)time(NULL);
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
+    /* Stamp NONE / 0 for codec and chunk_size now; the actual values are
+     * patched back after the payload region is written below. */
     ds4_kvstore_fill_header(h, (uint8_t)quant_bits,
                             ds4_kvstore_reason_code(reason),
-                            0, (uint32_t)tokens->len, 0,
+                            0, DS4_KVSTORE_CODEC_NONE, 0,
+                            (uint32_t)tokens->len, 0,
                             (uint32_t)ds4_session_ctx(w->session),
                             now, now, payload_bytes);
     uint8_t tb[4];
@@ -2343,12 +2363,54 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
 
     char save_err[160] = {0};
     errno = 0;
+    const int n_workers = ds4_kvstore_default_options().compression_threads;
+    const uint32_t chunk_bytes = DS4_KVSTORE_DEFAULT_CHUNK_BYTES;
+    uint8_t codec = DS4_KVSTORE_CODEC_NONE;
+    uint64_t on_disk_payload = 0;
     bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
               fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
-              fwrite(text, 1, text_len, fp) == text_len &&
-              ds4_session_save_payload(w->session, fp,
-                                       save_err, sizeof(save_err)) == 0 &&
-              fflush(fp) == 0;
+              fwrite(text, 1, text_len, fp) == text_len;
+    if (ok) {
+        const off_t payload_start = ftello(fp);
+        if (payload_start < 0) {
+            ok = false;
+        } else if (n_workers == 0) {
+            ok = ds4_session_save_payload(w->session, fp,
+                                          save_err, sizeof(save_err)) == 0;
+        } else {
+            FILE *cw = kv_lz4_writer_open(fp, chunk_bytes, n_workers);
+            if (!cw) {
+                ok = false;
+            } else {
+                ok = ds4_session_save_payload(w->session, cw,
+                                              save_err, sizeof(save_err)) == 0;
+                if (fclose(cw) != 0) ok = false;
+                if (ok) codec = DS4_KVSTORE_CODEC_LZ4;
+            }
+        }
+        const off_t payload_end = ftello(fp);
+        if (ok && payload_end < 0) ok = false;
+        if (ok) on_disk_payload = (uint64_t)(payload_end - payload_start);
+    }
+    if (ok) ok = fflush(fp) == 0;
+    /* Patch codec/chunk_size/payload_bytes in the header now that we know
+     * the real on-disk size.  Mirror of the kvstore store path. */
+    if (ok) {
+        uint8_t patched[DS4_KVSTORE_FIXED_HEADER];
+        ds4_kvstore_fill_header(patched, (uint8_t)quant_bits,
+                                ds4_kvstore_reason_code(reason),
+                                0, codec,
+                                codec == DS4_KVSTORE_CODEC_LZ4 ? chunk_bytes : 0,
+                                (uint32_t)tokens->len, 0,
+                                (uint32_t)ds4_session_ctx(w->session),
+                                now, now, on_disk_payload);
+        if (fseeko(fp, 0, SEEK_SET) != 0 ||
+            fwrite(patched, 1, sizeof(patched), fp) != sizeof(patched) ||
+            fflush(fp) != 0)
+        {
+            ok = false;
+        }
+    }
     int saved_errno = errno;
     if (fclose(fp) != 0) {
         if (!saved_errno) saved_errno = errno;

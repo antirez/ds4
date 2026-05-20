@@ -8413,8 +8413,10 @@ static void kv_fill_header(uint8_t h[KV_CACHE_FIXED_HEADER], uint8_t quant_bits,
                            uint32_t tokens, uint32_t hits, uint32_t ctx_size,
                            uint64_t created_at, uint64_t last_used,
                            uint64_t payload_bytes) {
-    ds4_kvstore_fill_header(h, quant_bits, reason, ext_flags, tokens, hits,
-                            ctx_size, created_at, last_used, payload_bytes);
+    ds4_kvstore_fill_header(h, quant_bits, reason, ext_flags,
+                            DS4_KVSTORE_CODEC_NONE, 0,
+                            tokens, hits, ctx_size,
+                            created_at, last_used, payload_bytes);
 }
 #endif
 
@@ -10956,6 +10958,10 @@ static void usage(FILE *fp) {
         "      Align cold boundary saves down to this token multiple. 0 disables alignment. Default: 2048\n"
         "  --kv-cache-reject-different-quant\n"
         "      Refuse checkpoints written by the same model with a different routed-expert quantization.\n"
+        "  --kv-cache-compression-threads N\n"
+        "      LZ4 compressor threads for the disk payload region.  0 disables\n"
+        "      compression (writes uncompressed v2 files).  Default: min(8, online cpus).\n"
+        "      Env override: DS4_KV_CACHE_COMPRESSION_THREADS.\n"
         "  --disable-exact-dsml-tool-replay\n"
         "      Disable the tool-id -> exact sampled DSML map. Tool history falls back to canonical JSON rendering.\n"
         "  --tool-memory-max-ids N\n"
@@ -11060,6 +11066,10 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_cache.boundary_align_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-reject-different-quant")) {
             c.kv_cache_reject_different_quant = true;
+        } else if (!strcmp(arg, "--kv-cache-compression-threads")) {
+            int t = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (t > 64) t = 64;  /* matches the writer/reader internal cap */
+            c.kv_cache.compression_threads = t;
         } else if (!strcmp(arg, "--disable-exact-dsml-tool-replay")) {
             c.disable_exact_dsml_tool_replay = true;
         } else if (!strcmp(arg, "--tool-memory-max-ids")) {
