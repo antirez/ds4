@@ -10916,6 +10916,10 @@ static void usage(FILE *fp) {
         "      Apply steering after FFN outputs: y -= F*v*dot(v,y). Default with file: 1\n"
         "  --dir-steering-attn F\n"
         "      Apply steering after attention outputs. Default: 0\n"
+        "  --expert-steering-file FILE\n"
+        "      Load one 43 x 256 f32 expert routing steering map.\n"
+        "  --expert-steering-scale F\n"
+        "      Router promote/suppress margin. Negative reverses the map. Default with file: 0.01\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before serving. Slower startup, fewer first-use stalls.\n"
         "  --metal | --cuda | --cpu | --backend NAME\n"
@@ -11015,6 +11019,7 @@ static server_config parse_options(int argc, char **argv) {
     c.kv_cache = kv_cache_default_options();
 
     bool directional_steering_scale_set = false;
+    bool expert_steering_scale_set = false;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
@@ -11074,6 +11079,11 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dir-steering-attn")) {
             c.engine.directional_steering_attn = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             directional_steering_scale_set = true;
+        } else if (!strcmp(arg, "--expert-steering-file")) {
+            c.engine.expert_steering_file = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--expert-steering-scale")) {
+            c.engine.expert_steering_scale = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
+            expert_steering_scale_set = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--metal")) {
@@ -11099,6 +11109,9 @@ static server_config parse_options(int argc, char **argv) {
     }
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
+    }
+    if (c.engine.expert_steering_file && !expert_steering_scale_set) {
+        c.engine.expert_steering_scale = 0.01f;
     }
     return c;
 }

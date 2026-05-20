@@ -52,6 +52,7 @@
 #define DS4_RMS_EPS ( 1.0e-6f)
 #define DS4_HC_EPS  ( 1.0e-6f)
 #define DS4_EXPERT_WEIGHT_SCALE (1.5f)
+#define DS4_EXPERT_STEERING_DEFAULT_SCALE (0.01f)
 #define DS4_SWIGLU_CLAMP_EXP    (10.0f)
 #define DS4_ROPE_FREQ_BASE      (10000.0f)
 #define DS4_ROPE_SCALE_FACTOR   (16.0f)
@@ -601,6 +602,22 @@ static bool read_f32_binary_file(const char *path, float *data, uint64_t n) {
 static bool cpu_directional_steering_enabled(
         const float *dirs,
         float        scale);
+
+static bool expert_steering_enabled(
+    const float *map,
+    float        scale);
+
+static void expert_steering_apply_probs(
+    float       probs[DS4_N_EXPERT],
+    const float *map,
+    float        scale,
+    uint32_t     il);
+
+static void expert_steering_apply_selection(
+    float       selection[DS4_N_EXPERT],
+    const float *map,
+    float        scale,
+    uint32_t     il);
 
 static void cpu_directional_steering_project_rows(
         float       *x,
@@ -5284,10 +5301,14 @@ static void layer_hash_router_weights_one(
         const ds4_model   * model,
         const ds4_layer_weights * layer,
         const float       * x,
-        const int          selected[DS4_N_EXPERT_USED]) {
+        const int          selected[DS4_N_EXPERT_USED],
+        const float       * expert_steering,
+        float               expert_steering_scale,
+        uint32_t            il) {
     float probs[DS4_N_EXPERT];
 
     layer_router_probs_one(probs, model, layer, x);
+    expert_steering_apply_probs(probs, expert_steering, expert_steering_scale, il);
     layer_hash_router_weights_from_probs(weights_out, probs, selected);
 }
 
@@ -5312,18 +5333,26 @@ static void layer_topk_selected_experts_from_probs(
         float                  expert_weight[DS4_N_EXPERT_USED],
         const ds4_model       *model,
         const ds4_layer_weights *layer,
-        const float           probs[DS4_N_EXPERT]);
+        const float           probs[DS4_N_EXPERT],
+        const float           *expert_steering,
+        float                 expert_steering_scale,
+        uint32_t              il);
 
 static void layer_topk_selected_experts(
         int                    selected[DS4_N_EXPERT_USED],
         float                  expert_weight[DS4_N_EXPERT_USED],
         const ds4_model       *model,
         const ds4_layer_weights *layer,
-        const float           *x) {
+        const float           *x,
+        const float           *expert_steering,
+        float                 expert_steering_scale,
+        uint32_t              il) {
     float probs[DS4_N_EXPERT];
 
     layer_router_probs_one(probs, model, layer, x);
-    layer_topk_selected_experts_from_probs(selected, expert_weight, model, layer, probs);
+    expert_steering_apply_probs(probs, expert_steering, expert_steering_scale, il);
+    layer_topk_selected_experts_from_probs(selected, expert_weight, model, layer, probs,
+                                           expert_steering, expert_steering_scale, il);
 }
 
 static void layer_topk_selected_experts_from_probs(
@@ -5331,7 +5360,10 @@ static void layer_topk_selected_experts_from_probs(
         float                  expert_weight[DS4_N_EXPERT_USED],
         const ds4_model       *model,
         const ds4_layer_weights *layer,
-        const float           probs[DS4_N_EXPERT]) {
+        const float           probs[DS4_N_EXPERT],
+        const float           *expert_steering,
+        float                 expert_steering_scale,
+        uint32_t              il) {
     float selection[DS4_N_EXPERT];
 
     memcpy(selection, probs, sizeof(selection));
@@ -5340,6 +5372,8 @@ static void layer_topk_selected_experts_from_probs(
         const float *bias = tensor_data(model, layer->ffn_exp_probs_b);
         for (int i = 0; i < DS4_N_EXPERT; i++) selection[i] += bias[i];
     }
+
+    expert_steering_apply_selection(selection, expert_steering, expert_steering_scale, il);
 
     topk_desc(selection, DS4_N_EXPERT, DS4_N_EXPERT_USED, selected);
 
@@ -5365,6 +5399,8 @@ static void layer_routed_moe_one(
         const float       * x,
         uint32_t            il,
         int                 token,
+    const float       * expert_steering,
+    float               expert_steering_scale,
         float               clamp,
         bool                trace) {
     int selected[DS4_N_EXPERT_USED];
@@ -5386,9 +5422,11 @@ static void layer_routed_moe_one(
 
     if (layer->ffn_gate_tid2eid) {
         layer_hash_selected_experts(selected, model, layer, token);
-        layer_hash_router_weights_one(expert_weight, model, layer, x, selected);
+        layer_hash_router_weights_one(expert_weight, model, layer, x, selected,
+                                      expert_steering, expert_steering_scale, il);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, x);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, x,
+                                    expert_steering, expert_steering_scale, il);
     }
 
     if (!trace) {
@@ -5463,6 +5501,8 @@ static void layer_routed_moe_one_prealloc(
         const float       * x,
         uint32_t            il,
         int                 token,
+    const float       * expert_steering,
+    float               expert_steering_scale,
         float               clamp,
         float              * mid_all,
         block_q8_K         * xq,
@@ -5480,9 +5520,11 @@ static void layer_routed_moe_one_prealloc(
 
     if (layer->ffn_gate_tid2eid) {
         layer_hash_selected_experts(selected, model, layer, token);
-        layer_hash_router_weights_one(expert_weight, model, layer, x, selected);
+        layer_hash_router_weights_one(expert_weight, model, layer, x, selected,
+                                      expert_steering, expert_steering_scale, il);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, x);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, x,
+                                    expert_steering, expert_steering_scale, il);
     }
 
     matvec_iq2_xxs_experts_mid_prequant(mid_all, model,
@@ -5514,6 +5556,8 @@ static void layer_routed_moe_batch(
         const int         * token_ids,
         uint32_t            n_tok,
         uint32_t            il,
+    const float       * expert_steering,
+    float               expert_steering_scale,
         float               clamp) {
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
     const uint64_t expert_out_dim = layer->ffn_gate_exps->dim[1];
@@ -5546,9 +5590,11 @@ static void layer_routed_moe_batch(
         float weights[DS4_N_EXPERT_USED];
         if (layer->ffn_gate_tid2eid) {
             layer_hash_selected_experts(sel, model, layer, token_ids[t]);
-            layer_hash_router_weights_one(weights, model, layer, norm + (uint64_t)t * expert_in_dim, sel);
+            layer_hash_router_weights_one(weights, model, layer, norm + (uint64_t)t * expert_in_dim, sel,
+                                          expert_steering, expert_steering_scale, il);
         } else {
-            layer_topk_selected_experts(sel, weights, model, layer, norm + (uint64_t)t * expert_in_dim);
+            layer_topk_selected_experts(sel, weights, model, layer, norm + (uint64_t)t * expert_in_dim,
+                                        expert_steering, expert_steering_scale, il);
         }
 
         for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
@@ -5665,6 +5711,8 @@ static void layer_ffn_one(
         int                 token,
         const float       * steering_dirs,
         float               steering_scale,
+    const float       * expert_steering,
+    float               expert_steering_scale,
         bool                trace) {
     const uint32_t n_hc = DS4_N_HC;
     const bool profile = getenv("DS4_DECODE_PROFILE_DETAIL") != NULL;
@@ -5706,7 +5754,9 @@ static void layer_ffn_one(
     }
 
     t0 = profile ? now_sec() : 0.0;
-    layer_routed_moe_one(moe, model, layer, norm, il, token, DS4_SWIGLU_CLAMP_EXP, trace);
+    layer_routed_moe_one(moe, model, layer, norm, il, token,
+                         expert_steering, expert_steering_scale,
+                         DS4_SWIGLU_CLAMP_EXP, trace);
     if (profile) t_routed = now_sec() - t0;
     if (trace) {
         char name[64];
@@ -5770,6 +5820,8 @@ static void layer_ffn_one_decode_scratch(
         int                      token,
         const float            * steering_dirs,
         float                    steering_scale,
+    const float            * expert_steering,
+    float                    expert_steering_scale,
         ds4_cpu_decode_scratch * scratch) {
     const uint32_t n_hc = DS4_N_HC;
     const bool profile = getenv("DS4_DECODE_PROFILE_DETAIL") != NULL;
@@ -5804,6 +5856,8 @@ static void layer_ffn_one_decode_scratch(
                                   scratch->ffn_norm,
                                   il,
                                   token,
+                                  expert_steering,
+                                  expert_steering_scale,
                                   DS4_SWIGLU_CLAMP_EXP,
                                   scratch->routed_mid_all,
                                   scratch->routed_xq,
@@ -5844,7 +5898,9 @@ static void layer_ffn_batch(
         uint32_t            n_tok,
         uint32_t            il,
         const float       * steering_dirs,
-        float               steering_scale) {
+        float               steering_scale,
+        const float       * expert_steering,
+        float               expert_steering_scale) {
     if (n_tok == 0) return;
     const uint32_t n_hc = DS4_N_HC;
     const uint64_t hc_dim = (uint64_t)n_hc * DS4_N_EMBD;
@@ -5872,7 +5928,9 @@ static void layer_ffn_batch(
                         DS4_RMS_EPS);
     }
 
-    layer_routed_moe_batch(moe, model, layer, norm, token_ids, n_tok, il, DS4_SWIGLU_CLAMP_EXP);
+    layer_routed_moe_batch(moe, model, layer, norm, token_ids, n_tok, il,
+                           expert_steering, expert_steering_scale,
+                           DS4_SWIGLU_CLAMP_EXP);
     layer_shared_ffn_batch(shared, model, layer, norm, n_tok);
 
     if (cpu_directional_steering_enabled(steering_dirs, steering_scale)) {
@@ -5916,6 +5974,8 @@ typedef struct {
     const ds4_layer_weights *layer;
     const float *norm;
     const int *token_ids;
+    const float *expert_steering;
+    float expert_steering_scale;
     uint64_t expert_in_dim;
     uint64_t down_in_dim;
     uint32_t il;
@@ -5934,6 +5994,8 @@ static void routed_moe_tokens_worker(void *vctx, uint64_t t0, uint64_t t1) {
                                       ctx->norm + t * DS4_N_EMBD,
                                       ctx->il,
                                       ctx->token_ids[t],
+                                      ctx->expert_steering,
+                                      ctx->expert_steering_scale,
                                       DS4_SWIGLU_CLAMP_EXP,
                                       routed_mid,
                                       routed_xq,
@@ -5952,13 +6014,17 @@ static void layer_routed_moe_tokens_parallel(
         const float       * norm,
         const int         * token_ids,
         uint32_t            n_tok,
-        uint32_t            il) {
+        uint32_t            il,
+        const float       * expert_steering,
+        float               expert_steering_scale) {
     routed_moe_tokens_ctx ctx = {
         .moe = moe,
         .model = model,
         .layer = layer,
         .norm = norm,
         .token_ids = token_ids,
+        .expert_steering = expert_steering,
+        .expert_steering_scale = expert_steering_scale,
         .expert_in_dim = layer->ffn_gate_exps->dim[0],
         .down_in_dim = layer->ffn_down_exps->dim[0],
         .il = il,
@@ -5977,7 +6043,9 @@ static void layer_ffn_shared_batch(
         uint32_t            n_tok,
         uint32_t            il,
         const float       * steering_dirs,
-        float               steering_scale) {
+        float               steering_scale,
+        const float       * expert_steering,
+        float               expert_steering_scale) {
     const bool profile = getenv("DS4_PREFILL_PROFILE_DETAIL") != NULL;
     const double t_start = profile ? now_sec() : 0.0;
     double t_hc_norm = 0.0;
@@ -6017,7 +6085,8 @@ static void layer_ffn_shared_batch(
 
     t0 = profile ? now_sec() : 0.0;
     if (routed_token_parallel) {
-        layer_routed_moe_tokens_parallel(moe, model, layer, norm, token_ids, n_tok, il);
+        layer_routed_moe_tokens_parallel(moe, model, layer, norm, token_ids, n_tok, il,
+                                         expert_steering, expert_steering_scale);
     } else {
         for (uint32_t t = 0; t < n_tok; t++) {
             layer_routed_moe_one_prealloc(moe + (uint64_t)t * DS4_N_EMBD,
@@ -6026,6 +6095,8 @@ static void layer_ffn_shared_batch(
                                           norm + (uint64_t)t * DS4_N_EMBD,
                                           il,
                                           token_ids[t],
+                                          expert_steering,
+                                          expert_steering_scale,
                                           DS4_SWIGLU_CLAMP_EXP,
                                           routed_mid,
                                           routed_xq,
@@ -6092,6 +6163,8 @@ typedef struct {
     const int *token_ids;
     const float *steering_dirs;
     float steering_scale;
+    const float *expert_steering;
+    float expert_steering_scale;
     uint64_t hc_dim;
     uint32_t il;
 } layer_ffn_tokens_ctx;
@@ -6107,6 +6180,8 @@ static void layer_ffn_tokens_worker(void *vctx, uint64_t t0, uint64_t t1) {
                       ctx->token_ids[t],
                       ctx->steering_dirs,
                       ctx->steering_scale,
+                      ctx->expert_steering,
+                      ctx->expert_steering_scale,
                       false);
     }
 }
@@ -6120,7 +6195,9 @@ static void layer_ffn_tokens_parallel(
         uint32_t            n_tok,
         uint32_t            il,
         const float       * steering_dirs,
-        float               steering_scale) {
+        float               steering_scale,
+        const float       * expert_steering,
+        float               expert_steering_scale) {
     layer_ffn_tokens_ctx ctx = {
         .out_hc = out_hc,
         .model = model,
@@ -6129,6 +6206,8 @@ static void layer_ffn_tokens_parallel(
         .token_ids = token_ids,
         .steering_dirs = steering_dirs,
         .steering_scale = steering_scale,
+        .expert_steering = expert_steering,
+        .expert_steering_scale = expert_steering_scale,
         .hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD,
         .il = il,
     };
@@ -7536,6 +7615,8 @@ static void layer_forward_raw_swa_one(
         const float             * steering_dirs,
         float                     steering_attn_scale,
         float                     steering_ffn_scale,
+        const float             * expert_steering,
+        float                     expert_steering_scale,
         ds4_cpu_decode_scratch  * scratch) {
     const uint32_t n_hc = DS4_N_HC;
     const bool profile = getenv("DS4_DECODE_PROFILE_DETAIL") != NULL;
@@ -7668,7 +7749,9 @@ static void layer_forward_raw_swa_one(
 
     t0 = profile ? now_sec() : 0.0;
     layer_ffn_one_decode_scratch(out_hc, model, layer, scratch->after_attn_hc, il, token,
-                                 steering_dirs, steering_ffn_scale, scratch);
+                                 steering_dirs, steering_ffn_scale,
+                                 expert_steering, expert_steering_scale,
+                                 scratch);
     if (profile) t_ffn = now_sec() - t0;
 
     if (profile) {
@@ -7710,6 +7793,8 @@ static void forward_token_raw_swa_cpu_decode_scratch(
         const float       * steering_dirs,
         float               steering_attn_scale,
         float               steering_ffn_scale,
+        const float       * expert_steering,
+        float               expert_steering_scale,
         ds4_cpu_decode_scratch * scratch) {
     float *cur = scratch->cur;
     float *next = scratch->next;
@@ -7723,6 +7808,8 @@ static void forward_token_raw_swa_cpu_decode_scratch(
                                   steering_dirs,
                                   steering_attn_scale,
                                   steering_ffn_scale,
+                                  expert_steering,
+                                  expert_steering_scale,
                                   scratch);
         float *tmp = cur;
         cur = next;
@@ -7753,7 +7840,9 @@ static void forward_token_raw_swa_cpu(
     }
     cpu_decode_scratch_init(&scratch, ctx_guess);
     forward_token_raw_swa_cpu_decode_scratch(logits, model, weights, cache, token, pos,
-                                             NULL, 0.0f, 0.0f, &scratch);
+                                             NULL, 0.0f, 0.0f,
+                                             NULL, 0.0f,
+                                             &scratch);
     cpu_decode_scratch_free(&scratch);
 }
 #endif
@@ -7768,7 +7857,9 @@ static void prefill_layer_major_cpu(
         const token_vec   * prompt,
         const float       * steering_dirs,
         float               steering_attn_scale,
-        float               steering_ffn_scale) {
+        float               steering_ffn_scale,
+        const float       * expert_steering,
+        float               expert_steering_scale) {
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t n_tok = (uint64_t)prompt->len;
     float *cur = xmalloc((size_t)n_tok * hc_dim * sizeof(cur[0]));
@@ -7822,7 +7913,9 @@ static void prefill_layer_major_cpu(
                                     nb,
                                     il,
                                     steering_dirs,
-                                    steering_ffn_scale);
+                                    steering_ffn_scale,
+                                    expert_steering,
+                                    expert_steering_scale);
                 }
             } else if (shared_batch_ffn) {
                 layer_ffn_shared_batch(next,
@@ -7833,7 +7926,9 @@ static void prefill_layer_major_cpu(
                                        (uint32_t)n_tok,
                                        il,
                                        steering_dirs,
-                                       steering_ffn_scale);
+                                       steering_ffn_scale,
+                                       expert_steering,
+                                       expert_steering_scale);
             } else if (parallel_ffn) {
                 layer_ffn_tokens_parallel(next,
                                           model,
@@ -7843,7 +7938,9 @@ static void prefill_layer_major_cpu(
                                           (uint32_t)n_tok,
                                           il,
                                           steering_dirs,
-                                          steering_ffn_scale);
+                                          steering_ffn_scale,
+                                          expert_steering,
+                                          expert_steering_scale);
             } else {
                 for (uint64_t t = 0; t < n_tok; t++) {
                     layer_ffn_one(next + t * hc_dim,
@@ -7854,6 +7951,8 @@ static void prefill_layer_major_cpu(
                                   prompt->v[t],
                                   steering_dirs,
                                   steering_ffn_scale,
+                                  expert_steering,
+                                  expert_steering_scale,
                                   false);
                 }
             }
@@ -7880,7 +7979,9 @@ static void prefill_layer_major_cpu(
                                 nb,
                                 il,
                                 steering_dirs,
-                                steering_ffn_scale);
+                                steering_ffn_scale,
+                                expert_steering,
+                                expert_steering_scale);
             }
         } else {
             if (!decode_scratch_ready) {
@@ -7899,6 +8000,8 @@ static void prefill_layer_major_cpu(
                                           steering_dirs,
                                           steering_attn_scale,
                                           steering_ffn_scale,
+                                          expert_steering,
+                                          expert_steering_scale,
                                           &decode_scratch);
             }
         }
@@ -7965,7 +8068,9 @@ static void layer_forward_self_one(
     hc_post_one(after_attn_hc, attn_out, attn_residual, post, comb, DS4_N_EMBD, n_hc);
 
     layer_ffn_one(out_hc, model, layer, after_attn_hc, il, token,
-                  NULL, 0.0f, false);
+                  NULL, 0.0f,
+                  NULL, 0.0f,
+                  false);
 
     free(after_attn_hc);
     free(attn_out);
@@ -8302,6 +8407,8 @@ typedef struct {
     ds4_gpu_tensor *directional_steering_dirs;
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
+    ds4_gpu_tensor *expert_steering_map;
+    float expert_steering_scale;
     bool quality;
     bool mtp_enabled;
 } ds4_gpu_graph;
@@ -8309,6 +8416,7 @@ typedef struct {
 /* Release every Metal tensor owned by the whole-model graph runtime. */
 static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->directional_steering_dirs);
+    ds4_gpu_tensor_free(g->expert_steering_map);
     ds4_gpu_tensor_free(g->batch_ffn_out);
     ds4_gpu_tensor_free(g->batch_routed_out);
     ds4_gpu_tensor_free(g->batch_routed_down);
@@ -8490,6 +8598,41 @@ static bool metal_graph_load_directional_steering(
     fprintf(stderr, "ds4: directional steering enabled: %s attn=%g ffn=%g\n",
             path, (double)attn_scale, (double)ffn_scale);
     return true;
+}
+
+static bool metal_graph_load_expert_steering(
+        ds4_gpu_graph *g,
+        const char    *path,
+        float          scale) {
+    if (scale == 0.0f) return true;
+
+    if (!path || !path[0]) {
+        fprintf(stderr, "ds4: expert steering needs --expert-steering-file\n");
+        return false;
+    }
+
+    const uint64_t n = (uint64_t)DS4_N_LAYER * DS4_N_EXPERT;
+    float *map = xmalloc((size_t)n * sizeof(map[0]));
+    bool ok = read_f32_binary_file(path, map, n);
+    if (ok) {
+        g->expert_steering_map = ds4_gpu_tensor_alloc(n * sizeof(map[0]));
+        ok = g->expert_steering_map != NULL &&
+             ds4_gpu_tensor_write(g->expert_steering_map, 0, map, n * sizeof(map[0])) != 0;
+    }
+    free(map);
+
+    if (!ok) {
+        fprintf(stderr, "ds4: failed to load expert steering map from %s\n", path);
+        return false;
+    }
+    g->expert_steering_scale = scale;
+    fprintf(stderr, "ds4: expert steering enabled: %s scale=%g\n",
+            path, (double)scale);
+    return true;
+}
+
+static bool metal_graph_expert_steering_enabled(const ds4_gpu_graph *g) {
+    return g && g->expert_steering_map && g->expert_steering_scale != 0.0f;
 }
 
 static bool metal_graph_directional_steering_attn_enabled(const ds4_gpu_graph *g) {
@@ -9843,6 +9986,9 @@ static bool metal_graph_encode_decode_layer(
                                                 0,
                                                 layer->ffn_exp_probs_b != NULL,
                                                 layer->ffn_gate_tid2eid != NULL,
+                                                metal_graph_expert_steering_enabled(g) ? g->expert_steering_map : NULL,
+                                                il,
+                                                metal_graph_expert_steering_enabled(g) ? g->expert_steering_scale : 0.0f,
                                                 g->router_logits) != 0;
     DS4_METAL_PROFILE_DECODE_STAGE("router");
     if (ok) {
@@ -10285,15 +10431,19 @@ static void metal_graph_trace_layer_stages(
                                   cpu_ffn_norm,
                                   il,
                                   token,
+                                  NULL,
+                                  0.0f,
                                   DS4_SWIGLU_CLAMP_EXP,
                                   routed_mid_all,
                                   routed_xq,
                                   routed_midq);
     if (layer->ffn_gate_tid2eid) {
         layer_hash_selected_experts(selected, model, layer, token);
-        layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected);
+        layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected,
+                                      NULL, 0.0f, il);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm,
+                                    NULL, 0.0f, il);
     }
     for (uint32_t i = 0; i < DS4_N_EMBD; i++) cpu_ffn_out[i] = cpu_shared[i] + cpu_routed[i];
     hc_post_one(cpu_after_ffn_hc, cpu_ffn_out, cpu_after_attn_hc, ffn_post, ffn_comb, DS4_N_EMBD, DS4_N_HC);
@@ -10509,15 +10659,19 @@ static int metal_graph_decode_test(
                                   cpu_ffn_norm,
                                   0,
                                   token,
+                                  NULL,
+                                  0.0f,
                                   DS4_SWIGLU_CLAMP_EXP,
                                   routed_mid_all,
                                   routed_xq,
                                   routed_midq);
     if (layer->ffn_gate_tid2eid) {
         layer_hash_selected_experts(selected, model, layer, token);
-        layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected);
+        layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected,
+                                                                            NULL, 0.0f, 0);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm,
+                                                                        NULL, 0.0f, 0);
     }
     for (uint32_t i = 0; i < DS4_N_EMBD; i++) cpu_ffn_out[i] = cpu_shared[i] + cpu_routed[i];
     hc_post_one(cpu_after_ffn_hc,
@@ -12613,6 +12767,9 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                       0,
                                                       layer->ffn_exp_probs_b != NULL,
                                                       layer->ffn_gate_tid2eid != NULL,
+                                                      metal_graph_expert_steering_enabled(g) ? g->expert_steering_map : NULL,
+                                                      il,
+                                                      metal_graph_expert_steering_enabled(g) ? g->expert_steering_scale : 0.0f,
                                                       g->batch_router_logits,
                                                       g->prefill_tokens,
                                                       n_tokens) != 0;
@@ -14383,6 +14540,9 @@ struct ds4_engine {
     float *directional_steering_dirs;
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
+    char *expert_steering_file;
+    float *expert_steering_map;
+    float expert_steering_scale;
     bool quality;
     bool metal_ready;
     bool mtp_ready;
@@ -14392,6 +14552,60 @@ static bool cpu_directional_steering_enabled(
         const float *dirs,
         float        scale) {
     return dirs && scale != 0.0f;
+}
+
+static bool expert_steering_enabled(
+        const float *map,
+        float        scale) {
+    return map && scale != 0.0f;
+}
+
+static void expert_steering_apply_probs(
+        float       probs[DS4_N_EXPERT],
+        const float *map,
+        float        scale,
+        uint32_t     il) {
+    if (!expert_steering_enabled(map, scale) || !probs || il >= DS4_N_LAYER) return;
+
+    const float *layer = map + (uint64_t)il * DS4_N_EXPERT;
+    float max_prob = probs[0];
+    for (uint32_t i = 1; i < DS4_N_EXPERT; i++) {
+        if (probs[i] > max_prob) max_prob = probs[i];
+    }
+
+    for (uint32_t i = 0; i < DS4_N_EXPERT; i++) {
+        const float action = layer[i] * scale;
+        if (action > 0.0f) {
+            probs[i] = max_prob + fabsf(action);
+        } else if (action < 0.0f) {
+            probs[i] = 0.0f;
+        }
+    }
+}
+
+static void expert_steering_apply_selection(
+        float       selection[DS4_N_EXPERT],
+        const float *map,
+        float        scale,
+        uint32_t     il) {
+    if (!expert_steering_enabled(map, scale) || !selection || il >= DS4_N_LAYER) return;
+
+    const float *layer = map + (uint64_t)il * DS4_N_EXPERT;
+    float max_score = selection[0];
+    float min_score = selection[0];
+    for (uint32_t i = 1; i < DS4_N_EXPERT; i++) {
+        if (selection[i] > max_score) max_score = selection[i];
+        if (selection[i] < min_score) min_score = selection[i];
+    }
+
+    for (uint32_t i = 0; i < DS4_N_EXPERT; i++) {
+        const float action = layer[i] * scale;
+        if (action > 0.0f) {
+            selection[i] = max_score + fabsf(action);
+        } else if (action < 0.0f) {
+            selection[i] = min_score - fabsf(action);
+        }
+    }
 }
 
 static void cpu_directional_steering_project_rows(
@@ -14441,6 +14655,29 @@ static bool cpu_load_directional_steering(ds4_engine *e) {
             path,
             (double)e->directional_steering_attn_scale,
             (double)e->directional_steering_ffn_scale);
+    return true;
+}
+
+static bool cpu_load_expert_steering(ds4_engine *e) {
+    if (!e || e->expert_steering_scale == 0.0f) return true;
+
+    const char *path = e->expert_steering_file;
+    if (!path || !path[0]) {
+        fprintf(stderr, "ds4: expert steering needs --expert-steering-file\n");
+        return false;
+    }
+
+    const uint64_t n = (uint64_t)DS4_N_LAYER * DS4_N_EXPERT;
+    e->expert_steering_map = xmalloc((size_t)n * sizeof(e->expert_steering_map[0]));
+    if (!read_f32_binary_file(path, e->expert_steering_map, n)) {
+        free(e->expert_steering_map);
+        e->expert_steering_map = NULL;
+        fprintf(stderr, "ds4: failed to load expert steering map from %s\n", path);
+        return false;
+    }
+    fprintf(stderr, "ds4: CPU expert steering enabled: %s scale=%g\n",
+            path,
+            (double)e->expert_steering_scale);
     return true;
 }
 
@@ -15341,6 +15578,8 @@ static int generate_raw_swa_cpu(
         const float       * directional_steering_dirs,
         float               directional_steering_attn,
         float               directional_steering_ffn,
+        const float       * expert_steering_map,
+        float               expert_steering_scale,
         ds4_token_emit_fn   emit,
         ds4_generation_done_fn done,
         void              * emit_ud,
@@ -15371,7 +15610,9 @@ static int generate_raw_swa_cpu(
     prefill_layer_major_cpu(logits, model, weights, &cache, prompt,
                             directional_steering_dirs,
                             directional_steering_attn,
-                            directional_steering_ffn);
+                            directional_steering_ffn,
+                            expert_steering_map,
+                            expert_steering_scale);
 
     const double t_prefill1 = now_sec();
     fprintf(stderr, "ds4: prefill %d/%d done\n", prompt->len, prompt->len);
@@ -15419,6 +15660,8 @@ static int generate_raw_swa_cpu(
                                                  directional_steering_dirs,
                                                  directional_steering_attn,
                                                  directional_steering_ffn,
+                                                 expert_steering_map,
+                                                 expert_steering_scale,
                                                  &decode_scratch);
         ds4_alloc_guard_end();
         if (token_timing) {
@@ -15459,6 +15702,8 @@ static int generate_metal_graph_raw_swa(
         const char        * directional_steering_file,
         float               directional_steering_attn,
         float               directional_steering_ffn,
+        const char        * expert_steering_file,
+        float               expert_steering_scale,
         ds4_token_emit_fn   emit,
         ds4_generation_done_fn done,
         void              * emit_ud,
@@ -15491,6 +15736,12 @@ static int generate_metal_graph_raw_swa(
                                                directional_steering_file,
                                                directional_steering_attn,
                                                directional_steering_ffn)) {
+        metal_graph_free(&g);
+        return 1;
+    }
+    if (!metal_graph_load_expert_steering(&g,
+                                          expert_steering_file,
+                                          expert_steering_scale)) {
         metal_graph_free(&g);
         return 1;
     }
@@ -16959,6 +17210,8 @@ int ds4_engine_generate_argmax(
                                             e->directional_steering_file,
                                             e->directional_steering_attn_scale,
                                             e->directional_steering_ffn_scale,
+                                            e->expert_steering_file,
+                                            e->expert_steering_scale,
                                             emit, done, emit_ud,
                                             progress, progress_ud);
 #else
@@ -16973,6 +17226,8 @@ int ds4_engine_generate_argmax(
                                 e->directional_steering_dirs,
                                 e->directional_steering_attn_scale,
                                 e->directional_steering_ffn_scale,
+                                e->expert_steering_map,
+                                e->expert_steering_scale,
                                 emit, done, emit_ud, progress, progress_ud);
 }
 
@@ -17077,7 +17332,9 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
 
     float *after_ffn_hc = xmalloc((size_t)n_hc * DS4_N_EMBD * sizeof(after_ffn_hc[0]));
     layer_ffn_one(after_ffn_hc, model, layer0, after_attn_hc, 0, prompt->v[prompt->len - 1],
-                  NULL, 0.0f, true);
+                  NULL, 0.0f,
+                  NULL, 0.0f,
+                  true);
     print_vec_stats("blk.0 after_ffn_hc", after_ffn_hc, (uint64_t)n_hc * DS4_N_EMBD);
 
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
@@ -17179,10 +17436,22 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         *out = NULL;
         return 1;
     }
+    if (opt->expert_steering_scale != 0.0f &&
+        (!opt->expert_steering_file || !opt->expert_steering_file[0]))
+    {
+        fprintf(stderr, "ds4: expert steering needs --expert-steering-file\n");
+        free(e);
+        *out = NULL;
+        return 1;
+    }
     if (opt->directional_steering_file && opt->directional_steering_file[0]) {
         e->directional_steering_file = ds4_strdup(opt->directional_steering_file);
         e->directional_steering_attn_scale = opt->directional_steering_attn;
         e->directional_steering_ffn_scale = opt->directional_steering_ffn;
+    }
+    if (opt->expert_steering_file && opt->expert_steering_file[0]) {
+        e->expert_steering_file = ds4_strdup(opt->expert_steering_file);
+        e->expert_steering_scale = opt->expert_steering_scale;
     }
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     ds4_acquire_instance_lock();
@@ -17194,6 +17463,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
     if (e->backend == DS4_BACKEND_CPU && !cpu_load_directional_steering(e)) {
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
+    if (e->backend == DS4_BACKEND_CPU && !cpu_load_expert_steering(e)) {
         ds4_engine_close(e);
         *out = NULL;
         return 1;
@@ -17303,6 +17577,8 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_release_instance_lock();
     free(e->directional_steering_dirs);
     free(e->directional_steering_file);
+    free(e->expert_steering_map);
+    free(e->expert_steering_file);
     free(e);
 }
 
@@ -17340,6 +17616,13 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                                e->directional_steering_file,
                                                e->directional_steering_attn_scale,
                                                e->directional_steering_ffn_scale)) {
+        metal_graph_free(&s->graph);
+        free(s);
+        return 1;
+    }
+    if (!metal_graph_load_expert_steering(&s->graph,
+                                          e->expert_steering_file,
+                                          e->expert_steering_scale)) {
         metal_graph_free(&s->graph);
         free(s);
         return 1;
@@ -17435,6 +17718,8 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                                          e->directional_steering_dirs,
                                                          e->directional_steering_attn_scale,
                                                          e->directional_steering_ffn_scale,
+                                                         e->expert_steering_map,
+                                                         e->expert_steering_scale,
                                                          &s->cpu_scratch);
                 token_vec_push(&s->checkpoint, prompt->v[i]);
                 if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
@@ -17451,7 +17736,9 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                 prompt,
                                 e->directional_steering_dirs,
                                 e->directional_steering_attn_scale,
-                                e->directional_steering_ffn_scale);
+                                e->directional_steering_ffn_scale,
+                                e->expert_steering_map,
+                                e->expert_steering_scale);
         ds4_tokens_copy(&s->checkpoint, prompt);
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
@@ -17713,6 +18000,8 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                                  e->directional_steering_dirs,
                                                  e->directional_steering_attn_scale,
                                                  e->directional_steering_ffn_scale,
+                                                 e->expert_steering_map,
+                                                 e->expert_steering_scale,
                                                  &s->cpu_scratch);
         token_vec_push(&s->checkpoint, token);
         s->checkpoint_valid = true;
