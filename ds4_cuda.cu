@@ -305,6 +305,8 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
     if (bytes == 0) return 1;
     if (g_model_device_owned || g_model_registered) return 1;
+    /* On the HMM direct path every range is immediately accessible. */
+    if (g_model_hmm_direct) return 1;
 
     const uint64_t end = offset + bytes;
     if (end < offset) return 0;
@@ -1487,6 +1489,12 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     } else {
         fprintf(stderr, "ds4: CUDA host registration skipped: %s\n", cudaGetErrorString(err));
         (void)cudaGetLastError();
+        /* On coherent unified memory systems (e.g. Grace-Blackwell NVLink-C2C) the
+         * host mmap pointer is directly addressable by the GPU via HMM page faults.
+         * Queue an async prefetch of the full model so pages are resident before
+         * inference starts, avoiding per-kernel page-fault stalls.  The function
+         * also sets g_model_hmm_direct=1 on success. */
+        (void)cuda_model_prefetch_range(model_map, model_size, 0, model_size);
     }
     return 1;
 }
