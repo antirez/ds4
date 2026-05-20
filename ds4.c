@@ -927,6 +927,66 @@ typedef struct {
     ds4_tensor *tensors;
 } ds4_model;
 
+typedef struct {
+    ds4_tensor *hc_attn_fn;
+    ds4_tensor *hc_attn_scale;
+    ds4_tensor *hc_attn_base;
+    ds4_tensor *attn_norm;
+    ds4_tensor *attn_q_a;
+    ds4_tensor *attn_q_a_norm;
+    ds4_tensor *attn_q_b;
+    ds4_tensor *attn_kv;
+    ds4_tensor *attn_kv_a_norm;
+    ds4_tensor *attn_sinks;
+    ds4_tensor *attn_output_a;
+    ds4_tensor *attn_output_b;
+    ds4_tensor *attn_compressor_ape;
+    ds4_tensor *attn_compressor_kv;
+    ds4_tensor *attn_compressor_gate;
+    ds4_tensor *attn_compressor_norm;
+    ds4_tensor *indexer_attn_q_b;
+    ds4_tensor *indexer_proj;
+    ds4_tensor *indexer_compressor_ape;
+    ds4_tensor *indexer_compressor_kv;
+    ds4_tensor *indexer_compressor_gate;
+    ds4_tensor *indexer_compressor_norm;
+    ds4_tensor *hc_ffn_fn;
+    ds4_tensor *hc_ffn_scale;
+    ds4_tensor *hc_ffn_base;
+    ds4_tensor *ffn_norm;
+    ds4_tensor *ffn_gate_tid2eid;
+    ds4_tensor *ffn_gate_inp;
+    ds4_tensor *ffn_exp_probs_b;
+    ds4_tensor *ffn_gate_exps;
+    ds4_tensor *ffn_up_exps;
+    ds4_tensor *ffn_down_exps;
+    ds4_tensor *ffn_gate_shexp;
+    ds4_tensor *ffn_up_shexp;
+    ds4_tensor *ffn_down_shexp;
+} ds4_layer_weights;
+
+typedef struct {
+    ds4_tensor *token_embd;
+    ds4_tensor *output_hc_base;
+    ds4_tensor *output_hc_fn;
+    ds4_tensor *output_hc_scale;
+    ds4_tensor *output_norm;
+    ds4_tensor *output;
+    ds4_layer_weights layer[DS4_N_LAYER];
+} ds4_weights;
+
+typedef struct {
+    ds4_tensor *e_proj;
+    ds4_tensor *h_proj;
+    ds4_tensor *enorm;
+    ds4_tensor *hnorm;
+    ds4_tensor *norm;
+    ds4_tensor *hc_head_base;
+    ds4_tensor *hc_head_fn;
+    ds4_tensor *hc_head_scale;
+    ds4_layer_weights block;
+} ds4_mtp_weights;
+
 static uint64_t scalar_value_size(uint32_t type) {
     switch (type) {
     case GGUF_VALUE_UINT8:
@@ -1372,6 +1432,289 @@ static uint64_t accelerator_cuda_preload_span_bytes(void) {
     return mb * 1048576ull;
 }
 
+typedef struct {
+    uint64_t off;
+    uint64_t end;
+    uint64_t bytes;
+    uint32_t priority;
+    uint32_t layer;
+    uint32_t group;
+} accelerator_weight_cache_candidate;
+
+enum {
+    ACCELERATOR_WEIGHT_CACHE_GLOBAL_STATE = 0,
+    ACCELERATOR_WEIGHT_CACHE_LAYER_STATE = 5,
+    ACCELERATOR_WEIGHT_CACHE_ATTENTION = 10,
+    ACCELERATOR_WEIGHT_CACHE_COMPRESSOR = 15,
+    ACCELERATOR_WEIGHT_CACHE_FFN_SHARED = 20,
+    ACCELERATOR_WEIGHT_CACHE_OUTPUT = 25,
+    ACCELERATOR_WEIGHT_CACHE_TOKEN_EMBD = 30,
+    ACCELERATOR_WEIGHT_CACHE_ROUTED_EXPERTS = 40,
+};
+
+/* Lower priorities are cached first: cover small global/layer state and dense
+ * per-token paths before spending the partial VRAM budget on large embeddings
+ * and routed expert matrices. */
+
+static bool accelerator_cuda_env_enabled(const char *name) {
+    const char *env = getenv(name);
+    return env && env[0] && !(env[0] == '0' && env[1] == '\0');
+}
+
+static bool accelerator_cuda_partial_weight_cache_enabled(void) {
+    return accelerator_cuda_env_enabled("DS4_CUDA_PARTIAL_WEIGHT_CACHE");
+}
+
+static int accelerator_weight_cache_candidate_cmp(const void *a, const void *b) {
+    const accelerator_weight_cache_candidate *ca = a;
+    const accelerator_weight_cache_candidate *cb = b;
+    if (ca->priority < cb->priority) return -1;
+    if (ca->priority > cb->priority) return 1;
+    if (ca->group < cb->group) return -1;
+    if (ca->group > cb->group) return 1;
+    if (ca->layer < cb->layer) return -1;
+    if (ca->layer > cb->layer) return 1;
+    if (ca->off < cb->off) return -1;
+    if (ca->off > cb->off) return 1;
+    if (ca->bytes > cb->bytes) return -1;
+    if (ca->bytes < cb->bytes) return 1;
+    return 0;
+}
+
+static int accelerator_weight_cache_candidate_off_cmp(const void *a, const void *b) {
+    const accelerator_weight_cache_candidate *ca = a;
+    const accelerator_weight_cache_candidate *cb = b;
+    if (ca->off < cb->off) return -1;
+    if (ca->off > cb->off) return 1;
+    if (ca->end < cb->end) return -1;
+    if (ca->end > cb->end) return 1;
+    if (ca->bytes > cb->bytes) return -1;
+    if (ca->bytes < cb->bytes) return 1;
+    return 0;
+}
+
+static bool accelerator_partial_cache_add(
+        accelerator_weight_cache_candidate *cands,
+        uint32_t *count,
+        uint32_t cap,
+        const ds4_model *m,
+        const ds4_tensor *t,
+        uint32_t priority,
+        uint32_t layer,
+        uint32_t group) {
+    if (!t || t->bytes == 0) return true;
+    if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) {
+        fprintf(stderr, "ds4: invalid CUDA cache candidate range for %.*s\n",
+                (int)t->name.len, t->name.ptr);
+        return false;
+    }
+    if (*count >= cap) {
+        fprintf(stderr, "ds4: too many CUDA partial weight cache candidates\n");
+        return false;
+    }
+    accelerator_weight_cache_candidate *c = &cands[*count];
+    c->off = t->abs_offset;
+    c->bytes = t->bytes;
+    c->end = t->abs_offset + t->bytes;
+    c->priority = priority;
+    c->layer = layer;
+    c->group = group;
+    (*count)++;
+    return true;
+}
+
+static bool accelerator_partial_cache_collect(
+        accelerator_weight_cache_candidate *cands,
+        uint32_t *count,
+        uint32_t cap,
+        const ds4_model *m,
+        const ds4_weights *w) {
+#define ADD_GLOBAL(t_, p_) \
+    do { \
+        if (!accelerator_partial_cache_add(cands, count, cap, m, (t_), (p_), UINT32_MAX, 0)) return false; \
+    } while (0)
+#define ADD_LAYER(t_, p_) \
+    do { \
+        if (!accelerator_partial_cache_add(cands, count, cap, m, (t_), (p_), il, 0)) return false; \
+    } while (0)
+#define ADD_LAYER_GROUP(t_, p_, group_) \
+    do { \
+        if (!accelerator_partial_cache_add(cands, count, cap, m, (t_), (p_), il, (group_))) return false; \
+    } while (0)
+
+    ADD_GLOBAL(w->output_hc_base, ACCELERATOR_WEIGHT_CACHE_GLOBAL_STATE);
+    ADD_GLOBAL(w->output_hc_scale, ACCELERATOR_WEIGHT_CACHE_GLOBAL_STATE);
+    ADD_GLOBAL(w->output_norm, ACCELERATOR_WEIGHT_CACHE_GLOBAL_STATE);
+    ADD_GLOBAL(w->output_hc_fn, ACCELERATOR_WEIGHT_CACHE_GLOBAL_STATE);
+    ADD_GLOBAL(w->output, ACCELERATOR_WEIGHT_CACHE_OUTPUT);
+    ADD_GLOBAL(w->token_embd, ACCELERATOR_WEIGHT_CACHE_TOKEN_EMBD);
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        ADD_LAYER(l->hc_attn_scale, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
+        ADD_LAYER(l->hc_attn_base, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
+        ADD_LAYER(l->attn_norm, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
+        ADD_LAYER(l->attn_q_a_norm, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
+        ADD_LAYER(l->attn_kv_a_norm, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
+        ADD_LAYER(l->attn_sinks, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
+        ADD_LAYER(l->attn_compressor_norm, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
+        ADD_LAYER(l->indexer_compressor_norm, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
+        ADD_LAYER(l->hc_ffn_scale, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
+        ADD_LAYER(l->hc_ffn_base, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
+        ADD_LAYER(l->ffn_norm, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
+        ADD_LAYER(l->ffn_exp_probs_b, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
+        ADD_LAYER(l->ffn_gate_tid2eid, ACCELERATOR_WEIGHT_CACHE_LAYER_STATE);
+
+        ADD_LAYER(l->hc_attn_fn, ACCELERATOR_WEIGHT_CACHE_ATTENTION);
+        ADD_LAYER(l->attn_q_a, ACCELERATOR_WEIGHT_CACHE_ATTENTION);
+        ADD_LAYER(l->attn_q_b, ACCELERATOR_WEIGHT_CACHE_ATTENTION);
+        ADD_LAYER(l->attn_kv, ACCELERATOR_WEIGHT_CACHE_ATTENTION);
+        ADD_LAYER(l->attn_output_a, ACCELERATOR_WEIGHT_CACHE_ATTENTION);
+        ADD_LAYER(l->attn_output_b, ACCELERATOR_WEIGHT_CACHE_ATTENTION);
+
+        ADD_LAYER(l->attn_compressor_ape, ACCELERATOR_WEIGHT_CACHE_COMPRESSOR);
+        ADD_LAYER(l->attn_compressor_kv, ACCELERATOR_WEIGHT_CACHE_COMPRESSOR);
+        ADD_LAYER(l->attn_compressor_gate, ACCELERATOR_WEIGHT_CACHE_COMPRESSOR);
+        ADD_LAYER(l->indexer_attn_q_b, ACCELERATOR_WEIGHT_CACHE_COMPRESSOR);
+        ADD_LAYER(l->indexer_proj, ACCELERATOR_WEIGHT_CACHE_COMPRESSOR);
+        ADD_LAYER(l->indexer_compressor_ape, ACCELERATOR_WEIGHT_CACHE_COMPRESSOR);
+        ADD_LAYER(l->indexer_compressor_kv, ACCELERATOR_WEIGHT_CACHE_COMPRESSOR);
+        ADD_LAYER(l->indexer_compressor_gate, ACCELERATOR_WEIGHT_CACHE_COMPRESSOR);
+
+        ADD_LAYER(l->hc_ffn_fn, ACCELERATOR_WEIGHT_CACHE_FFN_SHARED);
+        ADD_LAYER(l->ffn_gate_inp, ACCELERATOR_WEIGHT_CACHE_FFN_SHARED);
+        ADD_LAYER(l->ffn_gate_shexp, ACCELERATOR_WEIGHT_CACHE_FFN_SHARED);
+        ADD_LAYER(l->ffn_up_shexp, ACCELERATOR_WEIGHT_CACHE_FFN_SHARED);
+        ADD_LAYER(l->ffn_down_shexp, ACCELERATOR_WEIGHT_CACHE_FFN_SHARED);
+
+        const uint32_t routed_group = 1000u + il;
+        ADD_LAYER_GROUP(l->ffn_gate_exps, ACCELERATOR_WEIGHT_CACHE_ROUTED_EXPERTS, routed_group);
+        ADD_LAYER_GROUP(l->ffn_up_exps, ACCELERATOR_WEIGHT_CACHE_ROUTED_EXPERTS, routed_group);
+        ADD_LAYER_GROUP(l->ffn_down_exps, ACCELERATOR_WEIGHT_CACHE_ROUTED_EXPERTS, routed_group);
+    }
+
+#undef ADD_GLOBAL
+#undef ADD_LAYER
+#undef ADD_LAYER_GROUP
+    return true;
+}
+
+static uint32_t accelerator_partial_cache_dedup(
+        accelerator_weight_cache_candidate *cands,
+        uint32_t count) {
+    qsort(cands, count, sizeof(cands[0]), accelerator_weight_cache_candidate_cmp);
+    uint32_t out = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        bool seen = false;
+        for (uint32_t j = 0; j < out; j++) {
+            if (cands[j].off == cands[i].off && cands[j].end == cands[i].end) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) cands[out++] = cands[i];
+    }
+    return out;
+}
+
+static bool accelerator_cache_model_partial(
+        const ds4_model *m,
+        const ds4_weights *w,
+        uint64_t *cached_out,
+        uint32_t *ranges_out) {
+    enum { CAND_CAP = 2048 };
+    accelerator_weight_cache_candidate *cands = xmalloc((size_t)CAND_CAP * sizeof(cands[0]));
+    uint32_t count = 0;
+    uint64_t cached = 0;
+    uint32_t ranges = 0;
+
+    if (!accelerator_partial_cache_collect(cands, &count, CAND_CAP, m, w)) {
+        free(cands);
+        return false;
+    }
+    count = accelerator_partial_cache_dedup(cands, count);
+    if (count == 0) {
+        free(cands);
+        if (cached_out) *cached_out = 0;
+        if (ranges_out) *ranges_out = 0;
+        return true;
+    }
+
+    const double t0 = now_sec();
+    const uint64_t max_span = accelerator_cuda_preload_span_bytes();
+    bool ok = true;
+    bool stopped = false;
+    bool fallback_printed = false;
+    uint32_t span_id = 0;
+
+    for (uint32_t i = 0; i < count && ok && !stopped;) {
+        uint32_t j = i + 1;
+        while (j < count && cands[j].priority == cands[i].priority) j++;
+        qsort(cands + i, (size_t)(j - i), sizeof(cands[0]), accelerator_weight_cache_candidate_off_cmp);
+
+        for (uint32_t k = i; k < j && ok && !stopped;) {
+            uint64_t off = cands[k].off;
+            uint64_t end = cands[k].end;
+            k++;
+            while (k < j &&
+                   cands[k].off <= end + 65536u &&
+                   cands[k].end >= off &&
+                   cands[k].end - off <= max_span) {
+                if (cands[k].end > end) end = cands[k].end;
+                k++;
+            }
+            while (off < end && ok && !stopped) {
+                uint64_t chunk_end = end;
+                if (chunk_end - off > max_span) chunk_end = off + max_span;
+                char label[96];
+                snprintf(label, sizeof(label), "partial:p%u:span%u", cands[i].priority, span_id);
+                const uint64_t bytes = chunk_end - off;
+                if (ds4_gpu_cache_model_range(m->map, m->size, off, bytes, label) == 0) {
+                    if (accelerator_cuda_env_enabled("DS4_CUDA_STRICT_WEIGHT_CACHE")) {
+                        fprintf(stderr,
+                                "ds4: CUDA partial weight cache failed for %s at offset %" PRIu64
+                                " bytes %" PRIu64 "\n",
+                                label, off, bytes);
+                        ok = false;
+                    } else {
+                        if (!fallback_printed) {
+                            fprintf(stderr,
+                                    "ds4: CUDA partial weight cache stopped at %s "
+                                    "(offset %" PRIu64 ", %.2f MiB); remaining weights use direct fallback\n",
+                                    label, off, (double)bytes / 1048576.0);
+                            fallback_printed = true;
+                        }
+                        stopped = true;
+                    }
+                } else {
+                    cached += bytes;
+                    ranges++;
+                }
+                span_id++;
+                off = chunk_end;
+            }
+        }
+        i = j;
+    }
+
+    if (ok && cached != 0) {
+        const double t1 = now_sec();
+        if (ds4_log_is_tty(stderr)) fputc('\n', stderr);
+        fprintf(stderr,
+                "ds4: CUDA partial weight cache prepared %.2f GiB in %u ranges "
+                "from %u candidates in %.3fs\n",
+                (double)cached / 1073741824.0,
+                ranges,
+                count,
+                t1 - t0);
+    }
+
+    free(cands);
+    if (cached_out) *cached_out = cached;
+    if (ranges_out) *ranges_out = ranges;
+    return ok;
+}
+
 static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *cached_out) {
     accelerator_tensor_span *spans = xmalloc((size_t)m->n_tensors * sizeof(spans[0]));
     uint64_t nspan = 0;
@@ -1423,10 +1766,15 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
     return true;
 }
 
-static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
+static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m, const ds4_weights *w) {
     if (backend != DS4_BACKEND_CUDA) return true;
-    if (!m || !m->map || m->size == 0) return false;
-    if (getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
+    if (!m || !m->map || m->size == 0 || !w) return false;
+    if (accelerator_cuda_partial_weight_cache_enabled()) {
+        uint64_t cached = 0;
+        uint32_t ranges = 0;
+        return accelerator_cache_model_partial(m, w, &cached, &ranges);
+    }
+    if (accelerator_cuda_env_enabled("DS4_CUDA_DIRECT_MODEL")) {
         return true;
     }
 
@@ -1460,9 +1808,10 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
     return true;
 }
 #else
-static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
+static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m, const ds4_weights *w) {
     (void)backend;
     (void)m;
+    (void)w;
     return true;
 }
 #endif
@@ -2055,66 +2404,6 @@ static void ds4_vec_dot_iq2_xxs_pair_q8_K(
     ds4_vec_dot_iq2_xxs_q8_K(n, s1, x1, y);
 #endif
 }
-
-typedef struct {
-    ds4_tensor *hc_attn_fn;
-    ds4_tensor *hc_attn_scale;
-    ds4_tensor *hc_attn_base;
-    ds4_tensor *attn_norm;
-    ds4_tensor *attn_q_a;
-    ds4_tensor *attn_q_a_norm;
-    ds4_tensor *attn_q_b;
-    ds4_tensor *attn_kv;
-    ds4_tensor *attn_kv_a_norm;
-    ds4_tensor *attn_sinks;
-    ds4_tensor *attn_output_a;
-    ds4_tensor *attn_output_b;
-    ds4_tensor *attn_compressor_ape;
-    ds4_tensor *attn_compressor_kv;
-    ds4_tensor *attn_compressor_gate;
-    ds4_tensor *attn_compressor_norm;
-    ds4_tensor *indexer_attn_q_b;
-    ds4_tensor *indexer_proj;
-    ds4_tensor *indexer_compressor_ape;
-    ds4_tensor *indexer_compressor_kv;
-    ds4_tensor *indexer_compressor_gate;
-    ds4_tensor *indexer_compressor_norm;
-    ds4_tensor *hc_ffn_fn;
-    ds4_tensor *hc_ffn_scale;
-    ds4_tensor *hc_ffn_base;
-    ds4_tensor *ffn_norm;
-    ds4_tensor *ffn_gate_tid2eid;
-    ds4_tensor *ffn_gate_inp;
-    ds4_tensor *ffn_exp_probs_b;
-    ds4_tensor *ffn_gate_exps;
-    ds4_tensor *ffn_up_exps;
-    ds4_tensor *ffn_down_exps;
-    ds4_tensor *ffn_gate_shexp;
-    ds4_tensor *ffn_up_shexp;
-    ds4_tensor *ffn_down_shexp;
-} ds4_layer_weights;
-
-typedef struct {
-    ds4_tensor *token_embd;
-    ds4_tensor *output_hc_base;
-    ds4_tensor *output_hc_fn;
-    ds4_tensor *output_hc_scale;
-    ds4_tensor *output_norm;
-    ds4_tensor *output;
-    ds4_layer_weights layer[DS4_N_LAYER];
-} ds4_weights;
-
-typedef struct {
-    ds4_tensor *e_proj;
-    ds4_tensor *h_proj;
-    ds4_tensor *enorm;
-    ds4_tensor *hnorm;
-    ds4_tensor *norm;
-    ds4_tensor *hc_head_base;
-    ds4_tensor *hc_head_fn;
-    ds4_tensor *hc_head_scale;
-    ds4_layer_weights block;
-} ds4_mtp_weights;
 
 /* =========================================================================
  * Fixed Weight Binding and Model Validation.
@@ -17261,7 +17550,19 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        if (!e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->model)) {
+        const char *partial_cache_env = getenv("DS4_CUDA_PARTIAL_WEIGHT_CACHE");
+        const bool partial_cuda_cache =
+            e->backend == DS4_BACKEND_CUDA &&
+            partial_cache_env &&
+            partial_cache_env[0] &&
+            !(partial_cache_env[0] == '0' && partial_cache_env[1] == '\0');
+        if (e->mtp_ready && partial_cuda_cache) {
+            fprintf(stderr,
+                    "ds4: CUDA partial weight cache applies to the base model; "
+                    "MTP weights remain on the direct path\n");
+        }
+        if ((!e->mtp_ready || partial_cuda_cache) &&
+            !accelerator_cache_model_tensors(e->backend, &e->model, &e->weights)) {
             fprintf(stderr, "ds4: %s failed to prepare startup model cache\n",
                     ds4_backend_name(e->backend));
             ds4_engine_close(e);
