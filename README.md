@@ -177,7 +177,7 @@ by the on-disk KV cache itself. Moreover the tools and the system prompt
 are all designed vertically for DeepSeek v4 Flash. This provides a
 few advantages:
 
-* Low-latency experience, bounded mainly by prefill speed limits. Generated text display, tool calls, and new session startup are always instantaneous.
+* Low latency experience, bounded mainly by prefill speed limits. Generated text display, tool calls, and new session startup are always instantaneous.
 * Live progress bar during prefill time.
 * No DSML tool calling conversion, the tools are handled natively in the LLM format.
 * KV cache mismatches are impossible by construction, the current state is always the truth.
