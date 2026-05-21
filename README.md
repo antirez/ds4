@@ -167,6 +167,7 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 | DGX Spark GB10, 128 GB | q2 | 7047 tokens | 343.81 t/s | 13.75 t/s |
 
 ![M3 Max t/s](speed-bench/m3_max_ts.svg)
+![MacBook Pro M4 Max t/s](speed-bench/macbook_m4_max_ts.svg)
 
 ## Native agent
 
