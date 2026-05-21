@@ -240,6 +240,12 @@ tokens. Press `p` to pause, `q` to exit and print the report, Up/Down to
 inspect or select another question, and Enter to run the selected question next.
 `--plain` disables the TUI.
 
+Use `--regrade-trace /path/to/trace.txt` to replay the current answer
+extractor and scorer against a prior `--trace` file without loading the model
+or regenerating tokens. This is useful when auditing evaluator changes: it
+shows which cases changed, the old picked answer, the new picked answer, and a
+pass/fail summary.
+
 The first 75 embedded questions are interleaved as 25 GPQA Diamond, 25 audited
 SuperGPQA, and 25 AIME 2025 problems. The final 17 are an audited COMPSEC
 subset of reduced single-function C/C++ vulnerability-localization questions.
@@ -828,10 +834,11 @@ captured from the official DeepSeek V4 Flash API. The requests use
 `./ds4 --dump-logprobs` and compared by token bytes, so tokenizer/template or
 attention regressions show up before they become long generation failures.
 
-All project tests are driven by the C runner:
+All project tests are driven by the C runner, with a small `ds4-eval`
+extractor self-test run first:
 
 ```sh
-make test                  # ./ds4_test --all
+make test                  # ./ds4-eval --self-test-extractors && ./ds4_test --all
 ./ds4_test --logprob-vectors
 ./ds4_test --server
 ```
