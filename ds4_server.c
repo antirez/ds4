@@ -481,6 +481,13 @@ typedef enum {
     API_RESPONSES,
 } api_style;
 
+typedef enum {
+    DS4_STEERING_POLICY_ALWAYS,
+    DS4_STEERING_POLICY_DECODING,
+    DS4_STEERING_POLICY_FINAL_ANSWER,
+    DS4_STEERING_POLICY_OFF,
+} directional_steering_policy;
+
 static void random_tool_id(char *dst, size_t dstlen, api_style api) {
     static uint64_t fallback_ctr;
     unsigned char bytes[16];
@@ -5172,6 +5179,19 @@ static size_t dsml_max_tool_start_len(void) {
     return max;
 }
 
+static bool dsml_text_ends_with_partial_tool_start(const char *raw, size_t raw_len) {
+    if (!raw || raw_len == 0) return false;
+    for (size_t i = 0; i < sizeof(dsml_syntaxes) / sizeof(dsml_syntaxes[0]); i++) {
+        const char *lit = dsml_syntaxes[i].tool_calls_start;
+        const size_t lit_len = strlen(lit);
+        const size_t max = raw_len < lit_len ? raw_len : lit_len - 1;
+        for (size_t n = 2; n <= max; n++) {
+            if (!memcmp(raw + raw_len - n, lit, n)) return true;
+        }
+    }
+    return false;
+}
+
 static bool dsml_find_tool_start(const char *raw, size_t raw_len,
                                  size_t *pos_out,
                                  const dsml_syntax **syn_out) {
@@ -7599,6 +7619,7 @@ static void id_list_push_unique(stop_list *ids, const char *id);
 struct server {
     ds4_engine *engine;
     ds4_session *session;
+    directional_steering_policy steering_policy;
     int default_tokens;
     kv_disk_cache kv;
     tool_memory tool_mem;
@@ -9280,6 +9301,90 @@ static thinking_state thinking_state_from_prompt(const request *r) {
     return st;
 }
 
+static const char *directional_steering_policy_name(directional_steering_policy policy) {
+    switch (policy) {
+    case DS4_STEERING_POLICY_ALWAYS: return "always";
+    case DS4_STEERING_POLICY_DECODING: return "decoding";
+    case DS4_STEERING_POLICY_FINAL_ANSWER: return "final-answer";
+    case DS4_STEERING_POLICY_OFF: return "off";
+    }
+    return "unknown";
+}
+
+static bool request_has_tool_result_context(const request *r) {
+    return r && r->prompt_text && strstr(r->prompt_text, "<tool_result>") != NULL;
+}
+
+static bool directional_steering_final_answer_context(const request *r,
+                                                      bool responses_live_continuation,
+                                                      bool anthropic_live_continuation) {
+    if (!r) return false;
+    if (r->kind != REQ_CHAT) return true;
+    if (!r->has_tools) return true;
+    return responses_live_continuation ||
+           anthropic_live_continuation ||
+           request_has_tool_result_context(r);
+}
+
+static bool text_has_nonspace(const char *p, size_t len) {
+    if (!p) return false;
+    for (size_t i = 0; i < len; i++) {
+        if (!isspace((unsigned char)p[i])) return true;
+    }
+    return false;
+}
+
+static bool directional_steering_should_apply(
+        directional_steering_policy policy,
+        bool final_answer_context,
+        bool saw_final_answer_text,
+        bool thinking_before,
+        bool thinking_after,
+        dsml_decode_state dsml_before,
+        dsml_decode_state dsml_after,
+        bool partial_tool_start,
+        const char *piece,
+        size_t piece_len,
+        bool *starts_final_answer_out) {
+    if (starts_final_answer_out) *starts_final_answer_out = false;
+    if (policy == DS4_STEERING_POLICY_ALWAYS) return true;
+    if (policy == DS4_STEERING_POLICY_DECODING) return true;
+    if (policy == DS4_STEERING_POLICY_OFF) return false;
+
+    if (!final_answer_context) return false;
+    if (thinking_before || thinking_after) return false;
+    if (dsml_decode_state_is_tool(dsml_before) ||
+        dsml_decode_state_is_tool(dsml_after) ||
+        partial_tool_start)
+    {
+        return false;
+    }
+
+    const bool starts = text_has_nonspace(piece, piece_len);
+    if (starts_final_answer_out) *starts_final_answer_out = starts;
+    return saw_final_answer_text || starts;
+}
+
+static void server_apply_directional_steering(server *s, bool enable) {
+    if (!s || !s->session) return;
+    if (enable) {
+        ds4_session_use_engine_directional_steering(s->session);
+    } else {
+        ds4_session_set_directional_steering(s->session, 0.0f, 0.0f);
+    }
+}
+
+static void server_apply_prefill_directional_steering(server *s) {
+    server_apply_directional_steering(
+        s, s && s->steering_policy == DS4_STEERING_POLICY_ALWAYS);
+}
+
+static void server_apply_decode_directional_steering(server *s) {
+    server_apply_directional_steering(
+        s, s && (s->steering_policy == DS4_STEERING_POLICY_ALWAYS ||
+                 s->steering_policy == DS4_STEERING_POLICY_DECODING));
+}
+
 static bool should_remember_thinking_checkpoint(const request *r,
                                                 const thinking_state *thinking,
                                                 const char *finish) {
@@ -9822,6 +9927,7 @@ static void generate_job(server *s, job *j) {
                req_flags[0] ? " " : "",
                req_flags);
     ds4_session_set_progress(s->session, server_progress_cb, &progress);
+    server_apply_prefill_directional_steering(s);
 
     int cold_store_len = 0;
     if (cached == 0 &&
@@ -9987,6 +10093,14 @@ static void generate_job(server *s, job *j) {
         thinking_gates_tool_markers && thinking.inside;
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
+    const bool dynamic_steering =
+        s->steering_policy == DS4_STEERING_POLICY_FINAL_ANSWER;
+    const bool final_answer_context =
+        directional_steering_final_answer_context(&j->req,
+                                                  responses_live_continuation,
+                                                  anthropic_live_continuation);
+    bool saw_final_answer_text = false;
+    server_apply_decode_directional_steering(s);
 
     while (!g_stop_requested && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
@@ -10017,9 +10131,11 @@ static void generate_job(server *s, job *j) {
 
         int toks[17];
         int ntok = 0;
+        bool toks_evaluated = false;
         if (temperature <= 0.0f &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL)
+            getenv("DS4_MTP_SPEC_DISABLE") == NULL &&
+            !dynamic_steering)
         {
             ntok = ds4_session_eval_speculative_argmax(s->session,
                                                        token,
@@ -10033,11 +10149,8 @@ static void generate_job(server *s, job *j) {
                 finish = "error";
                 break;
             }
+            toks_evaluated = true;
         } else {
-            if (ds4_session_eval(s->session, token, err, sizeof(err)) != 0) {
-                finish = "error";
-                break;
-            }
             toks[0] = token;
             ntok = 1;
         }
@@ -10053,12 +10166,65 @@ static void generate_job(server *s, job *j) {
 
             size_t piece_len = 0;
             char *piece = ds4_token_text(s->engine, token, &piece_len);
+            thinking_state next_thinking = thinking;
+            dsml_decode_tracker next_dsml_tracker = dsml_tracker;
+            dsml_decode_state next_dsml_state = dsml_state;
+            bool starts_final_answer = false;
+
+            if (!toks_evaluated) {
+                if (dynamic_steering) {
+                    const bool thinking_before = thinking.inside;
+                    thinking_state_feed(&next_thinking, piece, piece_len);
+                    bool partial_tool_start = false;
+                    if (j->req.kind == REQ_CHAT && j->req.has_tools) {
+                        const size_t old_len = text.len;
+                        buf_append(&text, piece, piece_len);
+                        dsml_decode_tracker_update(&next_dsml_tracker,
+                                                   text.ptr, text.len);
+                        next_dsml_state = next_dsml_tracker.decode;
+                        partial_tool_start =
+                            dsml_text_ends_with_partial_tool_start(text.ptr,
+                                                                   text.len);
+                        text.len = old_len;
+                        if (text.ptr) text.ptr[text.len] = '\0';
+                    }
+                    const bool steer_token = directional_steering_should_apply(
+                        s->steering_policy,
+                        final_answer_context,
+                        saw_final_answer_text,
+                        thinking_before,
+                        next_thinking.inside,
+                        dsml_state,
+                        next_dsml_state,
+                        partial_tool_start,
+                        piece,
+                        piece_len,
+                        &starts_final_answer);
+                    server_apply_directional_steering(s, steer_token);
+                }
+                int eval_rc = dynamic_steering ?
+                    ds4_session_eval_no_mtp(s->session, token, err, sizeof(err)) :
+                    ds4_session_eval(s->session, token, err, sizeof(err));
+                if (eval_rc != 0) {
+                    finish = "error";
+                    free(piece);
+                    stop_decode = true;
+                    break;
+                }
+            }
             completion++;
 
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
-            thinking_state_feed(&thinking, piece, piece_len);
-            if (j->req.kind == REQ_CHAT && j->req.has_tools) {
+            if (dynamic_steering) {
+                thinking = next_thinking;
+                dsml_tracker = next_dsml_tracker;
+                if (starts_final_answer) saw_final_answer_text = true;
+            } else {
+                thinking_state_feed(&thinking, piece, piece_len);
+            }
+            if (!dynamic_steering &&
+                j->req.kind == REQ_CHAT && j->req.has_tools) {
                 dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
             }
 
@@ -10811,6 +10977,7 @@ typedef struct {
     const char *kv_disk_dir;
     uint64_t kv_disk_space_mb;
     kv_cache_options kv_cache;
+    directional_steering_policy steering_policy;
     bool kv_cache_reject_different_quant;
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
@@ -10916,6 +11083,8 @@ static void usage(FILE *fp) {
         "      Apply steering after FFN outputs: y -= F*v*dot(v,y). Default with file: 1\n"
         "  --dir-steering-attn F\n"
         "      Apply steering after attention outputs. Default: 0\n"
+        "  --dir-steering-policy MODE\n"
+        "      Server steering policy: final-answer, decoding, always, or off. Default: final-answer\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before serving. Slower startup, fewer first-use stalls.\n"
         "  --metal | --cuda | --cpu | --backend NAME\n"
@@ -10998,6 +11167,28 @@ static ds4_backend default_server_backend(void) {
 #endif
 }
 
+static directional_steering_policy parse_directional_steering_policy_arg(
+        const char *s,
+        const char *arg) {
+    if (!strcmp(s, "always")) return DS4_STEERING_POLICY_ALWAYS;
+    if (!strcmp(s, "decoding") || !strcmp(s, "decode")) {
+        return DS4_STEERING_POLICY_DECODING;
+    }
+    if (!strcmp(s, "final-answer") ||
+        !strcmp(s, "final") ||
+        !strcmp(s, "tool-safe"))
+    {
+        return DS4_STEERING_POLICY_FINAL_ANSWER;
+    }
+    if (!strcmp(s, "off") || !strcmp(s, "none")) {
+        return DS4_STEERING_POLICY_OFF;
+    }
+    server_log(DS4_LOG_DEFAULT, "ds4-server: invalid %s value: %s", arg, s);
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: valid directional steering policies are: final-answer, decoding, always, off");
+    exit(2);
+}
+
 static server_config parse_options(int argc, char **argv) {
     server_config c = {
         .engine = {
@@ -11010,6 +11201,7 @@ static server_config parse_options(int argc, char **argv) {
         .port = 8000,
         .ctx_size = 32768,
         .default_tokens = 393216,
+        .steering_policy = DS4_STEERING_POLICY_FINAL_ANSWER,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
     };
     c.kv_cache = kv_cache_default_options();
@@ -11074,6 +11266,9 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dir-steering-attn")) {
             c.engine.directional_steering_attn = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             directional_steering_scale_set = true;
+        } else if (!strcmp(arg, "--dir-steering-policy")) {
+            c.steering_policy =
+                parse_directional_steering_policy_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--metal")) {
@@ -11137,6 +11332,7 @@ int main(int argc, char **argv) {
     memset(&s, 0, sizeof(s));
     s.engine = engine;
     s.session = session;
+    s.steering_policy = cfg.steering_policy;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
@@ -11148,6 +11344,11 @@ int main(int argc, char **argv) {
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: exact DSML tool replay disabled; tool history uses canonical JSON rendering");
+    }
+    if (s.steering_policy != DS4_STEERING_POLICY_ALWAYS) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: directional steering policy=%s",
+                   directional_steering_policy_name(s.steering_policy));
     }
     pthread_mutex_init(&s.mu, NULL);
     pthread_cond_init(&s.cv, NULL);
@@ -13503,6 +13704,165 @@ static void test_dsml_decode_state_separates_structure_and_payload(void) {
     TEST_ASSERT(tracker.decode == DSML_DECODE_OUTSIDE);
 }
 
+static void test_directional_steering_final_answer_policy_is_tool_safe(void) {
+    char *argv0[] = {"ds4-server"};
+    server_config cfg = parse_options(1, argv0);
+    TEST_ASSERT(cfg.steering_policy == DS4_STEERING_POLICY_FINAL_ANSWER);
+    TEST_ASSERT(parse_directional_steering_policy_arg("decoding", "--dir-steering-policy") ==
+                DS4_STEERING_POLICY_DECODING);
+    TEST_ASSERT(parse_directional_steering_policy_arg("decode", "--dir-steering-policy") ==
+                DS4_STEERING_POLICY_DECODING);
+    TEST_ASSERT(!strcmp(directional_steering_policy_name(DS4_STEERING_POLICY_DECODING),
+                        "decoding"));
+
+    bool starts = true;
+    TEST_ASSERT(directional_steering_should_apply(
+        DS4_STEERING_POLICY_ALWAYS,
+        false,
+        false,
+        true,
+        false,
+        DSML_DECODE_STRUCTURAL,
+        DSML_DECODE_OUTSIDE,
+        true,
+        "",
+        0,
+        &starts));
+    TEST_ASSERT(starts == false);
+
+    TEST_ASSERT(directional_steering_should_apply(
+        DS4_STEERING_POLICY_DECODING,
+        false,
+        false,
+        true,
+        true,
+        DSML_DECODE_STRUCTURAL,
+        DSML_DECODE_STRING_BODY,
+        true,
+        DS4_TOOL_CALLS_START,
+        strlen(DS4_TOOL_CALLS_START),
+        NULL));
+
+    starts = true;
+    TEST_ASSERT(!directional_steering_should_apply(
+        DS4_STEERING_POLICY_OFF,
+        true,
+        true,
+        false,
+        false,
+        DSML_DECODE_OUTSIDE,
+        DSML_DECODE_OUTSIDE,
+        false,
+        "answer",
+        strlen("answer"),
+        &starts));
+    TEST_ASSERT(starts == false);
+
+    starts = true;
+    TEST_ASSERT(!directional_steering_should_apply(
+        DS4_STEERING_POLICY_FINAL_ANSWER,
+        false,
+        false,
+        false,
+        false,
+        DSML_DECODE_OUTSIDE,
+        DSML_DECODE_OUTSIDE,
+        false,
+        "answer",
+        strlen("answer"),
+        &starts));
+    TEST_ASSERT(starts == false);
+
+    TEST_ASSERT(!directional_steering_should_apply(
+        DS4_STEERING_POLICY_FINAL_ANSWER,
+        true,
+        false,
+        true,
+        false,
+        DSML_DECODE_OUTSIDE,
+        DSML_DECODE_OUTSIDE,
+        false,
+        "</think>",
+        strlen("</think>"),
+        NULL));
+
+    TEST_ASSERT(!directional_steering_should_apply(
+        DS4_STEERING_POLICY_FINAL_ANSWER,
+        true,
+        false,
+        false,
+        false,
+        DSML_DECODE_STRUCTURAL,
+        DSML_DECODE_STRUCTURAL,
+        false,
+        DS4_TOOL_CALLS_START,
+        strlen(DS4_TOOL_CALLS_START),
+        NULL));
+
+    TEST_ASSERT(!directional_steering_should_apply(
+        DS4_STEERING_POLICY_FINAL_ANSWER,
+        true,
+        false,
+        false,
+        false,
+        DSML_DECODE_OUTSIDE,
+        DSML_DECODE_OUTSIDE,
+        true,
+        DS4_TOOL_CALLS_START,
+        strlen(DS4_TOOL_CALLS_START) - 2,
+        NULL));
+
+    starts = false;
+    TEST_ASSERT(directional_steering_should_apply(
+        DS4_STEERING_POLICY_FINAL_ANSWER,
+        true,
+        false,
+        false,
+        false,
+        DSML_DECODE_OUTSIDE,
+        DSML_DECODE_OUTSIDE,
+        false,
+        "answer",
+        strlen("answer"),
+        &starts));
+    TEST_ASSERT(starts == true);
+
+    starts = true;
+    TEST_ASSERT(directional_steering_should_apply(
+        DS4_STEERING_POLICY_FINAL_ANSWER,
+        true,
+        true,
+        false,
+        false,
+        DSML_DECODE_OUTSIDE,
+        DSML_DECODE_OUTSIDE,
+        false,
+        " ",
+        1,
+        &starts));
+    TEST_ASSERT(starts == false);
+
+    request r = {
+        .kind = REQ_CHAT,
+        .has_tools = true,
+        .prompt_text = "user asks before any tool result",
+    };
+    TEST_ASSERT(!directional_steering_final_answer_context(&r, false, false));
+    TEST_ASSERT(directional_steering_final_answer_context(&r, true, false));
+    r.prompt_text = "<tool_result>ok</tool_result>";
+    TEST_ASSERT(directional_steering_final_answer_context(&r, false, false));
+    r.has_tools = false;
+    r.prompt_text = NULL;
+    TEST_ASSERT(directional_steering_final_answer_context(&r, false, false));
+
+    request c = {.kind = REQ_COMPLETION};
+    TEST_ASSERT(directional_steering_final_answer_context(&c, false, false));
+    TEST_ASSERT(dsml_text_ends_with_partial_tool_start(
+        DS4_TOOL_CALLS_START,
+        strlen(DS4_TOOL_CALLS_START) - 2));
+    TEST_ASSERT(!dsml_text_ends_with_partial_tool_start("plain", strlen("plain")));
+}
+
 static void test_tool_memory_max_ids_prunes_oldest(void) {
     const char *a_dsml = "\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"bash\">\n<｜DSML｜parameter name=\"command\" string=\"true\">a</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
     const char *b_dsml = "\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"bash\">\n<｜DSML｜parameter name=\"command\" string=\"true\">b</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
@@ -14650,6 +15010,7 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_visible_suffix_matches_client_replay();
     test_exact_dsml_tool_replay_can_be_disabled();
     test_dsml_decode_state_separates_structure_and_payload();
+    test_directional_steering_final_answer_policy_is_tool_safe();
     test_tool_memory_max_ids_prunes_oldest();
     test_kv_tool_map_filters_by_dsml_text();
     test_kv_tool_map_restores_before_prompt_render();

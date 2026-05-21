@@ -17,11 +17,25 @@ With no steering file or zero scales, ds4 follows the normal inference path.
 --dir-steering-file FILE   load a 43 x 4096 f32 direction file
 --dir-steering-ffn F       apply steering after FFN outputs; default is 1 when a file is provided
 --dir-steering-attn F      apply steering after attention outputs; default is 0
+--dir-steering-policy MODE server-only policy: final-answer, decoding, always, or off; default is final-answer
 ```
 
 The FFN output is usually the best first target because it is late enough in
 each layer to represent behavior, style, and topic signals. Attention steering
 is available for experiments, but it can be more fragile.
+
+For tool-using agents, `ds4-server` defaults to `--dir-steering-policy
+final-answer`. This keeps prompt prefill, thinking tokens, and DSML tool-call
+tokens unsteered. Steering is re-enabled only after generation has clearly
+entered final natural-language answer text. This avoids letting a
+behavior/style vector perturb tool-call grammar while still allowing the final
+prose to use the configured direction.
+
+`--dir-steering-policy decoding` is a middle ground for experiments that should
+leave prompt/prefill activations untouched but steer every generated token,
+including thinking and tool-call syntax. `always` restores the original
+always-on behavior, and `off` disables directional steering at the server policy
+layer.
 
 ## Verbosity Example
 
