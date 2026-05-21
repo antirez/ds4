@@ -11,8 +11,8 @@ struct ds4_metal_args_glu {
     float    limit;
 };
 
-// SwiGLU activation for the FFN inner state: silu(gate) * up. The DS4 graph
-// uses it between the gate/up expert matmuls and the down projection.
+// SwiGLU activation for the FFN inner state. DS4 clamps the shared expert with
+// the same swiglu_limit used by routed experts.
 kernel void kernel_swiglu_f32(
         constant ds4_metal_args_glu & args,
         device const char * src0,
@@ -26,11 +26,15 @@ kernel void kernel_swiglu_f32(
     device       float * dst_row  = (device       float *) ((device       char *) dst  + tgpig*args.nb1);
 
     for (int i0 = tpitg; i0 < args.ne0; i0 += ntg) {
-        const float x0 = src0_row[i0];
-        const float x1 = src1_row[i0];
+        float x0 = src0_row[i0];
+        float x1 = src1_row[i0];
+        if (args.limit > 1.0e-6f) {
+            x0 = min(x0, args.limit);
+            x1 = clamp(x1, -args.limit, args.limit);
+        }
 
         const float silu = x0 / (1.0f + exp(-x0));
 
-        dst_row[i0] = silu*x1;
+        dst_row[i0] = silu*x1*args.alpha;
     }
 }

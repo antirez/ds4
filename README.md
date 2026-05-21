@@ -1,13 +1,13 @@
 # DwarfStar 4
 
-DrawfStar 4 is a small native inference engine specific for **DeepSeek V4 Flash**. It is
+DwarfStar 4 is a small native inference engine specific for **DeepSeek V4 Flash**. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
 runtime: it is completely self-contained. Other than running the model in a
 correct and fast way, the project goal is to provide DS4 specific loading,
-prompt rendering, tool calling, KV state handling (RAM and on-disk), and server
-API, all ready to work with coding agents or with the provided CLI interface.
-There are also tools for GGUF and imatrix generation, and for quality and
-speed testing.
+prompt rendering, tool calling, KV state handling (RAM and on-disk), server
+API and integrated coding agent, all ready to work with coding agents or with
+the provided CLI interface. There are also tools for GGUF and imatrix generation,
+and for quality and speed testing.
 
 We support the following backends:
 * **Metal** is our primary target. Starting from MacBooks with 96GB of RAM.
@@ -18,8 +18,10 @@ This project would not exist without **llama.cpp and GGML**, make sure to read
 the acknowledgements section, a big thank you to Georgi Gerganov and all the
 other contributors.
 
+## Motivations
+
 Now, back at this project. Why we believe DeepSeek v4 Flash to be a pretty special
-model deserving a stand alone engine? Because after comparing it with powerful smaller
+model deserving a standalone engine? Because after comparing it with powerful smaller
 dense models, we can report that:
 
 1. DeepSeek v4 Flash is faster because of less active parameters.
@@ -36,7 +38,7 @@ That said, a few important things about this project:
 * The local inference landscape contains many excellent projects, but new models are released continuously, and the attention immediately gets captured by the next model to implement. This project takes a deliberately narrow bet: one model at a time, official-vector validation (logits obtained with the official implementation), long-context tests, and enough agent integration to know if it really works. The exact model may change as the landscape evolves, but the constraint remains: local inference credible on high end personal machines or Mac Studios, starting from 96/128GB of memory.
 * This software is developed with **strong assistance from GPT 5.5** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
 * This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache is actually a first-class disk citizen**.
-* Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. This inference engine only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is just alpha quality code, so probably we are not still there.
+* Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. This inference engine only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is beta quality code, so probably we are not still there.
 * The optimized graph path targets **Metal on macOS** and **CUDA on Linux**. The CPU path is only for correctness checks and model/tokenizer diagnostics. For CPU-only Linux builds, use `make cpu`; it builds the normal `./ds4` and `./ds4-server` binaries without CUDA or Metal. On macOS, **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. It was not possible to fix the CPU inference to avoid crashing, since each time you have to restart the computer, which is not funny. Help us, if you have the guts.
 
 ## Acknowledgements to llama.cpp and GGML
@@ -54,12 +56,14 @@ notice in our `LICENSE` file.
 
 ## Status
 
-The code and GGUF files are to be considered of **alpha quality** because
+The code and GGUF files are to be considered of **beta quality** because
 inference and model serving is a complicated matter and all this exists
 only for a few days. It will take months to reach a more stable form.
 However, we try to keep the project in a usable state, and we are making
-progresses. If you have issues, make sure to use `--trace` to log the
+progress. If you have issues, make sure to use `--trace` to log the
 sessions, and open issues including the full trace.
+
+The `ds4-agent` is alpha quality, the project was later added.
 
 ## More Documentation
 
@@ -164,6 +168,27 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 
 ![M3 Max t/s](speed-bench/m3_max_ts.svg)
 
+## Native agent
+
+DwarfStar 4 features a native coding agent that works in a different way
+than most other systems: the inference is controlled from within the agent
+itself, without socket/API boundaries, so the session is represented
+by the on-disk KV cache itself. Moreover the tools and the system prompt
+are all designed vertically for DeepSeek v4 Flash. This provides a
+few advantages:
+
+* Low latency experience, bounded mainly by the prefill speed limits. Displaying of generated text, tool calling, start of a new session are always instantaneous.
+* Live progress bar during prefill time.
+* No DSML tool calling conversion, the tools are handled natively in the LLM format.
+* KV cache mismatch are impossible by construction, the current state is always the truth.
+* Everything is tuned for this model.
+* Ability to switch session with `/list` and `/switch` without any prefill stage.
+
+However while the system already works, there is a lot of work to do
+in order to make it ready for prime time. When finally the agent will reach
+the wanted shape, we will *likely* split the server and the client creating a stateful
+session-based protocol that can recreate all that in a client-server way.
+
 ## Benchmarking
 
 `ds4-bench` measures instantaneous prefill and generation throughput at context
@@ -191,6 +216,70 @@ Use `--step-incr N` for different linear spacing, or `--step-mul F` for
 exponential sweeps. Output is CSV with one row per frontier: latest prefill
 interval tokens/sec, generation tokens/sec at that frontier, and
 `kvcache_bytes`.
+
+## Capability Evaluation
+
+`ds4-eval` is a small real-model integration benchmark. It is not a leaderboard
+runner and should not be reported as an official GPQA, SuperGPQA, AIME, or
+security benchmark score: the questions are an embedded 92-item subset chosen
+to make local regression testing useful and visually inspectable. The program
+loads the real GGUF,
+renders DS4 chat prompts, streams sampled tokens in a split-screen TUI, grades
+the final answer, and prints a per-question report with prompt tokens,
+generated tokens, pass/fail state, the model answer, and the correct answer.
+
+```sh
+./ds4-eval -m ds4flash.gguf --trace /tmp/ds4-eval.txt
+```
+
+The default run uses `--tokens 16000`, thinking mode enabled, and a soft/hard
+`</think>` budget cutoff so the model has room to produce a visible answer.
+`ds4-eval` sizes the context internally from the largest selected prompt plus
+the generation budget, and refuses runs that would need more than 1M context
+tokens. Press `p` to pause, `q` to exit and print the report, Up/Down to
+inspect or select another question, and Enter to run the selected question next.
+`--plain` disables the TUI.
+
+The first 75 embedded questions are interleaved as 25 GPQA Diamond, 25 audited
+SuperGPQA, and 25 AIME 2025 problems. The final 17 are an audited COMPSEC
+subset of reduced single-function C/C++ vulnerability-localization questions.
+The model is asked for the single best source line, or the smallest exact line
+set only when the bug cannot be localized to one line; the scorer accepts small
+audited ranges only when adjacent lines are equivalent locations for the same
+bug. The order is
+intentionally progressive: early questions are useful smoke tests, while later
+questions are hard enough that a strong reasoning model should still miss some
+of them. The SuperGPQA slice is curated rather than blind: upstream rows with
+wrong keys, missing figures, or underspecified prompts are replaced with cleaner
+rows.
+
+For a model like DeepSeek V4 Flash, the set should be treated as a hard
+capability regression suite rather than a pass/fail unit test:
+
+- **GPQA Diamond** contributes graduate-level science questions with
+  multiple-choice answers. DeepSeek's model card reports strong Flash results
+  on full GPQA Diamond in thinking mode, but individual items still require
+  careful physics, chemistry, or biology reasoning and are easy to lose with a
+  small prompt/rendering or sampling regression.
+- **SuperGPQA** contributes broad specialist knowledge and domain-transfer
+  questions. The model-card SuperGPQA number is much lower than GPQA Diamond,
+  so these items are expected to be uneven: some look mundane, others require
+  niche professional knowledge or exact interpretation of a translated-style
+  exam question.
+- **AIME 2025** contributes exact-answer contest math. These are often the most
+  unforgiving items in the set: no multiple-choice prior, no partial credit, and
+  a single arithmetic or algebraic slip changes the grade.
+- **COMPSEC** contributes single-function C/C++ security reasoning items
+  reduced from public CVE writeups. These are not exploit prompts: the task is
+  to identify the best source line where the defensive code flaw is introduced,
+  or return `0` for a safe function.
+
+In practice this means `ds4-eval` should not be expected to produce a perfect
+92/92 run. It is meant to answer a more useful engineering question: after a
+kernel, quantization, prompt-rendering, KV-cache, or tool-streaming change, does
+DeepSeek V4 Flash still solve a representative mix of hard science, broad
+knowledge, exact math, and security-code problems while using the same inference
+path users run?
 
 ## CLI
 
@@ -227,6 +316,9 @@ Start a local OpenAI/Anthropic-compatible server:
 ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
+Use `--chdir /path/to/ds4` when launching `ds4-server` from another directory,
+so relative runtime files such as `metal/*.metal` resolve from the project tree.
+
 The server keeps one mutable backend/KV checkpoint in memory,
 so stateless clients that resend a longer version of the same prompt can reuse
 the shared prefix instead of pre-filling from token zero.
@@ -241,6 +333,7 @@ Supported endpoints:
 - `GET /v1/models`
 - `GET /v1/models/deepseek-v4-flash`
 - `POST /v1/chat/completions`
+- `POST /v1/responses`
 - `POST /v1/completions`
 - `POST /v1/messages`
 
@@ -250,18 +343,39 @@ Supported endpoints:
 Tool schemas are rendered into DeepSeek's DSML tool format, and generated DSML
 tool calls are mapped back to OpenAI tool calls.
 
+`/v1/responses` accepts OpenAI Responses-style `input`, `instructions`,
+`tools`, `tool_choice`, `max_output_tokens`, `temperature`, `top_p`, `stream`,
+and `reasoning`. It is the preferred endpoint for Codex CLI. The server keeps
+Responses continuations bound to live state when possible, and can fall back to
+the same DSML rendering and KV prefix reuse used by chat completions.
+
 `/v1/messages` is the Anthropic-compatible endpoint used by Claude Code style
 clients. It accepts `system`, `messages`, `tools`, `tool_choice`, `max_tokens`,
 `temperature`, `top_p`, `top_k`, `stream`, `stop_sequences`, and thinking
 controls. Tool uses are returned as Anthropic `tool_use` blocks.
 
-Both APIs support SSE streaming. In thinking mode, reasoning is streamed in the
-native API shape instead of being mixed into final text. OpenAI chat streaming
+Default sampled API generation uses `temperature=1`, `top_p=1`, and
+`min_p=0.05`, so the default filter is relative probability rather than
+nucleus mass. In thinking mode DS4 uses those fixed sampling defaults and
+ignores client sampling knobs, matching DeepSeek's fixed-thinking API behavior.
+
+The chat, Responses, and Anthropic endpoints support SSE streaming. In thinking
+mode, reasoning is streamed in the native API shape instead of being mixed into
+final text. OpenAI chat streaming
 also streams tool calls as soon as the DSML invocation is recognized: the tool
 header is sent first, then parameter bytes are forwarded as
 `tool_calls[].function.arguments` deltas while generation continues. The
 Anthropic endpoint streams thinking and text live, then emits structured
 `tool_use` blocks when the generated tool block is complete.
+The Responses endpoint streams the Responses event lifecycle expected by Codex,
+including `response.output_text.delta`, function-call argument events, and
+terminal `response.completed` / `response.incomplete` / `response.failed`
+events.
+
+For browser JavaScript clients served from another origin, start the server with
+`--cors` to emit `Access-Control-Allow-*` headers. This only changes HTTP
+headers; it does not expose the server on the LAN. Use `--host 0.0.0.0`
+explicitly when remote machines should be able to connect.
 
 ### Tool call handling and canonicalization
 
@@ -421,6 +535,22 @@ Optionally make it the default Pi model in `~/.pi/agent/settings.json`:
   "defaultProvider": "ds4",
   "defaultModel": "deepseek-v4-flash"
 }
+```
+
+For **Codex CLI**, use the Responses wire API:
+
+```toml
+[model_providers.ds4]
+name = "DS4"
+base_url = "http://127.0.0.1:8000/v1"
+wire_api = "responses"
+stream_idle_timeout_ms = 1000000
+```
+
+Then run:
+
+```sh
+codex --model deepseek-v4-flash -c model_provider=ds4
 ```
 
 For **Claude Code**, use the Anthropic-compatible endpoint. A wrapper like this

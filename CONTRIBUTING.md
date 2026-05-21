@@ -43,8 +43,10 @@ What they cover:
 - `--logprob-vectors`: compares local token bytes and top-logprob slices against
   official DeepSeek V4 Flash continuation vectors. This catches tokenizer,
   template, attention, and logits regressions.
-- `--long-context`: runs a long-context continuation regression from
-  `tests/long_context_security_prompt.txt`.
+- `--long-context`: runs a long-context story fact-recall regression from
+  `tests/long_context_story_prompt.txt`. The model must retrieve spelled-out
+  person-number assignments from a long prose prompt and return `Name=number`
+  lines that the test parses.
 - `--tool-call-quality`: exercises actual model behavior for DSML tool-call
   emission in both fast and exact paths.
 - `--metal-kernels`: isolated Metal kernel numeric checks.

@@ -3,7 +3,17 @@
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 #include <hip/hip_fp16.h>
-#include <rocwmma/rocwmma-version.hpp>
+#include <hipcub/hipcub.hpp>
+
+// DS4 kernels currently assume CUDA-style 32-lane warps in their lane math.
+// Keep ROCm builds on wave32 targets until the wave64 paths are audited.
+#if defined(__gfx900__) || defined(__gfx906__) || defined(__gfx908__) || \
+    defined(__gfx90a__) || defined(__gfx940__) || defined(__gfx941__) || \
+    defined(__gfx942__) || defined(__gfx950__)
+#error "DS4 ROCm support currently requires wave32 AMD targets; wave64 GCN/CDNA targets are not supported yet."
+#endif
+
+namespace cub = hipcub;
 
 #define cudaError_t hipError_t
 #define cudaStream_t hipStream_t
@@ -23,6 +33,8 @@
 #define cudaDeviceGetAttribute hipDeviceGetAttribute
 #define cudaGetDeviceProperties hipGetDeviceProperties
 #define cudaDevAttrPageableMemoryAccess hipDeviceAttributePageableMemoryAccess
+// HIP has no separate opt-in LDS attribute; callers fall back when this is too small.
+#define cudaDevAttrMaxSharedMemoryPerBlockOptin hipDeviceAttributeMaxSharedMemoryPerBlock
 #define cudaMemLocationTypeDevice hipMemLocationTypeDevice
 
 #define cudaMalloc hipMalloc
@@ -62,6 +74,8 @@
 #define cudaEventSynchronize hipEventSynchronize
 #define cudaEventElapsedTime hipEventElapsedTime
 #define cudaEventDisableTiming hipEventDisableTiming
+#define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
+#define cudaFuncSetAttribute(func, attr, value) hipFuncSetAttribute(reinterpret_cast<const void *>(func), attr, value)
 
 #define cublasHandle_t hipblasHandle_t
 #define cublasStatus_t hipblasStatus_t
@@ -112,4 +126,3 @@ static __device__ __forceinline__ int32_t __dp4a(int32_t a, int32_t b, int32_t c
              + (int32_t)a_bytes[2] * b_bytes[2]
              + (int32_t)a_bytes[3] * b_bytes[3];
 }
-

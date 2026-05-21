@@ -880,7 +880,10 @@ static expert_tensor parse_expert_tensor(const char *name) {
     expert_tensor e = {0};
     int layer = -1;
     char kind[16];
-    if (sscanf(name, "blk.%d.ffn_%15[^_]_exps.weight", &layer, kind) == 2) {
+    int rest = 0;
+    if (sscanf(name, "blk.%d.ffn_%15[^_]_exps.weight%n", &layer, kind, &rest) == 2
+        && rest == (int)strlen(name))
+    {
         if (strcmp(kind, "gate") == 0 || strcmp(kind, "down") == 0 || strcmp(kind, "up") == 0) {
             e.is_expert = true;
             e.layer = layer;

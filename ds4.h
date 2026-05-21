@@ -50,6 +50,10 @@ typedef struct {
     float logprob;
 } ds4_token_score;
 
+#define DS4_DEFAULT_TEMPERATURE 1.0f
+#define DS4_DEFAULT_TOP_P 1.0f
+#define DS4_DEFAULT_MIN_P 0.05f
+
 typedef struct ds4_engine ds4_engine;
 typedef struct ds4_session ds4_session;
 
@@ -141,6 +145,8 @@ void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_thi
 
 char *ds4_token_text(ds4_engine *e, int token, size_t *len);
 int ds4_token_eos(ds4_engine *e);
+int ds4_token_user(ds4_engine *e);
+int ds4_token_assistant(ds4_engine *e);
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
@@ -182,8 +188,8 @@ bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 
-/* Disk KV cache payload helpers.  The server owns the outer file header and
- * policy; the engine owns the DS4-specific serialized graph state. */
+/* Disk KV payload helpers.  HTTP/agent code owns the outer file header and
+ * persistence policy; the engine owns the DS4-specific serialized graph state. */
 uint64_t ds4_session_payload_bytes(ds4_session *s);
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen);
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
