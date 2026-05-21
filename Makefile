@@ -33,7 +33,7 @@ CPU_CORE_OBJS = ds4_cpu.o
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression
+.PHONY: all help clean test agent-test cpu cuda cuda-spark cuda-generic cuda-regression
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -148,6 +148,9 @@ ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h ds4_kvstore.h rax.h
 tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/cuda_long_context_smoke.c
 
+ds4_agent_test.o: tests/ds4_agent_test.c ds4_agent.c ds4.h ds4_kvstore.h linenoise.h
+	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_agent_test.c
+
 rax.o: rax.c rax.h rax_malloc.h
 	$(CC) $(CFLAGS) -c -o $@ rax.c
 
@@ -188,8 +191,18 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_test.o ds4_kvstore.o rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
+ds4_agent_test: ds4_agent_test.o ds4_kvstore.o linenoise.o $(CORE_OBJS)
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(CFLAGS) -o $@ ds4_agent_test.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(METAL_LDLIBS)
+else
+	$(NVCC) $(NVCCFLAGS) -o $@ ds4_agent_test.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
+endif
+
 test: ds4_test
 	./ds4_test
 
+agent-test: ds4_agent_test
+	./ds4_agent_test
+
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

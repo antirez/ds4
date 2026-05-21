@@ -246,8 +246,6 @@ typedef struct {
     size_t pending_len;
     char dsml_start_tail[64];
     size_t dsml_start_len;
-    char think_dsml_tail[32];
-    size_t think_dsml_len;
     bool dsml_in_think;
     bool dsml_in_think_reported;
     bool post_think_gap;
@@ -1897,38 +1895,11 @@ static bool agent_stream_dsml_start_match(const char *tail, size_t len,
     return false;
 }
 
-static bool agent_tail_matches(const char *tail, size_t len,
-                               const char *needle, size_t needle_len) {
-    return len >= needle_len &&
-           memcmp(tail + len - needle_len, needle, needle_len) == 0;
-}
-
-static void agent_stream_note_thinking_byte(agent_stream_renderer *sr, char c) {
-    if (!sr->in_think || sr->dsml_in_think) return;
-    if (sr->think_dsml_len == sizeof(sr->think_dsml_tail)) {
-        memmove(sr->think_dsml_tail, sr->think_dsml_tail + 1,
-                sizeof(sr->think_dsml_tail) - 1);
-        sr->think_dsml_len--;
-    }
-    sr->think_dsml_tail[sr->think_dsml_len++] = c;
-
-    static const char fullwidth_marker[] = "｜DSML｜";
-    static const char ascii_marker[] = "|DSML|";
-    if (agent_tail_matches(sr->think_dsml_tail, sr->think_dsml_len,
-                           fullwidth_marker, sizeof(fullwidth_marker) - 1) ||
-        agent_tail_matches(sr->think_dsml_tail, sr->think_dsml_len,
-                           ascii_marker, sizeof(ascii_marker) - 1))
-    {
-        sr->dsml_in_think = true;
-    }
-}
-
 /* Route ordinary assistant bytes either to normal markdown rendering or into
  * the DSML detector.  The detector must hold short prefixes because the model
  * can split "<｜DSML｜tool_calls>" across arbitrary tokens. */
 static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
     static const char start[] = "<｜DSML｜tool_calls>";
-    agent_stream_note_thinking_byte(sr, c);
 
     /* DeepSeek usually emits one or more blank lines after </think> before
      * either prose or a DSML tool stanza.  At that point the bytes are just a
@@ -7163,6 +7134,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     return 0;
 }
 
+#ifndef DS4_AGENT_TEST_NO_MAIN
 int main(int argc, char **argv) {
     agent_config cfg = parse_options(argc, argv);
     log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
@@ -7183,3 +7155,4 @@ int main(int argc, char **argv) {
     ds4_engine_close(engine);
     return rc;
 }
+#endif
