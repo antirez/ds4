@@ -17729,9 +17729,10 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
 #else
     ds4_engine *e = s->engine;
     const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
+    const bool mtp_spec_disabled = getenv("DS4_MTP_SPEC_DISABLE") != NULL;
     const bool mtp_should_draft =
         probe_mtp && e->mtp_ready && s->mtp_logits &&
-        (e->mtp_draft_tokens > 1 || mtp_probe_log);
+        ((e->mtp_draft_tokens > 1 && !mtp_spec_disabled) || mtp_probe_log);
     if (probe_mtp && s->mtp_draft_valid) {
         if (mtp_probe_log) {
             s->mtp_probe_total++;
