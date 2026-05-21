@@ -6819,15 +6819,24 @@ static void agent_worker_free(agent_worker *w) {
 }
 
 static bool agent_prompt_yes_no(const char *prompt) {
-    char buf[32];
     for (;;) {
         printf("%s", prompt);
         fflush(stdout);
-        if (!fgets(buf, sizeof(buf), stdin)) return false;
-        char *p = buf;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == 'y' || *p == 'Y') return true;
-        if (*p == 'n' || *p == 'N') return false;
+        int answer = 0;
+        for (;;) {
+            int c = getchar();
+            if (c == EOF || c == 4) {
+                printf("\n");
+                return false;
+            }
+            if (c == '\n' || c == '\r') {
+                printf("\n");
+                if (answer == 'y' || answer == 'Y') return true;
+                if (answer == 'n' || answer == 'N' || !answer) return false;
+                break;
+            }
+            if (!answer && c != ' ' && c != '\t') answer = c;
+        }
     }
 }
 
