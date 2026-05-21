@@ -13734,6 +13734,8 @@ static bool metal_graph_verify_suffix_tops(
     const uint32_t top_rows = n_tokens > 1 ? n_tokens - 1 : 0;
     if (top_rows && !row_tops) return false;
 
+    const bool timing = getenv("DS4_MTP_VERIFY_TIMING") != NULL;
+    const double t0 = timing ? now_sec() : 0.0;
     bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
     if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
                                                          g->prefill_tokens,
@@ -13742,11 +13744,13 @@ static bool metal_graph_verify_suffix_tops(
                                                          prompt,
                                                          start,
                                                          n_tokens);
+    const double t_uploaded = timing ? now_sec() : 0.0;
     if (!ok) return false;
 
     const bool saved_capture = g->spec_capture_prefix1;
     g->spec_capture_prefix1 = capture_prefix1 && n_tokens == 2;
 
+    const double t_layers_encode0 = timing ? now_sec() : 0.0;
     ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         ok = metal_graph_encode_layer_batch(g,
@@ -13756,11 +13760,17 @@ static bool metal_graph_verify_suffix_tops(
                                             start,
                                             n_tokens);
     }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    else (void)ds4_gpu_synchronize();
+    const double t_layers_encoded = timing ? now_sec() : 0.0;
+    if (ok) {
+        ok = ds4_gpu_end_commands() != 0;
+    } else {
+        (void)ds4_gpu_synchronize();
+    }
+    const double t_layers_done = timing ? now_sec() : 0.0;
     g->spec_capture_prefix1 = saved_capture;
     if (!ok) return false;
 
+    const double t_head_encode0 = timing ? now_sec() : 0.0;
     ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = metal_graph_encode_output_head_batch(g,
                                                       model,
@@ -13776,8 +13786,14 @@ static bool metal_graph_verify_suffix_tops(
                                                top_rows) != 0;
         }
     }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    else (void)ds4_gpu_synchronize();
+    const double t_head_encoded = timing ? now_sec() : 0.0;
+    if (ok) {
+        ok = ds4_gpu_end_commands() != 0;
+    } else {
+        (void)ds4_gpu_synchronize();
+    }
+    const double t_head_done = timing ? now_sec() : 0.0;
+    const double t_read0 = timing ? now_sec() : 0.0;
     if (ok && top_rows) {
         ok = ds4_gpu_tensor_read(g->comp_selected,
                                    0,
@@ -13789,6 +13805,22 @@ static bool metal_graph_verify_suffix_tops(
                                    0,
                                    row_logits,
                                    (uint64_t)n_tokens * DS4_N_VOCAB * sizeof(row_logits[0])) != 0;
+    }
+    if (timing) {
+        const double t_done = now_sec();
+        fprintf(stderr,
+                "ds4: mtp verify suffix tokens=%u start=%u capture_prefix1=%d upload=%.3f ms layers_encode=%.3f ms layers_execute=%.3f ms head_encode=%.3f ms head_execute=%.3f ms read=%.3f ms total=%.3f ms ok=%d\n",
+                n_tokens,
+                start,
+                capture_prefix1 ? 1 : 0,
+                (t_uploaded - t0) * 1000.0,
+                (t_layers_encoded - t_layers_encode0) * 1000.0,
+                (t_layers_done - t_layers_encoded) * 1000.0,
+                (t_head_encoded - t_head_encode0) * 1000.0,
+                (t_head_done - t_head_encoded) * 1000.0,
+                (t_done - t_read0) * 1000.0,
+                (t_done - t0) * 1000.0,
+                ok ? 1 : 0);
     }
     return ok;
 }

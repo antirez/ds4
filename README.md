@@ -132,7 +132,9 @@ weights.
 GGUF. It can be used with q2-imatrix, q4-imatrix, q2, and q4, but must be
 enabled explicitly with `--mtp`. The current MTP/speculative decoding path is
 still experimental: it is correctness-gated and currently provides at most a
-slight speedup, not a meaningful generation-speed win.
+slight speedup, not a meaningful generation-speed win. The performance target
+is to make the target-model suffix verifier much cheaper than repeated normal
+decode; the MTP draft model itself is already a small part of the cycle.
 
 Then build:
 
@@ -205,6 +207,20 @@ greedy non-EOS probe, restores the memory snapshot, and continues prefill.
   --ctx-start 2048 \
   --ctx-max 65536 \
   --step-incr 2048 \
+  --gen-tokens 128
+```
+
+For MTP measurements, pass the support GGUF and a draft depth greater than one:
+
+```sh
+./ds4-bench \
+  -m ds4flash.gguf \
+  --mtp ds4flash-mtp.gguf \
+  --mtp-draft 2 \
+  --mtp-margin 0 \
+  --prompt-file speed-bench/promessi_sposi.txt \
+  --ctx-start 2048 \
+  --ctx-max 2048 \
   --gen-tokens 128
 ```
 
