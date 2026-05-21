@@ -504,7 +504,23 @@ double ds4_kvstore_entry_eviction_score(const ds4_kvstore_entry *e,
         effective_hits *= exp2(-elapsed / (double)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
         if (effective_hits < KV_CACHE_MIN_EFFECTIVE_HITS) effective_hits = 0.0;
     }
-    return (effective_hits + 1.0) * (double)e->tokens / (double)e->file_size;
+    /* Explicit checkpoints (cold, evict, shutdown) are written specifically
+     * to outlive their own prefill and serve future cross-session lookups.
+     * Continued checkpoints are intermediate restart frontiers that the
+     * superseder is already cleaning up as longer prefixes arrive.  Without
+     * a category-based bias, a freshly written cold or evict has the same
+     * (hits+1) base as a freshly written competing continued, and a tiny
+     * tokens-per-byte difference is enough to make the explicit checkpoint
+     * the lower-scoring victim.  Give cold/evict/shutdown a larger starting
+     * base so they need real accumulated hits on a continued to be ranked
+     * below it, while still decaying back toward parity as they go unused. */
+    double base = 1.0;
+    if (e->reason == DS4_KVSTORE_REASON_COLD ||
+        e->reason == DS4_KVSTORE_REASON_EVICT ||
+        e->reason == DS4_KVSTORE_REASON_SHUTDOWN) {
+        base = DS4_KVSTORE_CHECKPOINT_BASE_HITS;
+    }
+    return (effective_hits + base) * (double)e->tokens / (double)e->file_size;
 }
 
 void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
