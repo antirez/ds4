@@ -143,6 +143,10 @@ double ds4_kvstore_entry_eviction_score(const ds4_kvstore_entry *e,
                                         uint64_t now);
 void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        const char *protected_sha);
+void ds4_kvstore_prune_supersedes(ds4_kvstore *kc,
+                                  const char *new_text,
+                                  size_t new_text_len,
+                                  const char *new_sha);
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
                                  int quant_bits, int ctx_size);
 
