@@ -17640,6 +17640,29 @@ int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k, top_p, min_p, rng);
 }
 
+int ds4_session_sample_excluding(ds4_session *s, const int *excluded_ids, int n_excluded, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+    if (!s || !s->logits) return -1;
+    if (n_excluded <= 0 || !excluded_ids) {
+        return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k, top_p, min_p, rng);
+    }
+    enum { MAX_EXCL = 32 };
+    if (n_excluded > MAX_EXCL) n_excluded = MAX_EXCL;
+    float saved[MAX_EXCL];
+    int saved_id[MAX_EXCL];
+    int n_saved = 0;
+    for (int i = 0; i < n_excluded; i++) {
+        const int id = excluded_ids[i];
+        if (id < 0 || id >= (int)DS4_N_VOCAB) continue;
+        saved[n_saved] = s->logits[id];
+        saved_id[n_saved] = id;
+        s->logits[id] = DS4_NEG_INF;
+        n_saved++;
+    }
+    const int picked = sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k, top_p, min_p, rng);
+    for (int i = 0; i < n_saved; i++) s->logits[saved_id[i]] = saved[i];
+    return picked;
+}
+
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     if (!s || !out || k <= 0) return 0;
     if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;

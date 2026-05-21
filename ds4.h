@@ -172,6 +172,7 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
+int ds4_session_sample_excluding(ds4_session *s, const int *excluded_ids, int n_excluded, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
