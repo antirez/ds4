@@ -109,6 +109,7 @@ enum {
 };
 
 static int g_ds4_lock_fd = -1;
+static const char *g_ds4_lock_path = NULL;
 
 #if defined(__GNUC__) || defined(__clang__)
 #define DS4_MAYBE_UNUSED __attribute__((unused))
@@ -15664,6 +15665,9 @@ static void ds4_release_instance_lock(void) {
     if (g_ds4_lock_fd >= 0) {
         close(g_ds4_lock_fd);
         g_ds4_lock_fd = -1;
+        if (g_ds4_lock_path) {
+            (void)unlink(g_ds4_lock_path);
+        }
     }
 }
 
@@ -15710,6 +15714,7 @@ static void ds4_acquire_instance_lock(void) {
     }
     dprintf(fd, "%ld\n", (long)getpid());
     g_ds4_lock_fd = fd;
+    g_ds4_lock_path = path;
     atexit(ds4_release_instance_lock);
 }
 
