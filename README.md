@@ -177,17 +177,19 @@ by the on-disk KV cache itself. Moreover the tools and the system prompt
 are all designed vertically for DeepSeek v4 Flash. This provides a
 few advantages:
 
-* Low latency experience, bounded mainly by the prefill speed limits. Displaying of generated text, tool calling, start of a new session are always instantaneous.
+* Low latency experience, bounded mainly by prefill speed limits. Generated text display, tool calls, and new session startup are always instantaneous.
 * Live progress bar during prefill time.
 * No DSML tool calling conversion, the tools are handled natively in the LLM format.
-* KV cache mismatch are impossible by construction, the current state is always the truth.
+* KV cache mismatches are impossible by construction, the current state is always the truth.
 * Everything is tuned for this model.
-* Ability to switch session with `/list` and `/switch` without any prefill stage.
+* Ability to switch sessions with `/list` and `/switch` without any prefill stage.
 
-However while the system already works, there is a lot of work to do
-in order to make it ready for prime time. When finally the agent will reach
-the wanted shape, we will *likely* split the server and the client creating a stateful
-session-based protocol that can recreate all that in a client-server way.
+
+However, while the system already works, there is still a lot of work to do
+before it is ready for prime time. Once the agent reaches its desired shape,
+we will *likely* split the server and the client, creating a stateful,
+session-based protocol that can recreate all of this in a client-server setup.
+
 
 ## Benchmarking
 
