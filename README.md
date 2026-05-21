@@ -377,6 +377,20 @@ For browser JavaScript clients served from another origin, start the server with
 headers; it does not expose the server on the LAN. Use `--host 0.0.0.0`
 explicitly when remote machines should be able to connect.
 
+By default, `/v1/completions` wraps the `prompt` as a DS4 user message for
+compatibility with simple OpenAI completions clients. Start the server with
+`--raw-completions` to align with llama.cpp-style raw completions, where the
+client-provided `prompt` is treated as an already-rendered model prompt and the
+server only continues it:
+
+```sh
+./ds4-server --ctx 32768 --raw-completions
+```
+
+This mode is useful for clients that own their prompt templates, text
+completion/instruct frontends, and custom experiments that send model-specific
+templates directly.
+
 ### Tool call handling and canonicalization
 
 DeepSeek V4 Flash emits tool calls as [DSML text](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/encoding/README.md). Agent clients do not send that
