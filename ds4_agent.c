@@ -8918,7 +8918,6 @@ static const char *agent_yes_no_auto_name(agent_yes_no_auto answer) {
 static bool agent_prompt_yes_no_ex(const char *prompt,
                                    const agent_yes_no_options *opts,
                                    bool *timed_out) {
-    char buf[32];
     int timeout_sec = opts ? opts->timeout_sec : 0;
     agent_yes_no_auto auto_answer = opts ?
         opts->timeout_answer : AGENT_YES_NO_AUTO_NONE;
@@ -8934,31 +8933,41 @@ static bool agent_prompt_yes_no_ex(const char *prompt,
             printf("[auto-%s in %ds] ", agent_yes_no_auto_name(auto_answer), rem);
         }
         fflush(stdout);
-        if (use_timeout) {
-            double rem_sec = deadline - now_sec();
-            if (rem_sec <= 0.0) {
-                if (timed_out) *timed_out = true;
-                printf("\n");
-                return auto_answer == AGENT_YES_NO_AUTO_YES;
+        int answer = 0;
+        for (;;) {
+            if (use_timeout) {
+                double rem_sec = deadline - now_sec();
+                if (rem_sec <= 0.0) {
+                    if (timed_out) *timed_out = true;
+                    printf("\n");
+                    return auto_answer == AGENT_YES_NO_AUTO_YES;
+                }
+                struct pollfd pfd = {.fd = STDIN_FILENO, .events = POLLIN};
+                int timeout_ms = (int)(rem_sec * 1000.0) + 1;
+                int rc;
+                do {
+                    rc = poll(&pfd, 1, timeout_ms);
+                } while (rc < 0 && errno == EINTR);
+                if (rc == 0) {
+                    if (timed_out) *timed_out = true;
+                    printf("\n");
+                    return auto_answer == AGENT_YES_NO_AUTO_YES;
+                }
+                if (rc < 0) return false;
             }
-            struct pollfd pfd = {.fd = STDIN_FILENO, .events = POLLIN};
-            int timeout_ms = (int)(rem_sec * 1000.0) + 1;
-            int rc;
-            do {
-                rc = poll(&pfd, 1, timeout_ms);
-            } while (rc < 0 && errno == EINTR);
-            if (rc == 0) {
-                if (timed_out) *timed_out = true;
+            int c = getchar();
+            if (c == EOF || c == 4) {
                 printf("\n");
-                return auto_answer == AGENT_YES_NO_AUTO_YES;
+                return false;
             }
-            if (rc < 0) return false;
+            if (c == '\n' || c == '\r') {
+                printf("\n");
+                if (answer == 'y' || answer == 'Y') return true;
+                if (answer == 'n' || answer == 'N' || !answer) return false;
+                break;
+            }
+            if (!answer && c != ' ' && c != '\t') answer = c;
         }
-        if (!fgets(buf, sizeof(buf), stdin)) return false;
-        char *p = buf;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == 'y' || *p == 'Y') return true;
-        if (*p == 'n' || *p == 'N') return false;
     }
 }
 
