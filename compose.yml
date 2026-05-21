@@ -1,0 +1,30 @@
+services:
+  ds4:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        CUDA_VERSION: ${CUDA_VERSION:-13.0.3}
+        UBUNTU_VERSION: ${UBUNTU_VERSION:-24.04}
+        DS4_BUILD_TARGET: ${DS4_BUILD_TARGET:-cuda-generic}
+        CUDA_ARCH: ${CUDA_ARCH:-}
+    image: ds4:local
+    gpus: all
+    ports:
+      - "${DS4_PORT:-8000}:8000"
+    environment:
+      DS4_MODEL: ${DS4_MODEL:-q2}
+      DS4_ENABLE_MTP: ${DS4_ENABLE_MTP:-1}
+      DS4_CTX: ${DS4_CTX:-100000}
+      DS4_KV_DISK_SPACE_MB: ${DS4_KV_DISK_SPACE_MB:-20480}
+      DS4_PORT: 8000
+      DS4_HOST: 0.0.0.0
+      HF_TOKEN: ${HF_TOKEN:-}
+      DS4_MTP_DRAFT: ${DS4_MTP_DRAFT:-2}
+      DS4_MTP_MARGIN: ${DS4_MTP_MARGIN:-}
+      DS4_THREADS: ${DS4_THREADS:-}
+      DS4_EXTRA_ARGS: ${DS4_EXTRA_ARGS:-}
+    volumes:
+      - ${DS4_WEIGHTS_HOST_DIR:-./gguf}:/models
+      - ${DS4_VOLUMES_HOST_DIR:-./kv-cache}:/kv-cache
+    restart: unless-stopped

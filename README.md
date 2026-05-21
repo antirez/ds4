@@ -147,6 +147,11 @@ make cpu              # CPU-only diagnostics build
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 `./ds4-server --help` for the full flag list.
 
+For Linux CUDA container builds, see [`docker/README.md`](docker/README.md).
+The Compose setup builds `ds4-server` with CUDA 13, downloads the selected model
+into a weights volume on startup, and serves the HTTP API with a mounted disk KV
+cache volume.
+
 ## Speed
 
 These are single-run Metal CLI numbers with `--ctx 32768`, `--nothink`, greedy

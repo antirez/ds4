@@ -9,6 +9,7 @@
 /ds4flash.gguf
 /TODO.md
 /gguf/
+/kv-cache/
 *.o
 *.dSYM/
 /misc/
