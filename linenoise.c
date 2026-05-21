@@ -123,6 +123,9 @@
 #define LINENOISE_INITIAL_BUFLEN 4096
 #define PASTE_FOLD_THRESHOLD 200            // Min bytes to fold a single-line paste.
 #define PASTE_FOLD_CONTEXT 8                // Context chars kept around generic folds.
+#define HISTORY_FOLD_THRESHOLD 4096         // Min bytes to fold single-line history.
+#define HISTORY_FOLD_MULTILINE_LINES 16     // Min lines to fold shorter history.
+#define HISTORY_FOLD_CONTEXT 96             // Context chars kept around history folds.
 #define PASTE_MAX_BYTES LINENOISE_MAX_LINE
 static char *unsupported_term[] = {"dumb","cons25","emacs",NULL};
 static linenoiseCompletionCallback *completionCallback = NULL;
@@ -387,7 +390,6 @@ static int utf8CharWidth(uint32_t cp) {
          (cp >= 0x23E9 && cp <= 0x23F3) ||    /* Various symbols */
          (cp >= 0x23F8 && cp <= 0x23FA) ||    /* Various symbols */
          (cp >= 0x25AA && cp <= 0x25AB) ||    /* Small squares */
-         (cp >= 0x25B6 && cp <= 0x25C0) ||    /* Play/reverse buttons */
          (cp >= 0x25FB && cp <= 0x25FE) ||    /* Squares */
          (cp >= 0x2600 && cp <= 0x26FF) ||    /* Misc Symbols (sun, cloud, etc) */
          (cp >= 0x2700 && cp <= 0x27BF) ||    /* Dingbats (❤, ✂, etc) */
@@ -880,6 +882,15 @@ static int linenoiseStatusActive(struct linenoiseState *l) {
     return l->status && l->status[0];
 }
 
+static int linenoiseStatusRows(struct linenoiseState *l) {
+    if (!linenoiseStatusActive(l)) return 0;
+    int rows = 1;
+    for (char *p = l->status; *p; p++) {
+        if (*p == '\n') rows++;
+    }
+    return rows;
+}
+
 /* Append at most maxcols terminal cells of UTF-8 text.  Status text is
  * expected to be plain text, with styling supplied separately by the caller,
  * but we still treat ANSI CSI escapes as zero-width so a caller can pass a
@@ -911,7 +922,8 @@ static size_t abAppendUtf8Clipped(struct abuf *ab, const char *s, size_t len,
     return width;
 }
 
-static void refreshStatusLine(struct abuf *ab, struct linenoiseState *l) {
+static void refreshStatusLinePart(struct abuf *ab, struct linenoiseState *l,
+                                  const char *s, size_t len) {
     size_t width = 0;
     size_t cols = l->cols ? l->cols : 80;
     abAppend(ab, "\r\n", 2);
@@ -922,13 +934,24 @@ static void refreshStatusLine(struct abuf *ab, struct linenoiseState *l) {
      * not move the cursor to the next row. */
     abAppend(ab, "\x1b[?7l", 5);
     if (l->status_start) abAppend(ab, l->status_start, (int)strlen(l->status_start));
-    width = abAppendUtf8Clipped(ab, l->status, strlen(l->status), cols);
+    width = abAppendUtf8Clipped(ab, s, len, cols);
     while (width < cols) {
         abAppend(ab, " ", 1);
         width++;
     }
     if (l->status_end) abAppend(ab, l->status_end, (int)strlen(l->status_end));
     abAppend(ab, "\x1b[?7h", 5);
+}
+
+static void refreshStatusLine(struct abuf *ab, struct linenoiseState *l) {
+    const char *p = l->status;
+    while (p && *p) {
+        const char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        refreshStatusLinePart(ab, l, p, len);
+        if (!nl) break;
+        p = nl + 1;
+    }
 }
 
 /* A fold is a display-only replacement for a range in l->buf. The edited
@@ -961,6 +984,16 @@ static int shouldFoldText(const char *buf, size_t len) {
     return memchr(buf, '\n', len) != NULL || len >= PASTE_FOLD_THRESHOLD;
 }
 
+/* History recall should not aggressively hide normal prompts.  A single-line
+ * entry is folded only when it is very large; multiline history is folded if
+ * it is large or spans many terminal rows. */
+static int shouldFoldHistoryText(const char *buf, size_t len) {
+    size_t lines = foldCountLines(buf,len);
+    if (lines <= 1) return len >= HISTORY_FOLD_THRESHOLD;
+    return len >= HISTORY_FOLD_THRESHOLD ||
+           lines >= HISTORY_FOLD_MULTILINE_LINES;
+}
+
 /* Fill f->display with the text shown instead of the folded range. */
 static void foldSetRenderedText(struct linenoiseFold *f, const char *buf) {
     size_t hidden = f->end - f->start;
@@ -982,17 +1015,17 @@ static void foldSetRenderedText(struct linenoiseFold *f, const char *buf) {
 static int linenoiseBuildHistoryFold(struct linenoiseState *l, struct linenoiseFold *f) {
     f->start = f->end = f->displaylen = 0;
     if (l->len == 0 || maskmode) return 0;
-    if (!shouldFoldText(l->buf,l->len)) return 0;
+    if (!shouldFoldHistoryText(l->buf,l->len)) return 0;
 
     f->start = 0;
     f->end = l->len;
-    if (l->len > PASTE_FOLD_CONTEXT*2) {
+    if (l->len > HISTORY_FOLD_CONTEXT*2) {
         size_t pos = 0, chars = 0;
         int nl = 0;
 
         /* We leave (if possible) a few chars on
          * the start before the fold, to give context. */
-        while (pos < l->len && chars < PASTE_FOLD_CONTEXT) {
+        while (pos < l->len && chars < HISTORY_FOLD_CONTEXT) {
             size_t step = utf8NextCharLen(l->buf,pos,l->len);
             if (step == 0 || pos + step > l->len) break;
             if (l->buf[pos] == '\n') nl = 1;
@@ -1005,7 +1038,7 @@ static int linenoiseBuildHistoryFold(struct linenoiseState *l, struct linenoiseF
         pos = l->len;
         chars = 0;
         nl = 0;
-        while (pos > 0 && chars < PASTE_FOLD_CONTEXT) {
+        while (pos > 0 && chars < HISTORY_FOLD_CONTEXT) {
             size_t step = utf8PrevCharLen(l->buf,pos);
             if (step == 0 || step > pos) break;
             pos -= step;
@@ -1431,7 +1464,7 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
         abInit(&ab);
         layout_prompt_row =
             l->layout_callback(l, (size_t)rows,
-                               linenoiseStatusActive(l) ? 1 : 0,
+                               (size_t)linenoiseStatusRows(l),
                                l->layout_privdata);
     }
 
@@ -1484,11 +1517,15 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
              * scroll-region can grow or shrink, relative movement may be based
              * on stale physical rows and leave the prompt floating above the
              * terminal bottom. */
+            l->screen_cursor_row = layout_prompt_row + rpos2 - 1;
+            l->screen_cursor_col = 1 + col;
             snprintf(seq,64,"\x1b[%d;%dH", layout_prompt_row + rpos2 - 1,
                      1 + col);
         } else {
+            l->screen_cursor_row = 0;
+            l->screen_cursor_col = 0;
             /* Go up till we reach the expected position. */
-            int rows_below_cursor = rows - rpos2 + (linenoiseStatusActive(l) ? 1 : 0);
+            int rows_below_cursor = rows - rpos2 + linenoiseStatusRows(l);
             if (rows_below_cursor > 0) {
                 lndebug("go-up %d", rows_below_cursor);
                 snprintf(seq,64,"\x1b[%dA", rows_below_cursor);
@@ -1508,12 +1545,14 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
     l->oldpos = l->pos;
     if (flags & REFRESH_WRITE) {
         l->oldrows = rows;
-        l->oldstatusrows = linenoiseStatusActive(l) ? 1 : 0;
+        l->oldstatusrows = (size_t)linenoiseStatusRows(l);
         l->oldrpos = rpos2;
     } else if (flags & REFRESH_CLEAN) {
         l->oldrows = 0;
         l->oldstatusrows = 0;
         l->oldrpos = 1;
+        l->screen_cursor_row = 0;
+        l->screen_cursor_col = 0;
     }
 
     if (write(fd,ab.b,ab.len) == -1) {} /* Can't recover from write error. */
@@ -1547,6 +1586,19 @@ void linenoiseShow(struct linenoiseState *l) {
     } else {
         refreshLineWithFlags(l,REFRESH_WRITE);
     }
+}
+
+/* Clear the live nonblocking edit buffer and redraw the prompt/status.  This is
+ * used by clients that want Ctrl+C to cancel the current edit without tearing
+ * down the line editor. */
+void linenoiseEditClear(struct linenoiseState *l) {
+    l->buf[0] = '\0';
+    l->len = 0;
+    l->pos = 0;
+    l->oldpos = 0;
+    l->in_completion = 0;
+    linenoiseFoldClear(l);
+    refreshLine(l);
 }
 
 /* Grow the editing buffer if this state owns a growable buffer. Only the
@@ -1668,10 +1720,10 @@ int linenoiseEditQueueInput(struct linenoiseState *l, const char *buf, size_t le
 }
 
 /* Set the optional status footer rendered by the multiplexed editor.  The
- * footer is owned by linenoise and redrawn as a single extra terminal row
- * below the editable prompt.  start_escape/end_escape are emitted around the
- * whole padded status row, so callers can pass "\x1b[7m" and "\x1b[0m" for
- * an inverted status bar without leaking attributes into the prompt. */
+ * footer is owned by linenoise and redrawn as one or more terminal rows below
+ * the editable prompt.  start_escape/end_escape are emitted around each padded
+ * status row, so callers can pass "\x1b[7m" and "\x1b[0m" for an inverted
+ * status bar without leaking attributes into the prompt. */
 int linenoiseEditSetStatus(struct linenoiseState *l, const char *status,
                            const char *start_escape, const char *end_escape) {
     char *ns = NULL, *nstart = NULL, *nend = NULL;
@@ -1886,6 +1938,8 @@ int linenoiseEditStart(struct linenoiseState *l, int stdin_fd, int stdout_fd, ch
     l->status_end = NULL;
     l->layout_callback = NULL;
     l->layout_privdata = NULL;
+    l->screen_cursor_row = 0;
+    l->screen_cursor_col = 0;
     l->queued_input = NULL;
     l->queued_input_len = 0;
     l->queued_input_pos = 0;

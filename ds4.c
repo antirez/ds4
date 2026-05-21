@@ -13984,8 +13984,9 @@ static uint32_t metal_graph_prefill_cap_for_prompt(int prompt_len) {
 }
 
 /* When a server request shares a large prefix with the live checkpoint, extend
- * the KV cache with batched prefill instead of single-token decode.  The env
- * knob is useful while tuning the crossover point for different Macs. */
+ * the KV cache with batched prefill instead of single-token decode.  On an M3
+ * Max, prefill is faster from 2-token suffixes upward; keep the default at 4
+ * as a conservative crossover.  The env knob remains useful for retuning. */
 static uint32_t metal_graph_resume_prefill_min_tokens(void) {
     const char *env = getenv("DS4_METAL_RESUME_PREFILL_MIN");
     if (env && env[0]) {
@@ -13996,7 +13997,7 @@ static uint32_t metal_graph_resume_prefill_min_tokens(void) {
             return (uint32_t)v;
         }
     }
-    return 32u;
+    return 4u;
 }
 
 ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size) {

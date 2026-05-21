@@ -80,11 +80,13 @@ struct linenoiseState {
     int fold_count;    /* Number of folded ranges. */
     size_t fold_start[LINENOISE_MAX_FOLDS]; /* Folded range start offsets. */
     size_t fold_end[LINENOISE_MAX_FOLDS];   /* Folded range end offsets. */
-    char *status;       /* Optional one-line status rendered below the prompt. */
+    char *status;       /* Optional status/footer rendered below the prompt. */
     char *status_start; /* Optional escape sequence emitted before status. */
     char *status_end;   /* Optional escape sequence emitted after status. */
     linenoiseLayoutCallback *layout_callback; /* Called before refresh writes. */
     void *layout_privdata;
+    int screen_cursor_row; /* Absolute terminal cursor row after last refresh. */
+    int screen_cursor_col; /* Absolute terminal cursor col after last refresh. */
     char *queued_input; /* Bytes already read by an outer event loop. */
     size_t queued_input_len;
     size_t queued_input_pos;
@@ -102,6 +104,7 @@ char *linenoiseEditFeed(struct linenoiseState *l);
 char *linenoiseEditFeedByte(struct linenoiseState *l, char c);
 int linenoiseEditQueueInput(struct linenoiseState *l, const char *buf, size_t len);
 size_t linenoiseEditQueuedInput(struct linenoiseState *l);
+void linenoiseEditClear(struct linenoiseState *l);
 int linenoiseEditSetStatus(struct linenoiseState *l, const char *status,
                            const char *start_escape, const char *end_escape);
 void linenoiseEditSetLayoutCallback(struct linenoiseState *l,
