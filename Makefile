@@ -21,6 +21,16 @@ CPU_CORE_OBJS = ds4_cpu.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
+
+# Auto-detect Debian/Ubuntu apt-installed CUDA.
+ifeq ($(UNAME_S),Linux)
+ifeq ($(wildcard $(CUDA_HOME)/bin/nvcc),)
+ifneq ($(wildcard /usr/bin/nvcc),)
+CUDA_HOME := /usr
+endif
+endif
+endif
+
 NVCC ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?=
 ifneq ($(strip $(CUDA_ARCH)),)
