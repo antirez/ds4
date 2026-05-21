@@ -16,6 +16,16 @@
 #define DS4_KVSTORE_EXT_RESPONSES_VISIBLE (1u << 1)
 #define DS4_KVSTORE_EXT_THINKING_VISIBLE  (1u << 2)
 
+/* Payload codecs (header byte 7).  v1 files predate the codec byte; the
+ * loader synthesises CODEC_NONE for them. */
+#define DS4_KVSTORE_CODEC_NONE 0u
+#define DS4_KVSTORE_CODEC_LZ4  1u
+
+/* MAX bounds the chunk size read from the header so a tampered file cannot
+ * trigger a gigabyte allocation.  See misc/COMPRESSED_KV_CACHE.md. */
+#define DS4_KVSTORE_DEFAULT_CHUNK_BYTES (16u * 1024u * 1024u)
+#define DS4_KVSTORE_MAX_CHUNK_BYTES     (64u * 1024u * 1024u)
+
 typedef enum {
     DS4_KVSTORE_REASON_UNKNOWN   = 0,
     DS4_KVSTORE_REASON_COLD      = 1,
@@ -45,6 +55,8 @@ typedef struct {
     uint32_t hits;
     uint32_t ctx_size;
     uint8_t ext_flags;
+    uint8_t codec;          /* DS4_KVSTORE_CODEC_NONE for v1 files or v2-uncompressed */
+    uint32_t chunk_size;    /* raw bytes per chunk when codec == LZ4 */
     uint64_t created_at;
     uint64_t last_used;
     uint64_t payload_bytes;
@@ -58,6 +70,10 @@ typedef struct {
     int continued_interval_tokens;
     int boundary_trim_tokens;
     int boundary_align_tokens;
+    /* 0 disables compression (writes uncompressed v2 files); >=1 enables lz4
+     * with that many compressor threads.  ds4_kvstore_default_options sets the
+     * default from the online CPU count, matching ds4_threads_init in ds4.c. */
+    int compression_threads;
 } ds4_kvstore_options;
 
 typedef struct {
@@ -189,7 +205,8 @@ bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
                                  ds4_kvstore_entry *out);
 void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
                              uint8_t quant_bits, uint8_t reason,
-                             uint8_t ext_flags, uint32_t tokens,
+                             uint8_t ext_flags, uint8_t codec,
+                             uint32_t chunk_size, uint32_t tokens,
                              uint32_t hits, uint32_t ctx_size,
                              uint64_t created_at, uint64_t last_used,
                              uint64_t payload_bytes);
@@ -200,5 +217,16 @@ char *ds4_kvstore_path_join(const char *dir, const char *name);
 char *ds4_kvstore_path_for_sha(ds4_kvstore *kc, const char sha[41]);
 void ds4_kvstore_le_put32(uint8_t *p, uint32_t v);
 uint32_t ds4_kvstore_le_get32(const uint8_t *p);
+
+/* Streaming LZ4 cookie wrappers for the payload region.  Both return a FILE *
+ * around the raw file handle; closing the wrapper with fclose() patches the
+ * framing header and does NOT close the underlying file (the caller owns it).
+ * The reader peeks the 12-byte framing eagerly when uncompressed_total_out is
+ * non-NULL so the load site learns the uncompressed payload size before any
+ * decompression happens.  See misc/COMPRESSED_KV_CACHE.md. */
+FILE *kv_lz4_writer_open(FILE *out, uint32_t chunk_size, int n_workers);
+FILE *kv_lz4_reader_open(FILE *in, uint64_t payload_bytes,
+                         uint32_t chunk_size, int n_workers,
+                         uint64_t *uncompressed_total_out);
 
 #endif
