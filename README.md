@@ -253,6 +253,12 @@ tokens. Press `p` to pause, `q` to exit and print the report, Up/Down to
 inspect or select another question, and Enter to run the selected question next.
 `--plain` disables the TUI.
 
+Use `--regrade-trace /path/to/trace.txt` to replay the current answer
+extractor and scorer against a prior `--trace` file without loading the model
+or regenerating tokens. This is useful when auditing evaluator changes: it
+shows which cases changed, the old picked answer, the new picked answer, and a
+pass/fail summary.
+
 For Metal/Tensor changes that can affect generation drift, keep this
 deterministic q1..q4 token-count gate in the test plan:
 
@@ -1108,10 +1114,11 @@ C runner uses the standard Metal path and pins `DS4_METAL_PREFILL_CHUNK=2048`
 for this strict API-vector comparison; Tensor route drift is checked separately
 by `--metal-tensor-equivalence` and the five-fixture drift gate.
 
-All project tests are driven by the C runner:
+All project tests are driven by the C runner, with a small `ds4-eval`
+extractor self-test run first:
 
 ```sh
-make test                  # ./ds4_test --all
+make test                  # ./ds4-eval --self-test-extractors && ./ds4_test --all
 ./ds4_test --logprob-vectors
 ./ds4_test --metal-tensor-equivalence
 ./ds4_test --server
