@@ -277,6 +277,12 @@ tokens. Press `p` to pause, `q` to exit and print the report, Up/Down to
 inspect or select another question, and Enter to run the selected question next.
 `--plain` disables the TUI.
 
+Use `--regrade-trace /path/to/trace.txt` to replay the current answer
+extractor and scorer against a prior `--trace` file without loading the model
+or regenerating tokens. This is useful when auditing evaluator changes: it
+shows which cases changed, the old picked answer, the new picked answer, and a
+pass/fail summary.
+
 For Metal/Tensor changes that can affect generation drift, keep this
 deterministic q1..q4 token-count gate in the test plan:
 
@@ -371,55 +377,33 @@ Metal Tensor policy is explicit and guarded. Use `-mt auto` or `--mt auto` for
 the default route policy, `-mt on` to force Tensor routes where the Metal tensor
 path is available, and `-mt off` for the legacy Metal reference path. The old
 `--mpp` spelling remains accepted as a compatibility alias. Auto currently
-enables the F16 compressor Tensor path, enables attention-output low Tensor in
-all layers, and runs routed-MoE Tensor only in the q1..q4-token-count-safe late
-windows — gate/down from layer 35 and up from layer 36 — while preserving
-same-top1/same-greedy agreement. Wider routed-MoE windows caused deterministic
-`ds4-eval` generation drift, so earlier MoE Tensor layers stay behind explicit
-route enables (`DS4_METAL_MPP_MOE_*_ENABLE`), `DS4_METAL_MPP_FAST=1`, or
-`-mt on`. The dense Q8_0 prefill Tensor route is **default-off on M5** because
-bisection traced the entire `-mt auto` vs `-mt off` drift on M5 Max to that
-single route; it stays default-on for pre-M5 devices, where it uses the
-late-safe `attn_q_b` 32..37 plus all-Q8 38..42 window. Opt back in on M5 with
-`DS4_METAL_MPP_Q8_0_ENABLE=1`.
+enables the F16 compressor Tensor path, attention-output low Tensor in all
+layers, and routed-MoE Tensor only in the q1..q4-token-count-safe late windows:
+gate/down from layer 35 and up from layer 36. Wider routed-MoE windows caused
+deterministic `ds4-eval` generation drift, so earlier MoE Tensor layers stay
+behind explicit route opt-ins while they are being tuned. The dense Q8_0 prefill
+path remains on the legacy hand-written Metal simdgroup kernel; the
+experimental Tensor Q8_0 route was removed after M5 drift bisection showed it
+was the drift-prone path.
 
-The next prefill optimization target beyond the late MoE Tensor window is a new
-isolated quantized prefill matmul experiment that targets the high-impact
-routed-MoE and dense-attention shapes with Metal 4 cooperative matrix
-primitives, while keeping the legacy dequantization/reduction behavior close
-enough to pass the five-fixture quality gate before it can become part of
-`-mt auto`. Any Apple Neural Engine work should be a separate Core ML/Metal 4
-machine-learning pass investigation; it is not something the current custom
-compute shaders get automatically by changing their matrix instructions.
+The next prefill optimization target is therefore not a re-enable of the removed
+Q8_0 Tensor route. It is a new, isolated quantized prefill matmul experiment
+that targets the high-impact routed-MoE and dense-attention shapes with Metal 4
+cooperative matrix primitives, while keeping the legacy
+dequantization/reduction behavior close enough to pass the five-fixture quality
+gate before it can become part of `-mt auto`. Any Apple Neural Engine work
+should be a separate Core ML/Metal 4 machine-learning pass investigation; it is
+not something the current custom compute shaders get automatically by changing
+their matrix instructions.
 
 The environment controls `DS4_METAL_MPP_ENABLE` and
 `DS4_METAL_MPP_DISABLE` accept `1/true/yes/on` and `0/false/no/off`;
 `DS4_METAL_MPP_ENABLE=0` disables Tensor routes instead of enabling them by mere
 presence. Passing `--quality` also disables Tensor routes so strict/debug runs
 stay on the legacy Metal kernels. Set `DS4_METAL_MPP_FAST=1` to opt into the
-current throughput diagnostic profile: it widens Q8_0 and attention-output to
-all layers and routed-MoE to layer 0. This profile is not the default because
-its top-k overlap is weaker than auto in the current full-model suite.
-
-The Q8_0 prefill Tensor route can be isolated with `DS4_METAL_MPP_Q8_0_ENABLE=1`
-or `DS4_METAL_MPP_Q8_0_DISABLE=1`. It only affects prompt batches larger than
-eight tokens. Set `DS4_METAL_MPP_Q8_0_FILTER=all` to reproduce the wider
-all-context Q8 route, `DS4_METAL_MPP_Q8_0_FILTER=attn_q_b` for the broader
-small-prompt speed profile, or
-`DS4_METAL_MPP_Q8_0_FILTER=<substring[,substring...]>` to force named
-full-graph Q8 modules such as `attn_q_a`, `attn_kv`, `attn_q_b`, `attn_out`,
-`shared_gate`, `shared_up`, or `shared_down`. Use `<substring>@layer=A..B` to
-test one module family in a layer window, for example `shared_up@layer=30..37`.
-Set `DS4_METAL_MPP_Q8_0_TILE_N=32` to force the narrower 32-token tile; auto
-uses 64-token tiles below 4096-token batches and 32-token tiles above. Set
-`DS4_METAL_MPP_Q8_0_PARTIAL_ENABLE=0` to disable partial-tile dispatch.
-`DS4_METAL_MPP_Q8_0_DIRECT_RHS=1` isolates the direct-RHS tensor layout for
-this route without flipping the global `DS4_METAL_MPP_DIRECT_RHS` knob. When
-macOS reports Low Power Mode, auto widens the Q8_0 prefill route to all Q8_0
-contexts because that profile improved both prefill and generation in M5 Max
-low-power sweeps; set `DS4_METAL_MPP_LOW_POWER_DISABLE=1` to opt out, or
-`DS4_METAL_MPP_LOW_POWER_ENABLE=1` to force the low-power profile for
-comparison.
+current throughput diagnostic profile: it uses the routed-MoE all-layer
+diagnostic window. This profile is not the default because its top-k overlap is
+weaker than auto in the current full-model suite.
 
 The default safe-window policy uses the direct-RHS tensor layout for Tensor
 routes; set `DS4_METAL_MPP_DIRECT_RHS=0` to compare against the older staged-RHS
@@ -445,8 +429,8 @@ as a compatibility alias. Set `DS4_TEST_MPP_EQ_FORCE_ON=1` to compare forced
 Tensor against `-mt off` while working on a route.
 `DS4_TEST_MPP_EQ_CASE=<case-id-substring>` limits the diagnostic to one prompt,
 and `DS4_TEST_MPP_EQ_MATRIX=1` prints
-separate auto, fast-profile, q8-only, attention-output-only, MoE gate/up/down-only,
-and full-forced summary rows. The equivalence gate requires finite logits, the same
+separate auto, fast-profile, attention-output-only, MoE gate/up/down-only, and
+full-forced summary rows. The equivalence gate requires finite logits, the same
 top-1 token, and matching greedy continuation; it also reports top-5/top-20
 overlap, top-20 rank displacement, top-20 logit deltas, and whole-vocab RMS/max
 drift so route changes can be judged beyond pass/fail.
@@ -459,17 +443,16 @@ and reports the first comparison that exceeds the kernel target, including
 module/layer context, shape, max absolute error, RMS, and the largest element
 deltas. Set `DS4_METAL_MPP_COMPARE_VERBOSE=1` to print passing comparisons as
 well.
-Set `DS4_METAL_Q8_PREFILL_PROFILE=1` while profiling a prompt to time each
-dense Q8_0 prefill matmul dispatch by module/layer context without changing the
-route. Add `DS4_METAL_Q8_PREFILL_PROFILE_FILTER=<substring>` to limit the rows
-to dense Q8_0 contexts such as `attn_q_a`, `attn_kv`, or `attn_q_b`. Set
-`DS4_METAL_Q8_COMPARE=1` to run a per-call ref-vs-candidate comparison against
-the legacy Q8_0 matmul using the same comparator output format, and
+Set `DS4_METAL_Q8_PREFILL_PROFILE=1` while profiling a prompt to time the
+current legacy Q8_0 prefill matmul by module/layer context without changing the
+dispatch. Add `DS4_METAL_Q8_PREFILL_PROFILE_FILTER=<substring>` to limit the
+rows to dense Q8_0 contexts such as `attn_q_a`, `attn_kv`, or `attn_q_b`.
+Set `DS4_METAL_Q8_COMPARE=1` to run a local dense Q8_0 ref-vs-candidate
+comparison using the same comparator output format, and
 `DS4_METAL_Q8_COMPARE_FILTER=<substring>` to focus it on one context such as
-`attn_q_b` or `attn_out`. The compare hook runs legacy as the reference no
-matter which dispatch served the candidate, which lets it diagnose default-off
-Q8 kernel prototypes on M5; on pre-M5 devices the Q8_0 Tensor route is
-default-on and already runs the MPP path.
+`attn_q_b` or `attn_out`. This is a diagnostic hook for future default-off Q8
+kernel prototypes; the current production path still uses the legacy Q8_0
+prefill kernel.
 Set `DS4_METAL_FLASH_ATTN_COMPARE=1` with
 `DS4_METAL_MPP_COMPARE_ROUTE=flash_attn` to compare static-mixed prefill head
 outputs against the existing generic masked FlashAttention path. Use
@@ -494,13 +477,13 @@ Attention-output low projection is enabled for all layers by default. The
 earlier routed-MoE conservative window, down from layer 12 and gate/up from
 layer 15, remains available only through explicit MoE route enables or forced
 Tensor mode because widening past the late window costs prefill on this M5 Max
-build and changes deterministic `ds4-eval` q1..q4 generation lengths. The
+build and changes deterministic `ds4-eval` q1..q4 generation lengths. The dense
+Q8_0 prefill path now stays on the legacy hand-written Metal kernel. The
 attention-output low Tensor kernels stage activation tiles through half to
 match the legacy Metal matmul input path, which removes the first
 attention-output comparator breach. The current auto policy uses direct-RHS
 Tensor inputs and 64-token tiles for attention-output low projections. The F16
 compressor route did not introduce measurable drift in the current prompt set.
-The dense Q8_0 prefill route stays default-off on M5.
 
 Under this routed-MoE default, the local M5 Max `--metal-tensor-equivalence`
 diagnostic against `-mt off` reports same-top1/same-greedy agreement on all
@@ -1212,10 +1195,11 @@ C runner uses the standard Metal path and pins `DS4_METAL_PREFILL_CHUNK=2048`
 for this strict API-vector comparison; Tensor route drift is checked separately
 by `--metal-tensor-equivalence` and the five-fixture drift gate.
 
-All project tests are driven by the C runner:
+All project tests are driven by the C runner, with a small `ds4-eval`
+extractor self-test run first:
 
 ```sh
-make test                  # ./ds4_test --all
+make test                  # ./ds4-eval --self-test-extractors && ./ds4_test --all
 ./ds4_test --logprob-vectors
 ./ds4_test --metal-tensor-equivalence
 ./ds4_test --server
