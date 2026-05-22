@@ -197,6 +197,7 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 | Mac Studio M3 Ultra, 512 GB | q4 | 12018 tokens | 448.82 t/s | 26.62 t/s |
 | Mac Studio M3 Ultra, 512 GB | PRO q2 | 32768 tokens | 138.82 t/s | 9.56 t/s |
 | DGX Spark GB10, 128 GB | q2 | 7047 tokens | 343.81 t/s | 13.75 t/s |
+| NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM | q2-imatrix | 8192 tokens | 317.34 t/s | 33.85 t/s |
 
 ![M3 Max t/s](speed-bench/m3_max_ts.svg)
 ![PRO model M3 Ultra t/s](speed-bench/pro_model_m3_ultra_ts.svg)
