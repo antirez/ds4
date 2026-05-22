@@ -1,6 +1,9 @@
 #!/bin/sh
 set -e
 
+# Stop cleanly on Ctrl-C: the partial .part file is kept so a re-run resumes.
+trap 'echo >&2; echo "Interrupted; re-run the same command to resume." >&2; exit 130' INT
+
 REPO="antirez/deepseek-v4-gguf"
 Q2_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf"
 Q2_IMATRIX_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
@@ -15,6 +18,8 @@ case "$OUT_DIR" in
     *) OUT_DIR="$ROOT/$OUT_DIR" ;;
 esac
 TOKEN=${HF_TOKEN:-}
+MAX_RETRIES=${DS4_MAX_RETRIES:-100}
+RETRY_DELAY=${DS4_RETRY_DELAY:-5}
 
 usage() {
     cat <<EOF
@@ -57,8 +62,12 @@ Options:
                  cache is used if present.
 
 Environment:
-  DS4_GGUF_DIR   Directory used for downloaded GGUF files.
-                 Default: ./gguf
+  DS4_GGUF_DIR     Directory used for downloaded GGUF files.
+                   Default: ./gguf
+  DS4_MAX_RETRIES  Max automatic resume attempts on network errors.
+                   Default: 100
+  DS4_RETRY_DELAY  Seconds to wait between automatic resume attempts.
+                   Default: 5
 
 After q2-imatrix/q4-imatrix/q2/q4 downloads the script updates:
   ./ds4flash.gguf -> <download directory>/<selected model>
@@ -142,13 +151,56 @@ download_one() {
 
     echo "Downloading $file"
     echo "from https://huggingface.co/$REPO"
-    echo "If the download stops, run the same command again to resume it."
+    if [ -s "$part" ]; then
+        echo "Resuming a previous partial download."
+    fi
+    echo "Network errors are retried automatically; progress is saved to:"
+    echo "  $part"
 
     if [ -n "$TOKEN" ]; then
-        curl -fL --progress-meter -C - -H "Authorization: Bearer $TOKEN" -o "$part" "$url"
+        set -- -fL --progress-meter -C - --retry 5 --retry-delay 5 \
+            -H "Authorization: Bearer $TOKEN" -o "$part" "$url"
     else
-        curl -fL --progress-meter -C - -o "$part" "$url"
+        set -- -fL --progress-meter -C - --retry 5 --retry-delay 5 \
+            -o "$part" "$url"
     fi
+
+    attempt=1
+    while : ; do
+        rc=0
+        curl "$@" || rc=$?
+
+        if [ "$rc" -eq 0 ]; then
+            break
+        fi
+
+        if [ "$rc" -eq 22 ]; then
+            echo >&2
+            echo "Server returned an HTTP error (curl exit 22)." >&2
+            echo "The file may require a Hugging Face token. Pass --token TOKEN" >&2
+            echo "or set HF_TOKEN, then run the same command again." >&2
+            exit 1
+        fi
+
+        if [ "$rc" -ge 128 ]; then
+            echo >&2
+            echo "curl was terminated by a signal (exit $rc); stopping." >&2
+            exit 1
+        fi
+
+        if [ "$attempt" -ge "$MAX_RETRIES" ]; then
+            echo >&2
+            echo "Giving up after $attempt attempts (last curl exit: $rc)." >&2
+            echo "Run the same command again later to resume where it stopped." >&2
+            exit 1
+        fi
+
+        echo >&2
+        echo "Download interrupted (attempt $attempt/$MAX_RETRIES, curl exit $rc)." >&2
+        echo "Resuming in ${RETRY_DELAY}s -- Ctrl-C to stop, progress is kept." >&2
+        attempt=$((attempt + 1))
+        sleep "$RETRY_DELAY"
+    done
 
     mv "$part" "$out"
 }
