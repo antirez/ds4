@@ -15732,6 +15732,9 @@ struct ds4_session {
     int ctx_size;
     bool checkpoint_valid;
     bool mtp_draft_valid;
+    bool directional_steering_override;
+    float directional_steering_attn_scale;
+    float directional_steering_ffn_scale;
 };
 
 /* =========================================================================
@@ -15930,6 +15933,69 @@ static int payload_read_tensor_span(FILE *fp, ds4_gpu_tensor *tensor,
 
 static bool ds4_session_is_cpu(const ds4_session *s) {
     return s && s->engine && s->engine->backend == DS4_BACKEND_CPU;
+}
+
+static void ds4_session_directional_steering_scales(const ds4_session *s,
+                                                    float *attn,
+                                                    float *ffn) {
+    float a = 0.0f;
+    float f = 0.0f;
+    if (s && s->engine) {
+        if (s->directional_steering_override) {
+            a = s->directional_steering_attn_scale;
+            f = s->directional_steering_ffn_scale;
+        } else {
+            a = s->engine->directional_steering_attn_scale;
+            f = s->engine->directional_steering_ffn_scale;
+        }
+    }
+    if (attn) *attn = a;
+    if (ffn) *ffn = f;
+}
+
+static void ds4_session_apply_directional_steering_to_backend(ds4_session *s) {
+    if (!s) return;
+#ifndef DS4_NO_GPU
+    if (!ds4_session_is_cpu(s)) {
+        float attn = 0.0f;
+        float ffn = 0.0f;
+        ds4_session_directional_steering_scales(s, &attn, &ffn);
+        s->graph.directional_steering_attn_scale = attn;
+        s->graph.directional_steering_ffn_scale = ffn;
+    }
+#else
+    (void)s;
+#endif
+}
+
+static void ds4_session_set_directional_steering_state(ds4_session *s,
+                                                       bool override,
+                                                       float attn,
+                                                       float ffn) {
+    if (!s) return;
+    float old_attn = 0.0f;
+    float old_ffn = 0.0f;
+    ds4_session_directional_steering_scales(s, &old_attn, &old_ffn);
+
+    s->directional_steering_override = override;
+    s->directional_steering_attn_scale = attn;
+    s->directional_steering_ffn_scale = ffn;
+
+    float new_attn = 0.0f;
+    float new_ffn = 0.0f;
+    ds4_session_directional_steering_scales(s, &new_attn, &new_ffn);
+    if (old_attn != new_attn || old_ffn != new_ffn) {
+        s->mtp_draft_valid = false;
+    }
+    ds4_session_apply_directional_steering_to_backend(s);
+}
+
+void ds4_session_set_directional_steering(ds4_session *s, float attn, float ffn) {
+    ds4_session_set_directional_steering_state(s, true, attn, ffn);
+}
+
+void ds4_session_use_engine_directional_steering(ds4_session *s) {
+    ds4_session_set_directional_steering_state(s, false, 0.0f, 0.0f);
 }
 
 static uint32_t session_cpu_raw_live_rows(const ds4_session *s) {
@@ -17420,6 +17486,9 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     }
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
+        float steering_attn = 0.0f;
+        float steering_ffn = 0.0f;
+        ds4_session_directional_steering_scales(s, &steering_attn, &steering_ffn);
         if (s->checkpoint_valid &&
             prompt->len >= s->checkpoint.len &&
             ds4_tokens_starts_with(prompt, &s->checkpoint))
@@ -17433,8 +17502,8 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                                          prompt->v[i],
                                                          (uint32_t)s->checkpoint.len,
                                                          e->directional_steering_dirs,
-                                                         e->directional_steering_attn_scale,
-                                                         e->directional_steering_ffn_scale,
+                                                         steering_attn,
+                                                         steering_ffn,
                                                          &s->cpu_scratch);
                 token_vec_push(&s->checkpoint, prompt->v[i]);
                 if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
@@ -17450,8 +17519,8 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                 &s->cpu_cache,
                                 prompt,
                                 e->directional_steering_dirs,
-                                e->directional_steering_attn_scale,
-                                e->directional_steering_ffn_scale);
+                                steering_attn,
+                                steering_ffn);
         ds4_tokens_copy(&s->checkpoint, prompt);
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
@@ -17704,6 +17773,9 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     if (!s) return 1;
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
+        float steering_attn = 0.0f;
+        float steering_ffn = 0.0f;
+        ds4_session_directional_steering_scales(s, &steering_attn, &steering_ffn);
         forward_token_raw_swa_cpu_decode_scratch(s->logits,
                                                  &e->model,
                                                  &e->weights,
@@ -17711,8 +17783,8 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                                  token,
                                                  (uint32_t)s->checkpoint.len,
                                                  e->directional_steering_dirs,
-                                                 e->directional_steering_attn_scale,
-                                                 e->directional_steering_ffn_scale,
+                                                 steering_attn,
+                                                 steering_ffn,
                                                  &s->cpu_scratch);
         token_vec_push(&s->checkpoint, token);
         s->checkpoint_valid = true;
@@ -17778,6 +17850,10 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     return ds4_session_eval_internal(s, token, true, err, errlen);
+}
+
+int ds4_session_eval_no_mtp(ds4_session *s, int token, char *err, size_t errlen) {
+    return ds4_session_eval_internal(s, token, false, err, errlen);
 }
 
 /* Speculative decode state machine:
