@@ -1897,7 +1897,7 @@ static void tui_signal_restore(int sig) {
     }
     if (ui && ui->active) {
         const char restore[] = ANSI_RESET "\x1b[?25h\x1b[?1049l";
-        (void)write(STDOUT_FILENO, restore, sizeof(restore) - 1);
+        if (write(STDOUT_FILENO, restore, sizeof(restore) - 1) == -1) {}
         ui->active = false;
     }
     signal(sig, SIG_DFL);
@@ -2395,6 +2395,8 @@ static int eval_auto_context_size(ds4_engine *engine,
 static void trace_write_block(FILE *trace, const char *label, const char *text) {
     if (!trace) return;
     size_t len = text ? strlen(text) : 0;
+    /* Counted blocks make regrading robust against model output that happens
+     * to contain trace-looking delimiters or embedded CASE headers. */
     fprintf(trace, "%s_BEGIN bytes=%zu\n", label, len);
     if (len) {
         fwrite(text, 1, len, trace);
@@ -2870,6 +2872,12 @@ static void copy_span(char *dst, size_t dstlen, const char *start, const char *e
 static const char *trace_skip_counted_block(const char *line,
                                             const char *line_end,
                                             const char *end) {
+    /*
+     * Trace regrading must scan metadata lines without being confused by model
+     * output.  Prefer the byte count written by trace_write_block(); the older
+     * delimiter-only parser is still accepted in trace_copy_model_output for
+     * compatibility with existing trace files.
+     */
     const char *begin = bounded_strstr(line, line_end, "_BEGIN bytes=");
     if (!begin || begin == line) return NULL;
 

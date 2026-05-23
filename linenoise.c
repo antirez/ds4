@@ -2348,9 +2348,11 @@ void linenoiseEditStop(struct linenoiseState *l) {
         int down = (int)(l->oldrows + l->oldstatusrows) - l->oldrpos;
         if (down > 0) {
             int n = snprintf(seq, sizeof(seq), "\x1b[%dB", down);
-            if (n > 0) write(l->ofd, seq, (size_t)n);
+            if (n > 0 && (size_t)n < sizeof(seq)) {
+                if (write(l->ofd, seq, (size_t)n) == -1) {}
+            }
         }
-        write(l->ofd, "\r\x1b[0K", 5);
+        if (write(l->ofd, "\r\x1b[0K", 5) == -1) {}
     }
     free(l->queued_input);
     l->queued_input = NULL;

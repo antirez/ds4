@@ -107,9 +107,8 @@ next sections.
   how local GGUFs are scored against official DeepSeek V4 Flash continuations.
 - [dir-steering/README.md](dir-steering/README.md): directional steering data,
   vector generation, and usage.
-- [speed-bench/README.md](speed-bench/README.md): benchmark charts, Metal
-  Tensor candidate gates, drift checks, comparator probes, and local artifact
-  indexing.
+- [speed-bench/README.md](speed-bench/README.md): benchmark commands, charts,
+  and CSV generation.
 - [tests/test-vectors/README.md](tests/test-vectors/README.md): official
   continuation vectors used for regression checks.
 
@@ -185,8 +184,8 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 | MacBook Pro M3 Max, 128 GB | q2 | 11709 tokens | 250.11 t/s | 21.47 t/s |
 | MacBook Pro M3 Max, 128 GB | q4 | short | N/A | N/A |
 | MacBook Pro M3 Max, 128 GB | q4 | long | N/A | N/A |
-| MacBook Pro M5 Max, 128 GB | q2 | short | 86.02 t/s | 37.98 t/s |
-| MacBook Pro M5 Max, 128 GB | q2 | 11707 tokens | 348.22 t/s | 32.01 t/s |
+| MacBook Pro M5 Max, 128 GB | q2 | short | 87.25 t/s | 34.27 t/s |
+| MacBook Pro M5 Max, 128 GB | q2 | 11707 tokens | 463.44 t/s | 25.90 t/s |
 | Mac Studio M3 Ultra, 512 GB | q2 | short | 84.43 t/s | 36.86 t/s |
 | Mac Studio M3 Ultra, 512 GB | q2 | 11709 tokens | 468.03 t/s | 27.39 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | short | 78.95 t/s | 35.50 t/s |
@@ -283,8 +282,8 @@ or regenerating tokens. This is useful when auditing evaluator changes: it
 shows which cases changed, the old picked answer, the new picked answer, and a
 pass/fail summary.
 
-For Metal/Tensor changes that can affect generation drift, keep this
-deterministic q1..q4 token-count gate in the test plan:
+For inference changes that can affect generation drift, keep this deterministic
+q1..q4 token-count gate in the test plan:
 
 ```sh
 ./ds4-eval \
@@ -1191,9 +1190,8 @@ captured from the official DeepSeek V4 Flash API. The requests use
 `top_logprobs` slice exposed by the API. Local vectors are generated with
 `./ds4 --dump-logprobs` and compared by token bytes, so tokenizer/template or
 attention regressions show up before they become long generation failures. The
-C runner uses the standard Metal path and pins `DS4_METAL_PREFILL_CHUNK=2048`
-for this strict API-vector comparison; Tensor route drift is checked separately
-by `--metal-tensor-equivalence` and the five-fixture drift gate.
+C runner pins `DS4_METAL_PREFILL_CHUNK=2048` for this strict API-vector
+comparison.
 
 All project tests are driven by the C runner, with a small `ds4-eval`
 extractor self-test run first:
@@ -1213,8 +1211,7 @@ first answer:
 ```sh
 ./ds4 --dump-tokens -p "..."
 ./ds4 --dump-logprobs /tmp/out.json --logprobs-top-k 20 --temp 0 -p "..."
-./ds4 --dump-logits /tmp/q2-off.json --metal -mt off --nothink --prompt-file prompt.txt
-python3 speed-bench/compare_logit_drift.py /tmp/q2-off.json /tmp/q2-mt.json /tmp/q4-off.json --labels q2_mt q4_off
+./ds4 --dump-logits /tmp/logits.json --metal --nothink --prompt-file prompt.txt
 ./ds4-server --trace /tmp/ds4-trace.txt ...
 ```
 

@@ -2739,16 +2739,21 @@ typedef enum {
 
 typedef struct {
     const char **v;
+    agent_history_mark *mark;
     int len;
     int cap;
 } agent_history_ptrs;
 
-static void agent_history_ptrs_push(agent_history_ptrs *p, const char *s) {
+static void agent_history_ptrs_push(agent_history_ptrs *p, const char *s,
+                                    agent_history_mark mark) {
     if (p->len == p->cap) {
         p->cap = p->cap ? p->cap * 2 : 16;
         p->v = xrealloc(p->v, (size_t)p->cap * sizeof(p->v[0]));
+        p->mark = xrealloc(p->mark, (size_t)p->cap * sizeof(p->mark[0]));
     }
-    p->v[p->len++] = s;
+    p->v[p->len] = s;
+    p->mark[p->len] = mark;
+    p->len++;
 }
 
 static const char *agent_memmem(const char *hay, size_t hay_len,
@@ -2808,41 +2813,127 @@ static bool agent_history_is_tool_user(const char *p, const char *end) {
            agent_history_has_prefix(p, end, "Tool result");
 }
 
+static void agent_history_ptrs_free(agent_history_ptrs *p) {
+    free(p->v);
+    free(p->mark);
+    memset(p, 0, sizeof(*p));
+}
+
 /* Find the oldest rendered-chat marker needed to show the last N user turns.
- * Tool-result pseudo-user turns are skipped so /history remains centered on
- * the human conversation rather than internal tool plumbing. */
+ * Tool-result pseudo-user turns are skipped while human turns exist, so
+ * /history stays centered on the human conversation.  Compacted sessions can
+ * legitimately have a tail made only of tool result turns; in that case we
+ * fall back to recent tool/assistant events instead of showing an empty
+ * history. */
 static const char *agent_history_start_for_turns(const char *text, size_t len,
-                                                 int user_turns) {
+                                                 int user_turns,
+                                                 bool *tool_only) {
     const char *end = text + len;
+    agent_history_ptrs marks = {0};
     agent_history_ptrs users = {0};
+    agent_history_ptrs all_users = {0};
     const char *p = text;
     while (p < end) {
         agent_history_mark mark = AGENT_HISTORY_MARK_NONE;
         size_t mark_len = 0;
         const char *m = agent_history_next_marker(p, end, &mark, &mark_len);
         if (!m) break;
+        agent_history_ptrs_push(&marks, m, mark);
         const char *content = m + mark_len;
         agent_history_mark next_mark = AGENT_HISTORY_MARK_NONE;
         size_t next_len = 0;
         const char *next = agent_history_next_marker(content, end,
                                                      &next_mark, &next_len);
         const char *content_end = next ? next : end;
-        if (mark == AGENT_HISTORY_MARK_USER &&
-            !agent_history_is_tool_user(content, content_end))
-        {
-            agent_history_ptrs_push(&users, m);
+        if (mark == AGENT_HISTORY_MARK_USER) {
+            agent_history_ptrs_push(&all_users, m, mark);
+            if (!agent_history_is_tool_user(content, content_end))
+                agent_history_ptrs_push(&users, m, mark);
         }
         p = content_end;
     }
 
     const char *start = end;
+    if (tool_only) *tool_only = false;
     if (users.len > 0) {
         int idx = users.len - user_turns;
         if (idx < 0) idx = 0;
         start = users.v[idx];
+    } else if (all_users.len > 0) {
+        int idx = all_users.len - user_turns;
+        if (idx < 0) idx = 0;
+        start = all_users.v[idx];
+        if (tool_only) *tool_only = true;
+
+        /* Tool result messages are stored as user-role turns after the
+         * assistant DSML stanza that produced them.  Include that preceding
+         * assistant marker when it is still in the retained tail, otherwise
+         * replay shows the result but hides the call that caused it. */
+        for (int i = marks.len - 1; i >= 0; i--) {
+            if (marks.v[i] >= start) continue;
+            if (marks.mark[i] == AGENT_HISTORY_MARK_USER) break;
+            if (marks.mark[i] == AGENT_HISTORY_MARK_ASSISTANT) {
+                start = marks.v[i];
+                break;
+            }
+        }
     }
-    free(users.v);
+    agent_history_ptrs_free(&marks);
+    agent_history_ptrs_free(&users);
+    agent_history_ptrs_free(&all_users);
     return start;
+}
+
+static bool agent_history_latest_compaction_summary(const char *text,
+                                                    size_t len,
+                                                    const char **sum_start,
+                                                    const char **sum_end) {
+    static const char start_mark[] =
+        "[ds4-agent compacted earlier conversation. Durable task-state summary follows.]";
+    static const char end_mark[] =
+        "[End compacted summary. Recent conversation continues verbatim below.]";
+    const char *end = text + len;
+    const char *scan = text;
+    const char *best_start = NULL;
+    const char *best_end = NULL;
+    while (scan < end) {
+        const char *s = agent_memmem(scan, (size_t)(end - scan),
+                                     start_mark, sizeof(start_mark) - 1);
+        if (!s) break;
+        const char *content = s + sizeof(start_mark) - 1;
+        const char *e = agent_memmem(content, (size_t)(end - content),
+                                     end_mark, sizeof(end_mark) - 1);
+        if (!e) break;
+        best_start = content;
+        best_end = e;
+        scan = e + sizeof(end_mark) - 1;
+    }
+    if (!best_start || !best_end) return false;
+    agent_history_trim(&best_start, &best_end);
+    if (best_start >= best_end) return false;
+    if (sum_start) *sum_start = best_start;
+    if (sum_end) *sum_end = best_end;
+    return true;
+}
+
+static void agent_history_publish_limited(agent_worker *w, const char *p,
+                                          const char *end, int max_lines,
+                                          size_t max_bytes);
+
+static void agent_history_render_compaction_summary(agent_worker *w,
+                                                    const char *text,
+                                                    size_t len) {
+    const char *p = NULL, *end = NULL;
+    if (!agent_history_latest_compaction_summary(text, len, &p, &end)) return;
+    bool color = isatty(STDOUT_FILENO) != 0;
+    if (color) {
+        const char *s = "\n\x1b[1;95mCompacted Summary:\x1b[0m\n";
+        agent_publish(w, s, strlen(s));
+    } else {
+        agent_publish(w, "\nCompacted Summary:\n",
+                      strlen("\nCompacted Summary:\n"));
+    }
+    agent_history_publish_limited(w, p, end, 80, 12000);
 }
 
 static const char *agent_history_skip_utf8_continuation(const char *p,
@@ -2968,7 +3059,11 @@ static void agent_history_render_text(agent_worker *w, const char *text,
         user_turns = AGENT_HISTORY_MAX_TURNS;
 
     const char *end = text + len;
-    const char *p = agent_history_start_for_turns(text, len, user_turns);
+    agent_history_render_compaction_summary(w, text, len);
+
+    bool tool_only = false;
+    const char *p = agent_history_start_for_turns(text, len, user_turns,
+                                                  &tool_only);
     if (p >= end) {
         agent_publish(w, "\n(no user history)\n", strlen("\n(no user history)\n"));
         return;
@@ -2977,8 +3072,12 @@ static void agent_history_render_text(agent_worker *w, const char *text,
     bool color = isatty(STDOUT_FILENO) != 0;
     if (color) agent_publish(w, "\n\x1b[90m", strlen("\n\x1b[90m"));
     else agent_publish(w, "\n", 1);
-    agent_publishf(w, "--- session history: last %d user turn%s ---\n",
-                   user_turns, user_turns == 1 ? "" : "s");
+    if (tool_only) {
+        agent_publishf(w, "--- session history: recent tool/assistant events ---\n");
+    } else {
+        agent_publishf(w, "--- session history: last %d user turn%s ---\n",
+                       user_turns, user_turns == 1 ? "" : "s");
+    }
     if (color) agent_publish(w, "\x1b[0m", 4);
 
     while (p < end) {
@@ -3244,6 +3343,8 @@ static bool agent_worker_switch_session(agent_worker *w, const char *prefix,
         w->user_activity = true;
         w->session_dirty = false;
         w->status.state = AGENT_WORKER_IDLE;
+        w->status.ctx_used = w->transcript.len;
+        w->status.ctx_size = w->cfg->gen.ctx_size;
         w->status.error[0] = '\0';
         agent_wake_locked(w);
         pthread_mutex_unlock(&w->mu);
@@ -4810,7 +4911,7 @@ static char *agent_bash_observation(agent_bash_job *job, bool mark_observed) {
     double elapsed = now_sec() - job->start_time;
 
     agent_buf out = {0};
-    char line[512];
+    char line[PATH_MAX + 256];
     if (job->running) {
         snprintf(line, sizeof(line),
             "bash job=%d pid=%ld status=running elapsed_sec=%.1f timeout_sec=%.0f\n",
@@ -7158,6 +7259,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     bool running = true;
     bool exit_save_handled = false;
     bool show_welcome_after_restart = false;
+    bool force_status_redraw_after_restart = false;
     char *restore_line = NULL;
     while (running) {
         struct pollfd pfd[2] = {
@@ -7343,6 +7445,8 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                                                              AGENT_HISTORY_DEFAULT_TURNS,
                                                              err, sizeof(err)))
                                 printf("switch failed: %s\n", err);
+                            else
+                                force_status_redraw_after_restart = true;
                         }
                     }
                 } else if (!strncmp(cmd, "/history", 8) &&
@@ -7388,6 +7492,10 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     if (show_welcome_after_restart) {
                         editor_write_welcome_banner(&editor, cfg, prompt, statusline);
                         show_welcome_after_restart = false;
+                    }
+                    if (force_status_redraw_after_restart) {
+                        editor_write_async(&editor, "", 0, prompt, statusline, true);
+                        force_status_redraw_after_restart = false;
                     }
                     free(restore_line);
                     restore_line = NULL;

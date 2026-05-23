@@ -4,8 +4,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "ds4.h"
-
 /* =========================================================================
  * GPU Tensor and Command Lifetime.
  * =========================================================================
@@ -32,6 +30,9 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
+int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                   const ds4_gpu_tensor *src, uint64_t src_offset,
+                                   uint64_t count);
 
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
@@ -45,9 +46,6 @@ int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
 void ds4_gpu_set_quality(bool quality);
-void ds4_gpu_set_mpp_mode(ds4_mpp_mode mode);
-void ds4_gpu_set_mpp_compare_context(const char *module, uint32_t layer_index, uint32_t pos0);
-void ds4_gpu_clear_mpp_compare_context(void);
 void ds4_gpu_print_memory_report(const char *label);
 
 /* =========================================================================
@@ -494,6 +492,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
+        uint32_t                comp_kv_f16,
         const ds4_gpu_tensor *topk,
         uint32_t                n_tokens,
         uint32_t                pos0,
