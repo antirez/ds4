@@ -11014,8 +11014,11 @@ static bool metal_graph_refresh_ratio4_compressor_state(
         uint32_t          width,
         uint32_t          pos0,
         uint32_t          n_tokens) {
+    if (n_tokens < 4) {
+        return true;
+    }
     if (!g || !model || !state_kv || !state_score || !kv_weight || !score_weight || !ape ||
-        head_dim == 0 || width == 0 || n_tokens < 4) {
+        head_dim == 0 || width == 0) {
         return false;
     }
 
@@ -13407,6 +13410,7 @@ static bool imatrix_collector_save(
 }
 
 static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
+    memset(g->layer_n_comp, 0, sizeof(g->layer_n_comp));
     memset(g->layer_n_index_comp, 0, sizeof(g->layer_n_index_comp));
     g->mtp_n_raw = 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -16008,7 +16012,7 @@ static uint64_t session_payload_live_tensor_bytes(const ds4_gpu_graph *g, uint32
     return bytes;
 }
 
-/* Metal tensors are copied through a fixed-size CPU buffer.  We do not mmap the
+/* Accelerator tensors are copied through a fixed-size CPU buffer.  We do not mmap the
  * cache file and we do not allocate a second graph-sized blob just to serialize
  * it; both would be poor fits for this very large model. */
 static int payload_write_tensor_span(FILE *fp, const ds4_gpu_tensor *tensor,
@@ -16024,7 +16028,7 @@ static int payload_write_tensor_span(FILE *fp, const ds4_gpu_tensor *tensor,
     while (done < bytes) {
         const size_t n = bytes - done > (uint64_t)cap ? cap : (size_t)(bytes - done);
         if (ds4_gpu_tensor_read(tensor, offset + done, buf, n) == 0) {
-            payload_set_err(err, errlen, "failed to read Metal session tensor");
+            payload_set_err(err, errlen, "failed to read accelerator session tensor");
             return 1;
         }
         if (payload_write_bytes(fp, buf, n, err, errlen) != 0) return 1;
@@ -16048,7 +16052,7 @@ static int payload_read_tensor_span(FILE *fp, ds4_gpu_tensor *tensor,
         const size_t n = bytes - done > (uint64_t)cap ? cap : (size_t)(bytes - done);
         if (payload_read_bytes(fp, buf, n, remaining, err, errlen) != 0) return 1;
         if (ds4_gpu_tensor_write(tensor, offset + done, buf, n) == 0) {
-            payload_set_err(err, errlen, "failed to restore Metal session tensor");
+            payload_set_err(err, errlen, "failed to restore accelerator session tensor");
             return 1;
         }
         done += n;
@@ -16396,7 +16400,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     return 1;
 #else
     if (ds4_gpu_synchronize() == 0) {
-        payload_set_err(err, errlen, "failed to synchronize Metal before snapshot");
+        payload_set_err(err, errlen, "failed to synchronize accelerator before snapshot");
         return 1;
     }
 
@@ -16745,6 +16749,15 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         }
     }
 
+    if (ds4_gpu_synchronize() == 0) {
+        token_vec_free(&new_checkpoint);
+        payload_set_err(err, errlen, "failed to synchronize accelerator before KV restore");
+        return 1;
+    }
+    s->checkpoint_valid = false;
+    s->mtp_draft_valid = false;
+    g->mtp_n_raw = 0;
+
     uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
     int rc = 0;
     for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
@@ -16832,6 +16845,11 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     if (remaining != 0) {
         token_vec_free(&new_checkpoint);
         payload_set_err(err, errlen, "KV checkpoint has trailing payload bytes");
+        return 1;
+    }
+    if (ds4_gpu_synchronize() == 0) {
+        token_vec_free(&new_checkpoint);
+        payload_set_err(err, errlen, "failed to synchronize accelerator after KV restore");
         return 1;
     }
 
@@ -17722,6 +17740,12 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     }
 
     bool ok;
+    s->checkpoint_valid = false;
+    s->mtp_draft_valid = false;
+    if (!metal_graph_reset_prefill_state(&s->graph)) {
+        snprintf(err, errlen, "%s prefill state reset failed", backend_name);
+        return 1;
+    }
     if (s->prefill_cap < (uint32_t)prompt->len) {
         ds4_sync_progress progress = {
             .session = s,

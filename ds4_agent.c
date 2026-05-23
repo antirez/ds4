@@ -60,6 +60,7 @@ typedef struct {
 typedef struct {
     ds4_engine_options engine;
     agent_generation_options gen;
+    bool non_interactive;
 } agent_config;
 
 typedef enum {
@@ -103,6 +104,7 @@ typedef struct {
     bool wake_pending;
     bool stop;
     bool interrupt;
+    bool initialized;
     bool queued_user_pending;
     bool save_requested;
     int progress_base;
@@ -313,6 +315,37 @@ static void write_all(int fd, const char *p, size_t n) {
     }
 }
 
+typedef struct {
+    char *ptr;
+    size_t len;
+    size_t cap;
+} agent_input_buf;
+
+static void agent_input_buf_append(agent_input_buf *b, const char *s, size_t n) {
+    if (!n) return;
+    if (b->len + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap * 2 : 4096;
+        while (cap < b->len + n + 1) cap *= 2;
+        b->ptr = xrealloc(b->ptr, cap);
+        b->cap = cap;
+    }
+    memcpy(b->ptr + b->len, s, n);
+    b->len += n;
+    b->ptr[b->len] = '\0';
+}
+
+static char *agent_input_buf_take(agent_input_buf *b) {
+    if (!b->ptr) return xstrdup("");
+    char *p = b->ptr;
+    memset(b, 0, sizeof(*b));
+    return p;
+}
+
+static void agent_input_buf_free(agent_input_buf *b) {
+    free(b->ptr);
+    memset(b, 0, sizeof(*b));
+}
+
 static int parse_int(const char *s, const char *opt) {
     char *end = NULL;
     long v = strtol(s, &end, 10);
@@ -383,6 +416,8 @@ static void usage(FILE *fp) {
         "  -c, --ctx N            Context size. Default: 100000\n"
         "  -n, --tokens N         Max generated tokens per turn. Default: 50000\n"
         "  -p, --prompt TEXT      Submit an initial prompt after startup.\n"
+        "  --non-interactive      Run without the TUI. With -p: one turn and exit;\n"
+        "                         without -p: read repeated prompts from stdin.\n"
         "  -sys, --system TEXT    Extra system prompt. Empty disables extra text.\n"
         "  --trace FILE           Write prompt, token, and DSML debug trace.\n"
         "  --temp F               Sampling temperature. Default: 1\n"
@@ -447,6 +482,8 @@ static agent_config parse_options(int argc, char **argv) {
             exit(0);
         } else if (!strcmp(arg, "-p") || !strcmp(arg, "--prompt")) {
             c.gen.prompt = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--non-interactive")) {
+            c.non_interactive = true;
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {
@@ -1476,13 +1513,13 @@ static void agent_tool_viz_start(agent_stream_renderer *sr) {
     v->last_output_newline = true;
     if (sr->replay) {
         if (line_open) agent_tool_viz_puts(sr, "\n");
-    } else {
+    } else if (sr->renderer->use_color) {
         /* The raw DSML start marker may arrive after ordinary text on the
-         * current row.  Clear that row and repaint it as a semantic tool call
-         * line instead of letting the XML-ish control syntax leak into the live
-         * user interface.  Replay mode must not emit this cursor control,
-         * because it may erase already-rendered backlog. */
+         * current row.  Clear that row only for the live terminal UI; plain
+         * stdout mode must never leak cursor-control escapes into pipes. */
         agent_tool_viz_puts(sr, "\r\x1b[2K");
+    } else if (line_open) {
+        agent_tool_viz_puts(sr, "\n");
     }
     v->last_output_newline = true;
 }
@@ -2420,6 +2457,7 @@ static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
 }
 
 static void agent_publish_system_status(agent_worker *w, const char *msg) {
+    if (w->cfg->non_interactive) return;
     if (isatty(STDOUT_FILENO)) {
         agent_publish(w, "\x1b[1;33m", strlen("\x1b[1;33m"));
         agent_publish(w, msg, strlen(msg));
@@ -2506,13 +2544,18 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
                                     "agent-system", ignored_sha,
                                     save_err, sizeof(save_err)))
             {
-                agent_buf b = {0};
-                agent_buf_puts(&b, "\nds4-agent: failed to save system prompt KV: ");
-                agent_buf_puts(&b, save_err);
-                agent_buf_puts(&b, "\n");
-                char *msg = agent_buf_take(&b);
-                agent_publish(w, msg, strlen(msg));
-                free(msg);
+                if (w->cfg->non_interactive) {
+                    fprintf(stderr, "ds4-agent: failed to save system prompt KV: %s\n",
+                            save_err);
+                } else {
+                    agent_buf b = {0};
+                    agent_buf_puts(&b, "\nds4-agent: failed to save system prompt KV: ");
+                    agent_buf_puts(&b, save_err);
+                    agent_buf_puts(&b, "\n");
+                    char *msg = agent_buf_take(&b);
+                    agent_publish(w, msg, strlen(msg));
+                    free(msg);
+                }
             } else {
                 agent_trace(w, "sysprompt kv stored file=%s tokens=%d",
                             w->sysprompt_path, w->transcript.len);
@@ -5578,6 +5621,10 @@ static void *worker_main(void *arg) {
         agent_set_error(w, init_err[0] ? init_err : "failed to initialize system prompt");
     }
     agent_trace_tokens(w, "initial_system_prompt", &w->transcript, 0);
+    pthread_mutex_lock(&w->mu);
+    w->initialized = true;
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
 
     while (true) {
         pthread_mutex_lock(&w->mu);
@@ -5632,9 +5679,18 @@ static void drain_wake_fd(int fd) {
  * the UI can keep the typed text editable instead of silently queueing it. */
 static bool worker_submit(agent_worker *w, const char *text) {
     pthread_mutex_lock(&w->mu);
-    bool ok = w->status.state == AGENT_WORKER_IDLE && !w->cmd_text;
+    bool ok = w->initialized && w->status.state == AGENT_WORKER_IDLE && !w->cmd_text;
     if (ok) {
         w->cmd_text = xstrdup(text);
+        /* A submitted turn is no longer idle, even if the worker thread has
+         * not yet reached its real prefill accounting.  Non-interactive mode
+         * depends on this to avoid exiting in the small handoff window between
+         * accepting stdin and starting generation. */
+        w->status.state = AGENT_WORKER_PREFILL;
+        w->status.prefill_done = 0;
+        w->status.prefill_total = 0;
+        w->status.generated = 0;
+        w->status.gen_tps = 0.0;
         pthread_cond_signal(&w->cond);
     }
     pthread_mutex_unlock(&w->mu);
@@ -5683,9 +5739,22 @@ static void worker_get_status(agent_worker *w, agent_status *status) {
 }
 
 static bool worker_is_idle(agent_worker *w) {
-    agent_status st;
-    worker_get_status(w, &st);
-    return st.state == AGENT_WORKER_IDLE || st.state == AGENT_WORKER_ERROR;
+    pthread_mutex_lock(&w->mu);
+    bool idle = w->initialized &&
+        (w->status.state == AGENT_WORKER_IDLE ||
+         w->status.state == AGENT_WORKER_ERROR);
+    pthread_mutex_unlock(&w->mu);
+    return idle;
+}
+
+static bool worker_is_initialized(agent_worker *w, agent_status *status) {
+    pthread_mutex_lock(&w->mu);
+    w->status.ctx_used = w->transcript.len;
+    w->status.ctx_size = w->cfg->gen.ctx_size;
+    if (status) *status = w->status;
+    bool initialized = w->initialized;
+    pthread_mutex_unlock(&w->mu);
+    return initialized;
 }
 
 /* The UI owns queued user text.  This flag tells the worker to stop at the next
@@ -6866,6 +6935,186 @@ static agent_exit_save_result agent_maybe_save_before_exiting(agent_worker *w) {
  * ============================================================================
  */
 
+static void agent_noninteractive_marker(const char *msg) {
+    write_all(STDERR_FILENO, msg, strlen(msg));
+    write_all(STDERR_FILENO, "\n", 1);
+}
+
+static int agent_read_stdin_available(agent_input_buf *in, bool *eof) {
+    char buf[4096];
+    for (;;) {
+        ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+        if (n > 0) {
+            agent_input_buf_append(in, buf, (size_t)n);
+            continue;
+        }
+        if (n == 0) {
+            *eof = true;
+            return 0;
+        }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+        perror("ds4-agent: read stdin");
+        return -1;
+    }
+}
+
+/* Headless mode is intentionally just another front-end for the same worker.
+ * With -p/--prompt it is a one-shot execution.  Without -p it becomes a small
+ * stdin protocol: announce readiness on stderr, collect bytes until stdin has
+ * been quiet for 200 ms, submit that buffer as one prompt, and keep reading so
+ * later input can be queued while the model is still working. */
+static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
+    agent_worker worker;
+    if (agent_worker_init(&worker, engine, cfg) != 0) return 1;
+
+    const bool one_shot = cfg->gen.prompt != NULL;
+    bool one_shot_submitted = false;
+    bool stdin_eof = false;
+    bool waiting_announced = false;
+    bool stdin_nonblock = false;
+    int old_stdin_flags = 0;
+    agent_input_buf input = {0};
+    agent_prompt_queue queue = {0};
+    double quiet_deadline = 0.0;
+    int rc = 0;
+
+    if (!one_shot) {
+        if (set_nonblock(STDIN_FILENO, true, &old_stdin_flags) != 0) {
+            perror("ds4-agent: nonblocking stdin");
+            agent_worker_free(&worker);
+            return 1;
+        }
+        stdin_nonblock = true;
+    }
+
+    while (true) {
+        bool initialized = worker_is_initialized(&worker, NULL);
+        bool idle = worker_is_idle(&worker);
+
+        if (one_shot && !one_shot_submitted && initialized) {
+            if (worker_submit(&worker, cfg->gen.prompt))
+                one_shot_submitted = true;
+            idle = false;
+        }
+
+        if (!one_shot && queue.len && idle) {
+            char *queued = agent_prompt_queue_pop(&queue);
+            worker_set_queued_user_pending(&worker, queue.len > 0);
+            if (worker_submit(&worker, queued)) {
+                idle = false;
+            } else {
+                agent_prompt_queue_push_front(&queue, queued);
+                queued = NULL;
+                worker_set_queued_user_pending(&worker, true);
+            }
+            free(queued);
+        }
+
+        if (!one_shot && initialized && idle && !queue.len &&
+            input.len == 0 && !stdin_eof && !waiting_announced)
+        {
+            agent_noninteractive_marker("+DWARFSTAR_WAITING");
+            waiting_announced = true;
+        }
+
+        int timeout_ms = -1;
+        if (!one_shot && input.len > 0) {
+            double rem = quiet_deadline - now_sec();
+            timeout_ms = rem <= 0.0 ? 0 : (int)(rem * 1000.0) + 1;
+        }
+
+        struct pollfd pfd[2];
+        int nfds = 0;
+        int wake_idx = nfds;
+        pfd[nfds++] = (struct pollfd){.fd = worker.wake_fd[0], .events = POLLIN};
+        int stdin_idx = -1;
+        if (!one_shot && initialized && !stdin_eof) {
+            stdin_idx = nfds;
+            pfd[nfds++] = (struct pollfd){.fd = STDIN_FILENO, .events = POLLIN};
+        }
+
+        int prc = poll(pfd, (nfds_t)nfds, timeout_ms);
+        if (prc < 0) {
+            if (errno == EINTR) continue;
+            perror("ds4-agent: poll");
+            rc = 1;
+            break;
+        }
+        if (pfd[wake_idx].revents & POLLIN) drain_wake_fd(worker.wake_fd[0]);
+        if (stdin_idx >= 0 && (pfd[stdin_idx].revents & (POLLIN | POLLHUP))) {
+            size_t old_len = input.len;
+            if (agent_read_stdin_available(&input, &stdin_eof) != 0) {
+                rc = 1;
+                break;
+            }
+            if (input.len != old_len) {
+                quiet_deadline = now_sec() + 0.200;
+                waiting_announced = false;
+            }
+        }
+
+        char *out = NULL;
+        size_t out_len = 0;
+        agent_status st = {0};
+        worker_consume(&worker, &out, &out_len, &st);
+        if (out && out_len) {
+            write_all(STDOUT_FILENO, out, out_len);
+            fflush(stdout);
+        }
+        free(out);
+
+        if (st.state == AGENT_WORKER_ERROR) {
+            fprintf(stderr, "ds4-agent: %s\n",
+                    st.error[0] ? st.error : "worker error");
+            rc = 1;
+            break;
+        }
+
+        if (!one_shot && input.len > 0 &&
+            (stdin_eof || now_sec() >= quiet_deadline))
+        {
+            char *prompt = agent_input_buf_take(&input);
+            if (worker_is_idle(&worker) && queue.len == 0) {
+                worker_set_queued_user_pending(&worker, false);
+                if (!worker_submit(&worker, prompt)) {
+                    agent_prompt_queue_push(&queue, prompt);
+                    worker_set_queued_user_pending(&worker, true);
+                    agent_noninteractive_marker("+DWARFSTAR_QUEUED");
+                }
+            } else {
+                agent_prompt_queue_push(&queue, prompt);
+                worker_set_queued_user_pending(&worker, true);
+                agent_noninteractive_marker("+DWARFSTAR_QUEUED");
+            }
+            free(prompt);
+            waiting_announced = false;
+        }
+
+        if (one_shot && one_shot_submitted && worker_is_idle(&worker)) break;
+        if (!one_shot && stdin_eof && input.len == 0 &&
+            queue.len == 0 && worker_is_idle(&worker))
+            break;
+    }
+
+    /* Drain anything published between the final status transition and the
+     * loop exit.  This keeps stdout complete without adding another protocol. */
+    char *out = NULL;
+    size_t out_len = 0;
+    worker_consume(&worker, &out, &out_len, NULL);
+    if (out && out_len) {
+        write_all(STDOUT_FILENO, out, out_len);
+        fflush(stdout);
+    }
+    free(out);
+
+    if (stdin_nonblock) fcntl(STDIN_FILENO, F_SETFL, old_stdin_flags);
+    agent_input_buf_free(&input);
+    agent_prompt_queue_free(&queue);
+    agent_worker_free(&worker);
+    return rc;
+}
+
 /* Main UI loop.  poll() multiplexes stdin with the worker wake pipe; all
  * terminal writes go through editor_write_async() so linenoise, status footer,
  * model output, and tool output never race each other. */
@@ -7175,9 +7424,12 @@ int main(int argc, char **argv) {
     memset(&sa, 0, sizeof(sa));
     sigemptyset(&sa.sa_mask);
     sa.sa_handler = agent_sigint_handler;
-    bool sigint_installed = sigaction(SIGINT, &sa, &old_int) == 0;
+    bool sigint_installed = !cfg.non_interactive &&
+        sigaction(SIGINT, &sa, &old_int) == 0;
 
-    int rc = run_agent(engine, &cfg);
+    int rc = cfg.non_interactive ?
+        run_agent_non_interactive(engine, &cfg) :
+        run_agent(engine, &cfg);
 
     if (sigint_installed) sigaction(SIGINT, &old_int, NULL);
     ds4_engine_close(engine);
