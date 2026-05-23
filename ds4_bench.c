@@ -34,7 +34,6 @@ typedef struct {
     int step_incr;
     int gen_tokens;
     double step_mul;
-    ds4_mpp_mode mpp_mode;
     const char *dump_frontier_logits_dir;
     bool warm_weights;
     bool quality;
@@ -69,8 +68,6 @@ static void usage(FILE *fp) {
         "      Select backend explicitly. Defaults to Metal on macOS, CUDA elsewhere.\n"
         "  -t, --threads N        CPU helper threads.\n"
         "  --quality              Prefer exact kernels where applicable.\n"
-        "  -mt MODE, --mt MODE    Metal Tensor route mode: auto, on, or off.\n"
-        "      Legacy alias: --mpp MODE.\n"
         "  --warm-weights         Touch mapped tensor pages before benchmarking.\n"
         "\n"
         "Sweep:\n"
@@ -122,15 +119,6 @@ static ds4_backend parse_backend(const char *s, const char *opt) {
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     fprintf(stderr, "ds4-bench: invalid value for %s: %s\n", opt, s);
     fprintf(stderr, "ds4-bench: valid backends are: metal, cuda, cpu\n");
-    exit(2);
-}
-
-static ds4_mpp_mode parse_mpp_mode(const char *s, const char *opt) {
-    if (!strcmp(s, "auto")) return DS4_MPP_AUTO;
-    if (!strcmp(s, "on")) return DS4_MPP_ON;
-    if (!strcmp(s, "off")) return DS4_MPP_OFF;
-    fprintf(stderr, "ds4-bench: invalid value for %s: %s\n", opt, s);
-    fprintf(stderr, "ds4-bench: valid Metal Tensor modes are: auto, on, off\n");
     exit(2);
 }
 
@@ -193,7 +181,6 @@ static bench_config parse_options(int argc, char **argv) {
         .step_incr = 2048,
         .gen_tokens = 128,
         .step_mul = 1.0,
-        .mpp_mode = DS4_MPP_AUTO,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -237,8 +224,6 @@ static bench_config parse_options(int argc, char **argv) {
             c.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--quality")) {
             c.quality = true;
-        } else if (!strcmp(arg, "-mt") || !strcmp(arg, "--mt") || !strcmp(arg, "--mpp")) {
-            c.mpp_mode = parse_mpp_mode(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
         } else {
@@ -341,13 +326,12 @@ static int write_frontier_logits_json(
     fprintf(fp, "{\n  \"source\":\"ds4-bench\",\n  \"model\":");
     json_write_string(fp, cfg->model_path);
     fprintf(fp,
-            ",\n  \"backend\":\"%s\",\n  \"mt\":\"%s\",\n  \"quality\":%s,\n"
+            ",\n  \"backend\":\"%s\",\n  \"quality\":%s,\n"
             "  \"quant_bits\":%d,\n  \"prompt_tokens\":%d,\n"
             "  \"frontier_tokens\":%d,\n  \"prefill_tokens\":%d,\n"
             "  \"ctx\":%d,\n  \"vocab\":%d,\n"
             "  \"argmax_id\":%d,\n  \"argmax_logit\":%.9g,\n  \"logits\":[",
             ds4_backend_name(cfg->backend),
-            ds4_mpp_mode_name(cfg->mpp_mode),
             cfg->quality ? "true" : "false",
             ds4_engine_routed_quant_bits(engine),
             frontier,
@@ -410,7 +394,6 @@ int main(int argc, char **argv) {
         .n_threads = cfg.threads,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
-        .mpp_mode = cfg.mpp_mode,
     };
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) return 1;

@@ -916,7 +916,6 @@ template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_5")]] kernel mul_mv_ext_q4_f
 
 constant bool FC_mul_mm_bc_inp [[function_constant(FC_MUL_MM + 0)]];
 constant bool FC_mul_mm_bc_out [[function_constant(FC_MUL_MM + 1)]];
-constant bool FC_mul_mm_m5_sgmatrix [[function_constant(FC_MUL_MM_M5_SGMATRIX)]];
 
 #ifdef DS4_METAL_HAS_TENSOR
 template<
@@ -1038,124 +1037,13 @@ typedef decltype(kernel_mul_mm_mpp<64, 32, half, half4x4, float4x4, 1, dequantiz
 
 template [[host_name("kernel_mul_mm_f16_f32_mpp")]]  kernel mul_mm_mpp_t kernel_mul_mm_mpp<64, 32, half, half4x4, half4x4, 1, dequantize_f16,  half,  half4x4,  float>;
 
-kernel void kernel_mul_mm_f16_f32_pair_mpp(
-        constant ds4_metal_args_mul_mm & args,
-        device const char * srcA0,
-        device const char * srcA1,
-        device const char * srcB,
-        device       char * dst0,
-        device       char * dst1,
-        threadgroup  char * shmem [[threadgroup(0)]],
-        uint3  tgpig [[threadgroup_position_in_grid]],
-        ushort tiitg [[thread_index_in_threadgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    (void) sgitg;
-
-    constexpr int NR0 = 64;
-    constexpr int NR1 = 32;
-    constexpr int NK  = 32;
-    constexpr int NL  = NK/16;
-    constexpr int NUM_THREADS = 128;
-
-    const int K = args.ne00;
-    const int M = args.ne0;
-    const int N = args.ne1;
-    const int im = tgpig.z;
-    const int i12 = im%args.ne12;
-    const int i13 = im/args.ne12;
-    const int r0 = tgpig.y*NR0;
-    const int r1 = tgpig.x*NR1;
-
-    const uint64_t offset0 = (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
-
-    threadgroup half *sa0 = (threadgroup half *)shmem;
-    threadgroup half *sa1 = sa0 + NR0*NK;
-    threadgroup half *sb  = sa1 + NR0*NK;
-    auto tA0 = tensor(sa0, dextents<int32_t, 2>(NK, NR0));
-    auto tA1 = tensor(sa1, dextents<int32_t, 2>(NK, NR0));
-    auto tB  = tensor(sb,  dextents<int32_t, 2>(NK, NR1));
-
-    device const float *ptrB = (device const float *)(srcB + args.nb12*i12 + args.nb13*i13);
-    const int strideB = args.nb11/sizeof(float);
-
-    matmul2d<
-        matmul2d_descriptor(NR1, NR0, NK, false, true, false,
-            matmul2d_descriptor::mode::multiply_accumulate),
-        execution_simdgroups<4>> mm;
-
-    auto c0 = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA0), float>();
-    auto c1 = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA1), float>();
-
-    #pragma unroll
-    for (uint16_t i = 0; i < c0.get_capacity(); ++i) {
-        if (c0.is_valid_element(i)) {
-            c0[i] = 0.0f;
-            c1[i] = 0.0f;
-        }
-    }
-
-    for (int loop_k = 0; loop_k < K; loop_k += NK) {
-        for (int work = tiitg; work < NR0*NL; work += NUM_THREADS) {
-            const int row = work/NL;
-            const int k_chunk = work%NL;
-            const int k_pos = loop_k + k_chunk*16;
-            const short k_base = k_chunk*16;
-
-            if (!FC_mul_mm_bc_out || r0 + row < M) {
-                device const half *row0 = (device const half *)(srcA0 + args.nb01*(r0 + row) + offset0);
-                device const half *row1 = (device const half *)(srcA1 + args.nb01*(r0 + row) + offset0);
-                FOR_UNROLL (short i = 0; i < 16; i++) {
-                    const bool in_bounds = k_pos + i < K;
-                    sa0[row*NK + k_base + i] = in_bounds ? row0[k_pos + i] : (half)0;
-                    sa1[row*NK + k_base + i] = in_bounds ? row1[k_pos + i] : (half)0;
-                }
-            } else {
-                FOR_UNROLL (short i = 0; i < 16; i++) {
-                    sa0[row*NK + k_base + i] = (half)0;
-                    sa1[row*NK + k_base + i] = (half)0;
-                }
-            }
-        }
-        for (int work = tiitg; work < NK*NR1; work += NUM_THREADS) {
-            const int col = work/NK;
-            const int k = work%NK;
-            if (!FC_mul_mm_bc_out || (r1 + col < N && loop_k + k < K)) {
-                sb[col*NK + k] = (half)ptrB[(uint64_t)(r1 + col)*strideB + loop_k + k];
-            } else {
-                sb[col*NK + k] = (half)0;
-            }
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        auto mA0 = tA0.slice(0, 0);
-        auto mA1 = tA1.slice(0, 0);
-        auto mB = tB.slice(0, 0);
-        mm.run(mB, mA0, c0);
-        mm.run(mB, mA1, c1);
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    device float *dst0_batch = (device float *)dst0 + im*N*M;
-    device float *dst1_batch = (device float *)dst1 + im*N*M;
-    if (!FC_mul_mm_bc_out) {
-        device float *dst0_tile = dst0_batch + r0 + (uint64_t)r1*M;
-        device float *dst1_tile = dst1_batch + r0 + (uint64_t)r1*M;
-        auto tD0 = tensor(dst0_tile, dextents<int32_t, 2>(NR0, NR1), array<int, 2>({1, M}));
-        auto tD1 = tensor(dst1_tile, dextents<int32_t, 2>(NR0, NR1), array<int, 2>({1, M}));
-        c0.store(tD0);
-        c1.store(tD1);
-    } else {
-        auto tD0 = tensor(dst0_batch, dextents<int32_t, 2>(M, N), array<int, 2>({1, M}));
-        auto tD1 = tensor(dst1_batch, dextents<int32_t, 2>(M, N), array<int, 2>({1, M}));
-        auto mD0 = tD0.slice(r0, r1);
-        auto mD1 = tD1.slice(r0, r1);
-        c0.store(mD0);
-        c1.store(mD1);
-    }
-}
-
+// Retained Metal4/TensorOps dense prefill kernel.  The legacy MPP prototype
+// staged both operands in threadgroup memory; this version stages only the
+// model weight tile and lets MPP read the dense RHS activation matrix directly
+// from device memory.  That direct-RHS shape was the clear win for DS4's large
+// aligned F16/Q8_0 prompt matmuls.  The host selects the widest token tile that
+// evenly divides the batch, with 128-token tiles retained after the 64-token
+// retest was neutral or slower.
 template<
     short NR1,
     typename SA, typename SA_4x4, typename block_q, short nl,
@@ -1258,6 +1146,11 @@ kernel void kernel_mul_mm_mpp_direct_rhs(
 typedef decltype(kernel_mul_mm_mpp_direct_rhs<32, half, half4x4, float4x4, 1, dequantize_f32, float, float4x4, float>) mul_mm_mpp_direct_rhs_t;
 
 template [[host_name("kernel_mul_mm_f16_f32_mpp_direct_rhs")]]  kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<32, half, half4x4, half4x4, 1, dequantize_f16,  half,  half4x4,  float>;
+template [[host_name("kernel_mul_mm_f16_f32_mpp_direct_rhs_n64")]]  kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<64, half, half4x4, half4x4, 1, dequantize_f16,  half,  half4x4,  float>;
+template [[host_name("kernel_mul_mm_f16_f32_mpp_direct_rhs_n128")]]  kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<128, half, half4x4, half4x4, 1, dequantize_f16,  half,  half4x4,  float>;
+template [[host_name("kernel_mul_mm_q8_0_f32_nax_direct_rhs")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<32, half, half4x4, block_q8_0, 2, dequantize_q8_0, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_q8_0_f32_nax_direct_rhs_n64")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<64, half, half4x4, block_q8_0, 2, dequantize_q8_0, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_q8_0_f32_nax_direct_rhs_n128")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<128, half, half4x4, block_q8_0, 2, dequantize_q8_0, float, float4x4, float>;
 #endif
 
 // Tiled matrix-matrix kernel used for prompt batches larger than 8. DS4 uses
@@ -1397,21 +1290,20 @@ kernel void kernel_mul_mm(
         threadgroup const S0 * lsma = (sa + 4*64*(sgitg%2));
         threadgroup const S1 * lsmb = (sb + 2*64*(sgitg/2));
 
-        // M5 compiles this as a tighter simdgroup_matrix load/MMA chain without no-op barriers.
         FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
-            if (!FC_mul_mm_m5_sgmatrix) simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_barrier(mem_flags::mem_none);
 
             FOR_UNROLL (short i = 0; i < 4; i++) {
                 simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
             }
 
-            if (!FC_mul_mm_m5_sgmatrix) simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_barrier(mem_flags::mem_none);
 
             FOR_UNROLL (short i = 0; i < 2; i++) {
                 simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
             }
 
-            if (!FC_mul_mm_m5_sgmatrix) simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_barrier(mem_flags::mem_none);
 
             FOR_UNROLL (short i = 0; i < 8; i++){
                 simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);

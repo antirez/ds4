@@ -105,10 +105,7 @@ static void usage(FILE *fp) {
         "  -t, --threads N\n"
         "      CPU helper threads for host-side or reference work.\n"
         "  --quality\n"
-        "      Prefer exact kernels where faster approximate paths exist; disables Metal Tensor routes; MTP uses strict verification.\n"
-        "  -mt MODE, --mt MODE\n"
-        "      Metal Tensor policy: auto, on, or off. Default: auto. Auto enables validated safe routes; 'on' is a route diagnostic and may change output.\n"
-        "      Legacy alias: --mpp MODE.\n"
+        "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
         "  --dir-steering-file FILE\n"
         "      Load one f32 direction vector per layer for directional steering.\n"
         "  --dir-steering-ffn F\n"
@@ -250,15 +247,6 @@ static ds4_backend default_backend(void) {
 #else
     return DS4_BACKEND_CUDA;
 #endif
-}
-
-static ds4_mpp_mode parse_mpp_mode(const char *s) {
-    if (!strcmp(s, "auto")) return DS4_MPP_AUTO;
-    if (!strcmp(s, "on")) return DS4_MPP_ON;
-    if (!strcmp(s, "off")) return DS4_MPP_OFF;
-    fprintf(stderr, "ds4: invalid Metal Tensor mode: %s\n", s);
-    fprintf(stderr, "ds4: valid Metal Tensor modes are: auto, on, off\n");
-    exit(2);
 }
 
 static void log_context_memory(ds4_backend backend, int ctx_size) {
@@ -697,10 +685,9 @@ static int run_logits_dump(ds4_engine *engine, const cli_config *cfg, const ds4_
     fprintf(fp, "{\n  \"source\":\"ds4\",\n  \"model\":");
     json_write_string(fp, cfg->engine.model_path, strlen(cfg->engine.model_path));
     fprintf(fp,
-            ",\n  \"backend\":\"%s\",\n  \"mt\":\"%s\",\n  \"quant_bits\":%d,\n"
+            ",\n  \"backend\":\"%s\",\n  \"quant_bits\":%d,\n"
             "  \"prompt_tokens\":%d,\n  \"ctx\":%d,\n  \"vocab\":%d,\n",
             ds4_backend_name(cfg->engine.backend),
-            ds4_mpp_mode_name(cfg->engine.mpp_mode),
             ds4_engine_routed_quant_bits(engine),
             prompt->len,
             cfg->gen.ctx_size,
@@ -1432,8 +1419,6 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
-        } else if (!strcmp(arg, "-mt") || !strcmp(arg, "--mt") || !strcmp(arg, "--mpp")) {
-            c.engine.mpp_mode = parse_mpp_mode(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--dir-steering-file")) {
             c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dir-steering-ffn")) {
