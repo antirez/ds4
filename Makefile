@@ -127,7 +127,7 @@ rocm:
 		echo "error: specify ROCM_ARCH, for example: make rocm ROCM_ARCH=gfx1151"; \
 		exit 2; \
 	fi
-	$(MAKE) ds4 ds4-server ds4-bench ds4_test ds4-eval GPU_BACKEND=rocm ROCM_ARCH=$(ROCM_ARCH)
+	$(MAKE) ds4 ds4-server ds4-bench ds4_test ds4-eval ds4-agent GPU_BACKEND=rocm ROCM_ARCH=$(ROCM_ARCH)
 
 
 ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
@@ -143,7 +143,7 @@ ds4-eval: ds4_eval.o $(CORE_OBJS)
 	$(GPU_CC) $(GPU_CFLAGS) -o $@ $^ $(GPU_LDLIBS)
 
 ds4-agent: ds4_agent.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+	$(GPU_CC) $(GPU_CFLAGS) -o $@ $^ $(GPU_LDLIBS)
 
 cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o rax.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
