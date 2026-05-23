@@ -632,16 +632,14 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mm_pipeline(
 
 static id<MTLComputePipelineState> ds4_gpu_get_mul_mm_id_pipeline(
         const char *function_name,
-        bool        bc_inp,
-        bool        use_mpp) {
-    NSString *key = [NSString stringWithFormat:@"%s_bci=%d_mpp=%d",
-                     function_name, bc_inp ? 1 : 0, use_mpp ? 1 : 0];
+        bool        bc_inp) {
+    NSString *key = [NSString stringWithFormat:@"%s_bci=%d",
+                     function_name, bc_inp ? 1 : 0];
     id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
     if (cached) return cached;
 
     MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
     [constants setConstantValue:&bc_inp type:MTLDataTypeBool atIndex:700];
-    [constants setConstantValue:&use_mpp type:MTLDataTypeBool atIndex:702];
 
     NSError *error = nil;
     NSString *name = [NSString stringWithUTF8String:function_name];
@@ -771,61 +769,13 @@ static int ds4_gpu_mpp_available(void) {
  * lost during M5 work are removed or kept out of the dispatch path so future
  * changes do not accidentally turn old experiments into new modes.
  */
-static int ds4_gpu_mpp_moe_fast_layout(void) {
-    /* This layout stores the routed RHS in the order consumed by the TensorOps
-     * kernel.  It is the retained MoE prefill win.  The 64-token-tile and
-     * paired gate/up variants were slower on the DS4 expert shape, so they are
-     * not kept as alternate runtime paths. */
-    return 1;
-}
-
 static int ds4_gpu_use_mpp_attn_out_low_matmul(void) {
     return ds4_gpu_mpp_available();
 }
 
 enum {
     DS4_METAL_ATTN_OUT_MPP_TILE_N = 64,
-
-    DS4_METAL_MOE_MPP_GATE = 1 << 0,
-    DS4_METAL_MOE_MPP_UP   = 1 << 1,
-    DS4_METAL_MOE_MPP_DOWN = 1 << 2,
-    DS4_METAL_MOE_MPP_TILE_N = 32,
-
-    DS4_METAL_MOE_MPP_DEFAULT_GATE_LAYER = 0,
-    DS4_METAL_MOE_MPP_DEFAULT_UP_LAYER   = 0,
-    DS4_METAL_MOE_MPP_DEFAULT_DOWN_LAYER = 0,
 };
-
-static int ds4_gpu_mpp_routed_moe_default_target(void) {
-    return ds4_gpu_mpp_available();
-}
-
-static int ds4_gpu_mpp_routed_moe_stage_mask(void) {
-    if (!ds4_gpu_mpp_routed_moe_default_target()) return 0;
-    /*
-     * Keep TensorOps on every routed-MoE layer, but do not put both SwiGLU
-     * operands on TensorOps.  The gate and up projections feed
-     * silu(gate) * up; each TensorOps projection is locally close to the legacy
-     * simdgroup path, but moving both operands changes the product enough to
-     * flip later router top-k decisions.  Once a router changes experts the
-     * graph diverges discontinuously and can fall into repetition on sensitive
-     * prompts.  Accelerating only the linear up operand, plus the down
-     * projection, keeps the retained speedup without relying on layer cutoffs.
-     */
-    return DS4_METAL_MOE_MPP_UP |
-           DS4_METAL_MOE_MPP_DOWN;
-}
-
-static int ds4_gpu_mpp_routed_moe_mask_for_layer(uint32_t layer_index) {
-    const int requested_mask = ds4_gpu_mpp_routed_moe_stage_mask();
-    if (!requested_mask) return 0;
-
-    int mask = 0;
-    if ((int)layer_index >= DS4_METAL_MOE_MPP_DEFAULT_DOWN_LAYER) mask |= DS4_METAL_MOE_MPP_DOWN;
-    if ((int)layer_index >= DS4_METAL_MOE_MPP_DEFAULT_UP_LAYER)   mask |= DS4_METAL_MOE_MPP_UP;
-    if ((int)layer_index >= DS4_METAL_MOE_MPP_DEFAULT_GATE_LAYER) mask |= DS4_METAL_MOE_MPP_GATE;
-    return mask & requested_mask;
-}
 
 static void ds4_gpu_warn_mpp_fallback(void) {
     static int warned;
@@ -8742,10 +8692,12 @@ int ds4_gpu_attention_output_q8_batch_tensor(
 
         const bool use_direct_low =
             n_tokens < 32u && getenv("DS4_METAL_DISABLE_ATTN_OUT_LOW_DIRECT") == NULL;
-        /* The tensor tile store is only used on full token tiles; partial tails use the legacy path. */
+        /* The exported TensorOps attention-output kernel is a 64-token tile.
+         * Keep this on full tiles only; smaller multiples of 32 use the legacy
+         * path instead of relying on cooperative tensor partial RHS bounds. */
         const bool use_mpp_low =
             n_tokens >= 32u &&
-            (n_tokens % 32u) == 0 &&
+            (n_tokens % DS4_METAL_ATTN_OUT_MPP_TILE_N) == 0 &&
             ds4_gpu_use_mpp_attn_out_low_matmul();
         const NSUInteger ids_bytes = (NSUInteger)n_tokens * (NSUInteger)n_groups * sizeof(int32_t);
         id<MTLBuffer> group_ids_buffer = nil;
@@ -8847,9 +8799,7 @@ int ds4_gpu_attention_output_q8_batch_tensor(
                 const char *attn_out_pipeline_name =
                     "kernel_attn_out_low_q8_0_mpp_direct_rhs_n64";
                 id<MTLComputePipelineState> mm_pipeline =
-                    ds4_gpu_get_mul_mm_id_pipeline(attn_out_pipeline_name,
-                                                     false,
-                                                     false);
+                    ds4_gpu_get_mul_mm_id_pipeline(attn_out_pipeline_name, false);
                 ok = ds4_gpu_encode_attn_out_low_q8_mpp(cb,
                                                           mm_pipeline,
                                                           &mm_args,
@@ -8887,7 +8837,7 @@ int ds4_gpu_attention_output_q8_batch_tensor(
                             id<MTLComputePipelineState> map_pipeline =
                                 ds4_gpu_get_pipeline(ds4_gpu_mul_mm_id_map0_name(n_groups));
                             id<MTLComputePipelineState> fallback_pipeline =
-                                ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q8_0_f32", false, false);
+                                ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q8_0_f32", false);
                             ok = ds4_gpu_encode_mul_mm_id(cb,
                                                             map_pipeline,
                                                             fallback_pipeline,
@@ -8923,7 +8873,7 @@ int ds4_gpu_attention_output_q8_batch_tensor(
                 id<MTLComputePipelineState> map_pipeline =
                     ds4_gpu_get_pipeline(ds4_gpu_mul_mm_id_map0_name(n_groups));
                 id<MTLComputePipelineState> mm_pipeline =
-                    ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q8_0_f32", false, false);
+                    ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q8_0_f32", false);
                 ok = ds4_gpu_encode_mul_mm_id(cb,
                                                 map_pipeline,
                                                 mm_pipeline,
@@ -12619,53 +12569,27 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mv_pipeline(uint32_t type) {
     }
 }
 
-static id<MTLComputePipelineState> ds4_gpu_routed_mm_pipeline(uint32_t type, bool use_mpp) {
-    const bool fast_layout = use_mpp && ds4_gpu_mpp_moe_fast_layout();
+static id<MTLComputePipelineState> ds4_gpu_routed_mm_pipeline(uint32_t type) {
     switch (type) {
     case DS4_METAL_TENSOR_IQ2_XXS:
-        return ds4_gpu_get_mul_mm_id_pipeline(fast_layout ?
-                                                "kernel_mul_mm_id_iq2_xxs_f32_fast_mpp" :
-                                                "kernel_mul_mm_id_iq2_xxs_f32",
-                                                false,
-                                                use_mpp);
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f32", false);
     case DS4_METAL_TENSOR_Q2_K:
-        return ds4_gpu_get_mul_mm_id_pipeline(fast_layout ?
-                                                "kernel_mul_mm_id_q2_K_f32_fast_mpp" :
-                                                "kernel_mul_mm_id_q2_K_f32",
-                                                false,
-                                                use_mpp);
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f32", false);
     case DS4_METAL_TENSOR_Q4_K:
-        return ds4_gpu_get_mul_mm_id_pipeline(fast_layout ?
-                                                "kernel_mul_mm_id_q4_K_f32_fast_mpp" :
-                                                "kernel_mul_mm_id_q4_K_f32",
-                                                false,
-                                                use_mpp);
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32", false);
     default:
         return nil;
     }
 }
 
-static id<MTLComputePipelineState> ds4_gpu_routed_mm_f16_rhs_pipeline(uint32_t type, bool use_mpp) {
-    const bool fast_layout = use_mpp && ds4_gpu_mpp_moe_fast_layout();
+static id<MTLComputePipelineState> ds4_gpu_routed_mm_f16_rhs_pipeline(uint32_t type) {
     switch (type) {
     case DS4_METAL_TENSOR_IQ2_XXS:
-        return ds4_gpu_get_mul_mm_id_pipeline(fast_layout ?
-                                                "kernel_mul_mm_id_iq2_xxs_f16_fast_mpp" :
-                                                "kernel_mul_mm_id_iq2_xxs_f16",
-                                                false,
-                                                use_mpp);
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f16", false);
     case DS4_METAL_TENSOR_Q2_K:
-        return ds4_gpu_get_mul_mm_id_pipeline(fast_layout ?
-                                                "kernel_mul_mm_id_q2_K_f16_fast_mpp" :
-                                                "kernel_mul_mm_id_q2_K_f16",
-                                                false,
-                                                use_mpp);
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f16", false);
     case DS4_METAL_TENSOR_Q4_K:
-        return ds4_gpu_get_mul_mm_id_pipeline(fast_layout ?
-                                                "kernel_mul_mm_id_q4_K_f16_fast_mpp" :
-                                                "kernel_mul_mm_id_q4_K_f16",
-                                                false,
-                                                use_mpp);
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f16", false);
     default:
         return nil;
     }
@@ -12979,11 +12903,11 @@ static int ds4_gpu_encode_mul_mm_id_mapped_tile(
         return 0;
     }
     /*
-     * Routed MoE keeps a single 32-token TensorOps tile.  The 64-token tile was
-     * benchmarked on the DS4 expert-major map and lost, so this encoder does
-     * not carry a runtime tile switch.
+     * The routed MoE grouped matmul uses the legacy 32-token expert-major tile.
+     * The removed TensorOps variant was not semantically stable on evals, so keep
+     * this encoder tied to the tested simdgroup kernel shape.
      */
-    const NSUInteger tile_n = DS4_METAL_MOE_MPP_TILE_N;
+    const NSUInteger tile_n = 32u;
 
     const NSUInteger tpe_bytes = (NSUInteger)mm_args->ne02 * sizeof(int32_t);
     const NSUInteger hids_bytes = (NSUInteger)mm_args->ne02 * (NSUInteger)mm_args->ne21 * sizeof(int32_t);
@@ -14318,7 +14242,6 @@ int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_mul_mm_id_args gate_mm_args = { 0 };
         ds4_gpu_mul_mm_id_args down_mm_args = { 0 };
         id<MTLComputePipelineState> map_pipeline = nil;
-        const int moe_mpp_mask = ds4_gpu_mpp_routed_moe_mask_for_layer(layer_index);
         /*
          * The grouped routed-MoE matmul loads activation tiles as half before
          * using SIMD-group MMA.  Store the SwiGLU/route-weight intermediate in
@@ -14326,14 +14249,6 @@ int ds4_gpu_routed_moe_batch_tensor(
          * write/read. --quality keeps the older F32 intermediate.
          */
         const bool request_mid_f16 = !g_quality_mode;
-        /*
-         * All routed-MoE Tensor stages use the same fixed 32-token tile.  The
-         * profile still prints per-stage tile values because it is useful when
-         * comparing gate/up/down timings, but these are not user-tunable knobs.
-         */
-        const uint32_t gate_mm_tile_n = DS4_METAL_MOE_MPP_TILE_N;
-        const uint32_t up_mm_tile_n = DS4_METAL_MOE_MPP_TILE_N;
-        const uint32_t down_mm_tile_n = DS4_METAL_MOE_MPP_TILE_N;
         if (use_mm_id) {
             gate_map_args =
                 ds4_gpu_make_mul_mm_id_map_args(expert_in_dim, 256, 1, n_expert, n_tokens);
@@ -14348,15 +14263,11 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                         request_mid_f16 ? sizeof(uint16_t) : sizeof(float));
 
             map_pipeline = ds4_gpu_get_pipeline(ds4_gpu_mul_mm_id_map0_name(n_expert));
-            gate_mm_pipeline = ds4_gpu_routed_mm_pipeline(
-                    gate_type,
-                    (moe_mpp_mask & DS4_METAL_MOE_MPP_GATE) != 0);
-            up_mm_pipeline = ds4_gpu_routed_mm_pipeline(
-                    gate_type,
-                    (moe_mpp_mask & DS4_METAL_MOE_MPP_UP) != 0);
+            gate_mm_pipeline = ds4_gpu_routed_mm_pipeline(gate_type);
+            up_mm_pipeline = ds4_gpu_routed_mm_pipeline(gate_type);
             down_mm_pipeline = request_mid_f16 ?
-                ds4_gpu_routed_mm_f16_rhs_pipeline(down_type, (moe_mpp_mask & DS4_METAL_MOE_MPP_DOWN) != 0) :
-                ds4_gpu_routed_mm_pipeline(down_type, (moe_mpp_mask & DS4_METAL_MOE_MPP_DOWN) != 0);
+                ds4_gpu_routed_mm_f16_rhs_pipeline(down_type) :
+                ds4_gpu_routed_mm_pipeline(down_type);
             if (!map_pipeline || !gate_mm_pipeline || !up_mm_pipeline || !down_mm_pipeline) {
                 return 0;
             }
@@ -14393,15 +14304,11 @@ int ds4_gpu_routed_moe_batch_tensor(
                     if (print_stage) { \
                         fprintf(stderr, \
                                 "ds4: Metal routed MoE stage layer=%u tokens=%u pairs=%u experts=%u " \
-                                "gate=%s down=%s path=%s mpp=%u/%u/%u tile=%u/%u/%u mid=%s %s=%.3f ms\n", \
+                                "gate=%s down=%s path=%s mid=%s %s=%.3f ms\n", \
                                 layer_index, n_tokens, pair_rows, n_expert, \
                                 ds4_gpu_metal_tensor_type_name(gate_type), \
                                 ds4_gpu_metal_tensor_type_name(down_type), \
                                 moe_path, \
-                                (moe_mpp_mask & DS4_METAL_MOE_MPP_GATE) ? 1u : 0u, \
-                                (moe_mpp_mask & DS4_METAL_MOE_MPP_UP) ? 1u : 0u, \
-                                (moe_mpp_mask & DS4_METAL_MOE_MPP_DOWN) ? 1u : 0u, \
-                                gate_mm_tile_n, up_mm_tile_n, down_mm_tile_n, \
                                 request_mid_f16 ? "f16" : "f32", \
                                 stage_name, now_ms - moe_stage_t0); \
                     } \

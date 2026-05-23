@@ -85,7 +85,6 @@ typedef struct {
 } agent_status;
 
 typedef struct agent_bash_job agent_bash_job;
-typedef struct agent_file_view agent_file_view;
 
 typedef struct {
     ds4_engine *engine;
@@ -107,6 +106,8 @@ typedef struct {
     bool initialized;
     bool queued_user_pending;
     bool save_requested;
+    bool power_requested;
+    int requested_power;
     int progress_base;
     char *cmd_text;
     agent_status status;
@@ -117,12 +118,9 @@ typedef struct {
     int more_next_line;
     bool more_bare;
     bool more_valid;
-    agent_file_view *file_views;
     agent_bash_job *bash_jobs;
     int next_bash_job_id;
 } agent_worker;
-
-static void agent_file_views_clear(agent_worker *w);
 
 typedef struct agent_tail_capture {
     char *buf;
@@ -372,6 +370,14 @@ static int parse_int(const char *s, const char *opt) {
     return (int)v;
 }
 
+static bool parse_power_percent(const char *arg, int *out) {
+    char *end = NULL;
+    long v = strtol(arg, &end, 10);
+    if (!arg[0] || *end != '\0' || v < 1 || v > 100) return false;
+    *out = (int)v;
+    return true;
+}
+
 static uint64_t parse_u64(const char *s, const char *opt) {
     char *end = NULL;
     unsigned long long v = strtoull(s, &end, 10);
@@ -448,6 +454,7 @@ static void usage(FILE *fp) {
         "  -t, --threads N        CPU helper threads.\n"
         "  --quality              Prefer exact kernels where available.\n"
         "  --warm-weights         Touch mapped tensor pages before generation.\n"
+        "  --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n"
         "  --dir-steering-file FILE\n"
         "  --dir-steering-ffn F\n"
         "  --dir-steering-attn F\n"
@@ -459,6 +466,7 @@ static void usage(FILE *fp) {
         "  /list                  List saved sessions in ~/.ds4/kvcache.\n"
         "  /switch SHA            Load a saved session and show recent history.\n"
         "  /history [N]           Show N recent user turns from the current session.\n"
+        "  /power N               Set GPU duty cycle percentage, 1..100.\n"
         "  /new                   Start a fresh session from the system prompt.\n"
         "  /quit, /exit           Exit.\n");
 }
@@ -542,6 +550,12 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
+        } else if (!strcmp(arg, "--power")) {
+            c.engine.power_percent = parse_int(need_arg(&i, argc, argv, arg), arg);
+            if (c.engine.power_percent < 1 || c.engine.power_percent > 100) {
+                fprintf(stderr, "ds4-agent: --power must be between 1 and 100\n");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--dir-steering-file")) {
@@ -608,14 +622,32 @@ static const char agent_tools_prompt_intro[] =
 
 static const char agent_tools_prompt_edit_line[] =
     "## Editing files\n\n"
-    "Read and search output use plain line numbers. Prefer line/range edits with `new`; do not retype old text unless "
-    "you need the old/new fallback. The edit tool remembers the exact lines you saw from read/search and rejects a "
-    "line/range edit if those lines changed or were never shown to you. If that happens, read the range again and retry.\n"
-    "Use for example: edit path=\"/tmp/example.c\" range=\"16:20\" new=\"... new text ...\" without the old parameter.\n"
-    "For a single line, use line=16 new=\"... new line ...\". Use new=\"\" to delete the line or range. "
-    "Use range=\"all\" when replacing the whole file; this is "
-    "an explicit whole-file rewrite and does not require a previous read.\n"
-    "If you use old/new, old must match exactly once in the current file; line/range are ignored in that mode.\n"
+    "Use edit with path, old, and new. The old text must match exactly once in the current file, so edits are safe.\n"
+    "For large replacements, prefer anchored old text: write the first lines, then [snip], then the final lines. "
+    "The tool replaces everything from the head through the tail. If the head or tail is ambiguous, the edit fails.\n"
+    "Example anchored edit:\n"
+    "<｜DSML｜tool_calls>\n"
+    "<｜DSML｜invoke name=\"edit\">\n"
+    "<｜DSML｜parameter name=\"path\" string=\"true\">/tmp/example.c</｜DSML｜parameter>\n"
+    "<｜DSML｜parameter name=\"old\" string=\"true\">static int parse(void) {\n"
+    "    int ok = 0;\n"
+    "[snip]\n"
+    "    return ok;\n"
+    "}</｜DSML｜parameter>\n"
+    "<｜DSML｜parameter name=\"new\" string=\"true\">static int parse(void) {\n"
+    "    return parse_impl();\n"
+    "}</｜DSML｜parameter>\n"
+    "</｜DSML｜invoke>\n"
+    "</｜DSML｜tool_calls>\n"
+    "Use insert with path, either before or after, and new to add text around an exact unique anchor. "
+    "Example C include insertion:\n"
+    "<｜DSML｜tool_calls>\n"
+    "<｜DSML｜invoke name=\"insert\">\n"
+    "<｜DSML｜parameter name=\"path\" string=\"true\">/tmp/example.c</｜DSML｜parameter>\n"
+    "<｜DSML｜parameter name=\"after\" string=\"true\">#include <stdio.h>\n</｜DSML｜parameter>\n"
+    "<｜DSML｜parameter name=\"new\" string=\"true\">#include <unistd.h>\n</｜DSML｜parameter>\n"
+    "</｜DSML｜invoke>\n"
+    "</｜DSML｜tool_calls>\n"
     "Use read raw=true only when you need undecorated file text.\n\n";
 
 static const char agent_tools_prompt_after_edit[] =
@@ -641,11 +673,13 @@ static const char agent_tools_prompt_after_edit[] =
     "{\"type\":\"function\",\"function\":{\"name\":\"write\",\"description\":\"Create or overwrite a text file.\","
     "\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},"
     "\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}}}\n"
-    "{\"type\":\"function\",\"function\":{\"name\":\"edit\",\"description\":\"Edit a file by line/range or old/new text.\","
+    "{\"type\":\"function\",\"function\":{\"name\":\"edit\",\"description\":\"Replace exactly one old text match; old may contain [snip] between unique head and tail anchors.\","
     "\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},"
-    "\"line\":{\"type\":\"number\"},\"start_line\":{\"type\":\"number\"},\"end_line\":{\"type\":\"number\"},"
-    "\"range\":{\"type\":\"string\"},\"old\":{\"type\":\"string\"},\"new\":{\"type\":\"string\"}},"
-    "\"required\":[\"path\"]}}}\n"
+    "\"old\":{\"type\":\"string\"},\"new\":{\"type\":\"string\"}},\"required\":[\"path\",\"old\",\"new\"]}}}\n"
+    "{\"type\":\"function\",\"function\":{\"name\":\"insert\",\"description\":\"Insert text before or after exactly one anchor.\","
+    "\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},"
+    "\"before\":{\"type\":\"string\"},\"after\":{\"type\":\"string\"},\"new\":{\"type\":\"string\"}},"
+    "\"required\":[\"path\",\"new\"]}}}\n"
     "{\"type\":\"function\",\"function\":{\"name\":\"search\",\"description\":\"Search files and return compact edit-friendly matches.\","
     "\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},"
     "\"path\":{\"type\":\"string\"},\"mode\":{\"type\":\"string\"},\"glob\":{\"type\":\"string\"},"
@@ -657,9 +691,9 @@ static const char agent_tools_prompt_after_edit[] =
     "# Rules\n\n"
     "- Always use strict syntax for DSML tool stanzas.\n"
     "- This system runs on local inference of a few hundred tokens/s of prefill, "
-    "and a few tens of tokens/s decoding speed. Use tools and file/output reading "
-    "wisely to avoid very long pauses. Use line-based edit tools instead of "
-    "retyping old text whenever possible.\n"
+    "and a few tens of tokens/s decoding speed. Use read/search to get the "
+    "anchors you need, then use anchored edit or insert to avoid having to "
+    "retype large text.\n"
     "- Write code that is reliable and works well; always have a mental model of "
     "what is going on in complex parts of the code.\n"
     "- Work in a way that preserves the current system configuration integrity, "
@@ -2226,7 +2260,7 @@ static agent_tool_param_kind agent_tool_param_kind_for(const char *tool, const c
         return AGENT_TOOL_PARAM_BASH_COMMAND;
     if (!strcmp(tool, "edit") && !strcmp(param, "old"))
         return AGENT_TOOL_PARAM_DIFF_OLD;
-    if (!strcmp(tool, "edit") && !strcmp(param, "new"))
+    if ((!strcmp(tool, "edit") || !strcmp(tool, "insert")) && !strcmp(param, "new"))
         return AGENT_TOOL_PARAM_DIFF_NEW;
     if (streq_any(param, "path", "file", "filename", NULL))
         return AGENT_TOOL_PARAM_PATH;
@@ -2292,6 +2326,7 @@ static const char *agent_tool_viz_prefix(const char *name) {
     if (!strcmp(name, "read")) return "read ";
     if (!strcmp(name, "write")) return "write ";
     if (!strcmp(name, "edit")) return "edit ";
+    if (!strcmp(name, "insert")) return "insert ";
     if (!strcmp(name, "search")) return "search ";
     return NULL;
 }
@@ -2387,6 +2422,9 @@ static bool agent_tool_viz_param_is_code_body(agent_tool_visualizer *v) {
         (v->param_kind == AGENT_TOOL_PARAM_DIFF_OLD ||
          v->param_kind == AGENT_TOOL_PARAM_DIFF_NEW ||
          v->param_kind == AGENT_TOOL_PARAM_CONTENT))
+        return true;
+    if (!strcmp(v->tool_name, "insert") &&
+        v->param_kind == AGENT_TOOL_PARAM_DIFF_NEW)
         return true;
     return false;
 }
@@ -3413,8 +3451,6 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
     w->status.error[0] = '\0';
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
-    agent_file_views_clear(w);
-
     free(text);
     ds4_tokens_free(&sys);
     return true;
@@ -4177,7 +4213,6 @@ static bool agent_worker_switch_session(agent_worker *w, const char *prefix,
     if (ok) {
         ds4_tokens_free(&w->transcript);
         w->transcript = loaded;
-        agent_file_views_clear(w);
         pthread_mutex_lock(&w->mu);
         w->user_activity = true;
         w->session_dirty = false;
@@ -4268,8 +4303,8 @@ static void agent_line_spans_push(agent_line_spans *spans, agent_line_span span)
     spans->v[spans->len++] = span;
 }
 
-/* Split a text buffer into editable line spans.  content_end excludes CR/LF so
- * line tags remain stable across the common newline spellings. */
+/* Split a text buffer into line spans.  content_end excludes CR/LF so callers
+ * can print or compare line content without newline spelling differences. */
 static void agent_split_lines(const char *data, size_t len, agent_line_spans *spans) {
     size_t pos = 0;
     while (pos < len) {
@@ -4336,232 +4371,6 @@ static int agent_read_file_bytes(const char *path, char **data, size_t *len,
     return 0;
 }
 
-/* CRC32 is used only internally to remember the exact lines the model saw from
- * read/search.  The checksum is not model-facing; it is a compact stale-edit
- * guard for line-number edits. */
-static uint32_t agent_crc32_bytes(const char *s, size_t n) {
-    uint32_t crc = 0xffffffffu;
-    for (size_t i = 0; i < n; i++) {
-        crc ^= (unsigned char)s[i];
-        for (int j = 0; j < 8; j++)
-            crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
-    }
-    return crc ^ 0xffffffffu;
-}
-
-typedef struct {
-    bool known;
-    uint32_t crc;
-} agent_line_view;
-
-struct agent_file_view {
-    char *path;
-    agent_line_view *lines;
-    int len;
-    int cap;
-    struct agent_file_view *next;
-};
-
-static void agent_file_view_free(agent_file_view *v) {
-    if (!v) return;
-    free(v->path);
-    free(v->lines);
-    free(v);
-}
-
-static void agent_file_views_clear(agent_worker *w) {
-    agent_file_view *v = w->file_views;
-    while (v) {
-        agent_file_view *next = v->next;
-        agent_file_view_free(v);
-        v = next;
-    }
-    w->file_views = NULL;
-}
-
-static agent_file_view *agent_file_view_get(agent_worker *w, const char *path,
-                                            bool create) {
-    if (!path || !path[0]) return NULL;
-    for (agent_file_view *v = w->file_views; v; v = v->next) {
-        if (!strcmp(v->path, path)) return v;
-    }
-    if (!create) return NULL;
-    agent_file_view *v = xmalloc(sizeof(*v));
-    memset(v, 0, sizeof(*v));
-    v->path = xstrdup(path);
-    v->next = w->file_views;
-    w->file_views = v;
-    return v;
-}
-
-static void agent_worker_forget_file_view(agent_worker *w, const char *path) {
-    agent_file_view **prev = &w->file_views;
-    while (*prev) {
-        agent_file_view *v = *prev;
-        if (!strcmp(v->path, path)) {
-            *prev = v->next;
-            agent_file_view_free(v);
-            return;
-        }
-        prev = &v->next;
-    }
-}
-
-static bool agent_file_view_resize(agent_file_view *v, int lines) {
-    if (lines < 0) return false;
-    if (lines > v->cap) {
-        int cap = v->cap ? v->cap : 128;
-        while (cap < lines) cap *= 2;
-        v->lines = xrealloc(v->lines, (size_t)cap * sizeof(v->lines[0]));
-        for (int i = v->cap; i < cap; i++) {
-            v->lines[i].known = false;
-            v->lines[i].crc = 0;
-        }
-        v->cap = cap;
-    }
-    if (lines > v->len) {
-        for (int i = v->len; i < lines; i++) {
-            v->lines[i].known = false;
-            v->lines[i].crc = 0;
-        }
-    }
-    v->len = lines;
-    return true;
-}
-
-static uint32_t agent_line_crc(const char *s, size_t n) {
-    return agent_crc32_bytes(s, n);
-}
-
-static void agent_worker_remember_line(agent_worker *w, const char *path,
-                                       int line, const char *s, size_t n) {
-    if (line <= 0) return;
-    agent_file_view *v = agent_file_view_get(w, path, true);
-    if (!v) return;
-    if (line > v->len) agent_file_view_resize(v, line);
-    v->lines[line - 1].known = true;
-    v->lines[line - 1].crc = agent_line_crc(s, n);
-}
-
-static void agent_worker_remember_range(agent_worker *w, const char *path,
-                                        const char *data,
-                                        const agent_line_spans *spans,
-                                        int start_idx, int end_idx) {
-    if (!w || !path || !data || !spans) return;
-    agent_file_view *v = agent_file_view_get(w, path, true);
-    if (!v) return;
-    if (spans->len > v->len) agent_file_view_resize(v, spans->len);
-    for (int i = start_idx; i < end_idx; i++) {
-        agent_line_span sp = spans->v[i];
-        v->lines[i].known = true;
-        v->lines[i].crc = agent_line_crc(data + sp.start, sp.content_end - sp.start);
-    }
-}
-
-static void agent_worker_remember_whole_file(agent_worker *w, const char *path,
-                                             const char *data,
-                                             const agent_line_spans *spans) {
-    if (!w || !path || !data || !spans) return;
-    agent_file_view *v = agent_file_view_get(w, path, true);
-    if (!v) return;
-    agent_file_view_resize(v, spans->len);
-    for (int i = 0; i < spans->len; i++) {
-        agent_line_span sp = spans->v[i];
-        v->lines[i].known = true;
-        v->lines[i].crc =
-            agent_line_crc(data + sp.start, sp.content_end - sp.start);
-    }
-}
-
-static bool agent_worker_verify_seen_range(agent_worker *w, const char *path,
-                                           const char *data,
-                                           const agent_line_spans *spans,
-                                           int start_line, int end_line,
-                                           char *err, size_t err_len) {
-    agent_file_view *v = agent_file_view_get(w, path, false);
-    if (!v) {
-        snprintf(err, err_len,
-                 "line edit requires a recent read/search of %s; read the range before editing",
-                 path);
-        return false;
-    }
-    for (int line = start_line; line <= end_line; line++) {
-        if (line <= 0 || line > v->len || !v->lines[line - 1].known) {
-            snprintf(err, err_len,
-                     "line %d of %s was not shown recently or moved after an edit; read this range again before editing",
-                     line, path);
-            return false;
-        }
-        agent_line_span sp = spans->v[line - 1];
-        uint32_t current = agent_line_crc(data + sp.start, sp.content_end - sp.start);
-        if (current != v->lines[line - 1].crc) {
-            snprintf(err, err_len,
-                     "file changed around line %d of %s; read this range again before editing",
-                     line, path);
-            return false;
-        }
-    }
-    return true;
-}
-
-static void agent_worker_update_view_after_edit(agent_worker *w, const char *path,
-                                                const char *new_data,
-                                                size_t new_len,
-                                                int start_line,
-                                                int end_line,
-                                                int replacement_lines) {
-    agent_file_view *v = agent_file_view_get(w, path, true);
-    if (!v) return;
-
-    agent_line_spans new_spans = {0};
-    agent_split_lines(new_data, new_len, &new_spans);
-    int new_total = new_spans.len;
-    int old_len = v->len;
-    int replaced_lines = end_line - start_line + 1;
-    int delta = replacement_lines - replaced_lines;
-
-    agent_line_view *old = NULL;
-    if (old_len > 0) {
-        old = xmalloc((size_t)old_len * sizeof(old[0]));
-        memcpy(old, v->lines, (size_t)old_len * sizeof(old[0]));
-    }
-
-    agent_file_view_resize(v, new_total);
-    for (int i = 0; i < new_total; i++) {
-        v->lines[i].known = false;
-        v->lines[i].crc = 0;
-    }
-
-    int before = start_line - 1;
-    if (before > old_len) before = old_len;
-    if (before > new_total) before = new_total;
-    for (int i = 0; i < before; i++) v->lines[i] = old[i];
-
-    int repl_end = start_line + replacement_lines - 1;
-    for (int line = start_line; line <= repl_end && line <= new_total; line++) {
-        agent_line_span sp = new_spans.v[line - 1];
-        v->lines[line - 1].known = true;
-        v->lines[line - 1].crc =
-            agent_line_crc(new_data + sp.start, sp.content_end - sp.start);
-    }
-
-    /* If the edit kept the same line count, following line numbers still mean
-     * the same thing and can keep their checks.  If the edit inserted/deleted
-     * lines, old numeric references after the range are ambiguous: a stale old
-     * line number can now point at another line the model saw.  Mark that tail
-     * unknown and force a fresh read before another line edit there. */
-    if (delta == 0) {
-        for (int old_line = end_line + 1; old_line <= old_len; old_line++) {
-            int new_line = old_line;
-            if (new_line <= 0 || new_line > new_total) continue;
-            v->lines[new_line - 1] = old[old_line - 1];
-        }
-    }
-
-    free(old);
-    agent_line_spans_free(&new_spans);
-}
-
 static int agent_line_for_offset(const agent_line_spans *spans, size_t offset) {
     if (!spans || spans->len <= 0) return 1;
     for (int i = 0; i < spans->len; i++) {
@@ -4581,7 +4390,8 @@ static bool agent_old_new_line_effect(const char *old_data, size_t old_len,
     agent_split_lines(new_data, new_len, &new_spans);
     bool ok = old_spans.len > 0;
     if (ok) {
-        size_t old_last = edit_offset + replaced_len - 1;
+        size_t old_last = edit_offset;
+        if (replaced_len > 0) old_last = edit_offset + replaced_len - 1;
         if (old_last >= old_len) old_last = old_len ? old_len - 1 : 0;
         if (start_line) *start_line = agent_line_for_offset(&old_spans, edit_offset);
         if (end_line) *end_line = agent_line_for_offset(&old_spans, old_last);
@@ -4592,82 +4402,19 @@ static bool agent_old_new_line_effect(const char *old_data, size_t old_len,
     return ok;
 }
 
-static void agent_worker_update_view_after_old_new(agent_worker *w,
-                                                   const char *path,
-                                                   const char *old_data,
-                                                   size_t old_len,
-                                                   const char *new_data,
-                                                   size_t new_len,
-                                                   size_t edit_offset,
-                                                   size_t replaced_len) {
-    agent_file_view *v = agent_file_view_get(w, path, false);
-    if (!v) return;
-
-    agent_line_spans old_spans = {0};
-    agent_line_spans new_spans = {0};
-    agent_split_lines(old_data, old_len, &old_spans);
-    agent_split_lines(new_data, new_len, &new_spans);
-    if (old_spans.len <= 0) {
-        agent_worker_forget_file_view(w, path);
-        agent_line_spans_free(&old_spans);
-        agent_line_spans_free(&new_spans);
-        return;
-    }
-
-    size_t old_last = edit_offset + replaced_len - 1;
-    if (old_last >= old_len) old_last = old_len ? old_len - 1 : 0;
-    int start_line = agent_line_for_offset(&old_spans, edit_offset);
-    int end_line = agent_line_for_offset(&old_spans, old_last);
-    int old_total = old_spans.len;
-    int new_total = new_spans.len;
-    int delta = new_total - old_total;
-
-    agent_line_view *old = NULL;
-    int remembered_len = v->len;
-    if (remembered_len > 0) {
-        old = xmalloc((size_t)remembered_len * sizeof(old[0]));
-        memcpy(old, v->lines, (size_t)remembered_len * sizeof(old[0]));
-    }
-
-    agent_file_view_resize(v, new_total);
-    for (int i = 0; i < new_total; i++) {
-        v->lines[i].known = false;
-        v->lines[i].crc = 0;
-    }
-
-    int before = start_line - 1;
-    if (before > remembered_len) before = remembered_len;
-    if (before > new_total) before = new_total;
-    for (int i = 0; i < before; i++) v->lines[i] = old[i];
-
-    /* The model supplied only an arbitrary old/new byte span, not necessarily
-     * whole rendered lines.  The touched lines are therefore stale until read
-     * again.  Lines after the edit remain trustworthy only if their numeric
-     * line positions did not shift. */
-    if (delta == 0) {
-        for (int old_line = end_line + 1; old_line <= remembered_len; old_line++) {
-            if (old_line <= 0 || old_line > new_total) continue;
-            v->lines[old_line - 1] = old[old_line - 1];
-        }
-    }
-
-    free(old);
-    agent_line_spans_free(&old_spans);
-    agent_line_spans_free(&new_spans);
-}
-
-static void agent_edit_result_append_context(agent_worker *w, agent_buf *b,
+static void agent_edit_result_append_context(agent_buf *b,
                                              const char *path,
                                              const char *data, size_t len,
                                              int anchor_start,
                                              int anchor_end);
 
-static char *agent_edit_old_new_result(agent_worker *w, const char *path,
+static char *agent_edit_result(const char *path,
                                        int start_line, int end_line, int delta,
-                                       const char *new_data, size_t new_len) {
+                                       const char *new_data, size_t new_len,
+                                       const char *kind) {
     agent_buf b = {0};
     char msg[PATH_MAX + 180];
-    snprintf(msg, sizeof(msg), "Edited %s using old/new replacement\n", path);
+    snprintf(msg, sizeof(msg), "Edited %s using %s\n", path, kind);
     agent_buf_puts(&b, msg);
     if (start_line > 0 && end_line >= start_line) {
         snprintf(msg, sizeof(msg),
@@ -4676,7 +4423,7 @@ static char *agent_edit_old_new_result(agent_worker *w, const char *path,
         agent_buf_puts(&b, msg);
         if (delta != 0) {
             snprintf(msg, sizeof(msg),
-                     "Line shift: old lines after %d moved by %+d (old line %d is now line %d). Lines shown below are safe for immediate line/range editing; read again before editing other shifted lines.\n",
+                     "Line shift: old lines after %d moved by %+d (old line %d is now line %d). Re-read before relying on old line numbers there.\n",
                      end_line, delta, end_line + 1, end_line + 1 + delta);
             agent_buf_puts(&b, msg);
         }
@@ -4684,7 +4431,7 @@ static char *agent_edit_old_new_result(agent_worker *w, const char *path,
     if (start_line > 0 && end_line >= start_line) {
         int new_anchor_end = end_line + delta;
         if (new_anchor_end < start_line) new_anchor_end = start_line;
-        agent_edit_result_append_context(w, &b, path, new_data, new_len,
+        agent_edit_result_append_context(&b, path, new_data, new_len,
                                          start_line, new_anchor_end);
     }
     return agent_buf_take(&b);
@@ -4710,10 +4457,9 @@ static bool agent_tool_result_fits_context(agent_worker *w, const char *result,
     return tokens + reserve_tokens < w->cfg->gen.ctx_size;
 }
 
-/* Read file text for the model.  Normal mode shows plain line numbers and
- * records the exact line checks internally so later line/range edits can be
- * rejected if the file changed.  Raw mode is reserved for cases where line
- * decoration would corrupt the payload being inspected. */
+/* Read file text for the model.  Normal mode shows plain line numbers.  Raw
+ * mode is reserved for cases where line decoration would corrupt the payload
+ * being inspected. */
 static char *agent_read_range(agent_worker *w, const char *path, int start_line,
                               int max_lines, bool whole_file, bool bare,
                               bool set_more) {
@@ -4778,10 +4524,6 @@ static char *agent_read_range(agent_worker *w, const char *path, int start_line,
             agent_buf_append(&out, data + sp.start, sp.content_end - sp.start);
             agent_buf_puts(&out, "\n");
         }
-        if (start_idx == 0 && end_idx == spans.len)
-            agent_worker_remember_whole_file(w, path, data, &spans);
-        else
-            agent_worker_remember_range(w, path, data, &spans, start_idx, end_idx);
     }
     if (set_more) {
         if (end_idx < spans.len) agent_worker_set_more(w, path, end_idx + 1, bare);
@@ -4812,6 +4554,7 @@ static char *agent_tool_more(agent_worker *w, const agent_tool_call *call) {
 }
 
 static char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
+    (void)w;
     const char *path = agent_tool_arg_value(call, "path");
     const char *content = agent_tool_arg_value(call, "content");
     if (!path || !path[0]) return xstrdup("Tool error: write requires path\n");
@@ -4834,11 +4577,6 @@ static char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
         agent_buf_puts(&b, "\n");
         return agent_buf_take(&b);
     }
-    agent_line_spans spans = {0};
-    agent_split_lines(content, len, &spans);
-    agent_worker_remember_whole_file(w, path, content, &spans);
-    agent_line_spans_free(&spans);
-
     char msg[PATH_MAX + 160];
     snprintf(msg, sizeof(msg), "Wrote %zu bytes to %s\n", len, path);
     return xstrdup(msg);
@@ -4906,28 +4644,6 @@ static int agent_write_file_bytes(const char *path, const char *data, size_t len
     return 0;
 }
 
-static int agent_count_text_lines(const char *text) {
-    if (!text || !text[0]) return 0;
-    int lines = 0;
-    size_t pos = 0, len = strlen(text);
-    while (pos < len) {
-        while (pos < len && text[pos] != '\n' && text[pos] != '\r') pos++;
-        if (pos < len) {
-            if (text[pos] == '\r' && pos + 1 < len && text[pos + 1] == '\n')
-                pos += 2;
-            else
-                pos++;
-        }
-        lines++;
-    }
-    return lines;
-}
-
-static int agent_edit_replacement_line_count(const char *text, bool add_newline) {
-    int lines = agent_count_text_lines(text);
-    return lines ? lines : add_newline ? 1 : 0;
-}
-
 static void agent_edit_result_append_line(agent_buf *b, const char *data,
                                           const agent_line_span *sp,
                                           int line) {
@@ -4941,7 +4657,7 @@ static void agent_edit_result_append_line(agent_buf *b, const char *data,
 /* Successful edits return the nearby post-edit file shape.  This spends cheap
  * prefill tokens to save expensive model retries: the model immediately sees
  * shifted line numbers, braces, semicolons, and accidental duplication. */
-static void agent_edit_result_append_context(agent_worker *w, agent_buf *b,
+static void agent_edit_result_append_context(agent_buf *b,
                                              const char *path,
                                              const char *data, size_t len,
                                              int anchor_start,
@@ -4993,33 +4709,7 @@ static void agent_edit_result_append_context(agent_worker *w, agent_buf *b,
             agent_edit_result_append_line(b, data, &spans.v[line - 1], line);
     }
 
-    agent_worker_remember_range(w, path, data, &spans, ctx_start - 1, ctx_end);
     agent_line_spans_free(&spans);
-}
-
-static char *agent_edit_line_result(agent_worker *w, const char *path,
-                                    int start_line, int end_line,
-                                    int replacement_lines,
-                                    const char *new_data, size_t new_len) {
-    agent_buf b = {0};
-    char msg[PATH_MAX + 160];
-    snprintf(msg, sizeof(msg), "Edited %s lines %d-%d\n",
-             path, start_line, end_line);
-    agent_buf_puts(&b, msg);
-
-    int replaced_lines = end_line - start_line + 1;
-    int delta = replacement_lines - replaced_lines;
-    if (delta != 0) {
-        snprintf(msg, sizeof(msg),
-                 "Line shift: old lines after %d moved by %+d (old line %d is now line %d). Lines shown below are safe for immediate line/range editing; read again before editing other shifted lines.\n",
-                 end_line, delta, end_line + 1, end_line + 1 + delta);
-        agent_buf_puts(&b, msg);
-    }
-    int new_anchor_end = replacement_lines > 0 ?
-        start_line + replacement_lines - 1 : start_line;
-    agent_edit_result_append_context(w, &b, path, new_data, new_len,
-                                     start_line, new_anchor_end);
-    return agent_buf_take(&b);
 }
 
 static const char *agent_memmem_simple(const char *hay, size_t hay_len,
@@ -5034,93 +4724,117 @@ static const char *agent_memmem_simple(const char *hay, size_t hay_len,
     return NULL;
 }
 
-/* Classic old/new editing path.  It is intentionally conservative: the old
- * text must occur exactly once, otherwise the model should read more context
- * or use a line/range edit after reading the target lines. */
-static char *agent_tool_edit_old_new(agent_worker *w, const char *path, const char *old,
-                                     const char *new_text) {
-    if (!old || !old[0]) return xstrdup("Tool error: edit old/new requires non-empty old text\n");
-    if (!new_text) new_text = "";
-    char err[256];
-    char *data = NULL;
-    size_t len = 0;
-    if (agent_read_file_bytes(path, &data, &len, err, sizeof(err)) != 0) {
-        agent_buf b = {0};
-        agent_buf_puts(&b, "Tool error: ");
-        agent_buf_puts(&b, err);
-        agent_buf_puts(&b, "\n");
-        return agent_buf_take(&b);
+static bool agent_find_unique(const char *data, size_t len,
+                              const char *needle, size_t needle_len,
+                              const char **match, const char *label,
+                              char *err, size_t err_len) {
+    if (!needle || needle_len == 0) {
+        snprintf(err, err_len, "%s anchor is empty", label);
+        return false;
     }
-    size_t old_len = strlen(old);
-    const char *first = agent_memmem_simple(data, len, old, old_len);
+    const char *first = agent_memmem_simple(data, len, needle, needle_len);
     if (!first) {
-        free(data);
-        return xstrdup("Tool error: old text not found\n");
+        snprintf(err, err_len, "%s anchor not found", label);
+        return false;
     }
-    const char *second = agent_memmem_simple(first + old_len,
-                                             len - (size_t)(first - data) - old_len,
-                                             old, old_len);
+    size_t after_first = (size_t)(first - data) + 1;
+    const char *second = after_first <= len ?
+        agent_memmem_simple(data + after_first, len - after_first,
+                            needle, needle_len) : NULL;
     if (second) {
-        free(data);
-        return xstrdup("Tool error: old text is not unique; read the target lines and retry with line/range plus new\n");
+        snprintf(err, err_len, "%s anchor is not unique", label);
+        return false;
     }
-    size_t new_len = strlen(new_text);
-    size_t prefix = (size_t)(first - data);
-    size_t out_len = prefix + new_len + (len - prefix - old_len);
-    char *out = xmalloc(out_len + 1);
-    memcpy(out, data, prefix);
-    memcpy(out + prefix, new_text, new_len);
-    memcpy(out + prefix + new_len, first + old_len, len - prefix - old_len);
-    out[out_len] = '\0';
-    int rc = agent_write_file_bytes(path, out, out_len, err, sizeof(err));
-    int start_line = 0, end_line = 0, delta = 0;
-    agent_old_new_line_effect(data, len, out, out_len, prefix, old_len,
-                              &start_line, &end_line, &delta);
-    if (rc == 0) {
-        agent_worker_update_view_after_old_new(w, path, data, len, out, out_len,
-                                               prefix, old_len);
-    }
-    if (rc != 0) {
-        free(data);
-        free(out);
-        agent_buf b = {0};
-        agent_buf_puts(&b, "Tool error: ");
-        agent_buf_puts(&b, err);
-        agent_buf_puts(&b, "\n");
-        return agent_buf_take(&b);
-    }
-    char *result = agent_edit_old_new_result(w, path, start_line, end_line,
-                                             delta, out, out_len);
-    free(data);
-    free(out);
-    return result;
-}
-
-static bool agent_parse_line_range_arg(const char *s, int *start, int *end) {
-    if (!s || !s[0]) return false;
-    char *ep = NULL;
-    long a = strtol(s, &ep, 10);
-    if (a <= 0 || a > INT_MAX || ep == s) return false;
-    while (*ep == ' ' || *ep == '\t') ep++;
-    if (*ep != ':' && *ep != '-') return false;
-    ep++;
-    while (*ep == ' ' || *ep == '\t') ep++;
-    char *ep2 = NULL;
-    long b = strtol(ep, &ep2, 10);
-    if (b <= 0 || b > INT_MAX || ep2 == ep) return false;
-    while (*ep2 == ' ' || *ep2 == '\t' || *ep2 == '\r' || *ep2 == '\n') ep2++;
-    if (*ep2 != '\0' || b < a) return false;
-    *start = (int)a;
-    *end = (int)b;
+    *match = first;
     return true;
 }
 
-static char *agent_tool_edit_line_range(agent_worker *w, const char *path,
-                                        int start_line, int end_line,
-                                        const char *new_text) {
-    if (!new_text) new_text = "";
-    if (start_line <= 0 || end_line <= 0 || end_line < start_line)
-        return xstrdup("Tool error: invalid edit line range\n");
+static bool agent_edit_find_old_span(const char *data, size_t len,
+                                     const char *old, const char **match,
+                                     size_t *match_len, bool *anchored,
+                                     char *err, size_t err_len) {
+    static const char marker[] = "[snip]";
+    size_t old_len = strlen(old);
+    const char *snip = strstr(old, marker);
+    if (!snip) {
+        *anchored = false;
+        if (!agent_find_unique(data, len, old, old_len, match, "old text",
+                               err, err_len))
+            return false;
+        *match_len = old_len;
+        return true;
+    }
+    if (strstr(snip + strlen(marker), marker)) {
+        snprintf(err, err_len, "old text contains more than one [snip] marker");
+        return false;
+    }
+    size_t head_len = (size_t)(snip - old);
+    const char *tail = snip + strlen(marker);
+    size_t tail_len = old_len - head_len - strlen(marker);
+    const char *head_pos = NULL;
+    const char *tail_pos = NULL;
+    if (!agent_find_unique(data, len, old, head_len, &head_pos, "old head",
+                           err, err_len))
+        return false;
+    if (!agent_find_unique(data, len, tail, tail_len, &tail_pos, "old tail",
+                           err, err_len))
+        return false;
+    if (tail_pos < head_pos + head_len) {
+        snprintf(err, err_len, "old tail appears before old head");
+        return false;
+    }
+    *anchored = true;
+    *match = head_pos;
+    *match_len = (size_t)(tail_pos - head_pos) + tail_len;
+    return true;
+}
+
+static char *agent_apply_file_splice(const char *path,
+                                     const char *data, size_t len,
+                                     size_t offset, size_t remove_len,
+                                     const char *insert, const char *kind) {
+    char err[256];
+    if (!insert) insert = "";
+    size_t insert_len = strlen(insert);
+    size_t out_len = offset + insert_len + (len - offset - remove_len);
+    char *out = xmalloc(out_len + 1);
+    memcpy(out, data, offset);
+    memcpy(out + offset, insert, insert_len);
+    memcpy(out + offset + insert_len, data + offset + remove_len,
+           len - offset - remove_len);
+    out[out_len] = '\0';
+
+    int rc = agent_write_file_bytes(path, out, out_len, err, sizeof(err));
+    if (rc != 0) {
+        free(out);
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: ");
+        agent_buf_puts(&b, err);
+        agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
+
+    int start_line = 0, end_line = 0, delta = 0;
+    agent_old_new_line_effect(data, len, out, out_len, offset, remove_len,
+                              &start_line, &end_line, &delta);
+    char *result = agent_edit_result(path, start_line, end_line, delta,
+                                     out, out_len, kind);
+    free(out);
+    return result;
+}
+
+/* Old/new editing is intentionally conservative: exact old text must be unique.
+ * For large replacements, old may contain one [snip] marker; then both the head
+ * and tail anchors must be independently unique before the whole span is
+ * replaced. */
+static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
+    (void)w;
+    const char *path = agent_tool_arg_value(call, "path");
+    if (!path || !path[0]) return xstrdup("Tool error: edit requires path\n");
+    const char *old = agent_tool_arg_value(call, "old");
+    const char *new_text = agent_tool_arg_value(call, "new");
+    if (!old || !old[0]) return xstrdup("Tool error: edit requires non-empty old text\n");
+    if (!new_text) return xstrdup("Tool error: edit requires new text\n");
 
     char err[256];
     char *data = NULL;
@@ -5133,134 +4847,78 @@ static char *agent_tool_edit_line_range(agent_worker *w, const char *path,
         return agent_buf_take(&b);
     }
 
-    agent_line_spans spans = {0};
-    agent_split_lines(data, len, &spans);
-    if (start_line > spans.len || end_line > spans.len) {
-        agent_line_spans_free(&spans);
-        free(data);
-        return xstrdup("Tool error: edit line range is outside the file\n");
-    }
-    if (!agent_worker_verify_seen_range(w, path, data, &spans,
-                                        start_line, end_line,
-                                        err, sizeof(err)))
+    const char *match = NULL;
+    size_t match_len = 0;
+    bool anchored = false;
+    if (!agent_edit_find_old_span(data, len, old, &match, &match_len,
+                                  &anchored, err, sizeof(err)))
     {
-        agent_buf b = {0};
-        agent_buf_puts(&b, "Tool error: ");
-        agent_buf_puts(&b, err);
-        agent_buf_puts(&b, "\n");
-        agent_line_spans_free(&spans);
         free(data);
-        return agent_buf_take(&b);
-    }
-
-    agent_line_span s = spans.v[start_line - 1];
-    agent_line_span e = spans.v[end_line - 1];
-    size_t text_len = strlen(new_text);
-    bool replaced_had_newline = e.end > e.content_end;
-    bool add_newline = replaced_had_newline && text_len > 0 &&
-                       new_text[text_len - 1] != '\n';
-    size_t out_len = s.start + text_len + (add_newline ? 1 : 0) + (len - e.end);
-    char *out = xmalloc(out_len + 1);
-    size_t pos = 0;
-    memcpy(out + pos, data, s.start);
-    pos += s.start;
-    memcpy(out + pos, new_text, text_len);
-    pos += text_len;
-    if (add_newline) out[pos++] = '\n';
-    memcpy(out + pos, data + e.end, len - e.end);
-    pos += len - e.end;
-    out[pos] = '\0';
-
-    int rc = agent_write_file_bytes(path, out, out_len, err, sizeof(err));
-    int replacement_lines = agent_edit_replacement_line_count(new_text, add_newline);
-    if (rc == 0) {
-        agent_worker_update_view_after_edit(w, path, out, out_len,
-                                            start_line, end_line,
-                                            replacement_lines);
-    }
-    agent_line_spans_free(&spans);
-    if (rc != 0) {
-        free(data);
-        free(out);
         agent_buf b = {0};
         agent_buf_puts(&b, "Tool error: ");
         agent_buf_puts(&b, err);
         agent_buf_puts(&b, "\n");
         return agent_buf_take(&b);
     }
-    char *result = agent_edit_line_result(w, path, start_line, end_line,
-                                          replacement_lines, out, out_len);
+
+    char *result = agent_apply_file_splice(path, data, len,
+                                           (size_t)(match - data), match_len,
+                                           new_text,
+                                           anchored ? "anchored old/new replacement"
+                                                    : "old/new replacement");
     free(data);
-    free(out);
     return result;
 }
 
-static char *agent_tool_edit_line_all(agent_worker *w, const char *path,
-                                      const char *new_text) {
-    if (!new_text) new_text = "";
+static char *agent_tool_insert(agent_worker *w, const agent_tool_call *call) {
+    (void)w;
+    const char *path = agent_tool_arg_value(call, "path");
+    const char *before = agent_tool_arg_value(call, "before");
+    const char *after = agent_tool_arg_value(call, "after");
+    const char *new_text = agent_tool_arg_value(call, "new");
+    if (!path || !path[0]) return xstrdup("Tool error: insert requires path\n");
+    if (!new_text) return xstrdup("Tool error: insert requires new text\n");
+    if ((before && after) || (!before && !after))
+        return xstrdup("Tool error: insert requires exactly one of before or after\n");
+
     char err[256];
-    size_t len = strlen(new_text);
-    int rc = agent_write_file_bytes(path, new_text, len, err, sizeof(err));
-    if (rc != 0) {
+    char *data = NULL;
+    size_t len = 0;
+    if (agent_read_file_bytes(path, &data, &len, err, sizeof(err)) != 0) {
         agent_buf b = {0};
         agent_buf_puts(&b, "Tool error: ");
         agent_buf_puts(&b, err);
         agent_buf_puts(&b, "\n");
         return agent_buf_take(&b);
     }
-    agent_line_spans spans = {0};
-    agent_split_lines(new_text, len, &spans);
-    int total_lines = spans.len;
-    agent_worker_remember_whole_file(w, path, new_text, &spans);
-    agent_line_spans_free(&spans);
 
-    agent_buf b = {0};
-    char msg[PATH_MAX + 80];
-    snprintf(msg, sizeof(msg), "Edited %s range=all\n", path);
-    agent_buf_puts(&b, msg);
-    agent_edit_result_append_context(w, &b, path, new_text, len,
-                                     1, total_lines > 0 ? total_lines : 1);
-    return agent_buf_take(&b);
-}
+    const char *anchor = before ? before : after;
+    size_t anchor_len = strlen(anchor);
+    const char *match = NULL;
+    if (!agent_find_unique(data, len, anchor, anchor_len, &match,
+                           before ? "before" : "after", err, sizeof(err)))
+    {
+        free(data);
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: ");
+        agent_buf_puts(&b, err);
+        agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
 
-/* Pick the safest edit mode supported by the tool arguments.  Line/range edits
- * are guarded by the internal remembered read/search view; old/new remains as a
- * fallback for common coding-agent habits. */
-static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
-    const char *path = agent_tool_arg_value(call, "path");
-    if (!path || !path[0]) return xstrdup("Tool error: edit requires path\n");
-    const char *new_text = agent_tool_arg_value(call, "new");
-
-    int line = agent_parse_int_default(agent_tool_arg_value(call, "line"), 0, 0, INT_MAX);
-    int range_start = 0, range_end = 0;
-    const char *range = agent_tool_arg_value(call, "range");
-    bool range_all = range && !strcmp(range, "all");
-    bool have_range = !range_all && agent_parse_line_range_arg(range, &range_start, &range_end);
-    if (range && !range_all && !have_range)
-        return xstrdup("Tool error: invalid range; use START:END, for example 10:20\n");
-    int start = have_range ? range_start : line ? line :
-        agent_parse_int_default(agent_tool_arg_value(call, "start_line"),
-                                0, 0, INT_MAX);
-    int end = have_range ? range_end : line ? line :
-        agent_parse_int_default(agent_tool_arg_value(call, "end_line"),
-                                start, 0, INT_MAX);
-    const char *old = agent_tool_arg_value(call, "old");
-    if (old)
-        return agent_tool_edit_old_new(w, path, old, new_text);
-    if ((range_all || (start && end)) && !new_text)
-        return xstrdup("Tool error: line/range edit requires explicit new text; use new=\"\" only when deleting\n");
-    if (range_all)
-        return agent_tool_edit_line_all(w, path, new_text);
-    if (start && end)
-        return agent_tool_edit_line_range(w, path, start, end, new_text);
-
-    return xstrdup("Tool error: edit requires old/new, line+new, range+new, or range=\"all\"+new\n");
+    size_t offset = before ? (size_t)(match - data) :
+                             (size_t)(match - data) + anchor_len;
+    char *result = agent_apply_file_splice(path, data, len, offset, 0,
+                                           new_text,
+                                           before ? "insert before anchor"
+                                                  : "insert after anchor");
+    free(data);
+    return result;
 }
 
 typedef struct {
     const char *query;
     const char *glob;
-    agent_worker *worker;
     regex_t regex;
     bool use_regex;
     bool regex_ready;
@@ -5314,7 +4972,7 @@ static void agent_search_emit_line(agent_search_ctx *ctx, const char *data,
     agent_buf_puts(&ctx->out, "\n");
 }
 
-/* Search one text file and emit matching lines with edit-friendly tags. */
+/* Search one text file and emit matching lines with plain line numbers. */
 static void agent_search_file(agent_search_ctx *ctx, const char *path) {
     if (ctx->results >= ctx->max_results) return;
     if (ctx->glob && ctx->glob[0]) {
@@ -5351,12 +5009,6 @@ static void agent_search_file(agent_search_ctx *ctx, const char *path) {
         if (from <= last_context_line) from = last_context_line + 1;
         for (int j = from; j <= to; j++) {
             agent_search_emit_line(ctx, data, spans.v[j], j + 1);
-            if (ctx->worker) {
-                agent_line_span jsp = spans.v[j];
-                agent_worker_remember_line(ctx->worker, path, j + 1,
-                                           data + jsp.start,
-                                           jsp.content_end - jsp.start);
-            }
             last_context_line = j;
         }
         ctx->results++;
@@ -5392,6 +5044,7 @@ static void agent_search_path(agent_search_ctx *ctx, const char *path, int depth
 
 /* Implement the search tool using either literal matching or POSIX regex. */
 static char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
+    (void)w;
     const char *query = agent_tool_arg_value(call, "query");
     if (!query || !query[0]) return xstrdup("Tool error: search requires query\n");
     const char *path = agent_tool_arg_value(call, "path");
@@ -5400,7 +5053,6 @@ static char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
     agent_search_ctx ctx = {
         .query = query,
         .glob = agent_tool_arg_value(call, "glob"),
-        .worker = w,
         .use_regex = mode && !strcmp(mode, "regex"),
         .case_sensitive = agent_parse_bool_default(agent_tool_arg_value(call, "case_sensitive"), true),
         .context = agent_parse_int_default(agent_tool_arg_value(call, "context"), 0, 0, 5),
@@ -5933,6 +5585,7 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "write")) return agent_tool_write(w, call);
     if (!strcmp(call->name, "list")) return agent_tool_list(call);
     if (!strcmp(call->name, "edit")) return agent_tool_edit(w, call);
+    if (!strcmp(call->name, "insert")) return agent_tool_insert(w, call);
     if (!strcmp(call->name, "search")) return agent_tool_search(w, call);
 
     if (!strcmp(call->name, "bash")) {
@@ -6532,10 +6185,30 @@ static void worker_request_save(agent_worker *w) {
     pthread_mutex_unlock(&w->mu);
 }
 
+static void worker_request_power(agent_worker *w, int power) {
+    pthread_mutex_lock(&w->mu);
+    w->requested_power = power;
+    w->power_requested = true;
+    pthread_cond_signal(&w->cond);
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+}
+
 static bool worker_take_save_requested(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     bool requested = w->save_requested;
     w->save_requested = false;
+    pthread_mutex_unlock(&w->mu);
+    return requested;
+}
+
+static bool worker_take_power_requested(agent_worker *w, int *power) {
+    pthread_mutex_lock(&w->mu);
+    bool requested = w->power_requested;
+    if (requested) {
+        if (power) *power = w->requested_power;
+        w->power_requested = false;
+    }
     pthread_mutex_unlock(&w->mu);
     return requested;
 }
@@ -6551,6 +6224,17 @@ static void worker_run_deferred_save(agent_worker *w) {
     else
         agent_publishf(w, "\nsave failed: %s\n", err[0] ? err : "unknown error");
     agent_set_status(w, AGENT_WORKER_IDLE);
+}
+
+static void worker_run_deferred_power(agent_worker *w) {
+    int power = 0;
+    if (!worker_take_power_requested(w, &power)) return;
+    if (ds4_session_set_power(w->session, power) != 0) {
+        agent_publishf(w, "\npower change failed\n");
+        return;
+    }
+    w->cfg->engine.power_percent = power;
+    agent_publishf(w, "\npower set to %d%%\n", power);
 }
 
 /* Worker thread entry point.  The UI thread submits plain user text; this
@@ -6574,11 +6258,16 @@ static void *worker_main(void *arg) {
 
     while (true) {
         pthread_mutex_lock(&w->mu);
-        while (!w->stop && !w->cmd_text && !w->save_requested)
+        while (!w->stop && !w->cmd_text && !w->save_requested && !w->power_requested)
             pthread_cond_wait(&w->cond, &w->mu);
         if (w->stop) {
             pthread_mutex_unlock(&w->mu);
             break;
+        }
+        if (w->power_requested) {
+            pthread_mutex_unlock(&w->mu);
+            worker_run_deferred_power(w);
+            continue;
         }
         if (!w->cmd_text && w->save_requested) {
             pthread_mutex_unlock(&w->mu);
@@ -6591,6 +6280,7 @@ static void *worker_main(void *arg) {
 
         worker_run_turn(w, cmd);
         free(cmd);
+        worker_run_deferred_power(w);
         worker_run_deferred_save(w);
     }
 
@@ -7738,6 +7428,7 @@ static void runtime_help(void) {
     puts("  /list        List saved sessions.");
     puts("  /switch SHA  Load a saved session and show recent history.");
     puts("  /history [N] Show N recent user turns from the current session.");
+    puts("  /power N     Set GPU duty cycle percentage, 1..100.");
     puts("  /new         Start a fresh session from the system prompt.");
     puts("  /quit, /exit Exit.");
     puts("  Ctrl+C       Interrupt generation; clear edited text.");
@@ -7823,7 +7514,6 @@ static void agent_worker_free(agent_worker *w) {
     worker_stop(w);
     if (w->thread) pthread_join(w->thread, NULL);
     agent_bash_jobs_free(w);
-    agent_file_views_clear(w);
     ds4_session_free(w->session);
     ds4_tokens_free(&w->transcript);
     free(w->cache_dir);
@@ -8255,6 +7945,22 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     }
                 } else if (!strcmp(cmd, "/list")) {
                     agent_worker_list_sessions(&worker);
+                } else if (!strncmp(cmd, "/power", 6) &&
+                           (cmd[6] == '\0' || cmd[6] == ' ' || cmd[6] == '\t')) {
+                    char *arg = cmd + 6;
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                    if (!arg[0]) {
+                        printf("power: %d%%\n", cfg->engine.power_percent > 0 ?
+                               cfg->engine.power_percent : ds4_engine_power(engine));
+                    } else {
+                        int power = 0;
+                        if (!parse_power_percent(arg, &power)) {
+                            printf("usage: /power <1..100>\n");
+                        } else {
+                            worker_request_power(&worker, power);
+                            if (busy) printf("power change scheduled: %d%%\n", power);
+                        }
+                    }
                 } else if (cmd[0] == '/' && busy) {
                     printf("command requires the model to be idle: %s\n", cmd);
                 } else if (!strcmp(cmd, "/quit") || !strcmp(cmd, "/exit")) {

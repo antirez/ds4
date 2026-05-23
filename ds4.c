@@ -521,6 +521,20 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
+static void sleep_sec(double sec) {
+    if (sec <= 0.0 || !isfinite(sec)) return;
+    struct timespec req;
+    req.tv_sec = (time_t)sec;
+    req.tv_nsec = (long)((sec - (double)req.tv_sec) * 1000000000.0);
+    if (req.tv_nsec < 0) req.tv_nsec = 0;
+    if (req.tv_nsec >= 1000000000L) {
+        req.tv_sec++;
+        req.tv_nsec -= 1000000000L;
+    }
+    /* Do not resume after EINTR: Ctrl+C should cut through throttling sleeps. */
+    (void)nanosleep(&req, &req);
+}
+
 static const char *ds4_log_color_code(ds4_log_type type) {
     switch (type) {
     case DS4_LOG_PREFILL:
@@ -8325,9 +8339,49 @@ typedef struct {
     ds4_gpu_tensor *directional_steering_dirs;
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
+    uint32_t power_percent;
+    double prefill_layer_avg_sec[DS4_N_LAYER];
+    double decode_token_avg_sec;
     bool quality;
     bool mtp_enabled;
 } ds4_gpu_graph;
+
+static bool graph_power_throttle_enabled(const ds4_gpu_graph *g) {
+    return g && g->power_percent > 0 && g->power_percent < 100;
+}
+
+static double graph_power_update_avg(double avg, double sample) {
+    if (sample <= 0.0 || !isfinite(sample)) return avg;
+    if (avg <= 0.0 || !isfinite(avg)) return sample;
+    return avg * 0.875 + sample * 0.125;
+}
+
+static void graph_power_sleep(double work_sec, uint32_t power_percent) {
+    if (power_percent == 0 || power_percent >= 100) return;
+    /* Target duty cycle: work / (work + sleep) = power / 100.
+     * At --power 50 this sleeps for one measured work interval; at 25 it
+     * sleeps for three. */
+    const double sleep = work_sec * (100.0 - (double)power_percent) /
+                         (double)power_percent;
+    sleep_sec(sleep);
+}
+
+static void graph_power_note_prefill_layer(ds4_gpu_graph *g,
+                                           uint32_t il,
+                                           double elapsed_sec) {
+    if (!graph_power_throttle_enabled(g)) return;
+    if (il >= DS4_N_LAYER) return;
+    g->prefill_layer_avg_sec[il] =
+        graph_power_update_avg(g->prefill_layer_avg_sec[il], elapsed_sec);
+    graph_power_sleep(g->prefill_layer_avg_sec[il], g->power_percent);
+}
+
+static void graph_power_note_decode_token(ds4_gpu_graph *g, double elapsed_sec) {
+    if (!graph_power_throttle_enabled(g)) return;
+    g->decode_token_avg_sec =
+        graph_power_update_avg(g->decode_token_avg_sec, elapsed_sec);
+    graph_power_sleep(g->decode_token_avg_sec, g->power_percent);
+}
 
 /* Release every Metal tensor owned by the whole-model graph runtime. */
 static void metal_graph_free(ds4_gpu_graph *g) {
@@ -13079,19 +13133,20 @@ static bool metal_graph_eval_token_raw_swa(
         uint32_t               pos,
         float                 *logits) {
     const bool profile = getenv("DS4_METAL_GRAPH_TOKEN_PROFILE") != NULL;
-    const double t0 = profile ? now_sec() : 0.0;
+    const bool throttle = graph_power_throttle_enabled(g);
+    const double t0 = (profile || throttle) ? now_sec() : 0.0;
 
     bool ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL, true);
-    const double t_encoded = profile ? now_sec() : 0.0;
+    const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
     if (ok) ok = ds4_gpu_end_commands() != 0;
-    const double t_done = profile ? now_sec() : 0.0;
+    const double t_done = (profile || throttle) ? now_sec() : 0.0;
 
     if (ok && logits) {
         ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
+    const double t_read = (profile || throttle) ? now_sec() : 0.0;
     if (profile) {
-        const double t_read = now_sec();
         fprintf(stderr,
                 "ds4: metal graph token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=%d\n",
                 pos,
@@ -13101,6 +13156,7 @@ static bool metal_graph_eval_token_raw_swa(
                 (t_read - t0) * 1000.0,
                 logits != NULL);
     }
+    if (ok) graph_power_note_decode_token(g, t_read - t0);
     if (!ok) {
         if (ds4_gpu_synchronize() == 0) {
             fprintf(stderr, "ds4: Metal synchronize after graph eval failure also failed\n");
@@ -13566,7 +13622,8 @@ static bool metal_graph_prefill_layer_major(
      * low overhead, but submit long prompts layer by layer so the display
      * server gets regular scheduling points.
      */
-    const bool split_commands = split_profile || n_tokens > 2048 || imatrix != NULL;
+    const bool throttle = graph_power_throttle_enabled(g);
+    const bool split_commands = split_profile || throttle || n_tokens > 2048 || imatrix != NULL;
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL || split_profile;
     const double t0 = profile ? now_sec() : 0.0;
     double encode_s = 0.0;
@@ -13649,7 +13706,7 @@ static bool metal_graph_prefill_layer_major(
         return ok;
     }
 
-    double t_layer0 = profile ? now_sec() : 0.0;
+    double t_layer0 = (profile || throttle) ? now_sec() : 0.0;
     ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
                                                  g->prefill_tokens,
                                                  model,
@@ -13657,8 +13714,8 @@ static bool metal_graph_prefill_layer_major(
                                                  prompt,
                                                  start,
                                                  n_tokens);
-    const double t_embed_encoded = profile ? now_sec() : 0.0;
-    const double t_embed_done = profile ? now_sec() : 0.0;
+    const double t_embed_encoded = (profile || throttle) ? now_sec() : 0.0;
+    const double t_embed_done = (profile || throttle) ? now_sec() : 0.0;
     if (profile) {
         encode_s += t_embed_encoded - t_layer0;
         execute_s += t_embed_done - t_embed_encoded;
@@ -13677,6 +13734,7 @@ static bool metal_graph_prefill_layer_major(
     }
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        double layer_elapsed = 0.0;
         if (split_profile) {
             const double t_attn0 = now_sec();
             ok = ds4_gpu_begin_commands() != 0;
@@ -13707,6 +13765,7 @@ static bool metal_graph_prefill_layer_major(
             if (ok) ok = ds4_gpu_end_commands() != 0;
             const double t_ffn_done = now_sec();
             if (ok && imatrix) ok = imatrix_collect_layer_batch(imatrix, g, il, (uint32_t)n_tokens);
+            layer_elapsed = (t_attn_done - t_attn0) + (t_ffn_done - t_ffn0);
 
             encode_s += (t_attn_encoded - t_attn0) + (t_ffn_encoded - t_ffn0);
             execute_s += (t_attn_done - t_attn_encoded) + (t_ffn_done - t_ffn_encoded);
@@ -13718,7 +13777,7 @@ static bool metal_graph_prefill_layer_major(
                     (t_ffn_encoded - t_ffn0) * 1000.0,
                     (t_ffn_done - t_ffn_encoded) * 1000.0);
         } else {
-            const double t_chunk0 = profile ? now_sec() : 0.0;
+            const double t_chunk0 = (profile || throttle) ? now_sec() : 0.0;
             ok = ds4_gpu_begin_commands() != 0;
             if (ok) ok = metal_graph_encode_layer_batch(g,
                                                         model,
@@ -13726,10 +13785,11 @@ static bool metal_graph_prefill_layer_major(
                                                         il,
                                                         start,
                                                         n_tokens);
-            const double t_encoded = profile ? now_sec() : 0.0;
+            const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
             if (ok) ok = ds4_gpu_end_commands() != 0;
-            const double t_done = profile ? now_sec() : 0.0;
+            const double t_done = (profile || throttle) ? now_sec() : 0.0;
             if (ok && imatrix) ok = imatrix_collect_layer_batch(imatrix, g, il, (uint32_t)n_tokens);
+            layer_elapsed = t_done - t_chunk0;
             if (profile) {
                 encode_s += t_encoded - t_chunk0;
                 execute_s += t_done - t_encoded;
@@ -13746,6 +13806,7 @@ static bool metal_graph_prefill_layer_major(
             }
             return false;
         }
+        graph_power_note_prefill_layer(g, il, layer_elapsed);
         metal_graph_report_prefill_display_progress(display_progress,
                                                     display_progress_ud,
                                                     start,
@@ -14654,6 +14715,7 @@ struct ds4_engine {
     float *directional_steering_dirs;
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
+    int power_percent;
     bool quality;
     bool metal_ready;
     bool mtp_ready;
@@ -15727,6 +15789,7 @@ static int generate_metal_graph_raw_swa(
         int                 n_predict,
         int                 ctx_size,
         bool                quality,
+        int                 power_percent,
         const char        * directional_steering_file,
         float               directional_steering_attn,
         float               directional_steering_ffn,
@@ -15758,6 +15821,7 @@ static int generate_metal_graph_raw_swa(
         return 1;
     }
     g.quality = quality;
+    g.power_percent = power_percent > 0 ? (uint32_t)power_percent : 100u;
     if (!metal_graph_load_directional_steering(&g,
                                                directional_steering_file,
                                                directional_steering_attn,
@@ -17297,6 +17361,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
         return 1;
     }
     g.quality = e->quality;
+    g.power_percent = (uint32_t)e->power_percent;
 
     ds4_imatrix_collector collector;
     if (!imatrix_collector_init(&collector, prefill_cap, dataset_path)) {
@@ -17425,6 +17490,7 @@ int ds4_engine_generate_argmax(
         }
         return generate_metal_graph_raw_swa(model, vocab, weights, prompt,
                                             n_predict, ctx_size, e->quality,
+                                            e->power_percent,
                                             e->directional_steering_file,
                                             e->directional_steering_attn_scale,
                                             e->directional_steering_ffn_scale,
@@ -17637,6 +17703,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->mtp_model.fd = -1;
     e->backend = opt->backend;
     e->quality = opt->quality;
+    e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
+    if (e->power_percent > 100) e->power_percent = 100;
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
     e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
@@ -17763,6 +17831,16 @@ int ds4_engine_vocab_size(ds4_engine *e) {
     return e ? e->vocab.n_vocab : 0;
 }
 
+int ds4_engine_power(ds4_engine *e) {
+    return e ? e->power_percent : 100;
+}
+
+int ds4_engine_set_power(ds4_engine *e, int power_percent) {
+    if (!e || power_percent < 1 || power_percent > 100) return 1;
+    e->power_percent = power_percent;
+    return 0;
+}
+
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
     weights_free(&e->weights);
@@ -17809,6 +17887,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         return 1;
     }
     s->graph.quality = e->quality;
+    s->graph.power_percent = (uint32_t)e->power_percent;
     if (!metal_graph_load_directional_steering(&s->graph,
                                                e->directional_steering_file,
                                                e->directional_steering_attn_scale,
@@ -17842,6 +17921,20 @@ void ds4_session_free(ds4_session *s) {
     free(s->logits);
     free(s->mtp_logits);
     free(s);
+}
+
+int ds4_session_power(ds4_session *s) {
+    if (!s || !s->engine) return 100;
+    return s->engine->power_percent;
+}
+
+int ds4_session_set_power(ds4_session *s, int power_percent) {
+    if (!s || !s->engine || power_percent < 1 || power_percent > 100) return 1;
+    s->engine->power_percent = power_percent;
+#ifndef DS4_NO_GPU
+    if (!ds4_session_is_cpu(s)) s->graph.power_percent = (uint32_t)power_percent;
+#endif
+    return 0;
 }
 
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud) {

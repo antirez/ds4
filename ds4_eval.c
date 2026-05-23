@@ -1203,6 +1203,7 @@ typedef struct {
     float min_p;
     uint64_t seed;
     int pause_ms;
+    int power_percent;
     int soft_limit_reply_budget;
     int hard_limit_reply_budget;
     int soft_limit_think_close_rank;
@@ -1492,6 +1493,7 @@ static void usage(FILE *fp) {
         "  -t, --threads N        CPU helper threads.\n"
         "  --quality              Prefer exact kernels where applicable.\n"
         "  --warm-weights         Touch mapped tensor pages before evaluation.\n"
+        "  --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n"
         "\n"
         "Evaluation:\n"
         "  -n, --tokens N         Max generated tokens per question. Default: 16000\n"
@@ -1579,6 +1581,12 @@ static eval_config parse_options(int argc, char **argv) {
             c.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--quality")) {
             c.quality = true;
+        } else if (!strcmp(arg, "--power")) {
+            c.power_percent = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (c.power_percent < 1 || c.power_percent > 100) {
+                fprintf(stderr, "ds4-eval: --power must be between 1 and 100\n");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
         } else if (!strcmp(arg, "--think")) {
@@ -3265,7 +3273,9 @@ static double tui_wait_if_paused(eval_ui *ui, const char *phase) {
 
 static void eval_prefill_progress(void *ud, const char *event, int current, int total) {
     eval_ui *ui = ud;
-    if (!ui || !event || strcmp(event, "prefill_chunk")) return;
+    if (!ui || !event) return;
+    if (strcmp(event, "prefill_chunk") && strcmp(event, "prefill_display"))
+        return;
     tui_consume_input(ui);
     tui_run_clock_tick(ui);
     ui->prefill_current = current;
@@ -3362,8 +3372,10 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
 
     char err[256];
     ds4_session_set_progress(session, eval_prefill_progress, ui);
+    ds4_session_set_display_progress(session, eval_prefill_progress, ui);
     if (ds4_session_sync(session, &prompt, err, sizeof(err)) != 0) {
         ds4_session_set_progress(session, NULL, NULL);
+        ds4_session_set_display_progress(session, NULL, NULL);
         tui_run_clock_stop(ui);
         fprintf(stderr, "ds4-eval: prefill failed for %s: %s\n", tc->id, err);
         trace_write_case(trace, cfg, tc, idx, ui->ncases, "ERROR", err,
@@ -3373,6 +3385,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
         return EVAL_RUN_ERROR;
     }
     ds4_session_set_progress(session, NULL, NULL);
+    ds4_session_set_display_progress(session, NULL, NULL);
     int prompt_tokens = prompt.len;
     ui->prompt_tokens[idx] = prompt_tokens;
     ds4_tokens_free(&prompt);
@@ -3700,6 +3713,7 @@ int main(int argc, char **argv) {
         .n_threads = cfg.threads,
         .mtp_draft_tokens = 1,
         .mtp_margin = 3.0f,
+        .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
     };
