@@ -11,6 +11,12 @@ y = y - scale * direction[layer] * dot(direction[layer], y)
 Positive scale removes the represented direction. Negative scale amplifies it.
 With no steering file or zero scales, ds4 follows the normal inference path.
 
+DS4 also supports routed MoE expert steering, which uses a separate `43 x 256`
+f32 map to promote or suppress behavior-associated experts at router time. See
+[EXPERT_STEERING.md](EXPERT_STEERING.md) for the map format and builder, and
+[STEERING_LEVERS.md](STEERING_LEVERS.md) for the shortest combined overview of
+both levers. The two steering systems are independent and can be combined.
+
 ## Runtime Options
 
 ```text
@@ -99,6 +105,26 @@ ignores the prompt, or starts losing factual content, the scale is too strong.
 For this example, `-1` is a good first terse setting and `2` is a good first
 verbose setting. Strong negative scales such as `-2` or `-3` can over-amplify
 the terse direction and collapse into repetition on some prompts.
+
+## Expert Steering Example
+
+Expert steering uses a separate scale sweep helper. The command below matches
+the bundled verbosity example and is the quickest way to see how the map behaves
+across negative, neutral, and positive scales:
+
+```sh
+python3 dir-steering/tools/run_sweep_expert.py \
+  --ds4 ./ds4 \
+  --model ds4flash.gguf \
+  --direction dir-steering/out/verbosity-experts.f32 \
+  --prompts dir-steering/examples/eval_prompts.txt \
+  --scales "-1,-0.5,0,0.5,1,2" \
+  --tokens 180 \
+  --nothink
+```
+
+The script name still uses `--direction` for its steering file argument, but in
+this case it accepts the expert map `.f32` file.
 
 ## Observed Effect
 

@@ -87,6 +87,51 @@ struct ds4_metal_args_dsv4_router_select_one {
     uint32_t hash_rows;
 };
 
+struct ds4_metal_args_dsv4_expert_steering {
+    uint32_t n_tokens;
+    uint32_t layer;
+    uint32_t prob_mode;
+    uint32_t reserved;
+    uint64_t score_token_stride;
+    float    scale;
+};
+
+// Expert routing steering for DS4's routed-MoE scores. Positive map entries
+// promote an expert to the current per-token maximum plus a small margin;
+// negative entries suppress it. For probability rows, suppression clamps to
+// zero so downstream route weights remain non-negative. For selection rows
+// that may include router bias, suppression drops below the current minimum.
+kernel void kernel_dsv4_expert_steering_apply(
+        constant ds4_metal_args_dsv4_expert_steering &args,
+        device char *scores,
+        device const float *steering,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint token [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    if (token >= args.n_tokens || tid >= 256u || args.scale == 0.0f) return;
+
+    device float *row = (device float *)(scores + (uint64_t)token * args.score_token_stride);
+    const float value = row[tid];
+    scratch[tid] = value;
+    scratch[256u + tid] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint step = 128u; step > 0; step >>= 1) {
+        if (tid < step) {
+            scratch[tid] = max(scratch[tid], scratch[tid + step]);
+            scratch[256u + tid] = min(scratch[256u + tid], scratch[256u + tid + step]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float action = steering[(uint64_t)args.layer * 256u + tid] * args.scale;
+    if (action > 0.0f) {
+        row[tid] = scratch[0] + fabs(action);
+    } else if (action < 0.0f) {
+        row[tid] = args.prob_mode ? 0.0f : scratch[256u] - fabs(action);
+    }
+}
+
 struct ds4_metal_args_dsv4_directional_steering_project {
     uint32_t width;
     uint32_t rows;
