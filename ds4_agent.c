@@ -388,11 +388,16 @@ static bool parse_power_percent(const char *arg, int *out) {
     return true;
 }
 
-static uint64_t parse_u64(const char *s, const char *opt) {
+static uint64_t parse_seed(const char *s) {
     char *end = NULL;
+    if (s[0] == '\0' || s[0] == '-') {
+        fprintf(stderr, "ds4-agent: invalid value for --seed: %s\n", s);
+        exit(2);
+    }
+    errno = 0;
     unsigned long long v = strtoull(s, &end, 10);
-    if (s[0] == '\0' || *end != '\0' || v == 0) {
-        fprintf(stderr, "ds4-agent: invalid value for %s: %s\n", opt, s);
+    if (*end != '\0' || errno == ERANGE || v == 0) {
+        fprintf(stderr, "ds4-agent: invalid value for --seed: %s\n", s);
         exit(2);
     }
     return (uint64_t)v;
@@ -541,7 +546,7 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--min-p")) {
             c.gen.min_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
         } else if (!strcmp(arg, "--seed")) {
-            c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
+            c.gen.seed = parse_seed(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--think")) {
             c.gen.think_mode = DS4_THINK_HIGH;
         } else if (!strcmp(arg, "--think-max")) {

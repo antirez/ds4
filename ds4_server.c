@@ -11235,6 +11235,17 @@ static int parse_nonneg_int_arg(const char *s, const char *opt) {
     return (int)v;
 }
 
+static int parse_port_arg(const char *s) {
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(s, &end, 10);
+    if (!s[0] || *end || errno == ERANGE || v < 1 || v > 65535) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: --port must be between 1 and 65535: %s", s);
+        exit(2);
+    }
+    return (int)v;
+}
+
 static float parse_float_arg(const char *s, const char *opt, float minv, float maxv) {
     char *end = NULL;
     float v = strtof(s, &end);
@@ -11439,7 +11450,7 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--host")) {
             c.host = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--port")) {
-            c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.port = parse_port_arg(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
         } else if (!strcmp(arg, "--trace")) {
