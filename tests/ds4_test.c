@@ -150,6 +150,47 @@ static void test_metal_f16_matvec_fast_nr0_4(void) {
     free(weights_raw);
 }
 
+static void test_metal_short_prefill_ratio4(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+
+    const int tokens[] = {
+        ds4_token_user(engine),
+        ds4_token_assistant(engine),
+        ds4_token_eos(engine),
+    };
+    for (size_t i = 0; i < sizeof(tokens) / sizeof(tokens[0]); i++) {
+        TEST_ASSERT(tokens[i] >= 0);
+        if (tokens[i] < 0) return;
+    }
+
+    for (size_t n = 1; n <= 3; n++) {
+        ds4_tokens prompt = {0};
+        for (size_t i = 0; i < n; i++) {
+            ds4_tokens_push(&prompt, tokens[i]);
+        }
+        TEST_ASSERT(prompt.len == (int)n);
+
+        ds4_session *session = NULL;
+        TEST_ASSERT(ds4_session_create(&session, engine, 2048) == 0);
+        if (!session) {
+            ds4_tokens_free(&prompt);
+            return;
+        }
+
+        char err[160] = {0};
+        const int rc = ds4_session_sync(session, &prompt, err, sizeof(err));
+        if (rc != 0) {
+            fprintf(stderr, "ds4-test: short prefill failed for %zu token(s): %s\n",
+                    n, err);
+        }
+        TEST_ASSERT(rc == 0);
+
+        ds4_session_free(session);
+        ds4_tokens_free(&prompt);
+    }
+}
+
 static char *test_read_file(const char *path) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return NULL;
@@ -666,6 +707,7 @@ static const ds4_test_entry test_entries[] = {
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison", test_official_logprob_vectors},
+    {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_f16_matvec_fast_nr0_4},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},

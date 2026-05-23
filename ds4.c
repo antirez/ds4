@@ -10915,8 +10915,11 @@ static bool metal_graph_refresh_ratio4_compressor_state(
         uint32_t          width,
         uint32_t          pos0,
         uint32_t          n_tokens) {
+    if (n_tokens < 4) {
+        return true;
+    }
     if (!g || !model || !state_kv || !state_score || !kv_weight || !score_weight || !ape ||
-        head_dim == 0 || width == 0 || n_tokens < 4) {
+        head_dim == 0 || width == 0) {
         return false;
     }
 
