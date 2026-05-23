@@ -1,28 +1,13 @@
-# DwarfStar 4 with M5 optimizations
+# DwarfStar 4: Abliteration + Uncertainty Steering
 
-**Apple M5 performance note:** on an Apple M5 Max with 128 GB RAM, this fork's
-`main` branch is faster than `antirez/main` on both prefill and generation in a
-Metal `ds4-bench` sweep using `speed-bench/promessi_sposi.txt`, contexts
-2048-8192, 2048-token steps, 64 generated tokens, and `--warm-weights` on both
-sides so the mmap state is symmetric. Each fork is benched against its own
-preferred IQ2XXS quant: `antirez/main` against
-`DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf`
-and this fork against the abliterated, ds4-aligned IQ2XXS variant
-`cyberneurova-DeepSeek-V4-Flash-abliterated-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-aligned.gguf`.
+**Branch note:** upstream `antirez/main` has absorbed the main Metal/NAX
+performance work. This branch is now focused on the CyberNeurova abliterated,
+ds4-aligned IQ2XXS imatrix GGUF and the uncertainty steering direction that
+nudges final answers while leaving prompt prefill, thinking tokens, and tool
+syntax unsteered by default.
 
-Geometric-mean speedup across the measured frontiers is **1.05x prefill**
-and **1.10x generation**.
-
-| Context | antirez/main prefill | m5+Tensor prefill | Prefill uplift | antirez/main gen | m5 gen | Gen uplift |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2048 | 373.07 t/s | 386.10 t/s |  +3.5% | 31.50 t/s | 36.60 t/s | +16.2% |
-| 4096 | 338.25 t/s | 361.65 t/s |  +6.9% | 31.12 t/s | 33.39 t/s |  +7.3% |
-| 6144 | 333.81 t/s | 352.91 t/s |  +5.7% | 30.74 t/s | 33.23 t/s |  +8.1% |
-| 8192 | 330.58 t/s | 348.59 t/s |  +5.4% | 30.75 t/s | 33.11 t/s |  +7.7% |
-
-This fork includes M5-specific `metal_simdgroup_matrix` optimization for
-dense prefill/routed-MoE matmul kernels and GPU-private scratch buffers for hot
-Metal intermediates.
+The branch intentionally does not maintain a separate speed headline. Use
+upstream DS4 documentation for baseline performance expectations.
 
 DwarfStar 4 is a small native inference engine specific for **DeepSeek V4 Flash**. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
@@ -31,7 +16,7 @@ correct and fast way, the project goal is to provide DS4 specific loading,
 prompt rendering, tool calling, KV state handling (RAM and on-disk), server
 API and integrated coding agent, all ready to work with coding agents or with
 the provided CLI interface. There are also tools for GGUF and imatrix generation,
-and for quality and speed testing.
+and for quality testing.
 
 We support the following backends:
 * **Metal** is our primary target. Starting from MacBooks with 96GB of RAM.
@@ -95,8 +80,8 @@ If you are looking for very specific things, we have other
 sub-README files. Otherwise for normal usage keep reading the
 next sections.
 
-- [CONTRIBUTING.md](CONTRIBUTING.md): correctness and speed regression testing
-  guide for contributors. **Read this before sending a pull request**.
+- [CONTRIBUTING.md](CONTRIBUTING.md): correctness and regression testing guide
+  for contributors. **Read this before sending a pull request**.
 - [gguf-tools/README.md](gguf-tools/README.md): offline GGUF generation,
   imatrix collection, quantization tooling, and quality checks.
 - [gguf-tools/imatrix/README.md](gguf-tools/imatrix/README.md): how the
@@ -107,8 +92,6 @@ next sections.
   how local GGUFs are scored against official DeepSeek V4 Flash continuations.
 - [dir-steering/README.md](dir-steering/README.md): directional steering data,
   vector generation, and usage.
-- [speed-bench/README.md](speed-bench/README.md): benchmark commands, charts,
-  and CSV generation.
 - [tests/test-vectors/README.md](tests/test-vectors/README.md): official
   continuation vectors used for regression checks.
 
@@ -124,26 +107,29 @@ experts are quantized, up/gate at `IQ2_XXS`, down at `Q2_K`. They are the
 majority of all the model space: the other components (shared experts,
 projections, routing) are left untouched to guarantee quality.
 
-Download one main model. **Prefer the imatrix versions.**
+Download one main model. For this branch, `q2-imatrix` is the recommended
+target: it points at the CyberNeurova abliterated, ds4-aligned IQ2XXS imatrix
+GGUF and matches the included uncertainty steering vector.
 
 ```sh
-./download_model.sh q2-imatrix   # 96/128 GB RAM machines, imatrix-tuned q2
+./download_model.sh q2-imatrix   # CyberNeurova abliterated q2, 96/128 GB RAM
 ./download_model.sh q4-imatrix   # >= 256 GB RAM machines, imatrix-tuned q4
 ```
 
-Legacy GGUF files are still available if you specifically need the older
-non-imatrix quants:
+The upstream q4-imatrix and legacy GGUF files are still available if you
+specifically need them:
 
 ```sh
 ./download_model.sh q2           # 96/128 GB RAM machines, legacy non-imatrix
 ./download_model.sh q4           # >= 256 GB RAM machines, legacy non-imatrix
 ```
 
-The script downloads from `https://huggingface.co/antirez/deepseek-v4-gguf`,
-stores files under `./gguf/`, resumes partial downloads with `curl -C -`, and
-updates `./ds4flash.gguf` to point at the selected q2-imatrix/q4-imatrix/q2/q4
-model. The plain q2 XXS weights are produced with the weights importance vector
-only, without an imatrix. The imatrix variants are preferred.
+The script downloads `q2-imatrix` from
+`https://huggingface.co/audreyt/CyberNeurova-DeepSeek-V4-Flash-abliterated-GGUF`
+and the other targets from `https://huggingface.co/antirez/deepseek-v4-gguf`.
+It stores files under `./gguf/`, resumes partial downloads with `curl -C -`,
+and updates `./ds4flash.gguf` to point at the selected
+q2-imatrix/q4-imatrix/q2/q4 model.
 Authentication is optional for public downloads, but `--token TOKEN`,
 `HF_TOKEN`, or the local Hugging Face token cache are used when present.
 
@@ -171,28 +157,12 @@ make cpu              # CPU-only diagnostics build
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 `./ds4-server --help` for the full flag list.
 
-## Speed
+## Performance
 
-These are single-run Metal CLI numbers with `--ctx 32768`, `--nothink`, greedy
-decoding, and `-n 256`. The short prompt is a normal small Italian story
-prompt. The long prompts exercise chunked prefill plus long-context decode.
-Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
-
-| Machine | Quant | Prompt | Prefill | Generation |
-| --- | ---: | ---: | ---: | ---: |
-| MacBook Pro M3 Max, 128 GB | q2 | short | 58.52 t/s | 26.68 t/s |
-| MacBook Pro M3 Max, 128 GB | q2 | 11709 tokens | 250.11 t/s | 21.47 t/s |
-| MacBook Pro M3 Max, 128 GB | q4 | short | N/A | N/A |
-| MacBook Pro M3 Max, 128 GB | q4 | long | N/A | N/A |
-| MacBook Pro M5 Max, 128 GB | q2 | short | 87.25 t/s | 34.27 t/s |
-| MacBook Pro M5 Max, 128 GB | q2 | 11707 tokens | 463.44 t/s | 25.90 t/s |
-| Mac Studio M3 Ultra, 512 GB | q2 | short | 84.43 t/s | 36.86 t/s |
-| Mac Studio M3 Ultra, 512 GB | q2 | 11709 tokens | 468.03 t/s | 27.39 t/s |
-| Mac Studio M3 Ultra, 512 GB | q4 | short | 78.95 t/s | 35.50 t/s |
-| Mac Studio M3 Ultra, 512 GB | q4 | 12018 tokens | 448.82 t/s | 26.62 t/s |
-| DGX Spark GB10, 128 GB | q2 | 7047 tokens | 343.81 t/s | 13.75 t/s |
-
-![M3 Max t/s](speed-bench/m3_max_ts.svg)
+This branch no longer carries a separate performance claim. The Metal/NAX work
+has moved upstream or into pull requests, so keep throughput comparisons with
+the upstream project rather than this branch README. The local value here is the
+abliterated q2-imatrix model path plus uncertainty steering.
 
 ## Native agent
 
@@ -215,43 +185,12 @@ in order to make it ready for prime time. When finally the agent will reach
 the wanted shape, we will *likely* split the server and the client creating a stateful
 session-based protocol that can recreate all that in a client-server way.
 
-## Benchmarking
+## Branch Regression Checks
 
-`ds4-bench` measures instantaneous prefill and generation throughput at context
-frontiers instead of reporting one whole-run average. It loads the model once,
-walks a fixed token sequence to frontiers such as 2048, 4096, 6144, and uses
-incremental prefill so each row measures only the newly-added token interval.
-After each frontier it saves the live KV state to memory, generates a fixed
-greedy non-EOS probe, restores the memory snapshot, and continues prefill.
-
-```sh
-./ds4-bench \
-  -m ds4flash.gguf \
-  --prompt-file speed-bench/promessi_sposi.txt \
-  --ctx-start 2048 \
-  --ctx-max 65536 \
-  --step-incr 2048 \
-  --gen-tokens 128
-```
-
-The example file is a cleaned public-domain Project Gutenberg text of
-Alessandro Manzoni's *I Promessi Sposi* (ebook #45334), with the Gutenberg
-header and footer removed: <https://www.gutenberg.org/ebooks/45334>.
-
-Use `--step-incr N` for different linear spacing, or `--step-mul F` for
-exponential sweeps. Output is CSV with one row per frontier: latest prefill
-interval tokens/sec, generation tokens/sec at that frontier, and
-`kvcache_bytes`.
-
-Sessions prefill long prompts in 4096-token chunks by default. Set
-`DS4_METAL_PREFILL_CHUNK=N` to compare another chunk size, for example `2048`
-to match the strict official-vector checkpoint path, or
-`DS4_METAL_PREFILL_CHUNK=0` to prefill a prompt as one whole batch when memory
-allows. Changing the chunk changes the KV checkpoint/logit path, so compare it
-as an explicit run configuration.
-Chunked Metal prefill reuses the same range-capable layer-major graph for each
-chunk, preserving absolute compressor/indexer boundaries while avoiding the old
-per-layer chunk dispatch path.
+For this branch's current purpose, the useful regression checks are the
+capability evaluator, local logprob vectors, and steering behavior described
+below. Low-level throughput tools remain in the tree for inherited performance
+work, but they are not part of this README's branch narrative.
 
 ## Capability Evaluation
 
@@ -344,262 +283,6 @@ kernel, quantization, prompt-rendering, KV-cache, or tool-streaming change, does
 DeepSeek V4 Flash still solve a representative mix of hard science, broad
 knowledge, exact math, and security-code problems while using the same inference
 path users run?
-
-## Metal 4 and M5 Neural Accelerators
-
-The current production path is still hand-written Metal compute kernels over
-`MTLBuffer` storage. That is intentional: DS4's hot path is dominated by
-quantized routed-MoE matvec/matmul, sparse compressed attention, and mmap-backed
-model views, which do not map cleanly to a whole-model Core ML package.
-
-Metal 4 is the right next target, but it should be introduced as a feature-gated
-kernel backend rather than a rewrite. On macOS 26+ with `MTLGPUFamilyMetal4`,
-Apple exposes tensor resources, cooperative tensor primitives, and Metal 4
-command infrastructure that can run machine-learning work on the same timeline
-as compute work. The Apple Neural Engine path is exposed through Metal 4
-machine-learning passes over Core ML packages; it is separate from DS4's current
-hand-written compute-shader path over mmap-backed GGUF weights. For this branch,
-`DS4_METAL_MEMORY_REPORT=1` reports the device, Metal 4 family support, MTL4
-queue availability, and whether the device looks like an M5 Neural Accelerator
-target, but that diagnostic is not proof that a custom DS4 shader dispatched on
-the ANE.
-
-The implementation follows the same conservative shape used by llama.cpp's
-current Metal backend: the tensor API is disabled by default on pre-M5/pre-A19
-devices, can be forced with `DS4_METAL_TENSOR_ENABLE=1`, and can always be
-disabled with `DS4_METAL_TENSOR_DISABLE=1`. At startup ds4 compiles a tiny
-Metal Performance Primitives tensor matmul probe before it lets the main Metal
-shader source see `DS4_METAL_HAS_TENSOR`, so unsupported SDK/device
-combinations fall back to the legacy kernels.
-
-Metal Tensor policy is explicit and guarded. Use `-mt auto` or `--mt auto` for
-the default route policy, `-mt on` to force Tensor routes where the Metal tensor
-path is available, and `-mt off` for the legacy Metal reference path. The old
-`--mpp` spelling remains accepted as a compatibility alias. Auto currently
-enables the F16 compressor Tensor path, attention-output low Tensor in all
-layers, and routed-MoE Tensor only in the q1..q4-token-count-safe late windows:
-gate/down from layer 35 and up from layer 36. Wider routed-MoE windows caused
-deterministic `ds4-eval` generation drift, so earlier MoE Tensor layers stay
-behind explicit route opt-ins while they are being tuned. The dense Q8_0 prefill
-path remains on the legacy hand-written Metal simdgroup kernel; the
-experimental Tensor Q8_0 route was removed after M5 drift bisection showed it
-was the drift-prone path.
-
-The next prefill optimization target is therefore not a re-enable of the removed
-Q8_0 Tensor route. It is a new, isolated quantized prefill matmul experiment
-that targets the high-impact routed-MoE and dense-attention shapes with Metal 4
-cooperative matrix primitives, while keeping the legacy
-dequantization/reduction behavior close enough to pass the five-fixture quality
-gate before it can become part of `-mt auto`. Any Apple Neural Engine work
-should be a separate Core ML/Metal 4 machine-learning pass investigation; it is
-not something the current custom compute shaders get automatically by changing
-their matrix instructions.
-
-The environment controls `DS4_METAL_MPP_ENABLE` and
-`DS4_METAL_MPP_DISABLE` accept `1/true/yes/on` and `0/false/no/off`;
-`DS4_METAL_MPP_ENABLE=0` disables Tensor routes instead of enabling them by mere
-presence. Passing `--quality` also disables Tensor routes so strict/debug runs
-stay on the legacy Metal kernels. Set `DS4_METAL_MPP_FAST=1` to opt into the
-current throughput diagnostic profile: it uses the routed-MoE all-layer
-diagnostic window. This profile is not the default because its top-k overlap is
-weaker than auto in the current full-model suite.
-
-The default safe-window policy uses the direct-RHS tensor layout for Tensor
-routes; set `DS4_METAL_MPP_DIRECT_RHS=0` to compare against the older staged-RHS
-layout. Attention-output direct-RHS supports both 32-token and 64-token Tensor
-tiles, and auto defaults it to 64-token tiles. Set
-`DS4_METAL_MPP_ATTN_OUT_TILE_N=32` to force the narrower layout. The
-route-specific `DS4_METAL_MPP_F16_DIRECT_RHS=1` and
-`DS4_METAL_MPP_ATTN_OUT_DIRECT_RHS=1` switches isolate that layout without
-turning on every direct-RHS route at once when the global
-`DS4_METAL_MPP_DIRECT_RHS=0` override is set.
-
-On M5 devices, GPU-only scratch buffers use private Metal storage by default so
-intermediate prefill buffers do not stay CPU-visible. CPU-filled mask and
-attention-output group-id buffers remain shared. Set
-`DS4_METAL_DISABLE_M5_PRIVATE_SCRATCH=1` to compare against the older shared
-scratch allocation path.
-
-The isolated `./ds4_test --metal-kernels` regression reports
-small/medium/model-ish kernel deltas; the full-model
-`./ds4_test --metal-tensor-equivalence` diagnostic compares default auto
-against `-mt off`. The old `--metal-mpp-equivalence` spelling remains accepted
-as a compatibility alias. Set `DS4_TEST_MPP_EQ_FORCE_ON=1` to compare forced
-Tensor against `-mt off` while working on a route.
-`DS4_TEST_MPP_EQ_CASE=<case-id-substring>` limits the diagnostic to one prompt,
-and `DS4_TEST_MPP_EQ_MATRIX=1` prints
-separate auto, fast-profile, attention-output-only, MoE gate/up/down-only, and
-full-forced summary rows. The equivalence gate requires finite logits, the same
-top-1 token, and matching greedy continuation; it also reports top-5/top-20
-overlap, top-20 rank displacement, top-20 logit deltas, and whole-vocab RMS/max
-drift so route changes can be judged beyond pass/fail.
-
-Full-graph route localization is available with
-`DS4_METAL_MPP_COMPARE_ROUTE=q8|attn_out|moe_gate|moe_up|moe_down|flash_attn`
-and optional `DS4_METAL_MPP_COMPARE_MAX=N`. The comparator snapshots the
-candidate Tensor output, runs the legacy Metal route on the same tensor input,
-and reports the first comparison that exceeds the kernel target, including
-module/layer context, shape, max absolute error, RMS, and the largest element
-deltas. Set `DS4_METAL_MPP_COMPARE_VERBOSE=1` to print passing comparisons as
-well.
-Set `DS4_METAL_Q8_PREFILL_PROFILE=1` while profiling a prompt to time the
-current legacy Q8_0 prefill matmul by module/layer context without changing the
-dispatch. Add `DS4_METAL_Q8_PREFILL_PROFILE_FILTER=<substring>` to limit the
-rows to dense Q8_0 contexts such as `attn_q_a`, `attn_kv`, or `attn_q_b`.
-Set `DS4_METAL_Q8_COMPARE=1` to run a local dense Q8_0 ref-vs-candidate
-comparison using the same comparator output format, and
-`DS4_METAL_Q8_COMPARE_FILTER=<substring>` to focus it on one context such as
-`attn_q_b` or `attn_out`. This is a diagnostic hook for future default-off Q8
-kernel prototypes; the current production path still uses the legacy Q8_0
-prefill kernel.
-Set `DS4_METAL_FLASH_ATTN_COMPARE=1` with
-`DS4_METAL_MPP_COMPARE_ROUTE=flash_attn` to compare static-mixed prefill head
-outputs against the existing generic masked FlashAttention path. Use
-`DS4_METAL_FLASH_ATTN_COMPARE_FILTER=<substring>` to limit the comparison by
-shape label before testing a default-off static-mixed attention kernel.
-Routed-MoE gate/up/down uses the specialized routed-MoE profiler below instead
-of this dense wrapper. Use both profilers to choose the first default-off Metal 4
-matmul prototype target; current profile data points first at early routed-MoE
-matmuls, then at dense attention `attn_q_b`.
-
-Set `DS4_METAL_EXPERIMENTAL_MOE_MATMUL=1` to run a default-off routed-MoE
-matmul candidate that moves the existing Metal 4 cooperative/tensor MoE matmul
-window to the first layer, without changing dense Q8_0 dispatch. This is meant
-for timing and drift-gate experiments only. `DS4_METAL_EXPERIMENTAL_MOE_MATMUL_START_LAYER=N`
-can narrow that candidate before promotion, and the existing MoE route filters,
-route disables, comparator, and stage profiler still apply.
-
-Current Tensor route status balances drift with prefill throughput: `auto`
-enables F16 compressor, attention-output low projection, and routed-MoE Tensor
-in late route-specific windows: gate/down from layer 35 and up from layer 36.
-Attention-output low projection is enabled for all layers by default. The
-earlier routed-MoE conservative window, down from layer 12 and gate/up from
-layer 15, remains available only through explicit MoE route enables or forced
-Tensor mode because widening past the late window costs prefill on this M5 Max
-build and changes deterministic `ds4-eval` q1..q4 generation lengths. The dense
-Q8_0 prefill path now stays on the legacy hand-written Metal kernel. The
-attention-output low Tensor kernels stage activation tiles through half to
-match the legacy Metal matmul input path, which removes the first
-attention-output comparator breach. The current auto policy uses direct-RHS
-Tensor inputs and 64-token tiles for attention-output low projections. The F16
-compressor route did not introduce measurable drift in the current prompt set.
-
-Under this routed-MoE default, the local M5 Max `--metal-tensor-equivalence`
-diagnostic against `-mt off` reports same-top1/same-greedy agreement on all
-five fixtures with minimum top-5 overlap `5/5`, top-20 overlap `20/20` across
-every fixture, `worst_rank_delta = 2`, `worst_rms ~= 0.0748`, and
-`worst_top20_max_abs ~= 0.218`.
-
-In a local M5 Max `ds4-bench` sweep with `--gen-tokens 128`, this auto profile
-(`-mt auto`) sampled prefill at `273/333/329/351/341` tokens/sec for
-`512/2048/4096/8192/16384`-token contexts, versus `259/322/328/328/329` t/s
-for standard Metal (`-mt off`) and `252/308/326/336/319` t/s for `--quality`.
-Generation tokens/sec at the same frontiers was `36.0/35.4/32.0/32.5/31.4`
-for `-mt auto`, tracking standard Metal within noise and beating `--quality`
-on the three longest contexts.
-
-The `DS4_METAL_MPP_FAST=1` profile is the measured high-throughput diagnostic
-profile under the relaxed same-top1/same-greedy gate. In the current prompt
-suite it keeps top-1 and greedy continuations stable, but reports weaker top-k
-overlap than auto. It remains diagnostic-only because it widens routed-MoE
-Tensor to layer 0, which produces the largest full-suite drift.
-The current fastest default-off eval candidate keeps the fast gate/up window but
-excludes the largest local `moe_down` comparator outliers:
-
-```
-DS4_METAL_MPP_FAST=1 \
-DS4_METAL_MPP_MOE_DOWN_FILTER=layer=0-25,layer=27-28,layer=31-42
-```
-
-If generation steadiness matters more than maximum short-context prefill, add
-`DS4_METAL_MOE_MID_F32=1` to the same env. That balanced variant still passes
-the five-fixture drift gate, keeps the same Tensor-vs-standard drift summary,
-and reduces the compact-generation timing swings seen in the fastest variant.
-In the 128-token long sweep it remains prefill-positive through 65k context,
-but gives up the strongest long-context prefill gains and has a -2.7%
-generation point at 65k. Neither variant is promoted to the default policy; use
-them only for explicit eval runs.
-
-The routed-MoE Tensor projections are enabled by default from layer 35 for gate
-and down, and from layer 36 for up. Use `DS4_METAL_MPP_MOE_ENABLE=1`,
-route-specific enables, `DS4_METAL_MPP_FAST=1`, or `-mt on` to test wider
-windows; the earlier conservative window starts at layer 12 for down and layer
-15 for gate/up when routed-MoE Tensor is explicitly widened. For route
-isolation, use
-`DS4_METAL_MPP_MOE_GATE_ENABLE/DISABLE`,
-`DS4_METAL_MPP_MOE_UP_ENABLE/DISABLE`, and
-`DS4_METAL_MPP_MOE_DOWN_ENABLE/DISABLE`; `DS4_METAL_MPP_MOE_DISABLE=1`
-disables all routed-MoE Tensor projections. Set the common
-`DS4_METAL_MPP_MOE_FILTER` or route-specific
-`DS4_METAL_MPP_MOE_GATE_FILTER`, `DS4_METAL_MPP_MOE_UP_FILTER`, and
-`DS4_METAL_MPP_MOE_DOWN_FILTER` to `all`, `late_safe`, `none`, or
-comma-separated full-graph context substrings to localize safe layer windows.
-Use `layer=N` for an exact layer match or `layer=A..B` for an inclusive layer
-range when testing sparse Tensor windows. The same `<substring>@layer=A..B`
-syntax can restrict a context substring to a layer window.
-Set `DS4_METAL_MOE_STAGE_PROFILE=1` to split routed-MoE prefill into timed
-`map`, `gate`, `up`, `gate_up_pair`, `activation_weight`, `down`, and `sum`
-stages. Add `DS4_METAL_MOE_STAGE_PROFILE_FILTER=<substring>` to print only
-matching stages or layer context while still flushing every stage for correct
-timing.
-Set `DS4_METAL_FLASH_ATTN_STAGE_PROFILE=1` to split prefill FlashAttention into
-copy, mask, block-map, pad, attention, and reduce stages; add
-`DS4_METAL_FLASH_ATTN_STAGE_PROFILE_FILTER=<substring>` to limit printed rows
-while still flushing every stage.
-Set `DS4_METAL_MPP_MOE_TILE_N=64` to test the experimental wider routed-MoE
-Tensor token tile for performance against the default `32`. The routed-MoE
-Tensor path uses the faster first-PR threadgroup tensor layout by default inside
-the active routed-MoE windows; set `DS4_METAL_MPP_MOE_FAST_LAYOUT=0` to compare
-against the newer staged layout. Set
-`DS4_METAL_MPP_MOE_START_LAYER=N`, or the route-specific
-`DS4_METAL_MPP_MOE_GATE_START_LAYER`,
-`DS4_METAL_MPP_MOE_UP_START_LAYER`, and
-`DS4_METAL_MPP_MOE_DOWN_START_LAYER`, to test routed-MoE Tensor start layers; the
-resolved start layer also defines the route's default `late_safe` filter. Set
-`DS4_METAL_MPP_MOE_PAIR_GATE_UP=1` only to profile the experimental fused
-gate/up Tensor dispatch; it passes the current equivalence gate but is not a
-default path because it is slower than separate gate and up dispatches.
-
-For the common six-routed-expert prefill shape, the down-projection expert
-outputs are summed with a single Metal kernel instead of five chained add
-passes. Set `DS4_METAL_MOE_SUM6_DISABLE=1` to compare or temporarily disable
-that fused sum route.
-
-Long-context decode uses the indexed mixed-attention kernel once ratio-4
-compressed rows exceed the dense-attention window. The default decode
-specialization stages sixteen selected rows per threadgroup block; set
-`DS4_METAL_INDEXED_ATTN_RB4=1` to compare the older four-row staging variant.
-Set `DS4_METAL_DECODE_INDEXER_TOP_K` to a power of two from `4` through `512`
-to cap the decode indexer candidate count for speed/quality diagnostics. The
-normal non-quality decode path keeps the legacy dense-attention window until
-there are more than `1024` compressed rows, then selects `256` rows in sparse
-indexed attention. Set `DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD` to `64`,
-`128`, `256`, `512`, `1024`, `2048`, or `4096` to tune the sparse-decode
-crossover separately. `--quality` keeps the full `512` candidate path unless
-this environment override is set explicitly.
-
-The attention-output low-projection Tensor route applies to full 32-token
-multiples in all layers by default, using a 64-token Tensor tile by default and
-falling back to the existing indexed simdgroup kernel for shorter or
-non-32-multiple tails. Set
-`DS4_METAL_MPP_ATTN_OUT_ENABLE=1` or `DS4_METAL_MPP_ATTN_OUT_DISABLE=1` to
-isolate this route. Set `DS4_METAL_MPP_ATTN_OUT_FILTER=all`, `late_safe`,
-`none`, or a comma-separated list of full-graph context substrings such as
-`layer=42` to localize layer windows; `late_safe` keeps the old 32..42 default
-window for comparison. Layer filters are exact, and `layer=A..B` matches an
-inclusive range. Set
-`DS4_METAL_MPP_ATTN_OUT_TILE_N=32` to compare against the narrower Tensor token
-tile.
-The ratio-2 F16 compressor route can similarly be controlled with
-`DS4_METAL_MPP_F16_ENABLE=1` or `DS4_METAL_MPP_F16_DISABLE=1`.
-`DS4_METAL_MPP_F16_PAIR=1` tests a paired KV/gate compressor dispatch that keeps
-the standard simdgroup F16 matmul accumulation shape. It passes the current
-full-model equivalence gate, but the measured long-code prefill change was
-within noise (`~0.4%`), so it remains opt-in. `DS4_METAL_MPP_F16_WIDE=1` tests
-wider 512/1024-column compressor Tensor, including the paired Tensor route when both
-variables are set. The wide route is diagnostic only: the current long-code
-prompt fails full-model equivalence with wide F16 Tensor (`rms ~= 0.569`,
-`top20_max_abs ~= 1.48`), so it is not enabled by `auto`.
 
 ## CLI
 
@@ -856,31 +539,6 @@ Optionally make it the default Pi model in `~/.pi/agent/settings.json`:
   "defaultModel": "deepseek-v4-flash"
 }
 ```
-
-For **swival.dev**, point its generic OpenAI-compatible provider at the running server:
-
-```sh
-swival --provider generic \
-       --base-url http://127.0.0.1:8000/v1 \
-       --model deepseek-v4-flash \
-       --max-context-tokens 100000 \
-       --max-output-tokens 100000
-```
-
-`max-output-tokens` must be less than or equal to `max-context-tokens`.
-
-To toggle thinking mode, pass it through `--extra-body` rather than
-`--reasoning-effort` (ds4-server rejects swival's `none` and `minimal` levels
-and has no `max` choice in swival's enum):
-
-```sh
-swival --extra-body '{"thinking": false}' ...         # non-thinking
-swival --extra-body '{"thinking": true}' ...          # normal thinking (default)
-swival --extra-body '{"reasoning_effort": "max"}' ... # Think Max (server must be started with --ctx >= 393216, else it falls back to normal thinking)
-```
-
-Using `--model deepseek-chat` or `--model deepseek-reasoner` works as a
-shorthand for the first two.
 
 For **Codex CLI**, use the Responses wire API:
 
@@ -1153,16 +811,15 @@ support the CPU backend for reference/debug use and share the same KV session
 and snapshot format as Metal and CUDA, but normal inference should use Metal or
 CUDA.
 
-## Steering
+## Uncertainty Steering
 
-This project supports steering with single-vector activation directions; see the
-`dir-steering` directory for more information. This follows the core idea of the
+This branch includes an uncertainty direction for the CyberNeurova abliterated
+aligned-imatrix GGUF. The general mechanism is single-vector activation
+steering; see the `dir-steering` directory for vector generation and data
+details. It follows the core idea of the
 [Refusal in Language Models Is Mediated by a Single Direction](https://arxiv.org/abs/2406.11717)
-paper. You can use it to make the model more or less verbose, less likely to
-answer programming questions if it is a chatbot for your car rental web site,
-and so forth, much faster than fine-tuning.
-This is also useful for cybersecurity researchers who want to reduce a model's
-willingness to provide dual-use or offensive security guidance.
+paper, but the included vector is tuned as a branch-specific uncertainty and
+stakeholder-framing nudge rather than as a generic refusal direction.
 
 For `ds4-server`, directional steering defaults to the tool-safe
 `final-answer` policy: prompt prefill, thinking tokens, and DSML tool-call
