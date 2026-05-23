@@ -2113,7 +2113,8 @@ static void agent_stream_text(agent_stream_renderer *sr, const char *text, size_
 static void worker_progress_cb(void *ud, const char *event, int current, int total) {
     (void)total;
     agent_worker *w = ud;
-    if (!w || !event || strcmp(event, "prefill_chunk")) return;
+    if (!w || !event) return;
+    if (strcmp(event, "prefill_chunk") && strcmp(event, "prefill_display")) return;
     pthread_mutex_lock(&w->mu);
     int done = current - w->progress_base;
     if (done < 0) done = 0;
@@ -2495,8 +2496,12 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
 
     ds4_session_set_progress(w->session, publish_progress ? worker_progress_cb : NULL,
                              publish_progress ? w : NULL);
+    ds4_session_set_display_progress(w->session,
+                                     publish_progress ? worker_progress_cb : NULL,
+                                     publish_progress ? w : NULL);
     int rc = ds4_session_sync(w->session, tokens, err, err_len);
     ds4_session_set_progress(w->session, NULL, NULL);
+    ds4_session_set_display_progress(w->session, NULL, NULL);
     return rc;
 }
 
@@ -5313,8 +5318,10 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
                       summary_room : AGENT_COMPACT_SUMMARY_MAX_TOKENS;
 
     ds4_session_set_progress(w->session, worker_progress_cb, w);
+    ds4_session_set_display_progress(w->session, worker_progress_cb, w);
     if (ds4_session_sync(w->session, &prompt, err, err_len) != 0) {
         ds4_session_set_progress(w->session, NULL, NULL);
+        ds4_session_set_display_progress(w->session, NULL, NULL);
         ds4_session_invalidate(w->session);
         ds4_tokens_free(&prompt);
         ds4_tokens_free(&sys);
@@ -5322,6 +5329,7 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
         return false;
     }
     ds4_session_set_progress(w->session, NULL, NULL);
+    ds4_session_set_display_progress(w->session, NULL, NULL);
 
     /* From here until the final rebuild, the live KV contains the internal
      * compaction prompt/summary, while w->transcript still contains the real
@@ -5512,12 +5520,15 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
 
         char err[160];
         ds4_session_set_progress(w->session, worker_progress_cb, w);
+        ds4_session_set_display_progress(w->session, worker_progress_cb, w);
         if (ds4_session_sync(w->session, prompt_for_sync, err, sizeof(err)) != 0) {
             ds4_session_set_progress(w->session, NULL, NULL);
+            ds4_session_set_display_progress(w->session, NULL, NULL);
             agent_set_error(w, err);
             return 1;
         }
         ds4_session_set_progress(w->session, NULL, NULL);
+        ds4_session_set_display_progress(w->session, NULL, NULL);
 
         int max_tokens = cfg->gen.n_predict;
         int room = ds4_session_ctx(w->session) - ds4_session_pos(w->session);
@@ -5914,12 +5925,17 @@ static void agent_format_ctx_size(int ctx_size, char *buf, size_t len);
 #define AGENT_STATUS_BAR_FILL "\x1b[48;5;238;38;5;201;1m"
 #define AGENT_QUEUE_STYLE "\x1b[38;5;87;1m"
 #define AGENT_STATUS_REDRAW_INTERVAL_SEC 0.20
+#define AGENT_PROGRESS_BAR_WIDTH 32
+#define AGENT_PROGRESS_BAR_MAX_BYTES 256
 
 static void agent_progress_append(char *buf, size_t len, size_t *pos,
                                   const char *s) {
-    if (*pos >= len) return;
-    int n = snprintf(buf + *pos, len - *pos, "%s", s);
-    if (n > 0) *pos += (size_t)n;
+    if (len == 0 || *pos >= len - 1) return;
+    size_t avail = len - *pos;
+    int n = snprintf(buf + *pos, avail, "%s", s);
+    if (n <= 0) return;
+    if ((size_t)n >= avail) *pos = len - 1;
+    else *pos += (size_t)n;
 }
 
 static void build_prompt_text(const agent_status *st, char *buf, size_t len) {
@@ -5929,19 +5945,18 @@ static void build_prompt_text(const agent_status *st, char *buf, size_t len) {
 
 static void agent_progress_bar(int done, int total, char *buf, size_t len,
                                bool color) {
-    const int width = 20;
     if (len == 0) return;
     if (total <= 0) total = 1;
     if (done < 0) done = 0;
     if (done > total) done = total;
-    int filled = (int)(((long long)done * width) / total);
+    int filled = (int)(((long long)done * AGENT_PROGRESS_BAR_WIDTH) / total);
     if (filled < 0) filled = 0;
-    if (filled > width) filled = width;
+    if (filled > AGENT_PROGRESS_BAR_WIDTH) filled = AGENT_PROGRESS_BAR_WIDTH;
     if (color && filled == 0 && done < total) filled = 1;
     size_t pos = 0;
     agent_progress_append(buf, len, &pos, "[");
     if (color) agent_progress_append(buf, len, &pos, AGENT_STATUS_BAR_FILL);
-    for (int i = 0; i < width && pos + 1 < len; i++) {
+    for (int i = 0; i < AGENT_PROGRESS_BAR_WIDTH && pos + 1 < len; i++) {
         if (color && i == filled) {
             agent_progress_append(buf, len, &pos, AGENT_STATUS_STYLE_START);
         }
@@ -5965,7 +5980,7 @@ static void build_status_text(const agent_status *st, char *buf, size_t len) {
         int total = st->prefill_total > 0 ? st->prefill_total : 1;
         if (done > total) done = total;
         double pct = 100.0 * (double)done / (double)total;
-        char bar[128];
+        char bar[AGENT_PROGRESS_BAR_MAX_BYTES];
         agent_progress_bar(done, total, bar, sizeof(bar), stdout_is_tty());
         snprintf(buf, len, "ctx %s/%s | prefill %s %d/%d %.1f%%",
                  used, total_ctx, bar, done, total, pct);

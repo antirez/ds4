@@ -154,6 +154,9 @@ void ds4_session_free(ds4_session *s);
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
 void ds4_session_set_directional_steering(ds4_session *s, float attn, float ffn);
 void ds4_session_use_engine_directional_steering(ds4_session *s);
+/* UI-only progress. It may report fine-grained progress inside a prefill chunk;
+ * callers must not treat it as a durable KV checkpoint boundary. */
+void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
 
 typedef enum {
     DS4_SESSION_REWRITE_ERROR = -1,

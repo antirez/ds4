@@ -9348,6 +9348,32 @@ static int ds4_gpu_encode_cpy_f16_f32_1d(
     return 1;
 }
 
+static int ds4_gpu_encode_copy_to_f16_1d(
+        id<MTLCommandBuffer> cb,
+        id<MTLBuffer>        src,
+        NSUInteger           src_off,
+        bool                 src_is_f16,
+        id<MTLBuffer>        dst,
+        NSUInteger           dst_off,
+        uint32_t             n) {
+    if (!cb || !src || !dst) return 0;
+    if (n == 0) return 1;
+    if (!src_is_f16) {
+        return ds4_gpu_encode_cpy_f32_f16_1d(cb, src, src_off, dst, dst_off, n);
+    }
+
+    if (g_batch_cb && cb == g_batch_cb) ds4_gpu_close_batch_encoder();
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    if (!blit) return 0;
+    [blit copyFromBuffer:src
+            sourceOffset:src_off
+                toBuffer:dst
+       destinationOffset:dst_off
+                    size:(NSUInteger)n * sizeof(uint16_t)];
+    [blit endEncoding];
+    return 1;
+}
+
 static int ds4_gpu_encode_fill_f16_1d(
         id<MTLCommandBuffer> cb,
         id<MTLBuffer>        buf,
@@ -9698,6 +9724,7 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
+        uint32_t               comp_kv_f16,
         const ds4_gpu_tensor *comp_mask,
         uint32_t               use_comp_mask,
         uint32_t               n_tokens,
@@ -9720,7 +9747,8 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long
     id<MTLBuffer> headsbuf = ds4_gpu_tensor_buffer(heads);
     const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
     const uint64_t raw_bytes = (uint64_t)n_tokens * head_dim * sizeof(float);
-    const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
+    const uint64_t comp_bytes = (uint64_t)n_comp * head_dim *
+                                (comp_kv_f16 ? sizeof(uint16_t) : sizeof(float));
     const uint64_t comp_mask_bytes = use_comp_mask ? (uint64_t)n_comp * n_tokens * sizeof(float) : 0u;
     if (!qbuf || !rawbuf || !compbuf || !maskbuf || !headsbuf || !sinks_buf ||
         ds4_gpu_tensor_bytes(q) < q_bytes ||
@@ -9799,12 +9827,13 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long
     }
     DS4_METAL_PROFILE_FLASH_ATTN_STAGE("copy_raw");
     if (n_comp &&
-        !ds4_gpu_encode_cpy_f32_f16_1d(cb,
-                                         compbuf,
-                                         ds4_gpu_tensor_offset(comp_kv),
-                                         g_flash_attn_kv_buffer,
-                                         (NSUInteger)n_tokens * row_bytes_f16,
-                                         n_comp * head_dim)) {
+        !ds4_gpu_encode_copy_to_f16_1d(cb,
+                                       compbuf,
+                                       ds4_gpu_tensor_offset(comp_kv),
+                                       comp_kv_f16 != 0,
+                                       g_flash_attn_kv_buffer,
+                                       (NSUInteger)n_tokens * row_bytes_f16,
+                                       n_comp * head_dim)) {
         return 0;
     }
     if (n_comp) {
@@ -9970,6 +9999,7 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_vec(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
+        uint32_t               comp_kv_f16,
         const ds4_gpu_tensor *comp_mask,
         uint32_t               use_comp_mask,
         uint32_t               n_tokens,
@@ -9992,7 +10022,8 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_vec(
     id<MTLBuffer> headsbuf = ds4_gpu_tensor_buffer(heads);
     const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
     const uint64_t raw_bytes = (uint64_t)n_tokens * head_dim * sizeof(float);
-    const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
+    const uint64_t comp_bytes = (uint64_t)n_comp * head_dim *
+                                (comp_kv_f16 ? sizeof(uint16_t) : sizeof(float));
     const uint64_t comp_mask_bytes = use_comp_mask ? (uint64_t)n_comp * n_tokens * sizeof(float) : 0u;
     if (!qbuf || !rawbuf || !compbuf || !maskbuf || !headsbuf || !sinks_buf ||
         ds4_gpu_tensor_bytes(q) < q_bytes ||
@@ -10071,12 +10102,13 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_vec(
     }
     DS4_METAL_PROFILE_FLASH_ATTN_STAGE("copy_raw");
     if (n_comp) {
-        if (!ds4_gpu_encode_cpy_f32_f16_1d(cb,
-                                             compbuf,
-                                             ds4_gpu_tensor_offset(comp_kv),
-                                             g_flash_attn_kv_buffer,
-                                             (NSUInteger)n_tokens * row_bytes_f16,
-                                             n_comp * head_dim)) {
+        if (!ds4_gpu_encode_copy_to_f16_1d(cb,
+                                           compbuf,
+                                           ds4_gpu_tensor_offset(comp_kv),
+                                           comp_kv_f16 != 0,
+                                           g_flash_attn_kv_buffer,
+                                           (NSUInteger)n_tokens * row_bytes_f16,
+                                           n_comp * head_dim)) {
             return 0;
         }
         DS4_METAL_PROFILE_FLASH_ATTN_STAGE("copy_comp");
@@ -10233,6 +10265,7 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
+        uint32_t               comp_kv_f16,
         const ds4_gpu_tensor *comp_mask,
         uint32_t               use_comp_mask,
         uint32_t               n_tokens,
@@ -10249,6 +10282,7 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec(
                                                                                        q,
                                                                                        raw_kv,
                                                                                        comp_kv,
+                                                                                       comp_kv_f16,
                                                                                        comp_mask,
                                                                                        use_comp_mask,
                                                                                        n_tokens,
@@ -10265,6 +10299,7 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec(
                                                                            q,
                                                                            raw_kv,
                                                                            comp_kv,
+                                                                           comp_kv_f16,
                                                                            comp_mask,
                                                                            use_comp_mask,
                                                                            n_tokens,
@@ -10748,6 +10783,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         uint32_t               raw_cap,
         uint32_t               raw_start,
         const ds4_gpu_tensor *comp_kv,
+        uint32_t               comp_kv_f16,
         uint32_t               n_comp,
         const ds4_gpu_tensor *comp_mask,
         uint32_t               use_mask,
@@ -10766,7 +10802,8 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     id<MTLBuffer> maskbuf = use_mask ? ds4_gpu_tensor_buffer(comp_mask) : nil;
     const uint64_t q_bytes = (uint64_t)n_head * head_dim * sizeof(float);
     const uint64_t raw_bytes = (uint64_t)raw_cap * head_dim * sizeof(float);
-    const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
+    const uint64_t comp_bytes = (uint64_t)n_comp * head_dim *
+                                (comp_kv_f16 ? sizeof(uint16_t) : sizeof(float));
     const uint64_t comp_mask_bytes = use_mask ? (uint64_t)n_comp * sizeof(float) : 0u;
     if (!qbuf || !rawbuf || !headsbuf || !sinks_buf ||
         (n_comp && !compbuf) ||
@@ -10871,12 +10908,13 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         return 0;
     }
     if (n_comp) {
-        if (!ds4_gpu_encode_cpy_f32_f16_1d(cb,
-                                             compbuf,
-                                             ds4_gpu_tensor_offset(comp_kv),
-                                             g_flash_attn_kv_buffer,
-                                             (NSUInteger)n_raw * row_bytes_f16,
-                                             n_comp * head_dim)) {
+        if (!ds4_gpu_encode_copy_to_f16_1d(cb,
+                                           compbuf,
+                                           ds4_gpu_tensor_offset(comp_kv),
+                                           comp_kv_f16 != 0,
+                                           g_flash_attn_kv_buffer,
+                                           (NSUInteger)n_raw * row_bytes_f16,
+                                           n_comp * head_dim)) {
             return 0;
         }
     }
@@ -11243,6 +11281,7 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
+        uint32_t               comp_kv_f16,
         const ds4_gpu_tensor *comp_mask,
         uint32_t               use_comp_mask,
         uint32_t               n_tokens,
@@ -11285,7 +11324,8 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
     id<MTLBuffer> headsbuf = ds4_gpu_tensor_buffer(heads);
     const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
     const uint64_t raw_bytes = (uint64_t)raw_cap * head_dim * sizeof(float);
-    const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
+    const uint64_t comp_bytes = (uint64_t)n_comp * head_dim *
+                                (comp_kv_f16 ? sizeof(uint16_t) : sizeof(float));
     const uint64_t comp_mask_bytes = use_comp_mask ? (uint64_t)n_comp * n_tokens * sizeof(float) : 0u;
     if (!qbuf || !rawbuf || !compbuf || !maskbuf || !headsbuf || !sinks_buf ||
         ds4_gpu_tensor_bytes(q) < q_bytes ||
@@ -11370,12 +11410,13 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
                                          g_flash_attn_kv_buffer,
                                          0,
                                          n_raw * head_dim) ||
-        !ds4_gpu_encode_cpy_f32_f16_1d(cb,
-                                         compbuf,
-                                         ds4_gpu_tensor_offset(comp_kv),
-                                         g_flash_attn_kv_buffer,
-                                         (NSUInteger)n_raw * row_bytes_f16,
-                                         n_comp * head_dim)) {
+        !ds4_gpu_encode_copy_to_f16_1d(cb,
+                                       compbuf,
+                                       ds4_gpu_tensor_offset(comp_kv),
+                                       comp_kv_f16 != 0,
+                                       g_flash_attn_kv_buffer,
+                                       (NSUInteger)n_raw * row_bytes_f16,
+                                       n_comp * head_dim)) {
         return 0;
     }
 
@@ -11644,6 +11685,7 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
+        uint32_t                comp_kv_f16,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
         uint32_t                n_tokens,
@@ -11688,6 +11730,7 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
                                                                        q,
                                                                        raw_kv,
                                                                        comp_kv,
+                                                                       comp_kv_f16,
                                                                        comp_mask,
                                                                        use_comp_mask,
                                                                        n_tokens,
@@ -11883,6 +11926,7 @@ int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
+        uint32_t                comp_kv_f16,
         uint32_t                n_tokens,
         uint32_t                n_comp,
         uint32_t                window,
@@ -11919,6 +11963,7 @@ int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
                                                                                 q,
                                                                                 raw_kv,
                                                                                 comp_kv,
+                                                                                comp_kv_f16,
                                                                                 NULL,
                                                                                 0,
                                                                                 n_tokens,
@@ -11944,6 +11989,7 @@ int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
+        uint32_t                comp_kv_f16,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                n_tokens,
         uint32_t                n_comp,
@@ -11981,6 +12027,7 @@ int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
                                                                                 q,
                                                                                 raw_kv,
                                                                                 comp_kv,
+                                                                                comp_kv_f16,
                                                                                 comp_mask,
                                                                                 1,
                                                                                 n_tokens,
@@ -12009,6 +12056,7 @@ int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                raw_cap,
         uint32_t                raw_start,
         const ds4_gpu_tensor *comp_kv,
+        uint32_t                comp_kv_f16,
         uint32_t                n_comp,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_mask,
@@ -12027,7 +12075,8 @@ int ds4_gpu_attention_decode_heads_tensor(
     @autoreleasepool {
         const uint64_t q_bytes = (uint64_t)n_head * head_dim * sizeof(float);
         const uint64_t raw_bytes = (uint64_t)raw_cap * head_dim * sizeof(float);
-        const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
+        const uint64_t comp_bytes = (uint64_t)n_comp * head_dim *
+                                    (comp_kv_f16 ? sizeof(uint16_t) : sizeof(float));
         const uint64_t sink_bytes = (uint64_t)n_head * sizeof(float);
         if (sinks_offset > model_size || sink_bytes > model_size - sinks_offset) {
             fprintf(stderr, "ds4: Metal graph attention heads sink range is outside the mapped model\n");
@@ -12091,6 +12140,7 @@ int ds4_gpu_attention_decode_heads_tensor(
                                                              raw_cap,
                                                              raw_start,
                                                              comp_kv,
+                                                             comp_kv_f16,
                                                              n_comp,
                                                              comp_mask,
                                                              use_mask,
