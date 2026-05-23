@@ -8658,6 +8658,38 @@ static void metal_graph_debug_dump_tensor(
     }
 }
 
+static void metal_graph_debug_dump_f16_tensor(
+        const char       *name,
+        ds4_gpu_tensor *t,
+        uint64_t          n_f16,
+        uint32_t          il,
+        uint32_t          pos) {
+    const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
+    if (!t || n_f16 == 0 || !metal_graph_debug_wants(name, il, pos)) return;
+
+    if (ds4_gpu_synchronize() == 0) {
+        fprintf(stderr, "ds4: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
+        return;
+    }
+
+    uint16_t *hbuf = xmalloc((size_t)n_f16 * sizeof(hbuf[0]));
+    float *fbuf = xmalloc((size_t)n_f16 * sizeof(fbuf[0]));
+    if (ds4_gpu_tensor_read(t, 0, hbuf, n_f16 * sizeof(hbuf[0])) != 0) {
+        for (uint64_t i = 0; i < n_f16; i++) fbuf[i] = f16_to_f32(hbuf[i]);
+        char path[1024];
+        snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
+        if (write_f32_binary_file(path, fbuf, n_f16)) {
+            fprintf(stderr, "ds4: dumped %s layer %u pos %u to %s\n", name, il, pos, path);
+        }
+    }
+    free(fbuf);
+    free(hbuf);
+
+    if (ds4_gpu_begin_commands() == 0) {
+        fprintf(stderr, "ds4: failed to resume Metal command batch after dumping %s layer %u pos %u\n", name, il, pos);
+    }
+}
+
 static void metal_graph_debug_dump_i32_tensor(
         const char       *name,
         ds4_gpu_tensor *t,
@@ -12915,8 +12947,14 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EXPERT_USED * down_in_dim, il, pos0);
     }
     if (ok) {
-        metal_graph_debug_dump_tensor("ffn_moe_weighted_swiglu", g->batch_routed_mid,
-                                      (uint64_t)n_tokens * DS4_N_EXPERT_USED * down_in_dim, il, pos0);
+        const uint64_t routed_mid_elems = (uint64_t)n_tokens * DS4_N_EXPERT_USED * down_in_dim;
+        if (g->batch_routed_mid_is_f16) {
+            metal_graph_debug_dump_f16_tensor("ffn_moe_weighted_swiglu", g->batch_routed_mid,
+                                              routed_mid_elems, il, pos0);
+        } else {
+            metal_graph_debug_dump_tensor("ffn_moe_weighted_swiglu", g->batch_routed_mid,
+                                          routed_mid_elems, il, pos0);
+        }
     }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_down", g->batch_routed_down,

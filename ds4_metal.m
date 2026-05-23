@@ -802,8 +802,17 @@ static int ds4_gpu_mpp_routed_moe_default_target(void) {
 
 static int ds4_gpu_mpp_routed_moe_stage_mask(void) {
     if (!ds4_gpu_mpp_routed_moe_default_target()) return 0;
-    return DS4_METAL_MOE_MPP_GATE |
-           DS4_METAL_MOE_MPP_UP |
+    /*
+     * Keep TensorOps on every routed-MoE layer, but do not put both SwiGLU
+     * operands on TensorOps.  The gate and up projections feed
+     * silu(gate) * up; each TensorOps projection is locally close to the legacy
+     * simdgroup path, but moving both operands changes the product enough to
+     * flip later router top-k decisions.  Once a router changes experts the
+     * graph diverges discontinuously and can fall into repetition on sensitive
+     * prompts.  Accelerating only the linear up operand, plus the down
+     * projection, keeps the retained speedup without relying on layer cutoffs.
+     */
+    return DS4_METAL_MOE_MPP_UP |
            DS4_METAL_MOE_MPP_DOWN;
 }
 
