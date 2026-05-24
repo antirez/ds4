@@ -1390,6 +1390,12 @@ kernel void kernel_dsv4_attention_decode_h8_turbo3_f32(
             // 4. Accumulate weighted V into per-thread acc.
             for (uint j = 0; j < tile_rows; j++) {
                 const float w = scores_chunk[j];
+                /* Sparse V (TQ+ paper, "Why V is Free, K is Everything"):
+                 * skip rows whose softmax weight is negligible.  No PPL
+                 * impact since the contribution `w * V` is below fp16
+                 * mantissa precision; ~22.8% decode win on Tom's TQ+
+                 * Metal MoE at 32K context. */
+                if (w < 1.0e-6f) continue;
                 threadgroup const half *kvrow = kv_tile_h + (ulong)j * 512u;
                 for (uint i = 0; i < DIMS_PER_THREAD; i++) {
                     acc[i] += w * (float)kvrow[my_d0 + i];
@@ -1417,8 +1423,17 @@ kernel void kernel_dsv4_attention_decode_h8_turbo3_f32(
         const float ms = (isinf(M) && M < 0.0f) ? 0.0f : precise::exp(M - M_new);
         const float vs = precise::exp(s_full - M_new);
         L = L * ms + vs;
-        for (uint i = 0; i < DIMS_PER_THREAD; i++) {
-            acc[i] = acc[i] * ms + vs * (float)kvrow[my_d0 + i];
+        /* Sparse V: when vs is below noise threshold, skip the device-
+         * memory V reads (kvrow accesses) for this row.  acc still gets
+         * scaled by ms - only the `+ vs * V` contribution drops out. */
+        if (vs < 1.0e-6f) {
+            for (uint i = 0; i < DIMS_PER_THREAD; i++) {
+                acc[i] *= ms;
+            }
+        } else {
+            for (uint i = 0; i < DIMS_PER_THREAD; i++) {
+                acc[i] = acc[i] * ms + vs * (float)kvrow[my_d0 + i];
+            }
         }
         M = M_new;
     }
@@ -1597,6 +1612,12 @@ kernel void kernel_dsv4_attention_decode_h8_turbo4_f32(
             for (uint i = 0; i < DIMS_PER_THREAD; i++) acc[i] *= ms;
             for (uint j = 0; j < tile_rows; j++) {
                 const float w = scores_chunk[j];
+                /* Sparse V (TQ+ paper, "Why V is Free, K is Everything"):
+                 * skip rows whose softmax weight is negligible.  No PPL
+                 * impact since the contribution `w * V` is below fp16
+                 * mantissa precision; ~22.8% decode win on Tom's TQ+
+                 * Metal MoE at 32K context. */
+                if (w < 1.0e-6f) continue;
                 threadgroup const half *kvrow = kv_tile_h + (ulong)j * 512u;
                 for (uint i = 0; i < DIMS_PER_THREAD; i++) {
                     acc[i] += w * (float)kvrow[my_d0 + i];
@@ -1623,8 +1644,17 @@ kernel void kernel_dsv4_attention_decode_h8_turbo4_f32(
         const float ms = (isinf(M) && M < 0.0f) ? 0.0f : precise::exp(M - M_new);
         const float vs = precise::exp(s_full - M_new);
         L = L * ms + vs;
-        for (uint i = 0; i < DIMS_PER_THREAD; i++) {
-            acc[i] = acc[i] * ms + vs * (float)kvrow[my_d0 + i];
+        /* Sparse V: when vs is below noise threshold, skip the device-
+         * memory V reads (kvrow accesses) for this row.  acc still gets
+         * scaled by ms - only the `+ vs * V` contribution drops out. */
+        if (vs < 1.0e-6f) {
+            for (uint i = 0; i < DIMS_PER_THREAD; i++) {
+                acc[i] *= ms;
+            }
+        } else {
+            for (uint i = 0; i < DIMS_PER_THREAD; i++) {
+                acc[i] = acc[i] * ms + vs * (float)kvrow[my_d0 + i];
+            }
         }
         M = M_new;
     }
