@@ -13407,3 +13407,43 @@ extern "C" int ds4_gpu_attention_prefill_raw_turbo4_heads_tensor(
     return 0;
 }
 
+
+/* h8 Flash kernel CUDA stubs.  The h8 head-batched Flash attention is a
+ * Mac-only Apple9-specific optimization for the scalar-vs-tensor-core
+ * architectural gap.  Returning 0 lets the dispatcher fall through to the
+ * existing CUDA inline-dequant turbo3/turbo4 path which already matches fp8
+ * at decode T=1 on GX10. */
+
+extern "C" int ds4_gpu_attention_decode_h8_turbo3_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_bytes, uint64_t row_bytes,
+        const ds4_gpu_tensor *comp_kv, uint32_t comp_kv_f16,
+        const ds4_gpu_tensor *comp_mask, uint32_t use_comp_mask,
+        uint32_t n_tokens, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap,
+        uint32_t raw_start, uint32_t n_comp, uint32_t window, uint32_t ratio,
+        uint32_t n_head, uint32_t head_dim, uint32_t n_rot) {
+    (void)heads; (void)model_map; (void)model_size; (void)sinks_offset; (void)q;
+    (void)raw_kv_bytes; (void)row_bytes; (void)comp_kv; (void)comp_kv_f16;
+    (void)comp_mask; (void)use_comp_mask; (void)n_tokens; (void)pos0;
+    (void)n_raw; (void)raw_cap; (void)raw_start; (void)n_comp; (void)window;
+    (void)ratio; (void)n_head; (void)head_dim; (void)n_rot;
+    return 0;
+}
+
+extern "C" int ds4_gpu_attention_decode_h8_turbo4_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_bytes, uint64_t row_bytes,
+        const ds4_gpu_tensor *comp_kv, uint32_t comp_kv_f16,
+        const ds4_gpu_tensor *comp_mask, uint32_t use_comp_mask,
+        uint32_t n_tokens, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap,
+        uint32_t raw_start, uint32_t n_comp, uint32_t window, uint32_t ratio,
+        uint32_t n_head, uint32_t head_dim, uint32_t n_rot) {
+    (void)heads; (void)model_map; (void)model_size; (void)sinks_offset; (void)q;
+    (void)raw_kv_bytes; (void)row_bytes; (void)comp_kv; (void)comp_kv_f16;
+    (void)comp_mask; (void)use_comp_mask; (void)n_tokens; (void)pos0;
+    (void)n_raw; (void)raw_cap; (void)raw_start; (void)n_comp; (void)window;
+    (void)ratio; (void)n_head; (void)head_dim; (void)n_rot;
+    return 0;
+}

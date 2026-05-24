@@ -2586,7 +2586,12 @@ uint64_t ds4_kv_row_bytes(uint32_t head_dim, uint32_t n_rot, ds4_kv_dtype dtype)
     if (dtype == DS4_KV_TURBO3 || dtype == DS4_KV_TURBO4) {
         const uint32_t n_nope = head_dim - n_rot;
         const uint32_t n_groups = (n_nope + DS4_TURBO3_GROUP_SIZE - 1u) / DS4_TURBO3_GROUP_SIZE;
-        const uint64_t bits_per_elem = (dtype == DS4_KV_TURBO4) ? 4u : 3u;
+        uint64_t bits_per_elem;
+        switch (dtype) {
+            case DS4_KV_TURBO4: bits_per_elem = 4u; break;
+            case DS4_KV_TURBO3: bits_per_elem = 3u; break;
+            default:            bits_per_elem = 3u; break;
+        }
         const uint64_t data_bytes = ((uint64_t)n_nope * bits_per_elem + 7u) / 8u;
         const uint64_t scale_bytes = (uint64_t)n_groups;
         const uint64_t rope_bytes = (uint64_t)n_rot * sizeof(float);
@@ -11101,17 +11106,26 @@ static bool metal_graph_encode_decode_layer(
              * when raw_count exceeds the inline gate
              * (DS4_METAL_TURBO{3,4}_INLINE_THRESH). */
             const uint64_t row_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, g_ds4_kv_dtype);
-            int rc = (g_ds4_kv_dtype == DS4_KV_TURBO3)
-                    ? ds4_gpu_attention_decode_heads_turbo3_tensor(
-                            g->heads, model->map, model->size,
-                            layer->attn_sinks->abs_offset,
-                            g->q, raw_cache, row_bytes, n_raw,
-                            raw_cap, raw_start,
-                            n_comp ? comp_cache : NULL,
-                            metal_graph_attn_comp_cache_is_f16(),
-                            n_comp, NULL, 0,
-                            DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT)
-                    : ds4_gpu_attention_decode_heads_turbo4_tensor(
+            int rc = 0;
+            if (g_ds4_kv_dtype == DS4_KV_TURBO3) {
+                /* Try the h8 head-batched Flash kernel first (env-gated,
+                 * default-on).  Returns 0 if disabled or unsupported config
+                 * -> falls back to the per-head inline-dequant launcher. */
+                rc = ds4_gpu_attention_decode_h8_turbo3_tensor(
+                        g->heads, model->map, model->size,
+                        layer->attn_sinks->abs_offset,
+                        g->q, raw_cache, row_bytes,
+                        n_comp ? comp_cache : NULL,
+                        metal_graph_attn_comp_cache_is_f16(),
+                        NULL, 0,
+                        /* n_tokens */ 1u,
+                        /* pos0    */ 0u,
+                        n_raw, raw_cap, raw_start, n_comp,
+                        /* window  */ 0u,
+                        /* ratio   */ 0u,
+                        DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
+                if (rc == 0) {
+                    rc = ds4_gpu_attention_decode_heads_turbo3_tensor(
                             g->heads, model->map, model->size,
                             layer->attn_sinks->abs_offset,
                             g->q, raw_cache, row_bytes, n_raw,
@@ -11120,6 +11134,31 @@ static bool metal_graph_encode_decode_layer(
                             metal_graph_attn_comp_cache_is_f16(),
                             n_comp, NULL, 0,
                             DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
+                }
+            } else if (g_ds4_kv_dtype == DS4_KV_TURBO4) {
+                rc = ds4_gpu_attention_decode_h8_turbo4_tensor(
+                        g->heads, model->map, model->size,
+                        layer->attn_sinks->abs_offset,
+                        g->q, raw_cache, row_bytes,
+                        n_comp ? comp_cache : NULL,
+                        metal_graph_attn_comp_cache_is_f16(),
+                        NULL, 0,
+                        /* n_tokens */ 1u, /* pos0 */ 0u,
+                        n_raw, raw_cap, raw_start, n_comp,
+                        /* window */ 0u, /* ratio */ 0u,
+                        DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
+                if (rc == 0) {
+                    rc = ds4_gpu_attention_decode_heads_turbo4_tensor(
+                            g->heads, model->map, model->size,
+                            layer->attn_sinks->abs_offset,
+                            g->q, raw_cache, row_bytes, n_raw,
+                            raw_cap, raw_start,
+                            n_comp ? comp_cache : NULL,
+                            metal_graph_attn_comp_cache_is_f16(),
+                            n_comp, NULL, 0,
+                            DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
+                }
+            }
             if (rc == 0) {
                 ds4_gpu_tensor *raw_cache_attn = ds4_gpu_kv_attention_view_dispatch(
                         raw_cache, dequant_scratch,
@@ -19069,12 +19108,6 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (e->power_percent > 100) e->power_percent = 100;
     e->kv_dtype = opt->kv_dtype;
     ds4_kv_set_active_dtype(e->kv_dtype);
-    /* turbo3 KV on Metal: pack/dequant + float-sim quantize round trip ship
-     * here; the inline-dequant attention kernels are CUDA-only.  On Metal
-     * the turbo3 attention launchers return 0 and the fallback paths use
-     * view_dispatch (dequant to scratch) + the stock Metal fp8 attention
-     * kernels.  Correct with full 4.75x memory savings on Metal but the
-     * dequant-to-scratch hop costs ~13% gen_tps vs fp8. */
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
     e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
