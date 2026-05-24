@@ -13,6 +13,18 @@ static const char *test_model_path(void) {
     return (model_path && model_path[0]) ? model_path : "ds4flash.gguf";
 }
 
+static int test_power_percent(void) {
+    const char *power = getenv("DS4_TEST_POWER");
+    if (!power || !power[0]) return 0;
+
+    char *end = NULL;
+    long value = strtol(power, &end, 10);
+    TEST_ASSERT(end && *end == '\0');
+    TEST_ASSERT(value >= 1 && value <= 100);
+    if (!end || *end != '\0' || value < 1 || value > 100) return 0;
+    return (int)value;
+}
+
 static char *test_save_env(const char *name) {
     const char *value = getenv(name);
     if (!value) return NULL;
@@ -43,6 +55,7 @@ static ds4_engine *test_open_engine(bool quality) {
         .backend = DS4_BACKEND_CUDA,
 #endif
         .quality = quality,
+        .power_percent = test_power_percent(),
     };
     TEST_ASSERT(ds4_engine_open(&engine, &opt) == 0);
     return engine;
@@ -1431,6 +1444,7 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");
     puts("  DS4_TEST_VECTOR_FILE=FILE  Simple official-vector fixture.");
     puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
+    puts("  DS4_TEST_POWER=N           GPU duty cycle percentage for test engines, 1..100.");
 }
 
 static const ds4_test_entry *test_find_entry(const char *arg) {

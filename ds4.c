@@ -521,6 +521,7 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
+#ifndef DS4_NO_GPU
 static void sleep_sec(double sec) {
     if (sec <= 0.0 || !isfinite(sec)) return;
     struct timespec req;
@@ -534,6 +535,7 @@ static void sleep_sec(double sec) {
     /* Do not resume after EINTR: Ctrl+C should cut through throttling sleeps. */
     (void)nanosleep(&req, &req);
 }
+#endif
 
 static const char *ds4_log_color_code(ds4_log_type type) {
     switch (type) {
