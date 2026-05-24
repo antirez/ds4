@@ -634,7 +634,7 @@ static void cpu_directional_steering_project_rows(
 
 typedef void (*ds4_parallel_fn)(void *ctx, uint64_t row0, uint64_t row1);
 
-#define DS4_MAX_THREADS 32
+#define DS4_MAX_THREADS 64
 
 typedef struct {
     pthread_t threads[DS4_MAX_THREADS];
@@ -706,7 +706,7 @@ static void ds4_threads_init(void) {
     uint32_t n_threads = 12;
     const long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
     if (online_cpus > 0) {
-        n_threads = online_cpus < 12 ? (uint32_t)online_cpus : 12;
+        n_threads = online_cpus < DS4_MAX_THREADS ? (uint32_t)online_cpus : DS4_MAX_THREADS;
     }
 
     const char *env = getenv("DS4_THREADS");
@@ -733,6 +733,7 @@ static void ds4_threads_init(void) {
             ds4_die("failed to create worker thread");
         }
     }
+    fprintf(stderr, "================================ Using %d threads\n", n_threads);
 }
 
 static void ds4_threads_shutdown(void) {
