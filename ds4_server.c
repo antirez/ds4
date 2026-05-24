@@ -4429,6 +4429,8 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
     if (require_thinking_closed) {
         const char *think_end = find_last_substr(text, "</think>");
         if (!think_end) {
+            /* Model did not close thinking, ignore any DSML in reasoning */
+            fprintf(stderr, "ds4-server: thinking not closed, ignoring DSML in reasoning\n");
             split_reasoning_content(text, strlen(text), content_out, reasoning_out);
             return true;
         }
@@ -4591,6 +4593,70 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
     }
 }
 
+/* Try to repair a truncated DSML block.
+ *
+ * DSML nesting order is: tool_calls > invoke > parameter.
+ * Single-pass scan: count opens vs closes, then append missing closing tags.
+ *
+ * Returns true if repair was applied, false if the text had no recognizable DSML
+ * or was already balanced.  This deliberately does not rewrite malformed but
+ * balanced DSML into assistant text; semantic recovery belongs to the model. */
+static bool try_repair_dsml(const char *s, size_t len, buf *out) {
+    if (!s || !len) return false;
+
+    /* Only scan DSML tags after the last </think>.  DSML mentioned inside
+     * reasoning is not executable — it inflates tag counts and causes false
+     * positive repairs.  If no </think> is found, scan from the start
+     * (thinking mode is not active or thinking was never opened). */
+    const char *think_end = find_last_substr(s, "</think>");
+    const char *scan_start = think_end ? (think_end + 8) : s;
+    size_t scan_len = (size_t)((s + len) - scan_start);
+
+    /* Detect style from first <tool_calls> tag */
+    const char *ts, *te, *is, *ie, *ps, *pe;
+    if (strstr(scan_start, DS4_TOOL_CALLS_START)) {
+        ts = DS4_TOOL_CALLS_START;  te = DS4_TOOL_CALLS_END;
+        is = DS4_INVOKE_START;      ie = DS4_INVOKE_END;
+        ps = DS4_PARAM_START;       pe = DS4_PARAM_END;
+    } else if (strstr(scan_start, DS4_TOOL_CALLS_START_SHORT)) {
+        ts = DS4_TOOL_CALLS_START_SHORT;  te = DS4_TOOL_CALLS_END_SHORT;
+        is = DS4_INVOKE_START_SHORT;      ie = DS4_INVOKE_END_SHORT;
+        ps = DS4_PARAM_START_SHORT;       pe = DS4_PARAM_END_SHORT;
+    } else if (strstr(scan_start, "<tool_calls>")) {
+        ts = "<tool_calls>";   te = "</tool_calls>";
+        is = "<invoke";        ie = "</invoke>";
+        ps = "<parameter";     pe = "</parameter>";
+    } else {
+        return false; /* No recognizable DSML start tag */
+    }
+
+    /* Single-pass: count all 6 tag types in one scan */
+    size_t tos = 0, toe = 0, ios = 0, ioe = 0, pos = 0, poe = 0;
+    const char *e = scan_start + scan_len;
+    for (const char *p = scan_start; p < e; ) {
+        size_t d;
+        if ((d = strlen(ts)) && !strncmp(p, ts, d)) { tos++; p += d; }
+        else if ((d = strlen(te)) && !strncmp(p, te, d)) { toe++; p += d; }
+        else if ((d = strlen(is)) && !strncmp(p, is, d)) { ios++; p += d; }
+        else if ((d = strlen(ie)) && !strncmp(p, ie, d)) { ioe++; p += d; }
+        else if ((d = strlen(ps)) && !strncmp(p, ps, d)) { pos++; p += d; }
+        else if ((d = strlen(pe)) && !strncmp(p, pe, d)) { poe++; p += d; }
+        else p++;
+    }
+    if (tos == toe && ios == ioe && pos == poe) return false;
+    if (toe > tos || ioe > ios || poe > pos) {
+        /* Extra closing tags are not a truncation pattern.  Refuse repair so the
+         * unsigned differences below cannot wrap and append a huge suffix. */
+        return false;
+    }
+    /* Repair: copy original text and append missing closing tags in reverse order */
+    buf_puts(out, s);
+    for (size_t i = 0; i < pos - poe; i++) buf_puts(out, pe);
+    for (size_t i = 0; i < ios - ioe; i++) buf_puts(out, ie);
+    for (size_t i = 0; i < tos - toe; i++) buf_puts(out, te);
+    return true;
+}
+
 static const char *tool_parse_failure_recovery_finish(const char *finish) {
     /* Once DSML failed to parse there is no executable tool call to report.
      * Preserve a true length stop, because callers can distinguish truncation
@@ -4625,11 +4691,11 @@ static bool parse_generated_message_for_response(const char *text,
     *reasoning_out = NULL;
     tool_calls_free(calls);
 
-    /* A malformed tool block is model output, not a server failure.  Returning
-     * the sampled text as a regular assistant message keeps the API response
-     * valid and gives the caller enough transcript context to retry or recover
-     * on a later turn, instead of terminating the whole session on
-     * finish_reason="error". */
+    /* A malformed tool block is model output, not a server failure.  The
+     * generation worker may hide this turn from the client, append a tool error
+     * plus protocol reminder to the live session, and let the model try again.
+     * If that continuation is unavailable, parsed_content keeps the raw text as
+     * a last-resort assistant fallback instead of crashing the request. */
     const char *finish = finish_io && *finish_io ? *finish_io : "stop";
     if (has_tools && saw_tool_start && strcmp(finish, "error") != 0) {
         if (finish_io) *finish_io = tool_parse_failure_recovery_finish(finish);
@@ -9307,6 +9373,97 @@ static thinking_state thinking_state_from_prompt(const request *r) {
     return st;
 }
 
+static char *rendered_chat_system_region(const char *prompt_text) {
+    if (!prompt_text) return xstrdup("");
+    const char *p = prompt_text;
+    const char *bos = "<｜begin▁of▁sentence｜>";
+    const size_t bos_len = strlen(bos);
+    if (!strncmp(p, bos, bos_len)) p += bos_len;
+    const char *max_prefix = ds4_think_max_prefix();
+    const size_t max_prefix_len = strlen(max_prefix);
+    if (max_prefix_len && !strncmp(p, max_prefix, max_prefix_len)) {
+        p += max_prefix_len;
+    }
+    while (*p && isspace((unsigned char)*p)) p++;
+
+    const char *user = strstr(p, "<｜User｜>");
+    const char *assistant = strstr(p, "<｜Assistant｜>");
+    const char *end = NULL;
+    if (user && assistant) end = user < assistant ? user : assistant;
+    else end = user ? user : assistant;
+    if (!end) end = p + strlen(p);
+    while (end > p && isspace((unsigned char)end[-1])) end--;
+    return xstrndup(p, (size_t)(end - p));
+}
+
+static char *build_invalid_dsml_tool_error_suffix(const request *r,
+                                                  const thinking_state *thinking,
+                                                  const char *detail) {
+    char *system = rendered_chat_system_region(r ? r->prompt_text : NULL);
+    buf tool_error = {0};
+    buf_puts(&tool_error, "Tool error: invalid DSML tool call");
+    if (detail && detail[0]) {
+        buf_puts(&tool_error, ": ");
+        buf_puts(&tool_error, detail);
+    }
+    buf_puts(&tool_error,
+             "\nThe previous assistant output was not executed because the DSML syntax was malformed. "
+             "Emit a new valid DSML tool call, or answer normally if no tool is needed.");
+    if (system && system[0]) {
+        buf_puts(&tool_error, "\n\nSystem prompt reminder:\n");
+        buf_puts(&tool_error, system);
+    }
+
+    buf suffix = {0};
+    if (r && ds4_think_mode_enabled(r->think_mode) && thinking && thinking->inside) {
+        buf_puts(&suffix, "</think>");
+    }
+    buf_puts(&suffix, "<｜end▁of▁sentence｜><｜User｜><tool_result>");
+    append_tool_result_text(&suffix, tool_error.ptr ? tool_error.ptr : "");
+    buf_puts(&suffix, "</tool_result><｜Assistant｜>");
+    buf_puts(&suffix, r && ds4_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
+
+    free(system);
+    buf_free(&tool_error);
+    return buf_take(&suffix);
+}
+
+static bool append_rendered_suffix_to_live_session(server *s, const char *suffix,
+                                                   int *tokens_appended,
+                                                   char *err, size_t errlen) {
+    if (tokens_appended) *tokens_appended = 0;
+    if (!s || !suffix || !suffix[0]) return true;
+    const ds4_tokens *live = ds4_session_tokens(s->session);
+    if (!live) {
+        if (err && errlen) snprintf(err, errlen, "live session is unavailable");
+        return false;
+    }
+
+    ds4_tokens target = {0};
+    build_prompt_from_exact_prefix_and_text_suffix(s->engine, live, suffix, &target);
+    const int before = ds4_session_pos(s->session);
+    bool ok = ds4_session_sync(s->session, &target, err, errlen) == 0;
+    if (ok && tokens_appended) {
+        int delta = ds4_session_pos(s->session) - before;
+        *tokens_appended = delta > 0 ? delta : 0;
+    }
+    ds4_tokens_free(&target);
+    return ok;
+}
+
+static bool continue_after_invalid_dsml(server *s, const request *r,
+                                        const thinking_state *thinking,
+                                        const char *detail,
+                                        int *tokens_appended,
+                                        char *err, size_t errlen) {
+    char *suffix = build_invalid_dsml_tool_error_suffix(r, thinking, detail);
+    bool ok = append_rendered_suffix_to_live_session(s, suffix,
+                                                     tokens_appended,
+                                                     err, errlen);
+    free(suffix);
+    return ok;
+}
+
 static bool should_remember_thinking_checkpoint(const request *r,
                                                 const thinking_state *thinking,
                                                 const char *finish) {
@@ -10059,6 +10216,11 @@ static void generate_job(server *s, job *j) {
         }
     }
 
+    bool dsml_recovery_attempted = false;
+    uint64_t rng = j->req.seed ? j->req.seed :
+        (((uint64_t)time(NULL) << 32) ^ ((uint64_t)s->seq << 1) ^ (uint64_t)(uintptr_t)j);
+decode_again:
+    ;
     buf text = {0};
     size_t plain_stream_pos = 0;
     size_t stop_scan_from = 0;
@@ -10072,8 +10234,6 @@ static void generate_job(server *s, job *j) {
     size_t tool_scan_from = 0;
     int next_tool_progress = 128;
     int next_decode_log = 50;
-    uint64_t rng = j->req.seed ? j->req.seed :
-        (((uint64_t)time(NULL) << 32) ^ ((uint64_t)s->seq << 1) ^ (uint64_t)(uintptr_t)j);
     if (max_tokens < 0) max_tokens = 0;
     if (max_tokens > room) max_tokens = room;
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
@@ -10310,11 +10470,77 @@ static void generate_job(server *s, job *j) {
     if (j->req.kind == REQ_CHAT && j->req.has_tools &&
         saw_tool_start && !saw_tool_end && strcmp(finish, "error") != 0)
     {
-        /* A partial streamed tool call cannot be retracted.  If the model ends
-         * before closing the DSML block, fail the turn instead of letting clients
-         * execute an incomplete `{}` or partially parsed argument object. */
-        finish = "error";
-        snprintf(err, sizeof(err), "unterminated tool call");
+        /* Deterministically complete a simple truncation.  Anything more than
+         * missing closing tags stays model-owned: for non-streaming requests,
+         * append a tool error plus prompt reminder to the live session and let
+         * the model issue a fresh call. */
+        bool completed_truncation = false;
+        buf repaired = {0};
+        if (try_repair_dsml(text.ptr, text.len, &repaired)) {
+            /* Parse repaired text to verify it produces valid tool calls */
+            tool_calls test_calls = {0};
+            char *test_content = NULL;
+            char *test_reasoning = NULL;
+            bool repair_ok = parse_generated_message_ex(repaired.ptr, false, &test_content, &test_reasoning, &test_calls);
+            free(test_content);
+            free(test_reasoning);
+            if (repair_ok && test_calls.len > 0) {
+                /* Repair succeeded - replace text with repaired version */
+                free(text.ptr);
+                text.ptr = buf_take(&repaired);
+                text.len = strlen(text.ptr);
+                saw_tool_end = true;
+                completed_truncation = true;
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: chat ctx=%s%s%s repaired unterminated tool call (%d calls recovered)",
+                           ctx_span,
+                           req_flags[0] ? " " : "",
+                           req_flags,
+                           test_calls.len);
+                trace_event(s, trace_id, "repaired unterminated tool call (%d calls recovered)", test_calls.len);
+            }
+            tool_calls_free(&test_calls);
+        }
+        if (!completed_truncation) {
+            if (!j->req.stream && !dsml_recovery_attempted) {
+                int recovery_tokens = 0;
+                char recovery_err[160] = {0};
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: chat ctx=%s%s%s unterminated tool call; continuing with model-visible tool error",
+                           ctx_span,
+                           req_flags[0] ? " " : "",
+                           req_flags);
+                trace_event(s, trace_id,
+                            "unterminated tool call; continuing with model-visible tool error");
+                if (continue_after_invalid_dsml(s, &j->req, &thinking,
+                                                "unterminated tool call",
+                                                &recovery_tokens,
+                                                recovery_err,
+                                                sizeof(recovery_err)))
+                {
+                    dsml_recovery_attempted = true;
+                    server_log(DS4_LOG_GENERATION,
+                               "ds4-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
+                               ctx_span,
+                               req_flags[0] ? " " : "",
+                               req_flags,
+                               recovery_tokens);
+                    trace_event(s, trace_id,
+                                "tool-error continuation appended %d tokens",
+                                recovery_tokens);
+                    buf_free(&repaired);
+                    buf_free(&text);
+                    goto decode_again;
+                }
+                finish = "error";
+                snprintf(err, sizeof(err), "invalid tool call recovery failed: %s",
+                         recovery_err[0] ? recovery_err : "unknown error");
+            } else {
+                finish = "error";
+                snprintf(err, sizeof(err), "unterminated tool call");
+            }
+        }
+        buf_free(&repaired);
     }
 
     if (completion > last_decode_log_completion) {
@@ -10353,16 +10579,89 @@ static void generate_job(server *s, job *j) {
             &parsed_reasoning,
             &parsed_calls,
             &recovered_tool_parse_failure);
-        if (!parsed_ok && recovered_tool_parse_failure) {
-            server_log(DS4_LOG_WARNING,
-                       "ds4-server: chat ctx=%s%s%s invalid tool call returned as assistant text finish=%s",
-                       ctx_span,
-                       req_flags[0] ? " " : "",
-                       req_flags,
-                       final_finish);
-            trace_event(s, trace_id,
-                        "invalid tool call returned as assistant text finish=%s",
-                        final_finish);
+        if (!parsed_ok && recovered_tool_parse_failure && j->req.has_tools && saw_tool_start) {
+            /* parse_generated_message failed even though DSML was present.
+             * Semantic repair is intentionally avoided: if the parser cannot
+             * execute the block, feed the model a tool error and the protocol
+             * reminder so it owns the corrected next action. */
+            if (!j->req.stream && !dsml_recovery_attempted) {
+                int recovery_tokens = 0;
+                char recovery_err[160] = {0};
+                const char *detail = err[0] ? err : "invalid tool call";
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: chat ctx=%s%s%s invalid tool call; continuing with model-visible tool error",
+                           ctx_span,
+                           req_flags[0] ? " " : "",
+                           req_flags);
+                trace_event(s, trace_id,
+                            "invalid tool call; continuing with model-visible tool error");
+                if (continue_after_invalid_dsml(s, &j->req, &thinking,
+                                                detail,
+                                                &recovery_tokens,
+                                                recovery_err,
+                                                sizeof(recovery_err)))
+                {
+                    dsml_recovery_attempted = true;
+                    server_log(DS4_LOG_GENERATION,
+                               "ds4-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
+                               ctx_span,
+                               req_flags[0] ? " " : "",
+                               req_flags,
+                               recovery_tokens);
+                    trace_event(s, trace_id,
+                                "tool-error continuation appended %d tokens",
+                                recovery_tokens);
+                    free(parsed_content);
+                    free(parsed_reasoning);
+                    tool_calls_free(&parsed_calls);
+                    buf_free(&text);
+                    goto decode_again;
+                }
+                final_finish = "error";
+                snprintf(err, sizeof(err), "invalid tool call recovery failed: %s",
+                         recovery_err[0] ? recovery_err : "unknown error");
+            }
+            if (!parsed_ok) {
+                /* Print raw DSML snippet for debugging */
+                size_t dsml_snippet_len = 0;
+                const char *dsml_start = NULL;
+                const char *p;
+                for (p = text.ptr; p && (size_t)(p - text.ptr) < text.len - 20; p++) {
+                    if ((strncmp(p, DS4_TOOL_CALLS_START, strlen(DS4_TOOL_CALLS_START)) == 0) ||
+                        (strncmp(p, DS4_TOOL_CALLS_START_SHORT, strlen(DS4_TOOL_CALLS_START_SHORT)) == 0) ||
+                        (strncmp(p, "<tool_calls>", 12) == 0)) {
+                        dsml_start = p;
+                        break;
+                    }
+                }
+                if (dsml_start) {
+                    dsml_snippet_len = text.len - (dsml_start - text.ptr);
+                    if (dsml_snippet_len > 500) dsml_snippet_len = 500;
+                }
+                /* Also log a snippet of the full text to see what the model output */
+                size_t text_snippet_len = text.len > 300 ? 300 : text.len;
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: chat ctx=%s%s%s invalid tool call returned as assistant text finish=%s [text_len=%zu saw_start=%d saw_end=%d text_snippet: %.*s]",
+                           ctx_span,
+                           req_flags[0] ? " " : "",
+                           req_flags,
+                           final_finish,
+                           text.len,
+                           saw_tool_start,
+                           saw_tool_end,
+                           (int)text_snippet_len,
+                           text.ptr ? text.ptr : "(null)");
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: chat ctx=%s%s%s invalid tool call dsml_snippet: %.*s",
+                           ctx_span,
+                           req_flags[0] ? " " : "",
+                           req_flags,
+                           (int)dsml_snippet_len,
+                           dsml_start ? dsml_start : "(none)");
+                trace_event(s, trace_id,
+                            "invalid tool call returned as assistant text finish=%s",
+                            final_finish);
+            }
         }
         if (parsed_calls.len) {
             if (openai_live_chat) apply_openai_stream_tool_ids(&parsed_calls, &openai_live);
@@ -11017,6 +11316,8 @@ static void usage(FILE *fp) {
         "      Apply steering after attention outputs. Default: 0\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before serving. Slower startup, fewer first-use stalls.\n"
+        "  --power N\n"
+        "      Target GPU duty cycle percentage, 1..100. Default: 100\n"
         "  --metal | --cuda | --cpu | --backend NAME\n"
         "      Select backend explicitly. Defaults to Metal on macOS and CUDA on CUDA builds.\n"
         "\n"
@@ -11165,6 +11466,12 @@ static server_config parse_options(int argc, char **argv) {
             c.tool_memory_max_ids = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
+        } else if (!strcmp(arg, "--power")) {
+            c.engine.power_percent = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (c.engine.power_percent < 1 || c.engine.power_percent > 100) {
+                server_log(DS4_LOG_DEFAULT, "ds4-server: --power must be between 1 and 100");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--dir-steering-file")) {
             c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dir-steering-ffn")) {
@@ -12788,6 +13095,213 @@ static void test_dsml_parser_recovers_loose_nested_parameters(void) {
     tool_calls_free(&calls);
 }
 
+/* Verify that try_repair_dsml + parse_generated_message produces structurally
+   valid tool calls for all three DSML styles and multiple truncation scenarios.
+   Balanced but malformed DSML is not repaired: the model must retry it.
+   This tests repair ACCURACY, not just that it doesn't crash. */
+static void test_dsml_repair_produces_parseable_calls(void) {
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    buf repaired = {0};
+
+    /* === TEST 1: Full DSML - missing </tool_calls> === */
+    {
+        const char *broken =
+            "thinking done\n\n"
+            DS4_TOOL_CALLS_START "\n"
+            DS4_INVOKE_START " name=\"bash\">\n"
+            DS4_PARAM_START " name=\"command\" string=\"true\">ls -la" DS4_PARAM_END "\n"
+            DS4_INVOKE_END "\n";
+        /* Missing: DS4_TOOL_CALLS_END */
+
+        buf_free(&repaired);
+        TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
+        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
+        TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"ls -la\"") != NULL);
+        free(content); free(reasoning); tool_calls_free(&calls);
+    }
+
+    /* === TEST 2: Full DSML - missing </invoke> and </tool_calls> === */
+    {
+        const char *broken =
+            "\n\n"
+            DS4_TOOL_CALLS_START "\n"
+            DS4_INVOKE_START " name=\"edit\">\n"
+            DS4_PARAM_START " name=\"path\" string=\"true\">/tmp/test.c" DS4_PARAM_END "\n";
+        /* Missing: DS4_INVOKE_END, DS4_TOOL_CALLS_END */
+
+        buf_free(&repaired);
+        TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
+        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "edit"));
+        TEST_ASSERT(strstr(calls.v[0].arguments, "\"path\": \"/tmp/test.c\"") != NULL);
+        free(content); free(reasoning); tool_calls_free(&calls);
+    }
+
+    /* === TEST 3: Full DSML - missing </parameter> === */
+    {
+        const char *broken =
+            "\n\n"
+            DS4_TOOL_CALLS_START "\n"
+            DS4_INVOKE_START " name=\"bash\">\n"
+            DS4_PARAM_START " name=\"command\" string=\"true\">echo hello";
+        /* Missing: DS4_PARAM_END, DS4_INVOKE_END, DS4_TOOL_CALLS_END */
+
+        buf_free(&repaired);
+        TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
+        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
+        TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"echo hello\"") != NULL);
+        free(content); free(reasoning); tool_calls_free(&calls);
+    }
+
+    /* === TEST 4: Short DSML - missing closing tags === */
+    {
+        const char *broken =
+            "\n\n"
+            DS4_TOOL_CALLS_START_SHORT "\n"
+            DS4_INVOKE_START_SHORT " name=\"write_file\">\n"
+            DS4_PARAM_START_SHORT " name=\"path\" string=\"true\">/tmp/out.txt" DS4_PARAM_END_SHORT "\n"
+            DS4_PARAM_START_SHORT " name=\"content\" string=\"true\">hello world" DS4_PARAM_END_SHORT "\n"
+            DS4_INVOKE_END_SHORT "\n";
+        /* Missing: DS4_TOOL_CALLS_END_SHORT */
+
+        buf_free(&repaired);
+        TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
+        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "write_file"));
+        TEST_ASSERT(strstr(calls.v[0].arguments, "\"path\": \"/tmp/out.txt\"") != NULL);
+        TEST_ASSERT(strstr(calls.v[0].arguments, "\"content\": \"hello world\"") != NULL);
+        free(content); free(reasoning); tool_calls_free(&calls);
+    }
+
+    /* === TEST 5: Plain XML - missing closing tags === */
+    {
+        const char *broken =
+            "\n\n"
+            "<tool_calls>\n"
+            "<invoke name=\"execute_command\">\n"
+            "<parameter name=\"command\" string=\"true\">pwd</parameter>\n"
+            "</invoke>\n";
+        /* Missing: </tool_calls> */
+
+        buf_free(&repaired);
+        TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
+        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "execute_command"));
+        TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"pwd\"") != NULL);
+        free(content); free(reasoning); tool_calls_free(&calls);
+    }
+
+    /* === TEST 6: Balanced text should NOT be modified === */
+    {
+        const char *balanced =
+            "\n\n"
+            DS4_TOOL_CALLS_START "\n"
+            DS4_INVOKE_START " name=\"bash\">\n"
+            DS4_PARAM_START " name=\"command\" string=\"true\">ls" DS4_PARAM_END "\n"
+            DS4_INVOKE_END "\n"
+            DS4_TOOL_CALLS_END;
+
+        buf_free(&repaired);
+        TEST_ASSERT(!try_repair_dsml(balanced, strlen(balanced), &repaired));
+        /* No repair needed */
+    }
+
+    /* === TEST 7: No DSML tags should return false === */
+    {
+        const char *no_dsml = "just plain text, no tools";
+        buf_free(&repaired);
+        TEST_ASSERT(!try_repair_dsml(no_dsml, strlen(no_dsml), &repaired));
+    }
+
+    /* === TEST 8: Balanced DSML with no invoke is not repaired === */
+    {
+        const char *balanced_no_invoke =
+            "Let me analyze this.\n\n"
+            DS4_TOOL_CALLS_START
+            "The write tool truncates this too, at what looks like the same content location."
+            DS4_TOOL_CALLS_END;
+        buf_free(&repaired);
+        TEST_ASSERT(!try_repair_dsml(balanced_no_invoke, strlen(balanced_no_invoke), &repaired));
+    }
+
+    /* === TEST 9: Balanced short DSML with no invoke is not repaired === */
+    {
+        const char *balanced_short_no_invoke =
+            "thinking...\n\n"
+            DS4_TOOL_CALLS_START_SHORT
+            "some content here"
+            DS4_TOOL_CALLS_END_SHORT;
+        buf_free(&repaired);
+        TEST_ASSERT(!try_repair_dsml(balanced_short_no_invoke, strlen(balanced_short_no_invoke), &repaired));
+    }
+
+    /* === TEST 10: Balanced plain XML DSML with no invoke is not repaired === */
+    {
+        const char *balanced_xml_no_invoke =
+            "Let me think.\n\n"
+            "<tool_calls>"
+            "I need to use a tool but I don't know which one."
+            "</tool_calls>";
+        buf_free(&repaired);
+        TEST_ASSERT(!try_repair_dsml(balanced_xml_no_invoke, strlen(balanced_xml_no_invoke), &repaired));
+    }
+
+    /* === TEST 11: DSML mentioned inside thinking is not repaired === */
+    {
+        const char *thinking_quote =
+            "<think>The protocol uses "
+            DS4_TOOL_CALLS_START
+            "some explanatory text"
+            DS4_TOOL_CALLS_END
+            ", but this is only a quote.</think>\nFinal answer.";
+        buf_free(&repaired);
+        TEST_ASSERT(!try_repair_dsml(thinking_quote, strlen(thinking_quote), &repaired));
+    }
+
+    /* === TEST 12: Extra closing tags are unrecoverable, not truncation === */
+    {
+        const char *orphan_close =
+            "done\n\n"
+            DS4_TOOL_CALLS_START
+            DS4_TOOL_CALLS_END
+            DS4_TOOL_CALLS_END;
+        buf_free(&repaired);
+        TEST_ASSERT(!try_repair_dsml(orphan_close, strlen(orphan_close), &repaired));
+    }
+
+    /* === TEST 13: Real DSML after thinking still repairs normally === */
+    {
+        const char *broken_after_think =
+            "<think>"
+            DS4_TOOL_CALLS_START
+            "quoted DSML, not executable"
+            DS4_TOOL_CALLS_END
+            "</think>\n\n"
+            DS4_TOOL_CALLS_START "\n"
+            DS4_INVOKE_START " name=\"bash\">\n"
+            DS4_PARAM_START " name=\"command\" string=\"true\">date" DS4_PARAM_END "\n"
+            DS4_INVOKE_END "\n";
+        buf_free(&repaired);
+        TEST_ASSERT(try_repair_dsml(broken_after_think, strlen(broken_after_think), &repaired));
+        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, true, &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
+        TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"date\"") != NULL);
+        free(content); free(reasoning); tool_calls_free(&calls);
+    }
+
+    buf_free(&repaired);
+}
+
 static void test_tool_parse_failure_returns_recoverable_finish(void) {
     const char *generated =
         "trying a tool\n\n"
@@ -12823,6 +13337,28 @@ static void test_tool_parse_failure_returns_recoverable_finish(void) {
     free(content);
     free(reasoning);
     tool_calls_free(&calls);
+}
+
+static void test_invalid_dsml_tool_error_suffix_includes_system_prompt(void) {
+    request r = {0};
+    r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = xstrdup(
+        "<｜begin▁of▁sentence｜>"
+        "## Tools\nschema\n\nSystem rule\n\n"
+        "<｜User｜>Hi<｜Assistant｜><think>");
+    thinking_state st = {.inside = true};
+
+    char *suffix = build_invalid_dsml_tool_error_suffix(&r, &st, "missing invoke name");
+    TEST_ASSERT(suffix != NULL);
+    TEST_ASSERT(strstr(suffix, "</think><｜end▁of▁sentence｜><｜User｜><tool_result>") == suffix);
+    TEST_ASSERT(strstr(suffix, "Tool error: invalid DSML tool call: missing invoke name") != NULL);
+    TEST_ASSERT(strstr(suffix, "The previous assistant output was not executed") != NULL);
+    TEST_ASSERT(strstr(suffix, "System prompt reminder:\n## Tools\nschema\n\nSystem rule") != NULL);
+    TEST_ASSERT(strstr(suffix, "<｜User｜>Hi") == NULL);
+    TEST_ASSERT(strstr(suffix, "</tool_result><｜Assistant｜><think>") != NULL);
+
+    free(suffix);
+    free(r.prompt_text);
 }
 
 static void test_thinking_dsml_is_not_executable_before_think_close(void) {
@@ -14731,7 +15267,9 @@ static void ds4_server_unit_tests_run(void) {
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
     test_dsml_parser_recovers_loose_nested_parameters();
+    test_dsml_repair_produces_parseable_calls();
     test_tool_parse_failure_returns_recoverable_finish();
+    test_invalid_dsml_tool_error_suffix_includes_system_prompt();
     test_thinking_dsml_is_not_executable_before_think_close();
     test_thinking_dsml_after_think_close_is_executable();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();

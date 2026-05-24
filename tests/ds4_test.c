@@ -13,10 +13,28 @@ static const char *test_model_path(void) {
     return (model_path && model_path[0]) ? model_path : "ds4flash.gguf";
 }
 
-static ds4_engine *test_get_engine(bool quality) {
-    ds4_engine **slot = quality ? &test_engine_quality : &test_engine_fast;
-    if (*slot) return *slot;
+static char *test_save_env(const char *name) {
+    const char *value = getenv(name);
+    if (!value) return NULL;
+    size_t len = strlen(value);
+    char *copy = malloc(len + 1);
+    TEST_ASSERT(copy != NULL);
+    if (!copy) return NULL;
+    memcpy(copy, value, len + 1);
+    return copy;
+}
 
+static void test_restore_env(const char *name, char *saved) {
+    if (saved) {
+        setenv(name, saved, 1);
+        free(saved);
+    } else {
+        unsetenv(name);
+    }
+}
+
+static ds4_engine *test_open_engine(bool quality) {
+    ds4_engine *engine = NULL;
     ds4_engine_options opt = {
         .model_path = test_model_path(),
 #ifdef __APPLE__
@@ -26,7 +44,15 @@ static ds4_engine *test_get_engine(bool quality) {
 #endif
         .quality = quality,
     };
-    TEST_ASSERT(ds4_engine_open(slot, &opt) == 0);
+    TEST_ASSERT(ds4_engine_open(&engine, &opt) == 0);
+    return engine;
+}
+
+static ds4_engine *test_get_engine(bool quality) {
+    ds4_engine **slot = quality ? &test_engine_quality : &test_engine_fast;
+    if (*slot) return *slot;
+
+    *slot = test_open_engine(quality);
     return *slot;
 }
 
@@ -70,6 +96,66 @@ static uint16_t test_float_to_f16(float f) {
     uint32_t half = sign | ((uint32_t)exp << 10) | (mant >> 13);
     if (mant & 0x1000u) half++;
     return (uint16_t)half;
+}
+
+static float test_f16_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1fu;
+    uint32_t mant = h & 0x03ffu;
+    uint32_t bits;
+
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            exp = 1;
+            while ((mant & 0x0400u) == 0) {
+                mant <<= 1;
+                exp--;
+            }
+            mant &= 0x03ffu;
+            bits = sign | ((exp + 127u - 15u) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7f800000u | (mant << 13);
+    } else {
+        bits = sign | ((exp + 127u - 15u) << 23) | (mant << 13);
+    }
+
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+static void test_fill_q8_0_weights(uint8_t *weights,
+                                   uint32_t in_dim,
+                                   uint32_t out_dim) {
+    const uint32_t blocks = in_dim / 32u;
+    const uint64_t row_bytes = (uint64_t)blocks * 34u;
+    for (uint32_t o = 0; o < out_dim; o++) {
+        uint8_t *row = weights + (uint64_t)o * row_bytes;
+        for (uint32_t b = 0; b < blocks; b++) {
+            float vals[32];
+            float amax = 0.0f;
+            for (uint32_t i = 0; i < 32; i++) {
+                const uint32_t k = b * 32u + i;
+                const int v = (int)((o * 17u + k * 23u + (o ^ k) * 3u) % 67u) - 33;
+                vals[i] = (float)v / 96.0f;
+                float av = fabsf(vals[i]);
+                if (av > amax) amax = av;
+            }
+            const uint16_t scale_bits = test_float_to_f16(amax / 127.0f);
+            const float scale = test_f16_to_f32(scale_bits);
+            memcpy(row + b * 34u, &scale_bits, sizeof(scale_bits));
+            int8_t *qs = (int8_t *)(row + b * 34u + 2u);
+            for (uint32_t i = 0; i < 32; i++) {
+                int q = scale != 0.0f ? (int)lrintf(vals[i] / scale) : 0;
+                if (q > 127) q = 127;
+                if (q < -128) q = -128;
+                qs[i] = (int8_t)q;
+            }
+        }
+    }
 }
 
 static void test_metal_f16_matvec_fast_nr0_4(void) {
@@ -148,6 +234,238 @@ static void test_metal_f16_matvec_fast_nr0_4(void) {
     ds4_gpu_tensor_free(x);
     ds4_gpu_tensor_free(out);
     free(weights_raw);
+}
+
+static void test_metal_f16_prefill_matmul(void) {
+    const uint32_t in_dim = 128;
+    const uint32_t out_dim = 64;
+    const uint32_t n_tok = 128;
+    const uint64_t weight_bytes = (uint64_t)out_dim * in_dim * sizeof(uint16_t);
+    const uint64_t weight_alloc = test_round_up_u64(weight_bytes, (uint64_t)getpagesize());
+    const uint64_t x_bytes = (uint64_t)n_tok * in_dim * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)n_tok * out_dim * sizeof(float);
+
+    void *weights_raw = NULL;
+    TEST_ASSERT(posix_memalign(&weights_raw, (size_t)getpagesize(), (size_t)weight_alloc) == 0);
+    if (!weights_raw) return;
+
+    uint16_t *weights = weights_raw;
+    memset(weights, 0, (size_t)weight_alloc);
+    for (uint32_t o = 0; o < out_dim; o++) {
+        for (uint32_t i = 0; i < in_dim; i++) {
+            const int v = (int)((o * 11u + i * 13u + (o ^ i) * 5u) % 61u) - 30;
+            weights[(uint64_t)o * in_dim + i] = test_float_to_f16((float)v / 96.0f);
+        }
+    }
+
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_bytes);
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_bytes);
+    TEST_ASSERT(x != NULL);
+    TEST_ASSERT(out != NULL);
+    if (!x || !out) {
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(out);
+        free(weights_raw);
+        return;
+    }
+
+    float *x_host = malloc((size_t)x_bytes);
+    float *out_host = malloc((size_t)out_bytes);
+    TEST_ASSERT(x_host != NULL);
+    TEST_ASSERT(out_host != NULL);
+    if (!x_host || !out_host) {
+        free(x_host);
+        free(out_host);
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(out);
+        free(weights_raw);
+        return;
+    }
+
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t i = 0; i < in_dim; i++) {
+            const int v = (int)((t * 7u + i * 17u + (t ^ i) * 3u) % 73u) - 36;
+            x_host[(uint64_t)t * in_dim + i] = (float)v / 80.0f;
+        }
+    }
+    for (uint32_t i = 0; i < n_tok * out_dim; i++) {
+        out_host[i] = 12345.0f;
+    }
+
+    TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_host, x_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(out, 0, out_host, out_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_set_model_map(weights_raw, weight_alloc) != 0);
+    ds4_gpu_set_quality(false);
+    TEST_ASSERT(ds4_gpu_matmul_f16_tensor(out, weights_raw, weight_alloc, 0,
+                                          in_dim, out_dim, x, n_tok) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(out, 0, out_host, out_bytes) != 0);
+
+    float max_abs = 0.0f;
+    float rms = 0.0f;
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t o = 0; o < out_dim; o++) {
+            float ref = 0.0f;
+            for (uint32_t i = 0; i < in_dim; i++) {
+                ref += test_f16_to_f32(weights[(uint64_t)o * in_dim + i]) *
+                       x_host[(uint64_t)t * in_dim + i];
+            }
+            const float got = out_host[(uint64_t)t * out_dim + o];
+            TEST_ASSERT(isfinite(got));
+            const float err = fabsf(got - ref);
+            if (err > max_abs) max_abs = err;
+            rms += err * err;
+        }
+    }
+    rms = sqrtf(rms / (float)(n_tok * out_dim));
+    TEST_ASSERT(max_abs < 0.08f);
+    TEST_ASSERT(rms < 0.02f);
+
+    free(x_host);
+    free(out_host);
+    ds4_gpu_tensor_free(x);
+    ds4_gpu_tensor_free(out);
+    free(weights_raw);
+}
+
+static void test_metal_q8_0_prefill_matmul(void) {
+    const uint32_t in_dim = 128;
+    const uint32_t out_dim = 64;
+    const uint32_t n_tok = 128;
+    const uint64_t row_bytes = (uint64_t)(in_dim / 32u) * 34u;
+    const uint64_t weight_bytes = (uint64_t)out_dim * row_bytes;
+    const uint64_t weight_alloc = test_round_up_u64(weight_bytes, (uint64_t)getpagesize());
+    const uint64_t x_bytes = (uint64_t)n_tok * in_dim * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)n_tok * out_dim * sizeof(float);
+
+    void *weights_raw = NULL;
+    TEST_ASSERT(posix_memalign(&weights_raw, (size_t)getpagesize(), (size_t)weight_alloc) == 0);
+    if (!weights_raw) return;
+
+    uint8_t *weights = weights_raw;
+    memset(weights, 0, (size_t)weight_alloc);
+    test_fill_q8_0_weights(weights, in_dim, out_dim);
+
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_bytes);
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_bytes);
+    TEST_ASSERT(x != NULL);
+    TEST_ASSERT(out != NULL);
+    if (!x || !out) {
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(out);
+        free(weights_raw);
+        return;
+    }
+
+    float *x_host = malloc((size_t)x_bytes);
+    float *out_host = malloc((size_t)out_bytes);
+    TEST_ASSERT(x_host != NULL);
+    TEST_ASSERT(out_host != NULL);
+    if (!x_host || !out_host) {
+        free(x_host);
+        free(out_host);
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(out);
+        free(weights_raw);
+        return;
+    }
+
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t i = 0; i < in_dim; i++) {
+            const int v = (int)((t * 19u + i * 7u + (t ^ i)) % 71u) - 35;
+            x_host[(uint64_t)t * in_dim + i] = (float)v / 80.0f;
+        }
+    }
+    for (uint32_t i = 0; i < n_tok * out_dim; i++) {
+        out_host[i] = 12345.0f;
+    }
+
+    TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_host, x_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(out, 0, out_host, out_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_set_model_map(weights_raw, weight_alloc) != 0);
+    ds4_gpu_set_quality(false);
+    TEST_ASSERT(ds4_gpu_matmul_q8_0_tensor(out, weights_raw, weight_alloc, 0,
+                                           in_dim, out_dim, x, n_tok) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(out, 0, out_host, out_bytes) != 0);
+
+    float max_abs = 0.0f;
+    float rms = 0.0f;
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t o = 0; o < out_dim; o++) {
+            const uint8_t *row = weights + (uint64_t)o * row_bytes;
+            float ref = 0.0f;
+            for (uint32_t b = 0; b < in_dim / 32u; b++) {
+                uint16_t scale_bits;
+                memcpy(&scale_bits, row + b * 34u, sizeof(scale_bits));
+                const float scale = test_f16_to_f32(scale_bits);
+                const int8_t *qs = (const int8_t *)(row + b * 34u + 2u);
+                for (uint32_t i = 0; i < 32; i++) {
+                    ref += scale * (float)qs[i] *
+                           x_host[(uint64_t)t * in_dim + b * 32u + i];
+                }
+            }
+            const float got = out_host[(uint64_t)t * out_dim + o];
+            TEST_ASSERT(isfinite(got));
+            const float err = fabsf(got - ref);
+            if (err > max_abs) max_abs = err;
+            rms += err * err;
+        }
+    }
+    rms = sqrtf(rms / (float)(n_tok * out_dim));
+    TEST_ASSERT(max_abs < 0.08f);
+    TEST_ASSERT(rms < 0.02f);
+
+    free(x_host);
+    free(out_host);
+    ds4_gpu_tensor_free(x);
+    ds4_gpu_tensor_free(out);
+    free(weights_raw);
+}
+
+static void test_metal_kernel_group(void) {
+    test_metal_f16_matvec_fast_nr0_4();
+    test_metal_f16_prefill_matmul();
+    test_metal_q8_0_prefill_matmul();
+}
+
+static void test_metal_short_prefill_ratio4(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+
+    const int tokens[] = {
+        ds4_token_user(engine),
+        ds4_token_assistant(engine),
+        ds4_token_eos(engine),
+    };
+    for (size_t i = 0; i < sizeof(tokens) / sizeof(tokens[0]); i++) {
+        TEST_ASSERT(tokens[i] >= 0);
+        if (tokens[i] < 0) return;
+    }
+
+    for (size_t n = 1; n <= 3; n++) {
+        ds4_tokens prompt = {0};
+        for (size_t i = 0; i < n; i++) {
+            ds4_tokens_push(&prompt, tokens[i]);
+        }
+        TEST_ASSERT(prompt.len == (int)n);
+
+        ds4_session *session = NULL;
+        TEST_ASSERT(ds4_session_create(&session, engine, 2048) == 0);
+        if (!session) {
+            ds4_tokens_free(&prompt);
+            return;
+        }
+
+        char err[160] = {0};
+        const int rc = ds4_session_sync(session, &prompt, err, sizeof(err));
+        if (rc != 0) {
+            fprintf(stderr, "ds4-test: short prefill failed for %zu token(s): %s\n",
+                    n, err);
+        }
+        TEST_ASSERT(rc == 0);
+
+        ds4_session_free(session);
+        ds4_tokens_free(&prompt);
+    }
 }
 
 static char *test_read_file(const char *path) {
@@ -542,8 +860,18 @@ static void test_official_logprob_vectors(void) {
     TEST_ASSERT(fp != NULL);
     if (!fp) return;
 
-    ds4_engine *engine = test_get_engine(false);
+    char *saved_prefill_chunk = test_save_env("DS4_METAL_PREFILL_CHUNK");
+    char *saved_disable_metal4 = test_save_env("DS4_METAL_DISABLE_METAL4");
+    setenv("DS4_METAL_PREFILL_CHUNK", "2048", 1);
+    if (getenv("DS4_TEST_LOGPROB_AUTO_METAL") == NULL) {
+        setenv("DS4_METAL_DISABLE_METAL4", "1", 1);
+    } else {
+        unsetenv("DS4_METAL_DISABLE_METAL4");
+    }
+    ds4_engine *engine = test_open_engine(false);
     if (!engine) {
+        test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
+        test_restore_env("DS4_METAL_PREFILL_CHUNK", saved_prefill_chunk);
         fclose(fp);
         return;
     }
@@ -559,7 +887,416 @@ static void test_official_logprob_vectors(void) {
         fprintf(stderr, "ds4-test: vector %s\n", vc.id);
         test_logprob_vector_case(engine, &vc);
     }
+    ds4_engine_close(engine);
+    test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
+    test_restore_env("DS4_METAL_PREFILL_CHUNK", saved_prefill_chunk);
     fclose(fp);
+}
+
+#define TEST_MPP_EQ_MAX_CASES 8
+#define TEST_MPP_EQ_TOPK 20
+#define TEST_MPP_EQ_TOP5 5
+#define TEST_MPP_EQ_DELTAS 5
+
+typedef struct {
+    char id[96];
+    int ctx;
+    int vocab_size;
+    int gen_steps;
+    ds4_tokens prompt;
+    float *ref_logits;
+    int ref_gen[TEST_VEC_MAX_STEPS];
+    int ref_gen_len;
+} test_mpp_eq_case;
+
+typedef struct {
+    int ref_top1;
+    int cand_top1;
+    int overlap;
+    int top5_overlap;
+    int max_rank_delta;
+    int nonfinite;
+    float rms;
+    float max_abs;
+    float top20_max_abs;
+    bool same_top1;
+    bool pass;
+} test_mpp_eq_result;
+
+typedef struct {
+    const char *label;
+    int cases;
+    int capture_failures;
+    int logits_failures;
+    int greedy_failures;
+    int top1_mismatches;
+    int min_overlap;
+    int min_top5_overlap;
+    int worst_rank_delta;
+    float worst_rms;
+    float worst_max_abs;
+    float worst_top20_max_abs;
+} test_mpp_eq_summary;
+
+static void test_mpp_eq_case_free(test_mpp_eq_case *tc) {
+    if (!tc) return;
+    ds4_tokens_free(&tc->prompt);
+    free(tc->ref_logits);
+    memset(tc, 0, sizeof(*tc));
+}
+
+static void test_logits_topk(const float *logits, int n, int *out, int k) {
+    for (int i = 0; i < k; i++) out[i] = -1;
+    for (int id = 0; id < n; id++) {
+        const float v = logits[id];
+        if (!isfinite(v)) continue;
+        for (int j = 0; j < k; j++) {
+            if (out[j] < 0 || v > logits[out[j]]) {
+                for (int l = k - 1; l > j; l--) out[l] = out[l - 1];
+                out[j] = id;
+                break;
+            }
+        }
+    }
+}
+
+static bool test_topk_contains(const int *top, int k, int id) {
+    for (int i = 0; i < k; i++) {
+        if (top[i] == id) return true;
+    }
+    return false;
+}
+
+static int test_topk_rank(const int *top, int k, int id) {
+    for (int i = 0; i < k; i++) {
+        if (top[i] == id) return i;
+    }
+    return -1;
+}
+
+static void test_note_delta(int *ids, float *ref_vals, float *cand_vals,
+                            float *abs_vals, int id, float ref, float cand) {
+    const float abs_delta = fabsf(cand - ref);
+    for (int i = 0; i < TEST_MPP_EQ_DELTAS; i++) {
+        if (ids[i] < 0 || abs_delta > abs_vals[i]) {
+            for (int j = TEST_MPP_EQ_DELTAS - 1; j > i; j--) {
+                ids[j] = ids[j - 1];
+                ref_vals[j] = ref_vals[j - 1];
+                cand_vals[j] = cand_vals[j - 1];
+                abs_vals[j] = abs_vals[j - 1];
+            }
+            ids[i] = id;
+            ref_vals[i] = ref;
+            cand_vals[i] = cand;
+            abs_vals[i] = abs_delta;
+            return;
+        }
+    }
+}
+
+static float test_top_union_max_abs(const float *ref, const float *cand,
+                                    const int *ref_top, const int *cand_top, int k) {
+    float max_abs = 0.0f;
+    for (int i = 0; i < k; i++) {
+        if (ref_top[i] >= 0) {
+            const float d = fabsf(cand[ref_top[i]] - ref[ref_top[i]]);
+            if (d > max_abs) max_abs = d;
+        }
+        if (cand_top[i] >= 0 && !test_topk_contains(ref_top, k, cand_top[i])) {
+            const float d = fabsf(cand[cand_top[i]] - ref[cand_top[i]]);
+            if (d > max_abs) max_abs = d;
+        }
+    }
+    return max_abs;
+}
+
+/*
+ * Metal4/TensorOps equivalence is a smoke test, not a demand for bitwise local
+ * logits.  Tensor kernels change precision and reduction order, so the useful
+ * invariant here is: no NaNs, same first greedy token, and same short greedy
+ * continuation.  Larger logit drift is still printed so it can be compared with
+ * official API-vector and long-context recall gates.
+ */
+static test_mpp_eq_result test_compare_mpp_logits(const test_mpp_eq_case *tc,
+                                                  const float *cand_logits,
+                                                  bool assert_thresholds) {
+    int ref_top[TEST_MPP_EQ_TOPK];
+    int cand_top[TEST_MPP_EQ_TOPK];
+    test_logits_topk(tc->ref_logits, tc->vocab_size, ref_top, TEST_MPP_EQ_TOPK);
+    test_logits_topk(cand_logits, tc->vocab_size, cand_top, TEST_MPP_EQ_TOPK);
+
+    int overlap = 0;
+    int top5_overlap = 0;
+    int max_rank_delta = 0;
+    for (int i = 0; i < TEST_MPP_EQ_TOPK; i++) {
+        const int cand_rank = test_topk_rank(cand_top, TEST_MPP_EQ_TOPK, ref_top[i]);
+        if (ref_top[i] >= 0 && cand_rank >= 0) {
+            overlap++;
+            const int rank_delta = abs(cand_rank - i);
+            if (rank_delta > max_rank_delta) max_rank_delta = rank_delta;
+        }
+        if (i < TEST_MPP_EQ_TOP5 &&
+            ref_top[i] >= 0 &&
+            test_topk_contains(cand_top, TEST_MPP_EQ_TOP5, ref_top[i])) {
+            top5_overlap++;
+        }
+    }
+
+    double sumsq = 0.0;
+    float max_abs = 0.0f;
+    int nonfinite = 0;
+    int delta_ids[TEST_MPP_EQ_DELTAS];
+    float delta_ref[TEST_MPP_EQ_DELTAS];
+    float delta_cand[TEST_MPP_EQ_DELTAS];
+    float delta_abs[TEST_MPP_EQ_DELTAS];
+    for (int i = 0; i < TEST_MPP_EQ_DELTAS; i++) {
+        delta_ids[i] = -1;
+        delta_ref[i] = 0.0f;
+        delta_cand[i] = 0.0f;
+        delta_abs[i] = 0.0f;
+    }
+
+    for (int i = 0; i < tc->vocab_size; i++) {
+        if (!isfinite(tc->ref_logits[i]) || !isfinite(cand_logits[i])) {
+            nonfinite++;
+            continue;
+        }
+        const float delta = cand_logits[i] - tc->ref_logits[i];
+        const float abs_delta = fabsf(delta);
+        if (abs_delta > max_abs) max_abs = abs_delta;
+        sumsq += (double)delta * (double)delta;
+        test_note_delta(delta_ids, delta_ref, delta_cand, delta_abs,
+                        (int)i, tc->ref_logits[i], cand_logits[i]);
+    }
+
+    const float rms = (float)sqrt(sumsq / (double)tc->vocab_size);
+    const float top_abs = test_top_union_max_abs(tc->ref_logits, cand_logits,
+                                                 ref_top, cand_top, TEST_MPP_EQ_TOPK);
+    const bool same_top1 = ref_top[0] >= 0 && ref_top[0] == cand_top[0];
+    test_mpp_eq_result result = {
+        .ref_top1 = ref_top[0],
+        .cand_top1 = cand_top[0],
+        .overlap = overlap,
+        .top5_overlap = top5_overlap,
+        .max_rank_delta = max_rank_delta,
+        .nonfinite = nonfinite,
+        .rms = rms,
+        .max_abs = max_abs,
+        .top20_max_abs = top_abs,
+        .same_top1 = same_top1,
+        .pass = nonfinite == 0 && same_top1,
+    };
+
+    fprintf(stderr,
+            "ds4-test: Tensor equivalence %s top1 ref=%d cand=%d top5_overlap=%d/%d overlap=%d/%d max_rank_delta=%d rms=%g max_abs=%g top20_max_abs=%g\n",
+            tc->id, ref_top[0], cand_top[0],
+            top5_overlap, TEST_MPP_EQ_TOP5,
+            overlap, TEST_MPP_EQ_TOPK,
+            max_rank_delta, rms, max_abs, top_abs);
+    fprintf(stderr, "ds4-test: Tensor equivalence %s largest deltas:", tc->id);
+    for (int i = 0; i < TEST_MPP_EQ_DELTAS && delta_ids[i] >= 0; i++) {
+        fprintf(stderr, " id=%d ref=%g cand=%g abs=%g",
+                delta_ids[i], delta_ref[i], delta_cand[i], delta_abs[i]);
+    }
+    fputc('\n', stderr);
+
+    if (assert_thresholds) {
+        TEST_ASSERT(nonfinite == 0);
+        TEST_ASSERT(same_top1);
+    }
+    return result;
+}
+
+static bool test_mpp_capture(ds4_engine *engine, const test_mpp_eq_case *tc,
+                             float *logits, int *gen, int *gen_len) {
+    ds4_session *session = NULL;
+    TEST_ASSERT(ds4_session_create(&session, engine, tc->ctx) == 0);
+    if (!session) return false;
+
+    char err[160];
+    bool ok = ds4_session_sync(session, &tc->prompt, err, sizeof(err)) == 0;
+    TEST_ASSERT(ok);
+    if (ok) {
+        ok = ds4_session_copy_logits(session, logits, tc->vocab_size) == tc->vocab_size;
+        TEST_ASSERT(ok);
+    }
+
+    int n = 0;
+    while (ok && n < tc->gen_steps) {
+        const int token = ds4_session_argmax(session);
+        gen[n++] = token;
+        if (n < tc->gen_steps && ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+            ok = false;
+            TEST_ASSERT(false);
+        }
+    }
+    *gen_len = n;
+
+    ds4_session_free(session);
+    return ok;
+}
+
+static bool test_mpp_eq_case_selected(const char *id) {
+    const char *filter = getenv("DS4_TEST_MPP_EQ_CASE");
+    if (!filter || !filter[0]) return true;
+
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s", filter);
+    for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
+        tok = test_trim_line(tok);
+        if (tok[0] && strstr(id, tok)) return true;
+    }
+    return false;
+}
+
+static int test_load_mpp_cases(ds4_engine *engine, test_mpp_eq_case *cases, int cap) {
+    const char *path = getenv("DS4_TEST_VECTOR_FILE");
+    if (!path || !path[0]) path = "tests/test-vectors/official.vec";
+    FILE *fp = fopen(path, "rb");
+    TEST_ASSERT(fp != NULL);
+    if (!fp) return 0;
+
+    int ncase = 0;
+    test_vec_case vc;
+    while (ncase < cap && test_read_vector_case(fp, &vc)) {
+        if (!test_fill_vector_case(fp, &vc)) break;
+        if (!test_mpp_eq_case_selected(vc.id)) continue;
+        char *prompt_text = test_read_file(vc.prompt_path);
+        TEST_ASSERT(prompt_text != NULL);
+        if (!prompt_text) continue;
+
+        test_mpp_eq_case *tc = &cases[ncase++];
+        snprintf(tc->id, sizeof(tc->id), "%s", vc.id);
+        tc->ctx = vc.ctx;
+        tc->vocab_size = ds4_engine_vocab_size(engine);
+        tc->gen_steps = vc.nsteps < TEST_VEC_MAX_STEPS ? vc.nsteps : TEST_VEC_MAX_STEPS;
+        ds4_encode_chat_prompt(engine, "", prompt_text, DS4_THINK_NONE, &tc->prompt);
+        free(prompt_text);
+        TEST_ASSERT(tc->prompt.len > 0);
+    }
+    fclose(fp);
+    return ncase;
+}
+
+static void test_mpp_summary_init(test_mpp_eq_summary *summary, const char *label) {
+    memset(summary, 0, sizeof(*summary));
+    summary->label = label;
+    summary->min_overlap = TEST_MPP_EQ_TOPK;
+    summary->min_top5_overlap = TEST_MPP_EQ_TOP5;
+}
+
+static void test_mpp_summary_note_logits(test_mpp_eq_summary *summary,
+                                         const test_mpp_eq_result *result) {
+    if (!result->pass) summary->logits_failures++;
+    if (!result->same_top1) summary->top1_mismatches++;
+    if (result->overlap < summary->min_overlap) summary->min_overlap = result->overlap;
+    if (result->top5_overlap < summary->min_top5_overlap) {
+        summary->min_top5_overlap = result->top5_overlap;
+    }
+    if (result->max_rank_delta > summary->worst_rank_delta) {
+        summary->worst_rank_delta = result->max_rank_delta;
+    }
+    if (result->rms > summary->worst_rms) summary->worst_rms = result->rms;
+    if (result->max_abs > summary->worst_max_abs) summary->worst_max_abs = result->max_abs;
+    if (result->top20_max_abs > summary->worst_top20_max_abs) {
+        summary->worst_top20_max_abs = result->top20_max_abs;
+    }
+}
+
+static void test_mpp_summary_print(const test_mpp_eq_summary *summary) {
+    fprintf(stderr,
+            "ds4-test: Tensor summary route=%s cases=%d capture_fail=%d logits_fail=%d greedy_fail=%d top1_mismatch=%d min_top5_overlap=%d/%d min_overlap=%d/%d worst_rank_delta=%d worst_rms=%g worst_max_abs=%g worst_top20_max_abs=%g\n",
+            summary->label,
+            summary->cases,
+            summary->capture_failures,
+            summary->logits_failures,
+            summary->greedy_failures,
+            summary->top1_mismatches,
+            summary->min_top5_overlap,
+            TEST_MPP_EQ_TOP5,
+            summary->min_overlap,
+            TEST_MPP_EQ_TOPK,
+            summary->worst_rank_delta,
+            summary->worst_rms,
+            summary->worst_max_abs,
+            summary->worst_top20_max_abs);
+}
+
+static void test_run_mpp_candidate(const char *label,
+                                   test_mpp_eq_case *cases,
+                                   int ncase) {
+    fprintf(stderr, "ds4-test: Tensor equivalence candidate route=%s\n", label);
+    test_mpp_eq_summary summary;
+    test_mpp_summary_init(&summary, label);
+    ds4_engine *cand_engine = test_open_engine(false);
+    if (cand_engine) {
+        const int vocab_size = ncase > 0 ? cases[0].vocab_size : 0;
+        float *cand_logits = malloc((size_t)vocab_size * sizeof(cand_logits[0]));
+        TEST_ASSERT(cand_logits != NULL);
+        if (cand_logits) {
+            for (int i = 0; i < ncase; i++) {
+                test_mpp_eq_case *tc = &cases[i];
+                if (!tc->ref_logits) continue;
+                int cand_gen[TEST_VEC_MAX_STEPS] = {0};
+                int cand_gen_len = 0;
+                if (!test_mpp_capture(cand_engine, tc, cand_logits, cand_gen, &cand_gen_len)) {
+                    summary.capture_failures++;
+                    continue;
+                }
+                summary.cases++;
+                test_mpp_eq_result result = test_compare_mpp_logits(tc, cand_logits, true);
+                test_mpp_summary_note_logits(&summary, &result);
+                TEST_ASSERT(cand_gen_len == tc->ref_gen_len);
+                if (cand_gen_len != tc->ref_gen_len) summary.greedy_failures++;
+                for (int j = 0; j < tc->ref_gen_len && j < cand_gen_len; j++) {
+                    if (cand_gen[j] != tc->ref_gen[j]) {
+                        fprintf(stderr,
+                                "ds4-test: Tensor equivalence %s greedy token mismatch step=%d ref=%d cand=%d\n",
+                                tc->id, j, tc->ref_gen[j], cand_gen[j]);
+                        summary.greedy_failures++;
+                    }
+                    TEST_ASSERT(cand_gen[j] == tc->ref_gen[j]);
+                }
+            }
+            free(cand_logits);
+        }
+        ds4_engine_close(cand_engine);
+    }
+    test_mpp_summary_print(&summary);
+}
+
+static void test_metal_mpp_equivalence(void) {
+    test_close_engines();
+
+    test_mpp_eq_case cases[TEST_MPP_EQ_MAX_CASES];
+    memset(cases, 0, sizeof(cases));
+
+    char *saved_disable_metal4 = test_save_env("DS4_METAL_DISABLE_METAL4");
+    setenv("DS4_METAL_DISABLE_METAL4", "1", 1);
+    ds4_engine *ref_engine = test_open_engine(false);
+    if (!ref_engine) {
+        test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
+        return;
+    }
+
+    const int ncase = test_load_mpp_cases(ref_engine, cases, TEST_MPP_EQ_MAX_CASES);
+    TEST_ASSERT(ncase > 0);
+    for (int i = 0; i < ncase; i++) {
+        test_mpp_eq_case *tc = &cases[i];
+        tc->ref_logits = malloc((size_t)tc->vocab_size * sizeof(tc->ref_logits[0]));
+        TEST_ASSERT(tc->ref_logits != NULL);
+        if (!tc->ref_logits) continue;
+        TEST_ASSERT(test_mpp_capture(ref_engine, tc,
+                                     tc->ref_logits,
+                                     tc->ref_gen,
+                                     &tc->ref_gen_len));
+    }
+    ds4_engine_close(ref_engine);
+    test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
+
+    test_run_mpp_candidate("auto", cases, ncase);
+
+    for (int i = 0; i < ncase; i++) test_mpp_eq_case_free(&cases[i]);
 }
 
 static const char *test_tool_call_request_json(void) {
@@ -665,8 +1402,10 @@ static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
-    {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison", test_official_logprob_vectors},
-    {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_f16_matvec_fast_nr0_4},
+    {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard Metal path", test_official_logprob_vectors},
+    {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4},
+    {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
+    {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
@@ -681,15 +1420,25 @@ static void test_print_help(const char *prog) {
     }
     puts("  --list");
     puts("      Print test names only.");
+#ifndef DS4_NO_GPU
+    puts("  --metal-mpp-equivalence");
+    puts("      Compatibility alias for --metal-tensor-equivalence.");
+#endif
     puts("  -h, --help");
     puts("      Show this help.");
     puts("\nEnvironment:");
     puts("  DS4_TEST_MODEL=FILE        Model path. Default: ds4flash.gguf");
     puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");
     puts("  DS4_TEST_VECTOR_FILE=FILE  Simple official-vector fixture.");
+    puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
 }
 
 static const ds4_test_entry *test_find_entry(const char *arg) {
+#ifndef DS4_NO_GPU
+    if (!strcmp(arg, "--metal-mpp-equivalence")) {
+        arg = "--metal-tensor-equivalence";
+    }
+#endif
     for (size_t i = 0; i < sizeof(test_entries) / sizeof(test_entries[0]); i++) {
         if (!strcmp(arg, test_entries[i].flag)) return &test_entries[i];
     }

@@ -25,6 +25,10 @@ The C runner consumes `official.vec` directly:
 ./ds4_test --logprob-vectors
 ```
 
+The runner opens the normal non-quality path with accelerator-specific fast
+routes disabled and pins `DS4_METAL_PREFILL_CHUNK=2048` for this strict
+official-vector check.
+
 `official.vec` is intentionally trivial to parse from C: each case points to a
 prompt file and each expected token is hex-encoded by bytes. The official JSON
 files remain in the tree so the compact fixture can be audited against the raw

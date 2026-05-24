@@ -30,6 +30,9 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
+int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                   const ds4_gpu_tensor *src, uint64_t src_offset,
+                                   uint64_t count);
 
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
@@ -426,6 +429,7 @@ int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                raw_cap,
         uint32_t                raw_start,
         const ds4_gpu_tensor *comp_kv,
+        uint32_t                comp_kv_f16,
         uint32_t                n_comp,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_mask,
@@ -468,6 +472,7 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
+        uint32_t                comp_kv_f16,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
         uint32_t                n_tokens,
@@ -489,6 +494,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
+        uint32_t                comp_kv_f16,
         const ds4_gpu_tensor *topk,
         uint32_t                n_tokens,
         uint32_t                pos0,
@@ -510,6 +516,7 @@ int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
+        uint32_t                comp_kv_f16,
         uint32_t                n_tokens,
         uint32_t                n_comp,
         uint32_t                window,
@@ -525,6 +532,7 @@ int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
+        uint32_t                comp_kv_f16,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                n_tokens,
         uint32_t                n_comp,
@@ -673,6 +681,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                n_expert,
         float                   clamp,
         const ds4_gpu_tensor *x,
+        uint32_t                layer_index,
         uint32_t                n_tokens,
         bool                   *mid_is_f16);
 

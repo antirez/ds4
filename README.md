@@ -83,8 +83,8 @@ next sections.
   how local GGUFs are scored against official DeepSeek V4 Flash continuations.
 - [dir-steering/README.md](dir-steering/README.md): directional steering data,
   vector generation, and usage.
-- [speed-bench/README.md](speed-bench/README.md): benchmark CSV files and graph
-  generation.
+- [speed-bench/README.md](speed-bench/README.md): benchmark commands, charts,
+  and CSV generation.
 - [tests/test-vectors/README.md](tests/test-vectors/README.md): official
   continuation vectors used for regression checks.
 
@@ -160,6 +160,8 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 | MacBook Pro M3 Max, 128 GB | q2 | 11709 tokens | 250.11 t/s | 21.47 t/s |
 | MacBook Pro M3 Max, 128 GB | q4 | short | N/A | N/A |
 | MacBook Pro M3 Max, 128 GB | q4 | long | N/A | N/A |
+| MacBook Pro M5 Max, 128 GB | q2 | short | 87.25 t/s | 34.27 t/s |
+| MacBook Pro M5 Max, 128 GB | q2 | 11707 tokens | 463.44 t/s | 25.90 t/s |
 | Mac Studio M3 Ultra, 512 GB | q2 | short | 84.43 t/s | 36.86 t/s |
 | Mac Studio M3 Ultra, 512 GB | q2 | 11709 tokens | 468.03 t/s | 27.39 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | short | 78.95 t/s | 35.50 t/s |
@@ -167,6 +169,28 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 | DGX Spark GB10, 128 GB | q2 | 7047 tokens | 343.81 t/s | 13.75 t/s |
 
 ![M3 Max t/s](speed-bench/m3_max_ts.svg)
+
+## Reducing heat, power usage and fan noise
+
+Long local inference runs can keep the GPU busy for extended periods. If you
+care more about heat, fan noise, battery life on MacBooks, or reducing thermal
+stress on the hardware than about maximum throughput, use `--power N`.
+
+`--power 100` is the default and means full speed. Lower values ask DS4 to target
+that percentage of GPU usage: `--power 70` targets about 70%, `--power 50`
+targets about half usage, and so forth. DS4 does this by measuring GPU work time
+and inserting small sleeps between work units: during prefill it sleeps between
+layers, and during generation it sleeps between decoded tokens. This reduces
+sustained load without changing model output.
+
+The option is available on the CLI, server, agent, eval, and benchmark tools,
+for example:
+
+```sh
+./ds4 --power 50
+./ds4-agent --power 70
+./ds4-server --power 40 --ctx 100000
+```
 
 ## Native agent
 
@@ -217,6 +241,16 @@ exponential sweeps. Output is CSV with one row per frontier: latest prefill
 interval tokens/sec, generation tokens/sec at that frontier, and
 `kvcache_bytes`.
 
+Sessions prefill long prompts in 4096-token chunks by default. Set
+`DS4_METAL_PREFILL_CHUNK=N` to compare another chunk size, for example `2048`
+to match the strict official-vector checkpoint path, or
+`DS4_METAL_PREFILL_CHUNK=0` to prefill a prompt as one whole batch when memory
+allows. Changing the chunk changes the KV checkpoint/logit path, so compare it
+as an explicit run configuration.
+Chunked Metal prefill reuses the same range-capable layer-major graph for each
+chunk, preserving absolute compressor/indexer boundaries while avoiding the old
+per-layer chunk dispatch path.
+
 ## Capability Evaluation
 
 `ds4-eval` is a small real-model integration benchmark. It is not a leaderboard
@@ -239,6 +273,34 @@ the generation budget, and refuses runs that would need more than 1M context
 tokens. Press `p` to pause, `q` to exit and print the report, Up/Down to
 inspect or select another question, and Enter to run the selected question next.
 `--plain` disables the TUI.
+
+Use `--regrade-trace /path/to/trace.txt` to replay the current answer
+extractor and scorer against a prior `--trace` file without loading the model
+or regenerating tokens. This is useful when auditing evaluator changes: it
+shows which cases changed, the old picked answer, the new picked answer, and a
+pass/fail summary.
+
+For inference changes that can affect generation drift, keep this deterministic
+q1..q4 token-count gate in the test plan:
+
+```sh
+./ds4-eval \
+  -m ds4flash.gguf \
+  --plain \
+  --questions 4 \
+  --tokens 2048 \
+  --temp 0 \
+  --seed 1
+```
+
+The generated-token counts must stay aligned with the baseline:
+
+| Question | Expected state | Expected generated tokens | Expected given/correct |
+|---:|---|---:|---|
+| 1 | `PASSED` | 2048 | `B` / `B` |
+| 2 | `PASSED` | 438 | `C` / `C` |
+| 3 | `PASSED` | 666 | `70` / `70` |
+| 4 | `FAILED` | 2048 | `A` / `C` |
 
 The first 75 embedded questions are interleaved as 25 GPQA Diamond, 25 audited
 SuperGPQA, and 25 AIME 2025 problems. The final 17 are an audited COMPSEC
@@ -826,12 +888,15 @@ captured from the official DeepSeek V4 Flash API. The requests use
 `deepseek-v4-flash`, greedy decoding, thinking disabled, and the maximum
 `top_logprobs` slice exposed by the API. Local vectors are generated with
 `./ds4 --dump-logprobs` and compared by token bytes, so tokenizer/template or
-attention regressions show up before they become long generation failures.
+attention regressions show up before they become long generation failures. The
+C runner pins `DS4_METAL_PREFILL_CHUNK=2048` for this strict API-vector
+comparison.
 
-All project tests are driven by the C runner:
+All project tests are driven by the C runner, with a small `ds4-eval`
+extractor self-test run first:
 
 ```sh
-make test                  # ./ds4_test --all
+make test                  # ./ds4-eval --self-test-extractors && ./ds4_test --all
 ./ds4_test --logprob-vectors
 ./ds4_test --server
 ```
@@ -844,6 +909,7 @@ first answer:
 ```sh
 ./ds4 --dump-tokens -p "..."
 ./ds4 --dump-logprobs /tmp/out.json --logprobs-top-k 20 --temp 0 -p "..."
+./ds4 --dump-logits /tmp/logits.json --metal --nothink --prompt-file prompt.txt
 ./ds4-server --trace /tmp/ds4-trace.txt ...
 ```
 

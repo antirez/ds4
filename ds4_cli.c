@@ -33,6 +33,7 @@ typedef struct {
     float min_p;
     uint64_t seed;
     bool dump_tokens;
+    const char *dump_logits_path;
     const char *dump_logprobs_path;
     int dump_logprobs_top_k;
     const char *perplexity_file_path;
@@ -113,6 +114,8 @@ static void usage(FILE *fp) {
         "      Apply steering after attention outputs. Default: 0\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before generation. Slower startup, fewer first-use stalls.\n"
+        "  --power N\n"
+        "      Target GPU duty cycle percentage, 1..100. Default: 100\n"
         "\n"
         "Prompt and generation:\n"
         "  -p, --prompt TEXT\n"
@@ -145,6 +148,8 @@ static void usage(FILE *fp) {
         "      Select normal thinking, context-gated Think Max, or non-thinking mode.\n"
         "  /ctx N\n"
         "      Recreate the interactive session with a new context size.\n"
+        "  /power N\n"
+        "      Set GPU duty cycle percentage, 1..100.\n"
         "  /read FILE\n"
         "      Read a prompt from FILE and run it as the next user message.\n"
         "  /quit, /exit\n"
@@ -157,6 +162,8 @@ static void usage(FILE *fp) {
         "      Load the model and print a summary only.\n"
         "  --dump-tokens\n"
         "      Tokenize -p/--prompt-file exactly as written, then exit without inference.\n"
+        "  --dump-logits FILE\n"
+        "      Write full next-token logits as JSON after prompt prefill, then exit.\n"
         "  --dump-logprobs FILE\n"
         "      Write greedy continuation top-logprobs as JSON without printing text.\n"
         "  --logprobs-top-k N\n"
@@ -636,6 +643,85 @@ static void json_write_token(FILE *fp, ds4_engine *engine, int token) {
     free(text);
 }
 
+static int run_logits_dump(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
+    ds4_session *session = NULL;
+    if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
+        fprintf(stderr, "ds4: --dump-logits requires a graph session backend\n");
+        return 1;
+    }
+
+    char err[160];
+    cli_prefill_progress progress = {
+        .base_tokens = 0,
+        .input_tokens = prompt->len,
+        .use_color = ds4_log_is_tty(stderr),
+    };
+    ds4_session_set_progress(session, cli_prefill_progress_cb, &progress);
+    if (ds4_session_sync(session, prompt, err, sizeof(err)) != 0) {
+        ds4_session_set_progress(session, NULL, NULL);
+        fprintf(stderr, "ds4: prompt processing failed: %s\n", err);
+        ds4_session_free(session);
+        return 1;
+    }
+    ds4_session_set_progress(session, NULL, NULL);
+
+    const int vocab = ds4_engine_vocab_size(engine);
+    float *logits = malloc((size_t)vocab * sizeof(logits[0]));
+    if (!logits) {
+        ds4_session_free(session);
+        return 1;
+    }
+    if (ds4_session_copy_logits(session, logits, vocab) != vocab) {
+        fprintf(stderr, "ds4: failed to copy session logits\n");
+        free(logits);
+        ds4_session_free(session);
+        return 1;
+    }
+
+    FILE *fp = fopen(cfg->gen.dump_logits_path, "wb");
+    if (!fp) {
+        fprintf(stderr, "ds4: failed to open --dump-logits file: %s\n", cfg->gen.dump_logits_path);
+        free(logits);
+        ds4_session_free(session);
+        return 1;
+    }
+
+    fprintf(fp, "{\n  \"source\":\"ds4\",\n  \"model\":");
+    json_write_string(fp, cfg->engine.model_path, strlen(cfg->engine.model_path));
+    fprintf(fp,
+            ",\n  \"backend\":\"%s\",\n  \"quant_bits\":%d,\n"
+            "  \"prompt_tokens\":%d,\n  \"ctx\":%d,\n  \"vocab\":%d,\n",
+            ds4_backend_name(cfg->engine.backend),
+            ds4_engine_routed_quant_bits(engine),
+            prompt->len,
+            cfg->gen.ctx_size,
+            vocab);
+    const int argmax = ds4_session_argmax(session);
+    fputs("  \"argmax_token\":", fp);
+    json_write_token(fp, engine, argmax);
+    fprintf(fp, ",\n  \"argmax_logit\":%.9g,\n  \"logits\":[", logits[argmax]);
+    for (int i = 0; i < vocab; i++) {
+        if (i) fputc(',', fp);
+        if ((i % 8) == 0) fputs("\n    ", fp);
+        if (isfinite(logits[i])) {
+            fprintf(fp, "%.9g", logits[i]);
+        } else {
+            fputs("null", fp);
+        }
+    }
+    fputs("\n  ]\n}\n", fp);
+    if (fclose(fp) != 0) {
+        fprintf(stderr, "ds4: failed to close --dump-logits file: %s\n", cfg->gen.dump_logits_path);
+        free(logits);
+        ds4_session_free(session);
+        return 1;
+    }
+
+    free(logits);
+    ds4_session_free(session);
+    return 0;
+}
+
 static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
@@ -815,6 +901,11 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
         ds4_tokens_free(&prompt);
         return rc;
     }
+    if (cfg->gen.dump_logits_path) {
+        rc = run_logits_dump(engine, cfg, &prompt);
+        ds4_tokens_free(&prompt);
+        return rc;
+    }
     if (cfg->gen.dump_logprobs_path) {
         rc = run_logprob_dump(engine, cfg, &prompt);
         ds4_tokens_free(&prompt);
@@ -883,9 +974,18 @@ static void print_repl_help(void) {
     puts("  /think-max     Use Think Max only when context is at least 393216 tokens.");
     puts("  /nothink       Disable thinking mode.");
     puts("  /ctx N         Set context size for following prompts.");
+    puts("  /power N       Set GPU duty cycle percentage, 1..100.");
     puts("  /read FILE     Read a prompt from FILE and run it.");
     puts("  /quit, /exit   Leave the prompt.");
     puts("  Ctrl+C         Stop generation and return to the prompt.");
+}
+
+static bool parse_power_percent(const char *arg, int *out) {
+    char *end = NULL;
+    long v = strtol(arg, &end, 10);
+    if (!arg[0] || *end != '\0' || v < 1 || v > 100) return false;
+    *out = (int)v;
+    return true;
 }
 
 static void history_file_path(char *buf, size_t len) {
@@ -1169,6 +1269,21 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
             cfg->gen.think_mode = DS4_THINK_NONE;
             repl_chat_apply_max_prefix(engine, &chat, false);
             puts("Thinking mode: none.");
+        } else if (!strncmp(cmd, "/power", 6) && (cmd[6] == '\0' || isspace((unsigned char)cmd[6]))) {
+            char *arg = trim_inplace(cmd + 6);
+            if (!arg[0]) {
+                printf("Power: %d%%.\n", ds4_session_power(chat.session));
+            } else {
+                int power = 0;
+                if (!parse_power_percent(arg, &power)) {
+                    fprintf(stderr, "ds4: /power must be between 1 and 100\n");
+                } else if (ds4_session_set_power(chat.session, power) != 0) {
+                    fprintf(stderr, "ds4: failed to set /power\n");
+                } else {
+                    cfg->engine.power_percent = power;
+                    printf("Power: %d%%.\n", power);
+                }
+            }
         } else if (!strncmp(cmd, "/ctx", 4) && (cmd[4] == '\0' || isspace((unsigned char)cmd[4]))) {
             char *arg = trim_inplace(cmd + 4);
             if (!arg[0]) {
@@ -1332,6 +1447,12 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
+        } else if (!strcmp(arg, "--power")) {
+            c.engine.power_percent = parse_int(need_arg(&i, argc, argv, arg), arg);
+            if (c.engine.power_percent < 1 || c.engine.power_percent > 100) {
+                fprintf(stderr, "ds4: --power must be between 1 and 100\n");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--dir-steering-file")) {
             c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dir-steering-ffn")) {
@@ -1352,6 +1473,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_CUDA;
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
+        } else if (!strcmp(arg, "--dump-logits")) {
+            c.gen.dump_logits_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-logprobs")) {
             c.gen.dump_logprobs_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--logprobs-top-k")) {
