@@ -9503,7 +9503,10 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
 
 static void server_progress_cb(void *ud, const char *event, int current, int total) {
     server_prefill_progress *p = ud;
-    if (!p || !event || strcmp(event, "prefill_chunk")) return;
+    if (!p || !event) return;
+    const bool is_chunk = strcmp(event, "prefill_chunk") == 0;
+    const bool is_display = strcmp(event, "prefill_display") == 0;
+    if (!is_chunk && !is_display) return;
 
     double now = now_sec();
     /* Keep the HTTP/SSE connection alive while prefill runs.  We write the SSE
@@ -9529,6 +9532,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
             }
         }
     }
+    if (is_display) return;
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
         if (p->srv && current > p->cached_tokens) {
@@ -9797,8 +9801,10 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
         };
         snprintf(rebuild_progress.ctx, sizeof(rebuild_progress.ctx), "%s", rebuild_ctx);
         ds4_session_set_progress(s->session, server_progress_cb, &rebuild_progress);
+        ds4_session_set_display_progress(s->session, server_progress_cb, &rebuild_progress);
         if (ds4_session_sync(s->session, sync_prompt, sync_err, sizeof(sync_err)) == 0) {
             ds4_session_set_progress(s->session, NULL, NULL);
+            ds4_session_set_display_progress(s->session, NULL, NULL);
             const double rebuild_sec = now_sec() - rebuild_t0;
             if (loaded > 0) {
                 server_log(DS4_LOG_KVCACHE,
@@ -9817,6 +9823,7 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
             }
         } else {
             ds4_session_set_progress(s->session, NULL, NULL);
+            ds4_session_set_display_progress(s->session, NULL, NULL);
             server_log(DS4_LOG_KVCACHE,
                        "ds4-server: tool checkpoint rebuild failed ctx=%s request_ctx=%s source=%s cached=%d replay=%d target=%d error=\"%s\"",
                        rebuild_ctx, ctx, source, loaded, replay_tokens,
@@ -10064,6 +10071,7 @@ static void generate_job(server *s, job *j) {
                req_flags[0] ? " " : "",
                req_flags);
     ds4_session_set_progress(s->session, server_progress_cb, &progress);
+    ds4_session_set_display_progress(s->session, server_progress_cb, &progress);
 
     int cold_store_len = 0;
     if (cached == 0 &&
@@ -10100,6 +10108,7 @@ static void generate_job(server *s, job *j) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(s->session, NULL, NULL);
+            ds4_session_set_display_progress(s->session, NULL, NULL);
             kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                                   cold_store_len);
             trace_event(s, trace_id, "prefill failed: %s", err);
@@ -10120,6 +10129,7 @@ static void generate_job(server *s, job *j) {
     if (ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err)) != 0) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(s->session, NULL, NULL);
+        ds4_session_set_display_progress(s->session, NULL, NULL);
         kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                               cold_store_len);
         trace_event(s, trace_id, "prefill failed: %s", err);
@@ -10132,6 +10142,7 @@ static void generate_job(server *s, job *j) {
     if (!anthropic_live_continuation) anthropic_live_clear(s);
     if (!thinking_live_continuation) thinking_live_clear(s);
     ds4_session_set_progress(s->session, NULL, NULL);
+    ds4_session_set_display_progress(s->session, NULL, NULL);
     kv_cache_maybe_store_continued(s);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",

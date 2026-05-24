@@ -206,7 +206,18 @@ few advantages:
 * No DSML tool calling conversion, the tools are handled natively in the LLM format.
 * KV cache mismatch are impossible by construction, the current state is always the truth.
 * Everything is tuned for this model.
-* Ability to switch session with `/list` and `/switch` without any prefill stage.
+* Ability to switch saved sessions with `/list` and `/switch`; full KV sessions resume without a prefill stage.
+
+Agent sessions are stored in `~/.ds4/kvcache`. Use `/save` to persist the
+current session, `/list` to show saved sessions sorted by recent update time,
+and `/switch <sha>` to resume one of them. The session ID is stable across
+future saves and is derived from the first user prompt and creation time.
+`/del <sha>` removes a saved session. `/strip <sha>` keeps the rendered
+conversation text and title but removes the heavy KV payload; switching to a
+stripped session rebuilds the KV cache by prefilling the saved text.
+
+Use `--chdir /path/to/ds4` when launching `ds4-agent` from another directory,
+so relative runtime files such as `metal/*.metal` resolve from the project tree.
 
 However while the system already works, there is a lot of work to do
 in order to make it ready for prime time. When finally the agent will reach

@@ -13617,12 +13617,15 @@ static bool metal_graph_prefill_layer_major(
     const bool split_profile = getenv("DS4_METAL_GRAPH_PREFILL_SPLIT_PROFILE") != NULL;
     /*
      * A full long-prompt prefill can keep the GPU busy long enough for macOS
-     * to watchdog WindowServer. Keep short prompts in one command buffer for
-     * low overhead, but submit long prompts layer by layer so the display
-     * server gets regular scheduling points.
+     * to watchdog WindowServer. Also split non-tiny prefills when a frontend
+     * asked for display progress: completed layer command buffers are real
+     * scheduling/keepalive points, while callbacks emitted while encoding one
+     * huge command buffer would only be cosmetic.
      */
     const bool throttle = graph_power_throttle_enabled(g);
-    const bool split_commands = split_profile || throttle || n_tokens > 2048 || imatrix != NULL;
+    const bool callback_split = display_progress != NULL && n_tokens >= 32;
+    const bool split_commands = split_profile || throttle || callback_split ||
+                                n_tokens > 2048 || imatrix != NULL;
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL || split_profile;
     const double t0 = profile ? now_sec() : 0.0;
     double encode_s = 0.0;
