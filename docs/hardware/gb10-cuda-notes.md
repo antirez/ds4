@@ -2538,4 +2538,3 @@ CUDA-Graph-ing the whole layer — both structural refactors.
 | --- | --- |
 | `DS4_CUDA_Q8_PAIR_NO_WARP1_QUAD=1` | Restore 8-output/CTA pair kernel |
 | `DS4_CUDA_Q8_HC_EXPAND_NO_WARP1=1` | Force the warp8-unroll hc_expand variant |
-
