@@ -1450,6 +1450,9 @@ static const char *ds4_gpu_source =
 static NSString *ds4_gpu_full_source(void) {
     NSString *base = [NSString stringWithUTF8String:ds4_gpu_source];
     NSFileManager *fm = [NSFileManager defaultManager];
+    const char *runtime_root_c = getenv("DS4_RUNTIME_ROOT");
+    NSString *runtime_root = runtime_root_c && runtime_root_c[0] ?
+        [NSString stringWithUTF8String:runtime_root_c] : nil;
     /*
      * Kernels are kept as separate files for review, then concatenated into one
      * Metal library.  Environment overrides are still honored so a diagnostic
@@ -1483,6 +1486,9 @@ static NSString *ds4_gpu_full_source(void) {
         NSMutableArray<NSString *> *paths = [NSMutableArray array];
         if (override_path && override_path[0]) {
             [paths addObject:[NSString stringWithUTF8String:override_path]];
+        }
+        if (runtime_root) {
+            [paths addObject:[runtime_root stringByAppendingPathComponent:spec[1]]];
         }
         [paths addObject:spec[1]];
         [paths addObject:[@"./" stringByAppendingString:spec[1]]];

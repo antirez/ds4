@@ -216,8 +216,12 @@ future saves and is derived from the first user prompt and creation time.
 conversation text and title but removes the heavy KV payload; switching to a
 stripped session rebuilds the KV cache by prefilling the saved text.
 
-Use `--chdir /path/to/ds4` when launching `ds4-agent` from another directory,
-so relative runtime files such as `metal/*.metal` resolve from the project tree.
+When launched from another project directory, `ds4-agent` keeps the caller's
+current directory as its workspace while resolving default runtime files such
+as `ds4flash.gguf` and `metal/*.metal` from the directory containing the
+`ds4-agent` binary. Use `--runtime-root /path/to/ds4` only when those assets
+live somewhere else. `--chdir` is still available when you intentionally want
+to change the agent process cwd.
 
 However while the system already works, there is a lot of work to do
 in order to make it ready for prime time. When finally the agent will reach

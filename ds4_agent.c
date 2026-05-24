@@ -26,6 +26,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+
 /* This is intentionally not in linenoise.h, but it is part of the existing
  * multiplexed editor implementation.  The agent uses it only to restore text
  * after Enter is pressed while the model is still busy. */
@@ -61,6 +65,7 @@ typedef struct {
     ds4_engine_options engine;
     agent_generation_options gen;
     const char *chdir_path;
+    const char *runtime_root;
     bool non_interactive;
 } agent_config;
 
@@ -329,6 +334,121 @@ static char *xstrndup(const char *s, size_t n) {
     return p;
 }
 
+static bool agent_path_is_absolute(const char *path) {
+    return path && path[0] == '/';
+}
+
+static char *agent_path_join(const char *root, const char *rel) {
+    if (!root || !root[0]) return xstrdup(rel ? rel : "");
+    if (!rel || !rel[0]) return xstrdup(root);
+    if (agent_path_is_absolute(rel)) return xstrdup(rel);
+
+    size_t root_len = strlen(root);
+    while (root_len > 1 && root[root_len - 1] == '/') root_len--;
+
+    size_t rel_len = strlen(rel);
+    char *out = xmalloc(root_len + 1 + rel_len + 1);
+    memcpy(out, root, root_len);
+    out[root_len] = '/';
+    memcpy(out + root_len + 1, rel, rel_len + 1);
+    return out;
+}
+
+static char *agent_absolute_path(const char *path, const char *opt) {
+    if (!path || !path[0]) {
+        fprintf(stderr, "ds4-agent: %s must not be empty\n", opt);
+        exit(2);
+    }
+    if (agent_path_is_absolute(path)) return xstrdup(path);
+
+    char cwd[PATH_MAX];
+    if (!getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "ds4-agent: failed to resolve %s: %s\n",
+                opt, strerror(errno));
+        exit(2);
+    }
+    return agent_path_join(cwd, path);
+}
+
+static char *agent_dirname_owned(char *path) {
+    char *slash = strrchr(path, '/');
+    if (!slash) {
+        free(path);
+        return xstrdup(".");
+    }
+    if (slash == path) {
+        slash[1] = '\0';
+    } else {
+        *slash = '\0';
+    }
+    return path;
+}
+
+static char *agent_realpath_or_absolute(const char *path) {
+    char resolved[PATH_MAX];
+    if (realpath(path, resolved)) return xstrdup(resolved);
+    return agent_absolute_path(path, "executable path");
+}
+
+static char *agent_executable_dir(const char *argv0) {
+#ifdef __APPLE__
+    char stack_path[PATH_MAX];
+    uint32_t len = sizeof(stack_path);
+    if (_NSGetExecutablePath(stack_path, &len) == 0)
+        return agent_dirname_owned(agent_realpath_or_absolute(stack_path));
+    if (len > 0) {
+        char *buf = xmalloc((size_t)len + 1);
+        if (_NSGetExecutablePath(buf, &len) == 0) {
+            buf[len] = '\0';
+            char *path = agent_realpath_or_absolute(buf);
+            free(buf);
+            return agent_dirname_owned(path);
+        }
+        free(buf);
+    }
+#elif defined(__linux__)
+    char proc_path[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", proc_path, sizeof(proc_path) - 1);
+    if (n > 0) {
+        proc_path[n] = '\0';
+        return agent_dirname_owned(agent_realpath_or_absolute(proc_path));
+    }
+#endif
+
+    if (argv0 && strchr(argv0, '/'))
+        return agent_dirname_owned(agent_realpath_or_absolute(argv0));
+    return NULL;
+}
+
+static void agent_apply_runtime_root(agent_config *c, bool model_path_set,
+                                     const char *argv0) {
+    char *detected_root = NULL;
+    const char *env_root = getenv("DS4_RUNTIME_ROOT");
+    if ((!c->runtime_root || !c->runtime_root[0]) && env_root && env_root[0])
+        c->runtime_root = env_root;
+    if (!c->runtime_root || !c->runtime_root[0]) {
+        detected_root = agent_executable_dir(argv0);
+        c->runtime_root = detected_root;
+    }
+    if (!c->runtime_root || !c->runtime_root[0]) return;
+
+    c->runtime_root = agent_absolute_path(c->runtime_root, "--runtime-root");
+    free(detected_root);
+    if (setenv("DS4_RUNTIME_ROOT", c->runtime_root, 1) != 0) {
+        fprintf(stderr, "ds4-agent: failed to set DS4_RUNTIME_ROOT: %s\n",
+                strerror(errno));
+        exit(2);
+    }
+
+    if (!model_path_set &&
+        c->engine.model_path && c->engine.model_path[0] &&
+        !agent_path_is_absolute(c->engine.model_path))
+    {
+        c->engine.model_path = agent_path_join(c->runtime_root,
+                                               c->engine.model_path);
+    }
+}
+
 static void *xrealloc(void *ptr, size_t n) {
     void *p = realloc(ptr, n ? n : 1);
     if (!p) {
@@ -494,6 +614,7 @@ static void usage(FILE *fp) {
         "  --metal, --cuda, --cpu Select backend explicitly.\n"
         "  -t, --threads N        CPU helper threads.\n"
         "  --chdir DIR            Change working directory before loading runtime assets.\n"
+        "  --runtime-root DIR     Override runtime asset root. Default: ds4-agent's directory.\n"
         "  --quality              Prefer exact kernels where available.\n"
         "  --warm-weights         Touch mapped tensor pages before generation.\n"
         "  --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n"
@@ -543,6 +664,7 @@ static agent_config parse_options(int argc, char **argv) {
     };
 
     bool steering_scale_set = false;
+    bool model_path_set = false;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
@@ -558,6 +680,7 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
+            model_path_set = true;
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
@@ -594,6 +717,8 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--chdir")) {
             c.chdir_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--runtime-root")) {
+            c.runtime_root = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--power")) {
@@ -621,6 +746,8 @@ static agent_config parse_options(int argc, char **argv) {
 
     if (c.engine.directional_steering_file && !steering_scale_set)
         c.engine.directional_steering_ffn = 1.0f;
+
+    agent_apply_runtime_root(&c, model_path_set, argv[0]);
     return c;
 }
 
