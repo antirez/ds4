@@ -54,6 +54,8 @@ struct ds4_metal_args_dsv4_indexed_attention {
     uint32_t pos0;
     uint32_t window;
     uint32_t ratio;
+    uint32_t comp_kv_f16;
+    uint32_t pad0;
     uint64_t q_token_stride;
     uint64_t q_head_stride;
     uint64_t raw_row_stride;
@@ -467,6 +469,85 @@ static inline void dsv4_attend_shared_f32_row_as_f16_at(
                                       o0, o1, o2, o3);
 }
 
+static inline void dsv4_attend_shared_h4_row(
+        threadgroup const half4 *kv4,
+        half4 q0,
+        half4 q1,
+        half4 q2,
+        half4 q3,
+        float scale,
+        ushort lane,
+        thread float &M,
+        thread float &S,
+        thread float4 &o0,
+        thread float4 &o1,
+        thread float4 &o2,
+        thread float4 &o3) {
+    const half4 k0 = kv4[lane +  0];
+    const half4 k1 = kv4[lane + 32];
+    const half4 k2 = kv4[lane + 64];
+    const half4 k3 = kv4[lane + 96];
+
+    float score = dot((float4)q0, (float4)k0) +
+                  dot((float4)q1, (float4)k1) +
+                  dot((float4)q2, (float4)k2) +
+                  dot((float4)q3, (float4)k3);
+    score = simd_sum(score) * scale;
+
+    const float old_m = M;
+    const float new_m = max(M, score);
+    const float old_scale = exp(old_m - new_m);
+    const float row_scale = exp(score - new_m);
+
+    S = S * old_scale + row_scale;
+    o0 *= old_scale;
+    o1 *= old_scale;
+    o2 *= old_scale;
+    o3 *= old_scale;
+
+    o0 += (float4)k0 * row_scale;
+    o1 += (float4)k1 * row_scale;
+    o2 += (float4)k2 * row_scale;
+    o3 += (float4)k3 * row_scale;
+    M = new_m;
+}
+
+static inline void dsv4_attend_shared_h4_row_at(
+        threadgroup const half4 *kv4,
+        uint row_in_tg,
+        half4 q0,
+        half4 q1,
+        half4 q2,
+        half4 q3,
+        float scale,
+        ushort lane,
+        thread float &M,
+        thread float &S,
+        thread float4 &o0,
+        thread float4 &o1,
+        thread float4 &o2,
+        thread float4 &o3) {
+    dsv4_attend_shared_h4_row(kv4 + row_in_tg * 128u,
+                              q0, q1, q2, q3,
+                              scale,
+                              lane,
+                              M, S,
+                              o0, o1, o2, o3);
+}
+
+static inline half4 dsv4_load_cache_h4(
+        device const char *kv,
+        uint64_t row_stride,
+        uint row,
+        uint col,
+        bool f16_rows) {
+    device const char *base = kv + (uint64_t)row * row_stride;
+    if (f16_rows) {
+        return ((device const half4 *)base)[col];
+    }
+    return (half4)((device const float4 *)base)[col];
+}
+
 static inline void dsv4_attend_sink(
         float score,
         thread float &M,
@@ -501,7 +582,7 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8(
         device const char *topk,
         device const char *sinks,
         device       char *dst,
-        threadgroup float4 *kv_shared [[threadgroup(0)]],
+        threadgroup half4 *kv_shared [[threadgroup(0)]],
         uint2  tgpig [[threadgroup_position_in_grid]],
         ushort tid   [[thread_index_in_threadgroup]],
         ushort lane  [[thread_index_in_simdgroup]],
@@ -542,14 +623,14 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8(
             const uint row = (args.raw_start + logical) % args.raw_cap;
             device const float4 *src = (device const float4 *)(raw_kv +
                 (uint64_t)row * args.raw_row_stride);
-            if (tid < 128) kv_shared[tid] = src[tid];
+            if (tid < 128) kv_shared[tid] = (half4)src[tid];
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            dsv4_attend_shared_f32_row_as_f16(kv_shared,
-                                              q0, q1, q2, q3,
-                                              args.scale,
-                                              lane,
-                                              M, S,
-                                              o0, o1, o2, o3);
+            dsv4_attend_shared_h4_row(kv_shared,
+                                      q0, q1, q2, q3,
+                                      args.scale,
+                                      lane,
+                                      M, S,
+                                      o0, o1, o2, o3);
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
@@ -566,16 +647,20 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8(
         if ((uint)idx >= visible) {
             break;
         }
-        device const float4 *src = (device const float4 *)(comp_kv +
-            (uint64_t)(uint)idx * args.comp_row_stride);
-        if (tid < 128) kv_shared[tid] = src[tid];
+        if (tid < 128) {
+            kv_shared[tid] = dsv4_load_cache_h4(comp_kv,
+                                                args.comp_row_stride,
+                                                (uint)idx,
+                                                tid,
+                                                args.comp_kv_f16 != 0u);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        dsv4_attend_shared_f32_row_as_f16(kv_shared,
-                                          q0, q1, q2, q3,
-                                          args.scale,
-                                          lane,
-                                          M, S,
-                                          o0, o1, o2, o3);
+        dsv4_attend_shared_h4_row(kv_shared,
+                                  q0, q1, q2, q3,
+                                  args.scale,
+                                  lane,
+                                  M, S,
+                                  o0, o1, o2, o3);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -594,10 +679,10 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8(
 // Decode specialization of kernel_dsv4_indexed_mixed_attention_heads8.
 // Generation attends one token at a time, so the ratio-4 indexed path spends a
 // visible amount of time repeatedly staging the same K/V row for the eight
-// heads in a group. This variant stages four selected rows at once and then
+// heads in a group. This variant stages sixteen selected rows at once and then
 // consumes them sequentially, preserving the row order and online softmax math
 // while cutting threadgroup barriers in the long top-k scan.
-kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb4(
+kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16(
         constant ds4_metal_args_dsv4_indexed_attention & args,
         device const char *q,
         device const char *raw_kv,
@@ -605,7 +690,7 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb4(
         device const char *topk,
         device const char *sinks,
         device       char *dst,
-        threadgroup float4 *kv_shared [[threadgroup(0)]],
+        threadgroup half4 *kv_shared [[threadgroup(0)]],
         uint2  tgpig [[threadgroup_position_in_grid]],
         ushort tid   [[thread_index_in_threadgroup]],
         ushort lane  [[thread_index_in_simdgroup]],
@@ -641,8 +726,8 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb4(
     uint last = min(qpos, raw_last_pos);
 
     if (first <= last) {
-        for (uint pos0 = first; pos0 <= last; pos0 += 4u) {
-            const uint n_rows = min(4u, last - pos0 + 1u);
+        for (uint pos0 = first; pos0 <= last; pos0 += 16u) {
+            const uint n_rows = min(16u, last - pos0 + 1u);
             for (uint off = (uint)tid; off < n_rows * 128u; off += 256u) {
                 const uint r = off >> 7;
                 const uint c = off & 127u;
@@ -650,17 +735,17 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb4(
                 const uint row = (args.raw_start + logical) % args.raw_cap;
                 device const float4 *src = (device const float4 *)(raw_kv +
                     (uint64_t)row * args.raw_row_stride);
-                kv_shared[off] = src[c];
+                kv_shared[off] = (half4)src[c];
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint r = 0; r < n_rows; r++) {
-                dsv4_attend_shared_f32_row_as_f16_at(kv_shared,
-                                                     r,
-                                                     q0, q1, q2, q3,
-                                                     args.scale,
-                                                     lane,
-                                                     M, S,
-                                                     o0, o1, o2, o3);
+                dsv4_attend_shared_h4_row_at(kv_shared,
+                                             r,
+                                             q0, q1, q2, q3,
+                                             args.scale,
+                                             lane,
+                                             M, S,
+                                             o0, o1, o2, o3);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
@@ -671,10 +756,10 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb4(
     device const int32_t *row_topk = (device const int32_t *)(topk +
         (uint64_t)token * args.topk_token_stride);
     bool stop = false;
-    for (uint i = 0; i < args.top_k && !stop; i += 4u) {
-        uint rows[4];
+    for (uint i = 0; i < args.top_k && !stop; i += 16u) {
+        uint rows[16];
         uint n_rows = 0;
-        for (uint j = 0; j < 4u && i + j < args.top_k; j++) {
+        for (uint j = 0; j < 16u && i + j < args.top_k; j++) {
             const int32_t idx = row_topk[i + j];
             if (idx < 0) {
                 continue;
@@ -691,19 +776,21 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb4(
         for (uint off = (uint)tid; off < n_rows * 128u; off += 256u) {
             const uint r = off >> 7;
             const uint c = off & 127u;
-            device const float4 *src = (device const float4 *)(comp_kv +
-                (uint64_t)rows[r] * args.comp_row_stride);
-            kv_shared[off] = src[c];
+            kv_shared[off] = dsv4_load_cache_h4(comp_kv,
+                                                args.comp_row_stride,
+                                                rows[r],
+                                                c,
+                                                args.comp_kv_f16 != 0u);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint r = 0; r < n_rows; r++) {
-            dsv4_attend_shared_f32_row_as_f16_at(kv_shared,
-                                                 r,
-                                                 q0, q1, q2, q3,
-                                                 args.scale,
-                                                 lane,
-                                                 M, S,
-                                                 o0, o1, o2, o3);
+            dsv4_attend_shared_h4_row_at(kv_shared,
+                                         r,
+                                         q0, q1, q2, q3,
+                                         args.scale,
+                                         lane,
+                                         M, S,
+                                         o0, o1, o2, o3);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -1024,6 +1111,158 @@ kernel void kernel_dsv4_indexer_scores_tiled(
         *dst = comp1 < visible ? acc1 : -INFINITY;
     }
 }
+
+#ifdef DS4_METAL_HAS_TENSOR
+// Retained full-512 prefill indexer score path.  This is the part of sparse
+// compressed attention that maps cleanly to TensorOps: a regular token by
+// compressed-row dot tile.  The kernel intentionally leaves top-k selection and
+// indexed attention semantics unchanged; all 512 selected rows remain available
+// to the later attention kernel.
+kernel void kernel_dsv4_indexer_scores_nax(
+        constant ds4_metal_args_dsv4_indexer_scores_fused & args,
+        device const char *q,
+        device const char *weights,
+        device const char *index_comp,
+        device       char *scores,
+        threadgroup half *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]]) {
+    constexpr int TM = 16;
+    constexpr int TN = 32;
+    constexpr int NK = 32;
+    constexpr int D  = 128;
+    constexpr int NUM_THREADS = 128;
+
+    // The 16-token x 32-row tile was the winning NAX shape in local sweeps.  A
+    // wider 64-row compressed tile increased setup/cache pressure and was
+    // slower despite doing more work per dispatch.
+    const uint c0 = tgpig.x * TN;
+    const uint t0 = tgpig.y * TM;
+
+    threadgroup half  *qtg = shared;               // [16][32]
+    threadgroup half  *ktg = qtg + TM*NK;          // [32][128]
+    threadgroup float *dot = (threadgroup float *)(ktg + TN*D); // [16][32], column-major
+
+    const uint last_token = min(t0 + (uint)TM, args.n_tokens);
+    const uint max_visible = last_token > t0 ?
+        min((args.pos0 + last_token) / args.ratio, args.n_comp) : 0u;
+
+    if (c0 >= max_visible) {
+        for (uint i = tid; i < TM*TN; i += NUM_THREADS) {
+            const uint r = i / TN;
+            const uint cc = i - r*TN;
+            const uint token = t0 + r;
+            const uint comp = c0 + cc;
+            if (token < args.n_tokens && comp < args.n_comp) {
+                device float *dst = (device float *)(scores +
+                    (uint64_t)token * args.score_token_stride) + comp;
+                *dst = -INFINITY;
+            }
+        }
+        return;
+    }
+
+    for (uint work = tid; work < TN*D; work += NUM_THREADS) {
+        const uint cc = work / D;
+        const uint d = work - cc*D;
+        const uint comp = c0 + cc;
+        half v = half(0.0f);
+        if (comp < args.n_comp) {
+            device const float *krow = (device const float *)(index_comp +
+                (uint64_t)comp * args.index_row_stride);
+            v = half(krow[d]);
+        }
+        ktg[cc*D + d] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float acc[4];
+    #pragma unroll
+    for (uint j = 0; j < 4; j++) {
+        acc[j] = 0.0f;
+    }
+
+    auto tq = tensor(qtg, dextents<int32_t, 2>(NK, TM));
+    auto tk = tensor(ktg, dextents<int32_t, 2>(D, TN));
+    auto td = tensor(dot, dextents<int32_t, 2>(TM, TN), array<int, 2>({1, TM}));
+
+    matmul2d<
+        matmul2d_descriptor(TN, TM, NK, false, true, false,
+            matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+
+    for (uint head = 0; head < args.n_head; head++) {
+        auto ct = mm.template get_destination_cooperative_tensor<decltype(tk), decltype(tq), float>();
+        #pragma unroll
+        for (uint16_t i = 0; i < ct.get_capacity(); i++) {
+            if (ct.is_valid_element(i)) {
+                ct[i] = 0.0f;
+            }
+        }
+
+        for (uint loop_k = 0; loop_k < D; loop_k += NK) {
+            for (uint work = tid; work < TM*NK; work += NUM_THREADS) {
+                const uint r = work / NK;
+                const uint k = work - r*NK;
+                const uint token = t0 + r;
+                half v = half(0.0f);
+                if (token < args.n_tokens) {
+                    device const float *qrow = (device const float *)(q +
+                        (uint64_t)token * args.q_token_stride +
+                        (uint64_t)head  * args.q_head_stride);
+                    v = half(qrow[loop_k + k]);
+                }
+                qtg[r*NK + k] = v;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            auto mq = tq.slice(0, 0);
+            auto mk = tk.slice(loop_k, 0);
+            mm.run(mk, mq, ct);
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        ct.store(td);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma unroll
+        for (uint j = 0; j < 4; j++) {
+            const uint linear = (uint)tid + j*NUM_THREADS;
+            if (linear < TM*TN) {
+                const uint r = linear / TN;
+                const uint cc = linear - r*TN;
+                const uint token = t0 + r;
+                if (token < args.n_tokens) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token * args.weights_token_stride);
+                    acc[j] += max(dot[cc*TM + r], 0.0f) * (w[head] * args.scale);
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    #pragma unroll
+    for (uint j = 0; j < 4; j++) {
+        const uint linear = (uint)tid + j*NUM_THREADS;
+        if (linear >= TM*TN) {
+            continue;
+        }
+        const uint r = linear / TN;
+        const uint cc = linear - r*TN;
+        const uint token = t0 + r;
+        const uint comp = c0 + cc;
+        if (token < args.n_tokens && comp < args.n_comp) {
+            const uint visible = min((args.pos0 + token + 1u) / args.ratio, args.n_comp);
+            device float *dst = (device float *)(scores +
+                (uint64_t)token * args.score_token_stride) + comp;
+            *dst = comp < visible ? acc[j] : -INFINITY;
+        }
+    }
+}
+#endif
 
 // Collapses per-head indexer scores into one score per compressed row using the
 // learned head weights. Negative head scores are clipped exactly as DS4 expects.
