@@ -8,6 +8,7 @@
 /ds4_test
 /tests/ds4_agent_context_test
 /tests/ds4_agent_git_test
+/tests/ds4_kv_cache_benefit_test
 /tests/generated/
 /ds4flash.gguf
 /TODO.md

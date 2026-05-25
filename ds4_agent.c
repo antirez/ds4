@@ -7576,6 +7576,7 @@ static char *agent_compact_make_prompt(const char *reason) {
         "- decisions, rejected approaches, known bugs, and pending next steps\n"
         "- reloadable bulky data with exact paths/ranges/commands when available\n\n"
         "Do not invent facts. Do not include generic narration. Do not include raw file contents unless they were essential to a conclusion.\n"
+        "Use plain text headings or bullets. Do not output XML/HTML-like tags such as <context>, <tool_calls>, or <tool_call>.\n"
         "After the summary, stop. Do not continue the user task, do not call tools, and do not output thinking tags or DSML markup.\n"
         "Output only the compact summary.\n");
     if (reason && reason[0]) {
@@ -7587,11 +7588,24 @@ static char *agent_compact_make_prompt(const char *reason) {
 }
 
 static bool agent_compact_summary_has_signal(const char *s) {
-    int alnum = 0;
+    while (*s && isspace((unsigned char)*s)) s++;
+    if (*s == '<') return false;
+    if (strstr(s, "<tool_calls") || strstr(s, "<tool_call") ||
+        strstr(s, "<context") || strstr(s, "｜DSML｜"))
+        return false;
+
+    int alnum = 0, words = 0, run = 0;
     for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
-        if (isalnum(*p) && ++alnum >= 8) return true;
+        if (isalnum(*p)) {
+            alnum++;
+            run++;
+        } else {
+            if (run >= 2) words++;
+            run = 0;
+        }
     }
-    return false;
+    if (run >= 2) words++;
+    return alnum >= 24 && words >= 6;
 }
 
 /* Perform the full compaction exchange and rebuild the live DS4 session from
