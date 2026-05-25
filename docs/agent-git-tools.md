@@ -30,6 +30,9 @@ planning text in the context/KV document is historical only after the split:
 
 ## Implemented Actions
 
+The model-visible DSML schema enumerates the same action set so invalid action
+names are rejected before the model has to infer command names from prose.
+
 Read-only actions include `info`, `status`, `changed_files`, `diff`, `log`,
 `show`, `ls_files`, `file_at_ref`, `blame`, `path_history`, `remote_list`,
 `merge_base`, `merge_preview`, and `rebase_preview`.

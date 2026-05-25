@@ -809,7 +809,7 @@ static const char agent_tools_prompt_after_edit[] =
     "    \"parameters\": {\n"
     "      \"type\": \"object\",\n"
     "      \"properties\": {\n"
-    "        \"action\": {\"type\": \"string\"},\n"
+    "        \"action\": {\"type\": \"string\", \"enum\": [\"info\", \"status\", \"changed_files\", \"diff\", \"log\", \"show\", \"ls_files\", \"file_at_ref\", \"blame\", \"path_history\", \"log_path\", \"remote_list\", \"merge_base\", \"merge_preview\", \"rebase_preview\", \"stage\", \"unstage\", \"commit\", \"worktree_restore\", \"switch\", \"stash_list\", \"stash_push\", \"stash_show\", \"stash_apply\", \"stash_pop\", \"stash_drop\", \"fetch\", \"push\", \"merge\", \"merge_abort\", \"rebase\", \"rebase_abort\"]},\n"
     "        \"repo\": {\"type\": \"string\"},\n"
     "        \"path\": {\"type\": \"string\"},\n"
     "        \"ref\": {\"type\": \"string\"},\n"
