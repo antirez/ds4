@@ -29,6 +29,12 @@ typedef struct ds4_agent_side_effects {
     uint64_t latest_evicted_epoch;
 } ds4_agent_side_effects;
 
+typedef struct ds4_agent_context_restore_metrics {
+    int checkpoint_tokens;
+    int restore_notice_tokens;
+    int restored_tokens;
+} ds4_agent_context_restore_metrics;
+
 void ds4_agent_context_meta_free(ds4_agent_context_meta *m);
 bool ds4_agent_context_id_valid(const char *id);
 bool ds4_agent_context_file_component_safe(const char *s);
@@ -73,5 +79,7 @@ bool ds4_agent_context_restore_epoch_guard(uint64_t current_epoch,
                                            bool allow_side_effect_mismatch,
                                            char *err,
                                            size_t err_len);
+char *ds4_agent_context_restore_expected_metrics_line(
+        const ds4_agent_context_restore_metrics *metrics);
 
 #endif

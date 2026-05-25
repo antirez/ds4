@@ -172,6 +172,26 @@ int main(void) {
     CHECK(strstr(err, "2 bash job(s)") != NULL,
           "bash guard error missing job count");
 
+    ds4_agent_context_restore_metrics metrics = {
+        .checkpoint_tokens = 101,
+        .restore_notice_tokens = 13,
+        .restored_tokens = 114,
+    };
+    char *metrics_line = ds4_agent_context_restore_expected_metrics_line(&metrics);
+    CHECK(strstr(metrics_line, "KV restore expected metrics:") != NULL,
+          "restore metrics line missing expected label");
+    CHECK(strstr(metrics_line, "checkpoint_tokens=101") != NULL,
+          "restore metrics line missing checkpoint tokens");
+    CHECK(strstr(metrics_line, "expected_restore_notice_tokens=13") != NULL,
+          "restore metrics line missing notice tokens");
+    CHECK(strstr(metrics_line, "expected_prefill_suffix_tokens=13") != NULL,
+          "restore metrics line missing expected prefill suffix");
+    CHECK(strstr(metrics_line, "expected_saved_prefill_tokens=101") != NULL,
+          "restore metrics line missing expected saved prefill");
+    CHECK(strstr(metrics_line, " saved_prefill_tokens=") == NULL,
+          "restore metrics line should not present expected values as actual");
+    free(metrics_line);
+
     ds4_agent_side_effects effects = {0};
     uint64_t epoch = 3;
     epoch = ds4_agent_side_effects_note(&effects, epoch,

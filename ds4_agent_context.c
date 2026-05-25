@@ -637,3 +637,21 @@ bool ds4_agent_context_restore_epoch_guard(uint64_t current_epoch,
                 current_epoch, checkpoint_epoch);
     return false;
 }
+
+char *ds4_agent_context_restore_expected_metrics_line(
+        const ds4_agent_context_restore_metrics *metrics) {
+    ds4_agent_context_buf b = {0};
+    char line[384];
+    int checkpoint_tokens = metrics ? metrics->checkpoint_tokens : 0;
+    int notice_tokens = metrics ? metrics->restore_notice_tokens : 0;
+    int restored_tokens = metrics ? metrics->restored_tokens : 0;
+    if (checkpoint_tokens < 0) checkpoint_tokens = 0;
+    if (notice_tokens < 0) notice_tokens = 0;
+    if (restored_tokens < 0) restored_tokens = 0;
+    snprintf(line, sizeof(line),
+             "KV restore expected metrics: checkpoint_tokens=%d expected_restore_notice_tokens=%d expected_restored_tokens=%d expected_prefill_suffix_tokens=%d expected_full_prefill_tokens_without_kv=%d expected_saved_prefill_tokens=%d.\n",
+             checkpoint_tokens, notice_tokens, restored_tokens,
+             notice_tokens, restored_tokens, checkpoint_tokens);
+    ctx_buf_puts(&b, line);
+    return ctx_buf_take(&b);
+}

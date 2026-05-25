@@ -7019,11 +7019,14 @@ static char *agent_context_restore_notice(agent_worker *w,
              "Restored model context to %d tokens. world_epoch restored=%" PRIu64 " current=%" PRIu64 ".\n",
              meta->transcript_tokens, meta->world_epoch, w->world_epoch);
     agent_buf_puts(&b, line);
-    snprintf(line, sizeof(line),
-             "KV restore metrics: checkpoint_tokens=%d restore_notice_tokens=%d restored_tokens=%d expected_prefill_suffix_tokens=%d full_prefill_tokens_without_kv=%d saved_prefill_tokens=%d.\n",
-             checkpoint_tokens, restore_notice_tokens, restored_tokens,
-             restore_notice_tokens, restored_tokens, checkpoint_tokens);
-    agent_buf_puts(&b, line);
+    ds4_agent_context_restore_metrics metrics = {
+        .checkpoint_tokens = checkpoint_tokens,
+        .restore_notice_tokens = restore_notice_tokens,
+        .restored_tokens = restored_tokens,
+    };
+    char *metrics_line = ds4_agent_context_restore_expected_metrics_line(&metrics);
+    agent_buf_puts(&b, metrics_line);
+    free(metrics_line);
     snprintf(line, sizeof(line),
              "side_effect_mismatch_allowed=%s\n",
              allowed_mismatch ? "true" : "false");
@@ -7034,6 +7037,15 @@ static char *agent_context_restore_notice(agent_worker *w,
     free(safe_label);
     free(safe_reason);
     return agent_buf_take(&b);
+}
+
+static bool agent_context_resync_live_transcript(agent_worker *w,
+                                                 char *err, size_t err_len) {
+    if (agent_worker_sync_tokens(w, &w->transcript, false, err, err_len) != 0) {
+        ds4_session_invalidate(w->session);
+        return false;
+    }
+    return true;
 }
 
 static char *agent_context_restore(agent_worker *w, const agent_tool_call *call,
@@ -7111,15 +7123,24 @@ static char *agent_context_restore(agent_worker *w, const agent_tool_call *call,
         return agent_buf_take(&b);
     }
     if (loaded.len != meta.transcript_tokens) {
+        int meta_tokens = meta.transcript_tokens;
+        int kv_tokens = loaded.len;
         ds4_tokens_free(&loaded);
+        char sync_err[160] = {0};
+        bool live_resynced = agent_context_resync_live_transcript(w,
+                                                                  sync_err,
+                                                                  sizeof(sync_err));
         ds4_agent_context_meta_free(&meta);
         free(meta_path);
         free(kv_path);
         agent_buf b = {0};
-        char line[192];
+        char line[320];
         snprintf(line, sizeof(line),
-                 "Tool error: context restore failed: metadata tokens=%d but KV tokens=%d\n",
-                 meta.transcript_tokens, loaded.len);
+                 "Tool error: context restore failed: metadata tokens=%d but KV tokens=%d; live_session=%s%s%s\n",
+                 meta_tokens, kv_tokens,
+                 live_resynced ? "resynced" : "invalidated",
+                 !live_resynced && sync_err[0] ? " error=" : "",
+                 !live_resynced && sync_err[0] ? sync_err : "");
         agent_buf_puts(&b, line);
         return agent_buf_take(&b);
     }

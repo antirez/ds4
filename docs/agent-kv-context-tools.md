@@ -547,12 +547,14 @@ context action=compact status=ok old_tokens=28500 new_tokens=9400 removed_tokens
 Restore appends a model-visible notice that includes KV reuse accounting:
 
 ```text
-KV restore metrics: checkpoint_tokens=18420 restore_notice_tokens=140 restored_tokens=18560 expected_prefill_suffix_tokens=140 full_prefill_tokens_without_kv=18560 saved_prefill_tokens=18420.
+KV restore expected metrics: checkpoint_tokens=18420 expected_restore_notice_tokens=140 expected_restored_tokens=18560 expected_prefill_suffix_tokens=140 expected_full_prefill_tokens_without_kv=18560 expected_saved_prefill_tokens=18420.
 ```
 
 This makes the benefit concrete for both the implementation and the model:
 restoring the checkpoint loads the old prefix from KV, then only the synthetic
-restore notice is prefetched.
+restore notice is expected to be prefetched. The word `expected` is intentional:
+the notice is built before the final sync that appends it, while trace output
+records the actual cached/suffix counts observed by `ds4_session_sync()`.
 
 ## Correctness Verification Measures
 
@@ -575,6 +577,11 @@ For model-initiated restores, the actual post-restore transcript should be the
 checkpoint transcript plus the synthetic restore notice. Verification should
 measure both values separately: zero prefill for loading the checkpoint payload,
 then a small append for the notice.
+
+If payload tokens and metadata tokens disagree after a KV load, restore must not
+leave the live session at the loaded payload while the transcript still points
+to the previous conversation. It should resynchronize the live session to the
+current transcript or invalidate the session before returning the error.
 
 The `context status` output should expose the live-cache view as
 `cached_tokens` and `prefill_suffix_tokens`, so the agent can tell whether the
