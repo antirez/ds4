@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_agent_git.h"
 #include "ds4_kvstore.h"
 #include "ds4_web.h"
 #include "linenoise.h"
@@ -797,6 +798,41 @@ static const char agent_tools_prompt_after_edit[] =
     "        \"refresh_sec\": {\"type\": \"number\"}\n"
     "      },\n"
     "      \"required\": [\"job\"]\n"
+    "    }\n"
+    "  }\n"
+    "}\n\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"git\",\n"
+    "    \"description\": \"Git support: inspection plus guarded local mutations, merge/rebase, and explicit-confirm remote fetch/push. It never resets, force-pushes, or cleans.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"action\": {\"type\": \"string\"},\n"
+    "        \"repo\": {\"type\": \"string\"},\n"
+    "        \"path\": {\"type\": \"string\"},\n"
+    "        \"ref\": {\"type\": \"string\"},\n"
+    "        \"base_ref\": {\"type\": \"string\"},\n"
+    "        \"target_ref\": {\"type\": \"string\"},\n"
+    "        \"range\": {\"type\": \"string\"},\n"
+    "        \"message\": {\"type\": \"string\"},\n"
+    "        \"remote\": {\"type\": \"string\"},\n"
+    "        \"limit\": {\"type\": \"number\"},\n"
+    "        \"start_line\": {\"type\": \"number\"},\n"
+    "        \"line_count\": {\"type\": \"number\"},\n"
+    "        \"staged\": {\"type\": \"boolean\"},\n"
+    "        \"stat\": {\"type\": \"boolean\"},\n"
+    "        \"name_status\": {\"type\": \"boolean\"},\n"
+    "        \"name_only\": {\"type\": \"boolean\"},\n"
+    "        \"patch\": {\"type\": \"boolean\"},\n"
+    "        \"follow\": {\"type\": \"boolean\"},\n"
+    "        \"dry_run\": {\"type\": \"boolean\"},\n"
+    "        \"all\": {\"type\": \"boolean\"},\n"
+    "        \"confirm\": {\"type\": \"boolean\"},\n"
+    "        \"max_bytes\": {\"type\": \"number\"}\n"
+    "      },\n"
+    "      \"required\": [\"action\"]\n"
     "    }\n"
     "  }\n"
     "}\n\n"
@@ -2655,6 +2691,7 @@ static void agent_tool_viz_line_prefix(agent_stream_renderer *sr) {
 
 static const char *agent_tool_viz_prefix(const char *name) {
     if (!strcmp(name, "bash")) return "$ ";
+    if (!strcmp(name, "git")) return "git ";
     if (!strcmp(name, "read")) return "read ";
     if (!strcmp(name, "write")) return "write ";
     if (!strcmp(name, "edit")) return "edit ";
@@ -5505,6 +5542,86 @@ static char *agent_tool_list(const agent_tool_call *call) {
     return agent_buf_take(&out);
 }
 
+static char *agent_tool_git(const agent_tool_call *call) {
+    const char *action = agent_tool_arg_value(call, "action");
+    const char *repo = agent_tool_arg_value(call, "repo");
+    const char *path = agent_tool_arg_value(call, "path");
+    const char *ref = agent_tool_arg_value(call, "ref");
+    const char *base_ref = agent_tool_arg_value(call, "base_ref");
+    const char *target_ref = agent_tool_arg_value(call, "target_ref");
+    const char *range = agent_tool_arg_value(call, "range");
+    const char *message = agent_tool_arg_value(call, "message");
+    const char *remote = agent_tool_arg_value(call, "remote");
+    int limit = agent_parse_int_default(agent_tool_arg_value(call, "limit"),
+                                        10, 1, 100);
+    int start_line = agent_parse_int_default(agent_tool_arg_value(call, "start_line"),
+                                             1, 1, INT_MAX);
+    int line_count = agent_parse_int_default(agent_tool_arg_value(call, "line_count"),
+                                             80, 1, 1000);
+    int max_bytes = agent_parse_int_default(agent_tool_arg_value(call, "max_bytes"),
+                                            64 * 1024, 1024, 256 * 1024);
+    bool staged = agent_parse_bool_default(agent_tool_arg_value(call, "staged"), false);
+    bool stat = agent_parse_bool_default(agent_tool_arg_value(call, "stat"), false);
+    bool name_status = agent_parse_bool_default(agent_tool_arg_value(call, "name_status"), false);
+    bool name_only = agent_parse_bool_default(agent_tool_arg_value(call, "name_only"), false);
+    bool patch = agent_parse_bool_default(agent_tool_arg_value(call, "patch"), false);
+    bool follow = agent_parse_bool_default(agent_tool_arg_value(call, "follow"), false);
+    bool dry_run = agent_parse_bool_default(agent_tool_arg_value(call, "dry_run"), false);
+    bool all = agent_parse_bool_default(agent_tool_arg_value(call, "all"), false);
+    bool confirm = agent_parse_bool_default(agent_tool_arg_value(call, "confirm"), false);
+
+    ds4_agent_git_options opts = {
+        .repo = repo && repo[0] ? repo : ".",
+        .action = action,
+        .path = path,
+        .ref = ref,
+        .base_ref = base_ref,
+        .target_ref = target_ref,
+        .range = range,
+        .message = message,
+        .remote = remote,
+        .limit = limit,
+        .start_line = start_line,
+        .line_count = line_count,
+        .staged = staged,
+        .stat = stat,
+        .name_status = name_status,
+        .name_only = name_only,
+        .patch = patch,
+        .follow = follow,
+        .dry_run = dry_run,
+        .all = all,
+        .confirm = confirm,
+        .max_bytes = (size_t)max_bytes,
+    };
+    ds4_agent_git_result r = {0};
+    char err[256] = {0};
+    if (!ds4_agent_git_run_options(&opts, &r, err, sizeof(err))) {
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: git failed: ");
+        agent_buf_puts(&b, err[0] ? err : "unknown error");
+        agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
+
+    agent_buf b = {0};
+    char line[256];
+    snprintf(line, sizeof(line), "%sgit action=%s exit=%d truncated=%s\n",
+             r.exit_code == 0 ? "" : "Tool error: ",
+             action && action[0] ? action : "unknown",
+             r.exit_code,
+             r.truncated ? "true" : "false");
+    agent_buf_puts(&b, line);
+    if (r.output && r.output[0]) {
+        agent_buf_puts(&b, r.output);
+        if (b.len > 0 && b.ptr[b.len - 1] != '\n') agent_buf_puts(&b, "\n");
+    } else {
+        agent_buf_puts(&b, "(no output)\n");
+    }
+    ds4_agent_git_result_free(&r);
+    return agent_buf_take(&b);
+}
+
 /* ============================================================================
  * Edit And Search Tools
  * ============================================================================
@@ -6737,6 +6854,7 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "more")) return agent_tool_more(w, call);
     if (!strcmp(call->name, "write")) return agent_tool_write(w, call);
     if (!strcmp(call->name, "list")) return agent_tool_list(call);
+    if (!strcmp(call->name, "git")) return agent_tool_git(call);
     if (!strcmp(call->name, "edit")) return agent_tool_edit(w, call);
     if (!strcmp(call->name, "search")) return agent_tool_search(w, call);
     if (!strcmp(call->name, "google_search")) return agent_tool_google_search(w, call);
