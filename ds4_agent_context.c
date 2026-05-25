@@ -276,20 +276,54 @@ bool ds4_agent_context_write_meta(const ds4_agent_context_meta *m,
     return ok;
 }
 
-static const char *ctx_json_find_value(const char *json, const char *key) {
-    ds4_agent_context_buf needle = {0};
-    ctx_buf_puts(&needle, "\"");
-    ctx_buf_puts(&needle, key);
-    ctx_buf_puts(&needle, "\"");
-    char *n = ctx_buf_take(&needle);
-    const char *p = strstr(json, n);
-    free(n);
-    if (!p) return NULL;
-    p = strchr(p, ':');
-    if (!p) return NULL;
+static const char *ctx_json_skip_string(const char *p) {
+    if (!p || *p != '"') return p;
     p++;
-    while (*p && isspace((unsigned char)*p)) p++;
+    while (*p) {
+        if (*p == '\\' && p[1]) {
+            p += 2;
+            continue;
+        }
+        if (*p == '"') return p + 1;
+        p++;
+    }
     return p;
+}
+
+static bool ctx_json_key_matches(const char *start, const char *end,
+                                 const char *key) {
+    const char *p = start;
+    const char *k = key;
+    while (p < end) {
+        char c = *p++;
+        if (c == '\\' && p < end) c = *p++;
+        if (*k != c) return false;
+        k++;
+    }
+    return *k == '\0';
+}
+
+static const char *ctx_json_find_value(const char *json, const char *key) {
+    const char *p = json;
+    while (p && *p) {
+        if (*p != '"') {
+            p++;
+            continue;
+        }
+        const char *start = p + 1;
+        const char *after = ctx_json_skip_string(p);
+        if (!after || after == p || after[-1] != '"') return NULL;
+        const char *end = after - 1;
+        const char *q = after;
+        while (*q && isspace((unsigned char)*q)) q++;
+        if (*q == ':' && ctx_json_key_matches(start, end, key)) {
+            q++;
+            while (*q && isspace((unsigned char)*q)) q++;
+            return q;
+        }
+        p = after;
+    }
+    return NULL;
 }
 
 static bool ctx_json_get_string(const char *json, const char *key, char **out) {
@@ -507,6 +541,8 @@ void ds4_agent_side_effects_free(ds4_agent_side_effects *effects) {
     }
     effects->head = NULL;
     effects->count = 0;
+    effects->evicted_count = 0;
+    effects->latest_evicted_epoch = 0;
 }
 
 uint64_t ds4_agent_side_effects_note(ds4_agent_side_effects *effects,
@@ -530,6 +566,9 @@ uint64_t ds4_agent_side_effects_note(ds4_agent_side_effects *effects,
         if (!*link) break;
         ds4_agent_side_effect *old = *link;
         *link = NULL;
+        effects->evicted_count++;
+        if (old->epoch > effects->latest_evicted_epoch)
+            effects->latest_evicted_epoch = old->epoch;
         free(old->kind);
         free(old->detail);
         free(old);
@@ -542,6 +581,15 @@ uint64_t ds4_agent_side_effects_note(ds4_agent_side_effects *effects,
 char *ds4_agent_side_effects_summary_since(const ds4_agent_side_effects *effects,
                                            uint64_t epoch) {
     ds4_agent_context_buf b = {0};
+    if (effects && effects->latest_evicted_epoch > epoch) {
+        char line[256];
+        snprintf(line, sizeof(line),
+                 "Known side effects after checkpoint may be incomplete: "
+                 "%" PRIu64 " older side effect(s) were dropped from memory "
+                 "up to epoch=%" PRIu64 ".\n",
+                 effects->evicted_count, effects->latest_evicted_epoch);
+        ctx_buf_puts(&b, line);
+    }
     int shown = 0;
     for (const ds4_agent_side_effect *e = effects ? effects->head : NULL; e; e = e->next) {
         if (e->epoch <= epoch) continue;
@@ -559,4 +607,33 @@ char *ds4_agent_side_effects_summary_since(const ds4_agent_side_effects *effects
         }
     }
     return ctx_buf_take(&b);
+}
+
+bool ds4_agent_context_no_running_bash_guard(const char *action,
+                                             int running_bash_jobs,
+                                             char *err,
+                                             size_t err_len) {
+    if (running_bash_jobs <= 0) return true;
+    ctx_set_err(err, err_len,
+                "context %s denied because %d bash job(s) are still running; "
+                "use bash_status or bash_stop first",
+                action && action[0] ? action : "operation",
+                running_bash_jobs);
+    return false;
+}
+
+bool ds4_agent_context_restore_epoch_guard(uint64_t current_epoch,
+                                           uint64_t checkpoint_epoch,
+                                           bool allow_side_effect_mismatch,
+                                           char *err,
+                                           size_t err_len) {
+    if (current_epoch == checkpoint_epoch || allow_side_effect_mismatch)
+        return true;
+    ctx_set_err(err, err_len,
+                "restore would rewind model context from world_epoch=%" PRIu64
+                " to %" PRIu64 ", but external side effects may still exist. "
+                "Revert or inspect those effects, or call context restore with "
+                "allow_side_effect_mismatch=true.",
+                current_epoch, checkpoint_epoch);
+    return false;
 }

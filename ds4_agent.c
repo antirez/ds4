@@ -815,7 +815,7 @@ static const char agent_tools_prompt_after_edit[] =
     "    \"parameters\": {\n"
     "      \"type\": \"object\",\n"
     "      \"properties\": {\n"
-    "        \"action\": {\"type\": \"string\"},\n"
+    "        \"action\": {\"type\": \"string\", \"enum\": [\"status\", \"checkpoint\", \"list\", \"restore\", \"compact\", \"drop\"]},\n"
     "        \"id\": {\"type\": \"string\"},\n"
     "        \"label\": {\"type\": \"string\"},\n"
     "        \"reason\": {\"type\": \"string\"},\n"
@@ -6904,6 +6904,9 @@ static char *agent_context_checkpoint(agent_worker *w, const agent_tool_call *ca
     w->transcript = projected;
     memset(&projected, 0, sizeof(projected));
     pthread_mutex_lock(&w->mu);
+    /* session_dirty tracks the durable /save state, not live KV sync.  The
+     * session was synced to projected above; this marks the visible transcript
+     * as changed because the checkpoint tool result is now part of it. */
     w->session_dirty = true;
     w->user_activity = true;
     w->status.ctx_used = w->transcript.len;
@@ -6990,12 +6993,14 @@ static char *agent_context_restore(agent_worker *w, const agent_tool_call *call,
     bool dry_run = agent_parse_bool_default(agent_tool_arg_value(call, "dry_run"), false);
 
     int running = agent_context_running_bash_jobs(w);
-    if (running > 0) {
-        char msg[160];
-        snprintf(msg, sizeof(msg),
-                 "Tool error: context restore denied because %d bash job(s) are still running; use bash_status or bash_stop first\n",
-                 running);
-        return xstrdup(msg);
+    char guard_err[256] = {0};
+    if (!ds4_agent_context_no_running_bash_guard("restore", running,
+                                                 guard_err, sizeof(guard_err))) {
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: ");
+        agent_buf_puts(&b, guard_err);
+        agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
     }
 
     ds4_agent_context_meta meta = {0};
@@ -7012,13 +7017,13 @@ static char *agent_context_restore(agent_worker *w, const agent_tool_call *call,
         return agent_buf_take(&b);
     }
 
-    if (w->world_epoch != meta.world_epoch && !allow) {
+    if (!ds4_agent_context_restore_epoch_guard(w->world_epoch, meta.world_epoch,
+                                               allow, guard_err,
+                                               sizeof(guard_err))) {
         agent_buf b = {0};
-        char line[256];
-        snprintf(line, sizeof(line),
-                 "Tool error: restore would rewind model context from world_epoch=%" PRIu64 " to %" PRIu64 ", but external side effects may still exist. Revert or inspect those effects, or call context restore with allow_side_effect_mismatch=true.\n",
-                 w->world_epoch, meta.world_epoch);
-        agent_buf_puts(&b, line);
+        agent_buf_puts(&b, "Tool error: ");
+        agent_buf_puts(&b, guard_err);
+        agent_buf_puts(&b, "\n");
         agent_context_append_side_effects_since(w, meta.world_epoch, &b);
         ds4_agent_context_meta_free(&meta);
         free(meta_path);
@@ -7084,6 +7089,9 @@ static char *agent_context_restore(agent_worker *w, const agent_tool_call *call,
     w->transcript = restored;
     pthread_mutex_lock(&w->mu);
     w->user_activity = true;
+    /* session_dirty tracks the durable /save state, not live KV sync.  The
+     * session was synced to restored above; this marks the visible transcript
+     * as changed because the restore notice is now part of it. */
     w->session_dirty = true;
     w->status.ctx_used = w->transcript.len;
     agent_wake_locked(w);
@@ -7149,6 +7157,16 @@ static char *agent_context_status(agent_worker *w) {
 static char *agent_context_drop(agent_worker *w, const agent_tool_call *call) {
     const char *id = agent_tool_arg_value(call, "id");
     bool dry_run = agent_parse_bool_default(agent_tool_arg_value(call, "dry_run"), false);
+    int running = agent_context_running_bash_jobs(w);
+    char guard_err[256] = {0};
+    if (!ds4_agent_context_no_running_bash_guard("drop", running,
+                                                 guard_err, sizeof(guard_err))) {
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: ");
+        agent_buf_puts(&b, guard_err);
+        agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
     ds4_agent_context_meta meta = {0};
     char *meta_path = NULL;
     char *kv_path = NULL;

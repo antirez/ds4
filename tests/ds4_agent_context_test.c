@@ -56,6 +56,23 @@ static void write_raw_file(const char *path, const char *id) {
     CHECK(fclose(fp) == 0, "failed to write raw metadata");
 }
 
+static void write_key_collision_file(const char *path, const char *id) {
+    FILE *fp = fopen(path, "wb");
+    CHECK(fp != NULL, "failed to open key collision metadata");
+    fprintf(fp,
+            "{\n"
+            "  \"id\": \"%s\",\n"
+            "  \"label\": \"label mentions \\\"world_epoch\\\": 99 before the real key\",\n"
+            "  \"created_at\": 7,\n"
+            "  \"world_epoch\": 42,\n"
+            "  \"transcript_tokens\": 77,\n"
+            "  \"kv_path\": \"%s.kv\",\n"
+            "  \"memory_path\": \"%s.memory.md\"\n"
+            "}\n",
+            id, id, id);
+    CHECK(fclose(fp) == 0, "failed to write key collision metadata");
+}
+
 static void fill_meta(ds4_agent_context_meta *m, const char *id,
                       const char *label, uint64_t epoch, int tokens) {
     snprintf(m->id, sizeof(m->id), "%s", id);
@@ -71,6 +88,7 @@ int main(void) {
     static const char id1[] = "1111111111111111111111111111111111111111";
     static const char id2[] = "2222222222222222222222222222222222222222";
     static const char id3[] = "3333333333333333333333333333333333333333";
+    static const char id4[] = "4444444444444444444444444444444444444444";
     char err[256] = {0};
     char *dir = make_temp_dir();
 
@@ -126,6 +144,34 @@ int main(void) {
           "unsafe metadata path should be rejected");
     ds4_agent_context_meta_free(&unsafe);
 
+    char *collision_name = ds4_agent_context_file_name(id4, ".meta.json");
+    char *collision_path = ds4_agent_context_path_for_file(dir, collision_name);
+    write_key_collision_file(collision_path, id4);
+    ds4_agent_context_meta collision = {0};
+    CHECK(ds4_agent_context_read_meta_file(collision_path, &collision,
+                                           err, sizeof(err)),
+          "key collision metadata should parse");
+    CHECK(collision.world_epoch == 42,
+          "parser matched key text inside a string value");
+    CHECK(collision.transcript_tokens == 77,
+          "key collision transcript tokens mismatch");
+    ds4_agent_context_meta_free(&collision);
+
+    CHECK(ds4_agent_context_restore_epoch_guard(12, 12, false, err, sizeof(err)),
+          "equal epoch restore should be allowed");
+    CHECK(ds4_agent_context_restore_epoch_guard(13, 12, true, err, sizeof(err)),
+          "explicit side-effect override should be allowed");
+    CHECK(!ds4_agent_context_restore_epoch_guard(13, 12, false, err, sizeof(err)),
+          "epoch mismatch restore should be rejected");
+    CHECK(strstr(err, "world_epoch=13 to 12") != NULL,
+          "epoch guard error missing epoch details");
+    CHECK(ds4_agent_context_no_running_bash_guard("restore", 0, err, sizeof(err)),
+          "restore should allow no running bash jobs");
+    CHECK(!ds4_agent_context_no_running_bash_guard("restore", 2, err, sizeof(err)),
+          "restore should reject running bash jobs");
+    CHECK(strstr(err, "2 bash job(s)") != NULL,
+          "bash guard error missing job count");
+
     ds4_agent_side_effects effects = {0};
     uint64_t epoch = 3;
     epoch = ds4_agent_side_effects_note(&effects, epoch,
@@ -142,16 +188,36 @@ int main(void) {
     free(summary);
     ds4_agent_side_effects_free(&effects);
 
+    for (int i = 0; i < 70; i++) {
+        char detail[32];
+        snprintf(detail, sizeof(detail), "effect-%d", i + 1);
+        epoch = ds4_agent_side_effects_note(&effects, epoch, "bash", detail);
+    }
+    CHECK(effects.count == 64, "side effect retained count mismatch");
+    CHECK(effects.evicted_count == 6, "side effect evicted count mismatch");
+    summary = ds4_agent_side_effects_summary_since(&effects, 4);
+    CHECK(strstr(summary, "may be incomplete") != NULL,
+          "truncated side effect warning missing");
+    CHECK(strstr(summary, "6 older side effect") != NULL,
+          "truncated side effect count missing");
+    CHECK(strstr(summary, "... more side effects omitted ...") != NULL,
+          "retained side effect omission marker missing");
+    free(summary);
+    ds4_agent_side_effects_free(&effects);
+
     unlink(meta1_path);
     unlink(meta2_path);
     unlink(unsafe_path);
+    unlink(collision_path);
     rmdir(dir);
     free(meta1_name);
     free(meta2_name);
     free(unsafe_name);
+    free(collision_name);
     free(meta1_path);
     free(meta2_path);
     free(unsafe_path);
+    free(collision_path);
     free(dir);
     return 0;
 }

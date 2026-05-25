@@ -25,6 +25,8 @@ typedef struct ds4_agent_side_effect {
 typedef struct ds4_agent_side_effects {
     ds4_agent_side_effect *head;
     int count;
+    uint64_t evicted_count;
+    uint64_t latest_evicted_epoch;
 } ds4_agent_side_effects;
 
 void ds4_agent_context_meta_free(ds4_agent_context_meta *m);
@@ -62,5 +64,14 @@ uint64_t ds4_agent_side_effects_note(ds4_agent_side_effects *effects,
                                      const char *detail);
 char *ds4_agent_side_effects_summary_since(const ds4_agent_side_effects *effects,
                                            uint64_t epoch);
+bool ds4_agent_context_no_running_bash_guard(const char *action,
+                                             int running_bash_jobs,
+                                             char *err,
+                                             size_t err_len);
+bool ds4_agent_context_restore_epoch_guard(uint64_t current_epoch,
+                                           uint64_t checkpoint_epoch,
+                                           bool allow_side_effect_mismatch,
+                                           char *err,
+                                           size_t err_len);
 
 #endif

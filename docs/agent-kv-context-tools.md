@@ -61,7 +61,10 @@ actions easier to add without teaching the model a large new catalog.
     "parameters": {
       "type": "object",
       "properties": {
-        "action": {"type": "string"},
+        "action": {
+          "type": "string",
+          "enum": ["status", "checkpoint", "list", "restore", "compact", "drop"]
+        },
         "id": {"type": "string"},
         "label": {"type": "string"},
         "reason": {"type": "string"},
@@ -84,6 +87,10 @@ Initial actions:
 - `restore`: restore a checkpoint if side-effect rules allow it.
 - `compact`: request the existing compaction path with an explicit reason.
 - `drop`: delete checkpoint metadata and its associated payload when safe.
+  In the first implementation, "safe" means the checkpoint id resolves
+  unambiguously, paths remain inside the context directory, and no bash job is
+  running. The tool does not understand semantic roles such as "best baseline";
+  callers should use `dry_run=true` before deleting important checkpoints.
 
 Phase 1 should be disk-backed and reuse the existing agent KV save/load path.
 That avoids holding multiple huge KV payloads in RAM and keeps the first
@@ -222,7 +229,9 @@ after the restored transcript has been loaded. It must include:
 - whether side-effect mismatch was allowed,
 - a warning that files, subprocesses, browser state, network effects, and other
   external state were not reverted,
-- a compact summary of known post-checkpoint side effects when available.
+- a compact summary of known post-checkpoint side effects when available,
+- an explicit warning when the in-memory side-effect history has been truncated
+  and older post-checkpoint side effects may have been dropped.
 
 Example:
 
