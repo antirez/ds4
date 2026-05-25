@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_agent_context.h"
 #include "ds4_kvstore.h"
 #include "ds4_web.h"
 #include "linenoise.h"
@@ -8,6 +9,7 @@
 #include <dirent.h>
 #include <fnmatch.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <math.h>
 #include <poll.h>
@@ -96,6 +98,7 @@ typedef struct {
     ds4_session *session;
     ds4_tokens transcript;
     char *cache_dir;
+    char *context_dir;
     char *sysprompt_path;
     char session_sha[41];
     char *session_title;
@@ -139,9 +142,13 @@ typedef struct {
     bool more_valid;
     agent_bash_job *bash_jobs;
     int next_bash_job_id;
+    uint64_t world_epoch;
+    ds4_agent_side_effects side_effects;
 } agent_worker;
 
 static unsigned agent_next_prefill_label(void);
+static bool agent_worker_compact(agent_worker *w, const char *reason,
+                                 char *err, size_t err_len);
 
 typedef struct agent_tail_capture {
     char *buf;
@@ -797,6 +804,25 @@ static const char agent_tools_prompt_after_edit[] =
     "        \"refresh_sec\": {\"type\": \"number\"}\n"
     "      },\n"
     "      \"required\": [\"job\"]\n"
+    "    }\n"
+    "  }\n"
+    "}\n\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"context\",\n"
+    "    \"description\": \"Inspect, checkpoint, restore, compact, list, or drop the agent context state. Restore never reverts files, processes, browser state, or network effects.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"action\": {\"type\": \"string\"},\n"
+    "        \"id\": {\"type\": \"string\"},\n"
+    "        \"label\": {\"type\": \"string\"},\n"
+    "        \"reason\": {\"type\": \"string\"},\n"
+    "        \"allow_side_effect_mismatch\": {\"type\": \"boolean\"},\n"
+    "        \"dry_run\": {\"type\": \"boolean\"}\n"
+    "      },\n"
+    "      \"required\": [\"action\"]\n"
     "    }\n"
     "  }\n"
     "}\n\n"
@@ -5343,6 +5369,14 @@ static bool agent_tool_result_fits_context(agent_worker *w, const char *result,
     return tokens + reserve_tokens < w->cfg->gen.ctx_size;
 }
 
+static void agent_context_note_side_effect(agent_worker *w, const char *kind,
+                                           const char *detail) {
+    if (!w) return;
+    w->world_epoch = ds4_agent_side_effects_note(&w->side_effects,
+                                                 w->world_epoch,
+                                                 kind, detail);
+}
+
 /* Read file text for the model.  Normal mode shows plain line numbers.  Raw
  * mode is reserved for cases where line decoration would corrupt the payload
  * being inspected. */
@@ -5440,7 +5474,6 @@ static char *agent_tool_more(agent_worker *w, const agent_tool_call *call) {
 }
 
 static char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
-    (void)w;
     const char *path = agent_tool_arg_value(call, "path");
     const char *content = agent_tool_arg_value(call, "content");
     if (!path || !path[0]) return xstrdup("Tool error: write requires path\n");
@@ -5463,6 +5496,7 @@ static char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
         agent_buf_puts(&b, "\n");
         return agent_buf_take(&b);
     }
+    agent_context_note_side_effect(w, "write", path);
     char msg[PATH_MAX + 160];
     snprintf(msg, sizeof(msg), "Wrote %zu bytes to %s\n", len, path);
     return xstrdup(msg);
@@ -5920,6 +5954,8 @@ static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
                                            new_text,
                                            anchored ? "anchored old/new replacement"
                                                     : "old/new replacement");
+    if (strncmp(result, "Tool error:", strlen("Tool error:")) != 0)
+        agent_context_note_side_effect(w, "edit", path);
     free(data);
     return result;
 }
@@ -6722,6 +6758,469 @@ static pid_t agent_tool_pid(const agent_tool_call *call) {
 }
 
 /* ============================================================================
+ * Native Context Tool
+ * ============================================================================
+ */
+
+static int agent_context_running_bash_jobs(agent_worker *w) {
+    int running = 0;
+    for (agent_bash_job *job = w->bash_jobs; job; job = job->next) {
+        agent_bash_poll(job);
+        if (job->running) running++;
+    }
+    return running;
+}
+
+static void agent_context_generate_id(char out[41]) {
+    uint8_t buf[64];
+    memset(buf, 0, sizeof(buf));
+    int fd = open("/dev/urandom", O_RDONLY);
+    ssize_t got = fd >= 0 ? read(fd, buf, sizeof(buf)) : -1;
+    if (fd >= 0) close(fd);
+    if (got != (ssize_t)sizeof(buf)) {
+        uint64_t v[6];
+        v[0] = (uint64_t)time(NULL);
+        v[1] = (uint64_t)clock();
+        v[2] = (uint64_t)getpid();
+        v[3] = (uint64_t)(uintptr_t)&buf;
+        v[4] = (uint64_t)random();
+        v[5] = (uint64_t)now_sec();
+        memcpy(buf, v, sizeof(v));
+    }
+    ds4_kvstore_sha1_bytes_hex(buf, sizeof(buf), out);
+}
+
+static char *agent_context_checkpoint_result(const char id[41], const char *label,
+                                             int tokens, uint64_t epoch,
+                                             bool dry_run) {
+    char *safe = ds4_agent_context_oneline(label, 160);
+    agent_buf b = {0};
+    char line[256];
+    snprintf(line, sizeof(line),
+             "context action=%s id=%.40s label=\"",
+             dry_run ? "checkpoint-dry-run" : "checkpoint", id);
+    agent_buf_puts(&b, line);
+    agent_buf_puts(&b, safe);
+    snprintf(line, sizeof(line), "\" tokens=%d world_epoch=%" PRIu64 "\n",
+             tokens, epoch);
+    agent_buf_puts(&b, line);
+    free(safe);
+    return agent_buf_take(&b);
+}
+
+static bool agent_context_project_tool_result(agent_worker *w, const char *result,
+                                              ds4_tokens *projected,
+                                              int *tokens_out) {
+    ds4_tokens_free(projected);
+    ds4_tokens_copy(projected, &w->transcript);
+    ds4_chat_append_message(w->engine, projected, "tool", result ? result : "");
+    if (tokens_out) *tokens_out = projected->len;
+    return projected->len + 16 < w->cfg->gen.ctx_size;
+}
+
+static char *agent_context_checkpoint(agent_worker *w, const agent_tool_call *call,
+                                      bool *already_appended) {
+    const char *label_arg = agent_tool_arg_value(call, "label");
+    bool dry_run = agent_parse_bool_default(agent_tool_arg_value(call, "dry_run"), false);
+    char *label = ds4_agent_context_limited_strdup(label_arg && label_arg[0] ?
+                                               label_arg : "checkpoint", 240);
+    char id[41];
+    char *kv_file = NULL, *meta_file = NULL, *mem_file = NULL;
+    char *kv_path = NULL, *meta_path = NULL;
+    for (int i = 0; i < 16; i++) {
+        agent_context_generate_id(id);
+        free(kv_file);
+        free(meta_file);
+        free(mem_file);
+        free(kv_path);
+        free(meta_path);
+        kv_file = ds4_agent_context_file_name(id, ".kv");
+        meta_file = ds4_agent_context_file_name(id, ".meta.json");
+        mem_file = ds4_agent_context_file_name(id, ".memory.md");
+        kv_path = ds4_agent_context_path_for_file(w->context_dir, kv_file);
+        meta_path = ds4_agent_context_path_for_file(w->context_dir, meta_file);
+        if (access(meta_path, F_OK) != 0 && access(kv_path, F_OK) != 0) break;
+    }
+
+    int tokens = w->transcript.len;
+    char *result = NULL;
+    ds4_tokens projected = {0};
+    for (int i = 0; i < 4; i++) {
+        free(result);
+        result = agent_context_checkpoint_result(id, label, tokens, w->world_epoch, dry_run);
+        int new_tokens = 0;
+        if (!agent_context_project_tool_result(w, result, &projected, &new_tokens)) {
+            ds4_tokens_free(&projected);
+            free(label);
+            free(kv_file);
+            free(meta_file);
+            free(mem_file);
+            free(kv_path);
+            free(meta_path);
+            return xstrdup("Tool error: checkpoint result would exceed context\n");
+        }
+        if (new_tokens == tokens) break;
+        tokens = new_tokens;
+    }
+
+    if (dry_run) {
+        ds4_tokens_free(&projected);
+        free(label);
+        free(kv_file);
+        free(meta_file);
+        free(mem_file);
+        free(kv_path);
+        free(meta_path);
+        return result;
+    }
+
+    char err[256] = {0};
+    if (!agent_mkdir_p(w->context_dir)) {
+        snprintf(err, sizeof(err), "failed to create %s", w->context_dir);
+        goto fail;
+    }
+    if (agent_worker_sync_tokens(w, &projected, false, err, sizeof(err)) != 0)
+        goto fail;
+
+    char ignored_sha[41];
+    if (!agent_kv_save_path(w, kv_path, &projected, "agent-context",
+                            ignored_sha, NULL, 0, err, sizeof(err)))
+        goto rollback;
+
+    ds4_agent_context_meta meta = {0};
+    snprintf(meta.id, sizeof(meta.id), "%s", id);
+    meta.label = label;
+    meta.kv_file = kv_file;
+    meta.memory_file = mem_file;
+    meta.created_at = (uint64_t)time(NULL);
+    meta.world_epoch = w->world_epoch;
+    meta.transcript_tokens = projected.len;
+    if (!ds4_agent_context_write_meta(&meta, meta_path, err, sizeof(err))) {
+        unlink(kv_path);
+        goto rollback_no_meta_free;
+    }
+
+    ds4_tokens_free(&w->transcript);
+    w->transcript = projected;
+    memset(&projected, 0, sizeof(projected));
+    pthread_mutex_lock(&w->mu);
+    w->session_dirty = true;
+    w->user_activity = true;
+    w->status.ctx_used = w->transcript.len;
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+    if (already_appended) *already_appended = true;
+
+    free(meta_path);
+    free(kv_path);
+    free(meta_file);
+    ds4_agent_context_meta_free(&meta);
+    return result;
+
+rollback:
+    unlink(kv_path);
+rollback_no_meta_free:
+    {
+        char sync_err[160] = {0};
+        if (agent_worker_sync_tokens(w, &w->transcript, false,
+                                     sync_err, sizeof(sync_err)) != 0)
+            ds4_session_invalidate(w->session);
+    }
+fail:
+    ds4_tokens_free(&projected);
+    free(result);
+    free(label);
+    free(kv_file);
+    free(meta_file);
+    free(mem_file);
+    free(kv_path);
+    free(meta_path);
+    agent_buf b = {0};
+    agent_buf_puts(&b, "Tool error: context checkpoint failed: ");
+    agent_buf_puts(&b, err[0] ? err : "unknown error");
+    agent_buf_puts(&b, "\n");
+    return agent_buf_take(&b);
+}
+
+static void agent_context_append_side_effects_since(agent_worker *w, uint64_t epoch,
+                                                    agent_buf *b) {
+    char *summary = ds4_agent_side_effects_summary_since(&w->side_effects, epoch);
+    agent_buf_puts(b, summary);
+    free(summary);
+}
+
+static char *agent_context_restore_notice(agent_worker *w,
+                                          const ds4_agent_context_meta *meta,
+                                          const char *reason,
+                                          bool allowed_mismatch) {
+    char *safe_label = ds4_agent_context_oneline(meta->label, 160);
+    char *safe_reason = ds4_agent_context_oneline(reason && reason[0] ?
+                                              reason : "not specified", 240);
+    agent_buf b = {0};
+    char line[320];
+    snprintf(line, sizeof(line),
+             "Context restored from checkpoint %.40s label=\"%s\".\n",
+             meta->id, safe_label);
+    agent_buf_puts(&b, line);
+    agent_buf_puts(&b, "Reason: ");
+    agent_buf_puts(&b, safe_reason);
+    agent_buf_puts(&b, "\n");
+    snprintf(line, sizeof(line),
+             "Restored model context to %d tokens. world_epoch restored=%" PRIu64 " current=%" PRIu64 ".\n",
+             meta->transcript_tokens, meta->world_epoch, w->world_epoch);
+    agent_buf_puts(&b, line);
+    snprintf(line, sizeof(line),
+             "side_effect_mismatch_allowed=%s\n",
+             allowed_mismatch ? "true" : "false");
+    agent_buf_puts(&b, line);
+    agent_buf_puts(&b,
+        "External side effects were not reverted; inspect or revert files, processes, browser state, and network effects separately before assuming the workspace matches this checkpoint.\n");
+    agent_context_append_side_effects_since(w, meta->world_epoch, &b);
+    free(safe_label);
+    free(safe_reason);
+    return agent_buf_take(&b);
+}
+
+static char *agent_context_restore(agent_worker *w, const agent_tool_call *call,
+                                   bool *already_appended) {
+    const char *id = agent_tool_arg_value(call, "id");
+    const char *reason = agent_tool_arg_value(call, "reason");
+    bool allow = agent_parse_bool_default(
+        agent_tool_arg_value(call, "allow_side_effect_mismatch"), false);
+    bool dry_run = agent_parse_bool_default(agent_tool_arg_value(call, "dry_run"), false);
+
+    int running = agent_context_running_bash_jobs(w);
+    if (running > 0) {
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "Tool error: context restore denied because %d bash job(s) are still running; use bash_status or bash_stop first\n",
+                 running);
+        return xstrdup(msg);
+    }
+
+    ds4_agent_context_meta meta = {0};
+    char *meta_path = NULL;
+    char *kv_path = NULL;
+    char err[256] = {0};
+    if (!ds4_agent_context_find_checkpoint(w->context_dir, id, &meta,
+                                           &meta_path, &kv_path,
+                                           err, sizeof(err))) {
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: ");
+        agent_buf_puts(&b, err);
+        agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
+
+    if (w->world_epoch != meta.world_epoch && !allow) {
+        agent_buf b = {0};
+        char line[256];
+        snprintf(line, sizeof(line),
+                 "Tool error: restore would rewind model context from world_epoch=%" PRIu64 " to %" PRIu64 ", but external side effects may still exist. Revert or inspect those effects, or call context restore with allow_side_effect_mismatch=true.\n",
+                 w->world_epoch, meta.world_epoch);
+        agent_buf_puts(&b, line);
+        agent_context_append_side_effects_since(w, meta.world_epoch, &b);
+        ds4_agent_context_meta_free(&meta);
+        free(meta_path);
+        free(kv_path);
+        return agent_buf_take(&b);
+    }
+
+    if (dry_run) {
+        char *safe = ds4_agent_context_oneline(meta.label, 160);
+        agent_buf b = {0};
+        char line[256];
+        snprintf(line, sizeof(line),
+                 "context action=restore-dry-run id=%.40s label=\"%s\" tokens=%d world_epoch=%" PRIu64 " current_world_epoch=%" PRIu64 "\n",
+                 meta.id, safe, meta.transcript_tokens, meta.world_epoch, w->world_epoch);
+        agent_buf_puts(&b, line);
+        free(safe);
+        ds4_agent_context_meta_free(&meta);
+        free(meta_path);
+        free(kv_path);
+        return agent_buf_take(&b);
+    }
+
+    ds4_tokens loaded = {0};
+    if (!agent_kv_load_path(w, kv_path, NULL, NULL, 0, &loaded, NULL,
+                            err, sizeof(err))) {
+        ds4_agent_context_meta_free(&meta);
+        free(meta_path);
+        free(kv_path);
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: context restore failed: ");
+        agent_buf_puts(&b, err[0] ? err : "failed to load checkpoint");
+        agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
+
+    char *notice = agent_context_restore_notice(w, &meta, reason, allow);
+    ds4_tokens restored = loaded;
+    memset(&loaded, 0, sizeof(loaded));
+    ds4_chat_append_message(w->engine, &restored, "tool", notice);
+    if (restored.len + 16 >= w->cfg->gen.ctx_size) {
+        ds4_tokens_free(&restored);
+        ds4_agent_context_meta_free(&meta);
+        free(meta_path);
+        free(kv_path);
+        free(notice);
+        return xstrdup("Tool error: restore notice would exceed context\n");
+    }
+    if (agent_worker_sync_tokens(w, &restored, false, err, sizeof(err)) != 0) {
+        ds4_session_invalidate(w->session);
+        ds4_tokens_free(&restored);
+        ds4_agent_context_meta_free(&meta);
+        free(meta_path);
+        free(kv_path);
+        free(notice);
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: context restore failed after load: ");
+        agent_buf_puts(&b, err[0] ? err : "failed to append restore notice");
+        agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
+
+    ds4_tokens_free(&w->transcript);
+    w->transcript = restored;
+    pthread_mutex_lock(&w->mu);
+    w->user_activity = true;
+    w->session_dirty = true;
+    w->status.ctx_used = w->transcript.len;
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+    if (already_appended) *already_appended = true;
+
+    ds4_agent_context_meta_free(&meta);
+    free(meta_path);
+    free(kv_path);
+    return notice;
+}
+
+static char *agent_context_list(agent_worker *w) {
+    DIR *d = opendir(w->context_dir);
+    agent_buf out = {0};
+    if (!d) return xstrdup("context checkpoints: none\n");
+    agent_buf_puts(&out, "context checkpoints:\n");
+    int count = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (!ds4_agent_context_meta_filename(de->d_name)) continue;
+        char *meta_path = ds4_agent_context_path_for_file(w->context_dir, de->d_name);
+        ds4_agent_context_meta m = {0};
+        char err[160] = {0};
+        if (ds4_agent_context_read_meta_file(meta_path, &m, err, sizeof(err))) {
+            char *safe = ds4_agent_context_oneline(m.label, 120);
+            char line[320];
+            snprintf(line, sizeof(line),
+                     "- id=%.8s tokens=%d world_epoch=%" PRIu64 " created_at=%" PRIu64 " label=\"%s\"\n",
+                     m.id, m.transcript_tokens, m.world_epoch, m.created_at, safe);
+            agent_buf_puts(&out, line);
+            free(safe);
+            count++;
+        }
+        ds4_agent_context_meta_free(&m);
+        free(meta_path);
+    }
+    closedir(d);
+    if (count == 0) {
+        free(out.ptr);
+        return xstrdup("context checkpoints: none\n");
+    }
+    return agent_buf_take(&out);
+}
+
+static char *agent_context_status(agent_worker *w) {
+    int pos = ds4_session_pos(w->session);
+    int ctx = ds4_session_ctx(w->session);
+    int running = agent_context_running_bash_jobs(w);
+    int checkpoints = ds4_agent_context_count_checkpoints(w->context_dir);
+    bool dirty;
+    pthread_mutex_lock(&w->mu);
+    dirty = w->session_dirty;
+    pthread_mutex_unlock(&w->mu);
+    char msg[512];
+    snprintf(msg, sizeof(msg),
+             "context status transcript_tokens=%d session_pos=%d ctx_size=%d free_tokens=%d dirty=%s world_epoch=%" PRIu64 " active_bash_jobs=%d checkpoints=%d\n",
+             w->transcript.len, pos, ctx, ctx - pos, dirty ? "true" : "false",
+             w->world_epoch, running, checkpoints);
+    return xstrdup(msg);
+}
+
+static char *agent_context_drop(agent_worker *w, const agent_tool_call *call) {
+    const char *id = agent_tool_arg_value(call, "id");
+    bool dry_run = agent_parse_bool_default(agent_tool_arg_value(call, "dry_run"), false);
+    ds4_agent_context_meta meta = {0};
+    char *meta_path = NULL;
+    char *kv_path = NULL;
+    char err[256] = {0};
+    if (!ds4_agent_context_find_checkpoint(w->context_dir, id, &meta,
+                                           &meta_path, &kv_path,
+                                           err, sizeof(err))) {
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: ");
+        agent_buf_puts(&b, err);
+        agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
+    char *memory_path = ds4_agent_context_full_memory_path(w->context_dir, &meta);
+    if (dry_run) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "context action=drop-dry-run id=%.40s\n", meta.id);
+        ds4_agent_context_meta_free(&meta);
+        free(meta_path);
+        free(kv_path);
+        free(memory_path);
+        return xstrdup(msg);
+    }
+    bool ok = true;
+    if (unlink(kv_path) != 0 && errno != ENOENT) ok = false;
+    if (memory_path && unlink(memory_path) != 0 && errno != ENOENT) ok = false;
+    if (unlink(meta_path) != 0 && errno != ENOENT) ok = false;
+    char msg[256];
+    snprintf(msg, sizeof(msg), "%scontext action=drop id=%.40s\n",
+             ok ? "" : "Tool error: partial drop failure; ", meta.id);
+    ds4_agent_context_meta_free(&meta);
+    free(meta_path);
+    free(kv_path);
+    free(memory_path);
+    return xstrdup(msg);
+}
+
+static char *agent_tool_context(agent_worker *w, const agent_tool_call *call,
+                                bool *already_appended) {
+    const char *action = agent_tool_arg_value(call, "action");
+    if (!action || !action[0]) return xstrdup("Tool error: context requires action\n");
+    if (!strcmp(action, "status")) return agent_context_status(w);
+    if (!strcmp(action, "list")) return agent_context_list(w);
+    if (!strcmp(action, "checkpoint")) return agent_context_checkpoint(w, call, already_appended);
+    if (!strcmp(action, "restore")) return agent_context_restore(w, call, already_appended);
+    if (!strcmp(action, "drop")) return agent_context_drop(w, call);
+    if (!strcmp(action, "compact")) {
+        char err[256] = {0};
+        const char *reason = agent_tool_arg_value(call, "reason");
+        if (!agent_worker_compact(w, reason && reason[0] ? reason : "context tool",
+                                  err, sizeof(err))) {
+            agent_buf b = {0};
+            agent_buf_puts(&b, "Tool error: context compact failed: ");
+            agent_buf_puts(&b, err[0] ? err : "unknown error");
+            agent_buf_puts(&b, "\n");
+            return agent_buf_take(&b);
+        }
+        return xstrdup("context action=compact status=ok\n");
+    }
+    return xstrdup("Tool error: unknown context action\n");
+}
+
+static bool agent_tool_call_requires_exclusive_context(const agent_tool_call *call) {
+    if (!call || !call->name || strcmp(call->name, "context")) return false;
+    const char *action = agent_tool_arg_value(call, "action");
+    return action &&
+           (!strcmp(action, "checkpoint") ||
+            !strcmp(action, "restore") ||
+            !strcmp(action, "compact"));
+}
+
+/* ============================================================================
  * Tool Dispatch
  * ============================================================================
  */
@@ -6729,8 +7228,10 @@ static pid_t agent_tool_pid(const agent_tool_call *call) {
 /* Execute one parsed DSML tool call and return the text that will be appended as
  * the tool-role result.  UI visualization already happened while streaming; this
  * function is only about side effects and the model-visible observation. */
-static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call) {
+static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call,
+                                     bool *already_appended) {
     agent_buf result = {0};
+    if (already_appended) *already_appended = false;
     if (!call->name) return xstrdup("Tool error: missing tool name\n");
 
     if (!strcmp(call->name, "read")) return agent_tool_read(w, call);
@@ -6741,6 +7242,7 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "search")) return agent_tool_search(w, call);
     if (!strcmp(call->name, "google_search")) return agent_tool_google_search(w, call);
     if (!strcmp(call->name, "visit_page")) return agent_tool_visit_page(w, call);
+    if (!strcmp(call->name, "context")) return agent_tool_context(w, call, already_appended);
 
     if (!strcmp(call->name, "bash")) {
         const char *cmd = agent_tool_arg_value(call, "command");
@@ -6756,6 +7258,7 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
             agent_buf_puts(&result, "\n");
             return agent_buf_take(&result);
         }
+        agent_context_note_side_effect(w, "bash", cmd);
         return agent_bash_job_tool_result(w, job, true, refresh, false, true);
     }
 
@@ -6775,7 +7278,14 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
                                               60, 1, 3600);
         bool stop = !strcmp(call->name, "bash_stop");
         bool wait = stop;
-        return agent_bash_job_tool_result(w, job, wait, refresh, stop, true);
+        char *res = agent_bash_job_tool_result(w, job, wait, refresh, stop, true);
+        if (stop) {
+            char detail[160];
+            snprintf(detail, sizeof(detail), "job=%d pid=%ld",
+                     job_id, (long)pid);
+            agent_context_note_side_effect(w, "bash_stop", detail);
+        }
+        return res;
     }
 
     {
@@ -6791,10 +7301,25 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
 
 /* Execute all tool calls from one DSML block, preserving per-call labels in the
  * combined result so the model can associate observations with calls. */
-static char *agent_execute_tool_calls(agent_worker *w, const agent_tool_calls *calls) {
+static char *agent_execute_tool_calls(agent_worker *w, const agent_tool_calls *calls,
+                                      bool *already_appended) {
     agent_buf all = {0};
+    if (already_appended) *already_appended = false;
     for (int i = 0; i < calls->len; i++) {
-        char *res = agent_execute_tool_call(w, &calls->v[i]);
+        if (agent_tool_call_requires_exclusive_context(&calls->v[i]) &&
+            calls->len != 1)
+        {
+            return xstrdup("Tool error: context checkpoint, restore, and compact must be the only tool call in a DSML block\n");
+        }
+    }
+    for (int i = 0; i < calls->len; i++) {
+        bool one_appended = false;
+        char *res = agent_execute_tool_call(w, &calls->v[i], &one_appended);
+        if (one_appended) {
+            if (already_appended) *already_appended = true;
+            free(all.ptr);
+            return res;
+        }
         char hdr[128];
         snprintf(hdr, sizeof(hdr), "Tool result %d (%s):\n", i + 1,
                  calls->v[i].name ? calls->v[i].name : "unknown");
@@ -7338,6 +7863,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         }
 
         char *tool_result;
+        bool tool_result_already_appended = false;
         if (early_tool_error) {
             agent_buf b = {0};
             agent_buf_puts(&b, "Tool error: ");
@@ -7354,10 +7880,12 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             agent_buf_puts(&b, agent_dsml_syntax_reminder);
             tool_result = agent_buf_take(&b);
         } else {
-            tool_result = agent_execute_tool_calls(w, &dsml.calls);
+            tool_result = agent_execute_tool_calls(w, &dsml.calls,
+                                                   &tool_result_already_appended);
         }
         int projected_tokens = 0;
-        if (!agent_tool_result_fits_context(w, tool_result,
+        if (!tool_result_already_appended &&
+            !agent_tool_result_fits_context(w, tool_result,
                                             AGENT_TOOL_RESULT_RESERVE_TOKENS,
                                             &projected_tokens))
         {
@@ -7392,7 +7920,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 }
             }
         }
-        ds4_chat_append_message(w->engine, &w->transcript, "tool", tool_result);
+        if (!tool_result_already_appended)
+            ds4_chat_append_message(w->engine, &w->transcript, "tool", tool_result);
         free(tool_result);
         agent_dsml_parser_free(&dsml);
 
@@ -8857,6 +9386,8 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
         .log_privdata = w,
     };
     w->web = ds4_web_create(&web_cfg);
+    w->context_dir = ds4_kvstore_path_join(w->cache_dir, "context");
+    w->world_epoch = ds4_agent_context_max_world_epoch(w->context_dir);
     w->sysprompt_path = ds4_kvstore_path_join(w->cache_dir, "sysprompt.kv");
     if (cfg->gen.trace_path && cfg->gen.trace_path[0]) {
         w->trace = fopen(cfg->gen.trace_path, "ab");
@@ -8876,10 +9407,12 @@ static void agent_worker_free(agent_worker *w) {
     worker_stop(w);
     if (w->thread) pthread_join(w->thread, NULL);
     agent_bash_jobs_free(w);
+    ds4_agent_side_effects_free(&w->side_effects);
     ds4_web_free(w->web);
     ds4_session_free(w->session);
     ds4_tokens_free(&w->transcript);
     free(w->cache_dir);
+    free(w->context_dir);
     free(w->sysprompt_path);
     free(w->session_title);
     free(w->legacy_session_path_to_delete);
