@@ -72,6 +72,7 @@ typedef struct {
     int power_percent;
     bool warm_weights;
     bool quality;
+    bool inspect_only;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
@@ -99,12 +100,19 @@ void ds4_engine_summary(ds4_engine *e);
 int ds4_engine_vocab_size(ds4_engine *e);
 int ds4_engine_power(ds4_engine *e);
 int ds4_engine_set_power(ds4_engine *e, int power_percent);
+const char *ds4_engine_model_name(ds4_engine *e);
+/* Stable id for cache compatibility.  0 is the original Flash shape, so old
+ * KV files with the previously-zero reserved byte remain Flash-compatible;
+ * Pro and later shapes must use nonzero ids. */
+int ds4_engine_model_id(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
 const char *ds4_think_max_prefix(void);
 uint32_t ds4_think_max_min_context(void);
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size);
+/* Uses the active model shape selected by ds4_engine_open(); call after opening
+ * the GGUF so Flash/Pro dimensions are known. */
 ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size);
 bool ds4_log_is_tty(FILE *fp);
 void ds4_log(FILE *fp, ds4_log_type type, const char *fmt, ...);

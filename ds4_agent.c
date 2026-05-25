@@ -79,6 +79,7 @@ typedef struct {
     agent_worker_state state;
     int prefill_done;
     int prefill_total;
+    unsigned prefill_label;
     int generated;
     double gen_tps;
     int ctx_used;
@@ -139,6 +140,8 @@ typedef struct {
     agent_bash_job *bash_jobs;
     int next_bash_job_id;
 } agent_worker;
+
+static unsigned agent_next_prefill_label(void);
 
 typedef struct agent_tail_capture {
     char *buf;
@@ -3611,6 +3614,12 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
         ok = agent_kv_read_title_trailer(fp, &hdr, &title, err, err_len);
     uint32_t expected_tokens = hdr.tokens;
     if (ok && hdr.payload_bytes != 0 &&
+        hdr.model_id != (uint8_t)ds4_engine_model_id(w->engine))
+    {
+        snprintf(err, err_len, "KV checkpoint was written for a different model");
+        ok = false;
+    }
+    if (ok && hdr.payload_bytes != 0 &&
         hdr.quant_bits != (uint8_t)ds4_engine_routed_quant_bits(w->engine))
     {
         snprintf(err, err_len, "KV checkpoint was written for a different quantization");
@@ -3698,6 +3707,7 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
         snprintf(err, err_len, "unsupported routed quantization for KV save");
         return false;
     }
+    const int model_id = ds4_engine_model_id(w->engine);
 
     size_t text_len = 0;
     char *text = ds4_kvstore_render_tokens_text(w->engine, tokens, &text_len);
@@ -3751,7 +3761,7 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     }
 
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
-    ds4_kvstore_fill_header(h, (uint8_t)quant_bits,
+    ds4_kvstore_fill_header(h, (uint8_t)model_id, (uint8_t)quant_bits,
                             ds4_kvstore_reason_code(reason),
                             session_identity ? DS4_KVSTORE_EXT_SESSION_TITLE : 0,
                             (uint32_t)tokens->len, 0,
@@ -3928,10 +3938,13 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
 
     if (publish_progress) {
         pthread_mutex_lock(&w->mu);
+        unsigned prefill_label = w->status.state == AGENT_WORKER_PREFILL ?
+            w->status.prefill_label : agent_next_prefill_label();
         w->status.state = AGENT_WORKER_PREFILL;
         w->progress_base = cached;
         w->status.prefill_done = 0;
         w->status.prefill_total = suffix;
+        w->status.prefill_label = prefill_label;
         w->status.generated = 0;
         w->status.gen_tps = 0.0;
         agent_wake_locked(w);
@@ -3951,7 +3964,9 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
 
 /* Start a new session at the system/tool prompt.  A fixed sysprompt.kv
  * checkpoint avoids paying this prefill cost repeatedly, but only when the
- * rendered prompt text still matches the file. */
+ * rendered prompt text still matches the file.  The same fixed path is shared
+ * by Flash and Pro; agent_kv_load_path() checks the model id, so switching
+ * model families rebuilds this cache instead of restoring incompatible KV. */
 static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t err_len) {
     ds4_tokens sys = {0};
     agent_worker_build_system_tokens(w, &sys);
@@ -4703,6 +4718,7 @@ static void agent_worker_list_sessions(agent_worker *w) {
 
     agent_session_list_item *sessions = NULL;
     int sessions_len = 0, sessions_cap = 0;
+    const uint8_t model_id = (uint8_t)ds4_engine_model_id(w->engine);
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         char sha[41];
@@ -4710,9 +4726,13 @@ static void agent_worker_list_sessions(agent_worker *w) {
         char *path = ds4_kvstore_path_join(w->cache_dir, de->d_name);
         ds4_kvstore_entry e = {0};
         if (ds4_kvstore_read_entry_file(path, sha, &e)) {
-            char *title = agent_session_title_from_file(path, title_budget);
-            agent_session_list_push(&sessions, &sessions_len, &sessions_cap,
-                                    e, title);
+            if (e.model_id == model_id) {
+                char *title = agent_session_title_from_file(path, title_budget);
+                agent_session_list_push(&sessions, &sessions_len, &sessions_cap,
+                                        e, title);
+            } else {
+                ds4_kvstore_entry_free(&e);
+            }
         }
         free(path);
     }
@@ -4806,6 +4826,7 @@ static void agent_switch_completion_callback(const char *buf,
     if (!d) return;
 
     agent_completion_sessions sessions = {0};
+    const uint8_t model_id = (uint8_t)ds4_engine_model_id(w->engine);
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         char sha[41];
@@ -4816,10 +4837,14 @@ static void agent_switch_completion_callback(const char *buf,
         char *path = ds4_kvstore_path_join(w->cache_dir, de->d_name);
         ds4_kvstore_entry e = {0};
         if (ds4_kvstore_read_entry_file(path, sha, &e)) {
-            last_used = e.last_used;
+            if (e.model_id == model_id) last_used = e.last_used;
+            else last_used = UINT64_MAX;
             ds4_kvstore_entry_free(&e);
+        } else {
+            last_used = UINT64_MAX;
         }
         free(path);
+        if (last_used == UINT64_MAX) continue;
         agent_completion_sessions_push(&sessions, sha, last_used);
     }
     closedir(d);
@@ -4860,15 +4885,27 @@ static bool agent_worker_find_session(agent_worker *w, const char *prefix,
     int matches = 0;
     char match_sha[41] = {0};
     char *match_path = NULL;
+    const uint8_t model_id = (uint8_t)ds4_engine_model_id(w->engine);
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         char sha[41];
         if (!ds4_kvstore_sha_hex_name(de->d_name, sha)) continue;
         if (strncasecmp(sha, prefix, plen) != 0) continue;
+        char *path = ds4_kvstore_path_join(w->cache_dir, de->d_name);
+        ds4_kvstore_entry e = {0};
+        bool same_model = ds4_kvstore_read_entry_file(path, sha, &e) &&
+                          e.model_id == model_id;
+        ds4_kvstore_entry_free(&e);
+        if (!same_model) {
+            free(path);
+            continue;
+        }
         matches++;
         if (matches == 1) {
             memcpy(match_sha, sha, sizeof(match_sha));
-            match_path = ds4_kvstore_path_join(w->cache_dir, de->d_name);
+            match_path = path;
+        } else {
+            free(path);
         }
     }
     closedir(d);
@@ -4981,7 +5018,7 @@ static bool agent_worker_strip_session(agent_worker *w, const char *prefix,
 
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
     uint64_t now = (uint64_t)time(NULL);
-    ds4_kvstore_fill_header(h, hdr.quant_bits, hdr.reason, hdr.ext_flags,
+    ds4_kvstore_fill_header(h, hdr.model_id, hdr.quant_bits, hdr.reason, hdr.ext_flags,
                             stripped_token_count, hdr.hits, hdr.ctx_size,
                             hdr.created_at, now, 0);
     uint8_t tb[4];
@@ -6631,6 +6668,7 @@ static void agent_bash_publish_observation(agent_worker *w, const char *obs) {
         bool failed = strstr(obs, "status=done") && !strstr(obs, "exit_status=0\n");
         if (failed) agent_publish(w, "\x1b[38;5;208m", 11);
         agent_publish(w, body, n);
+        if (body[n - 1] != '\n') agent_publish(w, "\n", 1);
         if (failed) agent_publish(w, "\x1b[0m", 4);
     }
 }
@@ -7175,10 +7213,13 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         agent_trace_tokens(w, "prefill_suffix", prompt_for_sync, cached);
 
         pthread_mutex_lock(&w->mu);
+        unsigned prefill_label = w->status.state == AGENT_WORKER_PREFILL ?
+            w->status.prefill_label : agent_next_prefill_label();
         w->status.state = AGENT_WORKER_PREFILL;
         w->progress_base = cached;
         w->status.prefill_done = 0;
         w->status.prefill_total = suffix;
+        w->status.prefill_label = prefill_label;
         w->status.generated = 0;
         w->status.gen_tps = 0.0;
         agent_wake_locked(w);
@@ -7568,6 +7609,7 @@ static bool worker_submit(agent_worker *w, const char *text) {
         w->status.state = AGENT_WORKER_PREFILL;
         w->status.prefill_done = 0;
         w->status.prefill_total = 0;
+        w->status.prefill_label = agent_next_prefill_label();
         w->status.generated = 0;
         w->status.gen_tps = 0.0;
         pthread_cond_signal(&w->cond);
@@ -7734,6 +7776,26 @@ static void agent_power_status_suffix(const agent_status *st,
         buf[0] = '\0';
 }
 
+static unsigned agent_next_prefill_label(void) {
+    static unsigned next;
+    return next++;
+}
+
+/* Keep each prefill operation on a single playful label so the footer does not
+ * visually churn while progress updates stream in. */
+static const char *agent_prefill_label(const agent_status *st) {
+    static const char *labels[] = {
+        "reading",
+        "absorbing",
+        "studying",
+        "gathering",
+        "crunching",
+        "scrutinizing",
+    };
+    size_t n = sizeof(labels) / sizeof(labels[0]);
+    return labels[(st ? st->prefill_label : 0u) % n];
+}
+
 /* Build the one-line footer shown below the prompt.  It is intentionally compact
  * because linenoise redraws it on every progress update. */
 static void build_status_text(const agent_status *st, char *buf, size_t len) {
@@ -7751,8 +7813,9 @@ static void build_status_text(const agent_status *st, char *buf, size_t len) {
         double pct = 100.0 * (double)done / (double)total;
         char bar[AGENT_PROGRESS_BAR_MAX_BYTES];
         agent_progress_bar(done, total, bar, sizeof(bar), stdout_is_tty());
-        snprintf(buf, len, "ctx %s/%s | prefill %s %d/%d %.1f%%%s",
-                 used, total_ctx, bar, done, total, pct, power);
+        snprintf(buf, len, "ctx %s/%s | %s %s %d/%d %.1f%%%s",
+                 used, total_ctx, agent_prefill_label(st), bar,
+                 done, total, pct, power);
         break;
     }
     case AGENT_WORKER_GENERATING:
@@ -9522,10 +9585,9 @@ int main(int argc, char **argv) {
                 cfg.chdir_path, strerror(errno));
         return 1;
     }
-    log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
-
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
+    log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
 
     struct sigaction old_int;
     struct sigaction sa;

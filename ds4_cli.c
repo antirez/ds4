@@ -1582,14 +1582,15 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return rc;
     }
-    if (!cfg.inspect) {
-        log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
-        cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
-    }
+    cfg.engine.inspect_only = cfg.inspect;
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) {
         free(cfg.prompt_owned);
         return 1;
+    }
+    if (!cfg.inspect) {
+        log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
+        cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
     }
     int rc = 0;
     if (cfg.inspect) {
