@@ -33,7 +33,7 @@ CPU_CORE_OBJS = ds4_cpu.o
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-agent-context-loop cpu cuda cuda-spark cuda-generic cuda-regression
+.PHONY: all help clean test test-agent-context-loop test-kv-cache-benefit cpu cuda cuda-spark cuda-generic cuda-regression
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -45,6 +45,8 @@ help:
 	@echo "  make test         Build and run tests"
 	@echo "  make test-agent-context-loop"
 	@echo "                    Run slow DS4-generated agent context loop e2e"
+	@echo "  make test-kv-cache-benefit"
+	@echo "                    Run optional KV restore benefit benchmark"
 	@echo "  make clean        Remove build outputs"
 
 ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
@@ -83,6 +85,8 @@ help:
 	@echo "  make test                Build and run tests"
 	@echo "  make test-agent-context-loop"
 	@echo "                           Run slow DS4-generated agent context loop e2e"
+	@echo "  make test-kv-cache-benefit"
+	@echo "                           Run optional KV restore benefit benchmark"
 	@echo "  make clean               Remove build outputs"
 
 cuda-spark:
@@ -161,6 +165,9 @@ tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c ds4_gpu.h
 tests/ds4_agent_context_test.o: tests/ds4_agent_context_test.c ds4_agent_context.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/ds4_agent_context_test.c
 
+tests/ds4_kv_cache_benefit_test.o: tests/ds4_kv_cache_benefit_test.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/ds4_kv_cache_benefit_test.c
+
 rax.o: rax.c rax.h rax_malloc.h
 	$(CC) $(CFLAGS) -c -o $@ rax.c
 
@@ -197,6 +204,13 @@ tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
 tests/ds4_agent_context_test: tests/ds4_agent_context_test.o ds4_agent_context.o
 	$(CC) $(CFLAGS) -o $@ tests/ds4_agent_context_test.o ds4_agent_context.o $(LDLIBS)
 
+tests/ds4_kv_cache_benefit_test: tests/ds4_kv_cache_benefit_test.o $(CORE_OBJS)
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(CFLAGS) -o $@ tests/ds4_kv_cache_benefit_test.o $(CORE_OBJS) $(METAL_LDLIBS)
+else
+	$(NVCC) $(NVCCFLAGS) -o $@ tests/ds4_kv_cache_benefit_test.o $(CORE_OBJS) $(CUDA_LDLIBS)
+endif
+
 ds4_test: ds4_test.o ds4_kvstore.o rax.o $(CORE_OBJS)
 ifeq ($(UNAME_S),Darwin)
 	$(CC) $(CFLAGS) -o $@ ds4_test.o ds4_kvstore.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
@@ -212,5 +226,8 @@ test: ds4_test ds4-eval tests/ds4_agent_context_test
 test-agent-context-loop: ds4-agent tests/ds4_agent_context_test
 	sh tests/ds4_agent_context_loop_e2e.sh
 
+test-kv-cache-benefit: tests/ds4_kv_cache_benefit_test
+	./tests/ds4_kv_cache_benefit_test
+
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/ds4_agent_context_test tests/ds4_agent_context_test.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/ds4_agent_context_test tests/ds4_agent_context_test.o tests/ds4_kv_cache_benefit_test tests/ds4_kv_cache_benefit_test.o

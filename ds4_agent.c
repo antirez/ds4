@@ -147,8 +147,29 @@ typedef struct {
 } agent_worker;
 
 static unsigned agent_next_prefill_label(void);
+
+typedef struct {
+    int old_pos;
+    int prompt_tokens;
+    int common_prefix;
+    int cached_tokens;
+    int prefill_tokens;
+    double elapsed_sec;
+    int rc;
+} agent_sync_metrics;
+
+typedef struct {
+    int old_tokens;
+    int new_tokens;
+    int summary_tokens;
+    int tail_tokens;
+    int removed_tokens;
+    double reduction_percent;
+} agent_compact_stats;
+
 static bool agent_worker_compact(agent_worker *w, const char *reason,
-                                 char *err, size_t err_len);
+                                 char *err, size_t err_len,
+                                 agent_compact_stats *stats);
 
 typedef struct agent_tail_capture {
     char *buf;
@@ -3953,14 +3974,24 @@ static void worker_answer_queued_user_drain(agent_worker *w, char *text) {
  * cache-saving operation: if the requested transcript extends the live session,
  * only the suffix is prefetched; otherwise the DS4 session rebuilds from the
  * longest common prefix it can retain. */
-static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
-                                    bool publish_progress,
-                                    char *err, size_t err_len) {
+static int agent_worker_sync_tokens_ex(agent_worker *w, const ds4_tokens *tokens,
+                                       bool publish_progress,
+                                       char *err, size_t err_len,
+                                       agent_sync_metrics *metrics) {
     int old_pos = ds4_session_pos(w->session);
     int common = ds4_session_common_prefix(w->session, tokens);
     int cached = common == old_pos && tokens->len >= old_pos ? common : 0;
     int suffix = tokens->len - cached;
     if (suffix < 0) suffix = tokens->len;
+    if (metrics) {
+        metrics->old_pos = old_pos;
+        metrics->prompt_tokens = tokens->len;
+        metrics->common_prefix = common;
+        metrics->cached_tokens = cached;
+        metrics->prefill_tokens = suffix;
+        metrics->elapsed_sec = 0.0;
+        metrics->rc = 0;
+    }
 
     if (publish_progress) {
         pthread_mutex_lock(&w->mu);
@@ -3982,10 +4013,23 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
     ds4_session_set_display_progress(w->session,
                                      publish_progress ? worker_progress_cb : NULL,
                                      publish_progress ? w : NULL);
+    double t0 = now_sec();
     int rc = ds4_session_sync(w->session, tokens, err, err_len);
+    double elapsed = now_sec() - t0;
     ds4_session_set_progress(w->session, NULL, NULL);
     ds4_session_set_display_progress(w->session, NULL, NULL);
+    if (metrics) {
+        metrics->elapsed_sec = elapsed;
+        metrics->rc = rc;
+    }
     return rc;
+}
+
+static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
+                                    bool publish_progress,
+                                    char *err, size_t err_len) {
+    return agent_worker_sync_tokens_ex(w, tokens, publish_progress,
+                                       err, err_len, NULL);
 }
 
 /* Start a new session at the system/tool prompt.  A fixed sysprompt.kv
@@ -6955,7 +6999,10 @@ static void agent_context_append_side_effects_since(agent_worker *w, uint64_t ep
 static char *agent_context_restore_notice(agent_worker *w,
                                           const ds4_agent_context_meta *meta,
                                           const char *reason,
-                                          bool allowed_mismatch) {
+                                          bool allowed_mismatch,
+                                          int checkpoint_tokens,
+                                          int restored_tokens,
+                                          int restore_notice_tokens) {
     char *safe_label = ds4_agent_context_oneline(meta->label, 160);
     char *safe_reason = ds4_agent_context_oneline(reason && reason[0] ?
                                               reason : "not specified", 240);
@@ -6971,6 +7018,11 @@ static char *agent_context_restore_notice(agent_worker *w,
     snprintf(line, sizeof(line),
              "Restored model context to %d tokens. world_epoch restored=%" PRIu64 " current=%" PRIu64 ".\n",
              meta->transcript_tokens, meta->world_epoch, w->world_epoch);
+    agent_buf_puts(&b, line);
+    snprintf(line, sizeof(line),
+             "KV restore metrics: checkpoint_tokens=%d restore_notice_tokens=%d restored_tokens=%d expected_prefill_suffix_tokens=%d full_prefill_tokens_without_kv=%d saved_prefill_tokens=%d.\n",
+             checkpoint_tokens, restore_notice_tokens, restored_tokens,
+             restore_notice_tokens, restored_tokens, checkpoint_tokens);
     agent_buf_puts(&b, line);
     snprintf(line, sizeof(line),
              "side_effect_mismatch_allowed=%s\n",
@@ -7058,11 +7110,43 @@ static char *agent_context_restore(agent_worker *w, const agent_tool_call *call,
         agent_buf_puts(&b, "\n");
         return agent_buf_take(&b);
     }
+    if (loaded.len != meta.transcript_tokens) {
+        ds4_tokens_free(&loaded);
+        ds4_agent_context_meta_free(&meta);
+        free(meta_path);
+        free(kv_path);
+        agent_buf b = {0};
+        char line[192];
+        snprintf(line, sizeof(line),
+                 "Tool error: context restore failed: metadata tokens=%d but KV tokens=%d\n",
+                 meta.transcript_tokens, loaded.len);
+        agent_buf_puts(&b, line);
+        return agent_buf_take(&b);
+    }
 
-    char *notice = agent_context_restore_notice(w, &meta, reason, allow);
-    ds4_tokens restored = loaded;
-    memset(&loaded, 0, sizeof(loaded));
-    ds4_chat_append_message(w->engine, &restored, "tool", notice);
+    char *notice = NULL;
+    ds4_tokens restored = {0};
+    int checkpoint_tokens = loaded.len;
+    int notice_tokens = 0;
+    int restored_tokens = checkpoint_tokens;
+    for (int i = 0; i < 4; i++) {
+        free(notice);
+        notice = agent_context_restore_notice(w, &meta, reason, allow,
+                                              checkpoint_tokens,
+                                              restored_tokens,
+                                              notice_tokens);
+        ds4_tokens_free(&restored);
+        ds4_tokens_copy(&restored, &loaded);
+        ds4_chat_append_message(w->engine, &restored, "tool", notice);
+        int new_notice_tokens = restored.len - checkpoint_tokens;
+        int new_restored_tokens = restored.len;
+        if (new_notice_tokens == notice_tokens &&
+            new_restored_tokens == restored_tokens)
+            break;
+        notice_tokens = new_notice_tokens;
+        restored_tokens = new_restored_tokens;
+    }
+    ds4_tokens_free(&loaded);
     if (restored.len + 16 >= w->cfg->gen.ctx_size) {
         ds4_tokens_free(&restored);
         ds4_agent_context_meta_free(&meta);
@@ -7071,7 +7155,9 @@ static char *agent_context_restore(agent_worker *w, const agent_tool_call *call,
         free(notice);
         return xstrdup("Tool error: restore notice would exceed context\n");
     }
-    if (agent_worker_sync_tokens(w, &restored, false, err, sizeof(err)) != 0) {
+    agent_sync_metrics sync_metrics = {0};
+    if (agent_worker_sync_tokens_ex(w, &restored, false, err, sizeof(err),
+                                    &sync_metrics) != 0) {
         ds4_session_invalidate(w->session);
         ds4_tokens_free(&restored);
         ds4_agent_context_meta_free(&meta);
@@ -7083,6 +7169,19 @@ static char *agent_context_restore(agent_worker *w, const agent_tool_call *call,
         agent_buf_puts(&b, err[0] ? err : "failed to append restore notice");
         agent_buf_puts(&b, "\n");
         return agent_buf_take(&b);
+    }
+    agent_trace(w,
+                "context restore id=%.40s checkpoint=%d restored=%d cached=%d suffix=%d elapsed=%.3f",
+                meta.id, checkpoint_tokens, restored.len,
+                sync_metrics.cached_tokens, sync_metrics.prefill_tokens,
+                sync_metrics.elapsed_sec);
+    if (sync_metrics.cached_tokens < checkpoint_tokens ||
+        sync_metrics.prefill_tokens != restored.len - checkpoint_tokens)
+    {
+        agent_trace(w,
+                    "context restore prefill mismatch expected_cached=%d expected_suffix=%d common=%d old_pos=%d",
+                    checkpoint_tokens, restored.len - checkpoint_tokens,
+                    sync_metrics.common_prefix, sync_metrics.old_pos);
     }
 
     ds4_tokens_free(&w->transcript);
@@ -7140,17 +7239,22 @@ static char *agent_context_list(agent_worker *w) {
 static char *agent_context_status(agent_worker *w) {
     int pos = ds4_session_pos(w->session);
     int ctx = ds4_session_ctx(w->session);
+    int common = ds4_session_common_prefix(w->session, &w->transcript);
+    int cached = common == pos && w->transcript.len >= pos ? common : 0;
+    int prefill_suffix = w->transcript.len - cached;
+    if (prefill_suffix < 0) prefill_suffix = w->transcript.len;
     int running = agent_context_running_bash_jobs(w);
     int checkpoints = ds4_agent_context_count_checkpoints(w->context_dir);
     bool dirty;
     pthread_mutex_lock(&w->mu);
     dirty = w->session_dirty;
     pthread_mutex_unlock(&w->mu);
-    char msg[512];
+    char msg[640];
     snprintf(msg, sizeof(msg),
-             "context status transcript_tokens=%d session_pos=%d ctx_size=%d free_tokens=%d dirty=%s world_epoch=%" PRIu64 " active_bash_jobs=%d checkpoints=%d\n",
-             w->transcript.len, pos, ctx, ctx - pos, dirty ? "true" : "false",
-             w->world_epoch, running, checkpoints);
+             "context status transcript_tokens=%d session_pos=%d cached_tokens=%d prefill_suffix_tokens=%d ctx_size=%d free_tokens=%d dirty=%s world_epoch=%" PRIu64 " active_bash_jobs=%d checkpoints=%d\n",
+             w->transcript.len, pos, cached, prefill_suffix,
+             ctx, ctx - pos, dirty ? "true" : "false", w->world_epoch,
+             running, checkpoints);
     return xstrdup(msg);
 }
 
@@ -7216,15 +7320,22 @@ static char *agent_tool_context(agent_worker *w, const agent_tool_call *call,
     if (!strcmp(action, "compact")) {
         char err[256] = {0};
         const char *reason = agent_tool_arg_value(call, "reason");
+        agent_compact_stats stats = {0};
         if (!agent_worker_compact(w, reason && reason[0] ? reason : "context tool",
-                                  err, sizeof(err))) {
+                                  err, sizeof(err), &stats)) {
             agent_buf b = {0};
             agent_buf_puts(&b, "Tool error: context compact failed: ");
             agent_buf_puts(&b, err[0] ? err : "unknown error");
             agent_buf_puts(&b, "\n");
             return agent_buf_take(&b);
         }
-        return xstrdup("context action=compact status=ok\n");
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "context action=compact status=ok old_tokens=%d new_tokens=%d removed_tokens=%d reduction_percent=%.1f summary_tokens=%d tail_tokens=%d\n",
+                 stats.old_tokens, stats.new_tokens, stats.removed_tokens,
+                 stats.reduction_percent, stats.summary_tokens,
+                 stats.tail_tokens);
+        return xstrdup(msg);
     }
     return xstrdup("Tool error: unknown context action\n");
 }
@@ -7459,9 +7570,15 @@ static char *agent_compact_make_prompt(const char *reason) {
  * may have just seen private compaction instructions that are not part of the
  * real conversation. */
 static bool agent_worker_compact(agent_worker *w, const char *reason,
-                                 char *err, size_t err_len) {
+                                 char *err, size_t err_len,
+                                 agent_compact_stats *stats) {
+    if (stats) memset(stats, 0, sizeof(*stats));
     const int bottom = w->transcript.len;
     if (bottom <= 0) return true;
+    if (stats) {
+        stats->old_tokens = bottom;
+        stats->new_tokens = bottom;
+    }
 
     ds4_tokens sys = {0};
     agent_worker_build_system_tokens(w, &sys);
@@ -7588,7 +7705,9 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
     if (summary_msg.len && summary_msg.ptr[summary_msg.len - 1] != '\n')
         agent_buf_puts(&summary_msg, "\n");
     agent_buf_puts(&summary_msg, "[End compacted summary. Recent conversation continues verbatim below.]\n\n");
+    int before_summary_tokens = compacted.len;
     ds4_chat_append_message(w->engine, &compacted, "system", summary_msg.ptr);
+    int summary_tokens = compacted.len - before_summary_tokens;
     free(summary_msg.ptr);
     free(summary.ptr);
 
@@ -7624,13 +7743,23 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
     agent_trace(w, "compacted reason=\"%s\" old=%d new=%d tail_start=%d tail=%d",
                 reason ? reason : "", bottom, w->transcript.len,
                 tail_start, bottom - tail_start);
+    if (stats) {
+        stats->old_tokens = bottom;
+        stats->new_tokens = w->transcript.len;
+        stats->summary_tokens = summary_tokens;
+        stats->tail_tokens = bottom - tail_start;
+        stats->removed_tokens = bottom - w->transcript.len;
+        if (stats->removed_tokens < 0) stats->removed_tokens = 0;
+        stats->reduction_percent = bottom > 0 ?
+            ((double)stats->removed_tokens * 100.0) / (double)bottom : 0.0;
+    }
     return true;
 }
 
 static bool agent_worker_compact_if_needed(agent_worker *w, const char *reason,
                                            char *err, size_t err_len) {
     if (!agent_worker_should_compact(w)) return true;
-    return agent_worker_compact(w, reason, err, err_len);
+    return agent_worker_compact(w, reason, err, err_len, NULL);
 }
 
 static int worker_accept_generated_token(agent_worker *w,
@@ -7908,7 +8037,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                                             &projected_tokens))
         {
             if (!agent_worker_compact(w, "tool result would exceed context",
-                                      compact_err, sizeof(compact_err)))
+                                      compact_err, sizeof(compact_err), NULL))
             {
                 free(tool_result);
                 agent_dsml_parser_free(&dsml);
@@ -8046,7 +8175,7 @@ static void worker_run_deferred_compact(agent_worker *w) {
 
     int before = w->transcript.len;
     char err[160] = {0};
-    if (agent_worker_compact(w, "user requested compaction", err, sizeof(err))) {
+    if (agent_worker_compact(w, "user requested compaction", err, sizeof(err), NULL)) {
         if (w->transcript.len != before) {
             pthread_mutex_lock(&w->mu);
             w->session_dirty = true;

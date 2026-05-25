@@ -541,7 +541,18 @@ The action handler should return compact machine-readable text. Example:
 
 ```text
 context action=checkpoint id=7e1c2b1a label=before-parser-refactor tokens=18420 world_epoch=3
+context action=compact status=ok old_tokens=28500 new_tokens=9400 removed_tokens=19100 reduction_percent=67.0 summary_tokens=2100 tail_tokens=7000
 ```
+
+Restore appends a model-visible notice that includes KV reuse accounting:
+
+```text
+KV restore metrics: checkpoint_tokens=18420 restore_notice_tokens=140 restored_tokens=18560 expected_prefill_suffix_tokens=140 full_prefill_tokens_without_kv=18560 saved_prefill_tokens=18420.
+```
+
+This makes the benefit concrete for both the implementation and the model:
+restoring the checkpoint loads the old prefix from KV, then only the synthetic
+restore notice is prefetched.
 
 ## Correctness Verification Measures
 
@@ -564,6 +575,10 @@ For model-initiated restores, the actual post-restore transcript should be the
 checkpoint transcript plus the synthetic restore notice. Verification should
 measure both values separately: zero prefill for loading the checkpoint payload,
 then a small append for the notice.
+
+The `context status` output should expose the live-cache view as
+`cached_tokens` and `prefill_suffix_tokens`, so the agent can tell whether the
+current transcript will reuse KV or force a rebuild.
 
 3. Next-token equivalence.
 
@@ -641,6 +656,32 @@ prompt, response, and ledger files with the exact expanded prompt, the raw DS4
 output, and the generated ledger. It does not synthesize the loop in C; the
 point is to test whether the model can operate the new tool surface in the
 intended loop shape.
+
+10. KV cache benefit benchmark.
+
+Run the optional benchmark target:
+
+```sh
+make test-kv-cache-benefit
+```
+
+This target is intentionally separate from default `make test` because it opens
+the real model and backend. It verifies:
+
+- a saved KV payload reloads to the same token position,
+- restored logits have the same argmax and near-zero delta versus the original
+  checkpoint state,
+- extending the restored session requires prefill only for the suffix,
+- a fresh full prefill to the same extended transcript has the same top-1 next
+  token as KV-restore-plus-suffix,
+- the report prints `full_prefill_tokens`, `restored_prefill_tokens`,
+  `saved_prefill_tokens`, payload bytes, and wall-clock timings.
+
+The hallucination claim should be phrased conservatively: the deterministic
+guard is model-state equivalence. If logits/argmax match after restore, the KV
+path has not introduced state drift. Compaction can reduce context pressure,
+but factual quality after compaction still depends on the summary and must be
+tested with task-specific e2e prompts.
 
 ### Resume Point: 2026-05-25
 
