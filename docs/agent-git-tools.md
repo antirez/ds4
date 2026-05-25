@@ -14,8 +14,10 @@ against `ds4_agent_context.c`.
   disabled, and every invocation has a bounded timeout.
 - Allow guarded local mutations only when intent is explicit and validation
   happens before invoking Git.
-- Keep remote mutations opt-in with `confirm=true` unless the call is a
-  `dry_run`.
+- Require interactive user approval for every real Git mutation; `dry_run`
+  calls and read-only inspection never prompt.
+- Keep the riskiest local and remote mutations behind an additional
+  model-visible `confirm=true` intent flag unless the call is a `dry_run`.
 - Keep merge and rebase conservative: preview first, clean worktree required,
   and first real merge mode limited to `--ff-only`.
 
@@ -53,6 +55,8 @@ Guarded remote and integration actions include `fetch`, `push`, `merge`,
   reports exit code 124 with a timeout notice in the tool output.
 - Git runs with terminal prompts disabled (`GIT_TERMINAL_PROMPT=0`), askpass
   helpers disabled, merge auto-edit disabled, and `GIT_EDITOR=true`.
+- Every real mutating action prompts the local user before invoking Git.
+  In non-interactive mode, Git mutations are rejected.
 - `stage` and `unstage` require either `path` or `all=true`.
 - `commit` requires an explicit one-line `message`.
 - `worktree_restore` requires either `path` or `all=true`, defaults `ref=HEAD`,

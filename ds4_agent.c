@@ -125,11 +125,11 @@ typedef struct {
     size_t out_len;
     size_t out_cap;
     ds4_web *web;
-    bool web_approval_pending;
-    bool web_approval_answered;
-    bool web_approval_result;
-    char web_approval_message[256];
-    char web_approval_error[160];
+    bool approval_pending;
+    bool approval_answered;
+    bool approval_result;
+    char approval_message[256];
+    char approval_error[160];
     bool queued_user_drain_pending;
     bool queued_user_drain_answered;
     char *queued_user_drain_text;
@@ -3860,33 +3860,41 @@ static void agent_publish_system_status(agent_worker *w, const char *msg) {
     }
 }
 
-static int agent_web_confirm(void *privdata, const char *message,
-                             char *err, size_t err_len) {
-    agent_worker *w = privdata;
+static int agent_request_user_approval(agent_worker *w, const char *message,
+                                       const char *denied_message,
+                                       char *err, size_t err_len) {
     if (!w || w->cfg->non_interactive) {
-        snprintf(err, err_len,
-                 "visible Chrome browser startup requires interactive approval");
+        snprintf(err, err_len, "user approval requires interactive mode");
         return 0;
     }
 
     pthread_mutex_lock(&w->mu);
-    w->web_approval_pending = true;
-    w->web_approval_answered = false;
-    w->web_approval_result = false;
-    w->web_approval_error[0] = '\0';
-    snprintf(w->web_approval_message, sizeof(w->web_approval_message),
-             "%s", message ? message : "Start visible Chrome browser? (y/n) ");
+    w->approval_pending = true;
+    w->approval_answered = false;
+    w->approval_result = false;
+    w->approval_error[0] = '\0';
+    snprintf(w->approval_message, sizeof(w->approval_message),
+             "%s", message ? message : "Approve action? (y/n) ");
     agent_wake_locked(w);
-    while (!w->stop && !w->web_approval_answered)
+    while (!w->stop && !w->approval_answered)
         pthread_cond_wait(&w->cond, &w->mu);
-    bool ok = w->web_approval_result;
+    bool ok = w->approval_result;
     if (!ok) {
         snprintf(err, err_len, "%s",
-                 w->web_approval_error[0] ? w->web_approval_error :
-                 "user denied Chrome browser start");
+                 w->approval_error[0] ? w->approval_error :
+                 (denied_message && denied_message[0] ?
+                  denied_message : "user denied action"));
     }
     pthread_mutex_unlock(&w->mu);
     return ok ? 1 : 0;
+}
+
+static int agent_web_confirm(void *privdata, const char *message,
+                             char *err, size_t err_len) {
+    agent_worker *w = privdata;
+    return agent_request_user_approval(
+        w, message ? message : "Start visible Chrome browser? (y/n) ",
+        "user denied Chrome browser start", err, err_len);
 }
 
 static void agent_web_log(void *privdata, const char *message) {
@@ -3895,27 +3903,27 @@ static void agent_web_log(void *privdata, const char *message) {
     agent_trace(w, "web: %s", message);
 }
 
-static bool worker_take_web_approval_request(agent_worker *w,
-                                             char *message, size_t message_len) {
+static bool worker_take_approval_request(agent_worker *w,
+                                         char *message, size_t message_len) {
     pthread_mutex_lock(&w->mu);
-    bool pending = w->web_approval_pending;
+    bool pending = w->approval_pending;
     if (pending) {
-        snprintf(message, message_len, "%s", w->web_approval_message);
-        w->web_approval_pending = false;
+        snprintf(message, message_len, "%s", w->approval_message);
+        w->approval_pending = false;
     }
     pthread_mutex_unlock(&w->mu);
     return pending;
 }
 
-static void worker_answer_web_approval(agent_worker *w, bool allow,
-                                       const char *deny_error) {
+static void worker_answer_approval(agent_worker *w, bool allow,
+                                   const char *deny_error) {
     pthread_mutex_lock(&w->mu);
-    w->web_approval_result = allow;
-    w->web_approval_answered = true;
+    w->approval_result = allow;
+    w->approval_answered = true;
     if (!allow)
-        snprintf(w->web_approval_error, sizeof(w->web_approval_error),
+        snprintf(w->approval_error, sizeof(w->approval_error),
                  "%s", deny_error && deny_error[0] ? deny_error :
-                 "user denied Chrome browser start");
+                 "user denied action");
     pthread_cond_signal(&w->cond);
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
@@ -5543,7 +5551,48 @@ static char *agent_tool_list(const agent_tool_call *call) {
     return agent_buf_take(&out);
 }
 
-static char *agent_tool_git(const agent_tool_call *call) {
+static bool agent_git_action_mutates(const char *action) {
+    return action &&
+           (!strcmp(action, "stage") ||
+            !strcmp(action, "unstage") ||
+            !strcmp(action, "commit") ||
+            !strcmp(action, "worktree_restore") ||
+            !strcmp(action, "switch") ||
+            !strcmp(action, "stash_push") ||
+            !strcmp(action, "stash_apply") ||
+            !strcmp(action, "stash_pop") ||
+            !strcmp(action, "stash_drop") ||
+            !strcmp(action, "fetch") ||
+            !strcmp(action, "push") ||
+            !strcmp(action, "merge") ||
+            !strcmp(action, "merge_abort") ||
+            !strcmp(action, "rebase") ||
+            !strcmp(action, "rebase_abort"));
+}
+
+static bool agent_git_action_requires_confirm(const char *action) {
+    return action &&
+           (!strcmp(action, "worktree_restore") ||
+            !strcmp(action, "switch") ||
+            !strcmp(action, "stash_pop") ||
+            !strcmp(action, "stash_drop") ||
+            !strcmp(action, "fetch") ||
+            !strcmp(action, "push") ||
+            !strcmp(action, "merge") ||
+            !strcmp(action, "merge_abort") ||
+            !strcmp(action, "rebase") ||
+            !strcmp(action, "rebase_abort"));
+}
+
+static bool agent_git_needs_user_approval(const char *action,
+                                          bool dry_run,
+                                          bool confirm) {
+    if (dry_run || !agent_git_action_mutates(action)) return false;
+    if (agent_git_action_requires_confirm(action) && !confirm) return false;
+    return true;
+}
+
+static char *agent_tool_git(agent_worker *w, const agent_tool_call *call) {
     const char *action = agent_tool_arg_value(call, "action");
     const char *repo = agent_tool_arg_value(call, "repo");
     const char *path = agent_tool_arg_value(call, "path");
@@ -5572,6 +5621,28 @@ static char *agent_tool_git(const agent_tool_call *call) {
     bool dry_run = agent_parse_bool_default(agent_tool_arg_value(call, "dry_run"), false);
     bool all = agent_parse_bool_default(agent_tool_arg_value(call, "all"), false);
     bool confirm = agent_parse_bool_default(agent_tool_arg_value(call, "confirm"), false);
+
+    if (agent_git_needs_user_approval(action, dry_run, confirm)) {
+        char prompt[256];
+        snprintf(prompt, sizeof(prompt),
+                 "Approve git %s repo=%s path=%s ref=%s target=%s remote=%s? (y/n) ",
+                 action && action[0] ? action : "action",
+                 repo && repo[0] ? repo : ".",
+                 path && path[0] ? path : (all ? "." : "-"),
+                 ref && ref[0] ? ref : "-",
+                 target_ref && target_ref[0] ? target_ref : "-",
+                 remote && remote[0] ? remote : "-");
+        char approval_err[160] = {0};
+        if (!agent_request_user_approval(w, prompt, "user denied git action",
+                                         approval_err, sizeof(approval_err))) {
+            agent_buf b = {0};
+            agent_buf_puts(&b, "Tool error: git approval failed: ");
+            agent_buf_puts(&b, approval_err[0] ? approval_err :
+                           "user denied git action");
+            agent_buf_puts(&b, "\n");
+            return agent_buf_take(&b);
+        }
+    }
 
     ds4_agent_git_options opts = {
         .repo = repo && repo[0] ? repo : ".",
@@ -6858,7 +6929,7 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "more")) return agent_tool_more(w, call);
     if (!strcmp(call->name, "write")) return agent_tool_write(w, call);
     if (!strcmp(call->name, "list")) return agent_tool_list(call);
-    if (!strcmp(call->name, "git")) return agent_tool_git(call);
+    if (!strcmp(call->name, "git")) return agent_tool_git(w, call);
     if (!strcmp(call->name, "edit")) return agent_tool_edit(w, call);
     if (!strcmp(call->name, "search")) return agent_tool_search(w, call);
     if (!strcmp(call->name, "google_search")) return agent_tool_google_search(w, call);
@@ -9411,9 +9482,9 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             continue;
         }
 
-        char web_approval_msg[256];
-        if (worker_take_web_approval_request(&worker, web_approval_msg,
-                                             sizeof(web_approval_msg)))
+        char approval_msg[256];
+        if (worker_take_approval_request(&worker, approval_msg,
+                                         sizeof(approval_msg)))
         {
             char *saved_input = NULL;
             if (editor.active && editor.edit.buf && editor.edit.len)
@@ -9425,11 +9496,11 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                 .timeout_answer = AGENT_YES_NO_AUTO_NO,
             };
             bool approval_timed_out = false;
-            bool allow = agent_prompt_yes_no_ex(web_approval_msg,
+            bool allow = agent_prompt_yes_no_ex(approval_msg,
                                                 &approval_opts,
                                                 &approval_timed_out);
-            worker_answer_web_approval(&worker, allow,
-                approval_timed_out ? "Chrome browser start approval timed out" : NULL);
+            worker_answer_approval(&worker, allow,
+                approval_timed_out ? "approval timed out" : NULL);
             worker_get_status(&worker, &st);
             build_prompt_text(&st, prompt, sizeof(prompt));
             int restart_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
