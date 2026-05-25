@@ -33,7 +33,7 @@ CPU_CORE_OBJS = ds4_cpu.o
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-agent-context-loop test-kv-cache-benefit cpu cuda cuda-spark cuda-generic cuda-regression
+.PHONY: all help clean test test-agent-context-loop test-agent-context-compact-canary test-kv-cache-benefit cpu cuda cuda-spark cuda-generic cuda-regression
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -45,6 +45,8 @@ help:
 	@echo "  make test         Build and run tests"
 	@echo "  make test-agent-context-loop"
 	@echo "                    Run slow DS4-generated agent context loop e2e"
+	@echo "  make test-agent-context-compact-canary"
+	@echo "                    Run slow DS4-generated compaction canary e2e"
 	@echo "  make test-kv-cache-benefit"
 	@echo "                    Run optional KV restore benefit benchmark"
 	@echo "  make clean        Remove build outputs"
@@ -85,6 +87,8 @@ help:
 	@echo "  make test                Build and run tests"
 	@echo "  make test-agent-context-loop"
 	@echo "                           Run slow DS4-generated agent context loop e2e"
+	@echo "  make test-agent-context-compact-canary"
+	@echo "                           Run slow DS4-generated compaction canary e2e"
 	@echo "  make test-kv-cache-benefit"
 	@echo "                           Run optional KV restore benefit benchmark"
 	@echo "  make clean               Remove build outputs"
@@ -225,6 +229,9 @@ test: ds4_test ds4-eval tests/ds4_agent_context_test
 
 test-agent-context-loop: ds4-agent tests/ds4_agent_context_test
 	sh tests/ds4_agent_context_loop_e2e.sh
+
+test-agent-context-compact-canary: ds4-agent
+	sh tests/ds4_agent_context_compact_canary_e2e.sh
 
 test-kv-cache-benefit: tests/ds4_kv_cache_benefit_test
 	./tests/ds4_kv_cache_benefit_test

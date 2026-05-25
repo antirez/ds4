@@ -7586,6 +7586,14 @@ static char *agent_compact_make_prompt(const char *reason) {
     return agent_buf_take(&b);
 }
 
+static bool agent_compact_summary_has_signal(const char *s) {
+    int alnum = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (isalnum(*p) && ++alnum >= 8) return true;
+    }
+    return false;
+}
+
 /* Perform the full compaction exchange and rebuild the live DS4 session from
  * the compacted transcript.  Any failure invalidates live KV because the model
  * may have just seen private compaction instructions that are not part of the
@@ -7707,8 +7715,10 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
     agent_publish(w, "\x1b[0m\n", 5);
     ds4_tokens_free(&prompt);
 
-    if (!summary.ptr || !summary.ptr[0]) {
-        snprintf(err, err_len, "compaction summary was empty");
+    if (!summary.ptr || !summary.ptr[0] ||
+        !agent_compact_summary_has_signal(summary.ptr))
+    {
+        snprintf(err, err_len, "compaction summary was empty or malformed");
         ds4_session_invalidate(w->session);
         ds4_tokens_free(&sys);
         free(summary.ptr);

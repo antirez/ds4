@@ -690,6 +690,31 @@ path has not introduced state drift. Compaction can reduce context pressure,
 but factual quality after compaction still depends on the summary and must be
 tested with task-specific e2e prompts.
 
+11. Compaction canary retention e2e.
+
+Run the optional compaction-quality target:
+
+```sh
+make test-agent-context-compact-canary
+```
+
+This target is intentionally separate from default `make test`: it asks DS4 to
+operate the `context compact` tool, places five canary facts before a long
+irrelevant padding block, and then requires DS4 to write the canaries into a
+ledger only after compaction. The harness verifies:
+
+- the trace contains `compacted reason="canary-retention-test"`,
+- the compaction trace reports a reduced token count and a late enough recent
+  tail start,
+- the post-compaction ledger exists,
+- all five canary values survived,
+- the final response marker is present.
+
+This is still not a general hallucination benchmark. It is a focused task-level
+guard that checks whether compaction preserves facts explicitly marked as
+critical for the next action while those facts are pushed out of the recent
+verbatim tail.
+
 ### Resume Point: 2026-05-25
 
 The DS4-generated context loop was run successfully with:
