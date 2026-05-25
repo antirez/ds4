@@ -543,6 +543,19 @@ typedef struct {
     int cap;
 } tool_schema_orders;
 
+typedef enum {
+    DS4_TEXT_FORMAT_TEXT = 0,
+    DS4_TEXT_FORMAT_JSON_OBJECT,
+    DS4_TEXT_FORMAT_JSON_SCHEMA,
+} ds4_text_format_type;
+
+typedef struct {
+    ds4_text_format_type type;
+    char *name;
+    char *schema_json;
+    bool strict;
+} ds4_text_format;
+
 typedef struct {
     char *role;
     char *content;
@@ -600,6 +613,7 @@ typedef struct {
     int cache_read_tokens;
     int cache_write_tokens;
     ds4_think_mode think_mode;
+    ds4_text_format text_format;
     bool has_tools;
     bool prompt_preserves_reasoning;
     /* For /v1/responses: emit reasoning_summary_* events / fields only when the
@@ -742,6 +756,933 @@ static const tool_schema_order *tool_schema_orders_find(const tool_schema_orders
     return idx >= 0 ? &orders->v[idx] : NULL;
 }
 
+static void ds4_text_format_clear(ds4_text_format *f) {
+    if (!f) return;
+    free(f->name);
+    free(f->schema_json);
+    memset(f, 0, sizeof(*f));
+}
+
+static bool ds4_text_format_is_json(const ds4_text_format *f) {
+    return f && (f->type == DS4_TEXT_FORMAT_JSON_OBJECT ||
+                 f->type == DS4_TEXT_FORMAT_JSON_SCHEMA);
+}
+
+typedef enum {
+    STRUCT_JSON_INVALID = 0,
+    STRUCT_JSON_PREFIX = 1,
+    STRUCT_JSON_COMPLETE = 2,
+} structured_json_status;
+
+typedef enum {
+    STRUCT_SCHEMA_ANY = 0,
+    STRUCT_SCHEMA_NULL,
+    STRUCT_SCHEMA_BOOL,
+    STRUCT_SCHEMA_STRING,
+    STRUCT_SCHEMA_INTEGER,
+    STRUCT_SCHEMA_NUMBER,
+    STRUCT_SCHEMA_OBJECT,
+    STRUCT_SCHEMA_ARRAY,
+    STRUCT_SCHEMA_ENUM,
+    STRUCT_SCHEMA_CONST,
+    STRUCT_SCHEMA_ANYOF,
+} structured_schema_kind;
+
+typedef struct structured_schema structured_schema;
+
+typedef struct {
+    char *name;
+    char *name_json;
+    bool required;
+    structured_schema *schema;
+} structured_schema_prop;
+
+struct structured_schema {
+    structured_schema_kind kind;
+    bool additional_properties;
+    structured_schema_prop *props;
+    int props_len;
+    int props_cap;
+    structured_schema *items;
+    int min_items;
+    int max_items;
+    structured_schema **alts;
+    int alts_len;
+    int alts_cap;
+    char **literals;
+    int literals_len;
+    int literals_cap;
+};
+
+typedef struct {
+    char **v;
+    int len;
+    int cap;
+} schema_string_list;
+
+typedef struct {
+    const char *root_json;
+    int depth;
+} schema_parser;
+
+typedef struct {
+    bool active;
+    bool generic_object;
+    structured_schema *schema;
+} structured_decoder;
+
+static void schema_string_list_push(schema_string_list *l, char *s) {
+    if (l->len == l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 8;
+        l->v = xrealloc(l->v, (size_t)l->cap * sizeof(l->v[0]));
+    }
+    l->v[l->len++] = s;
+}
+
+static void schema_string_list_free(schema_string_list *l) {
+    for (int i = 0; i < l->len; i++) free(l->v[i]);
+    free(l->v);
+    memset(l, 0, sizeof(*l));
+}
+
+static bool schema_string_list_contains(const schema_string_list *l, const char *s) {
+    for (int i = 0; i < l->len; i++) {
+        if (l->v[i] && !strcmp(l->v[i], s)) return true;
+    }
+    return false;
+}
+
+static char *schema_quote_string(const char *s) {
+    buf b = {0};
+    buf_putc(&b, '"');
+    for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
+        switch (*p) {
+        case '"': buf_puts(&b, "\\\""); break;
+        case '\\': buf_puts(&b, "\\\\"); break;
+        case '\b': buf_puts(&b, "\\b"); break;
+        case '\f': buf_puts(&b, "\\f"); break;
+        case '\n': buf_puts(&b, "\\n"); break;
+        case '\r': buf_puts(&b, "\\r"); break;
+        case '\t': buf_puts(&b, "\\t"); break;
+        default:
+            if (*p < 0x20) buf_printf(&b, "\\u%04x", *p);
+            else buf_putc(&b, (char)*p);
+            break;
+        }
+    }
+    buf_putc(&b, '"');
+    return buf_take(&b);
+}
+
+static structured_schema *structured_schema_new(structured_schema_kind kind) {
+    structured_schema *s = xmalloc(sizeof(*s));
+    memset(s, 0, sizeof(*s));
+    s->kind = kind;
+    s->additional_properties = true;
+    s->min_items = 0;
+    s->max_items = -1;
+    return s;
+}
+
+static void structured_schema_free(structured_schema *s) {
+    if (!s) return;
+    for (int i = 0; i < s->props_len; i++) {
+        free(s->props[i].name);
+        free(s->props[i].name_json);
+        structured_schema_free(s->props[i].schema);
+    }
+    free(s->props);
+    structured_schema_free(s->items);
+    for (int i = 0; i < s->alts_len; i++) structured_schema_free(s->alts[i]);
+    free(s->alts);
+    for (int i = 0; i < s->literals_len; i++) free(s->literals[i]);
+    free(s->literals);
+    free(s);
+}
+
+static void structured_schema_prop_push(structured_schema *s, structured_schema_prop p) {
+    if (s->props_len == s->props_cap) {
+        s->props_cap = s->props_cap ? s->props_cap * 2 : 8;
+        s->props = xrealloc(s->props, (size_t)s->props_cap * sizeof(s->props[0]));
+    }
+    s->props[s->props_len++] = p;
+}
+
+static void structured_schema_alt_push(structured_schema *s, structured_schema *alt) {
+    if (!alt) return;
+    if (s->alts_len == s->alts_cap) {
+        s->alts_cap = s->alts_cap ? s->alts_cap * 2 : 4;
+        s->alts = xrealloc(s->alts, (size_t)s->alts_cap * sizeof(s->alts[0]));
+    }
+    s->alts[s->alts_len++] = alt;
+}
+
+static void structured_schema_literal_push(structured_schema *s, char *lit) {
+    if (s->literals_len == s->literals_cap) {
+        s->literals_cap = s->literals_cap ? s->literals_cap * 2 : 4;
+        s->literals = xrealloc(s->literals,
+                               (size_t)s->literals_cap * sizeof(s->literals[0]));
+    }
+    s->literals[s->literals_len++] = lit;
+}
+
+static bool schema_object_field_raw(const char *json, const char *wanted, char **out) {
+    const char *p = json ? json : "";
+    json_ws(&p);
+    if (*p != '{') return false;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        char *raw = NULL;
+        if (!json_string(&p, &key)) {
+            free(key);
+            return false;
+        }
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            return false;
+        }
+        p++;
+        if (!json_raw_value(&p, &raw)) {
+            free(key);
+            return false;
+        }
+        if (!strcmp(key, wanted)) {
+            free(key);
+            *out = raw;
+            return true;
+        }
+        free(key);
+        free(raw);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    return false;
+}
+
+static structured_schema_kind schema_kind_from_type(const char *type) {
+    if (!type) return STRUCT_SCHEMA_ANY;
+    if (!strcmp(type, "null")) return STRUCT_SCHEMA_NULL;
+    if (!strcmp(type, "boolean")) return STRUCT_SCHEMA_BOOL;
+    if (!strcmp(type, "string")) return STRUCT_SCHEMA_STRING;
+    if (!strcmp(type, "integer")) return STRUCT_SCHEMA_INTEGER;
+    if (!strcmp(type, "number")) return STRUCT_SCHEMA_NUMBER;
+    if (!strcmp(type, "object")) return STRUCT_SCHEMA_OBJECT;
+    if (!strcmp(type, "array")) return STRUCT_SCHEMA_ARRAY;
+    return STRUCT_SCHEMA_ANY;
+}
+
+static bool schema_parse_string_array(const char *json, schema_string_list *out) {
+    const char *p = json ? json : "";
+    json_ws(&p);
+    if (*p != '[') return false;
+    p++;
+    json_ws(&p);
+    while (*p && *p != ']') {
+        char *s = NULL;
+        if (!json_string(&p, &s)) return false;
+        schema_string_list_push(out, s);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    if (*p != ']') return false;
+    return true;
+}
+
+static structured_schema *schema_parse_node(schema_parser *sp, const char *json);
+
+static structured_schema *schema_resolve_ref(schema_parser *sp, const char *ref) {
+    if (!sp || !sp->root_json || !ref || ref[0] != '#') return NULL;
+    const char *prefix = NULL;
+    if (!strncmp(ref, "#/$defs/", 8)) {
+        prefix = "#/$defs/";
+    } else if (!strncmp(ref, "#/definitions/", 14)) {
+        prefix = "#/definitions/";
+    } else {
+        return NULL;
+    }
+    const char *name = ref + strlen(prefix);
+    if (!name[0] || strchr(name, '/')) return NULL;
+
+    char *defs = NULL;
+    if (!schema_object_field_raw(sp->root_json,
+                                 prefix[2] == '$' ? "$defs" : "definitions",
+                                 &defs))
+    {
+        return NULL;
+    }
+    char *raw = NULL;
+    bool found = schema_object_field_raw(defs, name, &raw);
+    free(defs);
+    if (!found) return NULL;
+    structured_schema *resolved = schema_parse_node(sp, raw);
+    free(raw);
+    return resolved;
+}
+
+static bool schema_parse_properties(schema_parser *sp, const char *json,
+                                    structured_schema *node) {
+    const char *p = json ? json : "";
+    json_ws(&p);
+    if (*p != '{') return false;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        char *raw = NULL;
+        if (!json_string(&p, &key)) goto invalid;
+        json_ws(&p);
+        if (*p != ':') goto invalid;
+        p++;
+        if (!json_raw_value(&p, &raw)) goto invalid;
+        structured_schema *child = schema_parse_node(sp, raw);
+        free(raw);
+        raw = NULL;
+        if (!child) child = structured_schema_new(STRUCT_SCHEMA_ANY);
+        structured_schema_prop prop = {
+            .name = key,
+            .name_json = schema_quote_string(key),
+            .schema = child,
+        };
+        key = NULL;
+        structured_schema_prop_push(node, prop);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+        continue;
+invalid:
+        free(key);
+        free(raw);
+        return false;
+    }
+    return *p == '}';
+}
+
+static bool schema_parse_schema_array(schema_parser *sp, const char *json,
+                                      structured_schema *node) {
+    const char *p = json ? json : "";
+    json_ws(&p);
+    if (*p != '[') return false;
+    p++;
+    json_ws(&p);
+    while (*p && *p != ']') {
+        char *raw = NULL;
+        if (!json_raw_value(&p, &raw)) return false;
+        structured_schema *alt = schema_parse_node(sp, raw);
+        free(raw);
+        if (!alt) alt = structured_schema_new(STRUCT_SCHEMA_ANY);
+        structured_schema_alt_push(node, alt);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    return *p == ']';
+}
+
+static bool schema_parse_enum_array(const char *json, structured_schema *node) {
+    const char *p = json ? json : "";
+    json_ws(&p);
+    if (*p != '[') return false;
+    p++;
+    json_ws(&p);
+    while (*p && *p != ']') {
+        char *raw = NULL;
+        if (!json_raw_value(&p, &raw)) return false;
+        char *min = json_minify_raw_value(raw);
+        free(raw);
+        structured_schema_literal_push(node, min);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    return *p == ']';
+}
+
+static void schema_mark_required(structured_schema *node,
+                                 const schema_string_list *required) {
+    for (int i = 0; i < node->props_len; i++) {
+        node->props[i].required =
+            required ? schema_string_list_contains(required, node->props[i].name) : false;
+    }
+}
+
+static structured_schema *schema_parse_node(schema_parser *sp, const char *json) {
+    if (!sp || sp->depth > 64) return structured_schema_new(STRUCT_SCHEMA_ANY);
+    sp->depth++;
+
+    const char *p = json ? json : "";
+    json_ws(&p);
+    if (*p != '{') {
+        sp->depth--;
+        return structured_schema_new(STRUCT_SCHEMA_ANY);
+    }
+    p++;
+
+    structured_schema *node = structured_schema_new(STRUCT_SCHEMA_ANY);
+    schema_string_list required = {0};
+    char *ref = NULL;
+
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        char *raw = NULL;
+        if (!json_string(&p, &key)) goto invalid;
+        json_ws(&p);
+        if (*p != ':') goto invalid;
+        p++;
+
+        if (!strcmp(key, "$ref")) {
+            free(ref);
+            ref = NULL;
+            if (!json_string(&p, &ref)) goto invalid;
+        } else if (!strcmp(key, "type")) {
+            json_ws(&p);
+            if (*p == '"') {
+                char *type = NULL;
+                if (!json_string(&p, &type)) goto invalid;
+                structured_schema_kind kind = schema_kind_from_type(type);
+                if (node->kind == STRUCT_SCHEMA_ANY || node->kind == kind) {
+                    node->kind = kind;
+                }
+                free(type);
+            } else if (*p == '[') {
+                if (!json_raw_value(&p, &raw)) goto invalid;
+                schema_string_list types = {0};
+                if (node->kind == STRUCT_SCHEMA_ANY &&
+                    schema_parse_string_array(raw, &types)) {
+                    node->kind = STRUCT_SCHEMA_ANYOF;
+                    for (int i = 0; i < types.len; i++) {
+                        structured_schema_alt_push(node,
+                            structured_schema_new(schema_kind_from_type(types.v[i])));
+                    }
+                }
+                schema_string_list_free(&types);
+                free(raw);
+                raw = NULL;
+            } else if (!json_skip_value(&p)) {
+                goto invalid;
+            }
+        } else if (!strcmp(key, "enum")) {
+            if (!json_raw_value(&p, &raw)) goto invalid;
+            node->kind = STRUCT_SCHEMA_ENUM;
+            if (!schema_parse_enum_array(raw, node)) goto invalid;
+            free(raw);
+            raw = NULL;
+        } else if (!strcmp(key, "const")) {
+            if (!json_raw_value(&p, &raw)) goto invalid;
+            node->kind = STRUCT_SCHEMA_CONST;
+            structured_schema_literal_push(node, json_minify_raw_value(raw));
+            free(raw);
+            raw = NULL;
+        } else if (!strcmp(key, "properties")) {
+            if (!json_raw_value(&p, &raw)) goto invalid;
+            node->kind = STRUCT_SCHEMA_OBJECT;
+            if (!schema_parse_properties(sp, raw, node)) goto invalid;
+            free(raw);
+            raw = NULL;
+        } else if (!strcmp(key, "items")) {
+            if (!json_raw_value(&p, &raw)) goto invalid;
+            node->items = schema_parse_node(sp, raw);
+            if (!node->items) node->items = structured_schema_new(STRUCT_SCHEMA_ANY);
+            free(raw);
+            raw = NULL;
+        } else if (!strcmp(key, "anyOf") || !strcmp(key, "oneOf")) {
+            if (!json_raw_value(&p, &raw)) goto invalid;
+            node->kind = STRUCT_SCHEMA_ANYOF;
+            if (!schema_parse_schema_array(sp, raw, node)) goto invalid;
+            free(raw);
+            raw = NULL;
+        } else if (!strcmp(key, "required")) {
+            schema_string_list_free(&required);
+            if (!json_raw_value(&p, &raw)) goto invalid;
+            if (!schema_parse_string_array(raw, &required)) goto invalid;
+            free(raw);
+            raw = NULL;
+        } else if (!strcmp(key, "additionalProperties")) {
+            json_ws(&p);
+            if (json_lit(&p, "false")) {
+                node->additional_properties = false;
+            } else if (json_lit(&p, "true")) {
+                node->additional_properties = true;
+            } else if (!json_skip_value(&p)) {
+                goto invalid;
+            }
+        } else if (!strcmp(key, "minItems")) {
+            int v = 0;
+            if (!json_int(&p, &v)) goto invalid;
+            node->min_items = v;
+        } else if (!strcmp(key, "maxItems")) {
+            int v = 0;
+            if (!json_int(&p, &v)) goto invalid;
+            node->max_items = v;
+        } else if (!json_skip_value(&p)) {
+            goto invalid;
+        }
+
+        free(key);
+        key = NULL;
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+        continue;
+invalid:
+        free(key);
+        free(raw);
+        free(ref);
+        schema_string_list_free(&required);
+        structured_schema_free(node);
+        sp->depth--;
+        return structured_schema_new(STRUCT_SCHEMA_ANY);
+    }
+
+    if (node->kind == STRUCT_SCHEMA_ARRAY && !node->items) {
+        node->items = structured_schema_new(STRUCT_SCHEMA_ANY);
+    } else if (node->items && node->kind == STRUCT_SCHEMA_ANY) {
+        node->kind = STRUCT_SCHEMA_ARRAY;
+    }
+    if (node->kind == STRUCT_SCHEMA_OBJECT) schema_mark_required(node, &required);
+
+    if (ref) {
+        structured_schema *resolved = schema_resolve_ref(sp, ref);
+        free(ref);
+        schema_string_list_free(&required);
+        structured_schema_free(node);
+        sp->depth--;
+        return resolved ? resolved : structured_schema_new(STRUCT_SCHEMA_ANY);
+    }
+
+    schema_string_list_free(&required);
+    sp->depth--;
+    return node;
+}
+
+static structured_json_status structured_status_best(structured_json_status a,
+                                                     structured_json_status b) {
+    if (a == STRUCT_JSON_COMPLETE || b == STRUCT_JSON_COMPLETE) return STRUCT_JSON_COMPLETE;
+    if (a == STRUCT_JSON_PREFIX || b == STRUCT_JSON_PREFIX) return STRUCT_JSON_PREFIX;
+    return STRUCT_JSON_INVALID;
+}
+
+static bool structured_json_is_ws(char c) {
+    return c == ' ' || c == '\n' || c == '\r' || c == '\t';
+}
+
+static bool structured_skip_ws_prefix(const char *s, size_t len, size_t *pos) {
+    while (*pos < len && structured_json_is_ws(s[*pos])) (*pos)++;
+    return *pos < len;
+}
+
+static structured_json_status structured_match_literal(const char *s, size_t len,
+                                                       size_t pos,
+                                                       const char *lit,
+                                                       size_t *out) {
+    const size_t lit_len = strlen(lit);
+    size_t i = 0;
+    while (i < lit_len && pos + i < len) {
+        if (s[pos + i] != lit[i]) return STRUCT_JSON_INVALID;
+        i++;
+    }
+    if (i < lit_len) return STRUCT_JSON_PREFIX;
+    *out = pos + lit_len;
+    return STRUCT_JSON_COMPLETE;
+}
+
+static structured_json_status structured_match_string_value(const char *s,
+                                                            size_t len,
+                                                            size_t pos,
+                                                            size_t *out) {
+    if (!structured_skip_ws_prefix(s, len, &pos)) return STRUCT_JSON_PREFIX;
+    if (s[pos] != '"') return STRUCT_JSON_INVALID;
+    pos++;
+    while (pos < len) {
+        unsigned char c = (unsigned char)s[pos++];
+        if (c == '"') {
+            *out = pos;
+            return STRUCT_JSON_COMPLETE;
+        }
+        if (c < 0x20) return STRUCT_JSON_INVALID;
+        if (c != '\\') continue;
+        if (pos >= len) return STRUCT_JSON_PREFIX;
+        c = (unsigned char)s[pos++];
+        if (c == '"' || c == '\\' || c == '/' || c == 'b' ||
+            c == 'f' || c == 'n' || c == 'r' || c == 't')
+        {
+            continue;
+        }
+        if (c != 'u') return STRUCT_JSON_INVALID;
+        for (int i = 0; i < 4; i++) {
+            if (pos >= len) return STRUCT_JSON_PREFIX;
+            if (json_hex(s[pos]) < 0) return STRUCT_JSON_INVALID;
+            pos++;
+        }
+    }
+    return STRUCT_JSON_PREFIX;
+}
+
+static structured_json_status structured_match_number_value(const char *s,
+                                                            size_t len,
+                                                            size_t pos,
+                                                            bool integer_only,
+                                                            size_t *out) {
+    if (!structured_skip_ws_prefix(s, len, &pos)) return STRUCT_JSON_PREFIX;
+    if (pos >= len) return STRUCT_JSON_PREFIX;
+    if (s[pos] == '-') {
+        pos++;
+        if (pos >= len) return STRUCT_JSON_PREFIX;
+    }
+    if (s[pos] == '0') {
+        pos++;
+    } else if (s[pos] >= '1' && s[pos] <= '9') {
+        pos++;
+        while (pos < len && isdigit((unsigned char)s[pos])) pos++;
+    } else {
+        return STRUCT_JSON_INVALID;
+    }
+    if (pos < len && s[pos] == '.') {
+        if (integer_only) return STRUCT_JSON_INVALID;
+        pos++;
+        if (pos >= len) return STRUCT_JSON_PREFIX;
+        if (!isdigit((unsigned char)s[pos])) return STRUCT_JSON_INVALID;
+        while (pos < len && isdigit((unsigned char)s[pos])) pos++;
+    }
+    if (pos < len && (s[pos] == 'e' || s[pos] == 'E')) {
+        if (integer_only) return STRUCT_JSON_INVALID;
+        pos++;
+        if (pos >= len) return STRUCT_JSON_PREFIX;
+        if (s[pos] == '+' || s[pos] == '-') {
+            pos++;
+            if (pos >= len) return STRUCT_JSON_PREFIX;
+        }
+        if (!isdigit((unsigned char)s[pos])) return STRUCT_JSON_INVALID;
+        while (pos < len && isdigit((unsigned char)s[pos])) pos++;
+    }
+    *out = pos;
+    return STRUCT_JSON_COMPLETE;
+}
+
+static structured_json_status structured_match_generic_value(const char *s,
+                                                             size_t len,
+                                                             size_t pos,
+                                                             size_t *out,
+                                                             int depth);
+
+static structured_json_status structured_match_generic_array(const char *s,
+                                                             size_t len,
+                                                             size_t pos,
+                                                             size_t *out,
+                                                             int depth) {
+    if (depth > 128) return STRUCT_JSON_INVALID;
+    if (!structured_skip_ws_prefix(s, len, &pos)) return STRUCT_JSON_PREFIX;
+    if (s[pos] != '[') return STRUCT_JSON_INVALID;
+    pos++;
+    if (!structured_skip_ws_prefix(s, len, &pos)) return STRUCT_JSON_PREFIX;
+    if (s[pos] == ']') {
+        *out = pos + 1;
+        return STRUCT_JSON_COMPLETE;
+    }
+    for (;;) {
+        structured_json_status st =
+            structured_match_generic_value(s, len, pos, &pos, depth + 1);
+        if (st != STRUCT_JSON_COMPLETE) return st;
+        if (!structured_skip_ws_prefix(s, len, &pos)) return STRUCT_JSON_PREFIX;
+        if (s[pos] == ']') {
+            *out = pos + 1;
+            return STRUCT_JSON_COMPLETE;
+        }
+        if (s[pos] != ',') return STRUCT_JSON_INVALID;
+        pos++;
+        if (!structured_skip_ws_prefix(s, len, &pos)) return STRUCT_JSON_PREFIX;
+    }
+}
+
+static structured_json_status structured_match_generic_object(const char *s,
+                                                              size_t len,
+                                                              size_t pos,
+                                                              size_t *out,
+                                                              int depth) {
+    if (depth > 128) return STRUCT_JSON_INVALID;
+    if (!structured_skip_ws_prefix(s, len, &pos)) return STRUCT_JSON_PREFIX;
+    if (s[pos] != '{') return STRUCT_JSON_INVALID;
+    pos++;
+    if (!structured_skip_ws_prefix(s, len, &pos)) return STRUCT_JSON_PREFIX;
+    if (s[pos] == '}') {
+        *out = pos + 1;
+        return STRUCT_JSON_COMPLETE;
+    }
+    for (;;) {
+        structured_json_status st = structured_match_string_value(s, len, pos, &pos);
+        if (st != STRUCT_JSON_COMPLETE) return st;
+        if (!structured_skip_ws_prefix(s, len, &pos)) return STRUCT_JSON_PREFIX;
+        if (s[pos] != ':') return STRUCT_JSON_INVALID;
+        pos++;
+        st = structured_match_generic_value(s, len, pos, &pos, depth + 1);
+        if (st != STRUCT_JSON_COMPLETE) return st;
+        if (!structured_skip_ws_prefix(s, len, &pos)) return STRUCT_JSON_PREFIX;
+        if (s[pos] == '}') {
+            *out = pos + 1;
+            return STRUCT_JSON_COMPLETE;
+        }
+        if (s[pos] != ',') return STRUCT_JSON_INVALID;
+        pos++;
+        if (!structured_skip_ws_prefix(s, len, &pos)) return STRUCT_JSON_PREFIX;
+    }
+}
+
+static structured_json_status structured_match_generic_value(const char *s,
+                                                             size_t len,
+                                                             size_t pos,
+                                                             size_t *out,
+                                                             int depth) {
+    if (!structured_skip_ws_prefix(s, len, &pos)) return STRUCT_JSON_PREFIX;
+    switch (s[pos]) {
+    case '{': return structured_match_generic_object(s, len, pos, out, depth + 1);
+    case '[': return structured_match_generic_array(s, len, pos, out, depth + 1);
+    case '"': return structured_match_string_value(s, len, pos, out);
+    case 't': return structured_match_literal(s, len, pos, "true", out);
+    case 'f': return structured_match_literal(s, len, pos, "false", out);
+    case 'n': return structured_match_literal(s, len, pos, "null", out);
+    default:
+        if (s[pos] == '-' || isdigit((unsigned char)s[pos])) {
+            return structured_match_number_value(s, len, pos, false, out);
+        }
+        return STRUCT_JSON_INVALID;
+    }
+}
+
+static structured_json_status structured_match_schema_value(const structured_schema *schema,
+                                                            const char *s,
+                                                            size_t len,
+                                                            size_t pos,
+                                                            size_t *out,
+                                                            int depth);
+
+static structured_json_status structured_match_schema_array(const structured_schema *schema,
+                                                            const char *s,
+                                                            size_t len,
+                                                            size_t pos,
+                                                            size_t *out,
+                                                            int depth) {
+    if (depth > 128) return STRUCT_JSON_INVALID;
+    if (!structured_skip_ws_prefix(s, len, &pos)) return STRUCT_JSON_PREFIX;
+    if (s[pos] != '[') return STRUCT_JSON_INVALID;
+    pos++;
+
+    int count = 0;
+    for (;;) {
+        if (!structured_skip_ws_prefix(s, len, &pos)) return STRUCT_JSON_PREFIX;
+        if (s[pos] == ']') {
+            if (count < schema->min_items) return STRUCT_JSON_INVALID;
+            *out = pos + 1;
+            return STRUCT_JSON_COMPLETE;
+        }
+        if (schema->max_items >= 0 && count >= schema->max_items) {
+            return STRUCT_JSON_INVALID;
+        }
+        const structured_schema *item_schema =
+            schema->items ? schema->items : NULL;
+        structured_json_status st = item_schema ?
+            structured_match_schema_value(item_schema, s, len, pos, &pos, depth + 1) :
+            structured_match_generic_value(s, len, pos, &pos, depth + 1);
+        if (st != STRUCT_JSON_COMPLETE) return st;
+        count++;
+        if (!structured_skip_ws_prefix(s, len, &pos)) return STRUCT_JSON_PREFIX;
+        if (s[pos] == ']') {
+            if (count < schema->min_items) return STRUCT_JSON_INVALID;
+            *out = pos + 1;
+            return STRUCT_JSON_COMPLETE;
+        }
+        if (s[pos] != ',') return STRUCT_JSON_INVALID;
+        pos++;
+        if (!structured_skip_ws_prefix(s, len, &pos)) return STRUCT_JSON_PREFIX;
+    }
+}
+
+static structured_json_status structured_match_object_from(const structured_schema *schema,
+                                                           const char *s,
+                                                           size_t len,
+                                                           int prop_idx,
+                                                           bool wrote_prop,
+                                                           size_t pos,
+                                                           size_t *out,
+                                                           int depth);
+
+static structured_json_status structured_match_object_include_prop(
+        const structured_schema *schema,
+        const char *s,
+        size_t len,
+        int prop_idx,
+        bool wrote_prop,
+        size_t pos,
+        size_t *out,
+        int depth) {
+    const structured_schema_prop *prop = &schema->props[prop_idx];
+    if (!structured_skip_ws_prefix(s, len, &pos)) return STRUCT_JSON_PREFIX;
+    if (wrote_prop) {
+        if (s[pos] != ',') return STRUCT_JSON_INVALID;
+        pos++;
+        if (!structured_skip_ws_prefix(s, len, &pos)) return STRUCT_JSON_PREFIX;
+    }
+    structured_json_status st =
+        structured_match_literal(s, len, pos, prop->name_json, &pos);
+    if (st != STRUCT_JSON_COMPLETE) return st;
+    if (!structured_skip_ws_prefix(s, len, &pos)) return STRUCT_JSON_PREFIX;
+    if (s[pos] != ':') return STRUCT_JSON_INVALID;
+    pos++;
+    st = structured_match_schema_value(prop->schema, s, len, pos, &pos, depth + 1);
+    if (st != STRUCT_JSON_COMPLETE) return st;
+    return structured_match_object_from(schema, s, len, prop_idx + 1, true,
+                                        pos, out, depth + 1);
+}
+
+static structured_json_status structured_match_object_from(const structured_schema *schema,
+                                                           const char *s,
+                                                           size_t len,
+                                                           int prop_idx,
+                                                           bool wrote_prop,
+                                                           size_t pos,
+                                                           size_t *out,
+                                                           int depth) {
+    if (depth > 128) return STRUCT_JSON_INVALID;
+    if (prop_idx >= schema->props_len) {
+        if (!structured_skip_ws_prefix(s, len, &pos)) return STRUCT_JSON_PREFIX;
+        if (s[pos] != '}') return STRUCT_JSON_INVALID;
+        *out = pos + 1;
+        return STRUCT_JSON_COMPLETE;
+    }
+
+    const structured_schema_prop *prop = &schema->props[prop_idx];
+    structured_json_status best = STRUCT_JSON_INVALID;
+    if (!prop->required) {
+        best = structured_match_object_from(schema, s, len, prop_idx + 1,
+                                            wrote_prop, pos, out, depth + 1);
+        if (best == STRUCT_JSON_COMPLETE) return best;
+    }
+    structured_json_status include =
+        structured_match_object_include_prop(schema, s, len, prop_idx,
+                                             wrote_prop, pos, out, depth + 1);
+    return structured_status_best(best, include);
+}
+
+static structured_json_status structured_match_schema_object(const structured_schema *schema,
+                                                             const char *s,
+                                                             size_t len,
+                                                             size_t pos,
+                                                             size_t *out,
+                                                             int depth) {
+    if (schema->props_len == 0 && schema->additional_properties) {
+        return structured_match_generic_object(s, len, pos, out, depth + 1);
+    }
+    if (!structured_skip_ws_prefix(s, len, &pos)) return STRUCT_JSON_PREFIX;
+    if (s[pos] != '{') return STRUCT_JSON_INVALID;
+    pos++;
+    return structured_match_object_from(schema, s, len, 0, false, pos, out,
+                                        depth + 1);
+}
+
+static structured_json_status structured_match_schema_value(const structured_schema *schema,
+                                                            const char *s,
+                                                            size_t len,
+                                                            size_t pos,
+                                                            size_t *out,
+                                                            int depth) {
+    if (!schema) return structured_match_generic_value(s, len, pos, out, depth + 1);
+    if (depth > 128) return STRUCT_JSON_INVALID;
+    switch (schema->kind) {
+    case STRUCT_SCHEMA_NULL:
+        if (!structured_skip_ws_prefix(s, len, &pos)) return STRUCT_JSON_PREFIX;
+        return structured_match_literal(s, len, pos, "null", out);
+    case STRUCT_SCHEMA_BOOL: {
+        if (!structured_skip_ws_prefix(s, len, &pos)) return STRUCT_JSON_PREFIX;
+        structured_json_status a = structured_match_literal(s, len, pos, "true", out);
+        structured_json_status b = structured_match_literal(s, len, pos, "false", out);
+        return structured_status_best(a, b);
+    }
+    case STRUCT_SCHEMA_STRING:
+        return structured_match_string_value(s, len, pos, out);
+    case STRUCT_SCHEMA_INTEGER:
+        return structured_match_number_value(s, len, pos, true, out);
+    case STRUCT_SCHEMA_NUMBER:
+        return structured_match_number_value(s, len, pos, false, out);
+    case STRUCT_SCHEMA_OBJECT:
+        return structured_match_schema_object(schema, s, len, pos, out, depth + 1);
+    case STRUCT_SCHEMA_ARRAY:
+        return structured_match_schema_array(schema, s, len, pos, out, depth + 1);
+    case STRUCT_SCHEMA_ENUM:
+    case STRUCT_SCHEMA_CONST: {
+        if (!structured_skip_ws_prefix(s, len, &pos)) return STRUCT_JSON_PREFIX;
+        structured_json_status best = STRUCT_JSON_INVALID;
+        for (int i = 0; i < schema->literals_len; i++) {
+            size_t p2 = pos;
+            structured_json_status st =
+                structured_match_literal(s, len, p2, schema->literals[i], &p2);
+            if (st == STRUCT_JSON_COMPLETE) *out = p2;
+            best = structured_status_best(best, st);
+            if (best == STRUCT_JSON_COMPLETE) break;
+        }
+        return best;
+    }
+    case STRUCT_SCHEMA_ANYOF: {
+        structured_json_status best = STRUCT_JSON_INVALID;
+        for (int i = 0; i < schema->alts_len; i++) {
+            size_t p2 = pos;
+            structured_json_status st =
+                structured_match_schema_value(schema->alts[i], s, len, p2,
+                                              &p2, depth + 1);
+            if (st == STRUCT_JSON_COMPLETE) *out = p2;
+            best = structured_status_best(best, st);
+            if (best == STRUCT_JSON_COMPLETE) break;
+        }
+        return best;
+    }
+    case STRUCT_SCHEMA_ANY:
+    default:
+        return structured_match_generic_value(s, len, pos, out, depth + 1);
+    }
+}
+
+static structured_json_status structured_decoder_status(const structured_decoder *d,
+                                                        const char *s,
+                                                        size_t len) {
+    size_t pos = 0;
+    structured_json_status st = d && d->generic_object ?
+        structured_match_generic_object(s ? s : "", len, 0, &pos, 0) :
+        structured_match_schema_value(d ? d->schema : NULL, s ? s : "",
+                                      len, 0, &pos, 0);
+    if (st != STRUCT_JSON_COMPLETE) return st;
+    while (pos < len && structured_json_is_ws(s[pos])) pos++;
+    return pos == len ? STRUCT_JSON_COMPLETE : STRUCT_JSON_INVALID;
+}
+
+static bool structured_decoder_init(structured_decoder *d,
+                                    const ds4_text_format *format,
+                                    char *err,
+                                    size_t errlen) {
+    memset(d, 0, sizeof(*d));
+    if (!ds4_text_format_is_json(format)) return true;
+    d->active = true;
+    if (format->type == DS4_TEXT_FORMAT_JSON_OBJECT) {
+        d->generic_object = true;
+        return true;
+    }
+    schema_parser sp = {.root_json = format->schema_json ? format->schema_json : "{}"};
+    d->schema = schema_parse_node(&sp, sp.root_json);
+    if (!d->schema) {
+        snprintf(err, errlen, "invalid JSON schema response_format");
+        return false;
+    }
+    return true;
+}
+
+static void structured_decoder_free(structured_decoder *d) {
+    if (!d) return;
+    structured_schema_free(d->schema);
+    memset(d, 0, sizeof(*d));
+}
+
 static void request_init(request *r, req_kind kind, int max_tokens) {
     memset(r, 0, sizeof(*r));
     r->kind = kind;
@@ -762,6 +1703,7 @@ static void request_free(request *r) {
     free(r->stops.v);
     free(r->raw_body);
     free(r->prompt_text);
+    ds4_text_format_clear(&r->text_format);
     stop_list_clear(&r->responses_live_call_ids);
     free(r->responses_live_call_ids.v);
     free(r->responses_live_suffix_text);
@@ -2268,18 +3210,20 @@ static bool chat_history_uses_tool_context(const chat_msgs *msgs,
     return false;
 }
 
-static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
+static char *render_chat_prompt_text(const chat_msgs *msgs,
+                                     const char *tool_schemas,
                                      const tool_schema_orders *tool_orders,
                                      ds4_think_mode think_mode) {
     (void)tool_orders;
     const bool think = ds4_think_mode_enabled(think_mode);
     const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
+    const bool has_tools = tool_schemas && tool_schemas[0];
     int last_user_idx = -1;
     buf system = {0};
     /* Render tool schemas before the client system content so
      * --kv-cache-boundary-trim-tokens chops a dynamic tail from the client
      * message instead of the much larger tool-schema region. */
-    if (tool_schemas && tool_schemas[0]) {
+    if (has_tools) {
         append_tools_prompt_text(&system, tool_schemas);
     }
     for (int i = 0; i < msgs->len; i++) {
@@ -2613,6 +3557,11 @@ static void anthropic_prepare_live_continuation(request *r,
         render_live_tool_tail(msgs, tail_start, r->think_mode);
 }
 
+static bool parse_chat_response_format(const char **p,
+                                       ds4_text_format *out,
+                                       char *err,
+                                       size_t errlen);
+
 /* The API parsers are intentionally selective JSON parsers: they keep only
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
@@ -2655,6 +3604,14 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
             if (!parse_tools_value(&p, &tool_schemas, &r->tool_orders)) {
                 free(key);
                 goto bad;
+            }
+        } else if (!strcmp(key, "response_format")) {
+            if (!parse_chat_response_format(&p, &r->text_format, err, errlen)) {
+                free(key);
+                chat_msgs_free(&msgs);
+                free(tool_schemas);
+                request_free(r);
+                return false;
             }
         } else if (!strcmp(key, "tool_choice")) {
             json_ws(&p);
@@ -2767,6 +3724,10 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    if (ds4_text_format_is_json(&r->text_format)) {
+        thinking_enabled = false;
+        reasoning_effort = DS4_THINK_NONE;
+    }
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
@@ -2774,8 +3735,8 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
-    r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
-                                             &r->tool_orders, r->think_mode);
+    r->prompt_text = render_chat_prompt_text(
+        &msgs, active_tool_schemas, &r->tool_orders, r->think_mode);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(tool_schemas);
@@ -3678,6 +4639,345 @@ static bool parse_responses_reasoning(const char **p, ds4_think_mode *effort,
     return true;
 }
 
+static bool parse_responses_text_format_value(const char **p,
+                                              ds4_text_format *out,
+                                              char *err,
+                                              size_t errlen) {
+    json_ws(p);
+    if (json_lit(p, "null")) {
+        ds4_text_format_clear(out);
+        return true;
+    }
+    if (**p != '{') {
+        snprintf(err, errlen, "text.format must be an object");
+        return false;
+    }
+    (*p)++;
+
+    ds4_text_format tmp = {0};
+    char *type = NULL;
+    bool saw_type = false;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) goto invalid;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            goto invalid;
+        }
+        (*p)++;
+        if (!strcmp(key, "type")) {
+            free(type);
+            type = NULL;
+            if (!json_string(p, &type)) {
+                free(key);
+                goto invalid;
+            }
+            saw_type = true;
+        } else if (!strcmp(key, "name")) {
+            free(tmp.name);
+            tmp.name = NULL;
+            json_ws(p);
+            if (json_lit(p, "null")) {
+                /* optional */
+            } else if (!json_string(p, &tmp.name)) {
+                free(key);
+                goto invalid;
+            }
+        } else if (!strcmp(key, "strict")) {
+            json_ws(p);
+            if (json_lit(p, "null")) {
+                tmp.strict = false;
+            } else if (!json_bool(p, &tmp.strict)) {
+                free(key);
+                goto invalid;
+            }
+        } else if (!strcmp(key, "schema")) {
+            char *raw = NULL;
+            if (!json_raw_value(p, &raw)) {
+                free(key);
+                goto invalid;
+            }
+            free(tmp.schema_json);
+            tmp.schema_json = json_minify_raw_value(raw);
+            free(raw);
+        } else if (!json_skip_value(p)) {
+            free(key);
+            goto invalid;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') goto invalid;
+    (*p)++;
+
+    if (!saw_type) {
+        snprintf(err, errlen, "missing text.format.type");
+        goto fail;
+    }
+    if (!strcmp(type, "text")) {
+        ds4_text_format_clear(&tmp);
+        ds4_text_format_clear(out);
+    } else if (!strcmp(type, "json_object")) {
+        tmp.type = DS4_TEXT_FORMAT_JSON_OBJECT;
+        free(tmp.schema_json);
+        tmp.schema_json = NULL;
+        ds4_text_format_clear(out);
+        *out = tmp;
+        memset(&tmp, 0, sizeof(tmp));
+    } else if (!strcmp(type, "json_schema")) {
+        if (!tmp.schema_json) {
+            snprintf(err, errlen, "missing text.format.schema");
+            goto fail;
+        }
+        tmp.type = DS4_TEXT_FORMAT_JSON_SCHEMA;
+        ds4_text_format_clear(out);
+        *out = tmp;
+        memset(&tmp, 0, sizeof(tmp));
+    } else {
+        snprintf(err, errlen, "text.format.type=%s not supported", type);
+        goto fail;
+    }
+
+    free(type);
+    return true;
+
+invalid:
+    snprintf(err, errlen, "invalid JSON request");
+fail:
+    free(type);
+    ds4_text_format_clear(&tmp);
+    return false;
+}
+
+static bool parse_responses_text_format(const char **p,
+                                        ds4_text_format *out,
+                                        char *err,
+                                        size_t errlen) {
+    json_ws(p);
+    if (json_lit(p, "null")) {
+        ds4_text_format_clear(out);
+        return true;
+    }
+    if (**p != '{') {
+        snprintf(err, errlen, "text must be an object");
+        return false;
+    }
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) goto invalid;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            goto invalid;
+        }
+        (*p)++;
+        if (!strcmp(key, "format")) {
+            if (!parse_responses_text_format_value(p, out, err, errlen)) {
+                free(key);
+                return false;
+            }
+        } else if (!json_skip_value(p)) {
+            free(key);
+            goto invalid;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') goto invalid;
+    (*p)++;
+    return true;
+
+invalid:
+    snprintf(err, errlen, "invalid JSON request");
+    return false;
+}
+
+static bool parse_chat_response_format_json_schema(const char **p,
+                                                   ds4_text_format *tmp) {
+    json_ws(p);
+    if (**p != '{') return false;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) goto invalid;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            goto invalid;
+        }
+        (*p)++;
+        if (!strcmp(key, "name")) {
+            free(tmp->name);
+            tmp->name = NULL;
+            json_ws(p);
+            if (json_lit(p, "null")) {
+                /* optional */
+            } else if (!json_string(p, &tmp->name)) {
+                free(key);
+                goto invalid;
+            }
+        } else if (!strcmp(key, "strict")) {
+            json_ws(p);
+            if (json_lit(p, "null")) {
+                tmp->strict = false;
+            } else if (!json_bool(p, &tmp->strict)) {
+                free(key);
+                goto invalid;
+            }
+        } else if (!strcmp(key, "schema")) {
+            char *raw = NULL;
+            if (!json_raw_value(p, &raw)) {
+                free(key);
+                goto invalid;
+            }
+            free(tmp->schema_json);
+            tmp->schema_json = json_minify_raw_value(raw);
+            free(raw);
+        } else if (!json_skip_value(p)) {
+            free(key);
+            goto invalid;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+
+invalid:
+    return false;
+}
+
+static bool parse_chat_response_format(const char **p,
+                                       ds4_text_format *out,
+                                       char *err,
+                                       size_t errlen) {
+    json_ws(p);
+    if (json_lit(p, "null")) {
+        ds4_text_format_clear(out);
+        return true;
+    }
+    if (**p != '{') {
+        snprintf(err, errlen, "response_format must be an object");
+        return false;
+    }
+    (*p)++;
+
+    ds4_text_format tmp = {0};
+    char *type = NULL;
+    bool saw_type = false;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) goto invalid;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            goto invalid;
+        }
+        (*p)++;
+        if (!strcmp(key, "type")) {
+            free(type);
+            type = NULL;
+            if (!json_string(p, &type)) {
+                free(key);
+                goto invalid;
+            }
+            saw_type = true;
+        } else if (!strcmp(key, "json_schema")) {
+            if (!parse_chat_response_format_json_schema(p, &tmp)) {
+                free(key);
+                goto invalid;
+            }
+        } else if (!strcmp(key, "name")) {
+            free(tmp.name);
+            tmp.name = NULL;
+            json_ws(p);
+            if (json_lit(p, "null")) {
+                /* optional */
+            } else if (!json_string(p, &tmp.name)) {
+                free(key);
+                goto invalid;
+            }
+        } else if (!strcmp(key, "strict")) {
+            json_ws(p);
+            if (json_lit(p, "null")) {
+                tmp.strict = false;
+            } else if (!json_bool(p, &tmp.strict)) {
+                free(key);
+                goto invalid;
+            }
+        } else if (!strcmp(key, "schema")) {
+            char *raw = NULL;
+            if (!json_raw_value(p, &raw)) {
+                free(key);
+                goto invalid;
+            }
+            free(tmp.schema_json);
+            tmp.schema_json = json_minify_raw_value(raw);
+            free(raw);
+        } else if (!json_skip_value(p)) {
+            free(key);
+            goto invalid;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') goto invalid;
+    (*p)++;
+
+    if (!saw_type) {
+        snprintf(err, errlen, "missing response_format.type");
+        goto fail;
+    }
+    if (!strcmp(type, "text")) {
+        ds4_text_format_clear(&tmp);
+        ds4_text_format_clear(out);
+    } else if (!strcmp(type, "json_object")) {
+        tmp.type = DS4_TEXT_FORMAT_JSON_OBJECT;
+        free(tmp.schema_json);
+        tmp.schema_json = NULL;
+        ds4_text_format_clear(out);
+        *out = tmp;
+        memset(&tmp, 0, sizeof(tmp));
+    } else if (!strcmp(type, "json_schema")) {
+        if (!tmp.schema_json) {
+            snprintf(err, errlen, "missing response_format.json_schema.schema");
+            goto fail;
+        }
+        tmp.type = DS4_TEXT_FORMAT_JSON_SCHEMA;
+        ds4_text_format_clear(out);
+        *out = tmp;
+        memset(&tmp, 0, sizeof(tmp));
+    } else {
+        snprintf(err, errlen, "response_format.type=%s not supported", type);
+        goto fail;
+    }
+
+    free(type);
+    return true;
+
+invalid:
+    snprintf(err, errlen, "invalid JSON request");
+fail:
+    free(type);
+    ds4_text_format_clear(&tmp);
+    return false;
+}
+
 static bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                     int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
@@ -3814,6 +5114,16 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "text")) {
+            if (!parse_responses_text_format(&p, &r->text_format, err, errlen)) {
+                free(key);
+                chat_msgs_free(&msgs);
+                buf_free(&loaded_tool_schemas);
+                free(instructions);
+                free(tool_schemas);
+                request_free(r);
+                return false;
+            }
         } else if (!strcmp(key, "reasoning")) {
             bool effort_seen = false;
             if (!parse_responses_reasoning(&p, &reasoning_effort,
@@ -3905,6 +5215,10 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     r->has_tools = active_tool_schemas && active_tool_schemas[0];
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    if (ds4_text_format_is_json(&r->text_format)) {
+        thinking_enabled = false;
+        reasoning_effort = DS4_THINK_NONE;
+    }
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     if (!responses_validate_tool_outputs(s, &msgs, r->think_mode,
@@ -3924,8 +5238,8 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     responses_prepare_live_continuation(r, &msgs);
-    r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
-                                             &r->tool_orders, r->think_mode);
+    r->prompt_text = render_chat_prompt_text(
+        &msgs, active_tool_schemas, &r->tool_orders, r->think_mode);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     buf_free(&combined_tool_schemas);
@@ -5965,6 +7279,12 @@ static bool request_uses_structured_stream(const request *r) {
                          request_uses_openai_live_stream(r));
 }
 
+static bool request_uses_structured_decoder(const request *r) {
+    return r && r->kind == REQ_CHAT &&
+           !r->has_tools &&
+           ds4_text_format_is_json(&r->text_format);
+}
+
 /* Codex' Responses API uses 24-hex suffixes for response/item ids. Prefix
  * controls the variant (resp_, rs_, msg_, fc_) so each event references a
  * stable identifier across output_item.added / .done. */
@@ -7718,6 +9038,11 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+    char **structured_token_text;
+    size_t *structured_token_len;
+    int structured_token_n;
+    float *structured_logits;
+    int structured_logits_n;
 };
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
@@ -7731,6 +9056,314 @@ struct job {
     pthread_cond_t cv;
     job *next;
 };
+
+static void server_structured_cache_free(server *s) {
+    if (!s) return;
+    if (s->structured_token_text) {
+        for (int i = 0; i < s->structured_token_n; i++) {
+            free(s->structured_token_text[i]);
+        }
+    }
+    free(s->structured_token_text);
+    free(s->structured_token_len);
+    free(s->structured_logits);
+    s->structured_token_text = NULL;
+    s->structured_token_len = NULL;
+    s->structured_token_n = 0;
+    s->structured_logits = NULL;
+    s->structured_logits_n = 0;
+}
+
+static bool server_structured_cache_init(server *s) {
+    if (!s || !s->engine) return false;
+    const int n_vocab = ds4_engine_vocab_size(s->engine);
+    if (n_vocab <= 0) return false;
+    if (s->structured_token_n == n_vocab &&
+        s->structured_token_text &&
+        s->structured_token_len &&
+        s->structured_logits)
+    {
+        return true;
+    }
+
+    server_structured_cache_free(s);
+    s->structured_token_text = xmalloc((size_t)n_vocab * sizeof(s->structured_token_text[0]));
+    s->structured_token_len = xmalloc((size_t)n_vocab * sizeof(s->structured_token_len[0]));
+    memset(s->structured_token_text, 0, (size_t)n_vocab * sizeof(s->structured_token_text[0]));
+    memset(s->structured_token_len, 0, (size_t)n_vocab * sizeof(s->structured_token_len[0]));
+    for (int i = 0; i < n_vocab; i++) {
+        size_t len = 0;
+        s->structured_token_text[i] = ds4_token_text(s->engine, i, &len);
+        s->structured_token_len[i] = len;
+    }
+    s->structured_logits = xmalloc((size_t)n_vocab * sizeof(s->structured_logits[0]));
+    s->structured_logits_n = n_vocab;
+    s->structured_token_n = n_vocab;
+    return true;
+}
+
+static uint64_t server_sample_rng_next(uint64_t *state) {
+    uint64_t x = *state;
+    if (x == 0) x = 0x9e3779b97f4a7c15ULL;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    return x * 0x2545f4914f6cdd1dULL;
+}
+
+static float server_sample_rng_f32(uint64_t *state) {
+    const uint64_t x = server_sample_rng_next(state);
+    return (float)((x >> 40) & 0xffffffu) / 16777216.0f;
+}
+
+typedef struct {
+    int id;
+    float logit;
+    float prob;
+} server_sample_candidate;
+
+#define STRUCTURED_MASK_LOGIT (-FLT_MAX)
+
+static bool server_logit_valid(float v) {
+    return v > (STRUCTURED_MASK_LOGIT * 0.5f) && isfinite(v);
+}
+
+static int server_sample_candidate_cmp_desc(const void *a, const void *b) {
+    const server_sample_candidate *ca = a;
+    const server_sample_candidate *cb = b;
+    return (cb->logit > ca->logit) - (cb->logit < ca->logit);
+}
+
+static int server_sample_argmax(const float *logits, int n_vocab) {
+    int best = 0;
+    float best_logit = STRUCTURED_MASK_LOGIT;
+    for (int i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (server_logit_valid(v) && v > best_logit) {
+            best_logit = v;
+            best = i;
+        }
+    }
+    return best;
+}
+
+static int server_sample_full_vocab(const float *logits,
+                                    int n_vocab,
+                                    float temperature,
+                                    float top_p,
+                                   float min_p,
+                                   uint64_t *rng) {
+    float max_logit = STRUCTURED_MASK_LOGIT;
+    int best = 0;
+    int finite = 0;
+    for (int i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (!server_logit_valid(v)) continue;
+        finite++;
+        if (v > max_logit) {
+            max_logit = v;
+            best = i;
+        }
+    }
+    if (finite == 0) return server_sample_argmax(logits, n_vocab);
+
+    if (top_p >= 1.0f) {
+        float sum = 0.0f;
+        const float min_rel = min_p > 0.0f ? min_p : 0.0f;
+        for (int i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!server_logit_valid(v)) continue;
+            const float p = expf((v - max_logit) / temperature);
+            if (p < min_rel) continue;
+            sum += p;
+        }
+        if (sum <= 0.0f || !isfinite(sum)) return best;
+        float r = server_sample_rng_f32(rng) * sum;
+        for (int i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!server_logit_valid(v)) continue;
+            const float p = expf((v - max_logit) / temperature);
+            if (p < min_rel) continue;
+            r -= p;
+            if (r <= 0.0f) return i;
+        }
+        return best;
+    }
+
+    server_sample_candidate *cand = xmalloc((size_t)finite * sizeof(cand[0]));
+    int n = 0;
+    float sum = 0.0f;
+    for (int i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (!server_logit_valid(v)) continue;
+        const float p = expf((v - max_logit) / temperature);
+        cand[n++] = (server_sample_candidate){.id = i, .logit = v, .prob = p};
+        sum += p;
+    }
+    if (sum <= 0.0f || !isfinite(sum)) {
+        free(cand);
+        return best;
+    }
+
+    qsort(cand, (size_t)n, sizeof(cand[0]), server_sample_candidate_cmp_desc);
+    const float min_prob = (cand[0].prob / sum) * (min_p > 0.0f ? min_p : 0.0f);
+    float filtered_sum = 0.0f;
+    int filtered = 0;
+    for (int i = 0; i < n; i++) {
+        const float p = cand[i].prob / sum;
+        if (i > 0 && p < min_prob) break;
+        filtered_sum += cand[i].prob;
+        filtered++;
+        if (filtered_sum / sum >= top_p) break;
+    }
+    if (filtered == 0) {
+        free(cand);
+        return best;
+    }
+
+    float r = server_sample_rng_f32(rng) * filtered_sum;
+    for (int i = 0; i < filtered; i++) {
+        r -= cand[i].prob;
+        if (r <= 0.0f) {
+            const int id = cand[i].id;
+            free(cand);
+            return id;
+        }
+    }
+    const int id = cand[filtered - 1].id;
+    free(cand);
+    return id;
+}
+
+static int server_sample_logits(const float *logits,
+                                int n_vocab,
+                                float temperature,
+                                int top_k,
+                                float top_p,
+                                float min_p,
+                                uint64_t *rng) {
+    if (temperature <= 0.0f) return server_sample_argmax(logits, n_vocab);
+    if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
+    if (min_p < 0.0f) min_p = 0.0f;
+    if (top_k <= 0) {
+        return server_sample_full_vocab(logits, n_vocab, temperature, top_p, min_p, rng);
+    }
+    if (top_k > 1024) top_k = 1024;
+    if (top_k > n_vocab) top_k = n_vocab;
+
+    int ids[1024];
+    float vals[1024];
+    int n = 0;
+    for (int i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (!server_logit_valid(v)) continue;
+        if (n == top_k && v <= vals[n - 1]) continue;
+        int j = n < top_k ? n++ : n - 1;
+        while (j > 0 && vals[j - 1] < v) {
+            vals[j] = vals[j - 1];
+            ids[j] = ids[j - 1];
+            j--;
+        }
+        vals[j] = v;
+        ids[j] = i;
+    }
+    if (n == 0) return server_sample_argmax(logits, n_vocab);
+
+    float probs[1024];
+    const float max_logit = vals[0];
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        probs[i] = expf((vals[i] - max_logit) / temperature);
+        sum += probs[i];
+    }
+    if (sum <= 0.0f || !isfinite(sum)) return ids[0];
+
+    const float min_prob = (probs[0] / sum) * min_p;
+    float filtered_sum = 0.0f;
+    int filtered = 0;
+    for (int i = 0; i < n; i++) {
+        const float p = probs[i] / sum;
+        if (i > 0 && p < min_prob) break;
+        filtered_sum += probs[i];
+        filtered++;
+        if (filtered_sum / sum >= top_p) break;
+    }
+    if (filtered <= 0) return ids[0];
+
+    float r = server_sample_rng_f32(rng) * filtered_sum;
+    for (int i = 0; i < filtered; i++) {
+        r -= probs[i];
+        if (r <= 0.0f) return ids[i];
+    }
+    return ids[filtered - 1];
+}
+
+static int structured_sample_token(server *srv,
+                                   structured_decoder *decoder,
+                                   buf *text,
+                                   float temperature,
+                                   int top_k,
+                                   float top_p,
+                                   float min_p,
+                                   uint64_t *rng,
+                                   char *err,
+                                   size_t errlen) {
+    if (!decoder || !decoder->active) {
+        snprintf(err, errlen, "structured output decoder is not active");
+        return -1;
+    }
+    structured_json_status current =
+        structured_decoder_status(decoder, text->ptr ? text->ptr : "", text->len);
+    if (current == STRUCT_JSON_COMPLETE) return ds4_token_eos(srv->engine);
+    if (current == STRUCT_JSON_INVALID) {
+        snprintf(err, errlen, "structured output prefix became invalid");
+        return -1;
+    }
+    if (!server_structured_cache_init(srv)) {
+        snprintf(err, errlen, "structured output token cache initialization failed");
+        return -1;
+    }
+
+    const int n_vocab = srv->structured_token_n;
+    if (ds4_session_copy_logits(srv->session, srv->structured_logits, n_vocab) != n_vocab) {
+        snprintf(err, errlen, "structured output logits unavailable");
+        return -1;
+    }
+
+    const int eos = ds4_token_eos(srv->engine);
+    const size_t old_len = text->len;
+    int valid = 0;
+    for (int i = 0; i < n_vocab; i++) {
+        if (i == eos || !server_logit_valid(srv->structured_logits[i])) {
+            srv->structured_logits[i] = STRUCTURED_MASK_LOGIT;
+            continue;
+        }
+        const char *piece = srv->structured_token_text[i];
+        const size_t piece_len = srv->structured_token_len[i];
+        if (!piece || piece_len == 0) {
+            srv->structured_logits[i] = STRUCTURED_MASK_LOGIT;
+            continue;
+        }
+        buf_append(text, piece, piece_len);
+        structured_json_status st =
+            structured_decoder_status(decoder, text->ptr, text->len);
+        text->len = old_len;
+        if (text->ptr) text->ptr[text->len] = '\0';
+        if (st == STRUCT_JSON_INVALID) {
+            srv->structured_logits[i] = STRUCTURED_MASK_LOGIT;
+        } else {
+            valid++;
+        }
+    }
+
+    if (valid == 0) {
+        snprintf(err, errlen, "structured output decoder found no valid token");
+        return -1;
+    }
+    return server_sample_logits(srv->structured_logits, n_vocab, temperature,
+                                top_k, top_p, min_p, rng);
+}
 
 /* =========================================================================
  * Tool Call Text Memory.
@@ -10205,6 +11838,19 @@ static void generate_job(server *s, job *j) {
              j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
              (unsigned long long)++s->seq);
 
+    structured_decoder structured = {0};
+    if (request_uses_structured_decoder(&j->req)) {
+        if (!structured_decoder_init(&structured, &j->req.text_format,
+                                     err, sizeof(err))) {
+            trace_event(s, trace_id, "structured decoder init failed: %s", err);
+            ds4_tokens_free(&effective_prompt);
+            http_error(j->fd, s->enable_cors, 400,
+                       err[0] ? err : "invalid structured response format");
+            return;
+        }
+        trace_event(s, trace_id, "structured decoder enabled");
+    }
+
     bool structured_stream = request_uses_structured_stream(&j->req);
     anthropic_stream anthropic_live = {0};
     openai_stream openai_live = {0};
@@ -10220,6 +11866,7 @@ static void generate_job(server *s, job *j) {
                        ctx_span,
                        req_flags[0] ? " " : "",
                        req_flags);
+            structured_decoder_free(&structured);
             ds4_tokens_free(&effective_prompt);
             return;
         }
@@ -10233,6 +11880,7 @@ static void generate_job(server *s, job *j) {
                        ctx_span,
                        req_flags[0] ? " " : "",
                        req_flags);
+            structured_decoder_free(&structured);
             ds4_tokens_free(&effective_prompt);
             return;
         }
@@ -10241,12 +11889,14 @@ static void generate_job(server *s, job *j) {
             !anthropic_sse_start_live(j->fd, &j->req, id,
                                       prompt_tokens, &anthropic_live)) {
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
+            structured_decoder_free(&structured);
             ds4_tokens_free(&effective_prompt);
             return;
         }
         if (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT &&
             !sse_chunk(j->fd, &j->req, id, NULL, NULL)) {
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s openai role chunk failed", ctx_span);
+            structured_decoder_free(&structured);
             ds4_tokens_free(&effective_prompt);
             return;
         }
@@ -10261,6 +11911,7 @@ static void generate_job(server *s, job *j) {
                            req_flags[0] ? " " : "",
                            req_flags);
                 responses_stream_free(&responses_live);
+                structured_decoder_free(&structured);
                 ds4_tokens_free(&effective_prompt);
                 return;
             }
@@ -10319,7 +11970,14 @@ decode_again:
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
             temperature = 0.0f;
         }
-        int token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
+        int token = structured.active ?
+            structured_sample_token(s, &structured, &text, temperature, top_k,
+                                    top_p, min_p, &rng, err, sizeof(err)) :
+            ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
+        if (token < 0) {
+            finish = "error";
+            break;
+        }
         if (token == ds4_token_eos(s->engine)) {
             finish = "stop";
             break;
@@ -10327,7 +11985,8 @@ decode_again:
 
         int toks[17];
         int ntok = 0;
-        if (temperature <= 0.0f &&
+        if (!structured.active &&
+            temperature <= 0.0f &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
@@ -10915,6 +12574,7 @@ decode_again:
     anthropic_stream_free(&anthropic_live);
     openai_stream_free(&openai_live);
     responses_stream_free(&responses_live);
+    structured_decoder_free(&structured);
     buf_free(&text);
     ds4_tokens_free(&effective_prompt);
 }
@@ -11347,6 +13007,7 @@ static void server_close_resources(server *s) {
     live_tool_state_free(&s->responses_live);
     live_tool_state_free(&s->anthropic_live);
     visible_live_free(&s->thinking_live);
+    server_structured_cache_free(s);
     pthread_mutex_destroy(&s->tool_mu);
     pthread_mutex_destroy(&s->trace_mu);
     pthread_cond_destroy(&s->clients_cv);
@@ -13038,6 +14699,146 @@ static void test_render_chat_prompt_text_renders_tools_before_system(void) {
     TEST_ASSERT(client < user_m);
     free(prompt);
     chat_msgs_free(&msgs);
+}
+
+static void test_parse_responses_text_format_json_schema(void) {
+    const char *json =
+        "{\"format\":{\"type\":\"json_schema\",\"name\":\"CalendarEvent\","
+        "\"strict\":true,\"schema\":{\"type\":\"object\",\"properties\":{"
+        "\"name\":{\"type\":\"string\"},"
+        "\"date\":{\"type\":\"string\"},"
+        "\"participants\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},"
+        "\"required\":[\"name\",\"date\",\"participants\"],"
+        "\"additionalProperties\":false}}}";
+    const char *p = json;
+    ds4_text_format format = {0};
+    char err[128] = {0};
+    TEST_ASSERT(parse_responses_text_format(&p, &format, err, sizeof(err)));
+    json_ws(&p);
+    TEST_ASSERT(*p == '\0');
+    TEST_ASSERT(format.type == DS4_TEXT_FORMAT_JSON_SCHEMA);
+    TEST_ASSERT(format.name && !strcmp(format.name, "CalendarEvent"));
+    TEST_ASSERT(format.strict);
+    TEST_ASSERT(format.schema_json && strstr(format.schema_json, "\"properties\""));
+    TEST_ASSERT(format.schema_json && strstr(format.schema_json, "\"participants\""));
+    ds4_text_format_clear(&format);
+}
+
+static void test_parse_responses_text_format_json_object(void) {
+    const char *json = "{\"format\":{\"type\":\"json_object\"}}";
+    const char *p = json;
+    ds4_text_format format = {0};
+    char err[128] = {0};
+    TEST_ASSERT(parse_responses_text_format(&p, &format, err, sizeof(err)));
+    TEST_ASSERT(format.type == DS4_TEXT_FORMAT_JSON_OBJECT);
+    TEST_ASSERT(format.schema_json == NULL);
+    ds4_text_format_clear(&format);
+}
+
+static void test_parse_responses_text_format_rejects_unknown_type(void) {
+    const char *json = "{\"format\":{\"type\":\"xml\"}}";
+    const char *p = json;
+    ds4_text_format format = {0};
+    char err[128] = {0};
+    TEST_ASSERT(!parse_responses_text_format(&p, &format, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "text.format.type") != NULL);
+    ds4_text_format_clear(&format);
+}
+
+static void test_parse_responses_text_format_text_is_noop(void) {
+    const char *json = "{\"format\":{\"type\":\"text\"}}";
+    const char *p = json;
+    ds4_text_format format = {
+        .type = DS4_TEXT_FORMAT_JSON_OBJECT,
+        .name = xstrdup("old"),
+        .schema_json = xstrdup("{\"old\":true}"),
+    };
+    char err[128] = {0};
+    TEST_ASSERT(parse_responses_text_format(&p, &format, err, sizeof(err)));
+    TEST_ASSERT(format.type == DS4_TEXT_FORMAT_TEXT);
+    TEST_ASSERT(format.name == NULL);
+    TEST_ASSERT(format.schema_json == NULL);
+    ds4_text_format_clear(&format);
+}
+
+static void test_parse_chat_response_format_json_schema(void) {
+    const char *json =
+        "{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"CalendarEvent\","
+        "\"strict\":true,\"schema\":{\"type\":\"object\",\"properties\":{"
+        "\"name\":{\"type\":\"string\"},"
+        "\"date\":{\"type\":\"string\"},"
+        "\"participants\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},"
+        "\"required\":[\"name\",\"date\",\"participants\"],"
+        "\"additionalProperties\":false}}}";
+    const char *p = json;
+    ds4_text_format format = {0};
+    char err[128] = {0};
+    TEST_ASSERT(parse_chat_response_format(&p, &format, err, sizeof(err)));
+    json_ws(&p);
+    TEST_ASSERT(*p == '\0');
+    TEST_ASSERT(format.type == DS4_TEXT_FORMAT_JSON_SCHEMA);
+    TEST_ASSERT(format.name && !strcmp(format.name, "CalendarEvent"));
+    TEST_ASSERT(format.strict);
+    TEST_ASSERT(format.schema_json && strstr(format.schema_json, "\"properties\""));
+    TEST_ASSERT(format.schema_json && strstr(format.schema_json, "\"participants\""));
+    ds4_text_format_clear(&format);
+}
+
+static void test_parse_chat_response_format_json_object(void) {
+    const char *json = "{\"type\":\"json_object\"}";
+    const char *p = json;
+    ds4_text_format format = {0};
+    char err[128] = {0};
+    TEST_ASSERT(parse_chat_response_format(&p, &format, err, sizeof(err)));
+    TEST_ASSERT(format.type == DS4_TEXT_FORMAT_JSON_OBJECT);
+    TEST_ASSERT(format.schema_json == NULL);
+    ds4_text_format_clear(&format);
+}
+
+static void test_parse_chat_response_format_rejects_missing_schema(void) {
+    const char *json = "{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"X\"}}";
+    const char *p = json;
+    ds4_text_format format = {0};
+    char err[128] = {0};
+    TEST_ASSERT(!parse_chat_response_format(&p, &format, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "schema") != NULL);
+    ds4_text_format_clear(&format);
+}
+
+static void test_structured_decoder_preserves_enum_after_type(void) {
+    ds4_text_format format = {
+        .type = DS4_TEXT_FORMAT_JSON_SCHEMA,
+        .schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"category\":{\"enum\":[\"billing\",\"technical\",\"account\"],\"type\":\"string\"}},"
+            "\"required\":[\"category\"],"
+            "\"additionalProperties\":false}",
+        .strict = true,
+    };
+    structured_decoder decoder = {0};
+    char err[128] = {0};
+    TEST_ASSERT(structured_decoder_init(&decoder, &format, err, sizeof(err)));
+    TEST_ASSERT(structured_decoder_status(&decoder, "{\"category\":\"technical\"}",
+                                          strlen("{\"category\":\"technical\"}")) ==
+                STRUCT_JSON_COMPLETE);
+    TEST_ASSERT(structured_decoder_status(&decoder, "{\"category\":\"technical issue\"}",
+                                          strlen("{\"category\":\"technical issue\"}")) ==
+                STRUCT_JSON_INVALID);
+    structured_decoder_free(&decoder);
+}
+
+static void test_structured_decoder_rejects_non_json_whitespace(void) {
+    ds4_text_format format = {.type = DS4_TEXT_FORMAT_JSON_OBJECT};
+    structured_decoder decoder = {0};
+    char err[128] = {0};
+    TEST_ASSERT(structured_decoder_init(&decoder, &format, err, sizeof(err)));
+    TEST_ASSERT(structured_decoder_status(&decoder, "{\"a\":1}", strlen("{\"a\":1}")) ==
+                STRUCT_JSON_COMPLETE);
+    TEST_ASSERT(structured_decoder_status(&decoder, "{\"a\":1\v}", strlen("{\"a\":1\v}")) ==
+                STRUCT_JSON_INVALID);
+    TEST_ASSERT(structured_decoder_status(&decoder, "{\"a\":1\f}", strlen("{\"a\":1\f}")) ==
+                STRUCT_JSON_INVALID);
+    structured_decoder_free(&decoder);
 }
 
 static void test_dsml_tool_args_preserve_call_order(void) {
@@ -15517,6 +17318,15 @@ static void ds4_server_unit_tests_run(void) {
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();
     test_render_chat_prompt_text_renders_tools_before_system();
+    test_parse_responses_text_format_json_schema();
+    test_parse_responses_text_format_json_object();
+    test_parse_responses_text_format_rejects_unknown_type();
+    test_parse_responses_text_format_text_is_noop();
+    test_parse_chat_response_format_json_schema();
+    test_parse_chat_response_format_json_object();
+    test_parse_chat_response_format_rejects_missing_schema();
+    test_structured_decoder_preserves_enum_after_type();
+    test_structured_decoder_rejects_non_json_whitespace();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
     test_tool_schema_order_from_responses_tool_search();
