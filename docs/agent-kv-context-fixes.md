@@ -238,6 +238,9 @@ Expected result:
 
 - default C tests pass,
 - compaction canary e2e passes,
+- context self-improvement e2e passes; it uses native Git tooling when that
+  tool is present, and falls back to `bash`-run `git status` / `git diff` when
+  this branch is tested without the Git-tool PR,
 - KV benefit benchmark reports a large `saved_prefill_tokens` value,
 - `git status --short` shows only intentional source changes before commit, and
   is clean after commit.
