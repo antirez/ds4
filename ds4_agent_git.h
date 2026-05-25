@@ -23,6 +23,7 @@ typedef struct ds4_agent_git_options {
     int limit;
     int start_line;
     int line_count;
+    int timeout_sec;
     bool staged;
     bool stat;
     bool name_status;

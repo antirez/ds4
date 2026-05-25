@@ -6,14 +6,22 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
+extern char **environ;
+
 #define DS4_AGENT_GIT_DEFAULT_MAX_BYTES (64 * 1024)
+#define DS4_AGENT_GIT_DEFAULT_TIMEOUT_SEC 30
+#define DS4_AGENT_GIT_MAX_TIMEOUT_SEC 600
 
 typedef struct {
     char *ptr;
@@ -121,68 +129,260 @@ static int git_argv_base(const char **argv, const char *repo) {
     return argc;
 }
 
-static bool run_argv(const char **argv, size_t max_bytes,
+static int git_timeout_sec(int timeout_sec) {
+    if (timeout_sec <= 0) return DS4_AGENT_GIT_DEFAULT_TIMEOUT_SEC;
+    if (timeout_sec > DS4_AGENT_GIT_MAX_TIMEOUT_SEC)
+        return DS4_AGENT_GIT_MAX_TIMEOUT_SEC;
+    return timeout_sec;
+}
+
+static long long git_now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return (long long)time(NULL) * 1000LL;
+    return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
+static void git_kill_process_group(pid_t pid) {
+    if (pid <= 0) return;
+    kill(-pid, SIGKILL);
+    kill(pid, SIGKILL);
+}
+
+static void git_sleep_ms(int ms) {
+    if (ms <= 0) return;
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
+}
+
+static void git_child_noninteractive_stdio(int pipe_write_fd) {
+    close(STDIN_FILENO);
+    int devnull = open("/dev/null", O_RDONLY);
+    if (devnull >= 0) {
+        dup2(devnull, STDIN_FILENO);
+        if (devnull != STDIN_FILENO) close(devnull);
+    }
+    dup2(pipe_write_fd, STDOUT_FILENO);
+    dup2(pipe_write_fd, STDERR_FILENO);
+}
+
+static bool git_env_entry_has_key(const char *entry, const char *key) {
+    size_t n = strlen(key);
+    return entry && !strncmp(entry, key, n) && entry[n] == '=';
+}
+
+static bool git_env_entry_overridden(const char *entry) {
+    static const char *keys[] = {
+        "GIT_TERMINAL_PROMPT",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "GCM_INTERACTIVE",
+        "GIT_MERGE_AUTOEDIT",
+        "GIT_EDITOR",
+        NULL,
+    };
+    for (int i = 0; keys[i]; i++) {
+        if (git_env_entry_has_key(entry, keys[i])) return true;
+    }
+    return false;
+}
+
+static char **git_child_env_build(void) {
+    static const char *overrides[] = {
+        "GIT_TERMINAL_PROMPT=0",
+        "GIT_ASKPASS=/bin/false",
+        "SSH_ASKPASS=/bin/false",
+        "GCM_INTERACTIVE=never",
+        "GIT_MERGE_AUTOEDIT=no",
+        "GIT_EDITOR=true",
+        NULL,
+    };
+    size_t keep_count = 0;
+    for (char **e = environ; e && *e; e++) {
+        if (!git_env_entry_overridden(*e)) keep_count++;
+    }
+    size_t override_count = 0;
+    while (overrides[override_count]) override_count++;
+
+    char **env = git_xmalloc((keep_count + override_count + 1) * sizeof(*env));
+    size_t j = 0;
+    for (char **e = environ; e && *e; e++) {
+        if (!git_env_entry_overridden(*e)) env[j++] = git_xstrdup(*e);
+    }
+    for (size_t i = 0; overrides[i]; i++) env[j++] = git_xstrdup(overrides[i]);
+    env[j] = NULL;
+    return env;
+}
+
+static void git_child_env_free(char **env) {
+    if (!env) return;
+    for (size_t i = 0; env[i]; i++) free(env[i]);
+    free(env);
+}
+
+static char *git_find_executable(const char *file) {
+    if (!file || !file[0]) return git_xstrdup("");
+    if (strchr(file, '/')) return git_xstrdup(file);
+
+    const char *path = getenv("PATH");
+    if (!path || !path[0]) path = "/usr/bin:/bin:/usr/local/bin";
+    const char *p = path;
+    size_t fn = strlen(file);
+    while (true) {
+        const char *end = strchr(p, ':');
+        size_t dn = end ? (size_t)(end - p) : strlen(p);
+        size_t dir_len = dn ? dn : 1;
+        char *candidate = git_xmalloc(dir_len + 1 + fn + 1);
+        size_t off = 0;
+        if (dn) {
+            memcpy(candidate, p, dn);
+            off = dn;
+        } else {
+            candidate[off++] = '.';
+        }
+        candidate[off++] = '/';
+        memcpy(candidate + off, file, fn + 1);
+        if (access(candidate, X_OK) == 0) return candidate;
+        free(candidate);
+        if (!end) break;
+        p = end + 1;
+    }
+    return git_xstrdup(file);
+}
+
+static bool run_argv(const char **argv, size_t max_bytes, int timeout_sec,
                      ds4_agent_git_result *result,
                      char *err, size_t err_len) {
     if (!max_bytes) max_bytes = DS4_AGENT_GIT_DEFAULT_MAX_BYTES;
+    timeout_sec = git_timeout_sec(timeout_sec);
     memset(result, 0, sizeof(*result));
     int pipefd[2];
     if (pipe(pipefd) != 0) {
         git_set_err(err, err_len, "pipe: %s", strerror(errno));
         return false;
     }
+    char **child_env = git_child_env_build();
+    char *git_exe = git_find_executable("git");
 
     pid_t pid = fork();
     if (pid < 0) {
         git_set_err(err, err_len, "fork: %s", strerror(errno));
         close(pipefd[0]);
         close(pipefd[1]);
+        git_child_env_free(child_env);
+        free(git_exe);
         return false;
     }
 
     if (pid == 0) {
+        setpgid(0, 0);
         close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
-        dup2(pipefd[1], STDERR_FILENO);
+        git_child_noninteractive_stdio(pipefd[1]);
         close(pipefd[1]);
-        execvp("git", (char * const *)argv);
+        execve(git_exe, (char * const *)argv, child_env);
         dprintf(STDERR_FILENO, "exec git: %s\n", strerror(errno));
         _exit(127);
     }
 
+    setpgid(pid, pid);
+    git_child_env_free(child_env);
+    free(git_exe);
     close(pipefd[1]);
+    int flags = fcntl(pipefd[0], F_GETFL, 0);
+    if (flags >= 0) fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK);
     ds4_agent_git_buf out = {0};
     char tmp[4096];
-    while (true) {
-        ssize_t n = read(pipefd[0], tmp, sizeof(tmp));
-        if (n < 0 && errno == EINTR) continue;
-        if (n < 0) {
-            git_set_err(err, err_len, "read git output: %s", strerror(errno));
-            close(pipefd[0]);
-            int ignored = 0;
-            waitpid(pid, &ignored, 0);
-            free(out.ptr);
-            return false;
-        }
-        if (n == 0) break;
-        size_t got = (size_t)n;
-        if (out.len < max_bytes) {
-            size_t keep = max_bytes - out.len;
-            if (keep > got) keep = got;
-            git_buf_append(&out, tmp, keep);
-        }
-        if (out.len >= max_bytes) result->truncated = true;
-    }
-    close(pipefd[0]);
-
     int status = 0;
-    while (waitpid(pid, &status, 0) < 0) {
-        if (errno == EINTR) continue;
-        git_set_err(err, err_len, "wait git: %s", strerror(errno));
-        free(out.ptr);
-        return false;
+    bool child_done = false;
+    bool pipe_open = true;
+    bool timed_out = false;
+    bool timeout_reported = false;
+    long long deadline = git_now_ms() + (long long)timeout_sec * 1000LL;
+    long long timeout_close_deadline = 0;
+
+    while (pipe_open || !child_done) {
+        if (!child_done) {
+            pid_t w = waitpid(pid, &status, WNOHANG);
+            if (w == pid) {
+                child_done = true;
+            } else if (w < 0 && errno != EINTR) {
+                git_set_err(err, err_len, "wait git: %s", strerror(errno));
+                if (pipe_open) close(pipefd[0]);
+                free(out.ptr);
+                return false;
+            }
+        }
+
+        if (pipe_open) {
+            while (true) {
+                ssize_t n = read(pipefd[0], tmp, sizeof(tmp));
+                if (n < 0 && errno == EINTR) continue;
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+                if (n < 0) {
+                    git_set_err(err, err_len, "read git output: %s", strerror(errno));
+                    close(pipefd[0]);
+                    git_kill_process_group(pid);
+                    int ignored = 0;
+                    waitpid(pid, &ignored, 0);
+                    free(out.ptr);
+                    return false;
+                }
+                if (n == 0) {
+                    close(pipefd[0]);
+                    pipe_open = false;
+                    break;
+                }
+                size_t got = (size_t)n;
+                if (out.len < max_bytes) {
+                    size_t keep = max_bytes - out.len;
+                    if (keep > got) keep = got;
+                    git_buf_append(&out, tmp, keep);
+                }
+                if (out.len >= max_bytes) result->truncated = true;
+            }
+        }
+
+        if (child_done && !pipe_open) break;
+
+        long long now = git_now_ms();
+        if (!child_done && !timed_out && now >= deadline) {
+            timed_out = true;
+            timeout_close_deadline = now + 1000;
+            git_kill_process_group(pid);
+            if (!timeout_reported) {
+                char msg[128];
+                snprintf(msg, sizeof(msg),
+                         "\n[git command timed out after %d seconds]\n",
+                         timeout_sec);
+                git_buf_append_capped(&out, msg, strlen(msg), max_bytes,
+                                      &result->truncated);
+                timeout_reported = true;
+            }
+        }
+        if (timed_out && pipe_open && timeout_close_deadline > 0 &&
+            now >= timeout_close_deadline) {
+            close(pipefd[0]);
+            pipe_open = false;
+        }
+
+        int wait_ms = 50;
+        if (!timed_out) {
+            long long remaining = deadline - now;
+            if (remaining < 0) remaining = 0;
+            if (remaining < wait_ms) wait_ms = (int)remaining;
+        }
+        if (pipe_open) {
+            struct pollfd pfd = {.fd = pipefd[0], .events = POLLIN | POLLHUP};
+            while (poll(&pfd, 1, wait_ms) < 0 && errno == EINTR) {}
+        } else if (!child_done && wait_ms > 0) {
+            git_sleep_ms(wait_ms);
+        }
     }
-    if (WIFEXITED(status)) result->exit_code = WEXITSTATUS(status);
+
+    if (timed_out) result->exit_code = 124;
+    else if (WIFEXITED(status)) result->exit_code = WEXITSTATUS(status);
     else if (WIFSIGNALED(status)) result->exit_code = 128 + WTERMSIG(status);
     else result->exit_code = 1;
 
@@ -191,13 +391,14 @@ static bool run_argv(const char **argv, size_t max_bytes,
 }
 
 static bool run_git_tail(const char *repo, const char * const *tail,
-                         size_t max_bytes, ds4_agent_git_result *result,
+                         size_t max_bytes, int timeout_sec,
+                         ds4_agent_git_result *result,
                          char *err, size_t err_len) {
     const char *argv[64];
     int argc = git_argv_base(argv, repo);
     for (int i = 0; tail && tail[i]; i++) argv_add(argv, &argc, tail[i]);
     argv[argc] = NULL;
-    return run_argv(argv, max_bytes, result, err, err_len);
+    return run_argv(argv, max_bytes, timeout_sec, result, err, err_len);
 }
 
 static char *git_first_line_value(const char *s) {
@@ -229,10 +430,12 @@ static bool git_status_dirty(const char *status) {
 static bool git_info_append_line(const char *repo, const char *key,
                                  const char * const *tail, bool required,
                                  ds4_agent_git_buf *out, size_t max_bytes,
+                                 int timeout_sec,
                                  bool *truncated, int *exit_code,
                                  char **line_out, char *err, size_t err_len) {
     ds4_agent_git_result tmp = {0};
-    if (!run_git_tail(repo, tail, max_bytes, &tmp, err, err_len)) return false;
+    if (!run_git_tail(repo, tail, max_bytes, timeout_sec, &tmp, err, err_len))
+        return false;
     char *line = git_first_line_value(tmp.output);
     git_buf_puts_capped(out, key, max_bytes, truncated);
     git_buf_puts_capped(out, "=", max_bytes, truncated);
@@ -259,11 +462,13 @@ static bool git_info_append_line(const char *repo, const char *key,
 static bool git_info_append_section(const char *repo, const char *header,
                                     const char * const *tail, bool required,
                                     ds4_agent_git_buf *out, size_t max_bytes,
+                                    int timeout_sec,
                                     bool *truncated, int *exit_code,
                                     ds4_agent_git_result *result_out,
                                     char *err, size_t err_len) {
     ds4_agent_git_result tmp = {0};
-    if (!run_git_tail(repo, tail, max_bytes, &tmp, err, err_len)) return false;
+    if (!run_git_tail(repo, tail, max_bytes, timeout_sec, &tmp, err, err_len))
+        return false;
     if (tmp.exit_code != 0 && required && exit_code && *exit_code == 0)
         *exit_code = tmp.exit_code;
     git_buf_puts_capped(out, header, max_bytes, truncated);
@@ -283,7 +488,7 @@ static bool git_info_append_section(const char *repo, const char *header,
     return true;
 }
 
-static bool git_run_info(const char *repo, size_t max_bytes,
+static bool git_run_info(const char *repo, size_t max_bytes, int timeout_sec,
                          ds4_agent_git_result *result,
                          char *err, size_t err_len) {
     if (!max_bytes) max_bytes = DS4_AGENT_GIT_DEFAULT_MAX_BYTES;
@@ -300,19 +505,19 @@ static bool git_run_info(const char *repo, size_t max_bytes,
         "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}", NULL
     };
     if (!git_info_append_line(repo, "repo_root", root_args, true, &out,
-                              max_bytes, &truncated, &exit_code, NULL,
+                              max_bytes, timeout_sec, &truncated, &exit_code, NULL,
                               err, err_len))
         goto fail;
     if (!git_info_append_line(repo, "branch", branch_args, true, &out,
-                              max_bytes, &truncated, &exit_code, NULL,
+                              max_bytes, timeout_sec, &truncated, &exit_code, NULL,
                               err, err_len))
         goto fail;
     if (!git_info_append_line(repo, "head", head_args, true, &out,
-                              max_bytes, &truncated, &exit_code, NULL,
+                              max_bytes, timeout_sec, &truncated, &exit_code, NULL,
                               err, err_len))
         goto fail;
     if (!git_info_append_line(repo, "upstream", upstream_args, false, &out,
-                              max_bytes, &truncated, &exit_code, &upstream,
+                              max_bytes, timeout_sec, &truncated, &exit_code, &upstream,
                               err, err_len))
         goto fail;
 
@@ -321,7 +526,7 @@ static bool git_run_info(const char *repo, size_t max_bytes,
             "rev-list", "--left-right", "--count", "@{u}...HEAD", NULL
         };
         if (!git_info_append_line(repo, "behind_ahead", ahead_args, false, &out,
-                                  max_bytes, &truncated, &exit_code, NULL,
+                                  max_bytes, timeout_sec, &truncated, &exit_code, NULL,
                                   err, err_len))
             goto fail;
     } else {
@@ -331,7 +536,7 @@ static bool git_run_info(const char *repo, size_t max_bytes,
     const char *status_args[] = {"status", "--porcelain=v1", "--branch", NULL};
     ds4_agent_git_result status = {0};
     if (!git_info_append_section(repo, "status:", status_args, true, &out,
-                                 max_bytes, &truncated, &exit_code, &status,
+                                 max_bytes, timeout_sec, &truncated, &exit_code, &status,
                                  err, err_len))
         goto fail;
     git_buf_puts_capped(&out, "dirty=", max_bytes, &truncated);
@@ -341,7 +546,7 @@ static bool git_run_info(const char *repo, size_t max_bytes,
 
     const char *remote_args[] = {"remote", "-v", NULL};
     if (!git_info_append_section(repo, "remotes:", remote_args, false, &out,
-                                 max_bytes, &truncated, &exit_code, NULL,
+                                 max_bytes, timeout_sec, &truncated, &exit_code, NULL,
                                  err, err_len))
         goto fail;
 
@@ -481,11 +686,12 @@ static bool git_required_ref(const char *action, const char *name,
 }
 
 static bool git_require_clean_worktree(const char *repo, const char *action,
+                                       int timeout_sec,
                                        char *err, size_t err_len) {
     const char *status_args[] = {"status", "--porcelain=v1", NULL};
     ds4_agent_git_result st = {0};
     bool ok = run_git_tail(repo, status_args, DS4_AGENT_GIT_DEFAULT_MAX_BYTES,
-                           &st, err, err_len);
+                           timeout_sec, &st, err, err_len);
     if (!ok) return false;
     if (st.exit_code != 0) {
         char *line = git_first_line_value(st.output);
@@ -530,7 +736,8 @@ bool ds4_agent_git_run_options(const ds4_agent_git_options *opts,
     const char *repo = opts->repo && opts->repo[0] ? opts->repo : ".";
     const char *action = opts->action;
     if (!strcmp(action, "info"))
-        return git_run_info(repo, opts->max_bytes, result, err, err_len);
+        return git_run_info(repo, opts->max_bytes, opts->timeout_sec,
+                            result, err, err_len);
 
     const char *argv[64];
     int argc = git_argv_base(argv, repo);
@@ -577,7 +784,8 @@ bool ds4_agent_git_run_options(const ds4_agent_git_options *opts,
             argv_add(argv, &argc, "HEAD");
             argv_add(argv, &argc, target);
         } else {
-            if (!git_require_clean_worktree(repo, action, err, err_len))
+            if (!git_require_clean_worktree(repo, action, opts->timeout_sec,
+                                            err, err_len))
                 return false;
             argv_add(argv, &argc, "merge");
             argv_add(argv, &argc, "--ff-only");
@@ -616,7 +824,8 @@ bool ds4_agent_git_run_options(const ds4_agent_git_options *opts,
             snprintf(range_arg, sizeof(range_arg), "%s..HEAD", upstream);
             argv_add(argv, &argc, range_arg);
         } else {
-            if (!git_require_clean_worktree(repo, action, err, err_len))
+            if (!git_require_clean_worktree(repo, action, opts->timeout_sec,
+                                            err, err_len))
                 return false;
             argv_add(argv, &argc, "rebase");
             argv_add(argv, &argc, upstream);
@@ -695,7 +904,8 @@ bool ds4_agent_git_run_options(const ds4_agent_git_options *opts,
     } else if (!strcmp(action, "worktree_restore")) {
         const char *ref = opts->ref && opts->ref[0] ? opts->ref : "HEAD";
         if (!git_path_or_all_required(opts, err, err_len) ||
-            !git_tree_ref_safe("ref", ref, err, err_len))
+            !git_tree_ref_safe("ref", ref, err, err_len) ||
+            !git_confirmed_or_dry_run(opts, err, err_len))
             return false;
         if (opts->dry_run) {
             argv_add(argv, &argc, "diff");
@@ -716,7 +926,9 @@ bool ds4_agent_git_run_options(const ds4_agent_git_options *opts,
             git_set_err(err, err_len, "git switch requires ref");
             return false;
         }
-        if (!git_optional_ref_safe("ref", ref, err, err_len)) return false;
+        if (!git_optional_ref_safe("ref", ref, err, err_len) ||
+            !git_confirmed_or_dry_run(opts, err, err_len))
+            return false;
         if (opts->dry_run) {
             argv_add(argv, &argc, "rev-parse");
             argv_add(argv, &argc, "--verify");
@@ -769,6 +981,9 @@ bool ds4_agent_git_run_options(const ds4_agent_git_options *opts,
                !strcmp(action, "stash_drop")) {
         const char *ref = opts->ref && opts->ref[0] ? opts->ref : "stash@{0}";
         if (!git_stash_ref_safe(ref, err, err_len)) return false;
+        if (strcmp(action, "stash_apply") &&
+            !git_confirmed_or_dry_run(opts, err, err_len))
+            return false;
         if (opts->dry_run) {
             argv_add(argv, &argc, "stash");
             argv_add(argv, &argc, "show");
@@ -921,7 +1136,8 @@ bool ds4_agent_git_run_options(const ds4_agent_git_options *opts,
         return false;
     }
     argv[argc] = NULL;
-    bool ok = run_argv(argv, opts->max_bytes, result, err, err_len);
+    bool ok = run_argv(argv, opts->max_bytes, opts->timeout_sec,
+                       result, err, err_len);
     free(owned_arg);
     return ok;
 }

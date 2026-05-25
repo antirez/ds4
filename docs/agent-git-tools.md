@@ -10,6 +10,8 @@ against `ds4_agent_context.c`.
 - Keep all argv construction direct through `fork`/`exec`, never through a shell.
 - Bound output with `max_bytes` and reject unsafe paths, refs, remotes, and
   messages before invoking Git.
+- Run Git non-interactively: stdin is `/dev/null`, pagers/prompts/editors are
+  disabled, and every invocation has a bounded timeout.
 - Allow guarded local mutations only when intent is explicit and validation
   happens before invoking Git.
 - Keep remote mutations opt-in with `confirm=true` unless the call is a
@@ -46,16 +48,24 @@ Guarded remote and integration actions include `fetch`, `push`, `merge`,
 
 ## Guardrails
 
+- Every Git subprocess defaults to `timeout_sec=30`; callers can request
+  `timeout_sec` from 1 to 600 seconds. A timeout kills the Git process group and
+  reports exit code 124 with a timeout notice in the tool output.
+- Git runs with terminal prompts disabled (`GIT_TERMINAL_PROMPT=0`), askpass
+  helpers disabled, merge auto-edit disabled, and `GIT_EDITOR=true`.
 - `stage` and `unstage` require either `path` or `all=true`.
 - `commit` requires an explicit one-line `message`.
 - `worktree_restore` requires either `path` or `all=true`, defaults `ref=HEAD`,
-  and supports `dry_run`.
-- `switch` requires an explicit safe `ref`; it does not create branches and
-  does not use force, discard, or merge flags.
+  supports `dry_run`, and requires `confirm=true` for a real restore.
+- `switch` requires an explicit safe `ref` and `confirm=true` for a real branch
+  switch; it does not create branches and does not use force, discard, or merge
+  flags.
 - `stash_push` requires an explicit one-line `message`; `all=true` includes
   untracked files.
 - `stash_show`, `stash_apply`, `stash_pop`, and `stash_drop` accept only safe
   stash refs such as `stash@{0}`.
+- Real `stash_pop` and `stash_drop` require `confirm=true`; `stash_apply`
+  supports `dry_run` preview and leaves the stash entry intact.
 - `fetch` requires an explicit `remote`; real fetch requires `confirm=true`.
 - `push` requires explicit `remote` and `ref`; real push requires
   `confirm=true`. Push rejects force, delete, and colon refspec syntax.

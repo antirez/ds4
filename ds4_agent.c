@@ -830,6 +830,7 @@ static const char agent_tools_prompt_after_edit[] =
     "        \"dry_run\": {\"type\": \"boolean\"},\n"
     "        \"all\": {\"type\": \"boolean\"},\n"
     "        \"confirm\": {\"type\": \"boolean\"},\n"
+    "        \"timeout_sec\": {\"type\": \"number\"},\n"
     "        \"max_bytes\": {\"type\": \"number\"}\n"
     "      },\n"
     "      \"required\": [\"action\"]\n"
@@ -5558,6 +5559,8 @@ static char *agent_tool_git(const agent_tool_call *call) {
                                              1, 1, INT_MAX);
     int line_count = agent_parse_int_default(agent_tool_arg_value(call, "line_count"),
                                              80, 1, 1000);
+    int timeout_sec = agent_parse_int_default(agent_tool_arg_value(call, "timeout_sec"),
+                                              30, 1, 600);
     int max_bytes = agent_parse_int_default(agent_tool_arg_value(call, "max_bytes"),
                                             64 * 1024, 1024, 256 * 1024);
     bool staged = agent_parse_bool_default(agent_tool_arg_value(call, "staged"), false);
@@ -5583,6 +5586,7 @@ static char *agent_tool_git(const agent_tool_call *call) {
         .limit = limit,
         .start_line = start_line,
         .line_count = line_count,
+        .timeout_sec = timeout_sec,
         .staged = staged,
         .stat = stat,
         .name_status = name_status,

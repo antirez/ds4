@@ -393,6 +393,15 @@ int main(void) {
     ds4_agent_git_result_free(&r);
 
     opts = (ds4_agent_git_options){.repo = repo, .action = "worktree_restore", .path = "a.txt"};
+    CHECK(!ds4_agent_git_run_options(&opts, &r, err, sizeof(err)),
+          "worktree_restore should require confirm=true or dry_run=true");
+
+    opts = (ds4_agent_git_options){
+        .repo = repo,
+        .action = "worktree_restore",
+        .path = "a.txt",
+        .confirm = true,
+    };
     assert_git_opts_ok(&opts, &r);
     ds4_agent_git_result_free(&r);
 
@@ -418,6 +427,15 @@ int main(void) {
     ds4_agent_git_result_free(&r);
 
     opts = (ds4_agent_git_options){.repo = repo, .action = "switch", .ref = "side"};
+    CHECK(!ds4_agent_git_run_options(&opts, &r, err, sizeof(err)),
+          "switch should require confirm=true or dry_run=true");
+
+    opts = (ds4_agent_git_options){
+        .repo = repo,
+        .action = "switch",
+        .ref = "side",
+        .confirm = true,
+    };
     assert_git_opts_ok(&opts, &r);
     ds4_agent_git_result_free(&r);
 
@@ -708,6 +726,23 @@ int main(void) {
         .action = "stash_drop",
         .ref = "stash@{0}",
     };
+    CHECK(!ds4_agent_git_run_options(&opts, &r, err, sizeof(err)),
+          "stash_drop should require confirm=true or dry_run=true");
+
+    opts = (ds4_agent_git_options){
+        .repo = repo,
+        .action = "stash_pop",
+        .ref = "stash@{0}",
+    };
+    CHECK(!ds4_agent_git_run_options(&opts, &r, err, sizeof(err)),
+          "stash_pop should require confirm=true or dry_run=true");
+
+    opts = (ds4_agent_git_options){
+        .repo = repo,
+        .action = "stash_drop",
+        .ref = "stash@{0}",
+        .confirm = true,
+    };
     assert_git_opts_ok(&opts, &r);
     CHECK(strstr(r.output, "Dropped") != NULL, "stash_drop did not drop stash");
     ds4_agent_git_result_free(&r);
@@ -829,6 +864,72 @@ int main(void) {
     };
     CHECK(!ds4_agent_git_run_options(&opts, &r, err, sizeof(err)),
           "conflicting diff formats should be rejected");
+
+    char *fake_dir = make_temp_dir();
+    char *fake_git = join_path(fake_dir, "git");
+    const char *current_path = getenv("PATH");
+    bool had_path = current_path != NULL;
+    char *old_path = current_path ? test_strdup(current_path) : NULL;
+    size_t new_path_len = strlen(fake_dir) + 1 + (old_path ? strlen(old_path) : 0) + 1;
+    char *new_path = malloc(new_path_len);
+    CHECK(new_path != NULL, "malloc failed");
+    if (old_path && old_path[0])
+        snprintf(new_path, new_path_len, "%s:%s", fake_dir, old_path);
+    else
+        snprintf(new_path, new_path_len, "%s", fake_dir);
+
+    write_file(fake_git,
+               "#!/bin/sh\n"
+               "printf 'prompt=%s askpass=%s ssh=%s editor=%s autoedit=%s gcm=%s\\n' "
+               "\"$GIT_TERMINAL_PROMPT\" \"$GIT_ASKPASS\" \"$SSH_ASKPASS\" "
+               "\"$GIT_EDITOR\" \"$GIT_MERGE_AUTOEDIT\" \"$GCM_INTERACTIVE\"\n");
+    CHECK(chmod(fake_git, 0700) == 0, "failed to chmod fake git");
+    CHECK(setenv("PATH", new_path, 1) == 0, "failed to override PATH");
+
+    opts = (ds4_agent_git_options){
+        .repo = repo,
+        .action = "status",
+        .timeout_sec = 5,
+    };
+    assert_git_opts_ok(&opts, &r);
+    CHECK(strstr(r.output, "prompt=0") != NULL, "git should disable terminal prompts");
+    CHECK(strstr(r.output, "askpass=/bin/false") != NULL, "git should disable askpass");
+    CHECK(strstr(r.output, "ssh=/bin/false") != NULL, "git should disable ssh askpass");
+    CHECK(strstr(r.output, "editor=true") != NULL, "git should use a noninteractive editor");
+    CHECK(strstr(r.output, "autoedit=no") != NULL, "git should disable merge autoedit");
+    CHECK(strstr(r.output, "gcm=never") != NULL, "git should disable credential manager prompts");
+    ds4_agent_git_result_free(&r);
+
+    write_file(fake_git,
+               "#!/bin/sh\n"
+               "sleep 2\n"
+               "echo late\n");
+    CHECK(chmod(fake_git, 0700) == 0, "failed to chmod timeout fake git");
+
+    opts = (ds4_agent_git_options){
+        .repo = repo,
+        .action = "status",
+        .timeout_sec = 1,
+    };
+    err[0] = '\0';
+    CHECK(ds4_agent_git_run_options(&opts, &r, err, sizeof(err)),
+          "timeout fake git should execute");
+    CHECK(r.exit_code == 124, "timed out git command should report exit code 124");
+    CHECK(strstr(r.output, "timed out after 1 seconds") != NULL,
+          "timed out git command should report timeout");
+    CHECK(strstr(r.output, "late") == NULL,
+          "timed out git command should kill the process group");
+    ds4_agent_git_result_free(&r);
+
+    if (had_path)
+        CHECK(setenv("PATH", old_path, 1) == 0, "failed to restore PATH");
+    else
+        CHECK(unsetenv("PATH") == 0, "failed to unset PATH");
+    remove_tree(fake_dir);
+    free(new_path);
+    free(old_path);
+    free(fake_git);
+    free(fake_dir);
 
     remove_tree(repo);
     remove_tree(remote_dir);
