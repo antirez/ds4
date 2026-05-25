@@ -223,6 +223,50 @@ Verification:
 - `make test-kv-cache-benefit`
 - `git status --short`
 
+## 7. Adaptive Self-Improvement E2E Scope
+
+This test demonstrates the agent loop, not a real DS4 code optimization.
+
+It means:
+
+- DS4 is given a temporary repository with a small failing Python project.
+- DS4 must inspect repository state, fix the bug, run the tests, inspect the
+  diff, checkpoint the context, restore it, and prove the tests still pass.
+- If the native Git tool is available, the prompt asks DS4 to use it for
+  `status` and `diff`.
+- If the native Git tool is not available, the same test falls back to the
+  existing `bash` path with `git status --short` and `git diff`.
+
+Before:
+
+```text
+context tools work in isolated calls -> less proof of agent-level usefulness
+```
+
+Now:
+
+```text
+agent fixes a controlled project -> checkpoints -> restores -> verifies state
+```
+
+The limitation is intentional. This test does not claim that DS4 found and
+optimized DS4's own C code. A stronger follow-up test should run against DS4
+itself: ask the agent to inspect the repository, choose one small measurable
+optimization, implement it, run the relevant benchmark or e2e check, inspect
+the diff, checkpoint, restore, and record whether the metric improved.
+
+That DS4-on-DS4 loop is the ideal product demonstration, but it is a slower and
+less deterministic test than this PR should require by default. The controlled
+temporary repository keeps this PR's regression signal clear while preserving a
+direct path to the stronger self-optimization loop.
+
+Verification:
+
+- `make test-agent-context-self-improvement`
+- The generated ledger records `git_status_mode`, `git_diff_mode`,
+  `context_checkpoint_before`, `context_checkpoint_after`,
+  `context_restore_used`, `tests_before_restore`, and `tests_after_restore`.
+
 ## Test Plan
 
 Run:
@@ -231,6 +275,7 @@ Run:
 make test
 make test-agent-context-compact-canary
 make test-kv-cache-benefit
+make test-agent-context-self-improvement
 git status --short
 ```
 

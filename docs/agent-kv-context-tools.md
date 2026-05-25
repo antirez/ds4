@@ -715,6 +715,49 @@ guard that checks whether compaction preserves facts explicitly marked as
 critical for the next action while those facts are pushed out of the recent
 verbatim tail.
 
+12. Adaptive context self-improvement e2e.
+
+Run the optional self-improvement target:
+
+```sh
+make test-agent-context-self-improvement
+```
+
+This target is intentionally separate from default `make test`: it requires a
+real model/backend and asks DS4 to operate a complete agent loop. The harness
+creates a temporary repository with a small failing Python project, then the
+prompt requires DS4 to:
+
+- create a context checkpoint before changing the project,
+- inspect repository status,
+- read and fix the failing code,
+- run the project test,
+- inspect the resulting diff,
+- create a second context checkpoint after the test passes,
+- restore from that checkpoint,
+- inspect repository status again,
+- run the test again,
+- write a ledger with the exact actions and final result.
+
+The Git inspection step is adaptive. If the model-visible schemas include the
+native Git tool, the prompt asks DS4 to use it for `status` and `diff`. If that
+tool is absent, the same prompt requires the existing `bash` path with
+`git status --short` and `git diff`. This keeps the context/KV branch
+independent from the Git-tool branch while still letting the same test exercise
+the native Git path after integration.
+
+This test is not a claim that DS4 has optimized DS4 itself. It is a controlled
+regression test for the agent loop shape: inspect, edit, test, diff,
+checkpoint, restore, retest, and record evidence.
+
+The stronger product demonstration should be a DS4-on-DS4 optimization loop:
+ask DS4 to inspect this repository, select one small measurable optimization,
+implement it, run the relevant benchmark or e2e check, inspect the source diff,
+checkpoint and restore the successful state, and record whether the metric
+improved. That is the right next target, but it should remain an optional slow
+evaluation because it is more expensive and less deterministic than a controlled
+temporary-repository regression.
+
 ### Resume Point: 2026-05-25
 
 The DS4-generated context loop was run successfully with:
