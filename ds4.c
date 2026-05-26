@@ -9219,6 +9219,40 @@ static bool metal_graph_ensure_batch_ffn_out(ds4_gpu_graph *g) {
     return g->batch_ffn_out != NULL;
 }
 
+#ifdef DS4_JACCL
+/* Zero router weights for experts not owned by this rank.  The fused Metal
+ * MoE kernel multiplies each expert contribution by its weight, so weight=0
+ * effectively masks it out.  Both buffers are StorageModeShared (zero-copy). */
+static void metal_graph_mask_non_owned_experts(
+        ds4_gpu_graph *g,
+        int expert_start,
+        int expert_end,
+        uint32_t n_expert_used) {
+    int32_t *sel = (int32_t *)ds4_gpu_tensor_contents(g->router_selected);
+    float   *wts = (float *)ds4_gpu_tensor_contents(g->router_weights);
+    for (uint32_t i = 0; i < n_expert_used; i++) {
+        if (sel[i] < expert_start || sel[i] >= expert_end)
+            wts[i] = 0.0f;
+    }
+}
+
+/* Batch variant: mask router weights for N tokens. */
+static void metal_graph_mask_non_owned_experts_batch(
+        ds4_gpu_graph *g,
+        int expert_start,
+        int expert_end,
+        uint32_t n_expert_used,
+        uint32_t n_tokens) {
+    int32_t *sel = (int32_t *)ds4_gpu_tensor_contents(g->batch_router_selected);
+    float   *wts = (float *)ds4_gpu_tensor_contents(g->batch_router_weights);
+    const uint32_t total = n_tokens * n_expert_used;
+    for (uint32_t i = 0; i < total; i++) {
+        if (sel[i] < expert_start || sel[i] >= expert_end)
+            wts[i] = 0.0f;
+    }
+}
+#endif
+
 /* =========================================================================
  * Metal Release Graph Allocation.
  * ========================================================================= */
@@ -10553,6 +10587,10 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", g->router_selected, DS4_N_EXPERT_USED, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
     }
+#ifdef DS4_JACCL
+    if (ok && g_jaccl_group)
+        metal_graph_mask_non_owned_experts(g, g_expert_start, g_expert_end, DS4_N_EXPERT_USED);
+#endif
     if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
                                                  g->routed_up,
