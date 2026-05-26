@@ -1971,6 +1971,20 @@ static const float DS4_TURBO3_BOUNDS[7] = {
 };
 #define DS4_TURBO3_MAX 2.1520f
 
+/* Lloyd-Max 16-level codebook for N(0,1).  MSE = 0.009497 - ~3.6x lower
+ * quantization noise than the 8-level turbo3 codebook above, at the cost
+ * of 32 B / 64-elem group (vs turbo3's 24 B).  Centroids + boundaries
+ * match TURBO4_CODEBOOK / TURBO4_BOUNDS in Atlas's reshape_and_cache_turbo.cu. */
+static const float DS4_TURBO4_CODEBOOK[16] = {
+    -2.7326f, -2.0690f, -1.6180f, -1.2562f, -0.9423f, -0.6568f, -0.3880f, -0.1284f,
+     0.1284f,  0.3880f,  0.6568f,  0.9423f,  1.2562f,  1.6180f,  2.0690f,  2.7326f
+};
+static const float DS4_TURBO4_BOUNDS[15] = {
+    -2.4008f, -1.8435f, -1.4371f, -1.0993f, -0.7996f, -0.5224f, -0.2582f, 0.0f,
+     0.2582f,  0.5224f,  0.7996f,  1.0993f,  1.4371f,  1.8435f,  2.4008f
+};
+#define DS4_TURBO4_MAX 2.7326f
+
 /* FP8 E4M3 max representable.  Matched-norm scale is clamped here so a future
  * Metal storage path can pack the scale into one FP8 byte per 64-element group
  * without an extra renormalization pass. */
@@ -2040,6 +2054,74 @@ static int dsv4_turbo_signs_enabled_cpu(void) {
         cached = (s && s[0] && !(s[0] == '0' && s[1] == 0)) ? 0 : 1;
     }
     return cached;
+}
+
+/* Linear scan over 15 boundaries -> 4-bit idx [0..15].  Same shape as turbo3
+ * quant - branch tree expanded but with twice the levels. */
+static int dsv4_turbo4_quantize_index_cpu(float x) {
+    int code = 0;
+    for (int j = 0; j < 15; j++) {
+        if (x >= DS4_TURBO4_BOUNDS[j]) code = j + 1;
+    }
+    return code;
+}
+
+/* turbo4 sibling of dsv4_turbo3_kv_quantize_row_inplace_cpu - same WHT +
+ * matched-norm L2 + iWHT sequence, only the per-element quant table changes. */
+static void dsv4_turbo4_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim, uint32_t n_rot) {
+    const uint32_t n_nope = head_dim - n_rot;
+    const int signs_on = dsv4_turbo_signs_enabled_cpu();
+    float buf[64];
+
+    for (uint32_t off = 0; off < n_nope; off += 64) {
+        if (signs_on) {
+            for (uint32_t i = 0; i < 64; i++) buf[i] = x[off + i] * DS4_TURBO_SIGNS1_64[i];
+        } else {
+            for (uint32_t i = 0; i < 64; i++) buf[i] = x[off + i];
+        }
+        dsv4_turbo3_wht64_inplace_cpu(buf);
+        const float inv_sqrt_n = 1.0f / sqrtf(64.0f);
+        for (uint32_t i = 0; i < 64; i++) buf[i] *= inv_sqrt_n;
+        if (signs_on) {
+            for (uint32_t i = 0; i < 64; i++) buf[i] *= DS4_TURBO_SIGNS2_64[i];
+        }
+
+        float amax = 0.0f, norm_sq = 0.0f;
+        for (uint32_t i = 0; i < 64; i++) {
+            const float v = buf[i];
+            const float av = fabsf(v);
+            if (av > amax) amax = av;
+            norm_sq += v * v;
+        }
+        const float k_inv = (amax > 1e-12f) ? (DS4_TURBO4_MAX / amax) : 1.0f;
+
+        int idx[64];
+        float recon_sq = 0.0f;
+        for (uint32_t i = 0; i < 64; i++) {
+            idx[i] = dsv4_turbo4_quantize_index_cpu(buf[i] * k_inv);
+            const float c = DS4_TURBO4_CODEBOOK[idx[i]];
+            recon_sq += c * c;
+        }
+        const float recon_norm = sqrtf(recon_sq);
+        float scale = (recon_norm > 1e-10f) ? (sqrtf(norm_sq) / recon_norm) : (amax / DS4_TURBO4_MAX);
+        if (scale > DS4_FP8_E4M3_MAX) scale = DS4_FP8_E4M3_MAX;
+
+        for (uint32_t i = 0; i < 64; i++) {
+            buf[i] = DS4_TURBO4_CODEBOOK[idx[i]] * scale;
+        }
+
+        if (signs_on) {
+            for (uint32_t i = 0; i < 64; i++) buf[i] *= DS4_TURBO_SIGNS2_64[i];
+        }
+        dsv4_turbo3_wht64_inplace_cpu(buf);
+        const float inv_sqrt_n2 = 1.0f / sqrtf(64.0f);
+        for (uint32_t i = 0; i < 64; i++) buf[i] *= inv_sqrt_n2;
+        if (signs_on) {
+            for (uint32_t i = 0; i < 64; i++) buf[i] *= DS4_TURBO_SIGNS1_64[i];
+        }
+
+        for (uint32_t i = 0; i < 64; i++) x[off + i] = buf[i];
+    }
 }
 
 /* In-place turbo3 quality round trip on one MLA latent KV row.  RoPE tail (last
@@ -2371,11 +2453,22 @@ static ds4_kv_dtype g_ds4_kv_dtype = DS4_KV_FP8;
 
 static void ds4_kv_set_active_dtype(ds4_kv_dtype dtype) { g_ds4_kv_dtype = dtype; }
 
+/* Returns 1 when the active dtype uses the packed-byte row layout (turbo3 or
+ * turbo4), 0 for the historical fp8 float-stride path.  Use this for layout
+ * gates (allocate-as-bytes, dequant-to-scratch round-trip, etc).  When the
+ * specific bit width matters (kernel selection, ppl reference), branch on
+ * the dtype directly. */
+static inline int ds4_kv_dtype_is_packed_byte(ds4_kv_dtype d) {
+    return d == DS4_KV_TURBO3 || d == DS4_KV_TURBO4;
+}
+
 /* Dtype-aware in-place round trip on one MLA latent KV row.  Picks the FP8 or
  * turbo3 path based on the engine-wide dtype set at open time. */
 static void ds4_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim, uint32_t n_rot) {
     if (g_ds4_kv_dtype == DS4_KV_TURBO3) {
         dsv4_turbo3_kv_quantize_row_inplace_cpu(x, head_dim, n_rot);
+    } else if (g_ds4_kv_dtype == DS4_KV_TURBO4) {
+        dsv4_turbo4_kv_quantize_row_inplace_cpu(x, head_dim, n_rot);
     } else {
         dsv4_fp8_kv_quantize_row_inplace_cpu(x, head_dim, n_rot);
     }
@@ -2397,6 +2490,9 @@ static int ds4_gpu_kv_quantize_tensor_dispatch(
     if (g_ds4_kv_dtype == DS4_KV_TURBO3) {
         return ds4_gpu_dsv4_turbo3_kv_quantize_tensor(x, n_tok, head_dim, n_rot);
     }
+    if (g_ds4_kv_dtype == DS4_KV_TURBO4) {
+        return ds4_gpu_dsv4_turbo4_kv_quantize_tensor(x, n_tok, head_dim, n_rot);
+    }
     return ds4_gpu_dsv4_fp8_kv_quantize_tensor(x, n_tok, head_dim, n_rot);
 }
 
@@ -2411,6 +2507,11 @@ static int ds4_gpu_kv_store_raw_tensor_dispatch(
         return ds4_gpu_dsv4_turbo3_kv_pack_batch_tensor(
                 kv, raw_cache, raw_cap, row, 1, head_dim, n_rot, row_bytes);
     }
+    if (g_ds4_kv_dtype == DS4_KV_TURBO4) {
+        const uint64_t row_bytes = ds4_kv_row_bytes(head_dim, n_rot, DS4_KV_TURBO4);
+        return ds4_gpu_dsv4_turbo4_kv_pack_batch_tensor(
+                kv, raw_cache, raw_cap, row, 1, head_dim, n_rot, row_bytes);
+    }
     return ds4_gpu_kv_fp8_store_raw_tensor(kv, raw_cache, raw_cap, row, head_dim, n_rot);
 }
 
@@ -2423,6 +2524,11 @@ static int ds4_gpu_kv_store_raw_batch_tensor_dispatch(
     if (g_ds4_kv_dtype == DS4_KV_TURBO3) {
         const uint64_t row_bytes = ds4_kv_row_bytes(head_dim, n_rot, DS4_KV_TURBO3);
         return ds4_gpu_dsv4_turbo3_kv_pack_batch_tensor(
+                src, raw_cache, raw_cap, pos0, n_tokens, head_dim, n_rot, row_bytes);
+    }
+    if (g_ds4_kv_dtype == DS4_KV_TURBO4) {
+        const uint64_t row_bytes = ds4_kv_row_bytes(head_dim, n_rot, DS4_KV_TURBO4);
+        return ds4_gpu_dsv4_turbo4_kv_pack_batch_tensor(
                 src, raw_cache, raw_cap, pos0, n_tokens, head_dim, n_rot, row_bytes);
     }
     return ds4_gpu_store_raw_kv_batch_tensor(raw_cache, src, raw_cap, pos0, n_tokens, head_dim);
@@ -2440,14 +2546,25 @@ static int ds4_gpu_kv_store_raw_batch_tensor_dispatch(
 static ds4_gpu_tensor *ds4_gpu_kv_attention_view_dispatch(
         ds4_gpu_tensor *raw_cache, ds4_gpu_tensor *scratch,
         uint32_t raw_cap, uint32_t head_dim, uint32_t n_rot) {
-    if (g_ds4_kv_dtype != DS4_KV_TURBO3) return raw_cache;
-    if (!scratch || !raw_cache) return NULL;
-    const uint64_t row_bytes = ds4_kv_row_bytes(head_dim, n_rot, DS4_KV_TURBO3);
-    if (ds4_gpu_dsv4_turbo3_kv_dequant_to_scratch_tensor(
-            raw_cache, scratch, raw_cap, head_dim, n_rot, row_bytes) == 0) {
-        return NULL;
+    if (g_ds4_kv_dtype == DS4_KV_TURBO3) {
+        if (!scratch || !raw_cache) return NULL;
+        const uint64_t row_bytes = ds4_kv_row_bytes(head_dim, n_rot, DS4_KV_TURBO3);
+        if (ds4_gpu_dsv4_turbo3_kv_dequant_to_scratch_tensor(
+                raw_cache, scratch, raw_cap, head_dim, n_rot, row_bytes) == 0) {
+            return NULL;
+        }
+        return scratch;
     }
-    return scratch;
+    if (g_ds4_kv_dtype == DS4_KV_TURBO4) {
+        if (!scratch || !raw_cache) return NULL;
+        const uint64_t row_bytes = ds4_kv_row_bytes(head_dim, n_rot, DS4_KV_TURBO4);
+        if (ds4_gpu_dsv4_turbo4_kv_dequant_to_scratch_tensor(
+                raw_cache, scratch, raw_cap, head_dim, n_rot, row_bytes) == 0) {
+            return NULL;
+        }
+        return scratch;
+    }
+    return raw_cache;
 }
 #endif
 
@@ -2466,13 +2583,11 @@ uint64_t ds4_kv_row_bytes(uint32_t head_dim, uint32_t n_rot, ds4_kv_dtype dtype)
         /* Pathological: no non-RoPE part to compress.  Fall back to floats. */
         return (uint64_t)head_dim * sizeof(float);
     }
-    if (dtype == DS4_KV_TURBO3) {
+    if (dtype == DS4_KV_TURBO3 || dtype == DS4_KV_TURBO4) {
         const uint32_t n_nope = head_dim - n_rot;
-        /* Round group count up.  ds4 invariably gives a 64-aligned n_nope
-         * (448 in practice) but the cast keeps the formula honest for future
-         * head shapes. */
         const uint32_t n_groups = (n_nope + DS4_TURBO3_GROUP_SIZE - 1u) / DS4_TURBO3_GROUP_SIZE;
-        const uint64_t data_bytes = ((uint64_t)n_nope * 3u + 7u) / 8u;
+        const uint64_t bits_per_elem = (dtype == DS4_KV_TURBO4) ? 4u : 3u;
+        const uint64_t data_bytes = ((uint64_t)n_nope * bits_per_elem + 7u) / 8u;
         const uint64_t scale_bytes = (uint64_t)n_groups;
         const uint64_t rope_bytes = (uint64_t)n_rot * sizeof(float);
         return data_bytes + scale_bytes + rope_bytes;
@@ -2485,6 +2600,7 @@ uint64_t ds4_kv_row_bytes(uint32_t head_dim, uint32_t n_rot, ds4_kv_dtype dtype)
 const char *ds4_kv_dtype_name(ds4_kv_dtype dtype) {
     switch (dtype) {
         case DS4_KV_TURBO3: return "turbo3";
+        case DS4_KV_TURBO4: return "turbo4";
         case DS4_KV_FP8:    return "fp8";
         default:            return "fp8";
     }
@@ -2494,6 +2610,7 @@ int ds4_kv_dtype_from_name(const char *name, ds4_kv_dtype *out) {
     if (!name || !out) return 0;
     if (!strcmp(name, "fp8"))    { *out = DS4_KV_FP8;    return 1; }
     if (!strcmp(name, "turbo3")) { *out = DS4_KV_TURBO3; return 1; }
+    if (!strcmp(name, "turbo4")) { *out = DS4_KV_TURBO4; return 1; }
     return 0;
 }
 
@@ -9851,7 +9968,7 @@ static bool metal_graph_alloc_raw_cap(
      * the bytes back into the per-graph `raw_cache_dequant_scratch` float
      * tensor that the existing attention kernels read. */
     const uint64_t raw_row_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, g_ds4_kv_dtype);
-    if (g_ds4_kv_dtype == DS4_KV_TURBO3) {
+    if (ds4_kv_dtype_is_packed_byte(g_ds4_kv_dtype)) {
         g->raw_cache_dequant_scratch = ds4_gpu_tensor_alloc(
                 (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
         g->mtp_raw_cache_dequant_scratch = enable_mtp
@@ -10941,7 +11058,7 @@ static bool metal_graph_encode_decode_layer(
                         DS4_N_HEAD_DIM, DS4_N_ROT);
             }
             if (turbo3_rc == 0) {
-                ds4_gpu_tensor *raw_cache_attn = (g_ds4_kv_dtype == DS4_KV_TURBO3)
+                ds4_gpu_tensor *raw_cache_attn = ds4_kv_dtype_is_packed_byte(g_ds4_kv_dtype)
                         ? ds4_gpu_kv_attention_view_dispatch(
                               raw_cache, dequant_scratch,
                               raw_cap, DS4_N_HEAD_DIM, DS4_N_ROT)
@@ -10977,25 +11094,33 @@ static bool metal_graph_encode_decode_layer(
                                                                 n_comp,
                                                                 &decode_index_stage_t0);
             }
-        } else if (g_ds4_kv_dtype == DS4_KV_TURBO3) {
-            /* decode_heads has an inline-dequant turbo3 sibling - pass
-             * packed bytes directly, no view_dispatch dequant. */
-            const uint64_t row_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, DS4_KV_TURBO3);
-            int rc = ds4_gpu_attention_decode_heads_turbo3_tensor(
-                    g->heads,
-                    model->map, model->size,
-                    layer->attn_sinks->abs_offset,
-                    g->q, raw_cache, row_bytes, n_raw,
-                    raw_cap,
-                    raw_start,
-                    n_comp ? comp_cache : NULL,
-                    metal_graph_attn_comp_cache_is_f16(),
-                    n_comp,
-                    NULL,
-                    0,
-                    DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
+        } else if (ds4_kv_dtype_is_packed_byte(g_ds4_kv_dtype)) {
+            /* Inline-dequant turbo3/turbo4 sibling of decode_heads: pass
+             * packed bytes directly, no view_dispatch dequant.  Launcher
+             * returns 0 (falls back to dequant-to-scratch + fp8 attention)
+             * when raw_count exceeds the inline gate
+             * (DS4_METAL_TURBO{3,4}_INLINE_THRESH). */
+            const uint64_t row_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, g_ds4_kv_dtype);
+            int rc = (g_ds4_kv_dtype == DS4_KV_TURBO3)
+                    ? ds4_gpu_attention_decode_heads_turbo3_tensor(
+                            g->heads, model->map, model->size,
+                            layer->attn_sinks->abs_offset,
+                            g->q, raw_cache, row_bytes, n_raw,
+                            raw_cap, raw_start,
+                            n_comp ? comp_cache : NULL,
+                            metal_graph_attn_comp_cache_is_f16(),
+                            n_comp, NULL, 0,
+                            DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT)
+                    : ds4_gpu_attention_decode_heads_turbo4_tensor(
+                            g->heads, model->map, model->size,
+                            layer->attn_sinks->abs_offset,
+                            g->q, raw_cache, row_bytes, n_raw,
+                            raw_cap, raw_start,
+                            n_comp ? comp_cache : NULL,
+                            metal_graph_attn_comp_cache_is_f16(),
+                            n_comp, NULL, 0,
+                            DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
             if (rc == 0) {
-                /* Turbo3 launcher rejected - fall back via dequant + float kernel. */
                 ds4_gpu_tensor *raw_cache_attn = ds4_gpu_kv_attention_view_dispatch(
                         raw_cache, dequant_scratch,
                         raw_cap, DS4_N_HEAD_DIM, DS4_N_ROT);
@@ -12860,9 +12985,26 @@ static bool metal_graph_encode_layer_attention_batch(
                     g->raw_window,
                     /* ratio */ 0,
                     DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
+        } else if (g_ds4_kv_dtype == DS4_KV_TURBO4) {
+            const uint64_t row_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, DS4_KV_TURBO4);
+            turbo3_rc = ds4_gpu_attention_decode_mixed_batch_turbo4_heads_tensor(
+                    g->batch_heads,
+                    model->map, model->size,
+                    layer->attn_sinks->abs_offset,
+                    g->batch_q,
+                    g->layer_raw_cache[il], row_bytes,
+                    /* comp_kv  */ NULL,
+                    /* comp_kv_f16 */ 0,
+                    /* comp_mask */ NULL,
+                    /* use_comp_mask */ 0,
+                    n_tokens, pos0, n_raw, g->raw_cap, raw_start,
+                    /* n_comp */ 0,
+                    g->raw_window,
+                    /* ratio */ 0,
+                    DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
         }
         if (turbo3_rc == 0) {
-            ds4_gpu_tensor *raw_cache_attn = ok ? ((g_ds4_kv_dtype == DS4_KV_TURBO3)
+            ds4_gpu_tensor *raw_cache_attn = ok ? (ds4_kv_dtype_is_packed_byte(g_ds4_kv_dtype)
                     ? ds4_gpu_kv_attention_view_dispatch(
                             g->layer_raw_cache[il], g->raw_cache_dequant_scratch,
                             g->raw_cap, DS4_N_HEAD_DIM, DS4_N_ROT)
@@ -13578,7 +13720,7 @@ static bool metal_graph_encode_layer_attention_batch(
             }
             ds4_gpu_tensor *raw_cache_attn_a = NULL;
             if (turbo3_rc_a == 0 && ok) {
-                raw_cache_attn_a = (g_ds4_kv_dtype == DS4_KV_TURBO3)
+                raw_cache_attn_a = ds4_kv_dtype_is_packed_byte(g_ds4_kv_dtype)
                         ? ds4_gpu_kv_attention_view_dispatch(
                                 g->layer_raw_cache[il], g->raw_cache_dequant_scratch,
                                 g->raw_cap, DS4_N_HEAD_DIM, DS4_N_ROT)
@@ -13725,7 +13867,7 @@ static bool metal_graph_encode_layer_attention_batch(
                         DS4_N_HEAD_DIM, DS4_N_ROT);
             }
             if (turbo3_rc_b == 0) {
-                ds4_gpu_tensor *raw_cache_attn_b = ok ? ((g_ds4_kv_dtype == DS4_KV_TURBO3)
+                ds4_gpu_tensor *raw_cache_attn_b = ok ? (ds4_kv_dtype_is_packed_byte(g_ds4_kv_dtype)
                         ? ds4_gpu_kv_attention_view_dispatch(
                                 g->layer_raw_cache[il], g->raw_cache_dequant_scratch,
                                 g->raw_cap, DS4_N_HEAD_DIM, DS4_N_ROT)
@@ -13905,7 +14047,7 @@ static bool metal_graph_encode_layer_attention_batch(
                     }
                 }
                 if (turbo3_rc_c == 0) {
-                    ds4_gpu_tensor *raw_cache_attn_c = ok ? ((g_ds4_kv_dtype == DS4_KV_TURBO3)
+                    ds4_gpu_tensor *raw_cache_attn_c = ok ? (ds4_kv_dtype_is_packed_byte(g_ds4_kv_dtype)
                             ? ds4_gpu_kv_attention_view_dispatch(
                                     g->layer_raw_cache[il], g->raw_cache_dequant_scratch,
                                     g->raw_cap, DS4_N_HEAD_DIM, DS4_N_ROT)

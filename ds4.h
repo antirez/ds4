@@ -43,6 +43,14 @@ typedef enum {
 typedef enum {
     DS4_KV_FP8 = 0,
     DS4_KV_TURBO3 = 1,
+    /* DS4_KV_TURBO4: 4-bit Lloyd-Max variant.  Storage is the same shape
+     * as DS4_KV_TURBO3 but with 16-level codebook (4-bit indices, 32 B
+     * data per 64-element group -> 487 B/row on DSV4's head_dim=512,
+     * n_rot=64).  Quantization MSE on N(0,1) is 0.0095 vs turbo3's
+     * 0.0345 - ~3.6x lower noise for ~10% more bytes per row.  Use when
+     * turbo3's quality regression is too large but >4x KV memory savings
+     * are still desirable. */
+    DS4_KV_TURBO4 = 2,
 } ds4_kv_dtype;
 const char *ds4_kv_dtype_name(ds4_kv_dtype dtype);
 int ds4_kv_dtype_from_name(const char *name, ds4_kv_dtype *out);

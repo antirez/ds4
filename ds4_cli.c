@@ -106,12 +106,14 @@ static void usage(FILE *fp) {
         "      CPU helper threads for host-side or reference work.\n"
         "  --quality\n"
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
-        "  --kv-cache fp8|turbo3\n"
-        "      KV cache compression simulation. fp8 (default) keeps the historical E4M3\n"
-        "      in-place round trip on the non-RoPE part of each compressed KV row. turbo3\n"
-        "      swaps in a TurboQuant+ Randomized Hadamard rotation + 3-bit Lloyd-Max\n"
-        "      Lloyd-Max quantization with matched-norm L2 correction on the same 64-element\n"
-        "      groups. Storage layout unchanged. CUDA-only at the moment; Metal port deferred.\n"
+        "  --kv-cache fp8|turbo3|turbo4\n"
+        "      KV cache compression. fp8 (default) keeps the historical E4M3 in-place\n"
+        "      round trip on the non-RoPE part of each compressed KV row. turbo3 swaps in\n"
+        "      a TurboQuant+ Randomized Hadamard rotation + 3-bit Lloyd-Max quantization\n"
+        "      (4.75x packed-byte shrink on the SWA raw cache). turbo4 uses the same shape\n"
+        "      with a 4-bit Lloyd-Max codebook (4.21x shrink, ~3.6x lower quantization\n"
+        "      noise -- pick when turbo3's quality regression is too large). All three\n"
+        "      work on CUDA + Metal.\n"
         "  --dir-steering-file FILE\n"
         "      Load one f32 direction vector per layer for directional steering.\n"
         "  --dir-steering-ffn F\n"
@@ -1485,7 +1487,7 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--kv-cache")) {
             const char *kv_name = need_arg(&i, argc, argv, arg);
             if (!ds4_kv_dtype_from_name(kv_name, &c.engine.kv_dtype)) {
-                fprintf(stderr, "ds4: unknown --kv-cache value '%s' (expected fp8 or turbo3)\n", kv_name);
+                fprintf(stderr, "ds4: unknown --kv-cache value '%s' (expected fp8, turbo3 or turbo4)\n", kv_name);
                 exit(1);
             }
         } else if (!strcmp(arg, "--dir-steering-file")) {
