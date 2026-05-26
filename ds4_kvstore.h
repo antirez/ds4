@@ -80,6 +80,15 @@ typedef struct {
 } ds4_kvstore;
 
 typedef struct {
+    const char *text;
+    size_t text_len;
+    uint8_t model_id;
+    uint8_t quant_bits;
+    uint32_t ctx_size;
+    bool reject_different_quant;
+} ds4_kvstore_eviction_context;
+
+typedef struct {
     void *ud;
     uint8_t ext_flag;
     bool (*serialized_size)(void *ud, const char *text, uint64_t *bytes_out);
@@ -143,10 +152,11 @@ bool ds4_kvstore_file_size_fits(const ds4_kvstore *kc,
                                 uint64_t *required_bytes_out);
 double ds4_kvstore_entry_eviction_score(const ds4_kvstore_entry *e,
                                         const ds4_tokens *live,
-                                        const char *protected_sha,
-                                        uint64_t now);
+                                        uint64_t now,
+                                        const ds4_kvstore_eviction_context *incoming);
 void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
-                       const char *protected_sha);
+                       uint64_t extra_bytes,
+                       const ds4_kvstore_eviction_context *incoming);
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
                                  int model_id, int quant_bits, int ctx_size);
 
