@@ -11,6 +11,7 @@
 /gguf/
 *.o
 *.dSYM/
+/build/
 __pycache__/
 *.pyc
 /misc/
