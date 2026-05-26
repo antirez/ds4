@@ -254,6 +254,60 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot);
 
+/* TurboQuant+ 3-bit Lloyd-Max in-place quality round trip.  Sibling of the FP8
+ * variant above with the same in/out contract: takes a [n_tok, head_dim] float
+ * tensor, leaves the last n_rot elements per row untouched (RoPE tail), and
+ * mutates the first head_dim - n_rot elements per row by quantizing them to
+ * 3-bit Lloyd-Max codebook indices inside a 64-element Randomized Hadamard
+ * rotation, then dequantizing back to the original basis.  Storage layout is
+ * unchanged from the FP8 path so the surrounding cache write logic stays
+ * identical - only the quantization error differs.  See ds4_kv_dtype in ds4.h
+ * for the algorithm rationale and prior-art citation chain. */
+int ds4_gpu_dsv4_turbo3_kv_quantize_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          head_dim,
+        uint32_t          n_rot);
+
+/* Packed-byte pack kernel.  Reads a [n_tok, head_dim] float tensor (the
+ * post-RoPE KV projection output) and writes the turbo3 packed bytes into
+ * `dst` at `n_tok * dst_row_bytes` total bytes.  `dst_row_bytes` must equal
+ * `ds4_kv_row_bytes(head_dim, n_rot, DS4_KV_TURBO3)`. */
+int ds4_gpu_dsv4_turbo3_kv_pack_tensor(
+        const ds4_gpu_tensor *src,
+        ds4_gpu_tensor       *dst,
+        uint32_t              n_tok,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint64_t              dst_row_bytes);
+
+/* Decompress-to-scratch entry point.  Reads `n_rows` packed turbo3 rows from
+ * `src` (each `src_row_bytes` long) and writes original-basis floats into
+ * `dst` at the natural `[n_rows, head_dim]` float layout that the existing
+ * attention kernels expect.  Used by attention paths that have no inline-
+ * dequant sibling; the inline-dequant kernels below skip this hop and read
+ * packed bytes directly to capture the V-load bandwidth win. */
+int ds4_gpu_dsv4_turbo3_kv_dequant_to_scratch_tensor(
+        const ds4_gpu_tensor *src,
+        ds4_gpu_tensor       *dst,
+        uint32_t              n_rows,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint64_t              src_row_bytes);
+
+/* Ring-aware batch pack into the SWA cache.  Mirrors
+ * ds4_gpu_store_raw_kv_batch_tensor (the fp8 path) - same `(pos0 + t) % raw_cap`
+ * ring-write semantics but writes packed turbo3 bytes per row. */
+int ds4_gpu_dsv4_turbo3_kv_pack_batch_tensor(
+        const ds4_gpu_tensor *src,
+        ds4_gpu_tensor       *raw,
+        uint32_t              raw_cap,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint64_t              row_bytes);
+
 int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_rows,
@@ -279,6 +333,17 @@ int ds4_gpu_rope_tail_tensor(
  * performs DS4's FP8 non-RoPE KV round trip and writes the F16-rounded raw
  * attention cache row in one dispatch. */
 int ds4_gpu_kv_fp8_store_raw_tensor(
+        ds4_gpu_tensor *kv,
+        ds4_gpu_tensor *raw_cache,
+        uint32_t          raw_cap,
+        uint32_t          row,
+        uint32_t          head_dim,
+        uint32_t          n_rot);
+
+/* Fused turbo3 quant + raw-cache store: sibling of ds4_gpu_kv_fp8_store_raw_tensor
+ * that applies the TurboQuant+ 3-bit round trip before writing the raw KV row.
+ * Storage layout unchanged. */
+int ds4_gpu_kv_turbo3_store_raw_tensor(
         ds4_gpu_tensor *kv,
         ds4_gpu_tensor *raw_cache,
         uint32_t          raw_cap,
@@ -507,6 +572,93 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim);
+
+/* Inline-dequant turbo3 attention launchers.  Read the packed-byte raw cache
+ * directly and dequant inside each K/V load to skip the scratch hop.  Live
+ * implementations in ds4_cuda.cu; Metal builds get stub returns in
+ * ds4_metal.m (never reached since engine open rejects --kv-cache turbo3 +
+ * --metal). */
+int ds4_gpu_attention_decode_heads_turbo3_tensor(
+        ds4_gpu_tensor       *heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_bytes,
+        uint64_t              row_bytes,
+        uint32_t              n_raw,
+        uint32_t              raw_cap,
+        uint32_t              raw_start,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t              comp_kv_f16,
+        uint32_t              n_comp,
+        const ds4_gpu_tensor *comp_mask,
+        uint32_t              use_mask,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              n_rot);
+
+int ds4_gpu_attention_decode_mixed_batch_turbo3_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_bytes,
+        uint64_t              row_bytes,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t              comp_kv_f16,
+        const ds4_gpu_tensor *comp_mask,
+        uint32_t              use_comp_mask,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              n_raw,
+        uint32_t              raw_cap,
+        uint32_t              raw_start,
+        uint32_t              n_comp,
+        uint32_t              window,
+        uint32_t              ratio,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              n_rot);
+
+int ds4_gpu_attention_indexed_mixed_batch_turbo3_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_bytes,
+        uint64_t              row_bytes,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t              comp_kv_f16,
+        const ds4_gpu_tensor *topk,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              n_raw,
+        uint32_t              raw_cap,
+        uint32_t              raw_start,
+        uint32_t              n_comp,
+        uint32_t              top_k,
+        uint32_t              window,
+        uint32_t              ratio,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              n_rot);
+
+int ds4_gpu_attention_prefill_raw_turbo3_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_bytes,
+        uint64_t              row_bytes,
+        uint32_t              n_tokens,
+        uint32_t              window,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              n_rot);
 
 int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         ds4_gpu_tensor       *heads,

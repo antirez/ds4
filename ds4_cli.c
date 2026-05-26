@@ -106,6 +106,12 @@ static void usage(FILE *fp) {
         "      CPU helper threads for host-side or reference work.\n"
         "  --quality\n"
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
+        "  --kv-cache fp8|turbo3\n"
+        "      KV cache compression simulation. fp8 (default) keeps the historical E4M3\n"
+        "      in-place round trip on the non-RoPE part of each compressed KV row. turbo3\n"
+        "      swaps in a TurboQuant+ Randomized Hadamard rotation + 3-bit Lloyd-Max\n"
+        "      Lloyd-Max quantization with matched-norm L2 correction on the same 64-element\n"
+        "      groups. Storage layout unchanged. CUDA-only at the moment; Metal port deferred.\n"
         "  --dir-steering-file FILE\n"
         "      Load one f32 direction vector per layer for directional steering.\n"
         "  --dir-steering-ffn F\n"
@@ -1475,6 +1481,12 @@ static cli_config parse_options(int argc, char **argv) {
             if (c.engine.power_percent < 1 || c.engine.power_percent > 100) {
                 fprintf(stderr, "ds4: --power must be between 1 and 100\n");
                 exit(2);
+            }
+        } else if (!strcmp(arg, "--kv-cache")) {
+            const char *kv_name = need_arg(&i, argc, argv, arg);
+            if (!ds4_kv_dtype_from_name(kv_name, &c.engine.kv_dtype)) {
+                fprintf(stderr, "ds4: unknown --kv-cache value '%s' (expected fp8 or turbo3)\n", kv_name);
+                exit(1);
             }
         } else if (!strcmp(arg, "--dir-steering-file")) {
             c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);

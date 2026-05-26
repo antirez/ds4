@@ -11,6 +11,7 @@
  */
 
 #include <errno.h>
+#include <float.h>
 #include <limits.h>
 #include <math.h>
 #include <stdbool.h>
@@ -38,6 +39,21 @@ typedef struct {
     const char *dump_frontier_logits_dir;
     bool warm_weights;
     bool quality;
+    /* KV cache compression simulation; fp8 is the historical default. */
+    ds4_kv_dtype kv_dtype;
+    /* PPL teacher-forced quality measurement.  When set, skips the
+     * throughput sweep and instead tokenizes the file, walks token by
+     * token, accumulates -log P(token_t | tokens_<t), and prints
+     * nll_avg / ppl / scored_tokens. */
+    const char *ppl_prompt_path;
+    int          ppl_max_tokens;
+    /* Quality validation: KLD + top-K agreement vs a baseline run.
+     * --quality-emit FILE writes per-position full-vocab logits during a PPL
+     * run; --quality-baseline FILE reads such a dump and compares each
+     * position's logit vector to the current run's, reporting KL divergence
+     * (mean / max), top-1 agreement %, and top-5 agreement %. */
+    const char *quality_emit_path;
+    const char *quality_baseline_path;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -69,6 +85,7 @@ static void usage(FILE *fp) {
         "      Select backend explicitly. Defaults to Metal on macOS, CUDA elsewhere.\n"
         "  -t, --threads N        CPU helper threads.\n"
         "  --quality              Prefer exact kernels where applicable.\n"
+        "  --kv-cache fp8|turbo3  KV cache compression simulation. Default: fp8 (historical path).\n"
         "  --warm-weights         Touch mapped tensor pages before benchmarking.\n"
         "  --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n"
         "\n"
@@ -234,6 +251,12 @@ static bench_config parse_options(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
+        } else if (!strcmp(arg, "--kv-cache")) {
+            const char *kv_name = need_arg(&i, argc, argv, arg);
+            if (!ds4_kv_dtype_from_name(kv_name, &c.kv_dtype)) {
+                fprintf(stderr, "ds4-bench: unknown --kv-cache value '%s' (expected fp8 or turbo3)\n", kv_name);
+                exit(2);
+            }
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
             usage(stderr);
@@ -335,12 +358,14 @@ static int write_frontier_logits_json(
     json_write_string(fp, cfg->model_path);
     fprintf(fp,
             ",\n  \"backend\":\"%s\",\n  \"quality\":%s,\n"
+            "  \"kv_cache\":\"%s\",\n"
             "  \"quant_bits\":%d,\n  \"prompt_tokens\":%d,\n"
             "  \"frontier_tokens\":%d,\n  \"prefill_tokens\":%d,\n"
             "  \"ctx\":%d,\n  \"vocab\":%d,\n"
             "  \"argmax_id\":%d,\n  \"argmax_logit\":%.9g,\n  \"logits\":[",
             ds4_backend_name(cfg->backend),
             cfg->quality ? "true" : "false",
+            ds4_kv_dtype_name(cfg->kv_dtype),
             ds4_engine_routed_quant_bits(engine),
             frontier,
             frontier,
@@ -392,8 +417,312 @@ static void log_context_memory(ds4_backend backend, int ctx_size) {
             m.comp_cap);
 }
 
+/* Side-by-side KV footprint for fp8 vs turbo3 at the given backend/ctx.
+ * The active dtype is highlighted; the other one is printed for comparison
+ * so users can see the packed-byte savings at a glance. */
+static void log_kv_footprint_compare(ds4_backend backend, int ctx_size, ds4_kv_dtype active) {
+    const ds4_kv_footprint fp8 = ds4_kv_footprint_estimate(backend, ctx_size, DS4_KV_FP8);
+    const ds4_kv_footprint t3  = ds4_kv_footprint_estimate(backend, ctx_size, DS4_KV_TURBO3);
+    const double mib = 1.0 / (1024.0 * 1024.0);
+    const double raw_ratio = (t3.raw_bytes > 0)
+            ? ((double)fp8.raw_bytes / (double)t3.raw_bytes) : 0.0;
+    /* Print the SWA ring (the only pool that swaps to packed bytes) plus
+     * the compressed pools (kept float / F16 because the compressor pool
+     * integrates softmax-weighted accumulations that need an original-basis
+     * read). */
+    fprintf(stderr,
+            "ds4-bench: KV footprint @ ctx=%d:\n"
+            "  fp8     raw=%.2f MiB  compressed=%.2f MiB  total=%.2f MiB%s\n"
+            "  turbo3  raw=%.2f MiB  compressed=%.2f MiB  total=%.2f MiB%s\n"
+            "  raw shrink: %.2fx  (turbo3 saves %.2f MiB on the SWA ring)\n",
+            ctx_size,
+            (double)fp8.raw_bytes * mib,
+            (double)fp8.compressed_bytes * mib,
+            (double)fp8.total_bytes * mib,
+            active == DS4_KV_FP8 ? "  <-- active" : "",
+            (double)t3.raw_bytes * mib,
+            (double)t3.compressed_bytes * mib,
+            (double)t3.total_bytes * mib,
+            active == DS4_KV_TURBO3 ? "  <-- active" : "",
+            raw_ratio,
+            (double)(fp8.raw_bytes - t3.raw_bytes) * mib);
+}
+
+/* Quality-dump binary format.  Magic "DS4Q" | u32 vocab | u32 scored
+ * | (scored * vocab * float32 logits).  Logits are written RAW, not
+ * softmaxed; the comparator runs log-sum-exp on read. */
+#define DS4_QDUMP_MAGIC "DS4Q"
+
+/* Streaming softmax: returns log Z so callers can compute log_p = logit - logZ. */
+static double ds4_log_sum_exp(const float *logits, int n) {
+    float m = logits[0];
+    for (int i = 1; i < n; i++) if (logits[i] > m) m = logits[i];
+    double s = 0.0;
+    for (int i = 0; i < n; i++) s += exp((double)(logits[i] - m));
+    return (double)m + log(s);
+}
+
+/* Find top-K indices of a logit vector via partial selection.  K small (<=5). */
+static void ds4_top_k_indices(const float *logits, int n, int k, int *out_idx) {
+    for (int i = 0; i < k; i++) out_idx[i] = -1;
+    float out_val[8]; /* k<=8 enforced by callers */
+    for (int i = 0; i < k; i++) out_val[i] = -FLT_MAX;
+    for (int i = 0; i < n; i++) {
+        float v = logits[i];
+        if (v <= out_val[k - 1]) continue;
+        int j = k - 1;
+        while (j > 0 && out_val[j - 1] < v) {
+            out_val[j] = out_val[j - 1];
+            out_idx[j] = out_idx[j - 1];
+            j--;
+        }
+        out_val[j] = v;
+        out_idx[j] = i;
+    }
+}
+
+/* Teacher-forced perplexity on a token sequence.  For each position i in
+ * [0, n-1) feed tokens[i], then read log P(tokens[i+1] | tokens[0..i])
+ * from the current logits.  Accumulate -logprob; report mean NLL and
+ * exp(mean_NLL).  Compares quality across --kv-cache dtypes apples-to-
+ * apples (deterministic, no sampling).
+ *
+ * Optional modes:
+ *   --quality-emit FILE      Dump per-position raw logits to FILE.
+ *   --quality-baseline FILE  Read baseline FILE, compare every position's
+ *                            logits to current run.  Reports:
+ *                              - KLD(baseline || current)  full vocab, mean / max
+ *                              - top-1 agreement (target argmax == baseline argmax)
+ *                              - top-5 agreement (target argmax in baseline top-5)
+ */
+static int run_ppl_mode(const bench_config *cfg) {
+    ds4_engine_options opt = {
+        .model_path = cfg->model_path,
+        .backend = cfg->backend,
+        .n_threads = cfg->threads,
+        .warm_weights = cfg->warm_weights,
+        .quality = cfg->quality,
+        .kv_dtype = cfg->kv_dtype,
+    };
+    ds4_engine *engine = NULL;
+    if (ds4_engine_open(&engine, &opt) != 0) return 1;
+
+    char *text = read_file(cfg->prompt_path);
+    ds4_tokens prompt = {0};
+    ds4_tokenize_text(engine, text, &prompt);
+    free(text);
+
+    int score_limit = cfg->ppl_max_tokens;
+    if (score_limit <= 0 || score_limit > prompt.len) score_limit = prompt.len;
+    if (score_limit < 2) {
+        fprintf(stderr, "ds4-bench: --ppl-prompt needs at least 2 tokens\n");
+        ds4_tokens_free(&prompt);
+        ds4_engine_close(engine);
+        return 1;
+    }
+
+    int ctx_size = score_limit + 16;
+    ds4_session *session = NULL;
+    if (ds4_session_create(&session, engine, ctx_size) != 0) {
+        fprintf(stderr, "ds4-bench: failed to create session\n");
+        ds4_tokens_free(&prompt);
+        ds4_engine_close(engine);
+        return 1;
+    }
+
+    const int vocab = ds4_engine_vocab_size(engine);
+    float *cur_logits = NULL;
+    float *bl_logits  = NULL;
+    FILE  *emit_fp    = NULL;
+    FILE  *bl_fp      = NULL;
+    int    bl_vocab   = 0;
+    int    bl_scored  = 0;
+    bool   quality_on = (cfg->quality_emit_path || cfg->quality_baseline_path);
+
+    if (quality_on) {
+        cur_logits = (float *)malloc((size_t)vocab * sizeof(float));
+        if (!cur_logits) {
+            fprintf(stderr, "ds4-bench: oom for logit scratch\n");
+            ds4_session_free(session); ds4_tokens_free(&prompt); ds4_engine_close(engine);
+            return 1;
+        }
+    }
+
+    if (cfg->quality_emit_path) {
+        emit_fp = fopen(cfg->quality_emit_path, "wb");
+        if (!emit_fp) {
+            fprintf(stderr, "ds4-bench: cannot open --quality-emit '%s': %s\n",
+                    cfg->quality_emit_path, strerror(errno));
+            free(cur_logits); ds4_session_free(session); ds4_tokens_free(&prompt); ds4_engine_close(engine);
+            return 1;
+        }
+        uint32_t hdr[3] = { 0, (uint32_t)vocab, 0 /* scored placeholder */ };
+        memcpy(&hdr[0], DS4_QDUMP_MAGIC, 4);
+        fwrite(hdr, sizeof(uint32_t), 3, emit_fp);
+    }
+
+    if (cfg->quality_baseline_path) {
+        bl_fp = fopen(cfg->quality_baseline_path, "rb");
+        if (!bl_fp) {
+            fprintf(stderr, "ds4-bench: cannot open --quality-baseline '%s': %s\n",
+                    cfg->quality_baseline_path, strerror(errno));
+            if (emit_fp) fclose(emit_fp);
+            free(cur_logits); ds4_session_free(session); ds4_tokens_free(&prompt); ds4_engine_close(engine);
+            return 1;
+        }
+        uint32_t hdr[3];
+        if (fread(hdr, sizeof(uint32_t), 3, bl_fp) != 3 ||
+            memcmp(&hdr[0], DS4_QDUMP_MAGIC, 4) != 0) {
+            fprintf(stderr, "ds4-bench: '%s' is not a DS4Q baseline dump\n",
+                    cfg->quality_baseline_path);
+            fclose(bl_fp); if (emit_fp) fclose(emit_fp);
+            free(cur_logits); ds4_session_free(session); ds4_tokens_free(&prompt); ds4_engine_close(engine);
+            return 1;
+        }
+        bl_vocab  = (int)hdr[1];
+        bl_scored = (int)hdr[2];
+        if (bl_vocab != vocab) {
+            fprintf(stderr, "ds4-bench: baseline vocab=%d, current vocab=%d (mismatch)\n",
+                    bl_vocab, vocab);
+            fclose(bl_fp); if (emit_fp) fclose(emit_fp);
+            free(cur_logits); ds4_session_free(session); ds4_tokens_free(&prompt); ds4_engine_close(engine);
+            return 1;
+        }
+        bl_logits = (float *)malloc((size_t)vocab * sizeof(float));
+        if (!bl_logits) {
+            fprintf(stderr, "ds4-bench: oom for baseline scratch\n");
+            fclose(bl_fp); if (emit_fp) fclose(emit_fp);
+            free(cur_logits); ds4_session_free(session); ds4_tokens_free(&prompt); ds4_engine_close(engine);
+            return 1;
+        }
+    }
+
+    char err[256];
+    double nll_sum = 0.0;
+    int    scored  = 0;
+    /* Quality-vs-baseline accumulators (only used when --quality-baseline). */
+    double kld_sum = 0.0;
+    double kld_max = 0.0;
+    int    top1_match = 0;
+    int    top5_match = 0;
+    int    qcompared  = 0;
+
+    double t0 = bench_now_sec();
+    for (int i = 0; i + 1 < score_limit; i++) {
+        if (ds4_session_eval(session, prompt.v[i], err, sizeof err) != 0) {
+            fprintf(stderr, "ds4-bench: ppl eval failed at pos %d: %s\n", i, err);
+            break;
+        }
+        ds4_token_score sc;
+        if (!ds4_session_token_logprob(session, prompt.v[i + 1], &sc)) {
+            fprintf(stderr, "ds4-bench: token_logprob failed at pos %d\n", i);
+            break;
+        }
+        if (!isfinite(sc.logprob)) continue;
+        nll_sum += -(double)sc.logprob;
+        scored++;
+
+        if (!quality_on) continue;
+
+        int copied = ds4_session_copy_logits(session, cur_logits, vocab);
+        if (copied != vocab) {
+            fprintf(stderr, "ds4-bench: copy_logits returned %d, expected %d\n", copied, vocab);
+            break;
+        }
+
+        if (emit_fp) {
+            if (fwrite(cur_logits, sizeof(float), (size_t)vocab, emit_fp) != (size_t)vocab) {
+                fprintf(stderr, "ds4-bench: quality-emit write failed at pos %d\n", i);
+                break;
+            }
+        }
+
+        if (bl_fp) {
+            if (qcompared >= bl_scored) {
+                fprintf(stderr, "ds4-bench: baseline has only %d positions, current at %d\n",
+                        bl_scored, qcompared);
+                break;
+            }
+            if (fread(bl_logits, sizeof(float), (size_t)vocab, bl_fp) != (size_t)vocab) {
+                fprintf(stderr, "ds4-bench: baseline read failed at pos %d\n", qcompared);
+                break;
+            }
+            /* KLD(baseline || current) = sum_v p_b(v) * (log p_b(v) - log p_c(v))
+             *                          = sum_v p_b(v) * (logit_b - logZ_b - logit_c + logZ_c) */
+            double logZb = ds4_log_sum_exp(bl_logits,  vocab);
+            double logZc = ds4_log_sum_exp(cur_logits, vocab);
+            double kld   = 0.0;
+            for (int v = 0; v < vocab; v++) {
+                double pb = exp((double)bl_logits[v] - logZb);
+                if (pb <= 0.0) continue;
+                double diff = (double)bl_logits[v] - logZb
+                            - (double)cur_logits[v] + logZc;
+                kld += pb * diff;
+            }
+            if (kld < 0.0) kld = 0.0; /* numerical floor */
+            kld_sum += kld;
+            if (kld > kld_max) kld_max = kld;
+
+            /* Top-1/top-5 agreement: target argmax vs baseline top-5 set. */
+            int bl_top5[5], cur_top1[1];
+            ds4_top_k_indices(bl_logits,  vocab, 5, bl_top5);
+            ds4_top_k_indices(cur_logits, vocab, 1, cur_top1);
+            if (cur_top1[0] == bl_top5[0]) top1_match++;
+            for (int j = 0; j < 5; j++) {
+                if (cur_top1[0] == bl_top5[j]) { top5_match++; break; }
+            }
+            qcompared++;
+        }
+    }
+    double elapsed = bench_now_sec() - t0;
+
+    /* Patch scored count into emit header. */
+    if (emit_fp) {
+        uint32_t s = (uint32_t)scored;
+        fseek(emit_fp, 8, SEEK_SET);
+        fwrite(&s, sizeof(uint32_t), 1, emit_fp);
+        fclose(emit_fp);
+    }
+    if (bl_fp) fclose(bl_fp);
+    free(cur_logits);
+    free(bl_logits);
+
+    const double avg_nll = scored > 0 ? (nll_sum / (double)scored) : 0.0;
+    const double ppl     = scored > 0 ? exp(avg_nll) : 0.0;
+    const char  *kv_name = ds4_kv_dtype_name(cfg->kv_dtype);
+    fprintf(stdout,
+            "ds4-bench: PPL teacher-forced  kv_cache=%s  tokens=%d  scored=%d  "
+            "elapsed=%.2fs\n"
+            "ds4-bench:   nll_avg=%.6f  ppl=%.6f\n",
+            kv_name, score_limit, scored, elapsed, avg_nll, ppl);
+
+    if (cfg->quality_emit_path) {
+        fprintf(stdout,
+                "ds4-bench: quality-emit wrote %d positions x vocab=%d to %s\n",
+                scored, vocab, cfg->quality_emit_path);
+    }
+    if (cfg->quality_baseline_path && qcompared > 0) {
+        const double kld_mean = kld_sum / (double)qcompared;
+        const double top1_pct = 100.0 * (double)top1_match / (double)qcompared;
+        const double top5_pct = 100.0 * (double)top5_match / (double)qcompared;
+        fprintf(stdout,
+                "ds4-bench: quality vs baseline (%s)  positions=%d\n"
+                "ds4-bench:   KLD(baseline||current)  mean=%.6f nats  max=%.6f nats\n"
+                "ds4-bench:   top-1 agreement=%.2f%%   top-5 agreement=%.2f%%\n",
+                cfg->quality_baseline_path, qcompared,
+                kld_mean, kld_max, top1_pct, top5_pct);
+    }
+
+    ds4_session_free(session);
+    ds4_tokens_free(&prompt);
+    ds4_engine_close(engine);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
+    log_context_memory(cfg.backend, cfg.ctx_alloc);
+    log_kv_footprint_compare(cfg.backend, cfg.ctx_alloc, cfg.kv_dtype);
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
@@ -402,6 +731,7 @@ int main(int argc, char **argv) {
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .kv_dtype = cfg.kv_dtype,
     };
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) return 1;
