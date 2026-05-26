@@ -18042,6 +18042,34 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 e->mtp_draft_tokens);
     }
 
+#ifdef DS4_JACCL
+    if (opt->distributed) {
+        e->jaccl_group = jaccl_init_from_env(/*strict=*/true);
+        if (!e->jaccl_group) {
+            fprintf(stderr, "ds4: JACCL init failed\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        e->world_size = jaccl_group_size(e->jaccl_group);
+        e->rank = jaccl_group_rank(e->jaccl_group);
+        int experts_per_rank = (int)DS4_N_EXPERT / e->world_size;
+        e->expert_start = e->rank * experts_per_rank;
+        e->expert_end = (e->rank == e->world_size - 1)
+                            ? (int)DS4_N_EXPERT
+                            : e->expert_start + experts_per_rank;
+        fprintf(stderr, "ds4: distributed mode rank %d/%d experts [%d, %d)\n",
+                e->rank, e->world_size, e->expert_start, e->expert_end);
+    } else
+#endif
+    {
+        e->jaccl_group = NULL;
+        e->world_size = 1;
+        e->rank = 0;
+        e->expert_start = 0;
+        e->expert_end = (int)DS4_N_EXPERT;
+    }
+
 #ifndef DS4_NO_GPU
     if (e->backend == DS4_BACKEND_CUDA) {
 #ifdef __APPLE__
@@ -18153,6 +18181,9 @@ int ds4_engine_model_id(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+#ifdef DS4_JACCL
+    if (e->jaccl_group) jaccl_group_free(e->jaccl_group);
+#endif
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
