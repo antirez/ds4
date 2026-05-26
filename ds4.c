@@ -73,6 +73,14 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
  * asks for a reasoning budget the allocated context is not meant to hold. */
 #define DS4_THINK_MAX_MIN_CONTEXT 393216u
 
+/* File-scope distributed state -- safe because ds4 enforces a single engine
+ * instance per process via the instance lock.  Set once in ds4_engine_open(),
+ * read by inner kernels without threading the engine pointer through every
+ * layer function. */
+static void *g_jaccl_group  = NULL; /* jaccl_group_t */
+static int   g_expert_start = 0;
+static int   g_expert_end   = 0;
+
 static bool ds4_backend_uses_graph(ds4_backend backend) {
     return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA;
 }
@@ -4373,6 +4381,9 @@ typedef struct {
     uint64_t in_dim;
     uint64_t row_bytes[DS4_MAX_EXPERT_USED];
     int n_expert;
+    int selected[DS4_MAX_EXPERT_USED]; /* expert IDs, for distributed ownership check */
+    int expert_start;                  /* first expert owned by this rank */
+    int expert_end;                    /* one-past-last expert owned */
 } matvec_q2_k_accum_ctx;
 
 static void matvec_q2_k_accum_worker(void *vctx, uint64_t row0, uint64_t row1) {
@@ -4381,6 +4392,10 @@ static void matvec_q2_k_accum_worker(void *vctx, uint64_t row0, uint64_t row1) {
     for (uint64_t row = row0; row < row1; row++) {
         float acc = 0.0f;
         for (int i = 0; i < ctx->n_expert; i++) {
+            /* In distributed mode, skip experts not owned by this rank. */
+            int eid = ctx->selected[i];
+            if (eid < ctx->expert_start || eid >= ctx->expert_end)
+                continue;
             float v = 0.0f;
             const block_q2_K *br = (const block_q2_K *)(ctx->base[i] + row * ctx->row_bytes[i]);
             ds4_vec_dot_q2_K_q8_K((int)ctx->in_dim, &v, br, ctx->xq[i]);
@@ -4424,11 +4439,14 @@ static void matvec_q2_k_experts_accum_prequant(
         .out = out,
         .in_dim = in_dim0,
         .n_expert = n_expert,
+        .expert_start = g_expert_start,
+        .expert_end   = g_expert_end,
     };
     for (int i = 0; i < n_expert; i++) {
         ctx.base[i] = base[i];
         ctx.row_bytes[i] = row_bytes[i];
         ctx.xq[i] = xq + (uint64_t)i * n_blocks;
+        ctx.selected[i] = selected[i];
     }
 
     ds4_parallel_for(out_dim0, matvec_q2_k_accum_worker, &ctx);
@@ -5769,6 +5787,14 @@ static void layer_routed_moe_one(
                                   (int64_t)down_in_dim);
         }
         matvec_q2_k_experts_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, DS4_N_EXPERT_USED);
+#ifdef DS4_JACCL
+        if (g_jaccl_group) {
+            float *tmp = alloca(DS4_N_EMBD * sizeof(float));
+            memcpy(tmp, out, DS4_N_EMBD * sizeof(float));
+            jaccl_group_all_sum(g_jaccl_group, tmp, out,
+                                DS4_N_EMBD * sizeof(float), JACCL_FLOAT32);
+        }
+#endif
     } else {
         for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
             const uint32_t expert = (uint32_t)selected[i];
@@ -5863,6 +5889,14 @@ static void layer_routed_moe_one_prealloc(
                               (int64_t)down_in_dim);
     }
     matvec_q2_k_experts_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, DS4_N_EXPERT_USED);
+#ifdef DS4_JACCL
+    if (g_jaccl_group) {
+        float *tmp = alloca(DS4_N_EMBD * sizeof(float));
+        memcpy(tmp, out, DS4_N_EMBD * sizeof(float));
+        jaccl_group_all_sum(g_jaccl_group, tmp, out,
+                            DS4_N_EMBD * sizeof(float), JACCL_FLOAT32);
+    }
+#endif
 
     (void)il;
 }
@@ -18069,6 +18103,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         e->expert_start = 0;
         e->expert_end = (int)DS4_N_EXPERT;
     }
+    g_jaccl_group  = e->jaccl_group;
+    g_expert_start = e->expert_start;
+    g_expert_end   = e->expert_end;
 
 #ifndef DS4_NO_GPU
     if (e->backend == DS4_BACKEND_CUDA) {
@@ -18181,6 +18218,9 @@ int ds4_engine_model_id(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+    g_jaccl_group  = NULL;
+    g_expert_start = 0;
+    g_expert_end   = 0;
 #ifdef DS4_JACCL
     if (e->jaccl_group) jaccl_group_free(e->jaccl_group);
 #endif
