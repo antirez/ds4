@@ -732,6 +732,11 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
  * implementations in ds4_cuda.cu; Metal builds get stub returns in
  * ds4_metal.m (never reached since engine open rejects --kv-cache turbo3 +
  * --metal). */
+/* Phase 7.5: turbo3 attention launchers accept `comp_row_bytes` to
+ * select inline-dequant comp_kv (>0 = packed turbo3 layout, ==0 = legacy
+ * float layout).  Inline-dequant path is implemented for the decode-token
+ * simple-path kernels only; prefill-chunk online kernels return 0 on the
+ * packed path so the caller falls back to dequant-to-scratch + float.  */
 int ds4_gpu_attention_decode_heads_turbo3_tensor(
         ds4_gpu_tensor       *heads,
         const void           *model_map,
@@ -745,6 +750,7 @@ int ds4_gpu_attention_decode_heads_turbo3_tensor(
         uint32_t              raw_start,
         const ds4_gpu_tensor *comp_kv,
         uint32_t              comp_kv_f16,
+        uint64_t              comp_row_bytes,
         uint32_t              n_comp,
         const ds4_gpu_tensor *comp_mask,
         uint32_t              use_mask,
@@ -762,6 +768,7 @@ int ds4_gpu_attention_decode_mixed_batch_turbo3_heads_tensor(
         uint64_t              row_bytes,
         const ds4_gpu_tensor *comp_kv,
         uint32_t              comp_kv_f16,
+        uint64_t              comp_row_bytes,
         const ds4_gpu_tensor *comp_mask,
         uint32_t              use_comp_mask,
         uint32_t              n_tokens,
@@ -786,6 +793,7 @@ int ds4_gpu_attention_indexed_mixed_batch_turbo3_heads_tensor(
         uint64_t              row_bytes,
         const ds4_gpu_tensor *comp_kv,
         uint32_t              comp_kv_f16,
+        uint64_t              comp_row_bytes,
         const ds4_gpu_tensor *topk,
         uint32_t              n_tokens,
         uint32_t              pos0,

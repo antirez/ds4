@@ -9717,8 +9717,18 @@ static uint64_t metal_graph_kv_cache_bytes_for_context(uint32_t ctx_size, uint32
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint64_t comp_cap = (uint64_t)(ctx_size / ratio + 2u);
-        bytes += comp_cap * DS4_N_HEAD_DIM *
-                 (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+        /* Account for the active comp_cache row layout.  Under
+         * `--comp-cache turbo3` the pool stores packed turbo3 bytes
+         * (~200 B/row at head_dim=512), not floats.  Reporting the
+         * float size here overstates the budget by ~10x and can
+         * prematurely trip the 8 GiB `ds4_gpu_should_use_managed_kv_cache`
+         * gate, forcing managed (demand-paged) allocations at contexts
+         * where regular device memory would suffice. */
+        const uint64_t comp_row_bytes = (g_ds4_comp_dtype == DS4_KV_TURBO3)
+                ? ds4_comp_row_bytes(DS4_N_HEAD_DIM, DS4_KV_TURBO3)
+                : (uint64_t)DS4_N_HEAD_DIM *
+                  (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+        bytes += comp_cap * comp_row_bytes;
         if (ratio == 4) {
             bytes += comp_cap * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
         }
@@ -10625,6 +10635,53 @@ static ds4_gpu_tensor *metal_graph_comp_kv_for_attn(
     return g->comp_cache_dequant_scratch;
 }
 
+/* Phase 7.5: variant that EXPOSES the packed pool to an inline-dequant
+ * attention launcher.  Writes the per-row stride (in bytes) into
+ * *out_row_bytes:
+ *   - 0  -> legacy float layout (caller may use returned tensor as
+ *           `const float *` of head_dim floats per row).
+ *   - >0 -> turbo3-packed bytes per row; caller MUST pass this value
+ *           to the launcher so the kernel knows to inline-dequant.
+ *
+ * **Disabled by default**.  Empirical finding: at long ctx (n_comp >
+ * ~512) inline-dequant comp loses to dequant-to-scratch because the
+ * dequant work is redundant across head_groups (each attention CTA
+ * dequants the same comp rows independently, vs the upfront kernel
+ * which dequants once across all CTAs).  Phase 7.4 dequant-to-scratch
+ * remains the right architecture for comp_kv.  Set DS4_GPU_INLINE_COMP_KV=1
+ * to enable for A/B testing on short contexts.
+ *
+ * The wiring (kernel branches, launcher params, dispatcher plumbing)
+ * stays in place because (a) the K-dot/V-acc skeleton is correct, just
+ * compute-redundant, and (b) future work (per-tile sparse-V skip,
+ * indexed comp selection) can re-enable it for cases where it pays. */
+static int metal_graph_comp_kv_inline_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_GPU_INLINE_COMP_KV");
+        cached = (env && env[0] && env[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+static ds4_gpu_tensor *metal_graph_comp_kv_packed_for_attn(
+        ds4_gpu_graph *g, uint32_t il, uint32_t n_comp,
+        uint64_t *out_row_bytes) {
+    if (out_row_bytes) *out_row_bytes = 0;
+    if (g_ds4_comp_dtype != DS4_KV_TURBO3) {
+        return g->layer_attn_comp_cache[il];
+    }
+    if (DS4_GPU_ATTN_COMP_CACHE_F16 || !metal_graph_comp_kv_inline_enabled()) {
+        return metal_graph_comp_kv_for_attn(g, il, n_comp);
+    }
+    if (n_comp == 0 || g->layer_attn_comp_cache_packed[il] == NULL) {
+        return metal_graph_comp_kv_for_attn(g, il, n_comp);
+    }
+    if (out_row_bytes) {
+        *out_row_bytes = ds4_comp_row_bytes(DS4_N_HEAD_DIM, DS4_KV_TURBO3);
+    }
+    return g->layer_attn_comp_cache_packed[il];
+}
+
 /* Encode one DS4 decode layer on Metal.  This is the release single-token
  * layer path; diagnostics reuse it so they compare exactly what generation
  * runs. */
@@ -10854,6 +10911,10 @@ static bool metal_graph_encode_decode_layer(
 
     uint32_t n_comp = 0;
     ds4_gpu_tensor *comp_cache = NULL;
+    /* Phase 7.5: when comp_cache points at the turbo3-packed pool, this
+     * holds the per-row byte stride; the inline-dequant attention
+     * launchers branch on it (0 = legacy float). */
+    uint64_t comp_row_bytes = 0;
     ds4_gpu_tensor *comp_selected = NULL;
     uint32_t n_selected = 0;
     double decode_index_stage_t0 = 0.0;
@@ -11147,7 +11208,10 @@ static bool metal_graph_encode_decode_layer(
         }
 
         n_comp = g->layer_n_comp[il];
-        comp_cache = metal_graph_comp_kv_for_attn(g, il, n_comp);
+        /* Phase 7.5: prefer the packed pool (no dequant-to-scratch pre-pass).
+         * Falls back to the dequant scratch when inline path is disabled
+         * (F16 staging, escape hatch, or n_comp==0). */
+        comp_cache = metal_graph_comp_kv_packed_for_attn(g, il, n_comp, &comp_row_bytes);
     }
     DS4_METAL_PROFILE_DECODE_STAGE("compressor_indexer");
 
@@ -11168,8 +11232,9 @@ static bool metal_graph_encode_decode_layer(
                         layer->attn_sinks->abs_offset,
                         g->q,
                         raw_cache, row_bytes,
-                        metal_graph_comp_kv_for_attn(g, il, n_comp),
+                        comp_cache,
                         metal_graph_attn_comp_cache_is_f16(),
+                        comp_row_bytes,
                         comp_selected,
                         1,
                         pos,
@@ -11253,6 +11318,7 @@ static bool metal_graph_encode_decode_layer(
                             raw_cap, raw_start,
                             n_comp ? comp_cache : NULL,
                             metal_graph_attn_comp_cache_is_f16(),
+                            comp_row_bytes,
                             n_comp, NULL, 0,
                             DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
                 }
@@ -11285,13 +11351,23 @@ static bool metal_graph_encode_decode_layer(
                         raw_cache, dequant_scratch,
                         raw_cap, DS4_N_HEAD_DIM, DS4_N_ROT);
                 if (!raw_cache_attn) ok = false;
+                /* The fp8 attention kernel reads comp_kv with a float row
+                 * layout.  When --comp-cache turbo3 is paired with the
+                 * inline-dequant path, the cached comp_cache pointer may
+                 * already reference the packed byte pool, which would be
+                 * misinterpreted as floats and corrupt attention output.
+                 * Route through the dequant-to-scratch helper to guarantee
+                 * a float comp_kv view for this fallback. */
+                ds4_gpu_tensor *comp_kv_float = n_comp
+                        ? metal_graph_comp_kv_for_attn(g, il, n_comp)
+                        : NULL;
                 if (ok) ok = ds4_gpu_attention_decode_heads_tensor(g->heads,
                                                                      model->map, model->size,
                                                                      layer->attn_sinks->abs_offset,
                                                                      g->q, raw_cache_attn, n_raw,
                                                                      raw_cap,
                                                                      raw_start,
-                                                                     n_comp ? comp_cache : NULL,
+                                                                     comp_kv_float,
                                                                      metal_graph_attn_comp_cache_is_f16(),
                                                                      n_comp,
                                                                      NULL,
@@ -13138,6 +13214,7 @@ static bool metal_graph_encode_layer_attention_batch(
                     g->layer_raw_cache[il], row_bytes,
                     /* comp_kv  */ NULL,
                     /* comp_kv_f16 */ 0,
+                    /* comp_row_bytes */ 0,
                     /* comp_mask */ NULL,
                     /* use_comp_mask */ 0,
                     n_tokens, pos0, n_raw, g->raw_cap, raw_start,
@@ -13861,14 +13938,18 @@ static bool metal_graph_encode_layer_attention_batch(
             int turbo3_rc_a = 0;
             if (g_ds4_kv_dtype == DS4_KV_TURBO3 && use_indexed_comp) {
                 const uint64_t row_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, DS4_KV_TURBO3);
+                uint64_t comp_row_bytes_a = 0;
+                ds4_gpu_tensor *comp_cache_a = metal_graph_comp_kv_packed_for_attn(
+                        g, il, n_comp, &comp_row_bytes_a);
                 turbo3_rc_a = ds4_gpu_attention_indexed_mixed_batch_turbo3_heads_tensor(
                         g->batch_heads,
                         model->map, model->size,
                         layer->attn_sinks->abs_offset,
                         g->batch_q,
                         g->layer_raw_cache[il], row_bytes,
-                        metal_graph_comp_kv_for_attn(g, il, n_comp),
+                        comp_cache_a,
                         metal_graph_attn_comp_cache_is_f16(),
+                        comp_row_bytes_a,
                         g->comp_selected,
                         n_tokens,
                         pos0,
@@ -14009,14 +14090,18 @@ static bool metal_graph_encode_layer_attention_batch(
             int turbo3_rc_b = 0;
             if (g_ds4_kv_dtype == DS4_KV_TURBO3) {
                 const uint64_t row_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, DS4_KV_TURBO3);
+                uint64_t comp_row_bytes_b = 0;
+                ds4_gpu_tensor *comp_cache_b = metal_graph_comp_kv_packed_for_attn(
+                        g, il, n_comp, &comp_row_bytes_b);
                 turbo3_rc_b = ds4_gpu_attention_indexed_mixed_batch_turbo3_heads_tensor(
                         g->batch_heads,
                         model->map, model->size,
                         layer->attn_sinks->abs_offset,
                         g->batch_q,
                         g->layer_raw_cache[il], row_bytes,
-                        metal_graph_comp_kv_for_attn(g, il, n_comp),
+                        comp_cache_b,
                         metal_graph_attn_comp_cache_is_f16(),
+                        comp_row_bytes_b,
                         g->comp_selected,
                         n_tokens,
                         pos0,
@@ -14170,6 +14255,9 @@ static bool metal_graph_encode_layer_attention_batch(
                 int turbo3_rc_c = 0;
                 if (g_ds4_kv_dtype == DS4_KV_TURBO3 && ok) {
                     const uint64_t row_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, DS4_KV_TURBO3);
+                    uint64_t comp_row_bytes_c = 0;
+                    ds4_gpu_tensor *comp_cache_c = metal_graph_comp_kv_packed_for_attn(
+                            g, il, cur_comp, &comp_row_bytes_c);
                     if (comp_mask != NULL && n_selected != 0) {
                         turbo3_rc_c = ds4_gpu_attention_indexed_mixed_batch_turbo3_heads_tensor(
                                 heads_view,
@@ -14177,8 +14265,9 @@ static bool metal_graph_encode_layer_attention_batch(
                                 layer->attn_sinks->abs_offset,
                                 q_view,
                                 g->layer_raw_cache[il], row_bytes,
-                                metal_graph_comp_kv_for_attn(g, il, cur_comp),
+                                comp_cache_c,
                                 metal_graph_attn_comp_cache_is_f16(),
+                                comp_row_bytes_c,
                                 g->comp_selected,
                                 1,
                                 pos,
@@ -14201,8 +14290,9 @@ static bool metal_graph_encode_layer_attention_batch(
                                 n_raw,
                                 g->raw_cap,
                                 raw_start,
-                                cur_comp ? metal_graph_comp_kv_for_attn(g, il, cur_comp) : NULL,
+                                cur_comp ? comp_cache_c : NULL,
                                 metal_graph_attn_comp_cache_is_f16(),
+                                comp_row_bytes_c,
                                 cur_comp,
                                 comp_mask,
                                 n_selected,
@@ -17773,11 +17863,16 @@ static uint64_t session_payload_live_tensor_bytes(const ds4_gpu_graph *g, uint32
     /* Disk v2: raw rows are stored at the per-dtype packed byte stride when
      * dtype=turbo3.  fp8 path stays at head_dim*4 (v1-equivalent). */
     const uint64_t raw_row_disk_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, g_ds4_kv_dtype);
+    /* Phase 7.4: comp_cache rows are packed turbo3 bytes when comp_dtype=TURBO3
+     * (no float pool, no RoPE tail).  Mirror the save side's per-row size. */
+    const uint64_t comp_row_disk_bytes = (g_ds4_comp_dtype == DS4_KV_TURBO3)
+        ? ds4_comp_row_bytes(DS4_N_HEAD_DIM, DS4_KV_TURBO3)
+        : (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         bytes += (uint64_t)raw_live * raw_row_disk_bytes;
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
-        bytes += (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM * sizeof(float);
+        bytes += (uint64_t)g->layer_n_comp[il] * comp_row_disk_bytes;
         bytes += layer_attn_state_bytes(ratio);
         bytes += layer_attn_state_bytes(ratio);
         if (ratio == 4) {
@@ -18264,7 +18359,20 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         /* Compressed rows are append-only from row zero, so the live prefix is
          * contiguous.  The two compressor state tensors hold the partial window
          * that will become the next compressed row. */
-        if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+        if (g_ds4_comp_dtype == DS4_KV_TURBO3) {
+            /* Phase 7.4: float comp pool was never allocated; save the
+             * packed pool directly.  Smaller payload (~4.75x), and load
+             * side reads it straight back into the same packed pool. */
+            const uint64_t comp_row_bytes = ds4_comp_row_bytes(DS4_N_HEAD_DIM, DS4_KV_TURBO3);
+            rc = payload_write_tensor_span(fp,
+                                           g->layer_attn_comp_cache_packed[il],
+                                           0,
+                                           (uint64_t)g->layer_n_comp[il] * comp_row_bytes,
+                                           buf,
+                                           DS4_SESSION_IO_CHUNK,
+                                           err,
+                                           errlen);
+        } else if (DS4_GPU_ATTN_COMP_CACHE_F16) {
             rc = payload_write_tensor_span_f16_as_f32(fp,
                                                       g->layer_attn_comp_cache[il],
                                                       0,
@@ -18626,7 +18734,19 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
-        if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+        if (g_ds4_comp_dtype == DS4_KV_TURBO3) {
+            /* Phase 7.4: packed-bytes load mirroring the save side. */
+            const uint64_t comp_row_bytes = ds4_comp_row_bytes(DS4_N_HEAD_DIM, DS4_KV_TURBO3);
+            rc = payload_read_tensor_span(fp,
+                                          g->layer_attn_comp_cache_packed[il],
+                                          0,
+                                          (uint64_t)n_comp[il] * comp_row_bytes,
+                                          buf,
+                                          DS4_SESSION_IO_CHUNK,
+                                          &remaining,
+                                          err,
+                                          errlen);
+        } else if (DS4_GPU_ATTN_COMP_CACHE_F16) {
             rc = payload_read_tensor_span_f32_as_f16(fp,
                                                      g->layer_attn_comp_cache[il],
                                                      0,

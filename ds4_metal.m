@@ -6858,6 +6858,7 @@ int ds4_gpu_attention_decode_heads_turbo3_tensor(
         uint32_t              raw_start,
         const ds4_gpu_tensor *comp_kv,
         uint32_t              comp_kv_f16,
+        uint64_t              comp_row_bytes,
         uint32_t              n_comp,
         const ds4_gpu_tensor *comp_mask,
         uint32_t              use_mask,
@@ -6867,7 +6868,7 @@ int ds4_gpu_attention_decode_heads_turbo3_tensor(
     return ds4_gpu_attention_decode_mixed_batch_turbo3_heads_tensor(
             heads, model_map, model_size, sinks_offset,
             q, raw_kv_bytes, row_bytes,
-            comp_kv, comp_kv_f16,
+            comp_kv, comp_kv_f16, comp_row_bytes,
             comp_mask, use_mask,
             /* n_tokens */ 1u,
             /* pos0    */ 0u,
@@ -6909,6 +6910,7 @@ int ds4_gpu_attention_decode_mixed_batch_turbo3_heads_tensor(
         uint64_t              row_bytes,
         const ds4_gpu_tensor *comp_kv,
         uint32_t              comp_kv_f16,
+        uint64_t              comp_row_bytes,
         const ds4_gpu_tensor *comp_mask,
         uint32_t              use_comp_mask,
         uint32_t              n_tokens,
@@ -6934,6 +6936,9 @@ int ds4_gpu_attention_decode_mixed_batch_turbo3_heads_tensor(
         inline_disable = (e && e[0] && e[0] != '0') ? 1 : 0;
     }
     if (inline_disable) return 0;
+    /* Metal kernel has no packed-comp variant yet (CUDA-only Phase 7.5).
+     * Caller must fall back to dequant-to-scratch + fp8 path. */
+    if (comp_row_bytes != 0) return 0;
     /* Kernel hard-codes half-precision comp_kv (Mac compile-time choice;
      * see DS4_GPU_ATTN_COMP_CACHE_F16 in ds4.c).  comp_kv_f16==0 would
      * need a separate variant - bail to fallback. */
@@ -7037,6 +7042,7 @@ int ds4_gpu_attention_indexed_mixed_batch_turbo3_heads_tensor(
         uint64_t              row_bytes,
         const ds4_gpu_tensor *comp_kv,
         uint32_t              comp_kv_f16,
+        uint64_t              comp_row_bytes,
         const ds4_gpu_tensor *topk,
         uint32_t              n_tokens,
         uint32_t              pos0,
@@ -7051,7 +7057,7 @@ int ds4_gpu_attention_indexed_mixed_batch_turbo3_heads_tensor(
         uint32_t              head_dim,
         uint32_t              n_rot) {
     (void)heads; (void)model_map; (void)model_size; (void)sinks_offset; (void)q;
-    (void)raw_kv_bytes; (void)row_bytes; (void)comp_kv; (void)comp_kv_f16; (void)topk;
+    (void)raw_kv_bytes; (void)row_bytes; (void)comp_kv; (void)comp_kv_f16; (void)comp_row_bytes; (void)topk;
     (void)n_tokens; (void)pos0; (void)n_raw; (void)raw_cap; (void)raw_start;
     (void)n_comp; (void)top_k; (void)window; (void)ratio; (void)n_head; (void)head_dim; (void)n_rot;
     return 0;
