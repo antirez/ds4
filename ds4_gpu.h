@@ -810,6 +810,21 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+/* =========================================================================
+ * Expert Ownership Mask (JACCL distributed).
+ * =========================================================================
+ *
+ * GPU-side masking of router weights for experts not owned by this rank.
+ * Eliminates the command buffer break that the CPU masking path required.
+ */
+
+int ds4_gpu_expert_mask(const ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+                        int32_t expert_start, int32_t expert_end, uint32_t n_expert_used);
+
+int ds4_gpu_expert_mask_batch(const ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+                              int32_t expert_start, int32_t expert_end,
+                              uint32_t n_expert_used, uint32_t n_tokens);
+
 int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *block_out,

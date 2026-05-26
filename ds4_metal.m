@@ -101,6 +101,8 @@ static id<MTLComputePipelineState> g_dsv4_softplus_sqrt_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_finalize_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_weights_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_hc_expand4_pipeline;
+static id<MTLComputePipelineState> g_expert_mask_pipeline;
+static id<MTLComputePipelineState> g_expert_mask_batch_pipeline;
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_pipeline_cache;
 static NSMutableDictionary<NSString *, id<MTLBuffer>> *g_model_buffer_cache;
 static NSMutableArray<id<MTLBuffer>> *g_transient_buffers;
@@ -1508,6 +1510,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_NORM_SOURCE",       @"metal/norm.metal"],
         @[@"DS4_METAL_BIN_SOURCE",        @"metal/bin.metal"],
         @[@"DS4_METAL_SET_ROWS_SOURCE",   @"metal/set_rows.metal"],
+        @[@"DS4_METAL_EXPERT_MASK_SOURCE", @"metal/expert_mask.metal"],
     ];
 
     NSMutableString *source = [NSMutableString stringWithString:base];
@@ -4159,6 +4162,12 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
+        /* Expert mask kernels — non-fatal, only needed for distributed JACCL. */
+        g_expert_mask_pipeline = ds4_gpu_get_pipeline("kernel_expert_mask");
+        g_expert_mask_batch_pipeline = ds4_gpu_get_pipeline("kernel_expert_mask_batch");
+        if (!g_expert_mask_pipeline || !g_expert_mask_batch_pipeline)
+            fprintf(stderr, "ds4: Metal expert_mask kernel(s) not found (distributed masking unavailable)\n");
+
         g_initialized = 1;
     }
 
@@ -4522,6 +4531,8 @@ void ds4_gpu_cleanup(void) {
         g_dsv4_router_finalize_one_pipeline = nil;
         g_dsv4_router_weights_one_pipeline = nil;
         g_dsv4_hc_expand4_pipeline = nil;
+        g_expert_mask_pipeline = nil;
+        g_expert_mask_batch_pipeline = nil;
         g_flash_attn_mask_buffer = nil;
         g_flash_attn_pad_buffer = nil;
         g_flash_attn_tmp_buffer = nil;
@@ -15809,5 +15820,74 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         if (!ds4_gpu_finish_command_buffer(cb, owned, "Q8 HC expand fused")) return 0;
     }
 
+    return 1;
+}
+
+/* =========================================================================
+ * Expert Ownership Mask — GPU kernel for distributed JACCL inference.
+ * =========================================================================
+ *
+ * Zeros router weights for experts not owned by this rank, entirely on GPU.
+ * Replaces the CPU path that required end_commands/begin_commands around a
+ * StorageModeShared pointer read, saving ~0.5ms per layer per token.
+ */
+
+/* Single-token decode path. */
+int ds4_gpu_expert_mask(const ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+                        int32_t expert_start, int32_t expert_end, uint32_t n_expert_used) {
+    if (!g_expert_mask_pipeline || !selected || !weights || n_expert_used == 0) return 0;
+
+    @autoreleasepool {
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        struct { int32_t expert_start; int32_t expert_end; uint32_t n_expert_used; } args = {
+            expert_start, expert_end, n_expert_used
+        };
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:g_expert_mask_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(selected) offset:ds4_gpu_tensor_offset(selected) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(weights)  offset:ds4_gpu_tensor_offset(weights)  atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(n_expert_used, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(n_expert_used, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "expert_mask")) return 0;
+    }
+    return 1;
+}
+
+/* Batch (prefill) path: mask N tokens' worth of expert weights. */
+int ds4_gpu_expert_mask_batch(const ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+                              int32_t expert_start, int32_t expert_end,
+                              uint32_t n_expert_used, uint32_t n_tokens) {
+    if (!g_expert_mask_batch_pipeline || !selected || !weights || n_expert_used == 0 || n_tokens == 0) return 0;
+
+    @autoreleasepool {
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        const uint32_t total = n_tokens * n_expert_used;
+        struct { int32_t expert_start; int32_t expert_end; uint32_t n_expert_used; uint32_t total; } args = {
+            expert_start, expert_end, n_expert_used, total
+        };
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:g_expert_mask_batch_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(selected) offset:ds4_gpu_tensor_offset(selected) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(weights)  offset:ds4_gpu_tensor_offset(weights)  atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(total, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(MIN(total, (uint32_t)g_expert_mask_batch_pipeline.maxTotalThreadsPerThreadgroup), 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "expert_mask_batch")) return 0;
+    }
     return 1;
 }
