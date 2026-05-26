@@ -1659,6 +1659,51 @@ extern "C" void ds4_gpu_set_quality(bool quality) {
     }
 }
 
+/* CUDA-only code*/
+#ifndef __HIP_PLATFORM_AMD__
+__device__ __forceinline__ static uint32_t dev_unpack_iq2_signs(uint32_t v) {
+    const uint32_t p = __popc(v) & 1u;
+    const uint32_t s = v ^ (p << 7u);
+    return s * 0x01010101u;
+}
+
+__device__ __forceinline__ static void dev_iq2_i8x8_lut(
+        const uint64_t *grid,
+        const uint8_t *signs,
+        uint8_t grid_idx,
+        uint32_t sign_idx,
+        int32_t *w0,
+        int32_t *w1) {
+    const uint32_t s = dev_unpack_iq2_signs(signs[sign_idx]);
+    const int32_t sm0 = __vcmpne4(s & 0x08040201u, 0);
+    const int32_t sm1 = __vcmpne4(s & 0x80402010u, 0);
+    const uint64_t g = grid[grid_idx];
+    *w0 = __vsub4((int32_t)(uint32_t)g ^ sm0, sm0);
+    *w1 = __vsub4((int32_t)(uint32_t)(g >> 32) ^ sm1, sm1);
+}
+
+__device__ __forceinline__ static int32_t dev_iq2_dp4a_8(uint64_t grid, uint32_t sign, const int8_t *q8, int32_t acc) {
+    const uint32_t signs = dev_unpack_iq2_signs(sign);
+    const int32_t sm0 = __vcmpne4(signs & 0x08040201u, 0);
+    const int32_t sm1 = __vcmpne4(signs & 0x80402010u, 0);
+    const int32_t g0 = __vsub4((int32_t)(uint32_t)grid ^ sm0, sm0);
+    const int32_t g1 = __vsub4((int32_t)(uint32_t)(grid >> 32) ^ sm1, sm1);
+    acc = __dp4a(g0, *(const int32_t *)(q8 + 0), acc);
+    acc = __dp4a(g1, *(const int32_t *)(q8 + 4), acc);
+    return acc;
+}
+
+__device__ static int32_t dev_dot_iq2_pair_16(uint8_t grid0, uint32_t sign0, uint8_t grid1, uint32_t sign1, const int8_t *q8) {
+    int32_t sum = 0;
+    sum = dev_iq2_dp4a_8(cuda_iq2xxs_grid[grid0], cuda_ksigns_iq2xs[sign0], q8, sum);
+    sum = dev_iq2_dp4a_8(cuda_iq2xxs_grid[grid1], cuda_ksigns_iq2xs[sign1], q8 + 8, sum);
+    return sum;
+}
+
+#endif
+
+
+
 __global__ static void embed_token_hc_kernel(float *out, const unsigned short *w, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t n = n_embd * n_hc;
@@ -1810,6 +1855,7 @@ __global__ static void matmul_f16_pair_ordered_chunks_kernel(
     }
 }
 
+
 __global__ static void matmul_f32_kernel(
         float *out,
         const float *w,
@@ -1850,14 +1896,16 @@ __global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n
     if (i < n) out[i] = __float2half(x[i]);
 }
 
-__device__ static float warp_sum_f32(float v) {
+__device__ __forceinline__ static float warp_sum_f32(float v) {
+#pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         v += __shfl_down_sync(DS4_FULL_WARP_MASK, v, offset, 32);
     }
     return v;
 }
 
-__device__ static float warp_max_f32(float v) {
+__device__ __forceinline__ static float warp_max_f32(float v) {
+#pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         v = fmaxf(v, __shfl_down_sync(DS4_FULL_WARP_MASK, v, offset, 32));
     }
@@ -1880,13 +1928,77 @@ __device__ __forceinline__ static int32_t load_i8x4_i32_unaligned(const int8_t *
                      ((uint32_t)u[3] << 24));
 }
 
+#ifdef AMD_RDNA_3_5
+// ROCM, __gfx1151__ specific optimisation
+template <uint32_t ROWS_PER_BLOCK>
+__global__ static void matmul_f16_pair_warp_lds_kernel(
+        float *out0,
+        float *out1,
+        const __half *w0,
+        const __half *w1,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim) {
+
+    const uint64_t row_base = (uint64_t)blockIdx.x * ROWS_PER_BLOCK;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+
+    extern __shared__ float xs[];
+    for (uint64_t i = tid; i < in_dim; i += blockDim.x) xs[i] = x[i];
+    __syncthreads();
+
+    if (warp >= ROWS_PER_BLOCK) return;
+    const uint64_t row = row_base + warp;
+    const bool valid0 = row < out0_dim;
+    const bool valid1 = row < out1_dim;
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+
+    if (valid0 || valid1) {
+        const __half *wr0 = valid0 ? w0 + row * in_dim : w0;
+        const __half *wr1 = valid1 ? w1 + row * in_dim : w1;
+
+        for (uint64_t i = tid; i < in_dim; i += 32u) {
+            if (valid0) sum0 += __half2float(wr0[i]) * xs[i];
+            if (valid1) sum1 += __half2float(wr1[i]) * xs[i];
+        }
+    }
+
+    sum0 = warp_sum_f32(sum0);
+    sum1 = warp_sum_f32(sum1);
+
+    if (!valid0 && !valid1) {
+        return;
+    }
+
+    if (lane == 0) {
+        if (valid0) out0[row] = sum0;
+        if (valid1) out1[row] = sum1;
+    }
+}
+#endif
+
 __device__ __forceinline__ static int32_t dot_i8x32_dp4a(const int8_t *a, const int8_t *b) {
+#ifdef __HIP_PLATFORM_AMD__
+    // ROCm float scalar loop: avoids emulated __dp4a
     int32_t dot = 0;
-#pragma unroll
+    #pragma unroll
+    for (uint32_t i = 0; i < 32u; i++) {
+        dot += (int32_t)a[i] * (int32_t)b[i];
+    }
+    return dot;
+#else
+    int32_t dot = 0;
+    #pragma unroll
     for (uint32_t i = 0; i < 32u; i += 4u) {
         dot = __dp4a(load_i8x4_i32_unaligned(a + i), load_i8x4_i32_aligned(b + i), dot);
     }
     return dot;
+#endif
 }
 
 __device__ __forceinline__ static int32_t dot_i8_block(const int8_t *a, const int8_t *b, uint64_t n, int use_dp4a) {
@@ -6325,7 +6437,29 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     }
     const __half *w0 = (const __half *)cuda_model_range_ptr(model_map, weight0_offset, weight_bytes, "f16_pair0");
     const __half *w1 = (const __half *)cuda_model_range_ptr(model_map, weight1_offset, weight_bytes, "f16_pair1");
+
     if (!w0 || !w1) return 0;
+
+#ifdef AMD_RDNA_3_5
+    // ROCM, __gfx1151__ specific optimisation
+    if (true) {
+        constexpr uint32_t ROWS_PER_BLOCK = 8u;
+        const unsigned grid = (unsigned)((out_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK);
+        const unsigned lds_bytes = (unsigned)(in_dim * sizeof(float));
+        matmul_f16_pair_warp_lds_kernel<ROWS_PER_BLOCK><<<grid, 256, lds_bytes>>>(
+            (float *)out0->ptr,
+            (float *)out1->ptr,
+            w0,
+            w1,
+            (const float *)x->ptr,
+            in_dim,
+            out_dim,
+            out_dim);
+
+        return cuda_ok(cudaGetLastError(), "matmul_f16_pair_warp_lds launch");
+    }
+#endif
+
     matmul_f16_pair_ordered_chunks_kernel<<<(unsigned)out_dim, 32>>>(
         (float *)out0->ptr,
         (float *)out1->ptr,
@@ -7883,24 +8017,17 @@ __device__ static float dev_f16_to_f32(uint16_t v) {
     return __half2float(*reinterpret_cast<const __half *>(&v));
 }
 
-__device__ __forceinline__ static uint32_t dev_unpack_iq2_signs(uint32_t v) {
-    const uint32_t p = __popc(v) & 1u;
-    const uint32_t s = v ^ (p << 7u);
-    return s * 0x01010101u;
-}
-
-__device__ __forceinline__ static int32_t dev_iq2_dp4a_8(uint64_t grid, uint32_t sign, const int8_t *q8, int32_t acc) {
-    const uint32_t signs = dev_unpack_iq2_signs(sign);
-    const int32_t sm0 = __vcmpne4(signs & 0x08040201u, 0);
-    const int32_t sm1 = __vcmpne4(signs & 0x80402010u, 0);
-    const int32_t g0 = __vsub4((int32_t)(uint32_t)grid ^ sm0, sm0);
-    const int32_t g1 = __vsub4((int32_t)(uint32_t)(grid >> 32) ^ sm1, sm1);
-    acc = __dp4a(g0, *(const int32_t *)(q8 + 0), acc);
-    acc = __dp4a(g1, *(const int32_t *)(q8 + 4), acc);
-    return acc;
-}
-
 __device__ static int32_t dev_dot_q2_16(const uint8_t *q2, const int8_t *q8, int shift) {
+#ifdef __HIP_PLATFORM_AMD__
+    // ROCm float scalar loop: avoids emulated __dp4a
+    int32_t sum = 0;
+    #pragma unroll
+    for (uint32_t i = 0; i < 16; i++) {
+        const int32_t v = (q2[i] >> shift) & 0x03;
+        sum += v * (int32_t)q8[i];
+    }
+    return sum;
+#else
     int32_t sum = 0;
     #pragma unroll
     for (uint32_t i = 0; i < 16; i += 4) {
@@ -7908,28 +8035,7 @@ __device__ static int32_t dev_dot_q2_16(const uint8_t *q2, const int8_t *q8, int
         sum = __dp4a(v, *(const int32_t *)(q8 + i), sum);
     }
     return sum;
-}
-
-__device__ static int32_t dev_dot_iq2_pair_16(uint8_t grid0, uint32_t sign0, uint8_t grid1, uint32_t sign1, const int8_t *q8) {
-    int32_t sum = 0;
-    sum = dev_iq2_dp4a_8(cuda_iq2xxs_grid[grid0], cuda_ksigns_iq2xs[sign0], q8, sum);
-    sum = dev_iq2_dp4a_8(cuda_iq2xxs_grid[grid1], cuda_ksigns_iq2xs[sign1], q8 + 8, sum);
-    return sum;
-}
-
-__device__ __forceinline__ static void dev_iq2_i8x8_lut(
-        const uint64_t *grid,
-        const uint8_t *signs,
-        uint8_t grid_idx,
-        uint32_t sign_idx,
-        int32_t *w0,
-        int32_t *w1) {
-    const uint32_t s = dev_unpack_iq2_signs(signs[sign_idx]);
-    const int32_t sm0 = __vcmpne4(s & 0x08040201u, 0);
-    const int32_t sm1 = __vcmpne4(s & 0x80402010u, 0);
-    const uint64_t g = grid[grid_idx];
-    *w0 = __vsub4((int32_t)(uint32_t)g ^ sm0, sm0);
-    *w1 = __vsub4((int32_t)(uint32_t)(g >> 32) ^ sm1, sm1);
+#endif
 }
 
 __device__ static float dev_dot_iq2_xxs_q8_K_block_lut(
@@ -7937,6 +8043,36 @@ __device__ static float dev_dot_iq2_xxs_q8_K_block_lut(
         const cuda_block_q8_K *y,
         const uint64_t *grid,
         const uint8_t *signs) {
+#ifdef __HIP_PLATFORM_AMD__
+    // ROCm float dequantize path: avoids emulated __dp4a / __vcmpne4 / __vsub4
+    const float xd = dev_f16_to_f32(x->d);
+    const uint16_t *q2 = x->qs;
+    const int8_t *q8 = y->qs;
+    float bsum = 0.0f;
+    for (int ib32 = 0; ib32 < CUDA_QK_K / 32; ib32++) {
+        const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+        const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+        q2 += 4;
+        const float ls = (float)(2u * (aux1 >> 28) + 1u);
+        // Decode 32 weights directly via grid/signs lookup
+        float sumi = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const uint8_t gi = (uint8_t)((aux0 >> (j * 8)) & 0xff);
+            const uint32_t si = (aux1 >> (j * 7)) & 127u;
+            const uint64_t g = grid[gi];
+            const uint8_t s = signs[si];
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                float w = (float)(int8_t)((g >> (k * 8)) & 0xff);
+                float sign_f = (s & (1u << k)) ? -1.0f : 1.0f;
+                sumi += sign_f * w * (float)q8[ib32 * 32 + j * 8 + k];
+            }
+        }
+        bsum += sumi * ls;
+    }
+    return 0.125f * xd * y->d * bsum;
+#else
     const float xd = dev_f16_to_f32(x->d);
     const uint16_t *q2 = x->qs;
     const int8_t *q8 = y->qs;
@@ -7963,9 +8099,73 @@ __device__ static float dev_dot_iq2_xxs_q8_K_block_lut(
         bsum += sumi * ls;
     }
     return 0.125f * xd * y->d * (float)bsum;
+#endif
 }
 
 __device__ static float dev_dot_iq2_xxs_q8_K_block(const cuda_block_iq2_xxs *x, const cuda_block_q8_K *y) {
+#ifdef __HIP_PLATFORM_AMD__
+    // ROCm float dequantize path: avoids emulated __dp4a by using float FMAs
+    const float d = dev_f16_to_f32(x->d) * y->d;
+    const uint16_t *q2 = x->qs;
+    const int8_t *q8 = y->qs;
+    float bsum = 0.0f;
+    for (int ib32 = 0; ib32 < CUDA_QK_K / 32; ib32++) {
+        const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+        const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+        q2 += 4;
+        const float ls = (float)(2u * (aux1 >> 28) + 1u);
+        const uint8_t a0 = (uint8_t)(aux0 & 0xffu);
+        const uint8_t a1 = (uint8_t)((aux0 >> 8) & 0xffu);
+        const uint8_t a2 = (uint8_t)((aux0 >> 16) & 0xffu);
+        const uint8_t a3 = (uint8_t)((aux0 >> 24) & 0xffu);
+        float sumi = 0.0f;
+        // Dequantize 16 weights to float, multiply by q8 values, accumulate as float
+        { // pair 0: a0/a1, 16 weights
+            const uint8_t sg0 = (uint8_t)((aux1 >> 0) & 127u);
+            const uint8_t sg1 = (uint8_t)((aux1 >> 7) & 127u);
+            const uint64_t g0 = cuda_iq2xxs_grid[a0];
+            const uint64_t g1 = cuda_iq2xxs_grid[a1];
+            const uint8_t s0 = cuda_ksigns_iq2xs[sg0];
+            const uint8_t s1 = cuda_ksigns_iq2xs[sg1];
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                float w = (float)(int8_t)((g0 >> (i * 8)) & 0xff);
+                float s = (s0 & (1u << i)) ? -1.0f : 1.0f;
+                sumi += s * w * (float)q8[i];
+            }
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                float w = (float)(int8_t)((g1 >> (i * 8)) & 0xff);
+                float s = (s1 & (1u << i)) ? -1.0f : 1.0f;
+                sumi += s * w * (float)q8[8 + i];
+            }
+        }
+        q8 += 16;
+        { // pair 1: a2/a3, 16 weights
+            const uint8_t sg2 = (uint8_t)((aux1 >> 14) & 127u);
+            const uint8_t sg3 = (uint8_t)((aux1 >> 21) & 127u);
+            const uint64_t g2 = cuda_iq2xxs_grid[a2];
+            const uint64_t g3 = cuda_iq2xxs_grid[a3];
+            const uint8_t s2 = cuda_ksigns_iq2xs[sg2];
+            const uint8_t s3 = cuda_ksigns_iq2xs[sg3];
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                float w = (float)(int8_t)((g2 >> (i * 8)) & 0xff);
+                float s = (s2 & (1u << i)) ? -1.0f : 1.0f;
+                sumi += s * w * (float)q8[i];
+            }
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                float w = (float)(int8_t)((g3 >> (i * 8)) & 0xff);
+                float s = (s3 & (1u << i)) ? -1.0f : 1.0f;
+                sumi += s * w * (float)q8[8 + i];
+            }
+        }
+        q8 += 16;
+        bsum += sumi * ls;
+    }
+    return 0.125f * d * bsum;
+#else
     const float d = dev_f16_to_f32(x->d) * y->d;
     const uint16_t *q2 = x->qs;
     const int8_t *q8 = y->qs;
@@ -7987,6 +8187,7 @@ __device__ static float dev_dot_iq2_xxs_q8_K_block(const cuda_block_iq2_xxs *x, 
         bsum += sumi * (int32_t)ls;
     }
     return 0.125f * d * (float)bsum;
+#endif
 }
 
 __device__ static void dev_dot_iq2_xxs_q8_K_block8_deq_lut(
@@ -8003,6 +8204,43 @@ __device__ static void dev_dot_iq2_xxs_q8_K_block8_deq_lut(
         float acc[8],
         const uint64_t *grid,
         const uint8_t *signs) {
+#ifdef __HIP_PLATFORM_AMD__
+    // ROCm float dequantize path: avoids emulated __dp4a / __vcmpne4 / __vsub4
+    const float xd = dev_f16_to_f32(x->d);
+    const uint16_t *q2 = x->qs;
+    float bsum[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    const int8_t *q8[8] = {
+        y0 ? y0->qs : NULL, y1 ? y1->qs : NULL, y2 ? y2->qs : NULL, y3 ? y3->qs : NULL,
+        y4 ? y4->qs : NULL, y5 ? y5->qs : NULL, y6 ? y6->qs : NULL, y7 ? y7->qs : NULL,
+    };
+    for (int ib32 = 0; ib32 < CUDA_QK_K / 32; ib32++) {
+        const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+        const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+        q2 += 4;
+        const float ls = (float)(2u * (aux1 >> 28) + 1u);
+        for (uint32_t p = 0; p < n; p++) {
+            const int8_t *q = q8[p] + ib32 * 32;
+            float sumi = 0.0f;
+            // Decode 4 × 8 = 32 weights on the fly — 8 weights at a time to reduce register pressure
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const uint8_t gi = (uint8_t)((aux0 >> (j * 8)) & 0xff);
+                const uint32_t si = (aux1 >> (j * 7)) & 127u;
+                const uint64_t g = grid[gi];
+                const uint8_t s = signs[si];
+                #pragma unroll
+                for (int k = 0; k < 8; k++) {
+                    float w = (float)(int8_t)((g >> (k * 8)) & 0xff);
+                    float sign_f = (s & (1u << k)) ? -1.0f : 1.0f;
+                    sumi += sign_f * w * (float)q[j * 8 + k];
+                }
+            }
+            bsum[p] += sumi * ls;
+        }
+    }
+    const cuda_block_q8_K *ys[8] = { y0, y1, y2, y3, y4, y5, y6, y7 };
+    for (uint32_t p = 0; p < n; p++) acc[p] += 0.125f * xd * ys[p]->d * bsum[p];
+#else
     const float xd = dev_f16_to_f32(x->d);
     const uint16_t *q2 = x->qs;
     int32_t bsum[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -8036,6 +8274,7 @@ __device__ static void dev_dot_iq2_xxs_q8_K_block8_deq_lut(
     }
     const cuda_block_q8_K *ys[8] = { y0, y1, y2, y3, y4, y5, y6, y7 };
     for (uint32_t p = 0; p < n; p++) acc[p] += 0.125f * xd * ys[p]->d * (float)bsum[p];
+#endif
 }
 
 __device__ static void dev_dot_iq2_xxs_q8_K_block4(
@@ -8046,6 +8285,45 @@ __device__ static void dev_dot_iq2_xxs_q8_K_block4(
         const cuda_block_q8_K *y3,
         uint32_t n,
         float acc[4]) {
+#ifdef __HIP_PLATFORM_AMD__
+    // ROCm float dequantize path: avoids emulated __dp4a / __vcmpne4 / __vsub4
+    const float xd = dev_f16_to_f32(x->d);
+    const uint16_t *q2 = x->qs;
+    float bsum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const int8_t *q8[4] = {
+        y0 ? y0->qs : NULL,
+        y1 ? y1->qs : NULL,
+        y2 ? y2->qs : NULL,
+        y3 ? y3->qs : NULL,
+    };
+    for (int ib32 = 0; ib32 < CUDA_QK_K / 32; ib32++) {
+        const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+        const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+        q2 += 4;
+        const float ls = (float)(2u * (aux1 >> 28) + 1u);
+        for (uint32_t p = 0; p < n; p++) {
+            const int8_t *q = q8[p] + ib32 * 32;
+            float sumi = 0.0f;
+            // Decode 4 × 8 = 32 weights on the fly — 8 weights at a time to reduce register pressure
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const uint8_t gi = (uint8_t)((aux0 >> (j * 8)) & 0xff);
+                const uint32_t si = (aux1 >> (j * 7)) & 127u;
+                const uint64_t g = cuda_iq2xxs_grid[gi];
+                const uint8_t s = cuda_ksigns_iq2xs[si];
+                #pragma unroll
+                for (int k = 0; k < 8; k++) {
+                    float w = (float)(int8_t)((g >> (k * 8)) & 0xff);
+                    float sign_f = (s & (1u << k)) ? -1.0f : 1.0f;
+                    sumi += sign_f * w * (float)q[j * 8 + k];
+                }
+            }
+            bsum[p] += sumi * ls;
+        }
+    }
+    const cuda_block_q8_K *ys[4] = { y0, y1, y2, y3 };
+    for (uint32_t p = 0; p < n; p++) acc[p] += 0.125f * xd * ys[p]->d * bsum[p];
+#else
     const float xd = dev_f16_to_f32(x->d);
     const uint16_t *q2 = x->qs;
     int32_t bsum[4] = {0, 0, 0, 0};
@@ -8073,6 +8351,7 @@ __device__ static void dev_dot_iq2_xxs_q8_K_block4(
     }
     const cuda_block_q8_K *ys[4] = { y0, y1, y2, y3 };
     for (uint32_t p = 0; p < n; p++) acc[p] += 0.125f * xd * ys[p]->d * (float)bsum[p];
+#endif
 }
 
 __device__ static DS4_CUDA_UNUSED void dev_dot_iq2_xxs_q8_K_block8(
@@ -8087,6 +8366,43 @@ __device__ static DS4_CUDA_UNUSED void dev_dot_iq2_xxs_q8_K_block8(
         const cuda_block_q8_K *y7,
         uint32_t n,
         float acc[8]) {
+#ifdef __HIP_PLATFORM_AMD__
+    // ROCm float dequantize path: avoids emulated __dp4a / __vcmpne4 / __vsub4
+    const float xd = dev_f16_to_f32(x->d);
+    const uint16_t *q2 = x->qs;
+    float bsum[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    const int8_t *q8[8] = {
+        y0 ? y0->qs : NULL, y1 ? y1->qs : NULL, y2 ? y2->qs : NULL, y3 ? y3->qs : NULL,
+        y4 ? y4->qs : NULL, y5 ? y5->qs : NULL, y6 ? y6->qs : NULL, y7 ? y7->qs : NULL,
+    };
+    for (int ib32 = 0; ib32 < CUDA_QK_K / 32; ib32++) {
+        const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+        const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+        q2 += 4;
+        const float ls = (float)(2u * (aux1 >> 28) + 1u);
+        for (uint32_t p = 0; p < n; p++) {
+            const int8_t *q = q8[p] + ib32 * 32;
+            float sumi = 0.0f;
+            // Decode 4 × 8 = 32 weights on the fly — 8 weights at a time to reduce register pressure
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const uint8_t gi = (uint8_t)((aux0 >> (j * 8)) & 0xff);
+                const uint32_t si = (aux1 >> (j * 7)) & 127u;
+                const uint64_t g = cuda_iq2xxs_grid[gi];
+                const uint8_t s = cuda_ksigns_iq2xs[si];
+                #pragma unroll
+                for (int k = 0; k < 8; k++) {
+                    float w = (float)(int8_t)((g >> (k * 8)) & 0xff);
+                    float sign_f = (s & (1u << k)) ? -1.0f : 1.0f;
+                    sumi += sign_f * w * (float)q[j * 8 + k];
+                }
+            }
+            bsum[p] += sumi * ls;
+        }
+    }
+    const cuda_block_q8_K *ys[8] = { y0, y1, y2, y3, y4, y5, y6, y7 };
+    for (uint32_t p = 0; p < n; p++) acc[p] += 0.125f * xd * ys[p]->d * bsum[p];
+#else
     const float xd = dev_f16_to_f32(x->d);
     const uint16_t *q2 = x->qs;
     int32_t bsum[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -8112,6 +8428,7 @@ __device__ static DS4_CUDA_UNUSED void dev_dot_iq2_xxs_q8_K_block8(
     }
     const cuda_block_q8_K *ys[8] = { y0, y1, y2, y3, y4, y5, y6, y7 };
     for (uint32_t p = 0; p < n; p++) acc[p] += 0.125f * xd * ys[p]->d * (float)bsum[p];
+#endif
 }
 
 __device__ static void dev_q4_K_get_scale_min(
@@ -8129,6 +8446,16 @@ __device__ static void dev_q4_K_get_scale_min(
 }
 
 __device__ __forceinline__ static int32_t dev_dot_q4_32(const uint8_t *qs, const int8_t *q8, int shift) {
+#ifdef __HIP_PLATFORM_AMD__
+    // ROCm float scalar loop: avoids emulated __dp4a
+    int32_t sum = 0;
+    #pragma unroll
+    for (uint32_t i = 0; i < 32u; i++) {
+        const int32_t v = (qs[i] >> shift) & 0x0f;
+        sum += v * (int32_t)q8[i];
+    }
+    return sum;
+#else
     int32_t sum = 0;
     #pragma unroll
     for (uint32_t i = 0; i < 32u; i += 4u) {
@@ -8136,6 +8463,7 @@ __device__ __forceinline__ static int32_t dev_dot_q4_32(const uint8_t *qs, const
         sum = __dp4a(v, *(const int32_t *)(q8 + i), sum);
     }
     return sum;
+#endif
 }
 
 __device__ static float dev_dot_q4_K_q8_K_block(const cuda_block_q4_K *x, const cuda_block_q8_K *y) {

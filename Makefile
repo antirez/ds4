@@ -30,6 +30,9 @@ ROCM_PATH ?= /opt/rocm
 GPU_CC = $(ROCM_PATH)/bin/hipcc
 ROCM_ARCH ?= gfx1151
 GPU_CFLAGS ?= -O3 -ffast-math -fno-finite-math-only -pthread -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
+ifeq ($(ROCM_ARCH),gfx1151)
+GPU_CFLAGS += -DAMD_RDNA_3_5
+endif
 GPU_LDLIBS = -lm -pthread -L$(ROCM_PATH)/lib -lhipblas
 EXTRA_DEPS = ds4_rocm.h
 else
