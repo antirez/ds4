@@ -40,6 +40,9 @@
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
 #endif
+#ifdef DS4_JACCL
+#include "jaccl_shim.h"
+#endif
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -15070,6 +15073,12 @@ struct ds4_engine {
     bool quality;
     bool metal_ready;
     bool mtp_ready;
+    /* Distributed (JACCL) */
+    void *jaccl_group;     /* jaccl_group_t, NULL when not distributed */
+    int   world_size;      /* total ranks (1 when single-node) */
+    int   rank;            /* this process's rank */
+    int   expert_start;    /* first expert owned by this rank */
+    int   expert_end;      /* one-past-last expert owned */
 };
 
 static bool cpu_directional_steering_enabled(

@@ -73,6 +73,7 @@ typedef struct {
     bool warm_weights;
     bool quality;
     bool inspect_only;
+    bool distributed;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
