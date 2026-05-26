@@ -8305,6 +8305,54 @@ extern "C" int ds4_gpu_dsv4_turbo3_kv_dequant_to_scratch_tensor(
     return cuda_ok(cudaGetLastError(), "turbo3_kv_dequant_to_scratch launch");
 }
 
+/* Phase 3a comp-cache pack: thin wrapper around the existing
+ * turbo3_kv_pack_kernel with n_rot=0 (compressor output has no RoPE
+ * tail).  Used by ds4.c to pack the per-layer attn_comp_cache when
+ * g_ds4_comp_dtype == DS4_KV_TURBO3.  Direct write, no ring-wrap
+ * (comp cache is linear, not a ring). */
+extern "C" int ds4_gpu_dsv4_turbo3_comp_pack_tensor(
+        const ds4_gpu_tensor *src,
+        ds4_gpu_tensor       *dst,
+        uint32_t              n_rows,
+        uint64_t              dst_first_row,
+        uint32_t              head_dim,
+        uint64_t              dst_row_bytes) {
+    if (!src || !dst) return 0;
+    if (n_rows == 0) return 1;
+    if (src->bytes < (uint64_t)n_rows * head_dim * sizeof(float)) return 0;
+    if (dst->bytes < (dst_first_row + n_rows) * dst_row_bytes) return 0;
+    /* Reuse turbo3_kv_pack_kernel with n_rot=0; advance dst by first_row. */
+    turbo3_kv_pack_kernel<<<n_rows, 64>>>(
+            (const float *)src->ptr,
+            (unsigned char *)dst->ptr + dst_first_row * dst_row_bytes,
+            n_rows, head_dim, /* n_rot */ 0u, dst_row_bytes,
+            ds4_turbo_signs_enabled_dev());
+    return cuda_ok(cudaGetLastError(), "turbo3_comp_pack launch");
+}
+
+/* Phase 3a comp-cache dequant: thin wrapper around
+ * turbo3_kv_dequant_to_scratch_kernel with n_rot=0.  Reads `n_rows`
+ * packed comp rows starting at `src_first_row` into a float scratch
+ * tensor sized [n_rows, head_dim]. */
+extern "C" int ds4_gpu_dsv4_turbo3_comp_dequant_to_scratch_tensor(
+        const ds4_gpu_tensor *src,
+        ds4_gpu_tensor       *dst,
+        uint64_t              src_first_row,
+        uint32_t              n_rows,
+        uint32_t              head_dim,
+        uint64_t              src_row_bytes) {
+    if (!src || !dst) return 0;
+    if (n_rows == 0) return 1;
+    if (src->bytes < (src_first_row + n_rows) * src_row_bytes) return 0;
+    if (dst->bytes < (uint64_t)n_rows * head_dim * sizeof(float)) return 0;
+    turbo3_kv_dequant_to_scratch_kernel<<<n_rows, 64>>>(
+            (const unsigned char *)src->ptr + src_first_row * src_row_bytes,
+            (float *)dst->ptr,
+            n_rows, head_dim, /* n_rot */ 0u, src_row_bytes,
+            ds4_turbo_signs_enabled_dev());
+    return cuda_ok(cudaGetLastError(), "turbo3_comp_dequant_to_scratch launch");
+}
+
 extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_rows, uint32_t head_dim) {
     if (!x || n_rows == 0 || head_dim != 128u ||
         x->bytes < (uint64_t)n_rows * head_dim * sizeof(float)) {

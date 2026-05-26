@@ -54,6 +54,11 @@ typedef enum {
 } ds4_kv_dtype;
 const char *ds4_kv_dtype_name(ds4_kv_dtype dtype);
 int ds4_kv_dtype_from_name(const char *name, ds4_kv_dtype *out);
+/* Seed the active dtype globals.  engine_open does this too; useful
+ * for tooling (ds4-bench's footprint estimator) that runs before
+ * engine_open and needs the per-dtype row-bytes math to be correct. */
+void ds4_kv_set_active_dtype(ds4_kv_dtype dtype);
+void ds4_comp_set_active_dtype(ds4_kv_dtype dtype);
 
 /* Packed turbo3 byte layout per cache row.  GROUP_SIZE is 64 - the same WHT
  * group cadence the float-sim quantizer uses, one matched-norm L2 scale per
@@ -80,6 +85,27 @@ int ds4_kv_dtype_from_name(const char *name, ds4_kv_dtype *out);
  * the storage byte layout changes. */
 #define DS4_TURBO3_GROUP_SIZE 64u
 uint64_t ds4_kv_row_bytes(uint32_t head_dim, uint32_t n_rot, ds4_kv_dtype dtype);
+
+/* Phase 3a: compressed cache row layout (per-layer attn_comp_cache).
+ * Distinct from the SWA raw cache:
+ *   - rows are head_dim-wide (512), NO RoPE tail (n_rot=0)
+ *   - data section : head_dim * 3 / 8 bytes (= 192 at head_dim=512)
+ *   - scale section: head_dim / GROUP_SIZE bytes (= 8 at head_dim=512)
+ *   - total       : 200 bytes/row (vs 2048 float / 1024 f16 baseline)
+ * Compression ratio: 10.24x vs float, 5.12x vs f16 staging.
+ *
+ * The pack/dequant kernels reuse the same primitives as the raw cache —
+ * they already handle the n_rot=0 case via early-out on the RoPE block.
+ * Comp pack callers just pass row_bytes = ds4_comp_row_bytes(...) and
+ * n_rot = 0 to the existing turbo3_kv_pack_kernel /
+ * turbo3_kv_dequant_to_scratch_kernel.
+ *
+ * TQ+ quality on comp output (post-learned-compressor projection) is
+ * uncertain — the original TQ+ codebook + matched-norm L2 scale assume
+ * near-Gaussian per-group distribution, which holds for MLA latents but
+ * may not for compressor outputs.  Quality gate via --perplexity-file
+ * is mandatory before enabling for production. */
+uint64_t ds4_comp_row_bytes(uint32_t head_dim, ds4_kv_dtype dtype);
 
 /* Footprint estimator broken down by section, parameterized on dtype.  Used by
  * `ds4-bench --print-kv-footprint` to print side-by-side fp8 vs turbo3 sizes.
@@ -156,6 +182,15 @@ typedef struct {
      * swaps in the TurboQuant+ 3-bit-per-element quality simulation on CUDA and
      * CPU reference.  See ds4_kv_dtype above for the algorithm summary. */
     ds4_kv_dtype kv_dtype;
+    /* Phase 3a: compressed-cache dtype.  Independent of kv_dtype — ds4-asym
+     * allows packing the per-layer attn_comp_cache separately from the SWA
+     * raw cache.  Default DS4_KV_FP8 keeps the historical float-sim path;
+     * DS4_KV_TURBO3 packs comp rows to 200 bytes (10.24x vs float).
+     *
+     * Quality is uncertain: TQ+'s Lloyd-Max codebook assumes Gaussian-ish
+     * input which holds for MLA latents but may not for compressor outputs
+     * — caller must verify with --perplexity-file before production use. */
+    ds4_kv_dtype comp_dtype;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
