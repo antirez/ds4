@@ -1213,6 +1213,12 @@ typedef struct {
     bool warm_weights;
     bool quality;
     bool self_test_extractors;
+    /* KV cache dtype and compressor-cache dtype.  Default fp8 / fp8 keeps
+     * the historical eval path.  Same parsing as ds4-bench so the four-
+     * question gate can validate turbo3 / turbo4 / --comp-cache builds
+     * against the deterministic expected answers. */
+    ds4_kv_dtype kv_dtype;
+    ds4_kv_dtype comp_dtype;
 } eval_config;
 
 typedef struct {
@@ -1494,6 +1500,11 @@ static void usage(FILE *fp) {
         "  --metal | --cuda | --cpu | --backend NAME\n"
         "  -t, --threads N        CPU helper threads.\n"
         "  --quality              Prefer exact kernels where applicable.\n"
+        "  --kv-cache fp8|turbo3|turbo4\n"
+        "                         KV cache compression. Default: fp8.\n"
+        "  --comp-cache fp8|turbo3\n"
+        "                         Compressor-cache dtype (CUDA-only). Pairs with\n"
+        "                         --kv-cache turbo3 for full-KV memory shrink.\n"
         "  --warm-weights         Touch mapped tensor pages before evaluation.\n"
         "  --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n"
         "\n"
@@ -1589,6 +1600,18 @@ static eval_config parse_options(int argc, char **argv) {
             c.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--quality")) {
             c.quality = true;
+        } else if (!strcmp(arg, "--kv-cache")) {
+            const char *kv_name = need_arg(&i, argc, argv, arg);
+            if (!ds4_kv_dtype_from_name(kv_name, &c.kv_dtype)) {
+                fprintf(stderr, "ds4-eval: unknown --kv-cache value '%s' (expected fp8, turbo3 or turbo4)\n", kv_name);
+                exit(1);
+            }
+        } else if (!strcmp(arg, "--comp-cache")) {
+            const char *cc_name = need_arg(&i, argc, argv, arg);
+            if (!ds4_kv_dtype_from_name(cc_name, &c.comp_dtype)) {
+                fprintf(stderr, "ds4-eval: unknown --comp-cache value '%s' (expected fp8 or turbo3)\n", cc_name);
+                exit(1);
+            }
         } else if (!strcmp(arg, "--power")) {
             c.power_percent = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
             if (c.power_percent < 1 || c.power_percent > 100) {
@@ -3839,6 +3862,8 @@ int main(int argc, char **argv) {
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .kv_dtype = cfg.kv_dtype,
+        .comp_dtype = cfg.comp_dtype,
     };
 
     ds4_engine *engine = NULL;
