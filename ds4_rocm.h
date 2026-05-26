@@ -180,3 +180,4 @@ static __device__ __forceinline__ uint32_t __dp4a(uint32_t a, uint32_t b, uint32
              + (uint32_t)a_bytes[3] * b_bytes[3];
 }
 
+

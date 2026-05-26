@@ -29,8 +29,12 @@ ifeq ($(GPU_BACKEND),rocm)
 ROCM_PATH ?= /opt/rocm
 GPU_CC = $(ROCM_PATH)/bin/hipcc
 ROCM_ARCH ?= gfx1151
+GPU_CFLAGS ?= -O3 -fno-fast-math -fsigned-zeros -fno-finite-math-only -ffp-contract=off -pthread -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
 
-GPU_CFLAGS ?= -O3 -ffast-math -fsigned-zeros -fno-finite-math-only -pthread -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
+ifeq ($(ROCM_ARCH),gfx1151)
+GPU_CFLAGS += -DAMD_RDNA_3_5
+endif
+
 GPU_LDLIBS = -lm -pthread -L$(ROCM_PATH)/lib -lhipblas
 EXTRA_DEPS = ds4_rocm.h
 else
@@ -100,7 +104,7 @@ rocm:
 		echo "error: specify ROCM_ARCH, for example: make rocm ROCM_ARCH=gfx1151"; \
 		exit 2; \
 	fi
-	$(MAKE) ds4 ds4-server ds4-bench ds4_test ds4-eval ds4-agent GPU_BACKEND=rocm ROCM_ARCH=$(ROCM_ARCH)
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4_test ds4-eval ds4-agent GPU_BACKEND=rocm ROCM_ARCH=$(ROCM_ARCH)
 
 cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke

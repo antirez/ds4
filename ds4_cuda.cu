@@ -1984,6 +1984,99 @@ __device__ __forceinline__ static int32_t load_i8x4_i32_unaligned(const int8_t *
                      ((uint32_t)u[3] << 24));
 }
 
+#ifdef AMD_RDNA_3_5
+// ROCM, __gfx1151__ specific optimisation
+template <uint32_t ROWS_PER_BLOCK>
+__global__ static void matmul_f16_pair_warp_lds_kernel(
+        float *out0,
+        float *out1,
+        const __half *w0,
+        const __half *w1,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim) {
+
+    const uint64_t row_base = (uint64_t)blockIdx.x * ROWS_PER_BLOCK;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+
+    const uint64_t row = row_base + warp;
+    const bool valid0 = row < out0_dim;
+    const bool valid1 = row < out1_dim;
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+
+    // map to guarantee proper sumation order over the 32 warp
+
+    const uint32_t idx_by_lane[] = {
+      0, // 0
+      8, // 1
+      6, // 2
+      10, // 3
+      4, // 4
+      14, // 5
+      12, // 6
+      16, // 7
+      2, // 8
+      22, // 9
+      20, // 10
+      24, // 11
+      18, // 12
+      28, // 13
+      26, // 14
+      30, // 15
+      1, // 16
+      9, // 17
+      7, // 18
+      11, // 19
+      5, // 20
+      15, // 21
+      13, // 22
+      17, // 23
+      3, // 24
+      23, // 25
+      21, // 26
+      25, // 27
+      19, // 28
+      29, // 29
+      27,  // 30
+      31  // 31
+    };
+
+    // the condition is warp dependant only - so we can warp sum inside the condition
+    if (valid0 || valid1) {
+        const __half *wr0 = valid0 ? w0 + row * in_dim : w0;
+        const __half *wr1 = valid1 ? w1 + row * in_dim : w1;
+
+        for (uint64_t i = 0; i < in_dim; i += 32u) {
+            const uint32_t idx = idx_by_lane[lane] + i;
+            float s0 = 0.0f;
+            float s1 = 0.0f;
+
+            if (idx < in_dim) {
+                const float xv = x[idx];
+                if (valid0) s0 = __half2float(wr0[idx]) * xv;
+                if (valid1) s1 = __half2float(wr1[idx]) * xv;
+            }
+            sum0 += warp_sum_f32(s0);
+            sum1 += warp_sum_f32(s1);
+        }
+    }
+
+    if (!valid0 && !valid1) {
+        return;
+    }
+
+    if (lane == 0) {
+        if (valid0) out0[row] = sum0;
+        if (valid1) out1[row] = sum1;
+    }
+}
+#endif
+
 __device__ __forceinline__ static int32_t dot_i8x32_dp4a(const int8_t *a, const int8_t *b) {
     int32_t dot = 0;
 #pragma unroll
@@ -6429,7 +6522,24 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     }
     const __half *w0 = (const __half *)cuda_model_range_ptr(model_map, weight0_offset, weight_bytes, "f16_pair0");
     const __half *w1 = (const __half *)cuda_model_range_ptr(model_map, weight1_offset, weight_bytes, "f16_pair1");
+
     if (!w0 || !w1) return 0;
+
+#ifdef AMD_RDNA_3_5
+    constexpr uint32_t ROWS_PER_BLOCK = 8u;
+    const unsigned grid = (unsigned)((out_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK);
+    matmul_f16_pair_warp_lds_kernel<ROWS_PER_BLOCK><<<grid, ROWS_PER_BLOCK * 32>>>(
+        (float *)out0->ptr,
+        (float *)out1->ptr,
+        w0,
+        w1,
+        (const float *)x->ptr,
+        in_dim,
+        out_dim,
+        out_dim);
+
+    return cuda_ok(cudaGetLastError(), "matmul_f16_pair_warp_lds launch");
+#else
     matmul_f16_pair_ordered_chunks_kernel<<<(unsigned)out_dim, 32>>>(
         (float *)out0->ptr,
         (float *)out1->ptr,
@@ -6440,6 +6550,7 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
         out_dim,
         out_dim);
     return cuda_ok(cudaGetLastError(), "matmul_f16_pair_ordered_chunks launch");
+#endif
 }
 
 extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
