@@ -32,7 +32,18 @@ enum {
      * becomes an out-of-bounds write at long context. */
     DS4_CUDA_ATTENTION_SCORE_CAP = 8192u,
     DS4_CUDA_ATTENTION_RAW_SCORE_CAP = 256u,
-    DS4_CUDA_TOPK_MERGE_GROUP = 8u
+    DS4_CUDA_TOPK_MERGE_GROUP = 8u,
+
+    /* HISA hierarchical indexer.  BLOCK_SIZE picks the granularity of
+     * the coarse pass (rows per block representative); 128 keeps the
+     * stage-1 dot in one warp-cooperative pass and matches the paper.
+     * HEAD_DIM equals the indexer head dimension so the block rep is
+     * laid out identically to one index_comp row.  The host-side gate
+     * (n_index_comp threshold) and top-m count live with the dispatch
+     * in ds4.c since those are tuning knobs rather than kernel
+     * invariants. */
+    DS4_CUDA_HISA_BLOCK_SIZE = 128u,
+    DS4_CUDA_HISA_HEAD_DIM = 128u
 };
 
 struct ds4_gpu_tensor {
@@ -6529,6 +6540,200 @@ __global__ static void zero_kernel(float *out, uint64_t n) {
     if (i < n) out[i] = 0.0f;
 }
 
+/* HISA hierarchical indexer (arxiv 2603.28458).
+ *
+ * The flat indexer scores every compressed row at decode-token, so the
+ * scan cost grows linearly with context.  HISA cuts that to two stages:
+ * a coarse pass scores block representatives (mean of BLOCK_SIZE rows),
+ * a top-m kernel picks the best blocks, and the refine pass scores
+ * individual tokens only inside those blocks.  The math inside each
+ * per-row dot is identical to `indexer_score_one_direct_kernel` (per-
+ * head ReLU dot weighted by the learned per-head scalar), so the paper's
+ * >99% top-K IoU guarantee carries over with no weight changes.
+ *
+ * The block_reps tensor is laid out [n_blocks, HEAD_DIM] float, one row
+ * per block; n_blocks = ceil(layer_comp_cap / BLOCK_SIZE).  v1 rebuilds
+ * all reps on every dispatch.  Rebuild cost is small at 256K (~512 CTAs
+ * doing one mean each) compared to the refine savings, but an
+ * incremental update covering only the last partial block on each
+ * compressor emit is a natural follow-up. */
+
+/* Mean-pool BLOCK_SIZE consecutive rows of `index_comp` into one row of
+ * `block_reps`.  One CTA per block, one thread per output dimension; the
+ * loop body is the same arithmetic the flat indexer used to do inline
+ * for every row, just amortized across BLOCK_SIZE rows up front. */
+__global__ static void hisa_block_rep_update_kernel(
+        float       *block_reps,
+        const float *index_comp,
+        uint32_t     n_comp,
+        uint32_t     n_blocks) {
+    const uint32_t block_id = blockIdx.x;
+    const uint32_t d = threadIdx.x;
+    if (block_id >= n_blocks || d >= DS4_CUDA_HISA_HEAD_DIM) return;
+    const uint32_t row_start = block_id * DS4_CUDA_HISA_BLOCK_SIZE;
+    if (row_start >= n_comp) {
+        block_reps[(uint64_t)block_id * DS4_CUDA_HISA_HEAD_DIM + d] = 0.0f;
+        return;
+    }
+    uint32_t row_end = row_start + DS4_CUDA_HISA_BLOCK_SIZE;
+    if (row_end > n_comp) row_end = n_comp;
+    const uint32_t count = row_end - row_start;
+    float sum = 0.0f;
+    for (uint32_t r = row_start; r < row_end; r++) {
+        sum += index_comp[(uint64_t)r * DS4_CUDA_HISA_HEAD_DIM + d];
+    }
+    block_reps[(uint64_t)block_id * DS4_CUDA_HISA_HEAD_DIM + d] = sum / (float)count;
+}
+
+/* Stage 1: score block representatives.  Same per-head ReLU dot-product
+ * as `indexer_score_one_direct_kernel` but over n_blocks << n_comp.
+ * Grid: <<<n_blocks, 128>>>.  Decode-token only (n_tokens==1). */
+__global__ static void hisa_block_scores_kernel(
+        float       *block_scores,
+        const float *q,
+        const float *weights,
+        const float *block_reps,
+        uint32_t     n_blocks,
+        uint32_t     n_visible_blocks,
+        float        scale) {
+    const uint32_t b = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    if (b >= n_blocks || tid >= 128u) return;
+    if (b >= n_visible_blocks) {
+        if (tid == 0) block_scores[b] = -INFINITY;
+        return;
+    }
+
+    __shared__ float krow[128];
+    __shared__ float partial[4];
+    if (tid < 128u) krow[tid] = block_reps[(uint64_t)b * 128u + tid];
+    __syncthreads();
+
+    float total = 0.0f;
+    for (uint32_t h0 = 0; h0 < 64u; h0 += 4u) {
+        const uint32_t h = h0 + warp;
+        const float4 qv = ((const float4 *)(q + (uint64_t)h * 128u))[lane];
+        const float4 kv = ((const float4 *)krow)[lane];
+        float dot = qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
+        dot = warp_sum_f32(dot);
+        if (lane == 0) partial[warp] = fmaxf(dot, 0.0f) * weights[h] * scale;
+        __syncthreads();
+        if (tid == 0) total += partial[0] + partial[1] + partial[2] + partial[3];
+        __syncthreads();
+    }
+    if (tid == 0) block_scores[b] = total;
+}
+
+/* Top-m block selection.  Single CTA partial selection-sort across
+ * n_blocks <= 1024 floats.  Force-includes block 0 and the most recent
+ * visible block (n_visible_blocks - 1) per the HISA recency rule.
+ * Writes block ids to `sel_blocks[0..m)`. */
+__global__ static void hisa_block_topm_kernel(
+        uint32_t    *sel_blocks,
+        const float *block_scores,
+        uint32_t     n_blocks,
+        uint32_t     n_visible_blocks,
+        uint32_t     m) {
+    extern __shared__ float shm[];
+    float *sscore = shm;
+    uint32_t *sidx = (uint32_t *)(shm + n_blocks);
+    const uint32_t tid = threadIdx.x;
+    for (uint32_t i = tid; i < n_blocks; i += blockDim.x) {
+        sscore[i] = (i < n_visible_blocks) ? block_scores[i] : -INFINITY;
+        sidx[i]   = i;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        for (uint32_t pick = 0; pick < m; pick++) {
+            uint32_t best = pick;
+            float best_v = sscore[pick];
+            for (uint32_t i = pick + 1; i < n_blocks; i++) {
+                if (sscore[i] > best_v) { best_v = sscore[i]; best = i; }
+            }
+            if (best != pick) {
+                float tv = sscore[pick];   sscore[pick] = sscore[best]; sscore[best] = tv;
+                uint32_t ti = sidx[pick];  sidx[pick]   = sidx[best];   sidx[best]   = ti;
+            }
+        }
+        if (n_visible_blocks > 0) {
+            uint32_t recency = n_visible_blocks - 1u;
+            bool present = false;
+            for (uint32_t i = 0; i < m; i++) if (sidx[i] == recency) { present = true; break; }
+            if (!present) sidx[m - 1u] = recency;
+        }
+        bool zero_present = false;
+        for (uint32_t i = 0; i < m; i++) if (sidx[i] == 0u) { zero_present = true; break; }
+        if (!zero_present && m >= 2u) sidx[m - 2u] = 0u;
+        for (uint32_t i = 0; i < m; i++) sel_blocks[i] = sidx[i];
+    }
+}
+
+/* Stage 2: refine - score every row inside each selected block.  Grid:
+ * <<<m, 128>>>.  One CTA per selected block; the 128 threads cooperate
+ * to dot-product against each of the up-to-DS4_CUDA_HISA_BLOCK_SIZE rows in
+ * sequence.  Writes into the flat scores[n_comp] array.  Non-candidate
+ * rows must be pre-initialized to -INF (see hisa_scores_init_neg_inf). */
+__global__ static void hisa_refine_scores_kernel(
+        float          *scores,
+        const float    *q,
+        const float    *weights,
+        const float    *index_comp,
+        const uint32_t *sel_blocks,
+        uint32_t        n_comp,
+        uint32_t        n_visible,
+        float           scale) {
+    const uint32_t blk_slot = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    if (tid >= 128u) return;
+
+    const uint32_t block_id = sel_blocks[blk_slot];
+    const uint32_t row_start = block_id * DS4_CUDA_HISA_BLOCK_SIZE;
+    if (row_start >= n_comp) return;
+
+    uint32_t row_end = row_start + DS4_CUDA_HISA_BLOCK_SIZE;
+    if (row_end > n_comp) row_end = n_comp;
+
+    __shared__ float krow[128];
+    __shared__ float partial[4];
+
+    for (uint32_t c = row_start; c < row_end; c++) {
+        if (c >= n_visible) {
+            if (tid == 0) scores[c] = -INFINITY;
+            __syncthreads();
+            continue;
+        }
+        if (tid < 128u) krow[tid] = index_comp[(uint64_t)c * 128u + tid];
+        __syncthreads();
+
+        float total = 0.0f;
+        for (uint32_t h0 = 0; h0 < 64u; h0 += 4u) {
+            const uint32_t h = h0 + warp;
+            const float4 qv = ((const float4 *)(q + (uint64_t)h * 128u))[lane];
+            const float4 kv = ((const float4 *)krow)[lane];
+            float dot = qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
+            dot = warp_sum_f32(dot);
+            if (lane == 0) partial[warp] = fmaxf(dot, 0.0f) * weights[h] * scale;
+            __syncthreads();
+            if (tid == 0) total += partial[0] + partial[1] + partial[2] + partial[3];
+            __syncthreads();
+        }
+        if (tid == 0) scores[c] = total;
+        __syncthreads();
+    }
+}
+
+/* Initialize scores[0..n_comp) to -INF so the refine pass can overwrite
+ * only the candidate rows while non-candidates stay at -INF and drop
+ * out of the downstream top-K. */
+__global__ static void hisa_scores_init_neg_inf_kernel(float *scores, uint32_t n_comp) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_comp) scores[i] = -INFINITY;
+}
+
 __global__ static void indexer_scores_kernel(
         float *scores,
         const float *q,
@@ -7682,6 +7887,90 @@ extern "C" int ds4_gpu_indexer_score_one_tensor(
         float                   scale) {
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, 1, 0,
                                  n_head, head_dim, 1, scale, 0);
+}
+
+/* HISA launchers (arxiv 2603.28458).  Pair with the existing top-K
+ * kernel; the scores tensor layout is preserved (per-row floats with
+ * non-candidate rows at -INF) so downstream code is unchanged. */
+
+/* Recompute all n_blocks block reps from index_comp.  Cheap at 256K:
+ * ~512 CTAs each doing a 128-row mean.  Called at the top of
+ * `ds4_gpu_hisa_score_one_tensor` so block_reps reflects the latest
+ * comp_kv state without needing incremental update wiring in the
+ * compressor emit path. */
+extern "C" int ds4_gpu_hisa_block_rep_update_tensor(
+        ds4_gpu_tensor       *block_reps,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t              n_comp,
+        uint32_t              n_blocks) {
+    if (!block_reps || !index_comp || n_blocks == 0) return 0;
+    if (block_reps->bytes < (uint64_t)n_blocks * DS4_CUDA_HISA_HEAD_DIM * sizeof(float)) return 0;
+    if (index_comp->bytes < (uint64_t)n_comp * DS4_CUDA_HISA_HEAD_DIM * sizeof(float)) return 0;
+    hisa_block_rep_update_kernel<<<n_blocks, DS4_CUDA_HISA_HEAD_DIM>>>(
+            (float *)block_reps->ptr,
+            (const float *)index_comp->ptr,
+            n_comp, n_blocks);
+    return cuda_ok(cudaGetLastError(), "hisa_block_rep_update launch");
+}
+
+/* Decode-token entry point.  Score block reps, pick top-m blocks, refine
+ * within selected blocks.  Writes per-row scores in the same layout as
+ * the flat indexer.  Returns 0 on launch error; callers fall back to
+ * the flat path on a zero return. */
+extern "C" int ds4_gpu_hisa_score_one_tensor(
+        ds4_gpu_tensor       *scores,
+        ds4_gpu_tensor       *sel_blocks,
+        ds4_gpu_tensor       *block_scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *block_reps,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t              n_comp,
+        uint32_t              n_blocks,
+        uint32_t              n_visible_blocks,
+        uint32_t              n_visible_rows,
+        uint32_t              m,
+        float                 scale) {
+    if (!scores || !sel_blocks || !block_scores ||
+        !q || !weights || !block_reps || !index_comp) return 0;
+    if (n_comp == 0u || n_blocks == 0u || m == 0u) return 0;
+    if (scores->bytes < (uint64_t)n_comp * sizeof(float)) return 0;
+    if (sel_blocks->bytes < (uint64_t)m * sizeof(uint32_t)) return 0;
+    if (block_scores->bytes < (uint64_t)n_blocks * sizeof(float)) return 0;
+
+    hisa_block_rep_update_kernel<<<n_blocks, DS4_CUDA_HISA_HEAD_DIM>>>(
+            (float *)block_reps->ptr,
+            (const float *)index_comp->ptr,
+            n_comp, n_blocks);
+    if (!cuda_ok(cudaGetLastError(), "hisa block_rep update inline launch")) return 0;
+
+    hisa_scores_init_neg_inf_kernel<<<(n_comp + 255u) / 256u, 256>>>(
+            (float *)scores->ptr, n_comp);
+    if (!cuda_ok(cudaGetLastError(), "hisa scores init launch")) return 0;
+
+    hisa_block_scores_kernel<<<n_blocks, 128>>>(
+            (float *)block_scores->ptr,
+            (const float *)q->ptr,
+            (const float *)weights->ptr,
+            (const float *)block_reps->ptr,
+            n_blocks, n_visible_blocks, scale);
+    if (!cuda_ok(cudaGetLastError(), "hisa block_scores launch")) return 0;
+
+    const size_t shm_bytes = (size_t)n_blocks * (sizeof(float) + sizeof(uint32_t));
+    hisa_block_topm_kernel<<<1, 256, shm_bytes>>>(
+            (uint32_t *)sel_blocks->ptr,
+            (const float *)block_scores->ptr,
+            n_blocks, n_visible_blocks, m);
+    if (!cuda_ok(cudaGetLastError(), "hisa block_topm launch")) return 0;
+
+    hisa_refine_scores_kernel<<<m, 128>>>(
+            (float *)scores->ptr,
+            (const float *)q->ptr,
+            (const float *)weights->ptr,
+            (const float *)index_comp->ptr,
+            (const uint32_t *)sel_blocks->ptr,
+            n_comp, n_visible_rows, scale);
+    return cuda_ok(cudaGetLastError(), "hisa refine_scores launch");
 }
 
 extern "C" int ds4_gpu_indexer_scores_prefill_tensor(

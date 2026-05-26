@@ -87,6 +87,33 @@ int ds4_gpu_indexer_score_one_tensor(
         uint32_t                head_dim,
         float                   scale);
 
+/* HISA hierarchical indexer (arxiv 2603.28458).  Two-stage block-coarse
+ * + token-refine scan; replaces the flat O(n_comp) indexer at decode-
+ * token with O(n_blocks + m * BLOCK_SIZE).  Block size is 128 rows, so
+ * at 65K rows the coarse stage walks ~512 blocks instead.  Output uses
+ * the same per-row scores layout as the flat indexer (non-candidate
+ * rows are -INF) so the downstream top-K kernel runs unchanged. */
+int ds4_gpu_hisa_block_rep_update_tensor(
+        ds4_gpu_tensor       *block_reps,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t              n_comp,
+        uint32_t              n_blocks);
+
+int ds4_gpu_hisa_score_one_tensor(
+        ds4_gpu_tensor       *scores,
+        ds4_gpu_tensor       *sel_blocks,
+        ds4_gpu_tensor       *block_scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *block_reps,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t              n_comp,
+        uint32_t              n_blocks,
+        uint32_t              n_visible_blocks,
+        uint32_t              n_visible_rows,
+        uint32_t              m,
+        float                 scale);
+
 int ds4_gpu_indexer_scores_prefill_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
