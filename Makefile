@@ -180,6 +180,12 @@ linenoise.o: linenoise.c linenoise.h
 jaccl_shim.o: jaccl_shim.cpp jaccl_shim.h $(JACCL_LIB)
 	$(CXX) $(CXXFLAGS) -I$(JACCL_INCLUDE) -c -o $@ jaccl_shim.cpp
 
+tests/test_jaccl_shim.o: tests/test_jaccl_shim.c jaccl_shim.h
+	$(CC) $(CFLAGS) -c -o $@ tests/test_jaccl_shim.c
+
+tests/test_jaccl_shim: tests/test_jaccl_shim.o jaccl_shim.o $(JACCL_LIB)
+	$(CC) $(CFLAGS) -o $@ tests/test_jaccl_shim.o jaccl_shim.o $(JACCL_LIB) -lc++
+
 $(JACCL_LIB):
 	@mkdir -p $(JACCL_BUILD_DIR)
 	cmake -S $(JACCL_SRC) -B $(JACCL_BUILD_DIR) -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1
