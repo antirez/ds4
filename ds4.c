@@ -4257,6 +4257,7 @@ typedef struct {
     uint64_t gate_row_bytes[DS4_MAX_EXPERT_USED];
     uint64_t up_row_bytes[DS4_MAX_EXPERT_USED];
     int n_expert;
+    bool skip_slot[DS4_MAX_EXPERT_USED]; /* distributed: true = non-owned expert */
 } matvec_iq2_xxs_mid_ctx;
 
 static void matvec_iq2_xxs_mid_worker(void *vctx, uint64_t row0, uint64_t row1) {
@@ -4265,6 +4266,13 @@ static void matvec_iq2_xxs_mid_worker(void *vctx, uint64_t row0, uint64_t row1) 
     for (uint64_t idx = row0; idx < row1; idx++) {
         const int slot = (int)(idx / ctx->out_dim);
         const uint64_t row = idx - (uint64_t)slot * ctx->out_dim;
+
+        /* In distributed mode, skip gate/up compute for non-owned experts. */
+        if (ctx->skip_slot[slot]) {
+            ctx->mid[idx] = 0.0f;
+            continue;
+        }
+
         float gate = 0.0f;
         float up = 0.0f;
 
@@ -4322,6 +4330,12 @@ static void matvec_iq2_xxs_experts_mid_prequant(
             ds4_die("IQ2_XXS expert tensors do not share a layout");
         }
         ctx.expert_weight[i] = expert_weight[i];
+#ifdef DS4_JACCL
+        ctx.skip_slot[i] = g_jaccl_group &&
+                           (selected[i] < g_expert_start || selected[i] >= g_expert_end);
+#else
+        ctx.skip_slot[i] = false;
+#endif
     }
     if (in_dim0 % QK_K != 0) ds4_die("IQ2_XXS expert row is not QK_K aligned");
 
@@ -4473,6 +4487,8 @@ typedef struct {
     uint64_t gate_row_bytes[DS4_MAX_EXPERT];
     uint64_t up_row_bytes[DS4_MAX_EXPERT];
     uint64_t xq_blocks;
+    int expert_start;   /* distributed: first owned expert */
+    int expert_end;     /* distributed: one-past-last owned expert */
 } matvec_iq2_xxs_batch_mid_ctx;
 
 static void matvec_iq2_xxs_batch_mid_worker(void *vctx, uint64_t task0, uint64_t task1) {
@@ -4482,6 +4498,18 @@ static void matvec_iq2_xxs_batch_mid_worker(void *vctx, uint64_t task0, uint64_t
         const uint32_t active_idx = (uint32_t)(task / ctx->out_dim);
         const uint64_t row = task - (uint64_t)active_idx * ctx->out_dim;
         const uint32_t expert = ctx->active_expert[active_idx];
+
+        /* In distributed mode, skip gate/up compute for non-owned experts. */
+        if ((int)expert < ctx->expert_start || (int)expert >= ctx->expert_end) {
+            const uint32_t begin = ctx->expert_offset[expert];
+            const uint32_t end = ctx->expert_offset[expert + 1];
+            for (uint32_t i = begin; i < end; i++) {
+                const uint32_t pair_id = ctx->pair_ids[i];
+                ctx->mid[(uint64_t)pair_id * ctx->out_dim + row] = 0.0f;
+            }
+            continue;
+        }
+
         const uint32_t begin = ctx->expert_offset[expert];
         const uint32_t end = ctx->expert_offset[expert + 1];
 
@@ -5989,6 +6017,8 @@ static void layer_routed_moe_batch(
         .in_dim = expert_in_dim,
         .out_dim = expert_out_dim,
         .xq_blocks = xq_blocks,
+        .expert_start = g_expert_start,
+        .expert_end   = g_expert_end,
     };
 
     for (uint32_t ai = 0; ai < n_active; ai++) {
