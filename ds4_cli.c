@@ -116,6 +116,9 @@ static void usage(FILE *fp) {
         "      Touch mapped tensor pages before generation. Slower startup, fewer first-use stalls.\n"
         "  --power N\n"
         "      Target GPU duty cycle percentage, 1..100. Default: 100\n"
+        "  --distributed\n"
+        "      Enable JACCL distributed expert parallelism across RDMA-connected nodes.\n"
+        "      Requires JACCL=1 build and JACCL_RANK/JACCL_COORDINATOR env vars.\n"
         "\n"
         "Prompt and generation:\n"
         "  -p, --prompt TEXT\n"
@@ -1494,6 +1497,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--distributed")) {
+            c.engine.distributed = true;
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logits")) {

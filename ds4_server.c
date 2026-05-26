@@ -11392,6 +11392,9 @@ static void usage(FILE *fp) {
         "      Target GPU duty cycle percentage, 1..100. Default: 100\n"
         "  --metal | --cuda | --cpu | --backend NAME\n"
         "      Select backend explicitly. Defaults to Metal on macOS and CUDA on CUDA builds.\n"
+        "  --distributed\n"
+        "      Enable JACCL distributed expert parallelism across RDMA-connected nodes.\n"
+        "      Requires JACCL=1 build and JACCL_RANK/JACCL_COORDINATOR env vars.\n"
         "\n"
         "HTTP API:\n"
         "  --host HOST\n"
@@ -11562,6 +11565,8 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = DS4_BACKEND_CPU;
+        } else if (!strcmp(arg, "--distributed")) {
+            c.engine.distributed = true;
         } else {
             server_log(DS4_LOG_DEFAULT, "ds4-server: unknown option: %s", arg);
             usage(stderr);
