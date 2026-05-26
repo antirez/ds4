@@ -5922,14 +5922,10 @@ static void layer_routed_moe_one_prealloc(
                               (int64_t)down_in_dim);
     }
     matvec_q2_k_experts_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, DS4_N_EXPERT_USED);
-#ifdef DS4_JACCL
-    if (g_jaccl_group) {
-        float *tmp = alloca(DS4_N_EMBD * sizeof(float));
-        memcpy(tmp, out, DS4_N_EMBD * sizeof(float));
-        jaccl_group_all_sum(g_jaccl_group, tmp, out,
-                            DS4_N_EMBD * sizeof(float), JACCL_FLOAT32);
-    }
-#endif
+    /* NOTE: all_sum is NOT done here — callers are responsible for
+     * synchronizing after this function returns.  This function is called
+     * from threaded contexts (routed_moe_tokens_worker via ds4_parallel_for)
+     * where concurrent all_sum would be undefined behavior. */
 
     (void)il;
 }
@@ -6250,6 +6246,14 @@ static void layer_ffn_one_decode_scratch(
                                   scratch->routed_mid_all,
                                   scratch->routed_xq,
                                   scratch->routed_midq);
+#ifdef DS4_JACCL
+    if (g_jaccl_group) {
+        float *tmp = alloca(DS4_N_EMBD * sizeof(float));
+        memcpy(tmp, scratch->ffn_moe, DS4_N_EMBD * sizeof(float));
+        jaccl_group_all_sum(g_jaccl_group, tmp, scratch->ffn_moe,
+                            DS4_N_EMBD * sizeof(float), JACCL_FLOAT32);
+    }
+#endif
     if (profile) t_routed = now_sec() - t0;
 
     t0 = profile ? now_sec() : 0.0;
@@ -6474,6 +6478,16 @@ static void layer_ffn_shared_batch(
                                           routed_midq);
         }
     }
+#ifdef DS4_JACCL
+    /* Single all_sum after all tokens are done — covers both the parallel
+     * path (where per-token all_sum inside threads would be UB) and the
+     * serial fallback. */
+    if (g_jaccl_group) {
+        jaccl_group_all_sum(g_jaccl_group, moe, moe,
+                            (size_t)n_tok * DS4_N_EMBD * sizeof(float),
+                            JACCL_FLOAT32);
+    }
+#endif
     if (profile) t_routed = now_sec() - t0;
 
     t0 = profile ? now_sec() : 0.0;
@@ -11064,6 +11078,14 @@ static void metal_graph_trace_layer_stages(
                                   routed_mid_all,
                                   routed_xq,
                                   routed_midq);
+#ifdef DS4_JACCL
+    if (g_jaccl_group) {
+        float *tmp = alloca(DS4_N_EMBD * sizeof(float));
+        memcpy(tmp, cpu_routed, DS4_N_EMBD * sizeof(float));
+        jaccl_group_all_sum(g_jaccl_group, tmp, cpu_routed,
+                            DS4_N_EMBD * sizeof(float), JACCL_FLOAT32);
+    }
+#endif
     if (layer->ffn_gate_tid2eid) {
         layer_hash_selected_experts(selected, model, layer, token);
         layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected);
@@ -11288,6 +11310,14 @@ static int metal_graph_decode_test(
                                   routed_mid_all,
                                   routed_xq,
                                   routed_midq);
+#ifdef DS4_JACCL
+    if (g_jaccl_group) {
+        float *tmp = alloca(DS4_N_EMBD * sizeof(float));
+        memcpy(tmp, cpu_routed, DS4_N_EMBD * sizeof(float));
+        jaccl_group_all_sum(g_jaccl_group, tmp, cpu_routed,
+                            DS4_N_EMBD * sizeof(float), JACCL_FLOAT32);
+    }
+#endif
     if (layer->ffn_gate_tid2eid) {
         layer_hash_selected_experts(selected, model, layer, token);
         layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected);
