@@ -9,7 +9,7 @@ struct ds4_metal_args_expert_mask {
     uint32_t n_expert_used;
 };
 
-// Single-token decode path: n_expert_used threads (typically 8).
+// Single-token decode path: zero weights for non-owned experts.
 kernel void kernel_expert_mask(
         constant ds4_metal_args_expert_mask & args,
         device const int32_t * selected [[buffer(1)]],
@@ -19,6 +19,32 @@ kernel void kernel_expert_mask(
     const int32_t expert_id = selected[tid];
     if (expert_id < args.expert_start || expert_id >= args.expert_end) {
         weights[tid] = 0.0f;
+    }
+}
+
+// Single-token compact: rewrite selected[] and weights[] to only owned experts.
+// Outputs new count to count_out[0]. Single-threaded (6 elements — not worth parallelizing).
+kernel void kernel_expert_compact(
+        constant ds4_metal_args_expert_mask & args,
+        device       int32_t * selected  [[buffer(1)]],
+        device       float   * weights   [[buffer(2)]],
+        device       uint    * count_out [[buffer(3)]],
+        uint tid [[thread_position_in_grid]]) {
+    if (tid != 0) return;
+    uint out_idx = 0;
+    for (uint i = 0; i < args.n_expert_used; i++) {
+        const int32_t expert_id = selected[i];
+        if (expert_id >= args.expert_start && expert_id < args.expert_end) {
+            selected[out_idx] = selected[i];
+            weights[out_idx] = weights[i];
+            out_idx++;
+        }
+    }
+    count_out[0] = out_idx;
+    // Zero remaining slots so kernel doesn't read garbage
+    for (uint i = out_idx; i < args.n_expert_used; i++) {
+        selected[i] = 0;
+        weights[i] = 0.0f;
     }
 }
 

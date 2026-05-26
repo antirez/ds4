@@ -1014,6 +1014,13 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
     const int64_t i11 = idx % args.ne11;
     const int64_t i12 = iid1;
 
+    // Distributed early exit: skip matmul entirely for non-owned experts
+    {
+        device const float *route_w_early =
+            (device const float *)(weights + (uint64_t)idx * act.weight_stride);
+        if (route_w_early[0] == 0.0f) return;
+    }
+
     const int nb = args.ne00 / QK_K;
     const int first_row = (tgpig.x * NSG + sgitg) * N_R0_IQ2_XXS;
     const int nb32 = nb * (QK_K / 32);
@@ -1189,6 +1196,7 @@ kernel void kernel_mul_mv_id_q4_K_pair_f32(
 // for gate and up, then the same lane that wrote each row derives the routed
 // SwiGLU input.  This keeps Q4 behavior aligned with the Q2 optimization while
 // preserving the old pair projection arithmetic.
+// Q4_K pair swiglu — gate+up matmul fused with SwiGLU + expert weight (distributed early-exit)
 kernel void kernel_mul_mv_id_q4_K_pair_swiglu_f32(
         constant ds4_metal_args_mul_mv_id & args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
@@ -1213,6 +1221,13 @@ kernel void kernel_mul_mv_id_q4_K_pair_swiglu_f32(
     const int32_t i02 = ((device const int32_t *)(ids + iid1 * args.nbi1))[idx];
     const int64_t i11 = idx % args.ne11;
     const int64_t i12 = iid1;
+
+    // Distributed early exit: skip matmul for non-owned experts
+    {
+        device const float *route_w_early =
+            (device const float *)(weights + (uint64_t)idx * act.weight_stride);
+        if (route_w_early[0] == 0.0f) return;
+    }
 
     device const char *src0_gate_cur = src0_gate + i02 * args.nb02;
     device const char *src0_up_cur   = src0_up   + i02 * args.nb02;
