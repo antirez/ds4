@@ -1,5 +1,129 @@
 #include "ds4_kvstore.h"
 #include "lz4.h"
+#include "lz4hc.h"
+
+#include <string.h>
+
+/* Byte-4 transpose for the LZ4 codec: see misc/COMPRESSED_KV_CACHE.md.
+ * Tail bytes (n % 4) pass through unmodified. */
+#if defined(__aarch64__) || defined(__arm64__)
+#  include <arm_neon.h>
+#  define KV_SHUF_HAS_NEON 1
+#else
+#  define KV_SHUF_HAS_NEON 0
+#endif
+#if defined(__SSSE3__) || defined(__AVX2__)
+#  include <tmmintrin.h>
+#  define KV_SHUF_HAS_SSSE3 1
+#else
+#  define KV_SHUF_HAS_SSSE3 0
+#endif
+
+static void kv_shuffle_byte4(const uint8_t *in, uint8_t *out, size_t n) {
+    size_t m = n >> 2;
+    size_t bytes4 = m << 2;
+#if KV_SHUF_HAS_NEON
+    /* vld4q_u8 reads 64 bytes and de-interleaves into four 16-byte
+     * lanes (lane k = positions k, k+4, k+8, ...).  Lane k is written
+     * to out[k*m + i], the k-th position-stream. */
+    size_t i = 0;
+    for (; i + 64 <= bytes4; i += 64) {
+        uint8x16x4_t v = vld4q_u8(in + i);
+        size_t pos = i >> 2;
+        vst1q_u8(out + 0 * m + pos, v.val[0]);
+        vst1q_u8(out + 1 * m + pos, v.val[1]);
+        vst1q_u8(out + 2 * m + pos, v.val[2]);
+        vst1q_u8(out + 3 * m + pos, v.val[3]);
+    }
+    for (; i < bytes4; i++) out[(i & 3) * m + (i >> 2)] = in[i];
+#elif KV_SHUF_HAS_SSSE3
+    /* pshufb each 16-byte input into AAAABBBBCCCCDDDD layout, then
+     * unpacklo_epi32 across pairs to assemble each position-stream. */
+    const __m128i sh = _mm_setr_epi8(0, 4, 8, 12,  1, 5, 9, 13,
+                                     2, 6, 10, 14, 3, 7, 11, 15);
+    size_t i = 0;
+    for (; i + 64 <= bytes4; i += 64) {
+        __m128i a = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(in + i + 0)), sh);
+        __m128i b = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(in + i + 16)), sh);
+        __m128i c = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(in + i + 32)), sh);
+        __m128i d = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(in + i + 48)), sh);
+        /* Each xmm now holds 4 4-byte position-quads.
+         * Interleave low/high 32-bit lanes pairwise so each output
+         * register accumulates all 16 bytes of one position-stream. */
+        __m128i ab_lo = _mm_unpacklo_epi32(a, b);
+        __m128i ab_hi = _mm_unpackhi_epi32(a, b);
+        __m128i cd_lo = _mm_unpacklo_epi32(c, d);
+        __m128i cd_hi = _mm_unpackhi_epi32(c, d);
+        __m128i s0 = _mm_unpacklo_epi64(ab_lo, cd_lo);  /* position 0 */
+        __m128i s1 = _mm_unpackhi_epi64(ab_lo, cd_lo);  /* position 1 */
+        __m128i s2 = _mm_unpacklo_epi64(ab_hi, cd_hi);  /* position 2 */
+        __m128i s3 = _mm_unpackhi_epi64(ab_hi, cd_hi);  /* position 3 */
+        size_t pos = i >> 2;
+        _mm_storeu_si128((__m128i *)(out + 0 * m + pos), s0);
+        _mm_storeu_si128((__m128i *)(out + 1 * m + pos), s1);
+        _mm_storeu_si128((__m128i *)(out + 2 * m + pos), s2);
+        _mm_storeu_si128((__m128i *)(out + 3 * m + pos), s3);
+    }
+    for (; i < bytes4; i++) out[(i & 3) * m + (i >> 2)] = in[i];
+#else
+    for (int b = 0; b < 4; b++)
+        for (size_t i = 0; i < m; i++)
+            out[b * m + i] = in[i * 4 + b];
+#endif
+    if (n != bytes4) memcpy(out + bytes4, in + bytes4, n - bytes4);
+}
+
+static void kv_unshuffle_byte4(const uint8_t *in, uint8_t *out, size_t n) {
+    size_t m = n >> 2;
+    size_t bytes4 = m << 2;
+#if KV_SHUF_HAS_NEON
+    /* vst4q_u8 is the inverse of vld4q_u8: take 16 bytes from each of
+     * the four input streams and interleave them back into 64 bytes
+     * of the original layout. */
+    size_t pos = 0;
+    for (; pos + 16 <= m; pos += 16) {
+        uint8x16x4_t v;
+        v.val[0] = vld1q_u8(in + 0 * m + pos);
+        v.val[1] = vld1q_u8(in + 1 * m + pos);
+        v.val[2] = vld1q_u8(in + 2 * m + pos);
+        v.val[3] = vld1q_u8(in + 3 * m + pos);
+        vst4q_u8(out + pos * 4, v);
+    }
+    for (; pos < m; pos++)
+        for (int b = 0; b < 4; b++) out[pos * 4 + b] = in[b * m + pos];
+#elif KV_SHUF_HAS_SSSE3
+    /* Interleave 16 bytes from each of the 4 input streams.  punpcklbw
+     * + punpcklwd does the 4-way interleave in a few instructions. */
+    size_t pos = 0;
+    for (; pos + 16 <= m; pos += 16) {
+        __m128i s0 = _mm_loadu_si128((const __m128i *)(in + 0 * m + pos));
+        __m128i s1 = _mm_loadu_si128((const __m128i *)(in + 1 * m + pos));
+        __m128i s2 = _mm_loadu_si128((const __m128i *)(in + 2 * m + pos));
+        __m128i s3 = _mm_loadu_si128((const __m128i *)(in + 3 * m + pos));
+        /* Interleave bytes pairwise (s0,s1) and (s2,s3). */
+        __m128i ab_lo = _mm_unpacklo_epi8(s0, s1);
+        __m128i ab_hi = _mm_unpackhi_epi8(s0, s1);
+        __m128i cd_lo = _mm_unpacklo_epi8(s2, s3);
+        __m128i cd_hi = _mm_unpackhi_epi8(s2, s3);
+        /* Interleave 16-bit halves to form the final 4-way layout. */
+        __m128i r0 = _mm_unpacklo_epi16(ab_lo, cd_lo);
+        __m128i r1 = _mm_unpackhi_epi16(ab_lo, cd_lo);
+        __m128i r2 = _mm_unpacklo_epi16(ab_hi, cd_hi);
+        __m128i r3 = _mm_unpackhi_epi16(ab_hi, cd_hi);
+        _mm_storeu_si128((__m128i *)(out + pos * 4 +  0), r0);
+        _mm_storeu_si128((__m128i *)(out + pos * 4 + 16), r1);
+        _mm_storeu_si128((__m128i *)(out + pos * 4 + 32), r2);
+        _mm_storeu_si128((__m128i *)(out + pos * 4 + 48), r3);
+    }
+    for (; pos < m; pos++)
+        for (int b = 0; b < 4; b++) out[pos * 4 + b] = in[b * m + pos];
+#else
+    for (int b = 0; b < 4; b++)
+        for (size_t i = 0; i < m; i++)
+            out[i * 4 + b] = in[b * m + i];
+#endif
+    if (n != bytes4) memcpy(out + bytes4, in + bytes4, n - bytes4);
+}
 
 /* Shared disk KV checkpoint file support.
  *
@@ -35,12 +159,7 @@
 /* Header byte 20 carries the graph-payload ABI.  It is separate from the outer
  * file version because the KVC envelope can remain stable while the serialized
  * ds4_session internals become unsafe to restore across runtime changes.
- *
- * Compressed-cache extension lives inside the previously-reserved area at
- * bytes 21..22:
- *   byte 21 = codec (NONE | LZ4)
- *   byte 22 = log2(chunk_size) when codec == LZ4 (default 24 == 16 MiB)
- * Older files wrote zero there, so they round-trip as codec=NONE / chunk=0. */
+ * Bytes 21..22 hold codec / chunk_size_log2 (see misc/COMPRESSED_KV_CACHE.md). */
 #define KV_CACHE_PAYLOAD_ABI 2u
 #define KV_CACHE_DEFAULT_MIN_TOKENS 512
 #define KV_CACHE_DEFAULT_COLD_MAX_TOKENS 30000
@@ -182,14 +301,10 @@ static void kv_logf(ds4_kvstore *kc, ds4_kvstore_log_type type,
     free(msg);
 }
 
-/* Forward declarations: the lz4 streaming block below uses these helpers,
- * whose canonical definitions live further down. */
 static void kv_le_put64(uint8_t *p, uint64_t v);
 static uint64_t kv_le_get64(const uint8_t *p);
 
-/* Cap at 8 so a save cannot monopolise cores that should still be running
- * inference.  Env override honoured for parity with DS4_THREADS;
- * --kv-cache-compression-threads overrides both. */
+/* Cap at 8 so a save cannot starve inference cores.  CLI overrides env. */
 static int kv_cache_default_compression_threads(void) {
     const char *env = getenv("DS4_KV_CACHE_COMPRESSION_THREADS");
     if (env && env[0]) {
@@ -203,30 +318,12 @@ static int kv_cache_default_compression_threads(void) {
     return (int)online;
 }
 
-/* ---------------------- KV Cache LZ4 streaming -----------------------------
- *
- * Wrap the engine's ds4_session_save_payload(fp) / load_payload(fp) FILE *
- * with a cookie FILE that compresses or decompresses chunks of the payload
- * region in parallel.  Engine signatures are unchanged.
- *
- * Payload framing on disk, when DS4_KVSTORE_CODEC_LZ4 is set in the KVC header:
- *
- *   u64 uncompressed_total
- *   u32 chunk_count
- *   for i in 0..chunk_count:
- *       u32 raw_size      (= chunk_size for all but possibly the last)
- *       u32 comp_size
- *       u8[comp_size]     LZ4_compress_default output
- *
- * DS4_KVSTORE_CODEC_NONE skips the framing and writes raw bytes.
- * See misc/COMPRESSED_KV_CACHE.md for design rationale.
- * --------------------------------------------------------------------------- */
+/* LZ4 streaming codec for the disk KV payload region.  Format and rationale
+ * live in misc/COMPRESSED_KV_CACHE.md. */
 
-/* fopencookie (glibc) and funopen (Darwin) take different callback shapes.
- * We hide both behind kv_lz4_fwrap_open() which always returns a FILE *
- * tied to a void cookie plus our write/read/close callbacks.  We never call
- * fseek on the wrapper, so no seek callback is required.  Closing the
- * wrapper does NOT close the underlying outer FILE: the caller owns that. */
+/* fopencookie / funopen wrapper.  Caller owns the outer FILE; closing the
+ * wrapper does not close it.  No seek callback because we never seek the
+ * wrapper. */
 #if defined(__APPLE__)
 typedef int    kv_lz4_io_ssize_t;
 typedef int    kv_lz4_io_size_t;
@@ -271,25 +368,33 @@ typedef struct {
     int dst_capacity;
     int out_size;
     bool ok;
+    /* Per-job byte-4 shuffle scratch (owned by writer/reader, at least
+     * dst_capacity bytes).  Compress: shuffle src -> shuf, then HC1
+     * compress shuf -> dst.  Decompress: decode src -> shuf, then
+     * unshuffle shuf -> dst. */
+    uint8_t *shuf;
 } kv_lz4_job;
 
 static void *kv_lz4_compress_worker(void *arg) {
     kv_lz4_job *j = arg;
-    j->out_size = LZ4_compress_default((const char *)j->src,
-                                       (char *)j->dst,
-                                       j->src_size,
-                                       j->dst_capacity);
+    kv_shuffle_byte4(j->src, j->shuf, (size_t)j->src_size);
+    j->out_size = LZ4_compress_HC((const char *)j->shuf,
+                                  (char *)j->dst,
+                                  j->src_size,
+                                  j->dst_capacity, 1);
     j->ok = j->out_size > 0;
     return NULL;
 }
 
 static void *kv_lz4_decompress_worker(void *arg) {
     kv_lz4_job *j = arg;
-    j->out_size = LZ4_decompress_safe((const char *)j->src,
-                                      (char *)j->dst,
-                                      j->src_size,
-                                      j->dst_capacity);
-    j->ok = j->out_size == j->dst_capacity;
+    int n = LZ4_decompress_safe((const char *)j->src,
+                                (char *)j->shuf,
+                                j->src_size, j->dst_capacity);
+    if (n != j->dst_capacity) { j->ok = false; j->out_size = n; return NULL; }
+    kv_unshuffle_byte4(j->shuf, j->dst, (size_t)n);
+    j->out_size = n;
+    j->ok = true;
     return NULL;
 }
 
@@ -327,6 +432,7 @@ typedef struct {
     int batch_cap;           /* number of slots allocated; == n_workers */
     uint8_t **raw;
     uint8_t **comp;
+    uint8_t **shuf;          /* per-slot byte-4 shuffle scratch */
     uint32_t *raw_sizes;     /* raw bytes in slot[i]; chunk_size or partial */
     int comp_capacity;       /* per-slot LZ4_compressBound(chunk_size) */
     int batch_n;             /* slots fully filled in this batch */
@@ -354,6 +460,7 @@ static void kv_lz4_writer_flush_batch(kv_lz4_writer *w) {
             .dst_capacity = w->comp_capacity,
             .out_size = 0,
             .ok = false,
+            .shuf = w->shuf[i],
         };
     }
     kv_lz4_run_batch(jobs, w->batch_n, w->n_workers, kv_lz4_compress_worker);
@@ -458,7 +565,12 @@ static int kv_lz4_writer_close(void *cookie) {
         }
     }
     int rc = w->err ? -1 : 0;
-    for (int i = 0; i < w->batch_cap; i++) { free(w->raw[i]); free(w->comp[i]); }
+    for (int i = 0; i < w->batch_cap; i++) {
+        free(w->raw[i]);
+        free(w->comp[i]);
+        if (w->shuf) free(w->shuf[i]);
+    }
+    free(w->shuf);
     free(w->raw);
     free(w->comp);
     free(w->raw_sizes);
@@ -486,12 +598,14 @@ FILE *kv_lz4_writer_open(FILE *out, uint32_t chunk_size, int n_workers) {
     w->comp_capacity = comp_bound;
     w->raw = calloc((size_t)n_workers, sizeof(uint8_t *));
     w->comp = calloc((size_t)n_workers, sizeof(uint8_t *));
+    w->shuf = calloc((size_t)n_workers, sizeof(uint8_t *));
     w->raw_sizes = calloc((size_t)n_workers, sizeof(uint32_t));
-    if (!w->raw || !w->comp || !w->raw_sizes) goto fail;
+    if (!w->raw || !w->comp || !w->shuf || !w->raw_sizes) goto fail;
     for (int i = 0; i < n_workers; i++) {
         w->raw[i] = malloc(chunk_size);
         w->comp[i] = malloc((size_t)comp_bound);
-        if (!w->raw[i] || !w->comp[i]) goto fail;
+        w->shuf[i] = malloc(chunk_size);
+        if (!w->raw[i] || !w->comp[i] || !w->shuf[i]) goto fail;
     }
     FILE *fp = kv_lz4_fwrap_open(w, "wb",
                                  kv_lz4_writer_write, NULL, kv_lz4_writer_close);
@@ -501,6 +615,7 @@ fail:
     if (w) {
         if (w->raw) { for (int i = 0; i < n_workers; i++) free(w->raw[i]); free(w->raw); }
         if (w->comp) { for (int i = 0; i < n_workers; i++) free(w->comp[i]); free(w->comp); }
+        if (w->shuf) { for (int i = 0; i < n_workers; i++) free(w->shuf[i]); free(w->shuf); }
         free(w->raw_sizes);
         free(w);
     }
@@ -518,6 +633,7 @@ typedef struct {
     int batch_cap;
     uint8_t **raw;          /* per-slot decompressed scratch */
     uint8_t **comp;         /* per-slot compressed input scratch */
+    uint8_t **shuf;         /* per-slot byte-4 unshuffle scratch */
     int comp_capacity;
     uint32_t *raw_sizes;    /* per-slot uncompressed size for the current batch */
     uint32_t *comp_sizes;   /* per-slot compressed size for the current batch */
@@ -601,6 +717,7 @@ static void kv_lz4_reader_fill_batch(kv_lz4_reader *r) {
             .dst_capacity = (int)r->raw_sizes[i],
             .out_size = 0,
             .ok = false,
+            .shuf = r->shuf[i],
         };
     }
     kv_lz4_run_batch(jobs, n, r->n_workers, kv_lz4_decompress_worker);
@@ -642,9 +759,14 @@ static kv_lz4_io_ssize_t kv_lz4_reader_read(void *cookie, char *buf, kv_lz4_io_s
 
 static int kv_lz4_reader_close(void *cookie) {
     kv_lz4_reader *r = cookie;
-    for (int i = 0; i < r->batch_cap; i++) { free(r->raw[i]); free(r->comp[i]); }
+    for (int i = 0; i < r->batch_cap; i++) {
+        free(r->raw[i]);
+        free(r->comp[i]);
+        if (r->shuf) free(r->shuf[i]);
+    }
     free(r->raw);
     free(r->comp);
+    free(r->shuf);
     free(r->raw_sizes);
     free(r->comp_sizes);
     free(r);
@@ -654,6 +776,8 @@ static int kv_lz4_reader_close(void *cookie) {
 /* Public entry: wrap `in` so subsequent reads transparently decompress.
  * payload_bytes is the on-disk payload byte count from the KVC header
  * (covers framing + all chunks).  chunk_size is also from the header.
+ * The reader always applies the byte-4 unshuffle after each chunk
+ * decode, matching the writer's mandatory shuffle pass.
  * If uncompressed_total_out != NULL, the framing header is read eagerly
  * so the caller learns the uncompressed payload size before reading.
  * The returned FILE * must be fclose()d when the caller is done. */
@@ -676,13 +800,15 @@ FILE *kv_lz4_reader_open(FILE *in, uint64_t payload_bytes,
     r->payload_bytes = payload_bytes;
     r->raw = calloc((size_t)n_workers, sizeof(uint8_t *));
     r->comp = calloc((size_t)n_workers, sizeof(uint8_t *));
+    r->shuf = calloc((size_t)n_workers, sizeof(uint8_t *));
     r->raw_sizes = calloc((size_t)n_workers, sizeof(uint32_t));
     r->comp_sizes = calloc((size_t)n_workers, sizeof(uint32_t));
-    if (!r->raw || !r->comp || !r->raw_sizes || !r->comp_sizes) goto fail;
+    if (!r->raw || !r->comp || !r->shuf || !r->raw_sizes || !r->comp_sizes) goto fail;
     for (int i = 0; i < n_workers; i++) {
         r->raw[i] = malloc(chunk_size);
         r->comp[i] = malloc((size_t)comp_bound);
-        if (!r->raw[i] || !r->comp[i]) goto fail;
+        r->shuf[i] = malloc(chunk_size);
+        if (!r->raw[i] || !r->comp[i] || !r->shuf[i]) goto fail;
     }
     if (uncompressed_total_out) {
         if (!kv_lz4_reader_read_framing(r)) goto fail;
@@ -696,6 +822,7 @@ fail:
     if (r) {
         if (r->raw) { for (int i = 0; i < n_workers; i++) free(r->raw[i]); free(r->raw); }
         if (r->comp) { for (int i = 0; i < n_workers; i++) free(r->comp[i]); free(r->comp); }
+        if (r->shuf) { for (int i = 0; i < n_workers; i++) free(r->shuf[i]); free(r->shuf); }
         free(r->raw_sizes);
         free(r->comp_sizes);
         free(r);

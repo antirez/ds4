@@ -4211,7 +4211,6 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
 
     char load_err[160] = {0};
     if (ok && hdr.payload_bytes == 0) {
-        /* Empty-payload session (transcript only, no live KV state). */
         ds4_tokens rebuilt = {0};
         ds4_tokenize_rendered_chat(w->engine, text, &rebuilt);
         expected_tokens = (uint32_t)rebuilt.len;
@@ -4352,9 +4351,7 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     }
 
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
-    /* Stamp codec=NONE, chunk_size_log2=0 now; the actual codec is patched
-     * back after the payload region is written below.  ext_flags drives the
-     * session-title trailer that lives after the payload. */
+    /* Header is patched with the real codec and on-disk size after the write. */
     const uint8_t ext_flags = session_identity ? DS4_KVSTORE_EXT_SESSION_TITLE : 0;
     ds4_kvstore_fill_header(h, (uint8_t)model_id, (uint8_t)quant_bits,
                             ds4_kvstore_reason_code(reason),
@@ -5790,7 +5787,6 @@ static bool agent_worker_strip_session(agent_worker *w, const char *prefix,
 
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
     uint64_t now = (uint64_t)time(NULL);
-    /* Payload-less stripped session file: codec=NONE, chunk_size_log2=0. */
     ds4_kvstore_fill_header(h, hdr.model_id, hdr.quant_bits,
                             hdr.reason, hdr.ext_flags,
                             DS4_KVSTORE_CODEC_NONE, 0,

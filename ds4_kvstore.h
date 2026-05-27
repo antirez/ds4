@@ -21,7 +21,7 @@
  * log2(chunk_size) for codec == LZ4.  Bytes 7 and 20 are used by upstream
  * for model_id and KV_CACHE_PAYLOAD_ABI respectively. */
 #define DS4_KVSTORE_CODEC_NONE 0u
-#define DS4_KVSTORE_CODEC_LZ4  1u
+#define DS4_KVSTORE_CODEC_LZ4  1u   /* lz4-HC1 + byte-4 NEON/SSSE3 shuffle */
 
 /* MAX bounds the chunk size read from the header so a tampered file cannot
  * trigger a gigabyte allocation.  See misc/COMPRESSED_KV_CACHE.md. */
