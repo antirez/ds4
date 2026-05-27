@@ -256,6 +256,44 @@ static int test_batch_dim_mismatch(void) {
     return fail;
 }
 
+static int test_zero_norm(void) {
+    float src[DIM] = {0};
+    float dst[DIM];
+    ds4_row_planar3 comp;
+    memset(&comp, 0, sizeof(comp));
+
+    ds4_planar3_quantize_row(src, &comp);
+    ds4_planar3_dequantize_row(&comp, dst);
+
+    int fail = 0;
+    for (int i = 0; i < DIM; i++) {
+        if (dst[i] != 0.0f) {
+            fail += expect(0, "zero-norm dequant should produce zeros");
+            break;
+        }
+    }
+    printf("test_zero_norm: all_zeros=%s -- %s\n", fail ? "no" : "yes", fail ? "FAIL" : "OK");
+    return fail;
+}
+
+static int test_single_element(void) {
+    float src[DIM] = {0};
+    src[42] = 3.7f;
+    float dst[DIM];
+    ds4_row_planar3 comp;
+
+    ds4_planar3_quantize_row(src, &comp);
+    ds4_planar3_dequantize_row(&comp, dst);
+
+    float cos = ds4_planar3_roundtrip_cosine(src, dst, DIM);
+    int fail = expect(cos > 0.5f,
+                      "single-element vector should preserve direction");
+    if (!fail) {
+        printf("test_single_element: cos=%f val[42]=%f -- OK\n", cos, dst[42]);
+    }
+    return fail;
+}
+
 /* ---- main ---- */
 
 int main(void) {
@@ -269,6 +307,8 @@ int main(void) {
     fail += test_compression_ratio();
     fail += test_block_independence();
     fail += test_batch_dim_mismatch();
+    fail += test_zero_norm();
+    fail += test_single_element();
 
     if (fail) {
         fprintf(stderr, "\nplanar_quant_test: %d test(s) FAILED\n", fail);

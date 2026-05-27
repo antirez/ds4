@@ -407,7 +407,6 @@ typedef struct {
     float *output_weights;
     float *output_embd;
     float *output_norm;
-    float *planar_staging;
 } ds4_cpu_decode_scratch;
 
 static const uint8_t kmask_iq2xs[8] = {
@@ -6523,6 +6522,7 @@ typedef struct {
     uint32_t n_comp;
     float *attn_comp_kv;
     ds4_row_planar3 *attn_comp_planar;
+    float *planar_staging;         /* dequant staging, same size as attn_comp_kv */
     float *attn_state_kv;
     float *attn_state_score;
 
@@ -6567,8 +6567,7 @@ static uint32_t ds4_default_prefill_cap_for_prompt(int prompt_len) {
 
 /* Allocate all CPU decode temporaries once.  This keeps generation deterministic
  * from the VM's point of view and makes accidental hot-loop malloc visible. */
-static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ctx_size,
-                                      bool planar_kv_cache) {
+static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ctx_size) {
     memset(scratch, 0, sizeof(*scratch));
     if (ctx_size == 0) ctx_size = 1;
     const uint32_t raw_cap = ds4_default_raw_cap(ctx_size);
@@ -6641,8 +6640,6 @@ static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ct
     scratch->output_weights = xmalloc((size_t)DS4_N_HC * sizeof(float));
     scratch->output_embd = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
     scratch->output_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-    scratch->planar_staging = planar_kv_cache ?
-        xmalloc_zeroed((size_t)comp_cap * DS4_N_HEAD_DIM, sizeof(float)) : NULL;
 }
 
 static void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch) {
@@ -6691,7 +6688,6 @@ static void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch) {
     free(scratch->next);
     free(scratch->cur);
     free(scratch->plain);
-    free(scratch->planar_staging);
     memset(scratch, 0, sizeof(*scratch));
 }
 
@@ -6722,6 +6718,8 @@ static void kv_cache_init(ds4_kv_cache *cache, uint32_t ctx_size, uint32_t raw_c
             cache->layer[il].attn_comp_kv = xmalloc_zeroed((size_t)comp_cap * DS4_N_HEAD_DIM, sizeof(float));
             cache->layer[il].attn_comp_planar = planar_kv_cache ?
                 xmalloc_zeroed(comp_cap, sizeof(ds4_row_planar3)) : NULL;
+            cache->layer[il].planar_staging = planar_kv_cache ?
+                xmalloc_zeroed((size_t)comp_cap * DS4_N_HEAD_DIM, sizeof(float)) : NULL;
             cache->layer[il].attn_state_kv = xmalloc_zeroed((size_t)attn_width * attn_rows, sizeof(float));
             cache->layer[il].attn_state_score = xmalloc((size_t)attn_width * attn_rows * sizeof(float));
             for (uint64_t i = 0; i < (uint64_t)attn_width * attn_rows; i++) {
@@ -6748,6 +6746,7 @@ static void kv_cache_free(ds4_kv_cache *cache) {
         free(cache->layer[il].raw_kv);
         free(cache->layer[il].attn_comp_kv);
         free(cache->layer[il].attn_comp_planar);
+        free(cache->layer[il].planar_staging);
         free(cache->layer[il].attn_state_kv);
         free(cache->layer[il].attn_state_score);
         free(cache->layer[il].index_comp_kv);
@@ -6755,14 +6754,6 @@ static void kv_cache_free(ds4_kv_cache *cache) {
         free(cache->layer[il].index_state_score);
     }
     memset(cache, 0, sizeof(*cache));
-}
-
-static bool kv_cache_uses_planar(const ds4_kv_cache *cache) {
-    if (!cache) return false;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        if (cache->layer[il].attn_comp_planar) return true;
-    }
-    return false;
 }
 
 /* Append to the raw SWA cache.  Once full, it slides by one row. */
@@ -6782,13 +6773,12 @@ static void kv_cache_push_raw(ds4_layer_cache *cache, const float *kv) {
 }
 
 /* Return comp_kv pointer for attention: dequantize from Planar3 if present. */
-static const float *comp_kv_for_attn(const ds4_layer_cache *layer,
-                                       float *planar_staging) {
+static const float *comp_kv_for_attn(const ds4_layer_cache *layer) {
     if (layer->attn_comp_planar && layer->n_comp > 0) {
-        if (!planar_staging) ds4_die("Planar3 compressed KV staging buffer is missing");
-        ds4_planar3_dequantize(layer->attn_comp_planar, planar_staging,
+        if (!layer->planar_staging) ds4_die("Planar3 compressed KV staging buffer is missing");
+        ds4_planar3_dequantize(layer->attn_comp_planar, layer->planar_staging,
                                 layer->n_comp, DS4_N_HEAD_DIM);
-        return planar_staging;
+        return layer->planar_staging;
     }
     return layer->attn_comp_kv;
 }
@@ -7546,13 +7536,10 @@ static void layer_attention_raw_swa_one(
                                                       il, pos);
         }
 
-        float *planar_staging_local = cache->attn_comp_planar ?
-            xmalloc((size_t)cache->n_comp * DS4_N_HEAD_DIM * sizeof(float)) : NULL;
         layer_attention_mixed_one(heads, model, layer, q,
                                   cache->raw_kv, cache->n_raw,
-                                  comp_kv_for_attn(cache, planar_staging_local), cache->n_comp,
+                                  comp_kv_for_attn(cache), cache->n_comp,
                                   comp_allowed);
-        free(planar_staging_local);
     } else {
         layer_attention_rows_one(heads, model, layer, q, cache->raw_kv, cache->n_raw);
     }
@@ -7804,13 +7791,10 @@ static void layer_attention_raw_swa_batch(
 
             if (!prefix_batch_attn) {
                 tx = profile ? now_sec() : 0.0;
-                float *ps = cache->attn_comp_planar ?
-                    xmalloc((size_t)cache->n_comp * DS4_N_HEAD_DIM * sizeof(float)) : NULL;
                 layer_attention_mixed_one(heads + (uint64_t)t * q_dim, model, layer, q_t,
                                           cache->raw_kv, cache->n_raw,
-                                          comp_kv_for_attn(cache, ps), cache->n_comp,
+                                          comp_kv_for_attn(cache), cache->n_comp,
                                           comp_allowed);
-                free(ps);
                 if (profile) t_tl_attn_rows += now_sec() - tx;
             }
         } else {
@@ -7838,16 +7822,8 @@ static void layer_attention_raw_swa_batch(
 
     if (prefix_batch_attn) {
         double tx = profile ? now_sec() : 0.0;
-        float *prefix_planar_staging = NULL;
-        const float *comp_kv_for_prefix;
-        if (cache->attn_comp_planar && cache->n_comp > 0) {
-            prefix_planar_staging = xmalloc((size_t)cache->n_comp * DS4_N_HEAD_DIM * sizeof(float));
-            ds4_planar3_dequantize(cache->attn_comp_planar, prefix_planar_staging,
-                                    cache->n_comp, DS4_N_HEAD_DIM);
-            comp_kv_for_prefix = prefix_planar_staging;
-        } else {
-            comp_kv_for_prefix = cache->attn_comp_kv ? cache->attn_comp_kv : kv;
-        }
+        const float *comp_kv_for_prefix = comp_kv_for_attn(cache);
+        if (!comp_kv_for_prefix) comp_kv_for_prefix = kv;
         if (!heads) {
             heads = xmalloc((size_t)n_tok * q_dim * sizeof(heads[0]));
         }
@@ -7885,7 +7861,6 @@ static void layer_attention_raw_swa_batch(
             }
         }
         if (profile) t_tl_inv_rope += now_sec() - tx;
-        free(prefix_planar_staging);
     }
     if (profile) t_token_loop = now_sec() - t0;
 
@@ -8058,7 +8033,7 @@ static void layer_forward_raw_swa_one(
     if (ratio != 0) {
         layer_attention_mixed_one_decode_scratch(scratch->heads, model, layer, scratch->q,
                                                  cache->raw_kv, cache->n_raw,
-                                                 comp_kv_for_attn(cache, scratch->planar_staging), cache->n_comp,
+                                                 comp_kv_for_attn(cache), cache->n_comp,
                                                  comp_allowed,
                                                  scratch);
     } else {
@@ -8162,7 +8137,7 @@ static void forward_token_raw_swa_cpu(
             if (ctx_guess < ctx_from_comp) ctx_guess = ctx_from_comp;
         }
     }
-    cpu_decode_scratch_init(&scratch, ctx_guess, false);
+    cpu_decode_scratch_init(&scratch, ctx_guess);
     forward_token_raw_swa_cpu_decode_scratch(logits, model, weights, cache, token, pos,
                                              NULL, 0.0f, 0.0f, &scratch);
     cpu_decode_scratch_free(&scratch);
@@ -8295,8 +8270,7 @@ static void prefill_layer_major_cpu(
             }
         } else {
             if (!decode_scratch_ready) {
-                cpu_decode_scratch_init(&decode_scratch, (uint32_t)n_tok,
-                                        kv_cache_uses_planar(cache));
+                cpu_decode_scratch_init(&decode_scratch, (uint32_t)n_tok);
                 decode_scratch_ready = true;
             }
             for (uint64_t t = 0; t < n_tok; t++) {
@@ -9824,6 +9798,7 @@ static bool metal_graph_quantize_attn_comp_planar(
         uint32_t       first_row,
         uint32_t       rows) {
     if (!g->layer_attn_comp_planar[il] || rows == 0) return true;
+    if (DS4_GPU_ATTN_COMP_CACHE_F16 && rows > g->attn_comp_stage_cap) return false;
     const uint64_t fp32_row = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
     const uint64_t planar_row = (uint64_t)4 * 50;
     ds4_gpu_tensor *src = DS4_GPU_ATTN_COMP_CACHE_F16
@@ -16147,7 +16122,7 @@ static int generate_raw_swa_cpu(
     ds4_kv_cache cache;
     kv_cache_init(&cache, (uint32_t)ctx_size, 0, false);
     ds4_cpu_decode_scratch decode_scratch;
-    cpu_decode_scratch_init(&decode_scratch, (uint32_t)ctx_size, false);
+    cpu_decode_scratch_init(&decode_scratch, (uint32_t)ctx_size);
 
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
     int pos = prompt->len;
@@ -18314,8 +18289,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->prefill_cap = ds4_default_prefill_cap_for_prompt(ctx_size);
         kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0,
                       e->planar_kv_cache);
-        cpu_decode_scratch_init(&s->cpu_scratch, (uint32_t)ctx_size,
-                                  e->planar_kv_cache);
+        cpu_decode_scratch_init(&s->cpu_scratch, (uint32_t)ctx_size);
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         *out = s;
         return 0;
@@ -19444,6 +19418,10 @@ int ds4_session_ctx(ds4_session *s) {
     return s->ctx_size;
 }
 
+/* Dump the first compressed layer's FP32 KV rows to a binary file.
+ * Layout: uint32_t n_rows, uint32_t dim, then n_rows*dim float32 values.
+ * Only dumps the first layer with compression; different layers may have
+ * different counts. Requires --cpu backend. */
 int ds4_session_dump_comp_kv(ds4_session *s, const char *path, char *err, size_t errlen) {
     if (!s || !path) {
         payload_set_err(err, errlen, "invalid compressed KV dump request");

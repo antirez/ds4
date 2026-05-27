@@ -24,7 +24,23 @@ static inline float fp16_to_fp32(uint16_t h) {
     uint32_t exp  = (h >> 10) & 0x1Fu;
     uint32_t mant = h & 0x3FFu;
     if (exp == 0) {
-        uint32_t f = sign | mant;
+        if (mant == 0) {
+            uint32_t f = sign;
+            float r;
+            memcpy(&r, &f, 4);
+            return r;
+        }
+        /* Subnormal FP16: (-1)^sign * 2^-14 * (mant/1024) */
+        float f = (float)mant / 1024.0f;
+        uint32_t bits;
+        memcpy(&bits, &f, 4);
+        bits = sign | (bits & 0x7FFFFFFFu);
+        float r;
+        memcpy(&r, &bits, 4);
+        return r * 6.103515625e-5f; /* 2^-14 */
+    }
+    if (exp == 31) {
+        uint32_t f = sign | 0x7F800000u | (mant << 13);
         float r;
         memcpy(&r, &f, 4);
         return r;

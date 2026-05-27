@@ -920,12 +920,23 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16(
             continue;
         }
         if (args.comp_kv_planar != 0u) {
-            for (uint r = 0; r < n_rows; r++) {
-                if (tid < 128) dsv4_dequant_planar3_row(comp_kv,
-                                                         args.comp_row_stride,
-                                                         rows[r],
-                                                         tid,
-                                                         &kv_shared[r * 128]);
+            /* Dequant two rows per iteration: tid 0-127 handle even row,
+             * tid 128-255 handle odd row. All 256 threads participate. */
+            for (uint r = 0; r < n_rows; r += 2) {
+                if (tid < 128) {
+                    dsv4_dequant_planar3_row(comp_kv,
+                                             args.comp_row_stride,
+                                             rows[r],
+                                             tid,
+                                             &kv_shared[r * 128]);
+                }
+                if (r + 1 < n_rows && tid >= 128) {
+                    dsv4_dequant_planar3_row(comp_kv,
+                                             args.comp_row_stride,
+                                             rows[r + 1],
+                                             tid - 128,
+                                             &kv_shared[(r + 1) * 128]);
+                }
             }
         } else {
             for (uint off = (uint)tid; off < n_rows * 128u; off += 256u) {
