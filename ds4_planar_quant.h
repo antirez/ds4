@@ -13,7 +13,7 @@
  * Block layout (per 128-dim block):
  *   norm:   uint16_t (FP16)     — 2 bytes
  *   qs:     uint8_t[32]         — 2-bit quantized indices per element, 32 bytes
- *   signs:  uint8_t[16]         — 1-bit QJL signs per element, 16 bytes
+ *   signs:  uint8_t[16]         — high bit of 3-bit centroid index per element, 16 bytes
  *   Total: 50 bytes per 128-dim block
  *
  * For ds4 head_dim=512: 4 blocks per row = 200 bytes.
@@ -29,7 +29,7 @@
 typedef struct {
     uint16_t norm;                       /* FP16 group norm */
     uint8_t  qs[DS4_PLANAR3_BLOCK_DIM / 4];    /* 2-bit indices: 32 bytes */
-    uint8_t  signs[DS4_PLANAR3_BLOCK_DIM / 8]; /* 1-bit QJL signs: 16 bytes */
+    uint8_t  signs[DS4_PLANAR3_BLOCK_DIM / 8]; /* high bit of 3-bit index: 16 bytes */
 } ds4_block_planar3;
 
 /* One 512-dim row = 4 blocks = 200 bytes. */

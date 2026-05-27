@@ -4,6 +4,7 @@
 #include <math.h>
 #include <string.h>
 #include <float.h>
+#include <assert.h>
 
 /* ---- FP16 conversion (standalone, no external lib) ---- */
 
@@ -41,7 +42,7 @@ static const float DS4_PLANAR3_CENTROIDS[8] = {
     0.021460f,  0.065717f,  0.117832f,  0.190685f,
 };
 
-/* ---- Givens rotation parameters (256 pairs, seed=42) ---- */
+/* ---- Givens rotation parameters (64 pairs per 128-dim block, reused across 4 blocks) ---- */
 
 static const float DS4_PLANAR3_COS[256] = {
  0.7386546135f, 0.8607548475f,-0.7411674857f, 0.9674890637f,-0.7723053098f,-0.8056974411f,-0.0412844308f, 0.2707833052f,
@@ -226,6 +227,7 @@ void ds4_planar3_dequantize_row(const ds4_row_planar3 *src, float *dst) {
 
 size_t ds4_planar3_quantize(const float *src, void *dst,
                              size_t nrows, size_t n_per_row) {
+    assert(n_per_row == 512);
     size_t total = 0;
     for (size_t row = 0; row < nrows; row++) {
         ds4_row_planar3 *out = (ds4_row_planar3 *)((char *)dst + row * sizeof(ds4_row_planar3));
@@ -236,11 +238,11 @@ size_t ds4_planar3_quantize(const float *src, void *dst,
 
 void ds4_planar3_dequantize(const void *src, float *dst,
                               size_t nrows, size_t n_per_row) {
-    (void)n_per_row;
+    assert(n_per_row == 512);
     for (size_t row = 0; row < nrows; row++) {
         const ds4_row_planar3 *in = (const ds4_row_planar3 *)
             ((const char *)src + row * sizeof(ds4_row_planar3));
-        ds4_planar3_dequantize_row(in, dst + row * 512);
+        ds4_planar3_dequantize_row(in, dst + row * n_per_row);
     }
 }
 
