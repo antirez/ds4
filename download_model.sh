@@ -19,6 +19,16 @@ case "$OUT_DIR" in
 esac
 TOKEN=${HF_TOKEN:-}
 
+# Honor the standard HF_ENDPOINT environment variable (same convention used by
+# the official huggingface_hub Python library). This lets users behind a Hugging
+# Face mirror, e.g. https://hf-mirror.com for users in mainland China where
+# huggingface.co is hard to reach, route the download through that mirror
+# without changing the script. The default keeps the original endpoint, so
+# existing users see no behavior change. See issue #85.
+HF_ENDPOINT=${HF_ENDPOINT:-https://huggingface.co}
+# Strip a trailing slash so the URL we build below has a single separator.
+HF_ENDPOINT=${HF_ENDPOINT%/}
+
 usage() {
     cat <<EOF
 DeepSeek V4 GGUF downloader
@@ -77,6 +87,14 @@ Options:
 Environment:
   DS4_GGUF_DIR   Directory used for downloaded GGUF files.
                  Default: ./gguf
+  HF_ENDPOINT    Base URL of the Hugging Face endpoint to download from.
+                 Default: https://huggingface.co
+                 Useful when huggingface.co is hard to reach. For example,
+                 users in mainland China can set:
+                   export HF_ENDPOINT=https://hf-mirror.com
+                 The same variable is honored by the official huggingface_hub
+                 Python library, so the setting is shared.
+  HF_TOKEN       Hugging Face access token, used when --token is not given.
 
 After main-model downloads the script updates:
   ./ds4flash.gguf -> <download directory>/<selected model>
@@ -146,7 +164,7 @@ download_one() {
     out="$OUT_DIR/$file"
     part="$out.part"
     aria2_part="$out.aria2"
-    url="https://huggingface.co/$REPO/resolve/main/$file"
+    url="$HF_ENDPOINT/$REPO/resolve/main/$file"
 
     mkdir -p "$OUT_DIR"
 
@@ -162,7 +180,7 @@ download_one() {
     fi
 
     echo "Downloading $file"
-    echo "from https://huggingface.co/$REPO"
+    echo "from $HF_ENDPOINT/$REPO"
     echo "If the download stops, run the same command again to resume it."
 
     if [ -n "$TOKEN" ]; then
