@@ -1,8 +1,13 @@
 CC ?= cc
 UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
 
 ifeq ($(UNAME_S),Darwin)
+ifeq ($(UNAME_M),arm64)
 NATIVE_CPU_FLAG ?= -mcpu=native
+else
+NATIVE_CPU_FLAG ?= -march=native
+endif
 else
 NATIVE_CPU_FLAG ?= -march=native
 endif
