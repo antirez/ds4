@@ -9741,6 +9741,14 @@ static void ds4_gpu_fill_static_mixed_prefill_mask(
     }
 }
 
+static int ds4_gpu_encode_planar3_dequant_to_f16(
+        id<MTLCommandBuffer>   cb,
+        id<MTLBuffer>          src,
+        NSUInteger             src_off,
+        id<MTLBuffer>          dst,
+        NSUInteger             dst_off,
+        uint32_t               n_rows);
+
 static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long(
         id<MTLCommandBuffer> __strong *cbp,
         ds4_gpu_tensor      *heads,
@@ -9757,7 +9765,10 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long
         uint32_t               window,
         uint32_t               ratio,
         uint32_t               n_head,
-        uint32_t               head_dim) {
+        uint32_t               head_dim,
+        bool                   comp_kv_planar,
+        id<MTLBuffer>          comp_kv_planar_buf,
+        NSUInteger             comp_kv_planar_off) {
     if (!cbp || !*cbp) return 0;
     id<MTLCommandBuffer> cb = *cbp;
     if (head_dim != 512 || n_head == 0 || n_tokens == 0 || ratio == 0) {
@@ -9851,17 +9862,24 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long
         return 0;
     }
     DS4_METAL_PROFILE_FLASH_ATTN_STAGE("copy_raw");
-    if (n_comp &&
-        !ds4_gpu_encode_copy_to_f16_1d(cb,
-                                       compbuf,
-                                       ds4_gpu_tensor_offset(comp_kv),
-                                       comp_kv_f16 != 0,
-                                       g_flash_attn_kv_buffer,
-                                       (NSUInteger)n_tokens * row_bytes_f16,
-                                       n_comp * head_dim)) {
-        return 0;
-    }
     if (n_comp) {
+        if (comp_kv_planar) {
+            if (!ds4_gpu_encode_planar3_dequant_to_f16(cb,
+                    comp_kv_planar_buf, comp_kv_planar_off,
+                    g_flash_attn_kv_buffer,
+                    (NSUInteger)n_tokens * row_bytes_f16,
+                    n_comp)) {
+                return 0;
+            }
+        } else if (!ds4_gpu_encode_copy_to_f16_1d(cb,
+                            compbuf,
+                            ds4_gpu_tensor_offset(comp_kv),
+                            comp_kv_f16 != 0,
+                            g_flash_attn_kv_buffer,
+                            (NSUInteger)n_tokens * row_bytes_f16,
+                            n_comp * head_dim)) {
+            return 0;
+        }
         DS4_METAL_PROFILE_FLASH_ATTN_STAGE("copy_comp");
     }
 
@@ -10032,7 +10050,10 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_vec(
         uint32_t               window,
         uint32_t               ratio,
         uint32_t               n_head,
-        uint32_t               head_dim) {
+        uint32_t               head_dim,
+        bool                   comp_kv_planar,
+        id<MTLBuffer>          comp_kv_planar_buf,
+        NSUInteger             comp_kv_planar_off) {
     if (!cbp || !*cbp) return 0;
     id<MTLCommandBuffer> cb = *cbp;
     if (head_dim != 512 || n_head == 0 || n_tokens == 0 || ratio == 0) {
@@ -10127,13 +10148,21 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_vec(
     }
     DS4_METAL_PROFILE_FLASH_ATTN_STAGE("copy_raw");
     if (n_comp) {
-        if (!ds4_gpu_encode_copy_to_f16_1d(cb,
-                                           compbuf,
-                                           ds4_gpu_tensor_offset(comp_kv),
-                                           comp_kv_f16 != 0,
-                                           g_flash_attn_kv_buffer,
-                                           (NSUInteger)n_tokens * row_bytes_f16,
-                                           n_comp * head_dim)) {
+        if (comp_kv_planar) {
+            if (!ds4_gpu_encode_planar3_dequant_to_f16(cb,
+                    comp_kv_planar_buf, comp_kv_planar_off,
+                    g_flash_attn_kv_buffer,
+                    (NSUInteger)n_tokens * row_bytes_f16,
+                    n_comp)) {
+                return 0;
+            }
+        } else if (!ds4_gpu_encode_copy_to_f16_1d(cb,
+                            compbuf,
+                            ds4_gpu_tensor_offset(comp_kv),
+                            comp_kv_f16 != 0,
+                            g_flash_attn_kv_buffer,
+                            (NSUInteger)n_tokens * row_bytes_f16,
+                            n_comp * head_dim)) {
             return 0;
         }
         DS4_METAL_PROFILE_FLASH_ATTN_STAGE("copy_comp");
@@ -10291,6 +10320,9 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec(
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
         uint32_t               comp_kv_f16,
+        bool                   comp_kv_planar,
+        id<MTLBuffer>          comp_kv_planar_buf,
+        NSUInteger             comp_kv_planar_off,
         const ds4_gpu_tensor *comp_mask,
         uint32_t               use_comp_mask,
         uint32_t               n_tokens,
@@ -10315,7 +10347,10 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec(
                                                                                        window,
                                                                                        ratio,
                                                                                        n_head,
-                                                                                       head_dim);
+                                                                                       head_dim,
+                                                                                       comp_kv_planar,
+                                                                                       comp_kv_planar_buf,
+                                                                                       comp_kv_planar_off);
     }
     return ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_vec(cbp,
                                                                            heads,
@@ -10332,7 +10367,10 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec(
                                                                            window,
                                                                            ratio,
                                                                            n_head,
-                                                                           head_dim);
+                                                                           head_dim,
+                                                                           comp_kv_planar,
+                                                                           comp_kv_planar_buf,
+                                                                           comp_kv_planar_off);
 }
 
 static int ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
@@ -10813,7 +10851,10 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         const ds4_gpu_tensor *comp_mask,
         uint32_t               use_mask,
         uint32_t               n_head,
-        uint32_t               head_dim) {
+        uint32_t               head_dim,
+        bool                   comp_kv_planar,
+        id<MTLBuffer>          comp_kv_planar_buf,
+        NSUInteger             comp_kv_planar_off) {
     const uint32_t n_keys = n_raw + n_comp;
     if (head_dim != 512 || n_head == 0 || n_raw == 0 || n_keys == 0 ||
         raw_cap < n_raw || n_keys < n_raw) {
@@ -10933,13 +10974,21 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         return 0;
     }
     if (n_comp) {
-        if (!ds4_gpu_encode_copy_to_f16_1d(cb,
-                                           compbuf,
-                                           ds4_gpu_tensor_offset(comp_kv),
-                                           comp_kv_f16 != 0,
-                                           g_flash_attn_kv_buffer,
-                                           (NSUInteger)n_raw * row_bytes_f16,
-                                           n_comp * head_dim)) {
+        if (comp_kv_planar) {
+            if (!ds4_gpu_encode_planar3_dequant_to_f16(cb,
+                    comp_kv_planar_buf, comp_kv_planar_off,
+                    g_flash_attn_kv_buffer,
+                    (NSUInteger)n_raw * row_bytes_f16,
+                    n_comp)) {
+                return 0;
+            }
+        } else if (!ds4_gpu_encode_copy_to_f16_1d(cb,
+                            compbuf,
+                            ds4_gpu_tensor_offset(comp_kv),
+                            comp_kv_f16 != 0,
+                            g_flash_attn_kv_buffer,
+                            (NSUInteger)n_raw * row_bytes_f16,
+                            n_comp * head_dim)) {
             return 0;
         }
     }
@@ -11318,7 +11367,10 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
         uint32_t               window,
         uint32_t               ratio,
         uint32_t               n_head,
-        uint32_t               head_dim) {
+        uint32_t               head_dim,
+        bool                   comp_kv_planar,
+        id<MTLBuffer>          comp_kv_planar_buf,
+        NSUInteger             comp_kv_planar_off) {
     if (n_comp == 0) {
         return ds4_gpu_encode_flash_attention_decode_raw_batch_heads(cb,
                                                                        heads,
@@ -11434,15 +11486,27 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
                                          kvoff,
                                          g_flash_attn_kv_buffer,
                                          0,
-                                         n_raw * head_dim) ||
-        !ds4_gpu_encode_copy_to_f16_1d(cb,
-                                       compbuf,
-                                       ds4_gpu_tensor_offset(comp_kv),
-                                       comp_kv_f16 != 0,
-                                       g_flash_attn_kv_buffer,
-                                       (NSUInteger)n_raw * row_bytes_f16,
-                                       n_comp * head_dim)) {
+                                         n_raw * head_dim)) {
         return 0;
+    }
+    if (n_comp) {
+        if (comp_kv_planar) {
+            if (!ds4_gpu_encode_planar3_dequant_to_f16(cb,
+                    comp_kv_planar_buf, comp_kv_planar_off,
+                    g_flash_attn_kv_buffer,
+                    (NSUInteger)n_raw * row_bytes_f16,
+                    n_comp)) {
+                return 0;
+            }
+        } else if (!ds4_gpu_encode_copy_to_f16_1d(cb,
+                            compbuf,
+                            ds4_gpu_tensor_offset(comp_kv),
+                            comp_kv_f16 != 0,
+                            g_flash_attn_kv_buffer,
+                            (NSUInteger)n_raw * row_bytes_f16,
+                            n_comp * head_dim)) {
+            return 0;
+        }
     }
 
     ds4_gpu_fill_mixed_decode_batch_mask((uint16_t *)[mask_buffer contents],
@@ -11722,7 +11786,8 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim) {
+        uint32_t                head_dim,
+        uint32_t                comp_kv_planar) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
         n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
@@ -11767,7 +11832,14 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
                                                                        window,
                                                                        ratio,
                                                                        n_head,
-                                                                       head_dim)) {
+                                                                       head_dim,
+                                                                       comp_kv_planar != 0,
+                                                                       comp_kv_planar
+                                                                           ? ds4_gpu_tensor_buffer(comp_kv)
+                                                                           : nil,
+                                                                       comp_kv_planar
+                                                                           ? ds4_gpu_tensor_offset(comp_kv)
+                                                                           : 0)) {
             return 0;
         }
 
@@ -11956,6 +12028,7 @@ int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
+        uint32_t                comp_kv_planar,
         uint32_t                n_tokens,
         uint32_t                n_comp,
         uint32_t                window,
@@ -11993,6 +12066,13 @@ int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
                                                                                 raw_kv,
                                                                                 comp_kv,
                                                                                 comp_kv_f16,
+                                                                                comp_kv_planar != 0,
+                                                                                comp_kv_planar
+                                                                                    ? ds4_gpu_tensor_buffer(comp_kv)
+                                                                                    : nil,
+                                                                                comp_kv_planar
+                                                                                    ? ds4_gpu_tensor_offset(comp_kv)
+                                                                                    : 0,
                                                                                 NULL,
                                                                                 0,
                                                                                 n_tokens,
@@ -12057,6 +12137,9 @@ int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
                                                                                 raw_kv,
                                                                                 comp_kv,
                                                                                 comp_kv_f16,
+                                                                                false,
+                                                                                nil,
+                                                                                0,
                                                                                 comp_mask,
                                                                                 1,
                                                                                 n_tokens,
@@ -12090,7 +12173,8 @@ int ds4_gpu_attention_decode_heads_tensor(
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_mask,
         uint32_t                n_head,
-        uint32_t                head_dim) {
+        uint32_t                head_dim,
+        uint32_t                comp_kv_planar) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!heads || !model_map || !q || !raw_kv ||
         n_raw == 0 || n_head == 0 || head_dim == 0 ||
@@ -12174,7 +12258,14 @@ int ds4_gpu_attention_decode_heads_tensor(
                                                              comp_mask,
                                                              use_mask,
                                                              n_head,
-                                                             head_dim)) {
+                                                             head_dim,
+                                                             comp_kv_planar != 0,
+                                                             comp_kv_planar
+                                                                 ? ds4_gpu_tensor_buffer(comp_kv)
+                                                                 : nil,
+                                                             comp_kv_planar
+                                                                 ? ds4_gpu_tensor_offset(comp_kv)
+                                                                 : 0)) {
             return 0;
         }
 

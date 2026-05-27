@@ -10392,12 +10392,13 @@ static bool metal_graph_encode_decode_layer(
                                                          g->q, raw_cache, n_raw,
                                                          raw_cap,
                                                          raw_start,
-                                                         n_comp ? comp_cache : NULL,
+                                                         n_comp ? metal_graph_attn_comp_for_attention(g, il) : NULL,
                                                          metal_graph_attn_comp_cache_is_f16(),
                                                          n_comp,
                                                          NULL,
                                                          0,
-                                                         DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
+                                                         DS4_N_HEAD, DS4_N_HEAD_DIM,
+                                                         n_comp ? metal_graph_attn_comp_is_planar(g, il) : 0) != 0;
         }
     }
     DS4_METAL_PROFILE_DECODE_STAGE("attention");
@@ -12928,7 +12929,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                              layer->attn_sinks->abs_offset,
                                                                              g->batch_q,
                                                                              g->layer_raw_cache[il],
-                                                                             g->layer_attn_comp_cache[il],
+                                                                             metal_graph_attn_comp_for_attention(g, il),
                                                                              metal_graph_attn_comp_cache_is_f16(),
                                                                              use_comp_mask ? g->comp_mask : NULL,
                                                                              use_comp_mask,
@@ -12941,7 +12942,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                              g->raw_window,
                                                                              ratio,
                                                                              DS4_N_HEAD,
-                                                                             DS4_N_HEAD_DIM) != 0;
+                                                                             DS4_N_HEAD_DIM,
+                                                                             metal_graph_attn_comp_is_planar(g, il)) != 0;
                 }
             }
             if (ok) batch_attention_done = true;
@@ -13046,8 +13048,9 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                        layer->attn_sinks->abs_offset,
                                                                        g->batch_q,
                                                                        g->batch_kv,
-                                                                       g->layer_attn_comp_cache[il],
+                                                                       metal_graph_attn_comp_for_attention(g, il),
                                                                        metal_graph_attn_comp_cache_is_f16(),
+                                                                       metal_graph_attn_comp_is_planar(g, il),
                                                                        n_tokens,
                                                                        n_comp,
                                                                        g->raw_window,
@@ -13166,13 +13169,14 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                  n_raw,
                                                                  g->raw_cap,
                                                                  raw_start,
-                                                                 cur_comp ? g->layer_attn_comp_cache[il] : NULL,
+                                                                 cur_comp ? metal_graph_attn_comp_for_attention(g, il) : NULL,
                                                                  metal_graph_attn_comp_cache_is_f16(),
                                                                  cur_comp,
                                                                  comp_mask,
                                                                  n_selected,
                                                                  DS4_N_HEAD,
-                                                                 DS4_N_HEAD_DIM) != 0;
+                                                                 DS4_N_HEAD_DIM,
+                                                                 cur_comp ? metal_graph_attn_comp_is_planar(g, il) : 0) != 0;
                 }
                 ds4_gpu_tensor_free(heads_view);
                 ds4_gpu_tensor_free(kv_cache_view);
