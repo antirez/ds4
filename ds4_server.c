@@ -899,7 +899,8 @@ static const char *server_model_id_from_engine(ds4_engine *engine) {
 static bool server_model_alias_known(const char *id) {
     return id &&
            (!strcmp(id, "deepseek-v4-flash") ||
-            !strcmp(id, "deepseek-v4-pro"));
+            !strcmp(id, "deepseek-v4-pro") ||
+            !strcmp(id, "deepseek-chat"));
 }
 
 static void stop_list_clear(stop_list *stops) {
@@ -11112,6 +11113,8 @@ static bool send_models(server *s, int fd) {
     append_model_json(&b, s, "deepseek-v4-flash");
     buf_putc(&b, ',');
     append_model_json(&b, s, "deepseek-v4-pro");
+    buf_putc(&b, ',');
+    append_model_json(&b, s, "deepseek-chat");
     buf_puts(&b, "]}\n");
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -14376,6 +14379,16 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":4096") != NULL);
     buf_free(&b);
+
+    append_model_json_values(&b, "deepseek-chat", "DeepSeek V4 Flash",
+                             32768, 393216);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-chat\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":32768") != NULL);
+    buf_free(&b);
+
+    TEST_ASSERT(server_model_alias_known("deepseek-chat"));
 }
 
 static void test_client_socket_nonblocking_flag(void) {
