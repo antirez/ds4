@@ -495,6 +495,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
+        uint32_t                comp_kv_planar,
         const ds4_gpu_tensor *topk,
         uint32_t                n_tokens,
         uint32_t                pos0,
@@ -574,6 +575,12 @@ int ds4_gpu_attention_output_low_q8_tensor(
  * These kernels implement the FFN body: router probabilities/top-k or hash
  * routing, shared SwiGLU, and the IQ2_XXS/Q2_K/Q4_K routed experts.
  */
+
+int ds4_gpu_planar3_quantize_tensor(
+        const ds4_gpu_tensor *src,
+        ds4_gpu_tensor       *dst,
+        uint32_t              n_rows,
+        uint32_t              head_dim);
 
 int ds4_gpu_swiglu_tensor(
         ds4_gpu_tensor       *out,

@@ -55,7 +55,7 @@ struct ds4_metal_args_dsv4_indexed_attention {
     uint32_t window;
     uint32_t ratio;
     uint32_t comp_kv_f16;
-    uint32_t pad0;
+    uint32_t comp_kv_planar;
     uint64_t q_token_stride;
     uint64_t q_head_stride;
     uint64_t raw_row_stride;
@@ -618,6 +618,63 @@ static inline void dsv4_dequant_planar3_row(
     kv_shared[tid] = result;
 }
 
+/* ---- Planar3 GPU quantize: FP32 comp KV row → Planar3 blocks ---- */
+
+constant static const float planar3_mid[7] = {
+   -0.154259f, -0.091775f, -0.043589f, 0.0f, 0.043589f, 0.091775f, 0.154259f,
+};
+
+kernel void kernel_planar3_quantize_row(
+        device const float     *src,
+        device ds4_planar3_block *dst,
+        constant uint32_t      &n_rows,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= n_rows) return;
+    device const float *row = src + (uint64_t)gid * 512;
+    device ds4_planar3_block *blocks = dst + (uint64_t)gid * 4;
+
+    for (uint blk = 0; blk < 4; blk++) {
+        device const float *in = row + blk * 128;
+        device ds4_planar3_block *b = &blocks[blk];
+
+        float norm_sq = 0.0f;
+        for (uint j = 0; j < 128; j++) norm_sq += in[j] * in[j];
+        float grp_norm = sqrt(norm_sq);
+        float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
+
+        float rotated[128];
+        for (uint p = 0; p < 64; p++) {
+            float x0 = in[p*2] * inv_norm;
+            float x1 = in[p*2+1] * inv_norm;
+            float c = planar3_cos[p], s = planar3_sin[p];
+            rotated[p*2]   = c * x0 - s * x1;
+            rotated[p*2+1] = s * x0 + c * x1;
+        }
+
+        for (uint j = 0; j < 32; j++) b->qs[j] = 0;
+        for (uint j = 0; j < 16; j++) b->signs[j] = 0;
+
+        float recon_sq = 0.0f;
+        for (uint j = 0; j < 128; j++) {
+            uint8_t idx;
+            float v = rotated[j];
+            if      (v < planar3_mid[0]) idx = 0;
+            else if (v < planar3_mid[1]) idx = 1;
+            else if (v < planar3_mid[2]) idx = 2;
+            else if (v < planar3_mid[3]) idx = 3;
+            else if (v < planar3_mid[4]) idx = 4;
+            else if (v < planar3_mid[5]) idx = 5;
+            else if (v < planar3_mid[6]) idx = 6;
+            else                          idx = 7;
+            b->qs[j/4] |= (idx & 0x3) << ((j % 4) * 2);
+            if (idx & 0x4) b->signs[j/8] |= (1 << (j % 8));
+            recon_sq += planar3_centroids[idx] * planar3_centroids[idx];
+        }
+        float recon_norm = sqrt(recon_sq);
+        b->norm = (half)(recon_norm > 1e-10f ? grp_norm / recon_norm : grp_norm);
+    }
+}
+
 static inline half4 dsv4_load_cache_h4(
         device const char *kv,
         uint64_t row_stride,
@@ -730,7 +787,13 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8(
         if ((uint)idx >= visible) {
             break;
         }
-        if (tid < 128) {
+        if (args.comp_kv_planar != 0u) {
+            if (tid < 128) dsv4_dequant_planar3_row(comp_kv,
+                                                     args.comp_row_stride,
+                                                     (uint)idx,
+                                                     tid,
+                                                     kv_shared);
+        } else if (tid < 128) {
             kv_shared[tid] = dsv4_load_cache_h4(comp_kv,
                                                 args.comp_row_stride,
                                                 (uint)idx,
@@ -856,14 +919,24 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16(
         if (n_rows == 0) {
             continue;
         }
-        for (uint off = (uint)tid; off < n_rows * 128u; off += 256u) {
-            const uint r = off >> 7;
-            const uint c = off & 127u;
-            kv_shared[off] = dsv4_load_cache_h4(comp_kv,
-                                                args.comp_row_stride,
-                                                rows[r],
-                                                c,
-                                                args.comp_kv_f16 != 0u);
+        if (args.comp_kv_planar != 0u) {
+            for (uint r = 0; r < n_rows; r++) {
+                if (tid < 128) dsv4_dequant_planar3_row(comp_kv,
+                                                         args.comp_row_stride,
+                                                         rows[r],
+                                                         tid,
+                                                         &kv_shared[r * 128]);
+            }
+        } else {
+            for (uint off = (uint)tid; off < n_rows * 128u; off += 256u) {
+                const uint r = off >> 7;
+                const uint c = off & 127u;
+                kv_shared[off] = dsv4_load_cache_h4(comp_kv,
+                                                    args.comp_row_stride,
+                                                    rows[r],
+                                                    c,
+                                                    args.comp_kv_f16 != 0u);
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint r = 0; r < n_rows; r++) {
