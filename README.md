@@ -486,6 +486,10 @@ For browser JavaScript clients served from another origin, start the server with
 headers; it does not expose the server on the LAN. Use `--host 0.0.0.0`
 explicitly when remote machines should be able to connect.
 
+Use `--api-key KEY` to require `Authorization: Bearer KEY` on all requests
+(OPTIONS preflight is always allowed). This is recommended when binding to
+a non-localhost interface.
+
 ### Tool call handling and canonicalization
 
 DeepSeek V4 emits tool calls as [DSML text](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/encoding/README.md). Agent clients do not send that

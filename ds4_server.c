@@ -4781,6 +4781,7 @@ static bool http_response(int fd, bool enable_cors, int code, const char *type, 
     const char *reason = code == 200 ? "OK" :
                          code == 204 ? "No Content" :
                          code == 400 ? "Bad Request" :
+                         code == 401 ? "Unauthorized" :
                          code == 404 ? "Not Found" :
                          code == 409 ? "Conflict" :
                          code == 500 ? "Internal Server Error" : "Error";
@@ -11022,8 +11023,12 @@ static bool bearer_token_valid(const char *headers, size_t headers_len,
             while (v < vend && isspace((unsigned char)*v)) v++;
             while (vend > v && isspace((unsigned char)*(vend - 1))) vend--;
             size_t klen = (size_t)(vend - v);
-            return klen == strlen(expected_key) &&
-                   memcmp(v, expected_key, klen) == 0;
+            size_t elen = strlen(expected_key);
+            if (klen != elen) return false;
+            volatile int diff = 0;
+            for (size_t i = 0; i < klen; i++)
+                diff |= (unsigned char)v[i] ^ (unsigned char)expected_key[i];
+            return diff == 0;
         }
         if (p < end) p++;
     }
