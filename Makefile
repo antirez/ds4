@@ -33,7 +33,7 @@ CPU_CORE_OBJS = ds4_cpu.o
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test planar-quant-test cpu cuda cuda-spark cuda-generic cuda-regression
+.PHONY: all help clean test planar-quant-test planar-eval cpu cuda cuda-spark cuda-generic cuda-regression
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -163,6 +163,12 @@ tests/planar_quant_test: tests/planar_quant_test.c ds4_planar_quant.c ds4_planar
 planar-quant-test: tests/planar_quant_test
 	./tests/planar_quant_test
 
+tools/planar_eval: tools/planar_eval.c ds4_planar_quant.c ds4_planar_quant.h
+	$(CC) $(CFLAGS) -I. -o $@ tools/planar_eval.c -lm
+
+planar-eval: tools/planar_eval
+	./tools/planar_eval --mode ds4_realistic --rows 10000
+
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
@@ -205,4 +211,4 @@ test: ds4_test ds4-eval
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/planar_quant_test
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/planar_quant_test tools/planar_eval
