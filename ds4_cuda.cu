@@ -1940,7 +1940,7 @@ __global__ static void matmul_q8_0_preq_warp8_kernel(
         uint64_t out_dim,
         uint64_t blocks,
         int use_dp4a) {
-    uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint64_t row = (uint64_t)blockIdx.x * 16u + (threadIdx.x >> 4u);
     uint32_t lane = threadIdx.x & 31u;
     if (row >= out_dim) return;
     const unsigned char *wr = w + row * blocks * 34;
@@ -1970,7 +1970,7 @@ __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
         uint64_t out1_dim,
         uint64_t blocks,
         int use_dp4a) {
-    uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint64_t row = (uint64_t)blockIdx.x * 16u + (threadIdx.x >> 4u);
     uint32_t lane = threadIdx.x & 31u;
     if (row >= out0_dim && row >= out1_dim) return;
     float acc0 = 0.0f;
@@ -2019,7 +2019,7 @@ __global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
         uint64_t blocks,
         int has_add,
         int use_dp4a) {
-    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint64_t row = (uint64_t)blockIdx.x * 16u + (threadIdx.x >> 4u);
     const uint32_t lane = threadIdx.x & 31u;
     if (row >= out_dim) return;
     const unsigned char *wr = w + row * blocks * 34;
@@ -2063,7 +2063,7 @@ __global__ static void matmul_q8_0_preq_batch_warp8_kernel(
         uint64_t n_tok,
         uint64_t blocks,
         int use_dp4a) {
-    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint64_t row = (uint64_t)blockIdx.x * 16u + (threadIdx.x >> 4u);
     const uint64_t tok = (uint64_t)blockIdx.y;
     const uint32_t lane = threadIdx.x & 31u;
     if (row >= out_dim || tok >= n_tok) return;
@@ -2134,7 +2134,7 @@ __global__ static void grouped_q8_0_a_preq_warp8_kernel(
         uint32_t n_tokens,
         uint64_t blocks,
         int use_dp4a) {
-    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint64_t row = (uint64_t)blockIdx.x * 16u + (threadIdx.x >> 4u);
     const uint64_t tok = (uint64_t)blockIdx.y;
     const uint32_t lane = threadIdx.x & 31u;
     const uint64_t low_dim = (uint64_t)n_groups * rank;
@@ -5914,7 +5914,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
     if (n_tok == 1) {
-        matmul_q8_0_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
+        matmul_q8_0_preq_warp8_kernel<<<((unsigned)out_dim + 15u) / 16u, 256>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq,
@@ -5926,7 +5926,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 warp launch");
     }
     if (getenv("DS4_CUDA_NO_Q8_BATCH_WARP") == NULL && blocks <= 32u) {
-        dim3 bgrid(((unsigned)out_dim + 7u) / 8u, (unsigned)n_tok, 1);
+        dim3 bgrid(((unsigned)out_dim + 15u) / 16u, (unsigned)n_tok, 1);
         matmul_q8_0_preq_batch_warp8_kernel<<<bgrid, 256>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
@@ -6006,7 +6006,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair quantize launch")) return 0;
     const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
-    matmul_q8_0_pair_preq_warp8_kernel<<<((unsigned)max_out + 7u) / 8u, 256>>>(
+    matmul_q8_0_pair_preq_warp8_kernel<<<((unsigned)max_out + 15u) / 16u, 256>>>(
             (float *)out0->ptr,
             (float *)out1->ptr,
             reinterpret_cast<const unsigned char *>(w0),
@@ -6068,7 +6068,7 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     const int use_dp4a = cuda_q8_use_dp4a();
     quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand quantize launch")) return 0;
-    matmul_q8_0_hc_expand_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
+    matmul_q8_0_hc_expand_preq_warp8_kernel<<<((unsigned)out_dim + 15u) / 16u, 256>>>(
             (float *)out_hc->ptr,
             (float *)block_out->ptr,
             block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr,
@@ -7492,7 +7492,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                                                 group_dim,
                                                 blocks_a);
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a prequant launch")) return 0;
-        dim3 grid_a(((unsigned)low_dim + 7u) / 8u, (unsigned)n_tokens, 1);
+        dim3 grid_a(((unsigned)low_dim + 15u) / 16u, (unsigned)n_tokens, 1);
         grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256>>>((float *)low->ptr,
                                                           out_a,
                                                           xq,
@@ -7558,7 +7558,7 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
                                             group_dim,
                                             blocks_a);
     if (!cuda_ok(cudaGetLastError(), "attention_output_low_q8 prequant launch")) return 0;
-    dim3 grid_a(((unsigned)low_dim + 7u) / 8u, 1, 1);
+    dim3 grid_a(((unsigned)low_dim + 15u) / 16u, 1, 1);
     grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256>>>((float *)low->ptr,
                                                       out_a,
                                                       xq,
@@ -8374,8 +8374,8 @@ __global__ static void moe_gate_up_mid_qwarp32_kernel(
     if (expert_i < 0) expert_i = 0;
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
-    for (uint32_t rr = 0; rr < 4u; rr++) {
-        uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
+    for (uint32_t rr = 0; rr < 8u; rr++) {
+        uint32_t row = blockIdx.x * 256u + row_lane + rr * 16u;
         if (row >= expert_mid_dim) continue;
         const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
         const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
@@ -8436,8 +8436,8 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
         __syncthreads();
         xqb = sxq;
     }
-    for (uint32_t rr = 0; rr < 4u; rr++) {
-        uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
+    for (uint32_t rr = 0; rr < 8u; rr++) {
+        uint32_t row = blockIdx.x * 256u + row_lane + rr * 16u;
         if (row >= expert_mid_dim) continue;
         const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
         const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
@@ -9191,8 +9191,8 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
     if (expert_i < 0) expert_i = 0;
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
-    for (uint32_t rr = 0; rr < 4u; rr++) {
-        uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
+    for (uint32_t rr = 0; rr < 8u; rr++) {
+        uint32_t row = blockIdx.x * 256u + row_lane + rr * 16u;
         if (row >= expert_mid_dim) continue;
         const cuda_block_q4_K *gr = (const cuda_block_q4_K *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
         const cuda_block_q4_K *ur = (const cuda_block_q4_K *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
@@ -10172,7 +10172,7 @@ static int routed_moe_launch(
                     n_expert,
                     clamp);
             } else if (ok) {
-                dim3 qgrid((expert_mid_dim + 127u) / 128u, n_tokens * n_expert, 1);
+                dim3 qgrid((expert_mid_dim + 255u) / 256u, n_tokens * n_expert, 1);
                 if (use_decode_lut_gate && q4k_path) {
                     moe_gate_up_mid_decode_q4K_qwarp32_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
