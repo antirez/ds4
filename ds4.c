@@ -6694,7 +6694,7 @@ static void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch) {
 /* Allocate per-layer KV state: a raw sliding window for all layers, plus
  * compressed attention/indexer caches for layers whose ratio is nonzero. */
 static void kv_cache_init(ds4_kv_cache *cache, uint32_t ctx_size, uint32_t raw_cap,
-                          bool planar_kv_cache) {
+                          bool planar_kv_cache, bool planar_kv_cache_only) {
     memset(cache, 0, sizeof(*cache));
     if (raw_cap == 0) raw_cap = ds4_default_raw_cap(ctx_size);
     if (raw_cap > ctx_size) raw_cap = ctx_size;
@@ -6715,11 +6715,17 @@ static void kv_cache_init(ds4_kv_cache *cache, uint32_t ctx_size, uint32_t raw_c
             const uint32_t attn_rows = coff * ratio;
 
             cache->layer[il].comp_cap = comp_cap;
-            cache->layer[il].attn_comp_kv = xmalloc_zeroed((size_t)comp_cap * DS4_N_HEAD_DIM, sizeof(float));
+            cache->layer[il].attn_comp_kv = planar_kv_cache_only ? NULL :
+                xmalloc_zeroed((size_t)comp_cap * DS4_N_HEAD_DIM, sizeof(float));
             cache->layer[il].attn_comp_planar = planar_kv_cache ?
                 xmalloc_zeroed(comp_cap, sizeof(ds4_row_planar3)) : NULL;
             cache->layer[il].planar_staging = planar_kv_cache ?
                 xmalloc_zeroed((size_t)comp_cap * DS4_N_HEAD_DIM, sizeof(float)) : NULL;
+            /* planar-only: ensure staging is always available for dequant */
+            if (planar_kv_cache_only && !cache->layer[il].planar_staging) {
+                cache->layer[il].planar_staging =
+                    xmalloc_zeroed((size_t)comp_cap * DS4_N_HEAD_DIM, sizeof(float));
+            }
             cache->layer[il].attn_state_kv = xmalloc_zeroed((size_t)attn_width * attn_rows, sizeof(float));
             cache->layer[il].attn_state_score = xmalloc((size_t)attn_width * attn_rows * sizeof(float));
             for (uint64_t i = 0; i < (uint64_t)attn_width * attn_rows; i++) {
@@ -6787,9 +6793,13 @@ static void kv_cache_push_comp(float *rows, ds4_row_planar3 *planar_rows,
                                 uint32_t *n_rows, uint32_t cap_rows,
                                 uint32_t row_dim, const float *kv) {
     if (*n_rows >= cap_rows) ds4_die("compressed KV cache capacity exceeded");
-    float *dst = rows + (uint64_t)(*n_rows) * row_dim;
-    for (uint32_t i = 0; i < row_dim; i++) dst[i] = f16_to_f32(f32_to_f16(kv[i]));
-    if (planar_rows) ds4_planar3_quantize_row(dst, &planar_rows[*n_rows]);
+    float f16_rounded[DS4_N_HEAD_DIM];
+    for (uint32_t i = 0; i < row_dim; i++) f16_rounded[i] = f16_to_f32(f32_to_f16(kv[i]));
+    if (rows) {
+        float *dst = rows + (uint64_t)(*n_rows) * row_dim;
+        memcpy(dst, f16_rounded, (size_t)row_dim * sizeof(float));
+    }
+    if (planar_rows) ds4_planar3_quantize_row(f16_rounded, &planar_rows[*n_rows]);
     (*n_rows)++;
 }
 
@@ -9180,7 +9190,8 @@ static bool metal_graph_alloc_raw_cap(
         uint32_t                ctx_size,
         uint32_t                prefill_cap,
         bool                    enable_mtp,
-        bool                    planar_kv_cache) {
+        bool                    planar_kv_cache,
+        bool                    planar_kv_cache_only) {
     memset(g, 0, sizeof(*g));
     g->mtp_enabled = enable_mtp;
     if (raw_cap == 0) raw_cap = 1;
@@ -9282,10 +9293,12 @@ static bool metal_graph_alloc_raw_cap(
             const uint32_t coff = ratio == 4 ? 2u : 1u;
             const uint64_t attn_width = (uint64_t)coff * DS4_N_HEAD_DIM;
             const uint64_t attn_rows = (uint64_t)coff * ratio;
-            g->layer_attn_comp_cache[il] = metal_graph_alloc_kv_cache_tensor(
-                    managed_kv_cache,
-                    (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
-                    (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
+            if (!planar_kv_cache_only) {
+                g->layer_attn_comp_cache[il] = metal_graph_alloc_kv_cache_tensor(
+                        managed_kv_cache,
+                        (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
+                        (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
+            }
             if (planar_kv_cache) {
                 g->layer_attn_comp_planar[il] = metal_graph_alloc_kv_cache_tensor(
                         managed_kv_cache,
@@ -9437,7 +9450,7 @@ static bool metal_graph_alloc_raw_cap(
         layer_cache_ok = g->layer_raw_cache[il] != NULL;
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (layer_cache_ok && ratio != 0) {
-            layer_cache_ok = g->layer_attn_comp_cache[il] != NULL &&
+            layer_cache_ok = (planar_kv_cache_only || g->layer_attn_comp_cache[il] != NULL) &&
                              g->layer_attn_state_kv[il] != NULL &&
                              g->layer_attn_state_score[il] != NULL &&
                              (!planar_kv_cache || g->layer_attn_comp_planar[il] != NULL) &&
@@ -9509,7 +9522,7 @@ static bool metal_graph_alloc(
         ds4_gpu_graph *g,
         const ds4_weights     *weights,
         const ds4_layer_weights *layer) {
-    return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false, false);
+    return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false, false, false);
 }
 
 static uint32_t metal_graph_raw_span_for_batch(
@@ -9747,7 +9760,8 @@ static bool metal_graph_store_attn_comp_stage(
         uint32_t       rows) {
     if (!g || il >= DS4_N_LAYER) return false;
     if (rows == 0) return true;
-    if (!g->layer_attn_comp_cache[il] || !g->attn_comp_stage) return false;
+    if (!g->layer_attn_comp_cache[il]) return true;
+    if (!g->attn_comp_stage) return false;
     if (rows > g->attn_comp_stage_cap || first_row > g->layer_comp_cap[il] ||
         rows > g->layer_comp_cap[il] - first_row) {
         return false;
@@ -14846,7 +14860,7 @@ static int metal_graph_prompt_logits_test(
 
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, (uint32_t)n_test, false, false);
+                                        raw_cap, (uint32_t)ctx_size, (uint32_t)n_test, false, false, false);
     if (!ok) {
         metal_graph_free(&g);
         fprintf(stderr, "ds4: failed to initialize Metal graph prompt test runtime\n");
@@ -14856,7 +14870,7 @@ static int metal_graph_prompt_logits_test(
     if (memory_report) ds4_gpu_print_memory_report("after graph alloc");
 
     ds4_kv_cache cpu_cache;
-    kv_cache_init(&cpu_cache, (uint32_t)ctx_size, raw_cap, false);
+    kv_cache_init(&cpu_cache, (uint32_t)ctx_size, raw_cap, false, false);
     float *cpu_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     float *gpu_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     float *oracle_logits = NULL;
@@ -15156,6 +15170,7 @@ struct ds4_engine {
     int power_percent;
     bool quality;
     bool planar_kv_cache;
+    bool planar_kv_cache_only;
     const char *dump_comp_kv;
     bool metal_ready;
     bool mtp_ready;
@@ -16124,7 +16139,7 @@ static int generate_raw_swa_cpu(
     fprintf(stderr, "ds4: using CPU generation with layer-major prefill\n");
 
     ds4_kv_cache cache;
-    kv_cache_init(&cache, (uint32_t)ctx_size, 0, false);
+    kv_cache_init(&cache, (uint32_t)ctx_size, 0, false, false);
     ds4_cpu_decode_scratch decode_scratch;
     cpu_decode_scratch_init(&decode_scratch, (uint32_t)ctx_size);
 
@@ -16255,7 +16270,7 @@ static int generate_metal_graph_raw_swa(
     }
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false, false);
+                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false, false, false);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate GPU graph runtime\n");
         return 1;
@@ -16836,7 +16851,7 @@ static uint64_t session_cpu_payload_live_tensor_bytes(const ds4_session *s) {
 static void session_cpu_reset_cache(ds4_session *s) {
     kv_cache_free(&s->cpu_cache);
     kv_cache_init(&s->cpu_cache, (uint32_t)s->ctx_size, 0,
-                  s->engine->planar_kv_cache);
+                  s->engine->planar_kv_cache, s->engine->planar_kv_cache_only);
 }
 
 int ds4_engine_routed_quant_bits(ds4_engine *e) {
@@ -17130,20 +17145,32 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         /* Compressed rows are append-only from row zero, so the live prefix is
          * contiguous.  The two compressor state tensors hold the partial window
          * that will become the next compressed row. */
-        if (DS4_GPU_ATTN_COMP_CACHE_F16) {
-            rc = payload_write_tensor_span_f16_as_f32(fp,
-                                                      g->layer_attn_comp_cache[il],
-                                                      0,
-                                                      (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM,
-                                                      buf,
-                                                      DS4_SESSION_IO_CHUNK,
-                                                      err,
-                                                      errlen);
-        } else {
+        if (g->layer_attn_comp_cache[il]) {
+            if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+                rc = payload_write_tensor_span_f16_as_f32(fp,
+                                                          g->layer_attn_comp_cache[il],
+                                                          0,
+                                                          (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM,
+                                                          buf,
+                                                          DS4_SESSION_IO_CHUNK,
+                                                          err,
+                                                          errlen);
+            } else {
+                rc = payload_write_tensor_span(fp,
+                                               g->layer_attn_comp_cache[il],
+                                               0,
+                                               (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM * sizeof(float),
+                                               buf,
+                                               DS4_SESSION_IO_CHUNK,
+                                               err,
+                                               errlen);
+            }
+        } else if (g->layer_attn_comp_planar[il]) {
+            /* planar-only: write Planar3 bytes directly */
             rc = payload_write_tensor_span(fp,
-                                           g->layer_attn_comp_cache[il],
+                                           g->layer_attn_comp_planar[il],
                                            0,
-                                           (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM * sizeof(float),
+                                           (uint64_t)g->layer_n_comp[il] * 200,
                                            buf,
                                            DS4_SESSION_IO_CHUNK,
                                            err,
@@ -17467,56 +17494,69 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
-        if (DS4_GPU_ATTN_COMP_CACHE_F16) {
-            rc = payload_read_tensor_span_f32_as_f16(fp,
-                                                     g->layer_attn_comp_cache[il],
-                                                     0,
-                                                     (uint64_t)n_comp[il] * DS4_N_HEAD_DIM,
-                                                     buf,
-                                                     DS4_SESSION_IO_CHUNK,
-                                                     &remaining,
-                                                     err,
-                                                     errlen);
-        } else {
+        if (g->layer_attn_comp_cache[il]) {
+            if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+                rc = payload_read_tensor_span_f32_as_f16(fp,
+                                                         g->layer_attn_comp_cache[il],
+                                                         0,
+                                                         (uint64_t)n_comp[il] * DS4_N_HEAD_DIM,
+                                                         buf,
+                                                         DS4_SESSION_IO_CHUNK,
+                                                         &remaining,
+                                                         err,
+                                                         errlen);
+            } else {
+                rc = payload_read_tensor_span(fp,
+                                              g->layer_attn_comp_cache[il],
+                                              0,
+                                              (uint64_t)n_comp[il] * DS4_N_HEAD_DIM * sizeof(float),
+                                              buf,
+                                              DS4_SESSION_IO_CHUNK,
+                                              &remaining,
+                                              err,
+                                              errlen);
+            }
+            /* Rebuild Planar3 GPU cache from the restored FP32/F16 comp rows. */
+            if (rc == 0 && g->layer_attn_comp_planar[il] && n_comp[il] > 0) {
+                const uint64_t fp32_bytes = (uint64_t)n_comp[il] * DS4_N_HEAD_DIM * sizeof(float);
+                float *stage = xmalloc(fp32_bytes);
+                if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+                    uint64_t f16_bytes = (uint64_t)n_comp[il] * DS4_N_HEAD_DIM * sizeof(uint16_t);
+                    void *f16_buf = xmalloc(f16_bytes);
+                    if (ds4_gpu_tensor_read(g->layer_attn_comp_cache[il], 0, f16_buf, f16_bytes)) {
+                        for (uint64_t i = 0; i < (uint64_t)n_comp[il] * DS4_N_HEAD_DIM; i++) {
+                            stage[i] = f16_to_f32(((uint16_t *)f16_buf)[i]);
+                        }
+                    } else { rc = 1; }
+                    free(f16_buf);
+                } else {
+                    if (!ds4_gpu_tensor_read(g->layer_attn_comp_cache[il], 0, stage, fp32_bytes)) {
+                        rc = 1;
+                    }
+                }
+                if (rc == 0) {
+                    const uint64_t planar_bytes = (uint64_t)n_comp[il] * 200;
+                    void *planar_buf = xmalloc(planar_bytes);
+                    ds4_planar3_quantize(stage, planar_buf, n_comp[il], DS4_N_HEAD_DIM);
+                    if (!ds4_gpu_tensor_write(g->layer_attn_comp_planar[il], 0, planar_buf, planar_bytes)) {
+                        rc = 1;
+                    }
+                    free(planar_buf);
+                }
+                free(stage);
+            }
+        } else if (g->layer_attn_comp_planar[il]) {
+            /* planar-only: read Planar3 bytes directly, skip FP16/FP32 cache */
+            const uint64_t planar_bytes = (uint64_t)n_comp[il] * 200;
             rc = payload_read_tensor_span(fp,
-                                          g->layer_attn_comp_cache[il],
+                                          g->layer_attn_comp_planar[il],
                                           0,
-                                          (uint64_t)n_comp[il] * DS4_N_HEAD_DIM * sizeof(float),
+                                          planar_bytes,
                                           buf,
                                           DS4_SESSION_IO_CHUNK,
                                           &remaining,
                                           err,
                                           errlen);
-        }
-        /* Rebuild Planar3 GPU cache from the restored FP32/F16 comp rows.
-         * Reads the comp cache back to CPU, quantizes, and uploads. */
-        if (rc == 0 && g->layer_attn_comp_planar[il] && n_comp[il] > 0) {
-            const uint64_t fp32_bytes = (uint64_t)n_comp[il] * DS4_N_HEAD_DIM * sizeof(float);
-            float *stage = xmalloc(fp32_bytes);
-            if (DS4_GPU_ATTN_COMP_CACHE_F16) {
-                uint64_t f16_bytes = (uint64_t)n_comp[il] * DS4_N_HEAD_DIM * sizeof(uint16_t);
-                void *f16_buf = xmalloc(f16_bytes);
-                if (ds4_gpu_tensor_read(g->layer_attn_comp_cache[il], 0, f16_buf, f16_bytes)) {
-                    for (uint64_t i = 0; i < (uint64_t)n_comp[il] * DS4_N_HEAD_DIM; i++) {
-                        stage[i] = f16_to_f32(((uint16_t *)f16_buf)[i]);
-                    }
-                } else { rc = 1; }
-                free(f16_buf);
-            } else {
-                if (!ds4_gpu_tensor_read(g->layer_attn_comp_cache[il], 0, stage, fp32_bytes)) {
-                    rc = 1;
-                }
-            }
-            if (rc == 0) {
-                const uint64_t planar_bytes = (uint64_t)n_comp[il] * 200;
-                void *planar_buf = xmalloc(planar_bytes);
-                ds4_planar3_quantize(stage, planar_buf, n_comp[il], DS4_N_HEAD_DIM);
-                if (!ds4_gpu_tensor_write(g->layer_attn_comp_planar[il], 0, planar_buf, planar_bytes)) {
-                    rc = 1;
-                }
-                free(planar_buf);
-            }
-            free(stage);
         }
         if (rc == 0) rc = payload_read_tensor_span(fp,
                                                    g->layer_attn_state_kv[il],
@@ -17763,7 +17803,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
 
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false, false);
+                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false, false, false);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate imatrix Metal graph runtime\n");
         free(dataset);
@@ -18113,6 +18153,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->backend = opt->backend;
     e->quality = opt->quality;
     e->planar_kv_cache = opt->planar_kv_cache;
+    e->planar_kv_cache_only = opt->planar_kv_cache_only;
     e->dump_comp_kv = opt->dump_comp_kv;
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
     if (e->power_percent > 100) e->power_percent = 100;
@@ -18292,7 +18333,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->ctx_size = ctx_size;
         s->prefill_cap = ds4_default_prefill_cap_for_prompt(ctx_size);
         kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0,
-                      e->planar_kv_cache);
+                      e->planar_kv_cache, e->planar_kv_cache_only);
         cpu_decode_scratch_init(&s->cpu_scratch, (uint32_t)ctx_size);
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         *out = s;
@@ -18310,7 +18351,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[0],
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready,
-                                   e->planar_kv_cache))
+                                   e->planar_kv_cache, e->planar_kv_cache_only))
     {
         free(s);
         return 1;

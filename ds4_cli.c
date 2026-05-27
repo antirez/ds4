@@ -164,6 +164,9 @@ static void usage(FILE *fp) {
         "      Dump compressed KV rows (binary) after prefill for offline Planar3 eval.\n"
         "  --planar-kv-cache\n"
         "      Enable Planar3 quantization for compressed attention KV cache.\n"
+        "  --planar-kv-cache-only\n"
+        "      Only keep Planar3 compressed KV cache, skip FP16/FP32 allocation.\n"
+        "      Implies --planar-kv-cache. Saves memory at the cost of dequant overhead.\n"
         "  --dump-tokens\n"
         "      Tokenize -p/--prompt-file exactly as written, then exit without inference.\n"
         "  --dump-logits FILE\n"
@@ -1554,6 +1557,9 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.dump_comp_kv = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--planar-kv-cache")) {
             c.engine.planar_kv_cache = true;
+        } else if (!strcmp(arg, "--planar-kv-cache-only")) {
+            c.engine.planar_kv_cache = true;
+            c.engine.planar_kv_cache_only = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--server")) {

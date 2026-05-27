@@ -75,6 +75,7 @@ typedef struct {
     bool inspect_only;
     const char *dump_comp_kv;
     bool planar_kv_cache;
+    bool planar_kv_cache_only;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
