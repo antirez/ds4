@@ -4,7 +4,7 @@
 #include <math.h>
 #include <string.h>
 #include <float.h>
-#include <assert.h>
+
 
 /* ---- FP16 conversion (standalone, no external lib) ---- */
 
@@ -227,7 +227,7 @@ void ds4_planar3_dequantize_row(const ds4_row_planar3 *src, float *dst) {
 
 size_t ds4_planar3_quantize(const float *src, void *dst,
                              size_t nrows, size_t n_per_row) {
-    assert(n_per_row == 512);
+    if (n_per_row != DS4_PLANAR3_BLOCK_DIM * DS4_PLANAR3_BLOCKS_512) return 0;
     size_t total = 0;
     for (size_t row = 0; row < nrows; row++) {
         ds4_row_planar3 *out = (ds4_row_planar3 *)((char *)dst + row * sizeof(ds4_row_planar3));
@@ -238,7 +238,7 @@ size_t ds4_planar3_quantize(const float *src, void *dst,
 
 void ds4_planar3_dequantize(const void *src, float *dst,
                               size_t nrows, size_t n_per_row) {
-    assert(n_per_row == 512);
+    if (n_per_row != DS4_PLANAR3_BLOCK_DIM * DS4_PLANAR3_BLOCKS_512) return;
     for (size_t row = 0; row < nrows; row++) {
         const ds4_row_planar3 *in = (const ds4_row_planar3 *)
             ((const char *)src + row * sizeof(ds4_row_planar3));

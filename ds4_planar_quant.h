@@ -19,7 +19,9 @@
  * For ds4 head_dim=512: 4 blocks per row = 200 bytes.
  * Compared to FP16 (1024 bytes): 5.12x compression.
  *
- * Reference: ParaMind2025 PlanarQuant, RotorQuant (arXiv:2403.xxxxx)
+ * Adapted from: experolk/planar-llama (MIT License)
+ * Method: PlanarQuant -- 2D Givens rotation + Lloyd-Max 3-bit centroids,
+ *         block layout compatible with ggml block_planar3_0.
  */
 
 #define DS4_PLANAR3_BLOCK_DIM  128
@@ -46,11 +48,13 @@ size_t ds4_planar3_quantize_row(const float *src, ds4_row_planar3 *dst);
  * dst must have space for 512 floats. */
 void ds4_planar3_dequantize_row(const ds4_row_planar3 *src, float *dst);
 
-/* Quantize nrows rows. Returns total compressed bytes. */
+/* Quantize nrows rows of n_per_row dims each.
+ * n_per_row must be 512. Returns total compressed bytes, or 0 if n_per_row != 512. */
 size_t ds4_planar3_quantize(const float *src, void *dst,
                              size_t nrows, size_t n_per_row);
 
-/* Dequantize nrows rows. */
+/* Dequantize nrows rows of n_per_row dims each.
+ * n_per_row must be 512. No-op if n_per_row != 512. */
 void ds4_planar3_dequantize(const void *src, float *dst,
                               size_t nrows, size_t n_per_row);
 

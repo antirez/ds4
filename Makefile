@@ -16,8 +16,8 @@ METAL_SRCS := $(wildcard metal/*.metal)
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_metal.o
-CPU_CORE_OBJS = ds4_cpu.o
+CORE_OBJS = ds4.o ds4_metal.o ds4_planar_quant.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_planar_quant.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -28,8 +28,8 @@ NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
-CORE_OBJS = ds4.o ds4_cuda.o
-CPU_CORE_OBJS = ds4_cpu.o
+CORE_OBJS = ds4.o ds4_cuda.o ds4_planar_quant.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_planar_quant.o
 METAL_LDLIBS := $(LDLIBS)
 endif
 
@@ -164,10 +164,10 @@ planar-quant-test: tests/planar_quant_test
 	./tests/planar_quant_test
 
 tools/planar_eval: tools/planar_eval.c ds4_planar_quant.c ds4_planar_quant.h
-	$(CC) $(CFLAGS) -I. -o $@ tools/planar_eval.c -lm
+	$(CC) $(CFLAGS) -I. -o $@ tools/planar_eval.c ds4_planar_quant.c $(LDLIBS)
 
 planar-eval: tools/planar_eval
-	./tools/planar_eval --mode ds4_realistic --rows 10000
+	./tools/planar_eval --mode ds4_like --rows 10000 --queries 8
 
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
@@ -206,7 +206,7 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_test.o ds4_kvstore.o rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
-test: ds4_test ds4-eval
+test: ds4_test ds4-eval planar-quant-test
 	./ds4-eval --self-test-extractors
 	./ds4_test
 

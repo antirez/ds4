@@ -535,6 +535,89 @@ static inline void dsv4_attend_shared_h4_row_at(
                               o0, o1, o2, o3);
 }
 
+/* ---- Planar3 dequantize constants (matches ds4_planar_quant.c) ---- */
+
+constant static const float planar3_centroids[8] = {
+   -0.190685f, -0.117832f, -0.065717f, -0.021460f,
+    0.021460f,  0.065717f,  0.117832f,  0.190685f,
+};
+
+constant static const float planar3_cos[64] = {
+ 0.7386546135f, 0.8607548475f,-0.7411674857f, 0.9674890637f,-0.7723053098f,-0.8056974411f,-0.0412844308f, 0.2707833052f,
+ 0.9315500855f, 0.6698185802f, 0.9167487621f,-0.8320636749f, 0.6818146110f,-0.9108457565f,-0.0559285842f,-0.9032276273f,
+ 0.7519487143f,-0.8941103816f,-0.1039871648f,-0.6961420774f,-0.1230370328f,-0.9328963161f,-0.2905603051f, 0.4910068214f,
+ 0.7889407277f,-0.1221836656f,-0.6316579580f, 0.3128163815f,-0.9563610554f, 0.9992509484f, 0.9540294409f, 0.8902468085f,
+ 0.7543080449f,-0.8664138913f,-0.5232898593f, 0.3621287644f,-0.8825117350f, 0.8234673142f,-0.9416025877f,-0.5480425358f,
+-0.6644080281f,-0.6585279703f,-0.2460795939f, 0.9438471198f, 0.2427810431f,-0.1960992366f, 0.2403578013f,-0.8461306095f,
+ 0.0246123374f, 0.3372744620f, 0.9994974732f,-0.3494733870f, 0.7438930869f, 0.8452339768f,-0.6177822948f,-0.2662552595f,
+-0.5457068086f,-0.9985070229f, 0.7757105827f, 0.6141811609f,-0.9805000424f, 0.5425475240f,-0.5663578510f,-0.4696439803f,
+};
+
+constant static const float planar3_sin[64] = {
+-0.6740840673f,-0.5090196729f, 0.6713201404f,-0.2529129684f, 0.6352515221f,-0.5923272967f, 0.9991474152f,-0.9626403451f,
+-0.3636130989f, 0.7425247431f,-0.3994642496f,-0.5546801090f,-0.7315250039f,-0.4127469361f,-0.9984347820f, 0.4291617870f,
+-0.6592215896f,-0.4478466809f, 0.9945786595f,-0.7179040313f, 0.9924020767f, 0.3601450622f, 0.9568566680f,-0.8711557388f,
+ 0.6144692898f, 0.9925075173f, 0.7752471566f, 0.9498136044f,-0.2921875417f, 0.0386975110f,-0.2997128963f, 0.4554784000f,
+-0.6565206647f,-0.4993265271f, 0.8521547318f,-0.9321280718f,-0.4702904224f,-0.5673637390f,-0.3367263079f, 0.8364504576f,
+-0.7473700047f, 0.7525562644f,-0.9692496061f,-0.3303825557f,-0.9700810909f, 0.9805840850f,-0.9706843495f,-0.5329755545f,
+-0.9996970892f, 0.9414063692f, 0.0316982083f, 0.9369462729f, 0.6682986617f,-0.5343964100f,-0.7863491774f,-0.9639025331f,
+-0.8379761577f, 0.0546237342f,-0.6310887933f, 0.7891650796f,-0.1965190321f, 0.8400250673f,-0.8241594434f, 0.8828558922f,
+};
+
+/* Planar3 block layout: 2 bytes norm + 32 bytes qs + 16 bytes signs = 50 bytes per 128-dim.
+ * 4 blocks per 512-dim row = 200 bytes. Cos/sin tables have 64 pairs, reused across 4 blocks. */
+
+struct ds4_planar3_block { half norm; uint8_t qs[32]; uint8_t signs[16]; };
+
+static inline void dsv4_dequant_planar3_row(
+        device const char *planar_base,
+        uint64_t row_stride,
+        uint row,
+        uint tid,
+        threadgroup half4 *kv_shared) {
+    /* Each thread dequantizes one half4 (4 elements) from the packed row.
+     * tid 0..127 covers all 512 dims. */
+    device const ds4_planar3_block *blocks = (device const ds4_planar3_block *)
+        (planar_base + (uint64_t)row * row_stride);
+
+    const uint blk_idx = tid / 32;   /* 0..3 */
+    const uint sub = tid % 32;       /* 0..31 -> half4 offset within block */
+
+    device const ds4_planar3_block *blk = &blocks[blk_idx];
+    const float norm = float(blk->norm);
+
+    half4 result;
+    for (int g = 0; g < 4; g++) {
+        const uint j = sub * 4 + g;
+        const uint pair = j / 2;
+        const uint8_t qb = blk->qs[j / 4];
+        const uint shift2 = (j % 4) * 2;
+        const uint8_t sb = blk->signs[j / 8];
+        const uint shift_s = j % 8;
+        const uint idx = ((qb >> shift2) & 0x3) | (((sb >> shift_s) & 1) << 2);
+        const float raw = planar3_centroids[idx];
+
+        const uint j_other = pair * 2 + (1 - (j & 1));
+        const uint8_t qb2 = blk->qs[j_other / 4];
+        const uint shift2b = (j_other % 4) * 2;
+        const uint8_t sb2 = blk->signs[j_other / 8];
+        const uint shift_sb = j_other % 8;
+        const uint idx2 = ((qb2 >> shift2b) & 0x3) | (((sb2 >> shift_sb) & 1) << 2);
+        const float raw2 = planar3_centroids[idx2];
+
+        const float c = planar3_cos[pair];
+        const float s = planar3_sin[pair];
+        float f;
+        if ((j & 1) == 0) {
+            f = c * raw + s * raw2;
+        } else {
+            f = -s * raw + c * raw2;
+        }
+        result[g] = (half)(f * norm);
+    }
+    kv_shared[tid] = result;
+}
+
 static inline half4 dsv4_load_cache_h4(
         device const char *kv,
         uint64_t row_stride,

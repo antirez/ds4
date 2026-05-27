@@ -160,6 +160,10 @@ static void usage(FILE *fp) {
         "Diagnostics:\n"
         "  --inspect\n"
         "      Load the model and print a summary only.\n"
+        "  --dump-comp-kv FILE\n"
+        "      Dump compressed KV rows (binary) after prefill for offline Planar3 eval.\n"
+        "  --planar-kv-cache\n"
+        "      Enable Planar3 quantization for compressed attention KV cache.\n"
         "  --dump-tokens\n"
         "      Tokenize -p/--prompt-file exactly as written, then exit without inference.\n"
         "  --dump-logits FILE\n"
@@ -509,6 +513,15 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     }
     ds4_session_set_progress(session, NULL, NULL);
     ds4_session_set_display_progress(session, NULL, NULL);
+
+    if (cfg->engine.dump_comp_kv) {
+        if (ds4_session_dump_comp_kv(session, cfg->engine.dump_comp_kv, err, sizeof(err)) != 0) {
+            fprintf(stderr, "ds4: compressed KV dump failed: %s\n", err);
+            ds4_session_free(session);
+            return 1;
+        }
+    }
+
     const double t_prefill1 = cli_now_sec();
 
     int max_tokens = cfg->gen.n_predict;
@@ -1537,6 +1550,10 @@ static cli_config parse_options(int argc, char **argv) {
             exit(2);
         } else if (!strcmp(arg, "--inspect")) {
             c.inspect = true;
+        } else if (!strcmp(arg, "--dump-comp-kv")) {
+            c.engine.dump_comp_kv = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--planar-kv-cache")) {
+            c.engine.planar_kv_cache = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--server")) {

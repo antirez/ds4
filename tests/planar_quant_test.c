@@ -1,5 +1,5 @@
 /*
- * planar_quant_test.c — unit tests for Planar3 512-dim quantization
+ * planar_quant_test.c -- unit tests for Planar3 512-dim quantization
  *
  * Build:
  *   cc -O2 -Wall -Wextra -std=c99 -I. -o tests/planar_quant_test \
@@ -59,7 +59,7 @@ static int test_block_size(void) {
     fail += expect(sizeof(ds4_row_planar3) == 200,
                    "sizeof(ds4_row_planar3) should be 200");
 
-    printf("test_block_size: block=%zu row=%zu — %s\n",
+    printf("test_block_size: block=%zu row=%zu -- %s\n",
            sizeof(ds4_block_planar3), sizeof(ds4_row_planar3),
            fail ? "FAIL" : "OK");
     return fail;
@@ -85,7 +85,7 @@ static int test_roundtrip_basis_vector(void) {
     int fail = expect(cos > 0.70f,
                       "basis vector cosine similarity should be > 0.70");
 
-    printf("test_roundtrip_basis_vector: cosine=%.6f mse=%.6f — %s\n",
+    printf("test_roundtrip_basis_vector: cosine=%.6f mse=%.6f -- %s\n",
            cos, mse, fail ? "FAIL" : "OK");
     return fail;
 }
@@ -123,7 +123,7 @@ static int test_roundtrip_random(void) {
     fail += expect(cos_avg > 0.97f,
                    "random vector avg cosine similarity should be > 0.97");
 
-    printf("test_roundtrip_random: %d vectors, cosine min=%.3f avg=%.3f max=%.3f, MSE avg=%.6f — %s\n",
+    printf("test_roundtrip_random: %d vectors, cosine min=%.3f avg=%.3f max=%.3f, MSE avg=%.6f -- %s\n",
            N, cos_min, cos_avg, cos_max, mse_avg, fail ? "FAIL" : "OK");
     return fail;
 }
@@ -152,7 +152,7 @@ static int test_roundtrip_large_norm(void) {
                    "reconstructed norm should be within 10% of original");
 
     printf("test_roundtrip_large_norm: cosine=%.6f mse=%.6f "
-           "norm_orig=%.3f norm_recon=%.3f ratio=%.3f — %s\n",
+           "norm_orig=%.3f norm_recon=%.3f ratio=%.3f -- %s\n",
            cos, mse, orig_norm, recon_norm, norm_ratio, fail ? "FAIL" : "OK");
     return fail;
 }
@@ -184,7 +184,7 @@ static int test_batch_quantize(void) {
     fail += expect(total == NROWS_BATCH * sizeof(ds4_row_planar3),
                    "batch total compressed size mismatch");
 
-    printf("test_batch_quantize: %d rows, avg cosine=%.4f, total_bytes=%zu — %s\n",
+    printf("test_batch_quantize: %d rows, avg cosine=%.4f, total_bytes=%zu -- %s\n",
            NROWS_BATCH, cos_avg, total, fail ? "FAIL" : "OK");
     return fail;
 }
@@ -197,7 +197,7 @@ static int test_compression_ratio(void) {
     int fail = expect(planar_bytes == 200,
                       "compressed row should be exactly 200 bytes");
 
-    printf("test_compression_ratio: fp16=%zu planar=%zu ratio=%.2fx — %s\n",
+    printf("test_compression_ratio: fp16=%zu planar=%zu ratio=%.2fx -- %s\n",
            fp16_bytes, planar_bytes, ratio, fail ? "FAIL" : "OK");
     return fail;
 }
@@ -223,8 +223,36 @@ static int test_block_independence(void) {
     int fail = expect(block3_norm < 1e-3f,
                        "block 3 should be near-zero when only block 0 has data");
 
-    printf("test_block_independence: block3_norm=%.6e — %s\n",
+    printf("test_block_independence: block3_norm=%.6e -- %s\n",
            block3_norm, fail ? "FAIL" : "OK");
+    return fail;
+}
+
+static int test_batch_dim_mismatch(void) {
+    float src[DIM];
+    float dst[DIM];
+    ds4_row_planar3 compressed[1];
+
+    for (int i = 0; i < DIM; i++) src[i] = 1.0f;
+
+    /* quantize with wrong dim should return 0 */
+    size_t ret = ds4_planar3_quantize(src, compressed, 1, 511);
+    int fail = expect(ret == 0,
+                      "quantize with n_per_row=511 should return 0");
+
+    /* dequantize with wrong dim should be no-op: fill dst with sentinel */
+    memset(compressed, 0, sizeof(ds4_row_planar3));
+    for (int i = 0; i < DIM; i++) dst[i] = 42.0f;
+    ds4_planar3_dequantize(compressed, dst, 1, 511);
+    for (int i = 0; i < DIM; i++) {
+        if (dst[i] != 42.0f) {
+            fail += expect(0, "dequantize with n_per_row=511 should not write dst");
+            break;
+        }
+    }
+
+    printf("test_batch_dim_mismatch: quantize_ret=%zu dst_unchanged=%s -- %s\n",
+           ret, fail ? "no" : "yes", fail ? "FAIL" : "OK");
     return fail;
 }
 
@@ -240,6 +268,7 @@ int main(void) {
     fail += test_batch_quantize();
     fail += test_compression_ratio();
     fail += test_block_independence();
+    fail += test_batch_dim_mismatch();
 
     if (fail) {
         fprintf(stderr, "\nplanar_quant_test: %d test(s) FAILED\n", fail);
