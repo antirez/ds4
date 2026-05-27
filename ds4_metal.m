@@ -95,6 +95,7 @@ static id<MTLComputePipelineState> g_dsv4_indexer_weighted_sum_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexer_score_one_direct_pipeline;
 static id<MTLComputePipelineState> g_dsv4_compressor_store_one_pipeline;
 static id<MTLComputePipelineState> g_planar3_quantize_pipeline;
+static id<MTLComputePipelineState> g_planar3_dequant_to_f16_pipeline;
 static id<MTLComputePipelineState> g_dsv4_sort_i32_rows_asc_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_rb16_pipeline;
@@ -4148,6 +4149,8 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_dsv4_compressor_store_one");
         g_planar3_quantize_pipeline =
             ds4_gpu_get_pipeline("kernel_planar3_quantize_row");
+        g_planar3_dequant_to_f16_pipeline =
+            ds4_gpu_get_pipeline("kernel_planar3_dequant_to_f16_rows");
         g_dsv4_sort_i32_rows_asc_pipeline =
             ds4_gpu_get_pipeline("kernel_dsv4_sort_i32_rows_asc");
         g_dsv4_indexed_attention_heads8_pipeline =
@@ -4533,6 +4536,7 @@ void ds4_gpu_cleanup(void) {
         g_dsv4_indexer_score_one_direct_pipeline = nil;
         g_dsv4_compressor_store_one_pipeline = nil;
         g_planar3_quantize_pipeline = nil;
+        g_planar3_dequant_to_f16_pipeline = nil;
         g_dsv4_sort_i32_rows_asc_pipeline = nil;
         g_dsv4_indexed_attention_heads8_pipeline = nil;
         g_dsv4_indexed_attention_heads8_rb16_pipeline = nil;
@@ -12219,6 +12223,35 @@ int ds4_gpu_planar3_quantize_tensor(
 
         return ds4_gpu_finish_command_buffer(cb, owned, "planar3 quantize");
     }
+}
+
+static int ds4_gpu_encode_planar3_dequant_to_f16(
+        id<MTLCommandBuffer>   cb,
+        id<MTLBuffer>          src,
+        NSUInteger             src_off,
+        id<MTLBuffer>          dst,
+        NSUInteger             dst_off,
+        uint32_t               n_rows) {
+    if (!cb || !src || !dst || n_rows == 0) return 0;
+
+    id<MTLComputePipelineState> pipeline =
+        ds4_gpu_hot_pipeline(g_planar3_dequant_to_f16_pipeline,
+                                "kernel_planar3_dequant_to_f16_rows");
+    if (!pipeline) return 0;
+
+    const uint64_t dst_row_stride = (uint64_t)512 * sizeof(uint16_t);
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:pipeline];
+    [enc setBuffer:src offset:src_off atIndex:0];
+    [enc setBuffer:dst offset:dst_off atIndex:1];
+    [enc setBytes:&n_rows length:sizeof(n_rows) atIndex:2];
+    [enc setBytes:&dst_row_stride length:sizeof(dst_row_stride) atIndex:3];
+
+    const NSUInteger threads = (NSUInteger)n_rows;
+    [enc dispatchThreadgroups:MTLSizeMake((threads + 255u) / 256u, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
 }
 
 int ds4_gpu_swiglu_tensor(

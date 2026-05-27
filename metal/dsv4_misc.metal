@@ -675,6 +675,48 @@ kernel void kernel_planar3_quantize_row(
     }
 }
 
+/* Dequantize Planar3 rows to F16 output buffer. One thread per row.
+ * Each thread dequantizes 4 blocks (512 dims) and writes 256 half values. */
+kernel void kernel_planar3_dequant_to_f16_rows(
+        device const ds4_planar3_block *src,
+        device half                 *dst,
+        constant uint32_t          &n_rows,
+        constant uint64_t          &dst_row_stride,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= n_rows) return;
+    device const ds4_planar3_block *blocks = src + (uint64_t)gid * 4;
+    device half *out = dst + (uint64_t)gid * (dst_row_stride / sizeof(half));
+
+    for (uint blk = 0; blk < 4; blk++) {
+        device const ds4_planar3_block *b = &blocks[blk];
+        float norm = float(b->norm);
+
+        for (uint p = 0; p < 64; p++) {
+            uint j0 = p * 2;
+            uint j1 = p * 2 + 1;
+
+            uint8_t low0 = (b->qs[j0 / 4] >> ((j0 % 4) * 2)) & 0x3;
+            uint8_t hi0  = (b->signs[j0 / 8] >> (j0 % 8)) & 0x1;
+            uint8_t idx0 = low0 | (hi0 << 2);
+
+            uint8_t low1 = (b->qs[j1 / 4] >> ((j1 % 4) * 2)) & 0x3;
+            uint8_t hi1  = (b->signs[j1 / 8] >> (j1 % 8)) & 0x1;
+            uint8_t idx1 = low1 | (hi1 << 2);
+
+            float q0 = planar3_centroids[idx0];
+            float q1 = planar3_centroids[idx1];
+            float c  = planar3_cos[p];
+            float s  = planar3_sin[p];
+            float f0 =  c * q0 + s * q1;
+            float f1 = -s * q0 + c * q1;
+
+            uint out_base = blk * 128 + p * 2;
+            out[out_base]     = (half)(f0 * norm);
+            out[out_base + 1] = (half)(f1 * norm);
+        }
+    }
+}
+
 static inline half4 dsv4_load_cache_h4(
         device const char *kv,
         uint64_t row_stride,
