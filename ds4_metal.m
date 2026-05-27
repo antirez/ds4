@@ -12660,7 +12660,11 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_pipeline_for_tile(uint32_t 
 }
 
 static uint32_t ds4_gpu_moe_mm_tile_n(uint32_t gate_type, uint32_t n_tokens) {
-    const uint32_t tile_max = ds4_gpu_env_u32("DS4_METAL_MOE_TILE_MAX", 128u);
+    /*
+     * Keep the wide MoE tiles opt-in until their output exactness matches the
+     * 32-token path. DS4_METAL_MOE_TILE_MAX=64/128 still enables them.
+     */
+    const uint32_t tile_max = ds4_gpu_env_u32("DS4_METAL_MOE_TILE_MAX", 32u);
     if (tile_max <= 32u) {
         return 32u;
     }
