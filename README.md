@@ -166,7 +166,10 @@ slight speedup, not a meaningful generation-speed win.
 `--suffix-decoding` enables an experimental model-free speculative decoder based
 on suffix tries built from the prompt and prior generated tokens. It does not
 need an MTP or draft GGUF; when both are configured, suffix matches are tried
-first and MTP remains the fallback.
+first and MTP remains the fallback. The default draft cap is conservative
+(`--suffix-spec-factor 0.01 --suffix-spec-offset 2`) because long over-drafts can
+cost more to verify than they save on the current Metal path; increase these
+values when benchmarking workloads with very high suffix acceptance.
 
 Then build:
 

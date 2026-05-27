@@ -18041,8 +18041,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->suffix_decoding = opt->suffix_decoding;
     e->suffix_max_depth = opt->suffix_max_depth > 0 ? opt->suffix_max_depth : 32;
     e->suffix_memory_budget = opt->suffix_memory_budget > 0 ? opt->suffix_memory_budget : 64 * 1024 * 1024;
-    e->suffix_spec_factor = opt->suffix_spec_factor > 0.0f ? opt->suffix_spec_factor : 1.0f;
-    e->suffix_spec_offset = opt->suffix_spec_offset > 0.0f ? opt->suffix_spec_offset : 0.0f;
+    e->suffix_spec_factor = opt->suffix_spec_factor > 0.0f ? opt->suffix_spec_factor : 0.01f;
+    e->suffix_spec_offset = opt->suffix_spec_offset > 0.0f ? opt->suffix_spec_offset : 2.0f;
     e->suffix_min_prob = opt->suffix_min_prob >= 0.0f ? opt->suffix_min_prob : 0.0f;
     if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
         (!opt->directional_steering_file || !opt->directional_steering_file[0]))

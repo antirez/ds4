@@ -99,8 +99,8 @@ static void usage(FILE *fp) {
         "  --suffix-max-depth N   Max sequence depth for suffix tree. Default: 32\n"
         "  --suffix-memory-budget MB\n"
         "      Max tree memory in MB. Default: 64\n"
-        "  --suffix-spec-factor F Draft cap = match_len * F + spec_offset. Default: 1.0\n"
-        "  --suffix-spec-offset F Additive offset for the draft cap. Default: 0\n"
+        "  --suffix-spec-factor F Draft cap = match_len * F + spec_offset. Default: 0.01\n"
+        "  --suffix-spec-offset F Additive offset for the draft cap. Default: 2\n"
         "  --suffix-min-prob F    Stop drafting when prob drops below F. Default: 0\n"
         "  --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n"
         "\n"
@@ -219,8 +219,8 @@ static bench_config parse_options(int argc, char **argv) {
         .step_mul = 1.0,
         .suffix_max_depth = 32,
         .suffix_memory_budget = 64ULL * 1024ULL * 1024ULL,
-        .suffix_spec_factor = 1.0f,
-        .suffix_spec_offset = 0.0f,
+        .suffix_spec_factor = 0.01f,
+        .suffix_spec_offset = 2.0f,
         .suffix_min_prob = 0.0f,
     };
 
