@@ -1,8 +1,9 @@
 /*
- * DeepSeek V4 Flash HF -> GGUF quantizer.
+ * DeepSeek V4 Flash/Pro HF -> GGUF quantizer.
  *
  * This is a plain C, model-specific version of the DS4 quantization pipeline.
- * It deliberately keeps only the pieces needed by DeepSeek V4 Flash:
+ * It deliberately keeps only the pieces needed by the DeepSeek V4 Flash and
+ * Pro GGUF recipes used by this repository:
  *
  * - safetensors index/header loading;
  * - FP8 E4M3 + E8M0 dequantization for dense tensors;
@@ -27,6 +28,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -1546,6 +1548,20 @@ typedef struct {
 } byte_span;
 
 typedef struct {
+    char *path;
+    uint32_t version;
+    uint64_t n_kv;
+    uint64_t n_tensors;
+    uint8_t *kv_raw;
+    size_t kv_raw_len;
+    size_t alignment;
+    int n_experts;
+    size_t data_offset;
+    tensor_meta *tensors;
+    hmap tensor_map;
+} gguf_file;
+
+typedef struct {
     tensor_meta *tensors;
     uint64_t n_tensors;
     uint64_t n_kv_extra;
@@ -1710,6 +1726,12 @@ static gguf_file load_gguf_metadata(const char *path) {
         if (strcmp(key, "general.alignment") == 0 && type == GGUF_TYPE_UINT32) {
             uint32_t a = read_u32_le_fp(fp, "GGUF alignment");
             if (a) g.alignment = a;
+        } else if (strcmp(key, "deepseek4.expert_count") == 0 && type == GGUF_TYPE_UINT32) {
+            uint32_t n = read_u32_le_fp(fp, "GGUF expert count");
+            if (n <= (uint32_t)INT_MAX) g.n_experts = (int)n;
+        } else if (strcmp(key, "deepseek4.expert_count") == 0 && type == GGUF_TYPE_UINT64) {
+            uint64_t n = read_u64_le_fp(fp, "GGUF expert count");
+            if (n <= (uint64_t)INT_MAX) g.n_experts = (int)n;
         } else {
             skip_gguf_value_fp(fp, type);
         }
@@ -1936,7 +1958,7 @@ typedef struct {
 
 static void usage(const char *argv0) {
     printf("usage: %s (--hf DIR | --source-gguf MODEL.gguf) --template MODEL.gguf --out OUT.gguf [options]\n", argv0);
-    printf("\nDeepSeek V4 Flash safetensors/GGUF -> GGUF quantizer in plain C.\n\n");
+    printf("\nDeepSeek V4 Flash/Pro safetensors/GGUF -> GGUF quantizer in plain C.\n\n");
     printf("options:\n");
     printf("  --hf DIR               Hugging Face model directory with model.safetensors.index.json\n");
     printf("  --source-gguf FILE     source GGUF to re-quantize from, e.g. an abliterated Q8_0 GGUF\n");
@@ -1960,7 +1982,7 @@ static void usage(const char *argv0) {
     printf("  --dense TYPE           remaining 2D+ non-routed tensor type\n");
     printf("  --tensor-type PFX=TYPE exact tensor-name or prefix override; may repeat\n");
     printf("  --alignment N          write GGUF tensor-data alignment, default from template\n");
-    printf("  --n-experts N          routed expert count, default 256\n");
+    printf("  --n-experts N          routed expert count, default template metadata\n");
     printf("  --threads N            expert worker count, default 8\n");
     printf("\nTYPE examples: f16, f32, bf16, q8_0, q4_k, q2_k, iq2_xxs\n");
 }
@@ -1985,7 +2007,7 @@ static params parse_args(int argc, char **argv) {
     p.policy.routed_w1 = p.policy.routed_w2 = p.policy.routed_w3 = DS4Q_TYPE_COUNT;
     p.policy.attention_proj = p.policy.attention = p.policy.shared = DS4Q_TYPE_COUNT;
     p.policy.embedding = p.policy.output = p.policy.dense = DS4Q_TYPE_COUNT;
-    p.n_experts = 256;
+    p.n_experts = 0;
     p.n_threads = 8;
 
     for (int i = 1; i < argc; i++) {
@@ -2120,6 +2142,17 @@ int main(int argc, char **argv) {
     if (p.imatrix_file) imatrix_load(&imatrix, p.imatrix_file, p.imatrix_strict);
 
     gguf_file tmpl = load_gguf_metadata(p.template_gguf);
+    if (p.n_experts <= 0) {
+        if (tmpl.n_experts > 0) {
+            p.n_experts = tmpl.n_experts;
+            fprintf(stderr, "using %d routed experts from template metadata\n", p.n_experts);
+        } else {
+            p.n_experts = 256;
+            fprintf(stderr, "warning: template has no deepseek4.expert_count; using Flash default %d routed experts\n", p.n_experts);
+        }
+    } else {
+        fprintf(stderr, "using %d routed experts from --n-experts\n", p.n_experts);
+    }
     if (p.alignment) tmpl.alignment = p.alignment;
     output_context out_ctx = build_output_context(&tmpl, &p.policy, &imatrix);
     print_plan(&tmpl, &out_ctx);

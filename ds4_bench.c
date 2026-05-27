@@ -394,7 +394,6 @@ static void log_context_memory(ds4_backend backend, int ctx_size) {
 
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
-    log_context_memory(cfg.backend, cfg.ctx_alloc);
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
@@ -406,6 +405,7 @@ int main(int argc, char **argv) {
     };
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) return 1;
+    log_context_memory(cfg.backend, cfg.ctx_alloc);
 
     char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
     ds4_tokens prompt = {0};

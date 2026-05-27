@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Collect official DeepSeek V4 Flash continuations for local quant scoring."""
+"""Collect official DeepSeek V4 continuations for local quant scoring."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -120,19 +121,28 @@ PROMPTS = [
 ]
 
 
-def request_one(api_key: str, prompt: str, max_tokens: int) -> dict:
+def request_one(
+    api_key: str,
+    endpoint: str,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    top_logprobs: int,
+    thinking: str,
+) -> dict:
     payload = {
-        "model": MODEL,
+        "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
         "max_tokens": max_tokens,
         "logprobs": True,
-        "top_logprobs": 5,
-        "thinking": {"type": "disabled"},
+        "top_logprobs": top_logprobs,
         "stream": False,
     }
+    if thinking != "omit":
+        payload["thinking"] = {"type": thinking}
     req = urllib.request.Request(
-        ENDPOINT,
+        endpoint,
         data=json.dumps(payload).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {api_key}",
@@ -144,11 +154,19 @@ def request_one(api_key: str, prompt: str, max_tokens: int) -> dict:
         return json.loads(fp.read().decode("utf-8"))
 
 
-def fetch_with_retry(api_key: str, prompt: str, max_tokens: int) -> dict:
+def fetch_with_retry(
+    api_key: str,
+    endpoint: str,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    top_logprobs: int,
+    thinking: str,
+) -> dict:
     delay = 1.0
     for attempt in range(6):
         try:
-            return request_one(api_key, prompt, max_tokens)
+            return request_one(api_key, endpoint, model, prompt, max_tokens, top_logprobs, thinking)
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", "replace")
             if e.code < 500 and e.code != 429:
@@ -167,9 +185,15 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="gguf-tools/quality-testing/data")
     ap.add_argument("--prompts", default="gguf-tools/quality-testing/prompts.jsonl")
+    ap.add_argument("--model", default=MODEL)
+    ap.add_argument("--endpoint", default=ENDPOINT)
     ap.add_argument("--count", type=int, default=100)
     ap.add_argument("--max-tokens", type=int, default=24)
+    ap.add_argument("--top-logprobs", type=int, default=5)
+    ap.add_argument("--thinking", choices=("disabled", "enabled", "omit"), default="disabled")
     args = ap.parse_args()
+    if args.top_logprobs < 0 or args.top_logprobs > 20:
+        raise SystemExit("--top-logprobs must be between 0 and 20")
 
     api_key = os.environ.get("DEEPSEEK_API_KEY")
     if not api_key:
@@ -184,10 +208,19 @@ def main() -> int:
     manifest = out / "manifest.tsv"
     rows = []
     total = min(args.count, len(prompts))
+    print(f"model={args.model} endpoint={args.endpoint}", file=sys.stderr)
     for i, prompt in enumerate(prompts[: args.count]):
         case_id = f"case_{i:03d}"
         print(f"official {i + 1}/{total}: {case_id}", file=sys.stderr, flush=True)
-        response = fetch_with_retry(api_key, prompt, args.max_tokens)
+        response = fetch_with_retry(
+            api_key,
+            args.endpoint,
+            args.model,
+            prompt,
+            args.max_tokens,
+            args.top_logprobs,
+            args.thinking,
+        )
         choice = response["choices"][0]
         content = choice.get("message", {}).get("content", "")
         if not content:

@@ -223,19 +223,22 @@ kernel void kernel_flash_attn_ext_blk(
 
     char res = i0*C + C > args.ne30 ? 1 : 0;
 
-    device const half * mask_src = (device const half *) (mask + (i1*Q)*args.nb31 + i2*args.nb32 + i3*args.nb33) + i0*C + tiisg;
-
     if ((C > NW || Q > 1) && res == 0) {
         half mmin =  MAXHALF;
         half mmax = -MAXHALF;
+        const int32_t q0 = i1*Q;
 
         FOR_UNROLL (short j = 0; j < Q; ++j) {
-            FOR_UNROLL (short ii = 0; ii < C/NW; ++ii) {
-                mmin = min(mmin, mask_src[ii*NW]);
-                mmax = max(mmax, mask_src[ii*NW]);
-            }
+            if (q0 + j < args.ne31) {
+                device const half * mask_src =
+                    (device const half *) (mask + (q0 + j)*args.nb31 + i2*args.nb32 + i3*args.nb33) +
+                    i0*C + tiisg;
 
-            mask_src += args.nb31/2;
+                FOR_UNROLL (short ii = 0; ii < C/NW; ++ii) {
+                    mmin = min(mmin, mask_src[ii*NW]);
+                    mmax = max(mmax, mask_src[ii*NW]);
+                }
+            }
         }
 
         mmin = simd_min(mmin);

@@ -1,10 +1,12 @@
 # DS4 Imatrix Pipeline
 
 This directory contains the calibration dataset and instructions used to build
-activation importance matrices for DeepSeek V4 Flash GGUF quantization.
+activation importance matrices for DeepSeek V4 Flash and Pro GGUF
+quantization.
 
-The current imatrix target is the routed MoE path.  DS4 has 43 layers, 256
-routed experts per layer, and three routed expert tensors per layer:
+The current imatrix target is the routed MoE path.  Flash has 43 layers and
+256 routed experts per layer.  Pro has 61 layers and 384 routed experts per
+layer.  Both variants expose three routed expert tensors per layer:
 
 - `blk.N.ffn_gate_exps.weight`
 - `blk.N.ffn_up_exps.weight`
@@ -47,13 +49,29 @@ summary.
 
 ## 2. Collect The Imatrix
 
-Use the DS4 runtime itself to collect routed MoE activation statistics:
+Use the DS4 runtime itself to collect routed MoE activation statistics.  The
+collector uses the loaded GGUF metadata, so the same command shape works for
+Flash and Pro.
+
+Flash example:
 
 ```sh
 ./ds4 \
   -m ../deepseek-v4-quants/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
   --imatrix-dataset gguf-tools/imatrix/dataset/rendered_prompts.txt \
   --imatrix-out ../deepseek-v4-quants/imatrix/DeepSeek-V4-Flash-chat-v2-routed-moe-ds4-1p5m.dat \
+  --ctx 32768
+```
+
+Pro example with a smaller calibration budget:
+
+```sh
+./ds4 \
+  -m ../deepseek-v4-quants/gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct.gguf \
+  --imatrix-dataset gguf-tools/imatrix/dataset/rendered_prompts.txt \
+  --imatrix-out ../deepseek-v4-quants/imatrix/DeepSeek-V4-Pro-Instruct-routed-moe-ds4-small.dat \
+  --imatrix-max-prompts 16 \
+  --imatrix-max-tokens 32768 \
   --ctx 32768
 ```
 
@@ -80,6 +98,8 @@ entry length = n_expert * n_columns
 ```
 
 The quantizer slices the right expert's segment when quantizing each expert.
+For Pro, that means each routed tensor entry contains 384 vectors instead of
+Flash's 256.
 
 ## 3. Generate GGUF Files With The Imatrix
 
@@ -109,6 +129,21 @@ gguf-tools/deepseek4-quantize \
   --out ../deepseek-v4-quants/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
   --imatrix ../deepseek-v4-quants/imatrix/DeepSeek-V4-Flash-chat-v2-routed-moe-ds4-1p5m.dat
 ```
+
+Example Pro Q2 regeneration from a Pro template:
+
+```sh
+gguf-tools/deepseek4-quantize \
+  --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Pro \
+  --template ../deepseek-v4-quants/gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct.gguf \
+  --out ../deepseek-v4-quants/gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix-small.gguf \
+  --imatrix ../deepseek-v4-quants/imatrix/DeepSeek-V4-Pro-Instruct-routed-moe-ds4-small.dat \
+  --threads 24
+```
+
+`deepseek4-quantize` reads the routed expert count from the template GGUF.  Use
+`--n-experts` only when working with an older template that lacks
+`deepseek4.expert_count`.
 
 For Q4, the imatrix does not change the runtime tensor type: routed experts
 remain `Q4_K`.  It changes how quantization error is weighted while choosing
