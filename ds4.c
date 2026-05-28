@@ -19155,7 +19155,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                   row0_logits,
                                                   row_logits);
         }
-        const double verify_done = mtp_timing ? now_sec() : 0.0;
+        const double verify_done = now_sec();
         if (ok && row0_top == drafts[1]) {
             memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
             token_vec_push(&s->checkpoint, drafts[0]);
