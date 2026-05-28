@@ -1,10 +1,321 @@
+# REAP-Compact GGUF Support Branch
+
+> **This is the `reap-compact-support` branch** of [ljubomirj/ds4](https://github.com/ljubomirj/ds4), enabling support for REAP-compact GGUF models.
+
+## What This Branch Does
+
+This branch adds support for **REAP-compact GGUF models** to the DS4 inference engine. REAP (Router-weighted Expert Activation Pruning) removes low-utility experts from MoE models while maintaining quality.
+
+The original target was **REAP25**, where layers 0-2 keep the full 256 routed experts and layers 3-42 are compacted to 192 experts. The branch now also supports newer compact DeepSeek V4 Flash GGUFs that advertise their compact expert count directly and do not carry `reap.*` metadata, including:
+
+| Variant | Routed experts | Approx file size | Metadata style |
+|---------|----------------|------------------|----------------|
+| Stock DS4 Flash | 256 in every layer | 80.76 GiB | `deepseek4.expert_count=256` |
+| REAP25 LCB50 compact | 256 in layers 0-2, 192 in layers 3-42 | 63.87 GiB | `deepseek4.expert_count=256`, `reap.layout=ds4-compact-v1` |
+| Spark Q2 REAP 180B | 160 in every layer | 53.52 GiB | `deepseek4.expert_count=160` |
+| Spark Mini Q2 REAP 162B | 144 in every layer | 48.98 GiB | `deepseek4.expert_count=144` |
+
+For all compact variants, DS4 treats the GGUF tensor directory as authoritative: each layer's runtime routed expert count is inferred from `blk.N.ffn_gate_inp.weight`.
+
+### Key Changes
+
+- Per-layer expert count tracking for stock, REAP25 mixed-width, and Spark uniform compact models
+- Expert count inference from tensor dimensions, including compact GGUFs without `reap.*` metadata
+- Updated validation and routing to use per-layer expert counts
+- Fully backward compatible with stock models
+
+## Model Files
+
+The first supported compact model was **REAP25-LCB50-DS4-compact**. The same
+runtime path also supports newer Spark compact files with uniform 160- and
+144-expert routed layers.
+
+| Variant | HF repo | Direct GGUF |
+|---------|---------|-------------|
+| REAP25 LCB50 compact | [eouya2/DeepSeek-V4-Flash-REAP25-LCB50-DS4](https://huggingface.co/eouya2/DeepSeek-V4-Flash-REAP25-LCB50-DS4) | `DeepSeek-V4-Flash-REAP25-LCB50-DS4-compact-IQ2XXS.gguf` in the repo |
+| Spark Mini Q2 REAP 162B | [0xSero/DeepSeek-V4-Flash-162B](https://huggingface.co/0xSero/DeepSeek-V4-Flash-162B), [0xSero/DeepSeek-V4-Flash-162B-GGUF](https://huggingface.co/0xSero/DeepSeek-V4-Flash-162B-GGUF) | [DeepSeek-V4-Flash-Spark-Mini-Q2-REAP-ds4.gguf](https://huggingface.co/0xSero/DeepSeek-V4-Flash-162B-GGUF/resolve/main/DeepSeek-V4-Flash-Spark-Mini-Q2-REAP-ds4.gguf) |
+| Spark Q2 REAP 180B | [0xSero/DeepSeek-V4-Flash-180B](https://huggingface.co/0xSero/DeepSeek-V4-Flash-180B), [0xSero/DeepSeek-V4-Flash-180B-GGUF](https://huggingface.co/0xSero/DeepSeek-V4-Flash-180B-GGUF) | [DeepSeek-V4-Flash-Spark-Q2-REAP-ds4.gguf](https://huggingface.co/0xSero/DeepSeek-V4-Flash-180B-GGUF/resolve/main/DeepSeek-V4-Flash-Spark-Q2-REAP-ds4.gguf) |
+
+> Special thanks to **eouya2** for the REAP25 DS4-compact layout and
+> LiveCodeBench calibration, and to **0xSero** for the Spark compact model
+> releases.
+
+## Build and Usage
+
+### Building
+
+```bash
+cd ~/ds4/github/worktrees/reap-compact
+make
+```
+
+### Running
+
+```bash
+# Basic inference
+./ds4 -m DeepSeek-V4-Flash-REAP25-LCB50-DS4-compact-IQ2XXS.gguf \
+       --ctx 32768 --nothink --temp 0 -n 64 \
+       -p 'write a python function to merge two sorted lists'
+
+# Server mode
+./ds4-server \
+  -m DeepSeek-V4-Flash-REAP25-LCB50-DS4-compact-IQ2XXS.gguf \
+  --ctx 32768 --tokens 1024 \
+  --host 127.0.0.1 --port 8000
+```
+
+**Important**
+
+Make sure you allowed use of the unified memory for vram so the models can be loaded.
+
+On an M2 Max MBP with 96gb ram looks like max one can go to is 88000 before MacOS starts exhibiting random glitches: 
+
+```bash
+$ sudo sysctl iogpu.wired_limit_mb=88000
+```
+
+This fits even the biggest REAP .gguf comfortably, leaving plenty of space for the KV-cache.
+
+On an M2 Ultra mac with 64gb ram it was reported that this works to fit the smaller REAP-s:
+
+```bash
+$ sudo sysctl iogpu.wired_limit_mb=61440
+```
+
+The above needs to be run only once to take effect, but can be re-run at will, there is no harm done. It can be run in any terminal - it's a global MacOS setting, affecting all sessions. But if the computer is rebooted, it will reset itself to the default value. So the above sysctl need to be re-run at least once before models are re-loaded.
+
+### Verification
+
+REAP25 mixed-width models load with tensor-inferred expert counts:
+```
+ds4: compact routed expert counts inferred from tensors: min=192 max=256 metadata=256
+ds4: REAP layout=ds4-compact-v1
+```
+
+Spark compact models validate as Flash-compatible compact shapes with uniform
+160 or 144 routed experts.
+
+## Performance Benchmarks
+
+**Test System**: 2023 MacBook Pro M2 Max, 96GB RAM, macOS, Metal backend
+
+**Memory Usage**:
+- Mapped: ~65.4 GB at ctx=2048 (vs ~82 GB stock)
+- Savings: ~17 GB (16.9 GB file size reduction)
+
+**Speed Benchmark Results**:
+
+| Context | Prefill (t/s) | Generation (t/s) | KV Cache |
+|---------|---------------|-------------------|----------|
+| 2K | 284.11 | 17.52 | 52 GB |
+| 4K | 234.42 | 15.53 | 80 GB |
+| 8K | 220.39 | 14.88 | 137 GB |
+| 16K | 199.10 | 13.86 | 250 GB |
+| 32K | 157.99 | 12.85 | 475 GB |
+| 48K | 135.82 | 11.80 | 672 GB |
+| 61K | 125.54 | 11.50 | 842 GB |
+
+**Benchmark Command**:
+```bash
+./ds4-bench \
+  -m DeepSeek-V4-Flash-REAP25-LCB50-DS4-compact-IQ2XXS.gguf \
+  --prompt-file speed-bench/promessi_sposi.txt \
+  --ctx-start 2048 \
+  --ctx-max 65536 \
+  --step-incr 2048 \
+  --gen-tokens 128
+```
+
+**Conclusion**: REAP-compact maintains full inference speed while saving ~17GB of memory, enabling 96GB RAM machines to run DeepSeek V4 Flash comfortably at 32K+ context.
+
+### Context Depth Benchmarks (via llama-benchy)
+
+**Test Method**: Server API benchmarking using [llama-benchy](https://github.com/ggerganov/llama.cpp/tree/master/contrib/llama-benchy) against ds4-server OpenAI-compatible API.
+
+**Server Configuration**:
+```bash
+#!/bin/bash
+MODEL_PATH="$HOME/ds4/gguf/DeepSeek-V4-Flash-REAP25-LCB50-DS4-compact-IQ2XXS.gguf"
+WORKTREE="$HOME/ds4/github/worktrees/reap-compact"
+
+./ds4-server \
+  --host 0.0.0.0 \
+  --port 8000 \
+  -m "$MODEL_PATH" \
+  --ctx 1048576 \
+  --tokens 65536 \
+  --backend metal
+```
+
+**Benchmark Command**:
+```bash
+llama-benchy \
+  --base-url http://127.0.0.1:8000/v1 \
+  --model deepseek-v4-flash \
+  --tokenizer Qwen/Qwen2.5-7B-Instruct \
+  --depth 1024 8192 32768 65536 131072 \
+  --pp 2048 \
+  --tg 128 \
+  --runs 1 \
+  --latency-mode none \
+  --no-warmup \
+  --save-result ~/llama.cpp/contrib/llama-benchy/results/reap-compact-depth-test-20260528-233816.md \
+  --format md
+```
+
+**Results** (M2 Max 96GB, Metal backend):
+
+| Context Depth | PP t/s | TG t/s | Peak TG t/s | E2E TTFT (s) | Total Time (s) |
+|---------------|--------|--------|-------------|--------------|-----------------|
+| 1K (1024) | 196.44 | 32.63 | 39.00 | 16.66 | ~17s |
+| 8K (8192) | 221.65 | 30.19 | 35.00 | 49.30 | ~49s |
+| 32K (32768) | 206.86 | 26.45 | 35.00 | 176.44 | ~176s (~3 min) |
+| 64K (65536) | 176.38 | 23.67 | 34.00 | 400.27 | ~400s (~6.7 min) |
+| 128K (131072) | 142.94 | 21.84 | 29.00 | 971.89 | ~972s (~16 min) |
+
+**Extended 768K Run** (same REAP25 model, M2 Max 96GB, Metal backend):
+
+| Context Depth | PP t/s | TG t/s | E2E TTFT |
+|---------------|--------|--------|----------|
+| 1K | 189.40 | 32.92 | 17s |
+| 8K | 210.43 | 29.39 | 51s |
+| 32K | 195.31 | 25.92 | 3 min |
+| 64K | 164.97 | 21.30 | 7 min |
+| 128K | 140.04 | 23.27 | 16 min |
+| 256K | 99.87 | 17.11 | 46 min |
+| 384K | 78.59 | 14.27 | 1h 27min |
+| 512K | 61.93 | 12.14 | 2h 27min |
+| 768K | 42.70 | 9.85 | 5h 20min |
+
+All extended-depth tests completed. REAP-compact handles up to 768K context on
+96GB RAM.
+
+**Key Observations**:
+- **Best PP**: 8K context (221.65 t/s)
+- **Best TG**: 1K context (32.63 t/s)
+- **PP degradation**: 36% from 8K peak to 128K
+- **TG degradation**: 33% from 1K to 128K
+- Token generation stays above 21 t/s even at 128K context
+
+The REAP-compact model shows **graceful degradation** - performance remains usable even at extreme context depths.
+
+## MTP (Multi-Token Prediction) Support
+
+**Compatibility**: ✅ REAP-compact is fully compatible with MTP speculative decoding.
+
+### Technical Details
+
+MTP uses layer 0's expert count for validation. Since REAP preserves layers 0-2 at 256 experts (hash-routed), MTP works correctly with REAP-compact models.
+
+### MTP Model
+
+**Source**: Available in the main DS4 repository (use `./download_model.sh mtp`)
+
+**Model**: `DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf`
+- File size: ~3.5 GB
+- Purpose: Speculative decoding via draft-token predictions
+
+### Memory with MTP
+
+| Configuration | Memory |
+|---------------|---------|
+| REAP only | ~65 GB |
+| REAP + MTP | ~69 GB (+3.6 GB) |
+| **Available for KV** | ~27 GB (of 96 GB total) |
+
+### MTP Performance Testing
+
+**Test System**: M2 Max 96GB RAM, macOS, Metal backend
+**Test**: 128 token generation at ctx=4096
+
+**Comprehensive Benchmark** (all MTP draft values):
+| MTP Draft | Prefill (t/s) | Generation (t/s) | Recommendation |
+|-----------|---------------|-----------------|----------------|
+| 0 (none) | 50.14 | **21.40** | ✅ **Fastest** |
+| 1 | 49.70 | 19.52 | Slower |
+| 2 | 38.36 | 20.13 | Slower |
+| 3 | 36.95 | 12.56 | ❌ **Significantly slower** |
+
+**Benchmark Script**: See `~/ds4/bench-mtp-reap.sh` for reproducible testing.
+
+### Recommendation: Do NOT Use MTP
+
+**MTP provides no speedup with REAP-compact** and actually slows down generation:
+- Draft 0 (no MTP) is the fastest configuration
+- Higher draft values progressively slow down both prefill and generation
+- Draft 3 (max speculation) reduces generation speed by ~40%
+
+**Why MTP Doesn't Help**:
+1. MTP is experimental per upstream DS4 documentation
+2. Correctness-gated speculation rejects low-confidence predictions
+3. Overhead exceeds benefits for this model/configuration
+4. Designed for greedy decoding scenarios
+
+**For Upstream Adoption**: MTP compatibility is still important for feature completeness, even though we recommend not using it. The branch fully supports MTP - users can choose to enable it, but our benchmarks show no performance benefit.
+
+## Agent Usage Example
+
+For running agents with REAP-compact model, create a startup script:
+
+```bash
+#!/bin/bash
+# Start ds4-agent with REAP-compact model
+#
+# Usage: ./start-reap-agent.sh [prompt]
+#
+# Environment: 96GB RAM M2 Max, macOS Metal backend
+#
+# Context depth testing for real agent tasks
+
+MODEL_PATH="$HOME/ds4/gguf/DeepSeek-V4-Flash-REAP25-LCB50-DS4-compact-IQ2XXS.gguf"
+WORKTREE="$HOME/ds4/github/worktrees/reap-compact"
+SERVER_BIN="$WORKTREE/ds4-agent"
+
+cd "$WORKTREE" || exit 1
+
+SERVER_ARGS=(
+  -m "$MODEL_PATH"
+  --ctx 1048576         # 1M context
+  --tokens 65536        # max output
+  --nothink
+  --temp 0
+  --top-p 0.9
+  --min-p 0.05
+  --backend metal
+)
+
+CMD="$SERVER_BIN ${SERVER_ARGS[@]} $@"
+echo "$0 running: $CMD"
+eval "$CMD"
+```
+
+This provides 1M token context for extended agent sessions with REAP memory efficiency.
+
+## This Branch
+
+- **Branch**: [`reap-compact-support`](https://github.com/ljubomirj/ds4/tree/reap-compact-support)
+- **Fork**: [ljubomirj/ds4](https://github.com/ljubomirj/ds4)
+- **Based on**: [antirez/ds4](https://github.com/antirez/ds4) (upstream)
+
+## Acknowledgments
+
+### Original Projects
+
+- **[DS4 by antirez](https://github.com/antirez/ds4)** - The original DeepSeek V4 Flash inference engine. Excellent architecture that made this adaptation straightforward.
+- **[REAP Research by Cerebras](https://github.com/CerebrasResearch/reap)** - Router-weighted Expert Activation Pruning methodology.
+- **[llama.cpp](https://github.com/ggml-org/llama.cpp)** - GGUF format, quantization, and kernel implementations.
+
+### REAP-Compact Model
+
+- **[eouya2/DeepSeek-V4-Flash-REAP25-LCB50-DS4](https://huggingface.co/eouya2/DeepSeek-V4-Flash-REAP25-LCB50-DS4)** - REAP-pruned GGUF with DS4-compact layout, LiveCodeBench calibration, and bundled runtime.
+
+---
+
 <p align="center">
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>
 
-> **Fork of [antirez/ds4](https://github.com/antirez/ds4)** — additional branches:
-> [`l26f`](https://github.com/ljubomirj/ds4/tree/l26f) (Ling-2.6-Flash),
-> [`reap-compact-support`](https://github.com/ljubomirj/ds4/tree/reap-compact-support) (REAP-compact GGUF)
+# DwarfStar
 
 **DwarfStar** is a small native inference engine optimized first for
 **DeepSeek V4 Flash**. It also supports **GLM 5.2** and, on very high-memory
