@@ -18359,6 +18359,10 @@ const ds4_spec_telemetry *ds4_engine_spec_telemetry(const ds4_engine *e) {
     return e ? &e->spec_telemetry : NULL;
 }
 
+void ds4_engine_spec_telemetry_reset(ds4_engine *e) {
+    if (e) memset(&e->spec_telemetry, 0, sizeof(e->spec_telemetry));
+}
+
 int ds4_session_power(ds4_session *s) {
     if (!s || !s->engine) return 100;
     return s->engine->power_percent;
@@ -18957,7 +18961,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     if (suffix_available) {
         uint32_t suffix_n = 0;
         float suffix_score = 0.0f;
-        const double dq_t0 = spec_telemetry_log ? now_sec() : 0.0;
+        const double dq_t0 = now_sec();
         uint32_t p = draft_from_suffix_tree(s, drafts, (uint32_t)draft_cap, &suffix_n, &suffix_score);
         if (spec_telemetry_log) {
             e->spec_telemetry.total_draft_query_ms += (now_sec() - dq_t0) * 1000.0;
@@ -19218,6 +19222,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 
     if (can_batch_verify && !use_decode2_exact)
     {
+        const double bv_t0 = now_sec();
         ds4_spec_frontier frontier;
         memset(&frontier, 0, sizeof(frontier));
         int *row_tops = s->spec_row_tops;
@@ -19303,6 +19308,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                         DS4_MTP_KEEP_ACCEPTED(replayed);
                         spec_frontier_free(&frontier);
                         DS4_SUFFIX_NOTE_ACCEPTED();
+                        e->spec_telemetry.total_verify_ms += (now_sec() - bv_t0) * 1000.0;
                         return n_accept;
                     }
                 }
@@ -19332,6 +19338,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                 (now_sec() - mtp_t0) * 1000.0);
                     }
                     spec_frontier_free(&frontier);
+                    e->spec_telemetry.total_verify_ms += (now_sec() - bv_t0) * 1000.0;
                     DS4_SUFFIX_NOTE_ACCEPTED();
                     return n_accept;
                 }
@@ -19362,6 +19369,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                 (now_sec() - mtp_t0) * 1000.0);
                     }
                     spec_frontier_free(&frontier);
+                    e->spec_telemetry.total_verify_ms += (now_sec() - bv_t0) * 1000.0;
                     DS4_SUFFIX_NOTE_ACCEPTED();
                     return n_accept;
                 }
@@ -19396,6 +19404,8 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                 (replay_done - mtp_t0) * 1000.0);
                     }
                     spec_frontier_free(&frontier);
+                    e->spec_telemetry.total_verify_ms += (now_sec() - bv_t0) * 1000.0; 
+                    e->spec_telemetry.total_replay_ms += (now_sec() - micro_verify_done) * 1000.0;
                     DS4_SUFFIX_NOTE_ACCEPTED();
                     return n_accept;
                 }
@@ -19436,6 +19446,8 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                 (replay_done - mtp_t0) * 1000.0);
                     }
                     spec_frontier_free(&frontier);
+                    e->spec_telemetry.total_verify_ms += (now_sec() - bv_t0) * 1000.0; 
+                    e->spec_telemetry.total_replay_ms += (now_sec() - micro_verify_done) * 1000.0;
                     DS4_SUFFIX_NOTE_ACCEPTED();
                     return n_accept;
                 }

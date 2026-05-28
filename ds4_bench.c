@@ -686,6 +686,7 @@ int main(int argc, char **argv) {
             const struct ds4_spec_telemetry *t = ds4_engine_spec_telemetry(engine);
             if (t) ds4_spec_telemetry_print(t);
         }
+        if (suffix_spec) ds4_engine_spec_telemetry_reset(engine);
 
         if (ds4_session_load_snapshot(session, &snap, err, sizeof(err)) != 0) {
             fprintf(stderr, "ds4-bench: restore at %d failed: %s\n", frontier, err);

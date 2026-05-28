@@ -244,4 +244,7 @@ void ds4_spec_telemetry_print(const struct ds4_spec_telemetry *t);
 /* Get spec telemetry from the engine. Returns NULL if engine is NULL. */
 const struct ds4_spec_telemetry *ds4_engine_spec_telemetry(const ds4_engine *e);
 
+/* Reset speculative decode telemetry counters to zero. */
+void ds4_engine_spec_telemetry_reset(ds4_engine *e);
+
 #endif
