@@ -1435,6 +1435,8 @@ static cli_config parse_options(int argc, char **argv) {
             .backend = default_backend(),
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
+            .suffix_spec_factor = -1.0f,
+            .suffix_spec_offset = -1.0f,
         },
         .gen = {
             .prompt = NULL,
@@ -1642,6 +1644,10 @@ int main(int argc, char **argv) {
         rc = run_repl(engine, &cfg);
     } else {
         rc = run_generation(engine, &cfg);
+    }
+    if (cfg.engine.suffix_decoding) {
+        const struct ds4_spec_telemetry *t = ds4_engine_spec_telemetry(engine);
+        if (t) ds4_spec_telemetry_print(t);
     }
     ds4_engine_close(engine);
     free(cfg.prompt_owned);

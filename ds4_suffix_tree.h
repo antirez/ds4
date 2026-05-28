@@ -109,4 +109,18 @@ void ds4_suffix_tree_reset(ds4_suffix_tree *tree);
 /* Get telemetry statistics. */
 void ds4_suffix_tree_stats(const ds4_suffix_tree *tree, ds4_suffix_stats *out);
 
+/* Speculative decode telemetry. */
+typedef struct ds4_spec_telemetry {
+    uint64_t spec_steps;
+    uint64_t first_draft_hit;
+    uint64_t first_draft_miss;
+    uint64_t full_accept[16];
+    uint64_t partial_accept[16];
+    uint64_t total_committed;
+    uint64_t total_verified;
+    double   total_verify_ms;
+    double   total_replay_ms;
+    double   total_draft_query_ms;
+} ds4_spec_telemetry;
+
 #endif /* DS4_SUFFIX_TREE_H */

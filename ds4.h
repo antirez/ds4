@@ -237,4 +237,11 @@ void ds4_session_snapshot_free(ds4_session_snapshot *snap);
 /* Suffix tree telemetry.  Fills *out with zero if suffix decoding is disabled. */
 void ds4_session_suffix_stats(ds4_session *s, ds4_suffix_stats *out);
 
+/* Print speculative decode telemetry summary to stderr. */
+struct ds4_spec_telemetry;
+void ds4_spec_telemetry_print(const struct ds4_spec_telemetry *t);
+
+/* Get spec telemetry from the engine. Returns NULL if engine is NULL. */
+const struct ds4_spec_telemetry *ds4_engine_spec_telemetry(const ds4_engine *e);
+
 #endif
