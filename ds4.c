@@ -13183,7 +13183,10 @@ static bool metal_graph_encode_layer_ffn_batch(
         uint32_t                il,
         uint32_t                pos0,
         uint32_t                n_tokens) {
-    if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
+    if (n_tokens == 0 || n_tokens > g->prefill_cap) {
+        fprintf(stderr, "ds4: ffn fail: n_tokens=%u prefill_cap=%u\n", n_tokens, g->prefill_cap);
+        return false;
+    }
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
@@ -13213,6 +13216,8 @@ static bool metal_graph_encode_layer_ffn_batch(
     ds4_gpu_tensor *next_hc_view = ds4_gpu_tensor_view(
             g->batch_next_hc, 0, (uint64_t)n_tokens * hc_dim * sizeof(float));
     bool ok = hc_mix_view && hc_split_view && ffn_cur_view && next_hc_view;
+    if (!ok) fprintf(stderr, "ds4: ffn fail: tensor views hc_mix=%p hc_split=%p ffn_cur=%p next_hc=%p\n",
+                     (void*)hc_mix_view, (void*)hc_split_view, (void*)ffn_cur_view, (void*)next_hc_view);
     if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       g->batch_after_attn_hc,
                                                       (uint32_t)hc_dim,
@@ -13226,6 +13231,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                              mix_hc,
                                              g->batch_flat_hc,
                                              n_tokens) != 0;
+    if (!ok) fprintf(stderr, "ds4: ffn fail: hc_ffn matmul_f16\n");
     if (metal_graph_use_reference_hc_decode()) {
         if (ok) ok = ds4_gpu_hc_split_sinkhorn_tensor(hc_split_view,
                                                         hc_mix_view,
@@ -13281,6 +13287,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                              DS4_N_EXPERT,
                                              g->batch_ffn_norm,
                                              n_tokens) != 0;
+    if (!ok) fprintf(stderr, "ds4: ffn fail: router matmul_f16\n");
 
     if (ok) ok = ds4_gpu_router_select_batch_tensor(g->batch_router_selected,
                                                       g->batch_router_weights,
@@ -13300,6 +13307,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                       DS4_N_EXPERT_USED,
                                                       DS4_EXPERT_WEIGHT_SCALE,
                                                       n_tokens) != 0;
+    if (!ok) fprintf(stderr, "ds4: ffn fail: router_select_batch\n");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_logits", g->batch_router_logits,
                                       (uint64_t)n_tokens * DS4_N_EXPERT, il, pos0);
@@ -13341,6 +13349,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                il,
                                                n_tokens,
                                                &g->batch_routed_mid_is_f16) != 0;
+        if (!ok) fprintf(stderr, "ds4: ffn fail: routed_moe_batch\n");
     }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->batch_routed_gate,
@@ -13463,7 +13472,9 @@ static bool metal_graph_encode_layer_batch(
         uint32_t                pos0,
         uint32_t                n_tokens) {
     bool ok = metal_graph_encode_layer_attention_batch(g, model, layer, il, pos0, n_tokens);
+    if (!ok) fprintf(stderr, "ds4: prefill fail: layer %u attention_batch\n", il);
     if (ok) ok = metal_graph_encode_layer_ffn_batch(g, model, layer, il, pos0, n_tokens);
+    if (!ok) fprintf(stderr, "ds4: prefill fail: layer %u ffn_batch\n", il);
     if (ok) {
         ds4_gpu_tensor *tmp = g->batch_cur_hc;
         g->batch_cur_hc = g->batch_next_hc;
@@ -13951,17 +13962,32 @@ static bool metal_graph_prefill_layer_major(
         ds4_imatrix_collector *imatrix,
         ds4_session_progress_fn display_progress,
         void                  *display_progress_ud) {
-    if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
-    if (start > (uint32_t)prompt->len) return false;
-    if (n_tokens > (uint32_t)prompt->len - start) return false;
+    if (n_tokens == 0 || n_tokens > g->prefill_cap) {
+        fprintf(stderr, "ds4: prefill fail: n_tokens=%u prefill_cap=%u\n", n_tokens, g->prefill_cap);
+        return false;
+    }
+    if (start > (uint32_t)prompt->len) {
+        fprintf(stderr, "ds4: prefill fail: start=%u > prompt->len=%d\n", start, prompt->len);
+        return false;
+    }
+    if (n_tokens > (uint32_t)prompt->len - start) {
+        fprintf(stderr, "ds4: prefill fail: n_tokens=%u > prompt->len=%d - start=%u\n", n_tokens, prompt->len, start);
+        return false;
+    }
 
     if (display_progress)
         display_progress(display_progress_ud, "prefill_display", (int)start, prompt->len);
 
     bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
-    if (!ok) return false;
+    if (!ok) {
+        fprintf(stderr, "ds4: prefill fail: upload_prompt_tokens\n");
+        return false;
+    }
 
-    if (!metal_graph_warmup_prefill_kernels(g, model, weights, n_tokens)) return false;
+    if (!metal_graph_warmup_prefill_kernels(g, model, weights, n_tokens)) {
+        fprintf(stderr, "ds4: prefill fail: warmup_prefill_kernels\n");
+        return false;
+    }
 
     const bool split_profile = getenv("DS4_METAL_GRAPH_PREFILL_SPLIT_PROFILE") != NULL;
     /*
@@ -13975,6 +14001,8 @@ static bool metal_graph_prefill_layer_major(
     const bool callback_split = display_progress != NULL && n_tokens >= 32;
     const bool split_commands = split_profile || throttle || callback_split ||
                                 n_tokens > 2048 || imatrix != NULL;
+    fprintf(stderr, "ds4: prefill split_commands=%d split_profile=%d throttle=%d callback_split=%d n_tokens=%u\n",
+            (int)split_commands, (int)split_profile, (int)throttle, (int)callback_split, n_tokens);
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL || split_profile;
     const double t0 = profile ? now_sec() : 0.0;
     double encode_s = 0.0;
@@ -13988,6 +14016,7 @@ static bool metal_graph_prefill_layer_major(
                                                      prompt,
                                                      start,
                                                      n_tokens);
+        if (!ok) fprintf(stderr, "ds4: prefill fail: upload_prompt_embeddings_hc\n");
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
             ok = metal_graph_encode_layer_batch(g,
@@ -13996,6 +14025,11 @@ static bool metal_graph_prefill_layer_major(
                                                 il,
                                                 start,
                                                 n_tokens);
+            if (!ok) {
+                fprintf(stderr, "ds4: prefill fail: encode_layer_batch il=%u\n", il);
+                int sync_rc = ds4_gpu_synchronize();
+                fprintf(stderr, "ds4: prefill fail: forced sync after layer %u returned %d\n", il, sync_rc);
+            }
             if (show_progress) {
                 fprintf(stderr, "ds4: gpu prefill layer %u/%u\r", il + 1, (uint32_t)DS4_N_LAYER);
                 fflush(stderr);
@@ -14021,10 +14055,12 @@ static bool metal_graph_prefill_layer_major(
         if (ok && logits) {
             last_hc = metal_graph_tensor_row_view(g->batch_cur_hc, output_row, hc_dim);
             ok = last_hc != NULL;
+            if (!ok) fprintf(stderr, "ds4: prefill fail: tensor_row_view\n");
         }
         if (ok && logits) {
             g->cur_hc = last_hc;
             ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+            if (!ok) fprintf(stderr, "ds4: prefill fail: encode_output_head\n");
             g->cur_hc = saved_cur;
         }
 
@@ -14034,6 +14070,7 @@ static bool metal_graph_prefill_layer_major(
         g->cur_hc = saved_cur;
         if (last_hc) ds4_gpu_tensor_free(last_hc);
         if (!ok) {
+            fprintf(stderr, "ds4: prefill fail: end_commands after layers\n");
             if (ds4_gpu_synchronize() == 0) {
                 fprintf(stderr, "ds4: Metal synchronize after whole-prefill graph failure also failed\n");
             }
@@ -14043,6 +14080,7 @@ static bool metal_graph_prefill_layer_major(
         const double t_before_read = profile ? now_sec() : 0.0;
         if (logits) {
             ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+            if (!ok) fprintf(stderr, "ds4: prefill fail: tensor_read logits\n");
         }
         if (profile) {
             const double t_read = now_sec();

@@ -712,11 +712,6 @@ static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size,
         (void)cudaGetLastError();
         return 0;
     }
-    cudaMemLocation loc;
-    memset(&loc, 0, sizeof(loc));
-    loc.type = cudaMemLocationTypeDevice;
-    loc.id = device;
-
     const long page_sz_l = sysconf(_SC_PAGESIZE);
     const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
     const uintptr_t host_addr = (uintptr_t)((const char *)model_map + map_offset);
@@ -726,13 +721,25 @@ static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size,
     void *pre_ptr = (void *)pre_addr;
 
     const double t0 = cuda_wall_sec();
+#if CUDART_VERSION >= 12000
+    cudaMemLocation loc;
+    memset(&loc, 0, sizeof(loc));
+    loc.type = cudaMemLocationTypeDevice;
+    loc.id = device;
     err = cudaMemAdvise(pre_ptr, (size_t)pre_bytes, cudaMemAdviseSetReadMostly, loc);
+#else
+    err = cudaMemAdvise(pre_ptr, (size_t)pre_bytes, cudaMemAdviseSetReadMostly, device);
+#endif
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: CUDA model read-mostly advise skipped: %s\n", cudaGetErrorString(err));
         (void)cudaGetLastError();
         return 0;
     }
+#if CUDART_VERSION >= 12000
     err = cudaMemAdvise(pre_ptr, (size_t)pre_bytes, cudaMemAdviseSetPreferredLocation, loc);
+#else
+    err = cudaMemAdvise(pre_ptr, (size_t)pre_bytes, cudaMemAdviseSetPreferredLocation, device);
+#endif
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: CUDA model preferred-location advise skipped: %s\n", cudaGetErrorString(err));
         (void)cudaGetLastError();
@@ -748,7 +755,11 @@ static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size,
         }
     }
 
-    err = cudaMemPrefetchAsync(pre_ptr, (size_t)pre_bytes, loc, 0, g_model_prefetch_stream);
+#if CUDART_VERSION >= 12000
+    err = cudaMemPrefetchAsync(pre_ptr, (size_t)pre_bytes, loc, g_model_prefetch_stream);
+#else
+    err = cudaMemPrefetchAsync(pre_ptr, (size_t)pre_bytes, device, g_model_prefetch_stream);
+#endif
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: CUDA model prefetch skipped: %s\n", cudaGetErrorString(err));
         (void)cudaGetLastError();
@@ -5526,7 +5537,11 @@ extern "C" int ds4_gpu_embed_tokens_hc_tensor(
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset,
                                             (uint64_t)n_vocab * n_embd * sizeof(uint16_t),
                                             "token_embd");
-    if (!wptr) return 0;
+    if (!wptr) {
+        fprintf(stderr, "ds4: CUDA embed_tokens weight ptr is NULL (offset=0x%llx n_vocab=%u n_embd=%u)\n",
+                (unsigned long long)weight_offset, n_vocab, n_embd);
+        return 0;
+    }
     uint64_t n = (uint64_t)n_tokens * n_hc * n_embd;
     embed_tokens_hc_kernel<<<(n + 255) / 256, 256>>>(
         (float *)out_hc->ptr,
@@ -8585,6 +8600,53 @@ __global__ static void moe_gate_up_mid_sorted_qwarp32_kernel(
     }
 }
 
+__global__ static void moe_gate_up_mid_sorted_q4K_qwarp32_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const uint32_t *sorted_pairs,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        float clamp) {
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    uint32_t pair = sorted_pairs[blockIdx.y];
+    if (row >= expert_mid_dim) return;
+    uint32_t tok = pair / n_expert;
+    uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    uint32_t expert = (uint32_t)expert_i;
+    const cuda_block_q4_K *gr = (const cuda_block_q4_K *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+    const cuda_block_q4_K *ur = (const cuda_block_q4_K *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+        gate += dev_dot_q4_K_q8_K_block(gr + b, xqb + b);
+        up += dev_dot_q4_K_q8_K_block(ur + b, xqb + b);
+    }
+    gate = quarter_warp_sum_f32(gate, lane);
+    up = quarter_warp_sum_f32(up, lane);
+    if (lane == 0) {
+        if (clamp > 1.0e-6f) {
+            if (gate > clamp) gate = clamp;
+            if (up > clamp) up = clamp;
+            if (up < -clamp) up = -clamp;
+        }
+        const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+    }
+}
+
 __global__ static DS4_CUDA_UNUSED void moe_gate_up_mid_expert_tile8_kernel(
         float *gate_out,
         float *up_out,
@@ -9301,6 +9363,33 @@ __global__ static void moe_down_sorted_qwarp32_kernel(
     if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = acc;
 }
 
+__global__ static void moe_down_sorted_q4K_qwarp32_kernel(
+        float *down_out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const uint32_t *sorted_pairs,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert) {
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    uint32_t pair = sorted_pairs[blockIdx.y];
+    if (row >= out_dim) return;
+    uint32_t tok = pair / n_expert;
+    uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+    const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_q4_K_q8_K_block(wr + b, xq + b);
+    acc = quarter_warp_sum_f32(acc, lane);
+    if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = acc;
+}
+
 __global__ static DS4_CUDA_UNUSED void moe_down_expert_tile8_kernel(
         float *down_out,
         const char *down_base,
@@ -9912,11 +10001,16 @@ static int routed_moe_launch(
         mid->bytes < (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) ||
         down->bytes < (uint64_t)n_tokens * n_expert * out_dim * sizeof(float) ||
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
+        fprintf(stderr, "ds4: routed_moe fail: basic param check n_tokens=%u n_expert=%u n_total=%u expert_in=%u expert_mid=%u out_dim=%u gate_type=%u down_type=%u\n",
+                n_tokens, n_expert, n_total_expert, expert_in_dim, expert_mid_dim, out_dim, gate_type, down_type);
         return 0;
     }
     const int q4k_path = (gate_type == 12u && down_type == 12u);
-    if (!q4k_path && (gate_type != 16u || down_type != 10u)) return 0;
-    if (q4k_path && (n_tokens != 1u || n_expert != 6u)) return 0;
+    if (!q4k_path && (gate_type != 16u || down_type != 10u)) {
+        fprintf(stderr, "ds4: routed_moe fail: unsupported gate_type=%u down_type=%u (need gate=16+down=10 or gate=12+down=12)\n",
+                gate_type, down_type);
+        return 0;
+    }
     const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
     const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
     if (gate_bytes > model_size - gate_offset ||
@@ -9927,7 +10021,11 @@ static int routed_moe_launch(
     const char *gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
     const char *up_w = cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
     const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
-    if (!gate_w || !up_w || !down_w) return 0;
+    if (!gate_w || !up_w || !down_w) {
+        fprintf(stderr, "ds4: routed_moe fail: weight ptr NULL gate=%p up=%p down=%p gate_off=0x%llx gate_bytes=%llu\n",
+                (void*)gate_w, (void*)up_w, (void*)down_w, (unsigned long long)gate_offset, (unsigned long long)gate_bytes);
+        return 0;
+    }
 
     int ok = 1;
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
@@ -9953,10 +10051,10 @@ static int routed_moe_launch(
         }
         const uint32_t pair_count = n_tokens * n_expert;
         const uint32_t use_sorted_pairs = n_tokens > 1u;
-        const uint32_t use_expert_tiles = use_sorted_pairs && getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL;
+        const uint32_t use_expert_tiles = use_sorted_pairs && getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL && !q4k_path;
         const uint32_t expert_tile_m = getenv("DS4_CUDA_MOE_TILE4") ? 4u : 8u;
         const uint32_t write_gate_up = getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL;
-        const uint32_t use_p2_sorted = use_sorted_pairs && getenv("DS4_CUDA_MOE_NO_P2") == NULL;
+        const uint32_t use_p2_sorted = use_sorted_pairs && getenv("DS4_CUDA_MOE_NO_P2") == NULL && !q4k_path;
         const uint32_t use_atomic_down = use_expert_tiles &&
             (getenv("DS4_CUDA_MOE_ATOMIC_DOWN") != NULL ||
              (n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN") == NULL));
@@ -10154,6 +10252,23 @@ static int routed_moe_launch(
                     n_expert,
                     pair_count,
                     clamp);
+            } else if (ok && sorted_pairs && q4k_path) {
+                moe_gate_up_mid_sorted_q4K_qwarp32_kernel<<<mgrid, 256>>>(
+                    (float *)gate->ptr,
+                    (float *)up->ptr,
+                    (float *)mid->ptr,
+                    gate_w,
+                    up_w,
+                    xq,
+                    sorted_pairs,
+                    (const int32_t *)selected->ptr,
+                    (const float *)weights->ptr,
+                    gate_expert_bytes,
+                    gate_row_bytes,
+                    xq_blocks,
+                    expert_mid_dim,
+                    n_expert,
+                    clamp);
             } else if (ok && sorted_pairs) {
                 moe_gate_up_mid_sorted_qwarp32_kernel<<<mgrid, 256>>>(
                     (float *)gate->ptr,
@@ -10337,6 +10452,18 @@ static int routed_moe_launch(
                     out_dim,
                     n_expert,
                     pair_count);
+            } else if (sorted_pairs && q4k_path) {
+                moe_down_sorted_q4K_qwarp32_kernel<<<dgrid, 256>>>(
+                    (float *)down->ptr,
+                    down_w,
+                    midq,
+                    sorted_pairs,
+                    (const int32_t *)selected->ptr,
+                    down_expert_bytes,
+                    down_row_bytes,
+                    midq_blocks,
+                    out_dim,
+                    n_expert);
             } else if (sorted_pairs) {
                 moe_down_sorted_qwarp32_kernel<<<dgrid, 256>>>(
                     (float *)down->ptr,
@@ -10349,6 +10476,16 @@ static int routed_moe_launch(
                     midq_blocks,
                     out_dim,
                     n_expert);
+            } else if (q4k_path) {
+                moe_down_q4K_sum6_qwarp32_kernel<<<dgrid, 256>>>(
+                    (float *)down->ptr,
+                    down_w,
+                    midq,
+                    (const int32_t *)selected->ptr,
+                    down_expert_bytes,
+                    down_row_bytes,
+                    midq_blocks,
+                    out_dim);
             } else {
                 moe_down_qwarp32_kernel<<<dgrid, 256>>>(
                     (float *)down->ptr,
