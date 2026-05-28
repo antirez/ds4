@@ -18045,7 +18045,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->suffix_decoding = opt->suffix_decoding;
     e->suffix_max_depth = opt->suffix_max_depth > 0 ? opt->suffix_max_depth : 32;
     e->suffix_memory_budget = opt->suffix_memory_budget > 0 ? opt->suffix_memory_budget : 64 * 1024 * 1024;
-    e->suffix_spec_factor = opt->suffix_spec_factor >= 0.0f ? opt->suffix_spec_factor : 0.01f;
+    e->suffix_spec_factor = opt->suffix_spec_factor > 0.0f ? opt->suffix_spec_factor : 0.01f;
     e->suffix_spec_offset = opt->suffix_spec_offset >= 0.0f ? opt->suffix_spec_offset : 2.0f;
     e->suffix_min_prob = opt->suffix_min_prob >= 0.0f ? opt->suffix_min_prob : 0.0f;
     if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
@@ -18937,7 +18937,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         } \
         if (draft_n > 0) { \
             e->spec_telemetry.total_committed += (uint64_t)(n_accept - 1); \
-            e->spec_telemetry.total_verified += (uint64_t)(draft_n - 1); \
+            e->spec_telemetry.total_verified += (uint64_t)draft_n; \
             if (n_accept >= draft_n + 1) { \
                 if ((uint32_t)(draft_n - 1) < 16) \
                     e->spec_telemetry.full_accept[(uint32_t)(draft_n - 1)]++; \
@@ -19130,7 +19130,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     const bool can_batch_verify = s->graph.spec_logits != NULL;
     const bool use_decode2_exact =
         can_batch_verify &&
-        draft_n == 2 && (strict_mtp || used_suffix_tree) &&
+        draft_n == 2 && strict_mtp &&
         getenv("DS4_MTP_BATCH_VERIFY") == NULL;
     if (use_decode2_exact) {
         ds4_spec_frontier frontier;
@@ -19155,7 +19155,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                   row0_logits,
                                                   row_logits);
         }
-        const double verify_done = mtp_timing ? now_sec() : 0.0;
+        const double verify_done = now_sec();
         if (ok && row0_top == drafts[1]) {
             memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
             token_vec_push(&s->checkpoint, drafts[0]);
