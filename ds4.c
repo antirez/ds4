@@ -18334,14 +18334,14 @@ void ds4_spec_telemetry_print(const ds4_spec_telemetry *t) {
             (unsigned long long)t->first_draft_miss,
             (unsigned long long)t->total_committed,
             (unsigned long long)t->total_verified);
-    if (t->spec_steps > 0) {
+    if (t->total_verified > 0) {
         double accept_rate = (double)t->total_committed / (double)t->total_verified;
         fprintf(stderr, " accept_rate=%.3f", accept_rate);
     }
     for (int i = 0; i < 16; i++) {
         if (t->full_accept[i] || t->partial_accept[i]) {
             fprintf(stderr, " N=%d:full=%llu:partial=%llu",
-                    i + 2,
+                    i + 1,
                     (unsigned long long)t->full_accept[i],
                     (unsigned long long)t->partial_accept[i]);
         }
@@ -18956,16 +18956,13 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     int draft_n = 0;
     bool using_mtp = false;
     const bool suffix_spec_log = getenv("DS4_SUFFIX_SPEC_LOG") != NULL;
-    const bool spec_telemetry_log = suffix_spec_log;
     e->spec_telemetry.spec_steps++;
     if (suffix_available) {
         uint32_t suffix_n = 0;
         float suffix_score = 0.0f;
         const double dq_t0 = now_sec();
         uint32_t p = draft_from_suffix_tree(s, drafts, (uint32_t)draft_cap, &suffix_n, &suffix_score);
-        if (spec_telemetry_log) {
-            e->spec_telemetry.total_draft_query_ms += (now_sec() - dq_t0) * 1000.0;
-        }
+        e->spec_telemetry.total_draft_query_ms += (now_sec() - dq_t0) * 1000.0;
         if (p >= 2 && suffix_n > 0 && suffix_score > 0.0f) {
             draft_n = (int)suffix_n;
             for (int i = 0; i < draft_n; i++) {
@@ -19023,6 +19020,9 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
      */
     if (sample_argmax(s->logits, DS4_N_VOCAB) != drafts[0]) {
         e->spec_telemetry.first_draft_miss++;
+        e->spec_telemetry.total_verified++;
+        if (draft_n > 0 && (uint32_t)(draft_n - 1) < 16)
+            e->spec_telemetry.partial_accept[(uint32_t)(draft_n - 1)]++;
         if (getenv("DS4_MTP_SPEC_LOG")) {
             fprintf(stderr, "ds4: spec miss first draft=%d source=%s\n",
                     drafts[0],
@@ -19265,7 +19265,8 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                 row_tops,
                                                 NULL);
         }
-        const double micro_verify_done = mtp_timing ? now_sec() : 0.0;
+        const double micro_verify_done = now_sec();
+        e->spec_telemetry.total_verify_ms += (micro_verify_done - bv_t0) * 1000.0;
         if (ok) {
             int commit_drafts = 1;
             for (int i = 1; i < draft_n; i++) {
@@ -19308,7 +19309,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                         DS4_MTP_KEEP_ACCEPTED(replayed);
                         spec_frontier_free(&frontier);
                         DS4_SUFFIX_NOTE_ACCEPTED();
-                        e->spec_telemetry.total_verify_ms += (now_sec() - bv_t0) * 1000.0;
+                        e->spec_telemetry.total_replay_ms += (now_sec() - micro_verify_done) * 1000.0;
                         return n_accept;
                     }
                 }
@@ -19338,7 +19339,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                 (now_sec() - mtp_t0) * 1000.0);
                     }
                     spec_frontier_free(&frontier);
-                    e->spec_telemetry.total_verify_ms += (now_sec() - bv_t0) * 1000.0;
                     DS4_SUFFIX_NOTE_ACCEPTED();
                     return n_accept;
                 }
@@ -19369,7 +19369,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                 (now_sec() - mtp_t0) * 1000.0);
                     }
                     spec_frontier_free(&frontier);
-                    e->spec_telemetry.total_verify_ms += (now_sec() - bv_t0) * 1000.0;
                     DS4_SUFFIX_NOTE_ACCEPTED();
                     return n_accept;
                 }
@@ -19404,7 +19403,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                 (replay_done - mtp_t0) * 1000.0);
                     }
                     spec_frontier_free(&frontier);
-                    e->spec_telemetry.total_verify_ms += (now_sec() - bv_t0) * 1000.0; 
                     e->spec_telemetry.total_replay_ms += (now_sec() - micro_verify_done) * 1000.0;
                     DS4_SUFFIX_NOTE_ACCEPTED();
                     return n_accept;
@@ -19446,7 +19444,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                 (replay_done - mtp_t0) * 1000.0);
                     }
                     spec_frontier_free(&frontier);
-                    e->spec_telemetry.total_verify_ms += (now_sec() - bv_t0) * 1000.0; 
                     e->spec_telemetry.total_replay_ms += (now_sec() - micro_verify_done) * 1000.0;
                     DS4_SUFFIX_NOTE_ACCEPTED();
                     return n_accept;
