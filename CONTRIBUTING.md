@@ -128,6 +128,12 @@ Use the same machine, backend, model file, context sweep, power/thermal state,
 and background load when comparing two commits. For backend work, run at least
 one before/after CSV and compare both `prefill_tps` and `gen_tps`. Generation is
 greedy and skips EOS so each frontier gets the same number of generated tokens.
+When testing memory-compression work, also compare `context_raw_bytes`,
+`context_compressed_bytes`, `context_scratch_bytes`, and `kvcache_bytes`. When
+testing speculative decoding, include the MTP columns such as
+`mtp_extra_accept_rate`, `mtp_accepted_extra_tokens`, and `mtp_eval_sec`.
+For suffix decoding, include the `suffix_*` columns and state whether MTP was
+also enabled.
 
 To generate a graph for a CSV:
 

@@ -163,6 +163,14 @@ enabled explicitly with `--mtp`. The current MTP/speculative decoding path is
 still experimental: it is correctness-gated and currently provides at most a
 slight speedup, not a meaningful generation-speed win.
 
+`--suffix-decoding` enables an experimental model-free speculative decoder based
+on suffix tries built from the prompt and prior generated tokens. It does not
+need an MTP or draft GGUF; when both are configured, suffix matches are tried
+first and MTP remains the fallback. The default draft cap is conservative
+(`--suffix-spec-factor 0.01 --suffix-spec-offset 2`) because long over-drafts can
+cost more to verify than they save on the current Metal path; increase these
+values when benchmarking workloads with very high suffix acceptance.
+
 Then build:
 
 ```sh
@@ -280,8 +288,26 @@ header and footer removed: <https://www.gutenberg.org/ebooks/45334>.
 
 Use `--step-incr N` for different linear spacing, or `--step-mul F` for
 exponential sweeps. Output is CSV with one row per frontier: latest prefill
-interval tokens/sec, generation tokens/sec at that frontier, and
-`kvcache_bytes`.
+interval tokens/sec, generation tokens/sec at that frontier, `kvcache_bytes`,
+the context memory estimate split into raw/compressed/scratch bytes, MTP
+speculative-decode counters when `--mtp` is enabled, and suffix-tree telemetry
+when `--suffix-decoding` is enabled.
+
+For MTP speculative-decoding sweeps, `ds4-bench` accepts the same MTP model
+options as the CLI:
+
+```sh
+./ds4-bench \
+  -m ds4flash.gguf \
+  --mtp gguf/DeepSeek-V4-Flash-MTP.gguf \
+  --mtp-draft 2 \
+  --prompt-file speed-bench/promessi_sposi.txt
+```
+
+The MTP columns report the actual generated tokens, accepted extra draft tokens,
+and their acceptance rate. For model-free suffix decoding, add
+`--suffix-decoding` and compare the `suffix_*` columns with the same prompt and
+context sweep.
 
 Sessions prefill long prompts in 4096-token chunks by default. Set
 `DS4_METAL_PREFILL_CHUNK=N` to compare another chunk size, for example `2048`
