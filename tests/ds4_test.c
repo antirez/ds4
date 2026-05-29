@@ -496,6 +496,450 @@ static char *test_read_file(const char *path) {
     return s;
 }
 
+static void test_send_all_or_fail(int fd, const char *data, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = send(fd, data + off, len - off, 0);
+        if (n < 0 && errno == EINTR) continue;
+        TEST_ASSERT(n > 0);
+        if (n <= 0) return;
+        off += (size_t)n;
+    }
+}
+
+static void test_set_nonblocking_or_fail(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    TEST_ASSERT(flags >= 0);
+    if (flags < 0) return;
+    TEST_ASSERT(fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0);
+}
+
+static void test_server_cleanup_keep_engine(server *s) {
+    if (!s) return;
+    if (s->trace) {
+        fclose(s->trace);
+        s->trace = NULL;
+    }
+    kv_cache_close(&s->kv);
+    tool_memory_free(&s->tool_mem);
+    live_tool_state_free(&s->responses_live);
+    live_tool_state_free(&s->anthropic_live);
+    visible_live_free(&s->thinking_live);
+    pthread_mutex_destroy(&s->tool_mu);
+    pthread_mutex_destroy(&s->trace_mu);
+    pthread_cond_destroy(&s->clients_cv);
+    pthread_cond_destroy(&s->cv);
+    pthread_mutex_destroy(&s->mu);
+    ds4_session_free(s->session);
+    memset(s, 0, sizeof(*s));
+}
+
+static void test_server_init_live(server *s, ds4_engine *engine, int ctx_size,
+                                  const char *trace_path) {
+    memset(s, 0, sizeof(*s));
+    s->engine = engine;
+    s->default_tokens = 256;
+    s->tool_mem.max_entries = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS;
+    TEST_ASSERT(ds4_session_create(&s->session, engine, ctx_size) == 0);
+    if (!s->session) return;
+    pthread_mutex_init(&s->mu, NULL);
+    pthread_cond_init(&s->cv, NULL);
+    pthread_cond_init(&s->clients_cv, NULL);
+    pthread_mutex_init(&s->tool_mu, NULL);
+    pthread_mutex_init(&s->trace_mu, NULL);
+    if (trace_path) {
+        s->trace = fopen(trace_path, "w");
+        TEST_ASSERT(s->trace != NULL);
+        if (!s->trace) return;
+        setvbuf(s->trace, NULL, _IONBF, 0);
+        server_log(DS4_LOG_DEFAULT, "ds4-server: tracing session to %s", trace_path);
+    }
+}
+
+typedef struct {
+    int fd;
+    bool saw_bytes;
+    bool saw_done;
+    bool eof;
+    double send_done_at;
+    double first_byte_at;
+    double last_byte_at;
+    double done_at;
+    double eof_at;
+    buf raw;
+} test_stream_capture;
+
+static double test_wall_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static void test_sleep_ms(long ms) {
+    struct timespec req = {
+        .tv_sec = ms / 1000,
+        .tv_nsec = (ms % 1000) * 1000000L,
+    };
+    while (nanosleep(&req, &req) != 0 && errno == EINTR) {}
+}
+
+static void test_stream_capture_append(test_stream_capture *cap,
+                                       const char *data, size_t len) {
+    if (!cap || !data || !len) return;
+    if (!cap->saw_bytes) {
+        cap->saw_bytes = true;
+        cap->first_byte_at = test_wall_sec();
+    }
+    cap->last_byte_at = test_wall_sec();
+    buf_append(&cap->raw, data, len);
+    if (!cap->saw_done && cap->raw.ptr && strstr(cap->raw.ptr, "data: [DONE]")) {
+        cap->saw_done = true;
+        cap->done_at = test_wall_sec();
+    }
+}
+
+static void test_stream_capture_close(test_stream_capture *cap) {
+    if (!cap || cap->fd < 0) return;
+    cap->eof_at = test_wall_sec();
+    close(cap->fd);
+    cap->fd = -1;
+    cap->eof = true;
+}
+
+static size_t test_count_nonempty_lines(const char *text) {
+    size_t lines = 0;
+    const char *p = text ? text : "";
+    while (*p) {
+        const char *line_end = strchr(p, '\n');
+        size_t len = line_end ? (size_t)(line_end - p) : strlen(p);
+        while (len > 0 && (p[len - 1] == '\r' || p[len - 1] == '\n')) len--;
+        if (len > 0) lines++;
+        if (!line_end) break;
+        p = line_end + 1;
+    }
+    return lines;
+}
+
+static void test_server_log_multiline(const char *prefix, const char *text) {
+    const char *p = text ? text : "";
+    while (*p) {
+        const char *line_end = strchr(p, '\n');
+        size_t len = line_end ? (size_t)(line_end - p) : strlen(p);
+        if (len > 0) {
+            char *line = xstrndup(p, len);
+            server_log(DS4_LOG_DEFAULT, "%s%s", prefix ? prefix : "", line);
+            free(line);
+        }
+        if (!line_end) break;
+        p = line_end + 1;
+    }
+}
+
+static void test_log_stream_capture_server(const char *label,
+                                           const test_stream_capture *cap,
+                                           const char *text) {
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-test: %s send_done_ts=%.6f first_byte_ts=%.6f done_marker_ts=%.6f last_byte_ts=%.6f eof_ts=%.6f",
+               label,
+               cap->send_done_at,
+               cap->first_byte_at,
+               cap->done_at > 0.0 ? cap->done_at : -1.0,
+               cap->last_byte_at,
+               cap->eof_at > 0.0 ? cap->eof_at : -1.0);
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-test: %s raw_response_after_eof",
+               label);
+    test_server_log_multiline("ds4-test: ", text ? text : "");
+}
+
+static void test_log_stream_timing_summary_server(const char *label,
+                                                  const test_stream_capture *cap) {
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-test: final_timing_summary %s send_done_ts=%.6f first_byte_ts=%.6f done_marker_ts=%.6f last_byte_ts=%.6f eof_ts=%.6f",
+               label,
+               cap->send_done_at,
+               cap->first_byte_at,
+               cap->done_at > 0.0 ? cap->done_at : -1.0,
+               cap->last_byte_at,
+               cap->eof_at > 0.0 ? cap->eof_at : -1.0);
+}
+
+static char *test_build_chat_http_request(const char *prompt, bool stream) {
+    buf user_prompt = {0};
+    buf body = {0};
+    buf req = {0};
+    buf_puts(&user_prompt, prompt ? prompt : "");
+    buf_puts(&user_prompt,
+             "\n\nFormato obbligatorio: restituisci tutte e sole le 50 parole "
+             "della lista che iniziano con c. L'ordine non importa. Puoi "
+             "separarle con spazi o nuove righe. Niente spiegazioni o altre parole.");
+    buf_puts(&body,
+             "{\"model\":\"deepseek-chat\","
+             "\"messages\":[{\"role\":\"user\",\"content\":");
+    json_escape(&body, user_prompt.ptr ? user_prompt.ptr : "");
+    buf_printf(&body,
+               "}],\"max_tokens\":512,\"temperature\":0,"
+               "\"stream\":%s,\"thinking\":false}",
+               stream ? "true" : "false");
+    buf_printf(&req,
+               "POST /v1/chat/completions HTTP/1.1\r\n"
+               "Host: localhost\r\n"
+               "Content-Type: application/json\r\n"
+               "Content-Length: %zu\r\n"
+               "\r\n",
+               body.len);
+    buf_append(&req, body.ptr, body.len);
+    buf_free(&user_prompt);
+    buf_free(&body);
+    return req.ptr;
+}
+
+static void test_drive_single_stream(test_stream_capture *cap) {
+    struct pollfd pfd;
+    double start = now_sec();
+
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.fd = cap->fd;
+    pfd.events = POLLIN | POLLHUP;
+    while (!cap->eof) {
+        int rc = poll(&pfd, 1, 1000);
+        if (rc < 0 && errno == EINTR) continue;
+        TEST_ASSERT(rc >= 0);
+        TEST_ASSERT(now_sec() - start < 180.0);
+        if (rc <= 0) continue;
+        if (!(pfd.revents & (POLLIN | POLLHUP))) continue;
+        for (;;) {
+            char tmp[4096];
+            ssize_t n = recv(cap->fd, tmp, sizeof(tmp), 0);
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+            TEST_ASSERT(n >= 0);
+            if (n < 0) {
+                test_stream_capture_close(cap);
+                break;
+            }
+            if (n == 0) {
+                test_stream_capture_close(cap);
+                break;
+            }
+            test_stream_capture_append(cap, tmp, (size_t)n);
+        }
+    }
+}
+
+static void test_drive_two_streams(test_stream_capture *a,
+                                   test_stream_capture *b) {
+    struct pollfd pfds[2];
+    double start = now_sec();
+
+    memset(pfds, 0, sizeof(pfds));
+    pfds[0].fd = a->fd;
+    pfds[0].events = POLLIN | POLLHUP;
+    pfds[1].fd = b->fd;
+    pfds[1].events = POLLIN | POLLHUP;
+
+    while (!a->eof || !b->eof) {
+        int rc = poll(pfds, 2, 1000);
+        if (rc < 0 && errno == EINTR) continue;
+        TEST_ASSERT(rc >= 0);
+        TEST_ASSERT(now_sec() - start < 180.0);
+        if (rc <= 0) continue;
+
+        for (int i = 0; i < 2; i++) {
+            test_stream_capture *cap = i == 0 ? a : b;
+            if (cap->eof) continue;
+            if (!(pfds[i].revents & (POLLIN | POLLHUP))) continue;
+            for (;;) {
+                char tmp[4096];
+                ssize_t n = recv(cap->fd, tmp, sizeof(tmp), 0);
+                if (n < 0 && errno == EINTR) continue;
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+                TEST_ASSERT(n >= 0);
+                if (n < 0) {
+                    test_stream_capture_close(cap);
+                    break;
+                }
+                if (n == 0) {
+                    test_stream_capture_close(cap);
+                    break;
+                }
+                test_stream_capture_append(cap, tmp, (size_t)n);
+            }
+        }
+    }
+}
+
+static const char test_server_word_filter_prompt[] =
+    "Ti passo una lista di parole. Di queste elencami le parole, solo quelle, senza altri frasi di spiegazione, che iniziano per il carattere c. una parola per ogni linea, mi aspetto 50 linee perche' abbimoa 50 parole che soddisfano il requisito.\n"
+    "cable cactus camera candle cannon canvas captain carbon castle catalog celery center ceremony champion channel chapter charity cheetah cherry chimney chorus circle citizen clarity classic climate closet cluster coastal coconut coffee college comfort comic compass concert condor control cookie corner cotton country courage cradle crystal culture curtain custom cyclone cylinder able about above absurd adapt admit adult afraid agent agree airport album alert alien alley almost alpha always amber amount anchor angel animal answer anyone apart april arena argue arise around artist aspect attack august author autumn avenue await banana barrel basket battle beauty behalf behind belief belong benefit beyond binary bishop blanket border borrow bottle bottom branch breeze bridge bright broken budget buffer bullet bundle button buyer damage danger daring debate decade defeat defend define degree demand depart depend desert design detail device dialog differ dinner direct disease display distant divide dollar domain dragon drawer dream driven during eager early earth easily editor effect effort eighth either elder elegant element elite embark emotion empire enable ending energy engine enjoy enough ensure entire envelope episode equal escape estate ethics evening fabric factor failure fairly family famous father feature fellow female fiction filter final finger finish fiscal flavor flight flower follow forest formal forward fragile freedom friday future galaxy gallery garden gather general gentle genuine gesture ginger global golden govern grammar harbor harmony hazard height hidden holiday honest hunger hybrid ideal ignore illegal imagine impact import improve include infant inform inherit initial inquiry inside inspire instead intense island jacket jungle kernel ladder language lawyer leader legend liberty light linear little magnet manager manual market master matter memory mental middle minute modern monkey mother mountain musical mystery narrow nation native nature nearby normal notice number object office online open opera option oral order organ origin output owner panel paper parent part party phase phone photo piano piece pilot place plain plane plant plate player point power press price prime print prior prize proof proud prove public punch pupil radio range rapid ratio ready realm reason reply report result retail review river round route royal rural scale share shift shirt shock short signal silver simple single sister skill sleep slide small smart smile solid solve sorry sound south space speak speed spend split sport staff stage stand start state steam steel stock stone store story style sugar suite super sweet table taste teach thank theme thick thing think third those throw tiger title today topic total touch tough tower trade train treat trend trial trust truth twice union unity value video virus visit vital voice waste watch water wheel where which while white whole woman world worry worth write wrong yield young youth";
+
+static const char test_server_trace_path[] = "/tmp/ds4-trace.txt";
+
+static char *test_server_word_filter_prompt_dup(void) {
+    return xstrdup(test_server_word_filter_prompt);
+}
+
+static void test_server_single_request_word_filter(void) {
+    char *prompt = test_server_word_filter_prompt_dup();
+    TEST_ASSERT(prompt != NULL);
+    if (!prompt) return;
+
+    char *http_req = test_build_chat_http_request(prompt, true);
+    TEST_ASSERT(http_req != NULL);
+    if (!http_req) {
+        free(prompt);
+        return;
+    }
+
+    ds4_engine *engine = test_get_engine(false);
+    server s;
+    pthread_t worker;
+    pthread_t client_thread;
+    int sv[2] = {-1, -1};
+    test_stream_capture cap = {.fd = -1};
+
+    test_server_init_live(&s, engine, 4096, NULL);
+    if (!s.session) {
+        free(http_req);
+        free(prompt);
+        return;
+    }
+    TEST_ASSERT(pthread_create(&worker, NULL, worker_main, &s) == 0);
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        configure_client_socket(sv[0]);
+        test_send_all_or_fail(sv[1], http_req, strlen(http_req));
+        shutdown(sv[1], SHUT_WR);
+        cap.send_done_at = test_wall_sec();
+        test_set_nonblocking_or_fail(sv[1]);
+        cap.fd = sv[1];
+
+        client_arg *ca = xmalloc(sizeof(*ca));
+        ca->srv = &s;
+        ca->fd = sv[0];
+        TEST_ASSERT(pthread_create(&client_thread, NULL, client_main, ca) == 0);
+
+        test_drive_single_stream(&cap);
+        pthread_join(client_thread, NULL);
+    }
+
+    pthread_mutex_lock(&s.mu);
+    s.stopping = true;
+    pthread_cond_broadcast(&s.cv);
+    pthread_mutex_unlock(&s.mu);
+    pthread_join(worker, NULL);
+
+    TEST_ASSERT(cap.raw.ptr != NULL);
+    TEST_ASSERT(cap.saw_bytes);
+    TEST_ASSERT(cap.saw_done);
+    TEST_ASSERT(cap.raw.ptr && strstr(cap.raw.ptr, "HTTP/1.1 200 OK") != NULL);
+    TEST_ASSERT(cap.last_byte_at > 0.0);
+    size_t line_count = test_count_nonempty_lines(cap.raw.ptr ? cap.raw.ptr : "");
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-test: smoke raw_response_nonempty_lines=%zu expected_lt=150",
+               line_count);
+    TEST_ASSERT(line_count < 150);
+
+    test_log_stream_capture_server("smoke", &cap, cap.raw.ptr ? cap.raw.ptr : "");
+
+    buf_free(&cap.raw);
+    test_server_cleanup_keep_engine(&s);
+    free(http_req);
+    free(prompt);
+}
+
+static void test_server_concurrent_requests_stream_sequentially(void) {
+    char *prompt = test_server_word_filter_prompt_dup();
+    TEST_ASSERT(prompt != NULL);
+    if (!prompt) return;
+
+    char *http_req = test_build_chat_http_request(prompt, true);
+    TEST_ASSERT(http_req != NULL);
+    if (!http_req) {
+        free(prompt);
+        return;
+    }
+
+    ds4_engine *engine = test_get_engine(false);
+    server s;
+    pthread_t worker;
+    pthread_t client_threads[2];
+    int sv[2][2] = {{-1, -1}, {-1, -1}};
+    test_stream_capture caps[2] = {{.fd = -1}, {.fd = -1}};
+
+    test_server_init_live(&s, engine, 4096, test_server_trace_path);
+    if (!s.session) {
+        free(http_req);
+        free(prompt);
+        return;
+    }
+    s.batching = true;
+    s.batch_size = 2;
+    TEST_ASSERT(pthread_create(&worker, NULL, worker_main, &s) == 0);
+
+    for (int i = 0; i < 2; i++) {
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv[i]) == 0);
+        if (sv[i][0] < 0 || sv[i][1] < 0) continue;
+        configure_client_socket(sv[i][0]);
+        test_send_all_or_fail(sv[i][1], http_req, strlen(http_req));
+        shutdown(sv[i][1], SHUT_WR);
+        caps[i].send_done_at = test_wall_sec();
+        test_set_nonblocking_or_fail(sv[i][1]);
+        caps[i].fd = sv[i][1];
+
+        client_arg *ca = xmalloc(sizeof(*ca));
+        ca->srv = &s;
+        ca->fd = sv[i][0];
+        TEST_ASSERT(pthread_create(&client_threads[i], NULL, client_main, ca) == 0);
+
+        if (i == 0) test_sleep_ms(500);
+    }
+
+    test_drive_two_streams(&caps[0], &caps[1]);
+
+    for (int i = 0; i < 2; i++) {
+        pthread_join(client_threads[i], NULL);
+    }
+    pthread_mutex_lock(&s.mu);
+    s.stopping = true;
+    pthread_cond_broadcast(&s.cv);
+    pthread_mutex_unlock(&s.mu);
+    pthread_join(worker, NULL);
+
+    for (int i = 0; i < 2; i++) {
+        TEST_ASSERT(caps[i].raw.ptr != NULL);
+        TEST_ASSERT(caps[i].saw_bytes);
+        TEST_ASSERT(caps[i].saw_done);
+        TEST_ASSERT(caps[i].raw.ptr && strstr(caps[i].raw.ptr, "HTTP/1.1 200 OK") != NULL);
+        TEST_ASSERT(caps[i].last_byte_at > 0.0);
+        size_t line_count = test_count_nonempty_lines(caps[i].raw.ptr ? caps[i].raw.ptr : "");
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-test: req%d raw_response_nonempty_lines=%zu expected_lt=150",
+                   i + 1,
+                   line_count);
+        TEST_ASSERT(line_count < 150);
+    }
+
+    test_log_stream_capture_server("req1", &caps[0], caps[0].raw.ptr ? caps[0].raw.ptr : "");
+    test_log_stream_capture_server("req2", &caps[1], caps[1].raw.ptr ? caps[1].raw.ptr : "");
+    test_log_stream_timing_summary_server("req1", &caps[0]);
+    test_log_stream_timing_summary_server("req2", &caps[1]);
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-test: concurrent compare req_gap_ms=500 req1_last_byte_ts=%.6f req2_first_byte_ts=%.6f sequential=%d",
+               caps[0].last_byte_at,
+               caps[1].first_byte_at,
+               caps[1].first_byte_at > caps[0].last_byte_at ? 1 : 0);
+    TEST_ASSERT(caps[1].first_byte_at > 0.0);
+    TEST_ASSERT(caps[0].last_byte_at > caps[1].first_byte_at);
+
+    buf_free(&caps[0].raw);
+    buf_free(&caps[1].raw);
+    test_server_cleanup_keep_engine(&s);
+    free(http_req);
+    free(prompt);
+}
+
 typedef struct {
     const char *name;
     int number;
@@ -1597,6 +2041,10 @@ static void test_tool_call_quality(void) {
 
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
+#ifndef DS4_NO_GPU
+    test_server_single_request_word_filter();
+    test_server_concurrent_requests_stream_sequentially();
+#endif
 }
 
 typedef void (*test_fn)(void);
@@ -1618,7 +2066,7 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
 #endif
-    {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
+    {"--server", "server", "server parser/rendering/cache unit tests plus concurrent inference smoke", test_server_unit_group},
 };
 
 static void test_print_help(const char *prog) {
