@@ -15,6 +15,10 @@
 #include "ds4.h"
 #include "ds4_gpu.h"
 
+#ifdef DS4_EMBED_KERNELS
+#include "metal_embedded_extras.h"
+#endif
+
 /*
  * Objective-C Metal glue for the C engine.
  *
@@ -1481,6 +1485,12 @@ static const char *ds4_gpu_source =
 "\n";
 
 static NSString *ds4_gpu_full_source(void) {
+#ifdef DS4_EMBED_KERNELS
+    // Use pre-embedded Metal sources (no runtime file I/O).
+    NSString *base = [NSString stringWithUTF8String:ds4_gpu_source];
+    NSString *extras = [NSString stringWithUTF8String:ds4_gpu_embedded_extras];
+    return [base stringByAppendingString:extras];
+#else
     NSString *base = [NSString stringWithUTF8String:ds4_gpu_source];
     NSFileManager *fm = [NSFileManager defaultManager];
     /*
@@ -1547,6 +1557,7 @@ static NSString *ds4_gpu_full_source(void) {
         [source appendFormat:@"\n// appended %@\n%@\n", loaded_path, loaded];
     }
     return source;
+#endif
 }
 
 typedef struct {

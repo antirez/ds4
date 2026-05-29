@@ -14,6 +14,34 @@ OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fo
 LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
 
+# Optional: embed Metal kernel sources into the binary instead of loading from disk.
+DS4_EMBED_KERNELS ?=
+ifneq ($(DS4_EMBED_KERNELS),)
+OBJCFLAGS += -DDS4_EMBED_KERNELS
+endif
+
+# Ordered list of Metal sources to embed, matching the order in ds4_gpu_full_source().
+METAL_EMBED_SRCS = \
+    metal/flash_attn.metal \
+    metal/dense.metal \
+    metal/moe.metal \
+    metal/dsv4_hc.metal \
+    metal/unary.metal \
+    metal/dsv4_kv.metal \
+    metal/dsv4_rope.metal \
+    metal/dsv4_misc.metal \
+    metal/argsort.metal \
+    metal/cpy.metal \
+    metal/concat.metal \
+    metal/get_rows.metal \
+    metal/sum_rows.metal \
+    metal/softmax.metal \
+    metal/repeat.metal \
+    metal/glu.metal \
+    metal/norm.metal \
+    metal/bin.metal \
+    metal/set_rows.metal
+
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 CORE_OBJS = ds4.o ds4_metal.o
@@ -44,6 +72,7 @@ help:
 	@echo "  make cpu          Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test         Build and run tests"
 	@echo "  make clean        Remove build outputs"
+	@echo "  make DS4_EMBED_KERNELS=1   Embed Metal sources into binary (no runtime file reads)"
 
 ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_cli.o linenoise.o $(CORE_OBJS) $(METAL_LDLIBS)
@@ -80,6 +109,7 @@ help:
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test                Build and run tests"
 	@echo "  make clean               Remove build outputs"
+	@echo "  make DS4_EMBED_KERNELS=1   Embed Metal sources into binary (no runtime file reads)"
 
 cuda-spark:
 	$(MAKE) ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=
@@ -119,6 +149,12 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu
 
 cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
+endif
+
+# Generate embedded Metal sources header.
+ifneq ($(DS4_EMBED_KERNELS),)
+metal_embedded_extras.h: $(METAL_EMBED_SRCS)
+	python3 tools/embed_metal.py $@ $(METAL_EMBED_SRCS)
 endif
 
 ds4.o: ds4.c ds4.h ds4_gpu.h
@@ -178,6 +214,10 @@ ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_kvstore.h ds4_web.h linenoise.h
 ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
+ifneq ($(DS4_EMBED_KERNELS),)
+ds4_metal.o: metal_embedded_extras.h
+endif
+
 ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
@@ -196,4 +236,4 @@ test: ds4_test ds4-eval
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o metal_embedded_extras.h
