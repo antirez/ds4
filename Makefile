@@ -16,8 +16,8 @@ METAL_SRCS := $(wildcard metal/*.metal)
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_metal.o
-CPU_CORE_OBJS = ds4_cpu.o
+CORE_OBJS = ds4.o ds4_metal.o ds4_planar_quant.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_planar_quant.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -28,12 +28,12 @@ NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
-CORE_OBJS = ds4.o ds4_cuda.o
-CPU_CORE_OBJS = ds4_cpu.o
+CORE_OBJS = ds4.o ds4_cuda.o ds4_planar_quant.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_planar_quant.o
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression
+.PHONY: all help clean test planar-quant-test planar-eval cpu cuda cuda-spark cuda-generic cuda-regression
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -154,6 +154,21 @@ tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c ds4_gpu.h
 rax.o: rax.c rax.h rax_malloc.h
 	$(CC) $(CFLAGS) -c -o $@ rax.c
 
+ds4_planar_quant.o: ds4_planar_quant.c ds4_planar_quant.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_planar_quant.c
+
+tests/planar_quant_test: tests/planar_quant_test.c ds4_planar_quant.c ds4_planar_quant.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/planar_quant_test.c ds4_planar_quant.c $(LDLIBS)
+
+planar-quant-test: tests/planar_quant_test
+	./tests/planar_quant_test
+
+tools/planar_eval: tools/planar_eval.c ds4_planar_quant.c ds4_planar_quant.h
+	$(CC) $(CFLAGS) -I. -o $@ tools/planar_eval.c ds4_planar_quant.c $(LDLIBS)
+
+planar-eval: tools/planar_eval
+	./tools/planar_eval --mode ds4_like --rows 10000 --queries 8
+
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
@@ -191,9 +206,9 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_test.o ds4_kvstore.o rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
-test: ds4_test ds4-eval
+test: ds4_test ds4-eval planar-quant-test
 	./ds4-eval --self-test-extractors
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/planar_quant_test tools/planar_eval

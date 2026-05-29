@@ -73,6 +73,9 @@ typedef struct {
     bool warm_weights;
     bool quality;
     bool inspect_only;
+    const char *dump_comp_kv;
+    bool planar_kv_cache;
+    bool planar_kv_cache_only;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
@@ -201,6 +204,7 @@ void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
+int ds4_session_dump_comp_kv(ds4_session *s, const char *path, char *err, size_t errlen);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
