@@ -921,6 +921,10 @@ static const char *server_model_id_from_engine(ds4_engine *engine) {
     return server_model_info_by_engine_id(ds4_engine_model_id(engine))->id;
 }
 
+static const server_model_info *server_model_info_from_engine(ds4_engine *engine) {
+    return server_model_info_by_engine_id(ds4_engine_model_id(engine));
+}
+
 static bool server_model_alias_known(const char *id) {
     return server_model_info_by_id(id) != NULL;
 }
@@ -11122,8 +11126,8 @@ static void append_model_json(buf *b, const server_model_info *model,
 }
 
 static bool send_model(server *s, int fd, const char *id) {
-    const server_model_info *model = server_model_info_by_id(id);
-    if (!model) return http_error(fd, s->enable_cors, 404, "unknown model");
+    const server_model_info *model = server_model_info_from_engine(s->engine);
+    if (strcmp(id, model->id)) return http_error(fd, s->enable_cors, 404, "unknown model");
 
     buf b = {0};
     append_model_json(&b, model, ds4_session_ctx(s->session), s->default_tokens);
@@ -11133,18 +11137,17 @@ static bool send_model(server *s, int fd, const char *id) {
     return ok;
 }
 
-static void append_models_json(buf *b, int ctx, int default_tokens) {
+static void append_models_json(buf *b, const server_model_info *model,
+                               int ctx, int default_tokens) {
     buf_puts(b, "{\"object\":\"list\",\"data\":[");
-    for (size_t i = 0; i < sizeof(server_models) / sizeof(server_models[0]); i++) {
-        if (i) buf_putc(b, ',');
-        append_model_json(b, &server_models[i], ctx, default_tokens);
-    }
+    append_model_json(b, model, ctx, default_tokens);
     buf_puts(b, "]}\n");
 }
 
 static bool send_models(server *s, int fd) {
     buf b = {0};
-    append_models_json(&b, ds4_session_ctx(s->session), s->default_tokens);
+    append_models_json(&b, server_model_info_from_engine(s->engine),
+                       ds4_session_ctx(s->session), s->default_tokens);
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
@@ -14410,17 +14413,21 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 }
 
-static void test_models_list_uses_alias_names(void) {
+static void test_models_list_uses_loaded_model(void) {
     buf b = {0};
-    append_models_json(&b, 100000, 100000);
+    append_models_json(&b, server_model_info_by_engine_id(0), 100000, 100000);
 
     const char *flash = strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"");
     TEST_ASSERT(flash != NULL);
     TEST_ASSERT(strstr(flash, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"") == NULL);
+    buf_free(&b);
 
+    append_models_json(&b, server_model_info_by_engine_id(1), 100000, 100000);
     const char *pro = strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"");
     TEST_ASSERT(pro != NULL);
     TEST_ASSERT(strstr(pro, "\"name\":\"DeepSeek V4 Pro\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") == NULL);
 
     buf_free(&b);
 }
@@ -15630,7 +15637,7 @@ static void ds4_server_unit_tests_run(void) {
     test_stop_list_streaming_holds_and_trims_stop_text();
     test_json_skip_has_nesting_limit();
     test_model_metadata_clamps_completion_to_context();
-    test_models_list_uses_alias_names();
+    test_models_list_uses_loaded_model();
     test_client_socket_nonblocking_flag();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_remember_gate();

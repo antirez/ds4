@@ -435,16 +435,16 @@ live graph/session.
 Supported endpoints:
 
 - `GET /v1/models`
-- `GET /v1/models/deepseek-v4-flash`
-- `GET /v1/models/deepseek-v4-pro`
+- `GET /v1/models/<loaded-model-id>`
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
 - `POST /v1/completions`
 - `POST /v1/messages`
 
-The Flash and PRO model endpoints are compatibility aliases. They both report
-the model currently loaded from the GGUF passed with `-m`; the endpoint name does
-not select a different model.
+The model metadata endpoints expose only the model currently loaded from the
+GGUF passed with `-m`: `deepseek-v4-flash` for Flash GGUFs or `deepseek-v4-pro`
+for Pro GGUFs. The request `model` field does not select a different model;
+inference always uses the loaded GGUF.
 
 `/v1/chat/completions` accepts the usual OpenAI-style `messages`,
 `max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, `top_k`, `min_p`,
