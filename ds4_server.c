@@ -891,15 +891,38 @@ static bool model_alias_enables_thinking(const char *model) {
     return model && !strcmp(model, "deepseek-reasoner");
 }
 
+typedef struct {
+    int engine_model_id;
+    const char *id;
+    const char *name;
+} server_model_info;
+
+static const server_model_info server_models[] = {
+    {0, "deepseek-v4-flash", "DeepSeek V4 Flash"},
+    {1, "deepseek-v4-pro", "DeepSeek V4 Pro"},
+};
+
+static const server_model_info *server_model_info_by_id(const char *id) {
+    if (!id) return NULL;
+    for (size_t i = 0; i < sizeof(server_models) / sizeof(server_models[0]); i++) {
+        if (!strcmp(id, server_models[i].id)) return &server_models[i];
+    }
+    return NULL;
+}
+
+static const server_model_info *server_model_info_by_engine_id(int engine_model_id) {
+    for (size_t i = 0; i < sizeof(server_models) / sizeof(server_models[0]); i++) {
+        if (engine_model_id == server_models[i].engine_model_id) return &server_models[i];
+    }
+    return &server_models[0];
+}
+
 static const char *server_model_id_from_engine(ds4_engine *engine) {
-    return ds4_engine_model_id(engine) == 1 ?
-           "deepseek-v4-pro" : "deepseek-v4-flash";
+    return server_model_info_by_engine_id(ds4_engine_model_id(engine))->id;
 }
 
 static bool server_model_alias_known(const char *id) {
-    return id &&
-           (!strcmp(id, "deepseek-v4-flash") ||
-            !strcmp(id, "deepseek-v4-pro"));
+    return server_model_info_by_id(id) != NULL;
 }
 
 static void stop_list_clear(stop_list *stops) {
@@ -11089,30 +11112,39 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
         max_completion);
 }
 
-static void append_model_json(buf *b, const server *s, const char *id) {
+static void append_model_json(buf *b, const server_model_info *model,
+                              int ctx, int default_tokens) {
     append_model_json_values(b,
-                             id,
-                             ds4_engine_model_name(s->engine),
-                             ds4_session_ctx(s->session),
-                             s->default_tokens);
+                             model->id,
+                             model->name,
+                             ctx,
+                             default_tokens);
 }
 
 static bool send_model(server *s, int fd, const char *id) {
+    const server_model_info *model = server_model_info_by_id(id);
+    if (!model) return http_error(fd, s->enable_cors, 404, "unknown model");
+
     buf b = {0};
-    append_model_json(&b, s, id);
+    append_model_json(&b, model, ds4_session_ctx(s->session), s->default_tokens);
     buf_putc(&b, '\n');
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
 }
 
+static void append_models_json(buf *b, int ctx, int default_tokens) {
+    buf_puts(b, "{\"object\":\"list\",\"data\":[");
+    for (size_t i = 0; i < sizeof(server_models) / sizeof(server_models[0]); i++) {
+        if (i) buf_putc(b, ',');
+        append_model_json(b, &server_models[i], ctx, default_tokens);
+    }
+    buf_puts(b, "]}\n");
+}
+
 static bool send_models(server *s, int fd) {
     buf b = {0};
-    buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    append_model_json(&b, s, "deepseek-v4-flash");
-    buf_putc(&b, ',');
-    append_model_json(&b, s, "deepseek-v4-pro");
-    buf_puts(&b, "]}\n");
+    append_models_json(&b, ds4_session_ctx(s->session), s->default_tokens);
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
@@ -14378,6 +14410,21 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 }
 
+static void test_models_list_uses_alias_names(void) {
+    buf b = {0};
+    append_models_json(&b, 100000, 100000);
+
+    const char *flash = strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"");
+    TEST_ASSERT(flash != NULL);
+    TEST_ASSERT(strstr(flash, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
+
+    const char *pro = strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"");
+    TEST_ASSERT(pro != NULL);
+    TEST_ASSERT(strstr(pro, "\"name\":\"DeepSeek V4 Pro\"") != NULL);
+
+    buf_free(&b);
+}
+
 static void test_client_socket_nonblocking_flag(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -15583,6 +15630,7 @@ static void ds4_server_unit_tests_run(void) {
     test_stop_list_streaming_holds_and_trims_stop_text();
     test_json_skip_has_nesting_limit();
     test_model_metadata_clamps_completion_to_context();
+    test_models_list_uses_alias_names();
     test_client_socket_nonblocking_flag();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_remember_gate();
