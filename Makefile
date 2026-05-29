@@ -14,18 +14,14 @@ OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fo
 LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
 LLGUIDANCE ?= 0
+LLGUIDANCE_DIR ?= .deps/llguidance
 LLGUIDANCE_REPO ?= https://github.com/guidance-ai/llguidance
 LLGUIDANCE_TAG ?= v1.7.5
 SERVER_EXTRA_OBJS := ds4_llguidance.o
 
 ifeq ($(LLGUIDANCE),1)
-ifeq ($(strip $(LLGUIDANCE_DIR)),)
-ifneq ($(wildcard ../../llguidance/parser/llguidance.h),)
-LLGUIDANCE_DIR := ../../llguidance
-else
-LLGUIDANCE_DIR := .deps/llguidance
+ifeq ($(LLGUIDANCE_DIR),.deps/llguidance)
 LLGUIDANCE_NEEDS_CLONE := 1
-endif
 endif
 LLGUIDANCE_LIB := $(LLGUIDANCE_DIR)/target/release/libllguidance.a
 LLGUIDANCE_LDLIBS := $(LLGUIDANCE_LIB)

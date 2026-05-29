@@ -646,6 +646,10 @@ Structured outputs are available when the server is built with llguidance:
 make LLGUIDANCE=1
 ```
 
+By default, this clones llguidance into `.deps/llguidance` and builds the
+static library there. To use an existing checkout instead, pass
+`LLGUIDANCE_DIR=/path/to/llguidance`.
+
 With that build, `/v1/chat/completions` supports
 `response_format.type=json_schema` and `response_format.type=json_object`;
 `/v1/responses` supports the same modes through `text.format`. Structured
