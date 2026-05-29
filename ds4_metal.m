@@ -87,6 +87,7 @@ static id<MTLComputePipelineState> g_dsv4_softmax_pool_pipeline;
 static id<MTLComputePipelineState> g_soft_max_f32_pipeline;
 static id<MTLComputePipelineState> g_soft_max_f32_4_pipeline;
 static id<MTLComputePipelineState> g_argsort_f32_i32_desc_pipeline;
+static id<MTLComputePipelineState> g_argmax_f32_i32_pipeline;
 static id<MTLComputePipelineState> g_argsort_merge_f32_i32_desc_pipeline;
 static id<MTLComputePipelineState> g_sum_rows_f32_f32_pipeline;
 static id<MTLComputePipelineState> g_dsv4_topk_mask_pipeline;
@@ -3763,6 +3764,22 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
+        fn = [library newFunctionWithName:@"kernel_argmax_f32_i32"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_argmax_f32_i32 function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_argmax_f32_i32_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_argmax_f32_i32_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_argmax_f32_i32 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
         fn = [library newFunctionWithName:@"kernel_argsort_merge_f32_i32_desc"];
         if (!fn) {
             fprintf(stderr, "ds4: Metal kernel_argsort_merge_f32_i32_desc function not found\n");
@@ -4508,6 +4525,7 @@ void ds4_gpu_cleanup(void) {
         g_soft_max_f32_pipeline = nil;
         g_soft_max_f32_4_pipeline = nil;
         g_argsort_f32_i32_desc_pipeline = nil;
+        g_argmax_f32_i32_pipeline = nil;
         g_argsort_merge_f32_i32_desc_pipeline = nil;
         g_sum_rows_f32_f32_pipeline = nil;
         g_dsv4_topk_mask_pipeline = nil;
@@ -5377,6 +5395,54 @@ int ds4_gpu_indexer_topk_tensor(
         }
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "indexer top-k")) return 0;
+    }
+
+    return 1;
+}
+
+int ds4_gpu_argmax_tensor(
+        ds4_gpu_tensor       *out_idx,
+        const ds4_gpu_tensor *logits,
+        uint32_t                n_vocab) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out_idx || !logits || n_vocab == 0) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> logitbuf = ds4_gpu_tensor_buffer(logits);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out_idx);
+        if (!logitbuf || !outbuf ||
+            ds4_gpu_tensor_bytes(logits) < (uint64_t)n_vocab * sizeof(float) ||
+            ds4_gpu_tensor_bytes(out_idx) < sizeof(int32_t)) {
+            fprintf(stderr, "ds4: Metal argmax received undersized buffers\n");
+            return 0;
+        }
+
+        /* Single threadgroup, power-of-two width so the reduction is exact. */
+        NSUInteger max_threads = g_argmax_f32_i32_pipeline.maxTotalThreadsPerThreadgroup;
+        if (max_threads == 0) max_threads = 1024;
+        NSUInteger nth = 1;
+        while (2u * nth <= max_threads && 2u * nth <= 1024u) nth *= 2;
+
+        const NSUInteger smem_val = ((nth * sizeof(float)) + 15u) & ~(NSUInteger)15u;
+        const NSUInteger smem_idx = ((nth * sizeof(int32_t)) + 15u) & ~(NSUInteger)15u;
+        const uint32_t nv = n_vocab;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_argmax_f32_i32_pipeline];
+        [enc setBytes:&nv length:sizeof(nv) atIndex:0];
+        [enc setBuffer:logitbuf offset:ds4_gpu_tensor_offset(logits) atIndex:1];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out_idx) atIndex:2];
+        [enc setThreadgroupMemoryLength:smem_val atIndex:0];
+        [enc setThreadgroupMemoryLength:smem_idx atIndex:1];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "argmax")) return 0;
     }
 
     return 1;

@@ -264,3 +264,49 @@ kernel void kernel_argsort_merge_f32_i32(
 
 // Host-visible merge variant used by DS4 top-k selection.
 template [[host_name("kernel_argsort_merge_f32_i32_desc")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC>;
+
+// GPU argmax over n_vocab F32 logits, computed by a single threadgroup with a
+// power-of-two width reduction. Writes the winning index as int32 at out_idx[0].
+// Tie-break: lower index wins (matches host sample_argmax and the CUDA
+// argmax_kernel). threads_per_threadgroup MUST be a power of two.
+kernel void kernel_argmax_f32_i32(
+        constant     uint  & n_vocab,
+        device const float * logits,
+        device       int32_t * out_idx,
+        threadgroup  float * sm_val [[threadgroup(0)]],
+        threadgroup  int32_t * sm_idx [[threadgroup(1)]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint ntg [[threads_per_threadgroup]]) {
+    float   local_v = -INFINITY;
+    int32_t local_i = 0;
+    for (uint i = tid; i < n_vocab; i += ntg) {
+        const float v = logits[i];
+        if (v > local_v) {
+            local_v = v;
+            local_i = (int32_t) i;
+        }
+    }
+    sm_val[tid] = local_v;
+    sm_idx[tid] = local_i;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = ntg / 2u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            const float   vr = sm_val[tid + s];
+            const int32_t ir = sm_idx[tid + s];
+            const float   vl = sm_val[tid];
+            const int32_t il = sm_idx[tid];
+            // Larger value wins; on exact ties prefer the lower index.
+            const bool take_right = (vr > vl) || (vr == vl && ir < il);
+            if (take_right) {
+                sm_val[tid] = vr;
+                sm_idx[tid] = ir;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        out_idx[0] = sm_idx[0];
+    }
+}
