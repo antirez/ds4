@@ -106,6 +106,19 @@ static void usage(FILE *fp) {
         "      CPU helper threads for host-side or reference work.\n"
         "  --quality\n"
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
+        "  --kv-cache fp8|turbo3|turbo4\n"
+        "      KV cache compression. fp8 (default) keeps the historical E4M3 in-place\n"
+        "      round trip on the non-RoPE part of each compressed KV row. turbo3 swaps in\n"
+        "      a TurboQuant+ Randomized Hadamard rotation + 3-bit Lloyd-Max quantization\n"
+        "      (4.75x packed-byte shrink on the SWA raw cache). turbo4 uses the same shape\n"
+        "      with a 4-bit Lloyd-Max codebook (4.21x shrink, ~3.6x lower quantization\n"
+        "      noise -- pick when turbo3's quality regression is too large). All three\n"
+        "      work on CUDA + Metal.\n"
+        "  --comp-cache fp8|turbo3\n"
+        "      Compressed comp-cache dtype (CUDA-only). Packs the per-layer\n"
+        "      attn_comp_cache to turbo3 bytes (4.75x vs float). Pair with\n"
+        "      --kv-cache turbo3 for total KV memory shrink at long context\n"
+        "      where the comp pool dominates.\n"
         "  --dir-steering-file FILE\n"
         "      Load one f32 direction vector per layer for directional steering.\n"
         "  --dir-steering-ffn F\n"
@@ -1480,6 +1493,18 @@ static cli_config parse_options(int argc, char **argv) {
             if (c.engine.power_percent < 1 || c.engine.power_percent > 100) {
                 fprintf(stderr, "ds4: --power must be between 1 and 100\n");
                 exit(2);
+            }
+        } else if (!strcmp(arg, "--kv-cache")) {
+            const char *kv_name = need_arg(&i, argc, argv, arg);
+            if (!ds4_kv_dtype_from_name(kv_name, &c.engine.kv_dtype)) {
+                fprintf(stderr, "ds4: unknown --kv-cache value '%s' (expected fp8, turbo3 or turbo4)\n", kv_name);
+                exit(1);
+            }
+        } else if (!strcmp(arg, "--comp-cache")) {
+            const char *cc_name = need_arg(&i, argc, argv, arg);
+            if (!ds4_kv_dtype_from_name(cc_name, &c.engine.comp_dtype)) {
+                fprintf(stderr, "ds4: unknown --comp-cache value '%s' (expected fp8 or turbo3)\n", cc_name);
+                exit(1);
             }
         } else if (!strcmp(arg, "--dir-steering-file")) {
             c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);

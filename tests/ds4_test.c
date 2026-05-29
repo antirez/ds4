@@ -44,6 +44,17 @@ static ds4_engine *test_open_engine(bool quality) {
 #endif
         .quality = quality,
     };
+    /* DS4_TEST_KV_DTYPE lets a regression run target one specific KV dtype
+     * without rebuilding.  Unknown values pass through (fp8 default) so a typo
+     * surfaces as a single fprintf rather than a failing assert. */
+    const char *kv_env = getenv("DS4_TEST_KV_DTYPE");
+    if (kv_env && kv_env[0]) {
+        if (!ds4_kv_dtype_from_name(kv_env, &opt.kv_dtype)) {
+            fprintf(stderr,
+                "ds4_test: ignoring DS4_TEST_KV_DTYPE='%s' (expected fp8 or turbo3)\n",
+                kv_env);
+        }
+    }
     TEST_ASSERT(ds4_engine_open(&engine, &opt) == 0);
     return engine;
 }
