@@ -4781,6 +4781,7 @@ static bool http_response(int fd, bool enable_cors, int code, const char *type, 
     const char *reason = code == 200 ? "OK" :
                          code == 204 ? "No Content" :
                          code == 400 ? "Bad Request" :
+                         code == 401 ? "Unauthorized" :
                          code == 404 ? "Not Found" :
                          code == 409 ? "Conflict" :
                          code == 500 ? "Internal Server Error" : "Error";
@@ -7706,6 +7707,7 @@ struct server {
     visible_live_state thinking_live;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
+    char *api_key;
     pthread_mutex_t tool_mu;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -10966,10 +10968,13 @@ typedef struct {
     char path[256];
     char *body;
     size_t body_len;
+    char *headers;
+    size_t headers_len;
 } http_request;
 
 static void http_request_free(http_request *r) {
     free(r->body);
+    free(r->headers);
     memset(r, 0, sizeof(*r));
 }
 
@@ -10998,6 +11003,36 @@ static long content_length(const char *h, size_t n) {
         if (p < end) p++;
     }
     return 0;
+}
+
+static bool bearer_token_valid(const char *headers, size_t headers_len,
+                               const char *expected_key) {
+    const char *p = headers, *end = headers + headers_len;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len > 14 && strncasecmp(line, "Authorization:", 14) == 0) {
+            const char *v = line + 14;
+            const char *vend = line + len;
+            while (v < vend && isspace((unsigned char)*v)) v++;
+            if (vend - v < 7 || strncasecmp(v, "Bearer ", 7) != 0)
+                return false;
+            v += 7;
+            while (v < vend && isspace((unsigned char)*v)) v++;
+            while (vend > v && isspace((unsigned char)*(vend - 1))) vend--;
+            size_t klen = (size_t)(vend - v);
+            size_t elen = strlen(expected_key);
+            if (klen != elen) return false;
+            volatile int diff = 0;
+            for (size_t i = 0; i < klen; i++)
+                diff |= (unsigned char)v[i] ^ (unsigned char)expected_key[i];
+            return diff == 0;
+        }
+        if (p < end) p++;
+    }
+    return false;
 }
 
 static bool read_http_request(int fd, http_request *r) {
@@ -11041,6 +11076,10 @@ static bool read_http_request(int fd, http_request *r) {
     r->body = xmalloc(r->body_len + 1);
     memcpy(r->body, b.ptr + hend, r->body_len);
     r->body[r->body_len] = '\0';
+    r->headers_len = (size_t)hend;
+    r->headers = xmalloc(r->headers_len + 1);
+    memcpy(r->headers, b.ptr, r->headers_len);
+    r->headers[r->headers_len] = '\0';
     buf_free(&b);
     return true;
 fail:
@@ -11141,6 +11180,12 @@ static void *client_main(void *arg) {
 
     if (!strcmp(hr.method, "OPTIONS")) {
         http_response(fd, s->enable_cors, 204, NULL, "");
+        http_request_free(&hr);
+        goto done;
+    }
+
+    if (s->api_key && !bearer_token_valid(hr.headers, hr.headers_len, s->api_key)) {
+        http_error(fd, s->enable_cors, 401, "unauthorized");
         http_request_free(&hr);
         goto done;
     }
@@ -11285,6 +11330,7 @@ typedef struct {
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
+    const char *api_key;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -11338,6 +11384,7 @@ static void log_context_memory(ds4_backend backend, int ctx_size) {
 }
 
 static void server_close_resources(server *s) {
+    free(s->api_key);
     if (s->trace) {
         fclose(s->trace);
         s->trace = NULL;
@@ -11400,6 +11447,8 @@ static void usage(FILE *fp) {
         "      Bind port. Default: 8000\n"
         "  --cors\n"
         "      Add Access-Control-Allow-* headers for browser JS clients. Does not change --host.\n"
+        "  --api-key KEY\n"
+        "      Require Bearer token authentication for all requests except OPTIONS preflight.\n"
         "  --trace FILE\n"
         "      Write a human-readable session trace: prompts, cache decisions, output, tool calls.\n"
         "\n"
@@ -11514,6 +11563,8 @@ static server_config parse_options(int argc, char **argv) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
+        } else if (!strcmp(arg, "--api-key")) {
+            c.api_key = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-dir")) {
@@ -11619,6 +11670,7 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.api_key = cfg.api_key ? xstrdup(cfg.api_key) : NULL;
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
@@ -11643,6 +11695,9 @@ int main(int argc, char **argv) {
         setvbuf(s.trace, NULL, _IONBF, 0);
         server_log(DS4_LOG_DEFAULT, "ds4-server: tracing session to %s", cfg.trace_path);
     }
+
+    if (s.api_key)
+        server_log(DS4_LOG_DEFAULT, "ds4-server: API key authentication enabled");
 
     pthread_t worker;
     if (pthread_create(&worker, NULL, worker_main, &s) != 0) die("failed to start worker");
@@ -14390,6 +14445,44 @@ static void test_client_socket_nonblocking_flag(void) {
     close(sv[1]);
 }
 
+static void test_bearer_token_valid(void) {
+    const char *key = "secret123";
+
+    const char *req1 = "POST /v1/chat/completions HTTP/1.1\r\n"
+                       "Authorization: Bearer secret123\r\n"
+                       "Content-Length: 0\r\n\r\n";
+    TEST_ASSERT(bearer_token_valid(req1, strlen(req1), key));
+
+    const char *req2 = "POST /v1/chat/completions HTTP/1.1\r\n"
+                       "Authorization: Bearer wrongkey\r\n"
+                       "Content-Length: 0\r\n\r\n";
+    TEST_ASSERT(!bearer_token_valid(req2, strlen(req2), key));
+
+    const char *req3 = "POST /v1/chat/completions HTTP/1.1\r\n"
+                       "Content-Length: 0\r\n\r\n";
+    TEST_ASSERT(!bearer_token_valid(req3, strlen(req3), key));
+
+    const char *req4 = "POST /v1/chat/completions HTTP/1.1\r\n"
+                       "authorization: bearer secret123\r\n"
+                       "Content-Length: 0\r\n\r\n";
+    TEST_ASSERT(bearer_token_valid(req4, strlen(req4), key));
+
+    const char *req5 = "POST /v1/chat/completions HTTP/1.1\r\n"
+                       "Authorization: Bearer  secret123  \r\n"
+                       "Content-Length: 0\r\n\r\n";
+    TEST_ASSERT(bearer_token_valid(req5, strlen(req5), key));
+
+    const char *req6 = "POST /v1/chat/completions HTTP/1.1\r\n"
+                       "Authorization: Basic abc123\r\n"
+                       "Content-Length: 0\r\n\r\n";
+    TEST_ASSERT(!bearer_token_valid(req6, strlen(req6), key));
+
+    const char *req7 = "POST /v1/chat/completions HTTP/1.1\r\n"
+                       "Authorization: Bearer secret123extra\r\n"
+                       "Content-Length: 0\r\n\r\n";
+    TEST_ASSERT(!bearer_token_valid(req7, strlen(req7), key));
+}
+
 static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -15584,6 +15677,7 @@ static void ds4_server_unit_tests_run(void) {
     test_json_skip_has_nesting_limit();
     test_model_metadata_clamps_completion_to_context();
     test_client_socket_nonblocking_flag();
+    test_bearer_token_valid();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_remember_gate();
     test_tool_marker_state_ignores_orphan_end();
