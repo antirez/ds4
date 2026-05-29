@@ -58,7 +58,7 @@ CUDA_LDLIBS += $(LLGUIDANCE_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression
+.PHONY: all help clean distclean test cpu cuda cuda-spark cuda-generic cuda-regression
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -71,22 +71,22 @@ help:
 	@echo "  make test         Build and run tests"
 	@echo "  make clean        Remove build outputs"
 
-ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
+ds4: ds4_cli.o linenoise.o $(CORE_OBJS) $(DS4_LLGUIDANCE_DEPS)
 	$(CC) $(CFLAGS) -o $@ ds4_cli.o linenoise.o $(CORE_OBJS) $(METAL_LDLIBS)
 
-ds4-server: ds4_server.o ds4_kvstore.o rax.o $(SERVER_EXTRA_OBJS) $(CORE_OBJS)
+ds4-server: ds4_server.o ds4_kvstore.o rax.o $(SERVER_EXTRA_OBJS) $(CORE_OBJS) $(DS4_LLGUIDANCE_DEPS)
 	$(CC) $(CFLAGS) -o $@ ds4_server.o ds4_kvstore.o rax.o $(SERVER_EXTRA_OBJS) $(CORE_OBJS) $(METAL_LDLIBS)
 
-ds4-bench: ds4_bench.o $(CORE_OBJS)
+ds4-bench: ds4_bench.o $(CORE_OBJS) $(DS4_LLGUIDANCE_DEPS)
 	$(CC) $(CFLAGS) -o $@ ds4_bench.o $(CORE_OBJS) $(METAL_LDLIBS)
 
-ds4-eval: ds4_eval.o $(CORE_OBJS)
+ds4-eval: ds4_eval.o $(CORE_OBJS) $(DS4_LLGUIDANCE_DEPS)
 	$(CC) $(CFLAGS) -o $@ ds4_eval.o $(CORE_OBJS) $(METAL_LDLIBS)
 
-ds4-agent: ds4_agent.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS)
+ds4-agent: ds4_agent.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(DS4_LLGUIDANCE_DEPS)
 	$(CC) $(CFLAGS) -o $@ ds4_agent.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(METAL_LDLIBS)
 
-cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o rax.o $(SERVER_EXTRA_OBJS) $(CPU_CORE_OBJS)
+cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o rax.o $(SERVER_EXTRA_OBJS) $(CPU_CORE_OBJS) $(DS4_LLGUIDANCE_DEPS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_kvstore.o rax.o $(SERVER_EXTRA_OBJS) $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
@@ -122,22 +122,22 @@ cuda:
 	fi
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH="$(CUDA_ARCH)"
 
-ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
+ds4: ds4_cli.o linenoise.o $(CORE_OBJS) $(DS4_LLGUIDANCE_DEPS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ds4-server: ds4_server.o ds4_kvstore.o rax.o $(SERVER_EXTRA_OBJS) $(CORE_OBJS)
+ds4-server: ds4_server.o ds4_kvstore.o rax.o $(SERVER_EXTRA_OBJS) $(CORE_OBJS) $(DS4_LLGUIDANCE_DEPS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ds4-bench: ds4_bench.o $(CORE_OBJS)
+ds4-bench: ds4_bench.o $(CORE_OBJS) $(DS4_LLGUIDANCE_DEPS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ds4-eval: ds4_eval.o $(CORE_OBJS)
+ds4-eval: ds4_eval.o $(CORE_OBJS) $(DS4_LLGUIDANCE_DEPS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ds4-agent: ds4_agent.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS)
+ds4-agent: ds4_agent.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(DS4_LLGUIDANCE_DEPS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o rax.o $(SERVER_EXTRA_OBJS) $(CPU_CORE_OBJS)
+cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o rax.o $(SERVER_EXTRA_OBJS) $(CPU_CORE_OBJS) $(DS4_LLGUIDANCE_DEPS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_kvstore.o rax.o $(SERVER_EXTRA_OBJS) $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
@@ -241,3 +241,6 @@ test: ds4_test ds4-eval
 
 clean:
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+
+distclean: clean
+	rm -rf .deps
