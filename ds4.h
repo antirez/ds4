@@ -57,6 +57,19 @@ typedef struct {
 typedef struct ds4_engine ds4_engine;
 typedef struct ds4_session ds4_session;
 
+#ifndef DS4_SUFFIX_STATS_DEFINED
+#define DS4_SUFFIX_STATS_DEFINED
+typedef struct ds4_suffix_stats {
+    uint64_t node_count;
+    uint64_t total_bytes;
+    uint64_t query_count;
+    uint64_t query_hits;
+    uint64_t draft_tokens_produced;
+    uint64_t draft_tokens_accepted;
+    double   draft_score_total;
+} ds4_suffix_stats;
+#endif
+
 typedef void (*ds4_session_progress_fn)(void *ud, const char *event, int current, int total);
 
 typedef struct {
@@ -73,6 +86,12 @@ typedef struct {
     bool warm_weights;
     bool quality;
     bool inspect_only;
+    bool suffix_decoding;
+    uint32_t suffix_max_depth;
+    uint64_t suffix_memory_budget;
+    float suffix_spec_factor;
+    float suffix_spec_offset;
+    float suffix_min_prob;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
@@ -214,5 +233,18 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen);
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen);
 void ds4_session_snapshot_free(ds4_session_snapshot *snap);
+
+/* Suffix tree telemetry.  Fills *out with zero if suffix decoding is disabled. */
+void ds4_session_suffix_stats(ds4_session *s, ds4_suffix_stats *out);
+
+/* Print speculative decode telemetry summary to stderr. */
+struct ds4_spec_telemetry;
+void ds4_spec_telemetry_print(const struct ds4_spec_telemetry *t);
+
+/* Get spec telemetry from the engine. Returns NULL if engine is NULL. */
+const struct ds4_spec_telemetry *ds4_engine_spec_telemetry(const ds4_engine *e);
+
+/* Reset speculative decode telemetry counters to zero. */
+void ds4_engine_spec_telemetry_reset(ds4_engine *e);
 
 #endif

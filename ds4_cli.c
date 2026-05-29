@@ -112,6 +112,18 @@ static void usage(FILE *fp) {
         "      Apply steering after FFN outputs: y -= F*v*dot(v,y). Default with file: 1\n"
         "  --dir-steering-attn F\n"
         "      Apply steering after attention outputs. Default: 0\n"
+        "  --suffix-decoding\n"
+        "      Enable suffix tree speculative decoding (model-free draft tokens).\n"
+        "  --suffix-max-depth N\n"
+        "      Max sequence depth for the suffix tree. Default: 32\n"
+        "  --suffix-memory-budget MB\n"
+        "      Max tree memory in MB. Default: 64\n"
+        "  --suffix-spec-factor F\n"
+        "      Draft cap = match_len * F + spec_offset. Default: 0.01\n"
+        "  --suffix-spec-offset F\n"
+        "      Additive offset for the draft cap. Default: 2\n"
+        "  --suffix-min-prob F\n"
+        "      Stop drafting when estimated probability drops below F. Default: 0\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before generation. Slower startup, fewer first-use stalls.\n"
         "  --power N\n"
@@ -468,6 +480,17 @@ static void print_generated_token(void *ud, int token) {
     free(text);
 }
 
+static bool cli_speculative_decode_enabled(ds4_engine *engine,
+                                           const cli_config *cfg) {
+    const bool suffix_spec =
+        cfg->engine.suffix_decoding && cfg->engine.backend != DS4_BACKEND_CPU;
+    return cfg->gen.temperature <= 0.0f &&
+           getenv("DS4_MTP_SPEC_DISABLE") == NULL &&
+           getenv("DS4_SPEC_DISABLE") == NULL &&
+           (ds4_engine_mtp_draft_tokens(engine) > 1 ||
+            suffix_spec);
+}
+
 static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, ds4_tokens *out) {
     if (is_rendered_chat_prompt(gen->prompt)) {
         ds4_tokenize_rendered_chat(engine, gen->prompt, out);
@@ -532,8 +555,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+        if (cli_speculative_decode_enabled(engine, cfg)) {
             ntok = ds4_session_eval_speculative_argmax(session,
                                                        token,
                                                        max_tokens - generated,
@@ -953,7 +975,8 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
             fprintf(stderr, "ds4: diagnostic run completed on the native %s path.\n",
                     ds4_backend_name(cfg->engine.backend));
         }
-    } else if (cfg->gen.temperature > 0.0f || ds4_engine_mtp_draft_tokens(engine) > 1) {
+    } else if (cfg->gen.temperature > 0.0f ||
+               cli_speculative_decode_enabled(engine, cfg)) {
         rc = run_sampled_generation(engine, cfg, &prompt);
     } else {
         token_printer printer = {
@@ -1180,8 +1203,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+        if (cli_speculative_decode_enabled(engine, cfg)) {
             ntok = ds4_session_eval_speculative_argmax(chat->session,
                                                        token,
                                                        max_tokens - generated,
@@ -1418,6 +1440,8 @@ static cli_config parse_options(int argc, char **argv) {
             .backend = default_backend(),
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
+            .suffix_spec_factor = -1.0f,
+            .suffix_spec_offset = -1.0f,
         },
         .gen = {
             .prompt = NULL,
@@ -1461,6 +1485,18 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
             c.engine.mtp_margin = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
+        } else if (!strcmp(arg, "--suffix-decoding")) {
+            c.engine.suffix_decoding = true;
+        } else if (!strcmp(arg, "--suffix-max-depth")) {
+            c.engine.suffix_max_depth = (uint32_t)parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--suffix-memory-budget")) {
+            c.engine.suffix_memory_budget = (uint64_t)parse_int(need_arg(&i, argc, argv, arg), arg) * 1024ULL * 1024ULL;
+        } else if (!strcmp(arg, "--suffix-spec-factor")) {
+            c.engine.suffix_spec_factor = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.000001f, 100.0f);
+        } else if (!strcmp(arg, "--suffix-spec-offset")) {
+            c.engine.suffix_spec_offset = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
+        } else if (!strcmp(arg, "--suffix-min-prob")) {
+            c.engine.suffix_min_prob = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.gen.n_predict = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
@@ -1613,6 +1649,10 @@ int main(int argc, char **argv) {
         rc = run_repl(engine, &cfg);
     } else {
         rc = run_generation(engine, &cfg);
+    }
+    if (cfg.engine.suffix_decoding) {
+        const struct ds4_spec_telemetry *t = ds4_engine_spec_telemetry(engine);
+        if (t) ds4_spec_telemetry_print(t);
     }
     ds4_engine_close(engine);
     free(cfg.prompt_owned);
