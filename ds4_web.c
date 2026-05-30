@@ -538,6 +538,14 @@ static char *web_ws_read_message(cdp_ws *ws, char *err, size_t err_len) {
         } else if (opcode == 0x1 || opcode == 0x0) {
             web_buf_append(&msg, (const char *)payload, (size_t)len);
             free(payload);
+            if (msg.len > DS4_WEB_MAX_RESULT_BYTES * 4ULL) {
+                /* Bound the reassembled message too, not just each frame: a peer
+                 * sending endless FIN=0 continuation frames would otherwise grow
+                 * msg without limit until allocation fails (exit). */
+                web_set_err(err, err_len, "websocket message too large");
+                free(msg.ptr);
+                return NULL;
+            }
             if (fin) return web_buf_take(&msg);
         } else {
             free(payload);
