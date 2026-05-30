@@ -238,6 +238,8 @@ static bool json_string(const char **p, char **out) {
             if (!json_u16(p, &cp)) goto fail;
             if (cp >= 0xd800 && cp <= 0xdbff && json_u16(p, &lo) && lo >= 0xdc00 && lo <= 0xdfff) {
                 cp = 0x10000u + ((cp - 0xd800u) << 10) + (lo - 0xdc00u);
+            } else if (cp >= 0xd800 && cp <= 0xdfff) {
+                cp = 0xfffdu;  /* unpaired UTF-16 surrogate -> U+FFFD, keep output valid UTF-8 */
             }
             utf8_put(&b, cp);
             break;
