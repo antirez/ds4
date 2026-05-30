@@ -5704,7 +5704,7 @@ __global__ static void topk_mask_kernel(float *mask, const uint32_t *topk, uint3
 }
 
 extern "C" int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
-    (void)n_vocab;
+    if (token >= n_vocab) token = 0;
     if (!out_hc || !model_map || weight_offset >= model_size) return 0;
     uint64_t weight_bytes = (uint64_t)n_vocab * n_embd * sizeof(uint16_t);
     if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
@@ -6059,7 +6059,7 @@ extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
     return cuda_ok(cudaGetLastError(), "topk mask launch");
 }
 static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
-    if (!out || !x || !model_map) return 0;
+    if (!out || !x || !model_map || in_dim == 0) return 0;
     uint64_t blocks = (in_dim + 31) / 32;
     if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34)) return 0;
     uint64_t weight_bytes = out_dim * blocks * 34;
@@ -6312,7 +6312,7 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
 }
 
 extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
-    if (!out || !x || !model_map) return 0;
+    if (!out || !x || !model_map || in_dim == 0) return 0;
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
     uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
     if (weight_bytes > model_size - weight_offset) return 0;
