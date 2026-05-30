@@ -3274,8 +3274,6 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
             request_free(r);
             return false;
         }
-        thinking_enabled = false;
-        got_thinking = true;
     }
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
@@ -4448,9 +4446,6 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
             request_free(r);
             return false;
         }
-        thinking_enabled = false;
-        got_thinking = true;
-        r->reasoning_summary_emit = false;
     }
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
@@ -10873,6 +10868,11 @@ decode_again:
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
+    bool structured_waiting_for_think_close = structured && thinking.inside;
+    if (structured_waiting_for_think_close) {
+        trace_event(s, trace_id,
+                    "structured output constraint delayed until </think>");
+    }
     const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
     bool tool_scan_waiting_for_think_close =
         thinking_gates_tool_markers && thinking.inside;
@@ -10900,7 +10900,8 @@ decode_again:
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
             temperature = 0.0f;
         }
-        int token = structured ?
+        bool structured_active = structured && !structured_waiting_for_think_close;
+        int token = structured_active ?
             ds4_llguidance_sample(structured, s->session,
                                   temperature, top_k, top_p, min_p,
                                   &rng, err, sizeof(err)) :
@@ -10916,7 +10917,8 @@ decode_again:
 
         int toks[17];
         int ntok = 0;
-        if (!structured &&
+        if (!structured_active &&
+            !structured_waiting_for_think_close &&
             temperature <= 0.0f &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
@@ -10950,7 +10952,8 @@ decode_again:
                 stop_decode = true;
                 break;
             }
-            if (structured &&
+            structured_active = structured && !structured_waiting_for_think_close;
+            if (structured_active &&
                 !ds4_llguidance_accept(structured, s->engine, token,
                                        err, sizeof(err))) {
                 finish = "error";
@@ -10964,7 +10967,16 @@ decode_again:
 
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
+            bool was_thinking_inside = thinking.inside;
             thinking_state_feed(&thinking, piece, piece_len);
+            if (structured_waiting_for_think_close &&
+                was_thinking_inside &&
+                !thinking.inside)
+            {
+                structured_waiting_for_think_close = false;
+                trace_event(s, trace_id,
+                            "structured output constraint activated after </think>");
+            }
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
                 dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
             }

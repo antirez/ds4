@@ -653,8 +653,9 @@ static library there. To use an existing checkout instead, pass
 With that build, `/v1/chat/completions` supports
 `response_format.type=json_schema`, `json_object`, `regex`, `lark`, and
 `llguidance`; `/v1/responses` supports the same modes through `text.format`.
-Structured outputs use constrained decoding, disable thinking for that turn,
-and currently cannot be combined with tools.
+Structured outputs use constrained decoding. If thinking is enabled, the
+constraint applies after `</think>` so the final assistant content is structured.
+They currently cannot be combined with tools.
 
 `/v1/messages` is the Anthropic-compatible endpoint used by Claude Code style
 clients. It accepts `system`, `messages`, `tools`, `tool_choice`, `max_tokens`,
