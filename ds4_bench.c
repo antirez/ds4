@@ -1,5 +1,6 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_help.h"
 
 /* Purpose-built throughput benchmark.
  *
@@ -48,50 +49,8 @@ static double bench_now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
-static void usage(FILE *fp) {
-    fprintf(fp,
-        "Usage: ds4-bench --prompt-file FILE [options]\n"
-        "\n"
-        "Benchmarks instantaneous prefill and generation throughput at context\n"
-        "frontiers such as 2048, 4096, 6144, ... . Generation is always greedy,\n"
-        "runs for exactly --gen-tokens tokens, and skips EOS so every row is\n"
-        "comparable.\n"
-        "\n"
-        "Input:\n"
-        "  --prompt-file FILE\n"
-        "      Raw benchmark text. The fixed token sequence is sliced at each frontier.\n"
-        "  --chat-prompt-file FILE\n"
-        "      Render FILE as one no-thinking chat user message, then slice that sequence.\n"
-        "  -sys, --system TEXT\n"
-        "      System prompt used only with --chat-prompt-file.\n"
-        "\n"
-        "Model and backend:\n"
-        "  -m, --model FILE       GGUF model path. Default: ds4flash.gguf\n"
-        "  --metal | --cuda | --cpu | --backend NAME\n"
-        "      Select backend explicitly. Defaults to Metal on macOS, CUDA elsewhere.\n"
-        "  -t, --threads N        CPU helper threads.\n"
-        "  --quality              Prefer exact kernels where applicable.\n"
-        "  --warm-weights         Touch mapped tensor pages before benchmarking.\n"
-        "  --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n"
-        "\n"
-        "Distributed:\n");
-    ds4_dist_usage(fp);
-    fprintf(fp,
-        "\n"
-        "\n"
-        "Sweep:\n"
-        "  --ctx-start N          First measured frontier. Default: 2048\n"
-        "  --ctx-max N            Last measured frontier. Default: 32768\n"
-        "  --ctx-alloc N          Allocated context. Default: ctx-max + gen-tokens + 1\n"
-        "  --step-mul F           Multiplicative step. Default: 1\n"
-        "  --step-incr N          Linear step when --step-mul is 1. Default: 2048\n"
-        "  --gen-tokens N         Greedy decode tokens per frontier. Use 0 for pure prefill. Default: 128\n"
-        "\n"
-        "Output:\n"
-        "  --csv FILE             Write CSV there instead of stdout.\n"
-        "  --dump-frontier-logits-dir DIR\n"
-        "      Write one full-logit JSON file per measured frontier. DIR must exist.\n"
-        "  -h, --help             Show this help.\n");
+static void usage(FILE *fp, const char *topic) {
+    ds4_help_print(fp, DS4_HELP_BENCH, topic);
 }
 
 static int parse_int(const char *s, const char *opt) {
@@ -205,7 +164,9 @@ static bench_config parse_options(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
-            usage(stdout);
+            const char *topic = (i + 1 < argc && argv[i + 1][0] != '-') ?
+                argv[i + 1] : NULL;
+            usage(stdout, topic);
             exit(0);
         }
         char dist_parse_err[256] = {0};
@@ -271,7 +232,7 @@ static bench_config parse_options(int argc, char **argv) {
             c.warm_weights = true;
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
-            usage(stderr);
+            usage(stderr, NULL);
             exit(2);
         }
     }

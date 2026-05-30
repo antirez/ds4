@@ -1,5 +1,6 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_help.h"
 
 /* ds4-eval: small built-in benchmark integration test.
  *
@@ -1479,58 +1480,8 @@ static ds4_backend default_backend(void) {
 #endif
 }
 
-static void usage(FILE *fp) {
-    fprintf(fp,
-        "Usage: ds4-eval [options]\n"
-        "\n"
-        "Runs a small built-in GPQA Diamond/audited SuperGPQA/AIME2025/COMPSEC integration test.\n"
-        "The TTY UI keeps the question list on the left and streams sampled\n"
-        "tokens live on the right; thinking text is dim grey until </think>.\n"
-        "In the TTY UI, Up/Down selects a question, Enter runs it next,\n"
-        "p pauses or resumes evaluation, and q exits with a report.\n"
-        "\n"
-        "Model and backend:\n"
-        "  -m, --model FILE       GGUF model path. Default: ds4flash.gguf\n"
-        "  --mtp FILE             Optional MTP support GGUF.\n"
-        "  -c, --ctx N            Allocated session context. Default: auto-sized.\n"
-        "  --metal | --cuda | --cpu | --backend NAME\n"
-        "  -t, --threads N        CPU helper threads.\n"
-        "  --quality              Prefer exact kernels where applicable.\n"
-        "  --warm-weights         Touch mapped tensor pages before evaluation.\n"
-        "  --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n"
-        "\n"
-        "Distributed:\n");
-    ds4_dist_usage(fp);
-    fprintf(fp,
-        "\n"
-        "\n"
-        "Evaluation:\n"
-        "  -n, --tokens N         Max generated tokens per question. Default: 16000\n"
-        "  --questions N          Run only the first N embedded questions.\n"
-        "  --case-sequence LIST   Run 1-based case numbers in this comma-separated order.\n"
-        "  --temp F               Sampling temperature. Default: 0\n"
-        "  --top-p F              Nucleus sampling probability. Default: 1\n"
-        "  --min-p F              Keep tokens scoring at least F times the top token. Default: 0.05\n"
-        "  --seed N               Sampling seed. Default: time-based\n"
-        "  --trace FILE           Write questions, outputs, and grading decisions.\n"
-        "  --regrade-trace FILE   Regrade a prior --trace file without loading the model.\n"
-        "  --think                Enable thinking mode. Default\n"
-        "  --think-max            Use Think Max. Auto context allocates at least 393216 tokens.\n"
-        "  --nothink              Disable thinking mode.\n"
-        "  --soft-limit-reply-budget N\n"
-        "                         Inside the last N tokens, close thinking if\n"
-        "                         </think> is already among the top close ranks.\n"
-        "                         Default: 1024\n"
-        "  --hard-limit-reply-budget N\n"
-        "                         Force </think> with N tokens left for the answer.\n"
-        "                         Default: 512\n"
-        "  --soft-limit-think-close-rank N\n"
-        "                         Soft-close when </think> is in the top N tokens.\n"
-        "                         Default: 3\n"
-        "  --pause-ms N           Pause after each result in the TTY UI. Default: 350\n"
-        "  --plain                Disable split-screen ANSI UI.\n"
-        "  --self-test-extractors Run answer-extractor self-tests and exit.\n"
-        "  -h, --help             Show this help.\n");
+static void usage(FILE *fp, const char *topic) {
+    ds4_help_print(fp, DS4_HELP_EVAL, topic);
 }
 
 static eval_config parse_options(int argc, char **argv) {
@@ -1550,7 +1501,9 @@ static eval_config parse_options(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
-            usage(stdout);
+            const char *topic = (i + 1 < argc && argv[i + 1][0] != '-') ?
+                argv[i + 1] : NULL;
+            usage(stdout, topic);
             exit(0);
         }
         char dist_parse_err[256] = {0};
@@ -1634,7 +1587,7 @@ static eval_config parse_options(int argc, char **argv) {
             c.self_test_extractors = true;
         } else {
             fprintf(stderr, "ds4-eval: unknown option: %s\n", arg);
-            usage(stderr);
+            usage(stderr, NULL);
             exit(2);
         }
     }

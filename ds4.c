@@ -1613,7 +1613,6 @@ static ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
 
 #ifndef DS4_NO_GPU
 #ifndef __APPLE__
-#ifdef DS4_CUDA_SPARK_HBM_CACHE
 typedef struct {
     uint64_t off;
     uint64_t end;
@@ -1642,16 +1641,44 @@ static uint64_t accelerator_cuda_preload_span_bytes(void) {
     return mb * 1048576ull;
 }
 
-static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *cached_out) {
-    /* Routed MoE expert weights (`*_exps.weight`) are ~65 GiB of the model on
-     * V4-Flash but only top-K of N=256 experts fire per token — pre-caching
-     * them in HBM wastes most of the budget on cold weights and starves the
-     * hot non-MoE tensors that every token reads.  Skip them at the span-
-     * build stage so the cap fills with attn / shared FFN / embedding /
-     * output head.  Cold MoE expert reads fall back to the UVA-mapped
-     * pointer. */
-    accelerator_tensor_span *spans = xmalloc((size_t)m->n_tensors * sizeof(spans[0]));
+static bool accelerator_span_filter_contains(uint64_t off,
+                                             uint64_t bytes,
+                                             const uint64_t *span_offsets,
+                                             const uint64_t *span_sizes,
+                                             uint32_t span_count) {
+    if (span_count == 0) return true;
+    if (bytes == 0) return true;
+    const uint64_t end = off + bytes;
+    if (end < off) return false;
+    for (uint32_t i = 0; i < span_count; i++) {
+        const uint64_t span_end = span_offsets[i] + span_sizes[i];
+        if (span_end < span_offsets[i]) return false;
+        if (off >= span_offsets[i] && end <= span_end) return true;
+    }
+    return false;
+}
+
+static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
+                                                   const uint64_t *span_offsets,
+                                                   const uint64_t *span_sizes,
+                                                   uint32_t span_count,
+                                                   uint64_t *prepared_out) {
+    uint64_t cap = m->n_tensors;
+    if (cap == 0) {
+        if (prepared_out) *prepared_out = 0;
+        return true;
+    }
+
+    accelerator_tensor_span *spans = xmalloc((size_t)cap * sizeof(spans[0]));
     uint64_t nspan = 0;
+    for (uint32_t i = 0; i < span_count; i++) {
+        if (span_offsets[i] > m->size ||
+            span_sizes[i] == 0 ||
+            span_sizes[i] > m->size - span_offsets[i]) {
+            free(spans);
+            return false;
+        }
+    }
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const ds4_tensor *t = &m->tensors[i];
         if (t->bytes == 0) continue;
@@ -1659,9 +1686,8 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
             free(spans);
             return false;
         }
-        /* Routed-expert weights are the only tensors with "_exps." in the
-         * name; memmem is safe on short names (returns NULL). */
-        if (memmem(t->name.ptr, t->name.len, "_exps.", 6) != NULL) {
+        if (!accelerator_span_filter_contains(t->abs_offset, t->bytes,
+                                              span_offsets, span_sizes, span_count)) {
             continue;
         }
         spans[nspan++] = (accelerator_tensor_span){
@@ -1669,91 +1695,131 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
             .end = t->abs_offset + t->bytes,
         };
     }
+    if (nspan == 0) {
+        free(spans);
+        if (prepared_out) *prepared_out = 0;
+        return true;
+    }
+
     qsort(spans, (size_t)nspan, sizeof(spans[0]), accelerator_tensor_span_cmp);
 
     const uint64_t max_span = accelerator_cuda_preload_span_bytes();
-    uint64_t cached = 0;
+    const int tty = ds4_log_is_tty(stderr);
+    const uint64_t progress_step = (tty ? 2ull : 16ull) * 1073741824ull;
+    uint64_t next_progress = progress_step;
+    double last_progress = now_sec();
+    uint64_t prepared = 0;
     uint64_t merged = 0;
+
+    fprintf(stderr, "%sds4: CUDA preparing model tensor mappings%s",
+            tty ? "\r\033[K" : "",
+            tty ? ": 0.00 GiB" : "\n");
+    fflush(stderr);
+
     for (uint64_t i = 0; i < nspan;) {
         uint64_t off = spans[i].off;
         uint64_t end = spans[i].end;
         i++;
-        while (i < nspan && spans[i].off <= end + 65536u && spans[i].end - off <= max_span) {
+        while (i < nspan &&
+               spans[i].off <= end + 65536u &&
+               spans[i].end - off <= max_span) {
             if (spans[i].end > end) end = spans[i].end;
             i++;
         }
-        while (off < end) {
-            uint64_t chunk_end = end;
-            if (chunk_end - off > max_span) chunk_end = off + max_span;
-            char label[96];
-            snprintf(label, sizeof(label), "tensor-span:%" PRIu64, merged);
-            if (ds4_gpu_cache_model_range(m->map, m->size, off, chunk_end - off, label) == 0) {
-                fprintf(stderr,
-                        "ds4: accelerator failed to cache model tensor span %" PRIu64
-                        " at offset %" PRIu64 "\n",
-                        merged, off);
-                free(spans);
-                return false;
+        char label[96];
+        snprintf(label, sizeof(label), "tensor-span:%" PRIu64, merged);
+        if (ds4_gpu_cache_model_range(m->map, m->size, off, end - off, label) == 0) {
+            if (tty) fputc('\n', stderr);
+            fprintf(stderr,
+                    "ds4: accelerator failed to prepare model tensor span %" PRIu64
+                    " at offset %" PRIu64 "\n",
+                    merged, off);
+            free(spans);
+            return false;
+        }
+        prepared += end - off;
+        merged++;
+
+        const double now = now_sec();
+        if (prepared >= next_progress || now - last_progress >= (tty ? 2.0 : 10.0)) {
+            if (tty) {
+                fprintf(stderr, "\r\033[Kds4: CUDA preparing model tensor mappings: %.2f GiB",
+                        (double)prepared / 1073741824.0);
+            } else {
+                fprintf(stderr, "ds4: CUDA prepared model tensor mappings %.2f GiB\n",
+                        (double)prepared / 1073741824.0);
             }
-            cached += chunk_end - off;
-            merged++;
-            off = chunk_end;
+            fflush(stderr);
+            last_progress = now;
+            while (next_progress <= prepared) next_progress += progress_step;
         }
     }
+
+    if (tty) fputc('\n', stderr);
     free(spans);
-    if (cached_out) *cached_out = cached;
+    if (prepared_out) *prepared_out = prepared;
     return true;
 }
-#endif
 
-static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
+static bool accelerator_cache_q8_tensors(const ds4_model *m,
+                                         const uint64_t *span_offsets,
+                                         const uint64_t *span_sizes,
+                                         uint32_t span_count) {
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->bytes == 0) continue;
+        if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) return false;
+        if (!accelerator_span_filter_contains(t->abs_offset, t->bytes,
+                                              span_offsets, span_sizes, span_count)) {
+            continue;
+        }
+        char label[128];
+        snprintf(label, sizeof(label), "tensor:%.*s", (int)t->name.len, t->name.ptr);
+        if (t->type == DS4_TENSOR_Q8_0 && t->ndim == 2 &&
+            ds4_gpu_cache_q8_f16_range(m->map, m->size, t->abs_offset, t->bytes, t->dim[0], t->dim[1], label) == 0) {
+            fprintf(stderr, "ds4: accelerator failed to cache dequantized Q8 tensor %.*s\n",
+                    (int)t->name.len, t->name.ptr);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool accelerator_cache_model_tensors(ds4_backend backend,
+                                            const ds4_model *m,
+                                            const uint64_t *span_offsets,
+                                            const uint64_t *span_sizes,
+                                            uint32_t span_count) {
     if (backend != DS4_BACKEND_CUDA) return true;
     if (!m || !m->map || m->size == 0) return false;
     if (getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
         return true;
     }
 
-#ifdef DS4_CUDA_SPARK_HBM_CACHE
     const double t0 = now_sec();
-    uint64_t cached = 0;
-    if (!accelerator_cache_model_tensor_spans(m, &cached)) return false;
-#else
-    uint64_t cached = 0;
-#endif
-    if (getenv("DS4_CUDA_Q8_F16_PRELOAD") != NULL ||
-        getenv("DS4_CUDA_Q8_F32_PRELOAD") != NULL) {
-        for (uint64_t i = 0; i < m->n_tensors; i++) {
-            const ds4_tensor *t = &m->tensors[i];
-            if (t->bytes == 0) continue;
-            if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) return false;
-            char label[128];
-            snprintf(label, sizeof(label), "tensor:%.*s", (int)t->name.len, t->name.ptr);
-            if (t->type == DS4_TENSOR_Q8_0 && t->ndim == 2 &&
-                ds4_gpu_cache_q8_f16_range(m->map, m->size, t->abs_offset, t->bytes, t->dim[0], t->dim[1], label) == 0) {
-                fprintf(stderr, "ds4: accelerator failed to cache dequantized Q8 tensor %.*s\n",
-                        (int)t->name.len, t->name.ptr);
-                return false;
-            }
-        }
+    uint64_t prepared = 0;
+    if (!accelerator_prepare_model_tensor_spans(m, span_offsets, span_sizes, span_count, &prepared)) {
+        return false;
     }
-#ifdef DS4_CUDA_SPARK_HBM_CACHE
-    if (cached != 0) {
-        const double t1 = now_sec();
-        if (ds4_log_is_tty(stderr)) fputc('\n', stderr);
-        fprintf(stderr,
-                "ds4: CUDA startup model cache prepared %.2f GiB of tensor spans in %.3fs\n",
-                (double)cached / 1073741824.0,
-                t1 - t0);
-    }
-#else
-    (void)cached;
-#endif
+    if (!accelerator_cache_q8_tensors(m, span_offsets, span_sizes, span_count)) return false;
+    const double t1 = now_sec();
+    fprintf(stderr,
+            "ds4: CUDA startup model preparation covered %.2f GiB of tensor spans in %.3fs\n",
+            (double)prepared / 1073741824.0,
+            t1 - t0);
     return true;
 }
 #else
-static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
+static bool accelerator_cache_model_tensors(ds4_backend backend,
+                                            const ds4_model *m,
+                                            const uint64_t *span_offsets,
+                                            const uint64_t *span_sizes,
+                                            uint32_t span_count) {
     (void)backend;
     (void)m;
+    (void)span_offsets;
+    (void)span_sizes;
+    (void)span_count;
     return true;
 }
 #endif
@@ -15787,6 +15853,28 @@ void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens) {
     bpe_tokenize_text(&e->vocab, DS4_REASONING_EFFORT_MAX_PREFIX, tokens);
 }
 
+static void bpe_tokenize_tool_result_text(ds4_vocab *vocab, const char *content, token_vec *out) {
+    /* Tool output is plain data inside <tool_result>...</tool_result>.
+     * Preserve literal '<', '>' and '&' so shell output and file snippets stay
+     * intact, but escape the exact closing sentinel so a malicious or accidental
+     * tool payload cannot terminate the wrapper early. */
+    const char *end = "</tool_result>";
+    const size_t endlen = strlen(end);
+    const char *span = content ? content : "";
+    const char *p = span;
+    while (*p) {
+        if (!strncmp(p, end, endlen)) {
+            tokenize_span(vocab, span, (size_t)(p - span), out);
+            bpe_tokenize_text(vocab, "&lt;", out);
+            p++;
+            span = p;
+        } else {
+            p++;
+        }
+    }
+    tokenize_span(vocab, span, (size_t)(p - span), out);
+}
+
 void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role, const char *content) {
     ds4_vocab *vocab = &e->vocab;
     if (!role) role = "user";
@@ -15800,11 +15888,13 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
             token_vec_push(tokens, vocab->think_end_id);
         }
         bpe_tokenize_text(vocab, content, tokens);
+    } else if (!strcmp(role, "tool") || !strcmp(role, "function")) {
+        token_vec_push(tokens, vocab->user_id);
+        bpe_tokenize_text(vocab, "<tool_result>", tokens);
+        bpe_tokenize_tool_result_text(vocab, content, tokens);
+        bpe_tokenize_text(vocab, "</tool_result>", tokens);
     } else {
         token_vec_push(tokens, vocab->user_id);
-        if (!strcmp(role, "tool") || !strcmp(role, "function")) {
-            bpe_tokenize_text(vocab, "Tool: ", tokens);
-        }
         bpe_tokenize_text(vocab, content, tokens);
     }
 }
@@ -18988,6 +19078,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         ds4_gpu_set_quality(e->quality);
         (void)ds4_gpu_set_model_fd(e->model.fd);
         int model_map_ok = 0;
+        uint64_t *load_offsets = NULL;
+        uint64_t *load_sizes = NULL;
+        uint32_t load_span_count = 0;
         if (load_slice) {
             char load_end[32];
             if (load_output && load_layer_end == UINT32_MAX) {
@@ -19020,20 +19113,22 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 sizes[i] = spans.v[i].end - spans.v[i].off;
                 span_bytes += sizes[i];
             }
+            load_offsets = offsets;
+            load_sizes = sizes;
+            load_span_count = spans.len;
             fprintf(stderr,
-                    "ds4: restricting Metal model map to layers %u:%s (%u spans, %.2f GiB tensor span)\n",
+                    "ds4: restricting %s model map to layers %u:%s (%u spans, %.2f GiB tensor span)\n",
+                    ds4_backend_name(e->backend),
                     load_layer_start,
                     load_end,
                     spans.len,
                     (double)span_bytes / 1073741824.0);
             model_map_ok = ds4_gpu_set_model_map_spans(e->model.map,
                                                         e->model.size,
-                                                        offsets,
-                                                        sizes,
-                                                        spans.len,
+                                                        load_offsets,
+                                                        load_sizes,
+                                                        load_span_count,
                                                         spans.max_tensor_bytes);
-            free(offsets);
-            free(sizes);
             free(spans.v);
         } else {
             model_map_ok = ds4_gpu_set_model_map_range(e->model.map,
@@ -19047,6 +19142,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                     "ds4: %s failed to map model views; aborting startup. "
                     "This is commonly caused by insufficient memory or accelerator VM budget.\n",
                     ds4_backend_name(e->backend));
+            free(load_offsets);
+            free(load_sizes);
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -19062,24 +19159,30 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                     "ds4: %s failed to map MTP model views; aborting startup. "
                     "This is commonly caused by insufficient memory or accelerator VM budget.\n",
                     ds4_backend_name(e->backend));
+            free(load_offsets);
+            free(load_sizes);
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
-        if (!accelerator_cache_model_tensors(e->backend, &e->model)) {
-            fprintf(stderr, "ds4: %s failed to prepare startup model cache\n",
+        if (!accelerator_cache_model_tensors(e->backend, &e->model,
+                                             load_offsets, load_sizes,
+                                             load_span_count)) {
+            fprintf(stderr, "ds4: %s failed to prepare optional model cache\n",
                     ds4_backend_name(e->backend));
+            free(load_offsets);
+            free(load_sizes);
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
-        /* Also populate the HBM cache for the MTP support model when loaded.
-         * Without this, MTP-block tensor reads at decode time hit the UVA-
-         * mapped pointer (slow) instead of cudaMalloc'd HBM copies (fast).
-         * The MoE expert filter in accelerator_cache_model_tensor_spans
-         * skips `mtp.0.ffn_*_exps.weight` automatically. */
-        if (e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->mtp_model)) {
-            fprintf(stderr, "ds4: %s failed to prepare MTP startup model cache\n",
+        free(load_offsets);
+        free(load_sizes);
+        /* Also apply explicit optional Q8 preload settings to the MTP support
+         * model when loaded. */
+        if (e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->mtp_model,
+                                                             NULL, NULL, 0)) {
+            fprintf(stderr, "ds4: %s failed to prepare optional MTP model cache\n",
                     ds4_backend_name(e->backend));
             ds4_engine_close(e);
             *out = NULL;
