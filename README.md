@@ -1150,7 +1150,6 @@ extractor self-test run first:
 make test                  # ./ds4-eval --self-test-extractors && ./ds4_test --all
 ./ds4_test --logprob-vectors
 ./ds4_test --server
-python3 tests/structured_outputs_stress.py --base-url http://127.0.0.1:8000/v1 --model ds4 --apis chat,responses
 ```
 
 ## Debugging Notes
