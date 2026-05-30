@@ -150,6 +150,17 @@ imatrix. The imatrix variants are preferred.
 Authentication is optional for public downloads, but `--token TOKEN`,
 `HF_TOKEN`, or the local Hugging Face token cache are used when present.
 
+If `huggingface.co` is hard to reach from your network, set the standard
+`HF_ENDPOINT` environment variable to a Hugging Face mirror before running the
+script. The same variable is honored by the official `huggingface_hub` Python
+library, so the setting is shared. For example, users in mainland China can use
+the community mirror:
+
+```sh
+export HF_ENDPOINT=https://hf-mirror.com
+./download_model.sh q2-imatrix
+```
+
 If you want to regenerate GGUF files or collect a new imatrix, see
 [gguf-tools/README.md](gguf-tools/README.md). Those tools are meant for offline
 model-building work and can take a long time on the full DeepSeek V4 Flash
