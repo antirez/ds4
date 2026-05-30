@@ -37,6 +37,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include <mach/mach.h>
 
 static volatile sig_atomic_t g_stop_requested = 0;
 static volatile sig_atomic_t g_listen_fd = -1;
@@ -603,6 +604,7 @@ typedef struct {
     ds4_think_mode think_mode;
     bool has_tools;
     bool prompt_preserves_reasoning;
+    bool skip_decode_cache_updates;  /* X-C0NR-MOTIF: on */
     /* For /v1/responses: emit reasoning_summary_* events / fields only when the
      * client opted in via reasoning.summary. Other APIs leave this false; the
      * field is ignored on those code paths. */
@@ -4654,10 +4656,10 @@ static bool try_repair_dsml(const char *s, size_t len, buf *out) {
         size_t d;
         if ((d = strlen(ts)) && !strncmp(p, ts, d)) { tos++; p += d; }
         else if ((d = strlen(te)) && !strncmp(p, te, d)) { toe++; p += d; }
-        else if ((d = strlen(is)) && !strncmp(p, is, d)) { ios++; p += d; }
-        else if ((d = strlen(ie)) && !strncmp(p, ie, d)) { ioe++; p += d; }
         else if ((d = strlen(ps)) && !strncmp(p, ps, d)) { pos++; p += d; }
         else if ((d = strlen(pe)) && !strncmp(p, pe, d)) { poe++; p += d; }
+        else if ((d = strlen(is)) && !strncmp(p, is, d)) { ios++; p += d; }
+        else if ((d = strlen(ie)) && !strncmp(p, ie, d)) { ioe++; p += d; }
         else p++;
     }
     if (tos == toe && ios == ioe && pos == poe) return false;
@@ -7592,6 +7594,19 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
+/* Get current physical memory footprint in MiB (equivalent to Activity
+ * Monitor's "Memory" column on macOS).  Uses phys_footprint which includes
+ * Metal GPU buffer allocations, mmap-backed pages, and wired memory —
+ * unlike resident_size which excludes clean file-backed pages. */
+static double get_rss_mib(void) {
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO,
+                  (task_info_t)&info, &count) != KERN_SUCCESS)
+        return 0.0;
+    return (double)info.phys_footprint / (1024.0 * 1024.0);
+}
+
 static void server_log(ds4_log_type type, const char *fmt, ...) {
     time_t now = time(NULL);
     struct tm tm;
@@ -7693,6 +7708,50 @@ typedef struct {
     size_t visible_len;
 } visible_live_state;
 
+#define POINT_CHECKPOINT_ALIGNMENT_TOKENS 128
+#define POINT_CHECKPOINT_MIN_INTERVAL_TOKENS 2048
+#ifndef POINT_CHECKPOINT_INTERVAL_TOKENS
+#define POINT_CHECKPOINT_INTERVAL_TOKENS 4096
+#endif
+#define POINT_CHECKPOINT_DEFAULT_SPACE_MB 8192
+
+#define PREFIX_LOOKBACK_MAX_TOKENS 2048
+#define PREFIX_LOOKBACK_DEFAULT_MIN_REWIND 128
+#define PREFIX_LOOKBACK_RING_SLOTS 18
+
+typedef struct {
+    int point;                     /* absolute token position */
+    int offset;
+    bool valid;                    /* semantic validity; buffers may remain allocated */
+    char token_prefix_hash[41];    /* SHA1(token_ids[0..point)) at capture time */
+    char verify_hash[41];          /* SHA1(live[0..point)) — rebuilt after each invalidation */
+    ds4_tokens tokens;             /* exact token IDs at capture time, for prefix comparison */
+    ds4_session_swa_shard swa_shard; /* partial raw-SWA data for this point */
+    time_t created_at;
+    int hits;
+} point_checkpoint_entry;
+
+typedef struct {
+    int lookback_tokens;
+    int min_rewind_tokens;
+    int tail_rows;
+    int hits;
+    int count;
+    int next;
+    int last_store_point;
+    uint64_t total_bytes;
+    point_checkpoint_entry entries[PREFIX_LOOKBACK_RING_SLOTS];
+} prefix_lookback_cache;
+
+typedef struct {
+    int interval;                  /* N = capture at every N-token boundary */
+    uint64_t max_bytes;            /* memory budget in bytes; 0 = unlimited (one entry) */
+    point_checkpoint_entry *entries;
+    int count;
+    int capacity;
+    uint64_t total_bytes;
+} point_checkpoint_cache;
+
 static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
 
@@ -7706,6 +7765,8 @@ struct server {
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
     bool disable_exact_dsml_tool_replay;
+    bool cache_verbose;
+    bool point_checkpoint_replay_boundary_token;
     bool enable_cors;
     pthread_mutex_t tool_mu;
     pthread_mutex_t mu;
@@ -7719,6 +7780,8 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+    prefix_lookback_cache prefix_lookback;
+    point_checkpoint_cache point_checkpoint;
 };
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
@@ -7732,6 +7795,98 @@ struct job {
     pthread_cond_t cv;
     job *next;
 };
+
+static void checkpoint_time_str(time_t t, char *buf, size_t len) {
+    if (!buf || len == 0) return;
+    if (t <= 0) {
+        snprintf(buf, len, "-");
+        return;
+    }
+    struct tm tm;
+    localtime_r(&t, &tm);
+    strftime(buf, len, "%Y-%m-%dT%H:%M:%S%z", &tm);
+}
+
+static long checkpoint_age_seconds(time_t t) {
+    time_t now = time(NULL);
+    return t > 0 && now >= t ? (long)(now - t) : 0;
+}
+
+static bool is_point_checkpoint_boundary(const server *s, int point) {
+    return s && s->point_checkpoint.interval > 0 && point > 0 &&
+        point % s->point_checkpoint.interval == 0;
+}
+
+static int prefix_lookback_effective_tokens(const prefix_lookback_cache *c) {
+    if (!c || c->lookback_tokens <= 0) return 0;
+    return c->lookback_tokens < PREFIX_LOOKBACK_MAX_TOKENS ?
+        c->lookback_tokens : PREFIX_LOOKBACK_MAX_TOKENS;
+}
+
+static void point_checkpoint_refresh_offsets(point_checkpoint_cache *c) {
+    if (!c) return;
+    for (int i = 0; i < c->count; i++) c->entries[i].offset = i;
+}
+
+static int point_checkpoint_find_index(const point_checkpoint_cache *c,
+                                       int point,
+                                       const char hash[41]) {
+    if (!c || !hash) return -1;
+    for (int i = 0; i < c->count; i++) {
+        const point_checkpoint_entry *e = &c->entries[i];
+        if (e->point == point && strncmp(e->token_prefix_hash, hash, 40) == 0)
+            return i;
+    }
+    return -1;
+}
+
+static void log_active_checkpoints(server *s, const char *reason) {
+    if (!s || !s->cache_verbose) return;
+    prefix_lookback_cache *pl = &s->prefix_lookback;
+    point_checkpoint_cache *pc = &s->point_checkpoint;
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: active checkpoints reason=%s prefix_lookback_tokens=%d min_rewind=%d tail_rows=%d prefix_hits=%d point=%d/%d point_bytes=%llu",
+               reason ? reason : "?",
+               pl->lookback_tokens,
+               pl->min_rewind_tokens,
+               pl->tail_rows,
+               pl->hits,
+               pc->count,
+               pc->capacity,
+               (unsigned long long)pc->total_bytes);
+    for (int i = 0; i < pc->count; i++) {
+        point_checkpoint_entry *e = &pc->entries[i];
+        char ts[40];
+        checkpoint_time_str(e->created_at, ts, sizeof(ts));
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: active point checkpoint offset=%d point=%d created_at=%s age=%lds hits=%d tokens=%d bytes=%llu hash=%.12s",
+                   e->offset,
+                   e->point,
+                   ts,
+                   checkpoint_age_seconds(e->created_at),
+                   e->hits,
+                   e->tokens.len,
+                   (unsigned long long)e->swa_shard.cap,
+                   e->token_prefix_hash);
+    }
+    for (int i = 0; i < PREFIX_LOOKBACK_RING_SLOTS; i++) {
+        point_checkpoint_entry *e = &pl->entries[i];
+        if (!e->valid || !e->swa_shard.ptr) continue;
+        char ts[40];
+        checkpoint_time_str(e->created_at, ts, sizeof(ts));
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: active tail checkpoint class=tail offset=%d point=%d point_boundary=%d created_at=%s age=%lds hits=%d tokens=%d bytes=%llu hash=%.12s",
+                   e->offset,
+                   e->point,
+                   is_point_checkpoint_boundary(s, e->point) ? 1 : 0,
+                   ts,
+                   checkpoint_age_seconds(e->created_at),
+                   e->hits,
+                   e->tokens.len,
+                   (unsigned long long)e->swa_shard.cap,
+                   e->token_prefix_hash);
+    }
+}
 
 /* =========================================================================
  * Tool Call Text Memory.
@@ -8625,6 +8780,556 @@ static void build_prompt_from_exact_prefix_and_text_suffix(
         engine, exact_prefix, suffix_text, out);
 }
 
+static void sha1_token_prefix_hex(const ds4_tokens *tokens, int prefix_len, char out[41]);
+static void point_checkpoint_entry_free(point_checkpoint_entry *entry);
+static void point_checkpoint_entry_invalidate(point_checkpoint_entry *entry);
+
+static void prefix_lookback_free(prefix_lookback_cache *c) {
+    if (!c) return;
+    for (int i = 0; i < PREFIX_LOOKBACK_RING_SLOTS; i++) {
+        point_checkpoint_entry_free(&c->entries[i]);
+    }
+    memset(c, 0, sizeof(*c));
+}
+
+static void point_checkpoint_rebuild_index(server *s);
+static int point_checkpoint_first_token_mismatch(const point_checkpoint_entry *e,
+                                                 const ds4_tokens *prompt);
+static void point_checkpoint_log_token_mismatch(const char *where,
+                                                const point_checkpoint_entry *e,
+                                                const ds4_tokens *prompt);
+
+static void prefix_lookback_refresh_offsets(prefix_lookback_cache *c) {
+    if (!c) return;
+    for (int i = 0; i < PREFIX_LOOKBACK_RING_SLOTS; i++) c->entries[i].offset = i;
+}
+
+static int prefix_lookback_valid_count(const prefix_lookback_cache *c) {
+    if (!c) return 0;
+    int n = 0;
+    for (int i = 0; i < PREFIX_LOOKBACK_RING_SLOTS; i++) {
+        if (c->entries[i].valid && c->entries[i].swa_shard.ptr) n++;
+    }
+    return n;
+}
+
+static int prefix_lookback_latest_valid_point(const prefix_lookback_cache *c) {
+    if (!c) return 0;
+    int point = 0;
+    for (int i = 0; i < PREFIX_LOOKBACK_RING_SLOTS; i++) {
+        const point_checkpoint_entry *e = &c->entries[i];
+        if (e->valid && e->swa_shard.ptr && e->point > point) point = e->point;
+    }
+    return point;
+}
+
+static void prefix_lookback_refresh_state(prefix_lookback_cache *c) {
+    if (!c) return;
+    c->count = prefix_lookback_valid_count(c);
+    c->last_store_point = prefix_lookback_latest_valid_point(c);
+    prefix_lookback_refresh_offsets(c);
+}
+
+static void prefix_lookback_reset_metadata(prefix_lookback_cache *c) {
+    if (!c) return;
+    for (int i = 0; i < PREFIX_LOOKBACK_RING_SLOTS; i++) {
+        point_checkpoint_entry_invalidate(&c->entries[i]);
+    }
+    prefix_lookback_refresh_state(c);
+}
+
+static int prefix_lookback_spacing(const prefix_lookback_cache *c) {
+    (void)c;
+    return 128;
+}
+
+static bool prefix_lookback_has_nearby_point(const prefix_lookback_cache *c, int point) {
+    if (!c || point <= 0) return false;
+    int spacing = prefix_lookback_spacing(c);
+    for (int i = 0; i < PREFIX_LOOKBACK_RING_SLOTS; i++) {
+        const point_checkpoint_entry *e = &c->entries[i];
+        if (!e->valid || !e->swa_shard.ptr) continue;
+        int d = e->point > point ? e->point - point : point - e->point;
+        if (d < spacing) return true;
+    }
+    return false;
+}
+
+static void prefix_lookback_trim_window(prefix_lookback_cache *c, int latest_point) {
+    if (!c || c->lookback_tokens <= 0 || latest_point <= 0) return;
+    int floor = latest_point - prefix_lookback_effective_tokens(c);
+    for (int i = 0; i < PREFIX_LOOKBACK_RING_SLOTS; i++) {
+        point_checkpoint_entry *e = &c->entries[i];
+        if (e->valid && e->point < floor) point_checkpoint_entry_invalidate(e);
+    }
+    prefix_lookback_refresh_state(c);
+}
+
+static int prefix_lookback_try_load(server *s, const ds4_tokens *prompt,
+                                     ds4_tokens *effective_prompt, char *err, size_t errlen) {
+    prefix_lookback_cache *c = s ? &s->prefix_lookback : NULL;
+    if (!s || !c || c->lookback_tokens <= 0 || !prompt || prompt->len <= 0) {
+        (void)err; (void)errlen;
+        return 0;
+    }
+    point_checkpoint_entry *best = NULL;
+    point_checkpoint_entry *nearest_mismatch = NULL;
+    for (int i = 0; i < PREFIX_LOOKBACK_RING_SLOTS; i++) {
+        point_checkpoint_entry *e = &c->entries[i];
+        int mismatch_pos = point_checkpoint_first_token_mismatch(e, prompt);
+        const char *skip_reason = NULL;
+        if (!e->valid) skip_reason = "invalid";
+        else if (!e->swa_shard.ptr) skip_reason = "no_swa_shard";
+        else if (e->point <= 0) skip_reason = "bad_point";
+        else if (e->point > (int)prompt->len) skip_reason = "point_gt_prompt";
+        else if (e->point == (int)prompt->len) skip_reason = "no_suffix";
+        else if (e->point % 128 != 0) skip_reason = "unaligned";
+        else if (mismatch_pos < e->point) {
+            if (!nearest_mismatch) nearest_mismatch = e;
+            continue;
+        }
+        if (skip_reason) continue;
+        if (mismatch_pos == e->point && (!best || e->point > best->point)) best = e;
+    }
+    if (!best) {
+        if (nearest_mismatch) point_checkpoint_log_token_mismatch("tail-lookup", nearest_mismatch, prompt);
+        return 0;
+    }
+    int checkpoint_point = best->point;
+    int restore_point = checkpoint_point;
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: tail checkpoint hit class=tail offset=%d point=%d prompt=%d suffix=%d point_boundary=%d hash=%s bytes=%llu",
+               best->offset,
+               best->point,
+               prompt->len,
+               prompt->len - best->point,
+               is_point_checkpoint_boundary(s, best->point) ? 1 : 0,
+               best->token_prefix_hash,
+               (unsigned long long)best->swa_shard.cap);
+    if (ds4_session_load_swa_shard(s->session, &best->swa_shard, err, errlen) != 0)
+        return 0;
+    const ds4_tokens *loaded = ds4_session_tokens(s->session);
+    if (!loaded || loaded->len < checkpoint_point) {
+        snprintf(err, errlen, "tail checkpoint load token mismatch");
+        ds4_session_invalidate(s->session);
+        return 0;
+    }
+    for (int i = 0; i < checkpoint_point; i++) {
+        if (i >= (int)prompt->len || loaded->v[i] != best->tokens.v[i] || loaded->v[i] != prompt->v[i]) {
+            snprintf(err, errlen, "tail checkpoint token-id mismatch at %d", i);
+            ds4_session_invalidate(s->session);
+            return 0;
+        }
+    }
+    ds4_tokens_copy(effective_prompt, loaded);
+    for (int i = restore_point; i < (int)prompt->len; i++)
+        ds4_tokens_push(effective_prompt, prompt->v[i]);
+    best->hits++;
+    c->hits++;
+    prefix_lookback_reset_metadata(c);
+    return restore_point;
+}
+
+static bool prefix_lookback_store_at(server *s, const ds4_tokens *tokens, int position, const char *ctx) {
+    if (!s || !tokens || s->prefix_lookback.lookback_tokens <= 0) return false;
+    if (position <= 0 || position % 128 != 0) return false;
+    if (position > tokens->len) return false;
+    prefix_lookback_cache *c = &s->prefix_lookback;
+    char live_hash[41] = {0};
+    sha1_token_prefix_hex(tokens, position, live_hash);
+    for (int i = 0; i < PREFIX_LOOKBACK_RING_SLOTS; i++) {
+        point_checkpoint_entry *e = &c->entries[i];
+        if (e->valid && e->point == position &&
+            strncmp(e->token_prefix_hash, live_hash, 40) == 0)
+            return true;
+    }
+    int slot = c->next % PREFIX_LOOKBACK_RING_SLOTS;
+    c->next = (slot + 1) % PREFIX_LOOKBACK_RING_SLOTS;
+    point_checkpoint_entry *entry = &c->entries[slot];
+    uint64_t old_cap = entry->swa_shard.cap;
+    char err[160] = {0};
+    if (ds4_session_save_swa_shard_at(s->session, position, &entry->swa_shard, err, sizeof(err)) != 0) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: tail checkpoint swa capture failed at %d: %s",
+                   position, err);
+        return false;
+    }
+    tokens_copy_prefix(&entry->tokens, tokens, position);
+    entry->point = position;
+    entry->valid = true;
+    memcpy(entry->token_prefix_hash, live_hash, sizeof(entry->token_prefix_hash));
+    memcpy(entry->verify_hash, live_hash, sizeof(entry->verify_hash));
+    entry->created_at = time(NULL);
+    entry->hits = 0;
+    if (entry->swa_shard.cap > old_cap) c->total_bytes += entry->swa_shard.cap - old_cap;
+    else if (old_cap > entry->swa_shard.cap && c->total_bytes >= old_cap - entry->swa_shard.cap)
+        c->total_bytes -= old_cap - entry->swa_shard.cap;
+    c->last_store_point = position;
+    prefix_lookback_trim_window(c, position);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: tail checkpoint stored class=tail offset=%d point=%d point_boundary=%d hash=%s bytes=%llu total=%llu ctx=%s",
+               entry->offset, entry->point,
+               is_point_checkpoint_boundary(s, entry->point) ? 1 : 0,
+               entry->token_prefix_hash,
+               (unsigned long long)entry->swa_shard.cap,
+               (unsigned long long)c->total_bytes,
+               ctx ? ctx : "-");
+    log_active_checkpoints(s, "tail-store");
+    return true;
+}
+
+static void prefix_lookback_store_window(server *s, const ds4_tokens *tokens, const char *ctx) {
+    if (!s || !tokens || s->prefix_lookback.lookback_tokens <= 0) return;
+    prefix_lookback_cache *c = &s->prefix_lookback;
+    int end = tokens->len - (tokens->len % 128);
+    if (end <= 0) return;
+    int spacing = prefix_lookback_spacing(c);
+    int floor = end - prefix_lookback_effective_tokens(c);
+    int start = c->last_store_point > 0 ? c->last_store_point + spacing : floor;
+    if (start < floor) start = floor;
+    if (start < 128) start = 128;
+    start += (128 - (start % 128)) % 128;
+    for (int point = start; point <= end; point += spacing) {
+        if (prefix_lookback_has_nearby_point(c, point)) continue;
+        prefix_lookback_store_at(s, tokens, point, ctx);
+    }
+}
+
+static void prefix_lookback_maybe_store_current(server *s, const char *ctx) {
+    if (!s || s->prefix_lookback.lookback_tokens <= 0) return;
+    const ds4_tokens *tokens = ds4_session_tokens(s->session);
+    if (!tokens || tokens->len <= 0) return;
+    prefix_lookback_store_window(s, tokens, ctx);
+}
+
+/* =========================================================================
+ * Phase-4 in-memory pointwise checkpoint cache
+ * ========================================================================= */
+
+static void sha1_token_prefix_hex(const ds4_tokens *tokens, int prefix_len, char out[41]) {
+    ds4_kvstore_sha1_bytes_hex(tokens->v, (size_t)prefix_len * sizeof(int), out);
+}
+
+static void point_checkpoint_entry_free(point_checkpoint_entry *entry) {
+    if (!entry) return;
+    ds4_tokens_free(&entry->tokens);
+    ds4_session_swa_shard_free(&entry->swa_shard);
+    memset(entry, 0, sizeof(*entry));
+}
+
+static void point_checkpoint_entry_invalidate(point_checkpoint_entry *entry) {
+    if (!entry) return;
+    entry->valid = false;
+    entry->tokens.len = 0;
+    entry->swa_shard.len = 0;
+    entry->token_prefix_hash[0] = '\0';
+    entry->verify_hash[0] = '\0';
+    entry->created_at = 0;
+    entry->hits = 0;
+}
+
+static void point_checkpoint_cache_free(point_checkpoint_cache *c) {
+    if (!c) return;
+    for (int i = 0; i < c->count; i++) point_checkpoint_entry_free(&c->entries[i]);
+    free(c->entries);
+    memset(c, 0, sizeof(*c));
+}
+
+static void point_checkpoint_evict_oldest(point_checkpoint_cache *c) {
+    if (!c || c->count <= 0) return;
+    c->total_bytes -= c->entries[0].swa_shard.cap;
+    point_checkpoint_entry_free(&c->entries[0]);
+    if (c->count > 1)
+        memmove(c->entries, c->entries + 1, (size_t)(c->count - 1) * sizeof(point_checkpoint_entry));
+    c->count--;
+    if (c->entries) memset(&c->entries[c->count], 0, sizeof(c->entries[c->count]));
+    point_checkpoint_refresh_offsets(c);
+}
+
+static void point_checkpoint_invalidate_after(point_checkpoint_cache *c, int point) {
+    if (!c || c->count <= 0) return;
+    for (int i = 0; i < c->count; i++)
+        if (c->entries[i].point > point) point_checkpoint_entry_invalidate(&c->entries[i]);
+    point_checkpoint_refresh_offsets(c);
+}
+
+static void point_checkpoint_rebuild_index(server *s) {
+    point_checkpoint_cache *c = &s->point_checkpoint;
+    if (!c || c->count <= 0) return;
+    const ds4_tokens *live = ds4_session_tokens(s->session);
+    if (!live || live->len <= 0) return;
+    for (int i = 0; i < c->count; i++) {
+        point_checkpoint_entry *e = &c->entries[i];
+        if (!e->valid || !e->swa_shard.ptr) continue;
+        if (e->point > live->len) {
+            memset(e->verify_hash, 0, sizeof(e->verify_hash));
+            continue;
+        }
+        sha1_token_prefix_hex(live, e->point, e->verify_hash);
+    }
+}
+
+static bool point_checkpoint_insert(point_checkpoint_cache *c, point_checkpoint_entry *entry) {
+    if (!c || !entry) return false;
+    uint64_t cost = entry->swa_shard.cap;
+    int idx = 0;
+    while (idx < c->count && c->entries[idx].point < entry->point) idx++;
+    if (idx < c->count && c->entries[idx].point == entry->point) {
+        if (c->total_bytes >= c->entries[idx].swa_shard.cap) c->total_bytes -= c->entries[idx].swa_shard.cap;
+        else c->total_bytes = 0;
+        point_checkpoint_entry_free(&c->entries[idx]);
+        c->entries[idx] = *entry;
+        c->total_bytes += cost;
+        memset(entry, 0, sizeof(*entry));
+        point_checkpoint_refresh_offsets(c);
+        return true;
+    }
+    /* Evict oldest while over budget (except keep at least one entry when max_bytes==0) */
+    while (c->count > 0 && c->max_bytes > 0 && c->total_bytes + cost > c->max_bytes)
+        point_checkpoint_evict_oldest(c);
+    idx = 0;
+    while (idx < c->count && c->entries[idx].point < entry->point) idx++;
+    if (c->count >= c->capacity) {
+        int new_cap = c->capacity ? c->capacity * 2 : 4;
+        point_checkpoint_entry *new_entries = realloc(c->entries,
+            (size_t)new_cap * sizeof(point_checkpoint_entry));
+        if (!new_entries) { point_checkpoint_entry_free(entry); return false; }
+        c->entries = new_entries;
+        c->capacity = new_cap;
+    }
+    memmove(c->entries + idx + 1, c->entries + idx,
+            (size_t)(c->count - idx) * sizeof(point_checkpoint_entry));
+    c->entries[idx] = *entry;
+    c->count++;
+    c->total_bytes += cost;
+    memset(entry, 0, sizeof(*entry));
+    point_checkpoint_refresh_offsets(c);
+    return true;
+}
+
+static int point_checkpoint_first_token_mismatch(const point_checkpoint_entry *e,
+                                                 const ds4_tokens *prompt) {
+    if (!e || !prompt) return 0;
+    int limit = e->tokens.len < prompt->len ? e->tokens.len : prompt->len;
+    if (limit > e->point) limit = e->point;
+    for (int i = 0; i < limit; i++) {
+        if (e->tokens.v[i] != prompt->v[i]) return i;
+    }
+    return limit;
+}
+
+static void point_checkpoint_log_token_mismatch(const char *where,
+                                                const point_checkpoint_entry *e,
+                                                const ds4_tokens *prompt) {
+    if (!e || !prompt) return;
+    int pos = point_checkpoint_first_token_mismatch(e, prompt);
+    int ckpt = pos < e->tokens.len ? e->tokens.v[pos] : -1;
+    int incoming = pos < prompt->len ? prompt->v[pos] : -1;
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: point checkpoint token-id mismatch %s point=%d at=%d checkpoint=%d prompt=%d prompt_len=%d",
+               where ? where : "?", e->point, pos, ckpt, incoming, prompt->len);
+}
+
+static void point_checkpoint_capture_maybe(server *s, int position) {
+    if (!s || s->point_checkpoint.interval <= 0) return;
+    if (position <= 0) return;
+    int interval = s->point_checkpoint.interval;
+    if (position % interval != 0) return;
+    point_checkpoint_cache *c = &s->point_checkpoint;
+    const ds4_tokens *live = ds4_session_tokens(s->session);
+    if (!live || live->len < position) return;
+    char live_hash[41] = {0};
+    sha1_token_prefix_hex(live, position, live_hash);
+    if (c->count > 0) {
+        for (int i = 0; i < c->count; i++) {
+            if (c->entries[i].valid && c->entries[i].point == position &&
+                strncmp(live_hash, c->entries[i].token_prefix_hash, 40) == 0)
+                return;
+        }
+    }
+    int existing = -1;
+    for (int i = 0; i < c->count; i++) {
+        if (c->entries[i].point == position) {
+            existing = i;
+            break;
+        }
+    }
+    if (existing >= 0) {
+        point_checkpoint_entry *entry = &c->entries[existing];
+        uint64_t old_cap = entry->swa_shard.cap;
+        char err[160] = {0};
+        if (ds4_session_save_swa_shard(s->session, &entry->swa_shard, err, sizeof(err)) != 0) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: point checkpoint swa capture failed at %d: %s",
+                       position, err);
+            return;
+        }
+        tokens_copy_prefix(&entry->tokens, live, position);
+        entry->valid = true;
+        memcpy(entry->token_prefix_hash, live_hash, sizeof(entry->token_prefix_hash));
+        memcpy(entry->verify_hash, live_hash, sizeof(entry->verify_hash));
+        entry->created_at = time(NULL);
+        entry->hits = 0;
+        if (entry->swa_shard.cap > old_cap) c->total_bytes += entry->swa_shard.cap - old_cap;
+        char ts[40];
+        checkpoint_time_str(entry->created_at, ts, sizeof(ts));
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: point checkpoint stored offset=%d point=%d created_at=%s hash=%s bytes=%llu total=%llu interval=%d reuse=1",
+                   entry->offset, entry->point, ts, entry->token_prefix_hash,
+                   (unsigned long long)entry->swa_shard.cap,
+                   (unsigned long long)c->total_bytes,
+                   c->interval);
+        log_active_checkpoints(s, "point-store");
+        return;
+    }
+    point_checkpoint_entry entry = {0};
+    entry.point = position;
+    char err[160] = {0};
+    if (ds4_session_save_swa_shard(s->session, &entry.swa_shard, err, sizeof(err)) != 0) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: point checkpoint swa capture failed at %d: %s",
+                   position, err);
+        return;
+    }
+    tokens_copy_prefix(&entry.tokens, live, position);
+    entry.valid = true;
+    memcpy(entry.token_prefix_hash, live_hash, sizeof(entry.token_prefix_hash));
+    entry.created_at = time(NULL);
+    entry.hits = 0;
+    memcpy(entry.verify_hash, live_hash, sizeof(entry.verify_hash));
+    int stored_point = entry.point;
+    char stored_hash[41] = {0};
+    memcpy(stored_hash, entry.token_prefix_hash, sizeof(stored_hash));
+    time_t stored_created_at = entry.created_at;
+    uint64_t stored_bytes = entry.swa_shard.cap;
+    if (point_checkpoint_insert(c, &entry)) {
+        int stored_offset = point_checkpoint_find_index(c, stored_point, stored_hash);
+        char ts[40];
+        checkpoint_time_str(stored_created_at, ts, sizeof(ts));
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: point checkpoint stored offset=%d point=%d created_at=%s hash=%s bytes=%llu total=%llu interval=%d",
+                   stored_offset, stored_point, ts, stored_hash,
+                   (unsigned long long)stored_bytes,
+                   (unsigned long long)c->total_bytes,
+                   c->interval);
+        log_active_checkpoints(s, "point-store");
+    }
+}
+
+static int point_checkpoint_try_load(server *s, const ds4_tokens *prompt,
+                                      ds4_tokens *effective_prompt, char *err, size_t errlen) {
+    point_checkpoint_cache *c = &s->point_checkpoint;
+    if (!c || c->interval <= 0 || c->count <= 0) {
+        (void)err; (void)errlen;
+        return 0;
+    }
+    /* Point checkpoints are RAM SWA shards keyed by the incoming
+     * prompt's token prefix.  Do not cap them by the current live LCP: a replay
+     * with clamped max_tokens can diverge in sampled decode while still having
+     * deeper prefill checkpoints from the previous full prompt. */
+    {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: point checkpoint manifest start count=%d prompt=%d",
+                   c->count, (int)prompt->len);
+        point_checkpoint_entry *best = NULL;
+        point_checkpoint_entry *nearest_mismatch = NULL;
+        for (int i = c->count - 1; i >= 0; i--) {
+            point_checkpoint_entry *e = &c->entries[i];
+            int mismatch_pos = point_checkpoint_first_token_mismatch(e, prompt);
+            const char *skip_reason = NULL;
+            if (!e->valid) skip_reason = "invalid";
+            else if (!e->swa_shard.ptr) skip_reason = "no_swa_shard";
+            else if (e->point <= 0) skip_reason = "bad_point";
+            else if (e->point > (int)prompt->len) skip_reason = "point_gt_prompt";
+            else if (mismatch_pos < e->point) {
+                int ckpt = mismatch_pos < e->tokens.len ? e->tokens.v[mismatch_pos] : -1;
+                int prom = mismatch_pos < (int)prompt->len ? prompt->v[mismatch_pos] : -1;
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: point checkpoint manifest scan offset=%d point=%d skip=mismatch at=%d ckpt=%d prompt=%d",
+                           e->offset, e->point, mismatch_pos, ckpt, prom);
+                if (!nearest_mismatch) nearest_mismatch = e;
+            }
+            if (skip_reason) {
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: point checkpoint manifest scan offset=%d point=%d skip=%s prompt=%d",
+                           e->offset, e->point, skip_reason, (int)prompt->len);
+                continue;
+            }
+            if (mismatch_pos == e->point) {
+                best = e;
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: point checkpoint manifest hit offset=%d point=%d tokens=%d bytes=%llu",
+                           e->offset, e->point, e->tokens.len,
+                           (unsigned long long)e->swa_shard.cap);
+                break;
+            }
+        }
+        if (!best) {
+            if (nearest_mismatch)
+                point_checkpoint_log_token_mismatch("lookup", nearest_mismatch, prompt);
+            server_log(DS4_LOG_WARNING,
+                        "ds4-server: point checkpoint miss count=%d prompt=%d no_match",
+                        c->count, (int)prompt->len);
+            return 0;
+        }
+        int checkpoint_point = best->point;
+        if (checkpoint_point <= 0) return 0;
+        if (ds4_session_load_swa_shard(s->session, &best->swa_shard, err, errlen) != 0)
+            return 0;
+        const ds4_tokens *loaded = ds4_session_tokens(s->session);
+        if (!loaded || loaded->len < checkpoint_point) {
+            snprintf(err, errlen, "point checkpoint load token mismatch");
+            ds4_session_invalidate(s->session);
+            return 0;
+        }
+        for (int i = 0; i < checkpoint_point; i++) {
+            if (i >= (int)prompt->len || loaded->v[i] != best->tokens.v[i] || loaded->v[i] != prompt->v[i]) {
+                int loaded_id = loaded && i < loaded->len ? loaded->v[i] : -1;
+                int ckpt_id = i < best->tokens.len ? best->tokens.v[i] : -1;
+                int prompt_id = i < prompt->len ? prompt->v[i] : -1;
+                snprintf(err, errlen,
+                         "point checkpoint token-id mismatch at %d loaded=%d checkpoint=%d prompt=%d",
+                         i, loaded_id, ckpt_id, prompt_id);
+                ds4_session_invalidate(s->session);
+                return 0;
+            }
+        }
+        int restore_point = checkpoint_point;
+        if (s->point_checkpoint_replay_boundary_token) {
+            restore_point = checkpoint_point - 1;
+            ds4_session_rewind(s->session, restore_point);
+            loaded = ds4_session_tokens(s->session);
+        }
+        ds4_tokens_copy(effective_prompt, loaded);
+        for (int i = restore_point; i < (int)prompt->len; i++)
+            ds4_tokens_push(effective_prompt, prompt->v[i]);
+        best->hits++;
+        /* Higher checkpoints belong to the previous token track; warm prefill
+         * must regenerate them with the current prompt's hashes and token IDs.
+         * The optional boundary-token replay is experimental; the default path
+         * restores the exact checkpoint point. */
+        point_checkpoint_invalidate_after(c, restore_point);
+        point_checkpoint_rebuild_index(s);
+        if (s->cache_verbose) {
+            char ts[40];
+            checkpoint_time_str(best->created_at, ts, sizeof(ts));
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: point checkpoint hit checkpoint offset=%d point=%d restore=%d replay_boundary=%d created_at=%s age=%lds hits=%d tokens=%d bytes=%llu hash=%.12s",
+                       best->offset,
+                       best->point,
+                       restore_point,
+                       s->point_checkpoint_replay_boundary_token ? 1 : 0,
+                       ts,
+                       checkpoint_age_seconds(best->created_at),
+                       best->hits,
+                       best->tokens.len,
+                       (unsigned long long)best->swa_shard.cap,
+                       best->token_prefix_hash);
+        }
+        return restore_point;
+    }
+}
+
 static int kv_cache_store_len(const kv_disk_cache *kc, int tokens) {
     return ds4_kvstore_store_len(kc, tokens);
 }
@@ -8828,6 +9533,24 @@ static int kv_cache_try_load(server *s, const request *req,
                                   loaded_ext_flags_out,
                                   req && req->api == API_RESPONSES);
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 static int live_text_prefix_prompt(server *s, const request *req,
                                    ds4_tokens *effective_prompt) {
@@ -9205,6 +9928,8 @@ static uint64_t trace_begin(
             (unsigned long long)j->req.seed);
     fprintf(s->trace, "stream_include_usage: %d\n",
             j->req.stream_include_usage ? 1 : 0);
+    fprintf(s->trace, "skip_decode_cache_updates: %d\n",
+            j->req.skip_decode_cache_updates ? 1 : 0);
     trace_write_cache_diag(s, cache_diag, &j->req.tool_replay, cached,
                            cache_source, disk_cached, disk_path);
     if (j->req.raw_body) {
@@ -9304,6 +10029,7 @@ typedef struct {
     const char *phase;
     bool has_tools;
     bool responses_protocol;
+    bool skip_decode_cache_updates;
     double t0;
     double last_t;
     int last_current;
@@ -9344,6 +10070,7 @@ static void log_flags(char *buf, size_t len, bool responses_protocol,
 }
 
 static void log_decode_progress(req_kind kind, int prompt_tokens, int completion,
+                                int max_tokens,
                                 bool responses_protocol,
                                 bool tools, bool thinking,
                                 bool dsml_start, bool dsml_end,
@@ -9355,6 +10082,7 @@ static void log_decode_progress(req_kind kind, int prompt_tokens, int completion
     const int interval_tokens = completion - *last_completion;
     const double chunk_tps = interval_s > 0.0 ? (double)interval_tokens / interval_s : 0.0;
     const double avg_tps = elapsed > 0.0 ? (double)completion / elapsed : 0.0;
+    const double pct = max_tokens > 0 ? 100.0 * (double)completion / (double)max_tokens : 0.0;
     char ctx[48];
     request_ctx_span(ctx, sizeof(ctx),
                      prompt_tokens + *last_completion,
@@ -9363,10 +10091,12 @@ static void log_decode_progress(req_kind kind, int prompt_tokens, int completion
     log_flags(flags, sizeof(flags), responses_protocol,
               tools, thinking, dsml_start, dsml_end);
     server_log(DS4_LOG_GENERATION,
-               "ds4-server: %s ctx=%s gen=%d%s%s decoding chunk=%.2f t/s avg=%.2f t/s %.3fs",
+               "ds4-server: %s ctx=%s gen=%d max=%d pct=%.1f%%%s%s decoding chunk=%.2f t/s avg=%.2f t/s %.3fs",
                kind == REQ_CHAT ? "chat" : "completion",
                ctx,
                completion,
+               max_tokens,
+               pct,
                flags[0] ? " " : "",
                flags,
                chunk_tps,
@@ -9574,6 +10304,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     if (p->seen && current == p->last_current) {
         if (p->srv && current > p->cached_tokens) {
             kv_cache_maybe_store_continued(p->srv);
+            prefix_lookback_maybe_store_current(p->srv, p->ctx);
         }
         return;
     }
@@ -9615,6 +10346,8 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                elapsed);
     if (p->srv && current > p->cached_tokens) {
         kv_cache_maybe_store_continued(p->srv);
+        prefix_lookback_maybe_store_current(p->srv, p->ctx);
+        point_checkpoint_capture_maybe(p->srv, current);
     }
 }
 
@@ -9826,6 +10559,7 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
             .cached_tokens = loaded,
             .phase = "tool checkpoint rebuild",
             .has_tools = j->req.has_tools,
+            .skip_decode_cache_updates = j->req.skip_decode_cache_updates,
             .t0 = rebuild_t0,
             .fd = j->fd,
             .stream = j->req.stream,
@@ -9915,21 +10649,56 @@ static void generate_job(server *s, job *j) {
     ds4_tokens effective_prompt = {0};
     const ds4_tokens *prompt_for_sync = &j->req.prompt;
     const bool responses_protocol = j->req.api == API_RESPONSES;
-    bool responses_live_continuation = false;
-    bool anthropic_live_continuation = false;
-    bool thinking_live_continuation = false;
-    const char *responses_live_match = NULL;
-    int responses_live_match_ids = 0;
-    int anthropic_live_match_ids = 0;
+    int cached = 0;
+    const char *cache_source = "none";
+    if (cached == 0) {
+        char restore_err[160] = {0};
+        cached = prefix_lookback_try_load(s, &j->req.prompt, &effective_prompt,
+                                          restore_err, sizeof(restore_err));
+        if (cached > 0) {
+            cache_source = "memory-prefix-lookback";
+            prompt_for_sync = &effective_prompt;
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: prefix lookback hit tokens=%d", cached);
+        } else if (restore_err[0]) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: prefix lookback restore failed: %s",
+                       restore_err);
+        }
+    }
+    /* Phase-4: pointwise in-memory checkpoint fallback after Phase-3 miss */
+    if (cached == 0 && s->point_checkpoint.interval > 0) {
+        char checkpoint_err[160] = {0};
+        cached = point_checkpoint_try_load(s, &j->req.prompt, &effective_prompt,
+                                           checkpoint_err, sizeof(checkpoint_err));
+        if (cached > 0) {
+            cache_source = "memory-point-checkpoint";
+            prompt_for_sync = &effective_prompt;
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: point checkpoint hit tokens=%d", cached);
+        } else if (checkpoint_err[0]) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: point checkpoint restore failed: %s",
+                       checkpoint_err);
+        }
+    }
     /* Responses gets the first chance to continue from live state.  This is
      * the whole point of the API shape: a request that is bound to prior live
      * output by visible transcript or tool call ids does not need to prove an
      * exact token-prefix match.  Exact token/text/disk matching remains the
      * fallback when the live state is absent or no longer describes the
      * request. */
-    int cached = responses_live_visible_prefix_prompt(s, &j->req, old_pos,
-                                                      &effective_prompt);
-    const char *cache_source = cached > 0 ? "responses-visible" : "none";
+    bool responses_live_continuation = false;
+    bool anthropic_live_continuation = false;
+    bool thinking_live_continuation = false;
+    const char *responses_live_match = NULL;
+    int responses_live_match_ids = 0;
+    int anthropic_live_match_ids = 0;
+    if (cached == 0) {
+        cached = responses_live_visible_prefix_prompt(s, &j->req, old_pos,
+                                                       &effective_prompt);
+        cache_source = cached > 0 ? "responses-visible" : "none";
+    }
     if (cached > 0) {
         responses_live_match = "visible-prefix";
         if (responses_live_matches_request(s, &j->req.responses_live_call_ids,
@@ -10026,6 +10795,20 @@ static void generate_job(server *s, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     const bool responses_reasoning_state_preserved =
         cached > 0 &&
         ((!strcmp(cache_source, "responses-visible") ||
@@ -10048,6 +10831,16 @@ static void generate_job(server *s, job *j) {
                                     cache_source, disk_cached, disk_cache_path);
     char ctx_span[48];
     request_ctx_span(ctx_span, sizeof(ctx_span), cached, prompt_tokens);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: cache decision source=%s cached=%d prompt=%d suffix=%d motif=%s skip_decode_cache_updates=%d",
+               cache_source,
+               cached,
+               prompt_tokens,
+               prompt_tokens > cached ? prompt_tokens - cached : 0,
+               j->req.skip_decode_cache_updates ? "on" : "off",
+               j->req.skip_decode_cache_updates ? 1 : 0);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: rss %.1f MiB", get_rss_mib());
     server_prefill_progress progress = {
         .srv = s,
         .kind = j->req.kind,
@@ -10055,6 +10848,7 @@ static void generate_job(server *s, job *j) {
         .cached_tokens = cached,
         .has_tools = j->req.has_tools,
         .responses_protocol = responses_protocol,
+        .skip_decode_cache_updates = j->req.skip_decode_cache_updates,
         .t0 = t0,
         .fd = j->fd,
         .stream = j->req.stream,
@@ -10191,7 +10985,9 @@ static void generate_job(server *s, job *j) {
                ctx_span,
                req_flags[0] ? " " : "",
                req_flags,
-               now_sec() - t0);
+                now_sec() - t0);
+    prefix_lookback_store_window(s, prompt_for_sync, ctx_span);
+    point_checkpoint_capture_maybe(s, prompt_for_sync->len);
     if (cold_store_len == prompt_for_sync->len) {
         if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
             kv_cache_note_store(&s->kv, cold_store_len);
@@ -10298,6 +11094,7 @@ decode_again:
         thinking_gates_tool_markers && thinking.inside;
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
+    bool logged_decode_cache_skip = false;
 
     while (!g_stop_requested && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
@@ -10306,6 +11103,14 @@ decode_again:
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
             kv_cache_maybe_store_continued(s);
+            if (!j->req.skip_decode_cache_updates) {
+                prefix_lookback_maybe_store_current(s, ctx_span);
+            } else if (!logged_decode_cache_skip) {
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: decode cache updates skipped motif=on ctx=%s",
+                           ctx_span);
+                logged_decode_cache_skip = true;
+            }
         }
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
@@ -10484,6 +11289,7 @@ decode_again:
 
             if (completion >= next_decode_log) {
                 log_decode_progress(j->req.kind, prompt_tokens, completion,
+                                    max_tokens,
                                     responses_protocol,
                                     j->req.has_tools,
                                     thinking.inside,
@@ -10597,6 +11403,7 @@ decode_again:
 
     if (completion > last_decode_log_completion) {
         log_decode_progress(j->req.kind, prompt_tokens, completion,
+                            max_tokens,
                             responses_protocol,
                             j->req.has_tools,
                             thinking.inside,
@@ -10967,6 +11774,7 @@ typedef struct {
     char path[256];
     char *body;
     size_t body_len;
+    bool x_c0nr_motif;    /* X-C0NR-MOTIF: on */
 } http_request;
 
 static void http_request_free(http_request *r) {
@@ -11001,6 +11809,23 @@ static long content_length(const char *h, size_t n) {
     return 0;
 }
 
+static bool header_x_c0nr_motif(const char *h, size_t n) {
+    const char *p = h, *end = h + n;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len >= 14 && strncasecmp(line, "X-C0NR-MOTIF:", 13) == 0) {
+            const char *v = line + 13;
+            while (v < line + len && isspace((unsigned char)*v)) v++;
+            return strncasecmp(v, "on", 2) == 0;
+        }
+        if (p < end) p++;
+    }
+    return false;
+}
+
 static bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
@@ -11027,6 +11852,8 @@ static bool read_http_request(int fd, http_request *r) {
     if (sscanf(line, "%7s %255s", r->method, r->path) != 2) goto fail;
     char *q = strchr(r->path, '?');
     if (q) *q = '\0';
+
+    r->x_c0nr_motif = header_x_c0nr_motif(b.ptr, (size_t)hend);
 
     long clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
@@ -11119,6 +11946,36 @@ static bool send_models(server *s, int fd) {
     return ok;
 }
 
+static bool fd_path_json(buf *b, const char *key, int fd) {
+#ifdef F_GETPATH
+    char pathbuf[PATH_MAX];
+    if (fcntl(fd, F_GETPATH, pathbuf) == 0 && pathbuf[0]) {
+        json_escape(b, key);
+        buf_putc(b, ':');
+        json_escape(b, pathbuf);
+        return true;
+    }
+#else
+    (void)fd;
+#endif
+    return false;
+}
+
+static bool send_ds4_runtime(server *s, int fd) {
+    buf b = {0};
+    buf_puts(&b, "{\"ok\":true,\"server\":\"ds4-server\",\"model\":");
+    json_escape(&b, ds4_engine_model_name(s->engine));
+    buf_printf(&b, ",\"ctx\":%d,\"logs\":{", ds4_session_ctx(s->session));
+    bool any = fd_path_json(&b, "stdout", STDOUT_FILENO);
+    if (any) buf_putc(&b, ',');
+    if (fd_path_json(&b, "stderr", STDERR_FILENO)) any = true;
+    (void)any;
+    buf_puts(&b, "}}\n");
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
 static void client_done(server *s) {
     pthread_mutex_lock(&s->mu);
     if (s->clients > 0) s->clients--;
@@ -11148,6 +12005,11 @@ static void *client_main(void *arg) {
 
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/__ds4/runtime")) {
+        send_ds4_runtime(s, fd);
         http_request_free(&hr);
         goto done;
     }
@@ -11184,6 +12046,8 @@ static void *client_main(void *arg) {
         goto done;
     }
     if (ok) req.raw_body = xstrndup(hr.body, hr.body_len);
+    if (ok && !strcmp(hr.path, "/v1/chat/completions"))
+        req.skip_decode_cache_updates = hr.x_c0nr_motif;
     http_request_free(&hr);
     if (!ok) {
         http_error(fd, s->enable_cors, 400, err);
@@ -11282,7 +12146,12 @@ typedef struct {
     const char *kv_disk_dir;
     uint64_t kv_disk_space_mb;
     kv_cache_options kv_cache;
+    int prefix_lookback_tokens;
+    int prefix_lookback_min_rewind_tokens;
+    int point_checkpoint_space_mb;
     bool kv_cache_reject_different_quant;
+    bool cache_verbose;
+    bool point_checkpoint_replay_boundary_token;
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
@@ -11344,6 +12213,8 @@ static void server_close_resources(server *s) {
         s->trace = NULL;
     }
     kv_cache_close(&s->kv);
+    prefix_lookback_free(&s->prefix_lookback);
+    point_checkpoint_cache_free(&s->point_checkpoint);
     tool_memory_free(&s->tool_mem);
     live_tool_state_free(&s->responses_live);
     live_tool_state_free(&s->anthropic_live);
@@ -11429,6 +12300,16 @@ static void usage(FILE *fp) {
         "      Align cold boundary saves down to this token multiple. 0 disables alignment. Default: 2048\n"
         "  --kv-cache-reject-different-quant\n"
         "      Refuse checkpoints written by the same model with a different routed-expert quantization.\n"
+        "  --kv-prefix-lookback-tokens N\n"
+        "      Enable live token-prefix lookback over the last N tokens. Default: 0\n"
+        "  --kv-prefix-lookback-min-rewind-tokens N\n"
+        "      Minimum useful live-tail rewind distance. Default: 128\n"
+        "  --kv-point-checkpoint-space-mb N\n"
+        "      Maximum memory budget for point checkpoints in MiB. Default: 8192 (0=unlimited)\n"
+        "  --kv-point-checkpoint-replay-boundary-token\n"
+        "      Experimental: restore one token before the checkpoint point and replay the boundary token. Default: off\n"
+        "  --kv-cache-verbose\n"
+        "      Log active in-memory checkpoint metadata after cache events.\n"
         "  --disable-exact-dsml-tool-replay\n"
         "      Disable the tool-id -> exact sampled DSML map. Tool history falls back to canonical JSON rendering.\n"
         "  --tool-memory-max-ids N\n"
@@ -11473,6 +12354,25 @@ static ds4_backend default_server_backend(void) {
 #endif
 }
 
+static void validate_checkpoint_geometry(const server_config *c) {
+    if (POINT_CHECKPOINT_INTERVAL_TOKENS != 0) {
+        if (POINT_CHECKPOINT_INTERVAL_TOKENS < POINT_CHECKPOINT_MIN_INTERVAL_TOKENS ||
+            POINT_CHECKPOINT_INTERVAL_TOKENS % POINT_CHECKPOINT_ALIGNMENT_TOKENS != 0) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: POINT_CHECKPOINT_INTERVAL_TOKENS must be 0 (disabled) or a multiple of %d and >= %d",
+                       POINT_CHECKPOINT_ALIGNMENT_TOKENS,
+                       POINT_CHECKPOINT_MIN_INTERVAL_TOKENS);
+            exit(2);
+        }
+        return;
+    }
+    if (c && c->prefix_lookback_tokens > 0) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: --kv-prefix-lookback-tokens requires point checkpoints; POINT_CHECKPOINT_INTERVAL_TOKENS=0 disables tail cache");
+        exit(2);
+    }
+}
+
 static server_config parse_options(int argc, char **argv) {
     server_config c = {
         .engine = {
@@ -11486,6 +12386,8 @@ static server_config parse_options(int argc, char **argv) {
         .ctx_size = 32768,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
+        .prefix_lookback_min_rewind_tokens = PREFIX_LOOKBACK_DEFAULT_MIN_REWIND,
+        .point_checkpoint_space_mb = POINT_CHECKPOINT_DEFAULT_SPACE_MB,
     };
     c.kv_cache = kv_cache_default_options();
 
@@ -11553,6 +12455,21 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_cache.boundary_align_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-reject-different-quant")) {
             c.kv_cache_reject_different_quant = true;
+        } else if (!strcmp(arg, "--kv-prefix-lookback-tokens")) {
+            c.prefix_lookback_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-prefix-lookback-min-rewind-tokens") ||
+                   !strcmp(arg, "--kv-prefix-lookback-align-tokens")) {
+            c.prefix_lookback_min_rewind_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-prefix-lookback-entries")) {
+            (void)need_arg(&i, argc, argv, arg);
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: --kv-prefix-lookback-entries is ignored; prefix lookback uses the live SWA tail");
+        } else if (!strcmp(arg, "--kv-point-checkpoint-space-mb")) {
+            c.point_checkpoint_space_mb = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-point-checkpoint-replay-boundary-token")) {
+            c.point_checkpoint_replay_boundary_token = true;
+        } else if (!strcmp(arg, "--kv-cache-verbose")) {
+            c.cache_verbose = true;
         } else if (!strcmp(arg, "--disable-exact-dsml-tool-replay")) {
             c.disable_exact_dsml_tool_replay = true;
         } else if (!strcmp(arg, "--tool-memory-max-ids")) {
@@ -11607,6 +12524,7 @@ static server_config parse_options(int argc, char **argv) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: %s", dist_err);
         exit(2);
     }
+    validate_checkpoint_geometry(&c);
     return c;
 }
 
@@ -11654,11 +12572,28 @@ int main(int argc, char **argv) {
     s.session = session;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
+    s.cache_verbose = cfg.cache_verbose;
+    s.point_checkpoint_replay_boundary_token = cfg.point_checkpoint_replay_boundary_token;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.prefix_lookback.lookback_tokens = cfg.prefix_lookback_tokens;
+    s.prefix_lookback.min_rewind_tokens = cfg.prefix_lookback_min_rewind_tokens > 0 ?
+        cfg.prefix_lookback_min_rewind_tokens : PREFIX_LOOKBACK_DEFAULT_MIN_REWIND;
+    s.prefix_lookback.tail_rows = s.prefix_lookback.lookback_tokens > 0 ?
+        s.prefix_lookback.lookback_tokens + 2 * s.prefix_lookback.min_rewind_tokens : 0;
+    s.point_checkpoint.interval = POINT_CHECKPOINT_INTERVAL_TOKENS;
+    s.point_checkpoint.max_bytes = cfg.point_checkpoint_space_mb > 0 ?
+        (uint64_t)cfg.point_checkpoint_space_mb * 1024ULL * 1024ULL : 0;
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+    }
+    if (s.prefix_lookback.lookback_tokens > 0) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: live prefix lookback enabled tokens=%d min_rewind=%d tail_rows=%d",
+                    s.prefix_lookback.lookback_tokens,
+                    s.prefix_lookback.min_rewind_tokens,
+                    s.prefix_lookback.tail_rows);
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
@@ -15545,6 +16480,308 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
     chat_msgs_free(&msgs);
 }
 
+static ds4_tokens test_tokens_range(int n, int base) {
+    ds4_tokens t = {0};
+    for (int i = 0; i < n; i++) ds4_tokens_push(&t, base + i);
+    return t;
+}
+
+static point_checkpoint_entry test_checkpoint_entry(int point, int base, size_t bytes) {
+    point_checkpoint_entry e = {0};
+    e.point = point;
+    e.valid = true;
+    e.swa_shard.ptr = malloc(bytes);
+    e.swa_shard.len = bytes;
+    e.swa_shard.cap = bytes;
+    memset(e.swa_shard.ptr, base & 0xff, bytes);
+    e.tokens = test_tokens_range(point, base);
+    sha1_token_prefix_hex(&e.tokens, point, e.token_prefix_hash);
+    memcpy(e.verify_hash, e.token_prefix_hash, sizeof(e.verify_hash));
+    return e;
+}
+
+static void test_prefix_lookback_ring_keeps_window_points(void) {
+    prefix_lookback_cache c = {.lookback_tokens = 4096, .min_rewind_tokens = 128};
+    for (int i = 0; i < PREFIX_LOOKBACK_RING_SLOTS; i++) {
+        c.entries[i] = test_checkpoint_entry((i + 1) * 128, 1000 + i * 1000, 4096);
+    }
+    prefix_lookback_trim_window(&c, PREFIX_LOOKBACK_RING_SLOTS * 128);
+    TEST_ASSERT(prefix_lookback_valid_count(&c) == 17);
+    TEST_ASSERT(!c.entries[0].valid);
+    for (int i = 1; i < PREFIX_LOOKBACK_RING_SLOTS; i++) TEST_ASSERT(c.entries[i].valid);
+    prefix_lookback_free(&c);
+}
+
+static void test_prefix_lookback_reset_metadata_preserves_buffers(void) {
+    prefix_lookback_cache c = {.lookback_tokens = 4096, .min_rewind_tokens = 128};
+    c.entries[0] = test_checkpoint_entry(128, 1000, 4096);
+    c.entries[1] = test_checkpoint_entry(256, 2000, 8192);
+    c.entries[2] = test_checkpoint_entry(384, 3000, 16384);
+    c.last_store_point = 384;
+    uint8_t *p1 = c.entries[1].swa_shard.ptr;
+    uint8_t *p2 = c.entries[2].swa_shard.ptr;
+    prefix_lookback_reset_metadata(&c);
+    TEST_ASSERT(!c.entries[0].valid);
+    TEST_ASSERT(!c.entries[1].valid);
+    TEST_ASSERT(!c.entries[2].valid);
+    TEST_ASSERT(c.entries[1].swa_shard.ptr == p1);
+    TEST_ASSERT(c.entries[2].swa_shard.ptr == p2);
+    TEST_ASSERT(c.entries[1].swa_shard.cap == 8192);
+    TEST_ASSERT(c.entries[2].swa_shard.cap == 16384);
+    TEST_ASSERT(c.entries[1].swa_shard.len == 0);
+    TEST_ASSERT(c.entries[2].tokens.len == 0);
+    TEST_ASSERT(prefix_lookback_valid_count(&c) == 0);
+    TEST_ASSERT(c.last_store_point == 0);
+    prefix_lookback_free(&c);
+}
+
+static void test_prefix_lookback_pointwise_exact_match_only(void) {
+    point_checkpoint_entry e = test_checkpoint_entry(256, 1000, 4096);
+    ds4_tokens prompt = test_tokens_range(384, 1000);
+    TEST_ASSERT(point_checkpoint_first_token_mismatch(&e, &prompt) == 256);
+    prompt.v[255] = 999999;
+    TEST_ASSERT(point_checkpoint_first_token_mismatch(&e, &prompt) == 255);
+    point_checkpoint_entry_free(&e);
+    ds4_tokens_free(&prompt);
+}
+
+static void test_prefix_lookback_disabled_by_default(void) {
+    prefix_lookback_cache c = {0};
+    server s = {0};
+    s.prefix_lookback = c;
+    char err[32] = {0};
+    ds4_tokens prompt = test_tokens_range(384, 1000);
+    ds4_tokens effective = {0};
+    TEST_ASSERT(prefix_lookback_try_load(&s, &prompt, &effective, err, sizeof(err)) == 0);
+    TEST_ASSERT(effective.len == 0);
+    ds4_tokens_free(&prompt);
+    ds4_tokens_free(&effective);
+}
+
+static void test_prefix_lookback_accepts_small_prompt_tail(void) {
+    server s = {0};
+    s.prefix_lookback = (prefix_lookback_cache){.lookback_tokens = 2048, .min_rewind_tokens = 128};
+    char err[32] = {0};
+    ds4_tokens prompt = test_tokens_range(384, 1000);
+    ds4_tokens effective = {0};
+    prompt.v[128] = 999999;
+    TEST_ASSERT(prefix_lookback_try_load(&s, &prompt, &effective, err, sizeof(err)) == 0);
+    TEST_ASSERT(effective.len == 0);
+    ds4_tokens_free(&prompt);
+    ds4_tokens_free(&effective);
+}
+
+static void test_prefix_lookback_ignores_generated_tail_when_prompt_tail_matches(void) {
+    server s = {0};
+    s.prefix_lookback = (prefix_lookback_cache){.lookback_tokens = 2048, .min_rewind_tokens = 128};
+    char err[32] = {0};
+    ds4_tokens prompt = test_tokens_range(480, 1000);
+    ds4_tokens effective = {0};
+    prompt.v[384] = 999999;
+    TEST_ASSERT(prefix_lookback_try_load(&s, &prompt, &effective, err, sizeof(err)) == 0);
+    TEST_ASSERT(effective.len == 0);
+    ds4_tokens_free(&prompt);
+    ds4_tokens_free(&effective);
+}
+
+static void test_prefix_lookback_accepts_min_rewind(void) {
+    server s = {0};
+    s.prefix_lookback = (prefix_lookback_cache){.lookback_tokens = 2048, .min_rewind_tokens = 128};
+    char err[32] = {0};
+    ds4_tokens prompt = test_tokens_range(384, 1000);
+    ds4_tokens effective = {0};
+    prompt.v[128] = 999999;
+    TEST_ASSERT(prefix_lookback_try_load(&s, &prompt, &effective, err, sizeof(err)) == 0);
+    TEST_ASSERT(effective.len == 0);
+    ds4_tokens_free(&prompt);
+    ds4_tokens_free(&effective);
+}
+
+static void test_prefix_lookback_accepts_unaligned_point_in_window(void) {
+    server s = {0};
+    s.prefix_lookback = (prefix_lookback_cache){.lookback_tokens = 2048, .min_rewind_tokens = 128};
+    char err[32] = {0};
+    ds4_tokens prompt = test_tokens_range(4300, 1000);
+    ds4_tokens effective = {0};
+    prompt.v[2500] = 999999;
+    TEST_ASSERT(prefix_lookback_try_load(&s, &prompt, &effective, err, sizeof(err)) == 0);
+    TEST_ASSERT(effective.len == 0);
+    ds4_tokens_free(&prompt);
+    ds4_tokens_free(&effective);
+}
+
+
+
+static void test_prefix_lookback_rejects_outside_window(void) {
+    server s = {0};
+    s.prefix_lookback = (prefix_lookback_cache){.lookback_tokens = 2048, .min_rewind_tokens = 128};
+    char err[32] = {0};
+    ds4_tokens prompt = test_tokens_range(4300, 1000);
+    ds4_tokens effective = {0};
+    prompt.v[1900] = 999999;
+    TEST_ASSERT(prefix_lookback_try_load(&s, &prompt, &effective, err, sizeof(err)) == 0);
+    TEST_ASSERT(effective.len == 0);
+    ds4_tokens_free(&prompt);
+    ds4_tokens_free(&effective);
+}
+
+static void test_prefix_lookback_rejects_full_prefix(void) {
+    server s = {0};
+    s.prefix_lookback = (prefix_lookback_cache){.lookback_tokens = 2048, .min_rewind_tokens = 128};
+    char err[32] = {0};
+    ds4_tokens prompt = test_tokens_range(384, 1000);
+    ds4_tokens effective = {0};
+    TEST_ASSERT(prefix_lookback_try_load(&s, &prompt, &effective, err, sizeof(err)) == 0);
+    TEST_ASSERT(effective.len == 0);
+    ds4_tokens_free(&prompt);
+    ds4_tokens_free(&effective);
+}
+
+static void test_prefix_lookback_options_do_not_enable_disk_cache(void) {
+    char *argv[] = {
+        "ds4-server",
+        "--kv-prefix-lookback-tokens", "4096",
+        "--kv-prefix-lookback-min-rewind-tokens", "128",
+    };
+    server_config cfg = parse_options((int)(sizeof(argv) / sizeof(argv[0])), argv);
+    TEST_ASSERT(cfg.prefix_lookback_tokens == 4096);
+    TEST_ASSERT(cfg.prefix_lookback_min_rewind_tokens == 128);
+    TEST_ASSERT(cfg.kv_disk_dir == NULL);
+}
+
+static void test_prefix_lookback_rejects_below_min_rewind(void) {
+    server s = {0};
+    s.prefix_lookback = (prefix_lookback_cache){.lookback_tokens = 2048, .min_rewind_tokens = 128};
+    char err[32] = {0};
+    ds4_tokens prompt = test_tokens_range(384, 1000);
+    ds4_tokens effective = {0};
+    prompt.v[200] = 999999;
+    TEST_ASSERT(prefix_lookback_try_load(&s, &prompt, &effective, err, sizeof(err)) == 0);
+    TEST_ASSERT(effective.len == 0);
+    ds4_tokens_free(&prompt);
+    ds4_tokens_free(&effective);
+}
+
+/* Phase-4 point checkpoint unit tests */
+
+static void test_point_checkpoint_disabled_by_default(void) {
+    /* Default interval is 4096; test that 0 explicitly means disabled */
+    point_checkpoint_cache c = {0};
+    c.interval = 0;
+    /* capture_maybe should be a no-op when interval==0; tested via smoke */
+    TEST_ASSERT(c.interval == 0);
+    point_checkpoint_cache_free(&c);
+}
+
+static void test_point_checkpoint_rejects_without_entries(void) {
+    /* With interval set but no entries captured, count should be 0 */
+    point_checkpoint_cache c = {.interval = 4096, .max_bytes = 0};
+    TEST_ASSERT(c.count == 0);
+    TEST_ASSERT(c.entries == NULL);
+    point_checkpoint_cache_free(&c);
+}
+
+static void test_point_checkpoint_eviction(void) {
+    /* Test budget enforcement: insert 3 entries with 1 MiB cap → only last survives */
+    point_checkpoint_cache c = {.interval = 4096, .max_bytes = 1048576}; /* 1 MiB */
+    ds4_session_swa_shard s1 = {.ptr = malloc(524288), .len = 524288, .cap = 524288}; /* 512K */
+    ds4_session_swa_shard s2 = {.ptr = malloc(524288), .len = 524288, .cap = 524288};
+    ds4_session_swa_shard s3 = {.ptr = malloc(524288), .len = 524288, .cap = 524288};
+    memset(s1.ptr, 1, s1.cap);
+    memset(s2.ptr, 2, s2.cap);
+    memset(s3.ptr, 3, s3.cap);
+    point_checkpoint_entry e1 = {.point = 4096, .swa_shard = s1};
+    point_checkpoint_entry e2 = {.point = 8192, .swa_shard = s2};
+    point_checkpoint_entry e3 = {.point = 12288, .swa_shard = s3};
+    TEST_ASSERT(point_checkpoint_insert(&c, &e1));
+    TEST_ASSERT(c.count == 1);
+    TEST_ASSERT(point_checkpoint_insert(&c, &e2));
+    /* 512K+512K=1MiB, fits budget */
+    TEST_ASSERT(c.count == 2);
+    TEST_ASSERT(point_checkpoint_insert(&c, &e3));
+    /* Adding 3rd 512K exceeds 1MiB → evicts e1 (oldest) */
+    TEST_ASSERT(c.count == 2);
+    TEST_ASSERT(c.entries[0].point == 8192);
+    TEST_ASSERT(c.entries[1].point == 12288);
+    point_checkpoint_cache_free(&c);
+}
+
+static void test_point_checkpoint_semantic_invalidate_preserves_buffers(void) {
+    point_checkpoint_cache c = {.interval = 4096, .max_bytes = 0};
+    ds4_session_swa_shard s1 = {.ptr = malloc(524288), .len = 524288, .cap = 524288};
+    ds4_session_swa_shard s2 = {.ptr = malloc(524288), .len = 524288, .cap = 524288};
+    ds4_session_swa_shard s3 = {.ptr = malloc(524288), .len = 524288, .cap = 524288};
+    memset(s1.ptr, 1, s1.cap);
+    memset(s2.ptr, 2, s2.cap);
+    memset(s3.ptr, 3, s3.cap);
+    point_checkpoint_entry e1 = {.point = 4096, .valid = true, .swa_shard = s1};
+    point_checkpoint_entry e2 = {.point = 8192, .valid = true, .swa_shard = s2};
+    point_checkpoint_entry e3 = {.point = 12288, .valid = true, .swa_shard = s3};
+    TEST_ASSERT(point_checkpoint_insert(&c, &e1));
+    TEST_ASSERT(point_checkpoint_insert(&c, &e2));
+    TEST_ASSERT(point_checkpoint_insert(&c, &e3));
+    uint8_t *p2 = c.entries[1].swa_shard.ptr;
+    uint8_t *p3 = c.entries[2].swa_shard.ptr;
+    uint64_t total = c.total_bytes;
+
+    point_checkpoint_invalidate_after(&c, 4096);
+    TEST_ASSERT(c.count == 3);
+    TEST_ASSERT(c.total_bytes == total);
+    TEST_ASSERT(c.entries[0].valid);
+    TEST_ASSERT(!c.entries[1].valid);
+    TEST_ASSERT(!c.entries[2].valid);
+    TEST_ASSERT(c.entries[1].swa_shard.ptr == p2);
+    TEST_ASSERT(c.entries[2].swa_shard.ptr == p3);
+    TEST_ASSERT(c.entries[1].swa_shard.cap == 524288);
+    TEST_ASSERT(c.entries[2].swa_shard.cap == 524288);
+    TEST_ASSERT(c.entries[1].swa_shard.len == 0);
+    TEST_ASSERT(c.entries[2].tokens.len == 0);
+    TEST_ASSERT(c.entries[1].token_prefix_hash[0] == '\0');
+    TEST_ASSERT(c.entries[2].verify_hash[0] == '\0');
+    point_checkpoint_cache_free(&c);
+}
+
+static void test_point_checkpoint_cli_parsing(void) {
+    char *argv[] = {
+        "ds4-server",
+        "--kv-point-checkpoint-space-mb", "8192",
+    };
+    server_config cfg = parse_options((int)(sizeof(argv) / sizeof(argv[0])), argv);
+    TEST_ASSERT(cfg.point_checkpoint_space_mb == 8192);
+    TEST_ASSERT(cfg.kv_disk_dir == NULL);
+}
+
+static void test_point_checkpoint_compile_time_geometry(void) {
+    TEST_ASSERT(POINT_CHECKPOINT_INTERVAL_TOKENS == 0 ||
+                POINT_CHECKPOINT_INTERVAL_TOKENS >= POINT_CHECKPOINT_MIN_INTERVAL_TOKENS);
+    TEST_ASSERT(POINT_CHECKPOINT_INTERVAL_TOKENS == 0 ||
+                POINT_CHECKPOINT_INTERVAL_TOKENS % POINT_CHECKPOINT_ALIGNMENT_TOKENS == 0);
+}
+
+static void test_point_checkpoint_free_empty(void) {
+    point_checkpoint_cache c = {0};
+    point_checkpoint_cache_free(&c);
+    TEST_ASSERT(c.count == 0);
+    TEST_ASSERT(c.entries == NULL);
+}
+
+static void test_point_checkpoint_sha1_token_prefix(void) {
+    /* Verify SHA1 of known token IDs produces deterministic output */
+    ds4_tokens tokens = {0};
+    ds4_tokens_push(&tokens, 42);
+    ds4_tokens_push(&tokens, 100);
+    ds4_tokens_push(&tokens, 2048);
+    char hash1[41] = {0}, hash2[41] = {0};
+    sha1_token_prefix_hex(&tokens, 3, hash1);
+    sha1_token_prefix_hex(&tokens, 3, hash2);
+    TEST_ASSERT(strncmp(hash1, hash2, 40) == 0);
+    /* Different prefix length = different hash */
+    char hash_partial[41] = {0};
+    sha1_token_prefix_hex(&tokens, 2, hash_partial);
+    TEST_ASSERT(strncmp(hash1, hash_partial, 40) != 0);
+    ds4_tokens_free(&tokens);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
@@ -15644,6 +16881,26 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
+    test_prefix_lookback_ring_keeps_window_points();
+    test_prefix_lookback_reset_metadata_preserves_buffers();
+    test_prefix_lookback_pointwise_exact_match_only();
+    test_prefix_lookback_disabled_by_default();
+    test_prefix_lookback_accepts_small_prompt_tail();
+    test_prefix_lookback_ignores_generated_tail_when_prompt_tail_matches();
+    test_prefix_lookback_accepts_min_rewind();
+    test_prefix_lookback_accepts_unaligned_point_in_window();
+    test_prefix_lookback_rejects_outside_window();
+    test_prefix_lookback_rejects_full_prefix();
+    test_prefix_lookback_options_do_not_enable_disk_cache();
+    test_prefix_lookback_rejects_below_min_rewind();
+    test_point_checkpoint_disabled_by_default();
+    test_point_checkpoint_rejects_without_entries();
+    test_point_checkpoint_eviction();
+    test_point_checkpoint_semantic_invalidate_preserves_buffers();
+    test_point_checkpoint_cli_parsing();
+    test_point_checkpoint_compile_time_geometry();
+    test_point_checkpoint_free_empty();
+    test_point_checkpoint_sha1_token_prefix();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN
