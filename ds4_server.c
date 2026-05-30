@@ -407,6 +407,9 @@ typedef enum {
     DS4_TEXT_FORMAT_TEXT,
     DS4_TEXT_FORMAT_JSON_OBJECT,
     DS4_TEXT_FORMAT_JSON_SCHEMA,
+    DS4_TEXT_FORMAT_REGEX,
+    DS4_TEXT_FORMAT_LARK,
+    DS4_TEXT_FORMAT_LLGUIDANCE,
 } ds4_text_format_type;
 
 typedef struct {
@@ -423,9 +426,12 @@ static void ds4_text_format_clear(ds4_text_format *f) {
     memset(f, 0, sizeof(*f));
 }
 
-static bool ds4_text_format_is_json(const ds4_text_format *f) {
+static bool ds4_text_format_is_structured(const ds4_text_format *f) {
     return f && (f->type == DS4_TEXT_FORMAT_JSON_OBJECT ||
-                 f->type == DS4_TEXT_FORMAT_JSON_SCHEMA);
+                 f->type == DS4_TEXT_FORMAT_JSON_SCHEMA ||
+                 f->type == DS4_TEXT_FORMAT_REGEX ||
+                 f->type == DS4_TEXT_FORMAT_LARK ||
+                 f->type == DS4_TEXT_FORMAT_LLGUIDANCE);
 }
 
 static void ds4_text_format_set_schema(ds4_text_format *f,
@@ -440,12 +446,21 @@ static void ds4_text_format_set_schema(ds4_text_format *f,
     f->strict = strict;
 }
 
+static void ds4_text_format_set_constraint(ds4_text_format *f,
+                                           ds4_text_format_type type,
+                                           char *constraint_data) {
+    ds4_text_format_set_schema(f, type, NULL, constraint_data, false);
+}
+
 static const char *ds4_text_format_constraint_type(const ds4_text_format *f) {
     if (!f) return "text";
     if (f->type == DS4_TEXT_FORMAT_JSON_SCHEMA) return "json_schema";
     if (f->type == DS4_TEXT_FORMAT_JSON_OBJECT) {
         return f->schema_json ? "json_schema" : "json_object";
     }
+    if (f->type == DS4_TEXT_FORMAT_REGEX) return "regex";
+    if (f->type == DS4_TEXT_FORMAT_LARK) return "lark";
+    if (f->type == DS4_TEXT_FORMAT_LLGUIDANCE) return "llguidance";
     return "text";
 }
 
@@ -457,7 +472,7 @@ static bool ds4_text_format_validate_with_llguidance(ds4_engine *e,
                                                      const ds4_text_format *f,
                                                      char *err,
                                                      size_t errlen) {
-    if (!ds4_text_format_is_json(f)) return true;
+    if (!ds4_text_format_is_structured(f)) return true;
     if (!ds4_llguidance_available()) {
         snprintf(err, errlen,
                  "structured outputs require building ds4 with LLGUIDANCE=1");
@@ -472,7 +487,7 @@ static bool ds4_text_format_validate_with_llguidance(ds4_engine *e,
         llg_err,
         sizeof(llg_err));
     if (!g) {
-        snprintf(err, errlen, "invalid structured output schema: %s",
+        snprintf(err, errlen, "invalid structured output constraint: %s",
                  llg_err[0] ? llg_err : "llguidance rejected constraint");
         return false;
     }
@@ -556,6 +571,8 @@ static bool parse_chat_response_format(const char **p,
 
     char *type = NULL;
     char *schema = NULL;
+    char *regex = NULL;
+    char *grammar = NULL;
     char *name = NULL;
     bool strict = false;
     bool saw_json_schema = false;
@@ -584,6 +601,18 @@ static bool parse_chat_response_format(const char **p,
         } else if (!strcmp(key, "schema")) {
             free(schema);
             if (!json_raw_value(p, &schema)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "regex")) {
+            free(regex);
+            if (!json_string(p, &regex)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "grammar")) {
+            free(grammar);
+            if (!json_string(p, &grammar)) {
                 free(key);
                 goto bad;
             }
@@ -632,6 +661,27 @@ static bool parse_chat_response_format(const char **p,
             snprintf(err, errlen, "response_format json_schema.schema is required");
             goto bad_keep_err;
         }
+    } else if (!strcmp(type, "regex")) {
+        if (!regex) {
+            snprintf(err, errlen, "response_format.regex is required");
+            goto bad_keep_err;
+        }
+        ds4_text_format_set_constraint(format, DS4_TEXT_FORMAT_REGEX, regex);
+        regex = NULL;
+    } else if (!strcmp(type, "lark")) {
+        if (!grammar) {
+            snprintf(err, errlen, "response_format.grammar is required");
+            goto bad_keep_err;
+        }
+        ds4_text_format_set_constraint(format, DS4_TEXT_FORMAT_LARK, grammar);
+        grammar = NULL;
+    } else if (!strcmp(type, "llguidance")) {
+        if (!grammar) {
+            snprintf(err, errlen, "response_format.grammar is required");
+            goto bad_keep_err;
+        }
+        ds4_text_format_set_constraint(format, DS4_TEXT_FORMAT_LLGUIDANCE, grammar);
+        grammar = NULL;
     } else {
         snprintf(err, errlen, "response_format.type=%s not supported", type);
         goto bad_keep_err;
@@ -640,6 +690,8 @@ static bool parse_chat_response_format(const char **p,
     free(type);
     free(name);
     free(schema);
+    free(regex);
+    free(grammar);
     return true;
 bad:
     snprintf(err, errlen, "invalid response_format");
@@ -647,6 +699,8 @@ bad_keep_err:
     free(type);
     free(name);
     free(schema);
+    free(regex);
+    free(grammar);
     return false;
 }
 
@@ -664,6 +718,8 @@ static bool parse_responses_text_format_object(const char **p,
     char *type = NULL;
     char *name = NULL;
     char *schema = NULL;
+    char *regex = NULL;
+    char *grammar = NULL;
     bool strict = false;
     json_ws(p);
     while (**p && **p != '}') {
@@ -690,6 +746,18 @@ static bool parse_responses_text_format_object(const char **p,
         } else if (!strcmp(key, "schema")) {
             free(schema);
             if (!json_raw_value(p, &schema)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "regex")) {
+            free(regex);
+            if (!json_string(p, &regex)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "grammar")) {
+            free(grammar);
+            if (!json_string(p, &grammar)) {
                 free(key);
                 goto bad;
             }
@@ -731,6 +799,27 @@ static bool parse_responses_text_format_object(const char **p,
                                    name, schema, strict);
         name = NULL;
         schema = NULL;
+    } else if (!strcmp(type, "regex")) {
+        if (!regex) {
+            snprintf(err, errlen, "text.format.regex is required");
+            goto bad_keep_err;
+        }
+        ds4_text_format_set_constraint(format, DS4_TEXT_FORMAT_REGEX, regex);
+        regex = NULL;
+    } else if (!strcmp(type, "lark")) {
+        if (!grammar) {
+            snprintf(err, errlen, "text.format.grammar is required");
+            goto bad_keep_err;
+        }
+        ds4_text_format_set_constraint(format, DS4_TEXT_FORMAT_LARK, grammar);
+        grammar = NULL;
+    } else if (!strcmp(type, "llguidance")) {
+        if (!grammar) {
+            snprintf(err, errlen, "text.format.grammar is required");
+            goto bad_keep_err;
+        }
+        ds4_text_format_set_constraint(format, DS4_TEXT_FORMAT_LLGUIDANCE, grammar);
+        grammar = NULL;
     } else {
         snprintf(err, errlen, "text.format.type=%s not supported", type);
         goto bad_keep_err;
@@ -739,6 +828,8 @@ static bool parse_responses_text_format_object(const char **p,
     free(type);
     free(name);
     free(schema);
+    free(regex);
+    free(grammar);
     return true;
 bad:
     snprintf(err, errlen, "invalid text.format");
@@ -746,6 +837,8 @@ bad_keep_err:
     free(type);
     free(name);
     free(schema);
+    free(regex);
+    free(grammar);
     return false;
 }
 
@@ -3164,7 +3257,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         return false;
     }
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
-    if (ds4_text_format_is_json(&r->text_format)) {
+    if (ds4_text_format_is_structured(&r->text_format)) {
         if (r->has_tools) {
             snprintf(err, errlen,
                      "structured outputs with tools are not supported");
@@ -4332,7 +4425,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
         (!tool_choice_none && combined_tool_schemas.len) ?
         combined_tool_schemas.ptr : NULL;
     r->has_tools = active_tool_schemas && active_tool_schemas[0];
-    if (ds4_text_format_is_json(&r->text_format)) {
+    if (ds4_text_format_is_structured(&r->text_format)) {
         if (r->has_tools) {
             snprintf(err, errlen,
                      "structured outputs with tools are not supported");
@@ -6421,7 +6514,8 @@ static bool request_uses_structured_stream(const request *r) {
 }
 
 static bool request_uses_structured_decoder(const request *r) {
-    return r && r->kind == REQ_CHAT && ds4_text_format_is_json(&r->text_format);
+    return r && r->kind == REQ_CHAT &&
+        ds4_text_format_is_structured(&r->text_format);
 }
 
 /* Codex' Responses API uses 24-hex suffixes for response/item ids. Prefix
@@ -12305,6 +12399,50 @@ static void test_parse_chat_response_format_json_object(void) {
     ds4_text_format_clear(&fmt);
 }
 
+static void test_parse_chat_response_format_llguidance_extensions(void) {
+    const struct {
+        const char *json;
+        ds4_text_format_type type;
+        const char *constraint_type;
+        const char *needle;
+    } cases[] = {
+        {
+            "{\"type\":\"regex\",\"regex\":\"INV-[0-9]{4}\"}",
+            DS4_TEXT_FORMAT_REGEX,
+            "regex",
+            "INV-"
+        },
+        {
+            "{\"type\":\"lark\",\"grammar\":\"%llguidance {}\\nstart: /OK/\"}",
+            DS4_TEXT_FORMAT_LARK,
+            "lark",
+            "start:"
+        },
+        {
+            "{\"type\":\"llguidance\",\"grammar\":\"{\\\"grammars\\\":[]}\"}",
+            DS4_TEXT_FORMAT_LLGUIDANCE,
+            "llguidance",
+            "grammars"
+        },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *p = cases[i].json;
+        ds4_text_format fmt = {0};
+        char err[160] = {0};
+
+        TEST_ASSERT(parse_chat_response_format(&p, &fmt, err, sizeof(err)));
+        TEST_ASSERT(fmt.type == cases[i].type);
+        TEST_ASSERT(!strcmp(ds4_text_format_constraint_type(&fmt),
+                            cases[i].constraint_type));
+        TEST_ASSERT(fmt.schema_json && strstr(fmt.schema_json, cases[i].needle));
+        json_ws(&p);
+        TEST_ASSERT(*p == '\0');
+
+        ds4_text_format_clear(&fmt);
+    }
+}
+
 static void test_parse_chat_response_format_rejects_missing_schema(void) {
     const char *json = "{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"bad\"}}";
     const char *p = json;
@@ -12352,6 +12490,50 @@ static void test_parse_responses_text_format_json_object(void) {
     TEST_ASSERT(!strcmp(ds4_text_format_constraint_type(&fmt), "json_object"));
 
     ds4_text_format_clear(&fmt);
+}
+
+static void test_parse_responses_text_format_llguidance_extensions(void) {
+    const struct {
+        const char *json;
+        ds4_text_format_type type;
+        const char *constraint_type;
+        const char *needle;
+    } cases[] = {
+        {
+            "{\"format\":{\"type\":\"regex\",\"regex\":\"INV-[0-9]{4}\"}}",
+            DS4_TEXT_FORMAT_REGEX,
+            "regex",
+            "INV-"
+        },
+        {
+            "{\"format\":{\"type\":\"lark\",\"grammar\":\"%llguidance {}\\nstart: /OK/\"}}",
+            DS4_TEXT_FORMAT_LARK,
+            "lark",
+            "start:"
+        },
+        {
+            "{\"format\":{\"type\":\"llguidance\",\"grammar\":\"{\\\"grammars\\\":[]}\"}}",
+            DS4_TEXT_FORMAT_LLGUIDANCE,
+            "llguidance",
+            "grammars"
+        },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *p = cases[i].json;
+        ds4_text_format fmt = {0};
+        char err[160] = {0};
+
+        TEST_ASSERT(parse_responses_text_value(&p, &fmt, err, sizeof(err)));
+        TEST_ASSERT(fmt.type == cases[i].type);
+        TEST_ASSERT(!strcmp(ds4_text_format_constraint_type(&fmt),
+                            cases[i].constraint_type));
+        TEST_ASSERT(fmt.schema_json && strstr(fmt.schema_json, cases[i].needle));
+        json_ws(&p);
+        TEST_ASSERT(*p == '\0');
+
+        ds4_text_format_clear(&fmt);
+    }
 }
 
 static void test_parse_responses_text_format_rejects_unknown_type(void) {
@@ -16168,9 +16350,11 @@ static void ds4_server_unit_tests_run(void) {
     test_render_chat_prompt_text_renders_tools_before_system();
     test_parse_chat_response_format_json_schema();
     test_parse_chat_response_format_json_object();
+    test_parse_chat_response_format_llguidance_extensions();
     test_parse_chat_response_format_rejects_missing_schema();
     test_parse_responses_text_format_json_schema();
     test_parse_responses_text_format_json_object();
+    test_parse_responses_text_format_llguidance_extensions();
     test_parse_responses_text_format_rejects_unknown_type();
     test_parse_responses_text_format_text_is_noop();
     test_tool_schema_order_from_anthropic_schema();

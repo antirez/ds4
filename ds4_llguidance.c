@@ -24,6 +24,7 @@ struct ds4_llguidance {
     size_t mask_words;
     int n_vocab;
     int eos_token;
+    bool deny_leading_ws;
     bool started;
 #else
     int unused;
@@ -107,6 +108,13 @@ static bool token_text_is_special(const char *p, size_t len) {
         if (!memcmp(p + i, bar, sizeof(bar))) return true;
     }
     return false;
+}
+
+static bool constraint_uses_json_leading_ws_rule(const char *constraint_type) {
+    return constraint_type &&
+        (!strcmp(constraint_type, "json") ||
+         !strcmp(constraint_type, "json_schema") ||
+         !strcmp(constraint_type, "json_object"));
 }
 
 static void bitset_set(uint32_t *mask, int token) {
@@ -334,6 +342,8 @@ ds4_llguidance *ds4_llguidance_create(ds4_engine *e,
     g->mask_words = mask_bytes / sizeof(uint32_t);
     g->n_vocab = n_vocab;
     g->eos_token = ds4_token_eos(e);
+    g->deny_leading_ws =
+        constraint_uses_json_leading_ws_rule(constraint_type);
     g->started = false;
     return g;
 }
@@ -372,7 +382,8 @@ int ds4_llguidance_sample(ds4_llguidance *g,
 
     const uint32_t *deny = NULL;
     size_t deny_words = 0;
-    if (!g->started &&
+    if (g->deny_leading_ws &&
+        !g->started &&
         mask_has_non_denied_token(allow, g->mask_words, g->leading_ws_mask,
                                   g->leading_ws_words, g->n_vocab))
     {
@@ -399,7 +410,7 @@ bool ds4_llguidance_accept(ds4_llguidance *g,
                 llg_matcher_get_error(g->matcher));
         return false;
     }
-    if (!g->started && e) {
+    if (g->deny_leading_ws && !g->started && e) {
         size_t len = 0;
         char *piece = ds4_token_text(e, token, &len);
         if (bytes_have_non_json_ws(piece, len)) g->started = true;
