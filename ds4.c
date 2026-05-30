@@ -6689,6 +6689,13 @@ typedef struct {
     uint32_t head_dim;
 } ds4_kv_cache;
 
+uint32_t ds4_tail_swa_rows(uint32_t ctx_size) {
+    uint32_t rows = DS4_N_SWA;
+    if (rows > ctx_size) rows = ctx_size;
+    if (rows == 0) rows = 1;
+    return rows;
+}
+
 static uint32_t ds4_default_raw_cap(uint32_t ctx_size) {
     uint32_t raw_cap = DS4_N_SWA;
     if (raw_cap > ctx_size) raw_cap = ctx_size;
@@ -18221,6 +18228,284 @@ void ds4_session_snapshot_free(ds4_session_snapshot *snap) {
     if (!snap) return;
     free(snap->ptr);
     memset(snap, 0, sizeof(*snap));
+}
+
+void ds4_session_swa_shard_free(ds4_session_swa_shard *shard) {
+    if (!shard) return;
+    free(shard->ptr);
+    memset(shard, 0, sizeof(*shard));
+}
+
+/* =========================================================================
+ * SWA shard — partial raw-SWA KV data.  It can be restored only onto a
+ * compatible trunk and is not a standalone session snapshot.
+ * ========================================================================= */
+
+static uint64_t session_swa_payload_live_tensor_bytes(const ds4_gpu_graph *g, uint32_t checkpoint_len) {
+    uint64_t bytes = 0;
+    const uint32_t raw_live = session_raw_live_rows(g, checkpoint_len);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        bytes += (uint64_t)raw_live * DS4_N_HEAD_DIM * sizeof(float);
+    }
+    return bytes;
+}
+
+static uint64_t ds4_session_swa_shard_payload_bytes_at(ds4_session *s, uint32_t checkpoint_len) {
+    if (!s || !s->checkpoint_valid) return 0;
+    if (ds4_session_is_cpu(s)) return 0; /* SWA shard not supported for CPU path */
+    const ds4_gpu_graph *g = &s->graph;
+    uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
+    bytes += (uint64_t)checkpoint_len * sizeof(int); /* token IDs */
+    bytes += (uint64_t)DS4_N_VOCAB * sizeof(float);      /* logits */
+    bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);   /* n_comp frontier */
+    bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);   /* n_index_comp frontier */
+    bytes += session_swa_payload_live_tensor_bytes(g, checkpoint_len);
+    return bytes;
+}
+
+uint64_t ds4_session_swa_shard_payload_bytes(ds4_session *s) {
+    if (!s || !s->checkpoint_valid) return 0;
+    return ds4_session_swa_shard_payload_bytes_at(s, (uint32_t)s->checkpoint.len);
+}
+
+int ds4_session_save_swa_shard_at(ds4_session *s, int point, ds4_session_swa_shard *shard, char *err, size_t errlen) {
+    if (!s || !shard) {
+        payload_set_err(err, errlen, "invalid swa shard save");
+        return 1;
+    }
+    if (!s->checkpoint_valid || point <= 0 || point > s->checkpoint.len) {
+        payload_set_err(err, errlen, "invalid swa shard point");
+        return 1;
+    }
+    if (ds4_session_is_cpu(s)) {
+        payload_set_err(err, errlen, "SWA shard not supported on CPU backend");
+        return 1;
+    }
+#ifndef DS4_NO_GPU
+    if (ds4_gpu_synchronize() == 0) {
+        payload_set_err(err, errlen, "failed to synchronize accelerator before swa shard");
+        return 1;
+    }
+    ds4_gpu_graph *g = &s->graph;
+    const uint32_t checkpoint_len = (uint32_t)point;
+    const uint32_t raw_live = session_raw_live_rows(g, checkpoint_len);
+    const uint32_t raw_first = checkpoint_len - raw_live;
+    if ((uint32_t)s->checkpoint.len - raw_first > g->raw_cap) {
+        payload_set_err(err, errlen, "swa shard point is outside live raw cache window");
+        return 1;
+    }
+
+    uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
+        DS4_SESSION_PAYLOAD_MAGIC,
+        DS4_SESSION_PAYLOAD_VERSION,
+        (uint32_t)s->ctx_size,
+        s->prefill_cap,
+        g->raw_cap,
+        g->raw_window,
+        g->comp_cap,
+        checkpoint_len,
+        DS4_N_LAYER,
+        DS4_N_HEAD_DIM,
+        DS4_N_INDEXER_HEAD_DIM,
+        DS4_N_VOCAB,
+        raw_live,
+    };
+
+    const uint64_t bytes = ds4_session_swa_shard_payload_bytes_at(s, checkpoint_len);
+    if (shard->cap < bytes) {
+        uint8_t *p = realloc(shard->ptr, (size_t)bytes);
+        if (!p) {
+            payload_set_err(err, errlen, "out of memory allocating swa shard");
+            return 1;
+        }
+        shard->ptr = p;
+        shard->cap = bytes;
+    }
+
+    FILE *fp = fmemopen(shard->ptr, (size_t)bytes, "wb");
+    if (!fp) {
+        payload_set_err(err, errlen, "failed to open memory stream for swa shard");
+        return 1;
+    }
+    int rc = 0;
+    for (uint32_t i = 0; rc == 0 && i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++)
+        rc = payload_write_u32(fp, header[i], err, errlen);
+    for (uint32_t i = 0; rc == 0 && i < checkpoint_len; i++)
+        rc = payload_write_u32(fp, (uint32_t)s->checkpoint.v[i], err, errlen);
+    if (rc == 0)
+        rc = payload_write_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), err, errlen);
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        const uint32_t n_comp = ratio == 0 ? 0 : checkpoint_len / ratio;
+        rc = payload_write_u32(fp, n_comp, err, errlen);
+    }
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        const uint32_t n_index_comp = ratio == 4 ? checkpoint_len / ratio : 0;
+        rc = payload_write_u32(fp, n_index_comp, err, errlen);
+    }
+
+    uint8_t *buf = NULL;
+    if (rc == 0) buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+        for (uint32_t r = 0; rc == 0 && r < raw_live; r++) {
+            const uint32_t pos = raw_first + r;
+            const uint32_t phys = pos % g->raw_cap;
+            rc = payload_write_tensor_span(fp,
+                                           g->layer_raw_cache[il],
+                                           (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
+                                           (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
+                                           buf, DS4_SESSION_IO_CHUNK, err, errlen);
+        }
+    }
+    free(buf);
+    if (fclose(fp) != 0 && rc == 0) {
+        payload_set_err(err, errlen, "failed to finalize swa shard");
+        return 1;
+    }
+    if (rc != 0) return 1;
+    shard->len = bytes;
+    return 0;
+#else
+    payload_set_err(err, errlen, "GPU support not compiled in");
+    return 1;
+#endif
+}
+
+int ds4_session_save_swa_shard(ds4_session *s, ds4_session_swa_shard *shard, char *err, size_t errlen) {
+    if (!s || !s->checkpoint_valid) {
+        payload_set_err(err, errlen, "invalid swa shard save");
+        return 1;
+    }
+    return ds4_session_save_swa_shard_at(s, s->checkpoint.len, shard, err, errlen);
+}
+
+int ds4_session_load_swa_shard(ds4_session *s, const ds4_session_swa_shard *shard, char *err, size_t errlen) {
+    if (!s || !shard || !shard->ptr || shard->len == 0) {
+        payload_set_err(err, errlen, "invalid swa shard load");
+        return 1;
+    }
+    if (ds4_session_is_cpu(s)) {
+        payload_set_err(err, errlen, "SWA shard not supported on CPU backend");
+        return 1;
+    }
+#ifndef DS4_NO_GPU
+    if (shard->len > (uint64_t)SIZE_MAX) {
+        payload_set_err(err, errlen, "swa shard is too large for this platform");
+        return 1;
+    }
+    FILE *fp = fmemopen((void *)shard->ptr, (size_t)shard->len, "rb");
+    if (!fp) {
+        payload_set_err(err, errlen, "failed to open memory stream for swa shard restore");
+        return 1;
+    }
+
+    uint64_t remaining = shard->len;
+    uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS];
+    int rc = 0;
+    for (uint32_t i = 0; rc == 0 && i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++)
+        rc = payload_read_u32(fp, &h[i], &remaining, err, errlen);
+    if (rc != 0) { fclose(fp); return 1; }
+    if (h[0] != DS4_SESSION_PAYLOAD_MAGIC || h[1] != DS4_SESSION_PAYLOAD_VERSION) {
+        fclose(fp);
+        payload_set_err(err, errlen, "unsupported swa shard version");
+        return 1;
+    }
+    const uint32_t saved_tokens = h[7];
+    const uint32_t saved_raw_window = h[5];
+    const uint32_t saved_raw_cap = h[4];
+    const uint32_t saved_raw_live = h[12];
+    if (h[8] != DS4_N_LAYER || h[9] != DS4_N_HEAD_DIM ||
+        h[10] != DS4_N_INDEXER_HEAD_DIM || h[11] != DS4_N_VOCAB)
+    {
+        fclose(fp);
+        payload_set_err(err, errlen, "swa shard was written for a different DS4 layout");
+        return 1;
+    }
+
+    ds4_gpu_graph *g = &s->graph;
+    if (saved_raw_window != g->raw_window) {
+        fclose(fp);
+        payload_set_err(err, errlen, "swa shard graph chunk layout does not match current runtime");
+        return 1;
+    }
+    const uint32_t expected_raw_live = saved_tokens < saved_raw_window ? saved_tokens : saved_raw_window;
+    if (saved_raw_cap == 0 || saved_raw_live != expected_raw_live || saved_raw_live > g->raw_cap) {
+        fclose(fp);
+        payload_set_err(err, errlen, "swa shard raw ring layout does not match");
+        return 1;
+    }
+
+    token_vec new_checkpoint = {0};
+    for (uint32_t i = 0; rc == 0 && i < saved_tokens; i++) {
+        uint32_t tok = 0;
+        rc = payload_read_u32(fp, &tok, &remaining, err, errlen);
+        if (rc == 0) token_vec_push(&new_checkpoint, (int)tok);
+    }
+    if (rc == 0)
+        rc = payload_read_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), &remaining, err, errlen);
+
+    uint32_t n_comp[DS4_MAX_LAYER];
+    uint32_t n_index_comp[DS4_MAX_LAYER];
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+        rc = payload_read_u32(fp, &n_comp[il], &remaining, err, errlen);
+        if (rc == 0 && n_comp[il] > g->layer_comp_cap[il]) {
+            rc = 1;
+            payload_set_err(err, errlen, "swa shard has invalid compressed row count");
+        }
+    }
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+        rc = payload_read_u32(fp, &n_index_comp[il], &remaining, err, errlen);
+        if (rc == 0 && n_index_comp[il] > g->layer_comp_cap[il]) {
+            rc = 1;
+            payload_set_err(err, errlen, "swa shard has invalid indexer row count");
+        }
+    }
+
+    if (rc == 0 && ds4_gpu_synchronize() == 0) {
+        token_vec_free(&new_checkpoint);
+        fclose(fp);
+        payload_set_err(err, errlen, "failed to synchronize accelerator before swa shard restore");
+        return 1;
+    }
+
+    s->checkpoint_valid = false;
+    s->mtp_draft_valid = false;
+    g->mtp_n_raw = 0;
+
+    uint8_t *buf = NULL;
+    if (rc == 0) buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+        const uint32_t raw_first = saved_tokens - saved_raw_live;
+        for (uint32_t r = 0; rc == 0 && r < saved_raw_live; r++) {
+            const uint32_t pos = raw_first + r;
+            const uint32_t phys = pos % g->raw_cap;
+            rc = payload_read_tensor_span(fp,
+                                          g->layer_raw_cache[il],
+                                          (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
+                                          (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
+                                          buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+        }
+        g->layer_n_comp[il] = n_comp[il];
+        g->layer_n_index_comp[il] = n_index_comp[il];
+    }
+    free(buf);
+
+    if (rc != 0) {
+        token_vec_free(&new_checkpoint);
+        fclose(fp);
+        return 1;
+    }
+
+    token_vec_free(&s->checkpoint);
+    s->checkpoint = new_checkpoint;
+    s->checkpoint_valid = true;
+    fclose(fp);
+    return 0;
+#else
+    payload_set_err(err, errlen, "GPU support not compiled in");
+    return 1;
+#endif
 }
 
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens) {

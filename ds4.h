@@ -131,6 +131,12 @@ typedef struct {
     uint64_t bytes;
 } ds4_session_payload_file;
 
+typedef struct {
+    uint8_t *ptr;
+    uint64_t len;
+    uint64_t cap;
+} ds4_session_swa_shard;
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 void ds4_engine_close(ds4_engine *e);
 void ds4_engine_summary(ds4_engine *e);
@@ -231,6 +237,7 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
         char *err, size_t errlen);
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
+uint32_t ds4_tail_swa_rows(uint32_t ctx_size);
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
@@ -297,6 +304,14 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen);
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen);
 void ds4_session_snapshot_free(ds4_session_snapshot *snap);
+void ds4_session_swa_shard_free(ds4_session_swa_shard *shard);
+
+/* SWA shard: partial raw-SWA data that can be restored only onto a
+ * compatible trunk. This is not a standalone session snapshot. */
+uint64_t ds4_session_swa_shard_payload_bytes(ds4_session *s);
+int ds4_session_save_swa_shard(ds4_session *s, ds4_session_swa_shard *shard, char *err, size_t errlen);
+int ds4_session_save_swa_shard_at(ds4_session *s, int point, ds4_session_swa_shard *shard, char *err, size_t errlen);
+int ds4_session_load_swa_shard(ds4_session *s, const ds4_session_swa_shard *shard, char *err, size_t errlen);
 
 uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
                                          uint32_t layer_start,
