@@ -5073,6 +5073,7 @@ static bool agent_worker_strip_session(agent_worker *w, const char *prefix,
         free(tmp);
         free(text);
         free(path);
+        free(title);
         return false;
     }
 
@@ -5084,6 +5085,7 @@ static bool agent_worker_strip_session(agent_worker *w, const char *prefix,
         free(tmp);
         free(text);
         free(path);
+        free(title);
         return false;
     }
 
@@ -5396,7 +5398,10 @@ static char *agent_edit_result(const char *path,
 
 static void agent_worker_set_more(agent_worker *w, const char *path,
                                   int next_line, bool bare) {
-    snprintf(w->more_path, sizeof(w->more_path), "%s", path ? path : "");
+    /* The `more` tool calls this with path == w->more_path; copying a buffer
+     * onto itself is undefined for snprintf, so skip the self-copy. */
+    if (path != w->more_path)
+        snprintf(w->more_path, sizeof(w->more_path), "%s", path ? path : "");
     w->more_next_line = next_line;
     w->more_bare = bare;
     w->more_valid = path && path[0] && next_line > 0;
@@ -5442,8 +5447,10 @@ static char *agent_read_range(agent_worker *w, const char *path, int start_line,
     } else {
         if (max_lines <= 0) max_lines = AGENT_READ_DEFAULT_LINES;
     }
-    int end_idx = start_idx + max_lines;
-    if (end_idx > spans.len) end_idx = spans.len;
+    /* max_lines can be up to INT_MAX (model-controlled), so compute the end in
+     * 64-bit to avoid signed overflow before clamping to the line count. */
+    long long end_wide = (long long)start_idx + max_lines;
+    int end_idx = end_wide > spans.len ? spans.len : (int)end_wide;
 
     agent_buf out = {0};
     if (bare) {
