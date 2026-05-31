@@ -13,6 +13,7 @@
 
 #define cudaSuccess hipSuccess
 #define cudaErrorNotSupported hipErrorNotSupported
+#define cudaMemAttachGlobal hipMemAttachGlobal
 #define cudaErrorInvalidValue hipErrorInvalidValue
 #define cudaGetLastError hipGetLastError
 #define cudaGetErrorString hipGetErrorString
