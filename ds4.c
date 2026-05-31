@@ -302,6 +302,313 @@ static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 
 static int g_ds4_lock_fd = -1;
 
+static void *xcalloc(size_t n, size_t size);
+static void *xmalloc(size_t size);
+
+/* Expert locality profiler (opt-in, DS4_EXPERT_PROFILE env var). */
+
+typedef struct {
+    int    expert_id;
+    float  weight;
+} ds4_profile_expert_slot;
+
+typedef struct {
+    int n_layers;
+    int n_experts;
+    int n_expert_used;
+    int n_tokens;
+    int capacity;
+    int current_token;
+    bool truncated;
+    ds4_profile_expert_slot *records; /* [n_layers * capacity * n_expert_used] */
+    bool *layer_is_hash;              /* [n_layers] */
+    bool *layer_recorded;             /* [n_layers] */
+} ds4_expert_profile;
+
+static ds4_expert_profile g_expert_profile;
+static bool g_expert_profile_active = false;
+static bool g_expert_profile_recording_token = false;
+
+static void ds4_expert_profile_init(int n_layers, int n_experts, int n_expert_used, int capacity) {
+    memset(&g_expert_profile, 0, sizeof(g_expert_profile));
+    g_expert_profile.n_layers = n_layers;
+    g_expert_profile.n_experts = n_experts;
+    g_expert_profile.n_expert_used = n_expert_used;
+    g_expert_profile.capacity = capacity;
+    g_expert_profile.current_token = -1;
+    const size_t n_records = (size_t)n_layers * (size_t)capacity * (size_t)n_expert_used;
+    g_expert_profile.records = xmalloc(n_records * sizeof(ds4_profile_expert_slot));
+    for (size_t i = 0; i < n_records; i++) {
+        g_expert_profile.records[i].expert_id = -1;
+        g_expert_profile.records[i].weight = 0.0f;
+    }
+    g_expert_profile.layer_is_hash = xcalloc((size_t)n_layers, sizeof(bool));
+    g_expert_profile.layer_recorded = xcalloc((size_t)n_layers, sizeof(bool));
+    g_expert_profile_active = true;
+}
+
+static void ds4_expert_profile_cleanup(void) {
+    free(g_expert_profile.records);
+    free(g_expert_profile.layer_is_hash);
+    free(g_expert_profile.layer_recorded);
+    memset(&g_expert_profile, 0, sizeof(g_expert_profile));
+    g_expert_profile_active = false;
+    g_expert_profile_recording_token = false;
+}
+
+/* Expert locality profiler JSON output. */
+
+typedef struct { int expert_id; uint64_t count; } ds4_profile_sort_entry;
+
+static void ds4_expert_profile_write_json(const char *path) {
+    if (!g_expert_profile_active || !path || !path[0]) return;
+    ds4_expert_profile *p = &g_expert_profile;
+    const int NL = p->n_layers;
+    const int NE = p->n_experts;
+    const int NK = p->n_expert_used;
+    const int NT = p->n_tokens;
+    if (NT == 0) { fprintf(stderr, "ds4: expert profiler has no data, skipping output\n"); return; }
+
+    FILE *fp = fopen(path, "w");
+    if (!fp) { fprintf(stderr, "ds4: cannot write expert profile to %s\n", path); return; }
+
+    fprintf(fp, "{\n");
+    fprintf(fp, "  \"n_layers\": %d,\n", NL);
+    fprintf(fp, "  \"n_experts\": %d,\n", NE);
+    fprintf(fp, "  \"n_expert_used\": %d,\n", NK);
+    fprintf(fp, "  \"capacity\": %d,\n", p->capacity);
+    fprintf(fp, "  \"truncated\": %s,\n", p->truncated ? "true" : "false");
+    fprintf(fp, "  \"n_tokens_profiled\": %d,\n", NT);
+    fprintf(fp, "  \"layers\": [\n");
+
+    uint64_t *hist       = xcalloc((size_t)NE, sizeof(uint64_t));
+    double   *weight_sum = xcalloc((size_t)NE, sizeof(double));
+    ds4_profile_sort_entry *sorted = xmalloc((size_t)NE * sizeof(sorted[0]));
+
+    for (int il = 0; il < NL; il++) {
+        fprintf(fp, "    {\n");
+        fprintf(fp, "      \"layer\": %d,\n", il);
+        fprintf(fp, "      \"recorded\": %s,\n", p->layer_recorded[il] ? "true" : "false");
+        fprintf(fp, "      \"is_hash_routed\": %s,\n", p->layer_is_hash[il] ? "true" : "false");
+
+        /* Histogram and weight distribution. */
+        memset(hist, 0, (size_t)NE * sizeof(uint64_t));
+        memset(weight_sum, 0.0, (size_t)NE * sizeof(double));
+
+        uint64_t total_selections = 0;
+        for (int t = 0; t < NT; t++) {
+            const ds4_profile_expert_slot *row =
+                p->records + ((size_t)il * (size_t)p->capacity + (size_t)t) * (size_t)NK;
+            for (int k = 0; k < NK; k++) {
+                int eid = row[k].expert_id;
+                if (eid >= 0 && eid < NE) {
+                    hist[eid]++;
+                    weight_sum[eid] += (double)row[k].weight;
+                    total_selections++;
+                }
+            }
+        }
+
+        /* unique expert count */
+        int unique_experts = 0;
+        for (int e = 0; e < NE; e++) {
+            if (hist[e] > 0) unique_experts++;
+        }
+        fprintf(fp, "      \"unique_experts\": %d,\n", unique_experts);
+
+        /* Histogram JSON. */
+        fprintf(fp, "      \"histogram\": {\n");
+        {
+            bool first = true;
+            for (int e = 0; e < NE; e++) {
+                if (hist[e] == 0) continue;
+                if (!first) fprintf(fp, ",\n");
+                first = false;
+                fprintf(fp, "        \"%d\": %llu", e, (unsigned long long)hist[e]);
+            }
+            fprintf(fp, "\n      },\n");
+        }
+
+        /* Weight distribution JSON. */
+        fprintf(fp, "      \"weight_distribution\": {\n");
+        {
+            bool first = true;
+            for (int e = 0; e < NE; e++) {
+                if (hist[e] == 0) continue;
+                if (!first) fprintf(fp, ",\n");
+                first = false;
+                fprintf(fp, "        \"%d\": %.4f", e, weight_sum[e] / (double)hist[e]);
+            }
+            fprintf(fp, "\n      },\n");
+        }
+
+        /* Sort experts descending by count (insertion sort, NE <= 256). */
+        for (int e = 0; e < NE; e++) {
+            sorted[e].expert_id = e;
+            sorted[e].count = hist[e];
+        }
+        for (int i = 1; i < NE; i++) {
+            ds4_profile_sort_entry tmp = sorted[i];
+            int j = i - 1;
+            while (j >= 0 && sorted[j].count < tmp.count) {
+                sorted[j + 1] = sorted[j];
+                j--;
+            }
+            sorted[j + 1] = tmp;
+        }
+
+        /* Top 10 experts. */
+        {
+            int top_n = unique_experts < 10 ? unique_experts : 10;
+            fprintf(fp, "      \"top_experts\": [\n");
+            for (int i = 0; i < top_n; i++) {
+                double pct = total_selections > 0
+                    ? 100.0 * (double)sorted[i].count / (double)total_selections : 0.0;
+                fprintf(fp, "        {\"expert\": %d, \"count\": %llu, \"pct\": %.2f}%s\n",
+                    sorted[i].expert_id,
+                    (unsigned long long)sorted[i].count,
+                    pct,
+                    (i < top_n - 1) ? "," : "");
+            }
+            fprintf(fp, "      ],\n");
+        }
+
+        /* Cumulative coverage. */
+        {
+            fprintf(fp, "      \"cumulative_coverage\": [");
+            uint64_t cum = 0;
+            for (int i = 0; i < unique_experts; i++) {
+                cum += sorted[i].count;
+                double frac = total_selections > 0
+                    ? (double)cum / (double)total_selections : 0.0;
+                if (i > 0) fprintf(fp, ", ");
+                fprintf(fp, "%.4f", frac);
+            }
+            fprintf(fp, "],\n");
+        }
+
+        /* Entropy. */
+        {
+            double entropy = 0.0;
+            for (int e = 0; e < NE; e++) {
+                if (hist[e] == 0) continue;
+                double pe = (double)hist[e] / (double)total_selections;
+                entropy -= pe * log2(pe);
+            }
+            double max_entropy = log2((double)NE);
+            double entropy_ratio = max_entropy > 0.0 ? entropy / max_entropy : 0.0;
+            fprintf(fp, "      \"entropy\": %.4f,\n", entropy);
+            fprintf(fp, "      \"max_entropy\": %.4f,\n", max_entropy);
+            fprintf(fp, "      \"entropy_ratio\": %.4f,\n", entropy_ratio);
+        }
+
+        /* Adjacent-token overlap and Jaccard similarity. */
+        {
+            double overlap_sum = 0.0;
+            double jaccard_sum = 0.0;
+            double pos_stab_sum = 0.0;
+            int n_pairs = 0;
+
+            for (int t = 0; t < NT - 1; t++) {
+                const ds4_profile_expert_slot *row_a =
+                    p->records + ((size_t)il * (size_t)p->capacity + (size_t)t) * (size_t)NK;
+                const ds4_profile_expert_slot *row_b =
+                    p->records + ((size_t)il * (size_t)p->capacity + (size_t)(t + 1)) * (size_t)NK;
+
+                int intersection = 0;
+                int pos_match = 0;
+                int valid_a = 0;
+                int valid_b = 0;
+                for (int ka = 0; ka < NK; ka++) {
+                    const int eid_a = row_a[ka].expert_id;
+                    const int eid_b = row_b[ka].expert_id;
+                    const bool a_valid = eid_a >= 0 && eid_a < NE;
+                    const bool b_valid = eid_b >= 0 && eid_b < NE;
+                    if (a_valid) valid_a++;
+                    if (b_valid) valid_b++;
+                    if (!a_valid) continue;
+                    for (int kb = 0; kb < NK; kb++) {
+                        const int eid_b_any = row_b[kb].expert_id;
+                        if (eid_b_any >= 0 && eid_b_any < NE && eid_a == eid_b_any) {
+                            intersection++;
+                            break;
+                        }
+                    }
+                    if (b_valid && eid_a == eid_b) {
+                        pos_match++;
+                    }
+                }
+
+                overlap_sum += (double)intersection / (double)NK;
+                int union_size = valid_a + valid_b - intersection;
+                jaccard_sum += (union_size > 0) ? (double)intersection / (double)union_size : 0.0;
+                pos_stab_sum += (double)pos_match / (double)NK;
+                n_pairs++;
+            }
+
+            double avg_overlap  = n_pairs > 0 ? overlap_sum  / (double)n_pairs : 0.0;
+            double avg_jaccard  = n_pairs > 0 ? jaccard_sum  / (double)n_pairs : 0.0;
+            double avg_pos_stab = n_pairs > 0 ? pos_stab_sum / (double)n_pairs : 0.0;
+
+            fprintf(fp, "      \"avg_overlap\": %.4f,\n", avg_overlap);
+            fprintf(fp, "      \"avg_jaccard\": %.4f,\n", avg_jaccard);
+            fprintf(fp, "      \"avg_position_stability\": %.4f\n", avg_pos_stab);
+        }
+
+        fprintf(fp, "    }%s\n", (il < NL - 1) ? "," : "");
+    }
+
+    fprintf(fp, "  ]\n");
+    fprintf(fp, "}\n");
+    fclose(fp);
+
+    fprintf(stderr, "ds4: expert profile written to %s (%d tokens, %d layers)\n", path, NT, NL);
+
+    free(hist);
+    free(weight_sum);
+    free(sorted);
+}
+
+static void ds4_expert_profile_record(
+        uint32_t il,
+        const int *selected,
+        const float *expert_weight,
+        bool is_hash) {
+    if (!g_expert_profile_active || !g_expert_profile_recording_token) return;
+    ds4_expert_profile *p = &g_expert_profile;
+    if (il >= (uint32_t)p->n_layers) return;
+    if (p->current_token < 0 || p->current_token >= p->capacity) return;
+    const int neu = p->n_expert_used;
+    ds4_profile_expert_slot *row =
+        p->records + ((size_t)il * (size_t)p->capacity + (size_t)p->current_token) * (size_t)neu;
+    for (int i = 0; i < neu; i++) {
+        row[i].expert_id = selected[i];
+        row[i].weight = expert_weight[i];
+    }
+    if (is_hash) p->layer_is_hash[il] = true;
+    p->layer_recorded[il] = true;
+}
+
+static bool ds4_expert_profile_begin_token(void) {
+    if (!g_expert_profile_active) return false;
+    if (g_expert_profile.n_tokens >= g_expert_profile.capacity) {
+        g_expert_profile_recording_token = false;
+        g_expert_profile.current_token = -1;
+        g_expert_profile.truncated = true;
+        return false;
+    }
+    g_expert_profile.current_token = g_expert_profile.n_tokens;
+    g_expert_profile_recording_token = true;
+    return true;
+}
+
+static void ds4_expert_profile_end_token(bool recorded) {
+    if (!g_expert_profile_active) return;
+    if (recorded) g_expert_profile.n_tokens++;
+    g_expert_profile.current_token = -1;
+    g_expert_profile_recording_token = false;
+}
+
 #if defined(__GNUC__) || defined(__clang__)
 #define DS4_MAYBE_UNUSED __attribute__((unused))
 #else
@@ -6422,6 +6729,11 @@ static void layer_routed_moe_one(
         layer_topk_selected_experts(selected, expert_weight, model, layer, x);
     }
 
+    if (g_expert_profile_active) {
+        const bool is_hash = (layer->ffn_gate_tid2eid != NULL);
+        ds4_expert_profile_record(il, selected, expert_weight, is_hash);
+    }
+
     if (!trace) {
         matvec_experts_mid_prequant(mid_all, model,
                                     layer->ffn_gate_exps,
@@ -6514,6 +6826,11 @@ static void layer_routed_moe_one_prealloc(
         layer_hash_router_weights_one(expert_weight, model, layer, x, selected);
     } else {
         layer_topk_selected_experts(selected, expert_weight, model, layer, x);
+    }
+
+    if (g_expert_profile_active) {
+        const bool is_hash = (layer->ffn_gate_tid2eid != NULL);
+        ds4_expert_profile_record(il, selected, expert_weight, is_hash);
     }
 
     matvec_experts_mid_prequant(mid_all, model,
@@ -8815,6 +9132,7 @@ static void forward_token_raw_swa_cpu_decode_scratch(
         ds4_cpu_decode_scratch * scratch) {
     float *cur = scratch->cur;
     float *next = scratch->next;
+    const bool expert_profile_token = ds4_expert_profile_begin_token();
 
     embed_token_f16(model, weights, token, scratch->plain);
     hc_from_plain_embedding(cur, scratch->plain, DS4_N_EMBD, DS4_N_HC);
@@ -8830,6 +9148,7 @@ static void forward_token_raw_swa_cpu_decode_scratch(
         cur = next;
         next = tmp;
     }
+    ds4_expert_profile_end_token(expert_profile_token);
 
     if (logits) {
         output_logits_one_decode_scratch(logits, model, weights, cur, scratch);
@@ -19329,6 +19648,22 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         *out = e;
         return 0;
     }
+    const char *expert_profile_path = getenv("DS4_EXPERT_PROFILE");
+    if (expert_profile_path && expert_profile_path[0]) {
+        if (e->backend == DS4_BACKEND_CPU) {
+            ds4_expert_profile_init(
+                (int)g_ds4_shape.n_layer,
+                (int)g_ds4_shape.n_expert,
+                (int)g_ds4_shape.n_expert_used,
+                8192);
+            fprintf(stderr, "ds4: expert locality profiler active (output: %s)\n",
+                    expert_profile_path);
+        } else {
+            fprintf(stderr,
+                    "ds4: DS4_EXPERT_PROFILE is CPU-only; ignoring it for %s backend\n",
+                    ds4_backend_name(e->backend));
+        }
+    }
     if (e->backend == DS4_BACKEND_CPU && !cpu_load_directional_steering(e)) {
         ds4_engine_close(e);
         *out = NULL;
@@ -19546,6 +19881,11 @@ int ds4_engine_model_id(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+    if (g_expert_profile_active) {
+        const char *expert_profile_path = getenv("DS4_EXPERT_PROFILE");
+        ds4_expert_profile_write_json(expert_profile_path);
+        ds4_expert_profile_cleanup();
+    }
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();

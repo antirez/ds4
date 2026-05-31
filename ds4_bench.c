@@ -38,6 +38,7 @@ typedef struct {
     int power_percent;
     double step_mul;
     const char *dump_frontier_logits_dir;
+    const char *expert_profile_path;
     ds4_dist_options dist;
     bool warm_weights;
     bool quality;
@@ -210,6 +211,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
             c.dump_frontier_logits_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--expert-profile")) {
+            c.expert_profile_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--backend")) {
@@ -462,6 +465,13 @@ int main(int argc, char **argv) {
     if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
         fprintf(stderr, "ds4-bench: %s\n", dist_err);
         return 2;
+    }
+    if (cfg.expert_profile_path) {
+        if (cfg.backend != DS4_BACKEND_CPU) {
+            fprintf(stderr, "ds4-bench: --expert-profile requires --cpu\n");
+            return 2;
+        }
+        setenv("DS4_EXPERT_PROFILE", cfg.expert_profile_path, 1);
     }
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) return 1;

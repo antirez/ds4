@@ -335,6 +335,7 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--gen-tokens N", "Greedy decode tokens per frontier. 0 for pure prefill. Default: 128");
     opt(fp, c, "--csv FILE", "Write CSV there instead of stdout.");
     opt(fp, c, "--dump-frontier-logits-dir DIR", "Write one full-logit JSON file per frontier.");
+    opt(fp, c, "--expert-profile FILE", "Record expert locality stats to JSON (CPU only).");
     fputc('\n', fp);
 }
 
