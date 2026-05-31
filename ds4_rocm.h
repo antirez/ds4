@@ -153,15 +153,10 @@ static __device__ __forceinline__ unsigned int __vcmpne4(unsigned int a, unsigne
     return c;
 }
 
-static __device__ __forceinline__ int32_t __vsub4(int32_t a, int32_t b) {
-    // Per-byte subtraction (wrapping, not saturating)
-    uint32_t ua = (uint32_t)a, ub = (uint32_t)b;
-    // Trick: subtract bytes in parallel avoiding cross-byte borrows
-    uint32_t diff = ((ua | 0x80808080u) - (ub & 0x7F7F7F7Fu)) ^ ((ua ^ ~ub) & 0x80808080u);
-    return (int32_t)diff;
+static __device__ __forceinline__ uint32_t __vsub4(uint32_t a, uint32_t b) {
+    return ((a | 0x80808080u) - (b & 0x7F7F7F7Fu)) ^ ((a ^ ~b) & 0x80808080u);
 }
 
-// __dp4a: dot product of 4 signed int8s packed in an int32
 static __device__ __forceinline__ int32_t __dp4a(int32_t a, int32_t b, int32_t c) {
     const int8_t *a_bytes = reinterpret_cast<const int8_t*>(&a);
     const int8_t *b_bytes = reinterpret_cast<const int8_t*>(&b);
@@ -171,13 +166,49 @@ static __device__ __forceinline__ int32_t __dp4a(int32_t a, int32_t b, int32_t c
              + (int32_t)a_bytes[3] * b_bytes[3];
 }
 
-static __device__ __forceinline__ uint32_t __dp4a(uint32_t a, uint32_t b, uint32_t c) {
-    const uint8_t *a_bytes = reinterpret_cast<const uint8_t*>(&a);
-    const uint8_t *b_bytes = reinterpret_cast<const uint8_t*>(&b);
-    return c + (uint32_t)a_bytes[0] * b_bytes[0]
-             + (uint32_t)a_bytes[1] * b_bytes[1]
-             + (uint32_t)a_bytes[2] * b_bytes[2]
-             + (uint32_t)a_bytes[3] * b_bytes[3];
-}
+__device__ static float warp_sum_f32(float v);
+template <uint32_t ROWS_PER_BLOCK>
+__global__ static void matmul_f16_pair_warp_kernel(
+        float *out0,
+        float *out1,
+        const __half *w0,
+        const __half *w1,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim) {
 
+    const uint64_t row_base = (uint64_t)blockIdx.x * ROWS_PER_BLOCK;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+
+    const uint64_t row = row_base + warp;
+    const bool valid0 = row < out0_dim;
+    const bool valid1 = row < out1_dim;
+    if (!valid0 && !valid1) {
+        return;
+    }
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+
+    const __half *wr0 = valid0 ? w0 + row * in_dim : w0;
+    const __half *wr1 = valid1 ? w1 + row * in_dim : w1;
+
+    for (uint64_t i = lane; i < in_dim; i += 32u) {
+
+        const float xv = x[i];
+        if (valid0) sum0 += __half2float(wr0[i]) * xv;
+        if (valid1) sum1 += __half2float(wr1[i]) * xv;
+    }
+
+    sum0 = warp_sum_f32(sum0);
+    sum1 = warp_sum_f32(sum1);
+
+    if (lane == 0) {
+        if (valid0) out0[row] = sum0;
+        if (valid1) out1[row] = sum1;
+    }
+}
 
