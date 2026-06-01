@@ -962,12 +962,6 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         return false;
     }
 
-    uint64_t payload_bytes = ds4_session_payload_bytes(session);
-    if (payload_bytes == 0) {
-        ds4_tokens_free(&store_tokens);
-        return false;
-    }
-
     size_t text_len = 0;
     char *text = NULL;
     const bool text_override = cache_text_override && cache_text_override[0];
@@ -995,23 +989,6 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         ds4_tokens_free(&store_tokens);
         return false;
     }
-    uint64_t est_file_bytes = 0, est_required_bytes = 0;
-    if (!ds4_kvstore_file_size_fits(kc, (uint64_t)text_len, payload_bytes,
-                                    trailer_est_bytes,
-                                    &est_file_bytes, &est_required_bytes)) {
-        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                "%s: kv cache skipped tokens=%d reason=%s because estimated file size %.2f MiB (%.2f MiB with safety) exceeds budget %.2f MiB",
-                kv_log_name(kc),
-                store_tokens.len,
-                reason,
-                (double)est_file_bytes / (1024.0 * 1024.0),
-                (double)est_required_bytes / (1024.0 * 1024.0),
-                (double)kc->budget_bytes / (1024.0 * 1024.0));
-        free(text);
-        ds4_tokens_free(&store_tokens);
-        return false;
-    }
-
     char sha[41];
     ds4_kvstore_sha1_bytes_hex(text, text_len, sha);
     char *path = ds4_kvstore_path_for_sha(kc, sha);
@@ -1025,6 +1002,43 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         free(path);
         ds4_tokens_free(&store_tokens);
         return true;
+    }
+
+    ds4_session_payload_file staged = {0};
+    if (ds4_session_stage_payload(session, &staged,
+                                  save_err, sizeof(save_err)) != 0) {
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache skipped tokens=%d reason=%s because KV payload staging failed: %s",
+                kv_log_name(kc),
+                store_tokens.len,
+                reason,
+                save_err[0] ? save_err : "unknown error");
+        if (err && err_len) snprintf(err, err_len, "%s",
+                                     save_err[0] ? save_err : "unknown error");
+        free(text);
+        free(path);
+        ds4_tokens_free(&store_tokens);
+        return false;
+    }
+    uint64_t payload_bytes = staged.bytes;
+
+    uint64_t est_file_bytes = 0, est_required_bytes = 0;
+    if (!ds4_kvstore_file_size_fits(kc, (uint64_t)text_len, payload_bytes,
+                                    trailer_est_bytes,
+                                    &est_file_bytes, &est_required_bytes)) {
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache skipped tokens=%d reason=%s because estimated file size %.2f MiB (%.2f MiB with safety) exceeds budget %.2f MiB",
+                kv_log_name(kc),
+                store_tokens.len,
+                reason,
+                (double)est_file_bytes / (1024.0 * 1024.0),
+                (double)est_required_bytes / (1024.0 * 1024.0),
+                (double)kc->budget_bytes / (1024.0 * 1024.0));
+        ds4_session_payload_file_free(&staged);
+        free(text);
+        free(path);
+        ds4_tokens_free(&store_tokens);
+        return false;
     }
 
     ds4_kvstore_eviction_context incoming = {
@@ -1047,6 +1061,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                 "%s: kv cache failed to create %s: %s save=%.1f ms",
                 kv_log_name(kc), tmp, strerror(errno),
                 (kv_now_sec() - save_t0) * 1000.0);
+        ds4_session_payload_file_free(&staged);
         free(tmp);
         free(text);
         free(path);
@@ -1070,7 +1085,8 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
               fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
               fwrite(text, 1, text_len, fp) == text_len &&
-              ds4_session_save_payload(session, fp, save_err, sizeof(save_err)) == 0 &&
+              ds4_session_write_staged_payload(&staged, fp,
+                                               save_err, sizeof(save_err)) == 0 &&
               kv_trailer_write(hooks, fp, text, &trailer_bytes) &&
               fflush(fp) == 0;
     int saved_errno = errno;
@@ -1130,6 +1146,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                 (double)(DS4_KVSTORE_FIXED_HEADER + 4ull + text_len + payload_bytes + trailer_bytes) / (1024.0 * 1024.0),
                 save_ms);
     }
+    ds4_session_payload_file_free(&staged);
     free(tmp);
     free(text);
     free(path);

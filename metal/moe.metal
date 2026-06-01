@@ -1564,6 +1564,7 @@ kernel void kernel_mul_mm_id(
     threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);
 
     constexpr int NR0 = 64;
+    static_assert(NR1 == 32, "kernel_mul_mm_id accumulator layout supports only 32 routed rows");
 
     constexpr int NK  = 32;
     constexpr int NL0 = NK/16;

@@ -1,4 +1,6 @@
 #include "ds4.h"
+#include "ds4_distributed.h"
+#include "ds4_help.h"
 
 /* ds4-eval: small built-in benchmark integration test.
  *
@@ -1209,6 +1211,7 @@ typedef struct {
     int hard_limit_reply_budget;
     int soft_limit_think_close_rank;
     ds4_think_mode think_mode;
+    ds4_dist_options dist;
     bool plain;
     bool warm_weights;
     bool quality;
@@ -1477,53 +1480,8 @@ static ds4_backend default_backend(void) {
 #endif
 }
 
-static void usage(FILE *fp) {
-    fprintf(fp,
-        "Usage: ds4-eval [options]\n"
-        "\n"
-        "Runs a small built-in GPQA Diamond/audited SuperGPQA/AIME2025/COMPSEC integration test.\n"
-        "The TTY UI keeps the question list on the left and streams sampled\n"
-        "tokens live on the right; thinking text is dim grey until </think>.\n"
-        "In the TTY UI, Up/Down selects a question, Enter runs it next,\n"
-        "p pauses or resumes evaluation, and q exits with a report.\n"
-        "\n"
-        "Model and backend:\n"
-        "  -m, --model FILE       GGUF model path. Default: ds4flash.gguf\n"
-        "  --mtp FILE             Optional MTP support GGUF.\n"
-        "  -c, --ctx N            Allocated session context. Default: auto-sized.\n"
-        "  --metal | --cuda | --cpu | --backend NAME\n"
-        "  -t, --threads N        CPU helper threads.\n"
-        "  --quality              Prefer exact kernels where applicable.\n"
-        "  --warm-weights         Touch mapped tensor pages before evaluation.\n"
-        "  --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n"
-        "\n"
-        "Evaluation:\n"
-        "  -n, --tokens N         Max generated tokens per question. Default: 16000\n"
-        "  --questions N          Run only the first N embedded questions.\n"
-        "  --case-sequence LIST   Run 1-based case numbers in this comma-separated order.\n"
-        "  --temp F               Sampling temperature. Default: 0\n"
-        "  --top-p F              Nucleus sampling probability. Default: 1\n"
-        "  --min-p F              Keep tokens scoring at least F times the top token. Default: 0.05\n"
-        "  --seed N               Sampling seed. Default: time-based\n"
-        "  --trace FILE           Write questions, outputs, and grading decisions.\n"
-        "  --regrade-trace FILE   Regrade a prior --trace file without loading the model.\n"
-        "  --think                Enable thinking mode. Default\n"
-        "  --think-max            Use Think Max. Auto context allocates at least 393216 tokens.\n"
-        "  --nothink              Disable thinking mode.\n"
-        "  --soft-limit-reply-budget N\n"
-        "                         Inside the last N tokens, close thinking if\n"
-        "                         </think> is already among the top close ranks.\n"
-        "                         Default: 1024\n"
-        "  --hard-limit-reply-budget N\n"
-        "                         Force </think> with N tokens left for the answer.\n"
-        "                         Default: 512\n"
-        "  --soft-limit-think-close-rank N\n"
-        "                         Soft-close when </think> is in the top N tokens.\n"
-        "                         Default: 3\n"
-        "  --pause-ms N           Pause after each result in the TTY UI. Default: 350\n"
-        "  --plain                Disable split-screen ANSI UI.\n"
-        "  --self-test-extractors Run answer-extractor self-tests and exit.\n"
-        "  -h, --help             Show this help.\n");
+static void usage(FILE *fp, const char *topic) {
+    ds4_help_print(fp, DS4_HELP_EVAL, topic);
 }
 
 static eval_config parse_options(int argc, char **argv) {
@@ -1543,9 +1501,29 @@ static eval_config parse_options(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
-            usage(stdout);
+            const char *topic = (i + 1 < argc && argv[i + 1][0] != '-') ?
+                argv[i + 1] : NULL;
+            usage(stdout, topic);
             exit(0);
-        } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
+        }
+        char dist_parse_err[256] = {0};
+        ds4_dist_cli_parse_result dist_parse =
+            ds4_dist_parse_cli_arg(arg,
+                                   &i,
+                                   argc,
+                                   argv,
+                                   &c.dist,
+                                   dist_parse_err,
+                                   sizeof(dist_parse_err));
+        if (dist_parse == DS4_DIST_CLI_ERROR) {
+            fprintf(stderr,
+                    "ds4-eval: %s\n",
+                    dist_parse_err[0] ? dist_parse_err : "invalid distributed option");
+            exit(2);
+        }
+        if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
+
+        if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
@@ -1609,11 +1587,21 @@ static eval_config parse_options(int argc, char **argv) {
             c.self_test_extractors = true;
         } else {
             fprintf(stderr, "ds4-eval: unknown option: %s\n", arg);
-            usage(stderr);
+            usage(stderr, NULL);
             exit(2);
         }
     }
     if (c.self_test_extractors || c.regrade_trace_path) return c;
+
+    char dist_err[256];
+    if (ds4_dist_prepare_engine_options(&c.dist, NULL, dist_err, sizeof(dist_err)) != 0) {
+        fprintf(stderr, "ds4-eval: %s\n", dist_err);
+        exit(2);
+    }
+    if (c.dist.role == DS4_DISTRIBUTED_WORKER) {
+        fprintf(stderr, "ds4-eval: --role worker is a serving mode; start workers with ./ds4\n");
+        exit(2);
+    }
 
     if (c.max_tokens > EVAL_MAX_CONTEXT) {
         fprintf(stderr,
@@ -3754,6 +3742,34 @@ static void log_context_memory(ds4_backend backend, int ctx_size) {
             m.comp_cap);
 }
 
+static int wait_distributed_route(ds4_session *session) {
+    char err[256] = {0};
+    char last[256] = {0};
+    unsigned ticks = 0;
+    const struct timespec delay = {0, 250000000L};
+
+    for (;;) {
+        int ready = ds4_session_distributed_route_ready(session, err, sizeof(err));
+        if (ready > 0) {
+            if (ticks) fprintf(stderr, "ds4-eval: distributed route ready\n");
+            return 0;
+        }
+        if (ready < 0) {
+            fprintf(stderr,
+                    "ds4-eval: distributed route readiness failed: %s\n",
+                    err[0] ? err : "unknown error");
+            return 1;
+        }
+        const char *why = err[0] ? err : "route incomplete";
+        if (strcmp(last, why) != 0 || (ticks % 20u) == 0) {
+            fprintf(stderr, "ds4-eval: waiting for distributed route: %s\n", why);
+            snprintf(last, sizeof(last), "%s", why);
+        }
+        nanosleep(&delay, NULL);
+        ticks++;
+    }
+}
+
 static const char *report_status_name(eval_status st) {
     switch (st) {
     case EVAL_PASSED: return "PASSED";
@@ -3839,7 +3855,15 @@ int main(int argc, char **argv) {
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .distributed = cfg.dist,
     };
+    char dist_err[256];
+    if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
+        fprintf(stderr, "ds4-eval: %s\n", dist_err);
+        if (trace) fclose(trace);
+        free(case_sequence);
+        return 2;
+    }
 
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) {
@@ -3875,6 +3899,15 @@ int main(int argc, char **argv) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
         fprintf(stderr, "ds4-eval: failed to create session\n");
+        if (trace) fclose(trace);
+        ds4_engine_close(engine);
+        free(case_sequence);
+        return 1;
+    }
+    if (cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR &&
+        wait_distributed_route(session) != 0)
+    {
+        ds4_session_free(session);
         if (trace) fclose(trace);
         ds4_engine_close(engine);
         free(case_sequence);
