@@ -7775,11 +7775,11 @@ static bool stdout_is_tty(void) {
 static char *agent_format_user_prompt_echo(const char *text) {
     agent_buf b = {0};
     if (stdout_is_tty()) {
-        agent_buf_puts(&b, "\x1b[1;91m*\x1b[1;97m ");
+        agent_buf_puts(&b, "\x1b[1;96mds4-agent>\x1b[0m \x1b[1;97m");
         agent_buf_puts(&b, text);
         agent_buf_puts(&b, "\x1b[0m\n\n");
     } else {
-        agent_buf_puts(&b, "* ");
+        agent_buf_puts(&b, "ds4-agent> ");
         agent_buf_puts(&b, text);
         agent_buf_puts(&b, "\n\n");
     }
@@ -7791,6 +7791,14 @@ static void agent_echo_user_prompt(const char *text) {
     printf("%s", msg);
     fflush(stdout);
     free(msg);
+}
+
+static void agent_echo_slash_command(const char *text) {
+    if (stdout_is_tty())
+        printf("\x1b[1;96mds4-agent>\x1b[0m \x1b[1;97m%s\x1b[0m\n", text);
+    else
+        printf("ds4-agent> %s\n", text);
+    fflush(stdout);
 }
 
 /* ============================================================================
@@ -9478,6 +9486,8 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                 int saved_output_col = editor.output_col;
                 editor_stop(&editor);
                 bool busy = !worker_is_idle(&worker);
+                bool known_slash = cmd[0] == '/' && agent_slash_command_known(cmd);
+                if (known_slash) agent_echo_slash_command(cmd);
                 if (!cmd[0]) {
                     /* Empty input: just reopen the editor. */
                 } else if (!strcmp(cmd, "/help")) {
@@ -9511,7 +9521,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                             worker_request_power(&worker, power);
                         }
                     }
-                } else if (cmd[0] == '/' && !agent_slash_command_known(cmd)) {
+                } else if (cmd[0] == '/' && !known_slash) {
                     ssize_t ignored = write(STDOUT_FILENO, "\a", 1);
                     (void)ignored;
                     restore_line = xstrdup(cmd);
