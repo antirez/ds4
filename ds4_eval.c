@@ -2765,7 +2765,17 @@ static void find_integer_answer(const char *generated, char *dst, size_t dstlen)
     if (answer) {
         const char *end = answer + strlen(answer);
         if (strlen(answer) > 160) end = answer + 160;
-        if (scan_first_integer(answer, end, dst, dstlen)) return;
+        /* Restrict to the final answer line: digits after it (continued
+         * reasoning, footnotes, years) must not override the answer. */
+        const char *nl = memchr(answer, '\n', (size_t)(end - answer));
+        if (nl) end = nl;
+        /* When the line shows arithmetic ("m+n = 256+37 = 293") the stated
+         * result is the right-hand side of the LAST '='. Otherwise the first
+         * integer on the line is the answer (keeps "Final answer: 082"). */
+        const char *eq = NULL;
+        for (const char *r = answer; r < end; r++) if (*r == '=') eq = r;
+        if (scan_first_integer(eq ? eq + 1 : answer, end, dst, dstlen)) return;
+        if (eq && scan_first_integer(answer, end, dst, dstlen)) return;
     }
 
     const char *last_start = NULL;
@@ -3132,6 +3142,32 @@ static char *trace_copy_model_output(const char *case_start, const char *case_en
     return out;
 }
 
+typedef enum {
+    REGRADE_NOT_GRADED,
+    REGRADE_PASSED,
+    REGRADE_FAILED,
+} regrade_outcome;
+
+/* Decide how one trace case regrades. Only PASSED/FAILED traces were graded by
+ * a completed run; STOPPED/SKIPPED/SWITCHED/ERROR cases carry partial or no
+ * model output and must be reported as not-graded rather than counted, since
+ * grading them inflates the totals and raises spurious "changed" drift. An
+ * empty status keeps legacy traces (written before the status line) working. */
+static regrade_outcome regrade_case_outcome(const eval_case *tc,
+                                            const char *traced_status,
+                                            const char *model_output,
+                                            char *got, size_t gotlen) {
+    bool gradeable = traced_status[0] == '\0' ||
+                     !strcmp(traced_status, "PASSED") ||
+                     !strcmp(traced_status, "FAILED");
+    if (!gradeable) {
+        if (gotlen) got[0] = '\0';
+        return REGRADE_NOT_GRADED;
+    }
+    find_case_answer(tc, model_output, got, gotlen);
+    return answer_matches(tc, got) ? REGRADE_PASSED : REGRADE_FAILED;
+}
+
 static int regrade_trace_file(const char *path) {
     size_t len = 0;
     char *text = read_text_file(path, &len);
@@ -3145,6 +3181,7 @@ static int regrade_trace_file(const char *path) {
     int changed = 0;
     int unknown = 0;
     int parse_errors = 0;
+    int not_graded = 0;
 
     while (true) {
         const char *case_start = trace_find_next_case(start, end);
@@ -3186,8 +3223,14 @@ static int regrade_trace_file(const char *path) {
         }
 
         char got[EVAL_ANSWER_MAX];
-        find_case_answer(tc, model_output, got, sizeof(got));
-        bool ok = answer_matches(tc, got);
+        regrade_outcome outcome =
+            regrade_case_outcome(tc, traced_status, model_output, got, sizeof(got));
+        if (outcome == REGRADE_NOT_GRADED) {
+            not_graded++;
+            free(model_output);
+            continue;
+        }
+        bool ok = (outcome == REGRADE_PASSED);
         if (ok) passed++;
         else failed++;
 
@@ -3204,8 +3247,8 @@ static int regrade_trace_file(const char *path) {
         free(model_output);
     }
 
-    printf("ds4-eval: regraded %d cases from %s: passed=%d failed=%d changed=%d unknown=%d parse_errors=%d\n",
-           total, path, passed, failed, changed, unknown, parse_errors);
+    printf("ds4-eval: regraded %d cases from %s: passed=%d failed=%d changed=%d not_graded=%d unknown=%d parse_errors=%d\n",
+           total, path, passed, failed, changed, not_graded, unknown, parse_errors);
     free(text);
     return (unknown || parse_errors || total == 0) ? 1 : 0;
 }
@@ -3273,10 +3316,37 @@ static int trace_copy_self_test_case(void) {
     return 0;
 }
 
+static int regrade_status_self_test_case(void) {
+    int failed = 0;
+    const eval_case integer = {.source = "AIME2025", .answer = "82"};
+    char got[EVAL_ANSWER_MAX];
+
+    if (regrade_case_outcome(&integer, "PASSED", "</think>Answer: 82",
+                             got, sizeof(got)) != REGRADE_PASSED) {
+        fprintf(stderr, "ds4-eval: regrade self-test failed: PASSED trace not regraded\n");
+        failed++;
+    }
+    /* An interrupted run whose partial output happens to look correct must not
+     * be counted or flagged as drift. */
+    if (regrade_case_outcome(&integer, "STOPPED", "</think>Answer: 82",
+                             got, sizeof(got)) != REGRADE_NOT_GRADED) {
+        fprintf(stderr, "ds4-eval: regrade self-test failed: STOPPED trace was graded\n");
+        failed++;
+    }
+    /* Legacy traces without a status line stay gradeable. */
+    if (regrade_case_outcome(&integer, "", "</think>Answer: 82",
+                             got, sizeof(got)) != REGRADE_PASSED) {
+        fprintf(stderr, "ds4-eval: regrade self-test failed: legacy empty status not graded\n");
+        failed++;
+    }
+    return failed;
+}
+
 static int run_extractor_self_tests(void) {
     int failed = 0;
 
     failed += trace_copy_self_test_case();
+    failed += regrade_status_self_test_case();
 
     const eval_case mc = {
         .source = "SuperGPQA",
@@ -3336,6 +3406,31 @@ static int run_extractor_self_tests(void) {
         "**Answer:** 10</think>The primary write is at line 10.\n"
         "Answer: 10",
         "10");
+
+    /* --- Regression cases for answer-extractor false negatives. These guard
+     *     against the grader under-reporting model accuracy on well-formed
+     *     final-answer lines. --- */
+
+    /* Integer: when the answer line shows the arithmetic, the graded value
+     * must be the stated result (right of the last '='), not the first
+     * summand/factor; digits on later lines must not leak in either. Many
+     * embedded AIME2025 cases ask for a derived sum (m+n, a+b+c, ...). */
+    const eval_case int_293 = {.source = "AIME2025", .answer = "293"};
+    failed += extractor_self_test_case(
+        "integer: sum line grades the total, not the first summand",
+        &int_293, "</think>Answer: m+n = 256+37 = 293", "293");
+    const eval_case int_62 = {.source = "AIME2025", .answer = "62"};
+    failed += extractor_self_test_case(
+        "integer: three-term sum line grades the total",
+        &int_62, "</think>Answer: a+b+c = 12+25+25 = 62", "62");
+    const eval_case int_81 = {.source = "AIME2025", .answer = "81"};
+    failed += extractor_self_test_case(
+        "integer: product-sum line grades the result, not the first factor",
+        &int_81, "</think>Answer: 2*7 + 3*6 + 5*4 + 7*5 = 81", "81");
+    const eval_case int_82 = {.source = "AIME2025", .answer = "82"};
+    failed += extractor_self_test_case(
+        "integer: digits on a later line do not override the answer line",
+        &int_82, "</think>Answer: 82\nThe value 2025 is just the year.", "82");
 
     if (failed) return 1;
     printf("ds4-eval: answer extractor self-tests passed\n");
