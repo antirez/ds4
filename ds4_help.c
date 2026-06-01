@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <termios.h>
 #include <unistd.h>
 
 typedef struct {
@@ -69,17 +70,23 @@ static void print_colored_option_name(FILE *fp, const help_colors *c, const char
 }
 
 static void opt(FILE *fp, const help_colors *c, const char *name, const char *desc) {
+    const int col = 30;
+    int n = (int)strlen(name);
     if (c->cyan) {
         fputs("  ", fp);
         print_colored_option_name(fp, c, name);
+        if (n > col) {
+            fprintf(fp, "\n      %s%s%s\n",
+                    c->white ? c->white : "", desc, c->white ? c->off : "");
+            return;
+        }
+        for (int i = n; i < col; i++) fputc(' ', fp);
         fprintf(fp, " %s|%s ", c->grey ? c->grey : "", c->grey ? c->off : "");
         fprintf(fp, "%s%s%s\n", c->white ? c->white : "", desc,
                 c->white ? c->off : "");
         return;
     }
 
-    const int col = 30;
-    int n = (int)strlen(name);
     if (n > col) {
         fprintf(fp, "  %s\n      %s\n", name, desc);
     } else {
@@ -525,6 +532,32 @@ static void print_default(FILE *fp, const help_colors *c, ds4_help_tool tool) {
 }
 
 void ds4_help_print(FILE *fp, ds4_help_tool tool, const char *topic) {
+    /* Help is plain text, but it can be requested after a raw-mode UI left the
+     * terminal with output processing disabled. In that state '\n' moves down
+     * without returning to column zero, producing stair-stepped output. */
+    int term_fd = fileno(fp);
+    bool restore_term = false;
+    struct termios saved_term;
+    if (term_fd >= 0 && isatty(term_fd) && tcgetattr(term_fd, &saved_term) == 0) {
+        fflush(fp);
+        struct termios normal = saved_term;
+        bool changed = false;
+#ifdef OPOST
+        if (!(normal.c_oflag & OPOST)) {
+            normal.c_oflag |= OPOST;
+            changed = true;
+        }
+#endif
+#ifdef ONLCR
+        if (!(normal.c_oflag & ONLCR)) {
+            normal.c_oflag |= ONLCR;
+            changed = true;
+        }
+#endif
+        if (changed && tcsetattr(term_fd, TCSANOW, &normal) == 0)
+            restore_term = true;
+    }
+
     help_colors c = help_make_colors(fp);
     if (topic && !tool_has_topic(tool, topic)) {
         fprintf(fp, "%s: unknown help topic '%s'\n\n", tool_name(tool), topic);
@@ -541,4 +574,9 @@ void ds4_help_print(FILE *fp, ds4_help_tool tool, const char *topic) {
         print_more_info(fp, &c, tool);
     }
     print_examples(fp, &c, tool, topic);
+    /* Let queued help bytes drain before restoring the caller's terminal mode. */
+    if (restore_term) {
+        fflush(fp);
+        tcsetattr(term_fd, TCSADRAIN, &saved_term);
+    }
 }
