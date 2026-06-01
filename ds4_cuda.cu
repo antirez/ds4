@@ -1443,6 +1443,11 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         }
     }
 
+    const char *chunked_env = getenv("DS4_CUDA_COPY_MODEL_CHUNKED");
+    if (chunked_env && chunked_env[0]) {
+        return 1;
+    }
+
     cudaError_t err = cudaHostRegister((void *)model_map, (size_t)model_size,
                                        cudaHostRegisterMapped | cudaHostRegisterReadOnly);
     if (err == cudaSuccess) {
