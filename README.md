@@ -201,6 +201,187 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 ![M3 Max t/s](speed-bench/m3_max_ts.svg)
 ![PRO model M3 Ultra t/s](speed-bench/pro_model_m3_ultra_ts.svg)
 
+## Distributed Inference
+
+Distributed inference lets DS4 **run a model that is too large for one machine** by
+splitting transformer layers across multiple machines. The main example is the
+full 4-bit Flash quant across two 128 GB MacBooks: each process maps only its
+own layer slice, activations are sent over TCP, and the coordinator keeps normal
+CLI/API behavior.
+
+Distributed inference also allows to **speed up prefill** by
+using multiple GPUs at the same time to process different micro-batches at
+different layers, like in an assembly line. Only prefill can be accelerated this
+way. Generation is purely autoregressive: each token must finish across the
+route before the next token can start. The model work is the same as a single
+process, plus coordination latency, so distributed generation is slower.
+
+To build an initial mental model, here are the high level concepts:
+
+1. You put the GGUF on every machine, but each one loads just a subset. `--layers` controls which tensors are mapped, so a worker with `--layers 20:output` does not load the earlier layers.
+2. Layer ranges are inclusive: `10:20` means layers 10, 11, ..., 20. `N:output` means layer `N` through the final layer plus the output head.
+3. You assign one of the machines the role of `coordinator`, the others the roles of `workers`. Workers will connect to the coordinator and will tell they are there and which layers they are able to process.
+4. Each worker keeps its slice of the KV cache.
+5. Communication is worker-to-worker, there is no need to use the coordinator as relay, so if your coordinator is `A`, and you make a request, activations will flow in `A -> B -> C -> back to A`.
+
+### How it works and how to configure it
+
+The prefill path is pipelined (this is why it can go faster than in a single machine).
+For large prompts the coordinator can run its
+slice on chunk N+1 while the worker is running its slice on chunk N. The
+distributed rows below were measured with two M5 Max 128 GB MacBooks connected
+by Thunderbolt 5, using the Q4 Flash GGUF and the default 4096-token
+distributed prefill chunk. The single-process column is a reference run with
+the Q2 GGUF on a single machine, so it actually is a bit faster since
+the routed MoEs are smaller.
+
+| Prompt | Single-process reference | Two MacBooks | Speedup |
+| ---: | ---: | ---: | ---: |
+| 9421 tokens | 421.70 t/s | 582.22 t/s | 1.38x |
+| 28684 tokens | 405.30 t/s | 674.16 t/s | 1.66x |
+| 63819 tokens | 353.62 t/s | 654.79 t/s | 1.85x |
+
+Generation is different. **It is strictly autoregressive**: token N+1 cannot start
+until token N has produced logits and sampling has selected the next token. That
+means distributed generation cannot use the long prefill pipeline. It pays at
+least one cross-machine activation hop per generated token, so generation is
+slower than a single local process. On the same two-Mac Thunderbolt setup, a
+12k-context control run with the 91 GB Flash quant went from 30.59 t/s
+single-process to 24.67 t/s distributed, a 19.4% loss. Distributed inference is
+therefore mainly for fitting larger models and speeding up long prefills, not
+for making decode faster.
+
+The measurements above use a Thunderbolt 5 cable. The implementation is plain
+TCP and also works over slower links, including WiFi, but fast Ethernet or
+Thunderbolt networking is strongly recommended. Slow links mostly hurt
+generation latency and short prefills; large prefills can still benefit when
+the layer split is balanced. In the normal performance path, the last worker
+owns the output head and returns logits directly.
+
+Minimal two-host configuration:
+
+```sh
+# Machine A: coordinator, owns tokenization, sampling, the prompt, and layers 0..19.
+./ds4 \
+  -m gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
+  --role coordinator \
+  --layers 0:19 \
+  --listen 169.254.43.68 1234
+
+# Machine B: worker, connects to A and owns layers 20..output.
+./ds4 \
+  -m gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
+  --role worker \
+  --layers 20:output \
+  --coordinator 169.254.43.68 1234
+```
+
+Normally the final worker should own the output head too, for example
+`--layers 20:output`. This avoids returning a full final hidden-state batch
+after prefill and lets the final worker produce the logits directly. On very
+slow or metered links, `--layers 20:42` is also supported: the coordinator will
+load the output head and compute logits locally, trading extra coordinator work
+for smaller per-token replies.
+
+### Network Link Comparison
+
+The table below shows the same two M5 Max hosts, the same 91 GB Flash quant,
+coordinator `--layers 0:19`, worker `--layers 20:output`, an 8192-token prompt
+from `speed-bench/promessi_sposi.txt`, and 128 generated tokens. WiFi and
+Internet numbers vary with local conditions, but the shape is the important
+part: high latency hurts generation directly, while lower bandwidth also pulls
+down long-prefill speed.
+
+| Link | Addresses | Ping avg | Prefill | Generation |
+| --- | --- | ---: | ---: | ---: |
+| Thunderbolt 5 | `169.254.43.68` -> `169.254.12.245` | 0.45 ms | 582.99 t/s | 25.09 t/s |
+| WiFi | `192.168.1.57` -> `192.168.1.95` | 77.20 ms | 250.70 t/s | 10.70 t/s |
+| Internet / VPN | `10.77.0.4` -> `10.77.0.3` | 152.10 ms | 114.88 t/s | 3.63 t/s |
+
+The Internet/VPN case is not meant to be a good interactive experience. It is
+still useful for collective testing: multiple people can temporarily combine
+machines to run a larger model that would not fit on any single host, accepting
+slow decode in exchange for being able to inspect the model at all.
+
+Use the coordinator exactly like normal `./ds4`: interactive chat, `/read`,
+and ordinary generation go through the same high-level session API. The same
+distributed options are also wired into `ds4-agent`, `ds4-eval`, and
+`ds4-bench`. For benchmarks, workers should already be running; `ds4-bench`
+waits until a complete route is available.
+
+Useful tuning and diagnostics:
+
+```sh
+./ds4-bench \
+  -m gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
+  --prompt-file speed-bench/promessi_sposi.txt \
+  --ctx-start 32768 \
+  --ctx-max 65536 \
+  --step-incr 32768 \
+  --gen-tokens 0 \
+  --role coordinator \
+  --layers 0:19 \
+  --listen 169.254.43.68 1234 \
+  --debug
+```
+
+`--debug` on the coordinator prints route formation and per-hop telemetry:
+layer range, token span, local evaluation time, downstream wait time, socket
+send time, and input/output byte counts. This is the current profiling tool for
+deciding whether a split is balanced. `--dist-prefill-window N` controls how
+many prefill chunks may be in flight end-to-end; the default is conservative
+and bounded. `--dist-prefill-chunk N` exists for experiments, but the default
+4096-token chunk is the canonical setting and should be used unless you are
+explicitly validating a different chunk size.
+
+By default DS4 sends hidden-state activations as 32-bit floats. To reduce
+traffic, pass `--dist-activation-bits 16` or `--dist-activation-bits 8` on the
+coordinator. This changes only the transport format between machines, not the
+model weights or KV cache. 16-bit transport halves activation traffic and is the
+first option to try on Ethernet or WiFi. 8-bit transport is more aggressive and
+should be treated as an approximate/experimental mode unless you have validated
+the output for your use case. However experimentally reduction activation
+size didn't provide a significant improvement, so this option may be removed
+in the future.
+
+**If a worker disconnects, the coordinator removes that worker from the active
+route**. The request already in flight can fail, and later calls report an
+incomplete route until a compatible worker reconnects and sends a new
+registration. For live sessions, the coordinator keeps the token history and can
+rebuild worker KV state by replaying the prefix when the route is available
+again. Workers also validate a rolling 64-bit token-prefix hash on every work
+item, so a restarted worker at position 0 cannot silently accept work for
+position N; it reports the mismatch and the coordinator replays the current
+transcript. Ctrl+C in the CLI and agent is cooperative: DS4 waits for the
+current distributed token or prefill chunk to drain before returning control,
+which avoids coordinator-caused KV splits. Saved agent/server sessions use the
+same KV file format as single-machine sessions: during save the coordinator
+fetches worker-owned layer tensors and serializes one normal payload; during
+load it splits that payload over the currently registered route.
+
+### Distributed protocol overview
+
+At the protocol level there are two kinds of connections. Workers keep a
+control TCP connection open to the coordinator and send a `HELLO` with their
+model ID, model family, quant profile, layer slice, context capacity, and data
+port. The coordinator uses these registrations to build a route that covers all
+layers. Work then moves over low-latency TCP data connections: the coordinator
+computes the first slice, sends a `WORK` frame with session ID, token positions,
+rolling token-prefix hashes before and after the span, route information, and
+hidden-state payload, and each worker computes its slice. Middle workers can
+forward directly to the next worker. The final worker returns logits to the
+coordinator, or ACKs for non-final prefill chunks so the prefill pipeline can
+stay full. `RESULT` frames echo the request ID and the post-span hash. A worker
+status error is handled differently from a socket failure: KV/hash mismatch can
+be recovered by replaying the token history on the same route, while transport
+failure drops the route and waits for a replacement worker. For persistent KV,
+the coordinator opens worker data connections and sends snapshot save/load
+messages for each worker-owned layer range; the disk payload remains a single
+agent/server cache file. The protocol has no
+encryption or authentication, and is not release-stable yet; coordinator and
+workers should be built from the same commit and used on trusted machines and
+trusted networks.
+
 ## Reducing heat, power usage and fan noise
 
 Long local inference runs can keep the GPU busy for extended periods. If you
@@ -810,7 +991,7 @@ The DS4 session payload starts with thirteen little-endian `u32` fields:
 
 ```text
 0   magic = "DSV4"
-1   payload version = 1
+1   payload version = 2
 2   saved context size
 3   prefill chunk size
 4   raw KV ring capacity
@@ -843,6 +1024,12 @@ snapshot can sample or continue from the exact next-token distribution without
 running one extra decode step. MTP draft logits/state are not persisted; after
 loading a disk checkpoint the draft state is invalidated and rebuilt by normal
 generation.
+
+Distributed coordinator sessions use the same `DSV4` payload. Worker-owned
+layer tensors are pulled during save and merged into the normal layer-ordered
+tensor stream; during load the coordinator splits that stream into the current
+route and pushes the relevant layer tensors back to the workers. The saved file
+does not retain the distributed topology.
 
 The tensor payload is DS4-specific KV/session state, not a generic inference
 graph dump. It is expected to be portable only across compatible `ds4.c`

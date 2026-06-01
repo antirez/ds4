@@ -1,5 +1,7 @@
 #include "ds4.h"
 #include "ds4_agent_git.h"
+#include "ds4_distributed.h"
+#include "ds4_help.h"
 #include "ds4_kvstore.h"
 #include "ds4_web.h"
 #include "linenoise.h"
@@ -71,6 +73,7 @@ typedef enum {
     AGENT_WORKER_PREFILL,
     AGENT_WORKER_GENERATING,
     AGENT_WORKER_COMPACTING,
+    AGENT_WORKER_DRAINING,
     AGENT_WORKER_SAVING,
     AGENT_WORKER_ERROR,
     AGENT_WORKER_STOPPED,
@@ -485,57 +488,8 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
-static void usage(FILE *fp) {
-    fprintf(fp,
-        "Usage: ds4-agent [options]\n"
-        "\n"
-        "This is an experimental native DS4 agent MVP. It keeps the terminal\n"
-        "responsive with linenoise's multiplexed API while a model worker owns\n"
-        "the live KV session.\n"
-        "\n"
-        "Options:\n"
-        "  -m, --model FILE        GGUF model path. Default: ds4flash.gguf\n"
-        "  --mtp FILE             Optional MTP support GGUF.\n"
-        "  --mtp-draft N          Maximum MTP draft tokens. Default: 1\n"
-        "  --mtp-margin F         MTP verifier margin. Default: 3\n"
-        "  -c, --ctx N            Context size. Default: 100000\n"
-        "  -n, --tokens N         Max generated tokens per turn. Default: 50000\n"
-        "  -p, --prompt TEXT      Submit an initial prompt after startup.\n"
-        "  --non-interactive      Run without the TUI. With -p: one turn and exit;\n"
-        "                         without -p: read repeated prompts from stdin.\n"
-        "  -sys, --system TEXT    Extra system prompt. Empty disables extra text.\n"
-        "  --trace FILE           Write prompt, token, and DSML debug trace.\n"
-        "  --temp F               Sampling temperature. Default: 1\n"
-        "  --top-p F              Nucleus sampling probability. Default: 1\n"
-        "  --min-p F              Min-p sampling threshold. Default: 0.05\n"
-        "  --seed N               Sampling seed.\n"
-        "  --think                Use normal thinking mode. Default.\n"
-        "  --think-max            Use Think Max when context is large enough.\n"
-        "  --nothink              Disable thinking.\n"
-        "  --backend NAME         metal, cuda, or cpu.\n"
-        "  --metal, --cuda, --cpu Select backend explicitly.\n"
-        "  -t, --threads N        CPU helper threads.\n"
-        "  --chdir DIR            Change working directory before loading runtime assets.\n"
-        "  --quality              Prefer exact kernels where available.\n"
-        "  --warm-weights         Touch mapped tensor pages before generation.\n"
-        "  --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n"
-        "  --dir-steering-file FILE\n"
-        "  --dir-steering-ffn F\n"
-        "  --dir-steering-attn F\n"
-        "  -h, --help             Show this help.\n"
-        "\n"
-        "Commands:\n"
-        "  /help                  Show runtime help.\n"
-        "  /save                  Save the current agent session.\n"
-        "  /compact               Compact the current session context now.\n"
-        "  /list                  List saved sessions in ~/.ds4/kvcache.\n"
-        "  /switch SHA            Load a saved session and show recent history.\n"
-        "  /del SHA               Delete a saved session.\n"
-        "  /strip SHA             Remove KV payload from a saved session.\n"
-        "  /history [N]           Show N recent user turns from the current session.\n"
-        "  /power N               Set GPU duty cycle percentage, 1..100.\n"
-        "  /new                   Start a fresh session from the system prompt.\n"
-        "  /quit, /exit           Exit.\n");
+static void usage(FILE *fp, const char *topic) {
+    ds4_help_print(fp, DS4_HELP_AGENT, topic);
 }
 
 static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
@@ -569,9 +523,29 @@ static agent_config parse_options(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
-            usage(stdout);
+            const char *topic = (i + 1 < argc && argv[i + 1][0] != '-') ?
+                argv[i + 1] : NULL;
+            usage(stdout, topic);
             exit(0);
-        } else if (!strcmp(arg, "-p") || !strcmp(arg, "--prompt")) {
+        }
+        char dist_parse_err[256] = {0};
+        ds4_dist_cli_parse_result dist_parse =
+            ds4_dist_parse_cli_arg(arg,
+                                   &i,
+                                   argc,
+                                   argv,
+                                   &c.engine.distributed,
+                                   dist_parse_err,
+                                   sizeof(dist_parse_err));
+        if (dist_parse == DS4_DIST_CLI_ERROR) {
+            fprintf(stderr,
+                    "ds4-agent: %s\n",
+                    dist_parse_err[0] ? dist_parse_err : "invalid distributed option");
+            exit(2);
+        }
+        if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
+
+        if (!strcmp(arg, "-p") || !strcmp(arg, "--prompt")) {
             c.gen.prompt = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--non-interactive")) {
             c.non_interactive = true;
@@ -637,13 +611,25 @@ static agent_config parse_options(int argc, char **argv) {
             steering_scale_set = true;
         } else {
             fprintf(stderr, "ds4-agent: unknown option: %s\n", arg);
-            usage(stderr);
+            usage(stderr, NULL);
             exit(2);
         }
     }
 
     if (c.engine.directional_steering_file && !steering_scale_set)
         c.engine.directional_steering_ffn = 1.0f;
+    char dist_err[256];
+    if (ds4_dist_prepare_engine_options(&c.engine.distributed,
+                                        &c.engine,
+                                        dist_err,
+                                        sizeof(dist_err)) != 0) {
+        fprintf(stderr, "ds4-agent: %s\n", dist_err);
+        exit(2);
+    }
+    if (c.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
+        fprintf(stderr, "ds4-agent: --role worker is a serving mode; start workers with ./ds4\n");
+        exit(2);
+    }
     return c;
 }
 
@@ -3769,12 +3755,16 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
         ds4_kvstore_sha1_bytes_hex(text, text_len, sha);
     if (sha_out) memcpy(sha_out, sha, sizeof(sha));
 
-    uint64_t payload_bytes = ds4_session_payload_bytes(w->session);
-    if (payload_bytes == 0) {
-        snprintf(err, err_len, "session has no valid KV payload");
+    ds4_session_payload_file staged = {0};
+    char save_err[160] = {0};
+    if (ds4_session_stage_payload(w->session, &staged,
+                                  save_err, sizeof(save_err)) != 0) {
+        snprintf(err, err_len, "%s",
+                 save_err[0] ? save_err : "session has no valid KV payload");
         free(text);
         return false;
     }
+    uint64_t payload_bytes = staged.bytes;
 
     agent_buf tmpl = {0};
     agent_buf_puts(&tmpl, path);
@@ -3783,6 +3773,7 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     int fd = mkstemp(tmp);
     if (fd < 0) {
         snprintf(err, err_len, "%s", strerror(errno));
+        ds4_session_payload_file_free(&staged);
         free(tmp);
         free(text);
         return false;
@@ -3793,6 +3784,7 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
         snprintf(err, err_len, "%s", strerror(errno));
         close(fd);
         unlink(tmp);
+        ds4_session_payload_file_free(&staged);
         free(tmp);
         free(text);
         return false;
@@ -3808,13 +3800,12 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     uint8_t tb[4];
     ds4_kvstore_le_put32(tb, (uint32_t)text_len);
 
-    char save_err[160] = {0};
     errno = 0;
     bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
               fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
               fwrite(text, 1, text_len, fp) == text_len &&
-              ds4_session_save_payload(w->session, fp,
-                                       save_err, sizeof(save_err)) == 0 &&
+              ds4_session_write_staged_payload(&staged, fp,
+                                               save_err, sizeof(save_err)) == 0 &&
               (!session_identity ||
                agent_kv_write_title_trailer(fp, session_title,
                                             save_err, sizeof(save_err))) &&
@@ -3835,6 +3826,7 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
         unlink(tmp);
     }
 
+    ds4_session_payload_file_free(&staged);
     free(tmp);
     free(text);
     return ok;
@@ -4092,6 +4084,55 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
     free(text);
     ds4_tokens_free(&sys);
     return true;
+}
+
+static bool agent_worker_should_stop(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    bool stop = w->stop;
+    pthread_mutex_unlock(&w->mu);
+    return stop;
+}
+
+static bool agent_worker_wait_distributed_route(agent_worker *w, char *err, size_t err_len) {
+    if (!w || !w->cfg ||
+        w->cfg->engine.distributed.role != DS4_DISTRIBUTED_COORDINATOR)
+        return true;
+
+    char last[160] = {0};
+    unsigned ticks = 0;
+    const struct timespec delay = {0, 250000000L};
+    for (;;) {
+        int ready = ds4_session_distributed_route_ready(w->session, err, err_len);
+        if (ready > 0) {
+            if (ticks != 0) {
+                if (w->cfg->non_interactive)
+                    fprintf(stderr, "ds4-agent: distributed route ready\n");
+                else
+                    agent_publish_system_status(w, "Distributed route ready.");
+            }
+            if (err_len) err[0] = '\0';
+            return true;
+        }
+        if (ready < 0) return false;
+
+        const char *why = err && err[0] ? err : "route incomplete";
+        if (strcmp(last, why) != 0 || (ticks % 20u) == 0) {
+            if (w->cfg->non_interactive) {
+                fprintf(stderr, "ds4-agent: waiting for distributed route: %s\n", why);
+            } else {
+                char msg[224];
+                snprintf(msg, sizeof(msg), "Waiting for distributed route: %s", why);
+                agent_publish_system_status(w, msg);
+            }
+            snprintf(last, sizeof(last), "%s", why);
+        }
+        if (agent_worker_should_stop(w)) {
+            snprintf(err, err_len, "agent stopped while waiting for distributed route");
+            return false;
+        }
+        nanosleep(&delay, NULL);
+        ticks++;
+    }
 }
 
 static bool agent_worker_has_user_session(agent_worker *w) {
@@ -4369,9 +4410,34 @@ static bool agent_history_has_prefix(const char *p, const char *end,
     return (size_t)(end - p) >= n && memcmp(p, prefix, n) == 0;
 }
 
+/* Tool messages are rendered as user turns in the transcript.  Return the
+ * inner payload for the current <tool_result> wrapper so /history skips these
+ * pseudo-user turns and displays their content without leaking the wrapper. */
+static bool agent_history_tool_result_payload(const char **p, const char **end) {
+    const char *s = *p, *e = *end;
+    agent_history_trim(&s, &e);
+
+    const char *open = "<tool_result>";
+    const char *close = "</tool_result>";
+    const size_t open_len = strlen(open);
+    const size_t close_len = strlen(close);
+    if (!agent_history_has_prefix(s, e, open)) return false;
+
+    s += open_len;
+    if ((size_t)(e - s) >= close_len &&
+        memcmp(e - close_len, close, close_len) == 0)
+    {
+        e -= close_len;
+    }
+    *p = s;
+    *end = e;
+    return true;
+}
+
 static bool agent_history_is_tool_user(const char *p, const char *end) {
     agent_history_trim(&p, &end);
-    return agent_history_has_prefix(p, end, "Tool:") ||
+    return agent_history_tool_result_payload(&p, &end) ||
+           agent_history_has_prefix(p, end, "Tool:") ||
            agent_history_has_prefix(p, end, "Tool result");
 }
 
@@ -4658,13 +4724,18 @@ static void agent_history_render_text(agent_worker *w, const char *text,
 
         if (mark == AGENT_HISTORY_MARK_USER) {
             if (agent_history_is_tool_user(tp, te)) {
+                const char *payload_start = tp;
+                const char *payload_end = te;
+                (void)agent_history_tool_result_payload(&payload_start,
+                                                        &payload_end);
                 if (color) {
                     const char *s = "\x1b[90mTool result:\n";
                     agent_publish(w, s, strlen(s));
                 } else {
                     agent_publish(w, "Tool result:\n", strlen("Tool result:\n"));
                 }
-                agent_history_publish_limited(w, tp, te, 12, 3000);
+                agent_history_publish_limited(w, payload_start, payload_end,
+                                              12, 3000);
                 if (color) agent_publish(w, "\x1b[0m", 4);
             } else {
                 if (color) {
@@ -7717,7 +7788,8 @@ static void *worker_main(void *arg) {
                 w->cfg->engine.model_path ? w->cfg->engine.model_path : "",
                 w->cfg->gen.trace_path ? w->cfg->gen.trace_path : "");
     char init_err[160] = {0};
-    if (!agent_worker_reset_to_sysprompt(w, init_err, sizeof(init_err))) {
+    if (!agent_worker_wait_distributed_route(w, init_err, sizeof(init_err)) ||
+        !agent_worker_reset_to_sysprompt(w, init_err, sizeof(init_err))) {
         agent_set_error(w, init_err[0] ? init_err : "failed to initialize system prompt");
     }
     agent_trace_tokens(w, "initial_system_prompt", &w->transcript, 0);
@@ -7821,6 +7893,15 @@ static int worker_status_power_locked(agent_worker *w) {
 static void worker_interrupt(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     w->interrupt = true;
+    if (w->cfg &&
+        w->cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR &&
+        (w->status.state == AGENT_WORKER_PREFILL ||
+         w->status.state == AGENT_WORKER_GENERATING ||
+         w->status.state == AGENT_WORKER_COMPACTING))
+    {
+        w->status.state = AGENT_WORKER_DRAINING;
+        agent_wake_locked(w);
+    }
     pthread_mutex_unlock(&w->mu);
 }
 
@@ -8018,6 +8099,10 @@ static void build_status_text(const agent_status *st, char *buf, size_t len) {
     case AGENT_WORKER_COMPACTING:
         snprintf(buf, len, "ctx %s/%s | COMPACTING summary %d tokens %.1f t/s%s",
                  used, total_ctx, st->generated, st->gen_tps, power);
+        break;
+    case AGENT_WORKER_DRAINING:
+        snprintf(buf, len, "ctx %s/%s | stopping after distributed cluster drains%s",
+                 used, total_ctx, power);
         break;
     case AGENT_WORKER_SAVING:
         snprintf(buf, len, "ctx %s/%s | saving session%s", used, total_ctx, power);
@@ -9620,7 +9705,8 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         }
                     }
                 } else if (cmd[0] == '/' && !agent_slash_command_known(cmd)) {
-                    write(STDOUT_FILENO, "\a", 1);
+                    ssize_t ignored = write(STDOUT_FILENO, "\a", 1);
+                    (void)ignored;
                     restore_line = xstrdup(cmd);
                 } else if (cmd[0] == '/' && busy) {
                     printf("command requires the model to be idle: %s\n", cmd);
