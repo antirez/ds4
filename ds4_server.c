@@ -566,6 +566,7 @@ static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
                                            tool_replay_stats *stats);
 static bool tool_memory_has_id(server *s, const char *id);
 static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs);
+static void server_log(ds4_log_type type, const char *fmt, ...);
 
 typedef struct {
     char **v;
@@ -4443,16 +4444,42 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
      * or an explanation of the protocol.  Treating it as a real tool call
      * duplicates it into both reasoning and structured tool_calls, and can make
      * clients execute something the assistant had not actually emitted as its
-     * post-thinking action. */
+     * post-thinking action.
+     *
+     * Exception: if </think> is absent but a DSML tool-call block is present,
+     * the model almost certainly intended a real tool call and simply forgot to
+     * close the thinking stanza.  In that case we treat the DSML start as an
+     * implicit </think> boundary rather than silently discarding the call.
+     * The pre-DSML text becomes reasoning; the DSML block is parsed normally. */
     if (require_thinking_closed) {
         const char *think_end = find_last_substr(text, "</think>");
         if (!think_end) {
-            /* Model did not close thinking, ignore any DSML in reasoning */
-            fprintf(stderr, "ds4-server: thinking not closed, ignoring DSML in reasoning\n");
-            split_reasoning_content(text, strlen(text), content_out, reasoning_out);
-            return true;
+            const char *dsml_start = find_any_tool_start(text);
+            if (dsml_start) {
+                /* Implicit close: treat DSML start as the thinking boundary. */
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: thinking not closed before tool call; "
+                           "treating DSML start as implicit </think>");
+                tool_search = dsml_start;
+                /* Expose reasoning as everything up to the implicit boundary. */
+                split_reasoning_content(text, (size_t)(dsml_start - text),
+                                        content_out, reasoning_out);
+                /* content_out holds any non-reasoning prefix; we only need
+                 * reasoning here — clear the content placeholder so the
+                 * tool-call path below can fill it in correctly. */
+                free(*content_out);
+                *content_out = NULL;
+            } else {
+                /* No DSML at all: entire output is unclosed reasoning. */
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: thinking not closed and no tool call found; "
+                           "returning output as reasoning only");
+                split_reasoning_content(text, strlen(text), content_out, reasoning_out);
+                return true;
+            }
+        } else {
+            tool_search = think_end + 8;
         }
-        tool_search = think_end + 8;
     }
 
     const char *start = strstr(tool_search, "\n\n" DS4_TOOL_CALLS_START);
