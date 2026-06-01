@@ -2712,7 +2712,19 @@ static char find_answer_letter(const char *generated, int nchoices) {
             if (c >= 'A' && c <= max_answer) {
                 char before = p == visible ? ' ' : p[-1];
                 char after = p[1];
-                if (is_letter_boundary(before, after)) return c;
+                if (!is_letter_boundary(before, after)) continue;
+                /* A standalone capital that begins a same-line English word
+                 * ("A careful ...") or a contraction ("I'll ...") is prose,
+                 * not the model's pick: the real letter comes later on the
+                 * line. Skip it; the reverse scan below still recovers it if
+                 * it was the only candidate (e.g. "Answer: A is correct"). */
+                if (after == '\'') continue;
+                if (after == ' ' || after == '\t') {
+                    const char *w = p + 1;
+                    while (*w == ' ' || *w == '\t') w++;
+                    if (islower((unsigned char)*w)) continue;
+                }
+                return c;
             }
         }
     }
@@ -3410,6 +3422,44 @@ static int run_extractor_self_tests(void) {
     /* --- Regression cases for answer-extractor false negatives. These guard
      *     against the grader under-reporting model accuracy on well-formed
      *     final-answer lines. --- */
+
+    /* Multiple choice: a standalone in-range capital that merely begins an
+     * English word ("I think", "A careful") or a contraction ("I'll") must
+     * not shadow the choice the model actually states later on the line.
+     * Only reachable when the stray letter is itself a valid option, i.e.
+     * 10-choice (A-J) cases, of which the embedded set has 24. */
+    const eval_case mc_c = {
+        .source = "SuperGPQA",
+        .choice = {"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"},
+        .answer = "C",
+    };
+    failed += extractor_self_test_case(
+        "MC: leading pronoun 'I' does not shadow the chosen letter",
+        &mc_c, "</think>Answer: I think it is C", "C");
+    failed += extractor_self_test_case(
+        "MC: contraction I'll does not shadow the chosen letter",
+        &mc_c, "</think>Answer: I'll go with C.", "C");
+    failed += extractor_self_test_case(
+        "MC: leading article 'A' does not shadow the chosen letter",
+        &mc_c, "</think>Answer: A careful reading shows C.", "C");
+
+    const eval_case mc_i = {
+        .source = "SuperGPQA",
+        .choice = {"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"},
+        .answer = "I",
+    };
+    failed += extractor_self_test_case(
+        "MC: a genuine standalone 'I' answer is still picked",
+        &mc_i, "</think>Answer: I.", "I");
+
+    const eval_case mc4_d = {
+        .source = "SuperGPQA",
+        .choice = {"A", "B", "C", "D"},
+        .answer = "D",
+    };
+    failed += extractor_self_test_case(
+        "MC: out-of-range pronoun is harmless on 4-choice cases",
+        &mc4_d, "</think>Answer: I think it is D", "D");
 
     /* Integer: when the answer line shows the arithmetic, the graded value
      * must be the stated result (right of the last '='), not the first
