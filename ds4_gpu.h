@@ -36,6 +36,8 @@ int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
 
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
+int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
+int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
@@ -45,6 +47,11 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
+int ds4_gpu_pro_q4_expert_table_auto_available(void);
+int ds4_gpu_preload_q4_expert_tables(const void *model_map, uint64_t model_size,
+                                     uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+                                     uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                                     uint32_t n_total_expert);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
 void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_print_memory_report(const char *label);
@@ -644,6 +651,8 @@ int ds4_gpu_router_select_batch_tensor(
         float                   expert_weight_scale,
         uint32_t                n_tokens);
 
+int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n_selected);
+
 int ds4_gpu_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
@@ -669,7 +678,8 @@ int ds4_gpu_routed_moe_one_tensor(
         uint32_t                n_total_expert,
         uint32_t                n_expert,
         float                   clamp,
-        const ds4_gpu_tensor *x);
+        const ds4_gpu_tensor *x,
+        uint32_t                layer_index);
 
 int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
