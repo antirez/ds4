@@ -16,3 +16,4 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+/tests/test_q4k_dot

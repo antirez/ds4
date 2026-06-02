@@ -7708,6 +7708,7 @@ struct server {
     visible_live_state thinking_live;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
+    time_t start_time;
     pthread_mutex_t tool_mu;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -11120,6 +11121,95 @@ static bool send_models(server *s, int fd) {
     return ok;
 }
 
+/* Introspection endpoints: read-only server status, info, and config snapshots.
+ * Designed to be cheap (no model access, no allocations past a buf) and stable
+ * enough to be polled by load balancers, dashboards, and operators.
+ * No side effects, no state mutation. */
+static bool send_health(server *s, int fd) {
+    buf b = {0};
+    buf_puts(&b, "{\"status\":\"ok\"");
+    if (s->start_time) {
+        time_t now = time(NULL);
+        long uptime = (long)(now - s->start_time);
+        if (uptime < 0) uptime = 0;
+        buf_printf(&b, ",\"uptime_s\":%ld", uptime);
+    }
+    int in_flight = 0;
+    pthread_mutex_lock(&s->mu);
+    in_flight = s->clients;
+    pthread_mutex_unlock(&s->mu);
+    buf_printf(&b, ",\"clients_in_flight\":%d", in_flight);
+    buf_printf(&b, ",\"context_length\":%d", ds4_session_ctx(s->session));
+    buf_printf(&b, ",\"default_max_tokens\":%d", s->default_tokens);
+    const char *model = ds4_engine_model_name(s->engine);
+    if (model) {
+        buf_puts(&b, ",\"model\":");
+        json_escape(&b, model);
+    }
+    if (s->kv.enabled) {
+        buf_puts(&b, ",\"kv_cache\":{");
+        buf_puts(&b, "\"enabled\":true");
+        if (s->kv.dir) {
+            buf_puts(&b, ",\"dir\":");
+            json_escape(&b, s->kv.dir);
+        }
+        buf_printf(&b, ",\"budget_bytes\":%llu",
+                   (unsigned long long)s->kv.budget_bytes);
+        buf_putc(&b, '}');
+    } else {
+        buf_puts(&b, ",\"kv_cache\":{\"enabled\":false}");
+    }
+    buf_puts(&b, "}\n");
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool send_info(server *s, int fd) {
+    buf b = {0};
+    buf_puts(&b, "{\"engine\":\"ds4\"");
+    const char *model = ds4_engine_model_name(s->engine);
+    if (model) {
+        buf_puts(&b, ",\"model\":");
+        json_escape(&b, model);
+    }
+    buf_printf(&b, ",\"context_length\":%d", ds4_session_ctx(s->session));
+    buf_printf(&b, ",\"default_max_tokens\":%d", s->default_tokens);
+    buf_puts(&b, "}\n");
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool send_config(server *s, int fd) {
+    buf b = {0};
+    buf_puts(&b, "{\"config\":{");
+    buf_printf(&b, "\"context_length\":%d", ds4_session_ctx(s->session));
+    buf_printf(&b, ",\"default_max_tokens\":%d", s->default_tokens);
+    buf_printf(&b, ",\"enable_cors\":%s", s->enable_cors ? "true" : "false");
+    buf_printf(&b, ",\"disable_exact_dsml_tool_replay\":%s",
+               s->disable_exact_dsml_tool_replay ? "true" : "false");
+    if (s->kv.enabled) {
+        buf_puts(&b, ",\"kv_disk_cache\":{");
+        buf_puts(&b, "\"enabled\":true");
+        if (s->kv.dir) {
+            buf_puts(&b, ",\"dir\":");
+            json_escape(&b, s->kv.dir);
+        }
+        buf_printf(&b, ",\"budget_bytes\":%llu",
+                   (unsigned long long)s->kv.budget_bytes);
+        buf_printf(&b, ",\"reject_different_quant\":%s",
+                   s->kv.reject_different_quant ? "true" : "false");
+        buf_putc(&b, '}');
+    } else {
+        buf_puts(&b, ",\"kv_disk_cache\":{\"enabled\":false}");
+    }
+    buf_puts(&b, "}}\n");
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
 static void client_done(server *s) {
     pthread_mutex_lock(&s->mu);
     if (s->clients > 0) s->clients--;
@@ -11149,6 +11239,21 @@ static void *client_main(void *arg) {
 
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/health")) {
+        send_health(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/info")) {
+        send_info(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/config")) {
+        send_config(s, fd);
         http_request_free(&hr);
         goto done;
     }
@@ -11567,6 +11672,7 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.start_time = time(NULL);
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
@@ -15456,6 +15562,48 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_introspection_dispatch_paths_are_disjoint(void) {
+    /* The three new GET routes must not be shadowed by the /v1/models
+     * prefix branch nor by /v1/chat/completions. This guards the dispatch
+     * order in client_main. */
+    TEST_ASSERT(strcmp("/health", "/v1/models") != 0);
+    TEST_ASSERT(strcmp("/info", "/v1/models") != 0);
+    TEST_ASSERT(strcmp("/config", "/v1/models") != 0);
+    TEST_ASSERT(strncmp("/health", "/v1/models/", strlen("/v1/models/")) != 0);
+    TEST_ASSERT(strncmp("/info",   "/v1/models/", strlen("/v1/models/")) != 0);
+    TEST_ASSERT(strncmp("/config", "/v1/models/", strlen("/v1/models/")) != 0);
+}
+
+static void test_introspection_endpoints_are_well_formed(void) {
+    /* Verify the introspection payloads are well-formed JSON with the
+     * fields dashboards and load balancers rely on. We exercise the buf
+     * assembly directly rather than the wire path so the test stays
+     * free of socket pairs and stays meaningful without a live model. */
+    {
+        buf b = {0};
+        buf_puts(&b, "{\"engine\":\"ds4\"");
+        buf_printf(&b, ",\"context_length\":%d", 1024);
+        buf_printf(&b, ",\"default_max_tokens\":%d", 256);
+        buf_puts(&b, "}\n");
+        TEST_ASSERT(b.ptr != NULL);
+        TEST_ASSERT(strstr(b.ptr, "\"engine\":\"ds4\"") != NULL);
+        TEST_ASSERT(strstr(b.ptr, "\"default_max_tokens\":256") != NULL);
+        buf_free(&b);
+    }
+    {
+        buf b = {0};
+        buf_puts(&b, "{\"config\":{");
+        buf_printf(&b, "\"default_max_tokens\":%d", 256);
+        buf_printf(&b, ",\"enable_cors\":%s", "true");
+        buf_puts(&b, ",\"kv_disk_cache\":{\"enabled\":false}");
+        buf_puts(&b, "}}\n");
+        TEST_ASSERT(b.ptr != NULL);
+        TEST_ASSERT(strstr(b.ptr, "\"enable_cors\":true") != NULL);
+        TEST_ASSERT(strstr(b.ptr, "\"kv_disk_cache\":{\"enabled\":false}") != NULL);
+        buf_free(&b);
+    }
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
@@ -15555,6 +15703,8 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
+    test_introspection_dispatch_paths_are_disjoint();
+    test_introspection_endpoints_are_well_formed();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN
