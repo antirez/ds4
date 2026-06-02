@@ -118,6 +118,7 @@ static int check_decode_attention_overflow_path(void) {
                                               n_raw,
                                               0,
                                               comp,
+                                              0,
                                               n_comp,
                                               NULL,
                                               0,

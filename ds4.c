@@ -1613,7 +1613,6 @@ static ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
 
 #ifndef DS4_NO_GPU
 #ifndef __APPLE__
-#ifdef DS4_CUDA_SPARK_HBM_CACHE
 typedef struct {
     uint64_t off;
     uint64_t end;
@@ -1642,16 +1641,44 @@ static uint64_t accelerator_cuda_preload_span_bytes(void) {
     return mb * 1048576ull;
 }
 
-static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *cached_out) {
-    /* Routed MoE expert weights (`*_exps.weight`) are ~65 GiB of the model on
-     * V4-Flash but only top-K of N=256 experts fire per token — pre-caching
-     * them in HBM wastes most of the budget on cold weights and starves the
-     * hot non-MoE tensors that every token reads.  Skip them at the span-
-     * build stage so the cap fills with attn / shared FFN / embedding /
-     * output head.  Cold MoE expert reads fall back to the UVA-mapped
-     * pointer. */
-    accelerator_tensor_span *spans = xmalloc((size_t)m->n_tensors * sizeof(spans[0]));
+static bool accelerator_span_filter_contains(uint64_t off,
+                                             uint64_t bytes,
+                                             const uint64_t *span_offsets,
+                                             const uint64_t *span_sizes,
+                                             uint32_t span_count) {
+    if (span_count == 0) return true;
+    if (bytes == 0) return true;
+    const uint64_t end = off + bytes;
+    if (end < off) return false;
+    for (uint32_t i = 0; i < span_count; i++) {
+        const uint64_t span_end = span_offsets[i] + span_sizes[i];
+        if (span_end < span_offsets[i]) return false;
+        if (off >= span_offsets[i] && end <= span_end) return true;
+    }
+    return false;
+}
+
+static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
+                                                   const uint64_t *span_offsets,
+                                                   const uint64_t *span_sizes,
+                                                   uint32_t span_count,
+                                                   uint64_t *prepared_out) {
+    uint64_t cap = m->n_tensors;
+    if (cap == 0) {
+        if (prepared_out) *prepared_out = 0;
+        return true;
+    }
+
+    accelerator_tensor_span *spans = xmalloc((size_t)cap * sizeof(spans[0]));
     uint64_t nspan = 0;
+    for (uint32_t i = 0; i < span_count; i++) {
+        if (span_offsets[i] > m->size ||
+            span_sizes[i] == 0 ||
+            span_sizes[i] > m->size - span_offsets[i]) {
+            free(spans);
+            return false;
+        }
+    }
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const ds4_tensor *t = &m->tensors[i];
         if (t->bytes == 0) continue;
@@ -1659,9 +1686,8 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
             free(spans);
             return false;
         }
-        /* Routed-expert weights are the only tensors with "_exps." in the
-         * name; memmem is safe on short names (returns NULL). */
-        if (memmem(t->name.ptr, t->name.len, "_exps.", 6) != NULL) {
+        if (!accelerator_span_filter_contains(t->abs_offset, t->bytes,
+                                              span_offsets, span_sizes, span_count)) {
             continue;
         }
         spans[nspan++] = (accelerator_tensor_span){
@@ -1669,91 +1695,131 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
             .end = t->abs_offset + t->bytes,
         };
     }
+    if (nspan == 0) {
+        free(spans);
+        if (prepared_out) *prepared_out = 0;
+        return true;
+    }
+
     qsort(spans, (size_t)nspan, sizeof(spans[0]), accelerator_tensor_span_cmp);
 
     const uint64_t max_span = accelerator_cuda_preload_span_bytes();
-    uint64_t cached = 0;
+    const int tty = ds4_log_is_tty(stderr);
+    const uint64_t progress_step = (tty ? 2ull : 16ull) * 1073741824ull;
+    uint64_t next_progress = progress_step;
+    double last_progress = now_sec();
+    uint64_t prepared = 0;
     uint64_t merged = 0;
+
+    fprintf(stderr, "%sds4: CUDA preparing model tensor mappings%s",
+            tty ? "\r\033[K" : "",
+            tty ? ": 0.00 GiB" : "\n");
+    fflush(stderr);
+
     for (uint64_t i = 0; i < nspan;) {
         uint64_t off = spans[i].off;
         uint64_t end = spans[i].end;
         i++;
-        while (i < nspan && spans[i].off <= end + 65536u && spans[i].end - off <= max_span) {
+        while (i < nspan &&
+               spans[i].off <= end + 65536u &&
+               spans[i].end - off <= max_span) {
             if (spans[i].end > end) end = spans[i].end;
             i++;
         }
-        while (off < end) {
-            uint64_t chunk_end = end;
-            if (chunk_end - off > max_span) chunk_end = off + max_span;
-            char label[96];
-            snprintf(label, sizeof(label), "tensor-span:%" PRIu64, merged);
-            if (ds4_gpu_cache_model_range(m->map, m->size, off, chunk_end - off, label) == 0) {
-                fprintf(stderr,
-                        "ds4: accelerator failed to cache model tensor span %" PRIu64
-                        " at offset %" PRIu64 "\n",
-                        merged, off);
-                free(spans);
-                return false;
+        char label[96];
+        snprintf(label, sizeof(label), "tensor-span:%" PRIu64, merged);
+        if (ds4_gpu_cache_model_range(m->map, m->size, off, end - off, label) == 0) {
+            if (tty) fputc('\n', stderr);
+            fprintf(stderr,
+                    "ds4: accelerator failed to prepare model tensor span %" PRIu64
+                    " at offset %" PRIu64 "\n",
+                    merged, off);
+            free(spans);
+            return false;
+        }
+        prepared += end - off;
+        merged++;
+
+        const double now = now_sec();
+        if (prepared >= next_progress || now - last_progress >= (tty ? 2.0 : 10.0)) {
+            if (tty) {
+                fprintf(stderr, "\r\033[Kds4: CUDA preparing model tensor mappings: %.2f GiB",
+                        (double)prepared / 1073741824.0);
+            } else {
+                fprintf(stderr, "ds4: CUDA prepared model tensor mappings %.2f GiB\n",
+                        (double)prepared / 1073741824.0);
             }
-            cached += chunk_end - off;
-            merged++;
-            off = chunk_end;
+            fflush(stderr);
+            last_progress = now;
+            while (next_progress <= prepared) next_progress += progress_step;
         }
     }
+
+    if (tty) fputc('\n', stderr);
     free(spans);
-    if (cached_out) *cached_out = cached;
+    if (prepared_out) *prepared_out = prepared;
     return true;
 }
-#endif
 
-static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
+static bool accelerator_cache_q8_tensors(const ds4_model *m,
+                                         const uint64_t *span_offsets,
+                                         const uint64_t *span_sizes,
+                                         uint32_t span_count) {
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->bytes == 0) continue;
+        if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) return false;
+        if (!accelerator_span_filter_contains(t->abs_offset, t->bytes,
+                                              span_offsets, span_sizes, span_count)) {
+            continue;
+        }
+        char label[128];
+        snprintf(label, sizeof(label), "tensor:%.*s", (int)t->name.len, t->name.ptr);
+        if (t->type == DS4_TENSOR_Q8_0 && t->ndim == 2 &&
+            ds4_gpu_cache_q8_f16_range(m->map, m->size, t->abs_offset, t->bytes, t->dim[0], t->dim[1], label) == 0) {
+            fprintf(stderr, "ds4: accelerator failed to cache dequantized Q8 tensor %.*s\n",
+                    (int)t->name.len, t->name.ptr);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool accelerator_cache_model_tensors(ds4_backend backend,
+                                            const ds4_model *m,
+                                            const uint64_t *span_offsets,
+                                            const uint64_t *span_sizes,
+                                            uint32_t span_count) {
     if (backend != DS4_BACKEND_CUDA) return true;
     if (!m || !m->map || m->size == 0) return false;
     if (getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
         return true;
     }
 
-#ifdef DS4_CUDA_SPARK_HBM_CACHE
     const double t0 = now_sec();
-    uint64_t cached = 0;
-    if (!accelerator_cache_model_tensor_spans(m, &cached)) return false;
-#else
-    uint64_t cached = 0;
-#endif
-    if (getenv("DS4_CUDA_Q8_F16_PRELOAD") != NULL ||
-        getenv("DS4_CUDA_Q8_F32_PRELOAD") != NULL) {
-        for (uint64_t i = 0; i < m->n_tensors; i++) {
-            const ds4_tensor *t = &m->tensors[i];
-            if (t->bytes == 0) continue;
-            if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) return false;
-            char label[128];
-            snprintf(label, sizeof(label), "tensor:%.*s", (int)t->name.len, t->name.ptr);
-            if (t->type == DS4_TENSOR_Q8_0 && t->ndim == 2 &&
-                ds4_gpu_cache_q8_f16_range(m->map, m->size, t->abs_offset, t->bytes, t->dim[0], t->dim[1], label) == 0) {
-                fprintf(stderr, "ds4: accelerator failed to cache dequantized Q8 tensor %.*s\n",
-                        (int)t->name.len, t->name.ptr);
-                return false;
-            }
-        }
+    uint64_t prepared = 0;
+    if (!accelerator_prepare_model_tensor_spans(m, span_offsets, span_sizes, span_count, &prepared)) {
+        return false;
     }
-#ifdef DS4_CUDA_SPARK_HBM_CACHE
-    if (cached != 0) {
-        const double t1 = now_sec();
-        if (ds4_log_is_tty(stderr)) fputc('\n', stderr);
-        fprintf(stderr,
-                "ds4: CUDA startup model cache prepared %.2f GiB of tensor spans in %.3fs\n",
-                (double)cached / 1073741824.0,
-                t1 - t0);
-    }
-#else
-    (void)cached;
-#endif
+    if (!accelerator_cache_q8_tensors(m, span_offsets, span_sizes, span_count)) return false;
+    const double t1 = now_sec();
+    fprintf(stderr,
+            "ds4: CUDA startup model preparation covered %.2f GiB of tensor spans in %.3fs\n",
+            (double)prepared / 1073741824.0,
+            t1 - t0);
     return true;
 }
 #else
-static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
+static bool accelerator_cache_model_tensors(ds4_backend backend,
+                                            const ds4_model *m,
+                                            const uint64_t *span_offsets,
+                                            const uint64_t *span_sizes,
+                                            uint32_t span_count) {
     (void)backend;
     (void)m;
+    (void)span_offsets;
+    (void)span_sizes;
+    (void)span_count;
     return true;
 }
 #endif
@@ -2174,6 +2240,108 @@ static void ds4_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const bl
         }
         sumf += dall * (float)isum - dmin * (float)summs;
     }
+    *s = sumf;
+#endif
+}
+
+static inline void q4_k_get_scale_min(int j, const uint8_t *q, uint8_t *sc, uint8_t *m) {
+    if (j < 4) {
+        *sc = q[j] & 63;
+        *m  = q[j + 4] & 63;
+    } else {
+        *sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m  = (q[j + 4] >> 4)  | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+static void ds4_vec_dot_q4_K_q8_K(int n, float *s, const block_q4_K *x, const block_q8_K *y) {
+    const int nb = n / QK_K;
+
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    const int32x4_t zero = vdupq_n_s32(0);
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float d  = y[i].d * f16_to_f32(x[i].d);
+        const float dm = -y[i].d * f16_to_f32(x[i].dmin);
+
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *sc = x[i].scales;
+        const int8_t  *q8 = y[i].qs;
+
+        int32_t summs = 0;
+        for (int j = 0; j < QK_K / 32; j++) {
+            uint8_t sc_val, m_val;
+            q4_k_get_scale_min(j, sc, &sc_val, &m_val);
+            int32_t gsum = (int32_t)y[i].bsums[j * 2] + (int32_t)y[i].bsums[j * 2 + 1];
+            summs += m_val * gsum;
+        }
+
+        int isum = 0;
+        for (int j = 0; j < QK_K / 32; j++) {
+            uint8_t sc_val, m_val;
+            q4_k_get_scale_min(j, sc, &sc_val, &m_val);
+
+            const int byte_off = (j >> 1) * 32;
+            const int shift = (j & 1) * 4;
+
+            /* Load 32 q8 values for this group */
+            const int8x16x2_t q8v = vld1q_s8_x2(q8 + j * 32);
+
+            /* Unpack 32 q4 values from 32 bytes at qs[byte_off] with shift */
+            uint8_t q4_u[32];
+            if (shift == 0) {
+                for (int l = 0; l < 32; l++) q4_u[l] = qs[byte_off + l] & 0xF;
+            } else {
+                for (int l = 0; l < 32; l++) q4_u[l] = qs[byte_off + l] >> 4;
+            }
+
+            const int8x16_t q4a = vreinterpretq_s8_u8(vld1q_u8(q4_u));
+            const int8x16_t q4b = vreinterpretq_s8_u8(vld1q_u8(q4_u + 16));
+
+            isum += vaddvq_s32(vdotq_s32(zero, q4a, q8v.val[0])) * sc_val;
+            isum += vaddvq_s32(vdotq_s32(zero, q4b, q8v.val[1])) * sc_val;
+        }
+
+        sumf += d * (float)isum + dm * (float)summs;
+    }
+
+    *s = sumf;
+#else
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float d  = y[i].d * f16_to_f32(x[i].d);
+        const float dm = -y[i].d * f16_to_f32(x[i].dmin);
+
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *sc = x[i].scales;
+        const int8_t  *q8 = y[i].qs;
+
+        int summs = 0;
+        for (int j = 0; j < QK_K / 32; j++) {
+            uint8_t sc_val, m_val;
+            q4_k_get_scale_min(j, sc, &sc_val, &m_val);
+            int32_t gsum = (int32_t)y[i].bsums[j * 2] + (int32_t)y[i].bsums[j * 2 + 1];
+            summs += m_val * gsum;
+        }
+
+        int isum = 0;
+        for (int j = 0; j < QK_K / 32; j++) {
+            uint8_t sc_val, m_val;
+            q4_k_get_scale_min(j, sc, &sc_val, &m_val);
+
+            const int byte_off = (j >> 1) * 32;
+            const int shift = (j & 1) * 4;
+
+            for (int l = 0; l < 32; l++) {
+                isum += ((qs[byte_off + l] >> shift) & 0xF) * (int)q8[j * 32 + l] * sc_val;
+            }
+        }
+
+        sumf += d * (float)isum + dm * (float)summs;
+    }
+
     *s = sumf;
 #endif
 }
@@ -4735,6 +4903,354 @@ static void matvec_q2_k_batch_accum_rows_worker(void *vctx, uint64_t row0, uint6
     }
 }
 
+/* =========================================================================
+ * Q4_K routed expert matrix-vector products.
+ * ========================================================================= */
+
+typedef struct {
+    float *mid;
+    const uint8_t *gate_base[DS4_MAX_EXPERT_USED];
+    const uint8_t *up_base[DS4_MAX_EXPERT_USED];
+    const block_q8_K *xq;
+    float expert_weight[DS4_MAX_EXPERT_USED];
+    float clamp;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    uint64_t gate_row_bytes[DS4_MAX_EXPERT_USED];
+    uint64_t up_row_bytes[DS4_MAX_EXPERT_USED];
+    int n_expert;
+} matvec_q4_k_mid_ctx;
+
+static void matvec_q4_k_mid_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    matvec_q4_k_mid_ctx *ctx = vctx;
+
+    for (uint64_t idx = row0; idx < row1; idx++) {
+        const int slot = (int)(idx / ctx->out_dim);
+        const uint64_t row = idx - (uint64_t)slot * ctx->out_dim;
+        float gate = 0.0f;
+        float up = 0.0f;
+
+        const block_q4_K *gate_row = (const block_q4_K *)(ctx->gate_base[slot] + row * ctx->gate_row_bytes[slot]);
+        ds4_vec_dot_q4_K_q8_K((int)ctx->in_dim, &gate, gate_row, ctx->xq);
+
+        const block_q4_K *up_row = (const block_q4_K *)(ctx->up_base[slot] + row * ctx->up_row_bytes[slot]);
+        ds4_vec_dot_q4_K_q8_K((int)ctx->in_dim, &up, up_row, ctx->xq);
+
+        if (ctx->clamp > 1.0e-6f) {
+            if (gate > ctx->clamp) gate = ctx->clamp;
+            if (up > ctx->clamp) up = ctx->clamp;
+            if (up < -ctx->clamp) up = -ctx->clamp;
+        }
+        ctx->mid[idx] = silu(gate) * up * ctx->expert_weight[slot];
+    }
+}
+
+static void matvec_q4_k_experts_mid_prequant(
+        float            *mid,
+        const ds4_model  *m,
+        const ds4_tensor *gate_w,
+        const ds4_tensor *up_w,
+        const block_q8_K *xq,
+        const int        *selected,
+        const float      *expert_weight,
+        int               n_expert,
+        float             clamp) {
+    if (gate_w->type != DS4_TENSOR_Q4_K || up_w->type != DS4_TENSOR_Q4_K)
+        ds4_die("expected Q4_K expert tensors");
+    if (n_expert < 1 || (uint32_t)n_expert > DS4_N_EXPERT_USED) ds4_die("unexpected routed expert count");
+
+    uint64_t in_dim0 = 0;
+    uint64_t out_dim0 = 0;
+    matvec_q4_k_mid_ctx ctx = {
+        .mid = mid,
+        .xq = xq,
+        .clamp = clamp,
+        .n_expert = n_expert,
+    };
+
+    for (int i = 0; i < n_expert; i++) {
+        uint64_t gate_in_dim, gate_out_dim;
+        uint64_t up_in_dim, up_out_dim;
+        ctx.gate_base[i] = tensor_expert_bytes(m, gate_w, (uint32_t)selected[i],
+                                               &gate_in_dim, &gate_out_dim, &ctx.gate_row_bytes[i]);
+        ctx.up_base[i] = tensor_expert_bytes(m, up_w, (uint32_t)selected[i],
+                                             &up_in_dim, &up_out_dim, &ctx.up_row_bytes[i]);
+        if (gate_in_dim != up_in_dim || gate_out_dim != up_out_dim) {
+            ds4_die("paired Q4_K expert tensors do not match");
+        }
+        if (i == 0) {
+            in_dim0 = gate_in_dim;
+            out_dim0 = gate_out_dim;
+        } else if (gate_in_dim != in_dim0 || gate_out_dim != out_dim0) {
+            ds4_die("Q4_K expert tensors do not share a layout");
+        }
+        ctx.expert_weight[i] = expert_weight[i];
+    }
+    if (in_dim0 % QK_K != 0) ds4_die("Q4_K expert row is not QK_K aligned");
+
+    ctx.in_dim = in_dim0;
+    ctx.out_dim = out_dim0;
+    ds4_parallel_for((uint64_t)n_expert * out_dim0, matvec_q4_k_mid_worker, &ctx);
+}
+
+typedef struct {
+    float *out;
+    const uint8_t *base[DS4_MAX_EXPERT_USED];
+    const block_q8_K *xq[DS4_MAX_EXPERT_USED];
+    uint64_t in_dim;
+    uint64_t row_bytes[DS4_MAX_EXPERT_USED];
+    int n_expert;
+} matvec_q4_k_accum_ctx;
+
+static void matvec_q4_k_accum_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    matvec_q4_k_accum_ctx *ctx = vctx;
+
+    for (uint64_t row = row0; row < row1; row++) {
+        float acc = 0.0f;
+        for (int i = 0; i < ctx->n_expert; i++) {
+            float v = 0.0f;
+            const block_q4_K *br = (const block_q4_K *)(ctx->base[i] + row * ctx->row_bytes[i]);
+            ds4_vec_dot_q4_K_q8_K((int)ctx->in_dim, &v, br, ctx->xq[i]);
+            acc += v;
+        }
+        ctx->out[row] = acc;
+    }
+}
+
+static void matvec_q4_k_experts_accum_prequant(
+        float            *out,
+        const ds4_model  *m,
+        const ds4_tensor *w,
+        const block_q8_K *xq,
+        const int        *selected,
+        int               n_expert) {
+    if (w->type != DS4_TENSOR_Q4_K) ds4_die("expected a Q4_K expert tensor");
+    if (n_expert < 1 || (uint32_t)n_expert > DS4_N_EXPERT_USED) ds4_die("unexpected routed expert count");
+
+    uint64_t in_dim0 = 0;
+    uint64_t out_dim0 = 0;
+    const uint8_t *base[DS4_MAX_EXPERT_USED];
+    uint64_t row_bytes[DS4_MAX_EXPERT_USED];
+
+    for (int i = 0; i < n_expert; i++) {
+        uint64_t in_dim, out_dim;
+        base[i] = tensor_expert_bytes(m, w, (uint32_t)selected[i], &in_dim, &out_dim, &row_bytes[i]);
+        if (i == 0) {
+            in_dim0 = in_dim;
+            out_dim0 = out_dim;
+        } else if (in_dim != in_dim0 || out_dim != out_dim0) {
+            ds4_die("Q4_K expert tensors do not share a layout");
+        }
+    }
+    if (in_dim0 % QK_K != 0) ds4_die("Q4_K expert row is not QK_K aligned");
+
+    const uint64_t n_blocks = in_dim0 / QK_K;
+    matvec_q4_k_accum_ctx ctx = {
+        .out = out,
+        .in_dim = in_dim0,
+        .n_expert = n_expert,
+    };
+    for (int i = 0; i < n_expert; i++) {
+        ctx.base[i] = base[i];
+        ctx.row_bytes[i] = row_bytes[i];
+        ctx.xq[i] = xq + (uint64_t)i * n_blocks;
+    }
+
+    ds4_parallel_for(out_dim0, matvec_q4_k_accum_worker, &ctx);
+}
+
+/* Q4_K batch mid worker: same structure as IQ2_XXS batch but uses Q4_K dot. */
+typedef struct {
+    float *mid;
+    const uint8_t *gate_base[DS4_MAX_EXPERT];
+    const uint8_t *up_base[DS4_MAX_EXPERT];
+    const block_q8_K *xq;
+    const ds4_expert_pair *pairs;
+    const uint32_t *pair_ids;
+    const uint32_t *expert_offset;
+    const uint32_t *active_expert;
+    const float *pair_weight;
+    float clamp;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    uint64_t gate_row_bytes[DS4_MAX_EXPERT];
+    uint64_t up_row_bytes[DS4_MAX_EXPERT];
+    uint64_t xq_blocks;
+} matvec_q4_k_batch_mid_ctx;
+
+static void matvec_q4_k_batch_mid_worker(void *vctx, uint64_t task0, uint64_t task1) {
+    matvec_q4_k_batch_mid_ctx *ctx = vctx;
+
+    for (uint64_t task = task0; task < task1; task++) {
+        const uint32_t active_idx = (uint32_t)(task / ctx->out_dim);
+        const uint64_t row = task - (uint64_t)active_idx * ctx->out_dim;
+        const uint32_t expert = ctx->active_expert[active_idx];
+        const uint32_t begin = ctx->expert_offset[expert];
+        const uint32_t end = ctx->expert_offset[expert + 1];
+
+        const block_q4_K *gate_row = (const block_q4_K *)(ctx->gate_base[expert] + row * ctx->gate_row_bytes[expert]);
+        const block_q4_K *up_row = (const block_q4_K *)(ctx->up_base[expert] + row * ctx->up_row_bytes[expert]);
+
+        for (uint32_t i = begin; i < end; i++) {
+            const uint32_t pair_id = ctx->pair_ids[i];
+            const ds4_expert_pair pair = ctx->pairs[pair_id];
+            const block_q8_K *xq = ctx->xq + (uint64_t)pair.token * ctx->xq_blocks;
+            float gate = 0.0f;
+            float up = 0.0f;
+
+            ds4_vec_dot_q4_K_q8_K((int)ctx->in_dim, &gate, gate_row, xq);
+            ds4_vec_dot_q4_K_q8_K((int)ctx->in_dim, &up, up_row, xq);
+
+            if (ctx->clamp > 1.0e-6f) {
+                if (gate > ctx->clamp) gate = ctx->clamp;
+                if (up > ctx->clamp) up = ctx->clamp;
+                if (up < -ctx->clamp) up = -ctx->clamp;
+            }
+
+            ctx->mid[(uint64_t)pair_id * ctx->out_dim + row] = silu(gate) * up * ctx->pair_weight[pair_id];
+        }
+    }
+}
+
+/* Q4_K batch down accum worker: same structure as Q2_K batch but uses Q4_K dot. */
+typedef struct {
+    float *moe;
+    const uint8_t *base[DS4_MAX_EXPERT];
+    const block_q8_K *midq;
+    const ds4_expert_pair *pairs;
+    const uint32_t *pair_ids;
+    const uint32_t *expert_offset;
+    const uint32_t *active_expert;
+    uint32_t n_active;
+    uint32_t n_tok;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    uint64_t row_bytes[DS4_MAX_EXPERT];
+    uint64_t midq_blocks;
+} matvec_q4_k_batch_accum_rows_ctx;
+
+static void matvec_q4_k_batch_accum_rows_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    matvec_q4_k_batch_accum_rows_ctx *ctx = vctx;
+
+    for (uint64_t row = row0; row < row1; row++) {
+        for (uint32_t t = 0; t < ctx->n_tok; t++) {
+            ctx->moe[(uint64_t)t * ctx->out_dim + row] = 0.0f;
+        }
+
+        for (uint32_t ai = 0; ai < ctx->n_active; ai++) {
+            const uint32_t expert = ctx->active_expert[ai];
+            const uint32_t begin = ctx->expert_offset[expert];
+            const uint32_t end = ctx->expert_offset[expert + 1];
+            const block_q4_K *br = (const block_q4_K *)(ctx->base[expert] + row * ctx->row_bytes[expert]);
+
+            for (uint32_t i = begin; i < end; i++) {
+                const uint32_t pair_id = ctx->pair_ids[i];
+                const ds4_expert_pair pair = ctx->pairs[pair_id];
+                const block_q8_K *xq = ctx->midq + (uint64_t)pair_id * ctx->midq_blocks;
+                float v = 0.0f;
+
+                ds4_vec_dot_q4_K_q8_K((int)ctx->in_dim, &v, br, xq);
+                ctx->moe[(uint64_t)pair.token * ctx->out_dim + row] += v;
+            }
+        }
+    }
+}
+
+/* Dispatch: call the right gate/up mid builder based on tensor type. */
+static void matvec_experts_mid_prequant(
+        float            *mid,
+        const ds4_model  *m,
+        const ds4_tensor *gate_w,
+        const ds4_tensor *up_w,
+        const block_q8_K *xq,
+        const int        *selected,
+        const float      *expert_weight,
+        int               n_expert,
+        float             clamp) {
+    if (gate_w->type == DS4_TENSOR_IQ2_XXS) {
+        matvec_iq2_xxs_experts_mid_prequant(mid, m, gate_w, up_w, xq,
+                                            selected, expert_weight, n_expert, clamp);
+    } else if (gate_w->type == DS4_TENSOR_Q4_K) {
+        matvec_q4_k_experts_mid_prequant(mid, m, gate_w, up_w, xq,
+                                         selected, expert_weight, n_expert, clamp);
+    } else {
+        ds4_die("unsupported gate/up expert tensor type");
+    }
+}
+
+/* Dispatch: call the right down-projection accumulator based on tensor type. */
+static void matvec_experts_down_accum_prequant(
+        float            *out,
+        const ds4_model  *m,
+        const ds4_tensor *w,
+        const block_q8_K *xq,
+        const int        *selected,
+        int               n_expert) {
+    if (w->type == DS4_TENSOR_Q2_K) {
+        matvec_q2_k_experts_accum_prequant(out, m, w, xq, selected, n_expert);
+    } else if (w->type == DS4_TENSOR_Q4_K) {
+        matvec_q4_k_experts_accum_prequant(out, m, w, xq, selected, n_expert);
+    } else {
+        ds4_die("unsupported down expert tensor type");
+    }
+}
+
+/* Dispatch: single-expert gate/up pair for tracing. */
+static void matvec_expert_pair_prequant(
+        float            *out0,
+        float            *out1,
+        const ds4_model  *m,
+        const ds4_tensor *w0,
+        const ds4_tensor *w1,
+        const block_q8_K *xq,
+        uint32_t          expert) {
+    if (w0->type == DS4_TENSOR_IQ2_XXS) {
+        matvec_iq2_xxs_expert_pair_prequant(out0, out1, m, w0, w1, xq, expert);
+    } else if (w0->type == DS4_TENSOR_Q4_K) {
+        uint64_t in_dim0, out_dim0, rb0;
+        uint64_t in_dim1, out_dim1, rb1;
+        const uint8_t *base0 = tensor_expert_bytes(m, w0, expert, &in_dim0, &out_dim0, &rb0);
+        const uint8_t *base1 = tensor_expert_bytes(m, w1, expert, &in_dim1, &out_dim1, &rb1);
+        if (in_dim0 != in_dim1 || out_dim0 != out_dim1) ds4_die("paired Q4_K expert tensors do not match");
+
+        for (uint64_t row = 0; row < out_dim0; row++) {
+            const block_q4_K *gr = (const block_q4_K *)(base0 + row * rb0);
+            ds4_vec_dot_q4_K_q8_K((int)in_dim0, &out0[row], gr, xq);
+            const block_q4_K *ur = (const block_q4_K *)(base1 + row * rb1);
+            ds4_vec_dot_q4_K_q8_K((int)in_dim0, &out1[row], ur, xq);
+        }
+    } else {
+        ds4_die("unsupported gate/up expert tensor type");
+    }
+}
+
+/* Dispatch: single-expert down projection for tracing. */
+static void matvec_expert_down(
+        float            *out,
+        const ds4_model  *m,
+        const ds4_tensor *w,
+        const float      *x,
+        uint32_t          expert) {
+    if (w->type == DS4_TENSOR_Q2_K) {
+        matvec_q2_k_expert(out, m, w, x, expert);
+    } else if (w->type == DS4_TENSOR_Q4_K) {
+        uint64_t in_dim, out_dim, row_bytes;
+        const uint8_t *base = tensor_expert_bytes(m, w, expert, &in_dim, &out_dim, &row_bytes);
+        if (in_dim % QK_K != 0) ds4_die("Q4_K expert row is not QK_K aligned");
+
+        block_q8_K *xq = xmalloc((size_t)(in_dim / QK_K) * sizeof(xq[0]));
+        ds4_quantize_row_q8_K(x, xq, (int64_t)in_dim);
+
+        for (uint64_t row = 0; row < out_dim; row++) {
+            const block_q4_K *br = (const block_q4_K *)(base + row * row_bytes);
+            ds4_vec_dot_q4_K_q8_K((int)in_dim, &out[row], br, xq);
+        }
+        free(xq);
+    } else {
+        ds4_die("unsupported down expert tensor type");
+    }
+}
+
 typedef struct {
     float *moe;
     const float *down_pair;
@@ -5891,8 +6407,8 @@ static void layer_routed_moe_one(
     float *down = trace ? xmalloc((size_t)DS4_N_EMBD * sizeof(down[0])) : NULL;
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
-    if (expert_in_dim % QK_K != 0) ds4_die("IQ2_XXS expert input is not QK_K aligned");
-    if (down_in_dim != DS4_N_FF_EXP || down_in_dim % QK_K != 0) ds4_die("Q2_K expert input has an unexpected layout");
+    if (expert_in_dim % QK_K != 0) ds4_die("routed expert input is not QK_K aligned");
+    if (down_in_dim != DS4_N_FF_EXP || down_in_dim % QK_K != 0) ds4_die("routed expert down input has an unexpected layout");
     block_q8_K *xq = xmalloc((size_t)(expert_in_dim / QK_K) * sizeof(xq[0]));
     block_q8_K *midq = trace ? NULL : xmalloc((size_t)DS4_N_EXPERT_USED * (down_in_dim / QK_K) * sizeof(midq[0]));
 
@@ -5907,29 +6423,29 @@ static void layer_routed_moe_one(
     }
 
     if (!trace) {
-        matvec_iq2_xxs_experts_mid_prequant(mid_all, model,
-                                            layer->ffn_gate_exps,
-                                            layer->ffn_up_exps,
-                                            xq,
-                                            selected,
-                                            expert_weight,
-                                            DS4_N_EXPERT_USED,
-                                            clamp);
+        matvec_experts_mid_prequant(mid_all, model,
+                                    layer->ffn_gate_exps,
+                                    layer->ffn_up_exps,
+                                    xq,
+                                    selected,
+                                    expert_weight,
+                                    DS4_N_EXPERT_USED,
+                                    clamp);
         for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
             ds4_quantize_row_q8_K(mid_all + (uint64_t)i * down_in_dim,
                                   midq + (uint64_t)i * (down_in_dim / QK_K),
                                   (int64_t)down_in_dim);
         }
-        matvec_q2_k_experts_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, DS4_N_EXPERT_USED);
+        matvec_experts_down_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, DS4_N_EXPERT_USED);
     } else {
         for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
             const uint32_t expert = (uint32_t)selected[i];
 
-            matvec_iq2_xxs_expert_pair_prequant(gate, up, model,
-                                                 layer->ffn_gate_exps,
-                                                 layer->ffn_up_exps,
-                                                 xq,
-                                                 expert);
+            matvec_expert_pair_prequant(gate, up, model,
+                                        layer->ffn_gate_exps,
+                                        layer->ffn_up_exps,
+                                        xq,
+                                        expert);
             char name[64];
             snprintf(name, sizeof(name), "blk.%u expert %u gate", il, expert);
             print_vec_stats(name, gate, DS4_N_FF_EXP);
@@ -5953,7 +6469,7 @@ static void layer_routed_moe_one(
             snprintf(name, sizeof(name), "blk.%u expert %u mid", il, expert);
             print_vec_stats(name, mid, DS4_N_FF_EXP);
 
-            matvec_q2_k_expert(down, model, layer->ffn_down_exps, mid, expert);
+            matvec_expert_down(down, model, layer->ffn_down_exps, mid, expert);
             snprintf(name, sizeof(name), "blk.%u expert %u down", il, expert);
             print_vec_stats(name, down, DS4_N_EMBD);
             for (uint32_t j = 0; j < DS4_N_EMBD; j++) out[j] += down[j];
@@ -5987,8 +6503,8 @@ static void layer_routed_moe_one_prealloc(
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
 
-    if (expert_in_dim % QK_K != 0) ds4_die("IQ2_XXS expert input is not QK_K aligned");
-    if (down_in_dim != DS4_N_FF_EXP || down_in_dim % QK_K != 0) ds4_die("Q2_K expert input has an unexpected layout");
+    if (expert_in_dim % QK_K != 0) ds4_die("routed expert input is not QK_K aligned");
+    if (down_in_dim != DS4_N_FF_EXP || down_in_dim % QK_K != 0) ds4_die("routed expert down input has an unexpected layout");
 
     memset(out, 0, (size_t)DS4_N_EMBD * sizeof(out[0]));
     ds4_quantize_row_q8_K(x, xq, (int64_t)expert_in_dim);
@@ -6000,21 +6516,21 @@ static void layer_routed_moe_one_prealloc(
         layer_topk_selected_experts(selected, expert_weight, model, layer, x);
     }
 
-    matvec_iq2_xxs_experts_mid_prequant(mid_all, model,
-                                        layer->ffn_gate_exps,
-                                        layer->ffn_up_exps,
-                                        xq,
-                                        selected,
-                                        expert_weight,
-                                        DS4_N_EXPERT_USED,
-                                        clamp);
+    matvec_experts_mid_prequant(mid_all, model,
+                                layer->ffn_gate_exps,
+                                layer->ffn_up_exps,
+                                xq,
+                                selected,
+                                expert_weight,
+                                DS4_N_EXPERT_USED,
+                                clamp);
 
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
         ds4_quantize_row_q8_K(mid_all + (uint64_t)i * down_in_dim,
                               midq + (uint64_t)i * (down_in_dim / QK_K),
                               (int64_t)down_in_dim);
     }
-    matvec_q2_k_experts_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, DS4_N_EXPERT_USED);
+    matvec_experts_down_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, DS4_N_EXPERT_USED);
 
     (void)il;
 }
@@ -6034,8 +6550,8 @@ static void layer_routed_moe_batch(
     const uint64_t expert_out_dim = layer->ffn_gate_exps->dim[1];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
     const uint64_t down_out_dim = layer->ffn_down_exps->dim[1];
-    if (expert_in_dim % QK_K != 0) ds4_die("IQ2_XXS expert input is not QK_K aligned");
-    if (down_in_dim % QK_K != 0) ds4_die("Q2_K expert input is not QK_K aligned");
+    if (expert_in_dim % QK_K != 0) ds4_die("routed expert input is not QK_K aligned");
+    if (down_in_dim % QK_K != 0) ds4_die("routed expert down input is not QK_K aligned");
     if (expert_out_dim != down_in_dim || down_out_dim != DS4_N_EMBD) {
         ds4_die("routed expert tensor layout is unexpected");
     }
@@ -6090,35 +6606,72 @@ static void layer_routed_moe_batch(
 
     float *mid = xmalloc((size_t)total_pairs * expert_out_dim * sizeof(mid[0]));
 
-    matvec_iq2_xxs_batch_mid_ctx mid_ctx = {
-        .mid = mid,
-        .xq = xq,
-        .pairs = pairs,
-        .pair_ids = pair_ids,
-        .expert_offset = counts,
-        .active_expert = active_expert,
-        .pair_weight = pair_weight,
-        .clamp = clamp,
-        .in_dim = expert_in_dim,
-        .out_dim = expert_out_dim,
-        .xq_blocks = xq_blocks,
-    };
+    const uint32_t gate_type = layer->ffn_gate_exps->type;
 
-    for (uint32_t ai = 0; ai < n_active; ai++) {
-        const uint32_t e = active_expert[ai];
-        uint64_t gate_in_dim, gate_out_dim;
-        uint64_t up_in_dim, up_out_dim;
-        mid_ctx.gate_base[e] = tensor_expert_bytes(model, layer->ffn_gate_exps, e,
-                                                   &gate_in_dim, &gate_out_dim, &mid_ctx.gate_row_bytes[e]);
-        mid_ctx.up_base[e] = tensor_expert_bytes(model, layer->ffn_up_exps, e,
-                                                 &up_in_dim, &up_out_dim, &mid_ctx.up_row_bytes[e]);
-        if (gate_in_dim != expert_in_dim || up_in_dim != expert_in_dim ||
-            gate_out_dim != expert_out_dim || up_out_dim != expert_out_dim) {
-            ds4_die("IQ2_XXS batch expert tensor layout mismatch");
+    /* Build mid vectors: dispatch based on gate/up tensor type. */
+    if (gate_type == DS4_TENSOR_IQ2_XXS) {
+        matvec_iq2_xxs_batch_mid_ctx mid_ctx = {
+            .mid = mid,
+            .xq = xq,
+            .pairs = pairs,
+            .pair_ids = pair_ids,
+            .expert_offset = counts,
+            .active_expert = active_expert,
+            .pair_weight = pair_weight,
+            .clamp = clamp,
+            .in_dim = expert_in_dim,
+            .out_dim = expert_out_dim,
+            .xq_blocks = xq_blocks,
+        };
+
+        for (uint32_t ai = 0; ai < n_active; ai++) {
+            const uint32_t e = active_expert[ai];
+            uint64_t gate_in_dim, gate_out_dim;
+            uint64_t up_in_dim, up_out_dim;
+            mid_ctx.gate_base[e] = tensor_expert_bytes(model, layer->ffn_gate_exps, e,
+                                                       &gate_in_dim, &gate_out_dim, &mid_ctx.gate_row_bytes[e]);
+            mid_ctx.up_base[e] = tensor_expert_bytes(model, layer->ffn_up_exps, e,
+                                                     &up_in_dim, &up_out_dim, &mid_ctx.up_row_bytes[e]);
+            if (gate_in_dim != expert_in_dim || up_in_dim != expert_in_dim ||
+                gate_out_dim != expert_out_dim || up_out_dim != expert_out_dim) {
+                ds4_die("batch expert tensor layout mismatch");
+            }
         }
-    }
 
-    ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_iq2_xxs_batch_mid_worker, &mid_ctx);
+        ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_iq2_xxs_batch_mid_worker, &mid_ctx);
+    } else if (gate_type == DS4_TENSOR_Q4_K) {
+        matvec_q4_k_batch_mid_ctx mid_ctx = {
+            .mid = mid,
+            .xq = xq,
+            .pairs = pairs,
+            .pair_ids = pair_ids,
+            .expert_offset = counts,
+            .active_expert = active_expert,
+            .pair_weight = pair_weight,
+            .clamp = clamp,
+            .in_dim = expert_in_dim,
+            .out_dim = expert_out_dim,
+            .xq_blocks = xq_blocks,
+        };
+
+        for (uint32_t ai = 0; ai < n_active; ai++) {
+            const uint32_t e = active_expert[ai];
+            uint64_t gate_in_dim, gate_out_dim;
+            uint64_t up_in_dim, up_out_dim;
+            mid_ctx.gate_base[e] = tensor_expert_bytes(model, layer->ffn_gate_exps, e,
+                                                       &gate_in_dim, &gate_out_dim, &mid_ctx.gate_row_bytes[e]);
+            mid_ctx.up_base[e] = tensor_expert_bytes(model, layer->ffn_up_exps, e,
+                                                     &up_in_dim, &up_out_dim, &mid_ctx.up_row_bytes[e]);
+            if (gate_in_dim != expert_in_dim || up_in_dim != expert_in_dim ||
+                gate_out_dim != expert_out_dim || up_out_dim != expert_out_dim) {
+                ds4_die("batch expert tensor layout mismatch");
+            }
+        }
+
+        ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_q4_k_batch_mid_worker, &mid_ctx);
+    } else {
+        ds4_die("unsupported gate/up expert tensor type for batch");
+    }
 
     const uint64_t midq_blocks = down_in_dim / QK_K;
     block_q8_K *midq = xmalloc((size_t)total_pairs * midq_blocks * sizeof(midq[0]));
@@ -6131,31 +6684,64 @@ static void layer_routed_moe_batch(
     ds4_parallel_for(total_pairs, quantize_mid_pairs_worker, &quant_ctx);
     free(mid);
 
-    matvec_q2_k_batch_accum_rows_ctx down_ctx = {
-        .moe = moe,
-        .midq = midq,
-        .pairs = pairs,
-        .pair_ids = pair_ids,
-        .expert_offset = counts,
-        .active_expert = active_expert,
-        .n_active = n_active,
-        .n_tok = n_tok,
-        .in_dim = down_in_dim,
-        .out_dim = down_out_dim,
-        .midq_blocks = midq_blocks,
-    };
+    /* Down projection: dispatch based on down tensor type. */
+    const uint32_t down_type = layer->ffn_down_exps->type;
 
-    for (uint32_t ai = 0; ai < n_active; ai++) {
-        const uint32_t e = active_expert[ai];
-        uint64_t in_dim, out_dim;
-        down_ctx.base[e] = tensor_expert_bytes(model, layer->ffn_down_exps, e,
-                                               &in_dim, &out_dim, &down_ctx.row_bytes[e]);
-        if (in_dim != down_in_dim || out_dim != down_out_dim) {
-            ds4_die("Q2_K batch expert tensor layout mismatch");
+    if (down_type == DS4_TENSOR_Q2_K) {
+        matvec_q2_k_batch_accum_rows_ctx down_ctx = {
+            .moe = moe,
+            .midq = midq,
+            .pairs = pairs,
+            .pair_ids = pair_ids,
+            .expert_offset = counts,
+            .active_expert = active_expert,
+            .n_active = n_active,
+            .n_tok = n_tok,
+            .in_dim = down_in_dim,
+            .out_dim = down_out_dim,
+            .midq_blocks = midq_blocks,
+        };
+
+        for (uint32_t ai = 0; ai < n_active; ai++) {
+            const uint32_t e = active_expert[ai];
+            uint64_t in_dim, out_dim;
+            down_ctx.base[e] = tensor_expert_bytes(model, layer->ffn_down_exps, e,
+                                                   &in_dim, &out_dim, &down_ctx.row_bytes[e]);
+            if (in_dim != down_in_dim || out_dim != down_out_dim) {
+                ds4_die("batch expert tensor layout mismatch");
+            }
         }
-    }
 
-    ds4_parallel_for(down_out_dim, matvec_q2_k_batch_accum_rows_worker, &down_ctx);
+        ds4_parallel_for(down_out_dim, matvec_q2_k_batch_accum_rows_worker, &down_ctx);
+    } else if (down_type == DS4_TENSOR_Q4_K) {
+        matvec_q4_k_batch_accum_rows_ctx down_ctx = {
+            .moe = moe,
+            .midq = midq,
+            .pairs = pairs,
+            .pair_ids = pair_ids,
+            .expert_offset = counts,
+            .active_expert = active_expert,
+            .n_active = n_active,
+            .n_tok = n_tok,
+            .in_dim = down_in_dim,
+            .out_dim = down_out_dim,
+            .midq_blocks = midq_blocks,
+        };
+
+        for (uint32_t ai = 0; ai < n_active; ai++) {
+            const uint32_t e = active_expert[ai];
+            uint64_t in_dim, out_dim;
+            down_ctx.base[e] = tensor_expert_bytes(model, layer->ffn_down_exps, e,
+                                                   &in_dim, &out_dim, &down_ctx.row_bytes[e]);
+            if (in_dim != down_in_dim || out_dim != down_out_dim) {
+                ds4_die("batch expert tensor layout mismatch");
+            }
+        }
+
+        ds4_parallel_for(down_out_dim, matvec_q4_k_batch_accum_rows_worker, &down_ctx);
+    } else {
+        ds4_die("unsupported down expert tensor type for batch");
+    }
 
     free(midq);
     free(pair_ids);
@@ -15794,6 +16380,28 @@ void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens) {
     bpe_tokenize_text(&e->vocab, DS4_REASONING_EFFORT_MAX_PREFIX, tokens);
 }
 
+static void bpe_tokenize_tool_result_text(ds4_vocab *vocab, const char *content, token_vec *out) {
+    /* Tool output is plain data inside <tool_result>...</tool_result>.
+     * Preserve literal '<', '>' and '&' so shell output and file snippets stay
+     * intact, but escape the exact closing sentinel so a malicious or accidental
+     * tool payload cannot terminate the wrapper early. */
+    const char *end = "</tool_result>";
+    const size_t endlen = strlen(end);
+    const char *span = content ? content : "";
+    const char *p = span;
+    while (*p) {
+        if (!strncmp(p, end, endlen)) {
+            tokenize_span(vocab, span, (size_t)(p - span), out);
+            bpe_tokenize_text(vocab, "&lt;", out);
+            p++;
+            span = p;
+        } else {
+            p++;
+        }
+    }
+    tokenize_span(vocab, span, (size_t)(p - span), out);
+}
+
 void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role, const char *content) {
     ds4_vocab *vocab = &e->vocab;
     if (!role) role = "user";
@@ -15807,11 +16415,13 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
             token_vec_push(tokens, vocab->think_end_id);
         }
         bpe_tokenize_text(vocab, content, tokens);
+    } else if (!strcmp(role, "tool") || !strcmp(role, "function")) {
+        token_vec_push(tokens, vocab->user_id);
+        bpe_tokenize_text(vocab, "<tool_result>", tokens);
+        bpe_tokenize_tool_result_text(vocab, content, tokens);
+        bpe_tokenize_text(vocab, "</tool_result>", tokens);
     } else {
         token_vec_push(tokens, vocab->user_id);
-        if (!strcmp(role, "tool") || !strcmp(role, "function")) {
-            bpe_tokenize_text(vocab, "Tool: ", tokens);
-        }
         bpe_tokenize_text(vocab, content, tokens);
     }
 }
@@ -19048,6 +19658,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         ds4_gpu_set_quality(e->quality);
         (void)ds4_gpu_set_model_fd(e->model.fd);
         int model_map_ok = 0;
+        uint64_t *load_offsets = NULL;
+        uint64_t *load_sizes = NULL;
+        uint32_t load_span_count = 0;
         if (load_slice) {
             char load_end[32];
             if (load_output && load_layer_end == UINT32_MAX) {
@@ -19080,6 +19693,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 sizes[i] = spans.v[i].end - spans.v[i].off;
                 span_bytes += sizes[i];
             }
+            load_offsets = offsets;
+            load_sizes = sizes;
+            load_span_count = spans.len;
             fprintf(stderr,
                     "ds4: restricting %s model map to layers %u:%s (%u spans, %.2f GiB tensor span)\n",
                     ds4_backend_name(e->backend),
@@ -19089,12 +19705,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                     (double)span_bytes / 1073741824.0);
             model_map_ok = ds4_gpu_set_model_map_spans(e->model.map,
                                                         e->model.size,
-                                                        offsets,
-                                                        sizes,
-                                                        spans.len,
+                                                        load_offsets,
+                                                        load_sizes,
+                                                        load_span_count,
                                                         spans.max_tensor_bytes);
-            free(offsets);
-            free(sizes);
             free(spans.v);
         } else {
             model_map_ok = ds4_gpu_set_model_map_range(e->model.map,
@@ -19108,6 +19722,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                     "ds4: %s failed to map model views; aborting startup. "
                     "This is commonly caused by insufficient memory or accelerator VM budget.\n",
                     ds4_backend_name(e->backend));
+            free(load_offsets);
+            free(load_sizes);
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -19123,24 +19739,30 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                     "ds4: %s failed to map MTP model views; aborting startup. "
                     "This is commonly caused by insufficient memory or accelerator VM budget.\n",
                     ds4_backend_name(e->backend));
+            free(load_offsets);
+            free(load_sizes);
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
-        if (!accelerator_cache_model_tensors(e->backend, &e->model)) {
-            fprintf(stderr, "ds4: %s failed to prepare startup model cache\n",
+        if (!accelerator_cache_model_tensors(e->backend, &e->model,
+                                             load_offsets, load_sizes,
+                                             load_span_count)) {
+            fprintf(stderr, "ds4: %s failed to prepare optional model cache\n",
                     ds4_backend_name(e->backend));
+            free(load_offsets);
+            free(load_sizes);
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
-        /* Also populate the HBM cache for the MTP support model when loaded.
-         * Without this, MTP-block tensor reads at decode time hit the UVA-
-         * mapped pointer (slow) instead of cudaMalloc'd HBM copies (fast).
-         * The MoE expert filter in accelerator_cache_model_tensor_spans
-         * skips `mtp.0.ffn_*_exps.weight` automatically. */
-        if (e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->mtp_model)) {
-            fprintf(stderr, "ds4: %s failed to prepare MTP startup model cache\n",
+        free(load_offsets);
+        free(load_sizes);
+        /* Also apply explicit optional Q8 preload settings to the MTP support
+         * model when loaded. */
+        if (e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->mtp_model,
+                                                             NULL, NULL, 0)) {
+            fprintf(stderr, "ds4: %s failed to prepare optional MTP model cache\n",
                     ds4_backend_name(e->backend));
             ds4_engine_close(e);
             *out = NULL;

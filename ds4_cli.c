@@ -1,5 +1,6 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_help.h"
 #include "linenoise.h"
 
 /* ds4 CLI.
@@ -127,140 +128,8 @@ static int cli_wait_distributed_route(const cli_config *cfg, ds4_session *sessio
     }
 }
 
-static void usage(FILE *fp) {
-    fprintf(fp,
-        "Usage: ds4 [(-p PROMPT | --prompt-file FILE)] [options]\n"
-        "\n"
-        "Invocation modes:\n"
-        "  ds4\n"
-        "      Start the interactive chat prompt with a session backend: ds4>\n"
-        "  ds4 -p TEXT\n"
-        "      Run one prompt and exit.\n"
-        "  ds4 --prompt-file FILE\n"
-        "      Run one prompt read from FILE and exit. Useful for long prompts.\n"
-        "\n"
-        "Model and runtime:\n"
-        "  -m, --model FILE\n"
-        "      GGUF model path. Default: ds4flash.gguf\n"
-        "  --mtp FILE\n"
-        "      Optional MTP support GGUF used for draft-token probes.\n"
-        "  --mtp-draft N\n"
-        "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
-        "  --mtp-margin F\n"
-        "      Minimum recursive-draft confidence for the fast N=2 verifier. Default: 3\n"
-        "  -c, --ctx N\n"
-        "      Context size allocated for the session. Default: 32768\n"
-        "  --metal\n"
-        "      Use the Metal graph backend. This is the normal fast path on macOS.\n"
-        "  --cuda\n"
-        "      Use the CUDA graph backend. This is the normal fast path on CUDA builds.\n"
-        "  --cpu\n"
-        "      Use the CPU reference/debug backend. Not recommended for normal inference.\n"
-        "  --backend NAME\n"
-        "      Select backend explicitly: metal, cuda, or cpu.\n"
-        "  -t, --threads N\n"
-        "      CPU helper threads for host-side or reference work.\n"
-        "  --quality\n"
-        "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
-        "  --dir-steering-file FILE\n"
-        "      Load one f32 direction vector per layer for directional steering.\n"
-        "  --dir-steering-ffn F\n"
-        "      Apply steering after FFN outputs: y -= F*v*dot(v,y). Default with file: 1\n"
-        "  --dir-steering-attn F\n"
-        "      Apply steering after attention outputs. Default: 0\n"
-        "  --warm-weights\n"
-        "      Touch mapped tensor pages before generation. Slower startup, fewer first-use stalls.\n"
-        "  --power N\n"
-        "      Target GPU duty cycle percentage, 1..100. Default: 100\n"
-    );
-    ds4_dist_usage(fp);
-    fprintf(fp,
-        "\n"
-        "Prompt and generation:\n"
-        "  -p, --prompt TEXT\n"
-        "      Prompt to generate from.\n"
-        "  --prompt-file FILE\n"
-        "      Read the prompt text from FILE.\n"
-        "  -sys, --system TEXT\n"
-        "      System prompt. Empty string disables the default. Default: You are a helpful assistant\n"
-        "  -n, --tokens N\n"
-        "      Maximum tokens to generate. Default: 50000\n"
-        "  --temp F\n"
-        "      Sampling temperature. 0 is greedy/deterministic. Default: 1\n"
-        "  --top-p F\n"
-        "      Nucleus sampling probability. Default: 1\n"
-        "  --min-p F\n"
-        "      Keep tokens scoring at least F times the top token. Default: 0.05\n"
-        "  --seed N\n"
-        "      Sampling seed for reproducible non-greedy runs. Default: time-based\n"
-        "  --think\n"
-        "      Use normal thinking mode. This is the default.\n"
-        "  --think-max\n"
-        "      Use Think Max when --ctx is at least 393216 tokens; otherwise normal thinking.\n"
-        "  --nothink\n"
-        "      Start assistant turns with </think> for direct non-thinking replies.\n"
-        "\n"
-        "Interactive commands:\n"
-        "  /help\n"
-        "      Show interactive commands.\n"
-        "  /think, /think-max, /nothink\n"
-        "      Select normal thinking, context-gated Think Max, or non-thinking mode.\n"
-        "  /ctx N\n"
-        "      Recreate the interactive session with a new context size.\n"
-        "  /power N\n"
-        "      Set GPU duty cycle percentage, 1..100.\n"
-        "  /read FILE\n"
-        "      Read a prompt from FILE and run it as the next user message.\n"
-        "  /quit, /exit\n"
-        "      Leave the interactive prompt.\n"
-        "  Ctrl+C\n"
-        "      Stop the current generation and return to ds4> without exiting.\n"
-        "\n"
-        "Diagnostics:\n"
-        "  --inspect\n"
-        "      Load the model and print a summary only.\n"
-        "  --dump-tokens\n"
-        "      Tokenize -p/--prompt-file exactly as written, then exit without inference.\n"
-        "  --dump-logits FILE\n"
-        "      Write full next-token logits as JSON after prompt prefill, then exit.\n"
-        "  --dump-logprobs FILE\n"
-        "      Write greedy continuation top-logprobs as JSON without printing text.\n"
-        "  --logprobs-top-k N\n"
-        "      Number of local alternatives stored by --dump-logprobs. Default: 20\n"
-        "  --perplexity-file FILE\n"
-        "      Score raw text with teacher-forced next-token negative log likelihood.\n"
-        "  --imatrix-dataset FILE\n"
-        "      Rendered DS4 prompt dataset produced by misc/imatrix_dataset.\n"
-        "  --imatrix-out FILE\n"
-        "      Collect a routed-MoE activation imatrix and write llama-compatible .dat.\n"
-        "  --imatrix-max-prompts N\n"
-        "      Stop imatrix collection after N prompts. Default: no prompt limit\n"
-        "  --imatrix-max-tokens N\n"
-        "      Stop imatrix collection after N prompt tokens. Default: no token limit\n"
-        "  --head-test\n"
-        "      Run the output HC/logits head after the native slice.\n"
-        "  --first-token-test\n"
-        "      Run an exact CPU whole-model pass for the first prompt token.\n"
-        "  --metal-graph-test\n"
-        "      Compare first GPU-resident graph stages with CPU.\n"
-        "  --metal-graph-full-test\n"
-        "      Run the GPU-resident self-token graph across all layers.\n"
-        "  --metal-graph-prompt-test\n"
-        "      Compare CPU and GPU graph logits for the full prompt.\n"
-        "\n"
-        "Normal CLI commands:\n"
-        "  ./ds4\n"
-        "  ./ds4 -p \"Scrivi una storia su una papera scansafatiche\"\n"
-        "  ./ds4 --think-max --prompt-file prompt.txt --ctx 393216\n"
-        "\n"
-        "Notes:\n"
-        "  The CLI keeps KV cache state across interactive turns on session backends.\n"
-        "  CPU mode supports interactive chat too, but it is a slow reference/debug path.\n"
-        "  Long added input is processed with batched prefill; short continuations use decode.\n"
-        "  Startup prints the extra context-buffer memory for the selected context size.\n"
-        "\n"
-        "  -h, --help\n"
-        "      Show this help.\n");
+static void usage(FILE *fp, const char *topic) {
+    ds4_help_print(fp, DS4_HELP_DS4, topic);
 }
 
 static int parse_int(const char *s, const char *opt) {
@@ -1536,7 +1405,9 @@ static cli_config parse_options(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
-            usage(stdout);
+            const char *topic = (i + 1 < argc && argv[i + 1][0] != '-') ?
+                argv[i + 1] : NULL;
+            usage(stdout, topic);
             exit(0);
         }
         char dist_parse_err[256] = {0};
@@ -1664,7 +1535,7 @@ static cli_config parse_options(int argc, char **argv) {
             exit(2);
         } else {
             fprintf(stderr, "ds4: unknown option: %s\n", arg);
-            usage(stderr);
+            usage(stderr, NULL);
             exit(2);
         }
     }
