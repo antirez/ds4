@@ -1070,12 +1070,14 @@ static bool parse_function_call(const char **p, tool_call *tc) {
         (*p)++;
         if (!strcmp(key, "name")) {
             free(tc->name);
+            tc->name = NULL;
             if (!json_string(p, &tc->name)) {
                 free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "arguments")) {
             free(tc->arguments);
+            tc->arguments = NULL;
             json_ws(p);
             if (**p == '"') {
                 if (!json_string(p, &tc->arguments)) {
@@ -1124,6 +1126,7 @@ static bool parse_tool_calls_value(const char **p, tool_calls *calls) {
             (*p)++;
             if (!strcmp(key, "id")) {
                 free(tc.id);
+                tc.id = NULL;
                 if (!json_string(p, &tc.id)) {
                     free(key);
                     goto bad;
@@ -1223,18 +1226,21 @@ static char *responses_special_schema_from_tool(const char *raw) {
         p++;
         if (!strcmp(key, "type")) {
             free(type);
+            type = NULL;
             if (!json_string(&p, &type)) {
                 free(key);
                 goto done;
             }
         } else if (!strcmp(key, "description")) {
             free(description);
+            description = NULL;
             if (!json_string(&p, &description)) {
                 free(key);
                 goto done;
             }
         } else if (!strcmp(key, "parameters")) {
             free(parameters);
+            parameters = NULL;
             if (!json_raw_value(&p, &parameters)) {
                 free(key);
                 goto done;
@@ -1293,24 +1299,28 @@ static char *responses_namespace_function_schema_from_tool(const char *raw,
         p++;
         if (!strcmp(key, "type")) {
             free(type);
+            type = NULL;
             if (!json_string(&p, &type)) {
                 free(key);
                 goto done;
             }
         } else if (!strcmp(key, "name")) {
             free(name);
+            name = NULL;
             if (!json_string(&p, &name)) {
                 free(key);
                 goto done;
             }
         } else if (!strcmp(key, "description")) {
             free(description);
+            description = NULL;
             if (!json_string(&p, &description)) {
                 free(key);
                 goto done;
             }
         } else if (!strcmp(key, "parameters") || !strcmp(key, "input_schema")) {
             free(parameters);
+            parameters = NULL;
             if (!json_raw_value(&p, &parameters)) {
                 free(key);
                 goto done;
@@ -1424,6 +1434,7 @@ static void tool_schema_orders_add_json_wire(tool_schema_orders *orders,
         p++;
         if (!strcmp(key, "name")) {
             free(order.name);
+            order.name = NULL;
             if (!json_string(&p, &order.name)) {
                 free(key);
                 goto done;
@@ -1485,18 +1496,21 @@ static bool append_responses_namespace_tool_schemas(buf *schemas,
         p++;
         if (!strcmp(key, "type")) {
             free(type);
+            type = NULL;
             if (!json_string(&p, &type)) {
                 free(key);
                 goto done;
             }
         } else if (!strcmp(key, "name")) {
             free(name);
+            name = NULL;
             if (!json_string(&p, &name)) {
                 free(key);
                 goto done;
             }
         } else if (!strcmp(key, "tools")) {
             free(tools);
+            tools = NULL;
             if (!json_raw_value(&p, &tools)) {
                 free(key);
                 goto done;
@@ -1617,18 +1631,21 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
             (*p)++;
             if (!strcmp(key, "role")) {
                 free(msg.role);
+                msg.role = NULL;
                 if (!json_string(p, &msg.role)) {
                     free(key);
                     goto fail;
                 }
             } else if (!strcmp(key, "content")) {
                 free(msg.content);
+                msg.content = NULL;
                 if (!json_content(p, &msg.content)) {
                     free(key);
                     goto fail;
                 }
             } else if (!strcmp(key, "reasoning_content")) {
                 free(msg.reasoning);
+                msg.reasoning = NULL;
                 if (!json_content(p, &msg.reasoning)) {
                     free(key);
                     goto fail;
@@ -1711,42 +1728,49 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
         (*p)++;
         if (!strcmp(key, "type")) {
             free(type);
+            type = NULL;
             if (!json_string(p, &type)) {
                 free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "text")) {
             free(text);
+            text = NULL;
             if (!json_content(p, &text)) {
                 free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "thinking")) {
             free(thinking);
+            thinking = NULL;
             if (!json_content(p, &thinking)) {
                 free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "id") || !strcmp(key, "tool_use_id")) {
             free(id);
+            id = NULL;
             if (!json_string(p, &id)) {
                 free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "name")) {
             free(name);
+            name = NULL;
             if (!json_string(p, &name)) {
                 free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "input")) {
             free(input);
+            input = NULL;
             if (!json_raw_value(p, &input)) {
                 free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "content")) {
             free(tool_result);
+            tool_result = NULL;
             if (!json_content(p, &tool_result)) {
                 free(key);
                 goto bad;
@@ -1876,6 +1900,7 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
             (*p)++;
             if (!strcmp(key, "role")) {
                 free(msg.role);
+                msg.role = NULL;
                 if (!json_string(p, &msg.role)) {
                     free(key);
                     goto fail;
@@ -2674,6 +2699,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
             }
         } else if (!strcmp(key, "model")) {
             free(r->model);
+            r->model = NULL;
             if (!json_string(&p, &r->model)) {
                 free(key);
                 goto bad;
@@ -2826,6 +2852,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
             got_messages = true;
         } else if (!strcmp(key, "system")) {
             free(system);
+            system = NULL;
             if (!parse_anthropic_system(&p, &system)) {
                 free(key);
                 goto bad;
@@ -2885,6 +2912,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
             }
         } else if (!strcmp(key, "model")) {
             free(r->model);
+            r->model = NULL;
             if (!json_string(&p, &r->model)) {
                 free(key);
                 goto bad;
@@ -3048,6 +3076,7 @@ static bool parse_responses_content_array(const char **p, char **out) {
                 (*p)++;
                 if (!strcmp(key, "type")) {
                     free(type);
+                    type = NULL;
                     if (!json_string(p, &type)) {
                         free(key);
                         free(text);
@@ -3055,6 +3084,7 @@ static bool parse_responses_content_array(const char **p, char **out) {
                     }
                 } else if (!strcmp(key, "text")) {
                     free(text);
+                    text = NULL;
                     /* The text field of a typed content block is a plain JSON
                      * string. Accept null as the empty string for parity with
                      * upstream serializers that emit null for empty blocks. */
@@ -3177,48 +3207,56 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
             (*p)++;
             if (!strcmp(key, "type")) {
                 free(type);
+                type = NULL;
                 if (!json_string(p, &type)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "role")) {
                 free(role);
+                role = NULL;
                 if (!json_string(p, &role)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "content")) {
                 free(content);
+                content = NULL;
                 if (!parse_responses_content_array(p, &content)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "name")) {
                 free(name);
+                name = NULL;
                 if (!json_string(p, &name)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "namespace")) {
                 free(namespace);
+                namespace = NULL;
                 if (!json_string(p, &namespace)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "call_id")) {
                 free(call_id);
+                call_id = NULL;
                 if (!json_string(p, &call_id)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "id")) {
                 free(item_id);
+                item_id = NULL;
                 if (!json_string(p, &item_id)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "arguments")) {
                 free(arguments);
+                arguments = NULL;
                 json_ws(p);
                 if (**p == '"') {
                     if (!json_string(p, &arguments)) {
@@ -3231,6 +3269,7 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                 }
             } else if (!strcmp(key, "output")) {
                 free(output);
+                output = NULL;
                 json_ws(p);
                 if (**p == '[') {
                     if (!parse_responses_content_array(p, &output)) {
@@ -3248,6 +3287,7 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                 }
             } else if (!strcmp(key, "input")) {
                 free(input_str);
+                input_str = NULL;
                 json_ws(p);
                 if (**p == '"') {
                     if (!json_string(p, &input_str)) {
@@ -3260,18 +3300,21 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                 }
             } else if (!strcmp(key, "summary")) {
                 free(summary);
+                summary = NULL;
                 if (!parse_responses_content_array(p, &summary)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "action")) {
                 free(action);
+                action = NULL;
                 if (!json_raw_value(p, &action)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "result")) {
                 free(result);
+                result = NULL;
                 json_ws(p);
                 if (**p == '"') {
                     if (!json_string(p, &result)) {
@@ -3284,6 +3327,7 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                 }
             } else if (!strcmp(key, "status")) {
                 free(status_str);
+                status_str = NULL;
                 if (!json_string(p, &status_str)) {
                     free(key);
                     goto item_fail;
@@ -3294,6 +3338,7 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                  * from the human-visible result body so malformed tool lists
                  * never get mistaken for normal tool output. */
                 free(tools_json);
+                tools_json = NULL;
                 if (!json_raw_value(p, &tools_json)) {
                     free(key);
                     goto item_fail;
@@ -3787,6 +3832,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
             }
         } else if (!strcmp(key, "model")) {
             free(r->model);
+            r->model = NULL;
             if (!json_string(&p, &r->model)) {
                 free(key);
                 goto bad;
@@ -3999,12 +4045,14 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
         p++;
         if (!strcmp(key, "prompt")) {
             free(prompt);
+            prompt = NULL;
             if (!parse_prompt(&p, &prompt)) {
                 free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "model")) {
             free(r->model);
+            r->model = NULL;
             if (!json_string(&p, &r->model)) {
                 free(key);
                 goto bad;
