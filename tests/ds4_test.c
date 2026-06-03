@@ -893,6 +893,216 @@ static void test_official_logprob_vectors(void) {
     fclose(fp);
 }
 
+static void test_logits_topk(const float *logits, int n, int *out, int k);
+static bool test_topk_contains(const int *top, int k, int id);
+
+#define TEST_LOCAL_GOLDEN_MAX_TOP 128
+
+typedef struct {
+    int id;
+    float logit;
+} test_local_golden_top;
+
+typedef struct {
+    char id[96];
+    char mode[16];
+    char prompt_path[512];
+    int ctx;
+    int frontier;
+    int ntop;
+    test_local_golden_top top[TEST_LOCAL_GOLDEN_MAX_TOP];
+} test_local_golden_case;
+
+static bool test_read_local_golden_case(FILE *fp, test_local_golden_case *tc) {
+    char line[2048];
+    memset(tc, 0, sizeof(*tc));
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = test_trim_line(line);
+        if (!p[0] || p[0] == '#') continue;
+        if (sscanf(p, "case %95s %15s %d %d %511s %d",
+                   tc->id, tc->mode, &tc->ctx, &tc->frontier,
+                   tc->prompt_path, &tc->ntop) == 6) {
+            TEST_ASSERT(tc->ctx > tc->frontier);
+            TEST_ASSERT(tc->frontier > 0);
+            TEST_ASSERT(tc->ntop > 0 && tc->ntop <= TEST_LOCAL_GOLDEN_MAX_TOP);
+            return true;
+        }
+        TEST_ASSERT(!"unexpected line before local golden case");
+        return false;
+    }
+    return false;
+}
+
+static bool test_fill_local_golden_case(FILE *fp, test_local_golden_case *tc) {
+    char line[2048];
+    int seen = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = test_trim_line(line);
+        if (!p[0] || p[0] == '#') continue;
+        if (!strcmp(p, "end")) {
+            TEST_ASSERT(seen == tc->ntop);
+            return seen == tc->ntop;
+        }
+        int rank = -1;
+        int id = -1;
+        float logit = 0.0f;
+        if (sscanf(p, "top %d %d %f", &rank, &id, &logit) != 3) {
+            TEST_ASSERT(!"bad local golden top line");
+            return false;
+        }
+        TEST_ASSERT(rank == seen);
+        TEST_ASSERT(seen < tc->ntop);
+        if (seen >= tc->ntop) return false;
+        tc->top[seen].id = id;
+        tc->top[seen].logit = logit;
+        seen++;
+    }
+    TEST_ASSERT(!"unterminated local golden case");
+    return false;
+}
+
+static int test_local_golden_overlap(const test_local_golden_case *tc,
+                                     const int *cand_top,
+                                     int n) {
+    int overlap = 0;
+    if (n > tc->ntop) n = tc->ntop;
+    for (int i = 0; i < n; i++) {
+        if (test_topk_contains(cand_top, n, tc->top[i].id)) overlap++;
+    }
+    return overlap;
+}
+
+static float test_local_golden_max_abs(const test_local_golden_case *tc,
+                                       const float *cand_logits,
+                                       int n) {
+    float max_abs = 0.0f;
+    if (n > tc->ntop) n = tc->ntop;
+    for (int i = 0; i < n; i++) {
+        const int id = tc->top[i].id;
+        if (id < 0) continue;
+        const float abs_delta = fabsf(cand_logits[id] - tc->top[i].logit);
+        if (abs_delta > max_abs) max_abs = abs_delta;
+    }
+    return max_abs;
+}
+
+static void test_local_golden_case_run(ds4_engine *engine,
+                                       const test_local_golden_case *tc) {
+    char *prompt_text = test_read_file(tc->prompt_path);
+    TEST_ASSERT(prompt_text != NULL);
+    if (!prompt_text) return;
+
+    ds4_tokens prompt = {0};
+    if (!strcmp(tc->mode, "text")) {
+        ds4_tokenize_text(engine, prompt_text, &prompt);
+    } else if (!strcmp(tc->mode, "rendered")) {
+        ds4_tokenize_rendered_chat(engine, prompt_text, &prompt);
+    } else if (!strcmp(tc->mode, "chat")) {
+        ds4_encode_chat_prompt(engine, "", prompt_text, DS4_THINK_NONE, &prompt);
+    } else {
+        TEST_ASSERT(!"unknown local golden prompt mode");
+    }
+    free(prompt_text);
+    TEST_ASSERT(prompt.len >= tc->frontier);
+    if (prompt.len < tc->frontier) {
+        ds4_tokens_free(&prompt);
+        return;
+    }
+
+    ds4_tokens prefix = {
+        .v = prompt.v,
+        .len = tc->frontier,
+        .cap = tc->frontier,
+    };
+
+    ds4_session *session = NULL;
+    TEST_ASSERT(ds4_session_create(&session, engine, tc->ctx) == 0);
+    if (!session) {
+        ds4_tokens_free(&prompt);
+        return;
+    }
+
+    char err[160];
+    TEST_ASSERT(ds4_session_sync(session, &prefix, err, sizeof(err)) == 0);
+
+    const int vocab = ds4_engine_vocab_size(engine);
+    float *cand_logits = malloc((size_t)vocab * sizeof(cand_logits[0]));
+    TEST_ASSERT(cand_logits != NULL);
+    if (cand_logits &&
+        ds4_session_copy_logits(session, cand_logits, vocab) == vocab) {
+        int cand_top[TEST_LOCAL_GOLDEN_MAX_TOP];
+        const int ntop = tc->ntop < TEST_LOCAL_GOLDEN_MAX_TOP ?
+                         tc->ntop : TEST_LOCAL_GOLDEN_MAX_TOP;
+        test_logits_topk(cand_logits, vocab, cand_top, ntop);
+
+        const int top5_overlap = test_local_golden_overlap(tc, cand_top, 5);
+        const int top20_overlap = test_local_golden_overlap(tc, cand_top, 20);
+        const int top64_overlap = test_local_golden_overlap(tc, cand_top, 64);
+        const float top20_max_abs =
+            test_local_golden_max_abs(tc, cand_logits, 20);
+
+        fprintf(stderr,
+                "ds4-test: local golden %s top1 ref=%d cand=%d "
+                "top5_overlap=%d/5 top20_overlap=%d/20 top64_overlap=%d/64 "
+                "top20_max_abs=%g\n",
+                tc->id, tc->top[0].id, cand_top[0],
+                top5_overlap, top20_overlap, top64_overlap, top20_max_abs);
+
+        /*
+         * This is intentionally tolerant: it is meant to catch substantial
+         * backend drift (wrong tiling, skipped work, bad dispatch), not tiny
+         * floating-point differences from otherwise sane kernel changes.
+         */
+        TEST_ASSERT(cand_top[0] == tc->top[0].id);
+        TEST_ASSERT(top5_overlap >= 4);
+        TEST_ASSERT(top20_overlap >= 15);
+        TEST_ASSERT(top64_overlap >= 40);
+        TEST_ASSERT(top20_max_abs <= 8.0f);
+    } else {
+        TEST_ASSERT(false);
+    }
+
+    free(cand_logits);
+    ds4_session_free(session);
+    ds4_tokens_free(&prompt);
+}
+
+static void test_local_golden_vectors(void) {
+    const char *path = getenv("DS4_TEST_LOCAL_GOLDEN_FILE");
+    if (!path || !path[0]) path = "tests/test-vectors/local-golden.vec";
+    FILE *fp = fopen(path, "rb");
+    TEST_ASSERT(fp != NULL);
+    if (!fp) return;
+
+    char *saved_prefill_chunk = test_save_env("DS4_METAL_PREFILL_CHUNK");
+    char *saved_disable_metal4 = test_save_env("DS4_METAL_DISABLE_METAL4");
+    char *saved_moe_tile_max = test_save_env("DS4_METAL_MOE_TILE_MAX");
+    setenv("DS4_METAL_PREFILL_CHUNK", "4096", 1);
+    setenv("DS4_METAL_DISABLE_METAL4", "1", 1);
+    unsetenv("DS4_METAL_MOE_TILE_MAX");
+
+    ds4_engine *engine = test_open_engine(false);
+    if (!engine) {
+        test_restore_env("DS4_METAL_MOE_TILE_MAX", saved_moe_tile_max);
+        test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
+        test_restore_env("DS4_METAL_PREFILL_CHUNK", saved_prefill_chunk);
+        fclose(fp);
+        return;
+    }
+
+    test_local_golden_case tc;
+    while (test_read_local_golden_case(fp, &tc)) {
+        if (!test_fill_local_golden_case(fp, &tc)) break;
+        test_local_golden_case_run(engine, &tc);
+    }
+
+    ds4_engine_close(engine);
+    test_restore_env("DS4_METAL_MOE_TILE_MAX", saved_moe_tile_max);
+    test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
+    test_restore_env("DS4_METAL_PREFILL_CHUNK", saved_prefill_chunk);
+    fclose(fp);
+}
+
 #define TEST_MPP_EQ_MAX_CASES 8
 #define TEST_MPP_EQ_TOPK 20
 #define TEST_MPP_EQ_TOP5 5
@@ -1403,6 +1613,7 @@ static const ds4_test_entry test_entries[] = {
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard Metal path", test_official_logprob_vectors},
+    {"--local-golden-vectors", "local-golden-vectors", "local top-k/logit drift regression for long Metal prefill", test_local_golden_vectors},
     {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
@@ -1430,6 +1641,7 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_MODEL=FILE        Model path. Default: ds4flash.gguf");
     puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");
     puts("  DS4_TEST_VECTOR_FILE=FILE  Simple official-vector fixture.");
+    puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local top-k golden-vector fixture.");
     puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
 }
 
