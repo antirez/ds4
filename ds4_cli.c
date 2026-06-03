@@ -144,9 +144,15 @@ static int parse_int(const char *s, const char *opt) {
 
 static uint64_t parse_seed(const char *s) {
     char *end = NULL;
-    if (s[0] == '\0' || s[0] == '-') {
+    if (s[0] == '\0') {
         fprintf(stderr, "ds4: invalid value for --seed: %s\n", s);
         exit(2);
+    }
+    for (const char *p = s; *p; p++) {
+        if (!isdigit((unsigned char)*p)) {
+            fprintf(stderr, "ds4: invalid value for --seed: %s\n", s);
+            exit(2);
+        }
     }
     errno = 0;
     unsigned long long v = strtoull(s, &end, 10);
