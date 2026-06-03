@@ -40,6 +40,12 @@ static int check_large_topk(void) {
     double elapsed = 0.0;
     if (scores && selected &&
         ds4_gpu_tensor_write(scores, 0, scores_host, score_count * sizeof(float))) {
+        /* Exclude one-time CUDA module/kernel setup from the throughput guard. */
+        if (!ds4_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens, top_k) ||
+            !ds4_gpu_synchronize()) {
+            rc = 1;
+            goto cleanup;
+        }
         const double t0 = monotonic_seconds();
         if (ds4_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens, top_k) &&
             ds4_gpu_synchronize()) {
@@ -72,6 +78,7 @@ static int check_large_topk(void) {
         }
     }
 
+cleanup:
     ds4_gpu_tensor_free(selected);
     ds4_gpu_tensor_free(scores);
     free(selected_host);

@@ -130,23 +130,21 @@ Download one main model. **Prefer the imatrix versions.**
 ./download_model.sh q2-imatrix   # 96/128 GB RAM machines, imatrix-tuned q2
 ./download_model.sh q2-q4-imatrix  # 96/128 GB RAM machines, q2 with last 6 layers q4
 ./download_model.sh q4-imatrix   # >= 256 GB RAM machines, imatrix-tuned q4
-./download_model.sh pro-imatrix  # 512 GB RAM machines, PRO imatrix quant
+./download_model.sh pro-q2-imatrix  # 512 GB RAM machines, PRO q2 imatrix quant
 ```
 
-Legacy GGUF files are still available if you specifically need the older
-non-imatrix quants:
+For the full PRO Q4 distributed run, download one half on each machine:
 
 ```sh
-./download_model.sh q2           # 96/128 GB RAM machines, legacy non-imatrix
-./download_model.sh q4           # >= 256 GB RAM machines, legacy non-imatrix
-./download_model.sh pro          # 512 GB RAM machines, legacy non-imatrix PRO
+./download_model.sh pro-q4-layers00-30      # first half of PRO Q4 split
+./download_model.sh pro-q4-layers31-output  # second half of PRO Q4 split
 ```
 
 The script downloads from `https://huggingface.co/antirez/deepseek-v4-gguf`,
 stores files under `./gguf/`, resumes partial downloads with `curl -C -`, and
-updates `./ds4flash.gguf` to point at the selected main model. The plain q2 XXS
-weights are produced with the weights importance vector only, without an
-imatrix. The imatrix variants are preferred.
+updates `./ds4flash.gguf` to point at the selected main model.
+The `pro-q4-layers00-30`, `pro-q4-layers31-output`, and `pro-q4-split` targets
+download distributed PRO Q4 pieces and do not update `./ds4flash.gguf`.
 Authentication is optional for public downloads, but `--token TOKEN`,
 `HF_TOKEN`, or the local Hugging Face token cache are used when present.
 
@@ -158,10 +156,10 @@ production currently still depends on the external `llama.cpp`-based workflow;
 native tooling can be added later.
 
 `./download_model.sh mtp` fetches the optional speculative decoding support
-GGUF for Flash. It can be used with q2-imatrix, q4-imatrix, q2, and q4, but must be
-enabled explicitly with `--mtp`. The current MTP/speculative decoding path is
-still experimental: it is correctness-gated and currently provides at most a
-slight speedup, not a meaningful generation-speed win.
+GGUF for Flash. It can be used with q2-imatrix, q2-q4-imatrix, and q4-imatrix,
+but must be enabled explicitly with `--mtp`. The current MTP/speculative
+decoding path is still experimental: it is correctness-gated and currently
+provides at most a slight speedup, not a meaningful generation-speed win.
 
 Then build:
 
@@ -251,6 +249,42 @@ single-process to 24.67 t/s distributed, a 19.4% loss. Distributed inference is
 therefore mainly for fitting larger models and speeding up long prefills, not
 for making decode faster.
 
+### Full DeepSeek V4 PRO Q4 on two Mac Studios
+
+The full-size PRO Q4 GGUF can be run across two 512 GB Mac Studio M3 Ultra
+machines by giving the coordinator layers `0:30` and the worker
+`31:output`. Use the split GGUF files so each side maps only the tensors it
+needs:
+
+```sh
+# Coordinator machine.
+./download_model.sh pro-q4-layers00-30
+
+# Worker machine.
+./download_model.sh pro-q4-layers31-output
+```
+
+The two files are:
+
+```text
+gguf/DeepSeek-V4-Pro-Q4K-Layers00-30.gguf
+gguf/DeepSeek-V4-Pro-Q4K-Layers-31-output.gguf
+```
+
+This is a capacity use case: each process maps only its own half of the model,
+while the worker owns the output head and returns logits.
+
+The current PRO Q4 Metal path uses queue-resident exact expert tables for the
+large routed experts. This avoids the broad multi-GiB routed-tensor bindings
+that made early distributed PRO Q4 attempts either run very slowly or hit Metal
+memory accounting limits. In a short greedy smoke test over the direct
+`192.168.0.182` / `192.168.0.183` link, the model generated coherent text and
+measured 11.47 t/s generation after startup. Per-token telemetry was balanced:
+local layers were around 39-43 ms, remote layers around 44-49 ms, for total
+token times around 84-92 ms. Expect a slow startup while each side maps and
+makes its half of the model resident. Long-context PRO Q4 prefill and decode
+slope still need separate benchmarking.
+
 The measurements above use a Thunderbolt 5 cable. The implementation is plain
 TCP and also works over slower links, including WiFi, but fast Ethernet or
 Thunderbolt networking is strongly recommended. Slow links mostly hurt
@@ -261,18 +295,18 @@ owns the output head and returns logits directly.
 Minimal two-host configuration:
 
 ```sh
-# Machine A: coordinator, owns tokenization, sampling, the prompt, and layers 0..19.
+# Machine A: coordinator, owns tokenization, sampling, the prompt, and layers 0..30.
 ./ds4 \
-  -m gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
+  -m gguf/DeepSeek-V4-Pro-Q4K-Layers00-30.gguf \
   --role coordinator \
-  --layers 0:19 \
+  --layers 0:30 \
   --listen 169.254.43.68 1234
 
-# Machine B: worker, connects to A and owns layers 20..output.
+# Machine B: worker, connects to A and owns layers 31..output.
 ./ds4 \
-  -m gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
+  -m gguf/DeepSeek-V4-Pro-Q4K-Layers-31-output.gguf \
   --role worker \
-  --layers 20:output \
+  --layers 31:output \
   --coordinator 169.254.43.68 1234
 ```
 

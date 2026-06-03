@@ -1523,6 +1523,15 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
 
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
+extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
+    (void)event_value;
+    return 0;
+}
+extern "C" int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label) {
+    (void)event_value;
+    (void)label;
+    return 0;
+}
 extern "C" int ds4_gpu_end_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "end commands"); }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
@@ -1629,6 +1638,25 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
         !cuda_model_copy_chunked(model_map, model_size, map_offset, map_size)) {
         (void)cuda_model_prefetch_range(model_map, model_size, map_offset, map_size);
     }
+    return 1;
+}
+
+extern "C" int ds4_gpu_pro_q4_expert_table_auto_available(void) {
+    return 0;
+}
+
+extern "C" int ds4_gpu_preload_q4_expert_tables(const void *model_map, uint64_t model_size,
+                                                uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+                                                uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                                                uint32_t n_total_expert) {
+    (void)model_map;
+    (void)model_size;
+    (void)gate_offset;
+    (void)up_offset;
+    (void)down_offset;
+    (void)gate_expert_bytes;
+    (void)down_expert_bytes;
+    (void)n_total_expert;
     return 1;
 }
 
@@ -11207,7 +11235,14 @@ static int routed_moe_launch(
     return ok;
 }
 
-extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x) {
+extern "C" int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n_selected) {
+    (void)selected;
+    (void)n_selected;
+    return 0;
+}
+
+extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index) {
+    (void)layer_index;
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,
