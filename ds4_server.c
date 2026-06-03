@@ -1,4 +1,6 @@
 #include "ds4.h"
+#include "ds4_distributed.h"
+#include "ds4_help.h"
 #include "ds4_kvstore.h"
 #include "rax.h"
 
@@ -584,6 +586,7 @@ typedef struct {
     api_style api;
     ds4_tokens prompt;
     char *model;
+    bool model_from_request;
     stop_list stops;
     char *raw_body;
     char *prompt_text;
@@ -888,6 +891,17 @@ static bool model_alias_disables_thinking(const char *model) {
 
 static bool model_alias_enables_thinking(const char *model) {
     return model && !strcmp(model, "deepseek-reasoner");
+}
+
+static const char *server_model_id_from_engine(ds4_engine *engine) {
+    return ds4_engine_model_id(engine) == 1 ?
+           "deepseek-v4-pro" : "deepseek-v4-flash";
+}
+
+static bool server_model_alias_known(const char *id) {
+    return id &&
+           (!strcmp(id, "deepseek-v4-flash") ||
+            !strcmp(id, "deepseek-v4-pro"));
 }
 
 static void stop_list_clear(stop_list *stops) {
@@ -2664,6 +2678,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+            r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens") || !strcmp(key, "max_completion_tokens")) {
             if (!json_int(&p, &r->max_tokens)) {
                 free(key);
@@ -2874,6 +2889,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                 free(key);
                 goto bad;
             }
+            r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens")) {
             if (!json_int(&p, &r->max_tokens)) {
                 free(key);
@@ -3775,6 +3791,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 free(key);
                 goto bad;
             }
+            r->model_from_request = true;
         } else if (!strcmp(key, "max_output_tokens") || !strcmp(key, "max_tokens")) {
             if (!json_int(&p, &r->max_tokens)) {
                 free(key);
@@ -3992,6 +4009,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 free(key);
                 goto bad;
             }
+            r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens")) {
             if (!json_int(&p, &r->max_tokens)) {
                 free(key);
@@ -8496,7 +8514,7 @@ static void kv_fill_header(uint8_t h[KV_CACHE_FIXED_HEADER], uint8_t quant_bits,
                            uint32_t tokens, uint32_t hits, uint32_t ctx_size,
                            uint64_t created_at, uint64_t last_used,
                            uint64_t payload_bytes) {
-    ds4_kvstore_fill_header(h, quant_bits, reason, ext_flags, tokens, hits,
+    ds4_kvstore_fill_header(h, 0, quant_bits, reason, ext_flags, tokens, hits,
                             ctx_size, created_at, last_used, payload_bytes);
 }
 #endif
@@ -8513,6 +8531,10 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
     stop_list wanted = {0};
     collect_tool_call_ids(msgs, &wanted);
     if (wanted.len == 0) return;
+    /* Tool replay payloads are stored next to KV checkpoints; keep them model
+     * scoped too, since token positions and graph state are not portable across
+     * Flash/Pro shapes even when the rendered chat text is identical. */
+    uint8_t model_id = s->engine ? (uint8_t)ds4_engine_model_id(s->engine) : 0;
 
     DIR *d = opendir(s->kv.dir);
     if (!d) {
@@ -8533,7 +8555,7 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
         uint32_t text_bytes = 0;
         bool ok = kv_read_header(fp, &hdr, &text_bytes);
         uint64_t skip = (uint64_t)text_bytes + hdr.payload_bytes;
-        if (ok && (hdr.ext_flags & KV_EXT_TOOL_MAP) &&
+        if (ok && hdr.model_id == model_id && (hdr.ext_flags & KV_EXT_TOOL_MAP) &&
             skip <= (uint64_t)INT64_MAX &&
             fseeko(fp, (off_t)skip, SEEK_CUR) == 0)
         {
@@ -8547,16 +8569,17 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
 
 #ifdef DS4_SERVER_TEST
 static double kv_entry_eviction_score(const kv_entry *e, const ds4_tokens *live,
-                                      const char *protected_sha,
-                                      uint64_t now) {
-    return ds4_kvstore_entry_eviction_score(e, live, protected_sha, now);
+                                      uint64_t now,
+                                      const ds4_kvstore_eviction_context *incoming) {
+    return ds4_kvstore_entry_eviction_score(e, live, now, incoming);
 }
 #endif
 
 #ifdef DS4_SERVER_TEST
 static void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live,
-                           const char *protected_sha) {
-    ds4_kvstore_evict(kc, live, protected_sha);
+                           uint64_t extra_bytes,
+                           const ds4_kvstore_eviction_context *incoming) {
+    ds4_kvstore_evict(kc, live, extra_bytes, incoming);
 }
 #endif
 
@@ -8743,6 +8766,21 @@ static void kv_cache_restore_suppressed_continued(kv_disk_cache *kc,
     ds4_kvstore_restore_suppressed_continued(kc, old_tokens, suppressed_tokens);
 }
 
+static void kv_cache_discard_failed_disk_entry(server *s, const char *path) {
+    if (!s || !path) return;
+    if (unlink(path) == 0) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv cache discarded reason=prefill-failed file=%s",
+                   path);
+    } else if (errno != ENOENT) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: kv cache failed to discard prefill-failed file=%s: %s",
+                   path, strerror(errno));
+    }
+    s->kv.continued_last_store_tokens = 0;
+    ds4_session_invalidate(s->session);
+}
+
 static void kv_cache_maybe_store_continued(server *s) {
     kv_disk_cache *kc = &s->kv;
     const ds4_tokens *tokens = ds4_session_tokens(s->session);
@@ -8757,7 +8795,7 @@ static void kv_cache_maybe_store_continued(server *s) {
 #ifdef DS4_SERVER_TEST
 static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
                                      int quant_bits, int ctx_size) {
-    return ds4_kvstore_find_text_prefix(kc, prompt_text, quant_bits, ctx_size);
+    return ds4_kvstore_find_text_prefix(kc, prompt_text, 0, quant_bits, ctx_size);
 }
 #endif
 
@@ -10009,7 +10047,6 @@ static void generate_job(server *s, job *j) {
     const double t0 = now_sec();
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
                                     cache_source, disk_cached, disk_cache_path);
-    free(disk_cache_path);
     char ctx_span[48];
     request_ctx_span(ctx_span, sizeof(ctx_span), cached, prompt_tokens);
     server_prefill_progress progress = {
@@ -10111,6 +10148,8 @@ static void generate_job(server *s, job *j) {
             ds4_session_set_display_progress(s->session, NULL, NULL);
             kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                                   cold_store_len);
+            kv_cache_discard_failed_disk_entry(s, disk_cache_path);
+            free(disk_cache_path);
             trace_event(s, trace_id, "prefill failed: %s", err);
             send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
             return;
@@ -10132,10 +10171,13 @@ static void generate_job(server *s, job *j) {
         ds4_session_set_display_progress(s->session, NULL, NULL);
         kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                               cold_store_len);
+        kv_cache_discard_failed_disk_entry(s, disk_cache_path);
+        free(disk_cache_path);
         trace_event(s, trace_id, "prefill failed: %s", err);
         send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
         return;
     }
+    free(disk_cache_path);
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
      * a binding only when this request explicitly continued from it. */
     if (!responses_live_continuation) responses_live_clear(s);
@@ -11013,14 +11055,20 @@ typedef struct {
     int fd;
 } client_arg;
 
-static void append_model_json_values(buf *b, int ctx, int default_tokens) {
+static void append_model_json_values(buf *b, const char *id, const char *name,
+                                     int ctx, int default_tokens) {
     const int max_completion = default_tokens < ctx ? default_tokens : ctx;
     buf_printf(b,
-        "{\"id\":\"deepseek-v4-flash\","
-        "\"object\":\"model\","
+        "{\"id\":");
+    json_escape(b, id);
+    buf_puts(b,
+        ",\"object\":\"model\","
         "\"created\":1767225600,"
         "\"owned_by\":\"ds4.c\","
-        "\"name\":\"DeepSeek V4 Flash\","
+        "\"name\":");
+    json_escape(b, name);
+    buf_printf(b,
+        ","
         "\"context_length\":%d,"
         "\"top_provider\":{"
             "\"context_length\":%d,"
@@ -11043,13 +11091,17 @@ static void append_model_json_values(buf *b, int ctx, int default_tokens) {
         max_completion);
 }
 
-static void append_model_json(buf *b, const server *s) {
-    append_model_json_values(b, ds4_session_ctx(s->session), s->default_tokens);
+static void append_model_json(buf *b, const server *s, const char *id) {
+    append_model_json_values(b,
+                             id,
+                             ds4_engine_model_name(s->engine),
+                             ds4_session_ctx(s->session),
+                             s->default_tokens);
 }
 
-static bool send_model(server *s, int fd) {
+static bool send_model(server *s, int fd, const char *id) {
     buf b = {0};
-    append_model_json(&b, s);
+    append_model_json(&b, s, id);
     buf_putc(&b, '\n');
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -11059,7 +11111,9 @@ static bool send_model(server *s, int fd) {
 static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    append_model_json(&b, s);
+    append_model_json(&b, s, "deepseek-v4-flash");
+    buf_putc(&b, ',');
+    append_model_json(&b, s, "deepseek-v4-pro");
     buf_puts(&b, "]}\n");
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -11098,8 +11152,13 @@ static void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
-    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models/deepseek-v4-flash")) {
-        send_model(s, fd);
+    const char *model_path_prefix = "/v1/models/";
+    const size_t model_path_prefix_len = strlen(model_path_prefix);
+    if (!strcmp(hr.method, "GET") &&
+        !strncmp(hr.path, model_path_prefix, model_path_prefix_len) &&
+        server_model_alias_known(hr.path + model_path_prefix_len))
+    {
+        send_model(s, fd, hr.path + model_path_prefix_len);
         http_request_free(&hr);
         goto done;
     }
@@ -11130,6 +11189,10 @@ static void *client_main(void *arg) {
     if (!ok) {
         http_error(fd, s->enable_cors, 400, err);
         goto done;
+    }
+    if (!req.model_from_request) {
+        free(req.model);
+        req.model = xstrdup(server_model_id_from_engine(s->engine));
     }
     if (request_exceeds_context(&req, ctx_size)) {
         http_error_context_length_exceeded(fd, s->enable_cors, &req, req.prompt.len, ctx_size);
@@ -11307,98 +11370,8 @@ static void server_close_resources(server *s) {
     memset(s, 0, sizeof(*s));
 }
 
-static void usage(FILE *fp) {
-    fprintf(fp,
-        "Usage: ds4-server [options]\n"
-        "\n"
-        "Model and runtime:\n"
-        "  -m, --model FILE\n"
-        "      GGUF model path. Default: ds4flash.gguf\n"
-        "  --mtp FILE\n"
-        "      Optional MTP support GGUF used for draft-token probes.\n"
-        "  --mtp-draft N\n"
-        "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
-        "  --mtp-margin F\n"
-        "      Minimum recursive-draft confidence for the fast N=2 verifier. Default: 3\n"
-        "  -c, --ctx N\n"
-        "      Context size allocated at startup. Default: 32768\n"
-        "  -n, --tokens N\n"
-        "      Default max output tokens when the client omits a limit. Default: 393216 (384K)\n"
-        "  -t, --threads N\n"
-        "      CPU helper threads for lightweight host-side work.\n"
-        "  --chdir DIR\n"
-        "      Change working directory before loading the model or runtime assets.\n"
-        "  --quality\n"
-        "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
-        "  --dir-steering-file FILE\n"
-        "      Load one f32 direction vector per layer for directional steering.\n"
-        "  --dir-steering-ffn F\n"
-        "      Apply steering after FFN outputs: y -= F*v*dot(v,y). Default with file: 1\n"
-        "  --dir-steering-attn F\n"
-        "      Apply steering after attention outputs. Default: 0\n"
-        "  --warm-weights\n"
-        "      Touch mapped tensor pages before serving. Slower startup, fewer first-use stalls.\n"
-        "  --power N\n"
-        "      Target GPU duty cycle percentage, 1..100. Default: 100\n"
-        "  --metal | --cuda | --cpu | --backend NAME\n"
-        "      Select backend explicitly. Defaults to Metal on macOS and CUDA on CUDA builds.\n"
-        "\n"
-        "HTTP API:\n"
-        "  --host HOST\n"
-        "      Bind address. Default: 127.0.0.1\n"
-        "  --port N\n"
-        "      Bind port. Default: 8000\n"
-        "  --cors\n"
-        "      Add Access-Control-Allow-* headers for browser JS clients. Does not change --host.\n"
-        "  --trace FILE\n"
-        "      Write a human-readable session trace: prompts, cache decisions, output, tool calls.\n"
-        "\n"
-        "Thinking and sampling:\n"
-        "  DeepSeek-compatible chat requests default to thinking mode with high effort.\n"
-        "  Only reasoning_effort=max or output_config.effort=max requests Think Max.\n"
-        "  Think Max is applied only when --ctx is at least 393216 tokens; smaller contexts use high.\n"
-        "  thinking={type:disabled}, think=false, or model=deepseek-chat selects non-thinking mode.\n"
-        "  API defaults are temperature=1, top_p=1, min_p=0.05, and no top-k cap.\n"
-        "  In thinking mode, client sampling knobs are ignored like the official API.\n"
-        "\n"
-        "Disk KV cache:\n"
-        "  --kv-disk-dir DIR\n"
-        "      Enable disk KV checkpoints in DIR. The directory is created if needed.\n"
-        "  --kv-disk-space-mb N\n"
-        "      Disk budget for checkpoint files. Default when enabled: 4096\n"
-        "  --kv-cache-min-tokens N\n"
-        "      Do not save or load checkpoints shorter than N tokens. Default: 512\n"
-        "  --kv-cache-cold-max-tokens N\n"
-        "      Cold first prompts in [min,N] are saved automatically. 0 disables cold saves. Default: 30000\n"
-        "  --kv-cache-continued-interval-tokens N\n"
-        "      Save at absolute aligned frontiers spaced about N tokens apart. 0 disables. Default: 10000\n"
-        "  --kv-cache-boundary-trim-tokens N\n"
-        "      Trim this many tail tokens before cold boundary saves to avoid tokenizer boundary merges. Default: 32\n"
-        "  --kv-cache-boundary-align-tokens N\n"
-        "      Align cold boundary saves down to this token multiple. 0 disables alignment. Default: 2048\n"
-        "  --kv-cache-reject-different-quant\n"
-        "      Refuse checkpoints written by the same model with a different routed-expert quantization.\n"
-        "  --disable-exact-dsml-tool-replay\n"
-        "      Disable the tool-id -> exact sampled DSML map. Tool history falls back to canonical JSON rendering.\n"
-        "  --tool-memory-max-ids N\n"
-        "      Maximum exact tool-call IDs kept in RAM for replay. Default: 100000\n"
-        "\n"
-        "  Cache triggers:\n"
-        "      cold       save a stable prefix of a long first prompt before generation starts\n"
-        "      continued  save absolute aligned restart frontiers during long prefill or generation\n"
-        "      evict      save the live conversation before another request replaces it\n"
-        "      shutdown   save the live conversation when the server exits cleanly\n"
-        "\n"
-        "Normal server command:\n"
-        "  ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192\n"
-        "\n"
-        "Notes:\n"
-        "  Use /v1/chat/completions, /v1/responses, /v1/completions, or /v1/messages.\n"
-        "  Larger --ctx values allocate more KV memory at startup; the startup log prints the estimate.\n"
-        "  Disk KV caching is best for agents that resend long prompts with stable prefixes.\n"
-        "\n"
-        "  -h, --help\n"
-        "      Show this help.\n");
+static void usage(FILE *fp, const char *topic) {
+    ds4_help_print(fp, DS4_HELP_SERVER, topic);
 }
 
 static ds4_backend parse_backend_arg(const char *s, const char *arg) {
@@ -11440,9 +11413,29 @@ static server_config parse_options(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
-            usage(stdout);
+            const char *topic = (i + 1 < argc && argv[i + 1][0] != '-') ?
+                argv[i + 1] : NULL;
+            usage(stdout, topic);
             exit(0);
-        } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
+        }
+        char dist_parse_err[256] = {0};
+        ds4_dist_cli_parse_result dist_parse =
+            ds4_dist_parse_cli_arg(arg,
+                                   &i,
+                                   argc,
+                                   argv,
+                                   &c.engine.distributed,
+                                   dist_parse_err,
+                                   sizeof(dist_parse_err));
+        if (dist_parse == DS4_DIST_CLI_ERROR) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: %s",
+                       dist_parse_err[0] ? dist_parse_err : "invalid distributed option");
+            exit(2);
+        }
+        if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
+
+        if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
@@ -11514,7 +11507,7 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_CPU;
         } else {
             server_log(DS4_LOG_DEFAULT, "ds4-server: unknown option: %s", arg);
-            usage(stderr);
+            usage(stderr, NULL);
             exit(2);
         }
     }
@@ -11527,6 +11520,14 @@ static server_config parse_options(int argc, char **argv) {
     }
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
+    }
+    char dist_err[256];
+    if (ds4_dist_prepare_engine_options(&c.engine.distributed,
+                                        &c.engine,
+                                        dist_err,
+                                        sizeof(dist_err)) != 0) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: %s", dist_err);
+        exit(2);
     }
     return c;
 }
@@ -11552,6 +11553,14 @@ int main(int argc, char **argv) {
     if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
 
     log_context_memory(cfg.engine.backend, cfg.ctx_size);
+    if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
+        ds4_dist_generation_options gen = {
+            .ctx_size = cfg.ctx_size,
+        };
+        int rc = ds4_dist_run(engine, &cfg.engine.distributed, &gen);
+        ds4_engine_close(engine);
+        return rc;
+    }
 
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
@@ -14311,12 +14320,18 @@ static void test_json_skip_has_nesting_limit(void) {
 
 static void test_model_metadata_clamps_completion_to_context(void) {
     buf b = {0};
-    append_model_json_values(&b, 32768, 393216);
+    append_model_json_values(&b, "deepseek-v4-flash", "DeepSeek V4 Flash",
+                             32768, 393216);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":32768") != NULL);
     buf_free(&b);
 
-    append_model_json_values(&b, 100000, 4096);
+    append_model_json_values(&b, "deepseek-v4-pro", "DeepSeek V4 Pro",
+                             100000, 4096);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":4096") != NULL);
     buf_free(&b);
@@ -14582,8 +14597,10 @@ static void test_kv_stub_file(const char *dir, const char *sha,
     free(path);
 }
 
-static void test_kv_text_stub_file(const char *dir, const char *text,
-                                   uint32_t tokens, uint64_t payload_bytes) {
+static void test_kv_text_stub_file_model(const char *dir, const char *text,
+                                         uint8_t model_id, uint8_t reason,
+                                         uint32_t tokens,
+                                         uint64_t payload_bytes) {
     char sha[41];
     sha1_bytes_hex(text, strlen(text), sha);
     char name[44];
@@ -14597,7 +14614,8 @@ static void test_kv_text_stub_file(const char *dir, const char *text,
     }
 
     uint8_t h[KV_CACHE_FIXED_HEADER];
-    kv_fill_header(h, 2, KV_REASON_COLD, 0, tokens, 0, 32768, 100, 100, payload_bytes);
+    ds4_kvstore_fill_header(h, model_id, 2, reason, 0, tokens, 0,
+                            32768, 100, 100, payload_bytes);
     uint8_t text_len[4];
     le_put32(text_len, (uint32_t)strlen(text));
     TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
@@ -14610,6 +14628,12 @@ static void test_kv_text_stub_file(const char *dir, const char *text,
     free(path);
 }
 
+static void test_kv_text_stub_file(const char *dir, const char *text,
+                                   uint8_t reason,
+                                   uint32_t tokens, uint64_t payload_bytes) {
+    test_kv_text_stub_file_model(dir, text, 0, reason, tokens, payload_bytes);
+}
+
 static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
     char tmpl[] = "/tmp/ds4-kv-text-prefix-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -14618,8 +14642,8 @@ static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
 
     const char *short_text = "transcript prefix";
     const char *long_text = "transcript prefix with sampled token bytes";
-    test_kv_text_stub_file(dir, short_text, 512, 0);
-    test_kv_text_stub_file(dir, long_text, 768, 0);
+    test_kv_text_stub_file(dir, short_text, KV_REASON_COLD, 512, 0);
+    test_kv_text_stub_file(dir, long_text, KV_REASON_COLD, 768, 0);
 
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -14647,6 +14671,79 @@ static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
     unlink(long_path);
     free(short_path);
     free(long_path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_lookup_rejects_wrong_model(void) {
+    char tmpl[] = "/tmp/ds4-kv-model-id-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *text = "shared rendered prefix";
+    test_kv_text_stub_file_model(dir, text, 1, KV_REASON_COLD, 512, 0);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, "shared rendered prefix and tail",
+                                             0, 2, 32768) < 0);
+    int idx = ds4_kvstore_find_text_prefix(&kc, "shared rendered prefix and tail",
+                                           1, 2, 32768);
+    TEST_ASSERT(idx >= 0);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].model_id == 1);
+
+    kv_cache_close(&kc);
+    char sha[41];
+    sha1_bytes_hex(text, strlen(text), sha);
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    unlink(path);
+    free(path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_lookup_rejects_stale_payload_abi(void) {
+    char tmpl[] = "/tmp/ds4-kv-stale-abi-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *text = "stale rendered prefix";
+    char sha[41];
+    sha1_bytes_hex(text, strlen(text), sha);
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        uint8_t h[KV_CACHE_FIXED_HEADER];
+        kv_fill_header(h, 2, KV_REASON_COLD, 0, 512, 0, 32768, 100, 100, 0);
+        h[20] = 0; /* pre-ABI-guard files used this byte as reserved zero. */
+        uint8_t text_len[4];
+        le_put32(text_len, (uint32_t)strlen(text));
+        TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
+        TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
+        TEST_ASSERT(fwrite(text, 1, strlen(text), fp) == strlen(text));
+        TEST_ASSERT(fclose(fp) == 0);
+    }
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, "stale rendered prefix and tail",
+                                             0, 2, 32768) < 0);
+
+    kv_cache_close(&kc);
+    unlink(path);
+    free(path);
     rmdir(dir);
 }
 
@@ -14808,7 +14905,7 @@ static void test_kv_cache_eviction_values_fresh_snapshots(void) {
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
     kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
-    kv_cache_evict(&kc, NULL, NULL);
+    kv_cache_evict(&kc, NULL, 0, NULL);
 
     TEST_ASSERT(access(old_path, F_OK) != 0);
     TEST_ASSERT(access(new_path, F_OK) == 0);
@@ -14821,75 +14918,197 @@ static void test_kv_cache_eviction_values_fresh_snapshots(void) {
     rmdir(dir);
 }
 
-static void test_kv_cache_eviction_protects_current_store(void) {
-    char tmpl[] = "/tmp/ds4-kv-current-store-evict-test.XXXXXX";
+static void test_kv_cache_eviction_prefers_anchor_reason(void) {
+    char tmpl[] = "/tmp/ds4-kv-anchor-reason-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *anchor_sha = "1111111111111111111111111111111111111111";
+    const char *continued_sha = "2222222222222222222222222222222222222222";
+    uint64_t now = (uint64_t)time(NULL);
+    test_kv_stub_file(dir, anchor_sha, KV_REASON_COLD, 2048, 0, now, 2048);
+    test_kv_stub_file(dir, continued_sha, KV_REASON_CONTINUED, 2048, 0, now, 2048);
+
+    char anchor_name[44], continued_name[44];
+    snprintf(anchor_name, sizeof(anchor_name), "%.40s.kv", anchor_sha);
+    snprintf(continued_name, sizeof(continued_name), "%.40s.kv", continued_sha);
+    char *anchor_path = path_join(dir, anchor_name);
+    char *continued_path = path_join(dir, continued_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
+    kv_cache_evict(&kc, NULL, 0, NULL);
+
+    TEST_ASSERT(access(anchor_path, F_OK) == 0);
+    TEST_ASSERT(access(continued_path, F_OK) != 0);
+
+    kv_cache_close(&kc);
+    unlink(anchor_path);
+    unlink(continued_path);
+    free(anchor_path);
+    free(continued_path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_eviction_makes_room_before_store(void) {
+    char tmpl[] = "/tmp/ds4-kv-pre-store-evict-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
     TEST_ASSERT(dir != NULL);
     if (!dir) return;
 
     const char *old_sha = "1111111111111111111111111111111111111111";
-    const char *new_sha = "2222222222222222222222222222222222222222";
     uint64_t now = (uint64_t)time(NULL);
     test_kv_stub_file(dir, old_sha, KV_REASON_COLD, 4096, 0, now, 2048);
-    test_kv_stub_file(dir, new_sha, KV_REASON_CONTINUED, 2048, 0, now, 4096);
 
-    char old_name[44], new_name[44];
+    char old_name[44];
     snprintf(old_name, sizeof(old_name), "%.40s.kv", old_sha);
-    snprintf(new_name, sizeof(new_name), "%.40s.kv", new_sha);
     char *old_path = path_join(dir, old_name);
-    char *new_path = path_join(dir, new_name);
 
     kv_disk_cache kc = {0};
     kc.enabled = true;
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
     kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 4096u) + 16u;
-    kv_cache_evict(&kc, NULL, new_sha);
+    kv_cache_evict(&kc, NULL, KV_CACHE_FIXED_HEADER + 4u + 4096u, NULL);
 
     TEST_ASSERT(access(old_path, F_OK) != 0);
-    TEST_ASSERT(access(new_path, F_OK) == 0);
 
     kv_cache_close(&kc);
     unlink(old_path);
-    unlink(new_path);
     free(old_path);
-    free(new_path);
     rmdir(dir);
 }
 
-static void test_kv_cache_eviction_does_not_protect_oversize_current_store(void) {
+static void test_kv_cache_eviction_ignores_oversize_incoming(void) {
     char tmpl[] = "/tmp/ds4-kv-oversize-store-evict-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
     TEST_ASSERT(dir != NULL);
     if (!dir) return;
 
     const char *old_sha = "1111111111111111111111111111111111111111";
-    const char *new_sha = "2222222222222222222222222222222222222222";
     uint64_t now = (uint64_t)time(NULL);
     test_kv_stub_file(dir, old_sha, KV_REASON_COLD, 4096, 0, now, 1024);
-    test_kv_stub_file(dir, new_sha, KV_REASON_CONTINUED, 4096, 0, now, 4096);
 
-    char old_name[44], new_name[44];
+    char old_name[44];
     snprintf(old_name, sizeof(old_name), "%.40s.kv", old_sha);
-    snprintf(new_name, sizeof(new_name), "%.40s.kv", new_sha);
     char *old_path = path_join(dir, old_name);
-    char *new_path = path_join(dir, new_name);
 
     kv_disk_cache kc = {0};
     kc.enabled = true;
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
     kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 1024u) + 16u;
-    kv_cache_evict(&kc, NULL, new_sha);
+    kv_cache_evict(&kc, NULL, kc.budget_bytes + 1, NULL);
 
     TEST_ASSERT(access(old_path, F_OK) == 0);
-    TEST_ASSERT(access(new_path, F_OK) != 0);
 
     kv_cache_close(&kc);
     unlink(old_path);
-    unlink(new_path);
     free(old_path);
-    free(new_path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_eviction_prefers_superseded_continued_prefix(void) {
+    char tmpl[] = "/tmp/ds4-kv-prefix-evict-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *continued_text = "system: hello world";
+    const char *cold_text = "different stable prefix";
+    const char *incoming_text = "system: hello world\nuser: prompt";
+    test_kv_text_stub_file(dir, continued_text, KV_REASON_CONTINUED, 4096, 2048);
+    test_kv_text_stub_file(dir, cold_text, KV_REASON_COLD, 1024, 2048);
+
+    char continued_sha[41], cold_sha[41];
+    sha1_bytes_hex(continued_text, strlen(continued_text), continued_sha);
+    sha1_bytes_hex(cold_text, strlen(cold_text), cold_sha);
+    char continued_name[44], cold_name[44];
+    snprintf(continued_name, sizeof(continued_name), "%.40s.kv", continued_sha);
+    snprintf(cold_name, sizeof(cold_name), "%.40s.kv", cold_sha);
+    char *continued_path = path_join(dir, continued_name);
+    char *cold_path = path_join(dir, cold_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    uint64_t incoming_bytes =
+        KV_CACHE_FIXED_HEADER + 4u + strlen(incoming_text) + 2048u;
+    kc.budget_bytes =
+        incoming_bytes + KV_CACHE_FIXED_HEADER + 4u + strlen(cold_text) + 2048u;
+    ds4_kvstore_eviction_context incoming = {
+        .text = incoming_text,
+        .text_len = strlen(incoming_text),
+        .model_id = 0,
+        .quant_bits = 2,
+        .ctx_size = 32768,
+        .reject_different_quant = false,
+    };
+    kv_cache_evict(&kc, NULL, incoming_bytes, &incoming);
+
+    TEST_ASSERT(access(continued_path, F_OK) != 0);
+    TEST_ASSERT(access(cold_path, F_OK) == 0);
+
+    kv_cache_close(&kc);
+    unlink(continued_path);
+    unlink(cold_path);
+    free(continued_path);
+    free(cold_path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_eviction_keeps_smaller_context_prefix(void) {
+    char tmpl[] = "/tmp/ds4-kv-prefix-ctx-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *continued_text = "system: hello world";
+    const char *cold_text = "different stable prefix";
+    const char *incoming_text = "system: hello world\nuser: prompt";
+    test_kv_text_stub_file(dir, continued_text, KV_REASON_CONTINUED, 4096, 2048);
+    test_kv_text_stub_file(dir, cold_text, KV_REASON_COLD, 1024, 2048);
+
+    char continued_sha[41], cold_sha[41];
+    sha1_bytes_hex(continued_text, strlen(continued_text), continued_sha);
+    sha1_bytes_hex(cold_text, strlen(cold_text), cold_sha);
+    char continued_name[44], cold_name[44];
+    snprintf(continued_name, sizeof(continued_name), "%.40s.kv", continued_sha);
+    snprintf(cold_name, sizeof(cold_name), "%.40s.kv", cold_sha);
+    char *continued_path = path_join(dir, continued_name);
+    char *cold_path = path_join(dir, cold_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    uint64_t incoming_bytes =
+        KV_CACHE_FIXED_HEADER + 4u + strlen(incoming_text) + 2048u;
+    kc.budget_bytes =
+        incoming_bytes + KV_CACHE_FIXED_HEADER + 4u + strlen(continued_text) + 2048u;
+    ds4_kvstore_eviction_context incoming = {
+        .text = incoming_text,
+        .text_len = strlen(incoming_text),
+        .model_id = 0,
+        .quant_bits = 2,
+        .ctx_size = 65536,
+        .reject_different_quant = false,
+    };
+    kv_cache_evict(&kc, NULL, incoming_bytes, &incoming);
+
+    TEST_ASSERT(access(continued_path, F_OK) == 0);
+    TEST_ASSERT(access(cold_path, F_OK) != 0);
+
+    kv_cache_close(&kc);
+    unlink(continued_path);
+    unlink(cold_path);
+    free(continued_path);
+    free(cold_path);
     rmdir(dir);
 }
 
@@ -14902,8 +15121,8 @@ static void test_kv_cache_eviction_score_decays_stale_hits(void) {
     kv_entry stale = {.tokens = 1024, .hits = 10, .file_size = 4096, .last_used = 1000};
     kv_entry fresh = {.tokens = 2048, .hits = 0,  .file_size = 4096, .last_used = now};
 
-    double s_on = kv_entry_eviction_score(&stale, NULL, NULL, now);
-    double f_on = kv_entry_eviction_score(&fresh, NULL, NULL, now);
+    double s_on = kv_entry_eviction_score(&stale, NULL, now, NULL);
+    double f_on = kv_entry_eviction_score(&fresh, NULL, now, NULL);
     TEST_ASSERT(s_on < f_on);
 
     /* A fresh entry's score never decays below its (0+1) * tokens/size floor,
@@ -14937,7 +15156,7 @@ static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
     kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
-    kv_cache_evict(&kc, NULL, NULL);
+    kv_cache_evict(&kc, NULL, 0, NULL);
 
     TEST_ASSERT(access(old_path, F_OK) != 0);
     TEST_ASSERT(access(new_path, F_OK) == 0);
@@ -14973,7 +15192,7 @@ static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
     kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
-    kv_cache_evict(&kc, NULL, NULL);
+    kv_cache_evict(&kc, NULL, 0, NULL);
 
     TEST_ASSERT(access(cold_path, F_OK) != 0);
     TEST_ASSERT(access(continued_path, F_OK) == 0);
@@ -15336,9 +15555,14 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
     test_kv_cache_lookup_uses_longest_text_prefix();
+    test_kv_cache_lookup_rejects_wrong_model();
+    test_kv_cache_lookup_rejects_stale_payload_abi();
     test_kv_cache_eviction_values_fresh_snapshots();
-    test_kv_cache_eviction_protects_current_store();
-    test_kv_cache_eviction_does_not_protect_oversize_current_store();
+    test_kv_cache_eviction_prefers_anchor_reason();
+    test_kv_cache_eviction_makes_room_before_store();
+    test_kv_cache_eviction_ignores_oversize_incoming();
+    test_kv_cache_eviction_prefers_superseded_continued_prefix();
+    test_kv_cache_eviction_keeps_smaller_context_prefix();
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();

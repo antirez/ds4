@@ -36,14 +36,22 @@ int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
 
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
+int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
+int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
-int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
+int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
+int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
+int ds4_gpu_pro_q4_expert_table_auto_available(void);
+int ds4_gpu_preload_q4_expert_tables(const void *model_map, uint64_t model_size,
+                                     uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+                                     uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                                     uint32_t n_total_expert);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
 void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_print_memory_report(const char *label);
@@ -118,6 +126,13 @@ int ds4_gpu_indexer_topk_tensor(
         uint32_t                n_comp,
         uint32_t                n_tokens,
         uint32_t                top_k);
+
+/* GPU argmax over n_vocab F32 logits. Writes the winning index as int32 at
+ * out_idx[0]. Tie-break: lower index wins (matches host sample_argmax). */
+int ds4_gpu_argmax_tensor(
+        ds4_gpu_tensor       *out_idx,
+        const ds4_gpu_tensor *logits,
+        uint32_t                n_vocab);
 
 int ds4_gpu_dsv4_topk_mask_tensor(
         ds4_gpu_tensor       *mask,
@@ -607,6 +622,9 @@ int ds4_gpu_router_select_tensor(
         uint64_t                hash_offset,
         uint32_t                hash_rows,
         uint32_t                token,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        float                   expert_weight_scale,
         uint32_t                n_expert_groups,
         uint32_t                n_group_used,
         bool                    has_bias,
@@ -628,7 +646,12 @@ int ds4_gpu_router_select_batch_tensor(
         bool                    hash_mode,
         const ds4_gpu_tensor *logits,
         const ds4_gpu_tensor *tokens,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        float                   expert_weight_scale,
         uint32_t                n_tokens);
+
+int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n_selected);
 
 int ds4_gpu_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,
@@ -652,9 +675,11 @@ int ds4_gpu_routed_moe_one_tensor(
         uint32_t                out_dim,
         const ds4_gpu_tensor *selected,
         const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
         uint32_t                n_expert,
         float                   clamp,
-        const ds4_gpu_tensor *x);
+        const ds4_gpu_tensor *x,
+        uint32_t                layer_index);
 
 int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
@@ -678,6 +703,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                out_dim,
         const ds4_gpu_tensor *selected,
         const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
         uint32_t                n_expert,
         float                   clamp,
         const ds4_gpu_tensor *x,
