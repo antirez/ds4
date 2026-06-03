@@ -827,7 +827,8 @@ static const char agent_tools_prompt_after_edit[] =
     "        \"label\": {\"type\": \"string\"},\n"
     "        \"reason\": {\"type\": \"string\"},\n"
     "        \"allow_side_effect_mismatch\": {\"type\": \"boolean\"},\n"
-    "        \"dry_run\": {\"type\": \"boolean\"}\n"
+    "        \"dry_run\": {\"type\": \"boolean\"},\n"
+    "        \"confirm\": {\"type\": \"boolean\"}\n"
     "      },\n"
     "      \"required\": [\"action\"]\n"
     "    }\n"
@@ -6942,6 +6943,7 @@ static char *agent_context_checkpoint(agent_worker *w, const agent_tool_call *ca
     char id[41];
     char *kv_file = NULL, *meta_file = NULL, *mem_file = NULL;
     char *kv_path = NULL, *meta_path = NULL;
+    bool unique_id = false;
     for (int i = 0; i < 16; i++) {
         agent_context_generate_id(id);
         free(kv_file);
@@ -6954,7 +6956,19 @@ static char *agent_context_checkpoint(agent_worker *w, const agent_tool_call *ca
         mem_file = ds4_agent_context_file_name(id, ".memory.md");
         kv_path = ds4_agent_context_path_for_file(w->context_dir, kv_file);
         meta_path = ds4_agent_context_path_for_file(w->context_dir, meta_file);
-        if (access(meta_path, F_OK) != 0 && access(kv_path, F_OK) != 0) break;
+        if (access(meta_path, F_OK) != 0 && access(kv_path, F_OK) != 0) {
+            unique_id = true;
+            break;
+        }
+    }
+    if (!unique_id) {
+        free(label);
+        free(kv_file);
+        free(meta_file);
+        free(mem_file);
+        free(kv_path);
+        free(meta_path);
+        return xstrdup("Tool error: context checkpoint id collision\n");
     }
 
     int tokens = w->transcript.len;
@@ -7103,7 +7117,9 @@ static char *agent_context_restore_notice(agent_worker *w,
              allowed_mismatch ? "true" : "false");
     agent_buf_puts(&b, line);
     agent_buf_puts(&b,
-        "External side effects were not reverted; inspect or revert files, processes, browser state, and network effects separately before assuming the workspace matches this checkpoint.\n");
+        "External side effects were not reverted; inspect or revert files, "
+        "processes, browser state, and network effects separately before "
+        "assuming the workspace matches this checkpoint.\n");
     agent_context_append_side_effects_since(w, meta->world_epoch, &b);
     free(safe_label);
     free(safe_reason);
@@ -7241,11 +7257,23 @@ static char *agent_context_restore(agent_worker *w, const agent_tool_call *call,
     ds4_tokens_free(&loaded);
     if (restored.len + 16 >= w->cfg->gen.ctx_size) {
         ds4_tokens_free(&restored);
+        char sync_err[160] = {0};
+        bool live_resynced = agent_context_resync_live_transcript(w,
+                                                                  sync_err,
+                                                                  sizeof(sync_err));
         ds4_agent_context_meta_free(&meta);
         free(meta_path);
         free(kv_path);
         free(notice);
-        return xstrdup("Tool error: restore notice would exceed context\n");
+        agent_buf b = {0};
+        char line[256];
+        snprintf(line, sizeof(line),
+                 "Tool error: restore notice would exceed context; live_session=%s%s%s\n",
+                 live_resynced ? "resynced" : "invalidated",
+                 !live_resynced && sync_err[0] ? " error=" : "",
+                 !live_resynced && sync_err[0] ? sync_err : "");
+        agent_buf_puts(&b, line);
+        return agent_buf_take(&b);
     }
     agent_sync_metrics sync_metrics = {0};
     if (agent_worker_sync_tokens_ex(w, &restored, false, err, sizeof(err),
@@ -7343,7 +7371,10 @@ static char *agent_context_status(agent_worker *w) {
     pthread_mutex_unlock(&w->mu);
     char msg[640];
     snprintf(msg, sizeof(msg),
-             "context status transcript_tokens=%d session_pos=%d cached_tokens=%d prefill_suffix_tokens=%d ctx_size=%d free_tokens=%d dirty=%s world_epoch=%" PRIu64 " active_bash_jobs=%d checkpoints=%d\n",
+             "context status transcript_tokens=%d session_pos=%d "
+             "cached_tokens=%d prefill_suffix_tokens=%d ctx_size=%d "
+             "free_tokens=%d dirty=%s world_epoch=%" PRIu64 " "
+             "active_bash_jobs=%d checkpoints=%d\n",
              w->transcript.len, pos, cached, prefill_suffix,
              ctx, ctx - pos, dirty ? "true" : "false", w->world_epoch,
              running, checkpoints);
@@ -7353,6 +7384,7 @@ static char *agent_context_status(agent_worker *w) {
 static char *agent_context_drop(agent_worker *w, const agent_tool_call *call) {
     const char *id = agent_tool_arg_value(call, "id");
     bool dry_run = agent_parse_bool_default(agent_tool_arg_value(call, "dry_run"), false);
+    bool confirm = agent_parse_bool_default(agent_tool_arg_value(call, "confirm"), false);
     int running = agent_context_running_bash_jobs(w);
     char guard_err[256] = {0};
     if (!ds4_agent_context_no_running_bash_guard("drop", running,
@@ -7380,6 +7412,20 @@ static char *agent_context_drop(agent_worker *w, const agent_tool_call *call) {
     if (dry_run) {
         char msg[160];
         snprintf(msg, sizeof(msg), "context action=drop-dry-run id=%.40s\n", meta.id);
+        ds4_agent_context_meta_free(&meta);
+        free(meta_path);
+        free(kv_path);
+        free(memory_path);
+        return xstrdup(msg);
+    }
+    if (!confirm) {
+        char *safe = ds4_agent_context_oneline(meta.label, 160);
+        char msg[320];
+        snprintf(msg, sizeof(msg),
+                 "Tool error: context drop requires confirm=true; "
+                 "use dry_run=true first id=%.40s label=\"%s\"\n",
+                 meta.id, safe);
+        free(safe);
         ds4_agent_context_meta_free(&meta);
         free(meta_path);
         free(kv_path);
@@ -7423,7 +7469,9 @@ static char *agent_tool_context(agent_worker *w, const agent_tool_call *call,
         }
         char msg[256];
         snprintf(msg, sizeof(msg),
-                 "context action=compact status=ok old_tokens=%d new_tokens=%d removed_tokens=%d reduction_percent=%.1f summary_tokens=%d tail_tokens=%d\n",
+                 "context action=compact status=ok old_tokens=%d "
+                 "new_tokens=%d removed_tokens=%d reduction_percent=%.1f "
+                 "summary_tokens=%d tail_tokens=%d\n",
                  stats.old_tokens, stats.new_tokens, stats.removed_tokens,
                  stats.reduction_percent, stats.summary_tokens,
                  stats.tail_tokens);
@@ -7438,6 +7486,7 @@ static bool agent_tool_call_requires_exclusive_context(const agent_tool_call *ca
     return action &&
            (!strcmp(action, "checkpoint") ||
             !strcmp(action, "restore") ||
+            !strcmp(action, "drop") ||
             !strcmp(action, "compact"));
 }
 
@@ -7530,7 +7579,9 @@ static char *agent_execute_tool_calls(agent_worker *w, const agent_tool_calls *c
         if (agent_tool_call_requires_exclusive_context(&calls->v[i]) &&
             calls->len != 1)
         {
-            return xstrdup("Tool error: context checkpoint, restore, and compact must be the only tool call in a DSML block\n");
+            return xstrdup("Tool error: context checkpoint, restore, drop, "
+                           "and compact must be the only tool call in a "
+                           "DSML block\n");
         }
     }
     for (int i = 0; i < calls->len; i++) {

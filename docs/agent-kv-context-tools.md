@@ -69,7 +69,8 @@ actions easier to add without teaching the model a large new catalog.
         "label": {"type": "string"},
         "reason": {"type": "string"},
         "allow_side_effect_mismatch": {"type": "boolean"},
-        "dry_run": {"type": "boolean"}
+        "dry_run": {"type": "boolean"},
+        "confirm": {"type": "boolean"}
       },
       "required": ["action"]
     }
@@ -89,8 +90,9 @@ Initial actions:
 - `drop`: delete checkpoint metadata and its associated payload when safe.
   In the first implementation, "safe" means the checkpoint id resolves
   unambiguously, paths remain inside the context directory, and no bash job is
-  running. The tool does not understand semantic roles such as "best baseline";
-  callers should use `dry_run=true` before deleting important checkpoints.
+  running. Deletion requires `confirm=true`; callers should use `dry_run=true`
+  first because the tool does not understand semantic roles such as "best
+  baseline".
 
 Phase 1 should be disk-backed and reuse the existing agent KV save/load path.
 That avoids holding multiple huge KV payloads in RAM and keeps the first

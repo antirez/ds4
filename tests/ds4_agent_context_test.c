@@ -39,7 +39,7 @@ static char *make_temp_dir(void) {
     return NULL;
 }
 
-static void write_raw_file(const char *path, const char *id) {
+static void write_raw_file(const char *path, const char *id, const char *kv_path) {
     FILE *fp = fopen(path, "wb");
     CHECK(fp != NULL, "failed to open raw metadata");
     fprintf(fp,
@@ -49,10 +49,10 @@ static void write_raw_file(const char *path, const char *id) {
             "  \"created_at\": 1,\n"
             "  \"world_epoch\": 1,\n"
             "  \"transcript_tokens\": 10,\n"
-            "  \"kv_path\": \"../escape.kv\",\n"
-            "  \"memory_path\": \"safe.memory.md\"\n"
+            "  \"kv_path\": \"%s\",\n"
+            "  \"memory_path\": \"%s.memory.md\"\n"
             "}\n",
-            id);
+            id, kv_path, id);
     CHECK(fclose(fp) == 0, "failed to write raw metadata");
 }
 
@@ -89,6 +89,7 @@ int main(void) {
     static const char id2[] = "2222222222222222222222222222222222222222";
     static const char id3[] = "3333333333333333333333333333333333333333";
     static const char id4[] = "4444444444444444444444444444444444444444";
+    static const char id5[] = "5555555555555555555555555555555555555555";
     char err[256] = {0};
     char *dir = make_temp_dir();
 
@@ -121,6 +122,16 @@ int main(void) {
 
     CHECK(ds4_agent_context_count_checkpoints(dir) == 2, "checkpoint count mismatch");
     CHECK(ds4_agent_context_max_world_epoch(dir) == 12, "max world epoch mismatch");
+    CHECK(ds4_agent_context_file_component_safe("safe.kv"),
+          "safe component rejected");
+    CHECK(!ds4_agent_context_file_component_safe("."),
+          "dot component should be rejected");
+    CHECK(!ds4_agent_context_file_component_safe(".."),
+          "dotdot component should be rejected");
+    CHECK(ds4_agent_context_meta_filename(meta1_name),
+          "valid metadata filename rejected");
+    CHECK(!ds4_agent_context_meta_filename("junk.meta.json"),
+          "invalid metadata filename accepted");
 
     ds4_agent_context_meta found = {0};
     char *found_meta_path = NULL;
@@ -138,11 +149,19 @@ int main(void) {
 
     char *unsafe_name = ds4_agent_context_file_name(id3, ".meta.json");
     char *unsafe_path = ds4_agent_context_path_for_file(dir, unsafe_name);
-    write_raw_file(unsafe_path, id3);
+    write_raw_file(unsafe_path, id3, "../escape.kv");
     ds4_agent_context_meta unsafe = {0};
     CHECK(!ds4_agent_context_read_meta_file(unsafe_path, &unsafe, err, sizeof(err)),
           "unsafe metadata path should be rejected");
     ds4_agent_context_meta_free(&unsafe);
+
+    char *dotdot_name = ds4_agent_context_file_name(id5, ".meta.json");
+    char *dotdot_path = ds4_agent_context_path_for_file(dir, dotdot_name);
+    write_raw_file(dotdot_path, id5, "..");
+    ds4_agent_context_meta dotdot = {0};
+    CHECK(!ds4_agent_context_read_meta_file(dotdot_path, &dotdot, err, sizeof(err)),
+          "dotdot metadata path should be rejected");
+    ds4_agent_context_meta_free(&dotdot);
 
     char *collision_name = ds4_agent_context_file_name(id4, ".meta.json");
     char *collision_path = ds4_agent_context_path_for_file(dir, collision_name);
@@ -228,15 +247,18 @@ int main(void) {
     unlink(meta1_path);
     unlink(meta2_path);
     unlink(unsafe_path);
+    unlink(dotdot_path);
     unlink(collision_path);
     rmdir(dir);
     free(meta1_name);
     free(meta2_name);
     free(unsafe_name);
+    free(dotdot_name);
     free(collision_name);
     free(meta1_path);
     free(meta2_path);
     free(unsafe_path);
+    free(dotdot_path);
     free(collision_path);
     free(dir);
     return 0;

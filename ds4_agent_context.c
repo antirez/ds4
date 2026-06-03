@@ -141,10 +141,20 @@ bool ds4_agent_context_id_valid(const char *id) {
 
 bool ds4_agent_context_file_component_safe(const char *s) {
     if (!s || !s[0]) return false;
+    if (!strcmp(s, ".") || !strcmp(s, "..")) return false;
     for (const char *p = s; *p; p++) {
         if (*p == '/' || *p == '\\') return false;
     }
     return true;
+}
+
+static bool ctx_file_component_matches(const char *s, const char id[41],
+                                       const char *suffix) {
+    if (!s || !id || !suffix) return false;
+    size_t suffix_len = strlen(suffix);
+    size_t n = strlen(s);
+    if (n != 40 + suffix_len) return false;
+    return !memcmp(s, id, 40) && !strcmp(s + 40, suffix);
 }
 
 char *ds4_agent_context_file_name(const char id[41], const char *suffix) {
@@ -402,9 +412,13 @@ bool ds4_agent_context_read_meta_file(const char *path,
         m->kv_file = ds4_agent_context_file_name(m->id, ".kv");
     if (ok && !ctx_json_get_string(json, "memory_path", &m->memory_file))
         m->memory_file = ds4_agent_context_file_name(m->id, ".memory.md");
-    if (ok && !ds4_agent_context_file_component_safe(m->kv_file)) ok = false;
+    if (ok && (!ds4_agent_context_file_component_safe(m->kv_file) ||
+               !ctx_file_component_matches(m->kv_file, m->id, ".kv")))
+        ok = false;
     if (ok && m->memory_file && m->memory_file[0] &&
-        !ds4_agent_context_file_component_safe(m->memory_file)) ok = false;
+        (!ds4_agent_context_file_component_safe(m->memory_file) ||
+         !ctx_file_component_matches(m->memory_file, m->id, ".memory.md")))
+        ok = false;
     if (!ok) {
         ctx_set_err(err, err_len, "invalid context metadata: %s", path);
         ds4_agent_context_meta_free(m);
@@ -414,10 +428,15 @@ bool ds4_agent_context_read_meta_file(const char *path,
 }
 
 bool ds4_agent_context_meta_filename(const char *name) {
+    if (!name) return false;
     size_t n = strlen(name);
     static const char suffix[] = ".meta.json";
     size_t s = sizeof(suffix) - 1;
-    return n > s && !strcmp(name + n - s, suffix);
+    if (n != 40 + s || strcmp(name + 40, suffix)) return false;
+    char id[41];
+    memcpy(id, name, 40);
+    id[40] = '\0';
+    return ds4_agent_context_id_valid(id);
 }
 
 int ds4_agent_context_count_checkpoints(const char *context_dir) {
@@ -649,7 +668,11 @@ char *ds4_agent_context_restore_expected_metrics_line(
     if (notice_tokens < 0) notice_tokens = 0;
     if (restored_tokens < 0) restored_tokens = 0;
     snprintf(line, sizeof(line),
-             "KV restore expected metrics: checkpoint_tokens=%d expected_restore_notice_tokens=%d expected_restored_tokens=%d expected_prefill_suffix_tokens=%d expected_full_prefill_tokens_without_kv=%d expected_saved_prefill_tokens=%d.\n",
+             "KV restore expected metrics: checkpoint_tokens=%d "
+             "expected_restore_notice_tokens=%d expected_restored_tokens=%d "
+             "expected_prefill_suffix_tokens=%d "
+             "expected_full_prefill_tokens_without_kv=%d "
+             "expected_saved_prefill_tokens=%d.\n",
              checkpoint_tokens, notice_tokens, restored_tokens,
              notice_tokens, restored_tokens, checkpoint_tokens);
     ctx_buf_puts(&b, line);
