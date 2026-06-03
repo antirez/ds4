@@ -629,9 +629,17 @@ static bool git_message_valid(const char *what, const char *message,
 
 static bool git_stash_ref_safe(const char *ref, char *err, size_t err_len) {
     if (!ref || !ref[0]) return true;
-    if (!git_ref_safe(ref) ||
-        strncmp(ref, "stash@{", strlen("stash@{")) != 0 ||
-        ref[strlen(ref) - 1] != '}') {
+    static const char prefix[] = "stash@{";
+    size_t prefix_len = sizeof(prefix) - 1;
+    size_t n = strlen(ref);
+    bool ok = git_ref_safe(ref) &&
+              n > prefix_len + 1 &&
+              !strncmp(ref, prefix, prefix_len) &&
+              ref[n - 1] == '}';
+    for (size_t i = prefix_len; ok && i + 1 < n; i++) {
+        if (!isdigit((unsigned char)ref[i])) ok = false;
+    }
+    if (!ok) {
         git_set_err(err, err_len, "unsafe git stash ref: %s", ref);
         return false;
     }
@@ -661,8 +669,17 @@ static bool git_push_ref_safe(const char *ref, char *err, size_t err_len) {
         git_set_err(err, err_len, "git push requires ref");
         return false;
     }
-    if (!git_ref_safe(ref) || strchr(ref, ':')) {
+    if (!git_ref_safe(ref) || ref[0] == '+' || strchr(ref, ':')) {
         git_set_err(err, err_len, "unsafe git push ref: %s", ref);
+        return false;
+    }
+    return true;
+}
+
+static bool git_fetch_ref_safe(const char *ref, char *err, size_t err_len) {
+    if (!ref || !ref[0]) return true;
+    if (!git_ref_safe(ref) || ref[0] == '+' || strchr(ref, ':')) {
+        git_set_err(err, err_len, "unsafe git fetch ref: %s", ref);
         return false;
     }
     return true;
@@ -998,7 +1015,7 @@ bool ds4_agent_git_run_options(const ds4_agent_git_options *opts,
         }
     } else if (!strcmp(action, "fetch")) {
         if (!git_remote_safe(opts->remote, err, err_len) ||
-            !git_optional_ref_safe("ref", opts->ref, err, err_len) ||
+            !git_fetch_ref_safe(opts->ref, err, err_len) ||
             !git_confirmed_or_dry_run(opts, err, err_len))
             return false;
         argv_add(argv, &argc, "fetch");

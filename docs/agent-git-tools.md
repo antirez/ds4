@@ -71,6 +71,7 @@ Guarded remote and integration actions include `fetch`, `push`, `merge`,
 - Real `stash_pop` and `stash_drop` require `confirm=true`; `stash_apply`
   supports `dry_run` preview and leaves the stash entry intact.
 - `fetch` requires an explicit `remote`; real fetch requires `confirm=true`.
+  Optional fetch refs reject force and colon refspec syntax.
 - `push` requires explicit `remote` and `ref`; real push requires
   `confirm=true`. Push rejects force, delete, and colon refspec syntax.
 - `merge` requires an explicit target ref, `confirm=true` or `dry_run=true`,

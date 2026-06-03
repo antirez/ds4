@@ -829,6 +829,14 @@ int main(void) {
     CHECK(!ds4_agent_git_run_options(&opts, &r, err, sizeof(err)),
           "stash_show should reject non-stash refs");
 
+    opts = (ds4_agent_git_options){
+        .repo = repo,
+        .action = "stash_show",
+        .ref = "stash@{bad}",
+    };
+    CHECK(!ds4_agent_git_run_options(&opts, &r, err, sizeof(err)),
+          "stash_show should reject non-numeric stash refs");
+
     opts = (ds4_agent_git_options){.repo = repo, .action = "fetch"};
     CHECK(!ds4_agent_git_run_options(&opts, &r, err, sizeof(err)),
           "fetch should require remote");
@@ -844,6 +852,26 @@ int main(void) {
 
     opts = (ds4_agent_git_options){
         .repo = repo,
+        .action = "fetch",
+        .remote = "local",
+        .ref = "+side",
+        .dry_run = true,
+    };
+    CHECK(!ds4_agent_git_run_options(&opts, &r, err, sizeof(err)),
+          "fetch should reject force refspecs");
+
+    opts = (ds4_agent_git_options){
+        .repo = repo,
+        .action = "fetch",
+        .remote = "local",
+        .ref = "side:refs/heads/side",
+        .dry_run = true,
+    };
+    CHECK(!ds4_agent_git_run_options(&opts, &r, err, sizeof(err)),
+          "fetch should reject colon refspecs");
+
+    opts = (ds4_agent_git_options){
+        .repo = repo,
         .action = "push",
         .remote = "local",
         .ref = ":side",
@@ -851,6 +879,16 @@ int main(void) {
     };
     CHECK(!ds4_agent_git_run_options(&opts, &r, err, sizeof(err)),
           "push should reject delete refspecs");
+
+    opts = (ds4_agent_git_options){
+        .repo = repo,
+        .action = "push",
+        .remote = "local",
+        .ref = "+side",
+        .dry_run = true,
+    };
+    CHECK(!ds4_agent_git_run_options(&opts, &r, err, sizeof(err)),
+          "push should reject force refspecs");
 
     opts = (ds4_agent_git_options){.repo = repo, .action = "diff", .range = "--stat"};
     CHECK(!ds4_agent_git_run_options(&opts, &r, err, sizeof(err)),
