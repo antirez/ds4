@@ -5890,9 +5890,13 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
         }
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
+        const char *dsml_implicit = (!close && final && r->has_tools)
+            ? find_any_tool_start(raw + st->emit_pos) : NULL;
         size_t limit;
         if (close) {
             limit = (size_t)(close - raw);
+        } else if (dsml_implicit) {
+            limit = (size_t)(dsml_implicit - raw);
         } else if (final) {
             limit = raw_len;
         } else {
@@ -5911,6 +5915,9 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
 
         if (close) {
             st->emit_pos = (size_t)(close - raw) + strlen("</think>");
+            st->mode = OPENAI_STREAM_TEXT;
+        } else if (dsml_implicit) {
+            st->emit_pos = (size_t)(dsml_implicit - raw);
             st->mode = OPENAI_STREAM_TEXT;
         } else if (final) {
             st->mode = OPENAI_STREAM_SUPPRESS;
@@ -6587,9 +6594,13 @@ static bool responses_sse_stream_update(int fd, const request *r,
         }
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
+        const char *dsml_implicit = (!close && final && r->has_tools)
+            ? find_any_tool_start(raw + st->emit_pos) : NULL;
         size_t limit;
         if (close) {
             limit = (size_t)(close - raw);
+        } else if (dsml_implicit) {
+            limit = (size_t)(dsml_implicit - raw);
         } else if (final) {
             limit = raw_len;
         } else {
@@ -6620,6 +6631,10 @@ static bool responses_sse_stream_update(int fd, const request *r,
 
         if (close) {
             st->emit_pos = (size_t)(close - raw) + strlen("</think>");
+            st->mode = RESP_STREAM_TEXT;
+            st->reasoning_closed_naturally = true;
+        } else if (dsml_implicit) {
+            st->emit_pos = (size_t)(dsml_implicit - raw);
             st->mode = RESP_STREAM_TEXT;
             st->reasoning_closed_naturally = true;
         } else if (final) {
@@ -7464,9 +7479,13 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
         }
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
+        const char *dsml_implicit = (!close && final && r->has_tools)
+            ? find_any_tool_start(raw + st->emit_pos) : NULL;
         size_t limit;
         if (close) {
             limit = (size_t)(close - raw);
+        } else if (dsml_implicit) {
+            limit = (size_t)(dsml_implicit - raw);
         } else if (final) {
             limit = raw_len;
         } else {
@@ -7484,10 +7503,13 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
             st->emit_pos = limit;
         }
 
-        if (close || final) {
+        if (close || dsml_implicit || final) {
             if (!anthropic_sse_close_block_live(fd, id, st)) return false;
             if (close) {
                 st->emit_pos = (size_t)(close - raw) + strlen("</think>");
+                st->mode = ANTH_STREAM_TEXT;
+            } else if (dsml_implicit) {
+                st->emit_pos = (size_t)(dsml_implicit - raw);
                 st->mode = ANTH_STREAM_TEXT;
             } else {
                 st->mode = ANTH_STREAM_SUPPRESS;
