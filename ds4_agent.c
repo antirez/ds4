@@ -8987,6 +8987,7 @@ typedef enum {
 typedef struct {
     int timeout_sec;
     agent_yes_no_auto timeout_answer;
+    agent_yes_no_auto default_answer;
 } agent_yes_no_options;
 
 static const char *agent_yes_no_auto_name(agent_yes_no_auto answer) {
@@ -8998,7 +8999,7 @@ static const char *agent_yes_no_auto_name(agent_yes_no_auto answer) {
 }
 
 /* Shared y/n prompt.  By default it blocks forever like the historical helper;
- * callers that cannot safely stall the agent can request an automatic answer
+ * callers can request an answer for an empty response, or an automatic answer
  * after timeout_sec seconds. */
 static bool agent_prompt_yes_no_ex(const char *prompt,
                                    const agent_yes_no_options *opts,
@@ -9007,6 +9008,8 @@ static bool agent_prompt_yes_no_ex(const char *prompt,
     int timeout_sec = opts ? opts->timeout_sec : 0;
     agent_yes_no_auto auto_answer = opts ?
         opts->timeout_answer : AGENT_YES_NO_AUTO_NONE;
+    agent_yes_no_auto default_answer = opts ?
+        opts->default_answer : AGENT_YES_NO_AUTO_NONE;
     bool use_timeout = timeout_sec > 0 && auto_answer != AGENT_YES_NO_AUTO_NONE;
     double deadline = use_timeout ? now_sec() + timeout_sec : 0.0;
 
@@ -9042,6 +9045,9 @@ static bool agent_prompt_yes_no_ex(const char *prompt,
         if (!fgets(buf, sizeof(buf), stdin)) return false;
         char *p = buf;
         while (*p == ' ' || *p == '\t') p++;
+        if ((*p == '\n' || *p == '\0') &&
+            default_answer != AGENT_YES_NO_AUTO_NONE)
+            return default_answer == AGENT_YES_NO_AUTO_YES;
         if (*p == 'y' || *p == 'Y') return true;
         if (*p == 'n' || *p == 'N') return false;
     }
@@ -9051,11 +9057,20 @@ static bool agent_prompt_yes_no(const char *prompt) {
     return agent_prompt_yes_no_ex(prompt, NULL, NULL);
 }
 
+static bool agent_prompt_yes_no_default(const char *prompt,
+                                        agent_yes_no_auto default_answer) {
+    agent_yes_no_options opts = {
+        .default_answer = default_answer,
+    };
+    return agent_prompt_yes_no_ex(prompt, &opts, NULL);
+}
+
 /* Ask before discarding a dirty user session.  Fresh sessions that contain only
  * the system prompt are deliberately ignored. */
 static bool agent_maybe_save_before_leaving_session(agent_worker *w) {
     if (!agent_worker_needs_save(w)) return true;
-    if (!agent_prompt_yes_no("Save current session? (y/n) ")) return true;
+    if (!agent_prompt_yes_no_default("Save this conversation? (y/N) ",
+                                     AGENT_YES_NO_AUTO_NO)) return true;
     char err[160] = {0};
     if (agent_worker_save_session(w, err, sizeof(err))) return true;
     printf("save failed: %s\n", err);
@@ -9073,7 +9088,8 @@ typedef enum {
  * model/Metal resources instead of waiting for orderly teardown. */
 static agent_exit_save_result agent_maybe_save_before_exiting(agent_worker *w) {
     if (!agent_worker_needs_save(w)) return AGENT_EXIT_CLEAN;
-    if (!agent_prompt_yes_no("Save current session? (y/n) ")) return AGENT_EXIT_NOW;
+    if (!agent_prompt_yes_no_default("Save this conversation? (y/N) ",
+                                     AGENT_YES_NO_AUTO_NO)) return AGENT_EXIT_NOW;
     char err[160] = {0};
     if (agent_worker_save_session(w, err, sizeof(err))) return AGENT_EXIT_CLEAN;
     printf("save failed: %s\n", err);
