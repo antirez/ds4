@@ -1,4 +1,6 @@
 #include "ds4.h"
+#include "ds4_distributed.h"
+#include "ds4_help.h"
 #include "ds4_kvstore.h"
 #include "rax.h"
 
@@ -11357,98 +11359,8 @@ static void server_close_resources(server *s) {
     memset(s, 0, sizeof(*s));
 }
 
-static void usage(FILE *fp) {
-    fprintf(fp,
-        "Usage: ds4-server [options]\n"
-        "\n"
-        "Model and runtime:\n"
-        "  -m, --model FILE\n"
-        "      GGUF model path. Default: ds4flash.gguf\n"
-        "  --mtp FILE\n"
-        "      Optional MTP support GGUF used for draft-token probes.\n"
-        "  --mtp-draft N\n"
-        "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
-        "  --mtp-margin F\n"
-        "      Minimum recursive-draft confidence for the fast N=2 verifier. Default: 3\n"
-        "  -c, --ctx N\n"
-        "      Context size allocated at startup. Default: 32768\n"
-        "  -n, --tokens N\n"
-        "      Default max output tokens when the client omits a limit. Default: 393216 (384K)\n"
-        "  -t, --threads N\n"
-        "      CPU helper threads for lightweight host-side work.\n"
-        "  --chdir DIR\n"
-        "      Change working directory before loading the model or runtime assets.\n"
-        "  --quality\n"
-        "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
-        "  --dir-steering-file FILE\n"
-        "      Load one f32 direction vector per layer for directional steering.\n"
-        "  --dir-steering-ffn F\n"
-        "      Apply steering after FFN outputs: y -= F*v*dot(v,y). Default with file: 1\n"
-        "  --dir-steering-attn F\n"
-        "      Apply steering after attention outputs. Default: 0\n"
-        "  --warm-weights\n"
-        "      Touch mapped tensor pages before serving. Slower startup, fewer first-use stalls.\n"
-        "  --power N\n"
-        "      Target GPU duty cycle percentage, 1..100. Default: 100\n"
-        "  --metal | --cuda | --cpu | --backend NAME\n"
-        "      Select backend explicitly. Defaults to Metal on macOS and CUDA on CUDA builds.\n"
-        "\n"
-        "HTTP API:\n"
-        "  --host HOST\n"
-        "      Bind address. Default: 127.0.0.1\n"
-        "  --port N\n"
-        "      Bind port. Default: 8000\n"
-        "  --cors\n"
-        "      Add Access-Control-Allow-* headers for browser JS clients. Does not change --host.\n"
-        "  --trace FILE\n"
-        "      Write a human-readable session trace: prompts, cache decisions, output, tool calls.\n"
-        "\n"
-        "Thinking and sampling:\n"
-        "  DeepSeek-compatible chat requests default to thinking mode with high effort.\n"
-        "  Only reasoning_effort=max or output_config.effort=max requests Think Max.\n"
-        "  Think Max is applied only when --ctx is at least 393216 tokens; smaller contexts use high.\n"
-        "  thinking={type:disabled}, think=false, or model=deepseek-chat selects non-thinking mode.\n"
-        "  API defaults are temperature=1, top_p=1, min_p=0.05, and no top-k cap.\n"
-        "  In thinking mode, client sampling knobs are ignored like the official API.\n"
-        "\n"
-        "Disk KV cache:\n"
-        "  --kv-disk-dir DIR\n"
-        "      Enable disk KV checkpoints in DIR. The directory is created if needed.\n"
-        "  --kv-disk-space-mb N\n"
-        "      Disk budget for checkpoint files. Default when enabled: 4096\n"
-        "  --kv-cache-min-tokens N\n"
-        "      Do not save or load checkpoints shorter than N tokens. Default: 512\n"
-        "  --kv-cache-cold-max-tokens N\n"
-        "      Cold first prompts in [min,N] are saved automatically. 0 disables cold saves. Default: 30000\n"
-        "  --kv-cache-continued-interval-tokens N\n"
-        "      Save at absolute aligned frontiers spaced about N tokens apart. 0 disables. Default: 10000\n"
-        "  --kv-cache-boundary-trim-tokens N\n"
-        "      Trim this many tail tokens before cold boundary saves to avoid tokenizer boundary merges. Default: 32\n"
-        "  --kv-cache-boundary-align-tokens N\n"
-        "      Align cold boundary saves down to this token multiple. 0 disables alignment. Default: 2048\n"
-        "  --kv-cache-reject-different-quant\n"
-        "      Refuse checkpoints written by the same model with a different routed-expert quantization.\n"
-        "  --disable-exact-dsml-tool-replay\n"
-        "      Disable the tool-id -> exact sampled DSML map. Tool history falls back to canonical JSON rendering.\n"
-        "  --tool-memory-max-ids N\n"
-        "      Maximum exact tool-call IDs kept in RAM for replay. Default: 100000\n"
-        "\n"
-        "  Cache triggers:\n"
-        "      cold       save a stable prefix of a long first prompt before generation starts\n"
-        "      continued  save absolute aligned restart frontiers during long prefill or generation\n"
-        "      evict      save the live conversation before another request replaces it\n"
-        "      shutdown   save the live conversation when the server exits cleanly\n"
-        "\n"
-        "Normal server command:\n"
-        "  ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192\n"
-        "\n"
-        "Notes:\n"
-        "  Use /v1/chat/completions, /v1/responses, /v1/completions, or /v1/messages.\n"
-        "  Larger --ctx values allocate more KV memory at startup; the startup log prints the estimate.\n"
-        "  Disk KV caching is best for agents that resend long prompts with stable prefixes.\n"
-        "\n"
-        "  -h, --help\n"
-        "      Show this help.\n");
+static void usage(FILE *fp, const char *topic) {
+    ds4_help_print(fp, DS4_HELP_SERVER, topic);
 }
 
 static ds4_backend parse_backend_arg(const char *s, const char *arg) {
@@ -11490,9 +11402,29 @@ static server_config parse_options(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
-            usage(stdout);
+            const char *topic = (i + 1 < argc && argv[i + 1][0] != '-') ?
+                argv[i + 1] : NULL;
+            usage(stdout, topic);
             exit(0);
-        } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
+        }
+        char dist_parse_err[256] = {0};
+        ds4_dist_cli_parse_result dist_parse =
+            ds4_dist_parse_cli_arg(arg,
+                                   &i,
+                                   argc,
+                                   argv,
+                                   &c.engine.distributed,
+                                   dist_parse_err,
+                                   sizeof(dist_parse_err));
+        if (dist_parse == DS4_DIST_CLI_ERROR) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: %s",
+                       dist_parse_err[0] ? dist_parse_err : "invalid distributed option");
+            exit(2);
+        }
+        if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
+
+        if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
@@ -11564,7 +11496,7 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_CPU;
         } else {
             server_log(DS4_LOG_DEFAULT, "ds4-server: unknown option: %s", arg);
-            usage(stderr);
+            usage(stderr, NULL);
             exit(2);
         }
     }
@@ -11577,6 +11509,14 @@ static server_config parse_options(int argc, char **argv) {
     }
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
+    }
+    char dist_err[256];
+    if (ds4_dist_prepare_engine_options(&c.engine.distributed,
+                                        &c.engine,
+                                        dist_err,
+                                        sizeof(dist_err)) != 0) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: %s", dist_err);
+        exit(2);
     }
     return c;
 }
@@ -11602,6 +11542,14 @@ int main(int argc, char **argv) {
     if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
 
     log_context_memory(cfg.engine.backend, cfg.ctx_size);
+    if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
+        ds4_dist_generation_options gen = {
+            .ctx_size = cfg.ctx_size,
+        };
+        int rc = ds4_dist_run(engine, &cfg.engine.distributed, &gen);
+        ds4_engine_close(engine);
+        return rc;
+    }
 
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
