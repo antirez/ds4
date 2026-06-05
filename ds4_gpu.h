@@ -38,11 +38,13 @@ int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);
+int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label);
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
+int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
@@ -54,6 +56,51 @@ int ds4_gpu_preload_q4_expert_tables(const void *model_map, uint64_t model_size,
                                      uint32_t n_total_expert);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
 void ds4_gpu_set_quality(bool quality);
+void ds4_gpu_set_ssd_streaming(bool enabled);
+void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
+uint64_t ds4_gpu_recommended_working_set_size(void);
+uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
+uint32_t ds4_gpu_stream_expert_cache_current_count(void);
+uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes);
+int ds4_gpu_stream_expert_cache_seed_selected(
+        const void    *model_map,
+        uint64_t       model_size,
+        uint32_t       layer,
+        const int32_t *selected_ids,
+        uint32_t       n_total_expert,
+        uint32_t       n_selected,
+        uint64_t       gate_offset,
+        uint64_t       up_offset,
+        uint64_t       down_offset,
+        uint64_t       gate_expert_bytes,
+        uint64_t       down_expert_bytes);
+int ds4_gpu_stream_expert_cache_begin_selected_load(
+        const void    *model_map,
+        uint64_t       model_size,
+        uint32_t       layer,
+        const int32_t *selected_ids,
+        uint32_t       n_total_expert,
+        uint32_t       n_selected,
+        uint64_t       gate_offset,
+        uint64_t       up_offset,
+        uint64_t       down_offset,
+        uint64_t       gate_expert_bytes,
+        uint64_t       down_expert_bytes);
+int ds4_gpu_stream_expert_cache_seed_experts(
+        const void    *model_map,
+        uint64_t       model_size,
+        uint32_t       layer,
+        const int32_t *expert_ids,
+        const uint32_t *expert_priorities,
+        uint32_t       n_experts,
+        uint32_t       n_total_expert,
+        uint64_t       gate_offset,
+        uint64_t       up_offset,
+        uint64_t       down_offset,
+        uint64_t       gate_expert_bytes,
+        uint64_t       down_expert_bytes);
 void ds4_gpu_print_memory_report(const char *label);
 
 /* =========================================================================

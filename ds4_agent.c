@@ -592,6 +592,42 @@ static agent_config parse_options(int argc, char **argv) {
             c.chdir_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
+        } else if (!strcmp(arg, "--ssd-streaming")) {
+            c.engine.ssd_streaming = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cold")) {
+            c.engine.ssd_streaming_cold = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
+            uint32_t experts = 0;
+            uint64_t bytes = 0;
+            if (!ds4_parse_streaming_cache_experts_arg(
+                    need_arg(&i, argc, argv, arg), &experts, &bytes)) {
+                fprintf(stderr,
+                        "ds4-agent: --ssd-streaming-cache-experts must be a positive count or <number>GB\n");
+                exit(2);
+            }
+            c.engine.ssd_streaming_cache_experts = experts;
+            c.engine.ssd_streaming_cache_bytes = bytes;
+        } else if (!strcmp(arg, "--ssd-streaming-preload-experts")) {
+            int v = parse_int(need_arg(&i, argc, argv, arg), arg);
+            if (v <= 0) {
+                fprintf(stderr, "ds4-agent: --ssd-streaming-preload-experts must be positive\n");
+                exit(2);
+            }
+            c.engine.ssd_streaming_preload_experts = (uint32_t)v;
+        } else if (!strcmp(arg, "--simulate-used-memory")) {
+            if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),
+                                   &c.engine.simulate_used_memory_bytes)) {
+                fprintf(stderr,
+                        "ds4-agent: --simulate-used-memory must be a positive GiB value, e.g. 64GB\n");
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--prefill-chunk")) {
+            int v = parse_int(need_arg(&i, argc, argv, arg), arg);
+            if (v <= 0) {
+                fprintf(stderr, "ds4-agent: --prefill-chunk must be positive\n");
+                exit(2);
+            }
+            c.engine.prefill_chunk = (uint32_t)v;
         } else if (!strcmp(arg, "--power")) {
             c.engine.power_percent = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (c.engine.power_percent < 1 || c.engine.power_percent > 100) {
@@ -632,8 +668,13 @@ static agent_config parse_options(int argc, char **argv) {
     return c;
 }
 
-static void log_context_memory(ds4_backend backend, int ctx_size) {
-    ds4_context_memory m = ds4_context_memory_estimate(backend, ctx_size);
+static void log_context_memory(ds4_backend backend,
+                               int         ctx_size,
+                               uint32_t    prefill_chunk) {
+    ds4_context_memory m =
+        ds4_context_memory_estimate_with_prefill(backend,
+                                                 ctx_size,
+                                                 prefill_chunk);
     fprintf(stderr,
             "ds4-agent: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
             (double)m.total_bytes / (1024.0 * 1024.0),
@@ -9673,7 +9714,9 @@ int main(int argc, char **argv) {
     }
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
-    log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
+    log_context_memory(cfg.engine.backend,
+                       cfg.gen.ctx_size,
+                       cfg.engine.prefill_chunk);
 
     struct sigaction old_int;
     struct sigaction sa;

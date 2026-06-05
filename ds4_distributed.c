@@ -394,6 +394,7 @@ struct ds4_dist_session {
     uint64_t plan_generation;
     uint64_t session_id;
     uint64_t request_id;
+    uint64_t snapshot_request_id;
 };
 
 typedef struct {
@@ -1027,22 +1028,37 @@ static int dist_set_socket_low_latency(int fd) {
     int one = 1;
     int rc = 0;
     int buffer_bytes = dist_socket_buffer_bytes();
-    int timeout_sec = 60;
+    int send_timeout_sec = 60;
     const char *timeout_env = getenv("DS4_DIST_SOCKET_TIMEOUT_SEC");
     if (timeout_env && timeout_env[0]) {
         char *end = NULL;
         long v = strtol(timeout_env, &end, 10);
         if (end != timeout_env && *end == '\0' && v > 0 && v <= 3600)
-            timeout_sec = (int)v;
+            send_timeout_sec = (int)v;
     }
-    struct timeval tv = {
-        .tv_sec = timeout_sec,
+    struct timeval send_tv = {
+        .tv_sec = send_timeout_sec,
         .tv_usec = 0,
     };
     if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) != 0) rc = -1;
     if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one)) != 0) rc = -1;
-    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0) rc = -1;
-    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) rc = -1;
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_tv, sizeof(send_tv)) != 0) rc = -1;
+    /* Do not install a receive timeout by default.  Worker control sockets can
+     * be legitimately idle while a KV snapshot is transferred on a separate
+     * data connection; timing out that read drops an otherwise healthy route. */
+    const char *recv_timeout_env = getenv("DS4_DIST_SOCKET_RECV_TIMEOUT_SEC");
+    if (recv_timeout_env && recv_timeout_env[0]) {
+        char *end = NULL;
+        long v = strtol(recv_timeout_env, &end, 10);
+        if (end != recv_timeout_env && *end == '\0' && v > 0 && v <= 3600) {
+            struct timeval recv_tv = {
+                .tv_sec = (int)v,
+                .tv_usec = 0,
+            };
+            if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                           &recv_tv, sizeof(recv_tv)) != 0) rc = -1;
+        }
+    }
     if (buffer_bytes > 0 &&
         setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer_bytes, sizeof(buffer_bytes)) != 0) rc = -1;
     if (buffer_bytes > 0 &&
@@ -4905,7 +4921,7 @@ static int dist_save_remote_shard_to_file(
         char *err,
         size_t errlen) {
     if (payload_bytes_out) *payload_bytes_out = 0;
-    uint64_t request_id = d->request_id++;
+    uint64_t request_id = d->snapshot_request_id++;
     int fd = dist_connect_endpoint(entry->host, (int)entry->port, err, errlen);
     if (fd < 0) return 1;
 
@@ -5022,7 +5038,7 @@ static int dist_load_remote_shard_from_payload(
         uint64_t payload_bytes,
         char *err,
         size_t errlen) {
-    uint64_t request_id = d->request_id++;
+    uint64_t request_id = d->snapshot_request_id++;
     int fd = dist_connect_endpoint(entry->host, (int)entry->port, err, errlen);
     if (fd < 0) return 1;
 
@@ -5418,6 +5434,10 @@ int ds4_dist_session_create(
     pthread_mutex_init(&d->state.mu, NULL);
     d->session_id = dist_make_session_id(d);
     d->request_id = 1;
+    /* KV snapshots use separate data connections and can run while pipelined
+     * WORK results are outstanding.  Keep them out of the WORK request-id stream
+     * so progress callbacks cannot perturb the reader's contiguous expectations. */
+    d->snapshot_request_id = UINT64_C(1) << 63;
 
     char local_end[32];
     if (opt->layers.has_output) snprintf(local_end, sizeof(local_end), "output");

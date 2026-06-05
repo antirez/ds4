@@ -157,6 +157,12 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     }
     opt(fp, c, "-t, --threads N", "CPU helper threads for host-side/reference work.");
     opt(fp, c, "--power N", "GPU duty-cycle target, 1..100. Default: 100");
+    opt(fp, c, "--ssd-streaming", "Metal-only: opt in to SSD-backed model streaming instead of full residency.");
+    opt(fp, c, "--ssd-streaming-cold", "Metal SSD streaming: skip default popularity-based expert-cache preload.");
+    opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "Metal SSD streaming: routed expert cache as expert count or GiB, e.g. 32GB. Default: 80% Metal working set minus non-routed weights.");
+    opt(fp, c, "--ssd-streaming-preload-experts N", "Metal SSD streaming: upfront popularity preload count. Default: auto hot seed capped at 4096; use --ssd-streaming-cold to skip.");
+    opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
+    opt(fp, c, "--prefill-chunk N", "Metal graph prefill chunk size. Default: auto (PRO long prompts use 8192; others use 4096).");
     if (full) {
         if (tool != DS4_HELP_BENCH) {
             opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");
@@ -167,6 +173,9 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
         }
         opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");
         opt(fp, c, "--warm-weights", "Touch mapped tensor pages at startup to reduce first-use stalls.");
+        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_BENCH) {
+            opt(fp, c, "--expert-profile FILE", "Metal-only: write routed expert locality/cache simulation JSON.");
+        }
     }
     fputc('\n', fp);
 }
@@ -234,6 +243,7 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "--dump-logits FILE", "Write full next-token logits as JSON.");
     opt(fp, c, "--dump-logprobs FILE", "Write greedy continuation top-logprobs as JSON.");
     opt(fp, c, "--logprobs-top-k N", "Alternatives stored by --dump-logprobs. Default: 20");
+    opt(fp, c, "--expert-profile FILE", "Metal-only: write routed expert locality/cache simulation JSON.");
     opt(fp, c, "--perplexity-file FILE", "Score raw text with teacher-forced NLL.");
     opt(fp, c, "--imatrix-dataset FILE", "Rendered prompt dataset for imatrix collection.");
     opt(fp, c, "--imatrix-out FILE", "Write llama-compatible routed-MoE imatrix .dat.");

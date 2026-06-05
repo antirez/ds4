@@ -28,6 +28,7 @@ typedef struct {
     const char *chat_prompt_path;
     const char *system;
     const char *csv_path;
+    const char *expert_profile_path;
     ds4_backend backend;
     int threads;
     int ctx_start;
@@ -36,11 +37,18 @@ typedef struct {
     int step_incr;
     int gen_tokens;
     int power_percent;
+    uint32_t prefill_chunk;
+    uint32_t ssd_streaming_cache_experts;
+    uint64_t ssd_streaming_cache_bytes;
+    uint32_t ssd_streaming_preload_experts;
+    uint64_t simulate_used_memory_bytes;
     double step_mul;
     const char *dump_frontier_logits_dir;
     ds4_dist_options dist;
     bool warm_weights;
     bool quality;
+    bool ssd_streaming;
+    bool ssd_streaming_cold;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -210,6 +218,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
             c.dump_frontier_logits_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--expert-profile")) {
+            c.expert_profile_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--backend")) {
@@ -222,6 +232,37 @@ static bench_config parse_options(int argc, char **argv) {
             c.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--quality")) {
             c.quality = true;
+        } else if (!strcmp(arg, "--ssd-streaming")) {
+            c.ssd_streaming = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cold")) {
+            c.ssd_streaming_cold = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
+            uint32_t experts = 0;
+            uint64_t bytes = 0;
+            if (!ds4_parse_streaming_cache_experts_arg(
+                    need_arg(&i, argc, argv, arg), &experts, &bytes)) {
+                fprintf(stderr,
+                        "ds4-bench: --ssd-streaming-cache-experts must be a positive count or <number>GB\n");
+                exit(2);
+            }
+            c.ssd_streaming_cache_experts = experts;
+            c.ssd_streaming_cache_bytes = bytes;
+        } else if (!strcmp(arg, "--ssd-streaming-preload-experts")) {
+            int v = parse_int(need_arg(&i, argc, argv, arg), arg);
+            if (v <= 0) {
+                fprintf(stderr, "ds4-bench: --ssd-streaming-preload-experts must be positive\n");
+                exit(2);
+            }
+            c.ssd_streaming_preload_experts = (uint32_t)v;
+        } else if (!strcmp(arg, "--simulate-used-memory")) {
+            if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),
+                                   &c.simulate_used_memory_bytes)) {
+                fprintf(stderr,
+                        "ds4-bench: --simulate-used-memory must be a positive GiB value, e.g. 64GB\n");
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--prefill-chunk")) {
+            c.prefill_chunk = (uint32_t)parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--power")) {
             c.power_percent = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (c.power_percent < 1 || c.power_percent > 100) {
@@ -385,8 +426,13 @@ static int next_frontier(const bench_config *c, int cur) {
     return next;
 }
 
-static void log_context_memory(ds4_backend backend, int ctx_size) {
-    ds4_context_memory m = ds4_context_memory_estimate(backend, ctx_size);
+static void log_context_memory(ds4_backend backend,
+                               int         ctx_size,
+                               uint32_t    prefill_chunk) {
+    ds4_context_memory m =
+        ds4_context_memory_estimate_with_prefill(backend,
+                                                 ctx_size,
+                                                 prefill_chunk);
     fprintf(stderr,
             "ds4-bench: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
             (double)m.total_bytes / (1024.0 * 1024.0),
@@ -453,9 +499,17 @@ int main(int argc, char **argv) {
         .model_path = cfg.model_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
+        .prefill_chunk = cfg.prefill_chunk,
+        .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
+        .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
+        .ssd_streaming_preload_experts = cfg.ssd_streaming_preload_experts,
+        .simulate_used_memory_bytes = cfg.simulate_used_memory_bytes,
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .ssd_streaming = cfg.ssd_streaming,
+        .ssd_streaming_cold = cfg.ssd_streaming_cold,
+        .expert_profile_path = cfg.expert_profile_path,
         .distributed = cfg.dist,
     };
     char dist_err[256];
@@ -465,7 +519,7 @@ int main(int argc, char **argv) {
     }
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) return 1;
-    log_context_memory(cfg.backend, cfg.ctx_alloc);
+    log_context_memory(cfg.backend, cfg.ctx_alloc, cfg.prefill_chunk);
 
     char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
     ds4_tokens prompt = {0};

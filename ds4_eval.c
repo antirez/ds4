@@ -1207,6 +1207,11 @@ typedef struct {
     uint64_t seed;
     int pause_ms;
     int power_percent;
+    uint32_t prefill_chunk;
+    uint32_t ssd_streaming_cache_experts;
+    uint64_t ssd_streaming_cache_bytes;
+    uint32_t ssd_streaming_preload_experts;
+    uint64_t simulate_used_memory_bytes;
     int soft_limit_reply_budget;
     int hard_limit_reply_budget;
     int soft_limit_think_close_rank;
@@ -1215,6 +1220,8 @@ typedef struct {
     bool plain;
     bool warm_weights;
     bool quality;
+    bool ssd_streaming;
+    bool ssd_streaming_cold;
     bool self_test_extractors;
 } eval_config;
 
@@ -1567,6 +1574,42 @@ static eval_config parse_options(int argc, char **argv) {
             c.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--quality")) {
             c.quality = true;
+        } else if (!strcmp(arg, "--ssd-streaming")) {
+            c.ssd_streaming = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cold")) {
+            c.ssd_streaming_cold = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
+            uint32_t experts = 0;
+            uint64_t bytes = 0;
+            if (!ds4_parse_streaming_cache_experts_arg(
+                    need_arg(&i, argc, argv, arg), &experts, &bytes)) {
+                fprintf(stderr,
+                        "ds4-eval: --ssd-streaming-cache-experts must be a positive count or <number>GB\n");
+                exit(2);
+            }
+            c.ssd_streaming_cache_experts = experts;
+            c.ssd_streaming_cache_bytes = bytes;
+        } else if (!strcmp(arg, "--ssd-streaming-preload-experts")) {
+            int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (v <= 0) {
+                fprintf(stderr, "ds4-eval: --ssd-streaming-preload-experts must be positive\n");
+                exit(2);
+            }
+            c.ssd_streaming_preload_experts = (uint32_t)v;
+        } else if (!strcmp(arg, "--simulate-used-memory")) {
+            if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),
+                                   &c.simulate_used_memory_bytes)) {
+                fprintf(stderr,
+                        "ds4-eval: --simulate-used-memory must be a positive GiB value, e.g. 64GB\n");
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--prefill-chunk")) {
+            int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (v <= 0) {
+                fprintf(stderr, "ds4-eval: --prefill-chunk must be positive\n");
+                exit(2);
+            }
+            c.prefill_chunk = (uint32_t)v;
         } else if (!strcmp(arg, "--power")) {
             c.power_percent = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
             if (c.power_percent < 1 || c.power_percent > 100) {
@@ -3730,8 +3773,13 @@ static int parse_case_sequence(const char *arg, int ncases, int **seq_out, int *
     return 0;
 }
 
-static void log_context_memory(ds4_backend backend, int ctx_size) {
-    ds4_context_memory m = ds4_context_memory_estimate(backend, ctx_size);
+static void log_context_memory(ds4_backend backend,
+                               int         ctx_size,
+                               uint32_t    prefill_chunk) {
+    ds4_context_memory m =
+        ds4_context_memory_estimate_with_prefill(backend,
+                                                 ctx_size,
+                                                 prefill_chunk);
     fprintf(stderr,
             "ds4-eval: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
             (double)m.total_bytes / (1024.0 * 1024.0),
@@ -3853,8 +3901,15 @@ int main(int argc, char **argv) {
         .mtp_draft_tokens = 1,
         .mtp_margin = 3.0f,
         .power_percent = cfg.power_percent,
+        .prefill_chunk = cfg.prefill_chunk,
+        .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
+        .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
+        .ssd_streaming_preload_experts = cfg.ssd_streaming_preload_experts,
+        .simulate_used_memory_bytes = cfg.simulate_used_memory_bytes,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .ssd_streaming = cfg.ssd_streaming,
+        .ssd_streaming_cold = cfg.ssd_streaming_cold,
         .distributed = cfg.dist,
     };
     char dist_err[256];
@@ -3894,7 +3949,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "ds4-eval: model shape %s\n", ds4_engine_model_name(engine));
     eval_warn_think_max_downgraded(&cfg);
     trace_write_header(trace, &cfg, ds4_engine_model_name(engine), ncases, max_prompt_tokens);
-    log_context_memory(cfg.backend, cfg.ctx_size);
+    log_context_memory(cfg.backend, cfg.ctx_size, cfg.prefill_chunk);
 
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
