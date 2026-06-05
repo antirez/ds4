@@ -45,6 +45,12 @@
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
+#if defined(__AVX2__) || defined(__AVX512F__)
+#include <immintrin.h>
+#endif
+#if defined(__AVX2__) && defined(__AVX512F__) && defined(__AVX512BW__)
+#define DS4_HAVE_AVX512_QUANT 1
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -566,6 +572,58 @@ static inline DS4_MAYBE_UNUSED int32_t dot_q2_16(const uint8_t *q2, const int8_t
     return sum;
 #endif
 }
+
+#if defined(__AVX2__)
+static inline DS4_MAYBE_UNUSED int32_t ds4_hsum_i32_8_avx2(__m256i v) {
+    const __m128i lo = _mm256_castsi256_si128(v);
+    const __m128i hi = _mm256_extracti128_si256(v, 1);
+    __m128i sum = _mm_add_epi32(lo, hi);
+    sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, 0x4e));
+    sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, 0xb1));
+    return _mm_cvtsi128_si32(sum);
+}
+
+static inline DS4_MAYBE_UNUSED __m256i ds4_dot_q2_16_avx2_epi32(
+        const uint8_t *q2,
+        const int8_t  *q8,
+        int             shift) {
+    __m128i q2v = _mm_loadu_si128((const __m128i *)q2);
+    if (shift != 0) q2v = _mm_srli_epi16(q2v, shift);
+    q2v = _mm_and_si128(q2v, _mm_set1_epi8(3));
+
+    const __m256i q2_16 = _mm256_cvtepu8_epi16(q2v);
+    const __m256i q8_16 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)q8));
+    return _mm256_madd_epi16(q2_16, q8_16);
+}
+#endif
+
+#if defined(DS4_HAVE_AVX512_QUANT)
+static inline DS4_MAYBE_UNUSED __m256i ds4_zext_i128_to_i256(__m128i v) {
+    return _mm256_inserti128_si256(_mm256_setzero_si256(), v, 0);
+}
+
+static inline DS4_MAYBE_UNUSED __m512i ds4_dot_q2_32_avx512_epi32(
+        const uint8_t *q2,
+        const int8_t  *q8,
+        int             shift) {
+    __m256i q2v = _mm256_loadu_si256((const __m256i *)q2);
+    if (shift != 0) q2v = _mm256_srli_epi16(q2v, shift);
+    q2v = _mm256_and_si256(q2v, _mm256_set1_epi8(3));
+
+    const __m512i q2_16 = _mm512_cvtepu8_epi16(q2v);
+    const __m512i q8_16 = _mm512_cvtepi8_epi16(_mm256_loadu_si256((const __m256i *)q8));
+    return _mm512_madd_epi16(q2_16, q8_16);
+}
+
+static inline DS4_MAYBE_UNUSED __m512i ds4_madd_i8_u8_i32_avx512(__m512i u8v, __m512i s8v) {
+#if defined(__AVX512VNNI__)
+    return _mm512_dpbusd_epi32(_mm512_setzero_si512(), u8v, s8v);
+#else
+    const __m512i ones = _mm512_set1_epi16(1);
+    return _mm512_madd_epi16(_mm512_maddubs_epi16(u8v, s8v), ones);
+#endif
+}
+#endif
 
 /* =========================================================================
  * Shared Helpers, Allocation Guards, Threads, and Cursor Reads.
@@ -2204,6 +2262,85 @@ static void ds4_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const bl
     }
 
     *s = sum;
+#elif defined(DS4_HAVE_AVX512_QUANT)
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const uint8_t *q2 = x[i].qs;
+        const int8_t  *q8 = y[i].qs;
+        const uint8_t *sc = x[i].scales;
+
+        const __m128i sc8 = _mm_loadu_si128((const __m128i *)sc);
+        const __m256i sc16 = _mm256_cvtepu8_epi16(sc8);
+        const __m256i mins16 = _mm256_srli_epi16(sc16, 4);
+        const __m256i bsums16 = _mm256_loadu_si256((const __m256i *)y[i].bsums);
+        const __m256i min_products = _mm256_madd_epi16(mins16, bsums16);
+        const int summs = ds4_hsum_i32_8_avx2(min_products);
+
+        const float dall = y[i].d * f16_to_f32(x[i].d);
+        const float dmin = y[i].d * f16_to_f32(x[i].dmin);
+
+        __m512i isumv = _mm512_setzero_si512();
+        int is = 0;
+        for (int k = 0; k < QK_K / 128; k++) {
+            for (int shift = 0; shift < 8; shift += 2) {
+                __m512i p = ds4_dot_q2_32_avx512_epi32(q2, q8, shift);
+                const __m512i scalev = _mm512_setr_epi32(
+                    sc[is] & 0x0f, sc[is] & 0x0f, sc[is] & 0x0f, sc[is] & 0x0f,
+                    sc[is] & 0x0f, sc[is] & 0x0f, sc[is] & 0x0f, sc[is] & 0x0f,
+                    sc[is + 1] & 0x0f, sc[is + 1] & 0x0f, sc[is + 1] & 0x0f, sc[is + 1] & 0x0f,
+                    sc[is + 1] & 0x0f, sc[is + 1] & 0x0f, sc[is + 1] & 0x0f, sc[is + 1] & 0x0f);
+                isumv = _mm512_add_epi32(isumv, _mm512_mullo_epi32(p, scalev));
+                is += 2;
+                q8 += 32;
+            }
+            q2 += 32;
+        }
+
+        const int isum = _mm512_reduce_add_epi32(isumv);
+        sumf += dall * (float)isum - dmin * (float)summs;
+    }
+
+    *s = sumf;
+#elif defined(__AVX2__)
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const uint8_t *q2 = x[i].qs;
+        const int8_t  *q8 = y[i].qs;
+        const uint8_t *sc = x[i].scales;
+
+        const __m128i sc8 = _mm_loadu_si128((const __m128i *)sc);
+        const __m256i sc16 = _mm256_cvtepu8_epi16(sc8);
+        const __m256i mins16 = _mm256_srli_epi16(sc16, 4);
+        const __m256i bsums16 = _mm256_loadu_si256((const __m256i *)y[i].bsums);
+        const __m256i min_products = _mm256_madd_epi16(mins16, bsums16);
+        const int summs = ds4_hsum_i32_8_avx2(min_products);
+
+        const float dall = y[i].d * f16_to_f32(x[i].d);
+        const float dmin = y[i].d * f16_to_f32(x[i].dmin);
+
+        __m256i isumv = _mm256_setzero_si256();
+        int is = 0;
+        for (int k = 0; k < QK_K / 128; k++) {
+            int shift = 0;
+            for (int j = 0; j < 4; j++) {
+                __m256i p0 = ds4_dot_q2_16_avx2_epi32(q2, q8, shift);
+                __m256i p1 = ds4_dot_q2_16_avx2_epi32(q2 + 16, q8 + 16, shift);
+                p0 = _mm256_mullo_epi32(p0, _mm256_set1_epi32(sc[is++] & 0x0f));
+                p1 = _mm256_mullo_epi32(p1, _mm256_set1_epi32(sc[is++] & 0x0f));
+                isumv = _mm256_add_epi32(isumv, _mm256_add_epi32(p0, p1));
+                shift += 2;
+                q8 += 32;
+            }
+            q2 += 32;
+        }
+
+        const int isum = ds4_hsum_i32_8_avx2(isumv);
+        sumf += dall * (float)isum - dmin * (float)summs;
+    }
+
+    *s = sumf;
 #else
     float sumf = 0.0f;
 
@@ -2307,6 +2444,95 @@ static void ds4_vec_dot_q4_K_q8_K(int n, float *s, const block_q4_K *x, const bl
     }
 
     *s = sumf;
+#elif defined(DS4_HAVE_AVX512_QUANT)
+    float sumf = 0.0f;
+    const __m256i m4 = _mm256_set1_epi8(0x0F);
+
+    for (int i = 0; i < nb; i++) {
+        const float d  = y[i].d * f16_to_f32(x[i].d);
+        const float dm = -y[i].d * f16_to_f32(x[i].dmin);
+
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *sc = x[i].scales;
+        const int8_t  *q8 = y[i].qs;
+
+        int summs = 0;
+        for (int j = 0; j < QK_K / 32; j++) {
+            uint8_t sc_val, m_val;
+            q4_k_get_scale_min(j, sc, &sc_val, &m_val);
+            int32_t gsum = (int32_t)y[i].bsums[j * 2] + (int32_t)y[i].bsums[j * 2 + 1];
+            summs += m_val * gsum;
+        }
+
+        __m512i isumv = _mm512_setzero_si512();
+        for (int j = 0; j < QK_K / 64; j++) {
+            uint8_t sc0, m0, sc1, m1;
+            q4_k_get_scale_min(j * 2, sc, &sc0, &m0);
+            q4_k_get_scale_min(j * 2 + 1, sc, &sc1, &m1);
+
+            const __m256i qs32 = _mm256_loadu_si256((const __m256i *)(qs + j * 32));
+            const __m256i lo = _mm256_and_si256(qs32, m4);
+            const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(qs32, 4), m4);
+            __m512i q4v = _mm512_castsi256_si512(lo);
+            q4v = _mm512_inserti64x4(q4v, hi, 1);
+
+            const __m512i q8v = _mm512_loadu_si512((const void *)(q8 + j * 64));
+            const __m512i dotv = ds4_madd_i8_u8_i32_avx512(q4v, q8v);
+            const __m512i scalev = _mm512_setr_epi32(
+                sc0, sc0, sc0, sc0, sc0, sc0, sc0, sc0,
+                sc1, sc1, sc1, sc1, sc1, sc1, sc1, sc1);
+            isumv = _mm512_add_epi32(isumv, _mm512_mullo_epi32(dotv, scalev));
+        }
+
+        sumf += d * (float)_mm512_reduce_add_epi32(isumv) + dm * (float)summs;
+    }
+
+    *s = sumf;
+#elif defined(__AVX2__)
+    float sumf = 0.0f;
+    const __m256i ones = _mm256_set1_epi16(1);
+    const __m256i m4   = _mm256_set1_epi8(0x0F);
+
+    for (int i = 0; i < nb; i++) {
+        const float d  = y[i].d * f16_to_f32(x[i].d);
+        const float dm = -y[i].d * f16_to_f32(x[i].dmin);
+
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *sc = x[i].scales;
+        const int8_t  *q8 = y[i].qs;
+
+        int summs = 0;
+        for (int j = 0; j < QK_K / 32; j++) {
+            uint8_t sc_val, m_val;
+            q4_k_get_scale_min(j, sc, &sc_val, &m_val);
+            int32_t gsum = (int32_t)y[i].bsums[j * 2] + (int32_t)y[i].bsums[j * 2 + 1];
+            summs += m_val * gsum;
+        }
+
+        __m256i isumv = _mm256_setzero_si256();
+        for (int j = 0; j < QK_K / 32; j++) {
+            uint8_t sc_val, m_val;
+            q4_k_get_scale_min(j, sc, &sc_val, &m_val);
+
+            const int byte_off = (j >> 1) * 32;
+            const int shift = (j & 1) * 4;
+
+            __m256i qs32 = _mm256_loadu_si256((const __m256i *)(qs + byte_off));
+            if (shift) qs32 = _mm256_srli_epi16(qs32, 4);
+            qs32 = _mm256_and_si256(qs32, m4);
+
+            const __m256i q8v = _mm256_loadu_si256((const __m256i *)(q8 + j * 32));
+            const __m256i prod16 = _mm256_maddubs_epi16(qs32, q8v);
+            const __m256i prod32 = _mm256_madd_epi16(prod16, ones);
+
+            isumv = _mm256_add_epi32(isumv,
+                        _mm256_mullo_epi32(prod32, _mm256_set1_epi32((int)sc_val)));
+        }
+
+        sumf += d * (float)ds4_hsum_i32_8_avx2(isumv) + dm * (float)summs;
+    }
+
+    *s = sumf;
 #else
     float sumf = 0.0f;
 
@@ -2402,6 +2628,96 @@ static DS4_MAYBE_UNUSED void ds4_vec_dot_iq2_xxs_q8_K(int n, float *s, const blo
     }
 
     *s = 0.25f * sumf;
+#elif defined(DS4_HAVE_AVX512_QUANT)
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d) * y[i].d;
+        const uint16_t *q2 = x[i].qs;
+        const int8_t *q8 = y[i].qs;
+        __m512i bsum = _mm512_setzero_si512();
+
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32++) {
+            uint32_t aux32[2];
+            memcpy(aux32, q2, 2 * sizeof(uint32_t));
+            q2 += 4;
+            const uint8_t *aux8 = (const uint8_t *)aux32;
+
+            const uint32_t ls = 2 * (aux32[1] >> 28) + 1;
+            __m512i sumi = _mm512_setzero_si512();
+
+            for (int l = 0; l < 4; l += 2) {
+                const uint32_t sign_idx0 = (aux32[1] >> (7 * l)) & 127;
+                const uint32_t sign_idx1 = (aux32[1] >> (7 * (l + 1))) & 127;
+
+                /* Load 8+8 = 16 signed int8 grid values */
+                const int8_t *g0 = iq2xxs_signed_grid[aux8[l]][sign_idx0];
+                const int8_t *g1 = iq2xxs_signed_grid[aux8[l + 1]][sign_idx1];
+                __m128i g_lo = _mm_loadl_epi64((const __m128i *)g0);
+                g_lo = _mm_unpacklo_epi64(g_lo, _mm_loadl_epi64((const __m128i *)g1));
+
+                /* 16 int8 grid + 16 int8 q8 → 32 int16 → 16 int32 via madd */
+                const __m512i g16 = _mm512_cvtepi8_epi16(ds4_zext_i128_to_i256(g_lo));
+                const __m512i q16 = _mm512_cvtepi8_epi16(
+                    ds4_zext_i128_to_i256(_mm_loadu_si128((const __m128i *)q8)));
+                q8 += 16;
+
+                sumi = _mm512_add_epi32(sumi, _mm512_madd_epi16(g16, q16));
+            }
+
+            __m512i ls_v = _mm512_set1_epi32((int32_t)ls);
+            bsum = _mm512_add_epi32(bsum, _mm512_mullo_epi32(sumi, ls_v));
+        }
+
+        sumf += d * (float)_mm512_reduce_add_epi32(bsum);
+    }
+
+    *s = 0.125f * sumf;
+#elif defined(__AVX2__)
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d) * y[i].d;
+        const uint16_t *q2 = x[i].qs;
+        const int8_t *q8 = y[i].qs;
+        __m256i bsum = _mm256_setzero_si256();
+
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32++) {
+            uint32_t aux32[2];
+            memcpy(aux32, q2, 2 * sizeof(uint32_t));
+            q2 += 4;
+            const uint8_t *aux8 = (const uint8_t *)aux32;
+
+            const uint32_t ls = 2 * (aux32[1] >> 28) + 1;
+            __m256i sumi = _mm256_setzero_si256();
+
+            for (int l = 0; l < 4; l += 2) {
+                const uint32_t sign_idx0 = (aux32[1] >> (7 * l)) & 127;
+                const uint32_t sign_idx1 = (aux32[1] >> (7 * (l + 1))) & 127;
+
+                /* Load 8+8 = 16 signed int8 grid values */
+                const int8_t *g0 = iq2xxs_signed_grid[aux8[l]][sign_idx0];
+                const int8_t *g1 = iq2xxs_signed_grid[aux8[l + 1]][sign_idx1];
+                __m128i g_lo = _mm_loadl_epi64((const __m128i *)g0);
+                g_lo = _mm_unpacklo_epi64(g_lo, _mm_loadl_epi64((const __m128i *)g1));
+                __m256i g16 = _mm256_cvtepi8_epi16(g_lo);
+
+                __m256i q16 = _mm256_cvtepi8_epi16(
+                    _mm_loadu_si128((const __m128i *)q8));
+                q8 += 16;
+
+                sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(g16, q16));
+            }
+
+            /* Apply level shift: sumi * ls, accumulate */
+            __m256i ls_v = _mm256_set1_epi32((int32_t)ls);
+            bsum = _mm256_add_epi32(bsum, _mm256_mullo_epi32(sumi, ls_v));
+        }
+
+        sumf += d * (float)ds4_hsum_i32_8_avx2(bsum);
+    }
+
+    *s = 0.125f * sumf;
 #else
     uint32_t aux32[2];
     const uint8_t *aux8 = (const uint8_t *)aux32;
@@ -2510,6 +2826,12 @@ static void ds4_vec_dot_iq2_xxs_pair_q8_K(
 
     *s0 = 0.25f * total0;
     *s1 = 0.25f * total1;
+#elif defined(DS4_HAVE_AVX512_QUANT)
+    ds4_vec_dot_iq2_xxs_q8_K(n, s0, x0, y);
+    ds4_vec_dot_iq2_xxs_q8_K(n, s1, x1, y);
+#elif defined(__AVX2__)
+    ds4_vec_dot_iq2_xxs_q8_K(n, s0, x0, y);
+    ds4_vec_dot_iq2_xxs_q8_K(n, s1, x1, y);
 #else
     ds4_vec_dot_iq2_xxs_q8_K(n, s0, x0, y);
     ds4_vec_dot_iq2_xxs_q8_K(n, s1, x1, y);
