@@ -43,6 +43,7 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
   tool-call mapping, disk KV cache policy.
 - `ds4_metal.m`: Objective-C Metal runtime and kernel wrappers.
 - `metal/*.metal`: compute kernels.
+- `docker/`: CUDA 13 Docker and Compose setup for serving `ds4-server` on Linux.
 - `tests/`: unit and live integration tests.
 - `misc/`: ignored notes, experiments, and old planning material.
 
@@ -51,3 +52,10 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
 Use `make` for build validation. Use `make test` for unit/regression tests when a
 model and Metal are available. Use live server tests only when intentionally
 testing the API surface.
+
+## Docker
+
+Docker-specific serving notes are documented in `docker/README.md`. The Docker
+setup targets Linux CUDA 13, mounts weights under `/models`, mounts disk KV cache
+under `/kv-cache`, downloads missing model weights during container startup, and
+serves `ds4-server` through Compose.

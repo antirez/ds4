@@ -1,0 +1,10 @@
+*
+!Makefile
+!*.c
+!*.h
+!*.cu
+!*.inc
+!download_model.sh
+!docker/
+!docker/Dockerfile
+!docker/entrypoint.sh
