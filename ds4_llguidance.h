@@ -10,7 +10,6 @@
 typedef struct ds4_llguidance ds4_llguidance;
 
 bool ds4_llguidance_available(void);
-const char *ds4_llguidance_build_info(void);
 
 ds4_llguidance *ds4_llguidance_create(ds4_engine *e,
                                       const char *constraint_type,

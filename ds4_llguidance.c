@@ -39,14 +39,6 @@ bool ds4_llguidance_available(void) {
 #endif
 }
 
-const char *ds4_llguidance_build_info(void) {
-#ifdef DS4_USE_LLGUIDANCE
-    return "llguidance enabled";
-#else
-    return "llguidance disabled";
-#endif
-}
-
 #ifdef DS4_USE_LLGUIDANCE
 
 typedef struct {
