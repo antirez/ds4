@@ -51,6 +51,7 @@ typedef struct {
     const char *prompt;
     const char *system;
     const char *trace_path;
+    int wrap_cols;
     int n_predict;
     int ctx_size;
     float temperature;
@@ -189,6 +190,13 @@ typedef struct {
     const char *md_code_line_prefix;
     const char *md_code_line_prefix_color;
     bool md_code_highlight_upto;
+    bool word_wrap_disabled;
+    int word_wrap_cols;
+    int word_wrap_col;
+    int word_wrap_width;
+    char *word_wrap_buf;
+    size_t word_wrap_len;
+    size_t word_wrap_cap;
     char *md_code_line;
     size_t md_code_line_len;
     size_t md_code_line_cap;
@@ -309,6 +317,7 @@ static void agent_trace(agent_worker *w, const char *fmt, ...);
 static void agent_trace_text(agent_worker *w, const char *label,
                              const char *text, size_t len);
 static void agent_publish_system_status(agent_worker *w, const char *msg);
+static int renderer_terminal_cols(void);
 static int agent_web_confirm(void *privdata, const char *message,
                              char *err, size_t err_len);
 static void agent_web_log(void *privdata, const char *message);
@@ -414,6 +423,19 @@ static int parse_int(const char *s, const char *opt) {
     return (int)v;
 }
 
+static int parse_wrap_cols(const char *s, const char *opt) {
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (s[0] == '\0' || *end != '\0' ||
+        (v != 0 && (v < 20 || v > 1000)))
+    {
+        fprintf(stderr, "ds4-agent: %s must be 0 or between 20 and 1000: %s\n",
+                opt, s);
+        exit(2);
+    }
+    return (int)v;
+}
+
 static bool parse_power_percent(const char *arg, int *out) {
     char *end = NULL;
     long v = strtol(arg, &end, 10);
@@ -509,6 +531,7 @@ static agent_config parse_options(int argc, char **argv) {
         },
         .gen = {
             .system = "You are a helpful coding assistant running inside ds4-agent.",
+            .wrap_cols = 100,
             .n_predict = 50000,
             .ctx_size = 100000,
             .temperature = DS4_DEFAULT_TEMPERATURE,
@@ -517,6 +540,10 @@ static agent_config parse_options(int argc, char **argv) {
             .think_mode = DS4_THINK_HIGH,
         },
     };
+
+    const char *env_wrap_cols = getenv("DS4_AGENT_WRAP_COLS");
+    if (env_wrap_cols && env_wrap_cols[0])
+        c.gen.wrap_cols = parse_wrap_cols(env_wrap_cols, "DS4_AGENT_WRAP_COLS");
 
     bool steering_scale_set = false;
     for (int i = 1; i < argc; i++) {
@@ -552,6 +579,8 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {
             c.gen.trace_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--wrap-cols")) {
+            c.gen.wrap_cols = parse_wrap_cols(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
@@ -1486,9 +1515,147 @@ static char *agent_tail_capture_take(agent_tail_capture *t, size_t *len) {
     return out;
 }
 
+/* Assistant prose is streamed word-by-word so ordinary words are not split by
+ * terminal wrapping.  The configured value is a maximum reading width; narrow
+ * terminals clamp it down to the live terminal width. */
+static int renderer_word_wrap_width(agent_token_renderer *r) {
+    if (!r->word_wrap_cols || r->word_wrap_disabled || r->capture ||
+        !isatty(STDOUT_FILENO))
+    {
+        return 0;
+    }
+    int cols = renderer_terminal_cols();
+    if (cols > 1 && cols < r->word_wrap_cols) return cols;
+    return r->word_wrap_cols;
+}
+
+static int renderer_display_width(agent_token_renderer *r,
+                                  const char *s, size_t n) {
+    if (!n) return 0;
+    unsigned char c = (unsigned char)s[0];
+    if (c == '\t') return 8 - (r->word_wrap_col & 7);
+    if (c < 0x20 || c == 0x7f) return 0;
+    return 1;
+}
+
+static void renderer_note_terminal_output(agent_token_renderer *r,
+                                          const char *s, size_t n) {
+    int cols = renderer_terminal_cols();
+    if (cols <= 1) cols = 80;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == 0x1b && i + 1 < n && s[i + 1] == '[') {
+            i += 2;
+            while (i < n) {
+                unsigned char e = (unsigned char)s[i];
+                if (e >= 0x40 && e <= 0x7e) break;
+                i++;
+            }
+            continue;
+        }
+        if (c == '\n') {
+            r->word_wrap_col = 0;
+            continue;
+        }
+        if (c == '\r') {
+            r->word_wrap_col = 0;
+            continue;
+        }
+        if (c == '\b') {
+            if (r->word_wrap_col > 0) r->word_wrap_col--;
+            continue;
+        }
+
+        int width = 1;
+        if (c == '\t') {
+            width = 8 - (r->word_wrap_col & 7);
+        } else if (c < 0x20 || c == 0x7f) {
+            width = 0;
+        } else if (c >= 0xc0) {
+            while (i + 1 < n && (((unsigned char)s[i + 1]) & 0xc0) == 0x80)
+                i++;
+        } else if ((c & 0xc0) == 0x80) {
+            width = 0;
+        }
+
+        if (width > 0)
+            r->word_wrap_col = (r->word_wrap_col + width) % cols;
+    }
+}
+
 static void renderer_write(agent_token_renderer *r, const char *s, size_t n) {
+    renderer_note_terminal_output(r, s, n);
     if (r->capture) agent_tail_capture_append(r->capture, s, n);
     else agent_publish(r->worker, s, n);
+}
+
+static void renderer_word_wrap_append(agent_token_renderer *r,
+                                      const char *s, size_t n, int width) {
+    if (r->word_wrap_len + n + 1 > r->word_wrap_cap) {
+        size_t cap = r->word_wrap_cap ? r->word_wrap_cap * 2 : 64;
+        while (cap < r->word_wrap_len + n + 1) cap *= 2;
+        r->word_wrap_buf = xrealloc(r->word_wrap_buf, cap);
+        r->word_wrap_cap = cap;
+    }
+    memcpy(r->word_wrap_buf + r->word_wrap_len, s, n);
+    r->word_wrap_len += n;
+    r->word_wrap_buf[r->word_wrap_len] = '\0';
+    r->word_wrap_width += width;
+}
+
+static void renderer_word_wrap_flush(agent_token_renderer *r) {
+    if (!r->word_wrap_len) return;
+    int wrap_cols = renderer_word_wrap_width(r);
+    if (wrap_cols > 1 && r->word_wrap_col > 0 &&
+        r->word_wrap_col + r->word_wrap_width >= wrap_cols)
+    {
+        renderer_write(r, "\n", 1);
+    }
+    renderer_write(r, r->word_wrap_buf, r->word_wrap_len);
+    r->word_wrap_len = 0;
+    r->word_wrap_width = 0;
+    r->last_output_newline = false;
+}
+
+static bool renderer_word_wrap_space(agent_token_renderer *r,
+                                     const char *s, size_t n) {
+    if (n != 1) return false;
+    char c = s[0];
+    if (c != ' ' && c != '\t' && c != '\r' && c != '\n') return false;
+
+    renderer_word_wrap_flush(r);
+    if (c == '\n') {
+        renderer_write(r, s, n);
+        r->last_output_newline = true;
+        return true;
+    }
+    if (c == ' ' || c == '\t') {
+        int wrap_cols = renderer_word_wrap_width(r);
+        int width = renderer_display_width(r, s, n);
+        if (wrap_cols > 1 &&
+            ((r->word_wrap_col == 0 && !r->last_output_newline) ||
+             (r->word_wrap_col > 0 && r->word_wrap_col + width >= wrap_cols)))
+        {
+            renderer_write(r, "\n", 1);
+            r->last_output_newline = true;
+            return true;
+        }
+    }
+    renderer_write(r, s, n);
+    r->last_output_newline = false;
+    return true;
+}
+
+static void renderer_word_wrap_char(agent_token_renderer *r,
+                                    const char *s, size_t n) {
+    if (renderer_word_wrap_space(r, s, n)) return;
+    int width = renderer_display_width(r, s, n);
+    renderer_word_wrap_append(r, s, n, width);
+    r->last_output_newline = false;
+
+    int wrap_cols = renderer_word_wrap_width(r);
+    if (wrap_cols > 1 && r->word_wrap_width >= wrap_cols)
+        renderer_word_wrap_flush(r);
 }
 
 static void renderer_set_grey(agent_token_renderer *r) {
@@ -1496,6 +1663,7 @@ static void renderer_set_grey(agent_token_renderer *r) {
 }
 
 static void renderer_reset_color(agent_token_renderer *r) {
+    renderer_word_wrap_flush(r);
     if (r->use_color) renderer_write(r, "\x1b[0m", 4);
     r->color_open = false;
 }
@@ -1542,9 +1710,14 @@ static void renderer_write_complete_char_raw(agent_token_renderer *r, const char
     } else if (!styled && r->color_open) {
         renderer_reset_color(r);
     }
-    renderer_write(r, s, n);
+    if (renderer_word_wrap_width(r) > 0) {
+        renderer_word_wrap_char(r, s, n);
+    } else {
+        renderer_word_wrap_flush(r);
+        renderer_write(r, s, n);
+        r->last_output_newline = n == 1 && s[0] == '\n';
+    }
     if (n) r->wrote_visible_output = true;
-    r->last_output_newline = n == 1 && s[0] == '\n';
 }
 
 static void renderer_flush_utf8(agent_token_renderer *r) {
@@ -1581,16 +1754,19 @@ static void renderer_write_plain_byte(agent_token_renderer *r, char c) {
     bool old_italic = r->md_italic;
     bool old_inline_code = r->md_inline_code;
     bool old_code_block = r->md_code_block;
+    bool old_wrap_disabled = r->word_wrap_disabled;
 
     /* Code blocks are streamed immediately in plain text, then repainted with
      * syntax colors when a complete terminal-safe line is available.  Disable
      * markdown attributes only for this byte; renderer_write_char_raw() will
      * reset any tracked manual color once if needed. */
+    r->word_wrap_disabled = true;
     r->md_bold = false;
     r->md_italic = false;
     r->md_inline_code = false;
     r->md_code_block = false;
     renderer_write_char_raw(r, c);
+    r->word_wrap_disabled = old_wrap_disabled;
     r->md_bold = old_bold;
     r->md_italic = old_italic;
     r->md_inline_code = old_inline_code;
@@ -2364,6 +2540,7 @@ static void renderer_markdown_commit_backticks(agent_token_renderer *r) {
     }
     /* Support both `code` and ``code``.  The latter is uncommon in model
      * replies, but accepting it costs nothing and avoids leaking delimiters. */
+    renderer_word_wrap_flush(r);
     r->md_inline_code = !r->md_inline_code;
 }
 
@@ -2408,12 +2585,14 @@ static void renderer_markdown_feed(agent_token_renderer *r, char c) {
     if (r->md_pending == AGENT_MD_PENDING_STAR) {
         renderer_markdown_clear_pending(r);
         if (!r->md_inline_code && !r->md_code_block && c == '*') {
+            renderer_word_wrap_flush(r);
             r->md_bold = !r->md_bold;
             return;
         }
         if (!r->md_inline_code && !r->md_code_block &&
             (r->md_italic || !renderer_space_byte(c)))
         {
+            renderer_word_wrap_flush(r);
             r->md_italic = !r->md_italic;
             renderer_markdown_feed(r, c);
             return;
@@ -2496,6 +2675,7 @@ static void renderer_process(agent_token_renderer *r, const char *text, size_t l
         const char *cur = buf + i;
         size_t rem = total - i;
         if (bytes_has_prefix(cur, rem, think_open)) {
+            renderer_word_wrap_flush(r);
             r->in_think = true;
             i += strlen(think_open);
             continue;
@@ -2531,17 +2711,24 @@ static void renderer_finish(agent_token_renderer *r) {
     }
     renderer_markdown_finish(r);
     renderer_flush_utf8(r);
+    renderer_word_wrap_flush(r);
     renderer_reset_color(r);
     if (r->wrote_visible_output) {
         if (!r->last_output_newline) renderer_write(r, "\n", 1);
         renderer_write(r, "\n", 1);
         r->last_output_newline = true;
     }
+    free(r->word_wrap_buf);
+    r->word_wrap_buf = NULL;
+    r->word_wrap_len = 0;
+    r->word_wrap_cap = 0;
+    r->word_wrap_width = 0;
 }
 
 static void renderer_color(agent_token_renderer *r, const char *seq) {
     renderer_markdown_emit_pending_literals(r);
     renderer_flush_utf8(r);
+    renderer_word_wrap_flush(r);
     bool reset = !seq || !seq[0] || !strcmp(seq, "\x1b[0m");
     if (r->use_color && seq && seq[0]) renderer_write(r, seq, strlen(seq));
     r->color_open = r->use_color && !reset;
@@ -2550,6 +2737,7 @@ static void renderer_color(agent_token_renderer *r, const char *seq) {
 static void renderer_plain(agent_token_renderer *r, const char *s, size_t n) {
     renderer_markdown_emit_pending_literals(r);
     renderer_flush_utf8(r);
+    renderer_word_wrap_flush(r);
     renderer_write(r, s, n);
     if (n) r->wrote_visible_output = true;
     if (n) r->last_output_newline = s[n - 1] == '\n';
@@ -4593,6 +4781,7 @@ static void agent_history_render_assistant(agent_worker *w,
         .format_markdown = true,
         .use_color = use_color && !source_truncated,
         .last_output_newline = true,
+        .word_wrap_cols = w->cfg->gen.wrap_cols,
         .capture = source_truncated ? &tail : NULL,
     };
     agent_dsml_parser dsml = {.state = AGENT_DSML_SEARCH};
@@ -7322,6 +7511,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             .in_think = ds4_think_mode_enabled(think_mode),
             .use_color = use_color,
             .last_output_newline = true,
+            .word_wrap_cols = cfg->gen.wrap_cols,
         };
         agent_dsml_parser dsml = {.state = AGENT_DSML_SEARCH};
         agent_stream_renderer stream = {
