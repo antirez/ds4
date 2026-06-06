@@ -27,12 +27,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+/* Native Windows (MinGW-w64) CPU build: a small dependency-free POSIX shim
+ * supplies mmap/flock/pread/sysconf/dprintf/fmemopen. See ds4_win.h. */
+#include "ds4_win.h"
+#include <sys/stat.h>
+#include <stdarg.h>
+#include <time.h>
+#include <unistd.h>
+#else
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
+#endif
 
 #include "ds4.h"
 
