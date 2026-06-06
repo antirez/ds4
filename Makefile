@@ -1,11 +1,27 @@
 CC ?= cc
 UNAME_S := $(shell uname -s)
 
+# On MinGW/MSYS `uname -s` is e.g. MINGW64_NT-10.0 or MSYS_NT-10.0.
+IS_WINDOWS := $(filter MINGW% MSYS%,$(UNAME_S))
+
+# MinGW has no `cc`; default the compiler to gcc there (still overridable).
+ifneq ($(IS_WINDOWS),)
+ifeq ($(origin CC),default)
+CC := gcc
+endif
+endif
+
 ifeq ($(UNAME_S),Darwin)
 NATIVE_CPU_FLAG ?= -mcpu=native
 else
 NATIVE_CPU_FLAG ?= -march=native
 endif
+
+# Native Windows (MinGW-w64) CPU build flags. ds4.c pulls in the dependency-free
+# POSIX shim (ds4_win.h) behind #ifdef _WIN32; no extra -I/-include is needed.
+WIN_CFLAGS ?= -O3 -ffast-math $(NATIVE_CPU_FLAG) -std=c99 -D_GNU_SOURCE \
+	-fno-finite-math-only -DDS4_NO_GPU -D_CRT_SECURE_NO_WARNINGS
+WIN_LDLIBS ?= -lm
 
 CFLAGS ?= -O3 -ffast-math $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
 OBJCFLAGS ?= -O3 -ffast-math $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc
@@ -57,7 +73,7 @@ METAL_LDLIBS := $(LDLIBS)
 
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression
+.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression windows-cpu
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench
@@ -85,6 +101,27 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o linenoise.o rax.o $(CPU_CORE
 
 cuda-regression:
 	@echo "cuda-regression requires a CUDA build"
+
+else ifneq ($(IS_WINDOWS),)
+# ---- Native Windows (MinGW-w64) ------------------------------------------
+# Only the CPU bench is portable today. The CLI (linenoise/termios + sigaction)
+# and server (BSD sockets/poll) still need Windows ports; see win/README.md.
+all: help
+
+help:
+	@echo "DS4 build targets (native Windows / MinGW-w64):"
+	@echo "  make windows-cpu   Build native Windows CPU ./ds4-bench.exe"
+	@echo "  make clean         Remove build outputs"
+	@echo ""
+	@echo "  ds4 (CLI) and ds4-server are not yet ported to Windows."
+
+windows-cpu: ds4-bench.exe
+
+ds4-bench.exe: ds4_bench.c ds4.c ds4.h ds4_gpu.h ds4_win.h
+	$(CC) $(WIN_CFLAGS) -c -o ds4_cpu.o ds4.c
+	$(CC) $(WIN_CFLAGS) -c -o ds4_bench_cpu.o ds4_bench.c
+	$(CC) $(WIN_CFLAGS) -o $@ ds4_bench_cpu.o ds4_cpu.o $(WIN_LDLIBS)
+
 else
 all: help
 
@@ -194,5 +231,5 @@ test: ds4_test
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4_cpu ds4_native ds4_server_test ds4_test *.o *.exe tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 

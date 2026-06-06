@@ -1,6 +1,7 @@
 /ds4
 /ds4-server
 /ds4-bench
+/ds4-bench.exe
 /ds4_native
 /ds4_server_test
 /ds4_test
@@ -8,6 +9,7 @@
 /TODO.md
 /gguf/
 *.o
+*.exe
 *.dSYM/
 /misc/
 .*.swp
