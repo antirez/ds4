@@ -18401,7 +18401,10 @@ static bool metal_graph_prefill_decode_streaming_range(
         ds4_session_progress_fn progress,
         void                  *progress_ud,
         ds4_session_progress_fn display_progress,
-        void                  *display_progress_ud) {
+        void                  *display_progress_ud,
+        ds4_session_cancel_fn  cancel,
+        void                  *cancel_ud,
+        bool                  *cancelled) {
     if (!metal_graph_use_streaming_decode_prefill(g, n_tokens)) return false;
     if (!prompt || start > (uint32_t)prompt->len ||
         n_tokens > (uint32_t)prompt->len - start) return false;
@@ -18421,6 +18424,10 @@ static bool metal_graph_prefill_decode_streaming_range(
     }
 
     for (uint32_t i = 0; i < n_tokens; i++) {
+        if (cancel && cancel(cancel_ud)) {
+            if (cancelled) *cancelled = true;
+            return true;
+        }
         const uint32_t pos = start + i;
         const bool last = i + 1u == n_tokens;
         float *token_logits = (last && logits) ? logits : NULL;
@@ -18441,6 +18448,10 @@ static bool metal_graph_prefill_decode_streaming_range(
         }
         if (display_progress) {
             display_progress(display_progress_ud, "prefill_display", (int)(pos + 1u), prompt->len);
+        }
+        if (cancel && cancel(cancel_ud)) {
+            if (cancelled) *cancelled = true;
+            return true;
         }
         if (show_progress) {
             fprintf(stderr, "ds4: gpu streaming prefill token %u/%u\r",
@@ -19610,7 +19621,10 @@ static bool metal_graph_prefill_raw_swa(
         float                 *logits,
         bool                   show_progress,
         ds4_session_progress_fn display_progress,
-        void                  *display_progress_ud) {
+        void                  *display_progress_ud,
+        ds4_session_cancel_fn  cancel,
+        void                  *cancel_ud,
+        bool                  *cancelled) {
     if (n_tokens <= 0 || n_tokens > prompt->len) return false;
     if ((uint32_t)n_tokens > g->prefill_cap) return false;
     if (metal_graph_use_streaming_decode_prefill_range(g, 0, (uint32_t)n_tokens)) {
@@ -19625,8 +19639,19 @@ static bool metal_graph_prefill_raw_swa(
                                                           NULL,
                                                           NULL,
                                                           display_progress,
-                                                          display_progress_ud);
+                                                          display_progress_ud,
+                                                          cancel,
+                                                          cancel_ud,
+                                                          cancelled);
     }
+    /* The layer-major fallback below may submit the whole short prefill as one
+     * Metal command buffer.  Once that command is in flight there is no useful
+     * safe prefix to expose: by the time cancellation can be observed again,
+     * the prompt has already been fully read and the KV is valid.  Let the
+     * caller observe the pending interrupt at generation time instead. */
+    (void)cancel;
+    (void)cancel_ud;
+    (void)cancelled;
     return metal_graph_prefill_layer_major(g,
                                            model,
                                            weights,
@@ -19661,7 +19686,10 @@ static bool metal_graph_prefill_chunked_range(
         void                  *progress_ud,
         ds4_session_progress_fn display_progress,
         void                  *display_progress_ud,
-        ds4_imatrix_collector *imatrix) {
+        ds4_imatrix_collector *imatrix,
+        ds4_session_cancel_fn  cancel,
+        void                  *cancel_ud,
+        bool                  *cancelled) {
     if (n_tokens == 0 || g->prefill_cap == 0) return false;
     if (start > (uint32_t)prompt->len) return false;
     if (n_tokens > (uint32_t)prompt->len - start) return false;
@@ -19678,7 +19706,10 @@ static bool metal_graph_prefill_chunked_range(
                                                           progress,
                                                           progress_ud,
                                                           display_progress,
-                                                          display_progress_ud);
+                                                          display_progress_ud,
+                                                          cancel,
+                                                          cancel_ud,
+                                                          cancelled);
     }
 
     uint32_t chunk_cap = g->prefill_cap;
@@ -19697,6 +19728,10 @@ static bool metal_graph_prefill_chunked_range(
     }
 
     for (uint32_t pos0 = start; pos0 < end; ) {
+        if (cancel && cancel(cancel_ud)) {
+            if (cancelled) *cancelled = true;
+            return true;
+        }
         const uint32_t remaining = end - pos0;
         uint32_t local_cap = chunk_cap;
         if (start != 0 && g->prefill_cap != 0) {
@@ -19732,6 +19767,10 @@ static bool metal_graph_prefill_chunked_range(
         if (display_progress) {
             display_progress(display_progress_ud, "prefill_display", (int)chunk_end, prompt->len);
         }
+        if (cancel && cancel(cancel_ud)) {
+            if (cancelled) *cancelled = true;
+            return true;
+        }
         pos0 = chunk_end;
     }
     if (show_progress) fputc('\n', stderr);
@@ -19760,7 +19799,10 @@ static bool metal_graph_prefill_chunked(
         ds4_session_progress_fn progress,
         void                  *progress_ud,
         ds4_session_progress_fn display_progress,
-        void                  *display_progress_ud) {
+        void                  *display_progress_ud,
+        ds4_session_cancel_fn  cancel,
+        void                  *cancel_ud,
+        bool                  *cancelled) {
     if (n_tokens <= 0) return false;
     return metal_graph_prefill_chunked_range(g,
                                              model,
@@ -19774,7 +19816,10 @@ static bool metal_graph_prefill_chunked(
                                              progress_ud,
                                              display_progress,
                                              display_progress_ud,
-                                             NULL);
+                                             NULL,
+                                             cancel,
+                                             cancel_ud,
+                                             cancelled);
 }
 
 /* Layer-major speculative target verifier for tiny MTP suffixes.
@@ -20211,7 +20256,8 @@ static int metal_graph_prompt_logits_test(
                                   (uint32_t)t);
     }
     ok = metal_graph_prefill_raw_swa(&g, model, weights, prompt, n_test,
-                                     gpu_logits, true, NULL, NULL);
+                                     gpu_logits, true, NULL, NULL,
+                                     NULL, NULL, NULL);
     if (memory_report) ds4_gpu_print_memory_report("after prompt graph");
 
     if (ok) {
@@ -21876,11 +21922,13 @@ static int generate_metal_graph_raw_swa(
         ok = metal_graph_prefill_chunked(&g, model, weights, prompt,
                                          prompt->len, logits, false,
                                          progress, progress_ud,
-                                         progress, progress_ud);
+                                         progress, progress_ud,
+                                         NULL, NULL, NULL);
     } else {
         ok = metal_graph_prefill_raw_swa(&g, model, weights, prompt,
                                          prompt->len, logits, true,
-                                         progress, progress_ud);
+                                         progress, progress_ud,
+                                         NULL, NULL, NULL);
     }
     const double t_prefill1 = now_sec();
     if (memory_report) ds4_gpu_print_memory_report("after prefill");
@@ -22115,6 +22163,8 @@ struct ds4_session {
     void *progress_ud;
     ds4_session_progress_fn display_progress;
     void *display_progress_ud;
+    ds4_session_cancel_fn cancel;
+    void *cancel_ud;
     uint32_t prefill_cap;
     int ctx_size;
     bool checkpoint_valid;
@@ -23923,7 +23973,8 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                                                            NULL, false,
                                                            NULL, NULL,
                                                            NULL, NULL,
-                                                           &collector);
+                                                           &collector,
+                                                           NULL, NULL, NULL);
                 } else {
                     ok = metal_graph_prefill_layer_major(&g, model, weights,
                                                          &prompt, 0,
@@ -24924,6 +24975,20 @@ void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn
     s->display_progress_ud = ud;
 }
 
+void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud) {
+    if (!s) return;
+    s->cancel = fn;
+    s->cancel_ud = ud;
+}
+
+static bool ds4_session_cancelled(ds4_session *s) {
+    return s && s->cancel && s->cancel(s->cancel_ud);
+}
+
+static bool ds4_session_cancelled_cb(void *ud) {
+    return ds4_session_cancelled(ud);
+}
+
 void ds4_session_report_progress(ds4_session *s, const char *event, int current, int total) {
     if (!s || !s->progress || !event) return;
     s->progress(s->progress_ud, event, current, total);
@@ -25364,6 +25429,10 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         snprintf(err, errlen, "prompt exceeds context");
         return 1;
     }
+    if (ds4_session_cancelled(s)) {
+        snprintf(err, errlen, "interrupted");
+        return DS4_SESSION_SYNC_INTERRUPTED;
+    }
     if (s->distributed) {
         const ds4_tokens *checkpoint = s->checkpoint_valid ? &s->checkpoint : NULL;
         return ds4_dist_session_sync(s->distributed,
@@ -25382,6 +25451,12 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         {
             s->mtp_draft_valid = false;
             for (int i = s->checkpoint.len; i < prompt->len; i++) {
+                if (ds4_session_cancelled(s)) {
+                    snprintf(err, errlen, "interrupted");
+                    s->checkpoint_valid = true;
+                    s->mtp_draft_valid = false;
+                    return DS4_SESSION_SYNC_INTERRUPTED;
+                }
                 forward_token_raw_swa_cpu_decode_scratch(s->logits,
                                                          &e->model,
                                                          &e->weights,
@@ -25431,14 +25506,13 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         const int suffix = prompt->len - s->checkpoint.len;
         const uint32_t resume_min = metal_graph_resume_prefill_min_tokens();
         if (suffix > 0 && (uint32_t)suffix >= resume_min) {
+            bool cancelled = false;
             ds4_sync_progress progress = {
                 .session = s,
                 .prompt = prompt,
                 .user = s->progress,
                 .user_ud = s->progress_ud,
             };
-            ds4_session_progress_fn progress_fn =
-                s->progress ? ds4_session_note_prefill_progress : NULL;
             bool ok = metal_graph_prefill_chunked_range(&s->graph,
                                                         &e->model,
                                                         &e->weights,
@@ -25447,11 +25521,20 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                                         (uint32_t)suffix,
                                                         s->logits,
                                                         false,
-                                                        progress_fn,
-                                                        progress_fn ? &progress : NULL,
+                                                        ds4_session_note_prefill_progress,
+                                                        &progress,
                                                         s->display_progress,
                                                         s->display_progress_ud,
-                                                        NULL);
+                                                        NULL,
+                                                        ds4_session_cancelled_cb,
+                                                        s,
+                                                        &cancelled);
+            if (cancelled) {
+                snprintf(err, errlen, "interrupted");
+                s->checkpoint_valid = true;
+                s->mtp_draft_valid = false;
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
             if (!ok) {
                 snprintf(err, errlen, "%s resumed prefill failed while extending checkpoint", backend_name);
                 s->checkpoint_valid = false;
@@ -25463,6 +25546,12 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         }
 
         for (int i = s->checkpoint.len; i < prompt->len; i++) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                s->checkpoint_valid = true;
+                s->mtp_draft_valid = false;
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
             if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
                                                 (uint32_t)prompt->v[i],
                                                 (uint32_t)s->checkpoint.len,
@@ -25479,30 +25568,47 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
 
     bool ok;
     s->checkpoint_valid = false;
+    s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
     if (!metal_graph_reset_prefill_state(&s->graph)) {
         snprintf(err, errlen, "%s prefill state reset failed", backend_name);
         return 1;
     }
     if (s->prefill_cap < (uint32_t)prompt->len) {
+        bool cancelled = false;
         ds4_sync_progress progress = {
             .session = s,
             .prompt = prompt,
             .user = s->progress,
             .user_ud = s->progress_ud,
         };
-        ds4_session_progress_fn progress_fn =
-            s->progress ? ds4_session_note_prefill_progress : NULL;
         ok = metal_graph_prefill_chunked(&s->graph, &e->model, &e->weights,
                                          prompt, prompt->len, s->logits, false,
-                                         progress_fn, progress_fn ? &progress : NULL,
+                                         ds4_session_note_prefill_progress, &progress,
                                          s->display_progress,
-                                         s->display_progress_ud);
+                                         s->display_progress_ud,
+                                         ds4_session_cancelled_cb,
+                                         s,
+                                         &cancelled);
+        if (cancelled) {
+            snprintf(err, errlen, "interrupted");
+            s->checkpoint_valid = s->checkpoint.len > 0;
+            s->mtp_draft_valid = false;
+            return DS4_SESSION_SYNC_INTERRUPTED;
+        }
     } else {
+        bool cancelled = false;
         ok = metal_graph_prefill_raw_swa(&s->graph, &e->model, &e->weights,
                                          prompt, prompt->len, s->logits, false,
                                          s->display_progress,
-                                         s->display_progress_ud);
+                                         s->display_progress_ud,
+                                         ds4_session_cancelled_cb,
+                                         s,
+                                         &cancelled);
+        if (cancelled) {
+            snprintf(err, errlen, "interrupted");
+            return DS4_SESSION_SYNC_INTERRUPTED;
+        }
     }
     if (!ok) {
         snprintf(err, errlen, "%s prefill failed", backend_name);
