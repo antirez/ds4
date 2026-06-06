@@ -65,6 +65,7 @@ typedef struct {
     agent_generation_options gen;
     const char *chdir_path;
     bool non_interactive;
+    bool agent_control;
 } agent_config;
 
 typedef enum {
@@ -408,6 +409,21 @@ static char *agent_input_buf_take(agent_input_buf *b) {
     return p;
 }
 
+static char *agent_input_buf_take_line(agent_input_buf *b, bool eof) {
+    if (!b->len) return NULL;
+    char *nl = memchr(b->ptr, '\n', b->len);
+    if (!nl && !eof) return NULL;
+
+    size_t line_len = nl ? (size_t)(nl - b->ptr) : b->len;
+    size_t take_len = nl ? line_len + 1 : line_len;
+    char *line = xstrndup(b->ptr, line_len);
+    size_t rem = b->len - take_len;
+    if (rem) memmove(b->ptr, b->ptr + take_len, rem);
+    b->len = rem;
+    if (b->ptr) b->ptr[b->len] = '\0';
+    return line;
+}
+
 static void agent_input_buf_free(agent_input_buf *b) {
     free(b->ptr);
     memset(b, 0, sizeof(*b));
@@ -557,6 +573,9 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.prompt = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--non-interactive")) {
             c.non_interactive = true;
+        } else if (!strcmp(arg, "--agent-control")) {
+            c.non_interactive = true;
+            c.agent_control = true;
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {
@@ -662,6 +681,10 @@ static agent_config parse_options(int argc, char **argv) {
 
     if (c.engine.directional_steering_file && !steering_scale_set)
         c.engine.directional_steering_ffn = 1.0f;
+    if (c.agent_control && c.gen.prompt) {
+        fprintf(stderr, "ds4-agent: --agent-control reads prompts and commands from stdin; do not combine it with -p\n");
+        exit(2);
+    }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.engine.distributed,
                                         &c.engine,
@@ -9266,6 +9289,18 @@ static void runtime_help(void) {
     puts("  Ctrl+D       Exit from an empty prompt.");
 }
 
+static void runtime_control_help(void) {
+    puts("Agent control stdin:");
+    puts("  each input line is a command or a user prompt.");
+    puts("  lines not starting with / are submitted as user prompts.");
+    puts("  /help        Show this help.");
+    puts("  /save        Save the current session.");
+    puts("  /list        List saved sessions.");
+    puts("  /switch SHA  Load a saved session.");
+    puts("  /new         Start a fresh session from the system prompt.");
+    puts("  /quit, /exit Exit.");
+}
+
 static void agent_format_ctx_size(int ctx_size, char *buf, size_t len) {
     if (ctx_size >= 1000) {
         if (ctx_size % 1000 == 0) snprintf(buf, len, "%dk", ctx_size / 1000);
@@ -9502,11 +9537,101 @@ static int agent_read_stdin_available(agent_input_buf *in, bool *eof) {
     }
 }
 
+typedef enum {
+    AGENT_CONTROL_COMMAND_HANDLED,
+    AGENT_CONTROL_COMMAND_EXIT,
+} agent_control_command_result;
+
+static char *agent_trim_line(char *line) {
+    char *cmd = line;
+    while (*cmd == ' ' || *cmd == '\t' || *cmd == '\r' || *cmd == '\n') cmd++;
+    char *end = cmd + strlen(cmd);
+    while (end > cmd &&
+           (end[-1] == ' ' || end[-1] == '\t' ||
+            end[-1] == '\r' || end[-1] == '\n'))
+        end--;
+    *end = '\0';
+    return cmd;
+}
+
+static agent_control_command_result agent_run_control_command(agent_worker *worker,
+                                                              char *cmd,
+                                                              bool queue_pending) {
+    bool busy = !worker_is_idle(worker) || queue_pending;
+    if (!strcmp(cmd, "/help")) {
+        runtime_control_help();
+    } else if (!strcmp(cmd, "/save")) {
+        if (busy) {
+            worker_request_save(worker);
+            printf("save scheduled at next safe point\n");
+        } else {
+            char err[160] = {0};
+            if (!agent_worker_save_session(worker, err, sizeof(err)))
+                printf("save failed: %s\n", err);
+        }
+    } else if (!strcmp(cmd, "/list")) {
+        agent_worker_list_sessions(worker);
+    } else if (!strcmp(cmd, "/quit") || !strcmp(cmd, "/exit")) {
+        return AGENT_CONTROL_COMMAND_EXIT;
+    } else if (cmd[0] == '/' && busy) {
+        printf("command requires the model to be idle: %s\n", cmd);
+    } else if (!strcmp(cmd, "/new")) {
+        if (agent_worker_needs_save(worker)) {
+            printf("new session refused: send /save first or restart the agent\n");
+        } else {
+            char err[160] = {0};
+            if (!agent_worker_reset_to_sysprompt(worker, err, sizeof(err)))
+                printf("new session failed: %s\n", err);
+            else
+                printf("new session started\n");
+        }
+    } else if (!strncmp(cmd, "/switch", 7) &&
+               (cmd[7] == '\0' || cmd[7] == ' ' || cmd[7] == '\t')) {
+        char *arg = cmd + 7;
+        while (*arg == ' ' || *arg == '\t') arg++;
+        if (!arg[0]) {
+            printf("usage: /switch <sha-prefix>\n");
+        } else if (agent_worker_needs_save(worker)) {
+            printf("switch refused: send /save first\n");
+        } else {
+            char *sha = arg;
+            while (*arg && *arg != ' ' && *arg != '\t') arg++;
+            if (*arg) *arg = '\0';
+            char err[160] = {0};
+            if (!agent_worker_switch_session(worker, sha,
+                                             0,
+                                             err, sizeof(err)))
+                printf("switch failed: %s\n", err);
+        }
+    } else if (cmd[0] == '/') {
+        printf("unknown command: %s\n", cmd);
+    }
+
+    fflush(stdout);
+    return AGENT_CONTROL_COMMAND_HANDLED;
+}
+
+static void agent_noninteractive_submit_or_queue(agent_worker *worker,
+                                                 agent_prompt_queue *queue,
+                                                 char *prompt) {
+    if (worker_is_idle(worker) && queue->len == 0) {
+        if (!worker_submit(worker, prompt)) {
+            agent_prompt_queue_push(queue, prompt);
+            agent_noninteractive_marker("+DWARFSTAR_QUEUED");
+        }
+    } else {
+        agent_prompt_queue_push(queue, prompt);
+        agent_noninteractive_marker("+DWARFSTAR_QUEUED");
+    }
+}
+
 /* Headless mode is intentionally just another front-end for the same worker.
  * With -p/--prompt it is a one-shot execution.  Without -p it becomes a small
  * stdin protocol: announce readiness on stderr, collect bytes until stdin has
  * been quiet for 200 ms, submit that buffer as one prompt, and keep reading so
- * later input can be queued while the model is still working. */
+ * later input can be queued while the model is still working.  --agent-control
+ * keeps the same worker path but uses newline-delimited stdin frames so slash
+ * commands can control the session without the TUI. */
 static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     agent_worker worker;
     if (agent_worker_init(&worker, engine, cfg) != 0) return 1;
@@ -9519,6 +9644,7 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     int old_stdin_flags = 0;
     agent_input_buf input = {0};
     agent_prompt_queue queue = {0};
+    bool exiting = false;
     double quiet_deadline = 0.0;
     int rc = 0;
 
@@ -9531,7 +9657,7 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
         stdin_nonblock = true;
     }
 
-    while (true) {
+    while (!exiting) {
         bool initialized = worker_is_initialized(&worker, NULL);
         bool idle = worker_is_idle(&worker);
 
@@ -9560,7 +9686,7 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
         }
 
         int timeout_ms = -1;
-        if (!one_shot && input.len > 0) {
+        if (!one_shot && input.len > 0 && !cfg->agent_control) {
             double rem = quiet_deadline - now_sec();
             timeout_ms = rem <= 0.0 ? 0 : (int)(rem * 1000.0) + 1;
         }
@@ -9590,7 +9716,8 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
                 break;
             }
             if (input.len != old_len) {
-                quiet_deadline = now_sec() + 0.200;
+                if (!cfg->agent_control)
+                    quiet_deadline = now_sec() + 0.200;
                 waiting_announced = false;
             }
         }
@@ -9617,19 +9744,38 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             break;
         }
 
-        if (!one_shot && input.len > 0 &&
+        if (!one_shot && cfg->agent_control) {
+            char *prompt = NULL;
+            while ((prompt = agent_input_buf_take_line(&input, stdin_eof)) != NULL) {
+                char *cmd = agent_trim_line(prompt);
+                if (!cmd[0]) {
+                    free(prompt);
+                    waiting_announced = false;
+                    continue;
+                }
+                if (cmd[0] == '/') {
+                    agent_control_command_result cr =
+                        agent_run_control_command(&worker, cmd, queue.len != 0);
+                    free(prompt);
+                    waiting_announced = false;
+                    if (cr == AGENT_CONTROL_COMMAND_EXIT) {
+                        exiting = true;
+                        break;
+                    }
+                    continue;
+                }
+                agent_noninteractive_submit_or_queue(&worker, &queue, prompt);
+                free(prompt);
+                waiting_announced = false;
+            }
+        }
+        if (exiting) break;
+
+        if (!one_shot && !cfg->agent_control && input.len > 0 &&
             (stdin_eof || now_sec() >= quiet_deadline))
         {
             char *prompt = agent_input_buf_take(&input);
-            if (worker_is_idle(&worker) && queue.len == 0) {
-                if (!worker_submit(&worker, prompt)) {
-                    agent_prompt_queue_push(&queue, prompt);
-                    agent_noninteractive_marker("+DWARFSTAR_QUEUED");
-                }
-            } else {
-                agent_prompt_queue_push(&queue, prompt);
-                agent_noninteractive_marker("+DWARFSTAR_QUEUED");
-            }
+            agent_noninteractive_submit_or_queue(&worker, &queue, prompt);
             free(prompt);
             waiting_announced = false;
         }
