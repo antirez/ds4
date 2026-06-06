@@ -103,15 +103,28 @@ cuda-regression:
 	@echo "cuda-regression requires a CUDA build"
 
 else ifneq ($(IS_WINDOWS),)
-# ---- Native Windows (MinGW-w64) ------------------------------------------
-# Only the CPU bench is portable today. The CLI (linenoise/termios + sigaction)
-# and server (BSD sockets/poll) still need Windows ports; see win/README.md.
+# ---- Native Windows (MinGW-w64 / HIP-clang) -------------------------------
+# CPU bench builds with MinGW. The GPU (ROCm/HIP) bench builds with the AMD HIP
+# SDK for gfx1151. The CLI (linenoise/termios + sigaction) and server (BSD
+# sockets/poll) still need Windows ports; see win/README.md.
+#
+# Windows ROCm/HIP build settings. hipcc.exe's .bat wrapper splits args on
+# spaces, so the actual compile/link is delegated to win/build-rocm.sh, which
+# relies on the SDK's default include search and a space-free import-lib dir.
+ROCM_PATH ?= C:/Program Files/AMD/ROCm/7.1
+ROCM_ARCH ?= gfx1151
+
 all: help
 
 help:
-	@echo "DS4 build targets (native Windows / MinGW-w64):"
-	@echo "  make windows-cpu   Build native Windows CPU ./ds4-bench.exe"
-	@echo "  make clean         Remove build outputs"
+	@echo "DS4 build targets (native Windows):"
+	@echo "  make windows-cpu    Build native Windows CPU   ./ds4-bench.exe (MinGW)"
+	@echo "  make windows-rocm   Build native Windows ROCm  ./ds4-bench.exe (HIP, gfx1151)"
+	@echo "  make clean          Remove build outputs"
+	@echo ""
+	@echo "  windows-rocm uses the AMD HIP SDK (ROCM_PATH=$(ROCM_PATH),"
+	@echo "  ROCM_ARCH=$(ROCM_ARCH)). See win/README.md for the rocWMMA vendoring"
+	@echo "  step and run caveats."
 	@echo ""
 	@echo "  ds4 (CLI) and ds4-server are not yet ported to Windows."
 
@@ -121,6 +134,12 @@ ds4-bench.exe: ds4_bench.c ds4.c ds4.h ds4_gpu.h ds4_win.h
 	$(CC) $(WIN_CFLAGS) -c -o ds4_cpu.o ds4.c
 	$(CC) $(WIN_CFLAGS) -c -o ds4_bench_cpu.o ds4_bench.c
 	$(CC) $(WIN_CFLAGS) -o $@ ds4_bench_cpu.o ds4_cpu.o $(WIN_LDLIBS)
+
+# Native Windows ROCm/HIP ds4-bench.exe (gfx1151). Delegates to the build
+# script to work around hipcc.exe's space-splitting argument wrapper.
+.PHONY: windows-rocm
+windows-rocm:
+	ROCM_PATH="$(ROCM_PATH)" ROCM_ARCH="$(ROCM_ARCH)" bash win/build-rocm.sh
 
 else
 all: help

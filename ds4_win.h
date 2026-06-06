@@ -50,6 +50,57 @@
 #define _SC_NPROCESSORS_ONLN 0x2
 #endif
 
+/* ---- misc POSIX surface used by the GPU (HIP) host code ------------------ */
+/* MinGW/UCRT supplies these; the clang-MSVC HIP toolchain (ds4_cuda.cu build)
+ * does not. Guard each so the MinGW CPU build is unaffected. */
+#ifndef STDIN_FILENO
+#define STDIN_FILENO  0
+#endif
+#ifndef STDOUT_FILENO
+#define STDOUT_FILENO 1
+#endif
+#ifndef STDERR_FILENO
+#define STDERR_FILENO 2
+#endif
+
+#ifndef SSIZE_MAX
+#define SSIZE_MAX ((ssize_t)(((size_t)-1) >> 1))
+#endif
+
+/* ssize_t / off_t: MinGW defines these via <sys/types.h>; MSVC does not.
+ * MSVC exposes _SSIZE_T_DEFINED once <BaseTsd.h> (pulled in by windows.h) and
+ * the CRT have declared SSIZE_T; provide ssize_t/off_t only when absent. */
+#if !defined(_SSIZE_T_DEFINED) && !defined(__MINGW32__) && !defined(_SSIZE_T_)
+typedef SSIZE_T ssize_t;
+#define _SSIZE_T_DEFINED
+#endif
+#if !defined(_OFF_T_DEFINED) && !defined(__MINGW32__)
+/* MSVC <sys/types.h> already typedefs off_t to long; only define if missing. */
+#ifndef _OFF_T_
+typedef long long off_t;
+#endif
+#endif
+
+/* clock_gettime / CLOCK_MONOTONIC: present in MinGW, absent in clang-MSVC.
+ * MSVC's <time.h> already declares struct timespec, so we only supply the
+ * clock id macros and the function. */
+#if !defined(CLOCK_MONOTONIC) && !defined(__MINGW32__)
+#include <time.h>
+#define CLOCK_REALTIME  0
+#define CLOCK_MONOTONIC 1
+static inline int clock_gettime(int clk, struct timespec *ts)
+{
+    (void)clk;
+    LARGE_INTEGER freq, cnt;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&cnt);
+    ts->tv_sec  = (long long)(cnt.QuadPart / freq.QuadPart);
+    long long rem = cnt.QuadPart % freq.QuadPart;
+    ts->tv_nsec = (long)((rem * 1000000000LL) / freq.QuadPart);
+    return 0;
+}
+#endif
+
 /* ---- file locking / fd flags -------------------------------------------- */
 #ifndef F_SETFD
 #define F_SETFD    2
@@ -144,7 +195,18 @@ static inline long long ds4_pread(int fd, void *buf, size_t count, long long off
 }
 #define pread(fd, buf, count, offset) ds4_pread((fd), (buf), (size_t)(count), (long long)(offset))
 
-/* ftruncate is already provided by MinGW <unistd.h>. */
+/* ftruncate: provided by MinGW <unistd.h>; absent in the MSVC ABI build. */
+#if !defined(__MINGW32__)
+static inline int ftruncate(int fd, long long length)
+{
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE) { errno = EBADF; return -1; }
+    LARGE_INTEGER li; li.QuadPart = length;
+    if (!SetFilePointerEx(h, li, NULL, FILE_BEGIN)) { errno = EINVAL; return -1; }
+    if (!SetEndOfFile(h)) { errno = EIO; return -1; }
+    return 0;
+}
+#endif
 
 static inline int dprintf(int fd, const char *fmt, ...)
 {

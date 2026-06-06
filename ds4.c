@@ -20,7 +20,14 @@
 #include <inttypes.h>
 #include <ctype.h>
 #include <math.h>
+#if defined(_WIN32) && defined(DS4_WIN_PTHREAD)
+/* Native Windows GPU (HIP/MSVC-ABI) build: MSVC has no <pthread.h>; use the
+ * Win32 pthread shim. The MinGW CPU build (no DS4_WIN_PTHREAD) keeps real
+ * winpthreads, so its behavior is unchanged. */
+#include "win/ds4_pthread_win.h"
+#else
 #include <pthread.h>
+#endif
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -28,13 +35,20 @@
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
-/* Native Windows (MinGW-w64) CPU build: a small dependency-free POSIX shim
- * supplies mmap/flock/pread/sysconf/dprintf/fmemopen. See ds4_win.h. */
+/* Native Windows CPU (MinGW-w64) and GPU (HIP/clang-MSVC) builds: a small
+ * dependency-free POSIX shim supplies mmap/flock/pread/sysconf/dprintf/
+ * fmemopen. See ds4_win.h. */
 #include "ds4_win.h"
 #include <sys/stat.h>
 #include <stdarg.h>
 #include <time.h>
-#include <unistd.h>
+#if defined(__MINGW32__)
+#include <unistd.h>          /* MinGW provides POSIX unistd surface */
+#else
+#include <io.h>              /* MSVC-ABI build: read/write/close/lseek/isatty */
+#include <process.h>         /* getpid */
+#include <direct.h>
+#endif
 #else
 #include <sys/file.h>
 #include <sys/mman.h>

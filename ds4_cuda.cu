@@ -23,7 +23,17 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#ifdef _WIN32
+/* Native Windows ROCm build: the same dependency-free POSIX shim used by
+ * ds4.c supplies mmap/sysconf/pread/fcntl/flock. <io.h> provides the
+ * _open/_read/_write/_close family; the aliases below map the POSIX names the
+ * device-host code uses. The shim body is guarded by _WIN32, so POSIX/CUDA
+ * builds are byte-for-byte unchanged. See win/README.md and ds4_win.h. */
+#include "ds4_win.h"
+#include <io.h>
+#else
 #include <unistd.h>
+#endif
 #include <unordered_map>
 #include <vector>
 
@@ -1491,7 +1501,12 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
         struct stat st;
         if (fstat(fd, &st) == 0 && st.st_size > 0) {
             g_model_file_size = (uint64_t)st.st_size;
+#ifndef _WIN32
+            /* MSVC's struct stat has no st_blksize; the direct-I/O alignment
+             * hint is a Linux O_DIRECT optimization (see below) and is unused
+             * on Windows, so leave g_model_direct_align at its default of 1. */
             if (st.st_blksize > 1) g_model_direct_align = (uint64_t)st.st_blksize;
+#endif
         }
 #if defined(__linux__) && defined(O_DIRECT)
         if (getenv("DS4_CUDA_NO_DIRECT_IO") == NULL) {

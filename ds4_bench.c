@@ -19,6 +19,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(_WIN32) && !defined(__MINGW32__)
+/* Native Windows GPU (HIP/clang-MSVC) build: MSVC lacks clock_gettime/
+ * CLOCK_MONOTONIC; the shim supplies them. The MinGW CPU build already has
+ * them via <time.h>, so it does not include the shim. See win/ds4_win.h. */
+#include "ds4_win.h"
+#endif
 
 typedef struct {
     const char *model_path;

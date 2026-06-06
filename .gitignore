@@ -11,6 +11,9 @@
 *.o
 *.exe
 *.dSYM/
+# Generated MSVC import lib for the Windows ROCm build (regenerated from the
+# HIP SDK's libhipblas.dll by win/build-rocm.sh).
+/win/third_party/hipblas.lib
 /misc/
 .*.swp
 .DS_Store
