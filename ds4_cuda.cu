@@ -3,6 +3,20 @@
 
 #define FULL_WARP_MASK 0xFFFFFFFFFFFFFFFFULL
 #define MASK_T uint64_t
+
+// Precise transcendentals for the MoE router top-k scores, immune to
+// -fapprox-func / fast-math. Used on expert-selection paths where a small
+// error can flip which experts get picked (a macro-visible effect). On ROCm
+// these bind directly to the OCML library entry points so the compiler cannot
+// substitute the lower-precision approximations.
+extern "C" __device__ __attribute__((pure))  float __ocml_exp_f32(float);
+extern "C" __device__ __attribute__((pure))  float __ocml_log1p_f32(float);
+extern "C" __device__ __attribute__((const)) float __ocml_sqrt_f32(float);
+
+static __device__ __forceinline__ float ds4_precise_expf(float x)   { return __ocml_exp_f32(x); }
+static __device__ __forceinline__ float ds4_precise_log1pf(float x) { return __ocml_log1p_f32(x); }
+static __device__ __forceinline__ float ds4_precise_sqrtf(float x)  { return __ocml_sqrt_f32(x); }
+
 #else
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -11,6 +25,15 @@
 
 #define FULL_WARP_MASK 0xFFFFFFFFu
 #define MASK_T uint32_t
+
+// Precise transcendentals for the MoE router top-k scores (see ROCm note
+// above). On CUDA the standard library calls already provide the required
+// precision; kept as named wrappers so the expert-selection path is identical
+// across backends.
+static __device__ __forceinline__ float ds4_precise_expf(float x)   { return expf(x); }
+static __device__ __forceinline__ float ds4_precise_log1pf(float x) { return log1pf(x); }
+static __device__ __forceinline__ float ds4_precise_sqrtf(float x)  { return sqrtf(x); }
+
 #endif
 
 #include <stdint.h>
@@ -4116,8 +4139,8 @@ __global__ static void compressor_shift_ratio4_kernel(float *state_kv, float *st
 
 __device__ static float softplus_dev(float x) {
     if (x > 20.0f) return x;
-    if (x < -20.0f) return expf(x);
-    return log1pf(expf(x));
+    if (x < -20.0f) return ds4_precise_expf(x);
+    return ds4_precise_log1pf(ds4_precise_expf(x));
 }
 
 __global__ static void router_select_kernel(
@@ -4140,7 +4163,7 @@ __global__ static void router_select_kernel(
     int32_t *sel = selected + (uint64_t)t * 6;
     float *w = weights + (uint64_t)t * 6;
 
-    for (int i = 0; i < 256; i++) prob[i] = sqrtf(softplus_dev(log[i]));
+    for (int i = 0; i < 256; i++) prob[i] = ds4_precise_sqrtf(softplus_dev(log[i]));
 
     if (hash_mode) {
         int32_t tok = tokens ? tokens[t] : token_scalar;
@@ -4194,7 +4217,7 @@ __global__ static void router_select_parallel_kernel(
     float *w = weights + (uint64_t)t * 6;
     __shared__ float sprob[256];
 
-    const float p = sqrtf(softplus_dev(log[i]));
+    const float p = ds4_precise_sqrtf(softplus_dev(log[i]));
     sprob[i] = p;
     prob[i] = p;
     __syncthreads();
@@ -4263,7 +4286,7 @@ __global__ static void router_select_warp_topk_kernel(
     #pragma unroll
     for (uint32_t j = 0; j < 8u; j++) {
         const uint32_t e = lane + j * 32u;
-        const float p = sqrtf(softplus_dev(log[e]));
+        const float p = ds4_precise_sqrtf(softplus_dev(log[e]));
         local_prob[j] = p;
         local_score[j] = p + (has_bias ? bias[e] : 0.0f);
         sprob[row_in_block][e] = p;
@@ -5001,6 +5024,13 @@ static int indexer_scores_launch(
                                                          scale, causal ? 1 : 0);
         return cuda_ok(cudaGetLastError(), "indexer score one direct launch");
     }
+#ifndef __HIP_PLATFORM_AMD__
+    // The WMMA indexer kernel body is gated on __CUDA_ARCH__ >= 700, which
+    // hipcc never defines, so on ROCm its body compiles empty and would leave
+    // `scores` uninitialised. The full rocWMMA matrix API is also not available
+    // in this build (only rocwmma-version.hpp is vendored). Skip the WMMA path
+    // on HIP entirely and fall through to the scalar indexer_scores_kernel
+    // below, which fully initialises `scores`. (On CUDA the WMMA path is kept.)
     if (!g_quality_mode && head_dim == 128u && n_head == 64u &&
         getenv("DS4_CUDA_NO_INDEXER_WMMA") == NULL) {
         dim3 grid((n_comp + 15u) / 16u, (n_tokens + 15u) / 16u, 1);
@@ -5012,6 +5042,7 @@ static int indexer_scores_launch(
                                                  head_dim, ratio, scale, causal ? 1 : 0);
         return cuda_ok(cudaGetLastError(), "indexer scores wmma launch");
     }
+#endif // !__HIP_PLATFORM_AMD__
     dim3 grid(n_comp, n_tokens, 1);
     indexer_scores_kernel<<<grid, 256>>>((float *)scores->ptr,
                                          (const float *)q->ptr,
