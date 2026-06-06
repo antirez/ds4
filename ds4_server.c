@@ -415,14 +415,11 @@ typedef enum {
 
 typedef struct {
     ds4_text_format_type type;
-    char *name;
     char *schema_json;
-    bool strict;
 } ds4_text_format;
 
 static void ds4_text_format_clear(ds4_text_format *f) {
     if (!f) return;
-    free(f->name);
     free(f->schema_json);
     memset(f, 0, sizeof(*f));
 }
@@ -437,20 +434,16 @@ static bool ds4_text_format_is_structured(const ds4_text_format *f) {
 
 static void ds4_text_format_set_schema(ds4_text_format *f,
                                        ds4_text_format_type type,
-                                       char *name,
-                                       char *schema_json,
-                                       bool strict) {
+                                       char *schema_json) {
     ds4_text_format_clear(f);
     f->type = type;
-    f->name = name;
     f->schema_json = schema_json;
-    f->strict = strict;
 }
 
 static void ds4_text_format_set_constraint(ds4_text_format *f,
                                            ds4_text_format_type type,
                                            char *constraint_data) {
-    ds4_text_format_set_schema(f, type, NULL, constraint_data, false);
+    ds4_text_format_set_schema(f, type, constraint_data);
 }
 
 static const char *ds4_text_format_constraint_type(const ds4_text_format *f) {
@@ -549,8 +542,10 @@ static bool parse_json_schema_wrapper(const char **p,
         free(name);
         return false;
     }
-    ds4_text_format_set_schema(format, DS4_TEXT_FORMAT_JSON_SCHEMA,
-                               name, schema, strict);
+    (void)strict;
+    ds4_text_format_set_schema(format, DS4_TEXT_FORMAT_JSON_SCHEMA, schema);
+    schema = NULL;
+    free(name);
     return true;
 bad:
     free(name);
@@ -639,24 +634,23 @@ static bool parse_chat_response_format(const char **p,
     }
     if (**p != '}') goto bad;
     (*p)++;
+    (void)strict;
 
     if (!type || !strcmp(type, "text")) {
         ds4_text_format_clear(format);
     } else if (!strcmp(type, "json_object")) {
         if (schema) {
             ds4_text_format_set_schema(format, DS4_TEXT_FORMAT_JSON_SCHEMA,
-                                       name, schema, strict);
-            name = NULL;
+                                       schema);
             schema = NULL;
         } else {
             ds4_text_format_set_schema(format, DS4_TEXT_FORMAT_JSON_OBJECT,
-                                       NULL, NULL, false);
+                                       NULL);
         }
     } else if (!strcmp(type, "json_schema")) {
         if (!saw_json_schema && schema) {
             ds4_text_format_set_schema(format, DS4_TEXT_FORMAT_JSON_SCHEMA,
-                                       name, schema, strict);
-            name = NULL;
+                                       schema);
             schema = NULL;
         } else if (!format->schema_json) {
             snprintf(err, errlen, "response_format json_schema.schema is required");
@@ -778,18 +772,18 @@ static bool parse_responses_text_format_object(const char **p,
     }
     if (**p != '}') goto bad;
     (*p)++;
+    (void)strict;
 
     if (!type || !strcmp(type, "text")) {
         ds4_text_format_clear(format);
     } else if (!strcmp(type, "json_object")) {
         if (schema) {
             ds4_text_format_set_schema(format, DS4_TEXT_FORMAT_JSON_SCHEMA,
-                                       name, schema, strict);
-            name = NULL;
+                                       schema);
             schema = NULL;
         } else {
             ds4_text_format_set_schema(format, DS4_TEXT_FORMAT_JSON_OBJECT,
-                                       NULL, NULL, false);
+                                       NULL);
         }
     } else if (!strcmp(type, "json_schema")) {
         if (!schema) {
@@ -797,8 +791,7 @@ static bool parse_responses_text_format_object(const char **p,
             goto bad_keep_err;
         }
         ds4_text_format_set_schema(format, DS4_TEXT_FORMAT_JSON_SCHEMA,
-                                   name, schema, strict);
-        name = NULL;
+                                   schema);
         schema = NULL;
     } else if (!strcmp(type, "regex")) {
         if (!regex) {
@@ -12344,9 +12337,8 @@ static void test_parse_chat_response_format_json_schema(void) {
 
     TEST_ASSERT(parse_chat_response_format(&p, &fmt, err, sizeof(err)));
     TEST_ASSERT(fmt.type == DS4_TEXT_FORMAT_JSON_SCHEMA);
-    TEST_ASSERT(fmt.name && !strcmp(fmt.name, "calendar_event"));
-    TEST_ASSERT(fmt.strict);
     TEST_ASSERT(fmt.schema_json && strstr(fmt.schema_json, "\"additionalProperties\""));
+    TEST_ASSERT(!strcmp(ds4_text_format_constraint_type(&fmt), "json_schema"));
     json_ws(&p);
     TEST_ASSERT(*p == '\0');
 
@@ -12436,8 +12428,6 @@ static void test_parse_responses_text_format_json_schema(void) {
 
     TEST_ASSERT(parse_responses_text_value(&p, &fmt, err, sizeof(err)));
     TEST_ASSERT(fmt.type == DS4_TEXT_FORMAT_JSON_SCHEMA);
-    TEST_ASSERT(fmt.name && !strcmp(fmt.name, "calendar_event"));
-    TEST_ASSERT(fmt.strict);
     TEST_ASSERT(fmt.schema_json && strstr(fmt.schema_json, "\"required\""));
     TEST_ASSERT(!strcmp(ds4_text_format_constraint_type(&fmt), "json_schema"));
     json_ws(&p);
