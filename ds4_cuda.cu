@@ -1793,6 +1793,59 @@ __device__ static float warp_sum_f32(float v) {
     return v;
 }
 
+#ifdef __HIP_PLATFORM_AMD__
+/* gfx1151 fast path for the paired F16 matmul (ported from upstream PR #311,
+ * commit 9565c07). One warp (32 lanes) computes one output row across both
+ * weight matrices; ROWS_PER_BLOCK warps per block improves occupancy over the
+ * one-block-per-row ordered_chunks kernel. Mathematically identical to that
+ * kernel (a per-row dot product), just a different parallelization. Selected at
+ * the launch site, gated by DS4_ROCM_NO_F16_PAIR_WARP_MATMUL. HIP-only so the
+ * CUDA preprocessor output stays byte-for-byte unchanged. */
+template <uint32_t ROWS_PER_BLOCK>
+__global__ static void matmul_f16_pair_warp_kernel(
+        float *out0,
+        float *out1,
+        const __half *w0,
+        const __half *w1,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim) {
+
+    const uint64_t row_base = (uint64_t)blockIdx.x * ROWS_PER_BLOCK;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+
+    const uint64_t row = row_base + warp;
+    const bool valid0 = row < out0_dim;
+    const bool valid1 = row < out1_dim;
+    if (!valid0 && !valid1) {
+        return;
+    }
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+
+    const __half *wr0 = valid0 ? w0 + row * in_dim : w0;
+    const __half *wr1 = valid1 ? w1 + row * in_dim : w1;
+
+    for (uint64_t i = lane; i < in_dim; i += 32u) {
+        const float xv = x[i];
+        if (valid0) sum0 += __half2float(wr0[i]) * xv;
+        if (valid1) sum1 += __half2float(wr1[i]) * xv;
+    }
+
+    sum0 = warp_sum_f32(sum0);
+    sum1 = warp_sum_f32(sum1);
+
+    if (lane == 0) {
+        if (valid0) out0[row] = sum0;
+        if (valid1) out1[row] = sum1;
+    }
+}
+#endif
+
 __device__ static float warp_max_f32(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
         v = fmaxf(v, __shfl_down_sync(FULL_WARP_MASK, v, offset));
@@ -5570,6 +5623,22 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     const __half *w0 = (const __half *)cuda_model_range_ptr(model_map, weight0_offset, weight_bytes, "f16_pair0");
     const __half *w1 = (const __half *)cuda_model_range_ptr(model_map, weight1_offset, weight_bytes, "f16_pair1");
     if (!w0 || !w1) return 0;
+#ifdef __HIP_PLATFORM_AMD__
+    if (!getenv("DS4_ROCM_NO_F16_PAIR_WARP_MATMUL")) {
+        constexpr uint32_t ROWS_PER_BLOCK = 8u;
+        const uint32_t grid = (uint32_t)((out_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK);
+        matmul_f16_pair_warp_kernel<ROWS_PER_BLOCK><<<grid, ROWS_PER_BLOCK * 32>>>(
+            (float *)out0->ptr,
+            (float *)out1->ptr,
+            w0,
+            w1,
+            (const float *)x->ptr,
+            in_dim,
+            out_dim,
+            out_dim);
+        return cuda_ok(cudaGetLastError(), "matmul_f16_pair_warp launch");
+    }
+#endif
     matmul_f16_pair_ordered_chunks_kernel<<<(unsigned)out_dim, 32>>>(
         (float *)out0->ptr,
         (float *)out1->ptr,
