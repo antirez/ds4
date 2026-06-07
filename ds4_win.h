@@ -81,6 +81,24 @@ typedef long long off_t;
 #endif
 #endif
 
+/* ---- 64-bit file stat --------------------------------------------------- */
+/* The Windows CRT's default `struct stat` / stat() / fstat() carry a 32-bit
+ * st_size, so stat'ing a file larger than 2 GB fails with EOVERFLOW
+ * ("value too large") — fatal for the ~80 GB DeepSeek V4 GGUF. Remap the bare
+ * names to the 64-bit `_stat64` family (which names both the struct and the
+ * functions, with an __int64 st_size).
+ *
+ * <sys/stat.h> is pulled in here first so its own real declarations are parsed
+ * before the macros exist; thanks to its include guard, any later
+ * `#include <sys/stat.h>` in a translation unit (e.g. ds4.c includes it after
+ * this header; ds4_cuda.cu includes it before) is a no-op but still sees the
+ * remap. #undef first in case the CRT already exposes stat/fstat as macros. */
+#include <sys/stat.h>
+#undef stat
+#undef fstat
+#define stat  _stat64
+#define fstat _fstat64
+
 /* clock_gettime / CLOCK_MONOTONIC: present in MinGW, absent in clang-MSVC.
  * MSVC's <time.h> already declares struct timespec, so we only supply the
  * clock id macros and the function. */
