@@ -1,6 +1,7 @@
 #define DS4_SERVER_TEST
 #define DS4_SERVER_TEST_NO_MAIN
 #include "../ds4_server.c"
+#include "../ds4_acp.h"
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
 #include <math.h>
@@ -1801,6 +1802,73 @@ static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
 
+static void test_acp_jsonrpc_parser(void) {
+    ds4_acp_request r;
+    char err[128];
+    TEST_ASSERT(ds4_acp_parse_request(
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1}}",
+        &r, err, sizeof(err)) == DS4_ACP_PARSE_OK);
+    TEST_ASSERT(r.has_id);
+    TEST_ASSERT(!strcmp(r.id_json, "7"));
+    TEST_ASSERT(!strcmp(r.method, "initialize"));
+    TEST_ASSERT(r.has_params);
+    ds4_acp_request_free(&r);
+
+    TEST_ASSERT(ds4_acp_parse_request(
+        "{\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"method\":\"session/new\",\"params\":{\"cwd\":\"/tmp\"}}",
+        &r, err, sizeof(err)) == DS4_ACP_PARSE_OK);
+    TEST_ASSERT(!strcmp(r.id_json, "\"abc\""));
+    char *cwd = NULL;
+    TEST_ASSERT(ds4_acp_object_get_string(r.params_json, "cwd", &cwd));
+    TEST_ASSERT(!strcmp(cwd, "/tmp"));
+    free(cwd);
+    ds4_acp_request_free(&r);
+
+    TEST_ASSERT(ds4_acp_parse_request("{bad", &r, err, sizeof(err)) ==
+                DS4_ACP_PARSE_JSON);
+    TEST_ASSERT(ds4_acp_parse_request("{\"jsonrpc\":\"2.0\",\"id\":1}", &r,
+                                      err, sizeof(err)) ==
+                DS4_ACP_PARSE_REQUEST);
+}
+
+static void test_acp_json_strings(void) {
+    const char *p = "\"a\\n\\\"b\\u0021\"";
+    char *s = NULL;
+    TEST_ASSERT(ds4_acp_json_string(&p, &s));
+    TEST_ASSERT(!strcmp(s, "a\n\"b!"));
+    free(s);
+
+    p = "\"\\ud83d\\ude00\"";
+    s = NULL;
+    TEST_ASSERT(ds4_acp_json_string(&p, &s));
+    TEST_ASSERT(!strcmp(s, "\xf0\x9f\x98\x80"));
+    free(s);
+
+    p = "\"\\ud800\"";
+    s = NULL;
+    TEST_ASSERT(!ds4_acp_json_string(&p, &s));
+    p = "\"\\ud800\\u0041\"";
+    s = NULL;
+    TEST_ASSERT(!ds4_acp_json_string(&p, &s));
+    p = "\"\\udc00\"";
+    s = NULL;
+    TEST_ASSERT(!ds4_acp_json_string(&p, &s));
+
+    char *q = ds4_acp_json_escape("a\n\"b\\", strlen("a\n\"b\\"));
+    TEST_ASSERT(!strcmp(q, "\"a\\n\\\"b\\\\\""));
+    free(q);
+
+    const char bad_utf8[] = {(char)0xff, 0};
+    q = ds4_acp_json_escape(bad_utf8, 1);
+    TEST_ASSERT(!strcmp(q, "\"\\u00ff\""));
+    free(q);
+}
+
+static void test_acp_unit_group(void) {
+    test_acp_jsonrpc_parser();
+    test_acp_json_strings();
+}
+
 typedef void (*test_fn)(void);
 
 typedef struct {
@@ -1822,6 +1890,7 @@ static const ds4_test_entry test_entries[] = {
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
+    {"--acp", "acp", "ACP JSON-RPC parser and writer unit tests", test_acp_unit_group},
 };
 
 static void test_print_help(const char *prog) {

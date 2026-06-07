@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_acp.h"
 #include "ds4_distributed.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
@@ -65,6 +66,7 @@ typedef struct {
     agent_generation_options gen;
     const char *chdir_path;
     bool non_interactive;
+    bool acp;
 } agent_config;
 
 typedef enum {
@@ -95,6 +97,14 @@ typedef struct {
 
 typedef struct agent_bash_job agent_bash_job;
 
+typedef enum {
+    AGENT_TURN_NONE,
+    AGENT_TURN_END,
+    AGENT_TURN_MAX_TOKENS,
+    AGENT_TURN_CANCELLED,
+    AGENT_TURN_ERROR,
+} agent_turn_result;
+
 typedef struct {
     ds4_engine *engine;
     agent_config *cfg;
@@ -111,12 +121,14 @@ typedef struct {
     pthread_t thread;
     pthread_mutex_t mu;
     pthread_cond_t cond;
+    pthread_mutex_t acp_mu;
     int wake_fd[2];
     FILE *trace;
     bool wake_pending;
     bool stop;
     bool interrupt;
     bool initialized;
+    agent_turn_result last_turn_result;
     bool save_requested;
     bool compact_requested;
     bool power_requested;
@@ -145,6 +157,8 @@ typedef struct {
     bool more_valid;
     agent_bash_job *bash_jobs;
     int next_bash_job_id;
+    char acp_session_id[64];
+    int next_acp_tool_call_id;
 } agent_worker;
 
 static unsigned agent_next_prefill_label(void);
@@ -318,6 +332,7 @@ static void agent_trace(agent_worker *w, const char *fmt, ...);
 static void agent_trace_text(agent_worker *w, const char *label,
                              const char *text, size_t len);
 static void agent_publish_system_status(agent_worker *w, const char *msg);
+static void agent_acp_notify_assistant(agent_worker *w, const char *s, size_t n);
 static int agent_web_confirm(void *privdata, const char *message,
                              char *err, size_t err_len);
 static void agent_web_log(void *privdata, const char *message);
@@ -406,6 +421,20 @@ static char *agent_input_buf_take(agent_input_buf *b) {
     char *p = b->ptr;
     memset(b, 0, sizeof(*b));
     return p;
+}
+
+static char *agent_input_buf_take_line(agent_input_buf *b) {
+    if (!b->ptr) return NULL;
+    char *nl = memchr(b->ptr, '\n', b->len);
+    if (!nl) return NULL;
+    size_t len = (size_t)(nl - b->ptr);
+    if (len && b->ptr[len - 1] == '\r') len--;
+    char *line = xstrndup(b->ptr, len);
+    size_t used = (size_t)(nl - b->ptr) + 1;
+    memmove(b->ptr, b->ptr + used, b->len - used);
+    b->len -= used;
+    b->ptr[b->len] = '\0';
+    return line;
 }
 
 static void agent_input_buf_free(agent_input_buf *b) {
@@ -557,6 +586,8 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.prompt = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--non-interactive")) {
             c.non_interactive = true;
+        } else if (!strcmp(arg, "--acp")) {
+            c.acp = true;
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {
@@ -662,6 +693,10 @@ static agent_config parse_options(int argc, char **argv) {
 
     if (c.engine.directional_steering_file && !steering_scale_set)
         c.engine.directional_steering_ffn = 1.0f;
+    if (c.acp && c.non_interactive) {
+        fprintf(stderr, "ds4-agent: --acp cannot be combined with --non-interactive\n");
+        exit(2);
+    }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.engine.distributed,
                                         &c.engine,
@@ -1073,6 +1108,7 @@ static void agent_wake_locked(agent_worker *w) {
  * to the terminal, which keeps linenoise redraws serialized in one place. */
 static void agent_publish(agent_worker *w, const char *s, size_t n) {
     if (!n) return;
+    if (w->cfg && w->cfg->acp) return;
     pthread_mutex_lock(&w->mu);
     if (w->out_len + n + 1 > w->out_cap) {
         size_t cap = w->out_cap ? w->out_cap * 2 : 4096;
@@ -1130,9 +1166,91 @@ static void agent_set_error(agent_worker *w, const char *msg) {
     w->status.state = AGENT_WORKER_ERROR;
     w->status.prefill_tps = 0.0;
     w->status.greedy_sampling = false;
+    w->last_turn_result = AGENT_TURN_ERROR;
     snprintf(w->status.error, sizeof(w->status.error), "%s", msg ? msg : "unknown error");
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
+}
+
+static void agent_set_turn_result(agent_worker *w, agent_turn_result result) {
+    pthread_mutex_lock(&w->mu);
+    w->last_turn_result = result;
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+}
+
+static const char *agent_turn_stop_reason(agent_turn_result result) {
+    switch (result) {
+    case AGENT_TURN_MAX_TOKENS: return "max_tokens";
+    case AGENT_TURN_CANCELLED: return "cancelled";
+    case AGENT_TURN_END: return "end_turn";
+    case AGENT_TURN_ERROR:
+    case AGENT_TURN_NONE:
+    default: return NULL;
+    }
+}
+
+static void agent_acp_write_all_locked(const char *s, size_t n) {
+    write_all(STDOUT_FILENO, s, n);
+}
+
+static void agent_acp_puts_locked(const char *s) {
+    agent_acp_write_all_locked(s, strlen(s));
+}
+
+static void agent_acp_write_response(agent_worker *w, const char *id_json,
+                                     const char *result_json) {
+    pthread_mutex_lock(&w->acp_mu);
+    agent_acp_puts_locked("{\"jsonrpc\":\"2.0\",\"id\":");
+    agent_acp_write_all_locked(id_json ? id_json : "null",
+                               strlen(id_json ? id_json : "null"));
+    agent_acp_puts_locked(",\"result\":");
+    agent_acp_write_all_locked(result_json ? result_json : "{}",
+                               strlen(result_json ? result_json : "{}"));
+    agent_acp_puts_locked("}\n");
+    pthread_mutex_unlock(&w->acp_mu);
+}
+
+static void agent_acp_write_error(agent_worker *w, const char *id_json,
+                                  int code, const char *message) {
+    char codebuf[32];
+    snprintf(codebuf, sizeof(codebuf), "%d", code);
+    char *qmsg = ds4_acp_json_escape(message ? message : "error",
+                                     strlen(message ? message : "error"));
+    pthread_mutex_lock(&w->acp_mu);
+    agent_acp_puts_locked("{\"jsonrpc\":\"2.0\",\"id\":");
+    agent_acp_write_all_locked(id_json ? id_json : "null",
+                               strlen(id_json ? id_json : "null"));
+    agent_acp_puts_locked(",\"error\":{\"code\":");
+    agent_acp_write_all_locked(codebuf, strlen(codebuf));
+    agent_acp_puts_locked(",\"message\":");
+    agent_acp_write_all_locked(qmsg, strlen(qmsg));
+    agent_acp_puts_locked("}}\n");
+    pthread_mutex_unlock(&w->acp_mu);
+    free(qmsg);
+}
+
+static void agent_acp_write_request_error(agent_worker *w,
+                                          const ds4_acp_request *req,
+                                          int code, const char *message) {
+    if (req->has_id) agent_acp_write_error(w, req->id_json, code, message);
+}
+
+static void agent_acp_notify_assistant(agent_worker *w, const char *s, size_t n) {
+    if (!w->cfg || !w->cfg->acp || !w->acp_session_id[0] || !n) return;
+    char *qsid = ds4_acp_json_escape(w->acp_session_id, strlen(w->acp_session_id));
+    char *qtext = ds4_acp_json_escape(s, n);
+    pthread_mutex_lock(&w->acp_mu);
+    agent_acp_puts_locked(
+        "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":");
+    agent_acp_write_all_locked(qsid, strlen(qsid));
+    agent_acp_puts_locked(
+        ",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":");
+    agent_acp_write_all_locked(qtext, strlen(qtext));
+    agent_acp_puts_locked("}}}}\n");
+    pthread_mutex_unlock(&w->acp_mu);
+    free(qsid);
+    free(qtext);
 }
 
 /* ============================================================================
@@ -1613,6 +1731,7 @@ static char *agent_tail_capture_take(agent_tail_capture *t, size_t *len) {
 
 static void renderer_write(agent_token_renderer *r, const char *s, size_t n) {
     if (r->capture) agent_tail_capture_append(r->capture, s, n);
+    else if (r->worker->cfg && r->worker->cfg->acp) agent_acp_notify_assistant(r->worker, s, n);
     else agent_publish(r->worker, s, n);
 }
 
@@ -1660,6 +1779,7 @@ static void renderer_restore_text_attrs(agent_token_renderer *r) {
 }
 
 static void renderer_write_complete_char_raw(agent_token_renderer *r, const char *s, size_t n) {
+    if (r->worker->cfg && r->worker->cfg->acp && r->in_think) return;
     bool styled = r->use_color && renderer_has_text_attrs(r);
     if (styled && !r->color_open) {
         renderer_set_text_attrs(r);
@@ -2729,6 +2849,10 @@ static const char *agent_tool_param_color(agent_tool_param_kind kind) {
 }
 
 static void agent_tool_viz_write(agent_stream_renderer *sr, const char *s, size_t n) {
+    if (sr->renderer->worker->cfg && sr->renderer->worker->cfg->acp) {
+        for (size_t i = 0; i < n; i++) sr->viz.last_output_newline = s[i] == '\n';
+        return;
+    }
     renderer_plain(sr->renderer, s, n);
     for (size_t i = 0; i < n; i++) sr->viz.last_output_newline = s[i] == '\n';
 }
@@ -3439,11 +3563,13 @@ static void agent_stream_text(agent_stream_renderer *sr, const char *text, size_
             agent_stream_flush_start_tail(sr);
             sr->in_think = false;
             sr->renderer->in_think = false;
-            renderer_reset_color(sr->renderer);
-            if (!sr->renderer->last_output_newline)
+            if (!sr->renderer->worker->cfg->acp) {
+                renderer_reset_color(sr->renderer);
+                if (!sr->renderer->last_output_newline)
+                    renderer_write(sr->renderer, "\n", 1);
                 renderer_write(sr->renderer, "\n", 1);
-            renderer_write(sr->renderer, "\n", 1);
-            sr->renderer->last_output_newline = true;
+                sr->renderer->last_output_newline = true;
+            }
             sr->post_think_gap = true;
             i += strlen(think_close);
             continue;
@@ -3996,6 +4122,7 @@ static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
 }
 
 static void agent_publish_system_status(agent_worker *w, const char *msg) {
+    if (w->cfg->acp) return;
     if (w->cfg->non_interactive) return;
     if (isatty(STDOUT_FILENO)) {
         static const char marker[] = "\x1b[33m✦ \x1b[38;5;218m";
@@ -4032,7 +4159,7 @@ static void agent_publishf_system_status(agent_worker *w, const char *fmt, ...) 
 static int agent_web_confirm(void *privdata, const char *message,
                              char *err, size_t err_len) {
     agent_worker *w = privdata;
-    if (!w || w->cfg->non_interactive) {
+    if (!w || w->cfg->non_interactive || w->cfg->acp) {
         snprintf(err, err_len,
                  "visible Chrome browser startup requires interactive approval");
         return 0;
@@ -4105,6 +4232,7 @@ static void worker_answer_web_approval(agent_worker *w, bool allow,
  * after the tool result is appended, so the next model input can contain both
  * the tool observation and the user's pending correction. */
 static char *worker_request_queued_user_drain(agent_worker *w) {
+    if (w->cfg->acp) return NULL;
     pthread_mutex_lock(&w->mu);
     w->queued_user_drain_pending = true;
     w->queued_user_drain_answered = false;
@@ -7035,6 +7163,120 @@ static pid_t agent_tool_pid(const agent_tool_call *call) {
 /* Execute one parsed DSML tool call and return the text that will be appended as
  * the tool-role result.  UI visualization already happened while streaming; this
  * function is only about side effects and the model-visible observation. */
+static const char *agent_acp_tool_kind(const char *name) {
+    if (!name) return "other";
+    if (!strcmp(name, "read") || !strcmp(name, "more") || !strcmp(name, "list"))
+        return "read";
+    if (!strcmp(name, "write") || !strcmp(name, "edit"))
+        return "edit";
+    if (!strcmp(name, "search")) return "search";
+    if (!strcmp(name, "google_search")) return "search";
+    if (!strcmp(name, "visit_page")) return "fetch";
+    if (!strcmp(name, "bash") || !strcmp(name, "bash_status") ||
+        !strcmp(name, "bash_stop"))
+        return "execute";
+    return "other";
+}
+
+static void agent_acp_tool_title(const agent_tool_call *call,
+                                 char *buf, size_t len) {
+    const char *name = call->name ? call->name : "tool";
+    const char *detail = agent_tool_arg_value(call, "path");
+    if (!detail) detail = agent_tool_arg_value(call, "command");
+    if (!detail) detail = agent_tool_arg_value(call, "query");
+    if (!detail) detail = agent_tool_arg_value(call, "url");
+    if (detail && detail[0])
+        snprintf(buf, len, "%s %s", name, detail);
+    else
+        snprintf(buf, len, "%s", name);
+}
+
+static char *agent_acp_tool_raw_input(const agent_tool_call *call) {
+    agent_buf b = {0};
+    char *qname = ds4_acp_json_escape(call->name ? call->name : "",
+                                      strlen(call->name ? call->name : ""));
+    agent_buf_puts(&b, "{\"name\":");
+    agent_buf_puts(&b, qname);
+    agent_buf_puts(&b, ",\"args\":{");
+    free(qname);
+    for (int i = 0; i < call->argc; i++) {
+        if (i) agent_buf_puts(&b, ",");
+        const char *name = call->args[i].name ? call->args[i].name : "";
+        const char *value = call->args[i].value ? call->args[i].value : "";
+        char *qarg = ds4_acp_json_escape(name, strlen(name));
+        char *qval = ds4_acp_json_escape(value, strlen(value));
+        agent_buf_puts(&b, qarg);
+        agent_buf_puts(&b, ":");
+        agent_buf_puts(&b, qval);
+        free(qarg);
+        free(qval);
+    }
+    agent_buf_puts(&b, "}}");
+    return agent_buf_take(&b);
+}
+
+/* ACP tool updates mirror the existing DSML tool execution: one tool_call when
+ * DS4 starts running the tool, followed by a tool_call_update with the final
+ * status and output. */
+static void agent_acp_notify_tool(agent_worker *w, const char *session_update,
+                                  const char *tool_id,
+                                  const agent_tool_call *call,
+                                  const char *status,
+                                  const char *output) {
+    if (!w->cfg->acp || !w->acp_session_id[0]) return;
+    char title[512];
+    agent_acp_tool_title(call, title, sizeof(title));
+    char *qsid = ds4_acp_json_escape(w->acp_session_id, strlen(w->acp_session_id));
+    char *qid = ds4_acp_json_escape(tool_id, strlen(tool_id));
+    char *qtitle = ds4_acp_json_escape(title, strlen(title));
+    char *qkind = ds4_acp_json_escape(agent_acp_tool_kind(call->name),
+                                      strlen(agent_acp_tool_kind(call->name)));
+    char *qstatus = ds4_acp_json_escape(status, strlen(status));
+    char *raw_input = agent_acp_tool_raw_input(call);
+    char *qout = output ? ds4_acp_json_escape(output, strlen(output)) : NULL;
+
+    pthread_mutex_lock(&w->acp_mu);
+    agent_acp_puts_locked(
+        "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":");
+    agent_acp_write_all_locked(qsid, strlen(qsid));
+    agent_acp_puts_locked(",\"update\":{\"sessionUpdate\":");
+    char *qupdate = ds4_acp_json_escape(session_update, strlen(session_update));
+    agent_acp_write_all_locked(qupdate, strlen(qupdate));
+    free(qupdate);
+    agent_acp_puts_locked(",\"toolCallId\":");
+    agent_acp_write_all_locked(qid, strlen(qid));
+    if (!strcmp(session_update, "tool_call")) {
+        agent_acp_puts_locked(",\"title\":");
+        agent_acp_write_all_locked(qtitle, strlen(qtitle));
+        agent_acp_puts_locked(",\"kind\":");
+        agent_acp_write_all_locked(qkind, strlen(qkind));
+        agent_acp_puts_locked(",\"rawInput\":");
+        agent_acp_write_all_locked(raw_input, strlen(raw_input));
+    }
+    agent_acp_puts_locked(",\"status\":");
+    agent_acp_write_all_locked(qstatus, strlen(qstatus));
+    if (qout) {
+        agent_acp_puts_locked(",\"rawOutput\":{\"text\":");
+        agent_acp_write_all_locked(qout, strlen(qout));
+        agent_acp_puts_locked("}");
+        /* ToolCallContent wraps a normal ContentBlock, so this outer type is
+         * "content" while the inner block keeps its own "text" discriminator. */
+        agent_acp_puts_locked(",\"content\":[{\"type\":\"content\",\"content\":{\"type\":\"text\",\"text\":");
+        agent_acp_write_all_locked(qout, strlen(qout));
+        agent_acp_puts_locked("}}]");
+    }
+    agent_acp_puts_locked("}}}\n");
+    pthread_mutex_unlock(&w->acp_mu);
+
+    free(qsid);
+    free(qid);
+    free(qtitle);
+    free(qkind);
+    free(qstatus);
+    free(raw_input);
+    free(qout);
+}
+
 static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call) {
     agent_buf result = {0};
     if (!call->name) return xstrdup("Tool error: missing tool name\n");
@@ -7100,7 +7342,16 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
 static char *agent_execute_tool_calls(agent_worker *w, const agent_tool_calls *calls) {
     agent_buf all = {0};
     for (int i = 0; i < calls->len; i++) {
+        char tool_id[64];
+        snprintf(tool_id, sizeof(tool_id), "tool_%d", ++w->next_acp_tool_call_id);
+        agent_acp_notify_tool(w, "tool_call", tool_id, &calls->v[i],
+                              "pending", NULL);
+        agent_acp_notify_tool(w, "tool_call_update", tool_id, &calls->v[i],
+                              "in_progress", NULL);
         char *res = agent_execute_tool_call(w, &calls->v[i]);
+        agent_acp_notify_tool(w, "tool_call_update", tool_id, &calls->v[i],
+                              !strncmp(res, "Tool error:", 11) ?
+                              "failed" : "completed", res);
         char hdr[128];
         snprintf(hdr, sizeof(hdr), "Tool result %d (%s):\n", i + 1,
                  calls->v[i].name ? calls->v[i].name : "unknown");
@@ -7543,6 +7794,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         if (agent_err_is_interrupted(compact_err)) {
             worker_clear_interrupt(w);
             agent_set_status(w, AGENT_WORKER_IDLE);
+            agent_set_turn_result(w, AGENT_TURN_CANCELLED);
             return 0;
         }
         agent_set_error(w, compact_err[0] ? compact_err : "context compaction failed");
@@ -7575,6 +7827,11 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
      * after a DSML stanza completes we terminate that assistant message, append
      * the tool result as a tool message, then ask the model to continue. */
     for (int tool_round = 0; ; tool_round++) {
+        if (worker_should_interrupt(w)) {
+            agent_set_status(w, AGENT_WORKER_IDLE);
+            agent_set_turn_result(w, AGENT_TURN_CANCELLED);
+            return 0;
+        }
         if (tool_round > 0 &&
             !agent_worker_compact_if_needed(w, "soft limit before tool continuation",
                                             compact_err, sizeof(compact_err)))
@@ -7582,6 +7839,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             if (agent_err_is_interrupted(compact_err)) {
                 worker_clear_interrupt(w);
                 agent_set_status(w, AGENT_WORKER_IDLE);
+                agent_set_turn_result(w, AGENT_TURN_CANCELLED);
                 return 0;
             }
             agent_set_error(w, compact_err[0] ? compact_err : "context compaction failed");
@@ -7631,6 +7889,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             ds4_tokens_push(&w->transcript, ds4_token_eos(w->engine));
             worker_clear_interrupt(w);
             agent_set_status(w, AGENT_WORKER_IDLE);
+            agent_set_turn_result(w, AGENT_TURN_CANCELLED);
             return 0;
         }
         if (sync_rc != 0) {
@@ -7732,8 +7991,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 break;
             }
         }
-
         bool interrupted = worker_should_interrupt(w);
+        bool hit_max_tokens = !interrupted && generated >= max_tokens;
         agent_stream_text(&stream, NULL, 0, true);
         renderer_finish(&renderer);
         worker_set_greedy_sampling(w, false);
@@ -7743,6 +8002,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             agent_publish_system_status(w, "Stopped by user");
             worker_clear_interrupt(w);
             agent_set_status(w, AGENT_WORKER_IDLE);
+            agent_set_turn_result(w, AGENT_TURN_CANCELLED);
             return 0;
         }
         if (stream.dsml_in_think) {
@@ -7768,6 +8028,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         if (!got_tool && !malformed_tool && !early_tool_error) {
             agent_dsml_parser_free(&dsml);
             agent_set_status(w, AGENT_WORKER_IDLE);
+            agent_set_turn_result(w, hit_max_tokens ?
+                                  AGENT_TURN_MAX_TOKENS : AGENT_TURN_END);
             return 0;
         }
 
@@ -7803,6 +8065,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 if (agent_err_is_interrupted(compact_err)) {
                     worker_clear_interrupt(w);
                     agent_set_status(w, AGENT_WORKER_IDLE);
+                    agent_set_turn_result(w, AGENT_TURN_CANCELLED);
                     return 0;
                 }
                 agent_set_error(w, compact_err[0] ? compact_err : "context compaction failed");
@@ -8059,6 +8322,7 @@ static bool worker_submit(agent_worker *w, const char *text) {
         w->status.generated = 0;
         w->status.gen_tps = 0.0;
         w->status.greedy_sampling = false;
+        w->last_turn_result = AGENT_TURN_NONE;
         pthread_cond_signal(&w->cond);
     }
     pthread_mutex_unlock(&w->mu);
@@ -8123,6 +8387,13 @@ static void worker_get_status(agent_worker *w, agent_status *status) {
     w->status.power_percent = worker_status_power_locked(w);
     *status = w->status;
     pthread_mutex_unlock(&w->mu);
+}
+
+static agent_turn_result worker_turn_result(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    agent_turn_result result = w->last_turn_result;
+    pthread_mutex_unlock(&w->mu);
+    return result;
 }
 
 static bool worker_is_idle(agent_worker *w) {
@@ -9308,6 +9579,7 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
     w->wake_fd[1] = -1;
     pthread_mutex_init(&w->mu, NULL);
     pthread_cond_init(&w->cond, NULL);
+    pthread_mutex_init(&w->acp_mu, NULL);
     w->status.state = AGENT_WORKER_IDLE;
     if (pipe(w->wake_fd) != 0) return -1;
     int old_flags;
@@ -9366,6 +9638,7 @@ static void agent_worker_free(agent_worker *w) {
     if (w->trace) fclose(w->trace);
     free(w->cmd_text);
     free(w->out);
+    pthread_mutex_destroy(&w->acp_mu);
     pthread_cond_destroy(&w->cond);
     pthread_mutex_destroy(&w->mu);
 }
@@ -9500,6 +9773,447 @@ static int agent_read_stdin_available(agent_input_buf *in, bool *eof) {
         perror("ds4-agent: read stdin");
         return -1;
     }
+}
+
+static void agent_acp_make_session_id(agent_worker *w) {
+    uint64_t bits[3];
+    bits[0] = (uint64_t)time(NULL);
+    bits[1] = (uint64_t)getpid();
+    bits[2] = (uint64_t)clock();
+    char sha[41];
+    ds4_kvstore_sha1_bytes_hex(bits, sizeof(bits), sha);
+    snprintf(w->acp_session_id, sizeof(w->acp_session_id), "ds4-%s", sha);
+}
+
+static bool agent_acp_wait_initialized(agent_worker *w, char *err, size_t err_len) {
+    for (;;) {
+        agent_status st;
+        if (worker_is_initialized(w, &st)) {
+            if (st.state == AGENT_WORKER_ERROR) {
+                snprintf(err, err_len, "%s",
+                         st.error[0] ? st.error : "worker initialization failed");
+                return false;
+            }
+            return true;
+        }
+        struct pollfd pfd = {.fd = w->wake_fd[0], .events = POLLIN};
+        int pr = poll(&pfd, 1, -1);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            snprintf(err, err_len, "poll failed: %s", strerror(errno));
+            return false;
+        }
+        if (pfd.revents & POLLIN) {
+            char *out = NULL;
+            size_t out_len = 0;
+            drain_wake_fd(w->wake_fd[0]);
+            worker_consume(w, &out, &out_len, &st);
+            free(out);
+        }
+    }
+}
+
+static bool agent_acp_check_session(agent_worker *w, const char *params,
+                                    char *err, size_t err_len) {
+    char *session_id = NULL;
+    if (!params || !ds4_acp_object_get_string(params, "sessionId", &session_id)) {
+        snprintf(err, err_len, "missing sessionId");
+        return false;
+    }
+    bool ok = w->acp_session_id[0] && !strcmp(session_id, w->acp_session_id);
+    if (!ok) snprintf(err, err_len, "unknown sessionId");
+    free(session_id);
+    return ok;
+}
+
+static bool agent_acp_json_empty_array(const char *json) {
+    const char *p = json;
+    ds4_acp_json_ws(&p);
+    if (*p != '[') return false;
+    p++;
+    ds4_acp_json_ws(&p);
+    if (*p != ']') return false;
+    p++;
+    ds4_acp_json_ws(&p);
+    return *p == '\0';
+}
+
+static bool agent_acp_protocol_version_param(const char *params) {
+    char *raw = NULL;
+    if (!params || !ds4_acp_object_get_raw(params, "protocolVersion", &raw))
+        return false;
+    const char *p = raw;
+    ds4_acp_json_ws(&p);
+    bool ok = false;
+    if (isdigit((unsigned char)*p)) {
+        errno = 0;
+        char *end = NULL;
+        long version = strtol(p, &end, 10);
+        const char *q = end;
+        ds4_acp_json_ws(&q);
+        ok = errno == 0 && *q == '\0' && version >= 0 && version <= 65535;
+    }
+    free(raw);
+    return ok;
+}
+
+static bool agent_acp_append_prompt_block(agent_buf *out, const char *block,
+                                          char *err, size_t err_len) {
+    char *type = NULL;
+    if (!ds4_acp_object_get_string(block, "type", &type)) {
+        snprintf(err, err_len, "prompt block missing type");
+        return false;
+    }
+    if (!strcmp(type, "text")) {
+        char *text = NULL;
+        if (!ds4_acp_object_get_string(block, "text", &text)) {
+            free(type);
+            snprintf(err, err_len, "text block missing text");
+            return false;
+        }
+        if (out->len && text[0]) agent_buf_puts(out, "\n");
+        agent_buf_puts(out, text);
+        free(text);
+        free(type);
+        return true;
+    }
+    if (!strcmp(type, "resource_link")) {
+        char *uri = NULL;
+        char *name = NULL;
+        if (!ds4_acp_object_get_string(block, "uri", &uri) ||
+            !ds4_acp_object_get_string(block, "name", &name))
+        {
+            free(type);
+            free(uri);
+            free(name);
+            snprintf(err, err_len, "resource_link block missing name or uri");
+            return false;
+        }
+        if (out->len) agent_buf_puts(out, "\n");
+        agent_buf_puts(out, "[resource_link");
+        if (name && name[0]) {
+            agent_buf_puts(out, " ");
+            agent_buf_puts(out, name);
+        }
+        agent_buf_puts(out, ": ");
+        agent_buf_puts(out, uri);
+        agent_buf_puts(out, "]");
+        free(uri);
+        free(name);
+        free(type);
+        return true;
+    }
+    snprintf(err, err_len, "unsupported prompt block type: %s", type);
+    free(type);
+    return false;
+}
+
+/* ACP prompt blocks can carry richer content than DS4's native text prompt.
+ * The first ACP pass accepts the required text and resource_link variants and
+ * flattens them into the same user text path used by the terminal agent. */
+static bool agent_acp_flatten_prompt(const char *params,
+                                     char **prompt_out,
+                                     char *err, size_t err_len) {
+    char *prompt = NULL;
+    if (!params || !ds4_acp_object_get_raw(params, "prompt", &prompt)) {
+        snprintf(err, err_len, "missing prompt");
+        return false;
+    }
+    const char *p = prompt;
+    ds4_acp_json_ws(&p);
+    if (*p != '[') {
+        free(prompt);
+        snprintf(err, err_len, "prompt must be an array");
+        return false;
+    }
+    p++;
+    ds4_acp_json_ws(&p);
+    agent_buf out = {0};
+    while (*p && *p != ']') {
+        char *block = NULL;
+        if (!ds4_acp_json_raw_value(&p, &block)) {
+            free(prompt);
+            free(out.ptr);
+            snprintf(err, err_len, "invalid prompt block");
+            return false;
+        }
+        bool ok = agent_acp_append_prompt_block(&out, block, err, err_len);
+        free(block);
+        if (!ok) {
+            free(prompt);
+            free(out.ptr);
+            return false;
+        }
+        ds4_acp_json_ws(&p);
+        if (*p == ',') {
+            p++;
+            ds4_acp_json_ws(&p);
+        } else if (*p != ']') {
+            free(prompt);
+            free(out.ptr);
+            snprintf(err, err_len, "invalid prompt array");
+            return false;
+        }
+    }
+    if (*p != ']' || out.len == 0) {
+        free(prompt);
+        free(out.ptr);
+        snprintf(err, err_len, "empty or unterminated prompt");
+        return false;
+    }
+    free(prompt);
+    *prompt_out = agent_buf_take(&out);
+    return true;
+}
+
+static void agent_acp_finish_prompt_if_needed(agent_worker *worker,
+                                              bool *prompt_active,
+                                              char **prompt_id_json) {
+    if (!*prompt_active) return;
+    agent_status st;
+    worker_get_status(worker, &st);
+    agent_turn_result result = worker_turn_result(worker);
+    if (result == AGENT_TURN_NONE ||
+        (st.state != AGENT_WORKER_IDLE && st.state != AGENT_WORKER_ERROR))
+    {
+        return;
+    }
+    /* ACP has no generic error stop reason; worker failures are reported as
+     * JSON-RPC internal errors instead of successful prompt responses. */
+    if (result == AGENT_TURN_ERROR || st.state == AGENT_WORKER_ERROR) {
+        agent_acp_write_error(worker, *prompt_id_json, -32603,
+                              st.error[0] ? st.error : "agent turn failed");
+    } else {
+        const char *stop_reason = agent_turn_stop_reason(result);
+        if (!stop_reason) {
+            agent_acp_write_error(worker, *prompt_id_json, -32603,
+                                  "agent turn ended without stop reason");
+        } else {
+            char response[96];
+            snprintf(response, sizeof(response), "{\"stopReason\":\"%s\"}",
+                     stop_reason);
+            agent_acp_write_response(worker, *prompt_id_json, response);
+        }
+    }
+    free(*prompt_id_json);
+    *prompt_id_json = NULL;
+    *prompt_active = false;
+}
+
+static void agent_acp_handle_request(agent_worker *worker,
+                                     ds4_acp_request *req,
+                                     bool *initialized,
+                                     bool *session_created,
+                                     bool *prompt_active,
+                                     char **prompt_id_json) {
+    char err[256] = {0};
+    if (!strcmp(req->method, "initialize")) {
+        if (!req->has_params ||
+            !agent_acp_protocol_version_param(req->params_json))
+        {
+            agent_acp_write_request_error(worker, req, -32602,
+                                          "initialize requires protocolVersion");
+            return;
+        }
+        *initialized = true;
+        if (req->has_id) {
+            agent_acp_write_response(worker, req->id_json,
+                "{\"protocolVersion\":1,"
+                "\"agentInfo\":{\"name\":\"ds4-agent\",\"version\":\"0\"},"
+                "\"agentCapabilities\":{}}");
+        }
+        return;
+    }
+
+    if (!strcmp(req->method, "session/new")) {
+        char *cwd = NULL;
+        char *mcp_servers = NULL;
+        if (!*initialized) {
+            agent_acp_write_request_error(worker, req, -32600,
+                                          "initialize must be called first");
+            return;
+        }
+        if (!req->has_params ||
+            !ds4_acp_object_get_string(req->params_json, "cwd", &cwd) ||
+            cwd[0] != '/')
+        {
+            free(cwd);
+            agent_acp_write_request_error(worker, req, -32602,
+                                          "session/new requires absolute cwd");
+            return;
+        }
+        if (!ds4_acp_object_get_raw(req->params_json, "mcpServers",
+                                    &mcp_servers) ||
+            !agent_acp_json_empty_array(mcp_servers))
+        {
+            free(cwd);
+            free(mcp_servers);
+            agent_acp_write_request_error(worker, req, -32602,
+                                          "session/new requires empty mcpServers");
+            return;
+        }
+        free(mcp_servers);
+        if (*session_created) {
+            free(cwd);
+            agent_acp_write_request_error(worker, req, -32603,
+                                          "ACP session already exists");
+            return;
+        }
+        if (chdir(cwd) != 0) {
+            snprintf(err, sizeof(err), "failed to chdir to %s: %s",
+                     cwd, strerror(errno));
+            free(cwd);
+            agent_acp_write_request_error(worker, req, -32603, err);
+            return;
+        }
+        free(cwd);
+        if (!agent_acp_wait_initialized(worker, err, sizeof(err))) {
+            agent_acp_write_request_error(worker, req, -32603, err);
+            return;
+        }
+        agent_acp_make_session_id(worker);
+        *session_created = true;
+        if (req->has_id) {
+            char *qsid = ds4_acp_json_escape(worker->acp_session_id,
+                                             strlen(worker->acp_session_id));
+            agent_buf b = {0};
+            agent_buf_puts(&b, "{\"sessionId\":");
+            agent_buf_puts(&b, qsid);
+            agent_buf_puts(&b, "}");
+            char *res = agent_buf_take(&b);
+            agent_acp_write_response(worker, req->id_json, res);
+            free(res);
+            free(qsid);
+        }
+        return;
+    }
+
+    if (!strcmp(req->method, "session/prompt")) {
+        char *prompt = NULL;
+        if (!*session_created ||
+            !agent_acp_check_session(worker, req->params_json, err, sizeof(err)))
+        {
+            agent_acp_write_request_error(worker, req, -32602,
+                                          err[0] ? err : "invalid session");
+            return;
+        }
+        if (!req->has_id) return;
+        if (*prompt_active) {
+            agent_acp_write_request_error(worker, req, -32603,
+                                          "agent is busy");
+            return;
+        }
+        if (!agent_acp_flatten_prompt(req->params_json, &prompt,
+                                      err, sizeof(err)))
+        {
+            agent_acp_write_request_error(worker, req, -32602, err);
+            return;
+        }
+        if (!worker_submit(worker, prompt)) {
+            free(prompt);
+            agent_acp_write_request_error(worker, req, -32603,
+                                          "agent is not ready");
+            return;
+        }
+        free(prompt);
+        *prompt_active = true;
+        *prompt_id_json = req->id_json;
+        req->id_json = NULL;
+        req->has_id = false;
+        return;
+    }
+
+    if (!strcmp(req->method, "session/cancel")) {
+        if (!req->has_params ||
+            !agent_acp_check_session(worker, req->params_json, err, sizeof(err)))
+        {
+            if (req->has_id)
+                agent_acp_write_error(worker, req->id_json, -32602,
+                                      err[0] ? err : "invalid session");
+            return;
+        }
+        worker_interrupt(worker);
+        if (req->has_id) agent_acp_write_response(worker, req->id_json, "{}");
+        return;
+    }
+
+    if (req->has_id)
+        agent_acp_write_error(worker, req->id_json, -32601, "method not found");
+}
+
+static int run_agent_acp(ds4_engine *engine, agent_config *cfg) {
+    agent_worker worker;
+    if (agent_worker_init(&worker, engine, cfg) != 0) return 1;
+
+    int old_stdin_flags = -1;
+    set_nonblock(STDIN_FILENO, true, &old_stdin_flags);
+
+    bool initialized = false;
+    bool session_created = false;
+    bool prompt_active = false;
+    bool stdin_eof = false;
+    char *prompt_id_json = NULL;
+    agent_input_buf in = {0};
+    int rc = 0;
+
+    while (!stdin_eof || prompt_active) {
+        struct pollfd fds[2] = {
+            {.fd = STDIN_FILENO, .events = stdin_eof ? 0 : POLLIN},
+            {.fd = worker.wake_fd[0], .events = POLLIN},
+        };
+        int pr = poll(fds, 2, -1);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            perror("ds4-agent: poll");
+            rc = 1;
+            break;
+        }
+        if (fds[0].revents & (POLLIN | POLLHUP)) {
+            if (agent_read_stdin_available(&in, &stdin_eof) != 0) {
+                rc = 1;
+                break;
+            }
+            char *line;
+            while ((line = agent_input_buf_take_line(&in)) != NULL) {
+                if (!line[0]) {
+                    free(line);
+                    continue;
+                }
+                ds4_acp_request req;
+                char err[256] = {0};
+                ds4_acp_parse_result parsed =
+                    ds4_acp_parse_request(line, &req, err, sizeof(err));
+                if (parsed != DS4_ACP_PARSE_OK) {
+                    agent_acp_write_error(&worker, NULL,
+                        parsed == DS4_ACP_PARSE_JSON ? -32700 : -32600,
+                        err[0] ? err : "invalid JSON-RPC request");
+                    free(line);
+                    continue;
+                }
+                agent_acp_handle_request(&worker, &req, &initialized,
+                                         &session_created, &prompt_active,
+                                         &prompt_id_json);
+                ds4_acp_request_free(&req);
+                free(line);
+            }
+        }
+        if (fds[1].revents & POLLIN) {
+            char *out = NULL;
+            size_t out_len = 0;
+            agent_status st;
+            drain_wake_fd(worker.wake_fd[0]);
+            worker_consume(&worker, &out, &out_len, &st);
+            free(out);
+        }
+        agent_acp_finish_prompt_if_needed(&worker, &prompt_active,
+                                          &prompt_id_json);
+    }
+
+    free(prompt_id_json);
+    agent_input_buf_free(&in);
+    if (old_stdin_flags >= 0) fcntl(STDIN_FILENO, F_SETFL, old_stdin_flags);
+    agent_worker_free(&worker);
+    return rc;
 }
 
 /* Headless mode is intentionally just another front-end for the same worker.
@@ -10088,12 +10802,13 @@ int main(int argc, char **argv) {
     memset(&sa, 0, sizeof(sa));
     sigemptyset(&sa.sa_mask);
     sa.sa_handler = agent_sigint_handler;
-    bool sigint_installed = !cfg.non_interactive &&
+    bool sigint_installed = !cfg.non_interactive && !cfg.acp &&
         sigaction(SIGINT, &sa, &old_int) == 0;
 
-    int rc = cfg.non_interactive ?
-        run_agent_non_interactive(engine, &cfg) :
-        run_agent(engine, &cfg);
+    int rc = cfg.acp ? run_agent_acp(engine, &cfg) :
+        (cfg.non_interactive ?
+         run_agent_non_interactive(engine, &cfg) :
+         run_agent(engine, &cfg));
 
     if (sigint_installed) sigaction(SIGINT, &old_int, NULL);
     ds4_engine_close(engine);

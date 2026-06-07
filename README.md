@@ -587,6 +587,10 @@ stripped session rebuilds the KV cache by prefilling the saved text.
 Use `--chdir /path/to/ds4` when launching `ds4-agent` from another directory,
 so relative runtime files such as `metal/*.metal` resolve from the project tree.
 
+`ds4-agent --acp` runs the agent over the Agent Client Protocol using
+newline-delimited JSON-RPC on stdin/stdout. In this mode stdout is reserved for
+protocol messages; diagnostics continue to go to stderr.
+
 However while the system already works, there is a lot of work to do
 in order to make it ready for prime time. When finally the agent will reach
 the wanted shape, we will *likely* split the server and the client creating a stateful
