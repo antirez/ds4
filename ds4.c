@@ -10574,9 +10574,17 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
     }
 #ifdef DS4_JACCL
-    if (ok && g_jaccl_group)
-        ok = ds4_gpu_expert_mask(g->router_selected, g->router_weights,
-                                 g_expert_start, g_expert_end, DS4_N_EXPERT_USED) != 0;
+    if (ok && g_jaccl_group) {
+        if (getenv("DS4_EXPERT_COMPACT")) {
+            uint32_t compacted = 0;
+            ok = ds4_gpu_expert_compact(g->router_selected, g->router_weights,
+                                        g_expert_start, g_expert_end,
+                                        DS4_N_EXPERT_USED, &compacted) != 0;
+        } else {
+            ok = ds4_gpu_expert_mask(g->router_selected, g->router_weights,
+                                     g_expert_start, g_expert_end, DS4_N_EXPERT_USED) != 0;
+        }
+    }
 #endif
     if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
@@ -10617,11 +10625,22 @@ static bool metal_graph_encode_decode_layer(
     }
 #ifdef DS4_JACCL
     if (ok && g_jaccl_group) {
-        /* Fused MoE kernel is synchronous (calls ds4_gpu_finish_command_buffer).
-         * routed_out is StorageModeShared — CPU-readable, RDMA-registerable. */
+        static bool first_allsum = true;
+        if (first_allsum) {
+            fprintf(stderr, "ds4: first all_sum layer=%u n_bytes=%zu\n",
+                    il, (size_t)(DS4_N_EMBD * sizeof(float)));
+            first_allsum = false;
+        }
+        if (!ds4_gpu_end_commands() || !ds4_gpu_begin_commands()) {
+            ok = 0;
+        }
+        if (ok) {
         void *buf = ds4_gpu_tensor_contents(g->routed_out);
         jaccl_group_all_sum(g_jaccl_group, buf, buf,
                             DS4_N_EMBD * sizeof(float), JACCL_FLOAT32);
+        }
+        metal_graph_debug_dump_tensor("ffn_moe_out_after_allsum",
+                                      g->routed_out, DS4_N_EMBD, il, pos);
     }
 #endif
     const bool fuse_shared_gate_up =
@@ -18203,8 +18222,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         e->expert_end = (e->rank == e->world_size - 1)
                             ? (int)DS4_N_EXPERT
                             : e->expert_start + experts_per_rank;
-        fprintf(stderr, "ds4: distributed mode rank %d/%d experts [%d, %d)\n",
-                e->rank, e->world_size, e->expert_start, e->expert_end);
+        fprintf(stderr, "ds4: JACCL group=%p rank=%d/%d experts=[%d,%d) of %d\n",
+                (void*)e->jaccl_group, e->rank, e->world_size,
+                e->expert_start, e->expert_end, (int)DS4_N_EXPERT);
     } else
 #endif
     {

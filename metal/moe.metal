@@ -1014,11 +1014,21 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
     const int64_t i11 = idx % args.ne11;
     const int64_t i12 = iid1;
 
-    // Distributed early exit: skip matmul entirely for non-owned experts
+    // Distributed early exit: skip matmul entirely for non-owned experts.
+    // Zero mid[] so the downstream down-projection reads zeros, not stale data.
     {
         device const float *route_w_early =
             (device const float *)(weights + (uint64_t)idx * act.weight_stride);
-        if (route_w_early[0] == 0.0f) return;
+        if (route_w_early[0] == 0.0f) {
+            if (tiisg == 0) {
+                const int fr = (tgpig.x * NSG + sgitg) * N_R0_IQ2_XXS;
+                device float *mid_zero =
+                    (device float *)(dst_mid + (uint64_t)idx * act.mid_row_stride);
+                for (int r = 0; r < N_R0_IQ2_XXS && fr + r < args.ne0; ++r)
+                    mid_zero[fr + r] = 0.0f;
+            }
+            return;
+        }
     }
 
     const int nb = args.ne00 / QK_K;
@@ -1222,11 +1232,22 @@ kernel void kernel_mul_mv_id_q4_K_pair_swiglu_f32(
     const int64_t i11 = idx % args.ne11;
     const int64_t i12 = iid1;
 
-    // Distributed early exit: skip matmul for non-owned experts
+    // Distributed early exit: skip matmul for non-owned experts.
+    // Zero mid[] so the downstream down-projection reads zeros, not stale data.
     {
         device const float *route_w_early =
             (device const float *)(weights + (uint64_t)idx * act.weight_stride);
-        if (route_w_early[0] == 0.0f) return;
+        if (route_w_early[0] == 0.0f) {
+            if (tiisg == 0) {
+                const short NSG_e = FC_mul_mv_nsg;
+                const int fr = (tgpig.x * NSG_e + sgitg) * N_R0_Q4_K;
+                device float *mid_zero =
+                    (device float *)(dst_mid + (uint64_t)idx * act.mid_row_stride);
+                for (int r = 0; r < N_R0_Q4_K && fr + r < args.ne0; ++r)
+                    mid_zero[fr + r] = 0.0f;
+            }
+            return;
+        }
     }
 
     device const char *src0_gate_cur = src0_gate + i02 * args.nb02;

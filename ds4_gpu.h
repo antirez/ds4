@@ -825,6 +825,10 @@ int ds4_gpu_expert_mask_batch(const ds4_gpu_tensor *selected, ds4_gpu_tensor *we
                               int32_t expert_start, int32_t expert_end,
                               uint32_t n_expert_used, uint32_t n_tokens);
 
+int ds4_gpu_expert_compact(const ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+                           int32_t expert_start, int32_t expert_end,
+                           uint32_t n_expert_used, uint32_t *compacted_count);
+
 int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *block_out,
