@@ -10635,9 +10635,15 @@ static bool metal_graph_encode_decode_layer(
             ok = 0;
         }
         if (ok) {
-        void *buf = ds4_gpu_tensor_contents(g->routed_out);
-        jaccl_group_all_sum(g_jaccl_group, buf, buf,
-                            DS4_N_EMBD * sizeof(float), JACCL_FLOAT32);
+        float *buf = (float *)ds4_gpu_tensor_contents(g->routed_out);
+        /* fp16 all_sum: halves RDMA payload (28KB → 14KB) with no quality
+         * loss — downstream HC post accumulates in fp32. */
+        static _Float16 *allsum_f16 = NULL;
+        if (!allsum_f16) allsum_f16 = malloc(DS4_N_EMBD * sizeof(_Float16));
+        for (uint32_t i = 0; i < DS4_N_EMBD; i++) allsum_f16[i] = (_Float16)buf[i];
+        jaccl_group_all_sum(g_jaccl_group, allsum_f16, allsum_f16,
+                            DS4_N_EMBD * sizeof(_Float16), JACCL_FLOAT16);
+        for (uint32_t i = 0; i < DS4_N_EMBD; i++) buf[i] = (float)allsum_f16[i];
         }
         metal_graph_debug_dump_tensor("ffn_moe_out_after_allsum",
                                       g->routed_out, DS4_N_EMBD, il, pos);
