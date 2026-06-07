@@ -3910,16 +3910,22 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
         ds4_kvstore_sha1_bytes_hex(text, text_len, sha);
     if (sha_out) memcpy(sha_out, sha, sizeof(sha));
 
-    ds4_session_payload_file staged = {0};
     char save_err[160] = {0};
-    if (ds4_session_stage_payload(w->session, &staged,
-                                  save_err, sizeof(save_err)) != 0) {
-        snprintf(err, err_len, "%s",
-                 save_err[0] ? save_err : "session has no valid KV payload");
-        free(text);
-        return false;
+    ds4_session_payload_file staged = {0};
+    bool staged_payload = false;
+    uint64_t payload_bytes = ds4_session_payload_bytes(w->session);
+    if (payload_bytes == 0) {
+        if (ds4_session_stage_payload(w->session, &staged,
+                                      save_err, sizeof(save_err)) != 0)
+        {
+            snprintf(err, err_len, "%s",
+                     save_err[0] ? save_err : "session has no valid KV payload");
+            free(text);
+            return false;
+        }
+        staged_payload = true;
+        payload_bytes = staged.bytes;
     }
-    uint64_t payload_bytes = staged.bytes;
 
     agent_buf tmpl = {0};
     agent_buf_puts(&tmpl, path);
@@ -3955,16 +3961,27 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     uint8_t tb[4];
     ds4_kvstore_le_put32(tb, (uint32_t)text_len);
 
+    uint64_t written = 0;
     errno = 0;
     bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
               fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
-              fwrite(text, 1, text_len, fp) == text_len &&
-              ds4_session_write_staged_payload(&staged, fp,
-                                               save_err, sizeof(save_err)) == 0 &&
-              (!session_identity ||
-               agent_kv_write_title_trailer(fp, session_title,
-                                            save_err, sizeof(save_err))) &&
-              fflush(fp) == 0;
+              fwrite(text, 1, text_len, fp) == text_len;
+    if (ok && staged_payload) {
+        ok = ds4_session_write_staged_payload(&staged, fp,
+                                              save_err, sizeof(save_err)) == 0;
+    } else if (ok) {
+        ok = ds4_session_save_payload_counted(w->session, fp, &written,
+                                             save_err, sizeof(save_err)) == 0;
+        if (ok && written != payload_bytes) {
+            snprintf(save_err, sizeof(save_err),
+                     "KV payload size changed while saving");
+            ok = false;
+        }
+    }
+    if (ok && session_identity)
+        ok = agent_kv_write_title_trailer(fp, session_title,
+                                          save_err, sizeof(save_err));
+    if (ok) ok = fflush(fp) == 0;
     int saved_errno = errno;
     if (fclose(fp) != 0) {
         if (!saved_errno) saved_errno = errno;
