@@ -1171,6 +1171,73 @@ The cache directory is disposable. If behavior looks suspicious, stop the
 server and remove it. You can investigate what is cached with hexdump as
 the kv cache files include the verbatim prompt cached.
 
+## ZFS filesystem tuning
+
+If your Linux machine uses ZFS for the filesystem containing model weights and
+on-disk KV cache, apply these settings to avoid double-caching RAM.
+
+### Disable ZFS ARC for model and cache directories
+
+Disable the ZFS Adaptive Replacement Cache for the dataset holding models and KV
+cache. Without this, ZFS caches the 80 GB+ model file in the ARC while the
+inference engine `mmap`s the same data — a wasteful double-cache.
+
+```sh
+zfs set primarycache=none zroot/home/user/models
+zfs set primarycache=none zroot/home/user/kv-cache
+```
+
+### Limit the ZFS ARC size at boot
+
+By default OpenZFS allocates up to 50 % of system RAM for the ARC. On a 128 GB
+system ZFS could consume 64 GB in the background. Add these kernel boot
+parameters:
+
+```text
+zfs.zfs_arc_max=2147483648 zfs.zfs_arc_min=536870912
+```
+
+- `zfs.zfs_arc_max=2147483648` — hard cap the ARC at 2 GB, preventing ZFS from
+  silently eating tens of GB of RAM.
+- `zfs.zfs_arc_min=536870912` — reserve a 512 MB floor so ZFS still caches
+  essential metadata (directory trees, file permissions) without starving.
+
+**Why capping the ARC matters even though the kernel can reclaim it under memory
+pressure:** ARC memory is managed through a translation layer (SPL) that adds
+significant latency to reclamation. When the LLM engine suddenly maps 80+ GB of
+model weights, the OOM killer fires before ZFS can finish shrinking its ARC.
+On unified-memory APUs, the GPU driver also demands large
+contiguous blocks immediately and will fail the allocation if ARC is in the way.
+Without these caps, the system either kills the inference process or falls into
+swap death-spiral thrashing.
+
+On Ubuntu with GRUB, edit `/etc/default/grub` and append to
+`GRUB_CMDLINE_LINUX_DEFAULT`:
+
+```sh
+sudo cp /etc/default/grub /etc/default/grub.bak
+sudoedit /etc/default/grub
+```
+
+Set:
+
+```text
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash zfs.zfs_arc_max=2147483648 zfs.zfs_arc_min=536870912"
+```
+
+Then:
+
+```sh
+sudo update-grub
+sudo reboot
+```
+
+After reboot, verify the ARC limits took effect:
+
+```sh
+cat /sys/module/zfs/parameters/zfs_arc_max /sys/module/zfs/parameters/zfs_arc_min
+```
+
 ## Backends
 
 The default graph backend is Metal on macOS and CUDA in CUDA builds:
