@@ -1,6 +1,13 @@
 #define DS4_SERVER_TEST
 #define DS4_SERVER_TEST_NO_MAIN
 #include "../ds4_server.c"
+#include "../ds4_acp.h"
+#include "../ds4_mcp.h"
+#include <errno.h>
+#include <limits.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
 #include <math.h>
@@ -1953,6 +1960,438 @@ static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
 
+static void test_acp_jsonrpc_parser(void) {
+    ds4_acp_request r;
+    ds4_acp_message m;
+    char err[128];
+    TEST_ASSERT(ds4_acp_parse_request(
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1}}",
+        &r, err, sizeof(err)) == DS4_ACP_PARSE_OK);
+    TEST_ASSERT(r.has_id);
+    TEST_ASSERT(!strcmp(r.id_json, "7"));
+    TEST_ASSERT(!strcmp(r.method, "initialize"));
+    TEST_ASSERT(r.has_params);
+    ds4_acp_request_free(&r);
+
+    TEST_ASSERT(ds4_acp_parse_request(
+        "{\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"method\":\"session/new\",\"params\":{\"cwd\":\"/tmp\"}}",
+        &r, err, sizeof(err)) == DS4_ACP_PARSE_OK);
+    TEST_ASSERT(!strcmp(r.id_json, "\"abc\""));
+    char *cwd = NULL;
+    TEST_ASSERT(ds4_acp_object_get_string(r.params_json, "cwd", &cwd));
+    TEST_ASSERT(!strcmp(cwd, "/tmp"));
+    free(cwd);
+    ds4_acp_request_free(&r);
+
+    TEST_ASSERT(ds4_acp_parse_request("{bad", &r, err, sizeof(err)) ==
+                DS4_ACP_PARSE_JSON);
+    TEST_ASSERT(ds4_acp_parse_request("{\"jsonrpc\":\"2.0\",\"id\":1}", &r,
+                                      err, sizeof(err)) ==
+                DS4_ACP_PARSE_REQUEST);
+
+    TEST_ASSERT(ds4_acp_parse_message(
+        "{\"jsonrpc\":\"2.0\",\"id\":11,\"result\":{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"allow-once\"}}}",
+        &m, err, sizeof(err)) == DS4_ACP_PARSE_OK);
+    TEST_ASSERT(m.has_id);
+    TEST_ASSERT(!strcmp(m.id_json, "11"));
+    TEST_ASSERT(!m.has_method);
+    TEST_ASSERT(m.has_result);
+    TEST_ASSERT(!m.has_error);
+    char *outcome = NULL;
+    TEST_ASSERT(ds4_acp_object_get_raw(m.result_json, "outcome", &outcome));
+    free(outcome);
+    ds4_acp_message_free(&m);
+
+    TEST_ASSERT(ds4_acp_parse_message(
+        "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"s\"}}",
+        &m, err, sizeof(err)) == DS4_ACP_PARSE_OK);
+    TEST_ASSERT(!m.has_id);
+    TEST_ASSERT(m.has_method);
+    TEST_ASSERT(!strcmp(m.method, "session/update"));
+    ds4_acp_message_free(&m);
+
+    TEST_ASSERT(ds4_acp_parse_message(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{},\"error\":{\"code\":-1,\"message\":\"bad\"}}",
+        &m, err, sizeof(err)) == DS4_ACP_PARSE_REQUEST);
+}
+
+static void test_acp_json_strings(void) {
+    const char *p = "\"a\\n\\\"b\\u0021\"";
+    char *s = NULL;
+    TEST_ASSERT(ds4_acp_json_string(&p, &s));
+    TEST_ASSERT(!strcmp(s, "a\n\"b!"));
+    free(s);
+
+    p = "\"\\ud83d\\ude00\"";
+    s = NULL;
+    TEST_ASSERT(ds4_acp_json_string(&p, &s));
+    TEST_ASSERT(!strcmp(s, "\xf0\x9f\x98\x80"));
+    free(s);
+
+    p = "\"\\ud800\"";
+    s = NULL;
+    TEST_ASSERT(!ds4_acp_json_string(&p, &s));
+    p = "\"\\ud800\\u0041\"";
+    s = NULL;
+    TEST_ASSERT(!ds4_acp_json_string(&p, &s));
+    p = "\"\\udc00\"";
+    s = NULL;
+    TEST_ASSERT(!ds4_acp_json_string(&p, &s));
+    const char bad_raw_utf8[] = {'"', (char)0xff, '"', 0};
+    p = bad_raw_utf8;
+    s = NULL;
+    TEST_ASSERT(!ds4_acp_json_string(&p, &s));
+    const char bad_overlong_utf8[] = {'"', (char)0xc0, (char)0x80, '"', 0};
+    p = bad_overlong_utf8;
+    s = NULL;
+    TEST_ASSERT(!ds4_acp_json_string(&p, &s));
+
+    char *q = ds4_acp_json_escape("a\n\"b\\", strlen("a\n\"b\\"));
+    TEST_ASSERT(!strcmp(q, "\"a\\n\\\"b\\\\\""));
+    free(q);
+
+    const char bad_utf8[] = {(char)0xff, 0};
+    q = ds4_acp_json_escape(bad_utf8, 1);
+    TEST_ASSERT(!strcmp(q, "\"\\u00ff\""));
+    free(q);
+}
+
+static char test_self_path[PATH_MAX];
+
+static void test_fake_mcp_response(const ds4_acp_message *m,
+                                   const char *result_json) {
+    if (!m->has_id) return;
+    printf("{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":%s}\n",
+           m->id_json, result_json);
+    fflush(stdout);
+}
+
+static void test_fake_mcp_error(const ds4_acp_message *m, int code,
+                                const char *message) {
+    if (!m->has_id) return;
+    char *qmsg = ds4_acp_json_escape(message, strlen(message));
+    printf("{\"jsonrpc\":\"2.0\",\"id\":%s,\"error\":{\"code\":%d,\"message\":%s}}\n",
+           m->id_json, code, qmsg);
+    fflush(stdout);
+    free(qmsg);
+}
+
+static int test_fake_mcp_server(void) {
+    char line[8192];
+    while (fgets(line, sizeof(line), stdin)) {
+        ds4_acp_message m;
+        char err[160] = {0};
+        if (ds4_acp_parse_message(line, &m, err, sizeof(err)) != DS4_ACP_PARSE_OK)
+            continue;
+        if (!m.has_method) {
+            ds4_acp_message_free(&m);
+            continue;
+        }
+        if (!strcmp(m.method, "initialize")) {
+            test_fake_mcp_response(&m,
+                "{\"protocolVersion\":\"2025-06-18\","
+                "\"capabilities\":{\"tools\":{}},"
+                "\"serverInfo\":{\"name\":\"fake-mcp\",\"version\":\"1\"}}");
+        } else if (!strcmp(m.method, "notifications/initialized")) {
+            /* no response */
+        } else if (!strcmp(m.method, "tools/list")) {
+            char *cursor = NULL;
+            bool second = m.has_params &&
+                ds4_acp_object_get_string(m.params_json, "cursor", &cursor) &&
+                !strcmp(cursor, "p2");
+            free(cursor);
+            if (second) {
+                test_fake_mcp_response(&m,
+                    "{\"tools\":[{\"name\":\"fail\",\"description\":\"Fail\","
+                    "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]}");
+            } else {
+                test_fake_mcp_response(&m,
+                    "{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo\","
+                    "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                    "\"text\":{\"type\":\"string\"}}}}],\"nextCursor\":\"p2\"}");
+            }
+        } else if (!strcmp(m.method, "tools/call")) {
+            char *name = NULL;
+            if (m.has_params)
+                (void)ds4_acp_object_get_string(m.params_json, "name", &name);
+            if (name && !strcmp(name, "echo")) {
+                test_fake_mcp_response(&m,
+                    "{\"content\":[{\"type\":\"text\",\"text\":\"echo ok\"}]}");
+            } else if (name && !strcmp(name, "fail")) {
+                test_fake_mcp_response(&m,
+                    "{\"isError\":true,\"content\":[{\"type\":\"text\","
+                    "\"text\":\"fixture failure\"}]}");
+            } else {
+                test_fake_mcp_error(&m, -32602, "unknown tool");
+            }
+            free(name);
+        } else {
+            test_fake_mcp_error(&m, -32601, "method not found");
+        }
+        ds4_acp_message_free(&m);
+    }
+    return 0;
+}
+
+static int test_fake_mcp_hang(void) {
+    char line[8192];
+    while (fgets(line, sizeof(line), stdin)) {
+        /* Keep stdout open without answering. */
+    }
+    return 0;
+}
+
+static int test_fake_mcp_close_stdin(void) {
+    char line[8192];
+    while (fgets(line, sizeof(line), stdin)) {
+        ds4_acp_message m;
+        char err[160] = {0};
+        if (ds4_acp_parse_message(line, &m, err, sizeof(err)) != DS4_ACP_PARSE_OK)
+            continue;
+        if (!m.has_method) {
+            ds4_acp_message_free(&m);
+            continue;
+        }
+        if (!strcmp(m.method, "initialize")) {
+            test_fake_mcp_response(&m,
+                "{\"protocolVersion\":\"2025-06-18\","
+                "\"capabilities\":{\"tools\":{}},"
+                "\"serverInfo\":{\"name\":\"close-stdin\",\"version\":\"1\"}}");
+        } else if (!strcmp(m.method, "notifications/initialized")) {
+            /* no response */
+        } else if (!strcmp(m.method, "tools/list")) {
+            test_fake_mcp_response(&m,
+                "{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo\","
+                "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]}");
+            ds4_acp_message_free(&m);
+            close(STDIN_FILENO);
+            sleep(2);
+            return 0;
+        } else {
+            test_fake_mcp_error(&m, -32601, "method not found");
+        }
+        ds4_acp_message_free(&m);
+    }
+    return 0;
+}
+
+static char *test_mcp_config(const char *name, const char *command,
+                             const char *arg) {
+    char *qname = ds4_acp_json_escape(name, strlen(name));
+    char *qcmd = ds4_acp_json_escape(command, strlen(command));
+    char *qarg = ds4_acp_json_escape(arg, strlen(arg));
+    size_t len = strlen(qname) + strlen(qcmd) + strlen(qarg) + 128;
+    char *cfg = malloc(len);
+    TEST_ASSERT(cfg != NULL);
+    if (!cfg) {
+        free(qname);
+        free(qcmd);
+        free(qarg);
+        return NULL;
+    }
+    snprintf(cfg, len,
+             "[{\"name\":%s,\"command\":%s,\"args\":[%s],\"env\":[]}]",
+             qname, qcmd, qarg);
+    free(qname);
+    free(qcmd);
+    free(qarg);
+    return cfg;
+}
+
+static char *test_mcp_fixture_config(void) {
+    return test_mcp_config("fixture", test_self_path, "--fake-mcp-server");
+}
+
+static void test_acp_mcp_path_command(void) {
+    char tmp[] = "/tmp/ds4-mcp-path-XXXXXX";
+    char *dir = mkdtemp(tmp);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    char command_path[PATH_MAX];
+    int n = snprintf(command_path, sizeof(command_path),
+                     "%s/ds4-mcp-fixture", dir);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(command_path));
+    if (n <= 0 || (size_t)n >= sizeof(command_path)) {
+        rmdir(dir);
+        return;
+    }
+    int symlink_rc = symlink(test_self_path, command_path);
+    TEST_ASSERT(symlink_rc == 0);
+    if (symlink_rc != 0) {
+        rmdir(dir);
+        return;
+    }
+
+    char *old_path = test_save_env("PATH");
+    const char *path = getenv("PATH");
+    size_t path_len = strlen(dir) + 1 + strlen(path ? path : "") + 1;
+    char *new_path = malloc(path_len);
+    TEST_ASSERT(new_path != NULL);
+    if (!new_path) {
+        test_restore_env("PATH", old_path);
+        unlink(command_path);
+        rmdir(dir);
+        return;
+    }
+    snprintf(new_path, path_len, "%s:%s", dir, path ? path : "");
+    setenv("PATH", new_path, 1);
+    free(new_path);
+
+    ds4_mcp mcp;
+    char err[160] = {0};
+    ds4_mcp_init(&mcp);
+    char *cfg = test_mcp_config("pathfixture", "ds4-mcp-fixture",
+                                "--fake-mcp-server");
+    TEST_ASSERT(cfg != NULL);
+    if (cfg) {
+        TEST_ASSERT(ds4_mcp_connect_json(&mcp, cfg, NULL, NULL,
+                                         err, sizeof(err)));
+        char *prompt = ds4_mcp_tools_prompt(&mcp);
+        TEST_ASSERT(strstr(prompt, "mcp__pathfixture__echo") != NULL);
+        free(prompt);
+        free(cfg);
+    }
+    ds4_mcp_close(&mcp);
+
+    test_restore_env("PATH", old_path);
+    unlink(command_path);
+    rmdir(dir);
+}
+
+static void test_acp_mcp_timeout(void) {
+    ds4_mcp mcp;
+    char err[160] = {0};
+    ds4_mcp_init(&mcp);
+    mcp.connect_timeout_ms = 100;
+    char *cfg = test_mcp_config("hang", test_self_path, "--fake-mcp-hang");
+    TEST_ASSERT(cfg != NULL);
+    if (cfg) {
+        TEST_ASSERT(!ds4_mcp_connect_json(&mcp, cfg, NULL, NULL,
+                                          err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "timed out") != NULL);
+        free(cfg);
+    }
+    ds4_mcp_close(&mcp);
+}
+
+static int test_acp_mcp_sigpipe_child(void) {
+    struct sigaction dfl_sa, got_sa;
+    memset(&dfl_sa, 0, sizeof(dfl_sa));
+    sigemptyset(&dfl_sa.sa_mask);
+    dfl_sa.sa_handler = SIG_DFL;
+    if (sigaction(SIGPIPE, &dfl_sa, NULL) != 0) return 1;
+
+    ds4_mcp mcp;
+    char err[160] = {0};
+    ds4_mcp_init(&mcp);
+    if (sigaction(SIGPIPE, NULL, &got_sa) != 0 ||
+        got_sa.sa_handler != SIG_DFL)
+        return 1;
+
+    char *cfg = test_mcp_config("closed", test_self_path,
+                                "--fake-mcp-close-stdin");
+    if (!cfg) return 1;
+    bool connected = ds4_mcp_connect_json(&mcp, cfg, NULL, NULL,
+                                          err, sizeof(err));
+    free(cfg);
+    if (!connected) {
+        ds4_mcp_close(&mcp);
+        return 1;
+    }
+    if (sigaction(SIGPIPE, NULL, &got_sa) != 0 ||
+        got_sa.sa_handler != SIG_DFL)
+    {
+        ds4_mcp_close(&mcp);
+        return 1;
+    }
+
+    err[0] = '\0';
+    char *result = ds4_mcp_call_tool(&mcp, "mcp__closed__echo",
+                                     "{}", NULL, NULL,
+                                     err, sizeof(err));
+    bool ok = result == NULL && err[0] != '\0';
+    free(result);
+    ds4_mcp_close(&mcp);
+    return ok ? 0 : 1;
+}
+
+static void test_acp_mcp_sigpipe(void) {
+    pid_t pid = fork();
+    TEST_ASSERT(pid >= 0);
+    if (pid < 0) return;
+    if (pid == 0) _exit(test_acp_mcp_sigpipe_child());
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    TEST_ASSERT(WIFEXITED(status));
+    TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
+static void test_acp_mcp_config(void) {
+    ds4_mcp mcp;
+    char err[160];
+    ds4_mcp_init(&mcp);
+    TEST_ASSERT(ds4_mcp_connect_json(&mcp, "[]", NULL, NULL,
+                                     err, sizeof(err)));
+    char *prompt = ds4_mcp_tools_prompt(&mcp);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(prompt[0] == '\0');
+    free(prompt);
+    ds4_mcp_close(&mcp);
+
+    ds4_mcp_init(&mcp);
+    TEST_ASSERT(!ds4_mcp_connect_json(&mcp,
+        "[{\"type\":\"http\",\"name\":\"api\",\"url\":\"https://example.com/mcp\",\"headers\":[]}]",
+        NULL, NULL, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "unsupported MCP transport") != NULL);
+    ds4_mcp_close(&mcp);
+
+    ds4_mcp_init(&mcp);
+    TEST_ASSERT(!ds4_mcp_connect_json(&mcp,
+        "[{\"name\":\"toolbox\",\"command\":\"/bin/echo\"}]",
+        NULL, NULL, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "requires args") != NULL);
+    ds4_mcp_close(&mcp);
+
+    ds4_mcp_init(&mcp);
+    char *cfg = test_mcp_fixture_config();
+    TEST_ASSERT(cfg != NULL);
+    if (!ds4_mcp_connect_json(&mcp, cfg, NULL, NULL, err, sizeof(err)))
+        fprintf(stderr, "MCP fixture connect failed: %s config=%s\n", err, cfg);
+    else
+        err[0] = '\0';
+    TEST_ASSERT(err[0] == '\0');
+    free(cfg);
+    prompt = ds4_mcp_tools_prompt(&mcp);
+    TEST_ASSERT(strstr(prompt, "mcp__fixture__echo") != NULL);
+    TEST_ASSERT(strstr(prompt, "mcp__fixture__fail") != NULL);
+    free(prompt);
+    char *result = ds4_mcp_call_tool(&mcp, "mcp__fixture__echo",
+                                     "{\"text\":\"hello\"}", NULL, NULL,
+                                     err, sizeof(err));
+    TEST_ASSERT(result != NULL);
+    TEST_ASSERT(strstr(result, "echo ok") != NULL);
+    free(result);
+    result = ds4_mcp_call_tool(&mcp, "mcp__fixture__fail",
+                               "{}", NULL, NULL, err, sizeof(err));
+    TEST_ASSERT(result != NULL);
+    TEST_ASSERT(strstr(result, "Tool error: MCP tool") != NULL);
+    TEST_ASSERT(strstr(result, "fixture failure") != NULL);
+    free(result);
+    ds4_mcp_close(&mcp);
+
+    test_acp_mcp_path_command();
+    test_acp_mcp_timeout();
+    test_acp_mcp_sigpipe();
+}
+
+static void test_acp_unit_group(void) {
+    test_acp_jsonrpc_parser();
+    test_acp_json_strings();
+    test_acp_mcp_config();
+}
+
 typedef void (*test_fn)(void);
 
 typedef struct {
@@ -1975,6 +2414,7 @@ static const ds4_test_entry test_entries[] = {
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
+    {"--acp", "acp", "ACP JSON-RPC parser and writer unit tests", test_acp_unit_group},
 };
 
 static void test_print_help(const char *prog) {
@@ -2031,6 +2471,18 @@ static void test_run_entry(const ds4_test_entry *entry) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--fake-mcp-server"))
+        return test_fake_mcp_server();
+    if (argc == 2 && !strcmp(argv[1], "--fake-mcp-hang"))
+        return test_fake_mcp_hang();
+    if (argc == 2 && !strcmp(argv[1], "--fake-mcp-close-stdin"))
+        return test_fake_mcp_close_stdin();
+
+    if (!realpath(argv[0], test_self_path)) {
+        fprintf(stderr, "failed to resolve %s: %s\n", argv[0], strerror(errno));
+        return 1;
+    }
+
     bool run_all = argc == 1;
     bool selected[sizeof(test_entries) / sizeof(test_entries[0])] = {0};
 
