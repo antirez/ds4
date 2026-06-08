@@ -158,6 +158,11 @@ uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
  * KV files with the previously-zero reserved byte remain Flash-compatible;
  * Pro and later shapes must use nonzero ids. */
 int ds4_engine_model_id(ds4_engine *e);
+/* Cheap, stable 64-bit model/quant identity over structural+quant metadata and
+ * vocab bytes (never the weights).  Stamped into the session payload header so a
+ * KV checkpoint saved against a different GGUF/quant of the same shape is
+ * rejected on load instead of silently decoding garbage. */
+uint64_t ds4_engine_model_fingerprint(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
@@ -302,8 +307,16 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
 /* Disk KV payload helpers.  HTTP/agent code owns the outer file header and
  * persistence policy; the engine owns the DS4-specific serialized graph state. */
 #define DS4_SESSION_PAYLOAD_MAGIC UINT32_C(0x34565344) /* "DSV4" */
-#define DS4_SESSION_PAYLOAD_VERSION UINT32_C(2)
-#define DS4_SESSION_PAYLOAD_U32_FIELDS 13u
+/* Version 3 appends a 64-bit model/quant fingerprint (header words 13,14) so a
+ * payload saved against a different GGUF or quant with the same structural
+ * layout is rejected on load instead of silently decoding garbage.  The coarse
+ * structural words (layers/head dims/vocab) cannot tell two different models of
+ * the same variant+quant apart; the fingerprint folds in routed-expert quant
+ * bits, output/token_embd tensor quant types, the per-layer ffn_gate_exps quant
+ * mix, and the vocab token bytes (metadata only, never the weights).  Older v<3
+ * payloads (13 header words, no fingerprint) are rejected cleanly on load. */
+#define DS4_SESSION_PAYLOAD_VERSION UINT32_C(3)
+#define DS4_SESSION_PAYLOAD_U32_FIELDS 15u
 #define DS4_SESSION_LAYER_PAYLOAD_MAGIC UINT32_C(0x4c565344) /* "DSVL" */
 #define DS4_SESSION_LAYER_PAYLOAD_VERSION UINT32_C(1)
 #define DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS 14u

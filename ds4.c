@@ -22264,6 +22264,60 @@ static uint32_t payload_get_u32(const uint8_t in[4]) {
            ((uint32_t)in[3] << 24);
 }
 
+/* Cheap, stable model/quant identity fingerprint for the session payload.
+ *
+ * A payload only restores correctly into an engine running the *same* model and
+ * quantization: the serialized KV rows are produced by that exact weight set.
+ * The structural header words (layers/head dims/vocab) catch a different DS4
+ * build, but two different GGUFs or quants can share that layout, so we also
+ * fold in identity that varies with the actual model and quant:
+ *   - the routed expert quant bits (Q2_K vs Q4_K),
+ *   - the output and token_embd tensor quant types,
+ *   - every per-layer ffn_gate_exps quant type (the quant "mix"),
+ *   - the full vocab token byte strings (differs across tokenizers/models).
+ * This reads only metadata and host-resident vocab bytes -- it never touches the
+ * (potentially 80 GB) weight data -- so it is cheap to compute on every save and
+ * load.  FNV-1a/64 keeps it dependency-free; collisions are astronomically
+ * unlikely for this use and a collision only fails to reject a mismatch, never
+ * corrupts a matching restore.  Exposed at engine scope so the distributed KV
+ * checkpoint path (ds4_distributed.c) can stamp/validate the same identity. */
+uint64_t ds4_engine_model_fingerprint(ds4_engine *e) {
+    uint64_t h = UINT64_C(1469598103934665603); /* FNV offset basis */
+    const uint64_t prime = UINT64_C(1099511628211);
+#define DS4_FP_MIX_U64(v) do { \
+        uint64_t _v = (uint64_t)(v); \
+        for (int _b = 0; _b < 8; _b++) { \
+            h ^= (uint64_t)((_v >> (_b * 8)) & 0xffu); \
+            h *= prime; \
+        } \
+    } while (0)
+    if (!e) return h;
+    DS4_FP_MIX_U64((uint64_t)ds4_engine_routed_quant_bits(e));
+    if (e->weights.output) DS4_FP_MIX_U64(e->weights.output->type);
+    if (e->weights.token_embd) DS4_FP_MIX_U64(e->weights.token_embd->type);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_tensor *g = e->weights.layer[il].ffn_gate_exps;
+        DS4_FP_MIX_U64(g ? g->type : 0u);
+    }
+    DS4_FP_MIX_U64((uint64_t)e->vocab.n_vocab);
+    for (int i = 0; i < e->vocab.n_vocab; i++) {
+        const ds4_str *t = &e->vocab.token[i];
+        const unsigned char *p = (const unsigned char *)t->ptr;
+        DS4_FP_MIX_U64(t->len);
+        for (uint64_t b = 0; p && b < t->len; b++) {
+            h ^= (uint64_t)p[b];
+            h *= prime;
+        }
+    }
+#undef DS4_FP_MIX_U64
+    return h;
+}
+
+static uint64_t ds4_session_model_fingerprint(const ds4_session *s) {
+    if (!s || !s->engine) return ds4_engine_model_fingerprint(NULL);
+    return ds4_engine_model_fingerprint(s->engine);
+}
+
 static int payload_write_bytes(FILE *fp, const void *ptr, uint64_t bytes, char *err, size_t errlen) {
     const uint8_t *p = ptr;
     while (bytes != 0) {
@@ -23223,6 +23277,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         const uint32_t raw_live = session_cpu_raw_live_rows(s);
         const uint32_t raw_cap = ds4_default_raw_cap((uint32_t)s->ctx_size);
         const uint32_t comp_cap = session_cpu_comp_cap(s);
+        const uint64_t model_fp = ds4_session_model_fingerprint(s);
         uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
             DS4_SESSION_PAYLOAD_MAGIC,
             DS4_SESSION_PAYLOAD_VERSION,
@@ -23237,6 +23292,8 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
             DS4_N_INDEXER_HEAD_DIM,
             DS4_N_VOCAB,
             raw_live,
+            (uint32_t)(model_fp & 0xffffffffu),       /* model fingerprint low  */
+            (uint32_t)(model_fp >> 32),               /* model fingerprint high */
         };
         for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
             if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
@@ -23299,8 +23356,10 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
      *   0 magic, 1 version, 2 ctx, 3 prefill chunk, 4 raw cap,
      *   5 raw window, 6 compressed cap, 7 token count,
      *   8 layers, 9 raw head dim, 10 indexer head dim, 11 vocab,
-     *   12 live raw rows serialized below.
+     *   12 live raw rows serialized below,
+     *   13 model fingerprint low, 14 model fingerprint high.
      */
+    const uint64_t model_fp = ds4_session_model_fingerprint(s);
     uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
         DS4_SESSION_PAYLOAD_MAGIC,
         DS4_SESSION_PAYLOAD_VERSION,
@@ -23315,6 +23374,8 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         DS4_N_INDEXER_HEAD_DIM,
         DS4_N_VOCAB,
         raw_live,
+        (uint32_t)(model_fp & 0xffffffffu),       /* model fingerprint low  */
+        (uint32_t)(model_fp >> 32),               /* model fingerprint high */
     };
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
@@ -23436,6 +23497,20 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     if (h[0] != DS4_SESSION_PAYLOAD_MAGIC || h[1] != DS4_SESSION_PAYLOAD_VERSION) {
         payload_set_err(err, errlen, "unsupported session payload version");
         return 1;
+    }
+    /* Reject a payload saved against a different model/quant (same structural
+     * layout but different weights would silently decode to garbage).  Header
+     * words 13/14 hold the 64-bit fingerprint; recompute it for the engine this
+     * session is bound to and reject before reading any KV bytes.  v<3 payloads
+     * lack these words and are already rejected by the version check above. */
+    {
+        const uint64_t saved_fp = (uint64_t)h[13] | ((uint64_t)h[14] << 32);
+        const uint64_t live_fp = ds4_session_model_fingerprint(s);
+        if (saved_fp != live_fp) {
+            payload_set_err(err, errlen,
+                "KV checkpoint was saved against a different model or quantization");
+            return 1;
+        }
     }
     if (ds4_session_is_cpu(s)) {
         const uint32_t saved_ctx = h[2];

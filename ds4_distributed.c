@@ -372,6 +372,7 @@ typedef struct {
     uint32_t indexer_head_dim;
     uint32_t vocab;
     uint32_t raw_live;
+    uint64_t model_fp;   /* model/quant fingerprint (payload v3 header words 13,14) */
 } ds4_dist_kv_layout;
 
 typedef struct {
@@ -4809,6 +4810,8 @@ static int dist_kv_write_session_header(
         layout->indexer_head_dim,
         layout->vocab,
         layout->raw_live,
+        (uint32_t)(layout->model_fp & 0xffffffffu),  /* model fingerprint low  */
+        (uint32_t)(layout->model_fp >> 32),          /* model fingerprint high */
     };
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (dist_payload_write_u32(fp, h[i], err, errlen) != 0) return 1;
@@ -5170,6 +5173,9 @@ int ds4_dist_session_save_payload(
         if (errlen) snprintf(err, errlen, "distributed KV shard metadata mismatch");
         goto cleanup;
     }
+    /* Stamp the model/quant fingerprint (payload v3) so a checkpoint restored
+     * against a different GGUF/quant of the same shape is rejected on load. */
+    layout.model_fp = ds4_engine_model_fingerprint(d->state.engine);
 
     if (dist_kv_write_session_header(fp, &layout, err, errlen) != 0)
         goto cleanup;
@@ -5246,7 +5252,16 @@ int ds4_dist_session_load_payload(
         .indexer_head_dim = h[10],
         .vocab = h[11],
         .raw_live = h[12],
+        .model_fp = (uint64_t)h[13] | ((uint64_t)h[14] << 32),
     };
+    /* Reject a checkpoint saved against a different model/quant before reading
+     * any KV bytes; the same structural layout with different weights would
+     * silently decode to garbage. */
+    if (layout.model_fp != ds4_engine_model_fingerprint(d->state.engine)) {
+        if (errlen) snprintf(err, errlen,
+            "KV checkpoint was saved against a different model or quantization");
+        return 1;
+    }
     if (layout.n_layers != d->state.n_layers ||
         layout.ctx > (uint32_t)ds4_session_ctx(owner) ||
         layout.token_count >= (uint32_t)ds4_session_ctx(owner) ||
