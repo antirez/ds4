@@ -2697,6 +2697,62 @@ static char *find_last_answer_marker(const char *visible) {
     return last ? last : strcasestr_local(visible, "answer");
 }
 
+/* True when the in-range capital at `letter` is the object of an explicit
+ * rejection earlier on the same answer line -- "not B", "isn't B",
+ * "rules out C", "eliminate E" -- so it is a distractor the model is
+ * discarding, not its pick.  This rewrites only the lexical "first valid
+ * letter wins" default for clear elimination phrasing; the cue set is kept
+ * small and high-precision on purpose, and there is no general
+ * selection-vs-rejection sentence parsing (issue #321).  It never looks before
+ * `start` or across a newline, so "D, not B" still grades D: the pick is
+ * reached and accepted before the rejected distractor is ever inspected. */
+static bool mc_letter_is_negated(const char *start, const char *letter) {
+    const char *p = letter;
+    /* Step back over the gap to the previous word: spaces and light separating
+     * punctuation only, and never across a line break. */
+    while (p > start) {
+        char c = p[-1];
+        if (c == '\n') return false;
+        if (c == ' ' || c == '\t' || c == ',' || c == ';') p--;
+        else break;
+    }
+    /* Read the immediately preceding word (letters/apostrophe), lowercased. */
+    const char *wend = p;
+    while (p > start && (isalpha((unsigned char)p[-1]) || p[-1] == '\'')) p--;
+    size_t wlen = (size_t)(wend - p);
+    if (wlen == 0 || wlen >= 16) return false;
+    char w[16];
+    for (size_t i = 0; i < wlen; i++) w[i] = (char)tolower((unsigned char)p[i]);
+    w[wlen] = '\0';
+
+    /* Contraction form: isn't / aren't / wasn't / doesn't / won't / can't. */
+    if (wlen >= 3 && strcmp(w + wlen - 3, "n't") == 0) return true;
+
+    static const char *cues[] = {
+        "not", "except", "excluding", "exclude", "excludes",
+        "eliminate", "eliminates", "eliminated",
+        "reject", "rejects", "rejected", "rejecting", NULL
+    };
+    for (int i = 0; cues[i]; i++) if (strcmp(w, cues[i]) == 0) return true;
+
+    /* Two-word cue: "rule out" / "rules out" / "ruled out". */
+    if (strcmp(w, "out") == 0) {
+        const char *q = p;
+        while (q > start && (q[-1] == ' ' || q[-1] == '\t')) q--;
+        const char *rend = q;
+        while (q > start && isalpha((unsigned char)q[-1])) q--;
+        size_t rl = (size_t)(rend - q);
+        if (rl && rl < 8) {
+            char r[8];
+            for (size_t i = 0; i < rl; i++) r[i] = (char)tolower((unsigned char)q[i]);
+            r[rl] = '\0';
+            if (!strcmp(r, "rule") || !strcmp(r, "rules") || !strcmp(r, "ruled"))
+                return true;
+        }
+    }
+    return false;
+}
+
 static char find_answer_letter(const char *generated, int nchoices) {
     if (nchoices <= 0) return '?';
     const char *visible = strstr(generated, "</think>");
@@ -2724,6 +2780,9 @@ static char find_answer_letter(const char *generated, int nchoices) {
                     while (*w == ' ' || *w == '\t') w++;
                     if (islower((unsigned char)*w)) continue;
                 }
+                /* A distractor explicitly rejected before the pick on the same
+                 * line ("not B, ... D") must not win over the real choice. */
+                if (mc_letter_is_negated(answer, p)) continue;
                 return c;
             }
         }
@@ -3460,6 +3519,30 @@ static int run_extractor_self_tests(void) {
     failed += extractor_self_test_case(
         "MC: out-of-range pronoun is harmless on 4-choice cases",
         &mc4_d, "</think>Answer: I think it is D", "D");
+
+    /* A distractor the model explicitly rejects *before* stating its pick on
+     * the same line must not shadow the real choice ("not B, ... D" /
+     * "rules out C, leaving D"). The bare first-valid-letter rule grabbed the
+     * rejected letter; a small, high-precision negation-cue skip fixes it.
+     * "D, not B" is the guard against the naive "take the last letter" fix:
+     * the pick is reached and accepted before the rejected distractor. #321 */
+    const eval_case mc_d = {
+        .source = "SuperGPQA",
+        .choice = {"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"},
+        .answer = "D",
+    };
+    failed += extractor_self_test_case(
+        "MC: 'not B' distractor before the pick does not shadow it",
+        &mc_d, "</think>Answer: It is not B, the answer is D", "D");
+    failed += extractor_self_test_case(
+        "MC: 'rules out C, leaving D' grades the surviving choice",
+        &mc_d, "</think>Answer: rules out C, leaving D", "D");
+    failed += extractor_self_test_case(
+        "MC: contraction negation (isn't B) before the pick is skipped",
+        &mc_d, "</think>Answer: It isn't B, so D", "D");
+    failed += extractor_self_test_case(
+        "MC: a leading pick followed by 'not B' is still graded as the pick",
+        &mc_d, "</think>Answer: D, not B", "D");
 
     /* Integer: when the answer line shows the arithmetic, the graded value
      * must be the stated result (right of the last '='), not the first
