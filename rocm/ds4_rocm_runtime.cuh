@@ -966,7 +966,14 @@ static int cuda_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
     uint64_t done = 0;
     while (done < bytes) {
         const size_t n_req = (bytes - done > (uint64_t)SSIZE_MAX) ? (size_t)SSIZE_MAX : (size_t)(bytes - done);
+#ifdef _WIN32
+        /* MSVC's off_t is 32-bit (long); casting a >2 GiB file offset through it
+         * truncates to a negative value (staged read fails at 2.00 GiB). The
+         * Windows pread shim takes a 64-bit offset, so pass it un-truncated. */
+        ssize_t n = pread(fd, (char *)buf + done, n_req, (long long)(offset + done));
+#else
         ssize_t n = pread(fd, (char *)buf + done, n_req, (off_t)(offset + done));
+#endif
         if (n < 0) {
             if (errno == EINTR) continue;
             return 0;
