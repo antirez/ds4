@@ -15,10 +15,30 @@
 
 #include "ds4_distributed.h"
 
-#include <arpa/inet.h>
 #include <errno.h>
 #include <float.h>
 #include <math.h>
+#include <limits.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#if defined(_WIN32)
+/* Native Windows build: main moved the distributed runtime into CORE_OBJS, so
+ * it links into ds4-bench. The POSIX sockets surface it uses (arpa/inet,
+ * netdb, sys/socket, poll, …) is supplied by a Winsock2 shim, and the POSIX
+ * shim (ds4_win.h) covers nanosleep/clock_gettime/etc. Both bodies are guarded
+ * by _WIN32, so POSIX builds are byte-for-byte unchanged. */
+#include "win/ds4_sockets_win.h"
+#if defined(DS4_WIN_PTHREAD)
+#include "win/ds4_pthread_win.h"
+#else
+#include <pthread.h>
+#endif
+#include "ds4_win.h"
+#else
+#include <arpa/inet.h>
 #include <netdb.h>
 #include <net/if.h>
 #include <netinet/in.h>
@@ -26,16 +46,11 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
-#include <limits.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
-#include <time.h>
 #include <unistd.h>
+#endif
 
 /* =========================================================================
  * Protocol Constants And Wire Records

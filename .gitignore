@@ -10,7 +10,12 @@
 /TODO.md
 /gguf/
 *.o
+*.exe
 *.dSYM/
+# Generated MSVC import libs for the Windows ROCm build (regenerated from the
+# HIP SDK's lib*.dll by win/build-rocm.sh).
+/win/third_party/hipblas.lib
+/win/third_party/hipblaslt.lib
 __pycache__/
 *.pyc
 /misc/

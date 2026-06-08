@@ -40,7 +40,15 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm windows-rocm
+
+# Native Windows ROCm/HIP build of ds4-bench.exe for gfx1151 (AMD HIP SDK, no
+# WSL). hipcc.exe's .bat wrapper splits args on spaces, so the compile/link is
+# delegated to win/build-rocm.sh (which also synthesizes the MSVC import libs
+# and vendors rocWMMA). Override ROCM_PATH / ROCM_ARCH as needed.
+ROCM_PATH ?= C:/Program Files/AMD/ROCm/7.1
+windows-rocm:
+	ROCM_PATH="$(ROCM_PATH)" ROCM_ARCH="$(ROCM_ARCH)" bash win/build-rocm.sh
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent

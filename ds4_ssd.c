@@ -6,8 +6,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+/* Native Windows build: the dependency-free POSIX shim supplies mmap (incl.
+ * anonymous MAP_PRIVATE|MAP_ANONYMOUS used by --simulate-used-memory),
+ * munmap, mlock/munlock and sysconf. Body guarded by _WIN32. See ds4_win.h. */
+#include "ds4_win.h"
+#if defined(__MINGW32__)
+#include <unistd.h>
+#endif
+#else
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
 
 #ifndef MAP_ANONYMOUS
 #define MAP_ANONYMOUS MAP_ANON

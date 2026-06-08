@@ -1542,7 +1542,12 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
         struct stat st;
         if (fstat(fd, &st) == 0 && st.st_size > 0) {
             g_model_file_size = (uint64_t)st.st_size;
+#ifndef _WIN32
+            /* MSVC's struct stat has no st_blksize; the direct-I/O alignment
+             * hint is a Linux O_DIRECT optimization (see below) and is unused
+             * on Windows, so leave g_model_direct_align at its default of 1. */
             if (st.st_blksize > 1) g_model_direct_align = (uint64_t)st.st_blksize;
+#endif
         }
 #if defined(__linux__) && defined(O_DIRECT)
         {
