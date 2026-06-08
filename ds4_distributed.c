@@ -36,6 +36,13 @@
 #else
 #include <pthread.h>
 #endif
+#if defined(__MINGW32__)
+/* MinGW supplies POSIX sleep()/usleep() via <unistd.h>; the MSVC ABI build does
+ * not, and relies on the sleep() shim in ds4_win.h instead (guarded there by
+ * !__MINGW32__). Pulling <unistd.h> here keeps the MinGW CPU build's sleep()
+ * declared without disturbing the MSVC ROCm path. */
+#include <unistd.h>
+#endif
 #include "ds4_win.h"
 #else
 #include <arpa/inet.h>

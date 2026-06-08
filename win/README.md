@@ -20,20 +20,35 @@ unchanged. No special include/search-path flags are needed.
 make windows-cpu
 ```
 
-`uname -s` on MinGW/MSYS reports `MINGW64_NT*` / `MSYS_NT*`; the Makefile detects
-this and selects a Windows branch that defaults `CC` to `gcc`.
+The `windows-cpu` target is self-contained: it sets its own `CC=gcc` (override
+with `WIN_CPU_CC=`) and CPU flags, so it builds the same way regardless of which
+`uname -s` branch the Makefile takes. It compiles the GPU-less core
+(`-DDS4_NO_GPU`) and links the Winsock import libs the distributed runtime now
+needs (see below).
 
 ### Direct gcc (no make)
 
+main moved `ds4_distributed.c` and `ds4_ssd.c` into the shared core, so the CPU
+bench now links them too — `ds4_distributed.c` pulls in the Winsock shim, so the
+link needs `-lws2_32 -liphlpapi` (the shim's `#pragma comment(lib,…)` is a no-op
+under gcc). Full TU set: `ds4.c`, `ds4_bench.c`, `ds4_help.c`,
+`ds4_distributed.c`, `ds4_ssd.c`.
+
 ```sh
 CF="-O3 -ffast-math -march=native -std=c99 -D_GNU_SOURCE -fno-finite-math-only \
-    -DDS4_NO_GPU -D_CRT_SECURE_NO_WARNINGS"
-gcc $CF -c ds4.c       -o ds4_cpu.o
-gcc $CF -c ds4_bench.c -o ds4_bench_cpu.o
-gcc $CF -o ds4-bench.exe ds4_bench_cpu.o ds4_cpu.o -lm
+    -DDS4_NO_GPU"
+gcc $CF -c ds4.c             -o ds4_cpu.o
+gcc $CF -c ds4_bench.c       -o ds4_bench_cpu.o
+gcc $CF -c ds4_help.c        -o ds4_help.o
+gcc $CF -c ds4_distributed.c -o ds4_distributed.o
+gcc $CF -c ds4_ssd.c         -o ds4_ssd.o
+gcc $CF -o ds4-bench.exe ds4_bench_cpu.o ds4_help.o ds4_cpu.o \
+    ds4_distributed.o ds4_ssd.o -lm -lpthread -lws2_32 -liphlpapi
 ```
 
-Toolchain used: `x86_64-w64-mingw32` GCC 15.2.0.
+Toolchain used: `x86_64-w64-mingw32` GCC 15.2.0. MinGW supplies
+pthread/`clock_gettime`/`ftruncate`/`sleep` natively, so the MSVC pthread shim
+(`win/ds4_pthread_win.h`) is not used here (it is `!__MINGW32__`-guarded).
 
 ### Verify it runs
 
