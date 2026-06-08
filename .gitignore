@@ -21,3 +21,4 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+ds4.lock
