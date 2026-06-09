@@ -3,7 +3,11 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#if defined(_WIN32) && !defined(__MINGW32__)
+#include <io.h>              /* MSVC-ABI build: isatty/fileno (no <unistd.h>) */
+#else
 #include <unistd.h>
+#endif
 
 typedef struct {
     const char *off;

@@ -40,7 +40,40 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm windows-rocm windows-cpu
+
+# Native Windows ROCm/HIP build of ds4-bench.exe for gfx1151 (AMD HIP SDK, no
+# WSL). hipcc.exe's .bat wrapper splits args on spaces, so the compile/link is
+# delegated to win/build-rocm.sh (which also synthesizes the MSVC import libs
+# and vendors rocWMMA). Override ROCM_PATH / ROCM_ARCH as needed.
+ROCM_PATH ?= C:/Program Files/AMD/ROCm/7.1
+windows-rocm:
+	ROCM_PATH="$(ROCM_PATH)" ROCM_ARCH="$(ROCM_ARCH)" bash win/build-rocm.sh
+
+# Native Windows CPU-only build of ds4-bench.exe with MinGW-w64 GCC (no GPU
+# backend, no WSL/MSVC). DeepSeek V4 runs on the CPU backend here; this mirrors
+# the old `windows-cpu` target from the pre-refactor base. The mmap/stat/socket
+# POSIX shims (ds4_win.h, win/ds4_sockets_win.h) are wired in-tree behind
+# _WIN32; MinGW already provides pthread/clock_gettime/ftruncate, so the MSVC
+# pthread shim is not used (it is !__MINGW32__-guarded). main moved
+# ds4_distributed.c / ds4_ssd.c into the shared core, so they link into the
+# bench too — hence -lws2_32 / -liphlpapi for the Winsock surface in
+# ds4_distributed.c (the MSVC `#pragma comment(lib,...)` in the sockets shim is
+# a no-op under gcc, so the import libs are named explicitly here). Self-
+# contained (sets its own CC/flags) so it builds regardless of the host
+# uname-s branch above and leaves the POSIX/cuda/rocm targets untouched.
+WIN_CPU_CC      ?= gcc
+WIN_CPU_CFLAGS  ?= -O3 -ffast-math -march=native -g -Wall -Wextra -std=c99 \
+                   -D_GNU_SOURCE -fno-finite-math-only -DDS4_NO_GPU
+WIN_CPU_LDLIBS  ?= -lm -lpthread -lws2_32 -liphlpapi
+WIN_CPU_OBJS     = ds4_bench_cpu.o ds4_help.o ds4_cpu.o ds4_distributed.o ds4_ssd.o
+windows-cpu:
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o ds4_cpu.o          ds4.c
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o ds4_bench_cpu.o    ds4_bench.c
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o ds4_help.o         ds4_help.c
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o ds4_distributed.o  ds4_distributed.c
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o ds4_ssd.o          ds4_ssd.c
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -o ds4-bench.exe $(WIN_CPU_OBJS) $(WIN_CPU_LDLIBS)
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -230,4 +263,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test tests/test_q4k_dot *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test tests/test_q4k_dot *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o ds4-bench.exe ds4.exe ds4-server.exe ds4-eval.exe ds4-agent.exe

@@ -21,6 +21,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef _WIN32
+/* Native Windows build: the POSIX shim supplies clock_gettime/CLOCK_MONOTONIC,
+ * nanosleep and PATH_MAX. Body guarded by _WIN32. See ds4_win.h. */
+#include "ds4_win.h"
+#endif
 
 typedef struct {
     const char *model_path;

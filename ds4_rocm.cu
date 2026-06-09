@@ -32,7 +32,17 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#ifdef _WIN32
+/* Native Windows ROCm build: the same dependency-free POSIX shim used by
+ * ds4.c supplies mmap/sysconf/pread/fcntl/flock. <io.h> provides the
+ * _open/_read/_write/_close family; the aliases below map the POSIX names the
+ * device-host code uses. The shim body is guarded by _WIN32, so POSIX/CUDA
+ * builds are byte-for-byte unchanged. See win/README.md and ds4_win.h. */
+#include "ds4_win.h"
+#include <io.h>
+#else
 #include <unistd.h>
+#endif
 #include <unordered_map>
 #include <vector>
 
