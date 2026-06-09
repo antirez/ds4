@@ -336,6 +336,20 @@ struct ds4_metal_q4_expert_table {
     array<device const char *, 384> experts [[id(0)]];
 };
 
+struct ds4_metal_expert_address_table {
+    device const uint64_t *addrs;
+};
+
+struct ds4_metal_stream_expert_validate_args {
+    uint32_t n_total_expert;
+    uint32_t n_expert;
+};
+
+struct ds4_metal_stream_expert_split_args {
+    uint32_t active_mask;
+    uint32_t accumulate;
+};
+
 struct ds4_metal_args_mul_mm_id_map0 {
     int32_t  ne02;
     int32_t  ne10;
@@ -1142,6 +1156,323 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
     }
 
     (void)tiitg;
+}
+
+kernel void kernel_mul_mv_slots6_iq2_xxs_pair_swiglu_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const char * src0_gate0,
+        device const char * src0_gate1,
+        device const char * src0_gate2,
+        device const char * src0_gate3,
+        device const char * src0_gate4,
+        device const char * src0_gate5,
+        device const char * src0_up0,
+        device const char * src0_up1,
+        device const char * src0_up2,
+        device const char * src0_up3,
+        device const char * src0_up4,
+        device const char * src0_up5,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        device const char * weights,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int iid1 = tgpig.z / args.nei0;
+    const int idx  = tgpig.z % args.nei0;
+
+    tgpig.z = 0;
+
+    const int64_t i11 = idx % args.ne11;
+    const int64_t i12 = iid1;
+
+    device const char *src0_gate_cur = src0_gate0;
+    device const char *src0_up_cur = src0_up0;
+    switch (idx) {
+    case 1: src0_gate_cur = src0_gate1; src0_up_cur = src0_up1; break;
+    case 2: src0_gate_cur = src0_gate2; src0_up_cur = src0_up2; break;
+    case 3: src0_gate_cur = src0_gate3; src0_up_cur = src0_up3; break;
+    case 4: src0_gate_cur = src0_gate4; src0_up_cur = src0_up4; break;
+    case 5: src0_gate_cur = src0_gate5; src0_up_cur = src0_up5; break;
+    default: break;
+    }
+
+    device const char *src1_cur = src1 + i11 * args.nb11 + i12 * args.nb12;
+
+    device char *dst_gate_cur = dst_gate + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
+    device char *dst_up_cur   = dst_up   + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
+
+    ds4_metal_args_mul_mv args0 = {
+        args.ne00, args.ne01, 1,
+        args.nb00, args.nb01, args.nb02, args.nb02,
+        args.ne10, 1, 1,
+        args.nb10, args.nb11, args.nb12, args.nb12,
+        args.ne0, 1, args.nr0, 1, 1,
+    };
+
+    kernel_mul_mv_iq2_xxs_pair_f32_impl<N_R0_IQ2_XXS>(
+        args0,
+        src0_gate_cur,
+        src0_up_cur,
+        src1_cur,
+        dst_gate_cur,
+        dst_up_cur,
+        shmem,
+        tgpig,
+        tiisg,
+        sgitg);
+
+    const short NSG = FC_mul_mv_nsg;
+    const int first_row = (tgpig.x * NSG + sgitg) * N_R0_IQ2_XXS;
+    device float *gate_f32 = (device float *)dst_gate_cur;
+    device float *up_f32 = (device float *)dst_up_cur;
+    const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
+    device float *mid_f32 = (device float *)(dst_mid + pair_row * act.mid_row_stride);
+    device const float *route_w = (device const float *)(weights + pair_row * act.weight_stride);
+    const float c = act.clamp_value;
+    const float route_weight = route_w[0];
+
+    if (tiisg == 0) {
+        for (int row = 0; row < N_R0_IQ2_XXS && first_row + row < args.ne0; ++row) {
+            const uint out_row = first_row + row;
+            float g = gate_f32[out_row];
+            float u = up_f32[out_row];
+            if (c > 1.0e-6f) {
+                g = min(g, c);
+                u = clamp(u, -c, c);
+            }
+            const float silu = g / (1.0f + exp(-g));
+            mid_f32[out_row] = silu * u * route_weight;
+        }
+    }
+
+    (void)tiitg;
+}
+
+kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const uint64_t * gate_addrs,
+        device const uint64_t * up_addrs,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        device const char * ids,
+        device const char * weights,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int iid1 = tgpig.z / args.nei0;
+    const int idx  = tgpig.z % args.nei0;
+
+    tgpig.z = 0;
+
+    const int32_t i02 = ((device const int32_t *)(ids + iid1 * args.nbi1))[idx];
+    if (i02 < 0 || i02 >= args.ne02 || i02 >= 384) {
+        return;
+    }
+    const uint64_t gate_addr = gate_addrs[(uint)i02];
+    const uint64_t up_addr = up_addrs[(uint)i02];
+    if (gate_addr == 0 || up_addr == 0) {
+        return;
+    }
+
+    const int64_t i11 = idx % args.ne11;
+    const int64_t i12 = iid1;
+
+    device const char *src0_gate_cur =
+        reinterpret_cast<device const char *>(gate_addr);
+    device const char *src0_up_cur =
+        reinterpret_cast<device const char *>(up_addr);
+    device const char *src1_cur = src1 + i11 * args.nb11 + i12 * args.nb12;
+
+    device char *dst_gate_cur = dst_gate + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
+    device char *dst_up_cur   = dst_up   + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
+
+    ds4_metal_args_mul_mv args0 = {
+        args.ne00, args.ne01, 1,
+        args.nb00, args.nb01, args.nb02, args.nb02,
+        args.ne10, 1, 1,
+        args.nb10, args.nb11, args.nb12, args.nb12,
+        args.ne0, 1, args.nr0, 1, 1,
+    };
+
+    kernel_mul_mv_iq2_xxs_pair_f32_impl<N_R0_IQ2_XXS>(
+        args0,
+        src0_gate_cur,
+        src0_up_cur,
+        src1_cur,
+        dst_gate_cur,
+        dst_up_cur,
+        shmem,
+        tgpig,
+        tiisg,
+        sgitg);
+
+    const short NSG = FC_mul_mv_nsg;
+    const int first_row = (tgpig.x * NSG + sgitg) * N_R0_IQ2_XXS;
+    device float *gate_f32 = (device float *)dst_gate_cur;
+    device float *up_f32 = (device float *)dst_up_cur;
+    const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
+    device float *mid_f32 = (device float *)(dst_mid + pair_row * act.mid_row_stride);
+    device const float *route_w = (device const float *)(weights + pair_row * act.weight_stride);
+    const float c = act.clamp_value;
+    const float route_weight = route_w[0];
+
+    if (tiisg == 0) {
+        for (int row = 0; row < N_R0_IQ2_XXS && first_row + row < args.ne0; ++row) {
+            const uint out_row = first_row + row;
+            float g = gate_f32[out_row];
+            float u = up_f32[out_row];
+            if (c > 1.0e-6f) {
+                g = min(g, c);
+                u = clamp(u, -c, c);
+            }
+            const float silu = g / (1.0f + exp(-g));
+            mid_f32[out_row] = silu * u * route_weight;
+        }
+    }
+
+    (void)tiitg;
+}
+
+kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        constant ds4_metal_stream_expert_split_args & split,
+        device const uint64_t * gate_addrs,
+        device const uint64_t * up_addrs,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        device const char * ids,
+        device const char * weights,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int iid1 = tgpig.z / args.nei0;
+    const int idx  = tgpig.z % args.nei0;
+    if ((split.active_mask & (1u << (uint)idx)) == 0) {
+        return;
+    }
+
+    tgpig.z = 0;
+
+    const int32_t i02 = ((device const int32_t *)(ids + iid1 * args.nbi1))[idx];
+    if (i02 < 0 || i02 >= args.ne02 || i02 >= 384) {
+        return;
+    }
+    const uint64_t gate_addr = gate_addrs[(uint)i02];
+    const uint64_t up_addr = up_addrs[(uint)i02];
+    if (gate_addr == 0 || up_addr == 0) {
+        return;
+    }
+
+    const int64_t i11 = idx % args.ne11;
+    const int64_t i12 = iid1;
+
+    device const char *src0_gate_cur =
+        reinterpret_cast<device const char *>(gate_addr);
+    device const char *src0_up_cur =
+        reinterpret_cast<device const char *>(up_addr);
+    device const char *src1_cur = src1 + i11 * args.nb11 + i12 * args.nb12;
+
+    device char *dst_gate_cur = dst_gate + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
+    device char *dst_up_cur   = dst_up   + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
+
+    ds4_metal_args_mul_mv args0 = {
+        args.ne00, args.ne01, 1,
+        args.nb00, args.nb01, args.nb02, args.nb02,
+        args.ne10, 1, 1,
+        args.nb10, args.nb11, args.nb12, args.nb12,
+        args.ne0, 1, args.nr0, 1, 1,
+    };
+
+    kernel_mul_mv_iq2_xxs_pair_f32_impl<N_R0_IQ2_XXS>(
+        args0,
+        src0_gate_cur,
+        src0_up_cur,
+        src1_cur,
+        dst_gate_cur,
+        dst_up_cur,
+        shmem,
+        tgpig,
+        tiisg,
+        sgitg);
+
+    const short NSG = FC_mul_mv_nsg;
+    const int first_row = (tgpig.x * NSG + sgitg) * N_R0_IQ2_XXS;
+    device float *gate_f32 = (device float *)dst_gate_cur;
+    device float *up_f32 = (device float *)dst_up_cur;
+    const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
+    device float *mid_f32 = (device float *)(dst_mid + pair_row * act.mid_row_stride);
+    device const float *route_w = (device const float *)(weights + pair_row * act.weight_stride);
+    const float c = act.clamp_value;
+    const float route_weight = route_w[0];
+
+    if (tiisg == 0) {
+        for (int row = 0; row < N_R0_IQ2_XXS && first_row + row < args.ne0; ++row) {
+            const uint out_row = first_row + row;
+            float g = gate_f32[out_row];
+            float u = up_f32[out_row];
+            if (c > 1.0e-6f) {
+                g = min(g, c);
+                u = clamp(u, -c, c);
+            }
+            const float silu = g / (1.0f + exp(-g));
+            mid_f32[out_row] = silu * u * route_weight;
+        }
+    }
+
+    (void)tiitg;
+}
+
+kernel void kernel_stream_expert_cache_validate(
+        constant ds4_metal_stream_expert_validate_args & args,
+        device const char * ids,
+        device const uint64_t * gate_addrs,
+        device const uint64_t * up_addrs,
+        device const uint64_t * down_addrs,
+        device uint32_t * status,
+        uint tid [[thread_position_in_grid]]) {
+    if (tid != 0) return;
+
+    uint32_t miss_mask = 0;
+    uint32_t invalid_mask = 0;
+    const uint32_t n_expert = min(args.n_expert, (uint32_t)6);
+    device const int32_t *selected = (device const int32_t *)ids;
+
+    status[3] = n_expert;
+    for (uint32_t i = 0; i < 6; i++) {
+        const int32_t expert = i < n_expert ? selected[i] : -1;
+        status[4 + i] = as_type<uint32_t>(expert);
+        if (i >= n_expert) continue;
+        if (expert < 0 ||
+            (uint32_t)expert >= args.n_total_expert ||
+            (uint32_t)expert >= 384) {
+            invalid_mask |= (1u << i);
+            continue;
+        }
+        const uint32_t e = (uint32_t)expert;
+        if (gate_addrs[e] == 0 || up_addrs[e] == 0 || down_addrs[e] == 0) {
+            miss_mask |= (1u << i);
+        }
+    }
+
+    status[0] = (miss_mask == 0 && invalid_mask == 0) ? 1u : 0u;
+    status[1] = miss_mask;
+    status[2] = invalid_mask;
 }
 
 kernel void kernel_mul_mv_id_q4_K_pair_f32(
@@ -2349,6 +2680,319 @@ kernel void kernel_mul_mv_id_q2_K_sum6_f32(
     for (int row = 0; row < nr0 && first_row + row < args.ne0; row++) {
         const float sum_all = simd_sum(sumf[row]);
         if (tiisg == 0) dst_f32[first_row + row] = sum_all;
+    }
+
+    (void)shmem;
+    (void)tiitg;
+    (void)tgpig;
+}
+
+kernel void kernel_mul_mv_slots6_q2_K_sum6_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src00,
+        device const char * src01,
+        device const char * src02,
+        device const char * src03,
+        device const char * src04,
+        device const char * src05,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+    const short nr0 = N_R0_Q2_K;
+    const int nb = args.ne00 / QK_K;
+    const int first_row = (tgpig.x * NSG + sgitg) * nr0;
+    const uint token = tgpig.y;
+    device const char *token_src1 = src1 + (uint64_t)token * args.nb12;
+
+    float sumf[nr0] = {0.f};
+
+    const short ix = tiisg / 8;
+    const short it = tiisg % 8;
+    const short iq = it / 4;
+    const short ir = it % 4;
+    const short is = (8 * ir) / 16;
+
+    for (int expert_slot = 0; expert_slot < 6; expert_slot++) {
+        device const char *src0_cur = src00;
+        switch (expert_slot) {
+        case 1: src0_cur = src01; break;
+        case 2: src0_cur = src02; break;
+        case 3: src0_cur = src03; break;
+        case 4: src0_cur = src04; break;
+        case 5: src0_cur = src05; break;
+        default: break;
+        }
+        device const block_q2_K *x =
+            (device const block_q2_K *)(src0_cur + first_row * args.nb01);
+        device const float *y = (device const float *)(token_src1 + expert_slot * args.nb11);
+        device const float *y4 = y + ix * QK_K + 128 * iq + 8 * ir;
+
+        for (int ib = ix; ib < nb; ib += 4) {
+            float yl[32];
+            float4 sumy = {0.f, 0.f, 0.f, 0.f};
+            for (short i = 0; i < 8; ++i) {
+                yl[i +  0] = y4[i +  0]; sumy[0] += yl[i +  0];
+                yl[i +  8] = y4[i + 32]; sumy[1] += yl[i +  8];
+                yl[i + 16] = y4[i + 64]; sumy[2] += yl[i + 16];
+                yl[i + 24] = y4[i + 96]; sumy[3] += yl[i + 24];
+            }
+
+            device const uint8_t  *sc = (device const uint8_t *)x[ib].scales + 8 * iq + is;
+            device const uint16_t *qs = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
+            device const half     *dh = &x[ib].d;
+
+            for (short row = 0; row < nr0; row++) {
+                if (first_row + row < args.ne0) {
+                    float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+                    float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+                    for (int i = 0; i < 8; i += 2) {
+                        acc1[0] += yl[i +  0] * (qs[i / 2] & 0x0003);
+                        acc2[0] += yl[i +  1] * (qs[i / 2] & 0x0300);
+                        acc1[1] += yl[i +  8] * (qs[i / 2] & 0x000c);
+                        acc2[1] += yl[i +  9] * (qs[i / 2] & 0x0c00);
+                        acc1[2] += yl[i + 16] * (qs[i / 2] & 0x0030);
+                        acc2[2] += yl[i + 17] * (qs[i / 2] & 0x3000);
+                        acc1[3] += yl[i + 24] * (qs[i / 2] & 0x00c0);
+                        acc2[3] += yl[i + 25] * (qs[i / 2] & 0xc000);
+                    }
+                    float dall = dh[0];
+                    float dmin = dh[1] * 1.f / 16.f;
+                    sumf[row] += dall * ((acc1[0] + 1.f / 256.f * acc2[0]) * (sc[0] & 0xF) * 1.f /  1.f +
+                                         (acc1[1] + 1.f / 256.f * acc2[1]) * (sc[2] & 0xF) * 1.f /  4.f +
+                                         (acc1[2] + 1.f / 256.f * acc2[2]) * (sc[4] & 0xF) * 1.f / 16.f +
+                                         (acc1[3] + 1.f / 256.f * acc2[3]) * (sc[6] & 0xF) * 1.f / 64.f) -
+                                 dmin * (sumy[0] * (sc[0] & 0xF0) + sumy[1] * (sc[2] & 0xF0) +
+                                         sumy[2] * (sc[4] & 0xF0) + sumy[3] * (sc[6] & 0xF0));
+                }
+
+                qs += args.nb01 / 2;
+                sc += args.nb01;
+                dh += args.nb01 / 2;
+            }
+
+            y4 += 4 * QK_K;
+        }
+    }
+
+    device float *dst_f32 = (device float *)(dst + (uint64_t)token * args.nb1);
+    for (int row = 0; row < nr0 && first_row + row < args.ne0; row++) {
+        const float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) dst_f32[first_row + row] = sum_all;
+    }
+
+    (void)shmem;
+    (void)tiitg;
+    (void)tgpig;
+}
+
+kernel void kernel_mul_mv_addr_q2_K_sum6_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const uint64_t * addrs,
+        device const char * src1,
+        device       char * dst,
+        device const char * ids,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+    const short nr0 = N_R0_Q2_K;
+    const int nb = args.ne00 / QK_K;
+    const int first_row = (tgpig.x * NSG + sgitg) * nr0;
+    const uint token = tgpig.y;
+    device const char *token_src1 = src1 + (uint64_t)token * args.nb12;
+    device const int32_t *token_ids =
+        (device const int32_t *)(ids + (uint64_t)token * args.nbi1);
+
+    float sumf[nr0] = {0.f};
+
+    const short ix = tiisg / 8;
+    const short it = tiisg % 8;
+    const short iq = it / 4;
+    const short ir = it % 4;
+    const short is = (8 * ir) / 16;
+
+    for (int expert_slot = 0; expert_slot < 6; expert_slot++) {
+        const int32_t expert = token_ids[expert_slot];
+        if (expert < 0 || expert >= args.ne02 || expert >= 384) {
+            continue;
+        }
+        const uint64_t addr = addrs[(uint)expert];
+        if (addr == 0) {
+            continue;
+        }
+        device const char *src0_cur =
+            reinterpret_cast<device const char *>(addr);
+        device const block_q2_K *x =
+            (device const block_q2_K *)(src0_cur + first_row * args.nb01);
+        device const float *y = (device const float *)(token_src1 + expert_slot * args.nb11);
+        device const float *y4 = y + ix * QK_K + 128 * iq + 8 * ir;
+
+        for (int ib = ix; ib < nb; ib += 4) {
+            float yl[32];
+            float4 sumy = {0.f, 0.f, 0.f, 0.f};
+            for (short i = 0; i < 8; ++i) {
+                yl[i +  0] = y4[i +  0]; sumy[0] += yl[i +  0];
+                yl[i +  8] = y4[i + 32]; sumy[1] += yl[i +  8];
+                yl[i + 16] = y4[i + 64]; sumy[2] += yl[i + 16];
+                yl[i + 24] = y4[i + 96]; sumy[3] += yl[i + 24];
+            }
+
+            device const uint8_t  *sc = (device const uint8_t *)x[ib].scales + 8 * iq + is;
+            device const uint16_t *qs = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
+            device const half     *dh = &x[ib].d;
+
+            for (short row = 0; row < nr0; row++) {
+                if (first_row + row < args.ne0) {
+                    float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+                    float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+                    for (int i = 0; i < 8; i += 2) {
+                        acc1[0] += yl[i +  0] * (qs[i / 2] & 0x0003);
+                        acc2[0] += yl[i +  1] * (qs[i / 2] & 0x0300);
+                        acc1[1] += yl[i +  8] * (qs[i / 2] & 0x000c);
+                        acc2[1] += yl[i +  9] * (qs[i / 2] & 0x0c00);
+                        acc1[2] += yl[i + 16] * (qs[i / 2] & 0x0030);
+                        acc2[2] += yl[i + 17] * (qs[i / 2] & 0x3000);
+                        acc1[3] += yl[i + 24] * (qs[i / 2] & 0x00c0);
+                        acc2[3] += yl[i + 25] * (qs[i / 2] & 0xc000);
+                    }
+                    float dall = dh[0];
+                    float dmin = dh[1] * 1.f / 16.f;
+                    sumf[row] += dall * ((acc1[0] + 1.f / 256.f * acc2[0]) * (sc[0] & 0xF) * 1.f /  1.f +
+                                         (acc1[1] + 1.f / 256.f * acc2[1]) * (sc[2] & 0xF) * 1.f /  4.f +
+                                         (acc1[2] + 1.f / 256.f * acc2[2]) * (sc[4] & 0xF) * 1.f / 16.f +
+                                         (acc1[3] + 1.f / 256.f * acc2[3]) * (sc[6] & 0xF) * 1.f / 64.f) -
+                                 dmin * (sumy[0] * (sc[0] & 0xF0) + sumy[1] * (sc[2] & 0xF0) +
+                                         sumy[2] * (sc[4] & 0xF0) + sumy[3] * (sc[6] & 0xF0));
+                }
+                qs += args.nb01 / 2;
+                sc += args.nb01;
+                dh += args.nb01 / 2;
+            }
+            y4 += 4 * QK_K;
+        }
+    }
+
+    device float * dst_f32 = (device float *)(dst + (uint64_t)token * args.nb1);
+    for (int row = 0; row < nr0 && first_row + row < args.ne0; row++) {
+        const float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) dst_f32[first_row + row] = sum_all;
+    }
+
+    (void)shmem;
+    (void)tiitg;
+    (void)tgpig;
+}
+
+kernel void kernel_mul_mv_addr_q2_K_sum6_masked_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_stream_expert_split_args & split,
+        device const uint64_t * addrs,
+        device const char * src1,
+        device       char * dst,
+        device const char * ids,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+    const short nr0 = N_R0_Q2_K;
+    const int nb = args.ne00 / QK_K;
+    const int first_row = (tgpig.x * NSG + sgitg) * nr0;
+    const uint token = tgpig.y;
+    device const char *token_src1 = src1 + (uint64_t)token * args.nb12;
+    device const int32_t *token_ids =
+        (device const int32_t *)(ids + (uint64_t)token * args.nbi1);
+
+    float sumf[nr0] = {0.f};
+
+    const short ix = tiisg / 8;
+    const short it = tiisg % 8;
+    const short iq = it / 4;
+    const short ir = it % 4;
+    const short is = (8 * ir) / 16;
+
+    for (int expert_slot = 0; expert_slot < 6; expert_slot++) {
+        if ((split.active_mask & (1u << (uint)expert_slot)) == 0) {
+            continue;
+        }
+        const int32_t expert = token_ids[expert_slot];
+        if (expert < 0 || expert >= args.ne02 || expert >= 384) {
+            continue;
+        }
+        const uint64_t addr = addrs[(uint)expert];
+        if (addr == 0) {
+            continue;
+        }
+        device const char *src0_cur =
+            reinterpret_cast<device const char *>(addr);
+        device const block_q2_K *x =
+            (device const block_q2_K *)(src0_cur + first_row * args.nb01);
+        device const float *y = (device const float *)(token_src1 + expert_slot * args.nb11);
+        device const float *y4 = y + ix * QK_K + 128 * iq + 8 * ir;
+
+        for (int ib = ix; ib < nb; ib += 4) {
+            float yl[32];
+            float4 sumy = {0.f, 0.f, 0.f, 0.f};
+            for (short i = 0; i < 8; ++i) {
+                yl[i +  0] = y4[i +  0]; sumy[0] += yl[i +  0];
+                yl[i +  8] = y4[i + 32]; sumy[1] += yl[i +  8];
+                yl[i + 16] = y4[i + 64]; sumy[2] += yl[i + 16];
+                yl[i + 24] = y4[i + 96]; sumy[3] += yl[i + 24];
+            }
+
+            device const uint8_t  *sc = (device const uint8_t *)x[ib].scales + 8 * iq + is;
+            device const uint16_t *qs = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
+            device const half     *dh = &x[ib].d;
+
+            for (short row = 0; row < nr0; row++) {
+                if (first_row + row < args.ne0) {
+                    float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+                    float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+                    for (int i = 0; i < 8; i += 2) {
+                        acc1[0] += yl[i +  0] * (qs[i / 2] & 0x0003);
+                        acc2[0] += yl[i +  1] * (qs[i / 2] & 0x0300);
+                        acc1[1] += yl[i +  8] * (qs[i / 2] & 0x000c);
+                        acc2[1] += yl[i +  9] * (qs[i / 2] & 0x0c00);
+                        acc1[2] += yl[i + 16] * (qs[i / 2] & 0x0030);
+                        acc2[2] += yl[i + 17] * (qs[i / 2] & 0x3000);
+                        acc1[3] += yl[i + 24] * (qs[i / 2] & 0x00c0);
+                        acc2[3] += yl[i + 25] * (qs[i / 2] & 0xc000);
+                    }
+                    float dall = dh[0];
+                    float dmin = dh[1] * 1.f / 16.f;
+                    sumf[row] += dall * ((acc1[0] + 1.f / 256.f * acc2[0]) * (sc[0] & 0xF) * 1.f /  1.f +
+                                         (acc1[1] + 1.f / 256.f * acc2[1]) * (sc[2] & 0xF) * 1.f /  4.f +
+                                         (acc1[2] + 1.f / 256.f * acc2[2]) * (sc[4] & 0xF) * 1.f / 16.f +
+                                         (acc1[3] + 1.f / 256.f * acc2[3]) * (sc[6] & 0xF) * 1.f / 64.f) -
+                                 dmin * (sumy[0] * (sc[0] & 0xF0) + sumy[1] * (sc[2] & 0xF0) +
+                                         sumy[2] * (sc[4] & 0xF0) + sumy[3] * (sc[6] & 0xF0));
+                }
+                qs += args.nb01 / 2;
+                sc += args.nb01;
+                dh += args.nb01 / 2;
+            }
+            y4 += 4 * QK_K;
+        }
+    }
+
+    device float * dst_f32 = (device float *)(dst + (uint64_t)token * args.nb1);
+    for (int row = 0; row < nr0 && first_row + row < args.ne0; row++) {
+        const float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            if (split.accumulate) {
+                dst_f32[first_row + row] += sum_all;
+            } else {
+                dst_f32[first_row + row] = sum_all;
+            }
+        }
     }
 
     (void)shmem;
@@ -3608,6 +4252,228 @@ kernel void kernel_mul_mm_id(
         i = (4*(nr0/4)) + tiisg;
         for (; i < nr0; i += 32) {
             *(D + i) = *(C + i);
+        }
+    }
+}
+
+kernel void kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16(
+        constant ds4_metal_args_mul_mm_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device const char * htpe,
+        device const char * hids,
+        device       char * dst_mid,
+        device const char * weights,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    threadgroup half *sa = (threadgroup half *)(shmem);
+    threadgroup half *sb = (threadgroup half *)(shmem + 4096);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+
+    const int im = tgpig.z;
+    const int r0 = tgpig.y*NR0;
+    const int r1 = tgpig.x*NR1;
+
+    device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
+    device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
+
+    const int32_t neh1 = tpe_u32[im];
+
+    if (r1 >= neh1) {
+        return;
+    }
+
+    const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
+    const short nr1 = (    neh1 - r1 < NR1) ? (    neh1 - r1) : NR1;
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+
+    const short il0 = (tiitg % NL0);
+    short il = il0;
+
+    const int id = ids_i32[im*args.ne21 + r1 + lr1];
+
+    const short i11 = (id % args.ne20) % args.ne11;
+    const short i12 = (id / args.ne20);
+    const short i13 = 0;
+
+    const uint64_t offset0 = im*args.nb02 + i13*args.nb03;
+    const short    offset1 = il0/QK_NL;
+
+    device const block_iq2_xxs * xg =
+        (device const block_iq2_xxs *)(src0_gate + args.nb01*(r0 + lr0) + offset0) + offset1;
+    device const block_iq2_xxs * xu =
+        (device const block_iq2_xxs *)(src0_up + args.nb01*(r0 + lr0) + offset0) + offset1;
+
+    const short iy = 8*(tiitg % NL1);
+
+    device const float * y = (device const float *)(src1
+        + args.nb13*i13
+        + args.nb12*i12
+        + args.nb11*i11
+        + args.nb10*iy);
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+
+    simdgroup_float8x8 mc_gate[8];
+    simdgroup_float8x8 mc_up[8];
+
+    for (short i = 0; i < 8; i++) {
+        mc_gate[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+        mc_up[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        const short sx_b = (tiitg%NL1);
+        const short sy_b = (tiitg/NL1)/8;
+        const short ly_b = (tiitg/NL1)%8;
+        const short ib_b = 4*sx_b + sy_b;
+        *(threadgroup half2x4 *)(sb + 64*ib_b + 8*ly_b) =
+            (half2x4)(*((device float2x4 *) y));
+
+        half4x4 temp_gate;
+        dequantize_iq2_xxs(xg, il, temp_gate);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (tiitg/NL0)/8;
+            const short lx = (tiitg/NL0)%8;
+            const short ly = i%8;
+            const short ib = 8*sx + sy;
+            *(sa + 64*ib + 8*ly + lx) = temp_gate[i/4][i%4];
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma_gate = (sa + 4*64*(sgitg%2));
+        threadgroup const half * lsmb = (sb + 2*64*(sgitg/2));
+
+        FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma_gate + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc_gate[i], mb[i/4], ma[i%4], mc_gate[i]);
+            }
+
+            lsma_gate += 8*64;
+            lsmb += 4*64;
+        }
+
+        half4x4 temp_up;
+        dequantize_iq2_xxs(xu, il, temp_up);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (tiitg/NL0)/8;
+            const short lx = (tiitg/NL0)%8;
+            const short ly = i%8;
+            const short ib = 8*sx + sy;
+            *(sa + 64*ib + 8*ly + lx) = temp_up[i/4][i%4];
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma_up = (sa + 4*64*(sgitg%2));
+        lsmb = (sb + 2*64*(sgitg/2));
+
+        FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma_up + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc_up[i], mb[i/4], ma[i%4], mc_up[i]);
+            }
+
+            lsma_up += 8*64;
+            lsmb += 4*64;
+        }
+
+        il = (il + 2 < QK_NL) ? il + 2 : il % 2;
+        xg = (il < 2) ? xg + (2 + QK_NL - 1)/QK_NL : xg;
+        xu = (il < 2) ? xu + (2 + QK_NL - 1)/QK_NL : xu;
+        y += NK;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float * temp_gate = (threadgroup float *) shmem;
+    threadgroup float * temp_up = temp_gate + NR0*NR1;
+    threadgroup float * temp_gate_str =
+        temp_gate + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+    threadgroup float * temp_up_str =
+        temp_up + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc_gate[i], temp_gate_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        simdgroup_store(mc_up[i],   temp_up_str   + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float c = act.clamp_value;
+    for (short j = sgitg; j < nr1; j += 4) {
+        const int idj = ids_i32[im*args.ne21 + r1 + j];
+
+        const short ide = idj % args.ne20;
+        const short idt = idj / args.ne20;
+
+        device half *D = (device half *)(dst_mid +
+            ((uint64_t)idt*args.ne1 + (uint64_t)ide)*act.mid_row_stride) + r0;
+        device const float *w = (device const float *)(weights + (uint64_t)idj*act.weight_stride);
+        const float route_weight = w[0];
+
+        threadgroup float *Cg = temp_gate + j*NR0;
+        threadgroup float *Cu = temp_up   + j*NR0;
+
+        int i = tiisg;
+        for (; i < nr0; i += 32) {
+            float g = Cg[i];
+            float u = Cu[i];
+            if (c > 1.0e-6f) {
+                g = min(g, c);
+                u = clamp(u, -c, c);
+            }
+            const float silu = g / (1.0f + exp(-g));
+            D[i] = (half)(silu * u * route_weight);
         }
     }
 }

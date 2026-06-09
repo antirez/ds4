@@ -6,6 +6,8 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "ds4_ssd.h"
+
 /* Public engine boundary.
  *
  * The CLI and server should treat ds4_engine as the loaded model and
@@ -58,6 +60,9 @@ typedef struct ds4_engine ds4_engine;
 typedef struct ds4_session ds4_session;
 
 typedef void (*ds4_session_progress_fn)(void *ud, const char *event, int current, int total);
+typedef bool (*ds4_session_cancel_fn)(void *ud);
+
+#define DS4_SESSION_SYNC_INTERRUPTED 2
 
 typedef enum {
     DS4_DISTRIBUTED_NONE = 0,
@@ -91,14 +96,22 @@ typedef struct {
     const char *mtp_path;
     ds4_backend backend;
     int n_threads;
+    uint32_t prefill_chunk;
     int mtp_draft_tokens;
     float mtp_margin;
     const char *directional_steering_file;
+    const char *expert_profile_path;
     float directional_steering_attn;
     float directional_steering_ffn;
     int power_percent;
+    uint32_t ssd_streaming_cache_experts;
+    uint64_t ssd_streaming_cache_bytes;
+    uint32_t ssd_streaming_preload_experts;
+    uint64_t simulate_used_memory_bytes;
     bool warm_weights;
     bool quality;
+    bool ssd_streaming;
+    bool ssd_streaming_cold;
     bool inspect_only;
     bool load_slice;
     uint32_t load_layer_start;
@@ -154,6 +167,10 @@ ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size);
 /* Uses the active model shape selected by ds4_engine_open(); call after opening
  * the GGUF so Flash/Pro dimensions are known. */
 ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size);
+ds4_context_memory ds4_context_memory_estimate_with_prefill(
+        ds4_backend backend,
+        int ctx_size,
+        uint32_t prefill_chunk);
 bool ds4_log_is_tty(FILE *fp);
 void ds4_log(FILE *fp, ds4_log_type type, const char *fmt, ...);
 int ds4_engine_generate_argmax(ds4_engine *e, const ds4_tokens *prompt,
@@ -209,6 +226,10 @@ void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *
 /* UI-only progress. It may report fine-grained progress inside a prefill chunk;
  * callers must not treat it as a durable KV checkpoint boundary. */
 void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
+/* Optional cooperative cancellation.  ds4_session_sync() checks it only at
+ * safe boundaries where the live checkpoint is either unchanged or represents a
+ * valid token prefix, and returns DS4_SESSION_SYNC_INTERRUPTED when it stops. */
+void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud);
 void ds4_session_report_progress(ds4_session *s, const char *event, int current, int total);
 /* Distributed coordinator sessions return 1 when the full layer route is
  * available, 0 when it is still incomplete, and -1 for a local API error. */
