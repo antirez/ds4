@@ -5,65 +5,43 @@
 machines. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
 runtime: it is completely self-contained. Other than running the model in a
-correct and fast way, the project goal is to provide DS4 specific loading,
+correct and fast way, the project goal is to provide DeepSeek specific loading,
 prompt rendering, tool calling, KV state handling (RAM and on-disk), server
 API and integrated coding agent, all ready to work with coding agents or with
 the provided CLI interface. There are also tools for GGUF and imatrix generation,
 and for quality and speed testing.
 
 We support the following backends:
-* **Metal** is our primary target. Starting from MacBooks with 96GB of RAM.
-* **NVIDIA CUDA** with special care for the DGX Spark.
-* **AMD ROCm** is only supported in the [rocm](https://github.com/antirez/ds4/tree/rocm) branch. It is kept separate from main since I (antirez) don't have direct hardware access, so the community rebases the branch as needed.
+* **Metal** is our primary target. Starting from MacBooks with 96GB of RAM (or less, using SSD streaming).
+* **NVIDIA CUDA / DGX Spark**, CUDA with special care for the DGX Spark.
+* **Strix Halo (ROCm)**, systems like the Framework Desktop and other systems based on the same GPU and unified RAM design.
 
 This project would not exist without **llama.cpp and GGML**, make sure to read
 the acknowledgements section, a big thank you to Georgi Gerganov and all the
 other contributors.
 
+**Note that DeepSeek v4** is not our only target. Right now Flash and PRO are the
+perfect fit because of capabilities, size, KV cache efficiency. If tomorrow a
+better open weight model is released for the 128GB size, we could switch, the same
+for other important size classes like 512GB of RAM. The project is stictly
+opportunistic depending on what open weight models exist in a given moment.
+If a new model will be supported, the old one may be removed completely and
+no longer supported, unless there is some kind of overlap of abilities.
+
 ## Motivations
 
-Now, back at this project. Why do we believe DeepSeek V4 Flash deserves a
-standalone engine? Because after comparing it with powerful smaller dense
-models, we can report that:
-
-1. DeepSeek V4 Flash is the practical target of the project: it can run on
-   96/128GB machines while still feeling much larger than local dense models.
-2. DeepSeek V4 PRO is supported too, as a side path for 512GB Mac Studio class
-   machines. It is heavier, but it shares the same engine ideas and can be
-   useful when the hardware is available.
-3. In thinking mode, if you avoid *max thinking*, Flash produces a thinking
-   section that is a lot shorter than other models, even 1/5 of other models in
-   many cases, and crucially, the thinking section length is **proportional to
-   the problem complexity**. This makes DeepSeek V4 Flash usable with thinking
-   enabled when other models are practically impossible to use in the same
-   conditions.
-4. The models feature a context window of **1 million tokens**.
-5. Being so large, Flash knows more things if you go sampling at the edge of
-   knowledge. For instance asking about Italian show or political questions soon
-   uncovers that 284B parameters are a lot more than 27B or 35B parameters. PRO
-   pushes further when you can run it.
-6. Flash writes much better English and Italian. It *feels* a quasi-frontier
-   model. PRO is stronger still, especially for tasks such as translation.
-7. The KV cache is incredibly compressed, allowing long context inference on
-   local computers and **on disk KV cache persistence**.
-8. Both DeepSeek V4 variants work well with 2-bit quantization, if quantized in
-   a special way (read later). This allows Flash to run on MacBooks with 128GB
-   of RAM (and many people reported it working with 96GB as well, even at 250k
-   context window!), and PRO on 512GB machines.
-9. We expect DeepSeek to release **updated versions of V4 Flash and PRO** in the
-   future, even better than the current ones.
+* Very capable open weight models finally exist. DeepSeek v4 Flash feels quasi-frontier. The PRO is even better. Both resist 2 bit quantization very well.
+* Very capable computers like MacBooks, the DGX Spark now exist.
+* DeepSeek v4 kv cache design makes it pratical to run very big contexts. Other vendors are using this approach.
+* This few hundred billions models are strictly better than smaller (even if dense) models, regardless of what benchmarks say.
 
 That said, a few important things about this project:
 
 * The local inference landscape contains many excellent projects, but new models are released continuously, and the attention immediately gets captured by the next model to implement. This project takes a deliberately narrow bet: one model at a time, official-vector validation (logits obtained with the official implementation), long-context tests, and enough agent integration to know if it really works. The exact model may change as the landscape evolves, but the constraint remains: local inference credible on high end personal machines or Mac Studios, starting from 96/128GB of memory.
 * This software is developed with **strong assistance from GPT 5.5** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
-* This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache is actually a first-class disk citizen**.
-* Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. This inference engine only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is beta quality code, so probably we are not still there.
+* This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache is actually a first-class disk citizen**. Fast SSD disks also changed the inference game from the point of view of "model needs to fit RAM": while having more RAM the the model size is still preferred, SSD streaming allows to turn the available amount of RAM from a hard cutoff (can I run this model or not?) to continuous spectrum of speed levels.
+* Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. D) Purpose built agents for specific models and execution environments. DwarfStar only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is beta quality code, so probably we are not still there, especially since recently we introduced large new features: distributed inference, SSD streaming, and other minor improvements.
 * The optimized graph path targets **Metal on macOS** and **CUDA on Linux**. The CPU path is only for correctness checks and model/tokenizer diagnostics. For CPU-only Linux builds, use `make cpu`; it builds the normal `./ds4` and `./ds4-server` binaries without CUDA or Metal. On macOS, **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. It was not possible to fix the CPU inference to avoid crashing, since each time you have to restart the computer, which is not funny. Help us, if you have the guts.
-* The project supports both Flash and PRO variants, but Flash remains the main
-  focus because it is the model that makes sense on 96/128GB personal machines.
-  **PRO support is experimental**: it is useful and welcome, but today it is
-  naturally limited to people with 512GB Mac Studio class hardware.
 
 ## Acknowledgements to llama.cpp and GGML
 
@@ -199,9 +177,99 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 ![M3 Max t/s](speed-bench/m3_max_ts.svg)
 ![PRO model M3 Ultra t/s](speed-bench/pro_model_m3_ultra_ts.svg)
 
+## Running models larger than RAM
+
+The normal Metal path tries to make the model resident in GPU-addressable
+memory. This is the fastest path and should remain your default when the model
+fits. When it does not fit, DwarfStar also has a Metal-only **SSD streaming**
+capacity mode. In this mode the non-routed model weights stay resident, while
+routed MoE experts are kept in an in-memory cache and loaded from the GGUF file
+on cache misses.
+
+Streaming is not as fast as fitting the full model in RAM. It still needs memory
+for non-routed weights, KV cache, graph scratch, activations, and the routed
+expert cache. It is useful because routed experts dominate model size and modern
+Mac SSDs are fast enough to make cache misses tolerable. Long prefills can still
+be fast; generation is more sensitive to cache misses because every new token
+routes through experts again.
+
+Start with the automatic cache budget:
+
+```sh
+./ds4 -m ./ds4flash.gguf --ssd-streaming
+```
+
+If startup reports that the expert cache is too large, or if you want to reserve
+more memory for context, set the routed expert cache explicitly:
+
+```sh
+./ds4 -m ./ds4flash.gguf --ssd-streaming --ssd-streaming-cache-experts 32GB
+```
+
+The `32GB` value is a memory budget for complete routed experts, not a generic
+byte cache. DwarfStar converts it to the number of full experts that fit for the
+current GGUF. Non-routed weights, KV cache, graph scratch, and activations need
+additional memory. Only the automatic cache budget does the subtraction for you:
+it takes 80% of the Metal recommended working set, subtracts non-routed weights,
+then uses the rest for routed experts. Leave the hot expert preload enabled for
+normal use; use `--ssd-streaming-cold` and `--ssd-streaming-preload-experts N`
+only for measurements.
+
+### Practical SSD streaming examples
+
+On 64GB MacBooks, start with the 2-bit Flash GGUF and a moderate expert cache:
+
+```sh
+./download_model.sh q2-imatrix
+
+./ds4 \
+  -m ./ds4flash.gguf \
+  --ssd-streaming \
+  --ssd-streaming-cache-experts 32GB \
+  --ctx 32768 \
+  --nothink
+```
+
+On 128GB MacBooks, PRO q2 streaming is experimental but usable for inspection
+and occasional work when you accept slow generation. Start with `--nothink`:
+
+```sh
+./download_model.sh pro-q2-imatrix
+
+./ds4 \
+  -m gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf \
+  --ssd-streaming \
+  --ctx 32768 \
+  --nothink
+```
+
+On an M5 Max with 128GB of RAM, a short PRO q2 streaming decode benchmark found
+the automatic budget best: it selected about `59GB` of routed expert cache.
+Manual `64GB` to `75GB` caches were close on that machine. Larger explicit
+`NGB` requests are capped before inference so the expert buffers remain
+lockable instead of falling into macOS paging. If the system is under extra
+memory pressure and `mlock` still fails, ds4 refuses to install pageable
+expert-cache entries and releases a locked-cache margin before continuing with
+the measured lockable cache size. Prefer the automatic budget; if setting the
+cache manually on this class of machine, start around `48GB` to `64GB`, then
+increase only while the startup log reports a lockable cache. Once the machine
+is stable, re-enable thinking with a conservative generation limit:
+
+```sh
+./ds4 \
+  -m gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf \
+  --ssd-streaming \
+  --ctx 32768 \
+  --think \
+  --tokens 1500
+```
+
+The important startup line is the cache report. Start conservative, then
+increase the cache if the machine has headroom.
+
 ## Distributed Inference
 
-Distributed inference lets DS4 **run a model that is too large for one machine** by
+Distributed inference lets DwarfStar **run a model that is too large for one machine** by
 splitting transformer layers across multiple machines. The main example is the
 full 4-bit Flash quant across two 128 GB MacBooks: each process maps only its
 own layer slice, activations are sent over TCP, and the coordinator keeps normal
@@ -283,7 +351,7 @@ measured 11.47 t/s generation after startup. Per-token telemetry was balanced:
 local layers were around 39-43 ms, remote layers around 44-49 ms, for total
 token times around 84-92 ms. Expect a slow startup while each side maps and
 makes its half of the model resident. Long-context PRO Q4 prefill and decode
-slope still need separate benchmarking.
+performance still needs separate benchmarking.
 
 The measurements above use a Thunderbolt 5 cable. The implementation is plain
 TCP and also works over slower links, including WiFi, but fast Ethernet or
@@ -368,7 +436,7 @@ and bounded. `--dist-prefill-chunk N` exists for experiments, but the default
 4096-token chunk is the canonical setting and should be used unless you are
 explicitly validating a different chunk size.
 
-By default DS4 sends hidden-state activations as 32-bit floats. To reduce
+By default DwarfStar sends hidden-state activations as 32-bit floats. To reduce
 traffic, pass `--dist-activation-bits 16` or `--dist-activation-bits 8` on the
 coordinator. This changes only the transport format between machines, not the
 model weights or KV cache. 16-bit transport halves activation traffic and is the
@@ -386,7 +454,7 @@ rebuild worker KV state by replaying the prefix when the route is available
 again. Workers also validate a rolling 64-bit token-prefix hash on every work
 item, so a restarted worker at position 0 cannot silently accept work for
 position N; it reports the mismatch and the coordinator replays the current
-transcript. Ctrl+C in the CLI and agent is cooperative: DS4 waits for the
+transcript. Ctrl+C in the CLI and agent is cooperative: DwarfStar waits for the
 current distributed token or prefill chunk to drain before returning control,
 which avoids coordinator-caused KV splits. Saved agent/server sessions use the
 same KV file format as single-machine sessions: during save the coordinator
@@ -422,9 +490,9 @@ Long local inference runs can keep the GPU busy for extended periods. If you
 care more about heat, fan noise, battery life on MacBooks, or reducing thermal
 stress on the hardware than about maximum throughput, use `--power N`.
 
-`--power 100` is the default and means full speed. Lower values ask DS4 to target
+`--power 100` is the default and means full speed. Lower values ask DwarfStar to target
 that percentage of GPU usage: `--power 70` targets about 70%, `--power 50`
-targets about half usage, and so forth. DS4 does this by measuring GPU work time
+targets about half usage, and so forth. DwarfStar does this by measuring GPU work time
 and inserting small sleeps between work units: during prefill it sleeps between
 layers, and during generation it sleeps between decoded tokens. This reduces
 sustained load without changing model output.
@@ -514,8 +582,7 @@ per-layer chunk dispatch path.
 runner and should not be reported as an official GPQA, SuperGPQA, AIME, or
 security benchmark score: the questions are an embedded 92-item subset chosen
 to make local regression testing useful and visually inspectable. The program
-loads the real GGUF,
-renders DS4 chat prompts, streams sampled tokens in a split-screen TUI, grades
+loads the real GGUF, renders DeepSeek chat prompts, streams sampled tokens in a split-screen TUI, grades
 the final answer, and prints a per-question report with prompt tokens,
 generated tokens, pass/fail state, the model answer, and the correct answer.
 
@@ -615,7 +682,7 @@ No `-p` starts the interactive prompt:
 ds4>
 ```
 
-The interactive CLI is a real multi-turn DS4 chat. It keeps the rendered chat
+The interactive CLI is a real multi-turn chat. It keeps the rendered chat
 transcript and the live graph KV checkpoint, so each turn extends the previous
 conversation. Useful commands are `/help`, `/think`, `/think-max`, `/nothink`,
 `/ctx N`, `/read FILE`, and `/quit`. Ctrl+C interrupts the current generation
@@ -680,7 +747,7 @@ controls. Tool uses are returned as Anthropic `tool_use` blocks.
 
 Default sampled API generation uses `temperature=1`, `top_p=1`, and
 `min_p=0.05`, so the default filter is relative probability rather than
-nucleus mass. In thinking mode DS4 uses those fixed sampling defaults and
+nucleus mass. In thinking mode DwarfStar uses those fixed sampling defaults and
 ignores client sampling knobs, matching DeepSeek's fixed-thinking API behavior.
 
 The chat, Responses, and Anthropic endpoints support SSE streaming. In thinking
