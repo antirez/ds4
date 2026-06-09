@@ -9619,6 +9619,38 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     }
 }
 
+/* Cooperative cancel for ds4_session_sync(): stop a long prefill once the
+ * client is gone instead of finishing minutes of GPU work nobody will read.
+ * The keepalive writes in server_progress_cb() only notice a dead peer on
+ * streaming requests, and only when a write fails; probing the socket
+ * directly also covers non-streaming requests.  recv() returning zero is an
+ * orderly shutdown, a pending pipelined byte (recv() > 0) means the client is
+ * still connected and waiting for its response. */
+static bool server_prefill_cancel_cb(void *ud) {
+    server_prefill_progress *p = ud;
+    if (!p) return false;
+    if (p->stream_failed) return true;
+    if (p->fd < 0) return false;
+    char b;
+    ssize_t n = recv(p->fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n > 0) return false;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+        return false;
+    }
+    p->stream_failed = true;
+    return true;
+}
+
+static void log_prefill_disconnect_abort(const job *j, const char *ctx,
+                                         const char *flags) {
+    server_log(DS4_LOG_PREFILL,
+               "ds4-server: %s ctx=%s%s%s prefill aborted: client disconnected",
+               j->req.kind == REQ_CHAT ? "chat" : "completion",
+               ctx,
+               flags && flags[0] ? " " : "",
+               flags && flags[0] ? flags : "");
+}
+
 static void send_prefill_failure_response(server *s, const job *j,
                                           const server_prefill_progress *progress,
                                           const char *ctx, const char *flags,
@@ -10109,6 +10141,7 @@ static void generate_job(server *s, job *j) {
                req_flags);
     ds4_session_set_progress(s->session, server_progress_cb, &progress);
     ds4_session_set_display_progress(s->session, server_progress_cb, &progress);
+    ds4_session_set_cancel(s->session, server_prefill_cancel_cb, &progress);
 
     int cold_store_len = 0;
     if (cached == 0 &&
@@ -10141,13 +10174,23 @@ static void generate_job(server *s, job *j) {
     {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        if (ds4_session_sync(s->session, &prefix, err, sizeof(err)) != 0) {
+        const int cold_rc = ds4_session_sync(s->session, &prefix, err, sizeof(err));
+        if (cold_rc != 0) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(s->session, NULL, NULL);
             ds4_session_set_display_progress(s->session, NULL, NULL);
+            ds4_session_set_cancel(s->session, NULL, NULL);
             kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                                   cold_store_len);
+            if (cold_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+                /* The peer is gone: no response to send, and the disk entry is
+                 * fine, the live checkpoint stays a valid prefix for a retry. */
+                free(disk_cache_path);
+                trace_event(s, trace_id, "prefill aborted: client disconnected");
+                log_prefill_disconnect_abort(j, ctx_span, req_flags);
+                return;
+            }
             kv_cache_discard_failed_disk_entry(s, disk_cache_path);
             free(disk_cache_path);
             trace_event(s, trace_id, "prefill failed: %s", err);
@@ -10165,12 +10208,22 @@ static void generate_job(server *s, job *j) {
         ds4_tokens_free(&prefix);
     }
 
-    if (ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err)) != 0) {
+    const int sync_rc = ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err));
+    if (sync_rc != 0) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(s->session, NULL, NULL);
         ds4_session_set_display_progress(s->session, NULL, NULL);
+        ds4_session_set_cancel(s->session, NULL, NULL);
         kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                               cold_store_len);
+        if (sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+            /* The peer is gone: no response to send, and the disk entry is
+             * fine, the live checkpoint stays a valid prefix for a retry. */
+            free(disk_cache_path);
+            trace_event(s, trace_id, "prefill aborted: client disconnected");
+            log_prefill_disconnect_abort(j, ctx_span, req_flags);
+            return;
+        }
         kv_cache_discard_failed_disk_entry(s, disk_cache_path);
         free(disk_cache_path);
         trace_event(s, trace_id, "prefill failed: %s", err);
@@ -10185,6 +10238,7 @@ static void generate_job(server *s, job *j) {
     if (!thinking_live_continuation) thinking_live_clear(s);
     ds4_session_set_progress(s->session, NULL, NULL);
     ds4_session_set_display_progress(s->session, NULL, NULL);
+    ds4_session_set_cancel(s->session, NULL, NULL);
     kv_cache_maybe_store_continued(s);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
@@ -14396,6 +14450,34 @@ static void test_client_socket_nonblocking_flag(void) {
     close(sv[1]);
 }
 
+static void test_prefill_cancel_cb_detects_disconnect(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    server_prefill_progress p = { .fd = sv[0] };
+    /* Connected and idle: the prefill keeps running. */
+    TEST_ASSERT(server_prefill_cancel_cb(&p) == false);
+    /* Pipelined bytes mean the client is still there; the probe must not
+     * consume them. */
+    TEST_ASSERT(send(sv[1], "x", 1, 0) == 1);
+    TEST_ASSERT(server_prefill_cancel_cb(&p) == false);
+    char b = 0;
+    TEST_ASSERT(recv(sv[0], &b, 1, MSG_DONTWAIT) == 1 && b == 'x');
+    /* Orderly shutdown: cancel fires and marks the stream dead. */
+    close(sv[1]);
+    TEST_ASSERT(server_prefill_cancel_cb(&p) == true);
+    TEST_ASSERT(p.stream_failed == true);
+    close(sv[0]);
+
+    /* A stream that already failed cancels without touching the socket. */
+    server_prefill_progress dead = { .fd = -1, .stream_failed = true };
+    TEST_ASSERT(server_prefill_cancel_cb(&dead) == true);
+    /* No client socket never cancels. */
+    server_prefill_progress nofd = { .fd = -1 };
+    TEST_ASSERT(server_prefill_cancel_cb(&nofd) == false);
+}
+
 static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -15590,6 +15672,7 @@ static void ds4_server_unit_tests_run(void) {
     test_json_skip_has_nesting_limit();
     test_model_metadata_clamps_completion_to_context();
     test_client_socket_nonblocking_flag();
+    test_prefill_cancel_cb_detects_disconnect();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_remember_gate();
     test_tool_marker_state_ignores_orphan_end();
