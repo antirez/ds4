@@ -6738,6 +6738,25 @@ static bool agent_edit_upto_forcer_should_replace(agent_edit_upto_forcer *forcer
     return false;
 }
 
+static bool agent_edit_match_anchors(const char *data, size_t len,
+                                     const char *old, size_t head_len,
+                                     const char *tail, size_t tail_len,
+                                     const char **match, size_t *match_len,
+                                     char *err, size_t err_len) {
+    const char *head_pos = NULL;
+    const char *tail_pos = NULL;
+    if (!agent_find_unique(data, len, old, head_len, &head_pos, "old head",
+                           err, err_len))
+        return false;
+    if (!agent_find_unique_after(data, len, head_pos + head_len,
+                                 tail, tail_len, &tail_pos, "old tail",
+                                 err, err_len))
+        return false;
+    *match = head_pos;
+    *match_len = (size_t)(tail_pos - head_pos) + tail_len;
+    return true;
+}
+
 static bool agent_edit_find_old_span(const char *data, size_t len,
                                      const char *old, bool allow_upto,
                                      const char **match,
@@ -6780,19 +6799,51 @@ static bool agent_edit_find_old_span(const char *data, size_t len,
                  "old text after [upto] must include a unique tail anchor");
         return false;
     }
-    const char *head_pos = NULL;
-    const char *tail_pos = NULL;
-    if (!agent_find_unique(data, len, old, head_len, &head_pos, "old head",
-                           err, err_len))
-        return false;
-    if (!agent_find_unique_after(data, len, head_pos + head_len,
-                                 tail, tail_len, &tail_pos, "old tail",
-                                 err, err_len))
-        return false;
-    *anchored = true;
-    *match = head_pos;
-    *match_len = (size_t)(tail_pos - head_pos) + tail_len;
-    return true;
+    if (agent_edit_match_anchors(data, len, old, head_len, tail, tail_len,
+                                 match, match_len, err, err_len)) {
+        *anchored = true;
+        return true;
+    }
+    /* The model may indent [upto] like the surrounding code, or pad it with
+     * blanks before its newline.  Those blanks belong to the marker line,
+     * not to the anchors, so retry once treating the whole line as the
+     * marker: drop the head's line-trailing blanks and the blank padding
+     * after the marker.  The exact needles must run first: a forcer-injected
+     * marker can sit after partial indentation whose blanks are what makes
+     * the head unique, so edits that match today must keep matching as-is. */
+    size_t lenient_head_len = head_len;
+    while (lenient_head_len > 0 && (old[lenient_head_len - 1] == ' ' ||
+                                    old[lenient_head_len - 1] == '\t'))
+        lenient_head_len--;
+    if (lenient_head_len > 0 && old[lenient_head_len - 1] != '\n')
+        lenient_head_len = head_len; /* inline head: blanks are content */
+    const char *lenient_tail = upto + strlen(marker);
+    size_t lenient_tail_len = old_len - head_len - strlen(marker);
+    size_t pad = 0;
+    while (pad < lenient_tail_len && (lenient_tail[pad] == ' ' ||
+                                      lenient_tail[pad] == '\t'))
+        pad++;
+    if (pad < lenient_tail_len && (lenient_tail[pad] == '\n' ||
+                                   lenient_tail[pad] == '\r')) {
+        lenient_tail += pad;
+        lenient_tail_len -= pad;
+    }
+    while (lenient_tail_len > 0 &&
+           (*lenient_tail == '\n' || *lenient_tail == '\r')) {
+        lenient_tail++;
+        lenient_tail_len--;
+    }
+    if (lenient_head_len == head_len && lenient_tail == tail)
+        return false; /* nothing to relax: keep the exact-match error */
+    char lenient_err[256];
+    if (agent_edit_match_anchors(data, len, old, lenient_head_len,
+                                 lenient_tail, lenient_tail_len,
+                                 match, match_len,
+                                 lenient_err, sizeof(lenient_err))) {
+        *anchored = true;
+        return true;
+    }
+    return false; /* report the exact-match error */
 }
 
 #ifdef DS4_AGENT_TEST
