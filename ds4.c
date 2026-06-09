@@ -20157,11 +20157,14 @@ static bool metal_graph_verify_suffix_tops(
                                        g->spec_logits,
                                        DS4_N_VOCAB) != 0;
         } else if (top_rows) {
+            /* top-1 of each of the top_rows rows: n_tokens=top_rows, top_k=1.
+             * The order is transposed vs the indexer-score callers; a swap
+             * silently scores row 0's runner-ups instead of each row. */
             ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
                                                g->spec_logits,
                                                DS4_N_VOCAB,
-                                               1,
-                                               top_rows) != 0;
+                                               top_rows,
+                                               1) != 0;
         }
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;

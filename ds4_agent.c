@@ -145,6 +145,7 @@ typedef struct {
     bool more_valid;
     agent_bash_job *bash_jobs;
     int next_bash_job_id;
+    bool raw_mode_needs_restore;
 } agent_worker;
 
 static unsigned agent_next_prefill_label(void);
@@ -6101,6 +6102,15 @@ static bool agent_edit_find_old_span(const char *data, size_t len,
     size_t head_len = (size_t)(upto - old);
     const char *tail = upto + strlen(marker);
     size_t tail_len = old_len - head_len - strlen(marker);
+    /* Strip leading newline/CR from tail before searching.  The head already
+     * includes the newline at its end, so the extra \n that follows [upto] in
+     * the old text (whether injected by the forcer or written by the model)
+     * must not be part of the tail needle -- the file after the head has no
+     * duplicate newline. */
+    while (tail_len > 0 && (*tail == '\n' || *tail == '\r')) {
+        tail++;
+        tail_len--;
+    }
     if (!agent_span_has_nonspace(tail, tail_len)) {
         snprintf(err, err_len,
                  "old text after [upto] must include a unique tail anchor");
@@ -6586,6 +6596,7 @@ struct agent_bash_job {
     bool running;
     bool timed_out;
     struct agent_bash_job *next;
+    agent_worker *worker;  /* back-pointer for terminal state restoration */
 };
 
 static int agent_bash_display_lines(const agent_bash_job *job) {
@@ -6660,6 +6671,13 @@ static void agent_bash_drain(agent_bash_job *job) {
     }
 }
 
+static void agent_worker_note_terminal_mode_may_have_changed(agent_worker *w) {
+    if (!w) return;
+    pthread_mutex_lock(&w->mu);
+    w->raw_mode_needs_restore = true;
+    pthread_mutex_unlock(&w->mu);
+}
+
 static void agent_bash_finalize(agent_bash_job *job, int status) {
     agent_bash_drain(job);
     if (job->pipe_fd >= 0) {
@@ -6674,6 +6692,10 @@ static void agent_bash_finalize(agent_bash_job *job, int status) {
     else if (WIFSIGNALED(status)) job->exit_status = 128 + WTERMSIG(status);
     else job->exit_status = -1;
     job->running = false;
+    /* A child can still open /dev/tty directly and alter terminal state even
+     * though its stdin is /dev/null.  Ask the UI thread to verify raw mode at
+     * a safe point instead of touching linenoise from the worker path. */
+    agent_worker_note_terminal_mode_may_have_changed(job->worker);
 }
 
 /* Drain available output, notice process exit, and enforce timeout.  This is
@@ -6700,6 +6722,7 @@ static void agent_bash_poll(agent_bash_job *job) {
             close(job->tmp_fd);
             job->tmp_fd = -1;
         }
+        agent_worker_note_terminal_mode_may_have_changed(job->worker);
         return;
     }
     if (now_sec() - job->start_time >= job->timeout_sec) {
@@ -6741,6 +6764,18 @@ static agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
     if (pid == 0) {
         setpgid(0, 0);
         close(tmpfd);
+        /* The bash tool is not interactive.  Give the shell /dev/null as
+         * stdin so it does not inherit the live linenoise terminal and reset
+         * it from raw mode to cooked mode behind the agent's back. */
+        int null_fd = open("/dev/null", O_RDONLY);
+        if (null_fd >= 0) {
+            if (dup2(null_fd, STDIN_FILENO) < 0)
+                close(STDIN_FILENO);
+            if (null_fd != STDIN_FILENO)
+                close(null_fd);
+        } else {
+            close(STDIN_FILENO);
+        }
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
         dup2(pipefd[1], STDERR_FILENO);
@@ -6767,6 +6802,7 @@ static agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
     job->timeout_sec = timeout_sec;
     job->exit_status = -1;
     job->running = true;
+    job->worker = w;
     job->next = w->bash_jobs;
     w->bash_jobs = job;
     return job;
@@ -8028,6 +8064,19 @@ static int set_nonblock(int fd, bool on, int *old_flags) {
     if (old_flags) *old_flags = flags;
     int next = on ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
     return fcntl(fd, F_SETFL, next);
+}
+
+/* Check and clear the raw_mode_needs_restore flag under the worker mutex.
+ * Returns true if the UI thread should verify/reapply linenoise raw mode. */
+static bool worker_check_raw_mode_restore(agent_worker *w) {
+    bool needs = false;
+    pthread_mutex_lock(&w->mu);
+    if (w->raw_mode_needs_restore) {
+        w->raw_mode_needs_restore = false;
+        needs = true;
+    }
+    pthread_mutex_unlock(&w->mu);
+    return needs;
 }
 
 static void drain_wake_fd(int fd) {
@@ -9431,7 +9480,17 @@ static bool agent_prompt_yes_no_ex(const char *prompt,
             }
             if (rc < 0) return false;
         }
-        if (!fgets(buf, sizeof(buf), stdin)) return false;
+        /* stdin may be in non-blocking mode (set by editor_start).
+         * Temporarily switch to blocking so fgets can wait for input. */
+        int saved_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+        if (saved_flags >= 0 && (saved_flags & O_NONBLOCK)) {
+            fcntl(STDIN_FILENO, F_SETFL, saved_flags & ~O_NONBLOCK);
+        }
+        bool got_line = fgets(buf, sizeof(buf), stdin) != NULL;
+        if (saved_flags >= 0 && (saved_flags & O_NONBLOCK)) {
+            fcntl(STDIN_FILENO, F_SETFL, saved_flags);
+        }
+        if (!got_line) return false;
         char *p = buf;
         while (*p == ' ' || *p == '\t') p++;
         if (*p == 'y' || *p == 'Y') return true;
@@ -9704,6 +9763,11 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     bool force_status_redraw_after_restart = false;
     char *restore_line = NULL;
     while (running) {
+        /* If a bash child process changed the terminal mode (e.g., from raw
+         * to cooked), restore raw mode so linenoise continues to work. */
+        if (worker_check_raw_mode_restore(&worker)) {
+            linenoiseRestoreRawMode();
+        }
         struct pollfd pfd[2] = {
             {.fd = STDIN_FILENO, .events = POLLIN},
             {.fd = worker.wake_fd[0], .events = POLLIN},
@@ -9924,6 +9988,10 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                 } else if (cmd[0] == '/' && busy) {
                     printf("command requires the model to be idle: %s\n", cmd);
                 } else if (!strcmp(cmd, "/quit") || !strcmp(cmd, "/exit")) {
+                    /* Stop the editor so raw mode and non-blocking stdin are
+                     * disabled before we prompt the user.  Then restore the
+                     * ANSI scroll region too; AGENT_EXIT_NOW exits directly. */
+                    editor_stop(&editor);
                     editor_restore_terminal_layout(&editor);
                     agent_exit_save_result exit_save =
                         agent_maybe_save_before_exiting(&worker);
@@ -9932,6 +10000,10 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     } else if (exit_save == AGENT_EXIT_CLEAN) {
                         exit_save_handled = true;
                         running = false;
+                    } else {
+                        /* AGENT_EXIT_CANCEL: user declined to proceed after a
+                         * save failure.  Reopen the editor and continue. */
+                        editor_start(&editor, prompt, statusline, NULL);
                     }
                 } else if (!strcmp(cmd, "/new")) {
                     editor_restore_terminal_layout(&editor);
