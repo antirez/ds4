@@ -7708,6 +7708,7 @@ struct server {
     visible_live_state thinking_live;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
+    volatile bool model_ready;
     pthread_mutex_t tool_mu;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -11249,6 +11250,16 @@ static void *client_main(void *arg) {
         goto done;
     }
 
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/health")) {
+        if (s->model_ready) {
+            http_response(fd, s->enable_cors, 200, "text/plain", "ok");
+        } else {
+            http_error(fd, s->enable_cors, 503, "model not yet loaded");
+        }
+        http_request_free(&hr);
+        goto done;
+    }
+
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
         http_request_free(&hr);
@@ -11727,6 +11738,7 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.model_ready = true;
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
