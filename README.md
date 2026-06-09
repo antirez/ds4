@@ -12,9 +12,9 @@ the provided CLI interface. There are also tools for GGUF and imatrix generation
 and for quality and speed testing.
 
 We support the following backends:
-* **Metal** is our primary target. Starting from MacBooks with 96GB of RAM.
-* **NVIDIA CUDA** with special care for the DGX Spark.
-* **AMD ROCm** is only supported in the [rocm](https://github.com/antirez/ds4/tree/rocm) branch. It is kept separate from main since I (antirez) don't have direct hardware access, so the community rebases the branch as needed.
+* **Metal** is our primary target. Starting from MacBooks with 96GB of RAM (or less, using SSD streaming).
+* **NVIDIA CUDA / DGX Spark**, CUDA with special care for the DGX Spark.
+* **Strix Halo (ROCm)**, systems like the Framework Desktop and other systems based on the same GPU and unified RAM design.
 
 This project would not exist without **llama.cpp and GGML**, make sure to read
 the acknowledgements section, a big thank you to Georgi Gerganov and all the
@@ -181,50 +181,43 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 
 The normal Metal path tries to make the model resident in GPU-addressable
 memory. This is the fastest path and should remain your default when the model
-fits. When it does not fit, DwarfStar also has an **SSD streaming** path for Metal:
-the non-routed parts of the model are mapped normally, while routed MoE experts
-are kept in an explicit in-memory cache and loaded from the GGUF file when the
-router selects an expert that is not resident. Streaming is only about those
-routed expert weights: the KV cache, shared experts, projections, embeddings,
-routers, output head, graph scratch, and other non-routed model parts still
-need memory.
+fits. When it does not fit, DwarfStar also has a Metal-only **SSD streaming**
+capacity mode. In this mode the non-routed model weights stay resident, while
+routed MoE experts are kept in an in-memory cache and loaded from the GGUF file
+on cache misses.
 
-This is not a silver bullet: it is not as fast as fitting the whole model in RAM. It
-is a capacity mode that becomes useful because modern MacBook SSDs are fast and
-because the routed experts dominate the model size. Long prefills can still be
-quite fast, because DwarfStar processes many tokens per layer. Generation is harder:
-every new token routes to a few experts in every layer, and cache misses have
-to touch the SSD. For interactive use, the size and quality of the expert cache
-matter more than anything else.
+Streaming is not as fast as fitting the full model in RAM. It still needs memory
+for non-routed weights, KV cache, graph scratch, activations, and the routed
+expert cache. It is useful because routed experts dominate model size and modern
+Mac SSDs are fast enough to make cache misses tolerable. Long prefills can still
+be fast; generation is more sensitive to cache misses because every new token
+routes through experts again.
 
-Enable it with:
+Start with the automatic cache budget:
 
 ```sh
 ./ds4 -m ./ds4flash.gguf --ssd-streaming
 ```
 
-In streaming mode DwarfStar prints the routed expert cache budget at startup. You can
-leave the budget automatic, or set it explicitly in GiB:
+If startup reports that the expert cache is too large, or if you want to reserve
+more memory for context, set the routed expert cache explicitly:
 
 ```sh
 ./ds4 -m ./ds4flash.gguf --ssd-streaming --ssd-streaming-cache-experts 32GB
 ```
 
-The `32GB` value is not a generic byte cache. DwarfStar computes how many full routed
-experts fit in that much memory for the current GGUF, counting gate, up, and
-down together. For example, with the Flash IQ2/Q2 GGUF, `32GB` is about 4854
-routed experts.
+The `32GB` value is a memory budget for complete routed experts, not a generic
+byte cache. DwarfStar converts it to the number of full experts that fit for the
+current GGUF. Non-routed weights, KV cache, graph scratch, and activations need
+additional memory. Only the automatic cache budget does the subtraction for you:
+it takes 80% of the Metal recommended working set, subtracts non-routed weights,
+then uses the rest for routed experts. Leave the hot expert preload enabled for
+normal use; use `--ssd-streaming-cold` and `--ssd-streaming-preload-experts N`
+only for measurements.
 
-By default DwarfStar also preloads a popularity-based hot expert seed. Do not disable
-this for normal use. `--ssd-streaming-cold` is useful for measuring worst-case
-cold behavior, but it gives a worse first interaction. Auto hot preload is
-capped at 4096 experts by default to avoid spending too long at startup; use
-`--ssd-streaming-preload-experts N` only when you explicitly want to test a
-larger upfront preload.
+### Practical SSD streaming examples
 
-### Flash on 64GB MacBooks
-
-The practical 64GB target is the 2-bit Flash GGUF:
+On 64GB MacBooks, start with the 2-bit Flash GGUF and a moderate expert cache:
 
 ```sh
 ./download_model.sh q2-imatrix
@@ -237,49 +230,12 @@ The practical 64GB target is the 2-bit Flash GGUF:
   --nothink
 ```
 
-This is the configuration to try first on 64GB MacBooks. On a 128GB MacBook
-with 64GB artificially locked away, the same command mapped the `32GB` cache to
-4854 routed experts. With `README.md` as a 14318-token prompt it measured about
-300 t/s prefill. Short prompts are much slower because fixed per-layer work
-dominates, but the default streaming prefill dispatcher now uses three paths to
-keep them usable: token-by-token decode-style prefill for tiny prompts,
-selected-expert batched prefill for medium prompts, and full layer-major
-prefill for long prompts.
-
-For a server:
-
-```sh
-./ds4-server \
-  -m ./ds4flash.gguf \
-  --ssd-streaming \
-  --ssd-streaming-cache-experts 32GB \
-  --ctx 100000 \
-  --kv-disk-dir /tmp/ds4-kv \
-  --kv-disk-space-mb 8192
-```
-
-Use a context that leaves room for the OS, the expert cache, activations, the
-non-routed weights, and the compressed KV cache. If the startup warning says
-the expert cache is too large to lock, reduce it, for example to `24GB` or
-`16GB`.
-
-### PRO on 128GB MacBooks
-
-PRO q2 streaming is an experimental capacity mode. It lets you inspect and use
-the PRO model on a 128GB MacBook, but it is naturally much slower than running
-PRO on a 512GB Mac Studio where the model fits. Use it when you want PRO's
-quality and accept a few tokens per second generation, not when you need a
-fast everyday assistant.
-
-Download the PRO q2 imatrix GGUF:
+On 128GB MacBooks, PRO q2 streaming is experimental but usable for inspection
+and occasional work when you accept slow generation. Start with `--nothink`:
 
 ```sh
 ./download_model.sh pro-q2-imatrix
-```
 
-Then start with the automatic cache budget:
-
-```sh
 ./ds4 \
   -m gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf \
   --ssd-streaming \
@@ -287,39 +243,29 @@ Then start with the automatic cache budget:
   --nothink
 ```
 
-If startup reports that the requested expert cache is too large, set it
-manually. On 128GB systems, useful values to try are usually in the `32GB` to
-`64GB` range:
+On an M5 Max with 128GB of RAM, a short PRO q2 streaming decode benchmark found
+the automatic budget best: it selected about `59GB` of routed expert cache.
+Manual `64GB` to `75GB` caches were close on that machine. Larger explicit
+`NGB` requests are capped before inference so the expert buffers remain
+lockable instead of falling into macOS paging. If the system is under extra
+memory pressure and `mlock` still fails, ds4 refuses to install pageable
+expert-cache entries and releases a locked-cache margin before continuing with
+the measured lockable cache size. Prefer the automatic budget; if setting the
+cache manually on this class of machine, start around `48GB` to `64GB`, then
+increase only while the startup log reports a lockable cache. Once the machine
+is stable, re-enable thinking with a conservative generation limit:
 
 ```sh
 ./ds4 \
   -m gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf \
   --ssd-streaming \
-  --ssd-streaming-cache-experts 48GB \
-  --ctx 32768 \
-  --nothink
-```
-
-For first tests, use `--nothink`: PRO with thinking enabled can spend a long
-time thinking, and streaming makes every generated token more expensive. Once
-you know the machine is stable, re-enable normal thinking with a conservative
-generation limit:
-
-```sh
-./ds4 \
-  -m gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf \
-  --ssd-streaming \
-  --ssd-streaming-cache-experts 48GB \
   --ctx 32768 \
   --think \
   --tokens 1500
 ```
 
-The important startup line is the cache report. If the cache is too small,
-generation will miss too often and will feel dominated by SSD reads. If the
-cache is too large, macOS may refuse to lock it or the system may become
-unresponsive. Start conservative, then increase the cache if the machine has
-headroom.
+The important startup line is the cache report. Start conservative, then
+increase the cache if the machine has headroom.
 
 ## Distributed Inference
 
