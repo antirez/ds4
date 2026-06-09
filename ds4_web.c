@@ -47,12 +47,15 @@ struct ds4_web {
     void *confirm_privdata;
     ds4_web_log_fn log;
     void *log_privdata;
+    ds4_web_cancel_fn cancel;
+    void *cancel_privdata;
     int next_cdp_id;
 };
 
 typedef struct {
     int fd;
     int next_id;
+    ds4_web *web;
 } cdp_ws;
 
 typedef struct {
@@ -117,6 +120,37 @@ static void web_set_err(char *err, size_t err_len, const char *fmt, ...) {
 
 static void web_log(ds4_web *web, const char *msg) {
     if (web && web->log) web->log(web->log_privdata, msg);
+}
+
+static double web_now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
+
+static bool web_cancelled(ds4_web *web) {
+    return web && web->cancel && web->cancel(web->cancel_privdata);
+}
+
+static bool web_set_cancel_err(ds4_web *web, char *err, size_t err_len) {
+    if (!web_cancelled(web)) return false;
+    web_set_err(err, err_len, "interrupted");
+    return true;
+}
+
+static bool web_sleep_ms(ds4_web *web, int ms) {
+    int left = ms;
+    while (left > 0) {
+        if (web_cancelled(web)) return false;
+        int step = left < 50 ? left : 50;
+        usleep((useconds_t)step * 1000u);
+        left -= step;
+    }
+    return !web_cancelled(web);
+}
+
+static bool web_err_is_interrupted(const char *err) {
+    return err && !strcmp(err, "interrupted");
 }
 
 static bool web_mkdir_p(const char *path) {
@@ -401,14 +435,31 @@ static int web_ws_connect(const char *ws_url, cdp_ws *ws,
 
     web_buf resp = {0};
     char tmp[1024];
+    double deadline = web_now_sec() + (double)DS4_WEB_CONNECT_TIMEOUT_MS / 1000.0;
     while (!strstr(resp.ptr ? resp.ptr : "", "\r\n\r\n")) {
-        ssize_t n = web_read_some(fd, tmp, sizeof(tmp), DS4_WEB_CONNECT_TIMEOUT_MS);
-        if (n <= 0) {
+        if (web_set_cancel_err(ws ? ws->web : NULL, err, err_len)) {
+            close(fd);
+            free(resp.ptr);
+            return -1;
+        }
+        double now = web_now_sec();
+        if (now >= deadline) {
             web_set_err(err, err_len, "websocket handshake read failed");
             close(fd);
             free(resp.ptr);
             return -1;
         }
+        int slice = 100;
+        int remaining = (int)((deadline - now) * 1000.0);
+        if (remaining < slice) slice = remaining > 0 ? remaining : 1;
+        ssize_t n = web_read_some(fd, tmp, sizeof(tmp), slice);
+        if (n < 0) {
+            web_set_err(err, err_len, "websocket handshake read failed");
+            close(fd);
+            free(resp.ptr);
+            return -1;
+        }
+        if (n == 0) continue;
         web_buf_append(&resp, tmp, (size_t)n);
         if (resp.len > 8192) break;
     }
@@ -431,11 +482,26 @@ static void web_ws_close(cdp_ws *ws) {
     }
 }
 
-static int web_read_exact(int fd, unsigned char *buf, size_t len, int timeout_ms) {
+static int web_read_exact(cdp_ws *ws, unsigned char *buf, size_t len,
+                          int timeout_ms, char *err, size_t err_len) {
     size_t off = 0;
+    double deadline = web_now_sec() + (double)timeout_ms / 1000.0;
     while (off < len) {
-        ssize_t n = web_read_some(fd, (char *)buf + off, len - off, timeout_ms);
-        if (n <= 0) return -1;
+        if (web_set_cancel_err(ws ? ws->web : NULL, err, err_len)) return -1;
+        double now = web_now_sec();
+        if (now >= deadline) {
+            web_set_err(err, err_len, "websocket read timeout");
+            return -1;
+        }
+        int slice = 100;
+        int remaining = (int)((deadline - now) * 1000.0);
+        if (remaining < slice) slice = remaining > 0 ? remaining : 1;
+        ssize_t n = web_read_some(ws->fd, (char *)buf + off, len - off, slice);
+        if (n < 0) {
+            web_set_err(err, err_len, "websocket frame read failed");
+            return -1;
+        }
+        if (n == 0) continue;
         off += (size_t)n;
     }
     return 0;
@@ -491,8 +557,7 @@ static char *web_ws_read_message(cdp_ws *ws, char *err, size_t err_len) {
     web_buf msg = {0};
     for (;;) {
         unsigned char h[2];
-        if (web_read_exact(ws->fd, h, 2, DS4_WEB_CDP_TIMEOUT_MS) != 0) {
-            web_set_err(err, err_len, "websocket read timeout");
+        if (web_read_exact(ws, h, 2, DS4_WEB_CDP_TIMEOUT_MS, err, err_len) != 0) {
             free(msg.ptr);
             return NULL;
         }
@@ -502,16 +567,16 @@ static char *web_ws_read_message(cdp_ws *ws, char *err, size_t err_len) {
         uint64_t len = h[1] & 0x7f;
         if (len == 126) {
             unsigned char x[2];
-            if (web_read_exact(ws->fd, x, 2, DS4_WEB_CDP_TIMEOUT_MS) != 0) goto fail;
+            if (web_read_exact(ws, x, 2, DS4_WEB_CDP_TIMEOUT_MS, err, err_len) != 0) goto fail;
             len = ((uint64_t)x[0] << 8) | x[1];
         } else if (len == 127) {
             unsigned char x[8];
-            if (web_read_exact(ws->fd, x, 8, DS4_WEB_CDP_TIMEOUT_MS) != 0) goto fail;
+            if (web_read_exact(ws, x, 8, DS4_WEB_CDP_TIMEOUT_MS, err, err_len) != 0) goto fail;
             len = 0;
             for (int i = 0; i < 8; i++) len = (len << 8) | x[i];
         }
         unsigned char mask[4] = {0};
-        if (masked && web_read_exact(ws->fd, mask, 4, DS4_WEB_CDP_TIMEOUT_MS) != 0)
+        if (masked && web_read_exact(ws, mask, 4, DS4_WEB_CDP_TIMEOUT_MS, err, err_len) != 0)
             goto fail;
         if (len > DS4_WEB_MAX_RESULT_BYTES * 4ULL) {
             web_set_err(err, err_len, "websocket message too large");
@@ -519,8 +584,8 @@ static char *web_ws_read_message(cdp_ws *ws, char *err, size_t err_len) {
             return NULL;
         }
         unsigned char *payload = web_xmalloc((size_t)len + 1);
-        if (len && web_read_exact(ws->fd, payload, (size_t)len,
-                                  DS4_WEB_CDP_TIMEOUT_MS) != 0) {
+        if (len && web_read_exact(ws, payload, (size_t)len,
+                                  DS4_WEB_CDP_TIMEOUT_MS, err, err_len) != 0) {
             free(payload);
             goto fail;
         }
@@ -544,7 +609,7 @@ static char *web_ws_read_message(cdp_ws *ws, char *err, size_t err_len) {
         }
     }
 fail:
-    web_set_err(err, err_len, "websocket frame read failed");
+    if (err && err_len && !err[0]) web_set_err(err, err_len, "websocket frame read failed");
     free(msg.ptr);
     return NULL;
 }
@@ -561,6 +626,7 @@ static bool web_json_id_matches(const char *json, int id) {
 
 static char *web_cdp_call(cdp_ws *ws, const char *method, const char *params,
                           char *err, size_t err_len) {
+    if (web_set_cancel_err(ws ? ws->web : NULL, err, err_len)) return NULL;
     int id = ws->next_id++;
     web_buf req = {0};
     char head[256];
@@ -581,6 +647,7 @@ static char *web_cdp_call(cdp_ws *ws, const char *method, const char *params,
     }
     free(wire);
     for (;;) {
+        if (web_set_cancel_err(ws ? ws->web : NULL, err, err_len)) return NULL;
         char *msg = web_ws_read_message(ws, err, err_len);
         if (!msg) return NULL;
         if (web_json_id_matches(msg, id)) return msg;
@@ -720,14 +787,19 @@ static char *web_cdp_eval_string(cdp_ws *ws, const char *expr,
 static bool web_wait_ready(cdp_ws *ws, char *err, size_t err_len) {
     const char *expr = "document.readyState";
     for (int i = 0; i < 80; i++) {
+        if (web_set_cancel_err(ws ? ws->web : NULL, err, err_len)) return false;
         char *state = web_cdp_eval_string(ws, expr, err, err_len);
         if (state && (!strcmp(state, "complete") || !strcmp(state, "interactive"))) {
             free(state);
-            usleep(800000);
-            return true;
+            if (web_sleep_ms(ws ? ws->web : NULL, 800)) return true;
+            web_set_err(err, err_len, "interrupted");
+            return false;
         }
         free(state);
-        usleep(250000);
+        if (!web_sleep_ms(ws ? ws->web : NULL, 250)) {
+            web_set_err(err, err_len, "interrupted");
+            return false;
+        }
     }
     return true;
 }
@@ -780,6 +852,7 @@ static bool web_wait_navigated_ready(cdp_ws *ws, const char *url,
     bool saw_real_url = false;
 
     for (int i = 0; i < 100; i++) {
+        if (web_set_cancel_err(ws ? ws->web : NULL, err, err_len)) return false;
         char *href = NULL;
         char *ready = NULL;
         long text_len = 0;
@@ -787,7 +860,10 @@ static bool web_wait_navigated_ready(cdp_ws *ws, const char *url,
         if (!ok) {
             free(href);
             free(ready);
-            usleep(250000);
+            if (!web_sleep_ms(ws ? ws->web : NULL, 250)) {
+                web_set_err(err, err_len, "interrupted");
+                return false;
+            }
             continue;
         }
 
@@ -805,11 +881,15 @@ static bool web_wait_navigated_ready(cdp_ws *ws, const char *url,
         free(ready);
 
         if (saw_real_url && ready_state && text_len > 0 && stable >= 2) {
-            usleep(500000);
-            return true;
+            if (web_sleep_ms(ws ? ws->web : NULL, 500)) return true;
+            web_set_err(err, err_len, "interrupted");
+            return false;
         }
         if (saw_real_url && ready_state && i >= 24) return true;
-        usleep(250000);
+        if (!web_sleep_ms(ws ? ws->web : NULL, 250)) {
+            web_set_err(err, err_len, "interrupted");
+            return false;
+        }
     }
     return true;
 }
@@ -828,7 +908,7 @@ static bool web_cdp_prepare_page(cdp_ws *ws, char *err, size_t err_len) {
     return web_wait_ready(ws, err, err_len);
 }
 
-static void web_scroll_dynamic_page(cdp_ws *ws) {
+static bool web_scroll_dynamic_page(cdp_ws *ws, char *err, size_t err_len) {
     const char *expr =
         "(() => new Promise(resolve => {"
         "const root=()=>document.scrollingElement||document.documentElement||document.body;"
@@ -867,9 +947,17 @@ static void web_scroll_dynamic_page(cdp_ws *ws) {
         "tick();},900);"
         "};tick();"
         "}))()";
-    char err[160] = {0};
-    char *res = web_cdp_eval_string(ws, expr, err, sizeof(err));
+    if (web_set_cancel_err(ws ? ws->web : NULL, err, err_len)) return false;
+
+    char local_err[160] = {0};
+    char *res = web_cdp_eval_string(ws, expr, local_err, sizeof(local_err));
+    if (!res && web_err_is_interrupted(local_err)) {
+        web_set_err(err, err_len, "interrupted");
+        return false;
+    }
     free(res);
+    if (web_set_cancel_err(ws ? ws->web : NULL, err, err_len)) return false;
+    return true;
 }
 
 static char *web_chrome_executable(void) {
@@ -992,6 +1080,7 @@ static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
     free(exe);
     web->chrome_pid = pid;
     for (int i = 0; i < 80; i++) {
+        if (web_set_cancel_err(web, err, err_len)) return false;
         if (web_cdp_alive(web)) {
             web_log(web, "Chrome browser session is ready");
             return true;
@@ -1004,7 +1093,10 @@ static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
             web_set_err(err, err_len, "Chrome exited before CDP became ready");
             return false;
         }
-        usleep(250000);
+        if (!web_sleep_ms(web, 250)) {
+            web_set_err(err, err_len, "interrupted");
+            return false;
+        }
     }
     web_set_err(err, err_len, "Chrome did not expose CDP on port %d", web->port);
     return false;
@@ -1058,7 +1150,7 @@ static bool web_open_tab(ds4_web *web, const char *url, web_tab *tab,
 
     char *browser_url = web_browser_ws_url(web, err, err_len);
     if (!browser_url) return false;
-    cdp_ws browser = {.fd = -1};
+    cdp_ws browser = {.fd = -1, .web = web};
     if (web_ws_connect(browser_url, &browser, err, err_len) != 0) {
         free(browser_url);
         return false;
@@ -1172,7 +1264,7 @@ static char *web_run_page_js(ds4_web *web, const char *url, const char *js,
     if (!web_ensure_browser(web, err, err_len)) return NULL;
     web_tab tab = {0};
     if (!web_open_tab(web, "about:blank", &tab, err, err_len)) return NULL;
-    cdp_ws ws = {.fd = -1};
+    cdp_ws ws = {.fd = -1, .web = web};
     if (web_ws_connect(tab.ws_url, &ws, err, err_len) != 0) {
         web_close_tab(web, &tab);
         web_tab_free(&tab);
@@ -1195,11 +1287,33 @@ static char *web_run_page_js(ds4_web *web, const char *url, const char *js,
     char *clicked = web_cdp_eval_string(&ws, web_click_google_consent_js, err, err_len);
     if (clicked && clicked[0]) {
         web_log(web, clicked);
-        usleep(1500000);
-        (void)web_wait_navigated_ready(&ws, url, err, err_len);
+        if (!web_sleep_ms(web, 1500)) {
+            free(clicked);
+            web_set_err(err, err_len, "interrupted");
+            web_ws_close(&ws);
+            web_close_tab(web, &tab);
+            web_tab_free(&tab);
+            return NULL;
+        }
+        char wait_err[160] = {0};
+        if (!web_wait_navigated_ready(&ws, url, wait_err, sizeof(wait_err)) &&
+            web_err_is_interrupted(wait_err))
+        {
+            free(clicked);
+            web_set_err(err, err_len, "interrupted");
+            web_ws_close(&ws);
+            web_close_tab(web, &tab);
+            web_tab_free(&tab);
+            return NULL;
+        }
     }
     free(clicked);
-    if (dynamic_scroll) web_scroll_dynamic_page(&ws);
+    if (dynamic_scroll && !web_scroll_dynamic_page(&ws, err, err_len)) {
+        web_ws_close(&ws);
+        web_close_tab(web, &tab);
+        web_tab_free(&tab);
+        return NULL;
+    }
     char *out = web_cdp_eval_string(&ws, js, err, err_len);
     web_ws_close(&ws);
     web_close_tab(web, &tab);
@@ -1223,6 +1337,8 @@ ds4_web *ds4_web_create(const ds4_web_config *cfg) {
         web->confirm_privdata = cfg->confirm_privdata;
         web->log = cfg->log;
         web->log_privdata = cfg->log_privdata;
+        web->cancel = cfg->cancel;
+        web->cancel_privdata = cfg->cancel_privdata;
     }
     return web;
 }
