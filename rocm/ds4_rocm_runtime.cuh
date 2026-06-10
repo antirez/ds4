@@ -207,12 +207,14 @@ static int cuda_model_image_find(const void *model_map) {
 }
 
 static const char *cuda_model_image_ptr(const void *model_map, uint64_t offset) {
-    const int idx = cuda_model_image_find(model_map);
-    if (idx < 0) return NULL;
-    const cuda_model_image &img = g_model_images[(size_t)idx];
-    if (offset < img.device_offset) return NULL;
-    if (offset - img.device_offset >= img.size) return NULL;
-    return img.device_ptr + (offset - img.device_offset);
+    for (size_t i = 0; i < g_model_images.size(); i++) {
+        const cuda_model_image &img = g_model_images[i];
+        if (img.host_base != model_map) continue;
+        if (offset < img.device_offset) continue;
+        if (offset - img.device_offset >= img.size) continue;
+        return img.device_ptr + (offset - img.device_offset);
+    }
+    return NULL;
 }
 
 static int cuda_model_image_owned(const void *model_map) {
@@ -1048,13 +1050,29 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
     if (err != cudaSuccess) {
-        fprintf(stderr, DS4_GPU_LOG_PREFIX "model arena alloc failed for %s (%.2f MiB chunk): %s\n",
-                what ? what : "weights",
-                (double)chunk / 1048576.0,
-                cudaGetErrorString(err));
         (void)cudaGetLastError();
-        g_model_cache_full = 1;
-        return NULL;
+        uint64_t fallback = chunk / 2u;
+        while (fallback >= aligned) {
+            err = cudaMalloc(&dev, (size_t)fallback);
+            if (err == cudaSuccess) break;
+            (void)cudaGetLastError();
+            fallback /= 2u;
+        }
+        if (err != cudaSuccess) {
+            err = cudaMalloc(&dev, (size_t)aligned);
+            if (err != cudaSuccess) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX "model arena alloc failed for %s (%.2f MiB): %s\n",
+                        what ? what : "weights",
+                        (double)aligned / 1048576.0,
+                        cudaGetErrorString(err));
+                (void)cudaGetLastError();
+                g_model_cache_full = 1;
+                return NULL;
+            }
+            fallback = aligned;
+        }
+        g_model_arenas.push_back({(char *)dev, fallback, aligned});
+        return (char *)dev;
     }
     g_model_arenas.push_back({(char *)dev, chunk, aligned});
     return (char *)dev;
@@ -1146,15 +1164,6 @@ static const char *cuda_model_range_ptr_from_fd(
 static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
     if (!model_map || model_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
     if (map_size == 0) return 0;
-    if (cuda_model_image_owned(model_map)) {
-        const int img_idx = cuda_model_image_find(model_map);
-        const cuda_model_image &img = g_model_images[(size_t)img_idx];
-        g_model_host_base = model_map;
-        g_model_device_base = img.device_ptr - img.device_offset;
-        g_model_registered_size = model_size;
-        g_model_device_owned = 1;
-        return 1;
-    }
 
     void *dev = NULL;
     const double t0 = cuda_wall_sec();
@@ -1228,7 +1237,7 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
     }
     g_model_images.push_back({model_map, map_size, (char *)dev, map_offset});
     g_model_host_base = model_map;
-    g_model_device_base = (const char *)dev - map_offset;
+    g_model_device_base = NULL;
     g_model_registered_size = model_size;
     g_model_device_owned = 1;
     const double t1 = cuda_wall_sec();
@@ -1516,12 +1525,14 @@ extern "C" int ds4_gpu_set_model_map_spans(
         uint64_t max_tensor_bytes) {
     (void)max_tensor_bytes;
     if (!model_map || model_size == 0 || !offsets || !sizes || count == 0) return 0;
+    uint64_t span_bytes = 0;
     for (uint32_t i = 0; i < count; i++) {
         if (offsets[i] > model_size ||
             sizes[i] == 0 ||
             sizes[i] > model_size - offsets[i]) {
             return 0;
         }
+        span_bytes += sizes[i];
     }
     uint64_t min_offset = offsets[0];
     uint64_t max_end = offsets[0] + sizes[0];
@@ -1531,7 +1542,31 @@ extern "C" int ds4_gpu_set_model_map_spans(
         if (end > max_end) max_end = end;
     }
     if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
-    return cuda_model_copy_chunked(model_map, model_size, min_offset, max_end - min_offset);
+    const uint64_t bbox = max_end - min_offset;
+    if (bbox <= span_bytes + span_bytes / 10u) {
+        return cuda_model_copy_chunked(model_map, model_size, min_offset, bbox);
+    }
+    /* Bounding box has large gaps.  Sort the spans, merge adjacent ones,
+     * and bulk-copy each contiguous group individually. */
+    std::vector<std::pair<uint64_t, uint64_t>> sorted(count);
+    for (uint32_t i = 0; i < count; i++) sorted[i] = {offsets[i], offsets[i] + sizes[i]};
+    std::sort(sorted.begin(), sorted.end());
+    uint64_t grp_off = sorted[0].first;
+    uint64_t grp_end = sorted[0].second;
+    for (uint32_t i = 1; i <= count; i++) {
+        const uint64_t gap = 64ull * 1024ull;
+        if (i < count && sorted[i].first <= grp_end + gap) {
+            if (sorted[i].second > grp_end) grp_end = sorted[i].second;
+            continue;
+        }
+        if (!cuda_model_copy_chunked(model_map, model_size, grp_off, grp_end - grp_off))
+            return 0;
+        if (i < count) {
+            grp_off = sorted[i].first;
+            grp_end = sorted[i].second;
+        }
+    }
+    return 1;
 }
 
 extern "C" int ds4_gpu_set_model_fd(int fd) {
