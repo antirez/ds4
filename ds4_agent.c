@@ -7445,6 +7445,42 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "visit_page")) return agent_tool_visit_page(w, call);
     if (!strcmp(call->name, "activate_skill")) return agent_tool_activate_skill(w, call);
 
+    if (!strcmp(call->name, "bash")) {
+        const char *cmd = agent_tool_arg_value(call, "command");
+        if (!cmd || !cmd[0]) return xstrdup("Tool error: bash requires command\n");
+        int timeout = agent_parse_timeout(agent_tool_arg_value(call, "timeout_sec"));
+        int refresh = agent_parse_int_default(agent_tool_arg_value(call, "refresh_sec"),
+                                              60, 1, 3600);
+        char err[160] = {0};
+        agent_bash_job *job = agent_bash_start(w, cmd, timeout, err, sizeof(err));
+        if (!job) {
+            agent_buf_puts(&result, "Tool error: bash failed to start: ");
+            agent_buf_puts(&result, err[0] ? err : "unknown error");
+            agent_buf_puts(&result, "\n");
+            return agent_buf_take(&result);
+        }
+        return agent_bash_job_tool_result(w, job, true, refresh, false, true);
+    }
+
+    if (!strcmp(call->name, "bash_status") ||
+        !strcmp(call->name, "bash_stop"))
+    {
+        int job_id = agent_tool_job_id(call);
+        pid_t pid = agent_tool_pid(call);
+        agent_bash_job *job = agent_bash_find_job(w, job_id, pid);
+        if (!job) {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "Tool error: bash job not found: job=%d pid=%ld\n",
+                     job_id, (long)pid);
+            return xstrdup(msg);
+        }
+        int refresh = agent_parse_int_default(agent_tool_arg_value(call, "refresh_sec"),
+                                              60, 1, 3600);
+        bool stop = !strcmp(call->name, "bash_stop");
+        bool wait = stop;
+        return agent_bash_job_tool_result(w, job, wait, refresh, stop, true);
+    }
+
     {
         char header[256];
         snprintf(header, sizeof(header), "\n[tool:%s] unknown tool\n", call->name);
