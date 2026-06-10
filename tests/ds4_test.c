@@ -918,7 +918,7 @@ static bool test_logprob_vector_case_disabled(const test_vec_case *vc) {
     return !strcmp(vc->id, "long_memory_archive");
 }
 
-static void test_official_logprob_vectors(void) {
+static void test_official_logprob_vectors_run(const char *case_filter) {
     const char *path = getenv("DS4_TEST_VECTOR_FILE");
     if (!path || !path[0]) path = "tests/test-vectors/official.vec";
     FILE *fp = fopen(path, "rb");
@@ -945,8 +945,12 @@ static void test_official_logprob_vectors(void) {
     }
 
     test_vec_case vc;
+    int ran = 0;
     while (test_read_vector_case(fp, &vc)) {
         if (!test_fill_vector_case(fp, &vc)) break;
+        if (case_filter && case_filter[0] && strcmp(vc.id, case_filter)) {
+            continue;
+        }
         if (test_logprob_vector_case_disabled(&vc)) {
             fprintf(stderr, "ds4-test: vector %s skipped (API/official graph mismatch)\n",
                     vc.id);
@@ -954,12 +958,67 @@ static void test_official_logprob_vectors(void) {
         }
         fprintf(stderr, "ds4-test: vector %s\n", vc.id);
         test_logprob_vector_case(engine, &vc);
+        ran++;
     }
+    TEST_ASSERT(!case_filter || !case_filter[0] || ran == 1);
     ds4_engine_close(engine);
     test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
     test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
     test_restore_env("DS4_METAL_PREFILL_CHUNK", saved_prefill_chunk);
     fclose(fp);
+}
+
+static void test_official_logprob_vectors(void) {
+    test_official_logprob_vectors_run(NULL);
+}
+
+static void test_metal_ssd_streaming_cache_pressure(void) {
+#ifndef __APPLE__
+    fprintf(stderr,
+            "ds4-test: Metal SSD streaming cache-pressure repro skipped "
+            "(Metal-only)\n");
+#else
+    /*
+     * Regression repro for GitHub issue #384.
+     *
+     * The bug needs the Metal SSD-streaming decode layer-batch path and a small
+     * routed-expert cache. Under pressure, a cache entry referenced by an
+     * already-encoded-but-not-yet-executed layer can be reused for a later
+     * layer in the same command buffer, producing deterministic wrong logits.
+     */
+    char *saved_streaming = test_save_env("DS4_TEST_SSD_STREAMING");
+    char *saved_cache_gb = test_save_env("DS4_TEST_SSD_STREAMING_CACHE_GB");
+    char *saved_cache_experts =
+        test_save_env("DS4_TEST_SSD_STREAMING_CACHE_EXPERTS");
+    char *saved_disable_layer_batch =
+        test_save_env("DS4_METAL_DISABLE_STREAMING_LAYER_BATCH");
+    char *saved_disable_static_decode =
+        test_save_env("DS4_METAL_DISABLE_STREAMING_STATIC_DECODE_MAP");
+    char *saved_one_stage =
+        test_save_env("DS4_METAL_MOE_ONE_STAGE_PROFILE");
+
+    setenv("DS4_TEST_SSD_STREAMING", "1", 1);
+    setenv("DS4_TEST_SSD_STREAMING_CACHE_GB", "16", 1);
+    unsetenv("DS4_TEST_SSD_STREAMING_CACHE_EXPERTS");
+    unsetenv("DS4_METAL_DISABLE_STREAMING_LAYER_BATCH");
+    unsetenv("DS4_METAL_DISABLE_STREAMING_STATIC_DECODE_MAP");
+    unsetenv("DS4_METAL_MOE_ONE_STAGE_PROFILE");
+
+    fprintf(stderr,
+            "ds4-test: Metal SSD streaming cache-pressure repro "
+            "(16GiB cache, layer-batched decode, short_code_completion)\n");
+    test_official_logprob_vectors_run("short_code_completion");
+
+    test_restore_env("DS4_METAL_MOE_ONE_STAGE_PROFILE", saved_one_stage);
+    test_restore_env("DS4_METAL_DISABLE_STREAMING_STATIC_DECODE_MAP",
+                     saved_disable_static_decode);
+    test_restore_env("DS4_METAL_DISABLE_STREAMING_LAYER_BATCH",
+                     saved_disable_layer_batch);
+    test_restore_env("DS4_TEST_SSD_STREAMING_CACHE_EXPERTS",
+                     saved_cache_experts);
+    test_restore_env("DS4_TEST_SSD_STREAMING_CACHE_GB", saved_cache_gb);
+    test_restore_env("DS4_TEST_SSD_STREAMING", saved_streaming);
+#endif
 }
 
 static void test_logits_topk(const float *logits, int n, int *out, int k);
@@ -2136,6 +2195,7 @@ static const ds4_test_entry test_entries[] = {
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
     {"--think-tool-recovery", "think-tool-recovery", "forced </think> recovery when a tool call starts inside thinking", test_think_tool_recovery},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard Metal path", test_official_logprob_vectors},
+    {"--metal-ssd-streaming-cache-pressure", "metal-ssd-streaming-cache-pressure", "Metal SSD-streaming layer-batched decode cache-pressure repro for issue #384", test_metal_ssd_streaming_cache_pressure},
     {"--local-golden-vectors", "local-golden-vectors", "local top-k/logit drift regression for long Metal prefill", test_local_golden_vectors},
     {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
