@@ -19202,11 +19202,16 @@ static float *imatrix_down_ptr(ds4_imatrix_collector *c, uint32_t il, uint32_t e
     return c->down_sum2 + ((size_t)il * DS4_N_EXPERT + expert) * DS4_N_FF_EXP;
 }
 
+// NOTE (yiakwy) : 0 : CPU, 1 : CUDA GPU
+static int g_imatrix_gpu_mode = 0;
+
 static bool imatrix_collect_layer_batch(
         ds4_imatrix_collector *c,
         ds4_gpu_graph         *g,
         uint32_t               il,
         uint32_t               n_tokens) {
+    if (g_imatrix_gpu_mode) return true;
+
     if (!c || n_tokens == 0) return true;
     if (n_tokens > c->cap_tokens) return false;
 
@@ -23946,10 +23951,15 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     return 1;
 #else
     if (!e || !dataset_path || !output_path) return 1;
-    if (e->backend != DS4_BACKEND_METAL || !e->metal_ready) {
-        fprintf(stderr, "ds4: imatrix collection currently requires --metal\n");
+
+    if (!ds4_backend_uses_graph(e->backend) || !e->metal_ready) {
+        fprintf(stderr, "ds4: imatrix collection requires a graph backend (Metal or CUDA)\n");
         return 1;
     }
+
+    const char* use_gpu_env = getenv("DS4_CUDA_IMATRIX_GPU_COLLECT");
+    bool use_gpu = (use_gpu_env && use_gpu_env[0] == '1' && e->backend == DS4_BACKEND_CUDA);
+
     if (ctx_size <= 0) ctx_size = 32768;
 
     char *dataset = NULL;
@@ -23975,6 +23985,113 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     g.ssd_streaming_cold = e->ssd_streaming_cold;
     g.streaming_preload_experts = e->ssd_streaming_preload_experts;
     g.power_percent = (uint32_t)e->power_percent;
+
+    if (use_gpu) {
+        if (!cuda_imatrix_init(DS4_N_LAYER, DS4_N_EXPERT, DS4_N_EMBD, DS4_N_FF_EXP, output_path)) {
+            fprintf(stderr, "ds4: failed to initialize GPU imatrix collector\n");
+            metal_graph_free(&g);
+            free(dataset);
+            return 1;
+        }
+
+        g_imatrix_gpu_mode = 1;
+
+        ds4_imatrix_collector dummy_collector;
+        memset(&dummy_collector, 0, sizeof(dummy_collector));
+
+        fprintf(stderr,
+                "ds4: collecting routed-MoE imatrix using GPU acceleration from %s (model=%s, layers=%u, experts=%u, ctx=%d, chunk=%u)\n",
+                dataset_path, DS4_MODEL_SHAPE_NAME, DS4_N_LAYER, DS4_N_EXPERT, ctx_size, prefill_cap);
+
+        int prompts_done = 0;
+        int tokens_done = 0;
+        char *cursor = dataset;
+        const char *marker_lit = "===== DS4_IMATRIX_PROMPT";
+        while (*cursor) {
+            char *start = cursor;
+            char *marker = strstr(cursor, marker_lit);
+            if (marker) {
+                char *nl = strchr(marker, '\n');
+                if (!nl) break;
+                start = nl + 1;
+            } else if (prompts_done != 0) {
+                break;
+            }
+
+            char *next = strstr(start, marker_lit);
+            char *end = next ? next : dataset + dataset_len;
+            char saved = *end;
+            char *prompt_text = imatrix_trim_block(start, end);
+            if (prompt_text[0] != '\0') {
+                token_vec prompt = {0};
+                ds4_tokenize_rendered_chat(e, prompt_text, &prompt);
+                if (prompt.len > ctx_size) prompt.len = ctx_size;
+                if (max_tokens > 0 && prompt.len > max_tokens - tokens_done) {
+                    prompt.len = max_tokens - tokens_done;
+                }
+                if (prompt.len > 0) {
+                    if (!metal_graph_reset_prefill_state(&g)) {
+                        fprintf(stderr, "ds4: failed to reset imatrix graph state\n");
+                        ok = false;
+                    } else if ((uint32_t)prompt.len > prefill_cap) {
+                        ok = metal_graph_prefill_chunked_range(&g, model, weights,
+                                                               &prompt, 0,
+                                                               (uint32_t)prompt.len,
+                                                               NULL, false,
+                                                               NULL, NULL,
+                                                               NULL, NULL,
+                                                               &dummy_collector,
+                                                               NULL, NULL, NULL);
+                    } else {
+                        ok = metal_graph_prefill_layer_major(&g, model, weights,
+                                                             &prompt, 0,
+                                                             (uint32_t)prompt.len,
+                                                             NULL, false,
+                                                             &dummy_collector,
+                                                             NULL, NULL);
+                    }
+                    if (!ok) {
+                        fprintf(stderr, "ds4: imatrix prefill failed at prompt %d\n", prompts_done + 1);
+                        token_vec_free(&prompt);
+                        *end = saved;
+                        break;
+                    }
+                    prompts_done++;
+                    tokens_done += prompt.len;
+                    if (prompts_done % 10 == 0) {
+                        fprintf(stderr,
+                                "ds4: imatrix GPU prompts=%d tokens=%d\r",
+                                prompts_done,
+                                tokens_done);
+                        fflush(stderr);
+                    }
+                }
+                token_vec_free(&prompt);
+            }
+            *end = saved;
+            if (!next) break;
+            cursor = next;
+            if (max_prompts > 0 && prompts_done >= max_prompts) break;
+            if (max_tokens > 0 && tokens_done >= max_tokens) break;
+        }
+        fputc('\n', stderr);
+
+        if (ok) {
+            ok = cuda_imatrix_finalize();
+            if (ok) {
+                fprintf(stderr,
+                        "ds4: wrote imatrix %s from %d prompts, %d tokens (GPU accelerated)\n",
+                        output_path,
+                        prompts_done,
+                        tokens_done);
+            }
+        }
+
+        g_imatrix_gpu_mode = 0;
+        metal_graph_free(&g);
+        free(dataset);
+        return ok ? 0 : 1;
+    }
 
     ds4_imatrix_collector collector;
     if (!imatrix_collector_init(&collector, prefill_cap, dataset_path)) {

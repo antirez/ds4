@@ -332,4 +332,26 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                    uint32_t layer_start, uint32_t layer_end,
                                    char *err, size_t errlen);
 
+// #ifdef DS4_CUDA_IMATRIX
+
+#ifdef __cplusplus
+extern "C" {
 #endif
+
+// NOTE (yiakwy) : this allocate device memory (CUDA GPU) for cuda_imatrix_collector_t instead of host memory (CPU) for ds4_imatrix_collector
+
+int cuda_imatrix_init(uint64_t n_layers, uint64_t n_experts,
+                      uint64_t expert_in_dim, uint64_t expert_mid_dim,
+                      const char* output_path);
+
+int cuda_imatrix_finalize(void);
+
+bool cuda_imatrix_is_collecting(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+// #endif // DS4_CUDA_IMATRIX
+
+#endif // DS4_H
