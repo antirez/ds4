@@ -146,9 +146,20 @@ typedef struct {
     agent_bash_job *bash_jobs;
     int next_bash_job_id;
     bool raw_mode_needs_restore;
+    /* Skills */
+    struct agent_skill *skills;
+    int skills_count;
+    int skills_cap;
+    bool skills_catalog_appended;
 } agent_worker;
 
 static unsigned agent_next_prefill_label(void);
+
+/* Skill type forward-declared; implementations are after agent_buf helpers. */
+typedef struct agent_skill agent_skill;
+static void agent_skills_free(agent_worker *w);
+static void agent_skills_discover(agent_worker *w);
+static void agent_skills_append_catalog(agent_worker *w);
 
 typedef struct agent_tail_capture {
     char *buf;
@@ -446,6 +457,8 @@ static bool agent_slash_command_known(const char *cmd) {
            !strcmp(cmd, "/quit") ||
            !strcmp(cmd, "/exit") ||
            !strcmp(cmd, "/new") ||
+           !strcmp(cmd, "/skills") ||
+           !strcmp(cmd, "/refresh") ||
            agent_slash_command_with_args(cmd, "/power") ||
            agent_slash_command_with_args(cmd, "/switch") ||
            agent_slash_command_with_args(cmd, "/del") ||
@@ -708,6 +721,11 @@ static const char agent_tools_prompt_intro[] =
     "You are a coding agent running in a local workspace. Use tools for local file and system work. "
     "Avoid printing large file contents or large code blocks as answers; create or edit files with tools, "
     "then summarize results briefly.\n\n"
+    "## Skills\n\n"
+    "A skill catalog is provided as a separate message in this conversation. "
+    "It lists available skills with their names and descriptions. "
+    "When a task matches a skill's description, call `activate_skill` with the skill's name "
+    "to load its full instructions. Follow those instructions precisely.\n\n"
     "## Tools\n\n"
     "You have access to native DSML tools. Invoke tools by writing exactly this shape:\n\n"
     "<｜DSML｜tool_calls>\n"
@@ -930,6 +948,20 @@ static const char agent_tools_prompt_after_edit[] =
     "        \"path\": {\"type\": \"string\"}\n"
     "      },\n"
     "      \"required\": [\"path\"]\n"
+    "    }\n"
+    "  }\n"
+    "}\n\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"activate_skill\",\n"
+    "    \"description\": \"Load and activate a skill by name. Use when a task matches a skill's description in the available skills catalog.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"name\": {\"type\": \"string\"}\n"
+    "      },\n"
+    "      \"required\": [\"name\"]\n"
     "    }\n"
     "  }\n"
     "}\n"
@@ -3581,6 +3613,189 @@ static char *agent_buf_take(agent_buf *b) {
     return p;
 }
 
+/* ============================================================================
+ * Skill Support — Implementations
+ * ============================================================================ */
+
+struct agent_skill {
+    char name[64];
+    char description[256];
+    char path[1024];
+};
+
+static void agent_skills_free(agent_worker *w) {
+    free(w->skills);
+    w->skills = NULL;
+    w->skills_count = 0;
+    w->skills_cap = 0;
+}
+
+/* Scan a single skills directory.  Returns the number of skills discovered. */
+static int agent_skills_scan_dir(agent_worker *w, const char *dirpath) {
+    DIR *dir = opendir(dirpath);
+    if (!dir) return 0;
+
+    struct dirent *entry;
+    int count = 0;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type != DT_DIR) continue;
+        if (entry->d_name[0] == '.') continue;   /* skip hidden dirs */
+        if (!strcmp(entry->d_name, "..")) continue;
+
+        /* Build path to SKILL.md */
+        char skill_path[PATH_MAX];
+        snprintf(skill_path, sizeof(skill_path),
+                 "%s/%s/SKILL.md", dirpath, entry->d_name);
+
+        FILE *fp = fopen(skill_path, "r");
+        if (!fp) continue;
+
+        /* Read entire file */
+        char *content = NULL;
+        size_t content_len = 0;
+        size_t content_cap = 0;
+        ssize_t n;
+        char buf[4096];
+        while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+            size_t need = content_len + (size_t)n;
+            if (need > content_cap) {
+                content_cap = content_cap ? content_cap * 2 : 4096;
+                if (need > content_cap) content_cap = need;
+                char *tmp = realloc(content, content_cap);
+                if (!tmp) { fclose(fp); free(content); break; }
+                content = tmp;
+            }
+            memcpy(content + content_len, buf, (size_t)n);
+            content_len += (size_t)n;
+        }
+        fclose(fp);
+        if (!content) continue;
+        content[content_len] = '\0';
+
+        /* Parse YAML frontmatter: find first --- and second --- */
+        char *name = NULL;
+        char *desc = NULL;
+        char *p = content;
+        /* Skip leading whitespace and first --- */
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (p[0] != '-' || p[1] != '-' || p[2] != '-') { free(content); continue; }
+        p += 3;
+        if (*p == '\n') p++;
+        /* Find closing --- */
+        char *end = strstr(p, "\n---");
+        if (!end) { free(content); continue; }
+        *end = '\0';  /* terminate YAML block */
+
+        /* Extract name and description (lenient parsing) */
+        char *line = p;
+        while (line && line < end) {
+            char *nl = strchr(line, '\n');
+            if (nl) *nl = '\0';
+            /* Skip leading whitespace */
+            char *trim = line;
+            while (*trim == ' ' || *trim == '\t') trim++;
+            if (!strncmp(trim, "name:", 5)) {
+                char *v = trim + 5;
+                while (*v == ' ' || *v == '\t') v++;
+                name = v;
+            } else if (!strncmp(trim, "description:", 12)) {
+                char *v = trim + 12;
+                while (*v == ' ' || *v == '\t') v++;
+                desc = v;
+            }
+            line = nl ? nl + 1 : end;
+        }
+
+        if (!name || !name[0] || !desc || !desc[0]) {
+            free(content);
+            continue;
+        }
+
+        /* Store skill */
+        if (w->skills_count >= w->skills_cap) {
+            int new_cap = w->skills_cap ? w->skills_cap * 2 : 8;
+            agent_skill *tmp = realloc(w->skills,
+                                       (size_t)new_cap * sizeof(agent_skill));
+            if (!tmp) { free(content); continue; }
+            w->skills = tmp;
+            w->skills_cap = new_cap;
+        }
+        agent_skill *sk = &w->skills[w->skills_count++];
+        snprintf(sk->name, sizeof(sk->name), "%s", name);
+        snprintf(sk->description, sizeof(sk->description), "%s", desc);
+        snprintf(sk->path, sizeof(sk->path), "%s", skill_path);
+        free(content);
+        count++;
+    }
+    closedir(dir);
+    return count;
+}
+
+/* Discover skills from project-level and user-level directories. */
+static void agent_skills_discover(agent_worker *w) {
+    /* Project-level: <cwd>/.agents/skills/ */
+    char cwd[PATH_MAX];
+    if (getcwd(cwd, sizeof(cwd))) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/.agents/skills", cwd);
+        agent_skills_scan_dir(w, path);
+    }
+
+    /* User-level: ~/.agents/skills/ */
+    const char *home = getenv("HOME");
+    if (home) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/.agents/skills", home);
+        agent_skills_scan_dir(w, path);
+    }
+}
+
+/* Build XML skill catalog text.  Returns allocated string. */
+static char *agent_skills_build_catalog(agent_worker *w) {
+    agent_buf b = {0};
+    agent_buf_puts(&b, "\n<available_skills>\n");
+    for (int i = 0; i < w->skills_count; i++) {
+        agent_skill *sk = &w->skills[i];
+        agent_buf_puts(&b, "  <skill>\n");
+        /* Use snprintf + agent_buf_puts since agent_buf_printf does not exist */
+        char tmp[1536];
+        snprintf(tmp, sizeof(tmp), "    <name>%s</name>\n", sk->name);
+        agent_buf_puts(&b, tmp);
+        snprintf(tmp, sizeof(tmp), "    <description>%s</description>\n", sk->description);
+        agent_buf_puts(&b, tmp);
+        snprintf(tmp, sizeof(tmp), "    <location>%s</location>\n", sk->path);
+        agent_buf_puts(&b, tmp);
+        agent_buf_puts(&b, "  </skill>\n");
+    }
+    agent_buf_puts(&b, "</available_skills>\n");
+    return agent_buf_take(&b);
+}
+
+/* Append the skill catalog as a user message after the system prompt. */
+static void agent_skills_append_catalog(agent_worker *w) {
+    if (w->skills_count <= 0) return;
+
+    char *catalog = agent_skills_build_catalog(w);
+    if (!catalog) return;
+
+    /* Prepend behavioral instructions before the catalog */
+    char *text;
+    {
+        agent_buf b = {0};
+        agent_buf_puts(&b,
+            "## Skills\n\n"
+            "The following skills provide specialized instructions for specific tasks. "
+            "When a task matches a skill's description, call `activate_skill` with "
+            "the skill's name to load its full instructions.\n\n");
+        agent_buf_puts(&b, catalog);
+        text = agent_buf_take(&b);
+    }
+    free(catalog);
+
+    ds4_chat_append_message(w->engine, &w->transcript, "user", text);
+    free(text);
+}
+
 static bool agent_tokens_equal(const ds4_tokens *a, const ds4_tokens *b) {
     if (!a || !b || a->len != b->len) return false;
     for (int i = 0; i < a->len; i++) {
@@ -4252,6 +4467,19 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
     }
 
     agent_worker_note_system_prompt_seen(w);
+
+    /* Append skill catalog as a separate user message after the system prompt.
+     * This keeps the system prompt static (cacheable) while the catalog can
+     * change independently.  Only append once per session. */
+    if (!w->skills_catalog_appended) {
+        /* Discover skills on first call */
+        if (w->skills_count == 0) {
+            agent_skills_discover(w);
+        }
+        agent_skills_append_catalog(w);
+        w->skills_catalog_appended = true;
+    }
+
     pthread_mutex_lock(&w->mu);
     w->user_activity = false;
     w->session_dirty = false;
@@ -7137,6 +7365,69 @@ static pid_t agent_tool_pid(const agent_tool_call *call) {
  * ============================================================================
  */
 
+/* Activate a skill: look up the skill by name, read its SKILL.md, return the
+ * full instructions wrapped in a structured tag so the model can follow them. */
+static char *agent_tool_activate_skill(agent_worker *w, const agent_tool_call *call) {
+    const char *name = agent_tool_arg_value(call, "name");
+    if (!name || !name[0])
+        return xstrdup("Tool error: activate_skill requires 'name' parameter\n");
+
+    /* Find the skill */
+    int idx = -1;
+    for (int i = 0; i < w->skills_count; i++) {
+        if (!strcmp(w->skills[i].name, name)) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx < 0) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "Tool error: skill not found: '%s'. Use `/skills` to list available skills.\n",
+                 name);
+        return xstrdup(msg);
+    }
+
+    agent_skill *sk = &w->skills[idx];
+
+    /* Read the SKILL.md file */
+    char *data = NULL;
+    size_t len = 0;
+    char err[256] = {0};
+    if (agent_read_file_bytes(sk->path, &data, &len, err, sizeof(err)) != 0) {
+        char msg[320];
+        snprintf(msg, sizeof(msg),
+                 "Tool error: failed to read skill '%s': %s\n", name, err);
+        return xstrdup(msg);
+    }
+
+    /* Build structured response */
+    agent_buf b = {0};
+    {
+        char tmp[128];
+        snprintf(tmp, sizeof(tmp), "\n<skill_content name=\"%s\">\n", sk->name);
+        agent_buf_puts(&b, tmp);
+    }
+    agent_buf_puts(&b, data);
+    {
+        char tmp[1152];
+        /* Truncate path to directory for display */
+        char dir[1024];
+        snprintf(dir, sizeof(dir), "%s", sk->path);
+        char *slash = strrchr(dir, '/');
+        if (slash) *slash = '\0';
+        snprintf(tmp, sizeof(tmp),
+                 "\nSkill directory: %s\n"
+                 "Relative paths in this skill are relative to the skill directory.\n",
+                 dir);
+        agent_buf_puts(&b, tmp);
+    }
+    agent_buf_puts(&b, "</skill_content>\n");
+
+    free(data);
+    return agent_buf_take(&b);
+}
+
 /* Execute one parsed DSML tool call and return the text that will be appended as
  * the tool-role result.  UI visualization already happened while streaming; this
  * function is only about side effects and the model-visible observation. */
@@ -7152,42 +7443,7 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "search")) return agent_tool_search(w, call);
     if (!strcmp(call->name, "google_search")) return agent_tool_google_search(w, call);
     if (!strcmp(call->name, "visit_page")) return agent_tool_visit_page(w, call);
-
-    if (!strcmp(call->name, "bash")) {
-        const char *cmd = agent_tool_arg_value(call, "command");
-        if (!cmd || !cmd[0]) return xstrdup("Tool error: bash requires command\n");
-        int timeout = agent_parse_timeout(agent_tool_arg_value(call, "timeout_sec"));
-        int refresh = agent_parse_int_default(agent_tool_arg_value(call, "refresh_sec"),
-                                              60, 1, 3600);
-        char err[160] = {0};
-        agent_bash_job *job = agent_bash_start(w, cmd, timeout, err, sizeof(err));
-        if (!job) {
-            agent_buf_puts(&result, "Tool error: bash failed to start: ");
-            agent_buf_puts(&result, err[0] ? err : "unknown error");
-            agent_buf_puts(&result, "\n");
-            return agent_buf_take(&result);
-        }
-        return agent_bash_job_tool_result(w, job, true, refresh, false, true);
-    }
-
-    if (!strcmp(call->name, "bash_status") ||
-        !strcmp(call->name, "bash_stop"))
-    {
-        int job_id = agent_tool_job_id(call);
-        pid_t pid = agent_tool_pid(call);
-        agent_bash_job *job = agent_bash_find_job(w, job_id, pid);
-        if (!job) {
-            char msg[128];
-            snprintf(msg, sizeof(msg), "Tool error: bash job not found: job=%d pid=%ld\n",
-                     job_id, (long)pid);
-            return xstrdup(msg);
-        }
-        int refresh = agent_parse_int_default(agent_tool_arg_value(call, "refresh_sec"),
-                                              60, 1, 3600);
-        bool stop = !strcmp(call->name, "bash_stop");
-        bool wait = stop;
-        return agent_bash_job_tool_result(w, job, wait, refresh, stop, true);
-    }
+    if (!strcmp(call->name, "activate_skill")) return agent_tool_activate_skill(w, call);
 
     {
         char header[256];
@@ -9375,6 +9631,8 @@ static void runtime_help(void) {
     puts("  /strip SHA   Strip KV payload; /switch rebuilds it by prefill.");
     puts("  /history [N] Show N recent user turns from the current session.");
     puts("  /power N     Set GPU duty cycle percentage, 1..100.");
+    puts("  /skills      List available skills.");
+    puts("  /refresh     Re-scan skills directory (requires /new to take effect).");
     puts("  /new         Start a fresh session from the system prompt.");
     puts("  /quit, /exit Exit.");
     puts("  Ctrl+C       Interrupt generation; clear edited text.");
@@ -9482,6 +9740,7 @@ static void agent_worker_free(agent_worker *w) {
     if (w->wake_fd[0] >= 0) close(w->wake_fd[0]);
     if (w->wake_fd[1] >= 0) close(w->wake_fd[1]);
     if (w->trace) fclose(w->trace);
+    agent_skills_free(w);
     free(w->cmd_text);
     free(w->out);
     pthread_cond_destroy(&w->cond);
@@ -10036,6 +10295,27 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         printf("compaction scheduled at next safe point\n");
                 } else if (!strcmp(cmd, "/list")) {
                     agent_worker_list_sessions(&worker);
+                } else if (!strcmp(cmd, "/skills")) {
+                    if (worker.skills_count <= 0) {
+                        printf("No skills available.\n");
+                    } else {
+                        printf("Available skills (%d):\n", worker.skills_count);
+                        for (int i = 0; i < worker.skills_count; i++) {
+                            printf("  %s — %s\n", worker.skills[i].name,
+                                   worker.skills[i].description);
+                        }
+                    }
+                } else if (!strcmp(cmd, "/refresh")) {
+                    printf("Refreshing skill catalog...\n");
+                    agent_skills_free(&worker);
+                    worker.skills_catalog_appended = false;
+                    agent_skills_discover(&worker);
+                    int count = worker.skills_count;
+                    printf("Discovered %d skill(s).\n", count);
+                    if (count > 0) {
+                        printf("NOTE: The skill catalog is part of the cached session prefix.\n");
+                        printf("To apply changes, use /new to start a fresh session.\n");
+                    }
                 } else if (!strncmp(cmd, "/power", 6) &&
                            (cmd[6] == '\0' || cmd[6] == ' ' || cmd[6] == '\t')) {
                     char *arg = cmd + 6;
@@ -10078,6 +10358,8 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     editor_restore_terminal_layout(&editor);
                     if (agent_maybe_save_before_leaving_session(&worker)) {
                         char err[160] = {0};
+                        /* Reset flag so the skill catalog is re-appended on the new session */
+                        worker.skills_catalog_appended = false;
                         if (!agent_worker_reset_to_sysprompt(&worker, err, sizeof(err))) {
                             printf("new session failed: %s\n", err);
                         } else {
