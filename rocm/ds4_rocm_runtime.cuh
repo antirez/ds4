@@ -47,6 +47,7 @@ struct cuda_model_image {
     const void *host_base;
     uint64_t size;
     char *device_ptr;
+    uint64_t device_offset;
 };
 
 struct cuda_q8_f16_range {
@@ -209,8 +210,9 @@ static const char *cuda_model_image_ptr(const void *model_map, uint64_t offset) 
     const int idx = cuda_model_image_find(model_map);
     if (idx < 0) return NULL;
     const cuda_model_image &img = g_model_images[(size_t)idx];
-    if (offset > img.size) return NULL;
-    return img.device_ptr + offset;
+    if (offset < img.device_offset) return NULL;
+    if (offset - img.device_offset >= img.size) return NULL;
+    return img.device_ptr + (offset - img.device_offset);
 }
 
 static int cuda_model_image_owned(const void *model_map) {
@@ -1143,9 +1145,12 @@ static const char *cuda_model_range_ptr_from_fd(
 
 static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
     if (!model_map || model_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
+    if (map_size == 0) return 0;
     if (cuda_model_image_owned(model_map)) {
+        const int img_idx = cuda_model_image_find(model_map);
+        const cuda_model_image &img = g_model_images[(size_t)img_idx];
         g_model_host_base = model_map;
-        g_model_device_base = cuda_model_image_ptr(model_map, 0);
+        g_model_device_base = img.device_ptr - img.device_offset;
         g_model_registered_size = model_size;
         g_model_device_owned = 1;
         return 1;
@@ -1153,7 +1158,7 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
 
     void *dev = NULL;
     const double t0 = cuda_wall_sec();
-    cudaError_t err = cudaMalloc(&dev, (size_t)model_size);
+    cudaError_t err = cudaMalloc(&dev, (size_t)map_size);
     if (err != cudaSuccess) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "model allocation skipped: %s\n", cudaGetErrorString(err));
         (void)cudaGetLastError();
@@ -1161,7 +1166,7 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
     }
 
     fprintf(stderr, DS4_GPU_LOG_PREFIX "chunk-copying %.2f GiB model image\n",
-            (double)model_size / 1073741824.0);
+            (double)map_size / 1073741824.0);
 
     const uint64_t chunk = cuda_model_copy_chunk_bytes();
     const uint64_t stage_bytes = chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
@@ -1172,8 +1177,8 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
 
     uint64_t copied = 0;
     uint64_t chunk_idx = 0;
-    while (copied < model_size) {
-        const uint64_t n = (model_size - copied < chunk) ? (model_size - copied) : chunk;
+    while (copied < map_size) {
+        const uint64_t n = (map_size - copied < chunk) ? (map_size - copied) : chunk;
         const uint64_t bi = chunk_idx % 4u;
         if (chunk_idx >= 4u) {
             err = cudaEventSynchronize(g_model_stage_event[bi]);
@@ -1186,7 +1191,7 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
         }
         const char *payload = NULL;
         if (!cuda_model_stage_read(g_model_stage[bi], g_model_stage_bytes,
-                                   copied, n, &payload)) {
+                                   map_offset + copied, n, &payload)) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX "model staged read failed at %.2f GiB: %s\n",
                     (double)copied / 1073741824.0, strerror(errno));
             (void)cudaFree(dev);
@@ -1208,11 +1213,11 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
             (void)cudaGetLastError();
             return 0;
         }
-        cuda_model_drop_file_pages(copied, n);
-        cuda_model_discard_source_pages(model_map, model_size, copied, n);
+        cuda_model_drop_file_pages(map_offset + copied, n);
+        cuda_model_discard_source_pages(model_map, model_size, map_offset + copied, n);
         copied += n;
         chunk_idx++;
-        cuda_model_load_progress_note(copied > map_offset ? copied - map_offset : 0);
+        cuda_model_load_progress_note(copied);
     }
     err = cudaStreamSynchronize(g_model_upload_stream);
     if (err != cudaSuccess) {
@@ -1221,9 +1226,9 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
         (void)cudaGetLastError();
         return 0;
     }
-    g_model_images.push_back({model_map, model_size, (char *)dev});
+    g_model_images.push_back({model_map, map_size, (char *)dev, map_offset});
     g_model_host_base = model_map;
-    g_model_device_base = (const char *)dev;
+    g_model_device_base = (const char *)dev - map_offset;
     g_model_registered_size = model_size;
     g_model_device_owned = 1;
     const double t1 = cuda_wall_sec();
