@@ -477,6 +477,7 @@ static ds4_backend parse_backend(const char *s) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
+    if (!strcmp(s, "rocm")) return DS4_BACKEND_CUDA;
     fprintf(stderr, "ds4-agent: invalid backend: %s\n", s);
     exit(2);
 }
@@ -593,6 +594,8 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--cuda")) {
+            c.engine.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--rocm")) {
             c.engine.backend = DS4_BACKEND_CUDA;
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = DS4_BACKEND_CPU;
