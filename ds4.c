@@ -22214,6 +22214,7 @@ struct ds4_session {
     int mtp_draft_token;
     uint64_t mtp_probe_total;
     uint64_t mtp_probe_hit;
+    uint32_t mtp_probe_skip;
     ds4_session_progress_fn progress;
     void *progress_ud;
     ds4_session_progress_fn display_progress;
@@ -25952,6 +25953,13 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                     s->mtp_draft_token,
                     (unsigned long long)s->mtp_probe_hit,
                     (unsigned long long)s->mtp_probe_total);
+        } else {
+            /* Nothing consumed the pending draft, so the caller is decoding
+             * outside the speculative path (sampled spans do this on every
+             * token) and the drafter eval below is wasted work.  Keep one
+             * probe in sixteen so speculation resumes quickly when the
+             * caller returns to greedy decoding. */
+            s->mtp_probe_skip = 15;
         }
         s->mtp_draft_valid = false;
     }
@@ -25965,7 +25973,9 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         return 1;
     }
     token_vec_push(&s->checkpoint, token);
-    if (mtp_should_draft) {
+    if (s->mtp_probe_skip > 0) {
+        s->mtp_probe_skip--;
+    } else if (mtp_should_draft) {
         int mtp_top = -1;
         if (metal_graph_eval_mtp_draft(&s->graph,
                                        &e->model,
@@ -26050,6 +26060,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     int draft_n = 1;
     drafts[0] = s->mtp_draft_token;
     s->mtp_draft_valid = false;
+    s->mtp_probe_skip = 0;
     const bool strict_mtp = e->quality || getenv("DS4_MTP_STRICT") != NULL;
     float mtp_margin_threshold = e->mtp_margin;
     const char *mtp_margin_env = getenv("DS4_MTP_MIN_MARGIN");
