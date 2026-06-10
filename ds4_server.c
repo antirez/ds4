@@ -489,6 +489,59 @@ static bool ds4_text_format_validate_with_llguidance(ds4_engine *e,
     return true;
 }
 
+/* Map the parsed "type" plus its companion fields to a ds4_text_format.
+ * Shared by response_format (chat) and text.format (Responses); `what` is the
+ * field name used in error messages. The json_schema type is not handled here
+ * because the two APIs disagree on where the schema lives (wrapped object vs
+ * inline). Consumed fields are moved into the format and set to NULL. */
+static bool ds4_text_format_apply_type(ds4_text_format *format,
+                                       const char *type,
+                                       char **schema,
+                                       char **regex,
+                                       char **grammar,
+                                       const char *what,
+                                       char *err,
+                                       size_t errlen) {
+    if (!type || !strcmp(type, "text")) {
+        ds4_text_format_clear(format);
+    } else if (!strcmp(type, "json_object")) {
+        if (*schema) {
+            ds4_text_format_set_schema(format, DS4_TEXT_FORMAT_JSON_SCHEMA,
+                                       *schema);
+            *schema = NULL;
+        } else {
+            ds4_text_format_set_schema(format, DS4_TEXT_FORMAT_JSON_OBJECT,
+                                       NULL);
+        }
+    } else if (!strcmp(type, "regex")) {
+        if (!*regex) {
+            snprintf(err, errlen, "%s.regex is required", what);
+            return false;
+        }
+        ds4_text_format_set_constraint(format, DS4_TEXT_FORMAT_REGEX, *regex);
+        *regex = NULL;
+    } else if (!strcmp(type, "lark")) {
+        if (!*grammar) {
+            snprintf(err, errlen, "%s.grammar is required", what);
+            return false;
+        }
+        ds4_text_format_set_constraint(format, DS4_TEXT_FORMAT_LARK, *grammar);
+        *grammar = NULL;
+    } else if (!strcmp(type, "llguidance")) {
+        if (!*grammar) {
+            snprintf(err, errlen, "%s.grammar is required", what);
+            return false;
+        }
+        ds4_text_format_set_constraint(format, DS4_TEXT_FORMAT_LLGUIDANCE,
+                                       *grammar);
+        *grammar = NULL;
+    } else {
+        snprintf(err, errlen, "%s.type=%s not supported", what, type);
+        return false;
+    }
+    return true;
+}
+
 static bool parse_json_schema_wrapper(const char **p,
                                       ds4_text_format *format,
                                       char *err,
@@ -636,18 +689,7 @@ static bool parse_chat_response_format(const char **p,
     (*p)++;
     (void)strict;
 
-    if (!type || !strcmp(type, "text")) {
-        ds4_text_format_clear(format);
-    } else if (!strcmp(type, "json_object")) {
-        if (schema) {
-            ds4_text_format_set_schema(format, DS4_TEXT_FORMAT_JSON_SCHEMA,
-                                       schema);
-            schema = NULL;
-        } else {
-            ds4_text_format_set_schema(format, DS4_TEXT_FORMAT_JSON_OBJECT,
-                                       NULL);
-        }
-    } else if (!strcmp(type, "json_schema")) {
+    if (type && !strcmp(type, "json_schema")) {
         if (!saw_json_schema && schema) {
             ds4_text_format_set_schema(format, DS4_TEXT_FORMAT_JSON_SCHEMA,
                                        schema);
@@ -656,29 +698,9 @@ static bool parse_chat_response_format(const char **p,
             snprintf(err, errlen, "response_format json_schema.schema is required");
             goto bad_keep_err;
         }
-    } else if (!strcmp(type, "regex")) {
-        if (!regex) {
-            snprintf(err, errlen, "response_format.regex is required");
-            goto bad_keep_err;
-        }
-        ds4_text_format_set_constraint(format, DS4_TEXT_FORMAT_REGEX, regex);
-        regex = NULL;
-    } else if (!strcmp(type, "lark")) {
-        if (!grammar) {
-            snprintf(err, errlen, "response_format.grammar is required");
-            goto bad_keep_err;
-        }
-        ds4_text_format_set_constraint(format, DS4_TEXT_FORMAT_LARK, grammar);
-        grammar = NULL;
-    } else if (!strcmp(type, "llguidance")) {
-        if (!grammar) {
-            snprintf(err, errlen, "response_format.grammar is required");
-            goto bad_keep_err;
-        }
-        ds4_text_format_set_constraint(format, DS4_TEXT_FORMAT_LLGUIDANCE, grammar);
-        grammar = NULL;
-    } else {
-        snprintf(err, errlen, "response_format.type=%s not supported", type);
+    } else if (!ds4_text_format_apply_type(format, type, &schema, &regex,
+                                           &grammar, "response_format",
+                                           err, errlen)) {
         goto bad_keep_err;
     }
 
@@ -774,18 +796,7 @@ static bool parse_responses_text_format_object(const char **p,
     (*p)++;
     (void)strict;
 
-    if (!type || !strcmp(type, "text")) {
-        ds4_text_format_clear(format);
-    } else if (!strcmp(type, "json_object")) {
-        if (schema) {
-            ds4_text_format_set_schema(format, DS4_TEXT_FORMAT_JSON_SCHEMA,
-                                       schema);
-            schema = NULL;
-        } else {
-            ds4_text_format_set_schema(format, DS4_TEXT_FORMAT_JSON_OBJECT,
-                                       NULL);
-        }
-    } else if (!strcmp(type, "json_schema")) {
+    if (type && !strcmp(type, "json_schema")) {
         if (!schema) {
             snprintf(err, errlen, "text.format.schema is required");
             goto bad_keep_err;
@@ -793,29 +804,9 @@ static bool parse_responses_text_format_object(const char **p,
         ds4_text_format_set_schema(format, DS4_TEXT_FORMAT_JSON_SCHEMA,
                                    schema);
         schema = NULL;
-    } else if (!strcmp(type, "regex")) {
-        if (!regex) {
-            snprintf(err, errlen, "text.format.regex is required");
-            goto bad_keep_err;
-        }
-        ds4_text_format_set_constraint(format, DS4_TEXT_FORMAT_REGEX, regex);
-        regex = NULL;
-    } else if (!strcmp(type, "lark")) {
-        if (!grammar) {
-            snprintf(err, errlen, "text.format.grammar is required");
-            goto bad_keep_err;
-        }
-        ds4_text_format_set_constraint(format, DS4_TEXT_FORMAT_LARK, grammar);
-        grammar = NULL;
-    } else if (!strcmp(type, "llguidance")) {
-        if (!grammar) {
-            snprintf(err, errlen, "text.format.grammar is required");
-            goto bad_keep_err;
-        }
-        ds4_text_format_set_constraint(format, DS4_TEXT_FORMAT_LLGUIDANCE, grammar);
-        grammar = NULL;
-    } else {
-        snprintf(err, errlen, "text.format.type=%s not supported", type);
+    } else if (!ds4_text_format_apply_type(format, type, &schema, &regex,
+                                           &grammar, "text.format",
+                                           err, errlen)) {
         goto bad_keep_err;
     }
 

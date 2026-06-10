@@ -21601,157 +21601,6 @@ static int sample_candidate_cmp_desc(const void *a, const void *b) {
     return (cb->logit > ca->logit) - (cb->logit < ca->logit);
 }
 
-static int sample_full_vocab(
-        const float *logits,
-        uint32_t     n_vocab,
-        float        temperature,
-        float        top_p,
-        float        min_p,
-        uint64_t    *rng) {
-    float max_logit = DS4_NEG_INF;
-    int best = 0;
-    uint32_t finite = 0;
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (!isfinite(v)) continue;
-        finite++;
-        if (v > max_logit) {
-            max_logit = v;
-            best = (int)i;
-        }
-    }
-    if (finite == 0) return sample_argmax(logits, n_vocab);
-
-    if (top_p >= 1.0f) {
-        float sum = 0.0f;
-        const float min_rel = min_p > 0.0f ? min_p : 0.0f;
-        for (uint32_t i = 0; i < n_vocab; i++) {
-            const float v = logits[i];
-            if (!isfinite(v)) continue;
-            const float p = expf((v - max_logit) / temperature);
-            if (p < min_rel) continue;
-            sum += p;
-        }
-        if (sum <= 0.0f || !isfinite(sum)) return best;
-        float r = sample_rng_f32(rng) * sum;
-        for (uint32_t i = 0; i < n_vocab; i++) {
-            const float v = logits[i];
-            if (!isfinite(v)) continue;
-            const float p = expf((v - max_logit) / temperature);
-            if (p < min_rel) continue;
-            r -= p;
-            if (r <= 0.0f) return (int)i;
-        }
-        return best;
-    }
-
-    sample_candidate *cand = xmalloc((size_t)finite * sizeof(cand[0]));
-    uint32_t n = 0;
-    float sum = 0.0f;
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (!isfinite(v)) continue;
-        const float p = expf((v - max_logit) / temperature);
-        cand[n++] = (sample_candidate){.id = (int)i, .logit = v, .prob = p};
-        sum += p;
-    }
-    if (sum <= 0.0f || !isfinite(sum)) {
-        free(cand);
-        return best;
-    }
-
-    qsort(cand, n, sizeof(cand[0]), sample_candidate_cmp_desc);
-    const float min_prob = (cand[0].prob / sum) * (min_p > 0.0f ? min_p : 0.0f);
-    float filtered_sum = 0.0f;
-    uint32_t filtered = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        const float p = cand[i].prob / sum;
-        if (i > 0 && p < min_prob) break;
-        filtered_sum += cand[i].prob;
-        filtered++;
-        if (filtered_sum / sum >= top_p) break;
-    }
-    if (filtered == 0) {
-        free(cand);
-        return best;
-    }
-
-    float r = sample_rng_f32(rng) * filtered_sum;
-    for (uint32_t i = 0; i < filtered; i++) {
-        r -= cand[i].prob;
-        if (r <= 0.0f) {
-            const int id = cand[i].id;
-            free(cand);
-            return id;
-        }
-    }
-    const int id = cand[filtered - 1].id;
-    free(cand);
-    return id;
-}
-
-static int sample_top_p_min_p(
-        const float *logits,
-        uint32_t     n_vocab,
-        float        temperature,
-        int          top_k,
-        float        top_p,
-        float        min_p,
-        uint64_t    *rng) {
-    if (temperature <= 0.0f) return sample_argmax(logits, n_vocab);
-    if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
-    if (min_p < 0.0f) min_p = 0.0f;
-    if (top_k <= 0) return sample_full_vocab(logits, n_vocab, temperature, top_p, min_p, rng);
-    if (top_k > 1024) top_k = 1024;
-    if ((uint32_t)top_k > n_vocab) top_k = (int)n_vocab;
-
-    int ids[1024];
-    float vals[1024];
-    int n = 0;
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        float v = logits[i];
-        if (!isfinite(v)) continue;
-        if (n == top_k && v <= vals[n - 1]) continue;
-        int j = n < top_k ? n++ : n - 1;
-        while (j > 0 && vals[j - 1] < v) {
-            vals[j] = vals[j - 1];
-            ids[j] = ids[j - 1];
-            j--;
-        }
-        vals[j] = v;
-        ids[j] = (int)i;
-    }
-    if (n == 0) return sample_argmax(logits, n_vocab);
-
-    float probs[1024];
-    const float max_logit = vals[0];
-    float sum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        probs[i] = expf((vals[i] - max_logit) / temperature);
-        sum += probs[i];
-    }
-    if (sum <= 0.0f || !isfinite(sum)) return ids[0];
-
-    const float min_prob = (probs[0] / sum) * min_p;
-    float filtered_sum = 0.0f;
-    int filtered = 0;
-    for (int i = 0; i < n; i++) {
-        float p = probs[i] / sum;
-        if (i > 0 && p < min_prob) break;
-        filtered_sum += probs[i];
-        filtered++;
-        if (filtered_sum / sum >= top_p) break;
-    }
-    if (filtered <= 0) return ids[0];
-
-    float r = sample_rng_f32(rng) * filtered_sum;
-    for (int i = 0; i < filtered; i++) {
-        r -= probs[i];
-        if (r <= 0.0f) return ids[i];
-    }
-    return ids[filtered - 1];
-}
-
 static bool sample_mask_allows(const uint32_t *mask, size_t words, uint32_t id) {
     if (!mask) return true;
     const size_t word = id / 32u;
@@ -21975,6 +21824,18 @@ static int sample_top_p_min_p_filtered(
         if (r <= 0.0f) return ids[i];
     }
     return ids[filtered - 1];
+}
+
+static int sample_top_p_min_p(
+        const float *logits,
+        uint32_t     n_vocab,
+        float        temperature,
+        int          top_k,
+        float        top_p,
+        float        min_p,
+        uint64_t    *rng) {
+    return sample_top_p_min_p_filtered(logits, n_vocab, temperature, top_k,
+                                       top_p, min_p, NULL, 0, NULL, 0, rng);
 }
 
 static void print_top_logits(
