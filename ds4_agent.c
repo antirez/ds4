@@ -151,6 +151,7 @@ typedef struct {
     int skills_count;
     int skills_cap;
     bool skills_catalog_appended;
+    char *catalog_text;          /* full catalog message text, for change detection */
 } agent_worker;
 
 static unsigned agent_next_prefill_label(void);
@@ -3628,6 +3629,8 @@ static void agent_skills_free(agent_worker *w) {
     w->skills = NULL;
     w->skills_count = 0;
     w->skills_cap = 0;
+    free(w->catalog_text);
+    w->catalog_text = NULL;
 }
 
 /* Scan a single skills directory.  Returns the number of skills discovered. */
@@ -3792,10 +3795,13 @@ static void agent_skills_append_catalog(agent_worker *w) {
     }
     free(catalog);
 
+    /* Save for change detection on /refresh */
+    free(w->catalog_text);
+    w->catalog_text = xstrdup(text);
+
     ds4_chat_append_message(w->engine, &w->transcript, "user", text);
     free(text);
 }
-
 static bool agent_tokens_equal(const ds4_tokens *a, const ds4_tokens *b) {
     if (!a || !b || a->len != b->len) return false;
     for (int i = 0; i < a->len; i++) {
@@ -9672,7 +9678,7 @@ static void runtime_help(void) {
     puts("  /history [N] Show N recent user turns from the current session.");
     puts("  /power N     Set GPU duty cycle percentage, 1..100.");
     puts("  /skills      List available skills.");
-    puts("  /refresh     Re-scan skills directory (requires /new to take effect).");
+    puts("  /refresh     Re-scan skills and append updated catalog to conversation.");
     puts("  /new         Start a fresh session from the system prompt.");
     puts("  /quit, /exit Exit.");
     puts("  Ctrl+C       Interrupt generation; clear edited text.");
@@ -10347,15 +10353,41 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     }
                 } else if (!strcmp(cmd, "/refresh")) {
                     printf("Refreshing skill catalog...\n");
+                    /* Save old catalog text for comparison */
+                    char *old_text = worker.catalog_text ?
+                                     xstrdup(worker.catalog_text) : NULL;
                     agent_skills_free(&worker);
-                    worker.skills_catalog_appended = false;
                     agent_skills_discover(&worker);
-                    int count = worker.skills_count;
-                    printf("Discovered %d skill(s).\n", count);
-                    if (count > 0) {
-                        printf("NOTE: The skill catalog is part of the cached session prefix.\n");
-                        printf("To apply changes, use /new to start a fresh session.\n");
+                    /* Build new full catalog text (instructions + XML) */
+                    char *new_cat = agent_skills_build_catalog(&worker);
+                    agent_buf b = {0};
+                    agent_buf_puts(&b,
+                        "## Skills\n\n"
+                        "The following skills provide specialized instructions "
+                        "for specific tasks. When a task matches a skill's "
+                        "description, call `activate_skill` with the skill's "
+                        "name to load its full instructions.\n\n");
+                    agent_buf_puts(&b, new_cat);
+                    free(new_cat);
+                    char *new_text = agent_buf_take(&b);
+                    bool changed = !old_text ||
+                                   strcmp(old_text, new_text) != 0;
+                    free(old_text);
+                    if (changed) {
+                        printf("Catalog changed, appending updated catalog...\n");
+                        free(worker.catalog_text);
+                        worker.catalog_text = xstrdup(new_text);
+                        /* Append updated catalog at end of transcript.
+                         * The model sees the new catalog and uses it going forward.
+                         * No full prefill needed — only the new tokens are processed. */
+                        ds4_chat_append_message(worker.engine,
+                                                &worker.transcript,
+                                                "user", new_text);
+                        worker.skills_catalog_appended = true;
+                    } else {
+                        printf("No changes detected.\n");
                     }
+                    free(new_text);
                 } else if (!strncmp(cmd, "/power", 6) &&
                            (cmd[6] == '\0' || cmd[6] == ' ' || cmd[6] == '\t')) {
                     char *arg = cmd + 6;
