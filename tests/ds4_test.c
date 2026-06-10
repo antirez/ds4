@@ -1736,6 +1736,174 @@ static const char *test_tool_call_request_json(void) {
         "}";
 }
 
+static const char *test_think_recovery_request_json(void) {
+    return
+        "{"
+        "\"model\":\"deepseek-v4-flash\","
+        "\"messages\":[{\"role\":\"user\",\"content\":\"List the files in the current directory. Use the provided tool; do not answer in prose.\"}],"
+        "\"tools\":[{\"type\":\"function\",\"function\":{"
+            "\"name\":\"list_files\","
+            "\"description\":\"List files in a directory.\","
+            "\"parameters\":{\"type\":\"object\",\"properties\":{"
+                "\"path\":{\"type\":\"string\",\"description\":\"Directory path to list.\"}"
+            "},\"required\":[\"path\"]}"
+        "}}],"
+        "\"tool_choice\":\"auto\","
+        "\"think\":true,"
+        "\"temperature\":0,"
+        "\"max_tokens\":384,"
+        "\"stream\":false"
+        "}";
+}
+
+/* The model sometimes opens a DSML stanza without closing </think> first.
+ * The server's forward recovery must force the close plus a fresh stanza
+ * opening, after which the model must still complete a valid call.  The
+ * malformed prefix is teacher-forced so the regression is deterministic and
+ * does not depend on coaxing the model into misbehaving. */
+static void test_think_tool_recovery(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+
+    request r;
+    char err[160];
+    TEST_ASSERT(parse_chat_request(engine, NULL, test_think_recovery_request_json(),
+                                   512, 32768, &r, err, sizeof(err)));
+
+    ds4_session *session = NULL;
+    TEST_ASSERT(ds4_session_create(&session, engine, 32768) == 0);
+    if (!session) {
+        request_free(&r);
+        return;
+    }
+    TEST_ASSERT(ds4_session_sync(session, &r.prompt, err, sizeof(err)) == 0);
+
+    if (getenv("DS4_TEST_RECOVERY_PROBE") != NULL) {
+        /* Diagnostic: print the model's natural tool-call turn for this
+         * request instead of running the recovery. */
+        buf nat = {0};
+        uint64_t prng = 7;
+        for (int i = 0; i < 300; i++) {
+            int token = ds4_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &prng);
+            if (token == ds4_token_eos(engine)) break;
+            size_t plen = 0;
+            char *p = ds4_token_text(engine, token, &plen);
+            buf_append(&nat, p, plen);
+            free(p);
+            bool ps = false, pe = false;
+            observe_tool_markers(nat.ptr, &ps, &pe, NULL);
+            if (pe) break;
+            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) break;
+        }
+        fprintf(stderr, "ds4-test: natural turn=[%s]\n", nat.ptr ? nat.ptr : "");
+        buf_free(&nat);
+        ds4_session_free(session);
+        request_free(&r);
+        test_close_engine(false);
+        return;
+    }
+
+    thinking_state thinking = thinking_state_from_prompt(&r);
+    buf text = {0};
+    buf forced = {0};
+    if (!thinking.inside) buf_append(&forced, "<think>", 7);
+    const char *body =
+        "The user wants a directory listing. I will call the "
+        "list_files tool right away.\n\n" DS4_TOOL_CALLS_START;
+    buf_append(&forced, body, strlen(body));
+
+    server srv;
+    memset(&srv, 0, sizeof(srv));
+    srv.engine = engine;
+    srv.session = session;
+
+    /* Replay the malformed prefix exactly as the worker loop would see it:
+     * token by token, running the recovery scan after each piece.  The stanza
+     * opening spans several tokens, so this also checks that detection does
+     * not depend on how the marker happens to be tokenized: recovery must
+     * stay quiet on every partial prefix and trigger exactly when the
+     * opening completes. */
+    ds4_tokens toks = {0};
+    ds4_tokenize_rendered_chat(engine, forced.ptr, &toks);
+    TEST_ASSERT(toks.len > 1);
+    size_t scan_from = 0;
+    int completion = 0;
+    int rec = 0;
+    int triggered_at = -1;
+    for (int i = 0; i < toks.len; i++) {
+        TEST_ASSERT(ds4_session_eval(session, toks.v[i], err, sizeof(err)) == 0);
+        size_t piece_len = 0;
+        char *piece = ds4_token_text(engine, toks.v[i], &piece_len);
+        buf_append(&text, piece, piece_len);
+        thinking_state_feed(&thinking, piece, piece_len);
+        free(piece);
+        TEST_ASSERT(thinking.inside);
+        rec = chat_think_tool_recovery(&srv, &text, &thinking, &scan_from,
+                                       &completion, 512, err, sizeof(err));
+        TEST_ASSERT(rec >= 0);
+        if (rec == 1) {
+            triggered_at = i;
+            break;
+        }
+    }
+    fprintf(stderr,
+            "ds4-test: think-tool-recovery trigger=%d/%d injected_tokens=%d\n",
+            triggered_at, toks.len, completion);
+    TEST_ASSERT(rec == 1);
+    TEST_ASSERT(triggered_at == toks.len - 1);
+    ds4_tokens_free(&toks);
+    buf_free(&forced);
+    TEST_ASSERT(!thinking.inside);
+    TEST_ASSERT(completion > 0);
+    TEST_ASSERT(text.ptr && text.len >= 10 &&
+                !memcmp(text.ptr + text.len - 10, "</think>\n\n", 10));
+
+    /* The model must now complete a valid call on the executable side. */
+    uint64_t rng = 123;
+    bool decode_ok = true;
+    bool saw_start = false;
+    bool saw_end = false;
+    for (int i = 0; i < 256 && !saw_end; i++) {
+        int token = ds4_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
+        if (token == ds4_token_eos(engine)) break;
+        size_t piece_len = 0;
+        char *piece = ds4_token_text(engine, token, &piece_len);
+        buf_append(&text, piece, piece_len);
+        free(piece);
+        observe_tool_markers(text.ptr, &saw_start, &saw_end, NULL);
+        if (saw_end) break;
+        if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+            decode_ok = false;
+            break;
+        }
+    }
+    fprintf(stderr, "ds4-test: think-tool-recovery continuation=[%s]\n",
+            text.ptr ? text.ptr : "");
+    TEST_ASSERT(decode_ok);
+    TEST_ASSERT(saw_end);
+
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    bool parsed = parse_generated_message_ex(text.ptr, true,
+                                             &content, &reasoning, &calls);
+    TEST_ASSERT(parsed);
+    TEST_ASSERT(calls.len > 0 && !strcmp(calls.v[0].name, "list_files"));
+    TEST_ASSERT(reasoning && strstr(reasoning, "list_files tool right away"));
+
+    fprintf(stderr,
+            "ds4-test: think-tool-recovery recovered=%d gen_tokens=%d calls=%d name=%s\n",
+            rec, completion, calls.len, calls.len ? calls.v[0].name : "-");
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+    buf_free(&text);
+    ds4_session_free(session);
+    request_free(&r);
+    test_close_engine(false);
+}
+
 static void test_tool_call_quality_one(bool quality) {
     ds4_engine *engine = test_get_engine(quality);
     if (!engine) return;
@@ -1966,6 +2134,7 @@ static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
+    {"--think-tool-recovery", "think-tool-recovery", "forced </think> recovery when a tool call starts inside thinking", test_think_tool_recovery},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard Metal path", test_official_logprob_vectors},
     {"--local-golden-vectors", "local-golden-vectors", "local top-k/logit drift regression for long Metal prefill", test_local_golden_vectors},
     {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4},

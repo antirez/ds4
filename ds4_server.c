@@ -9951,6 +9951,76 @@ static thinking_state thinking_state_from_prompt(const request *r) {
     return st;
 }
 
+/* Live recovery for a tool call started inside an unclosed <think> block.
+ *
+ * The model sometimes opens a DSML stanza without closing its thinking first.
+ * Waiting for a </think> that never comes stalls the turn: the marker is never
+ * scanned as executable and the block is dropped at parse time.  Instead of
+ * rewriting sampled context, recover forward: force-feed "</think>" plus a
+ * blank line and let the model continue.  Measured on the real model, that
+ * position predicts a fresh stanza opening so strongly that the model
+ * restarts the call cleanly on the executable side of the close.  Re-emitting
+ * the stanza opening ourselves was tried and is counterproductive: with the
+ * dangling opening right before the close and a forced copy right after it,
+ * the model reads the call as already made and ends the turn.  The dangling
+ * opening stays harmlessly inside reasoning.
+ *
+ * Detection works on accumulated text, so the tokenization of the marker does
+ * not matter, and it triggers only on a complete stanza opening: a lone "<"
+ * or a partial marker keeps decoding untouched, while *scan_from holds back
+ * far enough that an opening split across future tokens is still seen from
+ * its first byte.  The forced text is tokenized with the rendered-chat
+ * tokenizer so </think> maps to its special token.
+ *
+ * Returns 1 when an injection was performed (text extended, thinking closed),
+ * 0 when there is nothing to do or no budget, -1 on eval failure. */
+static int chat_think_tool_recovery(server *s,
+                                    buf *text,
+                                    thinking_state *thinking,
+                                    size_t *scan_from,
+                                    int *completion,
+                                    int max_tokens,
+                                    char *err,
+                                    size_t errlen) {
+    if (!thinking->inside || !text->ptr) return 0;
+    if (*scan_from > text->len) *scan_from = text->len;
+    if (!find_any_tool_start(text->ptr + *scan_from)) {
+        const size_t hold = 80; /* > longest stanza opening */
+        *scan_from = text->len > hold ? text->len - hold : 0;
+        return 0;
+    }
+
+    const char *inject = "</think>\n\n";
+    const size_t inject_len = strlen(inject);
+    ds4_tokens toks = {0};
+    ds4_tokenize_rendered_chat(s->engine, inject, &toks);
+
+    const int room = ds4_session_ctx(s->session) - ds4_session_pos(s->session);
+    if (toks.len <= 0 ||
+        toks.len >= room ||
+        *completion + toks.len >= max_tokens) {
+        /* Not enough budget to recover; leave the stream as generated and let
+         * the parse-time fallback deal with it.  Skip past this marker so the
+         * scan does not retry it every token. */
+        ds4_tokens_free(&toks);
+        *scan_from = text->len;
+        return 0;
+    }
+
+    for (int i = 0; i < toks.len; i++) {
+        if (ds4_session_eval(s->session, toks.v[i], err, errlen) != 0) {
+            ds4_tokens_free(&toks);
+            return -1;
+        }
+        (*completion)++;
+    }
+    buf_append(text, inject, inject_len);
+    thinking_state_feed(thinking, inject, inject_len);
+    *scan_from = text->len;
+    ds4_tokens_free(&toks);
+    return 1;
+}
+
 static char *rendered_chat_system_region(const char *prompt_text) {
     if (!prompt_text) return xstrdup("");
     const char *p = prompt_text;
@@ -10869,6 +10939,9 @@ decode_again:
     const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
     bool tool_scan_waiting_for_think_close =
         thinking_gates_tool_markers && thinking.inside;
+    size_t think_recovery_scan_from = 0;
+    const bool think_tool_recovery_enabled =
+        getenv("DS4_SERVER_DISABLE_THINK_TOOL_RECOVERY") == NULL;
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
 
@@ -11037,9 +11110,38 @@ decode_again:
                 if (thinking_gates_tool_markers && thinking.inside) {
                     /* A DSML block inside reasoning is not executable.  This is
                      * the live guard: do not let a quoted or mistaken marker in
-                     * <think> stop decoding as a real tool call. */
-                    tool_scan_waiting_for_think_close = true;
-                    tool_scan_from = text.len;
+                     * <think> stop decoding as a real tool call.  A complete
+                     * stanza opening, however, almost always means the model
+                     * forgot to close its thinking; recover by forcing the
+                     * close so the model restarts the call on the executable
+                     * side. */
+                    const int recovered = think_tool_recovery_enabled ?
+                        chat_think_tool_recovery(s, &text, &thinking,
+                                                 &think_recovery_scan_from,
+                                                 &completion, max_tokens,
+                                                 err, sizeof(err)) : 0;
+                    if (recovered < 0) {
+                        finish = "error";
+                        stop_decode = true;
+                        break;
+                    }
+                    if (recovered) {
+                        server_log(DS4_LOG_WARNING,
+                                   "ds4-server: chat ctx=%s%s%s tool call inside unclosed <think>; "
+                                   "forced </think> after %d generated tokens",
+                                   ctx_span,
+                                   req_flags[0] ? " " : "",
+                                   req_flags,
+                                   completion);
+                        trace_event(s, trace_id,
+                                    "think tool recovery after %d generated tokens",
+                                    completion);
+                        dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
+                        tool_scan_waiting_for_think_close = true;
+                    } else {
+                        tool_scan_waiting_for_think_close = true;
+                        tool_scan_from = text.len;
+                    }
                 } else {
                     if (tool_scan_waiting_for_think_close) {
                         const char *think_end = find_last_substr(text.ptr, "</think>");

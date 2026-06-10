@@ -6131,6 +6131,75 @@ static bool agent_edit_find_old_span(const char *data, size_t len,
     return true;
 }
 
+#ifdef DS4_AGENT_TEST
+static int agent_test_failures;
+
+static void agent_test_assert(bool cond, const char *expr,
+                              const char *file, int line) {
+    if (cond) return;
+    fprintf(stderr, "%s:%d: assertion failed: %s\n", file, line, expr);
+    agent_test_failures++;
+}
+
+#define AGENT_TEST_ASSERT(expr) \
+    agent_test_assert((expr), #expr, __FILE__, __LINE__)
+
+static void test_agent_edit_upto_tail_newline_is_not_part_of_anchor(void) {
+    const char *data =
+        "CFLAGS = -Wall -Wextra -g\n"
+        "LDFLAGS =\n"
+        "\n"
+        "all: bc\n"
+        "\n"
+        "bc: main.c\n"
+        "\t$(CC) $(CFLAGS) -o bc main.c $(LDFLAGS)\n"
+        "\n"
+        "clean:\n"
+        "\trm -f bc\n";
+    const char *old =
+        "CFLAGS = -Wall -Wextra -g\n"
+        "LDFLAGS =\n"
+        "\n"
+        "all: bc\n"
+        "\n"
+        "bc: main.c\n"
+        "\t$(CC) $(CFLAGS) -o bc main.c $(LDFLAGS)\n"
+        "\n"
+        "[upto]\n"
+        "clean:\n";
+
+    const char *match = NULL;
+    size_t match_len = 0;
+    bool anchored = false;
+    char err[128] = {0};
+    AGENT_TEST_ASSERT(agent_edit_find_old_span(data, strlen(data), old,
+                                              &match, &match_len, &anchored,
+                                              err, sizeof(err)));
+    AGENT_TEST_ASSERT(anchored);
+    AGENT_TEST_ASSERT(match == data);
+    AGENT_TEST_ASSERT(match_len == strlen(data) - strlen("\trm -f bc\n"));
+}
+
+static void test_agent_edit_upto_requires_tail_after_newline_strip(void) {
+    const char *data = "head\nbody\ntail\n";
+    const char *old = "head\n[upto]\n";
+    const char *match = NULL;
+    size_t match_len = 0;
+    bool anchored = false;
+    char err[128] = {0};
+
+    AGENT_TEST_ASSERT(!agent_edit_find_old_span(data, strlen(data), old,
+                                               &match, &match_len, &anchored,
+                                               err, sizeof(err)));
+    AGENT_TEST_ASSERT(strstr(err, "must include a unique tail anchor") != NULL);
+}
+
+static void ds4_agent_unit_tests_run(void) {
+    test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
+    test_agent_edit_upto_requires_tail_after_newline_strip();
+}
+#endif
+
 static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
                                      char *err, size_t err_len) {
     (void)w;
@@ -10142,6 +10211,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     return 0;
 }
 
+#ifndef DS4_AGENT_TEST_NO_MAIN
 int main(int argc, char **argv) {
     agent_config cfg = parse_options(argc, argv);
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
@@ -10171,3 +10241,4 @@ int main(int argc, char **argv) {
     ds4_engine_close(engine);
     return rc;
 }
+#endif
