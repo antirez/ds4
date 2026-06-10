@@ -804,22 +804,6 @@ static bool web_wait_ready(cdp_ws *ws, char *err, size_t err_len) {
     return true;
 }
 
-static bool web_cdp_navigate(cdp_ws *ws, const char *url,
-                             char *err, size_t err_len) {
-    char *qurl = web_json_quote(url);
-    web_buf params = {0};
-    web_buf_puts(&params, "{\"url\":");
-    web_buf_puts(&params, qurl);
-    web_buf_puts(&params, "}");
-    free(qurl);
-    char *params_s = web_buf_take(&params);
-    char *resp = web_cdp_call(ws, "Page.navigate", params_s, err, err_len);
-    free(params_s);
-    if (!resp) return false;
-    free(resp);
-    return true;
-}
-
 static bool web_page_probe(cdp_ws *ws, char **href_out, char **ready_out,
                            long *text_len_out, char *err, size_t err_len) {
     const char *expr =
@@ -1414,7 +1398,7 @@ static char *web_run_page_js(ds4_web *web, const char *url, const char *js,
                              char *err, size_t err_len) {
     if (!web_ensure_browser(web, err, err_len)) return NULL;
     web_tab tab = {0};
-    if (!web_open_tab(web, "about:blank", &tab, err, err_len)) return NULL;
+    if (!web_open_tab(web, url, &tab, err, err_len)) return NULL;
     cdp_ws ws = {.fd = -1, .web = web};
     if (web_ws_connect(tab.ws_url, &ws, err, err_len) != 0) {
         web_close_tab(web, &tab);
@@ -1427,8 +1411,7 @@ static char *web_run_page_js(ds4_web *web, const char *url, const char *js,
         web_tab_free(&tab);
         return NULL;
     }
-    if (!web_cdp_navigate(&ws, url, err, err_len) ||
-        !web_wait_navigated_ready(&ws, url, err, err_len))
+    if (!web_wait_navigated_ready(&ws, url, err, err_len))
     {
         web_ws_close(&ws);
         web_close_tab(web, &tab);
