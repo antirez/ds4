@@ -4478,6 +4478,10 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
         }
         agent_skills_append_catalog(w);
         w->skills_catalog_appended = true;
+        if (w->skills_count > 0)
+            agent_publishf_system_status(w, "Skills: %d loaded", w->skills_count);
+        else
+            agent_publish_system_status(w, "Skills: none found");
     }
 
     pthread_mutex_lock(&w->mu);
