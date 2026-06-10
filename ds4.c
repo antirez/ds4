@@ -23876,7 +23876,16 @@ int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *f
     token_vec tokens = {0};
 
     if (!fp) fp = stdout;
-    model_open(&model, model_path, false, false);
+
+    /* Resolve model path through runtime file discovery chain. */
+    char *resolved = NULL;
+    const char *path = model_path;
+    if (path && path[0] && path[0] != '/') {
+        resolved = ds4_find_runtime_file(path);
+        if (resolved) path = resolved;
+    }
+    model_open(&model, path, false, false);
+    free(resolved);
     vocab_load(&vocab, &model);
     tokenize_rendered_chat_vocab(&vocab, text ? text : "", &tokens);
 
