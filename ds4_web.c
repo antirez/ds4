@@ -1144,15 +1144,88 @@ static char *web_browser_ws_url(ds4_web *web, char *err, size_t err_len) {
     return ws;
 }
 
-static bool web_open_tab(ds4_web *web, const char *url, web_tab *tab,
-                         char *err, size_t err_len) {
-    memset(tab, 0, sizeof(*tab));
+static bool web_json_get_int(const char *json, const char *key, int *out) {
+    char pat[128];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = json;
+    while ((p = strstr(p, pat)) != NULL) {
+        p += strlen(pat);
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (*p++ != ':') continue;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+        if (end != p) {
+            if (out) *out = (int)v;
+            return true;
+        }
+    }
+    return false;
+}
 
-    char *browser_url = web_browser_ws_url(web, err, err_len);
-    if (!browser_url) return false;
+static void web_json_excerpt(const char *json, char *out, size_t out_len) {
+    if (!out || out_len == 0) return;
+    out[0] = '\0';
+    if (!json) return;
+    size_t j = 0;
+    bool space = false;
+    for (const char *p = json; *p && j + 1 < out_len; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '\r' || c == '\n' || c == '\t' || c == ' ') {
+            if (space) continue;
+            c = ' ';
+            space = true;
+        } else {
+            space = false;
+        }
+        out[j++] = (char)c;
+    }
+    out[j] = '\0';
+}
+
+static void web_cdp_response_error(const char *resp, char *out, size_t out_len) {
+    if (!out || out_len == 0) return;
+    char *msg = web_json_get_string(resp, "message");
+    int code = 0;
+    bool has_code = web_json_get_int(resp, "code", &code);
+    if (msg && msg[0] && has_code) {
+        web_set_err(out, out_len, "CDP error %d: %s", code, msg);
+    } else if (msg && msg[0]) {
+        web_set_err(out, out_len, "CDP error: %s", msg);
+    } else {
+        char excerpt[240];
+        web_json_excerpt(resp, excerpt, sizeof(excerpt));
+        web_set_err(out, out_len, "CDP response missing targetId: %s",
+                    excerpt[0] ? excerpt : "empty response");
+    }
+    free(msg);
+}
+
+static void web_tab_set_ws_from_id(ds4_web *web, web_tab *tab) {
+    char ws_url[PATH_MAX + 128];
+    snprintf(ws_url, sizeof(ws_url), "ws://127.0.0.1:%d/devtools/page/%s",
+             web->port, tab->id);
+    tab->ws_url = web_xstrdup(ws_url);
+}
+
+static bool web_open_tab_cdp_once(ds4_web *web, const char *url, web_tab *tab,
+                                  char *detail, size_t detail_len) {
+    char local_err[256] = {0};
+
+    memset(tab, 0, sizeof(*tab));
+    if (web_set_cancel_err(web, detail, detail_len)) return false;
+
+    char *browser_url = web_browser_ws_url(web, local_err, sizeof(local_err));
+    if (!browser_url) {
+        web_set_err(detail, detail_len, "%s",
+                    local_err[0] ? local_err : "Chrome did not return a browser WebSocket URL");
+        return false;
+    }
     cdp_ws browser = {.fd = -1, .web = web};
-    if (web_ws_connect(browser_url, &browser, err, err_len) != 0) {
+    if (web_ws_connect(browser_url, &browser, local_err, sizeof(local_err)) != 0) {
         free(browser_url);
+        web_set_err(detail, detail_len, "%s",
+                    local_err[0] ? local_err : "could not connect to Chrome browser WebSocket");
         return false;
     }
     free(browser_url);
@@ -1165,24 +1238,102 @@ static bool web_open_tab(ds4_web *web, const char *url, web_tab *tab,
     free(qurl);
     char *params_s = web_buf_take(&params);
     char *resp = web_cdp_call(&browser, "Target.createTarget",
-                              params_s, err, err_len);
+                              params_s, local_err, sizeof(local_err));
     free(params_s);
     web_ws_close(&browser);
-    if (!resp) return false;
-
-    tab->id = web_json_get_string(resp, "targetId");
-    free(resp);
-    if (!tab->id) {
-        web_tab_free(tab);
-        web_set_err(err, err_len, "Chrome did not return a page target id");
+    if (!resp) {
+        web_set_err(detail, detail_len, "%s",
+                    local_err[0] ? local_err : "Target.createTarget returned no response");
         return false;
     }
 
-    char ws_url[PATH_MAX + 128];
-    snprintf(ws_url, sizeof(ws_url), "ws://127.0.0.1:%d/devtools/page/%s",
-             web->port, tab->id);
-    tab->ws_url = web_xstrdup(ws_url);
+    tab->id = web_json_get_string(resp, "targetId");
+    if (!tab->id) {
+        web_cdp_response_error(resp, detail, detail_len);
+        free(resp);
+        web_tab_free(tab);
+        return false;
+    }
+    free(resp);
+
+    web_tab_set_ws_from_id(web, tab);
     return true;
+}
+
+static bool web_open_tab_http_fallback(ds4_web *web, const char *url, web_tab *tab,
+                                       char *detail, size_t detail_len) {
+    char local_err[256] = {0};
+
+    memset(tab, 0, sizeof(*tab));
+    if (web_set_cancel_err(web, detail, detail_len)) return false;
+
+    char *enc = web_url_encode(url);
+    web_buf path = {0};
+    web_buf_puts(&path, "/json/new?");
+    web_buf_puts(&path, enc);
+    free(enc);
+
+    char *path_s = web_buf_take(&path);
+    char *body = web_http_request("PUT", web->port, path_s, local_err, sizeof(local_err));
+    free(path_s);
+    if (!body) {
+        web_set_err(detail, detail_len, "%s",
+                    local_err[0] ? local_err : "/json/new returned no response");
+        return false;
+    }
+
+    tab->id = web_json_get_string(body, "id");
+    tab->ws_url = web_json_get_string(body, "webSocketDebuggerUrl");
+    if (!tab->id) {
+        web_cdp_response_error(body, detail, detail_len);
+        free(body);
+        web_tab_free(tab);
+        return false;
+    }
+    if (!tab->ws_url || !tab->ws_url[0]) {
+        free(tab->ws_url);
+        tab->ws_url = NULL;
+        web_tab_set_ws_from_id(web, tab);
+    }
+    free(body);
+    return true;
+}
+
+static bool web_open_tab(ds4_web *web, const char *url, web_tab *tab,
+                         char *err, size_t err_len) {
+    char last_cdp[512] = {0};
+    char fallback_err[512] = {0};
+    static const int backoff_ms[] = {150, 300};
+
+    memset(tab, 0, sizeof(*tab));
+    for (int attempt = 0; attempt < 3; attempt++) {
+        char detail[512] = {0};
+        if (web_open_tab_cdp_once(web, url, tab, detail, sizeof(detail)))
+            return true;
+        web_set_err(last_cdp, sizeof(last_cdp), "%s",
+                    detail[0] ? detail : "Target.createTarget failed");
+        if (web_err_is_interrupted(last_cdp)) {
+            web_set_err(err, err_len, "%s", last_cdp);
+            return false;
+        }
+        if (attempt < 2 && !web_sleep_ms(web, backoff_ms[attempt])) {
+            web_set_err(err, err_len, "interrupted");
+            return false;
+        }
+    }
+
+    if (web_open_tab_http_fallback(web, url, tab, fallback_err, sizeof(fallback_err)))
+        return true;
+    if (web_err_is_interrupted(fallback_err)) {
+        web_set_err(err, err_len, "%s", fallback_err);
+        return false;
+    }
+
+    web_set_err(err, err_len,
+                "Chrome could not create a page target: %s; fallback /json/new failed: %s",
+                last_cdp[0] ? last_cdp : "Target.createTarget failed",
+                fallback_err[0] ? fallback_err : "unknown error");
+    return false;
 }
 
 static void web_close_tab(ds4_web *web, const web_tab *tab) {
