@@ -3619,7 +3619,7 @@ static char *agent_buf_take(agent_buf *b) {
 
 struct agent_skill {
     char name[64];
-    char description[256];
+    char description[1024];
     char path[1024];
 };
 
