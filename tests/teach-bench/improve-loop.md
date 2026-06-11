@@ -3,7 +3,7 @@
 You are running an automated improvement loop on ds4-agent's **teaching
 prompt**. ds4-agent is a terminal coding agent that doubles as a programming
 mentor: while it works it emits short `<teach>` asides. The benchmark in
-`teach-bench/` runs the agent over 8 small coding tasks and has an OpenAI
+`tests/teach-bench/` runs the agent over 8 small coding tasks and has an OpenAI
 judge score every aside 1-5 on five dimensions (insight, calibration,
 engagement, grounding, economy) against the mentor design contract. Your job
 is to iteratively improve the judge composite (0-100) by editing the
@@ -15,16 +15,16 @@ teaching prompt, re-benchmarking, and keeping only changes that help.
   `ds4_agent.c` (search for `static const char agent_teach_prompt`).
   This is the ONLY thing you may edit, plus a one-line entry per iteration
   in the experiment log. Do not touch the rest of the agent, the corpus
-  (`teach-bench/prompts.json`), the judge rubric, or the benchmark tool —
+  (`tests/teach-bench/prompts.json`), the judge rubric, or the benchmark tool —
   changing the measuring stick invalidates the comparison.
 - Rebuild with `make ds4-agent` from the repo root.
-- Benchmark: `cd teach-bench && ./teachbench.py bench --run-id <name>`.
+- Benchmark: `cd tests/teach-bench && ./teachbench.py bench --run-id <name>`.
   One full run takes 15-25 minutes and must not run concurrently with any
   other ds4 instance (global lock; the tool aborts loudly if locked).
 - Results: `./teachbench.py history --json` for per-run aggregates;
-  `teach-bench/results/<run-id>/run.json` for per-aside judge scores,
+  `tests/teach-bench/results/<run-id>/run.json` for per-aside judge scores,
   comments, and flags; `results/<run-id>/<test>/stdout.txt` for transcripts.
-- Experiment log: `teach-bench/experiments.md` (create it if missing).
+- Experiment log: `tests/teach-bench/experiments.md` (create it if missing).
 
 ## Before the first iteration
 

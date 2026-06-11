@@ -45,7 +45,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(HERE)
+REPO = os.path.dirname(os.path.dirname(HERE))
 DEFAULT_CORPUS = os.path.join(HERE, "prompts.json")
 DEFAULT_RESULTS = os.path.join(HERE, "results")
 DEFAULT_BIN = os.path.join(REPO, "ds4-agent")

@@ -20,7 +20,7 @@ Stdlib-only Python; no dependencies.
 ## Quick start
 
 ```sh
-cd teach-bench
+cd tests/teach-bench
 
 # The whole pipeline in one shot: run + judge + report
 # (needs OPENAI_API_KEY in the environment; ~8 tasks x 1-3 min each on an M4 Max)
