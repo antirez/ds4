@@ -1557,7 +1557,14 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.imatrix_dataset_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--imatrix-out")) {
             c.gen.imatrix_output_path = need_arg(&i, argc, argv, arg);
+            // NOTE（yiakwy）: previously only METAL backend supported
+            /*
             c.engine.backend = DS4_BACKEND_METAL;
+            */
+
+            // if (c.engine.backend == DS4_BACKEND_AUTO) {
+                c.engine.backend = default_backend();
+            // }
         } else if (!strcmp(arg, "--imatrix-max-prompts")) {
             c.gen.imatrix_max_prompts = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--imatrix-max-tokens")) {

@@ -10750,6 +10750,46 @@ __global__ static void moe_down_f32_kernel(
     if (threadIdx.x == 0) down_out[(uint64_t)pair * out_dim + row] = partial[0];
 }
 
+__global__ void collect_gate_up_squared_kernel(
+    const float* __restrict__ x,               // [n_tokens, expert_in_dim]
+    const int32_t* __restrict__ selected,      // [n_tokens * n_expert]
+    float* __restrict__ gate_up_sum2,          // [n_total_expert, expert_in_dim]
+    unsigned long long* __restrict__ counter,
+    uint32_t n_tokens,
+    size_t n_expert,
+    uint32_t expert_in_dim,
+    uint32_t n_total_expert);
+
+__global__ void collect_down_squared_kernel(
+    const float* __restrict__ mid,             // [n_tokens * n_expert, expert_mid_dim]
+    const int32_t* __restrict__ selected,      // [n_tokens * n_expert]
+    float* __restrict__ down_sum2,             // [n_total_expert, expert_mid_dim]
+    unsigned long long* __restrict__ counter,
+    uint32_t n_tokens,
+    uint32_t n_expert,
+    uint32_t expert_mid_dim,
+    uint32_t n_total_expert);
+
+enum {
+    DS4_MAX_LAYER = 61,
+};
+
+typedef struct {
+    float *d_squared_sum_gate;      // GPU: [n_experts, expert_in_dim]
+    float *d_squared_sum_down;      // GPU: [n_experts, expert_mid_dim]
+    unsigned long long *d_counter;  // GPU: device samples counter
+    uint64_t *d_layer_counter;      // GPU: device layer counter for multi-layer collection
+    uint64_t n_layers;
+    uint64_t n_experts;
+    uint64_t expert_in_dim;
+    uint64_t expert_mid_dim;
+    bool is_collecting;
+    bool layer_active[DS4_MAX_LAYER];
+    char output_path[256];
+} cuda_imatrix_collector_t;
+
+static cuda_imatrix_collector_t g_imatrix_collector;
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -10776,7 +10816,9 @@ static int routed_moe_launch(
         uint32_t n_expert,
         float clamp,
         const ds4_gpu_tensor *x,
-        uint32_t n_tokens) {
+        uint32_t n_tokens,
+        uint32_t layer_idx,
+        bool collect_imatrix) {
     if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
@@ -10883,10 +10925,26 @@ static int routed_moe_launch(
         uint32_t *tile16_starts = NULL;
         uint32_t tile_capacity = 0;
         uint32_t tile16_capacity = 0;
+
         dim3 xq_grid(xq_blocks, n_tokens, 1);
         q8_K_quantize_kernel<<<xq_grid, 256>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
         ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
         if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
+
+        // TODO (yiakwy) : gate/up
+        if (ok && collect_imatrix) {
+            uint32_t total_pairs = n_tokens * n_expert;
+            dim3 block(256);
+            dim3 grid((total_pairs + block.x - 1) / block.x);
+            collect_gate_up_squared_kernel<<<grid, block>>>(
+                (const float*)x->ptr,
+                (const int32_t*)selected->ptr,
+                g_imatrix_collector.d_squared_sum_gate,
+                g_imatrix_collector.d_counter,
+                n_tokens, n_expert, expert_in_dim, n_total_expert);
+            cuda_ok(cudaGetLastError(), "collect_gate_up_squared");
+        }
+
         if (ok && use_sorted_pairs) {
             const uint64_t counts_bytes = 256ull * sizeof(uint32_t);
             const uint64_t offsets_bytes = 257ull * sizeof(uint32_t);
@@ -11142,7 +11200,23 @@ static int routed_moe_launch(
                 }
             }
             ok = cuda_ok(cudaGetLastError(), "routed_moe gate/up launch");
+
+            // NOTE (yiakwy) : collect down statistics
+            if (ok && collect_imatrix) {
+                // TODO (yiakwy) : down
+                uint32_t total_pairs = n_tokens * n_expert;
+                dim3 block(256);
+                dim3 grid((total_pairs + block.x - 1) / block.x);
+                collect_down_squared_kernel<<<grid, block>>>(
+                    (const float*)mid->ptr,
+                    (const int32_t*)selected->ptr,
+                    g_imatrix_collector.d_squared_sum_down,
+                    g_imatrix_collector.d_counter,
+                    n_tokens, n_expert, expert_mid_dim, n_total_expert);
+                cuda_ok(cudaGetLastError(), "collect_down_squared");
+            }
         }
+
         if (prof_ev[3]) (void)cudaEventRecord(prof_ev[3], 0);
         if (ok) {
             dim3 midq_grid(midq_blocks, n_tokens * n_expert, 1);
@@ -11429,25 +11503,29 @@ extern "C" int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected,
 }
 
 extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index) {
-    (void)layer_index;
+    bool collect = false; 
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,
                              gate_expert_bytes, gate_row_bytes,
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
-                             selected, weights, n_total_expert, n_expert, clamp, x, 1);
+                             selected, weights, n_total_expert, n_expert, clamp, x, 1, layer_index, collect);
 }
+
+extern "C" bool cuda_imatrix_is_collecting(void);
+
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
-    (void)layer_index;
+    // (void)layer_index;
     if (mid_is_f16) *mid_is_f16 = false;
+    bool collect = cuda_imatrix_is_collecting();
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,
                              gate_expert_bytes, gate_row_bytes,
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
-                             selected, weights, n_total_expert, n_expert, clamp, x, n_tokens);
+                             selected, weights, n_total_expert, n_expert, clamp, x, n_tokens, layer_index, collect);
 }
 extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;
@@ -11764,4 +11842,226 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
                                         weight_offset, in_dim, out_dim, x, 1) &&
            ds4_gpu_hc_expand_split_tensor(out_hc, block_out, residual_hc,
                                             split, n_embd, n_hc);
+}
+
+// NOTE (yiakwy) cuda gpu imatrix collector
+
+__global__ void collect_gate_up_squared_kernel(
+    const float* __restrict__ x,               // [n_tokens, expert_in_dim]
+    const int32_t* __restrict__ selected,      // [n_tokens * n_expert]
+    float* __restrict__ gate_up_sum2,          // [n_total_expert, expert_in_dim]
+    unsigned long long* __restrict__ counter,
+    uint32_t n_tokens,
+    size_t n_expert,
+    uint32_t expert_in_dim,
+    uint32_t n_total_expert
+) {
+    uint32_t pair = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pair >= n_tokens * n_expert) return;
+    
+    uint32_t tok = pair / n_expert;
+    uint32_t slot = pair - tok * n_expert;
+    int32_t expert = selected[pair];
+    if (expert < 0 || (uint32_t)expert >= n_total_expert) return;
+
+    const float* xr = x + (uint64_t)tok * expert_in_dim;
+    float* sum_row = gate_up_sum2 + (uint64_t)expert * expert_in_dim;
+
+    for (uint32_t d = 0; d < expert_in_dim; d++) {
+        float v = xr[d];
+        atomicAdd(&sum_row[d], v * v);
+    }
+
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        atomicAdd(counter, 1ULL);
+    }
+}
+
+__global__ void collect_down_squared_kernel(
+    const float* __restrict__ mid,             // [n_tokens * n_expert, expert_mid_dim]
+    const int32_t* __restrict__ selected,      // [n_tokens * n_expert]
+    float* __restrict__ down_sum2,             // [n_total_expert, expert_mid_dim]
+    unsigned long long* __restrict__ counter,
+    uint32_t n_tokens,
+    uint32_t n_expert,
+    uint32_t expert_mid_dim,
+    uint32_t n_total_expert)
+{
+    uint32_t pair = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pair >= n_tokens * n_expert) return;
+
+    int32_t expert = selected[pair];
+    if (expert < 0 || (uint32_t)expert >= n_total_expert) return;
+
+    const float* midr = mid + (uint64_t)pair * expert_mid_dim;
+    float* sum_row = down_sum2 + (uint64_t)expert * expert_mid_dim;
+
+    for (uint32_t d = 0; d < expert_mid_dim; d++) {
+        float v = midr[d];
+        atomicAdd(&sum_row[d], v * v);
+    }
+
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        atomicAdd(counter, 1ULL);
+    }
+}
+
+// cuda imatrix
+extern "C" int cuda_imatrix_init(
+    uint64_t n_layers,
+    uint64_t n_experts,
+    uint64_t expert_in_dim,
+    uint64_t expert_mid_dim,
+    const char* output_path)
+{
+    if (g_imatrix_collector.is_collecting) {
+        fprintf(stderr, "ds4: imatrix collector already active\n");
+        return 0;
+    }
+    memset(&g_imatrix_collector, 0, sizeof(g_imatrix_collector));
+
+    g_imatrix_collector.n_layers = n_layers;
+    g_imatrix_collector.n_experts = n_experts;
+    g_imatrix_collector.expert_in_dim = expert_in_dim;
+    g_imatrix_collector.expert_mid_dim = expert_mid_dim;
+    strncpy(g_imatrix_collector.output_path, output_path,
+            sizeof(g_imatrix_collector.output_path) - 1);
+    g_imatrix_collector.output_path[sizeof(g_imatrix_collector.output_path)-1] = '\0';
+
+    size_t gate_bytes = n_experts * expert_in_dim * sizeof(float);
+    if (!cuda_ok(cudaMalloc(&g_imatrix_collector.d_squared_sum_gate, gate_bytes),
+                 "imatrix gate alloc")) return 0;
+    if (!cuda_ok(cudaMemset(g_imatrix_collector.d_squared_sum_gate, 0, gate_bytes),
+                 "imatrix gate memset")) {
+        cudaFree(g_imatrix_collector.d_squared_sum_gate);
+        return 0;
+    }
+
+    size_t down_bytes = n_experts * expert_mid_dim * sizeof(float);
+    if (!cuda_ok(cudaMalloc(&g_imatrix_collector.d_squared_sum_down, down_bytes),
+                 "imatrix down alloc")) {
+        cudaFree(g_imatrix_collector.d_squared_sum_gate);
+        return 0;
+    }
+    if (!cuda_ok(cudaMemset(g_imatrix_collector.d_squared_sum_down, 0, down_bytes),
+                 "imatrix down memset")) {
+        cudaFree(g_imatrix_collector.d_squared_sum_gate);
+        cudaFree(g_imatrix_collector.d_squared_sum_down);
+        return 0;
+    }
+
+    if (!cuda_ok(cudaMalloc(&g_imatrix_collector.d_counter, sizeof(unsigned long long)),
+                 "imatrix counter alloc")) {
+        cudaFree(g_imatrix_collector.d_squared_sum_gate);
+        cudaFree(g_imatrix_collector.d_squared_sum_down);
+        return 0;
+    }
+    if (!cuda_ok(cudaMemset(g_imatrix_collector.d_counter, 0, sizeof(unsigned long long)),
+                 "imatrix counter memset")) {
+        cudaFree(g_imatrix_collector.d_squared_sum_gate);
+        cudaFree(g_imatrix_collector.d_squared_sum_down);
+        cudaFree(g_imatrix_collector.d_counter);
+        return 0;
+    }
+
+    for (uint64_t i = 0; i < n_layers && i < DS4_MAX_LAYER; i++)
+        g_imatrix_collector.layer_active[i] = true;
+
+    g_imatrix_collector.is_collecting = true;
+
+    fprintf(stderr, "ds4: CUDA imatrix collector initialized (layers=%llu, experts=%llu, in_dim=%llu, mid_dim=%llu)\n",
+            (unsigned long long)n_layers,
+            (unsigned long long)n_experts,
+            (unsigned long long)expert_in_dim,
+            (unsigned long long)expert_mid_dim);
+    return 1;
+}
+
+extern "C" int cuda_imatrix_finalize(void) {
+    if (!g_imatrix_collector.is_collecting) {
+        fprintf(stderr, "ds4: imatrix collector not active\n");
+        return 0;
+    }
+    cudaDeviceSynchronize();
+
+    unsigned long long n_samples = 0;
+    if (!cuda_ok(cudaMemcpy(&n_samples, g_imatrix_collector.d_counter,
+                            sizeof(unsigned long long), cudaMemcpyDeviceToHost),
+                 "imatrix copy counter")) return 0;
+    if (n_samples == 0) {
+        fprintf(stderr, "ds4: no samples collected for imatrix\n");
+        return 0;
+    }
+
+    size_t gate_bytes = g_imatrix_collector.n_experts * g_imatrix_collector.expert_in_dim * sizeof(float);
+    float* h_gate_sum = (float*)malloc(gate_bytes);
+    if (!h_gate_sum) return 0;
+    if (!cuda_ok(cudaMemcpy(h_gate_sum, g_imatrix_collector.d_squared_sum_gate,
+                            gate_bytes, cudaMemcpyDeviceToHost),
+                 "imatrix copy gate sum")) {
+        free(h_gate_sum);
+        return 0;
+    }
+
+    size_t down_bytes = g_imatrix_collector.n_experts * g_imatrix_collector.expert_mid_dim * sizeof(float);
+    float* h_down_sum = (float*)malloc(down_bytes);
+    if (!h_down_sum) {
+        free(h_gate_sum);
+        return 0;
+    }
+    if (!cuda_ok(cudaMemcpy(h_down_sum, g_imatrix_collector.d_squared_sum_down,
+                            down_bytes, cudaMemcpyDeviceToHost),
+                 "imatrix copy down sum")) {
+        free(h_gate_sum);
+        free(h_down_sum);
+        return 0;
+    }
+
+    FILE* fp = fopen(g_imatrix_collector.output_path, "wb");
+    if (fp) {
+        const char magic[] = "imatrix";
+        uint32_t version = 1;
+        uint32_t n_entries = 3; // gate, up, down
+        fwrite(magic, 1, 7, fp);
+        fwrite(&version, sizeof(version), 1, fp);
+        fwrite(&n_entries, sizeof(n_entries), 1, fp);
+
+        const char* names[3] = {
+            "blk.N.ffn_gate_exps.weight",
+            "blk.N.ffn_up_exps.weight",
+            "blk.N.ffn_down_exps.weight"
+        };
+        for (uint32_t entry = 0; entry < 3; entry++) {
+            uint32_t name_len = strlen(names[entry]);
+            fwrite(&name_len, sizeof(name_len), 1, fp);
+            fwrite(names[entry], 1, name_len, fp);
+            uint32_t n_rows = g_imatrix_collector.n_experts;
+            uint32_t n_cols = (entry < 2) ? g_imatrix_collector.expert_in_dim
+                                          : g_imatrix_collector.expert_mid_dim;
+            fwrite(&n_rows, sizeof(n_rows), 1, fp);
+            fwrite(&n_cols, sizeof(n_cols), 1, fp);
+            const float* data = (entry < 2) ? h_gate_sum : h_down_sum;
+            for (uint64_t i = 0; i < (uint64_t)n_rows * n_cols; i++) {
+                float mean = data[i] / (float)n_samples;
+                fwrite(&mean, sizeof(mean), 1, fp);
+            }
+        }
+        fclose(fp);
+        fprintf(stderr, "ds4: wrote imatrix to %s (samples=%llu)\n",
+                g_imatrix_collector.output_path, (unsigned long long)n_samples);
+    } else {
+        fprintf(stderr, "ds4: failed to open %s for writing\n", g_imatrix_collector.output_path);
+    }
+
+    free(h_gate_sum);
+    free(h_down_sum);
+    cudaFree(g_imatrix_collector.d_squared_sum_gate);
+    cudaFree(g_imatrix_collector.d_squared_sum_down);
+    cudaFree(g_imatrix_collector.d_counter);
+    memset(&g_imatrix_collector, 0, sizeof(g_imatrix_collector));
+    return 1;
+}
+
+extern "C" bool cuda_imatrix_is_collecting(void) {
+    return g_imatrix_collector.is_collecting;
 }
