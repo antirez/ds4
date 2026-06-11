@@ -10365,6 +10365,7 @@ typedef struct {
     bool quality;
     bool ssd_streaming;
     bool ssd_streaming_cold;
+    bool cuda_backend;
     bool streaming_static_decode_map_current;
     bool mtp_enabled;
     float *cpu_router_norm;
@@ -11391,6 +11392,7 @@ static bool metal_graph_stream_prefill_selected_pagein_enabled(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
+           !g->cuda_backend &&
            getenv("DS4_METAL_ENABLE_STREAMING_PREFILL_SELECTED_PAGEIN") != NULL &&
            getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_SELECTED_PAGEIN") == NULL;
 }
@@ -11399,6 +11401,7 @@ static bool metal_graph_stream_prefill_selected_madvise_enabled(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
+           !g->cuda_backend &&
            getenv("DS4_METAL_ENABLE_STREAMING_PREFILL_SELECTED_MADVISE") != NULL &&
            getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_SELECTED_MADVISE") == NULL;
 }
@@ -11407,6 +11410,7 @@ static bool metal_graph_stream_prefill_layer_pagein_enabled(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
+           !g->cuda_backend &&
            getenv("DS4_METAL_ENABLE_STREAMING_PREFILL_LAYER_PAGEIN") != NULL &&
            getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_LAYER_PAGEIN") == NULL;
 }
@@ -11415,6 +11419,7 @@ static bool metal_graph_stream_prefill_layer_readahead_enabled(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
+           !g->cuda_backend &&
            getenv("DS4_METAL_ENABLE_STREAMING_PREFILL_LAYER_READAHEAD") != NULL &&
            getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_LAYER_READAHEAD") == NULL &&
            getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_LAYER_PREPARE") == NULL;
@@ -11424,6 +11429,7 @@ static bool metal_graph_stream_prefill_layer_pread_enabled(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
+           !g->cuda_backend &&
            getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_LAYER_PREAD") == NULL &&
            getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_LAYER_PREPARE") == NULL;
 }
@@ -11432,6 +11438,7 @@ static bool metal_graph_stream_prefill_layer_madvise_enabled(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
+           !g->cuda_backend &&
            getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_LAYER_PREPARE") == NULL &&
            getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_LAYER_MADVISE") == NULL;
 }
@@ -11474,6 +11481,7 @@ static bool metal_graph_stream_prefill_batch_selected_addr_enabled(
         uint32_t             n_tokens) {
     if (!g ||
         !g->ssd_streaming ||
+        g->cuda_backend ||
         g->quality ||
         !weights ||
         n_tokens <= 1 ||
@@ -12480,6 +12488,7 @@ static bool metal_graph_stream_prefill_selected_readahead_enabled(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
+           !g->cuda_backend &&
            (getenv("DS4_METAL_ENABLE_STREAMING_PREFILL_SELECTED_READAHEAD") != NULL ||
             getenv("DS4_METAL_ENABLE_STREAMING_PREFILL_SELECTED_READAHEAD_SHARED") != NULL) &&
            getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_SELECTED_READAHEAD") == NULL;
@@ -12489,6 +12498,7 @@ static bool metal_graph_stream_prefill_selected_readahead_shared_enabled(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
+           !g->cuda_backend &&
            getenv("DS4_METAL_ENABLE_STREAMING_PREFILL_SELECTED_READAHEAD_SHARED") != NULL &&
            getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_SELECTED_READAHEAD_SHARED") == NULL &&
            getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_SELECTED_READAHEAD") == NULL;
@@ -13210,11 +13220,14 @@ static bool metal_graph_q4_non_streaming_opt_in_enabled(void) {
 }
 
 static bool metal_graph_q4_selected_paths_allowed(const ds4_gpu_graph *g) {
-    return g && (g->ssd_streaming || metal_graph_q4_non_streaming_opt_in_enabled());
+    return g &&
+           !g->cuda_backend &&
+           (g->ssd_streaming || metal_graph_q4_non_streaming_opt_in_enabled());
 }
 
 static bool metal_graph_use_iq2_selected_shared_overlap(const ds4_gpu_graph *g) {
     return g &&
+           !g->cuda_backend &&
            g->ssd_streaming &&
            getenv("DS4_METAL_DISABLE_STREAMING_SELECTED_SHARED_OVERLAP") == NULL &&
            getenv("DS4_METAL_DISABLE_IQ2_SELECTED_SHARED_OVERLAP") == NULL;
@@ -13222,6 +13235,7 @@ static bool metal_graph_use_iq2_selected_shared_overlap(const ds4_gpu_graph *g) 
 
 static bool metal_graph_use_iq2_selected_async_load(const ds4_gpu_graph *g) {
     return g &&
+           !g->cuda_backend &&
            g->ssd_streaming &&
            getenv("DS4_METAL_DISABLE_STREAMING_SELECTED_ASYNC_LOAD") == NULL;
 }
@@ -13229,8 +13243,21 @@ static bool metal_graph_use_iq2_selected_async_load(const ds4_gpu_graph *g) {
 static bool metal_graph_use_iq2_selected_async_early_commit(
         const ds4_gpu_graph *g) {
     return g &&
+           !g->cuda_backend &&
            g->ssd_streaming &&
            getenv("DS4_METAL_DISABLE_STREAMING_SELECTED_ASYNC_EARLY_COMMIT") == NULL;
+}
+
+static bool metal_graph_use_cuda_selected_async_load(const ds4_gpu_graph *g) {
+    return g &&
+           g->cuda_backend &&
+           g->ssd_streaming &&
+           getenv("DS4_CUDA_ENABLE_STREAMING_SELECTED_ASYNC_LOAD") != NULL &&
+           getenv("DS4_CUDA_DISABLE_STREAMING_SELECTED_ASYNC_LOAD") == NULL;
+}
+
+static bool metal_graph_use_cuda_selected_shared_overlap(const ds4_gpu_graph *g) {
+    return metal_graph_use_cuda_selected_async_load(g);
 }
 
 static bool metal_graph_use_pro_q4_expert_table_auto(const ds4_gpu_graph *g) {
@@ -13329,6 +13356,7 @@ static bool metal_graph_decode_iq2_selected_slots_expected(
         const ds4_gpu_graph     *g,
         const ds4_layer_weights *layer) {
     return g &&
+           !g->cuda_backend &&
            g->ssd_streaming &&
            !g->quality &&
            layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
@@ -13339,6 +13367,36 @@ static bool metal_graph_decode_iq2_selected_slots_expected(
            getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
            getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
            getenv("DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS") == NULL;
+}
+
+static bool metal_graph_decode_cuda_streaming_selected_slots_expected(
+        const ds4_gpu_graph     *g,
+        const ds4_layer_weights *layer) {
+    if (!g ||
+        !g->cuda_backend ||
+        !g->ssd_streaming ||
+        g->quality ||
+        !layer ||
+        !layer->ffn_gate_exps ||
+        !layer->ffn_up_exps ||
+        !layer->ffn_down_exps ||
+        DS4_N_EXPERT_USED == 0 ||
+        DS4_N_EXPERT_USED > DS4_MAX_EXPERT_USED ||
+        DS4_N_EXPERT == 0 ||
+        DS4_N_EXPERT > DS4_MAX_EXPERT ||
+        getenv("DS4_MOE_REPLAY_SELECTED_IDS") != NULL) {
+        return false;
+    }
+
+    const bool iq2_q2 =
+        layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q2_K;
+    const bool q4 =
+        layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
+        layer->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q4_K;
+    return iq2_q2 || q4;
 }
 
 static uint32_t metal_graph_streaming_prefill_cache_seed_k(const ds4_gpu_graph *g) {
@@ -13821,11 +13879,13 @@ static void metal_graph_selected_async_load_run(
                                 sizeof(job->selected_ids[0])) == 0) {
         return;
     }
+    const char *backend_label = job->g->cuda_backend ? "CUDA" : "Metal";
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
         if (job->selected_ids[i] < 0 ||
             (uint32_t)job->selected_ids[i] >= DS4_N_EXPERT) {
             fprintf(stderr,
-                    "ds4: Metal streaming async selected expert id %d is outside 0..%u at layer %u\n",
+                    "ds4: %s streaming async selected expert id %d is outside 0..%u at layer %u\n",
+                    backend_label,
                     job->selected_ids[i],
                     DS4_N_EXPERT,
                     job->il);
@@ -13887,7 +13947,7 @@ static bool metal_graph_selected_async_load_ensure_worker(void) {
     if (rc != 0) {
         pthread_mutex_unlock(&g_metal_graph_selected_async_load_mutex);
         fprintf(stderr,
-                "ds4: failed to start Metal streaming async selected load worker: %s\n",
+                "ds4: failed to start GPU streaming async selected load worker: %s\n",
                 strerror(rc));
         return false;
     }
@@ -14764,17 +14824,24 @@ static bool metal_graph_encode_decode_layer(
     const bool iq2_selected_shared_overlap =
         metal_graph_use_iq2_selected_shared_overlap(g) &&
         metal_graph_decode_iq2_selected_slots_expected(g, layer);
+    const bool cuda_selected_shared_overlap =
+        metal_graph_use_cuda_selected_shared_overlap(g) &&
+        metal_graph_decode_cuda_streaming_selected_slots_expected(g, layer);
     const bool overlap_selected_shared =
         ok &&
         !decode_stage_profile &&
         !metal_graph_decode_cpu_router_applicable(g, layer) &&
         layer->ffn_gate_tid2eid == NULL &&
         getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL &&
-        (q4_selected_shared_overlap || iq2_selected_shared_overlap);
+        (q4_selected_shared_overlap ||
+         iq2_selected_shared_overlap ||
+         cuda_selected_shared_overlap);
     const bool async_selected_load =
         overlap_selected_shared &&
-        iq2_selected_shared_overlap &&
-        metal_graph_use_iq2_selected_async_load(g);
+        ((iq2_selected_shared_overlap &&
+          metal_graph_use_iq2_selected_async_load(g)) ||
+         (cuda_selected_shared_overlap &&
+          metal_graph_use_cuda_selected_async_load(g)));
     const bool selected_readahead_shared_delay =
         ok &&
         !overlap_selected_shared &&
@@ -14914,19 +14981,19 @@ static bool metal_graph_encode_decode_layer(
         bool async_load_started = false;
         const bool async_early_commit =
             async_selected_load &&
+            !g->cuda_backend &&
             metal_graph_use_iq2_selected_async_early_commit(g);
         if (ok && async_selected_load) {
-            ok = metal_graph_selected_async_load_start(&async_load,
-                                                       g,
-                                                       model,
-                                                       layer,
-                                                       il,
-                                                       selected_event,
-                                                       gate_expert_bytes,
-                                                       down_expert_bytes);
-            async_load_started = ok;
+            async_load_started = metal_graph_selected_async_load_start(&async_load,
+                                                                       g,
+                                                                       model,
+                                                                       layer,
+                                                                       il,
+                                                                       selected_event,
+                                                                       gate_expert_bytes,
+                                                                       down_expert_bytes);
         }
-        if (ok && async_early_commit) {
+        if (ok && async_load_started && async_early_commit) {
             ok = ds4_gpu_flush_commands() != 0;
         }
         if (ok && fuse_shared_gate_up) {
@@ -14961,6 +15028,12 @@ static bool metal_graph_encode_decode_layer(
                                               g->shared_mid, 1) != 0;
         }
         DS4_METAL_PROFILE_DECODE_STAGE("shared_down");
+        if (!ok && selected_event != 0 && !async_load_started) {
+            (void)ds4_gpu_commit_and_wait_selected_readback(
+                    selected_event,
+                    "selected-id shared-overlap cleanup");
+            selected_event = 0;
+        }
         if (async_load_started) {
             const bool flush_ok = ds4_gpu_flush_commands() != 0;
             const bool finish_ok =
@@ -18535,7 +18608,7 @@ static bool metal_graph_eval_token_raw_swa(
         int                    token,
         uint32_t               pos,
         float                 *logits) {
-    if (g && g->ssd_streaming) {
+    if (g && g->ssd_streaming && !g->cuda_backend) {
         return metal_graph_eval_token_raw_swa_streaming(g, model, weights, token, pos, logits);
     }
 
@@ -18614,6 +18687,7 @@ static bool metal_graph_use_streaming_decode_prefill(
         metal_graph_streaming_decode_prefill_max_tokens(g, weights);
     return g &&
            g->ssd_streaming &&
+           !g->cuda_backend &&
            !g->quality &&
            n_tokens != 0 &&
            max_tokens != 0 &&
@@ -19503,7 +19577,7 @@ static bool metal_graph_prefill_layer_major(
         return ok;
     }
 
-    if (g->ssd_streaming) {
+    if (g->ssd_streaming && !g->cuda_backend) {
         g->streaming_static_decode_map_current = false;
         if (!metal_graph_stream_map_token(model, weights)) return false;
     }
@@ -19530,7 +19604,7 @@ static bool metal_graph_prefill_layer_major(
         metal_graph_stream_prefill_layer_prepare_ahead() : 1u;
     const bool batch_selected_addr =
         metal_graph_stream_prefill_batch_selected_addr_enabled(g, weights, n_tokens);
-    if (g->ssd_streaming && DS4_N_LAYER > 0) {
+    if (g->ssd_streaming && !g->cuda_backend && DS4_N_LAYER > 0) {
         if (layer_prepare) {
             if (!metal_graph_stream_prepare_start_if_needed(g,
                                                             model,
@@ -19602,7 +19676,7 @@ static bool metal_graph_prefill_layer_major(
             ok = false;
             break;
         }
-        if (g->ssd_streaming) {
+        if (g->ssd_streaming && !g->cuda_backend) {
             g->streaming_static_decode_map_current = false;
             const bool map_ok = batch_selected_addr ?
                 metal_graph_stream_map_layer_decode(model, weights, il) :
@@ -19612,7 +19686,7 @@ static bool metal_graph_prefill_layer_major(
                 break;
             }
         }
-        if (g->ssd_streaming) {
+        if (g->ssd_streaming && !g->cuda_backend) {
             if (layer_prepare && layer_prepare_overlap) {
                 bool started_future = false;
                 for (uint32_t ahead = 1; ahead <= layer_prepare_ahead; ahead++) {
@@ -19743,6 +19817,7 @@ static bool metal_graph_prefill_layer_major(
         }
         if (ok &&
             g->ssd_streaming &&
+            !g->cuda_backend &&
             layer_prepare &&
             !layer_prepare_overlap) {
             if (il + 1 < DS4_N_LAYER) {
@@ -19824,7 +19899,7 @@ static bool metal_graph_prefill_layer_major(
                                               hc_dim);
         ok = last_hc != NULL;
     }
-    if (ok && logits && g->ssd_streaming) {
+    if (ok && logits && g->ssd_streaming && !g->cuda_backend) {
         const bool static_decode_map =
             metal_graph_stream_decode_static_map_enabled();
         const bool static_map_state_cache =
@@ -21909,6 +21984,7 @@ static int generate_metal_graph_raw_swa(
         const ds4_vocab   * vocab,
         const ds4_weights * weights,
         const token_vec   * prompt,
+        ds4_backend         backend,
         int                 n_predict,
         int                 ctx_size,
         bool                quality,
@@ -21951,6 +22027,7 @@ static int generate_metal_graph_raw_swa(
     g.quality = quality;
     g.ssd_streaming = ssd_streaming;
     g.ssd_streaming_cold = ssd_streaming_cold;
+    g.cuda_backend = backend == DS4_BACKEND_CUDA;
     g.streaming_preload_experts = ssd_streaming_preload_experts;
     g.power_percent = power_percent > 0 ? (uint32_t)power_percent : 100u;
     if (!metal_graph_load_directional_steering(&g,
@@ -24106,6 +24183,7 @@ int ds4_engine_generate_argmax(
             return 1;
         }
         return generate_metal_graph_raw_swa(model, vocab, weights, prompt,
+                                            e->backend,
                                             n_predict, ctx_size, e->quality,
                                             e->ssd_streaming,
                                             e->ssd_streaming_cold,
@@ -24326,9 +24404,11 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
     (void)e;
     return true;
 #else
+    const char *backend_label =
+        e && e->backend == DS4_BACKEND_CUDA ? "CUDA" : "Metal";
     if (!e ||
         !e->ssd_streaming ||
-        e->backend != DS4_BACKEND_METAL ||
+        !ds4_backend_uses_graph(e->backend) ||
         e->ssd_streaming_cache_experts != 0 ||
         e->ssd_streaming_cache_bytes != 0) {
         return true;
@@ -24337,22 +24417,25 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
     const uint64_t recommended = ds4_gpu_recommended_working_set_size();
     if (recommended == 0) {
         fprintf(stderr,
-                "ds4: Metal SSD streaming auto cache: recommended working set unavailable; "
-                "set --ssd-streaming-cache-experts N or NGB explicitly\n");
+                "ds4: %s SSD streaming auto cache: recommended working set unavailable; "
+                "set --ssd-streaming-cache-experts N or NGB explicitly\n",
+                backend_label);
         return false;
     }
 
     uint64_t non_routed_bytes = 0;
     if (!weights_streaming_non_routed_bytes(&e->weights, &non_routed_bytes)) {
         fprintf(stderr,
-                "ds4: Metal SSD streaming auto cache could not measure non-routed model weights\n");
+                "ds4: %s SSD streaming auto cache could not measure non-routed model weights\n",
+                backend_label);
         return false;
     }
 
     uint64_t per_expert_bytes = 0;
     if (!ds4_streaming_routed_expert_bytes(&e->weights, &per_expert_bytes)) {
         fprintf(stderr,
-                "ds4: Metal SSD streaming auto cache could not measure routed expert size\n");
+                "ds4: %s SSD streaming auto cache could not measure routed expert size\n",
+                backend_label);
         return false;
     }
 
@@ -24364,15 +24447,18 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
                                  max_model_experts,
                                  &plan)) {
         fprintf(stderr,
-                "ds4: Metal SSD streaming auto cache could not compute a valid cache budget\n");
+                "ds4: %s SSD streaming auto cache could not compute a valid cache budget\n",
+                backend_label);
         return false;
     }
 
     e->ssd_streaming_cache_experts = plan.cache_experts;
     fprintf(stderr,
-            "ds4: Metal SSD streaming auto cache budget\n");
+            "ds4: %s SSD streaming auto cache budget\n",
+            backend_label);
     fprintf(stderr,
-            "ds4:   Metal recommends %.2f GiB working set\n",
+            "ds4:   %s recommends %.2f GiB working set\n",
+            backend_label,
             (double)recommended / 1073741824.0);
     fprintf(stderr,
             "ds4:   using 80%% total for model + cached experts: %.2f GiB\n",
@@ -24546,8 +24632,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (opt->warm_weights) model_warm_weights(&e->model);
     if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
-    if (e->ssd_streaming && e->backend != DS4_BACKEND_METAL) {
-        fprintf(stderr, "ds4: --ssd-streaming is currently supported only with --metal\n");
+    if (e->ssd_streaming && !ds4_backend_uses_graph(e->backend)) {
+        fprintf(stderr, "ds4: --ssd-streaming requires a GPU graph backend\n");
         ds4_engine_close(e);
         *out = NULL;
         return 1;
@@ -24602,7 +24688,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         e->ssd_streaming_cache_experts = budget;
         fprintf(stderr,
-                "ds4: Metal SSD streaming cache budget %.2f GiB / %.2f MiB per expert = %u experts\n",
+                "ds4: %s SSD streaming cache budget %.2f GiB / %.2f MiB per expert = %u experts\n",
+                e->backend == DS4_BACKEND_CUDA ? "CUDA" : "Metal",
                 (double)e->ssd_streaming_cache_bytes / 1073741824.0,
                 (double)per_expert_bytes / 1048576.0,
                 budget);
@@ -24984,6 +25071,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->graph.quality = e->quality;
     s->graph.ssd_streaming = e->ssd_streaming;
     s->graph.ssd_streaming_cold = e->ssd_streaming_cold;
+    s->graph.cuda_backend = e->backend == DS4_BACKEND_CUDA;
     s->graph.streaming_preload_experts = e->ssd_streaming_preload_experts;
     s->graph.power_percent = (uint32_t)e->power_percent;
     if (!metal_graph_load_directional_steering(&s->graph,
