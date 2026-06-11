@@ -1498,8 +1498,20 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
 
 extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
     (void)max_tensor_bytes;
+    if (!model_map || model_size == 0 ||
+        map_offset > model_size ||
+        map_size > model_size - map_offset) {
+        return 0;
+    }
     if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
-    return cuda_model_copy_chunked(model_map, model_size, map_offset, map_size);
+    /*
+     * Do not eagerly copy a contiguous model image here.  On Strix Halo the
+     * caller immediately follows with accelerator_cache_model_tensors(), which
+     * prepares the exact tensor spans selected by --layers.  Copying here would
+     * either allocate the whole GGUF image or, for sparse span sets, an oversized
+     * envelope before the precise tensor-span cache gets a chance to run.
+     */
+    return 1;
 }
 
 extern "C" int ds4_gpu_set_model_map_spans(
@@ -1518,15 +1530,13 @@ extern "C" int ds4_gpu_set_model_map_spans(
             return 0;
         }
     }
-    uint64_t min_offset = offsets[0];
-    uint64_t max_end = offsets[0] + sizes[0];
-    for (uint32_t i = 1; i < count; i++) {
-        if (offsets[i] < min_offset) min_offset = offsets[i];
-        const uint64_t end = offsets[i] + sizes[i];
-        if (end > max_end) max_end = end;
-    }
     if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
-    return cuda_model_copy_chunked(model_map, model_size, min_offset, max_end - min_offset);
+    /*
+     * The spans can be sparse distributed layer slices.  Materializing their
+     * min..max envelope can be much larger than the actual selected tensors.
+     * Leave the precise per-tensor preparation to accelerator_cache_model_tensors().
+     */
+    return 1;
 }
 
 extern "C" int ds4_gpu_set_model_fd(int fd) {
