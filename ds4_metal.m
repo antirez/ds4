@@ -15711,7 +15711,17 @@ int ds4_gpu_attention_output_q8_batch_tensor(
         (void)group_tmp;
         (void)low_tmp;
 
+        /* Multi-column low projection: one weight read serves every token
+         * column, instead of the per-(group, token) dispatch re-reading the
+         * out_a weights n_tokens times.  This is the dominant cost of this
+         * stage in small-batch verify passes. */
+        const bool use_ext_low =
+            n_tokens >= 2u && n_tokens <= 8u &&
+            (group_dim % 128u) == 0 &&
+            ds4_gpu_mv_ext_r1ptg(n_tokens) != 0 &&
+            getenv("DS4_METAL_DISABLE_ATTN_OUT_LOW_EXT") == NULL;
         const bool use_direct_low =
+            !use_ext_low &&
             n_tokens < 32u && getenv("DS4_METAL_DISABLE_ATTN_OUT_LOW_DIRECT") == NULL;
         /* The exported TensorOps attention-output kernel is a 64-token tile.
          * Keep this on full tiles only; smaller multiples of 32 use the legacy
@@ -15722,7 +15732,7 @@ int ds4_gpu_attention_output_q8_batch_tensor(
             ds4_gpu_use_mpp_attn_out_low_matmul();
         const NSUInteger ids_bytes = (NSUInteger)n_tokens * (NSUInteger)n_groups * sizeof(int32_t);
         id<MTLBuffer> group_ids_buffer = nil;
-        if (!use_direct_low && !use_mpp_low) {
+        if (!use_direct_low && !use_mpp_low && !use_ext_low) {
             if (getenv("DS4_METAL_DISABLE_ATTN_OUT_IDS_CACHE") != NULL) {
                 group_ids_buffer =
                     ds4_gpu_new_transient_buffer(ids_bytes, "attention output group ids");
@@ -15908,6 +15918,59 @@ int ds4_gpu_attention_output_q8_batch_tensor(
                                                 ds4_gpu_tensor_offset(low),
                                                 group_ids_buffer,
                                                 0) != 0;
+            } else if (use_ext_low) {
+                const int16_t ext_nsg = 2;
+                const int16_t ext_nxpsg = ds4_gpu_mv_ext_nxpsg(group_dim, n_tokens);
+                const int16_t ext_r1ptg = ds4_gpu_mv_ext_r1ptg(n_tokens);
+                const char *ext_fn = NULL;
+                switch (ext_r1ptg) {
+                case 2: ext_fn = "kernel_dsv4_attn_out_low_ext_q8_0_r1_2"; break;
+                case 3: ext_fn = "kernel_dsv4_attn_out_low_ext_q8_0_r1_3"; break;
+                case 4: ext_fn = "kernel_dsv4_attn_out_low_ext_q8_0_r1_4"; break;
+                case 5: ext_fn = "kernel_dsv4_attn_out_low_ext_q8_0_r1_5"; break;
+                default: break;
+                }
+                id<MTLComputePipelineState> ext_pipeline =
+                    ext_fn ? ds4_gpu_get_mul_mv_ext_pipeline(ext_fn, ext_nsg, ext_nxpsg) : nil;
+                ok = ext_pipeline != nil;
+                if (ok) {
+                    const int16_t ext_nypsg = 32 / ext_nxpsg;
+                    const NSUInteger ext_r0ptg = (NSUInteger)ext_nypsg * (NSUInteger)ext_nsg;
+                    /* z slice = head group: weights slab g at nb02 strides,
+                     * src1 columns stride by token (nb11) within a group
+                     * (nb12); dst is token-major via the dst_tm=1 kernel. */
+                    ds4_gpu_mul_mv_ext_args ext_args = {
+                        .ne00 = (int32_t)group_dim,
+                        .ne01 = (int32_t)rank,
+                        .ne02 = (int32_t)n_groups,
+                        .nb00 = 34,
+                        .nb01 = row_a_bytes,
+                        .nb02 = (uint64_t)rank * row_a_bytes,
+                        .nb03 = 0,
+                        .ne10 = (int32_t)group_dim,
+                        .ne11 = (int32_t)n_tokens,
+                        .ne12 = (int32_t)n_groups,
+                        .nb10 = sizeof(float),
+                        .nb11 = (uint64_t)n_groups * group_dim * sizeof(float),
+                        .nb12 = (uint64_t)group_dim * sizeof(float),
+                        .nb13 = 0,
+                        .ne0 = (int32_t)rank,
+                        .ne1 = (int32_t)n_tokens,
+                        .r2 = 1,
+                        .r3 = 1,
+                    };
+                    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+                    [enc setComputePipelineState:ext_pipeline];
+                    [enc setBytes:&ext_args length:sizeof(ext_args) atIndex:0];
+                    [enc setBuffer:out_a_buf offset:(NSUInteger)out_a_inner atIndex:1];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(heads) offset:ds4_gpu_tensor_offset(heads) atIndex:2];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(low) offset:ds4_gpu_tensor_offset(low) atIndex:3];
+                    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)rank + ext_r0ptg - 1u) / ext_r0ptg,
+                                                          ((NSUInteger)n_tokens + (NSUInteger)ext_r1ptg - 1u) / (NSUInteger)ext_r1ptg,
+                                                          (NSUInteger)n_groups)
+                         threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)ext_nsg, 1)];
+                    ds4_gpu_end_compute_encoder(cb, enc);
+                }
             } else if (use_direct_low) {
                 ds4_gpu_mul_mv_id_args args = {
                     .nei0 = (int32_t)n_groups,
