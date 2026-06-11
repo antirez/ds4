@@ -3270,6 +3270,28 @@ static bool ds4_streaming_routed_expert_bytes(
     return false;
 }
 
+/*
+ * Mixed-precision ("boosted") GGUFs upcast a few layers' routed experts to a
+ * bigger quant (e.g. Q4_K among IQ2 layers). The streaming expert cache is a
+ * single-size-class slab allocator sized from the FIRST routed layer, so those
+ * layers can never be served from it: they must read expert weights through the
+ * mapped-model views instead. A layer is "uniform" iff its per-expert bytes
+ * match the slab class.
+ */
+static DS4_MAYBE_UNUSED bool weights_streaming_layer_experts_uniform(
+        const ds4_weights *w,
+        uint32_t           il) {
+    uint64_t base = 0;
+    const ds4_layer_weights *l = &w->layer[il];
+    if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) return true;
+    if (!ds4_streaming_routed_expert_bytes(w, &base)) return true;
+    const uint64_t bytes =
+        l->ffn_gate_exps->dim[1] * routed_expert_row_bytes(l->ffn_gate_exps) +
+        l->ffn_up_exps->dim[1]   * routed_expert_row_bytes(l->ffn_up_exps) +
+        l->ffn_down_exps->dim[1] * routed_expert_row_bytes(l->ffn_down_exps);
+    return bytes == base;
+}
+
 static uint32_t ds4_streaming_cache_experts_for_byte_budget(
         const ds4_weights *weights,
         uint64_t           bytes,
@@ -4157,6 +4179,28 @@ static void model_map_span_vec_include_layer_decode_static(ds4_model_map_span_ve
 #undef DS4_INCLUDE_TENSOR
 }
 
+/*
+ * Decode-time spans for one layer. The static set excludes routed expert
+ * tensors because the streaming expert cache serves them — but a boosted
+ * layer (per-expert bytes != the global slab class) can never be cached, and
+ * both the selected-addr prefill fallback and the decode no-cache fallback
+ * read its experts through ds4_gpu_wrap_model_range / wrap_model_exact_range
+ * over the model map. Include its exps tensors so those reads are covered.
+ * Uniform models add nothing here (byte-identical behavior).
+ */
+static void model_map_span_vec_include_layer_decode(
+        ds4_model_map_span_vec *spans,
+        const ds4_weights      *w,
+        uint32_t                il) {
+    const ds4_layer_weights *l = &w->layer[il];
+    model_map_span_vec_include_layer_decode_static(spans, l);
+    if (!weights_streaming_layer_experts_uniform(w, il)) {
+        model_map_span_vec_include_one(spans, l->ffn_gate_exps);
+        model_map_span_vec_include_one(spans, l->ffn_up_exps);
+        model_map_span_vec_include_one(spans, l->ffn_down_exps);
+    }
+}
+
 static void model_map_span_vec_include_output(ds4_model_map_span_vec *spans, const ds4_weights *w) {
     model_map_span_vec_include_one(spans, w->output_hc_base);
     model_map_span_vec_include_one(spans, w->output_hc_fn);
@@ -4220,7 +4264,7 @@ static DS4_MAYBE_UNUSED bool weights_model_map_decode_layer_spans(
         ds4_model_map_span_vec *spans) {
     if (!w || !spans || il >= DS4_N_LAYER) return false;
     memset(spans, 0, sizeof(*spans));
-    model_map_span_vec_include_layer_decode_static(spans, &w->layer[il]);
+    model_map_span_vec_include_layer_decode(spans, w, il);
     return model_map_span_vec_finish(spans);
 }
 
@@ -4233,7 +4277,7 @@ static DS4_MAYBE_UNUSED bool weights_model_map_decode_static_spans(
     memset(spans, 0, sizeof(*spans));
     if (include_token) model_map_span_vec_include_one(spans, w->token_embd);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        model_map_span_vec_include_layer_decode_static(spans, &w->layer[il]);
+        model_map_span_vec_include_layer_decode(spans, w, il);
     }
     if (include_output) model_map_span_vec_include_output(spans, w);
     return model_map_span_vec_finish(spans);
@@ -4254,7 +4298,7 @@ static DS4_MAYBE_UNUSED bool weights_model_map_decode_static_slice_spans(
     memset(spans, 0, sizeof(*spans));
     if (include_token) model_map_span_vec_include_one(spans, w->token_embd);
     for (uint32_t il = layer_start; il <= layer_end; il++) {
-        model_map_span_vec_include_layer_decode_static(spans, &w->layer[il]);
+        model_map_span_vec_include_layer_decode(spans, w, il);
     }
     if (include_output) model_map_span_vec_include_output(spans, w);
     return model_map_span_vec_finish(spans);
@@ -24666,6 +24710,39 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             return 1;
         }
         ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
+        if (e->ssd_streaming) {
+            /*
+             * Pin the expert cache's slab size class to the model's uniform
+             * per-expert bytes, and count mixed-precision (boosted) layers:
+             * those are served through mapped model views instead of the
+             * cache (see weights_streaming_layer_experts_uniform).
+             */
+            uint64_t slab_expert_bytes = 0;
+            if (ds4_streaming_routed_expert_bytes(&e->weights, &slab_expert_bytes)) {
+                ds4_gpu_set_streaming_expert_cache_expert_bytes(slab_expert_bytes);
+                uint32_t routed = 0, boosted = 0;
+                for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                    const ds4_layer_weights *l = &e->weights.layer[il];
+                    if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) continue;
+                    routed++;
+                    if (!weights_streaming_layer_experts_uniform(&e->weights, il)) boosted++;
+                }
+                if (boosted > 0) {
+                    fprintf(stderr,
+                            "ds4: SSD streaming mixed-precision model: %u/%u routed layers "
+                            "off the slab size class will bypass the expert cache and read "
+                            "experts via mapped model views\n",
+                            boosted, routed);
+                }
+                if (boosted * 2 > routed) {
+                    fprintf(stderr,
+                            "ds4: WARNING: the majority of routed layers (%u/%u) are off the "
+                            "slab size class (is the FIRST routed layer itself boosted?); "
+                            "expert-cache hit rate will be catastrophic\n",
+                            boosted, routed);
+                }
+            }
+        }
         (void)ds4_gpu_set_model_fd(e->model.fd);
         int model_map_ok = 0;
         uint64_t *load_offsets = NULL;

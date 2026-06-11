@@ -2789,6 +2789,17 @@ void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
     ds4_gpu_stream_expert_cache_clear_all(1);
 }
 
+void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
+    /*
+     * Pre-seed the cache's single slab size class with the model's uniform
+     * per-expert bytes (first routed layer). With a mixed-precision GGUF this
+     * pins the class to the majority layers so the boosted ones are rejected
+     * deterministically from startup, instead of depending on which layer
+     * happens to touch the cache first.
+     */
+    g_stream_expert_cache_expert_bytes = bytes;
+}
+
 uint64_t ds4_gpu_recommended_working_set_size(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!g_device) return 0;
@@ -7312,9 +7323,20 @@ static int ds4_gpu_stream_expert_cache_note_expert_size(
         fprintf(stderr, "ds4: Metal streaming expert cache byte size overflow\n");
         return 0;
     }
-    g_stream_expert_cache_expert_bytes =
-        gate_expert_bytes * 2ull + down_expert_bytes;
-    return 1;
+    /*
+     * The cache is a single-size-class slab allocator: the expert byte size is
+     * frozen on first sight (or pre-seeded at startup from the model's slab
+     * class) and off-size layers are REJECTED rather than adopted. A rejected
+     * layer (mixed-precision boost: Q4_K experts among IQ2 layers) falls back
+     * to the mapped-model per-expert path; last-writer-wins here would instead
+     * poison the slot budget and deadlock slab reuse after an mlock cap.
+     */
+    const uint64_t bytes = gate_expert_bytes * 2ull + down_expert_bytes;
+    if (g_stream_expert_cache_expert_bytes == 0) {
+        g_stream_expert_cache_expert_bytes = bytes;
+        return 1;
+    }
+    return bytes == g_stream_expert_cache_expert_bytes;
 }
 
 static uint32_t ds4_gpu_stream_expert_cache_requested_budget(void) {
