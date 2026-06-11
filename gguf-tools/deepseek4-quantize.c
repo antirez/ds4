@@ -1201,11 +1201,21 @@ static byte_buf generate_regular(st_db *db, const char *gguf_name, const tensor_
     if (!is_quantizable_target(target)) die("unsupported regular target type");
     int64_t n = 0;
     float *f32 = NULL;
-    if (strcmp(te->info.dtype, "F8_E4M3") == 0) {
+
+    bool should_dequant = true;
+    // NOTE (yiakwy) : for these patterns, we don't have fp8 scale
+    if (strstr(hf_name, "attn.indexer.weights_proj.weight") != NULL) {
+        should_dequant = false;
+    }
+
+    if (strcmp(te->info.dtype, "F8_E4M3") == 0 && should_dequant) {
         if (!str_ends(hf_name, ".weight")) die("FP8 tensor without .weight suffix");
         char *scale_name = xstrdup(hf_name);
         strcpy(scale_name + strlen(scale_name) - strlen(".weight"), ".scale");
-        if (!db_has(db, scale_name)) die("missing FP8 scale tensor");
+        if (!db_has(db, scale_name)) {
+            fprintf(stderr, "missing fp8 scale %s for weight %s\n", scale_name, hf_name);
+            die("missing FP8 scale tensor");
+        }
         st_value w = db_read(db, hf_name);
         st_value s = db_read(db, scale_name);
         f32 = dequant_fp8_weight(&w, &s, &n);
