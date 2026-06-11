@@ -8642,6 +8642,11 @@ static int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tok
     return ds4_kvstore_continued_store_target(kc, live_tokens);
 }
 
+static int kv_cache_cold_store_target(const kv_disk_cache *kc, int cached,
+                                      int anchor, int prompt_tokens) {
+    return ds4_kvstore_cold_store_target(kc, cached, anchor, prompt_tokens);
+}
+
 /* A same-text-prefix file can be reused by a larger context, but not by a
  * smaller one: the payload was validated against the context capacity recorded
  * in the file.  If the existing file cannot be used by this server, replace it
@@ -10181,17 +10186,28 @@ static void generate_job(server *s, job *j) {
     ds4_session_set_display_progress(s->session, server_progress_cb, &progress);
 
     int cold_store_len = 0;
-    if (cached == 0 &&
-        s->kv.enabled &&
-        prompt_for_sync->len >= s->kv.opt.min_tokens &&
-        s->kv.opt.cold_max_tokens > 0 &&
-        prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
-    {
-        const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
-                                                    ds4_token_user(s->engine),
-                                                    ds4_token_assistant(s->engine));
-        cold_store_len = anchor >= s->kv.opt.min_tokens ?
-                         anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
+    if (s->kv.enabled && prompt_for_sync->len >= s->kv.opt.min_tokens) {
+        if (s->kv.opt.cold_max_tokens > 0 &&
+            prompt_for_sync->len > s->kv.opt.cold_max_tokens)
+        {
+            /* Without this hint the skip is invisible: agent clients whose
+             * first prompt grows past the limit (tool schemas, MCP servers)
+             * silently lose cold checkpoints and repay the full stable
+             * prefix on every fresh session. */
+            if (cached == 0) {
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: cold checkpoint skipped: prompt %d "
+                           "tokens exceeds --kv-cache-cold-max-tokens %d",
+                           prompt_for_sync->len, s->kv.opt.cold_max_tokens);
+            }
+        } else {
+            const int anchor =
+                kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
+                                         ds4_token_user(s->engine),
+                                         ds4_token_assistant(s->engine));
+            cold_store_len = kv_cache_cold_store_target(&s->kv, cached, anchor,
+                                                        prompt_for_sync->len);
+        }
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
@@ -14686,6 +14702,47 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000) == 30000);
 }
 
+static void test_kv_cache_cold_store_target_cold_start(void) {
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.opt = kv_cache_default_options();
+
+    /* Cold start with a usable anchor stores at the anchor. */
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, 0, 27005, 30000) == 27005);
+    /* Cold start without an anchor falls back to the aligned boundary. */
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, 0, -1, 11011) == 10240);
+    /* Prompts past cold_max never store cold. */
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, 0, 27005, 30001) == 0);
+    /* Short prompts never store cold. */
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, 0, -1, 100) == 0);
+
+    kc.opt.cold_max_tokens = 0;
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, 0, 27005, 30000) == 0);
+
+    kc.opt = kv_cache_default_options();
+    kc.enabled = false;
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, 0, 27005, 30000) == 0);
+}
+
+static void test_kv_cache_cold_store_target_refreshes_anchor_after_partial_hit(void) {
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.opt = kv_cache_default_options();
+
+    /* A partial hit below the anchor proves the stored anchor no longer
+     * matches this prompt: refresh it. */
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, 20480, 27005, 30000) == 27005);
+    /* A hit at or past the anchor means the stable prefix is already
+     * covered: nothing to refresh. */
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, 27005, 27005, 30000) == 0);
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, 29000, 27005, 30000) == 0);
+    /* No anchor: partial hits have nothing to refresh (no full-prompt
+     * fallback, that would duplicate the evict/continued schedule). */
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, 20480, -1, 30000) == 0);
+    /* Oversize prompts stay excluded on partial hits too. */
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, 20480, 27005, 30001) == 0);
+}
+
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -15700,6 +15757,8 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
     test_kv_cache_continued_uses_aligned_frontiers();
+    test_kv_cache_cold_store_target_cold_start();
+    test_kv_cache_cold_store_target_refreshes_anchor_after_partial_hit();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();

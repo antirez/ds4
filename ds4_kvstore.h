@@ -138,6 +138,8 @@ int ds4_kvstore_chat_anchor_pos(const ds4_kvstore *kc,
                                 int user_token_id,
                                 int assistant_token_id);
 int ds4_kvstore_continued_store_target(const ds4_kvstore *kc, int live_tokens);
+int ds4_kvstore_cold_store_target(const ds4_kvstore *kc, int cached,
+                                  int anchor, int prompt_tokens);
 void ds4_kvstore_note_store(ds4_kvstore *kc, int tokens);
 int ds4_kvstore_suppress_continued_store(ds4_kvstore *kc, int tokens);
 void ds4_kvstore_restore_suppressed_continued(ds4_kvstore *kc,

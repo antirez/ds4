@@ -753,6 +753,24 @@ void ds4_kvstore_note_store(ds4_kvstore *kc, int tokens) {
     }
 }
 
+int ds4_kvstore_cold_store_target(const ds4_kvstore *kc, int cached,
+                                  int anchor, int prompt_tokens) {
+    if (!kc->enabled || kc->opt.cold_max_tokens <= 0) return 0;
+    if (prompt_tokens < kc->opt.min_tokens) return 0;
+    if (prompt_tokens > kc->opt.cold_max_tokens) return 0;
+    if (cached == 0) {
+        return anchor >= kc->opt.min_tokens ?
+               anchor : ds4_kvstore_store_len(kc, prompt_tokens);
+    }
+    /* The prompt resumed from a checkpoint shorter than the stable chat
+     * prefix.  The anchor stored on disk no longer matches this prompt,
+     * otherwise the lookup would have returned it instead of the shorter
+     * entry.  Refresh the anchor so the next fresh session reuses the full
+     * stable prefix instead of repaying anchor-minus-cached tokens on every
+     * new conversation. */
+    return anchor > cached ? anchor : 0;
+}
+
 int ds4_kvstore_suppress_continued_store(ds4_kvstore *kc, int tokens) {
     if (ds4_kvstore_continued_store_target(kc, tokens) != tokens) return -1;
     int old = kc->continued_last_store_tokens;
