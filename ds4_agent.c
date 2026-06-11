@@ -58,6 +58,7 @@ typedef struct {
     float min_p;
     uint64_t seed;
     ds4_think_mode think_mode;
+    int teach_level;
 } agent_generation_options;
 
 typedef struct {
@@ -139,6 +140,9 @@ typedef struct {
     bool queued_user_drain_answered;
     char *queued_user_drain_text;
     bool datetime_context_injected;
+    int teach_level;
+    bool teach_context_injected;
+    bool teach_note_seen;
     char more_path[PATH_MAX];
     int more_next_line;
     bool more_bare;
@@ -172,6 +176,7 @@ typedef struct {
     bool format_thinking;
     bool format_markdown;
     bool in_think;
+    bool in_teach;
     bool color_open;
     bool use_color;
     bool last_output_newline;
@@ -432,6 +437,37 @@ static bool parse_power_percent(const char *arg, int *out) {
     return true;
 }
 
+/* Teaching levels form an ordered "instructiveness" scale so /teach more and
+ * /teach less can walk it like a slider.  The names are user-facing. */
+typedef enum {
+    AGENT_TEACH_OFF = 0,
+    AGENT_TEACH_LOW,
+    AGENT_TEACH_MEDIUM,
+    AGENT_TEACH_HIGH,
+} agent_teach_level;
+
+#define AGENT_TEACH_LEVEL_MAX AGENT_TEACH_HIGH
+
+static const char *agent_teach_level_name(int level) {
+    switch (level) {
+    case AGENT_TEACH_OFF: return "off";
+    case AGENT_TEACH_LOW: return "low";
+    case AGENT_TEACH_MEDIUM: return "medium";
+    case AGENT_TEACH_HIGH: return "high";
+    default: return "?";
+    }
+}
+
+static bool agent_teach_level_parse(const char *s, int *out) {
+    for (int level = AGENT_TEACH_OFF; level <= AGENT_TEACH_LEVEL_MAX; level++) {
+        if (!strcmp(s, agent_teach_level_name(level))) {
+            *out = level;
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool agent_slash_command_with_args(const char *cmd, const char *name) {
     size_t len = strlen(name);
     return !strncmp(cmd, name, len) &&
@@ -447,6 +483,8 @@ static bool agent_slash_command_known(const char *cmd) {
            !strcmp(cmd, "/exit") ||
            !strcmp(cmd, "/new") ||
            agent_slash_command_with_args(cmd, "/power") ||
+           agent_slash_command_with_args(cmd, "/teach") ||
+           agent_slash_command_with_args(cmd, "/profile") ||
            agent_slash_command_with_args(cmd, "/switch") ||
            agent_slash_command_with_args(cmd, "/del") ||
            agent_slash_command_with_args(cmd, "/strip") ||
@@ -525,10 +563,12 @@ static agent_config parse_options(int argc, char **argv) {
             .top_p = DS4_DEFAULT_TOP_P,
             .min_p = DS4_DEFAULT_MIN_P,
             .think_mode = DS4_THINK_HIGH,
+            .teach_level = AGENT_TEACH_MEDIUM,
         },
     };
 
     bool steering_scale_set = false;
+    bool teach_set = false;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
@@ -582,6 +622,14 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.min_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--teach")) {
+            const char *level = need_arg(&i, argc, argv, arg);
+            if (!agent_teach_level_parse(level, &c.gen.teach_level)) {
+                fprintf(stderr,
+                        "ds4-agent: --teach must be off, low, medium, or high\n");
+                exit(2);
+            }
+            teach_set = true;
         } else if (!strcmp(arg, "--think")) {
             c.gen.think_mode = DS4_THINK_HIGH;
         } else if (!strcmp(arg, "--think-max")) {
@@ -663,6 +711,9 @@ static agent_config parse_options(int argc, char **argv) {
 
     if (c.engine.directional_steering_file && !steering_scale_set)
         c.engine.directional_steering_ffn = 1.0f;
+    /* One-shot/pipe runs are usually consumed by scripts or other agents, so
+     * teaching defaults off there; an explicit --teach still wins. */
+    if (!teach_set && c.non_interactive) c.gen.teach_level = AGENT_TEACH_OFF;
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.engine.distributed,
                                         &c.engine,
@@ -932,6 +983,21 @@ static const char agent_tools_prompt_after_edit[] =
     "      \"required\": [\"path\"]\n"
     "    }\n"
     "  }\n"
+    "}\n\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"learn\",\n"
+    "    \"description\": \"Record one observation about the developer (skill level, languages, background, teaching feedback, what style keeps them engaged) in the persistent learner profile. Call it as soon as the developer reveals something about themselves, in the same tool block as your next action. replace=true rewrites the whole profile.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"note\": {\"type\": \"string\"},\n"
+    "        \"replace\": {\"type\": \"boolean\"}\n"
+    "      },\n"
+    "      \"required\": [\"note\"]\n"
+    "    }\n"
+    "  }\n"
     "}\n"
     "\n"
     "# Rules\n\n"
@@ -945,15 +1011,108 @@ static const char agent_tools_prompt_after_edit[] =
     "- Work in a way that preserves the current system configuration integrity, "
     "unless explicitly asked otherwise by the user.\n";
 
+/* The teaching contract.  This text is deliberately level-independent and
+ * static so the rendered system prompt (and its sysprompt.kv checkpoint) stays
+ * identical across teaching levels; the current level and the learner profile
+ * are injected per session as a plain system note instead. */
+static const char agent_teach_prompt[] =
+    "\n# Teaching\n\n"
+    "You are also a mentor, and not a polite beige one. You are the teacher "
+    "students remember twenty years later: equal parts Khan Academy patience "
+    "and slightly unhinged hacker glee. Engineering has real drama and you "
+    "feel it - a segfault is a crime scene, a green test suite on the first "
+    "run is a small miracle worth exactly one beat of celebration - and your "
+    "enthusiasm for the craft is a little feral, because enthusiasm is "
+    "contagious and a bored teacher makes a bored student.\n\n"
+    "The soul of your teaching:\n"
+    "- Nothing is magic. Explain from first principles in plain words; if you "
+    "cannot explain a thing simply, you do not get to use it silently. Anchor "
+    "every new idea to something the developer already knows.\n"
+    "- Make them lean in. Open loops before you close them: \"watch this test "
+    "- it is going to fail, and the way it fails is the whole lesson.\" "
+    "Foreshadow, build stakes, pay it off. Never bury the reveal in a wall of "
+    "prose.\n"
+    "- Ask before you tell. Before running something with an instructive "
+    "outcome, pose one short prediction question (\"What do you think this "
+    "prints?\") - then keep working and resolve it the moment the result "
+    "appears. Never stall the work waiting for an answer; if the developer "
+    "replies later, react to their answer first.\n"
+    "- Challenge them. Pitch one level above where the profile says they are. "
+    "If they can reach an answer themselves, hand them the rope, not the "
+    "answer. High expectations, zero condescension: confusion is normal, "
+    "never shameful.\n"
+    "- Failures are the good part. When something breaks, get visibly "
+    "interested: show the broken behavior, read the error like evidence, let "
+    "the bug do the teaching. Say \"I don't know, let's find out\" when that "
+    "is the truth.\n"
+    "- Think out loud with conviction, with opinions earned from scars (\"I "
+    "have been burned by strtok before; we use strsep\"). Dry wit and vivid "
+    "analogies are seasoning, never the meal. No corporate cheer, no \"Great "
+    "question!\", no exclamation-point confetti.\n"
+    "- Tune all of it to this developer over time: the learner profile tells "
+    "you what they know, what depth they want, and what makes them lean in.\n\n"
+    "When something is genuinely worth learning, add a teaching aside wrapped in "
+    "literal <teach> tags as its own paragraph. Place each aside at the moment "
+    "it is relevant, right after the step that taught it, never bundled at the "
+    "end. Example:\n\n"
+    "<teach>Why I search before editing: an edit that matches two places "
+    "rewrites one of them silently. I have watched that bug eat a weekend. "
+    "Confirm the symbol is unique, then strike.</teach>\n\n"
+    "The UI renders teach asides specially. Rules for them:\n"
+    "- Teach decisions, not keystrokes: trade-offs, invariants, debugging strategy, "
+    "idioms, how to verify. Never narrate trivia such as opening a file.\n"
+    "- Calibrate to the learner profile. Skip what the developer already knows and "
+    "explain one level deeper than where they are now.\n"
+    "- At most one or two teach asides between tool calls; the work always comes first.\n"
+    "- One concept per aside, in plain language, tied to the code at hand. No "
+    "generic lectures.\n"
+    "- Never put <teach> tags inside <think> blocks or tool calls.\n\n"
+    "Maintain the learner profile with the learn tool; taking these notes is part "
+    "of the job, not optional. When the developer states their background outright "
+    "(\"I'm new to C\", \"I've shipped kernels for years\"), call learn in the same "
+    "tool block as your next action. Also record the quieter signals as they accumulate: "
+    "what they ask, what they build, the vocabulary they use, corrections like "
+    "\"I know that\" or \"more depth please\", and which style lands with them "
+    "(the analogy that clicked, the topic that lit them up, humor they enjoyed "
+    "or ignored). Each note is one short observation: "
+    "call learn with note=\"...\". Do it silently alongside other tool calls; "
+    "never announce it in prose.\n"
+    "Write every note knowing the developer reads this file (/profile shows it; "
+    "it is theirs). Notes are teaching calibration, never assessment of the "
+    "person: record knowledge state and what works, not judgments. \"Has not "
+    "met epoll yet; explain from first principles\" is a good note; \"weak on "
+    "networking\" is not. Use their own words for their level (\"says they are "
+    "new to C\"), record strengths as readily as gaps, and never speculate "
+    "about ability or intelligence. If you are "
+    "about to lean on a concept and you do not know whether the developer knows it, "
+    "ask one short natural question in passing (\"Have you worked with epoll "
+    "before?\") and keep working; record what you learn from the answer. Never run "
+    "a quiz or an upfront survey. If a learn result says the profile is getting "
+    "long, rewrite it compactly with learn replace=true.\n\n"
+    "Teaching levels. The current level arrives as a system note; if no note is "
+    "present, teaching is off.\n"
+    "- off: no teach asides, no learn calls, no narration beyond your normal output.\n"
+    "- low: an occasional one-line why-note at key decisions; rare teach asides; "
+    "no prediction questions; keep the wit on a short leash.\n"
+    "- medium: the full behavior described above.\n"
+    "- high: medium plus depth and challenge: alternatives you rejected and why, "
+    "the mechanics underneath, an occasional pointer worth reading further, and "
+    "now and then a real challenge thrown to the developer (\"before you read my "
+    "fix, decide what you would change\"; \"try predicting the complexity before "
+    "I measure it\") - always resolving it yourself in the same turn so the work "
+    "never stalls.\n";
+
 static char *agent_build_tools_prompt(void) {
     const char *edit = agent_tools_prompt_edit_line;
     size_t a = strlen(agent_tools_prompt_intro);
     size_t b = strlen(edit);
     size_t c = strlen(agent_tools_prompt_after_edit);
-    char *out = xmalloc(a + b + c + 1);
+    size_t d = strlen(agent_teach_prompt);
+    char *out = xmalloc(a + b + c + d + 1);
     memcpy(out, agent_tools_prompt_intro, a);
     memcpy(out + a, edit, b);
-    memcpy(out + a + b, agent_tools_prompt_after_edit, c + 1);
+    memcpy(out + a + b, agent_tools_prompt_after_edit, c);
+    memcpy(out + a + b + c, agent_teach_prompt, d + 1);
     return out;
 }
 
@@ -1635,7 +1794,7 @@ static size_t renderer_utf8_need(unsigned char c) {
 }
 
 static bool renderer_has_text_attrs(agent_token_renderer *r) {
-    return r->in_think || r->md_bold || r->md_italic ||
+    return r->in_think || r->in_teach || r->md_bold || r->md_italic ||
            r->md_inline_code || r->md_code_block;
 }
 
@@ -1650,6 +1809,10 @@ static void renderer_set_text_attrs(agent_token_renderer *r) {
         return;
     } else if (r->md_inline_code) {
         renderer_write(r, "\x1b[36m", 5);
+    } else if (r->in_teach) {
+        /* Teaching asides get their own soft green so they read as a voice
+         * distinct from thinking (grey) and code (blue). */
+        renderer_write(r, "\x1b[38;5;114m", 11);
     }
     if (r->md_bold) renderer_write(r, "\x1b[1m", 4);
     if (r->md_italic) renderer_write(r, "\x1b[3m", 4);
@@ -2681,6 +2844,31 @@ static void renderer_plain(agent_token_renderer *r, const char *s, size_t n) {
     if (n) r->last_output_newline = s[n - 1] == '\n';
 }
 
+/* Open and close a <teach> aside.  The tags themselves are hidden like <think>
+ * tags, but unlike thinking the content stays first-class: it starts on its
+ * own line behind a book marker and renderer_set_text_attrs colors it while
+ * in_teach holds, with markdown still active inside. */
+static void renderer_teach_open(agent_token_renderer *r) {
+    renderer_markdown_emit_pending_literals(r);
+    renderer_flush_utf8(r);
+    renderer_reset_color(r);
+    if (!r->last_output_newline) renderer_write(r, "\n", 1);
+    renderer_write(r, "📚 ", strlen("📚 "));
+    r->wrote_visible_output = true;
+    r->last_output_newline = false;
+    r->in_teach = true;
+}
+
+static void renderer_teach_close(agent_token_renderer *r) {
+    renderer_markdown_emit_pending_literals(r);
+    renderer_flush_utf8(r);
+    r->in_teach = false;
+    renderer_reset_color(r);
+    if (!r->last_output_newline) renderer_write(r, "\n", 1);
+    renderer_write(r, "\n", 1);
+    r->last_output_newline = true;
+}
+
 /* ============================================================================
  * Streaming Tool Visualization
  * ============================================================================
@@ -3410,6 +3598,8 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
 static void agent_stream_text(agent_stream_renderer *sr, const char *text, size_t len, bool finish) {
     const char *think_open = "<think>";
     const char *think_close = "</think>";
+    const char *teach_open = "<teach>";
+    const char *teach_close = "</teach>";
     size_t total = sr->pending_len + len;
     char *buf = xmalloc(total ? total : 1);
     if (sr->pending_len) memcpy(buf, sr->pending, sr->pending_len);
@@ -3449,9 +3639,33 @@ static void agent_stream_text(agent_stream_renderer *sr, const char *text, size_
             i += strlen(think_close);
             continue;
         }
+        /* Teaching asides only exist in visible assistant text: inside <think>
+         * or DSML the tags stay ordinary bytes for those state machines. */
+        if (!sr->dsml_active && !sr->in_think &&
+            bytes_has_prefix(cur, rem, teach_open))
+        {
+            agent_stream_flush_start_tail(sr);
+            sr->post_think_gap = false;
+            renderer_teach_open(sr->renderer);
+            i += strlen(teach_open);
+            continue;
+        }
+        if (!sr->dsml_active && !sr->in_think &&
+            bytes_has_prefix(cur, rem, teach_close))
+        {
+            agent_stream_flush_start_tail(sr);
+            renderer_teach_close(sr->renderer);
+            /* The close already printed its own blank line; swallow the
+             * model's habitual extra newlines exactly like after </think>. */
+            sr->post_think_gap = true;
+            i += strlen(teach_close);
+            continue;
+        }
         if (!finish && !sr->dsml_active && cur[0] == '<' &&
             (bytes_is_partial_prefix(cur, rem, think_open) ||
-             bytes_is_partial_prefix(cur, rem, think_close)))
+             bytes_is_partial_prefix(cur, rem, think_close) ||
+             bytes_is_partial_prefix(cur, rem, teach_open) ||
+             bytes_is_partial_prefix(cur, rem, teach_close)))
         {
             if (rem < sizeof(sr->pending)) {
                 memcpy(sr->pending, cur, rem);
@@ -4266,6 +4480,8 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
     w->datetime_context_injected = false;
+    w->teach_context_injected = false;
+    w->teach_note_seen = false;
     agent_worker_clear_session_identity(w);
     free(text);
     ds4_tokens_free(&sys);
@@ -5399,6 +5615,10 @@ static bool agent_worker_switch_session(agent_worker *w, const char *prefix,
         w->legacy_session_path_to_delete = meta.legacy_identity ? xstrdup(path) : NULL;
         agent_worker_note_system_prompt_seen(w);
         w->datetime_context_injected = true;
+        /* A restored transcript may carry a stale teach note from another run,
+         * so force a fresh note (even an explicit "off") at the next turn. */
+        w->teach_context_injected = false;
+        w->teach_note_seen = true;
         pthread_mutex_lock(&w->mu);
         w->user_activity = true;
         w->session_dirty = false;
@@ -5808,6 +6028,186 @@ static char *agent_tool_list(const agent_tool_call *call) {
     if (de) agent_buf_puts(&out, "... more entries omitted ...\n");
     closedir(dir);
     return agent_buf_take(&out);
+}
+
+/* ============================================================================
+ * Teaching And Learner Profile
+ * ============================================================================
+ *
+ * ds4-agent doubles as a mentor: the model narrates its craft in <teach>
+ * asides and keeps a persistent profile of the developer it is teaching.  The
+ * profile is one markdown file shared by every session and project; the model
+ * maintains it through the learn tool and reads it through a per-session
+ * system note, so the cached system prompt never depends on it.
+ */
+
+/* Past this size the learn tool starts asking the model to consolidate. */
+#define AGENT_LEARNER_PROFILE_SOFT_BYTES 6000
+/* Hard cap on how much profile text is injected into the context. */
+#define AGENT_LEARNER_PROFILE_INJECT_MAX 12000
+
+static char *agent_learner_profile_path(void) {
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) home = ".";
+    size_t n = strlen(home) + strlen("/.ds4/learner.md") + 1;
+    char *path = xmalloc(n);
+    snprintf(path, n, "%s/.ds4/learner.md", home);
+    return path;
+}
+
+/* Read the learner profile for context injection.  Returns NULL when there is
+ * no profile yet.  Oversized profiles are truncated with a visible marker so
+ * the model knows to consolidate rather than trust a silently cut file. */
+static char *agent_learner_profile_read(size_t *len_out) {
+    char *path = agent_learner_profile_path();
+    FILE *fp = fopen(path, "rb");
+    free(path);
+    if (len_out) *len_out = 0;
+    if (!fp) return NULL;
+    agent_buf b = {0};
+    char chunk[4096];
+    size_t rd;
+    while (b.len <= AGENT_LEARNER_PROFILE_INJECT_MAX &&
+           (rd = fread(chunk, 1, sizeof(chunk), fp)) > 0)
+        agent_buf_append(&b, chunk, rd);
+    fclose(fp);
+    if (b.len > AGENT_LEARNER_PROFILE_INJECT_MAX) {
+        b.len = AGENT_LEARNER_PROFILE_INJECT_MAX;
+        agent_buf_puts(&b,
+            "\n[Profile truncated for length; consolidate it with learn replace=true.]\n");
+    }
+    if (!b.len) {
+        free(b.ptr);
+        return NULL;
+    }
+    if (len_out) *len_out = b.len;
+    return agent_buf_take(&b);
+}
+
+/* The learn tool is how the model takes notes about the developer.  Appends
+ * are dated one-line observations; replace=true rewrites the whole file, which
+ * is also the consolidation path once the profile grows long. */
+static char *agent_tool_learn(agent_worker *w, const agent_tool_call *call) {
+    (void)w;
+    const char *note = agent_tool_arg_value(call, "note");
+    bool replace = agent_parse_bool_default(agent_tool_arg_value(call, "replace"),
+                                            false);
+    if (!note || !note[0]) return xstrdup("Tool error: learn requires note\n");
+
+    char *path = agent_learner_profile_path();
+    struct stat st;
+    bool existed = stat(path, &st) == 0 && st.st_size > 0;
+    FILE *fp = fopen(path, replace ? "wb" : "ab");
+    if (!fp) {
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: open learner profile failed: ");
+        agent_buf_puts(&b, strerror(errno));
+        agent_buf_puts(&b, "\n");
+        free(path);
+        return agent_buf_take(&b);
+    }
+    bool ok;
+    size_t note_len = strlen(note);
+    if (replace) {
+        ok = fwrite(note, 1, note_len, fp) == note_len;
+        if (ok && note[note_len - 1] != '\n') ok = fputc('\n', fp) != EOF;
+    } else {
+        time_t now = time(NULL);
+        struct tm tm;
+        localtime_r(&now, &tm);
+        char day[32];
+        if (strftime(day, sizeof(day), "%Y-%m-%d", &tm) == 0) day[0] = '\0';
+        ok = true;
+        if (!existed) ok = fputs("# Learner Profile\n\n", fp) != EOF;
+        if (ok) ok = fprintf(fp, "- [%s] %s\n", day, note) > 0;
+    }
+    if (fclose(fp) != 0) ok = false;
+    long new_size = stat(path, &st) == 0 ? (long)st.st_size : 0;
+    free(path);
+    if (!ok) return xstrdup("Tool error: failed to update learner profile\n");
+
+    char msg[256];
+    if (replace) {
+        snprintf(msg, sizeof(msg), "Learner profile rewritten (%ld bytes)\n",
+                 new_size);
+    } else if (new_size > AGENT_LEARNER_PROFILE_SOFT_BYTES) {
+        snprintf(msg, sizeof(msg),
+                 "Noted (profile now %ld bytes). The profile is getting long: "
+                 "rewrite it compactly with learn replace=true.\n", new_size);
+    } else {
+        snprintf(msg, sizeof(msg), "Noted (profile now %ld bytes)\n", new_size);
+    }
+    return xstrdup(msg);
+}
+
+/* Inject the current teaching level and the learner profile as one plain
+ * system note.  Keeping this out of the cached system prompt means
+ * sysprompt.kv stays valid across level and profile changes; the note is
+ * re-injected after /teach changes and after compaction rebuilds the
+ * transcript.  Profile text is user data: it must stay plain content, never
+ * rendered-chat control tokens. */
+static void agent_worker_maybe_append_teach_context(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    bool injected = w->teach_context_injected;
+    bool seen = w->teach_note_seen;
+    int level = w->teach_level;
+    pthread_mutex_unlock(&w->mu);
+    if (injected) return;
+    /* Teaching that was never on needs no note; the system prompt says that
+     * silence means off.  Once a note was seen, off must be stated. */
+    if (level == AGENT_TEACH_OFF && !seen) return;
+
+    agent_buf b = {0};
+    char head[64];
+    snprintf(head, sizeof(head), "Teaching level: %s.",
+             agent_teach_level_name(level));
+    agent_buf_puts(&b, head);
+    if (level != AGENT_TEACH_OFF) {
+        size_t plen = 0;
+        char *profile = agent_learner_profile_read(&plen);
+        if (profile) {
+            agent_buf_puts(&b,
+                "\nLearner profile (persistent notes about this developer):\n");
+            agent_buf_append(&b, profile, plen);
+            if (profile[plen - 1] != '\n') agent_buf_puts(&b, "\n");
+            agent_buf_puts(&b, "[End learner profile.]");
+            free(profile);
+        } else {
+            agent_buf_puts(&b,
+                "\nLearner profile: empty. This is your first session with this "
+                "developer; calibrate as you go, and once this conversation reveals "
+                "anything about their level or background, record it with learn "
+                "alongside your next tool call.");
+        }
+    }
+    ds4_chat_append_message(w->engine, &w->transcript, "system", b.ptr);
+    agent_trace_text(w, "teach-context", b.ptr, b.len);
+    free(b.ptr);
+
+    pthread_mutex_lock(&w->mu);
+    /* If /teach changed the level while this note was being built, leave the
+     * flag clear so the next turn re-injects the new level. */
+    if (w->teach_level == level) w->teach_context_injected = true;
+    if (level != AGENT_TEACH_OFF) w->teach_note_seen = true;
+    pthread_mutex_unlock(&w->mu);
+}
+
+static int worker_get_teach_level(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    int level = w->teach_level;
+    pthread_mutex_unlock(&w->mu);
+    return level;
+}
+
+/* Level changes take effect at the next turn start: the worker re-injects the
+ * teach note before appending the next user message. */
+static void worker_set_teach_level(agent_worker *w, int level) {
+    pthread_mutex_lock(&w->mu);
+    if (w->teach_level != level) {
+        w->teach_level = level;
+        w->teach_context_injected = false;
+    }
+    pthread_mutex_unlock(&w->mu);
 }
 
 /* ============================================================================
@@ -7150,6 +7550,7 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "list")) return agent_tool_list(call);
     if (!strcmp(call->name, "edit")) return agent_tool_edit(w, call);
     if (!strcmp(call->name, "search")) return agent_tool_search(w, call);
+    if (!strcmp(call->name, "learn")) return agent_tool_learn(w, call);
     if (!strcmp(call->name, "google_search")) return agent_tool_google_search(w, call);
     if (!strcmp(call->name, "visit_page")) return agent_tool_visit_page(w, call);
 
@@ -7497,6 +7898,11 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
         return false;
     }
     agent_worker_note_system_prompt_seen(w);
+    /* The rebuilt transcript dropped the teach note along with the rest of the
+     * conversation body; re-inject level and learner profile at the next turn. */
+    pthread_mutex_lock(&w->mu);
+    w->teach_context_injected = false;
+    pthread_mutex_unlock(&w->mu);
     ds4_tokens_free(&old_transcript);
     ds4_tokens_free(&sys);
     char *bash_update = agent_bash_jobs_compaction_observation(w);
@@ -7518,6 +7924,146 @@ static bool agent_worker_compact_if_needed(agent_worker *w, const char *reason,
                                            char *err, size_t err_len) {
     if (!agent_worker_should_compact(w)) return true;
     return agent_worker_compact(w, reason, err, err_len);
+}
+
+#define AGENT_LEARNER_UPDATE_MAX_TOKENS 768
+
+/* Ask the model directly for an updated learner profile and write it to disk.
+ * In-band learn calls during turns are best-effort: a model focused on the
+ * coding task often forgets the meta-work.  This dedicated pass runs when a
+ * session is being left (quit, /new, /switch, end of non-interactive run), so
+ * updating the profile is the model's only job in that moment, and the live KV
+ * holding the private exchange can simply be invalidated instead of restored:
+ * the session is over either way. */
+static bool agent_worker_update_learner_profile(agent_worker *w,
+                                                char *err, size_t err_len) {
+    char *current = agent_learner_profile_read(NULL);
+    agent_buf req = {0};
+    agent_buf_puts(&req,
+        "Internal ds4-agent learner profile update request. This is not a user request.\n"
+        "Rewrite the persistent learner profile for this developer using what this "
+        "session revealed about them:\n"
+        "- experience level, languages, tools, and domains they know\n"
+        "- concepts they needed explained versus already knew\n"
+        "- teaching feedback they gave (more depth, fewer basics, topic interests)\n"
+        "- the style that keeps them engaged: depth, pace, humor, analogies that clicked\n"
+        "- anything else that calibrates future teaching\n"
+        "Merge the existing profile below with the new observations; keep prior "
+        "entries unless this session contradicted them. A background stated in "
+        "the developer's own words (\"fairly new to C, coming from Python\") is "
+        "always worth recording, as are demonstrated skills, gaps you taught to, "
+        "and preferences. Only if the session carried no signal at all about the "
+        "developer, output the existing profile unchanged, or the single word "
+        "EMPTY if there is no profile yet.\n"
+        "Write it knowing the developer reads this file; it is theirs. Notes are "
+        "teaching calibration, never assessment of the person: record knowledge "
+        "state (\"has not met epoll yet; explain from first principles\"), not "
+        "judgments (\"weak\", \"junior\", \"struggles\"). Use their own words for "
+        "their level when they gave them, and record strengths as readily as gaps.\n"
+        "Keep it under 40 lines of plain markdown.\n"
+        "Output only the profile text. Do not continue the user task, do not call "
+        "tools, and do not output thinking tags or DSML markup.\n\n"
+        "Existing profile:\n");
+    if (current) {
+        agent_buf_puts(&req, current);
+        if (req.len && req.ptr[req.len - 1] != '\n') agent_buf_puts(&req, "\n");
+        free(current);
+    } else {
+        agent_buf_puts(&req, "(empty)\n");
+    }
+
+    ds4_tokens prompt = {0};
+    ds4_tokens_copy(&prompt, &w->transcript);
+    ds4_chat_append_message(w->engine, &prompt, "user", req.ptr);
+    free(req.ptr);
+    ds4_chat_append_assistant_prefix(w->engine, &prompt, DS4_THINK_NONE);
+
+    if (w->cfg->gen.ctx_size - prompt.len - 1 < 256) {
+        snprintf(err, err_len, "not enough context room");
+        ds4_tokens_free(&prompt);
+        return false;
+    }
+
+    int sync_rc = ds4_session_sync(w->session, &prompt, err, err_len);
+    if (sync_rc != 0) {
+        ds4_session_invalidate(w->session);
+        ds4_tokens_free(&prompt);
+        if (sync_rc == DS4_SESSION_SYNC_INTERRUPTED)
+            snprintf(err, err_len, "interrupted");
+        return false;
+    }
+    ds4_tokens_free(&prompt);
+
+    agent_buf profile = {0};
+    char eval_err[160] = {0};
+    int think_end_id = agent_special_token_id(w->engine, "</think>");
+    int dsml_id = agent_special_token_id(w->engine, "｜DSML｜");
+    bool ok = true;
+    for (int i = 0; i < AGENT_LEARNER_UPDATE_MAX_TOKENS; i++) {
+        if (worker_should_interrupt(w)) {
+            snprintf(err, err_len, "interrupted");
+            ok = false;
+            break;
+        }
+        int token = ds4_session_argmax(w->session);
+        if (token == ds4_token_eos(w->engine)) break;
+        if (token == think_end_id || token == dsml_id) break;
+        if (ds4_session_eval(w->session, token, eval_err, sizeof(eval_err)) != 0) {
+            snprintf(err, err_len, "%s", eval_err);
+            ok = false;
+            break;
+        }
+        size_t text_len = 0;
+        char *text = ds4_token_text(w->engine, token, &text_len);
+        agent_buf_append(&profile, text, text_len);
+        free(text);
+    }
+    /* The live KV now contains the private profile exchange; it must never be
+     * continued from or saved. */
+    ds4_session_invalidate(w->session);
+    if (!ok) {
+        free(profile.ptr);
+        return false;
+    }
+
+    char *text = profile.ptr ? profile.ptr : xstrdup("");
+    size_t len = profile.len;
+    while (len && (text[len - 1] == '\n' || text[len - 1] == ' ')) text[--len] = '\0';
+    char *start = text;
+    while (*start == '\n' || *start == ' ') start++;
+    if (!start[0] || !strcmp(start, "EMPTY")) {
+        free(text);
+        snprintf(err, err_len, "session revealed nothing to record");
+        return false;
+    }
+
+    char *path = agent_learner_profile_path();
+    FILE *fp = fopen(path, "wb");
+    ok = fp != NULL;
+    if (ok) ok = fwrite(start, 1, strlen(start), fp) == strlen(start) &&
+                 fputc('\n', fp) != EOF;
+    if (fp && fclose(fp) != 0) ok = false;
+    if (!ok) snprintf(err, err_len, "write %s: %s", path, strerror(errno));
+    agent_trace_text(w, "learner-profile-update", start, strlen(start));
+    free(path);
+    free(text);
+    return ok;
+}
+
+/* Best-effort wrapper used on the UI thread at session-leaving moments while
+ * the worker is idle.  Profile maintenance must never block leaving. */
+static void agent_update_learner_profile_on_leave(agent_worker *w) {
+    if (worker_get_teach_level(w) == AGENT_TEACH_OFF) return;
+    pthread_mutex_lock(&w->mu);
+    bool active = w->user_activity;
+    pthread_mutex_unlock(&w->mu);
+    if (!active) return;
+    FILE *status = w->cfg->non_interactive ? stderr : stdout;
+    fprintf(status, "updating learner profile from this session...\n");
+    fflush(status);
+    char err[160] = {0};
+    if (!agent_worker_update_learner_profile(w, err, sizeof(err)))
+        fprintf(status, "learner profile unchanged: %s\n", err);
 }
 
 static int worker_accept_generated_token(agent_worker *w,
@@ -7654,6 +8200,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         return 1;
     }
     agent_worker_maybe_append_datetime_context(w);
+    agent_worker_maybe_append_teach_context(w);
     agent_trace_text(w, "user", user_text ? user_text : "",
                      user_text ? strlen(user_text) : 0);
     if (!w->session_title) {
@@ -9375,6 +9922,10 @@ static void runtime_help(void) {
     puts("  /strip SHA   Strip KV payload; /switch rebuilds it by prefill.");
     puts("  /history [N] Show N recent user turns from the current session.");
     puts("  /power N     Set GPU duty cycle percentage, 1..100.");
+    puts("  /teach [L]   Show or set teaching level: off, low, medium, high;");
+    puts("               or more/less to step it.");
+    puts("  /profile     Show the learner profile the agent keeps about you;");
+    puts("               /profile reset clears it.");
     puts("  /new         Start a fresh session from the system prompt.");
     puts("  /quit, /exit Exit.");
     puts("  Ctrl+C       Interrupt generation; clear edited text.");
@@ -9393,25 +9944,31 @@ static void agent_format_ctx_size(int ctx_size, char *buf, size_t len) {
     }
 }
 
-static void agent_format_welcome_banner(const agent_config *cfg,
+static void agent_format_welcome_banner(const agent_config *cfg, int teach_level,
                                         char *buf, size_t len) {
     char ctx[32];
     agent_format_ctx_size(cfg->gen.ctx_size, ctx, sizeof(ctx));
+    char teach[48] = "";
+    if (teach_level != AGENT_TEACH_OFF) {
+        snprintf(teach, sizeof(teach), ", teaching %s (/teach)",
+                 agent_teach_level_name(teach_level));
+    }
     if (stdout_is_tty()) {
         snprintf(buf, len,
-                 "\x1b[1;97mDwarf\x1b[1;94mStar\x1b[0m 🐋 Agent, context %s tokens\n\n",
-                 ctx);
+                 "\x1b[1;97mDwarf\x1b[1;94mStar\x1b[0m 🐋 Agent, context %s tokens%s\n\n",
+                 ctx, teach);
     } else {
-        snprintf(buf, len, "DwarfStar Agent, context %s tokens\n\n", ctx);
+        snprintf(buf, len, "DwarfStar Agent, context %s tokens%s\n\n", ctx, teach);
     }
 }
 
 static void editor_write_welcome_banner(agent_editor *editor,
                                         const agent_config *cfg,
+                                        int teach_level,
                                         const char *prompt,
                                         const char *statusline) {
     char banner[256];
-    agent_format_welcome_banner(cfg, banner, sizeof(banner));
+    agent_format_welcome_banner(cfg, teach_level, banner, sizeof(banner));
     editor_write_async(editor, banner, strlen(banner), prompt, statusline, true);
 }
 
@@ -9422,6 +9979,7 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
     memset(w, 0, sizeof(*w));
     w->engine = engine;
     w->cfg = cfg;
+    w->teach_level = cfg->gen.teach_level;
     w->wake_fd[0] = -1;
     w->wake_fd[1] = -1;
     pthread_mutex_init(&w->mu, NULL);
@@ -9779,6 +10337,8 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     }
     free(out);
 
+    if (rc == 0) agent_update_learner_profile_on_leave(&worker);
+
     if (stdin_nonblock) fcntl(STDIN_FILENO, F_SETFL, old_stdin_flags);
     agent_input_buf_free(&input);
     agent_prompt_queue_free(&queue);
@@ -9821,7 +10381,8 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
         agent_worker_free(&worker);
         return 1;
     }
-    editor_write_welcome_banner(&editor, cfg, prompt, statusline);
+    editor_write_welcome_banner(&editor, cfg, worker_get_teach_level(&worker),
+                                prompt, statusline);
 
     char *initial_pending = cfg->gen.prompt && cfg->gen.prompt[0] ?
                             xstrdup(cfg->gen.prompt) : NULL;
@@ -10050,6 +10611,61 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                             worker_request_power(&worker, power);
                         }
                     }
+                } else if (!strncmp(cmd, "/teach", 6) &&
+                           (cmd[6] == '\0' || cmd[6] == ' ' || cmd[6] == '\t')) {
+                    char *arg = cmd + 6;
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                    int cur = worker_get_teach_level(&worker);
+                    if (!arg[0]) {
+                        printf("teaching level: %s (off, low, medium, high; "
+                               "/teach more|less to adjust)\n",
+                               agent_teach_level_name(cur));
+                    } else {
+                        int level = cur;
+                        bool ok = true;
+                        if (!strcmp(arg, "more"))
+                            level = cur < AGENT_TEACH_LEVEL_MAX ? cur + 1 : cur;
+                        else if (!strcmp(arg, "less"))
+                            level = cur > AGENT_TEACH_OFF ? cur - 1 : cur;
+                        else
+                            ok = agent_teach_level_parse(arg, &level);
+                        if (!ok) {
+                            printf("usage: /teach [off|low|medium|high|more|less]\n");
+                        } else {
+                            worker_set_teach_level(&worker, level);
+                            printf("teaching level: %s%s\n",
+                                   agent_teach_level_name(level),
+                                   level != cur ? " (applies from the next prompt)" : "");
+                        }
+                    }
+                } else if (!strncmp(cmd, "/profile", 8) &&
+                           (cmd[8] == '\0' || cmd[8] == ' ' || cmd[8] == '\t')) {
+                    char *arg = cmd + 8;
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                    char *profile_path = agent_learner_profile_path();
+                    if (!strcmp(arg, "reset")) {
+                        if (unlink(profile_path) == 0 || errno == ENOENT)
+                            printf("learner profile cleared (%s)\n", profile_path);
+                        else
+                            printf("failed to clear %s: %s\n",
+                                   profile_path, strerror(errno));
+                    } else if (!arg[0]) {
+                        size_t profile_len = 0;
+                        char *profile = agent_learner_profile_read(&profile_len);
+                        if (profile) {
+                            fwrite(profile, 1, profile_len, stdout);
+                            if (profile[profile_len - 1] != '\n') printf("\n");
+                            printf("(%s; the agent updates it with the learn tool)\n",
+                                   profile_path);
+                            free(profile);
+                        } else {
+                            printf("learner profile is empty (%s); the agent fills "
+                                   "it in as it learns about you\n", profile_path);
+                        }
+                    } else {
+                        printf("usage: /profile [reset]\n");
+                    }
+                    free(profile_path);
                 } else if (cmd[0] == '/' && !agent_slash_command_known(cmd)) {
                     ssize_t ignored = write(STDOUT_FILENO, "\a", 1);
                     (void)ignored;
@@ -10065,8 +10681,11 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     agent_exit_save_result exit_save =
                         agent_maybe_save_before_exiting(&worker);
                     if (exit_save == AGENT_EXIT_NOW) {
+                        /* Declining the save is a discard gesture; exit fast
+                         * without a learner profile pass. */
                         exit(0);
                     } else if (exit_save == AGENT_EXIT_CLEAN) {
+                        agent_update_learner_profile_on_leave(&worker);
                         exit_save_handled = true;
                         running = false;
                     } else {
@@ -10077,6 +10696,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                 } else if (!strcmp(cmd, "/new")) {
                     editor_restore_terminal_layout(&editor);
                     if (agent_maybe_save_before_leaving_session(&worker)) {
+                        agent_update_learner_profile_on_leave(&worker);
                         char err[160] = {0};
                         if (!agent_worker_reset_to_sysprompt(&worker, err, sizeof(err))) {
                             printf("new session failed: %s\n", err);
@@ -10093,6 +10713,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     } else {
                         editor_restore_terminal_layout(&editor);
                         if (agent_maybe_save_before_leaving_session(&worker)) {
+                            agent_update_learner_profile_on_leave(&worker);
                             char *sha = arg;
                             while (*arg && *arg != ' ' && *arg != '\t') arg++;
                             if (*arg) *arg = '\0';
@@ -10181,7 +10802,9 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         editor.output_col = saved_output_col;
                     }
                     if (show_welcome_after_restart) {
-                        editor_write_welcome_banner(&editor, cfg, prompt, statusline);
+                        editor_write_welcome_banner(&editor, cfg,
+                                                    worker_get_teach_level(&worker),
+                                                    prompt, statusline);
                         show_welcome_after_restart = false;
                     }
                     if (force_status_redraw_after_restart) {
@@ -10206,6 +10829,8 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
         agent_exit_save_result exit_save =
             agent_maybe_save_before_exiting(&worker);
         if (exit_save == AGENT_EXIT_NOW) exit(0);
+        if (exit_save == AGENT_EXIT_CLEAN)
+            agent_update_learner_profile_on_leave(&worker);
     }
     agent_worker_free(&worker);
     return 0;

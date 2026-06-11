@@ -533,6 +533,55 @@ stripped session rebuilds the KV cache by prefilling the saved text.
 Use `--chdir /path/to/ds4` when launching `ds4-agent` from another directory,
 so relative runtime files such as `metal/*.metal` resolve from the project tree.
 
+### Teaching mode
+
+Most coding agents leave you outside the workshop: you pass a note under the
+door and a finished artifact comes back, with at best a raw thinking stream
+that was never written for a reader. `ds4-agent` instead treats the session as
+sitting at the craftsman's bench: while it works it narrates *why* it is doing
+things, and when something is genuinely worth learning it emits a short
+teaching aside as it happens, rendered distinctly in the terminal behind a
+`📚` marker so you can read it or skip it at a glance. Asides teach decisions,
+not keystrokes: trade-offs, invariants, debugging strategy, how to verify.
+The mentor has a soul, modeled on the teachers people remember: Khan Academy
+patience (nothing is shameful, everything anchors to what you already know)
+crossed with slightly unhinged hacker glee (a segfault is a crime scene, a
+failure is the good part). It opens loops to make you lean in, asks you to
+predict outcomes before running things — without ever stalling the work — and
+pitches one level above where you are. It tunes all of this to you over time,
+because a teacher without personality loses the student.
+
+Teaching is on by default (level `medium`) in interactive sessions and off in
+`--non-interactive` runs. The level is an instructiveness slider:
+
+* `off`: just do the work.
+* `low`: an occasional one-line why-note at key decisions, questions off.
+* `medium` (default): the full soul — narration, calibrated asides,
+  prediction questions resolved as the results land.
+* `high`: adds depth and challenge — rejected alternatives, underlying
+  mechanics, pointers, and real challenges thrown at you ("before you read my
+  fix, decide what you would change"), always resolved in the same turn so
+  the coding loop never blocks on the lesson.
+
+Select the startup level with `--teach LEVEL`, change it at any time with
+`/teach LEVEL`, or step it with `/teach more` and `/teach less`. Saying
+"more depth" or "I know that already" in the conversation works too: feedback
+about teaching is recorded and applied.
+
+There is no upfront survey. The agent calibrates like a craftsman sizing up an
+apprentice: it watches what you ask, what you build, and the vocabulary you
+use, occasionally asks one natural question in passing ("Have you worked with
+epoll before?"), and records what it learns in a persistent learner profile at
+`~/.ds4/learner.md`. Notes are taken two ways: in-band through the agent's
+`learn` tool while it works, and through a dedicated profile-update pass when
+you leave a session (`/quit`, `/new`, `/switch`, or the end of a
+non-interactive run), where the model's only job is to merge what the session
+revealed about you into the profile. The profile is shared across sessions and
+projects, so the calibration compounds over time: concepts you already know
+stop being explained, and the asides aim one level above where you are.
+Inspect it with `/profile`, clear it with `/profile reset`, or edit the file
+directly; it is yours.
+
 However while the system already works, there is a lot of work to do
 in order to make it ready for prime time. When finally the agent will reach
 the wanted shape, we will *likely* split the server and the client creating a stateful
