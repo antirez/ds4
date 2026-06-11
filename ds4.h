@@ -266,6 +266,13 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
+/* Greedy prompt-lookup speculative eval (DS4_PROMPT_LOOKUP_DRAFT=1): same
+ * contract as ds4_session_eval_speculative_argmax, drafting the continuation
+ * from the session's own token history instead of an MTP head. */
+int ds4_session_eval_prompt_lookup_argmax(ds4_session *s, int first_token,
+                                          int max_tokens, int eos_token,
+                                          int *accepted, int accepted_cap,
+                                          char *err, size_t errlen);
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);

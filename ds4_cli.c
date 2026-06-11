@@ -497,6 +497,23 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                 ds4_session_free(session);
                 return 1;
             }
+        } else if (cfg->gen.temperature <= 0.0f &&
+                   getenv("DS4_PROMPT_LOOKUP_DRAFT") != NULL) {
+            cli_dist_busy_set(cfg, true);
+            ntok = ds4_session_eval_prompt_lookup_argmax(session,
+                                                         token,
+                                                         max_tokens - generated,
+                                                         ds4_token_eos(engine),
+                                                         toks,
+                                                         (int)(sizeof(toks) / sizeof(toks[0])),
+                                                         err,
+                                                         sizeof(err));
+            cli_dist_busy_set(cfg, false);
+            if (ntok < 0) {
+                fprintf(stderr, "ds4: decode failed: %s\n", err);
+                ds4_session_free(session);
+                return 1;
+            }
         } else {
             cli_dist_busy_set(cfg, true);
             int eval_rc = ds4_session_eval(session, token, err, sizeof(err));
@@ -921,7 +938,8 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
         }
     } else if (cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR ||
                cfg->gen.temperature > 0.0f ||
-               ds4_engine_mtp_draft_tokens(engine) > 1) {
+               ds4_engine_mtp_draft_tokens(engine) > 1 ||
+               getenv("DS4_PROMPT_LOOKUP_DRAFT") != NULL) {
         rc = run_sampled_generation(engine, cfg, &prompt);
     } else {
         token_printer printer = {
