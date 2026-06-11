@@ -40,7 +40,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm install-user
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -51,6 +51,7 @@ help:
 	@echo "  make cpu          Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test         Build and run tests"
 	@echo "  make clean        Remove build outputs"
+	@echo "  make install-user Install ds4 and ds4-agent to ~/.local/bin and runtime files to ~/.ds4/runtime"
 
 ds4: ds4_cli.o ds4_help.o linenoise.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_cli.o ds4_help.o linenoise.o $(CORE_OBJS) $(METAL_LDLIBS)
@@ -89,6 +90,7 @@ help:
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test                Build and run tests"
 	@echo "  make clean               Remove build outputs"
+	@echo "  make install-user        Install ds4 and ds4-agent to ~/.local/bin and runtime files to ~/.ds4/runtime"
 
 cuda-spark:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=
@@ -239,6 +241,51 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test
 q4k-dot-test: tests/test_q4k_dot.c
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_q4k_dot tests/test_q4k_dot.c -lm -pthread
 	./tests/test_q4k_dot
+
+# -----------------------------------------------------------------------
+# User-local install — no system directories touched.
+#
+# INSTALL_BIN_DIR  — where to copy ds4 and ds4-agent binaries
+#                     (default: ~/.local/bin)
+# RUNTIME_DIR      — where to place runtime files for ds4_find_runtime_file()
+#                     (default: ~/.ds4/runtime)
+#
+# The model file is NOT copied (multi-GB).  If ds4flash.gguf exists in the
+# build directory a symlink command is suggested; otherwise the download
+# script path is printed.
+# -----------------------------------------------------------------------
+INSTALL_BIN_DIR ?= $(HOME)/.local/bin
+RUNTIME_DIR     ?= $(HOME)/.ds4/runtime
+
+install-user: ds4 ds4-agent
+	@echo "==> Installing binaries to $(INSTALL_BIN_DIR)"
+	mkdir -p $(INSTALL_BIN_DIR)
+	install -m 0755 ds4        $(INSTALL_BIN_DIR)/ds4
+	install -m 0755 ds4-agent  $(INSTALL_BIN_DIR)/ds4-agent
+	@echo "==> Installing runtime files to $(RUNTIME_DIR)"
+	mkdir -p $(RUNTIME_DIR)/metal
+	for f in metal/*.metal; do \
+		install -m 0644 "$$f" $(RUNTIME_DIR)/metal/; \
+	done
+	@echo ""
+	@echo "==> Model file"
+	@if [ -f ds4flash.gguf ]; then \
+		M="$$(realpath ds4flash.gguf)"; \
+		echo "  ds4flash.gguf found at: $$M"; \
+		if [ ! -L $(RUNTIME_DIR)/ds4flash.gguf ] || [ "$$(readlink $(RUNTIME_DIR)/ds4flash.gguf)" != "$$M" ]; then \
+			echo ""; \
+			echo "  To use it from any CWD, create a symlink:"; \
+			echo "    ln -s '$$M' $(RUNTIME_DIR)/ds4flash.gguf"; \
+		else \
+			echo "  Symlink $(RUNTIME_DIR)/ds4flash.gguf already points to it."; \
+		fi; \
+	else \
+		echo "  No ds4flash.gguf found in the build directory."; \
+		echo "  To download a model, run:"; \
+		echo "    ./download_model.sh"; \
+	fi
+	@echo ""
+	@echo "==> Done.  Run ds4 or ds4-agent from anywhere."
 
 clean:
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

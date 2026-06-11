@@ -23876,7 +23876,16 @@ int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *f
     token_vec tokens = {0};
 
     if (!fp) fp = stdout;
-    model_open(&model, model_path, false, false);
+
+    /* Resolve model path through runtime file discovery chain. */
+    char *resolved = NULL;
+    const char *path = model_path;
+    if (path && path[0] && path[0] != '/') {
+        resolved = ds4_find_runtime_file(path);
+        if (resolved) path = resolved;
+    }
+    model_open(&model, path, false, false);
+    free(resolved);
     vocab_load(&vocab, &model);
     tokenize_rendered_chat_vocab(&vocab, text ? text : "", &tokens);
 
@@ -24542,7 +24551,17 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
-    model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
+
+    /* Resolve model path through runtime file discovery chain unless the
+     * path is already absolute (user passed -m /full/path or env var). */
+    char *resolved_model = NULL;
+    const char *model_path = opt->model_path;
+    if (model_path && model_path[0] && model_path[0] != '/') {
+        resolved_model = ds4_find_runtime_file(model_path);
+        if (resolved_model) model_path = resolved_model;
+    }
+    model_open(&e->model, model_path, graph_backend, !opt->inspect_only);
+    free(resolved_model);
     if (opt->warm_weights) model_warm_weights(&e->model);
     if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
@@ -24624,7 +24643,14 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
+        char *resolved_mtp = NULL;
+        const char *mtp_path = opt->mtp_path;
+        if (mtp_path && mtp_path[0] && mtp_path[0] != '/') {
+            resolved_mtp = ds4_find_runtime_file(mtp_path);
+            if (resolved_mtp) mtp_path = resolved_mtp;
+        }
+        model_open(&e->mtp_model, mtp_path, graph_backend, true);
+        free(resolved_mtp);
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
         e->mtp_ready = true;
         fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
@@ -26596,6 +26622,89 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     }
     return n_accept;
 #endif
+}
+
+/* ============================================================================
+ * Runtime file discovery
+ *
+ * ds4_find_runtime_file() searches for a runtime file (e.g. model weights,
+ * Metal kernel sources) using the following lookup chain:
+ *
+ *   1. Already absolute (starts with '/') → use as-is
+ *   2. $DS4_RUNTIME_DIR env var          → check there
+ *   3. Binary-relative (dirname of exe)   → check there
+ *   4. ~/.ds4/runtime/                   → check there
+ *   5. CWD-relative                       → current fallback
+ *
+ * Returns an allocated path or NULL.  Caller frees.
+ * ========================================================================= */
+
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#include <libgen.h>
+bool ds4_get_executable_path(char *buf, size_t len) {
+    uint32_t size = (uint32_t)len;
+    return _NSGetExecutablePath(buf, &size) == 0;
+}
+#elif defined(__linux__)
+bool ds4_get_executable_path(char *buf, size_t len) {
+    ssize_t n = readlink("/proc/self/exe", buf, len - 1);
+    if (n <= 0) return false;
+    buf[n] = '\0';
+    return true;
+}
+#else
+bool ds4_get_executable_path(char *buf, size_t len) {
+    (void)buf; (void)len;
+    return false;  /* fallback to CWD */
+}
+#endif
+
+char *ds4_find_runtime_file(const char *name) {
+    /* 1. Already absolute? */
+    if (name[0] == '/') return strdup(name);
+
+    /* 2. DS4_RUNTIME_DIR env var */
+    const char *rt = getenv("DS4_RUNTIME_DIR");
+    if (rt && rt[0]) {
+        char *p = NULL;
+        if (asprintf(&p, "%s/%s", rt, name) > 0) {
+            if (p && access(p, F_OK) == 0) return p;
+            free(p);
+        }
+    }
+
+    /* 3. Binary-relative */
+    char exe_path[PATH_MAX];
+    if (ds4_get_executable_path(exe_path, sizeof(exe_path))) {
+        /* dirname may modify in-place; make a copy */
+        char *copy = strdup(exe_path);
+        if (copy) {
+            char *dir = dirname(copy);
+            char *p = NULL;
+            if (asprintf(&p, "%s/%s", dir, name) > 0) {
+                if (p && access(p, F_OK) == 0) {
+                    free(copy);
+                    return p;
+                }
+                free(p);
+            }
+            free(copy);
+        }
+    }
+
+    /* 4. ~/.ds4/runtime/ */
+    const char *home = getenv("HOME");
+    if (home) {
+        char *p = NULL;
+        if (asprintf(&p, "%s/.ds4/runtime/%s", home, name) > 0) {
+            if (p && access(p, F_OK) == 0) return p;
+            free(p);
+        }
+    }
+
+    /* 5. Fall back to name as relative-from-CWD */
+    return access(name, F_OK) == 0 ? strdup(name) : NULL;
 }
 
 void ds4_session_invalidate(ds4_session *s) {

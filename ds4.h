@@ -144,6 +144,12 @@ typedef struct {
     uint64_t bytes;
 } ds4_session_payload_file;
 
+/* Runtime file discovery — see ds4_find_runtime_file() in ds4.c for the
+ * lookup chain: absolute path → $DS4_RUNTIME_DIR → binary-relative →
+ * ~/.ds4/runtime/ → CWD-relative (current fallback). */
+bool ds4_get_executable_path(char *buf, size_t len);
+char *ds4_find_runtime_file(const char *name);
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 void ds4_engine_close(ds4_engine *e);
 void ds4_engine_summary(ds4_engine *e);

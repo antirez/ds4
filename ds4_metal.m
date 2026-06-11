@@ -2860,7 +2860,6 @@ static const char *ds4_gpu_source =
 
 static NSString *ds4_gpu_full_source(void) {
     NSString *base = [NSString stringWithUTF8String:ds4_gpu_source];
-    NSFileManager *fm = [NSFileManager defaultManager];
     /*
      * Kernels are kept as separate files for review, then concatenated into one
      * Metal library.  Environment overrides are still honored so a diagnostic
@@ -2891,29 +2890,41 @@ static NSString *ds4_gpu_full_source(void) {
     NSMutableString *source = [NSMutableString stringWithString:base];
     for (NSArray<NSString *> *spec in required_sources) {
         const char *override_path = getenv([spec[0] UTF8String]);
-        NSMutableArray<NSString *> *paths = [NSMutableArray array];
-        if (override_path && override_path[0]) {
-            [paths addObject:[NSString stringWithUTF8String:override_path]];
-        }
-        [paths addObject:spec[1]];
-        [paths addObject:[@"./" stringByAppendingString:spec[1]]];
-
         NSString *loaded = nil;
         NSString *loaded_path = nil;
-        for (NSString *path in paths) {
-            if (![fm fileExistsAtPath:path]) continue;
 
+        if (override_path && override_path[0]) {
+            loaded_path = [NSString stringWithUTF8String:override_path];
             NSError *error = nil;
-            loaded = [NSString stringWithContentsOfFile:path
+            loaded = [NSString stringWithContentsOfFile:loaded_path
                                                encoding:NSUTF8StringEncoding
                                                   error:&error];
             if (!loaded) {
                 fprintf(stderr, "ds4: failed to read Metal source %s: %s\n",
-                        [path UTF8String], [[error localizedDescription] UTF8String]);
+                        [loaded_path UTF8String],
+                        [[error localizedDescription] UTF8String]);
                 return nil;
             }
-            loaded_path = path;
-            break;
+        } else {
+            /* Use runtime file discovery chain: $DS4_RUNTIME_DIR →
+             * binary-relative → ~/.ds4/runtime/ → CWD. */
+            char *found = ds4_find_runtime_file([spec[1] UTF8String]);
+            if (found) {
+                loaded_path = [NSString stringWithUTF8String:found];
+                NSError *error = nil;
+                loaded = [NSString stringWithContentsOfFile:loaded_path
+                                                   encoding:NSUTF8StringEncoding
+                                                      error:&error];
+                if (!loaded) {
+                    fprintf(stderr,
+                            "ds4: failed to read Metal source %s: %s\n",
+                            [loaded_path UTF8String],
+                            [[error localizedDescription] UTF8String]);
+                    free(found);
+                    return nil;
+                }
+                free(found);
+            }
         }
 
         if (!loaded) {
