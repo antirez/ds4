@@ -212,10 +212,14 @@ static const char *cuda_model_range_register_mapped(const void *model_map,
     const uintptr_t reg_addr = host_addr & ~(uintptr_t)(page_sz - 1u);
     const uint64_t reg_delta = (uint64_t)(host_addr - reg_addr);
     uint64_t reg_bytes = (reg_delta + bytes + page_sz - 1u) & ~(page_sz - 1u);
+
     if (model_map == g_model_host_base &&
-        g_model_registered_size >= 88ull * 1073741824ull &&
+        g_model_registered_size >= 32ull * 1073741824ull &&
+        g_model_registered_size <= 64ull * 1073741824ull &&
+        g_model_registered_size <= 88ull * 1073741824ull &&
         g_model_registered_size <= 96ull * 1073741824ull &&
-        g_model_range_bytes >= 80ull * 1073741824ull) {
+        g_model_registered_size <= 160ull * 1073741824ull && // NOTE (yiakwy) : to cover deepseek v4 sft/rl q4 model
+        g_model_range_bytes >= 32ull * 1073741824ull) {
         const uintptr_t model_base = (uintptr_t)model_map;
         const uintptr_t model_end = model_base + (uintptr_t)g_model_registered_size;
         if (model_end > model_base && model_end > reg_addr) {
@@ -223,6 +227,7 @@ static const char *cuda_model_range_register_mapped(const void *model_map,
             reg_bytes = (tail_bytes + page_sz - 1u) & ~(page_sz - 1u);
         }
     }
+
     void *reg_dev = NULL;
 
     unsigned int flags = cudaHostRegisterMapped | cudaHostRegisterReadOnly;
@@ -355,12 +360,26 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         }
     }
 
-    if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
+    // NOTE (yiakwy) : ensure correct chunk reading
+    /*
+    uint64_t cache_limit = 32ull * 1073741824ull;
+    const char *env_limit = getenv("DS4_CUDA_WEIGHT_CACHE_LIMIT_GB");
+    if (env_limit && env_limit[0]) {
+        cache_limit = (uint64_t)strtoull(env_limit, NULL, 10) * 1073741824ull;
+    }
+     */
+
+    const uint64_t cache_limit = cuda_model_cache_limit_bytes();
+    if ((g_model_device_owned || g_model_registered) && (offset + bytes <= cache_limit)) {
+        return cuda_model_ptr(model_map, offset);
+    }
+
     if (g_model_hmm_direct &&
         getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
         getenv("DS4_CUDA_WEIGHT_PRELOAD") == NULL) {
         return cuda_model_ptr(model_map, offset);
     }
+
     const char *direct_env = getenv("DS4_CUDA_DIRECT_MODEL");
     if (direct_env && direct_env[0]) return cuda_model_ptr(model_map, offset);
 
@@ -369,6 +388,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         if (fd_ptr) return fd_ptr;
     }
 
+    // NOTE (yiakwy) : UVA coppying, only valid for Hopper+
     const char *mapped = cuda_model_range_register_mapped(model_map, offset, bytes, what);
     if (mapped) return mapped;
 
@@ -377,7 +397,20 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
 
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
     if (bytes == 0) return 1;
+
+    uint64_t cache_limit = 64ull * 1073741824ull;
+    const char *env_limit = getenv("DS4_CUDA_WEIGHT_CACHE_LIMIT_GB");
+    if (env_limit && env_limit[0]) {
+        cache_limit = (uint64_t)strtoull(env_limit, NULL, 10) * 1073741824ull;
+    }
+    /*
     if (g_model_device_owned || g_model_registered || g_model_hmm_direct) return 1;
+    */
+    if ((g_model_device_owned || g_model_registered) && (offset + bytes <= cache_limit)) {
+        return 1;
+    }
+
+    if (g_model_hmm_direct) return 1;
 
     const uint64_t end = offset + bytes;
     if (end < offset) return 0;
@@ -774,7 +807,7 @@ static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size,
     if (!model_map || map_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
     if (getenv("DS4_CUDA_NO_MODEL_PREFETCH") != NULL ||
         getenv("DS4_CUDA_COPY_MODEL") != NULL ||
-        getenv("DS4_CUDA_WEIGHT_CACHE") != NULL ||
+        // getenv("DS4_CUDA_WEIGHT_CACHE") != NULL ||
         getenv("DS4_CUDA_WEIGHT_PRELOAD") != NULL) {
         return 0;
     }
@@ -1017,7 +1050,8 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
      * scratch, KV, and optional Q8->F16 buffers, and make the full-Q4 model
      * use distributed layer loading unless the operator opts into a larger
      * cache budget explicitly. */
-    return 96ull * 1073741824ull;
+    // return 96ull * 1073741824ull;
+    return 32ull * 1073741824ull;
 }
 
 static uint64_t cuda_model_local_model_limit_bytes(void) {
@@ -1206,20 +1240,62 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
     if (!model_map || model_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
     if (getenv("DS4_CUDA_NO_MODEL_COPY") != NULL ||
         getenv("DS4_CUDA_DIRECT_MODEL") != NULL ||
-        getenv("DS4_CUDA_WEIGHT_CACHE") != NULL ||
+        // getenv("DS4_CUDA_WEIGHT_CACHE") != NULL ||
         getenv("DS4_CUDA_WEIGHT_PRELOAD") != NULL) {
         return 0;
     }
     if (g_model_device_owned || g_model_registered) return 1;
 
+    uint64_t cache_limit = 32ull * 1073741824ull;
+    const char *env_limit = getenv("DS4_CUDA_WEIGHT_CACHE_LIMIT_GB");
+
+    if (env_limit && env_limit[0]) {
+        char *end = NULL;
+        unsigned long long v = strtoull(env_limit, &end, 10);
+        if (end != env_limit) cache_limit = (uint64_t)v * 1073741824ull;
+    }
+
+    uint64_t alloc_size = model_size;
+    int is_partial_cache = 0;
+    if (getenv("DS4_CUDA_WEIGHT_CACHE") != NULL && model_size > cache_limit) {
+        alloc_size = cache_limit;
+        is_partial_cache = 1;
+        fprintf(stderr, "ds4: [yiakwy Opt Note] Model size (%.2f GiB) exceeds H800/H100/DGX Spark capacity. Restricting static device cache to %s GB.\n", 
+                (double)model_size / 1073741824.0, env_limit ? env_limit : "64");
+    }
+
     void *dev = NULL;
     const double t0 = cuda_wall_sec();
+
+    cudaError_t err = cudaMalloc(&dev, (size_t)alloc_size);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA static cache allocation failed: %s\n", cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    uint64_t target_copy_size = map_size;
+    if (is_partial_cache && (map_offset + map_size) > alloc_size) {
+        if (alloc_size > map_offset) {
+            target_copy_size = alloc_size - map_offset;
+        } else {
+            target_copy_size = 0;
+        }
+    }
+
+    /*
+    void *dev = NULL;
+    const double t0 = cuda_wall_sec();
+
+    // TODO (yiakwy) : fix & refactor to allow allocate weights cache/chunk instead of the whole model
     cudaError_t err = cudaMalloc(&dev, (size_t)model_size);
+
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: CUDA model allocation skipped: %s\n", cudaGetErrorString(err));
         (void)cudaGetLastError();
         return 0;
     }
+    */
 
     fprintf(stderr, "ds4: CUDA chunk-copying %.2f GiB model image\n",
             (double)model_size / 1073741824.0);
@@ -1234,7 +1310,7 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
         return 0;
     }
 
-    if (map_offset > 0) {
+    if (map_offset > 0 && map_offset <= alloc_size) {
         uint64_t copied_header = 0;
         while (copied_header < map_offset) {
             const uint64_t n = (map_offset - copied_header < chunk) ? (map_offset - copied_header) : chunk;
@@ -1253,7 +1329,8 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
 
     uint64_t copied = 0;
     double last_report = t0;
-    while (copied < map_size) {
+    // while (copied < map_size) {
+    while (copied < target_copy_size) {
         const uint64_t n = (map_size - copied < chunk) ? (map_size - copied) : chunk;
         const uint64_t off = map_offset + copied;
         memcpy(stage, (const char *)model_map + off, (size_t)n);
@@ -1272,7 +1349,8 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
         if (getenv("DS4_CUDA_MODEL_COPY_VERBOSE") != NULL && now - last_report >= 2.0) {
             fprintf(stderr, "ds4: CUDA model chunk copy %.2f/%.2f GiB\n",
                     (double)copied / 1073741824.0,
-                    (double)map_size / 1073741824.0);
+                    // (double)map_size / 1073741824.0);
+                    (double)target_copy_size / 1073741824.0);
             last_report = now;
         }
     }
@@ -1281,11 +1359,14 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
     g_model_device_base = (const char *)dev;
     g_model_device_owned = 1;
     g_model_hmm_direct = 0;
+
+    g_model_range_bytes = alloc_size;
+
     const double t1 = cuda_wall_sec();
     fprintf(stderr,
             "ds4: CUDA model chunk copy complete in %.3fs (%.2f GiB tensors)\n",
             t1 - t0,
-            (double)map_size / 1073741824.0);
+            env_limit ? env_limit : "32");
     return 1;
 }
 
@@ -1576,8 +1657,20 @@ static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!cuda_model_set_host_map(model_map, model_size)) return 0;
 
+    /*
+    // NOTE (yiakwy)
+    if (getenv("DS4_CUDA_WEIGHT_CACHE") != NULL) {
+        g_model_host_base = model_map;
+        g_model_registered_size = model_size;
+        return 1; 
+    }
+    */
+
+    g_model_host_base = model_map;
+    g_model_registered_size = model_size;
+
     const char *copy_env = getenv("DS4_CUDA_COPY_MODEL");
-    if (copy_env && copy_env[0]) {
+    if (copy_env && copy_env[0] && getenv("DS4_CUDA_WEIGHT_CACHE") == NULL) {
         void *dev = NULL;
         const double t0 = clock() / (double)CLOCKS_PER_SEC;
         cudaError_t err = cudaMalloc(&dev, (size_t)model_size);
@@ -1613,13 +1706,18 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         if (err == cudaSuccess && dev) {
             g_model_device_base = (const char *)dev;
             g_model_registered = 1;
-            fprintf(stderr, "ds4: CUDA registered %.2f GiB model mapping for device access\n",
+            fprintf(stderr, "ds4: CUDA registered %.2f GiB model UVA virtual mapping space for device access\n",
                     (double)model_size / 1073741824.0);
         } else {
             fprintf(stderr, "ds4: CUDA host registration pointer lookup failed: %s\n", cudaGetErrorString(err));
             (void)cudaGetLastError();
         }
     } else {
+        if (getenv("DS4_CUDA_WEIGHT_CACHE") == NULL) {
+            fprintf(stderr, "ds4: CUDA host registration skipped: %s\n", cudaGetErrorString(err));
+        }
+        (void)cudaGetLastError();
+        /*
         fprintf(stderr, "ds4: CUDA host registration skipped: %s\n", cudaGetErrorString(err));
         (void)cudaGetLastError();
         const uint64_t limit = cuda_model_local_model_limit_bytes();
@@ -1632,16 +1730,44 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
                     (double)limit / 1073741824.0);
             return 0;
         }
+        */
     }
     return 1;
 }
 
 extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
     (void)max_tensor_bytes;
+
+    // NOTE (yiakwy) : Make sure CUDA UVA mapping is set up for the model before any chunked copy or prefetch, 
+    // so that the copy/prefetch can directly target the device pointer if registered, or properly fall back to staging buffers if not.
     if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
+
+    if ((getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL || getenv("DS4_CUDA_WEIGHT_CACHE") != NULL)) {
+        int success = cuda_model_copy_chunked(model_map, model_size, map_offset, map_size);
+        
+        if (success) {
+            uint64_t cache_limit = 32ull * 1073741824ull;
+            if (model_size > cache_limit) {
+                uint64_t remain_offset = map_offset + cache_limit;
+                uint64_t remain_size = (model_size > remain_offset) ? (model_size - remain_offset) : 0;
+                if (remain_size > 0) {
+                    fprintf(stderr, "ds4: Launching background prefetch stream for the remaining %.2f GiB stream-weights...\n", 
+                            (double)remain_size / 1073741824.0);
+                    (void)cuda_model_prefetch_range(model_map, model_size, remain_offset, remain_size);
+                }
+            }
+            return 1;
+        } else {
+            fprintf(stderr, "ds4: (yiakwy Opt Note) CUDA model chunk copy failed or disabled, falling back to prefetch for the specified range.\n");
+        }
+
+    }
+
     if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL &&
         !cuda_model_copy_chunked(model_map, model_size, map_offset, map_size)) {
         (void)cuda_model_prefetch_range(model_map, model_size, map_offset, map_size);
+    } else {
+        fprintf(stderr, "ds4: (yiakwy Opt Note) CUDA model prefetch for the specified range disabled.\n");
     }
     return 1;
 }

@@ -2193,8 +2193,14 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
             if (spans[i].end > end) end = spans[i].end;
             i++;
         }
+
         char label[96];
         snprintf(label, sizeof(label), "tensor-span:%" PRIu64, merged);
+
+        int cache_status = 1;
+        uint64_t current_span_size = end - off;
+
+        /*
         if (ds4_gpu_cache_model_range(m->map, m->size, off, end - off, label) == 0) {
             if (tty) fputc('\n', stderr);
             fprintf(stderr,
@@ -2204,6 +2210,40 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
             free(spans);
             return false;
         }
+        */
+        if (getenv("DS4_CUDA_WEIGHT_CACHE") != NULL) {
+            uint64_t cache_limit = 32ull * 1073741824ull;
+            const char *env_limit = getenv("DS4_CUDA_WEIGHT_CACHE_LIMIT_GB");
+            if (env_limit && env_limit[0]) {
+                cache_limit = (uint64_t)strtoull(env_limit, NULL, 10) * 1073741824ull;
+            }
+
+            if (off >= cache_limit || prepared >= cache_limit) {
+                static bool fallback_logged = false;
+                if (!fallback_logged) {
+                    if (tty) fputc('\n', stderr);
+                    fprintf(stderr, "ds4: [Yiakwy Dynamic] Budget %.2f GiB exhausted. Routing remaining spans to UVA direct-access mode.\n",
+                            (double)cache_limit / 1073741824.0);
+                    fallback_logged = true;
+                }
+                cache_status = 1;
+            } else {
+                cache_status = ds4_gpu_cache_model_range(m->map, m->size, off, current_span_size, label);
+            }
+        } else {
+            cache_status = ds4_gpu_cache_model_range(m->map, m->size, off, current_span_size, label);
+        }
+        
+        if (cache_status == 0) {
+            if (tty) fputc('\n', stderr);
+            fprintf(stderr,
+                    "ds4: accelerator failed to prepare model tensor span %" PRIu64
+                    " at offset %" PRIu64 "\n",
+                    merged, off);
+            free(spans);
+            return false;
+        }        
+
         prepared += end - off;
         merged++;
 
