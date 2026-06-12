@@ -12134,6 +12134,39 @@ int ds4_gpu_indexer_score_one_tensor(
     return 1;
 }
 
+/* HISA stubs.  Metal port is deferred; a zero return causes the caller
+ * to fall through to the flat indexer path, which the Metal backend
+ * already supports. */
+int ds4_gpu_hisa_block_rep_update_tensor(
+        ds4_gpu_tensor       *block_reps,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t              n_comp,
+        uint32_t              n_blocks) {
+    (void)block_reps; (void)index_comp; (void)n_comp; (void)n_blocks;
+    return 0;
+}
+
+int ds4_gpu_hisa_score_one_tensor(
+        ds4_gpu_tensor       *scores,
+        ds4_gpu_tensor       *sel_blocks,
+        ds4_gpu_tensor       *block_scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *block_reps,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t              n_comp,
+        uint32_t              n_blocks,
+        uint32_t              n_visible_blocks,
+        uint32_t              n_visible_rows,
+        uint32_t              m,
+        float                 scale) {
+    (void)scores; (void)sel_blocks; (void)block_scores;
+    (void)q; (void)weights; (void)block_reps; (void)index_comp;
+    (void)n_comp; (void)n_blocks; (void)n_visible_blocks;
+    (void)n_visible_rows; (void)m; (void)scale;
+    return 0;
+}
+
 static int ds4_gpu_indexer_scores_batch_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
