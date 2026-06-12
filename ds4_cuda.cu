@@ -82,6 +82,9 @@ static uint64_t g_model_direct_align = 1;
 static uint64_t g_model_file_size;
 static int g_model_cache_full;
 static int g_model_mapping_failure_notice_printed;
+static int g_model_span_only;
+static uint64_t g_model_span_cover_offset;
+static uint64_t g_model_span_cover_end;
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
 static cublasHandle_t g_cublas;
@@ -153,7 +156,8 @@ static const char *cuda_model_range_ptr_from_fd(
         uint64_t offset,
         uint64_t bytes,
         const char *what);
-static const char *cuda_model_direct_fallback_ptr(const void *model_map, uint64_t offset);
+static const char *cuda_model_direct_fallback_ptr(const void *model_map, uint64_t offset, uint64_t bytes);
+static int cuda_model_range_in_span_cover(uint64_t offset, uint64_t bytes);
 static uint64_t cuda_model_cache_limit_bytes(void);
 static uint64_t cuda_model_local_model_limit_bytes(void);
 static int cuda_model_cache_limit_explicit(void);
@@ -213,6 +217,7 @@ static const char *cuda_model_range_register_mapped(const void *model_map,
     const uint64_t reg_delta = (uint64_t)(host_addr - reg_addr);
     uint64_t reg_bytes = (reg_delta + bytes + page_sz - 1u) & ~(page_sz - 1u);
     if (model_map == g_model_host_base &&
+        !g_model_span_only &&
         g_model_registered_size >= 88ull * 1073741824ull &&
         g_model_registered_size <= 96ull * 1073741824ull &&
         g_model_range_bytes >= 80ull * 1073741824ull) {
@@ -355,14 +360,17 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         }
     }
 
-    if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
+    if ((g_model_device_owned || g_model_registered) &&
+        cuda_model_range_in_span_cover(offset, bytes)) return cuda_model_ptr(model_map, offset);
     if (g_model_hmm_direct &&
         getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
-        getenv("DS4_CUDA_WEIGHT_PRELOAD") == NULL) {
+        getenv("DS4_CUDA_WEIGHT_PRELOAD") == NULL &&
+        cuda_model_range_in_span_cover(offset, bytes)) {
         return cuda_model_ptr(model_map, offset);
     }
     const char *direct_env = getenv("DS4_CUDA_DIRECT_MODEL");
-    if (direct_env && direct_env[0]) return cuda_model_ptr(model_map, offset);
+    if (direct_env && direct_env[0] &&
+        cuda_model_range_in_span_cover(offset, bytes)) return cuda_model_ptr(model_map, offset);
 
     if (getenv("DS4_CUDA_NO_FD_CACHE") == NULL) {
         const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
@@ -377,7 +385,8 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
 
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
     if (bytes == 0) return 1;
-    if (g_model_device_owned || g_model_registered || g_model_hmm_direct) return 1;
+    if ((g_model_device_owned || g_model_registered || g_model_hmm_direct) &&
+        cuda_model_range_in_span_cover(offset, bytes)) return 1;
 
     const uint64_t end = offset + bytes;
     if (end < offset) return 0;
@@ -1098,10 +1107,12 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
 /* A raw host pointer is safe for kernels only after CUDA owns, registered, or
  * HMM-prefetched the mapping.  Otherwise let the caller try per-range mapping
  * or a device copy instead of surfacing an async illegal access later. */
-static const char *cuda_model_direct_fallback_ptr(const void *model_map, uint64_t offset) {
+static const char *cuda_model_direct_fallback_ptr(const void *model_map, uint64_t offset, uint64_t bytes) {
     if (g_model_device_owned || g_model_registered || g_model_hmm_direct ||
         getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
-        return cuda_model_ptr(model_map, offset);
+        if (cuda_model_range_in_span_cover(offset, bytes)) {
+            return cuda_model_ptr(model_map, offset);
+        }
     }
     return NULL;
 }
@@ -1121,13 +1132,13 @@ static const char *cuda_model_range_ptr_from_fd(
                     (double)bytes / 1048576.0,
                     (double)limit / 1073741824.0);
         }
-        return cuda_model_direct_fallback_ptr(model_map, offset);
+        return cuda_model_direct_fallback_ptr(model_map, offset, bytes);
     }
 
     char *dev = cuda_model_arena_alloc(bytes, what);
     if (!dev) {
         if (getenv("DS4_CUDA_STRICT_WEIGHT_CACHE") != NULL) return NULL;
-        return cuda_model_direct_fallback_ptr(model_map, offset);
+        return cuda_model_direct_fallback_ptr(model_map, offset, bytes);
     }
     cudaError_t err = cudaSuccess;
 
@@ -1210,7 +1221,7 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
         getenv("DS4_CUDA_WEIGHT_PRELOAD") != NULL) {
         return 0;
     }
-    if (g_model_device_owned || g_model_registered) return 1;
+    if ((g_model_device_owned || g_model_registered) && !g_model_span_only) return 1;
 
     void *dev = NULL;
     const double t0 = cuda_wall_sec();
@@ -1350,6 +1361,9 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_q8_f32_ranges.clear();
     g_q8_f32_by_offset.clear();
     g_q8_f32_bytes = 0;
+    g_model_span_only = 0;
+    g_model_span_cover_offset = 0;
+    g_model_span_cover_end = 0;
     if (g_cuda_tmp) {
         (void)cudaFree(g_cuda_tmp);
         g_cuda_tmp = NULL;
@@ -1540,6 +1554,41 @@ extern "C" int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const 
 extern "C" int ds4_gpu_end_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "end commands"); }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
+/* Compute the minimal page-aligned cover of [offset, offset+size) spans.
+ * Writes cover start to *cover_offset and size to *cover_bytes. */
+static int cuda_model_compute_span_cover(
+        const uint64_t *offsets,
+        const uint64_t *sizes,
+        uint32_t count,
+        uint64_t model_size,
+        uint64_t *cover_offset,
+        uint64_t *cover_bytes) {
+    if (!offsets || !sizes || count == 0 || !cover_offset || !cover_bytes) return 0;
+    const long page_sz_l = sysconf(_SC_PAGESIZE);
+    const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
+    uint64_t lo = UINT64_MAX, hi = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (sizes[i] == 0) continue;
+        if (offsets[i] > model_size || sizes[i] > model_size - offsets[i]) return 0;
+        if (offsets[i] < lo) lo = offsets[i];
+        uint64_t end = offsets[i] + sizes[i];
+        if (end > hi) hi = end;
+    }
+    if (lo == UINT64_MAX) return 0;
+    *cover_offset = lo & ~(page_sz - 1u);
+    *cover_bytes = ((hi + page_sz - 1u) & ~(page_sz - 1u)) - *cover_offset;
+    return 1;
+}
+
+static int cuda_model_range_in_span_cover(uint64_t offset, uint64_t bytes) {
+    if (!g_model_span_only) return 1;
+    if (bytes == 0) return offset >= g_model_span_cover_offset &&
+                         offset <  g_model_span_cover_end;
+    if (bytes > UINT64_MAX - offset) return 0;
+    const uint64_t end = offset + bytes;
+    return offset >= g_model_span_cover_offset && end <= g_model_span_cover_end;
+}
+
 static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
     cuda_model_range_release_all();
@@ -1567,6 +1616,9 @@ static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
     g_model_hmm_direct = 0;
     g_model_cache_full = 0;
     g_model_mapping_failure_notice_printed = 0;
+    g_model_span_only = 0;
+    g_model_span_cover_offset = 0;
+    g_model_span_cover_end = 0;
     if (g_model_fd >= 0 && g_model_fd_host_base == NULL) {
         g_model_fd_host_base = model_map;
     }
@@ -1681,7 +1733,27 @@ extern "C" int ds4_gpu_set_model_map_spans(
             return 0;
         }
     }
-    if (!cuda_model_set_host_map(model_map, model_size)) return 0;
+    {
+        uint64_t cover_off = 0, cover_bytes = 0;
+        if (cuda_model_compute_span_cover(offsets, sizes, count, model_size,
+                                          &cover_off, &cover_bytes)) {
+            if (!cuda_model_set_host_map(model_map, model_size)) return 0;
+            g_model_span_cover_offset = cover_off;
+            g_model_span_cover_end = cover_off + cover_bytes;
+            g_model_span_only = 1;
+            if (cover_bytes < model_size) {
+                fprintf(stderr,
+                        "ds4: CUDA span cover %.2f GiB of %.2f GiB model "
+                        "(%u spans, offset %.2f GiB)\n",
+                        (double)cover_bytes / 1073741824.0,
+                        (double)model_size / 1073741824.0,
+                        count,
+                        (double)cover_off / 1073741824.0);
+            }
+        } else {
+            if (!cuda_model_set_host_map(model_map, model_size)) return 0;
+        }
+    }
 
     if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL) {
         for (uint32_t i = 0; i < count; i++) {
