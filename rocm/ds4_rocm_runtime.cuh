@@ -1237,6 +1237,8 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
     }
     g_model_images.push_back({model_map, map_size, (char *)dev, map_offset});
     g_model_host_base = model_map;
+    /* With multiple disjoint images there is no single base pointer;
+     * all tensor lookups go through cuda_model_image_ptr() instead. */
     g_model_device_base = NULL;
     g_model_registered_size = model_size;
     g_model_device_owned = 1;
@@ -1542,6 +1544,9 @@ extern "C" int ds4_gpu_set_model_map_spans(
         if (end > max_end) max_end = end;
     }
     if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
+    /* If the bounding box is tight (<=10% waste), copy it as one
+     * contiguous range.  Otherwise sort and merge to avoid copying
+     * large gaps between non-adjacent spans. */
     const uint64_t bbox = max_end - min_offset;
     if (bbox <= span_bytes + span_bytes / 10u) {
         return cuda_model_copy_chunked(model_map, model_size, min_offset, bbox);
@@ -1554,6 +1559,8 @@ extern "C" int ds4_gpu_set_model_map_spans(
     uint64_t grp_off = sorted[0].first;
     uint64_t grp_end = sorted[0].second;
     for (uint32_t i = 1; i <= count; i++) {
+        /* Merge spans separated by <= 64 KiB to reduce the number of
+         * device allocations without wasting meaningful memory. */
         const uint64_t gap = 64ull * 1024ull;
         if (i < count && sorted[i].first <= grp_end + gap) {
             if (sorted[i].second > grp_end) grp_end = sorted[i].second;
