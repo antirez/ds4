@@ -935,6 +935,53 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                                n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 8192 launch");
     }
+    if (top_k == 1024u && n_comp <= 1024u) {
+        indexer_topk_1024_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+                                                     (const float *)scores->ptr,
+                                                     n_comp, n_tokens, top_k);
+        return cuda_ok(cudaGetLastError(), "indexer topk 1024x1024 launch");
+    }
+    if (top_k == 1024u && n_comp <= 2048u) {
+        indexer_topk_pow2_kernel<2048><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+                                                           (const float *)scores->ptr,
+                                                           n_comp, n_tokens, top_k);
+        return cuda_ok(cudaGetLastError(), "indexer topk 2048x1024 launch");
+    }
+    if (top_k == 1024u && n_comp <= 4096u) {
+        indexer_topk_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+                                                           (const float *)scores->ptr,
+                                                           n_comp, n_tokens, top_k);
+        return cuda_ok(cudaGetLastError(), "indexer topk 4096x1024 launch");
+    }
+    if (top_k == 1024u && n_comp <= 8192u) {
+        if (n_comp > 4096u) {
+            using TopkCubSort = cub::BlockRadixSort<uint64_t, 512, 16>;
+            const int smem = (int)sizeof(typename TopkCubSort::TempStorage);
+            int dev = 0;
+            int max_optin_smem = 0;
+            cudaError_t attr_err = cudaGetDevice(&dev);
+            if (attr_err == cudaSuccess) {
+                attr_err = cudaDeviceGetAttribute(&max_optin_smem,
+                                                  cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                                  dev);
+            }
+            if (attr_err == cudaSuccess && max_optin_smem >= smem) {
+                attr_err = cudaFuncSetAttribute(indexer_topk_8192_cub_kernel,
+                                                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                smem);
+                if (attr_err == cudaSuccess) {
+                    indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
+                                                                                 (const float *)scores->ptr,
+                                                                                 n_comp, n_tokens, top_k);
+                    return cuda_ok(cudaGetLastError(), "indexer topk 8192x1024 cub launch");
+                }
+            }
+        }
+        indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+                                                               (const float *)scores->ptr,
+                                                               n_comp, n_tokens, top_k);
+        return cuda_ok(cudaGetLastError(), "indexer topk 8192x1024 launch");
+    }
     if (top_k == 512u) {
         const uint32_t chunk_n = 4096u;
         const uint32_t n_chunks = (n_comp + chunk_n - 1u) / chunk_n;
