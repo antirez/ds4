@@ -312,6 +312,18 @@ static int routed_moe_build_plan(
     return 1;
 }
 
+static int routed_moe_full_table_is_cached(
+        const void *model_map,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_bytes,
+        uint64_t down_bytes) {
+    return cuda_model_range_is_cached(model_map, gate_offset, gate_bytes) &&
+           cuda_model_range_is_cached(model_map, up_offset, gate_bytes) &&
+           cuda_model_range_is_cached(model_map, down_offset, down_bytes);
+}
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -462,11 +474,22 @@ static int routed_moe_launch(
                                    &gate_w,
                                    &up_w,
                                    &down_w));
+    const int full_table_cached =
+        !stream_full_layer &&
+        routed_moe_full_table_is_cached(model_map,
+                                        gate_offset,
+                                        up_offset,
+                                        down_offset,
+                                        gate_bytes,
+                                        down_bytes);
     if (!compact_selected && !batch_stream_selected && !batch_stream_split_selected) {
-        if (g_ssd_streaming_mode && n_total_expert > n_expert && !stream_full_layer) {
+        if (g_ssd_streaming_mode &&
+            n_total_expert > n_expert &&
+            !stream_full_layer &&
+            !full_table_cached) {
             fprintf(stderr,
                     DS4_GPU_LOG_PREFIX "SSD streaming routed MoE missing compact selected experts "
-                    "(layer=%u tokens=%u total_experts=%u selected=%u); refusing full expert-table cache\n",
+                    "(layer=%u tokens=%u total_experts=%u selected=%u); full expert table is not mapped\n",
                     layer_index,
                     n_tokens,
                     n_total_expert,
