@@ -14016,9 +14016,14 @@ static bool metal_graph_encode_decode_layer(
     const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
     const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
-    const bool compressed = ds4_layer_compress_ratio(il) != 0;
-    const float freq_base = layer_rope_freq_base(il);
-    const float freq_scale = layer_rope_freq_scale(il);
+    /* The MTP draft block is dense (no KV compressor) but borrows il=1, whose ratio
+     * is non-zero on Pro (all Pro main layers are compressed). Detect the dense block
+     * by its absent compressor and force dense compression + RoPE, so Pro MTP works
+     * (matches Flash, where layer 1 is naturally dense). Also covers ratio-0 layers. */
+    const bool dense_layer = (layer->attn_compressor_kv == NULL);
+    const bool compressed = !dense_layer && ds4_layer_compress_ratio(il) != 0;
+    const float freq_base = dense_layer ? DS4_ROPE_FREQ_BASE : layer_rope_freq_base(il);
+    const float freq_scale = dense_layer ? 1.0f : layer_rope_freq_scale(il);
     const float ext_factor = compressed && DS4_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
     float attn_factor = 1.0f;
     if (ext_factor != 0.0f && freq_scale > 0.0f) {
@@ -19071,7 +19076,7 @@ static bool metal_graph_eval_mtp_draft_from_hc(
         ok = metal_graph_encode_decode_layer(g,
                                              mtp_model,
                                              &mtp->block,
-                                             1,
+                                             1, /* in-bounds; MTP forced dense in encode_decode_layer (absent compressor) */
                                              pos,
                                              g->mtp_raw_cache,
                                              g->raw_cap,
