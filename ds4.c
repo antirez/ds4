@@ -3223,6 +3223,49 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t) {
     return (t->dim[0] / QK_K) * routed_expert_block_bytes(t->type);
 }
 
+static bool streaming_layer_routed_expert_bytes(
+        const ds4_layer_weights *layer,
+        uint64_t               *per_expert_bytes_out) {
+    if (per_expert_bytes_out) *per_expert_bytes_out = 0;
+    if (!layer ||
+        !per_expert_bytes_out ||
+        !layer->ffn_gate_exps ||
+        !layer->ffn_up_exps ||
+        !layer->ffn_down_exps) {
+        return false;
+    }
+
+    const uint64_t gate_row_bytes =
+        routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t up_row_bytes =
+        routed_expert_row_bytes(layer->ffn_up_exps);
+    const uint64_t down_row_bytes =
+        routed_expert_row_bytes(layer->ffn_down_exps);
+    if (layer->ffn_gate_exps->dim[1] > UINT64_MAX / gate_row_bytes ||
+        layer->ffn_up_exps->dim[1] > UINT64_MAX / up_row_bytes ||
+        layer->ffn_down_exps->dim[1] > UINT64_MAX / down_row_bytes) {
+        return false;
+    }
+
+    const uint64_t gate_expert_bytes =
+        layer->ffn_gate_exps->dim[1] * gate_row_bytes;
+    const uint64_t up_expert_bytes =
+        layer->ffn_up_exps->dim[1] * up_row_bytes;
+    const uint64_t down_expert_bytes =
+        layer->ffn_down_exps->dim[1] * down_row_bytes;
+    if (gate_expert_bytes > UINT64_MAX - up_expert_bytes ||
+        gate_expert_bytes + up_expert_bytes >
+            UINT64_MAX - down_expert_bytes) {
+        return false;
+    }
+
+    const uint64_t per_expert_bytes =
+        gate_expert_bytes + up_expert_bytes + down_expert_bytes;
+    if (per_expert_bytes == 0) return false;
+    *per_expert_bytes_out = per_expert_bytes;
+    return true;
+}
+
 static bool ds4_streaming_routed_expert_bytes(
         const ds4_weights *weights,
         uint64_t          *per_expert_bytes_out) {
@@ -3230,42 +3273,10 @@ static bool ds4_streaming_routed_expert_bytes(
     if (!weights || !per_expert_bytes_out) return false;
 
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const ds4_layer_weights *layer = &weights->layer[il];
-        if (!layer->ffn_gate_exps ||
-            !layer->ffn_up_exps ||
-            !layer->ffn_down_exps) {
-            continue;
+        if (streaming_layer_routed_expert_bytes(&weights->layer[il],
+                                                per_expert_bytes_out)) {
+            return true;
         }
-
-        const uint64_t gate_row_bytes =
-            routed_expert_row_bytes(layer->ffn_gate_exps);
-        const uint64_t up_row_bytes =
-            routed_expert_row_bytes(layer->ffn_up_exps);
-        const uint64_t down_row_bytes =
-            routed_expert_row_bytes(layer->ffn_down_exps);
-        if (layer->ffn_gate_exps->dim[1] > UINT64_MAX / gate_row_bytes ||
-            layer->ffn_up_exps->dim[1] > UINT64_MAX / up_row_bytes ||
-            layer->ffn_down_exps->dim[1] > UINT64_MAX / down_row_bytes) {
-            return false;
-        }
-
-        const uint64_t gate_expert_bytes =
-            layer->ffn_gate_exps->dim[1] * gate_row_bytes;
-        const uint64_t up_expert_bytes =
-            layer->ffn_up_exps->dim[1] * up_row_bytes;
-        const uint64_t down_expert_bytes =
-            layer->ffn_down_exps->dim[1] * down_row_bytes;
-        if (gate_expert_bytes > UINT64_MAX - up_expert_bytes ||
-            gate_expert_bytes + up_expert_bytes >
-                UINT64_MAX - down_expert_bytes) {
-            return false;
-        }
-
-        const uint64_t per_expert_bytes =
-            gate_expert_bytes + up_expert_bytes + down_expert_bytes;
-        if (per_expert_bytes == 0) return false;
-        *per_expert_bytes_out = per_expert_bytes;
-        return true;
     }
     return false;
 }
@@ -3282,13 +3293,11 @@ static DS4_MAYBE_UNUSED bool weights_streaming_layer_experts_uniform(
         const ds4_weights *w,
         uint32_t           il) {
     uint64_t base = 0;
+    uint64_t bytes = 0;
+    if (!w || il >= DS4_N_LAYER) return true;
     const ds4_layer_weights *l = &w->layer[il];
-    if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) return true;
+    if (!streaming_layer_routed_expert_bytes(l, &bytes)) return true;
     if (!ds4_streaming_routed_expert_bytes(w, &base)) return true;
-    const uint64_t bytes =
-        l->ffn_gate_exps->dim[1] * routed_expert_row_bytes(l->ffn_gate_exps) +
-        l->ffn_up_exps->dim[1]   * routed_expert_row_bytes(l->ffn_up_exps) +
-        l->ffn_down_exps->dim[1] * routed_expert_row_bytes(l->ffn_down_exps);
     return bytes == base;
 }
 
