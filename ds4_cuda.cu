@@ -18,6 +18,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "ds4_gpu.h"
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -2811,18 +2813,20 @@ extern "C" uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_selected(
-        const void    *model_map,
-        uint64_t       model_size,
-        uint32_t       layer,
-        const int32_t *selected_ids,
-        uint32_t       n_total_expert,
-        uint32_t       n_selected,
-        uint64_t       gate_offset,
-        uint64_t       up_offset,
-        uint64_t       down_offset,
-        uint64_t       gate_expert_bytes,
-        uint64_t       down_expert_bytes) {
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *selected_ids,
+        uint32_t                           n_selected) {
     if (!g_ssd_streaming_mode) return 1;
+    if (!table) return 0;
+    const void *model_map = table->model_map;
+    const uint64_t model_size = table->model_size;
+    const uint32_t layer = table->layer;
+    const uint32_t n_total_expert = table->n_total_expert;
+    const uint64_t gate_offset = table->gate_offset;
+    const uint64_t up_offset = table->up_offset;
+    const uint64_t down_offset = table->down_offset;
+    const uint64_t gate_expert_bytes = table->gate_expert_bytes;
+    const uint64_t down_expert_bytes = table->down_expert_bytes;
     if (!model_map || !selected_ids || n_selected == 0 ||
         n_selected > n_total_expert ||
         !cuda_stream_layer_expert_ranges_valid(model_size,
@@ -3111,19 +3115,20 @@ static int cuda_stream_selected_cache_begin_compact_load(
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
-        const void    *model_map,
-        uint64_t       model_size,
-        uint32_t       layer,
-        const int32_t *selected_ids,
-        uint32_t       n_total_expert,
-        uint32_t       n_selected,
-        uint64_t       gate_offset,
-        uint64_t       up_offset,
-        uint64_t       down_offset,
-        uint64_t       gate_expert_bytes,
-        uint64_t       down_expert_bytes) {
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *selected_ids,
+        uint32_t                           n_selected) {
     if (!g_ssd_streaming_mode) return 1;
-    if (!selected_ids || n_selected == 0) return 0;
+    if (!table || !selected_ids || n_selected == 0) return 0;
+    const void *model_map = table->model_map;
+    const uint64_t model_size = table->model_size;
+    const uint32_t layer = table->layer;
+    const uint32_t n_total_expert = table->n_total_expert;
+    const uint64_t gate_offset = table->gate_offset;
+    const uint64_t up_offset = table->up_offset;
+    const uint64_t down_offset = table->down_offset;
+    const uint64_t gate_expert_bytes = table->gate_expert_bytes;
+    const uint64_t down_expert_bytes = table->down_expert_bytes;
 
     std::vector<int32_t> expert_to_slot(n_total_expert, -1);
     std::vector<int32_t> compact_ids;
@@ -3169,26 +3174,28 @@ extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
-        const void    *model_map,
-        uint64_t       model_size,
-        uint32_t       layer,
-        const int32_t *selected_ids,
-        uint32_t       n_tokens,
-        uint32_t       n_total_expert,
-        uint32_t       n_selected,
-        uint64_t       gate_offset,
-        uint64_t       up_offset,
-        uint64_t       down_offset,
-        uint64_t       gate_expert_bytes,
-        uint64_t       down_expert_bytes) {
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *selected_ids,
+        uint32_t                           n_tokens,
+        uint32_t                           n_selected) {
     if (!g_ssd_streaming_mode) return 1;
-    if (!selected_ids ||
-        n_total_expert == 0 ||
+    if (!table ||
+        !selected_ids ||
+        table->n_total_expert == 0 ||
         n_selected == 0 ||
         n_tokens == 0 ||
         (uint64_t)n_tokens > UINT32_MAX / (uint64_t)n_selected) {
         return 0;
     }
+    const void *model_map = table->model_map;
+    const uint64_t model_size = table->model_size;
+    const uint32_t layer = table->layer;
+    const uint32_t n_total_expert = table->n_total_expert;
+    const uint64_t gate_offset = table->gate_offset;
+    const uint64_t up_offset = table->up_offset;
+    const uint64_t down_offset = table->down_offset;
+    const uint64_t gate_expert_bytes = table->gate_expert_bytes;
+    const uint64_t down_expert_bytes = table->down_expert_bytes;
 
     std::vector<int32_t> expert_to_slot(n_total_expert, -1);
     std::vector<int32_t> compact_ids;
@@ -3237,19 +3244,21 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
-        const void    *model_map,
-        uint64_t       model_size,
-        uint32_t       layer,
-        const int32_t *expert_ids,
-        const uint32_t *expert_priorities,
-        uint32_t       n_experts,
-        uint32_t       n_total_expert,
-        uint64_t       gate_offset,
-        uint64_t       up_offset,
-        uint64_t       down_offset,
-        uint64_t       gate_expert_bytes,
-        uint64_t       down_expert_bytes) {
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *expert_ids,
+        const uint32_t                    *expert_priorities,
+        uint32_t                           n_experts) {
     if (!g_ssd_streaming_mode) return 1;
+    if (!table) return 0;
+    const void *model_map = table->model_map;
+    const uint64_t model_size = table->model_size;
+    const uint32_t layer = table->layer;
+    const uint32_t n_total_expert = table->n_total_expert;
+    const uint64_t gate_offset = table->gate_offset;
+    const uint64_t up_offset = table->up_offset;
+    const uint64_t down_offset = table->down_offset;
+    const uint64_t gate_expert_bytes = table->gate_expert_bytes;
+    const uint64_t down_expert_bytes = table->down_expert_bytes;
     if (!model_map || !expert_ids || n_experts == 0 ||
         !cuda_stream_layer_expert_ranges_valid(model_size,
                                                n_total_expert,

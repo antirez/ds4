@@ -10426,21 +10426,23 @@ static int ds4_gpu_stream_expert_pending_load_matches(
 }
 
 int ds4_gpu_stream_expert_cache_begin_selected_load(
-        const void    *model_map,
-        uint64_t       model_size,
-        uint32_t       layer,
-        const int32_t *selected_ids,
-        uint32_t       n_total_expert,
-        uint32_t       n_selected,
-        uint64_t       gate_offset,
-        uint64_t       up_offset,
-        uint64_t       down_offset,
-        uint64_t       gate_expert_bytes,
-        uint64_t       down_expert_bytes) {
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *selected_ids,
+        uint32_t                           n_selected) {
     if (!g_ssd_streaming_mode ||
         getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_EARLY_LOAD") != NULL) {
         return 1;
     }
+    if (!table) return 0;
+    const void *model_map = table->model_map;
+    const uint64_t model_size = table->model_size;
+    const uint32_t layer = table->layer;
+    const uint32_t n_total_expert = table->n_total_expert;
+    const uint64_t gate_offset = table->gate_offset;
+    const uint64_t up_offset = table->up_offset;
+    const uint64_t down_offset = table->down_offset;
+    const uint64_t gate_expert_bytes = table->gate_expert_bytes;
+    const uint64_t down_expert_bytes = table->down_expert_bytes;
     if (!model_map || !selected_ids ||
         layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
         n_selected == 0 ||
@@ -11148,18 +11150,20 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
 }
 
 int ds4_gpu_stream_expert_cache_seed_selected(
-        const void    *model_map,
-        uint64_t       model_size,
-        uint32_t       layer,
-        const int32_t *selected_ids,
-        uint32_t       n_total_expert,
-        uint32_t       n_selected,
-        uint64_t       gate_offset,
-        uint64_t       up_offset,
-        uint64_t       down_offset,
-        uint64_t       gate_expert_bytes,
-        uint64_t       down_expert_bytes) {
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *selected_ids,
+        uint32_t                           n_selected) {
     if (!g_ssd_streaming_mode) return 1;
+    if (!table) return 0;
+    const void *model_map = table->model_map;
+    const uint64_t model_size = table->model_size;
+    const uint32_t layer = table->layer;
+    const uint32_t n_total_expert = table->n_total_expert;
+    const uint64_t gate_offset = table->gate_offset;
+    const uint64_t up_offset = table->up_offset;
+    const uint64_t down_offset = table->down_offset;
+    const uint64_t gate_expert_bytes = table->gate_expert_bytes;
+    const uint64_t down_expert_bytes = table->down_expert_bytes;
     if (!model_map || !selected_ids ||
         layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
         n_selected == 0 ||
@@ -11227,19 +11231,21 @@ int ds4_gpu_stream_expert_cache_seed_selected(
 }
 
 int ds4_gpu_stream_expert_cache_seed_experts(
-        const void    *model_map,
-        uint64_t       model_size,
-        uint32_t       layer,
-        const int32_t *expert_ids,
-        const uint32_t *expert_priorities,
-        uint32_t       n_experts,
-        uint32_t       n_total_expert,
-        uint64_t       gate_offset,
-        uint64_t       up_offset,
-        uint64_t       down_offset,
-        uint64_t       gate_expert_bytes,
-        uint64_t       down_expert_bytes) {
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *expert_ids,
+        const uint32_t                    *expert_priorities,
+        uint32_t                           n_experts) {
     if (!g_ssd_streaming_mode) return 1;
+    if (!table) return 0;
+    const void *model_map = table->model_map;
+    const uint64_t model_size = table->model_size;
+    const uint32_t layer = table->layer;
+    const uint32_t n_total_expert = table->n_total_expert;
+    const uint64_t gate_offset = table->gate_offset;
+    const uint64_t up_offset = table->up_offset;
+    const uint64_t down_offset = table->down_offset;
+    const uint64_t gate_expert_bytes = table->gate_expert_bytes;
+    const uint64_t down_expert_bytes = table->down_expert_bytes;
     if (!model_map || !expert_ids ||
         layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
         n_experts == 0 ||
@@ -23215,20 +23221,24 @@ int ds4_gpu_routed_moe_one_tensor(
                     stream_expert_missing_mask != 0 &&
                     g_batch_cb != nil &&
                     getenv("DS4_METAL_MOE_ONE_STAGE_PROFILE") == NULL;
-                if (use_stream_expert_split_deferred &&
-                    !ds4_gpu_stream_expert_cache_begin_selected_load(
-                            model_map,
-                            model_size,
-                            layer_index,
-                            selected_ids,
-                            n_total_expert,
-                            n_expert,
-                            gate_offset,
-                            up_offset,
-                            down_offset,
-                            gate_expert_bytes,
-                            down_expert_bytes)) {
-                    return 0;
+                if (use_stream_expert_split_deferred) {
+                    const ds4_gpu_stream_expert_table table = {
+                        .model_map = model_map,
+                        .model_size = model_size,
+                        .layer = layer_index,
+                        .n_total_expert = n_total_expert,
+                        .gate_offset = gate_offset,
+                        .up_offset = up_offset,
+                        .down_offset = down_offset,
+                        .gate_expert_bytes = gate_expert_bytes,
+                        .down_expert_bytes = down_expert_bytes,
+                    };
+                    if (!ds4_gpu_stream_expert_cache_begin_selected_load(
+                                &table,
+                                selected_ids,
+                                n_expert)) {
+                        return 0;
+                    }
                 }
                 if (stream_expert_missing_mask != 0 &&
                     !use_stream_expert_split_deferred) {

@@ -213,88 +213,67 @@ extern "C" uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_selected(
-        const void *model_map,
-        uint64_t model_size,
-        uint32_t layer,
-        const int32_t *selected_ids,
-        uint32_t n_total_expert,
-        uint32_t n_selected,
-        uint64_t gate_offset,
-        uint64_t up_offset,
-        uint64_t down_offset,
-        uint64_t gate_expert_bytes,
-        uint64_t down_expert_bytes) {
-    if (!cuda_stream_selected_load(model_map,
-                                   model_size,
-                                   layer,
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *selected_ids,
+        uint32_t                           n_selected) {
+    if (!table) return 0;
+    if (!cuda_stream_selected_load(table->model_map,
+                                   table->model_size,
+                                   table->layer,
                                    selected_ids,
-                                   n_total_expert,
+                                   table->n_total_expert,
                                    n_selected,
-                                   gate_offset,
-                                   up_offset,
-                                   down_offset,
-                                   gate_expert_bytes,
-                                   down_expert_bytes)) {
+                                   table->gate_offset,
+                                   table->up_offset,
+                                   table->down_offset,
+                                   table->gate_expert_bytes,
+                                   table->down_expert_bytes)) {
         return 0;
     }
     return cuda_stream_selected_finish_pending_missing(0);
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
-        const void *model_map,
-        uint64_t model_size,
-        uint32_t layer,
-        const int32_t *selected_ids,
-        uint32_t n_total_expert,
-        uint32_t n_selected,
-        uint64_t gate_offset,
-        uint64_t up_offset,
-        uint64_t down_offset,
-        uint64_t gate_expert_bytes,
-        uint64_t down_expert_bytes) {
-    return cuda_stream_selected_load(model_map,
-                                     model_size,
-                                     layer,
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *selected_ids,
+        uint32_t                           n_selected) {
+    if (!table) return 0;
+    return cuda_stream_selected_load(table->model_map,
+                                     table->model_size,
+                                     table->layer,
                                      selected_ids,
-                                     n_total_expert,
+                                     table->n_total_expert,
                                      n_selected,
-                                     gate_offset,
-                                     up_offset,
-                                     down_offset,
-                                     gate_expert_bytes,
-                                     down_expert_bytes);
+                                     table->gate_offset,
+                                     table->up_offset,
+                                     table->down_offset,
+                                     table->gate_expert_bytes,
+                                     table->down_expert_bytes);
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
-        const void *model_map,
-        uint64_t model_size,
-        uint32_t layer,
-        const int32_t *selected_ids,
-        uint32_t n_tokens,
-        uint32_t n_total_expert,
-        uint32_t n_selected,
-        uint64_t gate_offset,
-        uint64_t up_offset,
-        uint64_t down_offset,
-        uint64_t gate_expert_bytes,
-        uint64_t down_expert_bytes) {
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *selected_ids,
+        uint32_t                           n_tokens,
+        uint32_t                           n_selected) {
+    if (!table) return 0;
     const ds4_gpu_tensor *selected_exec = NULL;
     const char **gate_ptrs = NULL;
     const char **up_ptrs = NULL;
     const char **down_ptrs = NULL;
     uint32_t unique = 0;
-    return cuda_stream_batch_selected_prepare_from_host(model_map,
-                                                        model_size,
-                                                        layer,
+    return cuda_stream_batch_selected_prepare_from_host(table->model_map,
+                                                        table->model_size,
+                                                        table->layer,
                                                         selected_ids,
                                                         n_tokens,
-                                                        n_total_expert,
+                                                        table->n_total_expert,
                                                         n_selected,
-                                                        gate_offset,
-                                                        up_offset,
-                                                        down_offset,
-                                                        gate_expert_bytes,
-                                                        down_expert_bytes,
+                                                        table->gate_offset,
+                                                        table->up_offset,
+                                                        table->down_offset,
+                                                        table->gate_expert_bytes,
+                                                        table->down_expert_bytes,
                                                         &selected_exec,
                                                         &gate_ptrs,
                                                         &up_ptrs,
@@ -304,51 +283,38 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_load_layer(
-        const void *model_map,
-        uint64_t model_size,
-        uint32_t layer,
-        uint32_t n_total_expert,
-        uint64_t gate_offset,
-        uint64_t up_offset,
-        uint64_t down_offset,
-        uint64_t gate_expert_bytes,
-        uint64_t down_expert_bytes) {
-    return cuda_stream_layer_expert_cache_load(model_map,
-                                               model_size,
-                                               layer,
-                                               n_total_expert,
-                                               gate_offset,
-                                               up_offset,
-                                               down_offset,
-                                               gate_expert_bytes,
-                                               down_expert_bytes);
+        const ds4_gpu_stream_expert_table *table) {
+    if (!table) return 0;
+    return cuda_stream_layer_expert_cache_load(table->model_map,
+                                               table->model_size,
+                                               table->layer,
+                                               table->n_total_expert,
+                                               table->gate_offset,
+                                               table->up_offset,
+                                               table->down_offset,
+                                               table->gate_expert_bytes,
+                                               table->down_expert_bytes);
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_from_layer_selected(
-        const void *model_map,
-        uint32_t layer,
-        const ds4_gpu_tensor *selected,
-        uint32_t n_tokens,
-        uint32_t n_seed_tokens,
-        uint32_t n_total_expert,
-        uint32_t n_selected,
-        uint64_t gate_offset,
-        uint64_t up_offset,
-        uint64_t down_offset,
-        uint64_t gate_expert_bytes,
-        uint64_t down_expert_bytes) {
-    return cuda_stream_layer_expert_cache_seed_selected(model_map,
-                                                        layer,
+        const ds4_gpu_stream_expert_table *table,
+        const ds4_gpu_tensor             *selected,
+        uint32_t                          n_tokens,
+        uint32_t                          n_seed_tokens,
+        uint32_t                          n_selected) {
+    if (!table) return 0;
+    return cuda_stream_layer_expert_cache_seed_selected(table->model_map,
+                                                        table->layer,
                                                         selected,
                                                         n_tokens,
                                                         n_seed_tokens,
-                                                        n_total_expert,
+                                                        table->n_total_expert,
                                                         n_selected,
-                                                        gate_offset,
-                                                        up_offset,
-                                                        down_offset,
-                                                        gate_expert_bytes,
-                                                        down_expert_bytes);
+                                                        table->gate_offset,
+                                                        table->up_offset,
+                                                        table->down_offset,
+                                                        table->gate_expert_bytes,
+                                                        table->down_expert_bytes);
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_release_layer_cache(void) {
@@ -357,30 +323,14 @@ extern "C" int ds4_gpu_stream_expert_cache_release_layer_cache(void) {
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
-        const void *model_map,
-        uint64_t model_size,
-        uint32_t layer,
-        const int32_t *expert_ids,
-        const uint32_t *expert_priorities,
-        uint32_t n_experts,
-        uint32_t n_total_expert,
-        uint64_t gate_offset,
-        uint64_t up_offset,
-        uint64_t down_offset,
-        uint64_t gate_expert_bytes,
-        uint64_t down_expert_bytes) {
-    (void)model_map;
-    (void)model_size;
-    (void)layer;
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *expert_ids,
+        const uint32_t                    *expert_priorities,
+        uint32_t                           n_experts) {
+    (void)table;
     (void)expert_ids;
     (void)expert_priorities;
     (void)n_experts;
-    (void)n_total_expert;
-    (void)gate_offset;
-    (void)up_offset;
-    (void)down_offset;
-    (void)gate_expert_bytes;
-    (void)down_expert_bytes;
     return 1;
 }
 
