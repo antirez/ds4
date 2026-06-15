@@ -53,6 +53,10 @@ def benchmark_labels(path: Path) -> tuple[str, str]:
 def fmt_tps(value: float | None) -> str:
     if value is None:
         return "n/a"
+    if abs(value) >= 100:
+        return f"{value:.0f}"
+    if abs(value) >= 10:
+        return f"{value:.1f}"
     return f"{value:.2f}"
 
 
