@@ -16,6 +16,21 @@ REQUIRED_COLUMNS = {"ctx_tokens", "prefill_tps", "gen_tps"}
 TARGET_CTX = 32768
 
 
+@dataclass(frozen=True)
+class BenchmarkMetadata:
+    csv: str
+    hardware: str
+    backend: str
+    model: str
+    quant: str
+    model_label: str
+    prompt_file: str
+    ctx_start: int
+    ctx_max: int
+    step_incr: int
+    gen_tokens: int
+
+
 @dataclass
 class BenchSummary:
     hardware: str
@@ -28,7 +43,40 @@ class BenchSummary:
     avg_prefill: float
 
 
-def read_metadata() -> dict[str, dict[str, object]]:
+def require_str(item: dict[str, object], field: str) -> str:
+    value = item.get(field)
+    if not isinstance(value, str) or not value:
+        raise SystemExit(f"{METADATA}: benchmark {field} must be a non-empty string")
+    return value
+
+
+def require_int(item: dict[str, object], field: str) -> int:
+    value = item.get(field)
+    if not isinstance(value, int):
+        raise SystemExit(f"{METADATA}: benchmark {field} must be an integer")
+    return value
+
+
+def parse_benchmark_metadata(item: object) -> BenchmarkMetadata:
+    if not isinstance(item, dict):
+        raise SystemExit(f"{METADATA}: benchmark entries must be objects")
+
+    return BenchmarkMetadata(
+        csv=require_str(item, "csv"),
+        hardware=require_str(item, "hardware"),
+        backend=require_str(item, "backend"),
+        model=require_str(item, "model"),
+        quant=require_str(item, "quant"),
+        model_label=require_str(item, "model_label"),
+        prompt_file=require_str(item, "prompt_file"),
+        ctx_start=require_int(item, "ctx_start"),
+        ctx_max=require_int(item, "ctx_max"),
+        step_incr=require_int(item, "step_incr"),
+        gen_tokens=require_int(item, "gen_tokens"),
+    )
+
+
+def read_metadata() -> dict[str, BenchmarkMetadata]:
     try:
         data = json.loads(METADATA.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -40,21 +88,12 @@ def read_metadata() -> dict[str, dict[str, object]]:
     if not isinstance(benchmarks, list):
         raise SystemExit(f"{METADATA}: expected a benchmarks list")
 
-    by_csv: dict[str, dict[str, object]] = {}
-    required = {"csv", "hardware", "model_label"}
+    by_csv: dict[str, BenchmarkMetadata] = {}
     for item in benchmarks:
-        if not isinstance(item, dict):
-            raise SystemExit(f"{METADATA}: benchmark entries must be objects")
-        missing = required.difference(item)
-        if missing:
-            missing_list = ", ".join(sorted(missing))
-            raise SystemExit(f"{METADATA}: benchmark entry missing {missing_list}")
-        csv_name = item["csv"]
-        if not isinstance(csv_name, str) or not csv_name:
-            raise SystemExit(f"{METADATA}: benchmark csv must be a non-empty string")
-        if csv_name in by_csv:
-            raise SystemExit(f"{METADATA}: duplicate benchmark metadata for {csv_name}")
-        by_csv[csv_name] = item
+        metadata = parse_benchmark_metadata(item)
+        if metadata.csv in by_csv:
+            raise SystemExit(f"{METADATA}: duplicate benchmark metadata for {metadata.csv}")
+        by_csv[metadata.csv] = metadata
     return by_csv
 
 
@@ -68,7 +107,7 @@ def fmt_tps(value: float | None) -> str:
     return f"{value:.2f}"
 
 
-def read_summary(path: Path, metadata: dict[str, object]) -> BenchSummary:
+def read_summary(path: Path, metadata: BenchmarkMetadata) -> BenchSummary:
     rows = []
     with path.open("r", encoding="utf-8-sig", newline="") as fp:
         reader = csv.DictReader(fp)
@@ -91,8 +130,8 @@ def read_summary(path: Path, metadata: dict[str, object]) -> BenchSummary:
 
     target_row = next((row for row in rows if row["ctx_tokens"] == TARGET_CTX), None)
     return BenchSummary(
-        hardware=str(metadata["hardware"]),
-        model=str(metadata["model_label"]),
+        hardware=metadata.hardware,
+        model=metadata.model_label,
         best_gen=max(row["gen_tps"] for row in rows),
         gen_at_target_ctx=target_row["gen_tps"] if target_row else None,
         avg_gen=sum(row["gen_tps"] for row in rows) / len(rows),
