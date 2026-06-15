@@ -27,10 +27,10 @@ class BenchSummary:
 
 def display_name(path: Path) -> str:
     name_overrides = {
-        "gb10": "DGX Spark / GB10",
-        "m2_ultra": "M2 Ultra",
-        "m4_max": "M4 Max",
-        "pro_model_m3_ultra": "PRO model M3 Ultra",
+        "gb10": "NVIDIA DGX Spark / GB10 (DeepSeek V4 Flash q2)",
+        "m2_ultra": "Apple M2 Ultra (DeepSeek V4 Flash q2)",
+        "m4_max": "Apple M4 Max (DeepSeek V4 Flash q2)",
+        "pro_model_m3_ultra": "Apple M3 Ultra (DeepSeek V4 PRO q2)",
     }
     if path.stem in name_overrides:
         return name_overrides[path.stem]
