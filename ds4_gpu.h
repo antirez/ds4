@@ -157,6 +157,40 @@ int ds4_gpu_indexer_scores_prefill_tensor(
         uint32_t                ratio,
         float                   scale);
 
+/* comp_mask f16 (1) unless KV opts disabled via DS4_DISABLE_KV_OPTS (0 = f32). */
+int ds4_gpu_comp_mask_f16(void);
+
+int ds4_gpu_indexer_prefill_score_topk_tiled(
+        ds4_gpu_tensor       *scores,
+        ds4_gpu_tensor       *selected,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        float                   scale,
+        uint32_t                top_k,
+        uint32_t                score_tile);
+
+int ds4_gpu_indexer_decode_batch_score_topk_tiled(
+        ds4_gpu_tensor       *scores,
+        ds4_gpu_tensor       *selected,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        float                   scale,
+        uint32_t                top_k,
+        uint32_t                score_tile);
+
 int ds4_gpu_indexer_scores_decode_batch_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -388,6 +422,14 @@ int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
 int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_tok,
+        uint32_t          head_dim,
+        uint32_t          n_rot);
+
+int ds4_gpu_dsv4_kv_pack_comp_rows(
+        ds4_gpu_tensor *dst,
+        uint64_t          dst_byte_offset,
+        ds4_gpu_tensor *src,
+        uint32_t          n_rows,
         uint32_t          head_dim,
         uint32_t          n_rot);
 
