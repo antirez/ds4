@@ -17,6 +17,7 @@ Run `ds4-bench` as:
 Provide PR including your numbers if your hardware was not already tested.
 Call the benchmark csv file something like `m3_max.csv` or alike, so that
 it is clear what hardware was used for the benchmark.
+Record the machine, backend, model, and run parameters in `benchmarks.json`.
 
 To generate an SVG graph from a CSV file:
 

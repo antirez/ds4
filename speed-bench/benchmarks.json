@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "benchmarks": [
+    {
+      "csv": "gb10.csv",
+      "hardware": "NVIDIA DGX Spark / GB10",
+      "backend": "CUDA",
+      "model": "DeepSeek V4 Flash",
+      "quant": "q2",
+      "model_label": "DeepSeek V4 Flash q2",
+      "prompt_file": "speed-bench/promessi_sposi.txt",
+      "ctx_start": 2048,
+      "ctx_max": 65536,
+      "step_incr": 2048,
+      "gen_tokens": 128
+    },
+    {
+      "csv": "m2_ultra.csv",
+      "hardware": "Apple M2 Ultra",
+      "backend": "Metal",
+      "model": "DeepSeek V4 Flash",
+      "quant": "q2",
+      "model_label": "DeepSeek V4 Flash q2",
+      "prompt_file": "speed-bench/promessi_sposi.txt",
+      "ctx_start": 2048,
+      "ctx_max": 65536,
+      "step_incr": 2048,
+      "gen_tokens": 128
+    },
+    {
+      "csv": "m4_max.csv",
+      "hardware": "Apple M4 Max",
+      "backend": "Metal",
+      "model": "DeepSeek V4 Flash",
+      "quant": "q2",
+      "model_label": "DeepSeek V4 Flash q2",
+      "prompt_file": "speed-bench/promessi_sposi.txt",
+      "ctx_start": 2048,
+      "ctx_max": 65536,
+      "step_incr": 2048,
+      "gen_tokens": 128
+    },
+    {
+      "csv": "pro_model_m3_ultra.csv",
+      "hardware": "Apple M3 Ultra",
+      "backend": "Metal",
+      "model": "DeepSeek V4 PRO",
+      "quant": "q2",
+      "model_label": "DeepSeek V4 PRO q2",
+      "prompt_file": "speed-bench/promessi_sposi.txt",
+      "ctx_start": 2048,
+      "ctx_max": 32768,
+      "step_incr": 2048,
+      "gen_tokens": 128
+    }
+  ]
+}

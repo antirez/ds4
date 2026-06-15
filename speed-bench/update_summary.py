@@ -2,6 +2,7 @@
 """Update the generated benchmark summary in speed-bench/README.md."""
 
 import csv
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,6 +11,7 @@ BEGIN_MARKER = "<!-- BEGIN GENERATED BENCHMARK SUMMARY -->"
 END_MARKER = "<!-- END GENERATED BENCHMARK SUMMARY -->"
 README = Path(__file__).with_name("README.md")
 BENCH_DIR = Path(__file__).resolve().parent
+METADATA = BENCH_DIR / "benchmarks.json"
 REQUIRED_COLUMNS = {"ctx_tokens", "prefill_tps", "gen_tps"}
 TARGET_CTX = 32768
 
@@ -26,28 +28,34 @@ class BenchSummary:
     avg_prefill: float
 
 
-def benchmark_labels(path: Path) -> tuple[str, str]:
-    name_overrides = {
-        "gb10": ("NVIDIA DGX Spark / GB10", "DeepSeek V4 Flash q2"),
-        "m2_ultra": ("Apple M2 Ultra", "DeepSeek V4 Flash q2"),
-        "m4_max": ("Apple M4 Max", "DeepSeek V4 Flash q2"),
-        "pro_model_m3_ultra": ("Apple M3 Ultra", "DeepSeek V4 PRO q2"),
-    }
-    if path.stem in name_overrides:
-        return name_overrides[path.stem]
+def read_metadata() -> dict[str, dict[str, object]]:
+    try:
+        data = json.loads(METADATA.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise SystemExit(f"{METADATA}: metadata file is required") from None
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"{METADATA}: invalid JSON: {exc}") from None
 
-    replacements = {
-        "gb10": "GB10",
-        "m2": "M2",
-        "m3": "M3",
-        "m4": "M4",
-        "m5": "M5",
-        "pro": "PRO",
-        "max": "Max",
-        "ultra": "Ultra",
-    }
-    words = path.stem.replace("-", "_").split("_")
-    return " ".join(replacements.get(word.lower(), word) for word in words), "Unspecified model"
+    benchmarks = data.get("benchmarks")
+    if not isinstance(benchmarks, list):
+        raise SystemExit(f"{METADATA}: expected a benchmarks list")
+
+    by_csv: dict[str, dict[str, object]] = {}
+    required = {"csv", "hardware", "model_label"}
+    for item in benchmarks:
+        if not isinstance(item, dict):
+            raise SystemExit(f"{METADATA}: benchmark entries must be objects")
+        missing = required.difference(item)
+        if missing:
+            missing_list = ", ".join(sorted(missing))
+            raise SystemExit(f"{METADATA}: benchmark entry missing {missing_list}")
+        csv_name = item["csv"]
+        if not isinstance(csv_name, str) or not csv_name:
+            raise SystemExit(f"{METADATA}: benchmark csv must be a non-empty string")
+        if csv_name in by_csv:
+            raise SystemExit(f"{METADATA}: duplicate benchmark metadata for {csv_name}")
+        by_csv[csv_name] = item
+    return by_csv
 
 
 def fmt_tps(value: float | None) -> str:
@@ -60,7 +68,7 @@ def fmt_tps(value: float | None) -> str:
     return f"{value:.2f}"
 
 
-def read_summary(path: Path) -> BenchSummary:
+def read_summary(path: Path, metadata: dict[str, object]) -> BenchSummary:
     rows = []
     with path.open("r", encoding="utf-8-sig", newline="") as fp:
         reader = csv.DictReader(fp)
@@ -82,10 +90,9 @@ def read_summary(path: Path) -> BenchSummary:
         raise SystemExit(f"{path}: no benchmark rows")
 
     target_row = next((row for row in rows if row["ctx_tokens"] == TARGET_CTX), None)
-    hardware, model = benchmark_labels(path)
     return BenchSummary(
-        hardware=hardware,
-        model=model,
+        hardware=str(metadata["hardware"]),
+        model=str(metadata["model_label"]),
         best_gen=max(row["gen_tps"] for row in rows),
         gen_at_target_ctx=target_row["gen_tps"] if target_row else None,
         avg_gen=sum(row["gen_tps"] for row in rows) / len(rows),
@@ -158,7 +165,12 @@ def main() -> None:
     csv_paths = sorted(BENCH_DIR.glob("*.csv"))
     if not csv_paths:
         raise SystemExit(f"{BENCH_DIR}: no CSV files found")
-    summaries = [read_summary(path) for path in csv_paths]
+    metadata = read_metadata()
+    missing = [path.name for path in csv_paths if path.name not in metadata]
+    if missing:
+        missing_list = ", ".join(missing)
+        raise SystemExit(f"{METADATA}: missing metadata for CSV file(s): {missing_list}")
+    summaries = [read_summary(path, metadata[path.name]) for path in csv_paths]
     generated = render_summary(summaries)
     README.write_text(replace_generated_section(README.read_text(encoding="utf-8"), generated), encoding="utf-8")
 
