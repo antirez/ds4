@@ -28,7 +28,7 @@ The script uses only the Python standard library. By default it writes a file
 next to the CSV using the `_ts.svg` suffix, such as `speed-bench/m3_max_ts.svg`.
 
 <!-- BEGIN GENERATED BENCHMARK SUMMARY -->
-## Generated Benchmark Summary
+## Benchmark Summary
 
 Generated from the CSV files in this directory by `python3 speed-bench/update_summary.py`.
 

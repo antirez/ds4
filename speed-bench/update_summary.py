@@ -83,7 +83,7 @@ def render_summary(summaries: list[BenchSummary]) -> str:
     summaries = sorted(summaries, key=lambda item: item.best_gen, reverse=True)
     lines = [
         BEGIN_MARKER,
-        "## Generated Benchmark Summary",
+        "## Benchmark Summary",
         "",
         "Generated from the CSV files in this directory by `python3 speed-bench/update_summary.py`.",
         "",
