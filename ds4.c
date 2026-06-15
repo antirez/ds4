@@ -3368,6 +3368,7 @@ static uint32_t ds4_streaming_cache_experts_for_byte_budget(
     return ds4_ssd_cache_experts_for_byte_budget(bytes, per_expert_bytes);
 }
 
+#ifndef DS4_NO_GPU
 static ds4_gpu_stream_expert_table graph_stream_expert_table_make(
         const ds4_model         *model,
         const ds4_layer_weights *layer,
@@ -3388,6 +3389,7 @@ static ds4_gpu_stream_expert_table graph_stream_expert_table_make(
     table.down_expert_bytes = down_expert_bytes;
     return table;
 }
+#endif
 
 static uint64_t ds4_streaming_manual_cache_safe_bytes(void) {
 #ifdef DS4_NO_GPU
