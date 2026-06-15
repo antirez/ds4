@@ -1,4 +1,5 @@
 {
+  "$schema": "./benchmarks.schema.json",
   "schema_version": 1,
   "benchmarks": [
     {

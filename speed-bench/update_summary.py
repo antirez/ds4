@@ -6,12 +6,18 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+try:
+    import jsonschema
+except ImportError as exc:
+    raise SystemExit("python3-jsonschema is required to validate benchmarks.json") from exc
+
 
 BEGIN_MARKER = "<!-- BEGIN GENERATED BENCHMARK SUMMARY -->"
 END_MARKER = "<!-- END GENERATED BENCHMARK SUMMARY -->"
 README = Path(__file__).with_name("README.md")
 BENCH_DIR = Path(__file__).resolve().parent
 METADATA = BENCH_DIR / "benchmarks.json"
+METADATA_SCHEMA = BENCH_DIR / "benchmarks.schema.json"
 REQUIRED_COLUMNS = {"ctx_tokens", "prefill_tps", "gen_tps"}
 TARGET_CTX = 32768
 
@@ -43,39 +49,6 @@ class BenchSummary:
     avg_prefill: float
 
 
-def require_str(item: dict[str, object], field: str) -> str:
-    value = item.get(field)
-    if not isinstance(value, str) or not value:
-        raise SystemExit(f"{METADATA}: benchmark {field} must be a non-empty string")
-    return value
-
-
-def require_int(item: dict[str, object], field: str) -> int:
-    value = item.get(field)
-    if not isinstance(value, int):
-        raise SystemExit(f"{METADATA}: benchmark {field} must be an integer")
-    return value
-
-
-def parse_benchmark_metadata(item: object) -> BenchmarkMetadata:
-    if not isinstance(item, dict):
-        raise SystemExit(f"{METADATA}: benchmark entries must be objects")
-
-    return BenchmarkMetadata(
-        csv=require_str(item, "csv"),
-        hardware=require_str(item, "hardware"),
-        backend=require_str(item, "backend"),
-        model=require_str(item, "model"),
-        quant=require_str(item, "quant"),
-        model_label=require_str(item, "model_label"),
-        prompt_file=require_str(item, "prompt_file"),
-        ctx_start=require_int(item, "ctx_start"),
-        ctx_max=require_int(item, "ctx_max"),
-        step_incr=require_int(item, "step_incr"),
-        gen_tokens=require_int(item, "gen_tokens"),
-    )
-
-
 def read_metadata() -> dict[str, BenchmarkMetadata]:
     try:
         data = json.loads(METADATA.read_text(encoding="utf-8"))
@@ -84,13 +57,15 @@ def read_metadata() -> dict[str, BenchmarkMetadata]:
     except json.JSONDecodeError as exc:
         raise SystemExit(f"{METADATA}: invalid JSON: {exc}") from None
 
-    benchmarks = data.get("benchmarks")
-    if not isinstance(benchmarks, list):
-        raise SystemExit(f"{METADATA}: expected a benchmarks list")
+    schema = json.loads(METADATA_SCHEMA.read_text(encoding="utf-8"))
+    try:
+        jsonschema.validate(data, schema)
+    except jsonschema.ValidationError as exc:
+        raise SystemExit(f"{METADATA}: invalid metadata: {exc.message}") from None
 
     by_csv: dict[str, BenchmarkMetadata] = {}
-    for item in benchmarks:
-        metadata = parse_benchmark_metadata(item)
+    for item in data["benchmarks"]:
+        metadata = BenchmarkMetadata(**item)
         if metadata.csv in by_csv:
             raise SystemExit(f"{METADATA}: duplicate benchmark metadata for {metadata.csv}")
         by_csv[metadata.csv] = metadata

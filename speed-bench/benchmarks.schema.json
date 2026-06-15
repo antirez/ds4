@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "benchmarks"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "benchmarks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "csv",
+          "hardware",
+          "backend",
+          "model",
+          "quant",
+          "model_label",
+          "prompt_file",
+          "ctx_start",
+          "ctx_max",
+          "step_incr",
+          "gen_tokens"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "csv": {
+            "type": "string",
+            "minLength": 1
+          },
+          "hardware": {
+            "type": "string",
+            "minLength": 1
+          },
+          "backend": {
+            "type": "string",
+            "minLength": 1
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1
+          },
+          "quant": {
+            "type": "string",
+            "minLength": 1
+          },
+          "model_label": {
+            "type": "string",
+            "minLength": 1
+          },
+          "prompt_file": {
+            "type": "string",
+            "minLength": 1
+          },
+          "ctx_start": {
+            "type": "integer"
+          },
+          "ctx_max": {
+            "type": "integer"
+          },
+          "step_incr": {
+            "type": "integer"
+          },
+          "gen_tokens": {
+            "type": "integer"
+          }
+        }
+      }
+    }
+  }
+}
