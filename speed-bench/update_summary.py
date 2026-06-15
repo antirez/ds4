@@ -6,18 +6,12 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-try:
-    import jsonschema
-except ImportError as exc:
-    raise SystemExit("python3-jsonschema is required to validate benchmarks.json") from exc
-
 
 BEGIN_MARKER = "<!-- BEGIN GENERATED BENCHMARK SUMMARY -->"
 END_MARKER = "<!-- END GENERATED BENCHMARK SUMMARY -->"
 README = Path(__file__).with_name("README.md")
 BENCH_DIR = Path(__file__).resolve().parent
 METADATA = BENCH_DIR / "benchmarks.json"
-METADATA_SCHEMA = BENCH_DIR / "benchmarks.schema.json"
 REQUIRED_COLUMNS = {"ctx_tokens", "prefill_tps", "gen_tps"}
 TARGET_CTX = 32768
 
@@ -57,15 +51,19 @@ def read_metadata() -> dict[str, BenchmarkMetadata]:
     except json.JSONDecodeError as exc:
         raise SystemExit(f"{METADATA}: invalid JSON: {exc}") from None
 
-    schema = json.loads(METADATA_SCHEMA.read_text(encoding="utf-8"))
     try:
-        jsonschema.validate(data, schema)
-    except jsonschema.ValidationError as exc:
-        raise SystemExit(f"{METADATA}: invalid metadata: {exc.message}") from None
+        benchmarks = data["benchmarks"]
+    except (KeyError, TypeError):
+        raise SystemExit(f"{METADATA}: expected a benchmarks list") from None
+    if not isinstance(benchmarks, list):
+        raise SystemExit(f"{METADATA}: expected a benchmarks list")
 
     by_csv: dict[str, BenchmarkMetadata] = {}
-    for item in data["benchmarks"]:
-        metadata = BenchmarkMetadata(**item)
+    for item in benchmarks:
+        try:
+            metadata = BenchmarkMetadata(**item)
+        except TypeError as exc:
+            raise SystemExit(f"{METADATA}: invalid benchmark metadata: {exc}") from None
         if metadata.csv in by_csv:
             raise SystemExit(f"{METADATA}: duplicate benchmark metadata for {metadata.csv}")
         by_csv[metadata.csv] = metadata
