@@ -26,6 +26,15 @@ class BenchSummary:
 
 
 def display_name(path: Path) -> str:
+    name_overrides = {
+        "gb10": "DGX Spark / GB10",
+        "m2_ultra": "M2 Ultra",
+        "m4_max": "M4 Max",
+        "pro_model_m3_ultra": "PRO model M3 Ultra",
+    }
+    if path.stem in name_overrides:
+        return name_overrides[path.stem]
+
     replacements = {
         "gb10": "GB10",
         "m2": "M2",
