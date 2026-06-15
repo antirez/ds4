@@ -52,7 +52,7 @@ def display_name(path: Path) -> str:
 def fmt_tps(value: float | None) -> str:
     if value is None:
         return "n/a"
-    return f"{value:.2f} t/s"
+    return f"{value:.2f}"
 
 
 def read_summary(path: Path) -> BenchSummary:
@@ -98,7 +98,7 @@ def render_summary(summaries: list[BenchSummary]) -> str:
         "",
         f"`@ 32k ctx` means the row where `ctx_tokens` is `{TARGET_CTX}`.",
         "",
-        "| Benchmark | Best gen | Gen @ 32k ctx | Avg gen | Best prefill | Prefill @ 32k ctx | Avg prefill |",
+        "| Benchmark | Best gen (t/s) | Gen @ 32k ctx (t/s) | Avg gen (t/s) | Best prefill (t/s) | Prefill @ 32k ctx (t/s) | Avg prefill (t/s) |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for summary in summaries:

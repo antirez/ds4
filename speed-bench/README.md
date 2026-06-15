@@ -34,11 +34,11 @@ Generated from the CSV files in this directory by `python3 speed-bench/update_su
 
 `@ 32k ctx` means the row where `ctx_tokens` is `32768`.
 
-| Benchmark | Best gen | Gen @ 32k ctx | Avg gen | Best prefill | Prefill @ 32k ctx | Avg prefill |
+| Benchmark | Best gen (t/s) | Gen @ 32k ctx (t/s) | Avg gen (t/s) | Best prefill (t/s) | Prefill @ 32k ctx (t/s) | Avg prefill (t/s) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Apple M4 Max (DeepSeek V4 Flash q2) | 26.76 t/s | 24.52 t/s | 24.57 t/s | 343.76 t/s | 247.91 t/s | 250.39 t/s |
-| Apple M2 Ultra (DeepSeek V4 Flash q2) | 23.22 t/s | 21.92 t/s | 21.85 t/s | 410.62 t/s | 325.77 t/s | 324.90 t/s |
-| NVIDIA DGX Spark / GB10 (DeepSeek V4 Flash q2) | 14.23 t/s | 12.98 t/s | 13.13 t/s | 402.88 t/s | 346.36 t/s | 343.02 t/s |
-| Apple M3 Ultra (DeepSeek V4 PRO q2) | 12.42 t/s | 9.56 t/s | 9.90 t/s | 183.06 t/s | 138.82 t/s | 149.28 t/s |
+| Apple M4 Max (DeepSeek V4 Flash q2) | 26.76 | 24.52 | 24.57 | 343.76 | 247.91 | 250.39 |
+| Apple M2 Ultra (DeepSeek V4 Flash q2) | 23.22 | 21.92 | 21.85 | 410.62 | 325.77 | 324.90 |
+| NVIDIA DGX Spark / GB10 (DeepSeek V4 Flash q2) | 14.23 | 12.98 | 13.13 | 402.88 | 346.36 | 343.02 |
+| Apple M3 Ultra (DeepSeek V4 PRO q2) | 12.42 | 9.56 | 9.90 | 183.06 | 138.82 | 149.28 |
 
 <!-- END GENERATED BENCHMARK SUMMARY -->
