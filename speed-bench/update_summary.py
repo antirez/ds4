@@ -16,7 +16,8 @@ TARGET_CTX = 32768
 
 @dataclass
 class BenchSummary:
-    name: str
+    hardware: str
+    model: str
     best_gen: float
     gen_at_target_ctx: float | None
     avg_gen: float
@@ -25,12 +26,12 @@ class BenchSummary:
     avg_prefill: float
 
 
-def display_name(path: Path) -> str:
+def benchmark_labels(path: Path) -> tuple[str, str]:
     name_overrides = {
-        "gb10": "NVIDIA DGX Spark / GB10 (DeepSeek V4 Flash q2)",
-        "m2_ultra": "Apple M2 Ultra (DeepSeek V4 Flash q2)",
-        "m4_max": "Apple M4 Max (DeepSeek V4 Flash q2)",
-        "pro_model_m3_ultra": "Apple M3 Ultra (DeepSeek V4 PRO q2)",
+        "gb10": ("NVIDIA DGX Spark / GB10", "DeepSeek V4 Flash q2"),
+        "m2_ultra": ("Apple M2 Ultra", "DeepSeek V4 Flash q2"),
+        "m4_max": ("Apple M4 Max", "DeepSeek V4 Flash q2"),
+        "pro_model_m3_ultra": ("Apple M3 Ultra", "DeepSeek V4 PRO q2"),
     }
     if path.stem in name_overrides:
         return name_overrides[path.stem]
@@ -46,7 +47,7 @@ def display_name(path: Path) -> str:
         "ultra": "Ultra",
     }
     words = path.stem.replace("-", "_").split("_")
-    return " ".join(replacements.get(word.lower(), word) for word in words)
+    return " ".join(replacements.get(word.lower(), word) for word in words), "Unspecified model"
 
 
 def fmt_tps(value: float | None) -> str:
@@ -77,8 +78,10 @@ def read_summary(path: Path) -> BenchSummary:
         raise SystemExit(f"{path}: no benchmark rows")
 
     target_row = next((row for row in rows if row["ctx_tokens"] == TARGET_CTX), None)
+    hardware, model = benchmark_labels(path)
     return BenchSummary(
-        name=display_name(path),
+        hardware=hardware,
+        model=model,
         best_gen=max(row["gen_tps"] for row in rows),
         gen_at_target_ctx=target_row["gen_tps"] if target_row else None,
         avg_gen=sum(row["gen_tps"] for row in rows) / len(rows),
@@ -89,7 +92,14 @@ def read_summary(path: Path) -> BenchSummary:
 
 
 def render_summary(summaries: list[BenchSummary]) -> str:
-    summaries = sorted(summaries, key=lambda item: item.best_gen, reverse=True)
+    by_model = {}
+    for summary in summaries:
+        by_model.setdefault(summary.model, []).append(summary)
+    model_groups = sorted(
+        by_model.items(),
+        key=lambda item: max(summary.best_gen for summary in item[1]),
+        reverse=True,
+    )
     lines = [
         BEGIN_MARKER,
         "## Benchmark Summary",
@@ -98,26 +108,34 @@ def render_summary(summaries: list[BenchSummary]) -> str:
         "",
         f"`@ 32k ctx` means the row where `ctx_tokens` is `{TARGET_CTX}`.",
         "",
-        "| Benchmark | Best gen (t/s) | Gen @ 32k ctx (t/s) | Avg gen (t/s) | Best prefill (t/s) | Prefill @ 32k ctx (t/s) | Avg prefill (t/s) |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
-    for summary in summaries:
-        lines.append(
-            "| "
-            + " | ".join(
-                [
-                    summary.name,
-                    fmt_tps(summary.best_gen),
-                    fmt_tps(summary.gen_at_target_ctx),
-                    fmt_tps(summary.avg_gen),
-                    fmt_tps(summary.best_prefill),
-                    fmt_tps(summary.prefill_at_target_ctx),
-                    fmt_tps(summary.avg_prefill),
-                ]
-            )
-            + " |"
+    for model, model_summaries in model_groups:
+        lines.extend(
+            [
+                f"### {model}",
+                "",
+                "| Hardware | Best gen (t/s) | Gen @ 32k ctx (t/s) | Avg gen (t/s) | Best prefill (t/s) | Prefill @ 32k ctx (t/s) | Avg prefill (t/s) |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
         )
-    lines.extend(["", END_MARKER, ""])
+        for summary in sorted(model_summaries, key=lambda item: item.best_gen, reverse=True):
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        summary.hardware,
+                        fmt_tps(summary.best_gen),
+                        fmt_tps(summary.gen_at_target_ctx),
+                        fmt_tps(summary.avg_gen),
+                        fmt_tps(summary.best_prefill),
+                        fmt_tps(summary.prefill_at_target_ctx),
+                        fmt_tps(summary.avg_prefill),
+                    ]
+                )
+                + " |"
+            )
+        lines.append("")
+    lines.extend([END_MARKER, ""])
     return "\n".join(lines)
 
 
