@@ -26461,6 +26461,10 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         }
 
         bool ok = true;
+        if (g->ssd_streaming && !input_hc) {
+            g->streaming_static_decode_map_current = false;
+            ok = metal_graph_stream_map_token(&e->model, &e->weights);
+        }
         if (input_hc) {
             ok = ds4_gpu_tensor_write(g->cur_hc, 0, input_hc, hc_dim * sizeof(float)) != 0;
         }
@@ -26479,33 +26483,65 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos0, 1);
         const uint32_t split_after_layers = metal_graph_token_split_after_layers();
         uint32_t encoded_layers = 0;
-        for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
-            ok = metal_graph_encode_decode_layer(g,
-                                                 &e->model,
-                                                 &e->weights.layer[il],
-                                                 il,
-                                                 pos0,
-                                                 g->layer_raw_cache[il],
-                                                 g->raw_cap,
-                                                 raw_row,
-                                                 n_raw,
-                                                 tokens[0]);
-            ds4_gpu_tensor *tmp = g->cur_hc;
-            g->cur_hc = g->after_ffn_hc;
-            g->after_ffn_hc = tmp;
-            encoded_layers++;
-            if (ok &&
-                split_after_layers != 0 &&
-                encoded_layers == split_after_layers &&
-                il < layer_end)
-            {
-                ok = ds4_gpu_flush_commands() != 0;
+        if (g->ssd_streaming) {
+            if (ok) ok = ds4_gpu_end_commands() != 0;
+            for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+                g->streaming_static_decode_map_current = false;
+                ok = metal_graph_stream_map_layer_decode(&e->model, &e->weights, il);
+                if (ok) ok = ds4_gpu_begin_commands() != 0;
+                if (ok) {
+                    ok = metal_graph_encode_decode_layer(g,
+                                                         &e->model,
+                                                         &e->weights.layer[il],
+                                                         il,
+                                                         pos0,
+                                                         g->layer_raw_cache[il],
+                                                         g->raw_cap,
+                                                         raw_row,
+                                                         n_raw,
+                                                         tokens[0]);
+                    ds4_gpu_tensor *tmp = g->cur_hc;
+                    g->cur_hc = g->after_ffn_hc;
+                    g->after_ffn_hc = tmp;
+                }
+                if (ok) ok = ds4_gpu_end_commands() != 0;
             }
+            if (ok && output_logits) {
+                g->streaming_static_decode_map_current = false;
+                ok = metal_graph_stream_map_output(&e->model, &e->weights);
+                if (ok) ok = ds4_gpu_begin_commands() != 0;
+                if (ok) ok = metal_graph_encode_output_head(g, &e->model, &e->weights, e->weights.output->dim[1]);
+                if (ok) ok = ds4_gpu_end_commands() != 0;
+            }
+        } else {
+            for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+                ok = metal_graph_encode_decode_layer(g,
+                                                     &e->model,
+                                                     &e->weights.layer[il],
+                                                     il,
+                                                     pos0,
+                                                     g->layer_raw_cache[il],
+                                                     g->raw_cap,
+                                                     raw_row,
+                                                     n_raw,
+                                                     tokens[0]);
+                ds4_gpu_tensor *tmp = g->cur_hc;
+                g->cur_hc = g->after_ffn_hc;
+                g->after_ffn_hc = tmp;
+                encoded_layers++;
+                if (ok &&
+                    split_after_layers != 0 &&
+                    encoded_layers == split_after_layers &&
+                    il < layer_end)
+                {
+                    ok = ds4_gpu_flush_commands() != 0;
+                }
+            }
+            if (ok && output_logits) {
+                ok = metal_graph_encode_output_head(g, &e->model, &e->weights, e->weights.output->dim[1]);
+            }
+            if (ok) ok = ds4_gpu_end_commands() != 0;
         }
-        if (ok && output_logits) {
-            ok = metal_graph_encode_output_head(g, &e->model, &e->weights, e->weights.output->dim[1]);
-        }
-        if (ok) ok = ds4_gpu_end_commands() != 0;
         if (ok && !output_hc && !output_logits) ok = ds4_gpu_synchronize() != 0;
         if (ok && output_hc) {
             ok = ds4_gpu_tensor_read(g->cur_hc, 0, output_hc, hc_dim * sizeof(float)) != 0;
@@ -26533,7 +26569,12 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         .cap = (int)n_tokens,
     };
 
-    bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, &span, 0, n_tokens);
+    bool ok = true;
+    if (g->ssd_streaming && !input_hc) {
+        g->streaming_static_decode_map_current = false;
+        ok = metal_graph_stream_map_token(&e->model, &e->weights);
+    }
+    if (ok) ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, &span, 0, n_tokens);
     if (ok && input_hc) {
         ok = ds4_gpu_tensor_write(g->batch_cur_hc, 0, input_hc, hc_bytes) != 0;
     } else if (ok) {
@@ -26548,26 +26589,56 @@ int ds4_session_eval_layer_slice(ds4_session *s,
 
     ds4_gpu_tensor *last_hc = NULL;
     ds4_gpu_tensor *saved_cur = NULL;
-    if (ok) ok = ds4_gpu_begin_commands() != 0;
-    for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
-        ok = metal_graph_encode_layer_batch(g,
-                                            &e->model,
-                                            &e->weights.layer[il],
-                                            il,
-                                            pos0,
-                                            n_tokens);
+    const bool batch_selected_addr =
+        g->ssd_streaming &&
+        layer_start == 0 &&
+        (metal_graph_stream_prefill_batch_selected_addr_enabled(g, &e->weights, n_tokens) ||
+         metal_graph_cuda_stream_prefill_batch_selected_addr_enabled(g, &e->weights, n_tokens));
+    if (g->ssd_streaming) {
+        for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+            g->streaming_static_decode_map_current = false;
+            ok = batch_selected_addr ?
+                 metal_graph_stream_map_layer_decode(&e->model, &e->weights, il) :
+                 metal_graph_stream_map_layer(&e->model, &e->weights, il);
+            if (ok) ok = ds4_gpu_begin_commands() != 0;
+            if (ok) {
+                ok = metal_graph_encode_layer_batch(g,
+                                                    &e->model,
+                                                    &e->weights.layer[il],
+                                                    il,
+                                                    pos0,
+                                                    n_tokens);
+            }
+            if (ok) ok = ds4_gpu_end_commands() != 0;
+        }
+    } else {
+        if (ok) ok = ds4_gpu_begin_commands() != 0;
+        for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+            ok = metal_graph_encode_layer_batch(g,
+                                                &e->model,
+                                                &e->weights.layer[il],
+                                                il,
+                                                pos0,
+                                                n_tokens);
+        }
     }
     if (ok && output_logits) {
         saved_cur = g->cur_hc;
         last_hc = metal_graph_tensor_row_view(g->batch_cur_hc, n_tokens - 1u, hc_dim);
         ok = last_hc != NULL;
+        if (ok && g->ssd_streaming) {
+            g->streaming_static_decode_map_current = false;
+            ok = metal_graph_stream_map_output(&e->model, &e->weights);
+        }
         if (ok) {
             g->cur_hc = last_hc;
-            ok = metal_graph_encode_output_head(g, &e->model, &e->weights, e->weights.output->dim[1]);
+            if (g->ssd_streaming) ok = ds4_gpu_begin_commands() != 0;
+            if (ok) ok = metal_graph_encode_output_head(g, &e->model, &e->weights, e->weights.output->dim[1]);
+            if (ok && g->ssd_streaming) ok = ds4_gpu_end_commands() != 0;
             g->cur_hc = saved_cur;
         }
     }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
+    if (ok && !g->ssd_streaming) ok = ds4_gpu_end_commands() != 0;
     if (saved_cur) g->cur_hc = saved_cur;
     if (last_hc) ds4_gpu_tensor_free(last_hc);
 
