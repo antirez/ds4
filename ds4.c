@@ -8344,11 +8344,7 @@ static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
                 cap = (uint32_t)v;
             }
         } else if (prompt_len > 4096) {
-#ifdef DS4_ROCM_BUILD
-            cap = 8192u;
-#else
             cap = DS4_MODEL_VARIANT == DS4_VARIANT_PRO ? 8192u : 4096u;
-#endif
         }
     }
 
@@ -21387,8 +21383,7 @@ static uint32_t metal_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_c
 }
 
 /* Choose the prefill ubatch size. Whole-batch is fastest for normal prompts.
- * Long prompts default to 4096-token chunks, except PRO and Strix Halo ROCm
- * where larger raw/cache chunks are measurably better on long contexts. */
+ * Long Flash prompts default to 4096-token chunks; PRO defaults to 8192. */
 static uint32_t metal_graph_prefill_cap_for_prompt(int prompt_len,
                                                    uint32_t prefill_chunk) {
     return ds4_prefill_cap_for_prompt(prompt_len, prefill_chunk);
