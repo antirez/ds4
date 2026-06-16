@@ -227,6 +227,7 @@ static std::unordered_map<uint64_t, size_t> g_q8_f16_transpose_by_offset;
 static uint64_t g_model_range_bytes;
 static uint64_t g_q8_f16_bytes;
 static int g_q8_f16_disabled_after_oom;
+static int g_q8_f16_disabled_for_multi_model;
 static int g_q8_f16_budget_notice_printed;
 static uint64_t g_model_load_progress_next;
 static double g_model_load_progress_last;
@@ -3378,10 +3379,6 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
     if (cuda_model_image_owned(model_map)) return cuda_model_ptr(model_map, offset);
 
-    if (model_map != g_model_host_base) {
-        return cuda_model_range_copy_uncached(model_map, offset, bytes, what);
-    }
-
     const uint64_t end = offset + bytes;
     auto exact = g_model_range_by_offset.find(offset);
     if (exact != g_model_range_by_offset.end()) {
@@ -3403,6 +3400,10 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
 
     const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
     if (fd_ptr) return fd_ptr;
+
+    if (model_map != g_model_host_base) {
+        return cuda_model_range_copy_uncached(model_map, offset, bytes, what);
+    }
 
     cudaError_t err = cudaSuccess;
     if (g_model_range_mapping_supported && model_map == g_model_host_base) {
@@ -3663,6 +3664,8 @@ static void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t r
 static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
     if (g_quality_mode) return 0;
     if (g_q8_f16_disabled_after_oom) return 0;
+    if (g_q8_f16_disabled_for_multi_model) return 0;
+    if (getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL) return 0;
     if (!label) return 0;
     if (strstr(label, "attn_output_a") != NULL ||
         strstr(label, "attn_output_b") != NULL ||
@@ -4421,6 +4424,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     cuda_q8_f16_cache_release_all();
     cuda_stream_selected_cache_release();
     g_q8_f16_disabled_after_oom = 0;
+    g_q8_f16_disabled_for_multi_model = 0;
     g_q8_f16_budget_notice_printed = 0;
     if (g_cuda_tmp) {
         (void)cudaFree(g_cuda_tmp);
@@ -4600,10 +4604,23 @@ extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
+    const int multi_model =
+        g_model_host_base != NULL &&
+        (g_model_host_base != model_map || g_model_registered_size != model_size);
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
     g_q8_f16_budget_notice_printed = 0;
+    if (multi_model) {
+        /*
+         * MTP loads a second GGUF mapping.  Its weights are small, but on UMA
+         * ROCm systems the optional expanded Q8->F16 cache can consume the
+         * memory margin needed for session/context tensors once both model
+         * mappings are resident.  The cache is only a speed path; the normal
+         * Q8 kernels remain available and keep MTP startup reliable.
+         */
+        g_q8_f16_disabled_for_multi_model = 1;
+    }
     g_model_host_base = model_map;
     g_model_device_base = cuda_model_image_owned(model_map) ?
                           cuda_model_image_ptr(model_map, 0) :
