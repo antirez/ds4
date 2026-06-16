@@ -8825,6 +8825,55 @@ static int dist_validate_layers_for_model(const ds4_dist_options *opt, uint32_t 
     return 0;
 }
 
+int ds4_dist_test_validate_coordinator_layers(
+        const ds4_dist_options *opt,
+        uint32_t n_layers,
+        char *err,
+        size_t errlen) {
+    return dist_validate_layers_for_model(opt, n_layers, err, errlen);
+}
+
+int ds4_dist_test_infer_coordinator_topology(
+        const ds4_dist_options *opt,
+        uint32_t n_layers,
+        int *topology_out,
+        char *err,
+        size_t errlen) {
+    ds4_dist_topology topology = DS4_DIST_TOPOLOGY_FORWARD;
+    int rc = dist_infer_coordinator_topology(opt, n_layers, &topology, err, errlen);
+    if (rc == 0 && topology_out) *topology_out = (int)topology;
+    return rc;
+}
+
+bool ds4_dist_test_build_route_plan(
+        ds4_dist_coordinator_state *state,
+        ds4_dist_route_plan *plan,
+        char *err,
+        size_t errlen) {
+    if (!state || !plan) {
+        if (errlen) snprintf(err, errlen, "invalid distributed test route request");
+        return false;
+    }
+    return dist_coordinator_build_route_plan(state, plan, NULL, err, errlen);
+}
+
+void ds4_dist_test_route_plan_free(ds4_dist_route_plan *plan) {
+    dist_route_plan_free(plan);
+}
+
+uint32_t ds4_dist_test_kv_route_owner_count(const ds4_dist_session *d) {
+    return dist_kv_route_owner_count(d);
+}
+
+int ds4_dist_test_kv_route_build_owners(
+        const ds4_dist_session *d,
+        ds4_dist_kv_route_owner *owners,
+        uint32_t owner_count,
+        char *err,
+        size_t errlen) {
+    return dist_kv_route_build_owners(d, owners, owner_count, err, errlen);
+}
+
 int ds4_dist_run(ds4_engine *engine, const ds4_dist_options *opt, const ds4_dist_generation_options *gen) {
     if (!engine || !opt) {
         fprintf(stderr, "ds4: distributed runtime requires an open engine and options\n");
