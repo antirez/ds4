@@ -179,6 +179,11 @@ static uint64_t g_model_mapped_size;
 static uint64_t g_model_mapped_max_tensor_bytes;
 static uint64_t g_tensor_alloc_live_bytes;
 static uint64_t g_tensor_alloc_peak_bytes;
+static pthread_mutex_t g_tensor_mu = PTHREAD_MUTEX_INITIALIZER;
+static uintptr_t *g_tensor_live_slots;
+static size_t g_tensor_live_cap;
+static size_t g_tensor_live_count;
+static size_t g_tensor_live_tombs;
 static uint64_t g_model_wrap_count;
 static uint64_t g_model_wrap_bytes;
 static uint64_t g_model_wrap_max_bytes;
@@ -523,6 +528,164 @@ static DS4MetalTensor *ds4_gpu_tensor_obj(ds4_gpu_tensor *tensor) {
 
 static const DS4MetalTensor *ds4_gpu_tensor_const_obj(const ds4_gpu_tensor *tensor) {
     return (__bridge const DS4MetalTensor *)tensor;
+}
+
+/* C code owns ds4_gpu_tensor handles as retained Objective-C objects.  Freeing
+ * the same opaque handle twice would make the second __bridge_transfer release
+ * an already-deallocated object, which macOS reports as malloc corruption.  The
+ * live table lets free validate a handle before touching Objective-C state; the
+ * same mutex also serializes the diagnostic allocation counters. */
+static uint64_t ds4_gpu_tensor_ptr_hash(uintptr_t ptr) {
+    uint64_t x = (uint64_t)(ptr >> 4);
+    x ^= x >> 33;
+    x *= UINT64_C(0xff51afd7ed558ccd);
+    x ^= x >> 33;
+    x *= UINT64_C(0xc4ceb9fe1a85ec53);
+    x ^= x >> 33;
+    return x;
+}
+
+static int ds4_gpu_tensor_live_resize_locked(size_t min_cap) {
+    size_t new_cap = 1024;
+    while (new_cap < min_cap) new_cap <<= 1;
+
+    uintptr_t *new_slots = calloc(new_cap, sizeof(new_slots[0]));
+    if (!new_slots) return 0;
+
+    for (size_t i = 0; i < g_tensor_live_cap; i++) {
+        const uintptr_t key = g_tensor_live_slots[i];
+        if (key == 0 || key == UINTPTR_MAX) continue;
+
+        size_t idx = (size_t)ds4_gpu_tensor_ptr_hash(key) & (new_cap - 1);
+        while (new_slots[idx] != 0) idx = (idx + 1) & (new_cap - 1);
+        new_slots[idx] = key;
+    }
+
+    free(g_tensor_live_slots);
+    g_tensor_live_slots = new_slots;
+    g_tensor_live_cap = new_cap;
+    g_tensor_live_tombs = 0;
+    return 1;
+}
+
+static int ds4_gpu_tensor_live_insert_locked(const void *ptr) {
+    if (!ptr || (uintptr_t)ptr == UINTPTR_MAX) return 0;
+    if ((g_tensor_live_count + g_tensor_live_tombs + 1) * 10 >=
+        g_tensor_live_cap * 7)
+    {
+        const size_t min_cap = g_tensor_live_cap ? g_tensor_live_cap * 2 : 1024;
+        if (!ds4_gpu_tensor_live_resize_locked(min_cap)) return 0;
+    }
+
+    const uintptr_t key = (uintptr_t)ptr;
+    size_t idx = (size_t)ds4_gpu_tensor_ptr_hash(key) & (g_tensor_live_cap - 1);
+    size_t tomb = (size_t)-1;
+    for (;;) {
+        const uintptr_t cur = g_tensor_live_slots[idx];
+        if (cur == key) return 0;
+        if (cur == UINTPTR_MAX) {
+            if (tomb == (size_t)-1) tomb = idx;
+        } else if (cur == 0) {
+            if (tomb != (size_t)-1) {
+                idx = tomb;
+                g_tensor_live_tombs--;
+            }
+            g_tensor_live_slots[idx] = key;
+            g_tensor_live_count++;
+            return 1;
+        }
+        idx = (idx + 1) & (g_tensor_live_cap - 1);
+    }
+}
+
+static int ds4_gpu_tensor_live_remove_locked(const void *ptr) {
+    if (!ptr || g_tensor_live_cap == 0) return 0;
+
+    const uintptr_t key = (uintptr_t)ptr;
+    size_t idx = (size_t)ds4_gpu_tensor_ptr_hash(key) & (g_tensor_live_cap - 1);
+    for (;;) {
+        const uintptr_t cur = g_tensor_live_slots[idx];
+        if (cur == 0) return 0;
+        if (cur == key) {
+            g_tensor_live_slots[idx] = UINTPTR_MAX;
+            g_tensor_live_count--;
+            g_tensor_live_tombs++;
+            return 1;
+        }
+        idx = (idx + 1) & (g_tensor_live_cap - 1);
+    }
+}
+
+static int ds4_gpu_tensor_track_alloc_locked(
+        const void *ptr,
+        uint64_t bytes,
+        uint64_t *live_snap,
+        uint64_t *peak_snap)
+{
+    if (!ds4_gpu_tensor_live_insert_locked(ptr)) return 0;
+
+    g_tensor_alloc_live_bytes += bytes;
+    if (g_tensor_alloc_live_bytes > g_tensor_alloc_peak_bytes) {
+        g_tensor_alloc_peak_bytes = g_tensor_alloc_live_bytes;
+    }
+    if (live_snap) *live_snap = g_tensor_alloc_live_bytes;
+    if (peak_snap) *peak_snap = g_tensor_alloc_peak_bytes;
+    return 1;
+}
+
+static int ds4_gpu_tensor_track_view_locked(const void *ptr) {
+    return ds4_gpu_tensor_live_insert_locked(ptr);
+}
+
+static int ds4_gpu_tensor_prepare_free(
+        ds4_gpu_tensor *tensor,
+        uint8_t *owner,
+        uint64_t *bytes,
+        uint64_t *live_snap,
+        uint64_t *peak_snap)
+{
+    pthread_mutex_lock(&g_tensor_mu);
+    if (!ds4_gpu_tensor_live_remove_locked(tensor)) {
+        pthread_mutex_unlock(&g_tensor_mu);
+        fprintf(stderr,
+                "ds4: Metal tensor free ignored for unknown handle %p\n",
+                (void *)tensor);
+        return 0;
+    }
+
+    DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
+    const uint8_t obj_owner = obj.owner;
+    const uint64_t obj_bytes = obj.bytes;
+    if (obj_owner) {
+        if (obj_bytes <= g_tensor_alloc_live_bytes) {
+            g_tensor_alloc_live_bytes -= obj_bytes;
+        } else {
+            g_tensor_alloc_live_bytes = 0;
+        }
+    }
+    if (owner) *owner = obj_owner;
+    if (bytes) *bytes = obj_bytes;
+    if (live_snap) *live_snap = g_tensor_alloc_live_bytes;
+    if (peak_snap) *peak_snap = g_tensor_alloc_peak_bytes;
+    pthread_mutex_unlock(&g_tensor_mu);
+    return 1;
+}
+
+static void ds4_gpu_tensor_tracking_reset(void) {
+    pthread_mutex_lock(&g_tensor_mu);
+    if (g_tensor_live_count != 0) {
+        fprintf(stderr,
+                "ds4: Metal cleanup discarded %zu live tensor handles\n",
+                g_tensor_live_count);
+    }
+    free(g_tensor_live_slots);
+    g_tensor_live_slots = NULL;
+    g_tensor_live_cap = 0;
+    g_tensor_live_count = 0;
+    g_tensor_live_tombs = 0;
+    g_tensor_alloc_live_bytes = 0;
+    g_tensor_alloc_peak_bytes = 0;
+    pthread_mutex_unlock(&g_tensor_mu);
 }
 
 static id<MTLBuffer> ds4_gpu_tensor_buffer(const ds4_gpu_tensor *tensor) {
@@ -2523,10 +2686,14 @@ void ds4_gpu_print_memory_report(const char *label) {
     fprintf(stderr, "ds4: Metal memory report%s%s\n",
             label && label[0] ? " " : "",
             label && label[0] ? label : "");
+    pthread_mutex_lock(&g_tensor_mu);
+    const uint64_t tensor_live_snap = g_tensor_alloc_live_bytes;
+    const uint64_t tensor_peak_snap = g_tensor_alloc_peak_bytes;
+    pthread_mutex_unlock(&g_tensor_mu);
     fprintf(stderr,
             "ds4:   runtime tensors live %.2f MiB peak %.2f MiB\n",
-            ds4_gpu_mib(g_tensor_alloc_live_bytes),
-            ds4_gpu_mib(g_tensor_alloc_peak_bytes));
+            ds4_gpu_mib(tensor_live_snap),
+            ds4_gpu_mib(tensor_peak_snap));
     ds4_gpu_print_task_memory_report();
     fprintf(stderr,
             "ds4:   mmap model wrapper spans %llu buffers %.2f GiB total, %.2f GiB max (not copied)\n",
@@ -6044,16 +6211,26 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
         tensor.offset = 0;
         tensor.bytes = bytes;
         tensor.owner = 1;
-        g_tensor_alloc_live_bytes += bytes;
-        if (g_tensor_alloc_live_bytes > g_tensor_alloc_peak_bytes) {
-            g_tensor_alloc_peak_bytes = g_tensor_alloc_live_bytes;
+        uint64_t live_snap = 0;
+        uint64_t peak_snap = 0;
+        pthread_mutex_lock(&g_tensor_mu);
+        const int tracked = ds4_gpu_tensor_track_alloc_locked(
+                (__bridge const void *)tensor,
+                bytes,
+                &live_snap,
+                &peak_snap);
+        pthread_mutex_unlock(&g_tensor_mu);
+        if (!tracked) {
+            fprintf(stderr, "ds4: failed to track Metal tensor allocation\n");
+            tensor.buffer = nil;
+            return NULL;
         }
         if (ds4_gpu_trace_allocs()) {
             fprintf(stderr,
                     "ds4: Metal tensor alloc %.3f MiB live %.3f MiB peak %.3f MiB\n",
                     (double)bytes / (1024.0 * 1024.0),
-                    (double)g_tensor_alloc_live_bytes / (1024.0 * 1024.0),
-                    (double)g_tensor_alloc_peak_bytes / (1024.0 * 1024.0));
+                    (double)live_snap / (1024.0 * 1024.0),
+                    (double)peak_snap / (1024.0 * 1024.0));
         }
         return (__bridge_retained ds4_gpu_tensor *)tensor;
     }
@@ -6083,6 +6260,14 @@ ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset,
         view.offset = absolute_offset;
         view.bytes = bytes;
         view.owner = 0;
+        pthread_mutex_lock(&g_tensor_mu);
+        const int tracked = ds4_gpu_tensor_track_view_locked((__bridge const void *)view);
+        pthread_mutex_unlock(&g_tensor_mu);
+        if (!tracked) {
+            fprintf(stderr, "ds4: failed to track Metal tensor view\n");
+            view.buffer = nil;
+            return NULL;
+        }
         return (__bridge_retained ds4_gpu_tensor *)view;
     }
 }
@@ -6090,19 +6275,25 @@ ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset,
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     if (!tensor) return;
     @autoreleasepool {
+        uint8_t owner = 0;
+        uint64_t bytes = 0;
+        uint64_t live_snap = 0;
+        uint64_t peak_snap = 0;
+        if (!ds4_gpu_tensor_prepare_free(tensor,
+                                         &owner,
+                                         &bytes,
+                                         &live_snap,
+                                         &peak_snap)) {
+            return;
+        }
         DS4MetalTensor *obj = (__bridge_transfer DS4MetalTensor *)tensor;
-        if (obj.owner) {
-            if (obj.bytes <= g_tensor_alloc_live_bytes) {
-                g_tensor_alloc_live_bytes -= obj.bytes;
-            } else {
-                g_tensor_alloc_live_bytes = 0;
-            }
+        if (owner) {
             if (ds4_gpu_trace_allocs()) {
                 fprintf(stderr,
                         "ds4: Metal tensor free %.3f MiB live %.3f MiB peak %.3f MiB\n",
-                        (double)obj.bytes / (1024.0 * 1024.0),
-                        (double)g_tensor_alloc_live_bytes / (1024.0 * 1024.0),
-                        (double)g_tensor_alloc_peak_bytes / (1024.0 * 1024.0));
+                        (double)bytes / (1024.0 * 1024.0),
+                        (double)live_snap / (1024.0 * 1024.0),
+                        (double)peak_snap / (1024.0 * 1024.0));
             }
         }
         obj.buffer = nil;
@@ -6633,8 +6824,7 @@ void ds4_gpu_cleanup(void) {
         g_model_mapped_offset = 0;
         g_model_mapped_size = 0;
         g_model_mapped_max_tensor_bytes = 0;
-        g_tensor_alloc_live_bytes = 0;
-        g_tensor_alloc_peak_bytes = 0;
+        ds4_gpu_tensor_tracking_reset();
         g_flash_attn_mask_bytes = 0;
         g_flash_attn_pad_bytes = 0;
         g_flash_attn_tmp_bytes = 0;
