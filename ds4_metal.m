@@ -179,6 +179,7 @@ static uint64_t g_model_mapped_size;
 static uint64_t g_model_mapped_max_tensor_bytes;
 static uint64_t g_tensor_alloc_live_bytes;
 static uint64_t g_tensor_alloc_peak_bytes;
+static pthread_mutex_t g_tensor_alloc_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_model_wrap_count;
 static uint64_t g_model_wrap_bytes;
 static uint64_t g_model_wrap_max_bytes;
@@ -2523,10 +2524,14 @@ void ds4_gpu_print_memory_report(const char *label) {
     fprintf(stderr, "ds4: Metal memory report%s%s\n",
             label && label[0] ? " " : "",
             label && label[0] ? label : "");
+    pthread_mutex_lock(&g_tensor_alloc_mu);
+    uint64_t tensor_live_snap = g_tensor_alloc_live_bytes;
+    uint64_t tensor_peak_snap = g_tensor_alloc_peak_bytes;
+    pthread_mutex_unlock(&g_tensor_alloc_mu);
     fprintf(stderr,
             "ds4:   runtime tensors live %.2f MiB peak %.2f MiB\n",
-            ds4_gpu_mib(g_tensor_alloc_live_bytes),
-            ds4_gpu_mib(g_tensor_alloc_peak_bytes));
+            ds4_gpu_mib(tensor_live_snap),
+            ds4_gpu_mib(tensor_peak_snap));
     ds4_gpu_print_task_memory_report();
     fprintf(stderr,
             "ds4:   mmap model wrapper spans %llu buffers %.2f GiB total, %.2f GiB max (not copied)\n",
@@ -6044,16 +6049,20 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
         tensor.offset = 0;
         tensor.bytes = bytes;
         tensor.owner = 1;
+        pthread_mutex_lock(&g_tensor_alloc_mu);
         g_tensor_alloc_live_bytes += bytes;
         if (g_tensor_alloc_live_bytes > g_tensor_alloc_peak_bytes) {
             g_tensor_alloc_peak_bytes = g_tensor_alloc_live_bytes;
         }
+        uint64_t live_snap = g_tensor_alloc_live_bytes;
+        uint64_t peak_snap = g_tensor_alloc_peak_bytes;
+        pthread_mutex_unlock(&g_tensor_alloc_mu);
         if (ds4_gpu_trace_allocs()) {
             fprintf(stderr,
                     "ds4: Metal tensor alloc %.3f MiB live %.3f MiB peak %.3f MiB\n",
                     (double)bytes / (1024.0 * 1024.0),
-                    (double)g_tensor_alloc_live_bytes / (1024.0 * 1024.0),
-                    (double)g_tensor_alloc_peak_bytes / (1024.0 * 1024.0));
+                    (double)live_snap / (1024.0 * 1024.0),
+                    (double)peak_snap / (1024.0 * 1024.0));
         }
         return (__bridge_retained ds4_gpu_tensor *)tensor;
     }
@@ -6092,17 +6101,21 @@ void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     @autoreleasepool {
         DS4MetalTensor *obj = (__bridge_transfer DS4MetalTensor *)tensor;
         if (obj.owner) {
+            pthread_mutex_lock(&g_tensor_alloc_mu);
             if (obj.bytes <= g_tensor_alloc_live_bytes) {
                 g_tensor_alloc_live_bytes -= obj.bytes;
             } else {
                 g_tensor_alloc_live_bytes = 0;
             }
+            uint64_t live_snap = g_tensor_alloc_live_bytes;
+            uint64_t peak_snap = g_tensor_alloc_peak_bytes;
+            pthread_mutex_unlock(&g_tensor_alloc_mu);
             if (ds4_gpu_trace_allocs()) {
                 fprintf(stderr,
                         "ds4: Metal tensor free %.3f MiB live %.3f MiB peak %.3f MiB\n",
                         (double)obj.bytes / (1024.0 * 1024.0),
-                        (double)g_tensor_alloc_live_bytes / (1024.0 * 1024.0),
-                        (double)g_tensor_alloc_peak_bytes / (1024.0 * 1024.0));
+                        (double)live_snap / (1024.0 * 1024.0),
+                        (double)peak_snap / (1024.0 * 1024.0));
             }
         }
         obj.buffer = nil;
