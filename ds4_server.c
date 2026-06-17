@@ -3,6 +3,7 @@
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
 #include "rax.h"
+#include "ds4_dashboard.h"
 
 /* OpenAI/Anthropic compatible local server.
  *
@@ -7710,11 +7711,20 @@ typedef struct {
 static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
 
+/* Dashboard is now provided by the external ds4_dashboard module.
+ * The server struct holds a void * handle initialized at startup. */
+
 struct server {
     ds4_engine *engine;
     ds4_session *session;
+    int ctx_size;
     int default_tokens;
+    ds4_backend backend;
+    char kv_disk_dir[4096];
+    uint64_t kv_disk_space_mb;
+    kv_cache_options kv_opt;
     kv_disk_cache kv;
+    void *dash;                         /* ds4_dashboard handle */
     tool_memory tool_mem;
     live_tool_state responses_live;
     live_tool_state anthropic_live;
@@ -7734,6 +7744,8 @@ struct server {
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
 };
+
+
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
  * after the response has been written, so request data and the socket remain
@@ -9629,6 +9641,18 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     const bool is_display = strcmp(event, "prefill_display") == 0;
     if (!is_chunk && !is_display) return;
 
+    /* Update dashboard status with prefill progress */
+    if (p->srv && p->srv->dash) {
+        ds4_dashboard_status st = {0};
+        st.state = 1; /* prefilling */
+        st.prefill_current = current;
+        st.prefill_total = total;
+        st.prefill_elapsed = now_sec() - p->t0;
+        st.prefill_speed = st.prefill_elapsed > 0.001
+            ? (double)(current - p->cached_tokens) / st.prefill_elapsed : 0.0;
+        ds4_dashboard_set_status(p->srv->dash, &st);
+    }
+
     double now = now_sec();
     /* Keep the HTTP/SSE connection alive while prefill runs.  We write the SSE
      * response headers the first time the callback fires and then emit a
@@ -10248,6 +10272,17 @@ static void generate_job(server *s, job *j) {
         ds4_tokens_free(&prefix);
     }
 
+    /* Record accurate prefill timing for the dashboard */
+    if (s->dash) {
+        ds4_dashboard_status st = {0};
+        st.state = 1; /* prefilling */
+        st.prefill_begin = now_sec();
+        st.prefill_tokens = prompt_for_sync->len;
+        st.prefill_current = 0;
+        st.prefill_total = prompt_for_sync->len;
+        ds4_dashboard_set_status(s->dash, &st);
+    }
+
     if (ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err)) != 0) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(s->session, NULL, NULL);
@@ -10259,6 +10294,12 @@ static void generate_job(server *s, job *j) {
         trace_event(s, trace_id, "prefill failed: %s", err);
         send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
         return;
+    }
+    if (s->dash) {
+        ds4_dashboard_status st = {0};
+        st.state = 0;
+        st.prefill_end = now_sec();
+        ds4_dashboard_set_status(s->dash, &st);
     }
     free(disk_cache_path);
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
@@ -10374,6 +10415,22 @@ decode_again:
     if (max_tokens > room) max_tokens = room;
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
     const double decode_t0 = now_sec();
+    /* Update dashboard status: generation started */
+    if (s->dash) {
+        ds4_dashboard_status st = {0};
+        st.state = ds4_think_mode_enabled(j->req.think_mode) ? 2 : 3;
+        st.gen_begin = decode_t0;
+        st.current_tokens = 0;
+        st.target_tokens = max_tokens;
+        st.current_speed = 0.0;
+        st.elapsed_sec = 0.0;
+        st.last_text[0] = '\0';
+        st.prefill_current = 0;
+        st.prefill_total = 0;
+        st.prefill_elapsed = 0.0;
+        st.prefill_speed = 0.0;
+        ds4_dashboard_set_status(s->dash, &st);
+    }
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
@@ -10452,6 +10509,23 @@ decode_again:
             size_t piece_len = 0;
             char *piece = ds4_token_text(s->engine, token, &piece_len);
             completion++;
+
+            /* Update dashboard status periodically (every token) */
+            if (s->dash && (completion % 10 == 1 || completion == 1)) {
+                ds4_dashboard_status st = {0};
+                st.state = ds4_think_mode_enabled(j->req.think_mode)
+                    ? (thinking.inside ? 2 : 3) : 3;
+                st.current_tokens = completion;
+                st.current_speed = (double)completion / (now_sec() - decode_t0);
+                st.elapsed_sec = now_sec() - decode_t0;
+                if (text.len > 0) {
+                    size_t copy_len = text.len < 200 ? text.len : 200;
+                    size_t copy_start = text.len > 200 ? text.len - 200 : 0;
+                    memcpy(st.last_text, text.ptr + copy_start, copy_len);
+                    st.last_text[copy_len] = '\0';
+                }
+                ds4_dashboard_set_status(s->dash, &st);
+            }
 
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
@@ -11026,6 +11100,34 @@ decode_again:
                        now_sec() - t0);
         }
     }
+    /* Reset dashboard status and update metrics via the dashboard module */
+    if (s->dash) {
+        ds4_dashboard_status st = {0};
+        st.state = 0;
+        ds4_dashboard_set_status(s->dash, &st);
+
+        /* Compute prefill time */
+        ds4_dashboard_metrics mu = {0};
+        mu.last_prompt_tokens = prompt_tokens;
+        mu.last_completion_tokens = completion;
+        mu.last_prefill_sec = decode_t0 - t0;
+        mu.last_gen_sec = now_sec() - decode_t0;
+        mu.last_prefill_tps = mu.last_prefill_sec > 0.001
+            ? (double)prompt_tokens / mu.last_prefill_sec : 0.0;
+        mu.last_gen_tps = mu.last_gen_sec > 0.001
+            ? (double)completion / mu.last_gen_sec : 0.0;
+        /* total increments (1 for this request) */
+        mu.total_prompt_tokens = (uint64_t)prompt_tokens;
+        mu.total_completion_tokens = (uint64_t)completion;
+        mu.total_requests = 1;
+        mu.total_cache_hit_tokens = (uint64_t)(j->req.cache_read_tokens > 0 ? j->req.cache_read_tokens : 0);
+        mu.total_cache_hit_requests = j->req.cache_read_tokens > 0 ? 1 : 0;
+        ds4_dashboard_update_metrics(s->dash, &mu,
+                                     j->req.cache_read_tokens, prompt_tokens);
+        ds4_dashboard_persist(s->dash, s->kv_disk_dir);
+    }
+
+
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
@@ -11267,6 +11369,16 @@ static void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
+
+    /* Delegate dashboard / config / status / metrics endpoints to the dashboard module */
+    if (s->dash && ds4_dashboard_handle_http(s->dash, hr.method, hr.path,
+                                            fd, s->enable_cors)) {
+        http_request_free(&hr);
+        goto done;
+    }
+
+
+
     const char *model_path_prefix = "/v1/models/";
     const size_t model_path_prefix_len = strlen(model_path_prefix);
     if (!strcmp(hr.method, "GET") &&
@@ -11519,7 +11631,7 @@ static server_config parse_options(int argc, char **argv) {
             .mtp_margin = 3.0f,
         },
         .host = "127.0.0.1",
-        .port = 8000,
+        .port = 8010,
         .ctx_size = 32768,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
@@ -11736,13 +11848,39 @@ int main(int argc, char **argv) {
     memset(&s, 0, sizeof(s));
     s.engine = engine;
     s.session = session;
+    s.ctx_size = cfg.ctx_size;
     s.default_tokens = cfg.default_tokens;
+    s.backend = cfg.engine.backend;
+    if (cfg.kv_disk_dir) {
+        snprintf(s.kv_disk_dir, sizeof(s.kv_disk_dir), "%s", cfg.kv_disk_dir);
+    }
+    s.kv_disk_space_mb = cfg.kv_disk_space_mb;
+    s.kv_opt = cfg.kv_cache;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+    }
+
+    /* Initialize dashboard */
+    {
+        ds4_dashboard_config dc = {0};
+        dc.ctx_size = cfg.ctx_size;
+        dc.default_tokens = cfg.default_tokens;
+        dc.kv_disk_dir = cfg.kv_disk_dir;
+        dc.kv_disk_space_mb = cfg.kv_disk_space_mb;
+        dc.kv_cache_min_tokens = cfg.kv_cache.min_tokens;
+        dc.kv_cache_cold_max_tokens = cfg.kv_cache.cold_max_tokens;
+        dc.kv_cache_continued_interval_tokens = cfg.kv_cache.continued_interval_tokens;
+        dc.kv_cache_boundary_trim_tokens = cfg.kv_cache.boundary_trim_tokens;
+        dc.kv_cache_boundary_align_tokens = cfg.kv_cache.boundary_align_tokens;
+        dc.backend_name = ds4_backend_name(cfg.engine.backend);
+        s.dash = ds4_dashboard_init(&dc);
+        if (cfg.kv_disk_dir && s.dash) {
+            ds4_dashboard_load(s.dash, cfg.kv_disk_dir);
+        }
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
@@ -11835,6 +11973,10 @@ int main(int argc, char **argv) {
                    "ds4-server: persisting current KV cache before shutdown tokens=%d",
                    tokens->len);
         kv_cache_store_current(&s, "shutdown");
+    }
+    if (s.dash) {
+        ds4_dashboard_persist(s.dash, s.kv_disk_dir);
+        ds4_dashboard_free(s.dash);
     }
     server_close_resources(&s);
     return 0;
