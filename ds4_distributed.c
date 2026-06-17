@@ -237,6 +237,7 @@ typedef struct {
     ds4_dist_topology topology;
     bool local_has_output;
     bool local_can_output_head;
+    bool local_decode_requested;
     bool replay_check;
     bool debug;
     bool use_control_for_work;
@@ -408,6 +409,9 @@ struct ds4_dist_session {
     uint64_t session_id;
     uint64_t request_id;
     uint64_t snapshot_request_id;
+    bool local_decode_active;
+    bool local_decode_remote_flushable;
+    uint32_t local_decode_remote_pos;
 };
 
 typedef struct {
@@ -415,6 +419,16 @@ typedef struct {
     float logit;
     float logprob;
 } ds4_dist_logprob;
+
+typedef struct {
+    uint32_t chunk_index;
+    uint32_t pos;
+    uint32_t n_tokens;
+    uint32_t payload_bytes;
+    bool reset_session;
+    bool output_logits;
+    void *payload;
+} ds4_dist_prefill_reverse_slot;
 
 typedef struct {
     ds4_dist_coordinator_state *state;
@@ -430,6 +444,7 @@ typedef struct {
     uint32_t chunk_cap;
     uint32_t progress_base;
     uint32_t progress_total;
+    uint32_t progress_received;
     uint32_t progress_completed;
     bool progress_done;
     uint64_t hc_values;
@@ -444,6 +459,15 @@ typedef struct {
     char err[256];
     pthread_mutex_t progress_mu;
     pthread_cond_t progress_cv;
+    ds4_dist_prefill_reverse_slot *reverse_slots;
+    uint32_t reverse_slot_count;
+    uint32_t reverse_head;
+    uint32_t reverse_tail;
+    uint32_t reverse_queued;
+    bool reverse_producer_done;
+    pthread_mutex_t reverse_mu;
+    pthread_cond_t reverse_can_enqueue;
+    pthread_cond_t reverse_can_dequeue;
 } ds4_dist_prefill_result_reader;
 
 typedef struct {
@@ -483,6 +507,17 @@ typedef struct {
 /* =========================================================================
  * Small Utilities And Forward Declarations
  * ========================================================================= */
+
+static int dist_session_ensure_route(ds4_dist_session *d, char *err, size_t errlen);
+static int dist_save_remote_shard_to_file(
+        ds4_dist_session *d,
+        const ds4_dist_route_entry *entry,
+        const ds4_tokens *tokens,
+        uint64_t token_hash,
+        FILE *fp,
+        uint64_t *payload_bytes_out,
+        char *err,
+        size_t errlen);
 
 static uint32_t dist_prefill_send_depth(uint32_t chunk_count) {
     uint32_t depth = 2;
@@ -2842,6 +2877,7 @@ static int dist_coordinator_request_remote_on_fd(
         uint64_t prefix_hash,
         uint64_t expected_result_hash,
         bool reset_session,
+        bool ack_only,
         const float *hidden_hc,
         uint32_t hidden_hc_bytes,
         uint32_t *kind,
@@ -2863,7 +2899,7 @@ static int dist_coordinator_request_remote_on_fd(
                                                      prefix_hash,
                                                      expected_result_hash,
                                                      reset_session,
-                                                     false,
+                                                     ack_only,
                                                      hidden_hc,
                                                      hidden_hc_bytes,
                                                      err,
@@ -2948,6 +2984,7 @@ static int dist_coordinator_eval_remote_on_fd(
                                                    prefix_hash,
                                                    expected_result_hash,
                                                    reset_session,
+                                                   false,
                                                    hidden_hc,
                                                    hidden_hc_bytes,
                                                    &kind,
@@ -3011,6 +3048,7 @@ static int dist_coordinator_eval_local_suffix(
         bool reset_session,
         const float *input_hc,
         uint32_t input_hc_bytes,
+        bool output_logits,
         float *logits,
         char *err,
         size_t errlen) {
@@ -3036,7 +3074,7 @@ static int dist_coordinator_eval_local_suffix(
                                         state->local_end,
                                         input_hc,
                                         NULL,
-                                        true,
+                                        output_logits,
                                         logits,
                                         err,
                                         errlen);
@@ -3110,6 +3148,7 @@ static int dist_coordinator_eval_span(
                                                    prefix_hash,
                                                    result_hash,
                                                    reset_session,
+                                                   false,
                                                    NULL,
                                                    0u,
                                                    &kind,
@@ -3133,6 +3172,7 @@ static int dist_coordinator_eval_span(
                                                         reset_session,
                                                         payload,
                                                         payload_bytes,
+                                                        true,
                                                         logits,
                                                         err,
                                                         errlen);
@@ -3703,6 +3743,15 @@ static void dist_prefill_reader_signal_progress(
     pthread_mutex_unlock(&reader->progress_mu);
 }
 
+static void dist_prefill_reader_note_received(
+        ds4_dist_prefill_result_reader *reader,
+        uint32_t received) {
+    pthread_mutex_lock(&reader->progress_mu);
+    if (received > reader->progress_received) reader->progress_received = received;
+    pthread_cond_broadcast(&reader->progress_cv);
+    pthread_mutex_unlock(&reader->progress_mu);
+}
+
 static void dist_prefill_reader_emit_progress(
         ds4_dist_prefill_result_reader *reader,
         uint32_t *reported) {
@@ -3753,7 +3802,7 @@ static bool dist_prefill_reader_wait_flow_window(
 
     for (;;) {
         pthread_mutex_lock(&reader->progress_mu);
-        const uint32_t completed = reader->progress_completed;
+        const uint32_t completed = reader->progress_received;
         const bool done = reader->progress_done;
         const bool has_room = submitted < completed + window;
         if (done || has_room) {
@@ -3767,6 +3816,142 @@ static bool dist_prefill_reader_wait_flow_window(
     }
 }
 
+static int dist_prefill_reverse_queue_init(
+        ds4_dist_prefill_result_reader *reader,
+        uint32_t slot_count,
+        char *err,
+        size_t errlen) {
+    if (!reader) return 1;
+    if (slot_count == 0) slot_count = 1;
+    reader->reverse_slots = calloc(slot_count, sizeof(reader->reverse_slots[0]));
+    if (!reader->reverse_slots) {
+        if (errlen) snprintf(err, errlen, "out of memory allocating reverse prefill queue");
+        return 1;
+    }
+    reader->reverse_slot_count = slot_count;
+    pthread_mutex_init(&reader->reverse_mu, NULL);
+    pthread_cond_init(&reader->reverse_can_enqueue, NULL);
+    pthread_cond_init(&reader->reverse_can_dequeue, NULL);
+    return 0;
+}
+
+static void dist_prefill_reverse_queue_destroy(ds4_dist_prefill_result_reader *reader) {
+    if (!reader) return;
+    if (reader->reverse_slots) {
+        for (uint32_t i = 0; i < reader->reverse_slot_count; i++) {
+            free(reader->reverse_slots[i].payload);
+        }
+        free(reader->reverse_slots);
+        reader->reverse_slots = NULL;
+    }
+    if (reader->reverse_slot_count != 0) {
+        pthread_cond_destroy(&reader->reverse_can_dequeue);
+        pthread_cond_destroy(&reader->reverse_can_enqueue);
+        pthread_mutex_destroy(&reader->reverse_mu);
+        reader->reverse_slot_count = 0;
+    }
+}
+
+static int dist_prefill_reverse_enqueue(
+        ds4_dist_prefill_result_reader *reader,
+        uint32_t chunk_index,
+        uint32_t pos,
+        uint32_t n_tokens,
+        bool reset_session,
+        bool output_logits,
+        void *payload,
+        uint32_t payload_bytes,
+        char *err,
+        size_t errlen) {
+    pthread_mutex_lock(&reader->reverse_mu);
+    while (reader->reverse_queued == reader->reverse_slot_count && reader->rc == 0) {
+        pthread_cond_wait(&reader->reverse_can_enqueue, &reader->reverse_mu);
+    }
+    if (reader->rc != 0) {
+        if (errlen) snprintf(err, errlen, "%s",
+                             reader->err[0] ? reader->err : "reverse prefill apply queue stopped");
+        pthread_mutex_unlock(&reader->reverse_mu);
+        return 1;
+    }
+    ds4_dist_prefill_reverse_slot *slot = &reader->reverse_slots[reader->reverse_tail];
+    slot->chunk_index = chunk_index;
+    slot->pos = pos;
+    slot->n_tokens = n_tokens;
+    slot->payload_bytes = payload_bytes;
+    slot->reset_session = reset_session;
+    slot->output_logits = output_logits;
+    slot->payload = payload;
+    reader->reverse_tail = (reader->reverse_tail + 1u) % reader->reverse_slot_count;
+    reader->reverse_queued++;
+    pthread_cond_signal(&reader->reverse_can_dequeue);
+    pthread_mutex_unlock(&reader->reverse_mu);
+    return 0;
+}
+
+static void dist_prefill_reverse_finish(ds4_dist_prefill_result_reader *reader) {
+    pthread_mutex_lock(&reader->reverse_mu);
+    reader->reverse_producer_done = true;
+    pthread_cond_broadcast(&reader->reverse_can_dequeue);
+    pthread_mutex_unlock(&reader->reverse_mu);
+}
+
+static void dist_prefill_reverse_cancel(ds4_dist_prefill_result_reader *reader) {
+    pthread_mutex_lock(&reader->reverse_mu);
+    reader->reverse_producer_done = true;
+    pthread_cond_broadcast(&reader->reverse_can_enqueue);
+    pthread_cond_broadcast(&reader->reverse_can_dequeue);
+    pthread_mutex_unlock(&reader->reverse_mu);
+}
+
+static void *dist_prefill_reverse_apply_main(void *arg) {
+    ds4_dist_prefill_result_reader *reader = arg;
+    for (;;) {
+        pthread_mutex_lock(&reader->reverse_mu);
+        while (reader->reverse_queued == 0 && !reader->reverse_producer_done && reader->rc == 0) {
+            pthread_cond_wait(&reader->reverse_can_dequeue, &reader->reverse_mu);
+        }
+        if (reader->rc != 0 || (reader->reverse_queued == 0 && reader->reverse_producer_done)) {
+            pthread_mutex_unlock(&reader->reverse_mu);
+            break;
+        }
+        ds4_dist_prefill_reverse_slot slot = reader->reverse_slots[reader->reverse_head];
+        memset(&reader->reverse_slots[reader->reverse_head], 0, sizeof(reader->reverse_slots[reader->reverse_head]));
+        reader->reverse_head = (reader->reverse_head + 1u) % reader->reverse_slot_count;
+        reader->reverse_queued--;
+        pthread_cond_signal(&reader->reverse_can_enqueue);
+        pthread_mutex_unlock(&reader->reverse_mu);
+
+        const double local_t0 = dist_now_sec();
+        int local_rc = dist_coordinator_eval_local_suffix(reader->state,
+                                                          reader->session,
+                                                          reader->prompt->v + slot.pos,
+                                                          slot.n_tokens,
+                                                          reader->progress_base + slot.pos,
+                                                          slot.reset_session,
+                                                          slot.payload,
+                                                          slot.payload_bytes,
+                                                          slot.output_logits,
+                                                          slot.output_logits ? reader->logits : NULL,
+                                                          reader->err,
+                                                          sizeof(reader->err));
+        const double local_t1 = dist_now_sec();
+        reader->local_eval_sec += local_t1 - local_t0;
+        free(slot.payload);
+        if (local_rc != 0) {
+            reader->rc = local_rc;
+            shutdown(reader->fd, SHUT_RDWR);
+            dist_prefill_reverse_cancel(reader);
+            dist_prefill_reader_signal_progress(reader, slot.chunk_index, true);
+            return NULL;
+        }
+        dist_prefill_reader_signal_progress(reader, slot.chunk_index + 1u, false);
+    }
+    if (reader->rc == 0) {
+        dist_prefill_reader_signal_progress(reader, reader->count, true);
+    }
+    return NULL;
+}
+
 static void *dist_prefill_result_reader_main(void *arg) {
     ds4_dist_prefill_result_reader *reader = arg;
     reader->rc = 0;
@@ -3775,6 +3960,19 @@ static void *dist_prefill_result_reader_main(void *arg) {
     reader->final_payload = NULL;
     reader->final_payload_bytes = 0;
     reader->local_eval_sec = 0.0;
+    reader->progress_received = 0;
+
+    pthread_t reverse_tid;
+    bool reverse_started = false;
+    if (reader->reverse_apply_local_suffix) {
+        if (pthread_create(&reverse_tid, NULL, dist_prefill_reverse_apply_main, reader) != 0) {
+            reader->rc = 1;
+            snprintf(reader->err, sizeof(reader->err), "failed to start reverse prefill apply worker");
+            dist_prefill_reader_signal_progress(reader, 0, true);
+            return NULL;
+        }
+        reverse_started = true;
+    }
 
     const uint32_t logits_bytes =
         (uint32_t)((uint64_t)ds4_engine_vocab_size(reader->state->engine) * sizeof(float));
@@ -3837,29 +4035,26 @@ static void *dist_prefill_result_reader_main(void *arg) {
             return NULL;
         }
         if (reader->reverse_apply_local_suffix) {
-            const uint32_t chunk_pos = reader->progress_base + pos0;
             const bool reset_session = reader->reset_first_chunk && i == 0;
-            const double local_t0 = dist_now_sec();
-            int local_rc = dist_coordinator_eval_local_suffix(reader->state,
-                                                              reader->session,
-                                                              reader->prompt->v + chunk_pos,
-                                                              chunk,
-                                                              chunk_pos,
-                                                              reset_session,
-                                                              payload,
-                                                              payload_bytes,
-                                                              reader->logits,
-                                                              reader->err,
-                                                              sizeof(reader->err));
-            const double local_t1 = dist_now_sec();
-            reader->local_eval_sec += local_t1 - local_t0;
-            if (local_rc != 0) {
-                reader->rc = local_rc;
+            const bool output_logits = final_chunk;
+            if (dist_prefill_reverse_enqueue(reader,
+                                             i,
+                                             pos0,
+                                             chunk,
+                                             reset_session,
+                                             output_logits,
+                                             payload,
+                                             payload_bytes,
+                                             reader->err,
+                                             sizeof(reader->err)) != 0) {
+                reader->rc = 1;
                 free(payload);
                 shutdown(reader->fd, SHUT_RDWR);
                 dist_prefill_reader_signal_progress(reader, i, true);
-                return NULL;
+                break;
             }
+            payload = NULL;
+            dist_prefill_reader_note_received(reader, i + 1u);
         } else if (final_chunk) {
             reader->final_kind = kind;
             reader->final_payload = payload;
@@ -3867,7 +4062,19 @@ static void *dist_prefill_result_reader_main(void *arg) {
             payload = NULL;
         }
         free(payload);
-        dist_prefill_reader_signal_progress(reader, i + 1u, final_chunk);
+        if (!reader->reverse_apply_local_suffix) {
+            dist_prefill_reader_note_received(reader, i + 1u);
+            dist_prefill_reader_signal_progress(reader, i + 1u, final_chunk);
+        }
+    }
+    if (reader->reverse_apply_local_suffix) {
+        dist_prefill_reverse_finish(reader);
+        if (reverse_started) pthread_join(reverse_tid, NULL);
+        if (reader->rc != 0) {
+            dist_prefill_reverse_cancel(reader);
+            dist_prefill_reader_signal_progress(reader, reader->progress_completed, true);
+        }
+        return NULL;
     }
     dist_prefill_reader_signal_progress(reader, reader->count, true);
     return NULL;
@@ -3916,7 +4123,20 @@ static int dist_coordinator_prefill_chunk_cap(
             return 1;
         }
     }
-    if (requested == 0) requested = prefill_cap;
+    if (requested == 0) {
+        requested = prefill_cap;
+        if (state &&
+            state->topology == DS4_DIST_TOPOLOGY_REVERSE &&
+            requested > 2048u) {
+            /* Reverse prefill has two serialized GPU stages: worker prefix and
+             * coordinator suffix. Extremely large chunks leave too much
+             * fill/drain overhead on the table, while tiny chunks drown in
+             * per-chunk launch cost. Keep the CLI/env override, but use a
+             * smaller default chunk on reverse routes so the pipeline has
+             * enough chunks to overlap. */
+            requested = 2048u;
+        }
+    }
     if (requested > prefill_cap) {
         if (errlen) {
             snprintf(err,
@@ -4045,8 +4265,16 @@ static int dist_coordinator_prefill_prompt_pipelined(
         (plan->entry[plan->count - 1u].flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) == 0;
     pthread_mutex_init(&reader.progress_mu, NULL);
     pthread_cond_init(&reader.progress_cv, NULL);
+    if (reader.reverse_apply_local_suffix &&
+        dist_prefill_reverse_queue_init(&reader, flow_window, err, errlen) != 0) {
+        pthread_cond_destroy(&reader.progress_cv);
+        pthread_mutex_destroy(&reader.progress_mu);
+        dist_prefill_sender_destroy(&sender);
+        return 1;
+    }
     reader.expected_hashes = calloc(chunk_count, sizeof(reader.expected_hashes[0]));
     if (!reader.expected_hashes) {
+        dist_prefill_reverse_queue_destroy(&reader);
         pthread_cond_destroy(&reader.progress_cv);
         pthread_mutex_destroy(&reader.progress_mu);
         dist_prefill_sender_destroy(&sender);
@@ -4067,6 +4295,7 @@ static int dist_coordinator_prefill_prompt_pipelined(
     pthread_t reader_tid;
     if (pthread_create(&reader_tid, NULL, dist_prefill_result_reader_main, &reader) != 0) {
         free(reader.expected_hashes);
+        dist_prefill_reverse_queue_destroy(&reader);
         pthread_cond_destroy(&reader.progress_cv);
         pthread_mutex_destroy(&reader.progress_mu);
         dist_prefill_sender_destroy(&sender);
@@ -4078,6 +4307,7 @@ static int dist_coordinator_prefill_prompt_pipelined(
         dist_prefill_sender_cancel(&sender);
         pthread_join(reader_tid, NULL);
         free(reader.expected_hashes);
+        dist_prefill_reverse_queue_destroy(&reader);
         pthread_cond_destroy(&reader.progress_cv);
         pthread_mutex_destroy(&reader.progress_mu);
         dist_prefill_sender_destroy(&sender);
@@ -4206,6 +4436,7 @@ static int dist_coordinator_prefill_prompt_pipelined(
         int reader_rc = reader.rc;
         free(reader.final_payload);
         free(reader.expected_hashes);
+        dist_prefill_reverse_queue_destroy(&reader);
         dist_prefill_sender_destroy(&sender);
         pthread_cond_destroy(&reader.progress_cv);
         pthread_mutex_destroy(&reader.progress_mu);
@@ -4213,6 +4444,7 @@ static int dist_coordinator_prefill_prompt_pipelined(
     }
     dist_prefill_sender_destroy(&sender);
     free(reader.expected_hashes);
+    dist_prefill_reverse_queue_destroy(&reader);
     pthread_cond_destroy(&reader.progress_cv);
     pthread_mutex_destroy(&reader.progress_mu);
     if (rc != 0) {
@@ -5392,6 +5624,242 @@ static int dist_kv_route_build_owners(
     return 0;
 }
 
+static bool dist_session_supports_local_decode(const ds4_dist_session *d) {
+    return d &&
+           d->state.local_decode_requested &&
+           d->state.topology == DS4_DIST_TOPOLOGY_REVERSE &&
+           d->state.local_has_output &&
+           d->state.local_start > 0u;
+}
+
+static int dist_session_activate_local_decode(
+        ds4_dist_session *d,
+        ds4_session *owner,
+        const ds4_tokens *tokens,
+        char *err,
+        size_t errlen) {
+    if (!d || !owner || !tokens || tokens->len <= 0) {
+        if (errlen) snprintf(err, errlen, "invalid local decode activation request");
+        return 1;
+    }
+    if (d->local_decode_active) return 0;
+    if (!dist_session_supports_local_decode(d)) {
+        if (errlen) snprintf(err, errlen, "distributed route does not support coordinator local decode");
+        return 1;
+    }
+    if (!d->plan_ready && dist_session_ensure_route(d, err, errlen) != 0) return 1;
+
+    const uint32_t owner_count = dist_kv_route_owner_count(d);
+    ds4_dist_kv_route_owner *owners = calloc(owner_count, sizeof(owners[0]));
+    if (!owners) {
+        if (errlen) snprintf(err, errlen, "out of memory activating coordinator local decode");
+        return 1;
+    }
+    if (dist_kv_route_build_owners(d, owners, owner_count, err, errlen) != 0) {
+        free(owners);
+        return 1;
+    }
+
+    const uint64_t token_hash = dist_token_hash_prefix(tokens->v, (uint32_t)tokens->len);
+    const double t0 = dist_now_sec();
+    for (uint32_t i = 0; i < owner_count; i++) {
+        const ds4_dist_kv_route_owner *owner_desc = &owners[i];
+        if (owner_desc->is_local) continue;
+        FILE *tmp = dist_tmpfile_or_err("coordinator local-decode shard", err, errlen);
+        if (!tmp) {
+            free(owners);
+            return 1;
+        }
+        uint64_t shard_bytes = 0;
+        int rc = dist_save_remote_shard_to_file(d,
+                                                owner_desc->entry,
+                                                tokens,
+                                                token_hash,
+                                                tmp,
+                                                &shard_bytes,
+                                                err,
+                                                errlen);
+        if (rc == 0 && shard_bytes != 0) {
+            rc = dist_rewind_file(tmp, "coordinator local-decode shard", err, errlen);
+        }
+        if (rc == 0) {
+            rc = ds4_session_load_layer_payload(owner,
+                                                tmp,
+                                                shard_bytes,
+                                                tokens->v,
+                                                (uint32_t)tokens->len,
+                                                owner_desc->layer_start,
+                                                owner_desc->layer_end,
+                                                err,
+                                                errlen);
+        }
+        fclose(tmp);
+        if (rc != 0) {
+            free(owners);
+            return 1;
+        }
+    }
+    free(owners);
+    d->local_decode_active = true;
+    d->local_decode_remote_flushable = true;
+    d->local_decode_remote_pos = (uint32_t)tokens->len;
+    DIST_COORD_DEBUG(&d->state,
+                     "ds4: distributed coordinator: activated reverse-topology local decode tokens=%d local=%u:%u total=%.3fs\n",
+                     tokens->len,
+                     d->state.local_start,
+                     d->state.local_end,
+                     dist_now_sec() - t0);
+    return 0;
+}
+
+static int dist_session_restore_distributed_checkpoint(
+        ds4_dist_session *d,
+        ds4_session *owner,
+        const ds4_tokens *checkpoint,
+        float *logits,
+        char *err,
+        size_t errlen) {
+    if (!d || !owner || !checkpoint || checkpoint->len <= 0 || !logits) {
+        if (errlen) snprintf(err, errlen, "invalid distributed checkpoint restore request");
+        return 1;
+    }
+    if (!d->local_decode_active) return 0;
+    if (dist_coordinator_rebuild_from_transcript(&d->state,
+                                                 owner,
+                                                 &d->plan,
+                                                 checkpoint,
+                                                 d->session_id,
+                                                 &d->request_id,
+                                                 logits,
+                                                 &d->plan_generation,
+                                                 false,
+                                                 err,
+                                                 errlen) != 0) {
+        char rebuild_err[256];
+        snprintf(rebuild_err,
+                 sizeof(rebuild_err),
+                 "%s",
+                 err && err[0] ? err : "distributed checkpoint replay failed");
+        if (dist_coordinator_rebuild_from_transcript(&d->state,
+                                                     owner,
+                                                     &d->plan,
+                                                     checkpoint,
+                                                     d->session_id,
+                                                     &d->request_id,
+                                                     logits,
+                                                     &d->plan_generation,
+                                                     true,
+                                                     err,
+                                                     errlen) != 0) {
+            if (errlen && (!err || !err[0])) {
+                snprintf(err, errlen, "%s", rebuild_err);
+            }
+            d->plan_ready = false;
+            d->plan_generation = 0;
+            return 1;
+        }
+    }
+    d->plan_ready = true;
+    d->local_decode_active = false;
+    d->local_decode_remote_flushable = false;
+    d->local_decode_remote_pos = 0;
+    DIST_COORD_DEBUG(&d->state,
+                     "ds4: distributed coordinator: restored distributed checkpoint from local decode transcript tokens=%d\n",
+                     checkpoint->len);
+    return 0;
+}
+
+static int dist_session_flush_local_decode_remote(
+        ds4_dist_session *d,
+        ds4_session *owner,
+        char *err,
+        size_t errlen) {
+    if (!d || !owner) {
+        if (errlen) snprintf(err, errlen, "invalid local decode remote flush request");
+        return 1;
+    }
+    if (!d->local_decode_active || !d->local_decode_remote_flushable) {
+        if (errlen) snprintf(err, errlen, "local decode remote flush is inactive");
+        return 1;
+    }
+    if (d->state.topology != DS4_DIST_TOPOLOGY_REVERSE || d->plan.count == 0) {
+        if (errlen) snprintf(err, errlen, "local decode remote flush requires a reverse remote prefix route");
+        return 1;
+    }
+    const int remote_fd = d->plan.entry[0].fd;
+    if (remote_fd < 0) {
+        if (errlen) snprintf(err, errlen, "reverse distributed route has no live remote prefix worker");
+        return 1;
+    }
+
+    const ds4_tokens *timeline = ds4_session_tokens(owner);
+    if (!timeline || timeline->len < 0 || (uint64_t)timeline->len > UINT32_MAX) {
+        if (errlen) snprintf(err, errlen, "local decode remote flush has no valid token timeline");
+        return 1;
+    }
+    const uint32_t token_count = (uint32_t)timeline->len;
+    if (d->local_decode_remote_pos > token_count) {
+        if (errlen) snprintf(err, errlen, "local decode remote flush position exceeds current transcript");
+        return 1;
+    }
+
+    uint32_t chunk_cap = 0;
+    if (dist_coordinator_prefill_chunk_cap(&d->state, owner, &chunk_cap, err, errlen) != 0) {
+        return 1;
+    }
+
+    uint32_t pos = d->local_decode_remote_pos;
+    while (pos < token_count) {
+        const uint32_t remaining = token_count - pos;
+        const uint32_t chunk = remaining < chunk_cap ? remaining : chunk_cap;
+        uint64_t prefix_hash = 0;
+        if (dist_session_token_hash_prefix(owner, pos, &prefix_hash, err, errlen) != 0) {
+            return 1;
+        }
+        const uint64_t result_hash =
+            dist_token_hash_update_span(prefix_hash, timeline->v + pos, chunk);
+        uint32_t kind = 0, payload_bytes = 0;
+        int rc = dist_coordinator_request_remote_on_fd(&d->state,
+                                                       &d->plan,
+                                                       remote_fd,
+                                                       timeline->v + pos,
+                                                       chunk,
+                                                       pos,
+                                                       d->session_id,
+                                                       d->request_id++,
+                                                       prefix_hash,
+                                                       result_hash,
+                                                       false,
+                                                       true,
+                                                       NULL,
+                                                       0u,
+                                                       &kind,
+                                                       NULL,
+                                                       &payload_bytes,
+                                                       err,
+                                                       errlen);
+        if (rc != 0) return rc;
+        if (kind != DS4_DIST_RESULT_ACK || payload_bytes != 0) {
+            if (errlen) snprintf(err, errlen, "unexpected local decode remote flush result");
+            return 1;
+        }
+        pos += chunk;
+    }
+    d->local_decode_remote_pos = token_count;
+    return 0;
+}
+
+static int dist_session_eval_local_decode_token(
+        ds4_session *owner,
+        int token,
+        char *err,
+        size_t errlen) {
+    if (ds4_session_eval_local_only(owner, token, err, errlen) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
 static void dist_kv_shards_close(ds4_dist_kv_shard_file *shards, uint32_t count) {
     if (!shards) return;
     for (uint32_t i = 0; i < count; i++) {
@@ -5574,7 +6042,8 @@ int ds4_dist_session_save_payload(
         if (errlen) snprintf(err, errlen, "invalid distributed payload save");
         return 1;
     }
-    if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
+    if (!d->local_decode_active &&
+        dist_session_ensure_route(d, err, errlen) != 0) return 1;
     const uint32_t shard_count = dist_kv_route_owner_count(d);
     ds4_dist_kv_route_owner *owners = calloc(shard_count, sizeof(owners[0]));
     if (!owners) {
@@ -5631,7 +6100,7 @@ int ds4_dist_session_save_payload(
         const uint32_t layer_end = owner_desc->layer_end;
         shards[shard].fp = dist_tmpfile_or_err("distributed KV shard", err, errlen);
         if (!shards[shard].fp) goto cleanup;
-        if (owner_desc->is_local) {
+        if (owner_desc->is_local || d->local_decode_active) {
             if (ds4_session_save_layer_payload(owner, shards[shard].fp,
                                                layer_start, layer_end,
                                                err, errlen) != 0)
@@ -5947,6 +6416,7 @@ int ds4_dist_session_create(
     d->state.topology = topology;
     d->state.local_has_output = opt->layers.has_output;
     d->state.local_can_output_head = ds4_engine_has_output_head(engine);
+    d->state.local_decode_requested = opt->local_decode;
     d->state.replay_check = opt->replay_check;
     d->state.debug = opt->debug;
     d->state.use_control_for_work = true;
@@ -5960,6 +6430,9 @@ int ds4_dist_session_create(
      * WORK results are outstanding.  Keep them out of the WORK request-id stream
      * so progress callbacks cannot perturb the reader's contiguous expectations. */
     d->snapshot_request_id = UINT64_C(1) << 63;
+    d->local_decode_active = false;
+    d->local_decode_remote_flushable = false;
+    d->local_decode_remote_pos = 0;
 
     char local_end[32];
     if (opt->layers.has_output) snprintf(local_end, sizeof(local_end), "output");
@@ -6035,6 +6508,44 @@ int ds4_dist_session_sync(
     if (!d || !owner || !prompt || prompt->len <= 0 || !logits) {
         if (errlen) snprintf(err, errlen, "invalid distributed sync request");
         return 1;
+    }
+    if (d->local_decode_active) {
+        if (checkpoint &&
+            checkpoint->len >= 0 &&
+            checkpoint->len <= prompt->len &&
+            ds4_tokens_starts_with(prompt, checkpoint)) {
+            if (checkpoint->len == prompt->len) return 0;
+            const uint64_t plan_generation = d->plan_generation;
+            if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
+            if (d->local_decode_remote_flushable &&
+                d->plan_generation == plan_generation &&
+                dist_session_flush_local_decode_remote(d, owner, err, errlen) == 0) {
+                d->local_decode_active = false;
+                d->local_decode_remote_flushable = false;
+                d->local_decode_remote_pos = 0;
+            } else {
+                if (d->local_decode_remote_flushable) {
+                    DIST_COORD_DEBUG(&d->state,
+                                     "ds4: distributed coordinator: deferred local decode flush failed; rebuilding worker KV from transcript: %s\n",
+                                     err && err[0] ? err : "route changed");
+                }
+                d->local_decode_remote_flushable = false;
+                d->local_decode_remote_pos = 0;
+                if (errlen) err[0] = '\0';
+                if (dist_session_restore_distributed_checkpoint(d,
+                                                                owner,
+                                                                checkpoint,
+                                                                logits,
+                                                                err,
+                                                                errlen) != 0) {
+                    return 1;
+                }
+            }
+        } else {
+            d->local_decode_active = false;
+            d->local_decode_remote_flushable = false;
+            d->local_decode_remote_pos = 0;
+        }
     }
     if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
 
@@ -6168,6 +6679,15 @@ int ds4_dist_session_eval(
     if (!d || !owner || !checkpoint || checkpoint->len < 0 || !logits) {
         if (errlen) snprintf(err, errlen, "invalid distributed decode request");
         return 1;
+    }
+    if (d->local_decode_active) {
+        return dist_session_eval_local_decode_token(owner, token, err, errlen);
+    }
+    if (dist_session_supports_local_decode(d)) {
+        if (dist_session_activate_local_decode(d, owner, checkpoint, err, errlen) != 0) {
+            return 1;
+        }
+        return dist_session_eval_local_decode_token(owner, token, err, errlen);
     }
     if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
 
@@ -8673,6 +9193,9 @@ void ds4_dist_usage(FILE *fp) {
         "      Coordinator TCP listen address. Workers may later use it to force their data listener.\n"
         "  --coordinator HOST PORT\n"
         "      Coordinator TCP address for --role worker.\n"
+        "  --local-decode\n"
+        "      Coordinator-only opt-in: keep a reverse --layers N:output coordinator\n"
+        "      fully resident and switch to local decode after distributed prefill.\n"
         "  --dist-prefill-chunk N\n"
         "      Coordinator prefill pipeline chunk size. Default: session cap, normally 4096.\n"
         "      Non-default values are experimental and can change logits unless validated.\n"
@@ -8758,6 +9281,14 @@ ds4_dist_cli_parse_result ds4_dist_parse_cli_arg(
         opt->coordinator_host = host;
         return DS4_DIST_CLI_MATCHED;
     }
+    if (!strcmp(arg, "--local-decode")) {
+        if (!opt) {
+            if (errlen) snprintf(err, errlen, "missing distributed options");
+            return DS4_DIST_CLI_ERROR;
+        }
+        opt->local_decode = true;
+        return DS4_DIST_CLI_MATCHED;
+    }
     if (!strcmp(arg, "--dist-prefill-chunk")) {
         if (!opt) {
             if (errlen) snprintf(err, errlen, "missing distributed options");
@@ -8833,6 +9364,7 @@ static int dist_validate_options(const ds4_dist_options *opt, char *err, size_t 
         if (opt->layers.set || opt->listen_host || opt->listen_port ||
             opt->coordinator_host || opt->coordinator_port ||
             opt->prefill_chunk != 0 || opt->prefill_window != 0 ||
+            opt->local_decode ||
             opt->activation_bits != 0) {
             if (errlen) snprintf(err, errlen, "distributed options require --role coordinator or --role worker");
             return 1;
@@ -8854,6 +9386,15 @@ static int dist_validate_options(const ds4_dist_options *opt, char *err, size_t 
     }
 
     if (opt->role == DS4_DISTRIBUTED_COORDINATOR) {
+        if (opt->local_decode &&
+            (!opt->layers.has_output || opt->layers.start == 0u)) {
+            if (errlen) {
+                snprintf(err,
+                         errlen,
+                         "--local-decode requires reverse --role coordinator --layers N:output");
+            }
+            return 1;
+        }
         if (!opt->listen_host || opt->listen_port <= 0) {
             if (errlen) snprintf(err, errlen, "--role coordinator requires --listen HOST PORT");
             return 1;
@@ -8866,6 +9407,14 @@ static int dist_validate_options(const ds4_dist_options *opt, char *err, size_t 
     }
 
     if (opt->role == DS4_DISTRIBUTED_WORKER) {
+        if (opt->local_decode) {
+            if (errlen) {
+                snprintf(err,
+                         errlen,
+                         "--local-decode requires --role coordinator");
+            }
+            return 1;
+        }
         if (!opt->coordinator_host || opt->coordinator_port <= 0) {
             if (errlen) snprintf(err, errlen, "--role worker requires --coordinator HOST PORT");
             return 1;
@@ -8902,10 +9451,18 @@ int ds4_dist_prepare_engine_options(
     if (engine && opt) {
         engine->distributed = *opt;
         if (ds4_dist_enabled(opt)) {
-            engine->load_slice = true;
-            engine->load_layer_start = opt->layers.start;
-            engine->load_layer_end = opt->layers.has_output ? UINT32_MAX : opt->layers.end;
-            engine->load_output = opt->layers.has_output;
+            const bool reverse_coordinator_full_resident =
+                opt->role == DS4_DISTRIBUTED_COORDINATOR &&
+                opt->local_decode &&
+                opt->layers.set &&
+                opt->layers.has_output &&
+                opt->layers.start > 0u;
+            if (!reverse_coordinator_full_resident) {
+                engine->load_slice = true;
+                engine->load_layer_start = opt->layers.start;
+                engine->load_layer_end = opt->layers.has_output ? UINT32_MAX : opt->layers.end;
+                engine->load_output = opt->layers.has_output;
+            }
         }
     }
     return 0;

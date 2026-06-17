@@ -409,6 +409,16 @@ output locally. For example:
 Reverse `K:42` is intentionally unsupported. Reverse mode only supports
 `K:output`, because the coordinator must own the output head.
 
+You can also start the coordinator owning `K:output` layers with `--local-decode`.
+In that mode the route still does distributed prefill, but after prefill the worker
+pushes its KV shard to the coordinator, the coordinator finishes generation locally
+using full model residency. This hand-off keeps the distributed prefill speedup while
+moving decode back onto one machine and gaining decode speed.
+
+For example, using M5 Max 128GB as the coordinator with `--layers 22:output --local-decode`
+and running DGX Spark as a worker with `--layers 0:21` over 2.5GbE direct link provides
+`prefill: 602.78 t/s, generation: 30.10 t/s`.
+
 ### Network Link Comparison
 
 The table below shows the same two M5 Max hosts, the same 91 GB Flash quant,

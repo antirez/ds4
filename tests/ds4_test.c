@@ -2189,6 +2189,13 @@ static ds4_dist_options test_dist_options(
     opt.layers.end = end;
     opt.layers.has_output = has_output;
     opt.layers.set = true;
+    if (role == DS4_DISTRIBUTED_COORDINATOR) {
+        opt.listen_host = "127.0.0.1";
+        opt.listen_port = 1234;
+    } else if (role == DS4_DISTRIBUTED_WORKER) {
+        opt.coordinator_host = "127.0.0.1";
+        opt.coordinator_port = 1234;
+    }
     return opt;
 }
 
@@ -2231,22 +2238,56 @@ static ds4_dist_worker_entry *test_dist_worker(
 static void test_distributed_topology_logic_group(void) {
     char err[256];
     int topology = -1;
+    ds4_engine_options engine_opt;
 
     ds4_dist_options forward = test_dist_options(DS4_DISTRIBUTED_COORDINATOR, 0, 19, false);
     TEST_ASSERT(ds4_dist_test_validate_coordinator_layers(&forward, 43, err, sizeof(err)) == 0);
     TEST_ASSERT(ds4_dist_test_infer_coordinator_topology(&forward, 43, &topology, err, sizeof(err)) == 0);
     TEST_ASSERT(topology == 0);
+    memset(&engine_opt, 0, sizeof(engine_opt));
+    TEST_ASSERT(ds4_dist_prepare_engine_options(&forward, &engine_opt, err, sizeof(err)) == 0);
+    TEST_ASSERT(engine_opt.load_slice);
+    TEST_ASSERT(engine_opt.load_layer_start == 0u);
+    TEST_ASSERT(engine_opt.load_layer_end == 19u);
+    TEST_ASSERT(!engine_opt.load_output);
 
     ds4_dist_options reverse = test_dist_options(DS4_DISTRIBUTED_COORDINATOR, 20, 0, true);
     TEST_ASSERT(ds4_dist_test_validate_coordinator_layers(&reverse, 43, err, sizeof(err)) == 0);
     TEST_ASSERT(ds4_dist_test_infer_coordinator_topology(&reverse, 43, &topology, err, sizeof(err)) == 0);
     TEST_ASSERT(topology == 1);
+    memset(&engine_opt, 0, sizeof(engine_opt));
+    TEST_ASSERT(ds4_dist_prepare_engine_options(&reverse, &engine_opt, err, sizeof(err)) == 0);
+    TEST_ASSERT(engine_opt.load_slice);
+    TEST_ASSERT(engine_opt.load_layer_start == 20u);
+    TEST_ASSERT(engine_opt.load_layer_end == UINT32_MAX);
+    TEST_ASSERT(engine_opt.load_output);
+    TEST_ASSERT(engine_opt.prefill_chunk == 0u);
+    TEST_ASSERT(engine_opt.distributed.prefill_chunk == 0u);
+
+    reverse.local_decode = true;
+    memset(&engine_opt, 0, sizeof(engine_opt));
+    TEST_ASSERT(ds4_dist_prepare_engine_options(&reverse, &engine_opt, err, sizeof(err)) == 0);
+    TEST_ASSERT(!engine_opt.load_slice);
+    TEST_ASSERT(!engine_opt.load_output);
+    TEST_ASSERT(engine_opt.prefill_chunk == 0u);
+    TEST_ASSERT(engine_opt.distributed.prefill_chunk == 0u);
 
     ds4_dist_options reverse_partial = test_dist_options(DS4_DISTRIBUTED_COORDINATOR, 20, 42, false);
     TEST_ASSERT(ds4_dist_test_validate_coordinator_layers(&reverse_partial, 43, err, sizeof(err)) != 0);
 
     ds4_dist_options middle = test_dist_options(DS4_DISTRIBUTED_COORDINATOR, 5, 10, false);
     TEST_ASSERT(ds4_dist_test_validate_coordinator_layers(&middle, 43, err, sizeof(err)) != 0);
+
+    ds4_dist_options worker = test_dist_options(DS4_DISTRIBUTED_WORKER, 0, 19, false);
+    memset(&engine_opt, 0, sizeof(engine_opt));
+    TEST_ASSERT(ds4_dist_prepare_engine_options(&worker, &engine_opt, err, sizeof(err)) == 0);
+    TEST_ASSERT(engine_opt.load_slice);
+    TEST_ASSERT(engine_opt.load_layer_start == 0u);
+    TEST_ASSERT(engine_opt.load_layer_end == 19u);
+
+    worker.local_decode = true;
+    memset(&engine_opt, 0, sizeof(engine_opt));
+    TEST_ASSERT(ds4_dist_prepare_engine_options(&worker, &engine_opt, err, sizeof(err)) != 0);
 
     ds4_dist_coordinator_state state;
     memset(&state, 0, sizeof(state));

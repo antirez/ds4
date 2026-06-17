@@ -87,6 +87,7 @@ typedef struct {
     uint32_t prefill_chunk;
     uint32_t prefill_window;
     uint32_t activation_bits;
+    bool local_decode;
     bool replay_check;
     bool debug;
 } ds4_distributed_options;
@@ -261,6 +262,11 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
+/* Internal runtime helper: run the normal local eval path even if the session
+ * still carries a distributed coordinator attachment. Frontends should keep
+ * using ds4_session_eval(); ds4_distributed.c uses this helper once
+ * coordinator-owned reverse-topology local decode is active. */
+int ds4_session_eval_local_only(ds4_session *s, int token, char *err, size_t errlen);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
