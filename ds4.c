@@ -76,6 +76,28 @@ static bool ds4_backend_uses_graph(ds4_backend backend) {
     return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA;
 }
 
+static bool ds4_backend_supports_ssd_streaming(ds4_backend backend) {
+    if (backend == DS4_BACKEND_METAL) return true;
+    if (backend == DS4_BACKEND_CUDA) {
+#if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))
+        return true;
+#else
+        return false;
+#endif
+    }
+    return false;
+}
+
+static bool ds4_backend_supports_streaming_auto_cache(ds4_backend backend) {
+    if (backend == DS4_BACKEND_METAL) return true;
+#ifdef DS4_ROCM_BUILD
+    if (backend == DS4_BACKEND_CUDA) return true;
+#else
+    (void)backend;
+#endif
+    return false;
+}
+
 /* =========================================================================
  * DeepSeek V4 Shape Profiles.
  * =========================================================================
@@ -3223,6 +3245,79 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t) {
     return (t->dim[0] / QK_K) * routed_expert_block_bytes(t->type);
 }
 
+static bool streaming_layer_routed_expert_bytes(
+        const ds4_layer_weights *layer,
+        uint64_t               *per_expert_bytes_out) {
+    if (per_expert_bytes_out) *per_expert_bytes_out = 0;
+    if (!layer ||
+        !per_expert_bytes_out ||
+        !layer->ffn_gate_exps ||
+        !layer->ffn_up_exps ||
+        !layer->ffn_down_exps) {
+        return false;
+    }
+
+    const uint64_t gate_row_bytes =
+        routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t up_row_bytes =
+        routed_expert_row_bytes(layer->ffn_up_exps);
+    const uint64_t down_row_bytes =
+        routed_expert_row_bytes(layer->ffn_down_exps);
+    if (layer->ffn_gate_exps->dim[1] > UINT64_MAX / gate_row_bytes ||
+        layer->ffn_up_exps->dim[1] > UINT64_MAX / up_row_bytes ||
+        layer->ffn_down_exps->dim[1] > UINT64_MAX / down_row_bytes) {
+        return false;
+    }
+
+    const uint64_t gate_expert_bytes =
+        layer->ffn_gate_exps->dim[1] * gate_row_bytes;
+    const uint64_t up_expert_bytes =
+        layer->ffn_up_exps->dim[1] * up_row_bytes;
+    const uint64_t down_expert_bytes =
+        layer->ffn_down_exps->dim[1] * down_row_bytes;
+    if (gate_expert_bytes > UINT64_MAX - up_expert_bytes ||
+        gate_expert_bytes + up_expert_bytes >
+            UINT64_MAX - down_expert_bytes) {
+        return false;
+    }
+
+    const uint64_t per_expert_bytes =
+        gate_expert_bytes + up_expert_bytes + down_expert_bytes;
+    if (per_expert_bytes == 0) return false;
+    *per_expert_bytes_out = per_expert_bytes;
+    return true;
+}
+
+static DS4_MAYBE_UNUSED bool streaming_layer_gate_down_expert_bytes(
+        const ds4_layer_weights *layer,
+        uint64_t               *gate_expert_bytes,
+        uint64_t               *down_expert_bytes) {
+    if (gate_expert_bytes) *gate_expert_bytes = 0;
+    if (down_expert_bytes) *down_expert_bytes = 0;
+    if (!layer ||
+        !gate_expert_bytes ||
+        !down_expert_bytes ||
+        !layer->ffn_gate_exps ||
+        !layer->ffn_down_exps) {
+        return false;
+    }
+
+    const uint64_t gate_row_bytes =
+        routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t down_row_bytes =
+        routed_expert_row_bytes(layer->ffn_down_exps);
+    if (gate_row_bytes == 0 ||
+        down_row_bytes == 0 ||
+        layer->ffn_gate_exps->dim[1] > UINT64_MAX / gate_row_bytes ||
+        layer->ffn_down_exps->dim[1] > UINT64_MAX / down_row_bytes) {
+        return false;
+    }
+
+    *gate_expert_bytes = layer->ffn_gate_exps->dim[1] * gate_row_bytes;
+    *down_expert_bytes = layer->ffn_down_exps->dim[1] * down_row_bytes;
+    return *gate_expert_bytes != 0 && *down_expert_bytes != 0;
+}
+
 static bool ds4_streaming_routed_expert_bytes(
         const ds4_weights *weights,
         uint64_t          *per_expert_bytes_out) {
@@ -3230,44 +3325,32 @@ static bool ds4_streaming_routed_expert_bytes(
     if (!weights || !per_expert_bytes_out) return false;
 
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const ds4_layer_weights *layer = &weights->layer[il];
-        if (!layer->ffn_gate_exps ||
-            !layer->ffn_up_exps ||
-            !layer->ffn_down_exps) {
-            continue;
+        if (streaming_layer_routed_expert_bytes(&weights->layer[il],
+                                                per_expert_bytes_out)) {
+            return true;
         }
-
-        const uint64_t gate_row_bytes =
-            routed_expert_row_bytes(layer->ffn_gate_exps);
-        const uint64_t up_row_bytes =
-            routed_expert_row_bytes(layer->ffn_up_exps);
-        const uint64_t down_row_bytes =
-            routed_expert_row_bytes(layer->ffn_down_exps);
-        if (layer->ffn_gate_exps->dim[1] > UINT64_MAX / gate_row_bytes ||
-            layer->ffn_up_exps->dim[1] > UINT64_MAX / up_row_bytes ||
-            layer->ffn_down_exps->dim[1] > UINT64_MAX / down_row_bytes) {
-            return false;
-        }
-
-        const uint64_t gate_expert_bytes =
-            layer->ffn_gate_exps->dim[1] * gate_row_bytes;
-        const uint64_t up_expert_bytes =
-            layer->ffn_up_exps->dim[1] * up_row_bytes;
-        const uint64_t down_expert_bytes =
-            layer->ffn_down_exps->dim[1] * down_row_bytes;
-        if (gate_expert_bytes > UINT64_MAX - up_expert_bytes ||
-            gate_expert_bytes + up_expert_bytes >
-                UINT64_MAX - down_expert_bytes) {
-            return false;
-        }
-
-        const uint64_t per_expert_bytes =
-            gate_expert_bytes + up_expert_bytes + down_expert_bytes;
-        if (per_expert_bytes == 0) return false;
-        *per_expert_bytes_out = per_expert_bytes;
-        return true;
     }
     return false;
+}
+
+/*
+ * Mixed-precision ("boosted") GGUFs upcast a few layers' routed experts to a
+ * bigger quant (e.g. Q4_K among IQ2 layers). The streaming expert cache is a
+ * single-size-class slab allocator sized from the FIRST routed layer, so those
+ * layers can never be served from it: they must read expert weights through the
+ * mapped-model views instead. A layer is "uniform" iff its per-expert bytes
+ * match the slab class.
+ */
+static DS4_MAYBE_UNUSED bool weights_streaming_layer_experts_uniform(
+        const ds4_weights *w,
+        uint32_t           il) {
+    uint64_t base = 0;
+    uint64_t bytes = 0;
+    if (!w || il >= DS4_N_LAYER) return true;
+    const ds4_layer_weights *l = &w->layer[il];
+    if (!streaming_layer_routed_expert_bytes(l, &bytes)) return true;
+    if (!ds4_streaming_routed_expert_bytes(w, &base)) return true;
+    return bytes == base;
 }
 
 static uint32_t ds4_streaming_cache_experts_for_byte_budget(
@@ -3284,6 +3367,29 @@ static uint32_t ds4_streaming_cache_experts_for_byte_budget(
     if (per_expert_bytes_out) *per_expert_bytes_out = per_expert_bytes;
     return ds4_ssd_cache_experts_for_byte_budget(bytes, per_expert_bytes);
 }
+
+#ifndef DS4_NO_GPU
+static ds4_gpu_stream_expert_table graph_stream_expert_table_make(
+        const ds4_model         *model,
+        const ds4_layer_weights *layer,
+        uint32_t                 il,
+        uint64_t                 gate_expert_bytes,
+        uint64_t                 down_expert_bytes) {
+    ds4_gpu_stream_expert_table table;
+    memset(&table, 0, sizeof(table));
+    if (!model || !layer) return table;
+    table.model_map = model->map;
+    table.model_size = model->size;
+    table.layer = il;
+    table.n_total_expert = DS4_N_EXPERT;
+    table.gate_offset = layer->ffn_gate_exps ? layer->ffn_gate_exps->abs_offset : 0;
+    table.up_offset = layer->ffn_up_exps ? layer->ffn_up_exps->abs_offset : 0;
+    table.down_offset = layer->ffn_down_exps ? layer->ffn_down_exps->abs_offset : 0;
+    table.gate_expert_bytes = gate_expert_bytes;
+    table.down_expert_bytes = down_expert_bytes;
+    return table;
+}
+#endif
 
 static uint64_t ds4_streaming_manual_cache_safe_bytes(void) {
 #ifdef DS4_NO_GPU
@@ -4157,6 +4263,28 @@ static void model_map_span_vec_include_layer_decode_static(ds4_model_map_span_ve
 #undef DS4_INCLUDE_TENSOR
 }
 
+/*
+ * Decode-time spans for one layer. The static set excludes routed expert
+ * tensors because the streaming expert cache serves them — but a boosted
+ * layer (per-expert bytes != the global slab class) can never be cached, and
+ * both the selected-addr prefill fallback and the decode no-cache fallback
+ * read its experts through ds4_gpu_wrap_model_range / wrap_model_exact_range
+ * over the model map. Include its exps tensors so those reads are covered.
+ * Uniform models add nothing here (byte-identical behavior).
+ */
+static void model_map_span_vec_include_layer_decode(
+        ds4_model_map_span_vec *spans,
+        const ds4_weights      *w,
+        uint32_t                il) {
+    const ds4_layer_weights *l = &w->layer[il];
+    model_map_span_vec_include_layer_decode_static(spans, l);
+    if (!weights_streaming_layer_experts_uniform(w, il)) {
+        model_map_span_vec_include_one(spans, l->ffn_gate_exps);
+        model_map_span_vec_include_one(spans, l->ffn_up_exps);
+        model_map_span_vec_include_one(spans, l->ffn_down_exps);
+    }
+}
+
 static void model_map_span_vec_include_output(ds4_model_map_span_vec *spans, const ds4_weights *w) {
     model_map_span_vec_include_one(spans, w->output_hc_base);
     model_map_span_vec_include_one(spans, w->output_hc_fn);
@@ -4220,7 +4348,7 @@ static DS4_MAYBE_UNUSED bool weights_model_map_decode_layer_spans(
         ds4_model_map_span_vec *spans) {
     if (!w || !spans || il >= DS4_N_LAYER) return false;
     memset(spans, 0, sizeof(*spans));
-    model_map_span_vec_include_layer_decode_static(spans, &w->layer[il]);
+    model_map_span_vec_include_layer_decode(spans, w, il);
     return model_map_span_vec_finish(spans);
 }
 
@@ -4233,7 +4361,7 @@ static DS4_MAYBE_UNUSED bool weights_model_map_decode_static_spans(
     memset(spans, 0, sizeof(*spans));
     if (include_token) model_map_span_vec_include_one(spans, w->token_embd);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        model_map_span_vec_include_layer_decode_static(spans, &w->layer[il]);
+        model_map_span_vec_include_layer_decode(spans, w, il);
     }
     if (include_output) model_map_span_vec_include_output(spans, w);
     return model_map_span_vec_finish(spans);
@@ -4254,7 +4382,7 @@ static DS4_MAYBE_UNUSED bool weights_model_map_decode_static_slice_spans(
     memset(spans, 0, sizeof(*spans));
     if (include_token) model_map_span_vec_include_one(spans, w->token_embd);
     for (uint32_t il = layer_start; il <= layer_end; il++) {
-        model_map_span_vec_include_layer_decode_static(spans, &w->layer[il]);
+        model_map_span_vec_include_layer_decode(spans, w, il);
     }
     if (include_output) model_map_span_vec_include_output(spans, w);
     return model_map_span_vec_finish(spans);
@@ -8216,11 +8344,7 @@ static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
                 cap = (uint32_t)v;
             }
         } else if (prompt_len > 4096) {
-#ifdef DS4_ROCM_BUILD
-            cap = 8192u;
-#else
             cap = DS4_MODEL_VARIANT == DS4_VARIANT_PRO ? 8192u : 4096u;
-#endif
         }
     }
 
@@ -11447,6 +11571,10 @@ static uint32_t metal_graph_stream_prefill_batch_selected_addr_auto_max(void) {
             return (uint32_t)v;
         }
     }
+#ifdef DS4_ROCM_BUILD
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_PRO ||
+        DS4_MODEL_VARIANT == DS4_VARIANT_FLASH) return UINT32_MAX;
+#endif
     if (DS4_MODEL_VARIANT == DS4_VARIANT_PRO) return 800u;
     if (DS4_MODEL_VARIANT == DS4_VARIANT_FLASH) return 760u;
     return 0;
@@ -11503,6 +11631,289 @@ static bool metal_graph_stream_prefill_batch_selected_addr_enabled(
         metal_graph_stream_prefill_batch_selected_addr_auto_min();
     return max_tokens != 0 && n_tokens >= min_tokens && n_tokens <= max_tokens;
 }
+
+static bool metal_graph_cuda_stream_prefill_batch_selected_addr_enabled(
+        const ds4_gpu_graph *g,
+        const ds4_weights   *weights,
+        uint32_t             n_tokens) {
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    if (!g ||
+        !g->ssd_streaming ||
+        g->quality ||
+        !weights ||
+        n_tokens <= 1 ||
+        getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") != NULL ||
+        getenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") != NULL ||
+        getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE") != NULL ||
+        getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") != NULL ||
+        getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") != NULL ||
+        DS4_N_LAYER == 0 ||
+        DS4_N_EXPERT < 128 ||
+        DS4_N_EXPERT_USED != 6) {
+        return false;
+    }
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *layer = &weights->layer[il];
+        if (!layer->ffn_gate_exps || !layer->ffn_up_exps ||
+            !layer->ffn_down_exps) {
+            continue;
+        }
+        const bool q4 =
+            layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
+            layer->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
+            layer->ffn_down_exps->type == DS4_TENSOR_Q4_K;
+        const bool iq2 =
+            layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+            layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+            layer->ffn_down_exps->type == DS4_TENSOR_Q2_K;
+        if (q4 || iq2) return true;
+    }
+    return false;
+#else
+    (void)g;
+    (void)weights;
+    (void)n_tokens;
+    return false;
+#endif
+}
+
+#ifdef DS4_ROCM_BUILD
+enum { DS4_ROCM_STREAM_PREFILL_FULL_LAYER_MIN_TOKENS = 1024 };
+enum { DS4_ROCM_STREAM_PREFILL_FULL_LAYER_MAX_SEED_TOKENS = 8 };
+
+typedef struct rocm_graph_stream_layer_expert_load {
+    pthread_t                 thread;
+    bool                      active;
+    bool                      ok;
+    const ds4_model          *model;
+    const ds4_layer_weights  *layer;
+    uint32_t                  il;
+    uint64_t                  gate_expert_bytes;
+    uint64_t                  down_expert_bytes;
+} rocm_graph_stream_layer_expert_load;
+
+static bool rocm_graph_stream_prefill_full_layer_enabled(
+        const ds4_gpu_graph      *g,
+        const ds4_layer_weights  *layer,
+        uint32_t                  n_tokens) {
+    return g &&
+           g->ssd_streaming &&
+           !g->quality &&
+           layer &&
+           n_tokens >= DS4_ROCM_STREAM_PREFILL_FULL_LAYER_MIN_TOKENS &&
+           DS4_N_EXPERT_USED == 6 &&
+           layer->ffn_gate_exps &&
+           layer->ffn_up_exps &&
+           layer->ffn_down_exps &&
+           layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+           layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+           layer->ffn_down_exps->type == DS4_TENSOR_Q2_K;
+}
+
+static uint32_t rocm_graph_stream_prefill_full_layer_seed_tokens(void) {
+    const uint32_t budget = ds4_gpu_stream_expert_cache_configured_count();
+    const uint64_t entries_per_token =
+        (uint64_t)DS4_N_LAYER * (uint64_t)DS4_N_EXPERT_USED;
+    if (entries_per_token == 0) return 1;
+    uint32_t seed_tokens = budget == 0 ? 1 : (uint32_t)(budget / entries_per_token);
+    if (seed_tokens < 1) seed_tokens = 1;
+    if (seed_tokens > DS4_ROCM_STREAM_PREFILL_FULL_LAYER_MAX_SEED_TOKENS) {
+        seed_tokens = DS4_ROCM_STREAM_PREFILL_FULL_LAYER_MAX_SEED_TOKENS;
+    }
+    return seed_tokens;
+}
+
+static bool rocm_graph_stream_layer_expert_bytes(
+        const ds4_layer_weights  *layer,
+        uint64_t                 *gate_expert_bytes,
+        uint64_t                 *down_expert_bytes) {
+    return streaming_layer_gate_down_expert_bytes(layer,
+                                                  gate_expert_bytes,
+                                                  down_expert_bytes);
+}
+
+static bool rocm_graph_stream_layer_expert_load_sync(
+        const ds4_model          *model,
+        const ds4_layer_weights  *layer,
+        uint32_t                  il,
+        uint64_t                  gate_expert_bytes,
+        uint64_t                  down_expert_bytes) {
+    const ds4_gpu_stream_expert_table table =
+        graph_stream_expert_table_make(model,
+                                       layer,
+                                       il,
+                                       gate_expert_bytes,
+                                       down_expert_bytes);
+    return model &&
+           layer &&
+           ds4_gpu_stream_expert_cache_load_layer(&table) != 0;
+}
+
+static void *rocm_graph_stream_layer_expert_load_thread_main(void *arg) {
+    rocm_graph_stream_layer_expert_load *job = arg;
+    if (!job) return NULL;
+    job->ok = rocm_graph_stream_layer_expert_load_sync(job->model,
+                                                       job->layer,
+                                                       job->il,
+                                                       job->gate_expert_bytes,
+                                                       job->down_expert_bytes);
+    return NULL;
+}
+
+static bool rocm_graph_stream_layer_expert_load_join(
+        rocm_graph_stream_layer_expert_load *job) {
+    if (!job || !job->active) return true;
+    const int rc = pthread_join(job->thread, NULL);
+    const bool ok = rc == 0 && job->ok;
+    if (rc != 0) {
+        fprintf(stderr,
+                "ds4: ROCm streaming full-layer expert load join failed: %s\n",
+                strerror(rc));
+    }
+    memset(job, 0, sizeof(*job));
+    return ok;
+}
+
+static bool rocm_graph_stream_layer_expert_load_start(
+        rocm_graph_stream_layer_expert_load *job,
+        const ds4_model                     *model,
+        const ds4_layer_weights             *layer,
+        uint32_t                             il,
+        uint64_t                             gate_expert_bytes,
+        uint64_t                             down_expert_bytes) {
+    if (!job || job->active || !model || !layer) return false;
+    memset(job, 0, sizeof(*job));
+    job->model = model;
+    job->layer = layer;
+    job->il = il;
+    job->gate_expert_bytes = gate_expert_bytes;
+    job->down_expert_bytes = down_expert_bytes;
+    const int rc = pthread_create(&job->thread,
+                                  NULL,
+                                  rocm_graph_stream_layer_expert_load_thread_main,
+                                  job);
+    if (rc != 0) {
+        fprintf(stderr,
+                "ds4: failed to start ROCm streaming full-layer expert load "
+                "thread for layer %u: %s\n",
+                il,
+                strerror(rc));
+        memset(job, 0, sizeof(*job));
+        return false;
+    }
+    job->active = true;
+    return true;
+}
+
+static bool rocm_graph_stream_layer_expert_load_start_next(
+        rocm_graph_stream_layer_expert_load *job,
+        const ds4_gpu_graph                 *g,
+        const ds4_model                     *model,
+        const ds4_weights                   *weights,
+        uint32_t                             il,
+        uint32_t                             n_tokens) {
+    if (!job ||
+        !model ||
+        !weights ||
+        il >= DS4_N_LAYER ||
+        !rocm_graph_stream_prefill_full_layer_enabled(g,
+                                                      &weights->layer[il],
+                                                      n_tokens)) {
+        return true;
+    }
+    uint64_t gate_expert_bytes = 0;
+    uint64_t down_expert_bytes = 0;
+    if (!rocm_graph_stream_layer_expert_bytes(&weights->layer[il],
+                                              &gate_expert_bytes,
+                                              &down_expert_bytes)) {
+        return false;
+    }
+    return rocm_graph_stream_layer_expert_load_start(job,
+                                                     model,
+                                                     &weights->layer[il],
+                                                     il,
+                                                     gate_expert_bytes,
+                                                     down_expert_bytes);
+}
+
+static bool rocm_graph_stream_layer_expert_load_ready(
+        rocm_graph_stream_layer_expert_load *job,
+        const ds4_gpu_graph                 *g,
+        const ds4_model                     *model,
+        const ds4_weights                   *weights,
+        uint32_t                             il,
+        uint32_t                             n_tokens) {
+    if (!model || !weights || il >= DS4_N_LAYER) return false;
+    if (!rocm_graph_stream_prefill_full_layer_enabled(g,
+                                                      &weights->layer[il],
+                                                      n_tokens)) {
+        return true;
+    }
+    uint64_t gate_expert_bytes = 0;
+    uint64_t down_expert_bytes = 0;
+    if (!rocm_graph_stream_layer_expert_bytes(&weights->layer[il],
+                                              &gate_expert_bytes,
+                                              &down_expert_bytes)) {
+        return false;
+    }
+    if (job && job->active) {
+        if (job->il != il) {
+            fprintf(stderr,
+                    "ds4: ROCm streaming full-layer expert load expected layer "
+                    "%u but pending job is layer %u\n",
+                    il,
+                    job->il);
+            return false;
+        }
+        return rocm_graph_stream_layer_expert_load_join(job);
+    }
+    return rocm_graph_stream_layer_expert_load_sync(model,
+                                                    &weights->layer[il],
+                                                    il,
+                                                    gate_expert_bytes,
+                                                    down_expert_bytes);
+}
+
+static bool rocm_graph_stream_seed_full_layer_selected(
+        ds4_gpu_graph           *g,
+        const ds4_model         *model,
+        const ds4_layer_weights *layer,
+        uint32_t                 il,
+        uint32_t                 n_tokens) {
+    if (!rocm_graph_stream_prefill_full_layer_enabled(g, layer, n_tokens)) {
+        return true;
+    }
+    uint64_t gate_expert_bytes = 0;
+    uint64_t down_expert_bytes = 0;
+    if (!rocm_graph_stream_layer_expert_bytes(layer,
+                                              &gate_expert_bytes,
+                                              &down_expert_bytes)) {
+        return false;
+    }
+    const ds4_gpu_stream_expert_table table =
+        graph_stream_expert_table_make(model,
+                                       layer,
+                                       il,
+                                       gate_expert_bytes,
+                                       down_expert_bytes);
+    if (ds4_gpu_stream_expert_cache_seed_from_layer_selected(
+                &table,
+                g->batch_router_selected,
+                n_tokens,
+                rocm_graph_stream_prefill_full_layer_seed_tokens(),
+                DS4_N_EXPERT_USED) == 0) {
+        static bool warned = false;
+        if (!warned) {
+            fprintf(stderr,
+                    "ds4: ROCm streaming full-layer prefill seed skipped; "
+                    "decode may start with a colder expert cache\n");
+            warned = true;
+        }
+    }
+    return true;
+}
+#endif
 
 static bool metal_graph_stream_prefill_selected_profile_enabled(
         const ds4_gpu_graph *g) {
@@ -13200,6 +13611,17 @@ static bool metal_graph_use_q4_selected_shared_overlap(void) {
     return metal_graph_env_flag("DS4_METAL_Q4_SELECTED_OVERLAP_SHARED", &cache);
 }
 
+static bool metal_graph_use_cuda_selected_shared_overlap(const ds4_gpu_graph *g) {
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    return g &&
+           g->ssd_streaming &&
+           getenv("DS4_CUDA_DISABLE_STREAMING_SELECTED_SHARED_OVERLAP") == NULL;
+#else
+    (void)g;
+    return false;
+#endif
+}
+
 static bool metal_graph_q4_non_streaming_opt_in_enabled(void) {
     return getenv("DS4_METAL_ENABLE_Q4_SELECTED_EXPERT_VIEWS") != NULL ||
            getenv("DS4_METAL_ENABLE_PRO_Q4_SELECTED_EXPERT_VIEWS") != NULL ||
@@ -13223,14 +13645,22 @@ static bool metal_graph_use_iq2_selected_shared_overlap(const ds4_gpu_graph *g) 
 static bool metal_graph_use_iq2_selected_async_load(const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
+#ifndef DS4_ROCM_BUILD
            getenv("DS4_METAL_DISABLE_STREAMING_SELECTED_ASYNC_LOAD") == NULL;
+#else
+           true;
+#endif
 }
 
 static bool metal_graph_use_iq2_selected_async_early_commit(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
+#ifndef DS4_ROCM_BUILD
            getenv("DS4_METAL_DISABLE_STREAMING_SELECTED_ASYNC_EARLY_COMMIT") == NULL;
+#else
+           false;
+#endif
 }
 
 static bool metal_graph_use_pro_q4_expert_table_auto(const ds4_gpu_graph *g) {
@@ -13339,6 +13769,41 @@ static bool metal_graph_decode_iq2_selected_slots_expected(
            getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
            getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
            getenv("DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS") == NULL;
+}
+
+static bool metal_graph_decode_cuda_selected_slots_expected(
+        const ds4_gpu_graph     *g,
+        const ds4_layer_weights *layer) {
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    if (!g ||
+        !g->ssd_streaming ||
+        g->quality ||
+        !layer ||
+        !layer->ffn_gate_exps ||
+        !layer->ffn_up_exps ||
+        !layer->ffn_down_exps ||
+        DS4_N_EXPERT_USED != 6 ||
+        DS4_N_EXPERT < 128 ||
+        getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") != NULL ||
+        getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") != NULL) {
+        return false;
+    }
+    const bool q4 =
+        layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
+        layer->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q4_K &&
+        getenv("DS4_METAL_DISABLE_Q4_SELECTED_EXPERT_VIEWS") == NULL;
+    const bool iq2 =
+        layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
+        getenv("DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS") == NULL;
+    return q4 || iq2;
+#else
+    (void)g;
+    (void)layer;
+    return false;
+#endif
 }
 
 static uint32_t metal_graph_streaming_prefill_cache_seed_k(const ds4_gpu_graph *g) {
@@ -13555,6 +14020,7 @@ static uint32_t metal_graph_streaming_expert_preload_count(
 static bool metal_graph_decode_set_hash_selected_override(
         const ds4_model         *model,
         const ds4_layer_weights *layer,
+        uint32_t                 il,
         uint32_t                 token,
         uint64_t                 gate_tensor_bytes,
         uint64_t                 down_tensor_bytes,
@@ -13577,6 +14043,27 @@ static bool metal_graph_decode_set_hash_selected_override(
     layer_hash_selected_experts(selected, model, layer, (int)token);
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
         selected_i32[i] = (int32_t)selected[i];
+    }
+    if (g && g->ssd_streaming) {
+        if (DS4_N_EXPERT == 0 ||
+            gate_tensor_bytes % DS4_N_EXPERT != 0 ||
+            down_tensor_bytes % DS4_N_EXPERT != 0) {
+            return false;
+        }
+        const uint64_t gate_expert_bytes = gate_tensor_bytes / DS4_N_EXPERT;
+        const uint64_t down_expert_bytes = down_tensor_bytes / DS4_N_EXPERT;
+        const ds4_gpu_stream_expert_table table =
+            graph_stream_expert_table_make(model,
+                                           layer,
+                                           il,
+                                           gate_expert_bytes,
+                                           down_expert_bytes);
+        if (ds4_gpu_stream_expert_cache_begin_selected_load(
+                    &table,
+                    selected_i32,
+                    DS4_N_EXPERT_USED) == 0) {
+            return false;
+        }
     }
     return ds4_gpu_routed_moe_set_selected_override(selected_i32, DS4_N_EXPERT_USED) != 0;
 }
@@ -13745,18 +14232,16 @@ static bool metal_graph_decode_selected_readahead_override(
                                                  DS4_N_EXPERT_USED) == 0) {
         return false;
     }
+    const ds4_gpu_stream_expert_table table =
+        graph_stream_expert_table_make(model,
+                                       layer,
+                                       il,
+                                       gate_expert_bytes,
+                                       down_expert_bytes);
     if (ds4_gpu_stream_expert_cache_begin_selected_load(
-                model->map,
-                model->size,
-                il,
+                &table,
                 selected_ids,
-                DS4_N_EXPERT,
-                DS4_N_EXPERT_USED,
-                layer->ffn_gate_exps->abs_offset,
-                layer->ffn_up_exps->abs_offset,
-                layer->ffn_down_exps->abs_offset,
-                gate_expert_bytes,
-                down_expert_bytes) == 0) {
+                DS4_N_EXPERT_USED) == 0) {
         return false;
     }
     if (ds4_gpu_begin_commands() == 0) return false;
@@ -13774,6 +14259,163 @@ static bool metal_graph_decode_selected_readahead_override(
                 (t_done - t0) * 1000.0);
     }
     return true;
+}
+
+static bool metal_graph_decode_cuda_selected_load(
+        ds4_gpu_graph            *g,
+        const ds4_model          *model,
+        const ds4_layer_weights  *layer,
+        uint32_t                  il,
+        uint64_t                  gate_expert_bytes,
+        uint64_t                  down_expert_bytes) {
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    if (!metal_graph_decode_cuda_selected_slots_expected(g, layer) ||
+        !model ||
+        !g->router_selected ||
+        DS4_N_EXPERT == 0 ||
+        DS4_N_EXPERT > DS4_MAX_EXPERT ||
+        DS4_N_EXPERT_USED == 0 ||
+        DS4_N_EXPERT_USED > DS4_MAX_EXPERT_USED) {
+        return false;
+    }
+
+    const bool profile =
+        getenv("DS4_CUDA_STREAMING_EXPERT_CACHE_PROFILE") != NULL;
+    const double t0 = profile ? now_sec() : 0.0;
+
+    if (ds4_gpu_end_commands() == 0) return false;
+    const double t_sync = profile ? now_sec() : 0.0;
+
+    int32_t selected_ids[DS4_MAX_EXPERT_USED] = {0};
+    bool ok = ds4_gpu_tensor_read(g->router_selected,
+                                  0,
+                                  selected_ids,
+                                  (uint64_t)DS4_N_EXPERT_USED *
+                                      sizeof(selected_ids[0])) != 0;
+    const double t_read = profile ? now_sec() : 0.0;
+
+    if (ok) {
+        const ds4_gpu_stream_expert_table table =
+            graph_stream_expert_table_make(model,
+                                           layer,
+                                           il,
+                                           gate_expert_bytes,
+                                           down_expert_bytes);
+        ok = ds4_gpu_stream_expert_cache_begin_selected_load(
+                    &table,
+                    selected_ids,
+                    DS4_N_EXPERT_USED) != 0;
+    }
+    const double t_load = profile ? now_sec() : 0.0;
+
+    if (ds4_gpu_begin_commands() == 0) ok = false;
+    const double t_done = profile ? now_sec() : 0.0;
+
+    if (profile) {
+        fprintf(stderr,
+                "ds4: CUDA streaming selected load layer=%u sync=%.3f ms read=%.3f ms load=%.3f ms resume=%.3f ms total=%.3f ms\n",
+                il,
+                (t_sync - t0) * 1000.0,
+                (t_read - t_sync) * 1000.0,
+                (t_load - t_read) * 1000.0,
+                (t_done - t_load) * 1000.0,
+                (t_done - t0) * 1000.0);
+    }
+    return ok;
+#else
+    (void)g;
+    (void)model;
+    (void)layer;
+    (void)il;
+    (void)gate_expert_bytes;
+    (void)down_expert_bytes;
+    return false;
+#endif
+}
+
+static bool metal_graph_cuda_stream_prefill_batch_selected_load(
+        ds4_gpu_graph            *g,
+        const ds4_model          *model,
+        const ds4_layer_weights  *layer,
+        uint32_t                  il,
+        uint32_t                  n_tokens,
+        uint64_t                  gate_expert_bytes,
+        uint64_t                  down_expert_bytes) {
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    if (!metal_graph_decode_cuda_selected_slots_expected(g, layer) ||
+        !model ||
+        !g->batch_router_selected ||
+        n_tokens <= 1 ||
+        DS4_N_EXPERT == 0 ||
+        DS4_N_EXPERT_USED == 0 ||
+        getenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_LOAD") != NULL) {
+        return true;
+    }
+
+    if ((uint64_t)n_tokens > UINT64_MAX / (uint64_t)DS4_N_EXPERT_USED) {
+        fprintf(stderr, "ds4: CUDA streaming prefill selected-id count overflow at layer %u\n", il);
+        return false;
+    }
+    const uint64_t n_ids64 = (uint64_t)n_tokens * DS4_N_EXPERT_USED;
+    if (n_ids64 == 0 || n_ids64 > SIZE_MAX / sizeof(int32_t)) {
+        fprintf(stderr, "ds4: CUDA streaming prefill selected-id byte size overflow at layer %u\n", il);
+        return false;
+    }
+
+    const bool profile =
+        getenv("DS4_CUDA_STREAMING_PREFILL_BATCH_SELECTED_PROFILE") != NULL;
+    const double t0 = profile ? now_sec() : 0.0;
+
+    if (ds4_gpu_end_commands() == 0) return false;
+    const double t_sync = profile ? now_sec() : 0.0;
+
+    int32_t *selected_ids = xmalloc((size_t)n_ids64 * sizeof(selected_ids[0]));
+    bool ok = ds4_gpu_tensor_read(g->batch_router_selected,
+                                  0,
+                                  selected_ids,
+                                  n_ids64 * sizeof(selected_ids[0])) != 0;
+    const double t_read = profile ? now_sec() : 0.0;
+    if (ok) {
+        const ds4_gpu_stream_expert_table table =
+            graph_stream_expert_table_make(model,
+                                           layer,
+                                           il,
+                                           gate_expert_bytes,
+                                           down_expert_bytes);
+        ok = ds4_gpu_stream_expert_cache_prepare_selected_batch(
+                    &table,
+                    selected_ids,
+                    n_tokens,
+                    DS4_N_EXPERT_USED) != 0;
+    }
+    free(selected_ids);
+    const double t_load = profile ? now_sec() : 0.0;
+
+    if (ds4_gpu_begin_commands() == 0) ok = false;
+    const double t_done = profile ? now_sec() : 0.0;
+
+    if (profile) {
+        fprintf(stderr,
+                "ds4: CUDA streaming prefill batch selected load layer=%u tokens=%u sync=%.3f ms read=%.3f ms load=%.3f ms resume=%.3f ms total=%.3f ms\n",
+                il,
+                n_tokens,
+                (t_sync - t0) * 1000.0,
+                (t_read - t_sync) * 1000.0,
+                (t_load - t_read) * 1000.0,
+                (t_done - t_load) * 1000.0,
+                (t_done - t0) * 1000.0);
+    }
+    return ok;
+#else
+    (void)g;
+    (void)model;
+    (void)layer;
+    (void)il;
+    (void)n_tokens;
+    (void)gate_expert_bytes;
+    (void)down_expert_bytes;
+    return true;
+#endif
 }
 
 typedef struct metal_graph_selected_async_load {
@@ -13810,16 +14452,31 @@ static void metal_graph_selected_async_load_run(
         DS4_N_EXPERT_USED == 0 || DS4_N_EXPERT_USED > DS4_MAX_EXPERT_USED) {
         return;
     }
-    if (ds4_gpu_wait_selected_readback_ready(job->event_value,
-                                             "selected-id async expert load") == 0) {
-        return;
-    }
-    if (ds4_gpu_tensor_read(job->g->router_selected,
-                            0,
-                            job->selected_ids,
-                            (uint64_t)DS4_N_EXPERT_USED *
-                                sizeof(job->selected_ids[0])) == 0) {
-        return;
+    if (job->event_value != 0) {
+#ifdef DS4_ROCM_BUILD
+        if (ds4_gpu_tensor_read_after_selected_event(
+                    job->g->router_selected,
+                    0,
+                    job->selected_ids,
+                    (uint64_t)DS4_N_EXPERT_USED *
+                        sizeof(job->selected_ids[0]),
+                    job->event_value,
+                    "selected-id async expert load") == 0) {
+            return;
+        }
+#else
+        if (ds4_gpu_wait_selected_readback_ready(job->event_value,
+                                                 "selected-id async expert load") == 0) {
+            return;
+        }
+        if (ds4_gpu_tensor_read(job->g->router_selected,
+                                0,
+                                job->selected_ids,
+                                (uint64_t)DS4_N_EXPERT_USED *
+                                    sizeof(job->selected_ids[0])) == 0) {
+            return;
+        }
+#endif
     }
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
         if (job->selected_ids[i] < 0 ||
@@ -13832,18 +14489,16 @@ static void metal_graph_selected_async_load_run(
             return;
         }
     }
+    const ds4_gpu_stream_expert_table table =
+        graph_stream_expert_table_make(job->model,
+                                       job->layer,
+                                       job->il,
+                                       job->gate_expert_bytes,
+                                       job->down_expert_bytes);
     if (ds4_gpu_stream_expert_cache_begin_selected_load(
-                job->model->map,
-                job->model->size,
-                job->il,
+                &table,
                 job->selected_ids,
-                DS4_N_EXPERT,
-                DS4_N_EXPERT_USED,
-                job->layer->ffn_gate_exps->abs_offset,
-                job->layer->ffn_up_exps->abs_offset,
-                job->layer->ffn_down_exps->abs_offset,
-                job->gate_expert_bytes,
-                job->down_expert_bytes) == 0) {
+                DS4_N_EXPERT_USED) == 0) {
         return;
     }
 
@@ -13896,7 +14551,7 @@ static bool metal_graph_selected_async_load_ensure_worker(void) {
     return true;
 }
 
-static bool metal_graph_selected_async_load_start(
+static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start(
         metal_graph_selected_async_load *job,
         ds4_gpu_graph                   *g,
         const ds4_model                 *model,
@@ -13947,6 +14602,198 @@ static bool metal_graph_selected_async_load_finish(
     return ds4_gpu_routed_moe_set_selected_override(job->selected_ids,
                                                    DS4_N_EXPERT_USED) != 0;
 }
+
+#ifdef DS4_ROCM_BUILD
+typedef struct rocm_graph_batch_selected_async_load {
+    bool                      active;
+    bool                      ok;
+    ds4_gpu_graph            *g;
+    const ds4_model          *model;
+    const ds4_layer_weights  *layer;
+    uint32_t                  il;
+    uint32_t                  n_tokens;
+    uint64_t                  event_value;
+    uint64_t                  gate_expert_bytes;
+    uint64_t                  down_expert_bytes;
+    int32_t                  *selected_ids;
+} rocm_graph_batch_selected_async_load;
+
+static pthread_mutex_t g_rocm_graph_batch_selected_async_load_mutex =
+    PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_rocm_graph_batch_selected_async_load_cond =
+    PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_rocm_graph_batch_selected_async_load_done_cond =
+    PTHREAD_COND_INITIALIZER;
+static pthread_t g_rocm_graph_batch_selected_async_load_thread;
+static bool g_rocm_graph_batch_selected_async_load_thread_started = false;
+static bool g_rocm_graph_batch_selected_async_load_has_job = false;
+static bool g_rocm_graph_batch_selected_async_load_done = false;
+static rocm_graph_batch_selected_async_load
+    g_rocm_graph_batch_selected_async_load_job;
+
+static void rocm_graph_batch_selected_async_load_run(
+        rocm_graph_batch_selected_async_load *job) {
+    job->ok = false;
+    if (!job->g || !job->model || !job->layer ||
+        !job->g->batch_router_selected || !job->selected_ids ||
+        job->n_tokens <= 1 ||
+        DS4_N_EXPERT == 0 || DS4_N_EXPERT > DS4_MAX_EXPERT ||
+        DS4_N_EXPERT_USED == 0 || DS4_N_EXPERT_USED > DS4_MAX_EXPERT_USED) {
+        return;
+    }
+    if (DS4_N_EXPERT_USED != 0 &&
+        job->n_tokens > UINT64_MAX / DS4_N_EXPERT_USED) {
+        return;
+    }
+    const uint64_t n_ids = (uint64_t)job->n_tokens * DS4_N_EXPERT_USED;
+    if (n_ids > SIZE_MAX / sizeof(job->selected_ids[0])) return;
+    if (ds4_gpu_tensor_read_after_selected_event(
+                job->g->batch_router_selected,
+                0,
+                job->selected_ids,
+                n_ids * sizeof(job->selected_ids[0]),
+                job->event_value,
+                "prefill selected-id async expert load") == 0) {
+        return;
+    }
+    for (uint64_t i = 0; i < n_ids; i++) {
+        if (job->selected_ids[i] < 0 ||
+            (uint32_t)job->selected_ids[i] >= DS4_N_EXPERT) {
+            fprintf(stderr,
+                    "ds4: ROCm streaming async batch selected expert id %d "
+                    "is outside 0..%u at layer %u\n",
+                    job->selected_ids[i],
+                    DS4_N_EXPERT,
+                    job->il);
+            return;
+        }
+    }
+    const ds4_gpu_stream_expert_table table =
+        graph_stream_expert_table_make(job->model,
+                                       job->layer,
+                                       job->il,
+                                       job->gate_expert_bytes,
+                                       job->down_expert_bytes);
+    if (ds4_gpu_stream_expert_cache_prepare_selected_batch(
+                &table,
+                job->selected_ids,
+                job->n_tokens,
+                DS4_N_EXPERT_USED) == 0) {
+        return;
+    }
+    job->ok = true;
+}
+
+static void *rocm_graph_batch_selected_async_load_worker_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_rocm_graph_batch_selected_async_load_mutex);
+        while (!g_rocm_graph_batch_selected_async_load_has_job) {
+            pthread_cond_wait(&g_rocm_graph_batch_selected_async_load_cond,
+                              &g_rocm_graph_batch_selected_async_load_mutex);
+        }
+        rocm_graph_batch_selected_async_load job =
+            g_rocm_graph_batch_selected_async_load_job;
+        pthread_mutex_unlock(&g_rocm_graph_batch_selected_async_load_mutex);
+
+        rocm_graph_batch_selected_async_load_run(&job);
+
+        pthread_mutex_lock(&g_rocm_graph_batch_selected_async_load_mutex);
+        g_rocm_graph_batch_selected_async_load_job = job;
+        g_rocm_graph_batch_selected_async_load_has_job = false;
+        g_rocm_graph_batch_selected_async_load_done = true;
+        pthread_cond_signal(&g_rocm_graph_batch_selected_async_load_done_cond);
+        pthread_mutex_unlock(&g_rocm_graph_batch_selected_async_load_mutex);
+    }
+    return NULL;
+}
+
+static bool rocm_graph_batch_selected_async_load_ensure_worker(void) {
+    pthread_mutex_lock(&g_rocm_graph_batch_selected_async_load_mutex);
+    if (g_rocm_graph_batch_selected_async_load_thread_started) {
+        pthread_mutex_unlock(&g_rocm_graph_batch_selected_async_load_mutex);
+        return true;
+    }
+    const int rc = pthread_create(&g_rocm_graph_batch_selected_async_load_thread,
+                                  NULL,
+                                  rocm_graph_batch_selected_async_load_worker_main,
+                                  NULL);
+    if (rc != 0) {
+        pthread_mutex_unlock(&g_rocm_graph_batch_selected_async_load_mutex);
+        fprintf(stderr,
+                "ds4: failed to start ROCm streaming async batch selected "
+                "load worker: %s\n",
+                strerror(rc));
+        return false;
+    }
+    g_rocm_graph_batch_selected_async_load_thread_started = true;
+    pthread_mutex_unlock(&g_rocm_graph_batch_selected_async_load_mutex);
+    return true;
+}
+
+static bool rocm_graph_batch_selected_async_load_start(
+        rocm_graph_batch_selected_async_load *job,
+        ds4_gpu_graph                        *g,
+        const ds4_model                      *model,
+        const ds4_layer_weights              *layer,
+        uint32_t                              il,
+        uint32_t                              n_tokens,
+        uint64_t                              event_value,
+        uint64_t                              gate_expert_bytes,
+        uint64_t                              down_expert_bytes) {
+    if (!job || event_value == 0 || n_tokens <= 1) return false;
+    if (!rocm_graph_batch_selected_async_load_ensure_worker()) return false;
+    if (DS4_N_EXPERT_USED != 0 &&
+        n_tokens > UINT64_MAX / DS4_N_EXPERT_USED) {
+        return false;
+    }
+    const uint64_t n_ids = (uint64_t)n_tokens * DS4_N_EXPERT_USED;
+    if (n_ids > SIZE_MAX / sizeof(int32_t)) return false;
+    memset(job, 0, sizeof(*job));
+    job->selected_ids = xmalloc((size_t)n_ids * sizeof(job->selected_ids[0]));
+    job->g = g;
+    job->model = model;
+    job->layer = layer;
+    job->il = il;
+    job->n_tokens = n_tokens;
+    job->event_value = event_value;
+    job->gate_expert_bytes = gate_expert_bytes;
+    job->down_expert_bytes = down_expert_bytes;
+
+    pthread_mutex_lock(&g_rocm_graph_batch_selected_async_load_mutex);
+    if (g_rocm_graph_batch_selected_async_load_has_job ||
+        g_rocm_graph_batch_selected_async_load_done) {
+        pthread_mutex_unlock(&g_rocm_graph_batch_selected_async_load_mutex);
+        free(job->selected_ids);
+        memset(job, 0, sizeof(*job));
+        return false;
+    }
+    g_rocm_graph_batch_selected_async_load_job = *job;
+    g_rocm_graph_batch_selected_async_load_job.ok = false;
+    g_rocm_graph_batch_selected_async_load_has_job = true;
+    pthread_cond_signal(&g_rocm_graph_batch_selected_async_load_cond);
+    pthread_mutex_unlock(&g_rocm_graph_batch_selected_async_load_mutex);
+    job->active = true;
+    return true;
+}
+
+static bool rocm_graph_batch_selected_async_load_finish(
+        rocm_graph_batch_selected_async_load *job) {
+    if (!job || !job->active) return false;
+    pthread_mutex_lock(&g_rocm_graph_batch_selected_async_load_mutex);
+    while (!g_rocm_graph_batch_selected_async_load_done) {
+        pthread_cond_wait(&g_rocm_graph_batch_selected_async_load_done_cond,
+                          &g_rocm_graph_batch_selected_async_load_mutex);
+    }
+    *job = g_rocm_graph_batch_selected_async_load_job;
+    g_rocm_graph_batch_selected_async_load_done = false;
+    pthread_mutex_unlock(&g_rocm_graph_batch_selected_async_load_mutex);
+    const bool ok = job->ok;
+    free(job->selected_ids);
+    memset(job, 0, sizeof(*job));
+    return ok;
+}
+#endif
 
 static bool metal_graph_profile_router_selection(
         ds4_gpu_graph            *g,
@@ -14732,6 +15579,7 @@ static bool metal_graph_encode_decode_layer(
                                                     g->router_logits) != 0;
         if (ok) ok = metal_graph_decode_set_hash_selected_override(model,
                                                                    layer,
+                                                                   il,
                                                                    (uint32_t)token,
                                                                    layer->ffn_gate_exps->bytes,
                                                                    layer->ffn_down_exps->bytes,
@@ -14764,17 +15612,23 @@ static bool metal_graph_encode_decode_layer(
     const bool iq2_selected_shared_overlap =
         metal_graph_use_iq2_selected_shared_overlap(g) &&
         metal_graph_decode_iq2_selected_slots_expected(g, layer);
+    const bool cuda_selected_shared_overlap =
+        metal_graph_use_cuda_selected_shared_overlap(g) &&
+        metal_graph_decode_cuda_selected_slots_expected(g, layer);
     const bool overlap_selected_shared =
         ok &&
         !decode_stage_profile &&
         !metal_graph_decode_cpu_router_applicable(g, layer) &&
         layer->ffn_gate_tid2eid == NULL &&
         getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL &&
-        (q4_selected_shared_overlap || iq2_selected_shared_overlap);
+        (q4_selected_shared_overlap ||
+         iq2_selected_shared_overlap ||
+         cuda_selected_shared_overlap);
     const bool async_selected_load =
         overlap_selected_shared &&
-        iq2_selected_shared_overlap &&
-        metal_graph_use_iq2_selected_async_load(g);
+        ((iq2_selected_shared_overlap &&
+          metal_graph_use_iq2_selected_async_load(g)) ||
+         cuda_selected_shared_overlap);
     const bool selected_readahead_shared_delay =
         ok &&
         !overlap_selected_shared &&
@@ -14784,6 +15638,22 @@ static bool metal_graph_encode_decode_layer(
         !metal_graph_decode_cpu_router_applicable(g, layer) &&
         layer->ffn_gate_tid2eid == NULL &&
         getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL;
+    const bool cuda_stream_selected_load =
+        ok &&
+        !overlap_selected_shared &&
+        !selected_readahead_shared_delay &&
+        g->ssd_streaming &&
+        metal_graph_decode_cuda_selected_slots_expected(g, layer) &&
+        layer->ffn_gate_tid2eid == NULL &&
+        getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL;
+    if (cuda_stream_selected_load) {
+        ok = metal_graph_decode_cuda_selected_load(g,
+                                                   model,
+                                                   layer,
+                                                   il,
+                                                   gate_expert_bytes,
+                                                   down_expert_bytes);
+    }
     if (selected_readahead_shared_delay) {
         if (ok) {
             ok = metal_graph_decode_selected_readahead_override(g,
@@ -14979,18 +15849,16 @@ static bool metal_graph_encode_decode_layer(
                  ds4_gpu_routed_moe_set_selected_override(selected_ids,
                                                           DS4_N_EXPERT_USED) != 0;
             if (ok) {
+                const ds4_gpu_stream_expert_table table =
+                    graph_stream_expert_table_make(model,
+                                                   layer,
+                                                   il,
+                                                   gate_expert_bytes,
+                                                   down_expert_bytes);
                 ok = ds4_gpu_stream_expert_cache_begin_selected_load(
-                            model->map,
-                            model->size,
-                            il,
+                            &table,
                             selected_ids,
-                            DS4_N_EXPERT,
-                            DS4_N_EXPERT_USED,
-                            layer->ffn_gate_exps->abs_offset,
-                            layer->ffn_up_exps->abs_offset,
-                            layer->ffn_down_exps->abs_offset,
-                            gate_expert_bytes,
-                            down_expert_bytes) != 0;
+                            DS4_N_EXPERT_USED) != 0;
             }
         }
         if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
@@ -18066,10 +18934,60 @@ static bool metal_graph_encode_layer_ffn_batch(
     }
     DS4_METAL_PROFILE_FFN_STAGE("router");
 
+    if (ok) {
+        ok = metal_graph_cuda_stream_prefill_batch_selected_load(g,
+                                                                 model,
+                                                                 layer,
+                                                                 il,
+                                                                 n_tokens,
+                                                                 gate_expert_bytes,
+                                                                 down_expert_bytes);
+    }
+
+#ifdef DS4_ROCM_BUILD
+    rocm_graph_batch_selected_async_load rocm_batch_selected_async = {0};
+    bool rocm_batch_selected_async_started = false;
+    const bool rocm_batch_selected_shared_overlap =
+        ok &&
+        g->ssd_streaming &&
+        !g->quality &&
+        n_tokens > 1 &&
+        DS4_N_EXPERT_USED == 6 &&
+        !rocm_graph_stream_prefill_full_layer_enabled(g, layer, n_tokens) &&
+        layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q2_K;
+    if (rocm_batch_selected_shared_overlap) {
+        uint64_t selected_event = 0;
+        if (ds4_gpu_signal_selected_readback_ready(&selected_event) == 0) {
+            ok = false;
+        } else {
+            ok = rocm_graph_batch_selected_async_load_start(
+                    &rocm_batch_selected_async,
+                    g,
+                    model,
+                    layer,
+                    il,
+                    n_tokens,
+                    selected_event,
+                    gate_expert_bytes,
+                    down_expert_bytes);
+            rocm_batch_selected_async_started = ok;
+        }
+    }
+#endif
+
     const bool selected_readahead_shared =
-        metal_graph_stream_prefill_selected_readahead_shared_enabled(g);
+        metal_graph_stream_prefill_selected_readahead_shared_enabled(g)
+#ifdef DS4_ROCM_BUILD
+        && !rocm_batch_selected_async_started
+#endif
+        ;
     if (ok &&
         metal_graph_stream_prefill_selected_readahead_enabled(g) &&
+#ifdef DS4_ROCM_BUILD
+        !rocm_batch_selected_async_started &&
+#endif
         !selected_readahead_shared) {
         if (ds4_gpu_end_commands() == 0) {
             ok = false;
@@ -18212,6 +19130,18 @@ static bool metal_graph_encode_layer_ffn_batch(
         }
         if (ok) ok = ds4_gpu_begin_commands() != 0;
     }
+
+#ifdef DS4_ROCM_BUILD
+    if (rocm_batch_selected_async_started) {
+        if (ok && !shared_done) {
+            DS4_METAL_ENCODE_PREFILL_SHARED_EXPERT();
+            shared_done = ok;
+        }
+        const bool finish_ok =
+            rocm_graph_batch_selected_async_load_finish(&rocm_batch_selected_async);
+        ok = ok && finish_ok;
+    }
+#endif
 
     if (ok) {
         ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
@@ -18791,22 +19721,20 @@ static bool metal_graph_seed_streaming_expert_cache_from_prefill(
         }
         const uint64_t gate_expert_bytes = layer->ffn_gate_exps->dim[1] * gate_row_bytes;
         const uint64_t down_expert_bytes = layer->ffn_down_exps->dim[1] * down_row_bytes;
+        const ds4_gpu_stream_expert_table table =
+            graph_stream_expert_table_make(model,
+                                           layer,
+                                           il,
+                                           gate_expert_bytes,
+                                           down_expert_bytes);
         for (uint32_t row = 0; row < seed_tokens; row++) {
             const size_t sel_off = ((size_t)il *
                                     DS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS +
                                     row) * DS4_N_EXPERT_USED;
             if (ds4_gpu_stream_expert_cache_seed_selected(
-                        model->map,
-                        model->size,
-                        il,
+                        &table,
                         selected + sel_off,
-                        DS4_N_EXPERT,
-                        DS4_N_EXPERT_USED,
-                        layer->ffn_gate_exps->abs_offset,
-                        layer->ffn_up_exps->abs_offset,
-                        layer->ffn_down_exps->abs_offset,
-                        gate_expert_bytes,
-                        down_expert_bytes) == 0) {
+                        DS4_N_EXPERT_USED) == 0) {
                 return false;
             }
             seeded_rows++;
@@ -18918,19 +19846,17 @@ static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
         }
         const uint64_t gate_expert_bytes = layer->ffn_gate_exps->dim[1] * gate_row_bytes;
         const uint64_t down_expert_bytes = layer->ffn_down_exps->dim[1] * down_row_bytes;
+        const ds4_gpu_stream_expert_table table =
+            graph_stream_expert_table_make(model,
+                                           layer,
+                                           il,
+                                           gate_expert_bytes,
+                                           down_expert_bytes);
         if (ds4_gpu_stream_expert_cache_seed_experts(
-                    model->map,
-                    model->size,
-                    il,
+                    &table,
                     experts[il],
                     priorities[il],
-                    n,
-                    DS4_N_EXPERT,
-                    layer->ffn_gate_exps->abs_offset,
-                    layer->ffn_up_exps->abs_offset,
-                    layer->ffn_down_exps->abs_offset,
-                    gate_expert_bytes,
-                    down_expert_bytes) == 0) {
+                    n) == 0) {
             return false;
         }
         seeded_layers++;
@@ -19403,6 +20329,14 @@ static bool metal_graph_prefill_layer_major(
     bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
     if (!ok) return false;
 
+#ifdef DS4_ROCM_BUILD
+    if (g->ssd_streaming &&
+        DS4_MODEL_VARIANT == DS4_VARIANT_PRO &&
+        n_tokens >= 1024u) {
+        ds4_gpu_stream_expert_cache_release_resident();
+    }
+#endif
+
     if (!metal_graph_warmup_prefill_kernels(g, model, weights, n_tokens)) return false;
 
     const bool split_profile = getenv("DS4_METAL_GRAPH_PREFILL_SPLIT_PROFILE") != NULL;
@@ -19529,7 +20463,12 @@ static bool metal_graph_prefill_layer_major(
         layer_prepare && layer_prepare_overlap ?
         metal_graph_stream_prefill_layer_prepare_ahead() : 1u;
     const bool batch_selected_addr =
-        metal_graph_stream_prefill_batch_selected_addr_enabled(g, weights, n_tokens);
+        metal_graph_stream_prefill_batch_selected_addr_enabled(g, weights, n_tokens) ||
+        metal_graph_cuda_stream_prefill_batch_selected_addr_enabled(g, weights, n_tokens);
+#ifdef DS4_ROCM_BUILD
+    rocm_graph_stream_layer_expert_load rocm_full_layer_load;
+    memset(&rocm_full_layer_load, 0, sizeof(rocm_full_layer_load));
+#endif
     if (g->ssd_streaming && DS4_N_LAYER > 0) {
         if (layer_prepare) {
             if (!metal_graph_stream_prepare_start_if_needed(g,
@@ -19553,6 +20492,17 @@ static bool metal_graph_prefill_layer_major(
             }
         }
     }
+#ifdef DS4_ROCM_BUILD
+    if (g->ssd_streaming && DS4_N_LAYER > 0 &&
+        !rocm_graph_stream_layer_expert_load_start_next(&rocm_full_layer_load,
+                                                        g,
+                                                        model,
+                                                        weights,
+                                                        0,
+                                                        n_tokens)) {
+        return false;
+    }
+#endif
 
     double t_layer0 = (profile || throttle) ? now_sec() : 0.0;
     ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
@@ -19575,6 +20525,10 @@ static bool metal_graph_prefill_layer_major(
         }
     }
     if (!ok) {
+#ifdef DS4_ROCM_BUILD
+        (void)rocm_graph_stream_layer_expert_load_join(&rocm_full_layer_load);
+        (void)ds4_gpu_stream_expert_cache_release_layer_cache();
+#endif
         if (layer_prepare) {
             (void)metal_graph_stream_prepare_join_all(layer_prepare_slots,
                                                       layer_prepare_ahead);
@@ -19602,9 +20556,39 @@ static bool metal_graph_prefill_layer_major(
             ok = false;
             break;
         }
+#ifdef DS4_ROCM_BUILD
+        const bool rocm_full_layer_stream_prefill =
+            rocm_graph_stream_prefill_full_layer_enabled(g,
+                                                         &weights->layer[il],
+                                                         n_tokens);
+        if (rocm_full_layer_stream_prefill &&
+            !rocm_graph_stream_layer_expert_load_ready(&rocm_full_layer_load,
+                                                       g,
+                                                       model,
+                                                       weights,
+                                                       il,
+                                                       n_tokens)) {
+            ok = false;
+            break;
+        }
+        if (rocm_full_layer_stream_prefill &&
+            !rocm_graph_stream_layer_expert_load_start_next(&rocm_full_layer_load,
+                                                            g,
+                                                            model,
+                                                            weights,
+                                                            il + 1u,
+                                                            n_tokens)) {
+            ok = false;
+            break;
+        }
+#endif
         if (g->ssd_streaming) {
             g->streaming_static_decode_map_current = false;
-            const bool map_ok = batch_selected_addr ?
+            bool decode_only_map = batch_selected_addr;
+#ifdef DS4_ROCM_BUILD
+            decode_only_map = decode_only_map || rocm_full_layer_stream_prefill;
+#endif
+            const bool map_ok = decode_only_map ?
                 metal_graph_stream_map_layer_decode(model, weights, il) :
                 metal_graph_stream_map_layer(model, weights, il);
             if (!map_ok) {
@@ -19685,6 +20669,15 @@ static bool metal_graph_prefill_layer_major(
             const double t_ffn_encoded = now_sec();
             if (ok) ok = ds4_gpu_end_commands() != 0;
             const double t_ffn_done = now_sec();
+#ifdef DS4_ROCM_BUILD
+            if (ok) {
+                ok = rocm_graph_stream_seed_full_layer_selected(g,
+                                                                model,
+                                                                &weights->layer[il],
+                                                                il,
+                                                                n_tokens);
+            }
+#endif
             if (ok) {
                 ok = metal_graph_stream_prefill_selected_profile_layer(
                         g,
@@ -19722,6 +20715,15 @@ static bool metal_graph_prefill_layer_major(
             const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
             if (ok) ok = ds4_gpu_end_commands() != 0;
             const double t_done = (profile || throttle) ? now_sec() : 0.0;
+#ifdef DS4_ROCM_BUILD
+            if (ok) {
+                ok = rocm_graph_stream_seed_full_layer_selected(g,
+                                                                model,
+                                                                &weights->layer[il],
+                                                                il,
+                                                                n_tokens);
+            }
+#endif
             if (ok) {
                 ok = metal_graph_stream_prefill_selected_profile_layer(
                         g,
@@ -19764,6 +20766,10 @@ static bool metal_graph_prefill_layer_major(
             }
         }
         if (!ok) {
+#ifdef DS4_ROCM_BUILD
+            (void)rocm_graph_stream_layer_expert_load_join(&rocm_full_layer_load);
+            (void)ds4_gpu_stream_expert_cache_release_layer_cache();
+#endif
             if (layer_prepare) {
                 (void)metal_graph_stream_prepare_join_all(layer_prepare_slots,
                                                           layer_prepare_ahead);
@@ -19786,6 +20792,10 @@ static bool metal_graph_prefill_layer_major(
         }
     }
     if (!ok) {
+#ifdef DS4_ROCM_BUILD
+        (void)rocm_graph_stream_layer_expert_load_join(&rocm_full_layer_load);
+        (void)ds4_gpu_stream_expert_cache_release_layer_cache();
+#endif
         if (layer_prepare) {
             (void)metal_graph_stream_prepare_join_all(layer_prepare_slots,
                                                       layer_prepare_ahead);
@@ -19797,6 +20807,10 @@ static bool metal_graph_prefill_layer_major(
     }
     if (show_progress) fputc('\n', stderr);
     metal_graph_stream_prefill_selected_profile_summary(g);
+#ifdef DS4_ROCM_BUILD
+    (void)ds4_gpu_stream_expert_cache_release_layer_cache();
+    if (g->ssd_streaming) ds4_gpu_release_q8_f16_cache();
+#endif
     if (!metal_graph_seed_streaming_expert_cache_from_hotlist(g, model, weights)) {
         return false;
     }
@@ -20369,8 +21383,7 @@ static uint32_t metal_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_c
 }
 
 /* Choose the prefill ubatch size. Whole-batch is fastest for normal prompts.
- * Long prompts default to 4096-token chunks, except PRO and Strix Halo ROCm
- * where larger raw/cache chunks are measurably better on long contexts. */
+ * Long Flash prompts default to 4096-token chunks; PRO defaults to 8192. */
 static uint32_t metal_graph_prefill_cap_for_prompt(int prompt_len,
                                                    uint32_t prefill_chunk) {
     return ds4_prefill_cap_for_prompt(prompt_len, prefill_chunk);
@@ -22203,6 +23216,49 @@ const char *ds4_backend_name(ds4_backend backend) {
     case DS4_BACKEND_CPU:   return "cpu";
     }
     return "unknown";
+}
+
+static void ds4_linux_graph_backend_set_oom_score(ds4_backend backend) {
+#if defined(__linux__) && !defined(DS4_NO_GPU)
+    static bool attempted = false;
+    if (attempted) return;
+    attempted = true;
+
+    const int score = 1000;
+    FILE *fp = fopen("/proc/self/oom_score_adj", "w");
+    if (!fp) {
+        fprintf(stderr,
+                "ds4: failed to set Linux %s backend oom_score_adj=%d: %s\n",
+                ds4_backend_name(backend),
+                score,
+                strerror(errno));
+        return;
+    }
+    if (fprintf(fp, "%d\n", score) < 0) {
+        const int err = errno;
+        fclose(fp);
+        fprintf(stderr,
+                "ds4: failed to write Linux %s backend oom_score_adj=%d: %s\n",
+                ds4_backend_name(backend),
+                score,
+                strerror(err));
+        return;
+    }
+    if (fclose(fp) != 0) {
+        fprintf(stderr,
+                "ds4: failed to close Linux %s backend oom_score_adj=%d: %s\n",
+                ds4_backend_name(backend),
+                score,
+                strerror(errno));
+        return;
+    }
+    fprintf(stderr,
+            "ds4: Linux %s backend set oom_score_adj=%d\n",
+            ds4_backend_name(backend),
+            score);
+#else
+    (void)backend;
+#endif
 }
 
 bool ds4_think_mode_enabled(ds4_think_mode mode) {
@@ -24414,16 +25470,19 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
 #else
     if (!e ||
         !e->ssd_streaming ||
-        e->backend != DS4_BACKEND_METAL ||
+        !ds4_backend_supports_ssd_streaming(e->backend) ||
         e->ssd_streaming_cache_experts != 0 ||
         e->ssd_streaming_cache_bytes != 0) {
+        return true;
+    }
+    if (!ds4_backend_supports_streaming_auto_cache(e->backend)) {
         return true;
     }
 
     const uint64_t recommended = ds4_gpu_recommended_working_set_size();
     if (recommended == 0) {
         fprintf(stderr,
-                "ds4: Metal SSD streaming auto cache: recommended working set unavailable; "
+                "ds4: SSD streaming auto cache: recommended working set unavailable; "
                 "set --ssd-streaming-cache-experts N or NGB explicitly\n");
         return false;
     }
@@ -24431,14 +25490,14 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
     uint64_t non_routed_bytes = 0;
     if (!weights_streaming_non_routed_bytes(&e->weights, &non_routed_bytes)) {
         fprintf(stderr,
-                "ds4: Metal SSD streaming auto cache could not measure non-routed model weights\n");
+                "ds4: SSD streaming auto cache could not measure non-routed model weights\n");
         return false;
     }
 
     uint64_t per_expert_bytes = 0;
     if (!ds4_streaming_routed_expert_bytes(&e->weights, &per_expert_bytes)) {
         fprintf(stderr,
-                "ds4: Metal SSD streaming auto cache could not measure routed expert size\n");
+                "ds4: SSD streaming auto cache could not measure routed expert size\n");
         return false;
     }
 
@@ -24450,15 +25509,16 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
                                  max_model_experts,
                                  &plan)) {
         fprintf(stderr,
-                "ds4: Metal SSD streaming auto cache could not compute a valid cache budget\n");
+                "ds4: SSD streaming auto cache could not compute a valid cache budget\n");
         return false;
     }
 
     e->ssd_streaming_cache_experts = plan.cache_experts;
     fprintf(stderr,
-            "ds4: Metal SSD streaming auto cache budget\n");
+            "ds4: SSD streaming auto cache budget\n");
     fprintf(stderr,
-            "ds4:   Metal recommends %.2f GiB working set\n",
+            "ds4:   %s recommends %.2f GiB working set\n",
+            ds4_backend_name(e->backend),
             (double)recommended / 1073741824.0);
     fprintf(stderr,
             "ds4:   using 80%% total for model + cached experts: %.2f GiB\n",
@@ -24628,12 +25688,13 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
+    if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
     if (opt->warm_weights) model_warm_weights(&e->model);
     if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
-    if (e->ssd_streaming && e->backend != DS4_BACKEND_METAL) {
-        fprintf(stderr, "ds4: --ssd-streaming is currently supported only with --metal\n");
+    if (e->ssd_streaming && !ds4_backend_supports_ssd_streaming(e->backend)) {
+        fprintf(stderr, "ds4: --ssd-streaming is currently supported only with --metal/--cuda/--rocm\n");
         ds4_engine_close(e);
         *out = NULL;
         return 1;
@@ -24668,8 +25729,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             e->ssd_streaming_cache_bytes > safe_cache_bytes) {
             e->ssd_streaming_cache_bytes = safe_cache_bytes;
             fprintf(stderr,
-                    "ds4: Metal SSD streaming cache budget %.2f GiB capped to %.2f GiB "
+                    "ds4: %s SSD streaming cache budget %.2f GiB capped to %.2f GiB "
                     "to keep expert buffers lockable\n",
+                    ds4_backend_name(e->backend),
                     (double)requested_cache_bytes / 1073741824.0,
                     (double)e->ssd_streaming_cache_bytes / 1073741824.0);
         }
@@ -24688,7 +25750,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         e->ssd_streaming_cache_experts = budget;
         fprintf(stderr,
-                "ds4: Metal SSD streaming cache budget %.2f GiB / %.2f MiB per expert = %u experts\n",
+                "ds4: %s SSD streaming cache budget %.2f GiB / %.2f MiB per expert = %u experts\n",
+                ds4_backend_name(e->backend),
                 (double)e->ssd_streaming_cache_bytes / 1073741824.0,
                 (double)per_expert_bytes / 1048576.0,
                 budget);
@@ -24752,6 +25815,39 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             return 1;
         }
         ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
+        if (e->ssd_streaming) {
+            /*
+             * Pin the expert cache's slab size class to the model's uniform
+             * per-expert bytes, and count mixed-precision (boosted) layers:
+             * those are served through mapped model views instead of the
+             * cache (see weights_streaming_layer_experts_uniform).
+             */
+            uint64_t slab_expert_bytes = 0;
+            if (ds4_streaming_routed_expert_bytes(&e->weights, &slab_expert_bytes)) {
+                ds4_gpu_set_streaming_expert_cache_expert_bytes(slab_expert_bytes);
+                uint32_t routed = 0, boosted = 0;
+                for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                    const ds4_layer_weights *l = &e->weights.layer[il];
+                    if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) continue;
+                    routed++;
+                    if (!weights_streaming_layer_experts_uniform(&e->weights, il)) boosted++;
+                }
+                if (boosted > 0) {
+                    fprintf(stderr,
+                            "ds4: SSD streaming mixed-precision model: %u/%u routed layers "
+                            "off the slab size class will bypass the expert cache and read "
+                            "experts via mapped model views\n",
+                            boosted, routed);
+                }
+                if (boosted * 2 > routed) {
+                    fprintf(stderr,
+                            "ds4: WARNING: the majority of routed layers (%u/%u) are off the "
+                            "slab size class (is the FIRST routed layer itself boosted?); "
+                            "expert-cache hit rate will be catastrophic\n",
+                            boosted, routed);
+                }
+            }
+        }
         (void)ds4_gpu_set_model_fd(e->model.fd);
         int model_map_ok = 0;
         uint64_t *load_offsets = NULL;
@@ -25446,6 +26542,10 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         }
 
         bool ok = true;
+        if (g->ssd_streaming && !input_hc) {
+            g->streaming_static_decode_map_current = false;
+            ok = metal_graph_stream_map_token(&e->model, &e->weights);
+        }
         if (input_hc) {
             ok = ds4_gpu_tensor_write(g->cur_hc, 0, input_hc, hc_dim * sizeof(float)) != 0;
         }
@@ -25464,33 +26564,65 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos0, 1);
         const uint32_t split_after_layers = metal_graph_token_split_after_layers();
         uint32_t encoded_layers = 0;
-        for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
-            ok = metal_graph_encode_decode_layer(g,
-                                                 &e->model,
-                                                 &e->weights.layer[il],
-                                                 il,
-                                                 pos0,
-                                                 g->layer_raw_cache[il],
-                                                 g->raw_cap,
-                                                 raw_row,
-                                                 n_raw,
-                                                 tokens[0]);
-            ds4_gpu_tensor *tmp = g->cur_hc;
-            g->cur_hc = g->after_ffn_hc;
-            g->after_ffn_hc = tmp;
-            encoded_layers++;
-            if (ok &&
-                split_after_layers != 0 &&
-                encoded_layers == split_after_layers &&
-                il < layer_end)
-            {
-                ok = ds4_gpu_flush_commands() != 0;
+        if (g->ssd_streaming) {
+            if (ok) ok = ds4_gpu_end_commands() != 0;
+            for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+                g->streaming_static_decode_map_current = false;
+                ok = metal_graph_stream_map_layer_decode(&e->model, &e->weights, il);
+                if (ok) ok = ds4_gpu_begin_commands() != 0;
+                if (ok) {
+                    ok = metal_graph_encode_decode_layer(g,
+                                                         &e->model,
+                                                         &e->weights.layer[il],
+                                                         il,
+                                                         pos0,
+                                                         g->layer_raw_cache[il],
+                                                         g->raw_cap,
+                                                         raw_row,
+                                                         n_raw,
+                                                         tokens[0]);
+                    ds4_gpu_tensor *tmp = g->cur_hc;
+                    g->cur_hc = g->after_ffn_hc;
+                    g->after_ffn_hc = tmp;
+                }
+                if (ok) ok = ds4_gpu_end_commands() != 0;
             }
+            if (ok && output_logits) {
+                g->streaming_static_decode_map_current = false;
+                ok = metal_graph_stream_map_output(&e->model, &e->weights);
+                if (ok) ok = ds4_gpu_begin_commands() != 0;
+                if (ok) ok = metal_graph_encode_output_head(g, &e->model, &e->weights, e->weights.output->dim[1]);
+                if (ok) ok = ds4_gpu_end_commands() != 0;
+            }
+        } else {
+            for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+                ok = metal_graph_encode_decode_layer(g,
+                                                     &e->model,
+                                                     &e->weights.layer[il],
+                                                     il,
+                                                     pos0,
+                                                     g->layer_raw_cache[il],
+                                                     g->raw_cap,
+                                                     raw_row,
+                                                     n_raw,
+                                                     tokens[0]);
+                ds4_gpu_tensor *tmp = g->cur_hc;
+                g->cur_hc = g->after_ffn_hc;
+                g->after_ffn_hc = tmp;
+                encoded_layers++;
+                if (ok &&
+                    split_after_layers != 0 &&
+                    encoded_layers == split_after_layers &&
+                    il < layer_end)
+                {
+                    ok = ds4_gpu_flush_commands() != 0;
+                }
+            }
+            if (ok && output_logits) {
+                ok = metal_graph_encode_output_head(g, &e->model, &e->weights, e->weights.output->dim[1]);
+            }
+            if (ok) ok = ds4_gpu_end_commands() != 0;
         }
-        if (ok && output_logits) {
-            ok = metal_graph_encode_output_head(g, &e->model, &e->weights, e->weights.output->dim[1]);
-        }
-        if (ok) ok = ds4_gpu_end_commands() != 0;
         if (ok && !output_hc && !output_logits) ok = ds4_gpu_synchronize() != 0;
         if (ok && output_hc) {
             ok = ds4_gpu_tensor_read(g->cur_hc, 0, output_hc, hc_dim * sizeof(float)) != 0;
@@ -25518,7 +26650,12 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         .cap = (int)n_tokens,
     };
 
-    bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, &span, 0, n_tokens);
+    bool ok = true;
+    if (g->ssd_streaming && !input_hc) {
+        g->streaming_static_decode_map_current = false;
+        ok = metal_graph_stream_map_token(&e->model, &e->weights);
+    }
+    if (ok) ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, &span, 0, n_tokens);
     if (ok && input_hc) {
         ok = ds4_gpu_tensor_write(g->batch_cur_hc, 0, input_hc, hc_bytes) != 0;
     } else if (ok) {
@@ -25533,26 +26670,56 @@ int ds4_session_eval_layer_slice(ds4_session *s,
 
     ds4_gpu_tensor *last_hc = NULL;
     ds4_gpu_tensor *saved_cur = NULL;
-    if (ok) ok = ds4_gpu_begin_commands() != 0;
-    for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
-        ok = metal_graph_encode_layer_batch(g,
-                                            &e->model,
-                                            &e->weights.layer[il],
-                                            il,
-                                            pos0,
-                                            n_tokens);
+    const bool batch_selected_addr =
+        g->ssd_streaming &&
+        layer_start == 0 &&
+        (metal_graph_stream_prefill_batch_selected_addr_enabled(g, &e->weights, n_tokens) ||
+         metal_graph_cuda_stream_prefill_batch_selected_addr_enabled(g, &e->weights, n_tokens));
+    if (g->ssd_streaming) {
+        for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+            g->streaming_static_decode_map_current = false;
+            ok = batch_selected_addr ?
+                 metal_graph_stream_map_layer_decode(&e->model, &e->weights, il) :
+                 metal_graph_stream_map_layer(&e->model, &e->weights, il);
+            if (ok) ok = ds4_gpu_begin_commands() != 0;
+            if (ok) {
+                ok = metal_graph_encode_layer_batch(g,
+                                                    &e->model,
+                                                    &e->weights.layer[il],
+                                                    il,
+                                                    pos0,
+                                                    n_tokens);
+            }
+            if (ok) ok = ds4_gpu_end_commands() != 0;
+        }
+    } else {
+        if (ok) ok = ds4_gpu_begin_commands() != 0;
+        for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+            ok = metal_graph_encode_layer_batch(g,
+                                                &e->model,
+                                                &e->weights.layer[il],
+                                                il,
+                                                pos0,
+                                                n_tokens);
+        }
     }
     if (ok && output_logits) {
         saved_cur = g->cur_hc;
         last_hc = metal_graph_tensor_row_view(g->batch_cur_hc, n_tokens - 1u, hc_dim);
         ok = last_hc != NULL;
+        if (ok && g->ssd_streaming) {
+            g->streaming_static_decode_map_current = false;
+            ok = metal_graph_stream_map_output(&e->model, &e->weights);
+        }
         if (ok) {
             g->cur_hc = last_hc;
-            ok = metal_graph_encode_output_head(g, &e->model, &e->weights, e->weights.output->dim[1]);
+            if (g->ssd_streaming) ok = ds4_gpu_begin_commands() != 0;
+            if (ok) ok = metal_graph_encode_output_head(g, &e->model, &e->weights, e->weights.output->dim[1]);
+            if (ok && g->ssd_streaming) ok = ds4_gpu_end_commands() != 0;
             g->cur_hc = saved_cur;
         }
     }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
+    if (ok && !g->ssd_streaming) ok = ds4_gpu_end_commands() != 0;
     if (saved_cur) g->cur_hc = saved_cur;
     if (last_hc) ds4_gpu_tensor_free(last_hc);
 

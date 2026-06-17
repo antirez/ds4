@@ -386,7 +386,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         topk->bytes < (uint64_t)n_tokens * top_k * sizeof(int32_t)) {
         return 0;
     }
-    if (top_k > 512u) return 0;
+    if (top_k > DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP) return 0;
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
@@ -422,7 +422,9 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         if (!cuda_ok(cudaGetLastError(), "indexed attention topk sort launch")) return 0;
         topk_ptr = sorted;
     }
-    if (n_tokens > 1 && head_dim == 512 && top_k <= 512u) {
+    if (n_tokens > 1 &&
+        head_dim == 512 &&
+        top_k <= DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         if (!g_quality_mode && n_head <= 64u) {
             dim3 grid(n_tokens, (n_head + 31u) / 32u, 1);
@@ -858,6 +860,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
         group_dim == 0 || rank == 0 || n_groups == 0 || out_dim == 0 || n_tokens == 0) {
         return 0;
     }
+    if (g_ssd_streaming_mode && n_tokens > 1u) return 0;
     const uint64_t low_dim = (uint64_t)n_groups * rank;
     const uint64_t blocks_a = (group_dim + 31) / 32;
     const uint64_t blocks_b = (low_dim + 31) / 32;
@@ -987,7 +990,9 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
             cuda_model_range_ptr(model_map, out_b_offset, out_b_bytes, "attn_out_b"));
     if (!out_a || !out_b) return 0;
 
-    const int attn_output_cublas = cuda_runtime_config()->attention_output_cublas_all;
+    const int attn_output_cublas =
+        cuda_runtime_config()->attention_output_cublas_all &&
+        (n_tokens == 1u || !g_ssd_streaming_mode);
     if (!attn_output_cublas) {
         if ((group_dim & 31u) == 0u && rank <= UINT32_MAX && n_tokens <= UINT32_MAX) {
             const uint32_t rows_per_block = 32u;
@@ -1227,7 +1232,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a preq launch")) return 0;
     }
 
-    if (cuda_runtime_config()->attention_output_cublas_all && !g_quality_mode) {
+    if (attn_output_cublas && !g_quality_mode) {
         if (cuda_matmul_q8_0_tensor_f16_gemm(out,
                                              model_map,
                                              model_size,

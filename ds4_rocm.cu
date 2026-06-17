@@ -27,6 +27,7 @@
 #include <limits.h>
 #include <math.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +36,8 @@
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
+
+#include "ds4_gpu.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846

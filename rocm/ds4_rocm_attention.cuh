@@ -4,6 +4,9 @@
 // glue unchanged while kernel implementations are split into modules.
 
 #define DS4_ROCM_ATTENTION_PREFILL_MIXED_SCORE_CAP 2048u
+#define DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP 1024u
+#define DS4_ROCM_ATTENTION_INDEXED_SCORE_CAP \
+    (256u + DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP)
 
 __global__ static void attention_prefill_raw_kernel(
         float *heads,
@@ -536,7 +539,7 @@ __global__ static void attention_decode_indexed_mixed_one_fast_oldhip_kernel(
     const uint32_t h = (uint32_t)blockIdx.x;
     if (h >= n_head) return;
     extern __shared__ float scores[];
-    __shared__ uint32_t comp_rows[512];
+    __shared__ uint32_t comp_rows[DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP];
     __shared__ uint32_t comp_count_s;
     const uint32_t tid = threadIdx.x;
     const float *qh = q + (uint64_t)h * head_dim;
@@ -549,7 +552,9 @@ __global__ static void attention_decode_indexed_mixed_one_fast_oldhip_kernel(
     }
     if (tid == 0u) {
         comp_count_s = 0;
-        for (uint32_t i = 0; i < top_k && comp_count_s < 512u; i++) {
+        for (uint32_t i = 0;
+             i < top_k && comp_count_s < DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP;
+             i++) {
             const int32_t ci = topk[i];
             if (ci < 0) continue;
             const uint32_t c = (uint32_t)ci;
@@ -892,9 +897,9 @@ __global__ static void attention_indexed_mixed_kernel(
         if (visible_comp > n_comp) visible_comp = n_comp;
     }
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
-    __shared__ float scores[768];
+    __shared__ float scores[DS4_ROCM_ATTENTION_INDEXED_SCORE_CAP];
     __shared__ uint32_t raw_rows[256];
-    __shared__ uint32_t comp_rows[512];
+    __shared__ uint32_t comp_rows[DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP];
     __shared__ float partial[256];
     __shared__ float max_s;
     __shared__ float denom;
@@ -928,7 +933,9 @@ __global__ static void attention_indexed_mixed_kernel(
         raw_rows[r] = (raw_start + raw_first_idx + r) % raw_cap;
     }
     if (threadIdx.x == 0) {
-        for (uint32_t i = 0; i < top_k && comp_count < 512u; i++) {
+        for (uint32_t i = 0;
+             i < top_k && comp_count < DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP;
+             i++) {
             int32_t c = topk[(uint64_t)t * top_k + i];
             if (c >= 0 && (uint32_t)c < visible_comp) comp_rows[comp_count++] = (uint32_t)c;
         }
@@ -1046,7 +1053,7 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     const bool valid_head = head < n_head;
 
     __shared__ uint32_t raw_rows[256];
-    __shared__ uint32_t comp_rows[512];
+    __shared__ uint32_t comp_rows[DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP];
     __shared__ uint32_t raw_count;
     __shared__ uint32_t raw_first_idx;
     __shared__ uint32_t comp_count_s;
@@ -1080,7 +1087,9 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
                 }
             }
         }
-        for (uint32_t i = 0; i < top_k && comp_count_s < 512u; i++) {
+        for (uint32_t i = 0;
+             i < top_k && comp_count_s < DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP;
+             i++) {
             const int32_t ci = topk[(uint64_t)t * top_k + i];
             if (ci < 0) continue;
             const uint32_t c = (uint32_t)ci;
