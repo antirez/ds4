@@ -10376,6 +10376,15 @@ decode_again:
     const double decode_t0 = now_sec();
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
+    /* SSE keepalive during decode.  The prefill keepalive (server_progress_cb
+     * + prefill_display events) keeps the connection alive while the model is
+     * processing input; once we reach decode, long stretches with no
+     * streamable bytes still happen — typically when the model is mid-thinking
+     * (no `</think>` yet, nothing flushed to the client) or accumulating a
+     * large tool_use input JSON (held back until the block closes).  Without
+     * a periodic comment line, client TCP idle-timeouts close the socket
+     * during those quiet stretches and the final stream write fails. */
+    double decode_last_keepalive = decode_t0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
     const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
     bool tool_scan_waiting_for_think_close =
@@ -10388,6 +10397,23 @@ decode_again:
 
     while (!g_stop_requested && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
+        /* Emit a `:` SSE comment line at most every 15 seconds when the
+         * client requested streaming.  Best-effort: if the write fails the
+         * socket is already gone, end the turn with the same error path the
+         * regular event writer uses. */
+        if (j->req.stream) {
+            double now_kp = now_sec();
+            if (now_kp - decode_last_keepalive >= 15.0) {
+                static const char ka[] = ": decode\n\n";
+                if (!send_all(j->fd, ka, sizeof(ka) - 1)) {
+                    finish = "error";
+                    snprintf(err, sizeof(err),
+                             "client stream write failed during decode heartbeat");
+                    break;
+                }
+                decode_last_keepalive = now_kp;
+            }
+        }
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
