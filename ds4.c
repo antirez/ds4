@@ -9686,6 +9686,7 @@ static void layer_forward_raw_swa_one(
         uint32_t                  pos,
         int                       token,
         const float             * steering_dirs,
+        const float             * steering_ffn_dirs,
         float                     steering_attn_scale,
         float                     steering_ffn_scale,
         ds4_cpu_decode_scratch  * scratch) {
@@ -9820,7 +9821,8 @@ static void layer_forward_raw_swa_one(
 
     t0 = profile ? now_sec() : 0.0;
     layer_ffn_one_decode_scratch(out_hc, model, layer, scratch->after_attn_hc, il, token,
-                                 steering_dirs, steering_ffn_scale, scratch);
+                                 steering_ffn_dirs ? steering_ffn_dirs : steering_dirs,
+                                 steering_ffn_scale, scratch);
     if (profile) t_ffn = now_sec() - t0;
 
     if (profile) {
@@ -9860,6 +9862,7 @@ static void forward_token_raw_swa_cpu_decode_scratch(
         int                 token,
         uint32_t            pos,
         const float       * steering_dirs,
+        const float       * steering_ffn_dirs,
         float               steering_attn_scale,
         float               steering_ffn_scale,
         ds4_cpu_decode_scratch * scratch) {
@@ -9873,6 +9876,7 @@ static void forward_token_raw_swa_cpu_decode_scratch(
         layer_forward_raw_swa_one(next, model, &weights->layer[il], &cache->layer[il],
                                   cur, il, pos, token,
                                   steering_dirs,
+                                  steering_ffn_dirs,
                                   steering_attn_scale,
                                   steering_ffn_scale,
                                   scratch);
@@ -9905,7 +9909,7 @@ static void forward_token_raw_swa_cpu(
     }
     cpu_decode_scratch_init(&scratch, ctx_guess);
     forward_token_raw_swa_cpu_decode_scratch(logits, model, weights, cache, token, pos,
-                                             NULL, 0.0f, 0.0f, &scratch);
+                                             NULL, NULL, 0.0f, 0.0f, &scratch);
     cpu_decode_scratch_free(&scratch);
 }
 #endif
@@ -9919,6 +9923,7 @@ static void prefill_layer_major_cpu(
         ds4_kv_cache      * cache,
         const token_vec   * prompt,
         const float       * steering_dirs,
+        const float       * steering_ffn_dirs,
         float               steering_attn_scale,
         float               steering_ffn_scale) {
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
@@ -9947,6 +9952,8 @@ static void prefill_layer_major_cpu(
 
     free(plain);
 
+    const float *ffn_dirs = steering_ffn_dirs ? steering_ffn_dirs : steering_dirs;
+
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         fprintf(stderr, "ds4: prefill layer %u/%u\r", il + 1, (uint32_t)DS4_N_LAYER);
         fflush(stderr);
@@ -9973,7 +9980,7 @@ static void prefill_layer_major_cpu(
                                     prompt->v + t,
                                     nb,
                                     il,
-                                    steering_dirs,
+                                    ffn_dirs,
                                     steering_ffn_scale);
                 }
             } else if (shared_batch_ffn) {
@@ -9984,7 +9991,7 @@ static void prefill_layer_major_cpu(
                                        prompt->v,
                                        (uint32_t)n_tok,
                                        il,
-                                       steering_dirs,
+                                       ffn_dirs,
                                        steering_ffn_scale);
             } else if (parallel_ffn) {
                 layer_ffn_tokens_parallel(next,
@@ -9994,7 +10001,7 @@ static void prefill_layer_major_cpu(
                                           prompt->v,
                                           (uint32_t)n_tok,
                                           il,
-                                          steering_dirs,
+                                          ffn_dirs,
                                           steering_ffn_scale);
             } else {
                 for (uint64_t t = 0; t < n_tok; t++) {
@@ -10004,7 +10011,7 @@ static void prefill_layer_major_cpu(
                                   attn + t * hc_dim,
                                   il,
                                   prompt->v[t],
-                                  steering_dirs,
+                                  ffn_dirs,
                                   steering_ffn_scale,
                                   false);
                 }
@@ -10031,7 +10038,7 @@ static void prefill_layer_major_cpu(
                                 prompt->v + t,
                                 nb,
                                 il,
-                                steering_dirs,
+                                ffn_dirs,
                                 steering_ffn_scale);
             }
         } else {
@@ -10049,6 +10056,7 @@ static void prefill_layer_major_cpu(
                                           (uint32_t)t,
                                           prompt->v[t],
                                           steering_dirs,
+                                          ffn_dirs,
                                           steering_attn_scale,
                                           steering_ffn_scale,
                                           &decode_scratch);
@@ -10480,8 +10488,10 @@ typedef struct {
     ds4_gpu_tensor *batch_ffn_out;
     bool materialize_ffn_out;
     ds4_gpu_tensor *directional_steering_dirs;
+    ds4_gpu_tensor *directional_steering_think_dirs;
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
+    bool directional_steering_ffn_use_think;
     uint32_t power_percent;
     double prefill_layer_avg_sec[DS4_MAX_LAYER];
     double decode_token_avg_sec;
@@ -10534,6 +10544,7 @@ static void graph_power_note_decode_token(ds4_gpu_graph *g, double elapsed_sec) 
 /* Release every Metal tensor owned by the whole-model graph runtime. */
 static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->directional_steering_dirs);
+    ds4_gpu_tensor_free(g->directional_steering_think_dirs);
     ds4_gpu_tensor_free(g->batch_ffn_out);
     ds4_gpu_tensor_free(g->batch_routed_out);
     ds4_gpu_tensor_free(g->batch_routed_down);
@@ -10692,8 +10703,13 @@ static bool metal_graph_load_directional_steering(
         ds4_gpu_graph *g,
         const char      *path,
         float            attn_scale,
-        float            ffn_scale) {
-    if (attn_scale == 0.0f && ffn_scale == 0.0f) return true;
+        float            ffn_scale,
+        const char      *think_path,
+        float            think_ffn_scale,
+        float            think_ffn_decay_final) {
+    const bool think_wanted = think_path && think_path[0] &&
+                              (think_ffn_scale != 0.0f || think_ffn_decay_final != 0.0f);
+    if (attn_scale == 0.0f && ffn_scale == 0.0f && !think_wanted) return true;
 
     if (!path || !path[0]) {
         fprintf(stderr, "ds4: directional steering needs --dir-steering-file\n");
@@ -10714,10 +10730,28 @@ static bool metal_graph_load_directional_steering(
         fprintf(stderr, "ds4: failed to load directional steering vectors from %s\n", path);
         return false;
     }
+    if (think_wanted) {
+        float *tdirs = xmalloc((size_t)n * sizeof(tdirs[0]));
+        bool tok = read_f32_binary_file(think_path, tdirs, n);
+        if (tok) {
+            g->directional_steering_think_dirs = ds4_gpu_tensor_alloc(n * sizeof(tdirs[0]));
+            tok = g->directional_steering_think_dirs != NULL &&
+                  ds4_gpu_tensor_write(g->directional_steering_think_dirs, 0, tdirs, n * sizeof(tdirs[0])) != 0;
+        }
+        free(tdirs);
+        if (!tok) {
+            fprintf(stderr, "ds4: failed to load think directional steering vectors from %s\n", think_path);
+            return false;
+        }
+    }
     g->directional_steering_attn_scale = attn_scale;
     g->directional_steering_ffn_scale = ffn_scale;
     fprintf(stderr, "ds4: directional steering enabled: %s attn=%g ffn=%g\n",
             path, (double)attn_scale, (double)ffn_scale);
+    if (think_wanted) {
+        fprintf(stderr, "ds4: directional steering (think) enabled: %s ffn=%g\n",
+                think_path, (double)think_ffn_scale);
+    }
     return true;
 }
 
@@ -10726,18 +10760,21 @@ static bool metal_graph_directional_steering_attn_enabled(const ds4_gpu_graph *g
 }
 
 static bool metal_graph_directional_steering_ffn_enabled(const ds4_gpu_graph *g) {
-    return g && g->directional_steering_dirs && g->directional_steering_ffn_scale != 0.0f;
+    if (!g || g->directional_steering_ffn_scale == 0.0f) return false;
+    if (g->directional_steering_ffn_use_think && g->directional_steering_think_dirs) return true;
+    return g->directional_steering_dirs != NULL;
 }
 
 static bool metal_graph_apply_directional_steering(
         ds4_gpu_graph  *g,
         ds4_gpu_tensor *x,
+        ds4_gpu_tensor *dirs,
         uint32_t          il,
         uint32_t          rows,
         float             scale) {
-    if (!g || !g->directional_steering_dirs || scale == 0.0f) return true;
+    if (!g || !dirs || scale == 0.0f) return true;
     return ds4_gpu_directional_steering_project_tensor(x,
-                                            g->directional_steering_dirs,
+                                            dirs,
                                             il,
                                             DS4_N_EMBD,
                                             rows,
@@ -10749,7 +10786,10 @@ static bool metal_graph_apply_directional_steering_attn(
         ds4_gpu_tensor *x,
         uint32_t          il,
         uint32_t          rows) {
-    return metal_graph_apply_directional_steering(g, x, il, rows, g ? g->directional_steering_attn_scale : 0.0f);
+    return metal_graph_apply_directional_steering(g, x,
+                                                  g ? g->directional_steering_dirs : NULL,
+                                                  il, rows,
+                                                  g ? g->directional_steering_attn_scale : 0.0f);
 }
 
 static bool metal_graph_apply_directional_steering_ffn(
@@ -10757,7 +10797,13 @@ static bool metal_graph_apply_directional_steering_ffn(
         ds4_gpu_tensor *x,
         uint32_t          il,
         uint32_t          rows) {
-    return metal_graph_apply_directional_steering(g, x, il, rows, g ? g->directional_steering_ffn_scale : 0.0f);
+    ds4_gpu_tensor *dirs = NULL;
+    if (g) {
+        dirs = (g->directional_steering_ffn_use_think && g->directional_steering_think_dirs)
+            ? g->directional_steering_think_dirs : g->directional_steering_dirs;
+    }
+    return metal_graph_apply_directional_steering(g, x, dirs, il, rows,
+                                                  g ? g->directional_steering_ffn_scale : 0.0f);
 }
 
 static uint64_t metal_graph_kv_cache_bytes_for_context(uint32_t ctx_size, uint32_t raw_cap) {
@@ -13491,7 +13537,7 @@ static bool metal_graph_store_attn_comp_stage(
         ds4_gpu_graph *g,
         uint32_t       il,
         uint32_t       first_row,
-        uint32_t       rows) {
+    uint32_t       rows) {
     if (!g || il >= DS4_N_LAYER) return false;
     if (rows == 0) return true;
     if (!g->layer_attn_comp_cache[il] || !g->attn_comp_stage) return false;
@@ -21818,6 +21864,13 @@ struct ds4_engine {
     float *directional_steering_dirs;
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
+    int directional_steering_ffn_decay_tokens;
+    float directional_steering_ffn_decay_final;
+    char *directional_steering_think_file;
+    float *directional_steering_think_dirs;
+    float directional_steering_think_ffn_scale;
+    int directional_steering_think_ffn_decay_tokens;
+    float directional_steering_think_ffn_decay_final;
     int power_percent;
     uint32_t prefill_chunk;
     uint32_t ssd_streaming_cache_experts;
@@ -21831,6 +21884,22 @@ struct ds4_engine {
     bool metal_ready;
     bool mtp_ready;
 };
+
+static bool directional_steering_ffn_decay_enabled(const ds4_engine *e) {
+    return e && e->directional_steering_ffn_decay_tokens > 0;
+}
+
+static float directional_steering_ffn_scale_at(
+        float    start_scale,
+        int      decay_tokens,
+        float    final_scale,
+        uint32_t generated_tokens) {
+    if (decay_tokens <= 0) return start_scale;
+    if (generated_tokens >= (uint32_t)decay_tokens) return final_scale;
+    const float t = (float)generated_tokens / (float)decay_tokens;
+    const float smooth = (3.0f * t * t) - (2.0f * t * t * t);
+    return start_scale + (final_scale - start_scale) * smooth;
+}
 
 static bool cpu_directional_steering_enabled(
         const float *dirs,
@@ -21860,10 +21929,21 @@ static void cpu_directional_steering_project_rows(
     }
 }
 
+static bool directional_steering_think_enabled_engine(const ds4_engine *e) {
+    if (!e) return false;
+    if (!e->directional_steering_think_file || !e->directional_steering_think_file[0]) return false;
+    return e->directional_steering_think_ffn_scale != 0.0f ||
+           (e->directional_steering_think_ffn_decay_tokens > 0 &&
+            e->directional_steering_think_ffn_decay_final != 0.0f);
+}
+
 static bool cpu_load_directional_steering(ds4_engine *e) {
+    const bool think_wanted = directional_steering_think_enabled_engine(e);
     if (!e ||
         (e->directional_steering_attn_scale == 0.0f &&
-         e->directional_steering_ffn_scale == 0.0f)) {
+         e->directional_steering_ffn_scale == 0.0f &&
+         (!directional_steering_ffn_decay_enabled(e) || e->directional_steering_ffn_decay_final == 0.0f) &&
+         !think_wanted)) {
         return true;
     }
 
@@ -21885,6 +21965,21 @@ static bool cpu_load_directional_steering(ds4_engine *e) {
             path,
             (double)e->directional_steering_attn_scale,
             (double)e->directional_steering_ffn_scale);
+    if (think_wanted) {
+        e->directional_steering_think_dirs =
+            xmalloc((size_t)n * sizeof(e->directional_steering_think_dirs[0]));
+        if (!read_f32_binary_file(e->directional_steering_think_file,
+                                  e->directional_steering_think_dirs, n)) {
+            free(e->directional_steering_think_dirs);
+            e->directional_steering_think_dirs = NULL;
+            fprintf(stderr, "ds4: failed to load think directional steering vectors from %s\n",
+                    e->directional_steering_think_file);
+            return false;
+        }
+        fprintf(stderr, "ds4: CPU directional steering (think) enabled: %s ffn=%g\n",
+                e->directional_steering_think_file,
+                (double)e->directional_steering_think_ffn_scale);
+    }
     return true;
 }
 
@@ -22809,6 +22904,8 @@ static int generate_raw_swa_cpu(
         const float       * directional_steering_dirs,
         float               directional_steering_attn,
         float               directional_steering_ffn,
+        int                 directional_steering_ffn_decay_tokens,
+        float               directional_steering_ffn_decay_final,
         ds4_token_emit_fn   emit,
         ds4_generation_done_fn done,
         void              * emit_ud,
@@ -22838,6 +22935,7 @@ static int generate_raw_swa_cpu(
 
     prefill_layer_major_cpu(logits, model, weights, &cache, prompt,
                             directional_steering_dirs,
+                            NULL,
                             directional_steering_attn,
                             directional_steering_ffn);
 
@@ -22877,6 +22975,11 @@ static int generate_raw_swa_cpu(
         }
 
         const double t_eval0 = token_timing ? now_sec() : 0.0;
+        const float directional_steering_ffn_step = directional_steering_ffn_scale_at(
+            directional_steering_ffn,
+            directional_steering_ffn_decay_tokens,
+            directional_steering_ffn_decay_final,
+            (uint32_t)n_generated);
         /* The CPU decode step is expected to reuse buffers from
          * cpu_decode_scratch.  Keep the allocation guard tightly scoped to the
          * decode math itself; sampling, token emission, tracing, and callbacks
@@ -22885,8 +22988,9 @@ static int generate_raw_swa_cpu(
         ds4_alloc_guard_begin("CPU token decode");
         forward_token_raw_swa_cpu_decode_scratch(logits, model, weights, &cache, token, (uint32_t)pos,
                                                  directional_steering_dirs,
+                                                 NULL,
                                                  directional_steering_attn,
-                                                 directional_steering_ffn,
+                                                 directional_steering_ffn_step,
                                                  &decode_scratch);
         ds4_alloc_guard_end();
         if (token_timing) {
@@ -22933,6 +23037,8 @@ static int generate_metal_graph_raw_swa(
         const char        * directional_steering_file,
         float               directional_steering_attn,
         float               directional_steering_ffn,
+        int                 directional_steering_ffn_decay_tokens,
+        float               directional_steering_ffn_decay_final,
         ds4_token_emit_fn   emit,
         ds4_generation_done_fn done,
         void              * emit_ud,
@@ -22969,7 +23075,10 @@ static int generate_metal_graph_raw_swa(
     if (!metal_graph_load_directional_steering(&g,
                                                directional_steering_file,
                                                directional_steering_attn,
-                                               directional_steering_ffn)) {
+                                               directional_steering_ffn,
+                                               NULL,
+                                               0.0f,
+                                               0.0f)) {
         metal_graph_free(&g);
         return 1;
     }
@@ -23034,6 +23143,11 @@ static int generate_metal_graph_raw_swa(
         }
 
         const double t_eval0 = token_timing ? now_sec() : 0.0;
+        g.directional_steering_ffn_scale = directional_steering_ffn_scale_at(
+            directional_steering_ffn,
+            directional_steering_ffn_decay_tokens,
+            directional_steering_ffn_decay_final,
+            (uint32_t)n_generated);
         ok = metal_graph_eval_token_raw_swa(&g,
                                             model,
                                             weights,
@@ -23268,6 +23382,7 @@ struct ds4_session {
     float *logits;
     float *mtp_logits;
     int mtp_draft_token;
+    int directional_steering_generation_start;
     uint64_t mtp_probe_total;
     uint64_t mtp_probe_hit;
     ds4_session_progress_fn progress;
@@ -23281,6 +23396,51 @@ struct ds4_session {
     bool checkpoint_valid;
     bool mtp_draft_valid;
 };
+
+/* Scan the checkpoint to determine whether the next token to be generated
+ * falls inside a <think>...</think> block.  Walks forward toggling state:
+ * think_start opens, think_end closes.  Returns true if currently inside. */
+static bool ds4_session_in_think(const ds4_session *s) {
+    if (!s || !s->engine) return false;
+    const int ts = s->engine->vocab.think_start_id;
+    const int te = s->engine->vocab.think_end_id;
+    if (ts < 0 && te < 0) return false;
+    bool in_think = false;
+    for (int i = 0; i < s->checkpoint.len; i++) {
+        const int t = s->checkpoint.v[i];
+        if (t == ts) in_think = true;
+        else if (t == te) in_think = false;
+    }
+    return in_think;
+}
+
+static const float *ds4_session_directional_steering_ffn_dirs(ds4_session *s) {
+    if (!s || !s->engine) return NULL;
+    ds4_engine *e = s->engine;
+    if (directional_steering_think_enabled_engine(e) &&
+        e->directional_steering_think_dirs &&
+        ds4_session_in_think(s)) {
+        return e->directional_steering_think_dirs;
+    }
+    return e->directional_steering_dirs;
+}
+
+static float ds4_session_directional_steering_ffn_scale(ds4_session *s) {
+    if (!s || !s->engine) return 0.0f;
+    ds4_engine *e = s->engine;
+    int generated_tokens = s->checkpoint.len - s->directional_steering_generation_start;
+    if (generated_tokens < 0) generated_tokens = 0;
+    if (directional_steering_think_enabled_engine(e) && ds4_session_in_think(s)) {
+        return directional_steering_ffn_scale_at(e->directional_steering_think_ffn_scale,
+                                                 e->directional_steering_think_ffn_decay_tokens,
+                                                 e->directional_steering_think_ffn_decay_final,
+                                                 (uint32_t)generated_tokens);
+    }
+    return directional_steering_ffn_scale_at(e->directional_steering_ffn_scale,
+                                             e->directional_steering_ffn_decay_tokens,
+                                             e->directional_steering_ffn_decay_final,
+                                             (uint32_t)generated_tokens);
+}
 
 /* =========================================================================
  * Session Snapshot Payloads.
@@ -25171,6 +25331,8 @@ int ds4_engine_generate_argmax(
                                             e->directional_steering_file,
                                             e->directional_steering_attn_scale,
                                             e->directional_steering_ffn_scale,
+                                            e->directional_steering_ffn_decay_tokens,
+                                            e->directional_steering_ffn_decay_final,
                                             emit, done, emit_ud,
                                             progress, progress_ud);
 #else
@@ -25185,6 +25347,8 @@ int ds4_engine_generate_argmax(
                                 e->directional_steering_dirs,
                                 e->directional_steering_attn_scale,
                                 e->directional_steering_ffn_scale,
+                                e->directional_steering_ffn_decay_tokens,
+                                e->directional_steering_ffn_decay_final,
                                 emit, done, emit_ud, progress, progress_ud);
 }
 
@@ -25561,7 +25725,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
     e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
-    if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
+    if ((opt->directional_steering_attn != 0.0f ||
+         opt->directional_steering_ffn != 0.0f ||
+         (opt->directional_steering_ffn_decay_tokens > 0 && opt->directional_steering_ffn_decay_final != 0.0f)) &&
         (!opt->directional_steering_file || !opt->directional_steering_file[0]))
     {
         fprintf(stderr, "ds4: directional steering needs --dir-steering-file\n");
@@ -25573,6 +25739,20 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         e->directional_steering_file = ds4_strdup(opt->directional_steering_file);
         e->directional_steering_attn_scale = opt->directional_steering_attn;
         e->directional_steering_ffn_scale = opt->directional_steering_ffn;
+        e->directional_steering_ffn_decay_tokens = opt->directional_steering_ffn_decay_tokens;
+        e->directional_steering_ffn_decay_final = opt->directional_steering_ffn_decay_final;
+    }
+    if (opt->directional_steering_think_file && opt->directional_steering_think_file[0]) {
+        if (!opt->directional_steering_file || !opt->directional_steering_file[0]) {
+            fprintf(stderr, "ds4: --dir-steering-think-file requires --dir-steering-file\n");
+            free(e);
+            *out = NULL;
+            return 1;
+        }
+        e->directional_steering_think_file = ds4_strdup(opt->directional_steering_think_file);
+        e->directional_steering_think_ffn_scale = opt->directional_steering_think_ffn;
+        e->directional_steering_think_ffn_decay_tokens = opt->directional_steering_think_ffn_decay_tokens;
+        e->directional_steering_think_ffn_decay_final = opt->directional_steering_think_ffn_decay_final;
     }
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     ds4_acquire_instance_lock();
@@ -26033,6 +26213,8 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_release_instance_lock();
     free(e->directional_steering_dirs);
     free(e->directional_steering_file);
+    free(e->directional_steering_think_dirs);
+    free(e->directional_steering_think_file);
     free(e);
 }
 
@@ -26085,7 +26267,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!metal_graph_load_directional_steering(&s->graph,
                                                e->directional_steering_file,
                                                e->directional_steering_attn_scale,
-                                               e->directional_steering_ffn_scale)) {
+                                               e->directional_steering_ffn_scale,
+                                               e->directional_steering_think_file,
+                                               e->directional_steering_think_ffn_scale,
+                                               e->directional_steering_think_ffn_decay_final)) {
         metal_graph_free(&s->graph);
         free(s);
         return 1;
@@ -26735,6 +26920,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                                          prompt->v[i],
                                                          (uint32_t)s->checkpoint.len,
                                                          e->directional_steering_dirs,
+                                                         NULL,
                                                          e->directional_steering_attn_scale,
                                                          e->directional_steering_ffn_scale,
                                                          &s->cpu_scratch);
@@ -26742,6 +26928,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                 if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
             }
             s->checkpoint_valid = true;
+            s->directional_steering_generation_start = s->checkpoint.len;
             return 0;
         }
 
@@ -26752,10 +26939,12 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                 &s->cpu_cache,
                                 prompt,
                                 e->directional_steering_dirs,
+                                NULL,
                                 e->directional_steering_attn_scale,
                                 e->directional_steering_ffn_scale);
         ds4_tokens_copy(&s->checkpoint, prompt);
         s->checkpoint_valid = true;
+        s->directional_steering_generation_start = s->checkpoint.len;
         s->mtp_draft_valid = false;
         if (s->progress) s->progress(s->progress_ud, "prefill_chunk", prompt->len, prompt->len);
         return 0;
@@ -26813,6 +27002,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             }
             ds4_tokens_copy(&s->checkpoint, prompt);
             s->checkpoint_valid = true;
+            s->directional_steering_generation_start = s->checkpoint.len;
             return 0;
         }
 
@@ -26834,6 +27024,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             }
             token_vec_push(&s->checkpoint, prompt->v[i]);
         }
+        s->directional_steering_generation_start = s->checkpoint.len;
         return 0;
     }
 
@@ -26888,6 +27079,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     }
     ds4_tokens_copy(&s->checkpoint, prompt);
     s->checkpoint_valid = true;
+    s->directional_steering_generation_start = s->checkpoint.len;
     s->mtp_draft_valid = false;
     s->graph.mtp_n_raw = 0;
     return 0;
@@ -27081,6 +27273,8 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     }
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
+        const float directional_steering_ffn_scale = ds4_session_directional_steering_ffn_scale(s);
+        const float *steering_ffn_dirs = ds4_session_directional_steering_ffn_dirs(s);
         forward_token_raw_swa_cpu_decode_scratch(s->logits,
                                                  &e->model,
                                                  &e->weights,
@@ -27088,8 +27282,9 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                                  token,
                                                  (uint32_t)s->checkpoint.len,
                                                  e->directional_steering_dirs,
+                                                 steering_ffn_dirs,
                                                  e->directional_steering_attn_scale,
-                                                 e->directional_steering_ffn_scale,
+                                                 directional_steering_ffn_scale,
                                                  &s->cpu_scratch);
         token_vec_push(&s->checkpoint, token);
         s->checkpoint_valid = true;
@@ -27105,6 +27300,9 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     return 1;
 #else
     ds4_engine *e = s->engine;
+    s->graph.directional_steering_ffn_scale = ds4_session_directional_steering_ffn_scale(s);
+    s->graph.directional_steering_ffn_use_think =
+        directional_steering_think_enabled_engine(e) && ds4_session_in_think(s);
     const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
     const bool mtp_should_draft =
         probe_mtp && e->mtp_ready && s->mtp_logits &&
@@ -27176,6 +27374,14 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         return 1;
     }
     if (ds4_session_is_cpu(s)) {
+        (void)max_tokens;
+        (void)eos_token;
+        if (!accepted || accepted_cap <= 0) return 0;
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
+    if (directional_steering_ffn_decay_enabled(s ? s->engine : NULL)) {
         (void)max_tokens;
         (void)eos_token;
         if (!accepted || accepted_cap <= 0) return 0;

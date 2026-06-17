@@ -11527,6 +11527,7 @@ static server_config parse_options(int argc, char **argv) {
     c.kv_cache = kv_cache_default_options();
 
     bool directional_steering_scale_set = false;
+    bool directional_steering_think_scale_set = false;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
@@ -11647,9 +11648,22 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dir-steering-ffn")) {
             c.engine.directional_steering_ffn = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             directional_steering_scale_set = true;
+        } else if (!strcmp(arg, "--dir-steering-ffn-decay-tokens")) {
+            c.engine.directional_steering_ffn_decay_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--dir-steering-ffn-decay-final")) {
+            c.engine.directional_steering_ffn_decay_final = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
         } else if (!strcmp(arg, "--dir-steering-attn")) {
             c.engine.directional_steering_attn = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             directional_steering_scale_set = true;
+        } else if (!strcmp(arg, "--dir-steering-think-file")) {
+            c.engine.directional_steering_think_file = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dir-steering-think-ffn")) {
+            c.engine.directional_steering_think_ffn = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
+            directional_steering_think_scale_set = true;
+        } else if (!strcmp(arg, "--dir-steering-think-ffn-decay-tokens")) {
+            c.engine.directional_steering_think_ffn_decay_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--dir-steering-think-ffn-decay-final")) {
+            c.engine.directional_steering_think_ffn_decay_final = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--metal")) {
@@ -11680,6 +11694,9 @@ static server_config parse_options(int argc, char **argv) {
     }
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
+    }
+    if (c.engine.directional_steering_think_file && !directional_steering_think_scale_set) {
+        c.engine.directional_steering_think_ffn = 1.0f;
     }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.engine.distributed,

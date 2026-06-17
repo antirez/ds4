@@ -207,7 +207,13 @@ static void print_steering(FILE *fp, const help_colors *c) {
     title(fp, c, "Directional Steering");
     opt(fp, c, "--dir-steering-file FILE", "Load one f32 direction vector per layer.");
     opt(fp, c, "--dir-steering-ffn F", "Apply steering after FFN outputs. Default with file: 1");
+    opt(fp, c, "--dir-steering-ffn-decay-tokens N", "Linearly move FFN steering scale to --dir-steering-ffn-decay-final after N generated tokens. Default: 0");
+    opt(fp, c, "--dir-steering-ffn-decay-final F", "Final FFN steering scale after decay. Default: 0");
     opt(fp, c, "--dir-steering-attn F", "Apply steering after attention outputs. Default: 0");
+    opt(fp, c, "--dir-steering-think-file FILE", "Load one f32 direction vector per layer for think-phase steering.");
+    opt(fp, c, "--dir-steering-think-ffn F", "Apply think steering after FFN outputs. Default with file: 1");
+    opt(fp, c, "--dir-steering-think-ffn-decay-tokens N", "Linearly move think FFN steering scale after N generated tokens. Default: 0");
+    opt(fp, c, "--dir-steering-think-ffn-decay-final F", "Final think FFN steering scale after decay. Default: 0");
     fputc('\n', fp);
 }
 
