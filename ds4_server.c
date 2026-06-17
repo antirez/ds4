@@ -10407,6 +10407,34 @@ decode_again:
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
             temperature = 0.0f;
         }
+        /* Check if client disconnected before sampling the next token.
+         * For streaming requests the write-side checks already catch a dropped
+         * connection, but for non-streaming there is no fd interaction during
+         * generation and the worker would waste time completing the full
+         * response for a client that is no longer listening.
+         * On macOS POLLHUP is not raised for a graceful TCP close (FIN);
+         * instead the socket becomes readable and recv() returns 0.
+         * We therefore also check POLLIN and peek for EOF. */
+        if (!j->req.stream) {
+            struct pollfd pfd = {.fd = j->fd, .events = POLLIN};
+            int prc = poll(&pfd, 1, 0);
+            if (prc > 0) {
+                bool disconnected = false;
+                if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+                    disconnected = true;
+                } else if (pfd.revents & POLLIN) {
+                    char tmp;
+                    ssize_t n = recv(j->fd, &tmp, 1, MSG_PEEK | MSG_DONTWAIT);
+                    if (n == 0) disconnected = true;
+                }
+                if (disconnected) {
+                    server_log(DS4_LOG_WARNING, "ds4-server: client disconnected during generation, aborting job");
+                    finish = "error";
+                    snprintf(err, sizeof(err), "client disconnected");
+                    break;
+                }
+            }
+        }
         int token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
         if (token == ds4_token_eos(s->engine)) {
             finish = "stop";
