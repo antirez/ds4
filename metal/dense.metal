@@ -787,7 +787,11 @@ void dequantize_q8_0_t4(device const block_q8_0 *xb, short il, thread type4 & re
 }
 
 // DS4 small-batch mat-vec kernel used for 2..8 prompt tokens.
-template<short r1ptg, typename q_t, short chpb, void (*deq_t4)(device const q_t *, short, thread float4 &) >
+// dst_tm selects the dst layout: 0 keeps the standard [batch][column][row]
+// order; 1 writes token-major [column][batch][row] (column stride
+// ne0*ne12), which is the low[token][group][rank] layout the attention
+// output projection consumes without a transpose pass.
+template<short r1ptg, typename q_t, short chpb, void (*deq_t4)(device const q_t *, short, thread float4 &), short dst_tm = 0 >
 void kernel_mul_mv_ext_q4_f32_impl(
         constant ds4_metal_args_mul_mv_ext & args,
         device const char * src0,
@@ -877,7 +881,9 @@ void kernel_mul_mv_ext_q4_f32_impl(
 
     if (tx == 0) {
         for (short ir1 = 0; ir1 < r1ptg && i11 + ir1 < args.ne11; ++ir1) {
-            device float * dst_f32 = (device float *) dst + (uint64_t)i1m*args.ne0*args.ne1 + (uint64_t)(i11 + ir1)*args.ne0;
+            device float * dst_f32 = dst_tm == 0
+                ? (device float *) dst + (uint64_t)i1m*args.ne0*args.ne1 + (uint64_t)(i11 + ir1)*args.ne0
+                : (device float *) dst + (uint64_t)(i11 + ir1)*args.ne0*args.ne12 + (uint64_t)i1m*args.ne0;
 
             if (i01 < args.ne01) {
                 dst_f32[i01] = sumf[ir1];
@@ -913,6 +919,29 @@ template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_2")]] kernel mul_mv_ext_q4_f
 template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_q8_0, 32, dequantize_q8_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_q8_0, 32, dequantize_q8_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_q8_0, 32, dequantize_q8_0_t4>;
+
+// DS4 attention-output low projection, small-batch multi-column variant.
+// One grid z slice per head group; each weight read is shared across all
+// token columns (the per-token re-read in kernel_dsv4_attn_out_low_q8_0_f32
+// is the dominant batch-verify cost of this stage).  src1 columns stride by
+// token (args.nb11 = token stride, args.nb12 = group stride) and dst is
+// written token-major via dst_tm=1 so the out_b matmul reads it directly.
+template<short r1ptg, typename q_t, short epb, void (*deq_t4)(device const q_t *, short, thread float4 &)>
+kernel void kernel_dsv4_attn_out_low_ext_disp(
+        constant ds4_metal_args_mul_mv_ext & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_ext_q4_f32_impl<r1ptg, q_t, epb/4, deq_t4, 1>(args, src0, src1, dst, tgpig, tiisg, sgitg);
+}
+
+template [[host_name("kernel_dsv4_attn_out_low_ext_q8_0_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_dsv4_attn_out_low_ext_disp<2, block_q8_0, 32, dequantize_q8_0_t4>;
+template [[host_name("kernel_dsv4_attn_out_low_ext_q8_0_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_dsv4_attn_out_low_ext_disp<3, block_q8_0, 32, dequantize_q8_0_t4>;
+template [[host_name("kernel_dsv4_attn_out_low_ext_q8_0_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_dsv4_attn_out_low_ext_disp<4, block_q8_0, 32, dequantize_q8_0_t4>;
+template [[host_name("kernel_dsv4_attn_out_low_ext_q8_0_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_dsv4_attn_out_low_ext_disp<5, block_q8_0, 32, dequantize_q8_0_t4>;
 
 constant bool FC_mul_mm_bc_inp [[function_constant(FC_MUL_MM + 0)]];
 constant bool FC_mul_mm_bc_out [[function_constant(FC_MUL_MM + 1)]];
