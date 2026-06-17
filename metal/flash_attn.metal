@@ -22,6 +22,96 @@ void dequantize_f16_t4(device const half4 * src, short il, thread type4 & reg) {
     reg = (type4)(*(src));
 }
 
+// Packed FP8 compressed-KV row consumed directly by decode FlashAttention,
+// eliminating the F16 staging copy and ~1.75x of the KV read bandwidth. Layout
+// per 512-wide MLA row (K and V share the same latent, so one plane set):
+//   scale[0..6] : ue8m0 exponent+127, one per 64-element nope block (7 blocks)
+//   scale[7]    : padding (keeps nope/rot aligned; never read)
+//   nope[0..447]: e4m3 byte (sign<<7 | code) per non-RoPE element
+//   rot[0..63]  : RoPE prefix as F16 (matches the F16 staging exactly)
+// Reconstructed value = sign * e4m3_mag(code) * 2^(scale-127). Cast to half this
+// is bit-identical to the prior (half) float-quantized KV, so the attention
+// result is unchanged. nb11 = sizeof(struct) = 584, divisible by 8 (half4) and
+// 4 (uchar4) so every plane read stays naturally aligned.
+struct ds4_fp8_kv_row {
+    uchar scale[8];
+    uchar nope[448];
+    half  rot[64];
+};
+
+// e4m3fn magnitude (no sign) for code 0..127, precomputed. Values are exactly
+// (e==0 ? m*2^-9 : (1+m/8)*2^(e-7)) so the table is bit-identical to the formula;
+// replacing the per-element branch+exp2 with a constant load is the key decode-cost
+// reduction for the packed-KV read path (indexed attention + flash dequant).
+constant float ds4_e4m3_lut[128] = {
+    0.0f, 0.001953125f, 0.00390625f, 0.005859375f, 0.0078125f, 0.009765625f, 0.01171875f, 0.013671875f,
+    0.015625f, 0.017578125f, 0.01953125f, 0.021484375f, 0.0234375f, 0.025390625f, 0.02734375f, 0.029296875f,
+    0.03125f, 0.03515625f, 0.0390625f, 0.04296875f, 0.046875f, 0.05078125f, 0.0546875f, 0.05859375f,
+    0.0625f, 0.0703125f, 0.078125f, 0.0859375f, 0.09375f, 0.1015625f, 0.109375f, 0.1171875f,
+    0.125f, 0.140625f, 0.15625f, 0.171875f, 0.1875f, 0.203125f, 0.21875f, 0.234375f,
+    0.25f, 0.28125f, 0.3125f, 0.34375f, 0.375f, 0.40625f, 0.4375f, 0.46875f,
+    0.5f, 0.5625f, 0.625f, 0.6875f, 0.75f, 0.8125f, 0.875f, 0.9375f,
+    1.0f, 1.125f, 1.25f, 1.375f, 1.5f, 1.625f, 1.75f, 1.875f,
+    2.0f, 2.25f, 2.5f, 2.75f, 3.0f, 3.25f, 3.5f, 3.75f,
+    4.0f, 4.5f, 5.0f, 5.5f, 6.0f, 6.5f, 7.0f, 7.5f,
+    8.0f, 9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f,
+    16.0f, 18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 28.0f, 30.0f,
+    32.0f, 36.0f, 40.0f, 44.0f, 48.0f, 52.0f, 56.0f, 60.0f,
+    64.0f, 72.0f, 80.0f, 88.0f, 96.0f, 104.0f, 112.0f, 120.0f,
+    128.0f, 144.0f, 160.0f, 176.0f, 192.0f, 208.0f, 224.0f, 240.0f,
+    256.0f, 288.0f, 320.0f, 352.0f, 384.0f, 416.0f, 448.0f, 480.0f,
+};
+inline float ds4_e4m3_mag(uint code) {
+    return ds4_e4m3_lut[code & 0x7fu];
+}
+
+template <typename type4>
+void dequantize_fp8_kv_t4(device const ds4_fp8_kv_row * src, short il, thread type4 & reg) {
+    const short d0 = il * 4; // first dim of this 4-vec, 0..508 (il in 0..127)
+    if (d0 >= 448) {
+        device const half4 * rp = (device const half4 *) (src->rot + (d0 - 448));
+        reg = (type4) (*rp);
+    } else {
+        const uchar4 b = *((device const uchar4 *) (src->nope + d0));
+        // All four lanes share one 64-element block (d0 is a multiple of 4, the
+        // block size 64 is too, so a 4-vec never straddles a block boundary).
+        const float s = exp2((float)((int)src->scale[d0 >> 6] - 127));
+        float4 v;
+        v.x = ((b.x & 0x80u) ? -1.0f : 1.0f) * ds4_e4m3_mag(b.x & 0x7fu) * s;
+        v.y = ((b.y & 0x80u) ? -1.0f : 1.0f) * ds4_e4m3_mag(b.y & 0x7fu) * s;
+        v.z = ((b.z & 0x80u) ? -1.0f : 1.0f) * ds4_e4m3_mag(b.z & 0x7fu) * s;
+        v.w = ((b.w & 0x80u) ? -1.0f : 1.0f) * ds4_e4m3_mag(b.w & 0x7fu) * s;
+        reg = (type4) v;
+    }
+}
+
+// 4x4 variant for the non-vec (prefill/decode-batch) FlashAttention kernel, which
+// loads K/V as 16-element half4x4 chunks. chunk in 0..DK16-1 covers dims
+// [16*chunk, 16*chunk+16); since 16 divides both 64 (scale block) and 448 (nope/rot
+// split), a chunk never straddles either boundary. Produces the same half4x4 the
+// f16 staging would hold for that chunk -> bit-exact attention.
+template <typename type4x4>
+void dequantize_fp8_kv_4x4(device const ds4_fp8_kv_row * src, short chunk, thread type4x4 & reg) {
+    const short d0 = chunk * 16;
+    half4x4 out;
+    if (d0 >= 448) {
+        device const half4 * rp = (device const half4 *) (src->rot + (d0 - 448));
+        out[0] = rp[0]; out[1] = rp[1]; out[2] = rp[2]; out[3] = rp[3];
+    } else {
+        const float s = exp2((float)((int)src->scale[d0 >> 6] - 127));
+        for (short c = 0; c < 4; ++c) {
+            const uchar4 b = *((device const uchar4 *) (src->nope + d0 + c*4));
+            float4 v;
+            v.x = ((b.x & 0x80u) ? -1.0f : 1.0f) * ds4_e4m3_mag(b.x & 0x7fu) * s;
+            v.y = ((b.y & 0x80u) ? -1.0f : 1.0f) * ds4_e4m3_mag(b.y & 0x7fu) * s;
+            v.z = ((b.z & 0x80u) ? -1.0f : 1.0f) * ds4_e4m3_mag(b.z & 0x7fu) * s;
+            v.w = ((b.w & 0x80u) ? -1.0f : 1.0f) * ds4_e4m3_mag(b.w & 0x7fu) * s;
+            out[c] = (half4) v;
+        }
+    }
+    reg = (type4x4) out;
+}
+
 template <typename type4x4>
 void dequantize_f32(device const float4x4 * src, short il, thread type4x4 & reg);
 
@@ -90,6 +180,8 @@ struct ds4_metal_args_flash_attn_ext {
     float    m1;
     int32_t  n_head_log2;
     float    logit_softcap;
+    int32_t  n_raw_split; // FP8 mixed-KV: key rows >= this read from kcomp/vcomp (packed)
+    uint64_t nb_kcomp;    // packed comp row stride (bytes); 0 for the plain f16 path
 };
 
 struct ds4_metal_args_flash_attn_ext_vec {
@@ -125,6 +217,12 @@ struct ds4_metal_args_flash_attn_ext_vec {
     float    m1;
     int32_t  n_head_log2;
     float    logit_softcap;
+    // FP8 mixed-KV split: when the kernel is instantiated with MIX, key rows
+    // [0,n_raw_split) are read from the f16 `k`/`v` buffers and rows >= n_raw_split
+    // are read from the packed FP8 `kcomp`/`vcomp` buffers (row r-n_raw_split,
+    // stride nb_kcomp). Unused (0) for the plain f16 instantiation.
+    int32_t  n_raw_split;
+    uint64_t nb_kcomp;
 };
 
 struct ds4_metal_args_flash_attn_ext_vec_reduce {
@@ -304,7 +402,8 @@ template<
     short DV,
     short Q,
     short C,
-    short NSG>
+    short NSG,
+    bool  MIX = false>
 void kernel_flash_attn_ext_impl(
         constant ds4_metal_args_flash_attn_ext & args,
         device const char * q,
@@ -315,6 +414,8 @@ void kernel_flash_attn_ext_impl(
         device const char * pad,
         device const char * blk,
         device       char * dst,
+        device const char * kcomp,
+        device const char * vcomp,
         threadgroup  half * shmem_f16,
         uint3   tgpig,
         ushort  tiisg,
@@ -435,7 +536,11 @@ void kernel_flash_attn_ext_impl(
                 break;
             }
 
+            // MIX tail block served from the f16 `pad` buffer must be read as f16
+            // (bit-identical halfs), not from the packed comp buffer by row index.
+            bool in_pad = false;
             if (FC_flash_attn_ext_has_kvpad && ic + C > args.ne11) {
+                in_pad = true;
                 k    = pad;
                 v    = k + args.nb11*C*args.ne_12_2*args.ne_12_3;
                 mask = v + args.nb21*C*args.ne_12_2*args.ne_12_3;
@@ -568,13 +673,23 @@ void kernel_flash_attn_ext_impl(
 
                     qk8x8_t mqk = make_filled_simdgroup_matrix<qk_t, 8>((qk_t) 0.0f);
 
+                    const int k_kr = ic + 8*cc + ty;
+                    const bool k_comp = MIX && !in_pad && k_kr >= args.n_raw_split;
+                    device const ds4_fp8_kv_row * k_pc = k_comp
+                        ? (device const ds4_fp8_kv_row *) (kcomp + (int64_t)(k_kr - args.n_raw_split)*args.nb_kcomp)
+                        : (device const ds4_fp8_kv_row *) 0;
+
                     for (short ii = 0; ii < DK16; ii += 4) {
                         device const kd4x4_t * pk4x4 = (device const kd4x4_t *) (k + ((ic + 8*cc + ty)*args.nb11));
 
                         if (DK16%4 == 0) {
                             {
                                 k4x4_t tmp;
-                                deq_k(pk4x4 + (ii + tx)/nl_k, (ii + tx)%nl_k, tmp);
+                                if (k_comp) {
+                                    dequantize_fp8_kv_4x4(k_pc, ii + tx, tmp);
+                                } else {
+                                    deq_k(pk4x4 + (ii + tx)/nl_k, (ii + tx)%nl_k, tmp);
+                                }
                                 sk4x4[4*ty + tx] = tmp;
                             }
 
@@ -595,7 +710,11 @@ void kernel_flash_attn_ext_impl(
                         } else {
                             if (ii + tx < DK16) {
                                 k4x4_t tmp;
-                                deq_k(pk4x4 + (ii + tx)/nl_k, (ii + tx)%nl_k, tmp);
+                                if (k_comp) {
+                                    dequantize_fp8_kv_4x4(k_pc, ii + tx, tmp);
+                                } else {
+                                    deq_k(pk4x4 + (ii + tx)/nl_k, (ii + tx)%nl_k, tmp);
+                                }
                                 sk4x4[4*ty + tx] = tmp;
                             }
 
@@ -750,13 +869,23 @@ void kernel_flash_attn_ext_impl(
                         s8x8_t vs;
                         simdgroup_load(vs, ss + 8*cc, SH, 0, false);
 
+                        const int v_kr = ic + 8*cc + ty;
+                        const bool v_comp = MIX && !in_pad && v_kr >= args.n_raw_split;
+                        device const ds4_fp8_kv_row * v_pc = v_comp
+                            ? (device const ds4_fp8_kv_row *) (vcomp + (int64_t)(v_kr - args.n_raw_split)*args.nb_kcomp)
+                            : (device const ds4_fp8_kv_row *) 0;
+
                         for (short ii = 4*sgitg; ii < DV16; ii += 4*NSG) {
                             device const vd4x4_t * pv4x4 = (device const vd4x4_t *) (v + ((ic + 8*cc + ty)*args.nb21));
 
                             if (DV16%4 == 0) {
                                 {
                                     v4x4_t tmp;
-                                    deq_v(pv4x4 + (ii + tx)/nl_v, (ii + tx)%nl_v, tmp);
+                                    if (v_comp) {
+                                        dequantize_fp8_kv_4x4(v_pc, ii + tx, tmp);
+                                    } else {
+                                        deq_v(pv4x4 + (ii + tx)/nl_v, (ii + tx)%nl_v, tmp);
+                                    }
                                     sv4x4[4*ty + tx] = tmp;
                                 }
 
@@ -780,7 +909,11 @@ void kernel_flash_attn_ext_impl(
                             } else {
                                 if (ii + tx < DV16) {
                                     v4x4_t tmp;
-                                    deq_v(pv4x4 + (ii + tx)/nl_v, (ii + tx)%nl_v, tmp);
+                                    if (v_comp) {
+                                        dequantize_fp8_kv_4x4(v_pc, ii + tx, tmp);
+                                    } else {
+                                        deq_v(pv4x4 + (ii + tx)/nl_v, (ii + tx)%nl_v, tmp);
+                                    }
                                     sv4x4[4*ty + tx] = tmp;
                                 }
 
@@ -888,7 +1021,8 @@ template<
     short DK,
     short DV,
     short Q  = OP_FLASH_ATTN_EXT_NQPSG,
-    short C  = OP_FLASH_ATTN_EXT_NCPSG>
+    short C  = OP_FLASH_ATTN_EXT_NCPSG,
+    bool  MIX = false>
 kernel void kernel_flash_attn_ext(
         constant ds4_metal_args_flash_attn_ext & args,
         device const char * q,
@@ -899,15 +1033,17 @@ kernel void kernel_flash_attn_ext(
         device const char * pad,
         device const char * blk,
         device       char * dst,
+        device const char * kcomp,
+        device const char * vcomp,
         threadgroup  half * shmem_f16 [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
 #define FWD_TMPL q_t, q4_t, q8x8_t, k_t, k4x4_t, k8x8_t, v_t, v4x4_t, v8x8_t, qk_t, qk8x8_t, s_t, s2_t, s8x8_t, o_t, o4_t, o8x8_t, kd4x4_t, nl_k, deq_k, vd4x4_t, nl_v, deq_v, DK, DV, Q, C
-#define FWD_ARGS args, q, k, v, mask, sinks, pad, blk, dst, shmem_f16, tgpig, tiisg, sgitg
+#define FWD_ARGS args, q, k, v, mask, sinks, pad, blk, dst, kcomp, vcomp, shmem_f16, tgpig, tiisg, sgitg
     switch (FC_flash_attn_ext_nsg) {
-        case 4: kernel_flash_attn_ext_impl<FWD_TMPL, 4>(FWD_ARGS); break;
-        case 8: kernel_flash_attn_ext_impl<FWD_TMPL, 8>(FWD_ARGS); break;
+        case 4: kernel_flash_attn_ext_impl<FWD_TMPL, 4, MIX>(FWD_ARGS); break;
+        case 8: kernel_flash_attn_ext_impl<FWD_TMPL, 8, MIX>(FWD_ARGS); break;
     }
 #undef FWD_TMPL
 #undef FWD_ARGS
@@ -926,6 +1062,14 @@ typedef decltype(kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f
 // Host-visible prefill FlashAttention variant for DS4's 512-wide F16 K/V rows.
 template [[host_name("kernel_flash_attn_ext_f16_dk512_dv512")]]
 kernel flash_attn_ext_dk512_t kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 512, 512>;
+
+// Region-aware mixed-KV variant (MIX=true), used by batched decode: raw key rows
+// [0,n_raw_split) read from the f16 k/v buffers (deq_k/deq_v = dequantize_f16),
+// comp rows from the packed FP8 kcomp/vcomp via dequantize_fp8_kv_4x4. Same tile
+// order + bit-identical halfs -> bit-exact vs f16. Q/C passed explicitly so the
+// trailing MIX=true can be set.
+template [[host_name("kernel_flash_attn_ext_fp8mix_dk512_dv512")]]
+kernel flash_attn_ext_dk512_t kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 512, 512, OP_FLASH_ATTN_EXT_NQPSG, OP_FLASH_ATTN_EXT_NCPSG, true>;
 
 #undef FA_NONVEC_TYPES
 
@@ -960,7 +1104,8 @@ template<
     short DV,
     short NE = 4,
     short Q  = OP_FLASH_ATTN_EXT_VEC_NQPSG,
-    short C  = OP_FLASH_ATTN_EXT_VEC_NCPSG>
+    short C  = OP_FLASH_ATTN_EXT_VEC_NCPSG,
+    bool  MIX = false>
 kernel void kernel_flash_attn_ext_vec(
         constant ds4_metal_args_flash_attn_ext_vec & args,
         device const char * q,
@@ -970,6 +1115,8 @@ kernel void kernel_flash_attn_ext_vec(
         device const char * sinks,
         device const char * pad,
         device       char * dst,
+        device const char * kcomp,
+        device const char * vcomp,
         threadgroup  half * shmem_f16 [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
@@ -1067,7 +1214,12 @@ kernel void kernel_flash_attn_ext_vec(
                 break;
             }
 
+            // When the tail block is served from the f16 `pad` buffer, MIX must
+            // read it as f16 (the pad holds bit-identical half values), not from
+            // the packed comp buffer by global row index.
+            bool in_pad = false;
             if (FC_flash_attn_ext_vec_has_kvpad && ic + C > args.ne11) {
+                in_pad = true;
                 k    = pad;
                 v    = k + args.nb11*C*args.ne_12_2*args.ne_12_3;
                 mask = v + args.nb21*C*args.ne_12_2*args.ne_12_3;
@@ -1110,7 +1262,31 @@ kernel void kernel_flash_attn_ext_vec(
                 qk_t mqk[C/NE] = { [ 0 ... C/NE - 1] = 0.0f };
 
                 FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
-                    if (is_same<kd4_t, k4_t>::value) {
+                    if (MIX && !in_pad) {
+                        // Region-aware read: raw rows from the f16 `k` buffer, comp
+                        // rows from the packed FP8 `kcomp` buffer. The dequantized
+                        // half values are bit-identical to the prior combined f16
+                        // buffer and the iteration/accumulation order is unchanged,
+                        // so mqk is bit-exact vs the plain f16 kernel.
+                        const int kr = ic + NE*cc + ty;
+                        k4_t mk;
+                        if (kr >= args.n_raw_split) {
+                            device const ds4_fp8_kv_row * pc = (device const ds4_fp8_kv_row *)
+                                (kcomp + (int64_t)(kr - args.n_raw_split)*args.nb_kcomp);
+                            FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
+                                const short i = ii*NL + tx;
+                                dequantize_fp8_kv_t4(pc, i, mk);
+                                mqk[cc] += dot((float4) mk, (float4) sq4[i]);
+                            }
+                        } else {
+                            device const half4 * pr = (device const half4 *) (k + (int64_t)kr*args.nb11);
+                            FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
+                                const short i = ii*NL + tx;
+                                mk = (k4_t) pr[i];
+                                mqk[cc] += dot((float4) mk, (float4) sq4[i]);
+                            }
+                        }
+                    } else if (is_same<kd4_t, k4_t>::value) {
                         FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
                             mqk[cc] += dot((float4) pk4[cc*NE*NS10/4 +  ii*NL], (float4) pq4[ii*NL]);
                         }
@@ -1202,7 +1378,31 @@ kernel void kernel_flash_attn_ext_vec(
                     lo[ii] = 0.0f;
                 }
 
-                if (is_same<vd4_t, v4_t>::value) {
+                if (MIX && !in_pad) {
+                    // Region-aware V read, mirroring the K load: raw rows from the
+                    // f16 `v` buffer, comp rows from packed FP8 `vcomp`. Same order
+                    // and bit-identical half values -> bit-exact output vs f16.
+                    FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
+                        const int kr = ic + NE*cc + ty;
+                        if (kr >= args.n_raw_split) {
+                            device const ds4_fp8_kv_row * pc = (device const ds4_fp8_kv_row *)
+                                (vcomp + (int64_t)(kr - args.n_raw_split)*args.nb_kcomp);
+                            FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                                const short i = ii*NL + tx;
+                                v4_t mv;
+                                dequantize_fp8_kv_t4(pc, i, mv);
+                                lo[ii] += o4_t(float4(mv)*float4(ss[NE*cc + ty]));
+                            }
+                        } else {
+                            device const half4 * pr = (device const half4 *) (v + (int64_t)kr*args.nb21);
+                            FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                                const short i = ii*NL + tx;
+                                v4_t mv = (v4_t) pr[i];
+                                lo[ii] += o4_t(float4(mv)*float4(ss[NE*cc + ty]));
+                            }
+                        }
+                    }
+                } else if (is_same<vd4_t, v4_t>::value) {
                     device const v4_t * pv4 = (device const v4_t *) (v + ic*args.nb21);
 
                     pv4 += ty*NS20/4 + tx;
@@ -1377,6 +1577,14 @@ typedef decltype(kernel_flash_attn_ext_vec<FA_TYPES, half4, 1, dequantize_f16_t4
 
 // Host-visible decode FlashAttention variant for DS4's 512-wide F16 K/V rows.
 template [[host_name("kernel_flash_attn_ext_vec_f16_dk512_dv512")]]  kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES,     half4,  1, dequantize_f16_t4, half4,  1, dequantize_f16_t4, 512, 512, 1>;
+
+// Region-aware mixed-KV decode variant (MIX=true): raw key rows [0,n_raw_split)
+// are read from the f16 k/v buffers exactly as the f16 kernel; comp rows are read
+// from the packed FP8 kcomp/vcomp buffers via dequantize_fp8_kv_t4. Iteration and
+// accumulation order are identical to the f16 kernel and the dequantized halfs are
+// bit-identical, so the output is bit-exact while the comp KV read is ~1.75x
+// smaller. Q/C are passed explicitly so the trailing MIX=true can be set.
+template [[host_name("kernel_flash_attn_ext_vec_fp8mix_dk512_dv512")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4, 512, 512, 1, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, true>;
 
 #undef FA_TYPES
 #undef FA_TYPES_F32
