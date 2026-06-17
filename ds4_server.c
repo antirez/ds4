@@ -485,6 +485,30 @@ fail:
     return false;
 }
 
+static bool json_string_replace(const char **p, char **dst) {
+    char *tmp = NULL;
+    if (!json_string(p, &tmp)) return false;
+    free(*dst);
+    *dst = tmp;
+    return true;
+}
+
+static bool json_raw_value_replace(const char **p, char **dst) {
+    char *tmp = NULL;
+    if (!json_raw_value(p, &tmp)) return false;
+    free(*dst);
+    *dst = tmp;
+    return true;
+}
+
+static bool json_content_replace(const char **p, char **dst) {
+    char *tmp = NULL;
+    if (!json_content(p, &tmp)) return false;
+    free(*dst);
+    *dst = tmp;
+    return true;
+}
+
 typedef enum {
     REQ_CHAT,
     REQ_COMPLETION,
@@ -1082,20 +1106,18 @@ static bool parse_function_call(const char **p, tool_call *tc) {
         }
         (*p)++;
         if (!strcmp(key, "name")) {
-            free(tc->name);
-            if (!json_string(p, &tc->name)) {
+            if (!json_string_replace(p, &tc->name)) {
                 free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "arguments")) {
-            free(tc->arguments);
             json_ws(p);
             if (**p == '"') {
-                if (!json_string(p, &tc->arguments)) {
+                if (!json_string_replace(p, &tc->arguments)) {
                     free(key);
                     goto bad;
                 }
-            } else if (!json_raw_value(p, &tc->arguments)) {
+            } else if (!json_raw_value_replace(p, &tc->arguments)) {
                 free(key);
                 goto bad;
             }
@@ -1136,8 +1158,7 @@ static bool parse_tool_calls_value(const char **p, tool_calls *calls) {
             }
             (*p)++;
             if (!strcmp(key, "id")) {
-                free(tc.id);
-                if (!json_string(p, &tc.id)) {
+                if (!json_string_replace(p, &tc.id)) {
                     free(key);
                     goto bad;
                 }
@@ -1235,20 +1256,17 @@ static char *responses_special_schema_from_tool(const char *raw) {
         }
         p++;
         if (!strcmp(key, "type")) {
-            free(type);
-            if (!json_string(&p, &type)) {
+            if (!json_string_replace(&p, &type)) {
                 free(key);
                 goto done;
             }
         } else if (!strcmp(key, "description")) {
-            free(description);
-            if (!json_string(&p, &description)) {
+            if (!json_string_replace(&p, &description)) {
                 free(key);
                 goto done;
             }
         } else if (!strcmp(key, "parameters")) {
-            free(parameters);
-            if (!json_raw_value(&p, &parameters)) {
+            if (!json_raw_value_replace(&p, &parameters)) {
                 free(key);
                 goto done;
             }
@@ -1305,26 +1323,22 @@ static char *responses_namespace_function_schema_from_tool(const char *raw,
         }
         p++;
         if (!strcmp(key, "type")) {
-            free(type);
-            if (!json_string(&p, &type)) {
+            if (!json_string_replace(&p, &type)) {
                 free(key);
                 goto done;
             }
         } else if (!strcmp(key, "name")) {
-            free(name);
-            if (!json_string(&p, &name)) {
+            if (!json_string_replace(&p, &name)) {
                 free(key);
                 goto done;
             }
         } else if (!strcmp(key, "description")) {
-            free(description);
-            if (!json_string(&p, &description)) {
+            if (!json_string_replace(&p, &description)) {
                 free(key);
                 goto done;
             }
         } else if (!strcmp(key, "parameters") || !strcmp(key, "input_schema")) {
-            free(parameters);
-            if (!json_raw_value(&p, &parameters)) {
+            if (!json_raw_value_replace(&p, &parameters)) {
                 free(key);
                 goto done;
             }
@@ -1436,8 +1450,7 @@ static void tool_schema_orders_add_json_wire(tool_schema_orders *orders,
         }
         p++;
         if (!strcmp(key, "name")) {
-            free(order.name);
-            if (!json_string(&p, &order.name)) {
+            if (!json_string_replace(&p, &order.name)) {
                 free(key);
                 goto done;
             }
@@ -1497,20 +1510,17 @@ static bool append_responses_namespace_tool_schemas(buf *schemas,
         }
         p++;
         if (!strcmp(key, "type")) {
-            free(type);
-            if (!json_string(&p, &type)) {
+            if (!json_string_replace(&p, &type)) {
                 free(key);
                 goto done;
             }
         } else if (!strcmp(key, "name")) {
-            free(name);
-            if (!json_string(&p, &name)) {
+            if (!json_string_replace(&p, &name)) {
                 free(key);
                 goto done;
             }
         } else if (!strcmp(key, "tools")) {
-            free(tools);
-            if (!json_raw_value(&p, &tools)) {
+            if (!json_raw_value_replace(&p, &tools)) {
                 free(key);
                 goto done;
             }
@@ -1629,20 +1639,17 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
             }
             (*p)++;
             if (!strcmp(key, "role")) {
-                free(msg.role);
-                if (!json_string(p, &msg.role)) {
+                if (!json_string_replace(p, &msg.role)) {
                     free(key);
                     goto fail;
                 }
             } else if (!strcmp(key, "content")) {
-                free(msg.content);
-                if (!json_content(p, &msg.content)) {
+                if (!json_content_replace(p, &msg.content)) {
                     free(key);
                     goto fail;
                 }
             } else if (!strcmp(key, "reasoning_content")) {
-                free(msg.reasoning);
-                if (!json_content(p, &msg.reasoning)) {
+                if (!json_content_replace(p, &msg.reasoning)) {
                     free(key);
                     goto fail;
                 }
@@ -1723,44 +1730,37 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
         }
         (*p)++;
         if (!strcmp(key, "type")) {
-            free(type);
-            if (!json_string(p, &type)) {
+            if (!json_string_replace(p, &type)) {
                 free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "text")) {
-            free(text);
-            if (!json_content(p, &text)) {
+            if (!json_content_replace(p, &text)) {
                 free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "thinking")) {
-            free(thinking);
-            if (!json_content(p, &thinking)) {
+            if (!json_content_replace(p, &thinking)) {
                 free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "id") || !strcmp(key, "tool_use_id")) {
-            free(id);
-            if (!json_string(p, &id)) {
+            if (!json_string_replace(p, &id)) {
                 free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "name")) {
-            free(name);
-            if (!json_string(p, &name)) {
+            if (!json_string_replace(p, &name)) {
                 free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "input")) {
-            free(input);
-            if (!json_raw_value(p, &input)) {
+            if (!json_raw_value_replace(p, &input)) {
                 free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "content")) {
-            free(tool_result);
-            if (!json_content(p, &tool_result)) {
+            if (!json_content_replace(p, &tool_result)) {
                 free(key);
                 goto bad;
             }
@@ -1888,8 +1888,7 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
             }
             (*p)++;
             if (!strcmp(key, "role")) {
-                free(msg.role);
-                if (!json_string(p, &msg.role)) {
+                if (!json_string_replace(p, &msg.role)) {
                     free(key);
                     goto fail;
                 }
@@ -2686,8 +2685,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 goto bad;
             }
         } else if (!strcmp(key, "model")) {
-            free(r->model);
-            if (!json_string(&p, &r->model)) {
+            if (!json_string_replace(&p, &r->model)) {
                 free(key);
                 goto bad;
             }
@@ -2838,11 +2836,13 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
             }
             got_messages = true;
         } else if (!strcmp(key, "system")) {
-            free(system);
-            if (!parse_anthropic_system(&p, &system)) {
+            char *tmp = NULL;
+            if (!parse_anthropic_system(&p, &tmp)) {
                 free(key);
                 goto bad;
             }
+            free(system);
+            system = tmp;
         } else if (!strcmp(key, "tools")) {
             free(tool_schemas);
             tool_schemas = NULL;
@@ -2897,8 +2897,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                 goto bad;
             }
         } else if (!strcmp(key, "model")) {
-            free(r->model);
-            if (!json_string(&p, &r->model)) {
+            if (!json_string_replace(&p, &r->model)) {
                 free(key);
                 goto bad;
             }
@@ -3060,23 +3059,24 @@ static bool parse_responses_content_array(const char **p, char **out) {
                 }
                 (*p)++;
                 if (!strcmp(key, "type")) {
-                    free(type);
-                    if (!json_string(p, &type)) {
+                    if (!json_string_replace(p, &type)) {
                         free(key);
+                        free(type);
                         free(text);
                         goto fail;
                     }
                 } else if (!strcmp(key, "text")) {
-                    free(text);
                     /* The text field of a typed content block is a plain JSON
                      * string. Accept null as the empty string for parity with
                      * upstream serializers that emit null for empty blocks. */
                     json_ws(p);
                     if (json_lit(p, "null")) {
+                        free(text);
                         text = xstrdup("");
-                    } else if (!json_string(p, &text)) {
+                    } else if (!json_string_replace(p, &text)) {
                         free(key);
                         free(type);
+                        free(text);
                         goto fail;
                     }
                 } else if (!json_skip_value(p)) {
@@ -3131,6 +3131,14 @@ static bool parse_responses_content_array(const char **p, char **out) {
 fail:
     buf_free(&b);
     return false;
+}
+
+static bool parse_responses_content_array_replace(const char **p, char **dst) {
+    char *tmp = NULL;
+    if (!parse_responses_content_array(p, &tmp)) return false;
+    free(*dst);
+    *dst = tmp;
+    return true;
 }
 
 /* Codex /v1/responses input items have a `type` discriminator (message,
@@ -3189,115 +3197,101 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
             }
             (*p)++;
             if (!strcmp(key, "type")) {
-                free(type);
-                if (!json_string(p, &type)) {
+                if (!json_string_replace(p, &type)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "role")) {
-                free(role);
-                if (!json_string(p, &role)) {
+                if (!json_string_replace(p, &role)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "content")) {
-                free(content);
-                if (!parse_responses_content_array(p, &content)) {
+                if (!parse_responses_content_array_replace(p, &content)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "name")) {
-                free(name);
-                if (!json_string(p, &name)) {
+                if (!json_string_replace(p, &name)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "namespace")) {
-                free(namespace);
-                if (!json_string(p, &namespace)) {
+                if (!json_string_replace(p, &namespace)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "call_id")) {
-                free(call_id);
-                if (!json_string(p, &call_id)) {
+                if (!json_string_replace(p, &call_id)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "id")) {
-                free(item_id);
-                if (!json_string(p, &item_id)) {
+                if (!json_string_replace(p, &item_id)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "arguments")) {
-                free(arguments);
                 json_ws(p);
                 if (**p == '"') {
-                    if (!json_string(p, &arguments)) {
+                    if (!json_string_replace(p, &arguments)) {
                         free(key);
                         goto item_fail;
                     }
-                } else if (!json_raw_value(p, &arguments)) {
+                } else if (!json_raw_value_replace(p, &arguments)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "output")) {
-                free(output);
                 json_ws(p);
                 if (**p == '[') {
-                    if (!parse_responses_content_array(p, &output)) {
+                    if (!parse_responses_content_array_replace(p, &output)) {
                         free(key);
                         goto item_fail;
                     }
                 } else if (**p == '"') {
-                    if (!json_string(p, &output)) {
+                    if (!json_string_replace(p, &output)) {
                         free(key);
                         goto item_fail;
                     }
-                } else if (!json_raw_value(p, &output)) {
+                } else if (!json_raw_value_replace(p, &output)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "input")) {
-                free(input_str);
                 json_ws(p);
                 if (**p == '"') {
-                    if (!json_string(p, &input_str)) {
+                    if (!json_string_replace(p, &input_str)) {
                         free(key);
                         goto item_fail;
                     }
-                } else if (!json_raw_value(p, &input_str)) {
+                } else if (!json_raw_value_replace(p, &input_str)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "summary")) {
-                free(summary);
-                if (!parse_responses_content_array(p, &summary)) {
+                if (!parse_responses_content_array_replace(p, &summary)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "action")) {
-                free(action);
-                if (!json_raw_value(p, &action)) {
+                if (!json_raw_value_replace(p, &action)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "result")) {
-                free(result);
                 json_ws(p);
                 if (**p == '"') {
-                    if (!json_string(p, &result)) {
+                    if (!json_string_replace(p, &result)) {
                         free(key);
                         goto item_fail;
                     }
-                } else if (!json_raw_value(p, &result)) {
+                } else if (!json_raw_value_replace(p, &result)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "status")) {
-                free(status_str);
-                if (!json_string(p, &status_str)) {
+                if (!json_string_replace(p, &status_str)) {
                     free(key);
                     goto item_fail;
                 }
@@ -3306,8 +3300,7 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                  * here instead of in `output` / `result`. Keep it separate
                  * from the human-visible result body so malformed tool lists
                  * never get mistaken for normal tool output. */
-                free(tools_json);
-                if (!json_raw_value(p, &tools_json)) {
+                if (!json_raw_value_replace(p, &tools_json)) {
                     free(key);
                     goto item_fail;
                 }
@@ -3799,8 +3792,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 goto bad;
             }
         } else if (!strcmp(key, "model")) {
-            free(r->model);
-            if (!json_string(&p, &r->model)) {
+            if (!json_string_replace(&p, &r->model)) {
                 free(key);
                 goto bad;
             }
@@ -4011,14 +4003,16 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
         }
         p++;
         if (!strcmp(key, "prompt")) {
-            free(prompt);
-            if (!parse_prompt(&p, &prompt)) {
+            char *tmp = NULL;
+            if (!parse_prompt(&p, &tmp)) {
+                free(tmp);
                 free(key);
                 goto bad;
             }
+            free(prompt);
+            prompt = tmp;
         } else if (!strcmp(key, "model")) {
-            free(r->model);
-            if (!json_string(&p, &r->model)) {
+            if (!json_string_replace(&p, &r->model)) {
                 free(key);
                 goto bad;
             }
@@ -14480,6 +14474,67 @@ static void test_json_skip_has_nesting_limit(void) {
     free(bad);
 }
 
+static void test_request_parsers_reject_malformed_duplicate_owned_fields(void) {
+    const char *p =
+        "{\"name\":\"ok\",\"name\":\"bad\\q\",\"arguments\":\"{}\"}";
+    tool_call tc = {0};
+    TEST_ASSERT(!parse_function_call(&p, &tc));
+    tool_call_free(&tc);
+
+    p =
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"text\","
+        "\"text\":\"hello\",\"text\":\"bad\\q\"}]}]";
+    chat_msgs msgs = {0};
+    TEST_ASSERT(!parse_anthropic_messages(&p, &msgs));
+    chat_msgs_free(&msgs);
+
+    p =
+        "[{\"type\":\"message\",\"role\":\"user\","
+        "\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}],"
+        "\"content\":[{\"type\":\"input_text\",\"text\":\"bad\\q\"}]}]";
+    msgs = (chat_msgs){0};
+    TEST_ASSERT(!parse_responses_input(&p, &msgs, NULL, NULL));
+    chat_msgs_free(&msgs);
+
+    tool_schema_orders orders = {0};
+    tool_schema_orders_add_json(&orders,
+        "{\"name\":\"ok\",\"name\":\"bad\\q\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{}}}");
+    TEST_ASSERT(orders.len == 0);
+    tool_schema_orders_free(&orders);
+
+    char err[128];
+    request r;
+    bool ok = parse_anthropic_request(NULL, NULL,
+        "{\"model\":\"deepseek-v4-flash\",\"max_tokens\":1,"
+        "\"system\":\"ok\",\"system\":\"bad\\q\","
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}",
+        1, 100, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    if (ok) request_free(&r);
+
+    ok = parse_chat_request(NULL, NULL,
+        "{\"model\":\"deepseek-v4-flash\",\"model\":\"bad\\q\","
+        "\"max_tokens\":1,\"messages\":[{\"role\":\"user\","
+        "\"content\":\"hello\"}]}",
+        1, 100, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    if (ok) request_free(&r);
+
+    ok = parse_responses_request(NULL, NULL,
+        "{\"model\":\"deepseek-v4-flash\",\"model\":\"bad\\q\","
+        "\"max_output_tokens\":1,\"input\":\"hello\"}",
+        1, 100, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    if (ok) request_free(&r);
+
+    ok = parse_completion_request(NULL,
+        "{\"prompt\":\"hello\",\"prompt\":\"bad\\q\",\"max_tokens\":1}",
+        1, 100, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    if (ok) request_free(&r);
+}
+
 static void append_tool_heavy_schema(buf *b, int idx) {
     if (idx) buf_putc(b, ',');
     buf_puts(b, "{\"type\":\"function\",\"function\":{\"name\":");
@@ -15831,6 +15886,7 @@ static void ds4_server_unit_tests_run(void) {
     test_stop_list_parses_all_sequences();
     test_stop_list_streaming_holds_and_trims_stop_text();
     test_json_skip_has_nesting_limit();
+    test_request_parsers_reject_malformed_duplicate_owned_fields();
     test_json_parser_handles_tool_heavy_requests();
     test_json_string_handles_surrogates();
     test_model_metadata_clamps_completion_to_context();
