@@ -7,6 +7,8 @@ struct ds4_metal_args_dsv4_topk_mask {
     int64_t  ne1;
     uint64_t nb0;
     uint64_t nb1;
+    uint32_t mask_f16; // 1 = write comp_mask as f16 (default), 0 = f32 (opts disabled)
+    uint32_t pad0;
 };
 
 struct ds4_metal_args_dsv4_indexer_weighted_sum {
@@ -295,7 +297,12 @@ kernel void kernel_dsv4_topk_mask(
     const int64_t it = gid / args.ne0;
 
     (void)topk;
-    *((device float *) (dst + ic*args.nb0 + it*args.nb1)) = -INFINITY;
+    // comp_mask is binary -inf/0 (both exact in f16 or f32).
+    if (args.mask_f16) {
+        *((device half *) (dst + ic*args.nb0 + it*args.nb1)) = (half) -INFINITY;
+    } else {
+        *((device float *) (dst + ic*args.nb0 + it*args.nb1)) = -INFINITY;
+    }
 }
 
 // Enables the selected compressed rows in the dense mask. This replaces the
@@ -315,7 +322,11 @@ kernel void kernel_dsv4_topk_mask_scatter(
     const int64_t it = gid / args.ne00;
     const int32_t idx = *((device const int32_t *) (topk + ik*args.nb00 + it*args.nb01));
     if (idx >= 0 && (int64_t)idx < args.ne0) {
-        *((device float *) (dst + (int64_t)idx*args.nb0 + it*args.nb1)) = 0.0f;
+        if (args.mask_f16) {
+            *((device half *) (dst + (int64_t)idx*args.nb0 + it*args.nb1)) = (half) 0.0f;
+        } else {
+            *((device float *) (dst + (int64_t)idx*args.nb0 + it*args.nb1)) = 0.0f;
+        }
     }
 }
 
@@ -535,14 +546,23 @@ static inline void dsv4_attend_shared_h4_row_at(
                               o0, o1, o2, o3);
 }
 
+// comp cache element load. `format`: 0 = f32 rows, 1 = f16 rows, 2 = packed FP8
+// rows (ds4_fp8_kv_row, defined in flash_attn.metal which is concatenated first).
+// col is the 4-vec index 0..127 (dims [4col,4col+4)). The packed branch reuses the
+// same e4m3+ue8m0 decode as the flash reader, so the dequantized half4 is identical.
 static inline half4 dsv4_load_cache_h4(
         device const char *kv,
         uint64_t row_stride,
         uint row,
         uint col,
-        bool f16_rows) {
+        uint format) {
     device const char *base = kv + (uint64_t)row * row_stride;
-    if (f16_rows) {
+    if (format == 2u) {
+        half4 reg;
+        dequantize_fp8_kv_t4((device const ds4_fp8_kv_row *)base, (short)col, reg);
+        return reg;
+    }
+    if (format == 1u) {
         return ((device const half4 *)base)[col];
     }
     return (half4)((device const float4 *)base)[col];
@@ -652,7 +672,7 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8(
                                                 args.comp_row_stride,
                                                 (uint)idx,
                                                 tid,
-                                                args.comp_kv_f16 != 0u);
+                                                args.comp_kv_f16);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         dsv4_attend_shared_h4_row(kv_shared,
@@ -780,7 +800,7 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16(
                                                 args.comp_row_stride,
                                                 rows[r],
                                                 c,
-                                                args.comp_kv_f16 != 0u);
+                                                args.comp_kv_f16);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint r = 0; r < n_rows; r++) {

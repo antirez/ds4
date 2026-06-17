@@ -56,7 +56,37 @@ static inline float dsv4_e4m3fn_value(int i) {
         : (1.0f + float(mant) * 0.125f) * dsv4_e4m3fn_exp_scale[exp];
 }
 
-static inline float dsv4_e4m3fn_dequant(float x) {
+// Round a non-negative magnitude to the nearest e4m3fn code (0..126), ties to
+// even code. Shared by the value-returning dequant and the byte-packing path so
+// the packed e4m3 byte unpacks to exactly the value the float path would store.
+static inline int dsv4_e4m3fn_code(float ax) {
+    ax = min(ax, 448.0f);
+    int lo = 0;
+    int hi = 126;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (dsv4_e4m3fn_value(mid) <= ax) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    int best = lo;
+    if (best < 126) {
+        const float best_diff = abs(ax - dsv4_e4m3fn_value(best));
+        const float next_diff = abs(ax - dsv4_e4m3fn_value(best + 1));
+        if (next_diff < best_diff || (next_diff == best_diff && ((best + 1) & 1) == 0 && (best & 1) != 0)) {
+            best = best + 1;
+        }
+    }
+    return best;
+}
+
+// Software e4m3fn round-trip: round |x| to the nearest representable e4m3fn
+// magnitude (ties to even) and reapply the sign. Monotonic and correct across
+// the whole range; used directly when the native packer is unavailable and as
+// the subnormal fallback for the hybrid path below.
+static inline float dsv4_e4m3fn_dequant_sw(float x) {
     const float sign = x < 0.0f ? -1.0f : 1.0f;
     const float ax = min(abs(x), 448.0f);
 
@@ -82,6 +112,29 @@ static inline float dsv4_e4m3fn_dequant(float x) {
 
     return sign * dsv4_e4m3fn_value(best);
 }
+
+#if defined(DS4_METAL_FP8_NATIVE) && __METAL_VERSION__ >= 410
+// Hybrid e4m3fn round-trip using the MSL 4.1 hardware packer. On macOS 27 beta
+// (build 26A5353q) the metal_fp8_e4m3_format packer is bit-exact with the
+// software ladder on the normal range [2^-6, 448], but it rounds subnormals
+// non-monotonically and returns NaN for magnitudes above the max normal instead
+// of saturating. So below the min normal we keep the software ladder, and above
+// it we use the native pack/unpack with a defensive clamp that also guards the
+// >448 NaN. Verified bit-exact against dsv4_e4m3fn_dequant_sw over 4M samples
+// spanning [-448, 448] (see ds4_gpu_validate_fp8_native). Once Apple fixes the
+// subnormal/saturation behavior this can collapse to a bare pack/unpack.
+static inline float dsv4_e4m3fn_dequant(float x) {
+    if (abs(x) < 0.015625f) {
+        return dsv4_e4m3fn_dequant_sw(x);
+    }
+    const vec<float, 4> v(clamp(x, -448.0f, 448.0f), 0.0f, 0.0f, 0.0f);
+    return unpack<float, metal_fp8_e4m3_format, 4>(pack<metal_fp8_e4m3_format>(v))[0];
+}
+#else
+static inline float dsv4_e4m3fn_dequant(float x) {
+    return dsv4_e4m3fn_dequant_sw(x);
+}
+#endif
 
 static inline float dsv4_e2m1fn_dequant(float x) {
     const float sign = x < 0.0f ? -1.0f : 1.0f;
@@ -262,6 +315,176 @@ kernel void kernel_dsv4_kv_fp8_store_f32(
         raw[i] = (float)((half)kv[i]);
 #endif
     }
+}
+
+// Packed FP8 compressed-KV writer. Produces the same e4m3fn-quantized values as
+// kernel_dsv4_fp8_kv_quantize_f32 but stores them compactly for FlashAttention:
+//   - nope plane : one e4m3 byte per element (sign<<7 | code).
+//   - scale plane: one ue8m0 byte per 64-element block (exponent + 127).
+//   - rot plane  : the RoPE prefix copied verbatim as float (precision-preserving).
+// Reconstruction is value = e4m3_value(code) * 2^(ue8m0-127), which is bit-exact
+// with the float path's stored value (verified offline over 4M values). One row
+// per threadgroup, 64 threads, mirroring the quantize kernel's block reduction.
+kernel void kernel_dsv4_kv_pack_fp8_f32(
+        constant ds4_metal_args_dsv4_fp8_kv_quantize & args,
+        device  const float * src0,
+        device        uchar * nope_bytes,
+        device        uchar * scale_bytes,
+        device        float * rot_out,
+        threadgroup  float * scratch [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    const int64_t n_rows = args.ne01 * args.ne02 * args.ne03;
+    if ((int64_t) row >= n_rows || tid >= 64) {
+        return;
+    }
+
+    const int head_dim = (int)args.ne00;
+    const int n_rot = args.n_rot;
+    const int n_nope = head_dim - n_rot;
+    const int n_blk = n_nope / 64;
+
+    device const float * src = src0 + (int64_t)row * head_dim;
+    device       uchar * nb  = nope_bytes  + (int64_t)row * n_nope;
+    device       uchar * sb  = scale_bytes + (int64_t)row * n_blk;
+    device       float * rt  = rot_out     + (int64_t)row * n_rot;
+
+    for (int off = 0; off < n_nope; off += 64) {
+        float v = 0.0f;
+        if (off + (int)tid < n_nope) {
+            v = src[off + tid];
+            scratch[tid] = abs(v);
+        } else {
+            scratch[tid] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = 32; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                scratch[tid] = max(scratch[tid], scratch[tid + stride]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        const float amax = max(scratch[0], 1.0e-4f);
+        int exp = (int)ceil(log2(amax / 448.0f));
+        if (exp < -127) exp = -127;
+        if (exp > 127) exp = 127;
+        const float scale = exp2((float)exp);
+        if (tid == 0) {
+            sb[off / 64] = (uchar)(exp + 127);
+        }
+        if (off + (int)tid < n_nope) {
+            const float vs = clamp(v / scale, -448.0f, 448.0f);
+            const uint sign = vs < 0.0f ? 0x80u : 0x00u;
+            const int code = dsv4_e4m3fn_code(abs(vs));
+            nb[off + tid] = (uchar)(sign | (uint)code);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (int i = tid; i < n_rot; i += 64) {
+        rt[i] = src[n_nope + i];
+    }
+}
+
+// Row-interleaved packed FP8 writer consumed directly by decode FlashAttention's
+// dequantize_fp8_kv_t4 (see flash_attn.metal struct ds4_fp8_kv_row). Produces the
+// same e4m3-quantized values as the float quantize path but in one buffer with a
+// single per-row stride, so the F16 staging copy is eliminated:
+//   [scale: n_blk ue8m0 bytes, padded to 8][nope: n_nope e4m3 bytes][rot: n_rot half]
+// The rot prefix is rounded to half here to match the prior F16 staging exactly,
+// making the reconstructed (half) KV bit-identical to the current attention input.
+// One row per threadgroup, 64 threads, mirroring the quantize kernel's reduction.
+kernel void kernel_dsv4_kv_pack_fp8_row_f32(
+        constant ds4_metal_args_dsv4_fp8_kv_quantize & args,
+        device  const float * src0,
+        device        uchar * rows,
+        threadgroup  float * scratch [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    const int64_t n_rows = args.ne01 * args.ne02 * args.ne03;
+    if ((int64_t) row >= n_rows || tid >= 64) {
+        return;
+    }
+
+    const int head_dim = (int)args.ne00;
+    const int n_rot = args.n_rot;
+    const int n_nope = head_dim - n_rot;
+    const int n_blk = n_nope / 64;
+    const int scale_pad = (n_blk + 7) & ~7;          // 8 for n_blk=7; keeps rot 8-aligned
+    const int rot_off = scale_pad + n_nope;          // byte offset of the rot (half) plane
+    const int stride = rot_off + n_rot * (int)sizeof(half);
+
+    device const float * src = src0 + (int64_t)row * head_dim;
+    device       uchar * base = rows + (int64_t)row * stride;
+    device       uchar * sb   = base;                                  // scale plane
+    device       uchar * nb   = base + scale_pad;                      // nope plane
+    device       half  * rt   = (device half *)(base + rot_off);       // rot plane
+
+    for (int off = 0; off < n_nope; off += 64) {
+        float v = 0.0f;
+        if (off + (int)tid < n_nope) {
+            v = src[off + tid];
+            scratch[tid] = abs(v);
+        } else {
+            scratch[tid] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride2 = 32; stride2 > 0; stride2 >>= 1) {
+            if (tid < stride2) {
+                scratch[tid] = max(scratch[tid], scratch[tid + stride2]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        const float amax = max(scratch[0], 1.0e-4f);
+        int exp = (int)ceil(log2(amax / 448.0f));
+        if (exp < -127) exp = -127;
+        if (exp > 127) exp = 127;
+        const float scale = exp2((float)exp);
+        if (tid == 0) {
+            sb[off / 64] = (uchar)(exp + 127);
+        }
+        if (off + (int)tid < n_nope) {
+            const float vs = clamp(v / scale, -448.0f, 448.0f);
+            const uint sign = vs < 0.0f ? 0x80u : 0x00u;
+            const int code = dsv4_e4m3fn_code(abs(vs));
+            nb[off + tid] = (uchar)(sign | (uint)code);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (int i = tid; i < n_rot; i += 64) {
+        rt[i] = (half)src[n_nope + i];
+    }
+}
+
+// Inverse of kernel_dsv4_kv_pack_fp8_row_f32: unpack packed FP8 comp rows back to
+// a contiguous f16 buffer for the (cold) flash-attention staging path, which keeps
+// using the existing kvpad-correct F16 machinery. The hot indexed-attention path
+// reads the packed cache directly and does not use this. One row per threadgroup,
+// 128 threads (each emits one half4 via the shared dequantize_fp8_kv_t4 decode).
+kernel void kernel_dsv4_kv_unpack_fp8_row_f16(
+        constant ds4_metal_args_dsv4_fp8_kv_quantize & args,
+        device  const uchar * rows,
+        device        half  * dst,
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    const int64_t n_rows = args.ne01 * args.ne02 * args.ne03;
+    if ((int64_t) row >= n_rows || tid >= 128u) {
+        return;
+    }
+    const int head_dim = (int)args.ne00;
+    if (head_dim != 512 || args.n_rot != 64) {
+        return; // packed layout (ds4_fp8_kv_row) is fixed to DS4's 512/64 dims
+    }
+    device const ds4_fp8_kv_row * src = ((device const ds4_fp8_kv_row *) rows) + row;
+    device half4 * out = (device half4 *)(dst + (int64_t)row * head_dim);
+    half4 v;
+    dequantize_fp8_kv_t4(src, (short)tid, v);
+    out[tid] = v;
 }
 
 // Ratio-4 compression keeps two 4-row halves of recurrent state. After an
