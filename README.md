@@ -1,3 +1,5 @@
+![DwarfStar Logo](./logo.svg)
+
 # DwarfStar
 
 **DwarfStar** is a small native inference engine optimized first for
