@@ -1,0 +1,189 @@
+{
+  "personas": {
+    "junior": "Says they are a second-year CS student. Comfortable with basic Python; first month writing C, so pointers, memory, and the build toolchain are new territory. Has not used a debugger yet. Wants to understand why things work, not just get the fix.",
+    "senior": "Staff systems engineer; says they have shipped C for fifteen years, much of it performance work. Knows the toolchain cold. Wants depth: invariants, trade-offs, the mechanics underneath, what was rejected and why. Gets impatient when walked through basics."
+  },
+  "prompts": [
+    {
+      "id": "off-by-one",
+      "title": "Off-by-one array read in C",
+      "persona": "junior",
+      "teach_level": "medium",
+      "prompt": "sum.c is supposed to print 150 but it prints a different number almost every time I recompile, which makes no sense to me. I'm new to C. Can you find the bug, fix it, and make sure it really prints 150?",
+      "notes": "The loop bound is i <= n, so it reads one past the end of the array. Good teaching: why reading past an array picks up whatever happens to sit on the stack (hence a different wrong answer each build), why C does no bounds checking, the <= vs < idiom for array loops, and how to verify the fix by compiling and running.",
+      "check": "cc -o sum sum.c && [ \"$(./sum)\" = \"150\" ]",
+      "fixes": [
+        {"path": "sum.c", "old": "i <= n", "new": "i < n"}
+      ],
+      "files": [
+        {
+          "path": "sum.c",
+          "text": "#include <stdio.h>\n\n/* Sum the first n scores. */\nstatic int sum_scores(const int *scores, int n) {\n    int total = 0;\n    for (int i = 0; i <= n; i++)\n        total += scores[i];\n    return total;\n}\n\nint main(void) {\n    int scores[5] = {10, 20, 30, 40, 50};\n    printf(\"%d\\n\", sum_scores(scores, 5));\n    return 0;\n}\n"
+        }
+      ]
+    },
+    {
+      "id": "mutable-default",
+      "title": "Python mutable default argument",
+      "persona": "junior",
+      "teach_level": "medium",
+      "prompt": "Running python3 inventory.py fails an assert and I don't get why - each call to add_item should start with a fresh list when I don't pass one. Find out what is going on, fix it, and make the test pass.",
+      "notes": "Classic mutable default argument: the [] is evaluated once at def time and shared across calls. Good teaching: when default values are created in Python, why the second call sees the first call's item, the items=None idiom, and that this same aliasing trap appears anywhere a mutable object is shared.",
+      "check": "python3 inventory.py | grep -q ok",
+      "fixes": [
+        {"path": "inventory.py",
+         "old": "def add_item(item, items=[]):\n    items.append(item)\n    return items",
+         "new": "def add_item(item, items=None):\n    if items is None:\n        items = []\n    items.append(item)\n    return items"}
+      ],
+      "files": [
+        {
+          "path": "inventory.py",
+          "text": "def add_item(item, items=[]):\n    items.append(item)\n    return items\n\n\ndef test():\n    a = add_item(\"sword\")\n    b = add_item(\"shield\")\n    assert a == [\"sword\"], a\n    assert b == [\"shield\"], b\n    print(\"ok\")\n\n\ntest()\n"
+        }
+      ]
+    },
+    {
+      "id": "strcpy-overflow",
+      "title": "Unbounded strcpy from argv",
+      "persona": "junior",
+      "teach_level": "medium",
+      "prompt": "A fuzzer crashed greet.c by passing a very long name on the command line. Make it safe against any argument length, without changing what it prints for normal names like 'Rowan'.",
+      "notes": "strcpy into a fixed 16-byte stack buffer from attacker-controlled argv. Good teaching: what actually gets overwritten on the stack and why that is exploitable rather than just crashy, why the fix is to bound the copy (snprintf / strlcpy) and what happens to long input (truncation as a deliberate policy), and the general rule that any input crossing a trust boundary needs a length.",
+      "check": "cc -o greet greet.c && ./greet \"$(python3 -c 'print(\"x\"*500)')\" >/dev/null && [ \"$(./greet Rowan)\" = \"hello, Rowan\" ]",
+      "fixes": [
+        {"path": "greet.c",
+         "old": "    strcpy(name, argc > 1 ? argv[1] : \"world\");",
+         "new": "    snprintf(name, sizeof(name), \"%s\", argc > 1 ? argv[1] : \"world\");"}
+      ],
+      "files": [
+        {
+          "path": "greet.c",
+          "text": "#include <stdio.h>\n#include <string.h>\n\nint main(int argc, char **argv) {\n    char name[16];\n    strcpy(name, argc > 1 ? argv[1] : \"world\");\n    printf(\"hello, %s\\n\", name);\n    return 0;\n}\n"
+        }
+      ]
+    },
+    {
+      "id": "float-compare",
+      "title": "Floating-point equality in a test",
+      "persona": "junior",
+      "teach_level": "medium",
+      "prompt": "This tiny test in price_test.py fails, but the total() function looks completely right to me. Figure out what is actually wrong and fix it the way a real project would, then show the test passing.",
+      "notes": "0.1 + 0.2 != 0.3 in binary floating point. Good teaching: decimal fractions are repeating fractions in base 2 so the stored values are approximations, never compare floats with ==, fix with math.isclose or an epsilon (not by rounding the function), and a pointer that money usually wants Decimal or integer cents.",
+      "check": "python3 price_test.py | grep -q ok",
+      "fixes": [
+        {"path": "price_test.py",
+         "old": "assert total([0.1, 0.2]) == 0.3, \"total([0.1, 0.2]) != 0.3\"",
+         "new": "import math\nassert math.isclose(total([0.1, 0.2]), 0.3), \"total([0.1, 0.2]) != 0.3\""}
+      ],
+      "files": [
+        {
+          "path": "price_test.py",
+          "text": "def total(prices):\n    t = 0.0\n    for p in prices:\n        t += p\n    return t\n\n\nassert total([0.1, 0.2]) == 0.3, \"total([0.1, 0.2]) != 0.3\"\nprint(\"ok\")\n"
+        }
+      ]
+    },
+    {
+      "id": "rename-symbol",
+      "title": "Cross-file symbol rename",
+      "persona": "senior",
+      "teach_level": "high",
+      "prompt": "Rename calc_total to compute_total across this little project - header, implementation, callers, comments, everything. It must still build clean and run correctly afterwards; prove it.",
+      "notes": "A mechanical task where the teaching is the method: enumerate every occurrence before touching anything (search first, edit second), why a rename must cover declaration, definition, call sites and prose atomically, and that the compiler plus a run is the cheap proof. For a senior the asides should be about discipline and verification, not what grep is.",
+      "check": "! grep -rq calc_total . && cc -o report report.c stats.c && [ \"$(./report)\" = \"total=6\" ]",
+      "fixes": [
+        {"path": "stats.h", "old": "calc_total", "new": "compute_total"},
+        {"path": "stats.c", "old": "calc_total", "new": "compute_total"},
+        {"path": "report.c", "old": "calc_total", "new": "compute_total"}
+      ],
+      "files": [
+        {
+          "path": "stats.h",
+          "text": "#ifndef STATS_H\n#define STATS_H\n/* calc_total sums n values. */\nint calc_total(const int *v, int n);\n#endif\n"
+        },
+        {
+          "path": "stats.c",
+          "text": "#include \"stats.h\"\n\nint calc_total(const int *v, int n) {\n    int t = 0;\n    for (int i = 0; i < n; i++) t += v[i];\n    return t;\n}\n"
+        },
+        {
+          "path": "report.c",
+          "text": "#include <stdio.h>\n#include \"stats.h\"\n\nint main(void) {\n    int v[3] = {1, 2, 3};\n    /* calc_total gives the grand total for the report. */\n    printf(\"total=%d\\n\", calc_total(v, 3));\n    return 0;\n}\n"
+        }
+      ]
+    },
+    {
+      "id": "quadratic-dedupe",
+      "title": "Quadratic dedupe made linear",
+      "persona": "junior",
+      "teach_level": "high",
+      "prompt": "dedupe.py fails its own speed assert - it is way too slow on 40,000 items. Make dedupe() fast while keeping first-seen order, and make the whole script pass.",
+      "notes": "x not in out scans a list, so the loop is O(n^2); a seen-set makes membership O(1). Good teaching at high level: predict the complexity before measuring, why list membership is a linear scan while set membership is a hash lookup, the order-preserving set+list idiom (or dict.fromkeys), and showing the before/after timing as the payoff.",
+      "check": "python3 dedupe.py | grep -q ok",
+      "fixes": [
+        {"path": "dedupe.py",
+         "old": "def dedupe(xs):\n    out = []\n    for x in xs:\n        if x not in out:\n            out.append(x)\n    return out",
+         "new": "def dedupe(xs):\n    seen = set()\n    out = []\n    for x in xs:\n        if x not in seen:\n            seen.add(x)\n            out.append(x)\n    return out"}
+      ],
+      "files": [
+        {
+          "path": "dedupe.py",
+          "text": "import time\n\n\ndef dedupe(xs):\n    out = []\n    for x in xs:\n        if x not in out:\n            out.append(x)\n    return out\n\n\nxs = list(range(20000)) * 2\nt0 = time.time()\nr = dedupe(xs)\ndt = time.time() - t0\nassert r == list(range(20000))\nassert dt < 1.0, \"too slow: %.3fs\" % dt\nprint(\"ok %.3fs\" % dt)\n"
+        }
+      ]
+    },
+    {
+      "id": "makefile-header",
+      "title": "Missing header dependency in Makefile",
+      "persona": "senior",
+      "teach_level": "medium",
+      "prompt": "When I edit util.h and rerun make in this directory, nothing rebuilds and I keep running stale code. Fix the Makefile so header changes trigger the right rebuilds.",
+      "notes": "The .o rules list only the .c file, so make's mtime comparison never sees util.h change. Good teaching for a senior: make is nothing but a prerequisite graph over mtimes, headers are real prerequisites the graph must know about, and the scalable fix is compiler-generated dependencies (-MMD -MP plus -include) rather than hand-listing every header.",
+      "check": "make >/dev/null 2>&1 && sleep 1 && touch util.h && make -n 2>/dev/null | grep -q -e cc -e '$(CC)' -e util",
+      "fixes": [
+        {"path": "Makefile", "old": "app.o: app.c\n", "new": "app.o: app.c util.h\n"},
+        {"path": "Makefile", "old": "util.o: util.c\n", "new": "util.o: util.c util.h\n"}
+      ],
+      "files": [
+        {
+          "path": "Makefile",
+          "text": "CC = cc\n\napp: app.o util.o\n\t$(CC) -o app app.o util.o\n\napp.o: app.c\n\t$(CC) -c app.c\n\nutil.o: util.c\n\t$(CC) -c util.c\n\nclean:\n\trm -f app app.o util.o\n"
+        },
+        {
+          "path": "util.h",
+          "text": "#ifndef UTIL_H\n#define UTIL_H\n#define GREETING \"hello\"\nconst char *greeting(void);\n#endif\n"
+        },
+        {
+          "path": "util.c",
+          "text": "#include \"util.h\"\n\nconst char *greeting(void) {\n    return GREETING;\n}\n"
+        },
+        {
+          "path": "app.c",
+          "text": "#include <stdio.h>\n#include \"util.h\"\n\nint main(void) {\n    printf(\"%s\\n\", greeting());\n    return 0;\n}\n"
+        }
+      ]
+    },
+    {
+      "id": "endian-magic",
+      "title": "Endianness in a binary header",
+      "persona": "senior",
+      "teach_level": "high",
+      "prompt": "reader.c prints 'bad magic cefaedfe' on this Mac, but header.bin is valid - it came straight off the build server and other tools read it fine. Make the reader correct on any machine, properly - not by byte-swapping the constant.",
+      "notes": "The file stores 32-bit big-endian values; memcpy into a host-order int flips them on little-endian arm64 (cefaedfe is feedface byte-reversed, which is the tell). Good teaching for a senior at high level: on-disk formats define byte order while memcpy assumes host order, read the reversed hex as evidence, and the fix is assembling bytes explicitly (shifts) or ntohl-style conversion at the boundary - decode at the edge, host order inside.",
+      "check": "cc -o reader reader.c && [ \"$(./reader)\" = \"version 2\" ]",
+      "fixes": [
+        {"path": "reader.c",
+         "old": "    unsigned int magic, version;\n    memcpy(&magic, buf, 4);\n    memcpy(&version, buf + 4, 4);",
+         "new": "    unsigned int magic = ((unsigned int)buf[0] << 24) | ((unsigned int)buf[1] << 16) | ((unsigned int)buf[2] << 8) | buf[3];\n    unsigned int version = ((unsigned int)buf[4] << 24) | ((unsigned int)buf[5] << 16) | ((unsigned int)buf[6] << 8) | buf[7];"}
+      ],
+      "files": [
+        {
+          "path": "reader.c",
+          "text": "#include <stdio.h>\n#include <string.h>\n\n/* header.bin comes from the build server: a 32-bit magic 0xFEEDFACE\n * followed by a 32-bit version number, both big-endian. */\nint main(void) {\n    unsigned char buf[8];\n    FILE *f = fopen(\"header.bin\", \"rb\");\n    if (!f || fread(buf, 1, 8, f) != 8) {\n        puts(\"read error\");\n        return 1;\n    }\n    fclose(f);\n    unsigned int magic, version;\n    memcpy(&magic, buf, 4);\n    memcpy(&version, buf + 4, 4);\n    if (magic != 0xFEEDFACE) {\n        printf(\"bad magic %08x\\n\", magic);\n        return 1;\n    }\n    printf(\"version %u\\n\", version);\n    return 0;\n}\n"
+        },
+        {
+          "path": "header.bin",
+          "base64": "/u36zgAAAAI="
+        }
+      ]
+    }
+  ]
+}

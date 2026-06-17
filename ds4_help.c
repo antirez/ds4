@@ -279,6 +279,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "-p, --prompt TEXT", "Submit an initial prompt after startup.");
     opt(fp, c, "--non-interactive", "Run without TUI. With -p: one turn; without -p: repeated stdin prompts.");
     opt(fp, c, "-sys, --system TEXT", "Extra system prompt. Empty disables extra text.");
+    opt(fp, c, "--teach LEVEL", "Teaching level: off, low, medium, high. Default: medium (off when non-interactive).");
     opt(fp, c, "--trace FILE", "Write prompt, token, and DSML debug trace.");
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");
     fputc('\n', fp);
@@ -294,6 +295,8 @@ static void print_agent_sessions(FILE *fp, const help_colors *c) {
     opt(fp, c, "/strip ID", "Remove KV payload; the text history can be rebuilt later.");
     opt(fp, c, "/history [N]", "Show N recent user turns from the current session.");
     opt(fp, c, "/power N", "Set GPU duty cycle percentage, 1..100.");
+    opt(fp, c, "/teach [L]", "Show or set teaching level; more/less steps it.");
+    opt(fp, c, "/profile", "Show the persistent learner profile; /profile reset clears it.");
     opt(fp, c, "/new", "Start a fresh session from the system prompt.");
     opt(fp, c, "/quit, /exit", "Exit.");
     fputc('\n', fp);
