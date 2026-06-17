@@ -2101,6 +2101,108 @@ static bool dist_route_search_workers(
     return false;
 }
 
+static void dist_format_range_end(
+        uint32_t layer_end,
+        bool has_output,
+        char *buf,
+        size_t buflen) {
+    if (!buf || buflen == 0) return;
+    if (has_output) snprintf(buf, buflen, "output");
+    else snprintf(buf, buflen, "%u", layer_end);
+}
+
+static bool dist_route_diag_local_overlap(
+        const ds4_dist_coordinator_state *state,
+        const ds4_dist_worker_entry *w,
+        char *err,
+        size_t errlen) {
+    if (!state || !w) return false;
+    if (w->layer_end < state->local_start || w->layer_start > state->local_end) return false;
+
+    uint32_t overlap_start = w->layer_start > state->local_start ? w->layer_start : state->local_start;
+    uint32_t overlap_end = w->layer_end < state->local_end ? w->layer_end : state->local_end;
+    char worker_end[32];
+    char local_end[32];
+    dist_format_range_end(w->layer_end, w->has_output != 0, worker_end, sizeof(worker_end));
+    dist_format_range_end(state->local_end, state->local_has_output, local_end, sizeof(local_end));
+    if (errlen) {
+        snprintf(err,
+                 errlen,
+                 "distributed %s route invalid: worker %s:%u layers=%u:%s overlap coordinator local range %u:%s at layers %u:%u",
+                 dist_topology_name(state->topology),
+                 w->peer_host,
+                 w->listen_port,
+                 w->layer_start,
+                 worker_end,
+                 state->local_start,
+                 local_end,
+                 overlap_start,
+                 overlap_end);
+    }
+    return true;
+}
+
+static bool dist_route_diag_worker_overlap(
+        const ds4_dist_coordinator_state *state,
+        const ds4_dist_worker_entry *prev,
+        const ds4_dist_worker_entry *cur,
+        char *err,
+        size_t errlen) {
+    if (!state || !prev || !cur) return false;
+    if (cur->layer_start > prev->layer_end) return false;
+
+    uint32_t overlap_start = cur->layer_start;
+    uint32_t overlap_end = prev->layer_end < cur->layer_end ? prev->layer_end : cur->layer_end;
+    char prev_end[32];
+    char cur_end[32];
+    dist_format_range_end(prev->layer_end, prev->has_output != 0, prev_end, sizeof(prev_end));
+    dist_format_range_end(cur->layer_end, cur->has_output != 0, cur_end, sizeof(cur_end));
+    if (errlen) {
+        snprintf(err,
+                 errlen,
+                 "distributed %s route invalid: worker %s:%u layers=%u:%s overlap worker %s:%u layers=%u:%s at layers %u:%u",
+                 dist_topology_name(state->topology),
+                 prev->peer_host,
+                 prev->listen_port,
+                 prev->layer_start,
+                 prev_end,
+                 cur->peer_host,
+                 cur->listen_port,
+                 cur->layer_start,
+                 cur_end,
+                 overlap_start,
+                 overlap_end);
+    }
+    return true;
+}
+
+static void dist_route_diagnose_failure(
+        const ds4_dist_coordinator_state *state,
+        ds4_dist_worker_entry **workers,
+        uint32_t n,
+        uint32_t required_start,
+        uint32_t required_end,
+        uint32_t missing_layer,
+        char *err,
+        size_t errlen) {
+    if (!state || !err || errlen == 0) return;
+
+    ds4_dist_worker_entry *prev = NULL;
+    for (uint32_t i = 0; i < n; i++) {
+        ds4_dist_worker_entry *w = workers[i];
+        if (w->layer_end < required_start || w->layer_start > required_end) continue;
+        if (dist_route_diag_local_overlap(state, w, err, errlen)) return;
+        if (prev && dist_route_diag_worker_overlap(state, prev, w, err, errlen)) return;
+        prev = w;
+    }
+
+    snprintf(err,
+             errlen,
+             "distributed %s route incomplete: missing layer %u",
+             dist_topology_name(state->topology),
+             missing_layer);
+}
+
 static void dist_coordinator_report_plan(ds4_dist_coordinator_state *state) {
     if (!dist_coordinator_debug_enabled(state)) return;
     pthread_mutex_lock(&state->mu);
@@ -2411,11 +2513,17 @@ static bool dist_coordinator_build_route_plan(
                                    path,
                                    &path_len,
                                    &missing)) {
-        const char *topology_name = dist_topology_name(state->topology);
         pthread_mutex_unlock(&state->mu);
+        dist_route_diagnose_failure(state,
+                                    workers,
+                                    n,
+                                    required_start,
+                                    required_end,
+                                    missing,
+                                    err,
+                                    errlen);
         free(workers);
         free(path);
-        if (errlen) snprintf(err, errlen, "distributed %s route incomplete: missing layer %u", topology_name, missing);
         return false;
     }
 

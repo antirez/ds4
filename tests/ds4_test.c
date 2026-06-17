@@ -2329,6 +2329,44 @@ static void test_distributed_topology_logic_group(void) {
     state.workers = test_dist_worker("127.0.0.1", 20012, 2, 1, 19, false, true, 1024);
     memset(&route, 0, sizeof(route));
     TEST_ASSERT(!ds4_dist_test_build_route_plan(&state, &route, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "missing layer 0") != NULL);
+    test_dist_free_workers(state.workers);
+    pthread_mutex_destroy(&state.mu);
+
+    memset(&state, 0, sizeof(state));
+    state.n_layers = 43;
+    state.local_start = 21;
+    state.local_end = 42;
+    state.topology = DS4_DIST_TOPOLOGY_REVERSE;
+    state.local_has_output = true;
+    state.local_can_output_head = true;
+    state.use_control_for_work = false;
+    pthread_mutex_init(&state.mu, NULL);
+    state.workers = test_dist_worker("127.0.0.1", 20013, 2, 0, 21, false, true, 1024);
+    memset(&route, 0, sizeof(route));
+    err[0] = '\0';
+    TEST_ASSERT(!ds4_dist_test_build_route_plan(&state, &route, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "overlap coordinator local range 21:output") != NULL);
+    TEST_ASSERT(strstr(err, "layers 21:21") != NULL);
+    test_dist_free_workers(state.workers);
+    pthread_mutex_destroy(&state.mu);
+
+    memset(&state, 0, sizeof(state));
+    state.n_layers = 43;
+    state.local_start = 21;
+    state.local_end = 42;
+    state.topology = DS4_DIST_TOPOLOGY_REVERSE;
+    state.local_has_output = true;
+    state.local_can_output_head = true;
+    state.use_control_for_work = false;
+    pthread_mutex_init(&state.mu, NULL);
+    state.workers = test_dist_worker("127.0.0.1", 20014, 2, 0, 10, false, true, 1024);
+    state.workers->next = test_dist_worker("127.0.0.1", 20015, 2, 10, 20, false, true, 1024);
+    memset(&route, 0, sizeof(route));
+    err[0] = '\0';
+    TEST_ASSERT(!ds4_dist_test_build_route_plan(&state, &route, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "overlap worker") != NULL);
+    TEST_ASSERT(strstr(err, "layers 10:10") != NULL);
     test_dist_free_workers(state.workers);
     pthread_mutex_destroy(&state.mu);
 }
