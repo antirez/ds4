@@ -10431,6 +10431,24 @@ decode_again:
                 finish = "error";
                 break;
             }
+        } else if (temperature <= 0.0f &&
+                   getenv("DS4_PROMPT_LOOKUP_DRAFT") != NULL) {
+            /* Prompt-lookup drafting covers greedy decode spans, which includes
+             * forced-greedy tool-call payloads on otherwise sampled requests.
+             * Committed tokens flow through the same per-token stop/stream
+             * handling below, like the MTP batch path. */
+            ntok = ds4_session_eval_prompt_lookup_argmax(s->session,
+                                                         token,
+                                                         max_tokens - completion,
+                                                         ds4_token_eos(s->engine),
+                                                         toks,
+                                                         (int)(sizeof(toks) / sizeof(toks[0])),
+                                                         err,
+                                                         sizeof(err));
+            if (ntok < 0) {
+                finish = "error";
+                break;
+            }
         } else {
             if (ds4_session_eval(s->session, token, err, sizeof(err)) != 0) {
                 finish = "error";
