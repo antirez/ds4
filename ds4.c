@@ -23268,6 +23268,8 @@ struct ds4_session {
     float *logits;
     float *mtp_logits;
     int mtp_draft_token;
+    uint32_t cont_anchor_row;
+    bool cont_anchor_valid;
     uint64_t mtp_probe_total;
     uint64_t mtp_probe_hit;
     ds4_session_progress_fn progress;
@@ -24841,6 +24843,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     }
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
+    s->cont_anchor_valid = false;
     g->mtp_n_raw = 0;
     return 0;
 #endif
@@ -26704,6 +26707,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         snprintf(err, errlen, "interrupted");
         return DS4_SESSION_SYNC_INTERRUPTED;
     }
+    s->cont_anchor_valid = false;
     if (s->distributed) {
         const ds4_tokens *checkpoint = s->checkpoint_valid ? &s->checkpoint : NULL;
         return ds4_dist_session_sync(s->distributed,
@@ -27132,6 +27136,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         return 1;
     }
     token_vec_push(&s->checkpoint, token);
+    s->cont_anchor_valid = false;
     if (mtp_should_draft) {
         int mtp_top = -1;
         if (metal_graph_eval_mtp_draft(&s->graph,
@@ -27190,6 +27195,113 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     return -1;
 #else
     ds4_engine *e = s->engine;
+    int n_accept = 0;
+    const bool strict_mtp = e->quality || getenv("DS4_MTP_STRICT") != NULL;
+
+    /* Continuous depth-1 speculation (DS4_MTP_CONTINUOUS).  The default path
+     * below decodes first_token on its own and then batch-verifies the MTP
+     * draft; that standalone decode is a full shared-weight pass the verify
+     * could have amortized.  Continuous mode folds the two together: forward
+     * [first_token, draft] in a single verify, drafting from the anchor row the
+     * previous verify left in batch_cur_hc.  It removes one shared-weight pass
+     * per accepted draft (about 0.50 versus 0.70 reads per token).  Same
+     * near-greedy class as the batched draft-2 verifier, not bit-exact to a
+     * strict decode: a wrong draft is rejected by the verify and never
+     * committed, so a stale anchor only lowers acceptance, never corrupts.
+     * --quality / DS4_MTP_STRICT ask for a strict decode, so defer to the
+     * exact verifier below in that case. */
+    if (!strict_mtp && e->mtp_ready && s->mtp_logits &&
+        e->mtp_draft_tokens > 1 && s->graph.prefill_cap >= 2 &&
+        getenv("DS4_MTP_CONTINUOUS"))
+    {
+        const uint32_t start = (uint32_t)s->checkpoint.len;
+
+        int draft = -1;
+        if (s->cont_anchor_valid) {
+            const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+            ds4_gpu_tensor *anchor = metal_graph_tensor_row_view(s->graph.batch_cur_hc,
+                                                                 s->cont_anchor_row, hc_dim);
+            const bool drafted = metal_graph_eval_mtp_draft_from_hc(&s->graph, &e->model, &e->weights,
+                                                                    &e->mtp_model, &e->mtp_weights,
+                                                                    anchor, s->graph.mtp_state_hc,
+                                                                    first_token, start,
+                                                                    NULL, &draft);
+            if (anchor) ds4_gpu_tensor_free(anchor);
+            if (!drafted) draft = -1;
+        }
+
+        /*
+         * No usable draft (first token of a generation, draft unavailable, EOS,
+         * or no room to store or report two tokens): forward first_token alone
+         * and seat the anchor on its row, like an ordinary depth-1 cycle.
+         */
+        if (draft < 0 || first_token == eos_token ||
+            max_tokens == 1 || accepted_cap < 2 ||
+            start + 2u > (uint32_t)s->ctx_size)
+        {
+            token_vec_push(&s->checkpoint, first_token);
+            bool ok = metal_graph_verify_suffix_tops(&s->graph, &e->model, &e->weights,
+                                                     &s->checkpoint, start, 1,
+                                                     false, NULL, NULL) &&
+                      metal_graph_read_spec_logits_row(&s->graph, 0, s->logits);
+            if (!ok) {
+                s->checkpoint.len = start;
+                snprintf(err, errlen, "continuous decode failed");
+                s->checkpoint_valid = false;
+                s->cont_anchor_valid = false;
+                return -1;
+            }
+            accepted[n_accept++] = first_token;
+            s->checkpoint_valid = true;
+            s->mtp_draft_valid = false;
+            s->cont_anchor_row = 0;
+            s->cont_anchor_valid = true;
+            return n_accept;
+        }
+
+        /*
+         * Verify [first_token, draft] together with prefix-1 capture so a
+         * rejected draft rewinds cheaply.  first_token is always committed; the
+         * draft is committed only when the target agrees at row 0.
+         */
+        int row_tops[2] = { -1, -1 };
+        token_vec_push(&s->checkpoint, first_token);
+        token_vec_push(&s->checkpoint, draft);
+        bool ok = metal_graph_verify_suffix_tops(&s->graph, &e->model, &e->weights,
+                                                 &s->checkpoint, start, 2,
+                                                 true, row_tops, NULL);
+        if (ok && row_tops[0] == draft) {
+            ok = metal_graph_read_spec_logits_row(&s->graph, 1, s->logits);
+            if (ok) {
+                accepted[n_accept++] = first_token;
+                if (n_accept < accepted_cap) accepted[n_accept++] = draft;
+                s->cont_anchor_row = 1;
+            }
+        } else if (ok) {
+            if (getenv("DS4_MTP_SPEC_LOG")) {
+                fprintf(stderr, "ds4: mtp cont miss draft=%d top=%d\n", draft, row_tops[0]);
+            }
+            s->checkpoint.len = start;
+            ok = spec_frontier_commit_prefix1(s) &&
+                 metal_graph_read_spec_logits_row(&s->graph, 0, s->logits);
+            if (ok) {
+                accepted[n_accept++] = first_token;
+                token_vec_push(&s->checkpoint, first_token);
+                s->cont_anchor_row = 0;
+            }
+        }
+        if (!ok) {
+            s->checkpoint.len = start;
+            snprintf(err, errlen, "continuous verify failed");
+            s->checkpoint_valid = false;
+            s->cont_anchor_valid = false;
+            return -1;
+        }
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        s->cont_anchor_valid = true;
+        return n_accept;
+    }
 
     /*
      * MTP in DeepSeek V4 is a speculative drafter, not a replacement sampler.
@@ -27200,7 +27312,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
      * draft token is correctness-safe but cannot be faster than baseline.
      */
     if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
-    int n_accept = 0;
+    n_accept = 0;
     accepted[n_accept++] = first_token;
     if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
 
@@ -27217,7 +27329,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     int draft_n = 1;
     drafts[0] = s->mtp_draft_token;
     s->mtp_draft_valid = false;
-    const bool strict_mtp = e->quality || getenv("DS4_MTP_STRICT") != NULL;
     float mtp_margin_threshold = e->mtp_margin;
     const char *mtp_margin_env = getenv("DS4_MTP_MIN_MARGIN");
     if (mtp_margin_env && mtp_margin_env[0]) {
@@ -27769,6 +27880,7 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
+    s->cont_anchor_valid = false;
 }
 
 void ds4_session_rewind(ds4_session *s, int pos) {
@@ -27776,6 +27888,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;
     s->mtp_draft_valid = false;
+    s->cont_anchor_valid = false;
 }
 
 int ds4_session_pos(ds4_session *s) {

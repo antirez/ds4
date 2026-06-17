@@ -2144,6 +2144,8 @@ static void test_mtp_verify_depth(void) {
         return;
     }
     TEST_ASSERT(ds4_engine_mtp_draft_tokens(engine) > 2);
+    char *saved_cont = test_save_env("DS4_MTP_CONTINUOUS");
+    unsetenv("DS4_MTP_CONTINUOUS");
 
     ds4_tokens prompt = {0};
     ds4_chat_begin(engine, &prompt);
@@ -2173,6 +2175,54 @@ static void test_mtp_verify_depth(void) {
 
     free(spec);
     ds4_tokens_free(&prompt);
+    test_restore_env("DS4_MTP_CONTINUOUS", saved_cont);
+}
+
+/* Continuous depth-1 speculation (DS4_MTP_CONTINUOUS) must only commit tokens
+ * the target model would have produced.  Decode the copy task in continuous
+ * mode, then reuse the verify-depth oracle to replay every committed token
+ * through plain decode and require each to be the argmax within tie tolerance.
+ * Self-skips without DS4_TEST_MTP. */
+static void test_cont_argmax_gap(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine || !ds4_engine_has_mtp(engine)) {
+        fprintf(stderr, "ds4-test: cont-argmax-gap skipped (set DS4_TEST_MTP to an MTP GGUF)\n");
+        return;
+    }
+    char *saved = test_save_env("DS4_MTP_CONTINUOUS");
+    char *saved_strict = test_save_env("DS4_MTP_STRICT");
+    setenv("DS4_MTP_CONTINUOUS", "1", 1);
+    unsetenv("DS4_MTP_STRICT");
+
+    ds4_tokens prompt = {0};
+    ds4_chat_begin(engine, &prompt);
+    ds4_chat_append_message(engine, &prompt, "user", test_mtp_copy_prompt());
+    ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+    TEST_ASSERT(prompt.len > 0);
+
+    int *spec = malloc((size_t)TEST_MTP_MAXGEN * sizeof(*spec));
+    TEST_ASSERT(spec != NULL);
+    if (spec && prompt.len > 0) {
+        int nspec = 0, max_chunk = 0;
+        const bool ok_spec = test_mtp_capture_speculative(engine, &prompt, TEST_MTP_MAXGEN,
+                                                          spec, &nspec, &max_chunk);
+        TEST_ASSERT(ok_spec);
+        TEST_ASSERT(max_chunk == 2);  /* the continuous accept path ran; the draft-4 default
+                                       * path would exceed 2 on this prompt */
+        TEST_ASSERT(nspec > 64);
+        float worst_gap = 0.0f;
+        int worst_at = -1;
+        const bool ok_check = test_mtp_worst_argmax_gap(engine, &prompt, spec, nspec,
+                                                        &worst_gap, &worst_at);
+        TEST_ASSERT(ok_check);
+        fprintf(stderr, "ds4-test: cont-argmax-gap nspec=%d max_chunk=%d worst_argmax_gap=%.3f at=%d\n",
+                nspec, max_chunk, worst_gap, worst_at);
+        TEST_ASSERT(worst_gap <= 2.0f);
+    }
+    free(spec);
+    ds4_tokens_free(&prompt);
+    test_restore_env("DS4_MTP_CONTINUOUS", saved);
+    test_restore_env("DS4_MTP_STRICT", saved_strict);
 }
 #endif
 
@@ -2202,6 +2252,7 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
+    {"--cont-argmax-gap", "cont-argmax-gap", "DS4_MTP_CONTINUOUS commits autoregressive-identical tokens", test_cont_argmax_gap},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
