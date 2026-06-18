@@ -533,6 +533,12 @@ stripped session rebuilds the KV cache by prefilling the saved text.
 Use `--chdir /path/to/ds4` when launching `ds4-agent` from another directory,
 so relative runtime files such as `metal/*.metal` resolve from the project tree.
 
+Headless supervisors can use `--agent-control` for line-delimited stdin prompts
+plus minimal session commands. Lines starting with `/` run `/save`, `/list`,
+`/switch`, `/new`, or `/quit`; all other input is submitted as a normal user
+prompt. This exposes the same KV session lifecycle without requiring the TUI,
+and is a small step toward a future stateful agent session protocol.
+
 However while the system already works, there is a lot of work to do
 in order to make it ready for prime time. When finally the agent will reach
 the wanted shape, we will *likely* split the server and the client creating a stateful
