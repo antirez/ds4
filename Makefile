@@ -32,15 +32,19 @@ CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_cuda.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
+ROCM_PATH ?= /opt/rocm
 ROCM_ARCH ?= gfx1151
 ROCM_CFLAGS ?= -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
-ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt
+# Search both lib and lib64 (Fedora and other non-/opt layouts install ROCm libs
+# under lib64) and link the HIP runtime explicitly; some installs don't auto-add
+# -lamdhip64. See issue #179. Override ROCM_PATH for a wheel/non-default install.
+ROCM_LDLIBS ?= -lm -pthread -L$(ROCM_PATH)/lib -L$(ROCM_PATH)/lib64 -lhipblas -lhipblaslt -lamdhip64
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm rocm-strix-halo rocm-generic
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -84,8 +88,10 @@ help:
 	@echo "  make cuda-spark          Build CUDA for DGX Spark / GB10"
 	@echo "  make cuda-generic        Build CUDA for a generic local CUDA GPU"
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
-	@echo "  make strix-halo          Build ROCm for Strix Halo / gfx1151"
-	@echo "  make rocm                Alias for make strix-halo"
+	@echo "  make rocm-strix-halo     Build ROCm for Strix Halo / gfx1151"
+	@echo "  make rocm-generic        Build ROCm for a generic Radeon GPU (set ROCM_ARCH=gfxNNN)"
+	@echo "  make rocm ROCM_ARCH=gfxN Build ROCm with an explicit --offload-arch value"
+	@echo "  make strix-halo          Alias for make rocm-strix-halo"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test                Build and run tests"
 	@echo "  make clean               Remove build outputs"
@@ -104,14 +110,20 @@ cuda:
 	fi
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH="$(CUDA_ARCH)"
 
-strix-halo:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
+# ROCm / HIP builds, named consistently with the cuda-* targets (issue #357).
+# ROCM_ARCH selects the GPU via --offload-arch. -fPIC keeps the host objects
+# linkable by hipcc on installs that need it (issue #179).
+rocm-strix-halo: ROCM_ARCH := gfx1151
+rocm-strix-halo rocm-generic:
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent ROCM_ARCH="$(ROCM_ARCH)" \
 		CORE_OBJS="ds4.o ds4_distributed.o ds4_ssd.o ds4_rocm.o" \
-		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD" \
+		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD -fPIC" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
 
-rocm: strix-halo
+# Back-compat aliases for the names that shipped before #357.
+strix-halo: rocm-strix-halo
+rocm: rocm-strix-halo
 
 ds4: ds4_cli.o ds4_help.o linenoise.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
