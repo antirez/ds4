@@ -28,6 +28,41 @@ opportunistic depending on what open weight models exist in a given moment.
 If a new model will be supported, the old one may be removed completely and
 no longer supported, unless there is some kind of overlap of abilities.
 
+## Quickstart
+
+This gets you from a clean checkout to a running model. The example uses the
+2-bit imatrix Flash GGUF, which fits machines with 96/128 GB of RAM. See
+[Model Weights](#model-weights) for other quants and the larger PRO model, and
+[Running models larger than RAM](#running-models-larger-than-ram) for SSD
+streaming on smaller machines.
+
+```sh
+# 1. Build for your platform.
+make                  # macOS (Metal) — the primary target
+# make cuda-spark     # Linux CUDA, DGX Spark / GB10
+# make cuda-generic   # Linux CUDA, other local CUDA GPUs
+# make cpu            # CPU-only diagnostics build (see warning below)
+
+# 2. Download a model. This pulls several tens of GB into ./gguf/ and points
+#    ./ds4flash.gguf at it. Downloads resume, so it is safe to re-run.
+./download_model.sh q2-imatrix
+
+# 3. Run a one-shot prompt...
+./ds4 -p "Explain Redis streams in one paragraph." --nothink
+
+# 4. ...or start the interactive chat (multi-turn, /help for commands).
+./ds4
+
+# 5. ...or start an OpenAI/Anthropic-compatible HTTP server on :8080.
+./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
+```
+
+`./ds4flash.gguf` is the default model path for all binaries; pass `-m` to pick
+another GGUF from `./gguf/`. The CLI defaults to thinking mode; use `--nothink`
+for direct answers. Run `./ds4 --help` and `./ds4-server --help` for the full
+flag list. On macOS, **do not use the `cpu` build for inference**: current macOS
+versions have a virtual-memory bug that crashes the kernel on the CPU path.
+
 ## Motivations
 
 * Very capable open weight models finally exist. DeepSeek v4 Flash feels quasi-frontier. The PRO is even better. Both resist 2 bit quantization very well.
