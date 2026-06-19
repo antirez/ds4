@@ -9719,6 +9719,7 @@ static void server_apply_decode_directional_steering(server *s) {
     server_apply_directional_steering(
         s, s && (s->steering_policy == DS4_STEERING_POLICY_ALWAYS ||
                  s->steering_policy == DS4_STEERING_POLICY_DECODING));
+}
 /* Live recovery for a tool call started inside an unclosed <think> block.
  *
  * The model sometimes opens a DSML stanza without closing its thinking first.
