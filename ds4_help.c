@@ -280,6 +280,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--non-interactive", "Run without TUI. With -p: one turn; without -p: repeated stdin prompts.");
     opt(fp, c, "-sys, --system TEXT", "Extra system prompt. Empty disables extra text.");
     opt(fp, c, "--trace FILE", "Write prompt, token, and DSML debug trace.");
+    opt(fp, c, "--wrap-cols N", "Word-wrap assistant prose at max N columns. 0 disables. Default: 100");
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");
     fputc('\n', fp);
 }
