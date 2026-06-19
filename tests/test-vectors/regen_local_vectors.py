@@ -40,11 +40,11 @@ def capture_case(ds4_bin: Path, root: Path, prompt_id: str, ctx: int, steps: int
     out_path = tmp_dir / "logprobs.json"
     env = os.environ.copy()
     env["DS4_METAL_PREFILL_CHUNK"] = "2048"
+    env["DS4_METAL_DISABLE_METAL4"] = "1"
     env["DS4_LOCK_FILE"] = lock_file
     cmd = [
         str(ds4_bin),
         "--metal",
-        "-mt", "off",
         "--system", "",
         "--prompt-file", str(prompt_path),
         "--ctx", str(ctx),
