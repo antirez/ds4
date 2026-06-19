@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "projectId": "prj_https-github-com-antirez-ds4-git_7a1f361ae9",
+  "name": "ds4",
+  "rootPath": "/Users/au/w/ds4",
+  "git": {
+    "remoteUrl": "https://github.com/antirez/ds4.git",
+    "defaultBranch": "main",
+    "currentBranch": "main",
+    "headSha": "d0007576b5686ff9a02c0b9c3b5160c96a8b3dd9"
+  },
+  "detected": {
+    "languages": [],
+    "frameworks": [],
+    "packageManagers": [],
+    "commands": {
+      "typecheck": null,
+      "lint": null,
+      "format": null,
+      "test": null
+    }
+  },
+  "createdAt": "2026-05-17T03:51:53.340Z",
+  "updatedAt": "2026-05-17T03:51:53.340Z"
+}

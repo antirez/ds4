@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "findingId": "fnd_sig-feat-config-0902ad7be8-93493_47c76e7e41",
+  "featureId": "feat_config_0902ad7be8",
+  "title": "Generic test target is tied to CUDA on non-Darwin despite CPU-only build support",
+  "category": "test-gap",
+  "severity": "medium",
+  "confidence": "medium",
+  "triage": "test-gap",
+  "evidence": [
+    {
+      "path": "Makefile",
+      "startLine": 72,
+      "endLine": 76,
+      "symbol": null,
+      "quote": "The non-Darwin help advertises both a CPU-only build and a generic make test target."
+    },
+    {
+      "path": "Makefile",
+      "startLine": 30,
+      "endLine": 31,
+      "symbol": null,
+      "quote": "On non-Darwin, CORE_OBJS is ds4.o ds4_cuda.o while CPU_CORE_OBJS is ds4_cpu.o."
+    },
+    {
+      "path": "Makefile",
+      "startLine": 166,
+      "endLine": 174,
+      "symbol": null,
+      "quote": "ds4_test depends on $(CORE_OBJS) and links with $(NVCC), then test runs ./ds4_test."
+    }
+  ],
+  "reasoning": "The Makefile supports CPU-only non-Darwin builds through the cpu target, but the only generic test target always builds ds4_test from CORE_OBJS. On non-Darwin that pulls in ds4_cuda.o and links with nvcc/CUDA libraries, so CPU-only Linux builds have no corresponding make test path and a user without CUDA cannot run the advertised tests.",
+  "reproduction": "On a non-Darwin system without a usable CUDA toolkit, make cpu can use $(CC), but make test attempts to build ds4_cuda.o and link ds4_test with $(NVCC) and $(CUDA_LDLIBS).",
+  "recommendation": "Add a CPU test path for non-Darwin, such as test-cpu using ds4_cpu.o and $(CC), or make test select CPU_CORE_OBJS when CUDA is unavailable. Keep CUDA-specific coverage under cuda-regression or a dedicated test-cuda target.",
+  "whyTestsDoNotAlreadyCoverThis": "The included Makefile only defines test as a CUDA-backed ds4_test on non-Darwin; there is no linked CPU-only test target that would expose the coverage gap.",
+  "suggestedRegressionTest": "Add a dry-run or CI job that runs make cpu followed by the CPU test target with NVCC unavailable, verifying CPU-only builds remain testable.",
+  "minimumFixScope": "Define a CPU-backed test target and update the generic test/help behavior so CPU-only non-Darwin builds can be validated without CUDA.",
+  "status": "open",
+  "history": [],
+  "signature": "sig_feat-config-0902ad7be8_93493bac8c",
+  "linkedPatchAttemptIds": [],
+  "createdByRunId": "20260517T035202-ce587f",
+  "createdAt": "2026-05-17T03:53:21.372Z",
+  "updatedAt": "2026-05-17T03:53:21.372Z"
+}

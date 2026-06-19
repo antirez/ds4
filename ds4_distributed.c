@@ -20,6 +20,7 @@
 #include <float.h>
 #include <math.h>
 #include <netdb.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -393,6 +394,7 @@ struct ds4_dist_session {
     uint64_t plan_generation;
     uint64_t session_id;
     uint64_t request_id;
+    uint64_t snapshot_request_id;
 };
 
 typedef struct {
@@ -747,6 +749,10 @@ static uint32_t dist_worker_forward_window(void) {
     return depth;
 }
 
+static bool dist_decode_profile_enabled(void) {
+    return getenv("DS4_DIST_DECODE_PROFILE") != NULL;
+}
+
 static bool dist_parse_positive_u32(
         const char *s,
         const char *name,
@@ -1022,22 +1028,37 @@ static int dist_set_socket_low_latency(int fd) {
     int one = 1;
     int rc = 0;
     int buffer_bytes = dist_socket_buffer_bytes();
-    int timeout_sec = 60;
+    int send_timeout_sec = 60;
     const char *timeout_env = getenv("DS4_DIST_SOCKET_TIMEOUT_SEC");
     if (timeout_env && timeout_env[0]) {
         char *end = NULL;
         long v = strtol(timeout_env, &end, 10);
         if (end != timeout_env && *end == '\0' && v > 0 && v <= 3600)
-            timeout_sec = (int)v;
+            send_timeout_sec = (int)v;
     }
-    struct timeval tv = {
-        .tv_sec = timeout_sec,
+    struct timeval send_tv = {
+        .tv_sec = send_timeout_sec,
         .tv_usec = 0,
     };
     if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) != 0) rc = -1;
     if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one)) != 0) rc = -1;
-    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0) rc = -1;
-    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) rc = -1;
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_tv, sizeof(send_tv)) != 0) rc = -1;
+    /* Do not install a receive timeout by default.  Worker control sockets can
+     * be legitimately idle while a KV snapshot is transferred on a separate
+     * data connection; timing out that read drops an otherwise healthy route. */
+    const char *recv_timeout_env = getenv("DS4_DIST_SOCKET_RECV_TIMEOUT_SEC");
+    if (recv_timeout_env && recv_timeout_env[0]) {
+        char *end = NULL;
+        long v = strtol(recv_timeout_env, &end, 10);
+        if (end != recv_timeout_env && *end == '\0' && v > 0 && v <= 3600) {
+            struct timeval recv_tv = {
+                .tv_sec = (int)v,
+                .tv_usec = 0,
+            };
+            if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                           &recv_tv, sizeof(recv_tv)) != 0) rc = -1;
+        }
+    }
     if (buffer_bytes > 0 &&
         setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer_bytes, sizeof(buffer_bytes)) != 0) rc = -1;
     if (buffer_bytes > 0 &&
@@ -1085,6 +1106,25 @@ static int dist_read_full(int fd, void *buf, size_t len) {
         len -= (size_t)n;
     }
     return 1;
+}
+
+static bool dist_connect_trace_enabled(void) {
+    return getenv("DS4_DIST_CONNECT_TRACE") != NULL;
+}
+
+static void dist_sockaddr_string(const struct sockaddr *sa, socklen_t salen, char *buf, size_t buflen) {
+    if (buflen) buf[0] = '\0';
+    if (!sa || !buf || buflen == 0) return;
+    char host[NI_MAXHOST];
+    char service[NI_MAXSERV];
+    if (getnameinfo(sa, salen,
+                    host, sizeof(host),
+                    service, sizeof(service),
+                    NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
+        snprintf(buf, buflen, "%s:%s", host, service);
+        return;
+    }
+    snprintf(buf, buflen, "unknown");
 }
 
 static int dist_write_frame_header(int fd, uint32_t type, uint32_t bytes) {
@@ -1218,10 +1258,82 @@ static bool dist_connect_errno_retryable(int e) {
            e == EADDRNOTAVAIL;
 }
 
+static int dist_bind_connect_source(int fd, int family, const char *host, int *bind_errno) {
+    if (bind_errno) *bind_errno = 0;
+    if (!host || !host[0]) return 0;
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_family = family;
+
+    struct addrinfo *res = NULL;
+    int gai = getaddrinfo(host, "0", &hints, &res);
+    if (gai != 0) {
+        if (bind_errno) *bind_errno = EINVAL;
+        return -1;
+    }
+
+    int rc = -1;
+    int saved_errno = EADDRNOTAVAIL;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
+            rc = 0;
+            saved_errno = 0;
+            break;
+        }
+        saved_errno = errno;
+    }
+    freeaddrinfo(res);
+
+    if (bind_errno) *bind_errno = saved_errno;
+    return rc;
+}
+
+static int dist_bind_connect_interface(int fd, int family, const char *ifname, int *bind_errno) {
+    (void)fd;
+    if (bind_errno) *bind_errno = 0;
+    if (!ifname || !ifname[0]) return 0;
+
+    unsigned int ifindex = if_nametoindex(ifname);
+    if (ifindex == 0) {
+        if (bind_errno) *bind_errno = errno ? errno : ENODEV;
+        return -1;
+    }
+
+    int rc = 0;
+    if (family == AF_INET) {
+#ifdef IP_BOUND_IF
+        rc = setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &ifindex, sizeof(ifindex));
+#else
+        errno = ENOTSUP;
+        rc = -1;
+#endif
+    } else if (family == AF_INET6) {
+#ifdef IPV6_BOUND_IF
+        rc = setsockopt(fd, IPPROTO_IPV6, IPV6_BOUND_IF, &ifindex, sizeof(ifindex));
+#else
+        errno = ENOTSUP;
+        rc = -1;
+#endif
+    }
+
+    if (rc != 0) {
+        if (bind_errno) *bind_errno = errno ? errno : EIO;
+        return -1;
+    }
+    return 0;
+}
+
 static int dist_connect_endpoint_once(const char *host, int port, int *last_errno, char *err, size_t errlen) {
     char portbuf[16];
     snprintf(portbuf, sizeof(portbuf), "%d", port);
     if (last_errno) *last_errno = 0;
+    const char *bind_host = getenv("DS4_DIST_CONNECT_BIND_HOST");
+    if (bind_host && bind_host[0] == '\0') bind_host = NULL;
+    const char *bind_if = getenv("DS4_DIST_CONNECT_BIND_IF");
+    if (bind_if && bind_if[0] == '\0') bind_if = NULL;
+    const bool trace = dist_connect_trace_enabled();
 
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
@@ -1239,14 +1351,82 @@ static int dist_connect_endpoint_once(const char *host, int port, int *last_errn
     int fd = -1;
     int saved_errno = 0;
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        char dst_desc[NI_MAXHOST + NI_MAXSERV + 8];
+        if (trace) {
+            dist_sockaddr_string(ai->ai_addr, ai->ai_addrlen, dst_desc, sizeof(dst_desc));
+            fprintf(stderr, "ds4: distributed connect trace: candidate dst=%s family=%d bind=%s if=%s\n",
+                    dst_desc, ai->ai_family, bind_host ? bind_host : "(none)",
+                    bind_if ? bind_if : "(none)");
+        }
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) {
             saved_errno = errno;
+            if (trace) {
+                fprintf(stderr, "ds4: distributed connect trace: socket failed: %s\n",
+                        strerror(saved_errno));
+            }
             continue;
         }
         dist_set_socket_low_latency(fd);
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        if (bind_if) {
+            int bind_errno = 0;
+            if (dist_bind_connect_interface(fd, ai->ai_family, bind_if, &bind_errno) != 0) {
+                saved_errno = bind_errno ? bind_errno : ENODEV;
+                if (trace) {
+                    fprintf(stderr, "ds4: distributed connect trace: bind interface %s failed: %s\n",
+                            bind_if, strerror(saved_errno));
+                }
+                close(fd);
+                fd = -1;
+                continue;
+            }
+            if (trace) {
+                fprintf(stderr, "ds4: distributed connect trace: bound interface=%s\n", bind_if);
+            }
+        }
+        if (bind_host) {
+            int bind_errno = 0;
+            if (dist_bind_connect_source(fd, ai->ai_family, bind_host, &bind_errno) != 0) {
+                saved_errno = bind_errno ? bind_errno : EADDRNOTAVAIL;
+                if (trace) {
+                    fprintf(stderr, "ds4: distributed connect trace: bind source %s failed: %s\n",
+                            bind_host, strerror(saved_errno));
+                }
+                close(fd);
+                fd = -1;
+                continue;
+            }
+            if (trace) {
+                struct sockaddr_storage local_ss;
+                socklen_t local_len = sizeof(local_ss);
+                char local_desc[NI_MAXHOST + NI_MAXSERV + 8];
+                if (getsockname(fd, (struct sockaddr *)&local_ss, &local_len) == 0) {
+                    dist_sockaddr_string((const struct sockaddr *)&local_ss, local_len,
+                                         local_desc, sizeof(local_desc));
+                    fprintf(stderr, "ds4: distributed connect trace: bound source=%s\n",
+                            local_desc);
+                }
+            }
+        }
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
+            if (trace) {
+                struct sockaddr_storage local_ss;
+                socklen_t local_len = sizeof(local_ss);
+                char local_desc[NI_MAXHOST + NI_MAXSERV + 8];
+                if (getsockname(fd, (struct sockaddr *)&local_ss, &local_len) == 0) {
+                    dist_sockaddr_string((const struct sockaddr *)&local_ss, local_len,
+                                         local_desc, sizeof(local_desc));
+                    fprintf(stderr, "ds4: distributed connect trace: connected source=%s dst=%s\n",
+                            local_desc, dst_desc);
+                }
+            }
+            break;
+        }
         saved_errno = errno;
+        if (trace) {
+            fprintf(stderr, "ds4: distributed connect trace: connect to %s failed: %s\n",
+                    dst_desc, strerror(saved_errno));
+        }
         close(fd);
         fd = -1;
     }
@@ -2389,6 +2569,9 @@ static int dist_coordinator_eval_remote_on_fd(
         float *logits,
         char *err,
         size_t errlen) {
+    const bool profile = dist_decode_profile_enabled() && n_tokens == 1;
+    const double total_t0 = profile ? dist_now_sec() : 0.0;
+    const double send_t0 = profile ? dist_now_sec() : 0.0;
     int rc = dist_coordinator_send_remote_work_on_fd(state,
                                                      plan,
                                                      fd,
@@ -2405,10 +2588,12 @@ static int dist_coordinator_eval_remote_on_fd(
                                                      hidden_hc_bytes,
                                                      err,
                                                      errlen);
+    const double send_t1 = profile ? dist_now_sec() : 0.0;
     uint32_t kind = 0, payload_bytes = 0;
     uint64_t result_hash = 0;
     void *payload = NULL;
     if (rc == 0) {
+        const double recv_t0 = profile ? dist_now_sec() : 0.0;
         rc = dist_recv_result_alloc(fd,
                                     state,
                                     request_id,
@@ -2418,6 +2603,17 @@ static int dist_coordinator_eval_remote_on_fd(
                                     &payload_bytes,
                                     err,
                                     errlen);
+        const double recv_t1 = profile ? dist_now_sec() : 0.0;
+        if (profile) {
+            fprintf(stderr,
+                    "ds4: dist decode profile: remote request=%llu pos=%u send=%.3fms wait_result=%.3fms kind=%u payload=%.2fMiB\n",
+                    (unsigned long long)request_id,
+                    pos0,
+                    (send_t1 - send_t0) * 1000.0,
+                    (recv_t1 - recv_t0) * 1000.0,
+                    kind,
+                    (double)payload_bytes / (1024.0 * 1024.0));
+        }
     }
     if (rc != 0) return rc;
     if (result_hash != expected_result_hash) {
@@ -2428,11 +2624,21 @@ static int dist_coordinator_eval_remote_on_fd(
 
     const uint32_t logits_bytes = (uint32_t)((uint64_t)ds4_engine_vocab_size(state->engine) * sizeof(float));
     if (kind == DS4_DIST_RESULT_LOGITS && payload_bytes == logits_bytes) {
+        const double copy_t0 = profile ? dist_now_sec() : 0.0;
         memcpy(logits, payload, logits_bytes);
         free(payload);
+        if (profile) {
+            const double copy_t1 = dist_now_sec();
+            fprintf(stderr,
+                    "ds4: dist decode profile: remote request=%llu copy_logits=%.3fms total=%.3fms\n",
+                    (unsigned long long)request_id,
+                    (copy_t1 - copy_t0) * 1000.0,
+                    (copy_t1 - total_t0) * 1000.0);
+        }
         return 0;
     }
     if (kind == DS4_DIST_RESULT_HIDDEN_STATE && payload_bytes == hidden_hc_bytes) {
+        const double head_t0 = profile ? dist_now_sec() : 0.0;
         int head_rc = ds4_session_eval_output_head_from_hc(session,
                                                            payload,
                                                            n_tokens,
@@ -2440,6 +2646,15 @@ static int dist_coordinator_eval_remote_on_fd(
                                                            err,
                                                            errlen);
         free(payload);
+        if (profile) {
+            const double head_t1 = dist_now_sec();
+            fprintf(stderr,
+                    "ds4: dist decode profile: remote request=%llu output_head=%.3fms total=%.3fms rc=%d\n",
+                    (unsigned long long)request_id,
+                    (head_t1 - head_t0) * 1000.0,
+                    (head_t1 - total_t0) * 1000.0,
+                    head_rc);
+        }
         return head_rc;
     }
     if (kind == DS4_DIST_RESULT_HIDDEN_STATE) {
@@ -2465,6 +2680,8 @@ static int dist_coordinator_eval_span(
         float *logits,
         char *err,
         size_t errlen) {
+    const bool profile = dist_decode_profile_enabled() && n_tokens == 1;
+    const double span_t0 = profile ? dist_now_sec() : 0.0;
     const uint64_t hc_values = ds4_engine_hidden_f32_values(state->engine);
     const uint64_t hidden_bytes64 = (uint64_t)n_tokens * hc_values * sizeof(float);
     if (hidden_bytes64 > UINT32_MAX) {
@@ -2512,6 +2729,7 @@ static int dist_coordinator_eval_span(
         }
     }
 
+    const double local_t0 = profile ? dist_now_sec() : 0.0;
     int rc = ds4_session_eval_layer_slice(session,
                                           tokens,
                                           n_tokens,
@@ -2524,7 +2742,10 @@ static int dist_coordinator_eval_span(
                                           local_logits ? logits : NULL,
                                           err,
                                           errlen);
+    const double local_t1 = profile ? dist_now_sec() : 0.0;
+    double remote_t0 = 0.0, remote_t1 = 0.0;
     if (rc == 0 && plan->count != 0) {
+        remote_t0 = profile ? dist_now_sec() : 0.0;
         rc = dist_coordinator_eval_remote_on_fd(state,
                                                 session,
                                                 plan,
@@ -2542,6 +2763,21 @@ static int dist_coordinator_eval_span(
                                                 logits,
                                                 err,
                                                 errlen);
+        remote_t1 = profile ? dist_now_sec() : 0.0;
+    }
+    if (profile) {
+        const double span_t1 = dist_now_sec();
+        fprintf(stderr,
+                "ds4: dist decode profile: span request=%llu pos=%u layers=%u:%u local=%.3fms remote=%.3fms total=%.3fms hidden=%.2fMiB rc=%d\n",
+                (unsigned long long)request_id,
+                pos0,
+                state->local_start,
+                state->local_end,
+                (local_t1 - local_t0) * 1000.0,
+                (remote_t1 - remote_t0) * 1000.0,
+                (span_t1 - span_t0) * 1000.0,
+                (double)hidden_bytes / (1024.0 * 1024.0),
+                rc);
     }
     free(hidden);
     return rc;
@@ -4685,7 +4921,7 @@ static int dist_save_remote_shard_to_file(
         char *err,
         size_t errlen) {
     if (payload_bytes_out) *payload_bytes_out = 0;
-    uint64_t request_id = d->request_id++;
+    uint64_t request_id = d->snapshot_request_id++;
     int fd = dist_connect_endpoint(entry->host, (int)entry->port, err, errlen);
     if (fd < 0) return 1;
 
@@ -4802,7 +5038,7 @@ static int dist_load_remote_shard_from_payload(
         uint64_t payload_bytes,
         char *err,
         size_t errlen) {
-    uint64_t request_id = d->request_id++;
+    uint64_t request_id = d->snapshot_request_id++;
     int fd = dist_connect_endpoint(entry->host, (int)entry->port, err, errlen);
     if (fd < 0) return 1;
 
@@ -5188,7 +5424,7 @@ int ds4_dist_session_create(
     d->state.local_end = dist_resolved_layer_end(opt, d->state.n_layers);
     d->state.ctx_size = ctx_size > 0 ? (uint32_t)ctx_size : 0u;
     d->state.local_has_output = opt->layers.has_output;
-    d->state.local_can_output_head = true;
+    d->state.local_can_output_head = ds4_engine_has_output_head(engine);
     d->state.replay_check = opt->replay_check;
     d->state.debug = opt->debug;
     d->state.use_control_for_work = true;
@@ -5198,6 +5434,10 @@ int ds4_dist_session_create(
     pthread_mutex_init(&d->state.mu, NULL);
     d->session_id = dist_make_session_id(d);
     d->request_id = 1;
+    /* KV snapshots use separate data connections and can run while pipelined
+     * WORK results are outstanding.  Keep them out of the WORK request-id stream
+     * so progress callbacks cannot perturb the reader's contiguous expectations. */
+    d->snapshot_request_id = UINT64_C(1) << 63;
 
     char local_end[32];
     if (opt->layers.has_output) snprintf(local_end, sizeof(local_end), "output");
@@ -5469,7 +5709,7 @@ static int dist_run_coordinator(ds4_engine *engine, const ds4_dist_options *opt,
     state.local_end = dist_resolved_layer_end(opt, state.n_layers);
     state.ctx_size = gen && gen->ctx_size > 0 ? (uint32_t)gen->ctx_size : 0u;
     state.local_has_output = opt->layers.has_output;
-    state.local_can_output_head = true;
+    state.local_can_output_head = ds4_engine_has_output_head(engine);
     state.replay_check = opt->replay_check;
     state.debug = opt->debug;
     state.use_control_for_work = gen && gen->prompt;
@@ -6930,6 +7170,8 @@ static int dist_worker_process_work_payload(
                                                            work.prefix_hash_lo);
     const uint64_t work_result_hash = dist_u64_from_halves(work.result_hash_hi,
                                                            work.result_hash_lo);
+    const bool profile = dist_decode_profile_enabled() && work.n_tokens == 1;
+    const double total_t0 = profile ? dist_now_sec() : 0.0;
     DIST_DEBUG("worker work request=%llu layers=%u:%u tokens=%u pos=%u flags=0x%x token_bytes=%u input_hc=%u/%ub route_count=%u route_index=%u route_bytes=%u",
                (unsigned long long)request_id,
                work.layer_start,
@@ -7161,6 +7403,7 @@ static int dist_worker_process_work_payload(
         return dist_worker_upstream_send_work_error(upstream, request_id, "out of memory allocating distributed result");
     }
 
+    const double decode_t0 = profile ? dist_now_sec() : 0.0;
     bool input_hc_uses_wire = false;
     uint32_t input_hc_decoded_bytes = 0;
     if (input_hc_present &&
@@ -7184,8 +7427,11 @@ static int dist_worker_process_work_payload(
         free(tokens);
         return dist_worker_upstream_send_work_error(upstream, request_id, "decoded input hidden-state size does not match token span");
     }
+    const double decode_t1 = profile ? dist_now_sec() : 0.0;
 
+    const double lock_t0 = profile ? dist_now_sec() : 0.0;
     pthread_mutex_lock(&state->mu);
+    const double lock_t1 = profile ? dist_now_sec() : 0.0;
     ds4_dist_worker_session *session = dist_worker_get_session_locked(state, session_id, err, sizeof(err));
     if (!session) {
         pthread_mutex_unlock(&state->mu);
@@ -7292,6 +7538,7 @@ static int dist_worker_process_work_payload(
         .output_bytes = result_wire_bytes,
     };
 
+    const double send_t0 = profile ? dist_now_sec() : 0.0;
     int send_rc;
     if (has_next) {
         send_rc = dist_forward_work_to_next(upstream,
@@ -7313,6 +7560,23 @@ static int dist_worker_process_work_payload(
                                                         1,
                                                         result,
                                                         result_bytes);
+    }
+    const double send_t1 = profile ? dist_now_sec() : 0.0;
+    if (profile) {
+        fprintf(stderr,
+                "ds4: dist decode profile: worker request=%llu pos=%u layers=%u:%u input_decode=%.3fms lock_wait=%.3fms eval=%.3fms send=%.3fms total=%.3fms input=%.2fMiB output=%.2fMiB rc=%d\n",
+                (unsigned long long)request_id,
+                work.pos0,
+                work.layer_start,
+                work.layer_end,
+                (decode_t1 - decode_t0) * 1000.0,
+                (lock_t1 - lock_t0) * 1000.0,
+                (eval_t1 - eval_t0) * 1000.0,
+                (send_t1 - send_t0) * 1000.0,
+                (send_t1 - total_t0) * 1000.0,
+                (double)(work.token_bytes + work.input_hc_bytes) / (1024.0 * 1024.0),
+                (double)result_wire_bytes / (1024.0 * 1024.0),
+                send_rc);
     }
     DIST_DEBUG("worker send complete request=%llu has_next=%d send_rc=%d",
                (unsigned long long)request_id,
@@ -8095,7 +8359,7 @@ int ds4_dist_prepare_engine_options(
             engine->load_slice = true;
             engine->load_layer_start = opt->layers.start;
             engine->load_layer_end = opt->layers.has_output ? UINT32_MAX : opt->layers.end;
-            engine->load_output = opt->layers.has_output || opt->role == DS4_DISTRIBUTED_COORDINATOR;
+            engine->load_output = opt->layers.has_output;
         }
     }
     return 0;

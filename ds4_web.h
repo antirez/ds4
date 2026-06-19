@@ -7,6 +7,7 @@
 typedef int (*ds4_web_confirm_fn)(void *privdata, const char *message,
                                   char *err, size_t err_len);
 typedef void (*ds4_web_log_fn)(void *privdata, const char *message);
+typedef bool (*ds4_web_cancel_fn)(void *privdata);
 
 typedef struct {
     const char *home_dir;
@@ -15,6 +16,8 @@ typedef struct {
     void *confirm_privdata;
     ds4_web_log_fn log;
     void *log_privdata;
+    ds4_web_cancel_fn cancel;
+    void *cancel_privdata;
 } ds4_web_config;
 
 typedef struct ds4_web ds4_web;

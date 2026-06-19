@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "patchAttemptId": "pat_fnd-sig-feat-config-0902ad7be8-b_18e6168584",
+  "findingIds": [
+    "fnd_sig-feat-config-0902ad7be8-b59d5_eed8d3b357"
+  ],
+  "featureIds": [
+    "feat_config_0902ad7be8"
+  ],
+  "status": "applied",
+  "plan": "Added a CUDA config stamp for CUDA_ARCH/NVCC/NVCCFLAGS and made ds4_cuda.o depend on it, removing stale ds4_cuda.o when the recorded CUDA build settings change.",
+  "filesChanged": [
+    "Makefile"
+  ],
+  "commandsRun": [],
+  "testResults": [],
+  "provider": {
+    "name": "codex",
+    "model": null,
+    "requestId": null,
+    "startedAt": "2026-05-17T03:53:47.757Z",
+    "finishedAt": "2026-05-17T03:56:16.429Z"
+  },
+  "git": {
+    "baseSha": "d0007576b5686ff9a02c0b9c3b5160c96a8b3dd9",
+    "commitSha": null,
+    "branchName": "main",
+    "prUrl": null
+  },
+  "createdAt": "2026-05-17T03:53:47.756Z",
+  "updatedAt": "2026-05-17T03:56:16.429Z"
+}
