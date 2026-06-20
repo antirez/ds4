@@ -8773,7 +8773,7 @@ static void kv_cache_init(ds4_kv_cache *cache, uint32_t ctx_size, uint32_t raw_c
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         cache->layer[il].cap_raw = raw_cap;
-        cache->layer[il].raw_kv = xmalloc_zeroed((size_t)raw_cap * DS4_N_HEAD_DIM, sizeof(float));
+        cache->layer[il].raw_kv = xmalloc_zeroed((size_t)raw_cap * (DS4_IS_GLM() ? (uint64_t)DS4_N_KV_LORA + DS4_N_QK_ROPE : DS4_N_HEAD_DIM), sizeof(float));
         cache->layer[il].compress_ratio = ratio;
 
         if (ratio != 0) {
@@ -9955,6 +9955,295 @@ static void layer_attention_raw_swa_batch(
     free(attn_cur);
 }
 
+/* =========================================================================
+ * GLM-5.2 CPU forward reference
+ * =========================================================================
+ *
+ * Standard MLA, no hyper-connection, no compression/indexer (first port):
+ *   - Q:   layer_norm -> q_a -> q_a_norm -> q_b -> Q[n_head, qk=head_dim(qk_nope+qk_rope)]
+ *   - KV:  attn_kv (kv_a_proj_with_mqa) -> kv_a_norm(512-dim only) -> rope on 64
+ *         rope-dim -> kv_b -> K[n_head, qk_nope], V[n_head, v_head]
+ *         Cache the full 576-dim kv_a latent and re-expand via kv_b each step.
+ *   - Attn: scores_h = q_h • K_h (qk_nope + shared rope); weighted sum of V_h;
+ *     output projection: matvec(o_proj) -> residual.
+ *   - FFN: dense SwiGLU MLP (layers 0..n_dense_layers-1) or top-8 MoE (rest).
+ *
+ * The branch is invoked from layer_forward_raw_swa_one when DS4_IS_GLM() is
+ * set; the residual stream is DS4_N_EMBD wide (no HC duplication).
+ */
+static void glm_mla_attention_one(
+        float                  * heads,       /* [n_head, v_head] output */
+        const ds4_model        * model,
+        const ds4_layer_weights * layer,
+        const float            * attn_norm,   /* [n_embd] (unused) */
+        const float            * q,           /* [n_head, qk_head_dim] post-RoPE */
+        const float            * kv_latent,   /* [kv_lora + qk_rope] current row, normed + rope */
+        const float            * raw_kv,       /* [(n_raw+1)*kv_a_total] row-major cache */
+        uint32_t                 n_raw) {     /* last valid index (current) */
+    (void)attn_norm;
+    const uint32_t n_head = DS4_N_HEAD;
+    const uint32_t qk_nope = DS4_N_QK_NOPE;     /* 192 */
+    const uint32_t qk_rope = DS4_N_QK_ROPE;     /* 64 */
+    const uint32_t v_head = DS4_N_V_HEAD_DIM;    /* 256 */
+    const uint32_t kv_lora = DS4_N_KV_LORA;     /* 512 */
+    const uint64_t kv_a_total = (uint64_t)kv_lora + qk_rope;  /* 576 */
+    const uint64_t kv_b_cols = (uint64_t)(qk_nope + v_head) * n_head;  /* 448*64 */
+
+    /* Expansion for the current token (also used as one of the cached rows). */
+    float *kv_b_cur = xmalloc(kv_b_cols * sizeof(kv_b_cur[0]));
+    matvec_q8_0(kv_b_cur, model, layer->attn_kv_b, kv_latent);
+
+    const float kq_scale = 1.0f / sqrtf((float)(qk_nope + qk_rope));
+    float *score = xmalloc((size_t)(n_raw + 1) * sizeof(score[0]));
+
+    for (uint32_t h = 0; h < n_head; h++) {
+        const float *qh = q + (uint64_t)h * (qk_nope + qk_rope);
+
+        float max_score = -1e30f;
+        for (uint32_t r = 0; r <= n_raw; r++) {
+            const float *row = raw_kv + (uint64_t)r * kv_a_total;
+            /* Per row: K_nope is the first 192 of kv_b(row[:512]); K_rope is the
+             * row's own trailing 64 (already rotated by the caller). */
+            const float *kb_row;
+            float *row_vb = NULL;
+            if (r == n_raw) {
+                kb_row = kv_b_cur;
+            } else {
+                row_vb = xmalloc(kv_b_cols * sizeof(row_vb[0]));
+                /* kv_b takes the *normed* kv_lora (first 512) — the cache row's
+                 * first 512 dims after kv_a_norm.  We store the full 576 latent
+                 * (norm + rope tail), so the first 512 are the normed portion. */
+                matvec_q8_0(row_vb, model, layer->attn_kv_b, row);
+                kb_row = row_vb;
+            }
+            const float *k_nope = kb_row + (uint64_t)h * (qk_nope + v_head);
+            const float *k_rope = row + kv_lora;  /* row's already-rotated 64-dim tail */
+            float s = 0.0f;
+            for (uint32_t i = 0; i < qk_nope; i++) s += qh[i] * k_nope[i];
+            for (uint32_t i = 0; i < qk_rope; i++) s += qh[qk_nope + i] * k_rope[i];
+            score[r] = s * kq_scale;
+            if (score[r] > max_score) max_score = score[r];
+            free(row_vb);
+        }
+
+        /* Softmax across (n_raw + 1) rows. */
+        float denom = 0.0f;
+        for (uint32_t r = 0; r <= n_raw; r++) denom += expf(score[r] - max_score);
+        const float inv = (denom > 0.0f) ? 1.0f / denom : 0.0f;
+
+        /* Weighted sum of V_h: accumulate per-row V = kv_b(row[:512])[h*448+192:+256]. */
+        float *oh = heads + (uint64_t)h * v_head;
+        memset(oh, 0, (size_t)v_head * sizeof(oh[0]));
+        for (uint32_t r = 0; r <= n_raw; r++) {
+            const float w = expf(score[r] - max_score) * inv;
+            if (w == 0.0f) continue;
+            const float *row = raw_kv + (uint64_t)r * kv_a_total;
+            const float *kb_row;
+            float *row_vb = NULL;
+            if (r == n_raw) {
+                kb_row = kv_b_cur;
+            } else {
+                row_vb = xmalloc(kv_b_cols * sizeof(row_vb[0]));
+                matvec_q8_0(row_vb, model, layer->attn_kv_b, row);
+                kb_row = row_vb;
+            }
+            const float *v_ptr = kb_row + (uint64_t)h * (qk_nope + v_head) + qk_nope;
+            for (uint32_t i = 0; i < v_head; i++) oh[i] += w * v_ptr[i];
+            free(row_vb);
+        }
+    }
+
+    free(score);
+    free(kv_b_cur);
+}
+
+/* GLM dense MLP: gate/up are quantized weights shared with a 12288-wide
+ * intermediate, down projects back to EMBD.  Used for layers 0..n_dense-1.  */
+static void glm_dense_ffn_one(
+        float                  * out,         /* [n_embd] */
+        const ds4_model        * model,
+        const ds4_layer_weights * layer,
+        const float            * x_norm,      /* [n_embd] */
+        float                    clamp_exp) {
+    const uint64_t in_dim  = layer->ffn_gate->dim[0];   /* 6144 */
+    const uint64_t out_dim = layer->ffn_gate->dim[1];    /* 12288 */
+    (void)out_dim; (void)clamp_exp;
+    float *gate = xmalloc((size_t)in_dim * sizeof(gate[0]));
+    float *up   = xmalloc((size_t)in_dim * sizeof(up[0]));
+    float *mid  = xmalloc((size_t)out_dim * sizeof(mid[0]));
+
+    const uint64_t blocks = (in_dim + 31) / 32;
+    int8_t *xq = xmalloc((size_t)blocks * 32);
+    float *xscale = xmalloc((size_t)blocks * sizeof(xscale[0]));
+    quantize_q8_0_activation(x_norm, xq, xscale, in_dim);
+    matvec_q8_0_pair_prequant(gate, up, model, layer->ffn_gate, layer->ffn_up, xq, xscale);
+    swiglu(mid, gate, up, out_dim, DS4_SWIGLU_CLAMP_EXP);
+    matvec_q8_0(out, model, layer->ffn_down, mid);
+
+    free(gate); free(up); free(mid);
+    free(xq); free(xscale);
+}
+
+/* GLM MoE router: sigmoid + noaux_tc.  Selection adds e_score_correction_bias;
+ * expert weights = sigmoid(logits) * routed_scaling_factor / sum_topk. */
+static void glm_moe_router(
+        int                      selected[DS4_MAX_EXPERT_USED],
+        float                    expert_weight[DS4_MAX_EXPERT_USED],
+        const ds4_model        * model,
+        const ds4_layer_weights * layer,
+        const float            * x) {
+    const uint32_t n_exp = DS4_N_EXPERT;
+    const uint32_t k = DS4_N_EXPERT_USED;
+    float *logits  = xmalloc((size_t)n_exp * sizeof(logits[0]));
+    float *select  = xmalloc((size_t)n_exp * sizeof(select[0]));
+    matvec_any(logits, model, layer->ffn_gate_inp, x);
+    for (uint32_t i = 0; i < n_exp; i++) select[i] = sigmoid_stable(logits[i]);
+
+    /* Selection uses sigmoid + e_score_correction_bias (top-k of that). */
+    if (layer->ffn_exp_probs_b) {
+        const float *bias = tensor_data(model, layer->ffn_exp_probs_b);
+        for (uint32_t i = 0; i < n_exp; i++) select[i] += bias[i];
+    }
+    topk_desc(select, (int)n_exp, (int)k, selected);
+
+    /* Weights: original sigmoid, normalized to mean=1, scaled by routed_scale. */
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < k; i++) sum += sigmoid_stable(logits[selected[i]]);
+    if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
+    for (uint32_t i = 0; i < k; i++) {
+        expert_weight[i] = sigmoid_stable(logits[selected[i]]) / sum * DS4_EXPERT_WEIGHT_SCALE;
+    }
+    free(logits); free(select);
+}
+
+/* GLM routed MoE: top-8 expert gather + SwiGLU + down.  Reuses the existing
+ * IQ2_XXS/Q2_K prequant helpers (gate/up = IQ2_XXS, down = Q2_K). */
+static void glm_moe_one(
+        float             * out,
+        const ds4_model   * model,
+        const ds4_layer_weights * layer,
+        const float       * x,
+        float               clamp) {
+    int selected[DS4_MAX_EXPERT_USED];
+    float expert_weight[DS4_MAX_EXPERT_USED];
+    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
+    const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
+    memset(out, 0, (size_t)DS4_N_EMBD * sizeof(out[0]));
+
+    if (expert_in_dim % QK_K != 0) ds4_die("GLM routed gate_in not QK_K aligned");
+    if (down_in_dim % QK_K != 0)    ds4_die("GLM routed down_in not QK_K aligned");
+
+    block_q8_K *xq = xmalloc((size_t)(expert_in_dim / QK_K) * sizeof(xq[0]));
+    ds4_quantize_row_q8_K(x, xq, (int64_t)expert_in_dim);
+
+    glm_moe_router(selected, expert_weight, model, layer, x);
+
+    float *mid_all = xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(mid_all[0]));
+    block_q8_K *midq = xmalloc((size_t)DS4_N_EXPERT_USED * (down_in_dim / QK_K) * sizeof(midq[0]));
+
+    matvec_experts_mid_prequant(mid_all, model,
+                                layer->ffn_gate_exps, layer->ffn_up_exps,
+                                xq, selected, expert_weight, DS4_N_EXPERT_USED, clamp);
+    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+        ds4_quantize_row_q8_K(mid_all + (uint64_t)i * down_in_dim,
+                              midq + (uint64_t)i * (down_in_dim / QK_K),
+                              (int64_t)down_in_dim);
+    }
+    matvec_experts_down_accum_prequant(out, model, layer->ffn_down_exps,
+                                       midq, selected, DS4_N_EXPERT_USED);
+
+    free(mid_all); free(xq); free(midq);
+}
+
+/* Full GLM layer forward for one decode token.  Uses xmalloc for per-layer
+ * temporaries (decode is not perf critical for the CPU reference). */
+static void layer_forward_glm_decode_one(
+        float                  * out,         /* [n_embd] residual out */
+        const ds4_model        * model,
+        const ds4_layer_weights * layer,
+        ds4_layer_cache        * cache,
+        const float            * inp,         /* [n_embd] residual in */
+        uint32_t                 il,
+        uint32_t                 pos) {
+    const uint32_t n_embd = DS4_N_EMBD;
+    const uint32_t n_head = DS4_N_HEAD;
+    const uint32_t qk_size = DS4_N_HEAD_DIM;
+    const uint32_t qk_rope = DS4_N_QK_ROPE;
+    const uint32_t kv_lora = DS4_N_KV_LORA;
+    const uint64_t kv_a_total = (uint64_t)kv_lora + qk_rope;
+
+    float *attn_norm = xmalloc((size_t)n_embd * sizeof(attn_norm[0]));
+    rms_norm_weight(attn_norm, inp, tensor_data(model, layer->attn_norm),
+                    n_embd, DS4_RMS_EPS);
+
+    /* Q projection: q_a (q_lora_out), q_a_norm, q_b (qk_dim per head). */
+    float *q = xmalloc((size_t)n_head * qk_size * sizeof(q[0]));
+    float *q_a = xmalloc((size_t)kv_lora * sizeof(q_a[0]));
+    float *q_a_n = xmalloc((size_t)kv_lora * sizeof(q_a_n[0]));
+    matvec_q8_0(q_a, model, layer->attn_q_a, attn_norm);
+    rms_norm_weight(q_a_n, q_a, tensor_data(model, layer->attn_q_a_norm),
+                    kv_lora, DS4_RMS_EPS);
+    matvec_q8_0(q, model, layer->attn_q_b, q_a_n);
+    /* Apply forward RoPE to Q (per head, last qk_rope dims). */
+    rope_tail_layer_inplace(q, n_head, qk_size, qk_rope, pos, il, false);
+
+    /* KV latent: attn_kv → [kv_lora + qk_rope], RMSNorm only the kv_lora part,
+     * then RoPE on the trailing qk_rope. */
+    float *kv_a = xmalloc((size_t)kv_a_total * sizeof(kv_a[0]));
+    matvec_q8_0(kv_a, model, layer->attn_kv, attn_norm);
+    rms_norm_weight(kv_a, kv_a, tensor_data(model, layer->attn_kv_a_norm),
+                    kv_lora, DS4_RMS_EPS);
+    /* No 'head' to scale; treat the trailing 64 as a single-head rope. */
+    rope_tail_layer_inplace(kv_a + kv_lora, 1, qk_rope, qk_rope, pos, il, false);
+    /* Push the kv latent row into the layer's sliding KV cache (row width =
+     * kv_a_total = kv_lora + qk_rope). */
+    if (cache->n_raw < cache->cap_raw) {
+        float *dst = cache->raw_kv + (uint64_t)cache->n_raw * kv_a_total;
+        memcpy(dst, kv_a, (size_t)kv_a_total * sizeof(float));
+        cache->n_raw++;
+    } else {
+        memmove(cache->raw_kv, cache->raw_kv + kv_a_total,
+                (size_t)(cache->cap_raw - 1) * kv_a_total * sizeof(float));
+        float *dst = cache->raw_kv + (uint64_t)(cache->cap_raw - 1) * kv_a_total;
+        memcpy(dst, kv_a, (size_t)kv_a_total * sizeof(float));
+    }
+
+    /* Attention: build per-head K = [k_nope(192) | rope(64)], V = v_head(256),
+     * score over Q·K, softmax, sum V_h, output to heads[n_head, v_head]. */
+    float *heads = xmalloc((size_t)n_head * qk_size * sizeof(heads[0]));
+    glm_mla_attention_one(heads, model, layer, attn_norm, q,
+                          kv_a /* current latent */,
+                          cache->raw_kv, cache->n_raw - 1);
+
+    /* Output projection: attn_output (o_proj) maps [n_head*v_head] → EMBD. */
+    float *attn_out = xmalloc((size_t)n_embd * sizeof(attn_out[0]));
+    matvec_q8_0(attn_out, model, layer->attn_output, heads);
+
+    /* Add residual. */
+    for (uint32_t i = 0; i < n_embd; i++) out[i] = inp[i] + attn_out[i];
+
+    /* FFN: dense or MoE. */
+    float *ffn_norm = xmalloc((size_t)n_embd * sizeof(ffn_norm[0]));
+    rms_norm_weight(ffn_norm, out, tensor_data(model, layer->ffn_norm),
+                    n_embd, DS4_RMS_EPS);
+    float *ffn_out = xmalloc((size_t)n_embd * sizeof(ffn_out[0]));
+    if (il < DS4_N_DENSE_LAYERS) {
+        glm_dense_ffn_one(ffn_out, model, layer, ffn_norm, DS4_SWIGLU_CLAMP_EXP);
+    } else {
+        glm_moe_one(ffn_out, model, layer, ffn_norm, DS4_SWIGLU_CLAMP_EXP);
+        /* Add the shared expert; reuses Q8_0 shared FFN already sized to FF_EXP. */
+        float *shared = xmalloc((size_t)DS4_N_EMBD * sizeof(shared[0]));
+        layer_shared_ffn_one(shared, model, layer, ffn_norm);
+        for (uint32_t i = 0; i < n_embd; i++) ffn_out[i] += shared[i];
+        free(shared);
+    }
+    for (uint32_t i = 0; i < n_embd; i++) out[i] += ffn_out[i];
+
+    free(ffn_out); free(ffn_norm);
+    free(attn_out); free(heads);
+    free(kv_a); free(q_a_n); free(q_a); free(q); free(attn_norm);
+}
+
 /* Full transformer layer for one decode token: attention sublayer followed by
  * FFN sublayer, both operating on the HC state. */
 static void layer_forward_raw_swa_one(
@@ -10124,12 +10413,64 @@ static void layer_forward_raw_swa_one(
 
 }
 
+/* GLM CPU decode for one token through all layers using a PLAIN [n_embd]
+ * residual (no HC).  The output logits function is defined below. */
+static void output_logits_one_decode_scratch_glm(
+        float                  * logits,
+        const ds4_model        * model,
+        const ds4_weights      * weights,
+        const float            * x,
+        ds4_cpu_decode_scratch * scratch);
+
+static void forward_glm_cpu_decode_scratch(
+        float             * logits,
+        const ds4_model   * model,
+        const ds4_weights * weights,
+        ds4_kv_cache      * cache,
+        int                 token,
+        uint32_t            pos) {
+    const uint32_t n_embd = DS4_N_EMBD;
+    float *cur = xmalloc((size_t)n_embd * sizeof(float));
+    float *next = xmalloc((size_t)n_embd * sizeof(float));
+
+    embed_token_f16(model, weights, token, cur);
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        layer_forward_glm_decode_one(next, model, &weights->layer[il],
+                                     &cache->layer[il], cur, il, pos);
+        float *tmp = cur;
+        cur = next;
+        next = tmp;
+    }
+    if (logits) output_logits_one_decode_scratch_glm(logits, model, weights, cur, NULL);
+
+    free(cur);
+    free(next);
+}
+/* Forward declaration: the DeepSeek version is defined later in the file. */
 static void output_logits_one_decode_scratch(
         float                  * logits,
         const ds4_model        * model,
         const ds4_weights      * weights,
         const float            * inp_hc,
         ds4_cpu_decode_scratch * scratch);
+
+
+/* GLM logits: rms_norm on plain residual, then matvec(output) → logits. */
+static void output_logits_one_decode_scratch_glm(
+        float                  * logits,
+        const ds4_model        * model,
+        const ds4_weights      * weights,
+        const float            * x,
+        ds4_cpu_decode_scratch * scratch) {
+    const uint32_t n_embd = DS4_N_EMBD;
+    float *norm = xmalloc((size_t)n_embd * sizeof(norm[0]));
+    rms_norm_weight(norm, x, tensor_data(model, weights->output_norm),
+                    n_embd, DS4_RMS_EPS);
+    matvec_q8_0(logits, model, weights->output, norm);
+    free(norm);
+    (void)scratch;
+}
 
 /* CPU decode for one token through all 43 layers.  The caller owns scratch and
  * cache lifetimes so no per-token allocations are needed. */
@@ -10144,9 +10485,16 @@ static void forward_token_raw_swa_cpu_decode_scratch(
         float               steering_attn_scale,
         float               steering_ffn_scale,
         ds4_cpu_decode_scratch * scratch) {
+    if (DS4_IS_GLM()) {
+        /* GLM uses a plain residual and its own layer forward; ignore the
+         * DeepSeek scratch; the GLM driver allocates its own. */
+        (void)steering_dirs; (void)steering_attn_scale; (void)steering_ffn_scale;
+        (void)scratch;
+        forward_glm_cpu_decode_scratch(logits, model, weights, cache, token, pos);
+        return;
+    }
     float *cur = scratch->cur;
     float *next = scratch->next;
-
     embed_token_f16(model, weights, token, scratch->plain);
     hc_from_plain_embedding(cur, scratch->plain, DS4_N_EMBD, DS4_N_HC);
 
