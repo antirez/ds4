@@ -1026,12 +1026,14 @@ static void repl_chat_apply_max_prefix(ds4_engine *engine, repl_chat *chat, bool
     if (enable && chat->max_prefix_tokens == 0) {
         ds4_tokens prefix = {0};
         ds4_chat_append_max_effort_prefix(engine, &prefix);
-        tokens_insert(&chat->transcript, 1, &prefix);
+        const int prefix_pos = ds4_engine_is_glm(engine) ? 2 : 1;
+        tokens_insert(&chat->transcript, prefix_pos, &prefix);
         chat->max_prefix_tokens = prefix.len;
         ds4_tokens_free(&prefix);
         if (chat->session) ds4_session_invalidate(chat->session);
     } else if (!enable && chat->max_prefix_tokens > 0) {
-        tokens_remove(&chat->transcript, 1, chat->max_prefix_tokens);
+        const int prefix_pos = ds4_engine_is_glm(engine) ? 2 : 1;
+        tokens_remove(&chat->transcript, prefix_pos, chat->max_prefix_tokens);
         chat->max_prefix_tokens = 0;
         if (chat->session) ds4_session_invalidate(chat->session);
     }

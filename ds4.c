@@ -22458,6 +22458,7 @@ struct ds4_vocab {
     int eos_id;
     int user_id;
     int assistant_id;
+    int system_id;
     int think_start_id;
     int think_end_id;
     int obs_id;
@@ -22931,6 +22932,7 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         vocab->eos_id         = 154820; /* <|endof_text|> */
         vocab->user_id        = 154827; /* <|user|> */
         vocab->assistant_id   = 154828; /* <|assistant|> */
+        vocab->system_id      = 154826; /* <|system|> */
         vocab->obs_id         = 154829; /* <|observation|> */
         vocab->think_start_id = 154841; /* <|begin_of_thought|> */
         vocab->think_end_id   = 154842; /* <|end_of_thought|> */
@@ -22953,6 +22955,38 @@ static void vocab_free(ds4_vocab *vocab) {
     memset(vocab, 0, sizeof(*vocab));
 }
 
+enum {
+    GLM_TOKEN_TOOL_RESPONSE_BEGIN = 154845,
+    GLM_TOKEN_TOOL_RESPONSE_END   = 154846,
+};
+
+static void glm_chat_begin_vocab(const ds4_vocab *vocab, token_vec *out) {
+    token_vec_push(out, vocab->dsml_id); /* [gMASK] */
+    token_vec_push(out, vocab->bos_id);  /* <sop> */
+}
+
+static void glm_chat_append_reasoning_effort(const ds4_vocab *vocab,
+                                             ds4_think_mode think_mode,
+                                             token_vec *out) {
+    if (!ds4_think_mode_enabled(think_mode)) return;
+    token_vec_push(out, vocab->system_id);
+    bpe_tokenize_text(vocab,
+                      think_mode == DS4_THINK_HIGH ?
+                      "Reasoning Effort: High" :
+                      "Reasoning Effort: Max",
+                      out);
+}
+
+static void glm_chat_append_assistant_prefix(const ds4_vocab *vocab,
+                                             ds4_think_mode think_mode,
+                                             token_vec *out) {
+    token_vec_push(out, vocab->assistant_id);
+    token_vec_push(out, vocab->think_start_id);
+    if (!ds4_think_mode_enabled(think_mode)) {
+        token_vec_push(out, vocab->think_end_id);
+    }
+}
+
 /* Build the DS4 chat prompt: BOS, optional system text, user prompt, assistant
  * marker, and either <think> or </think> depending on the requested mode.  Max
  * thinking is only a prompt prefix: the model still enters through <think>. */
@@ -22962,6 +22996,19 @@ static void encode_chat_prompt(
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
+    if (DS4_IS_GLM()) {
+        glm_chat_begin_vocab(vocab, out);
+        glm_chat_append_reasoning_effort(vocab, think_mode, out);
+        if (system && system[0]) {
+            token_vec_push(out, vocab->system_id);
+            bpe_tokenize_text(vocab, system, out);
+        }
+        token_vec_push(out, vocab->user_id);
+        bpe_tokenize_text(vocab, prompt, out);
+        glm_chat_append_assistant_prefix(vocab, think_mode, out);
+        return;
+    }
+
     token_vec_push(out, vocab->bos_id);
     if (think_mode == DS4_THINK_MAX) {
         bpe_tokenize_text(vocab, DS4_REASONING_EFFORT_MAX_PREFIX, out);
@@ -22987,7 +23034,34 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
     struct special {
         const char *text;
         int token;
-    } specials[] = {
+    };
+
+    if (DS4_IS_GLM()) {
+        const struct special specials[] = {
+            {"[gMASK]",         vocab->dsml_id},
+            {"<sop>",           vocab->bos_id},
+            {"<|endoftext|>",   vocab->eos_id},
+            {"<|system|>",      vocab->system_id},
+            {"<|user|>",        vocab->user_id},
+            {"<|assistant|>",   vocab->assistant_id},
+            {"<|observation|>", vocab->obs_id},
+            {"<think>",         vocab->think_start_id},
+            {"</think>",        vocab->think_end_id},
+            {"<tool_response>",  GLM_TOKEN_TOOL_RESPONSE_BEGIN},
+            {"</tool_response>", GLM_TOKEN_TOOL_RESPONSE_END},
+        };
+        for (size_t i = 0; i < sizeof(specials) / sizeof(specials[0]); i++) {
+            size_t n = strlen(specials[i].text);
+            if (!strncmp(p, specials[i].text, n)) {
+                *token = specials[i].token;
+                *len = n;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    const struct special specials[] = {
         {"<｜begin▁of▁sentence｜>", vocab->bos_id},
         {"<｜end▁of▁sentence｜>",   vocab->eos_id},
         {"<｜User｜>",              vocab->user_id},
@@ -23043,7 +23117,11 @@ void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out
 }
 
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
-    token_vec_push(tokens, e->vocab.bos_id);
+    if (DS4_IS_GLM()) {
+        glm_chat_begin_vocab(&e->vocab, tokens);
+    } else {
+        token_vec_push(tokens, e->vocab.bos_id);
+    }
 }
 
 void ds4_encode_chat_prompt(
@@ -23056,7 +23134,11 @@ void ds4_encode_chat_prompt(
 }
 
 void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens) {
-    bpe_tokenize_text(&e->vocab, DS4_REASONING_EFFORT_MAX_PREFIX, tokens);
+    if (DS4_IS_GLM()) {
+        glm_chat_append_reasoning_effort(&e->vocab, DS4_THINK_MAX, tokens);
+    } else {
+        bpe_tokenize_text(&e->vocab, DS4_REASONING_EFFORT_MAX_PREFIX, tokens);
+    }
 }
 
 static void bpe_tokenize_tool_result_text(ds4_vocab *vocab, const char *content, token_vec *out) {
@@ -23064,7 +23146,7 @@ static void bpe_tokenize_tool_result_text(ds4_vocab *vocab, const char *content,
      * Preserve literal '<', '>' and '&' so shell output and file snippets stay
      * intact, but escape the exact closing sentinel so a malicious or accidental
      * tool payload cannot terminate the wrapper early. */
-    const char *end = "</tool_result>";
+    const char *end = DS4_IS_GLM() ? "</tool_response>" : "</tool_result>";
     const size_t endlen = strlen(end);
     const char *span = content ? content : "";
     const char *p = span;
@@ -23086,6 +23168,30 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     if (!role) role = "user";
     if (!content) content = "";
 
+    if (DS4_IS_GLM()) {
+        if (!strcmp(role, "system") || !strcmp(role, "developer")) {
+            token_vec_push(tokens, vocab->system_id);
+            bpe_tokenize_text(vocab, content, tokens);
+        } else if (!strcmp(role, "assistant")) {
+            token_vec_push(tokens, vocab->assistant_id);
+            if (strncmp(content, "<think>", 7) != 0 &&
+                strncmp(content, "</think>", 8) != 0) {
+                token_vec_push(tokens, vocab->think_start_id);
+                token_vec_push(tokens, vocab->think_end_id);
+            }
+            bpe_tokenize_text(vocab, content, tokens);
+        } else if (!strcmp(role, "tool") || !strcmp(role, "function")) {
+            token_vec_push(tokens, vocab->obs_id);
+            token_vec_push(tokens, GLM_TOKEN_TOOL_RESPONSE_BEGIN);
+            bpe_tokenize_tool_result_text(vocab, content, tokens);
+            token_vec_push(tokens, GLM_TOKEN_TOOL_RESPONSE_END);
+        } else {
+            token_vec_push(tokens, vocab->user_id);
+            bpe_tokenize_text(vocab, content, tokens);
+        }
+        return;
+    }
+
     if (!strcmp(role, "system") || !strcmp(role, "developer")) {
         bpe_tokenize_text(vocab, content, tokens);
     } else if (!strcmp(role, "assistant")) {
@@ -23106,9 +23212,13 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 }
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
-    token_vec_push(tokens, e->vocab.assistant_id);
-    token_vec_push(tokens, ds4_think_mode_enabled(think_mode) ?
-                   e->vocab.think_start_id : e->vocab.think_end_id);
+    if (DS4_IS_GLM()) {
+        glm_chat_append_assistant_prefix(&e->vocab, think_mode, tokens);
+    } else {
+        token_vec_push(tokens, e->vocab.assistant_id);
+        token_vec_push(tokens, ds4_think_mode_enabled(think_mode) ?
+                       e->vocab.think_start_id : e->vocab.think_end_id);
+    }
 }
 
 static void dump_tokens_fp(FILE *fp, const ds4_vocab *vocab, const token_vec *tokens) {
@@ -23232,6 +23342,10 @@ bool ds4_is_stop_token(ds4_engine *e, int token) {
 
 int ds4_token_user(ds4_engine *e) {
     return e->vocab.user_id;
+}
+
+int ds4_token_system(ds4_engine *e) {
+    return e->vocab.system_id;
 }
 
 int ds4_token_assistant(ds4_engine *e) {
@@ -25616,7 +25730,8 @@ int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *f
     token_vec tokens = {0};
 
     if (!fp) fp = stdout;
-    model_open(&model, model_path, false, false, false);
+    model_open(&model, model_path, false, false, true);
+    config_validate_model(&model);
     vocab_load(&vocab, &model);
     tokenize_rendered_chat_vocab(&vocab, text ? text : "", &tokens);
 
@@ -26701,6 +26816,11 @@ uint64_t ds4_engine_hidden_f32_values(ds4_engine *e) {
 int ds4_engine_model_id(ds4_engine *e) {
     (void)e;
     return (int)DS4_MODEL_VARIANT;
+}
+
+bool ds4_engine_is_glm(ds4_engine *e) {
+    (void)e;
+    return DS4_IS_GLM();
 }
 
 void ds4_engine_close(ds4_engine *e) {
