@@ -11165,13 +11165,35 @@ static bool read_http_request(int fd, http_request *r) {
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: raw header hex (first %zu bytes):%s", dump_len, hex);
     }
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: hend=%zu, b.len=%zu, header parsing starting",
+               (size_t)hend, b.len);
     const char *hdr = b.ptr;
     const char *hdr_end = b.ptr + (size_t)hend;
+    int line_no = 0;
     while (hdr < hdr_end) {
         const char *eol = hdr;
         while (eol < hdr_end && *eol != '\n') eol++;
         size_t hlen = (size_t)(eol - hdr);
         if (hlen && hdr[hlen - 1] == '\r') hlen--;
+        line_no++;
+        /* Debug: show each header line's first few bytes. */
+        {
+            size_t show = hlen < 24 ? hlen : 24;
+            char buf[64];
+            for (size_t j = 0; j < show; j++) {
+                unsigned char c = (unsigned char)hdr[j];
+                if (c >= 32 && c < 127) buf[j] = (char)c;
+                else buf[j] = '.';
+            }
+            buf[show] = '\0';
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server:   header line %d (hlen=%zu): '%.*s' -> auth_match=%d xapi_match=%d",
+                       line_no, hlen,
+                       (int)show, buf,
+                       (hlen >= 16 && strncasecmp(hdr, "Authorization: ", 16) == 0) ? 1 : 0,
+                       (hlen >= 9 && strncasecmp(hdr, "x-api-key:", 9) == 0) ? 1 : 0);
+        }
         if (hlen >= 16 && strncasecmp(hdr, "Authorization: ", 16) == 0) {
             const char *val = hdr + 16;
             while (val < hdr + hlen && isspace((unsigned char)*val)) val++;
@@ -11181,6 +11203,11 @@ static bool read_http_request(int fd, http_request *r) {
                 if (vlen > sizeof(r->auth) - 1) vlen = sizeof(r->auth) - 1;
                 memcpy(r->auth, val, vlen);
                 r->auth[vlen] = '\0';
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server:   => extracted auth key (len=%zu)", vlen);
+            } else {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server:   => Authorization header but no 'Bearer ' prefix");
             }
         } else if (hlen >= 9 && strncasecmp(hdr, "x-api-key:", 9) == 0) {
             const char *val = hdr + 9;
@@ -11189,9 +11216,15 @@ static bool read_http_request(int fd, http_request *r) {
             if (vlen > sizeof(r->auth) - 1) vlen = sizeof(r->auth) - 1;
             memcpy(r->auth, val, vlen);
             r->auth[vlen] = '\0';
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server:   => extracted x-api-key (len=%zu)", vlen);
         }
         hdr = eol < hdr_end ? eol + 1 : hdr_end;
     }
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: header parsing done, auth='%.*s' (len=%zu)",
+               (int)sizeof(r->auth), r->auth[0] ? r->auth : "(empty)",
+               r->auth[0] ? strlen(r->auth) : 0);
 
     long clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
