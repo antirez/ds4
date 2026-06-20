@@ -22460,6 +22460,7 @@ struct ds4_vocab {
     int assistant_id;
     int think_start_id;
     int think_end_id;
+    int obs_id;
     int dsml_id;
     str_i32_table token_to_id;
     str_i32_table merge_rank;
@@ -22923,6 +22924,19 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         table_put(&vocab->merge_rank, merge, (int)i);
     }
 
+    ds4_str arch;
+    if (model_get_string(model, "general.architecture", &arch) &&
+        ds4_streq(arch, "glm_moe_dsa")) {
+        vocab->bos_id         = 154824; /* <sop>; chat prefixes should add gMASK first. */
+        vocab->eos_id         = 154820; /* <|endof_text|> */
+        vocab->user_id        = 154827; /* <|user|> */
+        vocab->assistant_id   = 154828; /* <|assistant|> */
+        vocab->obs_id         = 154829; /* <|observation|> */
+        vocab->think_start_id = 154841; /* <|begin_of_thought|> */
+        vocab->think_end_id   = 154842; /* <|end_of_thought|> */
+        vocab->dsml_id        = 154822; /* [gMASK] */
+        return;
+    }
     vocab->bos_id       = vocab_lookup(vocab, "<｜begin▁of▁sentence｜>");
     vocab->eos_id       = vocab_lookup(vocab, "<｜end▁of▁sentence｜>");
     vocab->user_id      = vocab_lookup(vocab, "<｜User｜>");
@@ -23204,6 +23218,16 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
 
 int ds4_token_eos(ds4_engine *e) {
     return e->vocab.eos_id;
+}
+
+static bool vocab_is_stop_token(const ds4_vocab *vocab, int token) {
+    if (!vocab) return false;
+    if (token == vocab->eos_id) return true;
+    return DS4_IS_GLM() && (token == vocab->user_id || token == vocab->obs_id);
+}
+
+bool ds4_is_stop_token(ds4_engine *e, int token) {
+    return e && vocab_is_stop_token(&e->vocab, token);
 }
 
 int ds4_token_user(ds4_engine *e) {
@@ -23526,7 +23550,7 @@ static int generate_raw_swa_cpu(
         }
 
         int token = sample_argmax(logits, DS4_N_VOCAB);
-        if (token == vocab->eos_id) break;
+        if (vocab_is_stop_token(vocab, token)) break;
 
         if (emit) emit(emit_ud, token);
         n_generated++;
@@ -23683,7 +23707,7 @@ static int generate_metal_graph_raw_swa(
         }
 
         int token = sample_argmax(logits, DS4_N_VOCAB);
-        if (token == vocab->eos_id) break;
+        if (vocab_is_stop_token(vocab, token)) break;
 
         if (emit) emit(emit_ud, token);
         n_generated++;
@@ -27826,10 +27850,11 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
  * 4. fall back to ordinary one-token decode if the fast verifier cannot prove
  *    the target stream. */
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
-                                        int max_tokens, int eos_token,
+                                        int max_tokens,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
+    ds4_engine *e = s->engine;
     if (s->distributed) {
         if (!accepted) return 0;
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
@@ -27838,19 +27863,18 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     }
     if (ds4_session_is_cpu(s)) {
         (void)max_tokens;
-        (void)eos_token;
+        (void)e;
         if (!accepted || accepted_cap <= 0) return 0;
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         return 1;
     }
 #ifdef DS4_NO_GPU
-    (void)s; (void)first_token; (void)max_tokens; (void)eos_token;
+    (void)s; (void)e; (void)first_token; (void)max_tokens;
     (void)accepted; (void)accepted_cap;
     snprintf(err, errlen, "GPU support is not compiled in");
     return -1;
 #else
-    ds4_engine *e = s->engine;
 
     /*
      * MTP in DeepSeek V4 is a speculative drafter, not a replacement sampler.
@@ -27863,7 +27887,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
     int n_accept = 0;
     accepted[n_accept++] = first_token;
-    if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
+    if (ds4_is_stop_token(e, first_token) || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
 
     if (!e->mtp_ready || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) return n_accept;
 
@@ -27908,7 +27932,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         }
         return n_accept;
     }
-    if (drafts[0] == eos_token) draft_cap = 1;
+    if (ds4_is_stop_token(e, drafts[0])) draft_cap = 1;
     const uint32_t mtp_base_raw = s->graph.mtp_n_raw;
     /*
      * MTP has its own raw SWA cache. Recursive drafting writes speculative
@@ -27941,7 +27965,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             return n_accept;
         }
         drafts[draft_n] = mtp_top >= 0 ? mtp_top : sample_argmax(s->mtp_logits, DS4_N_VOCAB);
-        if (drafts[draft_n] == eos_token) {
+        if (ds4_is_stop_token(e, drafts[draft_n])) {
             draft_n++;
             break;
         }
@@ -28170,7 +28194,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                         memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
                         for (int i = 0; i < replayed && n_accept < accepted_cap; i++) {
                             accepted[n_accept++] = drafts[i];
-                            if (drafts[i] == eos_token) break;
+                            if (ds4_is_stop_token(e, drafts[i])) break;
                         }
                         s->checkpoint_valid = true;
                         s->mtp_draft_valid = false;
@@ -28191,7 +28215,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
                     for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
                         accepted[n_accept++] = drafts[i];
-                        if (drafts[i] == eos_token) break;
+                        if (ds4_is_stop_token(e, drafts[i])) break;
                     }
                     s->checkpoint_valid = true;
                     s->mtp_draft_valid = false;
@@ -28296,7 +28320,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
                     for (int i = 0; i < commit_drafts && n_accept < accepted_cap; i++) {
                         accepted[n_accept++] = drafts[i];
-                        if (drafts[i] == eos_token) break;
+                        if (ds4_is_stop_token(e, drafts[i])) break;
                     }
                     s->checkpoint_valid = true;
                     s->mtp_draft_valid = false;
@@ -28382,7 +28406,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         logits_on_host = false;
         accepted[n_accept++] = drafts[i];
         verified++;
-        if (drafts[i] == eos_token) break;
+        if (ds4_is_stop_token(e, drafts[i])) break;
     }
     if (verified > 0 && !logits_on_host) {
         if (ds4_gpu_tensor_read(s->graph.logits,

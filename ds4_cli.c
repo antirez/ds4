@@ -476,7 +476,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token = ds4_session_sample(session, cfg->gen.temperature, 0,
                                        cfg->gen.top_p, cfg->gen.min_p, &rng);
-        if (token == ds4_token_eos(engine)) break;
+        if (ds4_is_stop_token(engine, token)) break;
 
         int toks[17];
         int ntok = 0;
@@ -486,7 +486,6 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             ntok = ds4_session_eval_speculative_argmax(session,
                                                        token,
                                                        max_tokens - generated,
-                                                       ds4_token_eos(engine),
                                                        toks,
                                                        (int)(sizeof(toks) / sizeof(toks[0])),
                                                        err,
@@ -512,7 +511,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
         bool stop = false;
         for (int j = 0; j < ntok; j++) {
-            if (toks[j] == ds4_token_eos(engine)) {
+            if (ds4_is_stop_token(engine, toks[j])) {
                 stop = true;
                 break;
             }
@@ -766,7 +765,7 @@ static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4
         }
         fputs("]}", fp);
 
-        if (token == ds4_token_eos(engine)) break;
+        if (ds4_is_stop_token(engine, token)) break;
         if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
             fprintf(stderr, "ds4: decode failed while dumping logprobs: %s\n", err);
             free(scores);
@@ -1147,7 +1146,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                                        cfg->gen.top_p,
                                        cfg->gen.min_p,
                                        &rng);
-        if (token == ds4_token_eos(engine)) break;
+        if (ds4_is_stop_token(engine, token)) break;
 
         int toks[17];
         int ntok = 0;
@@ -1157,7 +1156,6 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
             ntok = ds4_session_eval_speculative_argmax(chat->session,
                                                        token,
                                                        max_tokens - generated,
-                                                       ds4_token_eos(engine),
                                                        toks,
                                                        (int)(sizeof(toks) / sizeof(toks[0])),
                                                        err,
@@ -1181,7 +1179,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
         bool stop = false;
         for (int j = 0; j < ntok; j++) {
-            if (toks[j] == ds4_token_eos(engine)) {
+            if (ds4_is_stop_token(engine, toks[j])) {
                 stop = true;
                 break;
             }

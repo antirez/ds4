@@ -7421,7 +7421,7 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
             return false;
         }
         int token = ds4_session_argmax(w->session);
-        if (token == ds4_token_eos(w->engine)) break;
+        if (ds4_is_stop_token(w->engine, token)) break;
         if (token == think_end_id || token == dsml_id) {
             if (token == dsml_id && summary.len && summary.ptr[summary.len - 1] == '<') {
                 summary.ptr[--summary.len] = '\0';
@@ -7787,7 +7787,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 status_greedy_sampling = greedy_sampling;
             }
             int token = worker_sample_with_mode(w, cfg, greedy_sampling, &rng);
-            if (token == ds4_token_eos(w->engine)) break;
+            if (ds4_is_stop_token(w->engine, token)) break;
 
             size_t text_len = 0;
             char *text = ds4_token_text(w->engine, token, &text_len);

@@ -717,7 +717,7 @@ static void test_long_story_fact_recall(void) {
     bool decode_ok = true;
     for (; generated < 350; generated++) {
         int token = ds4_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
-        if (token == ds4_token_eos(engine)) break;
+        if (ds4_is_stop_token(engine, token)) break;
 
         size_t piece_len = 0;
         char *piece = ds4_token_text(engine, token, &piece_len);
@@ -1844,7 +1844,7 @@ static void test_think_tool_recovery(void) {
         uint64_t prng = 7;
         for (int i = 0; i < 300; i++) {
             int token = ds4_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &prng);
-            if (token == ds4_token_eos(engine)) break;
+            if (ds4_is_stop_token(engine, token)) break;
             size_t plen = 0;
             char *p = ds4_token_text(engine, token, &plen);
             buf_append(&nat, p, plen);
@@ -1924,7 +1924,7 @@ static void test_think_tool_recovery(void) {
     bool saw_end = false;
     for (int i = 0; i < 256 && !saw_end; i++) {
         int token = ds4_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
-        if (token == ds4_token_eos(engine)) break;
+        if (ds4_is_stop_token(engine, token)) break;
         size_t piece_len = 0;
         char *piece = ds4_token_text(engine, token, &piece_len);
         buf_append(&text, piece, piece_len);
@@ -2042,22 +2042,21 @@ static bool test_mtp_capture_speculative(ds4_engine *engine, const ds4_tokens *p
     bool ok = ds4_session_sync(session, prompt, err, sizeof(err)) == 0;
     TEST_ASSERT(ok);
 
-    const int eos = ds4_token_eos(engine);
     int n = 0;
     bool stop = false;
     while (ok && !stop && n < max_tokens) {
         const int token = ds4_session_argmax(session);
-        if (token == eos) break;
+        if (ds4_is_stop_token(engine, token)) break;
 
         int toks[17]; /* base token + draft depth, which the engine clamps to 16 */
         const int ntok = ds4_session_eval_speculative_argmax(
-            session, token, max_tokens - n, eos, toks,
+            session, token, max_tokens - n, toks,
             (int)(sizeof(toks) / sizeof(toks[0])), err, sizeof(err));
         if (ntok < 0) { ok = false; TEST_ASSERT(false); break; }
         if (ntok > *max_chunk) *max_chunk = ntok;
 
         for (int j = 0; j < ntok; j++) {
-            if (toks[j] == eos) { stop = true; break; }
+            if (ds4_is_stop_token(engine, toks[j])) { stop = true; break; }
             out[n++] = toks[j];
             if (n >= max_tokens) { stop = true; break; }
         }
