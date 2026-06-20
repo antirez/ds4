@@ -11191,13 +11191,13 @@ static bool read_http_request(int fd, http_request *r) {
                        "ds4-server:   header line %d (hlen=%zu): '%.*s' -> auth_match=%d xapi_match=%d",
                        line_no, hlen,
                        (int)show, buf,
-                       (hlen >= 16 && strncasecmp(hdr, "Authorization: ", 16) == 0) ? 1 : 0,
-                       (hlen >= 9 && strncasecmp(hdr, "x-api-key:", 9) == 0) ? 1 : 0);
+                       (hlen >= 15 && strncasecmp(hdr, "Authorization: ", 15) == 0) ? 1 : 0,
+                       (hlen >= 10 && strncasecmp(hdr, "x-api-key:", 10) == 0) ? 1 : 0);
         }
-        if (hlen >= 16 && strncasecmp(hdr, "Authorization: ", 16) == 0) {
-            const char *val = hdr + 16;
+        if (hlen >= 15 && strncasecmp(hdr, "Authorization: ", 15) == 0) {
+            const char *val = hdr + 15;
             while (val < hdr + hlen && isspace((unsigned char)*val)) val++;
-            if (hlen >= 24 && strncasecmp(val, "Bearer ", 7) == 0) {
+            if (hlen >= 23 && strncasecmp(val, "Bearer ", 7) == 0) {
                 val += 7;
                 size_t vlen = (size_t)(hdr + hlen - val);
                 if (vlen > sizeof(r->auth) - 1) vlen = sizeof(r->auth) - 1;
@@ -11209,8 +11209,8 @@ static bool read_http_request(int fd, http_request *r) {
                 server_log(DS4_LOG_DEFAULT,
                            "ds4-server:   => Authorization header but no 'Bearer ' prefix");
             }
-        } else if (hlen >= 9 && strncasecmp(hdr, "x-api-key:", 9) == 0) {
-            const char *val = hdr + 9;
+        } else if (hlen >= 10 && strncasecmp(hdr, "x-api-key:", 10) == 0) {
+            const char *val = hdr + 10;
             while (val < hdr + hlen && isspace((unsigned char)*val)) val++;
             size_t vlen = (size_t)(hdr + hlen - val);
             if (vlen > sizeof(r->auth) - 1) vlen = sizeof(r->auth) - 1;
