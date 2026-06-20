@@ -11296,11 +11296,28 @@ static void *client_main(void *arg) {
 
     /* API key authentication check. */
     if (s->api_key && s->api_key[0]) {
-        if (!hr.auth[0] || strcmp(hr.auth, s->api_key) != 0) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: auth check for %s %s — received auth='%.*s', expected='%.8s...'",
+                   hr.method, hr.path,
+                   (int)sizeof(hr.auth), hr.auth[0] ? hr.auth : "(none)",
+                   s->api_key);
+        if (!hr.auth[0]) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: auth rejected — no auth header present");
             http_error(fd, s->enable_cors, 401, "invalid API key");
             http_request_free(&hr);
             goto done;
         }
+        if (strcmp(hr.auth, s->api_key) != 0) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: auth rejected — key mismatch (received length=%zu, expected length=%zu)",
+                       strlen(hr.auth), strlen(s->api_key));
+            http_error(fd, s->enable_cors, 401, "invalid API key");
+            http_request_free(&hr);
+            goto done;
+        }
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: auth accepted for %s %s", hr.method, hr.path);
     }
 
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
@@ -11787,6 +11804,11 @@ int main(int argc, char **argv) {
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
     s.api_key = cfg.api_key;
+    if (s.api_key && s.api_key[0]) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: API key authentication enabled (key starts with %.8s...)",
+                   s.api_key);
+    }
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
