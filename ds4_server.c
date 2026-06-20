@@ -11148,6 +11148,23 @@ static bool read_http_request(int fd, http_request *r) {
 
     /* Extract Authorization: Bearer <token> or x-api-key: <key>. */
     r->auth[0] = '\0';
+
+    /* Debug: dump raw header bytes so we see exactly what the server received. */
+    {
+        size_t dump_len = (size_t)hend;
+        if (dump_len > 200) dump_len = 200;
+        char hex[4096];
+        size_t pos = 0;
+        for (size_t j = 0; j < dump_len && pos < sizeof(hex) - 5; j++) {
+            unsigned char c = (unsigned char)b.ptr[j];
+            int n = snprintf(hex + pos, sizeof(hex) - pos, " %s%02x",
+                             (c >= 32 && c < 127) ? "" : "", c);
+            if (n > 0) pos += (size_t)n;
+        }
+        hex[pos] = '\0';
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: raw header hex (first %zu bytes):%s", dump_len, hex);
+    }
     const char *hdr = b.ptr;
     const char *hdr_end = b.ptr + (size_t)hend;
     while (hdr < hdr_end) {
