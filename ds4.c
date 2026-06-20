@@ -10176,13 +10176,14 @@ static void layer_forward_glm_decode_one(
     rms_norm_weight(attn_norm, inp, tensor_data(model, layer->attn_norm),
                     n_embd, DS4_RMS_EPS);
 
-    /* Q projection: q_a (q_lora_out), q_a_norm, q_b (qk_dim per head). */
+    /* Q projection: q_a is at q_lora_rank (DS4_N_LORA_Q = 2048 for GLM), NOT
+     * kv_lora (512). */
     float *q = xmalloc((size_t)n_head * qk_size * sizeof(q[0]));
-    float *q_a = xmalloc((size_t)kv_lora * sizeof(q_a[0]));
-    float *q_a_n = xmalloc((size_t)kv_lora * sizeof(q_a_n[0]));
+    float *q_a = xmalloc((size_t)DS4_N_LORA_Q * sizeof(q_a[0]));
+    float *q_a_n = xmalloc((size_t)DS4_N_LORA_Q * sizeof(q_a_n[0]));
     matvec_q8_0(q_a, model, layer->attn_q_a, attn_norm);
     rms_norm_weight(q_a_n, q_a, tensor_data(model, layer->attn_q_a_norm),
-                    kv_lora, DS4_RMS_EPS);
+                    DS4_N_LORA_Q, DS4_RMS_EPS);
     matvec_q8_0(q, model, layer->attn_q_b, q_a_n);
     /* Apply forward RoPE to Q (per head, last qk_rope dims). */
     rope_tail_layer_inplace(q, n_head, qk_size, qk_rope, pos, il, false);
@@ -10550,6 +10551,36 @@ static void prefill_layer_major_cpu(
         const float       * steering_dirs,
         float               steering_attn_scale,
         float               steering_ffn_scale) {
+    if (DS4_IS_GLM()) {
+        /* GLM uses a plain residual and follows the decode path token-by-token
+         * (max(N_EMBD, Q8_0) per layer; the GPU graph is the optimized one). */
+        const uint64_t n_tok = (uint64_t)prompt->len;
+        float *cur = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(cur[0]));
+        float *next = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(next[0]));
+        for (uint64_t t = 0; t < n_tok; t++) {
+            embed_token_f16(model, weights, prompt->v[t], cur + t * DS4_N_EMBD);
+        }
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            fprintf(stderr, "ds4: prefill layer %u/%u\r", il + 1, (uint32_t)DS4_N_LAYER);
+            fflush(stderr);
+            for (uint64_t t = 0; t < n_tok; t++) {
+                layer_forward_glm_decode_one(next + t * DS4_N_EMBD,
+                                              model, &weights->layer[il],
+                                              &cache->layer[il],
+                                              cur + t * DS4_N_EMBD,
+                                              il, (uint32_t)t);
+            }
+            float *tmp = cur; cur = next; next = tmp;
+        }
+        if (logits) {
+            output_logits_one_decode_scratch_glm(logits, model, weights,
+                                                 cur + (n_tok - 1) * DS4_N_EMBD, NULL);
+        }
+        free(cur);
+        free(next);
+        (void)steering_dirs; (void)steering_attn_scale; (void)steering_ffn_scale;
+        return;
+    }
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t n_tok = (uint64_t)prompt->len;
     float *cur = xmalloc((size_t)n_tok * hc_dim * sizeof(cur[0]));
