@@ -2225,6 +2225,22 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_blk_pipeline(
     return pipeline;
 }
 
+static bool ds4_gpu_flash_attn_head_dim_supported(uint32_t head_dim) {
+    return head_dim == 512u || head_dim == 256u;
+}
+
+static const char *ds4_gpu_flash_attn_function_name(uint32_t head_dim) {
+    return head_dim == 256u ?
+        "kernel_flash_attn_ext_f16_dk256_dv256" :
+        "kernel_flash_attn_ext_f16_dk512_dv512";
+}
+
+static const char *ds4_gpu_flash_attn_vec_function_name(uint32_t head_dim) {
+    return head_dim == 256u ?
+        "kernel_flash_attn_ext_vec_f16_dk256_dv256" :
+        "kernel_flash_attn_ext_vec_f16_dk512_dv512";
+}
+
 static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_pipeline(
         const char *function_name,
         bool        has_mask,
@@ -16802,7 +16818,7 @@ static int ds4_gpu_encode_flash_attention_raw_heads(
         uint32_t              raw_start,
         uint32_t              n_head,
         uint32_t              head_dim) {
-    if (head_dim != 512 || n_head == 0 || n_raw == 0 || raw_cap < n_raw) {
+    if (!ds4_gpu_flash_attn_head_dim_supported(head_dim) || n_head == 0 || n_raw == 0 || raw_cap < n_raw) {
         return 0;
     }
 
@@ -16858,7 +16874,7 @@ static int ds4_gpu_encode_flash_attention_raw_heads(
         if (!pad_pipeline) return 0;
     }
     id<MTLComputePipelineState> vec_pipeline =
-        ds4_gpu_get_flash_attn_vec_pipeline("kernel_flash_attn_ext_vec_f16_dk512_dv512",
+        ds4_gpu_get_flash_attn_vec_pipeline(ds4_gpu_flash_attn_vec_function_name(head_dim),
                                               true, true, false, false, (n_raw % ncpsg) != 0,
                                               (int32_t)head_dim,
                                               (int32_t)head_dim,
@@ -17121,7 +17137,7 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long
         uint32_t               head_dim) {
     if (!cbp || !*cbp) return 0;
     id<MTLCommandBuffer> cb = *cbp;
-    if (head_dim != 512 || n_head == 0 || n_tokens == 0 || ratio == 0) {
+    if (!ds4_gpu_flash_attn_head_dim_supported(head_dim) || n_head == 0 || n_tokens == 0 || ratio == 0) {
         return 0;
     }
 
@@ -17255,7 +17271,7 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long
     id<MTLComputePipelineState> blk_pipeline =
         ds4_gpu_get_flash_attn_blk_pipeline((int32_t)nqptg, (int32_t)ncpsg);
     id<MTLComputePipelineState> attn_pipeline =
-        ds4_gpu_get_flash_attn_pipeline("kernel_flash_attn_ext_f16_dk512_dv512",
+        ds4_gpu_get_flash_attn_pipeline(ds4_gpu_flash_attn_function_name(head_dim),
                                           true, true, false, false, has_kvpad, bc_mask,
                                           (int32_t)head_dim,
                                           (int32_t)head_dim,
@@ -17396,7 +17412,7 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_vec(
         uint32_t               head_dim) {
     if (!cbp || !*cbp) return 0;
     id<MTLCommandBuffer> cb = *cbp;
-    if (head_dim != 512 || n_head == 0 || n_tokens == 0 || ratio == 0) {
+    if (!ds4_gpu_flash_attn_head_dim_supported(head_dim) || n_head == 0 || n_tokens == 0 || ratio == 0) {
         return 0;
     }
 
@@ -17528,7 +17544,7 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_vec(
         if (!pad_pipeline) return 0;
     }
     id<MTLComputePipelineState> vec_pipeline =
-        ds4_gpu_get_flash_attn_vec_pipeline("kernel_flash_attn_ext_vec_f16_dk512_dv512",
+        ds4_gpu_get_flash_attn_vec_pipeline(ds4_gpu_flash_attn_vec_function_name(head_dim),
                                               true, true, false, false, has_kvpad,
                                               (int32_t)head_dim,
                                               (int32_t)head_dim,
@@ -17709,7 +17725,7 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
         uint32_t               head_dim) {
     if (!cbp || !*cbp) return 0;
     id<MTLCommandBuffer> cb = *cbp;
-    if (head_dim != 512 || n_head == 0 || n_tokens == 0) {
+    if (!ds4_gpu_flash_attn_head_dim_supported(head_dim) || n_head == 0 || n_tokens == 0) {
         return 0;
     }
 
@@ -17795,7 +17811,7 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
     id<MTLComputePipelineState> blk_pipeline =
         ds4_gpu_get_flash_attn_blk_pipeline((int32_t)nqptg, (int32_t)ncpsg);
     id<MTLComputePipelineState> attn_pipeline =
-        ds4_gpu_get_flash_attn_pipeline("kernel_flash_attn_ext_f16_dk512_dv512",
+        ds4_gpu_get_flash_attn_pipeline(ds4_gpu_flash_attn_function_name(head_dim),
                                           true, true, false, false, has_kvpad, bc_mask,
                                           (int32_t)head_dim,
                                           (int32_t)head_dim,
@@ -17939,7 +17955,7 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads(
         uint32_t               head_dim) {
     if (!cbp || !*cbp) return 0;
     id<MTLCommandBuffer> cb = *cbp;
-    if (head_dim != 512 || n_head == 0 || n_tokens == 0) {
+    if (!ds4_gpu_flash_attn_head_dim_supported(head_dim) || n_head == 0 || n_tokens == 0) {
         return 0;
     }
     if (n_tokens >= 20) {
@@ -18033,7 +18049,7 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads(
         if (!pad_pipeline) return 0;
     }
     id<MTLComputePipelineState> vec_pipeline =
-        ds4_gpu_get_flash_attn_vec_pipeline("kernel_flash_attn_ext_vec_f16_dk512_dv512",
+        ds4_gpu_get_flash_attn_vec_pipeline(ds4_gpu_flash_attn_vec_function_name(head_dim),
                                               true, true, false, false, true,
                                               (int32_t)head_dim,
                                               (int32_t)head_dim,
@@ -18176,7 +18192,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         uint32_t               n_head,
         uint32_t               head_dim) {
     const uint32_t n_keys = n_raw + n_comp;
-    if (head_dim != 512 || n_head == 0 || n_raw == 0 || n_keys == 0 ||
+    if (!ds4_gpu_flash_attn_head_dim_supported(head_dim) || n_head == 0 || n_raw == 0 || n_keys == 0 ||
         raw_cap < n_raw || n_keys < n_raw) {
         return 0;
     }
@@ -18241,7 +18257,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         if (!pad_pipeline) return 0;
     }
     id<MTLComputePipelineState> vec_pipeline =
-        ds4_gpu_get_flash_attn_vec_pipeline("kernel_flash_attn_ext_vec_f16_dk512_dv512",
+        ds4_gpu_get_flash_attn_vec_pipeline(ds4_gpu_flash_attn_vec_function_name(head_dim),
                                               true, true, false, false, (n_keys % ncpsg) != 0,
                                               (int32_t)head_dim,
                                               (int32_t)head_dim,
@@ -18434,7 +18450,7 @@ static int ds4_gpu_encode_flash_attention_decode_raw_batch_heads(
         uint32_t               window,
         uint32_t               n_head,
         uint32_t               head_dim) {
-    if (head_dim != 512 || n_head == 0 || n_tokens == 0 ||
+    if (!ds4_gpu_flash_attn_head_dim_supported(head_dim) || n_head == 0 || n_tokens == 0 ||
         n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap) {
         return 0;
     }
@@ -18542,7 +18558,7 @@ static int ds4_gpu_encode_flash_attention_decode_raw_batch_heads(
     id<MTLComputePipelineState> blk_pipeline =
         ds4_gpu_get_flash_attn_blk_pipeline((int32_t)nqptg, (int32_t)ncpsg);
     id<MTLComputePipelineState> attn_pipeline =
-        ds4_gpu_get_flash_attn_pipeline("kernel_flash_attn_ext_f16_dk512_dv512",
+        ds4_gpu_get_flash_attn_pipeline(ds4_gpu_flash_attn_function_name(head_dim),
                                           true, true, false, false, has_kvpad, bc_mask,
                                           (int32_t)head_dim,
                                           (int32_t)head_dim,
@@ -18696,7 +18712,7 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
                                                                        n_head,
                                                                        head_dim);
     }
-    if (head_dim != 512 || n_head == 0 || n_tokens == 0 ||
+    if (!ds4_gpu_flash_attn_head_dim_supported(head_dim) || n_head == 0 || n_tokens == 0 ||
         n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
         ratio == 0 || !comp_kv || (use_comp_mask && !comp_mask)) {
         return 0;
@@ -18835,7 +18851,7 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
     id<MTLComputePipelineState> blk_pipeline =
         ds4_gpu_get_flash_attn_blk_pipeline((int32_t)nqptg, (int32_t)ncpsg);
     id<MTLComputePipelineState> attn_pipeline =
-        ds4_gpu_get_flash_attn_pipeline("kernel_flash_attn_ext_f16_dk512_dv512",
+        ds4_gpu_get_flash_attn_pipeline(ds4_gpu_flash_attn_function_name(head_dim),
                                           true, true, false, false, has_kvpad, bc_mask,
                                           (int32_t)head_dim,
                                           (int32_t)head_dim,
@@ -19163,7 +19179,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     if (!heads || !model_map || !q || !raw_kv || !comp_kv || !topk ||
         n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
         n_comp == 0 || top_k == 0 || top_k > n_comp || (top_k & (top_k - 1u)) != 0 ||
-        ratio == 0 || n_head == 0 || head_dim != 512) {
+        ratio == 0 || n_head == 0 || !ds4_gpu_flash_attn_head_dim_supported(head_dim)) {
         return 0;
     }
 
