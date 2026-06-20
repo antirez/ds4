@@ -27,14 +27,17 @@ CPPFLAGS ?= -D_GNU_SOURCE
 
 .PHONY: all clean quality-score
 
-all: deepseek4-quantize
+all: deepseek4-quantize glm-quantize
 
 deepseek4-quantize: deepseek4-quantize.c quants.c quants.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ deepseek4-quantize.c quants.c -lm -pthread
 
+glm-quantize: glm-quantize.c quants.c quants.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ glm-quantize.c quants.c -lm -pthread
+
 quality-score:
 	$(MAKE) -C .. $(QUALITY_TARGETS)
-	$(QUALITY_LINK) quality-testing/score_official quality-testing/score_official.c $(QUALITY_OBJS) $(QUALITY_LDLIBS)
+	rm -f deepseek4-quantize glm-quantize quality-testing/score_official
 
 clean:
 	rm -f deepseek4-quantize quality-testing/score_official
