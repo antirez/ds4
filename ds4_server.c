@@ -7721,6 +7721,7 @@ struct server {
     visible_live_state thinking_live;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
+    char *api_key;
     pthread_mutex_t tool_mu;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -11083,6 +11084,7 @@ typedef struct {
     char path[256];
     char *body;
     size_t body_len;
+    char auth[512];
 } http_request;
 
 static void http_request_free(http_request *r) {
@@ -11143,6 +11145,36 @@ static bool read_http_request(int fd, http_request *r) {
     if (sscanf(line, "%7s %255s", r->method, r->path) != 2) goto fail;
     char *q = strchr(r->path, '?');
     if (q) *q = '\0';
+
+    /* Extract Authorization: Bearer <token> or x-api-key: <key>. */
+    r->auth[0] = '\0';
+    const char *hdr = b.ptr;
+    const char *hdr_end = b.ptr + (size_t)hend;
+    while (hdr < hdr_end) {
+        const char *eol = hdr;
+        while (eol < hdr_end && *eol != '\n') eol++;
+        size_t hlen = (size_t)(eol - hdr);
+        if (hlen && hdr[hlen - 1] == '\r') hlen--;
+        if (hlen >= 16 && strncasecmp(hdr, "Authorization: ", 16) == 0) {
+            const char *val = hdr + 16;
+            while (val < hdr + hlen && isspace((unsigned char)*val)) val++;
+            if (hlen >= 24 && strncasecmp(val, "Bearer ", 7) == 0) {
+                val += 7;
+                size_t vlen = (size_t)(hdr + hlen - val);
+                if (vlen > sizeof(r->auth) - 1) vlen = sizeof(r->auth) - 1;
+                memcpy(r->auth, val, vlen);
+                r->auth[vlen] = '\0';
+            }
+        } else if (hlen >= 9 && strncasecmp(hdr, "x-api-key:", 9) == 0) {
+            const char *val = hdr + 9;
+            while (val < hdr + hlen && isspace((unsigned char)*val)) val++;
+            size_t vlen = (size_t)(hdr + hlen - val);
+            if (vlen > sizeof(r->auth) - 1) vlen = sizeof(r->auth) - 1;
+            memcpy(r->auth, val, vlen);
+            r->auth[vlen] = '\0';
+        }
+        hdr = eol < hdr_end ? eol + 1 : hdr_end;
+    }
 
     long clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
@@ -11260,6 +11292,15 @@ static void *client_main(void *arg) {
         http_response(fd, s->enable_cors, 204, NULL, "");
         http_request_free(&hr);
         goto done;
+    }
+
+    /* API key authentication check. */
+    if (s->api_key && s->api_key[0]) {
+        if (!hr.auth[0] || strcmp(hr.auth, s->api_key) != 0) {
+            http_error(fd, s->enable_cors, 401, "invalid API key");
+            http_request_free(&hr);
+            goto done;
+        }
     }
 
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
@@ -11402,6 +11443,7 @@ typedef struct {
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
+    char *api_key;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -11469,6 +11511,8 @@ static void server_close_resources(server *s) {
     live_tool_state_free(&s->responses_live);
     live_tool_state_free(&s->anthropic_live);
     visible_live_free(&s->thinking_live);
+    free(s->api_key);
+    s->api_key = NULL;
     pthread_mutex_destroy(&s->tool_mu);
     pthread_mutex_destroy(&s->trace_mu);
     pthread_cond_destroy(&s->clients_cv);
@@ -11572,6 +11616,8 @@ static server_config parse_options(int argc, char **argv) {
             c.host = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--port")) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--api-key")) {
+            c.api_key = xstrdup(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
         } else if (!strcmp(arg, "--trace")) {
@@ -11740,6 +11786,7 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.api_key = cfg.api_key;
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
