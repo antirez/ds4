@@ -3409,6 +3409,18 @@ static bool ds4_streaming_routed_expert_bytes(
     return false;
 }
 
+static uint32_t ds4_streaming_routed_layer_count(const ds4_weights *weights) {
+    if (!weights) return 0;
+    uint32_t count = 0;
+    uint64_t bytes = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (streaming_layer_routed_expert_bytes(&weights->layer[il], &bytes)) {
+            count++;
+        }
+    }
+    return count;
+}
+
 /*
  * Mixed-precision ("boosted") GGUFs upcast a few layers' routed experts to a
  * bigger quant (e.g. Q4_K among IQ2 layers). The streaming expert cache is a
@@ -14342,6 +14354,12 @@ static bool metal_graph_use_pro_q4_expert_table_auto(const ds4_gpu_graph *g) {
 static bool metal_graph_decode_cpu_router_applicable(
         const ds4_gpu_graph     *g,
         const ds4_layer_weights *layer) {
+    if (!layer ||
+        !layer->ffn_gate_exps ||
+        !layer->ffn_up_exps ||
+        !layer->ffn_down_exps) {
+        return false;
+    }
     const bool pro_q4 =
         DS4_MODEL_VARIANT == DS4_VARIANT_PRO &&
         metal_graph_use_pro_q4_cpu_router() &&
@@ -14357,7 +14375,7 @@ static bool metal_graph_decode_cpu_router_applicable(
         layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
         layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
         layer->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
-        DS4_N_EXPERT_USED == 6 &&
+        (DS4_N_EXPERT_USED == 6 || DS4_N_EXPERT_USED == DS4_MAX_EXPERT_USED) &&
         DS4_N_EXPERT >= 128 &&
         getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
         getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
@@ -14370,6 +14388,13 @@ static bool metal_graph_decode_pro_q4_expert_table_expected(
         const ds4_layer_weights *layer,
         uint64_t                 gate_tensor_bytes,
         uint64_t                 down_tensor_bytes) {
+    if (!g ||
+        !layer ||
+        !layer->ffn_gate_exps ||
+        !layer->ffn_up_exps ||
+        !layer->ffn_down_exps) {
+        return false;
+    }
     const uint64_t q4_selected_min_tensor_bytes = 2ull * 1024ull * 1024ull * 1024ull;
     return !g->quality &&
            DS4_MODEL_VARIANT == DS4_VARIANT_PRO &&
@@ -14399,6 +14424,13 @@ static bool metal_graph_decode_q4_selected_slots_expected(
                                                         down_tensor_bytes)) {
         return false;
     }
+    if (!g ||
+        !layer ||
+        !layer->ffn_gate_exps ||
+        !layer->ffn_up_exps ||
+        !layer->ffn_down_exps) {
+        return false;
+    }
     const uint64_t q4_selected_min_tensor_bytes = 2ull * 1024ull * 1024ull * 1024ull;
     return !g->quality &&
            metal_graph_q4_selected_paths_allowed(g) &&
@@ -14421,10 +14453,14 @@ static bool metal_graph_decode_iq2_selected_slots_expected(
     return g &&
            g->ssd_streaming &&
            !g->quality &&
+           layer &&
+           layer->ffn_gate_exps &&
+           layer->ffn_up_exps &&
+           layer->ffn_down_exps &&
            layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
            layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
            layer->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
-           DS4_N_EXPERT_USED == 6 &&
+           (DS4_N_EXPERT_USED == 6 || DS4_N_EXPERT_USED == DS4_MAX_EXPERT_USED) &&
            DS4_N_EXPERT >= 128 &&
            getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
            getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
@@ -26214,7 +26250,13 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
         return false;
     }
 
-    const uint64_t max_model_experts = (uint64_t)DS4_N_LAYER * (uint64_t)DS4_N_EXPERT;
+    const uint32_t routed_layers = ds4_streaming_routed_layer_count(&e->weights);
+    if (routed_layers == 0) {
+        fprintf(stderr,
+                "ds4: SSD streaming auto cache found no routed expert layers\n");
+        return false;
+    }
+    const uint64_t max_model_experts = (uint64_t)routed_layers * (uint64_t)DS4_N_EXPERT;
     ds4_ssd_cache_plan plan;
     if (!ds4_ssd_auto_cache_plan(recommended,
                                  non_routed_bytes,

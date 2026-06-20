@@ -373,7 +373,7 @@ static uint32_t g_model_view_count;
 
 enum {
     DS4_METAL_MAX_EXPERT_USED = 8,
-    DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER = 61,
+    DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER = 80,
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT = 384,
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES =
         DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER *
@@ -1244,12 +1244,13 @@ static void ds4_gpu_moe_selected_trace_record_close(void) {
 }
 
 static int ds4_gpu_moe_selected_trace_record(
-        const int32_t selected_ids[6],
+        const int32_t selected_ids[DS4_METAL_MAX_EXPERT_USED],
         uint32_t      n_selected) {
     const char *path = getenv("DS4_MOE_RECORD_SELECTED_IDS");
     if (!path || !path[0]) return 1;
-    if (n_selected != 6) {
-        fprintf(stderr, "ds4: selected-id recording expects exactly 6 selected experts\n");
+    if (n_selected == 0 || n_selected > DS4_METAL_MAX_EXPERT_USED) {
+        fprintf(stderr, "ds4: selected-id recording expects 1..%u selected experts\n",
+                (uint32_t)DS4_METAL_MAX_EXPERT_USED);
         return 0;
     }
 
@@ -1277,12 +1278,13 @@ static int ds4_gpu_moe_selected_trace_record(
 }
 
 static int ds4_gpu_moe_selected_trace_replay(
-        int32_t  selected_ids[6],
+        int32_t  selected_ids[DS4_METAL_MAX_EXPERT_USED],
         uint32_t n_selected) {
     const char *path = getenv("DS4_MOE_REPLAY_SELECTED_IDS");
     if (!path || !path[0]) return 0;
-    if (n_selected != 6) {
-        fprintf(stderr, "ds4: selected-id replay expects exactly 6 selected experts\n");
+    if (n_selected == 0 || n_selected > DS4_METAL_MAX_EXPERT_USED) {
+        fprintf(stderr, "ds4: selected-id replay expects 1..%u selected experts\n",
+                (uint32_t)DS4_METAL_MAX_EXPERT_USED);
         return -1;
     }
 
@@ -7833,23 +7835,23 @@ typedef struct {
     uint32_t n_total_expert;
     uint32_t n_selected;
     uint32_t missing_mask;
-    uint32_t load_slots[6];
-    uint32_t source_slots[6];
+    uint32_t load_slots[DS4_METAL_MAX_EXPERT_USED];
+    uint32_t source_slots[DS4_METAL_MAX_EXPERT_USED];
     uint32_t n_loads;
     uint32_t n_tasks;
     uint64_t gate_expert_bytes;
     uint64_t down_expert_bytes;
-    int32_t selected_ids[6];
-    uint64_t gate_abs_offsets[6];
-    uint64_t up_abs_offsets[6];
-    uint64_t down_abs_offsets[6];
-    __strong id<MTLBuffer> gate_bufs[6];
-    __strong id<MTLBuffer> up_bufs[6];
-    __strong id<MTLBuffer> down_bufs[6];
-    NSUInteger gate_inners[6];
-    NSUInteger up_inners[6];
-    NSUInteger down_inners[6];
-    ds4_gpu_stream_expert_pread_task tasks[18];
+    int32_t selected_ids[DS4_METAL_MAX_EXPERT_USED];
+    uint64_t gate_abs_offsets[DS4_METAL_MAX_EXPERT_USED];
+    uint64_t up_abs_offsets[DS4_METAL_MAX_EXPERT_USED];
+    uint64_t down_abs_offsets[DS4_METAL_MAX_EXPERT_USED];
+    __strong id<MTLBuffer> gate_bufs[DS4_METAL_MAX_EXPERT_USED];
+    __strong id<MTLBuffer> up_bufs[DS4_METAL_MAX_EXPERT_USED];
+    __strong id<MTLBuffer> down_bufs[DS4_METAL_MAX_EXPERT_USED];
+    NSUInteger gate_inners[DS4_METAL_MAX_EXPERT_USED];
+    NSUInteger up_inners[DS4_METAL_MAX_EXPERT_USED];
+    NSUInteger down_inners[DS4_METAL_MAX_EXPERT_USED];
+    ds4_gpu_stream_expert_pread_task tasks[DS4_METAL_MAX_EXPERT_USED * 3];
     double start_ms;
 } ds4_gpu_stream_expert_pending_load;
 
@@ -10605,7 +10607,7 @@ static int ds4_gpu_stream_expert_pending_load_profile_enabled(void) {
 static void ds4_gpu_stream_expert_pending_load_release_buffers(
         ds4_gpu_stream_expert_pending_load *p) {
     if (!p) return;
-    for (uint32_t i = 0; i < 6; i++) {
+    for (uint32_t i = 0; i < DS4_METAL_MAX_EXPERT_USED; i++) {
         p->gate_bufs[i] = nil;
         p->up_bufs[i] = nil;
         p->down_bufs[i] = nil;
@@ -10617,7 +10619,7 @@ static void ds4_gpu_stream_expert_pending_load_release_buffers(
 
 static int ds4_gpu_stream_expert_pending_load_install(
         ds4_gpu_stream_expert_pending_load *p,
-        ds4_gpu_stream_expert_cache_entry *entries[6],
+        ds4_gpu_stream_expert_cache_entry *entries[DS4_METAL_MAX_EXPERT_USED],
         double elapsed_ms) {
     if (!p || p->n_loads == 0) return 1;
 
@@ -10640,9 +10642,7 @@ static int ds4_gpu_stream_expert_pending_load_install(
         [p->down_bufs[load_i] didModifyRange:NSMakeRange(p->down_inners[load_i], (NSUInteger)p->down_expert_bytes)];
     }
 
-    ds4_gpu_stream_expert_cache_entry *loaded_entries[6] = {
-        NULL, NULL, NULL, NULL, NULL, NULL
-    };
+    ds4_gpu_stream_expert_cache_entry *loaded_entries[DS4_METAL_MAX_EXPERT_USED] = { NULL };
     for (uint32_t load_i = 0; load_i < p->n_loads; load_i++) {
         const uint32_t slot = p->load_slots[load_i];
         const uint32_t expert = (uint32_t)p->selected_ids[slot];
@@ -10690,7 +10690,7 @@ static int ds4_gpu_stream_expert_pending_load_install(
 }
 
 static int ds4_gpu_stream_expert_pending_load_finish(
-        ds4_gpu_stream_expert_cache_entry *entries[6]) {
+        ds4_gpu_stream_expert_cache_entry *entries[DS4_METAL_MAX_EXPERT_USED]) {
     ds4_gpu_stream_expert_pending_load *p = &g_stream_expert_pending_load;
     if (!p->active) return 1;
 
@@ -10724,7 +10724,7 @@ static int ds4_gpu_stream_expert_pending_load_matches(
         const void   *model_map,
         uint64_t      model_size,
         uint32_t      layer,
-        const int32_t selected_ids[6],
+        const int32_t selected_ids[DS4_METAL_MAX_EXPERT_USED],
         uint32_t      n_total_expert,
         uint32_t      n_selected,
         uint64_t      gate_expert_bytes,
@@ -10767,7 +10767,7 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
     if (!model_map || !selected_ids ||
         layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
         n_selected == 0 ||
-        n_selected > 6 ||
+        n_selected > DS4_METAL_MAX_EXPERT_USED ||
         n_total_expert == 0 ||
         n_total_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ||
         !ds4_gpu_stream_expert_cache_note_expert_size(gate_expert_bytes,
@@ -10803,7 +10803,7 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
     p->n_tasks = 0;
     p->gate_expert_bytes = gate_expert_bytes;
     p->down_expert_bytes = down_expert_bytes;
-    for (uint32_t i = 0; i < 6; i++) {
+    for (uint32_t i = 0; i < DS4_METAL_MAX_EXPERT_USED; i++) {
         p->selected_ids[i] = -1;
         p->load_slots[i] = 0;
         p->source_slots[i] = UINT32_MAX;
@@ -10987,16 +10987,16 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing(
         const void    *model_map,
         uint64_t       model_size,
         uint32_t       layer,
-        const int32_t  selected_ids[6],
+        const int32_t  selected_ids[DS4_METAL_MAX_EXPERT_USED],
         uint32_t       n_total_expert,
         uint32_t       n_selected,
-        const uint64_t gate_abs_offsets[6],
-        const uint64_t up_abs_offsets[6],
-        const uint64_t down_abs_offsets[6],
+        const uint64_t gate_abs_offsets[DS4_METAL_MAX_EXPERT_USED],
+        const uint64_t up_abs_offsets[DS4_METAL_MAX_EXPERT_USED],
+        const uint64_t down_abs_offsets[DS4_METAL_MAX_EXPERT_USED],
         uint64_t       gate_expert_bytes,
         uint64_t       down_expert_bytes,
         uint32_t       missing_mask,
-        ds4_gpu_stream_expert_cache_entry *entries[6]) {
+        ds4_gpu_stream_expert_cache_entry *entries[DS4_METAL_MAX_EXPERT_USED]) {
     if (!g_ssd_streaming_mode ||
         !model_map ||
         !selected_ids ||
@@ -11006,7 +11006,7 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing(
         !entries ||
         layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
         n_selected == 0 ||
-        n_selected > 6 ||
+        n_selected > DS4_METAL_MAX_EXPERT_USED ||
         n_total_expert == 0 ||
         n_total_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ||
         !ds4_gpu_stream_expert_cache_note_expert_size(gate_expert_bytes,
@@ -11045,11 +11045,11 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing(
     double load_modify_ms = 0.0;
     double load_install_ms = 0.0;
 
-    uint32_t load_slots[6] = { 0, 0, 0, 0, 0, 0 };
-    uint32_t source_slots[6] = {
-        UINT32_MAX, UINT32_MAX, UINT32_MAX,
-        UINT32_MAX, UINT32_MAX, UINT32_MAX
-    };
+    uint32_t load_slots[DS4_METAL_MAX_EXPERT_USED] = { 0 };
+    uint32_t source_slots[DS4_METAL_MAX_EXPERT_USED];
+    for (uint32_t i = 0; i < DS4_METAL_MAX_EXPERT_USED; i++) {
+        source_slots[i] = UINT32_MAX;
+    }
     uint32_t n_loads = 0;
     for (uint32_t i = 0; i < n_selected; i++) {
         if ((missing_mask & (1u << i)) == 0) continue;
@@ -11094,13 +11094,13 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing(
         return 1;
     }
 
-    __strong id<MTLBuffer> gate_bufs[6] = { nil, nil, nil, nil, nil, nil };
-    __strong id<MTLBuffer> up_bufs[6] = { nil, nil, nil, nil, nil, nil };
-    __strong id<MTLBuffer> down_bufs[6] = { nil, nil, nil, nil, nil, nil };
-    NSUInteger gate_inners[6] = { 0, 0, 0, 0, 0, 0 };
-    NSUInteger up_inners[6] = { 0, 0, 0, 0, 0, 0 };
-    NSUInteger down_inners[6] = { 0, 0, 0, 0, 0, 0 };
-    ds4_gpu_stream_expert_pread_task tasks[18];
+    __strong id<MTLBuffer> gate_bufs[DS4_METAL_MAX_EXPERT_USED] = { nil };
+    __strong id<MTLBuffer> up_bufs[DS4_METAL_MAX_EXPERT_USED] = { nil };
+    __strong id<MTLBuffer> down_bufs[DS4_METAL_MAX_EXPERT_USED] = { nil };
+    NSUInteger gate_inners[DS4_METAL_MAX_EXPERT_USED] = { 0 };
+    NSUInteger up_inners[DS4_METAL_MAX_EXPERT_USED] = { 0 };
+    NSUInteger down_inners[DS4_METAL_MAX_EXPERT_USED] = { 0 };
+    ds4_gpu_stream_expert_pread_task tasks[DS4_METAL_MAX_EXPERT_USED * 3];
     memset(tasks, 0, sizeof(tasks));
     uint32_t n_tasks = 0;
     const uint32_t cache_budget =
@@ -11292,7 +11292,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
         n_tokens == 0 ||
         n_selected == 0 ||
-        n_selected > 6 ||
+        n_selected > DS4_METAL_MAX_EXPERT_USED ||
         n_total_expert == 0 ||
         n_total_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ||
         gate_expert_bytes == 0 ||
@@ -11488,7 +11488,7 @@ int ds4_gpu_stream_expert_cache_seed_selected(
     if (!model_map || !selected_ids ||
         layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
         n_selected == 0 ||
-        n_selected > 6 ||
+        n_selected > DS4_METAL_MAX_EXPERT_USED ||
         n_total_expert == 0 ||
         n_total_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ||
         !ds4_gpu_stream_expert_cache_note_expert_size(gate_expert_bytes,
@@ -11585,17 +11585,18 @@ int ds4_gpu_stream_expert_cache_seed_experts(
     uint32_t remaining = n_experts;
     while (remaining != 0) {
         const uint32_t batch =
-            remaining > 6u ? 6u : remaining;
+            remaining > DS4_METAL_MAX_EXPERT_USED ? DS4_METAL_MAX_EXPERT_USED : remaining;
         remaining -= batch;
 
-        int32_t selected_ids[6] = { -1, -1, -1, -1, -1, -1 };
-        uint64_t gate_abs_offsets[6] = { 0, 0, 0, 0, 0, 0 };
-        uint64_t up_abs_offsets[6] = { 0, 0, 0, 0, 0, 0 };
-        uint64_t down_abs_offsets[6] = { 0, 0, 0, 0, 0, 0 };
-        ds4_gpu_stream_expert_cache_entry *entries[6] = {
-            NULL, NULL, NULL, NULL, NULL, NULL
-        };
+        int32_t selected_ids[DS4_METAL_MAX_EXPERT_USED];
+        uint64_t gate_abs_offsets[DS4_METAL_MAX_EXPERT_USED] = { 0 };
+        uint64_t up_abs_offsets[DS4_METAL_MAX_EXPERT_USED] = { 0 };
+        uint64_t down_abs_offsets[DS4_METAL_MAX_EXPERT_USED] = { 0 };
+        ds4_gpu_stream_expert_cache_entry *entries[DS4_METAL_MAX_EXPERT_USED] = { NULL };
         uint32_t missing_mask = 0;
+        for (uint32_t i = 0; i < DS4_METAL_MAX_EXPERT_USED; i++) {
+            selected_ids[i] = -1;
+        }
 
         for (uint32_t i = 0; i < batch; i++) {
             const int32_t expert = expert_ids[remaining + i];
@@ -11676,7 +11677,7 @@ int ds4_gpu_stream_expert_cache_seed_experts(
         }
     }
 
-    const uint32_t protect_n = n_experts < 6u ? n_experts : 6u;
+    const uint32_t protect_n = n_experts < DS4_METAL_MAX_EXPERT_USED ? n_experts : DS4_METAL_MAX_EXPERT_USED;
     ds4_gpu_stream_expert_cache_prune_layer(layer,
                                             n_total_expert,
                                             1,
@@ -23430,7 +23431,6 @@ int ds4_gpu_routed_moe_one_tensor(
                 g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline != nil &&
                 g_moe_mul_mv_addr_q2_k_sum6_pipeline != nil;
             use_stream_expert_cache =
-                n_expert == 6 &&
                 !use_iq2_full_expert_addr_table &&
                 (use_iq2_selected_slots || use_q4_selected_slots) &&
                 stream_expert_cache_size_known &&
