@@ -736,9 +736,13 @@ tool calls are mapped back to OpenAI tool calls.
 
 `/v1/responses` accepts OpenAI Responses-style `input`, `instructions`,
 `tools`, `tool_choice`, `max_output_tokens`, `temperature`, `top_p`, `stream`,
-and `reasoning`. It is the preferred endpoint for Codex CLI. The server keeps
-Responses continuations bound to live state when possible, and can fall back to
-the same DSML rendering and KV prefix reuse used by chat completions.
+`previous_response_id`, and `reasoning`. It is the preferred endpoint for Codex
+CLI. The server keeps Responses continuations bound to live state when possible,
+and can fall back to the same DSML rendering and KV prefix reuse used by chat
+completions. `previous_response_id` is supported for the live in-memory
+continuation case: if the referenced response is no longer the current live KV
+frontier, the server returns `409` and the client should replay the full input
+history.
 
 `/v1/messages` is the Anthropic-compatible endpoint used by Claude Code style
 clients. It accepts `system`, `messages`, `tools`, `tool_choice`, `max_tokens`,
