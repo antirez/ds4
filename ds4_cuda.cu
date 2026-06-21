@@ -2476,6 +2476,18 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                    "tensor copy");
 }
 
+extern "C" int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                               const ds4_gpu_tensor *src, uint64_t src_offset,
+                                               uint64_t count) {
+    (void)dst;
+    (void)dst_offset;
+    (void)src;
+    (void)src_offset;
+    (void)count;
+    return 0;
+}
+
+
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
@@ -9633,6 +9645,86 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
     }
     return cuda_ok(cudaGetLastError(), "router_select launch");
 }
+extern "C" int ds4_gpu_glm_router_select_batch_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                bias_offset,
+        bool                    has_bias,
+        const ds4_gpu_tensor *logits,
+        const ds4_gpu_tensor *tokens,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        float                   expert_weight_scale,
+        uint32_t                n_tokens) {
+    (void)selected;
+    (void)weights;
+    (void)probs;
+    (void)model_map;
+    (void)model_size;
+    (void)bias_offset;
+    (void)has_bias;
+    (void)logits;
+    (void)tokens;
+    (void)n_expert;
+    (void)n_expert_used;
+    (void)expert_weight_scale;
+    (void)n_tokens;
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_kv_norm_copy_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                kv_lora,
+        uint32_t                qk_rope,
+        uint32_t                rows,
+        float                   eps) {
+    (void)out;
+    (void)x;
+    (void)model_map;
+    (void)model_size;
+    (void)weight_offset;
+    (void)kv_lora;
+    (void)qk_rope;
+    (void)rows;
+    (void)eps;
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_mla_attention_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *kv_b,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                raw_cap,
+        uint32_t                n_head,
+        uint32_t                qk_nope,
+        uint32_t                qk_rope,
+        uint32_t                kv_lora,
+        uint32_t                v_head) {
+    (void)heads;
+    (void)q;
+    (void)raw_kv;
+    (void)kv_b;
+    (void)n_tokens;
+    (void)pos0;
+    (void)raw_cap;
+    (void)n_head;
+    (void)qk_nope;
+    (void)qk_rope;
+    (void)kv_lora;
+    (void)v_head;
+    return 0;
+}
+
 
 __device__ static float dev_f16_to_f32(uint16_t v) {
     return __half2float(*reinterpret_cast<const __half *>(&v));

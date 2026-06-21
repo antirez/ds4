@@ -584,9 +584,6 @@ static void db_close(st_db *db) {
     memset(db, 0, sizeof(*db));
 }
 
-static bool db_has(const st_db *db, const char *name) {
-    return hmap_get(&db->weight_map, name) >= 0;
-}
 
 static tensor_entry *db_tensor(st_db *db, const char *name, shard **shard_out) {
     pthread_mutex_lock(&db->lock);
@@ -723,35 +720,6 @@ static float *dequant_fp8_weight(const st_value *w, const st_value *scale, int64
     return out;
 }
 
-static float *dequant_fp4_weight(const st_value *w, const st_value *scale, int64_t *n_out) {
-    static const float fp4_table[16] = {
-        0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
-        0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
-    };
-    if (strcmp(w->dtype, "I8") != 0 || strcmp(scale->dtype, "F8_E8M0") != 0) die("bad FP4 weight/scale dtype");
-    if (w->n_dims != 2 || scale->n_dims != 2) die("FP4 tensor must be 2D");
-    const int64_t out_dim = w->shape[0];
-    const int64_t packed_in = w->shape[1];
-    const int64_t in_dim = packed_in * 2;
-    if (in_dim % 32) die("FP4 in_dim is not divisible by 32");
-    const int64_t n_blocks = in_dim / 32;
-    if (scale->shape[0] != out_dim || scale->shape[1] != n_blocks) die("FP4 scale shape mismatch");
-    float *out = xmalloc((size_t)out_dim * (size_t)in_dim * sizeof(float));
-    for (int64_t r = 0; r < out_dim; r++) {
-        for (int64_t b = 0; b < n_blocks; b++) {
-            const float s = e8m0_to_f32(scale->data[(size_t)r * (size_t)n_blocks + (size_t)b]);
-            const size_t wbase = ((size_t)r * (size_t)n_blocks + (size_t)b) * 16;
-            const size_t obase = (size_t)r * (size_t)in_dim + (size_t)b * 32;
-            for (int64_t j = 0; j < 16; j++) {
-                const uint8_t q = w->data[wbase + (size_t)j];
-                out[obase + (size_t)(2*j + 0)] = fp4_table[q & 0x0f] * s;
-                out[obase + (size_t)(2*j + 1)] = fp4_table[(q >> 4) & 0x0f] * s;
-            }
-        }
-    }
-    if (n_out) *n_out = out_dim * in_dim;
-    return out;
-}
 
 /* =====
  * Imatrix
@@ -1184,8 +1152,13 @@ static byte_buf generate_regular(st_db *db, const char *gguf_name, const tensor_
         if (!str_ends(hf_name, ".weight")) die("FP8 tensor without .weight suffix");
         /* GLM pairs F8_E4M3 weights with "<name>.weight_scale_inv" (F32 block
          * scales), whereas DeepSeek used "<name>.scale" of e8m0 values. */
-        char *scale_name = xstrdup(hf_name);
-        strcpy(scale_name + strlen(hf_name) - strlen("weight"), "weight_scale_inv");
+        const char weight_suffix[] = "weight";
+        const char scale_suffix[] = "weight_scale_inv";
+        const size_t hf_len = strlen(hf_name);
+        const size_t base_len = hf_len - (sizeof(weight_suffix) - 1);
+        char *scale_name = xmalloc(base_len + sizeof(scale_suffix));
+        memcpy(scale_name, hf_name, base_len);
+        memcpy(scale_name + base_len, scale_suffix, sizeof(scale_suffix));
         st_value w = db_read(db, hf_name);
         st_value s = db_read(db, scale_name);
         f32 = dequant_fp8_weight(&w, &s, &n);

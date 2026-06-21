@@ -6,6 +6,8 @@
 /ds4_native
 /ds4_server_test
 /ds4_test
+/ds4_agent_test
+/gguf-tools/glm-quantize
 /ds4flash.gguf
 /TODO.md
 /gguf/

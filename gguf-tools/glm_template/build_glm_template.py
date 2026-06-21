@@ -14,6 +14,7 @@ import json
 import struct
 import sys
 import os
+import numpy as np
 
 try:
     import gguf
