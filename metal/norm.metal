@@ -158,3 +158,57 @@ kernel void kernel_dsv4_qkv_rms_norm_f32_4(
         y[i] = (x[i] * scale) * w[i];
     }
 }
+
+struct ds4_metal_args_glm_kv_norm_copy {
+    uint32_t kv_lora;
+    uint32_t qk_rope;
+    uint32_t rows;
+    float    eps;
+};
+
+kernel void kernel_glm_kv_norm_copy_f32(
+        constant ds4_metal_args_glm_kv_norm_copy & args,
+        device const float *src,
+        device const float *weight,
+        device       float *dst,
+        threadgroup float *shmem_f32 [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    const uint row = tgpig.x;
+    const uint tid = tpitg.x;
+    const ushort simd_lane = tiisg;
+    const ushort simd_group = sgitg;
+    if (row >= args.rows) return;
+    if (simd_group == 0) shmem_f32[simd_lane] = 0.0f;
+
+    const uint64_t src_stride = (uint64_t)args.kv_lora + args.qk_rope;
+    device const float *x = src + (uint64_t)row * src_stride;
+    device       float *y = dst + (uint64_t)row * src_stride;
+
+    float sumf = 0.0f;
+    for (uint i = tid; i < args.kv_lora; i += ntg.x) {
+        const float v = x[i];
+        sumf += v * v;
+    }
+    sumf = simd_sum(sumf);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane == 0) shmem_f32[simd_group] = sumf;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sumf = shmem_f32[simd_lane];
+    sumf = simd_sum(sumf);
+
+#ifdef DS4_METAL_NORM_RSQRT_DISABLE
+    const float scale = 1.0f / sqrt(sumf / float(args.kv_lora) + args.eps);
+#else
+    const float scale = rsqrt(sumf / float(args.kv_lora) + args.eps);
+#endif
+    for (uint i = tid; i < args.kv_lora; i += ntg.x) {
+        y[i] = x[i] * scale * weight[i];
+    }
+    for (uint i = tid; i < args.qk_rope; i += ntg.x) {
+        y[args.kv_lora + i] = x[args.kv_lora + i];
+    }
+}
