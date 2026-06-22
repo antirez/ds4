@@ -99,9 +99,12 @@ little; HC2+ costs the same and gains nothing.
 ## Streaming, not snapshot
 
 Compression goes through a `funopen`/`fopencookie` wrapper around
-`ds4_session_save_payload` / `load_payload`.  Peak extra RAM during
-a save is `2 * threads * chunk_size` (~256 MiB at the defaults),
-independent of context length — the worker never holds the full
-1–16 GiB uncompressed buffer.
+`ds4_session_save_payload` / `load_payload`.  Each worker holds three
+chunk-sized buffers — raw, byte-4 shuffle scratch, and the LZ4 output
+(`LZ4_compressBound(chunk_size)`, ~= chunk_size) — so peak extra RAM
+during a save is `~3 * threads * chunk_size` (~384 MiB at the defaults),
+independent of context length; the worker never holds the full
+1–16 GiB uncompressed buffer.  The reader allocates the same three
+buffers per worker.
 
 Engine APIs in `ds4.h` are unchanged.
