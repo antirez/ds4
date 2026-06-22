@@ -244,4 +244,26 @@ FILE *kv_lz4_reader_open(FILE *in, uint64_t payload_bytes,
                          uint32_t chunk_size, int n_workers,
                          uint64_t *uncompressed_total_out);
 
+/* Write the payload region for `staged` into `fp`, which must be positioned at
+ * the payload start.  n_workers == 0 writes a raw payload; >=1 wraps it in the
+ * LZ4 codec.  On success sets *codec_out, *chunk_log2_out, and *on_disk_out
+ * (payload bytes written, excluding any trailer) for the header patch-back.
+ * Returns true on success; save_err carries the reason on failure. */
+bool ds4_kvstore_write_payload_region(FILE *fp,
+                                      const ds4_session_payload_file *staged,
+                                      int n_workers, uint32_t chunk_bytes,
+                                      uint8_t *codec_out, uint8_t *chunk_log2_out,
+                                      uint64_t *on_disk_out,
+                                      char *save_err, size_t save_err_len);
+
+/* Load the payload region from `fp`, positioned at the payload start, into
+ * `session`.  codec, payload_bytes, and chunk_size come from the file header.
+ * Always leaves `fp` positioned just past the payload region (independent of
+ * codec or stdio read-ahead) so a trailing record loads at the right offset.
+ * Returns 0 on success; load_err carries the reason on failure. */
+int ds4_kvstore_load_payload_region(ds4_session *session, FILE *fp,
+                                    uint8_t codec, uint64_t payload_bytes,
+                                    uint32_t chunk_size, int n_workers,
+                                    char *load_err, size_t load_err_len);
+
 #endif

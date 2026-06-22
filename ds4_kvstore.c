@@ -830,6 +830,72 @@ fail:
     return NULL;
 }
 
+bool ds4_kvstore_write_payload_region(FILE *fp,
+                                      const ds4_session_payload_file *staged,
+                                      int n_workers, uint32_t chunk_bytes,
+                                      uint8_t *codec_out, uint8_t *chunk_log2_out,
+                                      uint64_t *on_disk_out,
+                                      char *save_err, size_t save_err_len) {
+    uint8_t codec = DS4_KVSTORE_CODEC_NONE;
+    uint64_t on_disk = 0;
+    bool ok = true;
+    const off_t payload_start = ftello(fp);
+    if (payload_start < 0) {
+        ok = false;
+    } else if (n_workers == 0) {
+        ok = ds4_session_write_staged_payload(staged, fp, save_err, save_err_len) == 0;
+    } else {
+        FILE *cw = kv_lz4_writer_open(fp, chunk_bytes, n_workers);
+        if (!cw) {
+            ok = false;
+        } else {
+            ok = ds4_session_write_staged_payload(staged, cw, save_err, save_err_len) == 0;
+            /* fclose on the cookie patches the framing header in fp and does
+             * NOT close fp. */
+            if (fclose(cw) != 0) ok = false;
+            if (ok) codec = DS4_KVSTORE_CODEC_LZ4;
+        }
+    }
+    const off_t payload_end = ftello(fp);
+    if (ok && payload_end < 0) ok = false;
+    if (ok) on_disk = (uint64_t)(payload_end - payload_start);
+    *codec_out = codec;
+    *chunk_log2_out = (codec == DS4_KVSTORE_CODEC_LZ4) ? kv_chunk_log2(chunk_bytes) : 0;
+    *on_disk_out = on_disk;
+    return ok;
+}
+
+int ds4_kvstore_load_payload_region(ds4_session *session, FILE *fp,
+                                    uint8_t codec, uint64_t payload_bytes,
+                                    uint32_t chunk_size, int n_workers,
+                                    char *load_err, size_t load_err_len) {
+    const off_t payload_start = ftello(fp);
+    int rc;
+    if (codec == DS4_KVSTORE_CODEC_LZ4) {
+        /* The engine reads UNCOMPRESSED bytes from cr and requires the
+         * remaining budget to be exactly the uncompressed payload size, so the
+         * reader peeks the framing header eagerly to learn that total. */
+        uint64_t uncompressed_total = 0;
+        FILE *cr = kv_lz4_reader_open(fp, payload_bytes, chunk_size,
+                                      n_workers > 0 ? n_workers : 1,
+                                      &uncompressed_total);
+        if (!cr) {
+            snprintf(load_err, load_err_len, "failed to open lz4 reader");
+            return 1;
+        }
+        rc = ds4_session_load_payload(session, cr, uncompressed_total,
+                                      load_err, load_err_len);
+        fclose(cr);
+    } else {
+        rc = ds4_session_load_payload(session, fp, payload_bytes,
+                                      load_err, load_err_len);
+    }
+    if (payload_start >= 0) {
+        (void)fseeko(fp, payload_start + (off_t)payload_bytes, SEEK_SET);
+    }
+    return rc;
+}
+
 ds4_kvstore_options ds4_kvstore_default_options(void) {
     return (ds4_kvstore_options){
         .min_tokens = KV_CACHE_DEFAULT_MIN_TOKENS,
@@ -1787,33 +1853,15 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     const int n_workers = kc->opt.compression_threads;
     const uint32_t chunk_bytes = DS4_KVSTORE_DEFAULT_CHUNK_BYTES;
     uint8_t codec = DS4_KVSTORE_CODEC_NONE;
+    uint8_t chunk_log2 = 0;
     uint64_t on_disk_payload = 0;
     bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
               fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
               fwrite(text, 1, text_len, fp) == text_len;
     if (ok) {
-        const off_t payload_start = ftello(fp);
-        if (payload_start < 0) {
-            ok = false;
-        } else if (n_workers == 0) {
-            ok = ds4_session_write_staged_payload(&staged, fp,
-                                                  save_err, sizeof(save_err)) == 0;
-        } else {
-            FILE *cw = kv_lz4_writer_open(fp, chunk_bytes, n_workers);
-            if (!cw) {
-                ok = false;
-            } else {
-                ok = ds4_session_write_staged_payload(&staged, cw,
-                                                      save_err, sizeof(save_err)) == 0;
-                /* fclose on the cookie patches the framing header in fp and
-                 * does NOT close fp. */
-                if (fclose(cw) != 0) ok = false;
-                if (ok) codec = DS4_KVSTORE_CODEC_LZ4;
-            }
-        }
-        const off_t payload_end = ftello(fp);
-        if (ok && payload_end < 0) ok = false;
-        if (ok) on_disk_payload = (uint64_t)(payload_end - payload_start);
+        ok = ds4_kvstore_write_payload_region(fp, &staged, n_workers, chunk_bytes,
+                                              &codec, &chunk_log2, &on_disk_payload,
+                                              save_err, sizeof(save_err));
     }
     if (ok) {
         ok = kv_trailer_write(hooks, fp, text, &trailer_bytes) &&
@@ -1823,8 +1871,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         uint8_t patched[DS4_KVSTORE_FIXED_HEADER];
         ds4_kvstore_fill_header(patched, (uint8_t)model_id, (uint8_t)quant_bits,
                                 reason_code, ext_flags,
-                                codec,
-                                codec == DS4_KVSTORE_CODEC_LZ4 ? kv_chunk_log2(chunk_bytes) : 0,
+                                codec, chunk_log2,
                                 (uint32_t)store_tokens.len, 0,
                                 (uint32_t)ds4_session_ctx(session),
                                 now, now, on_disk_payload);
@@ -2037,34 +2084,10 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     int loaded = 0;
     int load_rc = 1;
     if (header_ok) {
-        if (hdr.codec == DS4_KVSTORE_CODEC_LZ4) {
-            const off_t payload_start = ftello(fp);
-            /* The engine reads UNCOMPRESSED bytes from cr and requires the
-             * "remaining" budget to be exactly the uncompressed payload size
-             * (it errors on both shortfall and trailing bytes).  Have the
-             * reader peek the framing header eagerly so we know the
-             * uncompressed total before handing the wrapper to the engine. */
-            uint64_t uncompressed_total = 0;
-            FILE *cr = kv_lz4_reader_open(fp, hdr.payload_bytes, hdr.chunk_size,
-                                          kc->opt.compression_threads > 0 ? kc->opt.compression_threads : 1,
-                                          &uncompressed_total);
-            if (!cr) {
-                load_rc = 1;
-                snprintf(err, sizeof(err), "failed to open lz4 reader");
-            } else {
-                load_rc = ds4_session_load_payload(session, cr, uncompressed_total,
-                                                   err, sizeof(err));
-                fclose(cr);
-                /* Skip the outer fp past the payload region so the trailer
-                 * load lands at the right place. */
-                if (payload_start >= 0) {
-                    (void)fseeko(fp, payload_start + (off_t)hdr.payload_bytes, SEEK_SET);
-                }
-            }
-        } else {
-            load_rc = ds4_session_load_payload(session, fp, hdr.payload_bytes,
-                                               err, sizeof(err));
-        }
+        load_rc = ds4_kvstore_load_payload_region(session, fp, hdr.codec,
+                                                  hdr.payload_bytes, hdr.chunk_size,
+                                                  kc->opt.compression_threads,
+                                                  err, sizeof(err));
     }
     if (load_rc == 0) {
         const ds4_tokens *loaded_tokens = ds4_session_tokens(session);
