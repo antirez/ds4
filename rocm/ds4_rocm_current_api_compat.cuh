@@ -174,6 +174,10 @@ extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
     g_stream_expert_cache_budget = experts;
 }
 
+extern "C" void ds4_gpu_stream_set_selected_force_contiguous(int enabled) {
+    g_stream_selected_force_contiguous = enabled ? 1 : 0;
+}
+
 extern "C" void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
     (void)bytes;
 }
@@ -322,15 +326,121 @@ extern "C" int ds4_gpu_stream_expert_cache_release_layer_cache(void) {
     return 1;
 }
 
+/*
+ * Popularity-based cache warm-up.  Bulk-load the most popular experts of one
+ * layer into the resident cache via large sequential file reads, which are far
+ * cheaper than the scattered per-expert random reads that otherwise happen lazily
+ * on first-touch during decode.  Best-effort: any per-expert failure just leaves
+ * that expert to be streamed on demand later, so this always reports success.
+ */
 extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *expert_ids,
         const uint32_t                    *expert_priorities,
         uint32_t                           n_experts) {
-    (void)table;
-    (void)expert_ids;
     (void)expert_priorities;
-    (void)n_experts;
+    if (!g_ssd_streaming_mode || !table || !expert_ids || n_experts == 0) return 1;
+
+    const void *model_map = table->model_map;
+    const uint64_t model_size = table->model_size;
+    const uint32_t layer = table->layer;
+    const uint32_t n_total_expert = table->n_total_expert;
+    const uint64_t gate_offset = table->gate_offset;
+    const uint64_t up_offset = table->up_offset;
+    const uint64_t down_offset = table->down_offset;
+    const uint64_t gate_expert_bytes = table->gate_expert_bytes;
+    const uint64_t down_expert_bytes = table->down_expert_bytes;
+    if (n_total_expert == 0 || gate_expert_bytes == 0 || down_expert_bytes == 0) {
+        return 1;
+    }
+    /* Only the file-backed streaming path benefits from a bulk warm-up. */
+    const int use_fd = g_model_fd >= 0 &&
+        (g_model_fd_host_base == NULL || model_map == g_model_fd_host_base);
+    if (!use_fd || !cuda_stream_selected_ensure_stream()) return 1;
+
+    cuda_stream_read_job *jobs = (cuda_stream_read_job *)calloc(
+            DS4_ROCM_STREAM_READ_MAX_JOBS, sizeof(jobs[0]));
+    if (!jobs) return 1;
+    uint32_t job_count = 0;
+
+    for (uint32_t i = 0; i < n_experts; i++) {
+        /* Stop once the configured cache is full; let warm decode misses
+         * compete for the remaining slots through the normal LRU path. */
+        if (g_stream_expert_cache_budget != 0 &&
+            g_stream_resident_experts.size() >= g_stream_expert_cache_budget) {
+            break;
+        }
+        const int32_t expert_id = expert_ids[i];
+        if (expert_id < 0 || (uint32_t)expert_id >= n_total_expert) continue;
+        if (cuda_stream_resident_find(model_map, layer, expert_id,
+                                      gate_offset, up_offset, down_offset,
+                                      gate_expert_bytes, down_expert_bytes) >= 0) {
+            continue;
+        }
+
+        const uint64_t expert = (uint64_t)(uint32_t)expert_id;
+        uint64_t gate_rel = 0;
+        uint64_t down_rel = 0;
+        if (!cuda_u64_mul_checked(expert, gate_expert_bytes, &gate_rel) ||
+            !cuda_u64_mul_checked(expert, down_expert_bytes, &down_rel) ||
+            gate_offset > model_size ||
+            up_offset > model_size ||
+            down_offset > model_size ||
+            gate_rel > model_size - gate_offset ||
+            gate_rel > model_size - up_offset ||
+            down_rel > model_size - down_offset ||
+            gate_expert_bytes > model_size - gate_offset - gate_rel ||
+            gate_expert_bytes > model_size - up_offset - gate_rel ||
+            down_expert_bytes > model_size - down_offset - down_rel) {
+            continue;
+        }
+
+        const int idx = cuda_stream_resident_alloc(model_map, layer, expert_id,
+                                                   expert_ids, n_experts,
+                                                   gate_offset, up_offset, down_offset,
+                                                   gate_expert_bytes, down_expert_bytes);
+        if (idx < 0) break;  /* out of cache budget or device memory */
+        cuda_stream_resident_expert &entry = g_stream_resident_experts[(size_t)idx];
+
+        if (job_count + 3u > DS4_ROCM_STREAM_READ_MAX_JOBS) {
+            const int flushed =
+                cuda_stream_read_jobs_parallel(jobs, job_count) &&
+                cuda_stream_selected_upload_read_jobs(jobs, job_count);
+            cuda_stream_read_jobs_free(jobs, job_count);
+            job_count = 0;
+            if (!flushed) {
+                /* Unfilled resident entries would later be served as cache hits
+                 * with garbage data; drop the resident cache so it refills
+                 * correctly on demand. */
+                cuda_stream_resident_cache_release();
+                free(jobs);
+                return 1;
+            }
+        }
+        jobs[job_count++] = {entry.gate, gate_offset + gate_rel, gate_expert_bytes,
+                             NULL, NULL, 0, 0, 0};
+        jobs[job_count++] = {entry.up, up_offset + gate_rel, gate_expert_bytes,
+                             NULL, NULL, 0, 0, 0};
+        jobs[job_count++] = {entry.down, down_offset + down_rel, down_expert_bytes,
+                             NULL, NULL, 0, 0, 0};
+    }
+
+    if (job_count != 0) {
+        const int flushed =
+            cuda_stream_read_jobs_parallel(jobs, job_count) &&
+            cuda_stream_selected_upload_read_jobs(jobs, job_count);
+        cuda_stream_read_jobs_free(jobs, job_count);
+        if (!flushed) {
+            cuda_stream_resident_cache_release();
+            free(jobs);
+            return 1;
+        }
+    }
+    if (cuda_stream_cache_stats_on()) {
+        g_stream_cache_stats.seed_calls++;
+        g_stream_cache_stats.seed_unique += n_experts;
+    }
+    free(jobs);
     return 1;
 }
 

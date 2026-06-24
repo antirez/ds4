@@ -253,6 +253,14 @@ static cuda_stream_cache_stats g_stream_cache_stats;
 static int g_stream_cache_stats_enabled = -1;
 static int32_t g_routed_moe_selected_override[DS4_ROCM_N_EXPERT_USED];
 static uint32_t g_routed_moe_selected_override_n;
+/*
+ * When set, the single-token selected-expert loader always materializes a full
+ * contiguous compact expert buffer instead of deferring a mixed
+ * resident/missing set to the async split path.  The split decode kernels only
+ * exist for the IQ2_XXS/Q2_K quant pair, so Q4_K experts must use the
+ * contiguous path that feeds the standard Q4_K matmul.
+ */
+static int g_stream_selected_force_contiguous;
 static uint64_t g_stream_selected_stage_counter;
 static cudaEvent_t g_stream_selected_reuse_event;
 static int g_stream_selected_reuse_event_pending;
@@ -3057,7 +3065,8 @@ static int cuda_stream_selected_load(
         }
     }
 
-    if (use_fd && read_job_count != 0 && resident_mask != 0) {
+    if (use_fd && read_job_count != 0 && resident_mask != 0 &&
+        !g_stream_selected_force_contiguous) {
         g_stream_selected_pending.active = 1;
         g_stream_selected_pending.model_map = model_map;
         g_stream_selected_pending.layer = layer;
