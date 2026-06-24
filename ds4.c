@@ -11697,18 +11697,40 @@ static bool rocm_graph_stream_prefill_full_layer_enabled(
         const ds4_gpu_graph      *g,
         const ds4_layer_weights  *layer,
         uint32_t                  n_tokens) {
-    return g &&
-           g->ssd_streaming &&
-           !g->quality &&
-           layer &&
-           n_tokens >= DS4_ROCM_STREAM_PREFILL_FULL_LAYER_MIN_TOKENS &&
-           DS4_N_EXPERT_USED == 6 &&
-           layer->ffn_gate_exps &&
-           layer->ffn_up_exps &&
-           layer->ffn_down_exps &&
-           layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
-           layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
-           layer->ffn_down_exps->type == DS4_TENSOR_Q2_K;
+    if (!g ||
+        !g->ssd_streaming ||
+        g->quality ||
+        !layer ||
+        DS4_N_EXPERT_USED != 6 ||
+        !layer->ffn_gate_exps ||
+        !layer->ffn_up_exps ||
+        !layer->ffn_down_exps) {
+        return false;
+    }
+    const bool iq2_experts =
+        layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q2_K;
+    /*
+     * Q4_K routed experts have no batched selected-expert streaming kernels
+     * (those exist only for the IQ2_XXS gate / Q2_K down quant pair).  The
+     * full-layer load path is quant-agnostic: it stages the whole layer's
+     * expert table into a contiguous buffer and runs the standard matmul, which
+     * already supports Q4_K.  It is therefore the only multi-token streaming
+     * route for Q4_K, so enable it for any multi-token prefill.  IQ2 keeps the
+     * higher token threshold because its selected-expert path streams shorter
+     * prefills more cheaply.
+     */
+    const bool q4k_experts =
+        layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
+        layer->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q4_K;
+    if (!iq2_experts && !q4k_experts) {
+        return false;
+    }
+    const uint32_t min_tokens =
+        q4k_experts ? 2u : DS4_ROCM_STREAM_PREFILL_FULL_LAYER_MIN_TOKENS;
+    return n_tokens >= min_tokens;
 }
 
 static uint32_t rocm_graph_stream_prefill_full_layer_seed_tokens(void) {
@@ -13610,6 +13632,33 @@ static bool metal_graph_use_q4_selected_shared_overlap(void) {
     static int cache = -1;
     return metal_graph_env_flag("DS4_METAL_Q4_SELECTED_OVERLAP_SHARED", &cache);
 }
+
+#ifdef DS4_ROCM_BUILD
+/*
+ * ROCm has no batched/split decode kernels for Q4_K routed experts (those exist
+ * only for the IQ2_XXS/Q2_K pair).  Route Q4_K streaming decode through the same
+ * shared-overlap selected-load path IQ2 uses; the loader is quant-agnostic and,
+ * combined with the force-contiguous selected cache, feeds the standard Q4_K
+ * decode matmul.  This is what makes Q4_K usable under SSD streaming on ROCm.
+ */
+static bool metal_graph_use_rocm_q4_selected_shared_overlap(
+        const ds4_gpu_graph     *g,
+        const ds4_layer_weights *layer) {
+    return g &&
+           g->ssd_streaming &&
+           !g->quality &&
+           layer &&
+           layer->ffn_gate_exps &&
+           layer->ffn_up_exps &&
+           layer->ffn_down_exps &&
+           layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
+           layer->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
+           layer->ffn_down_exps->type == DS4_TENSOR_Q4_K &&
+           DS4_N_EXPERT_USED == 6 &&
+           DS4_N_EXPERT >= 128 &&
+           getenv("DS4_ROCM_DISABLE_Q4_SELECTED_SHARED_OVERLAP") == NULL;
+}
+#endif
 
 static bool metal_graph_use_cuda_selected_shared_overlap(const ds4_gpu_graph *g) {
 #if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
@@ -15615,6 +15664,18 @@ static bool metal_graph_encode_decode_layer(
     const bool cuda_selected_shared_overlap =
         metal_graph_use_cuda_selected_shared_overlap(g) &&
         metal_graph_decode_cuda_selected_slots_expected(g, layer);
+#ifdef DS4_ROCM_BUILD
+    const bool rocm_q4_selected_shared_overlap =
+        metal_graph_use_rocm_q4_selected_shared_overlap(g, layer);
+    /*
+     * Q4_K has no split decode kernel on ROCm, so force the selected-expert
+     * loader to build a full contiguous compact buffer for these layers.
+     */
+    ds4_gpu_stream_set_selected_force_contiguous(
+        rocm_q4_selected_shared_overlap ? 1 : 0);
+#else
+    const bool rocm_q4_selected_shared_overlap = false;
+#endif
     const bool overlap_selected_shared =
         ok &&
         !decode_stage_profile &&
@@ -15623,12 +15684,14 @@ static bool metal_graph_encode_decode_layer(
         getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL &&
         (q4_selected_shared_overlap ||
          iq2_selected_shared_overlap ||
-         cuda_selected_shared_overlap);
+         cuda_selected_shared_overlap ||
+         rocm_q4_selected_shared_overlap);
     const bool async_selected_load =
         overlap_selected_shared &&
         ((iq2_selected_shared_overlap &&
           metal_graph_use_iq2_selected_async_load(g)) ||
-         cuda_selected_shared_overlap);
+         cuda_selected_shared_overlap ||
+         rocm_q4_selected_shared_overlap);
     const bool selected_readahead_shared_delay =
         ok &&
         !overlap_selected_shared &&
@@ -19567,6 +19630,30 @@ static bool metal_graph_use_streaming_decode_prefill_range(
     return metal_graph_use_streaming_decode_prefill(g, weights, n_tokens);
 }
 
+/* True when a layer's routed experts use a quant that the streaming
+ * selected-expert cache can serve (IQ2_XXS/Q2_K everywhere; Q4_K on ROCm). */
+static bool metal_graph_decode_streaming_selected_slots_expected(
+        const ds4_gpu_graph     *g,
+        const ds4_layer_weights *layer) {
+    if (metal_graph_decode_iq2_selected_slots_expected(g, layer)) return true;
+#ifdef DS4_ROCM_BUILD
+    if (layer && layer->ffn_gate_exps && layer->ffn_down_exps &&
+        metal_graph_decode_q4_selected_slots_expected(
+                g,
+                layer,
+                layer->ffn_gate_exps->bytes,
+                layer->ffn_down_exps->bytes)) {
+        return true;
+    }
+#endif
+    return false;
+}
+
+static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
+        ds4_gpu_graph     *g,
+        const ds4_model   *model,
+        const ds4_weights *weights);
+
 static bool metal_graph_prefill_decode_streaming_range(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -19588,6 +19675,16 @@ static bool metal_graph_prefill_decode_streaming_range(
         n_tokens > (uint32_t)prompt->len - start) return false;
     if (start == 0) {
         ds4_gpu_stream_expert_cache_reset_route_hotness();
+        /*
+         * Warm the routed-expert cache with the popularity hotlist before the
+         * decode-style prefill loads experts one token at a time.  The layer-major
+         * prefill path does this at its tail, but the short-prompt decode path
+         * otherwise starts cold; a bulk sequential warm-up is far cheaper than the
+         * scattered first-touch reads it replaces.  Idempotent across turns.
+         */
+        if (!metal_graph_seed_streaming_expert_cache_from_hotlist(g, model, weights)) {
+            return false;
+        }
     }
 
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL;
@@ -19710,7 +19807,7 @@ static bool metal_graph_seed_streaming_expert_cache_from_prefill(
     uint32_t seeded_rows = 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *layer = &weights->layer[il];
-        if (!metal_graph_decode_iq2_selected_slots_expected(g, layer)) continue;
+        if (!metal_graph_decode_streaming_selected_slots_expected(g, layer)) continue;
 
         const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
         const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
@@ -19762,7 +19859,7 @@ static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
     uint32_t cache_budget = 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *layer = &weights->layer[il];
-        if (!metal_graph_decode_iq2_selected_slots_expected(g, layer)) continue;
+        if (!metal_graph_decode_streaming_selected_slots_expected(g, layer)) continue;
 
         const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
         const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
@@ -19835,7 +19932,7 @@ static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
         const uint32_t n = counts[il];
         if (n == 0) continue;
         const ds4_layer_weights *layer = &weights->layer[il];
-        if (!metal_graph_decode_iq2_selected_slots_expected(g, layer)) continue;
+        if (!metal_graph_decode_streaming_selected_slots_expected(g, layer)) continue;
 
         const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
         const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
