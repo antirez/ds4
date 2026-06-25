@@ -917,6 +917,10 @@ static bool server_model_alias_known(const char *id) {
             !strcmp(id, "deepseek-v4-pro"));
 }
 
+static bool server_model_name_valid(const char *name) {
+    return name && name[0] && strchr(name, '/') == NULL;
+}
+
 static void stop_list_clear(stop_list *stops) {
     for (int i = 0; i < stops->len; i++) free(stops->v[i]);
     stops->len = 0;
@@ -7714,6 +7718,7 @@ struct server {
     ds4_engine *engine;
     ds4_session *session;
     int default_tokens;
+    const char *served_model_name;
     kv_disk_cache kv;
     tool_memory tool_mem;
     live_tool_state responses_live;
@@ -7734,6 +7739,11 @@ struct server {
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
 };
+
+static bool server_model_id_advertised(const server *s, const char *id) {
+    if (s->served_model_name) return id && !strcmp(id, s->served_model_name);
+    return server_model_alias_known(id);
+}
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
  * after the response has been written, so request data and the socket remain
@@ -11206,6 +11216,19 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
         max_completion);
 }
 
+static void append_model_list_json_values(buf *b, const char *served_model_name,
+                                          const char *name, int ctx, int default_tokens) {
+    buf_puts(b, "{\"object\":\"list\",\"data\":[");
+    if (served_model_name) {
+        append_model_json_values(b, served_model_name, name, ctx, default_tokens);
+    } else {
+        append_model_json_values(b, "deepseek-v4-flash", name, ctx, default_tokens);
+        buf_putc(b, ',');
+        append_model_json_values(b, "deepseek-v4-pro", name, ctx, default_tokens);
+    }
+    buf_puts(b, "]}\n");
+}
+
 static void append_model_json(buf *b, const server *s, const char *id) {
     append_model_json_values(b,
                              id,
@@ -11225,11 +11248,10 @@ static bool send_model(server *s, int fd, const char *id) {
 
 static bool send_models(server *s, int fd) {
     buf b = {0};
-    buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    append_model_json(&b, s, "deepseek-v4-flash");
-    buf_putc(&b, ',');
-    append_model_json(&b, s, "deepseek-v4-pro");
-    buf_puts(&b, "]}\n");
+    append_model_list_json_values(&b, s->served_model_name,
+                                  ds4_engine_model_name(s->engine),
+                                  ds4_session_ctx(s->session),
+                                  s->default_tokens);
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
@@ -11271,7 +11293,7 @@ static void *client_main(void *arg) {
     const size_t model_path_prefix_len = strlen(model_path_prefix);
     if (!strcmp(hr.method, "GET") &&
         !strncmp(hr.path, model_path_prefix, model_path_prefix_len) &&
-        server_model_alias_known(hr.path + model_path_prefix_len))
+        server_model_id_advertised(s, hr.path + model_path_prefix_len))
     {
         send_model(s, fd, hr.path + model_path_prefix_len);
         http_request_free(&hr);
@@ -11393,6 +11415,7 @@ typedef struct {
     int port;
     int ctx_size;
     int default_tokens;
+    const char *served_model_name;
     const char *chdir_path;
     const char *trace_path;
     const char *kv_disk_dir;
@@ -11564,6 +11587,14 @@ static server_config parse_options(int argc, char **argv) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.default_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--served-model-name")) {
+            const char *name = need_arg(&i, argc, argv, arg);
+            if (!server_model_name_valid(name)) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --served-model-name must be non-empty and cannot contain '/'");
+                exit(2);
+            }
+            c.served_model_name = name;
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.engine.n_threads = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--chdir")) {
@@ -11737,6 +11768,7 @@ int main(int argc, char **argv) {
     s.engine = engine;
     s.session = session;
     s.default_tokens = cfg.default_tokens;
+    s.served_model_name = cfg.served_model_name;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
@@ -14627,6 +14659,36 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 }
 
+static void test_served_model_name_configuration(void) {
+    TEST_ASSERT(server_model_name_valid("ds4-flash"));
+    TEST_ASSERT(!server_model_name_valid(""));
+    TEST_ASSERT(!server_model_name_valid("local/ds4-flash"));
+
+    server s = {0};
+    TEST_ASSERT(server_model_id_advertised(&s, "deepseek-v4-flash"));
+    TEST_ASSERT(server_model_id_advertised(&s, "deepseek-v4-pro"));
+    TEST_ASSERT(!server_model_id_advertised(&s, "ds4-flash"));
+
+    s.served_model_name = "ds4-flash";
+    TEST_ASSERT(server_model_id_advertised(&s, "ds4-flash"));
+    TEST_ASSERT(!server_model_id_advertised(&s, "deepseek-v4-flash"));
+    TEST_ASSERT(!server_model_id_advertised(&s, "deepseek-v4-pro"));
+}
+
+static void test_served_model_name_metadata_list(void) {
+    buf b = {0};
+    append_model_list_json_values(&b, NULL, "DeepSeek V4 Flash", 32768, 393216);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"") != NULL);
+    buf_free(&b);
+
+    append_model_list_json_values(&b, "ds4-flash", "DeepSeek V4 Flash", 32768, 393216);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"ds4-flash\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") == NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"") == NULL);
+    buf_free(&b);
+}
+
 static void test_client_socket_nonblocking_flag(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -15834,6 +15896,8 @@ static void ds4_server_unit_tests_run(void) {
     test_json_parser_handles_tool_heavy_requests();
     test_json_string_handles_surrogates();
     test_model_metadata_clamps_completion_to_context();
+    test_served_model_name_configuration();
+    test_served_model_name_metadata_list();
     test_client_socket_nonblocking_flag();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_remember_gate();
