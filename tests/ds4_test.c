@@ -60,19 +60,15 @@ static void test_restore_env(const char *name, char *saved) {
 
 typedef struct {
     char *cold_decode;
-    char *batch_selected_addr;
 } test_streaming_prefill_env;
 
 static test_streaming_prefill_env test_force_canonical_streaming_prefill(void) {
     test_streaming_prefill_env saved = {
         .cold_decode =
             test_save_env("DS4_METAL_DISABLE_STREAMING_COLD_DECODE_PREFILL"),
-        .batch_selected_addr =
-            test_save_env("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR"),
     };
     if (test_env_bool("DS4_TEST_SSD_STREAMING")) {
         setenv("DS4_METAL_DISABLE_STREAMING_COLD_DECODE_PREFILL", "1", 1);
-        setenv("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR", "1", 1);
     }
     return saved;
 }
@@ -81,8 +77,6 @@ static void test_restore_canonical_streaming_prefill(
         test_streaming_prefill_env saved) {
     test_restore_env("DS4_METAL_DISABLE_STREAMING_COLD_DECODE_PREFILL",
                      saved.cold_decode);
-    test_restore_env("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR",
-                     saved.batch_selected_addr);
 }
 
 static ds4_engine *test_open_engine(bool quality) {
@@ -996,6 +990,14 @@ static void test_metal_ssd_streaming_cache_pressure(void) {
         test_save_env("DS4_METAL_DISABLE_STREAMING_STATIC_DECODE_MAP");
     char *saved_one_stage =
         test_save_env("DS4_METAL_MOE_ONE_STAGE_PROFILE");
+    char *saved_disable_selected_addr =
+        test_save_env("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR");
+    char *saved_enable_selected_addr =
+        test_save_env("DS4_METAL_ENABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR");
+    char *saved_selected_addr_max =
+        test_save_env("DS4_METAL_STREAMING_PREFILL_BATCH_SELECTED_ADDR_MAX");
+    char *saved_selected_addr_min =
+        test_save_env("DS4_METAL_STREAMING_PREFILL_BATCH_SELECTED_ADDR_MIN");
 
     setenv("DS4_TEST_SSD_STREAMING", "1", 1);
     setenv("DS4_TEST_SSD_STREAMING_CACHE_GB", "16", 1);
@@ -1003,6 +1005,10 @@ static void test_metal_ssd_streaming_cache_pressure(void) {
     unsetenv("DS4_METAL_DISABLE_STREAMING_LAYER_BATCH");
     unsetenv("DS4_METAL_DISABLE_STREAMING_STATIC_DECODE_MAP");
     unsetenv("DS4_METAL_MOE_ONE_STAGE_PROFILE");
+    unsetenv("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR");
+    unsetenv("DS4_METAL_ENABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR");
+    unsetenv("DS4_METAL_STREAMING_PREFILL_BATCH_SELECTED_ADDR_MAX");
+    unsetenv("DS4_METAL_STREAMING_PREFILL_BATCH_SELECTED_ADDR_MIN");
 
     fprintf(stderr,
             "ds4-test: Metal SSD streaming cache-pressure repro "
@@ -1010,6 +1016,14 @@ static void test_metal_ssd_streaming_cache_pressure(void) {
     test_official_logprob_vectors_run("short_code_completion");
 
     test_restore_env("DS4_METAL_MOE_ONE_STAGE_PROFILE", saved_one_stage);
+    test_restore_env("DS4_METAL_STREAMING_PREFILL_BATCH_SELECTED_ADDR_MIN",
+                     saved_selected_addr_min);
+    test_restore_env("DS4_METAL_STREAMING_PREFILL_BATCH_SELECTED_ADDR_MAX",
+                     saved_selected_addr_max);
+    test_restore_env("DS4_METAL_ENABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR",
+                     saved_enable_selected_addr);
+    test_restore_env("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR",
+                     saved_disable_selected_addr);
     test_restore_env("DS4_METAL_DISABLE_STREAMING_STATIC_DECODE_MAP",
                      saved_disable_static_decode);
     test_restore_env("DS4_METAL_DISABLE_STREAMING_LAYER_BATCH",

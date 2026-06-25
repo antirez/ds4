@@ -11575,8 +11575,7 @@ static uint32_t metal_graph_stream_prefill_batch_selected_addr_auto_max(void) {
     if (DS4_MODEL_VARIANT == DS4_VARIANT_PRO ||
         DS4_MODEL_VARIANT == DS4_VARIANT_FLASH) return UINT32_MAX;
 #endif
-    if (DS4_MODEL_VARIANT == DS4_VARIANT_PRO) return 800u;
-    if (DS4_MODEL_VARIANT == DS4_VARIANT_FLASH) return 760u;
+    /* Keep Metal selected-address batch prefill opt-in until it is vector-clean. */
     return 0;
 }
 

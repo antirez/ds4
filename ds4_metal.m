@@ -8831,8 +8831,8 @@ static uint32_t ds4_gpu_stream_prefill_batch_selected_addr_auto_max(
             return (uint32_t)v;
         }
     }
-    if (n_total_expert == 384) return 800u;
-    if (n_total_expert == 256) return 760u;
+    (void)n_total_expert;
+    /* Keep Metal selected-address batch prefill opt-in until it is vector-clean. */
     return 0;
 }
 
