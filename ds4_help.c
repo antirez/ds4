@@ -303,6 +303,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     title(fp, c, "HTTP API");
     opt(fp, c, "--host HOST", "Bind address. Default: 127.0.0.1");
     opt(fp, c, "--port N", "Bind port. Default: 8000");
+    opt(fp, c, "--served-model-name NAME", "Override the model ID advertised by discovery endpoints.");
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
