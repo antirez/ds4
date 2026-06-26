@@ -26,6 +26,7 @@
 #define cudaGetDeviceProperties hipGetDeviceProperties
 #define cudaDevAttrPageableMemoryAccess hipDeviceAttributePageableMemoryAccess
 #define cudaDevAttrMaxSharedMemoryPerBlockOptin hipDeviceAttributeSharedMemPerBlockOptin
+#define cudaDevAttrIntegrated hipDeviceAttributeIntegrated
 #define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 #define cudaFuncSetAttribute(func, attr, value) hipFuncSetAttribute((const void *)(func), (attr), (value))
 #define cudaMemLocationTypeDevice hipMemLocationTypeDevice
