@@ -110,6 +110,8 @@ struct cuda_stream_resident_expert {
     char *down;
     uint64_t bytes;
     uint64_t last_used;
+    int host_mapped;   /* discrete-VRAM fallback: base/host point at a host-registered, mapped buffer */
+    void *host_base;   /* host buffer passed to cudaHostRegister (free/unregister on evict) */
 };
 
 struct cuda_stream_resident_key {
@@ -477,7 +479,14 @@ static void cuda_model_image_release_all(void) {
 
 static void cuda_stream_resident_cache_release(void) {
     for (cuda_stream_resident_expert &e : g_stream_resident_experts) {
-        if (e.base) (void)cudaFree(e.base);
+        if (e.host_mapped) {
+            if (e.host_base) {
+                (void)cudaHostUnregister(e.host_base);
+                free(e.host_base);
+            }
+        } else if (e.base) {
+            (void)cudaFree(e.base);
+        }
     }
     g_stream_resident_experts.clear();
     g_stream_resident_index.clear();
@@ -970,6 +979,16 @@ static int cuda_stream_resident_evict_one(
 }
 
 static uint64_t cuda_stream_resident_free_reserve_bytes(void) {
+    /* Tunable for discrete GPUs with tight VRAM (e.g. 48 GiB W7800), where the
+     * upstream 16 GiB floor over-constrains the routed-expert cache and causes
+     * uncached experts to hard-fail instead of fitting. Default keeps upstream
+     * behavior. */
+    const char *e = getenv("DS4_ROCM_STREAM_FREE_RESERVE_GIB");
+    if (e && *e) {
+        char *end = NULL;
+        double g = strtod(e, &end);  /* fractional GiB allowed, e.g. 0.5 */
+        if (end != e && g >= 0) return (uint64_t)(g * 1024.0 * 1024.0 * 1024.0);
+    }
     return 16ull * 1024ull * 1024ull * 1024ull;
 }
 
@@ -1021,33 +1040,82 @@ static int cuda_stream_resident_alloc(
     }
     bytes = gate_pair + down_expert_bytes;
 
-    if (!cuda_stream_resident_make_room(bytes, layer, selected_ids, n_selected)) {
+    int make_room_ok = cuda_stream_resident_make_room(bytes, layer, selected_ids, n_selected);
+    if (!make_room_ok) {
         fprintf(stderr,
                 DS4_GPU_LOG_PREFIX "streaming expert cache cannot keep %.2f MiB "
-                "for layer=%u expert=%d while preserving %.2f GiB free\n",
+                "for layer=%u expert=%d while preserving %.2f GiB free; trying host-mapped fallback\n",
                 (double)bytes / 1048576.0,
                 layer,
                 expert,
                 (double)cuda_stream_resident_free_reserve_bytes() / 1073741824.0);
-        return -1;
     }
 
     void *base = NULL;
-    cudaError_t err = cudaMalloc(&base, (size_t)bytes);
-    while (err != cudaSuccess && cuda_stream_resident_evict_one(layer, selected_ids, n_selected)) {
-        (void)cudaGetLastError();
-        err = cudaMalloc(&base, (size_t)bytes);
+    int host_mapped = 0;
+    void *host_base = NULL;
+    if (make_room_ok) {
+        cudaError_t err = cudaMalloc(&base, (size_t)bytes);
+        while (err != cudaSuccess && cuda_stream_resident_evict_one(layer, selected_ids, n_selected)) {
+            (void)cudaGetLastError();
+            err = cudaMalloc(&base, (size_t)bytes);
+        }
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+            base = NULL;
+        }
     }
-    if (err != cudaSuccess) {
-        fprintf(stderr,
-                DS4_GPU_LOG_PREFIX "streaming expert cache allocation failed "
-                "for layer=%u expert=%d (%.2f MiB): %s\n",
-                layer,
-                expert,
-                (double)bytes / 1048576.0,
-                cudaGetErrorString(err));
-        (void)cudaGetLastError();
-        return -1;
+
+    if (!base) {
+        const char *hm_env = getenv("DS4_ROCM_HOST_MAPPED_EXPERT_FALLBACK");
+        if (hm_env && strcmp(hm_env, "0") == 0) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "streaming expert cache allocation failed "
+                    "for layer=%u expert=%d (%.2f MiB): VRAM exhausted\n",
+                    layer,
+                    expert,
+                    (double)bytes / 1048576.0);
+            return -1;
+        }
+        /* Discrete-VRAM fallback: build a packed contiguous host copy of the
+         * expert (gate|up|down) and zero-copy map it into GPU address space over
+         * PCIe. Lets inference proceed (slower) instead of hard-failing when the
+         * routed-expert working set exceeds VRAM. */
+        void *hbuf = malloc((size_t)bytes);
+        if (hbuf) {
+            memcpy((char *)hbuf,
+                   (const char *)model_map + gate_offset,
+                   (size_t)gate_expert_bytes);
+            memcpy((char *)hbuf + gate_expert_bytes,
+                   (const char *)model_map + up_offset,
+                   (size_t)gate_expert_bytes);
+            memcpy((char *)hbuf + 2ull * gate_expert_bytes,
+                   (const char *)model_map + down_offset,
+                   (size_t)down_expert_bytes);
+            cudaError_t err = cudaHostRegister(hbuf, (size_t)bytes, cudaHostRegisterMapped);
+            if (err == cudaSuccess) {
+                void *d = NULL;
+                err = cudaHostGetDevicePointer(&d, hbuf, 0);
+                if (err == cudaSuccess && d) {
+                    base = (char *)d;
+                    host_mapped = 1;
+                    host_base = hbuf;
+                } else {
+                    (void)cudaHostUnregister(hbuf);
+                    (void)cudaGetLastError();
+                }
+            } else {
+                (void)cudaGetLastError();
+            }
+            if (!host_mapped) free(hbuf);
+        }
+        if (!base) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "streaming expert host-mapped fallback FAILED "
+                    "for layer=%u expert=%d (%.2f MiB)\n",
+                    layer, expert, (double)bytes / 1048576.0);
+            return -1;
+        }
     }
 
     cuda_stream_resident_expert e;
@@ -1066,6 +1134,8 @@ static int cuda_stream_resident_alloc(
     e.down = e.base + 2u * gate_expert_bytes;
     e.bytes = bytes;
     e.last_used = ++g_stream_resident_clock;
+    e.host_mapped = host_mapped;
+    e.host_base = host_base;
     g_stream_resident_experts.push_back(e);
     g_stream_resident_index[cuda_stream_resident_entry_key(e)] =
         g_stream_resident_experts.size() - 1u;
@@ -3551,6 +3621,14 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
 }
 
 static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
+    /* Honor DS4_CUDA_Q8_F16_CACHE_MB (0 disables the optional q8->f16 cache,
+     * freeing VRAM for routed-expert residency on tight discrete GPUs). */
+    const char *e = getenv("DS4_CUDA_Q8_F16_CACHE_MB");
+    if (e && *e) {
+        char *end = NULL;
+        long mb = strtol(e, &end, 10);
+        if (end != e && mb >= 0) return (uint64_t)mb * 1048576ull;
+    }
     return UINT64_MAX;
 }
 
@@ -4174,6 +4252,40 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     return (char *)dev;
 }
 
+/* Detect whether the active GPU is discrete (separate VRAM) or integrated
+ * (unified memory, e.g. Strix Halo APU).  On discrete GPUs, raw host pointers
+ * are accessible from kernels but traverse PCIe on every read; the
+ * cudaHostRegister mapping path is preferred.  On integrated GPUs, host memory
+ * is directly accessible and the raw pointer path is fine.
+ *
+ * DS4_ROCM_REGISTERED_WEIGHTS overrides auto-detection:
+ *   "1" = always treat as discrete (force registered path)
+ *   "0" = always treat as integrated (force raw host pointer path)
+ *
+ * When the attribute query fails (unsupported ROCm version, etc.) the function
+ * defaults to discrete, which is the safer choice: the registered path works on
+ * all GPUs, while the raw pointer path silently degrades performance on
+ * discrete cards. */
+static int cuda_device_is_discrete(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+
+    const char *env = getenv("DS4_ROCM_REGISTERED_WEIGHTS");
+    if (env && *env) {
+        cached = (strcmp(env, "0") == 0) ? 0 : 1;
+        return cached;
+    }
+
+    int integrated = 0;
+    if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, 0) == cudaSuccess) {
+        cached = integrated ? 0 : 1;
+    } else {
+        (void)cudaGetLastError();
+        cached = 1;
+    }
+    return cached;
+}
+
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
@@ -4183,11 +4295,13 @@ static const char *cuda_model_range_ptr_from_fd(
     if (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base) return NULL;
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
+        if (cuda_device_is_discrete()) return NULL;
         return cuda_model_ptr(model_map, offset);
     }
 
     char *dev = cuda_model_arena_alloc(bytes, what);
     if (!dev) {
+        if (cuda_device_is_discrete()) return NULL;
         return cuda_model_ptr(model_map, offset);
     }
     cudaError_t err = cudaSuccess;
