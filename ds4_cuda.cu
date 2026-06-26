@@ -1744,6 +1744,87 @@ static int cuda_model_copy_to_device_streamed(
     return 1;
 }
 
+/* Return -1 when this expert needs the general streamed-copy path. */
+static int cuda_model_copy_expert_to_device_streamed(
+        char *const dst[3],
+        const void *model_map,
+        uint64_t model_size,
+        const uint64_t offset[3],
+        const uint64_t bytes[3],
+        const char *const what[3]) {
+    if (g_model_fd < 0 ||
+        (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base)) {
+        return -1;
+    }
+
+    const uint64_t chunk = cuda_model_copy_chunk_bytes();
+    for (uint32_t i = 0; i < 3; i++) {
+        if (!dst[i] || offset[i] > model_size ||
+            bytes[i] == 0 || bytes[i] > model_size - offset[i] ||
+            bytes[i] > chunk) {
+            return -1;
+        }
+    }
+
+    const uint64_t stage_bytes =
+        chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
+    if (!cuda_stream_selected_stage_pool_alloc(stage_bytes)) return 0;
+
+    int enqueued = 0;
+    for (uint32_t i = 0; i < 3; i++) {
+        const char *payload = NULL;
+        if (!cuda_model_stage_read(g_stream_selected_stage[i],
+                                   g_stream_selected_stage_bytes,
+                                   offset[i], bytes[i], &payload)) {
+            fprintf(stderr,
+                    "ds4: CUDA streaming selected read failed for %s: %s\n",
+                    what[i], strerror(errno));
+            if (enqueued) {
+                (void)cudaStreamSynchronize(g_stream_selected_upload_stream);
+            }
+            return 0;
+        }
+        cudaError_t err = cudaMemcpyAsync(dst[i], payload, (size_t)bytes[i],
+                                          cudaMemcpyHostToDevice,
+                                          g_stream_selected_upload_stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA streaming selected copy failed for %s: %s\n",
+                    what[i], cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            if (enqueued) {
+                (void)cudaStreamSynchronize(g_stream_selected_upload_stream);
+            }
+            return 0;
+        }
+        enqueued = 1;
+        err = cudaEventRecord(g_stream_selected_stage_event[i],
+                              g_stream_selected_upload_stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA streaming selected staging record failed for %s: %s\n",
+                    what[i], cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            (void)cudaStreamSynchronize(g_stream_selected_upload_stream);
+            return 0;
+        }
+        cuda_model_drop_file_pages(offset[i], bytes[i]);
+        cuda_model_discard_source_pages(model_map, model_size,
+                                        offset[i], bytes[i]);
+    }
+
+    const cudaError_t err =
+        cudaStreamSynchronize(g_stream_selected_upload_stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA streaming selected expert upload sync failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return 1;
+}
+
 static uint64_t cuda_model_cache_limit_bytes(void) {
     uint64_t gb = 0;
     const char *env = getenv("DS4_CUDA_WEIGHT_CACHE_LIMIT_GB");
@@ -23037,21 +23118,36 @@ static int cuda_stream_selected_cache_begin_load(
             table->down_offset + expert * table->down_expert_bytes;
         const uint64_t gate_dst = (uint64_t)i * table->gate_expert_bytes;
         const uint64_t down_dst = (uint64_t)i * table->down_expert_bytes;
-        if (!cuda_model_copy_to_device_streamed(
-                    g_stream_selected_cache.gate_ptr + gate_dst,
-                    table->model_map, table->model_size,
-                    gate_src, table->gate_expert_bytes,
-                    "stream gate expert copy") ||
-            !cuda_model_copy_to_device_streamed(
-                    g_stream_selected_cache.up_ptr + gate_dst,
-                    table->model_map, table->model_size,
-                    up_src, table->gate_expert_bytes,
-                    "stream up expert copy") ||
-            !cuda_model_copy_to_device_streamed(
-                    g_stream_selected_cache.down_ptr + down_dst,
-                    table->model_map, table->model_size,
-                    down_src, table->down_expert_bytes,
-                    "stream down expert copy")) {
+        char *dst[3] = {
+            g_stream_selected_cache.gate_ptr + gate_dst,
+            g_stream_selected_cache.up_ptr + gate_dst,
+            g_stream_selected_cache.down_ptr + down_dst
+        };
+        const uint64_t src[3] = { gate_src, up_src, down_src };
+        const uint64_t bytes[3] = {
+            table->gate_expert_bytes,
+            table->gate_expert_bytes,
+            table->down_expert_bytes
+        };
+        const char *what[3] = {
+            "stream gate expert copy",
+            "stream up expert copy",
+            "stream down expert copy"
+        };
+        const int batched = cuda_model_copy_expert_to_device_streamed(
+                dst, table->model_map, table->model_size,
+                src, bytes, what);
+        if (batched == 0 ||
+            (batched < 0 &&
+             (!cuda_model_copy_to_device_streamed(
+                      dst[0], table->model_map, table->model_size,
+                      src[0], bytes[0], what[0]) ||
+              !cuda_model_copy_to_device_streamed(
+                      dst[1], table->model_map, table->model_size,
+                      src[1], bytes[1], what[1]) ||
+              !cuda_model_copy_to_device_streamed(
+                      dst[2], table->model_map, table->model_size,
+                      src[2], bytes[2], what[2])))) {
             cuda_stream_selected_cache_invalidate();
             return 0;
         }
