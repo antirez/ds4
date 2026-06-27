@@ -25590,8 +25590,15 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     uint32_t load_layer_end = opt->load_layer_end;
     bool load_output = opt->load_output;
     bool load_output_optional = false;
+    const bool distributed_reverse_coordinator_full_resident =
+        opt->distributed.role == DS4_DISTRIBUTED_COORDINATOR &&
+        opt->distributed.local_decode &&
+        opt->distributed.layers.set &&
+        opt->distributed.layers.has_output &&
+        opt->distributed.layers.start > 0u;
     if (opt->distributed.role != DS4_DISTRIBUTED_NONE &&
-        opt->distributed.layers.set)
+        opt->distributed.layers.set &&
+        !distributed_reverse_coordinator_full_resident)
     {
         load_slice = true;
         load_layer_start = opt->distributed.layers.start;
@@ -27151,6 +27158,18 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     }
     return 0;
 #endif
+}
+
+int ds4_session_eval_local_only(ds4_session *s, int token, char *err, size_t errlen) {
+    if (!s) {
+        if (errlen) snprintf(err, errlen, "invalid session");
+        return 1;
+    }
+    ds4_dist_session *saved = s->distributed;
+    s->distributed = NULL;
+    const int rc = ds4_session_eval_internal(s, token, true, err, errlen);
+    s->distributed = saved;
+    return rc;
 }
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {

@@ -1,6 +1,7 @@
 #define DS4_SERVER_TEST
 #define DS4_SERVER_TEST_NO_MAIN
 #include "../ds4_server.c"
+#include "ds4_distributed_test_internal.h"
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
 #include <math.h>
@@ -2176,6 +2177,241 @@ static void test_mtp_verify_depth(void) {
 }
 #endif
 
+static ds4_dist_options test_dist_options(
+        ds4_distributed_role role,
+        uint32_t start,
+        uint32_t end,
+        bool has_output) {
+    ds4_dist_options opt;
+    memset(&opt, 0, sizeof(opt));
+    opt.role = role;
+    opt.layers.start = start;
+    opt.layers.end = end;
+    opt.layers.has_output = has_output;
+    opt.layers.set = true;
+    if (role == DS4_DISTRIBUTED_COORDINATOR) {
+        opt.listen_host = "127.0.0.1";
+        opt.listen_port = 1234;
+    } else if (role == DS4_DISTRIBUTED_WORKER) {
+        opt.coordinator_host = "127.0.0.1";
+        opt.coordinator_port = 1234;
+    }
+    return opt;
+}
+
+static void test_dist_free_workers(ds4_dist_worker_entry *workers) {
+    while (workers) {
+        ds4_dist_worker_entry *next = workers->next;
+        free(workers);
+        workers = next;
+    }
+}
+
+static ds4_dist_worker_entry *test_dist_worker(
+        const char *host,
+        uint32_t port,
+        uint32_t quant_bits,
+        uint32_t layer_start,
+        uint32_t layer_end,
+        bool has_output,
+        bool has_hidden,
+        uint32_t ctx_size) {
+    ds4_dist_worker_entry *w = calloc(1, sizeof(*w));
+    TEST_ASSERT(w != NULL);
+    if (!w) return NULL;
+    w->fd = -1;
+    snprintf(w->peer_host, sizeof(w->peer_host), "%s",
+             host && host[0] ? host : "127.0.0.1");
+    snprintf(w->peer_port, sizeof(w->peer_port), "%u", port);
+    w->model_id = 1;
+    w->quant_bits = quant_bits;
+    w->layer_start = layer_start;
+    w->layer_end = layer_end;
+    w->has_output = has_output;
+    w->has_hidden = has_hidden;
+    w->ctx_size = ctx_size;
+    w->n_layers = 43;
+    w->listen_port = port;
+    return w;
+}
+
+static void test_distributed_topology_logic_group(void) {
+    char err[256];
+    int topology = -1;
+    ds4_engine_options engine_opt;
+
+    ds4_dist_options forward = test_dist_options(DS4_DISTRIBUTED_COORDINATOR, 0, 19, false);
+    TEST_ASSERT(ds4_dist_test_validate_coordinator_layers(&forward, 43, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_dist_test_infer_coordinator_topology(&forward, 43, &topology, err, sizeof(err)) == 0);
+    TEST_ASSERT(topology == 0);
+    memset(&engine_opt, 0, sizeof(engine_opt));
+    TEST_ASSERT(ds4_dist_prepare_engine_options(&forward, &engine_opt, err, sizeof(err)) == 0);
+    TEST_ASSERT(engine_opt.load_slice);
+    TEST_ASSERT(engine_opt.load_layer_start == 0u);
+    TEST_ASSERT(engine_opt.load_layer_end == 19u);
+    TEST_ASSERT(!engine_opt.load_output);
+
+    ds4_dist_options reverse = test_dist_options(DS4_DISTRIBUTED_COORDINATOR, 20, 0, true);
+    TEST_ASSERT(ds4_dist_test_validate_coordinator_layers(&reverse, 43, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_dist_test_infer_coordinator_topology(&reverse, 43, &topology, err, sizeof(err)) == 0);
+    TEST_ASSERT(topology == 1);
+    memset(&engine_opt, 0, sizeof(engine_opt));
+    TEST_ASSERT(ds4_dist_prepare_engine_options(&reverse, &engine_opt, err, sizeof(err)) == 0);
+    TEST_ASSERT(engine_opt.load_slice);
+    TEST_ASSERT(engine_opt.load_layer_start == 20u);
+    TEST_ASSERT(engine_opt.load_layer_end == UINT32_MAX);
+    TEST_ASSERT(engine_opt.load_output);
+    TEST_ASSERT(engine_opt.prefill_chunk == 0u);
+    TEST_ASSERT(engine_opt.distributed.prefill_chunk == 0u);
+
+    reverse.local_decode = true;
+    memset(&engine_opt, 0, sizeof(engine_opt));
+    TEST_ASSERT(ds4_dist_prepare_engine_options(&reverse, &engine_opt, err, sizeof(err)) == 0);
+    TEST_ASSERT(!engine_opt.load_slice);
+    TEST_ASSERT(!engine_opt.load_output);
+    TEST_ASSERT(engine_opt.prefill_chunk == 0u);
+    TEST_ASSERT(engine_opt.distributed.prefill_chunk == 0u);
+
+    ds4_dist_options reverse_partial = test_dist_options(DS4_DISTRIBUTED_COORDINATOR, 20, 42, false);
+    TEST_ASSERT(ds4_dist_test_validate_coordinator_layers(&reverse_partial, 43, err, sizeof(err)) != 0);
+
+    ds4_dist_options middle = test_dist_options(DS4_DISTRIBUTED_COORDINATOR, 5, 10, false);
+    TEST_ASSERT(ds4_dist_test_validate_coordinator_layers(&middle, 43, err, sizeof(err)) != 0);
+
+    ds4_dist_options worker = test_dist_options(DS4_DISTRIBUTED_WORKER, 0, 19, false);
+    memset(&engine_opt, 0, sizeof(engine_opt));
+    TEST_ASSERT(ds4_dist_prepare_engine_options(&worker, &engine_opt, err, sizeof(err)) == 0);
+    TEST_ASSERT(engine_opt.load_slice);
+    TEST_ASSERT(engine_opt.load_layer_start == 0u);
+    TEST_ASSERT(engine_opt.load_layer_end == 19u);
+
+    worker.local_decode = true;
+    memset(&engine_opt, 0, sizeof(engine_opt));
+    TEST_ASSERT(ds4_dist_prepare_engine_options(&worker, &engine_opt, err, sizeof(err)) != 0);
+
+    ds4_dist_coordinator_state state;
+    memset(&state, 0, sizeof(state));
+    state.n_layers = 43;
+    state.local_start = 0;
+    state.local_end = 19;
+    state.topology = DS4_DIST_TOPOLOGY_FORWARD;
+    state.local_can_output_head = true;
+    state.use_control_for_work = false;
+    pthread_mutex_init(&state.mu, NULL);
+    state.workers = test_dist_worker("127.0.0.1", 20001, 2, 20, 42, true, true, 1024);
+    ds4_dist_route_plan route = {0};
+    TEST_ASSERT(ds4_dist_test_build_route_plan(&state, &route, err, sizeof(err)));
+    TEST_ASSERT(route.count == 1);
+    TEST_ASSERT(route.entry[0].layer_start == 20);
+    TEST_ASSERT(route.entry[0].layer_end == 42);
+    TEST_ASSERT((route.entry[0].flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) != 0);
+    ds4_dist_test_route_plan_free(&route);
+    test_dist_free_workers(state.workers);
+    pthread_mutex_destroy(&state.mu);
+
+    memset(&state, 0, sizeof(state));
+    state.n_layers = 43;
+    state.local_start = 20;
+    state.local_end = 42;
+    state.topology = DS4_DIST_TOPOLOGY_REVERSE;
+    state.local_has_output = true;
+    state.local_can_output_head = true;
+    state.use_control_for_work = false;
+    pthread_mutex_init(&state.mu, NULL);
+    state.workers = test_dist_worker("127.0.0.1", 20011, 2, 0, 19, false, true, 1024);
+    memset(&route, 0, sizeof(route));
+    TEST_ASSERT(ds4_dist_test_build_route_plan(&state, &route, err, sizeof(err)));
+    TEST_ASSERT(route.count == 1);
+    TEST_ASSERT(route.entry[0].layer_start == 0);
+    TEST_ASSERT(route.entry[0].layer_end == 19);
+    TEST_ASSERT((route.entry[0].flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) == 0);
+
+    ds4_dist_session session;
+    memset(&session, 0, sizeof(session));
+    session.state.n_layers = 43;
+    session.state.local_start = 20;
+    session.state.local_end = 42;
+    session.plan = route;
+    ds4_dist_kv_route_owner owners[4];
+    uint32_t owner_count = ds4_dist_test_kv_route_owner_count(&session);
+    TEST_ASSERT(owner_count == 2);
+    TEST_ASSERT(ds4_dist_test_kv_route_build_owners(&session,
+                                                    owners,
+                                                    owner_count,
+                                                    err,
+                                                    sizeof(err)) == 0);
+    TEST_ASSERT(owner_count == 2);
+    TEST_ASSERT(!owners[0].is_local);
+    TEST_ASSERT(owners[0].layer_start == 0);
+    TEST_ASSERT(owners[0].layer_end == 19);
+    TEST_ASSERT(owners[1].is_local);
+    TEST_ASSERT(owners[1].layer_start == 20);
+    TEST_ASSERT(owners[1].layer_end == 42);
+    route.entry[0].layer_end = 18;
+    TEST_ASSERT(ds4_dist_test_kv_route_build_owners(&session,
+                                                    owners,
+                                                    owner_count,
+                                                    err,
+                                                    sizeof(err)) != 0);
+    route.entry[0].layer_end = 19;
+    ds4_dist_test_route_plan_free(&route);
+    test_dist_free_workers(state.workers);
+    pthread_mutex_destroy(&state.mu);
+
+    memset(&state, 0, sizeof(state));
+    state.n_layers = 43;
+    state.local_start = 20;
+    state.local_end = 42;
+    state.topology = DS4_DIST_TOPOLOGY_REVERSE;
+    state.local_has_output = true;
+    state.local_can_output_head = true;
+    state.use_control_for_work = false;
+    pthread_mutex_init(&state.mu, NULL);
+    state.workers = test_dist_worker("127.0.0.1", 20012, 2, 1, 19, false, true, 1024);
+    memset(&route, 0, sizeof(route));
+    TEST_ASSERT(!ds4_dist_test_build_route_plan(&state, &route, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "missing layer 0") != NULL);
+    test_dist_free_workers(state.workers);
+    pthread_mutex_destroy(&state.mu);
+
+    memset(&state, 0, sizeof(state));
+    state.n_layers = 43;
+    state.local_start = 21;
+    state.local_end = 42;
+    state.topology = DS4_DIST_TOPOLOGY_REVERSE;
+    state.local_has_output = true;
+    state.local_can_output_head = true;
+    state.use_control_for_work = false;
+    pthread_mutex_init(&state.mu, NULL);
+    state.workers = test_dist_worker("127.0.0.1", 20013, 2, 0, 21, false, true, 1024);
+    memset(&route, 0, sizeof(route));
+    err[0] = '\0';
+    TEST_ASSERT(!ds4_dist_test_build_route_plan(&state, &route, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "overlap coordinator local range 21:output") != NULL);
+    TEST_ASSERT(strstr(err, "layers 21:21") != NULL);
+    test_dist_free_workers(state.workers);
+    pthread_mutex_destroy(&state.mu);
+
+    memset(&state, 0, sizeof(state));
+    state.n_layers = 43;
+    state.local_start = 21;
+    state.local_end = 42;
+    state.topology = DS4_DIST_TOPOLOGY_REVERSE;
+    state.local_has_output = true;
+    state.local_can_output_head = true;
+    state.use_control_for_work = false;
+    pthread_mutex_init(&state.mu, NULL);
+    state.workers = test_dist_worker("127.0.0.1", 20014, 2, 0, 10, false, true, 1024);
+    state.workers->next = test_dist_worker("127.0.0.1", 20015, 2, 10, 20, false, true, 1024);
+    memset(&route, 0, sizeof(route));
+    err[0] = '\0';
+    TEST_ASSERT(!ds4_dist_test_build_route_plan(&state, &route, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "overlap worker") != NULL);
+    TEST_ASSERT(strstr(err, "layers 10:10") != NULL);
+    test_dist_free_workers(state.workers);
+    pthread_mutex_destroy(&state.mu);
+}
+
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
@@ -2203,6 +2439,7 @@ static const ds4_test_entry test_entries[] = {
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
 #endif
+    {"--distributed-topology-logic", "distributed-topology-logic", "distributed coordinator topology, route-planning, and KV-owner logic", test_distributed_topology_logic_group},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 

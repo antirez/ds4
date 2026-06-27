@@ -385,6 +385,40 @@ slow or metered links, `--layers 20:42` is also supported: the coordinator will
 load the output head and compute logits locally, trading extra coordinator work
 for smaller per-token replies.
 
+Reverse topology is also supported when the coordinator owns a final suffix
+through the output head. In that layout workers cover the lower layers,
+return hidden state upstream, and the coordinator runs the higher layers plus
+output locally. For example:
+
+```sh
+# Machine A: worker, owns lower layers.
+./ds4 \
+  -m gguf/DeepSeek-V4-Pro-Q4K-Layers00-30.gguf \
+  --role worker \
+  --layers 0:30 \
+  --coordinator 169.254.43.68 1234
+
+# Machine B: coordinator, owns the upper suffix and output.
+./ds4 \
+  -m gguf/DeepSeek-V4-Pro-Q4K-Layers-31-output.gguf \
+  --role coordinator \
+  --layers 31:output \
+  --listen 169.254.43.68 1234
+```
+
+Reverse `K:42` is intentionally unsupported. Reverse mode only supports
+`K:output`, because the coordinator must own the output head.
+
+You can also start the coordinator owning `K:output` layers with `--local-decode`.
+In that mode the route still does distributed prefill, but after prefill the worker
+pushes its KV shard to the coordinator, the coordinator finishes generation locally
+using full model residency. This hand-off keeps the distributed prefill speedup while
+moving decode back onto one machine and gaining decode speed.
+
+For example, using M5 Max 128GB as the coordinator with `--layers 22:output --local-decode`
+and running DGX Spark as a worker with `--layers 0:21` over 2.5GbE direct link provides
+`prefill: 602.78 t/s, generation: 30.10 t/s`.
+
 ### Network Link Comparison
 
 The table below shows the same two M5 Max hosts, the same 91 GB Flash quant,
@@ -468,21 +502,26 @@ control TCP connection open to the coordinator and send a `HELLO` with their
 model ID, model family, quant profile, layer slice, context capacity, and data
 port. The coordinator uses these registrations to build a route that covers all
 layers. Work then moves over low-latency TCP data connections: the coordinator
-computes the first slice, sends a `WORK` frame with session ID, token positions,
-rolling token-prefix hashes before and after the span, route information, and
-hidden-state payload, and each worker computes its slice. Middle workers can
-forward directly to the next worker. The final worker returns logits to the
-coordinator, or ACKs for non-final prefill chunks so the prefill pipeline can
-stay full. `RESULT` frames echo the request ID and the post-span hash. A worker
-status error is handled differently from a socket failure: KV/hash mismatch can
-be recovered by replaying the token history on the same route, while transport
-failure drops the route and waits for a replacement worker. For persistent KV,
-the coordinator opens worker data connections and sends snapshot save/load
-messages for each worker-owned layer range; the disk payload remains a single
-agent/server cache file. The protocol has no
-encryption or authentication, and is not release-stable yet; coordinator and
-workers should be built from the same commit and used on trusted machines and
-trusted networks.
+computes the local prefix first in forward topology, sends a `WORK` frame with
+session ID, token positions, rolling token-prefix hashes before and after the
+span, route information, and hidden-state payload, and each worker computes its
+slice. In reverse topology the first worker starts from layer 0 with token
+input only, returns hidden state upstream, and the coordinator finishes the
+higher layers plus output locally. Middle workers can forward directly to the
+next worker. The final worker returns logits in the usual forward path, or
+returns hidden state when the coordinator owns the output path. Forward
+non-final prefill chunks may use ACK-only replies so the prefill pipeline can
+stay full; reverse pipelined prefill returns hidden state for every chunk
+because the coordinator must finish each chunk locally. `RESULT` frames echo
+the request ID and the post-span hash. A worker status error is handled
+differently from a socket failure: KV/hash mismatch can be recovered by
+replaying the token history on the same route, while transport failure drops
+the route and waits for a replacement worker. For persistent KV, the
+coordinator opens worker data connections and sends snapshot save/load messages
+for each worker-owned layer range; the disk payload remains a single
+agent/server cache file. The protocol has no encryption or authentication, and
+is not release-stable yet; coordinator and workers should be built from the
+same commit and used on trusted machines and trusted networks.
 
 ## Reducing heat, power usage and fan noise
 

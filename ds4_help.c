@@ -167,7 +167,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "SSD streaming: routed expert cache as expert count or GiB, e.g. 32GB. Metal/ROCm default: 80% working set minus non-routed weights; CUDA default: backend fixed cache.");
     opt(fp, c, "--ssd-streaming-preload-experts N", "SSD streaming: upfront popularity preload count. Default: auto hot seed capped at 4096; use --ssd-streaming-cold to skip.");
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
-    opt(fp, c, "--prefill-chunk N", "Metal graph prefill chunk size. Default: auto (PRO long prompts use 8192; others use 4096).");
+    opt(fp, c, "--prefill-chunk N", "Metal graph prefill chunk size. Default: auto (reverse distributed coordinators use 2048; PRO long prompts use 8192; others use 4096).");
     if (full) {
         if (tool != DS4_HELP_BENCH) {
             opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");
@@ -214,12 +214,13 @@ static void print_steering(FILE *fp, const help_colors *c) {
 static void print_distributed(FILE *fp, const help_colors *c) {
     title(fp, c, "Distributed Inference");
     fputc('\n', fp);
-    para(fp, c, "Distributed mode runs one logical session across several machines by assigning contiguous model layer ranges to workers. Workers own their layer slice and KV-cache shard; the coordinator owns the prompt, sampling loop, and client/API flow. Start workers first, then start the coordinator. The coordinator waits for a complete route and streams hidden states through the workers.");
+    para(fp, c, "Distributed mode runs one logical session across several machines by assigning contiguous model layer ranges to workers. The coordinator may own either a leading prefix (0:K) or a final suffix through output (K:output). Workers own their layer slice and KV-cache shard; the coordinator owns the prompt, sampling loop, and client/API flow. Start workers first, then start the coordinator. Reverse K:42 is unsupported.");
     fputc('\n', fp);
     opt(fp, c, "--role ROLE", "Distributed role: coordinator or worker.");
-    opt(fp, c, "--layers A:B", "Inclusive layer slice, e.g. 0:20 or 21:output.");
+    opt(fp, c, "--layers A:B", "Inclusive layer slice, e.g. 0:20, 21:42, or 21:output.");
     opt(fp, c, "--listen HOST PORT", "Coordinator listen address; workers may use it for their data listener.");
     opt(fp, c, "--coordinator HOST PORT", "Coordinator address for --role worker.");
+    opt(fp, c, "--local-decode", "Coordinator-only opt-in for reverse N:output local decode with full local model residency.");
     opt(fp, c, "--dist-prefill-chunk N", "Coordinator prefill pipeline chunk size. Default: session cap.");
     opt(fp, c, "--dist-prefill-window N", "Max prefill chunks in flight. Default: workers+2, capped at 8.");
     opt(fp, c, "--dist-activation-bits N", "Hidden-state transport width: 32, 16, or 8. Default: 32");
