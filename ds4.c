@@ -10485,6 +10485,8 @@ typedef struct {
     uint32_t power_percent;
     double prefill_layer_avg_sec[DS4_MAX_LAYER];
     double decode_token_avg_sec;
+    double decode_power_warmup_fastest_sec;
+    uint32_t decode_power_warmup_tokens;
     uint32_t streaming_preload_experts;
     bool quality;
     bool ssd_streaming;
@@ -10525,9 +10527,33 @@ static void graph_power_note_prefill_layer(ds4_gpu_graph *g,
 }
 
 static void graph_power_note_decode_token(ds4_gpu_graph *g, double elapsed_sec) {
+    const uint32_t warmup_tokens = 5u;
+    const double outlier_mult = 4.0;
+
     if (!graph_power_throttle_enabled(g)) return;
+    if (elapsed_sec <= 0.0 || !isfinite(elapsed_sec)) return;
+
+    if (g->decode_power_warmup_tokens < warmup_tokens) {
+        if (g->decode_power_warmup_tokens == 0 ||
+            elapsed_sec < g->decode_power_warmup_fastest_sec) {
+            g->decode_power_warmup_fastest_sec = elapsed_sec;
+        }
+        g->decode_power_warmup_tokens++;
+        return;
+    }
+
+    double sample = elapsed_sec;
+    if (g->decode_token_avg_sec <= 0.0 || !isfinite(g->decode_token_avg_sec)) {
+        if (g->decode_power_warmup_fastest_sec < sample) {
+            sample = g->decode_power_warmup_fastest_sec;
+        }
+    } else {
+        const double cap = g->decode_token_avg_sec * outlier_mult;
+        if (sample > cap) sample = cap;
+    }
+
     g->decode_token_avg_sec =
-        graph_power_update_avg(g->decode_token_avg_sec, elapsed_sec);
+        graph_power_update_avg(g->decode_token_avg_sec, sample);
     graph_power_sleep(g->decode_token_avg_sec, g->power_percent);
 }
 
@@ -26158,7 +26184,12 @@ int ds4_session_set_power(ds4_session *s, int power_percent) {
     if (!s || !s->engine || power_percent < 1 || power_percent > 100) return 1;
     s->engine->power_percent = power_percent;
 #ifndef DS4_NO_GPU
-    if (!ds4_session_is_cpu(s)) s->graph.power_percent = (uint32_t)power_percent;
+    if (!ds4_session_is_cpu(s)) {
+        s->graph.power_percent = (uint32_t)power_percent;
+        s->graph.decode_token_avg_sec = 0.0;
+        s->graph.decode_power_warmup_fastest_sec = 0.0;
+        s->graph.decode_power_warmup_tokens = 0;
+    }
 #endif
     return 0;
 }
