@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DwarfStar Chat</title>
+<style>
+  :root { --bg: #1a1a1a; --surface: #252525; --border: #333; --text: #e0e0e0; --text-muted: #888; --accent: #4a9eff; --accent-hover: #6ab0ff; --user-msg: #2d3748; --assistant-msg: #262626; --thinking: #2a2a30; --code-bg: #1e1e1e; --font: -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font-family: var(--font); height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+  #header { background: var(--surface); padding: 10px 20px; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  #header h1 { font-size: 16px; font-weight: 600; }
+  #header .status { font-size: 12px; padding: 3px 8px; border-radius: 4px; background: #2d2d2d; }
+  #header .status.ok { background: #1e3a1e; color: #7ccf7c; }
+  #header .status.err { background: #3a1e1e; color: #cf7c7c; }
+  #header button { margin-left: auto; background: transparent; border: 1px solid var(--border); color: var(--text); padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  #header button:hover { background: var(--surface); border-color: var(--accent); }
+  #chat { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
+  .msg { display: flex; flex-direction: column; gap: 4px; max-width: 85%; padding: 10px 14px; border-radius: 10px; line-height: 1.5; font-size: 14px; white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user { background: var(--user-msg); align-self: flex-end; border-bottom-right-radius: 2px; }
+  .msg.assistant { background: var(--assistant-msg); align-self: flex-start; border-bottom-left-radius: 2px; }
+  .msg .name { font-size: 11px; font-weight: 600; color: var(--text-muted); margin-bottom: 4px; }
+  .thinking-block { background: var(--thinking); border-left: 3px solid #7c7c3c; padding: 8px 12px; border-radius: 4px; font-size: 13px; color: #b0b070; margin: 4px 0; white-space: pre-wrap; }
+  .msg pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px 14px; overflow-x: auto; font-size: 13px; margin: 6px 0; }
+  .msg code { background: var(--code-bg); padding: 2px 5px; border-radius: 3px; font-size: 13px; }
+  .msg p { margin: 4px 0; }
+  .msg ul, .msg ol { margin: 4px 0; padding-left: 20px; }
+  #input-area { background: var(--surface); padding: 12px 20px; display: flex; gap: 10px; border-top: 1px solid var(--border); flex-shrink: 0; }
+  #input-area textarea { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; color: var(--text); font-size: 14px; font-family: var(--font); resize: none; outline: none; max-height: 200px; }
+  #input-area textarea:focus { border-color: var(--accent); }
+  #input-area button { background: var(--accent); border: none; color: #fff; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 500; }
+  #input-area button:disabled { background: #444; cursor: default; }
+  #input-area button:hover:not(:disabled) { background: var(--accent-hover); }
+  .typing { align-self: flex-start; color: var(--text-muted); font-size: 13px; padding: 6px 12px; }
+  .error-msg { align-self: center; background: #3a1e1e; padding: 8px 16px; border-radius: 6px; color: #cf7c7c; font-size: 13px; }
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-thumb { background: #444; border-radius: 3px; }
+  @media (max-width: 600px) { .msg { max-width: 95%; } }
+</style>
+</head>
+<body>
+<div id="header">
+  <h1>DwarfStar</h1>
+  <span class="status" id="status-indicator">connecting...</span>
+  <button id="new-chat-btn">New Chat</button>
+</div>
+<div id="chat"></div>
+<div id="input-area">
+  <textarea id="input" rows="1" placeholder="Send a message..." autofocus></textarea>
+  <button id="send-btn" disabled>Send</button>
+</div>
+
+<script>
+(function(){
+  const BASE = 'http://127.0.0.1:8000';
+
+  const chatEl = document.getElementById('chat');
+  const inputEl = document.getElementById('input');
+  const sendBtn = document.getElementById('send-btn');
+  const statusEl = document.getElementById('status-indicator');
+  const newChatBtn = document.getElementById('new-chat-btn');
+
+  let messages = [];
+  let modelId = '';
+  let sending = false;
+  let abortCtrl = null;
+
+  // Auto-resize textarea
+  inputEl.addEventListener('input', function(){
+    this.style.height = 'auto';
+    this.style.height = Math.min(this.scrollHeight, 200) + 'px';
+  });
+
+  function setStatus(ok, text){
+    statusEl.className = 'status ' + (ok ? 'ok' : 'err');
+    statusEl.textContent = text;
+  }
+
+  // Fetch available models
+  async function init(){
+    try {
+      const res = await fetch(BASE + '/v1/models');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      if (data.data && data.data.length > 0) {
+        modelId = data.data[0].id || 'ds4flash.gguf';
+      } else {
+        modelId = 'ds4flash.gguf';
+      }
+      setStatus(true, 'connected');
+      sendBtn.disabled = false;
+    } catch (e) {
+      setStatus(false, 'offline');
+      sendBtn.disabled = true;
+    }
+  }
+  init();
+
+  function escapeHtml(s){
+    const div = document.createElement('div');
+    div.appendChild(document.createTextNode(s));
+    return div.innerHTML;
+  }
+
+  function renderMessage(msg){
+    const div = document.createElement('div');
+    div.className = 'msg ' + msg.role;
+    const nameEl = document.createElement('div');
+    nameEl.className = 'name';
+    nameEl.textContent = msg.role === 'user' ? 'You' : 'DwarfStar';
+    div.appendChild(nameEl);
+
+    if (msg.reasoning) {
+      const rb = document.createElement('div');
+      rb.className = 'thinking-block';
+      rb.textContent = msg.reasoning;
+      div.appendChild(rb);
+    }
+    if (msg.content) {
+      const md = document.createElement('div');
+      md.innerHTML = renderMarkdown(msg.content);
+      div.appendChild(md);
+    }
+    if (msg.tool_calls) {
+      for (const tc of msg.tool_calls) {
+        const el = document.createElement('div');
+        el.style.cssText = 'font-size:12px;color:var(--text-muted);padding:4px 0;';
+        el.textContent = '🔧 ' + tc.function.name + '(' + tc.function.arguments + ')';
+        div.appendChild(el);
+      }
+    }
+    return div;
+  }
+
+  function renderMarkdown(text){
+    let s = escapeHtml(text);
+    // code blocks ```...```
+    s = s.replace(/```(\w*)\n([\s\S]*?)```/g, function(m, lang, code){
+      return '<pre><code>' + escapeHtml(code) + '</code></pre>';
+    });
+    // inline code
+    s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
+    // bold
+    s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    // italic
+    s = s.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+    // newlines
+    s = s.replace(/\n/g, '<br>');
+    return s;
+  }
+
+  function addMessage(msg, isDelta){
+    if (isDelta && msg.content === null && msg.finish_reason === null) return;
+    const last = messages[messages.length - 1];
+    if (isDelta && last && last.role === msg.role && !last.finish_reason) {
+      // Append to existing message
+      if (msg.content) last.content += msg.content;
+      if (msg.finish_reason) last.finish_reason = msg.finish_reason;
+      // Update DOM
+      const items = chatEl.querySelectorAll('.msg');
+      if (items.length > 0) {
+        const target = items[items.length - 1];
+        if (target.classList.contains(msg.role)) {
+          // Re-render the last message
+          const newEl = renderMessage(last);
+          target.replaceWith(newEl);
+        }
+      }
+      scrollToBottom();
+      return;
+    }
+    messages.push(msg);
+    const el = renderMessage(msg);
+    chatEl.appendChild(el);
+    scrollToBottom();
+  }
+
+  function scrollToBottom(){
+    chatEl.scrollTop = chatEl.scrollHeight;
+  }
+
+  function addTyping(){
+    const div = document.createElement('div');
+    div.className = 'typing';
+    div.id = 'typing-indicator';
+    div.textContent = 'DwarfStar is thinking...';
+    chatEl.appendChild(div);
+    scrollToBottom();
+  }
+
+  function removeTyping(){
+    const t = document.getElementById('typing-indicator');
+    if (t) t.remove();
+  }
+
+  function showError(text){
+    removeTyping();
+    const div = document.createElement('div');
+    div.className = 'error-msg';
+    div.textContent = text;
+    chatEl.appendChild(div);
+    scrollToBottom();
+  }
+
+  async function sendMessage(){
+    if (sending) return;
+    const text = inputEl.value.trim();
+    if (!text) return;
+    inputEl.value = '';
+    inputEl.style.height = 'auto';
+    sending = true;
+    sendBtn.disabled = true;
+
+    // Add user message
+    const userMsg = { role: 'user', content: text };
+    addMessage(userMsg, false);
+
+    // Build request
+    const msgs = messages.map(m => ({
+      role: m.role === 'tool' ? 'function' : m.role,
+      content: m.content || ''
+    }));
+    // Remove last assistant msg from msgs array (it's being built incrementally)
+    if (msgs.length > 0 && msgs[msgs.length - 1].role === 'assistant') {
+      msgs.pop();
+    }
+    msgs.push({ role: 'user', content: text });
+
+    addTyping();
+
+    const assistantMsg = { role: 'assistant', content: '', reasoning: '', finish_reason: null };
+    // Don't add to messages yet; will be added on first delta
+
+    abortCtrl = new AbortController();
+    let firstDelta = true;
+
+    try {
+      const body = JSON.stringify({
+        model: modelId || 'ds4flash.gguf',
+        messages: msgs,
+        stream: true,
+        temperature: 0.7,
+        max_tokens: 4096
+      });
+
+      const res = await fetch(BASE + '/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: body,
+        signal: abortCtrl.signal
+      });
+
+      if (!res.ok) {
+        let errText = 'HTTP ' + res.status;
+        try {
+          const e = await res.json();
+          errText = e.error?.message || errText;
+        } catch(_){}
+        showError('Server error: ' + errText);
+        sending = false;
+        sendBtn.disabled = false;
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+
+        const lines = buf.split('\n');
+        buf = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const payload = line.slice(6).trim();
+          if (payload === '[DONE]') break;
+
+          try {
+            const parsed = JSON.parse(payload);
+            const delta = parsed.choices?.[0]?.delta || {};
+            const finish = parsed.choices?.[0]?.finish_reason || null;
+
+            if (firstDelta) {
+              removeTyping();
+              messages.push(assistantMsg);
+              firstDelta = false;
+            }
+
+            if (delta.content) {
+              assistantMsg.content += delta.content;
+            }
+            // Reasoning from provider-specific field (not in standard OpenAI)
+            assistantMsg.finish_reason = finish;
+
+            // Update UI
+            const items = chatEl.querySelectorAll('.msg');
+            const lastEl = items[items.length - 1];
+            if (lastEl && lastEl.classList.contains('assistant')) {
+              const newEl = renderMessage(assistantMsg);
+              lastEl.replaceWith(newEl);
+            } else {
+              const el = renderMessage(assistantMsg);
+              chatEl.appendChild(el);
+            }
+            scrollToBottom();
+          } catch(e){ /* skip malformed */ }
+        }
+      }
+
+      if (firstDelta) removeTyping();
+      // Ensure finish_reason is set
+      if (!firstDelta && !assistantMsg.finish_reason) {
+        assistantMsg.finish_reason = 'stop';
+        const items = chatEl.querySelectorAll('.msg');
+        const lastEl = items[items.length - 1];
+        if (lastEl && lastEl.classList.contains('assistant')) {
+          const newEl = renderMessage(assistantMsg);
+          lastEl.replaceWith(newEl);
+        }
+      }
+    } catch (e) {
+      if (e.name === 'AbortError') {
+        removeTyping();
+      } else {
+        showError('Connection error: ' + e.message);
+      }
+    }
+
+    sending = false;
+    sendBtn.disabled = false;
+  }
+
+  function newChat(){
+    if (sending && abortCtrl) abortCtrl.abort();
+    sending = false;
+    sendBtn.disabled = false;
+    messages = [];
+    chatEl.innerHTML = '';
+    inputEl.value = '';
+    inputEl.style.height = 'auto';
+    removeTyping();
+  }
+
+  sendBtn.addEventListener('click', sendMessage);
+  inputEl.addEventListener('keydown', function(e){
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  });
+  newChatBtn.addEventListener('click', newChat);
+})();
+</script>
+</body>
+</html>
