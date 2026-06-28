@@ -189,7 +189,7 @@ static const ds4_shape DS4_SHAPE_FLASH = {
     .n_lora_q = 1024,
     .n_lora_o = 1024,
     .n_expert = 256,
-    .n_expert_used = 6,
+    .n_expert_used = 4,
     .n_expert_shared = 1,
     .n_ff_exp = 2048,
     .n_hash_layer = 3,
@@ -263,7 +263,7 @@ static ds4_shape g_ds4_shape = {
     .n_lora_q = 1024,
     .n_lora_o = 1024,
     .n_expert = 256,
-    .n_expert_used = 6,
+    .n_expert_used = 4,
     .n_expert_shared = 1,
     .n_ff_exp = 2048,
     .n_hash_layer = 3,
@@ -3756,15 +3756,17 @@ static void ds4_select_shape_from_metadata(
         uint32_t n_indexer_top_k,
         uint32_t n_hc,
         uint32_t n_hc_sinkhorn_iter) {
-    if (ds4_shape_matches_metadata(&DS4_SHAPE_FLASH,
-                                   n_layer, n_embd, n_vocab, n_head, n_head_kv,
-                                   n_head_dim, n_value_dim, n_rot, n_lora_q,
-                                   n_lora_o, n_out_group, n_expert,
-                                   n_expert_used, n_ff_exp, n_expert_shared,
-                                   n_hash_layer, n_swa, n_indexer_head,
-                                   n_indexer_head_dim, n_indexer_top_k, n_hc,
-                                   n_hc_sinkhorn_iter)) {
+    if ((n_expert_used == 4 || n_expert_used == 6) &&
+        ds4_shape_matches_metadata(&DS4_SHAPE_FLASH,
+                                    n_layer, n_embd, n_vocab, n_head, n_head_kv,
+                                    n_head_dim, n_value_dim, n_rot, n_lora_q,
+                                    n_lora_o, n_out_group, n_expert,
+                                    4, n_ff_exp, n_expert_shared,
+                                    n_hash_layer, n_swa, n_indexer_head,
+                                    n_indexer_head_dim, n_indexer_top_k, n_hc,
+                                    n_hc_sinkhorn_iter)) {
         g_ds4_shape = DS4_SHAPE_FLASH;
+        if (n_expert_used == 6) g_ds4_shape.n_expert_used = 6;
         return;
     }
     if (ds4_shape_matches_metadata(&DS4_SHAPE_PRO,
