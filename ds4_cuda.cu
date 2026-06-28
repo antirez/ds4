@@ -10469,10 +10469,13 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
     if (expert_i < 0) expert_i = 0;
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
-    __shared__ cuda_block_q8_K sxq[16];
+    /* Stage the quantized activation in shared mem; sized 32 to also cover PRO
+     * (expert_in_dim 7168 -> xq_blocks 28), not just <=4096-wide Flash/GLM (<=16).
+     * 32 blocks (~9 KiB) + grid/signs stays well under the per-SM shared limit. */
+    __shared__ cuda_block_q8_K sxq[32];
     __shared__ uint64_t s_iq2_grid[256];
     __shared__ uint8_t s_iq2_signs[128];
-    if (xq_blocks <= 16u) {
+    if (xq_blocks <= 32u) {
         for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
         for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
         for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
@@ -12336,7 +12339,7 @@ static int routed_moe_launch(
             n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_DOWN_TILE16") == NULL &&
             (use_atomic_down || q4k_path);
         const uint32_t use_decode_lut_gate =
-            !q4k_path && n_tokens == 1u && xq_blocks <= 16u &&
+            !q4k_path && n_tokens == 1u && xq_blocks <= 32u &&
             getenv("DS4_CUDA_MOE_NO_DECODE_LUT_GATE") == NULL;
         const uint32_t gate_row_span =
             getenv("DS4_CUDA_MOE_GATE_ROW512") != NULL ? 512u :
