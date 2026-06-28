@@ -4824,9 +4824,9 @@ __global__ static void attention_indexed_mixed_kernel(
         if (visible_comp > n_comp) visible_comp = n_comp;
     }
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
-    __shared__ float scores[768];
+    __shared__ float scores[1280];
     __shared__ uint32_t raw_rows[256];
-    __shared__ uint32_t comp_rows[512];
+    __shared__ uint32_t comp_rows[1024];
     __shared__ float partial[256];
     __shared__ float max_s;
     __shared__ float denom;
@@ -4863,12 +4863,12 @@ __global__ static void attention_indexed_mixed_kernel(
         int32_t c = topk[(uint64_t)t * top_k + i];
         if (c >= 0 && (uint32_t)c < visible_comp) {
             uint32_t slot = atomicAdd(&comp_count, 1u);
-            if (slot < 512u) comp_rows[slot] = (uint32_t)c;
+            if (slot < 1024u) comp_rows[slot] = (uint32_t)c;
         }
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        if (comp_count > 512u) comp_count = 512u;
+        if (comp_count > 1024u) comp_count = 1024u;
     }
     __syncthreads();
     uint32_t n_score = raw_count + comp_count;
@@ -5197,7 +5197,7 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     __syncthreads();
 
     uint32_t comp_count = top_k < visible_comp ? top_k : visible_comp;
-    if (comp_count > 512u) comp_count = 512u;
+    if (comp_count > 1024u) comp_count = 1024u;
     const uint32_t n_score = raw_count + comp_count;
     const float scale = rsqrtf((float)head_dim);
     const float4 *q4 = valid_head
@@ -7484,21 +7484,21 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         selected->bytes < (uint64_t)n_tokens * top_k * sizeof(uint32_t)) {
         return 0;
     }
-    if (top_k == 512u && n_comp <= 1024u &&
+    if (top_k <= 1024u && n_comp <= 1024u &&
         getenv("DS4_CUDA_NO_TOPK1024") == NULL) {
         indexer_topk_1024_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
                                                      (const float *)scores->ptr,
                                                      n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 1024 launch");
     }
-    if (top_k == 512u && n_comp <= 2048u &&
+    if (top_k <= 1024u && n_comp <= 2048u &&
         getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
         indexer_topk_pow2_kernel<2048><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
                                                            (const float *)scores->ptr,
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 2048 launch");
     }
-    if (top_k == 512u && n_comp <= 4096u &&
+    if (top_k <= 1024u && n_comp <= 4096u &&
         getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
         if (n_comp == 4096u) {
             using TopkCubSort = cub::BlockRadixSort<uint64_t, 512, 16>;
@@ -7528,7 +7528,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 4096 launch");
     }
-    if (top_k == 512u && n_comp <= 8192u &&
+    if (top_k <= 1024u && n_comp <= 8192u &&
         getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
         getenv("DS4_CUDA_NO_TOPK8192") == NULL) {
         if (n_comp > 4096u) {
@@ -7559,7 +7559,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                                n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 8192 launch");
     }
-    if (top_k == 512u && getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
+    if (top_k <= 1024u && getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
         getenv("DS4_CUDA_NO_TOPK_CHUNKED") == NULL) {
         const uint32_t chunk_n = 4096u;
         const uint32_t n_chunks = (n_comp + chunk_n - 1u) / chunk_n;
@@ -8979,7 +8979,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         topk->bytes < (uint64_t)n_tokens * top_k * sizeof(int32_t)) {
         return 0;
     }
-    if (top_k > 512u) return 0;
+    if (top_k > 1024u) return 0;
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
@@ -8993,9 +8993,9 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         if (!cuda_ok(cudaGetLastError(), "indexed attention topk sort launch")) return 0;
         topk_ptr = sorted;
     }
-    if (n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
+    if (n_tokens > 1 && head_dim == 512 && top_k <= 1024u &&
         getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
-        if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
+        if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL || top_k > 512u) {
             dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
             attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>((float *)heads->ptr,
                                                                                sinks,
