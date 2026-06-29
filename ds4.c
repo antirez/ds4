@@ -5142,14 +5142,24 @@ const char *ds4_mtp_draft_kind_name(ds4_mtp_draft_kind kind) {
     switch (kind) {
     case DS4_MTP_DRAFT_LEGACY: return "legacy-mtp";
     case DS4_MTP_DRAFT_DSPARK:  return "dspark";
+    case DS4_MTP_DRAFT_DSPARK_NONSEQ: return "dspark-nonseq";
     default:                    return "none";
     }
 }
 
-ds4_mtp_draft_kind ds4_mtp_draft_kind_guess(bool has_e_proj, bool has_main_proj, bool has_markov_w1) {
+ds4_mtp_draft_kind ds4_mtp_draft_kind_guess_ex(bool has_e_proj,
+                                                bool has_main_proj,
+                                                bool has_markov_w1,
+                                                bool markov_rank_set,
+                                                uint32_t markov_rank) {
     if (has_main_proj && has_markov_w1) return DS4_MTP_DRAFT_DSPARK;
+    if (has_main_proj && markov_rank_set && markov_rank == 0) return DS4_MTP_DRAFT_DSPARK_NONSEQ;
     if (has_e_proj) return DS4_MTP_DRAFT_LEGACY;
     return DS4_MTP_DRAFT_NONE;
+}
+
+ds4_mtp_draft_kind ds4_mtp_draft_kind_guess(bool has_e_proj, bool has_main_proj, bool has_markov_w1) {
+    return ds4_mtp_draft_kind_guess_ex(has_e_proj, has_main_proj, has_markov_w1, false, 0);
 }
 
 static void dspark_config_apply_metadata(ds4_dspark_config *cfg, const ds4_model *m) {
@@ -5165,7 +5175,7 @@ static void dspark_config_apply_metadata(ds4_dspark_config *cfg, const ds4_model
     }
     if (model_get_u32(m, "deepseek4.dspark.block_size", &v) && v > 0) cfg->block_size = v;
     if (model_get_u32(m, "deepseek4.dspark.noise_token_id", &v)) cfg->noise_token_id = v;
-    if (model_get_u32(m, "deepseek4.dspark.markov_rank", &v) && v > 0) cfg->markov_rank = v;
+    if (model_get_u32(m, "deepseek4.dspark.markov_rank", &v)) cfg->markov_rank = v;
     for (uint32_t i = 0; i < 3; i++) {
         char key[64];
         snprintf(key, sizeof(key), "deepseek4.dspark.target_layer_ids.%u", i);
@@ -5174,10 +5184,13 @@ static void dspark_config_apply_metadata(ds4_dspark_config *cfg, const ds4_model
 }
 
 static ds4_mtp_draft_kind mtp_model_detect_kind(const ds4_model *m) {
+    uint32_t markov_rank = 0;
+    const bool markov_rank_set = model_get_u32(m, "deepseek4.dspark.markov_rank", &markov_rank);
     const bool has_e_proj = model_find_tensor(m, "mtp.0.e_proj.weight") != NULL;
     const bool has_main_proj = model_find_tensor(m, "mtp.0.main_proj.weight") != NULL;
     const bool has_markov = model_find_tensor(m, "mtp.2.markov_head.markov_w1.weight") != NULL;
-    return ds4_mtp_draft_kind_guess(has_e_proj, has_main_proj, has_markov);
+    return ds4_mtp_draft_kind_guess_ex(has_e_proj, has_main_proj, has_markov,
+                                       markov_rank_set, markov_rank);
 }
 
 static void mtp_weights_bind_mtp_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t stage) {
