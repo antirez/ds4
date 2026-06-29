@@ -61,6 +61,7 @@ typedef enum {
     DS4_MTP_DRAFT_NONE = 0,
     DS4_MTP_DRAFT_LEGACY,
     DS4_MTP_DRAFT_DSPARK,
+    DS4_MTP_DRAFT_DSPARK_NONSEQ,
 } ds4_mtp_draft_kind;
 
 typedef struct {
@@ -75,6 +76,11 @@ void ds4_dspark_config_init_defaults(ds4_dspark_config *cfg);
 const char *ds4_mtp_draft_kind_name(ds4_mtp_draft_kind kind);
 /* Classify draft GGUF layout from presence markers (unit-testable, no model load). */
 ds4_mtp_draft_kind ds4_mtp_draft_kind_guess(bool has_e_proj, bool has_main_proj, bool has_markov_w1);
+ds4_mtp_draft_kind ds4_mtp_draft_kind_guess_ex(bool has_e_proj,
+                                                bool has_main_proj,
+                                                bool has_markov_w1,
+                                                bool markov_rank_set,
+                                                uint32_t markov_rank);
 
 typedef struct ds4_engine ds4_engine;
 typedef struct ds4_session ds4_session;

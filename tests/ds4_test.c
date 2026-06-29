@@ -2193,6 +2193,14 @@ static void test_dspark_binder_helpers(void) {
     TEST_ASSERT(ds4_mtp_draft_kind_guess(false, false, false) == DS4_MTP_DRAFT_NONE);
     TEST_ASSERT(ds4_mtp_draft_kind_guess(true, false, false) == DS4_MTP_DRAFT_LEGACY);
     TEST_ASSERT(ds4_mtp_draft_kind_guess(false, true, true) == DS4_MTP_DRAFT_DSPARK);
+    TEST_ASSERT(ds4_mtp_draft_kind_guess_ex(false, true, false, true, 0) ==
+                DS4_MTP_DRAFT_DSPARK_NONSEQ);
+    TEST_ASSERT(ds4_mtp_draft_kind_guess_ex(false, true, false, false, 0) ==
+                DS4_MTP_DRAFT_NONE);
+    TEST_ASSERT(ds4_mtp_draft_kind_guess_ex(false, true, false, true, 256) ==
+                DS4_MTP_DRAFT_NONE);
+    TEST_ASSERT(!strcmp(ds4_mtp_draft_kind_name(DS4_MTP_DRAFT_DSPARK_NONSEQ),
+                        "dspark-nonseq"));
     TEST_ASSERT(!strcmp(ds4_mtp_draft_kind_name(DS4_MTP_DRAFT_DSPARK), "dspark"));
     TEST_ASSERT(!strcmp(ds4_mtp_draft_kind_name(DS4_MTP_DRAFT_LEGACY), "legacy-mtp"));
 }
@@ -2204,6 +2212,8 @@ static void test_dspark_runtime_helpers(void) {
                 DS4_DSPARK_SPEC_LEGACY_MTP);
     TEST_ASSERT(ds4_dspark_speculative_gate(DS4_MTP_DRAFT_DSPARK, true, 5) ==
                 DS4_DSPARK_SPEC_DSPARK_NOT_READY);
+    TEST_ASSERT(ds4_dspark_speculative_gate(DS4_MTP_DRAFT_DSPARK_NONSEQ, true, 5) ==
+                DS4_DSPARK_SPEC_DSPARK_NONSEQ_NOT_READY);
     TEST_ASSERT(ds4_dspark_speculative_gate(DS4_MTP_DRAFT_DSPARK, true, 1) ==
                 DS4_DSPARK_SPEC_DISABLED);
     TEST_ASSERT(strstr(ds4_dspark_spec_gate_reason(DS4_DSPARK_SPEC_DSPARK_NOT_READY),
@@ -2213,8 +2223,25 @@ static void test_dspark_runtime_helpers(void) {
     TEST_ASSERT(ds4_mtp_speculative_draft_ready(DS4_MTP_DRAFT_LEGACY));
     TEST_ASSERT(!ds4_mtp_speculative_draft_ready(DS4_MTP_DRAFT_NONE));
     TEST_ASSERT(!ds4_mtp_speculative_draft_ready(DS4_MTP_DRAFT_DSPARK));
+    TEST_ASSERT(!ds4_mtp_speculative_draft_ready(DS4_MTP_DRAFT_DSPARK_NONSEQ));
+    TEST_ASSERT(strstr(ds4_dspark_spec_gate_reason(DS4_DSPARK_SPEC_DSPARK_NONSEQ_NOT_READY),
+                       "nonseq") != NULL);
+    TEST_ASSERT(strstr(ds4_dspark_spec_gate_reason(DS4_DSPARK_SPEC_DSPARK_NONSEQ_NOT_READY),
+                       "not been validated") != NULL);
     TEST_ASSERT(ds4_engine_has_mtp(NULL) == false);
 }
+
+static void test_dspark_target_cache_export_todo(void) {
+    fprintf(stderr,
+            "ds4-test: missing DSpark target-cache exporter: expected one prompt to write "
+            "a DeepSpec target cache directory with manifest.json version 2, samples.idx "
+            "records matching <QIIQQQQQ>, shards containing input_ids, attention_mask, "
+            "loss_mask, target_hidden_states, target_last_hidden_states, and manifest "
+            "metadata for tokenizer/chat-template, GGUF path, quantization family, "
+            "target_layer_ids, hidden convention, and ds4 commit.\n");
+    TEST_ASSERT(false);
+}
+
 
 
 static void test_server_unit_group(void) {
@@ -2250,13 +2277,21 @@ static const ds4_test_entry test_entries[] = {
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 
+static const ds4_test_entry manual_red_test_entries[] = {
+    {"--dspark-target-cache-export", "dspark-target-cache-export", "known-red DeepSpec target-cache exporter contract", test_dspark_target_cache_export_todo},
+};
+
 static void test_print_help(const char *prog) {
     printf("Usage: %s [--all | TEST...]\n\n", prog);
     puts("Tests:");
     puts("  --all");
-    puts("      Run every test. This is the default, ordered from slower to faster.");
+    puts("      Run every default test. This is the default, ordered from slower to faster.");
     for (size_t i = 0; i < sizeof(test_entries) / sizeof(test_entries[0]); i++) {
         printf("  %-20s %s\n", test_entries[i].flag, test_entries[i].desc);
+    }
+    puts("\nKnown-red tests (manual only):");
+    for (size_t i = 0; i < sizeof(manual_red_test_entries) / sizeof(manual_red_test_entries[0]); i++) {
+        printf("  %-20s %s\n", manual_red_test_entries[i].flag, manual_red_test_entries[i].desc);
     }
     puts("  --list");
     puts("      Print test names only.");
@@ -2291,6 +2326,13 @@ static const ds4_test_entry *test_find_entry(const char *arg) {
     return NULL;
 }
 
+static const ds4_test_entry *test_find_manual_red_entry(const char *arg) {
+    for (size_t i = 0; i < sizeof(manual_red_test_entries) / sizeof(manual_red_test_entries[0]); i++) {
+        if (!strcmp(arg, manual_red_test_entries[i].flag)) return &manual_red_test_entries[i];
+    }
+    return NULL;
+}
+
 static void test_run_entry(const ds4_test_entry *entry) {
     int before = test_failures;
     fprintf(stderr, "%s:\n", entry->name);
@@ -2306,6 +2348,7 @@ static void test_run_entry(const ds4_test_entry *entry) {
 int main(int argc, char **argv) {
     bool run_all = argc == 1;
     bool selected[sizeof(test_entries) / sizeof(test_entries[0])] = {0};
+    bool selected_red[sizeof(manual_red_test_entries) / sizeof(manual_red_test_entries[0])] = {0};
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--all")) {
@@ -2314,18 +2357,27 @@ int main(int argc, char **argv) {
             for (size_t j = 0; j < sizeof(test_entries) / sizeof(test_entries[0]); j++) {
                 puts(test_entries[j].flag);
             }
+            for (size_t j = 0; j < sizeof(manual_red_test_entries) / sizeof(manual_red_test_entries[0]); j++) {
+                puts(manual_red_test_entries[j].flag);
+            }
             return 0;
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             test_print_help(argv[0]);
             return 0;
         } else {
             const ds4_test_entry *entry = test_find_entry(argv[i]);
-            if (!entry) {
-                fprintf(stderr, "ds4-test: unknown test switch: %s\n", argv[i]);
-                test_print_help(argv[0]);
-                return 2;
+            if (entry) {
+                selected[(size_t)(entry - test_entries)] = true;
+                continue;
             }
-            selected[(size_t)(entry - test_entries)] = true;
+            entry = test_find_manual_red_entry(argv[i]);
+            if (entry) {
+                selected_red[(size_t)(entry - manual_red_test_entries)] = true;
+                continue;
+            }
+            fprintf(stderr, "ds4-test: unknown test switch: %s\n", argv[i]);
+            test_print_help(argv[0]);
+            return 2;
         }
     }
 
@@ -2336,6 +2388,9 @@ int main(int argc, char **argv) {
     } else {
         for (size_t i = 0; i < sizeof(test_entries) / sizeof(test_entries[0]); i++) {
             if (selected[i]) test_run_entry(&test_entries[i]);
+        }
+        for (size_t i = 0; i < sizeof(manual_red_test_entries) / sizeof(manual_red_test_entries[0]); i++) {
+            if (selected_red[i]) test_run_entry(&manual_red_test_entries[i]);
         }
     }
 

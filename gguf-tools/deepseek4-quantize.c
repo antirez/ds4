@@ -1054,6 +1054,21 @@ typedef struct {
     uint32_t target_layer_ids[DS4_DSPARK_TARGET_LAYER_COUNT];
 } dspark_metadata;
 
+typedef enum {
+    DS4_DSPARK_HF_NONE = 0,
+    DS4_DSPARK_HF_MARKOV,
+    DS4_DSPARK_HF_NONSEQ,
+} dspark_hf_layout;
+
+static const char *dspark_hf_layout_name(dspark_hf_layout layout) {
+    switch (layout) {
+    case DS4_DSPARK_HF_MARKOV: return "markov";
+    case DS4_DSPARK_HF_NONSEQ: return "nonseq";
+    case DS4_DSPARK_HF_NONE:
+    default: return "none";
+    }
+}
+
 static bool is_mtp_tensor_name(const char *name) {
     return str_starts(name, "mtp.");
 }
@@ -1074,10 +1089,25 @@ static bool is_dspark_kv_key(const char *key) {
            strncmp(key, DS4_KV_DSPARK_TARGET_LAYER_ID, strlen(DS4_KV_DSPARK_TARGET_LAYER_ID)) == 0;
 }
 
-static bool db_is_dspark_hf(const st_db *db) {
-    return db_has(db, "mtp.0.main_proj.weight") &&
-           db_has(db, "mtp.2.markov_head.markov_w1.weight") &&
-           db_has(db, "mtp.2.confidence_head.proj.weight");
+static dspark_hf_layout dspark_hf_layout_guess(bool has_main_proj,
+                                               bool has_markov_w1,
+                                               bool has_confidence_proj,
+                                               bool markov_rank_set,
+                                               uint32_t markov_rank) {
+    if (!has_main_proj) return DS4_DSPARK_HF_NONE;
+    if (has_markov_w1 && has_confidence_proj) return DS4_DSPARK_HF_MARKOV;
+    if (!has_markov_w1 && !has_confidence_proj && markov_rank_set && markov_rank == 0) {
+        return DS4_DSPARK_HF_NONSEQ;
+    }
+    return DS4_DSPARK_HF_NONE;
+}
+
+static dspark_hf_layout db_dspark_hf_layout(const st_db *db, bool markov_rank_set, uint32_t markov_rank) {
+    return dspark_hf_layout_guess(db_has(db, "mtp.0.main_proj.weight"),
+                                  db_has(db, "mtp.2.markov_head.markov_w1.weight"),
+                                  db_has(db, "mtp.2.confidence_head.proj.weight"),
+                                  markov_rank_set,
+                                  markov_rank);
 }
 
 static dspark_metadata dspark_metadata_defaults(void) {
@@ -1091,7 +1121,8 @@ static dspark_metadata dspark_metadata_defaults(void) {
     return m;
 }
 
-static dspark_metadata dspark_metadata_from_hf_config(const char *hf_dir) {
+static dspark_metadata dspark_metadata_from_hf_config(const char *hf_dir, bool *markov_rank_set) {
+    if (markov_rank_set) *markov_rank_set = false;
     dspark_metadata m = dspark_metadata_defaults();
     char *cfg_path = path_join(hf_dir, "inference/config.json");
     size_t len = 0;
@@ -1108,7 +1139,10 @@ static dspark_metadata dspark_metadata_from_hf_config(const char *hf_dir) {
     int layers = json_obj_get(&d, 0, "dspark_target_layer_ids");
     if (block >= 0) m.block_size = (uint32_t)json_i64(&d, block);
     if (noise >= 0) m.noise_token_id = (uint32_t)json_i64(&d, noise);
-    if (rank >= 0) m.markov_rank = (uint32_t)json_i64(&d, rank);
+    if (rank >= 0) {
+        m.markov_rank = (uint32_t)json_i64(&d, rank);
+        if (markov_rank_set) *markov_rank_set = true;
+    }
     if (n_mtp >= 0) m.n_mtp_layers = (uint32_t)json_i64(&d, n_mtp);
     if (layers >= 0 && d.v[layers].type == JT_ARRAY) {
         int n = 0;
@@ -1254,6 +1288,15 @@ static void self_test_dspark_map(void) {
     expect_policy_type(&pol, "output_hc_fn.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F16);
     pol.dense = DS4Q_TYPE_COUNT;
     expect_policy_type(&pol, "mtp.0.main_norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
+    if (dspark_hf_layout_guess(true, true, true, false, 0) != DS4_DSPARK_HF_MARKOV) {
+        die("official DSpark HF layout not detected");
+    }
+    if (dspark_hf_layout_guess(true, false, false, true, 0) != DS4_DSPARK_HF_NONSEQ) {
+        die("nonseq DSpark HF layout not detected");
+    }
+    if (dspark_hf_layout_guess(true, false, false, false, 0) != DS4_DSPARK_HF_NONE) {
+        die("main-proj-only DSpark layout detected without markov_rank=0 metadata");
+    }
     dspark_metadata dm = dspark_metadata_defaults();
     if (dm.block_size != 5 || dm.noise_token_id != 128799 || dm.markov_rank != 256 ||
         dm.n_mtp_layers != 3 || dm.target_layer_ids[0] != 40) {
@@ -2169,11 +2212,14 @@ int main(int argc, char **argv) {
     st_db db;
     bool write_dspark = false;
     dspark_metadata dspark_meta = dspark_metadata_defaults();
+    bool markov_rank_set = false;
+    dspark_meta = dspark_metadata_from_hf_config(p.hf_dir, &markov_rank_set);
     db_open(&db, p.hf_dir);
-    if (db_is_dspark_hf(&db)) {
+    dspark_hf_layout dspark_layout = db_dspark_hf_layout(&db, markov_rank_set, dspark_meta.markov_rank);
+    if (dspark_layout != DS4_DSPARK_HF_NONE) {
         write_dspark = true;
-        dspark_meta = dspark_metadata_from_hf_config(p.hf_dir);
-        fprintf(stderr, "DSpark HF detected; writing deepseek4.dspark.* metadata\n");
+        fprintf(stderr, "DSpark HF %s layout detected; writing deepseek4.dspark.* metadata\n",
+                dspark_hf_layout_name(dspark_layout));
     }
     output_context out_ctx = build_output_context(&tmpl, &p.policy, &imatrix, write_dspark, &dspark_meta);
     print_plan(&tmpl, &out_ctx);

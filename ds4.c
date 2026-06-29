@@ -3667,14 +3667,24 @@ const char *ds4_mtp_draft_kind_name(ds4_mtp_draft_kind kind) {
     switch (kind) {
     case DS4_MTP_DRAFT_LEGACY: return "legacy-mtp";
     case DS4_MTP_DRAFT_DSPARK:  return "dspark";
+    case DS4_MTP_DRAFT_DSPARK_NONSEQ: return "dspark-nonseq";
     default:                    return "none";
     }
 }
 
-ds4_mtp_draft_kind ds4_mtp_draft_kind_guess(bool has_e_proj, bool has_main_proj, bool has_markov_w1) {
+ds4_mtp_draft_kind ds4_mtp_draft_kind_guess_ex(bool has_e_proj,
+                                                bool has_main_proj,
+                                                bool has_markov_w1,
+                                                bool markov_rank_set,
+                                                uint32_t markov_rank) {
     if (has_main_proj && has_markov_w1) return DS4_MTP_DRAFT_DSPARK;
+    if (has_main_proj && markov_rank_set && markov_rank == 0) return DS4_MTP_DRAFT_DSPARK_NONSEQ;
     if (has_e_proj) return DS4_MTP_DRAFT_LEGACY;
     return DS4_MTP_DRAFT_NONE;
+}
+
+ds4_mtp_draft_kind ds4_mtp_draft_kind_guess(bool has_e_proj, bool has_main_proj, bool has_markov_w1) {
+    return ds4_mtp_draft_kind_guess_ex(has_e_proj, has_main_proj, has_markov_w1, false, 0);
 }
 
 static void dspark_config_apply_metadata(ds4_dspark_config *cfg, const ds4_model *m) {
@@ -3690,7 +3700,7 @@ static void dspark_config_apply_metadata(ds4_dspark_config *cfg, const ds4_model
     }
     if (model_get_u32(m, "deepseek4.dspark.block_size", &v) && v > 0) cfg->block_size = v;
     if (model_get_u32(m, "deepseek4.dspark.noise_token_id", &v)) cfg->noise_token_id = v;
-    if (model_get_u32(m, "deepseek4.dspark.markov_rank", &v) && v > 0) cfg->markov_rank = v;
+    if (model_get_u32(m, "deepseek4.dspark.markov_rank", &v)) cfg->markov_rank = v;
     for (uint32_t i = 0; i < 3; i++) {
         char key[64];
         snprintf(key, sizeof(key), "deepseek4.dspark.target_layer_ids.%u", i);
@@ -3699,10 +3709,13 @@ static void dspark_config_apply_metadata(ds4_dspark_config *cfg, const ds4_model
 }
 
 static ds4_mtp_draft_kind mtp_model_detect_kind(const ds4_model *m) {
+    uint32_t markov_rank = 0;
+    const bool markov_rank_set = model_get_u32(m, "deepseek4.dspark.markov_rank", &markov_rank);
     const bool has_e_proj = model_find_tensor(m, "mtp.0.e_proj.weight") != NULL;
     const bool has_main_proj = model_find_tensor(m, "mtp.0.main_proj.weight") != NULL;
     const bool has_markov = model_find_tensor(m, "mtp.2.markov_head.markov_w1.weight") != NULL;
-    return ds4_mtp_draft_kind_guess(has_e_proj, has_main_proj, has_markov);
+    return ds4_mtp_draft_kind_guess_ex(has_e_proj, has_main_proj, has_markov,
+                                       markov_rank_set, markov_rank);
 }
 
 static void mtp_weights_bind_mtp_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t stage) {
@@ -3788,7 +3801,7 @@ static void mtp_weights_validate_legacy_layout(const ds4_mtp_weights *w) {
 static void mtp_weights_validate_dspark_layout(const ds4_mtp_weights *w) {
     const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
     const uint64_t main_in = 3u * DS4_N_EMBD;
-    const uint64_t conf_in = DS4_N_EMBD + (uint64_t)w->dspark.markov_rank;
+    const bool has_markov_head = w->kind == DS4_MTP_DRAFT_DSPARK;
 
     tensor_expect_layout(w->main_proj, DS4_TENSOR_Q8_0, 2, main_in, DS4_N_EMBD, 0);
     tensor_expect_layout(w->main_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
@@ -3799,9 +3812,15 @@ static void mtp_weights_validate_dspark_layout(const ds4_mtp_weights *w) {
     tensor_expect_layout(w->hc_head_base,  DS4_TENSOR_F32,  1, DS4_N_HC, 0, 0);
     tensor_expect_plain_layout(w->hc_head_fn, 2, hc_dim, DS4_N_HC, 0);
     tensor_expect_layout(w->hc_head_scale, DS4_TENSOR_F32,  1, 1, 0, 0);
-    tensor_expect_plain_layout(w->markov_w1, 2, DS4_N_VOCAB, w->dspark.markov_rank, 0);
-    tensor_expect_plain_layout(w->markov_w2, 2, w->dspark.markov_rank, DS4_N_VOCAB, 0);
-    tensor_expect_plain_layout(w->confidence_proj, 2, conf_in, 1, 0);
+    if (has_markov_head) {
+        const uint64_t conf_in = DS4_N_EMBD + (uint64_t)w->dspark.markov_rank;
+        if (w->dspark.markov_rank == 0) ds4_die("official DSpark Markov head has zero markov rank");
+        tensor_expect_plain_layout(w->markov_w1, 2, DS4_N_VOCAB, w->dspark.markov_rank, 0);
+        tensor_expect_plain_layout(w->markov_w2, 2, w->dspark.markov_rank, DS4_N_VOCAB, 0);
+        tensor_expect_plain_layout(w->confidence_proj, 2, conf_in, 1, 0);
+    } else if (w->dspark.markov_rank != 0) {
+        ds4_die("nonseq DSpark draft must declare deepseek4.dspark.markov_rank=0");
+    }
 }
 
 static void mtp_weights_bind_legacy(ds4_mtp_weights *w, const ds4_model *m) {
@@ -3819,7 +3838,7 @@ static void mtp_weights_bind_legacy(ds4_mtp_weights *w, const ds4_model *m) {
 }
 
 static void mtp_weights_bind_dspark(ds4_mtp_weights *w, const ds4_model *m) {
-    w->kind = DS4_MTP_DRAFT_DSPARK;
+    w->kind = mtp_model_detect_kind(m);
     dspark_config_apply_metadata(&w->dspark, m);
     if (w->dspark.n_mtp_layers != DS4_DSPARK_MTP_LAYERS) {
         fprintf(stderr, "ds4: DSpark draft expects %u stages, GGUF has n_mtp_layers=%u\n",
@@ -3835,9 +3854,11 @@ static void mtp_weights_bind_dspark(ds4_mtp_weights *w, const ds4_model *m) {
     w->hc_head_base  = required_tensor(m, "mtp.2.hc_head_base.weight");
     w->hc_head_fn    = required_tensor(m, "mtp.2.hc_head_fn.weight");
     w->hc_head_scale = required_tensor(m, "mtp.2.hc_head_scale.weight");
-    w->markov_w1 = required_tensor(m, "mtp.2.markov_head.markov_w1.weight");
-    w->markov_w2 = required_tensor(m, "mtp.2.markov_head.markov_w2.weight");
-    w->confidence_proj = required_tensor(m, "mtp.2.confidence_head.proj.weight");
+    if (w->kind == DS4_MTP_DRAFT_DSPARK) {
+        w->markov_w1 = required_tensor(m, "mtp.2.markov_head.markov_w1.weight");
+        w->markov_w2 = required_tensor(m, "mtp.2.markov_head.markov_w2.weight");
+        w->confidence_proj = required_tensor(m, "mtp.2.confidence_head.proj.weight");
+    }
     mtp_weights_validate_dspark_layout(w);
 }
 
@@ -4602,7 +4623,7 @@ static bool mtp_draft_runtime_supported(ds4_mtp_draft_kind kind) {
 static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
     memset(w, 0, sizeof(*w));
     const ds4_mtp_draft_kind kind = mtp_model_detect_kind(m);
-    if (kind == DS4_MTP_DRAFT_DSPARK) {
+    if (kind == DS4_MTP_DRAFT_DSPARK || kind == DS4_MTP_DRAFT_DSPARK_NONSEQ) {
         mtp_weights_bind_dspark(w, m);
         return;
     }
@@ -4611,7 +4632,7 @@ static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
         return;
     }
     fprintf(stderr,
-            "ds4: unsupported draft GGUF: need legacy mtp.0.e_proj or DSpark mtp.0.main_proj + mtp.2.markov_head\n");
+            "ds4: unsupported draft GGUF: need legacy mtp.0.e_proj, official DSpark mtp.0.main_proj + mtp.2.markov_head, or nonseq DSpark mtp.0.main_proj + deepseek4.dspark.markov_rank=0\n");
     exit(1);
 }
 
@@ -25841,7 +25862,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
         e->mtp_ready = true;
-        if (e->mtp_weights.kind == DS4_MTP_DRAFT_DSPARK &&
+        if ((e->mtp_weights.kind == DS4_MTP_DRAFT_DSPARK || e->mtp_weights.kind == DS4_MTP_DRAFT_DSPARK_NONSEQ) &&
             (opt->mtp_draft_tokens <= 0 || opt->mtp_draft_tokens == 1)) {
             e->mtp_draft_tokens = (int)e->mtp_weights.dspark.block_size;
         }
@@ -25853,7 +25874,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         const ds4_dspark_spec_gate spec_gate = ds4_dspark_speculative_gate(e->mtp_weights.kind,
                                                                            e->mtp_ready,
                                                                            e->mtp_draft_tokens);
-        if (spec_gate == DS4_DSPARK_SPEC_DSPARK_NOT_READY) {
+        if (spec_gate == DS4_DSPARK_SPEC_DSPARK_NOT_READY ||
+            spec_gate == DS4_DSPARK_SPEC_DSPARK_NONSEQ_NOT_READY) {
             fprintf(stderr, "ds4: %s\n", ds4_dspark_spec_gate_reason(spec_gate));
         }
     }

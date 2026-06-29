@@ -10,6 +10,7 @@ ds4_dspark_spec_gate ds4_dspark_speculative_gate(ds4_mtp_draft_kind kind,
     if (!mtp_ready || mtp_draft_tokens <= 1) return DS4_DSPARK_SPEC_DISABLED;
     if (kind == DS4_MTP_DRAFT_LEGACY) return DS4_DSPARK_SPEC_LEGACY_MTP;
     if (kind == DS4_MTP_DRAFT_DSPARK) return DS4_DSPARK_SPEC_DSPARK_NOT_READY;
+    if (kind == DS4_MTP_DRAFT_DSPARK_NONSEQ) return DS4_DSPARK_SPEC_DSPARK_NONSEQ_NOT_READY;
     return DS4_DSPARK_SPEC_DISABLED;
 }
 
@@ -19,6 +20,9 @@ const char *ds4_dspark_spec_gate_reason(ds4_dspark_spec_gate gate) {
         return "legacy MTP draft path (DSpark block draft not engaged)";
     case DS4_DSPARK_SPEC_DSPARK_NOT_READY:
         return "DSpark draft graph has not been validated on real DSpark GGUF weights; "
+               "speculative decode stays off (no fake draft tokens)";
+    case DS4_DSPARK_SPEC_DSPARK_NONSEQ_NOT_READY:
+        return "DSpark nonseq draft head has not been validated on real trained DSpark GGUF weights; "
                "speculative decode stays off (no fake draft tokens)";
     case DS4_DSPARK_SPEC_DISABLED:
     default:
