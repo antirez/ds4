@@ -15,6 +15,7 @@
  */
 
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <float.h>
 #include <inttypes.h>
@@ -2089,6 +2090,7 @@ typedef struct {
     int fd;
     const uint8_t *map;
     uint64_t size;
+    char *path;
 
     uint32_t version;
     uint64_t n_kv;
@@ -2324,6 +2326,7 @@ static void model_close(ds4_model *m) {
     if (!m) return;
     free(m->kv);
     free(m->tensors);
+    free(m->path);
     if (m->map) munmap((void *)m->map, (size_t)m->size);
     if (m->fd >= 0) close(m->fd);
     memset(m, 0, sizeof(*m));
@@ -2481,6 +2484,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     m->fd = fd;
     m->map = map;
     m->size = (uint64_t)st.st_size;
+    m->path = ds4_strdup(path);
 
     ds4_cursor c = cursor_at(m, 0);
     uint32_t magic;
@@ -3188,6 +3192,14 @@ static inline uint16_t f32_to_f16(float f) {
     if (round > 0x1000u || (round == 0x1000u && (half & 1u))) half++;
     return (uint16_t)half;
 #endif
+}
+
+static inline uint16_t f32_to_bf16(float f) {
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof(bits));
+    const uint32_t lsb = (bits >> 16) & 1u;
+    bits += 0x7fffu + lsb;
+    return (uint16_t)(bits >> 16);
 }
 
 static void f16_round_inplace_cpu(float *x, uint32_t n) {
@@ -15280,6 +15292,7 @@ typedef struct {
     ds4_gpu_tensor *mtp_next_hc;
     ds4_gpu_tensor *mtp_raw_cache;
     uint32_t mtp_n_raw;
+
     uint32_t prefill_cap;
     uint32_t raw_window;
     uint32_t batch_token_offset;
@@ -16991,7 +17004,7 @@ static uint64_t metal_graph_q8_0_row_bytes(uint64_t in_dim) {
  * legacy 1-arg helpers when g_n_gpus <= 1. */
 static bool metal_graph_alloc_raw_cap(
         ds4_gpu_graph *g,
-        const ds4_weights     *weights,
+        const ds4_weights       *weights,
         const ds4_layer_weights *layer,
         uint32_t                raw_cap,
         uint32_t                ctx_size,

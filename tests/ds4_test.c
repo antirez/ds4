@@ -5,6 +5,7 @@
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
 #include <math.h>
+#include <sys/wait.h>
 
 bool ds4_test_dspark_cache_window_crop(void);
 
@@ -6444,10 +6445,10 @@ static void test_dspark_runtime_helpers(void) {
                 DS4_DSPARK_SPEC_DSPARK_NONSEQ_NOT_READY);
     TEST_ASSERT(ds4_dspark_speculative_gate(DS4_MTP_DRAFT_DSPARK, true, 1) ==
                 DS4_DSPARK_SPEC_DISABLED);
-    TEST_ASSERT(strstr(ds4_dspark_spec_gate_reason(DS4_DSPARK_SPEC_DSPARK_NOT_READY),
-                       "not been validated") != NULL);
-    TEST_ASSERT(strstr(ds4_dspark_spec_gate_reason(DS4_DSPARK_SPEC_DSPARK_NOT_READY),
-                       "no fake draft tokens") != NULL);
+    TEST_ASSERT(strstr(ds4_dspark_spec_gate_reason(DS4_DSPARK_SPEC_DSPARK_ENABLED),
+                       "enabled") != NULL);
+    TEST_ASSERT(strstr(ds4_dspark_spec_gate_reason(DS4_DSPARK_SPEC_DSPARK_NONSEQ_NOT_READY),
+                       "nonseq") != NULL);
     TEST_ASSERT(ds4_mtp_speculative_draft_ready(DS4_MTP_DRAFT_LEGACY));
     TEST_ASSERT(!ds4_mtp_speculative_draft_ready(DS4_MTP_DRAFT_NONE));
     TEST_ASSERT(!ds4_mtp_speculative_draft_ready(DS4_MTP_DRAFT_DSPARK));
@@ -6459,15 +6460,244 @@ static void test_dspark_runtime_helpers(void) {
     TEST_ASSERT(ds4_engine_has_mtp(NULL) == false);
 }
 
-static void test_dspark_target_cache_export_todo(void) {
-    fprintf(stderr,
-            "ds4-test: missing DSpark target-cache exporter: expected one prompt to write "
-            "a DeepSpec target cache directory with manifest.json version 2, samples.idx "
-            "records matching <QIIQQQQQ>, shards containing input_ids, attention_mask, "
-            "loss_mask, target_hidden_states, target_last_hidden_states, and manifest "
-            "metadata for tokenizer/chat-template, GGUF path, quantization family, "
-            "target_layer_ids, hidden convention, and ds4 commit.\n");
-    TEST_ASSERT(false);
+static uint32_t test_le32(const unsigned char *p) {
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static uint64_t test_le64(const unsigned char *p) {
+    return (uint64_t)p[0] |
+           ((uint64_t)p[1] << 8) |
+           ((uint64_t)p[2] << 16) |
+           ((uint64_t)p[3] << 24) |
+           ((uint64_t)p[4] << 32) |
+           ((uint64_t)p[5] << 40) |
+           ((uint64_t)p[6] << 48) |
+           ((uint64_t)p[7] << 56);
+}
+
+static bool test_file_size(const char *path, uint64_t *size_out) {
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size < 0) return false;
+    *size_out = (uint64_t)st.st_size;
+    return true;
+}
+static bool test_bf16_region_nonzero_finite(const char *path,
+                                            uint64_t offset,
+                                            uint64_t bytes) {
+    if (!path || bytes == 0 || (bytes & 1u) != 0) return false;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return false;
+    if (fseeko(fp, (off_t)offset, SEEK_SET) != 0) {
+        fclose(fp);
+        return false;
+    }
+    unsigned char buf[4096];
+    uint64_t remaining = bytes;
+    uint64_t values = 0;
+    uint64_t nonzero = 0;
+    while (remaining > 0) {
+        size_t chunk = remaining < sizeof(buf) ? (size_t)remaining : sizeof(buf);
+        if ((chunk & 1u) != 0) chunk--;
+        if (chunk == 0 || fread(buf, 1, chunk, fp) != chunk) {
+            fclose(fp);
+            return false;
+        }
+        for (size_t i = 0; i < chunk; i += 2) {
+            uint16_t u = (uint16_t)buf[i] | ((uint16_t)buf[i + 1] << 8);
+            if ((u & 0x7f80u) == 0x7f80u) {
+                fclose(fp);
+                return false;
+            }
+            if (u != 0) nonzero++;
+            values++;
+        }
+        remaining -= chunk;
+    }
+    return fclose(fp) == 0 && values == bytes / 2 && nonzero > 0;
+}
+
+
+static bool test_write_dspark_target_cache_dataset(const char *path) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return false;
+    const bool ok = fputs("===== DS4_IMATRIX_PROMPT 0 =====\n"
+                          "Explain target cache export in one short sentence.\n",
+                          fp) >= 0;
+    return fclose(fp) == 0 && ok;
+}
+
+static int test_run_dspark_target_cache_cli(const char *dataset_path,
+                                            const char *output_dir) {
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        execl("./ds4", "./ds4",
+              "-m", test_model_path(),
+              "--metal",
+              "--dspark-target-cache-dataset", dataset_path,
+              "--dspark-target-cache-out", output_dir,
+              "--dspark-target-cache-target-model", "deepseek-ai/DeepSeek-V4-Flash",
+              "--dspark-target-cache-chat-template", "deepseek_v4_rendered",
+              "--dspark-target-cache-max-prompts", "1",
+              "--dspark-target-cache-max-tokens", "8",
+              "--ctx", "128",
+              (char *)NULL);
+        _exit(127);
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) return -1;
+    }
+    if (!WIFEXITED(status)) return -1;
+    return WEXITSTATUS(status);
+}
+
+static int test_run_dspark_target_cache_cli_missing_target_model(const char *dataset_path,
+                                                                 const char *output_dir) {
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        execl("./ds4", "./ds4",
+              "-m", test_model_path(),
+              "--metal",
+              "--dspark-target-cache-dataset", dataset_path,
+              "--dspark-target-cache-out", output_dir,
+              "--dspark-target-cache-chat-template", "deepseek_v4_rendered",
+              "--dspark-target-cache-max-prompts", "1",
+              "--dspark-target-cache-max-tokens", "8",
+              "--ctx", "128",
+              (char *)NULL);
+        _exit(127);
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) return -1;
+    }
+    if (!WIFEXITED(status)) return -1;
+    return WEXITSTATUS(status);
+}
+static bool test_json_u64_field(const char *json, const char *key, uint64_t *out) {
+    const char *p = strstr(json, key);
+    if (!p) return false;
+    p += strlen(key);
+    while (*p == ' ' || *p == '\t') p++;
+    char *end = NULL;
+    unsigned long long v = strtoull(p, &end, 10);
+    if (end == p) return false;
+    *out = (uint64_t)v;
+    return true;
+}
+
+
+static void test_dspark_target_cache_export(void) {
+    char root_template[PATH_MAX];
+    snprintf(root_template, sizeof(root_template), "%s",
+             "/tmp/ds4-target-cache-test-XXXXXX");
+    char *root = mkdtemp(root_template);
+    TEST_ASSERT(root != NULL);
+    if (!root) return;
+
+    char dataset_path[PATH_MAX];
+    char output_dir[PATH_MAX];
+    char missing_target_output_dir[PATH_MAX];
+    char manifest_path[PATH_MAX];
+    char index_path[PATH_MAX];
+    char shard_path[PATH_MAX];
+    TEST_ASSERT(snprintf(dataset_path, sizeof(dataset_path), "%s/prompts.txt", root) <
+                (int)sizeof(dataset_path));
+    TEST_ASSERT(snprintf(output_dir, sizeof(output_dir), "%s/cache", root) <
+                (int)sizeof(output_dir));
+    TEST_ASSERT(snprintf(missing_target_output_dir, sizeof(missing_target_output_dir),
+                         "%s/missing-target-cache", root) <
+                (int)sizeof(missing_target_output_dir));
+    TEST_ASSERT(snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.json",
+                         output_dir) < (int)sizeof(manifest_path));
+    TEST_ASSERT(snprintf(index_path, sizeof(index_path), "%s/samples.idx", output_dir) <
+                (int)sizeof(index_path));
+    TEST_ASSERT(snprintf(shard_path, sizeof(shard_path), "%s/shard-00000.bin",
+                         output_dir) < (int)sizeof(shard_path));
+    TEST_ASSERT(test_write_dspark_target_cache_dataset(dataset_path));
+    const int missing_target_rc =
+        test_run_dspark_target_cache_cli_missing_target_model(dataset_path,
+                                                             missing_target_output_dir);
+    TEST_ASSERT(missing_target_rc != 0);
+
+    const int rc = test_run_dspark_target_cache_cli(dataset_path, output_dir);
+    TEST_ASSERT(rc == 0);
+    if (rc != 0) return;
+
+    char *manifest = test_read_file(manifest_path);
+    TEST_ASSERT(manifest != NULL);
+    if (!manifest) return;
+    uint64_t hidden_size = 0;
+    uint64_t target_hidden_layers = 0;
+    TEST_ASSERT(strstr(manifest, "\"version\": 2") != NULL);
+    TEST_ASSERT(strstr(manifest, "\"format\": \"deepspec-target-cache\"") != NULL);
+    TEST_ASSERT(strstr(manifest, "\"producer\": \"ds4\"") != NULL);
+    TEST_ASSERT(strstr(manifest, "\"target_model_name_or_path\": \"deepseek-ai/DeepSeek-V4-Flash\"") != NULL);
+    TEST_ASSERT(strstr(manifest, "\"source_gguf_path\": \"") != NULL);
+    TEST_ASSERT(strstr(manifest, "\"chat_template\": \"deepseek_v4_rendered\"") != NULL);
+    TEST_ASSERT(strstr(manifest, "\"target_layer_ids\": [40, 41, 42]") != NULL);
+    TEST_ASSERT(strstr(manifest, "\"hidden_dtype\": \"bfloat16\"") != NULL);
+    TEST_ASSERT(strstr(manifest, "\"token_dtype\": \"int32\"") != NULL);
+    TEST_ASSERT(strstr(manifest, "\"mask_dtype\": \"uint8\"") != NULL);
+    TEST_ASSERT(strstr(manifest, "\"index_record_size\": 56") != NULL);
+    TEST_ASSERT(test_json_u64_field(manifest, "\"target_hidden_layers\": ",
+                                    &target_hidden_layers));
+    TEST_ASSERT(target_hidden_layers == 3);
+    TEST_ASSERT(strstr(manifest, "\"sample_split_marker\": \"===== DS4_IMATRIX_PROMPT\"") != NULL);
+    TEST_ASSERT(strstr(manifest, "\"shard-00000.bin\"") != NULL);
+    TEST_ASSERT(test_json_u64_field(manifest, "\"hidden_size\": ", &hidden_size));
+    TEST_ASSERT(hidden_size > 0);
+    free(manifest);
+
+    uint64_t index_size = 0;
+    uint64_t shard_size = 0;
+    TEST_ASSERT(test_file_size(index_path, &index_size));
+    TEST_ASSERT(index_size == 56);
+    TEST_ASSERT(test_file_size(shard_path, &shard_size));
+    TEST_ASSERT(shard_size > 0);
+    if (index_size != 56 || shard_size == 0) return;
+
+    FILE *idx = fopen(index_path, "rb");
+    TEST_ASSERT(idx != NULL);
+    if (!idx) return;
+    unsigned char rec[56];
+    TEST_ASSERT(fread(rec, 1, sizeof(rec), idx) == sizeof(rec));
+    TEST_ASSERT(fclose(idx) == 0);
+
+    const uint64_t sample_id = test_le64(rec + 0);
+    const uint32_t shard_id = test_le32(rec + 8);
+    const uint32_t seq_len = test_le32(rec + 12);
+    const uint64_t input_ids_offset = test_le64(rec + 16);
+    const uint64_t attention_mask_offset = test_le64(rec + 24);
+    const uint64_t loss_mask_offset = test_le64(rec + 32);
+    const uint64_t target_hidden_states_offset = test_le64(rec + 40);
+    const uint64_t target_last_hidden_states_offset = test_le64(rec + 48);
+
+    TEST_ASSERT(sample_id == 0);
+    TEST_ASSERT(seq_len > 0 && seq_len <= 8);
+    TEST_ASSERT(shard_id == 0);
+    TEST_ASSERT(input_ids_offset == 0);
+    TEST_ASSERT(attention_mask_offset == (uint64_t)seq_len * sizeof(int32_t));
+    TEST_ASSERT(loss_mask_offset == attention_mask_offset + seq_len);
+    TEST_ASSERT(target_hidden_states_offset == loss_mask_offset + seq_len);
+    const uint64_t target_hidden_bytes =
+        (uint64_t)seq_len * target_hidden_layers * hidden_size * sizeof(uint16_t);
+    TEST_ASSERT(target_last_hidden_states_offset ==
+                target_hidden_states_offset + target_hidden_bytes);
+    TEST_ASSERT(test_bf16_region_nonzero_finite(shard_path,
+                                                target_hidden_states_offset,
+                                                target_hidden_bytes));
+    const uint64_t target_last_hidden_bytes =
+        (uint64_t)seq_len * hidden_size * sizeof(uint16_t);
+    TEST_ASSERT(shard_size == target_last_hidden_states_offset + target_last_hidden_bytes);
+    TEST_ASSERT(test_bf16_region_nonzero_finite(shard_path,
+                                                target_last_hidden_states_offset,
+                                                target_last_hidden_bytes));
 }
 
 
@@ -6506,8 +6736,8 @@ static const ds4_test_entry test_entries[] = {
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 
-static const ds4_test_entry manual_red_test_entries[] = {
-    {"--dspark-target-cache-export", "dspark-target-cache-export", "known-red DeepSpec target-cache exporter contract", test_dspark_target_cache_export_todo},
+static const ds4_test_entry manual_test_entries[] = {
+    {"--dspark-target-cache-export", "dspark-target-cache-export", "DeepSpec target-cache exporter smoke", test_dspark_target_cache_export},
 };
 
 static void test_print_help(const char *prog) {
@@ -6518,9 +6748,9 @@ static void test_print_help(const char *prog) {
     for (size_t i = 0; i < sizeof(test_entries) / sizeof(test_entries[0]); i++) {
         printf("  %-20s %s\n", test_entries[i].flag, test_entries[i].desc);
     }
-    puts("\nKnown-red tests (manual only):");
-    for (size_t i = 0; i < sizeof(manual_red_test_entries) / sizeof(manual_red_test_entries[0]); i++) {
-        printf("  %-20s %s\n", manual_red_test_entries[i].flag, manual_red_test_entries[i].desc);
+    puts("\nManual tests:");
+    for (size_t i = 0; i < sizeof(manual_test_entries) / sizeof(manual_test_entries[0]); i++) {
+        printf("  %-20s %s\n", manual_test_entries[i].flag, manual_test_entries[i].desc);
     }
     puts("  --list");
     puts("      Print test names only.");
@@ -6558,9 +6788,9 @@ static const ds4_test_entry *test_find_entry(const char *arg) {
     return NULL;
 }
 
-static const ds4_test_entry *test_find_manual_red_entry(const char *arg) {
-    for (size_t i = 0; i < sizeof(manual_red_test_entries) / sizeof(manual_red_test_entries[0]); i++) {
-        if (!strcmp(arg, manual_red_test_entries[i].flag)) return &manual_red_test_entries[i];
+static const ds4_test_entry *test_find_manual_entry(const char *arg) {
+    for (size_t i = 0; i < sizeof(manual_test_entries) / sizeof(manual_test_entries[0]); i++) {
+        if (!strcmp(arg, manual_test_entries[i].flag)) return &manual_test_entries[i];
     }
     return NULL;
 }
@@ -6580,7 +6810,7 @@ static void test_run_entry(const ds4_test_entry *entry) {
 int main(int argc, char **argv) {
     bool run_all = argc == 1;
     bool selected[sizeof(test_entries) / sizeof(test_entries[0])] = {0};
-    bool selected_red[sizeof(manual_red_test_entries) / sizeof(manual_red_test_entries[0])] = {0};
+    bool selected_manual[sizeof(manual_test_entries) / sizeof(manual_test_entries[0])] = {0};
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--all")) {
@@ -6589,8 +6819,8 @@ int main(int argc, char **argv) {
             for (size_t j = 0; j < sizeof(test_entries) / sizeof(test_entries[0]); j++) {
                 puts(test_entries[j].flag);
             }
-            for (size_t j = 0; j < sizeof(manual_red_test_entries) / sizeof(manual_red_test_entries[0]); j++) {
-                puts(manual_red_test_entries[j].flag);
+            for (size_t j = 0; j < sizeof(manual_test_entries) / sizeof(manual_test_entries[0]); j++) {
+                puts(manual_test_entries[j].flag);
             }
             return 0;
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
@@ -6602,9 +6832,9 @@ int main(int argc, char **argv) {
                 selected[(size_t)(entry - test_entries)] = true;
                 continue;
             }
-            entry = test_find_manual_red_entry(argv[i]);
+            entry = test_find_manual_entry(argv[i]);
             if (entry) {
-                selected_red[(size_t)(entry - manual_red_test_entries)] = true;
+                selected_manual[(size_t)(entry - manual_test_entries)] = true;
                 continue;
             }
             fprintf(stderr, "ds4-test: unknown test switch: %s\n", argv[i]);
@@ -6621,8 +6851,8 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < sizeof(test_entries) / sizeof(test_entries[0]); i++) {
             if (selected[i]) test_run_entry(&test_entries[i]);
         }
-        for (size_t i = 0; i < sizeof(manual_red_test_entries) / sizeof(manual_red_test_entries[0]); i++) {
-            if (selected_red[i]) test_run_entry(&manual_red_test_entries[i]);
+        for (size_t i = 0; i < sizeof(manual_test_entries) / sizeof(manual_test_entries[0]); i++) {
+            if (selected_manual[i]) test_run_entry(&manual_test_entries[i]);
         }
     }
 

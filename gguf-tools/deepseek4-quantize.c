@@ -36,6 +36,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #if defined(_WIN32)
 #error "deepseek4-quantize.c currently targets POSIX systems"
@@ -138,6 +140,24 @@ static bool str_ends(const char *s, const char *suffix) {
 static char *read_file(const char *path, size_t *len_out) {
     FILE *fp = fopen(path, "rb");
     if (!fp) die_errno("open", path);
+    if (fseeko(fp, 0, SEEK_END) != 0) die_errno("seek", path);
+    off_t n = ftello(fp);
+    if (n < 0) die_errno("tell", path);
+    if (fseeko(fp, 0, SEEK_SET) != 0) die_errno("seek", path);
+    char *buf = xmalloc((size_t)n + 1);
+    if (n && fread(buf, 1, (size_t)n, fp) != (size_t)n) die_errno("read", path);
+    buf[n] = '\0';
+    fclose(fp);
+    if (len_out) *len_out = (size_t)n;
+    return buf;
+}
+
+static char *read_optional_file(const char *path, size_t *len_out) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        if (errno == ENOENT) return NULL;
+        die_errno("open", path);
+    }
     if (fseeko(fp, 0, SEEK_END) != 0) die_errno("seek", path);
     off_t n = ftello(fp);
     if (n < 0) die_errno("tell", path);
@@ -1169,6 +1189,9 @@ static const name_map layer_map[] = {
     { "ffn_up_shexp.weight",              "ffn.shared_experts.w3.weight" },
     { "ffn_down_shexp.weight",            "ffn.shared_experts.w2.weight" },
     { "ffn_gate_inp.weight",              "ffn.gate.weight" },
+    { "ffn_gate_exps.weight",             "ffn.experts.*.w1.weight" },
+    { "ffn_up_exps.weight",               "ffn.experts.*.w3.weight" },
+    { "ffn_down_exps.weight",             "ffn.experts.*.w2.weight" },
     { "exp_probs_b.bias",                 "ffn.gate.bias" },
     { "ffn_gate_tid2eid.weight",          "ffn.gate.tid2eid" },
 };
@@ -1274,6 +1297,10 @@ static bool is_mtp_tensor_name(const char *name) {
 static bool is_dspark_special_tensor(const char *name) {
     return strstr(name, ".main_proj.weight") != NULL ||
            strstr(name, ".main_norm.weight") != NULL ||
+           strstr(name, ".attn_norm.weight") != NULL ||
+           strstr(name, ".attn_q_a_norm.weight") != NULL ||
+           strstr(name, ".attn_kv_a_norm.weight") != NULL ||
+           strstr(name, ".ffn_norm.weight") != NULL ||
            strstr(name, ".markov_head.markov_w1.weight") != NULL ||
            strstr(name, ".markov_head.markov_w2.weight") != NULL ||
            strstr(name, ".confidence_head.proj.weight") != NULL;
@@ -1319,39 +1346,43 @@ static dspark_metadata dspark_metadata_defaults(void) {
     return m;
 }
 
-static dspark_metadata dspark_metadata_from_hf_config(const char *hf_dir, bool *markov_rank_set) {
-    if (markov_rank_set) *markov_rank_set = false;
-    dspark_metadata m = dspark_metadata_defaults();
-    char *cfg_path = path_join(hf_dir, "inference/config.json");
+static void dspark_metadata_apply_hf_config_path(dspark_metadata *m, const char *cfg_path, bool *markov_rank_set) {
     size_t len = 0;
-    char *jtext = read_file(cfg_path, &len);
-    if (!jtext) {
-        free(cfg_path);
-        return m;
-    }
+    char *jtext = read_optional_file(cfg_path, &len);
+    if (!jtext) return;
     json_doc d = json_parse_text(jtext, len);
     int block = json_obj_get(&d, 0, "dspark_block_size");
     int noise = json_obj_get(&d, 0, "dspark_noise_token_id");
     int rank = json_obj_get(&d, 0, "dspark_markov_rank");
     int n_mtp = json_obj_get(&d, 0, "n_mtp_layers");
     int layers = json_obj_get(&d, 0, "dspark_target_layer_ids");
-    if (block >= 0) m.block_size = (uint32_t)json_i64(&d, block);
-    if (noise >= 0) m.noise_token_id = (uint32_t)json_i64(&d, noise);
+    if (block >= 0) m->block_size = (uint32_t)json_i64(&d, block);
+    if (noise >= 0) m->noise_token_id = (uint32_t)json_i64(&d, noise);
     if (rank >= 0) {
-        m.markov_rank = (uint32_t)json_i64(&d, rank);
+        m->markov_rank = (uint32_t)json_i64(&d, rank);
         if (markov_rank_set) *markov_rank_set = true;
     }
-    if (n_mtp >= 0) m.n_mtp_layers = (uint32_t)json_i64(&d, n_mtp);
+    if (n_mtp >= 0) m->n_mtp_layers = (uint32_t)json_i64(&d, n_mtp);
     if (layers >= 0 && d.v[layers].type == JT_ARRAY) {
         int n = 0;
         for (int i = layers + 1; i < d.len && d.v[i].parent == layers && n < DS4_DSPARK_TARGET_LAYER_COUNT;) {
-            m.target_layer_ids[n++] = (uint32_t)json_i64(&d, i);
+            m->target_layer_ids[n++] = (uint32_t)json_i64(&d, i);
             i = json_skip(&d, i);
         }
     }
     json_free(&d);
     free(jtext);
-    free(cfg_path);
+}
+
+static dspark_metadata dspark_metadata_from_hf_config(const char *hf_dir, bool *markov_rank_set) {
+    if (markov_rank_set) *markov_rank_set = false;
+    dspark_metadata m = dspark_metadata_defaults();
+    char *root_cfg_path = path_join(hf_dir, "config.json");
+    dspark_metadata_apply_hf_config_path(&m, root_cfg_path, markov_rank_set);
+    free(root_cfg_path);
+    char *inference_cfg_path = path_join(hf_dir, "inference/config.json");
+    dspark_metadata_apply_hf_config_path(&m, inference_cfg_path, markov_rank_set);
+    free(inference_cfg_path);
     return m;
 }
 
@@ -1375,6 +1406,12 @@ static bool is_attention_projection(const char *name) {
 
 static bool is_attention_tensor(const char *name) {
     return strstr(name, ".attn") || strstr(name, "attn_") || strstr(name, ".indexer") || strstr(name, "indexer_");
+}
+
+static bool is_norm_tensor(const char *name) {
+    return strcmp(name, "output_norm.weight") == 0 ||
+           strstr(name, "_norm.weight") != NULL ||
+           strstr(name, ".norm.weight") != NULL;
 }
 
 static bool is_shared_expert(const char *name) {
@@ -1428,13 +1465,16 @@ static ds4q_type policy_type(const quant_policy *p, const char *name, const tens
     if (is_mtp_tensor_name(name) && is_dspark_special_tensor(name)) {
         if (strstr(name, ".confidence_head.proj.weight")) return DS4Q_TYPE_F32;
         if (strstr(name, ".main_proj.weight")) return DS4Q_TYPE_Q8_0;
-        if (strstr(name, ".main_norm.weight")) return DS4Q_TYPE_F32;
+        if (strstr(name, ".main_norm.weight") || strstr(name, ".attn_norm.weight") ||
+            strstr(name, ".attn_q_a_norm.weight") || strstr(name, ".attn_kv_a_norm.weight") ||
+            strstr(name, ".ffn_norm.weight")) return DS4Q_TYPE_F32;
         if (strstr(name, ".markov_head.markov_w1.weight") ||
             strstr(name, ".markov_head.markov_w2.weight")) {
             return tmpl->type == DS4Q_TYPE_F32 ? DS4Q_TYPE_F32 : DS4Q_TYPE_F16;
         }
     }
     if (is_loader_plain_f16_tensor(name)) return DS4Q_TYPE_F16;
+    if (is_norm_tensor(name)) return DS4Q_TYPE_F32;
     if (tensor_n_dims(tmpl) <= 1) return tmpl->type;
     if (strcmp(name, "token_embd.weight") == 0 && p->embedding != DS4Q_TYPE_COUNT) return p->embedding;
     if (is_output_tensor(name) && p->output != DS4Q_TYPE_COUNT) return p->output;
@@ -1460,6 +1500,19 @@ static void expect_policy_type(const quant_policy *p, const char *name, ds4q_typ
     }
 }
 
+static void self_test_dspark_only_args(void);
+static ds4q_type dspark_template_for_name(const char *name, ds4q_type hf_type);
+
+static void expect_dspark_template_type(const char *name, ds4q_type hf_type, ds4q_type want) {
+    ds4q_type got = dspark_template_for_name(name, hf_type);
+    if (got != want) {
+        fprintf(stderr, "error: DSpark template %s -> %s, expected %s\n",
+                name, ds4q_type_name(got), ds4q_type_name(want));
+        exit(1);
+    }
+}
+
+
 static void self_test_dspark_map(void) {
     expect_hf_name("mtp.0.hc_attn_base.weight", "mtp.0.hc_attn_base");
     expect_hf_name("mtp.0.main_proj.weight", "mtp.0.main_proj.weight");
@@ -1484,8 +1537,30 @@ static void self_test_dspark_map(void) {
     expect_policy_type(&pol, "mtp.0.ffn_gate_inp.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F16);
     expect_policy_type(&pol, "blk.0.hc_ffn_fn.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F16);
     expect_policy_type(&pol, "output_hc_fn.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F16);
+    expect_policy_type(&pol, "blk.0.attn_norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
+    expect_policy_type(&pol, "blk.0.attn_q_a_norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
+    expect_policy_type(&pol, "blk.0.attn_kv_a_norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
+    expect_policy_type(&pol, "blk.0.ffn_norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
     pol.dense = DS4Q_TYPE_COUNT;
     expect_policy_type(&pol, "mtp.0.main_norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
+    expect_policy_type(&pol, "mtp.0.attn_norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
+    expect_policy_type(&pol, "mtp.0.ffn_norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
+    expect_dspark_template_type("mtp.0.hc_attn_base.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
+    expect_dspark_template_type("mtp.0.hc_attn_scale.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
+    expect_dspark_template_type("mtp.0.attn_sinks.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
+    expect_dspark_template_type("mtp.0.attn_norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
+    expect_dspark_template_type("mtp.0.attn_q_a_norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
+    expect_dspark_template_type("mtp.0.attn_kv_a_norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
+    expect_dspark_template_type("mtp.0.hc_ffn_base.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
+    expect_dspark_template_type("mtp.0.hc_ffn_scale.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
+    expect_dspark_template_type("mtp.0.ffn_norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
+    expect_dspark_template_type("mtp.0.exp_probs_b.bias", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
+    expect_dspark_template_type("mtp.2.main_norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
+    expect_dspark_template_type("mtp.2.norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
+    expect_dspark_template_type("mtp.0.ffn_gate_inp.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F16);
+    expect_dspark_template_type("mtp.2.hc_head_base.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
+    expect_dspark_template_type("mtp.2.hc_head_scale.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
+    expect_dspark_template_type("mtp.2.confidence_head.proj.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
     if (dspark_hf_layout_guess(true, true, true, false, 0) != DS4_DSPARK_HF_MARKOV) {
         die("official DSpark HF layout not detected");
     }
@@ -1495,11 +1570,59 @@ static void self_test_dspark_map(void) {
     if (dspark_hf_layout_guess(true, false, false, false, 0) != DS4_DSPARK_HF_NONE) {
         die("main-proj-only DSpark layout detected without markov_rank=0 metadata");
     }
+    char tmpdir[] = "/tmp/ds4q-config-XXXXXX";
+    char *dir = mkdtemp(tmpdir);
+    if (!dir) die_errno("mkdtemp", tmpdir);
+    char *cfg_path = path_join(dir, "config.json");
+    FILE *cfp = fopen(cfg_path, "wb");
+    if (!cfp) die_errno("create config", cfg_path);
+    fputs("{\"dspark_block_size\":7,\"dspark_noise_token_id\":9,\"dspark_markov_rank\":0,"
+          "\"n_mtp_layers\":3,\"dspark_target_layer_ids\":[5,6,7]}", cfp);
+    if (fclose(cfp) != 0) die_errno("close config", cfg_path);
+    bool rank_set = false;
+    dspark_metadata fm = dspark_metadata_from_hf_config(dir, &rank_set);
+    if (!rank_set || fm.block_size != 7 || fm.noise_token_id != 9 || fm.markov_rank != 0 ||
+        fm.n_mtp_layers != 3 || fm.target_layer_ids[0] != 5 || fm.target_layer_ids[2] != 7) {
+        die("bad DSpark root config metadata parse");
+    }
+    unlink(cfg_path);
+    free(cfg_path);
+    rmdir(dir);
+    char tmpdir_inference[] = "/tmp/ds4q-config-merge-XXXXXX";
+    char *dir_inference = mkdtemp(tmpdir_inference);
+    if (!dir_inference) die_errno("mkdtemp", tmpdir_inference);
+    char *root_cfg_path = path_join(dir_inference, "config.json");
+    FILE *root_cfp = fopen(root_cfg_path, "wb");
+    if (!root_cfp) die_errno("create root config", root_cfg_path);
+    fputs("{\"num_nextn_predict_layers\":1}", root_cfp);
+    if (fclose(root_cfp) != 0) die_errno("close root config", root_cfg_path);
+    char *inf_dir = path_join(dir_inference, "inference");
+    if (mkdir(inf_dir, 0700) != 0) die_errno("mkdir", inf_dir);
+    char *inf_cfg_path = path_join(inf_dir, "config.json");
+    FILE *inf_cfp = fopen(inf_cfg_path, "wb");
+    if (!inf_cfp) die_errno("create inference config", inf_cfg_path);
+    fputs("{\"dspark_block_size\":8,\"dspark_noise_token_id\":11,\"dspark_markov_rank\":0,"
+          "\"n_mtp_layers\":3,\"dspark_target_layer_ids\":[40,41,42]}", inf_cfp);
+    if (fclose(inf_cfp) != 0) die_errno("close inference config", inf_cfg_path);
+    rank_set = false;
+    fm = dspark_metadata_from_hf_config(dir_inference, &rank_set);
+    if (!rank_set || fm.block_size != 8 || fm.noise_token_id != 11 || fm.markov_rank != 0 ||
+        fm.n_mtp_layers != 3 || fm.target_layer_ids[0] != 40 || fm.target_layer_ids[2] != 42) {
+        die("bad DSpark inference config metadata merge");
+    }
+    unlink(inf_cfg_path);
+    unlink(root_cfg_path);
+    rmdir(inf_dir);
+    rmdir(dir_inference);
+    free(inf_cfg_path);
+    free(inf_dir);
+    free(root_cfg_path);
     dspark_metadata dm = dspark_metadata_defaults();
     if (dm.block_size != 5 || dm.noise_token_id != 128799 || dm.markov_rank != 256 ||
         dm.n_mtp_layers != 3 || dm.target_layer_ids[0] != 40) {
         die("bad DSpark metadata defaults");
     }
+    self_test_dspark_only_args();
     puts("dspark_map: OK");
 }
 
@@ -1604,18 +1727,23 @@ static size_t tensor_nbytes(ds4q_type type, const int64_t *ne, int n_dims) {
     return nbytes;
 }
 
+static bool reversed_shape_matches(const st_info *info, const tensor_meta *tmpl, int nd) {
+    if (info->n_dims != nd) return false;
+    for (int i = 0; i < nd; i++) {
+        if (tmpl->ne[i] != info->shape[nd - 1 - i]) return false;
+    }
+    return true;
+}
+
 static void check_reversed_shape(const char *gguf_name, const st_info *info, const tensor_meta *tmpl) {
-    int nd = tensor_n_dims(tmpl);
-    if (info->n_dims != nd) {
+    if (reversed_shape_matches(info, tmpl, tmpl->n_dims)) return;
+    if (reversed_shape_matches(info, tmpl, tensor_n_dims(tmpl))) return;
+    if (info->n_dims != tmpl->n_dims && info->n_dims != tensor_n_dims(tmpl)) {
         fprintf(stderr, "error: rank mismatch for %s\n", gguf_name);
         exit(1);
     }
-    for (int i = 0; i < nd; i++) {
-        if (tmpl->ne[i] != info->shape[nd - 1 - i]) {
-            fprintf(stderr, "error: shape mismatch for %s\n", gguf_name);
-            exit(1);
-        }
-    }
+    fprintf(stderr, "error: shape mismatch for %s\n", gguf_name);
+    exit(1);
 }
 
 static void check_reversed_shape_exact(const char *gguf_name, const st_info *info, const tensor_meta *tmpl) {
@@ -3081,6 +3209,8 @@ static params parse_args(int argc, char **argv) {
             p.overwrite = true;
         } else if (strcmp(arg, "--self-test-dspark-map") == 0) {
             p.self_test_dspark_map = true;
+        } else if (strcmp(arg, "--dspark-only") == 0) {
+            p.dspark_only = true;
         } else if (strcmp(arg, "--dry-run") == 0) {
             p.dry_run = true;
         } else if (strcmp(arg, "--dspark-manifest") == 0) {
@@ -3154,6 +3284,18 @@ static params parse_args(int argc, char **argv) {
     if (p.compare_tensor && !p.compare_gguf) p.compare_gguf = p.template_gguf;
     if (p.out_gguf && file_exists(p.out_gguf) && !p.overwrite) die("output exists; use --overwrite");
     return p;
+}
+
+static void self_test_dspark_only_args(void) {
+    char *argv[] = {
+        "deepseek4-quantize",
+        "--self-test-dspark-map",
+        "--dspark-only",
+    };
+    params p = parse_args((int)(sizeof(argv) / sizeof(argv[0])), argv);
+    if (!p.self_test_dspark_map || !p.dspark_only) {
+        die("bad --dspark-only self-test parsing");
+    }
 }
 
 static void free_gguf_file(gguf_file *g) {
@@ -3333,6 +3475,10 @@ int main(int argc, char **argv) {
         write_dspark = true;
         fprintf(stderr, "DSpark HF %s layout detected; writing deepseek4.dspark.* metadata\n",
                 dspark_hf_layout_name(dspark_layout));
+    }
+    if (p.dspark_only) {
+        gguf_use_dspark_mtp_template(&tmpl, &db, p.n_experts, dspark_layout);
+        write_dspark = true;
     }
     output_context out_ctx = build_output_context(&tmpl, &p.policy, &imatrix, write_dspark, &dspark_meta);
     print_plan(&tmpl, &out_ctx);

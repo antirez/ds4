@@ -13,6 +13,9 @@ The important pieces are:
   importance with `ds4`.
 - `quality-testing/`: prompts and scripts used to compare local GGUF variants
   against official DeepSeek V4 Flash continuations.
+- `deepspec/ds4_deepspec.py`: validates DS4 target-cache exports against the
+  DeepSpec v2 manifest/index/shard contract and emits the DS4-side non-Markov
+  DeepSpec config scaffold before external training.
 
 ## Build
 
