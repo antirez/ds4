@@ -1,6 +1,7 @@
 #define DS4_SERVER_TEST
 #define DS4_SERVER_TEST_NO_MAIN
 #include "../ds4_server.c"
+#include "../ds4_dspark_runtime.h"
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
 #include <math.h>
@@ -6406,6 +6407,44 @@ static void test_dspark_verify_depth(void) {
 }
 #endif
 
+static void test_dspark_binder_helpers(void) {
+    ds4_dspark_config cfg;
+    ds4_dspark_config_init_defaults(&cfg);
+    TEST_ASSERT(cfg.n_mtp_layers == 3);
+    TEST_ASSERT(cfg.block_size == 5);
+    TEST_ASSERT(cfg.noise_token_id == 128799u);
+    TEST_ASSERT(cfg.markov_rank == 256);
+    TEST_ASSERT(cfg.target_layer_ids[0] == 40);
+    TEST_ASSERT(cfg.target_layer_ids[1] == 41);
+    TEST_ASSERT(cfg.target_layer_ids[2] == 42);
+
+    TEST_ASSERT(ds4_mtp_draft_kind_guess(false, false, false) == DS4_MTP_DRAFT_NONE);
+    TEST_ASSERT(ds4_mtp_draft_kind_guess(true, false, false) == DS4_MTP_DRAFT_LEGACY);
+    TEST_ASSERT(ds4_mtp_draft_kind_guess(false, true, true) == DS4_MTP_DRAFT_DSPARK);
+    TEST_ASSERT(!strcmp(ds4_mtp_draft_kind_name(DS4_MTP_DRAFT_DSPARK), "dspark"));
+    TEST_ASSERT(!strcmp(ds4_mtp_draft_kind_name(DS4_MTP_DRAFT_LEGACY), "legacy-mtp"));
+}
+
+static void test_dspark_runtime_helpers(void) {
+    ds4_dspark_config cfg;
+    ds4_dspark_config_init_defaults(&cfg);
+    TEST_ASSERT(ds4_dspark_speculative_gate(DS4_MTP_DRAFT_LEGACY, true, 4) ==
+                DS4_DSPARK_SPEC_LEGACY_MTP);
+    TEST_ASSERT(ds4_dspark_speculative_gate(DS4_MTP_DRAFT_DSPARK, true, 5) ==
+                DS4_DSPARK_SPEC_DSPARK_NOT_READY);
+    TEST_ASSERT(ds4_dspark_speculative_gate(DS4_MTP_DRAFT_DSPARK, true, 1) ==
+                DS4_DSPARK_SPEC_DISABLED);
+    TEST_ASSERT(strstr(ds4_dspark_spec_gate_reason(DS4_DSPARK_SPEC_DSPARK_NOT_READY),
+                       "not been validated") != NULL);
+    TEST_ASSERT(strstr(ds4_dspark_spec_gate_reason(DS4_DSPARK_SPEC_DSPARK_NOT_READY),
+                       "no fake draft tokens") != NULL);
+    TEST_ASSERT(ds4_mtp_speculative_draft_ready(DS4_MTP_DRAFT_LEGACY));
+    TEST_ASSERT(!ds4_mtp_speculative_draft_ready(DS4_MTP_DRAFT_NONE));
+    TEST_ASSERT(!ds4_mtp_speculative_draft_ready(DS4_MTP_DRAFT_DSPARK));
+    TEST_ASSERT(ds4_engine_has_mtp(NULL) == false);
+}
+
+
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
@@ -6434,6 +6473,9 @@ static const ds4_test_entry test_entries[] = {
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
     {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
 #endif
+    {"--dspark-binder", "dspark-binder", "DSpark draft kind/config defaults without GGUF", test_dspark_binder_helpers},
+    {"--dspark-runtime", "dspark-runtime", "DSpark capture plan and speculative gate helpers", test_dspark_runtime_helpers},
+
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 
