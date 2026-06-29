@@ -135,9 +135,11 @@ native tooling can be added later.
 
 `./download_model.sh mtp` fetches the optional speculative decoding support
 GGUF for Flash. It can be used with q2-imatrix, q2-q4-imatrix, and q4-imatrix,
-but must be enabled explicitly with `--mtp`. The current MTP/speculative
-decoding path is still experimental: it is correctness-gated and currently
-provides at most a slight speedup, not a meaningful generation-speed win.
+but must be enabled explicitly with `--mtp`. Legacy one-step MTP is
+correctness-gated and experimental: it currently provides at most a slight
+speedup, not a meaningful generation-speed win. DSpark/DeepSpec draft GGUFs are
+recognized by the loader/converter, but block-draft speculative decode remains
+disabled until a Metal draft graph is validated on real converted weights.
 
 Then build:
 
@@ -689,10 +691,11 @@ conversation. Useful commands are `/help`, `/think`, `/think-max`, `/nothink`,
 and returns to `ds4>`.
 
 The CLI defaults to thinking mode. Use `/nothink` or `--nothink` for direct
-answers. `--mtp MTP.gguf --mtp-draft 2` enables the optional MTP speculative
-path; it is useful only for greedy decoding, currently uses a confidence gate
-(`--mtp-margin`) to avoid slow partial accepts, and should be treated as an
-experimental slight-speedup path.
+answers. `--mtp MTP.gguf --mtp-draft 2` enables the optional legacy one-step
+MTP speculative path; it is useful only for greedy decoding, currently uses a
+confidence gate (`--mtp-margin`) to avoid slow partial accepts, and should be
+treated as an experimental slight-speedup path. DSpark/DeepSpec GGUFs load and
+report a clear disabled-runtime reason instead of emitting fake draft tokens.
 
 ## Server
 

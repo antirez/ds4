@@ -38,6 +38,7 @@
 
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_dspark_runtime.h"
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
@@ -3061,16 +3062,26 @@ typedef struct {
     ds4_layer_weights layer[DS4_MAX_LAYER];
 } ds4_weights;
 
+enum { DS4_DSPARK_MTP_LAYERS = 3 };
+
 typedef struct {
-    ds4_tensor *e_proj;
-    ds4_tensor *h_proj;
-    ds4_tensor *enorm;
-    ds4_tensor *hnorm;
-    ds4_tensor *norm;
-    ds4_tensor *hc_head_base;
-    ds4_tensor *hc_head_fn;
-    ds4_tensor *hc_head_scale;
-    ds4_layer_weights block;
+    ds4_mtp_draft_kind kind;
+    ds4_dspark_config  dspark;
+    ds4_tensor        *e_proj;
+    ds4_tensor        *h_proj;
+    ds4_tensor        *enorm;
+    ds4_tensor        *hnorm;
+    ds4_tensor        *norm;
+    ds4_tensor        *hc_head_base;
+    ds4_tensor        *hc_head_fn;
+    ds4_tensor        *hc_head_scale;
+    ds4_tensor        *main_proj;
+    ds4_tensor        *main_norm;
+    ds4_tensor        *markov_w1;
+    ds4_tensor        *markov_w2;
+    ds4_tensor        *confidence_proj;
+    ds4_layer_weights  block;
+    ds4_layer_weights  stage[DS4_DSPARK_MTP_LAYERS];
 } ds4_mtp_weights;
 
 /* =========================================================================
@@ -3639,21 +3650,93 @@ static void weights_validate_layout(
     }
 }
 
-static void mtp_weights_validate_layout(const ds4_mtp_weights *w) {
+
+void ds4_dspark_config_init_defaults(ds4_dspark_config *cfg) {
+    if (!cfg) return;
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->n_mtp_layers = 3;
+    cfg->block_size = 5;
+    cfg->noise_token_id = 128799u;
+    cfg->markov_rank = 256;
+    cfg->target_layer_ids[0] = 40;
+    cfg->target_layer_ids[1] = 41;
+    cfg->target_layer_ids[2] = 42;
+}
+
+const char *ds4_mtp_draft_kind_name(ds4_mtp_draft_kind kind) {
+    switch (kind) {
+    case DS4_MTP_DRAFT_LEGACY: return "legacy-mtp";
+    case DS4_MTP_DRAFT_DSPARK:  return "dspark";
+    default:                    return "none";
+    }
+}
+
+ds4_mtp_draft_kind ds4_mtp_draft_kind_guess(bool has_e_proj, bool has_main_proj, bool has_markov_w1) {
+    if (has_main_proj && has_markov_w1) return DS4_MTP_DRAFT_DSPARK;
+    if (has_e_proj) return DS4_MTP_DRAFT_LEGACY;
+    return DS4_MTP_DRAFT_NONE;
+}
+
+static void dspark_config_apply_metadata(ds4_dspark_config *cfg, const ds4_model *m) {
+    ds4_dspark_config_init_defaults(cfg);
+    uint32_t v = 0;
+    if (model_get_u32(m, "deepseek4.dspark.n_mtp_layers", &v)) {
+        if (v != DS4_DSPARK_MTP_LAYERS) {
+            fprintf(stderr, "ds4: DSpark draft expects %u stages, GGUF has n_mtp_layers=%u\n",
+                    DS4_DSPARK_MTP_LAYERS, v);
+            exit(1);
+        }
+        cfg->n_mtp_layers = v;
+    }
+    if (model_get_u32(m, "deepseek4.dspark.block_size", &v) && v > 0) cfg->block_size = v;
+    if (model_get_u32(m, "deepseek4.dspark.noise_token_id", &v)) cfg->noise_token_id = v;
+    if (model_get_u32(m, "deepseek4.dspark.markov_rank", &v) && v > 0) cfg->markov_rank = v;
+    for (uint32_t i = 0; i < 3; i++) {
+        char key[64];
+        snprintf(key, sizeof(key), "deepseek4.dspark.target_layer_ids.%u", i);
+        if (model_get_u32(m, key, &v)) cfg->target_layer_ids[i] = v;
+    }
+}
+
+static ds4_mtp_draft_kind mtp_model_detect_kind(const ds4_model *m) {
+    const bool has_e_proj = model_find_tensor(m, "mtp.0.e_proj.weight") != NULL;
+    const bool has_main_proj = model_find_tensor(m, "mtp.0.main_proj.weight") != NULL;
+    const bool has_markov = model_find_tensor(m, "mtp.2.markov_head.markov_w1.weight") != NULL;
+    return ds4_mtp_draft_kind_guess(has_e_proj, has_main_proj, has_markov);
+}
+
+static void mtp_weights_bind_mtp_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t stage) {
+    l->hc_attn_fn      = required_tensorf(m, "mtp.%u.hc_attn_fn.weight", stage);
+    l->hc_attn_scale   = required_tensorf(m, "mtp.%u.hc_attn_scale.weight", stage);
+    l->hc_attn_base    = required_tensorf(m, "mtp.%u.hc_attn_base.weight", stage);
+    l->attn_norm       = required_tensorf(m, "mtp.%u.attn_norm.weight", stage);
+    l->attn_q_a        = required_tensorf(m, "mtp.%u.attn_q_a.weight", stage);
+    l->attn_q_a_norm   = required_tensorf(m, "mtp.%u.attn_q_a_norm.weight", stage);
+    l->attn_q_b        = required_tensorf(m, "mtp.%u.attn_q_b.weight", stage);
+    l->attn_kv         = required_tensorf(m, "mtp.%u.attn_kv.weight", stage);
+    l->attn_kv_a_norm  = required_tensorf(m, "mtp.%u.attn_kv_a_norm.weight", stage);
+    l->attn_sinks      = required_tensorf(m, "mtp.%u.attn_sinks.weight", stage);
+    l->attn_output_a   = required_tensorf(m, "mtp.%u.attn_output_a.weight", stage);
+    l->attn_output_b   = required_tensorf(m, "mtp.%u.attn_output_b.weight", stage);
+    l->hc_ffn_fn       = required_tensorf(m, "mtp.%u.hc_ffn_fn.weight", stage);
+    l->hc_ffn_scale    = required_tensorf(m, "mtp.%u.hc_ffn_scale.weight", stage);
+    l->hc_ffn_base     = required_tensorf(m, "mtp.%u.hc_ffn_base.weight", stage);
+    l->ffn_norm        = required_tensorf(m, "mtp.%u.ffn_norm.weight", stage);
+    l->ffn_gate_inp    = required_tensorf(m, "mtp.%u.ffn_gate_inp.weight", stage);
+    l->ffn_exp_probs_b = tensor_by_namef(m, "mtp.%u.exp_probs_b.bias", stage);
+    l->ffn_gate_exps   = required_tensorf(m, "mtp.%u.ffn_gate_exps.weight", stage);
+    l->ffn_up_exps     = required_tensorf(m, "mtp.%u.ffn_up_exps.weight", stage);
+    l->ffn_down_exps   = required_tensorf(m, "mtp.%u.ffn_down_exps.weight", stage);
+    l->ffn_gate_shexp  = required_tensorf(m, "mtp.%u.ffn_gate_shexp.weight", stage);
+    l->ffn_up_shexp    = required_tensorf(m, "mtp.%u.ffn_up_shexp.weight", stage);
+    l->ffn_down_shexp  = required_tensorf(m, "mtp.%u.ffn_down_shexp.weight", stage);
+}
+
+static void mtp_layer_validate_layout(const ds4_layer_weights *l, bool require_exp_probs_b) {
     const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
     const uint64_t hc_mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t out_low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
-    const ds4_layer_weights *l = &w->block;
-
-    tensor_expect_layout(w->hc_head_base,  DS4_TENSOR_F32,  1, DS4_N_HC, 0, 0);
-    tensor_expect_plain_layout(w->hc_head_fn, 2, hc_dim, DS4_N_HC, 0);
-    tensor_expect_layout(w->hc_head_scale, DS4_TENSOR_F32,  1, 1, 0, 0);
-    tensor_expect_layout(w->e_proj,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_EMBD, 0);
-    tensor_expect_layout(w->h_proj,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_EMBD, 0);
-    tensor_expect_layout(w->enorm,         DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-    tensor_expect_layout(w->hnorm,         DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-    tensor_expect_layout(w->norm,          DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
 
     tensor_expect_plain_layout(l->hc_attn_fn, 2, hc_dim, hc_mix_dim, 0);
     tensor_expect_layout(l->hc_attn_scale,  DS4_TENSOR_F32,  1, 3, 0, 0);
@@ -3667,13 +3750,16 @@ static void mtp_weights_validate_layout(const ds4_mtp_weights *w) {
     tensor_expect_layout(l->attn_sinks,     DS4_TENSOR_F32,  1, DS4_N_HEAD, 0, 0);
     tensor_expect_layout(l->attn_output_a,  DS4_TENSOR_Q8_0, 2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
     tensor_expect_layout(l->attn_output_b,  DS4_TENSOR_Q8_0, 2, out_low_dim, DS4_N_EMBD, 0);
-
     tensor_expect_plain_layout(l->hc_ffn_fn, 2, hc_dim, hc_mix_dim, 0);
     tensor_expect_layout(l->hc_ffn_scale,   DS4_TENSOR_F32,  1, 3, 0, 0);
     tensor_expect_layout(l->hc_ffn_base,    DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
     tensor_expect_layout(l->ffn_norm,       DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
     tensor_expect_plain_layout(l->ffn_gate_inp, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
-    tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
+    if (require_exp_probs_b) {
+        tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
+    } else {
+        tensor_expect_optional(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
+    }
     tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
     tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
     tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
@@ -3684,6 +3770,77 @@ static void mtp_weights_validate_layout(const ds4_mtp_weights *w) {
     tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
     tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_Q8_0, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
 }
+
+static void mtp_weights_validate_legacy_layout(const ds4_mtp_weights *w) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
+
+    tensor_expect_layout(w->hc_head_base,  DS4_TENSOR_F32,  1, DS4_N_HC, 0, 0);
+    tensor_expect_plain_layout(w->hc_head_fn, 2, hc_dim, DS4_N_HC, 0);
+    tensor_expect_layout(w->hc_head_scale, DS4_TENSOR_F32,  1, 1, 0, 0);
+    tensor_expect_layout(w->e_proj,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_EMBD, 0);
+    tensor_expect_layout(w->h_proj,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_EMBD, 0);
+    tensor_expect_layout(w->enorm,         DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
+    tensor_expect_layout(w->hnorm,         DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
+    tensor_expect_layout(w->norm,          DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
+    mtp_layer_validate_layout(&w->block, true);
+}
+
+static void mtp_weights_validate_dspark_layout(const ds4_mtp_weights *w) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
+    const uint64_t main_in = 3u * DS4_N_EMBD;
+    const uint64_t conf_in = DS4_N_EMBD + (uint64_t)w->dspark.markov_rank;
+
+    tensor_expect_layout(w->main_proj, DS4_TENSOR_Q8_0, 2, main_in, DS4_N_EMBD, 0);
+    tensor_expect_layout(w->main_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+    for (uint32_t s = 0; s < w->dspark.n_mtp_layers; s++) {
+        mtp_layer_validate_layout(&w->stage[s], false);
+    }
+    tensor_expect_layout(w->norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+    tensor_expect_layout(w->hc_head_base,  DS4_TENSOR_F32,  1, DS4_N_HC, 0, 0);
+    tensor_expect_plain_layout(w->hc_head_fn, 2, hc_dim, DS4_N_HC, 0);
+    tensor_expect_layout(w->hc_head_scale, DS4_TENSOR_F32,  1, 1, 0, 0);
+    tensor_expect_plain_layout(w->markov_w1, 2, DS4_N_VOCAB, w->dspark.markov_rank, 0);
+    tensor_expect_plain_layout(w->markov_w2, 2, w->dspark.markov_rank, DS4_N_VOCAB, 0);
+    tensor_expect_plain_layout(w->confidence_proj, 2, conf_in, 1, 0);
+}
+
+static void mtp_weights_bind_legacy(ds4_mtp_weights *w, const ds4_model *m) {
+    w->kind = DS4_MTP_DRAFT_LEGACY;
+    w->hc_head_base  = required_tensor(m, "mtp.0.hc_head_base.weight");
+    w->hc_head_fn    = required_tensor(m, "mtp.0.hc_head_fn.weight");
+    w->hc_head_scale = required_tensor(m, "mtp.0.hc_head_scale.weight");
+    w->e_proj        = required_tensor(m, "mtp.0.e_proj.weight");
+    w->h_proj        = required_tensor(m, "mtp.0.h_proj.weight");
+    w->enorm         = required_tensor(m, "mtp.0.enorm.weight");
+    w->hnorm         = required_tensor(m, "mtp.0.hnorm.weight");
+    w->norm          = required_tensor(m, "mtp.0.norm.weight");
+    mtp_weights_bind_mtp_layer(&w->block, m, 0);
+    mtp_weights_validate_legacy_layout(w);
+}
+
+static void mtp_weights_bind_dspark(ds4_mtp_weights *w, const ds4_model *m) {
+    w->kind = DS4_MTP_DRAFT_DSPARK;
+    dspark_config_apply_metadata(&w->dspark, m);
+    if (w->dspark.n_mtp_layers != DS4_DSPARK_MTP_LAYERS) {
+        fprintf(stderr, "ds4: DSpark draft expects %u stages, GGUF has n_mtp_layers=%u\n",
+                DS4_DSPARK_MTP_LAYERS, w->dspark.n_mtp_layers);
+        exit(1);
+    }
+    w->main_proj = required_tensor(m, "mtp.0.main_proj.weight");
+    w->main_norm = required_tensor(m, "mtp.0.main_norm.weight");
+    for (uint32_t s = 0; s < DS4_DSPARK_MTP_LAYERS; s++) {
+        mtp_weights_bind_mtp_layer(&w->stage[s], m, s);
+    }
+    w->norm = required_tensor(m, "mtp.2.norm.weight");
+    w->hc_head_base  = required_tensor(m, "mtp.2.hc_head_base.weight");
+    w->hc_head_fn    = required_tensor(m, "mtp.2.hc_head_fn.weight");
+    w->hc_head_scale = required_tensor(m, "mtp.2.hc_head_scale.weight");
+    w->markov_w1 = required_tensor(m, "mtp.2.markov_head.markov_w1.weight");
+    w->markov_w2 = required_tensor(m, "mtp.2.markov_head.markov_w2.weight");
+    w->confidence_proj = required_tensor(m, "mtp.2.confidence_head.proj.weight");
+    mtp_weights_validate_dspark_layout(w);
+}
+
 
 static bool ds4_shape_matches_metadata(
         const ds4_shape *s,
@@ -4433,45 +4590,29 @@ static DS4_MAYBE_UNUSED bool weights_model_map_output_spans(
     return model_map_span_vec_finish(spans);
 }
 
+
+bool ds4_mtp_speculative_draft_ready(ds4_mtp_draft_kind kind) {
+    return kind == DS4_MTP_DRAFT_LEGACY;
+}
+
+static bool mtp_draft_runtime_supported(ds4_mtp_draft_kind kind) {
+    return ds4_mtp_speculative_draft_ready(kind);
+}
+
 static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
     memset(w, 0, sizeof(*w));
-
-    w->hc_head_base  = required_tensor(m, "mtp.0.hc_head_base.weight");
-    w->hc_head_fn    = required_tensor(m, "mtp.0.hc_head_fn.weight");
-    w->hc_head_scale = required_tensor(m, "mtp.0.hc_head_scale.weight");
-    w->e_proj        = required_tensor(m, "mtp.0.e_proj.weight");
-    w->h_proj        = required_tensor(m, "mtp.0.h_proj.weight");
-    w->enorm         = required_tensor(m, "mtp.0.enorm.weight");
-    w->hnorm         = required_tensor(m, "mtp.0.hnorm.weight");
-    w->norm          = required_tensor(m, "mtp.0.norm.weight");
-
-    ds4_layer_weights *l = &w->block;
-    l->hc_attn_fn      = required_tensor(m, "mtp.0.hc_attn_fn.weight");
-    l->hc_attn_scale   = required_tensor(m, "mtp.0.hc_attn_scale.weight");
-    l->hc_attn_base    = required_tensor(m, "mtp.0.hc_attn_base.weight");
-    l->attn_norm       = required_tensor(m, "mtp.0.attn_norm.weight");
-    l->attn_q_a        = required_tensor(m, "mtp.0.attn_q_a.weight");
-    l->attn_q_a_norm   = required_tensor(m, "mtp.0.attn_q_a_norm.weight");
-    l->attn_q_b        = required_tensor(m, "mtp.0.attn_q_b.weight");
-    l->attn_kv         = required_tensor(m, "mtp.0.attn_kv.weight");
-    l->attn_kv_a_norm  = required_tensor(m, "mtp.0.attn_kv_a_norm.weight");
-    l->attn_sinks      = required_tensor(m, "mtp.0.attn_sinks.weight");
-    l->attn_output_a   = required_tensor(m, "mtp.0.attn_output_a.weight");
-    l->attn_output_b   = required_tensor(m, "mtp.0.attn_output_b.weight");
-    l->hc_ffn_fn       = required_tensor(m, "mtp.0.hc_ffn_fn.weight");
-    l->hc_ffn_scale    = required_tensor(m, "mtp.0.hc_ffn_scale.weight");
-    l->hc_ffn_base     = required_tensor(m, "mtp.0.hc_ffn_base.weight");
-    l->ffn_norm        = required_tensor(m, "mtp.0.ffn_norm.weight");
-    l->ffn_gate_inp    = required_tensor(m, "mtp.0.ffn_gate_inp.weight");
-    l->ffn_exp_probs_b = required_tensor(m, "mtp.0.exp_probs_b.bias");
-    l->ffn_gate_exps   = required_tensor(m, "mtp.0.ffn_gate_exps.weight");
-    l->ffn_up_exps     = required_tensor(m, "mtp.0.ffn_up_exps.weight");
-    l->ffn_down_exps   = required_tensor(m, "mtp.0.ffn_down_exps.weight");
-    l->ffn_gate_shexp  = required_tensor(m, "mtp.0.ffn_gate_shexp.weight");
-    l->ffn_up_shexp    = required_tensor(m, "mtp.0.ffn_up_shexp.weight");
-    l->ffn_down_shexp  = required_tensor(m, "mtp.0.ffn_down_shexp.weight");
-
-    mtp_weights_validate_layout(w);
+    const ds4_mtp_draft_kind kind = mtp_model_detect_kind(m);
+    if (kind == DS4_MTP_DRAFT_DSPARK) {
+        mtp_weights_bind_dspark(w, m);
+        return;
+    }
+    if (kind == DS4_MTP_DRAFT_LEGACY) {
+        mtp_weights_bind_legacy(w, m);
+        return;
+    }
+    fprintf(stderr,
+            "ds4: unsupported draft GGUF: need legacy mtp.0.e_proj or DSpark mtp.0.main_proj + mtp.2.markov_head\n");
+    exit(1);
 }
 
 static void weights_free(ds4_weights *w) {
@@ -8320,6 +8461,7 @@ typedef struct {
     uint32_t head_dim;
 } ds4_kv_cache;
 
+
 static uint32_t ds4_default_raw_cap(uint32_t ctx_size) {
     uint32_t raw_cap = DS4_N_SWA;
     if (raw_cap > ctx_size) raw_cap = ctx_size;
@@ -10530,7 +10672,6 @@ static void graph_power_note_decode_token(ds4_gpu_graph *g, double elapsed_sec) 
         graph_power_update_avg(g->decode_token_avg_sec, elapsed_sec);
     graph_power_sleep(g->decode_token_avg_sec, g->power_percent);
 }
-
 /* Release every Metal tensor owned by the whole-model graph runtime. */
 static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->directional_steering_dirs);
@@ -19457,7 +19598,8 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     return ok;
 }
 
-/* Execute one Metal decode token and read back logits. */
+/* Execute one Metal decode token and optionally capture the target hidden states
+ * that DSpark uses as the draft model's cross-token input. */
 static bool metal_graph_eval_token_raw_swa(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -19474,7 +19616,8 @@ static bool metal_graph_eval_token_raw_swa(
     const double t0 = (profile || throttle) ? now_sec() : 0.0;
 
     bool ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL, true);
+    if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos,
+                                                  logits != NULL, true);
     const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
     if (ok) ok = ds4_gpu_end_commands() != 0;
     const double t_done = (profile || throttle) ? now_sec() : 0.0;
@@ -19501,6 +19644,8 @@ static bool metal_graph_eval_token_raw_swa(
     }
     return ok;
 }
+
+/* Execute one Metal decode token and read back logits. */
 
 static bool metal_graph_streaming_decode_prefill_wide_default(
         const ds4_weights *weights) {
@@ -24040,11 +24185,17 @@ bool ds4_engine_has_output_head(ds4_engine *e) {
     return e && weights_have_output_head(&e->weights);
 }
 
+ds4_mtp_draft_kind ds4_engine_mtp_draft_kind(ds4_engine *e) {
+    return (e && e->mtp_ready) ? e->mtp_weights.kind : DS4_MTP_DRAFT_NONE;
+}
+
 bool ds4_engine_has_mtp(ds4_engine *e) {
     return e && e->backend != DS4_BACKEND_CPU &&
            e->distributed.role == DS4_DISTRIBUTED_NONE &&
-           e->mtp_ready;
+           e->mtp_ready &&
+           mtp_draft_runtime_supported(e->mtp_weights.kind);
 }
+
 
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     return ds4_engine_has_mtp(e) ? e->mtp_draft_tokens : 0;
@@ -25690,9 +25841,21 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
         e->mtp_ready = true;
-        fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
+        if (e->mtp_weights.kind == DS4_MTP_DRAFT_DSPARK &&
+            (opt->mtp_draft_tokens <= 0 || opt->mtp_draft_tokens == 1)) {
+            e->mtp_draft_tokens = (int)e->mtp_weights.dspark.block_size;
+        }
+        fprintf(stderr, "ds4: draft model loaded: %s (kind=%s, draft=%d, runtime_mtp=%s)\n",
                 opt->mtp_path,
-                e->mtp_draft_tokens);
+                ds4_mtp_draft_kind_name(e->mtp_weights.kind),
+                e->mtp_draft_tokens,
+                ds4_engine_has_mtp(e) ? "yes" : "no");
+        const ds4_dspark_spec_gate spec_gate = ds4_dspark_speculative_gate(e->mtp_weights.kind,
+                                                                           e->mtp_ready,
+                                                                           e->mtp_draft_tokens);
+        if (spec_gate == DS4_DSPARK_SPEC_DSPARK_NOT_READY) {
+            fprintf(stderr, "ds4: %s\n", ds4_dspark_spec_gate_reason(spec_gate));
+        }
     }
 
 #ifndef DS4_NO_GPU
@@ -25902,7 +26065,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        if (e->mtp_ready &&
+        if (ds4_engine_has_mtp(e) &&
             !ds4_gpu_set_model_map_range(e->mtp_model.map,
                                            e->mtp_model.size,
                                            e->mtp_model.tensor_data_pos,
@@ -25945,7 +26108,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         free(load_sizes);
         /* Also apply explicit optional Q8 preload settings to the MTP support
          * model when loaded. */
-        if (e->mtp_ready) {
+        if (ds4_engine_has_mtp(e)) {
             (void)ds4_gpu_set_model_fd_for_map(e->mtp_model.fd, e->mtp_model.map);
             if (!accelerator_cache_model_tensors(e->backend, &e->mtp_model,
                                                  NULL, NULL, 0)) {
@@ -26072,7 +26235,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         return 1;
     }
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
-                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready))
+                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap, ds4_engine_has_mtp(e)))
     {
         free(s);
         return 1;
@@ -26091,7 +26254,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         return 1;
     }
     s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-    if (e->mtp_ready) {
+    if (ds4_engine_has_mtp(e)) {
         s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
         s->mtp_draft_token = -1;
     }
@@ -27107,7 +27270,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     ds4_engine *e = s->engine;
     const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
     const bool mtp_should_draft =
-        probe_mtp && e->mtp_ready && s->mtp_logits &&
+        probe_mtp && ds4_engine_has_mtp(e) && s->mtp_logits &&
         (e->mtp_draft_tokens > 1 || mtp_probe_log);
     if (probe_mtp && s->mtp_draft_valid) {
         if (mtp_probe_log) {
@@ -27204,7 +27367,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     accepted[n_accept++] = first_token;
     if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
 
-    if (!e->mtp_ready || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) return n_accept;
+    if (!ds4_engine_has_mtp(e) || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) return n_accept;
 
     int draft_cap = e->mtp_draft_tokens;
     if (draft_cap > max_tokens - n_accept) draft_cap = max_tokens - n_accept;

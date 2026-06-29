@@ -56,6 +56,26 @@ typedef struct {
 #define DS4_DEFAULT_TOP_P 1.0f
 #define DS4_DEFAULT_MIN_P 0.05f
 
+
+typedef enum {
+    DS4_MTP_DRAFT_NONE = 0,
+    DS4_MTP_DRAFT_LEGACY,
+    DS4_MTP_DRAFT_DSPARK,
+} ds4_mtp_draft_kind;
+
+typedef struct {
+    uint32_t n_mtp_layers;
+    uint32_t block_size;
+    uint32_t noise_token_id;
+    uint32_t markov_rank;
+    uint32_t target_layer_ids[3];
+} ds4_dspark_config;
+
+void ds4_dspark_config_init_defaults(ds4_dspark_config *cfg);
+const char *ds4_mtp_draft_kind_name(ds4_mtp_draft_kind kind);
+/* Classify draft GGUF layout from presence markers (unit-testable, no model load). */
+ds4_mtp_draft_kind ds4_mtp_draft_kind_guess(bool has_e_proj, bool has_main_proj, bool has_markov_w1);
+
 typedef struct ds4_engine ds4_engine;
 typedef struct ds4_session ds4_session;
 
@@ -273,7 +293,11 @@ int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
+/* True when speculative decode has a real proposer and target verifier. */
+bool ds4_mtp_speculative_draft_ready(ds4_mtp_draft_kind kind);
 bool ds4_engine_has_mtp(ds4_engine *e);
+ds4_mtp_draft_kind ds4_engine_mtp_draft_kind(ds4_engine *e);
+
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 
