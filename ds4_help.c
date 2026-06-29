@@ -254,6 +254,12 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "--imatrix-out FILE", "Write llama-compatible routed-MoE imatrix .dat.");
     opt(fp, c, "--imatrix-max-prompts N", "Stop imatrix collection after N prompts.");
     opt(fp, c, "--imatrix-max-tokens N", "Stop imatrix collection after N prompt tokens.");
+    opt(fp, c, "--dspark-target-cache-dataset FILE", "Rendered prompt dataset for DeepSpec DSpark target-cache export.");
+    opt(fp, c, "--dspark-target-cache-out DIR", "Write DeepSpec DSpark target cache manifest/index/shard.");
+    opt(fp, c, "--dspark-target-cache-target-model HF_OR_PATH", "Required DeepSpec target model name/path stored in the target-cache manifest.");
+    opt(fp, c, "--dspark-target-cache-chat-template NAME", "DeepSpec chat template name stored in the target-cache manifest.");
+    opt(fp, c, "--dspark-target-cache-max-prompts N", "Stop target-cache export after N prompts.");
+    opt(fp, c, "--dspark-target-cache-max-tokens N", "Stop target-cache export after N prompt tokens.");
     opt(fp, c, "--head-test", "Run the output HC/logits head after the native slice.");
     opt(fp, c, "--first-token-test", "Run exact CPU whole-model pass for the first prompt token.");
     opt(fp, c, "--metal-graph-test", "Compare first GPU-resident graph stages with CPU.");

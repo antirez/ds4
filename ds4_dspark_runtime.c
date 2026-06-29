@@ -18,6 +18,8 @@ const char *ds4_dspark_spec_gate_reason(ds4_dspark_spec_gate gate) {
     switch (gate) {
     case DS4_DSPARK_SPEC_LEGACY_MTP:
         return "legacy MTP draft path (DSpark block draft not engaged)";
+    case DS4_DSPARK_SPEC_DSPARK_ENABLED:
+        return "DSpark block speculative decode enabled";
     case DS4_DSPARK_SPEC_DSPARK_NOT_READY:
         return "DSpark draft graph has not been validated on real DSpark GGUF weights; "
                "speculative decode stays off (no fake draft tokens)";

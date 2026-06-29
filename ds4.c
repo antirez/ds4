@@ -15,6 +15,7 @@
  */
 
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <float.h>
 #include <inttypes.h>
@@ -39,6 +40,10 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_dspark_runtime.h"
+
+#ifndef DS4_GIT_COMMIT
+#define DS4_GIT_COMMIT "unknown"
+#endif
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
@@ -1618,6 +1623,7 @@ typedef struct {
     int fd;
     const uint8_t *map;
     uint64_t size;
+    char *path;
 
     uint32_t version;
     uint64_t n_kv;
@@ -1825,6 +1831,7 @@ static void model_close(ds4_model *m) {
     if (!m) return;
     free(m->kv);
     free(m->tensors);
+    free(m->path);
     if (m->map) munmap((void *)m->map, (size_t)m->size);
     if (m->fd >= 0) close(m->fd);
     memset(m, 0, sizeof(*m));
@@ -1974,6 +1981,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     m->fd = fd;
     m->map = map;
     m->size = (uint64_t)st.st_size;
+    m->path = ds4_strdup(path);
 
     ds4_cursor c = cursor_at(m, 0);
     uint32_t magic;
@@ -2436,6 +2444,14 @@ static inline uint16_t f32_to_f16(float f) {
     if (round > 0x1000u || (round == 0x1000u && (half & 1u))) half++;
     return (uint16_t)half;
 #endif
+}
+
+static inline uint16_t f32_to_bf16(float f) {
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof(bits));
+    const uint32_t lsb = (bits >> 16) & 1u;
+    bits += 0x7fffu + lsb;
+    return (uint16_t)(bits >> 16);
 }
 
 static void f16_round_inplace_cpu(float *x, uint32_t n) {
@@ -3815,7 +3831,7 @@ static void mtp_weights_validate_dspark_layout(const ds4_mtp_weights *w) {
     if (has_markov_head) {
         const uint64_t conf_in = DS4_N_EMBD + (uint64_t)w->dspark.markov_rank;
         if (w->dspark.markov_rank == 0) ds4_die("official DSpark Markov head has zero markov rank");
-        tensor_expect_plain_layout(w->markov_w1, 2, DS4_N_VOCAB, w->dspark.markov_rank, 0);
+        tensor_expect_plain_layout(w->markov_w1, 2, w->dspark.markov_rank, DS4_N_VOCAB, 0);
         tensor_expect_plain_layout(w->markov_w2, 2, w->dspark.markov_rank, DS4_N_VOCAB, 0);
         tensor_expect_plain_layout(w->confidence_proj, 2, conf_in, 1, 0);
     } else if (w->dspark.markov_rank != 0) {
@@ -10584,6 +10600,16 @@ typedef struct {
     ds4_gpu_tensor *mtp_next_hc;
     ds4_gpu_tensor *mtp_raw_cache;
     uint32_t mtp_n_raw;
+
+    /* Optional DSpark block-draft state.  The target decoder captures mean-HC
+     * hidden rows at the configured target layers, then the drafter consumes
+     * that 3-row feature to propose a block of candidate tokens. */
+    ds4_gpu_tensor *dspark_main_hidden;
+    ds4_gpu_tensor *dspark_main_x;
+    ds4_gpu_tensor *dspark_mean_weights;
+    ds4_gpu_tensor *dspark_kv_cache[DS4_DSPARK_MTP_LAYERS];
+    uint32_t dspark_target_layer_ids[DS4_DSPARK_MTP_LAYERS];
+    uint32_t dspark_n_real;
     uint32_t prefill_cap;
     uint32_t raw_window;
 
@@ -10654,6 +10680,7 @@ typedef struct {
     bool ssd_streaming_cold;
     bool streaming_static_decode_map_current;
     bool mtp_enabled;
+    bool dspark_enabled;
     float *cpu_router_norm;
 } ds4_gpu_graph;
 
@@ -10737,6 +10764,12 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->batch_next_hc);
     ds4_gpu_tensor_free(g->batch_cur_hc);
     ds4_gpu_tensor_free(g->prefill_tokens);
+    for (uint32_t s = 0; s < DS4_DSPARK_MTP_LAYERS; s++) {
+        ds4_gpu_tensor_free(g->dspark_kv_cache[s]);
+    }
+    ds4_gpu_tensor_free(g->dspark_mean_weights);
+    ds4_gpu_tensor_free(g->dspark_main_x);
+    ds4_gpu_tensor_free(g->dspark_main_hidden);
     ds4_gpu_tensor_free(g->logits);
     ds4_gpu_tensor_free(g->mtp_raw_cache);
     ds4_gpu_tensor_free(g->mtp_next_hc);
@@ -11118,14 +11151,23 @@ static bool metal_graph_ensure_batch_ffn_out(ds4_gpu_graph *g) {
  * weights are not copied here; tensors reference the mapped GGUF. */
 static bool metal_graph_alloc_raw_cap(
         ds4_gpu_graph *g,
-        const ds4_weights     *weights,
+        const ds4_weights       *weights,
         const ds4_layer_weights *layer,
-        uint32_t                raw_cap,
-        uint32_t                ctx_size,
-        uint32_t                prefill_cap,
-        bool                    enable_mtp) {
+        const ds4_mtp_weights   *mtp_weights,
+        uint32_t                 raw_cap,
+        uint32_t                 ctx_size,
+        uint32_t                 prefill_cap,
+        bool                     enable_mtp) {
     memset(g, 0, sizeof(*g));
     g->mtp_enabled = enable_mtp;
+    const bool enable_dspark =
+        enable_mtp && mtp_weights && mtp_weights->kind == DS4_MTP_DRAFT_DSPARK;
+    g->dspark_enabled = enable_dspark;
+    if (enable_dspark) {
+        for (uint32_t s = 0; s < DS4_DSPARK_MTP_LAYERS; s++) {
+            g->dspark_target_layer_ids[s] = mtp_weights->dspark.target_layer_ids[s];
+        }
+    }
     if (raw_cap == 0) raw_cap = 1;
     if (ctx_size == 0) ctx_size = raw_cap;
     if (prefill_cap == 0) prefill_cap = 1;
@@ -11331,6 +11373,25 @@ static bool metal_graph_alloc_raw_cap(
         g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
         g->mtp_n_raw = 0;
     }
+    if (enable_dspark) {
+        g->dspark_main_hidden = ds4_gpu_tensor_alloc(
+                (uint64_t)DS4_DSPARK_MTP_LAYERS * DS4_N_EMBD * sizeof(float));
+        g->dspark_main_x = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+        g->dspark_mean_weights = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
+        for (uint32_t s = 0; s < DS4_DSPARK_MTP_LAYERS; s++) {
+            g->dspark_kv_cache[s] = metal_graph_alloc_kv_cache_tensor(
+                    managed_kv_cache,
+                    (uint64_t)(DS4_N_SWA + mtp_weights->dspark.block_size) *
+                    DS4_N_HEAD_DIM * sizeof(float));
+        }
+        if (g->dspark_mean_weights) {
+            state_init_ok = state_init_ok &&
+                metal_tensor_fill_f32(g->dspark_mean_weights,
+                                      1.0f / (float)DS4_N_HC,
+                                      DS4_N_HC);
+        }
+        g->dspark_n_real = 0;
+    }
 
     g->prefill_tokens = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));
     g->batch_cur_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
@@ -11427,6 +11488,11 @@ static bool metal_graph_alloc_raw_cap(
                       g->mtp_eproj_hc && g->mtp_hnorm_hc && g->mtp_hproj_hc &&
                       g->mtp_input_hc && g->mtp_state_hc && g->mtp_next_hc &&
                       g->mtp_raw_cache && g->spec_logits)) &&
+                    (!enable_dspark ||
+                     (g->dspark_main_hidden && g->dspark_main_x &&
+                      g->dspark_mean_weights &&
+                      g->dspark_kv_cache[0] && g->dspark_kv_cache[1] &&
+                      g->dspark_kv_cache[2])) &&
                     g->prefill_tokens &&
                     g->batch_cur_hc && g->batch_next_hc && g->batch_flat_hc &&
                     g->batch_hc_mix && g->batch_hc_split &&
@@ -11454,7 +11520,8 @@ static bool metal_graph_alloc(
         ds4_gpu_graph *g,
         const ds4_weights     *weights,
         const ds4_layer_weights *layer) {
-    return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false);
+    return metal_graph_alloc_raw_cap(g, weights, layer, NULL,
+                                     DS4_N_SWA, DS4_N_SWA, 1, false);
 }
 
 static bool metal_graph_install_model_spans(
@@ -21676,7 +21743,8 @@ static int metal_graph_prompt_logits_test(
 
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, (uint32_t)n_test, false);
+                                        NULL, raw_cap, (uint32_t)ctx_size,
+                                        (uint32_t)n_test, false);
     if (!ok) {
         metal_graph_free(&g);
         fprintf(stderr, "ds4: failed to initialize Metal graph prompt test runtime\n");
@@ -23122,7 +23190,8 @@ static int generate_metal_graph_raw_swa(
     }
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false);
+                                        NULL, raw_cap, (uint32_t)ctx_size,
+                                        prefill_cap, false);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate GPU graph runtime\n");
         return 1;
@@ -25158,6 +25227,374 @@ static char *imatrix_trim_block(char *p, char *end) {
     *end = '\0';
     return p;
 }
+
+static bool dspark_target_cache_join_path(char *dst, size_t dst_size, const char *dir, const char *name) {
+    if (!dst || dst_size == 0 || !dir || !name) return false;
+    const int n = snprintf(dst, dst_size, "%s/%s", dir, name);
+    return n > 0 && (size_t)n < dst_size;
+}
+
+static bool dspark_target_cache_output_dir_prepare(const char *path) {
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        if (!S_ISDIR(st.st_mode)) {
+            fprintf(stderr, "ds4: DSpark target cache output path is not a directory: %s\n", path);
+            return false;
+        }
+        DIR *dir = opendir(path);
+        if (!dir) {
+            fprintf(stderr, "ds4: failed to inspect DSpark target cache output dir %s: %s\n",
+                    path, strerror(errno));
+            return false;
+        }
+        bool empty = true;
+        struct dirent *ent = NULL;
+        while ((ent = readdir(dir)) != NULL) {
+            if (strcmp(ent->d_name, ".") && strcmp(ent->d_name, "..")) {
+                empty = false;
+                break;
+            }
+        }
+        closedir(dir);
+        if (!empty) {
+            fprintf(stderr, "ds4: DSpark target cache output dir is not empty: %s\n", path);
+            return false;
+        }
+        return true;
+    }
+    if (errno != ENOENT) {
+        fprintf(stderr, "ds4: failed to stat DSpark target cache output dir %s: %s\n",
+                path, strerror(errno));
+        return false;
+    }
+    if (mkdir(path, 0777) != 0) {
+        fprintf(stderr, "ds4: failed to create DSpark target cache output dir %s: %s\n",
+                path, strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+static bool dspark_target_cache_file_pos(FILE *fp, uint64_t *out) {
+    if (!fp || !out) return false;
+    off_t pos = ftello(fp);
+    if (pos < 0) return false;
+    *out = (uint64_t)pos;
+    return true;
+}
+
+static bool dspark_target_cache_write_all(FILE *fp, const void *ptr, size_t bytes, const char *what) {
+    if (bytes == 0) return true;
+    if (fwrite(ptr, 1, bytes, fp) != bytes) {
+        fprintf(stderr, "ds4: failed to write DSpark target cache %s: %s\n",
+                what ? what : "payload", strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+static void dspark_target_cache_store_le32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v & 0xffu);
+    p[1] = (uint8_t)((v >> 8) & 0xffu);
+    p[2] = (uint8_t)((v >> 16) & 0xffu);
+    p[3] = (uint8_t)((v >> 24) & 0xffu);
+}
+
+static void dspark_target_cache_store_le64(uint8_t *p, uint64_t v) {
+    for (uint32_t i = 0; i < 8; i++) p[i] = (uint8_t)((v >> (8u * i)) & 0xffu);
+}
+
+static bool dspark_target_cache_write_index_record(FILE *fp,
+                                                   uint64_t sample_id,
+                                                   uint32_t shard_id,
+                                                   uint32_t seq_len,
+                                                   uint64_t input_ids_offset,
+                                                   uint64_t attention_mask_offset,
+                                                   uint64_t loss_mask_offset,
+                                                   uint64_t target_hidden_states_offset,
+                                                   uint64_t target_last_hidden_states_offset) {
+    uint8_t rec[56];
+    dspark_target_cache_store_le64(rec + 0, sample_id);
+    dspark_target_cache_store_le32(rec + 8, shard_id);
+    dspark_target_cache_store_le32(rec + 12, seq_len);
+    dspark_target_cache_store_le64(rec + 16, input_ids_offset);
+    dspark_target_cache_store_le64(rec + 24, attention_mask_offset);
+    dspark_target_cache_store_le64(rec + 32, loss_mask_offset);
+    dspark_target_cache_store_le64(rec + 40, target_hidden_states_offset);
+    dspark_target_cache_store_le64(rec + 48, target_last_hidden_states_offset);
+    return dspark_target_cache_write_all(fp, rec, sizeof(rec), "samples.idx record");
+}
+
+static bool dspark_target_cache_write_json_string(FILE *fp, const char *s) {
+    if (fputc('"', fp) == EOF) return false;
+    for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
+        switch (*p) {
+        case '\\':
+        case '"':
+            if (fprintf(fp, "\\%c", *p) < 0) return false;
+            break;
+        case '\n':
+            if (fputs("\\n", fp) == EOF) return false;
+            break;
+        case '\r':
+            if (fputs("\\r", fp) == EOF) return false;
+            break;
+        case '\t':
+            if (fputs("\\t", fp) == EOF) return false;
+            break;
+        default:
+            if (*p < 0x20) {
+                if (fprintf(fp, "\\u%04x", (unsigned)*p) < 0) return false;
+            } else if (fputc((int)*p, fp) == EOF) {
+                return false;
+            }
+            break;
+        }
+    }
+    return fputc('"', fp) != EOF;
+}
+
+static const char *dspark_target_cache_quant_family(const ds4_weights *weights) {
+    if (!weights || DS4_N_LAYER == 0) return "unknown";
+    const ds4_layer_weights *layer = &weights->layer[0];
+    if (!layer->ffn_gate_exps || !layer->ffn_up_exps || !layer->ffn_down_exps) return "unknown";
+    if (layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
+        layer->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q4_K) {
+        return "q4_k_routed_experts";
+    }
+    if (layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q2_K) {
+        return "iq2_xxs_gate_up_q2_k_down_routed_experts";
+    }
+    return "mixed_routed_experts";
+}
+
+static bool dspark_target_cache_write_tensor_type_counts(FILE *fp, const ds4_model *model) {
+    uint64_t counts[32] = {0};
+    uint64_t unknown = 0;
+    if (model) {
+        for (uint64_t i = 0; i < model->n_tensors; i++) {
+            uint32_t type = model->tensors[i].type;
+            if (type < (uint32_t)(sizeof(counts) / sizeof(counts[0]))) {
+                counts[type]++;
+            } else {
+                unknown++;
+            }
+        }
+    }
+    if (fprintf(fp, "{") < 0) return false;
+    bool first = true;
+    for (uint32_t type = 0; type < (uint32_t)(sizeof(counts) / sizeof(counts[0])); type++) {
+        if (!counts[type]) continue;
+        if (!first && fprintf(fp, ", ") < 0) return false;
+        first = false;
+        if (fprintf(fp, "\"%s\": %llu",
+                    tensor_type_name(type),
+                    (unsigned long long)counts[type]) < 0) {
+            return false;
+        }
+    }
+    if (unknown) {
+        if (!first && fprintf(fp, ", ") < 0) return false;
+        if (fprintf(fp, "\"unknown\": %llu", (unsigned long long)unknown) < 0) return false;
+    }
+    return fprintf(fp, "}") >= 0;
+}
+
+static bool dspark_target_cache_write_manifest(const char *output_dir,
+                                               const char *dataset_path,
+                                               const char *target_model_name_or_path,
+                                               const char *chat_template,
+                                               const ds4_model *model,
+                                               const ds4_weights *weights,
+                                               const ds4_dspark_config *cfg,
+                                               uint64_t num_samples,
+                                               uint64_t num_tokens) {
+    char path[PATH_MAX];
+    if (!dspark_target_cache_join_path(path, sizeof(path), output_dir, "manifest.json")) {
+        fprintf(stderr, "ds4: DSpark target cache manifest path is too long\n");
+        return false;
+    }
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "ds4: failed to create DSpark target cache manifest %s: %s\n",
+                path, strerror(errno));
+        return false;
+    }
+    const char *source_gguf_path = (model && model->path && model->path[0]) ? model->path : DS4_MODEL_SHAPE_NAME;
+    const char *target_model = target_model_name_or_path;
+    const char *template_name = (chat_template && chat_template[0]) ?
+                                chat_template :
+                                "ds4_tokenize_rendered_chat";
+    bool ok = true;
+    ok = ok && fprintf(fp, "{\n") >= 0;
+    ok = ok && fprintf(fp, "  \"version\": 2,\n") >= 0;
+    ok = ok && fprintf(fp, "  \"format\": \"deepspec-target-cache\",\n") >= 0;
+    ok = ok && fprintf(fp, "  \"producer\": \"ds4\",\n") >= 0;
+    ok = ok && fprintf(fp, "  \"producer_commit\": ") >= 0;
+    ok = ok && dspark_target_cache_write_json_string(fp, DS4_GIT_COMMIT);
+    ok = ok && fprintf(fp, ",\n  \"source_dataset_path\": ") >= 0;
+    ok = ok && dspark_target_cache_write_json_string(fp, dataset_path);
+    ok = ok && fprintf(fp, ",\n  \"source_gguf_path\": ") >= 0;
+    ok = ok && dspark_target_cache_write_json_string(fp, source_gguf_path);
+    ok = ok && fprintf(fp, ",\n  \"target_model_name_or_path\": ") >= 0;
+    ok = ok && dspark_target_cache_write_json_string(fp, target_model);
+    ok = ok && fprintf(fp, ",\n  \"model_shape\": ") >= 0;
+    ok = ok && dspark_target_cache_write_json_string(fp, DS4_MODEL_SHAPE_NAME);
+    ok = ok && fprintf(fp, ",\n  \"quantization_family\": ") >= 0;
+    ok = ok && dspark_target_cache_write_json_string(fp, dspark_target_cache_quant_family(weights));
+    ok = ok && fprintf(fp, ",\n  \"num_samples\": %llu,\n", (unsigned long long)num_samples) >= 0;
+    ok = ok && fprintf(fp, "  \"num_tokens\": %llu,\n", (unsigned long long)num_tokens) >= 0;
+    ok = ok && fprintf(fp, "  \"num_shards\": %u,\n", num_samples ? 1u : 0u) >= 0;
+    ok = ok && fprintf(fp, "  \"target_layer_ids\": [%u, %u, %u],\n",
+                       cfg->target_layer_ids[0],
+                       cfg->target_layer_ids[1],
+                       cfg->target_layer_ids[2]) >= 0;
+    ok = ok && fprintf(fp, "  \"hidden_size\": %u,\n", DS4_N_EMBD) >= 0;
+    ok = ok && fprintf(fp, "  \"target_hidden_size\": %u,\n", DS4_N_EMBD) >= 0;
+    ok = ok && fprintf(fp, "  \"target_hidden_layers\": %u,\n", cfg->n_mtp_layers) >= 0;
+    ok = ok && fprintf(fp, "  \"hidden_dtype\": \"bfloat16\",\n") >= 0;
+    ok = ok && fprintf(fp, "  \"token_dtype\": \"int32\",\n") >= 0;
+    ok = ok && fprintf(fp, "  \"mask_dtype\": \"uint8\",\n") >= 0;
+    ok = ok && fprintf(fp, "  \"index_record_size\": 56,\n") >= 0;
+    ok = ok && fprintf(fp, "  \"input_convention\": {\n") >= 0;
+    ok = ok && fprintf(fp, "    \"tokenization\": \"ds4_tokenize_rendered_chat\",\n") >= 0;
+    ok = ok && fprintf(fp, "    \"chat_template\": ") >= 0;
+    ok = ok && dspark_target_cache_write_json_string(fp, template_name);
+    ok = ok && fprintf(fp, ",\n    \"sample_split_marker\": \"===== DS4_IMATRIX_PROMPT\",\n") >= 0;
+    ok = ok && fprintf(fp, "    \"loss_mask\": \"1 for every exported prompt token\"\n") >= 0;
+    ok = ok && fprintf(fp, "  },\n") >= 0;
+    ok = ok && fprintf(fp, "  \"hidden_convention\": {\n") >= 0;
+    ok = ok && fprintf(fp, "    \"target_hidden_states\": \"bfloat16 mean over DS4 HC heads after each target layer; row-major [seq_len, target_hidden_layers, hidden_size]\",\n") >= 0;
+    ok = ok && fprintf(fp, "    \"target_last_hidden_states\": \"bfloat16 output-HC projection plus final RMSNorm; row-major [seq_len, hidden_size]\"\n") >= 0;
+    ok = ok && fprintf(fp, "  },\n") >= 0;
+    ok = ok && fprintf(fp, "  \"gguf_tensor_type_counts\": ") >= 0;
+    ok = ok && dspark_target_cache_write_tensor_type_counts(fp, model);
+    ok = ok && fprintf(fp, ",\n  \"shards\": [") >= 0;
+    if (num_samples) {
+        ok = ok && fprintf(fp, "\n    {\n      \"file_name\": \"shard-00000.bin\",\n      \"shard_id\": 0\n    }\n  ") >= 0;
+    }
+    ok = ok && fprintf(fp, "]\n}\n") >= 0;
+    if (fclose(fp) != 0) ok = false;
+    if (!ok) fprintf(stderr, "ds4: failed to write DSpark target cache manifest %s\n", path);
+    return ok;
+}
+
+static uint32_t dspark_target_cache_layer_slot(const ds4_dspark_config *cfg, uint32_t layer_id) {
+    for (uint32_t i = 0; i < cfg->n_mtp_layers && i < 3; i++) {
+        if (cfg->target_layer_ids[i] == layer_id) return i;
+    }
+    return UINT32_MAX;
+}
+
+static void dspark_target_cache_hc_mean_bf16(uint16_t *out,
+                                             const float *hc_rows,
+                                             uint32_t rows,
+                                             uint32_t slot,
+                                             uint32_t n_slots) {
+    const float inv_hc = 1.0f / (float)DS4_N_HC;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    for (uint32_t row = 0; row < rows; row++) {
+        const float *hc = hc_rows + (uint64_t)row * hc_dim;
+        uint16_t *dst = out + ((uint64_t)row * n_slots + slot) * DS4_N_EMBD;
+        for (uint32_t d = 0; d < DS4_N_EMBD; d++) {
+            float sum = 0.0f;
+            for (uint32_t h = 0; h < DS4_N_HC; h++) {
+                sum += hc[(uint64_t)h * DS4_N_EMBD + d];
+            }
+            dst[d] = f32_to_bf16(sum * inv_hc);
+        }
+    }
+}
+
+static void dspark_target_cache_last_hidden_bf16(uint16_t *out,
+                                                 const ds4_model *model,
+                                                 const ds4_weights *weights,
+                                                 const float *hc_rows,
+                                                 uint32_t rows) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    float *embd = xmalloc((size_t)DS4_N_EMBD * sizeof(embd[0]));
+    float *norm = xmalloc((size_t)DS4_N_EMBD * sizeof(norm[0]));
+    const float *norm_weight = tensor_data(model, weights->output_norm);
+    for (uint32_t row = 0; row < rows; row++) {
+        const float *hc = hc_rows + (uint64_t)row * hc_dim;
+        output_hc_head_one(embd, model, weights, hc);
+        rms_norm_weight(norm, embd, norm_weight, DS4_N_EMBD, DS4_RMS_EPS);
+        uint16_t *dst = out + (uint64_t)row * DS4_N_EMBD;
+        for (uint32_t d = 0; d < DS4_N_EMBD; d++) dst[d] = f32_to_bf16(norm[d]);
+    }
+    free(norm);
+    free(embd);
+}
+
+static bool dspark_target_cache_encode_chunk(ds4_gpu_graph *g,
+                                             const ds4_model *model,
+                                             const ds4_weights *weights,
+                                             const ds4_dspark_config *cfg,
+                                             const token_vec *prompt,
+                                             uint32_t pos0,
+                                             uint32_t n_tokens,
+                                             float *hc_rows,
+                                             uint16_t *target_chunk,
+                                             uint16_t *last_chunk) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, pos0, n_tokens);
+    if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
+                                                         g->prefill_tokens,
+                                                         model,
+                                                         weights,
+                                                         prompt,
+                                                         pos0,
+                                                         n_tokens);
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        ok = ds4_gpu_begin_commands() != 0;
+        if (ok) {
+            ok = metal_graph_encode_layer_batch(g,
+                                                model,
+                                                &weights->layer[il],
+                                                il,
+                                                pos0,
+                                                n_tokens);
+        }
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        if (!ok) {
+            fprintf(stderr, "ds4: DSpark target cache layer %u encode failed\n", il);
+            return false;
+        }
+        const uint32_t slot = dspark_target_cache_layer_slot(cfg, il);
+        if (slot != UINT32_MAX) {
+            if (ds4_gpu_tensor_read(g->batch_cur_hc,
+                                    0,
+                                    hc_rows,
+                                    (uint64_t)n_tokens * hc_dim * sizeof(float)) == 0) {
+                fprintf(stderr, "ds4: failed to read DSpark target layer %u hidden states\n", il);
+                return false;
+            }
+            dspark_target_cache_hc_mean_bf16(target_chunk,
+                                             hc_rows,
+                                             n_tokens,
+                                             slot,
+                                             cfg->n_mtp_layers);
+        }
+    }
+    if (ok && ds4_gpu_tensor_read(g->batch_cur_hc,
+                                  0,
+                                  hc_rows,
+                                  (uint64_t)n_tokens * hc_dim * sizeof(float)) == 0) {
+        fprintf(stderr, "ds4: failed to read DSpark target final hidden states\n");
+        ok = false;
+    }
+    if (ok) {
+        dspark_target_cache_last_hidden_bf16(last_chunk,
+                                            model,
+                                            weights,
+                                            hc_rows,
+                                            n_tokens);
+    }
+    return ok;
+}
 #endif
 
 int ds4_engine_collect_imatrix(ds4_engine *e,
@@ -25195,7 +25632,8 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
 
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false);
+                                        NULL, raw_cap, (uint32_t)ctx_size,
+                                        prefill_cap, false);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate imatrix Metal graph runtime\n");
         free(dataset);
@@ -25306,6 +25744,315 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     }
 
     imatrix_collector_free(&collector);
+    metal_graph_free(&g);
+    free(dataset);
+    return ok ? 0 : 1;
+#endif
+}
+
+int ds4_engine_collect_dspark_target_cache(ds4_engine *e,
+                                           const char *dataset_path,
+                                           const char *output_dir,
+                                           const char *target_model_name_or_path,
+                                           const char *chat_template,
+                                           int ctx_size,
+                                           int max_prompts,
+                                           int max_tokens) {
+#ifdef DS4_NO_GPU
+    (void)e;
+    (void)dataset_path;
+    (void)output_dir;
+    (void)target_model_name_or_path;
+    (void)chat_template;
+    (void)ctx_size;
+    (void)max_prompts;
+    (void)max_tokens;
+    fprintf(stderr, "ds4: DSpark target cache export requires a graph backend build\n");
+    return 1;
+#else
+    if (!e || !dataset_path || !output_dir) return 1;
+    if (!target_model_name_or_path || !target_model_name_or_path[0]) {
+        fprintf(stderr,
+                "ds4: DSpark target cache export requires --dspark-target-cache-target-model\n");
+        return 1;
+    }
+    if (e->backend != DS4_BACKEND_METAL || !e->metal_ready) {
+        fprintf(stderr, "ds4: DSpark target cache export currently requires --metal\n");
+        return 1;
+    }
+    if (e->ssd_streaming) {
+        fprintf(stderr, "ds4: DSpark target cache export requires non-streaming Metal weights\n");
+        return 1;
+    }
+    if (ctx_size <= 0) ctx_size = 32768;
+
+    ds4_dspark_config cfg;
+    ds4_dspark_config_init_defaults(&cfg);
+    if (cfg.n_mtp_layers == 0 || cfg.n_mtp_layers > 3) {
+        fprintf(stderr, "ds4: unsupported DSpark target layer count %u\n", cfg.n_mtp_layers);
+        return 1;
+    }
+    for (uint32_t i = 0; i < cfg.n_mtp_layers; i++) {
+        if (cfg.target_layer_ids[i] >= DS4_N_LAYER) {
+            fprintf(stderr,
+                    "ds4: DSpark target layer %u is outside the loaded %u-layer model\n",
+                    cfg.target_layer_ids[i],
+                    DS4_N_LAYER);
+            return 1;
+        }
+        for (uint32_t j = i + 1; j < cfg.n_mtp_layers; j++) {
+            if (cfg.target_layer_ids[i] == cfg.target_layer_ids[j]) {
+                fprintf(stderr, "ds4: duplicate DSpark target layer %u\n", cfg.target_layer_ids[i]);
+                return 1;
+            }
+        }
+    }
+
+    char *dataset = NULL;
+    size_t dataset_len = 0;
+    if (!imatrix_read_text_file(dataset_path, &dataset, &dataset_len)) return 1;
+    if (!dspark_target_cache_output_dir_prepare(output_dir)) {
+        free(dataset);
+        return 1;
+    }
+
+    char shard_path[PATH_MAX];
+    char index_path[PATH_MAX];
+    if (!dspark_target_cache_join_path(shard_path, sizeof(shard_path), output_dir, "shard-00000.bin") ||
+        !dspark_target_cache_join_path(index_path, sizeof(index_path), output_dir, "samples.idx")) {
+        fprintf(stderr, "ds4: DSpark target cache output path is too long\n");
+        free(dataset);
+        return 1;
+    }
+
+    FILE *shard = fopen(shard_path, "wb");
+    if (!shard) {
+        fprintf(stderr, "ds4: failed to create DSpark target cache shard %s: %s\n",
+                shard_path, strerror(errno));
+        free(dataset);
+        return 1;
+    }
+    FILE *index = fopen(index_path, "wb");
+    if (!index) {
+        fprintf(stderr, "ds4: failed to create DSpark target cache index %s: %s\n",
+                index_path, strerror(errno));
+        fclose(shard);
+        free(dataset);
+        return 1;
+    }
+
+    const ds4_model *model = &e->model;
+    const ds4_weights *weights = &e->weights;
+    const uint32_t prefill_cap =
+        metal_graph_prefill_cap_for_prompt(ctx_size, e->prefill_chunk);
+    const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, prefill_cap);
+
+    ds4_gpu_graph g;
+    bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
+                                        NULL, raw_cap, (uint32_t)ctx_size,
+                                        prefill_cap, false);
+    if (!ok) {
+        fprintf(stderr, "ds4: failed to allocate DSpark target cache Metal graph runtime\n");
+        fclose(index);
+        fclose(shard);
+        free(dataset);
+        return 1;
+    }
+    g.quality = e->quality;
+    g.ssd_streaming = false;
+    g.ssd_streaming_cold = false;
+    g.streaming_preload_experts = 0;
+    g.power_percent = (uint32_t)e->power_percent;
+
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    float *hc_rows = xmalloc((size_t)prefill_cap * (size_t)hc_dim * sizeof(hc_rows[0]));
+    uint16_t *target_chunk = xmalloc((size_t)prefill_cap *
+                                     (size_t)cfg.n_mtp_layers *
+                                     (size_t)DS4_N_EMBD *
+                                     sizeof(target_chunk[0]));
+    uint16_t *last_chunk = xmalloc((size_t)prefill_cap *
+                                   (size_t)DS4_N_EMBD *
+                                   sizeof(last_chunk[0]));
+
+    fprintf(stderr,
+            "ds4: exporting DeepSpec DSpark target cache from %s (model=%s, target_layers=[%u,%u,%u], ctx=%d, chunk=%u)\n",
+            dataset_path,
+            DS4_MODEL_SHAPE_NAME,
+            cfg.target_layer_ids[0],
+            cfg.target_layer_ids[1],
+            cfg.target_layer_ids[2],
+            ctx_size,
+            prefill_cap);
+
+    int prompts_done = 0;
+    int tokens_done = 0;
+    char *cursor = dataset;
+    const char *marker_lit = "===== DS4_IMATRIX_PROMPT";
+    while (ok && *cursor) {
+        if (max_prompts > 0 && prompts_done >= max_prompts) break;
+        if (max_tokens > 0 && tokens_done >= max_tokens) break;
+
+        char *start = cursor;
+        char *marker = strstr(cursor, marker_lit);
+        if (marker) {
+            char *nl = strchr(marker, '\n');
+            if (!nl) break;
+            start = nl + 1;
+        } else if (prompts_done != 0) {
+            break;
+        }
+
+        char *next = strstr(start, marker_lit);
+        char *end = next ? next : dataset + dataset_len;
+        char saved = *end;
+        char *prompt_text = imatrix_trim_block(start, end);
+        if (prompt_text[0] != '\0') {
+            token_vec prompt = {0};
+            ds4_tokenize_rendered_chat(e, prompt_text, &prompt);
+            if (prompt.len > ctx_size) prompt.len = ctx_size;
+            if (max_tokens > 0 && prompt.len > max_tokens - tokens_done) {
+                prompt.len = max_tokens - tokens_done;
+            }
+            if (prompt.len > 0) {
+                uint16_t *last_full = xmalloc((size_t)prompt.len *
+                                              (size_t)DS4_N_EMBD *
+                                              sizeof(last_full[0]));
+                int32_t *ids = xmalloc((size_t)prompt.len * sizeof(ids[0]));
+                uint8_t *mask = xmalloc((size_t)prompt.len * sizeof(mask[0]));
+                for (int i = 0; i < prompt.len; i++) {
+                    ids[i] = (int32_t)prompt.v[i];
+                    mask[i] = 1;
+                }
+
+                uint64_t input_ids_offset = 0;
+                uint64_t attention_mask_offset = 0;
+                uint64_t loss_mask_offset = 0;
+                uint64_t target_hidden_states_offset = 0;
+                uint64_t target_last_hidden_states_offset = 0;
+                ok = dspark_target_cache_file_pos(shard, &input_ids_offset) &&
+                     dspark_target_cache_write_all(shard,
+                                                   ids,
+                                                   (size_t)prompt.len * sizeof(ids[0]),
+                                                   "input_ids");
+                ok = ok && dspark_target_cache_file_pos(shard, &attention_mask_offset) &&
+                     dspark_target_cache_write_all(shard,
+                                                   mask,
+                                                   (size_t)prompt.len * sizeof(mask[0]),
+                                                   "attention_mask");
+                ok = ok && dspark_target_cache_file_pos(shard, &loss_mask_offset) &&
+                     dspark_target_cache_write_all(shard,
+                                                   mask,
+                                                   (size_t)prompt.len * sizeof(mask[0]),
+                                                   "loss_mask");
+                ok = ok && dspark_target_cache_file_pos(shard, &target_hidden_states_offset);
+
+                if (ok && !metal_graph_reset_prefill_state(&g)) {
+                    fprintf(stderr, "ds4: failed to reset DSpark target cache graph state\n");
+                    ok = false;
+                }
+                for (uint32_t pos = 0; ok && pos < (uint32_t)prompt.len;) {
+                    uint32_t chunk = (uint32_t)prompt.len - pos;
+                    if (chunk > prefill_cap) chunk = prefill_cap;
+                    memset(target_chunk,
+                           0,
+                           (size_t)chunk * (size_t)cfg.n_mtp_layers *
+                           (size_t)DS4_N_EMBD * sizeof(target_chunk[0]));
+                    ok = dspark_target_cache_encode_chunk(&g,
+                                                          model,
+                                                          weights,
+                                                          &cfg,
+                                                          &prompt,
+                                                          pos,
+                                                          chunk,
+                                                          hc_rows,
+                                                          target_chunk,
+                                                          last_chunk);
+                    if (ok) {
+                        ok = dspark_target_cache_write_all(shard,
+                                                           target_chunk,
+                                                           (size_t)chunk *
+                                                           (size_t)cfg.n_mtp_layers *
+                                                           (size_t)DS4_N_EMBD *
+                                                           sizeof(target_chunk[0]),
+                                                           "target_hidden_states");
+                    }
+                    if (ok) {
+                        memcpy(last_full + (uint64_t)pos * DS4_N_EMBD,
+                               last_chunk,
+                               (size_t)chunk * (size_t)DS4_N_EMBD * sizeof(last_chunk[0]));
+                    }
+                    pos += chunk;
+                }
+                ok = ok && dspark_target_cache_file_pos(shard, &target_last_hidden_states_offset) &&
+                     dspark_target_cache_write_all(shard,
+                                                   last_full,
+                                                   (size_t)prompt.len *
+                                                   (size_t)DS4_N_EMBD *
+                                                   sizeof(last_full[0]),
+                                                   "target_last_hidden_states");
+                ok = ok && dspark_target_cache_write_index_record(index,
+                                                                  (uint64_t)prompts_done,
+                                                                  0,
+                                                                  (uint32_t)prompt.len,
+                                                                  input_ids_offset,
+                                                                  attention_mask_offset,
+                                                                  loss_mask_offset,
+                                                                  target_hidden_states_offset,
+                                                                  target_last_hidden_states_offset);
+                if (ok) {
+                    prompts_done++;
+                    tokens_done += prompt.len;
+                    fprintf(stderr,
+                            "ds4: DSpark target cache prompts=%d tokens=%d\r",
+                            prompts_done,
+                            tokens_done);
+                    fflush(stderr);
+                }
+                free(mask);
+                free(ids);
+                free(last_full);
+            }
+            token_vec_free(&prompt);
+        }
+        *end = saved;
+        if (!next) break;
+        cursor = next;
+    }
+    fputc('\n', stderr);
+
+    if (fflush(shard) != 0 || fsync(fileno(shard)) != 0) {
+        fprintf(stderr, "ds4: failed to flush DSpark target cache shard %s: %s\n",
+                shard_path, strerror(errno));
+        ok = false;
+    }
+    if (fflush(index) != 0 || fsync(fileno(index)) != 0) {
+        fprintf(stderr, "ds4: failed to flush DSpark target cache index %s: %s\n",
+                index_path, strerror(errno));
+        ok = false;
+    }
+    if (fclose(index) != 0) ok = false;
+    if (fclose(shard) != 0) ok = false;
+
+    if (ok) ok = dspark_target_cache_write_manifest(output_dir,
+                                                    dataset_path,
+                                                    target_model_name_or_path,
+                                                    chat_template,
+                                                    model,
+                                                    weights,
+                                                    &cfg,
+                                                    (uint64_t)prompts_done,
+                                                    (uint64_t)tokens_done);
+    if (ok) {
+        fprintf(stderr,
+                "ds4: wrote DeepSpec DSpark target cache %s from %d prompts and %d tokens\n",
+                output_dir,
+                prompts_done,
+                tokens_done);
+    }
+
+    free(last_chunk);
+    free(target_chunk);
+    free(hc_rows);
     metal_graph_free(&g);
     free(dataset);
     return ok ? 0 : 1;
@@ -26257,7 +27004,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         return 1;
     }
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
-                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap, ds4_engine_has_mtp(e)))
+                                   &e->mtp_weights, raw_cap, (uint32_t)ctx_size,
+                                   s->prefill_cap, ds4_engine_has_mtp(e)))
     {
         free(s);
         return 1;

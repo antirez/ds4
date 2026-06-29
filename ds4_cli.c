@@ -43,6 +43,12 @@ typedef struct {
     const char *imatrix_output_path;
     int imatrix_max_prompts;
     int imatrix_max_tokens;
+    const char *dspark_target_cache_dataset_path;
+    const char *dspark_target_cache_output_dir;
+    const char *dspark_target_cache_target_model;
+    const char *dspark_target_cache_chat_template;
+    int dspark_target_cache_max_prompts;
+    int dspark_target_cache_max_tokens;
     ds4_think_mode think_mode;
     bool head_test;
     bool first_token_test;
@@ -1562,6 +1568,18 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.imatrix_max_prompts = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--imatrix-max-tokens")) {
             c.gen.imatrix_max_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--dspark-target-cache-dataset")) {
+            c.gen.dspark_target_cache_dataset_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dspark-target-cache-out")) {
+            c.gen.dspark_target_cache_output_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dspark-target-cache-target-model")) {
+            c.gen.dspark_target_cache_target_model = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dspark-target-cache-chat-template")) {
+            c.gen.dspark_target_cache_chat_template = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dspark-target-cache-max-prompts")) {
+            c.gen.dspark_target_cache_max_prompts = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--dspark-target-cache-max-tokens")) {
+            c.gen.dspark_target_cache_max_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think")) {
             c.gen.think_mode = DS4_THINK_HIGH;
         } else if (!strcmp(arg, "--think-max")) {
@@ -1619,6 +1637,24 @@ static cli_config parse_options(int argc, char **argv) {
     }
     if (c.gen.imatrix_dataset_path && !c.gen.imatrix_output_path) {
         fprintf(stderr, "ds4: --imatrix-dataset requires --imatrix-out\n");
+        exit(2);
+    }
+    if (c.gen.dspark_target_cache_output_dir && !c.gen.dspark_target_cache_dataset_path) {
+        fprintf(stderr, "ds4: --dspark-target-cache-out requires --dspark-target-cache-dataset\n");
+        exit(2);
+    }
+    if (c.gen.dspark_target_cache_dataset_path && !c.gen.dspark_target_cache_output_dir) {
+        fprintf(stderr, "ds4: --dspark-target-cache-dataset requires --dspark-target-cache-out\n");
+        exit(2);
+    }
+    if (c.gen.dspark_target_cache_output_dir && c.gen.prompt) {
+        fprintf(stderr, "ds4: --dspark-target-cache-out does not use -p/--prompt-file\n");
+        exit(2);
+    }
+    if (c.gen.dspark_target_cache_output_dir &&
+        (!c.gen.dspark_target_cache_target_model ||
+         !c.gen.dspark_target_cache_target_model[0])) {
+        fprintf(stderr, "ds4: --dspark-target-cache-out requires --dspark-target-cache-target-model\n");
         exit(2);
     }
     if (c.gen.perplexity_file_path && c.gen.prompt) {
@@ -1693,6 +1729,15 @@ int main(int argc, char **argv) {
                                         cfg.gen.ctx_size,
                                         cfg.gen.imatrix_max_prompts,
                                         cfg.gen.imatrix_max_tokens);
+    } else if (cfg.gen.dspark_target_cache_output_dir) {
+        rc = ds4_engine_collect_dspark_target_cache(engine,
+                                                    cfg.gen.dspark_target_cache_dataset_path,
+                                                    cfg.gen.dspark_target_cache_output_dir,
+                                                    cfg.gen.dspark_target_cache_target_model,
+                                                    cfg.gen.dspark_target_cache_chat_template,
+                                                    cfg.gen.ctx_size,
+                                                    cfg.gen.dspark_target_cache_max_prompts,
+                                                    cfg.gen.dspark_target_cache_max_tokens);
     } else if (cfg.gen.perplexity_file_path) {
         rc = run_perplexity_file(engine, &cfg);
     } else if (cfg.gen.prompt == NULL) {

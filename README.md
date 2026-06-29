@@ -133,13 +133,31 @@ weights. Flash GGUF generation is supported by the local tools. PRO GGUF
 production currently still depends on the external `llama.cpp`-based workflow;
 native tooling can be added later.
 
-`./download_model.sh mtp` fetches the optional speculative decoding support
-GGUF for Flash. It can be used with q2-imatrix, q2-q4-imatrix, and q4-imatrix,
-but must be enabled explicitly with `--mtp`. Legacy one-step MTP is
+`./download_model.sh mtp` fetches the optional legacy speculative decoding
+support GGUF for Flash. It can be used with q2-imatrix, q2-q4-imatrix, and
+q4-imatrix, but must be enabled explicitly with `--mtp`. Legacy one-step MTP is
 correctness-gated and experimental: it currently provides at most a slight
-speedup, not a meaningful generation-speed win. DSpark/DeepSpec draft GGUFs are
-recognized by the loader/converter, but block-draft speculative decode remains
-disabled until a Metal draft graph is validated on real converted weights.
+speedup, not a meaningful generation-speed win. Official DeepSeek-V4-Flash
+DSpark/DeepSpec Markov draft shards can be converted with
+`gguf-tools/deepseek4-quantize --dspark-only`; converted DSpark draft GGUFs are
+recognized by the loader, but block-draft speculative decode remains disabled
+until a Metal draft graph is validated on real converted weights.
+
+For DeepSpec training experiments, `ds4 --dspark-target-cache-dataset FILE
+--dspark-target-cache-out DIR --dspark-target-cache-target-model HF_OR_PATH`
+consumes the same rendered prompt dataset format used by imatrix collection and
+writes a DeepSpec-compatible target cache (`manifest.json`, `samples.idx`, and
+shard data) containing prompt token ids, attention/loss masks, target-layer
+hidden states, and last hidden states. Use
+`--dspark-target-cache-chat-template NAME` to stamp the cache manifest with the
+DeepSpec training template identity.
+Validate the cache contract with
+`python3 gguf-tools/deepspec/ds4_deepspec.py DIR --target-model HF_OR_PATH`
+before handing it to a DeepSpec checkout. The same helper can emit the DS4-side
+non-Markov DeepSpec config scaffold with
+`python3 gguf-tools/deepspec/ds4_deepspec.py --emit-nonseq-config dspark_v4_nonseq.py --target-cache DIR`.
+This is an offline data-export path; DSpark block-draft runtime remains disabled
+until validated weights and a Metal draft graph are available.
 
 Then build:
 
