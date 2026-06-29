@@ -43,6 +43,7 @@ struct ds4_web {
     int port;
     pid_t chrome_pid;
     bool browser_allowed;
+    bool headless;
     ds4_web_confirm_fn confirm;
     void *confirm_privdata;
     ds4_web_log_fn log;
@@ -301,6 +302,8 @@ static bool web_cdp_alive(ds4_web *web) {
 }
 
 static char *web_json_get_string(const char *json, const char *key);
+
+static char *web_curl_dump_page(const char *url, char *err, size_t err_len);
 
 static char *web_url_encode(const char *s) {
     static const char hex[] = "0123456789ABCDEF";
@@ -1067,11 +1070,15 @@ static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
             execlp(exe, exe, port_arg, "--remote-allow-origins=*",
                    profile_arg, "--no-first-run", "--no-default-browser-check",
                    "--disable-sync", "--password-store=basic", "--no-sandbox",
+                   web->headless ? "--headless" : "",
+                   "--disable-gpu",
                    "--mute-audio", "about:blank", (char *)NULL);
         } else {
             execlp(exe, exe, port_arg, "--remote-allow-origins=*",
                    profile_arg, "--no-first-run", "--no-default-browser-check",
                    "--disable-sync", "--password-store=basic",
+                   web->headless ? "--headless" : "",
+                   "--disable-gpu",
                    "--mute-audio", "about:blank", (char *)NULL);
         }
 #endif
@@ -1109,14 +1116,21 @@ static bool web_ensure_browser(ds4_web *web, char *err, size_t err_len) {
         waitpid(web->chrome_pid, &status, WNOHANG);
         web->chrome_pid = 0;
     }
+    if (web->headless) {
+        web->browser_allowed = true;
+    }
     if (!web->browser_allowed) {
         if (!web->confirm) {
             web_set_err(err, err_len,
-                        "starting a visible Chrome browser requires interactive approval");
+                        web->headless
+                        ? "starting a headless Chrome browser requires interactive approval"
+                        : "starting a visible Chrome browser requires interactive approval");
             return false;
         }
-        if (!web->confirm(web->confirm_privdata,
-                          "The web tool wants to start a visible Chrome browser. Allow? (y/n) ",
+        const char *confirm_msg = web->headless
+            ? "The web tool wants to start a headless Chrome browser. Allow? (y/n) "
+            : "The web tool wants to start a visible Chrome browser. Allow? (y/n) ";
+        if (!web->confirm(web->confirm_privdata, confirm_msg,
                           err, err_len))
         {
             if (err && !err[0]) web_set_err(err, err_len, "user denied Chrome browser start");
@@ -1332,6 +1346,7 @@ ds4_web *ds4_web_create(const ds4_web_config *cfg) {
     web->port = cfg && cfg->port > 0 ? cfg->port : DS4_WEB_DEFAULT_PORT;
     web->chrome_pid = 0;
     web->next_cdp_id = 1;
+    web->headless = cfg && cfg->headless;
     if (cfg) {
         web->confirm = cfg->confirm;
         web->confirm_privdata = cfg->confirm_privdata;
@@ -1367,8 +1382,152 @@ char *ds4_web_google_search(ds4_web *web, const char *query,
     free(q);
     char *url_s = web_buf_take(&url);
     char *out = web_run_page_js(web, url_s, web_extract_search_js, false, err, err_len);
+    if (out) {
+        free(url_s);
+        return out;
+    }
+    /* Fall back to curl dump for headless mode */
+    if (web->headless) {
+        web_log(web, "CDP search failed, trying curl HTML dump");
+        char *dump = web_curl_dump_page(url_s, err, err_len);
+        free(url_s);
+        return dump;
+    }
     free(url_s);
-    return out;
+    return NULL;
+}
+
+/* Fetch page content via curl and produce a simple Markdown dump.
+ * Used as fallback in headless mode when CDP is not available. */
+static char *web_curl_dump_page(const char *url, char *err, size_t err_len) {
+    char cmd[PATH_MAX + 64];
+    snprintf(cmd, sizeof(cmd),
+             "curl -sL --max-time 30 --connect-timeout 10 -H 'Accept: text/html' "
+             "'%s' 2>/dev/null || echo ''", url);
+    FILE *pf = popen(cmd, "r");
+    if (!pf) {
+        web_set_err(err, err_len, "popen curl failed: %s", strerror(errno));
+        return NULL;
+    }
+    web_buf html = {0};
+    char buf[4096];
+    size_t total = 0;
+    for (;;) {
+        size_t n = fread(buf, 1, sizeof(buf), pf);
+        if (n == 0) break;
+        web_buf_append(&html, buf, n);
+        total += n;
+        if (total > DS4_WEB_MAX_RESULT_BYTES) break;
+    }
+    int rc = pclose(pf);
+    if (rc != 0 && html.len == 0) {
+        free(html.ptr);
+        web_set_err(err, err_len, "curl exit code %d", rc);
+        return NULL;
+    }
+    if (html.len == 0) {
+        free(html.ptr);
+        web_set_err(err, err_len, "curl returned empty page");
+        return NULL;
+    }
+    char *body = web_buf_take(&html);
+
+    /* Simple Markdown conversion */
+    web_buf md = {0};
+    web_buf_puts(&md, "## Page Dump (curl)\n\n");
+
+    /* Extract title */
+    char *title_s = strstr(body, "<title");
+    if (title_s) {
+        char *title_e = strstr(title_s, "</title>");
+        if (title_e) {
+            web_buf_puts(&md, "**Title:** ");
+            char *t = title_s;
+            while (*t && *t != '>') t++;
+            if (*t) t++;
+            size_t title_len = (size_t)(title_e - t);
+            if (title_len > 0) {
+                web_buf_append(&md, t, title_len < 200 ? title_len : 200);
+                web_buf_puts(&md, "\n\n");
+            }
+        }
+    }
+
+    web_buf_puts(&md, "## Links\n\n");
+    int link_count = 0;
+    for (char *a = body; a && *a && link_count < 50; a++) {
+        a = strstr(a, "<a ");
+        if (!a) break;
+        /* find href */
+        char *href_s = strstr(a, "href=\"");
+        char *href = NULL;
+        if (href_s && href_s < a + 512) {
+            href = href_s + 6;
+            char *href_e = strchr(href, '"');
+            if (href_e) {
+                size_t hlen = (size_t)(href_e - href);
+                if (hlen > 0 && hlen < 4096) {
+                    char href_copy[4096];
+                    memcpy(href_copy, href, hlen);
+                    href_copy[hlen] = '\0';
+                    /* find link text */
+                    char *close = strstr(a, "</a>");
+                    if (close && close < a + 512) {
+                        char *text_s = a;
+                        while (*text_s && *text_s != '>') text_s++;
+                        if (*text_s) text_s++;
+                        size_t text_len = (size_t)(close - text_s);
+                        if (text_len > 0 && text_len < 512) {
+                            web_buf_puts(&md, "- [");
+                            web_buf_append(&md, text_s, text_len);
+                            web_buf_puts(&md, "](");
+                            web_buf_puts(&md, href_copy);
+                            web_buf_puts(&md, ")\n");
+                            link_count++;
+                        }
+                    }
+                }
+            }
+        }
+        a = strstr(a, "</a>");
+        if (!a) break;
+        a += 4;
+    }
+
+    /* Extract body text */
+    char *body_s = strstr(body, "<body");
+    if (body_s) {
+        char *body_e = strstr(body_s, "</body>");
+        if (body_e) {
+            web_buf_puts(&md, "\n## Content\n\n");
+            char *t = body_s;
+            while (*t && *t != '>') t++;
+            if (*t) t++;
+            /* Strip tags, keep text */
+            int chars = 0;
+            bool in_tag = false;
+            for (char *p = t; p < body_e && *p && chars < 20000; p++) {
+                if (*p == '<') { in_tag = true; continue; }
+                if (*p == '>') { in_tag = false; continue; }
+                if (!in_tag) {
+                    /* collapse whitespace */
+                    if (isspace((unsigned char)*p)) {
+                        if (chars > 0 && !isspace((unsigned char)md.ptr[md.len-1])) {
+                            web_buf_append(&md, " ", 1);
+                            chars++;
+                        }
+                    } else {
+                        web_buf_append(&md, p, 1);
+                        chars++;
+                    }
+                }
+            }
+            web_buf_puts(&md, "\n");
+        }
+    }
+
+    free(body);
+    return web_buf_take(&md);
 }
 
 char *ds4_web_visit_page(ds4_web *web, const char *url,
@@ -1381,5 +1540,15 @@ char *ds4_web_visit_page(ds4_web *web, const char *url,
         web_set_err(err, err_len, "visit_page requires url");
         return NULL;
     }
-    return web_run_page_js(web, url, web_extract_page_js, true, err, err_len);
+    /* In headless mode, try CDP first (Chrome --headless), fall back to curl */
+    char cdp_err[256] = {0};
+    char *out = web_run_page_js(web, url, web_extract_page_js, true, cdp_err, sizeof(cdp_err));
+    if (out) return out;
+    if (web->headless) {
+        web_log(web, "CDP failed, trying curl HTML dump");
+        return web_curl_dump_page(url, err, err_len);
+    }
+    /* Non-headless: propagate the CDP error */
+    if (err && err_len > 0) snprintf(err, err_len, "%s", cdp_err);
+    return NULL;
 }
