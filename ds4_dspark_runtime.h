@@ -18,6 +18,9 @@ typedef enum {
 
 
 float ds4_dspark_bf16_to_f32(uint16_t h);
+int ds4_dspark_draft_len_until_eos(const int *drafts, int draft_n, int eos_token);
+
+
 
 
 ds4_dspark_spec_gate ds4_dspark_speculative_gate(ds4_mtp_draft_kind kind,
