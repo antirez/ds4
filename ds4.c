@@ -29472,24 +29472,17 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                 }
             }
 
-            /* Partial commit: restore compressed KV, skip-logits replay.
-             *
-             * The full replay costs ~27ms/token (full 43-layer forward + output head).
-             * Optimization: pass NULL for logits on intermediate tokens — only the
-             * LAST replayed token needs logits (for the next decode cycle). This
-             * skips the expensive lm_head matmul (129K × 4K) on K-1 tokens. */
+            /* Partial commit: restore frontier, replay accepted tokens one-by-one. */
             s->checkpoint.len = start;
             ok = have_frontier && spec_frontier_restore(&frontier, s);
             int replayed = 0;
             for (; ok && replayed < commit_drafts; replayed++) {
-                /* Only compute logits on the LAST replayed token. */
-                float *logits_out = (replayed == commit_drafts - 1) ? row_logits : NULL;
                 ok = metal_graph_eval_token_raw_swa(&s->graph,
                                                     &e->model,
                                                     &e->weights,
                                                     drafts[replayed],
                                                     (uint32_t)(start + replayed),
-                                                    logits_out);
+                                                    row_logits);
                 if (ok) {
                     token_vec_push(&s->checkpoint, drafts[replayed]);
                     ok = metal_graph_dspark_refresh_current_row(&s->graph,
