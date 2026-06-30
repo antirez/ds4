@@ -24577,6 +24577,7 @@ struct ds4_session {
     int dspark_draft_count;
     uint32_t dspark_draft_base_real;
     float *dspark_b2_draft_logits;   /* [block_size * DS4_N_VOCAB] post-markov-bias logits for B2 */
+    uint64_t dspark_b2_rng;          /* xorshift64* state for B2 rejection sampling (persisted across calls) */
     uint64_t mtp_probe_total;
     uint64_t mtp_probe_hit;
     ds4_session_progress_fn progress;
@@ -29276,24 +29277,27 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 
         /* B2 rejection sampling: parse DS4_SPEC_TEMP for stochastic path.
          * When set (temp > 0), uses B2 to produce lossless samples from
-         * the target model's distribution. Default (unset or <=0): greedy. */
+         * the target model's distribution. Default (unset or <=0): greedy.
+         *
+         * ARDD adversarial review fix: RNG state persisted in session struct
+         * (not reseeded per call) to avoid correlated random sequences when
+         * multiple speculative eval calls happen within the same second. */
         float b2_temp = 0.0f;
-        uint64_t b2_rng = 0;
         const char *spec_temp_env = getenv("DS4_SPEC_TEMP");
         if (spec_temp_env && spec_temp_env[0]) {
             char *end = NULL;
             float v = strtof(spec_temp_env, &end);
             if (end != spec_temp_env && v > 0.0f) b2_temp = v;
         }
-        if (b2_temp > 0.0f) {
+        if (b2_temp > 0.0f && s->dspark_b2_rng == 0) {
             const char *seed_env = getenv("DS4_SPEC_RNG_SEED");
             if (seed_env && seed_env[0]) {
-                b2_rng = (uint64_t)strtoull(seed_env, NULL, 0);
+                s->dspark_b2_rng = (uint64_t)strtoull(seed_env, NULL, 0);
             }
-            if (b2_rng == 0) {
-                b2_rng = (uint64_t)time(NULL) ^
-                         ((uint64_t)getpid() << 32) ^
-                         (uint64_t)clock();
+            if (s->dspark_b2_rng == 0) {
+                s->dspark_b2_rng = (uint64_t)time(NULL) ^
+                                   ((uint64_t)getpid() << 32) ^
+                                   (uint64_t)clock();
             }
         }
 
@@ -29315,8 +29319,19 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
 
         /* For B2 at temp>0, allocate target logits buffer for ALL draft positions.
-         * At temp=0 this stays NULL and we use the existing argmax path. */
-        const uint64_t all_logits_bytes = (uint64_t)draft_n * DS4_N_VOCAB * sizeof(float);
+         * At temp=0 this stays NULL and we use the existing argmax path.
+         *
+         * CRITICAL (ARDD adversarial review fix — off-by-one in target logits):
+         * metal_graph_verify_suffix_tops row[i] = target logits AFTER processing
+         * drafts[i] → predicts drafts[i+1], NOT drafts[i].
+         * Correct mapping: drafts[0] → s->logits (previous target eval),
+         *                  drafts[j>0] → verify_row[j-1].
+         * We store raw verify output in b2_verify_logits, then shift into
+         * b2_target_logits with s->logits prepended as row 0. */
+        const uint64_t row_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float);
+        const uint64_t all_logits_bytes = (uint64_t)draft_n * row_bytes;
+        float *b2_verify_logits = (b2_temp > 0.0f)
+            ? xmalloc((size_t)all_logits_bytes) : NULL;
         float *b2_target_logits = (b2_temp > 0.0f)
             ? xmalloc((size_t)all_logits_bytes) : NULL;
 
@@ -29335,7 +29350,18 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                 (uint32_t)draft_n,
                                                 false,
                                                 row_tops,
-                                                b2_target_logits);
+                                                b2_verify_logits);
+        }
+        /* Assemble shifted target logits for B2:
+         * row 0 = s->logits (target prediction for drafts[0])
+         * row j = verify_row[j-1] (target prediction for drafts[j]) */
+        if (ok && b2_verify_logits && b2_target_logits) {
+            memcpy(b2_target_logits, s->logits, (size_t)row_bytes);
+            if (draft_n > 1) {
+                memcpy(b2_target_logits + DS4_N_VOCAB,
+                       b2_verify_logits,
+                       (size_t)(draft_n - 1) * (size_t)row_bytes);
+            }
         }
         const double verify_done = mtp_timing ? now_sec() : 0.0;
         if (ok) {
@@ -29350,7 +29376,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     DS4_N_VOCAB,
                     draft_n,
                     b2_temp,
-                    &b2_rng);
+                    &s->dspark_b2_rng);
                 commit_drafts = b2r.n_accepted;
 
                 if (getenv("DS4_MTP_SPEC_LOG")) {
@@ -29392,7 +29418,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                         spec_frontier_free(&frontier);
                         free(row_logits);
                         free(row_tops);
-                        free(b2_target_logits);
+                        free(b2_target_logits); free(b2_verify_logits);
                         return n_accept;
                     }
                 }
@@ -29440,7 +29466,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                         spec_frontier_free(&frontier);
                         free(row_logits);
                         free(row_tops);
-                        free(b2_target_logits);
+                        free(b2_target_logits); free(b2_verify_logits);
                         return n_accept;
                     }
                 }
@@ -29488,7 +29514,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                 spec_frontier_free(&frontier);
                 free(row_logits);
                 free(row_tops);
-                free(b2_target_logits);
+                free(b2_target_logits); free(b2_verify_logits);
                 return n_accept;
             }
         }
@@ -29500,7 +29526,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         spec_frontier_free(&frontier);
         free(row_logits);
         free(row_tops);
-        free(b2_target_logits);
+        free(b2_target_logits); free(b2_verify_logits);
         return -1;
 #undef DS4_DSPARK_KEEP_ACCEPTED
     }
