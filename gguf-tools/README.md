@@ -13,6 +13,9 @@ The important pieces are:
   importance with `ds4`.
 - `quality-testing/`: prompts and scripts used to compare local GGUF variants
   against official DeepSeek V4 Flash continuations.
+- `deepspec/ds4_deepspec.py`: validates DS4 target-cache exports against the
+  DeepSpec v2 manifest/index/shard contract and emits the DS4-side non-Markov
+  DeepSpec config scaffold before external training.
 
 ## Build
 
@@ -107,6 +110,29 @@ gguf-tools/deepseek4-quantize \
 
 `--compare-tensor` regenerates a single tensor and byte-compares it against the
 template or `--compare-gguf`.  `--threads N` controls routed-expert workers.
+
+## Generate A DSpark/DeepSpec Draft GGUF
+
+Official DeepSeek-V4-Flash DSpark/DeepSpec Markov draft weights are stored in
+separate Hugging Face safetensor shards under the `mtp.*` namespace. Convert
+those shards into a DS4 auxiliary MTP GGUF with `--dspark-only`; the main Flash
+template supplies tokenizer metadata, tensor order, and GGUF layout:
+
+```sh
+gguf-tools/deepseek4-quantize \
+  --hf gguf/dspark-hf \
+  --template gguf/ds4flash.gguf \
+  --out gguf/deepseek4.dspark.gguf \
+  --dspark-only
+```
+
+The converter detects the official Markov layout from `mtp.0.main_proj.weight`
+plus `mtp.2.markov_head.markov_w1.weight`, stores the rank-256 Markov weights
+as F16, emits `deepseek4.dspark.*` metadata, and accepts the model
+repository root `config.json` as a fallback when `inference/config.json` is not
+present. Use `--dry-run` before writing and `--self-test-dspark-map` after
+changing tensor mapping rules.
+
 
 ## When No Imatrix Is Given
 

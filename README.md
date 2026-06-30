@@ -133,11 +133,37 @@ weights. Flash GGUF generation is supported by the local tools. PRO GGUF
 production currently still depends on the external `llama.cpp`-based workflow;
 native tooling can be added later.
 
-`./download_model.sh mtp` fetches the optional speculative decoding support
-GGUF for Flash. It can be used with q2-imatrix, q2-q4-imatrix, and q4-imatrix,
-but must be enabled explicitly with `--mtp`. The current MTP/speculative
-decoding path is still experimental: it is correctness-gated and currently
-provides at most a slight speedup, not a meaningful generation-speed win.
+`./download_model.sh mtp` fetches the optional legacy speculative decoding
+support GGUF for Flash. It can be used with q2-imatrix, q2-q4-imatrix, and
+q4-imatrix, but must be enabled explicitly with `--mtp`. Legacy one-step MTP is
+correctness-gated and experimental: it currently provides at most a slight
+speedup, not a meaningful generation-speed win. Official DeepSeek-V4-Flash
+DSpark/DeepSpec Markov draft shards can be converted with
+`gguf-tools/deepseek4-quantize --dspark-only`. Passing the converted DSpark GGUF
+with `--mtp DSpark.gguf` enables an experimental Metal block speculative decode
+path: draft blocks are target-verified before commit, but acceptance and speed
+depend on the base/draft quantization and prompt. DSpark GGUFs are additional
+draft-model weights, so higher draft precision trades directly against
+long-context headroom. CPU builds do not run MTP, and CUDA/ROCm currently load
+DSpark GGUFs without enabling the DSpark runtime.
+
+For DeepSpec training experiments, `ds4 --dspark-target-cache-dataset FILE
+--dspark-target-cache-out DIR --dspark-target-cache-target-model HF_OR_PATH`
+consumes the same rendered prompt dataset format used by imatrix collection and
+writes a DeepSpec-compatible target cache (`manifest.json`, `samples.idx`, and
+shard data) containing prompt token ids, attention/loss masks, target-layer
+hidden states, and last hidden states. Use
+`--dspark-target-cache-chat-template NAME` to stamp the cache manifest with the
+DeepSpec training template identity.
+Validate the cache contract with
+`python3 gguf-tools/deepspec/ds4_deepspec.py DIR --target-model HF_OR_PATH`
+before handing it to a DeepSpec checkout. The same helper can emit the DS4-side
+non-Markov DeepSpec config scaffold with
+`python3 gguf-tools/deepspec/ds4_deepspec.py --emit-nonseq-config dspark_v4_nonseq.py --target-cache DIR`.
+This target-cache export path remains useful for DSpark/DeepSpec training
+experiments; the built-in Metal runtime uses already converted official DSpark
+Markov draft GGUFs and should still be benchmarked with `DS4_MTP_TIMING=1` on
+the exact base/draft quant pair before treating it as a throughput win.
 
 Then build:
 
@@ -689,10 +715,12 @@ conversation. Useful commands are `/help`, `/think`, `/think-max`, `/nothink`,
 and returns to `ds4>`.
 
 The CLI defaults to thinking mode. Use `/nothink` or `--nothink` for direct
-answers. `--mtp MTP.gguf --mtp-draft 2` enables the optional MTP speculative
-path; it is useful only for greedy decoding, currently uses a confidence gate
-(`--mtp-margin`) to avoid slow partial accepts, and should be treated as an
-experimental slight-speedup path.
+answers. `--mtp MTP.gguf --mtp-draft 2` enables the optional legacy one-step
+MTP speculative path. Passing a converted official DSpark/DeepSpec Markov GGUF
+with `--mtp DSpark.gguf` opts into the experimental Metal block-draft runtime,
+which verifies proposed blocks against the target model before committing them.
+It is correctness-gated, not a guaranteed speedup; measure acceptance and wall
+time for the exact quantized base/draft pair.
 
 ## Server
 

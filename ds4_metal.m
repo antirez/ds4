@@ -17050,6 +17050,13 @@ static void ds4_gpu_fill_raw_decode_batch_mask(
     }
 }
 
+static void ds4_gpu_fill_raw_decode_batch_all_mask(
+        uint16_t *mask,
+        uint32_t  n_tokens,
+        uint32_t  n_raw) {
+    memset(mask, 0, (size_t)n_tokens * n_raw * sizeof(mask[0]));
+}
+
 static void ds4_gpu_fill_mixed_decode_batch_mask(
         uint16_t *mask,
         uint32_t  n_tokens,
@@ -18432,6 +18439,7 @@ static int ds4_gpu_encode_flash_attention_decode_raw_batch_heads(
         uint32_t               raw_cap,
         uint32_t               raw_start,
         uint32_t               window,
+        bool                   noncausal,
         uint32_t               n_head,
         uint32_t               head_dim) {
     if (head_dim != 512 || n_head == 0 || n_tokens == 0 ||
@@ -18528,11 +18536,17 @@ static int ds4_gpu_encode_flash_attention_decode_raw_batch_heads(
         return 0;
     }
 
-    ds4_gpu_fill_raw_decode_batch_mask((uint16_t *)[mask_buffer contents],
-                                         n_tokens,
-                                         n_raw,
-                                         pos0,
-                                         window);
+    if (noncausal) {
+        ds4_gpu_fill_raw_decode_batch_all_mask((uint16_t *)[mask_buffer contents],
+                                                 n_tokens,
+                                                 n_raw);
+    } else {
+        ds4_gpu_fill_raw_decode_batch_mask((uint16_t *)[mask_buffer contents],
+                                             n_tokens,
+                                             n_raw,
+                                             pos0,
+                                             window);
+    }
 
     id<MTLComputePipelineState> pad_pipeline = nil;
     if (has_kvpad) {
@@ -18693,6 +18707,7 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
                                                                        raw_cap,
                                                                        raw_start,
                                                                        window,
+                                                                       false,
                                                                        n_head,
                                                                        head_dim);
     }
@@ -19052,12 +19067,73 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
                                                                      raw_cap,
                                                                      raw_start,
                                                                      window,
+                                                                     false,
                                                                      n_head,
                                                                      head_dim)) {
             return 0;
         }
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "graph decode raw batch attention heads")) return 0;
+    }
+
+    return 1;
+}
+
+int ds4_gpu_attention_decode_raw_batch_heads_noncausal_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        uint32_t                n_tokens,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
+        n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        if (sinks_offset > model_size || (uint64_t)n_head * sizeof(float) > model_size - sinks_offset) {
+            fprintf(stderr, "ds4: Metal attention sinks range is outside the mapped model\n");
+            return 0;
+        }
+
+        uint64_t sinks_inner = 0;
+        id<MTLBuffer> sinks_buf = ds4_gpu_wrap_model_range(model_map, model_size,
+                                                             sinks_offset,
+                                                             (uint64_t)n_head * sizeof(float),
+                                                             &sinks_inner);
+        if (!sinks_buf) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        if (!ds4_gpu_encode_flash_attention_decode_raw_batch_heads(cb,
+                                                                     heads,
+                                                                     sinks_buf,
+                                                                     (NSUInteger)sinks_inner,
+                                                                     q,
+                                                                     raw_kv,
+                                                                     n_tokens,
+                                                                     0,
+                                                                     n_raw,
+                                                                     raw_cap,
+                                                                     raw_start,
+                                                                     0,
+                                                                     true,
+                                                                     n_head,
+                                                                     head_dim)) {
+            return 0;
+        }
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "dspark noncausal batch attention heads")) return 0;
     }
 
     return 1;
