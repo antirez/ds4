@@ -17,6 +17,8 @@ typedef enum {
 
 
 
+float ds4_dspark_bf16_to_f32(uint16_t h);
+
 
 ds4_dspark_spec_gate ds4_dspark_speculative_gate(ds4_mtp_draft_kind kind,
                                                  bool mtp_ready,

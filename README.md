@@ -139,9 +139,13 @@ q4-imatrix, but must be enabled explicitly with `--mtp`. Legacy one-step MTP is
 correctness-gated and experimental: it currently provides at most a slight
 speedup, not a meaningful generation-speed win. Official DeepSeek-V4-Flash
 DSpark/DeepSpec Markov draft shards can be converted with
-`gguf-tools/deepseek4-quantize --dspark-only`; converted DSpark draft GGUFs are
-recognized by the loader, but block-draft speculative decode remains disabled
-until a Metal draft graph is validated on real converted weights.
+`gguf-tools/deepseek4-quantize --dspark-only`. Passing the converted DSpark GGUF
+with `--mtp DSpark.gguf` enables an experimental Metal block speculative decode
+path: draft blocks are target-verified before commit, but acceptance and speed
+depend on the base/draft quantization and prompt. DSpark GGUFs are additional
+draft-model weights, so higher draft precision trades directly against
+long-context headroom. CPU builds do not run MTP, and CUDA/ROCm currently load
+DSpark GGUFs without enabling the DSpark runtime.
 
 For DeepSpec training experiments, `ds4 --dspark-target-cache-dataset FILE
 --dspark-target-cache-out DIR --dspark-target-cache-target-model HF_OR_PATH`
@@ -156,8 +160,10 @@ Validate the cache contract with
 before handing it to a DeepSpec checkout. The same helper can emit the DS4-side
 non-Markov DeepSpec config scaffold with
 `python3 gguf-tools/deepspec/ds4_deepspec.py --emit-nonseq-config dspark_v4_nonseq.py --target-cache DIR`.
-This is an offline data-export path; DSpark block-draft runtime remains disabled
-until validated weights and a Metal draft graph are available.
+This target-cache export path remains useful for DSpark/DeepSpec training
+experiments; the built-in Metal runtime uses already converted official DSpark
+Markov draft GGUFs and should still be benchmarked with `DS4_MTP_TIMING=1` on
+the exact base/draft quant pair before treating it as a throughput win.
 
 Then build:
 
@@ -710,10 +716,11 @@ and returns to `ds4>`.
 
 The CLI defaults to thinking mode. Use `/nothink` or `--nothink` for direct
 answers. `--mtp MTP.gguf --mtp-draft 2` enables the optional legacy one-step
-MTP speculative path; it is useful only for greedy decoding, currently uses a
-confidence gate (`--mtp-margin`) to avoid slow partial accepts, and should be
-treated as an experimental slight-speedup path. DSpark/DeepSpec GGUFs load and
-report a clear disabled-runtime reason instead of emitting fake draft tokens.
+MTP speculative path. Passing a converted official DSpark/DeepSpec Markov GGUF
+with `--mtp DSpark.gguf` opts into the experimental Metal block-draft runtime,
+which verifies proposed blocks against the target model before committing them.
+It is correctness-gated, not a guaranteed speedup; measure acceptance and wall
+time for the exact quantized base/draft pair.
 
 ## Server
 

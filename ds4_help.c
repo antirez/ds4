@@ -170,11 +170,11 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--prefill-chunk N", "Metal graph prefill chunk size. Default: auto (PRO long prompts use 8192; others use 4096).");
     if (full) {
         if (tool != DS4_HELP_BENCH) {
-            opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");
+            opt(fp, c, "--mtp FILE", "Optional speculative draft GGUF: legacy MTP or experimental converted DSpark/DeepSpec on Metal.");
         }
         if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
-            opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens. Default: 1");
-            opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
+            opt(fp, c, "--mtp-draft N", "Maximum speculative draft tokens. Legacy default: 1; DSpark uses GGUF block size.");
+            opt(fp, c, "--mtp-margin F", "Verifier confidence margin for legacy fast MTP acceptance. Default: 3");
         }
         opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");
         opt(fp, c, "--warm-weights", "Touch mapped tensor pages at startup to reduce first-use stalls.");

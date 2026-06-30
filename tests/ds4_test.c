@@ -87,11 +87,24 @@ static void test_restore_canonical_streaming_prefill(
                      saved.batch_selected_addr);
 }
 
+static ds4_backend test_backend(void) {
+#ifdef __APPLE__
+    return DS4_BACKEND_METAL;
+#else
+    return DS4_BACKEND_CUDA;
+#endif
+}
+
+
 static ds4_engine *test_open_engine(bool quality) {
     ds4_engine *engine = NULL;
-    /* DS4_TEST_MTP loads the MTP head on the fast engine so the speculative
-     * verify regression can reuse it; draft=4 hits the multi-row verify path. */
-    const char *mtp = getenv("DS4_TEST_MTP");
+    /* DS4_TEST_MTP loads the legacy MTP head on the fast engine so the speculative
+     * verify regression can reuse it; draft=4 hits the multi-row verify path.
+     * DS4_TEST_DSPARK loads an official DSpark draft GGUF and lets metadata choose
+     * the block size. */
+    const char *dspark = getenv("DS4_TEST_DSPARK");
+    const char *mtp = (dspark && dspark[0]) ? dspark : getenv("DS4_TEST_MTP");
+    const bool use_mtp = mtp && mtp[0] && !quality;
     ds4_engine_options opt = {
         .model_path = test_model_path(),
 #ifdef __APPLE__
@@ -108,8 +121,8 @@ static ds4_engine *test_open_engine(bool quality) {
             test_env_gib("DS4_TEST_SSD_STREAMING_CACHE_GB"),
         .ssd_streaming_preload_experts =
             test_env_u32("DS4_TEST_SSD_STREAMING_PRELOAD_EXPERTS"),
-        .mtp_path = (mtp && mtp[0] && !quality) ? mtp : NULL,
-        .mtp_draft_tokens = (mtp && mtp[0] && !quality) ? 4 : 0,
+        .mtp_path = use_mtp ? mtp : NULL,
+        .mtp_draft_tokens = use_mtp && !(dspark && dspark[0]) ? 4 : 0,
     };
     TEST_ASSERT(ds4_engine_open(&engine, &opt) == 0);
     return engine;
@@ -2177,6 +2190,52 @@ static void test_mtp_verify_depth(void) {
     ds4_tokens_free(&prompt);
 }
 
+static void test_dspark_speculative_block(void) {
+    const char *dspark = getenv("DS4_TEST_DSPARK");
+    if (!dspark || !dspark[0]) {
+        fprintf(stderr, "ds4-test: dspark-speculative-block skipped (set DS4_TEST_DSPARK to a DSpark GGUF)\n");
+        return;
+    }
+
+    ds4_engine *engine = test_get_engine(false);
+    const ds4_mtp_draft_kind draft_kind = ds4_engine_mtp_draft_kind(engine);
+    TEST_ASSERT(draft_kind == DS4_MTP_DRAFT_DSPARK);
+    if (!ds4_mtp_draft_runtime_supported(test_backend(), draft_kind)) {
+        fprintf(stderr, "ds4-test: dspark-speculative-block skipped (backend does not support DSpark runtime)\n");
+        return;
+    }
+    TEST_ASSERT(ds4_engine_has_mtp(engine));
+    TEST_ASSERT(ds4_engine_mtp_draft_tokens(engine) == 5);
+
+    ds4_tokens prompt = {0};
+    ds4_chat_begin(engine, &prompt);
+    ds4_chat_append_message(engine, &prompt, "user", test_mtp_copy_prompt());
+    ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+    TEST_ASSERT(prompt.len > 0);
+
+    int *spec = malloc((size_t)TEST_MTP_MAXGEN * sizeof(*spec));
+    TEST_ASSERT(spec != NULL);
+    if (spec && prompt.len > 0) {
+        int nspec = 0, max_chunk = 0;
+        const bool ok_spec = test_mtp_capture_speculative(engine, &prompt, 96,
+                                                          spec, &nspec, &max_chunk);
+        TEST_ASSERT(ok_spec);
+        TEST_ASSERT(max_chunk > 1);
+
+        float worst_gap = 0.0f;
+        int worst_at = -1;
+        const bool ok_check = test_mtp_worst_argmax_gap(engine, &prompt, spec, nspec,
+                                                        &worst_gap, &worst_at);
+        TEST_ASSERT(ok_check);
+        fprintf(stderr, "ds4-test: dspark-speculative-block nspec=%d max_chunk=%d worst_argmax_gap=%.3f at=%d\n",
+                nspec, max_chunk, worst_gap, worst_at);
+        TEST_ASSERT(worst_gap <= 2.0f);
+    }
+
+    free(spec);
+    ds4_tokens_free(&prompt);
+}
+
 
 #endif
 
@@ -2206,13 +2265,19 @@ static void test_dspark_binder_helpers(void) {
     TEST_ASSERT(!strcmp(ds4_mtp_draft_kind_name(DS4_MTP_DRAFT_LEGACY), "legacy-mtp"));
 }
 
+static void test_dspark_markov_bf16_helpers(void) {
+    TEST_ASSERT(fabsf(ds4_dspark_bf16_to_f32(0x3fc0u) - 1.5f) < 0.001f);
+    TEST_ASSERT(fabsf(ds4_dspark_bf16_to_f32(0xbe80u) + 0.25f) < 0.001f);
+}
+
+
 static void test_dspark_runtime_helpers(void) {
     ds4_dspark_config cfg;
     ds4_dspark_config_init_defaults(&cfg);
     TEST_ASSERT(ds4_dspark_speculative_gate(DS4_MTP_DRAFT_LEGACY, true, 4) ==
                 DS4_DSPARK_SPEC_LEGACY_MTP);
     TEST_ASSERT(ds4_dspark_speculative_gate(DS4_MTP_DRAFT_DSPARK, true, 5) ==
-                DS4_DSPARK_SPEC_DSPARK_NOT_READY);
+                DS4_DSPARK_SPEC_DSPARK_ENABLED);
     TEST_ASSERT(ds4_dspark_speculative_gate(DS4_MTP_DRAFT_DSPARK_NONSEQ, true, 5) ==
                 DS4_DSPARK_SPEC_DSPARK_NONSEQ_NOT_READY);
     TEST_ASSERT(ds4_dspark_speculative_gate(DS4_MTP_DRAFT_DSPARK, true, 1) ==
@@ -2223,8 +2288,16 @@ static void test_dspark_runtime_helpers(void) {
                        "nonseq") != NULL);
     TEST_ASSERT(ds4_mtp_speculative_draft_ready(DS4_MTP_DRAFT_LEGACY));
     TEST_ASSERT(!ds4_mtp_speculative_draft_ready(DS4_MTP_DRAFT_NONE));
-    TEST_ASSERT(!ds4_mtp_speculative_draft_ready(DS4_MTP_DRAFT_DSPARK));
+    TEST_ASSERT(ds4_mtp_speculative_draft_ready(DS4_MTP_DRAFT_DSPARK));
     TEST_ASSERT(!ds4_mtp_speculative_draft_ready(DS4_MTP_DRAFT_DSPARK_NONSEQ));
+    TEST_ASSERT(ds4_mtp_draft_runtime_supported(DS4_BACKEND_METAL,
+                                                DS4_MTP_DRAFT_DSPARK));
+    TEST_ASSERT(!ds4_mtp_draft_runtime_supported(DS4_BACKEND_CUDA,
+                                                 DS4_MTP_DRAFT_DSPARK));
+    TEST_ASSERT(!ds4_mtp_draft_runtime_supported(DS4_BACKEND_CUDA,
+                                                 DS4_MTP_DRAFT_DSPARK_NONSEQ));
+    TEST_ASSERT(!ds4_mtp_draft_runtime_supported(DS4_BACKEND_CPU,
+                                                 DS4_MTP_DRAFT_LEGACY));
     TEST_ASSERT(strstr(ds4_dspark_spec_gate_reason(DS4_DSPARK_SPEC_DSPARK_NONSEQ_NOT_READY),
                        "nonseq") != NULL);
     TEST_ASSERT(strstr(ds4_dspark_spec_gate_reason(DS4_DSPARK_SPEC_DSPARK_NONSEQ_NOT_READY),
@@ -2376,6 +2449,7 @@ static void test_dspark_target_cache_export(void) {
     char output_dir[PATH_MAX];
     char missing_target_output_dir[PATH_MAX];
     char manifest_path[PATH_MAX];
+    char lock_path[PATH_MAX];
     char index_path[PATH_MAX];
     char shard_path[PATH_MAX];
     TEST_ASSERT(snprintf(dataset_path, sizeof(dataset_path), "%s/prompts.txt", root) <
@@ -2391,6 +2465,9 @@ static void test_dspark_target_cache_export(void) {
                 (int)sizeof(index_path));
     TEST_ASSERT(snprintf(shard_path, sizeof(shard_path), "%s/shard-00000.bin",
                          output_dir) < (int)sizeof(shard_path));
+    TEST_ASSERT(snprintf(lock_path, sizeof(lock_path), "%s/ds4.lock", root) <
+                (int)sizeof(lock_path));
+    TEST_ASSERT(setenv("DS4_LOCK_FILE", lock_path, 1) == 0);
     TEST_ASSERT(test_write_dspark_target_cache_dataset(dataset_path));
     const int missing_target_rc =
         test_run_dspark_target_cache_cli_missing_target_model(dataset_path,
@@ -2500,8 +2577,10 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
+    {"--dspark-speculative-block", "dspark-speculative-block", "DSpark block drafts commit only target-verified tokens", test_dspark_speculative_block},
 #endif
     {"--dspark-binder", "dspark-binder", "DSpark draft kind/config defaults without GGUF", test_dspark_binder_helpers},
+    {"--dspark-markov-bf16", "dspark-markov-bf16", "DSpark Markov BF16 tensor decoding", test_dspark_markov_bf16_helpers},
     {"--dspark-runtime", "dspark-runtime", "DSpark capture plan and speculative gate helpers", test_dspark_runtime_helpers},
 
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
