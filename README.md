@@ -161,9 +161,10 @@ before handing it to a DeepSpec checkout. The same helper can emit the DS4-side
 non-Markov DeepSpec config scaffold with
 `python3 gguf-tools/deepspec/ds4_deepspec.py --emit-nonseq-config dspark_v4_nonseq.py --target-cache DIR`.
 This target-cache export path remains useful for DSpark/DeepSpec training
-experiments; the built-in Metal runtime uses already converted official DSpark
-Markov draft GGUFs and should still be benchmarked with `DS4_MTP_TIMING=1` on
-the exact base/draft quant pair before treating it as a throughput win.
+experiments; the built-in Metal runtime uses converted Markov or nonseq DSpark
+draft GGUFs through the same target-verified block speculation path. Benchmark
+with `DS4_MTP_TIMING=1` on the exact base/draft quant pair before treating it as
+a throughput win.
 
 Then build:
 

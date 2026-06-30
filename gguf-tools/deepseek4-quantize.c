@@ -1896,7 +1896,7 @@ static void write_dspark_kvs(FILE *fp, const dspark_metadata *m) {
     }
 }
 
-static gguf_file load_gguf_metadata(const char *path) {
+static gguf_file load_gguf_metadata(const char *path, bool drop_dspark_kvs) {
     gguf_file g = {0};
     g.path = xstrdup(path);
     FILE *fp = fopen(path, "rb");
@@ -1935,12 +1935,12 @@ static gguf_file load_gguf_metadata(const char *path) {
         if (rec_end < 0 || rec_end < rec_start) die("GGUF ftell failed");
 
         /*
-         * Template GGUFs may already carry imatrix provenance from a previous
-         * quantization.  Drop those keys and write the current run's keys later,
-         * otherwise the output can contain duplicate GGUF metadata with stale
-         * and new values.
+         * Template GGUFs may already carry provenance from a previous run.
+         * Always drop imatrix keys because the current run rewrites them.
+         * Drop DSpark keys only when this run will rewrite DSpark metadata;
+         * source/template reuse without DSpark rewriting must preserve them.
          */
-        if (!is_imatrix_kv_key(key) && !is_dspark_kv_key(key)) {
+        if (!is_imatrix_kv_key(key) && !(drop_dspark_kvs && is_dspark_kv_key(key))) {
             kv_keep[n_kv_keep++] = (byte_span){
                 .start = (size_t)(rec_start - kv_start),
                 .end = (size_t)(rec_end - kv_start),
@@ -2244,6 +2244,79 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
     fclose(fp);
 }
 
+static void free_gguf_file(gguf_file *g);
+
+static uint64_t count_gguf_kv_prefix_in_file(const char *path, const char *prefix) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) die_errno("open GGUF", path);
+    char magic[4];
+    if (fread(magic, 1, sizeof(magic), fp) != sizeof(magic) || memcmp(magic, "GGUF", 4) != 0) {
+        die("bad GGUF self-test file");
+    }
+    (void)read_u32_le_fp(fp, "GGUF version");
+    (void)read_u64_le_fp(fp, "GGUF tensor count");
+    uint64_t n_kv = read_u64_le_fp(fp, "GGUF KV count");
+    uint64_t count = 0;
+    for (uint64_t i = 0; i < n_kv; i++) {
+        char *key = read_gguf_string_fp(fp);
+        uint32_t type = read_u32_le_fp(fp, "GGUF KV type");
+        if (str_starts(key, prefix)) count++;
+        skip_gguf_value_fp(fp, type);
+        free(key);
+    }
+    fclose(fp);
+    return count;
+}
+
+static void write_dspark_metadata_template(const char *path, const dspark_metadata *m) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) die_errno("create GGUF self-test template", path);
+    if (fwrite("GGUF", 1, 4, fp) != 4) die("write GGUF magic failed");
+    write_u32(fp, 3);
+    write_u64(fp, 0);
+    write_u64(fp, extra_dspark_kv_count(true));
+    write_dspark_kvs(fp, m);
+    if (fclose(fp) != 0) die_errno("close GGUF self-test template", path);
+}
+
+static void self_test_dspark_kv_rewrite_no_duplicates(void) {
+    char tmpl_path[] = "/tmp/ds4q-dspark-template-XXXXXX";
+    int tmpl_fd = mkstemp(tmpl_path);
+    if (tmpl_fd < 0) die_errno("mkstemp", tmpl_path);
+    close(tmpl_fd);
+    char out_path[] = "/tmp/ds4q-dspark-output-XXXXXX";
+    int out_fd = mkstemp(out_path);
+    if (out_fd < 0) die_errno("mkstemp", out_path);
+    close(out_fd);
+
+    dspark_metadata old_meta = dspark_metadata_defaults();
+    old_meta.markov_rank = 64;
+    write_dspark_metadata_template(tmpl_path, &old_meta);
+
+    gguf_file preserved = load_gguf_metadata(tmpl_path, false);
+    if (preserved.n_kv != extra_dspark_kv_count(true)) {
+        die("DSpark metadata should be preserved when not rewriting it");
+    }
+    free_gguf_file(&preserved);
+
+    gguf_file tmpl = load_gguf_metadata(tmpl_path, true);
+    if (tmpl.n_kv != 0) die("DSpark metadata should be dropped before rewrite");
+    quant_policy policy = {0};
+    imatrix_store im = {0};
+    dspark_metadata new_meta = dspark_metadata_defaults();
+    new_meta.markov_rank = 0;
+    output_context out = build_output_context(&tmpl, &policy, &im, true, &new_meta);
+    write_full_gguf(NULL, &tmpl, &out, out_path, 0, 1, &im);
+    if (count_gguf_kv_prefix_in_file(out_path, "deepseek4.dspark.") != extra_dspark_kv_count(true)) {
+        die("rewritten DSpark metadata should not contain duplicate keys");
+    }
+
+    free(out.tensors);
+    free_gguf_file(&tmpl);
+    unlink(tmpl_path);
+    unlink(out_path);
+}
+
 static void print_plan(const gguf_file *tmpl, const output_context *out_ctx) {
     size_t tensor_bytes = 0;
     size_t changed = 0;
@@ -2443,7 +2516,7 @@ static void compare_one_tensor(st_db *db, const gguf_file *tmpl, const output_co
             p->compare_tensor, ds4q_type_name(out_ctx->tensors[idx].type));
     byte_buf generated = generate_tensor(db, p->compare_tensor, &tmpl->tensors[idx],
                                          out_ctx->tensors[idx].type, p->n_experts, p->n_threads, imatrix);
-    gguf_file ref = load_gguf_metadata(p->compare_gguf);
+    gguf_file ref = load_gguf_metadata(p->compare_gguf, false);
     byte_buf reference = read_gguf_tensor_data(&ref, p->compare_gguf, p->compare_tensor);
     printf("tensor: %s\n", p->compare_tensor);
     printf("type: %s\n", ds4q_type_name(out_ctx->tensors[idx].type));
@@ -2478,12 +2551,13 @@ int main(int argc, char **argv) {
     params p = parse_args(argc, argv);
     if (p.self_test_dspark_map) {
         self_test_dspark_map();
+        self_test_dspark_kv_rewrite_no_duplicates();
         return 0;
     }
     imatrix_store imatrix = {0};
     if (p.imatrix_file) imatrix_load(&imatrix, p.imatrix_file, p.imatrix_strict);
 
-    gguf_file tmpl = load_gguf_metadata(p.template_gguf);
+    gguf_file tmpl = load_gguf_metadata(p.template_gguf, false);
     if (p.n_experts <= 0) {
         if (tmpl.n_experts > 0) {
             p.n_experts = tmpl.n_experts;
@@ -2508,9 +2582,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "DSpark HF %s layout detected; writing deepseek4.dspark.* metadata\n",
                 dspark_hf_layout_name(dspark_layout));
     }
+    if (p.dspark_only) write_dspark = true;
+    if (write_dspark) {
+        free_gguf_file(&tmpl);
+        tmpl = load_gguf_metadata(p.template_gguf, true);
+    }
     if (p.dspark_only) {
         gguf_use_dspark_mtp_template(&tmpl, &db, p.n_experts, dspark_layout);
-        write_dspark = true;
     }
     output_context out_ctx = build_output_context(&tmpl, &p.policy, &imatrix, write_dspark, &dspark_meta);
     print_plan(&tmpl, &out_ctx);

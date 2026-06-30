@@ -262,7 +262,7 @@ if [ "$MODEL" = "mtp" ]; then
     echo "MTP is an optional legacy one-step component for q2-imatrix, q2-q4-imatrix, and q4-imatrix."
     echo "Enable it explicitly, for example:"
     echo "  ./ds4 --mtp $OUT_DIR/$MTP_FILE --mtp-draft 2"
-    echo "DeepSpec/DSpark GGUFs are recognized separately by the loader but speculative block drafting remains disabled until validated."
+    echo "Converted DeepSpec/DSpark GGUFs are recognized separately by the loader and use Metal target-verified block drafting."
 elif [ "$MODEL" = "pro-q4-layers00-30" ] || [ "$MODEL" = "pro-q4-layers31-output" ] || [ "$MODEL" = "pro-q4-split" ]; then
     echo
     echo "Downloaded PRO Q4 distributed split file(s). Use them with --layers,"

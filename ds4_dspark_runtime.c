@@ -9,6 +9,15 @@ float ds4_dspark_bf16_to_f32(uint16_t h) {
     memcpy(&f, &bits, sizeof(f));
     return f;
 }
+int ds4_dspark_draft_len_until_eos(const int *drafts, int draft_n, int eos_token) {
+    if (!drafts || draft_n <= 0) return 0;
+    for (int i = 0; i < draft_n; i++) {
+        if (drafts[i] == eos_token) return i + 1;
+    }
+    return draft_n;
+}
+
+
 
 
 
@@ -17,8 +26,8 @@ ds4_dspark_spec_gate ds4_dspark_speculative_gate(ds4_mtp_draft_kind kind,
                                                  int mtp_draft_tokens) {
     if (!mtp_ready || mtp_draft_tokens <= 1) return DS4_DSPARK_SPEC_DISABLED;
     if (kind == DS4_MTP_DRAFT_LEGACY) return DS4_DSPARK_SPEC_LEGACY_MTP;
-    if (kind == DS4_MTP_DRAFT_DSPARK) return DS4_DSPARK_SPEC_DSPARK_ENABLED;
-    if (kind == DS4_MTP_DRAFT_DSPARK_NONSEQ) return DS4_DSPARK_SPEC_DSPARK_NONSEQ_NOT_READY;
+    if (kind == DS4_MTP_DRAFT_DSPARK ||
+        kind == DS4_MTP_DRAFT_DSPARK_NONSEQ) return DS4_DSPARK_SPEC_DSPARK_ENABLED;
     return DS4_DSPARK_SPEC_DISABLED;
 }
 

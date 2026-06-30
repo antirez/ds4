@@ -128,10 +128,12 @@ gguf-tools/deepseek4-quantize \
 
 The converter detects the official Markov layout from `mtp.0.main_proj.weight`
 plus `mtp.2.markov_head.markov_w1.weight`, stores the rank-256 Markov weights
-as F16, emits `deepseek4.dspark.*` metadata, and accepts the model
-repository root `config.json` as a fallback when `inference/config.json` is not
-present. Use `--dry-run` before writing and `--self-test-dspark-map` after
-changing tensor mapping rules.
+as F16, emits `deepseek4.dspark.*` metadata, and accepts the model repository
+root `config.json` as a fallback when `inference/config.json` is not present.
+Nonseq DSpark exports use `markov_rank=0` metadata and omit Markov/confidence
+head tensors; the runtime still target-verifies every drafted block before
+committing tokens. Use `--dry-run` before writing and
+`--self-test-dspark-map` after changing tensor mapping rules.
 
 
 ## When No Imatrix Is Given

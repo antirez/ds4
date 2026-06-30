@@ -2279,29 +2279,30 @@ static void test_dspark_runtime_helpers(void) {
     TEST_ASSERT(ds4_dspark_speculative_gate(DS4_MTP_DRAFT_DSPARK, true, 5) ==
                 DS4_DSPARK_SPEC_DSPARK_ENABLED);
     TEST_ASSERT(ds4_dspark_speculative_gate(DS4_MTP_DRAFT_DSPARK_NONSEQ, true, 5) ==
-                DS4_DSPARK_SPEC_DSPARK_NONSEQ_NOT_READY);
+                DS4_DSPARK_SPEC_DSPARK_ENABLED);
     TEST_ASSERT(ds4_dspark_speculative_gate(DS4_MTP_DRAFT_DSPARK, true, 1) ==
                 DS4_DSPARK_SPEC_DISABLED);
     TEST_ASSERT(strstr(ds4_dspark_spec_gate_reason(DS4_DSPARK_SPEC_DSPARK_ENABLED),
                        "enabled") != NULL);
-    TEST_ASSERT(strstr(ds4_dspark_spec_gate_reason(DS4_DSPARK_SPEC_DSPARK_NONSEQ_NOT_READY),
-                       "nonseq") != NULL);
     TEST_ASSERT(ds4_mtp_speculative_draft_ready(DS4_MTP_DRAFT_LEGACY));
     TEST_ASSERT(!ds4_mtp_speculative_draft_ready(DS4_MTP_DRAFT_NONE));
     TEST_ASSERT(ds4_mtp_speculative_draft_ready(DS4_MTP_DRAFT_DSPARK));
-    TEST_ASSERT(!ds4_mtp_speculative_draft_ready(DS4_MTP_DRAFT_DSPARK_NONSEQ));
+    TEST_ASSERT(ds4_mtp_speculative_draft_ready(DS4_MTP_DRAFT_DSPARK_NONSEQ));
     TEST_ASSERT(ds4_mtp_draft_runtime_supported(DS4_BACKEND_METAL,
                                                 DS4_MTP_DRAFT_DSPARK));
+    TEST_ASSERT(ds4_mtp_draft_runtime_supported(DS4_BACKEND_METAL,
+                                                DS4_MTP_DRAFT_DSPARK_NONSEQ));
     TEST_ASSERT(!ds4_mtp_draft_runtime_supported(DS4_BACKEND_CUDA,
                                                  DS4_MTP_DRAFT_DSPARK));
     TEST_ASSERT(!ds4_mtp_draft_runtime_supported(DS4_BACKEND_CUDA,
                                                  DS4_MTP_DRAFT_DSPARK_NONSEQ));
     TEST_ASSERT(!ds4_mtp_draft_runtime_supported(DS4_BACKEND_CPU,
                                                  DS4_MTP_DRAFT_LEGACY));
-    TEST_ASSERT(strstr(ds4_dspark_spec_gate_reason(DS4_DSPARK_SPEC_DSPARK_NONSEQ_NOT_READY),
-                       "nonseq") != NULL);
-    TEST_ASSERT(strstr(ds4_dspark_spec_gate_reason(DS4_DSPARK_SPEC_DSPARK_NONSEQ_NOT_READY),
-                       "not been validated") != NULL);
+
+    const int eos_drafts[] = { 101, 102, 2, 103 };
+    TEST_ASSERT(ds4_dspark_draft_len_until_eos(eos_drafts, 4, 2) == 3);
+    TEST_ASSERT(ds4_dspark_draft_len_until_eos(eos_drafts, 4, 999) == 4);
+    TEST_ASSERT(ds4_dspark_draft_len_until_eos(eos_drafts, 0, 2) == 0);
     TEST_ASSERT(ds4_engine_has_mtp(NULL) == false);
 }
 

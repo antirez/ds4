@@ -4665,7 +4665,9 @@ static DS4_MAYBE_UNUSED bool weights_model_map_output_spans(
 
 
 bool ds4_mtp_speculative_draft_ready(ds4_mtp_draft_kind kind) {
-    return kind == DS4_MTP_DRAFT_LEGACY || kind == DS4_MTP_DRAFT_DSPARK;
+    return kind == DS4_MTP_DRAFT_LEGACY ||
+           kind == DS4_MTP_DRAFT_DSPARK ||
+           kind == DS4_MTP_DRAFT_DSPARK_NONSEQ;
 }
 
 bool ds4_mtp_draft_runtime_supported(ds4_backend backend, ds4_mtp_draft_kind kind) {
@@ -29071,7 +29073,8 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     if (draft_cap > room - 1) draft_cap = room - 1;
     if (draft_cap <= 0) return n_accept;
 
-    if (e->mtp_weights.kind == DS4_MTP_DRAFT_DSPARK) {
+    if (e->mtp_weights.kind == DS4_MTP_DRAFT_DSPARK ||
+        e->mtp_weights.kind == DS4_MTP_DRAFT_DSPARK_NONSEQ) {
         int drafts[16];
         int draft_n = s->dspark_draft_count;
         if (draft_n > draft_cap) draft_n = draft_cap;
@@ -29097,7 +29100,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             }
             return n_accept;
         }
-        if (drafts[0] == eos_token) draft_n = 1;
+        draft_n = ds4_dspark_draft_len_until_eos(drafts, draft_n, eos_token);
 
         ds4_spec_frontier frontier;
         memset(&frontier, 0, sizeof(frontier));
