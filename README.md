@@ -1010,10 +1010,11 @@ and returns to `ds4>`.
 
 The CLI defaults to thinking mode. Use `/nothink` or `--nothink` for direct
 answers. `--mtp MTP.gguf --mtp-draft 2` enables the optional legacy one-step
-MTP speculative path; it is useful only for greedy decoding, currently uses a
-confidence gate (`--mtp-margin`) to avoid slow partial accepts, and should be
-treated as an experimental slight-speedup path. DSpark/DeepSpec GGUFs load and
-report a clear disabled-runtime reason instead of emitting fake draft tokens.
+MTP speculative path. Passing a converted official DSpark/DeepSpec Markov GGUF
+with `--mtp DSpark.gguf` opts into the experimental Metal block-draft runtime,
+which verifies proposed blocks against the target model before committing them.
+It is correctness-gated, not a guaranteed speedup; measure acceptance and wall
+time for the exact quantized base/draft pair.
 
 ## Server
 

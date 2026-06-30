@@ -487,6 +487,8 @@ int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
 /* True when speculative decode has a real proposer and target verifier. */
 bool ds4_mtp_speculative_draft_ready(ds4_mtp_draft_kind kind);
+bool ds4_mtp_draft_runtime_supported(ds4_backend backend,
+                                     ds4_mtp_draft_kind kind);
 bool ds4_engine_has_mtp(ds4_engine *e);
 ds4_mtp_draft_kind ds4_engine_mtp_draft_kind(ds4_engine *e);
 

@@ -6675,11 +6675,17 @@ static DS4_MAYBE_UNUSED bool weights_model_map_output_spans(
 
 
 bool ds4_mtp_speculative_draft_ready(ds4_mtp_draft_kind kind) {
-    return kind == DS4_MTP_DRAFT_LEGACY;
+    return kind == DS4_MTP_DRAFT_LEGACY ||
+           kind == DS4_MTP_DRAFT_DSPARK;
 }
 
-static bool mtp_draft_runtime_supported(ds4_mtp_draft_kind kind) {
-    return ds4_mtp_speculative_draft_ready(kind);
+bool ds4_mtp_draft_runtime_supported(ds4_backend backend, ds4_mtp_draft_kind kind) {
+    if (backend == DS4_BACKEND_CPU) return false;
+    if (!ds4_mtp_speculative_draft_ready(kind)) return false;
+    const bool dspark_family = kind == DS4_MTP_DRAFT_DSPARK ||
+                               kind == DS4_MTP_DRAFT_DSPARK_NONSEQ;
+    if (dspark_family && backend != DS4_BACKEND_METAL) return false;
+    return true;
 }
 
 static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
@@ -51372,7 +51378,7 @@ bool ds4_engine_has_mtp(ds4_engine *e) {
     return e && e->backend != DS4_BACKEND_CPU &&
            e->distributed.role == DS4_DISTRIBUTED_NONE &&
            e->mtp_ready &&
-           mtp_draft_runtime_supported(e->mtp_weights.kind);
+           ds4_mtp_draft_runtime_supported(e->backend, e->mtp_weights.kind);
 }
 
 
