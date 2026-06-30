@@ -116,7 +116,13 @@ static void buf_reserve(buf *b, size_t add) {
     size_t need = b->len + add + 1;
     if (need <= b->cap) return;
     size_t cap = b->cap ? b->cap * 2 : 256;
-    while (cap < need) cap *= 2;
+    while (cap < need) {
+        if (cap > SIZE_MAX / 2) {
+            cap = need;
+            break;
+        }
+        cap *= 2;
+    }
     b->ptr = xrealloc(b->ptr, cap);
     b->cap = cap;
 }
@@ -181,6 +187,7 @@ static int json_hex(char c) {
 }
 
 static void utf8_put(buf *b, uint32_t cp) {
+    if (cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) cp = 0xfffd;
     if (cp <= 0x7f) {
         buf_putc(b, (char)cp);
     } else if (cp <= 0x7ff) {
@@ -236,8 +243,14 @@ static bool json_string(const char **p, char **out) {
             *p -= 2;
             uint32_t cp = 0, lo = 0;
             if (!json_u16(p, &cp)) goto fail;
-            if (cp >= 0xd800 && cp <= 0xdbff && json_u16(p, &lo) && lo >= 0xdc00 && lo <= 0xdfff) {
-                cp = 0x10000u + ((cp - 0xd800u) << 10) + (lo - 0xdc00u);
+            if (cp >= 0xd800 && cp <= 0xdbff) {
+                const char *low_start = *p;
+                if (json_u16(p, &lo) && lo >= 0xdc00 && lo <= 0xdfff) {
+                    cp = 0x10000u + ((cp - 0xd800u) << 10) + (lo - 0xdc00u);
+                } else {
+                    *p = low_start;
+                    cp = 0xfffd;
+                }
             }
             utf8_put(&b, cp);
             break;
@@ -959,7 +972,7 @@ static bool stop_list_find_from(const stop_list *stops, const char *text,
     bool found = false;
     size_t best_pos = 0, best_len = 0;
     for (int i = 0; i < stops->len; i++) {
-        char *p = strstr(text + from, stops->v[i]);
+        const char *p = strstr(text + from, stops->v[i]);
         if (!p) continue;
         size_t ppos = (size_t)(p - text);
         size_t plen = strlen(stops->v[i]);
@@ -14643,6 +14656,134 @@ static void test_json_skip_has_nesting_limit(void) {
     free(bad);
 }
 
+static void append_tool_heavy_schema(buf *b, int idx) {
+    if (idx) buf_putc(b, ',');
+    buf_puts(b, "{\"type\":\"function\",\"function\":{\"name\":");
+    char name[64];
+    snprintf(name, sizeof(name), "opencode_tool_%02d", idx);
+    json_escape(b, name);
+    buf_puts(b, ",\"description\":");
+    json_escape(b, "Tool schema with many properties and escaped text.");
+    buf_puts(b, ",\"parameters\":{\"type\":\"object\",\"properties\":{");
+    for (int j = 0; j < 12; j++) {
+        if (j) buf_putc(b, ',');
+        char prop[64];
+        snprintf(prop, sizeof(prop), "arg_%02d_%02d", idx, j);
+        json_escape(b, prop);
+        buf_puts(b, ":{\"type\":\"string\",\"description\":");
+        json_escape(b, "argument description with \\\\ escapes, quotes, and unicode \\ud83d\\ude80");
+        buf_putc(b, '}');
+    }
+    buf_puts(b, "},\"required\":[");
+    for (int j = 0; j < 4; j++) {
+        if (j) buf_putc(b, ',');
+        char prop[64];
+        snprintf(prop, sizeof(prop), "arg_%02d_%02d", idx, j);
+        json_escape(b, prop);
+    }
+    buf_puts(b, "]}}}");
+}
+
+static void append_tool_heavy_messages(buf *b) {
+    buf_putc(b, '[');
+    buf_puts(b, "{\"role\":\"system\",\"content\":");
+    json_escape(b, "You are running OpenCode with many local tools.");
+    buf_puts(b, "},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
+    json_escape(b, "Please inspect the repository, edit files, run tests, and report briefly.");
+    buf_puts(b, "}]}");
+
+    for (int turn = 0; turn < 24; turn++) {
+        buf_puts(b, ",{\"role\":\"assistant\",\"reasoning_content\":");
+        json_escape(b, "I need to inspect files, use tools, and keep track of changes.");
+        buf_puts(b, ",\"content\":");
+        json_escape(b, "I will use the available tools.");
+        buf_puts(b, ",\"tool_calls\":[");
+        for (int call = 0; call < 3; call++) {
+            if (call) buf_putc(b, ',');
+            char id[64], name[64];
+            snprintf(id, sizeof(id), "call_%02d_%02d", turn, call);
+            snprintf(name, sizeof(name), "opencode_tool_%02d", call);
+
+            buf args = {0};
+            buf_puts(&args, "{\"path\":\"/tmp/opencode/project/file.c\",");
+            buf_printf(&args, "\"range\":\"%d:%d\",", 10 + turn, 14 + turn);
+            buf_puts(&args, "\"old\":\"line one\\\\nline two with quotes \\\" and backslash \\\\\\\\ plus rocket ");
+            buf_puts(&args, "\\ud83d\\ude80\",");
+            buf_puts(&args, "\"new\":\"replacement text\\\\nwith several lines\\\\nand symbols <>&\"}");
+
+            buf_puts(b, "{\"id\":");
+            json_escape(b, id);
+            buf_puts(b, ",\"type\":\"function\",\"function\":{\"name\":");
+            json_escape(b, name);
+            buf_puts(b, ",\"arguments\":");
+            json_escape(b, args.ptr ? args.ptr : "");
+            buf_puts(b, "}}");
+            buf_free(&args);
+        }
+        buf_puts(b, "]}");
+
+        for (int call = 0; call < 3; call++) {
+            char id[64];
+            snprintf(id, sizeof(id), "call_%02d_%02d", turn, call);
+            buf_puts(b, ",{\"role\":\"tool\",\"tool_call_id\":");
+            json_escape(b, id);
+            buf_puts(b, ",\"content\":[{\"type\":\"text\",\"text\":");
+            json_escape(b, "tool output first line\nsecond line with escaped JSON-looking text {\"ok\":true}");
+            buf_puts(b, "}]}");
+        }
+    }
+    buf_putc(b, ']');
+}
+
+static void test_json_parser_handles_tool_heavy_requests(void) {
+    buf tools = {0};
+    buf_putc(&tools, '[');
+    for (int i = 0; i < 32; i++) append_tool_heavy_schema(&tools, i);
+    buf_putc(&tools, ']');
+
+    buf messages = {0};
+    append_tool_heavy_messages(&messages);
+
+    for (int i = 0; i < 32; i++) {
+        const char *tp = tools.ptr;
+        char *schemas = NULL;
+        tool_schema_orders orders = {0};
+        TEST_ASSERT(parse_tools_value(&tp, &schemas, &orders));
+        json_ws(&tp);
+        TEST_ASSERT(*tp == '\0');
+        TEST_ASSERT(schemas && strstr(schemas, "\"name\":\"opencode_tool_00\""));
+        TEST_ASSERT(tool_schema_orders_find(&orders, "opencode_tool_00") != NULL);
+        free(schemas);
+        tool_schema_orders_free(&orders);
+
+        const char *mp = messages.ptr;
+        chat_msgs msgs = {0};
+        TEST_ASSERT(parse_messages(&mp, &msgs));
+        json_ws(&mp);
+        TEST_ASSERT(*mp == '\0');
+        TEST_ASSERT(msgs.len == 98);
+        TEST_ASSERT(msgs.v[2].calls.len == 3);
+        TEST_ASSERT(msgs.v[2].calls.v[0].arguments != NULL);
+        TEST_ASSERT(strstr(msgs.v[2].calls.v[0].arguments, "replacement text") != NULL);
+        chat_msgs_free(&msgs);
+    }
+
+    buf_free(&messages);
+    buf_free(&tools);
+}
+
+static void test_json_string_handles_surrogates(void) {
+    const char *p = "\"paired \\ud83d\\ude80 lone \\ud83d text badlow \\ud83d\\u0041\"";
+    char *s = NULL;
+    TEST_ASSERT(json_string(&p, &s));
+    TEST_ASSERT(s != NULL);
+    TEST_ASSERT(strstr(s, "paired \xf0\x9f\x9a\x80") != NULL);
+    TEST_ASSERT(strstr(s, "lone \xef\xbf\xbd text") != NULL);
+    TEST_ASSERT(strstr(s, "badlow \xef\xbf\xbd" "A") != NULL);
+    TEST_ASSERT(*p == '\0');
+    free(s);
+}
+
 static void test_model_metadata_clamps_completion_to_context(void) {
     buf b = {0};
     append_model_json_values(&b, "deepseek-v4-flash", "DeepSeek V4 Flash",
@@ -15866,6 +16007,8 @@ static void ds4_server_unit_tests_run(void) {
     test_stop_list_parses_all_sequences();
     test_stop_list_streaming_holds_and_trims_stop_text();
     test_json_skip_has_nesting_limit();
+    test_json_parser_handles_tool_heavy_requests();
+    test_json_string_handles_surrogates();
     test_model_metadata_clamps_completion_to_context();
     test_client_socket_nonblocking_flag();
     test_thinking_state_tracks_prompt_and_generated_tags();
