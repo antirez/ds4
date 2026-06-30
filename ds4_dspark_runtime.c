@@ -16,6 +16,26 @@ int ds4_dspark_draft_len_until_eos(const int *drafts, int draft_n, int eos_token
     }
     return draft_n;
 }
+int ds4_dspark_prefix_slot_for_accept(int accepted, int draft_n) {
+    if (accepted <= 0 || draft_n <= 1 || accepted >= draft_n) return -1;
+    return accepted - 1;
+}
+
+int ds4_dspark_prefix_slot_count(ds4_mtp_draft_kind kind, int block_size, int max_slots) {
+    if (max_slots <= 0) return 0;
+    if (kind != DS4_MTP_DRAFT_LEGACY &&
+        kind != DS4_MTP_DRAFT_DSPARK &&
+        kind != DS4_MTP_DRAFT_DSPARK_NONSEQ) {
+        return 0;
+    }
+    int slots = 1;
+    if (kind == DS4_MTP_DRAFT_DSPARK || kind == DS4_MTP_DRAFT_DSPARK_NONSEQ) {
+        slots = block_size > 1 ? block_size - 1 : 1;
+    }
+    if (slots > max_slots) slots = max_slots;
+    return slots;
+}
+
 
 
 

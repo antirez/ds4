@@ -3194,14 +3194,6 @@ static inline uint16_t f32_to_f16(float f) {
 #endif
 }
 
-static inline uint16_t f32_to_bf16(float f) {
-    uint32_t bits;
-    memcpy(&bits, &f, sizeof(bits));
-    const uint32_t lsb = (bits >> 16) & 1u;
-    bits += 0x7fffu + lsb;
-    return (uint16_t)(bits >> 16);
-}
-
 static void f16_round_inplace_cpu(float *x, uint32_t n) {
     for (uint32_t i = 0; i < n; i++) x[i] = f16_to_f32(f32_to_f16(x[i]));
 }
@@ -5172,64 +5164,6 @@ ds4_mtp_draft_kind ds4_mtp_draft_kind_guess_ex(bool has_e_proj,
 
 ds4_mtp_draft_kind ds4_mtp_draft_kind_guess(bool has_e_proj, bool has_main_proj, bool has_markov_w1) {
     return ds4_mtp_draft_kind_guess_ex(has_e_proj, has_main_proj, has_markov_w1, false, 0);
-}
-
-static void dspark_config_apply_metadata(ds4_dspark_config *cfg, const ds4_model *m) {
-    ds4_dspark_config_init_defaults(cfg);
-    uint32_t v = 0;
-    if (model_get_u32(m, "deepseek4.dspark.n_mtp_layers", &v)) {
-        if (v != DS4_DSPARK_MTP_LAYERS) {
-            fprintf(stderr, "ds4: DSpark draft expects %u stages, GGUF has n_mtp_layers=%u\n",
-                    DS4_DSPARK_MTP_LAYERS, v);
-            exit(1);
-        }
-        cfg->n_mtp_layers = v;
-    }
-    if (model_get_u32(m, "deepseek4.dspark.block_size", &v) && v > 0) cfg->block_size = v;
-    if (model_get_u32(m, "deepseek4.dspark.noise_token_id", &v)) cfg->noise_token_id = v;
-    if (model_get_u32(m, "deepseek4.dspark.markov_rank", &v)) cfg->markov_rank = v;
-    for (uint32_t i = 0; i < 3; i++) {
-        char key[64];
-        snprintf(key, sizeof(key), "deepseek4.dspark.target_layer_ids.%u", i);
-        if (model_get_u32(m, key, &v)) cfg->target_layer_ids[i] = v;
-    }
-}
-
-static ds4_mtp_draft_kind mtp_model_detect_kind(const ds4_model *m) {
-    uint32_t markov_rank = 0;
-    const bool markov_rank_set = model_get_u32(m, "deepseek4.dspark.markov_rank", &markov_rank);
-    const bool has_e_proj = model_find_tensor(m, "mtp.0.e_proj.weight") != NULL;
-    const bool has_main_proj = model_find_tensor(m, "mtp.0.main_proj.weight") != NULL;
-    const bool has_markov = model_find_tensor(m, "mtp.2.markov_head.markov_w1.weight") != NULL;
-    return ds4_mtp_draft_kind_guess_ex(has_e_proj, has_main_proj, has_markov,
-                                       markov_rank_set, markov_rank);
-}
-
-static void mtp_weights_bind_mtp_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t stage) {
-    l->hc_attn_fn      = required_tensorf(m, "mtp.%u.hc_attn_fn.weight", stage);
-    l->hc_attn_scale   = required_tensorf(m, "mtp.%u.hc_attn_scale.weight", stage);
-    l->hc_attn_base    = required_tensorf(m, "mtp.%u.hc_attn_base.weight", stage);
-    l->attn_norm       = required_tensorf(m, "mtp.%u.attn_norm.weight", stage);
-    l->attn_q_a        = required_tensorf(m, "mtp.%u.attn_q_a.weight", stage);
-    l->attn_q_a_norm   = required_tensorf(m, "mtp.%u.attn_q_a_norm.weight", stage);
-    l->attn_q_b        = required_tensorf(m, "mtp.%u.attn_q_b.weight", stage);
-    l->attn_kv         = required_tensorf(m, "mtp.%u.attn_kv.weight", stage);
-    l->attn_kv_a_norm  = required_tensorf(m, "mtp.%u.attn_kv_a_norm.weight", stage);
-    l->attn_sinks      = required_tensorf(m, "mtp.%u.attn_sinks.weight", stage);
-    l->attn_output_a   = required_tensorf(m, "mtp.%u.attn_output_a.weight", stage);
-    l->attn_output_b   = required_tensorf(m, "mtp.%u.attn_output_b.weight", stage);
-    l->hc_ffn_fn       = required_tensorf(m, "mtp.%u.hc_ffn_fn.weight", stage);
-    l->hc_ffn_scale    = required_tensorf(m, "mtp.%u.hc_ffn_scale.weight", stage);
-    l->hc_ffn_base     = required_tensorf(m, "mtp.%u.hc_ffn_base.weight", stage);
-    l->ffn_norm        = required_tensorf(m, "mtp.%u.ffn_norm.weight", stage);
-    l->ffn_gate_inp    = required_tensorf(m, "mtp.%u.ffn_gate_inp.weight", stage);
-    l->ffn_exp_probs_b = tensor_by_namef(m, "mtp.%u.exp_probs_b.bias", stage);
-    l->ffn_gate_exps   = required_tensorf(m, "mtp.%u.ffn_gate_exps.weight", stage);
-    l->ffn_up_exps     = required_tensorf(m, "mtp.%u.ffn_up_exps.weight", stage);
-    l->ffn_down_exps   = required_tensorf(m, "mtp.%u.ffn_down_exps.weight", stage);
-    l->ffn_gate_shexp  = required_tensorf(m, "mtp.%u.ffn_gate_shexp.weight", stage);
-    l->ffn_up_shexp    = required_tensorf(m, "mtp.%u.ffn_up_shexp.weight", stage);
-    l->ffn_down_shexp  = required_tensorf(m, "mtp.%u.ffn_down_shexp.weight", stage);
 }
 
 static void mtp_layer_validate_layout(const ds4_layer_weights *l, bool require_exp_probs_b) {
