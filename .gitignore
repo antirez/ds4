@@ -6,6 +6,7 @@
 /ds4_native
 /ds4_server_test
 /ds4_test
+/tests/test_q4k_dot
 /ds4flash.gguf
 /TODO.md
 /gguf/
@@ -16,3 +17,4 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+/logs/
