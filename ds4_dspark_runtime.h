@@ -19,6 +19,8 @@ typedef enum {
 
 float ds4_dspark_bf16_to_f32(uint16_t h);
 int ds4_dspark_draft_len_until_eos(const int *drafts, int draft_n, int eos_token);
+int ds4_dspark_prefix_slot_for_accept(int accepted, int draft_n);
+int ds4_dspark_prefix_slot_count(ds4_mtp_draft_kind kind, int block_size, int max_slots);
 
 
 

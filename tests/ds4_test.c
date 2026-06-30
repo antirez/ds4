@@ -2068,7 +2068,7 @@ static bool test_mtp_capture_speculative(ds4_engine *engine, const ds4_tokens *p
         const int ntok = ds4_session_eval_speculative_argmax(
             session, token, max_tokens - n, eos, toks,
             (int)(sizeof(toks) / sizeof(toks[0])), err, sizeof(err));
-        if (ntok < 0) { ok = false; TEST_ASSERT(false); break; }
+        if (ntok < 0) { fprintf(stderr, "ds4-test speculative error: %s\n", err); ok = false; TEST_ASSERT(false); break; }
         if (ntok > *max_chunk) *max_chunk = ntok;
 
         for (int j = 0; j < ntok; j++) {
@@ -2303,6 +2303,18 @@ static void test_dspark_runtime_helpers(void) {
     TEST_ASSERT(ds4_dspark_draft_len_until_eos(eos_drafts, 4, 2) == 3);
     TEST_ASSERT(ds4_dspark_draft_len_until_eos(eos_drafts, 4, 999) == 4);
     TEST_ASSERT(ds4_dspark_draft_len_until_eos(eos_drafts, 0, 2) == 0);
+    TEST_ASSERT(ds4_dspark_prefix_slot_for_accept(1, 5) == 0);
+    TEST_ASSERT(ds4_dspark_prefix_slot_for_accept(2, 5) == 1);
+    TEST_ASSERT(ds4_dspark_prefix_slot_for_accept(4, 5) == 3);
+    TEST_ASSERT(ds4_dspark_prefix_slot_for_accept(5, 5) == -1);
+    TEST_ASSERT(ds4_dspark_prefix_slot_for_accept(0, 5) == -1);
+    TEST_ASSERT(ds4_dspark_prefix_slot_for_accept(1, 1) == -1);
+    TEST_ASSERT(ds4_dspark_prefix_slot_count(DS4_MTP_DRAFT_LEGACY, 0, 15) == 1);
+    TEST_ASSERT(ds4_dspark_prefix_slot_count(DS4_MTP_DRAFT_DSPARK, 5, 15) == 4);
+    TEST_ASSERT(ds4_dspark_prefix_slot_count(DS4_MTP_DRAFT_DSPARK_NONSEQ, 16, 15) == 15);
+    TEST_ASSERT(ds4_dspark_prefix_slot_count(DS4_MTP_DRAFT_DSPARK, 32, 15) == 15);
+    TEST_ASSERT(ds4_dspark_prefix_slot_count(DS4_MTP_DRAFT_NONE, 5, 15) == 0);
+    TEST_ASSERT(ds4_dspark_prefix_slot_count(DS4_MTP_DRAFT_DSPARK, 5, 0) == 0);
     TEST_ASSERT(ds4_engine_has_mtp(NULL) == false);
 }
 
