@@ -28,6 +28,24 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
 - Avoid large CPU inference runs on macOS; the CPU path has previously exposed kernel VM failures with very large mappings.
 - Do not run multiple huge model processes concurrently. The instance lock is intentional.
 
+
+## Repository Maintenance
+
+- In this checkout, `origin` is the audreyt/ds4 fork. To chase antirez
+  upstream, fetch it explicitly:
+  `git fetch https://github.com/antirez/ds4.git main:refs/remotes/antirez/main`.
+- Compare and merge `antirez/main`; do not merge `origin/main` expecting
+  upstream changes.
+- Leave upstream-chase merge commits unpushed unless the user asks.
+- Preserve local README/MODEL_CARD benchmark numbers unless replaced by fresh
+  local measurements.
+- Treat scheduling, KV-cache lifetime, attention math, tokenizer behavior,
+  model shape, and tensor metadata conflicts as correctness-sensitive.
+- Keep CUDA/ROCm parity in view when upstream changes Metal logic.
+- Historical branch note: older M5 side experiments used Metal function
+  constant slot 703 after avoiding slot 702. Verify current branches before
+  reusing those slots.
+
 ## Layout
 
 - `ds4.c`: model loading, tokenizer, CPU reference code, Metal graph scheduling,

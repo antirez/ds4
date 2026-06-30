@@ -8917,6 +8917,25 @@ extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
                                       n_head, head_dim);
 }
 
+extern "C" int ds4_gpu_attention_decode_raw_batch_heads_noncausal_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        uint32_t                n_tokens,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    (void)heads; (void)model_map; (void)model_size; (void)sinks_offset;
+    (void)q; (void)raw_kv; (void)n_tokens; (void)n_raw; (void)raw_cap;
+    (void)raw_start; (void)n_head; (void)head_dim;
+    return 0;
+}
+
 extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,

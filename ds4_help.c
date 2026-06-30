@@ -170,11 +170,11 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--prefill-chunk N", "Metal graph prefill chunk size. Default: auto (PRO long prompts use 8192; others use 4096).");
     if (full) {
         if (tool != DS4_HELP_BENCH) {
-            opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");
+            opt(fp, c, "--mtp FILE", "Optional speculative draft GGUF: legacy MTP or experimental converted DSpark/DeepSpec on Metal.");
         }
         if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
-            opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens. Default: 1");
-            opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
+            opt(fp, c, "--mtp-draft N", "Maximum speculative draft tokens. Legacy default: 1; DSpark uses GGUF block size.");
+            opt(fp, c, "--mtp-margin F", "Verifier confidence margin for legacy fast MTP acceptance. Default: 3");
         }
         opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");
         opt(fp, c, "--warm-weights", "Touch mapped tensor pages at startup to reduce first-use stalls.");
@@ -255,6 +255,12 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "--imatrix-out FILE", "Write llama-compatible routed-MoE imatrix .dat.");
     opt(fp, c, "--imatrix-max-prompts N", "Stop imatrix collection after N prompts.");
     opt(fp, c, "--imatrix-max-tokens N", "Stop imatrix collection after N prompt tokens.");
+    opt(fp, c, "--dspark-target-cache-dataset FILE", "Rendered prompt dataset for DeepSpec DSpark target-cache export.");
+    opt(fp, c, "--dspark-target-cache-out DIR", "Write DeepSpec DSpark target cache manifest/index/shard.");
+    opt(fp, c, "--dspark-target-cache-target-model HF_OR_PATH", "Required DeepSpec target model name/path stored in the target-cache manifest.");
+    opt(fp, c, "--dspark-target-cache-chat-template NAME", "DeepSpec chat template name stored in the target-cache manifest.");
+    opt(fp, c, "--dspark-target-cache-max-prompts N", "Stop target-cache export after N prompts.");
+    opt(fp, c, "--dspark-target-cache-max-tokens N", "Stop target-cache export after N prompt tokens.");
     opt(fp, c, "--head-test", "Run the output HC/logits head after the native slice.");
     opt(fp, c, "--first-token-test", "Run exact CPU whole-model pass for the first prompt token.");
     opt(fp, c, "--metal-graph-test", "Compare first GPU-resident graph stages with CPU.");

@@ -129,6 +129,17 @@ and background load when comparing two commits. For backend work, run at least
 one before/after CSV and compare both `prefill_tps` and `gen_tps`. Generation is
 greedy and skips EOS so each frontier gets the same number of generated tokens.
 
+When comparing this fork against antirez/main or another fork:
+
+- Use each fork's preferred quant only when the question is fork-vs-fork
+  behavior; use the same GGUF when isolating runtime or kernel changes.
+- Run baseline and candidate sequentially on the same machine. Do not run two
+  huge model processes concurrently.
+- Use the current sweep above unless the PR notes explicitly choose another
+  sweep. Do not copy old README tables or stale agent playbooks.
+- Report exact commits, model files, CSV paths, backend, hardware, and thermal
+  state.
+
 To generate a graph for a CSV:
 
 ```sh

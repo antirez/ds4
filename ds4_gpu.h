@@ -623,6 +623,22 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
+/* Non-causal variant (mask = all-attend): every query attends to every key in
+ * the gathered window. Used by the DSpark drafter's block attention. */
+int ds4_gpu_attention_decode_raw_batch_heads_noncausal_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        uint32_t                n_tokens,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_head,
+        uint32_t                head_dim);
+
 int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,

@@ -68,9 +68,9 @@ Targets:
        Downloads both PRO Q4 split files into the download directory. About
        838 GB total. This target does not update ./ds4flash.gguf.
 
-  mtp  Optional speculative decoding component, about 3.5 GB on disk.
-       It is useful with q2-imatrix, q2-q4-imatrix, and q4-imatrix, but must be
-       enabled explicitly with --mtp when running ds4 or ds4-server.
+  mtp  Optional legacy one-step speculative decoding component, about 3.5 GB on
+       disk. It is useful with q2-imatrix, q2-q4-imatrix, and q4-imatrix, but
+       must be enabled explicitly with --mtp when running ds4 or ds4-server.
 
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
@@ -268,9 +268,10 @@ fi
 
 if [ "$MODEL" = "mtp" ]; then
     echo
-    echo "MTP is an optional component for q2-imatrix, q2-q4-imatrix, and q4-imatrix."
+    echo "MTP is an optional legacy one-step component for q2-imatrix, q2-q4-imatrix, and q4-imatrix."
     echo "Enable it explicitly, for example:"
     echo "  ./ds4 --mtp $OUT_DIR/$MTP_FILE --mtp-draft 2"
+    echo "Converted DeepSpec/DSpark GGUFs are recognized separately by the loader and use Metal target-verified block drafting."
 elif [ "$MODEL" = "pro-q4-layers00-30" ] || [ "$MODEL" = "pro-q4-layers31-output" ] || [ "$MODEL" = "pro-q4-split" ]; then
     echo
     echo "Downloaded PRO Q4 distributed split file(s). Use them with --layers,"

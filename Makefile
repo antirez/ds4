@@ -18,8 +18,8 @@ ROCM_SRCS := $(wildcard rocm/*.cuh)
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_metal.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o
+CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_dspark_runtime.o ds4_metal.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o ds4_dspark_runtime.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -29,8 +29,8 @@ ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
-CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_cuda.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o
+CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_dspark_runtime.o ds4_cuda.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o ds4_dspark_runtime.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
@@ -107,7 +107,7 @@ cuda:
 
 strix-halo:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
-		CORE_OBJS="ds4.o ds4_distributed.o ds4_ssd.o ds4_rocm.o" \
+		CORE_OBJS="ds4.o ds4_distributed.o ds4_ssd.o ds4_dspark_runtime.o ds4_rocm.o" \
 		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
@@ -154,11 +154,13 @@ $(CUDA_CONFIG): FORCE
 	fi
 endif
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
+ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_dspark_runtime.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_ssd.o: ds4_ssd.c ds4_ssd.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_ssd.c
+
+ds4_dspark_runtime.o: ds4_dspark_runtime.c ds4_dspark_runtime.h ds4.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_dspark_runtime.c
 
 ds4_cli.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
@@ -202,7 +204,7 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
+ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_dspark_runtime.h ds4_gpu.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
