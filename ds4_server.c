@@ -4505,7 +4505,11 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
     }
 
     size_t content_len = trim_tool_separator_ws(text, 0, (size_t)(start - text));
-    const char *raw_block_start = start;
+    /* Capture the raw block from the trimmed-content boundary, not from the
+     * marker match: any whitespace separator the model sampled between the
+     * content and the block lives in the KV cache, so byte-exact replay must
+     * include it even when it is not the canonical "\n\n". */
+    const char *raw_block_start = text + content_len;
     const char *tool_calls_start = DS4_TOOL_CALLS_START;
     const char *tool_calls_end = DS4_TOOL_CALLS_END;
     const char *invoke_start = DS4_INVOKE_START;
@@ -14202,6 +14206,35 @@ static void test_tool_memory_attach_requires_all_block_invokes(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+static void test_raw_dsml_capture_keeps_sampled_separator(void) {
+    /* A single-newline separator is not the canonical "\n\n", but the model
+     * sampled it, so byte-exact replay must include it in the raw block. */
+    const char *generated =
+        "done\n"
+        DS4_TOOL_CALLS_START "\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        DS4_TOOL_CALLS_END;
+
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex(generated, false, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(content && !strcmp(content, "done"));
+    TEST_ASSERT(calls.raw_dsml != NULL);
+    TEST_ASSERT(calls.raw_dsml[0] == '\n');
+    TEST_ASSERT(!strncmp(calls.raw_dsml + 1, DS4_TOOL_CALLS_START,
+                         strlen(DS4_TOOL_CALLS_START)));
+    /* content + raw block must reassemble the sampled bytes exactly. */
+    TEST_ASSERT(strlen(content) + strlen(calls.raw_dsml) == strlen(generated));
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
 static void test_anthropic_tool_memory_replays_sampled_dsml(void) {
     const char *sampled_dsml =
         "\n\n" DS4_TOOL_CALLS_START "\n"
@@ -16201,6 +16234,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();
     test_tool_memory_attach_requires_all_block_invokes();
+    test_raw_dsml_capture_keeps_sampled_separator();
     test_anthropic_tool_memory_replays_sampled_dsml();
     test_anthropic_live_tail_renders_tool_results_only();
     test_anthropic_tool_result_id_validation();
