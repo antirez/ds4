@@ -10614,6 +10614,42 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
     free(visible);
 }
 
+/* Thinking + tool calls over chat/completions.  The sampled KV holds this turn's
+ * hidden reasoning, but the next request re-renders the turn with an empty
+ * <think></think> block: clients such as Hermes replay the tool call bytes but
+ * not the reasoning bytes.  Exact DSML tool replay realigns the tool-call tokens,
+ * yet the live checkpoint still diverges from the next prompt at the very first
+ * reasoning token, so every follow-up turn misses the cache (memory_miss_reason
+ * token-mismatch with live_prompt_common capped at the user boundary).
+ *
+ * Mirror the tool-less thinking path: remember the reasoning-stripped visible
+ * transcript (prompt_text + </think> + content + DSML + eos, i.e. exactly what
+ * render_chat_prompt_text() emits for this completed turn on the next request) as
+ * a key for the live frontier.  The next request then continues from the verbatim
+ * live KV -- hidden reasoning included -- while tokenizing only the new suffix.
+ * thinking_live_visible_prefix_prompt() validates the key with an exact byte
+ * prefix match and a live-token-count check, so a stale or mismatched key simply
+ * falls through to the existing cold-prefill behaviour. */
+static void remember_tool_thinking_checkpoint(server *s, server_slot *slot,
+                                              const job *j,
+                                              const char *content,
+                                              const tool_calls *calls) {
+    if (!s || !j->req.prompt_text || !ds4_think_mode_enabled(j->req.think_mode)) {
+        thinking_live_clear(s, slot);
+        return;
+    }
+    /* calls may be empty: a tools-enabled request whose thinking turn ended in a
+     * final answer with no tool call renders as prompt + </think> + content + eos,
+     * which build_tool_checkpoint_suffix() produces with an empty call list. */
+    char *suffix = build_tool_checkpoint_suffix(&j->req, content, "", calls);
+    buf visible = {0};
+    buf_puts(&visible, j->req.prompt_text);
+    buf_puts(&visible, suffix ? suffix : "");
+    thinking_live_remember(s, slot, visible.ptr ? visible.ptr : "");
+    buf_free(&visible);
+    free(suffix);
+}
+
 /* After a successful tool-call finish, make the live checkpoint match what the
  * next request will render.  Usually that is just the exact DSML remembered by
  * tool id.  If a client sends a tool call without an id we know, the fallback
@@ -11881,8 +11917,7 @@ decode_again:
     }
 
     if (j->req.kind == REQ_CHAT && parsed_calls.len &&
-        j->req.api != API_RESPONSES &&
-        should_canonicalize_tool_checkpoint(s, &parsed_calls))
+        j->req.api != API_RESPONSES)
     {
         /* Chat/completions has no protocol object that binds the next request
          * to this live KV state.  Canonicalize only the fallback tool-call
@@ -11890,17 +11925,50 @@ decode_again:
          * replaying those bytes keeps future prompts aligned without rebuilding
          * hidden reasoning.  Responses deliberately skips this path because its
          * previous_response_id contract binds the next turn to live state. */
-        canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
-                                     parsed_content ? parsed_content : "",
-                                     parsed_reasoning, &parsed_calls);
-        thinking_live_clear(s, slot);
+        if (should_canonicalize_tool_checkpoint(s, &parsed_calls)) {
+            canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
+                                         parsed_content ? parsed_content : "",
+                                         parsed_reasoning, &parsed_calls);
+        }
+        /* Whether the tool-call bytes are realigned next turn by exact DSML
+         * replay or by canonicalization, a thinking model still leaves this
+         * turn's hidden reasoning in the live KV.  The next request re-renders
+         * the turn with an empty <think></think> (clients replay tool-call bytes
+         * but not reasoning bytes), so the live checkpoint diverges at the first
+         * reasoning token -- and reasoning-inclusive canonicalization cannot
+         * reconcile that either.  Remember a reasoning-stripped visible key for
+         * the live frontier so the next request continues from live KV.  This is
+         * self-validating: thinking_live_visible_prefix_prompt() only reuses it
+         * on an exact byte-prefix match, otherwise it is a no-op. */
+        remember_tool_thinking_checkpoint(s, slot, j,
+                                          parsed_content ? parsed_content : "",
+                                          &parsed_calls);
     } else if (parsed_calls.len) {
         thinking_live_clear(s, slot);
-    } else if (!parsed_calls.len &&
-               should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
+    } else if (should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
         remember_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "");
-    } else if (!parsed_calls.len) {
+    } else if (j->req.kind == REQ_CHAT && j->req.api != API_RESPONSES &&
+               j->req.has_tools &&
+               ds4_think_mode_enabled(j->req.think_mode) && !thinking.inside &&
+               strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
+        /* Tools-enabled thinking turn that ended in a final answer with no tool
+         * call.  should_remember_thinking_checkpoint() excludes has_tools, and
+         * the tool-call remember paths above require parsed_calls -- so without
+         * this the live frontier is cleared and the next request re-prefills from
+         * the user boundary even though only the hidden reasoning diverges.  The
+         * empty-call remember produces prompt + </think> + content + eos, which
+         * is exactly what render_chat_prompt_text() emits for this completed turn
+         * in a tool-using conversation (tool_context forces <think></think> on
+         * every assistant turn).  Do NOT gate on prompt_preserves_reasoning: that
+         * flag is really "history uses tools" (always true here) and would
+         * disable this path for the entire agent workload.  The reuse is still
+         * validated by an exact byte-prefix match, so a client that genuinely
+         * replays reasoning simply no-ops instead of mismatching. */
+        remember_tool_thinking_checkpoint(s, slot, j,
+                                          parsed_content ? parsed_content : "",
+                                          &parsed_calls);
+    } else {
         thinking_live_clear(s, slot);
     }
 
@@ -17388,6 +17456,185 @@ static void test_thinking_canonical_with_tools_preserves_reasoning(void) {
     chat_msgs_free(&history);
 }
 
+/* The reasoning-stripped visible key that remember_tool_thinking_checkpoint()
+ * builds for a tool-call turn -- prompt_text + build_tool_checkpoint_suffix(
+ * content, "", calls) -- must byte-match what render_chat_prompt_text() produces
+ * on the next request, where the client replays the tool call but drops the
+ * hidden reasoning.  If it does not, thinking-visible reuse silently misses and
+ * every follow-up turn re-prefills from the user boundary (the original bug). */
+static void test_tool_thinking_checkpoint_tool_call_matches_future_prompt(void) {
+    tool_schema_orders orders = {0};
+    tool_schema_orders_add_json(&orders,
+        "{\"name\":\"read_file\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"path\":{}}}}");
+    const char *tool_schemas =
+        "{\"name\":\"read_file\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"path\":{}}}}";
+
+    chat_msgs prefix_msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("read the file");
+    chat_msgs_push(&prefix_msgs, user);
+    char *prompt_text = render_chat_prompt_text(&prefix_msgs, tool_schemas,
+                                                &orders, DS4_THINK_HIGH);
+    size_t pt_len = strlen(prompt_text);
+    TEST_ASSERT(pt_len >= 7 && !memcmp(prompt_text + pt_len - 7, "<think>", 7));
+
+    /* The model generates reasoning + a tool call. */
+    const char *generated =
+        "let me read it</think>\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        "<｜DSML｜invoke name=\"read_file\">\n"
+        "<｜DSML｜parameter name=\"path\" string=\"true\">/tmp/x</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex(generated, false, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(reasoning && strstr(reasoning, "let me read it"));
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.think_mode = DS4_THINK_HIGH;
+    r.tool_orders = orders;
+    memset(&orders, 0, sizeof(orders));
+
+    /* remember_tool_thinking_checkpoint() strips reasoning (passes ""). */
+    char *suffix = build_tool_checkpoint_suffix(&r, content, "", &calls);
+    buf key = {0};
+    buf_puts(&key, prompt_text);
+    buf_puts(&key, suffix);
+
+    /* Next request: the same turn with reasoning dropped by the client. */
+    chat_msgs history = {0};
+    chat_msg h_user = {0};
+    h_user.role = xstrdup("user");
+    h_user.content = xstrdup("read the file");
+    chat_msgs_push(&history, h_user);
+    chat_msg h_asst = {0};
+    h_asst.role = xstrdup("assistant");
+    h_asst.reasoning = xstrdup("");          /* client omits reasoning */
+    h_asst.content = xstrdup(content ? content : "");
+    h_asst.calls = calls;
+    memset(&calls, 0, sizeof(calls));
+    chat_msgs_push(&history, h_asst);
+
+    char *future = render_chat_prompt_text(&history, tool_schemas,
+                                           &r.tool_orders, DS4_THINK_HIGH);
+
+    TEST_ASSERT(!strcmp(key.ptr, future));
+    /* The empty think block is kept (tool_context), and the generated reasoning
+     * is absent from the replayed transcript even though it stays in live KV. */
+    TEST_ASSERT(strstr(future, "<think></think>") != NULL);
+    TEST_ASSERT(strstr(future, "let me read it") == NULL);
+
+    free(future);
+    buf_free(&key);
+    free(suffix);
+    free(prompt_text);
+    free(content);
+    free(reasoning);
+    chat_msgs_free(&prefix_msgs);
+    chat_msgs_free(&history);
+    tool_calls_free(&calls);
+    request_free(&r);
+    tool_schema_orders_free(&orders);
+}
+
+/* Regression for trace4 req8/req16: a tools-enabled thinking turn that ends in a
+ * final answer with NO tool call.  should_remember_thinking_checkpoint() excludes
+ * has_tools and the tool-call paths require parsed_calls, so this turn is handled
+ * by remember_tool_thinking_checkpoint() with an empty call list.  The key must be
+ * a byte-prefix of the next prompt, where the assistant turn is now historical
+ * (a follow-up user turn follows) and tool_context keeps the empty <think></think>
+ * block. */
+static void test_tool_thinking_checkpoint_final_answer_matches_future_prompt(void) {
+    const char *tool_schemas = "{\"name\":\"bash\"}";
+
+    chat_msgs prefix_msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("explain the fix");
+    chat_msgs_push(&prefix_msgs, user);
+    char *prompt_text = render_chat_prompt_text(&prefix_msgs, tool_schemas, NULL,
+                                                DS4_THINK_HIGH);
+    size_t pt_len = strlen(prompt_text);
+    TEST_ASSERT(pt_len >= 7 && !memcmp(prompt_text + pt_len - 7, "<think>", 7));
+
+    const char *content = "Done. Two changes made.";
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.think_mode = DS4_THINK_HIGH;
+
+    /* Empty call list: the final-answer key is prompt + </think> + content + eos. */
+    tool_calls no_calls = {0};
+    char *suffix = build_tool_checkpoint_suffix(&r, content, "", &no_calls);
+    buf key = {0};
+    buf_puts(&key, prompt_text);
+    buf_puts(&key, suffix);
+
+    /* Next request: the final answer became historical (a new user follows), with
+     * reasoning dropped by the client. */
+    chat_msgs history = {0};
+    chat_msg h_user = {0};
+    h_user.role = xstrdup("user");
+    h_user.content = xstrdup("explain the fix");
+    chat_msgs_push(&history, h_user);
+    chat_msg h_asst = {0};
+    h_asst.role = xstrdup("assistant");
+    h_asst.reasoning = xstrdup("");
+    h_asst.content = xstrdup(content);
+    chat_msgs_push(&history, h_asst);
+    chat_msg h_user2 = {0};
+    h_user2.role = xstrdup("user");
+    h_user2.content = xstrdup("now continue");
+    chat_msgs_push(&history, h_user2);
+
+    char *future = render_chat_prompt_text(&history, tool_schemas, NULL,
+                                           DS4_THINK_HIGH);
+
+    TEST_ASSERT(strlen(future) > key.len);
+    TEST_ASSERT(!memcmp(future, key.ptr, key.len));
+    /* Historical final-answer turn keeps the empty think block under tool_context;
+     * the follow-up user turn opens a fresh <think>. */
+    TEST_ASSERT(strstr(future, "<think></think>Done. Two changes made.") != NULL);
+    TEST_ASSERT(strstr(future + key.len, "now continue") != NULL);
+
+    free(future);
+    buf_free(&key);
+    free(suffix);
+    free(prompt_text);
+    chat_msgs_free(&prefix_msgs);
+    chat_msgs_free(&history);
+    request_free(&r);
+}
+
+/* build_tool_checkpoint_suffix() with reasoning="" is what removes the hidden
+ * thinking from the remembered key; a non-empty reasoning would leave it in and
+ * never match a reasoning-stripping client.  Lock that contract directly. */
+static void test_tool_checkpoint_suffix_strips_reasoning(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.think_mode = DS4_THINK_HIGH;
+    tool_calls no_calls = {0};
+
+    char *stripped = build_tool_checkpoint_suffix(&r, "the answer", "", &no_calls);
+    TEST_ASSERT(!strncmp(stripped, "</think>the answer", strlen("</think>the answer")));
+    TEST_ASSERT(strstr(stripped, "<think>") == NULL);       /* no open tag, no reasoning */
+    TEST_ASSERT(strstr(stripped, DS4_TOOL_CALLS_START) == NULL); /* no DSML for empty calls */
+
+    char *kept = build_tool_checkpoint_suffix(&r, "the answer", "hidden why", &no_calls);
+    TEST_ASSERT(strstr(kept, "hidden why") != NULL);         /* contrast: reasoning retained */
+
+    free(stripped);
+    free(kept);
+    request_free(&r);
+}
+
 static void test_thinking_canonical_non_thinking_mode_noop(void) {
     /* When thinking is disabled (deepseek-chat), prompt_text ends with
      * </think> not <think>.  The toolless thinking live binding is a no-op
@@ -17488,6 +17735,9 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_canonical_empty_content();
     test_thinking_canonical_multi_turn();
     test_thinking_canonical_with_tools_preserves_reasoning();
+    test_tool_thinking_checkpoint_tool_call_matches_future_prompt();
+    test_tool_thinking_checkpoint_final_answer_matches_future_prompt();
+    test_tool_checkpoint_suffix_strips_reasoning();
     test_thinking_canonical_non_thinking_mode_noop();
     test_tool_separator_whitespace_is_not_content();
     test_dsml_prompt_escapes_tool_supplied_text();
