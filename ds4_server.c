@@ -22,6 +22,7 @@
 #include <limits.h>
 #include <math.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -2680,7 +2681,26 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                     goto bad;
                 }
                 tool_choice_none = !strcmp(choice, "none");
+                /* Like the Responses parser: "required" and forced function
+                 * targets need constrained decoding we don't implement, so
+                 * reject instead of silently downgrading to auto. */
+                if (!tool_choice_none && strcmp(choice, "auto") != 0) {
+                    snprintf(err, errlen, "tool_choice=%s not supported", choice);
+                    free(choice);
+                    free(key);
+                    chat_msgs_free(&msgs);
+                    free(tool_schemas);
+                    request_free(r);
+                    return false;
+                }
                 free(choice);
+            } else if (*p == '{') {
+                snprintf(err, errlen, "forced tool_choice not supported");
+                free(key);
+                chat_msgs_free(&msgs);
+                free(tool_schemas);
+                request_free(r);
+                return false;
             } else if (!json_skip_value(&p)) {
                 free(key);
                 goto bad;
@@ -4840,7 +4860,28 @@ static bool http_error(int fd, bool enable_cors, int code, const char *msg) {
     buf b = {0};
     buf_puts(&b, "{\"error\":{\"message\":");
     json_escape(&b, msg);
-    buf_puts(&b, ",\"type\":\"invalid_request_error\"}}\n");
+    buf_puts(&b, ",\"type\":\"");
+    buf_puts(&b, code >= 500 ? "api_error" :
+                 code == 429 ? "rate_limit_error" : "invalid_request_error");
+    buf_puts(&b, "\"}}\n");
+    bool ok = http_response(fd, enable_cors, code, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+/* Anthropic SDKs classify errors by the {"type":"error","error":{...}}
+ * envelope; give /v1/messages clients that shape instead of the OpenAI one. */
+static bool http_error_api(int fd, bool enable_cors, int code, const char *msg,
+                           api_style api) {
+    if (api != API_ANTHROPIC) return http_error(fd, enable_cors, code, msg);
+    buf b = {0};
+    buf_puts(&b, "{\"type\":\"error\",\"error\":{\"type\":\"");
+    buf_puts(&b, code >= 500 ? "api_error" :
+                 code == 429 ? "rate_limit_error" :
+                 code == 529 ? "overloaded_error" : "invalid_request_error");
+    buf_puts(&b, "\",\"message\":");
+    json_escape(&b, msg);
+    buf_puts(&b, "}}\n");
     bool ok = http_response(fd, enable_cors, code, "application/json", b.ptr);
     buf_free(&b);
     return ok;
@@ -9834,7 +9875,7 @@ static void send_prefill_failure_response(server *s, const job *j,
         }
         return;
     }
-    http_error(j->fd, s->enable_cors, 500, err);
+    http_error_api(j->fd, s->enable_cors, 500, err, j->req.api);
 }
 
 static char *build_tool_checkpoint_suffix(const request *r, const char *content,
@@ -10206,8 +10247,9 @@ static void generate_job(server *s, job *j) {
                j->req.anthropic_requires_live_tool_state)
     {
         ds4_tokens_free(&effective_prompt);
-        http_error(j->fd, s->enable_cors, 409,
-                   "Anthropic continuation state is not available; retry by replaying the full messages history");
+        http_error_api(j->fd, s->enable_cors, 409,
+                       "Anthropic continuation state is not available; retry by replaying the full messages history",
+                       API_ANTHROPIC);
         return;
     } else if (cached == 0) {
         cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
@@ -10596,6 +10638,18 @@ decode_again:
     size_t think_recovery_scan_from = 0;
     const bool think_tool_recovery_enabled =
         getenv("DS4_SERVER_DISABLE_THINK_TOOL_RECOVERY") == NULL;
+    if (ds4_think_mode_enabled(j->req.think_mode) &&
+        (j->req.temperature != DS4_DEFAULT_TEMPERATURE ||
+         j->req.top_p != DS4_DEFAULT_TOP_P ||
+         j->req.min_p != DS4_DEFAULT_MIN_P ||
+         j->req.top_k != 0))
+    {
+        /* Same behavior as the official DeepSeek API, but say so once instead
+         * of silently ignoring the request's sampling parameters. */
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: thinking mode ignores request sampling params "
+                   "(temperature/top_p/top_k/min_p); using defaults");
+    }
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
 
@@ -11389,11 +11443,39 @@ static long content_length(const char *h, size_t n) {
     return 0;
 }
 
-static bool read_http_request(int fd, http_request *r) {
+/* True when the header block contains `name` and its value contains `value`
+ * (both case-insensitive). */
+static bool header_value_contains(const char *h, size_t n,
+                                  const char *name, const char *value) {
+    const size_t name_len = strlen(name);
+    const char *p = h, *end = h + n;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len > name_len && strncasecmp(line, name, name_len) == 0 &&
+            line[name_len] == ':')
+        {
+            char v[128];
+            size_t vlen = len - name_len - 1;
+            if (vlen >= sizeof(v)) vlen = sizeof(v) - 1;
+            memcpy(v, line + name_len + 1, vlen);
+            v[vlen] = '\0';
+            for (size_t k = 0; v[k]; k++) v[k] = (char)tolower((unsigned char)v[k]);
+            return strstr(v, value) != NULL;
+        }
+        if (p < end) p++;
+    }
+    return false;
+}
+
+static bool read_http_request(int fd, http_request *r, const char **errmsg) {
     buf b = {0};
     ssize_t hend = -1;
     const size_t max_header = 64 * 1024;
     const size_t max_body = 64 * 1024 * 1024;
+    if (errmsg) *errmsg = "bad HTTP request";
 
     while (hend < 0 && b.len < max_header) {
         char tmp[4096];
@@ -11415,6 +11497,19 @@ static bool read_http_request(int fd, http_request *r) {
     if (sscanf(line, "%7s %255s", r->method, r->path) != 2) goto fail;
     char *q = strchr(r->path, '?');
     if (q) *q = '\0';
+
+    if (header_value_contains(b.ptr, (size_t)hend, "Transfer-Encoding", "chunked")) {
+        /* Chunked bodies used to be silently read as Content-Length: 0 and
+         * fail JSON parsing with a misleading error. */
+        if (errmsg) *errmsg = "chunked transfer encoding is not supported; send Content-Length";
+        goto fail;
+    }
+    if (header_value_contains(b.ptr, (size_t)hend, "Expect", "100-continue")) {
+        /* curl-style clients wait up to a second for this interim response
+         * before sending a large POST body. */
+        static const char cont[] = "HTTP/1.1 100 Continue\r\n\r\n";
+        if (!send_all(fd, cont, sizeof(cont) - 1)) goto fail;
+    }
 
     long clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
@@ -11606,8 +11701,9 @@ static void *client_main(void *arg) {
     free(ca);
 
     http_request hr = {0};
-    if (!read_http_request(fd, &hr)) {
-        http_error(fd, s->enable_cors, 400, "bad HTTP request");
+    const char *read_err = NULL;
+    if (!read_http_request(fd, &hr, &read_err)) {
+        http_error(fd, s->enable_cors, 400, read_err ? read_err : "bad HTTP request");
         goto done;
     }
 
@@ -11668,10 +11764,12 @@ static void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
+    const bool anthropic_endpoint = !strcmp(hr.path, "/v1/messages");
     if (ok) req.raw_body = xstrndup(hr.body, hr.body_len);
     http_request_free(&hr);
     if (!ok) {
-        http_error(fd, s->enable_cors, 400, err);
+        http_error_api(fd, s->enable_cors, 400, err,
+                       anthropic_endpoint ? API_ANTHROPIC : API_OPENAI);
         goto done;
     }
     if (!req.model_from_request) {
@@ -11697,10 +11795,10 @@ static void *client_main(void *arg) {
     if (enq != ENQUEUE_OK) {
         pthread_mutex_unlock(&j.mu);
         if (enq == ENQUEUE_FULL) {
-            http_error(fd, s->enable_cors, 429,
-                       "server request queue is full; retry later");
+            http_error_api(fd, s->enable_cors, 429,
+                           "server request queue is full; retry later", j.req.api);
         } else {
-            http_error(fd, s->enable_cors, 503, "server shutting down");
+            http_error_api(fd, s->enable_cors, 503, "server shutting down", j.req.api);
         }
         pthread_cond_destroy(&j.cv);
         pthread_mutex_destroy(&j.mu);
@@ -11752,6 +11850,10 @@ static void configure_client_socket(int fd) {
     tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    /* Per-token SSE writes are tiny; without this Nagle adds latency jitter
+     * whenever the client is not on loopback. */
+    int yes = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
 }
 
 static void set_client_socket_nonblocking(int fd) {
