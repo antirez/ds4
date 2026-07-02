@@ -8586,6 +8586,23 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
     stop_list wanted = {0};
     collect_tool_call_ids(msgs, &wanted);
     if (wanted.len == 0) return;
+    /* Agent requests replay every historical tool-call id on every turn.
+     * tool_memory_remember() already holds them in RAM, so only scan the
+     * cache directory for ids that are actually missing (the common case is
+     * none, except right after a server restart). */
+    int missing = 0;
+    for (int i = 0; i < wanted.len; i++) {
+        if (tool_memory_has_id(s, wanted.v[i])) {
+            free(wanted.v[i]);
+        } else {
+            wanted.v[missing++] = wanted.v[i];
+        }
+    }
+    wanted.len = missing;
+    if (wanted.len == 0) {
+        id_list_free(&wanted);
+        return;
+    }
     /* Tool replay payloads are stored next to KV checkpoints; keep them model
      * scoped too, since token positions and graph state are not portable across
      * Flash/Pro shapes even when the rendered chat text is identical. */
