@@ -90,11 +90,9 @@ static bool ds4_backend_supports_ssd_streaming(ds4_backend backend) {
 
 static bool ds4_backend_supports_streaming_auto_cache(ds4_backend backend) {
     if (backend == DS4_BACKEND_METAL) return true;
-#ifdef DS4_ROCM_BUILD
+    /* CUDA now has a working ds4_gpu_recommended_working_set_size()
+     * implementation, so the auto cache planner can run here too. */
     if (backend == DS4_BACKEND_CUDA) return true;
-#else
-    (void)backend;
-#endif
     return false;
 }
 

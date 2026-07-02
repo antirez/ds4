@@ -2781,7 +2781,19 @@ extern "C" void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) 
 }
 
 extern "C" uint64_t ds4_gpu_recommended_working_set_size(void) {
-    return 0;
+    /* Metal exposes recommendedMaxWorkingSetSize natively; CUDA has no
+     * direct equivalent, so use total device memory as the closest
+     * analogue. The 80% margin applied by callers (see
+     * ds4_ssd_auto_cache_plan) accounts for KV cache, activations and
+     * driver overhead. */
+    size_t free_bytes = 0, total_bytes = 0;
+    cudaError_t err = cudaMemGetInfo(&free_bytes, &total_bytes);
+    (void)free_bytes;
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return (uint64_t)total_bytes;
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
