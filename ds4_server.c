@@ -4163,6 +4163,18 @@ static bool send_all(int fd, const void *p, size_t n) {
     return true;
 }
 
+/* True when the client socket is closed or reset.  A live but idle client
+ * reports EAGAIN; stray unread bytes count as alive.  Never consumes data, so
+ * it is safe to call at any point of the request lifecycle. */
+static bool client_socket_gone(int fd) {
+    if (fd < 0) return true;
+    char b;
+    ssize_t n = recv(fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n > 0) return false;
+    if (n == 0) return true;
+    return !(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR);
+}
+
 static void json_escape(buf *b, const char *s) {
     buf_putc(b, '"');
     for (; *s; s++) {
@@ -9334,6 +9346,21 @@ typedef struct {
     double last_keepalive;
 } server_prefill_progress;
 
+/* Cooperative prefill cancellation: ds4_session_sync() polls this at chunk
+ * boundaries and stops with a valid token prefix.  Cancels on shutdown, on a
+ * failed SSE keepalive write, and on a disconnected client socket, so a gone
+ * client cannot burn minutes of prefill for a response nobody will read. */
+static bool server_sync_cancel_cb(void *ud) {
+    server_prefill_progress *p = ud;
+    if (g_stop_requested) return true;
+    if (p->stream_failed) return true;
+    if (client_socket_gone(p->fd)) {
+        p->stream_failed = true;
+        return true;
+    }
+    return false;
+}
+
 static void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
     int suffix = prompt - cached;
     if (suffix < 0) suffix = 0;
@@ -9923,7 +9950,9 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
         snprintf(rebuild_progress.ctx, sizeof(rebuild_progress.ctx), "%s", rebuild_ctx);
         ds4_session_set_progress(s->session, server_progress_cb, &rebuild_progress);
         ds4_session_set_display_progress(s->session, server_progress_cb, &rebuild_progress);
+        ds4_session_set_cancel(s->session, server_sync_cancel_cb, &rebuild_progress);
         if (ds4_session_sync(s->session, sync_prompt, sync_err, sizeof(sync_err)) == 0) {
+            ds4_session_set_cancel(s->session, NULL, NULL);
             ds4_session_set_progress(s->session, NULL, NULL);
             ds4_session_set_display_progress(s->session, NULL, NULL);
             const double rebuild_sec = now_sec() - rebuild_t0;
@@ -9943,6 +9972,7 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
                             common, live_len, canonical.len, err);
             }
         } else {
+            ds4_session_set_cancel(s->session, NULL, NULL);
             ds4_session_set_progress(s->session, NULL, NULL);
             ds4_session_set_display_progress(s->session, NULL, NULL);
             server_log(DS4_LOG_KVCACHE,
@@ -10199,6 +10229,7 @@ static void generate_job(server *s, job *j) {
                req_flags);
     ds4_session_set_progress(s->session, server_progress_cb, &progress);
     ds4_session_set_display_progress(s->session, server_progress_cb, &progress);
+    ds4_session_set_cancel(s->session, server_sync_cancel_cb, &progress);
 
     int cold_store_len = 0;
     if (cached == 0 &&
@@ -10231,17 +10262,28 @@ static void generate_job(server *s, job *j) {
     {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        if (ds4_session_sync(s->session, &prefix, err, sizeof(err)) != 0) {
+        int sync_rc = ds4_session_sync(s->session, &prefix, err, sizeof(err));
+        if (sync_rc != 0) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
+            ds4_session_set_cancel(s->session, NULL, NULL);
             ds4_session_set_progress(s->session, NULL, NULL);
             ds4_session_set_display_progress(s->session, NULL, NULL);
             kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                                   cold_store_len);
-            kv_cache_discard_failed_disk_entry(s, disk_cache_path);
+            if (sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+                /* Cancelled (shutdown or client gone): the session keeps a
+                 * valid prefix and the disk entry is still good. */
+                server_log(DS4_LOG_PREFILL,
+                           "ds4-server: prefill cancelled ctx=%s reason=%s",
+                           ctx_span, g_stop_requested ? "shutdown" : "client-gone");
+                trace_event(s, trace_id, "prefill cancelled");
+            } else {
+                kv_cache_discard_failed_disk_entry(s, disk_cache_path);
+                trace_event(s, trace_id, "prefill failed: %s", err);
+                send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+            }
             free(disk_cache_path);
-            trace_event(s, trace_id, "prefill failed: %s", err);
-            send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
             return;
         }
         if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
@@ -10255,16 +10297,25 @@ static void generate_job(server *s, job *j) {
         ds4_tokens_free(&prefix);
     }
 
-    if (ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err)) != 0) {
+    int prompt_sync_rc = ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err));
+    if (prompt_sync_rc != 0) {
         ds4_tokens_free(&effective_prompt);
+        ds4_session_set_cancel(s->session, NULL, NULL);
         ds4_session_set_progress(s->session, NULL, NULL);
         ds4_session_set_display_progress(s->session, NULL, NULL);
         kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                               cold_store_len);
-        kv_cache_discard_failed_disk_entry(s, disk_cache_path);
+        if (prompt_sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+            server_log(DS4_LOG_PREFILL,
+                       "ds4-server: prefill cancelled ctx=%s reason=%s",
+                       ctx_span, g_stop_requested ? "shutdown" : "client-gone");
+            trace_event(s, trace_id, "prefill cancelled");
+        } else {
+            kv_cache_discard_failed_disk_entry(s, disk_cache_path);
+            trace_event(s, trace_id, "prefill failed: %s", err);
+            send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+        }
         free(disk_cache_path);
-        trace_event(s, trace_id, "prefill failed: %s", err);
-        send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
         return;
     }
     free(disk_cache_path);
@@ -10273,6 +10324,7 @@ static void generate_job(server *s, job *j) {
     if (!responses_live_continuation) responses_live_clear(s);
     if (!anthropic_live_continuation) anthropic_live_clear(s);
     if (!thinking_live_continuation) thinking_live_clear(s);
+    ds4_session_set_cancel(s->session, NULL, NULL);
     ds4_session_set_progress(s->session, NULL, NULL);
     ds4_session_set_display_progress(s->session, NULL, NULL);
     kv_cache_maybe_store_continued(s);
@@ -10395,6 +10447,14 @@ decode_again:
 
     while (!g_stop_requested && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
+        /* Streaming clients reveal a disconnect through failed SSE writes;
+         * non-streaming clients write nothing until the end, so poll the
+         * socket instead of decoding minutes of output for a dead peer. */
+        if (!j->req.stream && client_socket_gone(j->fd)) {
+            snprintf(err, sizeof(err), "client disconnected");
+            finish = "error";
+            break;
+        }
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
@@ -11076,7 +11136,15 @@ static void *worker_main(void *arg) {
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;
-        generate_job(s, j);
+        if (client_socket_gone(j->fd)) {
+            /* The client gave up while this request sat in the queue (agent
+             * timeout + retry is the common case).  Skip it instead of
+             * spending minutes of prefill and decode on a dead socket. */
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: dropping queued request: client disconnected");
+        } else {
+            generate_job(s, j);
+        }
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
