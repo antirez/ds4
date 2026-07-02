@@ -1324,7 +1324,12 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         const char *key_kind = ds4_kvstore_key_kind(hdr.ext_flags);
         bool consumed = false;
         if (kc->opt.cold_max_tokens > 0 && loaded > kc->opt.cold_max_tokens) {
-            unlink(path);
+            /* This entry is superseded once the caller extends the restored
+             * state, but unlinking it here would lose the only recoverable
+             * copy if the tail prefill then fails or is cancelled.  Report it
+             * as consumed and let the caller unlink after the extension
+             * succeeds; without a result struct nobody could, so delete. */
+            if (!result) unlink(path);
             consumed = true;
             kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                     "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms consumed file=%s",

@@ -8828,9 +8828,11 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
                                   ds4_tokens *effective_prompt,
                                   char **loaded_path_out,
                                   uint8_t *loaded_ext_flags_out,
+                                  bool *loaded_consumed_out,
                                   bool responses_protocol) {
     if (loaded_path_out) *loaded_path_out = NULL;
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+    if (loaded_consumed_out) *loaded_consumed_out = false;
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, s->session,
@@ -8839,6 +8841,7 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
     if (loaded > 0) {
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
+        if (loaded_consumed_out) *loaded_consumed_out = lr.consumed;
     }
     ds4_kvstore_load_result_free(&lr);
     return loaded;
@@ -8847,11 +8850,13 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
 static int kv_cache_try_load(server *s, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
-                             uint8_t *loaded_ext_flags_out) {
+                             uint8_t *loaded_ext_flags_out,
+                             bool *loaded_consumed_out) {
     return kv_cache_try_load_text(s, req ? req->prompt_text : NULL,
                                   effective_prompt,
                                   loaded_path_out,
                                   loaded_ext_flags_out,
+                                  loaded_consumed_out,
                                   req && req->api == API_RESPONSES);
 }
 
@@ -9899,9 +9904,11 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
          * live raw-window ring.  Prefer an older disk checkpoint over replaying
          * a very long conversation from token zero. */
         char *path = NULL;
+        bool path_consumed = false;
         ds4_tokens effective = {0};
         int loaded = kv_cache_try_load_text(s, rendered.ptr ? rendered.ptr : "",
-                                            &effective, &path, NULL, false);
+                                            &effective, &path, NULL,
+                                            &path_consumed, false);
         if (loaded == 0) ds4_session_invalidate(s->session);
 
         char sync_err[160] = {0};
@@ -9955,6 +9962,7 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
             ds4_session_set_cancel(s->session, NULL, NULL);
             ds4_session_set_progress(s->session, NULL, NULL);
             ds4_session_set_display_progress(s->session, NULL, NULL);
+            if (path_consumed && path) unlink(path);
             const double rebuild_sec = now_sec() - rebuild_t0;
             if (loaded > 0) {
                 server_log(DS4_LOG_KVCACHE,
@@ -10107,6 +10115,7 @@ static void generate_job(server *s, job *j) {
     }
     int disk_cached = 0;
     char *disk_cache_path = NULL;
+    bool disk_cache_consume = false;
     uint8_t disk_cache_ext_flags = 0;
     if (cached == 0) {
         int text_cached = live_text_prefix_prompt(s, &j->req, &effective_prompt);
@@ -10133,7 +10142,8 @@ static void generate_job(server *s, job *j) {
     if (cached == 0) {
         disk_cached = kv_cache_try_load(s, &j->req, &effective_prompt,
                                         &disk_cache_path,
-                                        &disk_cache_ext_flags);
+                                        &disk_cache_ext_flags,
+                                        &disk_cache_consume);
         if (disk_cached > 0) {
             cached = disk_cached;
             cache_source = "disk-text";
@@ -10318,6 +10328,11 @@ static void generate_job(server *s, job *j) {
         free(disk_cache_path);
         return;
     }
+    /* The prefill extended past this snapshot, so its deferred consume-unlink
+     * is now safe: the live state supersedes it and the next store persists a
+     * longer prefix.  Keeping it until here means a cancelled or failed tail
+     * prefill can still hit it on retry. */
+    if (disk_cache_consume && disk_cache_path) unlink(disk_cache_path);
     free(disk_cache_path);
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
      * a binding only when this request explicitly continued from it. */
