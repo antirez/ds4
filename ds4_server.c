@@ -15827,6 +15827,47 @@ static void test_kv_cache_eviction_prefers_anchor_reason(void) {
     rmdir(dir);
 }
 
+static void test_kv_cache_eviction_evicts_stale_anchor_before_fresh_waypoint(void) {
+    /* Observed in production: the newest continued waypoints of the live
+     * conversation (hits=0 because they were written minutes ago) were
+     * evicted while stale never-hit anchors survived on the reason bonus.
+     * A stale anchor must lose to a fresh waypoint of equal density. */
+    char tmpl[] = "/tmp/ds4-kv-stale-anchor-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *anchor_sha = "1111111111111111111111111111111111111111";
+    const char *waypoint_sha = "2222222222222222222222222222222222222222";
+    uint64_t now = (uint64_t)time(NULL);
+    uint64_t stale = now - 30u * 24u * 3600u;
+    test_kv_stub_file(dir, anchor_sha, KV_REASON_COLD, 2048, 0, stale, 2048);
+    test_kv_stub_file(dir, waypoint_sha, KV_REASON_CONTINUED, 2048, 0, now, 2048);
+
+    char anchor_name[44], waypoint_name[44];
+    snprintf(anchor_name, sizeof(anchor_name), "%.40s.kv", anchor_sha);
+    snprintf(waypoint_name, sizeof(waypoint_name), "%.40s.kv", waypoint_sha);
+    char *anchor_path = path_join(dir, anchor_name);
+    char *waypoint_path = path_join(dir, waypoint_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
+    kv_cache_evict(&kc, NULL, 0, NULL);
+
+    TEST_ASSERT(access(anchor_path, F_OK) != 0);
+    TEST_ASSERT(access(waypoint_path, F_OK) == 0);
+
+    kv_cache_close(&kc);
+    unlink(anchor_path);
+    unlink(waypoint_path);
+    free(anchor_path);
+    free(waypoint_path);
+    rmdir(dir);
+}
+
 static void test_kv_cache_eviction_makes_room_before_store(void) {
     char tmpl[] = "/tmp/ds4-kv-pre-store-evict-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -15998,9 +16039,10 @@ static void test_kv_cache_eviction_score_decays_stale_hits(void) {
     double f_on = kv_entry_eviction_score(&fresh, NULL, now, NULL);
     TEST_ASSERT(s_on < f_on);
 
-    /* A fresh entry's score never decays below its (0+1) * tokens/size floor,
-     * regardless of how old another entry's hit history is. */
-    TEST_ASSERT(f_on == 1.0 * (double)fresh.tokens / (double)fresh.file_size);
+    /* A fresh never-hit entry gets the freshness grace: it scores like a
+     * once-hit file, (1+1) * tokens/size, and never below the (0+1) floor. */
+    TEST_ASSERT(f_on == 2.0 * (double)fresh.tokens / (double)fresh.file_size);
+    TEST_ASSERT(f_on >= 1.0 * (double)fresh.tokens / (double)fresh.file_size);
 }
 
 static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
@@ -16436,6 +16478,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_lookup_rejects_stale_payload_abi();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_prefers_anchor_reason();
+    test_kv_cache_eviction_evicts_stale_anchor_before_fresh_waypoint();
     test_kv_cache_eviction_makes_room_before_store();
     test_kv_cache_eviction_ignores_oversize_incoming();
     test_kv_cache_eviction_prefers_superseded_continued_prefix();

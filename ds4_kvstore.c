@@ -545,10 +545,29 @@ double ds4_kvstore_entry_eviction_score(
         effective_hits *= exp2(-elapsed / (double)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
         if (effective_hits < KV_CACHE_MIN_EFFECTIVE_HITS) effective_hits = 0.0;
     }
+    /* Freshness grace: a just-written file has had no chance to be hit yet,
+     * so score it like a once-hit file and let the grace decay on the same
+     * half-life.  Without it, the newest waypoints of the live conversation
+     * are always the first eviction victims while stale never-hit files
+     * survive on age alone. */
+    double freshness = 0.0;
+    if (used_at) {
+        freshness = now > used_at ?
+            exp2(-(double)(now - used_at) /
+                 (double)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS) : 1.0;
+        if (freshness < KV_CACHE_MIN_EFFECTIVE_HITS) freshness = 0.0;
+    }
+    if (effective_hits < freshness) effective_hits = freshness;
     double score = (effective_hits + 1.0) *
                    (double)e->tokens / (double)e->file_size;
-    if (kv_cache_reason_is_anchor(e->reason))
-        score *= KV_CACHE_ANCHOR_REASON_SCORE_FACTOR;
+    if (kv_cache_reason_is_anchor(e->reason)) {
+        /* The anchor bonus exists so restart/eviction recovery points stay
+         * around, but a never-hit anchor that has aged past the half-life is
+         * not anyone's recovery point anymore — let it compete on density
+         * alone instead of outliving the live conversation's waypoints. */
+        double activity = effective_hits > 1.0 ? 1.0 : effective_hits;
+        score *= 1.0 + (KV_CACHE_ANCHOR_REASON_SCORE_FACTOR - 1.0) * activity;
+    }
     if (kv_cache_incoming_supersedes_continued(e, incoming)) {
         double h = effective_hits > 0.0 ?
             effective_hits / (effective_hits + 1.0) : 0.0;
