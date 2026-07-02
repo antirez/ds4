@@ -3522,6 +3522,8 @@ struct ds4_rocm_runtime_config {
     int disable_shared_gate_up_fused_w32;
     int attention_output_cublas_all;
     int shared_down_cublas;
+    int q8_batch_mfma;
+    int prefill_online_attention;
     int graph_dump;
     uint32_t q8_decode_rpb;
     uint32_t q8_hc_decode_rpb;
@@ -3539,12 +3541,17 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
         g_rocm_cfg.disable_shared_gate_up_fused_w32 = !g_quality_mode;
         g_rocm_cfg.attention_output_cublas_all = !g_quality_mode;
         g_rocm_cfg.shared_down_cublas = !g_quality_mode;
+        g_rocm_cfg.q8_batch_mfma = !g_quality_mode;
+        g_rocm_cfg.prefill_online_attention = 0;
         g_rocm_cfg.graph_dump = cuda_env_present(getenv("DS4_METAL_GRAPH_DUMP_PREFIX"));
         g_rocm_cfg.q8_decode_rpb = g_quality_mode ? 8u : 1u;
         g_rocm_cfg.q8_hc_decode_rpb = g_quality_mode ? 8u : 16u;
         g_rocm_cfg.attn_out_low_decode_rpb = g_quality_mode ? 8u : 32u;
         g_rocm_cfg.moe_decode_rpb = g_quality_mode ? 8u : 1u;
         g_rocm_cfg.oldhip_attention_decode = !g_quality_mode;
+        if (cuda_env_present(getenv("DS4_ROCM_DISABLE_Q8_BATCH_MFMA"))) {
+            g_rocm_cfg.q8_batch_mfma = 0;
+        }
         g_rocm_cfg.initialized = 1;
     }
     return &g_rocm_cfg;
@@ -3559,7 +3566,12 @@ static uint64_t cuda_q8_f16_cache_reserve_bytes(uint64_t total_bytes) {
         return cuda_stream_resident_free_reserve_bytes();
     }
     if (total_bytes >= 112ull * 1024ull * 1024ull * 1024ull) {
-        return 512ull * 1048576ull;
+        /*
+         * On large discrete cards, Q8->F16 expansion is still optional.  Leave
+         * enough room for long-context KV and normal runtime scratch instead of
+         * forcing otherwise-fitting contexts into managed memory.
+         */
+        return 40ull * 1024ull * 1024ull * 1024ull;
     }
 
     /* The expanded Q8->F16 cache is only an acceleration path.  Keep enough
@@ -4131,13 +4143,20 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
     return UINT64_MAX;
 }
 
-static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
-    uint64_t bytes = 1792ull * 1048576ull;
-    if (bytes < need) {
-        const uint64_t align = 256ull * 1048576ull;
-        bytes = (need + align - 1u) & ~(align - 1u);
+static uint64_t cuda_model_arena_allocated_bytes(void) {
+    uint64_t bytes = 0;
+    for (const cuda_model_arena &a : g_model_arenas) {
+        if (a.bytes > UINT64_MAX - bytes) return UINT64_MAX;
+        bytes += a.bytes;
     }
     return bytes;
+}
+
+static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
+    const uint64_t min_chunk = 64ull * 1048576ull;
+    const uint64_t align = 64ull * 1048576ull;
+    uint64_t bytes = need < min_chunk ? min_chunk : need;
+    return cuda_round_up(bytes, align);
 }
 
 static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
@@ -4162,10 +4181,34 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
     if (err != cudaSuccess) {
-        fprintf(stderr, DS4_GPU_LOG_PREFIX "model arena alloc failed for %s (%.2f MiB chunk): %s\n",
-                what ? what : "weights",
-                (double)chunk / 1048576.0,
-                cudaGetErrorString(err));
+        size_t free_b = 0;
+        size_t total_b = 0;
+        const cudaError_t mem_err = cudaMemGetInfo(&free_b, &total_b);
+        if (mem_err == cudaSuccess) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "model arena alloc failed for %s "
+                    "(request=%.2f MiB chunk=%.2f MiB cached=%.2f GiB "
+                    "arena=%.2f GiB free=%.2f GiB total=%.2f GiB): %s\n",
+                    what ? what : "weights",
+                    (double)bytes / 1048576.0,
+                    (double)chunk / 1048576.0,
+                    (double)g_model_range_bytes / 1073741824.0,
+                    (double)cuda_model_arena_allocated_bytes() / 1073741824.0,
+                    (double)free_b / 1073741824.0,
+                    (double)total_b / 1073741824.0,
+                    cudaGetErrorString(err));
+        } else {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "model arena alloc failed for %s "
+                    "(request=%.2f MiB chunk=%.2f MiB cached=%.2f GiB "
+                    "arena=%.2f GiB): %s\n",
+                    what ? what : "weights",
+                    (double)bytes / 1048576.0,
+                    (double)chunk / 1048576.0,
+                    (double)g_model_range_bytes / 1073741824.0,
+                    (double)cuda_model_arena_allocated_bytes() / 1073741824.0,
+                    cudaGetErrorString(err));
+        }
         (void)cudaGetLastError();
         g_model_cache_full = 1;
         return NULL;
@@ -4387,7 +4430,8 @@ extern "C" int ds4_gpu_init(void) {
     }
     if (!g_cublas_ready) {
         if (!cublas_ok(cublasCreate(&g_cublas), "create handle")) return 0;
-        const cublasMath_t math_mode = g_quality_mode ? CUBLAS_DEFAULT_MATH : CUBLAS_TF32_TENSOR_OP_MATH;
+        const cublasMath_t math_mode = g_quality_mode ?
+            CUBLAS_DEFAULT_MATH : CUBLAS_TF32_TENSOR_OP_MATH;
         (void)cublasSetMathMode(g_cublas, math_mode);
         g_cublas_ready = 1;
     }
@@ -4502,8 +4546,8 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
 
 static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
     const uint64_t min_reserve = 8ull * 1073741824ull;
-    const uint64_t max_reserve = 40ull * 1073741824ull;
-    uint64_t reserve = total_bytes / 4u;
+    const uint64_t max_reserve = 16ull * 1073741824ull;
+    uint64_t reserve = total_bytes / 12u;
     if (reserve < min_reserve) reserve = min_reserve;
     if (reserve > max_reserve) reserve = max_reserve;
     return reserve;
@@ -4512,12 +4556,10 @@ static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
 extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
     if (kv_cache_bytes == 0) return 0;
 
-    /* Very large KV caches are where device-only cudaMalloc() can make a
-     * unified-memory machine unresponsive.  Managed memory restores the old
-     * demand-paged behavior for this one long-lived allocation class only. */
-    const uint64_t huge_kv = 8ull * 1073741824ull;
-    if (kv_cache_bytes >= huge_kv) return 1;
-
+    /* On discrete CDNA devices, large KV caches should stay in normal VRAM when
+     * they fit.  ROCm managed memory is a pressure valve, not the default path:
+     * use it only when the estimated context footprint would exhaust free device
+     * memory or leave too little reserve for transient runtime allocations. */
     const uint64_t large_context = 8ull * 1073741824ull;
     if (context_bytes < large_context) return 0;
 
@@ -4800,7 +4842,8 @@ extern "C" void ds4_gpu_set_quality(bool quality) {
     }
     g_quality_mode = new_quality_mode;
     if (g_cublas_ready) {
-        const cublasMath_t math_mode = g_quality_mode ? CUBLAS_DEFAULT_MATH : CUBLAS_TF32_TENSOR_OP_MATH;
+        const cublasMath_t math_mode = g_quality_mode ?
+            CUBLAS_DEFAULT_MATH : CUBLAS_TF32_TENSOR_OP_MATH;
         (void)cublasSetMathMode(g_cublas, math_mode);
     }
 }

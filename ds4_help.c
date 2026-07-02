@@ -146,7 +146,11 @@ static const char *tool_summary(ds4_help_tool tool) {
 static void print_model_runtime(FILE *fp, const help_colors *c,
                                 ds4_help_tool tool, bool full) {
     title(fp, c, "Model And Runtime");
-    opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ds4flash.gguf");
+    if (tool == DS4_HELP_DS4) {
+        opt(fp, c, "-m, --model FILE", "GGUF model path. Repeat with --gpus for distributed split shards. Default: ds4flash.gguf");
+    } else {
+        opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ds4flash.gguf");
+    }
 #ifdef DS4_ROCM_BUILD
     opt(fp, c, "--metal | --rocm | --cpu", "Select the backend explicitly.");
     opt(fp, c, "--backend NAME", "Backend name: metal, rocm, or cpu.");
@@ -211,7 +215,7 @@ static void print_steering(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
 }
 
-static void print_distributed(FILE *fp, const help_colors *c) {
+static void print_distributed(FILE *fp, const help_colors *c, ds4_help_tool tool) {
     title(fp, c, "Distributed Inference");
     fputc('\n', fp);
     para(fp, c, "Distributed mode runs one logical session across several machines by assigning contiguous model layer ranges to workers. Workers own their layer slice and KV-cache shard; the coordinator owns the prompt, sampling loop, and client/API flow. Start workers first, then start the coordinator. The coordinator waits for a complete route and streams hidden states through the workers.");
@@ -225,6 +229,9 @@ static void print_distributed(FILE *fp, const help_colors *c) {
     opt(fp, c, "--dist-activation-bits N", "Hidden-state transport width: 32, 16, or 8. Default: 32");
     opt(fp, c, "--dist-replay-check", "Diagnostic: reset and replay prompt, then compare logits.");
     opt(fp, c, "--debug", "Print coordinator route/debug logs.");
+    if (tool == DS4_HELP_DS4) {
+        opt(fp, c, "--gpus LIST", "Local CUDA/ROCm launcher: split layers over comma-separated GPU ids, e.g. 0,1,2,3.");
+    }
     fputc('\n', fp);
 }
 
@@ -270,7 +277,7 @@ static void print_cli_commands(FILE *fp, const help_colors *c) {
     opt(fp, c, "/power N", "Set GPU duty cycle percentage, 1..100.");
     opt(fp, c, "/read FILE", "Read FILE and submit it as the next user message.");
     opt(fp, c, "/quit, /exit", "Leave the prompt.");
-    opt(fp, c, "Ctrl+C", "Stop current generation and return to ds4>.");
+    opt(fp, c, "Ctrl+C", "Stop current generation; at the prompt, exit.");
     fputc('\n', fp);
 }
 
@@ -480,7 +487,7 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
         print_model_runtime(fp, c, tool, true);
         if (tool_has_topic(tool, "sampling")) print_sampling(fp, c, true);
         if (tool_has_topic(tool, "steering")) print_steering(fp, c);
-        print_distributed(fp, c);
+        print_distributed(fp, c, tool);
         if (tool == DS4_HELP_DS4) {
             print_cli_specific(fp, c, true);
             print_cli_commands(fp, c);
@@ -502,7 +509,7 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
     if (streq(topic, "runtime")) print_model_runtime(fp, c, tool, true);
     else if (streq(topic, "sampling")) print_sampling(fp, c, true);
     else if (streq(topic, "steering")) print_steering(fp, c);
-    else if (streq(topic, "distributed")) print_distributed(fp, c);
+    else if (streq(topic, "distributed")) print_distributed(fp, c, tool);
     else if (tool == DS4_HELP_DS4 && streq(topic, "diagnostics")) print_cli_diagnostics(fp, c);
     else if (tool == DS4_HELP_DS4 && streq(topic, "commands")) print_cli_commands(fp, c);
     else if (tool == DS4_HELP_SERVER && streq(topic, "api")) print_server_api(fp, c);

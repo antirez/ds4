@@ -38,6 +38,7 @@
 
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_internal.h"
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
@@ -2123,6 +2124,32 @@ static uint64_t accelerator_cuda_preload_span_bytes(void) {
     return mb * 1048576ull;
 }
 
+static bool accelerator_model_cache_preflight(const char *accelerator_name,
+                                              uint64_t    required_bytes) {
+    if (required_bytes == 0 || required_bytes == UINT64_MAX) return true;
+    uint64_t free_bytes = 0;
+    uint64_t total_bytes = 0;
+    if (ds4_gpu_memory_info(&free_bytes, &total_bytes) == 0) return true;
+
+    const uint64_t reserve_bytes = 2ull * 1073741824ull;
+    const uint64_t available_bytes =
+        free_bytes > reserve_bytes ? free_bytes - reserve_bytes : 0;
+    if (required_bytes <= available_bytes) return true;
+
+    fprintf(stderr,
+            "ds4: %s non-streaming model tensor cache needs %.2f GiB, "
+            "but this device has %.2f GiB free (%.2f GiB total, %.2f GiB reserve)\n",
+            accelerator_name,
+            (double)required_bytes / 1073741824.0,
+            (double)free_bytes / 1073741824.0,
+            (double)total_bytes / 1073741824.0,
+            (double)reserve_bytes / 1073741824.0);
+    fprintf(stderr,
+            "ds4: use --ssd-streaming for single-GPU routed-expert streaming, "
+            "or --gpus to shard layers across local GPUs\n");
+    return false;
+}
+
 static bool accelerator_span_filter_contains(uint64_t off,
                                              uint64_t bytes,
                                              const uint64_t *span_offsets,
@@ -2186,18 +2213,40 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
     qsort(spans, (size_t)nspan, sizeof(spans[0]), accelerator_tensor_span_cmp);
 
     const uint64_t max_span = accelerator_cuda_preload_span_bytes();
+#ifdef DS4_ROCM_BUILD
+    const char *accelerator_name = "ROCm";
+#else
+    const char *accelerator_name = "CUDA";
+#endif
+    uint64_t required = 0;
+    for (uint64_t i = 0; i < nspan;) {
+        uint64_t off = spans[i].off;
+        uint64_t end = spans[i].end;
+        i++;
+        while (i < nspan &&
+               spans[i].off <= end + 65536u &&
+               spans[i].end - off <= max_span) {
+            if (spans[i].end > end) end = spans[i].end;
+            i++;
+        }
+        const uint64_t bytes = end - off;
+        if (required > UINT64_MAX - bytes) {
+            required = UINT64_MAX;
+            break;
+        }
+        required += bytes;
+    }
+    if (!accelerator_model_cache_preflight(accelerator_name, required)) {
+        free(spans);
+        return false;
+    }
+
     const int tty = ds4_log_is_tty(stderr);
     const uint64_t progress_step = (tty ? 2ull : 16ull) * 1073741824ull;
     uint64_t next_progress = progress_step;
     double last_progress = now_sec();
     uint64_t prepared = 0;
     uint64_t merged = 0;
-
-#ifdef DS4_ROCM_BUILD
-    const char *accelerator_name = "ROCm";
-#else
-    const char *accelerator_name = "CUDA";
-#endif
 
     fprintf(stderr, "%sds4: %s preparing model tensor mappings%s",
             tty ? "\r\033[K" : "",
@@ -10360,6 +10409,8 @@ typedef struct {
     uint32_t spec_prefix1_n_index_comp[DS4_MAX_LAYER];
     bool spec_capture_prefix1;
     uint32_t raw_cap;
+    uint32_t layer_start;
+    uint32_t layer_end;
     /* Maximum compressed-row capacity across layers.  Shared work buffers use
      * this worst-case size because ratio-4 indexer layers can still reach it. */
     uint32_t comp_cap;
@@ -10961,9 +11012,16 @@ static bool metal_graph_alloc_raw_cap(
         uint32_t                raw_cap,
         uint32_t                ctx_size,
         uint32_t                prefill_cap,
+        uint32_t                layer_start,
+        uint32_t                layer_end,
         bool                    enable_mtp) {
     memset(g, 0, sizeof(*g));
     g->mtp_enabled = enable_mtp;
+    if (layer_start >= DS4_N_LAYER) return false;
+    if (layer_end == UINT32_MAX || layer_end >= DS4_N_LAYER) layer_end = DS4_N_LAYER - 1u;
+    if (layer_end < layer_start) return false;
+    g->layer_start = layer_start;
+    g->layer_end = layer_end;
     if (raw_cap == 0) raw_cap = 1;
     if (ctx_size == 0) ctx_size = raw_cap;
     if (prefill_cap == 0) prefill_cap = 1;
@@ -10977,7 +11035,7 @@ static bool metal_graph_alloc_raw_cap(
     g->raw_window = raw_window;
     g->prefill_cap = prefill_cap;
     uint32_t min_ratio = UINT32_MAX;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
     }
@@ -10988,7 +11046,7 @@ static bool metal_graph_alloc_raw_cap(
         g->attn_comp_stage_cap = prefill_cap / min_ratio + 2u;
         if (g->attn_comp_stage_cap < 2u) g->attn_comp_stage_cap = 2u;
     }
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) {
             g->layer_comp_cap[il] = 0;
@@ -11027,7 +11085,7 @@ static bool metal_graph_alloc_raw_cap(
          * turning memory pressure into a machine-wide lockup.
          */
         fprintf(stderr,
-                "ds4: CUDA using managed KV cache for ctx=%u "
+                "ds4: GPU using managed KV cache for ctx=%u "
                 "(kv cache %.2f GiB, context buffers %.2f GiB); "
                 "this may degrade performance but is needed for very large contexts\n",
                 ctx_size,
@@ -11054,7 +11112,7 @@ static bool metal_graph_alloc_raw_cap(
     g->kv_raw = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     g->kv = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     bool state_init_ok = true;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
         g->layer_raw_cache[il] = metal_graph_alloc_kv_cache_tensor(
                 managed_kv_cache,
                 (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
@@ -11216,7 +11274,7 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_routed_out = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
 
     bool layer_cache_ok = true;
-    for (uint32_t il = 0; layer_cache_ok && il < DS4_N_LAYER; il++) {
+    for (uint32_t il = layer_start; layer_cache_ok && il <= layer_end; il++) {
         layer_cache_ok = g->layer_raw_cache[il] != NULL;
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (layer_cache_ok && ratio != 0) {
@@ -11292,7 +11350,15 @@ static bool metal_graph_alloc(
         ds4_gpu_graph *g,
         const ds4_weights     *weights,
         const ds4_layer_weights *layer) {
-    return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false);
+    return metal_graph_alloc_raw_cap(g,
+                                     weights,
+                                     layer,
+                                     DS4_N_SWA,
+                                     DS4_N_SWA,
+                                     1,
+                                     0,
+                                     DS4_N_LAYER - 1u,
+                                     false);
 }
 
 static bool metal_graph_install_model_spans(
@@ -20272,7 +20338,11 @@ static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
     memset(g->layer_n_comp, 0, sizeof(g->layer_n_comp));
     memset(g->layer_n_index_comp, 0, sizeof(g->layer_n_index_comp));
     g->mtp_n_raw = 0;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    uint32_t layer_start = g->layer_start;
+    uint32_t layer_end = g->layer_end;
+    if (layer_start >= DS4_N_LAYER) layer_start = 0;
+    if (layer_end >= DS4_N_LAYER || layer_end < layer_start) layer_end = DS4_N_LAYER - 1u;
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint32_t coff = ratio == 4 ? 2u : 1u;
@@ -21510,7 +21580,8 @@ static int metal_graph_prompt_logits_test(
 
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, (uint32_t)n_test, false);
+                                        raw_cap, (uint32_t)ctx_size, (uint32_t)n_test,
+                                        0, DS4_N_LAYER - 1u, false);
     if (!ok) {
         metal_graph_free(&g);
         fprintf(stderr, "ds4: failed to initialize Metal graph prompt test runtime\n");
@@ -21828,6 +21899,9 @@ struct ds4_engine {
     bool ssd_streaming;
     bool ssd_streaming_cold;
     ds4_distributed_options distributed;
+    bool load_slice;
+    uint32_t load_layer_start;
+    uint32_t load_layer_end;
     bool metal_ready;
     bool mtp_ready;
 };
@@ -22956,7 +23030,8 @@ static int generate_metal_graph_raw_swa(
     }
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false);
+                                        raw_cap, (uint32_t)ctx_size, prefill_cap,
+                                        0, DS4_N_LAYER - 1u, false);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate GPU graph runtime\n");
         return 1;
@@ -25023,7 +25098,8 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
 
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false);
+                                        raw_cap, (uint32_t)ctx_size, prefill_cap,
+                                        0, DS4_N_LAYER - 1u, false);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate imatrix Metal graph runtime\n");
         free(dataset);
@@ -25552,6 +25628,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->ssd_streaming = opt->ssd_streaming;
     e->ssd_streaming_cold = opt->ssd_streaming_cold;
     e->distributed = opt->distributed;
+    ds4_internal_dist_copy_options_private(&opt->distributed, &e->distributed);
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
     e->prefill_chunk = opt->prefill_chunk;
     e->ssd_streaming_cache_experts = opt->ssd_streaming_cache_experts;
@@ -25575,7 +25652,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         e->directional_steering_ffn_scale = opt->directional_steering_ffn;
     }
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
-    ds4_acquire_instance_lock();
+    if (opt->distributed.role == DS4_DISTRIBUTED_NONE) ds4_acquire_instance_lock();
 
     if (opt->simulate_used_memory_bytes != 0 &&
         !ds4_ssd_memory_lock_acquire(&e->simulated_memory,
@@ -25599,6 +25676,12 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                          UINT32_MAX : opt->distributed.layers.end;
         load_output = opt->distributed.layers.has_output;
         load_output_optional = opt->distributed.role == DS4_DISTRIBUTED_COORDINATOR;
+    }
+    e->load_slice = load_slice;
+    e->load_layer_start = load_slice ? load_layer_start : 0;
+    e->load_layer_end = load_slice ? load_layer_end : DS4_N_LAYER - 1u;
+    if (e->load_layer_end == UINT32_MAX || e->load_layer_end >= DS4_N_LAYER) {
+        e->load_layer_end = DS4_N_LAYER - 1u;
     }
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
@@ -25933,7 +26016,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         if (!accelerator_cache_model_tensors(e->backend, &e->model,
                                              load_offsets, load_sizes,
                                              load_span_count)) {
-            fprintf(stderr, "ds4: %s failed to prepare optional model cache\n",
+            fprintf(stderr, "ds4: %s failed to prepare model cache\n",
                     ds4_backend_name(e->backend));
             free(load_offsets);
             free(load_sizes);
@@ -25949,7 +26032,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             (void)ds4_gpu_set_model_fd_for_map(e->mtp_model.fd, e->mtp_model.map);
             if (!accelerator_cache_model_tensors(e->backend, &e->mtp_model,
                                                  NULL, NULL, 0)) {
-                fprintf(stderr, "ds4: %s failed to prepare optional MTP model cache\n",
+                fprintf(stderr, "ds4: %s failed to prepare MTP model cache\n",
                         ds4_backend_name(e->backend));
                 ds4_engine_close(e);
                 *out = NULL;
@@ -26013,6 +26096,65 @@ uint64_t ds4_engine_hidden_f32_values(ds4_engine *e) {
     return (uint64_t)DS4_N_HC * DS4_N_EMBD;
 }
 
+int ds4_internal_model_shard_info_from_file(
+        const char *model_path,
+        ds4_internal_model_shard_info *out) {
+    if (!out) return 1;
+    memset(out, 0, sizeof(*out));
+    if (DS4_N_LAYER > DS4_INTERNAL_MAX_LAYER) return 1;
+
+    ds4_model m;
+    model_open(&m, model_path, false, false);
+    config_validate_model(&m);
+
+    out->n_layers = DS4_N_LAYER;
+    out->has_token_embedding = model_find_tensor(&m, "token_embd.weight") != NULL;
+    out->has_output_head =
+        model_find_tensor(&m, "output_hc_base.weight") != NULL &&
+        model_find_tensor(&m, "output_hc_fn.weight") != NULL &&
+        model_find_tensor(&m, "output_hc_scale.weight") != NULL &&
+        model_find_tensor(&m, "output_norm.weight") != NULL &&
+        model_find_tensor(&m, "output.weight") != NULL;
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!tensor_by_namef(&m, "blk.%u.attn_norm.weight", il)) continue;
+        if (!out->has_layers) {
+            out->first_layer = il;
+            out->last_layer = il;
+            out->has_layers = true;
+        } else {
+            out->last_layer = il;
+        }
+    }
+
+    if (out->has_layers) {
+        ds4_weights w;
+        weights_bind(&w,
+                     &m,
+                     true,
+                     out->first_layer,
+                     out->last_layer,
+                     out->has_output_head,
+                     false);
+        for (uint32_t start = out->first_layer; start <= out->last_layer; start++) {
+            for (uint32_t end = start; end <= out->last_layer; end++) {
+                ds4_model_map_span_vec spans;
+                const bool include_output = out->has_output_head && end == out->last_layer;
+                if (weights_model_map_spans(&w, start, end, include_output, &spans)) {
+                    out->range_cache_bytes[start][end] =
+                        model_map_span_vec_total_bytes(&spans);
+                    free(spans.v);
+                }
+            }
+        }
+        out->total_cache_bytes =
+            out->range_cache_bytes[out->first_layer][out->last_layer];
+    }
+
+    model_close(&m);
+    return 0;
+}
+
 int ds4_engine_model_id(ds4_engine *e) {
     (void)e;
     return (int)DS4_MODEL_VARIANT;
@@ -26030,6 +26172,7 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_gpu_cleanup();
 #endif
     ds4_ssd_memory_lock_release(&e->simulated_memory);
+    ds4_internal_dist_clear_options_private(&e->distributed);
     ds4_release_instance_lock();
     free(e->directional_steering_dirs);
     free(e->directional_steering_file);
@@ -26072,7 +26215,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         return 1;
     }
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
-                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready))
+                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap,
+                                   e->load_layer_start, e->load_layer_end, e->mtp_ready))
     {
         free(s);
         return 1;
@@ -26185,7 +26329,11 @@ static bool ds4_session_cancelled(ds4_session *s) {
     return s && s->cancel && s->cancel(s->cancel_ud);
 }
 
-static bool ds4_session_cancelled_cb(void *ud) {
+bool ds4_internal_session_cancel_requested(ds4_session *s) {
+    return ds4_session_cancelled(s);
+}
+
+static DS4_MAYBE_UNUSED bool ds4_session_cancelled_cb(void *ud) {
     return ds4_session_cancelled(ud);
 }
 
@@ -26381,6 +26529,12 @@ int ds4_session_eval_layer_slice(ds4_session *s,
 
     ds4_engine *e = s->engine;
     ds4_gpu_graph *g = &s->graph;
+    if (layer_start < g->layer_start || layer_end > g->layer_end) {
+        if (errlen) snprintf(err, errlen, "layer-slice %u:%u is outside allocated graph range %u:%u",
+                             layer_start, layer_end, g->layer_start, g->layer_end);
+        s->checkpoint_valid = false;
+        return 1;
+    }
     if (!input_hc && !output_hc && output_logits &&
         layer_start == 0 && layer_end + 1u == (uint32_t)DS4_N_LAYER) {
         bool ok = false;

@@ -47,13 +47,10 @@ static int routed_moe_q2_float_down_launch(
     uint32_t hot_count = 0u;
     uint32_t hot_max = 0u;
     const uint32_t hot_threshold = 8u;
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-    const int use_wmma_hot = hot_experts_dev &&
-        !g_quality_mode &&
-        (expert_mid_dim % 16u) == 0u && (out_dim % 16u) == 0u;
-#else
+    /* The IQ2/Q2 float-down hotlist WMMA overlay can write huge invalid
+     * activations on CDNA, which later overflow into NaN logits.  Keep this
+     * path on the scalar expert-batch kernel until the overlay has coverage. */
     const int use_wmma_hot = 0;
-#endif
     uint32_t h_hot[DS4_ROCM_MAX_N_EXPERT] = {0};
     if (use_wmma_hot) {
         for (uint32_t e = 0; e < n_total_expert; e++) {
@@ -372,6 +369,9 @@ static int routed_moe_launch(
     const char **gate_slot_ptrs = NULL;
     const char **up_slot_ptrs = NULL;
     const char **down_slot_ptrs = NULL;
+    const char **q4_gate_slot_ptrs = NULL;
+    const char **q4_up_slot_ptrs = NULL;
+    const char **q4_down_slot_ptrs = NULL;
     const char **resident_gate_slot_ptrs = NULL;
     const char **resident_up_slot_ptrs = NULL;
     const char **missing_gate_slot_ptrs = NULL;
@@ -520,6 +520,52 @@ static int routed_moe_launch(
     }
 
     int ok = 1;
+    if (q4k_path &&
+        !compact_selected &&
+        !batch_stream_selected &&
+        !batch_stream_split_selected) {
+        if (!gate_w || !up_w || !down_w ||
+            n_total_expert == 0 ||
+            n_total_expert > DS4_ROCM_MAX_N_EXPERT) {
+            return 0;
+        }
+        const uint64_t ptr_bytes = (uint64_t)n_total_expert * sizeof(char *);
+        uint8_t *ptr_scratch = (uint8_t *)cuda_tmp_alloc(ptr_bytes * 3u,
+                                                         "routed_moe q4 expert ptr table");
+        if (!ptr_scratch) return 0;
+        q4_gate_slot_ptrs = (const char **)ptr_scratch;
+        q4_up_slot_ptrs = (const char **)(ptr_scratch + ptr_bytes);
+        q4_down_slot_ptrs = (const char **)(ptr_scratch + ptr_bytes * 2u);
+        const char *h_gate[DS4_ROCM_MAX_N_EXPERT] = {0};
+        const char *h_up[DS4_ROCM_MAX_N_EXPERT] = {0};
+        const char *h_down[DS4_ROCM_MAX_N_EXPERT] = {0};
+        for (uint32_t e = 0; e < n_total_expert; e++) {
+            uint64_t gate_rel = 0;
+            uint64_t down_rel = 0;
+            if (!cuda_u64_mul_checked(e, gate_expert_bytes, &gate_rel) ||
+                !cuda_u64_mul_checked(e, down_expert_bytes, &down_rel)) {
+                return 0;
+            }
+            h_gate[e] = (const char *)((uintptr_t)gate_w + (uintptr_t)gate_rel);
+            h_up[e] = (const char *)((uintptr_t)up_w + (uintptr_t)gate_rel);
+            h_down[e] = (const char *)((uintptr_t)down_w + (uintptr_t)down_rel);
+        }
+        ok = cuda_ok(cudaMemcpy(q4_gate_slot_ptrs, h_gate, (size_t)ptr_bytes,
+                                cudaMemcpyHostToDevice),
+                     "routed_moe q4 gate ptr table upload");
+        if (ok) {
+            ok = cuda_ok(cudaMemcpy(q4_up_slot_ptrs, h_up, (size_t)ptr_bytes,
+                                    cudaMemcpyHostToDevice),
+                         "routed_moe q4 up ptr table upload");
+        }
+        if (ok) {
+            ok = cuda_ok(cudaMemcpy(q4_down_slot_ptrs, h_down, (size_t)ptr_bytes,
+                                    cudaMemcpyHostToDevice),
+                         "routed_moe q4 down ptr table upload");
+        }
+        if (!ok) return 0;
+    }
+
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
     const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
     const uint64_t xq_count = (uint64_t)n_tokens * xq_blocks;
@@ -530,8 +576,7 @@ static int routed_moe_launch(
         cuda_block_q8_K *xq = (cuda_block_q8_K *)down->ptr;
         cuda_block_q8_K *midq = (cuda_block_q8_K *)gate->ptr;
         const uint32_t pair_count = n_tokens * n_expert;
-        const uint32_t use_sorted_pairs = n_tokens > 1u &&
-            (!q4k_path || n_tokens >= 32u);
+        const uint32_t use_sorted_pairs = n_tokens > 1u && !q4k_path;
         const uint32_t use_expert_tiles = use_sorted_pairs;
         const uint32_t expert_tile_m = 8u;
         const uint32_t write_gate_up = 0u;
@@ -1002,22 +1047,40 @@ static int routed_moe_launch(
             } else if (ok) {
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, n_tokens * n_expert, 1);
                 if (q4k_path) {
-                    moe_gate_up_mid_decode_q4K_qwarp32_kernel<<<qgrid, 256>>>(
-                        (float *)gate->ptr,
-                        (float *)up->ptr,
-                        (float *)mid->ptr,
-                        gate_w,
-                        up_w,
-                        xq,
-                        (const int32_t *)selected_exec->ptr,
-                        (const float *)weights->ptr,
-                        gate_expert_bytes,
-                        gate_row_bytes,
-                        xq_blocks,
-                        expert_mid_dim,
-                        n_expert,
-                        write_gate_up,
-                        clamp);
+                    if (q4_gate_slot_ptrs && q4_up_slot_ptrs) {
+                        moe_gate_up_mid_decode_q4K_qwarp32_ptrs_kernel<<<qgrid, 256>>>(
+                            (float *)gate->ptr,
+                            (float *)up->ptr,
+                            (float *)mid->ptr,
+                            q4_gate_slot_ptrs,
+                            q4_up_slot_ptrs,
+                            xq,
+                            (const int32_t *)selected_exec->ptr,
+                            (const float *)weights->ptr,
+                            gate_row_bytes,
+                            xq_blocks,
+                            expert_mid_dim,
+                            n_expert,
+                            write_gate_up,
+                            clamp);
+                    } else {
+                        moe_gate_up_mid_decode_q4K_qwarp32_kernel<<<qgrid, 256>>>(
+                            (float *)gate->ptr,
+                            (float *)up->ptr,
+                            (float *)mid->ptr,
+                            gate_w,
+                            up_w,
+                            xq,
+                            (const int32_t *)selected_exec->ptr,
+                            (const float *)weights->ptr,
+                            gate_expert_bytes,
+                            gate_row_bytes,
+                            xq_blocks,
+                            expert_mid_dim,
+                            n_expert,
+                            write_gate_up,
+                            clamp);
+                    }
                 } else if (use_decode_lut_gate) {
                     moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
@@ -1175,15 +1238,26 @@ static int routed_moe_launch(
             if (use_direct_down_sum6) {
                 dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
                 if (q4k_path) {
-                    moe_down_q4K_sum6_qwarp32_kernel<<<sgrid, 256>>>(
-                        (float *)out->ptr,
-                        down_w,
-                        midq,
-                        (const int32_t *)selected_exec->ptr,
-                        down_expert_bytes,
-                        down_row_bytes,
-                        midq_blocks,
-                        out_dim);
+                    if (q4_down_slot_ptrs) {
+                        moe_down_q4K_sum6_qwarp32_ptrs_kernel<<<sgrid, 256>>>(
+                            (float *)out->ptr,
+                            q4_down_slot_ptrs,
+                            midq,
+                            (const int32_t *)selected_exec->ptr,
+                            down_row_bytes,
+                            midq_blocks,
+                            out_dim);
+                    } else {
+                        moe_down_q4K_sum6_qwarp32_kernel<<<sgrid, 256>>>(
+                            (float *)out->ptr,
+                            down_w,
+                            midq,
+                            (const int32_t *)selected_exec->ptr,
+                            down_expert_bytes,
+                            down_row_bytes,
+                            midq_blocks,
+                            out_dim);
+                    }
                 } else {
                     moe_down_sum6_qwarp32_kernel<<<sgrid, 256>>>(
                         (float *)out->ptr,
@@ -1306,16 +1380,28 @@ static int routed_moe_launch(
                 }
             } else {
                 if (q4k_path) {
-                    moe_down_q4K_qwarp32_kernel<<<dgrid, 256>>>(
-                        (float *)down->ptr,
-                        down_w,
-                        midq,
-                        (const int32_t *)selected_exec->ptr,
-                        down_expert_bytes,
-                        down_row_bytes,
-                        midq_blocks,
-                        out_dim,
-                        n_expert);
+                    if (q4_down_slot_ptrs) {
+                        moe_down_q4K_qwarp32_ptrs_kernel<<<dgrid, 256>>>(
+                            (float *)down->ptr,
+                            q4_down_slot_ptrs,
+                            midq,
+                            (const int32_t *)selected_exec->ptr,
+                            down_row_bytes,
+                            midq_blocks,
+                            out_dim,
+                            n_expert);
+                    } else {
+                        moe_down_q4K_qwarp32_kernel<<<dgrid, 256>>>(
+                            (float *)down->ptr,
+                            down_w,
+                            midq,
+                            (const int32_t *)selected_exec->ptr,
+                            down_expert_bytes,
+                            down_row_bytes,
+                            midq_blocks,
+                            out_dim,
+                            n_expert);
+                    }
                 } else {
                     moe_down_qwarp32_kernel<<<dgrid, 256>>>(
                         (float *)down->ptr,

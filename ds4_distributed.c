@@ -14,6 +14,7 @@
  */
 
 #include "ds4_distributed.h"
+#include "ds4_internal.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -68,6 +69,115 @@
 #define DS4_DIST_RECV_TRANSPORT_ERROR 1
 #define DS4_DIST_RECV_REMOTE_ERROR 2
 #define DS4_DIST_SNAPSHOT_CHUNK_BYTES (8u * 1024u * 1024u)
+
+typedef struct ds4_dist_options_private {
+    const ds4_distributed_options *opt;
+    int adopt_listen_fd;
+    bool local_worker;
+    struct ds4_dist_options_private *next;
+} ds4_dist_options_private;
+
+static pthread_mutex_t g_dist_options_private_mu = PTHREAD_MUTEX_INITIALIZER;
+static ds4_dist_options_private *g_dist_options_private;
+
+static ds4_dist_options_private *dist_options_private_find_locked(
+        const ds4_distributed_options *opt,
+        bool create) {
+    if (!opt) return NULL;
+    for (ds4_dist_options_private *it = g_dist_options_private; it; it = it->next) {
+        if (it->opt == opt) return it;
+    }
+    if (!create) return NULL;
+    ds4_dist_options_private *p = calloc(1, sizeof(*p));
+    if (!p) return NULL;
+    p->opt = opt;
+    p->next = g_dist_options_private;
+    g_dist_options_private = p;
+    return p;
+}
+
+static void dist_options_private_remove_locked(const ds4_distributed_options *opt) {
+    ds4_dist_options_private **link = &g_dist_options_private;
+    while (*link) {
+        if ((*link)->opt == opt) {
+            ds4_dist_options_private *old = *link;
+            *link = old->next;
+            free(old);
+            return;
+        }
+        link = &(*link)->next;
+    }
+}
+
+static void dist_options_private_prune_locked(const ds4_distributed_options *opt) {
+    ds4_dist_options_private *p = dist_options_private_find_locked(opt, false);
+    if (p && p->adopt_listen_fd <= 0 && !p->local_worker) {
+        dist_options_private_remove_locked(opt);
+    }
+}
+
+static int dist_options_adopt_listen_fd(const ds4_distributed_options *opt) {
+    pthread_mutex_lock(&g_dist_options_private_mu);
+    ds4_dist_options_private *p = dist_options_private_find_locked(opt, false);
+    const int fd = p ? p->adopt_listen_fd : 0;
+    pthread_mutex_unlock(&g_dist_options_private_mu);
+    return fd;
+}
+
+static bool dist_options_local_worker(const ds4_distributed_options *opt) {
+    pthread_mutex_lock(&g_dist_options_private_mu);
+    ds4_dist_options_private *p = dist_options_private_find_locked(opt, false);
+    const bool local_worker = p && p->local_worker;
+    pthread_mutex_unlock(&g_dist_options_private_mu);
+    return local_worker;
+}
+
+void ds4_internal_dist_set_adopt_listen_fd(ds4_distributed_options *opt, int fd) {
+    if (!opt) return;
+    pthread_mutex_lock(&g_dist_options_private_mu);
+    ds4_dist_options_private *p = dist_options_private_find_locked(opt, fd > 0);
+    if (p) {
+        p->adopt_listen_fd = fd;
+        dist_options_private_prune_locked(opt);
+    }
+    pthread_mutex_unlock(&g_dist_options_private_mu);
+}
+
+void ds4_internal_dist_set_local_worker(
+        ds4_distributed_options *opt,
+        bool local_worker) {
+    if (!opt) return;
+    pthread_mutex_lock(&g_dist_options_private_mu);
+    ds4_dist_options_private *p = dist_options_private_find_locked(opt, local_worker);
+    if (p) {
+        p->local_worker = local_worker;
+        dist_options_private_prune_locked(opt);
+    }
+    pthread_mutex_unlock(&g_dist_options_private_mu);
+}
+
+void ds4_internal_dist_copy_options_private(
+        const ds4_distributed_options *src,
+        const ds4_distributed_options *dst) {
+    if (!dst || src == dst) return;
+    pthread_mutex_lock(&g_dist_options_private_mu);
+    dist_options_private_remove_locked(dst);
+    ds4_dist_options_private *sp = dist_options_private_find_locked(src, false);
+    if (sp && (sp->adopt_listen_fd > 0 || sp->local_worker)) {
+        ds4_dist_options_private *dp = dist_options_private_find_locked(dst, true);
+        if (dp) {
+            dp->adopt_listen_fd = sp->adopt_listen_fd;
+            dp->local_worker = sp->local_worker;
+        }
+    }
+    pthread_mutex_unlock(&g_dist_options_private_mu);
+}
+
+void ds4_internal_dist_clear_options_private(const ds4_distributed_options *opt) {
+    pthread_mutex_lock(&g_dist_options_private_mu);
+    dist_options_private_remove_locked(opt);
+    pthread_mutex_unlock(&g_dist_options_private_mu);
+}
 
 typedef struct {
     uint32_t magic;
@@ -492,6 +602,8 @@ static int dist_send_snapshot_file_chunks(
         uint64_t request_id,
         FILE *fp,
         uint64_t bytes);
+static bool dist_session_cancelled(ds4_session *session);
+static int dist_session_interrupted(char *err, size_t errlen);
 
 static int dist_worker_handle_work(
         ds4_dist_worker_state *state,
@@ -780,7 +892,9 @@ static bool dist_parse_positive_u32(
  *
  * The graph-slice APIs exchange float buffers. Distributed transport can leave
  * those buffers as 32-bit floats or pack them to 16/8 bits on the wire; workers
- * decode back to float before executing the next slice.
+ * decode back to float before executing the next slice. 16-bit transport uses
+ * BF16 rather than IEEE fp16 so layer-boundary activation outliers keep the
+ * float32 exponent range.
  */
 
 static uint32_t dist_activation_bits_or_default(uint32_t bits) {
@@ -815,62 +929,16 @@ static bool dist_activation_wire_bytes_from_f32_bytes(uint32_t bits, uint32_t f3
     return dist_activation_wire_bytes(bits, f32_bytes / (uint32_t)sizeof(float), out);
 }
 
-static uint16_t dist_f32_to_f16(float f) {
+static uint16_t dist_f32_to_bf16(float f) {
     uint32_t bits;
     memcpy(&bits, &f, sizeof(bits));
-
-    const uint32_t sign = (bits >> 16) & 0x8000u;
-    int32_t exp = (int32_t)((bits >> 23) & 0xffu) - 127 + 15;
-    uint32_t mant = bits & 0x7fffffu;
-
-    if (exp <= 0) {
-        if (exp < -10) return (uint16_t)sign;
-        mant |= 0x800000u;
-        const uint32_t shift = (uint32_t)(14 - exp);
-        uint32_t half_mant = mant >> shift;
-        const uint32_t round_bit = (mant >> (shift - 1)) & 1u;
-        const uint32_t sticky = mant & ((1u << (shift - 1)) - 1u);
-        if (round_bit && (sticky || (half_mant & 1u))) half_mant++;
-        return (uint16_t)(sign | half_mant);
-    }
-
-    if (exp >= 31) {
-        if (((bits >> 23) & 0xffu) == 0xffu && mant != 0) {
-            return (uint16_t)(sign | 0x7e00u);
-        }
-        return (uint16_t)(sign | 0x7c00u);
-    }
-
-    uint32_t half = sign | ((uint32_t)exp << 10) | (mant >> 13);
-    const uint32_t round = mant & 0x1fffu;
-    if (round > 0x1000u || (round == 0x1000u && (half & 1u))) half++;
-    return (uint16_t)half;
+    const uint32_t lsb = (bits >> 16) & 1u;
+    bits += 0x7fffu + lsb;
+    return (uint16_t)(bits >> 16);
 }
 
-static float dist_f16_to_f32(uint16_t h) {
-    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
-    int32_t exp = (int32_t)((h >> 10) & 0x1fu);
-    uint32_t mant = h & 0x03ffu;
-    uint32_t bits;
-
-    if (exp == 0) {
-        if (mant == 0) {
-            bits = sign;
-        } else {
-            exp = 1;
-            while ((mant & 0x0400u) == 0) {
-                mant <<= 1;
-                exp--;
-            }
-            mant &= 0x03ffu;
-            bits = sign | ((uint32_t)(exp + 127 - 15) << 23) | (mant << 13);
-        }
-    } else if (exp == 31) {
-        bits = sign | 0x7f800000u | (mant << 13);
-    } else {
-        bits = sign | ((uint32_t)(exp + 127 - 15) << 23) | (mant << 13);
-    }
-
+static float dist_bf16_to_f32(uint16_t h) {
+    const uint32_t bits = (uint32_t)h << 16;
     float f;
     memcpy(&f, &bits, sizeof(f));
     return f;
@@ -948,7 +1016,7 @@ static int dist_write_activation_payload(
         if (n > cap) n = cap;
         if (bits == 16u) {
             uint16_t *dst = buf;
-            for (uint64_t i = 0; i < n; i++) dst[i] = dist_f32_to_f16(src[done + i]);
+            for (uint64_t i = 0; i < n; i++) dst[i] = dist_f32_to_bf16(src[done + i]);
         } else {
             uint8_t *dst = buf;
             for (uint64_t i = 0; i < n; i++) dst[i] = dist_f32_to_f8_e4m3(src[done + i]);
@@ -1010,7 +1078,7 @@ static int dist_decode_activation_payload(
     }
     if (bits == 16u) {
         const uint16_t *src = wire;
-        for (uint64_t i = 0; i < values; i++) dst[i] = dist_f16_to_f32(src[i]);
+        for (uint64_t i = 0; i < values; i++) dst[i] = dist_bf16_to_f32(src[i]);
     } else {
         const uint8_t *src = wire;
         for (uint64_t i = 0; i < values; i++) dst[i] = dist_f8_e4m3_to_f32(src[i]);
@@ -1248,6 +1316,27 @@ static int dist_listener_port(int fd) {
     unsigned long v = strtoul(service, &end, 10);
     if (end == service || *end != '\0' || v > 65535ul) return 0;
     return (int)v;
+}
+
+static int dist_coordinator_listener_fd(
+        const ds4_dist_options *opt,
+        char *err,
+        size_t errlen) {
+    int adopted = dist_options_adopt_listen_fd(opt);
+    if (adopted > 0) {
+        int fd = dup(adopted);
+        if (fd < 0) {
+            if (errlen) {
+                snprintf(err, errlen,
+                         "failed to duplicate adopted listener fd: %s",
+                         strerror(errno));
+            }
+            return -1;
+        }
+        dist_set_socket_low_latency(fd);
+        return fd;
+    }
+    return dist_open_listener(opt->listen_host, opt->listen_port, err, errlen);
 }
 
 static bool dist_connect_errno_retryable(int e) {
@@ -2326,7 +2415,32 @@ static bool dist_coordinator_ensure_route(
         uint64_t *generation,
         char *err,
         size_t errlen) {
-    return dist_coordinator_build_route_plan(state, plan, generation, err, errlen);
+    const char *wait_s = getenv("DS4_DIST_ROUTE_WAIT_SEC");
+    char route_err[256];
+    char *errbuf = err ? err : route_err;
+    size_t errbuf_len = err ? errlen : sizeof(route_err);
+
+    double wait_sec = 0.0;
+    if (wait_s && wait_s[0]) {
+        errno = 0;
+        char *end = NULL;
+        double v = strtod(wait_s, &end);
+        if (errno == 0 && end != wait_s && *end == '\0' && v > 0.0) wait_sec = v;
+    }
+
+    const double deadline = dist_now_sec() + wait_sec;
+    for (;;) {
+        if (dist_coordinator_build_route_plan(state, plan, generation, errbuf, errbuf_len)) {
+            return true;
+        }
+        if (strncmp(errbuf, "distributed route incomplete:", 29) != 0 ||
+            wait_sec <= 0.0 ||
+            dist_now_sec() >= deadline) {
+            return false;
+        }
+        const struct timespec delay = {0, 50 * 1000 * 1000};
+        nanosleep(&delay, NULL);
+    }
 }
 
 static uint64_t dist_coordinator_generation(ds4_dist_coordinator_state *state) {
@@ -2571,6 +2685,7 @@ static int dist_coordinator_eval_remote_on_fd(
         size_t errlen) {
     const bool profile = dist_decode_profile_enabled() && n_tokens == 1;
     const double total_t0 = profile ? dist_now_sec() : 0.0;
+    if (dist_session_cancelled(session)) return dist_session_interrupted(err, errlen);
     const double send_t0 = profile ? dist_now_sec() : 0.0;
     int rc = dist_coordinator_send_remote_work_on_fd(state,
                                                      plan,
@@ -2614,6 +2729,10 @@ static int dist_coordinator_eval_remote_on_fd(
                     kind,
                     (double)payload_bytes / (1024.0 * 1024.0));
         }
+    }
+    if (dist_session_cancelled(session)) {
+        free(payload);
+        return dist_session_interrupted(err, errlen);
     }
     if (rc != 0) return rc;
     if (result_hash != expected_result_hash) {
@@ -2682,6 +2801,7 @@ static int dist_coordinator_eval_span(
         size_t errlen) {
     const bool profile = dist_decode_profile_enabled() && n_tokens == 1;
     const double span_t0 = profile ? dist_now_sec() : 0.0;
+    if (dist_session_cancelled(session)) return dist_session_interrupted(err, errlen);
     const uint64_t hc_values = ds4_engine_hidden_f32_values(state->engine);
     const uint64_t hidden_bytes64 = (uint64_t)n_tokens * hc_values * sizeof(float);
     if (hidden_bytes64 > UINT32_MAX) {
@@ -2743,6 +2863,10 @@ static int dist_coordinator_eval_span(
                                           err,
                                           errlen);
     const double local_t1 = profile ? dist_now_sec() : 0.0;
+    if (dist_session_cancelled(session)) {
+        free(hidden);
+        return dist_session_interrupted(err, errlen);
+    }
     double remote_t0 = 0.0, remote_t1 = 0.0;
     if (rc == 0 && plan->count != 0) {
         remote_t0 = profile ? dist_now_sec() : 0.0;
@@ -3510,6 +3634,15 @@ static void dist_report_prefill_progress(ds4_session *session, uint32_t current,
     ds4_session_report_progress(session, "prefill_chunk", (int)current, (int)total);
 }
 
+static bool dist_session_cancelled(ds4_session *session) {
+    return ds4_internal_session_cancel_requested(session);
+}
+
+static int dist_session_interrupted(char *err, size_t errlen) {
+    if (errlen) snprintf(err, errlen, "interrupted");
+    return DS4_SESSION_SYNC_INTERRUPTED;
+}
+
 static int dist_coordinator_prefill_prompt_pipelined(
         ds4_dist_coordinator_state *state,
         ds4_session *session,
@@ -3525,6 +3658,7 @@ static int dist_coordinator_prefill_prompt_pipelined(
         char *err,
         size_t errlen) {
     const uint32_t total = n_tokens;
+    if (dist_session_cancelled(session)) return dist_session_interrupted(err, errlen);
     if (!prompt ||
         span_start > (uint32_t)prompt->len ||
         n_tokens == 0 ||
@@ -3634,6 +3768,7 @@ static int dist_coordinator_prefill_prompt_pipelined(
                      flow_window);
 
     int rc = 0;
+    bool interrupted = false;
     double local_eval_sec = 0.0;
     const double pipeline_t0 = dist_now_sec();
     uint32_t pos = span_start;
@@ -3641,6 +3776,9 @@ static int dist_coordinator_prefill_prompt_pipelined(
     uint32_t reported_chunks = 0;
     uint32_t submitted_chunks = 0;
     while (pos < span_end) {
+        if (dist_session_cancelled(session)) {
+            interrupted = true;
+        }
         if (!dist_prefill_reader_wait_flow_window(&reader,
                                                   submitted_chunks,
                                                   flow_window,
@@ -3681,6 +3819,9 @@ static int dist_coordinator_prefill_prompt_pipelined(
         const double local_t1 = dist_now_sec();
         local_eval_sec += local_t1 - local_t0;
         if (rc != 0) break;
+        if (dist_session_cancelled(session)) {
+            interrupted = true;
+        }
 
         slot->pos = pos;
         slot->n_tokens = chunk;
@@ -3714,6 +3855,9 @@ static int dist_coordinator_prefill_prompt_pipelined(
     }
     if (rc == 0) {
         while (!dist_prefill_reader_wait_emit_progress(&reader, &reported_chunks)) {
+            if (dist_session_cancelled(session)) {
+                interrupted = true;
+            }
             ;
         }
     }
@@ -3750,6 +3894,10 @@ static int dist_coordinator_prefill_prompt_pipelined(
     if (rc != 0) {
         free(reader.final_payload);
         return 1;
+    }
+    if (interrupted || dist_session_cancelled(session)) {
+        free(reader.final_payload);
+        return dist_session_interrupted(err, errlen);
     }
     const uint32_t logits_bytes =
         (uint32_t)((uint64_t)ds4_engine_vocab_size(state->engine) * sizeof(float));
@@ -5406,7 +5554,7 @@ int ds4_dist_session_create(
     }
     if (dist_validate_options(opt, err, errlen) != 0) return 1;
 
-    int listen_fd = dist_open_listener(opt->listen_host, opt->listen_port, err, errlen);
+    int listen_fd = dist_coordinator_listener_fd(opt, err, errlen);
     if (listen_fd < 0) return 1;
 
     ds4_dist_session *d = calloc(1, sizeof(*d));
@@ -5513,7 +5661,9 @@ int ds4_dist_session_sync(
         if (errlen) snprintf(err, errlen, "invalid distributed sync request");
         return 1;
     }
+    if (dist_session_cancelled(owner)) return dist_session_interrupted(err, errlen);
     if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
+    if (dist_session_cancelled(owner)) return dist_session_interrupted(err, errlen);
 
     if (checkpoint &&
         checkpoint->len >= 0 &&
@@ -5543,6 +5693,11 @@ int ds4_dist_session_sync(
                                                                        err,
                                                                        errlen);
             if (prefill_rc != 0) {
+                if (dist_session_cancelled(owner) || prefill_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+                    d->plan_ready = false;
+                    d->plan_generation = 0;
+                    return dist_session_interrupted(err, errlen);
+                }
                 if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                              owner,
                                                              &d->plan,
@@ -5565,6 +5720,7 @@ int ds4_dist_session_sync(
 
         uint32_t pos = pos0;
         while (pos < (uint32_t)prompt->len) {
+            if (dist_session_cancelled(owner)) return dist_session_interrupted(err, errlen);
             const uint32_t remaining = (uint32_t)prompt->len - pos;
             const uint32_t chunk = remaining < chunk_cap ? remaining : chunk_cap;
             int eval_rc = dist_coordinator_eval_span(&d->state,
@@ -5580,6 +5736,11 @@ int ds4_dist_session_sync(
                                                      err,
                                                      errlen);
             if (eval_rc != 0) {
+                if (dist_session_cancelled(owner) || eval_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+                    d->plan_ready = false;
+                    d->plan_generation = 0;
+                    return dist_session_interrupted(err, errlen);
+                }
                 if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                              owner,
                                                              &d->plan,
@@ -5614,6 +5775,11 @@ int ds4_dist_session_sync(
                                                      err,
                                                      errlen);
     if (prefill_rc != 0) {
+        if (dist_session_cancelled(owner) || prefill_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+            d->plan_ready = false;
+            d->plan_generation = 0;
+            return dist_session_interrupted(err, errlen);
+        }
         if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                      owner,
                                                      &d->plan,
@@ -5646,7 +5812,9 @@ int ds4_dist_session_eval(
         if (errlen) snprintf(err, errlen, "invalid distributed decode request");
         return 1;
     }
+    if (dist_session_cancelled(owner)) return dist_session_interrupted(err, errlen);
     if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
+    if (dist_session_cancelled(owner)) return dist_session_interrupted(err, errlen);
 
     ds4_tokens transcript = {0};
     ds4_tokens_copy(&transcript, checkpoint);
@@ -5665,6 +5833,12 @@ int ds4_dist_session_eval(
                                         err,
                                         errlen);
     if (rc != 0) {
+        if (dist_session_cancelled(owner) || rc == DS4_SESSION_SYNC_INTERRUPTED) {
+            d->plan_ready = false;
+            d->plan_generation = 0;
+            ds4_tokens_free(&transcript);
+            return dist_session_interrupted(err, errlen);
+        }
         if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                      owner,
                                                      &d->plan,
@@ -5694,7 +5868,7 @@ int ds4_dist_session_eval(
 
 static int dist_run_coordinator(ds4_engine *engine, const ds4_dist_options *opt, const ds4_dist_generation_options *gen) {
     char err[256];
-    int listen_fd = dist_open_listener(opt->listen_host, opt->listen_port, err, sizeof(err));
+    int listen_fd = dist_coordinator_listener_fd(opt, err, sizeof(err));
     if (listen_fd < 0) {
         fprintf(stderr, "ds4: distributed coordinator: %s\n", err);
         return 1;
@@ -6713,12 +6887,7 @@ static int dist_forward_work_to_next(
         const ds4_dist_telemetry_fixed *telemetry,
         const void *route_blob) {
     char err[256];
-    ds4_dist_worker_forwarder *forwarder =
-        dist_worker_get_forwarder(upstream, next->host, next->port, err, sizeof(err));
     const uint64_t request_id = dist_u64_from_halves(work->request_hi, work->request_lo);
-    if (!forwarder) {
-        return dist_worker_upstream_send_work_error(upstream, request_id, err);
-    }
 
     ds4_dist_work_fixed forwarded = *work;
     forwarded.layer_start = next->layer_start;
@@ -6737,6 +6906,74 @@ static int dist_forward_work_to_next(
         forwarded.flags |= DS4_DIST_WORK_F_OUTPUT_LOGITS;
     } else {
         forwarded.flags &= ~DS4_DIST_WORK_F_OUTPUT_LOGITS;
+    }
+
+    if (getenv("DS4_DIST_WORKER_FORWARD_SYNC") != NULL) {
+        int fd = dist_connect_endpoint(next->host, (int)next->port, err, sizeof(err));
+        if (fd < 0) {
+            return dist_worker_upstream_send_work_error(upstream, request_id, err);
+        }
+
+        const double send_t0 = dist_now_sec();
+        int rc = dist_send_work_frame(fd, &forwarded, tokens, hidden_hc, route_blob);
+        const double send_t1 = dist_now_sec();
+        if (rc != 0) {
+            close(fd);
+            return dist_worker_upstream_send_work_error(upstream,
+                                                        request_id,
+                                                        "failed to forward distributed work");
+        }
+
+        uint32_t kind = 0, payload_bytes = 0;
+        uint64_t result_hash = 0;
+        void *payload = NULL;
+        const double downstream_t0 = dist_now_sec();
+        rc = dist_recv_result_alloc(fd,
+                                    NULL,
+                                    request_id,
+                                    &kind,
+                                    &result_hash,
+                                    &payload,
+                                    &payload_bytes,
+                                    err,
+                                    sizeof(err));
+        const double downstream_t1 = dist_now_sec();
+        close(fd);
+        if (rc != 0) {
+            free(payload);
+            return dist_worker_upstream_send_work_error(upstream, request_id, err);
+        }
+
+        ds4_dist_telemetry_fixed local_telemetry;
+        const ds4_dist_telemetry_fixed *telemetry_out = NULL;
+        uint32_t telemetry_count = 0;
+        if (telemetry) {
+            local_telemetry = *telemetry;
+            local_telemetry.forward_send_usec = dist_usec_since(send_t0, send_t1);
+            local_telemetry.downstream_wait_usec =
+                dist_usec_since(downstream_t0, downstream_t1);
+            telemetry_out = &local_telemetry;
+            telemetry_count = 1;
+        }
+        const uint32_t payload_bits = 32u;
+        int send_rc = dist_worker_upstream_send_work_result(upstream,
+                                                            request_id,
+                                                            result_hash,
+                                                            0,
+                                                            kind,
+                                                            payload_bits,
+                                                            telemetry_out,
+                                                            telemetry_count,
+                                                            payload,
+                                                            payload_bytes);
+        free(payload);
+        return send_rc;
+    }
+
+    ds4_dist_worker_forwarder *forwarder =
+        dist_worker_get_forwarder(upstream, next->host, next->port, err, sizeof(err));
+    if (!forwarder) {
+        return dist_worker_upstream_send_work_error(upstream, request_id, err);
     }
 
     pthread_mutex_lock(&forwarder->send_mu);
@@ -7993,6 +8230,10 @@ static int dist_run_worker(ds4_engine *engine, const ds4_dist_options *opt, int 
         }
         fprintf(stderr, "ds4: distributed worker: coordinator disconnected%s; reconnecting\n",
                 rc ? " after error" : "");
+        if (dist_options_local_worker(opt)) {
+            fprintf(stderr, "ds4: local GPU worker: coordinator disconnected; exiting\n");
+            return rc ? 1 : 0;
+        }
         dist_sleep_reconnect();
     }
 }
@@ -8114,6 +8355,7 @@ ds4_dist_options *ds4_dist_options_create(void) {
 }
 
 void ds4_dist_options_free(ds4_dist_options *opt) {
+    ds4_internal_dist_clear_options_private(opt);
     free(opt);
 }
 
@@ -8287,7 +8529,8 @@ static int dist_validate_options(const ds4_dist_options *opt, char *err, size_t 
         if (opt->layers.set || opt->listen_host || opt->listen_port ||
             opt->coordinator_host || opt->coordinator_port ||
             opt->prefill_chunk != 0 || opt->prefill_window != 0 ||
-            opt->activation_bits != 0) {
+            opt->activation_bits != 0 ||
+            dist_options_adopt_listen_fd(opt) > 0) {
             if (errlen) snprintf(err, errlen, "distributed options require --role coordinator or --role worker");
             return 1;
         }
@@ -8320,6 +8563,10 @@ static int dist_validate_options(const ds4_dist_options *opt, char *err, size_t 
     }
 
     if (opt->role == DS4_DISTRIBUTED_WORKER) {
+        if (dist_options_adopt_listen_fd(opt) > 0) {
+            if (errlen) snprintf(err, errlen, "adopted listen fd requires --role coordinator");
+            return 1;
+        }
         if (!opt->coordinator_host || opt->coordinator_port <= 0) {
             if (errlen) snprintf(err, errlen, "--role worker requires --coordinator HOST PORT");
             return 1;
@@ -8355,6 +8602,7 @@ int ds4_dist_prepare_engine_options(
     }
     if (engine && opt) {
         engine->distributed = *opt;
+        ds4_internal_dist_copy_options_private(opt, &engine->distributed);
         if (ds4_dist_enabled(opt)) {
             engine->load_slice = true;
             engine->load_layer_start = opt->layers.start;

@@ -189,6 +189,18 @@ extern "C" uint64_t ds4_gpu_recommended_working_set_size(void) {
     return (uint64_t)total_b;
 }
 
+extern "C" int ds4_gpu_memory_info(uint64_t *free_bytes, uint64_t *total_bytes) {
+    size_t free_b = 0;
+    size_t total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (free_bytes) *free_bytes = (uint64_t)free_b;
+    if (total_bytes) *total_bytes = (uint64_t)total_b;
+    return 1;
+}
+
 extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
     return g_ssd_streaming_mode ? g_stream_expert_cache_budget : 0;
 }

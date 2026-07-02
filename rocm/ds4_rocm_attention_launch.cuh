@@ -123,7 +123,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     if (n_tokens > 1 && head_dim == 512 &&
-        !g_quality_mode &&
+        cuda_runtime_config()->prefill_online_attention &&
         ((window != 0u ? window : n_tokens) <= 768u)) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
@@ -247,9 +247,9 @@ static int attention_decode_batch_launch(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
-    const int fast_window_attention = !g_quality_mode;
+    const int fast_window_attention = cuda_runtime_config()->prefill_online_attention;
     if (!cuda_attention_score_buffer_fits(n_comp)) {
-        if (!use_comp_mask && head_dim == 512u) {
+        if (!use_comp_mask && head_dim == 512u && fast_window_attention) {
             dim3 online_grid(n_tokens, (n_head + 7u) / 8u, 1);
             attention_decode_mixed_heads8_online_kernel<<<online_grid, 256>>>((float *)heads->ptr,
                                                                               sinks,
@@ -647,7 +647,7 @@ static int attention_prefill_mixed_launch(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
-        !g_quality_mode &&
+        cuda_runtime_config()->prefill_online_attention &&
         ((window != 0u ? window : n_tokens) + n_comp <= 768u)) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
@@ -860,6 +860,12 @@ extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
         group_dim == 0 || rank == 0 || n_groups == 0 || out_dim == 0 || n_tokens == 0) {
         return 0;
     }
+    /*
+     * Prefill attention heads can exceed fp16 range after attention/inverse-rope
+     * on Pro.  Packing those rows to fp16 turns finite activations into Inf and
+     * poisons the output projection, so keep batched attention output in f32.
+     */
+    if (n_tokens > 1u) return 0;
     if (g_ssd_streaming_mode && n_tokens > 1u) return 0;
     const uint64_t low_dim = (uint64_t)n_groups * rank;
     const uint64_t blocks_a = (group_dim + 31) / 32;
@@ -992,7 +998,8 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
 
     const int attn_output_cublas =
         cuda_runtime_config()->attention_output_cublas_all &&
-        (n_tokens == 1u || !g_ssd_streaming_mode);
+        n_tokens == 1u &&
+        !g_ssd_streaming_mode;
     if (!attn_output_cublas) {
         if ((group_dim & 31u) == 0u && rank <= UINT32_MAX && n_tokens <= UINT32_MAX) {
             const uint32_t rows_per_block = 32u;

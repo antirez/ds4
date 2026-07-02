@@ -678,7 +678,13 @@ __global__ static void attention_decode_mixed_kernel(
     __syncthreads();
     uint32_t n_score = raw_count + visible_comp;
     float local_max = sinks[h];
-    if (visible_comp == 0 || n_tokens == 1u) {
+    const bool scalar_score_path =
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+        true;
+#else
+        (visible_comp == 0 || n_tokens == 1u);
+#endif
+    if (scalar_score_path) {
         for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
             const float *kvrow = raw_kv + (uint64_t)raw_rows[r] * head_dim;
             float dot = 0.0f;

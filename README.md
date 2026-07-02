@@ -14,7 +14,7 @@ and for quality and speed testing.
 We support the following backends:
 * **Metal** is our primary target. Starting from MacBooks with 96GB of RAM (or less, using SSD streaming).
 * **NVIDIA CUDA / DGX Spark**, CUDA with special care for the DGX Spark.
-* **Strix Halo (ROCm)**, systems like the Framework Desktop and other systems based on the same GPU and unified RAM design.
+* **AMD ROCm / Strix Halo**, systems like the Framework Desktop and other systems based on the same GPU and unified RAM design, and CDNA3/MI300X.
 
 This project would not exist without **llama.cpp and GGML**, make sure to read
 the acknowledgements section, a big thank you to Georgi Gerganov and all the
@@ -41,7 +41,7 @@ That said, a few important things about this project:
 * This software is developed with **strong assistance from GPT 5.5** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
 * This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache is actually a first-class disk citizen**. Fast SSD disks also changed the inference game from the point of view of "model needs to fit RAM": while having more RAM the the model size is still preferred, SSD streaming allows to turn the available amount of RAM from a hard cutoff (can I run this model or not?) to continuous spectrum of speed levels.
 * Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. D) Purpose built agents for specific models and execution environments. DwarfStar only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is beta quality code, so probably we are not still there, especially since recently we introduced large new features: distributed inference, SSD streaming, and other minor improvements.
-* The optimized graph path targets **Metal on macOS** and **CUDA on Linux**. The CPU path is only for correctness checks and model/tokenizer diagnostics. For CPU-only Linux builds, use `make cpu`; it builds the normal `./ds4` and `./ds4-server` binaries without CUDA or Metal. On macOS, **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. It was not possible to fix the CPU inference to avoid crashing, since each time you have to restart the computer, which is not funny. Help us, if you have the guts.
+* The optimized graph path targets **Metal on macOS** and **CUDA or ROCm on Linux**. The CPU path is only for correctness checks and model/tokenizer diagnostics. For CPU-only Linux builds, use `make cpu`; it builds the normal `./ds4` and `./ds4-server` binaries without CUDA, ROCm, or Metal. On macOS, **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. It was not possible to fix the CPU inference to avoid crashing, since each time you have to restart the computer, which is not funny. Help us, if you have the guts.
 
 ## Acknowledgements to llama.cpp and GGML
 
@@ -145,6 +145,10 @@ Then build:
 make                  # macOS Metal
 make cuda-spark       # Linux CUDA, DGX Spark / GB10
 make cuda-generic     # Linux CUDA, other local CUDA GPUs
+make cdna             # Linux ROCm, AMD Instinct CDNA3+CDNA4 / gfx942+gfx950
+make cdna3            # Linux ROCm, AMD Instinct MI300X/MI325X / gfx942
+make cdna4            # Linux ROCm, AMD Instinct MI350X/MI355X / gfx950 (runtime validation pending)
+make strix-halo       # Linux ROCm, Strix Halo / gfx1151
 make cpu              # CPU-only diagnostics build
 ```
 
@@ -289,6 +293,34 @@ To build an initial mental model, here are the high level concepts:
 3. You assign one of the machines the role of `coordinator`, the others the roles of `workers`. Workers will connect to the coordinator and will tell they are there and which layers they are able to process.
 4. Each worker keeps its slice of the KV cache.
 5. Communication is worker-to-worker, there is no need to use the coordinator as relay, so if your coordinator is `A`, and you make a request, activations will flow in `A -> B -> C -> back to A`.
+
+For multiple GPUs in one local Linux host, `./ds4 --gpus` starts the local
+workers for you, assigns one process per listed GPU, picks a localhost
+coordinator port, and splits layers contiguously. It uses the same distributed
+runtime as the manual `--role coordinator` / `--role worker` flow, but you do
+not need a shell loop:
+
+```sh
+./ds4 --rocm -m ds4flash.gguf --gpus 0,1,2,3,4,5,6,7 -p "Hello"
+./ds4 --cuda -m ds4flash.gguf --gpus 0,1,2,3 -p "Hello"
+```
+
+For distributed split GGUFs on one host, repeat `-m` for each shard in any
+order. The local launcher inspects and sorts the shards, assigns GPUs
+by model-cache footprint across the full layer range, and gives the output head
+to the final GPU. If a physical GPU's assigned range crosses a GGUF shard
+boundary, the launcher starts two adjacent local workers on that same GPU so
+each process can keep loading one shard file. For very tight VRAM splits, the
+launcher may default `--prefill-chunk` to 1024 to keep graph scratch below the
+remaining device memory; pass `--prefill-chunk` explicitly to override that:
+
+```sh
+./ds4 --rocm \
+  -m gguf/DeepSeek-V4-Pro-Q4K-Layers00-30.gguf \
+  -m gguf/DeepSeek-V4-Pro-Q4K-Layers-31-output.gguf \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --ctx 262144
+```
 
 ### How it works and how to configure it
 
@@ -685,8 +717,8 @@ ds4>
 The interactive CLI is a real multi-turn chat. It keeps the rendered chat
 transcript and the live graph KV checkpoint, so each turn extends the previous
 conversation. Useful commands are `/help`, `/think`, `/think-max`, `/nothink`,
-`/ctx N`, `/read FILE`, and `/quit`. Ctrl+C interrupts the current generation
-and returns to `ds4>`.
+`/ctx N`, `/read FILE`, and `/quit`. Ctrl+C interrupts the current generation;
+at `ds4>`, it exits.
 
 The CLI defaults to thinking mode. Use `/nothink` or `--nothink` for direct
 answers. `--mtp MTP.gguf --mtp-draft 2` enables the optional MTP speculative
@@ -1173,11 +1205,13 @@ the kv cache files include the verbatim prompt cached.
 
 ## Backends
 
-The default graph backend is Metal on macOS and CUDA in CUDA builds:
+The default graph backend is Metal on macOS, CUDA in CUDA builds, and ROCm in
+ROCm builds:
 
 ```sh
 ./ds4 -p "Hello" --metal
 ./ds4 -p "Hello" --cuda
+./ds4 -p "Hello" --rocm
 ```
 
 On Linux, plain `make` prints the available build targets instead of selecting a
@@ -1189,6 +1223,34 @@ when cross-building or when you need a known target:
 ```sh
 make cuda CUDA_ARCH=sm_120
 make cuda CUDA_ARCH=native
+```
+
+For AMD GPUs, use the matching ROCm target. `make cdna` builds a CDNA3/CDNA4
+binary with both `gfx942` and `gfx950` code objects and enables the CDNA wave64
+MFMA q8 prefill path. Runtime validation for this path has been performed on
+CDNA3 / MI300X only; the CDNA4 targets compile the `gfx950` path but still need
+validation on MI350X/MI355X hardware. If you only need one product generation,
+`make cdna3`, `make mi300x`, and `make mi325x` target `gfx942`; `make cdna4`,
+`make mi350x`, and `make mi355x` target `gfx950`. Strix Halo systems use
+`make strix-halo` and keep the gfx11 wave32 WMMA q8 path. For another AMD GPU,
+set `ROCM_ARCH` explicitly. Multiple targets can be passed as a quoted
+space-separated list:
+
+```sh
+make cdna
+make mi300x
+make mi325x
+make mi355x
+make strix-halo
+make rocm ROCM_ARCH=gfx942
+make rocm ROCM_ARCH="gfx942 gfx950"
+```
+
+The portable synthetic check for the CDNA MFMA Q8 path is:
+
+```sh
+make rocm-q8-mfma-correctness
+make rocm-q8-mfma-correctness ROCM_Q8_MFMA_ARCH=gfx950  # requires CDNA4 hardware to run
 ```
 
 There is also a CPU reference/debug path:

@@ -5,6 +5,23 @@
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 #include <rocwmma/rocwmma.hpp>
+#include "ds4_rocm_mfma.cuh"
+#endif
+
+#ifndef DS4_ROCM_WMMA_W32
+#define DS4_ROCM_WMMA_W32 0
+#endif
+
+#ifndef DS4_ROCM_MFMA_F16
+#define DS4_ROCM_MFMA_F16 0
+#endif
+
+#ifndef DS4_ROCM_DIRECT_MFMA_F16
+#define DS4_ROCM_DIRECT_MFMA_F16 DS4_ROCM_MFMA_F16
+#endif
+
+#ifndef DS4_ROCM_ROCWMMA_F16_FALLBACK
+#define DS4_ROCM_ROCWMMA_F16_FALLBACK 0
 #endif
 
 __device__ __forceinline__ static int32_t load_i8x4_i32_aligned(const int8_t *p) {
@@ -670,6 +687,7 @@ __global__ static void matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kerne
 }
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+#if DS4_ROCM_WMMA_W32
 typedef _Float16 __attribute__((ext_vector_type(16))) ds4_q8_half16_t;
 typedef float    __attribute__((ext_vector_type(8)))  ds4_q8_float8_t;
 
@@ -780,6 +798,7 @@ __global__ static void matmul_q8_0_f32_batch_wmma_4w_kernel(
         }
     }
 }
+#endif
 
 template <int TILES_N=8, int BM=16, int BN=16, int BK=16>
 __global__ static void matmul_q8_0_f32_batch_wmma_onthefly_kernel(
@@ -853,6 +872,185 @@ __global__ static void matmul_q8_0_f32_batch_wmma_onthefly_kernel(
         if (t < n_tokens && row < out_dim) out[(uint64_t)t * out_dim + row] = shC[j];
     }
 }
+
+#if DS4_ROCM_MFMA_F16
+#if DS4_ROCM_DIRECT_MFMA_F16
+/* CDNA/gfx9 large-batch Q8_0 GEMM path.  Each hardware wave64 owns one
+ * 16-token x 16-row output tile.  The high-level dispatch is shared across
+ * CDNA3/CDNA4; the low-level wrapper selects the native MFMA shape. */
+template <int TILES_N=4, int BM=16, int BN=16>
+__launch_bounds__(256, 2)
+__global__ static void matmul_q8_0_f32_batch_mfma_w64_onthefly_kernel(
+        float *out,
+        const unsigned char *w,
+        const float *x,
+        uint32_t n_tokens,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint64_t row_bytes) {
+    constexpr uint32_t BK = DS4_ROCM_MFMA_F16_K;
+    constexpr uint32_t K_PER_LANE = DS4_ROCM_MFMA_F16_K_PER_LANE;
+    static_assert(BM == 16 && BN == 16, "direct MFMA kernel expects 16x16 output tiles");
+    static_assert(BK == 16u || BK == 32u, "unsupported CDNA MFMA K tile");
+
+    extern __shared__ unsigned char raw_sh[];
+    _Float16 *shA = reinterpret_cast<_Float16 *>(raw_sh);
+    _Float16 *shB = shA + BM * BK;
+    float *shC = reinterpret_cast<float *>(shB + TILES_N * BK * BN);
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t wave = tid >> 6u;
+    const uint32_t lane = tid & 63u;
+    const uint32_t t0 = (uint32_t)blockIdx.y * BM;
+    const uint32_t row0 = (uint32_t)blockIdx.x * TILES_N * BN;
+
+    ds4_rocm_f32x4_t acc = ds4_rocm_f32x4_zero();
+
+    for (uint32_t k0 = 0; k0 < in_dim; k0 += BK) {
+        for (uint32_t j = tid; j < BM * BK; j += blockDim.x) {
+            const uint32_t m = j / BK;
+            const uint32_t kk = j - m * BK;
+            const uint32_t t = t0 + m;
+            shA[j] = (t < n_tokens && k0 + kk < in_dim)
+                ? (_Float16)x[(uint64_t)t * in_dim + k0 + kk]
+                : (_Float16)0.0f;
+        }
+        for (uint32_t j = tid; j < TILES_N * BK * BN; j += blockDim.x) {
+            const uint32_t tn = j / (BK * BN);
+            const uint32_t rem = j - tn * BK * BN;
+            const uint32_t kk = rem / BN;
+            const uint32_t nn = rem - kk * BN;
+            const uint32_t row = row0 + tn * BN + nn;
+            const uint32_t k = k0 + kk;
+            if (row < out_dim && k < in_dim) {
+                const unsigned char *blk = w + (uint64_t)row * row_bytes + (uint64_t)(k >> 5u) * 34u;
+                uint16_t scale_bits;
+                _Float16 d;
+                __builtin_memcpy(&scale_bits, blk, 2);
+                __builtin_memcpy(&d, &scale_bits, 2);
+                const int8_t q = ((const int8_t *)(blk + 2u))[k & 31u];
+                shB[j] = d * (_Float16)(float)(int)q;
+            } else {
+                shB[j] = (_Float16)0.0f;
+            }
+        }
+        __syncthreads();
+        if (wave < TILES_N) {
+            ds4_rocm_mfma_f16_frag_t a;
+            ds4_rocm_mfma_f16_frag_t b;
+            const uint32_t frag_m = lane & 15u;
+            const uint32_t frag_n = lane & 15u;
+            const uint32_t frag_k = (lane >> 4u) * K_PER_LANE;
+            const _Float16 *tile_b = shB + wave * BK * BN;
+#pragma unroll
+            for (uint32_t i = 0; i < K_PER_LANE; i++) {
+                a[i] = shA[frag_m * BK + frag_k + i];
+                b[i] = tile_b[(frag_k + i) * BN + frag_n];
+            }
+            acc = ds4_rocm_mfma_f16_16x16(a, b, acc);
+        }
+        __syncthreads();
+    }
+
+    if (wave < TILES_N) {
+        const uint32_t frag_n = lane & 15u;
+        const uint32_t frag_m0 = (lane >> 4u) * 4u;
+        float *tile_c = shC + wave * BM * BN;
+#pragma unroll
+        for (uint32_t i = 0; i < 4u; i++) {
+            tile_c[(frag_m0 + i) * BN + frag_n] = acc[i];
+        }
+    }
+    __syncthreads();
+    for (uint32_t j = tid; j < TILES_N * BM * BN; j += blockDim.x) {
+        const uint32_t tn = j / (BM * BN);
+        const uint32_t rem = j - tn * BM * BN;
+        const uint32_t m = rem / BN;
+        const uint32_t nn = rem - m * BN;
+        const uint32_t t = t0 + m;
+        const uint32_t row = row0 + tn * BN + nn;
+        if (t < n_tokens && row < out_dim) out[(uint64_t)t * out_dim + row] = shC[j];
+    }
+}
+#elif DS4_ROCM_ROCWMMA_F16_FALLBACK
+/* Rollback path for comparing the direct MFMA implementation against rocWMMA. */
+template <int TILES_N=4, int BM=16, int BN=16>
+__launch_bounds__(256, 2)
+__global__ static void matmul_q8_0_f32_batch_mfma_w64_onthefly_kernel(
+        float *out,
+        const unsigned char *w,
+        const float *x,
+        uint32_t n_tokens,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint64_t row_bytes) {
+    constexpr uint32_t BK = 16u;
+    extern __shared__ unsigned char raw_sh[];
+    half *shA = reinterpret_cast<half *>(raw_sh);
+    half *shB = shA + BM * BK;
+    float *shC = reinterpret_cast<float *>(shB + TILES_N * BK * BN);
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t wave = tid >> 6u;
+    const uint32_t t0 = (uint32_t)blockIdx.y * BM;
+    const uint32_t row0 = (uint32_t)blockIdx.x * TILES_N * BN;
+
+    using frag_a = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_c = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK, float>;
+    frag_a a;
+    frag_b b;
+    frag_c acc;
+    if (wave < TILES_N) rocwmma::fill_fragment(acc, 0.0f);
+
+    for (uint32_t k0 = 0; k0 < in_dim; k0 += BK) {
+        for (uint32_t j = tid; j < BM * BK; j += blockDim.x) {
+            const uint32_t m = j / BK;
+            const uint32_t kk = j - m * BK;
+            const uint32_t t = t0 + m;
+            shA[j] = (t < n_tokens && k0 + kk < in_dim)
+                ? __float2half(x[(uint64_t)t * in_dim + k0 + kk])
+                : __float2half(0.0f);
+        }
+        for (uint32_t j = tid; j < TILES_N * BK * BN; j += blockDim.x) {
+            const uint32_t tn = j / (BK * BN);
+            const uint32_t rem = j - tn * BK * BN;
+            const uint32_t kk = rem / BN;
+            const uint32_t nn = rem - kk * BN;
+            const uint32_t row = row0 + tn * BN + nn;
+            const uint32_t k = k0 + kk;
+            if (row < out_dim && k < in_dim) {
+                const unsigned char *blk = w + (uint64_t)row * row_bytes + (uint64_t)(k >> 5u) * 34u;
+                const float d = __half2float(*(const half *)blk);
+                const int8_t q = ((const int8_t *)(blk + 2u))[k & 31u];
+                shB[j] = __float2half(d * (float)q);
+            } else {
+                shB[j] = __float2half(0.0f);
+            }
+        }
+        __syncthreads();
+        if (wave < TILES_N) {
+            rocwmma::load_matrix_sync(a, shA, BK);
+            rocwmma::load_matrix_sync(b, shB + wave * BK * BN, BN);
+            rocwmma::mma_sync(acc, a, b, acc);
+        }
+        __syncthreads();
+    }
+
+    if (wave < TILES_N) rocwmma::store_matrix_sync(shC + wave * BM * BN, acc, BN, rocwmma::mem_row_major);
+    __syncthreads();
+    for (uint32_t j = tid; j < TILES_N * BM * BN; j += blockDim.x) {
+        const uint32_t tn = j / (BM * BN);
+        const uint32_t rem = j - tn * BM * BN;
+        const uint32_t m = rem / BN;
+        const uint32_t nn = rem - m * BN;
+        const uint32_t t = t0 + m;
+        const uint32_t row = row0 + tn * BN + nn;
+        if (t < n_tokens && row < out_dim) out[(uint64_t)t * out_dim + row] = shC[j];
+    }
+}
+#endif
+#endif
 #endif
 
 __global__ static void matmul_q8_0_pair_f32_warp8_kernel(

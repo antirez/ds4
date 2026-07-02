@@ -531,6 +531,7 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         float                 beta_fast,
         float                 beta_slow,
         float                 eps) {
+    if (g_quality_mode) return 0;
     if (!g_cublas_ready || !out || !q_half || !x || !model_map || n_tok == 0 ||
         n_rot > head_dim || (n_rot & 1u) || out_dim != (uint64_t)n_head * head_dim ||
         x->bytes < (uint64_t)n_tok * in_dim * sizeof(float) ||

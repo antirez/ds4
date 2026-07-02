@@ -274,7 +274,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 warp launch");
     }
     if (n_tok > 1) {
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+#if (defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)) && DS4_ROCM_WMMA_W32
         if (!g_quality_mode && (in_dim % 32u) == 0u &&
             out_dim >= 1024u &&
             n_tok >= 256u &&
@@ -291,6 +291,33 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                     (uint32_t)out_dim,
                     blocks * 34u);
             return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch wmma 4w launch");
+        }
+#endif
+#if (defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)) && DS4_ROCM_MFMA_F16 && (DS4_ROCM_DIRECT_MFMA_F16 || DS4_ROCM_ROCWMMA_F16_FALLBACK)
+        if (!g_quality_mode && cuda_runtime_config()->q8_batch_mfma &&
+            (in_dim % 32u) == 0u &&
+            out_dim >= 1024u &&
+            n_tok >= 32u &&
+            in_dim <= UINT32_MAX && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
+            constexpr uint32_t tiles_n = 4u;
+            constexpr uint32_t bm = 16u;
+            constexpr uint32_t bn = 16u;
+            constexpr uint32_t bk_max = 32u;
+            const dim3 grid((uint32_t)((out_dim + tiles_n * bn - 1u) / (tiles_n * bn)),
+                            (uint32_t)((n_tok + bm - 1u) / bm),
+                            1u);
+            const size_t shmem =
+                ((size_t)bm * bk_max + (size_t)tiles_n * bk_max * bn) * sizeof(half) +
+                (size_t)tiles_n * bm * bn * sizeof(float);
+            matmul_q8_0_f32_batch_mfma_w64_onthefly_kernel<tiles_n,bm,bn><<<grid, 256u, shmem>>>(
+                    (float *)out->ptr,
+                    reinterpret_cast<const unsigned char *>(wptr),
+                    (const float *)x->ptr,
+                    (uint32_t)n_tok,
+                    (uint32_t)in_dim,
+                    (uint32_t)out_dim,
+                    blocks * 34u);
+            return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch mfma w64 launch");
         }
 #endif
         if ((in_dim & 31u) == 0u && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
