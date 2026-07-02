@@ -10110,6 +10110,13 @@ static void generate_job(server *s, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
+    /* Restart the continued-store cadence from the continuation point, so the
+     * threshold-crossing rule measures the step from where this prefill
+     * actually resumes instead of firing a near-duplicate store on the first
+     * chunk after a hit. */
+    if (cached > 0 && s->kv.continued_last_store_tokens < cached) {
+        s->kv.continued_last_store_tokens = cached;
+    }
     const bool responses_reasoning_state_preserved =
         cached > 0 &&
         ((!strcmp(cache_source, "responses-visible") ||
@@ -14803,7 +14810,7 @@ static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
     ds4_tokens_free(&prompt);
 }
 
-static void test_kv_cache_continued_uses_aligned_frontiers(void) {
+static void test_kv_cache_continued_uses_step_thresholds(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
     kc.opt = kv_cache_default_options();
@@ -14811,11 +14818,16 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 10239) == 0);
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 10240);
 
+    /* A full step must pass since the last store, from wherever it was. */
     kc.continued_last_store_tokens = 4096;
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 10240);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 14336) == 14336);
 
+    /* Unaligned resume positions (disk hits) get waypoints too. */
     kc.continued_last_store_tokens = 24576;
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30720) == 30720);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30720) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 34816) == 34816);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 45374) == 45374);
 
     kc.continued_last_store_tokens = 10240;
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 18432) == 0);
@@ -14824,7 +14836,7 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kc.opt.boundary_align_tokens = 0;
     kc.continued_last_store_tokens = 20480;
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 29999) == 0);
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000) == 30000);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30480) == 30480);
 }
 
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
@@ -15842,7 +15854,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_store_len_uses_configured_boundary();
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
-    test_kv_cache_continued_uses_aligned_frontiers();
+    test_kv_cache_continued_uses_step_thresholds();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
