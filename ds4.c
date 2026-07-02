@@ -10309,6 +10309,11 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
 
 enum { DS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS = 64 };
 
+/* Power of two so the ring index is a mask.  With an even count the upper
+ * middle sample is used as the median, erring toward slightly longer sleeps
+ * (stays under the power target). */
+enum { DS4_POWER_DECODE_WINDOW = 16 };
+
 typedef struct {
     /* One-token decode tensors.  These stay allocated for the life of a
      * session; a generated token enters as an embedding in cur_hc and leaves as
@@ -10484,7 +10489,8 @@ typedef struct {
     float directional_steering_ffn_scale;
     uint32_t power_percent;
     double prefill_layer_avg_sec[DS4_MAX_LAYER];
-    double decode_token_avg_sec;
+    double decode_power_sample_sec[DS4_POWER_DECODE_WINDOW];
+    uint32_t decode_power_sample_count;
     uint32_t streaming_preload_experts;
     bool quality;
     bool ssd_streaming;
@@ -10524,11 +10530,35 @@ static void graph_power_note_prefill_layer(ds4_gpu_graph *g,
     graph_power_sleep(g->prefill_layer_avg_sec[il], g->power_percent);
 }
 
+/* Throttle decode on the median of a recent window rather than a running
+ * average: a token can stall for reasons unrelated to steady-state work
+ * (scheduler preemption, first-touch page faults, GPU clock ramps after
+ * throttle sleeps, SSD expert streaming when enabled), and one-off stalls
+ * must not inflate the sleeps applied to the fast tokens that follow.  A
+ * sustained slowdown still throttles proportionally once it fills half
+ * the window. */
 static void graph_power_note_decode_token(ds4_gpu_graph *g, double elapsed_sec) {
     if (!graph_power_throttle_enabled(g)) return;
-    g->decode_token_avg_sec =
-        graph_power_update_avg(g->decode_token_avg_sec, elapsed_sec);
-    graph_power_sleep(g->decode_token_avg_sec, g->power_percent);
+    if (elapsed_sec <= 0.0 || !isfinite(elapsed_sec)) return;
+
+    g->decode_power_sample_sec[g->decode_power_sample_count &
+                               (DS4_POWER_DECODE_WINDOW - 1u)] = elapsed_sec;
+    g->decode_power_sample_count++;
+
+    uint32_t n = g->decode_power_sample_count;
+    if (n > DS4_POWER_DECODE_WINDOW) n = DS4_POWER_DECODE_WINDOW;
+    double sorted[DS4_POWER_DECODE_WINDOW];
+    memcpy(sorted, g->decode_power_sample_sec, n * sizeof(double));
+    for (uint32_t i = 1; i < n; i++) {
+        const double v = sorted[i];
+        uint32_t j = i;
+        while (j > 0 && sorted[j - 1] > v) {
+            sorted[j] = sorted[j - 1];
+            j--;
+        }
+        sorted[j] = v;
+    }
+    graph_power_sleep(sorted[n / 2], g->power_percent);
 }
 
 /* Release every Metal tensor owned by the whole-model graph runtime. */
@@ -26158,7 +26188,10 @@ int ds4_session_set_power(ds4_session *s, int power_percent) {
     if (!s || !s->engine || power_percent < 1 || power_percent > 100) return 1;
     s->engine->power_percent = power_percent;
 #ifndef DS4_NO_GPU
-    if (!ds4_session_is_cpu(s)) s->graph.power_percent = (uint32_t)power_percent;
+    if (!ds4_session_is_cpu(s)) {
+        s->graph.power_percent = (uint32_t)power_percent;
+        s->graph.decode_power_sample_count = 0;
+    }
 #endif
     return 0;
 }
