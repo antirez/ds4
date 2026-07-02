@@ -304,8 +304,10 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--host HOST", "Bind address. Default: 127.0.0.1");
     opt(fp, c, "--port N", "Bind port. Default: 8000");
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
+    opt(fp, c, "--max-queue N", "Reject requests with 429 when N jobs are already waiting. 0 disables. Default: 0");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
+    para(fp, c, "GET /health and GET /stats report liveness and operational counters even mid-generation.");
     para(fp, c, "Model endpoint aliases include deepseek-v4-flash and deepseek-v4-pro; both serve the loaded GGUF.");
     fputc('\n', fp);
 }
