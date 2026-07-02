@@ -7665,6 +7665,7 @@ typedef struct {
     size_t len;
     size_t bytes;
     int refs;
+    int invokes;
     uint64_t seen;
     tool_memory_entry *entries;
 } tool_memory_block;
@@ -7864,6 +7865,18 @@ static tool_memory_block *tool_memory_find_block_locked(tool_memory *m,
     return v == raxNotFound ? NULL : v;
 }
 
+/* Number of invoke elements inside one remembered DSML block.  A block is
+ * only replayable into a message that carries exactly this many calls. */
+static int dsml_count_invokes(const char *dsml) {
+    int n = 0;
+    for (const char *p = dsml; (p = strstr(p, DS4_INVOKE_START)) != NULL;
+         p += strlen(DS4_INVOKE_START)) n++;
+    if (n > 0) return n;
+    for (const char *p = dsml; (p = strstr(p, DS4_INVOKE_START_SHORT)) != NULL;
+         p += strlen(DS4_INVOKE_START_SHORT)) n++;
+    return n;
+}
+
 static tool_memory_block *tool_memory_get_block_locked(tool_memory *m,
                                                        const char *dsml,
                                                        size_t len) {
@@ -7875,6 +7888,7 @@ static tool_memory_block *tool_memory_get_block_locked(tool_memory *m,
     b->dsml = xstrndup(dsml, len);
     b->len = len;
     b->bytes = len + 1 + sizeof(*b);
+    b->invokes = dsml_count_invokes(b->dsml);
     if (!raxInsert(m->by_block, (unsigned char *)b->dsml, b->len, b, NULL)) {
         free(b->dsml);
         free(b);
@@ -8209,7 +8223,14 @@ static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
             }
             if (source == TOOL_MEMORY_RAM) matched_source = TOOL_MEMORY_RAM;
         }
-        if (exact && matched) {
+        /* Replaying a block into a message that carries fewer calls than the
+         * block has invokes would duplicate the missing invokes into the
+         * rendered prompt (e.g. a client that splits one turn's parallel
+         * calls across two assistant messages).  Such messages fall back to
+         * canonical JSON rendering. */
+        const bool complete = matched &&
+            (matched->invokes <= 0 || matched->invokes == calls->len);
+        if (exact && matched && complete) {
             calls->raw_dsml = xstrdup(matched->dsml);
             if (stats) {
                 if (matched_source == TOOL_MEMORY_RAM) stats->mem++;
@@ -14114,6 +14135,73 @@ static void test_tool_memory_replays_sampled_dsml(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+static void test_tool_memory_attach_requires_all_block_invokes(void) {
+    const char *generated =
+        DS4_TOOL_CALLS_START "\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">pwd</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls sampled = {0};
+    TEST_ASSERT(parse_generated_message_ex(generated, false, &content, &reasoning, &sampled));
+    TEST_ASSERT(sampled.len == 2);
+
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.tool_mu, NULL);
+    assign_tool_call_ids(&s, &sampled, API_OPENAI);
+    tool_memory_remember(&s, &sampled);
+
+    /* A message replaying only one of the block's two calls must not attach
+     * the raw block: rendering it would duplicate the other invoke. */
+    chat_msgs partial = {0};
+    chat_msg one = {0};
+    one.role = xstrdup("assistant");
+    tool_call tc = {0};
+    tc.id = xstrdup(sampled.v[0].id);
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\":\"ls\"}");
+    tool_calls_push(&one.calls, tc);
+    chat_msgs_push(&partial, one);
+    tool_replay_stats stats = {0};
+    tool_memory_attach_to_messages(&s, &partial, &stats);
+    TEST_ASSERT(partial.v[0].calls.raw_dsml == NULL);
+    TEST_ASSERT(stats.canonical == 1);
+    TEST_ASSERT(stats.mem == 0);
+
+    /* A message carrying both calls attaches the block as before. */
+    chat_msgs full = {0};
+    chat_msg both = {0};
+    both.role = xstrdup("assistant");
+    for (int i = 0; i < 2; i++) {
+        tool_call c = {0};
+        c.id = xstrdup(sampled.v[i].id);
+        c.name = xstrdup("bash");
+        c.arguments = xstrdup("{}");
+        tool_calls_push(&both.calls, c);
+    }
+    chat_msgs_push(&full, both);
+    tool_replay_stats stats2 = {0};
+    tool_memory_attach_to_messages(&s, &full, &stats2);
+    TEST_ASSERT(full.v[0].calls.raw_dsml != NULL);
+    TEST_ASSERT(stats2.mem == 1);
+    TEST_ASSERT(stats2.canonical == 0);
+
+    chat_msgs_free(&partial);
+    chat_msgs_free(&full);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&sampled);
+    tool_memory_free(&s.tool_mem);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
 static void test_anthropic_tool_memory_replays_sampled_dsml(void) {
     const char *sampled_dsml =
         "\n\n" DS4_TOOL_CALLS_START "\n"
@@ -16112,6 +16200,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();
+    test_tool_memory_attach_requires_all_block_invokes();
     test_anthropic_tool_memory_replays_sampled_dsml();
     test_anthropic_live_tail_renders_tool_results_only();
     test_anthropic_tool_result_id_validation();
