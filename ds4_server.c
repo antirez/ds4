@@ -7724,6 +7724,9 @@ typedef struct {
     int live_tokens;
     char *visible_text;
     size_t visible_len;
+    /* True when this frontier ends in an assistant tool-call turn rather than
+     * a final answer; only used to label the cache hit source. */
+    bool tool_turn;
 } visible_live_state;
 
 static bool id_list_contains(const stop_list *ids, const char *id);
@@ -7743,6 +7746,7 @@ typedef struct {
     uint64_t cache_responses_tool_output;
     uint64_t cache_anthropic_tool_output;
     uint64_t cache_thinking_visible;
+    uint64_t cache_tool_visible;
     uint64_t cache_disk_text;
     uint64_t cache_cold;
     uint64_t prompt_tokens;
@@ -8025,6 +8029,7 @@ static void visible_live_clear_locked(visible_live_state *st) {
     st->visible_text = NULL;
     st->visible_len = 0;
     st->live_tokens = 0;
+    st->tool_turn = false;
     st->valid = false;
 }
 
@@ -8041,13 +8046,15 @@ static void thinking_live_clear(server *s) {
     pthread_mutex_unlock(&s->tool_mu);
 }
 
-static void thinking_live_remember(server *s, const char *visible_text) {
+static void thinking_live_remember(server *s, const char *visible_text,
+                                   bool tool_turn) {
     if (!s || !visible_text || !visible_text[0]) return;
     pthread_mutex_lock(&s->tool_mu);
     visible_live_clear_locked(&s->thinking_live);
     s->thinking_live.visible_text = xstrdup(visible_text);
     s->thinking_live.visible_len = strlen(visible_text);
     s->thinking_live.live_tokens = ds4_session_pos(s->session);
+    s->thinking_live.tool_turn = tool_turn;
     s->thinking_live.valid = true;
     pthread_mutex_unlock(&s->tool_mu);
 }
@@ -9907,7 +9914,7 @@ static void remember_thinking_checkpoint(server *s, const job *j, const char *ct
     char *visible = build_toolless_thinking_visible_text(&j->req, content);
     if (!visible) return;
 
-    thinking_live_remember(s, visible);
+    thinking_live_remember(s, visible, false);
     server_log(DS4_LOG_KVCACHE,
                "ds4-server: thinking live checkpoint remembered ctx=%s live=%d visible=%zu",
                ctx, ds4_session_pos(s->session), strlen(visible));
@@ -9915,6 +9922,38 @@ static void remember_thinking_checkpoint(server *s, const job *j, const char *ct
                 "thinking live checkpoint remembered: live=%d visible=%zu",
                 ds4_session_pos(s->session), strlen(visible));
     free(visible);
+}
+
+/* Chat/completions and Anthropic have no protocol object that binds the next
+ * request to this live tool-call frontier, and the sampled bytes (hidden
+ * reasoning, exact DSML spelling) never token-match the client's replay.  But
+ * the text the next request will render for this turn is predictable: it is
+ * the same prompt_text + suffix that canonicalize_tool_checkpoint() builds.
+ * Remember it as a visible key for the live frontier so the next request
+ * continues in memory instead of taking the evict-store + disk-restore round
+ * trip on every agent turn. */
+static void remember_tool_visible_checkpoint(server *s, const job *j,
+                                             const char *ctx, uint64_t trace_id,
+                                             const char *content,
+                                             const char *reasoning,
+                                             const tool_calls *calls) {
+    if (!j->req.prompt_text || !j->req.prompt_text[0]) {
+        thinking_live_clear(s);
+        return;
+    }
+    char *suffix = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
+    buf visible = {0};
+    buf_puts(&visible, j->req.prompt_text);
+    buf_puts(&visible, suffix ? suffix : "");
+    thinking_live_remember(s, visible.ptr ? visible.ptr : "", true);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: tool live checkpoint remembered ctx=%s live=%d visible=%zu",
+               ctx, ds4_session_pos(s->session), visible.len);
+    trace_event(s, trace_id,
+                "tool live checkpoint remembered: live=%d visible=%zu",
+                ds4_session_pos(s->session), visible.len);
+    buf_free(&visible);
+    free(suffix);
 }
 
 /* After a successful tool-call finish, make the live checkpoint match what the
@@ -10180,7 +10219,10 @@ static void generate_job(server *s, job *j) {
                                                 &effective_prompt);
         if (thinking_cached > 0) {
             cached = thinking_cached;
-            cache_source = "thinking-visible";
+            pthread_mutex_lock(&s->tool_mu);
+            cache_source = s->thinking_live.tool_turn ?
+                           "tool-visible" : "thinking-visible";
+            pthread_mutex_unlock(&s->tool_mu);
             thinking_live_continuation = true;
             prompt_for_sync = &effective_prompt;
         }
@@ -10247,6 +10289,7 @@ static void generate_job(server *s, job *j) {
     else if (!strcmp(cache_source, "responses-tool-output")) s->stats.cache_responses_tool_output++;
     else if (!strcmp(cache_source, "anthropic-tool-output")) s->stats.cache_anthropic_tool_output++;
     else if (!strcmp(cache_source, "thinking-visible")) s->stats.cache_thinking_visible++;
+    else if (!strcmp(cache_source, "tool-visible")) s->stats.cache_tool_visible++;
     else if (!strcmp(cache_source, "disk-text")) s->stats.cache_disk_text++;
     else s->stats.cache_cold++;
     s->stats.prompt_tokens += (uint64_t)prompt_tokens;
@@ -11075,7 +11118,15 @@ decode_again:
                                      parsed_reasoning, &parsed_calls);
         thinking_live_clear(s);
     } else if (parsed_calls.len) {
-        thinking_live_clear(s);
+        if (j->req.kind == REQ_CHAT && j->req.api != API_RESPONSES &&
+            !strcmp(final_finish, "tool_calls"))
+        {
+            remember_tool_visible_checkpoint(s, j, ctx_span, trace_id,
+                                             parsed_content ? parsed_content : "",
+                                             parsed_reasoning, &parsed_calls);
+        } else {
+            thinking_live_clear(s);
+        }
     } else if (!parsed_calls.len &&
                should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
         remember_thinking_checkpoint(s, j, ctx_span, trace_id,
@@ -11479,7 +11530,8 @@ static bool send_stats(server *s, int fd) {
                                 st.cache_responses_visible +
                                 st.cache_responses_tool_output +
                                 st.cache_anthropic_tool_output +
-                                st.cache_thinking_visible + st.cache_disk_text;
+                                st.cache_thinking_visible +
+                                st.cache_tool_visible + st.cache_disk_text;
     buf b = {0};
     buf_printf(&b,
         "{\"uptime_s\":%.0f,"
@@ -11506,6 +11558,7 @@ static bool send_stats(server *s, int fd) {
             "\"responses_tool_output\":%llu,"
             "\"anthropic_tool_output\":%llu,"
             "\"thinking_visible\":%llu,"
+            "\"tool_visible\":%llu,"
             "\"disk_text\":%llu}}\n",
         now_sec() - s->started_at,
         busy ? "true" : "false",
@@ -11530,6 +11583,7 @@ static bool send_stats(server *s, int fd) {
         (unsigned long long)st.cache_responses_tool_output,
         (unsigned long long)st.cache_anthropic_tool_output,
         (unsigned long long)st.cache_thinking_visible,
+        (unsigned long long)st.cache_tool_visible,
         (unsigned long long)st.cache_disk_text);
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
