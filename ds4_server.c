@@ -22,6 +22,7 @@
 #include <limits.h>
 #include <math.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -2751,7 +2752,26 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                     goto bad;
                 }
                 tool_choice_none = !strcmp(choice, "none");
+                /* Like the Responses parser: "required" and forced function
+                 * targets need constrained decoding we don't implement, so
+                 * reject instead of silently downgrading to auto. */
+                if (!tool_choice_none && strcmp(choice, "auto") != 0) {
+                    snprintf(err, errlen, "tool_choice=%s not supported", choice);
+                    free(choice);
+                    free(key);
+                    chat_msgs_free(&msgs);
+                    free(tool_schemas);
+                    request_free(r);
+                    return false;
+                }
                 free(choice);
+            } else if (*p == '{') {
+                snprintf(err, errlen, "forced tool_choice not supported");
+                free(key);
+                chat_msgs_free(&msgs);
+                free(tool_schemas);
+                request_free(r);
+                return false;
             } else if (!json_skip_value(&p)) {
                 free(key);
                 goto bad;
@@ -4234,6 +4254,18 @@ static bool send_all(int fd, const void *p, size_t n) {
     return true;
 }
 
+/* True when the client socket is closed or reset.  A live but idle client
+ * reports EAGAIN; stray unread bytes count as alive.  Never consumes data, so
+ * it is safe to call at any point of the request lifecycle. */
+static bool client_socket_gone(int fd) {
+    if (fd < 0) return true;
+    char b;
+    ssize_t n = recv(fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n > 0) return false;
+    if (n == 0) return true;
+    return !(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR);
+}
+
 static void json_escape(buf *b, const char *s) {
     buf_putc(b, '"');
     for (; *s; s++) {
@@ -4564,7 +4596,11 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
     }
 
     size_t content_len = trim_tool_separator_ws(text, 0, (size_t)(start - text));
-    const char *raw_block_start = start;
+    /* Capture the raw block from the trimmed-content boundary, not from the
+     * marker match: any whitespace separator the model sampled between the
+     * content and the block lives in the KV cache, so byte-exact replay must
+     * include it even when it is not the canonical "\n\n". */
+    const char *raw_block_start = text + content_len;
     const char *tool_calls_start = DS4_TOOL_CALLS_START;
     const char *tool_calls_end = DS4_TOOL_CALLS_END;
     const char *invoke_start = DS4_INVOKE_START;
@@ -4869,7 +4905,9 @@ static bool http_response(int fd, bool enable_cors, int code, const char *type, 
                          code == 400 ? "Bad Request" :
                          code == 404 ? "Not Found" :
                          code == 409 ? "Conflict" :
-                         code == 500 ? "Internal Server Error" : "Error";
+                         code == 429 ? "Too Many Requests" :
+                         code == 500 ? "Internal Server Error" :
+                         code == 503 ? "Service Unavailable" : "Error";
     const size_t body_len = body ? strlen(body) : 0;
     buf h = {0};
     buf_printf(&h,
@@ -4893,7 +4931,28 @@ static bool http_error(int fd, bool enable_cors, int code, const char *msg) {
     buf b = {0};
     buf_puts(&b, "{\"error\":{\"message\":");
     json_escape(&b, msg);
-    buf_puts(&b, ",\"type\":\"invalid_request_error\"}}\n");
+    buf_puts(&b, ",\"type\":\"");
+    buf_puts(&b, code >= 500 ? "api_error" :
+                 code == 429 ? "rate_limit_error" : "invalid_request_error");
+    buf_puts(&b, "\"}}\n");
+    bool ok = http_response(fd, enable_cors, code, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+/* Anthropic SDKs classify errors by the {"type":"error","error":{...}}
+ * envelope; give /v1/messages clients that shape instead of the OpenAI one. */
+static bool http_error_api(int fd, bool enable_cors, int code, const char *msg,
+                           api_style api) {
+    if (api != API_ANTHROPIC) return http_error(fd, enable_cors, code, msg);
+    buf b = {0};
+    buf_puts(&b, "{\"type\":\"error\",\"error\":{\"type\":\"");
+    buf_puts(&b, code >= 500 ? "api_error" :
+                 code == 429 ? "rate_limit_error" :
+                 code == 529 ? "overloaded_error" : "invalid_request_error");
+    buf_puts(&b, "\",\"message\":");
+    json_escape(&b, msg);
+    buf_puts(&b, "}}\n");
     bool ok = http_response(fd, enable_cors, code, "application/json", b.ptr);
     buf_free(&b);
     return ok;
@@ -7743,6 +7802,7 @@ typedef struct {
     size_t len;
     size_t bytes;
     int refs;
+    int invokes;
     uint64_t seen;
     tool_memory_entry *entries;
 } tool_memory_block;
@@ -7797,10 +7857,37 @@ typedef struct {
     int live_tokens;
     char *visible_text;
     size_t visible_len;
+    /* True when this frontier ends in an assistant tool-call turn rather than
+     * a final answer; only used to label the cache hit source. */
+    bool tool_turn;
 } visible_live_state;
 
 static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
+
+/* Operational counters for GET /stats.  Guarded by server.mu; every field is
+ * cheap to maintain because it piggybacks on decisions the request path
+ * already makes. */
+typedef struct {
+    uint64_t requests;
+    uint64_t queue_rejected;
+    uint64_t queue_dropped_disconnected;
+    uint64_t prefill_cancelled;
+    uint64_t cache_memory_token;
+    uint64_t cache_memory_text;
+    uint64_t cache_responses_visible;
+    uint64_t cache_responses_tool_output;
+    uint64_t cache_anthropic_tool_output;
+    uint64_t cache_thinking_visible;
+    uint64_t cache_tool_visible;
+    uint64_t cache_disk_text;
+    uint64_t cache_cold;
+    uint64_t prompt_tokens;
+    uint64_t cached_tokens;
+    uint64_t generated_tokens;
+    double last_prefill_tps;
+    double last_decode_tps;
+} server_stats;
 
 struct server {
     ds4_engine *engine;
@@ -7822,6 +7909,11 @@ struct server {
     job *tail;
     bool stopping;
     int clients;
+    int queue_depth;
+    int max_queue;
+    bool busy;
+    double started_at;
+    server_stats stats;
     uint64_t seq;
     FILE *trace;
     pthread_mutex_t trace_mu;
@@ -7915,6 +8007,18 @@ static tool_memory_block *tool_memory_find_block_locked(tool_memory *m,
     return v == raxNotFound ? NULL : v;
 }
 
+/* Number of invoke elements inside one remembered DSML block.  A block is
+ * only replayable into a message that carries exactly this many calls. */
+static int dsml_count_invokes(const char *dsml) {
+    int n = 0;
+    for (const char *p = dsml; (p = strstr(p, DS4_INVOKE_START)) != NULL;
+         p += strlen(DS4_INVOKE_START)) n++;
+    if (n > 0) return n;
+    for (const char *p = dsml; (p = strstr(p, DS4_INVOKE_START_SHORT)) != NULL;
+         p += strlen(DS4_INVOKE_START_SHORT)) n++;
+    return n;
+}
+
 static tool_memory_block *tool_memory_get_block_locked(tool_memory *m,
                                                        const char *dsml,
                                                        size_t len) {
@@ -7926,6 +8030,7 @@ static tool_memory_block *tool_memory_get_block_locked(tool_memory *m,
     b->dsml = xstrndup(dsml, len);
     b->len = len;
     b->bytes = len + 1 + sizeof(*b);
+    b->invokes = dsml_count_invokes(b->dsml);
     if (!raxInsert(m->by_block, (unsigned char *)b->dsml, b->len, b, NULL)) {
         free(b->dsml);
         free(b);
@@ -8058,6 +8163,7 @@ static void visible_live_clear_locked(visible_live_state *st) {
     st->visible_text = NULL;
     st->visible_len = 0;
     st->live_tokens = 0;
+    st->tool_turn = false;
     st->valid = false;
 }
 
@@ -8074,13 +8180,15 @@ static void thinking_live_clear(server *s) {
     pthread_mutex_unlock(&s->tool_mu);
 }
 
-static void thinking_live_remember(server *s, const char *visible_text) {
+static void thinking_live_remember(server *s, const char *visible_text,
+                                   bool tool_turn) {
     if (!s || !visible_text || !visible_text[0]) return;
     pthread_mutex_lock(&s->tool_mu);
     visible_live_clear_locked(&s->thinking_live);
     s->thinking_live.visible_text = xstrdup(visible_text);
     s->thinking_live.visible_len = strlen(visible_text);
     s->thinking_live.live_tokens = ds4_session_pos(s->session);
+    s->thinking_live.tool_turn = tool_turn;
     s->thinking_live.valid = true;
     pthread_mutex_unlock(&s->tool_mu);
 }
@@ -8260,7 +8368,14 @@ static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
             }
             if (source == TOOL_MEMORY_RAM) matched_source = TOOL_MEMORY_RAM;
         }
-        if (exact && matched) {
+        /* Replaying a block into a message that carries fewer calls than the
+         * block has invokes would duplicate the missing invokes into the
+         * rendered prompt (e.g. a client that splits one turn's parallel
+         * calls across two assistant messages).  Such messages fall back to
+         * canonical JSON rendering. */
+        const bool complete = matched &&
+            (matched->invokes <= 0 || matched->invokes == calls->len);
+        if (exact && matched && complete) {
             calls->raw_dsml = xstrdup(matched->dsml);
             if (stats) {
                 if (matched_source == TOOL_MEMORY_RAM) stats->mem++;
@@ -8645,6 +8760,23 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
     stop_list wanted = {0};
     collect_tool_call_ids(msgs, &wanted);
     if (wanted.len == 0) return;
+    /* Agent requests replay every historical tool-call id on every turn.
+     * tool_memory_remember() already holds them in RAM, so only scan the
+     * cache directory for ids that are actually missing (the common case is
+     * none, except right after a server restart). */
+    int missing = 0;
+    for (int i = 0; i < wanted.len; i++) {
+        if (tool_memory_has_id(s, wanted.v[i])) {
+            free(wanted.v[i]);
+        } else {
+            wanted.v[missing++] = wanted.v[i];
+        }
+    }
+    wanted.len = missing;
+    if (wanted.len == 0) {
+        id_list_free(&wanted);
+        return;
+    }
     /* Tool replay payloads are stored next to KV checkpoints; keep them model
      * scoped too, since token positions and graph state are not portable across
      * Flash/Pro shapes even when the rendered chat text is identical. */
@@ -8917,9 +9049,11 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
                                   ds4_tokens *effective_prompt,
                                   char **loaded_path_out,
                                   uint8_t *loaded_ext_flags_out,
+                                  bool *loaded_consumed_out,
                                   bool responses_protocol) {
     if (loaded_path_out) *loaded_path_out = NULL;
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+    if (loaded_consumed_out) *loaded_consumed_out = false;
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, s->session,
@@ -8928,6 +9062,7 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
     if (loaded > 0) {
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
+        if (loaded_consumed_out) *loaded_consumed_out = lr.consumed;
     }
     ds4_kvstore_load_result_free(&lr);
     return loaded;
@@ -8936,11 +9071,13 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
 static int kv_cache_try_load(server *s, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
-                             uint8_t *loaded_ext_flags_out) {
+                             uint8_t *loaded_ext_flags_out,
+                             bool *loaded_consumed_out) {
     return kv_cache_try_load_text(s, req ? req->prompt_text : NULL,
                                   effective_prompt,
                                   loaded_path_out,
                                   loaded_ext_flags_out,
+                                  loaded_consumed_out,
                                   req && req->api == API_RESPONSES);
 }
 
@@ -9434,6 +9571,21 @@ typedef struct {
     bool stream_failed;
     double last_keepalive;
 } server_prefill_progress;
+
+/* Cooperative prefill cancellation: ds4_session_sync() polls this at chunk
+ * boundaries and stops with a valid token prefix.  Cancels on shutdown, on a
+ * failed SSE keepalive write, and on a disconnected client socket, so a gone
+ * client cannot burn minutes of prefill for a response nobody will read. */
+static bool server_sync_cancel_cb(void *ud) {
+    server_prefill_progress *p = ud;
+    if (g_stop_requested) return true;
+    if (p->stream_failed) return true;
+    if (client_socket_gone(p->fd)) {
+        p->stream_failed = true;
+        return true;
+    }
+    return false;
+}
 
 static void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
     int suffix = prompt - cached;
@@ -10019,7 +10171,7 @@ static void send_prefill_failure_response(server *s, const job *j,
         }
         return;
     }
-    http_error(j->fd, s->enable_cors, 500, err);
+    http_error_api(j->fd, s->enable_cors, 500, err, j->req.api);
 }
 
 static char *build_tool_checkpoint_suffix(const request *r, const char *content,
@@ -10099,7 +10251,7 @@ static void remember_thinking_checkpoint(server *s, const job *j, const char *ct
     char *visible = build_toolless_thinking_visible_text(&j->req, content);
     if (!visible) return;
 
-    thinking_live_remember(s, visible);
+    thinking_live_remember(s, visible, false);
     server_log(DS4_LOG_KVCACHE,
                "ds4-server: thinking live checkpoint remembered ctx=%s live=%d visible=%zu",
                ctx, ds4_session_pos(s->session), strlen(visible));
@@ -10107,6 +10259,38 @@ static void remember_thinking_checkpoint(server *s, const job *j, const char *ct
                 "thinking live checkpoint remembered: live=%d visible=%zu",
                 ds4_session_pos(s->session), strlen(visible));
     free(visible);
+}
+
+/* Chat/completions and Anthropic have no protocol object that binds the next
+ * request to this live tool-call frontier, and the sampled bytes (hidden
+ * reasoning, exact DSML spelling) never token-match the client's replay.  But
+ * the text the next request will render for this turn is predictable: it is
+ * the same prompt_text + suffix that canonicalize_tool_checkpoint() builds.
+ * Remember it as a visible key for the live frontier so the next request
+ * continues in memory instead of taking the evict-store + disk-restore round
+ * trip on every agent turn. */
+static void remember_tool_visible_checkpoint(server *s, const job *j,
+                                             const char *ctx, uint64_t trace_id,
+                                             const char *content,
+                                             const char *reasoning,
+                                             const tool_calls *calls) {
+    if (!j->req.prompt_text || !j->req.prompt_text[0]) {
+        thinking_live_clear(s);
+        return;
+    }
+    char *suffix = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
+    buf visible = {0};
+    buf_puts(&visible, j->req.prompt_text);
+    buf_puts(&visible, suffix ? suffix : "");
+    thinking_live_remember(s, visible.ptr ? visible.ptr : "", true);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: tool live checkpoint remembered ctx=%s live=%d visible=%zu",
+               ctx, ds4_session_pos(s->session), visible.len);
+    trace_event(s, trace_id,
+                "tool live checkpoint remembered: live=%d visible=%zu",
+                ds4_session_pos(s->session), visible.len);
+    buf_free(&visible);
+    free(suffix);
 }
 
 /* After a successful tool-call finish, make the live checkpoint match what the
@@ -10168,9 +10352,11 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
          * live raw-window ring.  Prefer an older disk checkpoint over replaying
          * a very long conversation from token zero. */
         char *path = NULL;
+        bool path_consumed = false;
         ds4_tokens effective = {0};
         int loaded = kv_cache_try_load_text(s, rendered.ptr ? rendered.ptr : "",
-                                            &effective, &path, NULL, false);
+                                            &effective, &path, NULL,
+                                            &path_consumed, false);
         if (loaded == 0) ds4_session_invalidate(s->session);
 
         char sync_err[160] = {0};
@@ -10219,9 +10405,12 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
         snprintf(rebuild_progress.ctx, sizeof(rebuild_progress.ctx), "%s", rebuild_ctx);
         ds4_session_set_progress(s->session, server_progress_cb, &rebuild_progress);
         ds4_session_set_display_progress(s->session, server_progress_cb, &rebuild_progress);
+        ds4_session_set_cancel(s->session, server_sync_cancel_cb, &rebuild_progress);
         if (ds4_session_sync(s->session, sync_prompt, sync_err, sizeof(sync_err)) == 0) {
+            ds4_session_set_cancel(s->session, NULL, NULL);
             ds4_session_set_progress(s->session, NULL, NULL);
             ds4_session_set_display_progress(s->session, NULL, NULL);
+            if (path_consumed && path) unlink(path);
             const double rebuild_sec = now_sec() - rebuild_t0;
             if (loaded > 0) {
                 server_log(DS4_LOG_KVCACHE,
@@ -10239,6 +10428,7 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
                             common, live_len, canonical.len, err);
             }
         } else {
+            ds4_session_set_cancel(s->session, NULL, NULL);
             ds4_session_set_progress(s->session, NULL, NULL);
             ds4_session_set_display_progress(s->session, NULL, NULL);
             server_log(DS4_LOG_KVCACHE,
@@ -10353,8 +10543,9 @@ static void generate_job(server *s, job *j) {
                j->req.anthropic_requires_live_tool_state)
     {
         ds4_tokens_free(&effective_prompt);
-        http_error(j->fd, s->enable_cors, 409,
-                   "Anthropic continuation state is not available; retry by replaying the full messages history");
+        http_error_api(j->fd, s->enable_cors, 409,
+                       "Anthropic continuation state is not available; retry by replaying the full messages history",
+                       API_ANTHROPIC);
         return;
     } else if (cached == 0) {
         cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
@@ -10366,13 +10557,17 @@ static void generate_job(server *s, job *j) {
                                                 &effective_prompt);
         if (thinking_cached > 0) {
             cached = thinking_cached;
-            cache_source = "thinking-visible";
+            pthread_mutex_lock(&s->tool_mu);
+            cache_source = s->thinking_live.tool_turn ?
+                           "tool-visible" : "thinking-visible";
+            pthread_mutex_unlock(&s->tool_mu);
             thinking_live_continuation = true;
             prompt_for_sync = &effective_prompt;
         }
     }
     int disk_cached = 0;
     char *disk_cache_path = NULL;
+    bool disk_cache_consume = false;
     uint8_t disk_cache_ext_flags = 0;
     if (cached == 0) {
         int text_cached = live_text_prefix_prompt(s, &j->req, &effective_prompt);
@@ -10399,12 +10594,20 @@ static void generate_job(server *s, job *j) {
     if (cached == 0) {
         disk_cached = kv_cache_try_load(s, &j->req, &effective_prompt,
                                         &disk_cache_path,
-                                        &disk_cache_ext_flags);
+                                        &disk_cache_ext_flags,
+                                        &disk_cache_consume);
         if (disk_cached > 0) {
             cached = disk_cached;
             cache_source = "disk-text";
             prompt_for_sync = &effective_prompt;
         }
+    }
+    /* Restart the continued-store cadence from the continuation point, so the
+     * threshold-crossing rule measures the step from where this prefill
+     * actually resumes instead of firing a near-duplicate store on the first
+     * chunk after a hit. */
+    if (cached > 0 && s->kv.continued_last_store_tokens < cached) {
+        s->kv.continued_last_store_tokens = cached;
     }
     const bool responses_reasoning_state_preserved =
         cached > 0 &&
@@ -10417,6 +10620,19 @@ static void generate_job(server *s, job *j) {
         j->req.responses_requires_live_reasoning &&
         !responses_reasoning_state_preserved;
     const int prompt_tokens = prompt_for_sync->len;
+    pthread_mutex_lock(&s->mu);
+    if (!strcmp(cache_source, "memory-token")) s->stats.cache_memory_token++;
+    else if (!strcmp(cache_source, "memory-text")) s->stats.cache_memory_text++;
+    else if (!strcmp(cache_source, "responses-visible")) s->stats.cache_responses_visible++;
+    else if (!strcmp(cache_source, "responses-tool-output")) s->stats.cache_responses_tool_output++;
+    else if (!strcmp(cache_source, "anthropic-tool-output")) s->stats.cache_anthropic_tool_output++;
+    else if (!strcmp(cache_source, "thinking-visible")) s->stats.cache_thinking_visible++;
+    else if (!strcmp(cache_source, "tool-visible")) s->stats.cache_tool_visible++;
+    else if (!strcmp(cache_source, "disk-text")) s->stats.cache_disk_text++;
+    else s->stats.cache_cold++;
+    s->stats.prompt_tokens += (uint64_t)prompt_tokens;
+    s->stats.cached_tokens += (uint64_t)(cached > 0 ? cached : 0);
+    pthread_mutex_unlock(&s->mu);
     /* OpenAI usage details: the reusable prefix is a cache read, while the
      * effective prompt suffix evaluated by ds4_session_sync() is written into
      * the live KV cache and can be reused by the next request. */
@@ -10489,6 +10705,7 @@ static void generate_job(server *s, job *j) {
     ds4_session_set_progress(s->session, server_progress_cb, &progress);
     ds4_session_set_display_progress(s->session, server_progress_cb, &progress);
     server_apply_prefill_directional_steering(s);
+    ds4_session_set_cancel(s->session, server_sync_cancel_cb, &progress);
 
     int cold_store_len = 0;
     if (cached == 0 &&
@@ -10521,17 +10738,31 @@ static void generate_job(server *s, job *j) {
     {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        if (ds4_session_sync(s->session, &prefix, err, sizeof(err)) != 0) {
+        int sync_rc = ds4_session_sync(s->session, &prefix, err, sizeof(err));
+        if (sync_rc != 0) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
+            ds4_session_set_cancel(s->session, NULL, NULL);
             ds4_session_set_progress(s->session, NULL, NULL);
             ds4_session_set_display_progress(s->session, NULL, NULL);
             kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                                   cold_store_len);
-            kv_cache_discard_failed_disk_entry(s, disk_cache_path);
+            if (sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+                /* Cancelled (shutdown or client gone): the session keeps a
+                 * valid prefix and the disk entry is still good. */
+                pthread_mutex_lock(&s->mu);
+                s->stats.prefill_cancelled++;
+                pthread_mutex_unlock(&s->mu);
+                server_log(DS4_LOG_PREFILL,
+                           "ds4-server: prefill cancelled ctx=%s reason=%s",
+                           ctx_span, g_stop_requested ? "shutdown" : "client-gone");
+                trace_event(s, trace_id, "prefill cancelled");
+            } else {
+                kv_cache_discard_failed_disk_entry(s, disk_cache_path);
+                trace_event(s, trace_id, "prefill failed: %s", err);
+                send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+            }
             free(disk_cache_path);
-            trace_event(s, trace_id, "prefill failed: %s", err);
-            send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
             return;
         }
         if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
@@ -10545,34 +10776,58 @@ static void generate_job(server *s, job *j) {
         ds4_tokens_free(&prefix);
     }
 
-    if (ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err)) != 0) {
+    int prompt_sync_rc = ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err));
+    if (prompt_sync_rc != 0) {
         ds4_tokens_free(&effective_prompt);
+        ds4_session_set_cancel(s->session, NULL, NULL);
         ds4_session_set_progress(s->session, NULL, NULL);
         ds4_session_set_display_progress(s->session, NULL, NULL);
         kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                               cold_store_len);
-        kv_cache_discard_failed_disk_entry(s, disk_cache_path);
+        if (prompt_sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+            pthread_mutex_lock(&s->mu);
+            s->stats.prefill_cancelled++;
+            pthread_mutex_unlock(&s->mu);
+            server_log(DS4_LOG_PREFILL,
+                       "ds4-server: prefill cancelled ctx=%s reason=%s",
+                       ctx_span, g_stop_requested ? "shutdown" : "client-gone");
+            trace_event(s, trace_id, "prefill cancelled");
+        } else {
+            kv_cache_discard_failed_disk_entry(s, disk_cache_path);
+            trace_event(s, trace_id, "prefill failed: %s", err);
+            send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+        }
         free(disk_cache_path);
-        trace_event(s, trace_id, "prefill failed: %s", err);
-        send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
         return;
     }
+    /* The prefill extended past this snapshot, so its deferred consume-unlink
+     * is now safe: the live state supersedes it and the next store persists a
+     * longer prefix.  Keeping it until here means a cancelled or failed tail
+     * prefill can still hit it on retry. */
+    if (disk_cache_consume && disk_cache_path) unlink(disk_cache_path);
     free(disk_cache_path);
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
      * a binding only when this request explicitly continued from it. */
     if (!responses_live_continuation) responses_live_clear(s);
     if (!anthropic_live_continuation) anthropic_live_clear(s);
     if (!thinking_live_continuation) thinking_live_clear(s);
+    ds4_session_set_cancel(s->session, NULL, NULL);
     ds4_session_set_progress(s->session, NULL, NULL);
     ds4_session_set_display_progress(s->session, NULL, NULL);
     kv_cache_maybe_store_continued(s);
+    const double prefill_sec = now_sec() - t0;
+    if (prompt_tokens > cached && prefill_sec > 0.0) {
+        pthread_mutex_lock(&s->mu);
+        s->stats.last_prefill_tps = (double)(prompt_tokens - cached) / prefill_sec;
+        pthread_mutex_unlock(&s->mu);
+    }
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
                ctx_span,
                req_flags[0] ? " " : "",
                req_flags,
-               now_sec() - t0);
+               prefill_sec);
     if (cold_store_len == prompt_for_sync->len) {
         if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
             kv_cache_note_store(&s->kv, cold_store_len);
@@ -10680,6 +10935,18 @@ decode_again:
     size_t think_recovery_scan_from = 0;
     const bool think_tool_recovery_enabled =
         getenv("DS4_SERVER_DISABLE_THINK_TOOL_RECOVERY") == NULL;
+    if (ds4_think_mode_enabled(j->req.think_mode) &&
+        (j->req.temperature != DS4_DEFAULT_TEMPERATURE ||
+         j->req.top_p != DS4_DEFAULT_TOP_P ||
+         j->req.min_p != DS4_DEFAULT_MIN_P ||
+         j->req.top_k != 0))
+    {
+        /* Same behavior as the official DeepSeek API, but say so once instead
+         * of silently ignoring the request's sampling parameters. */
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: thinking mode ignores request sampling params "
+                   "(temperature/top_p/top_k/min_p); using defaults");
+    }
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
     decode_repetition_guard repeat_guard = {0};
@@ -10694,6 +10961,14 @@ decode_again:
 
     while (!g_stop_requested && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
+        /* Streaming clients reveal a disconnect through failed SSE writes;
+         * non-streaming clients write nothing until the end, so poll the
+         * socket instead of decoding minutes of output for a dead peer. */
+        if (!j->req.stream && client_socket_gone(j->fd)) {
+            snprintf(err, sizeof(err), "client disconnected");
+            finish = "error";
+            break;
+        }
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
@@ -11291,7 +11566,15 @@ decode_again:
                                      parsed_reasoning, &parsed_calls);
         thinking_live_clear(s);
     } else if (parsed_calls.len) {
-        thinking_live_clear(s);
+        if (j->req.kind == REQ_CHAT && j->req.api != API_RESPONSES &&
+            !strcmp(final_finish, "tool_calls"))
+        {
+            remember_tool_visible_checkpoint(s, j, ctx_span, trace_id,
+                                             parsed_content ? parsed_content : "",
+                                             parsed_reasoning, &parsed_calls);
+        } else {
+            thinking_live_clear(s);
+        }
     } else if (!parsed_calls.len &&
                should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
         remember_thinking_checkpoint(s, j, ctx_span, trace_id,
@@ -11360,6 +11643,15 @@ decode_again:
                        parsed_reasoning,
                        &parsed_calls, final_finish,
                        prompt_tokens, completion);
+    }
+    {
+        const double decode_sec = now_sec() - decode_t0;
+        pthread_mutex_lock(&s->mu);
+        s->stats.generated_tokens += (uint64_t)completion;
+        if (completion > 0 && decode_sec > 0.0) {
+            s->stats.last_decode_tps = (double)completion / decode_sec;
+        }
+        pthread_mutex_unlock(&s->mu);
     }
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
@@ -11431,17 +11723,32 @@ decode_again:
     decode_repetition_guard_free(&repeat_guard);
 }
 
-static bool enqueue(server *s, job *j) {
+enum { ENQUEUE_OK = 0, ENQUEUE_STOPPING, ENQUEUE_FULL };
+
+static int enqueue(server *s, job *j) {
     pthread_mutex_lock(&s->mu);
     if (s->stopping) {
         pthread_mutex_unlock(&s->mu);
-        return false;
+        return ENQUEUE_STOPPING;
+    }
+    if (s->max_queue > 0 && s->queue_depth >= s->max_queue) {
+        s->stats.queue_rejected++;
+        pthread_mutex_unlock(&s->mu);
+        return ENQUEUE_FULL;
     }
     if (s->tail) s->tail->next = j; else s->head = j;
     s->tail = j;
+    s->queue_depth++;
+    const int waiting = s->queue_depth;
+    const bool busy = s->busy;
     pthread_cond_signal(&s->cv);
     pthread_mutex_unlock(&s->mu);
-    return true;
+    if (waiting > 1 || busy) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: request queued behind %d job(s)%s",
+                   waiting - 1, busy ? " (worker busy)" : "");
+    }
+    return ENQUEUE_OK;
 }
 
 static job *dequeue(server *s) {
@@ -11454,6 +11761,7 @@ static job *dequeue(server *s) {
     job *j = s->head;
     s->head = j->next;
     if (!s->head) s->tail = NULL;
+    if (s->queue_depth > 0) s->queue_depth--;
     pthread_mutex_unlock(&s->mu);
     j->next = NULL;
     return j;
@@ -11464,7 +11772,25 @@ static void *worker_main(void *arg) {
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;
-        generate_job(s, j);
+        if (client_socket_gone(j->fd)) {
+            /* The client gave up while this request sat in the queue (agent
+             * timeout + retry is the common case).  Skip it instead of
+             * spending minutes of prefill and decode on a dead socket. */
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: dropping queued request: client disconnected");
+            pthread_mutex_lock(&s->mu);
+            s->stats.queue_dropped_disconnected++;
+            pthread_mutex_unlock(&s->mu);
+        } else {
+            pthread_mutex_lock(&s->mu);
+            s->busy = true;
+            s->stats.requests++;
+            pthread_mutex_unlock(&s->mu);
+            generate_job(s, j);
+            pthread_mutex_lock(&s->mu);
+            s->busy = false;
+            pthread_mutex_unlock(&s->mu);
+        }
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -11512,11 +11838,39 @@ static long content_length(const char *h, size_t n) {
     return 0;
 }
 
-static bool read_http_request(int fd, http_request *r) {
+/* True when the header block contains `name` and its value contains `value`
+ * (both case-insensitive). */
+static bool header_value_contains(const char *h, size_t n,
+                                  const char *name, const char *value) {
+    const size_t name_len = strlen(name);
+    const char *p = h, *end = h + n;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len > name_len && strncasecmp(line, name, name_len) == 0 &&
+            line[name_len] == ':')
+        {
+            char v[128];
+            size_t vlen = len - name_len - 1;
+            if (vlen >= sizeof(v)) vlen = sizeof(v) - 1;
+            memcpy(v, line + name_len + 1, vlen);
+            v[vlen] = '\0';
+            for (size_t k = 0; v[k]; k++) v[k] = (char)tolower((unsigned char)v[k]);
+            return strstr(v, value) != NULL;
+        }
+        if (p < end) p++;
+    }
+    return false;
+}
+
+static bool read_http_request(int fd, http_request *r, const char **errmsg) {
     buf b = {0};
     ssize_t hend = -1;
     const size_t max_header = 64 * 1024;
     const size_t max_body = 64 * 1024 * 1024;
+    if (errmsg) *errmsg = "bad HTTP request";
 
     while (hend < 0 && b.len < max_header) {
         char tmp[4096];
@@ -11538,6 +11892,19 @@ static bool read_http_request(int fd, http_request *r) {
     if (sscanf(line, "%7s %255s", r->method, r->path) != 2) goto fail;
     char *q = strchr(r->path, '?');
     if (q) *q = '\0';
+
+    if (header_value_contains(b.ptr, (size_t)hend, "Transfer-Encoding", "chunked")) {
+        /* Chunked bodies used to be silently read as Content-Length: 0 and
+         * fail JSON parsing with a misleading error. */
+        if (errmsg) *errmsg = "chunked transfer encoding is not supported; send Content-Length";
+        goto fail;
+    }
+    if (header_value_contains(b.ptr, (size_t)hend, "Expect", "100-continue")) {
+        /* curl-style clients wait up to a second for this interim response
+         * before sending a large POST body. */
+        static const char cont[] = "HTTP/1.1 100 Continue\r\n\r\n";
+        if (!send_all(fd, cont, sizeof(cont) - 1)) goto fail;
+    }
 
     long clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
@@ -11630,6 +11997,89 @@ static bool send_models(server *s, int fd) {
     return ok;
 }
 
+/* Both handlers run on the client thread, so they answer immediately even
+ * while the worker is deep inside a multi-minute prefill. */
+static bool send_health(server *s, int fd) {
+    buf b = {0};
+    buf_puts(&b, "{\"status\":\"ok\",\"model\":");
+    json_escape(&b, ds4_engine_model_name(s->engine));
+    buf_printf(&b, ",\"uptime_s\":%.0f}\n", now_sec() - s->started_at);
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool send_stats(server *s, int fd) {
+    pthread_mutex_lock(&s->mu);
+    server_stats st = s->stats;
+    const int queue_depth = s->queue_depth;
+    const bool busy = s->busy;
+    const int clients = s->clients;
+    pthread_mutex_unlock(&s->mu);
+    const uint64_t cache_hits = st.cache_memory_token + st.cache_memory_text +
+                                st.cache_responses_visible +
+                                st.cache_responses_tool_output +
+                                st.cache_anthropic_tool_output +
+                                st.cache_thinking_visible +
+                                st.cache_tool_visible + st.cache_disk_text;
+    buf b = {0};
+    buf_printf(&b,
+        "{\"uptime_s\":%.0f,"
+        "\"busy\":%s,"
+        "\"queue_depth\":%d,"
+        "\"clients\":%d,"
+        "\"live_tokens\":%d,"
+        "\"ctx_size\":%d,"
+        "\"requests\":%llu,"
+        "\"queue_rejected\":%llu,"
+        "\"queue_dropped_disconnected\":%llu,"
+        "\"prefill_cancelled\":%llu,"
+        "\"prompt_tokens\":%llu,"
+        "\"cached_tokens\":%llu,"
+        "\"generated_tokens\":%llu,"
+        "\"last_prefill_tps\":%.2f,"
+        "\"last_decode_tps\":%.2f,"
+        "\"cache\":{"
+            "\"hits\":%llu,"
+            "\"cold\":%llu,"
+            "\"memory_token\":%llu,"
+            "\"memory_text\":%llu,"
+            "\"responses_visible\":%llu,"
+            "\"responses_tool_output\":%llu,"
+            "\"anthropic_tool_output\":%llu,"
+            "\"thinking_visible\":%llu,"
+            "\"tool_visible\":%llu,"
+            "\"disk_text\":%llu}}\n",
+        now_sec() - s->started_at,
+        busy ? "true" : "false",
+        queue_depth,
+        clients,
+        ds4_session_pos(s->session),
+        ds4_session_ctx(s->session),
+        (unsigned long long)st.requests,
+        (unsigned long long)st.queue_rejected,
+        (unsigned long long)st.queue_dropped_disconnected,
+        (unsigned long long)st.prefill_cancelled,
+        (unsigned long long)st.prompt_tokens,
+        (unsigned long long)st.cached_tokens,
+        (unsigned long long)st.generated_tokens,
+        st.last_prefill_tps,
+        st.last_decode_tps,
+        (unsigned long long)cache_hits,
+        (unsigned long long)st.cache_cold,
+        (unsigned long long)st.cache_memory_token,
+        (unsigned long long)st.cache_memory_text,
+        (unsigned long long)st.cache_responses_visible,
+        (unsigned long long)st.cache_responses_tool_output,
+        (unsigned long long)st.cache_anthropic_tool_output,
+        (unsigned long long)st.cache_thinking_visible,
+        (unsigned long long)st.cache_tool_visible,
+        (unsigned long long)st.cache_disk_text);
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
 static void client_done(server *s) {
     pthread_mutex_lock(&s->mu);
     if (s->clients > 0) s->clients--;
@@ -11646,8 +12096,9 @@ static void *client_main(void *arg) {
     free(ca);
 
     http_request hr = {0};
-    if (!read_http_request(fd, &hr)) {
-        http_error(fd, s->enable_cors, 400, "bad HTTP request");
+    const char *read_err = NULL;
+    if (!read_http_request(fd, &hr, &read_err)) {
+        http_error(fd, s->enable_cors, 400, read_err ? read_err : "bad HTTP request");
         goto done;
     }
 
@@ -11659,6 +12110,20 @@ static void *client_main(void *arg) {
 
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") &&
+        (!strcmp(hr.path, "/health") || !strcmp(hr.path, "/v1/health")))
+    {
+        send_health(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") &&
+        (!strcmp(hr.path, "/stats") || !strcmp(hr.path, "/v1/stats")))
+    {
+        send_stats(s, fd);
         http_request_free(&hr);
         goto done;
     }
@@ -11705,10 +12170,12 @@ static void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
+    const bool anthropic_endpoint = !strcmp(hr.path, "/v1/messages");
     if (ok) req.raw_body = xstrndup(hr.body, hr.body_len);
     http_request_free(&hr);
     if (!ok) {
-        http_error(fd, s->enable_cors, 400, err);
+        http_error_api(fd, s->enable_cors, 400, err,
+                       anthropic_endpoint ? API_ANTHROPIC : API_OPENAI);
         goto done;
     }
     if (!req.model_from_request) {
@@ -11738,9 +12205,15 @@ static void *client_main(void *arg) {
     pthread_cond_init(&j.cv, NULL);
 
     pthread_mutex_lock(&j.mu);
-    if (!enqueue(s, &j)) {
+    const int enq = enqueue(s, &j);
+    if (enq != ENQUEUE_OK) {
         pthread_mutex_unlock(&j.mu);
-        http_error(fd, s->enable_cors, 503, "server shutting down");
+        if (enq == ENQUEUE_FULL) {
+            http_error_api(fd, s->enable_cors, 429,
+                           "server request queue is full; retry later", j.req.api);
+        } else {
+            http_error_api(fd, s->enable_cors, 503, "server shutting down", j.req.api);
+        }
         pthread_cond_destroy(&j.cv);
         pthread_mutex_destroy(&j.mu);
         request_free(&j.req);
@@ -11791,6 +12264,10 @@ static void configure_client_socket(int fd) {
     tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    /* Per-token SSE writes are tiny; without this Nagle adds latency jitter
+     * whenever the client is not on loopback. */
+    int yes = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
 }
 
 static void set_client_socket_nonblocking(int fd) {
@@ -11817,6 +12294,7 @@ typedef struct {
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
+    int max_queue;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -12012,6 +12490,8 @@ static server_config parse_options(int argc, char **argv) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
+        } else if (!strcmp(arg, "--max-queue")) {
+            c.max_queue = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-dir")) {
@@ -12182,6 +12662,8 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.max_queue = cfg.max_queue;
+    s.started_at = now_sec();
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
@@ -14326,6 +14808,102 @@ static void test_seeded_tool_ids_are_deterministic(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+static void test_tool_memory_attach_requires_all_block_invokes(void) {
+    const char *generated =
+        DS4_TOOL_CALLS_START "\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">pwd</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls sampled = {0};
+    TEST_ASSERT(parse_generated_message_ex(generated, false, &content, &reasoning, &sampled));
+    TEST_ASSERT(sampled.len == 2);
+
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.tool_mu, NULL);
+    assign_tool_call_ids(&s, NULL, &sampled, API_OPENAI);
+    tool_memory_remember(&s, &sampled);
+
+    /* A message replaying only one of the block's two calls must not attach
+     * the raw block: rendering it would duplicate the other invoke. */
+    chat_msgs partial = {0};
+    chat_msg one = {0};
+    one.role = xstrdup("assistant");
+    tool_call tc = {0};
+    tc.id = xstrdup(sampled.v[0].id);
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\":\"ls\"}");
+    tool_calls_push(&one.calls, tc);
+    chat_msgs_push(&partial, one);
+    tool_replay_stats stats = {0};
+    tool_memory_attach_to_messages(&s, &partial, &stats);
+    TEST_ASSERT(partial.v[0].calls.raw_dsml == NULL);
+    TEST_ASSERT(stats.canonical == 1);
+    TEST_ASSERT(stats.mem == 0);
+
+    /* A message carrying both calls attaches the block as before. */
+    chat_msgs full = {0};
+    chat_msg both = {0};
+    both.role = xstrdup("assistant");
+    for (int i = 0; i < 2; i++) {
+        tool_call c = {0};
+        c.id = xstrdup(sampled.v[i].id);
+        c.name = xstrdup("bash");
+        c.arguments = xstrdup("{}");
+        tool_calls_push(&both.calls, c);
+    }
+    chat_msgs_push(&full, both);
+    tool_replay_stats stats2 = {0};
+    tool_memory_attach_to_messages(&s, &full, &stats2);
+    TEST_ASSERT(full.v[0].calls.raw_dsml != NULL);
+    TEST_ASSERT(stats2.mem == 1);
+    TEST_ASSERT(stats2.canonical == 0);
+
+    chat_msgs_free(&partial);
+    chat_msgs_free(&full);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&sampled);
+    tool_memory_free(&s.tool_mem);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
+static void test_raw_dsml_capture_keeps_sampled_separator(void) {
+    /* A single-newline separator is not the canonical "\n\n", but the model
+     * sampled it, so byte-exact replay must include it in the raw block. */
+    const char *generated =
+        "done\n"
+        DS4_TOOL_CALLS_START "\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        DS4_TOOL_CALLS_END;
+
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex(generated, false, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(content && !strcmp(content, "done"));
+    TEST_ASSERT(calls.raw_dsml != NULL);
+    TEST_ASSERT(calls.raw_dsml[0] == '\n');
+    TEST_ASSERT(!strncmp(calls.raw_dsml + 1, DS4_TOOL_CALLS_START,
+                         strlen(DS4_TOOL_CALLS_START)));
+    /* content + raw block must reassemble the sampled bytes exactly. */
+    TEST_ASSERT(strlen(content) + strlen(calls.raw_dsml) == strlen(generated));
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
 static void test_anthropic_tool_memory_replays_sampled_dsml(void) {
     const char *sampled_dsml =
         "\n\n" DS4_TOOL_CALLS_START "\n"
@@ -15561,7 +16139,7 @@ static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
     ds4_tokens_free(&prompt);
 }
 
-static void test_kv_cache_continued_uses_aligned_frontiers(void) {
+static void test_kv_cache_continued_uses_step_thresholds(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
     kc.opt = kv_cache_default_options();
@@ -15569,11 +16147,16 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 10239) == 0);
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 10240);
 
+    /* A full step must pass since the last store, from wherever it was. */
     kc.continued_last_store_tokens = 4096;
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 10240);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 14336) == 14336);
 
+    /* Unaligned resume positions (disk hits) get waypoints too. */
     kc.continued_last_store_tokens = 24576;
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30720) == 30720);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30720) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 34816) == 34816);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 45374) == 45374);
 
     kc.continued_last_store_tokens = 10240;
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 18432) == 0);
@@ -15582,7 +16165,7 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kc.opt.boundary_align_tokens = 0;
     kc.continued_last_store_tokens = 20480;
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 29999) == 0);
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000) == 30000);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30480) == 30480);
 }
 
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
@@ -16002,6 +16585,47 @@ static void test_kv_cache_eviction_prefers_anchor_reason(void) {
     rmdir(dir);
 }
 
+static void test_kv_cache_eviction_evicts_stale_anchor_before_fresh_waypoint(void) {
+    /* Observed in production: the newest continued waypoints of the live
+     * conversation (hits=0 because they were written minutes ago) were
+     * evicted while stale never-hit anchors survived on the reason bonus.
+     * A stale anchor must lose to a fresh waypoint of equal density. */
+    char tmpl[] = "/tmp/ds4-kv-stale-anchor-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *anchor_sha = "1111111111111111111111111111111111111111";
+    const char *waypoint_sha = "2222222222222222222222222222222222222222";
+    uint64_t now = (uint64_t)time(NULL);
+    uint64_t stale = now - 30u * 24u * 3600u;
+    test_kv_stub_file(dir, anchor_sha, KV_REASON_COLD, 2048, 0, stale, 2048);
+    test_kv_stub_file(dir, waypoint_sha, KV_REASON_CONTINUED, 2048, 0, now, 2048);
+
+    char anchor_name[44], waypoint_name[44];
+    snprintf(anchor_name, sizeof(anchor_name), "%.40s.kv", anchor_sha);
+    snprintf(waypoint_name, sizeof(waypoint_name), "%.40s.kv", waypoint_sha);
+    char *anchor_path = path_join(dir, anchor_name);
+    char *waypoint_path = path_join(dir, waypoint_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
+    kv_cache_evict(&kc, NULL, 0, NULL);
+
+    TEST_ASSERT(access(anchor_path, F_OK) != 0);
+    TEST_ASSERT(access(waypoint_path, F_OK) == 0);
+
+    kv_cache_close(&kc);
+    unlink(anchor_path);
+    unlink(waypoint_path);
+    free(anchor_path);
+    free(waypoint_path);
+    rmdir(dir);
+}
+
 static void test_kv_cache_eviction_makes_room_before_store(void) {
     char tmpl[] = "/tmp/ds4-kv-pre-store-evict-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -16173,9 +16797,10 @@ static void test_kv_cache_eviction_score_decays_stale_hits(void) {
     double f_on = kv_entry_eviction_score(&fresh, NULL, now, NULL);
     TEST_ASSERT(s_on < f_on);
 
-    /* A fresh entry's score never decays below its (0+1) * tokens/size floor,
-     * regardless of how old another entry's hit history is. */
-    TEST_ASSERT(f_on == 1.0 * (double)fresh.tokens / (double)fresh.file_size);
+    /* A fresh never-hit entry gets the freshness grace: it scores like a
+     * once-hit file, (1+1) * tokens/size, and never below the (0+1) floor. */
+    TEST_ASSERT(f_on == 2.0 * (double)fresh.tokens / (double)fresh.file_size);
+    TEST_ASSERT(f_on >= 1.0 * (double)fresh.tokens / (double)fresh.file_size);
 }
 
 static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
@@ -16565,6 +17190,8 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();
     test_seeded_tool_ids_are_deterministic();
+    test_tool_memory_attach_requires_all_block_invokes();
+    test_raw_dsml_capture_keeps_sampled_separator();
     test_anthropic_tool_memory_replays_sampled_dsml();
     test_anthropic_live_tail_renders_tool_results_only();
     test_anthropic_tool_result_id_validation();
@@ -16605,7 +17232,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_store_len_uses_configured_boundary();
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
-    test_kv_cache_continued_uses_aligned_frontiers();
+    test_kv_cache_continued_uses_step_thresholds();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
@@ -16614,6 +17241,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_lookup_rejects_stale_payload_abi();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_prefers_anchor_reason();
+    test_kv_cache_eviction_evicts_stale_anchor_before_fresh_waypoint();
     test_kv_cache_eviction_makes_room_before_store();
     test_kv_cache_eviction_ignores_oversize_incoming();
     test_kv_cache_eviction_prefers_superseded_continued_prefix();
