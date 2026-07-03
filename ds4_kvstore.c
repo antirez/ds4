@@ -545,10 +545,29 @@ double ds4_kvstore_entry_eviction_score(
         effective_hits *= exp2(-elapsed / (double)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
         if (effective_hits < KV_CACHE_MIN_EFFECTIVE_HITS) effective_hits = 0.0;
     }
+    /* Freshness grace: a just-written file has had no chance to be hit yet,
+     * so score it like a once-hit file and let the grace decay on the same
+     * half-life.  Without it, the newest waypoints of the live conversation
+     * are always the first eviction victims while stale never-hit files
+     * survive on age alone. */
+    double freshness = 0.0;
+    if (used_at) {
+        freshness = now > used_at ?
+            exp2(-(double)(now - used_at) /
+                 (double)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS) : 1.0;
+        if (freshness < KV_CACHE_MIN_EFFECTIVE_HITS) freshness = 0.0;
+    }
+    if (effective_hits < freshness) effective_hits = freshness;
     double score = (effective_hits + 1.0) *
                    (double)e->tokens / (double)e->file_size;
-    if (kv_cache_reason_is_anchor(e->reason))
-        score *= KV_CACHE_ANCHOR_REASON_SCORE_FACTOR;
+    if (kv_cache_reason_is_anchor(e->reason)) {
+        /* The anchor bonus exists so restart/eviction recovery points stay
+         * around, but a never-hit anchor that has aged past the half-life is
+         * not anyone's recovery point anymore — let it compete on density
+         * alone instead of outliving the live conversation's waypoints. */
+        double activity = effective_hits > 1.0 ? 1.0 : effective_hits;
+        score *= 1.0 + (KV_CACHE_ANCHOR_REASON_SCORE_FACTOR - 1.0) * activity;
+    }
     if (kv_cache_incoming_supersedes_continued(e, incoming)) {
         double h = effective_hits > 0.0 ?
             effective_hits / (effective_hits + 1.0) : 0.0;
@@ -742,8 +761,12 @@ int ds4_kvstore_continued_store_target(const ds4_kvstore *kc, int live_tokens) {
     const int step = kv_cache_continued_step(kc);
     if (step <= 0) return 0;
     if (live_tokens < kc->opt.min_tokens) return 0;
-    if (live_tokens % step != 0) return 0;
-    if (live_tokens <= kc->continued_last_store_tokens) return 0;
+    /* Threshold-crossing rather than exact-multiple: prefills resumed from an
+     * unaligned cached position (disk hits, live text continuations) never
+     * land on multiples of the step, which used to leave arbitrarily large
+     * gaps between waypoint snapshots.  Storing the current prefix at any
+     * position is safe; evict stores already do it. */
+    if (live_tokens < kc->continued_last_store_tokens + step) return 0;
     return live_tokens;
 }
 
@@ -1320,7 +1343,12 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         const char *key_kind = ds4_kvstore_key_kind(hdr.ext_flags);
         bool consumed = false;
         if (kc->opt.cold_max_tokens > 0 && loaded > kc->opt.cold_max_tokens) {
-            unlink(path);
+            /* This entry is superseded once the caller extends the restored
+             * state, but unlinking it here would lose the only recoverable
+             * copy if the tail prefill then fails or is cancelled.  Report it
+             * as consumed and let the caller unlink after the extension
+             * succeeds; without a result struct nobody could, so delete. */
+            if (!result) unlink(path);
             consumed = true;
             kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                     "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms consumed file=%s",
