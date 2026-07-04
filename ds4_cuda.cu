@@ -18,6 +18,25 @@
 #include <unordered_map>
 #include <vector>
 
+/* CUDA < 12.2 lacks the cudaMemLocation overloads of cudaMemAdvise() and
+ * cudaMemPrefetchAsync(). Forward to the legacy int-device signatures. */
+#if CUDART_VERSION < 12020
+static inline cudaError_t cudaMemAdvise(const void *ptr, size_t count,
+                                        cudaMemoryAdvise advice,
+                                        cudaMemLocation loc) {
+    int dev = loc.type == cudaMemLocationTypeDevice ? loc.id : cudaCpuDeviceId;
+    return cudaMemAdvise(ptr, count, advice, dev);
+}
+static inline cudaError_t cudaMemPrefetchAsync(const void *ptr, size_t count,
+                                               cudaMemLocation loc,
+                                               unsigned int flags,
+                                               cudaStream_t stream) {
+    (void)flags;
+    int dev = loc.type == cudaMemLocationTypeDevice ? loc.id : cudaCpuDeviceId;
+    return cudaMemPrefetchAsync(ptr, count, dev, stream);
+}
+#endif
+
 #include "ds4_gpu.h"
 
 #ifndef M_PI
