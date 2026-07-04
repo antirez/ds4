@@ -14342,10 +14342,15 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_load(
         uint64_t                  gate_expert_bytes,
         uint64_t                  down_expert_bytes) {
 #if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    /* n_tokens == 1 must also take the selected load. The MTP verifier can
+     * issue single-position ffn batch encodes; skipping the selected load
+     * there falls through to resident full-expert ranges, which cannot fit
+     * in device memory under SSD streaming (observed as ~1.8 GiB arena
+     * allocation failures followed by "MTP verifier failed"). */
     if (!metal_graph_decode_cuda_selected_slots_expected(g, layer) ||
         !model ||
         !g->batch_router_selected ||
-        n_tokens <= 1 ||
+        n_tokens == 0 ||
         DS4_N_EXPERT == 0 ||
         DS4_N_EXPERT_USED == 0 ||
         getenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_LOAD") != NULL) {
