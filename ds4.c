@@ -2445,6 +2445,69 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
     }
 }
 
+/* Env-gated: wire the mmap ranges of every non-routed-expert tensor so macOS
+ * cannot page them out under memory pressure. Routed experts still stream
+ * from the SSD-backed cache as usual. Requires DS4_MLOCK_NONROUTED=1. Large
+ * lock ranges typically need root (mlock user limits are tiny by default). */
+static bool tensor_name_is_routed_expert(ds4_str name) {
+    static const char *needles[] = {
+        ".ffn_gate_exps.", ".ffn_up_exps.", ".ffn_down_exps.",
+    };
+    for (size_t i = 0; i < sizeof(needles) / sizeof(needles[0]); i++) {
+        const char *needle = needles[i];
+        size_t nlen = strlen(needle);
+        if (name.len < nlen) continue;
+        for (uint64_t j = 0; j + nlen <= name.len; j++) {
+            if (memcmp(name.ptr + j, needle, nlen) == 0) return true;
+        }
+    }
+    return false;
+}
+
+static void model_mlock_nonrouted(const ds4_model *m) {
+    const char *env = getenv("DS4_MLOCK_NONROUTED");
+    if (!env || env[0] == '\0' || env[0] == '0') return;
+
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) page_size = 16384;
+
+    uint64_t requested = 0, locked = 0, failed = 0, skipped = 0;
+    int last_errno = 0;
+
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (tensor_name_is_routed_expert(t->name)) { skipped += t->bytes; continue; }
+        if (t->bytes == 0) continue;
+        if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) continue;
+
+        uint64_t start = t->abs_offset;
+        uint64_t end   = t->abs_offset + t->bytes;
+        uint64_t pstart = start & ~((uint64_t)page_size - 1);
+        uint64_t pend   = (end + (uint64_t)page_size - 1) & ~((uint64_t)page_size - 1);
+        if (pend > m->size) pend = m->size;
+        uint64_t len = pend - pstart;
+        requested += len;
+        if (mlock((const uint8_t *)m->map + pstart, (size_t)len) == 0) {
+            locked += len;
+        } else {
+            failed += len;
+            last_errno = errno;
+        }
+    }
+
+    const double gib = 1024.0 * 1024.0 * 1024.0;
+    fprintf(stderr,
+        "ds4: mlock non-routed weights: locked %.2f GiB, failed %.2f GiB, "
+        "skipped routed %.2f GiB\n",
+        (double)locked / gib, (double)failed / gib, (double)skipped / gib);
+    if (failed && last_errno) {
+        fprintf(stderr, "ds4: mlock error (last): %s (try running with sudo, "
+                        "or raise the wired-memory limit)\n",
+                        strerror(last_errno));
+    }
+    (void)requested;
+}
+
 /* Open and map the GGUF once.  Metal needs a shared mapping for no-copy
  * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress.
  * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
@@ -2495,6 +2558,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     parse_tensors(m, &c);
 
     if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
+    if (metal_mapping) model_mlock_nonrouted(m);
 }
 
 static void print_size(uint64_t bytes) {
