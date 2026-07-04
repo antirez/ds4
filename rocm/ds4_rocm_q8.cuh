@@ -295,7 +295,7 @@ __global__ static void shared_gate_up_swiglu_q8_0_pair_preq_warp8_kernel(
             sg = fminf(sg, clamp);
             su = fminf(fmaxf(su, -clamp), clamp);
         }
-        mid[row] = (sg / (1.0f + expf(-sg))) * su;
+        mid[row] = (dev_silu_stable(sg)) * su;
     }
 }
 
@@ -602,7 +602,7 @@ __global__ static void shared_gate_up_swiglu_q8_0_batch_sharedx_w32_kernel(
                     gate[off] = g;
                     up[off] = uv;
                 }
-                mid[off] = (g / (1.0f + expf(-g))) * uv;
+                mid[off] = (dev_silu_stable(g)) * uv;
             }
         }
     }
@@ -991,7 +991,7 @@ __global__ static void shared_gate_up_swiglu_q8_0_rows_w32_kernel(
             sg = fminf(sg, clamp);
             su = fminf(fmaxf(su, -clamp), clamp);
         }
-        mid[row] = (sg / (1.0f + expf(-sg))) * su;
+        mid[row] = (dev_silu_stable(sg)) * su;
     }
 }
 

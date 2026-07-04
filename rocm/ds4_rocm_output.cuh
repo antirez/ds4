@@ -29,7 +29,7 @@ __global__ static void swiglu_kernel(float *out, const float *gate, const float 
         g = fminf(g, clamp);
         u = fminf(fmaxf(u, -clamp), clamp);
     }
-    float s = g / (1.0f + expf(-g));
+    float s = dev_silu_stable(g);
     out[i] = s * u * weight;
 }
 

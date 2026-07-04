@@ -584,7 +584,7 @@ __global__ static DS4_ROCM_UNUSED void moe_gate_up_mid_kernel(
         const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
         gate_out[off] = gate;
         up_out[off] = up;
-        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        mid_out[off] = (dev_silu_stable(gate)) * up * weights[(uint64_t)tok * n_expert + slot];
     }
 }
 
@@ -633,7 +633,7 @@ __global__ static DS4_ROCM_UNUSED void moe_gate_up_mid_warp8_kernel(
         const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
         gate_out[off] = gate;
         up_out[off] = up;
-        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        mid_out[off] = (dev_silu_stable(gate)) * up * weights[(uint64_t)tok * n_expert + slot];
     }
 }
 
@@ -681,7 +681,7 @@ __global__ static DS4_ROCM_UNUSED void moe_gate_up_mid_hwarp16_kernel(
         const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
         gate_out[off] = gate;
         up_out[off] = up;
-        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        mid_out[off] = (dev_silu_stable(gate)) * up * weights[(uint64_t)tok * n_expert + slot];
     }
 }
 
@@ -733,7 +733,7 @@ __global__ static void moe_gate_up_mid_qwarp32_kernel(
             const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
             gate_out[off] = gate;
             up_out[off] = up;
-            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+            mid_out[off] = (dev_silu_stable(gate)) * up * weights[(uint64_t)tok * n_expert + slot];
         }
     }
 }
@@ -788,7 +788,7 @@ __global__ static void moe_gate_up_mid_qwarp32_ptrs_kernel(
             const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
             gate_out[off] = gate;
             up_out[off] = up;
-            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+            mid_out[off] = (dev_silu_stable(gate)) * up * weights[(uint64_t)tok * n_expert + slot];
         }
     }
 }
@@ -846,7 +846,7 @@ __global__ static void moe_gate_up_mid_qwarp32_ptrs_split_kernel(
             const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
             gate_out[off] = gate;
             up_out[off] = up;
-            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+            mid_out[off] = (dev_silu_stable(gate)) * up * weights[(uint64_t)tok * n_expert + slot];
         }
     }
 }
@@ -912,7 +912,7 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
                 gate_out[off] = gate;
                 up_out[off] = up;
             }
-            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+            mid_out[off] = (dev_silu_stable(gate)) * up * weights[(uint64_t)tok * n_expert + slot];
         }
     }
 }
@@ -980,7 +980,7 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_ptrs_kernel(
                 gate_out[off] = gate;
                 up_out[off] = up;
             }
-            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+            mid_out[off] = (dev_silu_stable(gate)) * up * weights[(uint64_t)tok * n_expert + slot];
         }
     }
 }
@@ -1126,7 +1126,7 @@ __global__ static void moe_gate_up_mid_sorted_qwarp32_kernel(
         const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
         gate_out[off] = gate;
         up_out[off] = up;
-        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        mid_out[off] = (dev_silu_stable(gate)) * up * weights[(uint64_t)tok * n_expert + slot];
     }
 }
 
@@ -1187,7 +1187,7 @@ __global__ static DS4_ROCM_UNUSED void moe_gate_up_mid_expert_tile8_kernel(
             const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
             gate_out[off] = gate;
             up_out[off] = up;
-            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+            mid_out[off] = (dev_silu_stable(gate)) * up * weights[(uint64_t)tok * n_expert + slot];
         }
     }
 }
@@ -1270,7 +1270,7 @@ __global__ static void moe_gate_up_mid_expert_tile4_row32_kernel(
                 gate_out[off] = gate[p];
                 up_out[off] = up[p];
             }
-            mid_out[off] = (gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
+            mid_out[off] = (dev_silu_stable(gate[p])) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
         }
     }
 }
@@ -1363,7 +1363,7 @@ __global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
                 gate_out[off] = gate[p];
                 up_out[off] = up[p];
             }
-            mid_out[off] = (gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
+            mid_out[off] = (dev_silu_stable(gate[p])) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
         }
     }
 }
@@ -1458,7 +1458,7 @@ __global__ static void moe_gate_up_mid_expert_tile8_row2048_kernel(
                     gate_out[off] = gate[p];
                     up_out[off] = up[p];
                 }
-                mid_out[off] = (gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
+                mid_out[off] = (dev_silu_stable(gate[p])) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
             }
         }
     }
@@ -1555,7 +1555,7 @@ __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
                     gate_out[off] = gate[p];
                     up_out[off] = up[p];
                 }
-                mid_out[off] = (gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
+                mid_out[off] = (dev_silu_stable(gate[p])) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
             }
         }
     }
@@ -1609,7 +1609,7 @@ __global__ static void moe_gate_up_mid_sorted_p2_qwarp32_kernel(
         const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
         gate_out[off] = gate;
         up_out[off] = up;
-        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        mid_out[off] = (dev_silu_stable(gate)) * up * weights[(uint64_t)tok * n_expert + slot];
     }
 }
 
@@ -1658,7 +1658,7 @@ __global__ static void moe_gate_up_mid_q4K_sorted_qwarp32_kernel(
         const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
         gate_out[off] = gate;
         up_out[off] = up;
-        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        mid_out[off] = (dev_silu_stable(gate)) * up * weights[(uint64_t)tok * n_expert + slot];
     }
 }
 
@@ -1740,7 +1740,7 @@ __global__ static void moe_gate_up_mid_q4K_expert_tile4_row32_kernel(
                 gate_out[off] = gate[p];
                 up_out[off] = up[p];
             }
-            mid_out[off] = (gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
+            mid_out[off] = (dev_silu_stable(gate[p])) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
         }
     }
 }
@@ -1827,7 +1827,7 @@ __global__ static void moe_gate_up_mid_q4K_expert_tile8_row32_kernel(
                 gate_out[off] = gate[p];
                 up_out[off] = up[p];
             }
-            mid_out[off] = (gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
+            mid_out[off] = (dev_silu_stable(gate[p])) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
         }
     }
 }
@@ -1991,7 +1991,7 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
                 gate_out[off] = gate;
                 up_out[off] = up;
             }
-            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+            mid_out[off] = (dev_silu_stable(gate)) * up * weights[(uint64_t)tok * n_expert + slot];
         }
     }
 }
@@ -2051,7 +2051,7 @@ __global__ static void moe_gate_up_mid_q2K_decode_q8_qwarp32_kernel(
                 gate_out[off] = gate;
                 up_out[off] = up;
             }
-            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+            mid_out[off] = (dev_silu_stable(gate)) * up * weights[(uint64_t)tok * n_expert + slot];
         }
     }
 }
@@ -3089,7 +3089,7 @@ __device__ __forceinline__ static void q2_K_dequant_dual_pair_tile_half_rowwise(
 }
 
 __device__ __forceinline__ static float moe_silu_oldhip(float x) {
-    return x * (1.0f / (1.0f + expf(-x)));
+    return dev_silu_stable(x);
 }
 
 __global__ __launch_bounds__(32) static void moe_gate_up_mid_q2K_rows_rpb1_w32_kernel(
@@ -4168,7 +4168,7 @@ __global__ static void moe_gate_up_mid_f32_kernel(
         const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
         gate_out[off] = gate;
         up_out[off] = up;
-        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        mid_out[off] = (dev_silu_stable(gate)) * up * weights[(uint64_t)tok * n_expert + slot];
     }
 }
 
@@ -4228,7 +4228,7 @@ __global__ static void moe_gate_up_mid_q2K_f32_kernel(
         const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
         gate_out[off] = gate;
         up_out[off] = up;
-        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        mid_out[off] = (dev_silu_stable(gate)) * up * weights[(uint64_t)tok * n_expert + slot];
     }
 }
 

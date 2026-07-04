@@ -8,6 +8,19 @@ __global__ static void fill_f32_kernel(float *x, uint64_t n, float v) {
     if (i < n) x[i] = v;
 }
 
+/* Numerically stable sigmoid/SiLU matching the CPU reference (ds4.c
+ * sigmoid_stable/silu). The naive gate/(1+expf(-gate)) overflows for large
+ * negative gate: expf(-gate) -> +inf makes it -inf/inf = NaN, which the CPU
+ * path avoids. Use these everywhere the ROCm MoE/FFN applies SiLU. */
+__device__ __forceinline__ static float dev_sigmoid_stable(float x) {
+    if (x >= 0.0f) return 1.0f / (1.0f + expf(-x));
+    const float e = expf(x);
+    return e / (1.0f + e);
+}
+__device__ __forceinline__ static float dev_silu_stable(float x) {
+    return x * dev_sigmoid_stable(x);
+}
+
 __global__ static void embed_token_hc_kernel(float *out, const unsigned short *w, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t n = n_embd * n_hc;
