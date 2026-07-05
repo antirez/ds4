@@ -157,6 +157,17 @@ static void test_cpu_stream_fetch(void) {
     printf("cpu-stream fetch/install: OK\n");
 }
 
+/* Concurrency stress test for cpu_stream_fetch(): spawns worker threads that
+ * fetch experts under the same layer sequence, the way routed_moe_tokens_worker
+ * does on the token-parallel decode path. Same reasoning as above: the scenario
+ * lives in ds4.c behind the ds4_cpu_stream_parallel_self_test() hook since
+ * g_cpu_stream and the mutex guarding it are static there. */
+static void test_cpu_stream_parallel(void) {
+    extern int ds4_cpu_stream_parallel_self_test(void);
+    TEST_ASSERT(ds4_cpu_stream_parallel_self_test() == 1);
+    printf("cpu-stream concurrent fetch stress: OK\n");
+}
+
 static uint16_t test_float_to_f16(float f) {
     union {
         float f;
@@ -2225,6 +2236,7 @@ static const ds4_test_entry test_entries[] = {
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
     {"--cpu-stream-cache", "cpu-stream-cache", "CPU streaming expert cache policy unit test", test_cpu_stream_cache_policy},
     {"--cpu-stream-fetch", "cpu-stream-fetch", "CPU streaming pread/install unit test", test_cpu_stream_fetch},
+    {"--cpu-stream-parallel", "cpu-stream-parallel", "CPU streaming concurrent fetch stress test", test_cpu_stream_parallel},
 };
 
 static void test_print_help(const char *prog) {
