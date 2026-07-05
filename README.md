@@ -41,7 +41,7 @@ That said, a few important things about this project:
 * This software is developed with **strong assistance from GPT 5.5** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
 * This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache is actually a first-class disk citizen**. Fast SSD disks also changed the inference game from the point of view of "model needs to fit RAM": while having more RAM the the model size is still preferred, SSD streaming allows to turn the available amount of RAM from a hard cutoff (can I run this model or not?) to continuous spectrum of speed levels.
 * Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. D) Purpose built agents for specific models and execution environments. DwarfStar only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is beta quality code, so probably we are not still there, especially since recently we introduced large new features: distributed inference, SSD streaming, and other minor improvements.
-* The optimized graph path targets **Metal on macOS** and **CUDA on Linux**. The CPU path is only for correctness checks and model/tokenizer diagnostics. For CPU-only Linux builds, use `make cpu`; it builds the normal `./ds4` and `./ds4-server` binaries without CUDA or Metal. On macOS, **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. It was not possible to fix the CPU inference to avoid crashing, since each time you have to restart the computer, which is not funny. Help us, if you have the guts.
+* The optimized graph path targets **Metal on macOS** and **CUDA on Linux**. The CPU path is only for correctness checks and model/tokenizer diagnostics. For CPU-only Linux builds, use `make cpu`; it builds the normal `./ds4` and `./ds4-server` binaries without CUDA or Metal. On macOS, **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. It was not possible to fix the CPU inference to avoid crashing, since each time you have to restart the computer, which is not funny. Help us, if you have the guts. Update: the CPU backend can now run safely on macOS with `--ssd-streaming`: routed experts are pread() into a bounded cache instead of being faulted through the huge mmap, which keeps the kernel out of the pathological VM regime. This does not make the CPU path fast, it makes it safe to use for correctness checks and diagnostics. Example: `./ds4 --cpu --ssd-streaming -m ds4flash.gguf`.
 
 ## Acknowledgements to llama.cpp and GGML
 
@@ -214,6 +214,15 @@ it takes 80% of the Metal recommended working set, subtracts non-routed weights,
 then uses the rest for routed experts. Leave the hot expert preload enabled for
 normal use; use `--ssd-streaming-cold` and `--ssd-streaming-preload-experts N`
 only for measurements.
+
+`--ssd-streaming` also works with `--cpu`. It is the supported way to run the
+CPU backend on macOS (see the warning above): routed experts are pread() from
+the GGUF into a bounded cache instead of being faulted through the mmap.
+`--ssd-streaming-cache-experts N|NGB` applies as above; with no explicit cache
+size, the CPU backend defaults to 25% of physical RAM, floored so a full layer
+of experts always fits. `--ssd-streaming-preload-experts` is ignored on the
+CPU backend (a warning is printed) since the cache is filled on demand rather
+than pre-seeded.
 
 ### Practical SSD streaming examples
 
@@ -1203,7 +1212,8 @@ make cpu
 Do not treat the CPU path as the production target. The CLI and `ds4-server`
 support the CPU backend for reference/debug use and share the same KV session
 and snapshot format as Metal and CUDA, but normal inference should use Metal or
-CUDA.
+CUDA. On macOS, the CPU backend requires `--ssd-streaming` to avoid the kernel
+VM issue described above.
 
 ## Steering
 
