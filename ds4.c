@@ -5565,16 +5565,16 @@ typedef struct {
     uint64_t hits, misses, evictions, pread_bytes;  /* stats for the summary log */
 } cpu_stream_state;
 
-cpu_stream_state g_cpu_stream;
+static cpu_stream_state g_cpu_stream;
 
-uint64_t cpu_stream_triple_bytes(uint32_t il) {
+static uint64_t cpu_stream_triple_bytes(uint32_t il) {
     return g_cpu_stream.expert_bytes[CPU_STREAM_GATE][il] +
            g_cpu_stream.expert_bytes[CPU_STREAM_UP][il] +
            g_cpu_stream.expert_bytes[CPU_STREAM_DOWN][il];
 }
 
 /* Victim: lowest use_count, oldest last_used as tie-break; skip pinned. */
-uint32_t cpu_stream_pick_victim(void) {
+static uint32_t cpu_stream_pick_victim(void) {
     const uint64_t total = (uint64_t)DS4_MAX_LAYER * g_cpu_stream.n_experts;
     uint32_t victim = UINT32_MAX;
     for (uint64_t i = 0; i < total; i++) {
@@ -5591,7 +5591,7 @@ uint32_t cpu_stream_pick_victim(void) {
     return victim;
 }
 
-bool cpu_stream_evict_one(void) {
+static bool cpu_stream_evict_one(void) {
     const uint32_t victim = cpu_stream_pick_victim();
     if (victim == UINT32_MAX) return false;
     cpu_stream_entry *en = &g_cpu_stream.entries[victim];
@@ -5603,8 +5603,71 @@ bool cpu_stream_evict_one(void) {
     return true;
 }
 
-void cpu_stream_layer_begin(void) {
+static void cpu_stream_layer_begin(void) {
     if (g_cpu_stream.enabled) g_cpu_stream.seq++;
+}
+
+/* Self-test hook for the cache policy, callable from ds4_test (which links
+ * against ds4.o and cannot see the statics above). Returns 1 on pass. */
+int ds4_cpu_stream_policy_self_test(void) {
+#define CPU_STREAM_CHECK(x) \
+    do { if (!(x)) { fprintf(stderr, "cpu-stream self-test failed: %s\n", #x); return 0; } } while (0)
+
+    memset(&g_cpu_stream, 0, sizeof(g_cpu_stream));
+    g_cpu_stream.enabled = true;
+    g_cpu_stream.n_experts = 4;
+    g_cpu_stream.entries = calloc((size_t)DS4_MAX_LAYER * 4, sizeof(cpu_stream_entry));
+    CPU_STREAM_CHECK(g_cpu_stream.entries != NULL);
+    for (uint32_t il = 0; il < 2; il++) {
+        g_cpu_stream.expert_bytes[CPU_STREAM_GATE][il] = 64;
+        g_cpu_stream.expert_bytes[CPU_STREAM_UP][il] = 64;
+        g_cpu_stream.expert_bytes[CPU_STREAM_DOWN][il] = 64;
+    }
+    /* Install 3 synthetic entries in layer 0: experts 0,1,2. */
+    for (uint32_t e = 0; e < 3; e++) {
+        cpu_stream_entry *en = &g_cpu_stream.entries[0 * 4 + e];
+        for (int k = 0; k < 3; k++) {
+            en->buf[k] = aligned_alloc(64, 64);
+            CPU_STREAM_CHECK(en->buf[k] != NULL);
+        }
+        en->valid = true;
+        en->last_used = 10 + e;   /* 10, 11, 12 */
+        en->use_count = 5;
+        g_cpu_stream.used_bytes += cpu_stream_triple_bytes(0);
+    }
+    /* Expert 1 is hotter; expert 0 and 2 tie on use_count, 0 is older. */
+    g_cpu_stream.entries[1].use_count = 9;
+
+    uint32_t v = cpu_stream_pick_victim();
+    CPU_STREAM_CHECK(v == 0);                       /* lowest count, oldest */
+
+    /* Pin expert 0: victim must move to expert 2 (same count, newer but unpinned). */
+    g_cpu_stream.seq = 7;
+    g_cpu_stream.entries[0].pin_seq = 7;
+    v = cpu_stream_pick_victim();
+    CPU_STREAM_CHECK(v == 2);
+
+    /* Evict: frees buffers, drops used_bytes, marks invalid. */
+    uint64_t before = g_cpu_stream.used_bytes;
+    CPU_STREAM_CHECK(cpu_stream_evict_one());
+    CPU_STREAM_CHECK(g_cpu_stream.used_bytes == before - cpu_stream_triple_bytes(0));
+    CPU_STREAM_CHECK(!g_cpu_stream.entries[2].valid);
+    CPU_STREAM_CHECK(g_cpu_stream.evictions == 1);
+
+    /* Pin everything remaining: no victim available. */
+    g_cpu_stream.entries[1].pin_seq = 7;
+    CPU_STREAM_CHECK(cpu_stream_pick_victim() == UINT32_MAX);
+    CPU_STREAM_CHECK(!cpu_stream_evict_one());
+
+    for (uint32_t e = 0; e < 3; e++) {
+        cpu_stream_entry *en = &g_cpu_stream.entries[e];
+        if (en->valid) for (int k = 0; k < 3; k++) free(en->buf[k]);
+    }
+    free(g_cpu_stream.entries);
+    memset(&g_cpu_stream, 0, sizeof(g_cpu_stream));
+
+    return 1;
+#undef CPU_STREAM_CHECK
 }
 
 /* Locate one expert's 2D matrix inside a 3D GGUF expert tensor. */
