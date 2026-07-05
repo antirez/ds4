@@ -92,11 +92,7 @@ static ds4_engine *test_open_engine(bool quality) {
     const char *mtp = getenv("DS4_TEST_MTP");
     ds4_engine_options opt = {
         .model_path = test_model_path(),
-#ifdef __APPLE__
-        .backend = DS4_BACKEND_METAL,
-#else
-        .backend = DS4_BACKEND_CUDA,
-#endif
+        .backend = DS4_BACKEND_METAL, /* overridden below */
         .quality = quality,
         .ssd_streaming = test_env_bool("DS4_TEST_SSD_STREAMING"),
         .ssd_streaming_cold = test_env_bool("DS4_TEST_SSD_STREAMING_COLD"),
@@ -109,6 +105,14 @@ static ds4_engine *test_open_engine(bool quality) {
         .mtp_path = (mtp && mtp[0] && !quality) ? mtp : NULL,
         .mtp_draft_tokens = (mtp && mtp[0] && !quality) ? 4 : 0,
     };
+    const char *backend_env = getenv("DS4_TEST_BACKEND");
+    if (backend_env && !strcmp(backend_env, "cpu")) {
+        opt.backend = DS4_BACKEND_CPU;
+    } else {
+#ifndef __APPLE__
+        opt.backend = DS4_BACKEND_CUDA;
+#endif
+    }
     TEST_ASSERT(ds4_engine_open(&engine, &opt) == 0);
     return engine;
 }
