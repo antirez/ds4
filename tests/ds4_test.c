@@ -5,6 +5,38 @@
 #include "../ds4_gpu.h"
 #include <math.h>
 
+/* Forward declarations for CPU SSD streaming expert cache (defined in ds4.c) */
+#define CPU_STREAM_MAX_LAYER 61
+typedef enum { CPU_STREAM_GATE = 0, CPU_STREAM_UP = 1, CPU_STREAM_DOWN = 2 } cpu_stream_kind;
+
+typedef struct {
+    uint8_t *buf[3];
+    uint64_t last_used;
+    uint64_t use_count;
+    uint64_t pin_seq;
+    bool valid;
+} cpu_stream_entry;
+
+typedef struct {
+    bool enabled;
+    int fd;
+    uint32_t n_layers;
+    uint32_t n_experts;
+    uint64_t off[3][CPU_STREAM_MAX_LAYER];
+    uint64_t expert_bytes[3][CPU_STREAM_MAX_LAYER];
+    cpu_stream_entry *entries;
+    uint64_t clock;
+    uint64_t seq;
+    uint64_t budget_bytes, used_bytes;
+    uint64_t hits, misses, evictions, pread_bytes;
+} cpu_stream_state;
+
+extern cpu_stream_state g_cpu_stream;
+extern uint64_t cpu_stream_triple_bytes(uint32_t il);
+extern uint32_t cpu_stream_pick_victim(void);
+extern bool cpu_stream_evict_one(void);
+extern void cpu_stream_layer_begin(void);
+
 static ds4_engine *test_engine_fast;
 static ds4_engine *test_engine_quality;
 
@@ -136,6 +168,65 @@ static void test_close_engine(bool quality) {
 
 static uint64_t test_round_up_u64(uint64_t n, uint64_t align) {
     return (n + align - 1) & ~(align - 1);
+}
+
+/* Unit test for the CPU streaming expert cache eviction policy. Builds a tiny
+ * synthetic cache (no model file needed) and checks victim selection: lowest
+ * use_count first, oldest last_used as tie-break, pinned entries skipped. */
+static void test_cpu_stream_cache_policy(void) {
+    memset(&g_cpu_stream, 0, sizeof(g_cpu_stream));
+    g_cpu_stream.enabled = true;
+    g_cpu_stream.n_experts = 4;
+    g_cpu_stream.entries = calloc((size_t)CPU_STREAM_MAX_LAYER * 4, sizeof(cpu_stream_entry));
+    TEST_ASSERT(g_cpu_stream.entries != NULL);
+    for (uint32_t il = 0; il < 2; il++) {
+        g_cpu_stream.expert_bytes[CPU_STREAM_GATE][il] = 64;
+        g_cpu_stream.expert_bytes[CPU_STREAM_UP][il] = 64;
+        g_cpu_stream.expert_bytes[CPU_STREAM_DOWN][il] = 64;
+    }
+    /* Install 3 synthetic entries in layer 0: experts 0,1,2. */
+    for (uint32_t e = 0; e < 3; e++) {
+        cpu_stream_entry *en = &g_cpu_stream.entries[0 * 4 + e];
+        for (int k = 0; k < 3; k++) {
+            en->buf[k] = aligned_alloc(64, 64);
+            TEST_ASSERT(en->buf[k] != NULL);
+        }
+        en->valid = true;
+        en->last_used = 10 + e;   /* 10, 11, 12 */
+        en->use_count = 5;
+        g_cpu_stream.used_bytes += cpu_stream_triple_bytes(0);
+    }
+    /* Expert 1 is hotter; expert 0 and 2 tie on use_count, 0 is older. */
+    g_cpu_stream.entries[1].use_count = 9;
+
+    uint32_t v = cpu_stream_pick_victim();
+    TEST_ASSERT(v == 0);                       /* lowest count, oldest */
+
+    /* Pin expert 0: victim must move to expert 2 (same count, newer but unpinned). */
+    g_cpu_stream.seq = 7;
+    g_cpu_stream.entries[0].pin_seq = 7;
+    v = cpu_stream_pick_victim();
+    TEST_ASSERT(v == 2);
+
+    /* Evict: frees buffers, drops used_bytes, marks invalid. */
+    uint64_t before = g_cpu_stream.used_bytes;
+    TEST_ASSERT(cpu_stream_evict_one());
+    TEST_ASSERT(g_cpu_stream.used_bytes == before - cpu_stream_triple_bytes(0));
+    TEST_ASSERT(!g_cpu_stream.entries[2].valid);
+    TEST_ASSERT(g_cpu_stream.evictions == 1);
+
+    /* Pin everything remaining: no victim available. */
+    g_cpu_stream.entries[1].pin_seq = 7;
+    TEST_ASSERT(cpu_stream_pick_victim() == UINT32_MAX);
+    TEST_ASSERT(!cpu_stream_evict_one());
+
+    for (uint32_t e = 0; e < 3; e++) {
+        cpu_stream_entry *en = &g_cpu_stream.entries[e];
+        if (en->valid) for (int k = 0; k < 3; k++) free(en->buf[k]);
+    }
+    free(g_cpu_stream.entries);
+    memset(&g_cpu_stream, 0, sizeof(g_cpu_stream));
+    printf("cpu-stream cache policy: OK\n");
 }
 
 static uint16_t test_float_to_f16(float f) {
@@ -2204,6 +2295,7 @@ static const ds4_test_entry test_entries[] = {
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
+    {"--cpu-stream-cache", "cpu-stream-cache", "CPU streaming expert cache policy unit test", test_cpu_stream_cache_policy},
 };
 
 static void test_print_help(const char *prog) {

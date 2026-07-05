@@ -5525,6 +5525,88 @@ static float tensor_2d_value(const ds4_model *m, const ds4_tensor *t, uint64_t x
     return tensor_1d_value(m, t, y * t->dim[0] + x);
 }
 
+/* ---------------- CPU backend SSD streaming of routed experts ----------------
+ *
+ * On macOS, faulting the whole multi-GB GGUF through the CPU mmap can panic
+ * the kernel (see README and the mmap_flags comment in model_open). When
+ * --ssd-streaming is used with the CPU backend, routed expert weights are
+ * pread() into a bounded LRU cache of heap slabs instead, and the huge mmap
+ * is only touched for the (small) non-routed weights.
+ *
+ * Invariant: all lookups happen on the orchestrating thread. Worker threads
+ * only consume base pointers computed before dispatch, so no locking is
+ * needed. Entries touched during the current layer call carry
+ * pin_seq == g_cpu_stream.seq and are never evicted within that call. */
+
+/* Kinds of per-expert weight slabs (order matches Metal's gate/up/down naming). */
+typedef enum { CPU_STREAM_GATE = 0, CPU_STREAM_UP = 1, CPU_STREAM_DOWN = 2 } cpu_stream_kind;
+
+typedef struct {
+    uint8_t *buf[3];        /* gate/up/down slabs, aligned_alloc(64), NULL when !valid */
+    uint64_t last_used;     /* LRU clock stamp */
+    uint64_t use_count;     /* hotness (halved periodically) */
+    uint64_t pin_seq;       /* == g_cpu_stream.seq -> cannot be evicted this layer call */
+    bool valid;
+} cpu_stream_entry;
+
+typedef struct {
+    bool enabled;
+    int fd;                       /* model file descriptor (m->fd) */
+    uint32_t n_layers;            /* layers that HAVE expert tensors (moe layers) */
+    uint32_t n_experts;           /* experts per layer, from gate tensor dim[2] */
+    /* Per-moe-layer geometry, indexed by GGUF "blk.N" layer id (il). Layers
+     * without expert tensors keep off[il]==0 and are never resolved. */
+    uint64_t off[3][DS4_MAX_LAYER];          /* file abs_offset of gate/up/down tensor */
+    uint64_t expert_bytes[3][DS4_MAX_LAYER]; /* one expert's slab bytes per kind */
+    cpu_stream_entry *entries;    /* DS4_MAX_LAYER * n_experts, calloc'd */
+    uint64_t clock;               /* lookup counter, drives LRU + decay */
+    uint64_t seq;                 /* layer-call sequence, drives pinning */
+    uint64_t budget_bytes, used_bytes;
+    uint64_t hits, misses, evictions, pread_bytes;  /* stats for the summary log */
+} cpu_stream_state;
+
+cpu_stream_state g_cpu_stream;
+
+uint64_t cpu_stream_triple_bytes(uint32_t il) {
+    return g_cpu_stream.expert_bytes[CPU_STREAM_GATE][il] +
+           g_cpu_stream.expert_bytes[CPU_STREAM_UP][il] +
+           g_cpu_stream.expert_bytes[CPU_STREAM_DOWN][il];
+}
+
+/* Victim: lowest use_count, oldest last_used as tie-break; skip pinned. */
+uint32_t cpu_stream_pick_victim(void) {
+    const uint64_t total = (uint64_t)DS4_MAX_LAYER * g_cpu_stream.n_experts;
+    uint32_t victim = UINT32_MAX;
+    for (uint64_t i = 0; i < total; i++) {
+        cpu_stream_entry *en = &g_cpu_stream.entries[i];
+        if (!en->valid || (en->pin_seq != 0 && en->pin_seq == g_cpu_stream.seq)) continue;
+        if (victim == UINT32_MAX) { victim = (uint32_t)i; continue; }
+        cpu_stream_entry *v = &g_cpu_stream.entries[victim];
+        if (en->use_count < v->use_count ||
+            (en->use_count == v->use_count && en->last_used < v->last_used))
+        {
+            victim = (uint32_t)i;
+        }
+    }
+    return victim;
+}
+
+bool cpu_stream_evict_one(void) {
+    const uint32_t victim = cpu_stream_pick_victim();
+    if (victim == UINT32_MAX) return false;
+    cpu_stream_entry *en = &g_cpu_stream.entries[victim];
+    const uint32_t il = victim / g_cpu_stream.n_experts;
+    for (int k = 0; k < 3; k++) { free(en->buf[k]); en->buf[k] = NULL; }
+    en->valid = false;
+    g_cpu_stream.used_bytes -= cpu_stream_triple_bytes(il);
+    g_cpu_stream.evictions++;
+    return true;
+}
+
+void cpu_stream_layer_begin(void) {
+    if (g_cpu_stream.enabled) g_cpu_stream.seq++;
+}
+
 /* Locate one expert's 2D matrix inside a 3D GGUF expert tensor. */
 static const uint8_t *tensor_expert_bytes(
         const ds4_model  *m,
