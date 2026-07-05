@@ -1212,8 +1212,8 @@ make cpu
 Do not treat the CPU path as the production target. The CLI and `ds4-server`
 support the CPU backend for reference/debug use and share the same KV session
 and snapshot format as Metal and CUDA, but normal inference should use Metal or
-CUDA. On macOS, the CPU backend requires `--ssd-streaming` to avoid the kernel
-VM issue described above.
+CUDA. On macOS, use `--ssd-streaming` with the CPU backend: the plain mmap CPU
+path can panic current macOS kernels.
 
 ## Steering
 

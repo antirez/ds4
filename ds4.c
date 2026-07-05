@@ -5902,6 +5902,9 @@ int ds4_cpu_stream_parallel_self_test(void) {
      * own, but alternating rounds guarantee eviction across rounds. */
     g_cpu_stream.budget_bytes = 5 * (uint64_t)(SLAB * 3);
 
+    /* pthread_join() below is the real synchronization barrier that makes
+     * each round's writes to failed visible to this thread; volatile is
+     * belt-and-braces, not load-bearing. */
     volatile int failed = 0;
 
     for (int round = 0; round < N_ROUNDS; round++) {
@@ -5953,7 +5956,11 @@ static bool cpu_stream_resolve(const ds4_tensor *w, uint32_t *il, cpu_stream_kin
 }
 
 /* Streaming twin of tensor_expert_bytes(): same out-params, but the returned
- * pointer refers to a resident cache slab instead of the mmap. */
+ * pointer refers to a resident cache slab instead of the mmap. Never returns
+ * NULL: a routed expert tensor that fails to resolve means the streaming
+ * cache's tables disagree with the model it was built from, which is a bug,
+ * not a condition to silently fall back on (that fallback is exactly the
+ * huge-mmap-fault regime --ssd-streaming exists to avoid). */
 static const uint8_t *cpu_stream_expert_bytes(
         const ds4_model  *m,
         const ds4_tensor *w,
@@ -5961,12 +5968,10 @@ static const uint8_t *cpu_stream_expert_bytes(
         uint64_t         *in_dim,
         uint64_t         *out_dim,
         uint64_t         *row_bytes) {
+    (void)m;
     uint32_t il; cpu_stream_kind kind;
     if (!cpu_stream_resolve(w, &il, &kind)) {
-        /* Not a routed expert tensor we track (should not happen: only 3D
-         * expert tensors reach this path). Fall back to the mmap. */
-        (void)m;
-        return NULL;
+        ds4_die("cpu-stream: routed expert tensor is not registered in the streaming cache");
     }
     *in_dim = w->dim[0];
     *out_dim = w->dim[1];
@@ -5981,6 +5986,7 @@ static const uint8_t *cpu_stream_expert_bytes(
 /* Pin + prefetch every unique expert a batch will touch in this layer, in
  * ascending expert id (== ascending file offset, so reads are near-sequential). */
 static void cpu_stream_ensure_experts(uint32_t il, const uint32_t *experts, uint32_t n) {
+    /* enabled is set once at init, before any worker thread exists. */
     if (!g_cpu_stream.enabled) return;
     for (uint32_t i = 0; i < n; i++) (void)cpu_stream_fetch(il, experts[i]);
 }
@@ -6008,12 +6014,20 @@ static uint64_t cpu_stream_resolve_budget(const ds4_engine_options *opt) {
     }
     const uint64_t floor_bytes = max_triple * g_cpu_stream.n_experts;
     uint64_t budget = 0;
+    const bool explicit_budget =
+        opt->ssd_streaming_cache_bytes != 0 || opt->ssd_streaming_cache_experts != 0;
     if (opt->ssd_streaming_cache_bytes) {
         budget = opt->ssd_streaming_cache_bytes;
     } else if (opt->ssd_streaming_cache_experts) {
         budget = (uint64_t)opt->ssd_streaming_cache_experts * max_triple;
     } else {
         budget = cpu_stream_phys_ram() / 4;
+    }
+    if (explicit_budget && budget < floor_bytes) {
+        fprintf(stderr,
+                "ds4: cpu-stream: requested expert cache below the one-layer minimum; "
+                "raised to %.2f GiB\n",
+                (double)floor_bytes / (1024.0 * 1024.0 * 1024.0));
     }
     return budget < floor_bytes ? floor_bytes : budget;
 }
@@ -6063,6 +6077,16 @@ static bool cpu_stream_init(const ds4_model *m, const ds4_engine_options *opt) {
 
 static void cpu_stream_close(void) {
     if (!g_cpu_stream.entries) return;
+    if (g_cpu_stream.enabled) {
+        ds4_log(stderr, DS4_LOG_WARNING,
+                "ds4: CPU stream: %u layers, %llu hits, %llu misses, %llu evictions, "
+                "%.2f GiB read\n",
+                g_cpu_stream.n_layers,
+                (unsigned long long)g_cpu_stream.hits,
+                (unsigned long long)g_cpu_stream.misses,
+                (unsigned long long)g_cpu_stream.evictions,
+                (double)g_cpu_stream.pread_bytes / (1024.0 * 1024.0 * 1024.0));
+    }
     const uint64_t total = (uint64_t)DS4_MAX_LAYER * g_cpu_stream.n_experts;
     for (uint64_t i = 0; i < total; i++) {
         cpu_stream_entry *en = &g_cpu_stream.entries[i];
@@ -6103,8 +6127,7 @@ static const uint8_t *tensor_expert_bytes(
     if (expert >= w->dim[2]) ds4_die("expert id is outside expert tensor");
 
     if (g_cpu_stream.enabled) {
-        const uint8_t *p = cpu_stream_expert_bytes(m, w, expert, in_dim, out_dim, row_bytes);
-        if (p) return p;
+        return cpu_stream_expert_bytes(m, w, expert, in_dim, out_dim, row_bytes);
     }
 
     *in_dim = w->dim[0];
@@ -26187,6 +26210,16 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
     const bool cpu_streaming = opt->ssd_streaming && opt->backend == DS4_BACKEND_CPU;
+#ifdef __APPLE__
+    /* Advisory only: we do not refuse to run, we just warn. Tokenizer-only
+     * (--inspect-only) runs never touch the tensor payload, so they cannot
+     * trigger the mmap fault storm this warns about. */
+    if (opt->backend == DS4_BACKEND_CPU && !opt->ssd_streaming && !opt->inspect_only) {
+        fprintf(stderr,
+                "ds4: warning: the plain CPU path can crash current macOS kernels with "
+                "large models; use --ssd-streaming (see README)\n");
+    }
+#endif
     /* CPU streaming replaces the whole-file WILLNEED prefetch with per-tensor
      * hints on the non-routed weights only (see cpu_stream_prefetch_nonrouted). */
     model_open(&e->model, opt->model_path, graph_backend,
