@@ -5607,6 +5607,62 @@ static void cpu_stream_layer_begin(void) {
     if (g_cpu_stream.enabled) g_cpu_stream.seq++;
 }
 
+/* Robust positional read: loops on EINTR/short reads; model file truncation
+ * is fatal, matching ds4_die_errno style elsewhere. */
+static void cpu_stream_pread_range(int fd, void *dst, uint64_t len, uint64_t off) {
+    uint8_t *p = dst;
+    uint64_t pos = 0;
+    while (pos < len) {
+        ssize_t n = pread(fd, p + pos, (size_t)(len - pos), (off_t)(off + pos));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            ds4_die_errno("cpu-stream: pread of expert slab failed", "expert slab");
+        }
+        if (n == 0) ds4_die("cpu-stream: model file truncated while reading expert slab");
+        pos += (uint64_t)n;
+    }
+    g_cpu_stream.pread_bytes += len;
+}
+
+/* Make (il, e) resident and return its entry. Evicts until the triple fits;
+ * dies if the budget cannot hold the working set (all candidates pinned). */
+static cpu_stream_entry *cpu_stream_fetch(uint32_t il, uint32_t e) {
+    cpu_stream_entry *en = &g_cpu_stream.entries[(uint64_t)il * g_cpu_stream.n_experts + e];
+    g_cpu_stream.clock++;
+    /* Periodic hotness decay so old bursts don't pin the cache forever. */
+    if ((g_cpu_stream.clock & 0xFFF) == 0) {
+        const uint64_t total = (uint64_t)DS4_MAX_LAYER * g_cpu_stream.n_experts;
+        for (uint64_t i = 0; i < total; i++) g_cpu_stream.entries[i].use_count >>= 1;
+    }
+    en->pin_seq = g_cpu_stream.seq;
+    if (en->valid) {
+        en->last_used = g_cpu_stream.clock;
+        en->use_count++;
+        g_cpu_stream.hits++;
+        return en;
+    }
+    const uint64_t need = cpu_stream_triple_bytes(il);
+    while (g_cpu_stream.used_bytes + need > g_cpu_stream.budget_bytes) {
+        if (!cpu_stream_evict_one()) {
+            ds4_die("cpu-stream: expert cache budget too small for the working set; "
+                    "raise --ssd-streaming-cache-experts");
+        }
+    }
+    for (int k = 0; k < 3; k++) {
+        const uint64_t bytes = g_cpu_stream.expert_bytes[k][il];
+        en->buf[k] = aligned_alloc(64, (size_t)((bytes + 63) & ~63ull));
+        if (!en->buf[k]) ds4_die("cpu-stream: out of memory allocating expert slab");
+        cpu_stream_pread_range(g_cpu_stream.fd, en->buf[k], bytes,
+                               g_cpu_stream.off[k][il] + (uint64_t)e * bytes);
+    }
+    en->valid = true;
+    en->last_used = g_cpu_stream.clock;
+    en->use_count = 1;
+    g_cpu_stream.used_bytes += need;
+    g_cpu_stream.misses++;
+    return en;
+}
+
 /* Self-test hook for the cache policy, callable from ds4_test (which links
  * against ds4.o and cannot see the statics above). Returns 1 on pass. */
 int ds4_cpu_stream_policy_self_test(void) {
@@ -5665,6 +5721,68 @@ int ds4_cpu_stream_policy_self_test(void) {
     }
     free(g_cpu_stream.entries);
     memset(&g_cpu_stream, 0, sizeof(g_cpu_stream));
+
+    return 1;
+#undef CPU_STREAM_CHECK
+}
+
+/* Self-test hook for the pread loader and fetch/install path, callable from
+ * ds4_test (which links against ds4.o and cannot see the statics above).
+ * Exercises a real temp file so byte round-tripping and eviction-triggered
+ * re-reads are verified against actual pread() behavior. Returns 1 on pass. */
+int ds4_cpu_stream_fetch_self_test(void) {
+#define CPU_STREAM_CHECK(x) \
+    do { if (!(x)) { fprintf(stderr, "cpu-stream fetch self-test failed: %s\n", #x); return 0; } } while (0)
+
+    char path[] = "/tmp/ds4_cpu_stream_test_XXXXXX";
+    int fd = mkstemp(path);
+    CPU_STREAM_CHECK(fd >= 0);
+    /* Layout: layer 0 has 2 experts, slabs of 64 bytes per kind.
+     * gate tensor at off 0 (2*64), up at 128 (2*64), down at 256 (2*64). */
+    uint8_t filedata[384];
+    for (int i = 0; i < 384; i++) filedata[i] = (uint8_t)(i * 7 + 3);
+    CPU_STREAM_CHECK(write(fd, filedata, sizeof(filedata)) == (ssize_t)sizeof(filedata));
+
+    memset(&g_cpu_stream, 0, sizeof(g_cpu_stream));
+    g_cpu_stream.enabled = true;
+    g_cpu_stream.fd = fd;
+    g_cpu_stream.n_experts = 2;
+    g_cpu_stream.off[CPU_STREAM_GATE][0] = 0;
+    g_cpu_stream.off[CPU_STREAM_UP][0] = 128;
+    g_cpu_stream.off[CPU_STREAM_DOWN][0] = 256;
+    for (int k = 0; k < 3; k++) g_cpu_stream.expert_bytes[k][0] = 64;
+    g_cpu_stream.entries = calloc((size_t)DS4_MAX_LAYER * 2, sizeof(cpu_stream_entry));
+    CPU_STREAM_CHECK(g_cpu_stream.entries != NULL);
+    g_cpu_stream.budget_bytes = 2 * 192;   /* room for both experts */
+
+    cpu_stream_entry *e1 = cpu_stream_fetch(0, 1);
+    CPU_STREAM_CHECK(e1 && e1->valid);
+    /* Expert 1's gate slab lives at file offset 0 + 1*64. */
+    CPU_STREAM_CHECK(memcmp(e1->buf[CPU_STREAM_GATE], filedata + 64, 64) == 0);
+    CPU_STREAM_CHECK(memcmp(e1->buf[CPU_STREAM_UP], filedata + 128 + 64, 64) == 0);
+    CPU_STREAM_CHECK(memcmp(e1->buf[CPU_STREAM_DOWN], filedata + 256 + 64, 64) == 0);
+    CPU_STREAM_CHECK(g_cpu_stream.misses == 1);
+
+    cpu_stream_entry *again = cpu_stream_fetch(0, 1);
+    CPU_STREAM_CHECK(again == e1 && g_cpu_stream.hits == 1 && g_cpu_stream.misses == 1);
+
+    /* Budget for one expert only: fetching 0 evicts 1 (unpinned in new seq). */
+    g_cpu_stream.budget_bytes = 192;
+    g_cpu_stream.seq++;
+    cpu_stream_entry *e0 = cpu_stream_fetch(0, 0);
+    CPU_STREAM_CHECK(e0 && e0->valid);
+    CPU_STREAM_CHECK(!g_cpu_stream.entries[1].valid);   /* evicted */
+    CPU_STREAM_CHECK(g_cpu_stream.evictions == 1);
+    CPU_STREAM_CHECK(memcmp(e0->buf[CPU_STREAM_GATE], filedata + 0, 64) == 0);
+    CPU_STREAM_CHECK(g_cpu_stream.used_bytes == 192);
+
+    for (uint32_t e = 0; e < 2; e++) {
+        cpu_stream_entry *en = &g_cpu_stream.entries[e];
+        if (en->valid) for (int k = 0; k < 3; k++) free(en->buf[k]);
+    }
+    free(g_cpu_stream.entries);
+    memset(&g_cpu_stream, 0, sizeof(g_cpu_stream));
+    close(fd); unlink(path);
 
     return 1;
 #undef CPU_STREAM_CHECK

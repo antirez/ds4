@@ -148,6 +148,15 @@ static void test_cpu_stream_cache_policy(void) {
     printf("cpu-stream cache policy: OK\n");
 }
 
+/* Unit test for the CPU streaming expert cache pread loader and fetch/install
+ * path. Same reasoning as above: the scenario lives in ds4.c behind the
+ * ds4_cpu_stream_fetch_self_test() hook since g_cpu_stream is static there. */
+static void test_cpu_stream_fetch(void) {
+    extern int ds4_cpu_stream_fetch_self_test(void);
+    TEST_ASSERT(ds4_cpu_stream_fetch_self_test() == 1);
+    printf("cpu-stream fetch/install: OK\n");
+}
+
 static uint16_t test_float_to_f16(float f) {
     union {
         float f;
@@ -2215,6 +2224,7 @@ static const ds4_test_entry test_entries[] = {
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
     {"--cpu-stream-cache", "cpu-stream-cache", "CPU streaming expert cache policy unit test", test_cpu_stream_cache_policy},
+    {"--cpu-stream-fetch", "cpu-stream-fetch", "CPU streaming pread/install unit test", test_cpu_stream_fetch},
 };
 
 static void test_print_help(const char *prog) {
