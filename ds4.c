@@ -32,6 +32,9 @@
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
@@ -5980,6 +5983,112 @@ static const uint8_t *cpu_stream_expert_bytes(
 static void cpu_stream_ensure_experts(uint32_t il, const uint32_t *experts, uint32_t n) {
     if (!g_cpu_stream.enabled) return;
     for (uint32_t i = 0; i < n; i++) (void)cpu_stream_fetch(il, experts[i]);
+}
+
+/* Physical RAM size, used to size the default streaming cache budget when the
+ * caller does not pass an explicit --ssd-streaming-cache-experts/bytes. */
+static uint64_t cpu_stream_phys_ram(void) {
+#ifdef __APPLE__
+    uint64_t mem = 0; size_t len = sizeof(mem);
+    if (sysctlbyname("hw.memsize", &mem, &len, NULL, 0) == 0 && mem) return mem;
+#else
+    long pages = sysconf(_SC_PHYS_PAGES), psize = sysconf(_SC_PAGE_SIZE);
+    if (pages > 0 && psize > 0) return (uint64_t)pages * (uint64_t)psize;
+#endif
+    return 8ull * 1024 * 1024 * 1024;  /* conservative fallback */
+}
+
+/* Explicit flags win; otherwise default to 25% of physical RAM, floored so a
+ * full prefill layer (every expert selected once) always fits. */
+static uint64_t cpu_stream_resolve_budget(const ds4_engine_options *opt) {
+    uint64_t max_triple = 0;
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        const uint64_t t = cpu_stream_triple_bytes(il);
+        if (t > max_triple) max_triple = t;
+    }
+    const uint64_t floor_bytes = max_triple * g_cpu_stream.n_experts;
+    uint64_t budget = 0;
+    if (opt->ssd_streaming_cache_bytes) {
+        budget = opt->ssd_streaming_cache_bytes;
+    } else if (opt->ssd_streaming_cache_experts) {
+        budget = (uint64_t)opt->ssd_streaming_cache_experts * max_triple;
+    } else {
+        budget = cpu_stream_phys_ram() / 4;
+    }
+    return budget < floor_bytes ? floor_bytes : budget;
+}
+
+/* Build the (layer, kind) -> file range tables from the GGUF tensor directory
+ * alone (names like "blk.N.ffn_gate_exps.weight"), so init only needs the
+ * model, not the resolved weights table. */
+static bool cpu_stream_init(const ds4_model *m, const ds4_engine_options *opt) {
+    memset(&g_cpu_stream, 0, sizeof(g_cpu_stream));
+    uint32_t n_experts = 0, n_moe_layers = 0;
+    static const char *suffix[3] = {
+        ".ffn_gate_exps.weight", ".ffn_up_exps.weight", ".ffn_down_exps.weight",
+    };
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->ndim != 3 || t->name.len >= 64) continue;
+        char name[64];
+        memcpy(name, t->name.ptr, t->name.len);
+        name[t->name.len] = '\0';
+        unsigned il = 0; int k = -1; char rest[48] = "";
+        if (sscanf(name, "blk.%u%47s", &il, rest) != 2 || il >= DS4_MAX_LAYER) continue;
+        for (int s = 0; s < 3; s++) if (!strcmp(rest, suffix[s])) { k = s; break; }
+        if (k < 0) continue;
+        const gguf_type_info *info = tensor_type(t->type);
+        if (!info || info->block_elems == 0) return false;
+        const uint64_t blocks = (t->dim[0] + info->block_elems - 1) / info->block_elems;
+        g_cpu_stream.off[k][il] = t->abs_offset;
+        g_cpu_stream.expert_bytes[k][il] = t->dim[1] * (blocks * info->block_bytes);
+        if (n_experts == 0) n_experts = (uint32_t)t->dim[2];
+        if (t->dim[2] != n_experts) return false;
+        if (k == 0) n_moe_layers++;
+    }
+    if (!n_experts || !n_moe_layers) return false;
+    g_cpu_stream.n_experts = n_experts;
+    g_cpu_stream.n_layers = n_moe_layers;
+    g_cpu_stream.fd = m->fd;
+    g_cpu_stream.entries = calloc((size_t)DS4_MAX_LAYER * n_experts, sizeof(cpu_stream_entry));
+    if (!g_cpu_stream.entries) return false;
+    g_cpu_stream.budget_bytes = cpu_stream_resolve_budget(opt);
+    g_cpu_stream.enabled = true;
+    ds4_log(stderr, DS4_LOG_WARNING,
+            "ds4: CPU SSD streaming: %u moe layers, %u experts/layer, cache budget %.2f GiB\n",
+            n_moe_layers, n_experts,
+            (double)g_cpu_stream.budget_bytes / (1024.0 * 1024.0 * 1024.0));
+    return true;
+}
+
+static void cpu_stream_close(void) {
+    if (!g_cpu_stream.entries) return;
+    const uint64_t total = (uint64_t)DS4_MAX_LAYER * g_cpu_stream.n_experts;
+    for (uint64_t i = 0; i < total; i++) {
+        cpu_stream_entry *en = &g_cpu_stream.entries[i];
+        if (en->valid) for (int k = 0; k < 3; k++) free(en->buf[k]);
+    }
+    free(g_cpu_stream.entries);
+    memset(&g_cpu_stream, 0, sizeof(g_cpu_stream));
+}
+
+/* WILLNEED only the non-routed weights: they are the small resident part.
+ * Never hint the routed expert ranges -- those go through pread. */
+static void cpu_stream_prefetch_nonrouted(const ds4_model *m) {
+#if defined(POSIX_MADV_WILLNEED)
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->ndim == 3) {
+            uint32_t il; cpu_stream_kind kind;
+            if (cpu_stream_resolve(t, &il, &kind)) continue;  /* routed: skip */
+        }
+        if (t->bytes == 0) continue;
+        posix_madvise((void *)(m->map + t->abs_offset), (size_t)t->bytes,
+                      POSIX_MADV_WILLNEED);
+    }
+#else
+    (void)m;
+#endif
 }
 
 /* Locate one expert's 2D matrix inside a 3D GGUF expert tensor. */
@@ -26077,15 +26186,35 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
-    model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
+    const bool cpu_streaming = opt->ssd_streaming && opt->backend == DS4_BACKEND_CPU;
+    /* CPU streaming replaces the whole-file WILLNEED prefetch with per-tensor
+     * hints on the non-routed weights only (see cpu_stream_prefetch_nonrouted). */
+    model_open(&e->model, opt->model_path, graph_backend,
+               !opt->inspect_only && !cpu_streaming);
     if (opt->warm_weights) model_warm_weights(&e->model);
     if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
     if (e->ssd_streaming && !ds4_backend_supports_ssd_streaming(e->backend)) {
-        fprintf(stderr, "ds4: --ssd-streaming is currently supported only with --metal/--cuda/--rocm\n");
-        ds4_engine_close(e);
-        *out = NULL;
-        return 1;
+        if (e->backend == DS4_BACKEND_CPU) {
+            /* CPU streaming: bounded pread cache for routed experts. This is
+             * the supported way to run the CPU backend on macOS, where
+             * faulting the whole GGUF through the mmap can panic the kernel. */
+            if (!cpu_stream_init(&e->model, opt)) {
+                fprintf(stderr, "ds4: --ssd-streaming: model has no routed expert tensors\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            if (opt->ssd_streaming_preload_experts != 0) {
+                fprintf(stderr, "ds4: --ssd-streaming-preload-experts is ignored on the CPU backend\n");
+            }
+            if (!opt->inspect_only) cpu_stream_prefetch_nonrouted(&e->model);
+        } else {
+            fprintf(stderr, "ds4: --ssd-streaming is currently supported only with --metal/--cuda/--rocm (or --cpu)\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
     }
     const char *expert_profile_path = opt->expert_profile_path;
     if (!expert_profile_path || !expert_profile_path[0]) {
@@ -26499,6 +26628,7 @@ void ds4_engine_close(ds4_engine *e) {
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
     if (e->mtp_ready) model_close(&e->mtp_model);
+    cpu_stream_close();
     model_close(&e->model);
 #ifndef DS4_NO_GPU
     ds4_gpu_cleanup();
