@@ -92,11 +92,7 @@ static ds4_engine *test_open_engine(bool quality) {
     const char *mtp = getenv("DS4_TEST_MTP");
     ds4_engine_options opt = {
         .model_path = test_model_path(),
-#ifdef __APPLE__
-        .backend = DS4_BACKEND_METAL,
-#else
-        .backend = DS4_BACKEND_CUDA,
-#endif
+        .backend = DS4_BACKEND_METAL, /* overridden below */
         .quality = quality,
         .ssd_streaming = test_env_bool("DS4_TEST_SSD_STREAMING"),
         .ssd_streaming_cold = test_env_bool("DS4_TEST_SSD_STREAMING_COLD"),
@@ -109,6 +105,14 @@ static ds4_engine *test_open_engine(bool quality) {
         .mtp_path = (mtp && mtp[0] && !quality) ? mtp : NULL,
         .mtp_draft_tokens = (mtp && mtp[0] && !quality) ? 4 : 0,
     };
+    const char *backend_env = getenv("DS4_TEST_BACKEND");
+    if (backend_env && !strcmp(backend_env, "cpu")) {
+        opt.backend = DS4_BACKEND_CPU;
+    } else {
+#ifndef __APPLE__
+        opt.backend = DS4_BACKEND_CUDA;
+#endif
+    }
     TEST_ASSERT(ds4_engine_open(&engine, &opt) == 0);
     return engine;
 }
@@ -136,6 +140,36 @@ static void test_close_engine(bool quality) {
 
 static uint64_t test_round_up_u64(uint64_t n, uint64_t align) {
     return (n + align - 1) & ~(align - 1);
+}
+
+/* Unit test for the CPU streaming expert cache eviction policy. The policy
+ * internals (g_cpu_stream and friends) are static in ds4.c, which this test
+ * binary links as a separately compiled object, so the actual test body
+ * lives in ds4.c behind the ds4_cpu_stream_policy_self_test() hook. */
+static void test_cpu_stream_cache_policy(void) {
+    extern int ds4_cpu_stream_policy_self_test(void);
+    TEST_ASSERT(ds4_cpu_stream_policy_self_test() == 1);
+    printf("cpu-stream cache policy: OK\n");
+}
+
+/* Unit test for the CPU streaming expert cache pread loader and fetch/install
+ * path. Same reasoning as above: the scenario lives in ds4.c behind the
+ * ds4_cpu_stream_fetch_self_test() hook since g_cpu_stream is static there. */
+static void test_cpu_stream_fetch(void) {
+    extern int ds4_cpu_stream_fetch_self_test(void);
+    TEST_ASSERT(ds4_cpu_stream_fetch_self_test() == 1);
+    printf("cpu-stream fetch/install: OK\n");
+}
+
+/* Concurrency stress test for cpu_stream_fetch(): spawns worker threads that
+ * fetch experts under the same layer sequence, the way routed_moe_tokens_worker
+ * does on the token-parallel decode path. Same reasoning as above: the scenario
+ * lives in ds4.c behind the ds4_cpu_stream_parallel_self_test() hook since
+ * g_cpu_stream and the mutex guarding it are static there. */
+static void test_cpu_stream_parallel(void) {
+    extern int ds4_cpu_stream_parallel_self_test(void);
+    TEST_ASSERT(ds4_cpu_stream_parallel_self_test() == 1);
+    printf("cpu-stream concurrent fetch stress: OK\n");
 }
 
 static uint16_t test_float_to_f16(float f) {
@@ -2204,6 +2238,9 @@ static const ds4_test_entry test_entries[] = {
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
+    {"--cpu-stream-cache", "cpu-stream-cache", "CPU streaming expert cache policy unit test", test_cpu_stream_cache_policy},
+    {"--cpu-stream-fetch", "cpu-stream-fetch", "CPU streaming pread/install unit test", test_cpu_stream_fetch},
+    {"--cpu-stream-parallel", "cpu-stream-parallel", "CPU streaming concurrent fetch stress test", test_cpu_stream_parallel},
 };
 
 static void test_print_help(const char *prog) {

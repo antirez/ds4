@@ -32,6 +32,9 @@
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
@@ -5525,6 +5528,593 @@ static float tensor_2d_value(const ds4_model *m, const ds4_tensor *t, uint64_t x
     return tensor_1d_value(m, t, y * t->dim[0] + x);
 }
 
+/* ---------------- CPU backend SSD streaming of routed experts ----------------
+ *
+ * On macOS, faulting the whole multi-GB GGUF through the CPU mmap can panic
+ * the kernel (see README and the mmap_flags comment in model_open). When
+ * --ssd-streaming is used with the CPU backend, routed expert weights are
+ * pread() into a bounded LRU cache of heap slabs instead, and the huge mmap
+ * is only touched for the (small) non-routed weights.
+ *
+ * Invariant: cache lookups can happen concurrently from pool worker threads
+ * (layer_routed_moe_tokens_parallel() dispatches routed_moe_tokens_worker()
+ * across the pool, each reaching cpu_stream_fetch() through
+ * tensor_expert_bytes()), so cpu_stream_fetch() serializes its body under
+ * g_cpu_stream_lock. Entries touched during the current layer call carry
+ * pin_seq == g_cpu_stream.seq and are never evicted within that call, which
+ * keeps pointers already handed to workers valid while others still run.
+ * The pin sequence itself is only advanced by the orchestrating thread
+ * between parallel sections (cpu_stream_layer_begin() never runs on a
+ * worker thread), and cpu_stream_resolve() needs no lock since it only
+ * reads tables that are immutable once streaming is enabled. */
+
+/* Kinds of per-expert weight slabs (order matches Metal's gate/up/down naming). */
+typedef enum { CPU_STREAM_GATE = 0, CPU_STREAM_UP = 1, CPU_STREAM_DOWN = 2 } cpu_stream_kind;
+
+typedef struct {
+    uint8_t *buf[3];        /* gate/up/down slabs, aligned_alloc(64), NULL when !valid */
+    uint64_t last_used;     /* LRU clock stamp */
+    uint64_t use_count;     /* hotness (halved periodically) */
+    uint64_t pin_seq;       /* == g_cpu_stream.seq -> cannot be evicted this layer call */
+    bool valid;
+} cpu_stream_entry;
+
+typedef struct {
+    bool enabled;
+    int fd;                       /* model file descriptor (m->fd) */
+    uint32_t n_layers;            /* layers that HAVE expert tensors (moe layers) */
+    uint32_t n_experts;           /* experts per layer, from gate tensor dim[2] */
+    /* Per-moe-layer geometry, indexed by GGUF "blk.N" layer id (il). Layers
+     * without expert tensors keep off[il]==0 and are never resolved. */
+    uint64_t off[3][DS4_MAX_LAYER];          /* file abs_offset of gate/up/down tensor */
+    uint64_t expert_bytes[3][DS4_MAX_LAYER]; /* one expert's slab bytes per kind */
+    cpu_stream_entry *entries;    /* DS4_MAX_LAYER * n_experts, calloc'd */
+    uint64_t clock;               /* lookup counter, drives LRU + decay */
+    uint64_t seq;                 /* layer-call sequence, drives pinning */
+    uint64_t budget_bytes, used_bytes;
+    uint64_t hits, misses, evictions, pread_bytes;  /* stats for the summary log */
+} cpu_stream_state;
+
+static cpu_stream_state g_cpu_stream;
+
+/* layer_routed_moe_tokens_parallel() dispatches routed_moe_tokens_worker()
+ * across pool worker threads, each of which reaches cpu_stream_fetch() via
+ * tensor_expert_bytes() concurrently for disjoint token ranges of the same
+ * layer. This mutex serializes the cache's shared state (entries table,
+ * used_bytes, LRU/hotness bookkeeping) across those threads. It is safe and
+ * cheap: entries pinned in the current seq are never evicted, so a pointer
+ * handed back to one worker stays valid while other workers run; seq itself
+ * is only advanced by the orchestrating thread between parallel sections
+ * (cpu_stream_layer_begin() never runs on a worker thread), so no worker can
+ * unpin another worker's in-flight entry mid-layer. */
+static pthread_mutex_t g_cpu_stream_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t cpu_stream_triple_bytes(uint32_t il) {
+    return g_cpu_stream.expert_bytes[CPU_STREAM_GATE][il] +
+           g_cpu_stream.expert_bytes[CPU_STREAM_UP][il] +
+           g_cpu_stream.expert_bytes[CPU_STREAM_DOWN][il];
+}
+
+/* Victim: lowest use_count, oldest last_used as tie-break; skip pinned. */
+static uint32_t cpu_stream_pick_victim(void) {
+    const uint64_t total = (uint64_t)DS4_MAX_LAYER * g_cpu_stream.n_experts;
+    uint32_t victim = UINT32_MAX;
+    for (uint64_t i = 0; i < total; i++) {
+        cpu_stream_entry *en = &g_cpu_stream.entries[i];
+        if (!en->valid || (en->pin_seq != 0 && en->pin_seq == g_cpu_stream.seq)) continue;
+        if (victim == UINT32_MAX) { victim = (uint32_t)i; continue; }
+        cpu_stream_entry *v = &g_cpu_stream.entries[victim];
+        if (en->use_count < v->use_count ||
+            (en->use_count == v->use_count && en->last_used < v->last_used))
+        {
+            victim = (uint32_t)i;
+        }
+    }
+    return victim;
+}
+
+static bool cpu_stream_evict_one(void) {
+    const uint32_t victim = cpu_stream_pick_victim();
+    if (victim == UINT32_MAX) return false;
+    cpu_stream_entry *en = &g_cpu_stream.entries[victim];
+    const uint32_t il = victim / g_cpu_stream.n_experts;
+    for (int k = 0; k < 3; k++) { free(en->buf[k]); en->buf[k] = NULL; }
+    en->valid = false;
+    g_cpu_stream.used_bytes -= cpu_stream_triple_bytes(il);
+    g_cpu_stream.evictions++;
+    return true;
+}
+
+static void cpu_stream_layer_begin(void) {
+    if (g_cpu_stream.enabled) g_cpu_stream.seq++;
+}
+
+/* Robust positional read: loops on EINTR/short reads; model file truncation
+ * is fatal, matching ds4_die_errno style elsewhere. */
+static void cpu_stream_pread_range(int fd, void *dst, uint64_t len, uint64_t off) {
+    uint8_t *p = dst;
+    uint64_t pos = 0;
+    while (pos < len) {
+        ssize_t n = pread(fd, p + pos, (size_t)(len - pos), (off_t)(off + pos));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            ds4_die_errno("cpu-stream: pread of expert slab failed", "expert slab");
+        }
+        if (n == 0) ds4_die("cpu-stream: model file truncated while reading expert slab");
+        pos += (uint64_t)n;
+    }
+    g_cpu_stream.pread_bytes += len;
+}
+
+/* Make (il, e) resident and return its entry. Evicts until the triple fits;
+ * dies if the budget cannot hold the working set (all candidates pinned).
+ * Must be called with g_cpu_stream_lock held; see cpu_stream_fetch(). */
+static cpu_stream_entry *cpu_stream_fetch_locked(uint32_t il, uint32_t e) {
+    cpu_stream_entry *en = &g_cpu_stream.entries[(uint64_t)il * g_cpu_stream.n_experts + e];
+    g_cpu_stream.clock++;
+    /* Periodic hotness decay so old bursts don't pin the cache forever. */
+    if ((g_cpu_stream.clock & 0xFFF) == 0) {
+        const uint64_t total = (uint64_t)DS4_MAX_LAYER * g_cpu_stream.n_experts;
+        for (uint64_t i = 0; i < total; i++) g_cpu_stream.entries[i].use_count >>= 1;
+    }
+    en->pin_seq = g_cpu_stream.seq;
+    if (en->valid) {
+        en->last_used = g_cpu_stream.clock;
+        en->use_count++;
+        g_cpu_stream.hits++;
+        return en;
+    }
+    const uint64_t need = cpu_stream_triple_bytes(il);
+    while (g_cpu_stream.used_bytes + need > g_cpu_stream.budget_bytes) {
+        if (!cpu_stream_evict_one()) {
+            ds4_die("cpu-stream: expert cache budget too small for the working set; "
+                    "raise --ssd-streaming-cache-experts");
+        }
+    }
+    for (int k = 0; k < 3; k++) {
+        const uint64_t bytes = g_cpu_stream.expert_bytes[k][il];
+        en->buf[k] = aligned_alloc(64, (size_t)((bytes + 63) & ~63ull));
+        if (!en->buf[k]) ds4_die("cpu-stream: out of memory allocating expert slab");
+        cpu_stream_pread_range(g_cpu_stream.fd, en->buf[k], bytes,
+                               g_cpu_stream.off[k][il] + (uint64_t)e * bytes);
+    }
+    en->valid = true;
+    en->last_used = g_cpu_stream.clock;
+    en->use_count = 1;
+    g_cpu_stream.used_bytes += need;
+    g_cpu_stream.misses++;
+    return en;
+}
+
+/* Worker threads in layer_routed_moe_tokens_parallel() call this concurrently
+ * (one thread per disjoint token range, same layer) via tensor_expert_bytes().
+ * The whole cache lookup/install/eviction body runs under g_cpu_stream_lock;
+ * see the comment above g_cpu_stream_lock for why this is safe to serialize
+ * without stalling correctness (pinned entries keep returned pointers alive
+ * across the critical section). */
+static cpu_stream_entry *cpu_stream_fetch(uint32_t il, uint32_t e) {
+    pthread_mutex_lock(&g_cpu_stream_lock);
+    cpu_stream_entry *en = cpu_stream_fetch_locked(il, e);
+    pthread_mutex_unlock(&g_cpu_stream_lock);
+    return en;
+}
+
+/* Self-test hook for the cache policy, callable from ds4_test (which links
+ * against ds4.o and cannot see the statics above). Returns 1 on pass. */
+int ds4_cpu_stream_policy_self_test(void) {
+#define CPU_STREAM_CHECK(x) \
+    do { if (!(x)) { fprintf(stderr, "cpu-stream self-test failed: %s\n", #x); return 0; } } while (0)
+
+    memset(&g_cpu_stream, 0, sizeof(g_cpu_stream));
+    g_cpu_stream.enabled = true;
+    g_cpu_stream.n_experts = 4;
+    g_cpu_stream.entries = calloc((size_t)DS4_MAX_LAYER * 4, sizeof(cpu_stream_entry));
+    CPU_STREAM_CHECK(g_cpu_stream.entries != NULL);
+    for (uint32_t il = 0; il < 2; il++) {
+        g_cpu_stream.expert_bytes[CPU_STREAM_GATE][il] = 64;
+        g_cpu_stream.expert_bytes[CPU_STREAM_UP][il] = 64;
+        g_cpu_stream.expert_bytes[CPU_STREAM_DOWN][il] = 64;
+    }
+    /* Install 3 synthetic entries in layer 0: experts 0,1,2. */
+    for (uint32_t e = 0; e < 3; e++) {
+        cpu_stream_entry *en = &g_cpu_stream.entries[0 * 4 + e];
+        for (int k = 0; k < 3; k++) {
+            en->buf[k] = aligned_alloc(64, 64);
+            CPU_STREAM_CHECK(en->buf[k] != NULL);
+        }
+        en->valid = true;
+        en->last_used = 10 + e;   /* 10, 11, 12 */
+        en->use_count = 5;
+        g_cpu_stream.used_bytes += cpu_stream_triple_bytes(0);
+    }
+    /* Expert 1 is hotter; expert 0 and 2 tie on use_count, 0 is older. */
+    g_cpu_stream.entries[1].use_count = 9;
+
+    uint32_t v = cpu_stream_pick_victim();
+    CPU_STREAM_CHECK(v == 0);                       /* lowest count, oldest */
+
+    /* Pin expert 0: victim must move to expert 2 (same count, newer but unpinned). */
+    g_cpu_stream.seq = 7;
+    g_cpu_stream.entries[0].pin_seq = 7;
+    v = cpu_stream_pick_victim();
+    CPU_STREAM_CHECK(v == 2);
+
+    /* Evict: frees buffers, drops used_bytes, marks invalid. */
+    uint64_t before = g_cpu_stream.used_bytes;
+    CPU_STREAM_CHECK(cpu_stream_evict_one());
+    CPU_STREAM_CHECK(g_cpu_stream.used_bytes == before - cpu_stream_triple_bytes(0));
+    CPU_STREAM_CHECK(!g_cpu_stream.entries[2].valid);
+    CPU_STREAM_CHECK(g_cpu_stream.evictions == 1);
+
+    /* Pin everything remaining: no victim available. */
+    g_cpu_stream.entries[1].pin_seq = 7;
+    CPU_STREAM_CHECK(cpu_stream_pick_victim() == UINT32_MAX);
+    CPU_STREAM_CHECK(!cpu_stream_evict_one());
+
+    for (uint32_t e = 0; e < 3; e++) {
+        cpu_stream_entry *en = &g_cpu_stream.entries[e];
+        if (en->valid) for (int k = 0; k < 3; k++) free(en->buf[k]);
+    }
+    free(g_cpu_stream.entries);
+    memset(&g_cpu_stream, 0, sizeof(g_cpu_stream));
+
+    return 1;
+#undef CPU_STREAM_CHECK
+}
+
+/* Self-test hook for the pread loader and fetch/install path, callable from
+ * ds4_test (which links against ds4.o and cannot see the statics above).
+ * Exercises a real temp file so byte round-tripping and eviction-triggered
+ * re-reads are verified against actual pread() behavior. Returns 1 on pass. */
+int ds4_cpu_stream_fetch_self_test(void) {
+#define CPU_STREAM_CHECK(x) \
+    do { if (!(x)) { fprintf(stderr, "cpu-stream fetch self-test failed: %s\n", #x); return 0; } } while (0)
+
+    char path[] = "/tmp/ds4_cpu_stream_test_XXXXXX";
+    int fd = mkstemp(path);
+    CPU_STREAM_CHECK(fd >= 0);
+    /* Layout: layer 0 has 2 experts, slabs of 64 bytes per kind.
+     * gate tensor at off 0 (2*64), up at 128 (2*64), down at 256 (2*64). */
+    uint8_t filedata[384];
+    for (int i = 0; i < 384; i++) filedata[i] = (uint8_t)(i * 7 + 3);
+    CPU_STREAM_CHECK(write(fd, filedata, sizeof(filedata)) == (ssize_t)sizeof(filedata));
+
+    memset(&g_cpu_stream, 0, sizeof(g_cpu_stream));
+    g_cpu_stream.enabled = true;
+    g_cpu_stream.fd = fd;
+    g_cpu_stream.n_experts = 2;
+    g_cpu_stream.off[CPU_STREAM_GATE][0] = 0;
+    g_cpu_stream.off[CPU_STREAM_UP][0] = 128;
+    g_cpu_stream.off[CPU_STREAM_DOWN][0] = 256;
+    for (int k = 0; k < 3; k++) g_cpu_stream.expert_bytes[k][0] = 64;
+    g_cpu_stream.entries = calloc((size_t)DS4_MAX_LAYER * 2, sizeof(cpu_stream_entry));
+    CPU_STREAM_CHECK(g_cpu_stream.entries != NULL);
+    g_cpu_stream.budget_bytes = 2 * 192;   /* room for both experts */
+
+    cpu_stream_entry *e1 = cpu_stream_fetch(0, 1);
+    CPU_STREAM_CHECK(e1 && e1->valid);
+    /* Expert 1's gate slab lives at file offset 0 + 1*64. */
+    CPU_STREAM_CHECK(memcmp(e1->buf[CPU_STREAM_GATE], filedata + 64, 64) == 0);
+    CPU_STREAM_CHECK(memcmp(e1->buf[CPU_STREAM_UP], filedata + 128 + 64, 64) == 0);
+    CPU_STREAM_CHECK(memcmp(e1->buf[CPU_STREAM_DOWN], filedata + 256 + 64, 64) == 0);
+    CPU_STREAM_CHECK(g_cpu_stream.misses == 1);
+
+    cpu_stream_entry *again = cpu_stream_fetch(0, 1);
+    CPU_STREAM_CHECK(again == e1 && g_cpu_stream.hits == 1 && g_cpu_stream.misses == 1);
+
+    /* Budget for one expert only: fetching 0 evicts 1 (unpinned in new seq). */
+    g_cpu_stream.budget_bytes = 192;
+    g_cpu_stream.seq++;
+    cpu_stream_entry *e0 = cpu_stream_fetch(0, 0);
+    CPU_STREAM_CHECK(e0 && e0->valid);
+    CPU_STREAM_CHECK(!g_cpu_stream.entries[1].valid);   /* evicted */
+    CPU_STREAM_CHECK(g_cpu_stream.evictions == 1);
+    CPU_STREAM_CHECK(memcmp(e0->buf[CPU_STREAM_GATE], filedata + 0, 64) == 0);
+    CPU_STREAM_CHECK(g_cpu_stream.used_bytes == 192);
+
+    for (uint32_t e = 0; e < 2; e++) {
+        cpu_stream_entry *en = &g_cpu_stream.entries[e];
+        if (en->valid) for (int k = 0; k < 3; k++) free(en->buf[k]);
+    }
+    free(g_cpu_stream.entries);
+    memset(&g_cpu_stream, 0, sizeof(g_cpu_stream));
+    close(fd); unlink(path);
+
+    return 1;
+#undef CPU_STREAM_CHECK
+}
+
+/* Shared context for ds4_cpu_stream_parallel_self_test()'s worker threads. */
+typedef struct {
+    uint32_t experts[2];      /* the two experts this thread alternates between */
+    volatile int *failed;     /* shared failure flag, set (never cleared) on mismatch */
+} cpu_stream_parallel_worker_ctx;
+
+/* Worker body for the concurrent fetch stress test: repeatedly fetches its
+ * two assigned experts in layer 0 and verifies every byte of all three
+ * returned slabs against the deterministic file pattern. Runs concurrently
+ * with sibling threads the way routed_moe_tokens_worker() calls
+ * cpu_stream_fetch() (via tensor_expert_bytes()) from multiple pool threads
+ * for the same layer. */
+static void *cpu_stream_parallel_self_test_worker(void *arg) {
+    cpu_stream_parallel_worker_ctx *ctx = arg;
+    for (int iter = 0; iter < 100; iter++) {
+        const uint32_t e = ctx->experts[iter & 1];
+        cpu_stream_entry *en = cpu_stream_fetch(0, e);
+        if (!en || !en->valid) { *ctx->failed = 1; continue; }
+        for (int k = 0; k < 3; k++) {
+            uint8_t expected[256];
+            for (int i = 0; i < 256; i++) {
+                expected[i] = (uint8_t)(k * 31 + (int)e * 7 + (i & 0xFF));
+            }
+            if (memcmp(en->buf[k], expected, sizeof(expected)) != 0) {
+                *ctx->failed = 1;
+            }
+        }
+    }
+    return NULL;
+}
+
+/* Self-test hook for concurrent cpu_stream_fetch() calls, callable from
+ * ds4_test (which links against ds4.o and cannot see the statics above).
+ * Reproduces the concurrency shape of layer_routed_moe_tokens_parallel():
+ * the orchestrator advances the pin sequence once per round, then several
+ * threads call cpu_stream_fetch() concurrently for the same layer. A tight
+ * 5-triple budget forces cross-round eviction so the mutex + pinning
+ * invariants are actually exercised, not just the uncontended fast path.
+ * Returns 1 on pass. */
+int ds4_cpu_stream_parallel_self_test(void) {
+#define CPU_STREAM_CHECK(x) \
+    do { if (!(x)) { fprintf(stderr, "cpu-stream parallel self-test failed: %s\n", #x); return 0; } } while (0)
+
+    enum { N_EXPERTS = 8, SLAB = 256, N_THREADS = 4, N_ROUNDS = 50 };
+
+    char path[] = "/tmp/ds4_cpu_stream_parallel_test_XXXXXX";
+    int fd = mkstemp(path);
+    CPU_STREAM_CHECK(fd >= 0);
+
+    /* Layout: 1 layer, 8 experts, 3 kinds, 256-byte slabs per expert.
+     * gate at file offset 0, up at 2048, down at 4096. Byte i of expert e's
+     * kind-k slab holds (uint8_t)(k*31 + e*7 + (i & 0xFF)). */
+    uint8_t *filedata = xmalloc((size_t)N_EXPERTS * SLAB * 3);
+    for (int k = 0; k < 3; k++) {
+        for (int e = 0; e < N_EXPERTS; e++) {
+            uint8_t *slab = filedata + (size_t)k * N_EXPERTS * SLAB + (size_t)e * SLAB;
+            for (int i = 0; i < SLAB; i++) slab[i] = (uint8_t)(k * 31 + e * 7 + (i & 0xFF));
+        }
+    }
+    CPU_STREAM_CHECK(write(fd, filedata, (size_t)N_EXPERTS * SLAB * 3) ==
+                     (ssize_t)((size_t)N_EXPERTS * SLAB * 3));
+    free(filedata);
+
+    memset(&g_cpu_stream, 0, sizeof(g_cpu_stream));
+    g_cpu_stream.enabled = true;
+    g_cpu_stream.fd = fd;
+    g_cpu_stream.n_experts = N_EXPERTS;
+    g_cpu_stream.off[CPU_STREAM_GATE][0] = 0;
+    g_cpu_stream.off[CPU_STREAM_UP][0] = (uint64_t)N_EXPERTS * SLAB;
+    g_cpu_stream.off[CPU_STREAM_DOWN][0] = (uint64_t)N_EXPERTS * SLAB * 2;
+    for (int k = 0; k < 3; k++) g_cpu_stream.expert_bytes[k][0] = SLAB;
+    g_cpu_stream.entries = calloc((size_t)DS4_MAX_LAYER * N_EXPERTS, sizeof(cpu_stream_entry));
+    CPU_STREAM_CHECK(g_cpu_stream.entries != NULL);
+    /* Budget = 5 triples: each round's union of touched experts is 4 triples
+     * ({0,1,2,3} or {4,5,6,7}), so a round never exceeds the budget on its
+     * own, but alternating rounds guarantee eviction across rounds. */
+    g_cpu_stream.budget_bytes = 5 * (uint64_t)(SLAB * 3);
+
+    /* pthread_join() below is the real synchronization barrier that makes
+     * each round's writes to failed visible to this thread; volatile is
+     * belt-and-braces, not load-bearing. */
+    volatile int failed = 0;
+
+    for (int round = 0; round < N_ROUNDS; round++) {
+        cpu_stream_layer_begin();
+        const uint32_t base = (round & 1) ? 4 : 0;
+        pthread_t threads[N_THREADS];
+        cpu_stream_parallel_worker_ctx ctxs[N_THREADS];
+        for (int t = 0; t < N_THREADS; t++) {
+            ctxs[t].experts[0] = base + (uint32_t)t;
+            ctxs[t].experts[1] = base + (((uint32_t)t + 1) & 3);
+            ctxs[t].failed = &failed;
+            CPU_STREAM_CHECK(pthread_create(&threads[t], NULL,
+                                             cpu_stream_parallel_self_test_worker,
+                                             &ctxs[t]) == 0);
+        }
+        for (int t = 0; t < N_THREADS; t++) pthread_join(threads[t], NULL);
+    }
+
+    CPU_STREAM_CHECK(!failed);
+    CPU_STREAM_CHECK(g_cpu_stream.evictions > 0);
+
+    const uint64_t total = (uint64_t)DS4_MAX_LAYER * N_EXPERTS;
+    for (uint64_t i = 0; i < total; i++) {
+        cpu_stream_entry *en = &g_cpu_stream.entries[i];
+        if (en->valid) for (int k = 0; k < 3; k++) free(en->buf[k]);
+    }
+    free(g_cpu_stream.entries);
+    memset(&g_cpu_stream, 0, sizeof(g_cpu_stream));
+    close(fd); unlink(path);
+
+    return 1;
+#undef CPU_STREAM_CHECK
+}
+
+/* Map a routed expert tensor back to (layer, kind) by its file offset. Linear
+ * scan over <= 61*3 entries; negligible next to the matvec work per call. */
+static bool cpu_stream_resolve(const ds4_tensor *w, uint32_t *il, cpu_stream_kind *kind) {
+    for (uint32_t l = 0; l < DS4_MAX_LAYER; l++) {
+        for (int k = 0; k < 3; k++) {
+            if (g_cpu_stream.expert_bytes[k][l] != 0 &&
+                g_cpu_stream.off[k][l] == w->abs_offset)
+            {
+                *il = l; *kind = (cpu_stream_kind)k;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* Streaming twin of tensor_expert_bytes(): same out-params, but the returned
+ * pointer refers to a resident cache slab instead of the mmap. Never returns
+ * NULL: a routed expert tensor that fails to resolve means the streaming
+ * cache's tables disagree with the model it was built from, which is a bug,
+ * not a condition to silently fall back on (that fallback is exactly the
+ * huge-mmap-fault regime --ssd-streaming exists to avoid). */
+static const uint8_t *cpu_stream_expert_bytes(
+        const ds4_model  *m,
+        const ds4_tensor *w,
+        uint32_t          expert,
+        uint64_t         *in_dim,
+        uint64_t         *out_dim,
+        uint64_t         *row_bytes) {
+    (void)m;
+    uint32_t il; cpu_stream_kind kind;
+    if (!cpu_stream_resolve(w, &il, &kind)) {
+        ds4_die("cpu-stream: routed expert tensor is not registered in the streaming cache");
+    }
+    *in_dim = w->dim[0];
+    *out_dim = w->dim[1];
+    const gguf_type_info *info = tensor_type(w->type);
+    if (!info || info->block_elems == 0) ds4_die("unsupported expert tensor type");
+    const uint64_t blocks = (*in_dim + info->block_elems - 1) / info->block_elems;
+    *row_bytes = blocks * info->block_bytes;
+    cpu_stream_entry *en = cpu_stream_fetch(il, expert);
+    return en->buf[kind];
+}
+
+/* Pin + prefetch every unique expert a batch will touch in this layer, in
+ * ascending expert id (== ascending file offset, so reads are near-sequential). */
+static void cpu_stream_ensure_experts(uint32_t il, const uint32_t *experts, uint32_t n) {
+    /* enabled is set once at init, before any worker thread exists. */
+    if (!g_cpu_stream.enabled) return;
+    for (uint32_t i = 0; i < n; i++) (void)cpu_stream_fetch(il, experts[i]);
+}
+
+/* Physical RAM size, used to size the default streaming cache budget when the
+ * caller does not pass an explicit --ssd-streaming-cache-experts/bytes. */
+static uint64_t cpu_stream_phys_ram(void) {
+#ifdef __APPLE__
+    uint64_t mem = 0; size_t len = sizeof(mem);
+    if (sysctlbyname("hw.memsize", &mem, &len, NULL, 0) == 0 && mem) return mem;
+#else
+    long pages = sysconf(_SC_PHYS_PAGES), psize = sysconf(_SC_PAGE_SIZE);
+    if (pages > 0 && psize > 0) return (uint64_t)pages * (uint64_t)psize;
+#endif
+    return 8ull * 1024 * 1024 * 1024;  /* conservative fallback */
+}
+
+/* Explicit flags win; otherwise default to 25% of physical RAM, floored so a
+ * full prefill layer (every expert selected once) always fits. */
+static uint64_t cpu_stream_resolve_budget(const ds4_engine_options *opt) {
+    uint64_t max_triple = 0;
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        const uint64_t t = cpu_stream_triple_bytes(il);
+        if (t > max_triple) max_triple = t;
+    }
+    const uint64_t floor_bytes = max_triple * g_cpu_stream.n_experts;
+    uint64_t budget = 0;
+    const bool explicit_budget =
+        opt->ssd_streaming_cache_bytes != 0 || opt->ssd_streaming_cache_experts != 0;
+    if (opt->ssd_streaming_cache_bytes) {
+        budget = opt->ssd_streaming_cache_bytes;
+    } else if (opt->ssd_streaming_cache_experts) {
+        budget = (uint64_t)opt->ssd_streaming_cache_experts * max_triple;
+    } else {
+        budget = cpu_stream_phys_ram() / 4;
+    }
+    if (explicit_budget && budget < floor_bytes) {
+        fprintf(stderr,
+                "ds4: cpu-stream: requested expert cache below the one-layer minimum; "
+                "raised to %.2f GiB\n",
+                (double)floor_bytes / (1024.0 * 1024.0 * 1024.0));
+    }
+    return budget < floor_bytes ? floor_bytes : budget;
+}
+
+/* Build the (layer, kind) -> file range tables from the GGUF tensor directory
+ * alone (names like "blk.N.ffn_gate_exps.weight"), so init only needs the
+ * model, not the resolved weights table. */
+static bool cpu_stream_init(const ds4_model *m, const ds4_engine_options *opt) {
+    memset(&g_cpu_stream, 0, sizeof(g_cpu_stream));
+    uint32_t n_experts = 0, n_moe_layers = 0;
+    static const char *suffix[3] = {
+        ".ffn_gate_exps.weight", ".ffn_up_exps.weight", ".ffn_down_exps.weight",
+    };
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->ndim != 3 || t->name.len >= 64) continue;
+        char name[64];
+        memcpy(name, t->name.ptr, t->name.len);
+        name[t->name.len] = '\0';
+        unsigned il = 0; int k = -1; char rest[48] = "";
+        if (sscanf(name, "blk.%u%47s", &il, rest) != 2 || il >= DS4_MAX_LAYER) continue;
+        for (int s = 0; s < 3; s++) if (!strcmp(rest, suffix[s])) { k = s; break; }
+        if (k < 0) continue;
+        const gguf_type_info *info = tensor_type(t->type);
+        if (!info || info->block_elems == 0) return false;
+        const uint64_t blocks = (t->dim[0] + info->block_elems - 1) / info->block_elems;
+        g_cpu_stream.off[k][il] = t->abs_offset;
+        g_cpu_stream.expert_bytes[k][il] = t->dim[1] * (blocks * info->block_bytes);
+        if (n_experts == 0) n_experts = (uint32_t)t->dim[2];
+        if (t->dim[2] != n_experts) return false;
+        if (k == 0) n_moe_layers++;
+    }
+    if (!n_experts || !n_moe_layers) return false;
+    g_cpu_stream.n_experts = n_experts;
+    g_cpu_stream.n_layers = n_moe_layers;
+    g_cpu_stream.fd = m->fd;
+    g_cpu_stream.entries = calloc((size_t)DS4_MAX_LAYER * n_experts, sizeof(cpu_stream_entry));
+    if (!g_cpu_stream.entries) return false;
+    g_cpu_stream.budget_bytes = cpu_stream_resolve_budget(opt);
+    g_cpu_stream.enabled = true;
+    ds4_log(stderr, DS4_LOG_WARNING,
+            "ds4: CPU SSD streaming: %u moe layers, %u experts/layer, cache budget %.2f GiB\n",
+            n_moe_layers, n_experts,
+            (double)g_cpu_stream.budget_bytes / (1024.0 * 1024.0 * 1024.0));
+    return true;
+}
+
+static void cpu_stream_close(void) {
+    if (!g_cpu_stream.entries) return;
+    if (g_cpu_stream.enabled) {
+        ds4_log(stderr, DS4_LOG_WARNING,
+                "ds4: CPU stream: %u layers, %llu hits, %llu misses, %llu evictions, "
+                "%.2f GiB read\n",
+                g_cpu_stream.n_layers,
+                (unsigned long long)g_cpu_stream.hits,
+                (unsigned long long)g_cpu_stream.misses,
+                (unsigned long long)g_cpu_stream.evictions,
+                (double)g_cpu_stream.pread_bytes / (1024.0 * 1024.0 * 1024.0));
+    }
+    const uint64_t total = (uint64_t)DS4_MAX_LAYER * g_cpu_stream.n_experts;
+    for (uint64_t i = 0; i < total; i++) {
+        cpu_stream_entry *en = &g_cpu_stream.entries[i];
+        if (en->valid) for (int k = 0; k < 3; k++) free(en->buf[k]);
+    }
+    free(g_cpu_stream.entries);
+    memset(&g_cpu_stream, 0, sizeof(g_cpu_stream));
+}
+
+/* WILLNEED only the non-routed weights: they are the small resident part.
+ * Never hint the routed expert ranges -- those go through pread. */
+static void cpu_stream_prefetch_nonrouted(const ds4_model *m) {
+#if defined(POSIX_MADV_WILLNEED)
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->ndim == 3) {
+            uint32_t il; cpu_stream_kind kind;
+            if (cpu_stream_resolve(t, &il, &kind)) continue;  /* routed: skip */
+        }
+        if (t->bytes == 0) continue;
+        posix_madvise((void *)(m->map + t->abs_offset), (size_t)t->bytes,
+                      POSIX_MADV_WILLNEED);
+    }
+#else
+    (void)m;
+#endif
+}
+
 /* Locate one expert's 2D matrix inside a 3D GGUF expert tensor. */
 static const uint8_t *tensor_expert_bytes(
         const ds4_model  *m,
@@ -5535,6 +6125,10 @@ static const uint8_t *tensor_expert_bytes(
         uint64_t         *row_bytes) {
     if (w->ndim != 3) ds4_die("expected a 3D expert tensor");
     if (expert >= w->dim[2]) ds4_die("expert id is outside expert tensor");
+
+    if (g_cpu_stream.enabled) {
+        return cpu_stream_expert_bytes(m, w, expert, in_dim, out_dim, row_bytes);
+    }
 
     *in_dim = w->dim[0];
     *out_dim = w->dim[1];
@@ -7443,6 +8037,7 @@ static void layer_routed_moe_one(
         int                 token,
         float               clamp,
         bool                trace) {
+    cpu_stream_layer_begin();
     int selected[DS4_MAX_EXPERT_USED];
     float expert_weight[DS4_MAX_EXPERT_USED];
     float *gate = trace ? xmalloc((size_t)DS4_N_FF_EXP * sizeof(gate[0])) : NULL;
@@ -7591,6 +8186,7 @@ static void layer_routed_moe_batch(
         uint32_t            n_tok,
         uint32_t            il,
         float               clamp) {
+    cpu_stream_layer_begin();
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
     const uint64_t expert_out_dim = layer->ffn_gate_exps->dim[1];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
@@ -7642,6 +8238,8 @@ static void layer_routed_moe_batch(
         cursor[e] = counts[e];
         if (counts[e + 1] != counts[e]) active_expert[n_active++] = e;
     }
+
+    cpu_stream_ensure_experts(il, active_expert, n_active);
 
     uint32_t *pair_ids = xmalloc((size_t)total_pairs * sizeof(pair_ids[0]));
     for (uint32_t p = 0; p < total_pairs; p++) {
@@ -7944,6 +8542,7 @@ static void layer_ffn_one_decode_scratch(
     if (profile) t_norm = now_sec() - t0;
 
     t0 = profile ? now_sec() : 0.0;
+    cpu_stream_layer_begin();
     layer_routed_moe_one_prealloc(scratch->ffn_moe,
                                   model,
                                   layer,
@@ -8109,6 +8708,10 @@ static void layer_routed_moe_tokens_parallel(
         .down_in_dim = layer->ffn_down_exps->dim[0],
         .il = il,
     };
+    /* Bump the pin sequence once here, on the orchestrating thread, before
+     * dispatching worker threads that will call cpu_stream_fetch() (via
+     * tensor_expert_bytes()) concurrently for this layer. */
+    cpu_stream_layer_begin();
     ds4_parallel_for_min_rows(n_tok, routed_moe_tokens_worker, &ctx, 1);
 }
 
@@ -8165,6 +8768,7 @@ static void layer_ffn_shared_batch(
     if (routed_token_parallel) {
         layer_routed_moe_tokens_parallel(moe, model, layer, norm, token_ids, n_tok, il);
     } else {
+        cpu_stream_layer_begin();
         for (uint32_t t = 0; t < n_tok; t++) {
             layer_routed_moe_one_prealloc(moe + (uint64_t)t * DS4_N_EMBD,
                                           model,
@@ -16398,6 +17002,7 @@ static void metal_graph_trace_layer_stages(
                               shared_xscale);
     swiglu(cpu_shared_mid, cpu_shared_gate, cpu_shared_up, shared_dim, DS4_SWIGLU_CLAMP_EXP);
     matvec_q8_0(cpu_shared, model, layer->ffn_down_shexp, cpu_shared_mid);
+    cpu_stream_layer_begin();
     layer_routed_moe_one_prealloc(cpu_routed,
                                   model,
                                   layer,
@@ -16623,6 +17228,7 @@ static int metal_graph_decode_test(
                           cpu_after_attn_hc, cpu_ffn_cur, cpu_ffn_post, cpu_ffn_comb);
     rms_norm_weight(cpu_ffn_norm, cpu_ffn_cur, tensor_data(model, layer->ffn_norm), DS4_N_EMBD, DS4_RMS_EPS);
     layer_shared_ffn_one(cpu_shared, model, layer, cpu_ffn_norm);
+    cpu_stream_layer_begin();
     layer_routed_moe_one_prealloc(cpu_routed,
                                   model,
                                   layer,
@@ -25603,15 +26209,45 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
-    model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
+    const bool cpu_streaming = opt->ssd_streaming && opt->backend == DS4_BACKEND_CPU;
+#ifdef __APPLE__
+    /* Advisory only: we do not refuse to run, we just warn. Tokenizer-only
+     * (--inspect-only) runs never touch the tensor payload, so they cannot
+     * trigger the mmap fault storm this warns about. */
+    if (opt->backend == DS4_BACKEND_CPU && !opt->ssd_streaming && !opt->inspect_only) {
+        fprintf(stderr,
+                "ds4: warning: the plain CPU path can crash current macOS kernels with "
+                "large models; use --ssd-streaming (see README)\n");
+    }
+#endif
+    /* CPU streaming replaces the whole-file WILLNEED prefetch with per-tensor
+     * hints on the non-routed weights only (see cpu_stream_prefetch_nonrouted). */
+    model_open(&e->model, opt->model_path, graph_backend,
+               !opt->inspect_only && !cpu_streaming);
     if (opt->warm_weights) model_warm_weights(&e->model);
     if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
     if (e->ssd_streaming && !ds4_backend_supports_ssd_streaming(e->backend)) {
-        fprintf(stderr, "ds4: --ssd-streaming is currently supported only with --metal/--cuda/--rocm\n");
-        ds4_engine_close(e);
-        *out = NULL;
-        return 1;
+        if (e->backend == DS4_BACKEND_CPU) {
+            /* CPU streaming: bounded pread cache for routed experts. This is
+             * the supported way to run the CPU backend on macOS, where
+             * faulting the whole GGUF through the mmap can panic the kernel. */
+            if (!cpu_stream_init(&e->model, opt)) {
+                fprintf(stderr, "ds4: --ssd-streaming: model has no routed expert tensors\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            if (opt->ssd_streaming_preload_experts != 0) {
+                fprintf(stderr, "ds4: --ssd-streaming-preload-experts is ignored on the CPU backend\n");
+            }
+            if (!opt->inspect_only) cpu_stream_prefetch_nonrouted(&e->model);
+        } else {
+            fprintf(stderr, "ds4: --ssd-streaming is currently supported only with --metal/--cuda/--rocm (or --cpu)\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
     }
     const char *expert_profile_path = opt->expert_profile_path;
     if (!expert_profile_path || !expert_profile_path[0]) {
@@ -26025,6 +26661,7 @@ void ds4_engine_close(ds4_engine *e) {
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
     if (e->mtp_ready) model_close(&e->mtp_model);
+    cpu_stream_close();
     model_close(&e->model);
 #ifndef DS4_NO_GPU
     ds4_gpu_cleanup();
