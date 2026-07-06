@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/file.h>  /* For clock_gettime, nanosleep, PATH_MAX on Windows */
 
 typedef struct {
     const char *model_path;

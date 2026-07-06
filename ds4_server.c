@@ -13,7 +13,16 @@
  * batching decisions in one place instead of spreading graph mutations across
  * client threads. */
 
-#include <arpa/inet.h>
+#ifdef _WIN32
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  #include <sys/file.h>
+#else
+  #include <arpa/inet.h>
+  #include <netinet/in.h>
+  #include <poll.h>
+#endif
+
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -21,8 +30,6 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <math.h>
-#include <netinet/in.h>
-#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -32,7 +39,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/socket.h>
+#ifdef _WIN32
+  /* On Windows, use compat/win32/sys/socket.h which wraps winsock2.h,
+     initializes WSAStartup, and provides POSIX socket compat. */
+  #include <sys/socket.h>
+#else
+  #include <sys/socket.h>
+#endif
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -11348,7 +11361,7 @@ static int listen_on(const char *host, int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     int yes = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
 
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof(sa));
@@ -11375,8 +11388,8 @@ static void configure_client_socket(int fd) {
     struct timeval tv;
     tv.tv_sec = DS4_SERVER_IO_TIMEOUT_SEC;
     tv.tv_usec = 0;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
 }
 
 static void set_client_socket_nonblocking(int fd) {

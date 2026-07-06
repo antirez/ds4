@@ -3568,7 +3568,15 @@ static uint64_t cuda_q8_f16_cache_reserve_bytes(uint64_t total_bytes) {
      * last few GiB on 96 GiB cards. */
     const uint64_t min_reserve = 4096ull * 1048576ull;
     const uint64_t pct_reserve = total_bytes / 20u; /* 5% */
-    return pct_reserve > min_reserve ? pct_reserve : min_reserve;
+    uint64_t reserve = pct_reserve > min_reserve ? pct_reserve : min_reserve;
+#ifdef _WIN32
+    /* On Windows, the ROCm driver has substantially higher memory overhead
+     * (~12 GiB on Strix Halo) due to driver bookkeeping and pinned staging
+     * buffers.  Reserve an extra 12 GiB so the Q8->F16 cache does not crowd
+     * out the inference computation buffers. */
+    reserve += 12ull * 1024ull * 1048576ull;
+#endif
+    return reserve;
 }
 
 static void cuda_q8_f16_cache_budget_notice(
@@ -4082,7 +4090,9 @@ static int cuda_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
     uint64_t done = 0;
     while (done < bytes) {
         const size_t n_req = (bytes - done > (uint64_t)SSIZE_MAX) ? (size_t)SSIZE_MAX : (size_t)(bytes - done);
-        ssize_t n = pread(fd, (char *)buf + done, n_req, (off_t)(offset + done));
+        /* Use int64_t cast, not off_t: on Windows MSVC, off_t is 32-bit
+         * (typedef long off_t) and would truncate offsets above 4 GB. */
+        ssize_t n = pread(fd, (char *)buf + done, n_req, (int64_t)(offset + done));
         if (n < 0) {
             if (errno == EINTR) continue;
             return 0;
@@ -4706,7 +4716,9 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
         struct stat st;
         if (fstat(fd, &st) == 0 && st.st_size > 0) {
             g_model_file_size = (uint64_t)st.st_size;
+#ifndef _WIN32
             if (st.st_blksize > 1) g_model_direct_align = (uint64_t)st.st_blksize;
+#endif
         }
 #if defined(__linux__) && defined(O_DIRECT)
         {

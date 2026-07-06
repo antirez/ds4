@@ -28,7 +28,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -1950,8 +1949,13 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     int fd = open(path, O_RDONLY);
     if (fd == -1) ds4_die_errno("cannot open model", path);
 
-    struct stat st;
-    if (fstat(fd, &st) == -1) ds4_die_errno("cannot stat model", path);
+    #ifdef _WIN32
+        struct _stat64 st;
+        if (_fstat64(fd, &st) == -1) ds4_die_errno("cannot stat model", path);
+    #else
+        struct stat st;
+        if (fstat(fd, &st) == -1) ds4_die_errno("cannot stat model", path);
+    #endif
     if (st.st_size < 32) ds4_die("model file is too small to be GGUF");
 
     /*

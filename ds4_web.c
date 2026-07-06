@@ -1,12 +1,21 @@
 #include "ds4_web.h"
 
-#include <arpa/inet.h>
+#ifdef _WIN32
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  #include <sys/file.h>
+#else
+  #include <arpa/inet.h>
+  #include <netdb.h>
+  #include <poll.h>
+  #include <sys/socket.h>
+  #include <sys/wait.h>
+#endif
+
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <netdb.h>
-#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -15,10 +24,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1020,6 +1027,16 @@ static const char *web_macos_chrome_app_name(void) {
 }
 #endif
 
+#ifdef _WIN32
+/* On Windows, Chrome browser spawning via fork/exec is not supported.
+   Provide a no-op stub that indicates the feature is unavailable. */
+static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
+    (void)web;
+    web_set_err(err, err_len, "Chrome browser spawning is not supported on Windows");
+    return false;
+}
+#else
+/* POSIX: fork/exec to spawn Chrome as a background process. */
 static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
     if (!web_mkdir_p(web->profile_dir)) {
         web_set_err(err, err_len, "failed to create Chrome profile dir %s: %s",
@@ -1101,14 +1118,17 @@ static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
     web_set_err(err, err_len, "Chrome did not expose CDP on port %d", web->port);
     return false;
 }
+#endif
 
 static bool web_ensure_browser(ds4_web *web, char *err, size_t err_len) {
     if (web_cdp_alive(web)) return true;
+#ifndef _WIN32
     if (web->chrome_pid > 0) {
         int status = 0;
         waitpid(web->chrome_pid, &status, WNOHANG);
         web->chrome_pid = 0;
     }
+#endif
     if (!web->browser_allowed) {
         if (!web->confirm) {
             web_set_err(err, err_len,

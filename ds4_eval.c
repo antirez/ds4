@@ -40,8 +40,13 @@
 #include <string.h>
 #include <strings.h>
 #include <pthread.h>
-#include <sys/ioctl.h>
-#include <termios.h>
+#ifdef _WIN32
+  #include <windows.h>
+  #include <sys/file.h>
+#else
+  #include <sys/ioctl.h>
+  #include <termios.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 
@@ -1320,7 +1325,9 @@ typedef struct {
     volatile sig_atomic_t running;
     pthread_t thread;
     pthread_mutex_t mu;
+#ifndef _WIN32
     struct termios orig_termios;
+#endif
     int move_delta;
     bool enter_pressed;
     bool pause_pressed;
@@ -1852,6 +1859,7 @@ static void *input_thread_main(void *arg) {
 }
 
 static void tui_start_input(void) {
+#ifndef _WIN32
     if (!isatty(STDIN_FILENO)) return;
     if (tcgetattr(STDIN_FILENO, &global_input.orig_termios) != 0) return;
 
@@ -1865,6 +1873,7 @@ static void tui_start_input(void) {
     raw.c_cc[VMIN] = 0;
     raw.c_cc[VTIME] = 1;
     if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) return;
+#endif
 
     pthread_mutex_lock(&global_input.mu);
     global_input.move_delta = 0;
@@ -1881,7 +1890,9 @@ static void tui_start_input(void) {
     } else {
         global_input.running = 0;
         global_input.enabled = false;
+#ifndef _WIN32
         tcsetattr(STDIN_FILENO, TCSANOW, &global_input.orig_termios);
+#endif
         global_input.raw_mode = false;
     }
 }
@@ -1892,10 +1903,12 @@ static void tui_stop_input(void) {
         pthread_join(global_input.thread, NULL);
         global_input.thread_started = false;
     }
+#ifndef _WIN32
     if (global_input.raw_mode) {
         tcsetattr(STDIN_FILENO, TCSANOW, &global_input.orig_termios);
         global_input.raw_mode = false;
     }
+#endif
     global_input.enabled = false;
 }
 
@@ -1961,10 +1974,12 @@ static void tui_signal_restore(int sig) {
      * default action so the process status remains correct. */
     eval_ui *ui = global_ui;
     global_input.running = 0;
+#ifndef _WIN32
     if (global_input.raw_mode) {
         tcsetattr(STDIN_FILENO, TCSANOW, &global_input.orig_termios);
         global_input.raw_mode = false;
     }
+#endif
     if (ui && ui->active) {
         const char restore[] = ANSI_RESET "\x1b[?25h\x1b[?1049l";
         if (write(STDOUT_FILENO, restore, sizeof(restore) - 1) == -1) {}
