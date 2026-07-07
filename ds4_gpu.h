@@ -1733,6 +1733,42 @@ int ds4_gpu_glm_attention_flash_tensor(
         uint32_t              value_dim,
         bool                  cache_f16);
 
+/* pos-vector variants for batched decode: token t uses pos[t] instead of
+ * pos0 + t.  n_tok is capped at DS4_GPU_DECODE_MULTI_MAX (positions travel
+ * by value in the kernel parameters). */
+int ds4_gpu_head_rms_norm_rope_tail_multi_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          n_head,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        const uint32_t   *pos,
+        uint32_t          n_ctx_orig,
+        bool              inverse,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow,
+        float             eps);
+
+int ds4_gpu_rope_tail_multi_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          n_head,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        const uint32_t   *pos,
+        uint32_t          n_ctx_orig,
+        bool              inverse,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow);
+
 /* Release decode fused KV finalizer: after the standalone RoPE kernel, this
  * performs DS4's FP8 non-RoPE KV round trip and writes the F16-rounded raw
  * attention cache row in one dispatch. */
