@@ -217,6 +217,12 @@ int ds4_token_eos(ds4_engine *e);
 int ds4_token_user(ds4_engine *e);
 int ds4_token_assistant(ds4_engine *e);
 
+/* Multiple sessions may share one engine: each session owns its live KV
+ * cache and timeline, while transient work buffers are engine-owned and
+ * shared.  Sessions sharing an engine must therefore be driven from one
+ * thread at a time (create/sync/eval/sample/free); interleaving calls across
+ * sessions on that thread is fine, concurrent calls are not.  This matches
+ * the server's single graph worker. */
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
 int ds4_session_power(ds4_session *s);
