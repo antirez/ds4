@@ -1971,6 +1971,33 @@ int ds4_gpu_flash_kv_stage_f16_tensor(
         uint32_t                n_comp,
         uint32_t                head_dim);
 
+/* Batched multi-sequence decode attention: one query token per sequence,
+ * each attending to its own KV caches (all rows visible, decode semantics).
+ * Slot b reads q row b and writes heads row b. */
+#define DS4_GPU_DECODE_MULTI_MAX 4u
+
+typedef struct {
+    const ds4_gpu_tensor *raw_kv;
+    const ds4_gpu_tensor *comp_kv;     /* NULL when the layer keeps no compressed cache */
+    const ds4_gpu_tensor *comp_mask;   /* per-sequence mask row (n_comp floats), NULL = none */
+    uint32_t                n_raw;
+    uint32_t                raw_cap;
+    uint32_t                raw_start;
+    uint32_t                n_comp;
+} ds4_gpu_attn_seqview;
+
+int ds4_gpu_attention_decode_heads_multi_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_attn_seqview *seqs,
+        uint32_t                n_seqs,
+        uint32_t                comp_kv_f16,
+        uint32_t                n_head,
+        uint32_t                head_dim);
+
 int ds4_gpu_attention_prefill_raw_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,

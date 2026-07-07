@@ -11283,6 +11283,123 @@ static int ds4_cuda_attn_tokentile_arch_ok(void) {
     return prop.major >= 8;
 }
 
+/* Multi-sequence decode attention.  One block column per sequence: sequence b
+ * evaluates its single query token against its own raw + compressed caches
+ * with everything visible, exactly like the n_tokens==1 launch of
+ * attention_decode_mixed_kernel, but each sequence reads from its own
+ * cache pointers.  Kept as a standalone kernel so the single-session hot
+ * path stays untouched. */
+typedef struct {
+    const float *raw_kv;
+    const float *comp_kv;
+    const float *comp_mask;   /* per-sequence mask row, NULL = none */
+    uint32_t n_raw;
+    uint32_t raw_cap;
+    uint32_t raw_start;
+    uint32_t n_comp;
+} cuda_attn_seqview;
+
+typedef struct {
+    cuda_attn_seqview v[DS4_GPU_DECODE_MULTI_MAX];
+} cuda_attn_seqviews;
+
+__global__ static void attention_decode_multi_kernel(
+        float *heads,
+        const float *sinks,
+        const float *q,
+        cuda_attn_seqviews views,
+        uint32_t n_seqs,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    const uint32_t t = blockIdx.x;
+    const uint32_t h = blockIdx.y;
+    if (t >= n_seqs || h >= n_head) return;
+    const cuda_attn_seqview view = views.v[t];
+    const uint32_t raw_count = view.n_raw > 256u ? 256u : view.n_raw;
+    const uint32_t visible_comp = view.n_comp;
+    const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+    __shared__ float scores[DS4_CUDA_ATTENTION_SCORE_CAP];
+    __shared__ uint32_t raw_rows[256];
+    __shared__ float partial[256];
+    __shared__ float max_s;
+    __shared__ float denom;
+    const float scale = rsqrtf((float)head_dim);
+    for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
+        raw_rows[r] = (view.raw_start + r) % view.raw_cap;
+    }
+    __syncthreads();
+    const uint32_t n_score = raw_count + visible_comp;
+    float local_max = sinks[h];
+    for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
+        const float *kvrow = view.raw_kv + (uint64_t)raw_rows[r] * head_dim;
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+        scores[r] = dot * scale;
+        local_max = fmaxf(local_max, scores[r]);
+    }
+    for (uint32_t cidx = threadIdx.x; cidx < visible_comp; cidx += blockDim.x) {
+        float add = view.comp_mask ? view.comp_mask[cidx] : 0.0f;
+        float s = -INFINITY;
+        if (add > -1.0e20f) {
+            const float *kvrow = view.comp_kv + (uint64_t)cidx * head_dim;
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+            s = dot * scale + add;
+        }
+        scores[raw_count + cidx] = s;
+        local_max = fmaxf(local_max, s);
+    }
+    partial[threadIdx.x] = local_max;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) max_s = partial[0];
+    __syncthreads();
+    float den_local = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n_score; i += blockDim.x) {
+        scores[i] = expf(scores[i] - max_s);
+        den_local += scores[i];
+    }
+    partial[threadIdx.x] = den_local;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) denom = partial[0] + expf(sinks[h] - max_s);
+    __syncthreads();
+    float *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
+    if (head_dim == 512u && blockDim.x == 256u) {
+        const uint32_t d0 = threadIdx.x;
+        const uint32_t d1 = d0 + 256u;
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        for (uint32_t r = 0; r < raw_count; r++) {
+            const float s = scores[r];
+            const float *kv = view.raw_kv + (uint64_t)raw_rows[r] * head_dim;
+            acc0 += kv[d0] * s;
+            acc1 += kv[d1] * s;
+        }
+        for (uint32_t cidx = 0; cidx < visible_comp; cidx++) {
+            const float s = scores[raw_count + cidx];
+            const float *kv = view.comp_kv + (uint64_t)cidx * head_dim;
+            acc0 += kv[d0] * s;
+            acc1 += kv[d1] * s;
+        }
+        oh[d0] = acc0 / denom;
+        oh[d1] = acc1 / denom;
+    } else {
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            float acc = 0.0f;
+            for (uint32_t r = 0; r < raw_count; r++) acc += view.raw_kv[(uint64_t)raw_rows[r] * head_dim + d] * scores[r];
+            for (uint32_t cidx = 0; cidx < visible_comp; cidx++) acc += view.comp_kv[(uint64_t)cidx * head_dim + d] * scores[raw_count + cidx];
+            oh[d] = acc / denom;
+        }
+    }
+}
+
 __global__ static void __launch_bounds__(256, 4)
 attention_decode_mixed_heads8_online_kernel(
         float *heads,
@@ -17336,6 +17453,64 @@ extern "C" int ds4_gpu_attention_decode_rows_rope_tensor(
         beta_fast, beta_slow);
     return cuda_ok(cudaGetLastError(),
                    "attention decode rows inverse rope launch");
+}
+
+extern "C" int ds4_gpu_attention_decode_heads_multi_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_attn_seqview *seqs,
+        uint32_t                n_seqs,
+        uint32_t                comp_kv_f16,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    if (comp_kv_f16 || !heads || !q || !seqs || !model_map ||
+        n_seqs == 0 || n_seqs > DS4_GPU_DECODE_MULTI_MAX ||
+        sinks_offset > model_size ||
+        (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
+        heads->bytes < (uint64_t)n_seqs * n_head * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_seqs * n_head * head_dim * sizeof(float)) {
+        return 0;
+    }
+    cuda_attn_seqviews views;
+    memset(&views, 0, sizeof(views));
+    for (uint32_t b = 0; b < n_seqs; b++) {
+        const ds4_gpu_attn_seqview *sv = &seqs[b];
+        if (!sv->raw_kv || sv->n_raw == 0 || sv->raw_cap < sv->n_raw ||
+            sv->raw_start >= sv->raw_cap ||
+            (sv->n_comp != 0 && !sv->comp_kv) ||
+            sv->raw_kv->bytes < (uint64_t)sv->raw_cap * head_dim * sizeof(float) ||
+            (sv->n_comp && sv->comp_kv->bytes < (uint64_t)sv->n_comp * head_dim * sizeof(float)) ||
+            (sv->comp_mask && sv->comp_mask->bytes < (uint64_t)sv->n_comp * sizeof(float))) {
+            return 0;
+        }
+        if (!cuda_attention_score_buffer_fits(sv->n_comp)) {
+            /* The large-context online variant is not implemented for the
+             * multi path yet; callers gate batched decode on this. */
+            return 0;
+        }
+        views.v[b].raw_kv = (const float *)sv->raw_kv->ptr;
+        views.v[b].comp_kv = sv->n_comp ? (const float *)sv->comp_kv->ptr : (const float *)sv->raw_kv->ptr;
+        views.v[b].comp_mask = sv->comp_mask ? (const float *)sv->comp_mask->ptr : NULL;
+        views.v[b].n_raw = sv->n_raw;
+        views.v[b].raw_cap = sv->raw_cap;
+        views.v[b].raw_start = sv->raw_start;
+        views.v[b].n_comp = sv->n_comp;
+    }
+    const float *sinks = (const float *)cuda_model_range_ptr(
+            model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
+    if (!sinks) return 0;
+    dim3 grid(n_seqs, n_head, 1);
+    attention_decode_multi_kernel<<<grid, 256>>>((float *)heads->ptr,
+                                                 sinks,
+                                                 (const float *)q->ptr,
+                                                 views,
+                                                 n_seqs,
+                                                 n_head,
+                                                 head_dim);
+    return cuda_ok(cudaGetLastError(), "attention decode multi launch");
 }
 
 extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim) {
