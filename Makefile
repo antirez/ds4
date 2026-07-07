@@ -241,6 +241,12 @@ tests/batched_decode_smoke.o: tests/batched_decode_smoke.c ds4.h
 tests/batched_decode_smoke: tests/batched_decode_smoke.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
+tests/batched_decode_bench.o: tests/batched_decode_bench.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/batched_decode_bench.c
+
+tests/batched_decode_bench: tests/batched_decode_bench.o $(CORE_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
 ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)
 ifeq ($(UNAME_S),Darwin)
 	$(CC) $(CFLAGS) -o $@ ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
