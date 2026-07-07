@@ -223,6 +223,12 @@ tests/two_sessions_smoke.o: tests/two_sessions_smoke.c ds4.h
 tests/two_sessions_smoke: tests/two_sessions_smoke.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
+tests/attention_multi_smoke.o: tests/attention_multi_smoke.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/attention_multi_smoke.c
+
+tests/attention_multi_smoke: tests/attention_multi_smoke.o ds4_cuda.o
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
 ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)
 ifeq ($(UNAME_S),Darwin)
 	$(CC) $(CFLAGS) -o $@ ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
