@@ -156,6 +156,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
 #endif
     if (tool != DS4_HELP_BENCH) {
         opt(fp, c, "-c, --ctx N", "Allocated context tokens.");
+        opt(fp, c, "--parallel N", "Serve up to N requests concurrently by interleaving N sessions on the graph worker. Requires resident experts. Default: 1");
     }
     if (tool == DS4_HELP_SERVER) {
         opt(fp, c, "-n, --tokens N", "Default max output tokens when clients omit a limit.");
