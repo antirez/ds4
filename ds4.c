@@ -30697,9 +30697,13 @@ static bool glm_graph_forward_indexed_tokens(
         !force_scalar_attn && glm_graph_indexed_prefill_batch_qk_low();
     const bool use_batch_attn_kernel =
         !force_scalar_attn && glm_graph_indexed_prefill_batch_attn_kernel();
+    /* The split value-projection path assumes the f16 compact cache layout
+     * (Metal); on CUDA the compact cache is f32 and the split path fails
+     * the batch attention-lora encode at layer 0. */
     const bool use_split_value_proj =
         use_batch_attn_kernel &&
-        g->batch_attn_lora;
+        g->batch_attn_lora &&
+        glm_graph_compact_cache_is_f16() != 0;
     const bool use_batch_q_rank_proj = true;
     const bool use_batch_q_proj = true;
     const bool use_batch_indexer_k_proj = true;
@@ -38717,10 +38721,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = e;
             return 0;
         }
-        if (e->backend != DS4_BACKEND_METAL || !ds4_backend_uses_graph(e->backend)) {
+        if ((e->backend != DS4_BACKEND_METAL && e->backend != DS4_BACKEND_CUDA) ||
+            !ds4_backend_uses_graph(e->backend)) {
             fprintf(stderr,
                     "ds4: GLM 5.2 tensor layout is recognized, but GLM inference is "
-                    "currently Metal-only; use --inspect, --cpu --first-token-test, "
+                    "currently Metal/CUDA-only; use --inspect, --cpu --first-token-test, "
                     "--metal --metal-graph-test, or limited --metal generation\n");
             ds4_engine_close(e);
             *out = NULL;
