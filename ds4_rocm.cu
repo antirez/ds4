@@ -27,13 +27,21 @@
 #include <limits.h>
 #include <math.h>
 #include <fcntl.h>
+#ifdef _WIN32
+#include <unistd.h>   /* compat/win32/unistd.h — POSIX shims for MSVC target */
+#include <pthread.h>  /* compat/win32/pthread.h — Windows shim via -I./compat/win32 */
+#else
+#include <unistd.h>
 #include <pthread.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 #include <unordered_map>
 #include <vector>
 

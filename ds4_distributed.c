@@ -15,15 +15,30 @@
 
 #include "ds4_distributed.h"
 
-#include <arpa/inet.h>
+#ifdef _WIN32
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  #include <sys/file.h>
+  #include <sys/socket.h>  /* Provides poll() and if_nametoindex() on Windows */
+  /* POSIX socket shutdown constants */
+  #ifndef SHUT_RD
+  #  define SHUT_RD    SD_RECEIVE
+  #  define SHUT_WR    SD_SEND
+  #  define SHUT_RDWR  SD_BOTH
+  #endif
+#else
+  #include <arpa/inet.h>
+  #include <netdb.h>
+  #include <net/if.h>
+  #include <netinet/in.h>
+  #include <netinet/tcp.h>
+  #include <sys/socket.h>
+  #include <poll.h>
+#endif
+
 #include <errno.h>
 #include <float.h>
 #include <math.h>
-#include <netdb.h>
-#include <net/if.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <limits.h>
@@ -31,7 +46,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <time.h>
@@ -8400,7 +8414,9 @@ int ds4_dist_run(ds4_engine *engine, const ds4_dist_options *opt, const ds4_dist
         return 2;
     }
 
+#ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     if (opt->role == DS4_DISTRIBUTED_COORDINATOR) {
         return dist_run_coordinator(engine, opt, gen);

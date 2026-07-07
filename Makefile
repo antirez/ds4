@@ -33,14 +33,14 @@ CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
-ROCM_CFLAGS ?= -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
+ROCM_CFLAGS ?= -O3 -ffast-math -g -fno-finite-math-only -std=c++17 -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
 ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo strix-halo-windows rocm
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -110,6 +110,44 @@ strix-halo:
 		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
+
+# Windows build for Strix Halo (gfx1151) using AMD HIP SDK + MSYS2 MinGW-w64.
+# Prerequisites:
+#   1. AMD HIP SDK for Windows: https://rocm.docs.amd.com/projects/install-on-windows/en/latest/
+#   2. MSYS2 with MinGW-w64: https://www.msys2.org/  (pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-make)
+#   3. hipcc in PATH (from the HIP SDK bin directory)
+#   4. rocWMMA headers: git clone --depth 1 --branch rocm-7.1.0 https://github.com/ROCm/rocWMMA.git
+#                       and copy library/include/rocwmma to a directory in your include path
+# Usage: make strix-halo-windows  (from an MSYS2 MinGW64 shell)
+WIN32_COMPAT_DIR = ./compat/win32
+WIN32_COMPAT_OBJS = compat/win32/sys/mman.o
+MSYS2_MINGW_INC ?= C:/msys64/mingw64/include
+# Isolated include path for hipcc: only rocwmma headers, no MinGW stdlib
+# (MinGW stdlib conflicts with hipcc's built-in MSVC headers)
+WIN32_ROCWMMA_INC ?= C:/msys64/opt/include
+WIN32_CFLAGS = -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=gnu99 \
+    -fno-finite-math-only -D_GNU_SOURCE -DDS4_ROCM_BUILD -I$(WIN32_COMPAT_DIR) -I$(MSYS2_MINGW_INC)
+WIN32_ROCM_CFLAGS = $(ROCM_CFLAGS) -I$(WIN32_COMPAT_DIR) -I$(WIN32_ROCWMMA_INC) -D_HAS_CLANG_BUILTINS=0 -Wno-invalid-specialization
+# Use hipcc (MSVC target) for ALL compilation to avoid ABI mismatch.
+# WIN32_CC_CMD wraps hipcc for C sources: compile as C with MSVC-compatible flags.
+WIN32_CC_CMD = $(HIPCC) -x c -std=c11 -D_CRT_SECURE_NO_WARNINGS
+WIN32_CFLAGS_MSVC = -O3 $(DEBUG_FLAGS) -D_GNU_SOURCE -DDS4_ROCM_BUILD -I$(WIN32_COMPAT_DIR) -I$(WIN32_ROCWMMA_INC)
+# Import libraries generated from HIP SDK DLLs via dlltool:
+#   dlltool -D libhipblas.dll -l C:/msys64/opt/lib/hipblas.lib
+#   dlltool -D libhipblaslt.dll -l C:/msys64/opt/lib/hipblaslt.lib
+WIN32_ROCM_LIBS_DIR ?= C:/msys64/opt/lib
+
+strix-halo-windows: $(WIN32_COMPAT_OBJS)
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval \
+		CC="$(HIPCC) -x c -std=c11 -D_CRT_SECURE_NO_WARNINGS -Wno-deprecated-declarations" \
+		CORE_OBJS="ds4.o ds4_distributed.o ds4_ssd.o ds4_rocm.o $(WIN32_COMPAT_OBJS)" \
+		CFLAGS="-O3 $(DEBUG_FLAGS) -DDS4_ROCM_BUILD -I$(WIN32_COMPAT_DIR) -I$(WIN32_ROCWMMA_INC) -D_HAS_CLANG_BUILTINS=0 -Wno-invalid-specialization" \
+		ROCM_CFLAGS="$(WIN32_ROCM_CFLAGS)" \
+		DS4_LINK="$(HIPCC) $(WIN32_ROCM_CFLAGS)" \
+		DS4_LINK_LIBS="C:/PROGRA~1/AMD/ROCm/7.1/lib/libhipblas.dll.a C:/PROGRA~1/AMD/ROCm/7.1/lib/libhipblaslt.dll.a C:/PROGRA~1/AMD/ROCm/7.1/lib/amdhip64.lib -L$(WIN32_ROCM_LIBS_DIR) -lws2_32 -liphlpapi"
+
+$(WIN32_COMPAT_OBJS): compat/win32/sys/mman.c compat/win32/sys/mman.h
+	$(HIPCC) -x c -std=c11 -O3 $(DEBUG_FLAGS) -D_GNU_SOURCE -DDS4_ROCM_BUILD -I$(WIN32_COMPAT_DIR) -I$(WIN32_ROCWMMA_INC) -Wno-deprecated-declarations -D_CRT_SECURE_NO_WARNINGS -c -o $@ compat/win32/sys/mman.c
 
 rocm: strix-halo
 

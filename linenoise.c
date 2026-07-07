@@ -103,7 +103,9 @@
  *
  */
 
+#ifndef _WIN32
 #include <termios.h>
+#endif
 #include <unistd.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -113,7 +115,13 @@
 #include <ctype.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/ioctl.h>
+
+/* On Windows, termios is not available. linenoise features requiring it will be disabled. */
+#ifdef _WIN32
+  #include <sys/file.h>
+#else
+  #include <sys/ioctl.h>
+#endif
 #include <unistd.h>
 #include <stdint.h>
 #include "linenoise.h"
@@ -137,7 +145,9 @@ static void refreshLineWithCompletion(struct linenoiseState *ls, linenoiseComple
 static void refreshLineWithFlags(struct linenoiseState *l, int flags);
 static void linenoiseFoldClear(struct linenoiseState *l);
 
+#ifndef _WIN32
 static struct termios orig_termios; /* In order to restore at exit.*/
+#endif
 static int maskmode = 0; /* Show "***" instead of input. For passwords. */
 static int rawmode = 0; /* For atexit() function to check if restore is needed*/
 static int rawmode_output = STDOUT_FILENO; /* fd used for terminal escapes. */
@@ -565,6 +575,7 @@ static int isUnsupportedTerm(void) {
     return 0;
 }
 
+#ifndef _WIN32
 static void linenoiseMakeRawMode(struct termios *raw) {
     raw->c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
     raw->c_oflag &= ~(OPOST);
@@ -574,8 +585,7 @@ static void linenoiseMakeRawMode(struct termios *raw) {
     raw->c_cc[VTIME] = 0;
 }
 
-static int linenoiseTermiosRawFieldsEqual(const struct termios *a,
-                                          const struct termios *b) {
+static int linenoiseTermiosRawFieldsEqual(const struct termios *a, const struct termios *b) {
     return a->c_iflag == b->c_iflag &&
            a->c_oflag == b->c_oflag &&
            a->c_cflag == b->c_cflag &&
@@ -583,8 +593,16 @@ static int linenoiseTermiosRawFieldsEqual(const struct termios *a,
            a->c_cc[VMIN] == b->c_cc[VMIN] &&
            a->c_cc[VTIME] == b->c_cc[VTIME];
 }
+#endif
 
 /* Raw mode: 1960 magic shit. */
+#ifdef _WIN32
+static int enableRawMode(int fd) {
+    (void)fd;
+    rawmode = 1;
+    return 0;
+}
+#else
 static int enableRawMode(int fd) {
     struct termios raw;
 
@@ -616,6 +634,7 @@ fatal:
     errno = ENOTTY;
     return -1;
 }
+#endif
 
 static void disableRawMode(int fd) {
     /* Test mode: nothing to restore. */
@@ -623,12 +642,16 @@ static void disableRawMode(int fd) {
         rawmode = 0;
         return;
     }
+#ifndef _WIN32
     /* Don't even check the return value as it's too late. */
     if (rawmode && tcsetattr(fd,TCSAFLUSH,&orig_termios) != -1) {
         /* Leave bracketed paste mode when leaving raw mode. */
         if (write(rawmode_output, "\x1b[?2004l", 8) == -1) {}
         rawmode = 0;
     }
+#else
+    rawmode = 0;
+#endif
 }
 
 /* Re-enable raw mode if a child process changed the terminal state.  This is
@@ -641,6 +664,7 @@ void linenoiseRestoreRawMode(void) {
     if (getenv("LINENOISE_ASSUME_TTY")) return;
     if (!rawmode) return;
     if (!isatty(STDIN_FILENO)) return;
+#ifndef _WIN32
     struct termios current, raw = orig_termios;
     linenoiseMakeRawMode(&raw);
     if (tcgetattr(STDIN_FILENO, &current) == -1) return;
@@ -648,6 +672,7 @@ void linenoiseRestoreRawMode(void) {
         tcsetattr(STDIN_FILENO, TCSANOW, &raw);
     /* Re-enable bracketed paste mode in case the child disabled it. */
     if (write(rawmode_output, "\x1b[?2004h", 8) == -1) {}
+#endif
 }
 
 /* Use the ESC [6n escape sequence to query the horizontal cursor position
@@ -2644,7 +2669,9 @@ int linenoiseHistorySave(const char *filename) {
     fp = fopen(filename,"w");
     umask(old_umask);
     if (fp == NULL) return -1;
+#ifndef _WIN32
     fchmod(fileno(fp),S_IRUSR|S_IWUSR);
+#endif
     for (j = 0; j < history_len; j++) {
         char *p = history[j];
         /* Keep the history file newline-separated: embedded newlines in an
