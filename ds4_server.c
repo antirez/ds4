@@ -7754,6 +7754,7 @@ struct server {
     uint64_t sched_seq;
     double sched_prefill_slice_sec;
     int sched_decode_tokens;
+    bool batched_decode;
     int default_tokens;
     kv_disk_cache kv;
     tool_memory tool_mem;
@@ -10547,10 +10548,12 @@ static void job_decode_round_init(server *s, job *j, gen_state *gs) {
     dsml_decode_tracker_init(&gs->dsml_tracker);
 }
 
-/* One iteration of the decode loop: sample, advance the session (plain eval
- * or MTP burst), stream the new text and scan for stops and tool markers.
- * Returns true while more tokens should be generated in this round. */
-static bool job_decode_step(server *s, job *j, gen_state *gs) {
+/* Sampling half of a decode iteration: store the continued KV checkpoint if
+ * allowed, sample the next token from the current logits and decide whether
+ * this step would take the MTP speculative path.  Returns false when the
+ * round ends before evaluating anything (budget/ctx exhausted, EOS). */
+static bool job_decode_sample(server *s, job *j, gen_state *gs,
+                              int *out_token, bool *out_speculative) {
     if (g_stop_requested || gs->completion >= gs->max_tokens ||
         ds4_session_pos(s->active->session) >= ds4_session_ctx(s->active->session)) {
         return false;
@@ -10579,37 +10582,21 @@ static bool job_decode_step(server *s, job *j, gen_state *gs) {
             gs->finish = "stop";
             return false;
         }
+    *out_token = token;
+    *out_speculative = temperature <= 0.0f &&
+                       ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+                       getenv("DS4_MTP_SPEC_DISABLE") == NULL;
+    return true;
+}
 
-        int toks[17];
-        int ntok = 0;
-        if (temperature <= 0.0f &&
-            ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL)
-        {
-            ntok = ds4_session_eval_speculative_argmax(s->active->session,
-                                                       token,
-                                                       gs->max_tokens - gs->completion,
-                                                       ds4_token_eos(s->engine),
-                                                       toks,
-                                                       (int)(sizeof(toks) / sizeof(toks[0])),
-                                                       gs->err,
-                                                       sizeof(gs->err));
-            if (ntok < 0) {
-                gs->finish = "error";
-                return false;
-            }
-        } else {
-            if (ds4_session_eval(s->active->session, token, gs->err, sizeof(gs->err)) != 0) {
-                gs->finish = "error";
-                return false;
-            }
-            toks[0] = token;
-            ntok = 1;
-        }
-
+/* Streaming half of a decode iteration: append the committed tokens' text,
+ * stream the deltas and scan for stops and tool markers.  Returns true while
+ * more tokens should be generated in this round. */
+static bool job_decode_post(server *s, job *j, gen_state *gs,
+                            const int *toks, int ntok) {
         bool stop_decode = false;
         for (int ti = 0; ti < ntok && gs->completion < gs->max_tokens; ti++) {
-            token = toks[ti];
+            int token = toks[ti];
             if (token == ds4_token_eos(s->engine)) {
                 gs->finish = "stop";
                 stop_decode = true;
@@ -10796,6 +10783,40 @@ static bool job_decode_step(server *s, job *j, gen_state *gs) {
         }
         if (stop_decode) return false;
     return true;
+}
+
+/* One iteration of the decode loop: sample, advance the session (plain eval
+ * or MTP burst), stream the new text and scan for stops and tool markers.
+ * Returns true while more tokens should be generated in this round. */
+static bool job_decode_step(server *s, job *j, gen_state *gs) {
+    int token = 0;
+    bool speculative = false;
+    if (!job_decode_sample(s, j, gs, &token, &speculative)) return false;
+
+    int toks[17];
+    int ntok = 0;
+    if (speculative) {
+        ntok = ds4_session_eval_speculative_argmax(s->active->session,
+                                                   token,
+                                                   gs->max_tokens - gs->completion,
+                                                   ds4_token_eos(s->engine),
+                                                   toks,
+                                                   (int)(sizeof(toks) / sizeof(toks[0])),
+                                                   gs->err,
+                                                   sizeof(gs->err));
+        if (ntok < 0) {
+            gs->finish = "error";
+            return false;
+        }
+    } else {
+        if (ds4_session_eval(s->active->session, token, gs->err, sizeof(gs->err)) != 0) {
+            gs->finish = "error";
+            return false;
+        }
+        toks[0] = token;
+        ntok = 1;
+    }
+    return job_decode_post(s, j, gs, toks, ntok);
 }
 
 /* Repair or parse the generated text, register live tool/thinking state,
@@ -11298,6 +11319,102 @@ static void slot_step(server *s, server_slot *sl) {
     s->active = NULL;
 }
 
+/* Batched decode turn: every collected slot advances one token per round,
+ * committing the sampled tokens together through ds4_session_eval_multi, for
+ * the same per-turn token budget a single slot gets.  A slot whose step
+ * wants the MTP speculative path advances inline with its own burst instead
+ * (tool-call payloads force greedy sampling mid-stream, so eligibility can
+ * flip per token); a slot that stops moves to SLOT_FINISH and completes on
+ * its next regular turn. */
+static void slot_step_decode_batch(server *s, server_slot **batch, int nb) {
+    bool live[DS4_SESSION_EVAL_MULTI_MAX];
+    for (int i = 0; i < nb; i++) {
+        live[i] = true;
+        batch[i]->last_step_seq = ++s->sched_seq;
+    }
+    int rounds = s->sched_decode_tokens > 0 ? s->sched_decode_tokens : 1;
+    while (rounds-- > 0) {
+        server_slot *pending[DS4_SESSION_EVAL_MULTI_MAX];
+        ds4_session *sessions[DS4_SESSION_EVAL_MULTI_MAX];
+        int tokens[DS4_SESSION_EVAL_MULTI_MAX];
+        int np = 0;
+        int n_live = 0;
+        for (int i = 0; i < nb; i++) {
+            if (!live[i]) continue;
+            server_slot *sl = batch[i];
+            s->active = sl;
+            s->kv.continued_last_store_tokens = sl->kv_continued_last_store_tokens;
+            int token = 0;
+            bool speculative = false;
+            bool more = job_decode_sample(s, sl->job, sl->gs, &token, &speculative);
+            if (more && speculative) {
+                int toks[17];
+                const int ntok = ds4_session_eval_speculative_argmax(
+                        sl->session, token,
+                        sl->gs->max_tokens - sl->gs->completion,
+                        ds4_token_eos(s->engine),
+                        toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                        sl->gs->err, sizeof(sl->gs->err));
+                if (ntok < 0) {
+                    sl->gs->finish = "error";
+                    more = false;
+                } else {
+                    more = job_decode_post(s, sl->job, sl->gs, toks, ntok);
+                }
+            } else if (more) {
+                pending[np] = sl;
+                sessions[np] = sl->session;
+                tokens[np] = token;
+                np++;
+            }
+            sl->kv_continued_last_store_tokens = s->kv.continued_last_store_tokens;
+            if (!more) {
+                live[i] = false;
+                sl->phase = SLOT_FINISH;
+            } else {
+                n_live++;
+            }
+        }
+        if (np != 0) {
+            char err[160] = {0};
+            if (ds4_session_eval_multi(sessions, np, tokens, err, sizeof(err)) != 0) {
+                for (int p = 0; p < np; p++) {
+                    server_slot *sl = pending[p];
+                    sl->gs->finish = "error";
+                    snprintf(sl->gs->err, sizeof(sl->gs->err), "%s", err);
+                    sl->phase = SLOT_FINISH;
+                }
+                break;
+            }
+            for (int p = 0; p < np; p++) {
+                server_slot *sl = pending[p];
+                s->active = sl;
+                s->kv.continued_last_store_tokens = sl->kv_continued_last_store_tokens;
+                if (!job_decode_post(s, sl->job, sl->gs, &tokens[p], 1)) {
+                    sl->phase = SLOT_FINISH;
+                    n_live--;
+                    for (int i = 0; i < nb; i++) {
+                        if (batch[i] == sl) live[i] = false;
+                    }
+                }
+                sl->kv_continued_last_store_tokens = s->kv.continued_last_store_tokens;
+            }
+        }
+        if (n_live == 0) break;
+    }
+    s->active = NULL;
+}
+
+/* Collect every slot currently in plain decode for a batched turn. */
+static int sched_collect_decode_batch(server *s, server_slot **batch) {
+    int nb = 0;
+    for (int i = 0; i < s->n_slots && nb < DS4_SESSION_EVAL_MULTI_MAX; i++) {
+        server_slot *sl = &s->slots[i];
+        if (sl->job && sl->phase == SLOT_DECODE) batch[nb++] = sl;
+    }
+    return nb;
+}
+
 static bool sched_any_runnable(server *s) {
     for (int i = 0; i < s->n_slots; i++) {
         if (s->slots[i].job) return true;
@@ -11380,6 +11497,14 @@ static void *worker_main(void *arg) {
         }
         pthread_mutex_unlock(&s->mu);
         server_slot *sl = sched_next_slot(s);
+        if (sl && sl->phase == SLOT_DECODE && s->batched_decode) {
+            server_slot *batch[DS4_SESSION_EVAL_MULTI_MAX];
+            const int nb = sched_collect_decode_batch(s, batch);
+            if (nb >= 2) {
+                slot_step_decode_batch(s, batch, nb);
+                continue;
+            }
+        }
         if (sl) slot_step(s, sl);
     }
     return NULL;
@@ -12064,6 +12189,14 @@ int main(int argc, char **argv) {
         s.sched_decode_tokens = dt ? atoi(dt) : 6;
         if (s.sched_prefill_slice_sec <= 0) s.sched_prefill_slice_sec = 1.5;
         if (s.sched_decode_tokens < 1) s.sched_decode_tokens = 1;
+        /* Opt-in while the batched MoE stage still goes through the prefill
+         * expert path: correct (token streams match single decode) but slower
+         * than interleaving at small batch sizes.  Flip the default once the
+         * routed experts run through the decode selected-expert kernels. */
+        const char *bd = getenv("DS4_SERVER_BATCHED_DECODE");
+        s.batched_decode = n_slots > 1 &&
+                           ds4_engine_supports_batched_decode(engine) &&
+                           bd != NULL && atoi(bd) != 0;
     }
     for (int i = 0; i < n_slots; i++) {
         server_slot *sl = &s.slots[i];
@@ -12089,9 +12222,11 @@ int main(int argc, char **argv) {
     if (n_slots > 1) {
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: %d parallel sessions, ctx %d each "
-                   "(prefill slice %.0f ms, decode burst %d tokens)",
+                   "(prefill slice %.0f ms, decode burst %d tokens, "
+                   "batched decode %s)",
                    n_slots, cfg.ctx_size,
-                   s.sched_prefill_slice_sec * 1000.0, s.sched_decode_tokens);
+                   s.sched_prefill_slice_sec * 1000.0, s.sched_decode_tokens,
+                   s.batched_decode ? "on" : "off");
     }
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;

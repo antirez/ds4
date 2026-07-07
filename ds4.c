@@ -11116,6 +11116,9 @@ static bool metal_scratch_alloc(
         scr->attn_comp_stage = ds4_gpu_tensor_alloc((uint64_t)attn_comp_stage_cap *
                                                     DS4_N_HEAD_DIM * sizeof(float));
     }
+    /* Row-per-token logits: used by the MTP verifiers and by batched decode
+     * (one row per sequence), so it is always allocated. */
+    scr->spec_logits = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
     if (enable_mtp) {
         scr->mtp_embed = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
         scr->mtp_enorm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
@@ -11126,7 +11129,6 @@ static bool metal_scratch_alloc(
         scr->mtp_input_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
         scr->mtp_state_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
         scr->mtp_next_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-        scr->spec_logits = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
     }
 
     const bool ok = scr->cpu_router_norm &&
@@ -11160,11 +11162,11 @@ static bool metal_scratch_alloc(
                     scr->batch_router_selected && scr->batch_router_weights && scr->prefill_seed_router_selected &&
                     scr->batch_routed_gate && scr->batch_routed_up && scr->batch_routed_mid &&
                     scr->batch_routed_down && scr->batch_routed_out &&
+                    scr->spec_logits &&
                     (!enable_mtp ||
                      (scr->mtp_embed && scr->mtp_enorm && scr->mtp_eproj &&
                       scr->mtp_eproj_hc && scr->mtp_hnorm_hc && scr->mtp_hproj_hc &&
-                      scr->mtp_input_hc && scr->mtp_state_hc && scr->mtp_next_hc &&
-                      scr->spec_logits));
+                      scr->mtp_input_hc && scr->mtp_state_hc && scr->mtp_next_hc));
     if (!ok) metal_scratch_free(scr);
     return ok;
 }
@@ -19859,12 +19861,25 @@ static bool metal_graph_encode_decode_multi(
         ds4_gpu_tensor_free(hc_view);
     }
 
+    if (!ok) {
+        fprintf(stderr, "ds4: batched decode token/embed setup failed\n");
+        return false;
+    }
+
     const uint32_t split_after_layers = metal_graph_token_split_after_layers();
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         ok = metal_graph_encode_layer_attention_decode_multi(graphs, n_seqs, model,
                                                              &weights->layer[il], il, pos);
-        if (ok) ok = metal_graph_encode_layer_ffn_batch(g, model, &weights->layer[il],
-                                                        il, pos[0], n_seqs);
+        if (!ok) {
+            fprintf(stderr, "ds4: gpu layer %u batched decode attention failed\n", il);
+        }
+        if (ok) {
+            ok = metal_graph_encode_layer_ffn_batch(g, model, &weights->layer[il],
+                                                    il, pos[0], n_seqs);
+            if (!ok) {
+                fprintf(stderr, "ds4: gpu layer %u batched decode ffn failed\n", il);
+            }
+        }
         if (ok) {
             ds4_gpu_tensor *tmp = g->scr->batch_cur_hc;
             g->scr->batch_cur_hc = g->scr->batch_next_hc;
@@ -19877,6 +19892,9 @@ static bool metal_graph_encode_decode_multi(
     if (ok && need_logits) {
         ok = metal_graph_encode_output_head_batch(g, model, weights, n_seqs,
                                                   weights->output->dim[1]);
+        if (!ok) {
+            fprintf(stderr, "ds4: batched decode output head failed\n");
+        }
     }
     return ok;
 }
@@ -27833,7 +27851,11 @@ int ds4_session_eval_multi(ds4_session *const *sessions, int n_sessions,
         if (errlen) snprintf(err, errlen, "batched decode needs at least one session");
         return 1;
     }
-    if (n_sessions == 1) return ds4_session_eval(sessions[0], tokens[0], err, errlen);
+    /* DS4_BATCHED_DECODE_FORCE keeps n==1 on the batched path so tests can
+     * exercise the multi encoder without a second sequence. */
+    if (n_sessions == 1 && getenv("DS4_BATCHED_DECODE_FORCE") == NULL) {
+        return ds4_session_eval(sessions[0], tokens[0], err, errlen);
+    }
 #ifdef DS4_NO_GPU
     if (errlen) snprintf(err, errlen, "GPU support is not compiled in");
     return 1;

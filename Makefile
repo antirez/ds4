@@ -235,6 +235,12 @@ tests/rope_multi_bench.o: tests/rope_multi_bench.c ds4_gpu.h
 tests/rope_multi_bench: tests/rope_multi_bench.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
+tests/batched_decode_smoke.o: tests/batched_decode_smoke.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/batched_decode_smoke.c
+
+tests/batched_decode_smoke: tests/batched_decode_smoke.o $(CORE_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
 ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)
 ifeq ($(UNAME_S),Darwin)
 	$(CC) $(CFLAGS) -o $@ ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
