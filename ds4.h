@@ -268,6 +268,19 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
+
+/* Batched decode: evaluate one token for each of up to
+ * DS4_SESSION_EVAL_MULTI_MAX sessions of the same engine in a single GPU
+ * pass.  Each session's caches, position and logits advance exactly as with
+ * one ds4_session_eval() per session; the dense stages run batched, so the
+ * numerics are close to, but not bit-identical with, single-token decode
+ * (same caveat as the prefill/decode boundary).  With n_sessions == 1 this
+ * is ds4_session_eval().  Sessions must be distinct GPU sessions; check
+ * ds4_engine_supports_batched_decode() before relying on it. */
+#define DS4_SESSION_EVAL_MULTI_MAX 4
+int ds4_engine_supports_batched_decode(const ds4_engine *e);
+int ds4_session_eval_multi(ds4_session *const *sessions, int n_sessions,
+                           const int *tokens, char *err, size_t errlen);
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,

@@ -19826,7 +19826,7 @@ static bool metal_graph_encode_layer_attention_decode_multi(
  * scratch; the FFN stages use no per-graph state).  The per-sequence caches
  * and counters advance exactly as n_seqs independent single-token evals
  * would.  Logits for sequence b land in scr->spec_logits row b. */
-DS4_MAYBE_UNUSED static bool metal_graph_encode_decode_multi(
+static bool metal_graph_encode_decode_multi(
         ds4_gpu_graph  *const *graphs,
         uint32_t                n_seqs,
         const ds4_model        *model,
@@ -21803,6 +21803,34 @@ static bool metal_graph_read_spec_logits_row(ds4_gpu_graph *g, uint32_t row, flo
                                  (uint64_t)row * row_bytes,
                                  logits,
                                  row_bytes) != 0;
+}
+
+/* Evaluate one decode token for each of n_seqs sequences in one command
+ * buffer (see metal_graph_encode_decode_multi).  graphs[0] carries the
+ * engine-shared scratch; logits for sequence b are read back from
+ * spec_logits row b into logits[b].  Power-throttle pacing is not accounted
+ * for batched steps. */
+static bool metal_graph_eval_decode_multi(
+        ds4_gpu_graph *const *graphs,
+        uint32_t                n_seqs,
+        const ds4_model        *model,
+        const ds4_weights      *weights,
+        const int              *tokens,
+        const uint32_t         *pos,
+        float *const           *logits) {
+    bool ok = ds4_gpu_begin_commands() != 0;
+    if (ok) ok = metal_graph_encode_decode_multi(graphs, n_seqs, model, weights,
+                                                 tokens, pos, true);
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    for (uint32_t b = 0; ok && b < n_seqs; b++) {
+        ok = metal_graph_read_spec_logits_row(graphs[0], b, logits[b]);
+    }
+    if (!ok) {
+        if (ds4_gpu_synchronize() == 0) {
+            fprintf(stderr, "ds4: Metal synchronize after batched decode failure also failed\n");
+        }
+    }
+    return ok;
 }
 
 /* Exact N=2 target verifier for MTP.
@@ -27779,6 +27807,79 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     return ds4_session_eval_internal(s, token, true, err, errlen);
+}
+
+int ds4_engine_supports_batched_decode(const ds4_engine *e) {
+#ifdef DS4_NO_GPU
+    (void)e;
+    return 0;
+#else
+    return e != NULL &&
+           e->backend != DS4_BACKEND_CPU &&
+           !e->ssd_streaming &&
+           e->directional_steering_dirs == NULL;
+#endif
+}
+
+#ifndef DS4_NO_GPU
+/* ds4.h exposes the batch bound without pulling in ds4_gpu.h. */
+typedef char ds4_session_eval_multi_max_check[
+        DS4_SESSION_EVAL_MULTI_MAX == (int)DS4_GPU_DECODE_MULTI_MAX ? 1 : -1];
+#endif
+
+int ds4_session_eval_multi(ds4_session *const *sessions, int n_sessions,
+                           const int *tokens, char *err, size_t errlen) {
+    if (!sessions || !tokens || n_sessions <= 0) {
+        if (errlen) snprintf(err, errlen, "batched decode needs at least one session");
+        return 1;
+    }
+    if (n_sessions == 1) return ds4_session_eval(sessions[0], tokens[0], err, errlen);
+#ifdef DS4_NO_GPU
+    if (errlen) snprintf(err, errlen, "GPU support is not compiled in");
+    return 1;
+#else
+    if (n_sessions > DS4_SESSION_EVAL_MULTI_MAX) {
+        if (errlen) snprintf(err, errlen, "batched decode supports at most %d sessions",
+                             DS4_SESSION_EVAL_MULTI_MAX);
+        return 1;
+    }
+    ds4_engine *e = sessions[0] ? sessions[0]->engine : NULL;
+    if (!ds4_engine_supports_batched_decode(e)) {
+        if (errlen) snprintf(err, errlen, "engine does not support batched decode");
+        return 1;
+    }
+    ds4_gpu_graph *graphs[DS4_SESSION_EVAL_MULTI_MAX];
+    uint32_t pos[DS4_SESSION_EVAL_MULTI_MAX];
+    float *logits[DS4_SESSION_EVAL_MULTI_MAX];
+    for (int b = 0; b < n_sessions; b++) {
+        ds4_session *s = sessions[b];
+        if (!s || s->engine != e || s->distributed || ds4_session_is_cpu(s) || !s->logits) {
+            if (errlen) snprintf(err, errlen, "batched decode requires GPU sessions of one engine");
+            return 1;
+        }
+        for (int j = 0; j < b; j++) {
+            if (sessions[j] == s) {
+                if (errlen) snprintf(err, errlen, "batched decode got the same session twice");
+                return 1;
+            }
+        }
+        graphs[b] = &s->graph;
+        pos[b] = (uint32_t)s->checkpoint.len;
+        logits[b] = s->logits;
+        /* Any pending MTP draft belongs to a single-token eval flow. */
+        s->mtp_draft_valid = false;
+    }
+    if (!metal_graph_eval_decode_multi(graphs, (uint32_t)n_sessions, &e->model,
+                                       &e->weights, tokens, pos, logits)) {
+        for (int b = 0; b < n_sessions; b++) sessions[b]->checkpoint_valid = false;
+        if (errlen) snprintf(err, errlen, "%s batched decode failed", ds4_backend_name(e->backend));
+        return 1;
+    }
+    for (int b = 0; b < n_sessions; b++) {
+        token_vec_push(&sessions[b]->checkpoint, tokens[b]);
+    }
+    return 0;
+#endif
 }
 
 /* Speculative decode state machine:
