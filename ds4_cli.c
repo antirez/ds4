@@ -281,8 +281,13 @@ static void cli_prefill_progress_cb(void *ud, const char *event, int current, in
 }
 
 static bool is_rendered_chat_prompt(const char *prompt) {
-    const char *bos = "<｜begin▁of▁sentence｜>";
-    return prompt && strncmp(prompt, bos, strlen(bos)) == 0;
+    if (!prompt) return false;
+    const char *bos_deepseek = "<｜begin▁of▁sentence｜>";
+    const char *bos_hy3 = "<｜hy_begin_of_sentence:opensource｜>";
+    const char *bos_glm = "[gMASK]<sop>";
+    return strncmp(prompt, bos_deepseek, strlen(bos_deepseek)) == 0 ||
+           strncmp(prompt, bos_hy3, strlen(bos_hy3)) == 0 ||
+           strncmp(prompt, bos_glm, strlen(bos_glm)) == 0;
 }
 
 typedef struct {
@@ -670,6 +675,12 @@ static int run_logits_dump(ds4_engine *engine, const cli_config *cfg, const ds4_
             prompt->len,
             cfg->gen.ctx_size,
             vocab);
+    fputs("  \"prompt_ids\":[", fp);
+    for (int i = 0; i < prompt->len; i++) {
+        if (i) fputc(',', fp);
+        fprintf(fp, "%d", prompt->v[i]);
+    }
+    fputs("],\n", fp);
     const int argmax = ds4_session_argmax(session);
     fputs("  \"argmax_token\":", fp);
     json_write_token(fp, engine, argmax);
