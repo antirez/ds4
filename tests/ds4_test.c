@@ -1873,8 +1873,13 @@ static void test_think_tool_recovery(void) {
 
     server srv;
     memset(&srv, 0, sizeof(srv));
+    server_slot srv_slot;
+    memset(&srv_slot, 0, sizeof(srv_slot));
+    srv_slot.session = session;
     srv.engine = engine;
-    srv.session = session;
+    srv.slots = &srv_slot;
+    srv.n_slots = 1;
+    srv.active = &srv_slot;
 
     /* Replay the malformed prefix exactly as the worker loop would see it:
      * token by token, running the recovery scan after each piece.  The stanza

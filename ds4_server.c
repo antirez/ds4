@@ -14492,10 +14492,14 @@ static void test_anthropic_tool_result_id_validation(void) {
                                                  err, sizeof(err)));
     TEST_ASSERT(strstr(err, "Anthropic continuation state is not available") != NULL);
 
+    server_slot slot = {0};
+    s.slots = &slot;
+    s.n_slots = 1;
+    s.active = &slot;
     pthread_mutex_lock(&s.tool_mu);
-    s.anthropic_live.valid = true;
-    s.anthropic_live.live_tokens = 10;
-    id_list_push_unique(&s.anthropic_live.call_ids, "toolu_missing");
+    slot.anthropic_live.valid = true;
+    slot.anthropic_live.live_tokens = 10;
+    id_list_push_unique(&slot.anthropic_live.call_ids, "toolu_missing");
     pthread_mutex_unlock(&s.tool_mu);
     bool needs_live_tool_state = false;
     err[0] = '\0';
@@ -14505,7 +14509,7 @@ static void test_anthropic_tool_result_id_validation(void) {
     TEST_ASSERT(needs_live_tool_state);
 
     chat_msgs_free(&msgs);
-    live_tool_state_free(&s.anthropic_live);
+    live_tool_state_free(&slot.anthropic_live);
     pthread_mutex_destroy(&s.tool_mu);
 }
 
@@ -14549,10 +14553,14 @@ static void test_anthropic_tool_use_parses_before_role(void) {
      * must still remember prior assistant tool_use ids, otherwise old
      * tool_result blocks are mistaken for live-only continuations and rejected
      * once the live frontier has moved on to newer tool calls. */
+    server_slot slot = {0};
+    s.slots = &slot;
+    s.n_slots = 1;
+    s.active = &slot;
     pthread_mutex_lock(&s.tool_mu);
-    s.anthropic_live.valid = true;
-    s.anthropic_live.live_tokens = 100;
-    id_list_push_unique(&s.anthropic_live.call_ids, "toolu_current");
+    slot.anthropic_live.valid = true;
+    slot.anthropic_live.live_tokens = 100;
+    id_list_push_unique(&slot.anthropic_live.call_ids, "toolu_current");
     pthread_mutex_unlock(&s.tool_mu);
 
     const char *json =
@@ -14582,7 +14590,7 @@ static void test_anthropic_tool_use_parses_before_role(void) {
     TEST_ASSERT(!needs_live_tool_state);
 
     chat_msgs_free(&msgs);
-    live_tool_state_free(&s.anthropic_live);
+    live_tool_state_free(&slot.anthropic_live);
     pthread_mutex_destroy(&s.tool_mu);
 }
 
@@ -14668,10 +14676,14 @@ static void test_responses_tool_output_id_validation(void) {
                                                  err, sizeof(err)));
     TEST_ASSERT(strstr(err, "Responses continuation state is not available") != NULL);
 
+    server_slot slot = {0};
+    s.slots = &slot;
+    s.n_slots = 1;
+    s.active = &slot;
     pthread_mutex_lock(&s.tool_mu);
-    s.responses_live.valid = true;
-    s.responses_live.live_tokens = 10;
-    id_list_push_unique(&s.responses_live.call_ids, "call_missing");
+    slot.responses_live.valid = true;
+    slot.responses_live.live_tokens = 10;
+    id_list_push_unique(&slot.responses_live.call_ids, "call_missing");
     pthread_mutex_unlock(&s.tool_mu);
     err[0] = '\0';
     bool needs_live_tool_state = false;
@@ -14681,7 +14693,7 @@ static void test_responses_tool_output_id_validation(void) {
     TEST_ASSERT(needs_live_tool_state);
 
     chat_msgs_free(&msgs);
-    live_tool_state_free(&s.responses_live);
+    live_tool_state_free(&slot.responses_live);
     pthread_mutex_destroy(&s.tool_mu);
 }
 
@@ -14715,10 +14727,14 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
     TEST_ASSERT(!needs_live_tool_state);
     TEST_ASSERT(needs_live_reasoning);
 
+    server_slot slot = {0};
+    s.slots = &slot;
+    s.n_slots = 1;
+    s.active = &slot;
     pthread_mutex_lock(&s.tool_mu);
-    s.responses_live.valid = true;
-    s.responses_live.live_tokens = 123;
-    id_list_push_unique(&s.responses_live.call_ids, "call_replay");
+    slot.responses_live.valid = true;
+    slot.responses_live.live_tokens = 123;
+    id_list_push_unique(&slot.responses_live.call_ids, "call_replay");
     pthread_mutex_unlock(&s.tool_mu);
     err[0] = '\0';
     needs_live_reasoning = false;
@@ -14755,7 +14771,7 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
     TEST_ASSERT(!needs_live_reasoning);
 
     chat_msgs_free(&msgs);
-    live_tool_state_free(&s.responses_live);
+    live_tool_state_free(&slot.responses_live);
     pthread_mutex_destroy(&s.tool_mu);
 }
 
