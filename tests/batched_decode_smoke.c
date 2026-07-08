@@ -200,6 +200,41 @@ int main(int argc, char **argv) {
     rc |= compare("A single-vs-batched2", &iso_a, &b2[0]);
     rc |= compare("B single-vs-batched2", &iso_b, &b2[1]);
 
+    /* Discriminate bug from drift: re-run batched B=2 forcing the old batch
+     * warp kernel (DS4_CUDA_NO_Q8_NARROW) and compare the FIRST-step logits
+     * (identical prompt prefix by construction) against the narrow run.  A
+     * tiny distance means the narrow kernel differs from the batch kernel
+     * only by fast-math reassociation (same accuracy as the accepted path);
+     * a large distance means the narrow kernel is wrong. */
+    printf("== narrow vs batch-warp (first-step logits, identical prefix) ==\n");
+    gen_result nb2[2];
+    memset(nb2, 0, sizeof(nb2));
+    nb2[0].logits = malloc((size_t)n * g_vocab * sizeof(float));
+    nb2[1].logits = malloc((size_t)n * g_vocab * sizeof(float));
+    if (!nb2[0].logits || !nb2[1].logits) die("logits alloc failed", NULL);
+    setenv("DS4_CUDA_NO_Q8_NARROW", "1", 1);
+    run_batched(e, both, 2, n, ctx_size, nb2);
+    unsetenv("DS4_CUDA_NO_Q8_NARROW");
+    /* First-step logits distance (identical prefix). */
+    for (int seq = 0; seq < 2; seq++) {
+        float maxd = 0.0f; double ss = 0.0;
+        const float *ln = b2[seq].logits;    /* narrow */
+        const float *lb = nb2[seq].logits;   /* batch warp */
+        for (int v = 0; v < g_vocab; v++) {
+            float d = fabsf(ln[v] - lb[v]);
+            if (d > maxd) maxd = d;
+            ss += (double)d * d;
+        }
+        printf("seq %c first-step logits: max|diff| %.6f  rms %.6f\n",
+               seq == 0 ? 'A' : 'B', (double)maxd, sqrt(ss / g_vocab));
+    }
+    /* The decisive check: does narrow produce the same token stream as the
+     * already-validated batch-warp path?  If yes, narrow changes nothing
+     * observable; any divergence from single decode is the batched drift the
+     * batch-warp path already had. */
+    rc |= compare("A narrow-vs-batchwarp", &nb2[0], &b2[0]);
+    rc |= compare("B narrow-vs-batchwarp", &nb2[1], &b2[1]);
+
     ds4_tokens_free(&pa);
     ds4_tokens_free(&pb);
     ds4_engine_close(e);
