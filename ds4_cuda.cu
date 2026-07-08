@@ -6198,6 +6198,51 @@ static int cuda_q8_mma_try_launch(
     return cuda_ok(cudaGetLastError(), "matmul_q8_0 mma launch") ? 1 : -1;
 }
 
+/* Narrow-batch q8_0 matmul for 2-4 tokens (batched decode).
+ *
+ * The batch kernel above puts n_tok on the grid Y axis, so every token
+ * re-reads the same weight row from VRAM independently: at n_tok=2 the
+ * weights stream through memory twice for no reason.  In decode the weights
+ * are the whole cost, so that doubles the time.  This kernel keeps the grid
+ * one-dimensional (one warp per output row) and, for each 32-weight block it
+ * reads once, dots it against all n_tok activation blocks — the weight bytes
+ * cross memory once and are reused from L1 for the remaining tokens.  Output
+ * layout matches the batch kernel: out[tok * out_dim + row]. */
+#define DS4_CUDA_NARROW_MAX 4u
+__global__ static void matmul_q8_0_preq_narrow_warp8_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint32_t n_tok,
+        uint64_t blocks,
+        int use_dp4a) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + row * blocks * 34;
+    float acc[DS4_CUDA_NARROW_MAX];
+#pragma unroll
+    for (uint32_t t = 0; t < DS4_CUDA_NARROW_MAX; t++) acc[t] = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const uint64_t i0 = b * 32;
+        const uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
+        const float wscale = __half2float(*(const __half *)(wr + b * 34));
+        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+        for (uint32_t t = 0; t < n_tok; t++) {
+            const int8_t *xqb = xq + (uint64_t)t * blocks * 32 + b * 32;
+            const float xs = xscale[(uint64_t)t * blocks + b];
+            const int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+            acc[t] += wscale * xs * (float)dot;
+        }
+    }
+    for (uint32_t t = 0; t < n_tok; t++) {
+        const float a = warp_sum_f32(acc[t]);
+        if (lane == 0) out[(uint64_t)t * out_dim + row] = a;
+    }
+}
 
 __global__ static void dequant_q8_0_to_f16_kernel(
         __half *out,
@@ -14738,6 +14783,14 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     }
     const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes, logical_tier, "q8_0");
     if (!wptr) return 0;
+    /* 2-4 tokens (batched decode) go through the narrow kernel, which reads
+     * each weight row once and reuses it across tokens.  It beats both cuBLAS
+     * (GEMM setup dwarfs the work at tiny n_tok) and the batch warp kernel
+     * (which re-reads weights per token), so it takes priority here.  Like the
+     * n_tok==1 warp8 kernel it loops blocks with a lane stride, so it handles
+     * any in_dim (no blocks<=32 restriction). */
+    const bool narrow = n_tok >= 2 && n_tok <= DS4_CUDA_NARROW_MAX &&
+                        getenv("DS4_CUDA_NO_Q8_NARROW") == NULL;
     /* mmq fused-dequant-matmul prefill tier (ported from the Entrpi/ds4
      * fork).  Layout-compatible drop-in for the cuBLAS+dequant pipeline
      * below: mmq's [out_dim, n_tok] column-major output flattens to
@@ -14745,8 +14798,10 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
      * and the Q8_0 weight is already in mmq's expected row-major block
      * layout (the GGUF on-disk format).  K must be a multiple of 256;
      * every Q8_0 weight in V4 Flash satisfies this, odd shapes fall
-     * through to the legacy paths. */
-    if (n_tok > 1 && (in_dim % 256u) == 0 && cuda_use_mmq()) {
+     * through to the legacy paths.  Narrow-batch decode (2-4 tokens)
+     * keeps priority over mmq: n_tok that small is a co-decoded session
+     * batch, not a prefill tile. */
+    if (!narrow && n_tok > 1 && (in_dim % 256u) == 0 && cuda_use_mmq()) {
         int rc = ds4_mmq_q8_0_dense(wptr, (const float *)x->ptr, (float *)out->ptr,
                                     (int)out_dim, (int)n_tok, (int)in_dim,
                                     (cudaStream_t)0);
@@ -14755,7 +14810,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 rc, label ? label : "", (unsigned long long)in_dim,
                 (unsigned long long)out_dim, (unsigned long long)n_tok);
     }
-    if (g_cublas_ready && n_tok > 1) {
+    if (!narrow && g_cublas_ready && n_tok > 1) {
         const float *w_f32 = cuda_q8_f32_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, physical_device, label);
         if (w_f32) {
             const float alpha = 1.0f;
@@ -14923,6 +14978,19 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     }
     const bool force_decode_warp =
         n_tok == 2u && g_glm_mtp_verify_mode;
+    if (narrow && !force_decode_warp) {
+        matmul_q8_0_preq_narrow_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
+                (float *)out->ptr,
+                reinterpret_cast<const unsigned char *>(wptr),
+                xq,
+                xscale,
+                in_dim,
+                out_dim,
+                (uint32_t)n_tok,
+                blocks,
+                use_dp4a);
+        return cuda_ok(cudaGetLastError(), "matmul_q8_0 narrow launch");
+    }
     if (n_tok > 1u && !force_decode_warp) {
         /* T matches the reduction width of whichever reference kernel would
          * have run: warp tree (32) for blocks <= 32, exact-thread tree
