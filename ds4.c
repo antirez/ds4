@@ -30722,7 +30722,15 @@ static bool glm_graph_forward_indexed_tokens(
     const uint32_t drain_interval =
         progress_flush_interval != 0 ? glm_graph_indexed_prefill_drain_interval() : 0u;
     const bool progress_requested = display_progress && work_total > 0;
-    ds4_gpu_set_glm_streaming_prefill_full_layer(false);
+    /* Mirror the plain prefill flow: above the full-layer threshold the
+     * selected-expert addr loader is the wrong tool — a chunk of N tokens
+     * selects far more unique experts per layer than the cache can hold, and
+     * its overflow branch needs the full expert tensors mapped.  Hardcoding
+     * false here broke every generation prompt above ~64 tokens ("failed to
+     * map overflow expert views"), while short prompts keep the addr path. */
+    const bool full_layer_prefill =
+        glm_graph_stream_prefill_full_layer_enabled(g, n_tokens);
+    ds4_gpu_set_glm_streaming_prefill_full_layer(full_layer_prefill);
 
     if (trace) {
         glm_graph_indexed_prefill_tracef(
@@ -30818,7 +30826,7 @@ static bool glm_graph_forward_indexed_tokens(
                                                     weights,
                                                     il,
                                                     n_tokens,
-                                                    false);
+                                                    full_layer_prefill);
             if (ok) ok = ds4_gpu_begin_commands() != 0;
         }
         const ds4_layer_weights *l = &weights->layer[il];
