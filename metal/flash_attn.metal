@@ -1558,3 +1558,145 @@ kernel void kernel_glm_mla_attention_f32(
         dst[tid] = acc;
     }
 }
+
+struct ds4_metal_args_hy3_gqa_attention {
+    uint32_t n_tokens;
+    uint32_t pos0;
+    uint32_t n_raw;
+    uint32_t raw_cap;
+    uint32_t raw_start;
+    uint32_t n_head;
+    uint32_t n_kv_head;
+    uint32_t head_dim;
+    uint64_t q_token_stride;
+    uint64_t q_head_stride;
+    uint64_t raw_row_stride;
+    uint64_t dst_token_stride;
+    uint64_t dst_head_stride;
+    float scale;
+};
+
+kernel void kernel_hy3_gqa_attention_f32(
+        constant ds4_metal_args_hy3_gqa_attention &args,
+        device const float *q,
+        device const float *raw_kv,
+        device       float *heads,
+        threadgroup float *shmem [[threadgroup(0)]],
+        uint3 gid[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    const uint tid = tpitg.x;
+    const ushort simd_lane = tiisg;
+    const ushort simd_group = sgitg;
+    const uint token = gid.x;
+    const uint head = gid.y;
+    if (token >= args.n_tokens || head >= args.n_head ||
+        args.n_raw == 0 || args.raw_cap == 0 ||
+        args.n_kv_head == 0 || args.head_dim == 0) {
+        return;
+    }
+
+    const uint q_per_kv = args.n_head / args.n_kv_head;
+    if (q_per_kv == 0) return;
+    const uint kv_head = head / q_per_kv;
+    if (kv_head >= args.n_kv_head) return;
+
+    threadgroup float *partial = shmem;
+    threadgroup float *shared = shmem + 256;
+    const uint n_sg = (uint(ntg.x) + 31u) / 32u;
+    if (simd_group == 0 && simd_lane == 0) {
+        shared[0] = -FLT_MAX/2;
+        shared[1] = 0.0f;
+        shared[2] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint qpos = args.pos0 + token;
+    const uint last_pos = args.pos0 + args.n_tokens - 1u;
+    const uint first_raw_pos = last_pos + 1u - args.n_raw;
+    const uint raw_last_pos = first_raw_pos + args.n_raw - 1u;
+    const uint first = first_raw_pos;
+    const uint last = min(qpos, raw_last_pos);
+    if (first > last) return;
+
+    device const float *qh = (device const float *)((device const char *)q +
+            (uint64_t)token * args.q_token_stride + (uint64_t)head * args.q_head_stride);
+
+    for (uint pos = first; pos <= last; ++pos) {
+        const uint logical = pos - first_raw_pos;
+        const uint phys = (args.raw_start + logical) % args.raw_cap;
+        device const float *kh = (device const float *)((device const char *)raw_kv +
+                (uint64_t)phys * args.raw_row_stride) +
+                (uint64_t)kv_head * args.head_dim;
+        float dotv = 0.0f;
+        for (uint i = tid; i < args.head_dim; i += ntg.x) dotv += qh[i] * kh[i];
+        dotv = simd_sum(dotv);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_lane == 0) partial[simd_group] = dotv;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float score = 0.0f;
+            for (uint k = 0; k < n_sg; ++k) score += partial[k];
+            shared[0] = max(shared[0], score * args.scale);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float max_score = shared[0];
+    for (uint pos = first; pos <= last; ++pos) {
+        const uint logical = pos - first_raw_pos;
+        const uint phys = (args.raw_start + logical) % args.raw_cap;
+        device const float *kh = (device const float *)((device const char *)raw_kv +
+                (uint64_t)phys * args.raw_row_stride) +
+                (uint64_t)kv_head * args.head_dim;
+        float dotv = 0.0f;
+        for (uint i = tid; i < args.head_dim; i += ntg.x) dotv += qh[i] * kh[i];
+        dotv = simd_sum(dotv);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_lane == 0) partial[simd_group] = dotv;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float score = 0.0f;
+            for (uint k = 0; k < n_sg; ++k) score += partial[k];
+            shared[1] += exp(score * args.scale - max_score);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float acc = 0.0f;
+    const float inv_denom = shared[1] > 0.0f ? 1.0f / shared[1] : 0.0f;
+    for (uint pos = first; pos <= last; ++pos) {
+        const uint logical = pos - first_raw_pos;
+        const uint phys = (args.raw_start + logical) % args.raw_cap;
+        device const float *kh = (device const float *)((device const char *)raw_kv +
+                (uint64_t)phys * args.raw_row_stride) +
+                (uint64_t)kv_head * args.head_dim;
+        device const float *vh = (device const float *)((device const char *)raw_kv +
+                (uint64_t)phys * args.raw_row_stride) +
+                (uint64_t)args.n_kv_head * args.head_dim +
+                (uint64_t)kv_head * args.head_dim;
+        float dotv = 0.0f;
+        for (uint i = tid; i < args.head_dim; i += ntg.x) dotv += qh[i] * kh[i];
+        dotv = simd_sum(dotv);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_lane == 0) partial[simd_group] = dotv;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float score = 0.0f;
+            for (uint k = 0; k < n_sg; ++k) score += partial[k];
+            shared[2] = score * args.scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < args.head_dim) {
+            acc += exp(shared[2] - max_score) * inv_denom * vh[tid];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid < args.head_dim) {
+        device float *dst = (device float *)((device char *)heads +
+                (uint64_t)token * args.dst_token_stride + (uint64_t)head * args.dst_head_stride);
+        dst[tid] = acc;
+    }
+}

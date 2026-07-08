@@ -4559,6 +4559,24 @@ typedef struct {
 } ds4_gpu_glm_mla_attention_args;
 
 typedef struct {
+    uint32_t n_tokens;
+    uint32_t pos0;
+    uint32_t n_raw;
+    uint32_t raw_cap;
+    uint32_t raw_start;
+    uint32_t n_head;
+    uint32_t n_kv_head;
+    uint32_t head_dim;
+    uint64_t q_token_stride;
+    uint64_t q_head_stride;
+    uint64_t raw_row_stride;
+    uint64_t dst_token_stride;
+    uint64_t dst_head_stride;
+    float    scale;
+} ds4_gpu_hy3_gqa_attention_args;
+
+
+typedef struct {
     uint32_t n_comp;
     uint32_t n_tokens;
     uint32_t n_head;
@@ -13930,7 +13948,7 @@ int ds4_gpu_head_rms_norm_tensor(
     return 1;
 }
 
-int ds4_gpu_rope_tail_tensor(
+static int ds4_gpu_rope_tail_tensor_mode(
         ds4_gpu_tensor *x,
         uint32_t          n_tok,
         uint32_t          n_head,
@@ -13944,7 +13962,8 @@ int ds4_gpu_rope_tail_tensor(
         float             ext_factor,
         float             attn_factor,
         float             beta_fast,
-        float             beta_slow) {
+        float             beta_slow,
+        int32_t           mode) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!x || n_tok == 0 || n_head == 0 || head_dim == 0 || n_rot > head_dim || (n_rot & 1u) != 0) {
         return 0;
@@ -13962,6 +13981,7 @@ int ds4_gpu_rope_tail_tensor(
         ds4_gpu_rope_tail_batch_args args = ds4_gpu_make_rope_tail_args(
             n_tok, n_head, head_dim, n_rot, n_ctx_orig, inverse,
             freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+        args.mode = mode;
 
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
@@ -13983,6 +14003,70 @@ int ds4_gpu_rope_tail_tensor(
     }
 
     return 1;
+}
+
+int ds4_gpu_rope_tail_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          n_head,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        uint32_t          pos0,
+        uint32_t          n_ctx_orig,
+        bool              inverse,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow) {
+    return ds4_gpu_rope_tail_tensor_mode(x,
+                                         n_tok,
+                                         n_head,
+                                         head_dim,
+                                         n_rot,
+                                         pos0,
+                                         n_ctx_orig,
+                                         inverse,
+                                         freq_base,
+                                         freq_scale,
+                                         ext_factor,
+                                         attn_factor,
+                                         beta_fast,
+                                         beta_slow,
+                                         0);
+}
+
+int ds4_gpu_rope_tail_split_half_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          n_head,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        uint32_t          pos0,
+        uint32_t          n_ctx_orig,
+        bool              inverse,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow) {
+    return ds4_gpu_rope_tail_tensor_mode(x,
+                                         n_tok,
+                                         n_head,
+                                         head_dim,
+                                         n_rot,
+                                         pos0,
+                                         n_ctx_orig,
+                                         inverse,
+                                         freq_base,
+                                         freq_scale,
+                                         ext_factor,
+                                         attn_factor,
+                                         beta_fast,
+                                         beta_slow,
+                                         2);
 }
 
 int ds4_gpu_head_rms_norm_rope_tail_tensor(
@@ -19270,6 +19354,89 @@ int ds4_gpu_glm_mla_attention_tensor(
         ds4_gpu_end_compute_encoder(cb, enc);
 
         return ds4_gpu_finish_command_buffer(cb, owned, "GLM MLA attention");
+    }
+}
+
+int ds4_gpu_hy3_gqa_attention_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_head,
+        uint32_t                n_kv_head,
+        uint32_t                head_dim) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!heads || !q || !raw_kv ||
+        n_tokens == 0 || n_raw == 0 || raw_cap == 0 ||
+        n_head == 0 || n_kv_head == 0 || head_dim == 0 ||
+        n_head % n_kv_head != 0 || n_raw > raw_cap || raw_start >= raw_cap) {
+        return 0;
+    }
+
+    const uint64_t kv_pack = (uint64_t)n_kv_head * head_dim;
+    if (kv_pack > UINT64_MAX / 2u) return 0;
+    const uint64_t raw_row_elems = 2u * kv_pack;
+    if ((uint64_t)n_head > UINT64_MAX / head_dim) return 0;
+    const uint64_t q_token_elems = (uint64_t)n_head * head_dim;
+    if ((uint64_t)n_tokens > UINT64_MAX / q_token_elems) return 0;
+    if ((uint64_t)raw_cap > UINT64_MAX / raw_row_elems) return 0;
+
+    const uint64_t q_bytes = (uint64_t)n_tokens * q_token_elems * sizeof(float);
+    const uint64_t raw_bytes = (uint64_t)raw_cap * raw_row_elems * sizeof(float);
+    if (ds4_gpu_tensor_bytes(q) < q_bytes ||
+        ds4_gpu_tensor_bytes(raw_kv) < raw_bytes ||
+        ds4_gpu_tensor_bytes(heads) < q_bytes) {
+        fprintf(stderr, "ds4: Metal HY3 GQA attention received undersized buffers\n");
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_hy3_gqa_attention_f32");
+        if (!pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        DS4MetalTensor *heads_obj = ds4_gpu_tensor_obj(heads);
+        const DS4MetalTensor *q_obj = ds4_gpu_tensor_const_obj(q);
+        const DS4MetalTensor *raw_obj = ds4_gpu_tensor_const_obj(raw_kv);
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+
+        ds4_gpu_hy3_gqa_attention_args args = {
+            .n_tokens = n_tokens,
+            .pos0 = pos0,
+            .n_raw = n_raw,
+            .raw_cap = raw_cap,
+            .raw_start = raw_start,
+            .n_head = n_head,
+            .n_kv_head = n_kv_head,
+            .head_dim = head_dim,
+            .q_token_stride = q_token_elems * sizeof(float),
+            .q_head_stride = (uint64_t)head_dim * sizeof(float),
+            .raw_row_stride = raw_row_elems * sizeof(float),
+            .dst_token_stride = q_token_elems * sizeof(float),
+            .dst_head_stride = (uint64_t)head_dim * sizeof(float),
+            .scale = 1.0f / sqrtf((float)head_dim),
+        };
+
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:q_obj.buffer offset:ds4_gpu_tensor_offset(q) atIndex:1];
+        [enc setBuffer:raw_obj.buffer offset:ds4_gpu_tensor_offset(raw_kv) atIndex:2];
+        [enc setBuffer:heads_obj.buffer offset:ds4_gpu_tensor_offset(heads) atIndex:3];
+        [enc setThreadgroupMemoryLength:260u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(n_tokens, n_head, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        return ds4_gpu_finish_command_buffer(cb, owned, "HY3 GQA attention");
     }
 }
 

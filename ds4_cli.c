@@ -24,6 +24,10 @@
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 
 typedef struct {
     const char *prompt;
@@ -1644,6 +1648,75 @@ static cli_config parse_options(int argc, char **argv) {
 
     return c;
 }
+static bool cli_generation_uses_heavy_metal_diagnostic(
+        const cli_generation_options *gen) {
+    return gen->metal_graph_test ||
+           gen->metal_graph_full_test ||
+           gen->metal_graph_prompt_test;
+}
+
+static uint64_t cli_metal_diagnostic_physical_ram(void) {
+    const char *forced = getenv("DS4_METAL_DIAGNOSTIC_RAM_BYTES");
+    if (forced && forced[0]) {
+        char *end = NULL;
+        unsigned long long n = strtoull(forced, &end, 10);
+        if (end != forced && n > 0) return (uint64_t)n;
+    }
+
+#ifdef __APPLE__
+    uint64_t mem = 0;
+    size_t len = sizeof(mem);
+    if (sysctlbyname("hw.memsize", &mem, &len, NULL, 0) == 0 && mem > 0) {
+        return mem;
+    }
+#endif
+    return 0;
+}
+
+static int cli_refuse_oversized_metal_diagnostic(const cli_config *cfg) {
+    if (cfg->engine.backend != DS4_BACKEND_METAL) return 0;
+    if (!cli_generation_uses_heavy_metal_diagnostic(&cfg->gen)) return 0;
+
+    const char *override = getenv("DS4_ALLOW_HUGE_METAL_DIAGNOSTIC");
+    if (override && override[0] && strcmp(override, "0") != 0) return 0;
+
+    struct stat st;
+    if (stat(cfg->engine.model_path, &st) != 0) return 0;
+    if (!S_ISREG(st.st_mode) || st.st_size <= 0) return 0;
+
+    const uint64_t one_gib = 1024ull * 1024ull * 1024ull;
+    const uint64_t model_size = (uint64_t)st.st_size;
+    const uint64_t headroom = 16ull * one_gib;
+    const uint64_t ram = cli_metal_diagnostic_physical_ram();
+    if (ram == 0) return 0;
+    const uint64_t budget = ram - (ram / 5u);
+
+    if (model_size <= (UINT64_MAX - headroom) / 2u) {
+        const uint64_t required = model_size * 2u + headroom;
+        if (required <= budget) return 0;
+
+        fprintf(stderr,
+                "ds4: refusing oversized Metal diagnostic for %s "
+                "(model=%llu GiB, estimated diagnostic footprint=%llu GiB, safety budget=%llu GiB, physical RAM=%llu GiB); "
+                "use a tiny/local diagnostic model, run the full diagnostic on a remote host, "
+                "or set DS4_ALLOW_HUGE_METAL_DIAGNOSTIC=1 to override\n",
+                cfg->engine.model_path,
+                (unsigned long long)((model_size + one_gib - 1u) / one_gib),
+                (unsigned long long)((required + one_gib - 1u) / one_gib),
+                (unsigned long long)((budget + one_gib - 1u) / one_gib),
+                (unsigned long long)((ram + one_gib - 1u) / one_gib));
+        return 2;
+    }
+
+    fprintf(stderr,
+            "ds4: refusing oversized Metal diagnostic for %s "
+            "(model is too large to estimate safely); "
+            "use a tiny/local diagnostic model, run the full diagnostic on a remote host, "
+            "or set DS4_ALLOW_HUGE_METAL_DIAGNOSTIC=1 to override\n",
+            cfg->engine.model_path);
+    return 2;
+}
+
 
 int main(int argc, char **argv) {
     cli_config cfg = parse_options(argc, argv);
@@ -1659,6 +1732,12 @@ int main(int argc, char **argv) {
         ds4_dist_options_free(cfg.dist);
         free(cfg.prompt_owned);
         return rc;
+    }
+    int safety_rc = cli_refuse_oversized_metal_diagnostic(&cfg);
+    if (safety_rc != 0) {
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return safety_rc;
     }
     cfg.engine.inspect_only = cfg.inspect;
     ds4_engine *engine = NULL;
