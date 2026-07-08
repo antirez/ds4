@@ -7755,6 +7755,10 @@ struct server {
     double sched_prefill_slice_sec;
     int sched_decode_tokens;
     bool batched_decode;
+    bool batch_diag;
+    uint64_t diag_batch_turns;
+    uint64_t diag_batched_slots;
+    uint64_t diag_single_decode_turns;
     int default_tokens;
     kv_disk_cache kv;
     tool_memory tool_mem;
@@ -11250,7 +11254,14 @@ static bool slot_prefill_cancel_cb(void *ud) {
 }
 
 static void slot_complete(server *s, server_slot *sl) {
-    (void)s;
+    if (s->batch_diag) {
+        const uint64_t bt = s->diag_batch_turns, st = s->diag_single_decode_turns;
+        const double avg = bt ? (double)s->diag_batched_slots / (double)bt : 0.0;
+        fprintf(stderr, "ds4: batch-diag  batch_turns=%llu (avg %.2f slots) "
+                "single_decode_turns=%llu  batched_fraction=%.1f%%\n",
+                (unsigned long long)bt, avg, (unsigned long long)st,
+                (bt + st) ? 100.0 * (double)bt / (double)(bt + st) : 0.0);
+    }
     job *j = sl->job;
     sl->job = NULL;
     sl->phase = SLOT_IDLE;
@@ -11501,10 +11512,15 @@ static void *worker_main(void *arg) {
             server_slot *batch[DS4_SESSION_EVAL_MULTI_MAX];
             const int nb = sched_collect_decode_batch(s, batch);
             if (nb >= 2) {
+                if (s->batch_diag) {
+                    s->diag_batch_turns++;
+                    s->diag_batched_slots += (uint64_t)nb;
+                }
                 slot_step_decode_batch(s, batch, nb);
                 continue;
             }
         }
+        if (s->batch_diag && sl && sl->phase == SLOT_DECODE) s->diag_single_decode_turns++;
         if (sl) slot_step(s, sl);
     }
     return NULL;
@@ -12197,6 +12213,7 @@ int main(int argc, char **argv) {
         s.batched_decode = n_slots > 1 &&
                            ds4_engine_supports_batched_decode(engine) &&
                            bd != NULL && atoi(bd) != 0;
+        s.batch_diag = getenv("DS4_SERVER_BATCH_DIAG") != NULL;
     }
     for (int i = 0; i < n_slots; i++) {
         server_slot *sl = &s.slots[i];
