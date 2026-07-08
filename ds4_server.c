@@ -11282,12 +11282,26 @@ static void slot_complete(server *s, server_slot *sl) {
     pthread_mutex_unlock(&j->mu);
 }
 
+/* The scheduler multiplexes one shared kv.continued_last_store_tokens register
+ * across all live slots: swap_in loads the active slot's saved continued-
+ * checkpoint frontier before that slot is stepped, swap_out saves it back
+ * afterwards.  This keeps each slot from ever observing another slot's frontier
+ * (which would corrupt its continued disk-store decisions) without teaching the
+ * kvstore about slots.  Unit-tested by
+ * test_kv_cache_continued_frontier_is_per_slot(). */
+static void slot_kv_swap_in(server *s, server_slot *sl) {
+    s->active = sl;
+    s->kv.continued_last_store_tokens = sl->kv_continued_last_store_tokens;
+}
+static void slot_kv_swap_out(server *s, server_slot *sl) {
+    sl->kv_continued_last_store_tokens = s->kv.continued_last_store_tokens;
+}
+
 /* Run one scheduling turn for a slot: a whole phase transition, one prefill
  * slice, or up to sched_decode_tokens decode steps. */
 static void slot_step(server *s, server_slot *sl) {
     sl->last_step_seq = ++s->sched_seq;
-    s->active = sl;
-    s->kv.continued_last_store_tokens = sl->kv_continued_last_store_tokens;
+    slot_kv_swap_in(s, sl);
     job *j = sl->job;
     gen_state *gs = sl->gs;
     switch (sl->phase) {
@@ -11337,7 +11351,7 @@ static void slot_step(server *s, server_slot *sl) {
         }
         break;
     }
-    sl->kv_continued_last_store_tokens = s->kv.continued_last_store_tokens;
+    slot_kv_swap_out(s, sl);
     s->active = NULL;
 }
 
@@ -11364,8 +11378,7 @@ static void slot_step_decode_batch(server *s, server_slot **batch, int nb) {
         for (int i = 0; i < nb; i++) {
             if (!live[i]) continue;
             server_slot *sl = batch[i];
-            s->active = sl;
-            s->kv.continued_last_store_tokens = sl->kv_continued_last_store_tokens;
+            slot_kv_swap_in(s, sl);
             int token = 0;
             bool speculative = false;
             bool more = job_decode_sample(s, sl->job, sl->gs, &token, &speculative);
@@ -11389,7 +11402,7 @@ static void slot_step_decode_batch(server *s, server_slot **batch, int nb) {
                 tokens[np] = token;
                 np++;
             }
-            sl->kv_continued_last_store_tokens = s->kv.continued_last_store_tokens;
+            slot_kv_swap_out(s, sl);
             if (!more) {
                 live[i] = false;
                 sl->phase = SLOT_FINISH;
@@ -11410,8 +11423,7 @@ static void slot_step_decode_batch(server *s, server_slot **batch, int nb) {
             }
             for (int p = 0; p < np; p++) {
                 server_slot *sl = pending[p];
-                s->active = sl;
-                s->kv.continued_last_store_tokens = sl->kv_continued_last_store_tokens;
+                slot_kv_swap_in(s, sl);
                 if (!job_decode_post(s, sl->job, sl->gs, &tokens[p], 1)) {
                     sl->phase = SLOT_FINISH;
                     n_live--;
@@ -11419,7 +11431,7 @@ static void slot_step_decode_batch(server *s, server_slot **batch, int nb) {
                         if (batch[i] == sl) live[i] = false;
                     }
                 }
-                sl->kv_continued_last_store_tokens = s->kv.continued_last_store_tokens;
+                slot_kv_swap_out(s, sl);
             }
         }
         if (n_live == 0) break;
@@ -12378,9 +12390,7 @@ int main(int argc, char **argv) {
     pthread_mutex_unlock(&s.mu);
 
     for (int i = 0; i < s.n_slots; i++) {
-        s.active = &s.slots[i];
-        s.kv.continued_last_store_tokens =
-            s.slots[i].kv_continued_last_store_tokens;
+        slot_kv_swap_in(&s, &s.slots[i]);
         const ds4_tokens *tokens = ds4_session_tokens(s.active->session);
         if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
             server_log(DS4_LOG_KVCACHE,
@@ -15396,6 +15406,46 @@ static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(voi
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 10240);
 }
 
+static void test_kv_cache_continued_frontier_is_per_slot(void) {
+    /* Regression for cross-slot leakage of the continued-checkpoint frontier.
+     * The server owns a single kv.continued_last_store_tokens register; the
+     * scheduler swaps the active slot's saved value in before stepping it and
+     * back out afterwards (slot_kv_swap_in/out, used by slot_step and
+     * slot_step_decode_batch).  If a swap is dropped, one slot's frontier bleeds
+     * into another and corrupts its continued disk-store decisions.  Drive the
+     * exact swap discipline the scheduler uses over two interleaved slots and
+     * assert each slot only ever observes its own frontier. */
+    server s;
+    memset(&s, 0, sizeof(s));
+    server_slot a, b;
+    memset(&a, 0, sizeof(a));
+    memset(&b, 0, sizeof(b));
+    a.kv_continued_last_store_tokens = 10240;
+    b.kv_continued_last_store_tokens = 20480;
+
+    /* Turn 1: slot A advances its own frontier. */
+    slot_kv_swap_in(&s, &a);
+    TEST_ASSERT(s.active == &a);
+    TEST_ASSERT(s.kv.continued_last_store_tokens == 10240);
+    s.kv.continued_last_store_tokens = 30720;
+    slot_kv_swap_out(&s, &a);
+
+    /* Turn 2: slot B must see its own 20480, never A's 30720. */
+    slot_kv_swap_in(&s, &b);
+    TEST_ASSERT(s.kv.continued_last_store_tokens == 20480);
+    s.kv.continued_last_store_tokens = 40960;
+    slot_kv_swap_out(&s, &b);
+
+    /* Turn 3: slot A resumes and must recover its advanced 30720. */
+    slot_kv_swap_in(&s, &a);
+    TEST_ASSERT(s.kv.continued_last_store_tokens == 30720);
+    slot_kv_swap_out(&s, &a);
+
+    /* Saved per-slot frontiers stay independent after the interleaving. */
+    TEST_ASSERT(a.kv_continued_last_store_tokens == 30720);
+    TEST_ASSERT(b.kv_continued_last_store_tokens == 40960);
+}
+
 static void test_kv_cache_file_size_must_fit_budget(void) {
     kv_disk_cache kc = {0};
     kc.budget_bytes = 1100;
@@ -16398,6 +16448,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
     test_kv_cache_continued_uses_aligned_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
+    test_kv_cache_continued_frontier_is_per_slot();
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
     test_kv_cache_lookup_uses_longest_text_prefix();

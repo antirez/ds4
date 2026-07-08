@@ -9037,6 +9037,12 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                  0, 0, n_head, head_dim);
     return cuda_ok(cudaGetLastError(), "attention decode launch");
 }
+/* Batched decode gate.  The multi-sequence attention kernel handles raw-SWA and
+ * f32-compressed KV only: the compressed-f16 and large-context "online" variants
+ * (n_comp beyond the score buffer, roughly past ~31k tokens) are not implemented
+ * for the multi path yet, so callers fall back to per-slot single decode there —
+ * correct, just without the batch speedup.  Adding the f16/online multi kernel is
+ * the remaining follow-up. */
 extern "C" int ds4_gpu_attention_decode_multi_supported(uint32_t n_comp, uint32_t comp_kv_f16) {
     return comp_kv_f16 == 0 && cuda_attention_score_buffer_fits(n_comp) ? 1 : 0;
 }
@@ -9074,7 +9080,9 @@ extern "C" int ds4_gpu_attention_decode_heads_multi_tensor(
         }
         if (!cuda_attention_score_buffer_fits(sv->n_comp)) {
             /* The large-context online variant is not implemented for the
-             * multi path yet; callers gate batched decode on this. */
+             * multi path yet; ds4_gpu_attention_decode_multi_supported() gates
+             * batched decode on this, so past ~31k tokens the batch cleanly
+             * falls back to per-slot single decode (correct, no speedup). */
             return 0;
         }
         views.v[b].raw_kv = (const float *)sv->raw_kv->ptr;
