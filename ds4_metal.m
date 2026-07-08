@@ -25479,8 +25479,11 @@ int ds4_gpu_routed_moe_batch_tensor(
     const bool can_single_token_q4_selected_slots =
         ds4_gpu_q4_selected_paths_allowed() &&
         getenv("DS4_METAL_DISABLE_Q4_SELECTED_EXPERT_VIEWS") == NULL &&
-        g_moe_mul_mv_slots6_q4_k_pair_swiglu_pipeline != nil &&
-        g_moe_mul_mv_slots6_q4_k_sum6_pipeline != nil;
+        (n_expert == DS4_METAL_MAX_EXPERT_USED ?
+            (g_moe_mul_mv_slots8_q4_k_pair_swiglu_pipeline != nil &&
+             g_moe_mul_mv_slots8_q4_k_sum8_pipeline != nil) :
+            (g_moe_mul_mv_slots6_q4_k_pair_swiglu_pipeline != nil &&
+             g_moe_mul_mv_slots6_q4_k_sum6_pipeline != nil));
     const bool can_single_token_q4_group6 =
         n_total_expert == 384 &&
         getenv("DS4_METAL_ENABLE_Q4_GROUP6_EXPERT_TABLE") != NULL &&
@@ -25544,7 +25547,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         gate_type == DS4_METAL_TENSOR_Q4_K &&
         down_type == DS4_METAL_TENSOR_Q4_K &&
         n_tokens == 1 &&
-        n_expert == 6 &&
+        (n_expert == 6 || n_expert == DS4_METAL_MAX_EXPERT_USED) &&
         n_total_expert >= 128 &&
         (g_ssd_streaming_mode ||
          (gate_tensor_bytes >= q4_selected_min_tensor_bytes &&

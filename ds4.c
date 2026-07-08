@@ -15029,7 +15029,7 @@ static bool metal_graph_decode_q4_selected_slots_expected(
            layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
            layer->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
            layer->ffn_down_exps->type == DS4_TENSOR_Q4_K &&
-           DS4_N_EXPERT_USED == 6 &&
+           (DS4_N_EXPERT_USED == 6 || DS4_N_EXPERT_USED == DS4_MAX_EXPERT_USED) &&
            DS4_N_EXPERT >= 128 &&
            (g->ssd_streaming ||
             (gate_tensor_bytes >= q4_selected_min_tensor_bytes &&
