@@ -8,11 +8,17 @@ closes the socket mid-decode. The server handles this reactively (a failed SSE
 write sets finish="error" + stops the decode; SIGPIPE is ignored; POLLHUP/
 POLLERR are polled). This harness proves the observable contract:
 
-  1. baseline        — a normal streaming completion returns tokens;
+  1. baseline        — a normal streaming completion returns output;
   2. slot is freed   — after aborting a stream mid-decode, a fresh request
                        still completes (the slot did not leak / hang);
   3. peer unaffected — a concurrent completion on another slot finishes
                        normally while a sibling stream is aborted mid-decode.
+
+NOTE on thinking: ds4 / DeepSeek V4 Flash default to reasoning ("THINKING"),
+so the first tokens of a turn stream as `delta.reasoning_content`, not
+`delta.content`. This harness counts BOTH as decode output, otherwise the
+abort would never trigger (no visible content until thinking closes) and the
+serve-checks would see an "empty" but actually-served response.
 
 It targets an ALREADY-RUNNING dev server (starting one needs the model + GPU,
 which the operator provides). Run against the ds4-dev worktree binary on a
@@ -22,6 +28,10 @@ non-prod port, e.g.:
     /data/src/ds4-dev/ds4-server --port 8011 --parallel 4 --ctx 32768 \
         --prefill-chunk 1024 <flash-q2.gguf> &
     python3 tests/disconnect_mid_decode_test.py --base http://127.0.0.1:8011
+
+For the STRICTEST single-slot proof (a leaked slot makes the follow-up hang),
+run the dev server with --parallel 1. With --parallel N > 1 the harness runs
+more abort rounds than slots so a leak would still exhaust them.
 
 Exit code 0 = all scenarios PASS, non-zero = failure. Pure stdlib (no deps).
 """
@@ -79,8 +89,9 @@ def _open_stream(host, port, model, prompt, max_tokens, timeout):
     return c, resp
 
 
-def _iter_deltas(resp):
-    """Yield assistant content deltas from an SSE stream until [DONE]/EOF."""
+def _iter_output(resp):
+    """Yield (kind, piece) for each content/reasoning delta until [DONE]/EOF.
+    kind is "content" or "reasoning" — both count as decode progress."""
     while True:
         line = resp.readline()
         if not line:
@@ -95,25 +106,31 @@ def _iter_deltas(resp):
         except json.JSONDecodeError:
             continue
         for ch in obj.get("choices", []):
-            piece = ch.get("delta", {}).get("content")
-            if piece:
-                yield piece
+            d = ch.get("delta", {})
+            if d.get("content"):
+                yield ("content", d["content"])
+            if d.get("reasoning_content"):
+                yield ("reasoning", d["reasoning_content"])
 
 
 def run_to_completion(host, port, model, prompt, max_tokens=48, timeout=120):
+    """Return (content, reasoning) text produced by a full streaming turn."""
     c, resp = _open_stream(host, port, model, prompt, max_tokens, timeout)
+    content, reasoning = [], []
     try:
-        text = "".join(_iter_deltas(resp))
+        for kind, piece in _iter_output(resp):
+            (content if kind == "content" else reasoning).append(piece)
     finally:
         c.close()
-    return text
+    return "".join(content), "".join(reasoning)
 
 
 def decode_then_abort(host, port, model, prompt, read_tokens=4, timeout=120):
-    """Open a stream, read a few decoded tokens, then hard-close the socket."""
+    """Open a stream, read a few decoded tokens (content or reasoning), then
+    hard-close the socket mid-decode so the next server write fails."""
     c, resp = _open_stream(host, port, model, prompt, 256, timeout)
     got = 0
-    for _ in _iter_deltas(resp):
+    for _ in _iter_output(resp):
         got += 1
         if got >= read_tokens:
             break
@@ -123,11 +140,16 @@ def decode_then_abort(host, port, model, prompt, read_tokens=4, timeout=120):
     return got
 
 
+def _served(content, reasoning):
+    return bool(content.strip() or reasoning.strip())
+
+
 def scenario_baseline(host, port, model):
-    text = run_to_completion(host, port, model, "Say hello in one short sentence.")
-    ok = len(text.strip()) > 0
+    content, reasoning = run_to_completion(host, port, model,
+                                           "Say hello in one short sentence.")
+    ok = _served(content, reasoning)
     print(f"[1] baseline completion .......... {'PASS' if ok else 'FAIL'} "
-          f"({len(text)} chars)")
+          f"({len(content)} content / {len(reasoning)} reasoning chars)")
     return ok
 
 
@@ -140,9 +162,10 @@ def scenario_slot_freed(host, port, model, rounds):
             ok = False
         # Small settle so the worker observes the disconnect before we re-ask.
         time.sleep(0.2)
-        text = run_to_completion(host, port, model,
-                                 "Reply with a single word: ok.", max_tokens=16)
-        if len(text.strip()) == 0:
+        content, reasoning = run_to_completion(host, port, model,
+                                               "Reply with a single word: ok.",
+                                               max_tokens=16)
+        if not _served(content, reasoning):
             print(f"    round {i}: server did not serve after abort")
             ok = False
             break
@@ -155,8 +178,8 @@ def scenario_peer_unaffected(host, port, model):
 
     def peer():
         try:
-            result["text"] = run_to_completion(host, port, model, LONG_PROMPT,
-                                                max_tokens=64)
+            result["out"] = run_to_completion(host, port, model, LONG_PROMPT,
+                                              max_tokens=64)
         except Exception as e:  # noqa: BLE001
             result["error"] = str(e)
 
@@ -169,9 +192,15 @@ def scenario_peer_unaffected(host, port, model):
     except Exception as e:  # noqa: BLE001
         print(f"    sibling abort raised (non-fatal): {e}")
     t.join(timeout=180)
-    ok = (not t.is_alive() and "error" not in result
-          and len(result.get("text", "").strip()) > 0)
-    detail = result.get("error") or f"{len(result.get('text', ''))} chars"
+    served = "out" in result and _served(*result["out"])
+    ok = (not t.is_alive() and "error" not in result and served)
+    if "error" in result:
+        detail = result["error"]
+    elif "out" in result:
+        c, r = result["out"]
+        detail = f"{len(c)} content / {len(r)} reasoning chars"
+    else:
+        detail = "peer did not finish"
     print(f"[3] peer unaffected by abort ..... {'PASS' if ok else 'FAIL'} "
           f"({detail})")
     return ok
@@ -183,8 +212,9 @@ def main():
                     help="ds4-server base URL (default prod-adjacent :8010)")
     ap.add_argument("--model", default="deepseek-chat",
                     help="model id fallback if /v1/models is empty")
-    ap.add_argument("--rounds", type=int, default=3,
-                    help="disconnect/re-serve rounds for scenario 2")
+    ap.add_argument("--rounds", type=int, default=6,
+                    help="disconnect/re-serve rounds for scenario 2 "
+                         "(keep > --parallel so a slot leak would exhaust them)")
     args = ap.parse_args()
 
     u = urlparse(args.base)
