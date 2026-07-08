@@ -24281,19 +24281,22 @@ int ds4_gpu_routed_moe_one_tensor(
                     (use_iq2_selected_slots ? "exact-cache" : q4_selected_view_mode));
                 fprintf(stderr,
                         "ds4: Metal selected views layer=%u path=%s mode=%s ids=%s "
-                        "experts=%d,%d,%d,%d,%d,%d expert_gate=%.2f MiB "
+                        "n_expert=%u experts=%d,%d,%d,%d,%d,%d,%d,%d expert_gate=%.2f MiB "
                         "expert_down=%.2f MiB read=%.3f ms bind=%.3f ms "
                         "cache_hits=%llu cache_misses=%llu cache_wraps=%llu cache_evictions=%llu\n",
                         layer_index,
                         selected_path,
                         selected_view_mode,
                         selected_id_source,
-                        selected_ids_available ? selected_ids[0] : -1,
-                        selected_ids_available ? selected_ids[1] : -1,
-                        selected_ids_available ? selected_ids[2] : -1,
-                        selected_ids_available ? selected_ids[3] : -1,
-                        selected_ids_available ? selected_ids[4] : -1,
-                        selected_ids_available ? selected_ids[5] : -1,
+                        n_expert,
+                        selected_ids_available && n_expert > 0 ? selected_ids[0] : -1,
+                        selected_ids_available && n_expert > 1 ? selected_ids[1] : -1,
+                        selected_ids_available && n_expert > 2 ? selected_ids[2] : -1,
+                        selected_ids_available && n_expert > 3 ? selected_ids[3] : -1,
+                        selected_ids_available && n_expert > 4 ? selected_ids[4] : -1,
+                        selected_ids_available && n_expert > 5 ? selected_ids[5] : -1,
+                        selected_ids_available && n_expert > 6 ? selected_ids[6] : -1,
+                        selected_ids_available && n_expert > 7 ? selected_ids[7] : -1,
                         ds4_gpu_mib(gate_expert_bytes),
                         ds4_gpu_mib(down_expert_bytes),
                         selected_read_ms,
@@ -25597,6 +25600,127 @@ int ds4_gpu_routed_moe_batch_tensor(
                                              clamp,
                                              x,
                                              layer_index);
+    }
+
+    /*
+     * Hy3/PRO Q4 streaming has no multi-token selected-addr path yet. Loop the
+     * one-token selected-slot path so prefill never falls through to wrapping
+     * multi-GiB full expert tensors (which wedges 128 GiB machines).
+     */
+    const bool use_multi_token_q4_selected_loop =
+        n_tokens > 1 &&
+        g_ssd_streaming_mode &&
+        gate_type == DS4_METAL_TENSOR_Q4_K &&
+        down_type == DS4_METAL_TENSOR_Q4_K &&
+        (n_expert == 6 || n_expert == DS4_METAL_MAX_EXPERT_USED) &&
+        n_total_expert >= 128 &&
+        !g_quality_mode &&
+        getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
+        getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
+        can_single_token_q4_selected_slots &&
+        getenv("DS4_METAL_DISABLE_Q4_SELECTED_TOKEN_LOOP") == NULL;
+    if (use_multi_token_q4_selected_loop) {
+        if (mid_is_f16) *mid_is_f16 = false;
+        const uint64_t x_row = (uint64_t)expert_in_dim * sizeof(float);
+        const uint64_t mid_row = (uint64_t)n_expert * expert_mid_dim * sizeof(float);
+        const uint64_t out_row = (uint64_t)out_dim * sizeof(float);
+        const uint64_t experts_row = (uint64_t)n_expert * out_dim * sizeof(float);
+        const uint64_t selected_row = (uint64_t)n_expert * sizeof(int);
+        const uint64_t weights_row = (uint64_t)n_expert * sizeof(float);
+        if (ds4_gpu_tensor_bytes(x) < (uint64_t)n_tokens * x_row ||
+            ds4_gpu_tensor_bytes(gate) < (uint64_t)n_tokens * mid_row ||
+            ds4_gpu_tensor_bytes(up) < (uint64_t)n_tokens * mid_row ||
+            ds4_gpu_tensor_bytes(mid) < (uint64_t)n_tokens * mid_row ||
+            ds4_gpu_tensor_bytes(out) < (uint64_t)n_tokens * out_row ||
+            ds4_gpu_tensor_bytes(selected) < (uint64_t)n_tokens * selected_row ||
+            ds4_gpu_tensor_bytes(weights) < (uint64_t)n_tokens * weights_row ||
+            (experts && ds4_gpu_tensor_bytes(experts) < (uint64_t)n_tokens * experts_row)) {
+            fprintf(stderr,
+                    "ds4: Metal Q4 selected token-loop received undersized batch buffers "
+                    "(tokens=%u experts=%u)\n",
+                    n_tokens,
+                    n_expert);
+            return 0;
+        }
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            ds4_gpu_tensor *x_t = ds4_gpu_tensor_view(x, (uint64_t)t * x_row, x_row);
+            ds4_gpu_tensor *gate_t = ds4_gpu_tensor_view(gate, (uint64_t)t * mid_row, mid_row);
+            ds4_gpu_tensor *up_t = ds4_gpu_tensor_view(up, (uint64_t)t * mid_row, mid_row);
+            ds4_gpu_tensor *mid_t = ds4_gpu_tensor_view(mid, (uint64_t)t * mid_row, mid_row);
+            ds4_gpu_tensor *out_t = ds4_gpu_tensor_view(out, (uint64_t)t * out_row, out_row);
+            ds4_gpu_tensor *selected_t =
+                ds4_gpu_tensor_view(selected, (uint64_t)t * selected_row, selected_row);
+            ds4_gpu_tensor *weights_t =
+                ds4_gpu_tensor_view(weights, (uint64_t)t * weights_row, weights_row);
+            ds4_gpu_tensor *experts_t =
+                experts ? ds4_gpu_tensor_view(experts, (uint64_t)t * experts_row, experts_row)
+                        : NULL;
+            const int ok_t =
+                x_t && gate_t && up_t && mid_t && out_t && selected_t && weights_t &&
+                (!experts || experts_t) &&
+                ds4_gpu_routed_moe_one_tensor(out_t,
+                                             gate_t,
+                                             up_t,
+                                             mid_t,
+                                             experts_t,
+                                             model_map,
+                                             model_size,
+                                             gate_offset,
+                                             up_offset,
+                                             down_offset,
+                                             gate_type,
+                                             down_type,
+                                             gate_expert_bytes,
+                                             gate_row_bytes,
+                                             down_expert_bytes,
+                                             down_row_bytes,
+                                             expert_in_dim,
+                                             expert_mid_dim,
+                                             out_dim,
+                                             selected_t,
+                                             weights_t,
+                                             n_total_expert,
+                                             n_expert,
+                                             clamp,
+                                             x_t,
+                                             layer_index);
+            ds4_gpu_tensor_free(x_t);
+            ds4_gpu_tensor_free(gate_t);
+            ds4_gpu_tensor_free(up_t);
+            ds4_gpu_tensor_free(mid_t);
+            ds4_gpu_tensor_free(out_t);
+            ds4_gpu_tensor_free(selected_t);
+            ds4_gpu_tensor_free(weights_t);
+            ds4_gpu_tensor_free(experts_t);
+            if (!ok_t) {
+                fprintf(stderr,
+                        "ds4: Metal Q4 selected token-loop failed at layer=%u token=%u/%u\n",
+                        layer_index,
+                        t,
+                        n_tokens);
+                return 0;
+            }
+        }
+        return 1;
+    }
+
+    /* Refuse Q4 streaming multi-token fallthrough to full expert maps. */
+    if (g_ssd_streaming_mode &&
+        gate_type == DS4_METAL_TENSOR_Q4_K &&
+        down_type == DS4_METAL_TENSOR_Q4_K &&
+        n_tokens > 1 &&
+        gate_tensor_bytes >= q4_selected_min_tensor_bytes &&
+        getenv("DS4_METAL_ALLOW_Q4_FULL_EXPERT_BATCH_WRAP") == NULL) {
+        fprintf(stderr,
+                "ds4: refusing Q4 full-expert batch wrap under SSD streaming "
+                "(layer=%u tokens=%u experts_used=%u total=%u gate=%.2f GiB); "
+                "use selected token-loop or set DS4_METAL_ALLOW_Q4_FULL_EXPERT_BATCH_WRAP=1\n",
+                layer_index,
+                n_tokens,
+                n_expert,
+                n_total_expert,
+                ds4_gpu_mib(gate_tensor_bytes) / 1024.0);
+        return 0;
     }
 
     @autoreleasepool {
