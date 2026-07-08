@@ -7759,6 +7759,12 @@ struct server {
     uint64_t diag_batch_turns;
     uint64_t diag_batched_slots;
     uint64_t diag_single_decode_turns;
+    /* Breakdown of the single-decode turns by why the lone decoder could not
+     * batch: a peer was still prefilling (will join soon), a peer was finishing
+     * (past decode), or there was genuinely no other job (async arrival). */
+    uint64_t diag_single_peer_prefill;
+    uint64_t diag_single_peer_finish;
+    uint64_t diag_single_no_peer;
     int default_tokens;
     kv_disk_cache kv;
     tool_memory tool_mem;
@@ -11261,6 +11267,11 @@ static void slot_complete(server *s, server_slot *sl) {
                 "single_decode_turns=%llu  batched_fraction=%.1f%%\n",
                 (unsigned long long)bt, avg, (unsigned long long)st,
                 (bt + st) ? 100.0 * (double)bt / (double)(bt + st) : 0.0);
+        fprintf(stderr, "ds4: batch-diag  single_by_cause  peer_prefill=%llu "
+                "peer_finish=%llu no_peer=%llu\n",
+                (unsigned long long)s->diag_single_peer_prefill,
+                (unsigned long long)s->diag_single_peer_finish,
+                (unsigned long long)s->diag_single_no_peer);
     }
     job *j = sl->job;
     sl->job = NULL;
@@ -11426,6 +11437,34 @@ static int sched_collect_decode_batch(server *s, server_slot **batch) {
     return nb;
 }
 
+/* Record why a lone decoder could not batch this turn, so the batched fraction
+ * loss can be attributed instead of guessed.  A peer still in prefill will join
+ * decode shortly (recoverable overlap); a peer past decode or no peer at all is
+ * the unavoidable cost of asynchronous, uneven-length chat turns. */
+static void diag_note_single_decode(server *s, const server_slot *lone) {
+    s->diag_single_decode_turns++;
+    bool peer_prefill = false, peer_finish = false;
+    for (int i = 0; i < s->n_slots; i++) {
+        const server_slot *sl = &s->slots[i];
+        if (sl == lone || !sl->job) continue;
+        switch (sl->phase) {
+        case SLOT_BEGIN:
+        case SLOT_PREFILL:
+        case SLOT_START_DECODE:
+            peer_prefill = true;
+            break;
+        case SLOT_FINISH:
+            peer_finish = true;
+            break;
+        default:
+            break;
+        }
+    }
+    if (peer_prefill) s->diag_single_peer_prefill++;
+    else if (peer_finish) s->diag_single_peer_finish++;
+    else s->diag_single_no_peer++;
+}
+
 static bool sched_any_runnable(server *s) {
     for (int i = 0; i < s->n_slots; i++) {
         if (s->slots[i].job) return true;
@@ -11520,7 +11559,7 @@ static void *worker_main(void *arg) {
                 continue;
             }
         }
-        if (s->batch_diag && sl && sl->phase == SLOT_DECODE) s->diag_single_decode_turns++;
+        if (s->batch_diag && sl && sl->phase == SLOT_DECODE) diag_note_single_decode(s, sl);
         if (sl) slot_step(s, sl);
     }
     return NULL;
