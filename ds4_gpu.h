@@ -359,6 +359,17 @@ int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         uint32_t                rows,
         float                   eps);
 
+int ds4_gpu_glm_kv_norm_copy_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                kv_lora,
+        uint32_t                qk_rope,
+        uint32_t                rows,
+        float                   eps);
+
 int ds4_gpu_head_rms_norm_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_tok,
@@ -419,6 +430,22 @@ int ds4_gpu_dsv4_indexer_qat_tensor(
         uint32_t          head_dim);
 
 int ds4_gpu_rope_tail_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          n_head,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        uint32_t          pos0,
+        uint32_t          n_ctx_orig,
+        bool              inverse,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow);
+
+int ds4_gpu_rope_tail_split_half_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_tok,
         uint32_t          n_head,
@@ -667,6 +694,33 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
+int ds4_gpu_glm_mla_attention_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *kv_b,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                raw_cap,
+        uint32_t                n_head,
+        uint32_t                qk_nope,
+        uint32_t                qk_rope,
+        uint32_t                kv_lora,
+        uint32_t                v_head);
+
+int ds4_gpu_hy3_gqa_attention_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_head,
+        uint32_t                n_kv_head,
+        uint32_t                head_dim);
+
 int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -802,6 +856,21 @@ int ds4_gpu_router_select_batch_tensor(
         uint32_t                n_group_used,
         bool                    has_bias,
         bool                    hash_mode,
+        const ds4_gpu_tensor *logits,
+        const ds4_gpu_tensor *tokens,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        float                   expert_weight_scale,
+        uint32_t                n_tokens);
+
+int ds4_gpu_glm_router_select_batch_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                bias_offset,
+        bool                    has_bias,
         const ds4_gpu_tensor *logits,
         const ds4_gpu_tensor *tokens,
         uint32_t                n_expert,

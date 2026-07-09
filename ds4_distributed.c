@@ -3033,7 +3033,6 @@ static int dist_write_logprobs_dump(
 
     char err[256];
     int rc = 0;
-    const int eos = ds4_token_eos(state->engine);
     for (int generated = 0; generated < max_tokens; generated++) {
         const int n = dist_logits_top_logprobs(logits, ds4_engine_vocab_size(state->engine), scores, k);
         const int token = dist_logits_argmax(logits, ds4_engine_vocab_size(state->engine));
@@ -3049,7 +3048,7 @@ static int dist_write_logprobs_dump(
         }
         fputs("]}", fp);
 
-        if (token == eos) break;
+        if (ds4_is_stop_token(state->engine, token)) break;
         const uint32_t token_pos = (uint32_t)prompt->len + (uint32_t)generated;
         ds4_tokens_push(&transcript, token);
         if (dist_coordinator_eval_span(state, session, plan,
@@ -4027,7 +4026,6 @@ static int dist_run_coordinator_generation(
     else if (max_tokens > room - 1) max_tokens = room - 1;
     uint64_t rng = gen->seed ? gen->seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
-    const int eos = ds4_token_eos(state->engine);
     ds4_tokens transcript = {0};
     ds4_tokens_copy(&transcript, &prompt);
     while (generated < max_tokens) {
@@ -4038,7 +4036,7 @@ static int dist_run_coordinator_generation(
                                       gen->top_p,
                                       gen->min_p,
                                       &rng);
-        if (token == eos) break;
+        if (ds4_is_stop_token(state->engine, token)) break;
 
         size_t len = 0;
         char *text = ds4_token_text(state->engine, token, &len);

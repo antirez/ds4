@@ -3756,7 +3756,6 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     if (!tty && plain_in_think) plain_set_thinking_color(use_plain_color);
     tui_refresh(ui, "thinking");
 
-    const int eos = ds4_token_eos(engine);
     double t0 = ui->phase_start_sec;
     int forced_close_pos = -1;
     for (int i = 0; i < generation_limit; i++) {
@@ -3858,7 +3857,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
         if (token < 0)
             token = ds4_session_sample(session, cfg->temperature, 0,
                                        cfg->top_p, cfg->min_p, rng);
-        if (token == eos) break;
+        if (ds4_is_stop_token(engine, token)) break;
         if (close_kind != EVAL_THINK_CLOSE_NONE &&
             think_close.kind == EVAL_THINK_CLOSE_NONE) {
             think_close.kind = close_kind;

@@ -158,6 +158,7 @@ uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
  * KV files with the previously-zero reserved byte remain Flash-compatible;
  * Pro and later shapes must use nonzero ids. */
 int ds4_engine_model_id(ds4_engine *e);
+bool ds4_engine_is_glm(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
@@ -214,6 +215,8 @@ void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_thi
 
 char *ds4_token_text(ds4_engine *e, int token, size_t *len);
 int ds4_token_eos(ds4_engine *e);
+bool ds4_is_stop_token(ds4_engine *e, int token);
+int ds4_token_system(ds4_engine *e);
 int ds4_token_user(ds4_engine *e);
 int ds4_token_assistant(ds4_engine *e);
 
@@ -263,7 +266,7 @@ int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
-                                        int max_tokens, int eos_token,
+                                        int max_tokens,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
 void ds4_session_invalidate(ds4_session *s);

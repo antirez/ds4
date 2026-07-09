@@ -24,6 +24,10 @@
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 
 typedef struct {
     const char *prompt;
@@ -281,8 +285,13 @@ static void cli_prefill_progress_cb(void *ud, const char *event, int current, in
 }
 
 static bool is_rendered_chat_prompt(const char *prompt) {
-    const char *bos = "<｜begin▁of▁sentence｜>";
-    return prompt && strncmp(prompt, bos, strlen(bos)) == 0;
+    if (!prompt) return false;
+    const char *bos_deepseek = "<｜begin▁of▁sentence｜>";
+    const char *bos_hy3 = "<｜hy_begin_of_sentence:opensource｜>";
+    const char *bos_glm = "[gMASK]<sop>";
+    return strncmp(prompt, bos_deepseek, strlen(bos_deepseek)) == 0 ||
+           strncmp(prompt, bos_hy3, strlen(bos_hy3)) == 0 ||
+           strncmp(prompt, bos_glm, strlen(bos_glm)) == 0;
 }
 
 typedef struct {
@@ -476,7 +485,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token = ds4_session_sample(session, cfg->gen.temperature, 0,
                                        cfg->gen.top_p, cfg->gen.min_p, &rng);
-        if (token == ds4_token_eos(engine)) break;
+        if (ds4_is_stop_token(engine, token)) break;
 
         int toks[17];
         int ntok = 0;
@@ -486,7 +495,6 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             ntok = ds4_session_eval_speculative_argmax(session,
                                                        token,
                                                        max_tokens - generated,
-                                                       ds4_token_eos(engine),
                                                        toks,
                                                        (int)(sizeof(toks) / sizeof(toks[0])),
                                                        err,
@@ -512,7 +520,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
         bool stop = false;
         for (int j = 0; j < ntok; j++) {
-            if (toks[j] == ds4_token_eos(engine)) {
+            if (ds4_is_stop_token(engine, toks[j])) {
                 stop = true;
                 break;
             }
@@ -671,6 +679,12 @@ static int run_logits_dump(ds4_engine *engine, const cli_config *cfg, const ds4_
             prompt->len,
             cfg->gen.ctx_size,
             vocab);
+    fputs("  \"prompt_ids\":[", fp);
+    for (int i = 0; i < prompt->len; i++) {
+        if (i) fputc(',', fp);
+        fprintf(fp, "%d", prompt->v[i]);
+    }
+    fputs("],\n", fp);
     const int argmax = ds4_session_argmax(session);
     fputs("  \"argmax_token\":", fp);
     json_write_token(fp, engine, argmax);
@@ -766,7 +780,7 @@ static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4
         }
         fputs("]}", fp);
 
-        if (token == ds4_token_eos(engine)) break;
+        if (ds4_is_stop_token(engine, token)) break;
         if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
             fprintf(stderr, "ds4: decode failed while dumping logprobs: %s\n", err);
             free(scores);
@@ -1027,12 +1041,14 @@ static void repl_chat_apply_max_prefix(ds4_engine *engine, repl_chat *chat, bool
     if (enable && chat->max_prefix_tokens == 0) {
         ds4_tokens prefix = {0};
         ds4_chat_append_max_effort_prefix(engine, &prefix);
-        tokens_insert(&chat->transcript, 1, &prefix);
+        const int prefix_pos = ds4_engine_is_glm(engine) ? 2 : 1;
+        tokens_insert(&chat->transcript, prefix_pos, &prefix);
         chat->max_prefix_tokens = prefix.len;
         ds4_tokens_free(&prefix);
         if (chat->session) ds4_session_invalidate(chat->session);
     } else if (!enable && chat->max_prefix_tokens > 0) {
-        tokens_remove(&chat->transcript, 1, chat->max_prefix_tokens);
+        const int prefix_pos = ds4_engine_is_glm(engine) ? 2 : 1;
+        tokens_remove(&chat->transcript, prefix_pos, chat->max_prefix_tokens);
         chat->max_prefix_tokens = 0;
         if (chat->session) ds4_session_invalidate(chat->session);
     }
@@ -1147,7 +1163,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                                        cfg->gen.top_p,
                                        cfg->gen.min_p,
                                        &rng);
-        if (token == ds4_token_eos(engine)) break;
+        if (ds4_is_stop_token(engine, token)) break;
 
         int toks[17];
         int ntok = 0;
@@ -1157,7 +1173,6 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
             ntok = ds4_session_eval_speculative_argmax(chat->session,
                                                        token,
                                                        max_tokens - generated,
-                                                       ds4_token_eos(engine),
                                                        toks,
                                                        (int)(sizeof(toks) / sizeof(toks[0])),
                                                        err,
@@ -1181,7 +1196,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
         bool stop = false;
         for (int j = 0; j < ntok; j++) {
-            if (toks[j] == ds4_token_eos(engine)) {
+            if (ds4_is_stop_token(engine, toks[j])) {
                 stop = true;
                 break;
             }
@@ -1633,6 +1648,75 @@ static cli_config parse_options(int argc, char **argv) {
 
     return c;
 }
+static bool cli_generation_uses_heavy_metal_diagnostic(
+        const cli_generation_options *gen) {
+    return gen->metal_graph_test ||
+           gen->metal_graph_full_test ||
+           gen->metal_graph_prompt_test;
+}
+
+static uint64_t cli_metal_diagnostic_physical_ram(void) {
+    const char *forced = getenv("DS4_METAL_DIAGNOSTIC_RAM_BYTES");
+    if (forced && forced[0]) {
+        char *end = NULL;
+        unsigned long long n = strtoull(forced, &end, 10);
+        if (end != forced && n > 0) return (uint64_t)n;
+    }
+
+#ifdef __APPLE__
+    uint64_t mem = 0;
+    size_t len = sizeof(mem);
+    if (sysctlbyname("hw.memsize", &mem, &len, NULL, 0) == 0 && mem > 0) {
+        return mem;
+    }
+#endif
+    return 0;
+}
+
+static int cli_refuse_oversized_metal_diagnostic(const cli_config *cfg) {
+    if (cfg->engine.backend != DS4_BACKEND_METAL) return 0;
+    if (!cli_generation_uses_heavy_metal_diagnostic(&cfg->gen)) return 0;
+
+    const char *override = getenv("DS4_ALLOW_HUGE_METAL_DIAGNOSTIC");
+    if (override && override[0] && strcmp(override, "0") != 0) return 0;
+
+    struct stat st;
+    if (stat(cfg->engine.model_path, &st) != 0) return 0;
+    if (!S_ISREG(st.st_mode) || st.st_size <= 0) return 0;
+
+    const uint64_t one_gib = 1024ull * 1024ull * 1024ull;
+    const uint64_t model_size = (uint64_t)st.st_size;
+    const uint64_t headroom = 16ull * one_gib;
+    const uint64_t ram = cli_metal_diagnostic_physical_ram();
+    if (ram == 0) return 0;
+    const uint64_t budget = ram - (ram / 5u);
+
+    if (model_size <= (UINT64_MAX - headroom) / 2u) {
+        const uint64_t required = model_size * 2u + headroom;
+        if (required <= budget) return 0;
+
+        fprintf(stderr,
+                "ds4: refusing oversized Metal diagnostic for %s "
+                "(model=%llu GiB, estimated diagnostic footprint=%llu GiB, safety budget=%llu GiB, physical RAM=%llu GiB); "
+                "use a tiny/local diagnostic model, run the full diagnostic on a remote host, "
+                "or set DS4_ALLOW_HUGE_METAL_DIAGNOSTIC=1 to override\n",
+                cfg->engine.model_path,
+                (unsigned long long)((model_size + one_gib - 1u) / one_gib),
+                (unsigned long long)((required + one_gib - 1u) / one_gib),
+                (unsigned long long)((budget + one_gib - 1u) / one_gib),
+                (unsigned long long)((ram + one_gib - 1u) / one_gib));
+        return 2;
+    }
+
+    fprintf(stderr,
+            "ds4: refusing oversized Metal diagnostic for %s "
+            "(model is too large to estimate safely); "
+            "use a tiny/local diagnostic model, run the full diagnostic on a remote host, "
+            "or set DS4_ALLOW_HUGE_METAL_DIAGNOSTIC=1 to override\n",
+            cfg->engine.model_path);
+    return 2;
+}
+
 
 int main(int argc, char **argv) {
     cli_config cfg = parse_options(argc, argv);
@@ -1648,6 +1732,12 @@ int main(int argc, char **argv) {
         ds4_dist_options_free(cfg.dist);
         free(cfg.prompt_owned);
         return rc;
+    }
+    int safety_rc = cli_refuse_oversized_metal_diagnostic(&cfg);
+    if (safety_rc != 0) {
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return safety_rc;
     }
     cfg.engine.inspect_only = cfg.inspect;
     ds4_engine *engine = NULL;

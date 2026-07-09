@@ -230,3 +230,33 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
     }
     return cuda_ok(cudaGetLastError(), "router_select launch");
 }
+
+extern "C" int ds4_gpu_glm_router_select_batch_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                bias_offset,
+        bool                    has_bias,
+        const ds4_gpu_tensor *logits,
+        const ds4_gpu_tensor *tokens,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        float                   expert_weight_scale,
+        uint32_t                n_tokens) {
+    (void)selected;
+    (void)weights;
+    (void)probs;
+    (void)model_map;
+    (void)model_size;
+    (void)bias_offset;
+    (void)has_bias;
+    (void)logits;
+    (void)tokens;
+    (void)n_expert;
+    (void)n_expert_used;
+    (void)expert_weight_scale;
+    (void)n_tokens;
+    return 0;
+}

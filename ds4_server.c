@@ -10408,7 +10408,7 @@ decode_again:
             temperature = 0.0f;
         }
         int token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
-        if (token == ds4_token_eos(s->engine)) {
+        if (ds4_is_stop_token(s->engine, token)) {
             finish = "stop";
             break;
         }
@@ -10422,7 +10422,6 @@ decode_again:
             ntok = ds4_session_eval_speculative_argmax(s->session,
                                                        token,
                                                        max_tokens - completion,
-                                                       ds4_token_eos(s->engine),
                                                        toks,
                                                        (int)(sizeof(toks) / sizeof(toks[0])),
                                                        err,
@@ -10443,7 +10442,7 @@ decode_again:
         bool stop_decode = false;
         for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
             token = toks[ti];
-            if (token == ds4_token_eos(s->engine)) {
+            if (ds4_is_stop_token(s->engine, token)) {
                 finish = "stop";
                 stop_decode = true;
                 break;
