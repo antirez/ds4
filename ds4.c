@@ -4535,7 +4535,18 @@ typedef struct {
 } matvec_f16_ctx;
 
 static inline float dot_f16_row(const uint16_t *row, const float *x, uint64_t n) {
-#if defined(__ARM_NEON)
+#if defined(__AVX512F__)
+    uint64_t i = 0;
+    __m512 acc = _mm512_setzero_ps();
+    for (; i + 16 <= n; i += 16) {
+        __m256i h = _mm256_loadu_si256((const __m256i*)(row + i));
+        __m512 f = _mm512_cvtph_ps(h);
+        acc = _mm512_fmadd_ps(f, _mm512_loadu_ps(x + i), acc);
+    }
+    float result = _mm512_reduce_add_ps(acc);
+    for (; i < n; i++) result += f16_to_f32(row[i]) * x[i];
+    return result;
+#elif defined(__ARM_NEON)
     uint64_t i = 0;
     float32x4_t acc0 = vdupq_n_f32(0.0f);
     float32x4_t acc1 = vdupq_n_f32(0.0f);
@@ -4671,7 +4682,22 @@ typedef struct {
 } quantize_q8_0_batch_ctx;
 
 static inline int32_t dot_i8_32(const int8_t *a, const int8_t *b, uint64_t n) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#if defined(__AVX512F__)
+    if (n == 32) {
+        __m256i a8 = _mm256_loadu_si256((const __m256i*)a);
+        __m256i b8 = _mm256_loadu_si256((const __m256i*)b);
+        __m512i a16 = _mm512_cvtepi8_epi16(a8);
+        __m512i b16 = _mm512_cvtepi8_epi16(b8);
+        __m512i p32 = _mm512_madd_epi16(a16, b16);
+        __m256i lo = _mm512_castsi512_si256(p32);
+        __m256i hi = _mm512_extracti32x8_epi32(p32, 1);
+        __m256i s256 = _mm256_add_epi32(lo, hi);
+        __m128i s128 = _mm_add_epi32(_mm256_castsi256_si128(s256), _mm256_extracti128_si256(s256, 1));
+        s128 = _mm_hadd_epi32(s128, s128);
+        s128 = _mm_hadd_epi32(s128, s128);
+        return _mm_extract_epi32(s128, 0);
+    }
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     if (n == 32) {
         int32x4_t acc = vdupq_n_s32(0);
         acc = vdotq_s32(acc, vld1q_s8(a),      vld1q_s8(b));
@@ -4690,7 +4716,34 @@ static inline float dot_q8_0_row(
         const float   *xscale,
         uint64_t       in_dim,
         uint64_t       blocks) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#if defined(__AVX512F__)
+    if ((in_dim & 31u) == 0) {
+        __m512 acc_f = _mm512_setzero_ps();
+        uint64_t b = 0;
+        for (; b + 1 < blocks; b += 2) {
+            uint16_t sb0; memcpy(&sb0, row + b * 34, 2);
+            uint16_t sb1; memcpy(&sb1, row + (b + 1) * 34, 2);
+            float s0 = f16_to_f32(sb0) * xscale[b];
+            float s1 = f16_to_f32(sb1) * xscale[b + 1];
+            __m256i qs0 = _mm256_loadu_si256((const __m256i*)(row + b * 34 + 2));
+            __m256i qs1 = _mm256_loadu_si256((const __m256i*)(row + (b + 1) * 34 + 2));
+            __m256i xq0 = _mm256_loadu_si256((const __m256i*)(xq + b * 32));
+            __m256i xq1 = _mm256_loadu_si256((const __m256i*)(xq + (b + 1) * 32));
+            __m512i p0 = _mm512_madd_epi16(_mm512_cvtepi8_epi16(qs0), _mm512_cvtepi8_epi16(xq0));
+            __m512i p1 = _mm512_madd_epi16(_mm512_cvtepi8_epi16(qs1), _mm512_cvtepi8_epi16(xq1));
+            acc_f = _mm512_fmadd_ps(_mm512_set1_ps(s0), _mm512_cvtepi32_ps(p0), acc_f);
+            acc_f = _mm512_fmadd_ps(_mm512_set1_ps(s1), _mm512_cvtepi32_ps(p1), acc_f);
+        }
+        if (b < blocks) {
+            uint16_t sb; memcpy(&sb, row + b * 34, 2);
+            __m256i qs = _mm256_loadu_si256((const __m256i*)(row + b * 34 + 2));
+            __m256i xqb = _mm256_loadu_si256((const __m256i*)(xq + b * 32));
+            __m512i p = _mm512_madd_epi16(_mm512_cvtepi8_epi16(qs), _mm512_cvtepi8_epi16(xqb));
+            acc_f = _mm512_fmadd_ps(_mm512_set1_ps(f16_to_f32(sb) * xscale[b]), _mm512_cvtepi32_ps(p), acc_f);
+        }
+        return _mm512_reduce_add_ps(acc_f);
+    }
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     if ((in_dim & 31u) == 0) {
         float32x4_t accv0 = vdupq_n_f32(0.0f);
         float32x4_t accv1 = vdupq_n_f32(0.0f);
@@ -4745,6 +4798,122 @@ static inline float dot_q8_0_row(
         acc += f16_to_f32(scale_bits) * xscale[b] * (float)dot_i8_32(qs, xq + i0, n);
     }
     return acc;
+}
+
+static inline void dot_q8_0_row_2(
+        const uint8_t *row,
+        const int8_t  *xq0,
+        const float   *xscale0,
+        const int8_t  *xq1,
+        const float   *xscale1,
+        uint64_t       in_dim,
+        uint64_t       blocks,
+        float         *out0,
+        float         *out1) {
+#if defined(__AVX512F__)
+    if ((in_dim & 31u) == 0) {
+        __m512 acc00 = _mm512_setzero_ps();
+        __m512 acc01 = _mm512_setzero_ps();
+        __m512 acc10 = _mm512_setzero_ps();
+        __m512 acc11 = _mm512_setzero_ps();
+        uint64_t b = 0;
+        for (; b + 1 < blocks; b += 2) {
+            uint16_t sb0, sb1;
+            memcpy(&sb0, row + b * 34, 2);
+            memcpy(&sb1, row + (b + 1) * 34, 2);
+            float s0 = f16_to_f32(sb0);
+            float s1 = f16_to_f32(sb1);
+            __m256i qs0 = _mm256_loadu_si256((const __m256i*)(row + b * 34 + 2));
+            __m256i qs1 = _mm256_loadu_si256((const __m256i*)(row + (b + 1) * 34 + 2));
+            __m512i qs0_16 = _mm512_cvtepi8_epi16(qs0);
+            __m512i qs1_16 = _mm512_cvtepi8_epi16(qs1);
+            __m512i p0_xq0 = _mm512_madd_epi16(qs0_16, _mm512_cvtepi8_epi16(_mm256_loadu_si256((const __m256i*)(xq0 + b * 32))));
+            __m512i p0_xq1 = _mm512_madd_epi16(qs0_16, _mm512_cvtepi8_epi16(_mm256_loadu_si256((const __m256i*)(xq1 + b * 32))));
+            __m512i p1_xq0 = _mm512_madd_epi16(qs1_16, _mm512_cvtepi8_epi16(_mm256_loadu_si256((const __m256i*)(xq0 + (b + 1) * 32))));
+            __m512i p1_xq1 = _mm512_madd_epi16(qs1_16, _mm512_cvtepi8_epi16(_mm256_loadu_si256((const __m256i*)(xq1 + (b + 1) * 32))));
+            acc00 = _mm512_fmadd_ps(_mm512_set1_ps(s0 * xscale0[b]), _mm512_cvtepi32_ps(p0_xq0), acc00);
+            acc01 = _mm512_fmadd_ps(_mm512_set1_ps(s1 * xscale0[b + 1]), _mm512_cvtepi32_ps(p1_xq0), acc01);
+            acc10 = _mm512_fmadd_ps(_mm512_set1_ps(s0 * xscale1[b]), _mm512_cvtepi32_ps(p0_xq1), acc10);
+            acc11 = _mm512_fmadd_ps(_mm512_set1_ps(s1 * xscale1[b + 1]), _mm512_cvtepi32_ps(p1_xq1), acc11);
+        }
+        if (b < blocks) {
+            uint16_t sb; memcpy(&sb, row + b * 34, 2);
+            __m256i qs = _mm256_loadu_si256((const __m256i*)(row + b * 34 + 2));
+            __m512i qs_16 = _mm512_cvtepi8_epi16(qs);
+            __m512i p0 = _mm512_madd_epi16(qs_16, _mm512_cvtepi8_epi16(_mm256_loadu_si256((const __m256i*)(xq0 + b * 32))));
+            __m512i p1 = _mm512_madd_epi16(qs_16, _mm512_cvtepi8_epi16(_mm256_loadu_si256((const __m256i*)(xq1 + b * 32))));
+            float s = f16_to_f32(sb);
+            acc00 = _mm512_fmadd_ps(_mm512_set1_ps(s * xscale0[b]), _mm512_cvtepi32_ps(p0), acc00);
+            acc10 = _mm512_fmadd_ps(_mm512_set1_ps(s * xscale1[b]), _mm512_cvtepi32_ps(p1), acc10);
+        }
+        *out0 = _mm512_reduce_add_ps(_mm512_add_ps(acc00, acc01));
+        *out1 = _mm512_reduce_add_ps(_mm512_add_ps(acc10, acc11));
+        return;
+    }
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    if ((in_dim & 31u) == 0) {
+        float32x4_t acc00 = vdupq_n_f32(0.0f);
+        float32x4_t acc01 = vdupq_n_f32(0.0f);
+        float32x4_t acc10 = vdupq_n_f32(0.0f);
+        float32x4_t acc11 = vdupq_n_f32(0.0f);
+
+        uint64_t b = 0;
+        for (; b + 1 < blocks; b += 2) {
+            uint16_t scale_bits0;
+            uint16_t scale_bits1;
+            memcpy(&scale_bits0, row + b * 34, sizeof(scale_bits0));
+            memcpy(&scale_bits1, row + (b + 1) * 34, sizeof(scale_bits1));
+
+            const int8_t *qs0 = (const int8_t *)(row + b * 34 + 2);
+            const int8_t *qs1 = (const int8_t *)(row + (b + 1) * 34 + 2);
+
+            int32x4_t d00 = vdupq_n_s32(0);
+            d00 = vdotq_s32(d00, vld1q_s8(qs0),      vld1q_s8(xq0 + b * 32));
+            d00 = vdotq_s32(d00, vld1q_s8(qs0 + 16), vld1q_s8(xq0 + b * 32 + 16));
+            int32x4_t d01 = vdupq_n_s32(0);
+            d01 = vdotq_s32(d01, vld1q_s8(qs1),      vld1q_s8(xq0 + (b + 1) * 32));
+            d01 = vdotq_s32(d01, vld1q_s8(qs1 + 16), vld1q_s8(xq0 + (b + 1) * 32 + 16));
+
+            int32x4_t d10 = vdupq_n_s32(0);
+            d10 = vdotq_s32(d10, vld1q_s8(qs0),      vld1q_s8(xq1 + b * 32));
+            d10 = vdotq_s32(d10, vld1q_s8(qs0 + 16), vld1q_s8(xq1 + b * 32 + 16));
+            int32x4_t d11 = vdupq_n_s32(0);
+            d11 = vdotq_s32(d11, vld1q_s8(qs1),      vld1q_s8(xq1 + (b + 1) * 32));
+            d11 = vdotq_s32(d11, vld1q_s8(qs1 + 16), vld1q_s8(xq1 + (b + 1) * 32 + 16));
+
+            const float s0 = f16_to_f32(scale_bits0);
+            const float s1 = f16_to_f32(scale_bits1);
+            acc00 = vfmaq_n_f32(acc00, vcvtq_f32_s32(d00), s0 * xscale0[b]);
+            acc01 = vfmaq_n_f32(acc01, vcvtq_f32_s32(d01), s1 * xscale0[b + 1]);
+            acc10 = vfmaq_n_f32(acc10, vcvtq_f32_s32(d10), s0 * xscale1[b]);
+            acc11 = vfmaq_n_f32(acc11, vcvtq_f32_s32(d11), s1 * xscale1[b + 1]);
+        }
+
+        if (b < blocks) {
+            uint16_t scale_bits;
+            memcpy(&scale_bits, row + b * 34, sizeof(scale_bits));
+            const int8_t *qs = (const int8_t *)(row + b * 34 + 2);
+
+            int32x4_t d0 = vdupq_n_s32(0);
+            d0 = vdotq_s32(d0, vld1q_s8(qs),      vld1q_s8(xq0 + b * 32));
+            d0 = vdotq_s32(d0, vld1q_s8(qs + 16), vld1q_s8(xq0 + b * 32 + 16));
+            int32x4_t d1 = vdupq_n_s32(0);
+            d1 = vdotq_s32(d1, vld1q_s8(qs),      vld1q_s8(xq1 + b * 32));
+            d1 = vdotq_s32(d1, vld1q_s8(qs + 16), vld1q_s8(xq1 + b * 32 + 16));
+
+            const float s0 = f16_to_f32(scale_bits);
+            acc00 = vfmaq_n_f32(acc00, vcvtq_f32_s32(d0), s0 * xscale0[b]);
+            acc10 = vfmaq_n_f32(acc10, vcvtq_f32_s32(d1), s0 * xscale1[b]);
+        }
+
+        *out0 = vaddvq_f32(vaddq_f32(acc00, acc01));
+        *out1 = vaddvq_f32(vaddq_f32(acc10, acc11));
+        return;
+    }
+#endif
+
+    *out0 = dot_q8_0_row(row, xq0, xscale0, in_dim, blocks);
+    *out1 = dot_q8_0_row(row, xq1, xscale1, in_dim, blocks);
 }
 
 static inline void dot_q8_0_row_2(
@@ -4832,7 +5001,54 @@ static inline DS4_MAYBE_UNUSED void dot_q8_0_row_pair(
         uint64_t       blocks,
         float         *out0,
         float         *out1) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#if defined(__AVX512F__)
+    if ((in_dim & 31u) == 0) {
+        __m512 acc00 = _mm512_setzero_ps();
+        __m512 acc01 = _mm512_setzero_ps();
+        __m512 acc10 = _mm512_setzero_ps();
+        __m512 acc11 = _mm512_setzero_ps();
+        uint64_t b = 0;
+        for (; b + 1 < blocks; b += 2) {
+            uint16_t s00, s01, s10, s11;
+            memcpy(&s00, row0 + b * 34, 2);
+            memcpy(&s01, row0 + (b + 1) * 34, 2);
+            memcpy(&s10, row1 + b * 34, 2);
+            memcpy(&s11, row1 + (b + 1) * 34, 2);
+            __m256i xqv0 = _mm256_loadu_si256((const __m256i*)(xq + b * 32));
+            __m256i xqv1 = _mm256_loadu_si256((const __m256i*)(xq + (b + 1) * 32));
+            __m512i xqv0_16 = _mm512_cvtepi8_epi16(xqv0);
+            __m512i xqv1_16 = _mm512_cvtepi8_epi16(xqv1);
+            __m256i q00v = _mm256_loadu_si256((const __m256i*)(row0 + b * 34 + 2));
+            __m256i q01v = _mm256_loadu_si256((const __m256i*)(row0 + (b + 1) * 34 + 2));
+            __m256i q10v = _mm256_loadu_si256((const __m256i*)(row1 + b * 34 + 2));
+            __m256i q11v = _mm256_loadu_si256((const __m256i*)(row1 + (b + 1) * 34 + 2));
+            __m512i d00 = _mm512_madd_epi16(_mm512_cvtepi8_epi16(q00v), xqv0_16);
+            __m512i d01 = _mm512_madd_epi16(_mm512_cvtepi8_epi16(q01v), xqv1_16);
+            __m512i d10 = _mm512_madd_epi16(_mm512_cvtepi8_epi16(q10v), xqv0_16);
+            __m512i d11 = _mm512_madd_epi16(_mm512_cvtepi8_epi16(q11v), xqv1_16);
+            acc00 = _mm512_fmadd_ps(_mm512_set1_ps(f16_to_f32(s00) * xscale[b]), _mm512_cvtepi32_ps(d00), acc00);
+            acc01 = _mm512_fmadd_ps(_mm512_set1_ps(f16_to_f32(s01) * xscale[b + 1]), _mm512_cvtepi32_ps(d01), acc01);
+            acc10 = _mm512_fmadd_ps(_mm512_set1_ps(f16_to_f32(s10) * xscale[b]), _mm512_cvtepi32_ps(d10), acc10);
+            acc11 = _mm512_fmadd_ps(_mm512_set1_ps(f16_to_f32(s11) * xscale[b + 1]), _mm512_cvtepi32_ps(d11), acc11);
+        }
+        if (b < blocks) {
+            uint16_t s0, s1;
+            memcpy(&s0, row0 + b * 34, 2);
+            memcpy(&s1, row1 + b * 34, 2);
+            __m256i xqb = _mm256_loadu_si256((const __m256i*)(xq + b * 32));
+            __m512i xqb_16 = _mm512_cvtepi8_epi16(xqb);
+            __m256i q0v = _mm256_loadu_si256((const __m256i*)(row0 + b * 34 + 2));
+            __m256i q1v = _mm256_loadu_si256((const __m256i*)(row1 + b * 34 + 2));
+            __m512i d0 = _mm512_madd_epi16(_mm512_cvtepi8_epi16(q0v), xqb_16);
+            __m512i d1 = _mm512_madd_epi16(_mm512_cvtepi8_epi16(q1v), xqb_16);
+            acc00 = _mm512_fmadd_ps(_mm512_set1_ps(f16_to_f32(s0) * xscale[b]), _mm512_cvtepi32_ps(d0), acc00);
+            acc10 = _mm512_fmadd_ps(_mm512_set1_ps(f16_to_f32(s1) * xscale[b]), _mm512_cvtepi32_ps(d1), acc10);
+        }
+        *out0 = _mm512_reduce_add_ps(_mm512_add_ps(acc00, acc01));
+        *out1 = _mm512_reduce_add_ps(_mm512_add_ps(acc10, acc11));
+        return;
+    }
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     if ((in_dim & 31u) == 0) {
         float32x4_t acc00 = vdupq_n_f32(0.0f);
         float32x4_t acc01 = vdupq_n_f32(0.0f);
