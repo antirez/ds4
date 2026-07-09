@@ -2861,19 +2861,18 @@ static void ds4_vec_dot_q4_K_q8_K(int n, float *s, const block_q4_K *x, const bl
         const uint8_t *sc = x[i].scales;
         const int8_t  *q8 = y[i].qs;
 
+        uint8_t sc_vals[8], m_vals[8];
+        for (int j = 0; j < 8; j++)
+            q4_k_get_scale_min(j, sc, &sc_vals[j], &m_vals[j]);
+
         int32_t summs = 0;
-        for (int j = 0; j < QK_K / 32; j++) {
-            uint8_t sc_val, m_val;
-            q4_k_get_scale_min(j, sc, &sc_val, &m_val);
+        for (int j = 0; j < 8; j++) {
             int32_t gsum = (int32_t)y[i].bsums[j * 2] + (int32_t)y[i].bsums[j * 2 + 1];
-            summs += m_val * gsum;
+            summs += m_vals[j] * gsum;
         }
 
         int isum = 0;
-        for (int j = 0; j < QK_K / 32; j++) {
-            uint8_t sc_val, m_val;
-            q4_k_get_scale_min(j, sc, &sc_val, &m_val);
-
+        for (int j = 0; j < 8; j++) {
             const int byte_off = (j >> 1) * 32;
             const int shift = (j & 1) * 4;
 
@@ -2891,8 +2890,8 @@ static void ds4_vec_dot_q4_K_q8_K(int n, float *s, const block_q4_K *x, const bl
             const int8x16_t q4a = vreinterpretq_s8_u8(vld1q_u8(q4_u));
             const int8x16_t q4b = vreinterpretq_s8_u8(vld1q_u8(q4_u + 16));
 
-            isum += vaddvq_s32(vdotq_s32(zero, q4a, q8v.val[0])) * sc_val;
-            isum += vaddvq_s32(vdotq_s32(zero, q4b, q8v.val[1])) * sc_val;
+            isum += vaddvq_s32(vdotq_s32(zero, q4a, q8v.val[0])) * sc_vals[j];
+            isum += vaddvq_s32(vdotq_s32(zero, q4b, q8v.val[1])) * sc_vals[j];
         }
 
         sumf += d * (float)isum + dm * (float)summs;
@@ -2910,44 +2909,39 @@ static void ds4_vec_dot_q4_K_q8_K(int n, float *s, const block_q4_K *x, const bl
         const uint8_t *sc = x[i].scales;
         const int8_t  *q8 = y[i].qs;
 
+        uint8_t sc_vals[8], m_vals[8];
+        for (int j = 0; j < 8; j++)
+            q4_k_get_scale_min(j, sc, &sc_vals[j], &m_vals[j]);
+
         int summs = 0;
-        for (int j = 0; j < QK_K / 32; j++) {
-            uint8_t sc_val, m_val;
-            q4_k_get_scale_min(j, sc, &sc_val, &m_val);
+        for (int j = 0; j < 8; j++) {
             int32_t gsum = (int32_t)y[i].bsums[j * 2] + (int32_t)y[i].bsums[j * 2 + 1];
-            summs += m_val * gsum;
+            summs += m_vals[j] * gsum;
         }
 
         __m256i acc = _mm256_setzero_si256();
-        for (int j = 0; j < QK_K / 32; j++) {
-            uint8_t sc_val, m_val;
-            q4_k_get_scale_min(j, sc, &sc_val, &m_val);
-
+        for (int j = 0; j < 8; j++) {
             const int byte_off = (j >> 1) * 32;
-            const int shift = (j & 1) * 4;
-
             __m256i q4p = _mm256_loadu_si256((const __m256i*)(qs + byte_off));
-            if (shift == 0) {
+            if (j & 1) {
+                q4p = _mm256_srli_epi16(q4p, 4);
                 q4p = _mm256_and_si256(q4p, _mm256_set1_epi8(0x0F));
             } else {
-                q4p = _mm256_and_si256(q4p, _mm256_set1_epi8(0xF0));
-                q4p = _mm256_srli_epi16(q4p, 4);
                 q4p = _mm256_and_si256(q4p, _mm256_set1_epi8(0x0F));
             }
 
             __m256i q8v = _mm256_loadu_si256((const __m256i*)(q8 + j * 32));
 
             __m256i p = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q4p, q8v);
-            acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(p, _mm256_set1_epi32(sc_val)));
+            acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(p, _mm256_set1_epi32(sc_vals[j])));
         }
 
-        int isum = 0;
         __m128i lo = _mm256_castsi256_si128(acc);
         __m128i hi = _mm256_extracti128_si256(acc, 1);
         __m128i s128 = _mm_add_epi32(lo, hi);
         s128 = _mm_hadd_epi32(s128, s128);
         s128 = _mm_hadd_epi32(s128, s128);
-        isum = _mm_extract_epi32(s128, 0);
+        int isum = _mm_extract_epi32(s128, 0);
 
         sumf += d * (float)isum + dm * (float)summs;
     }
@@ -2964,24 +2958,23 @@ static void ds4_vec_dot_q4_K_q8_K(int n, float *s, const block_q4_K *x, const bl
         const uint8_t *sc = x[i].scales;
         const int8_t  *q8 = y[i].qs;
 
+        uint8_t sc_vals[8], m_vals[8];
+        for (int j = 0; j < 8; j++)
+            q4_k_get_scale_min(j, sc, &sc_vals[j], &m_vals[j]);
+
         int summs = 0;
-        for (int j = 0; j < QK_K / 32; j++) {
-            uint8_t sc_val, m_val;
-            q4_k_get_scale_min(j, sc, &sc_val, &m_val);
+        for (int j = 0; j < 8; j++) {
             int32_t gsum = (int32_t)y[i].bsums[j * 2] + (int32_t)y[i].bsums[j * 2 + 1];
-            summs += m_val * gsum;
+            summs += m_vals[j] * gsum;
         }
 
         int isum = 0;
-        for (int j = 0; j < QK_K / 32; j++) {
-            uint8_t sc_val, m_val;
-            q4_k_get_scale_min(j, sc, &sc_val, &m_val);
-
+        for (int j = 0; j < 8; j++) {
             const int byte_off = (j >> 1) * 32;
             const int shift = (j & 1) * 4;
 
             for (int l = 0; l < 32; l++) {
-                isum += ((qs[byte_off + l] >> shift) & 0xF) * (int)q8[j * 32 + l] * sc_val;
+                isum += ((qs[byte_off + l] >> shift) & 0xF) * (int)q8[j * 32 + l] * sc_vals[j];
             }
         }
 
@@ -4645,31 +4638,114 @@ static void embed_token_f16(const ds4_model *m, const ds4_weights *w, int token,
 
 /* RMSNorm without a learned scale, used by hyper-connection control vectors. */
 static void rms_norm_no_weight(float *out, const float *x, uint64_t n, float eps) {
+    uint64_t i = 0;
+#if defined(__AVX512F__)
+    __m512 vsum = _mm512_setzero_ps();
+    for (; i + 16 <= n; i += 16) {
+        __m512 vx = _mm512_loadu_ps(&x[i]);
+        vsum = _mm512_fmadd_ps(vx, vx, vsum);
+    }
+    __m128 lo = _mm512_castps512_ps128(vsum);
+    __m128 hi = _mm512_extractf32x4_ps(vsum, 1);
+    __m128 hi2 = _mm512_extractf32x4_ps(vsum, 2);
+    __m128 hi3 = _mm512_extractf32x4_ps(vsum, 3);
+    __m128 s128 = _mm_add_ps(_mm_add_ps(lo, hi), _mm_add_ps(hi2, hi3));
+    s128 = _mm_hadd_ps(s128, s128);
+    s128 = _mm_hadd_ps(s128, s128);
+    double ss = (double)_mm_cvtss_f32(s128);
+#else
     double ss = 0.0;
-    for (uint64_t i = 0; i < n; i++) ss += (double)x[i] * x[i];
+    for (; i < n; i++) ss += (double)x[i] * x[i];
+#endif
+    for (; i < n; i++) ss += (double)x[i] * x[i];
 
     const float scale = 1.0f / sqrtf((float)(ss / (double)n) + eps);
-    for (uint64_t i = 0; i < n; i++) out[i] = x[i] * scale;
+
+#if defined(__AVX512F__)
+    i = 0;
+    const __m512 vscale = _mm512_set1_ps(scale);
+    for (; i + 16 <= n; i += 16) {
+        __m512 vx = _mm512_loadu_ps(&x[i]);
+        _mm512_storeu_ps(&out[i], _mm512_mul_ps(vx, vscale));
+    }
+#endif
+    for (; i < n; i++) out[i] = x[i] * scale;
 }
 
 /* Standard DS4 RMSNorm with learned per-channel scale. */
-static void rms_norm_weight(float *out, const float *x, const float *weight, uint64_t n, float eps) {
+static void rms_norm_weight(float *restrict out, const float *restrict x,
+                            const float *restrict weight, uint64_t n, float eps) {
+    uint64_t i = 0;
+#if defined(__AVX512F__)
+    __m512 vsum = _mm512_setzero_ps();
+    for (; i + 16 <= n; i += 16) {
+        __m512 vx = _mm512_loadu_ps(&x[i]);
+        vsum = _mm512_fmadd_ps(vx, vx, vsum);
+    }
+    __m128 lo = _mm512_castps512_ps128(vsum);
+    __m128 hi = _mm512_extractf32x4_ps(vsum, 1);
+    __m128 hi2 = _mm512_extractf32x4_ps(vsum, 2);
+    __m128 hi3 = _mm512_extractf32x4_ps(vsum, 3);
+    __m128 s128 = _mm_add_ps(_mm_add_ps(lo, hi), _mm_add_ps(hi2, hi3));
+    s128 = _mm_hadd_ps(s128, s128);
+    s128 = _mm_hadd_ps(s128, s128);
+    double ss = (double)_mm_cvtss_f32(s128);
+#else
     double ss = 0.0;
-    for (uint64_t i = 0; i < n; i++) ss += (double)x[i] * x[i];
+    for (; i < n; i++) ss += (double)x[i] * x[i];
+#endif
+    for (; i < n; i++) ss += (double)x[i] * x[i];
 
     const float scale = 1.0f / sqrtf((float)(ss / (double)n) + eps);
-    for (uint64_t i = 0; i < n; i++) out[i] = x[i] * scale * weight[i];
+
+#if defined(__AVX512F__)
+    i = 0;
+    const __m512 vscale = _mm512_set1_ps(scale);
+    for (; i + 16 <= n; i += 16) {
+        __m512 vx = _mm512_loadu_ps(&x[i]);
+        __m512 vw = _mm512_loadu_ps(&weight[i]);
+        _mm512_storeu_ps(&out[i], _mm512_mul_ps(_mm512_mul_ps(vx, vscale), vw));
+    }
+#endif
+    for (; i < n; i++) out[i] = x[i] * scale * weight[i];
 }
 
 /* Normalize each attention head independently after Q projection. */
 static void head_rms_norm_inplace(float *x, uint32_t n_head, uint32_t head_dim, float eps) {
     for (uint32_t h = 0; h < n_head; h++) {
         float *head = x + (uint64_t)h * head_dim;
-        double ss = 0.0;
-        for (uint32_t i = 0; i < head_dim; i++) ss += (double)head[i] * head[i];
+#if defined(__AVX512F__)
+        __m512 vsum = _mm512_setzero_ps();
+        uint32_t i = 0;
+        for (; i + 16 <= head_dim; i += 16) {
+            __m512 vx = _mm512_loadu_ps(&head[i]);
+            vsum = _mm512_fmadd_ps(vx, vx, vsum);
+        }
+        __m128 lo = _mm512_castps512_ps128(vsum);
+        __m128 hi = _mm512_extractf32x4_ps(vsum, 1);
+        __m128 hi2 = _mm512_extractf32x4_ps(vsum, 2);
+        __m128 hi3 = _mm512_extractf32x4_ps(vsum, 3);
+        __m128 s128 = _mm_add_ps(_mm_add_ps(lo, hi), _mm_add_ps(hi2, hi3));
+        s128 = _mm_hadd_ps(s128, s128);
+        s128 = _mm_hadd_ps(s128, s128);
+        double ss = (double)_mm_cvtss_f32(s128);
+
+        for (; i < head_dim; i++) ss += (double)head[i] * head[i];
 
         const float scale = 1.0f / sqrtf((float)(ss / (double)head_dim) + eps);
+        const __m512 vscale = _mm512_set1_ps(scale);
+        i = 0;
+        for (; i + 16 <= head_dim; i += 16) {
+            __m512 vx = _mm512_loadu_ps(&head[i]);
+            _mm512_storeu_ps(&head[i], _mm512_mul_ps(vx, vscale));
+        }
+        for (; i < head_dim; i++) head[i] *= scale;
+#else
+        double ss = 0.0;
+        for (uint32_t i = 0; i < head_dim; i++) ss += (double)head[i] * head[i];
+        const float scale = 1.0f / sqrtf((float)(ss / (double)head_dim) + eps);
         for (uint32_t i = 0; i < head_dim; i++) head[i] *= scale;
+#endif
     }
 }
 
@@ -7466,11 +7542,13 @@ static float softplus_stable(float x) {
     return log1pf(expf(x));
 }
 
-static void swiglu(float *out, const float *gate, const float *up, uint64_t n, float clamp) {
+static void swiglu(float *restrict out, const float *restrict gate, const float *restrict up,
+                   uint64_t n, float clamp) {
+    const int use_clamp = clamp > 1.0e-6f;
     for (uint64_t i = 0; i < n; i++) {
         float g = gate[i];
         float u = up[i];
-        if (clamp > 1.0e-6f) {
+        if (use_clamp) {
             if (g > clamp) g = clamp;
             if (u > clamp) u = clamp;
             if (u < -clamp) u = -clamp;
