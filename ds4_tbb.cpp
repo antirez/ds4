@@ -7,9 +7,12 @@
 #include <cstdio>
 
 static tbb::global_control *g_tbb_control = nullptr;
+static int g_tbb_initialized = 0;
 
 extern "C" void ds4_tbb_init(uint32_t n_threads) {
-    if (g_tbb_control) return;
+    if (g_tbb_initialized) return;
+    g_tbb_initialized = 1;
+
     if (n_threads == 0) {
         const char *env = std::getenv("DS4_THREADS");
         if (env && env[0]) {

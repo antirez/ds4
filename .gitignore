@@ -16,3 +16,8 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+*.vtune
+r*[0-9]hs/
+/tmp/vtune_results*/
+*.log
+*.trace

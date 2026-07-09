@@ -1361,6 +1361,7 @@ static void ds4_threads_shutdown(void) {
 }
 
 static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void *ctx, uint64_t min_parallel_rows) {
+    ds4_threads_init();
     if (n_rows < min_parallel_rows) {
         fn(ctx, 0, n_rows);
         return;
@@ -2862,6 +2863,60 @@ static void ds4_vec_dot_q4_K_q8_K(int n, float *s, const block_q4_K *x, const bl
             isum += vaddvq_s32(vdotq_s32(zero, q4a, q8v.val[0])) * sc_val;
             isum += vaddvq_s32(vdotq_s32(zero, q4b, q8v.val[1])) * sc_val;
         }
+
+        sumf += d * (float)isum + dm * (float)summs;
+    }
+
+    *s = sumf;
+#elif defined(__AVX512VNNI__) && defined(__AVX512VL__)
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float d  = y[i].d * f16_to_f32(x[i].d);
+        const float dm = -y[i].d * f16_to_f32(x[i].dmin);
+
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *sc = x[i].scales;
+        const int8_t  *q8 = y[i].qs;
+
+        int summs = 0;
+        for (int j = 0; j < QK_K / 32; j++) {
+            uint8_t sc_val, m_val;
+            q4_k_get_scale_min(j, sc, &sc_val, &m_val);
+            int32_t gsum = (int32_t)y[i].bsums[j * 2] + (int32_t)y[i].bsums[j * 2 + 1];
+            summs += m_val * gsum;
+        }
+
+        __m256i acc = _mm256_setzero_si256();
+        for (int j = 0; j < QK_K / 32; j++) {
+            uint8_t sc_val, m_val;
+            q4_k_get_scale_min(j, sc, &sc_val, &m_val);
+
+            const int byte_off = (j >> 1) * 32;
+            const int shift = (j & 1) * 4;
+
+            __m256i q4p = _mm256_loadu_si256((const __m256i*)(qs + byte_off));
+            if (shift == 0) {
+                q4p = _mm256_and_si256(q4p, _mm256_set1_epi8(0x0F));
+            } else {
+                q4p = _mm256_and_si256(q4p, _mm256_set1_epi8(0xF0));
+                q4p = _mm256_srli_epi16(q4p, 4);
+                q4p = _mm256_and_si256(q4p, _mm256_set1_epi8(0x0F));
+            }
+
+            __m256i q8v = _mm256_loadu_si256((const __m256i*)(q8 + j * 32));
+
+            __m256i p = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q4p, q8v);
+            acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(p, _mm256_set1_epi32(sc_val)));
+        }
+
+        int isum = 0;
+        __m128i lo = _mm256_castsi256_si128(acc);
+        __m128i hi = _mm256_extracti128_si256(acc, 1);
+        __m128i s128 = _mm_add_epi32(lo, hi);
+        s128 = _mm_hadd_epi32(s128, s128);
+        s128 = _mm_hadd_epi32(s128, s128);
+        isum = _mm_extract_epi32(s128, 0);
 
         sumf += d * (float)isum + dm * (float)summs;
     }
@@ -9168,7 +9223,8 @@ static void layer_attention_mixed_scratch_worker(void *ctx_ptr, uint64_t h0, uin
     const layer_attention_mixed_scratch_ctx *c = ctx_ptr;
     const float *sinks = tensor_data(c->model, c->layer->attn_sinks);
     const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
-    float *score = c->scratch->attn_score;
+    uint32_t n_total = c->n_raw + c->n_comp;
+    float score[n_total];
 
     for (uint32_t h = (uint32_t)h0; h < (uint32_t)h1; h++) {
         const float *qh = c->q + (uint64_t)h * DS4_N_HEAD_DIM;

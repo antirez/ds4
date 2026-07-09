@@ -201,7 +201,7 @@ ds4_tbb.o: ds4_tbb.cpp ds4_tbb.h
 	$(CXX) $(CFLAGS) -std=c++17 $(TBB_FLAGS) -c -o $@ ds4_tbb.cpp
 
 ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
-	$(CC) $(CFLAGS) $(AVX512_FLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
+	$(CC) $(CFLAGS) $(AVX512_FLAGS) -DDS4_NO_GPU -DDS4_USE_TBB -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
 	$(CC) $(CFLAGS) $(AVX512_FLAGS) -DDS4_NO_GPU -c -o $@ ds4_cli.c
