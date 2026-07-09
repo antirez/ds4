@@ -575,7 +575,23 @@ static inline DS4_MAYBE_UNUSED int32_t dot_iq2_pair_16(const int8_t *grid0, cons
 }
 
 static inline DS4_MAYBE_UNUSED int32_t dot_q2_16(const uint8_t *q2, const int8_t *q8, int shift) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#if defined(__AVX512F__) && defined(__AVX512VBMI__)
+    __m128i packed = _mm_loadu_si128((const __m128i*)q2);
+    __m256i wide = _mm256_cvtepu8_epi16(packed);
+    wide = _mm256_srli_epi16(wide, shift);
+    __m128i shifted = _mm256_cvtepi16_epi8(wide);
+    shifted = _mm_and_si128(shifted, _mm_set1_epi8(3));
+    __m128i q8v = _mm_loadu_si128((const __m128i*)q8);
+    __m256i vals_16 = _mm256_cvtepu8_epi16(shifted);
+    __m256i q8_16 = _mm256_cvtepi8_epi16(q8v);
+    __m256i p32 = _mm256_madd_epi16(q8_16, vals_16);
+    __m128i lo = _mm256_castsi256_si128(p32);
+    __m128i hi = _mm256_extracti128_si256(p32, 1);
+    __m128i s128 = _mm_add_epi32(lo, hi);
+    s128 = _mm_hadd_epi32(s128, s128);
+    s128 = _mm_hadd_epi32(s128, s128);
+    return _mm_extract_epi32(s128, 0);
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     const uint8x16_t packed = vld1q_u8(q2);
     uint8x16_t shifted;
     switch (shift) {
@@ -1329,6 +1345,35 @@ static void cpu_directional_steering_project_rows(
 
 typedef void (*ds4_parallel_fn)(void *ctx, uint64_t row0, uint64_t row1);
 
+static uint32_t g_requested_threads;
+
+#ifdef DS4_USE_TBB
+
+#include "ds4_tbb.h"
+
+/* TBB-backed parallel dispatch — handles nesting, work-stealing */
+static void ds4_threads_init(void) {
+    ds4_tbb_init(g_requested_threads);
+}
+
+static void ds4_threads_shutdown(void) {
+    ds4_tbb_shutdown();
+}
+
+static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void *ctx, uint64_t min_parallel_rows) {
+    if (n_rows < min_parallel_rows) {
+        fn(ctx, 0, n_rows);
+        return;
+    }
+    ds4_tbb_parallel_for(n_rows, (ds4_tbb_parallel_fn)fn, ctx);
+}
+
+static void ds4_parallel_for(uint64_t n_rows, ds4_parallel_fn fn, void *ctx) {
+    ds4_parallel_for_min_rows(n_rows, fn, ctx, 512);
+}
+
+#else /* !DS4_USE_TBB — fallback pthread pool */
+
 #define DS4_MAX_THREADS 32
 
 typedef struct {
@@ -1349,7 +1394,6 @@ typedef struct {
 
 static ds4_thread_pool g_pool;
 static __thread int g_parallel_depth;
-static uint32_t g_requested_threads;
 
 static void *ds4_worker_main(void *arg) {
     const uint32_t tid = (uint32_t)(uintptr_t)arg;
@@ -1488,6 +1532,8 @@ static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void 
 static void ds4_parallel_for(uint64_t n_rows, ds4_parallel_fn fn, void *ctx) {
     ds4_parallel_for_min_rows(n_rows, fn, ctx, 512);
 }
+
+#endif /* DS4_USE_TBB */
 
 static void cursor_error(ds4_cursor *c, const char *msg) {
     if (c->error[0] == '\0') {
@@ -7185,35 +7231,40 @@ static float sigmoid_stable(float x) {
 
 /* Sink-aware attention over a set of KV rows.  The learned sink logit is part
  * of the softmax denominator but contributes no value vector. */
-static void layer_attention_rows_one(
-        float             * out_heads,
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
-        const float       * q,
-        const float       * kv_rows,
-        uint32_t            n_kv) {
-    const float *sinks = tensor_data(model, layer->attn_sinks);
-    const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
-    float score_stack[512];
-    float *score = n_kv <= 512 ? score_stack : xmalloc((size_t)n_kv * sizeof(score[0]));
 
-    for (uint32_t h = 0; h < DS4_N_HEAD; h++) {
-        const float *qh = q + (uint64_t)h * DS4_N_HEAD_DIM;
+typedef struct {
+    float             * out_heads;
+    const ds4_model   * model;
+    const ds4_layer_weights * layer;
+    const float       * q;
+    const float       * kv_rows;
+    uint32_t            n_kv;
+} layer_attention_rows_ctx;
+
+static void layer_attention_rows_worker(void *ctx_ptr, uint64_t h0, uint64_t h1) {
+    const layer_attention_rows_ctx *c = ctx_ptr;
+    const float *sinks = tensor_data(c->model, c->layer->attn_sinks);
+    const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
+    const uint32_t n = c->n_kv;
+    float score[n];
+
+    for (uint32_t h = (uint32_t)h0; h < (uint32_t)h1; h++) {
+        const float *qh = c->q + (uint64_t)h * DS4_N_HEAD_DIM;
 
         float max_score = sinks[h];
-        for (uint32_t r = 0; r < n_kv; r++) {
-            const float *kv = kv_rows + (uint64_t)r * DS4_N_HEAD_DIM;
+        for (uint32_t r = 0; r < n; r++) {
+            const float *kv = c->kv_rows + (uint64_t)r * DS4_N_HEAD_DIM;
             score[r] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
             if (score[r] > max_score) max_score = score[r];
         }
 
-        float *oh = out_heads + (uint64_t)h * DS4_N_HEAD_DIM;
+        float *oh = c->out_heads + (uint64_t)h * DS4_N_HEAD_DIM;
         memset(oh, 0, (size_t)DS4_N_HEAD_DIM * sizeof(oh[0]));
 
         float denom = expf(sinks[h] - max_score);
-        for (uint32_t r = 0; r < n_kv; r++) {
+        for (uint32_t r = 0; r < n; r++) {
             const float weight = expf(score[r] - max_score);
-            const float *kv = kv_rows + (uint64_t)r * DS4_N_HEAD_DIM;
+            const float *kv = c->kv_rows + (uint64_t)r * DS4_N_HEAD_DIM;
             denom += weight;
             axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
         }
@@ -7221,8 +7272,27 @@ static void layer_attention_rows_one(
         const float inv = 1.0f / denom;
         scale_f32(oh, inv, DS4_N_HEAD_DIM);
     }
+}
 
-    if (score != score_stack) free(score);
+static void layer_attention_rows_one(
+        float             * out_heads,
+        const ds4_model   * model,
+        const ds4_layer_weights * layer,
+        const float       * q,
+        const float       * kv_rows,
+        uint32_t            n_kv) {
+    if (n_kv == 0) {
+        memset(out_heads, 0, (size_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(out_heads[0]));
+        return;
+    }
+    layer_attention_rows_ctx ctx;
+    ctx.out_heads = out_heads;
+    ctx.model = model;
+    ctx.layer = layer;
+    ctx.q = q;
+    ctx.kv_rows = kv_rows;
+    ctx.n_kv = n_kv;
+    ds4_parallel_for_min_rows(DS4_N_HEAD, layer_attention_rows_worker, &ctx, 1);
 }
 
 static void layer_attention_one(
@@ -8991,6 +9061,69 @@ static bool compressor_decode_one_decode_scratch(
 
 /* Attention over raw SWA rows plus optional compressed rows.  Ratio-4 layers
  * pass an indexer mask to hide compressed rows not selected for this token. */
+typedef struct {
+    float             * out_heads;
+    const ds4_model   * model;
+    const ds4_layer_weights * layer;
+    const float       * q;
+    const float       * raw_kv;
+    uint32_t            n_raw;
+    const float       * comp_kv;
+    uint32_t            n_comp;
+    const bool        * comp_allowed;
+} layer_attention_mixed_ctx;
+
+static void layer_attention_mixed_worker(void *ctx_ptr, uint64_t h0, uint64_t h1) {
+    const layer_attention_mixed_ctx *c = ctx_ptr;
+    const float *sinks = tensor_data(c->model, c->layer->attn_sinks);
+    const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
+    const uint32_t n_total = c->n_raw + c->n_comp;
+    float score[n_total];
+
+    for (uint32_t h = (uint32_t)h0; h < (uint32_t)h1; h++) {
+        const float *qh = c->q + (uint64_t)h * DS4_N_HEAD_DIM;
+        float max_score = sinks[h];
+        uint32_t idx = 0;
+
+        for (uint32_t r = 0; r < c->n_raw; r++, idx++) {
+            const float *kv = c->raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
+            score[idx] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
+            if (score[idx] > max_score) max_score = score[idx];
+        }
+        for (uint32_t r = 0; r < c->n_comp; r++, idx++) {
+            if (c->comp_allowed && !c->comp_allowed[r]) {
+                score[idx] = DS4_NEG_INF;
+                continue;
+            }
+            const float *kv = c->comp_kv + (uint64_t)r * DS4_N_HEAD_DIM;
+            score[idx] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
+            if (score[idx] > max_score) max_score = score[idx];
+        }
+
+        float *oh = c->out_heads + (uint64_t)h * DS4_N_HEAD_DIM;
+        memset(oh, 0, (size_t)DS4_N_HEAD_DIM * sizeof(oh[0]));
+
+        float denom = expf(sinks[h] - max_score);
+        idx = 0;
+        for (uint32_t r = 0; r < c->n_raw; r++, idx++) {
+            const float weight = expf(score[idx] - max_score);
+            const float *kv = c->raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
+            denom += weight;
+            axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
+        }
+        for (uint32_t r = 0; r < c->n_comp; r++, idx++) {
+            if (score[idx] <= DS4_NEG_INF * 0.5f) continue;
+            const float weight = expf(score[idx] - max_score);
+            const float *kv = c->comp_kv + (uint64_t)r * DS4_N_HEAD_DIM;
+            denom += weight;
+            axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
+        }
+
+        const float inv = 1.0f / denom;
+        scale_f32(oh, inv, DS4_N_HEAD_DIM);
+    }
+}
+
 static void layer_attention_mixed_one(
         float             * out_heads,
         const ds4_model   * model,
@@ -9001,47 +9134,77 @@ static void layer_attention_mixed_one(
         const float       * comp_kv,
         uint32_t            n_comp,
         const bool        * comp_allowed) {
-    const float *sinks = tensor_data(model, layer->attn_sinks);
-    const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
-    const uint32_t n_total = n_raw + n_comp;
-    float score_stack[512];
-    float *score = n_total <= 512 ? score_stack : xmalloc((size_t)n_total * sizeof(score[0]));
+    if (n_raw + n_comp == 0) {
+        memset(out_heads, 0, (size_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(out_heads[0]));
+        return;
+    }
+    layer_attention_mixed_ctx ctx;
+    ctx.out_heads = out_heads;
+    ctx.model = model;
+    ctx.layer = layer;
+    ctx.q = q;
+    ctx.raw_kv = raw_kv;
+    ctx.n_raw = n_raw;
+    ctx.comp_kv = comp_kv;
+    ctx.n_comp = n_comp;
+    ctx.comp_allowed = comp_allowed;
+    ds4_parallel_for_min_rows(DS4_N_HEAD, layer_attention_mixed_worker, &ctx, 1);
+}
 
-    for (uint32_t h = 0; h < DS4_N_HEAD; h++) {
-        const float *qh = q + (uint64_t)h * DS4_N_HEAD_DIM;
+typedef struct {
+    float                  * out_heads;
+    const ds4_model        * model;
+    const ds4_layer_weights * layer;
+    const float            * q;
+    const float            * raw_kv;
+    uint32_t                 n_raw;
+    const float            * comp_kv;
+    uint32_t                 n_comp;
+    const bool             * comp_allowed;
+    ds4_cpu_decode_scratch * scratch;
+} layer_attention_mixed_scratch_ctx;
+
+static void layer_attention_mixed_scratch_worker(void *ctx_ptr, uint64_t h0, uint64_t h1) {
+    const layer_attention_mixed_scratch_ctx *c = ctx_ptr;
+    const float *sinks = tensor_data(c->model, c->layer->attn_sinks);
+    const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
+    float *score = c->scratch->attn_score;
+
+    for (uint32_t h = (uint32_t)h0; h < (uint32_t)h1; h++) {
+        const float *qh = c->q + (uint64_t)h * DS4_N_HEAD_DIM;
         float max_score = sinks[h];
         uint32_t idx = 0;
 
-        for (uint32_t r = 0; r < n_raw; r++, idx++) {
-            const float *kv = raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
+        for (uint32_t r = 0; r < c->n_raw; r++, idx++) {
+            const float *kv = c->raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
             score[idx] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
             if (score[idx] > max_score) max_score = score[idx];
         }
-        for (uint32_t r = 0; r < n_comp; r++, idx++) {
-            if (comp_allowed && !comp_allowed[r]) {
+        for (uint32_t r = 0; r < c->n_comp; r++, idx++) {
+            if (c->comp_allowed && !c->comp_allowed[r]) {
                 score[idx] = DS4_NEG_INF;
                 continue;
             }
-            const float *kv = comp_kv + (uint64_t)r * DS4_N_HEAD_DIM;
+            const float *kv = c->comp_kv + (uint64_t)r * DS4_N_HEAD_DIM;
             score[idx] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
             if (score[idx] > max_score) max_score = score[idx];
         }
 
-        float *oh = out_heads + (uint64_t)h * DS4_N_HEAD_DIM;
+        float *oh = c->out_heads + (uint64_t)h * DS4_N_HEAD_DIM;
         memset(oh, 0, (size_t)DS4_N_HEAD_DIM * sizeof(oh[0]));
 
         float denom = expf(sinks[h] - max_score);
         idx = 0;
-        for (uint32_t r = 0; r < n_raw; r++, idx++) {
+        for (uint32_t r = 0; r < c->n_raw; r++, idx++) {
             const float weight = expf(score[idx] - max_score);
-            const float *kv = raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
+            const float *kv = c->raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
             denom += weight;
             axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
         }
-        for (uint32_t r = 0; r < n_comp; r++, idx++) {
+        for (uint32_t r = 0; r < c->n_comp; r++, idx++) {
             if (score[idx] <= DS4_NEG_INF * 0.5f) continue;
             const float weight = expf(score[idx] - max_score);
-            const float *kv = comp_kv + (uint64_t)r * DS4_N_HEAD_DIM;
+            const float *kv = c->comp_kv + (uint64_t)r * DS4_N_HEAD_DIM;
             denom += weight;
             axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
         }
@@ -9049,8 +9212,6 @@ static void layer_attention_mixed_one(
         const float inv = 1.0f / denom;
         scale_f32(oh, inv, DS4_N_HEAD_DIM);
     }
-
-    if (score != score_stack) free(score);
 }
 
 static void layer_attention_mixed_one_decode_scratch(
@@ -9064,54 +9225,24 @@ static void layer_attention_mixed_one_decode_scratch(
         uint32_t                 n_comp,
         const bool             * comp_allowed,
         ds4_cpu_decode_scratch * scratch) {
-    const float *sinks = tensor_data(model, layer->attn_sinks);
-    const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
     const uint32_t n_total = n_raw + n_comp;
-    if (n_total > scratch->attn_score_cap) ds4_die("CPU decode attention score scratch buffer is too small");
-    float *score = scratch->attn_score;
-
-    for (uint32_t h = 0; h < DS4_N_HEAD; h++) {
-        const float *qh = q + (uint64_t)h * DS4_N_HEAD_DIM;
-        float max_score = sinks[h];
-        uint32_t idx = 0;
-
-        for (uint32_t r = 0; r < n_raw; r++, idx++) {
-            const float *kv = raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
-            score[idx] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
-            if (score[idx] > max_score) max_score = score[idx];
-        }
-        for (uint32_t r = 0; r < n_comp; r++, idx++) {
-            if (comp_allowed && !comp_allowed[r]) {
-                score[idx] = DS4_NEG_INF;
-                continue;
-            }
-            const float *kv = comp_kv + (uint64_t)r * DS4_N_HEAD_DIM;
-            score[idx] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
-            if (score[idx] > max_score) max_score = score[idx];
-        }
-
-        float *oh = out_heads + (uint64_t)h * DS4_N_HEAD_DIM;
-        memset(oh, 0, (size_t)DS4_N_HEAD_DIM * sizeof(oh[0]));
-
-        float denom = expf(sinks[h] - max_score);
-        idx = 0;
-        for (uint32_t r = 0; r < n_raw; r++, idx++) {
-            const float weight = expf(score[idx] - max_score);
-            const float *kv = raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
-            denom += weight;
-            axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
-        }
-        for (uint32_t r = 0; r < n_comp; r++, idx++) {
-            if (score[idx] <= DS4_NEG_INF * 0.5f) continue;
-            const float weight = expf(score[idx] - max_score);
-            const float *kv = comp_kv + (uint64_t)r * DS4_N_HEAD_DIM;
-            denom += weight;
-            axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
-        }
-
-        const float inv = 1.0f / denom;
-        scale_f32(oh, inv, DS4_N_HEAD_DIM);
+    if (n_total == 0) {
+        memset(out_heads, 0, (size_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(out_heads[0]));
+        return;
     }
+    if (n_total > scratch->attn_score_cap) ds4_die("CPU decode attention score scratch buffer is too small");
+    layer_attention_mixed_scratch_ctx ctx;
+    ctx.out_heads = out_heads;
+    ctx.model = model;
+    ctx.layer = layer;
+    ctx.q = q;
+    ctx.raw_kv = raw_kv;
+    ctx.n_raw = n_raw;
+    ctx.comp_kv = comp_kv;
+    ctx.n_comp = n_comp;
+    ctx.comp_allowed = comp_allowed;
+    ctx.scratch = scratch;
+    ds4_parallel_for_min_rows(DS4_N_HEAD, layer_attention_mixed_scratch_worker, &ctx, 1);
 }
 
 typedef struct {
