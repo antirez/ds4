@@ -45,6 +45,9 @@
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
+#if defined(__x86_64__) && defined(__AVX512F__)
+#include <immintrin.h>
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -6984,7 +6987,16 @@ static void rope_tail_layer_batch_inplace(
 }
 
 static inline float dot_f32(const float *a, const float *b, uint32_t n) {
-#if defined(__ARM_NEON)
+#if defined(__AVX512F__)
+    __m512 acc = _mm512_setzero_ps();
+    uint32_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        acc = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), acc);
+    }
+    float res = _mm512_reduce_add_ps(acc);
+    for (; i < n; i++) res += a[i] * b[i];
+    return res;
+#elif defined(__ARM_NEON)
     uint32_t i = 0;
     float32x4_t acc0 = vdupq_n_f32(0.0f);
     float32x4_t acc1 = vdupq_n_f32(0.0f);
@@ -7003,7 +7015,16 @@ static inline float dot_f32(const float *a, const float *b, uint32_t n) {
 }
 
 static inline void axpy_f32(float *y, const float *x, float a, uint32_t n) {
-#if defined(__ARM_NEON)
+#if defined(__AVX512F__)
+    const __m512 av = _mm512_set1_ps(a);
+    uint32_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m512 yv = _mm512_loadu_ps(y + i);
+        __m512 xv = _mm512_loadu_ps(x + i);
+        _mm512_storeu_ps(y + i, _mm512_fmadd_ps(av, xv, yv));
+    }
+    for (; i < n; i++) y[i] += a * x[i];
+#elif defined(__ARM_NEON)
     uint32_t i = 0;
     const float32x4_t av = vdupq_n_f32(a);
     for (; i + 8 <= n; i += 8) {
@@ -7017,7 +7038,15 @@ static inline void axpy_f32(float *y, const float *x, float a, uint32_t n) {
 }
 
 static inline void scale_f32(float *x, float a, uint32_t n) {
-#if defined(__ARM_NEON)
+#if defined(__AVX512F__)
+    const __m512 av = _mm512_set1_ps(a);
+    uint32_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m512 xv = _mm512_loadu_ps(x + i);
+        _mm512_storeu_ps(x + i, _mm512_mul_ps(xv, av));
+    }
+    for (; i < n; i++) x[i] *= a;
+#elif defined(__ARM_NEON)
     uint32_t i = 0;
     const float32x4_t av = vdupq_n_f32(a);
     for (; i + 8 <= n; i += 8) {
