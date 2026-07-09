@@ -19,6 +19,9 @@
 #include <float.h>
 #include <inttypes.h>
 #include <ctype.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #include <limits.h>
 #include <math.h>
 #include <pthread.h>
@@ -1894,6 +1897,31 @@ static void model_close(ds4_model *m) {
     m->fd = -1;
 }
 
+#ifdef __linux__
+static void model_numa_interleave(void *addr, size_t length) {
+    long n_nodes = 1;
+    FILE *f = fopen("/sys/devices/system/node/possible", "r");
+    if (f) {
+        unsigned first, last;
+        if (fscanf(f, "%u-%u", &first, &last) == 2)
+            n_nodes = (long)(last - first + 1);
+        fclose(f);
+    }
+    if (n_nodes < 2) return;
+
+    unsigned long nodemask = (n_nodes >= (long)sizeof(nodemask) * 8)
+                                 ? ~0UL
+                                 : (1UL << n_nodes) - 1;
+
+    long ret = syscall(__NR_mbind, addr, length, 3 /* MPOL_INTERLEAVE */,
+                       &nodemask, (unsigned long)n_nodes, 0);
+    if (ret != 0)
+        ds4_log(stderr, DS4_LOG_WARNING,
+                "ds4: warning: mbind(MPOL_INTERLEAVE) failed: %s\n",
+                strerror(errno));
+}
+#endif
+
 static void model_prefetch_cpu_mapping(const ds4_model *m) {
     if (!m || !m->map || m->size == 0) return;
 
@@ -2033,6 +2061,9 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     const int mmap_flags = metal_mapping ? MAP_SHARED : MAP_PRIVATE;
     void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, mmap_flags, fd, 0);
     if (map == MAP_FAILED) ds4_die_errno("cannot mmap model", path);
+
+    /* Interleave model pages across NUMA nodes before prefetch/page-fault */
+    if (!metal_mapping) model_numa_interleave(map, (size_t)st.st_size);
 
     m->fd = fd;
     m->map = map;
