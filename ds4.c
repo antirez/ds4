@@ -1350,6 +1350,10 @@ typedef void (*ds4_parallel_fn)(void *ctx, uint64_t row0, uint64_t row1);
 
 static uint32_t g_requested_threads;
 
+#if defined(__AMX_INT8__)
+static bool g_amx_supported;
+#endif
+
 #ifdef DS4_USE_TBB
 
 #include "ds4_tbb.h"
@@ -2846,7 +2850,78 @@ static inline void q4_k_get_scale_min(int j, const uint8_t *q, uint8_t *sc, uint
     }
 }
 
+/* ========== Intel AMX-accelerated Q4_K dot product ========== */
+#if defined(__AMX_INT8__)
+
+static bool amx_check_support(void) {
+    unsigned eax, ebx, ecx, edx;
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(7), "c"(0));
+    if (!(edx & (1 << 24))) return false;
+    if (!(edx & (1 << 25))) return false;
+    uint32_t xcr0_low, xcr0_high;
+    __asm__ volatile("xgetbv" : "=a"(xcr0_low), "=d"(xcr0_high) : "c"(0));
+    if (!(xcr0_low & (1 << 18))) return false;
+    if (!(xcr0_low & (1 << 19))) return false;
+    return true;
+}
+
+/* Configure tiles for Q4_K dot: tmm0=1×1 int32, tmm1=1×32 uint8, tmm2=32×1 int8 */
+static void amx_configure_q4k(void) {
+    uint8_t cfg[64] __attribute__((aligned(64)));
+    memset(cfg, 0, sizeof(cfg));
+    cfg[0] = 1;
+    *(uint16_t*)(cfg + 16) = 4;  cfg[24] = 1;
+    *(uint16_t*)(cfg + 18) = 32; cfg[26] = 1;
+    *(uint16_t*)(cfg + 20) = 1;  cfg[28] = 32;
+    __asm__ volatile("ldtilecfg %0" : : "m"(*(const uint8_t(*)[64])cfg) : "memory");
+}
+
+static void ds4_vec_dot_q4_K_q8_K_amx(int n, float *s, const block_q4_K *x, const block_q8_K *y) {
+    const int nb = n / QK_K;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const float d  = y[i].d * f16_to_f32(x[i].d);
+        const float dm = -y[i].d * f16_to_f32(x[i].dmin);
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *sc = x[i].scales;
+        const int8_t  *q8 = y[i].qs;
+        uint8_t sc_vals[8], m_vals[8];
+        for (int j = 0; j < 8; j++)
+            q4_k_get_scale_min(j, sc, &sc_vals[j], &m_vals[j]);
+        int summs = 0;
+        for (int j = 0; j < 8; j++)
+            summs += (int)m_vals[j] * ((int32_t)y[i].bsums[j*2] + (int32_t)y[i].bsums[j*2+1]);
+        amx_configure_q4k();
+        int isum = 0;
+        uint8_t unpacked[32] __attribute__((aligned(64)));
+        for (int j = 0; j < 8; j++) {
+            const int byte_off = (j >> 1) * 32;
+            const int shift = (j & 1) * 4;
+            for (int l = 0; l < 32; l++)
+                unpacked[l] = (qs[byte_off + l] >> shift) & 0xF;
+            _tile_zero(0);
+            _tile_loadd(1, unpacked, 32);
+            _tile_loadd(2, q8 + j * 32, 1);
+            _tile_dpbusd(0, 1, 2);
+            int32_t raw;
+            _tile_stored(0, &raw, 4);
+            isum += raw * (int)sc_vals[j];
+        }
+        __asm__ volatile("tilerelease" : : : "memory");
+        sumf += d * (float)isum + dm * (float)summs;
+    }
+    *s = sumf;
+}
+
+#endif /* __AMX_INT8__ */
+
 static void ds4_vec_dot_q4_K_q8_K(int n, float *s, const block_q4_K *x, const block_q8_K *y) {
+#if defined(__AMX_INT8__)
+    if (g_amx_supported) {
+        ds4_vec_dot_q4_K_q8_K_amx(n, s, x, y);
+        return;
+    }
+#endif
     const int nb = n / QK_K;
 
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
@@ -26014,6 +26089,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         e->directional_steering_ffn_scale = opt->directional_steering_ffn;
     }
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
+#if defined(__AMX_INT8__)
+    g_amx_supported = amx_check_support();
+    if (g_amx_supported)
+        fprintf(stderr, "ds4: Intel AMX detected, using AMX-accelerated Q4_K dot product\n");
+#endif
     ds4_acquire_instance_lock();
 
     if (opt->simulate_used_memory_bytes != 0 &&

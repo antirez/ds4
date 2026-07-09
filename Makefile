@@ -16,6 +16,9 @@ LDLIBS ?= -lm -pthread
 # AVX512 flags (override to empty on non-AVX512 hosts)
 AVX512_FLAGS ?= -mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512vnni
 
+# Intel AMX flags (forward-looking; requires Sapphire Rapids+)
+AMX_FLAGS ?= -mamx-tile -mamx-int8
+
 # Intel TBB (oneAPI) paths
 TBB_HOME ?= /opt/intel/oneapi/tbb/latest
 TBB_FLAGS := -DDS4_USE_TBB -I$(TBB_HOME)/include
@@ -201,7 +204,7 @@ ds4_tbb.o: ds4_tbb.cpp ds4_tbb.h
 	$(CXX) $(CFLAGS) -std=c++17 $(TBB_FLAGS) -c -o $@ ds4_tbb.cpp
 
 ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
-	$(CC) $(CFLAGS) $(AVX512_FLAGS) -DDS4_NO_GPU -DDS4_USE_TBB -c -o $@ ds4.c
+	$(CC) $(CFLAGS) $(AVX512_FLAGS) $(AMX_FLAGS) -DDS4_NO_GPU -DDS4_USE_TBB -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
 	$(CC) $(CFLAGS) $(AVX512_FLAGS) -DDS4_NO_GPU -c -o $@ ds4_cli.c
@@ -249,9 +252,11 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test
 	./ds4_agent_test
 	./ds4_test
 
-q4k-dot-test: tests/test_q4k_dot.c
+q4k-dot-test: tests/test_q4k_dot.c tests/test_q4k_dot_amx.c
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_q4k_dot tests/test_q4k_dot.c -lm -pthread
 	./tests/test_q4k_dot
+	$(CC) -O3 -march=native -mamx-tile -mamx-int8 -o tests/test_q4k_dot_amx tests/test_q4k_dot_amx.c -lm -Wall -Wextra -std=c99
+	./tests/test_q4k_dot_amx
 
 clean:
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
