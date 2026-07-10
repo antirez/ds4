@@ -283,6 +283,7 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats);
 static void ds4_gpu_stream_expert_pending_load_clear(void);
 static void ds4_gpu_stream_expert_pread_pool_shutdown(void);
 static int ds4_gpu_stream_expert_timing_summary_enabled(void);
+static void ds4_gpu_stream_expert_pread_pool_stats_print(void);
 static int ds4_gpu_stream_expert_cache_entry_protected(
         uint32_t       layer,
         uint32_t       expert,
@@ -2789,6 +2790,7 @@ void ds4_gpu_print_memory_report(const char *label) {
                 ds4_gpu_stream_expert_timing_print("delta", delta);
                 g_stream_expert_timing_last_report = total;
             }
+            ds4_gpu_stream_expert_pread_pool_stats_print();
         }
         if (getenv("DS4_METAL_STREAMING_EXPERT_LAYER_STATS") != NULL) {
             fprintf(stderr, "ds4:   streaming expert cache per-layer stats:\n");
@@ -7855,6 +7857,19 @@ static ds4_gpu_stream_expert_pread_task *g_stream_expert_pread_pool_tasks;
 static int g_stream_expert_pread_pool_initialized;
 static int g_stream_expert_pread_pool_stopping;
 
+/* Dispatch stats for the timing summary: qd_avg = task_ms / wall_ms is
+ * the effective pread concurrency the pool actually sustains. */
+static uint64_t g_stream_expert_pread_pool_stat_dispatches;
+static uint64_t g_stream_expert_pread_pool_stat_tasks;
+static uint64_t g_stream_expert_pread_pool_stat_workers;
+static uint64_t g_stream_expert_pread_pool_stat_bytes;
+static double g_stream_expert_pread_pool_stat_task_ms;
+static double g_stream_expert_pread_pool_stat_wall_ms;
+static double g_stream_expert_pread_pool_stat_t0;
+static const ds4_gpu_stream_expert_pread_task *g_stream_expert_pread_pool_stat_task_ptr;
+static uint32_t g_stream_expert_pread_pool_stat_task_n;
+static int g_stream_expert_pread_pool_stat_pending;
+
 static int ds4_gpu_stream_expert_pread_pool_enabled(void) {
     const char *env = getenv("DS4_METAL_STREAMING_EXPERT_PREAD_POOL");
     return !(env && strcmp(env, "0") == 0);
@@ -7995,6 +8010,11 @@ static int ds4_gpu_stream_expert_pread_pool_begin(
     g_stream_expert_pread_pool_active_workers = n_workers;
     g_stream_expert_pread_pool_remaining_workers = n_workers;
     g_stream_expert_pread_pool_generation++;
+    g_stream_expert_pread_pool_stat_t0 = ds4_gpu_now_ms();
+    g_stream_expert_pread_pool_stat_task_ptr = tasks;
+    g_stream_expert_pread_pool_stat_task_n = n_tasks;
+    g_stream_expert_pread_pool_stat_workers += n_workers;
+    g_stream_expert_pread_pool_stat_pending = 1;
     pthread_cond_broadcast(&g_stream_expert_pread_pool_start_cond);
     pthread_mutex_unlock(&g_stream_expert_pread_pool_mutex);
     return 1;
@@ -8008,8 +8028,49 @@ static int ds4_gpu_stream_expert_pread_pool_wait(void) {
         pthread_cond_wait(&g_stream_expert_pread_pool_done_cond,
                           &g_stream_expert_pread_pool_mutex);
     }
+    if (g_stream_expert_pread_pool_stat_pending) {
+        const ds4_gpu_stream_expert_pread_task *st =
+            g_stream_expert_pread_pool_stat_task_ptr;
+        g_stream_expert_pread_pool_stat_wall_ms +=
+            ds4_gpu_now_ms() - g_stream_expert_pread_pool_stat_t0;
+        g_stream_expert_pread_pool_stat_dispatches++;
+        g_stream_expert_pread_pool_stat_tasks +=
+            g_stream_expert_pread_pool_stat_task_n;
+        for (uint32_t i = 0; i < g_stream_expert_pread_pool_stat_task_n; i++) {
+            g_stream_expert_pread_pool_stat_task_ms += st[i].ms;
+            g_stream_expert_pread_pool_stat_bytes += st[i].read_bytes;
+        }
+        g_stream_expert_pread_pool_stat_task_ptr = NULL;
+        g_stream_expert_pread_pool_stat_task_n = 0;
+        g_stream_expert_pread_pool_stat_pending = 0;
+    }
     pthread_mutex_unlock(&g_stream_expert_pread_pool_mutex);
     return 1;
+}
+
+static void ds4_gpu_stream_expert_pread_pool_stats_print(void) {
+    pthread_mutex_lock(&g_stream_expert_pread_pool_mutex);
+    const uint64_t dispatches = g_stream_expert_pread_pool_stat_dispatches;
+    const uint64_t tasks = g_stream_expert_pread_pool_stat_tasks;
+    const uint64_t workers = g_stream_expert_pread_pool_stat_workers;
+    const uint64_t bytes = g_stream_expert_pread_pool_stat_bytes;
+    const double task_ms = g_stream_expert_pread_pool_stat_task_ms;
+    const double wall_ms = g_stream_expert_pread_pool_stat_wall_ms;
+    pthread_mutex_unlock(&g_stream_expert_pread_pool_mutex);
+    if (dispatches == 0) return;
+    fprintf(stderr,
+            "ds4:   streaming pread pool dispatches=%llu tasks=%llu "
+            "tasks_avg=%.1f workers_avg=%.1f bytes=%.2f GiB wall_avg=%.3f ms "
+            "qd_avg=%.2f pool_gbps=%.2f task_gbps=%.2f\n",
+            (unsigned long long)dispatches,
+            (unsigned long long)tasks,
+            (double)tasks / (double)dispatches,
+            (double)workers / (double)dispatches,
+            ds4_gpu_gib(bytes),
+            wall_ms / (double)dispatches,
+            wall_ms > 0.0 ? task_ms / wall_ms : 0.0,
+            wall_ms > 0.0 ? (double)bytes / 1e6 / wall_ms : 0.0,
+            task_ms > 0.0 ? (double)bytes / 1e6 / task_ms : 0.0);
 }
 
 static int ds4_gpu_stream_expert_pread_pool_dispatch(
