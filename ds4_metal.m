@@ -14,6 +14,8 @@
 #include <limits.h>
 #include <time.h>
 #include <pthread.h>
+#include <pthread/qos.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
@@ -7829,9 +7831,12 @@ static int ds4_gpu_stream_expert_pread_into(
     return 1;
 }
 
+static void ds4_gpu_stream_expert_pread_thread_qos(void);
+
 static void *ds4_gpu_stream_expert_pread_worker(void *arg) {
     ds4_gpu_stream_expert_pread_worker_args *wa =
         (ds4_gpu_stream_expert_pread_worker_args *)arg;
+    ds4_gpu_stream_expert_pread_thread_qos();
     for (uint32_t i = wa->worker_index; i < wa->n_tasks; i += wa->n_workers) {
         ds4_gpu_stream_expert_pread_task *task = &wa->tasks[i];
         task->ok = ds4_gpu_stream_expert_pread_into(task->offset,
@@ -7875,9 +7880,19 @@ static int ds4_gpu_stream_expert_pread_pool_enabled(void) {
     return !(env && strcmp(env, "0") == 0);
 }
 
+/* Expert reads are on the token critical path: exempt reader threads
+ * from the IO throttling / background QoS a demoted parent would hand
+ * them (plain nice does not throttle IO, taskpolicy -b does). */
+static void ds4_gpu_stream_expert_pread_thread_qos(void) {
+    if (getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_PREAD_QOS") != NULL) return;
+    (void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+    (void)setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_IMPORTANT);
+}
+
 static void *ds4_gpu_stream_expert_pread_pool_worker(void *arg) {
     const uint32_t worker_index = (uint32_t)(uintptr_t)arg;
     uint64_t seen_generation = 0;
+    ds4_gpu_stream_expert_pread_thread_qos();
 
     for (;;) {
         pthread_mutex_lock(&g_stream_expert_pread_pool_mutex);
