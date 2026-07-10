@@ -7658,6 +7658,14 @@ static int ds4_gpu_stream_expert_readahead_enabled(void) {
            getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD") == NULL;
 }
 
+/* Advise for ranges the pread pool reads immediately after: the fcntl
+ * blocks the eval thread while the pool fetches the same bytes anyway.
+ * Off by default; the env restores the old behavior for comparisons. */
+static int ds4_gpu_stream_expert_miss_readahead_enabled(void) {
+    return ds4_gpu_stream_expert_readahead_enabled() &&
+           getenv("DS4_METAL_ENABLE_STREAMING_EXPERT_MISS_READAHEAD") != NULL;
+}
+
 static void ds4_gpu_stream_expert_readahead_range(uint64_t offset, uint64_t len) {
     if (!ds4_gpu_stream_expert_readahead_enabled() || g_model_fd < 0 || len == 0) {
         return;
@@ -10345,9 +10353,11 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_get_protec
         return e;
     }
 
-    ds4_gpu_stream_expert_readahead_range(gate_abs_offset, gate_expert_bytes);
-    ds4_gpu_stream_expert_readahead_range(up_abs_offset, gate_expert_bytes);
-    ds4_gpu_stream_expert_readahead_range(down_abs_offset, down_expert_bytes);
+    if (ds4_gpu_stream_expert_miss_readahead_enabled()) {
+        ds4_gpu_stream_expert_readahead_range(gate_abs_offset, gate_expert_bytes);
+        ds4_gpu_stream_expert_readahead_range(up_abs_offset, gate_expert_bytes);
+        ds4_gpu_stream_expert_readahead_range(down_abs_offset, down_expert_bytes);
+    }
 
     id<MTLBuffer> gate_buf = nil;
     id<MTLBuffer> up_buf = nil;
@@ -10760,12 +10770,14 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         const int force_reuse =
             cache_budget != 0 && reserved_entries >= cache_budget;
 
-        ds4_gpu_stream_expert_readahead_range(p->gate_abs_offsets[slot],
-                                              gate_expert_bytes);
-        ds4_gpu_stream_expert_readahead_range(p->up_abs_offsets[slot],
-                                              gate_expert_bytes);
-        ds4_gpu_stream_expert_readahead_range(p->down_abs_offsets[slot],
-                                              down_expert_bytes);
+        if (ds4_gpu_stream_expert_miss_readahead_enabled()) {
+            ds4_gpu_stream_expert_readahead_range(p->gate_abs_offsets[slot],
+                                                  gate_expert_bytes);
+            ds4_gpu_stream_expert_readahead_range(p->up_abs_offsets[slot],
+                                                  gate_expert_bytes);
+            ds4_gpu_stream_expert_readahead_range(p->down_abs_offsets[slot],
+                                                  down_expert_bytes);
+        }
 
         if (!ds4_gpu_stream_expert_cache_prepare_load_buffers(layer,
                                                               expert,
@@ -10982,12 +10994,14 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing(
         const int force_reuse =
             cache_budget != 0 && reserved_entries >= cache_budget;
 
-        ds4_gpu_stream_expert_readahead_range(gate_abs_offsets[slot],
-                                              gate_expert_bytes);
-        ds4_gpu_stream_expert_readahead_range(up_abs_offsets[slot],
-                                              gate_expert_bytes);
-        ds4_gpu_stream_expert_readahead_range(down_abs_offsets[slot],
-                                              down_expert_bytes);
+        if (ds4_gpu_stream_expert_miss_readahead_enabled()) {
+            ds4_gpu_stream_expert_readahead_range(gate_abs_offsets[slot],
+                                                  gate_expert_bytes);
+            ds4_gpu_stream_expert_readahead_range(up_abs_offsets[slot],
+                                                  gate_expert_bytes);
+            ds4_gpu_stream_expert_readahead_range(down_abs_offsets[slot],
+                                                  down_expert_bytes);
+        }
 
         if (!ds4_gpu_stream_expert_cache_prepare_load_buffers(layer,
                                                               expert,
