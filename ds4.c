@@ -30722,7 +30722,15 @@ static bool glm_graph_forward_indexed_tokens(
     const uint32_t drain_interval =
         progress_flush_interval != 0 ? glm_graph_indexed_prefill_drain_interval() : 0u;
     const bool progress_requested = display_progress && work_total > 0;
-    ds4_gpu_set_glm_streaming_prefill_full_layer(false);
+    /* Mirror the plain prefill flow: above the full-layer threshold the
+     * selected-expert addr loader is the wrong tool — a chunk of N tokens
+     * selects far more unique experts per layer than the cache can hold, and
+     * its overflow branch needs the full expert tensors mapped.  Hardcoding
+     * false here broke every generation prompt above ~64 tokens ("failed to
+     * map overflow expert views"), while short prompts keep the addr path. */
+    const bool full_layer_prefill =
+        glm_graph_stream_prefill_full_layer_enabled(g, n_tokens);
+    ds4_gpu_set_glm_streaming_prefill_full_layer(full_layer_prefill);
 
     if (trace) {
         glm_graph_indexed_prefill_tracef(
@@ -30810,15 +30818,58 @@ static bool glm_graph_forward_indexed_tokens(
     } while (0)
     ds4_gpu_tensor *last_indexer_selected = NULL;
     uint32_t last_indexer_selected_count = 0;
+    /* The indexed prefill maps each full layer and then pays the sweep as GPU
+     * demand faults during the kernels (~2.6 GB/s measured on an M5 Pro
+     * against ~7 GB/s the SSD can sustain).  Reuse the full-attention layer
+     * prepare (pread pool warming the next layer while this one computes):
+     * measured 3.5 -> 8.5 t/s prefill on a 271-token prompt, decode
+     * unaffected, identical greedy output.  Opt-in while it soaks. */
+    metal_graph_stream_prepare_slot idx_prepare_slots[DS4_STREAM_PREFILL_MAX_PREPARE_AHEAD];
+    memset(idx_prepare_slots, 0, sizeof(idx_prepare_slots));
+    const bool idx_prepare =
+        g->ssd_streaming &&
+        full_layer_prefill &&
+        getenv("DS4_METAL_ENABLE_GLM_INDEXED_PREFILL_PREPARE") != NULL;
     for (uint32_t il = g->layer_start; ok && il <= g->layer_end; il++) {
         const uint32_t slice_layer_done = il - g->layer_start + 1u;
         if (g->ssd_streaming) {
+            if (idx_prepare &&
+                !metal_graph_stream_prepare_join_layer(NULL,
+                                                       model,
+                                                       weights,
+                                                       il,
+                                                       n_tokens,
+                                                       false,
+                                                       true,
+                                                       false,
+                                                       false,
+                                                       idx_prepare_slots,
+                                                       DS4_STREAM_PREFILL_MAX_PREPARE_AHEAD)) {
+                ok = false;
+                break;
+            }
             ok = glm_graph_stream_map_prefill_layer(g,
                                                     model,
                                                     weights,
                                                     il,
                                                     n_tokens,
-                                                    false);
+                                                    full_layer_prefill);
+            if (ok && idx_prepare && il < g->layer_end) {
+                if (!metal_graph_stream_prepare_start_if_needed(
+                            NULL,
+                            model,
+                            weights,
+                            il + 1,
+                            n_tokens,
+                            false,
+                            true,
+                            false,
+                            false,
+                            idx_prepare_slots,
+                            DS4_STREAM_PREFILL_MAX_PREPARE_AHEAD)) {
+                    ok = false;
+                }
+            }
             if (ok) ok = ds4_gpu_begin_commands() != 0;
         }
         const ds4_layer_weights *l = &weights->layer[il];
@@ -31737,6 +31788,11 @@ static bool glm_graph_forward_indexed_tokens(
                     (now_sec() - trace_chunk_t0) * 1000.0);
         }
         (void)ds4_gpu_synchronize();
+    }
+    if (idx_prepare &&
+        !metal_graph_stream_prepare_join_all(idx_prepare_slots,
+                                             DS4_STREAM_PREFILL_MAX_PREPARE_AHEAD)) {
+        ok = false;
     }
     if (ok) {
         glm_graph_report_prefill_display_progress(display_progress,

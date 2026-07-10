@@ -12859,12 +12859,16 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                 continue;
             }
 
-            if (cache_budget != 0 && reserved_entries >= cache_budget) {
-                unique_entries[u] = NULL;
-                continue;
-            }
-
-            const int force_reuse = 0;
+            /* At budget, evict-and-reuse like the decode loader does instead
+             * of spilling to whole-tensor overflow views: the overflow wrap
+             * needs the expert tensors in the mapped view set, which the
+             * decode-expert-cache prefill mapping does not provide, so a
+             * full cache made any checkpoint-extend or small-suffix prefill
+             * fail ("failed to map overflow expert views").  Commands were
+             * just synced by the caller, so reuse cannot race the GPU, and
+             * prepare_load_buffers protects this layer's unique set. */
+            const int force_reuse =
+                cache_budget != 0 && reserved_entries >= cache_budget;
             ds4_gpu_stream_expert_readahead_range(unique_gate_offsets[u],
                                                   gate_expert_bytes);
             ds4_gpu_stream_expert_readahead_range(unique_up_offsets[u],
