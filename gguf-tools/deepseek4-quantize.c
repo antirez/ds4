@@ -691,6 +691,15 @@ static float *dequant_fp8_weight(const st_value *w, const st_value *scale, int64
     const int64_t scale_rows = out_dim / block_out;
     const int64_t scale_cols = in_dim / block_in;
     if (scale->shape[0] != scale_rows || scale->shape[1] != scale_cols) die("FP8 scale shape mismatch");
+    /* shape and data_offsets are independent header fields; cross-check that the
+     * on-disk buffers (sized from data_offsets by db_read) are actually large
+     * enough for the shape-driven indexing below. Without this, a weight that
+     * declares a large shape but a tiny data_offsets range makes the loops read
+     * past the end of w->data / scale->data (heap-buffer-overflow read). One
+     * byte per element for F8_E4M3 weights and F8_E8M0 scales. */
+    if (w->nbytes < (size_t)out_dim * (size_t)in_dim ||
+        scale->nbytes < (size_t)scale_rows * (size_t)scale_cols)
+        die("FP8 tensor data smaller than its declared shape");
     float *out = xmalloc((size_t)out_dim * (size_t)in_dim * sizeof(float));
     for (int64_t ob = 0; ob < scale_rows; ob++) {
         for (int64_t ib = 0; ib < scale_cols; ib++) {
@@ -721,6 +730,14 @@ static float *dequant_fp4_weight(const st_value *w, const st_value *scale, int64
     if (in_dim % 32) die("FP4 in_dim is not divisible by 32");
     const int64_t n_blocks = in_dim / 32;
     if (scale->shape[0] != out_dim || scale->shape[1] != n_blocks) die("FP4 scale shape mismatch");
+    /* As in dequant_fp8_weight: cross-check the on-disk buffer sizes (from
+     * data_offsets) against the shape-driven indexing so a small data range
+     * under a large declared shape cannot drive an out-of-bounds read. The I8
+     * weight packs two 4-bit values per byte -> out_dim * packed_in bytes; the
+     * F8_E8M0 scale is one byte per block. */
+    if (w->nbytes < (size_t)out_dim * (size_t)packed_in ||
+        scale->nbytes < (size_t)out_dim * (size_t)n_blocks)
+        die("FP4 tensor data smaller than its declared shape");
     float *out = xmalloc((size_t)out_dim * (size_t)in_dim * sizeof(float));
     for (int64_t r = 0; r < out_dim; r++) {
         for (int64_t b = 0; b < n_blocks; b++) {
