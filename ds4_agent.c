@@ -592,8 +592,13 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.backend = parse_backend(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
+#ifdef DS4_ROCM_BUILD
+        } else if (!strcmp(arg, "--rocm")) {
+            c.engine.backend = DS4_BACKEND_CUDA;
+#else
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
+#endif
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
