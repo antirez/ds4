@@ -281,7 +281,11 @@ static bool json_number(const char **p, double *out) {
 static bool json_int(const char **p, int *out) {
     double v = 0.0;
     if (!json_number(p, &v)) return false;
-    if (v < 0) v = 0;
+    /* json_number() uses strtod(), which accepts "NaN"/"Infinity". NaN fails
+     * every comparison, so a plain `v < 0` clamp would let it through to the
+     * (int) cast, which is undefined for NaN; `!(v >= 0)` folds NaN (and
+     * negatives) to 0. +/-Infinity are handled by the two clamps. */
+    if (!(v >= 0)) v = 0;
     if (v > INT_MAX) v = INT_MAX;
     *out = (int)v;
     return true;
