@@ -4,8 +4,8 @@ UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
 NATIVE_CPU_FLAG ?= -mcpu=native
 QUALITY_LDLIBS := -lm -pthread -framework Foundation -framework Metal
-QUALITY_TARGETS := ds4.o ds4_metal.o
-QUALITY_OBJS := ../ds4.o ../ds4_metal.o
+QUALITY_TARGETS := ds4.o ds4_distributed.o ds4_ssd.o ds4_metal.o
+QUALITY_OBJS := ../ds4.o ../ds4_distributed.o ../ds4_ssd.o ../ds4_metal.o
 QUALITY_LINK := $(CC) $(CFLAGS) -I.. -o
 else
 NATIVE_CPU_FLAG ?= -march=native
@@ -17,8 +17,8 @@ NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 QUALITY_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
-QUALITY_TARGETS := ds4.o ds4_cuda.o
-QUALITY_OBJS := ../ds4.o ../ds4_cuda.o
+QUALITY_TARGETS := ds4.o ds4_distributed.o ds4_ssd.o ds4_cuda.o
+QUALITY_OBJS := ../ds4.o ../ds4_distributed.o ../ds4_ssd.o ../ds4_cuda.o
 QUALITY_LINK := $(NVCC) $(NVCCFLAGS) -I.. -o
 endif
 
