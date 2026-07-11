@@ -454,6 +454,40 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
         uint32_t                rows,
         float                   eps);
 
+/* GQA attention (Hy3-class models): ds4_cuda_gqa.inc */
+int ds4_gpu_gqa_head_rms_norm_weight(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *w,
+        uint32_t                rows,
+        uint32_t                head_dim,
+        float                   eps);
+int ds4_gpu_gqa_rope(
+        ds4_gpu_tensor       *x,
+        uint32_t                n_tok,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                pos0,
+        float                   theta);
+int ds4_gpu_gqa_kv_cache_append(
+        ds4_gpu_tensor       *cache,
+        const ds4_gpu_tensor *kv_in,
+        uint32_t                n_tok,
+        uint32_t                n_kv_head,
+        uint32_t                head_dim,
+        uint32_t                cap,
+        uint32_t                pos0);
+int ds4_gpu_gqa_attention(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_cache,
+        const ds4_gpu_tensor *v_cache,
+        uint32_t                n_tok,
+        uint32_t                n_head,
+        uint32_t                n_kv_head,
+        uint32_t                head_dim,
+        uint32_t                cap,
+        uint32_t                pos0);
+
 int ds4_gpu_add_rms_norm_weight_tensor(
         ds4_gpu_tensor       *norm_out,
         ds4_gpu_tensor       *sum_out,

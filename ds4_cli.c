@@ -1937,6 +1937,19 @@ static cli_config parse_options(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+    /* Kernel self-tests that need no model file; handled before option
+     * parsing so no other flags are required. */
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--gqa-selftest")) {
+#ifndef DS4_NO_GPU
+            extern int ds4_gpu_gqa_selftest(void);
+            return ds4_gpu_gqa_selftest() ? 0 : 1;
+#else
+            fprintf(stderr, "ds4: --gqa-selftest requires a GPU build\n");
+            return 2;
+#endif
+        }
+    }
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {
