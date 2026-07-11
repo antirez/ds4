@@ -219,6 +219,13 @@ static bool json_u16(const char **p, uint32_t *out) {
 }
 
 static bool json_string(const char **p, char **out) {
+    /* Always define *out. Every failure path below returns false without
+     * producing a string, and several callers reparse in place with
+     * `free(x); json_string(&p, &x)` (e.g. duplicate JSON keys, the "model"
+     * field). Without this, a non-string or malformed value leaves *out
+     * holding the just-freed pointer, which a later cleanup frees again --
+     * a double-free. Nulling on entry closes that whole class at the root. */
+    *out = NULL;
     json_ws(p);
     if (**p != '"') return false;
     (*p)++;
