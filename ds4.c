@@ -22241,7 +22241,8 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         ds4_die("GGUF tokenizer token table is missing or invalid");
     }
     if (!model_get_array(model, "tokenizer.ggml.merges", &merges) ||
-        merges.type != GGUF_VALUE_STRING) {
+        merges.type != GGUF_VALUE_STRING ||
+        merges.len > INT32_MAX) {
         ds4_die("GGUF tokenizer merge table is missing or invalid");
     }
 
