@@ -7797,9 +7797,349 @@ typedef struct {
     double last_decode_tps;
 } server_stats;
 
+/* Client threads serialize this value copy and never inspect the mutable model
+ * session.  Only the worker publishes live_tokens; the remaining fields are
+ * sampled under server.mu at the same publication point. */
+typedef struct {
+    server_stats counters;
+    int queue_depth;
+    int clients;
+    int live_tokens;
+    int ctx_size;
+    bool busy;
+    uint64_t version;
+} server_stats_snapshot;
+
+typedef enum {
+    SERVER_TXN_PHASE_ADMITTED = 0,
+    SERVER_TXN_PHASE_RESTORE,
+    SERVER_TXN_PHASE_SYNCHRONIZE,
+    SERVER_TXN_PHASE_EXTEND,
+    SERVER_TXN_PHASE_DECODE,
+    SERVER_TXN_PHASE_RECOVER,
+    SERVER_TXN_PHASE_SETTLE,
+    SERVER_TXN_PHASE_TERMINALIZE,
+    SERVER_TXN_PHASE_DONE,
+} server_txn_phase;
+
+typedef enum {
+    SERVER_TXN_COMPLETED = 0,
+    SERVER_TXN_REJECTED,
+    SERVER_TXN_CANCELLED,
+    SERVER_TXN_FAILED,
+} server_txn_class;
+
+typedef enum {
+    SERVER_TXN_REASON_NONE = 0,
+    SERVER_TXN_REASON_STOP,
+    SERVER_TXN_REASON_LENGTH,
+    SERVER_TXN_REASON_TOOL_CALLS,
+    SERVER_TXN_REASON_CONTINUATION_UNAVAILABLE,
+    SERVER_TXN_REASON_CLIENT_GONE,
+    SERVER_TXN_REASON_CANCELLED,
+    SERVER_TXN_REASON_SHUTDOWN,
+    SERVER_TXN_REASON_RESTORE_FAILED,
+    SERVER_TXN_REASON_SYNC_FAILED,
+    SERVER_TXN_REASON_DECODE_FAILED,
+    SERVER_TXN_REASON_OUTPUT_FAILED,
+    SERVER_TXN_REASON_COMMIT_FAILED,
+    SERVER_TXN_REASON_INTERNAL,
+} server_txn_reason;
+
+typedef enum {
+    SERVER_TXN_FINISH_NONE = 0,
+    SERVER_TXN_FINISH_STOP,
+    SERVER_TXN_FINISH_LENGTH,
+    SERVER_TXN_FINISH_TOOL_CALLS,
+    SERVER_TXN_FINISH_ERROR,
+} server_txn_finish;
+
+typedef enum {
+    SERVER_SESSION_UNCHANGED = 0,
+    SERVER_SESSION_VALID_PREFIX,
+    SERVER_SESSION_COMMITTED,
+    SERVER_SESSION_INVALIDATED,
+} server_session_disposition;
+
+typedef enum {
+    SERVER_WIRE_UNTOUCHED = 0,
+    SERVER_WIRE_STARTED,
+    SERVER_WIRE_IRREVERSIBLE,
+    SERVER_WIRE_COMPLETE,
+    SERVER_WIRE_BROKEN,
+} server_wire_disposition;
+
+enum {
+    SERVER_TXN_SECONDARY_ROLLBACK = 1u << 0,
+    SERVER_TXN_SECONDARY_CHECKPOINT = 1u << 1,
+    SERVER_TXN_SECONDARY_OUTPUT = 1u << 2,
+    SERVER_TXN_SECONDARY_TRACE = 1u << 3,
+    SERVER_TXN_SECONDARY_STATS = 1u << 4,
+    SERVER_TXN_SECONDARY_CLEANUP = 1u << 5,
+};
+
+typedef struct {
+    server_txn_class class;
+    server_txn_phase decided_at;
+    server_txn_reason reason;
+    server_txn_finish finish;
+    server_session_disposition session;
+    server_wire_disposition wire;
+    uint32_t secondary;
+    int prompt_tokens;
+    int cached_tokens;
+    int generated_tokens;
+    char detail[160];
+} server_txn_outcome;
+
+typedef enum {
+    SERVER_TXN_STEP_CONTINUE = 0,
+    SERVER_TXN_STEP_TERMINAL,
+} server_txn_step_status;
+
+typedef struct {
+    server_txn_step_status status;
+    server_txn_class class;
+    server_txn_reason reason;
+    server_txn_finish finish;
+    server_session_disposition session;
+    const char *detail;
+} server_txn_step_result;
+
+typedef struct {
+    bool ok;
+    server_session_disposition session;
+    uint32_t secondary;
+} server_txn_settle_result;
+
+typedef struct {
+    bool ok;
+    server_wire_disposition wire;
+    uint32_t secondary;
+} server_txn_output_result;
+
+typedef struct server_txn server_txn;
+
+typedef struct {
+    void *ctx;
+    server_txn_step_result (*advance)(void *ctx,
+                                      const server_txn_outcome *outcome,
+                                      server_txn_phase phase);
+    server_txn_settle_result (*settle)(
+        void *ctx, const server_txn_outcome *outcome, bool commit);
+    bool (*cleanup)(void *ctx, const server_txn_outcome *outcome);
+} server_session_adapter;
+
+typedef struct {
+    void *ctx;
+    server_txn_output_result (*finish)(
+        void *ctx, const server_txn_outcome *outcome);
+} server_output_adapter;
+
+typedef struct {
+    void *ctx;
+    bool (*finish)(void *ctx, const server_txn_outcome *outcome);
+} server_trace_adapter;
+
+typedef struct {
+    void *ctx;
+    bool (*finish)(void *ctx, const server_txn_outcome *outcome);
+} server_statistics_adapter;
+
+typedef struct {
+    server_session_adapter session;
+    server_output_adapter output;
+    server_trace_adapter trace;
+    server_statistics_adapter stats;
+} server_txn_adapters;
+
+struct server_txn {
+    server_txn_outcome outcome;
+    server_txn_adapters adapters;
+    server_txn_phase phase;
+    bool failure_latched;
+    bool terminalizing;
+    bool terminalized;
+    bool settle_done;
+    bool output_done;
+    bool trace_done;
+    bool stats_done;
+    bool cleanup_done;
+};
+
+static void server_txn_init(server_txn *tx,
+                            const server_txn_adapters *adapters) {
+    memset(tx, 0, sizeof(*tx));
+    if (adapters) tx->adapters = *adapters;
+    tx->phase = SERVER_TXN_PHASE_ADMITTED;
+    tx->outcome.decided_at = SERVER_TXN_PHASE_ADMITTED;
+}
+
+static void server_txn_complete(server_txn *tx, server_txn_reason reason,
+                                server_txn_finish finish) {
+    if (!tx || tx->failure_latched || tx->terminalizing) return;
+    tx->outcome.class = SERVER_TXN_COMPLETED;
+    tx->outcome.decided_at = tx->phase;
+    tx->outcome.reason = reason;
+    tx->outcome.finish = finish;
+}
+
+static bool server_txn_fail_once(server_txn *tx, server_txn_phase phase,
+                                 server_txn_class class,
+                                 server_txn_reason reason,
+                                 server_session_disposition session,
+                                 const char *detail) {
+    if (!tx || tx->failure_latched) return false;
+    tx->failure_latched = true;
+    tx->outcome.class = class;
+    tx->outcome.decided_at = phase;
+    tx->outcome.reason = reason;
+    tx->outcome.finish = SERVER_TXN_FINISH_ERROR;
+    tx->outcome.session = session;
+    snprintf(tx->outcome.detail, sizeof(tx->outcome.detail), "%s",
+             detail ? detail : "");
+    return true;
+}
+
+static server_txn_outcome server_txn_terminalize(server_txn *tx) {
+    if (tx->terminalized || tx->terminalizing) return tx->outcome;
+    tx->terminalizing = true;
+    tx->phase = SERVER_TXN_PHASE_TERMINALIZE;
+    if (tx->outcome.reason == SERVER_TXN_REASON_NONE) {
+        server_txn_fail_once(tx, SERVER_TXN_PHASE_TERMINALIZE,
+                             SERVER_TXN_FAILED, SERVER_TXN_REASON_INTERNAL,
+                             SERVER_SESSION_INVALIDATED,
+                             "transaction reached terminalization without an outcome");
+    }
+
+    const bool commit = tx->outcome.class == SERVER_TXN_COMPLETED;
+    if (!tx->settle_done) {
+        tx->settle_done = true;
+        server_txn_settle_result result = {
+            .ok = false,
+            .session = tx->outcome.session,
+        };
+        if (tx->adapters.session.settle) {
+            result = tx->adapters.session.settle(
+                tx->adapters.session.ctx, &tx->outcome, commit);
+        }
+        tx->outcome.secondary |= result.secondary;
+        if (result.ok) {
+            tx->outcome.session = result.session;
+        } else {
+            tx->outcome.session = SERVER_SESSION_INVALIDATED;
+            if (commit) {
+                server_txn_fail_once(tx, SERVER_TXN_PHASE_SETTLE,
+                                     SERVER_TXN_FAILED,
+                                     SERVER_TXN_REASON_COMMIT_FAILED,
+                                     SERVER_SESSION_INVALIDATED,
+                                     "session commit failed");
+            } else {
+                tx->outcome.secondary |= SERVER_TXN_SECONDARY_ROLLBACK;
+            }
+        }
+    }
+
+    if (!tx->output_done) {
+        tx->output_done = true;
+        if (tx->outcome.wire != SERVER_WIRE_BROKEN) {
+            server_txn_output_result result = {
+                .ok = false,
+                .wire = tx->outcome.wire,
+            };
+            if (tx->adapters.output.finish) {
+                result = tx->adapters.output.finish(
+                    tx->adapters.output.ctx, &tx->outcome);
+            }
+            tx->outcome.secondary |= result.secondary;
+            tx->outcome.wire = result.wire;
+            if (!result.ok) {
+                tx->outcome.wire = SERVER_WIRE_BROKEN;
+                if (!server_txn_fail_once(tx, SERVER_TXN_PHASE_TERMINALIZE,
+                                          SERVER_TXN_FAILED,
+                                          SERVER_TXN_REASON_OUTPUT_FAILED,
+                                          tx->outcome.session,
+                                          "terminal output failed")) {
+                    tx->outcome.secondary |= SERVER_TXN_SECONDARY_OUTPUT;
+                }
+            }
+        }
+    }
+
+    if (!tx->cleanup_done) {
+        tx->cleanup_done = true;
+        if (!tx->adapters.session.cleanup ||
+            !tx->adapters.session.cleanup(
+                tx->adapters.session.ctx, &tx->outcome)) {
+            tx->outcome.secondary |= SERVER_TXN_SECONDARY_CLEANUP;
+        }
+    }
+    if (!tx->stats_done) {
+        tx->stats_done = true;
+        if (!tx->adapters.stats.finish ||
+            !tx->adapters.stats.finish(tx->adapters.stats.ctx, &tx->outcome)) {
+            tx->outcome.secondary |= SERVER_TXN_SECONDARY_STATS;
+        }
+    }
+    if (!tx->trace_done) {
+        tx->trace_done = true;
+        if (!tx->adapters.trace.finish ||
+            !tx->adapters.trace.finish(tx->adapters.trace.ctx, &tx->outcome)) {
+            tx->outcome.secondary |= SERVER_TXN_SECONDARY_TRACE;
+        }
+    }
+
+    tx->phase = SERVER_TXN_PHASE_DONE;
+    tx->terminalized = true;
+    tx->terminalizing = false;
+    return tx->outcome;
+}
+
+static server_txn_outcome
+server_txn_run_adapters(const server_txn_adapters *adapters) {
+    static const server_txn_phase phases[] = {
+        SERVER_TXN_PHASE_RESTORE,
+        SERVER_TXN_PHASE_SYNCHRONIZE,
+        SERVER_TXN_PHASE_EXTEND,
+        SERVER_TXN_PHASE_DECODE,
+    };
+    server_txn tx;
+    server_txn_init(&tx, adapters);
+    for (size_t i = 0; i < sizeof(phases) / sizeof(phases[0]); i++) {
+        tx.phase = phases[i];
+        if (!tx.adapters.session.advance) {
+            server_txn_fail_once(&tx, tx.phase, SERVER_TXN_FAILED,
+                                 SERVER_TXN_REASON_INTERNAL,
+                                 SERVER_SESSION_INVALIDATED,
+                                 "session adapter has no phase runner");
+            break;
+        }
+        const server_txn_step_result step =
+            tx.adapters.session.advance(
+                tx.adapters.session.ctx, &tx.outcome, tx.phase);
+        if (step.status == SERVER_TXN_STEP_CONTINUE) continue;
+        if (step.class == SERVER_TXN_COMPLETED) {
+            server_txn_complete(&tx, step.reason, step.finish);
+            tx.outcome.session = step.session;
+        } else {
+            server_txn_fail_once(&tx, tx.phase, step.class, step.reason,
+                                 step.session, step.detail);
+        }
+        break;
+    }
+    if (tx.outcome.reason == SERVER_TXN_REASON_NONE) {
+        server_txn_fail_once(&tx, tx.phase, SERVER_TXN_FAILED,
+                             SERVER_TXN_REASON_INTERNAL,
+                             SERVER_SESSION_INVALIDATED,
+                             "session adapter finished without an outcome");
+    }
+    return server_txn_terminalize(&tx);
+}
+
 struct server {
     ds4_engine *engine;
     ds4_session *session;
+    int ctx_size;
     int default_tokens;
     kv_disk_cache kv;
     tool_memory tool_mem;
@@ -7821,6 +8161,7 @@ struct server {
     bool busy;
     double started_at;
     server_stats stats;
+    server_stats_snapshot stats_snapshot;
     uint64_t seq;
     FILE *trace;
     pthread_mutex_t trace_mu;
@@ -7838,6 +8179,18 @@ struct job {
     pthread_cond_t cv;
     job *next;
 };
+
+static void server_publish_stats_snapshot(server *s, int live_tokens) {
+    pthread_mutex_lock(&s->mu);
+    s->stats_snapshot.counters = s->stats;
+    s->stats_snapshot.queue_depth = s->queue_depth;
+    s->stats_snapshot.clients = s->clients;
+    s->stats_snapshot.live_tokens = live_tokens;
+    s->stats_snapshot.ctx_size = s->ctx_size;
+    s->stats_snapshot.busy = s->busy;
+    s->stats_snapshot.version++;
+    pthread_mutex_unlock(&s->mu);
+}
 
 /* =========================================================================
  * Tool Call Text Memory.
@@ -9852,6 +10205,10 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     if (p->srv && current > p->cached_tokens) {
         kv_cache_maybe_store_continued(p->srv);
     }
+    if (p->srv) {
+        server_publish_stats_snapshot(
+            p->srv, ds4_session_pos(p->srv->session));
+    }
 }
 
 static void send_prefill_failure_response(server *s, const job *j,
@@ -11374,6 +11731,7 @@ static job *dequeue(server *s) {
 
 static void *worker_main(void *arg) {
     server *s = arg;
+    server_publish_stats_snapshot(s, ds4_session_pos(s->session));
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;
@@ -11396,6 +11754,7 @@ static void *worker_main(void *arg) {
             s->busy = false;
             pthread_mutex_unlock(&s->mu);
         }
+        server_publish_stats_snapshot(s, ds4_session_pos(s->session));
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -11577,7 +11936,7 @@ static void append_model_json(buf *b, const server *s, const char *id) {
     append_model_json_values(b,
                              id,
                              ds4_engine_model_name(s->engine),
-                             ds4_session_ctx(s->session),
+                             s->ctx_size,
                              s->default_tokens);
 }
 
@@ -11616,11 +11975,9 @@ static bool send_health(server *s, int fd) {
 
 static bool send_stats(server *s, int fd) {
     pthread_mutex_lock(&s->mu);
-    server_stats st = s->stats;
-    const int queue_depth = s->queue_depth;
-    const bool busy = s->busy;
-    const int clients = s->clients;
+    const server_stats_snapshot snapshot = s->stats_snapshot;
     pthread_mutex_unlock(&s->mu);
+    const server_stats st = snapshot.counters;
     const uint64_t cache_hits = st.cache_memory_token + st.cache_memory_text +
                                 st.cache_responses_visible +
                                 st.cache_responses_tool_output +
@@ -11656,11 +12013,11 @@ static bool send_stats(server *s, int fd) {
             "\"tool_visible\":%llu,"
             "\"disk_text\":%llu}}\n",
         now_sec() - s->started_at,
-        busy ? "true" : "false",
-        queue_depth,
-        clients,
-        ds4_session_pos(s->session),
-        ds4_session_ctx(s->session),
+        snapshot.busy ? "true" : "false",
+        snapshot.queue_depth,
+        snapshot.clients,
+        snapshot.live_tokens,
+        snapshot.ctx_size,
         (unsigned long long)st.requests,
         (unsigned long long)st.queue_rejected,
         (unsigned long long)st.queue_dropped_disconnected,
@@ -11746,7 +12103,7 @@ static void *client_main(void *arg) {
     request req;
     char err[160];
     bool ok = false;
-    const int ctx_size = ds4_session_ctx(s->session);
+    const int ctx_size = s->ctx_size;
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
@@ -12216,12 +12573,14 @@ int main(int argc, char **argv) {
     memset(&s, 0, sizeof(s));
     s.engine = engine;
     s.session = session;
+    s.ctx_size = cfg.ctx_size;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
     s.max_queue = cfg.max_queue;
     s.started_at = now_sec();
+    s.stats_snapshot.ctx_size = cfg.ctx_size;
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
@@ -12626,6 +12985,300 @@ static char *read_socket_text(int fd) {
         buf_append(&b, tmp, (size_t)n);
     }
     return buf_take(&b);
+}
+
+static void test_stats_uses_published_snapshot(void) {
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.mu, NULL);
+    s.started_at = now_sec();
+    s.stats_snapshot.version = 7;
+    s.stats_snapshot.busy = true;
+    s.stats_snapshot.queue_depth = 3;
+    s.stats_snapshot.clients = 4;
+    s.stats_snapshot.live_tokens = 1234;
+    s.stats_snapshot.ctx_size = 524288;
+    s.stats_snapshot.counters.requests = 9;
+    s.stats_snapshot.counters.cache_memory_token = 2;
+
+    int sv[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(send_stats(&s, sv[0]));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "\"busy\":true") != NULL);
+        TEST_ASSERT(strstr(out, "\"queue_depth\":3") != NULL);
+        TEST_ASSERT(strstr(out, "\"clients\":4") != NULL);
+        TEST_ASSERT(strstr(out, "\"live_tokens\":1234") != NULL);
+        TEST_ASSERT(strstr(out, "\"ctx_size\":524288") != NULL);
+        TEST_ASSERT(strstr(out, "\"requests\":9") != NULL);
+        TEST_ASSERT(strstr(out, "\"hits\":2") != NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    pthread_mutex_destroy(&s.mu);
+}
+
+typedef struct {
+    int settle_calls;
+    int output_calls;
+    int trace_calls;
+    int stats_calls;
+    int cleanup_calls;
+    server_txn_phase phases[8];
+    int phase_count;
+    server_txn_phase fail_phase;
+    server_txn_class fail_class;
+    server_txn_reason fail_reason;
+    server_session_disposition fail_session;
+    bool fail_settle;
+    bool fail_output;
+    bool fail_trace;
+    bool fail_stats;
+    bool fail_cleanup;
+    uint32_t settle_secondary;
+} test_txn_effects;
+
+static server_txn_step_result test_txn_advance(void *ctx,
+                                                const server_txn_outcome *outcome,
+                                                server_txn_phase phase) {
+    (void)outcome;
+    test_txn_effects *effects = ctx;
+    if (effects->phase_count < (int)(sizeof(effects->phases) /
+                                     sizeof(effects->phases[0]))) {
+        effects->phases[effects->phase_count++] = phase;
+    }
+    if (phase == effects->fail_phase) {
+        return (server_txn_step_result) {
+            .status = SERVER_TXN_STEP_TERMINAL,
+            .class = effects->fail_class,
+            .reason = effects->fail_reason,
+            .session = effects->fail_session,
+            .detail = "scripted phase failure",
+        };
+    }
+    if (phase == SERVER_TXN_PHASE_DECODE) {
+        return (server_txn_step_result) {
+            .status = SERVER_TXN_STEP_TERMINAL,
+            .class = SERVER_TXN_COMPLETED,
+            .reason = SERVER_TXN_REASON_STOP,
+            .finish = SERVER_TXN_FINISH_STOP,
+            .session = SERVER_SESSION_COMMITTED,
+        };
+    }
+    return (server_txn_step_result) {.status = SERVER_TXN_STEP_CONTINUE};
+}
+
+static server_txn_settle_result
+test_txn_settle(void *ctx, const server_txn_outcome *outcome, bool commit) {
+    test_txn_effects *effects = ctx;
+    effects->settle_calls++;
+    return (server_txn_settle_result) {
+        .ok = !effects->fail_settle,
+        .session = commit ? SERVER_SESSION_COMMITTED : outcome->session,
+        .secondary = effects->settle_secondary,
+    };
+}
+
+static server_txn_output_result test_txn_output(
+        void *ctx, const server_txn_outcome *outcome) {
+    (void)outcome;
+    test_txn_effects *effects = ctx;
+    effects->output_calls++;
+    return (server_txn_output_result) {
+        .ok = !effects->fail_output,
+        .wire = effects->fail_output ? SERVER_WIRE_IRREVERSIBLE :
+                                       SERVER_WIRE_COMPLETE,
+    };
+}
+
+static bool test_txn_trace(void *ctx, const server_txn_outcome *outcome) {
+    (void)outcome;
+    test_txn_effects *effects = ctx;
+    effects->trace_calls++;
+    return !effects->fail_trace;
+}
+
+static bool test_txn_stats(void *ctx, const server_txn_outcome *outcome) {
+    (void)outcome;
+    test_txn_effects *effects = ctx;
+    effects->stats_calls++;
+    return !effects->fail_stats;
+}
+
+static bool test_txn_cleanup(void *ctx,
+                             const server_txn_outcome *outcome) {
+    (void)outcome;
+    test_txn_effects *effects = ctx;
+    effects->cleanup_calls++;
+    return !effects->fail_cleanup;
+}
+
+static void test_txn_terminalizer_is_idempotent(void) {
+    test_txn_effects effects = {0};
+    const server_txn_adapters adapters = {
+        .session = {
+            .ctx = &effects,
+            .advance = test_txn_advance,
+            .settle = test_txn_settle,
+            .cleanup = test_txn_cleanup,
+        },
+        .output = {.ctx = &effects, .finish = test_txn_output},
+        .trace = {.ctx = &effects, .finish = test_txn_trace},
+        .stats = {.ctx = &effects, .finish = test_txn_stats},
+    };
+    server_txn tx;
+    server_txn_init(&tx, &adapters);
+    server_txn_complete(&tx, SERVER_TXN_REASON_STOP, SERVER_TXN_FINISH_STOP);
+
+    server_txn_outcome first = server_txn_terminalize(&tx);
+    server_txn_outcome second = server_txn_terminalize(&tx);
+
+    TEST_ASSERT(first.class == SERVER_TXN_COMPLETED);
+    TEST_ASSERT(first.reason == SERVER_TXN_REASON_STOP);
+    TEST_ASSERT(first.finish == SERVER_TXN_FINISH_STOP);
+    TEST_ASSERT(first.session == SERVER_SESSION_COMMITTED);
+    TEST_ASSERT(first.wire == SERVER_WIRE_COMPLETE);
+    TEST_ASSERT(first.class == second.class);
+    TEST_ASSERT(first.decided_at == second.decided_at);
+    TEST_ASSERT(first.reason == second.reason);
+    TEST_ASSERT(first.finish == second.finish);
+    TEST_ASSERT(first.session == second.session);
+    TEST_ASSERT(first.wire == second.wire);
+    TEST_ASSERT(first.secondary == second.secondary);
+    TEST_ASSERT(!strcmp(first.detail, second.detail));
+    TEST_ASSERT(effects.settle_calls == 1);
+    TEST_ASSERT(effects.output_calls == 1);
+    TEST_ASSERT(effects.trace_calls == 1);
+    TEST_ASSERT(effects.stats_calls == 1);
+    TEST_ASSERT(effects.cleanup_calls == 1);
+}
+
+static server_txn_outcome test_txn_run_script(test_txn_effects *effects) {
+    const server_txn_adapters adapters = {
+        .session = {
+            .ctx = effects,
+            .advance = test_txn_advance,
+            .settle = test_txn_settle,
+            .cleanup = test_txn_cleanup,
+        },
+        .output = {.ctx = effects, .finish = test_txn_output},
+        .trace = {.ctx = effects, .finish = test_txn_trace},
+        .stats = {.ctx = effects, .finish = test_txn_stats},
+    };
+    return server_txn_run_adapters(&adapters);
+}
+
+static void test_txn_scripted_phase_outcomes(void) {
+    const struct {
+        server_txn_phase phase;
+        server_txn_class class;
+        server_txn_reason reason;
+        server_session_disposition session;
+    } cases[] = {
+        {SERVER_TXN_PHASE_RESTORE, SERVER_TXN_FAILED,
+         SERVER_TXN_REASON_RESTORE_FAILED, SERVER_SESSION_INVALIDATED},
+        {SERVER_TXN_PHASE_SYNCHRONIZE, SERVER_TXN_FAILED,
+         SERVER_TXN_REASON_SYNC_FAILED, SERVER_SESSION_INVALIDATED},
+        {SERVER_TXN_PHASE_SYNCHRONIZE, SERVER_TXN_CANCELLED,
+         SERVER_TXN_REASON_CANCELLED, SERVER_SESSION_VALID_PREFIX},
+        {SERVER_TXN_PHASE_DECODE, SERVER_TXN_FAILED,
+         SERVER_TXN_REASON_DECODE_FAILED, SERVER_SESSION_INVALIDATED},
+        {SERVER_TXN_PHASE_EXTEND, SERVER_TXN_FAILED,
+         SERVER_TXN_REASON_OUTPUT_FAILED, SERVER_SESSION_VALID_PREFIX},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        test_txn_effects effects = {
+            .fail_phase = cases[i].phase,
+            .fail_class = cases[i].class,
+            .fail_reason = cases[i].reason,
+            .fail_session = cases[i].session,
+        };
+        server_txn_outcome outcome = test_txn_run_script(&effects);
+        TEST_ASSERT(outcome.class == cases[i].class);
+        TEST_ASSERT(outcome.reason == cases[i].reason);
+        TEST_ASSERT(outcome.decided_at == cases[i].phase);
+        TEST_ASSERT(outcome.session == cases[i].session);
+        TEST_ASSERT(effects.settle_calls == 1);
+        TEST_ASSERT(effects.output_calls == 1);
+        TEST_ASSERT(effects.trace_calls == 1);
+        TEST_ASSERT(effects.stats_calls == 1);
+        TEST_ASSERT(effects.cleanup_calls == 1);
+    }
+}
+
+static void test_txn_scripted_failure_precedence(void) {
+    test_txn_effects effects = {
+        .fail_phase = SERVER_TXN_PHASE_DECODE,
+        .fail_class = SERVER_TXN_FAILED,
+        .fail_reason = SERVER_TXN_REASON_DECODE_FAILED,
+        .fail_session = SERVER_SESSION_INVALIDATED,
+        .fail_settle = true,
+        .fail_output = true,
+        .fail_trace = true,
+        .fail_stats = true,
+        .fail_cleanup = true,
+    };
+    server_txn_outcome outcome = test_txn_run_script(&effects);
+    TEST_ASSERT(outcome.reason == SERVER_TXN_REASON_DECODE_FAILED);
+    TEST_ASSERT(outcome.decided_at == SERVER_TXN_PHASE_DECODE);
+    TEST_ASSERT(outcome.session == SERVER_SESSION_INVALIDATED);
+    TEST_ASSERT(outcome.wire == SERVER_WIRE_BROKEN);
+    TEST_ASSERT(outcome.secondary & SERVER_TXN_SECONDARY_ROLLBACK);
+    TEST_ASSERT(outcome.secondary & SERVER_TXN_SECONDARY_OUTPUT);
+    TEST_ASSERT(outcome.secondary & SERVER_TXN_SECONDARY_TRACE);
+    TEST_ASSERT(outcome.secondary & SERVER_TXN_SECONDARY_STATS);
+    TEST_ASSERT(outcome.secondary & SERVER_TXN_SECONDARY_CLEANUP);
+}
+
+static void test_txn_scripted_commit_and_output_failures(void) {
+    test_txn_effects commit = {.fail_settle = true};
+    server_txn_outcome commit_outcome = test_txn_run_script(&commit);
+    TEST_ASSERT(commit_outcome.reason == SERVER_TXN_REASON_COMMIT_FAILED);
+    TEST_ASSERT(commit_outcome.finish == SERVER_TXN_FINISH_ERROR);
+    TEST_ASSERT(commit_outcome.session == SERVER_SESSION_INVALIDATED);
+
+    test_txn_effects output = {.fail_output = true};
+    server_txn_outcome output_outcome = test_txn_run_script(&output);
+    TEST_ASSERT(output_outcome.reason == SERVER_TXN_REASON_OUTPUT_FAILED);
+    TEST_ASSERT(output_outcome.wire == SERVER_WIRE_BROKEN);
+    TEST_ASSERT(output.output_calls == 1);
+
+    test_txn_effects checkpoint = {
+        .settle_secondary = SERVER_TXN_SECONDARY_CHECKPOINT,
+    };
+    server_txn_outcome checkpoint_outcome = test_txn_run_script(&checkpoint);
+    TEST_ASSERT(checkpoint_outcome.reason == SERVER_TXN_REASON_STOP);
+    TEST_ASSERT(checkpoint_outcome.secondary & SERVER_TXN_SECONDARY_CHECKPOINT);
+}
+
+static void test_txn_broken_wire_is_never_finalized_again(void) {
+    test_txn_effects effects = {0};
+    const server_txn_adapters adapters = {
+        .session = {
+            .ctx = &effects,
+            .advance = test_txn_advance,
+            .settle = test_txn_settle,
+            .cleanup = test_txn_cleanup,
+        },
+        .output = {.ctx = &effects, .finish = test_txn_output},
+        .trace = {.ctx = &effects, .finish = test_txn_trace},
+        .stats = {.ctx = &effects, .finish = test_txn_stats},
+    };
+    server_txn tx;
+    server_txn_init(&tx, &adapters);
+    tx.phase = SERVER_TXN_PHASE_DECODE;
+    server_txn_fail_once(&tx, tx.phase, SERVER_TXN_FAILED,
+                         SERVER_TXN_REASON_OUTPUT_FAILED,
+                         SERVER_SESSION_VALID_PREFIX,
+                         "stream write failed");
+    tx.outcome.wire = SERVER_WIRE_BROKEN;
+    server_txn_outcome outcome = server_txn_terminalize(&tx);
+    TEST_ASSERT(outcome.reason == SERVER_TXN_REASON_OUTPUT_FAILED);
+    TEST_ASSERT(outcome.wire == SERVER_WIRE_BROKEN);
+    TEST_ASSERT(effects.output_calls == 0);
 }
 
 static void test_context_length_error_uses_protocol_standard_shape(void) {
@@ -16383,6 +17036,12 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
 }
 
 static void ds4_server_unit_tests_run(void) {
+    test_stats_uses_published_snapshot();
+    test_txn_terminalizer_is_idempotent();
+    test_txn_scripted_phase_outcomes();
+    test_txn_scripted_failure_precedence();
+    test_txn_scripted_commit_and_output_failures();
+    test_txn_broken_wire_is_never_finalized_again();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
     test_api_thinking_controls_parse();
