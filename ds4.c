@@ -1857,6 +1857,10 @@ static void model_prefetch_cpu_mapping(const ds4_model *m) {
 /* Read the GGUF metadata table.  Values stay in the mmap; we store offsets so
  * later validation can decode only the keys it needs. */
 static void parse_metadata(ds4_model *m, ds4_cursor *c) {
+    /* n_kv comes from the header. Every entry consumes at least one byte in the
+     * file, so a count larger than the bytes remaining cannot be real; reject it
+     * before calloc so a tiny file can't request an enormous allocation. */
+    if (m->n_kv > c->size - c->pos) ds4_die("GGUF metadata count exceeds file size");
     m->kv = calloc((size_t)m->n_kv, sizeof(m->kv[0]));
     if (!m->kv) ds4_die("out of memory while allocating metadata table");
 
@@ -1887,6 +1891,10 @@ static void parse_metadata(ds4_model *m, ds4_cursor *c) {
 /* Read the tensor directory and convert relative GGUF offsets to absolute
  * mmap offsets.  Tensor bytes are still never copied here. */
 static void parse_tensors(ds4_model *m, ds4_cursor *c) {
+    /* As in parse_metadata: each tensor directory entry needs at least one byte
+     * in the file, so reject a count larger than the bytes remaining before the
+     * allocation. */
+    if (m->n_tensors > c->size - c->pos) ds4_die("GGUF tensor count exceeds file size");
     m->tensors = calloc((size_t)m->n_tensors, sizeof(m->tensors[0]));
     if (!m->tensors) ds4_die("out of memory while allocating tensor table");
 
