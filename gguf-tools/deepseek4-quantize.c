@@ -153,6 +153,37 @@ static uint64_t read_u64_le_fp(FILE *fp, const char *what) {
     return v;
 }
 
+/* Bytes from the current position to EOF, restoring the position afterwards. */
+static uint64_t bytes_remaining_fp(FILE *fp, const char *what) {
+    off_t cur = ftello(fp);
+    if (cur < 0 || fseeko(fp, 0, SEEK_END) != 0) {
+        fprintf(stderr, "error: seek failed while sizing %s\n", what);
+        exit(1);
+    }
+    off_t end = ftello(fp);
+    if (end < 0 || fseeko(fp, cur, SEEK_SET) != 0) {
+        fprintf(stderr, "error: seek failed while sizing %s\n", what);
+        exit(1);
+    }
+    return end > cur ? (uint64_t)(end - cur) : 0;
+}
+
+/* Read a u64 length prefix and reject it if it claims more than the bytes left
+ * in the file. Without this a crafted length can (a) be so large that
+ * (size_t)len + 1 wraps to 0, so xmalloc() returns a 1-byte buffer that the
+ * following fread() then overflows, or (b) request a multi-GB allocation from a
+ * tiny file. */
+static uint64_t read_checked_len_fp(FILE *fp, const char *what) {
+    uint64_t n = read_u64_le_fp(fp, what);
+    uint64_t remaining = bytes_remaining_fp(fp, what);
+    if (n > remaining) {
+        fprintf(stderr, "error: %s (%" PRIu64 ") exceeds %" PRIu64
+                " bytes remaining in file\n", what, n, remaining);
+        exit(1);
+    }
+    return n;
+}
+
 static uint32_t read_u32_le_fp(FILE *fp, const char *what) {
     uint32_t v;
     if (fread(&v, 1, sizeof(v), fp) != sizeof(v)) {
@@ -475,7 +506,7 @@ static void shard_load(shard *s) {
     if (s->loaded) return;
     FILE *fp = fopen(s->path, "rb");
     if (!fp) die_errno("open", s->path);
-    uint64_t header_len = read_u64_le_fp(fp, "safetensors header length");
+    uint64_t header_len = read_checked_len_fp(fp, "safetensors header length");
     char *header = xmalloc((size_t)header_len + 1);
     if (fread(header, 1, (size_t)header_len, fp) != (size_t)header_len) die_errno("read header", s->path);
     header[header_len] = '\0';
@@ -1359,7 +1390,7 @@ static size_t gguf_scalar_size(uint32_t type) {
 }
 
 static char *read_gguf_string_fp(FILE *fp) {
-    uint64_t n = read_u64_le_fp(fp, "GGUF string length");
+    uint64_t n = read_checked_len_fp(fp, "GGUF string length");
     char *s = xmalloc((size_t)n + 1);
     if (n && fread(s, 1, (size_t)n, fp) != (size_t)n) die("short GGUF string read");
     s[n] = '\0';
