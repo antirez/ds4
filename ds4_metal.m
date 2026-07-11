@@ -8603,11 +8603,20 @@ static id<MTLBuffer> ds4_gpu_wrap_model_range(
         }
     }
 
-    fprintf(stderr,
-            "ds4: Metal model range %.2f..%.2f GiB is not covered by mapped model views\n",
-            ds4_gpu_gib(offset),
-            ds4_gpu_gib(end));
-    return nil;
+    /* Streaming maps only part of the model as boot views; ranges outside the
+     * mapped spans (e.g. routed expert tensors touched by streaming prefill on
+     * models much larger than RAM) fall back to on-demand cached exact views
+     * over the same mmap instead of failing the whole graph. */
+    static int fallback_noted = 0;
+    if (!fallback_noted) {
+        fallback_noted = 1;
+        fprintf(stderr,
+                "ds4: Metal model range %.2f..%.2f GiB not covered by mapped model views; "
+                "falling back to on-demand exact views\n",
+                ds4_gpu_gib(offset),
+                ds4_gpu_gib(end));
+    }
+    return ds4_gpu_wrap_model_exact_range(model_map, model_size, offset, len, inner_offset);
 }
 
 typedef enum {
