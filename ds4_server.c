@@ -2429,31 +2429,12 @@ static char *render_live_tool_tail(const chat_msgs *msgs, int start,
     return buf_take(&out);
 }
 
-static bool chat_msg_has_call_id(const chat_msg *m, const char *id) {
-    if (!m || !id || !id[0] || strcmp(m->role, "assistant")) return false;
-    for (int i = 0; i < m->calls.len; i++) {
-        if (m->calls.v[i].id && !strcmp(m->calls.v[i].id, id)) return true;
-    }
-    return false;
-}
-
 static void chat_msg_collect_tool_call_ids(const chat_msg *m, stop_list *ids) {
     if (!m || !ids) return;
     id_list_push_unique(ids, m->tool_call_id);
     for (int i = 0; i < m->tool_call_ids_len; i++) {
         id_list_push_unique(ids, m->tool_call_ids[i]);
     }
-}
-
-static const chat_msg *responses_find_prior_call_msg(const chat_msgs *msgs,
-                                                     int before,
-                                                     const char *id) {
-    if (!msgs || !id || !id[0]) return NULL;
-    if (before > msgs->len) before = msgs->len;
-    for (int i = before - 1; i >= 0; i--) {
-        if (chat_msg_has_call_id(&msgs->v[i], id)) return &msgs->v[i];
-    }
-    return NULL;
 }
 
 /* Validate Responses tool outputs before rendering.
@@ -2480,8 +2461,25 @@ static bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
     if (requires_live_tool_state) *requires_live_tool_state = false;
     if (requires_live_reasoning) *requires_live_reasoning = false;
     const bool needs_reasoning = ds4_think_mode_enabled(think_mode);
-    for (int i = 0; i < msgs->len; i++) {
+
+    /* Map call_id -> the nearest preceding assistant message that declares it,
+     * built as we scan forward. This replaces a per-id backward rescan
+     * (responses_find_prior_call_msg) that made the whole pass O(n^2) over an
+     * attacker-supplied, uncapped message array. Only assistant messages declare
+     * call ids (via their calls[] array), so registering them as we pass and
+     * looking up on tool messages reproduces the nearest-preceding result. */
+    rax *by_call_id = raxNew();
+    bool ok = true;
+    for (int i = 0; i < msgs->len && ok; i++) {
         const chat_msg *m = &msgs->v[i];
+        if (!strcmp(m->role, "assistant")) {
+            for (int k = 0; k < m->calls.len; k++) {
+                const char *cid = m->calls.v[k].id;
+                if (cid && cid[0])
+                    raxInsert(by_call_id, (unsigned char *)cid, strlen(cid), (void *)m, NULL);
+            }
+            continue;
+        }
         if (strcmp(m->role, "tool") && strcmp(m->role, "function")) continue;
 
         stop_list ids = {0};
@@ -2489,13 +2487,15 @@ static bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
         for (int j = 0; j < ids.len; j++) {
             const char *id = ids.v[j];
             const bool live_known = responses_live_has_call_id(s, id);
-            const chat_msg *prior = responses_find_prior_call_msg(msgs, i, id);
+            void *found = id && id[0]
+                ? raxFind(by_call_id, (unsigned char *)id, strlen(id)) : raxNotFound;
+            const chat_msg *prior = found == raxNotFound ? NULL : (const chat_msg *)found;
             if (!live_known && !prior) {
                 snprintf(err, errlen,
                          "Responses continuation state is not available for call_id %s; retry by replaying the full input history",
                          id);
-                id_list_free(&ids);
-                return false;
+                ok = false;
+                break;
             }
             if (!prior) {
                 if (requires_live_tool_state) *requires_live_tool_state = true;
@@ -2509,7 +2509,8 @@ static bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
         }
         id_list_free(&ids);
     }
-    return true;
+    raxFree(by_call_id);
+    return ok;
 }
 
 /* Record the call ids and suffix candidate for a live Responses continuation.
@@ -2570,8 +2571,21 @@ static bool anthropic_validate_tool_results(server *s, const chat_msgs *msgs,
                                             char *err, size_t errlen) {
     if (requires_live_tool_state) *requires_live_tool_state = false;
     if (!msgs) return true;
-    for (int i = 0; i < msgs->len; i++) {
+
+    /* Same O(1) call_id -> prior assistant message map as
+     * responses_validate_tool_outputs, replacing the O(n^2) backward rescan. */
+    rax *by_call_id = raxNew();
+    bool ok = true;
+    for (int i = 0; i < msgs->len && ok; i++) {
         const chat_msg *m = &msgs->v[i];
+        if (!strcmp(m->role, "assistant")) {
+            for (int k = 0; k < m->calls.len; k++) {
+                const char *cid = m->calls.v[k].id;
+                if (cid && cid[0])
+                    raxInsert(by_call_id, (unsigned char *)cid, strlen(cid), (void *)m, NULL);
+            }
+            continue;
+        }
         if (!anthropic_msg_is_tool_result_tail(m)) continue;
 
         stop_list ids = {0};
@@ -2579,13 +2593,15 @@ static bool anthropic_validate_tool_results(server *s, const chat_msgs *msgs,
         for (int j = 0; j < ids.len; j++) {
             const char *id = ids.v[j];
             const bool live_known = anthropic_live_has_call_id(s, id);
-            const chat_msg *prior = responses_find_prior_call_msg(msgs, i, id);
+            void *found = id && id[0]
+                ? raxFind(by_call_id, (unsigned char *)id, strlen(id)) : raxNotFound;
+            const chat_msg *prior = found == raxNotFound ? NULL : (const chat_msg *)found;
             if (!live_known && !prior) {
                 snprintf(err, errlen,
                          "Anthropic continuation state is not available for tool_use_id %s; retry by replaying the full messages history",
                          id);
-                id_list_free(&ids);
-                return false;
+                ok = false;
+                break;
             }
             if (!prior && requires_live_tool_state) {
                 *requires_live_tool_state = true;
@@ -2593,7 +2609,8 @@ static bool anthropic_validate_tool_results(server *s, const chat_msgs *msgs,
         }
         id_list_free(&ids);
     }
-    return true;
+    raxFree(by_call_id);
+    return ok;
 }
 
 /* Prepare the Anthropic live-tool fast path.
