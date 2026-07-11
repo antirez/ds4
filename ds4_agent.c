@@ -3685,8 +3685,29 @@ static char *agent_session_title_from_text(const char *text, size_t text_len,
  *
  * The DS4 payload stores the exact token sequence and graph state.  The rendered
  * text is retained for listing, history rendering, and stripped-session rebuilds. */
+
+/* Bytes from the current position to EOF, restoring the position. Returns false
+ * if the stream is not seekable. Used to cap a file-declared length before
+ * allocating, so a tiny cache file can't drive a multi-GB xmalloc. */
+static bool agent_fp_remaining(FILE *fp, uint64_t *out) {
+    off_t pos = ftello(fp);
+    if (pos < 0 || fseeko(fp, 0, SEEK_END) != 0) return false;
+    off_t end = ftello(fp);
+    if (end < 0 || fseeko(fp, pos, SEEK_SET) != 0) return false;
+    *out = end > pos ? (uint64_t)(end - pos) : 0;
+    return true;
+}
+
 static bool agent_kv_read_text(FILE *fp, uint32_t text_bytes,
                                char **text_out, char *err, size_t err_len) {
+    /* text_bytes is read from the on-disk header; cap it against the bytes
+     * actually left in the file before allocating, so a 1-byte file declaring
+     * text_bytes = 0xFFFFFFFF can't request ~4 GiB. */
+    uint64_t remaining = 0;
+    if (!agent_fp_remaining(fp, &remaining) || text_bytes > remaining) {
+        if (err && err_len) snprintf(err, err_len, "truncated cached text");
+        return false;
+    }
     char *text = xmalloc((size_t)text_bytes + 1);
     if (fread(text, 1, text_bytes, fp) != text_bytes) {
         if (err && err_len) snprintf(err, err_len, "truncated cached text");
@@ -3736,6 +3757,14 @@ static bool agent_kv_read_title_trailer(FILE *fp, const ds4_kvstore_entry *hdr,
         return false;
     }
     uint32_t title_bytes = ds4_kvstore_le_get32(tb);
+    /* Same cap as agent_kv_read_text: reject a title length larger than the
+     * bytes left in the file before allocating. */
+    uint64_t title_remaining = 0;
+    if (!agent_fp_remaining(fp, &title_remaining) || title_bytes > title_remaining) {
+        if (err && err_len) snprintf(err, err_len, "truncated agent session title trailer");
+        fseeko(fp, payload_pos, SEEK_SET);
+        return false;
+    }
     char *title = xmalloc((size_t)title_bytes + 1);
     if (fread(title, 1, title_bytes, fp) != title_bytes) {
         if (err && err_len) snprintf(err, err_len, "truncated agent session title trailer");
