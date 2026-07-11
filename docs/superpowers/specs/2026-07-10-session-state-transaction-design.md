@@ -80,8 +80,9 @@ The implementation records:
 
 - `server_txn_phase`: where execution is or where a result was decided;
 - `server_txn_reason`: model stop, length, tool calls, continuation conflict,
-  queued disconnect, cancellation, shutdown, restore/sync/decode/output/commit
-  failure, or invariant failure;
+  client gone, cancellation, shutdown, restore/sync/decode/output/commit
+  failure, or invariant failure. A queued disconnect is recorded as client
+  gone decided in the restore phase with the session unchanged;
 - `server_session_disposition`: unchanged, valid prefix retained, committed,
   or invalidated;
 - `server_wire_disposition`: untouched, started, irreversible, complete, or

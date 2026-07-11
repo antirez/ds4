@@ -57,6 +57,7 @@ static void stop_signal_handler(int sig) {
     }
 }
 
+#ifdef DS4_SERVER_TEST
 typedef enum {
     TEST_TXN_EVENT_RESTORE = 0,
     TEST_TXN_EVENT_SYNCHRONIZE,
@@ -75,6 +76,7 @@ typedef enum {
     TEST_TXN_EVENT_TRACE,
     TEST_TXN_EVENT_CLEANUP,
 } test_txn_event;
+#endif
 
 typedef struct {
     char *ptr;
@@ -12407,6 +12409,12 @@ static server_txn_settle_result production_session_settle(
         } else {
             thinking_live_clear(s);
         }
+    } else {
+        /* Rollback: this turn's frontier is not kept, so a live binding
+         * remembered for it must not survive to match a later request. */
+        if (j->req.api == API_RESPONSES) responses_live_clear(s);
+        if (j->req.api == API_ANTHROPIC) anthropic_live_clear(s);
+        thinking_live_clear(s);
     }
 
     server_session_disposition disposition = outcome->session;
@@ -12719,7 +12727,11 @@ static void *worker_main(void *arg) {
         if (!j) break;
         server_txn_outcome outcome = server_txn_run(s, j);
         if (!job_publish_terminal_outcome(j, &outcome)) {
-            die("admitted request produced more than one terminal outcome");
+            /* The terminalizer is idempotent, so a duplicate publish means an
+             * engine bug; the first outcome already reached the client, so
+             * dropping the duplicate is safer than killing a loaded server. */
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: dropped duplicate terminal outcome for an admitted request");
         }
     }
     const ds4_tokens *tokens = ds4_session_tokens(s->session);
@@ -12727,7 +12739,10 @@ static void *worker_main(void *arg) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: persisting current KV cache before shutdown tokens=%d",
                    tokens->len);
-        kv_cache_store_current(s, "shutdown");
+        if (!kv_cache_store_current(s, "shutdown")) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: shutdown KV persist failed; next start will re-prefill");
+        }
     }
     server_publish_stats_snapshot(s, ds4_session_pos(s->session));
     return NULL;
@@ -14092,6 +14107,50 @@ static void test_production_txn_shutdown_beats_queued_disconnect(void) {
     TEST_ASSERT(outcome.wire == SERVER_WIRE_UNTOUCHED);
     TEST_ASSERT(s.stats.queue_dropped_disconnected == 1);
     close(sv[0]);
+    pthread_mutex_destroy(&s.mu);
+}
+
+static void test_production_settle_rollback_clears_live_bindings(void) {
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_mutex_init(&s.tool_mu, NULL);
+    s.responses_live.visible_text = xstrdup("turn");
+    s.responses_live.visible_len = 4;
+    s.responses_live.valid = true;
+    s.thinking_live.visible_text = xstrdup("turn");
+    s.thinking_live.visible_len = 4;
+    s.thinking_live.valid = true;
+    s.anthropic_live.valid = true;
+
+    job j;
+    memset(&j, 0, sizeof(j));
+    j.req.api = API_RESPONSES;
+    production_txn p;
+    memset(&p, 0, sizeof(p));
+    p.srv = &s;
+    p.job = &j;
+    p.normal_ready = true;
+    p.wire = SERVER_WIRE_UNTOUCHED;
+    const server_txn_outcome outcome = {
+        .class = SERVER_TXN_FAILED,
+        .reason = SERVER_TXN_REASON_DECODE_FAILED,
+        .session = SERVER_SESSION_VALID_PREFIX,
+    };
+
+    server_txn_settle_result r = production_session_settle(&p, &outcome, false);
+    TEST_ASSERT(r.ok);
+    TEST_ASSERT(r.session == SERVER_SESSION_VALID_PREFIX);
+    TEST_ASSERT(!s.responses_live.valid);
+    TEST_ASSERT(!s.thinking_live.valid);
+    TEST_ASSERT(s.anthropic_live.valid);
+
+    j.req.api = API_ANTHROPIC;
+    r = production_session_settle(&p, &outcome, false);
+    TEST_ASSERT(r.ok);
+    TEST_ASSERT(!s.anthropic_live.valid);
+
+    pthread_mutex_destroy(&s.tool_mu);
     pthread_mutex_destroy(&s.mu);
 }
 
@@ -18549,6 +18608,7 @@ static void ds4_server_unit_tests_run(void) {
     test_dequeue_prioritizes_jobs_then_publishes_idle_stats();
     test_production_txn_terminalizes_queued_disconnect();
     test_production_txn_shutdown_beats_queued_disconnect();
+    test_production_settle_rollback_clears_live_bindings();
     test_job_terminal_outcome_is_published_once();
     test_txn_terminalizer_is_idempotent();
     test_txn_scripted_success_order();

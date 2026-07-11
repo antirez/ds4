@@ -109,3 +109,21 @@
 - Top recommendation: make request execution one terminal transaction while preserving the single local Metal worker.
 - Verified the report in headless Chrome, including Tailwind and Mermaid rendering, and ran `./ds4_test --server` successfully.
 - No production or test source was changed. Repo changes are limited to the task tracker and lesson required by the operating manual.
+
+# Task: Post-review robustness fixes for the session transaction (2026-07-10)
+
+## Plan
+
+- [x] Two-axis review (standards + spec) of 5a91c33..a2815e5 → verify: findings cite file:line evidence.
+- [x] Fix rollback retaining stale protocol live bindings → verify: new unit test fails before, passes after.
+- [x] Consume the `kv_cache_store_current("shutdown")` result → verify: warning logged on failure path.
+- [x] Compile `test_txn_event` only under `DS4_SERVER_TEST` → verify: warning-free production build.
+- [x] Downgrade duplicate-terminal-publish `die()` to a loud log → verify: `./ds4_test --server` still passes.
+- [x] Align spec text with the queued-disconnect encoding (client gone, restore phase) → verify: doc reads true against `production_restore`.
+
+## Review
+
+- Declined review item "wire mislabeled BROKEN on zero-byte failure": the spec's monotonic wire ledger deliberately treats any failed write attempt as may-have-emitted (spec lines 170-171, 195-196), scripted tests pin that contract, and the cited stream-failed early return is unreachable from `production_output_finish` because the wire is already BROKEN there.
+- Kept the worker-ownership `die()` calls: they guard cross-thread session mutation, which is memory-unsafe to continue past.
+- Deferred (out of scope): collapsing the adapter vtable layer to direct calls, deduplicating the two trace vsnprintf wrappers and the two failure latches, and whether docs/tasks files belong in the upstream PR.
+- Verified: warning-free `make ds4-server ds4_test`; `./ds4_test --server` OK including new `test_production_settle_rollback_clears_live_bindings`.
