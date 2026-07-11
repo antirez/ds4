@@ -268,6 +268,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         char *err, size_t errlen);
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
+bool ds4_session_is_valid(const ds4_session *s);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);

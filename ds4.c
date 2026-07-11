@@ -27778,6 +27778,10 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     s->mtp_draft_valid = false;
 }
 
+bool ds4_session_is_valid(const ds4_session *s) {
+    return s && s->checkpoint_valid;
+}
+
 int ds4_session_pos(ds4_session *s) {
     return s->checkpoint.len;
 }

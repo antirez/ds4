@@ -17,17 +17,21 @@ is implicit.
 Every admitted request runs through one private worker-owned session-state
 transaction and returns exactly one typed terminal outcome.
 
-- Only the worker mutates or inspects live session position and continuation
-  frontiers. `/stats` reads a worker-published immutable snapshot; client code
-  uses an immutable configured context size.
+- Only the worker reads or mutates live session position and mutates
+  continuation frontiers. Client parsing may validate call IDs against
+  mutex-protected frontier metadata, but `/stats` reads only a worker-published
+  immutable snapshot and client code uses an immutable configured context size.
 - One idempotent terminalizer settles session state, finalizes output, closes
-  tracing, applies counters, publishes statistics, and cleans up. Each effect
-  occurs at most once even if terminalization is invoked again.
+  tracing, cleans up, applies counters, and publishes statistics. Each effect
+  occurs at most once even if terminalization is invoked again; the final
+  snapshot reports idle only after trace and cleanup complete.
 - The first causal execution failure is primary. Rollback, checkpoint
   maintenance, terminal reporting, tracing, statistics, and cleanup failures
   are recorded as secondary and cannot overwrite it.
 - Session rollback means retaining the strongest engine-guaranteed valid prefix
-  or invalidating the live state. It is not a full KV snapshot restore.
+  or invalidating the live state. Failed and cancelled execution does not
+  publish a newly parsed continuation frontier or canonicalize a new
+  checkpoint. Rollback is not a full KV snapshot restore.
 - Socket bytes are irreversible. Once a write may have emitted bytes, rollback
   cannot retract them and a broken stream is never retried as another HTTP or
   terminal response.

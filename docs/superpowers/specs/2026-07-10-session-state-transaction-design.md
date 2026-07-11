@@ -70,7 +70,7 @@ ADMITTED
   -> RESTORE
   -> SYNCHRONIZE
   -> EXTEND
-  -> DECODE [-> RECOVER -> DECODE, at most once]
+  -> DECODE [contains the existing bounded recovery retry, at most once]
   -> SETTLE
   -> TERMINALIZE
   -> DONE
@@ -125,8 +125,9 @@ implementations:
 
 These are not mirrors of `ds4.h` or the protocol helper set. Each production
 operation owns a substantial existing lifecycle block. Scripted adapters use an
-ordered in-memory operation script, fail on unexpected calls, and never open a
-socket, load a model, touch a KVC file, or inspect a live session.
+ordered in-memory operation log whose tests fail on an unexpected sequence;
+they never open a socket, load a model, touch a KVC file, or inspect a live
+session.
 
 ## Exactly-once terminalization
 
@@ -138,18 +139,19 @@ Terminalization uses monotonic per-effect flags and attempts this controlled
 sequence:
 
 1. Freeze the first causal reason and intended state disposition.
-2. Detach session callbacks before stack-backed transaction state can expire.
-3. Commit or roll back continuation/checkpoint state as appropriate.
-4. Attempt the one allowed terminal wire projection, respecting the wire
+2. Detach session callbacks and commit or roll back continuation/checkpoint
+   state as appropriate.
+3. Attempt the one allowed terminal wire projection, respecting the wire
    ledger; a broken wire forbids retries or an alternate HTTP response.
-5. Close the typed trace record.
-6. Apply terminal counters once and publish the final immutable snapshot.
-7. Release all transaction-owned resources once.
-8. Cache and return the terminal outcome.
+4. Close the typed trace record while transaction-owned trace data is live.
+5. Release all transaction-owned resources once.
+6. Apply terminal counters once and publish the final immutable snapshot, so
+   `busy=false` means tracing and cleanup have also completed.
+7. Cache and return the terminal outcome.
 
 Frontier settlement remains before the final protocol event, preserving the
-current continuation semantics and protocol event ordering. Trace and counters
-observe the settled outcome but cannot change it.
+current continuation semantics and protocol event ordering. Trace, cleanup,
+and counters cannot replace the primary outcome; their failures are secondary.
 
 ## Failure precedence
 
@@ -182,6 +184,9 @@ by the engine contract. It is not an ACID snapshot restore:
 
 - interrupted `ds4_session_sync()` retains its guaranteed valid prefix;
 - a generic restore, sync, or decode failure may invalidate the live session;
+- failed or cancelled execution does not publish newly parsed Responses,
+  Anthropic, thinking, or tool-call continuation frontiers and does not run
+  commit-only checkpoint canonicalization;
 - a suppressed continued-store frontier and deferred disk checkpoint are
   restored or consumed using the existing rules;
 - no full per-request KV snapshot is introduced, and token-only rewind is not
@@ -206,20 +211,19 @@ socketpair tests pin equivalent behavior. Specifically, this change preserves:
 
 ## Verification strategy
 
-Deterministic scripted tests assert both outcome values and ordered effects for:
+Deterministic scripted tests run the same phase driver as production and assert
+typed restore, synchronization, decode, cancellation, commit, rollback, trace,
+statistics, and cleanup failures. The shared output seam injects failures at
+prefill, stream-open, incremental-update, flush, and terminal-finalization
+operations. Tests also pin terminal-effect ordering, shutdown/output causal
+precedence, settlement-time broken-wire behavior, repeated terminalizer
+invocation, and checkpoint-failure disposition. A production
+queued-disconnect test proves terminal accounting without a live session. The
+`/stats` tests prove serialization works with `server.session == NULL` and
+that queued work wins over a coalesced idle snapshot refresh.
 
-- restore success/failure and deferred checkpoint handling;
-- sync success, interruption, and hard failure;
-- decode success/failure and bounded recovery;
-- queued, prefill, and decode cancellation;
-- output open, delta, and terminal failures before and after irreversible bytes;
-- commit and rollback failures;
-- trace, statistics, and cleanup failures;
-- repeated terminalizer invocation;
-- snapshot reads while a scripted session phase is blocked, proving that the
-  reader never calls the session adapter.
-
-Existing server socketpair/protocol, continuation, and KVC tests remain the
-behavioral compatibility suite. Build verification uses `make`; server unit
-verification uses `./ds4_test --server`. The already-running Metal server is
-monitored but not stopped or duplicated during this change.
+Existing server socketpair/protocol, continuation, and KVC tests cover deferred
+checkpoint handling, recovery behavior, protocol bytes, and cache compatibility.
+Build verification uses `make`; server unit verification uses
+`./ds4_test --server`. Live verification uses the user's local Metal server after the
+replacement binary passes those gates.

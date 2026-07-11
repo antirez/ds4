@@ -12,12 +12,15 @@
 ## Plan
 
 - [x] Compare three deep-module interfaces and record the approved design and implementation plan.
-- [ ] Add a worker-published immutable `/stats` snapshot test-first.
-- [ ] Add typed execution phases, reasons, dispositions, and one idempotent terminalizer test-first.
-- [ ] Add private production and scripted adapters with deterministic failure precedence tests.
-- [ ] Migrate restore, sync, decode, output, commit/rollback, tracing, statistics, and cleanup through the controlled lifecycle.
-- [ ] Add the domain glossary entry and ADR.
-- [ ] Run safe verification, guard reviews, inspect the diff, and commit only scoped files.
+- [x] Add a worker-published immutable `/stats` snapshot test-first.
+- [x] Add typed execution phases, reasons, dispositions, and one idempotent terminalizer test-first.
+- [x] Add private production and scripted adapters with deterministic failure precedence tests.
+- [x] Migrate restore, sync, decode, output, commit/rollback, tracing, statistics, and cleanup through the controlled lifecycle.
+- [x] Add the domain glossary entry and ADR.
+- [x] Route prefill/open/delta output and nonterminal trace/statistics observations through the private adapters.
+- [x] Correct causal-failure, checkpoint-disposition, wire, and stats-publication edge cases found by guard review.
+- [x] Add deterministic coverage for operational adapter failures, shutdown/output precedence, checkpoint disposition, and idle stats refresh.
+- [x] Run safe verification, guard reviews, inspect the diff, and commit only scoped files.
 
 ## Acceptance criteria
 
@@ -31,7 +34,40 @@
 
 ## Review
 
-Pending.
+- Replaced the worker's request monolith with one shared, forward-only
+  transaction driver and private production/scripted session, output, trace,
+  and statistics adapters. All admitted jobs publish one typed outcome through
+  an idempotent terminalizer.
+- Routed prefill keepalives, stream open/update/flush/finalization, trace
+  begin/event/piece/finalization, request counters, progress snapshots,
+  settlement, cleanup, and checkpoint accounting through the controlled
+  lifecycle. Rollback no longer publishes a newly parsed continuation frontier.
+- `/stats` now copies only a worker-published immutable snapshot. Worker refresh
+  coalescing prioritizes admitted jobs, and terminal publication occurs after
+  trace and cleanup so `busy=false` is truthful.
+- Added explicit session-validity inspection, sticky shutdown/output failure
+  precedence, broken-wire no-retry behavior, checkpoint secondary failures,
+  and actual-validity rollback disposition.
+- Verification passed:
+  - warning-free `make -B ds4-server ds4_test`;
+  - `./ds4_test --server`;
+  - `./ds4-eval --self-test-extractors`;
+  - `git diff --check`;
+  - independent spec, concurrency, test/documentation, and clean-code audits.
+- Gracefully stopped PID 81030 after it persisted 101,224 live tokens to the
+  disk cache, then restarted the exact requested command as PID 31807. Metal
+  mapped about 95.1 GiB, allocated about 8.6 GiB for the 524,288-token context,
+  reopened the 32 GiB cache, and listened on `127.0.0.1:8000`.
+- Live health, model metadata, and immutable stats checks passed. A one-token
+  chat smoke request completed in 2.7 seconds; the final snapshot reported
+  `busy=false`, one request, nine live tokens, and no rejection/cancellation.
+  Its trace closed with completed/length, committed session, complete wire, and
+  no secondary failure.
+- Supplemental macOS AddressSanitizer was not a passing gate: LeakSanitizer is
+  unsupported, and the leak-disabled instrumented server suite was time-boxed
+  and terminated when it remained unexpectedly CPU-heavy. CUDA, distributed,
+  and SSD-streaming model modes were not exercised; the live Apple M5 Max Metal
+  path and disk checkpoint cache were exercised.
 
 ---
 
