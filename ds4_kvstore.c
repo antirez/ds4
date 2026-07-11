@@ -49,11 +49,20 @@
  * store. */
 #define KV_CACHE_CONTINUED_PREFIX_MIN_FACTOR 0.05
 #define KV_CACHE_CONTINUED_PREFIX_HIT_FACTOR 0.45
-/* Cold/evict/shutdown checkpoints are intentional anchors, not just automatic
- * waypoints in a single growing conversation. Give them a soft prior so they
- * survive comparable continued entries, while still allowing pressure and poor
- * density to evict them. */
+/* The cold session prefix is an intentional entry point, reused across
+ * independent sessions. Give it a soft prior so it survives comparable entries,
+ * while still allowing pressure and poor density to evict it. */
 #define KV_CACHE_ANCHOR_REASON_SCORE_FACTOR 2.0
+/* Time-since-last-use drives two independent decays. Reuse evidence (the hit
+ * count) decays on a per-role clock: a cold session prefix is reused on a slow
+ * cross-session cadence, so its evidence persists for weeks; a conversation tip
+ * (evict/continued/shutdown) only matters until that conversation is continued,
+ * so its evidence decays in hours (DS4_KVSTORE_HIT_HALF_LIFE_SECONDS). A
+ * decaying "freshness" baseline replaces the old constant +1 floor, so a
+ * checkpoint that is never reused loses its density-driven score within about a
+ * day instead of lingering on raw size forever. */
+#define KV_CACHE_HIT_HALF_LIFE_ANCHOR_SECONDS (21ull * 24ull * 60ull * 60ull)
+#define KV_CACHE_FRESHNESS_HALF_LIFE_SECONDS (8ull * 60ull * 60ull)
 
 typedef struct {
     char *ptr;
@@ -523,10 +532,11 @@ static bool kv_cache_incoming_supersedes_continued(
     return !strcmp(prefix_sha, e->sha);
 }
 
-static bool kv_cache_reason_is_anchor(uint8_t reason) {
-    return reason == DS4_KVSTORE_REASON_COLD ||
-           reason == DS4_KVSTORE_REASON_EVICT ||
-           reason == DS4_KVSTORE_REASON_SHUTDOWN;
+static bool kv_cache_reason_is_entry_anchor(uint8_t reason) {
+    /* Only the cold session prefix is a durable entry point reused across
+     * independent sessions. evict/shutdown persist a conversation tip, which
+     * behaves like a continuation and must decay on the fast clock. */
+    return reason == DS4_KVSTORE_REASON_COLD;
 }
 
 double ds4_kvstore_entry_eviction_score(
@@ -536,18 +546,28 @@ double ds4_kvstore_entry_eviction_score(
         const ds4_kvstore_eviction_context *incoming) {
     if (!e || e->file_size == 0) return 0.0;
     (void)live;
+    const bool anchor = kv_cache_reason_is_entry_anchor(e->reason);
+    const double hit_half_life = anchor ?
+        (double)KV_CACHE_HIT_HALF_LIFE_ANCHOR_SECONDS :
+        (double)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS;
     double effective_hits = (double)e->hits;
+    /* freshness replaces the old constant +1.0 floor and decays with idle time,
+     * so a never-reused checkpoint cannot ride its raw density forever. A future
+     * last_used (a manual pin) takes neither decay branch and stays at full
+     * score. */
+    double freshness = 1.0;
     uint64_t used_at = e->last_used ? e->last_used : e->created_at;
     if (used_at == 0) {
         effective_hits = 0.0;
     } else if (now > used_at) {
         double elapsed = (double)(now - used_at);
-        effective_hits *= exp2(-elapsed / (double)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
+        effective_hits *= exp2(-elapsed / hit_half_life);
         if (effective_hits < KV_CACHE_MIN_EFFECTIVE_HITS) effective_hits = 0.0;
+        freshness = exp2(-elapsed / (double)KV_CACHE_FRESHNESS_HALF_LIFE_SECONDS);
     }
-    double score = (effective_hits + 1.0) *
+    double score = (effective_hits + freshness) *
                    (double)e->tokens / (double)e->file_size;
-    if (kv_cache_reason_is_anchor(e->reason))
+    if (anchor)
         score *= KV_CACHE_ANCHOR_REASON_SCORE_FACTOR;
     if (kv_cache_incoming_supersedes_continued(e, incoming)) {
         double h = effective_hits > 0.0 ?
@@ -630,7 +650,7 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
     kc->opt = opt;
     ds4_kvstore_evict(kc, NULL, 0, NULL);
     kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-            "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus)",
+            "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus, anchor_half_life=%llus, freshness_half_life=%llus)",
             kv_log_name(kc),
             kc->dir,
             (unsigned long long)(kc->budget_bytes / (1024ull * 1024ull)),
@@ -640,7 +660,9 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
             kc->opt.continued_interval_tokens,
             kc->opt.boundary_trim_tokens,
             kc->opt.boundary_align_tokens,
-            (unsigned long long)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
+            (unsigned long long)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS,
+            (unsigned long long)KV_CACHE_HIT_HALF_LIFE_ANCHOR_SECONDS,
+            (unsigned long long)KV_CACHE_FRESHNESS_HALF_LIFE_SECONDS);
     return true;
 }
 
