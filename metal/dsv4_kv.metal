@@ -41,6 +41,13 @@ struct ds4_metal_args_dsv4_ratio4_shift {
     uint32_t width;
 };
 
+struct ds4_metal_args_dsv4_compressor_pack_ratio4 {
+    uint32_t head_dim;
+    uint32_t n_comp;
+    uint32_t replay;
+    uint32_t n_threads;
+};
+
 struct ds4_metal_args_dsv4_compressor_store_one {
     uint32_t width;
     uint32_t ratio;
@@ -261,6 +268,54 @@ kernel void kernel_dsv4_kv_fp8_store_f32(
 #else
         raw[i] = (float)((half)kv[i]);
 #endif
+    }
+}
+
+// Builds the two ratio-4 softmax-pool packs together. Each output plane holds
+// four previous-half rows followed by four current-half rows. Normal prefill
+// seeds plane zero with 0/-inf; replay seeds it from the previous compressor
+// state. Later planes take their previous half from the prior input group.
+kernel void kernel_dsv4_compressor_pack_ratio4(
+        constant ds4_metal_args_dsv4_compressor_pack_ratio4 & args,
+        device const uint * kv,
+        device const uint * score,
+        device const uint * state_kv,
+        device const uint * state_score,
+        device       uint * packed_kv,
+        device       uint * packed_score,
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    if (group.x >= args.n_comp || group.y >= 8u ||
+        args.head_dim == 0u || args.n_threads == 0u) {
+        return;
+    }
+
+    const uint plane = group.x;
+    const uint row = group.y;
+    const uint64_t input_row_stride = 2ull * args.head_dim;
+    const uint64_t dst_row = ((uint64_t)plane * 8u + row) * args.head_dim;
+
+    for (uint col = tid; col < args.head_dim; col += args.n_threads) {
+        const uint64_t dst = dst_row + col;
+        if (row >= 4u) {
+            const uint token = plane * 4u + (row - 4u);
+            const uint64_t src = (uint64_t)token * input_row_stride +
+                                 args.head_dim + col;
+            packed_kv[dst] = kv[src];
+            packed_score[dst] = score[src];
+        } else if (plane != 0u) {
+            const uint token = (plane - 1u) * 4u + row;
+            const uint64_t src = (uint64_t)token * input_row_stride + col;
+            packed_kv[dst] = kv[src];
+            packed_score[dst] = score[src];
+        } else if (args.replay != 0u) {
+            const uint64_t src = (uint64_t)row * input_row_stride + col;
+            packed_kv[dst] = state_kv[src];
+            packed_score[dst] = state_score[src];
+        } else {
+            packed_kv[dst] = 0u;
+            packed_score[dst] = 0xff800000u;
+        }
     }
 }
 

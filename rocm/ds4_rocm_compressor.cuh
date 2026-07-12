@@ -260,7 +260,8 @@ extern "C" int ds4_gpu_compressor_update_tensor(
         float                   attn_factor,
         float                   beta_fast,
         float                   beta_slow,
-        float                   rms_eps) {
+        float                   rms_eps,
+        bool                    state_already_stored) {
     if (!kv_cur || !sc_cur || !state_kv || !state_score || !comp_cache ||
         !model_map || !cuda_compressor_shape_supported(head_dim, ratio) ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
@@ -284,10 +285,12 @@ extern "C" int ds4_gpu_compressor_update_tensor(
         (emit && !cuda_tensor_has_bytes(comp_cache, comp_bytes))) {
         return 0;
     }
-    if (!ds4_gpu_compressor_store_batch_tensor(kv_cur, sc_cur, state_kv, state_score,
-                                                 model_map, model_size, ape_offset, ape_type,
-                                                 head_dim, ratio, pos, 1)) {
-        return 0;
+    if (!state_already_stored) {
+        if (!ds4_gpu_compressor_store_batch_tensor(kv_cur, sc_cur, state_kv, state_score,
+                                                     model_map, model_size, ape_offset, ape_type,
+                                                     head_dim, ratio, pos, 1)) {
+            return 0;
+        }
     }
     if (!emit) return 1;
     ds4_gpu_tensor *comp_row_view = ds4_gpu_tensor_view(

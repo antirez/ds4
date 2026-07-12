@@ -21,6 +21,26 @@ struct ds4_metal_args_dsv4_hc_weighted_sum {
     uint64_t nb1;
 };
 
+struct ds4_metal_args_dsv4_hc_weighted_sum_norm {
+    int64_t  n_embd;
+    int64_t  n_hc;
+    int64_t  n_tokens;
+    uint64_t nb_x0;
+    uint64_t nb_x1;
+    uint64_t nb_x2;
+    uint64_t nb_w0;
+    uint64_t nb_w1;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb_norm1;
+    float    norm_eps;
+};
+
+struct ds4_metal_args_dsv4_output_hc_weights4 {
+    float post_scale;
+    float eps;
+};
+
 struct ds4_metal_args_dsv4_hc_split_weighted_sum {
     int64_t  n_embd;
     int32_t  n_hc;
@@ -506,10 +526,12 @@ kernel void kernel_dsv4_hc_split_weighted_sum_norm4(
         device const float4 *x1 = (device const float4 *)(x + 1 * args.nb_x1 + (uint64_t)row * args.nb_x2);
         device const float4 *x2 = (device const float4 *)(x + 2 * args.nb_x1 + (uint64_t)row * args.nb_x2);
         device const float4 *x3 = (device const float4 *)(x + 3 * args.nb_x1 + (uint64_t)row * args.nb_x2);
-        const float4 v = x0[i] * pre_shmem[0] +
-                         x1[i] * pre_shmem[1] +
-                         x2[i] * pre_shmem[2] +
-                         x3[i] * pre_shmem[3];
+        // Preserve the standalone HC collapse's explicit accumulation order.
+        float4 v = 0.0f;
+        v += x0[i] * pre_shmem[0];
+        v += x1[i] * pre_shmem[1];
+        v += x2[i] * pre_shmem[2];
+        v += x3[i] * pre_shmem[3];
         row_shmem[i] = v;
         sumf += dot(v, v);
     }
@@ -523,7 +545,11 @@ kernel void kernel_dsv4_hc_split_weighted_sum_norm4(
 
     sumf = sum_shmem[tiisg];
     sumf = simd_sum(sumf);
-    const float norm_scale = rsqrt(sumf / float(n_embd) + args.norm_eps);
+    // Batched prefill must match kernel_rms_norm_fuse_impl so enabling this
+    // fusion does not change its scale by an ULP. Keep the established
+    // single-row decode result unchanged; that path historically used rsqrt.
+    const float norm_arg = sumf / float(n_embd) + args.norm_eps;
+    const float norm_scale = args.n_rows > 1 ? 1.0f / sqrt(norm_arg) : rsqrt(norm_arg);
 
     device float4 *dst4 = (device float4 *)(dst + (uint64_t)row * args.nb1);
     device const float4 *w4 = (device const float4 *)norm_weight;
@@ -882,4 +908,110 @@ kernel void kernel_dsv4_hc_weighted_sum(
     }
 
     *((device float *) (dst + d*args.nb0 + t*args.nb1)) = acc;
+}
+
+// The one-row output head immediately applies a learned RMSNorm after reducing
+// its four HC streams. Preserve the standalone scalar HC accumulation, write
+// the collapsed row for diagnostics, then reload its F32 values from
+// threadgroup memory using the standalone RMSNorm's float4 reduction mapping.
+kernel void kernel_dsv4_hc_weighted_sum_norm4(
+        constant ds4_metal_args_dsv4_hc_weighted_sum_norm & args,
+        device  const char * x,
+        device  const char * weights,
+        device        char * dst,
+        device  const char * norm_weight,
+        device        char * norm_dst,
+        threadgroup  float * shared [[threadgroup(0)]],
+        ushort tid [[thread_position_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort ntg [[threads_per_threadgroup]]) {
+    if (args.n_tokens != 1 || args.n_hc != 4 ||
+        args.n_embd <= 0 || (args.n_embd & 3) != 0) {
+        return;
+    }
+
+    const uint n_embd = uint(args.n_embd);
+    const uint n4 = n_embd >> 2;
+    threadgroup float *row_shmem = shared;
+    threadgroup float *sum_shmem = shared + n_embd;
+
+    if (sgitg == 0) {
+        sum_shmem[tiisg] = 0.0f;
+    }
+
+    for (uint d = tid; d < n_embd; d += ntg) {
+        float acc = 0.0f;
+        for (int64_t h = 0; h < args.n_hc; ++h) {
+            const float xv = *((device const float *)(
+                x + (uint64_t)d*args.nb_x0 + (uint64_t)h*args.nb_x1));
+            const float wv = *((device const float *)(
+                weights + (uint64_t)h*args.nb_w0));
+            acc += xv * wv;
+        }
+        row_shmem[d] = acc;
+        *((device float *)(dst + (uint64_t)d*args.nb0)) = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup const float4 *row4 =
+        (threadgroup const float4 *)row_shmem;
+    float sumf = 0.0f;
+    for (uint i = tid; i < n4; i += ntg) {
+        sumf += dot(row4[i], row4[i]);
+    }
+    sumf = simd_sum(sumf);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        sum_shmem[sgitg] = sumf;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = sum_shmem[tiisg];
+    sumf = simd_sum(sumf);
+
+    const float mean = sumf/args.n_embd;
+    const float scale = 1.0f/sqrt(mean + args.norm_eps);
+    device const float4 *w4 = (device const float4 *)norm_weight;
+    device float4 *norm4 = (device float4 *)norm_dst;
+    for (uint i = tid; i < n4; i += ntg) {
+        norm4[i] = (row4[i]*scale)*w4[i];
+    }
+}
+
+// The one-row HC=4 output head historically materializes four device-F32
+// stages across separate launches. Collapse those launches into one tiny
+// two-thread group while preserving the scalar/vector lane mapping and every
+// global rounding boundary.
+kernel void kernel_dsv4_output_hc_weights4(
+        constant ds4_metal_args_dsv4_output_hc_weights4 & args,
+        device  const float * pre,
+        device  const float * hc_scale,
+        device  const float * hc_base,
+        device        float * dst,
+        ushort tid [[thread_position_in_threadgroup]]) {
+    device volatile float *stage = (device volatile float *)dst;
+
+    for (uint i = tid; i < 4; i += 2) {
+        stage[i] = pre[i] * hc_scale[0];
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    for (uint i = tid; i < 4; i += 2) {
+        stage[i] = stage[i] + hc_base[i];
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    if (tid == 0) {
+        const float4 x = *((device volatile float4 *)stage);
+        *((device volatile float4 *)stage) = 1 / (1 + exp(-x));
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    if (tid == 0) {
+        const float4 x = *((device volatile float4 *)stage);
+        *((device volatile float4 *)stage) =
+            args.post_scale * x + args.eps;
+    }
 }

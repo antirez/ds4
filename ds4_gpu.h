@@ -72,6 +72,9 @@ int ds4_gpu_preload_q4_expert_tables(const void *model_map, uint64_t model_size,
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
 void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_set_ssd_streaming(bool enabled);
+#ifdef __APPLE__
+void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
+#endif
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
 uint64_t ds4_gpu_recommended_working_set_size(void);
@@ -297,6 +300,26 @@ int ds4_gpu_matmul_f16_pair_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Optional Metal decode fusion. Returns 1 when the paired projection and
+ * recurrent compressor-state store were encoded, 0 when the optimized path
+ * is unavailable, and -1 on an attempted-path error. */
+int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
+        ds4_gpu_tensor       *out_kv,
+        ds4_gpu_tensor       *out_score,
+        ds4_gpu_tensor       *state_kv,
+        ds4_gpu_tensor       *state_score,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_kv_offset,
+        uint64_t                weight_score_offset,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint64_t                in_dim,
+        uint32_t                width,
+        const ds4_gpu_tensor *x,
+        uint32_t                ratio,
+        uint32_t                pos);
+
 int ds4_gpu_matmul_f32_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -496,7 +519,8 @@ int ds4_gpu_compressor_update_tensor(
         float                   attn_factor,
         float                   beta_fast,
         float                   beta_slow,
-        float                   rms_eps);
+        float                   rms_eps,
+        bool                    state_already_stored);
 
 int ds4_gpu_compressor_store_batch_tensor(
         const ds4_gpu_tensor *kv,
@@ -593,6 +617,20 @@ int ds4_gpu_attention_decode_heads_tensor(
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_mask,
         uint32_t                n_head,
+        uint32_t                head_dim);
+
+/* Diagnostic/public form of the dk=512 gathered decode-attention KV staging
+ * step. The compressed source must be F16; dst writes chronological raw-ring
+ * rows followed by compressed rows and must not overlap either source. */
+int ds4_gpu_flash_kv_stage_f16_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_raw,
+        const ds4_gpu_tensor *comp,
+        uint32_t                comp_is_f16,
+        uint32_t                n_comp,
         uint32_t                head_dim);
 
 int ds4_gpu_attention_prefill_raw_heads_tensor(
@@ -895,6 +933,18 @@ int ds4_gpu_hc_weighted_sum_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+int ds4_gpu_hc_weighted_sum_norm_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *norm_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *weights,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                norm_weight_offset,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        float                   norm_eps);
+
 int ds4_gpu_hc_weighted_sum_split_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *residual_hc,
@@ -934,6 +984,21 @@ int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         uint32_t                sinkhorn_iters,
         float                   eps,
         float                   norm_eps);
+
+/* Batched HC RMSNorm followed by its narrow F16 mixer projection. On the
+ * tuned Metal path, scale_scratch stores one float per row instead of the
+ * full normalized HC tensor; other shapes retain the established fallback. */
+int ds4_gpu_hc_rms_scale_project_f16_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *scale_scratch,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                in_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_rows,
+        float                   eps);
 
 int ds4_gpu_output_hc_weights_tensor(
         ds4_gpu_tensor       *out,

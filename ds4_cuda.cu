@@ -8040,6 +8040,40 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     return cuda_ok(cudaGetLastError(), "matmul_f16_pair_ordered_chunks launch");
 }
 
+extern "C" int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
+        ds4_gpu_tensor *out_kv,
+        ds4_gpu_tensor *out_score,
+        ds4_gpu_tensor *state_kv,
+        ds4_gpu_tensor *state_score,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_kv_offset,
+        uint64_t weight_score_offset,
+        uint64_t ape_offset,
+        uint32_t ape_type,
+        uint64_t in_dim,
+        uint32_t width,
+        const ds4_gpu_tensor *x,
+        uint32_t ratio,
+        uint32_t pos) {
+    (void)out_kv;
+    (void)out_score;
+    (void)state_kv;
+    (void)state_score;
+    (void)model_map;
+    (void)model_size;
+    (void)weight_kv_offset;
+    (void)weight_score_offset;
+    (void)ape_offset;
+    (void)ape_type;
+    (void)in_dim;
+    (void)width;
+    (void)x;
+    (void)ratio;
+    (void)pos;
+    return 0;
+}
+
 extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
@@ -8331,7 +8365,8 @@ extern "C" int ds4_gpu_compressor_update_tensor(
         float                   attn_factor,
         float                   beta_fast,
         float                   beta_slow,
-        float                   rms_eps) {
+        float                   rms_eps,
+        bool                    state_already_stored) {
     if (!kv_cur || !sc_cur || !state_kv || !state_score || !comp_cache ||
         !model_map || head_dim == 0 || ratio == 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
@@ -8355,10 +8390,12 @@ extern "C" int ds4_gpu_compressor_update_tensor(
         (emit && comp_cache->bytes < comp_bytes)) {
         return 0;
     }
-    if (!ds4_gpu_compressor_store_batch_tensor(kv_cur, sc_cur, state_kv, state_score,
-                                                 model_map, model_size, ape_offset, ape_type,
-                                                 head_dim, ratio, pos, 1)) {
-        return 0;
+    if (!state_already_stored) {
+        if (!ds4_gpu_compressor_store_batch_tensor(kv_cur, sc_cur, state_kv, state_score,
+                                                     model_map, model_size, ape_offset, ape_type,
+                                                     head_dim, ratio, pos, 1)) {
+            return 0;
+        }
     }
     if (!emit) return 1;
     ds4_gpu_tensor *comp_row_view = ds4_gpu_tensor_view(

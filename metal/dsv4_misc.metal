@@ -43,6 +43,21 @@ struct ds4_metal_args_dsv4_softmax_pool {
     uint64_t nb1;
 };
 
+struct ds4_metal_args_dsv4_softmax_pool_ratio4_direct {
+    int64_t  n_rows;
+    uint32_t head_dim;
+    uint32_t n_comp;
+    uint32_t replay;
+    uint32_t pad;
+};
+
+struct ds4_metal_args_dsv4_compressor_score_ape {
+    uint32_t width;
+    uint32_t ratio;
+    uint32_t pos0;
+    uint32_t n_tokens;
+};
+
 struct ds4_metal_args_dsv4_indexed_attention {
     uint32_t n_tokens;
     uint32_t n_head;
@@ -218,6 +233,54 @@ kernel void kernel_dsv4_router_weights_one(
     w[tid] = p[s[tid]] / sum * 1.5f;
 }
 
+// Batched Flash-router weight finalization after selection is already known.
+// Six active lanes deliberately match kernel_sum_rows_f32_f32's reduction
+// topology. The denominator and divided weights cross threadgroup storage
+// boundaries so division cannot be reassociated with the final scale.
+kernel void kernel_dsv4_router_weights_batch(
+        constant float &scale,
+        device const float *probs,
+        device const int32_t *selected,
+        device float *weights,
+        threadgroup volatile float *scratch [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        ushort tid [[thread_position_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    if (tid >= 6) return;
+
+    threadgroup volatile float *sum_scratch = scratch;
+    threadgroup volatile float *denom_scratch = scratch + 32;
+    threadgroup volatile float *div_scratch = scratch + 33;
+    const uint out_index = row * 6u + (uint)tid;
+    const int32_t expert = selected[out_index];
+    const float p = probs[row * 256u + (uint)expert];
+
+    // Keep this sequence identical to kernel_sum_rows_f32_f32 for width 6.
+    if (sgitg == 0) {
+        sum_scratch[tiisg] = 0.0f;
+    }
+    float sumf = 0.0f;
+    sumf += p;
+    sumf = simd_sum(sumf);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        sum_scratch[sgitg] = sumf;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sumf = sum_scratch[tiisg];
+    sumf = simd_sum(sumf);
+
+    if (tid == 0) {
+        denom_scratch[0] = clamp(sumf, 6.103515625e-5f, INFINITY);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    div_scratch[tid] = p / denom_scratch[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    weights[out_index] = div_scratch[tid] * scale;
+}
+
 // Decode router selection for one token after the existing
 // sqrt(softplus(logit)) probability kernel has run. Bias affects only top-k
 // selection. Route-weight normalization deliberately stays in the old one-token
@@ -277,6 +340,176 @@ kernel void kernel_dsv4_router_finalize_one(
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// M3 decode specialization for the non-hash one-token router. Scores and ids
+// stay in registers. Intra-SIMD bitonic stages use shuffle-xor; the six stages
+// that cross 32-lane SIMD groups exchange through alternating threadgroup
+// banks. The next bank's publish barrier proves every prior-bank read finished;
+// by the time a bank is reused two cross stages later, no reader can remain.
+kernel void kernel_dsv4_router_finalize_one_simd(
+        constant ds4_metal_args_dsv4_router_select_one & args,
+        device const float *probs,
+        device const float *bias,
+        device const int32_t *hash,
+        device const int32_t *tokens,
+        device int32_t *selected,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    if (tid >= 256 || args.hash_mode) return;
+
+    (void)hash;
+    (void)tokens;
+    threadgroup float *score0_tg = scratch;
+    threadgroup int32_t *idx0_tg =
+        (threadgroup int32_t *)(scratch + 256);
+    threadgroup float *score1_tg = scratch + 512;
+    threadgroup int32_t *idx1_tg =
+        (threadgroup int32_t *)(scratch + 768);
+    const float p = probs[tid];
+    float score = args.has_bias ? p + bias[tid] : p;
+    int32_t idx = (int32_t)tid;
+    uint cross_stage = 0;
+
+    for (uint k = 2; k <= 256; k <<= 1) {
+        for (uint j = k >> 1; j > 0; j >>= 1) {
+            float peer_score;
+            int32_t peer_idx;
+            bool take_peer;
+            const bool lower = (tid & j) == 0;
+            const bool descending = (tid & k) == 0;
+
+            if (j < 32) {
+                peer_score = simd_shuffle_xor(score, (ushort)j);
+                peer_idx = simd_shuffle_xor(idx, (ushort)j);
+                take_peer = descending
+                    ? (lower ? score < peer_score : score > peer_score)
+                    : (lower ? score > peer_score : score < peer_score);
+                if (take_peer) {
+                    score = peer_score;
+                    idx = peer_idx;
+                }
+            } else {
+                threadgroup float *score_tg =
+                    (cross_stage & 1u) != 0u ? score1_tg : score0_tg;
+                threadgroup int32_t *idx_tg =
+                    (cross_stage & 1u) != 0u ? idx1_tg : idx0_tg;
+                score_tg[tid] = score;
+                idx_tg[tid] = idx;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                const uint other = tid ^ j;
+                peer_score = score_tg[other];
+                peer_idx = idx_tg[other];
+                take_peer = descending
+                    ? (lower ? score < peer_score : score > peer_score)
+                    : (lower ? score > peer_score : score < peer_score);
+                if (take_peer) {
+                    score = peer_score;
+                    idx = peer_idx;
+                }
+                cross_stage++;
+            }
+        }
+    }
+
+    if (tid < 6) {
+        selected[tid] = idx;
+    }
+}
+
+// M3 decode specialization that extends the register/TG SIMD selection above
+// through the existing six-value serial weight normalization. The selected ids
+// cross the same device-memory boundary as the standalone weight kernel;
+// volatile TG stores pin its left-fold and scaled-reciprocal rounding points.
+kernel void kernel_dsv4_router_finalize_weights_one_simd(
+        constant ds4_metal_args_dsv4_router_select_one & args,
+        device const float *probs,
+        device const float *bias,
+        device const int32_t *hash,
+        device const int32_t *tokens,
+        device int32_t *selected,
+        device float *weights,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    if (tid >= 256 || args.hash_mode) return;
+
+    (void)hash;
+    (void)tokens;
+    threadgroup float *score0_tg = scratch;
+    threadgroup int32_t *idx0_tg =
+        (threadgroup int32_t *)(scratch + 256);
+    threadgroup float *score1_tg = scratch + 512;
+    threadgroup int32_t *idx1_tg =
+        (threadgroup int32_t *)(scratch + 768);
+    const float p = probs[tid];
+    float score = args.has_bias ? p + bias[tid] : p;
+    int32_t idx = (int32_t)tid;
+    uint cross_stage = 0;
+
+    for (uint k = 2; k <= 256; k <<= 1) {
+        for (uint j = k >> 1; j > 0; j >>= 1) {
+            float peer_score;
+            int32_t peer_idx;
+            bool take_peer;
+            const bool lower = (tid & j) == 0;
+            const bool descending = (tid & k) == 0;
+
+            if (j < 32) {
+                peer_score = simd_shuffle_xor(score, (ushort)j);
+                peer_idx = simd_shuffle_xor(idx, (ushort)j);
+                take_peer = descending
+                    ? (lower ? score < peer_score : score > peer_score)
+                    : (lower ? score > peer_score : score < peer_score);
+                if (take_peer) {
+                    score = peer_score;
+                    idx = peer_idx;
+                }
+            } else {
+                threadgroup float *score_tg =
+                    (cross_stage & 1u) != 0u ? score1_tg : score0_tg;
+                threadgroup int32_t *idx_tg =
+                    (cross_stage & 1u) != 0u ? idx1_tg : idx0_tg;
+                score_tg[tid] = score;
+                idx_tg[tid] = idx;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                const uint other = tid ^ j;
+                peer_score = score_tg[other];
+                peer_idx = idx_tg[other];
+                take_peer = descending
+                    ? (lower ? score < peer_score : score > peer_score)
+                    : (lower ? score > peer_score : score < peer_score);
+                if (take_peer) {
+                    score = peer_score;
+                    idx = peer_idx;
+                }
+                cross_stage++;
+            }
+        }
+    }
+
+    if (tid < 6) {
+        selected[tid] = idx;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    threadgroup volatile float *norm_scratch =
+        (threadgroup volatile float *)scratch;
+    if (tid == 0) {
+        device const int32_t *s = selected;
+        norm_scratch[0] = 0.0f;
+        for (uint i = 0; i < 6; i++) {
+            norm_scratch[0] = norm_scratch[0] + probs[s[i]];
+        }
+        norm_scratch[0] = max(norm_scratch[0], 6.103515625e-5f);
+        norm_scratch[1] = 1.5f / norm_scratch[0];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 6) {
+        device const int32_t *s = selected;
+        weights[tid] = probs[s[tid]] * norm_scratch[1];
+    }
 }
 
 // Fills the dense compressed-attention mask with -inf. The selected top-k rows
@@ -1290,6 +1523,39 @@ kernel void kernel_dsv4_indexer_weighted_sum(
     *((device float *) (dst + ic*args.nb0 + it*args.nb1)) = acc;
 }
 
+// Adds the periodic compressor APE directly to projected scores. The legacy
+// path materializes one repeated APE segment per period and then performs this
+// same single F32 add; these kernels remove only that intermediate copy graph.
+kernel void kernel_dsv4_compressor_score_ape_f32(
+        constant ds4_metal_args_dsv4_compressor_score_ape & args,
+        device const float *score,
+        device const float *ape,
+        device       float *dst,
+        uint gid [[thread_position_in_grid]]) {
+    const uint64_t total = (uint64_t)args.n_tokens * args.width;
+    if ((uint64_t)gid >= total) return;
+
+    const uint token = gid / args.width;
+    const uint col = gid - token*args.width;
+    const uint ape_row = (uint)(((uint64_t)args.pos0 + token) % args.ratio);
+    dst[gid] = score[gid] + ape[(uint64_t)ape_row*args.width + col];
+}
+
+kernel void kernel_dsv4_compressor_score_ape_f16(
+        constant ds4_metal_args_dsv4_compressor_score_ape & args,
+        device const float *score,
+        device const half  *ape,
+        device       float *dst,
+        uint gid [[thread_position_in_grid]]) {
+    const uint64_t total = (uint64_t)args.n_tokens * args.width;
+    if ((uint64_t)gid >= total) return;
+
+    const uint token = gid / args.width;
+    const uint col = gid - token*args.width;
+    const uint ape_row = (uint)(((uint64_t)args.pos0 + token) % args.ratio);
+    dst[gid] = score[gid] + float(ape[(uint64_t)ape_row*args.width + col]);
+}
+
 // Fused softmax-weighted pooling of compressed KV rows. It is used when several
 // compressor rows are present; the one-row case deliberately follows the
 // unfused softmax/mul/sum graph in Objective-C to keep identical reductions.
@@ -1324,4 +1590,87 @@ kernel void kernel_dsv4_softmax_pool(
     }
 
     *((device float *) (dst + id*args.nb0 + ic*args.nb1)) = acc/sum;
+}
+
+// Ratio-4 compressor pooling without materializing the [n_comp, 8, head_dim]
+// KV and score packs. The row mapping and both reduction loops deliberately
+// match kernel_dsv4_softmax_pool so the arithmetic order is unchanged.
+kernel void kernel_dsv4_softmax_pool_ratio4_direct(
+        constant ds4_metal_args_dsv4_softmax_pool_ratio4_direct & args,
+        device const float * kv,
+        device const float * score,
+        device const float * state_kv,
+        device const float * state_score,
+        device       float * dst,
+        uint gid [[thread_position_in_grid]]) {
+    const uint64_t n = (uint64_t)args.head_dim * args.n_comp;
+    if ((uint64_t)gid >= n || args.head_dim == 0u) {
+        return;
+    }
+
+    const uint64_t id = gid % args.head_dim;
+    const uint64_t ic = gid / args.head_dim;
+    const uint64_t input_row_stride = 2ull * args.head_dim;
+
+    float max_s = -INFINITY;
+    float sum = 0.0f;
+    float acc = 0.0f;
+    if (ic != 0u) {
+        const int64_t token_base = (int64_t)ic * 4 - 4;
+        for (int64_t ir = 0; ir < args.n_rows; ++ir) {
+            const uint64_t token = (uint64_t)(token_base + ir);
+            const uint64_t src = token * input_row_stride +
+                                 ((uint64_t)ir >> 2u) * args.head_dim + id;
+            const float s = score[src];
+            max_s = max(max_s, s);
+        }
+
+        for (int64_t ir = 0; ir < args.n_rows; ++ir) {
+            const uint64_t token = (uint64_t)(token_base + ir);
+            const uint64_t src = token * input_row_stride +
+                                 ((uint64_t)ir >> 2u) * args.head_dim + id;
+            const float s = score[src];
+            const float w = exp(s - max_s);
+            const float v = kv[src];
+            sum += w;
+            acc += v*w;
+        }
+    } else {
+        for (int64_t ir = 0; ir < args.n_rows; ++ir) {
+            float s;
+            if (ir >= 4) {
+                const uint64_t src = (uint64_t)(ir - 4) * input_row_stride +
+                                     args.head_dim + id;
+                s = score[src];
+            } else if (args.replay != 0u) {
+                s = state_score[(uint64_t)ir * input_row_stride + id];
+            } else {
+                s = -INFINITY;
+            }
+            max_s = max(max_s, s);
+        }
+
+        for (int64_t ir = 0; ir < args.n_rows; ++ir) {
+            float s;
+            float v;
+            if (ir >= 4) {
+                const uint64_t src = (uint64_t)(ir - 4) * input_row_stride +
+                                     args.head_dim + id;
+                s = score[src];
+                v = kv[src];
+            } else if (args.replay != 0u) {
+                const uint64_t src = (uint64_t)ir * input_row_stride + id;
+                s = state_score[src];
+                v = state_kv[src];
+            } else {
+                s = -INFINITY;
+                v = 0.0f;
+            }
+            const float w = exp(s - max_s);
+            sum += w;
+            acc += v*w;
+        }
+    }
+
+    dst[ic * args.head_dim + id] = acc/sum;
 }

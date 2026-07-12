@@ -753,6 +753,40 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     return cuda_ok(cudaGetLastError(), "matmul_f16_pair_ordered_chunks launch");
 }
 
+extern "C" int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
+        ds4_gpu_tensor *out_kv,
+        ds4_gpu_tensor *out_score,
+        ds4_gpu_tensor *state_kv,
+        ds4_gpu_tensor *state_score,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_kv_offset,
+        uint64_t weight_score_offset,
+        uint64_t ape_offset,
+        uint32_t ape_type,
+        uint64_t in_dim,
+        uint32_t width,
+        const ds4_gpu_tensor *x,
+        uint32_t ratio,
+        uint32_t pos) {
+    (void)out_kv;
+    (void)out_score;
+    (void)state_kv;
+    (void)state_score;
+    (void)model_map;
+    (void)model_size;
+    (void)weight_kv_offset;
+    (void)weight_score_offset;
+    (void)ape_offset;
+    (void)ape_type;
+    (void)in_dim;
+    (void)width;
+    (void)x;
+    (void)ratio;
+    (void)pos;
+    return 0;
+}
+
 extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0 ||
         in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
