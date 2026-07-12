@@ -10,7 +10,8 @@
  *
  * U1 is the skeleton: parse options, dispatch --help, print a placeholder.
  * U2 ships the backend compile check.
- * U3 (model), U4 (environment) follow.
+ * U3 ships the model file integrity check.
+ * U4 (port / memory / kv-disk) follows.
  * JSON / human output and exit-code policy land in U5.
  */
 
@@ -20,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 typedef struct {
@@ -106,7 +108,7 @@ typedef struct {
     const char *title;    /* human-readable label */
     doctor_status status; /* canonical status */
     int duration_ms;      /* wall time spent in the check */
-    const char *message;  /* one-line explanation or hint */
+    char message[256];    /* one-line explanation or hint */
 } doctor_check;
 
 static uint64_t now_ms(void) {
@@ -128,14 +130,138 @@ static doctor_check doctor_check_backend(void) {
     c.title = "Backend compile";
     c.status = DOCTOR_OK;
 #ifdef DS4_NO_GPU
-    c.message = "CPU-only build (DS4_NO_GPU)";
+    snprintf(c.message, sizeof(c.message), "CPU-only build (DS4_NO_GPU)");
 #elif defined(__APPLE__)
-    c.message = "Metal backend compiled in (Apple Silicon)";
+    snprintf(c.message, sizeof(c.message), "Metal backend compiled in (Apple Silicon)");
 #elif defined(DS4_ROCM_BUILD)
-    c.message = "ROCm/HIP backend compiled in (Strix Halo / gfx1151)";
+    snprintf(c.message, sizeof(c.message), "ROCm/HIP backend compiled in (Strix Halo / gfx1151)");
 #else
-    c.message = "CUDA backend compiled in (Linux/Windows CUDA)";
+    snprintf(c.message, sizeof(c.message), "CUDA backend compiled in (Linux/Windows CUDA)");
 #endif
+    return c;
+}
+
+/* Read a little-endian u32 / u64 with strict short-read detection.
+ * Returns false if the stream ends before the requested width. */
+static bool read_u32_le(FILE *fp, uint32_t *out) {
+    uint8_t buf[4];
+    if (fread(buf, 1, 4, fp) != 4) return false;
+    *out = (uint32_t)buf[0]
+         | ((uint32_t)buf[1] << 8)
+         | ((uint32_t)buf[2] << 16)
+         | ((uint32_t)buf[3] << 24);
+    return true;
+}
+
+static bool read_u64_le(FILE *fp, uint64_t *out) {
+    uint8_t buf[8];
+    if (fread(buf, 1, 8, fp) != 8) return false;
+    *out = (uint64_t)buf[0]
+         | ((uint64_t)buf[1] << 8)
+         | ((uint64_t)buf[2] << 16)
+         | ((uint64_t)buf[3] << 24)
+         | ((uint64_t)buf[4] << 32)
+         | ((uint64_t)buf[5] << 40)
+         | ((uint64_t)buf[6] << 48)
+         | ((uint64_t)buf[7] << 56);
+    return true;
+}
+
+#define DOCTOR_GGUF_MAGIC 0x46554747u /* "GGUF" little-endian; matches
+                                        DS4_GGUF_MAGIC in ds4.c. */
+#define DOCTOR_GGUF_VERSION 3u
+
+static doctor_check doctor_check_model(const char *model_path, int timeout_ms) {
+    (void)timeout_ms; /* timeout-bounded read lands in U5 */
+    doctor_check c = {0};
+    c.id = "model";
+    c.title = "Model file integrity";
+    c.status = DOCTOR_OK;
+
+    if (model_path == NULL) {
+        c.status = DOCTOR_SKIP;
+        snprintf(c.message, sizeof(c.message),
+                 "no model path provided (use -m FILE or DS4_GGUF)");
+        return c;
+    }
+
+    FILE *fp = fopen(model_path, "rb");
+    if (!fp) {
+        c.status = DOCTOR_FAIL;
+        snprintf(c.message, sizeof(c.message),
+                 "cannot open %s", model_path);
+        return c;
+    }
+
+    struct stat st;
+    if (fstat(fileno(fp), &st) != 0) {
+        fclose(fp);
+        c.status = DOCTOR_FAIL;
+        snprintf(c.message, sizeof(c.message),
+                 "cannot stat %s", model_path);
+        return c;
+    }
+
+    uint32_t magic = 0;
+    if (!read_u32_le(fp, &magic)) {
+        fclose(fp);
+        c.status = DOCTOR_FAIL;
+        snprintf(c.message, sizeof(c.message),
+                 "%s: header too short to read magic (< 4 bytes)", model_path);
+        return c;
+    }
+
+    if (magic != DOCTOR_GGUF_MAGIC) {
+        fclose(fp);
+        c.status = DOCTOR_FAIL;
+        snprintf(c.message, sizeof(c.message),
+                 "%s: bad magic 0x%08x (expected GGUF)", model_path, magic);
+        return c;
+    }
+
+    uint32_t version = 0;
+    if (!read_u32_le(fp, &version)) {
+        fclose(fp);
+        c.status = DOCTOR_FAIL;
+        snprintf(c.message, sizeof(c.message),
+                 "%s: header truncated at version field", model_path);
+        return c;
+    }
+
+    if (version != DOCTOR_GGUF_VERSION) {
+        fclose(fp);
+        c.status = DOCTOR_FAIL;
+        snprintf(c.message, sizeof(c.message),
+                 "%s: unsupported GGUF version %u (expected %u)",
+                 model_path, version, DOCTOR_GGUF_VERSION);
+        return c;
+    }
+
+    uint64_t n_tensors = 0;
+    if (!read_u64_le(fp, &n_tensors)) {
+        fclose(fp);
+        c.status = DOCTOR_FAIL;
+        snprintf(c.message, sizeof(c.message),
+                 "%s: header truncated at tensor count", model_path);
+        return c;
+    }
+
+    uint64_t n_kv = 0;
+    if (!read_u64_le(fp, &n_kv)) {
+        fclose(fp);
+        c.status = DOCTOR_FAIL;
+        snprintf(c.message, sizeof(c.message),
+                 "%s: header truncated at metadata kv count", model_path);
+        return c;
+    }
+
+    fclose(fp);
+
+    double gib = (double)st.st_size / (1024.0 * 1024.0 * 1024.0);
+    snprintf(c.message, sizeof(c.message),
+             "%.2f GiB, v%u, %llu tensors, %llu metadata kvs",
+             gib, version, (unsigned long long)n_tensors,
+             (unsigned long long)n_kv);
     return c;
 }
 
@@ -151,12 +277,19 @@ static void print_human(const doctor_check *checks, size_t n, bool color) {
 int main(int argc, char **argv) {
     doctor_config cfg = parse_options(argc, argv);
 
-    /* U2: backend check only. U3/U4 add model + env checks. U5 wires the
-     * final JSON renderer + exit-code policy across all of them. */
-    doctor_check checks[1];
-    uint64_t t0 = now_ms();
+    /* U2: backend check. U3: model integrity check.
+     * U4 (port / memory / kv-disk) and U5 (final render + exit codes)
+     * are still pending. */
+    doctor_check checks[2];
+    uint64_t t0;
+
+    t0 = now_ms();
     checks[0] = doctor_check_backend();
     checks[0].duration_ms = (int)(now_ms() - t0);
+
+    t0 = now_ms();
+    checks[1] = doctor_check_model(cfg.model_path, cfg.timeout_ms);
+    checks[1].duration_ms = (int)(now_ms() - t0);
 
     if (cfg.json_output) {
         /* JSON renderer lands in U5; keep the empty array alive for now. */
@@ -164,6 +297,6 @@ int main(int argc, char **argv) {
         return 0;
     }
     print_human(checks, sizeof(checks) / sizeof(checks[0]), cfg.color_output);
-    puts("ds4-doctor: skeleton — implementation pending in U3..U5");
+    puts("ds4-doctor: skeleton — implementation pending in U4..U5");
     return 0;
 }
