@@ -11,7 +11,7 @@
  * U1 is the skeleton: parse options, dispatch --help, print a placeholder.
  * U2 ships the backend compile check.
  * U3 ships the model file integrity check.
- * U4 (port / memory / kv-disk) follows.
+ * U4 ships the port / memory / kv-disk checks.
  * JSON / human output and exit-code policy land in U5.
  */
 
@@ -21,8 +21,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <errno.h>
 #include <time.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 typedef struct {
     const char *model_path;
@@ -265,6 +272,152 @@ static doctor_check doctor_check_model(const char *model_path, int timeout_ms) {
     return c;
 }
 
+/* Default port ds4-server binds to when --port is not provided. Mirrors
+ * ds4_server.c; if the project changes the default, update both. */
+#define DOCTOR_DEFAULT_PORT 8000
+#define DOCTOR_DEFAULT_HOST "127.0.0.1"
+
+static doctor_check doctor_check_port(void) {
+    doctor_check c = {0};
+    c.id = "port";
+    c.title = "Default server port";
+    c.status = DOCTOR_OK;
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        c.status = DOCTOR_FAIL;
+        snprintf(c.message, sizeof(c.message),
+                 "cannot create socket: %s", strerror(errno));
+        return c;
+    }
+
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)DOCTOR_DEFAULT_PORT);
+    if (inet_pton(AF_INET, DOCTOR_DEFAULT_HOST, &sa.sin_addr) != 1) {
+        close(fd);
+        c.status = DOCTOR_FAIL;
+        snprintf(c.message, sizeof(c.message),
+                 "inet_pton failed for %s", DOCTOR_DEFAULT_HOST);
+        return c;
+    }
+
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        int e = errno;
+        close(fd);
+        if (e == EADDRINUSE) {
+            c.status = DOCTOR_WARN;
+            snprintf(c.message, sizeof(c.message),
+                     "port %d is in use (ds4-server may already be running)",
+                     DOCTOR_DEFAULT_PORT);
+            return c;
+        }
+        if (e == EACCES) {
+            c.status = DOCTOR_WARN;
+            snprintf(c.message, sizeof(c.message),
+                     "port %d requires elevated privileges",
+                     DOCTOR_DEFAULT_PORT);
+            return c;
+        }
+        c.status = DOCTOR_FAIL;
+        snprintf(c.message, sizeof(c.message),
+                 "bind to %s:%d failed: %s",
+                 DOCTOR_DEFAULT_HOST, DOCTOR_DEFAULT_PORT, strerror(e));
+        return c;
+    }
+
+    close(fd);
+    snprintf(c.message, sizeof(c.message),
+             "%s:%d bindable (default for ds4-server)",
+             DOCTOR_DEFAULT_HOST, DOCTOR_DEFAULT_PORT);
+    return c;
+}
+
+#define DOCTOR_MEM_WARN_GIB 8.0
+#define DOCTOR_MEM_FAIL_GIB 4.0
+
+static doctor_check doctor_check_memory(void) {
+    doctor_check c = {0};
+    c.id = "memory";
+    c.title = "Total system RAM";
+    c.status = DOCTOR_OK;
+
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (pages <= 0 || page_size <= 0) {
+        c.status = DOCTOR_FAIL;
+        snprintf(c.message, sizeof(c.message),
+                 "sysconf(_SC_PHYS_PAGES/_SC_PAGESIZE) unavailable");
+        return c;
+    }
+
+    double gib = (double)pages * (double)page_size
+               / (1024.0 * 1024.0 * 1024.0);
+
+    if (gib < DOCTOR_MEM_FAIL_GIB) {
+        c.status = DOCTOR_FAIL;
+        snprintf(c.message, sizeof(c.message),
+                 "%.2f GiB total RAM (below %.0f GiB minimum)",
+                 gib, DOCTOR_MEM_FAIL_GIB);
+        return c;
+    }
+    if (gib < DOCTOR_MEM_WARN_GIB) {
+        c.status = DOCTOR_WARN;
+        snprintf(c.message, sizeof(c.message),
+                 "%.2f GiB total RAM (below %.0f GiB recommended)",
+                 gib, DOCTOR_MEM_WARN_GIB);
+        return c;
+    }
+    snprintf(c.message, sizeof(c.message),
+             "%.2f GiB total RAM", gib);
+    return c;
+}
+
+static doctor_check doctor_check_kv_disk(const char *kv_disk_dir) {
+    doctor_check c = {0};
+    c.id = "kv-disk";
+    c.title = "KV-disk directory";
+    c.status = DOCTOR_OK;
+
+    if (kv_disk_dir == NULL) {
+        c.status = DOCTOR_SKIP;
+        snprintf(c.message, sizeof(c.message),
+                 "no --kv-disk-dir provided");
+        return c;
+    }
+
+    struct stat st;
+    if (stat(kv_disk_dir, &st) != 0) {
+        int e = errno;
+        c.status = DOCTOR_WARN;
+        snprintf(c.message, sizeof(c.message),
+                 "%s: %s (server will create it on demand)",
+                 kv_disk_dir, strerror(e));
+        return c;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        c.status = DOCTOR_FAIL;
+        snprintf(c.message, sizeof(c.message),
+                 "%s: exists but is not a directory", kv_disk_dir);
+        return c;
+    }
+
+    struct statvfs vfs;
+    double free_gib = 0.0;
+    if (statvfs(kv_disk_dir, &vfs) == 0 && vfs.f_frsize > 0) {
+        free_gib = (double)vfs.f_bavail * (double)vfs.f_frsize
+                 / (1024.0 * 1024.0 * 1024.0);
+    }
+
+    snprintf(c.message, sizeof(c.message),
+             "%s: %.2f GiB free", kv_disk_dir, free_gib);
+    return c;
+}
+
 static void print_human(const doctor_check *checks, size_t n, bool color) {
     (void)color; /* color rendering lands in U5 */
     for (size_t i = 0; i < n; i++) {
@@ -277,10 +430,9 @@ static void print_human(const doctor_check *checks, size_t n, bool color) {
 int main(int argc, char **argv) {
     doctor_config cfg = parse_options(argc, argv);
 
-    /* U2: backend check. U3: model integrity check.
-     * U4 (port / memory / kv-disk) and U5 (final render + exit codes)
-     * are still pending. */
-    doctor_check checks[2];
+    /* U2: backend. U3: model. U4: port, memory, kv-disk.
+     * U5 (final JSON renderer + exit-code policy) is still pending. */
+    doctor_check checks[5];
     uint64_t t0;
 
     t0 = now_ms();
@@ -291,12 +443,24 @@ int main(int argc, char **argv) {
     checks[1] = doctor_check_model(cfg.model_path, cfg.timeout_ms);
     checks[1].duration_ms = (int)(now_ms() - t0);
 
+    t0 = now_ms();
+    checks[2] = doctor_check_port();
+    checks[2].duration_ms = (int)(now_ms() - t0);
+
+    t0 = now_ms();
+    checks[3] = doctor_check_memory();
+    checks[3].duration_ms = (int)(now_ms() - t0);
+
+    t0 = now_ms();
+    checks[4] = doctor_check_kv_disk(cfg.kv_disk_dir);
+    checks[4].duration_ms = (int)(now_ms() - t0);
+
     if (cfg.json_output) {
         /* JSON renderer lands in U5; keep the empty array alive for now. */
         fputs("{\"status\":\"ok\",\"checks\":[]}\n", stdout);
         return 0;
     }
     print_human(checks, sizeof(checks) / sizeof(checks[0]), cfg.color_output);
-    puts("ds4-doctor: skeleton — implementation pending in U4..U5");
+    puts("ds4-doctor: skeleton — implementation pending in U5");
     return 0;
 }
