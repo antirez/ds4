@@ -8,11 +8,12 @@
  * probe functions already do, no network calls, no filesystem writes.
  * Intended to be safe to run in CI without GPU hardware.
  *
- * U1 is the skeleton: parse options, dispatch --help, print a placeholder.
- * U2 ships the backend compile check.
- * U3 ships the model file integrity check.
- * U4 ships the port / memory / kv-disk checks.
- * JSON / human output and exit-code policy land in U5.
+ * Units:
+ *   U1  skeleton + help dispatch + option parsing
+ *   U2  doctor_check_backend (compile-time backend identity)
+ *   U3  doctor_check_model   (GGUF v3 header walk)
+ *   U4  doctor_check_port, doctor_check_memory, doctor_check_kv_disk
+ *   U5  print_json, print_human, exit-code policy
  */
 
 #include <stdbool.h>
@@ -91,7 +92,10 @@ static doctor_config parse_options(int argc, char **argv) {
  *   WARN  check ran but flagged a soft problem
  *   FAIL  check ran and found a hard problem
  *
- * Exit-code mapping lands in U5.
+ * Exit-code mapping (per R4):
+ *   0 = OK or SKIP only
+ *   1 = at least one WARN, no FAIL
+ *   2 = at least one FAIL
  */
 typedef enum {
     DOCTOR_OK,
@@ -124,7 +128,7 @@ static uint64_t now_ms(void) {
     return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
 }
 
-/* Forward declarations for checks added in U3 and U4. */
+/* Forward declarations for the five checks. */
 static doctor_check doctor_check_backend(void);
 static doctor_check doctor_check_model(const char *model_path, int timeout_ms);
 static doctor_check doctor_check_port(void);
@@ -179,7 +183,8 @@ static bool read_u64_le(FILE *fp, uint64_t *out) {
 #define DOCTOR_GGUF_VERSION 3u
 
 static doctor_check doctor_check_model(const char *model_path, int timeout_ms) {
-    (void)timeout_ms; /* timeout-bounded read lands in U5 */
+    (void)timeout_ms; /* 24-byte header read is bounded by syscall latency;
+                         no async timeout needed at this scale */
     doctor_check c = {0};
     c.id = "model";
     c.title = "Model file integrity";
@@ -418,49 +423,177 @@ static doctor_check doctor_check_kv_disk(const char *kv_disk_dir) {
     return c;
 }
 
-static void print_human(const doctor_check *checks, size_t n, bool color) {
-    (void)color; /* color rendering lands in U5 */
+/* Aggregate counts: drives both the JSON summary field, the human
+ * "Status: ..." footer line, and the exit-code policy. */
+typedef struct {
+    int ok;
+    int warn;
+    int fail;
+    int skip;
+    doctor_status worst; /* highest severity observed */
+} doctor_summary;
+
+static void doctor_summary_update(doctor_summary *s, doctor_status st) {
+    switch (st) {
+    case DOCTOR_OK:   s->ok++;   break;
+    case DOCTOR_WARN: s->warn++; break;
+    case DOCTOR_FAIL: s->fail++; break;
+    case DOCTOR_SKIP: s->skip++; break;
+    }
+    if ((int)st > (int)s->worst) s->worst = st;
+}
+
+static doctor_status doctor_summary_status(const doctor_summary *s) {
+    if (s->fail > 0) return DOCTOR_FAIL;
+    if (s->warn > 0) return DOCTOR_WARN;
+    return DOCTOR_OK;
+}
+
+static const char *doctor_summary_name(const doctor_summary *s) {
+    return doctor_status_name(doctor_summary_status(s));
+}
+
+/* Minimal JSON string escaper. Every emitted message comes from
+ * known C literals or snprintf into fixed-size buffers with %s %d %u %f
+ * format specifiers, so the only character we expect to escape is the
+ * double quote and the backslash. */
+static void print_json_escaped(FILE *fp, const char *s) {
+    fputc('"', fp);
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        switch (c) {
+        case '"':  fputs("\\\"", fp); break;
+        case '\\': fputs("\\\\", fp); break;
+        case '\n': fputs("\\n", fp);  break;
+        case '\r': fputs("\\r", fp);  break;
+        case '\t': fputs("\\t", fp);  break;
+        default:
+            if (c < 0x20) fprintf(fp, "\\u%04x", c);
+            else fputc((char)c, fp);
+        }
+    }
+    fputc('"', fp);
+}
+
+static void print_json(const doctor_check *checks, size_t n,
+                       const doctor_summary *s) {
+    fputs("{\"status\":", stdout);
+    print_json_escaped(stdout, doctor_summary_name(s));
+    fprintf(stdout,
+            ",\"summary\":\"%d checks: %d ok, %d warn, %d fail, %d skip\","
+            "\"checks\":[",
+            (int)n, s->ok, s->warn, s->fail, s->skip);
     for (size_t i = 0; i < n; i++) {
         const doctor_check *c = &checks[i];
-        printf("[%s] %s: %s\n",
-               doctor_status_name(c->status), c->id, c->message);
+        if (i) fputc(',', stdout);
+        fputc('{', stdout);
+        fputs("\"id\":", stdout);          print_json_escaped(stdout, c->id ? c->id : "");
+        fputs(",\"title\":", stdout);      print_json_escaped(stdout, c->title ? c->title : "");
+        fputs(",\"status\":", stdout);     print_json_escaped(stdout, doctor_status_name(c->status));
+        fprintf(stdout,
+                ",\"duration_ms\":%d,\"message\":",
+                c->duration_ms < 0 ? 0 : c->duration_ms);
+        print_json_escaped(stdout, c->message);
+        fputc('}', stdout);
     }
+    fputs("]}\n", stdout);
+}
+
+/* ANSI color codes (used when --color is requested or stdout is a TTY
+ * and cfg.color_output is unset). Color output is intentionally minimal:
+ * just the status column. */
+static const char *status_color(doctor_status st, bool color) {
+    if (!color) return "";
+    switch (st) {
+    case DOCTOR_OK:   return "\x1b[32m"; /* green */
+    case DOCTOR_WARN: return "\x1b[33m"; /* yellow */
+    case DOCTOR_FAIL: return "\x1b[31m"; /* red */
+    case DOCTOR_SKIP: return "\x1b[90m"; /* grey */
+    }
+    return "";
+}
+
+static const char *color_off(bool color) { return color ? "\x1b[0m" : ""; }
+
+static void print_human(const doctor_check *checks, size_t n,
+                        const doctor_summary *s, bool color) {
+    printf("%sds4-doctor%s\n\n", color ? "\x1b[1m" : "", color_off(color));
+    printf("%-9s %-5s %-7s %s\n",
+           "ID", "STATE", "TIME", "MESSAGE");
+    for (size_t i = 0; i < n; i++) {
+        const doctor_check *c = &checks[i];
+        char tbuf[16];
+        if (c->duration_ms < 0) snprintf(tbuf, sizeof(tbuf), "0ms");
+        else if (c->duration_ms >= 1000)
+            snprintf(tbuf, sizeof(tbuf), "1s+");
+        else snprintf(tbuf, sizeof(tbuf), "%dms", c->duration_ms);
+        printf("%-9s %s%-5s%s %-7s %s\n",
+               c->id ? c->id : "",
+               status_color(c->status, color),
+               doctor_status_name(c->status),
+               color_off(color),
+               tbuf,
+               c->message);
+    }
+    printf("\nStatus: %s%s%s (%d checks: %d ok, %d warn, %d fail, %d skip)\n",
+           status_color(doctor_summary_status(s), color),
+           doctor_summary_name(s),
+           color_off(color),
+           (int)n, s->ok, s->warn, s->fail, s->skip);
 }
 
 int main(int argc, char **argv) {
     doctor_config cfg = parse_options(argc, argv);
 
-    /* U2: backend. U3: model. U4: port, memory, kv-disk.
-     * U5 (final JSON renderer + exit-code policy) is still pending. */
     doctor_check checks[5];
+    doctor_summary summary = {0};
+    summary.worst = DOCTOR_OK;
     uint64_t t0;
 
     t0 = now_ms();
     checks[0] = doctor_check_backend();
     checks[0].duration_ms = (int)(now_ms() - t0);
+    doctor_summary_update(&summary, checks[0].status);
 
     t0 = now_ms();
     checks[1] = doctor_check_model(cfg.model_path, cfg.timeout_ms);
     checks[1].duration_ms = (int)(now_ms() - t0);
+    doctor_summary_update(&summary, checks[1].status);
 
     t0 = now_ms();
     checks[2] = doctor_check_port();
     checks[2].duration_ms = (int)(now_ms() - t0);
+    doctor_summary_update(&summary, checks[2].status);
 
     t0 = now_ms();
     checks[3] = doctor_check_memory();
     checks[3].duration_ms = (int)(now_ms() - t0);
+    doctor_summary_update(&summary, checks[3].status);
 
     t0 = now_ms();
     checks[4] = doctor_check_kv_disk(cfg.kv_disk_dir);
     checks[4].duration_ms = (int)(now_ms() - t0);
+    doctor_summary_update(&summary, checks[4].status);
+
+    size_t n = sizeof(checks) / sizeof(checks[0]);
 
     if (cfg.json_output) {
-        /* JSON renderer lands in U5; keep the empty array alive for now. */
-        fputs("{\"status\":\"ok\",\"checks\":[]}\n", stdout);
-        return 0;
+        print_json(checks, n, &summary);
+    } else {
+        bool color = cfg.color_output || isatty(fileno(stdout));
+        print_human(checks, n, &summary, color);
     }
-    print_human(checks, sizeof(checks) / sizeof(checks[0]), cfg.color_output);
-    puts("ds4-doctor: skeleton — implementation pending in U5");
+
+    /* Exit-code policy (per R4 in the plan):
+     *   0 = no FAIL, no WARN  (everything OK or SKIP)
+     *   1 = at least one WARN, no FAIL
+     *   2 = at least one FAIL
+     */
+    switch (doctor_summary_status(&summary)) {
+    case DOCTOR_OK:   return 0;
+    case DOCTOR_WARN: return 1;
+    case DOCTOR_FAIL: return 2;
+    case DOCTOR_SKIP: return 0;
+    }
     return 0;
 }
