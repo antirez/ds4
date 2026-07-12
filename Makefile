@@ -245,7 +245,7 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
-test: ds4_test ds4_agent_test ds4-eval q4k-dot-test
+test: ds4_test ds4_agent_test ds4-eval ds4-doctor q4k-dot-test
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test

@@ -4,6 +4,8 @@
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
 #include <math.h>
+#endif
+#include <sys/wait.h>
 
 static ds4_engine *test_engine_fast;
 static ds4_engine *test_engine_quality;
@@ -2180,6 +2182,125 @@ static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
 
+/* ds4-doctor is a separate binary; tests shell out to it via popen().
+ * The default binary path is "./ds4-doctor" relative to the test CWD;
+ * DS4_TEST_DOCTOR_BIN overrides it (handy for cross-build CI). */
+static const char *test_doctor_bin(void) {
+    const char *env = getenv("DS4_TEST_DOCTOR_BIN");
+    return (env && env[0]) ? env : "./ds4-doctor";
+}
+
+/* Run `bin <args>` and capture stdout in `out` (size `out_cap`). Returns
+ * the child exit status, or -1 on popen failure. Stderr is left for the
+ * child to surface — the test relies on the JSON output, not on stderr. */
+static int test_doctor_run(const char *bin, const char *args, char *out,
+                           size_t out_cap) {
+    if (out_cap == 0) return -1;
+    out[0] = '\0';
+    char cmd[1024];
+    int n = snprintf(cmd, sizeof(cmd), "%s %s 2>/dev/null", bin, args);
+    if (n < 0 || (size_t)n >= sizeof(cmd)) return -1;
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return -1;
+    size_t got = 0;
+    while (got + 1 < out_cap) {
+        size_t r = fread(out + got, 1, out_cap - 1 - got, fp);
+        if (r == 0) break;
+        got += r;
+    }
+    out[got] = '\0';
+    int status = pclose(fp);
+    if (status == -1) return -1;
+    /* pclose returns the wait(2) status; the child's exit code is in the
+     * upper byte for a normal exit. */
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return -1;
+}
+
+/* Write a temp file with the given bytes; returns the path on success or
+ * NULL on failure. The path uses mkstemp so it's race-safe across CI. */
+static const char *test_doctor_write_temp(const uint8_t *bytes, size_t n_bytes,
+                                         char *path_buf, size_t path_cap) {
+    if (path_cap < 32) return NULL;
+    strcpy(path_buf, "/tmp/ds4_test_doctor_XXXXXX");
+    int fd = mkstemp(path_buf);
+    if (fd < 0) return NULL;
+    size_t written = 0;
+    while (written < n_bytes) {
+        ssize_t w = write(fd, bytes + written, n_bytes - written);
+        if (w <= 0) { close(fd); unlink(path_buf); return NULL; }
+        written += (size_t)w;
+    }
+    close(fd);
+    return path_buf;
+}
+
+static void test_doctor_json_shape(void) {
+    char out[8192];
+    int rc = test_doctor_run(test_doctor_bin(), "--json", out, sizeof(out));
+    TEST_ASSERT(rc >= 0);
+    TEST_ASSERT(out[0] == '{');
+    TEST_ASSERT(strstr(out, "\"status\":\"ok\"") ||
+                strstr(out, "\"status\":\"warn\"") ||
+                strstr(out, "\"status\":\"fail\""));
+    TEST_ASSERT(strstr(out, "\"id\":\"backend\""));
+    TEST_ASSERT(strstr(out, "\"id\":\"model\""));
+    TEST_ASSERT(strstr(out, "\"id\":\"port\""));
+    TEST_ASSERT(strstr(out, "\"id\":\"memory\""));
+    TEST_ASSERT(strstr(out, "\"id\":\"kv-disk\""));
+}
+
+static void test_doctor_bad_model_file(void) {
+    char path_buf[64];
+    const char *path = test_doctor_write_temp(
+        (const uint8_t *)"this is not a gguf file at all",
+        30, path_buf, sizeof(path_buf));
+    TEST_ASSERT(path != NULL);
+
+    char args[128];
+    snprintf(args, sizeof(args), "-m %s --json", path);
+    char out[8192];
+    int rc = test_doctor_run(test_doctor_bin(), args, out, sizeof(out));
+    TEST_ASSERT(rc >= 0);
+    /* Bad model -> at least one FAIL, so rc must be 2 per R4. */
+    TEST_ASSERT(rc == 2);
+    TEST_ASSERT(strstr(out, "\"id\":\"model\""));
+    TEST_ASSERT(strstr(out, "\"status\":\"fail\""));
+
+    unlink(path);
+}
+
+static void test_doctor_good_model_header(void) {
+    /* 24-byte GGUF v3 header: magic + version=3 + n_tensors=1 + n_kv=0. */
+    uint8_t hdr[24] = {0};
+    hdr[0] = 'G'; hdr[1] = 'G'; hdr[2] = 'U'; hdr[3] = 'F';
+    hdr[4] = 3; /* version = 3 (LE u32) */
+    hdr[8] = 1; /* n_tensors = 1 */
+    char path_buf[64];
+    const char *path = test_doctor_write_temp(hdr, sizeof(hdr),
+                                              path_buf, sizeof(path_buf));
+    TEST_ASSERT(path != NULL);
+
+    char args[128];
+    snprintf(args, sizeof(args), "-m %s --json", path);
+    char out[8192];
+    int rc = test_doctor_run(test_doctor_bin(), args, out, sizeof(out));
+    TEST_ASSERT(rc >= 0);
+    /* 24 valid header bytes -> model check is OK, and nothing else fails
+     * by default -> overall status must be ok. */
+    TEST_ASSERT(rc == 0);
+    TEST_ASSERT(strstr(out, "\"id\":\"model\",\"title\":\"Model file integrity\""));
+    TEST_ASSERT(strstr(out, "\"status\":\"ok\""));
+
+    unlink(path);
+}
+
+static void test_doctor_group(void) {
+    test_doctor_json_shape();
+    test_doctor_bad_model_file();
+    test_doctor_good_model_header();
+}
+
 typedef void (*test_fn)(void);
 
 typedef struct {
@@ -2204,6 +2325,7 @@ static const ds4_test_entry test_entries[] = {
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
+    {"--doctor", "doctor", "ds4-doctor JSON shape, bad/valid GGUF checks, exit codes", test_doctor_group},
 };
 
 static void test_print_help(const char *prog) {
