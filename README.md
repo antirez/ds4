@@ -667,6 +667,45 @@ DeepSeek V4 Flash still solve a representative mix of hard science, broad
 knowledge, exact math, and security-code problems while using the same inference
 path users run?
 
+## Self-Diagnostics
+
+`ds4-doctor` is a small read-only diagnostic command that checks the local
+installation before a real inference run. It does not load the model, does not
+touch the network, and does not write to disk. The default run walks five
+checks: the compile-time backend (`Metal` / `CUDA` / `ROCm` / `CPU`), the GGUF
+header of the model file you point it at, whether the default server port
+(`127.0.0.1:8000`) is bindable, total system RAM, and the optional KV-disk
+directory. It is safe to run inside CI on machines without a GPU.
+
+```sh
+./ds4-doctor
+./ds4-doctor -m ./ds4flash.gguf
+./ds4-doctor -m ./ds4flash.gguf --kv-disk-dir /tmp/ds4-kv --json
+```
+
+Each check produces one of four states: `ok`, `warn`, `fail`, `skip` (a check
+that did not run, e.g. the model path was not given). Human-readable output
+includes an ANSI-coloured status column when stdout is a TTY; pass `--color`
+to force it on. `--json` emits one self-describing line with a top-level
+`status`, a `summary` counter, and a `checks` array:
+
+```json
+{"status":"ok","summary":"5 checks: 4 ok, 0 warn, 0 fail, 1 skip","checks":[
+  {"id":"backend","title":"Backend compile","status":"ok","duration_ms":0,"message":"Metal backend compiled in (Apple Silicon)"},
+  {"id":"model","title":"Model file integrity","status":"ok","duration_ms":3,"message":"81.32 GiB, v3, 715 tensors, 24 metadata kvs"},
+  {"id":"port","title":"Default server port","status":"ok","duration_ms":0,"message":"127.0.0.1:8000 bindable (default for ds4-server)"},
+  {"id":"memory","title":"Total system RAM","status":"ok","duration_ms":0,"message":"128.00 GiB total RAM"},
+  {"id":"kv-disk","title":"KV-disk directory","status":"skip","duration_ms":0,"message":"no --kv-disk-dir provided"}
+]}
+```
+
+Exit codes match the worst severity, so scripts can branch without parsing
+output: `0` if every check is `ok` or `skip`, `1` if at least one check is
+`warn` and none is `fail`, `2` if any check is `fail`. `--timeout N` bounds
+individual checks to `N` milliseconds (default 5000, max 600000).
+
+Run `./ds4-doctor --help` for the full option list.
+
 ## CLI
 
 One-shot prompt:
