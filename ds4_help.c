@@ -107,6 +107,7 @@ static const char *tool_name(ds4_help_tool tool) {
     case DS4_HELP_AGENT: return "ds4-agent";
     case DS4_HELP_BENCH: return "ds4-bench";
     case DS4_HELP_EVAL: return "ds4-eval";
+    case DS4_HELP_DOCTOR: return "ds4-doctor";
     }
     return "ds4";
 }
@@ -123,6 +124,8 @@ static const char *tool_usage(ds4_help_tool tool) {
         return "Usage: ds4-bench (--prompt-file FILE | --chat-prompt-file FILE) [options]";
     case DS4_HELP_EVAL:
         return "Usage: ds4-eval [options]";
+    case DS4_HELP_DOCTOR:
+        return "Usage: ds4-doctor [options]";
     }
     return "Usage: ds4 [options]";
 }
@@ -139,6 +142,8 @@ static const char *tool_summary(ds4_help_tool tool) {
         return "Measure prefill, decode, context growth, and KV-cache size across repeatable context frontiers.";
     case DS4_HELP_EVAL:
         return "Run the built-in reasoning, math, science, and security evaluation harness with a live terminal UI.";
+    case DS4_HELP_DOCTOR:
+        return "Run read-only self-diagnostics: backend compile, model file integrity, and environment sanity.";
     }
     return "";
 }
@@ -369,6 +374,18 @@ static void print_eval_specific(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
 }
 
+static void print_doctor_specific(FILE *fp, const help_colors *c) {
+    title(fp, c, "Doctor Checks");
+    para(fp, c, "ds4-doctor runs read-only self-diagnostics against the local installation. No GPU loads beyond what the probe functions already do, no network calls, no filesystem writes. Intended to be safe in CI without GPU hardware.");
+    fputc('\n', fp);
+    opt(fp, c, "--json", "Emit a machine-readable JSON report on stdout.");
+    opt(fp, c, "--color", "Force colored output even when stdout is not a TTY.");
+    opt(fp, c, "-m, --model FILE", "GGUF model to validate. Default: ds4flash.gguf");
+    opt(fp, c, "--kv-disk-dir DIR", "KV disk directory to stat. Default: unset (skip disk check).");
+    opt(fp, c, "--timeout N", "Per-check timeout in ms. 0..600000. Default: 5000");
+    fputc('\n', fp);
+}
+
 static bool tool_has_topic(ds4_help_tool tool, const char *topic) {
     if (!topic) return true;
     if (streq(topic, "all")) return true;
@@ -388,6 +405,8 @@ static bool tool_has_topic(ds4_help_tool tool, const char *topic) {
         return streq(topic, "benchmark");
     case DS4_HELP_EVAL:
         return streq(topic, "evaluation");
+    case DS4_HELP_DOCTOR:
+        return false;
     }
     return false;
 }
@@ -449,6 +468,9 @@ static void print_examples(FILE *fp, const help_colors *c, ds4_help_tool tool, c
         } else if (tool == DS4_HELP_EVAL) {
             opt(fp, c, "eval", "./ds4-eval --questions 10 --ctx 100000");
             opt(fp, c, "CPU debug", "./ds4-eval --cpu --questions 1 --tokens 32");
+        } else if (tool == DS4_HELP_DOCTOR) {
+            opt(fp, c, "human", "./ds4-doctor");
+            opt(fp, c, "json", "./ds4-doctor --json | jq .status");
         } else {
             opt(fp, c, "Metal", "./ds4 -m ds4flash.gguf --metal -c 100000");
             opt(fp, c, "quiet thermals", "./ds4 -p \"Summarize README\" --power 50");
@@ -467,6 +489,10 @@ static void print_examples(FILE *fp, const help_colors *c, ds4_help_tool tool, c
     } else if (tool == DS4_HELP_EVAL || topic_is(topic, "evaluation")) {
         opt(fp, c, "first 10", "./ds4-eval --questions 10 --trace eval.trace");
         opt(fp, c, "plain", "./ds4-eval --plain --nothink --tokens 512");
+    } else if (tool == DS4_HELP_DOCTOR) {
+        opt(fp, c, "human", "./ds4-doctor");
+        opt(fp, c, "json", "./ds4-doctor --json");
+        opt(fp, c, "model check", "./ds4-doctor -m /path/to/model.gguf");
     } else {
         opt(fp, c, "chat", "./ds4");
         opt(fp, c, "one shot", "./ds4 -p \"Explain mmap in C\"");
@@ -495,6 +521,8 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
             print_bench_specific(fp, c);
         } else if (tool == DS4_HELP_EVAL) {
             print_eval_specific(fp, c);
+        } else if (tool == DS4_HELP_DOCTOR) {
+            print_doctor_specific(fp, c);
         }
         return;
     }
@@ -536,6 +564,8 @@ static void print_default(FILE *fp, const help_colors *c, ds4_help_tool tool) {
         print_bench_specific(fp, c);
     } else if (tool == DS4_HELP_EVAL) {
         print_eval_specific(fp, c);
+    } else if (tool == DS4_HELP_DOCTOR) {
+        print_doctor_specific(fp, c);
     }
 }
 

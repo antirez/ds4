@@ -9,6 +9,7 @@ typedef enum {
     DS4_HELP_AGENT,
     DS4_HELP_BENCH,
     DS4_HELP_EVAL,
+    DS4_HELP_DOCTOR,
 } ds4_help_tool;
 
 void ds4_help_print(FILE *fp, ds4_help_tool tool, const char *topic);
