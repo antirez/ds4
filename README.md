@@ -896,12 +896,11 @@ For **Pi**, add a provider to `~/.pi/agent/models.json`:
           "name": "DeepSeek V4 Flash (ds4.c local)",
           "reasoning": true,
           "thinkingLevelMap": {
-            "off": null,
-            "minimal": "low",
-            "low": "low",
-            "medium": "medium",
+            "minimal": null,
+            "low": null,
+            "medium": null,
             "high": "high",
-            "xhigh": "xhigh"
+            "max": "max"
           },
           "input": ["text"],
           "contextWindow": 100000,
@@ -924,7 +923,8 @@ Optionally make it the default Pi model in `~/.pi/agent/settings.json`:
 ```json
 {
   "defaultProvider": "ds4",
-  "defaultModel": "deepseek-v4-flash"
+  "defaultModel": "deepseek-v4-flash",
+  "defaultThinkingLevel": "high"
 }
 ```
 
