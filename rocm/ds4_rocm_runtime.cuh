@@ -970,7 +970,22 @@ static int cuda_stream_resident_evict_one(
 }
 
 static uint64_t cuda_stream_resident_free_reserve_bytes(void) {
-    return 16ull * 1024ull * 1024ull * 1024ull;
+    /* Default 16 GiB: tuned for unified-memory APUs (Strix Halo) where the
+     * OS shares the pool. On discrete GPUs (e.g. 32 GiB RDNA4 cards) this
+     * would waste half the VRAM, so allow an override in MiB via
+     * DS4_ROCM_FREE_RESERVE_MB. */
+    static uint64_t cached_reserve = 0;
+    static int reserve_initialized = 0;
+    if (!reserve_initialized) {
+        const char *env = getenv("DS4_ROCM_FREE_RESERVE_MB");
+        if (env && *env) {
+            cached_reserve = strtoull(env, NULL, 10) * 1024ull * 1024ull;
+        } else {
+            cached_reserve = 16ull * 1024ull * 1024ull * 1024ull;
+        }
+        reserve_initialized = 1;
+    }
+    return cached_reserve;
 }
 
 static int cuda_stream_resident_make_room(
