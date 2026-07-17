@@ -973,6 +973,27 @@ void dequantize_q8_0(device const block_q8_0 *xb, short il, thread type4x4 & reg
     reg = (type4x4) reg_f;
 }
 
+/*
+ * Bit-identical twin of dequantize_q8_0 for the MPP staging loop: same
+ * half(float(qs[i]) * d) per element, but the 16 consecutive int8 lanes are
+ * fetched as eight aligned 16-bit loads instead of sixteen byte loads.
+ * xb->qs is always 2-byte aligned (block_q8_0.d is a half).
+ */
+void dequantize_q8_0_pairs(device const block_q8_0 *xb, short il, thread half4x4 & reg) {
+    device const ushort *qs16 = (device const ushort *)(xb->qs + 16*il);
+    const float d = xb->d;
+
+    float4x4 reg_f;
+
+    FOR_UNROLL (short i = 0; i < 8; i++) {
+        const ushort u = qs16[i];
+        reg_f[i/2][(i%2)*2 + 0] = ((float)(int8_t)(u & 0xFF)) * d;
+        reg_f[i/2][(i%2)*2 + 1] = ((float)(int8_t)(u >> 8)) * d;
+    }
+
+    reg = (half4x4) reg_f;
+}
+
 template <typename type4>
 void dequantize_q8_0_t4(device const block_q8_0 *xb, short il, thread type4 & reg) {
     device const int8_t * qs = ((device const int8_t *)xb->qs);
@@ -1241,6 +1262,11 @@ template [[host_name("kernel_mul_mm_f16_f32_mpp")]]  kernel mul_mm_mpp_t kernel_
 // aligned F16/Q8_0 prompt matmuls.  The host selects the widest token tile that
 // evenly divides the batch, with 128-token tiles retained after the 64-token
 // retest was neutral or slower.
+//
+// The host dispatch guarantees M % NR0 == 0 and K % NK == 0, so the dequant
+// stage does no bounds work.  The weight tile is double-buffered: the next
+// k-step's dequant overlaps the current cooperative matmul, so the k-loop
+// needs one threadgroup barrier per step instead of two.
 template<
     short NR1,
     typename SA, typename SA_4x4, typename block_q, short nl,
@@ -1274,7 +1300,8 @@ kernel void kernel_mul_mm_mpp_direct_rhs(
     const uint64_t offset0 = (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
 
     threadgroup SA *sa = (threadgroup SA *)shmem;
-    auto tA = tensor(sa, dextents<int32_t, 2>(NK, NR0));
+    auto tA0 = tensor(sa,          dextents<int32_t, 2>(NK, NR0));
+    auto tA1 = tensor(sa + NR0*NK, dextents<int32_t, 2>(NK, NR0));
 
     device T1 *ptrB = (device T1 *)(srcB + args.nb12*i12 + args.nb13*i13);
     const int strideB = args.nb11/sizeof(T1);
@@ -1285,7 +1312,7 @@ kernel void kernel_mul_mm_mpp_direct_rhs(
             matmul2d_descriptor::mode::multiply_accumulate),
         execution_simdgroups<4>> mm;
 
-    auto cT = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+    auto cT = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA0), float>();
 
     #pragma unroll
     for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
@@ -1294,43 +1321,48 @@ kernel void kernel_mul_mm_mpp_direct_rhs(
         }
     }
 
-    for (int loop_k = 0; loop_k < K; loop_k += NK) {
-        for (int work = tiitg; work < NR0*NL; work += NUM_THREADS) {
-            const int row = work/NL;
-            const int k_chunk = work%NL;
+    // NR0*NL/NUM_THREADS 16-value weight chunks per thread (1 at NR0=64).
+    auto stage_tile = [&](const int loop_k, threadgroup SA *buf) {
+        FOR_UNROLL (int work = tiitg; work < NR0*NL; work += NUM_THREADS) {
+            const int row = work / NL;
+            const int k_chunk = work % NL;
             const int k_pos = loop_k + k_chunk*16;
             const short k_base = k_chunk*16;
-
-            if (r0 + row < M) {
-                if (is_same<T0_4x4, block_q>::value && FC_mul_mm_bc_inp) {
-                    device const T0 *row_ptr = (device const T0 *)(srcA + args.nb01*(r0 + row) + offset0);
-                    FOR_UNROLL (short i = 0; i < 16; i++) {
-                        sa[row*NK + k_base + i] = (k_pos + i < K) ? (SA)row_ptr[k_pos + i] : (SA)0;
-                    }
-                } else {
-                    const int block_idx = k_pos/(16*nl);
-                    const short il = (k_pos/16)%nl;
-                    device const block_q *row_ptr = (device const block_q *)(srcA + args.nb01*(r0 + row) + offset0);
-
-                    SA_4x4 temp_a;
-                    dequantize_func(row_ptr + block_idx, il, temp_a);
-                    FOR_UNROLL (short i = 0; i < 16; i++) {
-                        sa[row*NK + k_base + i] = (k_pos + i < K) ? temp_a[i/4][i%4] : (SA)0;
-                    }
+            if (is_same<T0_4x4, block_q>::value && FC_mul_mm_bc_inp) {
+                device const T0 *row_ptr_f =
+                    (device const T0 *)(srcA + args.nb01*(r0 + row) + offset0);
+                FOR_UNROLL (short i = 0; i < 16; i++) {
+                    buf[row*NK + k_base + i] = (SA)row_ptr_f[k_pos + i];
                 }
             } else {
-                FOR_UNROLL (short i = 0; i < 16; i++) {
-                    sa[row*NK + k_base + i] = (SA)0;
-                }
+                device const block_q *row_ptr =
+                    (device const block_q *)(srcA + args.nb01*(r0 + row) + offset0);
+                SA_4x4 temp_a;
+                dequantize_func(row_ptr + k_pos/(16*nl), (k_pos/16)%nl, temp_a);
+                typedef vec<SA, 4> SA4;
+                threadgroup SA4 *dst4 = (threadgroup SA4 *)(buf + row*NK + k_base);
+                dst4[0] = temp_a[0];
+                dst4[1] = temp_a[1];
+                dst4[2] = temp_a[2];
+                dst4[3] = temp_a[3];
             }
         }
+    };
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    stage_tile(0, sa);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        auto mA = tA.slice(0, 0);
+    uint buf_sel = 0;
+    for (int loop_k = 0; loop_k < K; loop_k += NK) {
+        auto mA = (buf_sel ? tA1 : tA0).slice(0, 0);
         auto mB = tB.slice(loop_k, r1);
         mm.run(mB, mA, cT);
 
+        const int next_k = loop_k + NK;
+        if (next_k < K) {
+            buf_sel ^= 1u;
+            stage_tile(next_k, buf_sel ? sa + NR0*NK : sa);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -1345,9 +1377,9 @@ typedef decltype(kernel_mul_mm_mpp_direct_rhs<32, half, half4x4, float4x4, 1, de
 template [[host_name("kernel_mul_mm_f16_f32_mpp_direct_rhs")]]  kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<32, half, half4x4, half4x4, 1, dequantize_f16,  half,  half4x4,  float>;
 template [[host_name("kernel_mul_mm_f16_f32_mpp_direct_rhs_n64")]]  kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<64, half, half4x4, half4x4, 1, dequantize_f16,  half,  half4x4,  float>;
 template [[host_name("kernel_mul_mm_f16_f32_mpp_direct_rhs_n128")]]  kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<128, half, half4x4, half4x4, 1, dequantize_f16,  half,  half4x4,  float>;
-template [[host_name("kernel_mul_mm_q8_0_f32_nax_direct_rhs")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<32, half, half4x4, block_q8_0, 2, dequantize_q8_0, float, float4x4, float>;
-template [[host_name("kernel_mul_mm_q8_0_f32_nax_direct_rhs_n64")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<64, half, half4x4, block_q8_0, 2, dequantize_q8_0, float, float4x4, float>;
-template [[host_name("kernel_mul_mm_q8_0_f32_nax_direct_rhs_n128")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<128, half, half4x4, block_q8_0, 2, dequantize_q8_0, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_q8_0_f32_nax_direct_rhs")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<32, half, half4x4, block_q8_0, 2, dequantize_q8_0_pairs, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_q8_0_f32_nax_direct_rhs_n64")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<64, half, half4x4, block_q8_0, 2, dequantize_q8_0_pairs, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_q8_0_f32_nax_direct_rhs_n128")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<128, half, half4x4, block_q8_0, 2, dequantize_q8_0_pairs, float, float4x4, float>;
 #endif
 
 // Tiled matrix-matrix kernel used for prompt batches larger than 8. DS4 uses

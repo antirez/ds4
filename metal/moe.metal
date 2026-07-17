@@ -4478,6 +4478,11 @@ template [[host_name("kernel_mul_mm_id_iq2_xxs_f16")]]      kernel mul_mm_id_f16
 // weights to a half tile, then let TensorOps read the dense head activations
 // directly.  Only the 64-token direct-RHS instantiation is exported because the
 // staged-RHS and 32-token variants were benchmark-only experiments.
+//
+// Full tiles (the host dispatch guarantee for aligned batches) skip all bounds
+// work.  The weight tile is double-buffered: the next k-step's dequant
+// overlaps the current cooperative matmul, so the k-loop needs one
+// threadgroup barrier per step instead of two.
 template<short NR1>
 kernel void kernel_attn_out_low_q8_0_mpp_direct_rhs(
         constant ds4_metal_args_mul_mm_id & args,
@@ -4505,7 +4510,8 @@ kernel void kernel_attn_out_low_q8_0_mpp_direct_rhs(
     const bool full_tile = r0 + NR0 <= M && r1 + NR1 <= N && (K % NK) == 0;
 
     threadgroup half *sa = (threadgroup half *)shmem;
-    auto tA = tensor(sa, dextents<int32_t, 2>(NK, NR0));
+    auto tA0 = tensor(sa,          dextents<int32_t, 2>(NK, NR0));
+    auto tA1 = tensor(sa + NR0*NK, dextents<int32_t, 2>(NK, NR0));
 
     device float *ptrB = (device float *)(srcB + args.nb11*group);
     const int strideB = args.nb12/sizeof(float);
@@ -4516,7 +4522,7 @@ kernel void kernel_attn_out_low_q8_0_mpp_direct_rhs(
             matmul2d_descriptor::mode::multiply_accumulate),
         execution_simdgroups<4>> mm;
 
-    auto cT = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+    auto cT = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA0), float>();
 
     #pragma unroll
     for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
@@ -4525,37 +4531,57 @@ kernel void kernel_attn_out_low_q8_0_mpp_direct_rhs(
         }
     }
 
-    for (int loop_k = 0; loop_k < K; loop_k += NK) {
+    auto stage_tile = [&](const int loop_k, threadgroup half *buf) {
         for (int work = tiitg; work < NR0*NL; work += NUM_THREADS) {
             const int row = work/NL;
             const int k_chunk = work%NL;
             const int k_pos = loop_k + k_chunk*16;
             const short k_base = k_chunk*16;
 
-            if (full_tile || r0 + row < M) {
+            if (full_tile) {
+                device const block_q8_0 *row_ptr =
+                    (device const block_q8_0 *)(srcA + args.nb01*(r0 + row) + group*args.nb02);
+
+                half4x4 temp_a;
+                dequantize_q8_0_pairs(row_ptr + k_pos/32, (k_pos/16)%2, temp_a);
+                threadgroup half4 *dst4 = (threadgroup half4 *)(buf + row*NK + k_base);
+                dst4[0] = temp_a[0];
+                dst4[1] = temp_a[1];
+                dst4[2] = temp_a[2];
+                dst4[3] = temp_a[3];
+            } else if (r0 + row < M) {
                 const int block_idx = k_pos/32;
                 const short il = (k_pos/16)%2;
                 device const block_q8_0 *row_ptr =
                     (device const block_q8_0 *)(srcA + args.nb01*(r0 + row) + group*args.nb02);
 
                 half4x4 temp_a;
-                dequantize_q8_0(row_ptr + block_idx, il, temp_a);
+                dequantize_q8_0_pairs(row_ptr + block_idx, il, temp_a);
                 FOR_UNROLL (short i = 0; i < 16; i++) {
-                    sa[row*NK + k_base + i] = (full_tile || k_pos + i < K) ? temp_a[i/4][i%4] : (half)0;
+                    buf[row*NK + k_base + i] = (k_pos + i < K) ? temp_a[i/4][i%4] : (half)0;
                 }
             } else {
                 FOR_UNROLL (short i = 0; i < 16; i++) {
-                    sa[row*NK + k_base + i] = (half)0;
+                    buf[row*NK + k_base + i] = (half)0;
                 }
             }
         }
+    };
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    stage_tile(0, sa);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        auto mA = tA.slice(0, 0);
+    uint buf_sel = 0;
+    for (int loop_k = 0; loop_k < K; loop_k += NK) {
+        auto mA = (buf_sel ? tA1 : tA0).slice(0, 0);
         auto mB = tB.slice(loop_k, r1);
         mm.run(mB, mA, cT);
 
+        const int next_k = loop_k + NK;
+        if (next_k < K) {
+            buf_sel ^= 1u;
+            stage_tile(next_k, buf_sel ? sa + NR0*NK : sa);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 

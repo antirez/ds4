@@ -13013,9 +13013,9 @@ static int ds4_gpu_indexer_scores_batch_tensor(
         [enc setBuffer:compbuf offset:ds4_gpu_tensor_offset(index_comp) atIndex:3];
         [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:4];
         if (use_nax) {
-            const NSUInteger q_shared = 16u * 32u;
+            const NSUInteger q_shared = 2u * 32u * 32u;
             const NSUInteger k_shared = 32u * 128u;
-            const NSUInteger dot_shared = 16u * 32u;
+            const NSUInteger dot_shared = 32u * 32u;
             [enc setThreadgroupMemoryLength:(q_shared + k_shared) * sizeof(uint16_t) +
                                             dot_shared * sizeof(float) atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 31u) / 32u,
@@ -13459,7 +13459,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
                 [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
                 [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
                 [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-                [enc setThreadgroupMemoryLength:64u * 32u * sizeof(uint16_t) atIndex:0];
+                [enc setThreadgroupMemoryLength:2u * 64u * 32u * sizeof(uint16_t) atIndex:0];
                 [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(n_tok / nax_tile_n),
                                                       (NSUInteger)out_dim / 64u,
                                                       1)
@@ -13908,7 +13908,7 @@ int ds4_gpu_matmul_f16_tensor(
                 [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
                 [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
                 [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-                [enc setThreadgroupMemoryLength:64u * 32u * sizeof(uint16_t) atIndex:0];
+                [enc setThreadgroupMemoryLength:2u * 64u * 32u * sizeof(uint16_t) atIndex:0];
                 [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(n_tok / nax_tile_n),
                                                       (NSUInteger)out_dim / 64u,
                                                       1)
@@ -23029,7 +23029,7 @@ static int ds4_gpu_encode_attn_out_low_q8_mpp(
     [enc setBuffer:src0 offset:src0_off atIndex:1];
     [enc setBuffer:src1 offset:src1_off atIndex:2];
     [enc setBuffer:dst offset:dst_off atIndex:3];
-    [enc setThreadgroupMemoryLength:4096u atIndex:0];
+    [enc setThreadgroupMemoryLength:8192u atIndex:0];
     [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)mm_args->ne21 + (NSUInteger)tile_n - 1u) / (NSUInteger)tile_n,
                                           ((NSUInteger)mm_args->ne0 + 63u) / 64u,
                                           (NSUInteger)mm_args->ne02)

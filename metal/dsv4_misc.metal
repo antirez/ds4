@@ -1351,6 +1351,15 @@ kernel void kernel_dsv4_indexer_scores_tiled(
 // compressed-row dot tile.  The kernel intentionally leaves top-k selection and
 // indexed attention semantics unchanged; all 512 selected rows remain available
 // to the later attention kernel.
+//
+// Each matmul processes a pair of heads (TQ = 2 x TM q rows): the per-element
+// dot is still a 128-deep reduction in 32-wide k-steps, so scores are
+// bit-identical to single-head tiles while the run count halves.  The q tile
+// is double-buffered, so the next k-step's stage overlaps the current
+// cooperative matmul and each pair needs 5 barriers instead of 10.  q and k
+// staging use one float4/half4 per lane (each thread covers one row of 8/32
+// consecutive elements), which is the same half(float) conversion per element
+// as the scalar form.
 kernel void kernel_dsv4_indexer_scores_nax(
         constant ds4_metal_args_dsv4_indexer_scores_fused & args,
         device const char *q,
@@ -1361,6 +1370,7 @@ kernel void kernel_dsv4_indexer_scores_nax(
         uint2  tgpig [[threadgroup_position_in_grid]],
         ushort tid   [[thread_index_in_threadgroup]]) {
     constexpr int TM = 16;
+    constexpr int TQ = 32;
     constexpr int TN = 32;
     constexpr int NK = 32;
     constexpr int D  = 128;
@@ -1372,9 +1382,9 @@ kernel void kernel_dsv4_indexer_scores_nax(
     const uint c0 = tgpig.x * TN;
     const uint t0 = tgpig.y * TM;
 
-    threadgroup half  *qtg = shared;               // [16][32]
-    threadgroup half  *ktg = qtg + TM*NK;          // [32][128]
-    threadgroup float *dot = (threadgroup float *)(ktg + TN*D); // [16][32], column-major
+    threadgroup half  *qtg = shared;               // 2 x [TQ][NK]
+    threadgroup half  *ktg = qtg + 2*TQ*NK;        // [32][128]
+    threadgroup float *dot = (threadgroup float *)(ktg + TN*D); // [TQ][TN], column-major
 
     const uint last_token = min(t0 + (uint)TM, args.n_tokens);
     const uint max_visible = last_token > t0 ?
@@ -1395,17 +1405,21 @@ kernel void kernel_dsv4_indexer_scores_nax(
         return;
     }
 
-    for (uint work = tid; work < TN*D; work += NUM_THREADS) {
-        const uint cc = work / D;
-        const uint d = work - cc*D;
+    {
+        // One compressed row per 4 threads, 32 consecutive floats per thread.
+        const uint cc = tid / 4;
         const uint comp = c0 + cc;
-        half v = half(0.0f);
+        device const float *krow = nullptr;
         if (comp < args.n_comp) {
-            device const float *krow = (device const float *)(index_comp +
+            krow = (device const float *)(index_comp +
                 (uint64_t)comp * args.index_row_stride);
-            v = half(krow[d]);
         }
-        ktg[cc*D + d] = v;
+        const uint d0 = (tid % 4) * 32;
+        FOR_UNROLL (uint j = 0; j < 8; j++) {
+            const float4 kv = krow ? *(device const float4 *)(krow + d0 + 4*j)
+                                   : float4(0.0f);
+            *(threadgroup half4 *)(ktg + cc*D + d0 + 4*j) = half4(kv);
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1415,17 +1429,45 @@ kernel void kernel_dsv4_indexer_scores_nax(
         acc[j] = 0.0f;
     }
 
-    auto tq = tensor(qtg, dextents<int32_t, 2>(NK, TM));
+    auto tq0 = tensor(qtg,          dextents<int32_t, 2>(NK, TQ));
+    auto tq1 = tensor(qtg + TQ*NK,  dextents<int32_t, 2>(NK, TQ));
     auto tk = tensor(ktg, dextents<int32_t, 2>(D, TN));
-    auto td = tensor(dot, dextents<int32_t, 2>(TM, TN), array<int, 2>({1, TM}));
+    auto td = tensor(dot, dextents<int32_t, 2>(TQ, TN), array<int, 2>({1, TQ}));
 
     matmul2d<
-        matmul2d_descriptor(TN, TM, NK, false, true, false,
+        matmul2d_descriptor(TN, TQ, NK, false, true, false,
             matmul2d_descriptor::mode::multiply_accumulate),
         execution_simdgroups<4>> mm;
 
-    for (uint head = 0; head < args.n_head; head++) {
-        auto ct = mm.template get_destination_cooperative_tensor<decltype(tk), decltype(tq), float>();
+    // One q row per 4 threads, 8 consecutive floats per thread.  Row r covers
+    // head (r / TM) of the pair and token row (r % TM).
+    const uint q_r = tid / 4;
+    const uint q_k4 = (tid % 4) * 8;
+    const uint q_hl = q_r / TM;
+    const uint q_tr = q_r % TM;
+    const uint q_token = t0 + q_tr;
+    device const char *q_row_base = nullptr;
+    if (q_token < args.n_tokens) {
+        q_row_base = q + (uint64_t)q_token * args.q_token_stride;
+    }
+
+    auto stage_q = [&](const uint head0, const uint loop_k, threadgroup half *buf) {
+        const uint head = head0 + q_hl;
+        half4 v0 = half4(0.0f);
+        half4 v1 = half4(0.0f);
+        if (q_row_base && head < args.n_head) {
+            device const float4 *src4 = (device const float4 *)
+                (q_row_base + (uint64_t)head * args.q_head_stride +
+                 (uint64_t)(loop_k + q_k4) * sizeof(float));
+            v0 = half4(src4[0]);
+            v1 = half4(src4[1]);
+        }
+        *(threadgroup half4 *)(buf + q_r*NK + q_k4)     = v0;
+        *(threadgroup half4 *)(buf + q_r*NK + q_k4 + 4) = v1;
+    };
+
+    for (uint head0 = 0; head0 < args.n_head; head0 += 2) {
+        auto ct = mm.template get_destination_cooperative_tensor<decltype(tk), decltype(tq0), float>();
         #pragma unroll
         for (uint16_t i = 0; i < ct.get_capacity(); i++) {
             if (ct.is_valid_element(i)) {
@@ -1433,27 +1475,19 @@ kernel void kernel_dsv4_indexer_scores_nax(
             }
         }
 
-        for (uint loop_k = 0; loop_k < D; loop_k += NK) {
-            for (uint work = tid; work < TM*NK; work += NUM_THREADS) {
-                const uint r = work / NK;
-                const uint k = work - r*NK;
-                const uint token = t0 + r;
-                half v = half(0.0f);
-                if (token < args.n_tokens) {
-                    device const float *qrow = (device const float *)(q +
-                        (uint64_t)token * args.q_token_stride +
-                        (uint64_t)head  * args.q_head_stride);
-                    v = half(qrow[loop_k + k]);
-                }
-                qtg[r*NK + k] = v;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+        stage_q(head0, 0, qtg);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            auto mq = tq.slice(0, 0);
-            auto mk = tk.slice(loop_k, 0);
+        uint qsel = 0;
+        FOR_UNROLL (uint i = 0; i < 4; i++) {
+            auto mk = tk.slice(i*NK, 0);
+            auto mq = (qsel ? tq1 : tq0).slice(0, 0);
             mm.run(mk, mq, ct);
-
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (i < 3) {
+                qsel ^= 1u;
+                stage_q(head0, (i + 1)*NK, qsel ? qtg + TQ*NK : qtg);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
         }
 
         ct.store(td);
@@ -1469,12 +1503,16 @@ kernel void kernel_dsv4_indexer_scores_nax(
                 if (token < args.n_tokens) {
                     device const float *w = (device const float *)(weights +
                         (uint64_t)token * args.weights_token_stride);
-                    acc[j] += max(dot[cc*TM + r], 0.0f) * (w[head] * args.scale);
+                    acc[j] += max(dot[cc*TQ + r], 0.0f) * (w[head0] * args.scale);
+                    if (head0 + 1 < args.n_head) {
+                        acc[j] += max(dot[cc*TQ + TM + r], 0.0f) * (w[head0 + 1] * args.scale);
+                    }
                 }
             }
         }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // No barrier here: the next pair's q stage and these dot reads touch
+        // different buffers, and the next q-stage barrier separates the next
+        // ct.store from these reads.
     }
 
     #pragma unroll
