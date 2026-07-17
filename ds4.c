@@ -10818,7 +10818,16 @@ static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor(bool managed, uint64_t 
  */
 
 static bool metal_graph_debug_wants(const char *name, uint32_t il, uint32_t pos) {
-    const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
+    /*
+     * The dump prefix gates every debug hook in the hot path; read it once.
+     * The remaining filter envs are only consulted in diagnostic runs.
+     */
+    static const char *prefix;
+    static int prefix_loaded;
+    if (!prefix_loaded) {
+        prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
+        prefix_loaded = 1;
+    }
     if (!prefix || !prefix[0]) return false;
 
     const char *name_env = getenv("DS4_METAL_GRAPH_DUMP_NAME");
@@ -10840,9 +10849,9 @@ static void metal_graph_debug_dump_tensor(
         uint64_t          n_f32,
         uint32_t          il,
         uint32_t          pos) {
-    const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
     if (!t || n_f32 == 0 || !metal_graph_debug_wants(name, il, pos)) return;
 
+    const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
     if (ds4_gpu_synchronize() == 0) {
         fprintf(stderr, "ds4: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
         return;

@@ -2496,6 +2496,24 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_vec_pipeline(
         int32_t     ns20,
         int32_t     nsg,
         int32_t     nwg) {
+    /*
+     * Decode calls this once per layer with identical arguments, so memoize
+     * the last hit and skip the NSString key + dictionary lookup on the hot
+     * path.  The generic cache below remains the fallback for new variants.
+     */
+    static struct {
+        const char *fn;
+        bool m, s, b, c, k, sp;
+        int32_t n10, n20, sg, wg;
+        id<MTLComputePipelineState> pipeline;
+    } memo;
+    if (memo.pipeline && memo.fn != NULL && strcmp(memo.fn, function_name) == 0 &&
+        memo.m == has_mask && memo.s == has_sinks && memo.b == has_bias &&
+        memo.c == has_scap && memo.k == has_kvpad && memo.sp == shared_kvpad &&
+        memo.n10 == ns10 && memo.n20 == ns20 && memo.sg == nsg && memo.wg == nwg) {
+        return memo.pipeline;
+    }
+
     NSString *key = [NSString stringWithFormat:@"%s_mask=%d_sinks=%d_bias=%d_scap=%d_kvpad=%d_sharedpad=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d",
                      function_name,
                      has_mask ? 1 : 0,
@@ -2509,7 +2527,12 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_vec_pipeline(
                      (int)nsg,
                      (int)nwg];
     id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
-    if (cached) return cached;
+    if (cached) {
+        memo = (typeof(memo)){ function_name, has_mask, has_sinks, has_bias,
+                               has_scap, has_kvpad, shared_kvpad, ns10, ns20,
+                               nsg, nwg, cached };
+        return cached;
+    }
 
     MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
     [constants setConstantValue:&has_mask  type:MTLDataTypeBool atIndex:400];
@@ -2543,16 +2566,29 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_vec_pipeline(
     }
 
     [g_pipeline_cache setObject:pipeline forKey:key];
+    memo = (typeof(memo)){ function_name, has_mask, has_sinks, has_bias,
+                           has_scap, has_kvpad, shared_kvpad, ns10, ns20,
+                           nsg, nwg, pipeline };
     return pipeline;
 }
 
 static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_reduce_pipeline(
         int32_t dv,
         int32_t nwg) {
+    /* Same per-layer memo pattern as the vec getter above. */
+    static int32_t memo_dv, memo_nwg;
+    static id<MTLComputePipelineState> memo_pipeline;
+    if (memo_pipeline && memo_dv == dv && memo_nwg == nwg) {
+        return memo_pipeline;
+    }
+
     NSString *key = [NSString stringWithFormat:@"kernel_flash_attn_ext_vec_reduce_dv=%d_nwg=%d",
                      (int)dv, (int)nwg];
     id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
-    if (cached) return cached;
+    if (cached) {
+        memo_dv = dv; memo_nwg = nwg; memo_pipeline = cached;
+        return cached;
+    }
 
     MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
     [constants setConstantValue:&dv  type:MTLDataTypeInt atIndex:500];
@@ -2577,6 +2613,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_reduce_pipeline(
     }
 
     [g_pipeline_cache setObject:pipeline forKey:key];
+    memo_dv = dv; memo_nwg = nwg; memo_pipeline = pipeline;
     return pipeline;
 }
 
@@ -13121,7 +13158,9 @@ int ds4_gpu_indexer_topk_tensor(
             .ne3 = 1,
             .top_k = block_top_k,
         };
-        const NSUInteger smem = (((NSUInteger)nth * sizeof(int32_t)) + 15u) & ~(NSUInteger)15u;
+        // kernel_argsort_f32_i32_desc stages the block's scores behind the
+        // index array: nth int32 indices + nth float scores.
+        const NSUInteger smem = (((NSUInteger)nth * (sizeof(int32_t) + sizeof(float))) + 15u) & ~(NSUInteger)15u;
 
         NSUInteger cur_off = 0;
         NSUInteger next_off = (NSUInteger)scratch_row_bytes * n_tokens;
@@ -26491,13 +26530,21 @@ int ds4_gpu_routed_moe_batch_tensor(
             !g_quality_mode &&
             !use_q4_batch_expert_table &&
             !use_iq2_batch_selected_addr;
+        /*
+         * Fused gate+up grouped matmul with the SwiGLU epilogue.  The IQ2
+         * variant stays opt-in behind its env flag; the Q4_K variant is the
+         * default path — same MMA accumulation order and epilogue math as the
+         * separate GEMMs + swiglu pass, so the mid tensor is bit-identical.
+         */
         const bool use_mm_id_pair_swiglu =
             use_mm_id &&
             request_mid_f16 &&
-            gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
-            down_type == DS4_METAL_TENSOR_Q2_K &&
             n_expert == 6 &&
-            getenv("DS4_METAL_ENABLE_MOE_MM_ID_PAIR_SWIGLU") != NULL &&
+            ((gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
+              down_type == DS4_METAL_TENSOR_Q2_K &&
+              getenv("DS4_METAL_ENABLE_MOE_MM_ID_PAIR_SWIGLU") != NULL) ||
+             (gate_type == DS4_METAL_TENSOR_Q4_K &&
+              down_type == DS4_METAL_TENSOR_Q4_K)) &&
             getenv("DS4_METAL_DISABLE_MOE_MM_ID_PAIR_SWIGLU") == NULL &&
             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
             getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL;
@@ -26522,7 +26569,9 @@ int ds4_gpu_routed_moe_batch_tensor(
                 ds4_gpu_routed_mm_pipeline(down_type);
             if (use_mm_id_pair_swiglu) {
                 pair_swiglu_mm_pipeline =
-                    ds4_gpu_get_pipeline("kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16");
+                    ds4_gpu_get_pipeline(gate_type == DS4_METAL_TENSOR_Q4_K ?
+                        "kernel_mul_mm_id_q4_K_pair_swiglu_f16" :
+                        "kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16");
             }
             if (!map_pipeline || !gate_mm_pipeline || !up_mm_pipeline || !down_mm_pipeline ||
                 (use_mm_id_pair_swiglu && !pair_swiglu_mm_pipeline)) {

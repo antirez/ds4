@@ -4256,7 +4256,13 @@ kernel void kernel_mul_mm_id(
     }
 }
 
-kernel void kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16(
+// Fused routed gate+up grouped matmul with the SwiGLU epilogue, generic over
+// the expert quant block.  Both A streams share one staged B tile per k-step;
+// each output keeps the exact MMA accumulation order of the separate GEMMs,
+// and the epilogue matches kernel_dsv4_moe_swiglu_weight_f16, so the fused
+// result is bit-identical to the unfused path.
+template<typename block_q, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
         constant ds4_metal_args_mul_mm_id & args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
         device const char * src0_gate,
@@ -4271,8 +4277,9 @@ kernel void kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16(
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    threadgroup half *sa = (threadgroup half *)(shmem);
-    threadgroup half *sb = (threadgroup half *)(shmem + 4096);
+    threadgroup half *sa_gate = (threadgroup half *)(shmem);
+    threadgroup half *sa_up   = (threadgroup half *)(shmem + 4096);
+    threadgroup half *sb      = (threadgroup half *)(shmem + 8192);
 
     constexpr int NR0 = 64;
     constexpr int NR1 = 32;
@@ -4311,10 +4318,10 @@ kernel void kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16(
     const uint64_t offset0 = im*args.nb02 + i13*args.nb03;
     const short    offset1 = il0/QK_NL;
 
-    device const block_iq2_xxs * xg =
-        (device const block_iq2_xxs *)(src0_gate + args.nb01*(r0 + lr0) + offset0) + offset1;
-    device const block_iq2_xxs * xu =
-        (device const block_iq2_xxs *)(src0_up + args.nb01*(r0 + lr0) + offset0) + offset1;
+    device const block_q * xg =
+        (device const block_q *)(src0_gate + args.nb01*(r0 + lr0) + offset0) + offset1;
+    device const block_q * xu =
+        (device const block_q *)(src0_up + args.nb01*(r0 + lr0) + offset0) + offset1;
 
     const short iy = 8*(tiitg % NL1);
 
@@ -4324,7 +4331,8 @@ kernel void kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16(
         + args.nb11*i11
         + args.nb10*iy);
 
-    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 ma_g[4];
+    simdgroup_half8x8 ma_u[4];
     simdgroup_half8x8 mb[2];
 
     simdgroup_float8x8 mc_gate[8];
@@ -4336,17 +4344,23 @@ kernel void kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16(
     }
 
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
-        const short sx_b = (tiitg%NL1);
-        const short sy_b = (tiitg/NL1)/8;
-        const short ly_b = (tiitg/NL1)%8;
-        const short ib_b = 4*sx_b + sy_b;
-        *(threadgroup half2x4 *)(sb + 64*ib_b + 8*ly_b) =
-            (half2x4)(*((device float2x4 *) y));
-
         half4x4 temp_gate;
-        dequantize_iq2_xxs(xg, il, temp_gate);
+        dequantize_func(xg, il, temp_gate);
+        half4x4 temp_up;
+        dequantize_func(xu, il, temp_up);
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Stage the shared B tile and both expert A tiles in one pass: two
+        // threadgroup barriers per k-step total instead of two per matrix.
+        {
+            const short sx_b = (tiitg%NL1);
+            const short sy_b = (tiitg/NL1)/8;
+            const short ly_b = (tiitg/NL1)%8;
+            const short ib_b = 4*sx_b + sy_b;
+            *(threadgroup half2x4 *)(sb + 64*ib_b + 8*ly_b) =
+                (half2x4)(*((device float2x4 *) y));
+        }
 
         FOR_UNROLL (short i = 0; i < 16; i++) {
             const short sx = 2*il0 + i/8;
@@ -4354,23 +4368,23 @@ kernel void kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16(
             const short lx = (tiitg/NL0)%8;
             const short ly = i%8;
             const short ib = 8*sx + sy;
-            *(sa + 64*ib + 8*ly + lx) = temp_gate[i/4][i%4];
+            *(sa_gate + 64*ib + 8*ly + lx) = temp_gate[i/4][i%4];
+            *(sa_up   + 64*ib + 8*ly + lx) = temp_up[i/4][i%4];
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        threadgroup const half * lsma_gate = (sa + 4*64*(sgitg%2));
-        threadgroup const half * lsmb = (sb + 2*64*(sgitg/2));
+        threadgroup const half * lsma_gate = (sa_gate + 4*64*(sgitg%2));
+        threadgroup const half * lsma_up   = (sa_up   + 4*64*(sgitg%2));
+        threadgroup const half * lsmb      = (sb      + 2*64*(sgitg/2));
 
         FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
             simdgroup_barrier(mem_flags::mem_none);
 
             FOR_UNROLL (short i = 0; i < 4; i++) {
-                simdgroup_load(ma[i], lsma_gate + 64*i, 8, 0, false);
+                simdgroup_load(ma_g[i], lsma_gate + 64*i, 8, 0, false);
+                simdgroup_load(ma_u[i], lsma_up   + 64*i, 8, 0, false);
             }
-
-            simdgroup_barrier(mem_flags::mem_none);
-
             FOR_UNROLL (short i = 0; i < 2; i++) {
                 simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
             }
@@ -4378,53 +4392,13 @@ kernel void kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16(
             simdgroup_barrier(mem_flags::mem_none);
 
             FOR_UNROLL (short i = 0; i < 8; i++) {
-                simdgroup_multiply_accumulate(mc_gate[i], mb[i/4], ma[i%4], mc_gate[i]);
+                simdgroup_multiply_accumulate(mc_gate[i], mb[i/4], ma_g[i%4], mc_gate[i]);
+                simdgroup_multiply_accumulate(mc_up[i],   mb[i/4], ma_u[i%4], mc_up[i]);
             }
 
             lsma_gate += 8*64;
-            lsmb += 4*64;
-        }
-
-        half4x4 temp_up;
-        dequantize_iq2_xxs(xu, il, temp_up);
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        FOR_UNROLL (short i = 0; i < 16; i++) {
-            const short sx = 2*il0 + i/8;
-            const short sy = (tiitg/NL0)/8;
-            const short lx = (tiitg/NL0)%8;
-            const short ly = i%8;
-            const short ib = 8*sx + sy;
-            *(sa + 64*ib + 8*ly + lx) = temp_up[i/4][i%4];
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        threadgroup const half * lsma_up = (sa + 4*64*(sgitg%2));
-        lsmb = (sb + 2*64*(sgitg/2));
-
-        FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
-            simdgroup_barrier(mem_flags::mem_none);
-
-            FOR_UNROLL (short i = 0; i < 4; i++) {
-                simdgroup_load(ma[i], lsma_up + 64*i, 8, 0, false);
-            }
-
-            simdgroup_barrier(mem_flags::mem_none);
-
-            FOR_UNROLL (short i = 0; i < 2; i++) {
-                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
-            }
-
-            simdgroup_barrier(mem_flags::mem_none);
-
-            FOR_UNROLL (short i = 0; i < 8; i++) {
-                simdgroup_multiply_accumulate(mc_up[i], mb[i/4], ma[i%4], mc_up[i]);
-            }
-
-            lsma_up += 8*64;
-            lsmb += 4*64;
+            lsma_up   += 8*64;
+            lsmb      += 4*64;
         }
 
         il = (il + 2 < QK_NL) ? il + 2 : il % 2;
@@ -4477,6 +4451,13 @@ kernel void kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16(
         }
     }
 }
+
+typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_iq2_xxs, dequantize_iq2_xxs>) mul_mm_id_pair_swiglu_f16_iq2;
+typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_q4_K,    dequantize_q4_K>)    mul_mm_id_pair_swiglu_f16_q4;
+
+// Host-visible fused routed pair matmuls for the DS4 expert quant formats.
+template [[host_name("kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16")]] kernel mul_mm_id_pair_swiglu_f16_iq2 kernel_mul_mm_id_pair_swiglu_f16_impl<block_iq2_xxs, dequantize_iq2_xxs>;
+template [[host_name("kernel_mul_mm_id_q4_K_pair_swiglu_f16")]]    kernel mul_mm_id_pair_swiglu_f16_q4  kernel_mul_mm_id_pair_swiglu_f16_impl<block_q4_K,    dequantize_q4_K>;
 
 typedef decltype(kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>) mul_mm_id;
 typedef decltype(kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>) mul_mm_id_f16_rhs;
