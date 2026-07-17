@@ -4962,8 +4962,54 @@ static void append_openai_usage_json(buf *b, const request *r,
                cached_tokens, cache_write_tokens);
 }
 
+static void append_openai_timings_json(buf *b, const request *r,
+                                       double prompt_sec, double predicted_sec,
+                                       int prompt_tokens, int completion_tokens) {
+    int cache_n = r ? r->cache_read_tokens : 0;
+    int prompt_n = prompt_tokens - cache_n;
+    if (prompt_n < 0) prompt_n = 0;
+
+    double prompt_ms = prompt_sec * 1000.0;
+    double prompt_per_token_ms = prompt_n > 0 ? prompt_ms / prompt_n : 0.0;
+    double prompt_per_second = prompt_sec > 0.0 ? (double)prompt_n / prompt_sec : 0.0;
+
+    int predicted_n = completion_tokens;
+    double predicted_ms = predicted_sec * 1000.0;
+    double predicted_per_token_ms = predicted_n > 0 ? predicted_ms / predicted_n : 0.0;
+    double predicted_per_second = predicted_sec > 0.0 ? (double)predicted_n / predicted_sec : 0.0;
+
+    if (!isfinite(prompt_ms)) prompt_ms = 0.0;
+    if (!isfinite(prompt_per_token_ms)) prompt_per_token_ms = 0.0;
+    if (!isfinite(prompt_per_second)) prompt_per_second = 0.0;
+    if (!isfinite(predicted_ms)) predicted_ms = 0.0;
+    if (!isfinite(predicted_per_token_ms)) predicted_per_token_ms = 0.0;
+    if (!isfinite(predicted_per_second)) predicted_per_second = 0.0;
+
+    buf_printf(b,
+        ",\"timings\":{"
+        "\"cache_n\":%d,"
+        "\"prompt_n\":%d,"
+        "\"prompt_ms\":%.1f,"
+        "\"prompt_per_token_ms\":%.2f,"
+        "\"prompt_per_second\":%.2f,"
+        "\"predicted_n\":%d,"
+        "\"predicted_ms\":%.1f,"
+        "\"predicted_per_token_ms\":%.2f,"
+        "\"predicted_per_second\":%.2f}",
+        cache_n,
+        prompt_n,
+        prompt_ms,
+        prompt_per_token_ms,
+        prompt_per_second,
+        predicted_n,
+        predicted_ms,
+        predicted_per_token_ms,
+        predicted_per_second);
+}
+
 static bool sse_usage_chunk(int fd, const request *r, const char *id,
-                            int prompt_tokens, int completion_tokens) {
+                             int prompt_tokens, int completion_tokens,
+                             double prompt_sec, double predicted_sec) {
     if (!r->stream_include_usage) return true;
 
     buf b = {0};
@@ -4978,6 +5024,8 @@ static bool sse_usage_chunk(int fd, const request *r, const char *id,
         buf_puts(&b, ",\"choices\":[],\"usage\":");
     }
     append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
+    append_openai_timings_json(&b, r, prompt_sec, predicted_sec,
+                               prompt_tokens, completion_tokens);
     buf_puts(&b, "}\n\n");
 
     bool ok = send_all(fd, b.ptr, b.len);
@@ -4986,14 +5034,17 @@ static bool sse_usage_chunk(int fd, const request *r, const char *id,
 }
 
 static bool sse_done(int fd, const request *r, const char *id,
-                     int prompt_tokens, int completion_tokens) {
-    return sse_usage_chunk(fd, r, id, prompt_tokens, completion_tokens) &&
+                     int prompt_tokens, int completion_tokens,
+                     double prompt_sec, double predicted_sec) {
+    return sse_usage_chunk(fd, r, id, prompt_tokens, completion_tokens,
+                           prompt_sec, predicted_sec) &&
            send_all(fd, "data: [DONE]\n\n", 14);
 }
 
 static bool sse_chat_finish(int fd, const request *r, const char *id, const char *content,
                             const char *reasoning, const tool_calls *calls, const char *finish,
-                            int prompt_tokens, int completion_tokens) {
+                            int prompt_tokens, int completion_tokens,
+                            double prompt_sec, double predicted_sec) {
     if (!sse_chunk(fd, r, id, NULL, NULL)) return false;
 
     buf b = {0};
@@ -5026,7 +5077,8 @@ static bool sse_chat_finish(int fd, const request *r, const char *id, const char
     buf_puts(&b, "}]}\n\n");
 
     bool ok = send_all(fd, b.ptr, b.len) &&
-              sse_done(fd, r, id, prompt_tokens, completion_tokens);
+              sse_done(fd, r, id, prompt_tokens, completion_tokens,
+                       prompt_sec, predicted_sec);
     buf_free(&b);
     return ok;
 }
@@ -5942,7 +5994,8 @@ static bool openai_sse_finish_live(int fd, server *s, const request *r, const ch
                                    openai_stream *st, const char *raw,
                                    size_t raw_len, const tool_calls *calls,
                                    const char *finish, int prompt_tokens,
-                                   int completion_tokens) {
+                                   int completion_tokens,
+                                   double prompt_sec, double predicted_sec) {
     if (!openai_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
 
     buf b = {0};
@@ -5961,7 +6014,8 @@ static bool openai_sse_finish_live(int fd, server *s, const request *r, const ch
     buf_puts(&b, "}]}\n\n");
 
     bool ok = send_all(fd, b.ptr, b.len) &&
-              sse_done(fd, r, id, prompt_tokens, completion_tokens);
+              sse_done(fd, r, id, prompt_tokens, completion_tokens,
+                       prompt_sec, predicted_sec);
     buf_free(&b);
     return ok;
 }
@@ -6792,7 +6846,8 @@ static bool responses_final_response(int fd, bool enable_cors,
 static bool final_response(int fd, bool enable_cors,
                            const request *r, const char *id, const char *text,
                            const char *reasoning, const tool_calls *calls, const char *finish,
-                           int prompt_tokens, int completion_tokens) {
+                           int prompt_tokens, int completion_tokens,
+                           double prompt_sec, double predicted_sec) {
     buf b = {0};
     long now = (long)time(NULL);
     if (r->kind == REQ_CHAT) {
@@ -6821,6 +6876,8 @@ static bool final_response(int fd, bool enable_cors,
         buf_puts(&b, "}],\"usage\":");
     }
     append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
+    append_openai_timings_json(&b, r, prompt_sec, predicted_sec,
+                               prompt_tokens, completion_tokens);
     buf_puts(&b, "}\n");
     bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -10355,6 +10412,7 @@ static void generate_job(server *s, job *j) {
     bool dsml_recovery_attempted = false;
     uint64_t rng = j->req.seed ? j->req.seed :
         (((uint64_t)time(NULL) << 32) ^ ((uint64_t)s->seq << 1) ^ (uint64_t)(uintptr_t)j);
+    double prompt_sec;  /* set once after decode_t0 below */
 decode_again:
     ;
     buf text = {0};
@@ -10374,6 +10432,7 @@ decode_again:
     if (max_tokens > room) max_tokens = room;
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
     const double decode_t0 = now_sec();
+    if (!dsml_recovery_attempted) prompt_sec = decode_t0 - t0;
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
@@ -10913,10 +10972,12 @@ decode_again:
                                                     text.ptr ? text.ptr : "", text.len,
                                                     &parsed_calls, final_finish, completion);
         } else if (openai_live_chat) {
+            double predicted_sec = now_sec() - decode_t0;
             response_ok = openai_sse_finish_live(j->fd, s, &j->req, id, &openai_live,
                                                  text.ptr ? text.ptr : "", text.len,
                                                  &parsed_calls, final_finish,
-                                                 prompt_tokens, completion);
+                                                 prompt_tokens, completion,
+                                                 prompt_sec, predicted_sec);
         } else if (responses_live_chat) {
             /* If parse recovered a malformed tool call back to plain text,
              * pass parsed_content so the streaming tail can be flushed; in
@@ -10931,14 +10992,18 @@ decode_again:
                                                     prompt_tokens, completion,
                                                     responses_created_at);
         } else if (structured_stream) {
+            double predicted_sec = now_sec() - decode_t0;
             response_ok = sse_chat_finish(j->fd, &j->req, id,
                                           parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                                           parsed_reasoning,
                                           &parsed_calls, final_finish,
-                                          prompt_tokens, completion);
+                                          prompt_tokens, completion,
+                                          prompt_sec, predicted_sec);
         } else {
+            double predicted_sec = now_sec() - decode_t0;
             response_ok = sse_chunk(j->fd, &j->req, id, NULL, final_finish) &&
-                          sse_done(j->fd, &j->req, id, prompt_tokens, completion);
+                          sse_done(j->fd, &j->req, id, prompt_tokens, completion,
+                                   prompt_sec, predicted_sec);
         }
         if (!response_ok) {
             server_log(DS4_LOG_DEFAULT,
@@ -10961,11 +11026,13 @@ decode_again:
                                  &parsed_calls, final_finish,
                                  prompt_tokens, completion);
     } else {
+        double predicted_sec = now_sec() - decode_t0;
         final_response(j->fd, s->enable_cors, &j->req, id,
                        parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                        parsed_reasoning,
                        &parsed_calls, final_finish,
-                       prompt_tokens, completion);
+                       prompt_tokens, completion,
+                       prompt_sec, predicted_sec);
     }
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
@@ -12478,8 +12545,8 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
 
     tool_calls calls = make_swapped_bash_call();
     TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_test", &st,
-                                       raw, strlen(raw), &calls,
-                                       "tool_calls", 10, 8));
+                                        raw, strlen(raw), &calls,
+                                        "tool_calls", 10, 8, 0.0, 0.0));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -12520,7 +12587,7 @@ static void test_openai_stream_usage_reports_cache_details(void) {
     r.cache_read_tokens = 7;
     r.cache_write_tokens = 3;
 
-    TEST_ASSERT(sse_done(sv[0], &r, "chatcmpl_usage", 10, 2));
+    TEST_ASSERT(sse_done(sv[0], &r, "chatcmpl_usage", 10, 2, 0.5, 1.0));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -12531,6 +12598,52 @@ static void test_openai_stream_usage_reports_cache_details(void) {
     TEST_ASSERT(strstr(out, "\"cached_tokens\":7") != NULL);
     TEST_ASSERT(strstr(out, "\"cache_write_tokens\":3") != NULL);
     TEST_ASSERT(strstr(out, "data: [DONE]") != NULL);
+    TEST_ASSERT(strstr(out, "\"timings\":{") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_n\":7") != NULL);
+    TEST_ASSERT(strstr(out, "\"prompt_n\":3") != NULL);
+    TEST_ASSERT(strstr(out, "\"prompt_ms\":500.0") != NULL);
+    TEST_ASSERT(strstr(out, "\"prompt_per_token_ms\":166.67") != NULL);
+    TEST_ASSERT(strstr(out, "\"prompt_per_second\":6.00") != NULL);
+    TEST_ASSERT(strstr(out, "\"predicted_n\":2") != NULL);
+    TEST_ASSERT(strstr(out, "\"predicted_ms\":1000.0") != NULL);
+    TEST_ASSERT(strstr(out, "\"predicted_per_token_ms\":500.00") != NULL);
+    TEST_ASSERT(strstr(out, "\"predicted_per_second\":2.00") != NULL);
+
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_timings_zero_division(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.stream_include_usage = true;
+    r.cache_read_tokens = 0;
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        request_free(&r);
+        return;
+    }
+
+    TEST_ASSERT(sse_done(sv[0], &r, "chatcmpl_zero", 10, 0, 0.0, 0.0));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"timings\":{") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_n\":0") != NULL);
+    TEST_ASSERT(strstr(out, "\"prompt_n\":10") != NULL);
+    TEST_ASSERT(strstr(out, "\"prompt_ms\":0.0") != NULL);
+    TEST_ASSERT(strstr(out, "\"prompt_per_token_ms\":0.00") != NULL);
+    TEST_ASSERT(strstr(out, "\"prompt_per_second\":0.00") != NULL);
+    TEST_ASSERT(strstr(out, "\"predicted_n\":0") != NULL);
+    TEST_ASSERT(strstr(out, "\"predicted_ms\":0.0") != NULL);
+    TEST_ASSERT(strstr(out, "\"predicted_per_token_ms\":0.00") != NULL);
+    TEST_ASSERT(strstr(out, "\"predicted_per_second\":0.00") != NULL);
 
     free(out);
     request_free(&r);
@@ -12621,8 +12734,8 @@ static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
     const char *raw2 =
         "We need to generate a title</think>Free disk space check";
     TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_title", &st,
-                                       raw2, strlen(raw2), NULL,
-                                       "stop", 12, 8));
+                                        raw2, strlen(raw2), NULL,
+                                        "stop", 12, 8, 0.0, 0.0));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -12694,8 +12807,8 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
     TEST_ASSERT(calls.v[0].id != NULL);
     TEST_ASSERT(!strncmp(calls.v[0].id, "call_", 5));
     TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_partial_tool", &st,
-                                       raw_complete, strlen(raw_complete), &calls,
-                                       "tool_calls", 10, 4));
+                                        raw_complete, strlen(raw_complete), &calls,
+                                        "tool_calls", 10, 4, 0.0, 0.0));
 
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
@@ -15787,6 +15900,7 @@ static void ds4_server_unit_tests_run(void) {
     test_anthropic_tool_stream_sends_live_tool_use();
     test_openai_tool_stream_sends_incremental_text();
     test_openai_stream_usage_reports_cache_details();
+    test_openai_timings_zero_division();
     test_responses_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
