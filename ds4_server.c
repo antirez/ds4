@@ -559,6 +559,10 @@ typedef struct {
      * happens to be named "tool_search". */
     bool responses_tool_search;
     char **prop;
+    /* Declared JSON schema "type" of each property (parallel to prop), or NULL
+     * when the schema does not declare a plain string type.  Used to restore
+     * argument types for tool-call wire formats that are untyped (GLM). */
+    char **prop_type;
     int len;
     int cap;
 } tool_schema_order;
@@ -725,6 +729,8 @@ static void tool_schema_order_free(tool_schema_order *o) {
     free(o->namespace);
     for (int i = 0; i < o->len; i++) free(o->prop[i]);
     free(o->prop);
+    for (int i = 0; i < o->len; i++) free(o->prop_type ? o->prop_type[i] : NULL);
+    free(o->prop_type);
     memset(o, 0, sizeof(*o));
 }
 
@@ -734,12 +740,23 @@ static void tool_schema_orders_free(tool_schema_orders *orders) {
     memset(orders, 0, sizeof(*orders));
 }
 
-static void tool_schema_order_prop_push(tool_schema_order *o, char *prop) {
+static void tool_schema_order_prop_push(tool_schema_order *o, char *prop, char *prop_type) {
     if (o->len == o->cap) {
         o->cap = o->cap ? o->cap * 2 : 8;
         o->prop = xrealloc(o->prop, (size_t)o->cap * sizeof(o->prop[0]));
+        o->prop_type = xrealloc(o->prop_type, (size_t)o->cap * sizeof(o->prop_type[0]));
     }
-    o->prop[o->len++] = prop;
+    o->prop[o->len] = prop;
+    o->prop_type[o->len] = prop_type;
+    o->len++;
+}
+
+static const char *tool_schema_order_prop_type(const tool_schema_order *o, const char *key) {
+    if (!o || !o->prop_type || !key) return NULL;
+    for (int i = 0; i < o->len; i++) {
+        if (o->prop[i] && !strcmp(o->prop[i], key)) return o->prop_type[i];
+    }
+    return NULL;
 }
 
 static int tool_schema_orders_find_index(const tool_schema_orders *orders, const char *name) {
@@ -1400,6 +1417,41 @@ done:
     return out;
 }
 
+/* Extract the top-level "type" string from a property schema object, e.g.
+ * {"type":"number","description":...} -> "number".  Returns NULL when the
+ * value is not an object or "type" is absent or not a plain string (union
+ * types stay untyped, which keeps the current stringly behavior). */
+static char *json_schema_value_type(const char *value) {
+    const char *p = value ? value : "";
+    json_ws(&p);
+    if (*p != '{') return NULL;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) return NULL;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            return NULL;
+        }
+        p++;
+        if (!strcmp(key, "type")) {
+            free(key);
+            char *type = NULL;
+            json_ws(&p);
+            if (*p != '"' || !json_string(&p, &type)) return NULL;
+            return type;
+        }
+        free(key);
+        if (!json_skip_value(&p)) return NULL;
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    return NULL;
+}
+
 static bool parse_schema_properties(const char *json, tool_schema_order *order) {
     const char *p = json;
     json_ws(&p);
@@ -1430,8 +1482,15 @@ static bool parse_schema_properties(const char *json, tool_schema_order *order) 
                     return false;
                 }
                 p++;
-                tool_schema_order_prop_push(order, prop);
-                if (!json_skip_value(&p)) return false;
+                const char *value_start = p;
+                if (!json_skip_value(&p)) {
+                    tool_schema_order_prop_push(order, prop, NULL);
+                    return false;
+                }
+                char *raw_value = xstrndup(value_start, (size_t)(p - value_start));
+                tool_schema_order_prop_push(order, prop,
+                                            json_schema_value_type(raw_value));
+                free(raw_value);
                 json_ws(&p);
                 if (*p == ',') p++;
                 json_ws(&p);
@@ -2184,6 +2243,50 @@ bad:
     return true;
 }
 
+/* Return true when `text` is exactly one valid JSON value whose kind matches
+ * the declared schema type. */
+static bool json_text_matches_schema_type(const char *text, const char *type) {
+    const char *p = text ? text : "";
+    json_ws(&p);
+    char c = *p;
+    bool kind_ok = false;
+    if (!strcmp(type, "number") || !strcmp(type, "integer")) {
+        kind_ok = (c == '-' || (c >= '0' && c <= '9'));
+    } else if (!strcmp(type, "boolean")) {
+        kind_ok = (c == 't' || c == 'f');
+    } else if (!strcmp(type, "array")) {
+        kind_ok = (c == '[');
+    } else if (!strcmp(type, "object")) {
+        kind_ok = (c == '{');
+    } else if (!strcmp(type, "null")) {
+        kind_ok = (c == 'n');
+    }
+    if (!kind_ok) return false;
+    if (!json_skip_value(&p)) return false;
+    json_ws(&p);
+    return *p == '\0';
+}
+
+/* GLM's tool-call wire format (<arg_key>k</arg_key><arg_value>v</arg_value>)
+ * carries no type information, so the parser stores every argument as a JSON
+ * string.  Before serializing arguments back to the client, restore the types
+ * the client declared in the tool schema: a string value whose declared type
+ * is non-string and whose text is valid JSON of that type is emitted raw.
+ * Values that don't cleanly match their declared type are left untouched. */
+static void json_args_restore_schema_types(json_args *args,
+                                           const tool_schema_order *order) {
+    if (!order || !order->prop_type) return;
+    for (int i = 0; i < args->len; i++) {
+        json_arg *arg = &args->v[i];
+        if (!arg->is_string || !arg->value) continue;
+        const char *type = tool_schema_order_prop_type(order, arg->key);
+        if (!type || !strcmp(type, "string")) continue;
+        if (json_text_matches_schema_type(arg->value, type)) {
+            arg->is_string = false;
+        }
+    }
+}
+
 static void append_dsml_attr_escaped(buf *b, const char *s) {
     for (s = s ? s : ""; *s; s++) {
         if (*s == '&') buf_puts(b, "&amp;");
@@ -2326,12 +2429,14 @@ static void append_json_arg_pair(buf *b, const json_arg *arg) {
     else buf_puts(b, arg->value);
 }
 
-static void append_json_object_or_empty(buf *b, const char *json) {
+static void append_json_object_or_empty_typed(buf *b, const char *json,
+                                              const tool_schema_order *order) {
     json_args args = {0};
     if (!json_args_parse(json, &args)) {
         buf_puts(b, "{}");
         return;
     }
+    json_args_restore_schema_types(&args, order);
     buf_putc(b, '{');
     bool wrote = false;
     for (int i = 0; i < args.len; i++) {
@@ -5241,16 +5346,16 @@ static DS4_SERVER_MAYBE_UNUSED bool parse_generated_message_for_response(
         reasoning_out, calls, recovered_out);
 }
 
-static void append_json_object_string(buf *b, const char *json) {
+static void append_json_object_string(buf *b, const char *json,
+                                      const tool_schema_order *order) {
     buf tmp = {0};
-    append_json_object_or_empty(&tmp, json);
+    append_json_object_or_empty_typed(&tmp, json, order);
     json_escape(b, tmp.ptr ? tmp.ptr : "{}");
     buf_free(&tmp);
 }
 
 static void append_tool_calls_json(buf *b, const tool_calls *calls, const char *id_prefix,
                                    const tool_schema_orders *orders) {
-    (void)orders;
     buf_putc(b, '[');
     for (int i = 0; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
@@ -5262,7 +5367,8 @@ static void append_tool_calls_json(buf *b, const tool_calls *calls, const char *
         buf_puts(b, ",\"type\":\"function\",\"function\":{\"name\":");
         json_escape(b, tc->name ? tc->name : "");
         buf_puts(b, ",\"arguments\":");
-        append_json_object_string(b, tc->arguments);
+        append_json_object_string(b, tc->arguments,
+                                  tool_schema_orders_find(orders, tc->name));
         buf_puts(b, "}}");
     }
     buf_putc(b, ']');
@@ -5270,7 +5376,6 @@ static void append_tool_calls_json(buf *b, const tool_calls *calls, const char *
 
 static void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const char *id_prefix,
                                          const tool_schema_orders *orders) {
-    (void)orders;
     buf_putc(b, '[');
     for (int i = 0; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
@@ -5284,7 +5389,8 @@ static void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const 
         buf_puts(b, ",\"type\":\"function\",\"function\":{\"name\":");
         json_escape(b, tc->name ? tc->name : "");
         buf_puts(b, ",\"arguments\":");
-        append_json_object_string(b, tc->arguments);
+        append_json_object_string(b, tc->arguments,
+                                  tool_schema_orders_find(orders, tc->name));
         buf_puts(b, "}}");
     }
     buf_putc(b, ']');
@@ -6845,7 +6951,7 @@ static void responses_append_function_call_item(buf *b, const tool_call *tc,
             "{\"id\":\"%s\",\"type\":\"tool_search_call\",\"status\":\"%s\","
             "\"call_id\":\"%s\",\"execution\":\"client\",\"arguments\":",
             item->fc_id, item_status, item->call_id);
-        if (with_args) append_json_object_or_empty(b, tc->arguments);
+        if (with_args) append_json_object_or_empty_typed(b, tc->arguments, order);
         else buf_puts(b, "{}");
         buf_putc(b, '}');
         return;
@@ -6870,7 +6976,7 @@ static void responses_append_function_call_item(buf *b, const tool_call *tc,
     } else if (item->is_custom) {
         json_escape(b, tc->arguments ? tc->arguments : "");
     } else {
-        append_json_object_string(b, tc->arguments);
+        append_json_object_string(b, tc->arguments, order);
     }
     buf_putc(b, '}');
 }
@@ -6909,7 +7015,7 @@ static bool responses_sse_function_call_arguments_done(int fd, responses_stream 
     const tool_schema_order *order = tool_schema_orders_find(orders, tc->name);
     if (item->is_custom || responses_tool_call_is_tool_search(tc, order)) return true;
     buf args = {0};
-    append_json_object_string(&args, tc->arguments);
+    append_json_object_string(&args, tc->arguments, order);
     buf b = {0};
     buf_printf(&b,
         "{\"type\":\"response.function_call_arguments.delta\","
@@ -7340,7 +7446,6 @@ static const char *anthropic_stop_reason(const char *finish) {
 
 static void append_anthropic_tool_use(buf *b, const tool_call *tc, const char *id_prefix, int i,
                                       const tool_schema_orders *orders) {
-    (void)orders;
     char idbuf[128];
     snprintf(idbuf, sizeof(idbuf), "toolu_%s_%d", id_prefix, i);
     buf_puts(b, "{\"type\":\"tool_use\",\"id\":");
@@ -7348,7 +7453,8 @@ static void append_anthropic_tool_use(buf *b, const tool_call *tc, const char *i
     buf_puts(b, ",\"name\":");
     json_escape(b, tc->name ? tc->name : "");
     buf_puts(b, ",\"input\":");
-    append_json_object_or_empty(b, tc->arguments);
+    append_json_object_or_empty_typed(b, tc->arguments,
+                                      tool_schema_orders_find(orders, tc->name));
     buf_putc(b, '}');
 }
 
@@ -8032,7 +8138,6 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
 static bool anthropic_sse_tool_blocks_live(int fd, const request *r, const char *id,
                                            anthropic_stream *st,
                                            const tool_calls *calls) {
-    (void)r;
     if (!calls) return true;
 
     buf b = {0};
@@ -8062,7 +8167,8 @@ static bool anthropic_sse_tool_blocks_live(int fd, const request *r, const char 
                    "{\"type\":\"content_block_delta\",\"index\":%d,"
                    "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":",
                    st->next_index);
-        append_json_object_string(&b, tc->arguments);
+        append_json_object_string(&b, tc->arguments,
+                                  tool_schema_orders_find(&r->tool_orders, tc->name));
         buf_puts(&b, "}}");
         ok = sse_event(fd, "content_block_delta", b.ptr);
         buf_free(&b);
@@ -13914,6 +14020,55 @@ static void test_openai_tool_args_preserve_call_order(void) {
     request_free(&r);
 }
 
+/* GLM's untyped tool-call wire format makes the parser store every argument
+ * as a JSON string; serialization must restore the client-declared schema
+ * types (see json_args_restore_schema_types). */
+static void test_openai_tool_args_restore_schema_types(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    tool_schema_orders_add_json(&r.tool_orders,
+        "{\"name\":\"web_search\",\"input_schema\":{\"type\":\"object\",\"properties\":{"
+        "\"query\":{\"type\":\"string\"},"
+        "\"max_results\":{\"type\":\"number\"},"
+        "\"deep\":{\"type\":\"boolean\"},"
+        "\"exclude_domains\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}}}}");
+
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.name = xstrdup("web_search");
+    /* What the GLM parser produces today: every value is a string. */
+    tc.arguments = xstrdup("{\"query\":\"chips 2026\",\"max_results\":\"10\","
+                           "\"deep\":\"true\",\"exclude_domains\":\"[\\\"x.com\\\"]\","
+                           "\"unknown\":\"7\"}");
+    tool_calls_push(&calls, tc);
+
+    buf b = {0};
+    append_tool_calls_json(&b, &calls, "test", &r.tool_orders);
+    /* Declared non-string types are restored... */
+    TEST_ASSERT(strstr(b.ptr, "\\\"max_results\\\":10") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\\\"deep\\\":true") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\\\"exclude_domains\\\":[\\\"x.com\\\"]") != NULL);
+    /* ...while strings and undeclared properties stay strings. */
+    TEST_ASSERT(strstr(b.ptr, "\\\"query\\\":\\\"chips 2026\\\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\\\"unknown\\\":\\\"7\\\"") != NULL);
+    buf_free(&b);
+
+    /* A value that is not valid JSON of the declared type stays a string. */
+    tool_calls calls2 = {0};
+    tool_call tc2 = {0};
+    tc2.name = xstrdup("web_search");
+    tc2.arguments = xstrdup("{\"max_results\":\"ten\"}");
+    tool_calls_push(&calls2, tc2);
+    buf b2 = {0};
+    append_tool_calls_json(&b2, &calls2, "test", &r.tool_orders);
+    TEST_ASSERT(strstr(b2.ptr, "\\\"max_results\\\":\\\"ten\\\"") != NULL);
+    buf_free(&b2);
+
+    tool_calls_free(&calls);
+    tool_calls_free(&calls2);
+    request_free(&r);
+}
+
 static void test_anthropic_thinking_and_tool_args_preserve_call_order(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -16624,6 +16779,7 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_output_sends_tool_search_call_item();
     test_dsml_tool_args_preserve_call_order();
     test_openai_tool_args_preserve_call_order();
+    test_openai_tool_args_restore_schema_types();
     test_anthropic_thinking_and_tool_args_preserve_call_order();
     test_context_length_error_uses_protocol_standard_shape();
     test_cors_headers_are_opt_in();
