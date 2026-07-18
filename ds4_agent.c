@@ -2820,7 +2820,7 @@ static const char *agent_tool_viz_prefix(const char *name) {
     if (!strcmp(name, "search")) return "search ";
     if (!strcmp(name, "google_search")) return "google ";
     if (!strcmp(name, "visit_page")) return "visit ";
-    if (!strncmp(name, "mcp__", 5)) return "mcp ";
+    if (!strncmp(name, "mcp_", 4)) return "mcp ";
     return NULL;
 }
 
@@ -7435,6 +7435,7 @@ typedef struct {
     char *name;
     char *description;
     char *schema_json; /* raw compact JSON text of inputSchema, "{}" if absent */
+    bool primary;      /* full schema in the system prompt vs directory entry */
 } agent_mcp_tool;
 
 struct agent_mcp_server {
@@ -7442,6 +7443,7 @@ struct agent_mcp_server {
     char *command;
     char **args;     /* NULL-terminated argv tail */
     char **envp;     /* NULL-terminated "KEY=VAL" additions */
+    char **primary_tools; /* NULL-terminated names from config; NULL = all primary */
     pid_t pid;
     int in_fd;       /* write end: agent -> server stdin */
     int out_fd;      /* read end: server stdout -> agent */
@@ -7491,6 +7493,9 @@ static void agent_mcp_servers_free(agent_mcp_server *list) {
         free(list->args);
         if (list->envp) for (int i = 0; list->envp[i]; i++) free(list->envp[i]);
         free(list->envp);
+        if (list->primary_tools)
+            for (int i = 0; list->primary_tools[i]; i++) free(list->primary_tools[i]);
+        free(list->primary_tools);
         free(list);
         list = next;
     }
@@ -7711,6 +7716,13 @@ static bool agent_mcp_server_handshake(agent_mcp_server *s, char *err, size_t er
             agent_mcp_tool *out = &s->tools[s->tool_count++];
             out->name = xstrdup(name);
             out->description = xstrdup(agent_json_str(t, "description", ""));
+            out->primary = true;
+            if (s->primary_tools) {
+                out->primary = false;
+                for (int j = 0; s->primary_tools[j]; j++) {
+                    if (!strcmp(s->primary_tools[j], name)) { out->primary = true; break; }
+                }
+            }
             agent_json *schema = agent_json_get(t, "inputSchema");
             agent_buf sb = {.unbounded = true};
             if (schema) agent_json_write(&sb, schema);
@@ -7788,6 +7800,20 @@ static agent_mcp_server *agent_mcp_config_load(const char *path) {
                 }
                 s->envp[out_i] = NULL;
             }
+            /* Optional prompt-size control: tools named here get their full
+             * schema in the system prompt; the rest only appear in a compact
+             * directory and are described on demand via mcp_describe.  An
+             * empty list means every tool is directory-only. */
+            agent_json *primary = agent_json_get(sv, "primaryTools");
+            if (primary && primary->kind == AGENT_JSON_ARR) {
+                s->primary_tools = xmalloc(sizeof(char *) * (size_t)(primary->len + 1));
+                int out_i = 0;
+                for (int j = 0; j < primary->len; j++) {
+                    if (primary->vals[j]->kind == AGENT_JSON_STR)
+                        s->primary_tools[out_i++] = xstrdup(primary->vals[j]->str);
+                }
+                s->primary_tools[out_i] = NULL;
+            }
             if (tail) tail->next = s; else head = s;
             tail = s;
         }
@@ -7822,25 +7848,85 @@ static agent_mcp_server *agent_mcp_load_and_start(const agent_config *cfg) {
     return alive_head;
 }
 
-/* Render every discovered MCP tool as an "Available Tool Schemas" block in
- * the same function-call JSON shape the native tools use, namespaced
- * mcp__<server>__<tool> so names never collide across servers or with
- * native tools. */
+static void agent_mcp_append_one_schema(agent_buf *b, const agent_mcp_server *s,
+                                        const agent_mcp_tool *t) {
+    agent_buf_puts(b, "{\n  \"type\": \"function\",\n  \"function\": {\n    \"name\": \"mcp__");
+    agent_buf_puts(b, s->name);
+    agent_buf_puts(b, "__");
+    agent_buf_puts(b, t->name);
+    agent_buf_puts(b, "\",\n    \"description\": ");
+    agent_json_escape(b, t->description);
+    agent_buf_puts(b, ",\n    \"parameters\": ");
+    agent_buf_puts(b, t->schema_json);
+    agent_buf_puts(b, "\n  }\n}\n\n");
+}
+
+/* Trim an MCP description to its first line for the directory, keeping the
+ * prompt cost of a secondary tool to roughly one line. */
+static void agent_mcp_append_short_description(agent_buf *b, const char *desc) {
+    size_t n = strcspn(desc, "\n");
+    const size_t max = 120;
+    bool cut = n > max;
+    if (cut) n = max;
+    agent_buf_append(b, desc, n);
+    if (cut || desc[n]) agent_buf_puts(b, "...");
+}
+
+/* Render MCP tools for the system prompt.  Primary tools get their full
+ * function-call JSON schema like the native tools; secondary tools only get a
+ * one-line directory entry, and the model fetches their schema on demand with
+ * mcp_describe.  Names are namespaced mcp__<server>__<tool> so they never
+ * collide across servers or with native tools. */
 static void agent_mcp_append_tool_schemas(agent_buf *b, const agent_mcp_server *servers) {
     for (const agent_mcp_server *s = servers; s; s = s->next) {
         for (int i = 0; i < s->tool_count; i++) {
+            if (s->tools[i].primary)
+                agent_mcp_append_one_schema(b, s, &s->tools[i]);
+        }
+    }
+
+    bool have_secondary = false;
+    for (const agent_mcp_server *s = servers; s; s = s->next) {
+        for (int i = 0; i < s->tool_count; i++) {
+            if (!s->tools[i].primary) { have_secondary = true; break; }
+        }
+    }
+    if (!have_secondary) return;
+
+    agent_buf_puts(b,
+        "### MCP Tool Directory\n\n"
+        "These additional tools exist but their parameter schemas are not "
+        "loaded. Before the first use of one, call mcp_describe with its full "
+        "name to get the schema:\n\n"
+        "{\n"
+        "  \"type\": \"function\",\n"
+        "  \"function\": {\n"
+        "    \"name\": \"mcp_describe\",\n"
+        "    \"description\": \"Return the full parameter schema of directory MCP tools. Accepts one or more space-separated tool names.\",\n"
+        "    \"parameters\": {\n"
+        "      \"type\": \"object\",\n"
+        "      \"properties\": {\n"
+        "        \"tools\": {\"type\": \"string\"}\n"
+        "      },\n"
+        "      \"required\": [\"tools\"]\n"
+        "    }\n"
+        "  }\n"
+        "}\n\n"
+        "Directory:\n");
+    for (const agent_mcp_server *s = servers; s; s = s->next) {
+        for (int i = 0; i < s->tool_count; i++) {
             const agent_mcp_tool *t = &s->tools[i];
-            agent_buf_puts(b, "{\n  \"type\": \"function\",\n  \"function\": {\n    \"name\": \"mcp__");
+            if (t->primary) continue;
+            agent_buf_puts(b, "- mcp__");
             agent_buf_puts(b, s->name);
             agent_buf_puts(b, "__");
             agent_buf_puts(b, t->name);
-            agent_buf_puts(b, "\",\n    \"description\": ");
-            agent_json_escape(b, t->description);
-            agent_buf_puts(b, ",\n    \"parameters\": ");
-            agent_buf_puts(b, t->schema_json);
-            agent_buf_puts(b, "\n  }\n}\n\n");
+            agent_buf_puts(b, ": ");
+            agent_mcp_append_short_description(b, t->description);
+            agent_buf_puts(b, "\n");
         }
     }
+    agent_buf_puts(b, "\n");
 }
 
 static agent_mcp_server *agent_mcp_find_server(agent_mcp_server *servers, const char *name, size_t len) {
@@ -7934,6 +8020,50 @@ static char *agent_tool_mcp_call(agent_worker *w, const agent_tool_call *call) {
     agent_mcp_append_content(&out, result);
     agent_json_free(result);
     if (out.len == 0) agent_buf_puts(&out, "(no output)\n");
+    return agent_buf_take(&out);
+}
+
+/* Resolve one namespaced mcp__<server>__<tool> name against the live server
+ * list.  Returns NULL when the name is malformed or unknown. */
+static agent_mcp_tool *agent_mcp_resolve(agent_mcp_server *servers, const char *name,
+                                         const agent_mcp_server **out_server) {
+    if (strncmp(name, "mcp__", 5)) return NULL;
+    const char *full = name + 5;
+    const char *sep = strstr(full, "__");
+    if (!sep) return NULL;
+    agent_mcp_server *s = agent_mcp_find_server(servers, full, (size_t)(sep - full));
+    if (!s) return NULL;
+    if (out_server) *out_server = s;
+    return agent_mcp_find_tool(s, sep + 2);
+}
+
+/* mcp_describe: return the full schema of directory (secondary) tools so the
+ * model can invoke them without carrying every schema in the system prompt. */
+static char *agent_tool_mcp_describe(agent_worker *w, const agent_tool_call *call) {
+    const char *names = agent_tool_arg_value(call, "tools");
+    if (!names || !names[0])
+        return xstrdup("Tool error: mcp_describe requires tools\n");
+
+    agent_buf out = {0};
+    char *copy = xstrdup(names);
+    int found = 0;
+    for (char *save = NULL, *name = strtok_r(copy, " \t\n,", &save);
+         name; name = strtok_r(NULL, " \t\n,", &save))
+    {
+        const agent_mcp_server *s = NULL;
+        agent_mcp_tool *t = agent_mcp_resolve(w->mcp_servers, name, &s);
+        if (!t) {
+            agent_buf_puts(&out, "Tool error: unknown mcp tool: ");
+            agent_buf_puts(&out, name);
+            agent_buf_puts(&out, "\n");
+            continue;
+        }
+        agent_mcp_append_one_schema(&out, s, t);
+        found++;
+    }
+    free(copy);
+    if (found == 0 && out.len == 0)
+        agent_buf_puts(&out, "Tool error: mcp_describe found no tool names\n");
     return agent_buf_take(&out);
 }
 
@@ -8060,6 +8190,87 @@ static void test_agent_json_string_larger_than_buf_cap_is_not_truncated(void) {
     free(big);
 }
 
+static void test_agent_mcp_config_load_parses_primary_tools(void) {
+    char path[] = "/tmp/ds4_agent_test_mcp_XXXXXX";
+    int fd = mkstemp(path);
+    AGENT_TEST_ASSERT(fd >= 0);
+    const char *cfg =
+        "{\"mcpServers\":{\"demo\":{\"command\":\"echo\","
+        "\"primaryTools\":[\"alpha\",\"beta\"]}}}";
+    write_all(fd, cfg, strlen(cfg));
+    close(fd);
+
+    agent_mcp_server *list = agent_mcp_config_load(path);
+    AGENT_TEST_ASSERT(list && list->primary_tools);
+    AGENT_TEST_ASSERT(!strcmp(list->primary_tools[0], "alpha"));
+    AGENT_TEST_ASSERT(!strcmp(list->primary_tools[1], "beta"));
+    AGENT_TEST_ASSERT(!list->primary_tools[2]);
+    agent_mcp_servers_free(list);
+    unlink(path);
+}
+
+/* Build an in-memory two-tool server (one primary, one directory-only) for
+ * prompt-rendering and mcp_describe tests; no subprocess involved. */
+static agent_mcp_server *agent_test_make_split_server(void) {
+    agent_mcp_server *s = xmalloc(sizeof(*s));
+    memset(s, 0, sizeof(*s));
+    s->in_fd = s->out_fd = -1;
+    s->alive = true;
+    s->name = xstrdup("demo");
+    s->command = xstrdup("true");
+    s->tools = xmalloc(sizeof(*s->tools) * 2);
+    s->tools[0] = (agent_mcp_tool){
+        .name = xstrdup("alpha"),
+        .description = xstrdup("Primary tool."),
+        .schema_json = xstrdup("{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\"}}}"),
+        .primary = true,
+    };
+    s->tools[1] = (agent_mcp_tool){
+        .name = xstrdup("omega"),
+        .description = xstrdup("Secondary tool.\nSecond line not shown."),
+        .schema_json = xstrdup("{\"type\":\"object\",\"properties\":{\"o\":{\"type\":\"number\"}}}"),
+        .primary = false,
+    };
+    s->tool_count = 2;
+    return s;
+}
+
+static void test_agent_mcp_tool_schemas_split_primary_and_directory(void) {
+    agent_mcp_server *s = agent_test_make_split_server();
+    agent_buf b = {.unbounded = true};
+    agent_mcp_append_tool_schemas(&b, s);
+    char *out = agent_buf_take(&b);
+
+    AGENT_TEST_ASSERT(strstr(out, "\"name\": \"mcp__demo__alpha\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(out, "MCP Tool Directory") != NULL);
+    AGENT_TEST_ASSERT(strstr(out, "\"name\": \"mcp_describe\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(out, "- mcp__demo__omega: Secondary tool....") != NULL);
+    /* The secondary tool's schema and description tail stay out of the prompt. */
+    AGENT_TEST_ASSERT(strstr(out, "\"name\": \"mcp__demo__omega\"") == NULL);
+    AGENT_TEST_ASSERT(strstr(out, "Second line") == NULL);
+
+    free(out);
+    agent_mcp_servers_free(s);
+}
+
+static void test_agent_mcp_describe_returns_directory_tool_schema(void) {
+    agent_mcp_server *s = agent_test_make_split_server();
+    agent_worker w = {0};
+    w.mcp_servers = s;
+
+    agent_tool_call call = {0};
+    call.name = xstrdup("mcp_describe");
+    agent_tool_call_add_arg(&call, "tools", "mcp__demo__omega mcp__demo__nope",
+                            strlen("mcp__demo__omega mcp__demo__nope"), true);
+    char *out = agent_tool_mcp_describe(&w, &call);
+    AGENT_TEST_ASSERT(strstr(out, "\"name\": \"mcp__demo__omega\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(out, "\"o\":{\"type\":\"number\"}") != NULL);
+    AGENT_TEST_ASSERT(strstr(out, "unknown mcp tool: mcp__demo__nope") != NULL);
+    free(out);
+    agent_tool_call_free(&call);
+    agent_mcp_servers_free(s);
+}
+
 static void ds4_agent_mcp_unit_tests_run(void) {
     test_agent_json_round_trip();
     test_agent_json_escape_round_trips_through_writer();
@@ -8069,6 +8280,9 @@ static void ds4_agent_mcp_unit_tests_run(void) {
     test_agent_mcp_config_load_missing_file_is_not_an_error();
     test_agent_mcp_config_load_rejects_double_underscore_names();
     test_agent_json_string_larger_than_buf_cap_is_not_truncated();
+    test_agent_mcp_config_load_parses_primary_tools();
+    test_agent_mcp_tool_schemas_split_primary_and_directory();
+    test_agent_mcp_describe_returns_directory_tool_schema();
 }
 #endif
 
@@ -8129,6 +8343,7 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
         return agent_bash_job_tool_result(w, job, wait, refresh, stop, true);
     }
 
+    if (!strcmp(call->name, "mcp_describe")) return agent_tool_mcp_describe(w, call);
     if (!strncmp(call->name, "mcp__", 5)) return agent_tool_mcp_call(w, call);
 
     {
