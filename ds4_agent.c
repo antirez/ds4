@@ -64,6 +64,7 @@ typedef struct {
     ds4_engine_options engine;
     agent_generation_options gen;
     const char *chdir_path;
+    const char *mcp_config_path;
     bool non_interactive;
 } agent_config;
 
@@ -94,6 +95,7 @@ typedef struct {
 } agent_status;
 
 typedef struct agent_bash_job agent_bash_job;
+typedef struct agent_mcp_server agent_mcp_server;
 
 typedef struct {
     ds4_engine *engine;
@@ -146,6 +148,7 @@ typedef struct {
     agent_bash_job *bash_jobs;
     int next_bash_job_id;
     bool raw_mode_needs_restore;
+    agent_mcp_server *mcp_servers;
 } agent_worker;
 
 static unsigned agent_next_prefill_label(void);
@@ -383,6 +386,48 @@ static void write_all(int fd, const char *p, size_t n) {
     }
 }
 
+/* Bounded by default: tool results and other model-visible text cap at 128KB
+ * so one observation cannot flood the context.  Builders that must never
+ * silently drop bytes (system prompt assembly, JSON encoding/decoding) set
+ * unbounded before the first append. */
+typedef struct {
+    char *ptr;
+    size_t len;
+    size_t cap;
+    bool truncated;
+    bool unbounded;
+} agent_buf;
+
+static void agent_buf_append(agent_buf *b, const char *s, size_t n) {
+    if (!n || b->truncated) return;
+    const size_t max = 128 * 1024;
+    if (!b->unbounded && b->len + n > max) {
+        n = max > b->len ? max - b->len : 0;
+        b->truncated = true;
+    }
+    if (!n) return;
+    if (b->len + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap * 2 : 4096;
+        while (cap < b->len + n + 1) cap *= 2;
+        b->ptr = xrealloc(b->ptr, cap);
+        b->cap = cap;
+    }
+    memcpy(b->ptr + b->len, s, n);
+    b->len += n;
+    b->ptr[b->len] = '\0';
+}
+
+static void agent_buf_puts(agent_buf *b, const char *s) {
+    agent_buf_append(b, s, strlen(s));
+}
+
+static char *agent_buf_take(agent_buf *b) {
+    if (!b->ptr) return xstrdup("");
+    char *p = b->ptr;
+    memset(b, 0, sizeof(*b));
+    return p;
+}
+
 typedef struct {
     char *ptr;
     size_t len;
@@ -600,6 +645,8 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--chdir")) {
             c.chdir_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mcp-config")) {
+            c.mcp_config_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
@@ -945,16 +992,15 @@ static const char agent_tools_prompt_after_edit[] =
     "- Work in a way that preserves the current system configuration integrity, "
     "unless explicitly asked otherwise by the user.\n";
 
-static char *agent_build_tools_prompt(void) {
-    const char *edit = agent_tools_prompt_edit_line;
-    size_t a = strlen(agent_tools_prompt_intro);
-    size_t b = strlen(edit);
-    size_t c = strlen(agent_tools_prompt_after_edit);
-    char *out = xmalloc(a + b + c + 1);
-    memcpy(out, agent_tools_prompt_intro, a);
-    memcpy(out + a, edit, b);
-    memcpy(out + a + b, agent_tools_prompt_after_edit, c + 1);
-    return out;
+static void agent_mcp_append_tool_schemas(agent_buf *b, const agent_mcp_server *servers);
+
+static char *agent_build_tools_prompt(const agent_mcp_server *mcp_servers) {
+    agent_buf b = {.unbounded = true};
+    agent_buf_puts(&b, agent_tools_prompt_intro);
+    agent_buf_puts(&b, agent_tools_prompt_edit_line);
+    agent_buf_puts(&b, agent_tools_prompt_after_edit);
+    if (mcp_servers) agent_mcp_append_tool_schemas(&b, mcp_servers);
+    return agent_buf_take(&b);
 }
 
 static const char agent_dsml_syntax_reminder[] =
@@ -967,8 +1013,8 @@ static const char agent_dsml_syntax_reminder[] =
 
 #define AGENT_SYSTEM_PROMPT_REMINDER_TOKENS 50000
 
-static char *agent_build_system_prompt_reminder(void) {
-    char *tools = agent_build_tools_prompt();
+static char *agent_build_system_prompt_reminder(const agent_mcp_server *mcp_servers) {
+    char *tools = agent_build_tools_prompt(mcp_servers);
     const char *start = "\n\n[System prompt reminder follows.]\n";
     const char *end = "[End system prompt reminder.]\n\n";
     size_t len = strlen(start) + strlen(tools) + strlen(end) + 1;
@@ -982,13 +1028,14 @@ static char *agent_build_system_prompt_reminder(void) {
 }
 
 static void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
-                                       const char *extra) {
+                                       const char *extra,
+                                       const agent_mcp_server *mcp_servers) {
     /* The built-in tool prompt is trusted DS4 control text.  Tokenize it like a
      * rendered chat prompt so the literal ｜DSML｜ markers in the examples become
      * the model's dedicated DSML token.  Do not apply that tokenizer to user
      * supplied -sys text: arbitrary user text containing <｜User｜>, <think>, or
      * ｜DSML｜ must remain plain content, not control tokens. */
-    char *tools_prompt = agent_build_tools_prompt();
+    char *tools_prompt = agent_build_tools_prompt(mcp_servers);
     ds4_tokenize_rendered_chat(engine, tools_prompt, tokens);
     free(tools_prompt);
 
@@ -1040,7 +1087,7 @@ static void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
         return;
     }
 
-    char *reminder = agent_build_system_prompt_reminder();
+    char *reminder = agent_build_system_prompt_reminder(w->mcp_servers);
     agent_publish_system_status(w, "Re-injecting system prompt reminder...");
     agent_trace(w, "system prompt reminder injected at transcript=%d",
                 w->transcript.len);
@@ -2773,6 +2820,7 @@ static const char *agent_tool_viz_prefix(const char *name) {
     if (!strcmp(name, "search")) return "search ";
     if (!strcmp(name, "google_search")) return "google ";
     if (!strcmp(name, "visit_page")) return "visit ";
+    if (!strncmp(name, "mcp__", 5)) return "mcp ";
     return NULL;
 }
 
@@ -3544,43 +3592,6 @@ static bool worker_cancel_session_cb(void *ud) {
     return worker_should_interrupt(ud);
 }
 
-typedef struct {
-    char *ptr;
-    size_t len;
-    size_t cap;
-    bool truncated;
-} agent_buf;
-
-static void agent_buf_append(agent_buf *b, const char *s, size_t n) {
-    if (!n || b->truncated) return;
-    const size_t max = 128 * 1024;
-    if (b->len + n > max) {
-        n = max > b->len ? max - b->len : 0;
-        b->truncated = true;
-    }
-    if (!n) return;
-    if (b->len + n + 1 > b->cap) {
-        size_t cap = b->cap ? b->cap * 2 : 4096;
-        while (cap < b->len + n + 1) cap *= 2;
-        b->ptr = xrealloc(b->ptr, cap);
-        b->cap = cap;
-    }
-    memcpy(b->ptr + b->len, s, n);
-    b->len += n;
-    b->ptr[b->len] = '\0';
-}
-
-static void agent_buf_puts(agent_buf *b, const char *s) {
-    agent_buf_append(b, s, strlen(s));
-}
-
-static char *agent_buf_take(agent_buf *b) {
-    if (!b->ptr) return xstrdup("");
-    char *p = b->ptr;
-    memset(b, 0, sizeof(*b));
-    return p;
-}
-
 static bool agent_tokens_equal(const ds4_tokens *a, const ds4_tokens *b) {
     if (!a || !b || a->len != b->len) return false;
     for (int i = 0; i < a->len; i++) {
@@ -3993,7 +4004,7 @@ static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
     if (w->cfg->gen.think_mode == DS4_THINK_MAX &&
         effective_think_mode(w->cfg) == DS4_THINK_MAX)
         ds4_chat_append_max_effort_prefix(w->engine, out);
-    agent_append_system_prompt(w->engine, out, w->cfg->gen.system);
+    agent_append_system_prompt(w->engine, out, w->cfg->gen.system, w->mcp_servers);
 }
 
 static void agent_publish_system_status(agent_worker *w, const char *msg) {
@@ -6194,9 +6205,12 @@ static void test_agent_edit_upto_requires_tail_after_newline_strip(void) {
     AGENT_TEST_ASSERT(strstr(err, "must include a unique tail anchor") != NULL);
 }
 
+static void ds4_agent_mcp_unit_tests_run(void);
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
+    ds4_agent_mcp_unit_tests_run();
 }
 #endif
 
@@ -7133,6 +7147,932 @@ static pid_t agent_tool_pid(const agent_tool_call *call) {
 }
 
 /* ============================================================================
+ * MCP Client
+ * ============================================================================
+ *
+ * ds4-agent can load external tools from stdio MCP servers listed in a
+ * .mcp.json file, alongside its native DSML tools. Each server is a
+ * long-lived subprocess speaking newline-delimited JSON-RPC 2.0 on its
+ * stdin/stdout (the MCP stdio transport). The client here is intentionally
+ * synchronous: one tool call blocks the worker thread for one round trip,
+ * exactly like every other tool in agent_execute_tool_call.
+ */
+
+typedef enum {
+    AGENT_JSON_NULL,
+    AGENT_JSON_BOOL,
+    AGENT_JSON_NUM,
+    AGENT_JSON_STR,
+    AGENT_JSON_ARR,
+    AGENT_JSON_OBJ,
+} agent_json_kind;
+
+typedef struct agent_json {
+    agent_json_kind kind;
+    bool b;
+    double num;
+    char *str;
+    char **keys;             /* AGENT_JSON_OBJ only, len entries */
+    struct agent_json **vals; /* AGENT_JSON_ARR/OBJ, len entries */
+    int len;
+} agent_json;
+
+static agent_json *agent_json_new(agent_json_kind kind) {
+    agent_json *v = xmalloc(sizeof(*v));
+    memset(v, 0, sizeof(*v));
+    v->kind = kind;
+    return v;
+}
+
+static void agent_json_free(agent_json *v) {
+    if (!v) return;
+    for (int i = 0; i < v->len; i++) {
+        agent_json_free(v->vals[i]);
+        if (v->keys) free(v->keys[i]);
+    }
+    free(v->vals);
+    free(v->keys);
+    free(v->str);
+    free(v);
+}
+
+static void agent_json_skip_ws(const char **p) {
+    while (**p == ' ' || **p == '\t' || **p == '\n' || **p == '\r') (*p)++;
+}
+
+static bool agent_json_parse_value(const char **p, agent_json **out);
+
+static bool agent_json_parse_string_raw(const char **p, char **out) {
+    if (**p != '"') return false;
+    (*p)++;
+    agent_buf b = {.unbounded = true};
+    while (**p && **p != '"') {
+        char c = *(*p)++;
+        if (c == '\\') {
+            char e = *(*p)++;
+            switch (e) {
+            case '"': agent_buf_append(&b, "\"", 1); break;
+            case '\\': agent_buf_append(&b, "\\", 1); break;
+            case '/': agent_buf_append(&b, "/", 1); break;
+            case 'b': agent_buf_append(&b, "\b", 1); break;
+            case 'f': agent_buf_append(&b, "\f", 1); break;
+            case 'n': agent_buf_append(&b, "\n", 1); break;
+            case 'r': agent_buf_append(&b, "\r", 1); break;
+            case 't': agent_buf_append(&b, "\t", 1); break;
+            case 'u': {
+                unsigned cp = 0;
+                for (int i = 0; i < 4; i++) {
+                    char h = *(*p)++;
+                    cp <<= 4;
+                    if (h >= '0' && h <= '9') cp |= (unsigned)(h - '0');
+                    else if (h >= 'a' && h <= 'f') cp |= (unsigned)(h - 'a' + 10);
+                    else if (h >= 'A' && h <= 'F') cp |= (unsigned)(h - 'A' + 10);
+                    else { free(b.ptr); return false; }
+                }
+                /* Encode as UTF-8; surrogate pairs are not needed for the
+                 * plain ASCII tool text MCP servers exchange with this
+                 * client, so only the basic multilingual plane is handled. */
+                if (cp < 0x80) {
+                    char c1 = (char)cp;
+                    agent_buf_append(&b, &c1, 1);
+                } else if (cp < 0x800) {
+                    char enc[2] = {(char)(0xC0 | (cp >> 6)), (char)(0x80 | (cp & 0x3F))};
+                    agent_buf_append(&b, enc, 2);
+                } else {
+                    char enc[3] = {(char)(0xE0 | (cp >> 12)),
+                                   (char)(0x80 | ((cp >> 6) & 0x3F)),
+                                   (char)(0x80 | (cp & 0x3F))};
+                    agent_buf_append(&b, enc, 3);
+                }
+                break;
+            }
+            default: free(b.ptr); return false;
+            }
+        } else {
+            agent_buf_append(&b, &c, 1);
+        }
+    }
+    if (**p != '"') { free(b.ptr); return false; }
+    (*p)++;
+    *out = agent_buf_take(&b);
+    return true;
+}
+
+static bool agent_json_parse_value(const char **p, agent_json **out) {
+    agent_json_skip_ws(p);
+    if (!**p) return false;
+    if (**p == '"') {
+        char *s;
+        if (!agent_json_parse_string_raw(p, &s)) return false;
+        agent_json *v = agent_json_new(AGENT_JSON_STR);
+        v->str = s;
+        *out = v;
+        return true;
+    }
+    if (!strncmp(*p, "null", 4)) {
+        *p += 4;
+        *out = agent_json_new(AGENT_JSON_NULL);
+        return true;
+    }
+    if (!strncmp(*p, "true", 4)) {
+        *p += 4;
+        agent_json *v = agent_json_new(AGENT_JSON_BOOL);
+        v->b = true;
+        *out = v;
+        return true;
+    }
+    if (!strncmp(*p, "false", 5)) {
+        *p += 5;
+        agent_json *v = agent_json_new(AGENT_JSON_BOOL);
+        v->b = false;
+        *out = v;
+        return true;
+    }
+    if (**p == '-' || isdigit((unsigned char)**p)) {
+        char *end;
+        double n = strtod(*p, &end);
+        if (end == *p) return false;
+        *p = end;
+        agent_json *v = agent_json_new(AGENT_JSON_NUM);
+        v->num = n;
+        *out = v;
+        return true;
+    }
+    if (**p == '[') {
+        (*p)++;
+        agent_json *v = agent_json_new(AGENT_JSON_ARR);
+        agent_json_skip_ws(p);
+        if (**p == ']') { (*p)++; *out = v; return true; }
+        for (;;) {
+            agent_json *item;
+            if (!agent_json_parse_value(p, &item)) { agent_json_free(v); return false; }
+            v->vals = xrealloc(v->vals, sizeof(agent_json *) * (size_t)(v->len + 1));
+            v->vals[v->len++] = item;
+            agent_json_skip_ws(p);
+            if (**p == ',') { (*p)++; continue; }
+            if (**p == ']') { (*p)++; break; }
+            agent_json_free(v);
+            return false;
+        }
+        *out = v;
+        return true;
+    }
+    if (**p == '{') {
+        (*p)++;
+        agent_json *v = agent_json_new(AGENT_JSON_OBJ);
+        agent_json_skip_ws(p);
+        if (**p == '}') { (*p)++; *out = v; return true; }
+        for (;;) {
+            agent_json_skip_ws(p);
+            char *key;
+            if (!agent_json_parse_string_raw(p, &key)) { agent_json_free(v); return false; }
+            agent_json_skip_ws(p);
+            if (**p != ':') { free(key); agent_json_free(v); return false; }
+            (*p)++;
+            agent_json *val;
+            if (!agent_json_parse_value(p, &val)) { free(key); agent_json_free(v); return false; }
+            v->keys = xrealloc(v->keys, sizeof(char *) * (size_t)(v->len + 1));
+            v->vals = xrealloc(v->vals, sizeof(agent_json *) * (size_t)(v->len + 1));
+            v->keys[v->len] = key;
+            v->vals[v->len] = val;
+            v->len++;
+            agent_json_skip_ws(p);
+            if (**p == ',') { (*p)++; continue; }
+            if (**p == '}') { (*p)++; break; }
+            agent_json_free(v);
+            return false;
+        }
+        *out = v;
+        return true;
+    }
+    return false;
+}
+
+/* Parse one complete JSON document from a NUL-terminated string. Returns NULL
+ * on any syntax error. */
+static agent_json *agent_json_parse(const char *text) {
+    const char *p = text;
+    agent_json *v;
+    if (!agent_json_parse_value(&p, &v)) return NULL;
+    return v;
+}
+
+static agent_json *agent_json_get(const agent_json *obj, const char *key) {
+    if (!obj || obj->kind != AGENT_JSON_OBJ) return NULL;
+    for (int i = 0; i < obj->len; i++) {
+        if (!strcmp(obj->keys[i], key)) return obj->vals[i];
+    }
+    return NULL;
+}
+
+static const char *agent_json_str(const agent_json *obj, const char *key, const char *def) {
+    agent_json *v = agent_json_get(obj, key);
+    return (v && v->kind == AGENT_JSON_STR) ? v->str : def;
+}
+
+static void agent_json_escape(agent_buf *b, const char *s) {
+    agent_buf_append(b, "\"", 1);
+    for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
+        switch (*p) {
+        case '"': agent_buf_puts(b, "\\\""); break;
+        case '\\': agent_buf_puts(b, "\\\\"); break;
+        case '\n': agent_buf_puts(b, "\\n"); break;
+        case '\r': agent_buf_puts(b, "\\r"); break;
+        case '\t': agent_buf_puts(b, "\\t"); break;
+        default:
+            if (*p < 0x20) {
+                char esc[8];
+                snprintf(esc, sizeof(esc), "\\u%04x", *p);
+                agent_buf_puts(b, esc);
+            } else {
+                agent_buf_append(b, (const char *)p, 1);
+            }
+        }
+    }
+    agent_buf_append(b, "\"", 1);
+}
+
+/* Serialize an agent_json value read from JSON Schema back to compact JSON
+ * text; used to re-embed inputSchema in the tools prompt. */
+static void agent_json_write(agent_buf *b, const agent_json *v) {
+    if (!v) { agent_buf_puts(b, "null"); return; }
+    switch (v->kind) {
+    case AGENT_JSON_NULL: agent_buf_puts(b, "null"); break;
+    case AGENT_JSON_BOOL: agent_buf_puts(b, v->b ? "true" : "false"); break;
+    case AGENT_JSON_NUM: {
+        char n[64];
+        double r = round(v->num);
+        if (r == v->num && fabs(v->num) < 1e15)
+            snprintf(n, sizeof(n), "%.0f", v->num);
+        else
+            snprintf(n, sizeof(n), "%g", v->num);
+        agent_buf_puts(b, n);
+        break;
+    }
+    case AGENT_JSON_STR: agent_json_escape(b, v->str); break;
+    case AGENT_JSON_ARR:
+        agent_buf_append(b, "[", 1);
+        for (int i = 0; i < v->len; i++) {
+            if (i) agent_buf_append(b, ",", 1);
+            agent_json_write(b, v->vals[i]);
+        }
+        agent_buf_append(b, "]", 1);
+        break;
+    case AGENT_JSON_OBJ:
+        agent_buf_append(b, "{", 1);
+        for (int i = 0; i < v->len; i++) {
+            if (i) agent_buf_append(b, ",", 1);
+            agent_json_escape(b, v->keys[i]);
+            agent_buf_append(b, ":", 1);
+            agent_json_write(b, v->vals[i]);
+        }
+        agent_buf_append(b, "}", 1);
+        break;
+    }
+}
+
+typedef struct {
+    char *name;
+    char *description;
+    char *schema_json; /* raw compact JSON text of inputSchema, "{}" if absent */
+} agent_mcp_tool;
+
+struct agent_mcp_server {
+    char *name;
+    char *command;
+    char **args;     /* NULL-terminated argv tail */
+    char **envp;     /* NULL-terminated "KEY=VAL" additions */
+    pid_t pid;
+    int in_fd;       /* write end: agent -> server stdin */
+    int out_fd;      /* read end: server stdout -> agent */
+    bool alive;
+    int next_id;
+    char *rbuf;
+    size_t rbuf_len, rbuf_cap;
+    agent_mcp_tool *tools;
+    int tool_count;
+    agent_mcp_server *next;
+};
+
+#define AGENT_MCP_TIMEOUT_SEC 30
+
+static void agent_mcp_tool_free(agent_mcp_tool *t) {
+    free(t->name);
+    free(t->description);
+    free(t->schema_json);
+}
+
+static void agent_mcp_server_close(agent_mcp_server *s) {
+    if (s->in_fd >= 0) close(s->in_fd);
+    if (s->out_fd >= 0) close(s->out_fd);
+    s->in_fd = s->out_fd = -1;
+    if (s->alive && s->pid > 0) {
+        kill(s->pid, SIGTERM);
+        int status;
+        double start = now_sec();
+        while (waitpid(s->pid, &status, WNOHANG) == 0 && now_sec() - start < 1.0)
+            usleep(20000);
+        if (waitpid(s->pid, &status, WNOHANG) == 0) kill(s->pid, SIGKILL);
+        waitpid(s->pid, &status, 0);
+    }
+    s->alive = false;
+}
+
+static void agent_mcp_servers_free(agent_mcp_server *list) {
+    while (list) {
+        agent_mcp_server *next = list->next;
+        agent_mcp_server_close(list);
+        for (int i = 0; i < list->tool_count; i++) agent_mcp_tool_free(&list->tools[i]);
+        free(list->tools);
+        free(list->rbuf);
+        free(list->name);
+        free(list->command);
+        if (list->args) for (int i = 0; list->args[i]; i++) free(list->args[i]);
+        free(list->args);
+        if (list->envp) for (int i = 0; list->envp[i]; i++) free(list->envp[i]);
+        free(list->envp);
+        free(list);
+        list = next;
+    }
+}
+
+/* Read one newline-delimited JSON-RPC message, blocking up to the absolute
+ * deadline. Returns NULL (and marks the server dead) on timeout, EOF, or read
+ * error. */
+static char *agent_mcp_read_line(agent_mcp_server *s, double deadline) {
+    for (;;) {
+        for (size_t i = 0; i < s->rbuf_len; i++) {
+            if (s->rbuf[i] == '\n') {
+                char *line = xstrndup(s->rbuf, i);
+                memmove(s->rbuf, s->rbuf + i + 1, s->rbuf_len - i - 1);
+                s->rbuf_len -= i + 1;
+                return line;
+            }
+        }
+        double remaining = deadline - now_sec();
+        if (remaining <= 0) { s->alive = false; return NULL; }
+        struct pollfd pfd = {.fd = s->out_fd, .events = POLLIN};
+        int pr = poll(&pfd, 1, (int)(remaining * 1000) + 1);
+        if (pr <= 0) { s->alive = false; return NULL; }
+        char chunk[4096];
+        ssize_t n = read(s->out_fd, chunk, sizeof(chunk));
+        if (n <= 0) { s->alive = false; return NULL; }
+        if (s->rbuf_len + (size_t)n + 1 > s->rbuf_cap) {
+            size_t cap = s->rbuf_cap ? s->rbuf_cap * 2 : 4096;
+            while (cap < s->rbuf_len + (size_t)n + 1) cap *= 2;
+            s->rbuf = xrealloc(s->rbuf, cap);
+            s->rbuf_cap = cap;
+        }
+        memcpy(s->rbuf + s->rbuf_len, chunk, (size_t)n);
+        s->rbuf_len += (size_t)n;
+    }
+}
+
+static bool agent_mcp_write_line(agent_mcp_server *s, const char *line) {
+    size_t len = strlen(line);
+    agent_buf b = {.unbounded = true};
+    agent_buf_append(&b, line, len);
+    agent_buf_append(&b, "\n", 1);
+    char *out = agent_buf_take(&b);
+    size_t n = strlen(out);
+    size_t off = 0;
+    bool ok = true;
+    while (off < n) {
+        ssize_t wr = write(s->in_fd, out + off, n - off);
+        if (wr < 0) {
+            if (errno == EINTR) continue;
+            ok = false;
+            break;
+        }
+        off += (size_t)wr;
+    }
+    free(out);
+    if (!ok) s->alive = false;
+    return ok;
+}
+
+/* Send a JSON-RPC request and wait for the reply with a matching id,
+ * discarding any notifications the server sends in between. On success
+ * returns the "result" value (caller frees the returned agent_json's owning
+ * response, not the result directly -- see callers). Returns false on
+ * transport failure or a JSON-RPC error, filling err. */
+static bool agent_mcp_request(agent_mcp_server *s, const char *method,
+                              const char *params_json, agent_json **out_result,
+                              char *err, size_t err_len) {
+    int id = ++s->next_id;
+    agent_buf b = {.unbounded = true};
+    char hdr[128];
+    snprintf(hdr, sizeof(hdr), "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":", id);
+    agent_buf_puts(&b, hdr);
+    agent_json_escape(&b, method);
+    agent_buf_puts(&b, ",\"params\":");
+    agent_buf_puts(&b, params_json ? params_json : "{}");
+    agent_buf_append(&b, "}", 1);
+    char *req = agent_buf_take(&b);
+    bool sent = agent_mcp_write_line(s, req);
+    free(req);
+    if (!sent) {
+        snprintf(err, err_len, "failed to write to server: %s", strerror(errno));
+        return false;
+    }
+
+    /* The deadline covers the whole exchange, not each line: a server that
+     * streams notifications forever must still answer within the timeout. */
+    double deadline = now_sec() + AGENT_MCP_TIMEOUT_SEC;
+    for (;;) {
+        char *line = agent_mcp_read_line(s, deadline);
+        if (!line) {
+            snprintf(err, err_len, "no response from server (timeout or closed pipe)");
+            return false;
+        }
+        agent_json *resp = agent_json_parse(line);
+        free(line);
+        if (!resp) continue; /* ignore unparsable/log lines on stdout */
+        agent_json *resp_id = agent_json_get(resp, "id");
+        if (!resp_id || resp_id->kind != AGENT_JSON_NUM || (int)resp_id->num != id) {
+            agent_json_free(resp);
+            continue; /* a notification or a reply to an older call */
+        }
+        agent_json *error = agent_json_get(resp, "error");
+        if (error) {
+            snprintf(err, err_len, "%s", agent_json_str(error, "message", "MCP error"));
+            agent_json_free(resp);
+            return false;
+        }
+        agent_json *result = agent_json_get(resp, "result");
+        if (result) {
+            /* Detach result from its parent so the caller can free it alone. */
+            for (int i = 0; i < resp->len; i++) {
+                if (resp->vals[i] == result) { resp->vals[i] = NULL; break; }
+            }
+        }
+        agent_json_free(resp);
+        *out_result = result;
+        return true;
+    }
+}
+
+static bool agent_mcp_notify(agent_mcp_server *s, const char *method) {
+    char line[256];
+    snprintf(line, sizeof(line), "{\"jsonrpc\":\"2.0\",\"method\":\"%s\",\"params\":{}}",
+             method);
+    return agent_mcp_write_line(s, line);
+}
+
+/* Spawn the server process with stdin/stdout piped and stderr sent to
+ * /dev/null so stdout carries only JSON-RPC (mirrors agent_bash_start's
+ * fork/exec/pipe shape but keeps stdout and stderr separate). */
+static bool agent_mcp_server_spawn(agent_mcp_server *s, char *err, size_t err_len) {
+    /* Build argv before fork: the child must not call malloc, which is not
+     * async-signal-safe and can deadlock a forked child of this threaded
+     * process on the allocator lock. */
+    int argc = 0;
+    while (s->args && s->args[argc]) argc++;
+    char **argv = xmalloc(sizeof(char *) * (size_t)(argc + 2));
+    argv[0] = s->command;
+    for (int i = 0; i < argc; i++) argv[i + 1] = s->args[i];
+    argv[argc + 1] = NULL;
+
+    int in_pipe[2], out_pipe[2];
+    if (pipe(in_pipe) != 0) {
+        snprintf(err, err_len, "pipe failed: %s", strerror(errno));
+        free(argv);
+        return false;
+    }
+    if (pipe(out_pipe) != 0) {
+        snprintf(err, err_len, "pipe failed: %s", strerror(errno));
+        close(in_pipe[0]); close(in_pipe[1]);
+        free(argv);
+        return false;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        snprintf(err, err_len, "fork failed: %s", strerror(errno));
+        close(in_pipe[0]); close(in_pipe[1]);
+        close(out_pipe[0]); close(out_pipe[1]);
+        free(argv);
+        return false;
+    }
+    if (pid == 0) {
+        setpgid(0, 0);
+        close(in_pipe[1]);
+        close(out_pipe[0]);
+        dup2(in_pipe[0], STDIN_FILENO);
+        dup2(out_pipe[1], STDOUT_FILENO);
+        close(in_pipe[0]);
+        close(out_pipe[1]);
+        int null_fd = open("/dev/null", O_WRONLY);
+        if (null_fd >= 0) {
+            dup2(null_fd, STDERR_FILENO);
+            if (null_fd != STDERR_FILENO) close(null_fd);
+        }
+        if (s->envp) {
+            for (int i = 0; s->envp[i]; i++) putenv(s->envp[i]);
+        }
+        execvp(s->command, argv);
+        _exit(127);
+    }
+    free(argv);
+    close(in_pipe[0]);
+    close(out_pipe[1]);
+    s->pid = pid;
+    s->in_fd = in_pipe[1];
+    s->out_fd = out_pipe[0];
+    s->alive = true;
+    return true;
+}
+
+/* Full startup handshake: initialize, notifications/initialized, tools/list.
+ * Any failure here kills the process and leaves the server not alive so the
+ * caller drops it rather than exposing broken tools to the model. */
+static bool agent_mcp_server_handshake(agent_mcp_server *s, char *err, size_t err_len) {
+    agent_json *result = NULL;
+    const char *init_params =
+        "{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},"
+        "\"clientInfo\":{\"name\":\"ds4-agent\",\"version\":\"1.0\"}}";
+    if (!agent_mcp_request(s, "initialize", init_params, &result, err, err_len))
+        return false;
+    agent_json_free(result);
+    if (!agent_mcp_notify(s, "notifications/initialized")) {
+        snprintf(err, err_len, "failed to send notifications/initialized");
+        return false;
+    }
+    result = NULL;
+    if (!agent_mcp_request(s, "tools/list", "{}", &result, err, err_len))
+        return false;
+
+    agent_json *tools = agent_json_get(result, "tools");
+    if (tools && tools->kind == AGENT_JSON_ARR) {
+        s->tools = xmalloc(sizeof(*s->tools) * (size_t)(tools->len ? tools->len : 1));
+        for (int i = 0; i < tools->len; i++) {
+            agent_json *t = tools->vals[i];
+            const char *name = agent_json_str(t, "name", NULL);
+            if (!name) continue;
+            agent_mcp_tool *out = &s->tools[s->tool_count++];
+            out->name = xstrdup(name);
+            out->description = xstrdup(agent_json_str(t, "description", ""));
+            agent_json *schema = agent_json_get(t, "inputSchema");
+            agent_buf sb = {.unbounded = true};
+            if (schema) agent_json_write(&sb, schema);
+            else agent_buf_puts(&sb, "{\"type\":\"object\",\"properties\":{}}");
+            out->schema_json = agent_buf_take(&sb);
+        }
+    }
+    agent_json_free(result);
+    return true;
+}
+
+/* Parse a .mcp.json file's "mcpServers" object into a list of not-yet-started
+ * agent_mcp_server entries. Returns NULL (not an error) if the file is
+ * missing; prints a warning and returns NULL if it exists but is malformed. */
+static agent_mcp_server *agent_mcp_config_load(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    agent_buf b = {.unbounded = true};
+    char chunk[4096];
+    size_t n;
+    while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0) agent_buf_append(&b, chunk, n);
+    fclose(f);
+    char *text = agent_buf_take(&b);
+    agent_json *root = agent_json_parse(text);
+    free(text);
+    if (!root) {
+        fprintf(stderr, "ds4-agent: %s: invalid JSON, ignoring MCP config\n", path);
+        return NULL;
+    }
+    agent_json *servers = agent_json_get(root, "mcpServers");
+    agent_mcp_server *head = NULL, *tail = NULL;
+    if (servers && servers->kind == AGENT_JSON_OBJ) {
+        for (int i = 0; i < servers->len; i++) {
+            agent_json *sv = servers->vals[i];
+            const char *command = agent_json_str(sv, "command", NULL);
+            if (!command) {
+                fprintf(stderr, "ds4-agent: MCP server \"%s\" has no command, skipping\n",
+                        servers->keys[i]);
+                continue;
+            }
+            /* Tool names are advertised as mcp__<server>__<tool> and split at
+             * the first "__" on dispatch, so a server name containing "__"
+             * could never be routed back.  Reject it up front. */
+            if (strstr(servers->keys[i], "__")) {
+                fprintf(stderr,
+                        "ds4-agent: MCP server name \"%s\" must not contain \"__\", skipping\n",
+                        servers->keys[i]);
+                continue;
+            }
+            agent_mcp_server *s = xmalloc(sizeof(*s));
+            memset(s, 0, sizeof(*s));
+            s->in_fd = s->out_fd = -1;
+            s->name = xstrdup(servers->keys[i]);
+            s->command = xstrdup(command);
+
+            agent_json *args = agent_json_get(sv, "args");
+            if (args && args->kind == AGENT_JSON_ARR) {
+                s->args = xmalloc(sizeof(char *) * (size_t)(args->len + 1));
+                int out_i = 0;
+                for (int j = 0; j < args->len; j++) {
+                    if (args->vals[j]->kind == AGENT_JSON_STR)
+                        s->args[out_i++] = xstrdup(args->vals[j]->str);
+                }
+                s->args[out_i] = NULL;
+            }
+            agent_json *env = agent_json_get(sv, "env");
+            if (env && env->kind == AGENT_JSON_OBJ) {
+                s->envp = xmalloc(sizeof(char *) * (size_t)(env->len + 1));
+                int out_i = 0;
+                for (int j = 0; j < env->len; j++) {
+                    if (env->vals[j]->kind != AGENT_JSON_STR) continue;
+                    char kv[1024];
+                    snprintf(kv, sizeof(kv), "%s=%s", env->keys[j], env->vals[j]->str);
+                    s->envp[out_i++] = xstrdup(kv);
+                }
+                s->envp[out_i] = NULL;
+            }
+            if (tail) tail->next = s; else head = s;
+            tail = s;
+        }
+    }
+    agent_json_free(root);
+    return head;
+}
+
+/* Resolve the config path (explicit flag, else ./.mcp.json relative to the
+ * already-applied --chdir), load it, spawn+handshake each server, and drop
+ * any that fail rather than aborting the whole agent. */
+static agent_mcp_server *agent_mcp_load_and_start(const agent_config *cfg) {
+    const char *path = (cfg->mcp_config_path && cfg->mcp_config_path[0]) ?
+        cfg->mcp_config_path : ".mcp.json";
+    agent_mcp_server *list = agent_mcp_config_load(path);
+    agent_mcp_server *alive_head = NULL, *alive_tail = NULL;
+    for (agent_mcp_server *s = list, *next = NULL; s; s = next) {
+        next = s->next;
+        s->next = NULL;
+        char err[256] = {0};
+        if (!agent_mcp_server_spawn(s, err, sizeof(err)) ||
+            !agent_mcp_server_handshake(s, err, sizeof(err)))
+        {
+            fprintf(stderr, "ds4-agent: MCP server \"%s\" unavailable: %s\n",
+                    s->name, err[0] ? err : "unknown error");
+            agent_mcp_servers_free(s);
+            continue;
+        }
+        if (alive_tail) alive_tail->next = s; else alive_head = s;
+        alive_tail = s;
+    }
+    return alive_head;
+}
+
+/* Render every discovered MCP tool as an "Available Tool Schemas" block in
+ * the same function-call JSON shape the native tools use, namespaced
+ * mcp__<server>__<tool> so names never collide across servers or with
+ * native tools. */
+static void agent_mcp_append_tool_schemas(agent_buf *b, const agent_mcp_server *servers) {
+    for (const agent_mcp_server *s = servers; s; s = s->next) {
+        for (int i = 0; i < s->tool_count; i++) {
+            const agent_mcp_tool *t = &s->tools[i];
+            agent_buf_puts(b, "{\n  \"type\": \"function\",\n  \"function\": {\n    \"name\": \"mcp__");
+            agent_buf_puts(b, s->name);
+            agent_buf_puts(b, "__");
+            agent_buf_puts(b, t->name);
+            agent_buf_puts(b, "\",\n    \"description\": ");
+            agent_json_escape(b, t->description);
+            agent_buf_puts(b, ",\n    \"parameters\": ");
+            agent_buf_puts(b, t->schema_json);
+            agent_buf_puts(b, "\n  }\n}\n\n");
+        }
+    }
+}
+
+static agent_mcp_server *agent_mcp_find_server(agent_mcp_server *servers, const char *name, size_t len) {
+    for (agent_mcp_server *s = servers; s; s = s->next) {
+        if (strlen(s->name) == len && !strncmp(s->name, name, len)) return s;
+    }
+    return NULL;
+}
+
+static agent_mcp_tool *agent_mcp_find_tool(agent_mcp_server *s, const char *name) {
+    for (int i = 0; i < s->tool_count; i++) {
+        if (!strcmp(s->tools[i].name, name)) return &s->tools[i];
+    }
+    return NULL;
+}
+
+/* Convert DSML call arguments into a JSON-RPC "arguments" object.  Per the
+ * tools-prompt contract, string=true args are raw text needing JSON escaping
+ * and string=false args are already-valid JSON literals (numbers, booleans,
+ * objects, arrays) that can be emitted verbatim. */
+static char *agent_mcp_args_to_json(const agent_tool_call *call) {
+    agent_buf b = {.unbounded = true};
+    agent_buf_append(&b, "{", 1);
+    for (int i = 0; i < call->argc; i++) {
+        if (i) agent_buf_append(&b, ",", 1);
+        agent_json_escape(&b, call->args[i].name);
+        agent_buf_append(&b, ":", 1);
+        if (call->args[i].is_string) agent_json_escape(&b, call->args[i].value);
+        else agent_buf_puts(&b, call->args[i].value ? call->args[i].value : "null");
+    }
+    agent_buf_append(&b, "}", 1);
+    return agent_buf_take(&b);
+}
+
+/* Flatten a tools/call result's content[] into plain text, the same shape
+ * every other tool returns. */
+static void agent_mcp_append_content(agent_buf *out, const agent_json *result) {
+    agent_json *content = agent_json_get(result, "content");
+    if (!content || content->kind != AGENT_JSON_ARR) return;
+    for (int i = 0; i < content->len; i++) {
+        const char *text = agent_json_str(content->vals[i], "text", NULL);
+        if (!text) continue;
+        agent_buf_puts(out, text);
+        if (!text[0] || text[strlen(text) - 1] != '\n') agent_buf_puts(out, "\n");
+    }
+}
+
+static char *agent_tool_mcp_call(agent_worker *w, const agent_tool_call *call) {
+    const char *full = call->name + 5; /* skip "mcp__" */
+    const char *sep = strstr(full, "__");
+    if (!sep) return xstrdup("Tool error: malformed mcp tool name, expected mcp__server__tool\n");
+
+    agent_mcp_server *s = agent_mcp_find_server(w->mcp_servers, full, (size_t)(sep - full));
+    if (!s || !s->alive) return xstrdup("Tool error: mcp server not available\n");
+    const char *tool_name = sep + 2;
+    agent_mcp_tool *tool = agent_mcp_find_tool(s, tool_name);
+    if (!tool) {
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: unknown mcp tool: ");
+        agent_buf_puts(&b, call->name);
+        agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
+
+    agent_buf params = {.unbounded = true};
+    agent_buf_puts(&params, "{\"name\":");
+    agent_json_escape(&params, tool_name);
+    agent_buf_puts(&params, ",\"arguments\":");
+    char *args_json = agent_mcp_args_to_json(call);
+    agent_buf_puts(&params, args_json);
+    free(args_json);
+    agent_buf_append(&params, "}", 1);
+    char *params_json = agent_buf_take(&params);
+
+    agent_json *result = NULL;
+    char err[256] = {0};
+    bool ok = agent_mcp_request(s, "tools/call", params_json, &result, err, sizeof(err));
+    free(params_json);
+    if (!ok) {
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: mcp call failed: ");
+        agent_buf_puts(&b, err);
+        agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
+
+    agent_buf out = {0};
+    agent_json *is_error = agent_json_get(result, "isError");
+    if (is_error && is_error->kind == AGENT_JSON_BOOL && is_error->b)
+        agent_buf_puts(&out, "Tool error: ");
+    agent_mcp_append_content(&out, result);
+    agent_json_free(result);
+    if (out.len == 0) agent_buf_puts(&out, "(no output)\n");
+    return agent_buf_take(&out);
+}
+
+#ifdef DS4_AGENT_TEST
+static void test_agent_json_round_trip(void) {
+    const char *text =
+        "{\"name\":\"echo\",\"description\":\"say hi\",\"n\":3,\"ok\":true,"
+        "\"tags\":[\"a\",\"b\"],\"nested\":{\"x\":1}}";
+    agent_json *v = agent_json_parse(text);
+    AGENT_TEST_ASSERT(v != NULL);
+    AGENT_TEST_ASSERT(v->kind == AGENT_JSON_OBJ);
+    AGENT_TEST_ASSERT(!strcmp(agent_json_str(v, "name", ""), "echo"));
+    agent_json *n = agent_json_get(v, "n");
+    AGENT_TEST_ASSERT(n && n->kind == AGENT_JSON_NUM && n->num == 3);
+    agent_json *ok = agent_json_get(v, "ok");
+    AGENT_TEST_ASSERT(ok && ok->kind == AGENT_JSON_BOOL && ok->b == true);
+    agent_json *tags = agent_json_get(v, "tags");
+    AGENT_TEST_ASSERT(tags && tags->kind == AGENT_JSON_ARR && tags->len == 2);
+    AGENT_TEST_ASSERT(!strcmp(tags->vals[1]->str, "b"));
+    agent_json *nested = agent_json_get(v, "nested");
+    agent_json *x = agent_json_get(nested, "x");
+    AGENT_TEST_ASSERT(x && x->num == 1);
+    agent_json_free(v);
+}
+
+static void test_agent_json_escape_round_trips_through_writer(void) {
+    agent_buf b = {0};
+    agent_json_escape(&b, "line\n\"quoted\"\ttab");
+    char *out = agent_buf_take(&b);
+    agent_json *v = agent_json_parse(out);
+    AGENT_TEST_ASSERT(v != NULL);
+    AGENT_TEST_ASSERT(v->kind == AGENT_JSON_STR);
+    AGENT_TEST_ASSERT(!strcmp(v->str, "line\n\"quoted\"\ttab"));
+    agent_json_free(v);
+    free(out);
+}
+
+static void test_agent_json_write_re_emits_schema(void) {
+    const char *schema = "{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}}}";
+    agent_json *v = agent_json_parse(schema);
+    agent_buf b = {0};
+    agent_json_write(&b, v);
+    char *out = agent_buf_take(&b);
+    agent_json *v2 = agent_json_parse(out);
+    AGENT_TEST_ASSERT(v2 != NULL);
+    agent_json *props = agent_json_get(v2, "properties");
+    agent_json *q = agent_json_get(props, "q");
+    AGENT_TEST_ASSERT(!strcmp(agent_json_str(q, "type", ""), "string"));
+    agent_json_free(v);
+    agent_json_free(v2);
+    free(out);
+}
+
+static void test_agent_mcp_args_to_json_mixes_string_and_raw(void) {
+    agent_tool_call call = {0};
+    agent_tool_call_add_arg(&call, "query", "hello \"world\"", strlen("hello \"world\""), true);
+    agent_tool_call_add_arg(&call, "limit", "5", strlen("5"), false);
+    char *json = agent_mcp_args_to_json(&call);
+    agent_json *v = agent_json_parse(json);
+    AGENT_TEST_ASSERT(v != NULL);
+    AGENT_TEST_ASSERT(!strcmp(agent_json_str(v, "query", ""), "hello \"world\""));
+    agent_json *limit = agent_json_get(v, "limit");
+    AGENT_TEST_ASSERT(limit && limit->kind == AGENT_JSON_NUM && limit->num == 5);
+    agent_json_free(v);
+    free(json);
+    agent_tool_call_free(&call);
+}
+
+static void test_agent_mcp_config_load_parses_servers(void) {
+    char path[] = "/tmp/ds4_agent_test_mcp_XXXXXX";
+    int fd = mkstemp(path);
+    AGENT_TEST_ASSERT(fd >= 0);
+    const char *cfg =
+        "{\"mcpServers\":{\"demo\":{\"command\":\"echo\",\"args\":[\"hi\"],"
+        "\"env\":{\"FOO\":\"bar\"}}}}";
+    write_all(fd, cfg, strlen(cfg));
+    close(fd);
+
+    agent_mcp_server *list = agent_mcp_config_load(path);
+    AGENT_TEST_ASSERT(list != NULL);
+    AGENT_TEST_ASSERT(!strcmp(list->name, "demo"));
+    AGENT_TEST_ASSERT(!strcmp(list->command, "echo"));
+    AGENT_TEST_ASSERT(list->args && !strcmp(list->args[0], "hi") && !list->args[1]);
+    AGENT_TEST_ASSERT(list->envp && !strcmp(list->envp[0], "FOO=bar"));
+    AGENT_TEST_ASSERT(list->next == NULL);
+    agent_mcp_servers_free(list);
+    unlink(path);
+}
+
+static void test_agent_mcp_config_load_missing_file_is_not_an_error(void) {
+    agent_mcp_server *list = agent_mcp_config_load("/tmp/ds4_agent_test_mcp_does_not_exist.json");
+    AGENT_TEST_ASSERT(list == NULL);
+}
+
+static void test_agent_mcp_config_load_rejects_double_underscore_names(void) {
+    char path[] = "/tmp/ds4_agent_test_mcp_XXXXXX";
+    int fd = mkstemp(path);
+    AGENT_TEST_ASSERT(fd >= 0);
+    const char *cfg = "{\"mcpServers\":{\"bad__name\":{\"command\":\"echo\"}}}";
+    write_all(fd, cfg, strlen(cfg));
+    close(fd);
+
+    agent_mcp_server *list = agent_mcp_config_load(path);
+    AGENT_TEST_ASSERT(list == NULL);
+    unlink(path);
+}
+
+static void test_agent_json_string_larger_than_buf_cap_is_not_truncated(void) {
+    /* JSON buffers opt out of the 128KB agent_buf cap; a large tool result
+     * string must survive an escape/parse round trip intact. */
+    size_t n = 200 * 1024;
+    char *big = xmalloc(n + 1);
+    memset(big, 'a', n);
+    big[n] = '\0';
+    agent_buf b = {.unbounded = true};
+    agent_json_escape(&b, big);
+    char *escaped = agent_buf_take(&b);
+    agent_json *v = agent_json_parse(escaped);
+    AGENT_TEST_ASSERT(v != NULL);
+    AGENT_TEST_ASSERT(v->kind == AGENT_JSON_STR);
+    AGENT_TEST_ASSERT(strlen(v->str) == n);
+    agent_json_free(v);
+    free(escaped);
+    free(big);
+}
+
+static void ds4_agent_mcp_unit_tests_run(void) {
+    test_agent_json_round_trip();
+    test_agent_json_escape_round_trips_through_writer();
+    test_agent_json_write_re_emits_schema();
+    test_agent_mcp_args_to_json_mixes_string_and_raw();
+    test_agent_mcp_config_load_parses_servers();
+    test_agent_mcp_config_load_missing_file_is_not_an_error();
+    test_agent_mcp_config_load_rejects_double_underscore_names();
+    test_agent_json_string_larger_than_buf_cap_is_not_truncated();
+}
+#endif
+
+/* ============================================================================
  * Tool Dispatch
  * ============================================================================
  */
@@ -7188,6 +8128,8 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
         bool wait = stop;
         return agent_bash_job_tool_result(w, job, wait, refresh, stop, true);
     }
+
+    if (!strncmp(call->name, "mcp__", 5)) return agent_tool_mcp_call(w, call);
 
     {
         char header[256];
@@ -9452,6 +10394,7 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
         .cancel_privdata = w,
     };
     w->web = ds4_web_create(&web_cfg);
+    w->mcp_servers = agent_mcp_load_and_start(cfg);
     w->sysprompt_path = ds4_kvstore_path_join(w->cache_dir, "sysprompt.kv");
     if (cfg->gen.trace_path && cfg->gen.trace_path[0]) {
         w->trace = fopen(cfg->gen.trace_path, "ab");
@@ -9472,6 +10415,7 @@ static void agent_worker_free(agent_worker *w) {
     if (w->thread) pthread_join(w->thread, NULL);
     agent_bash_jobs_free(w);
     ds4_web_free(w->web);
+    agent_mcp_servers_free(w->mcp_servers);
     ds4_session_free(w->session);
     ds4_tokens_free(&w->transcript);
     free(w->cache_dir);
