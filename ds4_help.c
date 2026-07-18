@@ -281,6 +281,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "-sys, --system TEXT", "Extra system prompt. Empty disables extra text.");
     opt(fp, c, "--trace FILE", "Write prompt, token, and DSML debug trace.");
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");
+    opt(fp, c, "--mcp-config FILE", "Load MCP servers from a .mcp.json-style file (default: ./.mcp.json if present).");
     fputc('\n', fp);
 }
 
