@@ -1,0 +1,6 @@
+# id	prompt_file	continuation_file	response_file
+short_italian_fact	tests/test-vectors/glm-openrouter/prompts/short_italian_fact.txt	tests/test-vectors/glm-openrouter/continuations/short_italian_fact.txt	tests/test-vectors/glm-openrouter/official/short_italian_fact.official.json
+short_code_completion	tests/test-vectors/glm-openrouter/prompts/short_code_completion.txt	tests/test-vectors/glm-openrouter/continuations/short_code_completion.txt	tests/test-vectors/glm-openrouter/official/short_code_completion.official.json
+short_reasoning_plain	tests/test-vectors/glm-openrouter/prompts/short_reasoning_plain.txt	tests/test-vectors/glm-openrouter/continuations/short_reasoning_plain.txt	tests/test-vectors/glm-openrouter/official/short_reasoning_plain.official.json
+long_memory_archive	tests/test-vectors/glm-openrouter/prompts/long_memory_archive.txt	tests/test-vectors/glm-openrouter/continuations/long_memory_archive.txt	tests/test-vectors/glm-openrouter/official/long_memory_archive.official.json
+long_code_audit	tests/test-vectors/glm-openrouter/prompts/long_code_audit.txt	tests/test-vectors/glm-openrouter/continuations/long_code_audit.txt	tests/test-vectors/glm-openrouter/official/long_code_audit.official.json

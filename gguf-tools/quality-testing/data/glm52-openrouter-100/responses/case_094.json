@@ -1,0 +1,437 @@
+{
+  "id": "gen-1781982335-QXqPukoJU43F2BlVjeMJ",
+  "object": "chat.completion",
+  "created": 1781982335,
+  "model": "z-ai/glm-5.2-20260616",
+  "provider": "Parasail",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": {
+        "content": [
+          {
+            "token": "Tok",
+            "bytes": [
+              84,
+              111,
+              107
+            ],
+            "logprob": -0.16025294363498688,
+            "top_logprobs": [
+              {
+                "token": "Tok",
+                "bytes": [
+                  84,
+                  111,
+                  107
+                ],
+                "logprob": -0.16025294363498688
+              },
+              {
+                "token": "The",
+                "bytes": [
+                  84,
+                  104,
+                  101
+                ],
+                "logprob": -1.9102529287338257
+              },
+              {
+                "token": " Tokyo",
+                "bytes": [
+                  32,
+                  84,
+                  111,
+                  107,
+                  121,
+                  111
+                ],
+                "logprob": -10.660252571105957
+              },
+              {
+                "token": "_tok",
+                "bytes": [
+                  95,
+                  116,
+                  111,
+                  107
+                ],
+                "logprob": -13.535252571105957
+              },
+              {
+                "token": "Toy",
+                "bytes": [
+                  84,
+                  111,
+                  121
+                ],
+                "logprob": -13.660252571105957
+              },
+              {
+                "token": "东京",
+                "bytes": [
+                  228,
+                  184,
+                  156,
+                  228,
+                  186,
+                  172
+                ],
+                "logprob": -13.910252571105957
+              },
+              {
+                "token": "Japan",
+                "bytes": [
+                  74,
+                  97,
+                  112,
+                  97,
+                  110
+                ],
+                "logprob": -14.910252571105957
+              },
+              {
+                "token": "Ky",
+                "bytes": [
+                  75,
+                  121
+                ],
+                "logprob": -15.035252571105957
+              },
+              {
+                "token": "T",
+                "bytes": [
+                  84
+                ],
+                "logprob": -15.035252571105957
+              },
+              {
+                "token": "東京",
+                "bytes": [
+                  230,
+                  157,
+                  177,
+                  228,
+                  186,
+                  172
+                ],
+                "logprob": -15.160252571105957
+              },
+              {
+                "token": "To",
+                "bytes": [
+                  84,
+                  111
+                ],
+                "logprob": -15.535252571105957
+              },
+              {
+                "token": "tok",
+                "bytes": [
+                  116,
+                  111,
+                  107
+                ],
+                "logprob": -16.035253524780273
+              },
+              {
+                "token": " TOK",
+                "bytes": [
+                  32,
+                  84,
+                  79,
+                  75
+                ],
+                "logprob": -16.410253524780273
+              },
+              {
+                "token": "**",
+                "bytes": [
+                  42,
+                  42
+                ],
+                "logprob": -16.660253524780273
+              },
+              {
+                "token": "Tai",
+                "bytes": [
+                  84,
+                  97,
+                  105
+                ],
+                "logprob": -17.035253524780273
+              },
+              {
+                "token": "It",
+                "bytes": [
+                  73,
+                  116
+                ],
+                "logprob": -17.535253524780273
+              },
+              {
+                "token": "Capital",
+                "bytes": [
+                  67,
+                  97,
+                  112,
+                  105,
+                  116,
+                  97,
+                  108
+                ],
+                "logprob": -17.660253524780273
+              },
+              {
+                "token": "Answer",
+                "bytes": [
+                  65,
+                  110,
+                  115,
+                  119,
+                  101,
+                  114
+                ],
+                "logprob": -17.785253524780273
+              },
+              {
+                "token": "A",
+                "bytes": [
+                  65
+                ],
+                "logprob": -17.972753524780273
+              },
+              {
+                "token": "N",
+                "bytes": [
+                  78
+                ],
+                "logprob": -18.160253524780273
+              }
+            ]
+          },
+          {
+            "token": "yo",
+            "bytes": [
+              121,
+              111
+            ],
+            "logprob": -5.960462772236497e-07,
+            "top_logprobs": [
+              {
+                "token": "yo",
+                "bytes": [
+                  121,
+                  111
+                ],
+                "logprob": -5.960462772236497e-07
+              },
+              {
+                "token": "oyo",
+                "bytes": [
+                  111,
+                  121,
+                  111
+                ],
+                "logprob": -15.125000953674316
+              },
+              {
+                "token": "io",
+                "bytes": [
+                  105,
+                  111
+                ],
+                "logprob": -15.625000953674316
+              },
+              {
+                "token": "YO",
+                "bytes": [
+                  89,
+                  79
+                ],
+                "logprob": -16.5
+              },
+              {
+                "token": "ya",
+                "bytes": [
+                  121,
+                  97
+                ],
+                "logprob": -17.625
+              },
+              {
+                "token": "you",
+                "bytes": [
+                  121,
+                  111,
+                  117
+                ],
+                "logprob": -17.875
+              },
+              {
+                "token": "yor",
+                "bytes": [
+                  121,
+                  111,
+                  114
+                ],
+                "logprob": -18.625
+              },
+              {
+                "token": "yota",
+                "bytes": [
+                  121,
+                  111,
+                  116,
+                  97
+                ],
+                "logprob": -18.75
+              },
+              {
+                "token": "Yo",
+                "bytes": [
+                  89,
+                  111
+                ],
+                "logprob": -18.875
+              },
+              {
+                "token": "yon",
+                "bytes": [
+                  121,
+                  111,
+                  110
+                ],
+                "logprob": -18.875
+              },
+              {
+                "token": "oto",
+                "bytes": [
+                  111,
+                  116,
+                  111
+                ],
+                "logprob": -19
+              },
+              {
+                "token": "uyo",
+                "bytes": [
+                  117,
+                  121,
+                  111
+                ],
+                "logprob": -19.5
+              },
+              {
+                "token": "yó",
+                "bytes": [
+                  121,
+                  195,
+                  179
+                ],
+                "logprob": -19.625
+              },
+              {
+                "token": "y",
+                "bytes": [
+                  121
+                ],
+                "logprob": -19.875
+              },
+              {
+                "token": "yt",
+                "bytes": [
+                  121,
+                  116
+                ],
+                "logprob": -19.875
+              },
+              {
+                "token": "to",
+                "bytes": [
+                  116,
+                  111
+                ],
+                "logprob": -20
+              },
+              {
+                "token": " yo",
+                "bytes": [
+                  32,
+                  121,
+                  111
+                ],
+                "logprob": -20
+              },
+              {
+                "token": "ye",
+                "bytes": [
+                  121,
+                  101
+                ],
+                "logprob": -20.375
+              },
+              {
+                "token": "<|user|>",
+                "bytes": [
+                  60,
+                  124,
+                  117,
+                  115,
+                  101,
+                  114,
+                  124,
+                  62
+                ],
+                "logprob": -20.9375
+              },
+              {
+                "token": "yos",
+                "bytes": [
+                  121,
+                  111,
+                  115
+                ],
+                "logprob": -21.0625
+              }
+            ]
+          }
+        ],
+        "refusal": null
+      },
+      "finish_reason": "stop",
+      "native_finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "content": "Tokyo",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 18,
+    "completion_tokens": 3,
+    "total_tokens": 21,
+    "cost": 3.84e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 3.84e-05,
+      "upstream_inference_prompt_cost": 2.52e-05,
+      "upstream_inference_completions_cost": 1.32e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

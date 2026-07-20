@@ -1,0 +1,3 @@
+The short answer is **memory fragmentation and allocation granularity**.
+
+While a single large buffer seems simpler (one allocation, one

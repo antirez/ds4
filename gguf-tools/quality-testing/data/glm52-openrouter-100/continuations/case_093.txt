@@ -1,0 +1,1 @@
+A page cache makes a second file read significantly faster due to a concept called **temporal locality**—the idea that

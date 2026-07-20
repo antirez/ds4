@@ -24,6 +24,23 @@ struct ds4_metal_args_dsv4_rope_tail {
     bool     src2;
 };
 
+struct ds4_metal_args_dsv4_rope_affine_pair {
+    uint64_t row_bytes;
+    uint64_t token_bytes;
+    int32_t head_dim;
+    int32_t n_dims;
+    int32_t n_ctx_orig;
+    int32_t inverse;
+    uint32_t pos0;
+    uint32_t pos_step;
+    float freq_base;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
+};
+
 static float rope_yarn_ramp(const float low, const float high, const int i0) {
     const float y = (i0 / 2 - low) / max(0.001f, high - low);
     return 1.0f - min(1.0f, max(0.0f, y));
@@ -161,5 +178,208 @@ kernel void kernel_dsv4_rope_tail_f32(
             *((device float *) (dst_base + j0*args.nb0)) = x0*cos_theta - x1*sin_theta;
             *((device float *) (dst_base + j1*args.nb0)) = x0*sin_theta + x1*cos_theta;
         }
+    }
+}
+
+// DS4 only calls the Metal RoPE helper in-place and uses the adjacent-pair
+// layout (mode 0). The generic kernel above still copies the no-position
+// prefix, even though source and destination alias, and dispatches enough
+// lanes for the full head. This specialization maps lanes directly to the
+// rotated pairs and deliberately never reads or writes the unchanged prefix.
+// Keep the arithmetic below in the same order as the mode-0 branch above so
+// the optimized and reference paths remain bit-identical.
+kernel void kernel_dsv4_rope_tail_f32_inplace_pair(
+        constant ds4_metal_args_dsv4_rope_tail & args,
+        device const char * src0,
+        device const char * src1,
+        device const char * src2,
+        device       char * dst,
+        uint  tid   [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    if (args.mode != 0) {
+        return;
+    }
+
+    const int i1 = tgpig[0];
+    const int i2 = tgpig[1];
+    const int i3 = tgpig[2];
+    const int n_nope = args.ne00 - args.n_dims;
+    if (n_nope < 0) {
+        return;
+    }
+
+    device const int32_t * pos = (device const int32_t *) src1;
+
+    float corr_dims[2];
+    rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base, args.beta_fast, args.beta_slow, corr_dims);
+
+    const float theta_base = (float) pos[i2];
+    const float inv_ndims = -1.f/args.n_dims;
+    device const char * src_base = src0 + i3*args.nb03 + i2*args.nb02 + i1*args.nb01;
+    device       char * dst_base = dst  + i3*args.nb3  + i2*args.nb2  + i1*args.nb1;
+
+    // Keep each pair on the same SIMD lane as the generic in-place dispatch.
+    // n_nope is 32-aligned for the supported DS4 shapes, so logical tail index
+    // r ran on lane r%32 in the reference kernel. Compacting pairs would move
+    // them to lane (r/2)%32 and can perturb fast-math code generation.
+    for (int r = tid; r < args.n_dims; r += ntg.x) {
+        if ((r & 1) != 0) {
+            continue;
+        }
+        const int ic = r/2;
+#ifdef DS4_METAL_ROPE_EXP2_LOG2
+        const float theta = theta_base * exp2(inv_ndims * (float)r * log2(args.freq_base));
+#else
+        const float theta = theta_base * pow(args.freq_base, inv_ndims*r);
+#endif
+        const float freq_factor = args.src2 ? ((device const float *) src2)[ic] : 1.0f;
+
+        float cos_theta;
+        float sin_theta;
+        rope_yarn(theta/freq_factor, args.freq_scale, corr_dims, r, args.ext_factor, args.attn_factor, &cos_theta, &sin_theta);
+        if (args.inverse) {
+            sin_theta = -sin_theta;
+        }
+
+        const int j0 = n_nope + r;
+        const int j1 = j0 + 1;
+        const float x0 = *((device const float *) (src_base + j0*args.nb00));
+        const float x1 = *((device const float *) (src_base + j1*args.nb00));
+
+        *((device float *) (dst_base + j0*args.nb0)) = x0*cos_theta - x1*sin_theta;
+        *((device float *) (dst_base + j1*args.nb0)) = x0*sin_theta + x1*cos_theta;
+    }
+}
+
+// The Q/K RoPE calls use the same position and scaling parameters for every
+// head. Group four heads into one threadgroup so one 64-thread cohort computes
+// the 32 adjacent-pair coefficients and the other cohorts reuse them. Keeping
+// r on the same r%32 SIMD lane as the per-head specialization preserves the
+// fast-math instruction mapping; only the redundant coefficient work changes.
+kernel void kernel_dsv4_rope_tail_f32_inplace_pair_shared4(
+        constant ds4_metal_args_dsv4_rope_tail & args,
+        device const char * src0,
+        device const char * src1,
+        device const char * src2,
+        device       char * dst,
+        uint  tid   [[thread_index_in_threadgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    if (args.mode != 0 || args.n_dims != 64) {
+        return;
+    }
+
+    const int n_nope = args.ne00 - args.n_dims;
+    if (n_nope < 0) {
+        return;
+    }
+
+    const uint cohort = tid >> 6;
+    const int r = (int)(tid & 63u);
+    threadgroup float cos_shared[32];
+    threadgroup float sin_shared[32];
+
+    device const int32_t * pos = (device const int32_t *) src1;
+    float corr_dims[2];
+    rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base, args.beta_fast, args.beta_slow, corr_dims);
+
+    const int i2 = tgpig[1];
+    const float theta_base = (float) pos[i2];
+    const float inv_ndims = -1.f/args.n_dims;
+
+    if (cohort == 0 && (r & 1) == 0) {
+        const int ic = r/2;
+#ifdef DS4_METAL_ROPE_EXP2_LOG2
+        const float theta = theta_base * exp2(inv_ndims * (float)r * log2(args.freq_base));
+#else
+        const float theta = theta_base * pow(args.freq_base, inv_ndims*r);
+#endif
+        const float freq_factor = args.src2 ? ((device const float *) src2)[ic] : 1.0f;
+
+        float cos_theta;
+        float sin_theta;
+        rope_yarn(theta/freq_factor, args.freq_scale, corr_dims, r, args.ext_factor, args.attn_factor, &cos_theta, &sin_theta);
+        if (args.inverse) {
+            sin_theta = -sin_theta;
+        }
+        cos_shared[ic] = cos_theta;
+        sin_shared[ic] = sin_theta;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int i1 = (int)tgpig[0]*4 + (int)cohort;
+    if (i1 >= args.ne01 || (r & 1) != 0) {
+        return;
+    }
+
+    const int i3 = tgpig[2];
+    device const char * src_base = src0 + i3*args.nb03 + i2*args.nb02 + i1*args.nb01;
+    device       char * dst_base = dst  + i3*args.nb3  + i2*args.nb2  + i1*args.nb1;
+    const int j0 = n_nope + r;
+    const int j1 = j0 + 1;
+    const float x0 = *((device const float *) (src_base + j0*args.nb00));
+    const float x1 = *((device const float *) (src_base + j1*args.nb00));
+    const float cos_theta = cos_shared[r/2];
+    const float sin_theta = sin_shared[r/2];
+
+    *((device float *) (dst_base + j0*args.nb0)) = x0*cos_theta - x1*sin_theta;
+    *((device float *) (dst_base + j1*args.nb0)) = x0*sin_theta + x1*cos_theta;
+}
+
+// DS4 positions are always affine within one RoPE dispatch. This variant
+// reconstructs the same wrapped int32 position in-kernel, avoiding the host
+// position array and its buffer binding while preserving the pair lane mapping
+// and all floating-point operations of the specialization above.
+kernel void kernel_dsv4_rope_tail_f32_inplace_pair_affine(
+        constant ds4_metal_args_dsv4_rope_affine_pair & args [[buffer(0)]],
+        device const char * src0 [[buffer(1)]],
+        device       char * dst  [[buffer(4)]],
+        uint  tid   [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    const int i1 = tgpig[0];
+    const int i2 = tgpig[1];
+    const int n_nope = args.head_dim - args.n_dims;
+    if (n_nope < 0) {
+        return;
+    }
+
+    float corr_dims[2];
+    rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base, args.beta_fast, args.beta_slow, corr_dims);
+
+    const uint raw_pos = args.pos0 + (uint)i2 * args.pos_step;
+    const float theta_base = (float)as_type<int>(raw_pos);
+    const float inv_ndims = -1.f/args.n_dims;
+    device const char * src_base =
+        src0 + (uint64_t)i2*args.token_bytes + (uint64_t)i1*args.row_bytes;
+    device char * dst_base =
+        dst + (uint64_t)i2*args.token_bytes + (uint64_t)i1*args.row_bytes;
+
+    for (int r = tid; r < args.n_dims; r += ntg.x) {
+        if ((r & 1) != 0) {
+            continue;
+        }
+#ifdef DS4_METAL_ROPE_EXP2_LOG2
+        const float theta = theta_base * exp2(inv_ndims * (float)r * log2(args.freq_base));
+#else
+        const float theta = theta_base * pow(args.freq_base, inv_ndims*r);
+#endif
+        const float freq_factor = 1.0f;
+
+        float cos_theta;
+        float sin_theta;
+        rope_yarn(theta/freq_factor, args.freq_scale, corr_dims, r, args.ext_factor, args.attn_factor, &cos_theta, &sin_theta);
+        if (args.inverse) {
+            sin_theta = -sin_theta;
+        }
+
+        const int j0 = n_nope + r;
+        const int j1 = j0 + 1;
+        const float x0 = *((device const float *) (src_base + j0*sizeof(float)));
+        const float x1 = *((device const float *) (src_base + j1*sizeof(float)));
+
+        *((device float *) (dst_base + j0*sizeof(float))) = x0*cos_theta - x1*sin_theta;
+        *((device float *) (dst_base + j1*sizeof(float))) = x0*sin_theta + x1*cos_theta;
     }
 }

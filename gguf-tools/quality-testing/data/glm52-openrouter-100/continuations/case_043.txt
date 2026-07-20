@@ -1,0 +1,5 @@
+Here is a minimal JSON schema for a tool call:
+
+```json
+{
+  "$schema": "http://json-schema

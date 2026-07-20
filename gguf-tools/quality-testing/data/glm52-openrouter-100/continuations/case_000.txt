@@ -1,0 +1,1 @@
+A **B-tree** is a self-balancing search tree designed to store data in a way that minimizes disk I

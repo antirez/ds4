@@ -1,0 +1,1 @@
+Per capire l'**online softmax** (usata nell'attenzione dei modelli come i Transformer), dobb

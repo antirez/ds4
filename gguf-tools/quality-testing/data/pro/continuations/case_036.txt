@@ -1,0 +1,4 @@
+# Piano di Test per Chunking di Prompt Lunghi
+
+## Obiettivo
+Verificare l'efficacia

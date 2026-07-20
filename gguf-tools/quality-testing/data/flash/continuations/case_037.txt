@@ -1,0 +1,1 @@
+Nella quantizzazione low-bit (a bassa precisione) dei modelli di deep learning, una **matrice

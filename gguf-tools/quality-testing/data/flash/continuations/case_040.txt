@@ -1,0 +1,3 @@
+Here are the first five measurements to take when diagnosing generation slowdowns at long context:
+
+1.  **Time-to-F

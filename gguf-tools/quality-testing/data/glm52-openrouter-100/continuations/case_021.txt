@@ -1,0 +1,4 @@
+Here is a short and efficient C function to clamp an integer to a specified range:
+
+```c
+int clamp_int(int

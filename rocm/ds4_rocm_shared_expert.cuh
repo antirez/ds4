@@ -66,6 +66,135 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
            ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, clamp, 1.0f);
 }
 
+extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        float                   clamp) {
+    (void)gate; (void)up; (void)mid; (void)model_map; (void)model_size;
+    (void)gate_offset; (void)up_offset; (void)in_dim; (void)out_dim;
+    (void)x; (void)n_tok; (void)clamp;
+    return 0;
+}
+
+extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_batch_tensor(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
+extern "C" int ds4_gpu_shared_mid_swiglu_q8_0_tensor(
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        float                   clamp) {
+    if (!mid || out_dim == 0u || out_dim > UINT32_MAX) return 0;
+    uint64_t tmp_bytes = 0;
+    if (!cuda_u64_mul3_checked(2u, out_dim, sizeof(float), &tmp_bytes)) return 0;
+    void *tmp = cuda_tmp_alloc(tmp_bytes, "shared gate/up mid wrapper");
+    if (!tmp) return 0;
+    ds4_gpu_tensor gate_tmp = { tmp, out_dim * sizeof(float), 0 };
+    ds4_gpu_tensor up_tmp = { (char *)tmp + out_dim * sizeof(float),
+                              out_dim * sizeof(float),
+                              0 };
+    return ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(&gate_tmp,
+                                                     &up_tmp,
+                                                     mid,
+                                                     model_map,
+                                                     model_size,
+                                                     gate_offset,
+                                                     up_offset,
+                                                     in_dim,
+                                                     out_dim,
+                                                     x,
+                                                     clamp);
+}
+
+extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_model_view_tensor(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        float                   clamp) {
+    return ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(gate,
+                                                     up,
+                                                     mid,
+                                                     model_map,
+                                                     model_size,
+                                                     gate_offset,
+                                                     up_offset,
+                                                     in_dim,
+                                                     out_dim,
+                                                     x,
+                                                     clamp);
+}
+
+extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        float                   clamp) {
+    if (n_tok == 1u) {
+        return ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(gate,
+                                                         up,
+                                                         mid,
+                                                         model_map,
+                                                         model_size,
+                                                         gate_offset,
+                                                         up_offset,
+                                                         in_dim,
+                                                         out_dim,
+                                                         x,
+                                                         clamp);
+    }
+    if (clamp > 1.0e-6f) return 0;
+    return ds4_gpu_shared_gate_up_swiglu_q8_0_batch_tensor(gate,
+                                                           up,
+                                                           mid,
+                                                           model_map,
+                                                           model_size,
+                                                           gate_offset,
+                                                           up_offset,
+                                                           in_dim,
+                                                           out_dim,
+                                                           x,
+                                                           n_tok);
+}
+
 static cudaStream_t g_shared_gate_up_stream = NULL;
 static cudaEvent_t g_shared_gate_up_ready_event = NULL;
 static void *g_shared_gate_up_tmp = NULL;

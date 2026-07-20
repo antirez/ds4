@@ -1,0 +1,1 @@
+Ecco un confronto dettagliato tra **mmap** (memory-mapped file) e **copia

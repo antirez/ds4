@@ -1,0 +1,6 @@
+Here's a simple SQL query that counts rows per category:
+
+```sql
+SELECT 
+    category,
+    COUNT(*) AS

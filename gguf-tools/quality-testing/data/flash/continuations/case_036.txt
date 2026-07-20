@@ -1,0 +1,1 @@
+Ecco un piano breve e strutturato per testare il **chunking** (frammentazione) di

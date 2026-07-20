@@ -1,0 +1,1 @@
+Ecco un breve e classico esempio di **race condition** (condizione di gara) in C, utilizz
