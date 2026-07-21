@@ -15881,28 +15881,51 @@ static bool metal_graph_configure_dspark_capture(
         return false;
     }
 
+    /* DSpark support weights, drafter kernels, and target-hidden capture all
+     * run on the configured executor tier (see ds4_session_prepare_dspark_draft,
+     * ds4.c:59635). The legacy ds4_gpu_tensor_alloc(bytes) always allocates on
+     * tier 0 (ds4_cuda.cu:2592), so under multi-tier SSD streaming — where the
+     * DSpark executor is tier 1 — every capture/drafter kernel that touched
+     * this scratch (hc_weighted_sum_tensor reading cur_hc on tier 1 against
+     * dspark_target_hidden / dspark_hc_mean_weights on tier 0) raised a sticky
+     * CUDA illegal-memory-access the moment the first target layer (40) was
+     * captured during decode. Allocate all DSpark scratch on exec_tier so the
+     * capture path stays on a single device. Single-tier (Metal/CPU) builds
+     * keep working because ds4_gpu_tensor_alloc_ptr_on(0, ...) collapses to
+     * the legacy allocator there (ds4.c:173). */
+    const int exec_tier =
+        g->dspark_exec_tier >= 0 && g->dspark_exec_tier < DS4_MAX_GPUS
+            ? g->dspark_exec_tier : 0;
+
     g->dspark_hc_mean_weights =
-        ds4_gpu_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
+        ds4_gpu_tensor_alloc_ptr_on(exec_tier,
+                                    (uint64_t)DS4_N_HC * sizeof(float));
     g->dspark_hc_mean_rows =
-        ds4_gpu_tensor_alloc((uint64_t)g->prefill_cap *
-                             DS4_N_HC * sizeof(float));
+        ds4_gpu_tensor_alloc_ptr_on(exec_tier,
+                                    (uint64_t)g->prefill_cap *
+                                    DS4_N_HC * sizeof(float));
     g->dspark_target_hidden =
-        ds4_gpu_tensor_alloc((uint64_t)dw->target_layer_count *
-                             DS4_N_EMBD * sizeof(float));
+        ds4_gpu_tensor_alloc_ptr_on(exec_tier,
+                                    (uint64_t)dw->target_layer_count *
+                                    DS4_N_EMBD * sizeof(float));
     g->dspark_target_hidden_batch =
-        ds4_gpu_tensor_alloc((uint64_t)dw->target_layer_count *
-                             g->prefill_cap *
-                             DS4_N_EMBD * sizeof(float));
+        ds4_gpu_tensor_alloc_ptr_on(exec_tier,
+                                    (uint64_t)dw->target_layer_count *
+                                    g->prefill_cap *
+                                    DS4_N_EMBD * sizeof(float));
     if (dw->block_size != 0 && dw->block_size <= DS4_DSPARK_MAX_BLOCK_SIZE) {
         g->dspark_stage0_packed =
-            ds4_gpu_tensor_alloc(((uint64_t)dw->block_size + 1u) *
-                                 dw->target_layer_count *
-                                 DS4_N_EMBD * sizeof(float));
+            ds4_gpu_tensor_alloc_ptr_on(exec_tier,
+                                        ((uint64_t)dw->block_size + 1u) *
+                                        dw->target_layer_count *
+                                        DS4_N_EMBD * sizeof(float));
     }
     g->dspark_stage0_proj =
-        ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+        ds4_gpu_tensor_alloc_ptr_on(exec_tier,
+                                    (uint64_t)DS4_N_EMBD * sizeof(float));
     g->dspark_main_x =
-        ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+        ds4_gpu_tensor_alloc_ptr_on(exec_tier,
+                                    (uint64_t)DS4_N_EMBD * sizeof(float));
     if (!g->dspark_hc_mean_weights || !g->dspark_hc_mean_rows ||
         !g->dspark_target_hidden || !g->dspark_target_hidden_batch ||
         !g->dspark_stage0_proj || !g->dspark_main_x) {
@@ -15911,20 +15934,26 @@ static bool metal_graph_configure_dspark_capture(
     if (dw->block_size != 0 && dw->block_size <= DS4_DSPARK_MAX_BLOCK_SIZE) {
         const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
         g->dspark_draft_tokens =
-            ds4_gpu_tensor_alloc((uint64_t)dw->block_size * sizeof(int32_t));
+            ds4_gpu_tensor_alloc_ptr_on(exec_tier,
+                                        (uint64_t)dw->block_size * sizeof(int32_t));
         g->dspark_draft_hc =
-            ds4_gpu_tensor_alloc((uint64_t)dw->block_size * hc_dim * sizeof(float));
+            ds4_gpu_tensor_alloc_ptr_on(exec_tier,
+                                        (uint64_t)dw->block_size * hc_dim * sizeof(float));
         g->dspark_target_hc =
-            ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
+            ds4_gpu_tensor_alloc_ptr_on(exec_tier,
+                                        hc_dim * sizeof(float));
         g->dspark_stage_input_hc =
-            ds4_gpu_tensor_alloc((uint64_t)(dw->block_size + 1u) *
-                                 hc_dim * sizeof(float));
+            ds4_gpu_tensor_alloc_ptr_on(exec_tier,
+                                        (uint64_t)(dw->block_size + 1u) *
+                                        hc_dim * sizeof(float));
         g->dspark_stage_output_hc =
-            ds4_gpu_tensor_alloc((uint64_t)dw->block_size *
-                                 hc_dim * sizeof(float));
+            ds4_gpu_tensor_alloc_ptr_on(exec_tier,
+                                        (uint64_t)dw->block_size *
+                                        hc_dim * sizeof(float));
         g->dspark_position_ids =
-            ds4_gpu_tensor_alloc((uint64_t)(dw->block_size + 1u) *
-                                 sizeof(int32_t));
+            ds4_gpu_tensor_alloc_ptr_on(exec_tier,
+                                        (uint64_t)(dw->block_size + 1u) *
+                                        sizeof(int32_t));
         if (!g->dspark_draft_tokens || !g->dspark_draft_hc ||
             !g->dspark_target_hc || !g->dspark_stage_input_hc ||
             !g->dspark_stage_output_hc || !g->dspark_position_ids) {
@@ -15933,8 +15962,9 @@ static bool metal_graph_configure_dspark_capture(
         if (dw->n_stages != 0 && g->raw_cap != 0) {
             for (uint32_t stage = 0; stage < dw->n_stages; stage++) {
                 g->dspark_raw_cache[stage] =
-                    ds4_gpu_tensor_alloc((uint64_t)g->raw_cap *
-                                         DS4_N_HEAD_DIM * sizeof(float));
+                    ds4_gpu_tensor_alloc_ptr_on(exec_tier,
+                                                (uint64_t)g->raw_cap *
+                                                DS4_N_HEAD_DIM * sizeof(float));
                 if (!g->dspark_raw_cache[stage]) return false;
             }
             g->dspark_cache_cap = g->raw_cap;
@@ -55799,12 +55829,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     if (opt->mtp_path && opt->mtp_path[0] &&
         opt->distributed.role == DS4_DISTRIBUTED_NONE) {
-        if (e->ssd_streaming) {
-            fprintf(stderr, "ds4: --ssd-streaming is not compatible with --mtp yet\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
+        /* SSD streaming + MTP/DSpark: previously refused upstream ("not compatible
+         * yet"). Allowed here — the support model loads resident while the main
+         * model streams; verify correctness end-to-end. */
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
         ds4_dspark_summary dspark = {0};
         e->support_kind =
