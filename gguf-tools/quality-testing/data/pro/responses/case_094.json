@@ -1,0 +1,223 @@
+{
+  "id": "0986beb7-603d-47f6-885f-22ad54f3f758",
+  "object": "chat.completion",
+  "created": 1779684825,
+  "model": "deepseek-v4-pro",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Tokyo"
+      },
+      "logprobs": {
+        "content": [
+          {
+            "token": "Tokyo",
+            "logprob": 0.0,
+            "bytes": [
+              84,
+              111,
+              107,
+              121,
+              111
+            ],
+            "top_logprobs": [
+              {
+                "token": "Tokyo",
+                "logprob": 0.0,
+                "bytes": [
+                  84,
+                  111,
+                  107,
+                  121,
+                  111
+                ]
+              },
+              {
+                "token": "<｜｜end▁of▁sentence｜｜>",
+                "logprob": -9999.0,
+                "bytes": [
+                  60,
+                  239,
+                  189,
+                  156,
+                  239,
+                  189,
+                  156,
+                  101,
+                  110,
+                  100,
+                  226,
+                  150,
+                  129,
+                  111,
+                  102,
+                  226,
+                  150,
+                  129,
+                  115,
+                  101,
+                  110,
+                  116,
+                  101,
+                  110,
+                  99,
+                  101,
+                  239,
+                  189,
+                  156,
+                  239,
+                  189,
+                  156,
+                  62
+                ]
+              },
+              {
+                "token": "!",
+                "logprob": -9999.0,
+                "bytes": [
+                  33
+                ]
+              },
+              {
+                "token": "\"",
+                "logprob": -9999.0,
+                "bytes": [
+                  34
+                ]
+              },
+              {
+                "token": "#",
+                "logprob": -9999.0,
+                "bytes": [
+                  35
+                ]
+              },
+              {
+                "token": "$",
+                "logprob": -9999.0,
+                "bytes": [
+                  36
+                ]
+              },
+              {
+                "token": "%",
+                "logprob": -9999.0,
+                "bytes": [
+                  37
+                ]
+              },
+              {
+                "token": "&",
+                "logprob": -9999.0,
+                "bytes": [
+                  38
+                ]
+              },
+              {
+                "token": "'",
+                "logprob": -9999.0,
+                "bytes": [
+                  39
+                ]
+              },
+              {
+                "token": "(",
+                "logprob": -9999.0,
+                "bytes": [
+                  40
+                ]
+              },
+              {
+                "token": ")",
+                "logprob": -9999.0,
+                "bytes": [
+                  41
+                ]
+              },
+              {
+                "token": "*",
+                "logprob": -9999.0,
+                "bytes": [
+                  42
+                ]
+              },
+              {
+                "token": "+",
+                "logprob": -9999.0,
+                "bytes": [
+                  43
+                ]
+              },
+              {
+                "token": ",",
+                "logprob": -9999.0,
+                "bytes": [
+                  44
+                ]
+              },
+              {
+                "token": "-",
+                "logprob": -9999.0,
+                "bytes": [
+                  45
+                ]
+              },
+              {
+                "token": "What",
+                "logprob": -9999.0,
+                "bytes": [
+                  87,
+                  104,
+                  97,
+                  116
+                ]
+              },
+              {
+                "token": ".",
+                "logprob": -9999.0,
+                "bytes": [
+                  46
+                ]
+              },
+              {
+                "token": "/",
+                "logprob": -9999.0,
+                "bytes": [
+                  47
+                ]
+              },
+              {
+                "token": "0",
+                "logprob": -9999.0,
+                "bytes": [
+                  48
+                ]
+              },
+              {
+                "token": "1",
+                "logprob": -9999.0,
+                "bytes": [
+                  49
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 16,
+    "completion_tokens": 1,
+    "total_tokens": 17,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 16
+  },
+  "system_fingerprint": "fp_9954b31ca7_prod0820_fp8_kvcache_20260402"
+}

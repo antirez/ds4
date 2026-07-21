@@ -50,7 +50,7 @@ static const ds4q_traits ds4q_type_traits[DS4Q_TYPE_COUNT] = {
     [DS4Q_TYPE_Q4_K]    = { "q4_K",  QK_K, 144, true,  false },
     [DS4Q_TYPE_Q5_K]    = { "q5_K",  QK_K, 176, false, false },
     [DS4Q_TYPE_Q6_K]    = { "q6_K",  QK_K, 210, false, false },
-    [DS4Q_TYPE_Q8_K]    = { "q8_K",  QK_K, 292, false, false },
+    [DS4Q_TYPE_Q8_K]    = { "q8_K",  QK_K, 292, true,  false },
     [DS4Q_TYPE_IQ2_XXS] = { "iq2_xxs", QK_K,  66, true,  true  },
     [DS4Q_TYPE_IQ2_XS]  = { "iq2_xs",  QK_K,  74, false, true  },
     [DS4Q_TYPE_IQ3_XXS] = { "iq3_xxs", QK_K,  98, false, false },
@@ -362,6 +362,63 @@ static size_t ds4q_quantize_q8_0(const float *src, void *dst, int64_t start,
         int8_t *qs = (int8_t *)(out + sizeof(hd));
         for (int j = 0; j < qk; j++) qs[j] = (int8_t)roundf(x[j] * id);
         out += sizeof(hd) + qk;
+    }
+    return (size_t)nrows * row_size;
+}
+
+static void ds4q_write_q8_k_block(const float *x, uint8_t *y) {
+    enum { d_off = 0, qs_off = 4, bsums_off = 260 };
+    int8_t qs[QK_K];
+    int16_t bsums[QK_K / 16];
+
+    float max = 0.0f;
+    float amax = 0.0f;
+    for (int j = 0; j < QK_K; j++) {
+        const float ax = fabsf(x[j]);
+        if (ax > amax) {
+            amax = ax;
+            max = x[j];
+        }
+    }
+
+    if (amax == 0.0f) {
+        memset(y, 0, ds4q_type_traits[DS4Q_TYPE_Q8_K].type_size);
+        return;
+    }
+
+    const float iscale = -127.0f / max;
+    for (int j = 0; j < QK_K; j++) {
+        int v = (int)lrintf(iscale * x[j]);
+        if (v > 127) v = 127;
+        if (v < -128) v = -128;
+        qs[j] = (int8_t)v;
+    }
+    for (int j = 0; j < QK_K / 16; j++) {
+        int sum = 0;
+        for (int i = 0; i < 16; i++) sum += qs[j * 16 + i];
+        bsums[j] = (int16_t)sum;
+    }
+
+    const float d = 1.0f / iscale;
+    memcpy(y + d_off, &d, sizeof(d));
+    memcpy(y + qs_off, qs, sizeof(qs));
+    memcpy(y + bsums_off, bsums, sizeof(bsums));
+}
+
+static size_t ds4q_quantize_q8_k(const float *src, void *dst, int64_t start,
+                                 int64_t nrows, int64_t ncols) {
+    const size_t row_size = ds4q_row_size(DS4Q_TYPE_Q8_K, ncols);
+    const int64_t start_row = start / ncols;
+    uint8_t *out = (uint8_t *)dst + (size_t)start_row * row_size;
+    const int64_t blocks_per_row = ncols / QK_K;
+
+    for (int64_t row = 0; row < nrows; row++) {
+        const float *xrow = src + start + (size_t)row * (size_t)ncols;
+        for (int64_t b = 0; b < blocks_per_row; b++) {
+            uint8_t *block = out + (size_t)row * row_size +
+                             (size_t)b * ds4q_type_traits[DS4Q_TYPE_Q8_K].type_size;
+            ds4q_write_q8_k_block(xrow + (size_t)b * QK_K, block);
+        }
     }
     return (size_t)nrows * row_size;
 }
@@ -1053,6 +1110,10 @@ size_t ds4q_quantize_chunk(ds4q_type type, const float *src, void *dst,
     if (type == DS4Q_TYPE_Q8_0) {
         (void)imatrix;
         return ds4q_quantize_q8_0(src, dst, start, nrows, ncols);
+    }
+    if (type == DS4Q_TYPE_Q8_K) {
+        (void)imatrix;
+        return ds4q_quantize_q8_k(src, dst, start, nrows, ncols);
     }
     if (type == DS4Q_TYPE_Q2_K) {
         return ds4q_quantize_q2_k(src, dst, start, nrows, ncols, imatrix);

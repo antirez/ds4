@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect official DeepSeek V4 continuations for local quant scoring."""
+"""Collect hosted-model continuations for local quant scoring."""
 
 from __future__ import annotations
 
@@ -129,18 +129,31 @@ def request_one(
     max_tokens: int,
     top_logprobs: int,
     thinking: str,
+    reasoning_effort: str,
+    token_limit_field: str,
+    provider_order: list[str],
+    provider_allow_fallbacks: bool,
+    provider_require_parameters: bool,
 ) -> dict:
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
-        "max_tokens": max_tokens,
         "logprobs": True,
         "top_logprobs": top_logprobs,
         "stream": False,
     }
+    payload[token_limit_field] = max_tokens
     if thinking != "omit":
         payload["thinking"] = {"type": thinking}
+    if reasoning_effort != "omit":
+        payload["reasoning"] = {"effort": reasoning_effort}
+    if provider_order or provider_require_parameters:
+        provider = {"require_parameters": provider_require_parameters}
+        if provider_order:
+            provider["order"] = provider_order
+            provider["allow_fallbacks"] = provider_allow_fallbacks
+        payload["provider"] = provider
     req = urllib.request.Request(
         endpoint,
         data=json.dumps(payload).encode("utf-8"),
@@ -162,11 +175,29 @@ def fetch_with_retry(
     max_tokens: int,
     top_logprobs: int,
     thinking: str,
+    reasoning_effort: str,
+    token_limit_field: str,
+    provider_order: list[str],
+    provider_allow_fallbacks: bool,
+    provider_require_parameters: bool,
 ) -> dict:
     delay = 1.0
     for attempt in range(6):
         try:
-            return request_one(api_key, endpoint, model, prompt, max_tokens, top_logprobs, thinking)
+            return request_one(
+                api_key,
+                endpoint,
+                model,
+                prompt,
+                max_tokens,
+                top_logprobs,
+                thinking,
+                reasoning_effort,
+                token_limit_field,
+                provider_order,
+                provider_allow_fallbacks,
+                provider_require_parameters,
+            )
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", "replace")
             if e.code < 500 and e.code != 429:
@@ -187,17 +218,44 @@ def main() -> int:
     ap.add_argument("--prompts", default="gguf-tools/quality-testing/prompts.jsonl")
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--endpoint", default=ENDPOINT)
+    ap.add_argument("--api-key-env", default=None)
     ap.add_argument("--count", type=int, default=100)
     ap.add_argument("--max-tokens", type=int, default=24)
     ap.add_argument("--top-logprobs", type=int, default=5)
     ap.add_argument("--thinking", choices=("disabled", "enabled", "omit"), default="disabled")
+    ap.add_argument("--reasoning-effort",
+                    choices=("xhigh", "high", "medium", "low", "minimal", "none", "omit"),
+                    default=None)
+    ap.add_argument("--token-limit-field",
+                    choices=("auto", "max_tokens", "max_completion_tokens"),
+                    default="auto")
+    ap.add_argument("--provider-order",
+                    help="comma-separated OpenRouter provider slugs, for example ambient/fp8")
+    ap.add_argument("--allow-provider-fallbacks", action="store_true")
+    ap.add_argument("--require-parameters", action="store_true",
+                    help="for OpenRouter, route only to endpoints advertising the requested parameters")
     args = ap.parse_args()
     if args.top_logprobs < 0 or args.top_logprobs > 20:
         raise SystemExit("--top-logprobs must be between 0 and 20")
 
-    api_key = os.environ.get("DEEPSEEK_API_KEY")
+    openrouter = "openrouter.ai" in args.endpoint
+    api_key_env = args.api_key_env or ("OPENROUTER_API_KEY" if openrouter else "DEEPSEEK_API_KEY")
+    api_key = os.environ.get(api_key_env)
     if not api_key:
-        raise SystemExit("DEEPSEEK_API_KEY is not set")
+        raise SystemExit(f"{api_key_env} is not set")
+    thinking = args.thinking
+    reasoning_effort = args.reasoning_effort
+    if reasoning_effort is None:
+        reasoning_effort = "none" if openrouter else "omit"
+    if openrouter and args.thinking == "disabled":
+        thinking = "omit"
+    token_limit_field = args.token_limit_field
+    if token_limit_field == "auto":
+        token_limit_field = "max_tokens"
+    provider_order = []
+    if args.provider_order:
+        provider_order = [item.strip() for item in args.provider_order.split(",") if item.strip()]
+    provider_require_parameters = args.require_parameters
     prompts = load_prompts(Path(args.prompts))
 
     out = Path(args.out)
@@ -209,6 +267,12 @@ def main() -> int:
     rows = []
     total = min(args.count, len(prompts))
     print(f"model={args.model} endpoint={args.endpoint}", file=sys.stderr)
+    print(f"key_env={api_key_env} token_field={token_limit_field} thinking={thinking} reasoning={reasoning_effort}",
+          file=sys.stderr)
+    if provider_order or provider_require_parameters:
+        print(f"provider_order={','.join(provider_order) or '-'} "
+              f"provider_fallbacks={args.allow_provider_fallbacks} "
+              f"require_parameters={provider_require_parameters}", file=sys.stderr)
     for i, prompt in enumerate(prompts[: args.count]):
         case_id = f"case_{i:03d}"
         print(f"official {i + 1}/{total}: {case_id}", file=sys.stderr, flush=True)
@@ -219,12 +283,20 @@ def main() -> int:
             prompt,
             args.max_tokens,
             args.top_logprobs,
-            args.thinking,
+            thinking,
+            reasoning_effort,
+            token_limit_field,
+            provider_order,
+            args.allow_provider_fallbacks,
+            provider_require_parameters,
         )
         choice = response["choices"][0]
         content = choice.get("message", {}).get("content", "")
         if not content:
             print(f"warning: empty continuation for {case_id}", file=sys.stderr)
+        logprob_items = (choice.get("logprobs") or {}).get("content", []) or []
+        if args.top_logprobs > 0 and not logprob_items:
+            raise RuntimeError(f"{case_id}: response did not include output-token logprobs")
 
         prompt_path = out / "prompts" / f"{case_id}.txt"
         cont_path = out / "continuations" / f"{case_id}.txt"

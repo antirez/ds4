@@ -1,0 +1,1 @@
+To understand the tradeoffs between **top-p sampling** (also known as nucleus sampling) and **temperature zero decoding**

@@ -1,0 +1,1 @@
+Checksums catch accidental corruption by generating a concise mathematical summary—such as a sum or hash—of a dataset's binary

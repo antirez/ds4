@@ -1,0 +1,1 @@
+Certamente! Latenza e throughput sono due metriche fondamentali per misurare le prestazioni di un sistema (

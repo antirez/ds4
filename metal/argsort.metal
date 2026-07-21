@@ -65,6 +65,15 @@ kernel void kernel_argsort_f32_i32(
     // initialize indices
     shmem_i32[col] = i00 + col;
 
+    // Stage this block's score slice in threadgroup memory (indices stay in
+    // [i00, i00+ntg.x), so shmem_f32[idx - i00] replaces the device gather).
+    // The host allocates ntg.x extra floats after the index array.  Values and
+    // the comparison network are unchanged, so the permutation is identical.
+    threadgroup float * shmem_f32 = (threadgroup float *) (shmem_i32 + ntg.x);
+    if (i00 + col < args.ne00) {
+        shmem_f32[col] = src0_row[i00 + col];
+    }
+
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (int k = 2; k <= ntg.x; k *= 2) {
@@ -74,16 +83,16 @@ kernel void kernel_argsort_f32_i32(
                 if ((col & k) == 0) {
                     if (shmem_i32[col] >= args.ne00 ||
                        (shmem_i32[ixj] <  args.ne00 && (order == DS4_SORT_ORDER_ASC ?
-                            src0_row[shmem_i32[col]] > src0_row[shmem_i32[ixj]] :
-                            src0_row[shmem_i32[col]] < src0_row[shmem_i32[ixj]]))
+                            shmem_f32[shmem_i32[col] - i00] > shmem_f32[shmem_i32[ixj] - i00] :
+                            shmem_f32[shmem_i32[col] - i00] < shmem_f32[shmem_i32[ixj] - i00]))
                     ) {
                         SWAP(shmem_i32[col], shmem_i32[ixj]);
                     }
                 } else {
                     if (shmem_i32[ixj] >= args.ne00 ||
                        (shmem_i32[col] <  args.ne00 && (order == DS4_SORT_ORDER_ASC ?
-                            src0_row[shmem_i32[col]] < src0_row[shmem_i32[ixj]] :
-                            src0_row[shmem_i32[col]] > src0_row[shmem_i32[ixj]]))
+                            shmem_f32[shmem_i32[col] - i00] < shmem_f32[shmem_i32[ixj] - i00] :
+                            shmem_f32[shmem_i32[col] - i00] > shmem_f32[shmem_i32[ixj] - i00]))
                     ) {
                         SWAP(shmem_i32[col], shmem_i32[ixj]);
                     }

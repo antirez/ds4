@@ -1,0 +1,1 @@
+In Metal (così come in altre API grafiche moderne come Vulkan o DirectX 12), la gestione della memoria e

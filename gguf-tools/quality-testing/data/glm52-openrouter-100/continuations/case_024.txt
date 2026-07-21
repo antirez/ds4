@@ -1,0 +1,1 @@
+A safe format for storing a model checkpoint header prioritizes **human-readability**, **forward/backward compatibility**, **ext

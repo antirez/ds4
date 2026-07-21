@@ -1,0 +1,1 @@
+A **trie** (pronounced "try") represents a set of strings as a tree-like data structure where each

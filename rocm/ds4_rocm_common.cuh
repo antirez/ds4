@@ -320,6 +320,28 @@ __global__ static void repeat_hc_kernel(float *out, const float *row, uint32_t n
     out[i] = row[i % n_embd];
 }
 
+__global__ static void repeat_hc_rows_kernel(float *out, const float *rows, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n = (uint64_t)n_tokens * n_hc * n_embd;
+    if (i >= n) return;
+
+    uint64_t hc_row = (uint64_t)n_hc * n_embd;
+    uint64_t tok = i / hc_row;
+    uint64_t embd = i % n_embd;
+    out[i] = rows[tok * n_embd + embd];
+}
+
+__global__ static void pack_slot_rows_f32_kernel(float *out, const float *slots, uint32_t n_rows, uint32_t width, uint32_t n_slots, uint32_t slot_cap) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n = (uint64_t)n_rows * n_slots * width;
+    if (i >= n) return;
+
+    uint64_t col = i % width;
+    uint64_t slot = (i / width) % n_slots;
+    uint64_t row = i / ((uint64_t)n_slots * width);
+    out[i] = slots[((slot * slot_cap) + row) * width + col];
+}
+
 __global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = __float2half(x[i]);
@@ -374,4 +396,3 @@ __device__ static float f16_bits_to_f32(uint16_t bits) {
 __device__ static float dot4_f32(float4 a, float4 b) {
     return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
 }
-

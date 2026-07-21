@@ -1,0 +1,1 @@
+Certamente! Spiegherò la **softmax** nel contesto del meccanismo di **attenzione**

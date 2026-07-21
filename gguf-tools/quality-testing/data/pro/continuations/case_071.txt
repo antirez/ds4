@@ -1,0 +1,1 @@
+Gli array ordinati rendono più veloce la ricerca di appartenenza principalmente grazie alla possibilità di utilizzare l'

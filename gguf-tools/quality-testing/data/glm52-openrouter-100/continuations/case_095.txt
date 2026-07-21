@@ -1,0 +1,1 @@
+The derivative of x squared is **2x**.

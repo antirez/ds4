@@ -126,6 +126,91 @@ typedef struct {
 
 #include "rocm/ds4_rocm_moe_launch.cuh"
 
+#include "rocm/ds4_rocm_glm.cuh"
+
 #include "rocm/ds4_rocm_hc_output_launch.cuh"
 
 #include "rocm/ds4_rocm_current_api_compat.cuh"
+
+/* Tensor-parallel gates are Metal-only; stubs keep shared graph code
+ * linkable (TP option validation rejects non-Metal backends). */
+extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
+    (void)layer; (void)gate;
+    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
+    return 0;
+}
+
+extern "C" void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn) {
+    (void)fn;
+}
+
+extern "C" void ds4_gpu_tp_suspend_expert_sharding(int suspend) {
+    (void)suspend;
+}
+
+extern "C" void ds4_gpu_tp_keepalive_pause(int paused) {
+    (void)paused;
+}
+
+extern "C" void ds4_gpu_tp_set_attn_head_split(int enabled) {
+    (void)enabled;
+}
+
+extern "C" void ds4_gpu_model_residency_skip(int skip) {
+    (void)skip;
+}
+
+extern "C" void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn) {
+    (void)fn;
+}
+
+extern "C" int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
+                                          const ds4_gpu_tensor *out_t,
+                                          ds4_gpu_tensor *in_t,
+                                          uint64_t bytes) {
+    (void)layer; (void)rows; (void)out_t; (void)in_t; (void)bytes;
+    return 0;
+}
+
+extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
+    (void)layer; (void)rows;
+    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
+    return 0;
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_kslice_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t full_in_dim, uint64_t k_off,
+        uint64_t k_cnt, uint64_t out_dim, const ds4_gpu_tensor *x,
+        uint64_t x_elem_off) {
+    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
+    (void)full_in_dim; (void)k_off; (void)k_cnt; (void)out_dim; (void)x;
+    (void)x_elem_off;
+    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
+    return 0;
+}
+
+extern "C" int ds4_gpu_attention_output_q8_tp_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *low, const void *model_map,
+        uint64_t model_size, uint64_t out_a_offset, uint64_t out_b_offset,
+        uint64_t group_dim, uint64_t rank, uint32_t n_groups_total,
+        uint32_t group0, uint32_t group_cnt, uint64_t out_dim,
+        const ds4_gpu_tensor *heads) {
+    (void)out; (void)low; (void)model_map; (void)model_size;
+    (void)out_a_offset; (void)out_b_offset; (void)group_dim; (void)rank;
+    (void)n_groups_total; (void)group0; (void)group_cnt; (void)out_dim;
+    (void)heads;
+    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
+    return 0;
+}
+
+extern "C" int ds4_gpu_hc_expand_add_tensor(
+        ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *post, const ds4_gpu_tensor *comb,
+        uint32_t n_embd, uint32_t n_hc) {
+    (void)out_hc; (void)block_out; (void)block_add; (void)residual_hc;
+    (void)post; (void)comb; (void)n_embd; (void)n_hc;
+    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
+    return 0;
+}

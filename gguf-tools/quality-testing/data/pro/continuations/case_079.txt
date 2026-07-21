@@ -1,0 +1,5 @@
+Ecco una checklist concisa per revisionare i lifetime di memoria in una PR:
+
+## Checklist Revisione Lifetime
+
+###

@@ -1,0 +1,1 @@
+Per capire perché il **prefill** (l'elaborazione iniziale del prompt) su GPU può essere

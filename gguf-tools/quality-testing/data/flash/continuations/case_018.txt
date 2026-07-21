@@ -1,0 +1,1 @@
+Questa è un'ottima domanda che tocca un aspetto fondamentale dell'ottimizzazione dell'inferenza
