@@ -1,0 +1,3 @@
+Here is a concise design for a TCP echo server optimized to handle slow clients without blocking other connections.
+
+### Architecture: Async

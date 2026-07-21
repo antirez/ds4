@@ -1,0 +1,1 @@
+Testing a command-line parser thoroughly requires covering both normal usage and edge cases that could break assumptions. Here's a systematic approach

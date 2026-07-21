@@ -1,0 +1,1 @@
+Certamente. Ecco una derivazione dettagliata del perché **RMSNorm** (Root Mean Square Normalization

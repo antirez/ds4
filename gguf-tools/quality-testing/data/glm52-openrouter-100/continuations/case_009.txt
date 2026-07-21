@@ -1,0 +1,3 @@
+Here are three invariants for a tokenizer special-token table, focusing on consistency, safety, and bidirectional mapping:
+
+**

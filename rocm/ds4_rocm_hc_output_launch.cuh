@@ -9,6 +9,21 @@ extern "C" int ds4_gpu_repeat_hc_tensor(ds4_gpu_tensor *out, const ds4_gpu_tenso
     return cuda_ok(cudaGetLastError(), "repeat_hc launch");
 }
 
+extern "C" int ds4_gpu_repeat_hc_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *rows, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc) {
+    uint64_t rows_elems = 0;
+    uint64_t n = 0;
+    if (n_tokens == 0 || n_embd == 0 || n_hc == 0 ||
+        !cuda_u64_mul_checked(n_tokens, n_embd, &rows_elems) ||
+        !cuda_u64_mul_checked(rows_elems, n_hc, &n) ||
+        !cuda_tensor_has_f32(rows, rows_elems) || !cuda_tensor_has_f32(out, n)) {
+        return 0;
+    }
+    const uint64_t blocks = (n + 255u) / 256u;
+    if (blocks > UINT32_MAX) return 0;
+    repeat_hc_rows_kernel<<<(unsigned)blocks, 256>>>((float *)out->ptr, (const float *)rows->ptr, n_tokens, n_embd, n_hc);
+    return cuda_ok(cudaGetLastError(), "repeat_hc_rows launch");
+}
+
 extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;
     const uint64_t mix_bytes = 24ull * sizeof(float);

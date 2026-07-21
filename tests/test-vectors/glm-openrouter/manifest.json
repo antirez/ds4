@@ -1,0 +1,57 @@
+{
+  "schema": "ds4-test-vector-manifest-v1",
+  "source": "openrouter",
+  "model": "z-ai/glm-5.2",
+  "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+  "top_logprobs": 20,
+  "max_completion_tokens": 16,
+  "token_limit_field": "max_tokens",
+  "reasoning_effort": "none",
+  "provider_order": [
+    "parasail/fp8"
+  ],
+  "allow_provider_fallbacks": false,
+  "require_parameters": true,
+  "prompts": [
+    {
+      "id": "short_italian_fact",
+      "kind": "short",
+      "prompt_file": "prompts/short_italian_fact.txt",
+      "official_file": "official/short_italian_fact.official.json",
+      "prompt_chars": 57,
+      "steps": 16
+    },
+    {
+      "id": "short_code_completion",
+      "kind": "short",
+      "prompt_file": "prompts/short_code_completion.txt",
+      "official_file": "official/short_code_completion.official.json",
+      "prompt_chars": 102,
+      "steps": 1
+    },
+    {
+      "id": "short_reasoning_plain",
+      "kind": "short",
+      "prompt_file": "prompts/short_reasoning_plain.txt",
+      "official_file": "official/short_reasoning_plain.official.json",
+      "prompt_chars": 51,
+      "steps": 1
+    },
+    {
+      "id": "long_memory_archive",
+      "kind": "long",
+      "prompt_file": "prompts/long_memory_archive.txt",
+      "official_file": "official/long_memory_archive.official.json",
+      "prompt_chars": 18503,
+      "steps": 10
+    },
+    {
+      "id": "long_code_audit",
+      "kind": "long",
+      "prompt_file": "prompts/long_code_audit.txt",
+      "official_file": "official/long_code_audit.official.json",
+      "prompt_chars": 18851,
+      "steps": 16
+    }
+  ]
+}

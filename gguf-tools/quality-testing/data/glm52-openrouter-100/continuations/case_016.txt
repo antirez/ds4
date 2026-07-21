@@ -1,0 +1,1 @@
+Per comprendere i pro e i contro di **top-p** (noto anche come *nucleus sampling*)

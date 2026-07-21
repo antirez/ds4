@@ -1,0 +1,1 @@
+Ottima domanda! Partiamo dall'inizio per capire perché RMSNorm (Root Mean Square Layer Normalization)

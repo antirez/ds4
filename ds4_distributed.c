@@ -4616,6 +4616,16 @@ static bool dist_kv_layer_tensor_bytes(
         uint32_t n_index_comp,
         uint64_t *out) {
     if (!layout || !out) return false;
+    if (ds4_engine_is_glm_dsa(engine)) {
+        return ds4_engine_glm_layer_payload_bytes(engine,
+                                                  layer,
+                                                  layout->raw_live,
+                                                  layout->head_dim,
+                                                  layout->indexer_head_dim,
+                                                  n_comp,
+                                                  n_index_comp,
+                                                  out);
+    }
     uint64_t bytes = 0;
     uint64_t tmp = 0;
     if (!dist_u64_mul(layout->raw_live, layout->head_dim, &tmp) ||
@@ -4668,12 +4678,15 @@ static bool dist_kv_layout_matches(
            a->raw_live == b->raw_live;
 }
 
-static bool dist_kv_raw_live_valid(const ds4_dist_kv_layout *layout) {
+static bool dist_kv_raw_live_valid(ds4_engine *engine, const ds4_dist_kv_layout *layout) {
     if (!layout || layout->raw_window == 0 || layout->raw_cap == 0) return false;
-    const uint32_t expected =
+    const uint32_t max_live =
         layout->token_count < layout->raw_window ? layout->token_count : layout->raw_window;
-    return layout->raw_live == expected &&
-           layout->raw_live <= layout->raw_cap;
+    if (ds4_engine_is_glm_dsa(engine)) {
+        return layout->raw_live <= max_live &&
+               layout->raw_live <= layout->raw_cap;
+    }
+    return layout->raw_live == max_live && layout->raw_live <= layout->raw_cap;
 }
 
 static int dist_kv_parse_layer_payload(
@@ -4725,7 +4738,7 @@ static int dist_kv_parse_layer_payload(
         return 1;
     }
     if (got.n_layers != (uint32_t)ds4_engine_layer_count(engine) ||
-        !dist_kv_raw_live_valid(&got)) {
+        !dist_kv_raw_live_valid(engine, &got)) {
         if (errlen) snprintf(err, errlen, "distributed KV shard layout is invalid");
         return 1;
     }
@@ -5251,7 +5264,7 @@ int ds4_dist_session_load_payload(
         layout.ctx > (uint32_t)ds4_session_ctx(owner) ||
         layout.token_count >= (uint32_t)ds4_session_ctx(owner) ||
         layout.vocab != (uint32_t)ds4_engine_vocab_size(d->state.engine) ||
-        !dist_kv_raw_live_valid(&layout)) {
+        !dist_kv_raw_live_valid(d->state.engine, &layout)) {
         if (errlen) snprintf(err, errlen, "DS4 KV payload does not match current distributed runtime");
         return 1;
     }
@@ -5648,10 +5661,6 @@ int ds4_dist_session_eval(
     }
     if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
 
-    ds4_tokens transcript = {0};
-    ds4_tokens_copy(&transcript, checkpoint);
-    ds4_tokens_push(&transcript, token);
-
     int rc = dist_coordinator_eval_span(&d->state,
                                         owner,
                                         &d->plan,
@@ -5665,6 +5674,9 @@ int ds4_dist_session_eval(
                                         err,
                                         errlen);
     if (rc != 0) {
+        ds4_tokens transcript = {0};
+        ds4_tokens_copy(&transcript, checkpoint);
+        ds4_tokens_push(&transcript, token);
         if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                      owner,
                                                      &d->plan,
@@ -5682,9 +5694,9 @@ int ds4_dist_session_eval(
             return 1;
         }
         d->plan_ready = true;
+        ds4_tokens_free(&transcript);
         rc = 0;
     }
-    ds4_tokens_free(&transcript);
     return rc;
 }
 

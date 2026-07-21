@@ -1,0 +1,1 @@
+La formula di **RMSNorm** (Root Mean Square Normalization) si basa su due passaggi fondamentali

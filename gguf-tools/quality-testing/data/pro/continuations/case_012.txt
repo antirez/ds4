@@ -1,0 +1,1 @@
+Su macOS, il caricamento dei pesi di un modello (come quelli per il machine learning) può avvenire

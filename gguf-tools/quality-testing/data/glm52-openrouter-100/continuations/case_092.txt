@@ -1,0 +1,3 @@
+Here is a simple SQL query to count the number of rows per category. 
+
+Assuming your table is named `your

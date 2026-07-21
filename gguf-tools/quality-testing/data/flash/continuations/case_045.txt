@@ -1,0 +1,1 @@
+This is a fascinating question that gets to the heart of how modern graphics APIs like Metal, Vulkan, and DirectX

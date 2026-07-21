@@ -1,0 +1,1 @@
+On macOS, the choice between memory-mapped model weights and copying weights into private buffers involves several trade-offs. Here's

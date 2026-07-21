@@ -1,0 +1,3 @@
+Ecco una descrizione di un formato sicuro per salvare l'header di un checkpoint modello:
+
+## Formato

@@ -1,0 +1,3 @@
+Here’s a clear explanation of why a page cache makes a second file read faster.
+
+### The Core Reason: Avoiding

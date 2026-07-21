@@ -1,0 +1,5 @@
+Here's a minimal JSON schema for a tool call with name and arguments:
+
+```json
+{
+  "type": "
