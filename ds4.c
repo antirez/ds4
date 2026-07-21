@@ -15452,6 +15452,7 @@ static bool metal_graph_set_active_tier_batch(ds4_gpu_graph *g, int tier, uint32
         return true;
     }
     if (tier < 0 || tier >= DS4_MAX_GPUS) return false;
+    (void)ds4_gpu_debug_probe("set_active_tier_batch entry", -1, tier);
     if (tier == g->active_tier) return true;
     if (ds4_gpu_set_current_device(tier) != 0) return false;
     if (g->active_tier >= 0) {
@@ -15464,6 +15465,7 @@ static bool metal_graph_set_active_tier_batch(ds4_gpu_graph *g, int tier, uint32
         }
     }
     g->active_tier = tier;
+    (void)ds4_gpu_debug_probe("set_active_tier_batch done", -1, tier);
     return true;
 }
 
@@ -15492,8 +15494,23 @@ static inline void metal_graph_ssd_assert_tier_device(const ds4_gpu_graph *g,
                                                        uint32_t il) {
     if (g && g->placement) {
         const int tier = g->placement[il + 1];
-        if (tier >= 0) (void)ds4_gpu_set_current_device(tier);
+        if (tier >= 0) {
+            (void)ds4_gpu_set_current_device(tier);
+            (void)ds4_gpu_debug_probe("ssd_assert_tier_device", (int)il, tier);
+        }
     }
+}
+
+/* Multi-tier + SSD-staging debug trace gate (matches ds4_cuda.cu). Default
+ * off in production; set DS4_SSD_DEBUG=1 to enable the per-step prefill
+ * trace. */
+static int ds4_ssd_dbg(void) {
+    static int e = -1;
+    if (e < 0) {
+        const char *s = getenv("DS4_SSD_DEBUG");
+        e = (s && s[0] == '1') ? 1 : 0;
+    }
+    return e;
 }
 
 /* Upstream: --power N GPU duty-cycle throttling helpers. The single-tier
@@ -20757,6 +20774,8 @@ static bool metal_graph_decode_cuda_selected_load(
         getenv("DS4_CUDA_STREAMING_EXPERT_CACHE_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
 
+    int stage_tier = g->placement ? g->placement[il + 1] : 0;
+    (void)ds4_gpu_debug_probe("decode_cuda_sel_load entry", (int)il, stage_tier);
     if (ds4_gpu_end_commands() == 0) return false;
     const double t_sync = profile ? now_sec() : 0.0;
 
@@ -20766,10 +20785,12 @@ static bool metal_graph_decode_cuda_selected_load(
                                   selected_ids,
                                   (uint64_t)DS4_N_EXPERT_USED *
                                       sizeof(selected_ids[0])) != 0;
+    (void)ds4_gpu_debug_probe("decode_cuda_sel_load post-read", (int)il, stage_tier);
     const double t_read = profile ? now_sec() : 0.0;
 
     if (ok) {
         metal_graph_ssd_assert_tier_device(g, il);
+        (void)ds4_gpu_debug_probe("decode_cuda_sel_load pre-stage", (int)il, stage_tier);
         const ds4_gpu_stream_expert_table table =
             graph_stream_expert_table_make(model,
                                            layer,
@@ -20780,6 +20801,7 @@ static bool metal_graph_decode_cuda_selected_load(
                     &table,
                     selected_ids,
                     DS4_N_EXPERT_USED) != 0;
+        (void)ds4_gpu_debug_probe("decode_cuda_sel_load post-stage", (int)il, stage_tier);
     }
     const double t_load = profile ? now_sec() : 0.0;
 
@@ -20841,6 +20863,8 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_load(
         getenv("DS4_CUDA_STREAMING_PREFILL_BATCH_SELECTED_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
 
+    int home_tier = g->placement ? g->placement[il + 1] : 0;
+    (void)ds4_gpu_debug_probe("batch_selected_load entry", (int)il, home_tier);
     if (ds4_gpu_end_commands() == 0) return false;
     const double t_sync = profile ? now_sec() : 0.0;
 
@@ -20849,9 +20873,11 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_load(
                                   0,
                                   selected_ids,
                                   n_ids64 * sizeof(selected_ids[0])) != 0;
+    (void)ds4_gpu_debug_probe("batch_selected_load post-read", (int)il, home_tier);
     const double t_read = profile ? now_sec() : 0.0;
     if (ok) {
         metal_graph_ssd_assert_tier_device(g, il);
+        (void)ds4_gpu_debug_probe("batch_selected_load pre-stage", (int)il, home_tier);
         const ds4_gpu_stream_expert_table table =
             graph_stream_expert_table_make(model,
                                            layer,
@@ -20863,6 +20889,7 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_load(
                     selected_ids,
                     n_tokens,
                     DS4_N_EXPERT_USED) != 0;
+        (void)ds4_gpu_debug_probe("batch_selected_load post-stage", (int)il, home_tier);
     }
     free(selected_ids);
     const double t_load = profile ? now_sec() : 0.0;
@@ -28624,7 +28651,9 @@ static bool metal_graph_encode_layer_ffn_batch(
     }
     DS4_METAL_PROFILE_FFN_STAGE("router");
 
+    int ffn_tier = g->placement ? g->placement[il + 1] : 0;
     if (ok) {
+        (void)ds4_gpu_debug_probe("ffn_batch pre-staging", (int)il, ffn_tier);
         ok = metal_graph_cuda_stream_prefill_batch_selected_load(g,
                                                                  model,
                                                                  layer,
@@ -28632,6 +28661,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                                  n_tokens,
                                                                  gate_expert_bytes,
                                                                  down_expert_bytes);
+        (void)ds4_gpu_debug_probe("ffn_batch post-staging", (int)il, ffn_tier);
     }
 
 #ifdef DS4_ROCM_BUILD
@@ -28857,6 +28887,7 @@ static bool metal_graph_encode_layer_ffn_batch(
         g->tp_batch_out && g->tp_batch_in;
     const bool cuda_tp_owned_batch_moe =
         g->cuda_tp_ep && g->cuda_tp_prefill_ffn;
+    (void)ds4_gpu_debug_probe("ffn_batch pre-routed-moe", (int)il, ffn_tier);
     if (ok && cuda_tp_owned_batch_moe) {
         ok = metal_graph_encode_mixed_routed_rows(
                 g, decode_items, decode_count, model, layer, il, n_tokens);
@@ -28975,6 +29006,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("routed_moe");
+    (void)ds4_gpu_debug_probe("ffn_batch post-routed-moe", (int)il, ffn_tier);
     if (!shared_done) {
         DS4_METAL_ENCODE_PREFILL_SHARED_EXPERT();
     }
@@ -29090,8 +29122,9 @@ static bool metal_graph_encode_layer_batch(
         uint32_t                il,
         uint32_t                pos0,
         uint32_t                n_tokens) {
+    int this_tier = g->placement ? g->placement[il + 1u] : 0;
+    (void)ds4_gpu_debug_probe("encode_layer_batch entry", (int)il, this_tier);
     if (g->placement) {
-        const int this_tier = g->placement[il + 1u];
         if (!metal_graph_set_active_tier_batch(g, this_tier, n_tokens)) {
             return false;
         }
@@ -29103,6 +29136,7 @@ static bool metal_graph_encode_layer_batch(
     if (!ok) {
         fprintf(stderr, "ds4: gpu layer %u attention batch encode failed\n", il);
     }
+    (void)ds4_gpu_debug_probe("encode_layer_batch post-attn", (int)il, this_tier);
     if (ok) {
         ok = metal_graph_encode_layer_ffn_batch(g, model, layer, il, pos0,
                                                  n_tokens, NULL, 0);
@@ -29110,6 +29144,7 @@ static bool metal_graph_encode_layer_batch(
             fprintf(stderr, "ds4: gpu layer %u ffn batch encode failed\n", il);
         }
     }
+    (void)ds4_gpu_debug_probe("encode_layer_batch post-ffn", (int)il, this_tier);
     if (ok) {
         ds4_gpu_tensor *tmp = metal_graph_batch_cur_hc(g);
         g->batch_cur_hc_by_tier[g->active_tier] = metal_graph_batch_next_hc(g);
@@ -29145,19 +29180,50 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     const bool batch_static_decode =
         static_decode_map && metal_graph_stream_decode_layer_batch_enabled(g);
     bool ok = true;
+    /* Multi-tier: the per-token embed kernel reads token_embd (staged on
+     * emb_tier) and writes to metal_graph_cur_hc(g) = cur_hc_by_tier[active_tier].
+     * After init (active_tier=-1) OR after a prior decode/prefill left
+     * active_tier on a different tier (e.g. the head tier / tier 1, where the
+     * last decode layer ran), the embed would resolve cur_hc to the wrong
+     * tier or to an out-of-bounds slot (cur_hc_by_tier[-1]). The embed then
+     * silently no-ops (NULL out_hc) and the whole prefill returns false
+     * ("cuda prefill failed") with NO CUDA error logged.
+     *
+     * The per-layer decode dispatcher (metal_graph_set_active_tier_decode)
+     * early-returns when active_tier already equals the requested tier
+     * WITHOUT calling cudaSetDevice, so we MUST also switch the AMBIENT
+     * device here — otherwise a stale ambient device left by the previous
+     * token's last layer (e.g. tier 1) survives into il=0 of this token
+     * (tier 0), where encode_decode_layer_phase's set_active_tier_decode(0)
+     * no-ops and the layer's attention kernels run on device 1 reading
+     * device-0 raw_kv / norm tensors -> illegal memory access.
+     *
+     * metal_graph_set_active_tier_no_copy does both: cudaSetDevice(emb_tier)
+     * AND active_tier=emb_tier. The embed kernel itself uses WITH_DEVICE for
+     * defense-in-depth. No boundary-hop copy is needed: the embed overwrites
+     * cur_hc in full. No-op single-tier (placement == NULL). */
+    if (g->placement &&
+        !metal_graph_set_active_tier_no_copy(g, g->emb_tier)) {
+        return false;
+    }
+    (void)ds4_gpu_debug_probe("eval_token_raw_swa entry", -1, g->active_tier);
     if (static_decode_map) {
         if (!static_map_state_cache || !g->streaming_static_decode_map_current) {
             ok = metal_graph_stream_map_decode_static_all(model, weights);
+            (void)ds4_gpu_debug_probe("eval_token_raw_swa post-map_static_all", -1, g->active_tier);
             if (ok) g->streaming_static_decode_map_current = static_map_state_cache;
         }
     } else {
         g->streaming_static_decode_map_current = false;
         ok = metal_graph_stream_map_token(model, weights);
+        (void)ds4_gpu_debug_probe("eval_token_raw_swa post-map_token", -1, g->active_tier);
     }
     if (ok && !static_decode_map && DS4_N_LAYER > 0) {
         metal_graph_stream_readahead_layer_decode(model, weights, 0);
+        (void)ds4_gpu_debug_probe("eval_token_raw_swa post-readahead_l0", -1, g->active_tier);
     }
     if (ok) ok = ds4_gpu_begin_commands() != 0;
+    (void)ds4_gpu_debug_probe("eval_token_raw_swa pre-embed", -1, g->active_tier);
     if (ok) {
         ok = ds4_gpu_embed_token_hc_tensor(metal_graph_cur_hc(g),
                                            model->map,
@@ -29167,9 +29233,12 @@ static bool metal_graph_eval_token_raw_swa_streaming(
                                            (uint32_t)token,
                                            DS4_N_EMBD,
                                            DS4_N_HC) != 0;
+        (void)ds4_gpu_debug_probe("eval_token_raw_swa post-embed", -1, g->active_tier);
     }
     if (batch_static_decode) {
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+            int bsd_tier = g->placement ? g->placement[il + 1] : 0;
+            (void)ds4_gpu_debug_probe("eval_token bsd pre-encode", (int)il, bsd_tier);
             ok = metal_graph_encode_decode_layer(g,
                                                  model,
                                                  &weights->layer[il],
@@ -29180,6 +29249,7 @@ static bool metal_graph_eval_token_raw_swa_streaming(
                                                  raw_row,
                                                  n_raw,
                                                  token);
+            (void)ds4_gpu_debug_probe("eval_token bsd post-encode", (int)il, bsd_tier);
             if (ok) {
                 ds4_gpu_tensor *tmp = metal_graph_cur_hc(g);
                 g->cur_hc_by_tier[g->active_tier] = metal_graph_after_ffn_hc(g);
@@ -29188,13 +29258,17 @@ static bool metal_graph_eval_token_raw_swa_streaming(
             }
         }
         if (ok && logits) {
+            (void)ds4_gpu_debug_probe("eval_token bsd pre-output_head", -1, g->active_tier);
             ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+            (void)ds4_gpu_debug_probe("eval_token bsd post-output_head", -1, g->active_tier);
         }
         const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
         if (ok) ok = ds4_gpu_end_commands() != 0;
+        (void)ds4_gpu_debug_probe("eval_token bsd post-end_commands", -1, g->active_tier);
         const double t_done = (profile || throttle) ? now_sec() : 0.0;
         if (ok && logits) {
             ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+            (void)ds4_gpu_debug_probe("eval_token bsd post-logits_read", -1, g->active_tier);
         }
         const double t_read = (profile || throttle) ? now_sec() : 0.0;
         if (profile) {
@@ -29218,11 +29292,14 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         return ok;
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
+    (void)ds4_gpu_debug_probe("eval_token post-embed end_commands", -1, g->active_tier);
 
     double encode_s = 0.0;
     double execute_s = 0.0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const double tl0 = profile ? now_sec() : 0.0;
+        int decode_tier = g->placement ? g->placement[il + 1] : 0;
+        (void)ds4_gpu_debug_probe("eval_token decode_loop pre-map", (int)il, decode_tier);
         if (!static_decode_map && !metal_graph_stream_map_layer_decode(model, weights, il)) {
             ok = false;
             break;
@@ -29232,6 +29309,7 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         } else if (!static_decode_map && logits) {
             metal_graph_stream_readahead_output(model, weights);
         }
+        (void)ds4_gpu_debug_probe("eval_token decode_loop pre-encode", (int)il, decode_tier);
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         bool encoded_layer = false;
         if (ok) {
@@ -29246,6 +29324,7 @@ static bool metal_graph_eval_token_raw_swa_streaming(
                                                  n_raw,
                                                  token);
             encoded_layer = true;
+            (void)ds4_gpu_debug_probe("eval_token decode_loop post-encode", (int)il, decode_tier);
         }
         if (encoded_layer) {
             ds4_gpu_tensor *tmp = metal_graph_cur_hc(g);
@@ -32628,12 +32707,21 @@ static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
     g->mtp_n_raw = 0;
     metal_graph_dspark_cache_reset(g);
     metal_graph_dspark_capture_invalidate(g);
+    int prev_active = g->active_tier;
+    if (ds4_ssd_dbg()) {
+        fprintf(stderr,
+                "ds4[probe] reset_prefill_state ENTER active_tier=%d emb_tier=%d placement=%p\n",
+                prev_active, g->emb_tier, (void*)g->placement);
+        fflush(stderr);
+    }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint32_t coff = ratio == 4 ? 2u : 1u;
         const uint64_t attn_width = (uint64_t)coff * DS4_N_HEAD_DIM;
         const uint64_t attn_rows = (uint64_t)coff * ratio;
+        int home_tier = g->placement ? g->placement[il + 1] : 0;
+        (void)ds4_gpu_debug_probe("reset_prefill pre-fill", (int)il, home_tier);
         if (!metal_tensor_fill_f32(g->layer_attn_state_kv[il], 0.0f, attn_width * attn_rows)) return false;
         if (!metal_tensor_fill_f32(g->layer_attn_state_score[il], DS4_NEG_INF, attn_width * attn_rows)) return false;
         if (ratio == 4) {
@@ -32643,6 +32731,7 @@ static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
             if (!metal_tensor_fill_f32(g->layer_index_state_score[il], DS4_NEG_INF, index_width * index_rows)) return false;
         }
     }
+    (void)ds4_gpu_debug_probe("reset_prefill post-all", -1, prev_active);
     return true;
 }
 
@@ -33060,6 +33149,7 @@ static bool metal_graph_prefill_layer_major(
          * on the head tier, so repoint at emb_tier (no boundary-hop copy is
          * needed: the embed overwrites batch_cur_hc in full). No-op single-tier. */
         if (g->placement && g->active_tier != g->emb_tier) g->active_tier = g->emb_tier;
+        (void)ds4_gpu_debug_probe("prefill_nosplit pre-embed", -1, g->active_tier);
         ok = metal_graph_upload_prompt_embeddings_hc(metal_graph_batch_cur_hc(g),
                                                      metal_graph_prefill_tokens(g),
                                                      model,
@@ -33067,6 +33157,7 @@ static bool metal_graph_prefill_layer_major(
                                                      prompt,
                                                      start,
                                                      n_tokens);
+        (void)ds4_gpu_debug_probe("prefill_nosplit post-embed", -1, g->active_tier);
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
             ok = metal_graph_encode_layer_batch(g,
@@ -33221,6 +33312,13 @@ static bool metal_graph_prefill_layer_major(
      * active_tier at emb_tier before the embed upload so the kernel runs on
      * the device that owns prefill_tokens + token_embd. No-op single-tier. */
     if (g->placement && g->active_tier != g->emb_tier) g->active_tier = g->emb_tier;
+    (void)ds4_gpu_debug_probe("prefill_split pre-embed", -1, g->active_tier);
+    if (ds4_ssd_dbg()) {
+        fprintf(stderr,
+                "ds4[probe] prefill_split embed: active_tier=%d emb_tier=%d n_tokens=%u start=%u ssd_streaming=%d\n",
+                g->active_tier, g->emb_tier, n_tokens, start, (int)g->ssd_streaming);
+        fflush(stderr);
+    }
     ok = metal_graph_upload_prompt_embeddings_hc(metal_graph_batch_cur_hc(g),
                                                  metal_graph_prefill_tokens(g),
                                                  model,
@@ -33228,6 +33326,7 @@ static bool metal_graph_prefill_layer_major(
                                                  prompt,
                                                  start,
                                                  n_tokens);
+    (void)ds4_gpu_debug_probe("prefill_split post-embed", -1, g->active_tier);
     const double t_embed_encoded = (profile || throttle) ? now_sec() : 0.0;
     const double t_embed_done = (profile || throttle) ? now_sec() : 0.0;
     if (profile) {

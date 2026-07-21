@@ -120,7 +120,17 @@ static int g_cuda_exact_score_split_vec4_plain;
 static int g_cuda_exact_score_split_dim2;
 static int g_cuda_exact_score_split_fuse_inv_rope;
 static int g_cuda_moe_decode_graph;
-static int g_current_logical_tier = -1;
+/* Per-thread cache of the current logical tier. MUST be thread-local:
+ * cudaSetDevice is per-thread, so a process-global cache would let one
+ * thread's set-device answer a different thread's "am I already there?"
+ * check. Concretely: the async staging worker (metal_graph_selected_async_*
+ * in ds4.c) reads the main thread's just-set tier from a global cache and
+ * skips its own cudaSetDevice, leaving the worker on device 0 while it
+ * believes it is on tier 1. The worker then stages experts on device 0,
+ * the per-tier SSD selected_cache on tier 1 stays zero, and the consumer's
+ * routed_moe_launch fails with "streaming selected experts are unavailable".
+ * Thread-localizing the cache makes each thread track its own device. */
+static thread_local int g_current_logical_tier = -1;
 static int g_ssd_streaming_mode;
 
 typedef struct {
@@ -299,6 +309,65 @@ static ds4_ssd_ctx *ssd_current(void) {
         if (g_gpu[t].device_id == dev) return &g_ssd[t];
     }
     return &g_ssd[0];
+}
+
+/* =========================================================================
+ * Debug probe for the multi-tier SSD-staging fault investigation.
+ *
+ * Gate with DS4_SSD_DEBUG=1 (default OFF). Logs the ambient CUDA device, the
+ * expected physical device for `tier`, the logical tier, the layer, and any
+ * pending CUDA error. To catch *lazy* async illegal-memory-access errors
+ * promptly, it forces a cudaDeviceSynchronize() before sampling
+ * cudaGetLastError(); this is expensive, so it is opt-in.
+ *
+ * NB: cudaGetLastError() *clears* the sticky error, so a subsequent cuda_ok()
+ * will not _exit() on it — i.e. enabling DS4_SSD_DEBUG effectively suspends
+ * fail-fast so the full prefill trace can be captured. The CUDA context is
+ * still poisoned, so later ops will re-report and the trace is still
+ * terminal; we just get to see every step instead of dying on the first one.
+ * Returns the (cleared) cudaError_t ordinal, or 0 on success (or when off). */
+static int ds4_ssd_debug_on(void) {
+    static int e = -1;
+    if (e < 0) {
+        const char *s = getenv("DS4_SSD_DEBUG");
+        e = (s && s[0] == '1') ? 1 : 0;
+    }
+    return e;
+}
+
+extern "C" int ds4_gpu_debug_probe(const char *where, int il, int tier) {
+    /* Resolve the ambient device even when the probe is off so the call still
+     * has a well-defined side-effect-free return; the work happens inside the
+     * gated branch. */
+    int dev = -1;
+    (void)cudaGetDevice(&dev);
+    int phys = (tier >= 0 && tier < g_n_gpus) ? g_gpu[tier].device_id : -99;
+    if (!ds4_ssd_debug_on()) return 0;
+    /* Sync EVERY device (not just ambient) and report the first non-zero
+     * error. Cross-device illegal-memory-access errors otherwise hide from
+     * an ambient-only cudaDeviceSynchronize. */
+    cudaError_t err = cudaSuccess;
+    int err_dev = -1;
+    int prev_dev = -1;
+    (void)cudaGetDevice(&prev_dev);
+    for (int t = 0; t < g_n_gpus; t++) {
+        if (cudaSetDevice(g_gpu[t].device_id) != cudaSuccess) continue;
+        cudaError_t sync_err = cudaDeviceSynchronize();
+        cudaError_t peek = cudaGetLastError();
+        if (sync_err != cudaSuccess && peek == cudaSuccess) peek = sync_err;
+        if (peek != cudaSuccess && err == cudaSuccess) {
+            err = peek;
+            err_dev = g_gpu[t].device_id;
+        }
+    }
+    if (prev_dev >= 0) (void)cudaSetDevice(prev_dev);
+    fprintf(stderr,
+            "ds4[probe] %-30s il=%-3u tier=%d phys_dev=%d ambient_dev=%d n_gpus=%d err=%d%s%s%s\n",
+            where ? where : "?", (unsigned)il, tier, phys, dev, g_n_gpus,
+            (int)err, err ? " :: " : "", err ? cudaGetErrorString(err) : "",
+            err ? (err_dev >= 0 ? "" : "") : "");
+    fflush(stderr);
+    return (int)err;
 }
 
 /* Debug/override flags are read once per CUDA init. The hot decode path calls
@@ -1330,9 +1399,42 @@ static float *cuda_q8_f32_ptr(
     return dev;
 }
 
+/* CUDA "sticky" errors permanently invalidate the context: after one of them
+ * every subsequent CUDA call returns cudaErrorIllegalAddress, so the engine
+ * would keep surfacing HTTP 500 ("cuda prefill failed") on every request
+ * until manually restarted. Fail fast on these so a supervisor
+ * (systemd Restart=on-failure) can restart the process and restore service.
+ * Override for debugging with DS4_CUDA_NO_FAIL_FAST=1. */
+static bool cuda_err_is_sticky(cudaError_t err) {
+    switch (err) {
+        case cudaErrorIllegalAddress:        /* "an illegal memory access was encountered" */
+        case cudaErrorLaunchFailure:
+        case cudaErrorHardwareStackError:
+        case cudaErrorIllegalInstruction:
+        case cudaErrorInvalidPc:
+        case cudaErrorMisalignedAddress:
+        case cudaErrorAssert:
+        case cudaErrorCooperativeLaunchTooLarge:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static int cuda_ok(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
     fprintf(stderr, "ds4: CUDA %s failed: %s\n", what, cudaGetErrorString(err));
+    if (cuda_err_is_sticky(err) && getenv("DS4_CUDA_NO_FAIL_FAST") == NULL) {
+        fprintf(stderr,
+                "ds4: CUDA %s failed: %s is a sticky unrecoverable context error; "
+                "exiting so a supervisor can restart the process "
+                "(set DS4_CUDA_NO_FAIL_FAST=1 to disable).\n",
+                what, cudaGetErrorString(err));
+        fflush(stderr);
+        /* _exit, not exit: skip atexit handlers that could themselves touch
+         * the broken CUDA context and hang. The OS reclaims all resources. */
+        _exit(1);
+    }
     return 0;
 }
 
@@ -20971,6 +21073,33 @@ static int routed_moe_launch(
         fprintf(stderr,
                 "ds4: CUDA streaming selected experts are unavailable for layer %u\n",
                 layer_index);
+        if (ds4_ssd_debug_on()) {
+            int cur_dev = -1;
+            (void)cudaGetDevice(&cur_dev);
+            /* Find which tier the ambient device corresponds to. */
+            int ambient_tier = -1;
+            for (int t = 0; t < g_n_gpus; t++) {
+                if (g_gpu[t].device_id == cur_dev) { ambient_tier = t; break; }
+            }
+            fprintf(stderr,
+                    "ds4[probe] moe_check FAIL layer=%u logical_tier=%d cur_dev=%d ambient_tier=%d "
+                    "sc(valid=%d logical=%d model_map=%p layer=%u n_total=%u slot_count=%u req=%u "
+                    "gate_off=%llu up_off=%llu down_off=%llu gate_bytes=%llu down_bytes=%llu "
+                    "gate_ptr=%p up_ptr=%p down_ptr=%p slot_ptr=%p slot_bytes=%llu)\n",
+                    layer_index, logical_tier, cur_dev, ambient_tier,
+                    (int)sc->valid, sc->logical_tier, (void*)sc->model_map,
+                    (unsigned)sc->layer, (unsigned)sc->n_total_expert,
+                    (unsigned)sc->slot_count, (unsigned)required_slot_count,
+                    (unsigned long long)sc->gate_offset,
+                    (unsigned long long)sc->up_offset,
+                    (unsigned long long)sc->down_offset,
+                    (unsigned long long)sc->gate_expert_bytes,
+                    (unsigned long long)sc->down_expert_bytes,
+                    (void*)sc->gate_ptr, (void*)sc->up_ptr, (void*)sc->down_ptr,
+                    (void*)sc->slot_selected_tensor.ptr,
+                    (unsigned long long)sc->slot_selected_tensor.bytes);
+            fflush(stderr);
+        }
         return 0;
     }
     if (use_stream_selected_cache) {

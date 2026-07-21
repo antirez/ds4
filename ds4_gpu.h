@@ -190,6 +190,10 @@ int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         const int32_t                     *selected_ids,
         uint32_t                           n_tokens,
         uint32_t                           n_selected);
+/* Multi-tier SSD debug probe. No-op when DS4_SSD_DEBUG!=1; otherwise logs the
+ * ambient device, expected tier device, and any pending CUDA error after a
+ * forced sync. Defined in ds4_cuda.cu / ds4_rocm.cu. */
+int ds4_gpu_debug_probe(const char *where, int il, int tier);
 #endif
 #ifdef DS4_ROCM_BUILD
 int ds4_gpu_stream_expert_cache_load_layer(
