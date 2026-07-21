@@ -56,6 +56,16 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
+/* Same semantics as ds4_gpu_tensor_copy for 4-byte-aligned f32 payloads, but
+ * encoded as a compute-kernel copy.  On Metal this rides the open batch
+ * compute encoder instead of forcing an end-compute/blit/begin-compute
+ * encoder round-trip per copy, which matters when many small copies are
+ * interleaved with kernel dispatches (the DSpark prefix checkpoints).  On
+ * CUDA/ROCm it is an alias of ds4_gpu_tensor_copy.  Offsets and bytes must
+ * be multiples of 4. */
+int ds4_gpu_tensor_copy_f32_inline(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                   const ds4_gpu_tensor *src, uint64_t src_offset,
+                                   uint64_t bytes);
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);

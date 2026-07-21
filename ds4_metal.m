@@ -8035,6 +8035,34 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     return 1;
 }
 
+/* Compute-kernel twin of ds4_gpu_tensor_copy for f32 payloads.  A blit copy
+ * must end the cached batch compute encoder and reopen it afterwards, so a
+ * copy interleaved with kernel dispatches costs four encoder transitions.
+ * Encoding the copy as a cpy_f32_f32 dispatch keeps the batch encoder open,
+ * which is what makes the per-row DSpark frontier checkpoints cheap. */
+int ds4_gpu_tensor_copy_f32_inline(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                   const ds4_gpu_tensor *src, uint64_t src_offset,
+                                   uint64_t bytes) {
+    if (!dst || !src) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if ((bytes | dst_offset | src_offset) & 3u) return 0;
+    if (!g_batch_cb || !g_cpy_f32_f32_pipeline ||
+        bytes / sizeof(float) > UINT32_MAX) {
+        return ds4_gpu_tensor_copy(dst, dst_offset, src, src_offset, bytes);
+    }
+    DS4MetalTensor *d = ds4_gpu_tensor_obj(dst);
+    const DS4MetalTensor *s = ds4_gpu_tensor_const_obj(src);
+    if (dst_offset > d.bytes || bytes > d.bytes - dst_offset) return 0;
+    if (src_offset > s.bytes || bytes > s.bytes - src_offset) return 0;
+    if (bytes == 0) return 1;
+    return ds4_gpu_encode_cpy_f32_f32_1d(g_batch_cb,
+                                         s.buffer,
+                                         (NSUInteger)(s.offset + src_offset),
+                                         d.buffer,
+                                         (NSUInteger)(d.offset + dst_offset),
+                                         (uint32_t)(bytes / sizeof(float)));
+}
+
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count) {

@@ -2605,6 +2605,15 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     return ok;
 }
 
+/* CUDA has no Metal-style encoder churn to avoid; the compute-copy variant
+ * is an alias of the plain device copy. */
+extern "C" int ds4_gpu_tensor_copy_f32_inline(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                              const ds4_gpu_tensor *src, uint64_t src_offset,
+                                              uint64_t bytes) {
+    if ((bytes | dst_offset | src_offset) & 3u) return 0;
+    return ds4_gpu_tensor_copy(dst, dst_offset, src, src_offset, bytes);
+}
+
 __global__ static void moe_handoff_pack_kernel(
         unsigned char *packed,
         const float *ffn_norm,
