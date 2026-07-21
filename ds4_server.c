@@ -3508,7 +3508,9 @@ static bool parse_responses_content_array_replace(const char **p, char **dst) {
  * render_chat_prompt_text can wrap them in <think>. */
 static bool parse_responses_input(const char **p, chat_msgs *msgs,
                                   buf *loaded_tool_schemas,
-                                  tool_schema_orders *orders) {
+                                  tool_schema_orders *orders,
+                                  bool *last_was_compaction) {
+    if (last_was_compaction) *last_was_compaction = false;
     json_ws(p);
     if (**p != '[') return false;
     (*p)++;
@@ -3741,6 +3743,7 @@ item_fail:
             !strcmp(t, "tool_search_call") || !strcmp(t, "image_generation_call");
         bool is_bookkeeping =
             !strcmp(t, "compaction") || !strcmp(t, "context_compaction");
+        if (is_bookkeeping && last_was_compaction) *last_was_compaction = true;
         if (!consumes_reasoning && !is_bookkeeping && pending_reasoning.len) {
             chat_msg flush_msg = {0};
             flush_msg.role = xstrdup("assistant");
@@ -4042,6 +4045,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     const char *p = body;
     bool got_input = false;
     bool tool_choice_none = false;
+    bool last_was_compaction = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
@@ -4079,7 +4083,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 msg.content = plain;
                 chat_msgs_push(&msgs, msg);
             } else if (!parse_responses_input(&p, &msgs, &loaded_tool_schemas,
-                                              &r->tool_orders)) {
+                                              &r->tool_orders, &last_was_compaction)) {
                 free(key);
                 goto bad;
             }
@@ -4260,7 +4264,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     const char *active_tool_schemas =
         (!tool_choice_none && combined_tool_schemas.len) ?
         combined_tool_schemas.ptr : NULL;
-    r->has_tools = active_tool_schemas && active_tool_schemas[0];
+    r->has_tools = active_tool_schemas && active_tool_schemas[0] && !last_was_compaction;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
@@ -13816,7 +13820,7 @@ static void test_responses_input_tool_search_output_loads_tools(void) {
     chat_msgs msgs = {0};
     buf loaded = {0};
     tool_schema_orders orders = {0};
-    TEST_ASSERT(parse_responses_input(&p, &msgs, &loaded, &orders));
+    TEST_ASSERT(parse_responses_input(&p, &msgs, &loaded, &orders, NULL));
     TEST_ASSERT(loaded.ptr && strstr(loaded.ptr, "\"name\":\"mcp__perplexity__perplexity_search\""));
     const tool_schema_order *order =
         tool_schema_orders_find(&orders, "mcp__perplexity__perplexity_search");
@@ -13841,7 +13845,7 @@ static void test_responses_input_tool_search_output_rejects_bad_tools(void) {
     chat_msgs msgs = {0};
     buf loaded = {0};
     tool_schema_orders orders = {0};
-    TEST_ASSERT(!parse_responses_input(&p, &msgs, &loaded, &orders));
+    TEST_ASSERT(!parse_responses_input(&p, &msgs, &loaded, &orders, NULL));
     buf_free(&loaded);
     tool_schema_orders_free(&orders);
     chat_msgs_free(&msgs);
@@ -13864,7 +13868,7 @@ static void test_responses_input_function_call_namespace_round_trips_to_dsml(voi
         "\"arguments\":{\"query\":\"deepseek\"}}]";
     const char *input_p = input_json;
     chat_msgs msgs = {0};
-    TEST_ASSERT(parse_responses_input(&input_p, &msgs, NULL, NULL));
+    TEST_ASSERT(parse_responses_input(&input_p, &msgs, NULL, NULL, NULL));
     TEST_ASSERT(msgs.len == 1);
     TEST_ASSERT(msgs.v[0].calls.len == 1);
     TEST_ASSERT(!strcmp(msgs.v[0].calls.v[0].name,
@@ -16672,7 +16676,7 @@ static void test_request_parsers_reject_malformed_duplicate_owned_fields(void) {
         "\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}],"
         "\"content\":[{\"type\":\"input_text\",\"text\":\"bad\\q\"}]}]";
     msgs = (chat_msgs){0};
-    TEST_ASSERT(!parse_responses_input(&p, &msgs, NULL, NULL));
+    TEST_ASSERT(!parse_responses_input(&p, &msgs, NULL, NULL, NULL));
     chat_msgs_free(&msgs);
 
     tool_schema_orders orders = {0};
