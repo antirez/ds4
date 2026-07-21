@@ -147,31 +147,56 @@ typedef struct {
     ds4_gpu_tensor slot_selected_tensor;
 } cuda_stream_selected_cache;
 
-static cuda_stream_selected_cache g_stream_selected_cache;
+/* Per-tier SSD streaming state. SSD streaming was originally single-device:
+ * one selected-expert cache, one pinned staging pool, one upload stream, all
+ * on device 0. In multi-GPU mode q4k's per-layer dispatch routes each layer
+ * to a tier via cudaSetDevice(g_gpu[tier].device_id) (ds4.c helpers around
+ * metal_graph_set_active_tier_*), and each tier may own a contiguous layer
+ * range. A single SSD cache therefore cannot serve two devices — CUDA
+ * streams are device-bound and cudaFree must run on the allocating device.
+ *
+ * Style B resolution (no ds4.c call-site signature changes): every SSD
+ * producer/consumer resolves the active tier itself via cudaGetDevice()
+ * (see ssd_current()). Per-layer dispatch has already cudaSetDevice()'d to
+ * the tier that owns the current layer before any SSD function runs, so
+ * ssd_current() returns the tier that owns the layer about to execute. */
+struct ds4_ssd_ctx {
+    cuda_stream_selected_cache selected_cache;
+    void       *stage_raw[4];
+    void       *stage[4];
+    cudaEvent_t stage_event[4];
+    uint64_t    stage_bytes;
+    cudaStream_t upload_stream;
+};
+static ds4_ssd_ctx g_ssd[DS4_MAX_GPUS];
+
+/* Forward declaration: body is defined after g_gpu[] / g_n_gpus below. */
+static ds4_ssd_ctx *ssd_current(void);
 
 static void cuda_stream_selected_cache_invalidate(void) {
-    g_stream_selected_cache.valid = 0;
+    ssd_current()->selected_cache.valid = 0;
 }
 
 static void cuda_stream_selected_cache_release(void) {
-    const int tier = g_stream_selected_cache.logical_tier;
+    ds4_ssd_ctx *ssd = ssd_current();
+    const int tier = ssd->selected_cache.logical_tier;
     if (tier >= 0 && tier < g_n_gpus) {
         (void)ds4_gpu_set_current_device(tier);
     }
-    if (g_stream_selected_cache.gate_ptr) {
-        (void)cudaFree(g_stream_selected_cache.gate_ptr);
+    if (ssd->selected_cache.gate_ptr) {
+        (void)cudaFree(ssd->selected_cache.gate_ptr);
     }
-    if (g_stream_selected_cache.up_ptr) {
-        (void)cudaFree(g_stream_selected_cache.up_ptr);
+    if (ssd->selected_cache.up_ptr) {
+        (void)cudaFree(ssd->selected_cache.up_ptr);
     }
-    if (g_stream_selected_cache.down_ptr) {
-        (void)cudaFree(g_stream_selected_cache.down_ptr);
+    if (ssd->selected_cache.down_ptr) {
+        (void)cudaFree(ssd->selected_cache.down_ptr);
     }
-    if (g_stream_selected_cache.slot_selected_ptr) {
-        (void)cudaFree(g_stream_selected_cache.slot_selected_ptr);
+    if (ssd->selected_cache.slot_selected_ptr) {
+        (void)cudaFree(ssd->selected_cache.slot_selected_ptr);
     }
-    memset(&g_stream_selected_cache, 0, sizeof(g_stream_selected_cache));
-    g_stream_selected_cache.logical_tier = -1;
+    memset(&ssd->selected_cache, 0, sizeof(ssd->selected_cache));
+    ssd->selected_cache.logical_tier = -1;
 }
 
 typedef struct {
@@ -258,6 +283,22 @@ static inline int ds4_tensor_device_idx(const ds4_gpu_tensor *t) {
     int d = t->device_id;
     if (d < 0) return 0;
     return d;
+}
+
+/* Resolve the SSD context for the currently-active CUDA device. Per-layer
+ * dispatch (ds4.c) calls ds4_gpu_set_current_device(tier) — which maps tier
+ * to g_gpu[tier].device_id and cudaSetDevice()s — BEFORE any SSD
+ * producer/consumer runs, so cudaGetDevice() returns the device that owns
+ * the layer about to execute. Falls back to tier 0 when the runtime is
+ * unavailable (e.g. CPU-only build path) or the device is not in g_gpu[]
+ * (e.g. the default context before init). */
+static ds4_ssd_ctx *ssd_current(void) {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return &g_ssd[0];
+    for (int t = 0; t < g_n_gpus; t++) {
+        if (g_gpu[t].device_id == dev) return &g_ssd[t];
+    }
+    return &g_ssd[0];
 }
 
 /* Debug/override flags are read once per CUDA init. The hot decode path calls
@@ -407,11 +448,8 @@ static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
 static uint64_t g_model_stage_bytes;
-static void *g_stream_selected_stage_raw[4];
-static void *g_stream_selected_stage[4];
-static cudaEvent_t g_stream_selected_stage_event[4];
-static uint64_t g_stream_selected_stage_bytes;
-static cudaStream_t g_stream_selected_upload_stream;
+/* The per-tier SSD staging pool (stage_raw/stage/stage_event/stage_bytes +
+ * upload_stream) lives in g_ssd[tier] (see struct ds4_ssd_ctx above). */
 
 static int cuda_ok(cudaError_t err, const char *what);
 static const char *cuda_model_range_ptr_from_fd(
@@ -1596,29 +1634,35 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
 }
 
 static void cuda_stream_selected_stage_release(void) {
+    ds4_ssd_ctx *ssd = ssd_current();
     for (size_t i = 0; i < 4; i++) {
-        if (g_stream_selected_stage_event[i]) {
-            (void)cudaEventDestroy(g_stream_selected_stage_event[i]);
-            g_stream_selected_stage_event[i] = NULL;
+        if (ssd->stage_event[i]) {
+            (void)cudaEventDestroy(ssd->stage_event[i]);
+            ssd->stage_event[i] = NULL;
         }
-        if (g_stream_selected_stage_raw[i]) {
-            (void)cudaFreeHost(g_stream_selected_stage_raw[i]);
-            g_stream_selected_stage_raw[i] = NULL;
-            g_stream_selected_stage[i] = NULL;
+        if (ssd->stage_raw[i]) {
+            (void)cudaFreeHost(ssd->stage_raw[i]);
+            ssd->stage_raw[i] = NULL;
+            ssd->stage[i] = NULL;
         }
     }
-    g_stream_selected_stage_bytes = 0;
-    if (g_stream_selected_upload_stream) {
-        (void)cudaStreamDestroy(g_stream_selected_upload_stream);
-        g_stream_selected_upload_stream = NULL;
+    ssd->stage_bytes = 0;
+    if (ssd->upload_stream) {
+        (void)cudaStreamDestroy(ssd->upload_stream);
+        ssd->upload_stream = NULL;
     }
 }
 
 static int cuda_stream_selected_stage_pool_alloc(uint64_t bytes) {
-    if (g_stream_selected_stage_bytes >= bytes) return 1;
+    ds4_ssd_ctx *ssd = ssd_current();
+    if (ssd->stage_bytes >= bytes) return 1;
     cuda_stream_selected_stage_release();
+    /* Upload stream is device-bound: create it on the CURRENT device (the
+     * per-layer dispatcher has already cudaSetDevice()'d to the tier that
+     * owns this layer). Stash it in this tier's ssd ctx. */
+    ssd = ssd_current();
     cudaError_t err = cudaStreamCreateWithFlags(
-            &g_stream_selected_upload_stream, cudaStreamNonBlocking);
+            &ssd->upload_stream, cudaStreamNonBlocking);
     if (err != cudaSuccess) {
         fprintf(stderr,
                 "ds4: CUDA streaming selected upload stream creation failed: %s\n",
@@ -1627,7 +1671,7 @@ static int cuda_stream_selected_stage_pool_alloc(uint64_t bytes) {
         return 0;
     }
     for (size_t i = 0; i < 4; i++) {
-        err = cudaMallocHost(&g_stream_selected_stage_raw[i], (size_t)bytes);
+        err = cudaMallocHost(&ssd->stage_raw[i], (size_t)bytes);
         if (err != cudaSuccess) {
             fprintf(stderr,
                     "ds4: CUDA streaming selected staging allocation failed: %s\n",
@@ -1636,9 +1680,9 @@ static int cuda_stream_selected_stage_pool_alloc(uint64_t bytes) {
             cuda_stream_selected_stage_release();
             return 0;
         }
-        g_stream_selected_stage[i] = cuda_align_ptr(
-                g_stream_selected_stage_raw[i], g_model_direct_align);
-        err = cudaEventCreateWithFlags(&g_stream_selected_stage_event[i],
+        ssd->stage[i] = cuda_align_ptr(
+                ssd->stage_raw[i], g_model_direct_align);
+        err = cudaEventCreateWithFlags(&ssd->stage_event[i],
                                        cudaEventDisableTiming);
         if (err != cudaSuccess) {
             fprintf(stderr,
@@ -1649,7 +1693,7 @@ static int cuda_stream_selected_stage_pool_alloc(uint64_t bytes) {
             return 0;
         }
     }
-    g_stream_selected_stage_bytes = bytes;
+    ssd->stage_bytes = bytes;
     return 1;
 }
 
@@ -1679,6 +1723,9 @@ static int cuda_model_copy_to_device_streamed(
         chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
     if (!cuda_stream_selected_stage_pool_alloc(stage_bytes)) return 0;
 
+    /* pool_alloc just sized this tier's stage pool + upload stream. Cache the
+     * tier ctx once: device does not change for the lifetime of this copy. */
+    ds4_ssd_ctx *ssd = ssd_current();
     uint64_t copied = 0;
     uint64_t chunk_idx = 0;
     while (copied < bytes) {
@@ -1686,7 +1733,7 @@ static int cuda_model_copy_to_device_streamed(
         const uint64_t bi = chunk_idx % 4u;
         cudaError_t err;
         if (chunk_idx >= 4u) {
-            err = cudaEventSynchronize(g_stream_selected_stage_event[bi]);
+            err = cudaEventSynchronize(ssd->stage_event[bi]);
             if (err != cudaSuccess) {
                 fprintf(stderr,
                         "ds4: CUDA streaming selected staging wait failed for %s: %s\n",
@@ -1696,8 +1743,8 @@ static int cuda_model_copy_to_device_streamed(
             }
         }
         const char *payload = NULL;
-        if (!cuda_model_stage_read(g_stream_selected_stage[bi],
-                                   g_stream_selected_stage_bytes,
+        if (!cuda_model_stage_read(ssd->stage[bi],
+                                   ssd->stage_bytes,
                                    offset + copied, n, &payload)) {
             fprintf(stderr,
                     "ds4: CUDA streaming selected read failed for %s at %.2f MiB: %s\n",
@@ -1707,7 +1754,7 @@ static int cuda_model_copy_to_device_streamed(
         }
         err = cudaMemcpyAsync(dst + copied, payload, (size_t)n,
                               cudaMemcpyHostToDevice,
-                              g_stream_selected_upload_stream);
+                              ssd->upload_stream);
         if (err != cudaSuccess) {
             fprintf(stderr,
                     "ds4: CUDA streaming selected copy failed for %s at %.2f MiB: %s\n",
@@ -1716,8 +1763,8 @@ static int cuda_model_copy_to_device_streamed(
             (void)cudaGetLastError();
             return 0;
         }
-        err = cudaEventRecord(g_stream_selected_stage_event[bi],
-                              g_stream_selected_upload_stream);
+        err = cudaEventRecord(ssd->stage_event[bi],
+                              ssd->upload_stream);
         if (err != cudaSuccess) {
             fprintf(stderr,
                     "ds4: CUDA streaming selected staging record failed for %s: %s\n",
@@ -1733,7 +1780,7 @@ static int cuda_model_copy_to_device_streamed(
     }
 
     const cudaError_t err =
-        cudaStreamSynchronize(g_stream_selected_upload_stream);
+        cudaStreamSynchronize(ssd->upload_stream);
     if (err != cudaSuccess) {
         fprintf(stderr,
                 "ds4: CUDA streaming selected upload sync failed for %s: %s\n",
@@ -2250,6 +2297,11 @@ extern "C" void ds4_gpu_cleanup(void) {
             c->scratch = NULL;
             c->scratch_bytes = 0;
         }
+        /* Per-tier SSD teardown: free this tier's selected-expert cache and
+         * staging pool on the device that owns them. cudaSetDevice(c->device_id)
+         * above makes ssd_current() resolve to g_ssd[i]. */
+        cuda_stream_selected_cache_release();
+        cuda_stream_selected_stage_release();
     }
     for (int i = 0; i < DS4_MAX_GPUS; i++) {
         for (int j = 0; j < DS4_MAX_GPUS; j++) {
@@ -2260,8 +2312,6 @@ extern "C" void ds4_gpu_cleanup(void) {
             }
         }
     }
-    cuda_stream_selected_cache_release();
-    cuda_stream_selected_stage_release();
     g_n_gpus = 0;
     g_cublas_ready = 0;
 
@@ -11532,11 +11582,23 @@ extern "C" int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void 
     uint64_t weight_bytes = (uint64_t)n_vocab * n_embd * sizeof(uint16_t);
     if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
     const int logical_tier = ds4_tensor_device_idx(out_hc);
-    const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes, logical_tier, "token_embd");
-    if (!wptr) return 0;
-    uint32_t n = n_embd * n_hc;
-    embed_token_hc_kernel<<<(n + 255) / 256, 256>>>((float *)out_hc->ptr, (const unsigned short *)wptr, token, n_embd, n_hc);
-    return cuda_ok(cudaGetLastError(), "embed token launch");
+    /* Pin the kernel to out_hc's home device: cuda_resolve_weight_ptr returns
+     * a device-local pointer valid only on logical_tier's physical device.
+     * Without this the kernel can launch on a stale ambient device left by a
+     * prior decode on another tier and take an illegal memory access. */
+    const int target_dev = (logical_tier >= 0 && logical_tier < g_n_gpus)
+        ? g_gpu[logical_tier].device_id : 0;
+    int ok = 0;
+    WITH_DEVICE(target_dev) {
+        const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes, logical_tier, "token_embd");
+        if (!wptr) { ok = 0; }
+        else {
+            uint32_t n = n_embd * n_hc;
+            embed_token_hc_kernel<<<(n + 255) / 256, 256>>>((float *)out_hc->ptr, (const unsigned short *)wptr, token, n_embd, n_hc);
+            ok = cuda_ok(cudaGetLastError(), "embed token launch");
+        }
+    }
+    return ok;
 }
 
 extern "C" int ds4_gpu_embed_tokens_hc_tensor(
@@ -11557,18 +11619,31 @@ extern "C" int ds4_gpu_embed_tokens_hc_tensor(
         return 0;
     }
     const int logical_tier = ds4_tensor_device_idx(out_hc);
-    const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset,
-                                                (uint64_t)n_vocab * n_embd * sizeof(uint16_t),
-                                                logical_tier,
-                                                "token_embd");
-    if (!wptr) return 0;
-    uint64_t n = (uint64_t)n_tokens * n_hc * n_embd;
-    embed_tokens_hc_kernel<<<(n + 255) / 256, 256>>>(
-        (float *)out_hc->ptr,
-        (const int32_t *)tokens_t->ptr,
-        (const __half *)wptr,
-        n_vocab, n_tokens, n_embd, n_hc);
-    return cuda_ok(cudaGetLastError(), "embed tokens launch");
+    /* Pin the kernel to out_hc's home device: cuda_resolve_weight_ptr returns
+     * a device-local pointer valid only on logical_tier's physical device,
+     * and out_hc/tokens_t live there too. Without this the kernel launched on
+     * the ambient device (left there by a prior decode on another tier) and
+     * the first prefill chunk took an illegal memory access. */
+    const int target_dev = (logical_tier >= 0 && logical_tier < g_n_gpus)
+        ? g_gpu[logical_tier].device_id : 0;
+    int ok = 0;
+    WITH_DEVICE(target_dev) {
+        const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset,
+                                                    (uint64_t)n_vocab * n_embd * sizeof(uint16_t),
+                                                    logical_tier,
+                                                    "token_embd");
+        if (!wptr) { ok = 0; }
+        else {
+            uint64_t n = (uint64_t)n_tokens * n_hc * n_embd;
+            embed_tokens_hc_kernel<<<(n + 255) / 256, 256>>>(
+                (float *)out_hc->ptr,
+                (const int32_t *)tokens_t->ptr,
+                (const __half *)wptr,
+                n_vocab, n_tokens, n_embd, n_hc);
+            ok = cuda_ok(cudaGetLastError(), "embed tokens launch");
+        }
+    }
+    return ok;
 }
 
 static int indexer_scores_launch(
@@ -20859,25 +20934,37 @@ static int routed_moe_launch(
     }
     const uint64_t required_slot_count = (uint64_t)n_tokens * n_expert;
     const int logical_tier = ds4_tensor_device_idx(out);
+    /* SSD selected-expert cache: when SSD streaming has staged a compact
+     * (gate, up, down) slab for THIS layer's routed experts, read directly
+     * from the staged device pointers instead of going through the model
+     * range / selective-cache resolver. Multi-tier aware: ssd_current()
+     * resolves the tier whose layer is executing. The per-layer dispatcher
+     * sets the device, but ambient device can drift across the attention/
+     * router kernels that ran before this consumer; re-affirm the OUT
+     * tensor's home tier so ssd_current() reads THIS layer's slab. */
+    if (g_n_gpus > 1 && logical_tier >= 0 && logical_tier < g_n_gpus) {
+        (void)cudaSetDevice(g_gpu[logical_tier].device_id);
+    }
+    cuda_stream_selected_cache *sc = &ssd_current()->selected_cache;
     const int use_stream_selected_cache =
         allow_streaming &&
         g_ssd_streaming_mode &&
-        g_stream_selected_cache.valid &&
-        g_stream_selected_cache.logical_tier == logical_tier &&
-        g_stream_selected_cache.model_map == model_map &&
-        g_stream_selected_cache.layer == layer_index &&
-        g_stream_selected_cache.n_total_expert == n_total_expert &&
-        g_stream_selected_cache.slot_count >= required_slot_count &&
-        g_stream_selected_cache.gate_offset == gate_offset &&
-        g_stream_selected_cache.up_offset == up_offset &&
-        g_stream_selected_cache.down_offset == down_offset &&
-        g_stream_selected_cache.gate_expert_bytes == gate_expert_bytes &&
-        g_stream_selected_cache.down_expert_bytes == down_expert_bytes &&
-        g_stream_selected_cache.gate_ptr &&
-        g_stream_selected_cache.up_ptr &&
-        g_stream_selected_cache.down_ptr &&
-        g_stream_selected_cache.slot_selected_tensor.ptr &&
-        g_stream_selected_cache.slot_selected_tensor.bytes >=
+        sc->valid &&
+        sc->logical_tier == logical_tier &&
+        sc->model_map == model_map &&
+        sc->layer == layer_index &&
+        sc->n_total_expert == n_total_expert &&
+        sc->slot_count >= required_slot_count &&
+        sc->gate_offset == gate_offset &&
+        sc->up_offset == up_offset &&
+        sc->down_offset == down_offset &&
+        sc->gate_expert_bytes == gate_expert_bytes &&
+        sc->down_expert_bytes == down_expert_bytes &&
+        sc->gate_ptr &&
+        sc->up_ptr &&
+        sc->down_ptr &&
+        sc->slot_selected_tensor.ptr &&
+        sc->slot_selected_tensor.bytes >=
             required_slot_count * sizeof(int32_t);
     if (g_ssd_streaming_mode && allow_streaming &&
         !use_stream_selected_cache) {
@@ -20887,18 +20974,18 @@ static int routed_moe_launch(
         return 0;
     }
     if (use_stream_selected_cache) {
-        selected = &g_stream_selected_cache.slot_selected_tensor;
+        selected = &sc->slot_selected_tensor;
     }
     const char *gate_w = use_stream_selected_cache ?
-        g_stream_selected_cache.gate_ptr :
+        sc->gate_ptr :
         cuda_resolve_weight_ptr(model_map, gate_offset, gate_bytes,
                                 logical_tier, "moe_gate");
     const char *up_w = use_stream_selected_cache ?
-        g_stream_selected_cache.up_ptr :
+        sc->up_ptr :
         cuda_resolve_weight_ptr(model_map, up_offset, gate_bytes,
                                 logical_tier, "moe_up");
     const char *down_w = use_stream_selected_cache ?
-        g_stream_selected_cache.down_ptr :
+        sc->down_ptr :
         cuda_resolve_weight_ptr(model_map, down_offset, down_bytes,
                                 logical_tier, "moe_down");
     if (!gate_w || !up_w || !down_w) return 0;
@@ -22918,9 +23005,10 @@ static int cuda_stream_selected_ensure_bytes(
 static int cuda_stream_selected_ensure_i32(uint64_t count) {
     if (count == 0 || count > UINT64_MAX / sizeof(int32_t)) return 0;
     const uint64_t bytes = count * sizeof(int32_t);
+    cuda_stream_selected_cache *sc = &ssd_current()->selected_cache;
     return cuda_stream_selected_ensure_bytes(
-            (char **)&g_stream_selected_cache.slot_selected_ptr,
-            &g_stream_selected_cache.slot_selected_capacity,
+            (char **)&sc->slot_selected_ptr,
+            &sc->slot_selected_capacity,
             bytes,
             "selected-id remap");
 }
@@ -22960,11 +23048,6 @@ static int cuda_stream_selected_cache_begin_load(
         slot_count == 0) {
         return 0;
     }
-    if (g_n_gpus != 1) {
-        fprintf(stderr,
-                "ds4: CUDA SSD streaming requires single-GPU placement\n");
-        return 0;
-    }
 
     std::vector<int32_t> expert_to_slot;
     std::vector<int32_t> compact_ids;
@@ -23001,26 +23084,39 @@ static int cuda_stream_selected_cache_begin_load(
     }
     const uint64_t gate_bytes = compact_count * table->gate_expert_bytes;
     const uint64_t down_bytes = compact_count * table->down_expert_bytes;
-    const int logical_tier = 0;
-    if (g_stream_selected_cache.logical_tier != logical_tier &&
-        (g_stream_selected_cache.gate_ptr ||
-         g_stream_selected_cache.up_ptr ||
-         g_stream_selected_cache.down_ptr ||
-         g_stream_selected_cache.slot_selected_ptr)) {
-        cuda_stream_selected_cache_release();
+    /* Per-tier selected-expert cache. The per-layer dispatcher has already
+     * cudaSetDevice()'d to the tier that owns this layer, so ssd_current()
+     * returns that tier's selected_cache. All ensures/copies below land on
+     * the SAME device — cudaMalloc inside ensure_bytes targets the current
+     * device, and the stage/upload path uses this tier's stream. Resolve
+     * logical_tier from the active device so the cache tags land correctly
+     * for whatever tier owns this layer. */
+    int ambient_dev = 0;
+    (void)cudaGetDevice(&ambient_dev);
+    int logical_tier = 0;
+    for (int t = 0; t < g_n_gpus; t++) {
+        if (g_gpu[t].device_id == ambient_dev) { logical_tier = t; break; }
     }
-    if (ds4_gpu_set_current_device(logical_tier) != 0 ||
-        !cuda_stream_selected_ensure_bytes(
-                &g_stream_selected_cache.gate_ptr,
-                &g_stream_selected_cache.gate_capacity,
+    cuda_stream_selected_cache *sc = &ssd_current()->selected_cache;
+    if (sc->logical_tier != logical_tier &&
+        (sc->gate_ptr ||
+         sc->up_ptr ||
+         sc->down_ptr ||
+         sc->slot_selected_ptr)) {
+        cuda_stream_selected_cache_release();
+        sc = &ssd_current()->selected_cache;
+    }
+    if (!cuda_stream_selected_ensure_bytes(
+                &sc->gate_ptr,
+                &sc->gate_capacity,
                 gate_bytes, "gate experts") ||
         !cuda_stream_selected_ensure_bytes(
-                &g_stream_selected_cache.up_ptr,
-                &g_stream_selected_cache.up_capacity,
+                &sc->up_ptr,
+                &sc->up_capacity,
                 gate_bytes, "up experts") ||
         !cuda_stream_selected_ensure_bytes(
-                &g_stream_selected_cache.down_ptr,
-                &g_stream_selected_cache.down_capacity,
+                &sc->down_ptr,
+                &sc->down_capacity,
                 down_bytes, "down experts") ||
         !cuda_stream_selected_ensure_i32(slot_count)) {
         cuda_stream_selected_cache_invalidate();
@@ -23038,17 +23134,17 @@ static int cuda_stream_selected_cache_begin_load(
         const uint64_t gate_dst = (uint64_t)i * table->gate_expert_bytes;
         const uint64_t down_dst = (uint64_t)i * table->down_expert_bytes;
         if (!cuda_model_copy_to_device_streamed(
-                    g_stream_selected_cache.gate_ptr + gate_dst,
+                    sc->gate_ptr + gate_dst,
                     table->model_map, table->model_size,
                     gate_src, table->gate_expert_bytes,
                     "stream gate expert copy") ||
             !cuda_model_copy_to_device_streamed(
-                    g_stream_selected_cache.up_ptr + gate_dst,
+                    sc->up_ptr + gate_dst,
                     table->model_map, table->model_size,
                     up_src, table->gate_expert_bytes,
                     "stream up expert copy") ||
             !cuda_model_copy_to_device_streamed(
-                    g_stream_selected_cache.down_ptr + down_dst,
+                    sc->down_ptr + down_dst,
                     table->model_map, table->model_size,
                     down_src, table->down_expert_bytes,
                     "stream down expert copy")) {
@@ -23056,7 +23152,7 @@ static int cuda_stream_selected_cache_begin_load(
             return 0;
         }
     }
-    if (!cuda_ok(cudaMemcpy(g_stream_selected_cache.slot_selected_ptr,
+    if (!cuda_ok(cudaMemcpy(sc->slot_selected_ptr,
                             slot_ids.data(),
                             (size_t)slot_count * sizeof(int32_t),
                             cudaMemcpyHostToDevice),
@@ -23065,24 +23161,24 @@ static int cuda_stream_selected_cache_begin_load(
         return 0;
     }
 
-    g_stream_selected_cache.logical_tier = logical_tier;
-    g_stream_selected_cache.model_map = table->model_map;
-    g_stream_selected_cache.layer = table->layer;
-    g_stream_selected_cache.n_total_expert = table->n_total_expert;
-    g_stream_selected_cache.slot_count = slot_count;
-    g_stream_selected_cache.compact_count = (uint32_t)compact_count;
-    g_stream_selected_cache.gate_offset = table->gate_offset;
-    g_stream_selected_cache.up_offset = table->up_offset;
-    g_stream_selected_cache.down_offset = table->down_offset;
-    g_stream_selected_cache.gate_expert_bytes = table->gate_expert_bytes;
-    g_stream_selected_cache.down_expert_bytes = table->down_expert_bytes;
-    g_stream_selected_cache.slot_selected_tensor.ptr =
-        g_stream_selected_cache.slot_selected_ptr;
-    g_stream_selected_cache.slot_selected_tensor.bytes =
+    sc->logical_tier = logical_tier;
+    sc->model_map = table->model_map;
+    sc->layer = table->layer;
+    sc->n_total_expert = table->n_total_expert;
+    sc->slot_count = slot_count;
+    sc->compact_count = (uint32_t)compact_count;
+    sc->gate_offset = table->gate_offset;
+    sc->up_offset = table->up_offset;
+    sc->down_offset = table->down_offset;
+    sc->gate_expert_bytes = table->gate_expert_bytes;
+    sc->down_expert_bytes = table->down_expert_bytes;
+    sc->slot_selected_tensor.ptr =
+        sc->slot_selected_ptr;
+    sc->slot_selected_tensor.bytes =
         (uint64_t)slot_count * sizeof(int32_t);
-    g_stream_selected_cache.slot_selected_tensor.owner = 0;
-    g_stream_selected_cache.slot_selected_tensor.device_id = logical_tier;
-    g_stream_selected_cache.valid = 1;
+    sc->slot_selected_tensor.owner = 0;
+    sc->slot_selected_tensor.device_id = logical_tier;
+    sc->valid = 1;
     return 1;
 }
 
@@ -27373,8 +27469,24 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
 
 extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_ssd_streaming_mode = enabled ? 1 : 0;
-    cuda_stream_selected_cache_invalidate();
-    if (!g_ssd_streaming_mode) cuda_stream_selected_cache_release();
+    /* Multi-tier: invalidate every tier's selected_cache, and when disabling
+     * free each tier's caches + staging pool on the device that owns them.
+     * cudaSetDevice before the release helpers so ssd_current() resolves to
+     * g_ssd[t]. Single-tier path (g_n_gpus == 0 at the time of the first
+     * call) is handled by the fallback loop iteration over n == 1, which
+     * runs on whatever device is current — matching the legacy behavior. */
+    const int n = g_n_gpus > 0 ? g_n_gpus : 1;
+    int prev = -1;
+    (void)cudaGetDevice(&prev);
+    for (int t = 0; t < n; t++) {
+        if (g_n_gpus > 0) (void)cudaSetDevice(g_gpu[t].device_id);
+        cuda_stream_selected_cache_invalidate();
+        if (!g_ssd_streaming_mode) {
+            cuda_stream_selected_cache_release();
+            cuda_stream_selected_stage_release();
+        }
+    }
+    if (prev >= 0) (void)cudaSetDevice(prev);
 }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
@@ -27390,15 +27502,25 @@ extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
-    return g_stream_selected_cache.valid ?
-        g_stream_selected_cache.compact_count : 0;
+    /* Status readout: report the active tier's resident count. Per-layer
+     * dispatch has set the device; ssd_current() returns the right tier. */
+    cuda_stream_selected_cache *sc = &ssd_current()->selected_cache;
+    return sc->valid ? sc->compact_count : 0;
 }
 
 extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
 }
 
 extern "C" void ds4_gpu_stream_expert_cache_release_resident(void) {
-    cuda_stream_selected_cache_release();
+    /* Release resident caches on every tier (each on its own device). */
+    const int n = g_n_gpus > 0 ? g_n_gpus : 1;
+    int prev = -1;
+    (void)cudaGetDevice(&prev);
+    for (int t = 0; t < n; t++) {
+        if (g_n_gpus > 0) (void)cudaSetDevice(g_gpu[t].device_id);
+        cuda_stream_selected_cache_release();
+    }
+    if (prev >= 0) (void)cudaSetDevice(prev);
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_selected(

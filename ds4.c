@@ -15479,6 +15479,23 @@ static bool metal_graph_set_active_tier_no_copy(ds4_gpu_graph *g, int tier) {
     return true;
 }
 
+/* SSD streaming producer/consumer device re-affirmation. The per-layer
+ * dispatcher (metal_graph_set_active_tier_*) sets the CUDA device to the
+ * layer's home tier at layer entry, but the ambient device can drift back
+ * to tier 0 across the attention/router kernels that run before the SSD
+ * producer (the resident path tolerates drift because each kernel re-sets
+ * its own device; SSD allocation does not). Call this right before any
+ * SSD producer stages data for layer `il` so ssd_current() resolves to the
+ * layer's home tier and the staging lands on the right device. No-op for
+ * single-tier (placement == NULL). */
+static inline void metal_graph_ssd_assert_tier_device(const ds4_gpu_graph *g,
+                                                       uint32_t il) {
+    if (g && g->placement) {
+        const int tier = g->placement[il + 1];
+        if (tier >= 0) (void)ds4_gpu_set_current_device(tier);
+    }
+}
+
 /* Upstream: --power N GPU duty-cycle throttling helpers. The single-tier
  * --power=100 path is a no-op; multi-tier inherits the same helpers via
  * graph_power_note_prefill_layer / graph_power_note_decode_token which we
@@ -20507,6 +20524,7 @@ static bool metal_graph_decode_set_hash_selected_override(
         }
         const uint64_t gate_expert_bytes = gate_tensor_bytes / DS4_N_EXPERT;
         const uint64_t down_expert_bytes = down_tensor_bytes / DS4_N_EXPERT;
+        metal_graph_ssd_assert_tier_device(g, il);
         const ds4_gpu_stream_expert_table table =
             graph_stream_expert_table_make(model,
                                            layer,
@@ -20687,6 +20705,7 @@ static bool metal_graph_decode_selected_readahead_override(
                                                  DS4_N_EXPERT_USED) == 0) {
         return false;
     }
+    metal_graph_ssd_assert_tier_device(g, il);
     const ds4_gpu_stream_expert_table table =
         graph_stream_expert_table_make(model,
                                        layer,
@@ -20750,6 +20769,7 @@ static bool metal_graph_decode_cuda_selected_load(
     const double t_read = profile ? now_sec() : 0.0;
 
     if (ok) {
+        metal_graph_ssd_assert_tier_device(g, il);
         const ds4_gpu_stream_expert_table table =
             graph_stream_expert_table_make(model,
                                            layer,
@@ -20831,6 +20851,7 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_load(
                                   n_ids64 * sizeof(selected_ids[0])) != 0;
     const double t_read = profile ? now_sec() : 0.0;
     if (ok) {
+        metal_graph_ssd_assert_tier_device(g, il);
         const ds4_gpu_stream_expert_table table =
             graph_stream_expert_table_make(model,
                                            layer,
@@ -20887,6 +20908,12 @@ typedef struct metal_graph_selected_async_load {
     uint64_t                  gate_expert_bytes;
     uint64_t                  down_expert_bytes;
     int32_t                   selected_ids[DS4_MAX_EXPERT_USED];
+    /* Home tier (logical) of the layer this job is staging for. The worker
+     * thread is a long-lived service pthread that defaults to device 0; SSD
+     * streaming requires cudaSetDevice to the tier that owns the layer
+     * BEFORE the load runs, so ssd_current() in ds4_cuda.cu resolves to the
+     * right per-tier cache. -1 means "no preference" (single-tier path). */
+    int                       home_tier;
 } metal_graph_selected_async_load;
 
 static pthread_mutex_t g_metal_graph_selected_async_load_mutex =
@@ -20904,6 +20931,12 @@ static metal_graph_selected_async_load g_metal_graph_selected_async_load_job;
 static void metal_graph_selected_async_load_run(
         metal_graph_selected_async_load *job) {
     job->ok = false;
+    /* Worker thread defaults to device 0; SSD streaming needs the device
+     * set to the tier that owns this layer so ssd_current() resolves to the
+     * right per-tier cache. home_tier is -1 in single-tier (no-op). */
+    if (job->home_tier >= 0) {
+        (void)ds4_gpu_set_current_device(job->home_tier);
+    }
 
     if (!job->router_selected || !job->model || !job->layer ||
         DS4_N_EXPERT == 0 || DS4_N_EXPERT > DS4_MAX_EXPERT ||
@@ -20948,6 +20981,7 @@ static void metal_graph_selected_async_load_run(
         }
     }
     job->ids_ok = true;
+    /* home_tier was applied at run() entry; no graph pointer in the job. */
     const ds4_gpu_stream_expert_table table =
         graph_stream_expert_table_make(job->model,
                                        job->layer,
@@ -21024,7 +21058,8 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start_tensor(
         uint32_t                         il,
         uint64_t                         event_value,
         uint64_t                         gate_expert_bytes,
-        uint64_t                         down_expert_bytes) {
+        uint64_t                         down_expert_bytes,
+        int                              home_tier) {
     if (!job || !router_selected || event_value == 0) return false;
     if (!metal_graph_selected_async_load_ensure_worker()) return false;
     memset(job, 0, sizeof(*job));
@@ -21035,6 +21070,7 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start_tensor(
     job->event_value = event_value;
     job->gate_expert_bytes = gate_expert_bytes;
     job->down_expert_bytes = down_expert_bytes;
+    job->home_tier = home_tier;
 
     pthread_mutex_lock(&g_metal_graph_selected_async_load_mutex);
     if (g_metal_graph_selected_async_load_has_job ||
@@ -21060,6 +21096,14 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start(
         uint64_t                         event_value,
         uint64_t                         gate_expert_bytes,
         uint64_t                         down_expert_bytes) {
+    /* Set home_tier on the caller's job struct BEFORE _start_tensor copies it
+     * into the shared slot (under the mutex). Setting it after would race with
+     * the worker waking up and copying the job back out. */
+    int home_tier = -1;
+    if (g && g->placement) {
+        const int tier = g->placement[il + 1];
+        home_tier = (tier >= 0) ? tier : 0;
+    }
     return metal_graph_selected_async_load_start_tensor(
             job,
             g ? metal_graph_router_selected(g) : NULL,
@@ -21068,7 +21112,8 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start(
             il,
             event_value,
             gate_expert_bytes,
-            down_expert_bytes);
+            down_expert_bytes,
+            home_tier);
 }
 
 static bool metal_graph_selected_async_load_finish(
@@ -21152,6 +21197,7 @@ static void rocm_graph_batch_selected_async_load_run(
             return;
         }
     }
+    /* home_tier was applied at run() entry; no graph pointer in the job. */
     const ds4_gpu_stream_expert_table table =
         graph_stream_expert_table_make(job->model,
                                        job->layer,
@@ -23433,6 +23479,7 @@ static bool metal_graph_encode_decode_layer_phase(
                 /* The worker read valid ids but could not stage the load
                  * (it is not allowed to wait on in-flight cache entries).
                  * This thread is, so retry the same load synchronously. */
+                metal_graph_ssd_assert_tier_device(g, il);
                 const ds4_gpu_stream_expert_table retry_table =
                     graph_stream_expert_table_make(model,
                                                    layer,
@@ -23462,6 +23509,7 @@ static bool metal_graph_encode_decode_layer_phase(
                  ds4_gpu_routed_moe_set_selected_override(selected_ids,
                                                           DS4_N_EXPERT_USED) != 0;
             if (ok) {
+                metal_graph_ssd_assert_tier_device(g, il);
                 const ds4_gpu_stream_expert_table table =
                     graph_stream_expert_table_make(model,
                                                    layer,
@@ -29533,6 +29581,7 @@ static bool metal_graph_seed_streaming_expert_cache_from_prefill(
         }
         const uint64_t gate_expert_bytes = layer->ffn_gate_exps->dim[1] * gate_row_bytes;
         const uint64_t down_expert_bytes = layer->ffn_down_exps->dim[1] * down_row_bytes;
+        metal_graph_ssd_assert_tier_device(g, il);
         const ds4_gpu_stream_expert_table table =
             graph_stream_expert_table_make(model,
                                            layer,
@@ -29666,6 +29715,7 @@ static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
         }
         const uint64_t gate_expert_bytes = layer->ffn_gate_exps->dim[1] * gate_row_bytes;
         const uint64_t down_expert_bytes = layer->ffn_down_exps->dim[1] * down_row_bytes;
+        metal_graph_ssd_assert_tier_device(g, il);
         const ds4_gpu_stream_expert_table table =
             graph_stream_expert_table_make(model,
                                            layer,
@@ -33004,6 +33054,12 @@ static bool metal_graph_prefill_layer_major(
     }
 
     if (!split_commands) {
+        /* Multi-tier: the batch embedding kernel reads prefill_tokens (staged
+         * on emb_tier) and the token_embd weight (staged on emb_tier); it
+         * must run on emb_tier's device. After a decode, active_tier is left
+         * on the head tier, so repoint at emb_tier (no boundary-hop copy is
+         * needed: the embed overwrites batch_cur_hc in full). No-op single-tier. */
+        if (g->placement && g->active_tier != g->emb_tier) g->active_tier = g->emb_tier;
         ok = metal_graph_upload_prompt_embeddings_hc(metal_graph_batch_cur_hc(g),
                                                      metal_graph_prefill_tokens(g),
                                                      model,
@@ -33161,6 +33217,10 @@ static bool metal_graph_prefill_layer_major(
 #endif
 
     double t_layer0 = (profile || throttle) ? now_sec() : 0.0;
+    /* Multi-tier: see comment at the !split_commands branch above — repoint
+     * active_tier at emb_tier before the embed upload so the kernel runs on
+     * the device that owns prefill_tokens + token_embd. No-op single-tier. */
+    if (g->placement && g->active_tier != g->emb_tier) g->active_tier = g->emb_tier;
     ok = metal_graph_upload_prompt_embeddings_hc(metal_graph_batch_cur_hc(g),
                                                  metal_graph_prefill_tokens(g),
                                                  model,
@@ -33836,6 +33896,9 @@ static bool metal_graph_verify_suffix_tops_impl(
 
     const double upload_t0 = timing ? now_sec() : 0.0;
     bool ok = metal_graph_upload_prompt_tokens(metal_graph_prefill_tokens(g), prompt, start, n_tokens);
+    /* Multi-tier: repoint active_tier at emb_tier so the embed kernel runs on
+     * the device that owns prefill_tokens + token_embd. No-op single-tier. */
+    if (g->placement && g->active_tier != g->emb_tier) g->active_tier = g->emb_tier;
     if (ok) ok = metal_graph_upload_prompt_embeddings_hc(metal_graph_batch_cur_hc(g),
                                                          metal_graph_prefill_tokens(g),
                                                          model,
@@ -40070,7 +40133,8 @@ static bool glm_graph_encode_sparse_ffn_one(
                         il,
                         selected_event,
                         gate_out * gate_row_bytes,
-                        down_out * down_row_bytes);
+                        down_out * down_row_bytes,
+                        -1);
                 async_path_profiled = async_profile && async_load_started;
             }
             if (async_profile) {
@@ -53981,6 +54045,31 @@ static void model_warm_weights_sharded(const ds4_model *m,
  *
  * Tensor names live in ds4_str slices (ptr+len), NOT NUL-terminated.
  * We bound every comparison by name.len to avoid out-of-buffer reads. */
+
+/* Returns true if the tensor is a routed-expert weight that SSD streaming
+ * serves from host/disk instead of resident VRAM. When SSD streaming is
+ * enabled these tensors MUST be excluded from the multi-tier placement
+ * budget (they are not loaded resident — they stream per-tier at runtime
+ * via the per-tier SSD cache). The names are the flat ds4_tensor slice form
+ * of "blk.<il>.{ffn_gate_exps,ffn_up_exps,ffn_down_exps}.weight" (and the
+ * mtp.* mirrors). Suffix-matched so the "blk.<il>." / "mtp.0." prefix does
+ * not matter. */
+static bool tensor_is_ssd_streamed_routed_expert(const ds4_tensor *t) {
+    const char *p = t->name.ptr;
+    int n = (int)t->name.len;
+    if (n <= 0 || !p) return false;
+    static const char k_gate[]  = ".ffn_gate_exps.weight";
+    static const char k_up[]    = ".ffn_up_exps.weight";
+    static const char k_down[]  = ".ffn_down_exps.weight";
+    const size_t ng  = sizeof(k_gate) - 1;
+    const size_t nu  = sizeof(k_up) - 1;
+    const size_t nd  = sizeof(k_down) - 1;
+    if ((size_t)n >= ng && memcmp(p + n - ng, k_gate, ng) == 0) return true;
+    if ((size_t)n >= nu && memcmp(p + n - nu, k_up,   nu) == 0) return true;
+    if ((size_t)n >= nd && memcmp(p + n - nd, k_down, nd) == 0) return true;
+    return false;
+}
+
 static int tensor_to_entry(const ds4_tensor *t, int n_layer) {
     const char *p = t->name.ptr;
     int n = (int)t->name.len;
@@ -54067,11 +54156,25 @@ static bool engine_cuda_tp_output_env_requested(void);
 static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
     const int n_entries = DS4_N_LAYER + 2;
     const bool cuda_tp_ep = engine_cuda_tp_ep_requested(e);
+    /* When SSD streaming is on AND we are NOT using CUDA tensor parallelism,
+     * the routed-expert weights (the bulk of an MoE model) are served from
+     * host/disk by the per-tier SSD caches, not loaded resident. Exclude
+     * them from the placement budget so the packer sizes only dense weights
+     * + KV; the per-tier expert cache is grown lazily at runtime out of each
+     * tier's free VRAM. Without this, the packer refuses CPU-spill for a
+     * model whose routed experts were never going to be resident anyway.
+     * Under CUDA TP the experts are sharded resident, so they must stay in
+     * the budget. */
+    const bool ssd_excludes_routed =
+        e->ssd_streaming && !cuda_tp_ep;
     for (int i = 0; i < n_entries; i++) out[i] = 0;
 
     for (uint64_t i = 0; i < e->model.n_tensors; i++) {
         const ds4_tensor *t = &e->model.tensors[i];
         if (t->bytes == 0) continue;
+        if (ssd_excludes_routed && tensor_is_ssd_streamed_routed_expert(t)) {
+            continue;
+        }
         int entry = tensor_to_entry(t, DS4_N_LAYER);
         if (entry < 0 || entry >= n_entries) entry = 0;
         if (cuda_tp_ep && engine_cuda_tp_output_env_requested() &&
@@ -54352,6 +54455,60 @@ static int engine_compute_cuda_ep_placement(
     return 0;
 }
 
+/* Rewrite e->placement[] for SSD streaming: split the transformer layer
+ * range (entries 1..DS4_N_LAYER) into CONTIGUOUS ranges across the
+ * cfg->n_gpus GPUs in proportion to each GPU's vram_bytes share. Token
+ * embedding (entry 0) stays on tier 0; the output head (entry n_layers+1)
+ * follows the last tier that owns a transformer layer.
+ *
+ * Why: with SSD streaming the routed-expert weights (the bulk of an MoE
+ * model) are excluded from the resident budget by engine_compute_entry_
+ * bytes, so the small dense footprint collapses onto tier 0 and the other
+ * requested GPUs sit idle. But routed experts stream per-tier from SSD,
+ * so the layer RANGE — and thus the streaming work — must be balanced
+ * across every GPU the user requested. Balancing the layer range shares
+ * the streaming work evenly.
+ *
+ * Dense weights (attention + shared expert + norms) are small relative to
+ * any reasonable --gpu-vram budget, so this contiguous split never spills
+ * to CPU. e->n_placement_entries and e->multi_tier are updated in place. */
+static void engine_balance_placement_for_ssd(ds4_engine *e,
+                                              const ds4_gpu_config *cfg) {
+    const int n_gpus = cfg->n_gpus;
+    const int n_layers = DS4_N_LAYER;
+    if (n_gpus < 2 || n_layers < 1) return;
+
+    double total = 0.0;
+    for (int d = 0; d < n_gpus; d++) total += (double)cfg->vram_bytes[d];
+    if (total <= 0) return;
+
+    /* Entry 0 (token embedding) on tier 0. */
+    e->placement[0] = 0;
+
+    /* Walk transformer layers in order, assigning each to the tier whose
+     * cumulative budget share covers this layer's fractional position. This
+     * yields contiguous, budget-proportional ranges. */
+    int t = 0;
+    double cumulative = (double)cfg->vram_bytes[0];
+    for (int i = 1; i <= n_layers; i++) {
+        const double layer_frac = (double)i / (double)n_layers;
+        while (t + 1 < n_gpus && layer_frac > cumulative / total) {
+            t++;
+            cumulative += (double)cfg->vram_bytes[t];
+        }
+        e->placement[i] = t;
+    }
+
+    /* Output head (entry n_layers+1) on the highest tier that owns a layer. */
+    int last_tier = 0;
+    for (int i = 1; i <= n_layers; i++) {
+        if (e->placement[i] > last_tier) last_tier = e->placement[i];
+    }
+    e->placement[n_layers + 1] = last_tier;
+    e->n_placement_entries = n_layers + 2;
+    e->multi_tier = last_tier > 0 ? 1 : 0;
+}
+
 /* Phase A: classify multi-tier on a freshly-opened engine (model loaded,
  * weights bound). Pure CPU — no GPU init required. Sets e->multi_tier,
  * e->n_placement_entries, e->placement[], and e->gpu_cfg. Returns 0 on
@@ -54435,6 +54592,20 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
     }
     e->n_placement_entries = DS4_N_LAYER + 2;
     engine_adjust_output_head_for_cuda_tp(e, entry_bytes);
+
+    /* SSD streaming rebalance (non-TP only): the greedy packer fills tier 0
+     * first, so with routed experts excluded from the resident budget
+     * (engine_compute_entry_bytes) the small dense footprint collapses onto
+     * tier 0 and the other requested GPUs sit idle. But routed experts
+     * stream per-tier from SSD, so the layer RANGE — and thus the streaming
+     * work — must be balanced across every GPU the user requested. Rewrite
+     * placement[] with a contiguous, budget-proportional split. Dense
+     * weights are tiny relative to the per-tier budget, so this never
+     * causes CPU-spill. Under CUDA TP this is skipped: TP needs the
+     * sharded placement produced by engine_compute_cuda_ep_placement. */
+    if (e->ssd_streaming && !cuda_tp_ep && e->gpu_cfg.n_gpus >= 2) {
+        engine_balance_placement_for_ssd(e, &e->gpu_cfg);
+    }
 
     int first_tier = e->placement[0];
     int multi_tier = 0;
@@ -54555,9 +54726,18 @@ static int engine_install_per_device_caches(ds4_engine *e) {
                     : "ds4: CUDA output TP cache duplication enabled for output head (%u ways)\n",
                 output_tp_ways);
     }
+    /* SSD streaming (non-TP): routed-expert weights stream per-tier from
+     * the host mmap via the per-tier SSD caches; do NOT register them
+     * resident on each device (would blow the budget and defeat streaming).
+     * Only the dense weights (attention, shared expert, norms) are loaded
+     * resident. Under CUDA TP the experts are sharded resident, so keep
+     * them. */
+    const bool ssd_skip_routed =
+        e->ssd_streaming && !cuda_tp_ep;
     for (uint64_t i = 0; i < e->model.n_tensors; i++) {
         const ds4_tensor *t = &e->model.tensors[i];
         if (t->bytes == 0) continue;
+        if (ssd_skip_routed && tensor_is_ssd_streamed_routed_expert(t)) continue;
         int entry = tensor_to_entry(t, DS4_N_LAYER);
         if (entry < 0 || entry >= e->n_placement_entries) entry = 0;
         int logical_tier = e->placement[entry];
@@ -55447,9 +55627,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
     }
-    if (e->ssd_streaming && e->multi_tier) {
+    if (e->ssd_streaming && e->multi_tier && e->cuda_tensor_parallel) {
         fprintf(stderr,
-                "ds4: --ssd-streaming is not compatible with multi-GPU placement\n");
+                "ds4: --ssd-streaming is not compatible with CUDA tensor parallelism "
+                "(TP keeps half the routed experts resident per tier; SSD streams them)\n");
         ds4_engine_close(e);
         *out = NULL;
         return 1;
@@ -55634,6 +55815,27 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 ds4_engine_close(e);
                 *out = NULL;
                 return 1;
+            }
+            /* SSD streaming: now that ds4_gpu_init_multi has populated g_gpu[],
+             * enable SSD per tier. ds4_gpu_set_ssd_streaming loops every tier,
+             * cudaSetDevice()ing to each so ssd_current() in the release/reset
+             * helpers resolves to g_ssd[t]; the per-tier caches size lazily
+             * on first use. Mirrors the single-tier sequence below. */
+            ds4_gpu_set_glm_model(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA);
+            ds4_gpu_set_ssd_streaming(e->ssd_streaming);
+            if (!ds4_engine_configure_streaming_auto_cache(e)) {
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
+            if (e->ssd_streaming) {
+                /* Pin the expert cache's slab size class to the model's uniform
+                 * per-expert bytes (mirrors the single-tier branch). */
+                uint64_t slab_expert_bytes = 0;
+                if (ds4_streaming_routed_expert_bytes(&e->weights, &slab_expert_bytes)) {
+                    ds4_gpu_set_streaming_expert_cache_expert_bytes(slab_expert_bytes);
+                }
             }
             /* GPU-only multi-tier execution is now wired up
              * (B2-B6: per-tier graph allocation, dispatch loops, boundary
