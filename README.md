@@ -834,6 +834,20 @@ exponential sweeps. Output is CSV with one row per frontier: latest prefill
 interval tokens/sec, generation tokens/sec at that frontier, and
 `kvcache_bytes`.
 
+Use `--gen-warmup-tokens N` to keep generating the requested `--gen-tokens`
+while excluding the first N tokens only from the appended `gen_measured_*`
+columns. The original `gen_tokens`, `gen_tps`, `gen_first_ms`, and
+`gen_steady_*` columns retain their existing meaning. For example,
+`--gen-tokens 512 --gen-warmup-tokens 32` reports a 32-token diagnostic warmup
+and a 480-token primary measurement window. The default warmup is 0 for
+backward-compatible runs.
+
+`tests/long_context_story_prompt_gb10.txt` is the deterministic extended
+fact-recall fixture for 65K–100K sweeps. Regenerate it with
+`python3 tests/generate_gb10_long_context_fixture.py`; the canonical source
+prompt remains unchanged and the extended file contains exactly one final
+query.
+
 Sessions prefill long prompts in 4096-token chunks by default. Use
 `--prefill-chunk 2048`, for example, to match the strict official-vector
 checkpoint path. Changing the chunk changes the KV checkpoint/logit path, so

@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_bench_metrics.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
@@ -41,6 +42,7 @@ typedef struct {
     int ctx_alloc;
     int step_incr;
     int gen_tokens;
+    int gen_warmup_tokens;
     int power_percent;
     uint32_t prefill_chunk;
     uint32_t ssd_streaming_cache_experts;
@@ -254,6 +256,9 @@ static bench_config parse_options(int argc, char **argv) {
             c.step_mul = parse_double_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--gen-tokens") || !strcmp(arg, "--tokens") || !strcmp(arg, "-n")) {
             c.gen_tokens = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--gen-warmup-tokens")) {
+            c.gen_warmup_tokens =
+                parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--csv")) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
@@ -353,6 +358,11 @@ static bench_config parse_options(int argc, char **argv) {
     }
     if (c.ctx_max > INT_MAX - c.gen_tokens - 1) {
         fprintf(stderr, "ds4-bench: requested context is too large\n");
+        exit(2);
+    }
+    if (c.gen_warmup_tokens > c.gen_tokens) {
+        fprintf(stderr,
+                "ds4-bench: --gen-warmup-tokens must be <= --gen-tokens\n");
         exit(2);
     }
     if (c.ctx_alloc == 0) c.ctx_alloc = c.ctx_max + c.gen_tokens + 1;
@@ -668,7 +678,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes\n");
+    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes,gen_warmup_tokens,gen_warmup_ms,gen_warmup_tps,gen_measured_tokens,gen_measured_ms,gen_measured_tps\n");
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
@@ -730,6 +740,7 @@ int main(int argc, char **argv) {
         }
 
         const double gen_t0 = bench_now_sec();
+        double gen_measured_t0 = gen_t0;
         double gen_first_sec = 0.0;
         double gen_steady_sec = 0.0;
         int gen_done = 0;
@@ -760,6 +771,8 @@ int main(int argc, char **argv) {
             else gen_steady_sec += token_t1 - token_t0;
             if (gen_token_buf) gen_token_buf[gen_token_count++] = token;
             gen_done++;
+            if (gen_done == cfg.gen_warmup_tokens)
+                gen_measured_t0 = token_t1;
         }
         const double gen_t1 = bench_now_sec();
         if (cfg.show_output && gen_token_buf && gen_token_count > 0) {
@@ -796,8 +809,14 @@ int main(int argc, char **argv) {
 
         const double gen_sec = gen_t1 - gen_t0;
         const int gen_steady_tokens = gen_done > 1 ? gen_done - 1 : 0;
+        const ds4_bench_decode_metrics decode_metrics =
+            ds4_bench_decode_metrics_make(gen_done,
+                                          cfg.gen_warmup_tokens,
+                                          gen_t0,
+                                          gen_measured_t0,
+                                          gen_t1);
         fprintf(out,
-                "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu\n",
+                "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu,%d,%.3f,%.2f,%d,%.3f,%.2f\n",
                 frontier,
                 prefill_tokens,
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
@@ -806,7 +825,13 @@ int main(int argc, char **argv) {
                 gen_first_sec * 1000.0,
                 gen_steady_tokens,
                 gen_steady_sec > 0.0 ? (double)gen_steady_tokens / gen_steady_sec : 0.0,
-                (unsigned long long)(have_snapshot ? snap.len : 0));
+                (unsigned long long)(have_snapshot ? snap.len : 0),
+                decode_metrics.warmup_tokens,
+                decode_metrics.warmup_sec * 1000.0,
+                decode_metrics.warmup_tps,
+                decode_metrics.measured_tokens,
+                decode_metrics.measured_sec * 1000.0,
+                decode_metrics.measured_tps);
         fflush(out);
 
         previous = frontier;
