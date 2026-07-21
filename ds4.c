@@ -55927,6 +55927,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 *out = NULL;
                 return 1;
             }
+            /* Convert a byte budget (--ssd-streaming-cache-experts NGB) into
+             * an expert count; the LRU's budget_visible_to_shared() gates on
+             * ssd_streaming_cache_experts != 0. Single-tier path has always
+             * done this; multi-tier must too or 'NGB' silently leaves the
+             * LRU disabled. */
+            if (!ds4_engine_configure_streaming_cache_budget(e)) {
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
             ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
             if (e->ssd_streaming) {
                 /* Pin the expert cache's slab size class to the model's uniform
