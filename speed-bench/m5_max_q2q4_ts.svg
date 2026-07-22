@@ -8,7 +8,7 @@ text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 .legend { font-size: 13px; font-weight: 600; fill: #1f2933; }
 </style>
 <rect width="960" height="540" fill="#ffffff"/>
-<text class="title" x="480.0" y="34" text-anchor="middle">M5 Max t/s</text>
+<text class="title" x="480.0" y="34" text-anchor="middle">M5 Max Q2+Q4 t/s</text>
 <line x1="82" y1="468.00" x2="878" y2="468.00" stroke="#e2e8f0" stroke-width="1"/>
 <text class="tick" x="70" y="472.00" text-anchor="end">0</text>
 <line x1="82" y1="387.60" x2="878" y2="387.60" stroke="#e2e8f0" stroke-width="1"/>
