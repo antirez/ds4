@@ -59932,7 +59932,15 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
         probe_mtp = false;
     }
 #endif
-    return ds4_session_eval_probe_tp(s, token, probe_mtp, err, errlen);
+    int r = ds4_session_eval_probe_tp(s, token, probe_mtp, err, errlen);
+    static int first_call = 1;
+    if (first_call) {
+        first_call = 0;
+        fprintf(stderr, "LOGITS[0..7]=%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f (token=%d)\n",
+            s->logits[0], s->logits[1], s->logits[2], s->logits[3],
+            s->logits[4], s->logits[5], s->logits[6], s->logits[7], token);
+    }
+    return r;
 }
 
 #ifndef DS4_NO_GPU

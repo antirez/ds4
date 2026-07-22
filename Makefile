@@ -132,7 +132,7 @@ strix-halo:
 		CORE_OBJS="ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o" \
 		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
-		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
+		DS4_LINK_LIBS="-lamdhip64 -lm -pthread -lhipblas -lhipblaslt"
 
 rocm: strix-halo
 

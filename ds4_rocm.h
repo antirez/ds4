@@ -4,8 +4,13 @@
 #include <hipblas/hipblas.h>
 #include <hip/hip_fp16.h>
 #include <hipcub/hipcub.hpp>
-#include <rocwmma/rocwmma-version.hpp>
-#include <rocwmma/rocwmma.hpp>
+// rocwmma stubs - not actually used in inference code
+// #include <rocwmma/rocwmma-version.hpp>
+// #include <rocwmma/rocwmma.hpp>
+#define ROCWMMA_VERSION_MAJOR 0
+#define ROCWMMA_VERSION_MINOR 0
+#define ROCWMMA_VERSION_PATCH 0
+#define ROCWMMA_VERSION "stub"
 
 #define cudaError_t hipError_t
 #define cudaStream_t hipStream_t
