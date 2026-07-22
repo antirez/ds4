@@ -332,7 +332,9 @@ Things to know before enabling it:
 The startup log prints `expert bundle loaded`/`written` when the sidecar is
 in place and `expert bundle in use` once misses are actually served from it.
 The file format is shared with the DwarfStar Swift port, so a bundle built by
-either implementation is reused by the other.
+either implementation is reused by the other. The C reader also recognizes
+the fingerprints emitted by the original Swift v1 writer, so existing large
+sidecars are reused rather than rebuilt.
 
 Measured on an M1 Pro with 16 GiB of RAM (2-bit Flash imatrix GGUF, auto
 cache budget of 193 experts, `--ssd-streaming-cold`, page cache purged, 200
@@ -340,6 +342,53 @@ greedy tokens): decode went from 3.06 to 3.34 tokens/s (+9%) with the sidecar
 serving every miss. That configuration is nearly all misses, so it isolates
 the per-miss read improvement; machines where decode is less I/O-bound will
 see a smaller end-to-end delta.
+
+### Lossless dense streaming on low-memory Macs
+
+On a 16GB Mac, the non-routed weights can churn through the macOS page cache
+once per generated token even though routed experts already use SSD streaming.
+The opt-in dense streamer reads the exact model bytes through a dedicated
+`F_NOCACHE` descriptor into an asynchronous per-layer staging ring:
+
+```sh
+DS4_EXPERT_BUNDLE=1 \
+DS4_DENSE_STREAM=1 \
+DS4_DENSE_AHEAD=2 \
+./ds4 \
+  -m ./ds4flash.gguf \
+  --ssd-streaming \
+  --ssd-streaming-cache-experts 320 \
+  --nothink
+```
+
+This path does not create or consume the Swift port's lossy `.q4dense` cache.
+It stages byte-identical GGUF ranges, and falls back to ordinary mmap views if
+setup or an asynchronous read fails. The token embedding path also maps only
+the requested F16 row instead of exposing the full table to Metal.
+
+On an M1 Pro with 16 GiB, using the same lossless Swift expert bundle, a
+1024-token context and a cold 344-expert cache, the prompt `Rispondi con una
+sola parola: Roma.` improved from about 0.225 token/s to about 0.60 token/s
+with `DS4_DENSE_AHEAD=2`. The selected tokens (`R`, `oma`, EOS) and the dumped
+top-20 logprobs were byte-identical. SSD and cache state can move these timings,
+so use them as a controlled comparison rather than a universal throughput
+claim.
+
+Useful controls:
+
+* `DS4_DENSE_AHEAD=1..3` selects the read-ahead depth. `1` is the conservative
+  default; `2` was faster on an M1 Pro and costs one extra staging slot.
+* `DS4_DENSE_IO_DEPTH=1..4` selects parallel reads across a layer's disjoint
+  spans; the default is `3`.
+* `DS4_LAZY_IDX=0` disables the default lossless omission of indexer scoring
+  weights when the configured context cannot reach the sparse-attention
+  boundary. Longer contexts keep those weights in the stream.
+* `DS4_MLOCK=1` best-effort pins the output head and staging ring.
+  `DS4_RESIDENT_COMP=1` additionally excludes compressor weights from the
+  stream and is experimental: on a 16GB M1 Pro the extra resident pressure
+  was slower even though it reduced SSD bytes.
+* `DS4_DENSE_STREAM=0` or `DS4_METAL_DISABLE_DENSE_STREAM=1` restores the mmap
+  path. Keep that path when the working set fits or is already warm.
 
 ### Practical SSD streaming examples
 

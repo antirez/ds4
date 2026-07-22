@@ -6016,7 +6016,11 @@ static void model_map_span_vec_include_layer(ds4_model_map_span_vec *spans, cons
 #undef DS4_INCLUDE_TENSOR
 }
 
-static void model_map_span_vec_include_layer_decode_static(ds4_model_map_span_vec *spans, const ds4_layer_weights *l) {
+static void model_map_span_vec_include_layer_decode_static_policy(
+        ds4_model_map_span_vec *spans,
+        const ds4_layer_weights *l,
+        bool defer_compressor_kv_gate,
+        bool defer_lazy_indexer) {
 #define DS4_INCLUDE_TENSOR(t_) model_map_span_vec_include_one(spans, (t_))
     DS4_INCLUDE_TENSOR(l->hc_attn_fn);
     DS4_INCLUDE_TENSOR(l->hc_attn_scale);
@@ -6035,17 +6039,21 @@ static void model_map_span_vec_include_layer_decode_static(ds4_model_map_span_ve
     DS4_INCLUDE_TENSOR(l->attn_output_a);
     DS4_INCLUDE_TENSOR(l->attn_output_b);
     DS4_INCLUDE_TENSOR(l->attn_compressor_ape);
-    DS4_INCLUDE_TENSOR(l->attn_compressor_kv);
-    DS4_INCLUDE_TENSOR(l->attn_compressor_gate);
+    if (!defer_compressor_kv_gate) {
+        DS4_INCLUDE_TENSOR(l->attn_compressor_kv);
+        DS4_INCLUDE_TENSOR(l->attn_compressor_gate);
+    }
     DS4_INCLUDE_TENSOR(l->attn_compressor_norm);
-    DS4_INCLUDE_TENSOR(l->indexer_attn_q_b);
+    if (!defer_lazy_indexer) DS4_INCLUDE_TENSOR(l->indexer_attn_q_b);
     DS4_INCLUDE_TENSOR(l->indexer_attn_k);
     DS4_INCLUDE_TENSOR(l->indexer_k_norm);
     DS4_INCLUDE_TENSOR(l->indexer_k_norm_b);
-    DS4_INCLUDE_TENSOR(l->indexer_proj);
+    if (!defer_lazy_indexer) DS4_INCLUDE_TENSOR(l->indexer_proj);
     DS4_INCLUDE_TENSOR(l->indexer_compressor_ape);
-    DS4_INCLUDE_TENSOR(l->indexer_compressor_kv);
-    DS4_INCLUDE_TENSOR(l->indexer_compressor_gate);
+    if (!defer_compressor_kv_gate) {
+        DS4_INCLUDE_TENSOR(l->indexer_compressor_kv);
+        DS4_INCLUDE_TENSOR(l->indexer_compressor_gate);
+    }
     DS4_INCLUDE_TENSOR(l->indexer_compressor_norm);
     DS4_INCLUDE_TENSOR(l->hc_ffn_fn);
     DS4_INCLUDE_TENSOR(l->hc_ffn_scale);
@@ -6065,6 +6073,13 @@ static void model_map_span_vec_include_layer_decode_static(ds4_model_map_span_ve
     DS4_INCLUDE_TENSOR(l->nextn_hnorm);
     DS4_INCLUDE_TENSOR(l->nextn_shared_head_norm);
 #undef DS4_INCLUDE_TENSOR
+}
+
+static void model_map_span_vec_include_layer_decode_static(
+        ds4_model_map_span_vec *spans,
+        const ds4_layer_weights *l) {
+    model_map_span_vec_include_layer_decode_static_policy(
+        spans, l, false, false);
 }
 
 static bool glm_stream_resident_decode_layer_supported(
@@ -14837,6 +14852,79 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
 
 enum { DS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS = 64 };
 
+typedef ds4_gpu_model_staging_range metal_graph_dense_stream_range;
+
+typedef struct {
+    metal_graph_dense_stream_range *ranges;
+    uint32_t count;
+    uint64_t bytes;
+} metal_graph_dense_stream_plan;
+
+enum {
+    DS4_DENSE_STREAM_MAX_AHEAD = 3,
+    DS4_DENSE_STREAM_MAX_SLOTS = DS4_DENSE_STREAM_MAX_AHEAD + 1,
+    DS4_DENSE_STREAM_MAX_IO_DEPTH = 4,
+};
+
+typedef struct metal_graph_dense_stream metal_graph_dense_stream;
+
+typedef struct {
+    pthread_t thread;
+    metal_graph_dense_stream *stream;
+    uint8_t *dst;
+    uint32_t layer;
+    uint32_t worker_index;
+    uint32_t worker_count;
+    int error_code;
+    double done_seconds;
+    bool started;
+} metal_graph_dense_stream_worker;
+
+typedef struct {
+    metal_graph_dense_stream_worker worker[DS4_DENSE_STREAM_MAX_IO_DEPTH];
+    uint32_t layer;
+    uint32_t worker_count;
+    double start_seconds;
+    bool pending;
+} metal_graph_dense_stream_job;
+
+typedef struct {
+    void *ptr;
+    uint64_t bytes;
+} metal_graph_dense_stream_model_lock;
+
+struct metal_graph_dense_stream {
+    metal_graph_dense_stream_plan layer[DS4_MAX_LAYER];
+    ds4_gpu_tensor *staging[DS4_DENSE_STREAM_MAX_SLOTS];
+    metal_graph_dense_stream_job job[DS4_DENSE_STREAM_MAX_SLOTS];
+    const void *model_map;
+    uint64_t model_size;
+    uint64_t staging_bytes;
+    uint64_t deferred_compressor_bytes;
+    uint64_t deferred_indexer_bytes;
+    uint64_t bytes_read;
+    double read_seconds;
+    double wait_seconds;
+    uint64_t staged_layers;
+    void *locked_ptr[DS4_DENSE_STREAM_MAX_SLOTS];
+    uint64_t locked_bytes[DS4_DENSE_STREAM_MAX_SLOTS];
+    metal_graph_dense_stream_model_lock *model_locks;
+    uint32_t model_lock_count;
+    uint64_t model_locked_bytes;
+    int fd;
+    uint32_t ahead;
+    uint32_t slot_count;
+    uint32_t io_depth;
+    bool initialized;
+    bool active;
+    bool profile;
+    bool resident_comp;
+    bool lazy_idx;
+};
+
+static void metal_graph_dense_stream_join_jobs_for_cleanup(
+        metal_graph_dense_stream *stream);
+
 typedef struct {
     /* Class P — per-tier replicated kernel scratch buffers.
      * Each used tier has its own copy; active_tier names the slot the
@@ -15122,6 +15210,7 @@ typedef struct {
     uint32_t streaming_preload_experts;
     bool ssd_streaming_cold;
     bool streaming_static_decode_map_current;
+    metal_graph_dense_stream dense_stream;
     float *cpu_router_norm;
 
     /* Metal network tensor parallelism. These views alias engine-owned
@@ -15573,6 +15662,70 @@ static void metal_graph_free_prefill_workspace(ds4_gpu_graph *g) {
     g->owns_prefill_workspace = false;
 }
 
+static void metal_graph_dense_stream_free(ds4_gpu_graph *g) {
+    if (!g) return;
+    metal_graph_dense_stream *stream = &g->dense_stream;
+    metal_graph_dense_stream_join_jobs_for_cleanup(stream);
+#if defined(__APPLE__)
+    if (stream->model_map) {
+        if (!ds4_gpu_synchronize()) {
+            fprintf(stderr,
+                    "ds4: Metal dense stream synchronize during teardown failed\n");
+        }
+        if (!ds4_gpu_clear_model_staging_overrides(stream->model_map)) {
+            fprintf(stderr,
+                    "ds4: Metal dense stream override clear during teardown failed\n");
+        }
+    }
+#endif
+    if (stream->profile && stream->staged_layers != 0) {
+        const double mib = (double)stream->bytes_read / (1024.0 * 1024.0);
+        const double gib_s = stream->read_seconds > 0.0 ?
+            ((double)stream->bytes_read / 1073741824.0) / stream->read_seconds : 0.0;
+        fprintf(stderr,
+                "ds4: Metal dense stream summary: layers=%" PRIu64
+                " read=%.2f MiB io=%.3f s wait=%.3f s rate=%.2f GiB/s\n",
+                stream->staged_layers,
+                mib,
+                stream->read_seconds,
+                stream->wait_seconds,
+                gib_s);
+    }
+#if defined(__APPLE__)
+    for (uint32_t i = 0; i < stream->model_lock_count; i++) {
+        if (stream->model_locks[i].ptr && stream->model_locks[i].bytes != 0) {
+            (void)munlock(stream->model_locks[i].ptr,
+                          (size_t)stream->model_locks[i].bytes);
+        }
+    }
+#endif
+    free(stream->model_locks);
+    stream->model_locks = NULL;
+    stream->model_lock_count = 0;
+    stream->model_locked_bytes = 0;
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        free(stream->layer[il].ranges);
+        stream->layer[il].ranges = NULL;
+        stream->layer[il].count = 0;
+        stream->layer[il].bytes = 0;
+    }
+    for (uint32_t slot = 0; slot < DS4_DENSE_STREAM_MAX_SLOTS; slot++) {
+#if defined(__APPLE__)
+        if (stream->locked_ptr[slot] && stream->locked_bytes[slot] != 0) {
+            (void)munlock(stream->locked_ptr[slot],
+                          (size_t)stream->locked_bytes[slot]);
+        }
+#endif
+        stream->locked_ptr[slot] = NULL;
+        stream->locked_bytes[slot] = 0;
+        ds4_gpu_tensor_free(stream->staging[slot]);
+        stream->staging[slot] = NULL;
+    }
+    if (stream->fd >= 0) close(stream->fd);
+    memset(stream, 0, sizeof(*stream));
+    stream->fd = -1;
+}
+
 /* Release every Metal tensor owned by the whole-model graph runtime. */
 static void metal_graph_free(ds4_gpu_graph *g) {
     /* free every Class P slot across all DS4_MAX_GPUS tier
@@ -15580,6 +15733,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
      * no-op. The hc_pre / hc_post / hc_comb views must be freed BEFORE
      * their parent hc_split — view destruction releases its own struct
      * but does not touch the parent's memory. */
+    metal_graph_dense_stream_free(g);
     metal_graph_free_prefill_workspace(g);
     for (int t = 0; t < DS4_MAX_GPUS; t++) {
         ds4_gpu_tensor_free(g->directional_steering_dirs_by_tier[t]);
@@ -15723,6 +15877,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->tp_logits_half);
     free(g->cpu_router_norm);
     memset(g, 0, sizeof(*g));
+    g->dense_stream.fd = -1;
 }
 
 static bool metal_tensor_fill_f32(ds4_gpu_tensor *t, float v, uint64_t n) {
@@ -16708,6 +16863,7 @@ static bool metal_graph_alloc_raw_cap(
     const int saved_dspark_exec_tier = g->dspark_exec_tier;
     memset(g, 0, sizeof(*g));
     g->dspark_exec_tier = saved_dspark_exec_tier;
+    g->dense_stream.fd = -1;
     g->owns_prefill_workspace = shared_prefill_workspace == NULL;
     g->cpu_router_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(g->cpu_router_norm[0]));
     g->active_tier = placement ? -1 : 0;
@@ -29070,6 +29226,704 @@ static bool metal_graph_encode_layer_batch(
     return ok;
 }
 
+static bool metal_graph_dense_stream_requested(const ds4_gpu_graph *g) {
+#if defined(__APPLE__)
+    const char *value = getenv("DS4_DENSE_STREAM");
+    if (!g || !g->ssd_streaming ||
+        getenv("DS4_METAL_DISABLE_DENSE_STREAM") != NULL ||
+        (value && strcmp(value, "0") == 0)) {
+        return false;
+    }
+    /* Opt-in for the first lossless tranche.  Keeping the explicit disable
+     * gates above makes a future default-on policy a one-line change. */
+    return value && strcmp(value, "1") == 0;
+#else
+    (void)g;
+    return false;
+#endif
+}
+
+static void metal_graph_dense_stream_join_jobs_for_cleanup(
+        metal_graph_dense_stream *stream) {
+    if (!stream) return;
+    for (uint32_t slot = 0; slot < DS4_DENSE_STREAM_MAX_SLOTS; slot++) {
+        metal_graph_dense_stream_job *job = &stream->job[slot];
+        if (!job->pending) continue;
+        for (uint32_t i = 0; i < job->worker_count; i++) {
+            metal_graph_dense_stream_worker *worker = &job->worker[i];
+            if (worker->started) {
+                const int rc = pthread_join(worker->thread, NULL);
+                if (rc != 0) {
+                    fprintf(stderr,
+                            "ds4: Metal dense stream pthread_join failed: %s\n",
+                            strerror(rc));
+                    ds4_die("Metal dense stream pthread_join invariant failed");
+                }
+                worker->started = false;
+            }
+        }
+        job->pending = false;
+    }
+}
+
+#if defined(__APPLE__)
+static uint32_t metal_graph_dense_stream_env_u32(
+        const char *name,
+        uint32_t fallback,
+        uint32_t maximum) {
+    const char *value = getenv(name);
+    if (!value || !value[0]) return fallback;
+    char *end = NULL;
+    errno = 0;
+    const unsigned long parsed = strtoul(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' ||
+        parsed == 0 || parsed > maximum) {
+        fprintf(stderr,
+                "ds4: ignoring invalid %s=%s (expected 1..%u)\n",
+                name,
+                value,
+                maximum);
+        return fallback;
+    }
+    return (uint32_t)parsed;
+}
+
+static bool metal_graph_dense_stream_default_on(const char *name) {
+    const char *value = getenv(name);
+    return !value || !value[0] || strcmp(value, "0") != 0;
+}
+
+static bool metal_graph_dense_stream_mlock_compressors(
+        metal_graph_dense_stream *stream,
+        const ds4_weights *weights) {
+    if (!stream || !weights || !stream->resident_comp ||
+        !stream->model_map || stream->model_size == 0) {
+        return false;
+    }
+
+    ds4_model_map_span_vec spans;
+    memset(&spans, 0, sizeof(spans));
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *layer = &weights->layer[il];
+        model_map_span_vec_include_one(&spans, layer->attn_compressor_kv);
+        model_map_span_vec_include_one(&spans, layer->attn_compressor_gate);
+        model_map_span_vec_include_one(&spans, layer->indexer_compressor_kv);
+        model_map_span_vec_include_one(&spans, layer->indexer_compressor_gate);
+    }
+    if (spans.len == 0) {
+        free(spans.v);
+        return false;
+    }
+
+    const long page_long = sysconf(_SC_PAGESIZE);
+    const uint64_t page = page_long > 0 ? (uint64_t)page_long : 4096u;
+    for (uint32_t i = 0; i < spans.len; i++) {
+        spans.v[i].off = (spans.v[i].off / page) * page;
+        const uint64_t rem = spans.v[i].end % page;
+        if (rem != 0) {
+            const uint64_t add = page - rem;
+            spans.v[i].end = spans.v[i].end > UINT64_MAX - add ?
+                UINT64_MAX : spans.v[i].end + add;
+        }
+        if (spans.v[i].end > stream->model_size) {
+            spans.v[i].end = stream->model_size;
+        }
+        spans.v[i].isolate = false;
+    }
+    if (!model_map_span_vec_finish(&spans)) {
+        free(spans.v);
+        return false;
+    }
+
+    metal_graph_dense_stream_model_lock *locks =
+        calloc((size_t)spans.len, sizeof(locks[0]));
+    if (!locks) {
+        fprintf(stderr,
+                "ds4: Metal dense stream compressor mlock skipped: out of memory\n");
+        free(spans.v);
+        return false;
+    }
+
+    uint32_t locked = 0;
+    uint64_t bytes_locked = 0;
+    int first_error = 0;
+    for (uint32_t i = 0; i < spans.len; i++) {
+        const uint64_t bytes = spans.v[i].end - spans.v[i].off;
+        if (bytes == 0 || bytes > (uint64_t)SIZE_MAX) {
+            first_error = EOVERFLOW;
+            break;
+        }
+        void *ptr = (uint8_t *)stream->model_map + spans.v[i].off;
+        if (mlock(ptr, (size_t)bytes) != 0) {
+            first_error = errno;
+            break;
+        }
+        locks[locked++] = (metal_graph_dense_stream_model_lock) {
+            .ptr = ptr,
+            .bytes = bytes,
+        };
+        bytes_locked = ds4_add_sat_u64(bytes_locked, bytes);
+    }
+    free(spans.v);
+
+    if (first_error != 0 || bytes_locked == UINT64_MAX) {
+        for (uint32_t i = 0; i < locked; i++) {
+            (void)munlock(locks[i].ptr, (size_t)locks[i].bytes);
+        }
+        free(locks);
+        fprintf(stderr,
+                "ds4: Metal dense stream compressor mlock failed "
+                "(best effort): %s\n",
+                strerror(first_error ? first_error : EOVERFLOW));
+        return false;
+    }
+
+    stream->model_locks = locks;
+    stream->model_lock_count = locked;
+    stream->model_locked_bytes = bytes_locked;
+    fprintf(stderr,
+            "ds4: Metal dense stream compressor mlock active "
+            "(%u ranges, %.2f MiB)\n",
+            locked,
+            (double)bytes_locked / (1024.0 * 1024.0));
+    return true;
+}
+
+static void *metal_graph_dense_stream_worker_main(void *opaque) {
+    metal_graph_dense_stream_worker *worker = opaque;
+    metal_graph_dense_stream *stream = worker->stream;
+    const metal_graph_dense_stream_plan *plan =
+        &stream->layer[worker->layer];
+    worker->error_code = 0;
+
+    for (uint32_t i = worker->worker_index;
+         i < plan->count;
+         i += worker->worker_count) {
+        const metal_graph_dense_stream_range *range = &plan->ranges[i];
+        uint64_t done = 0;
+        while (done < range->bytes) {
+            const uint64_t file_offset = range->model_offset + done;
+            if (file_offset > (uint64_t)INT64_MAX) {
+                worker->error_code = EOVERFLOW;
+                goto finished;
+            }
+            const uint64_t remaining = range->bytes - done;
+            const size_t want = remaining > (uint64_t)SSIZE_MAX ?
+                (size_t)SSIZE_MAX : (size_t)remaining;
+            ssize_t got;
+            do {
+                got = pread(stream->fd,
+                            worker->dst + range->staging_offset + done,
+                            want,
+                            (off_t)file_offset);
+            } while (got < 0 && errno == EINTR);
+            if (got <= 0) {
+                worker->error_code = got == 0 ? EIO : errno;
+                goto finished;
+            }
+            done += (uint64_t)got;
+        }
+    }
+
+finished:
+    worker->done_seconds = now_sec();
+    return NULL;
+}
+
+static bool metal_graph_dense_stream_start_layer(
+        metal_graph_dense_stream *stream,
+        uint32_t layer) {
+    if (!stream || !stream->active || layer >= DS4_N_LAYER ||
+        stream->slot_count == 0) {
+        return false;
+    }
+    const uint32_t slot = layer % stream->slot_count;
+    metal_graph_dense_stream_job *job = &stream->job[slot];
+    metal_graph_dense_stream_plan *plan = &stream->layer[layer];
+    if (job->pending || !plan->ranges || plan->count == 0 ||
+        !stream->staging[slot]) {
+        return false;
+    }
+    uint8_t *dst = ds4_gpu_tensor_contents(stream->staging[slot]);
+    if (!dst) return false;
+
+    memset(job, 0, sizeof(*job));
+    job->layer = layer;
+    job->worker_count = plan->count < stream->io_depth ?
+        plan->count : stream->io_depth;
+    if (job->worker_count == 0 ||
+        job->worker_count > DS4_DENSE_STREAM_MAX_IO_DEPTH) {
+        return false;
+    }
+    job->start_seconds = now_sec();
+    job->pending = true;
+    for (uint32_t i = 0; i < job->worker_count; i++) {
+        metal_graph_dense_stream_worker *worker = &job->worker[i];
+        worker->stream = stream;
+        worker->dst = dst;
+        worker->layer = layer;
+        worker->worker_index = i;
+        worker->worker_count = job->worker_count;
+        const int rc = pthread_create(&worker->thread,
+                                      NULL,
+                                      metal_graph_dense_stream_worker_main,
+                                      worker);
+        if (rc != 0) {
+            worker->error_code = rc;
+            worker->done_seconds = now_sec();
+            return false;
+        }
+        worker->started = true;
+    }
+    return true;
+}
+
+static bool metal_graph_dense_stream_join_layer(
+        metal_graph_dense_stream *stream,
+        uint32_t layer,
+        int *error_code,
+        double *io_seconds,
+        double *wait_seconds) {
+    if (error_code) *error_code = 0;
+    if (io_seconds) *io_seconds = 0.0;
+    if (wait_seconds) *wait_seconds = 0.0;
+    if (!stream || stream->slot_count == 0) return false;
+    const uint32_t slot = layer % stream->slot_count;
+    metal_graph_dense_stream_job *job = &stream->job[slot];
+    if (!job->pending || job->layer != layer || job->worker_count == 0) {
+        return false;
+    }
+
+    const double wait_t0 = now_sec();
+    double done_seconds = job->start_seconds;
+    int first_error = 0;
+    for (uint32_t i = 0; i < job->worker_count; i++) {
+        metal_graph_dense_stream_worker *worker = &job->worker[i];
+        if (worker->started) {
+            const int rc = pthread_join(worker->thread, NULL);
+            if (rc != 0) {
+                fprintf(stderr,
+                        "ds4: Metal dense stream pthread_join failed: %s\n",
+                        strerror(rc));
+                ds4_die("Metal dense stream pthread_join invariant failed");
+            }
+            worker->started = false;
+        }
+        if (worker->error_code != 0 && first_error == 0) {
+            first_error = worker->error_code;
+        }
+        if (worker->done_seconds > done_seconds) {
+            done_seconds = worker->done_seconds;
+        }
+    }
+    const double wait_t1 = now_sec();
+    job->pending = false;
+    if (error_code) *error_code = first_error;
+    if (io_seconds) *io_seconds = done_seconds - job->start_seconds;
+    if (wait_seconds) *wait_seconds = wait_t1 - wait_t0;
+    return first_error == 0;
+}
+#endif
+
+static void metal_graph_dense_stream_fallback(
+        ds4_gpu_graph *g,
+        const char    *reason) {
+    metal_graph_dense_stream_free(g);
+    g->dense_stream.initialized = true;
+    g->dense_stream.active = false;
+    fprintf(stderr,
+            "ds4: Metal dense stream disabled; falling back to mmap model views (%s)\n",
+            reason ? reason : "unknown error");
+}
+
+static bool metal_graph_dense_stream_init(
+        ds4_gpu_graph    *g,
+        const ds4_model  *model,
+        const ds4_weights *weights) {
+    metal_graph_dense_stream *stream = &g->dense_stream;
+    if (stream->initialized) return stream->active;
+    stream->initialized = true;
+    stream->fd = -1;
+    if (!metal_graph_dense_stream_requested(g)) return false;
+
+#if defined(__APPLE__)
+    stream->profile = getenv("DS4_DENSE_STREAM_PROFILE") != NULL &&
+                      strcmp(getenv("DS4_DENSE_STREAM_PROFILE"), "0") != 0;
+    const char *resident_comp_env = getenv("DS4_RESIDENT_COMP");
+    const char *mlock_env = getenv("DS4_MLOCK");
+    const bool mlock_requested = mlock_env && strcmp(mlock_env, "1") == 0;
+    /* Keeping the compressor mmap views resident is not a free win on a
+     * memory-constrained Mac: even when mlock succeeds, the extra pressure
+     * can slow expert and dense reads.  Leave it as an explicit experiment;
+     * DS4_MLOCK by itself only pins the output head and staging ring. */
+    stream->resident_comp = resident_comp_env && resident_comp_env[0] &&
+                            strcmp(resident_comp_env, "0") != 0;
+    const bool lazy_idx_requested =
+        metal_graph_dense_stream_default_on("DS4_LAZY_IDX");
+    stream->lazy_idx = lazy_idx_requested;
+    if (stream->lazy_idx) {
+        const uint32_t sparse_threshold =
+            metal_graph_decode_indexer_sparse_threshold(g);
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            /* The current C path deliberately omits the scorer only when it
+             * cannot be reached at this configured context.  At longer
+             * contexts keep staging it until a load-once resident scorer is
+             * available; otherwise crossing the sparse boundary would turn
+             * the omitted weights back into evictable mmap traffic. */
+            if (ds4_layer_compress_ratio(il) == 4u &&
+                g->layer_comp_cap[il] > 2u &&
+                g->layer_comp_cap[il] - 2u > sparse_threshold) {
+                stream->lazy_idx = false;
+                break;
+            }
+        }
+        if (!stream->lazy_idx) {
+            fprintf(stderr,
+                    "ds4: Metal dense stream lazy indexer disabled: "
+                    "configured context can cross the sparse boundary\n");
+        }
+    }
+    stream->ahead = metal_graph_dense_stream_env_u32(
+        "DS4_DENSE_AHEAD", 1u, DS4_DENSE_STREAM_MAX_AHEAD);
+    stream->slot_count = stream->ahead + 1u;
+    stream->io_depth = metal_graph_dense_stream_env_u32(
+        "DS4_DENSE_IO_DEPTH", 3u, DS4_DENSE_STREAM_MAX_IO_DEPTH);
+    stream->model_map = model ? model->map : NULL;
+    stream->model_size = model ? model->size : 0;
+    if (!model || !weights || model->fd < 0 || !model->map || model->size == 0) {
+        metal_graph_dense_stream_fallback(g, "model fd/map unavailable");
+        return false;
+    }
+
+    char path[PATH_MAX];
+    if (fcntl(model->fd, F_GETPATH, path) != 0) {
+        metal_graph_dense_stream_fallback(g, "F_GETPATH failed");
+        return false;
+    }
+    const int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        metal_graph_dense_stream_fallback(g, "dedicated model fd open failed");
+        return false;
+    }
+    stream->fd = fd;
+
+    struct stat source_stat;
+    struct stat stream_stat;
+    if (fstat(model->fd, &source_stat) != 0 ||
+        fstat(stream->fd, &stream_stat) != 0 ||
+        source_stat.st_dev != stream_stat.st_dev ||
+        source_stat.st_ino != stream_stat.st_ino ||
+        source_stat.st_size != stream_stat.st_size) {
+        metal_graph_dense_stream_fallback(g, "dedicated model fd identity mismatch");
+        return false;
+    }
+    if (fcntl(stream->fd, F_NOCACHE, 1) != 0) {
+        metal_graph_dense_stream_fallback(g, "F_NOCACHE failed");
+        return false;
+    }
+    if (stream->resident_comp && mlock_requested) {
+        const bool compressors_locked =
+            metal_graph_dense_stream_mlock_compressors(stream, weights);
+        if (!compressors_locked) {
+            stream->resident_comp = false;
+            fprintf(stderr,
+                    "ds4: Metal dense stream restoring lossless compressor "
+                    "streaming because compressor mlock failed\n");
+        }
+    }
+
+    const uint64_t alignment = 4096u;
+    uint64_t max_staging = 0;
+    uint64_t bytes_per_pass = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *layer = &weights->layer[il];
+        if (stream->resident_comp) {
+            const ds4_tensor *deferred[] = {
+                layer->attn_compressor_kv,
+                layer->attn_compressor_gate,
+                layer->indexer_compressor_kv,
+                layer->indexer_compressor_gate,
+            };
+            for (uint32_t i = 0; i < sizeof(deferred) / sizeof(deferred[0]); i++) {
+                if (deferred[i]) {
+                    stream->deferred_compressor_bytes = ds4_add_sat_u64(
+                        stream->deferred_compressor_bytes,
+                        deferred[i]->bytes);
+                }
+            }
+        }
+        if (stream->lazy_idx) {
+            const ds4_tensor *deferred[] = {
+                layer->indexer_attn_q_b,
+                layer->indexer_proj,
+            };
+            for (uint32_t i = 0; i < sizeof(deferred) / sizeof(deferred[0]); i++) {
+                if (deferred[i]) {
+                    stream->deferred_indexer_bytes = ds4_add_sat_u64(
+                        stream->deferred_indexer_bytes,
+                        deferred[i]->bytes);
+                }
+            }
+        }
+        if (stream->deferred_compressor_bytes == UINT64_MAX ||
+            stream->deferred_indexer_bytes == UINT64_MAX) {
+            metal_graph_dense_stream_fallback(
+                g, "deferred dense byte accounting overflow");
+            return false;
+        }
+
+        ds4_model_map_span_vec spans;
+        memset(&spans, 0, sizeof(spans));
+        model_map_span_vec_include_layer_decode_static_policy(
+            &spans,
+            layer,
+            stream->resident_comp,
+            stream->lazy_idx);
+        if (!model_map_span_vec_finish(&spans)) {
+            free(spans.v);
+            metal_graph_dense_stream_fallback(g, "empty per-layer dense plan");
+            return false;
+        }
+
+        metal_graph_dense_stream_plan *plan = &stream->layer[il];
+        plan->ranges = calloc((size_t)spans.len, sizeof(plan->ranges[0]));
+        if (!plan->ranges) {
+            free(spans.v);
+            metal_graph_dense_stream_fallback(g, "per-layer dense plan allocation failed");
+            return false;
+        }
+        plan->count = spans.len;
+        uint64_t cursor = 0;
+        for (uint32_t i = 0; i < spans.len; i++) {
+            const uint64_t bytes = spans.v[i].end - spans.v[i].off;
+            if (cursor > UINT64_MAX - (alignment - 1u)) {
+                free(spans.v);
+                metal_graph_dense_stream_fallback(g, "dense staging offset overflow");
+                return false;
+            }
+            cursor = align_up(cursor, alignment);
+            if (bytes == 0 || cursor > UINT64_MAX - bytes ||
+                plan->bytes > UINT64_MAX - bytes ||
+                bytes_per_pass > UINT64_MAX - bytes) {
+                free(spans.v);
+                metal_graph_dense_stream_fallback(g, "dense staging byte overflow");
+                return false;
+            }
+            plan->ranges[i].model_offset = spans.v[i].off;
+            plan->ranges[i].bytes = bytes;
+            plan->ranges[i].staging_offset = cursor;
+            cursor += bytes;
+            plan->bytes += bytes;
+            bytes_per_pass += bytes;
+        }
+        free(spans.v);
+        if (cursor > max_staging) max_staging = cursor;
+    }
+    if (max_staging == 0 || max_staging > SIZE_MAX) {
+        metal_graph_dense_stream_fallback(g, "invalid dense staging slot size");
+        return false;
+    }
+
+    stream->staging_bytes = max_staging;
+    for (uint32_t slot = 0; slot < stream->slot_count; slot++) {
+        stream->staging[slot] = ds4_gpu_tensor_alloc(max_staging);
+        if (!stream->staging[slot] ||
+            !ds4_gpu_tensor_contents(stream->staging[slot])) {
+            metal_graph_dense_stream_fallback(
+                g, "shared staging ring allocation failed");
+            return false;
+        }
+    }
+
+    if (mlock_requested) {
+        uint32_t locked_slots = 0;
+        int first_error = 0;
+        for (uint32_t slot = 0; slot < stream->slot_count; slot++) {
+            void *ptr = ds4_gpu_tensor_contents(stream->staging[slot]);
+            if (mlock(ptr, (size_t)max_staging) == 0) {
+                stream->locked_ptr[slot] = ptr;
+                stream->locked_bytes[slot] = max_staging;
+                locked_slots++;
+            } else if (first_error == 0) {
+                first_error = errno;
+            }
+        }
+        if (locked_slots == stream->slot_count) {
+            fprintf(stderr,
+                    "ds4: Metal dense stream staging mlock active "
+                    "(%u slots, %.2f MiB total)\n",
+                    locked_slots,
+                    (double)max_staging * locked_slots / (1024.0 * 1024.0));
+        } else {
+            fprintf(stderr,
+                    "ds4: Metal dense stream staging mlock best effort: "
+                    "%u/%u slots locked (%s)\n",
+                    locked_slots,
+                    stream->slot_count,
+                    strerror(first_error ? first_error : ENOMEM));
+        }
+    }
+    stream->active = true;
+    fprintf(stderr,
+            "ds4: Metal dense stream enabled: %u x %.2f MiB shared slots, "
+            "ahead=%u io_depth=%u, %.2f GiB/pass, "
+            "dedicated F_NOCACHE fd\n",
+            stream->slot_count,
+            (double)max_staging / (1024.0 * 1024.0),
+            stream->ahead,
+            stream->io_depth,
+            (double)bytes_per_pass / 1073741824.0);
+    fprintf(stderr,
+            "ds4: Metal dense stream deferred mmap views: compressors=%.2f MiB "
+            "(%s), lazy-indexer=%.2f MiB (%s) per pass\n",
+            (double)stream->deferred_compressor_bytes / (1024.0 * 1024.0),
+            stream->resident_comp ? "resident" : "streamed",
+            (double)stream->deferred_indexer_bytes / (1024.0 * 1024.0),
+            stream->lazy_idx ? "lazy" : "streamed");
+    return true;
+#else
+    (void)model;
+    (void)weights;
+    return false;
+#endif
+}
+
+static bool metal_graph_dense_stream_prepare_token(ds4_gpu_graph *g) {
+    metal_graph_dense_stream *stream = &g->dense_stream;
+    if (!stream->active) return true;
+#if defined(__APPLE__)
+    const uint32_t initial = stream->slot_count < DS4_N_LAYER ?
+        stream->slot_count : DS4_N_LAYER;
+    for (uint32_t il = 0; il < initial; il++) {
+        if (!metal_graph_dense_stream_start_layer(stream, il)) {
+            metal_graph_dense_stream_fallback(
+                g, "initial asynchronous prefetch launch failed");
+            return true;
+        }
+    }
+#endif
+    return true;
+}
+
+static bool metal_graph_dense_stream_publish_layer(
+        ds4_gpu_graph   *g,
+        const ds4_model *model,
+        uint32_t         il) {
+    metal_graph_dense_stream *stream = &g->dense_stream;
+    if (!stream->active) return true;
+#if defined(__APPLE__)
+    if (!model || model->map != stream->model_map ||
+        model->size != stream->model_size || il >= DS4_N_LAYER ||
+        stream->slot_count == 0) {
+        metal_graph_dense_stream_fallback(
+            g, "model changed or prefetched layer is invalid");
+        return true;
+    }
+
+    metal_graph_dense_stream_plan *plan = &stream->layer[il];
+    const uint32_t slot = il % stream->slot_count;
+    metal_graph_dense_stream_job *job = &stream->job[slot];
+    if (!plan->ranges || plan->count == 0 || !stream->staging[slot]) {
+        metal_graph_dense_stream_fallback(
+            g, "prefetched staging plan/buffer unavailable");
+        return true;
+    }
+
+    int error_code = 0;
+    double io_seconds = 0.0;
+    double wait_seconds = 0.0;
+    if (!metal_graph_dense_stream_join_layer(stream,
+                                             il,
+                                             &error_code,
+                                             &io_seconds,
+                                             &wait_seconds)) {
+        char reason[192];
+        snprintf(reason,
+                 sizeof(reason),
+                 "asynchronous pread failed at layer %u: %s",
+                 il,
+                 strerror(error_code ? error_code : EIO));
+        metal_graph_dense_stream_fallback(g, reason);
+        return true;
+    }
+    if (!ds4_gpu_set_model_staging_overrides(model->map,
+                                             model->size,
+                                             plan->ranges,
+                                             plan->count,
+                                             stream->staging[slot])) {
+        metal_graph_dense_stream_fallback(g, "Metal staging override publish failed");
+        return true;
+    }
+
+    if (io_seconds < 0.0) io_seconds = 0.0;
+    if (wait_seconds < 0.0) wait_seconds = 0.0;
+    stream->bytes_read += plan->bytes;
+    stream->read_seconds += io_seconds;
+    stream->wait_seconds += wait_seconds;
+    stream->staged_layers++;
+    if (stream->profile) {
+        const double gib_s = io_seconds > 0.0 ?
+            ((double)plan->bytes / 1073741824.0) / io_seconds : 0.0;
+        fprintf(stderr,
+                "ds4: Metal dense stream layer=%u slot=%u ranges=%u workers=%u "
+                "read=%.2f MiB io=%.3f ms wait=%.3f ms rate=%.2f GiB/s\n",
+                il,
+                slot,
+                plan->count,
+                job->worker_count,
+                (double)plan->bytes / (1024.0 * 1024.0),
+                io_seconds * 1000.0,
+                wait_seconds * 1000.0,
+                gib_s);
+    }
+#else
+    (void)model;
+    (void)il;
+#endif
+    return true;
+}
+
+static bool metal_graph_dense_stream_schedule_after_layer(
+        ds4_gpu_graph *g,
+        uint32_t il) {
+    metal_graph_dense_stream *stream = &g->dense_stream;
+    if (!stream->active) return true;
+#if defined(__APPLE__)
+    /* The layer command buffer has completed before this function is called.
+     * Stop exposing the slot through model-range resolution before its pread
+     * worker reuses the memory for a future layer. */
+    if (!ds4_gpu_clear_model_staging_overrides(stream->model_map)) {
+        metal_graph_dense_stream_fallback(
+            g, "Metal staging override clear before ring reuse failed");
+        return true;
+    }
+    const uint32_t next = il + stream->slot_count;
+    if (next < DS4_N_LAYER &&
+        !metal_graph_dense_stream_start_layer(stream, next)) {
+        metal_graph_dense_stream_fallback(
+            g, "asynchronous prefetch ring advance failed");
+    }
+#else
+    (void)il;
+#endif
+    return true;
+}
+
+static void metal_graph_dense_stream_abort_token(
+        ds4_gpu_graph *g,
+        const ds4_model *model) {
+    if (!g) return;
+    metal_graph_dense_stream *stream = &g->dense_stream;
+    metal_graph_dense_stream_join_jobs_for_cleanup(stream);
+#if defined(__APPLE__)
+    if (stream->active && model && model->map == stream->model_map) {
+        (void)ds4_gpu_clear_model_staging_overrides(model->map);
+    }
+#else
+    (void)model;
+#endif
+}
+
 static bool metal_graph_eval_token_raw_swa_streaming(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -29091,11 +29945,15 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
     metal_graph_dspark_capture_begin(g);
 
+    const bool dense_stream_active =
+        metal_graph_dense_stream_init(g, model, weights);
     const bool static_decode_map = metal_graph_stream_decode_static_map_enabled();
     const bool static_map_state_cache =
         static_decode_map && metal_graph_stream_decode_static_map_state_cache_enabled();
     const bool batch_static_decode =
-        static_decode_map && metal_graph_stream_decode_layer_batch_enabled(g);
+        static_decode_map &&
+        !dense_stream_active &&
+        metal_graph_stream_decode_layer_batch_enabled(g);
     bool ok = true;
     if (static_decode_map) {
         if (!static_map_state_cache || !g->streaming_static_decode_map_current) {
@@ -29106,8 +29964,11 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         g->streaming_static_decode_map_current = false;
         ok = metal_graph_stream_map_token(model, weights);
     }
-    if (ok && !static_decode_map && DS4_N_LAYER > 0) {
+    if (ok && !static_decode_map && !g->dense_stream.active && DS4_N_LAYER > 0) {
         metal_graph_stream_readahead_layer_decode(model, weights, 0);
+    }
+    if (ok && g->dense_stream.active) {
+        ok = metal_graph_dense_stream_prepare_token(g);
     }
     if (ok) ok = ds4_gpu_begin_commands() != 0;
     if (ok) {
@@ -29179,10 +30040,14 @@ static bool metal_graph_eval_token_raw_swa_streaming(
             ok = false;
             break;
         }
-        if (!static_decode_map && il + 1 < DS4_N_LAYER) {
+        if (!static_decode_map && !g->dense_stream.active &&
+            il + 1 < DS4_N_LAYER) {
             metal_graph_stream_readahead_layer_decode(model, weights, il + 1);
-        } else if (!static_decode_map && logits) {
+        } else if (!static_decode_map && !g->dense_stream.active && logits) {
             metal_graph_stream_readahead_output(model, weights);
+        }
+        if (ok && g->dense_stream.active) {
+            ok = metal_graph_dense_stream_publish_layer(g, model, il);
         }
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         bool encoded_layer = false;
@@ -29208,12 +30073,21 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         const double tl_encoded = profile ? now_sec() : 0.0;
         if (ok) ok = ds4_gpu_end_commands() != 0;
         const double tl_done = profile ? now_sec() : 0.0;
+        if (ok && g->dense_stream.active) {
+            ok = metal_graph_dense_stream_schedule_after_layer(g, il);
+        }
         if (profile) {
             encode_s += tl_encoded - tl0;
             execute_s += tl_done - tl_encoded;
         }
     }
 
+#if defined(__APPLE__)
+    if (ok && g->dense_stream.active &&
+        !ds4_gpu_clear_model_staging_overrides(model->map)) {
+        ok = false;
+    }
+#endif
     if (ok && logits && !static_decode_map) ok = metal_graph_stream_map_output(model, weights);
     const double t_head0 = profile ? now_sec() : 0.0;
     if (ok && logits) ok = ds4_gpu_begin_commands() != 0;
@@ -29245,6 +30119,7 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         if (ds4_gpu_synchronize() == 0) {
             fprintf(stderr, "ds4: Metal synchronize after SSD streaming graph eval failure also failed\n");
         }
+        metal_graph_dense_stream_abort_token(g, model);
     }
     return ok;
 }
@@ -29360,9 +30235,11 @@ static bool metal_graph_use_streaming_decode_prefill_range(
         uint32_t             start,
         uint32_t             n_tokens) {
     /*
-     * Short streamed prefill is latency-sensitive.  Use the decode-style path
-     * by default for SSD streaming, while keeping a cold-only escape hatch for
-     * strict-vector tests that need canonical layer-major prefill semantics.
+     * A cold IQ2 Flash prompt must not walk the whole model once per token.
+     * Layer-major prefill reads each layer once and is several times faster on
+     * memory-constrained Apple Silicon.  Keep the old decode-style path as an
+     * explicit diagnostic A/B; warm suffix extension and the wider Q4 default
+     * retain their existing policy.
      */
     if (start == 0) {
         if (glm_graph_env_present(
@@ -29370,6 +30247,13 @@ static bool metal_graph_use_streaming_decode_prefill_range(
                     "DS4_METAL_DISABLE_STREAMING_COLD_DECODE_PREFILL")) {
             return false;
         }
+#if defined(__APPLE__)
+        if (DS4_MODEL_VARIANT == DS4_VARIANT_FLASH &&
+            !metal_graph_streaming_decode_prefill_wide_default(weights) &&
+            getenv("DS4_METAL_ENABLE_STREAMING_COLD_DECODE_PREFILL") == NULL) {
+            return false;
+        }
+#endif
     }
     return metal_graph_use_streaming_decode_prefill(g, weights, n_tokens);
 }
@@ -35264,6 +36148,11 @@ typedef struct {
     bool active;
 } ds4_engine_tp_state;
 
+typedef struct {
+    void    *ptr;
+    uint64_t bytes;
+} ds4_locked_model_range;
+
 struct ds4_engine {
     ds4_model model;
     ds4_model mtp_model;
@@ -35291,6 +36180,9 @@ struct ds4_engine {
     uint32_t ssd_streaming_full_layers;
     uint32_t ssd_streaming_preload_experts;
     uint64_t startup_model_span_bytes;
+    ds4_locked_model_range *locked_output_ranges;
+    uint32_t locked_output_range_count;
+    uint64_t locked_output_bytes;
     ds4_ssd_memory_lock simulated_memory;
     ds4_expert_bundle expert_bundle;
     bool quality;
@@ -35330,6 +36222,102 @@ struct ds4_engine {
      * caller that doesn't set the option observe the prior behavior). */
     int            placement_ctx_hint;
 };
+
+/*
+ * DS4Demo keeps the output head resident when dense weights are streamed.
+ * Pinning the byte-identical mmap pages gives the C backend the same useful
+ * property without adding a second copy or changing any kernel input.  This
+ * is deliberately best-effort: macOS may enforce a low per-process mlock
+ * limit, in which case inference continues through the normal mapped view.
+ */
+static void ds4_engine_lock_streaming_output_head(ds4_engine *e) {
+#if defined(__APPLE__)
+    const char *lock_env = getenv("DS4_MLOCK");
+    if (!e || !e->ssd_streaming || e->backend != DS4_BACKEND_METAL ||
+        !lock_env || strcmp(lock_env, "1") != 0 ||
+        !weights_have_output_head(&e->weights) ||
+        !e->model.map || e->model.size == 0) {
+        return;
+    }
+
+    ds4_model_map_span_vec spans;
+    if (!weights_model_map_output_spans(&e->weights, &spans)) return;
+
+    const long page_long = sysconf(_SC_PAGESIZE);
+    const uint64_t page = page_long > 0 ? (uint64_t)page_long : 4096ull;
+    ds4_locked_model_range *locked =
+        xcalloc(spans.len, sizeof(locked[0]));
+    uint32_t n_locked = 0;
+    uint64_t total = 0;
+    bool ok = true;
+
+    for (uint32_t i = 0; i < spans.len; i++) {
+        const uint64_t start = (spans.v[i].off / page) * page;
+        uint64_t end = spans.v[i].end;
+        const uint64_t rem = end % page;
+        if (rem != 0) {
+            const uint64_t add = page - rem;
+            end = end > UINT64_MAX - add ? UINT64_MAX : end + add;
+        }
+        if (end > e->model.size) end = e->model.size;
+        if (start >= end || end - start > (uint64_t)SIZE_MAX) {
+            ok = false;
+            break;
+        }
+        const uint64_t bytes = end - start;
+        void *ptr = (uint8_t *)e->model.map + start;
+        if (mlock(ptr, (size_t)bytes) != 0) {
+            fprintf(stderr,
+                    "ds4: DS4_MLOCK output-head pin failed after %.2f GiB: %s; "
+                    "continuing with evictable mmap pages\n",
+                    ds4_bytes_to_gib(total),
+                    strerror(errno));
+            ok = false;
+            break;
+        }
+        locked[n_locked++] = (ds4_locked_model_range) {
+            .ptr = ptr,
+            .bytes = bytes,
+        };
+        total = ds4_add_sat_u64(total, bytes);
+    }
+    free(spans.v);
+
+    if (!ok) {
+        for (uint32_t i = 0; i < n_locked; i++) {
+            (void)munlock(locked[i].ptr, (size_t)locked[i].bytes);
+        }
+        free(locked);
+        return;
+    }
+
+    e->locked_output_ranges = locked;
+    e->locked_output_range_count = n_locked;
+    e->locked_output_bytes = total;
+    fprintf(stderr,
+            "ds4: DS4_MLOCK pinned %.2f GiB of output-head model pages\n",
+            ds4_bytes_to_gib(total));
+#else
+    (void)e;
+#endif
+}
+
+static void ds4_engine_unlock_streaming_output_head(ds4_engine *e) {
+    if (!e) return;
+#if defined(__APPLE__)
+    for (uint32_t i = 0; i < e->locked_output_range_count; i++) {
+        ds4_locked_model_range *range = &e->locked_output_ranges[i];
+        if (range->ptr && range->bytes != 0 &&
+            range->bytes <= (uint64_t)SIZE_MAX) {
+            (void)munlock(range->ptr, (size_t)range->bytes);
+        }
+    }
+#endif
+    free(e->locked_output_ranges);
+    e->locked_output_ranges = NULL;
+    e->locked_output_range_count = 0;
+    e->locked_output_bytes = 0;
+}
 
 static uint64_t ds4_engine_dynamic_expert_cache_bytes(
         const ds4_engine *e) {
@@ -35378,6 +36366,7 @@ static void ds4_engine_print_startup_memory(
     uint64_t total = kv_bytes;
     total = ds4_add_sat_u64(total, mem.scratch_bytes);
     total = ds4_add_sat_u64(total, e->startup_model_span_bytes);
+    total = ds4_add_sat_u64(total, e->locked_output_bytes);
     total = ds4_add_sat_u64(total, dynamic_expert_cache_bytes);
     total = ds4_add_sat_u64(total, e->ssd_streaming_full_layer_bytes);
     total = ds4_add_sat_u64(total, expert_reserved_bytes);
@@ -35396,6 +36385,11 @@ static void ds4_engine_print_startup_memory(
             ds4_bytes_to_gib(mem.compressed_bytes),
             ds4_bytes_to_gib(mem.scratch_bytes),
             ds4_bytes_to_gib(e->startup_model_span_bytes));
+    if (e->locked_output_bytes != 0) {
+        fprintf(stderr,
+                " + locked output %.2f GiB",
+                ds4_bytes_to_gib(e->locked_output_bytes));
+    }
     if (e->ssd_streaming_full_layer_bytes != 0) {
         fprintf(stderr,
                 " + full-layer experts %.2f GiB",
@@ -55550,6 +56544,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = e;
         return 0;
     }
+    ds4_engine_lock_streaming_output_head(e);
     if (e->backend == DS4_BACKEND_CPU && !cpu_load_directional_steering(e)) {
         ds4_engine_close(e);
         *out = NULL;
@@ -56400,6 +57395,7 @@ void ds4_engine_close(ds4_engine *e) {
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
     if (e->mtp_model.map) model_close(&e->mtp_model);
+    ds4_engine_unlock_streaming_output_head(e);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
     ds4_gpu_cleanup();

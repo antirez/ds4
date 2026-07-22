@@ -29,6 +29,9 @@
 #define DOWN_BYTES 7000ull
 #define ALIGN 4096ull
 #define RECORD 20480ull   /* align4096(6000+6000+7000) */
+#define FNV1A64_OFFSET 0xcbf29ce484222325ull
+#define FNV1A64_PRIME 0x100000001b3ull
+#define SWIFT_V1_PRIME 0x10000000001b3ull
 
 static int g_failures;
 
@@ -126,6 +129,53 @@ static uint64_t get_u64(const uint8_t *p) {
     return (uint64_t)get_u32(p) | ((uint64_t)get_u32(p + 4) << 32);
 }
 
+static void put_u64(uint8_t *p, uint64_t v) {
+    for (uint32_t i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (i * 8));
+}
+
+static uint64_t fnv1a64(const uint8_t *p, uint64_t n, uint64_t prime) {
+    uint64_t h = FNV1A64_OFFSET;
+    for (uint64_t i = 0; i < n; i++) h = (h ^ p[i]) * prime;
+    return h;
+}
+
+enum bundle_hash_scheme {
+    HASH_CANONICAL,
+    HASH_SWIFT_V1,
+    HASH_MIXED,
+};
+
+/* Rewrite only the tiny fingerprint table, leaving the records and padding
+ * untouched. This models bundles produced by the canonical C writer and by
+ * the original Swift v1 writer without building two large fixtures. */
+static int rewrite_bundle_hashes(const char             *bundle_path,
+                                 int                     model_fd,
+                                 const model_layout     *m,
+                                 enum bundle_hash_scheme scheme) {
+    uint8_t source[4096];
+    uint8_t encoded[8];
+    const int fd = open(bundle_path, O_WRONLY);
+    if (fd < 0) return 0;
+    for (uint32_t layer = 0; layer < LAYER_COUNT; layer++) {
+        if (!pread_full(model_fd, source, sizeof(source),
+                        tensor_offset(m, layer, KIND_GATE))) {
+            close(fd);
+            return 0;
+        }
+        const bool legacy = scheme == HASH_SWIFT_V1 ||
+                            (scheme == HASH_MIXED && layer != 0);
+        put_u64(encoded, fnv1a64(source, sizeof(source),
+                                 legacy ? SWIFT_V1_PRIME : FNV1A64_PRIME));
+        if (pwrite(fd, encoded, sizeof(encoded),
+                   (off_t)(56 + (uint64_t)layer * 8)) !=
+            (ssize_t)sizeof(encoded)) {
+            close(fd);
+            return 0;
+        }
+    }
+    return close(fd) == 0;
+}
+
 static int open_bundle(ds4_expert_bundle *b, const char *model_path,
                        int model_fd, const model_layout *m) {
     return ds4_expert_bundle_open_or_build(b, model_path, model_fd,
@@ -172,6 +222,14 @@ next_record:;
 }
 
 int main(void) {
+    static const uint8_t hello[] = "hello";
+    CHECK(fnv1a64(hello, sizeof(hello) - 1, FNV1A64_PRIME) ==
+              0xa430d84680aabd0bull,
+          "canonical FNV-1a known vector");
+    CHECK(fnv1a64(hello, sizeof(hello) - 1, SWIFT_V1_PRIME) ==
+              0xb476bc4680aabd0bull,
+          "legacy Swift v1 known vector");
+
     char dir[] = "/tmp/ds4_expert_bundle_test.XXXXXX";
     if (!mkdtemp(dir)) {
         fprintf(stderr, "mkdtemp failed: %s\n", strerror(errno));
@@ -204,6 +262,15 @@ int main(void) {
     CHECK(get_u64(head + 32) == GATE_BYTES, "header gate bytes");
     CHECK(get_u64(head + 40) == UP_BYTES, "header up bytes");
     CHECK(get_u64(head + 48) == DOWN_BYTES, "header down bytes");
+    uint8_t source[4096];
+    for (uint32_t layer = 0; layer < LAYER_COUNT; layer++) {
+        CHECK(pread_full(model_fd, source, sizeof(source),
+                         tensor_offset(&m, layer, KIND_GATE)),
+              "read source fingerprint bytes");
+        CHECK(get_u64(head + 56 + (uint64_t)layer * 8) ==
+                  fnv1a64(source, sizeof(source), FNV1A64_PRIME),
+              "writer emits canonical FNV-1a fingerprints");
+    }
     CHECK(ds4_expert_bundle_record_offset(&b, LAYER_LO + 1, 2) ==
               ALIGN + (1 * N_EXPERT + 2) * RECORD,
           "record offset math");
@@ -224,6 +291,32 @@ int main(void) {
     CHECK(pread_full(b.fd, &got, 1, mark_off) && got == 0xAB,
           "existing bundle reused without rebuild");
     ds4_expert_bundle_close(&b);
+
+    /* A bundle written by the original Swift v1 code must be reused as-is:
+     * the padding marker proves open_or_build did not replace the file. */
+    CHECK(rewrite_bundle_hashes(bundle_path, model_fd, &m, HASH_SWIFT_V1),
+          "write legacy Swift v1 fingerprints");
+    CHECK(open_bundle(&b, model_path, model_fd, &m),
+          "open legacy Swift v1 bundle");
+    CHECK(pread_full(b.fd, &got, 1, mark_off) && got == 0xAB,
+          "legacy Swift v1 bundle reused without rebuild");
+    ds4_expert_bundle_close(&b);
+
+    /* Compatibility is selected for the complete table, not independently
+     * per layer. A hybrid header is corrupt and must be rebuilt. */
+    CHECK(rewrite_bundle_hashes(bundle_path, model_fd, &m, HASH_MIXED),
+          "write mixed fingerprint schemes");
+    CHECK(open_bundle(&b, model_path, model_fd, &m),
+          "rebuild mixed fingerprint bundle");
+    CHECK(pread_full(b.fd, &got, 1, mark_off) && got == 0,
+          "mixed fingerprint schemes trigger a rebuild");
+    ds4_expert_bundle_close(&b);
+
+    /* Restore the rebuild marker for the independent source-tamper test. */
+    wfd = open(bundle_path, O_WRONLY);
+    CHECK(wfd >= 0 && pwrite(wfd, &mark, 1, (off_t)mark_off) == 1,
+          "mark before source tamper");
+    if (wfd >= 0) close(wfd);
 
     /* Tamper with the model inside a fingerprinted region (first 4 KiB of
      * layer 1's gate tensor): the bundle must be rebuilt with the new byte. */

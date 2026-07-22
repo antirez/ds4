@@ -44,8 +44,8 @@ void ds4_ssd_memory_lock_release(ds4_ssd_memory_lock *lock);
  * expert region of the model on disk, so it is opt-in (DS4_EXPERT_BUNDLE=1)
  * and skipped when free space is short.
  *
- * The file format matches the DwarfStar Swift port byte for byte, so a
- * bundle built by either implementation is reused by the other:
+ * The file layout is shared with the DwarfStar Swift port, so a bundle built
+ * by either implementation is reused by the other:
  *
  *   u32 magic "DSEB"    u32 version=1    u64 model_size
  *   u32 layer_lo        u32 layer_count  u32 n_expert     u32 pad=0
@@ -54,6 +54,10 @@ void ds4_ssd_memory_lock_release(ds4_ssd_memory_lock *lock);
  *   ...zero pad to 4 KiB...
  *   records: layer-major, expert-minor, gate|up|down zero-padded to the
  *   record stride (gate+up+down rounded up to 4 KiB).
+ *
+ * Writers emit standard FNV-1a. Readers also accept the fingerprint table
+ * produced by the original Swift v1 writer's incorrect FNV multiplier, so
+ * existing multi-gigabyte sidecars do not need to be rebuilt.
  */
 typedef struct {
     uint64_t gate_offset;   /* absolute model-file offsets of the layer's   */

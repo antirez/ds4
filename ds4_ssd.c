@@ -290,25 +290,39 @@ static bool expert_bundle_write_full(int fd, const void *src, uint64_t bytes) {
     return true;
 }
 
+typedef struct {
+    uint64_t canonical;
+    uint64_t swift_v1;
+} expert_bundle_layer_fingerprints;
+
 /*
  * FNV-1a over the first 4 KiB of a layer's gate-experts tensor in the model
  * file: the bundle must match the MODEL BYTES, not just its size and shape.
+ *
+ * Early Swift writers accidentally used 0x10000000001b3 (2^48 + 0x1b3)
+ * instead of the FNV-1a prime 0x100000001b3 (2^40 + 0x1b3).  Keep both
+ * fingerprints so those already-large v1 bundles remain readable.  New
+ * bundles always write the canonical fingerprint.
  */
-static bool expert_bundle_layer_hash(int       model_fd,
-                                     uint64_t  gate_offset,
-                                     uint64_t  gate_tensor_bytes,
-                                     uint64_t *hash_out) {
+static bool expert_bundle_layer_hashes(
+        int                               model_fd,
+        uint64_t                          gate_offset,
+        uint64_t                          gate_tensor_bytes,
+        expert_bundle_layer_fingerprints *hashes_out) {
     uint8_t buf[4096];
     uint64_t n = gate_tensor_bytes < sizeof(buf) ? gate_tensor_bytes : sizeof(buf);
     if (n == 0 ||
         !expert_bundle_pread_full(model_fd, buf, n, gate_offset)) {
         return false;
     }
-    uint64_t h = 0xcbf29ce484222325ull;
+    uint64_t canonical = 0xcbf29ce484222325ull;
+    uint64_t swift_v1 = canonical;
     for (uint64_t i = 0; i < n; i++) {
-        h = (h ^ buf[i]) * 0x100000001b3ull;
+        canonical = (canonical ^ buf[i]) * 0x100000001b3ull;
+        swift_v1 = (swift_v1 ^ buf[i]) * 0x10000000001b3ull;
     }
-    *hash_out = h;
+    hashes_out->canonical = canonical;
+    hashes_out->swift_v1 = swift_v1;
     return true;
 }
 
@@ -334,7 +348,8 @@ static bool expert_bundle_open_existing(ds4_expert_bundle *b,
                                         uint64_t           gate_bytes,
                                         uint64_t           up_bytes,
                                         uint64_t           down_bytes,
-                                        const uint64_t    *hashes) {
+                                        const expert_bundle_layer_fingerprints
+                                                           *hashes) {
     const int fd = open(path, O_RDONLY);
     if (fd < 0) return false;
 #ifdef __APPLE__
@@ -363,16 +378,41 @@ static bool expert_bundle_open_existing(ds4_expert_bundle *b,
                 path);
         return false;
     }
+    bool canonical_match = true;
+    bool swift_v1_match = true;
+    uint32_t invalid_layer = UINT32_MAX;
     for (uint32_t i = 0; i < layer_count; i++) {
-        if (expert_bundle_get_u64(head + 56 + (uint64_t)i * 8) != hashes[i]) {
-            free(head);
-            close(fd);
+        const uint64_t stored =
+            expert_bundle_get_u64(head + 56 + (uint64_t)i * 8);
+        const bool canonical = stored == hashes[i].canonical;
+        const bool swift_v1 = stored == hashes[i].swift_v1;
+        canonical_match = canonical_match && canonical;
+        swift_v1_match = swift_v1_match && swift_v1;
+        if (!canonical && !swift_v1 && invalid_layer == UINT32_MAX) {
+            invalid_layer = layer_lo + i;
+        }
+    }
+    if (!canonical_match && !swift_v1_match) {
+        free(head);
+        close(fd);
+        if (invalid_layer != UINT32_MAX) {
             fprintf(stderr,
                     "ds4: expert bundle incompatible (layer %u changed): %s\n",
-                    layer_lo + i,
+                    invalid_layer,
                     path);
-            return false;
+        } else {
+            fprintf(stderr,
+                    "ds4: expert bundle incompatible "
+                    "(mixed fingerprint schemes): %s\n",
+                    path);
         }
+        return false;
+    }
+    if (swift_v1_match && !canonical_match) {
+        fprintf(stderr,
+                "ds4: expert bundle accepted with legacy Swift v1 "
+                "fingerprints: %s\n",
+                path);
     }
     free(head);
 
@@ -420,7 +460,8 @@ static bool expert_bundle_build(const char                    *path,
                                 uint64_t                       up_bytes,
                                 uint64_t                       down_bytes,
                                 const ds4_expert_bundle_layer *layers,
-                                const uint64_t                *hashes) {
+                                const expert_bundle_layer_fingerprints
+                                                              *hashes) {
     const uint64_t hb = expert_bundle_header_bytes(layer_count);
     const uint64_t data_base = expert_bundle_align_up(hb);
     const uint64_t record =
@@ -505,7 +546,8 @@ static bool expert_bundle_build(const char                    *path,
     expert_bundle_put_u64(head + 40, up_bytes);
     expert_bundle_put_u64(head + 48, down_bytes);
     for (uint32_t i = 0; i < layer_count; i++) {
-        expert_bundle_put_u64(head + 56 + (uint64_t)i * 8, hashes[i]);
+        expert_bundle_put_u64(head + 56 + (uint64_t)i * 8,
+                              hashes[i].canonical);
     }
     if (!expert_bundle_write_full(fd, head, data_base)) goto cleanup;
 
@@ -596,14 +638,15 @@ bool ds4_expert_bundle_open_or_build(ds4_expert_bundle             *b,
         return false;
     }
 
-    uint64_t *hashes = malloc((size_t)layer_count * sizeof(*hashes));
+    expert_bundle_layer_fingerprints *hashes =
+        malloc((size_t)layer_count * sizeof(*hashes));
     if (!hashes) return false;
     for (uint32_t i = 0; i < layer_count; i++) {
         if (n_expert > UINT64_MAX / gate_bytes ||
-            !expert_bundle_layer_hash(model_fd,
-                                      layers[i].gate_offset,
-                                      (uint64_t)n_expert * gate_bytes,
-                                      &hashes[i])) {
+            !expert_bundle_layer_hashes(model_fd,
+                                        layers[i].gate_offset,
+                                        (uint64_t)n_expert * gate_bytes,
+                                        &hashes[i])) {
             fprintf(stderr,
                     "ds4: expert bundle model fingerprint read failed "
                     "(layer %u); skipping\n",

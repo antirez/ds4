@@ -99,6 +99,27 @@ int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
+/* Temporarily serve model-file sub-ranges from one shared staging tensor.
+ * The Metal SSD dense streamer installs one layer at a time; every existing
+ * kernel keeps using its model offset and the backend transparently resolves
+ * that offset to the byte-identical staged copy.
+ *
+ * This registry is process-global backend state, not session-local state.
+ * Callers must serialize set/clear with every model-range resolver and may
+ * change it only when no command buffer is open or in flight. */
+typedef struct {
+    uint64_t model_offset;
+    uint64_t bytes;
+    uint64_t staging_offset;
+} ds4_gpu_model_staging_range;
+
+int ds4_gpu_set_model_staging_overrides(
+        const void                        *model_map,
+        uint64_t                           model_size,
+        const ds4_gpu_model_staging_range *ranges,
+        uint32_t                           count,
+        const ds4_gpu_tensor              *staging);
+int ds4_gpu_clear_model_staging_overrides(const void *model_map);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_q8_cache_suppressed(void);
