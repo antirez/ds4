@@ -330,7 +330,7 @@ Things to know before enabling it:
   own `DS4_BUNDLE_DIR`, since the bundle covers the loaded layer range.
 
 The startup log prints `expert bundle loaded`/`written` when the sidecar is
-in place and `expert bundle in use` once misses are actually served from it.
+validated or created; serving records from it is intentionally silent.
 The file format is shared with the DwarfStar Swift port, so a bundle built by
 either implementation is reused by the other. The C reader also recognizes
 the fingerprints emitted by the original Swift v1 writer, so existing large

@@ -646,7 +646,6 @@ static uint64_t g_stream_expert_cache_slab_slot_bytes;
 static ds4_expert_bundle g_stream_expert_bundle = { .fd = -1 };
 static ds4_expert_bundle_layer
     g_stream_expert_bundle_layers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
-static uint64_t g_stream_expert_bundle_served;
 static int g_stream_expert_bundle_fallback_warned;
 static int ds4_gpu_stream_expert_bundle_remap(uint64_t offset, uint64_t len,
                                               uint64_t *bundle_offset);
@@ -10939,7 +10938,6 @@ int ds4_gpu_set_streaming_expert_bundle(
         const ds4_expert_bundle       *bundle,
         const ds4_expert_bundle_layer *layers) {
     g_stream_expert_bundle.fd = -1;
-    g_stream_expert_bundle_served = 0;
     g_stream_expert_bundle_fallback_warned = 0;
     if (!bundle || bundle->fd < 0 || !layers) return 0;
     if (bundle->layer_count == 0 ||
@@ -11053,25 +11051,6 @@ static int ds4_gpu_stream_expert_bundle_record_remap(
     *bundle_offset = gate_bundle;
     *payload_bytes = gate_bytes * 2ull + down_bytes;
     return 1;
-}
-
-/*
- * Runtime PROOF in the engine log that misses are actually served from the
- * sidecar ("loaded" only proves the file validated): the first served slab,
- * then a logarithmic heartbeat -- a long prefill serves hundreds of
- * thousands of slabs and a linear beat would flood the log.
- */
-static void ds4_gpu_stream_expert_bundle_note_served(void) {
-    const uint64_t n = __atomic_add_fetch(&g_stream_expert_bundle_served, 1,
-                                          __ATOMIC_RELAXED);
-    if (n == 1) {
-        fprintf(stderr,
-                "ds4: expert bundle in use: first slab served from the sidecar\n");
-    } else if (n >= 16384 && (n & (n - 1)) == 0) {
-        fprintf(stderr,
-                "ds4: expert bundle in use: %llu slabs served from the sidecar\n",
-                (unsigned long long)n);
-    }
 }
 
 typedef enum {
@@ -11395,7 +11374,6 @@ static int ds4_gpu_stream_expert_pread_into(
             if (read_bytes) *read_bytes = attempt_bytes;
             if (read_calls) *read_calls = attempt_calls;
             if (ms_out) *ms_out = attempt_ms;
-            ds4_gpu_stream_expert_bundle_note_served();
             return 1;
         }
         if (read_bytes) *read_bytes = attempt_bytes;
@@ -11467,7 +11445,6 @@ static int ds4_gpu_stream_expert_pread_bundle_record(
         task->read_bytes = attempt_bytes;
         task->read_calls = attempt_calls;
         task->ms = attempt_ms;
-        ds4_gpu_stream_expert_bundle_note_served();
         return 1;
     }
 

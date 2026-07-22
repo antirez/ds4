@@ -14876,7 +14876,6 @@ typedef struct {
     uint32_t worker_index;
     uint32_t worker_count;
     int error_code;
-    double done_seconds;
     bool started;
 } metal_graph_dense_stream_worker;
 
@@ -14884,7 +14883,6 @@ typedef struct {
     metal_graph_dense_stream_worker worker[DS4_DENSE_STREAM_MAX_IO_DEPTH];
     uint32_t layer;
     uint32_t worker_count;
-    double start_seconds;
     bool pending;
 } metal_graph_dense_stream_job;
 
@@ -14900,12 +14898,6 @@ struct metal_graph_dense_stream {
     const void *model_map;
     uint64_t model_size;
     uint64_t staging_bytes;
-    uint64_t deferred_compressor_bytes;
-    uint64_t deferred_indexer_bytes;
-    uint64_t bytes_read;
-    double read_seconds;
-    double wait_seconds;
-    uint64_t staged_layers;
     void *locked_ptr[DS4_DENSE_STREAM_MAX_SLOTS];
     uint64_t locked_bytes[DS4_DENSE_STREAM_MAX_SLOTS];
     metal_graph_dense_stream_model_lock *model_locks;
@@ -14917,7 +14909,6 @@ struct metal_graph_dense_stream {
     uint32_t io_depth;
     bool initialized;
     bool active;
-    bool profile;
     bool resident_comp;
     bool lazy_idx;
 };
@@ -15670,27 +15661,14 @@ static void metal_graph_dense_stream_free(ds4_gpu_graph *g) {
     if (stream->model_map) {
         if (!ds4_gpu_synchronize()) {
             fprintf(stderr,
-                    "ds4: Metal dense stream synchronize during teardown failed\n");
+                    "ds4: Metal staging synchronization during teardown failed\n");
         }
         if (!ds4_gpu_clear_model_staging_overrides(stream->model_map)) {
             fprintf(stderr,
-                    "ds4: Metal dense stream override clear during teardown failed\n");
+                    "ds4: Metal staging override cleanup during teardown failed\n");
         }
     }
 #endif
-    if (stream->profile && stream->staged_layers != 0) {
-        const double mib = (double)stream->bytes_read / (1024.0 * 1024.0);
-        const double gib_s = stream->read_seconds > 0.0 ?
-            ((double)stream->bytes_read / 1073741824.0) / stream->read_seconds : 0.0;
-        fprintf(stderr,
-                "ds4: Metal dense stream summary: layers=%" PRIu64
-                " read=%.2f MiB io=%.3f s wait=%.3f s rate=%.2f GiB/s\n",
-                stream->staged_layers,
-                mib,
-                stream->read_seconds,
-                stream->wait_seconds,
-                gib_s);
-    }
 #if defined(__APPLE__)
     for (uint32_t i = 0; i < stream->model_lock_count; i++) {
         if (stream->model_locks[i].ptr && stream->model_locks[i].bytes != 0) {
@@ -29255,9 +29233,9 @@ static void metal_graph_dense_stream_join_jobs_for_cleanup(
                 const int rc = pthread_join(worker->thread, NULL);
                 if (rc != 0) {
                     fprintf(stderr,
-                            "ds4: Metal dense stream pthread_join failed: %s\n",
+                            "ds4: Metal staging pthread_join failed: %s\n",
                             strerror(rc));
-                    ds4_die("Metal dense stream pthread_join invariant failed");
+                    ds4_die("Metal staging pthread_join invariant failed");
                 }
                 worker->started = false;
             }
@@ -29338,8 +29316,6 @@ static bool metal_graph_dense_stream_mlock_compressors(
     metal_graph_dense_stream_model_lock *locks =
         calloc((size_t)spans.len, sizeof(locks[0]));
     if (!locks) {
-        fprintf(stderr,
-                "ds4: Metal dense stream compressor mlock skipped: out of memory\n");
         free(spans.v);
         return false;
     }
@@ -29371,21 +29347,12 @@ static bool metal_graph_dense_stream_mlock_compressors(
             (void)munlock(locks[i].ptr, (size_t)locks[i].bytes);
         }
         free(locks);
-        fprintf(stderr,
-                "ds4: Metal dense stream compressor mlock failed "
-                "(best effort): %s\n",
-                strerror(first_error ? first_error : EOVERFLOW));
         return false;
     }
 
     stream->model_locks = locks;
     stream->model_lock_count = locked;
     stream->model_locked_bytes = bytes_locked;
-    fprintf(stderr,
-            "ds4: Metal dense stream compressor mlock active "
-            "(%u ranges, %.2f MiB)\n",
-            locked,
-            (double)bytes_locked / (1024.0 * 1024.0));
     return true;
 }
 
@@ -29426,7 +29393,6 @@ static void *metal_graph_dense_stream_worker_main(void *opaque) {
     }
 
 finished:
-    worker->done_seconds = now_sec();
     return NULL;
 }
 
@@ -29455,7 +29421,6 @@ static bool metal_graph_dense_stream_start_layer(
         job->worker_count > DS4_DENSE_STREAM_MAX_IO_DEPTH) {
         return false;
     }
-    job->start_seconds = now_sec();
     job->pending = true;
     for (uint32_t i = 0; i < job->worker_count; i++) {
         metal_graph_dense_stream_worker *worker = &job->worker[i];
@@ -29470,7 +29435,6 @@ static bool metal_graph_dense_stream_start_layer(
                                       worker);
         if (rc != 0) {
             worker->error_code = rc;
-            worker->done_seconds = now_sec();
             return false;
         }
         worker->started = true;
@@ -29481,12 +29445,8 @@ static bool metal_graph_dense_stream_start_layer(
 static bool metal_graph_dense_stream_join_layer(
         metal_graph_dense_stream *stream,
         uint32_t layer,
-        int *error_code,
-        double *io_seconds,
-        double *wait_seconds) {
+        int *error_code) {
     if (error_code) *error_code = 0;
-    if (io_seconds) *io_seconds = 0.0;
-    if (wait_seconds) *wait_seconds = 0.0;
     if (!stream || stream->slot_count == 0) return false;
     const uint32_t slot = layer % stream->slot_count;
     metal_graph_dense_stream_job *job = &stream->job[slot];
@@ -29494,8 +29454,6 @@ static bool metal_graph_dense_stream_join_layer(
         return false;
     }
 
-    const double wait_t0 = now_sec();
-    double done_seconds = job->start_seconds;
     int first_error = 0;
     for (uint32_t i = 0; i < job->worker_count; i++) {
         metal_graph_dense_stream_worker *worker = &job->worker[i];
@@ -29503,24 +29461,18 @@ static bool metal_graph_dense_stream_join_layer(
             const int rc = pthread_join(worker->thread, NULL);
             if (rc != 0) {
                 fprintf(stderr,
-                        "ds4: Metal dense stream pthread_join failed: %s\n",
+                        "ds4: Metal staging pthread_join failed: %s\n",
                         strerror(rc));
-                ds4_die("Metal dense stream pthread_join invariant failed");
+                ds4_die("Metal staging pthread_join invariant failed");
             }
             worker->started = false;
         }
         if (worker->error_code != 0 && first_error == 0) {
             first_error = worker->error_code;
         }
-        if (worker->done_seconds > done_seconds) {
-            done_seconds = worker->done_seconds;
-        }
     }
-    const double wait_t1 = now_sec();
     job->pending = false;
     if (error_code) *error_code = first_error;
-    if (io_seconds) *io_seconds = done_seconds - job->start_seconds;
-    if (wait_seconds) *wait_seconds = wait_t1 - wait_t0;
     return first_error == 0;
 }
 #endif
@@ -29532,7 +29484,7 @@ static void metal_graph_dense_stream_fallback(
     g->dense_stream.initialized = true;
     g->dense_stream.active = false;
     fprintf(stderr,
-            "ds4: Metal dense stream disabled; falling back to mmap model views (%s)\n",
+            "ds4: Metal staging fallback to mmap model views (%s)\n",
             reason ? reason : "unknown error");
 }
 
@@ -29547,8 +29499,6 @@ static bool metal_graph_dense_stream_init(
     if (!metal_graph_dense_stream_requested(g)) return false;
 
 #if defined(__APPLE__)
-    stream->profile = getenv("DS4_DENSE_STREAM_PROFILE") != NULL &&
-                      strcmp(getenv("DS4_DENSE_STREAM_PROFILE"), "0") != 0;
     const char *resident_comp_env = getenv("DS4_RESIDENT_COMP");
     const char *mlock_env = getenv("DS4_MLOCK");
     const bool mlock_requested = mlock_env && strcmp(mlock_env, "1") == 0;
@@ -29576,11 +29526,6 @@ static bool metal_graph_dense_stream_init(
                 stream->lazy_idx = false;
                 break;
             }
-        }
-        if (!stream->lazy_idx) {
-            fprintf(stderr,
-                    "ds4: Metal dense stream lazy indexer disabled: "
-                    "configured context can cross the sparse boundary\n");
         }
     }
     stream->ahead = metal_graph_dense_stream_env_u32(
@@ -29626,52 +29571,13 @@ static bool metal_graph_dense_stream_init(
             metal_graph_dense_stream_mlock_compressors(stream, weights);
         if (!compressors_locked) {
             stream->resident_comp = false;
-            fprintf(stderr,
-                    "ds4: Metal dense stream restoring lossless compressor "
-                    "streaming because compressor mlock failed\n");
         }
     }
 
     const uint64_t alignment = 4096u;
     uint64_t max_staging = 0;
-    uint64_t bytes_per_pass = 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *layer = &weights->layer[il];
-        if (stream->resident_comp) {
-            const ds4_tensor *deferred[] = {
-                layer->attn_compressor_kv,
-                layer->attn_compressor_gate,
-                layer->indexer_compressor_kv,
-                layer->indexer_compressor_gate,
-            };
-            for (uint32_t i = 0; i < sizeof(deferred) / sizeof(deferred[0]); i++) {
-                if (deferred[i]) {
-                    stream->deferred_compressor_bytes = ds4_add_sat_u64(
-                        stream->deferred_compressor_bytes,
-                        deferred[i]->bytes);
-                }
-            }
-        }
-        if (stream->lazy_idx) {
-            const ds4_tensor *deferred[] = {
-                layer->indexer_attn_q_b,
-                layer->indexer_proj,
-            };
-            for (uint32_t i = 0; i < sizeof(deferred) / sizeof(deferred[0]); i++) {
-                if (deferred[i]) {
-                    stream->deferred_indexer_bytes = ds4_add_sat_u64(
-                        stream->deferred_indexer_bytes,
-                        deferred[i]->bytes);
-                }
-            }
-        }
-        if (stream->deferred_compressor_bytes == UINT64_MAX ||
-            stream->deferred_indexer_bytes == UINT64_MAX) {
-            metal_graph_dense_stream_fallback(
-                g, "deferred dense byte accounting overflow");
-            return false;
-        }
-
         ds4_model_map_span_vec spans;
         memset(&spans, 0, sizeof(spans));
         model_map_span_vec_include_layer_decode_static_policy(
@@ -29703,8 +29609,7 @@ static bool metal_graph_dense_stream_init(
             }
             cursor = align_up(cursor, alignment);
             if (bytes == 0 || cursor > UINT64_MAX - bytes ||
-                plan->bytes > UINT64_MAX - bytes ||
-                bytes_per_pass > UINT64_MAX - bytes) {
+                plan->bytes > UINT64_MAX - bytes) {
                 free(spans.v);
                 metal_graph_dense_stream_fallback(g, "dense staging byte overflow");
                 return false;
@@ -29714,7 +29619,6 @@ static bool metal_graph_dense_stream_init(
             plan->ranges[i].staging_offset = cursor;
             cursor += bytes;
             plan->bytes += bytes;
-            bytes_per_pass += bytes;
         }
         free(spans.v);
         if (cursor > max_staging) max_staging = cursor;
@@ -29736,50 +29640,15 @@ static bool metal_graph_dense_stream_init(
     }
 
     if (mlock_requested) {
-        uint32_t locked_slots = 0;
-        int first_error = 0;
         for (uint32_t slot = 0; slot < stream->slot_count; slot++) {
             void *ptr = ds4_gpu_tensor_contents(stream->staging[slot]);
             if (mlock(ptr, (size_t)max_staging) == 0) {
                 stream->locked_ptr[slot] = ptr;
                 stream->locked_bytes[slot] = max_staging;
-                locked_slots++;
-            } else if (first_error == 0) {
-                first_error = errno;
             }
-        }
-        if (locked_slots == stream->slot_count) {
-            fprintf(stderr,
-                    "ds4: Metal dense stream staging mlock active "
-                    "(%u slots, %.2f MiB total)\n",
-                    locked_slots,
-                    (double)max_staging * locked_slots / (1024.0 * 1024.0));
-        } else {
-            fprintf(stderr,
-                    "ds4: Metal dense stream staging mlock best effort: "
-                    "%u/%u slots locked (%s)\n",
-                    locked_slots,
-                    stream->slot_count,
-                    strerror(first_error ? first_error : ENOMEM));
         }
     }
     stream->active = true;
-    fprintf(stderr,
-            "ds4: Metal dense stream enabled: %u x %.2f MiB shared slots, "
-            "ahead=%u io_depth=%u, %.2f GiB/pass, "
-            "dedicated F_NOCACHE fd\n",
-            stream->slot_count,
-            (double)max_staging / (1024.0 * 1024.0),
-            stream->ahead,
-            stream->io_depth,
-            (double)bytes_per_pass / 1073741824.0);
-    fprintf(stderr,
-            "ds4: Metal dense stream deferred mmap views: compressors=%.2f MiB "
-            "(%s), lazy-indexer=%.2f MiB (%s) per pass\n",
-            (double)stream->deferred_compressor_bytes / (1024.0 * 1024.0),
-            stream->resident_comp ? "resident" : "streamed",
-            (double)stream->deferred_indexer_bytes / (1024.0 * 1024.0),
-            stream->lazy_idx ? "lazy" : "streamed");
     return true;
 #else
     (void)model;
@@ -29822,7 +29691,6 @@ static bool metal_graph_dense_stream_publish_layer(
 
     metal_graph_dense_stream_plan *plan = &stream->layer[il];
     const uint32_t slot = il % stream->slot_count;
-    metal_graph_dense_stream_job *job = &stream->job[slot];
     if (!plan->ranges || plan->count == 0 || !stream->staging[slot]) {
         metal_graph_dense_stream_fallback(
             g, "prefetched staging plan/buffer unavailable");
@@ -29830,13 +29698,9 @@ static bool metal_graph_dense_stream_publish_layer(
     }
 
     int error_code = 0;
-    double io_seconds = 0.0;
-    double wait_seconds = 0.0;
     if (!metal_graph_dense_stream_join_layer(stream,
                                              il,
-                                             &error_code,
-                                             &io_seconds,
-                                             &wait_seconds)) {
+                                             &error_code)) {
         char reason[192];
         snprintf(reason,
                  sizeof(reason),
@@ -29853,28 +29717,6 @@ static bool metal_graph_dense_stream_publish_layer(
                                              stream->staging[slot])) {
         metal_graph_dense_stream_fallback(g, "Metal staging override publish failed");
         return true;
-    }
-
-    if (io_seconds < 0.0) io_seconds = 0.0;
-    if (wait_seconds < 0.0) wait_seconds = 0.0;
-    stream->bytes_read += plan->bytes;
-    stream->read_seconds += io_seconds;
-    stream->wait_seconds += wait_seconds;
-    stream->staged_layers++;
-    if (stream->profile) {
-        const double gib_s = io_seconds > 0.0 ?
-            ((double)plan->bytes / 1073741824.0) / io_seconds : 0.0;
-        fprintf(stderr,
-                "ds4: Metal dense stream layer=%u slot=%u ranges=%u workers=%u "
-                "read=%.2f MiB io=%.3f ms wait=%.3f ms rate=%.2f GiB/s\n",
-                il,
-                slot,
-                plan->count,
-                job->worker_count,
-                (double)plan->bytes / (1024.0 * 1024.0),
-                io_seconds * 1000.0,
-                wait_seconds * 1000.0,
-                gib_s);
     }
 #else
     (void)model;
@@ -29936,11 +29778,8 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         return false;
     }
 
-    const bool profile =
-        glm_graph_env_present("DS4_ROCM_GRAPH_TOKEN_PROFILE",
-                              "DS4_METAL_GRAPH_TOKEN_PROFILE");
     const bool throttle = graph_power_throttle_enabled(g);
-    const double t0 = (profile || throttle) ? now_sec() : 0.0;
+    const double t0 = throttle ? now_sec() : 0.0;
     const uint32_t raw_row = pos % g->raw_cap;
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
     metal_graph_dspark_capture_begin(g);
@@ -30003,23 +29842,11 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         if (ok && logits) {
             ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
         }
-        const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
         if (ok) ok = ds4_gpu_end_commands() != 0;
-        const double t_done = (profile || throttle) ? now_sec() : 0.0;
         if (ok && logits) {
             ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
         }
-        const double t_read = (profile || throttle) ? now_sec() : 0.0;
-        if (profile) {
-            fprintf(stderr,
-                    "ds4: metal SSD streaming batched token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=%d\n",
-                    pos,
-                    (t_encoded - t0) * 1000.0,
-                    (t_done - t_encoded) * 1000.0,
-                    (t_read - t_done) * 1000.0,
-                    (t_read - t0) * 1000.0,
-                    logits != NULL);
-        }
+        const double t_read = throttle ? now_sec() : 0.0;
         if (ok && throttle) {
             graph_power_note_decode_token(g, t_read - t0);
         }
@@ -30032,10 +29859,7 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
 
-    double encode_s = 0.0;
-    double execute_s = 0.0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        const double tl0 = profile ? now_sec() : 0.0;
         if (!static_decode_map && !metal_graph_stream_map_layer_decode(model, weights, il)) {
             ok = false;
             break;
@@ -30070,15 +29894,9 @@ static bool metal_graph_eval_token_raw_swa_streaming(
             g->after_ffn_hc_by_tier[g->active_tier] = tmp;
             if (ok) ok = metal_graph_dspark_capture_decode_layer(g, il);
         }
-        const double tl_encoded = profile ? now_sec() : 0.0;
         if (ok) ok = ds4_gpu_end_commands() != 0;
-        const double tl_done = profile ? now_sec() : 0.0;
         if (ok && g->dense_stream.active) {
             ok = metal_graph_dense_stream_schedule_after_layer(g, il);
-        }
-        if (profile) {
-            encode_s += tl_encoded - tl0;
-            execute_s += tl_done - tl_encoded;
         }
     }
 
@@ -30089,32 +29907,14 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     }
 #endif
     if (ok && logits && !static_decode_map) ok = metal_graph_stream_map_output(model, weights);
-    const double t_head0 = profile ? now_sec() : 0.0;
     if (ok && logits) ok = ds4_gpu_begin_commands() != 0;
     if (ok && logits) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
-    const double t_head_encoded = profile ? now_sec() : 0.0;
     if (ok && logits) ok = ds4_gpu_end_commands() != 0;
-    const double t_done = (profile || throttle) ? now_sec() : 0.0;
     if (ok && logits) {
         ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
-    const double t_read = (profile || throttle) ? now_sec() : 0.0;
-
-    if (profile) {
-        if (logits) {
-            encode_s += t_head_encoded - t_head0;
-            execute_s += t_done - t_head_encoded;
-        }
-        fprintf(stderr,
-                "ds4: metal SSD streaming token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=%d\n",
-                pos,
-                encode_s * 1000.0,
-                execute_s * 1000.0,
-                (t_read - t_done) * 1000.0,
-                (t_read - t0) * 1000.0,
-                logits != NULL);
-    }
-    if (ok) graph_power_note_decode_token(g, t_read - t0);
+    const double t_read = throttle ? now_sec() : 0.0;
+    if (ok && throttle) graph_power_note_decode_token(g, t_read - t0);
     if (!ok) {
         if (ds4_gpu_synchronize() == 0) {
             fprintf(stderr, "ds4: Metal synchronize after SSD streaming graph eval failure also failed\n");
@@ -33910,12 +33710,7 @@ static bool metal_graph_prefill_layer_major(
                                                                   il,
                                                                   start,
                                                                   n_tokens);
-            if (show_progress) {
-                fprintf(stderr, "ds4: gpu prefill layer %u/%u\r", il + 1, (uint32_t)DS4_N_LAYER);
-                fflush(stderr);
-            }
         }
-        if (show_progress) fputc('\n', stderr);
         if (display_progress)
             display_progress(display_progress_ud, "prefill_display",
                              (int)(start + n_tokens), prompt->len);
@@ -34349,10 +34144,6 @@ static bool metal_graph_prefill_layer_major(
                                                   n_tokens,
                                                   il + 1,
                                                   prompt->len);
-        if (show_progress) {
-            fprintf(stderr, "ds4: gpu prefill layer %u/%u\r", il + 1, (uint32_t)DS4_N_LAYER);
-            fflush(stderr);
-        }
     }
     if (!ok) {
 #ifdef DS4_ROCM_BUILD
@@ -34374,7 +34165,6 @@ static bool metal_graph_prefill_layer_major(
      * replay/decode chunks so the prefill win does not add residency pressure. */
     ds4_gpu_release_zero_prefix_prefill_mask_cache();
 #endif
-    if (show_progress) fputc('\n', stderr);
     metal_graph_stream_prefill_selected_profile_summary(g);
 #ifdef DS4_ROCM_BUILD
     (void)ds4_gpu_stream_expert_cache_release_layer_cache();
