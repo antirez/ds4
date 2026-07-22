@@ -16696,7 +16696,6 @@ static uint64_t metal_graph_q8_0_row_bytes(uint64_t in_dim) {
  * legacy 1-arg helpers when g_n_gpus <= 1. */
 static bool metal_graph_alloc_raw_cap(
         ds4_gpu_graph *g,
-        const ds4_weights     *weights,
         const ds4_layer_weights *layer,
         uint32_t                raw_cap,
         uint32_t                ctx_size,
@@ -16823,7 +16822,7 @@ static bool metal_graph_alloc_raw_cap(
     const uint64_t group_dim = (uint64_t)DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP);
     const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
     const uint64_t routed_mid_dim = layer->ffn_gate_exps->dim[1];
-    const uint64_t vocab_dim = weights->output->dim[1];
+    const uint64_t vocab_dim = DS4_N_VOCAB;
     const uint64_t comp_width_max = 2ull * (DS4_N_HEAD_DIM > DS4_N_INDEXER_HEAD_DIM
         ? DS4_N_HEAD_DIM
         : DS4_N_INDEXER_HEAD_DIM);
@@ -17307,11 +17306,10 @@ static bool metal_graph_alloc_raw_cap(
 
 static bool metal_graph_alloc(
         ds4_gpu_graph *g,
-        const ds4_weights     *weights,
         const ds4_layer_weights *layer) {
     /* single-tier convenience wrapper; placement=NULL routes
      * all per-layer allocations to tier 0. */
-    return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA,
+    return metal_graph_alloc_raw_cap(g, layer, DS4_N_SWA, DS4_N_SWA,
                                      1, false, NULL, false, NULL);
 }
 
@@ -25314,7 +25312,7 @@ static int metal_graph_decode_test(
     output_logits_one(cpu_logits, model, weights, cpu_after_ffn_hc);
 
     ds4_gpu_graph g;
-    bool ok = metal_graph_alloc(&g, weights, layer);
+    bool ok = metal_graph_alloc(&g, layer);
     g.quality = quality;
     g.materialize_ffn_out = true;
     if (ok) ok = ds4_gpu_begin_commands() != 0;
@@ -25470,7 +25468,7 @@ static int metal_graph_first_token_full_test(
     output_logits_one(cpu_logits, model, weights, cpu_hc);
 
     ds4_gpu_graph g;
-    bool ok = metal_graph_alloc(&g, weights, &weights->layer[0]);
+    bool ok = metal_graph_alloc(&g, &weights->layer[0]);
     g.quality = quality;
     const bool trace_layers = getenv("DS4_METAL_GRAPH_TRACE_LAYERS") != NULL;
     if (trace_layers && ok) {
@@ -34938,7 +34936,7 @@ static int metal_graph_prompt_logits_test(
 
     ds4_gpu_graph g;
     /* diagnostic single-tier callsite; placement=NULL. */
-    bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
+    bool ok = metal_graph_alloc_raw_cap(&g, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size,
                                         (uint32_t)n_test, false, NULL, false, NULL);
     if (!ok) {
@@ -46662,7 +46660,7 @@ static int generate_metal_graph_raw_swa(
     }
     ds4_gpu_graph g;
     /* diagnostic single-tier callsite; placement=NULL. */
-    bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
+    bool ok = metal_graph_alloc_raw_cap(&g, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size,
                                         prefill_cap, false, NULL, false, NULL);
     if (!ok) {
@@ -50460,7 +50458,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
 
     ds4_gpu_graph g;
     /* diagnostic single-tier callsite; placement=NULL. */
-    bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
+    bool ok = metal_graph_alloc_raw_cap(&g, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size,
                                         prefill_cap, false, NULL, false, NULL);
     if (!ok) {
@@ -56575,7 +56573,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             ? &e->shared_prefill_workspace
             : NULL;
     s->graph.dspark_exec_tier = e->multi_tier ? e->dspark_exec_tier : 0;
-    if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
+    if (!metal_graph_alloc_raw_cap(&s->graph, shape_layer,
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap,
                                    need_spec_verifier,
                                    placement,
