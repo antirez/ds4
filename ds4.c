@@ -47471,7 +47471,6 @@ static int generate_metal_graph_raw_swa(
 
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
     const bool trace_top = getenv("DS4_TRACE_TOP") != NULL;
-    const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
 
     const double t_prefill0 = now_sec();
     if (prefill_cap < (uint32_t)prompt->len) {
@@ -47506,7 +47505,6 @@ static int generate_metal_graph_raw_swa(
 
     int pos = prompt->len;
     int n_generated = 0;
-    int n_decode_eval = 0;
     const double t_decode0 = now_sec();
     for (int i = 0; i < n_predict && pos < ctx_size; i++) {
         if (trace_top) {
@@ -47526,7 +47524,6 @@ static int generate_metal_graph_raw_swa(
             break;
         }
 
-        const double t_eval0 = token_timing ? now_sec() : 0.0;
         ok = metal_graph_eval_token_raw_swa(&g,
                                             model,
                                             weights,
@@ -47534,11 +47531,6 @@ static int generate_metal_graph_raw_swa(
                                             (uint32_t)pos,
                                             logits);
         if (!ok) break;
-        if (token_timing) {
-            const double t_eval1 = now_sec();
-            fprintf(stderr, "ds4: gpu decode eval %d took %.3f ms\n", n_decode_eval + 1, (t_eval1 - t_eval0) * 1000.0);
-        }
-        n_decode_eval++;
         pos++;
     }
     const double t_decode1 = now_sec();
