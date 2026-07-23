@@ -97,7 +97,7 @@ __global__ static void quantize_q8_0_f32_kernel(
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
     const float d = __shfl(a, 0, 32) / 127.0f;
 #else
-    const float d = __shfl_sync(FULL_WARP_MASK, a, 0, 32) / 127.0f;
+    const float d = __shfl_sync(DS4_WARP32_MASK, a, 0, 32) / 127.0f;
 #endif
     const float id = d != 0.0f ? 1.0f / d : 0.0f;
     if (threadIdx.x == 0) xscale[tok * blocks + b] = d;
@@ -392,7 +392,7 @@ __device__ static float q8_0_scale_broadcast_w32(const unsigned char *blk) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
     return __shfl(d, 0, 32);
 #else
-    return __shfl_sync(FULL_WARP_MASK, d, 0, 32);
+    return __shfl_sync(DS4_WARP32_MASK, d, 0, 32);
 #endif
 }
 
@@ -1289,7 +1289,7 @@ __device__ static float warp_sum_f32_oldhip_w32(float v) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         v += __shfl_down(v, offset, 32);
 #else
-        v += __shfl_down_sync(FULL_WARP_MASK, v, offset, 32);
+        v += __shfl_down_sync(DS4_WARP32_MASK, v, offset, 32);
 #endif
     }
     return v;
@@ -1301,7 +1301,7 @@ __device__ static float q8_0_scale_broadcast_oldhip_w32(const unsigned char *blk
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
     return __shfl(d, 0, 32);
 #else
-    return __shfl_sync(FULL_WARP_MASK, d, 0, 32);
+    return __shfl_sync(DS4_WARP32_MASK, d, 0, 32);
 #endif
 }
 

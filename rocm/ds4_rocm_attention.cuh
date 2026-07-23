@@ -378,7 +378,7 @@ __device__ static float attention_warp_sum_oldhip_w32(float v) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         v += __shfl_down(v, offset, 32);
 #else
-        v += __shfl_down_sync(FULL_WARP_MASK, v, offset, 32);
+        v += __shfl_down_sync(DS4_WARP32_MASK, v, offset, 32);
 #endif
     }
     return v;
@@ -389,7 +389,7 @@ __device__ static float attention_warp_max_oldhip_w32(float v) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         v = fmaxf(v, __shfl_down(v, offset, 32));
 #else
-        v = fmaxf(v, __shfl_down_sync(FULL_WARP_MASK, v, offset, 32));
+        v = fmaxf(v, __shfl_down_sync(DS4_WARP32_MASK, v, offset, 32));
 #endif
     }
     return v;
@@ -717,9 +717,9 @@ __global__ static void attention_decode_mixed_kernel(
                 if (kvrow) {
                     float dot = 0.0f;
                     for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
-                    const uint32_t mask = 0xffu << (threadIdx.x & 24u);
+                    const MASK_T mask = ds4_subwave_mask<8u>();
                     for (uint32_t off = 4u; off > 0u; off >>= 1u) {
-                        dot += __shfl_down_sync(static_cast<MASK_T>(mask), dot, off, 8);
+                        dot += __shfl_down_sync(mask, dot, off, 8);
                     }
                     s = dot * scale + add;
                 }
@@ -962,9 +962,9 @@ __global__ static void attention_indexed_mixed_kernel(
                     : comp_kv + (uint64_t)comp_rows[row - raw_count] * head_dim;
                 float dot = 0.0f;
                 for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
-                const uint32_t mask = 0xffu << (threadIdx.x & 24u);
+                const MASK_T mask = ds4_subwave_mask<8u>();
                 for (uint32_t off = 4u; off > 0u; off >>= 1u) {
-                    dot += __shfl_down_sync(static_cast<MASK_T>(mask), dot, off, 8);
+                    dot += __shfl_down_sync(mask, dot, off, 8);
                 }
                 if (qlane == 0) scores[row] = dot * scale;
             }
@@ -1146,7 +1146,7 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
                               dot4_f32(q2, k2) +
                               dot4_f32(q3, k3);
                 score = warp_sum_f32(score) * scale;
-                score = __shfl_sync(FULL_WARP_MASK, score, 0);
+                score = __shfl_sync(DS4_WARP32_MASK, score, 0, 32);
 
                 const float new_m = fmaxf(max_s, score);
                 const float old_scale = expf(max_s - new_m);
@@ -1257,7 +1257,7 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
         const float *score_row = scores + warp * 768u;
         for (uint32_t i = lane; i < n_score; i += 32u) max_s = fmaxf(max_s, score_row[i]);
         max_s = warp_max_f32(max_s);
-        max_s = __shfl_sync(FULL_WARP_MASK, max_s, 0);
+        max_s = __shfl_sync(DS4_WARP32_MASK, max_s, 0, 32);
     }
     float den = 0.0f;
     if (valid_head) {
@@ -1269,7 +1269,7 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
         }
         den = warp_sum_f32(den);
         den += expf(sinks[head] - max_s);
-        den = __shfl_sync(FULL_WARP_MASK, den, 0);
+        den = __shfl_sync(DS4_WARP32_MASK, den, 0, 32);
     }
 
     float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -1422,7 +1422,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
                               dot4_f32(q2, k2) +
                               dot4_f32(q3, k3);
                 score = warp_sum_f32(score) * scale;
-                score = __shfl_sync(FULL_WARP_MASK, score, 0);
+                score = __shfl_sync(DS4_WARP32_MASK, score, 0, 32);
 
                 max_s = fmaxf(max_s, score);
             }
@@ -1458,7 +1458,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
                               dot4_f32(q2, k2) +
                               dot4_f32(q3, k3);
                 score = warp_sum_f32(score) * scale;
-                score = __shfl_sync(FULL_WARP_MASK, score, 0);
+                score = __shfl_sync(DS4_WARP32_MASK, score, 0, 32);
 
                 const float row_scale = expf(score - max_s);
                 sum_s += row_scale;
