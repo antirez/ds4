@@ -632,7 +632,7 @@ int ds4_gpu_matmul_quant_rows_scalar_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
-/* Laguna's official Q4_K_M file keeps selected down projections and the
+/* The original Laguna Q4_K_M recipe keeps selected down projections and the
  * output head in Q6_K. */
 int ds4_gpu_matmul_q6_K_tensor(
         ds4_gpu_tensor       *out,

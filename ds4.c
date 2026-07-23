@@ -5133,9 +5133,30 @@ static void weights_validate_laguna_layout(
         ds4_die("invalid layer range in Laguna weight layout validation");
     }
 
+    /* Poolside published two coherent recipes under the same Q4_K_M
+     * filename. The embedding type identifies full models; attention Q is
+     * the equivalent marker for layer-only/distributed weight views. */
+    const ds4_tensor *layout_marker = w->token_embd;
+    if (!layout_marker) layout_marker = w->layer[layer_start].attn_q;
+    if (!layout_marker) {
+        ds4_die("cannot identify Laguna quantization layout");
+    }
+    const bool signal_q8 = layout_marker->type == DS4_TENSOR_Q8_0;
+    const bool legacy_layout =
+        (w->token_embd && layout_marker->type == DS4_TENSOR_Q4_K) ||
+        (!w->token_embd && layout_marker->type == DS4_TENSOR_F16);
+    if (!signal_q8 && !legacy_layout) {
+        fprintf(stderr,
+                "ds4: unsupported Laguna quantization layout marker %s; "
+                "expected legacy Q4_K/F16 or Q8_0 signal weights\n",
+                tensor_type_name(layout_marker->type));
+        exit(1);
+    }
+
     if (require_token_embd && !w->token_embd) ds4_die("required token embedding tensor is missing");
     if (w->token_embd) {
-        tensor_expect_layout(w->token_embd, DS4_TENSOR_Q4_K,
+        tensor_expect_layout(w->token_embd,
+                             signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q4_K,
                              2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
 
@@ -5145,7 +5166,8 @@ static void weights_validate_laguna_layout(
     if (have_output) {
         tensor_expect_layout(w->output_norm, DS4_TENSOR_F32,
                              1, DS4_N_EMBD, 0, 0);
-        tensor_expect_layout(w->output, DS4_TENSOR_Q6_K,
+        tensor_expect_layout(w->output,
+                             signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q6_K,
                              2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
 
@@ -5161,29 +5183,34 @@ static void weights_validate_laguna_layout(
 
         tensor_expect_layout(l->attn_norm, DS4_TENSOR_F32,
                              1, DS4_N_EMBD, 0, 0);
-        tensor_expect_layout(l->attn_q, DS4_TENSOR_F16,
+        const uint32_t attn_type =
+            signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_F16;
+        tensor_expect_layout(l->attn_q, attn_type,
                              2, DS4_N_EMBD, q_dim, 0);
-        tensor_expect_layout(l->attn_k, DS4_TENSOR_F16,
+        tensor_expect_layout(l->attn_k, attn_type,
                              2, DS4_N_EMBD, kv_dim, 0);
-        tensor_expect_layout(l->attn_v, DS4_TENSOR_F16,
+        tensor_expect_layout(l->attn_v, attn_type,
                              2, DS4_N_EMBD, kv_dim, 0);
-        tensor_expect_layout(l->attn_gate, DS4_TENSOR_F16,
+        tensor_expect_layout(l->attn_gate, attn_type,
                              2, DS4_N_EMBD, n_head, 0);
         tensor_expect_layout(l->attn_q_norm, DS4_TENSOR_F32,
                              1, DS4_N_HEAD_DIM, 0, 0);
         tensor_expect_layout(l->attn_k_norm, DS4_TENSOR_F32,
                              1, DS4_N_HEAD_DIM, 0, 0);
-        tensor_expect_layout(l->attn_output, DS4_TENSOR_F16,
+        tensor_expect_layout(l->attn_output, attn_type,
                              2, q_dim, DS4_N_EMBD, 0);
         tensor_expect_layout(l->ffn_norm, DS4_TENSOR_F32,
                              1, DS4_N_EMBD, 0, 0);
 
         if (il < DS4_N_LEADING_DENSE) {
-            tensor_expect_layout(l->ffn_gate, DS4_TENSOR_Q4_K,
+            tensor_expect_layout(l->ffn_gate,
+                                 signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q4_K,
                                  2, DS4_N_EMBD, DS4_N_FF_DENSE, 0);
-            tensor_expect_layout(l->ffn_up, DS4_TENSOR_Q4_K,
+            tensor_expect_layout(l->ffn_up,
+                                 signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q4_K,
                                  2, DS4_N_EMBD, DS4_N_FF_DENSE, 0);
-            tensor_expect_layout(l->ffn_down, DS4_TENSOR_Q6_K,
+            tensor_expect_layout(l->ffn_down,
+                                 signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q6_K,
                                  2, DS4_N_FF_DENSE, DS4_N_EMBD, 0);
             continue;
         }
@@ -5197,7 +5224,7 @@ static void weights_validate_laguna_layout(
         tensor_expect_layout(l->ffn_up_exps, DS4_TENSOR_Q4_K,
                              3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
         if (l->ffn_down_exps->type != DS4_TENSOR_Q4_K &&
-            l->ffn_down_exps->type != DS4_TENSOR_Q6_K) {
+            (signal_q8 || l->ffn_down_exps->type != DS4_TENSOR_Q6_K)) {
             fprintf(stderr,
                     "ds4: Laguna routed down tensor for layer %u has unsupported type %s\n",
                     il, tensor_type_name(l->ffn_down_exps->type));
@@ -5205,18 +5232,23 @@ static void weights_validate_laguna_layout(
         }
         tensor_expect_layout(l->ffn_down_exps, l->ffn_down_exps->type,
                              3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
-        tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_Q4_K,
+        tensor_expect_layout(l->ffn_gate_shexp,
+                             signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q4_K,
                              2, DS4_N_EMBD, DS4_N_FF_SHARED, 0);
-        tensor_expect_layout(l->ffn_up_shexp, DS4_TENSOR_Q4_K,
+        tensor_expect_layout(l->ffn_up_shexp,
+                             signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q4_K,
                              2, DS4_N_EMBD, DS4_N_FF_SHARED, 0);
-        if (l->ffn_down_shexp->type != DS4_TENSOR_Q4_K &&
-            l->ffn_down_shexp->type != DS4_TENSOR_Q6_K) {
+        const uint32_t shared_down_type =
+            signal_q8 ? DS4_TENSOR_Q8_0 : l->ffn_down_shexp->type;
+        if (!signal_q8 &&
+            shared_down_type != DS4_TENSOR_Q4_K &&
+            shared_down_type != DS4_TENSOR_Q6_K) {
             fprintf(stderr,
                     "ds4: Laguna shared down tensor for layer %u has unsupported type %s\n",
-                    il, tensor_type_name(l->ffn_down_shexp->type));
+                    il, tensor_type_name(shared_down_type));
             exit(1);
         }
-        tensor_expect_layout(l->ffn_down_shexp, l->ffn_down_shexp->type,
+        tensor_expect_layout(l->ffn_down_shexp, shared_down_type,
                              2, DS4_N_FF_SHARED, DS4_N_EMBD, 0);
     }
 }
@@ -49204,13 +49236,23 @@ fail:
     return false;
 }
 
-static bool laguna_graph_matmul_quant(
+static bool laguna_graph_matmul(
         ds4_gpu_tensor       *out,
         const ds4_model      *model,
         const ds4_tensor     *weight,
         const ds4_gpu_tensor *x,
         uint64_t              n_tokens) {
     if (!out || !model || !weight || !x || weight->ndim < 2) return false;
+    if (weight->type == DS4_TENSOR_F16) {
+        return ds4_gpu_matmul_f16_tensor(out,
+                                         model->map,
+                                         model->size,
+                                         weight->abs_offset,
+                                         weight->dim[0],
+                                         weight->dim[1],
+                                         x,
+                                         n_tokens) != 0;
+    }
     if (weight->type == DS4_TENSOR_Q6_K) {
         return ds4_gpu_matmul_q6_K_tensor(out,
                                           model->map,
@@ -49284,22 +49326,49 @@ static bool laguna_graph_forward_token(
                                              DS4_N_EMBD,
                                              DS4_RMS_EPS) != 0;
         if (ok) {
-            ok = ds4_gpu_laguna_qkvg_f16_tensor(
-                    g->q,
-                    g->k,
-                    g->v,
-                    g->gate,
-                    model->map,
-                    model->size,
-                    l->attn_q->abs_offset,
-                    l->attn_k->abs_offset,
-                    l->attn_v->abs_offset,
-                    l->attn_gate->abs_offset,
-                    DS4_N_EMBD,
-                    q_dim,
-                    DS4_N_HEAD_KV * DS4_N_HEAD_DIM,
-                    n_head,
-                    g->attn_norm) != 0;
+            if (l->attn_q->type == DS4_TENSOR_F16) {
+                ok = ds4_gpu_laguna_qkvg_f16_tensor(
+                        g->q,
+                        g->k,
+                        g->v,
+                        g->gate,
+                        model->map,
+                        model->size,
+                        l->attn_q->abs_offset,
+                        l->attn_k->abs_offset,
+                        l->attn_v->abs_offset,
+                        l->attn_gate->abs_offset,
+                        DS4_N_EMBD,
+                        q_dim,
+                        DS4_N_HEAD_KV * DS4_N_HEAD_DIM,
+                        n_head,
+                        g->attn_norm) != 0;
+            } else {
+                ok = ds4_gpu_matmul_q8_0_pair_tensor(
+                        g->q,
+                        g->k,
+                        model->map,
+                        model->size,
+                        l->attn_q->abs_offset,
+                        l->attn_k->abs_offset,
+                        DS4_N_EMBD,
+                        q_dim,
+                        DS4_N_HEAD_KV * DS4_N_HEAD_DIM,
+                        g->attn_norm,
+                        1) != 0 &&
+                     ds4_gpu_matmul_q8_0_pair_tensor(
+                        g->v,
+                        g->gate,
+                        model->map,
+                        model->size,
+                        l->attn_v->abs_offset,
+                        l->attn_gate->abs_offset,
+                        DS4_N_EMBD,
+                        DS4_N_HEAD_KV * DS4_N_HEAD_DIM,
+                        n_head,
+                        g->attn_norm,
+                        1) != 0;
+            }
         }
         if (ok) {
             ok = ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
@@ -49346,15 +49415,27 @@ static bool laguna_graph_forward_token(
                     1.0f / sqrtf((float)DS4_N_HEAD_DIM)) != 0;
         }
         if (ok) {
-            ok = ds4_gpu_laguna_attn_output_residual_f16_tensor(
-                    g->after_attn,
-                    model->map,
-                    model->size,
-                    l->attn_output->abs_offset,
-                    q_dim,
-                    DS4_N_EMBD,
-                    g->heads,
-                    g->cur) != 0;
+            if (l->attn_output->type == DS4_TENSOR_F16) {
+                ok = ds4_gpu_laguna_attn_output_residual_f16_tensor(
+                        g->after_attn,
+                        model->map,
+                        model->size,
+                        l->attn_output->abs_offset,
+                        q_dim,
+                        DS4_N_EMBD,
+                        g->heads,
+                        g->cur) != 0;
+            } else {
+                ok = laguna_graph_matmul(g->attn_out,
+                                         model,
+                                         l->attn_output,
+                                         g->heads,
+                                         1) &&
+                     ds4_gpu_add_tensor(g->after_attn,
+                                        g->cur,
+                                        g->attn_out,
+                                        DS4_N_EMBD) != 0;
+            }
         }
         if (ok) {
             ok = ds4_gpu_rms_norm_weight_tensor(g->ffn_norm,
@@ -49367,16 +49448,16 @@ static bool laguna_graph_forward_token(
         }
 
         if (ok && il < DS4_N_LEADING_DENSE) {
-            ok = laguna_graph_matmul_quant(g->ffn_gate,
-                                           model,
-                                           l->ffn_gate,
-                                           g->ffn_norm,
-                                           1) &&
-                 laguna_graph_matmul_quant(g->ffn_up,
-                                           model,
-                                           l->ffn_up,
-                                           g->ffn_norm,
-                                           1);
+            ok = laguna_graph_matmul(g->ffn_gate,
+                                     model,
+                                     l->ffn_gate,
+                                     g->ffn_norm,
+                                     1) &&
+                 laguna_graph_matmul(g->ffn_up,
+                                     model,
+                                     l->ffn_up,
+                                     g->ffn_norm,
+                                     1);
             if (ok) {
                 ok = ds4_gpu_swiglu_tensor(g->ffn_mid,
                                             g->ffn_gate,
@@ -49386,11 +49467,11 @@ static bool laguna_graph_forward_token(
                                             1.0f) != 0;
             }
             if (ok) {
-                ok = laguna_graph_matmul_quant(g->ffn_out,
-                                               model,
-                                               l->ffn_down,
-                                               g->ffn_mid,
-                                               1);
+                ok = laguna_graph_matmul(g->ffn_out,
+                                         model,
+                                         l->ffn_down,
+                                         g->ffn_mid,
+                                         1);
             }
             if (ok) {
                 ok = ds4_gpu_add_tensor(g->next,
@@ -49470,7 +49551,10 @@ static bool laguna_graph_forward_token(
                     l->ffn_down_shexp->dim[1] * shared_down_row_bytes,
                 .down_row_bytes = shared_down_row_bytes,
             };
-            if (ok) {
+            /* The legacy recipe can co-dispatch routed and shared Q4 work.
+             * The replacement keeps routed experts Q4 but makes the shared
+             * expert Q8, so each uses its native fast kernel family. */
+            if (ok && l->ffn_gate_shexp->type == DS4_TENSOR_Q4_K) {
                 ok = ds4_gpu_laguna_routed_shared_moe_one_tensor(
                         g->ffn_out,
                         g->routed_mid,
@@ -49490,6 +49574,53 @@ static bool laguna_graph_forward_token(
                         g->shared_selected,
                         g->shared_weight,
                         g->ffn_norm) != 0;
+            } else if (ok) {
+                ok = ds4_gpu_glm_routed_moe_one_tensor(
+                        g->ffn_out,
+                        g->routed_mid,
+                        model->map,
+                        model->size,
+                        l->ffn_gate_exps->abs_offset,
+                        l->ffn_up_exps->abs_offset,
+                        l->ffn_down_exps->abs_offset,
+                        l->ffn_gate_exps->type,
+                        l->ffn_up_exps->type,
+                        l->ffn_down_exps->type,
+                        gate_expert_bytes,
+                        gate_row_bytes,
+                        up_expert_bytes,
+                        up_row_bytes,
+                        down_expert_bytes,
+                        down_row_bytes,
+                        DS4_N_EMBD,
+                        DS4_N_FF_EXP,
+                        DS4_N_EMBD,
+                        g->router_selected,
+                        g->router_weights,
+                        DS4_N_EXPERT,
+                        DS4_N_EXPERT_USED,
+                        il,
+                        g->ffn_norm,
+                        true) != 0;
+                if (ok) {
+                    ok = ds4_gpu_shared_mid_swiglu_q8_0_tensor(
+                            g->ffn_mid,
+                            model->map,
+                            model->size,
+                            l->ffn_gate_shexp->abs_offset,
+                            l->ffn_up_shexp->abs_offset,
+                            DS4_N_EMBD,
+                            DS4_N_FF_SHARED,
+                            g->ffn_norm,
+                            0.0f) != 0;
+                }
+                if (ok) {
+                    ok = laguna_graph_matmul(g->shared_out,
+                                             model,
+                                             l->ffn_down_shexp,
+                                             g->ffn_mid,
+                                             1);
+                }
             }
             if (ok) {
                 ok = ds4_gpu_add3_tensor(g->next,
@@ -49516,11 +49647,11 @@ static bool laguna_graph_forward_token(
                                              DS4_N_EMBD,
                                              DS4_RMS_EPS) != 0;
         if (ok) {
-            ok = laguna_graph_matmul_quant(g->logits,
-                                           model,
-                                           weights->output,
-                                           g->output_norm,
-                                           1);
+            ok = laguna_graph_matmul(g->logits,
+                                     model,
+                                     weights->output,
+                                     g->output_norm,
+                                     1);
         }
     }
     if (ds4_gpu_commands_active() && ds4_gpu_end_commands() == 0) ok = false;
@@ -49624,7 +49755,6 @@ static bool laguna_graph_forward_batch(
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &weights->layer[il];
         const uint32_t n_head = ds4_layer_head_count(il);
-        const uint32_t q_dim = n_head * DS4_N_HEAD_DIM;
         const bool is_swa = ds4_laguna_layer_is_swa(il);
         const uint32_t n_rot = is_swa ? DS4_N_ROT_SWA : DS4_N_ROT;
         const float freq_base = is_swa ?
@@ -49650,46 +49780,32 @@ static bool laguna_graph_forward_batch(
                 DS4_RMS_EPS) != 0;
         if (ok) {
             failed_stage = "Q projection";
-            ok = ds4_gpu_matmul_f16_tensor(g->q,
-                                            model->map,
-                                            model->size,
-                                            l->attn_q->abs_offset,
-                                            DS4_N_EMBD,
-                                            q_dim,
-                                            g->attn_norm,
-                                            n_tokens) != 0;
+            ok = laguna_graph_matmul(g->q,
+                                     model,
+                                     l->attn_q,
+                                     g->attn_norm,
+                                     n_tokens);
         }
         if (ok) {
             failed_stage = "K/V projection";
-            ok = ds4_gpu_matmul_f16_tensor(
-                    g->k,
-                    model->map,
-                    model->size,
-                    l->attn_k->abs_offset,
-                    DS4_N_EMBD,
-                    DS4_N_HEAD_KV * DS4_N_HEAD_DIM,
-                    g->attn_norm,
-                    n_tokens) != 0 &&
-                 ds4_gpu_matmul_f16_tensor(
-                    g->v,
-                    model->map,
-                    model->size,
-                    l->attn_v->abs_offset,
-                    DS4_N_EMBD,
-                    DS4_N_HEAD_KV * DS4_N_HEAD_DIM,
-                    g->attn_norm,
-                    n_tokens) != 0;
+            ok = laguna_graph_matmul(g->k,
+                                     model,
+                                     l->attn_k,
+                                     g->attn_norm,
+                                     n_tokens) &&
+                 laguna_graph_matmul(g->v,
+                                     model,
+                                     l->attn_v,
+                                     g->attn_norm,
+                                     n_tokens);
         }
         if (ok) {
             failed_stage = "attention gate projection";
-            ok = ds4_gpu_matmul_f16_tensor(g->gate,
-                                            model->map,
-                                            model->size,
-                                            l->attn_gate->abs_offset,
-                                            DS4_N_EMBD,
-                                            n_head,
-                                            g->attn_norm,
-                                            n_tokens) != 0;
+            ok = laguna_graph_matmul(g->gate,
+                                     model,
+                                     l->attn_gate,
+                                     g->attn_norm,
+                                     n_tokens);
         }
         if (ok) {
             failed_stage = "Q norm/RoPE";
@@ -49755,14 +49871,11 @@ static bool laguna_graph_forward_batch(
         }
         if (ok) {
             failed_stage = "attention output projection";
-            ok = ds4_gpu_matmul_f16_tensor(g->attn_out,
-                                            model->map,
-                                            model->size,
-                                            l->attn_output->abs_offset,
-                                            q_dim,
-                                            DS4_N_EMBD,
-                                            g->heads,
-                                            n_tokens) != 0;
+            ok = laguna_graph_matmul(g->attn_out,
+                                     model,
+                                     l->attn_output,
+                                     g->heads,
+                                     n_tokens);
         }
         if (ok) {
             failed_stage = "attention residual";
@@ -49786,16 +49899,16 @@ static bool laguna_graph_forward_batch(
 
         if (ok && il < DS4_N_LEADING_DENSE) {
             failed_stage = "dense FFN gate/up";
-            ok = laguna_graph_matmul_quant(g->ffn_gate,
-                                           model,
-                                           l->ffn_gate,
-                                           g->ffn_norm,
-                                           n_tokens) &&
-                 laguna_graph_matmul_quant(g->ffn_up,
-                                           model,
-                                           l->ffn_up,
-                                           g->ffn_norm,
-                                           n_tokens);
+            ok = laguna_graph_matmul(g->ffn_gate,
+                                     model,
+                                     l->ffn_gate,
+                                     g->ffn_norm,
+                                     n_tokens) &&
+                 laguna_graph_matmul(g->ffn_up,
+                                     model,
+                                     l->ffn_up,
+                                     g->ffn_norm,
+                                     n_tokens);
             if (ok) {
                 failed_stage = "dense FFN SwiGLU";
                 ok = ds4_gpu_swiglu_tensor(
@@ -49808,11 +49921,11 @@ static bool laguna_graph_forward_batch(
             }
             if (ok) {
                 failed_stage = "dense FFN down";
-                ok = laguna_graph_matmul_quant(g->ffn_out,
-                                               model,
-                                               l->ffn_down,
-                                               g->ffn_mid,
-                                               n_tokens);
+                ok = laguna_graph_matmul(g->ffn_out,
+                                         model,
+                                         l->ffn_down,
+                                         g->ffn_mid,
+                                         n_tokens);
             }
             if (ok) {
                 failed_stage = "dense FFN residual";
@@ -49893,16 +50006,16 @@ static bool laguna_graph_forward_batch(
             }
             if (ok) {
                 failed_stage = "shared expert gate/up";
-                ok = laguna_graph_matmul_quant(g->ffn_gate,
-                                               model,
-                                               l->ffn_gate_shexp,
-                                               g->ffn_norm,
-                                               n_tokens) &&
-                     laguna_graph_matmul_quant(g->ffn_up,
-                                               model,
-                                               l->ffn_up_shexp,
-                                               g->ffn_norm,
-                                               n_tokens);
+                ok = laguna_graph_matmul(g->ffn_gate,
+                                         model,
+                                         l->ffn_gate_shexp,
+                                         g->ffn_norm,
+                                         n_tokens) &&
+                     laguna_graph_matmul(g->ffn_up,
+                                         model,
+                                         l->ffn_up_shexp,
+                                         g->ffn_norm,
+                                         n_tokens);
             }
             if (ok) {
                 failed_stage = "shared expert SwiGLU";
@@ -49916,11 +50029,11 @@ static bool laguna_graph_forward_batch(
             }
             if (ok) {
                 failed_stage = "shared expert down";
-                ok = laguna_graph_matmul_quant(g->shared_out,
-                                               model,
-                                               l->ffn_down_shexp,
-                                               g->ffn_mid,
-                                               n_tokens);
+                ok = laguna_graph_matmul(g->shared_out,
+                                         model,
+                                         l->ffn_down_shexp,
+                                         g->ffn_mid,
+                                         n_tokens);
             }
             if (ok) {
                 failed_stage = "MoE residual";
@@ -49987,11 +50100,11 @@ static bool laguna_graph_forward_batch(
                     DS4_RMS_EPS) != 0;
         }
         if (ok) {
-            ok = laguna_graph_matmul_quant(g->logits,
-                                           model,
-                                           weights->output,
-                                           g->output_norm,
-                                           1);
+            ok = laguna_graph_matmul(g->logits,
+                                     model,
+                                     weights->output,
+                                     g->output_norm,
+                                     1);
         }
     }
     if (ds4_gpu_commands_active() && ds4_gpu_end_commands() == 0) ok = false;
