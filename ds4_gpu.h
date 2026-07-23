@@ -161,6 +161,7 @@ int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t contex
 void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_set_tensor_matmul_suppressed(bool suppressed);
 void ds4_gpu_set_glm_model(bool enabled);
+void ds4_gpu_set_laguna_revised_q8(bool enabled);
 void ds4_gpu_set_ssd_streaming(bool enabled);
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
 #ifdef __APPLE__

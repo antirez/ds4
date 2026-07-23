@@ -59942,6 +59942,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
         ds4_gpu_set_quality(e->quality);
         ds4_gpu_set_glm_model(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA);
+        ds4_gpu_set_laguna_revised_q8(
+                DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA &&
+                e->weights.token_embd &&
+                e->weights.token_embd->type == DS4_TENSOR_Q8_0);
         ds4_gpu_set_ssd_streaming(e->ssd_streaming);
         if (!ds4_engine_configure_streaming_auto_cache(e)) {
             ds4_engine_close(e);

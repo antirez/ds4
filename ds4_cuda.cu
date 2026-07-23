@@ -150,6 +150,7 @@ static int g_cuda_exact_score_split_fuse_inv_rope;
 static int g_cuda_moe_decode_graph;
 static int g_current_logical_tier = -1;
 static int g_ssd_streaming_mode;
+static int g_laguna_revised_q8;
 
 typedef struct {
     int valid;
@@ -1577,6 +1578,16 @@ static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_
     if (getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL) return 0;
     if (cuda_q8_f16_cache_limit_bytes() == 0) return 0;
     if (getenv("DS4_CUDA_Q8_F16_ALL") != NULL) return 1;
+    /* The revised Laguna checkpoint moved every signal projection from F16
+     * or K-quant to Q8_0.  Requantizing each F32 activation to Q8_0 again is
+     * not numerically equivalent to Metal's Q8-weight/F32-activation kernels:
+     * across 48 layers the extra error is large enough to corrupt generation.
+     * Expanding those Q8 weights to F16 lets cuBLAS convert each activation
+     * once to F16 instead of requantizing it blockwise to Q8_0 during batched
+     * prefill. Decode keeps the bandwidth-efficient native Q8 path; an
+     * accurate prefill state is sufficient to prevent catastrophic
+     * divergence. */
+    if (g_laguna_revised_q8) return 1;
     if (!label) return 0;
     if (strstr(label, "attn_output_a") != NULL ||
         strstr(label, "attn_output_b") != NULL ||
@@ -14612,8 +14623,12 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
              * operation through the native Q8 kernels below. */
         }
     }
-    if (g_q8_dequant_gemm_enabled && g_cublas_ready &&
-        n_tok >= 128u && blocks > 32u && (in_dim & 31u) == 0u) {
+    const int laguna_accurate_prefill =
+        g_laguna_revised_q8 && n_tok > 1u;
+    if (g_cublas_ready &&
+        ((g_q8_dequant_gemm_enabled && n_tok >= 128u) ||
+         laguna_accurate_prefill) &&
+        blocks > 32u && (in_dim & 31u) == 0u) {
         /* Streaming dequant + f16 GEMM: the exact-q8 batched kernels only
          * cover blocks <= 32 (DS4 TP shard widths); the per-token fallback
          * re-reads the full weight per token (~30x the bytes at GLM dims).
@@ -29232,6 +29247,9 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         uint32_t                mid_token_stride,
         bool                    force_resident) {
     (void)layer_index; (void)n_total_expert; (void)force_resident;
+    /* Laguna's legacy recipe uses Q4/Q4/Q6 routed experts; the revised
+     * recipe is Q4 throughout.  Keep both on the same model-specific path so
+     * the graph's generic MoE dispatch does not lose the sorted Q4 kernels. */
     if (gate_type == 12u && up_type == 12u &&
         (down_type == 12u || down_type == 14u)) {
         const ds4_gpu_laguna_moe_desc desc = {
@@ -30966,6 +30984,10 @@ extern "C" int ds4_gpu_preload_q4_expert_tables(
 
 extern "C" void ds4_gpu_set_glm_model(bool enabled) {
     (void)enabled;
+}
+
+extern "C" void ds4_gpu_set_laguna_revised_q8(bool enabled) {
+    g_laguna_revised_q8 = enabled ? 1 : 0;
 }
 
 extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {

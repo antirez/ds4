@@ -40,31 +40,31 @@ index 81d4881..debc1e9 100644
 -	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 +	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_laguna_smoke
 diff --git a/README.md b/README.md
-index f9f9409..5a9738c 100644
+index 7d9e5c7..78ce765 100644
 --- a/README.md
 +++ b/README.md
-@@ -174,11 +174,11 @@ GLM inference uses the Metal, CUDA, or ROCm graph backend. Directional steering,
- file are not supported for GLM yet.
- 
+@@ -176,11 +176,11 @@ file are not supported for GLM yet.
  Laguna S 2.1 support targets Poolside's official imatrix-quantized Q4_K_M GGUF.
--It currently requires Metal and full model residency; SSD streaming,
--distributed inference, CUDA, ROCm, and the DFlash draft model are rejected
--explicitly. The 70.01 GiB model fits comfortably on a 96 or 128 GiB Mac. CLI,
--agent, and server use Laguna's native chat, interleaved reasoning, and tagged
--tool-call formats:
-+It supports Metal or CUDA with full model residency; SSD streaming,
-+distributed inference, ROCm, and the DFlash draft model are rejected
-+explicitly. The 70.01 GiB model requires at least 96 GiB of unified or device
-+memory. CLI, agent, and server use Laguna's native chat, interleaved reasoning,
-+and tagged tool-call formats:
+ The current 63.56 GiB recipe uses Q4_K routed experts and Q8_0 signal-path
+ weights. DwarfStar also accepts Poolside's earlier 70.01 GiB recipe with F16
+-attention and mixed Q4_K/Q6_K experts. Laguna currently requires Metal and full
+-model residency; SSD streaming, distributed inference, CUDA, ROCm, and the
+-DFlash draft model are rejected explicitly. Both files fit comfortably on a
+-96 or 128 GiB Mac. CLI, agent, and server use Laguna's native chat, interleaved
+-reasoning, and tagged tool-call formats:
++attention and mixed Q4_K/Q6_K experts. Both layouts support Metal or CUDA with
++full model residency; SSD streaming, distributed inference, ROCm, and the
++DFlash draft model are rejected explicitly. They require at least 96 GiB of
++unified or device memory. CLI, agent, and server use Laguna's native chat,
++interleaved reasoning, and tagged tool-call formats:
  
  ```sh
  ./download_model.sh laguna-q4
 diff --git a/ds4.c b/ds4.c
-index 07846bb..4bab1b7 100644
+index 39b39be..aea9aae 100644
 --- a/ds4.c
 +++ b/ds4.c
-@@ -47382,7 +47382,7 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
+@@ -47414,7 +47414,7 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
      }
  
      fprintf(stderr,
@@ -73,7 +73,7 @@ index 07846bb..4bab1b7 100644
              ctx_size,
              g->prefill_cap,
              (double)g->kv_bytes / 1073741824.0,
-@@ -47390,7 +47390,7 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
+@@ -47422,7 +47422,7 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
      return true;
  
  fail:
@@ -82,7 +82,7 @@ index 07846bb..4bab1b7 100644
      laguna_graph_free(g);
      return false;
  }
-@@ -48206,7 +48206,7 @@ static bool laguna_graph_forward_batch(
+@@ -48319,7 +48319,7 @@ static bool laguna_graph_forward_batch(
      return ok;
  }
  
@@ -91,7 +91,7 @@ index 07846bb..4bab1b7 100644
          const ds4_model   *model,
          const ds4_vocab   *vocab,
          const ds4_weights *weights,
-@@ -48346,17 +48346,17 @@ static int generate_metal_graph_raw_swa(
+@@ -48459,17 +48459,17 @@ static int generate_metal_graph_raw_swa(
                                           progress_ud);
      }
      if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
@@ -120,7 +120,7 @@ index 07846bb..4bab1b7 100644
      }
  
      const uint32_t prefill_cap =
-@@ -57367,9 +57367,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
+@@ -57480,9 +57480,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
              *out = e;
              return 0;
          }
@@ -133,7 +133,7 @@ index 07846bb..4bab1b7 100644
              ds4_engine_close(e);
              *out = NULL;
              return 1;
-@@ -57399,7 +57400,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
+@@ -57512,7 +57513,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
              (opt->mtp_path && opt->mtp_path[0]) ||
              opt->dspark || opt->glm_mtp || opt->first_token_test) {
              fprintf(stderr,
@@ -142,7 +142,18 @@ index 07846bb..4bab1b7 100644
                      "generation path only (no steering, power cap, custom "
                      "prefill chunk, MTP/DSpark, or first-token diagnostic)\n");
              ds4_engine_close(e);
-@@ -61645,7 +61646,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
+@@ -57867,6 +57868,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
+         }
+         ds4_gpu_set_quality(e->quality);
+         ds4_gpu_set_glm_model(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA);
++        ds4_gpu_set_laguna_revised_q8(
++                DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA &&
++                e->weights.token_embd &&
++                e->weights.token_embd->type == DS4_TENSOR_Q8_0);
+         ds4_gpu_set_ssd_streaming(e->ssd_streaming);
+         if (!ds4_engine_configure_streaming_auto_cache(e)) {
+             ds4_engine_close(e);
+@@ -61758,7 +61763,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
          }
          if ((uint32_t)s->checkpoint.len >= s->laguna_graph.ctx_size) {
              if (errlen) snprintf(err, errlen,
@@ -152,7 +163,7 @@ index 07846bb..4bab1b7 100644
              return 1;
          }
 diff --git a/ds4_cuda.cu b/ds4_cuda.cu
-index e66fa36..0fe7115 100644
+index e66fa36..1761e50 100644
 --- a/ds4_cuda.cu
 +++ b/ds4_cuda.cu
 @@ -60,6 +60,13 @@ typedef struct {
@@ -193,7 +204,15 @@ index e66fa36..0fe7115 100644
  #include "ds4_gpu_mgpu.h"
  #include "ds4_iq2_tables_cuda.inc"
  
-@@ -225,6 +249,24 @@ static int cuda_q4_mma_ok(void) {
+@@ -122,6 +146,7 @@ static int g_cuda_exact_score_split_fuse_inv_rope;
+ static int g_cuda_moe_decode_graph;
+ static int g_current_logical_tier = -1;
+ static int g_ssd_streaming_mode;
++static int g_laguna_revised_q8;
+ 
+ typedef struct {
+     int valid;
+@@ -225,6 +250,24 @@ static int cuda_q4_mma_ok(void) {
      return cached;
  }
  
@@ -218,7 +237,39 @@ index e66fa36..0fe7115 100644
  
  
  
-@@ -16387,6 +16429,58 @@ __device__ static void dev_q4_K_get_scale_min(
+@@ -998,6 +1041,16 @@ static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_
+     if (getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL) return 0;
+     if (cuda_q8_f16_cache_limit_bytes() == 0) return 0;
+     if (getenv("DS4_CUDA_Q8_F16_ALL") != NULL) return 1;
++    /* The revised Laguna checkpoint moved every signal projection from F16
++     * or K-quant to Q8_0.  Requantizing each F32 activation to Q8_0 again is
++     * not numerically equivalent to Metal's Q8-weight/F32-activation kernels:
++     * across 48 layers the extra error is large enough to corrupt generation.
++     * Expanding those Q8 weights to F16 lets cuBLAS convert each activation
++     * once to F16 instead of requantizing it blockwise to Q8_0 during batched
++     * prefill. Decode keeps the bandwidth-efficient native Q8 path; an
++     * accurate prefill state is sufficient to prevent catastrophic
++     * divergence. */
++    if (g_laguna_revised_q8) return 1;
+     if (!label) return 0;
+     if (strstr(label, "attn_output_a") != NULL ||
+         strstr(label, "attn_output_b") != NULL ||
+@@ -12159,8 +12212,12 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
+              * operation through the native Q8 kernels below. */
+         }
+     }
+-    if (g_q8_dequant_gemm_enabled && g_cublas_ready &&
+-        n_tok >= 128u && blocks > 32u && (in_dim & 31u) == 0u) {
++    const int laguna_accurate_prefill =
++        g_laguna_revised_q8 && n_tok > 1u;
++    if (g_cublas_ready &&
++        ((g_q8_dequant_gemm_enabled && n_tok >= 128u) ||
++         laguna_accurate_prefill) &&
++        blocks > 32u && (in_dim & 31u) == 0u) {
+         /* Streaming dequant + f16 GEMM: the exact-q8 batched kernels only
+          * cover blocks <= 32 (DS4 TP shard widths); the per-token fallback
+          * re-reads the full weight per token (~30x the bytes at GLM dims).
+@@ -16387,6 +16444,58 @@ __device__ static void dev_q4_K_get_scale_min(
      }
  }
  
@@ -277,7 +328,7 @@ index e66fa36..0fe7115 100644
  __device__ __forceinline__ static int32_t dev_dot_q4_32(const uint8_t *qs, const int8_t *q8, int shift) {
      int32_t sum = 0;
      #pragma unroll
-@@ -16414,6 +16508,17 @@ __device__ static float dev_dot_q4_K_q8_K_block(const cuda_block_q4_K *x, const
+@@ -16414,6 +16523,17 @@ __device__ static float dev_dot_q4_K_q8_K_block(const cuda_block_q4_K *x, const
      return y->d * xd * (float)isum - y->d * xmin * (float)summs;
  }
  
@@ -295,7 +346,7 @@ index e66fa36..0fe7115 100644
  /* Vector-load variant of dev_dot_q4_K_q8_K_block: loads the whole 144-byte
   * Q4_K block with nine 16B loads (requires a 16B-aligned tensor base; block
   * stride 144 and row strides are 16B multiples), then computes the exact same
-@@ -23237,6 +23342,17 @@ __global__ static void glm_embed_token_q8_0_kernel(
+@@ -23237,6 +23357,17 @@ __global__ static void glm_embed_token_q8_0_kernel(
      out[d] = scale * (float)((const int8_t *)(blk + 2))[d & 31u];
  }
  
@@ -313,7 +364,7 @@ index e66fa36..0fe7115 100644
  extern "C" int ds4_gpu_embed_token_quant_tensor(
          ds4_gpu_tensor *out,
          const void       *model_map,
-@@ -23250,12 +23366,15 @@ extern "C" int ds4_gpu_embed_token_quant_tensor(
+@@ -23250,12 +23381,15 @@ extern "C" int ds4_gpu_embed_token_quant_tensor(
          token >= n_vocab) {
          return 0;
      }
@@ -331,7 +382,7 @@ index e66fa36..0fe7115 100644
      if (weight_offset > model_size ||
          (uint64_t)n_vocab * row_bytes > model_size - weight_offset ||
          out->bytes < (uint64_t)n_embd * sizeof(float)) {
-@@ -23266,6 +23385,14 @@ extern "C" int ds4_gpu_embed_token_quant_tensor(
+@@ -23266,6 +23400,14 @@ extern "C" int ds4_gpu_embed_token_quant_tensor(
              model_map, weight_offset, (uint64_t)n_vocab * row_bytes,
              logical_tier, "glm_token_embd");
      if (!w) return 0;
@@ -346,7 +397,7 @@ index e66fa36..0fe7115 100644
      glm_embed_token_q8_0_kernel<<<(n_embd + 255) / 256, 256>>>(
              (float *)out->ptr, w, token, n_embd);
      return cuda_ok(cudaGetLastError(), "glm embed token launch");
-@@ -23289,6 +23416,22 @@ __global__ static void glm_embed_tokens_q8_0_kernel(
+@@ -23289,6 +23431,22 @@ __global__ static void glm_embed_tokens_q8_0_kernel(
      out[gid] = scale * (float)((const int8_t *)(blk + 2))[d & 31u];
  }
  
@@ -369,7 +420,7 @@ index e66fa36..0fe7115 100644
  extern "C" int ds4_gpu_embed_tokens_quant_tensor(
          ds4_gpu_tensor       *out,
          const ds4_gpu_tensor *tokens,
-@@ -23303,12 +23446,15 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
+@@ -23303,12 +23461,15 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
          (n_embd & 31u) != 0u) {
          return 0;
      }
@@ -387,7 +438,7 @@ index e66fa36..0fe7115 100644
      if (weight_offset > model_size ||
          (uint64_t)n_vocab * row_bytes > model_size - weight_offset ||
          out->bytes < (uint64_t)n_tokens * n_embd * sizeof(float) ||
-@@ -23321,10 +23467,20 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
+@@ -23321,10 +23482,20 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
              logical_tier, "glm_token_embd");
      if (!w) return 0;
      uint64_t n = (uint64_t)n_tokens * n_embd;
@@ -411,7 +462,7 @@ index e66fa36..0fe7115 100644
      return cuda_ok(cudaGetLastError(), "glm embed tokens launch");
  }
  
-@@ -25895,6 +26051,22 @@ static int glm_routed_moe_finish_batch(
+@@ -25895,6 +26066,22 @@ static int glm_routed_moe_finish_batch(
                     "glm routed moe local output copy");
  }
  
@@ -434,7 +485,7 @@ index e66fa36..0fe7115 100644
  extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
          ds4_gpu_tensor       *out,
          ds4_gpu_tensor       *mid,
-@@ -25922,8 +26094,32 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
+@@ -25922,8 +26109,35 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
          uint32_t                layer_index,
          const ds4_gpu_tensor *x,
          uint32_t                n_tokens,
@@ -443,6 +494,9 @@ index e66fa36..0fe7115 100644
 +        uint32_t                mid_token_stride,
 +        bool                    force_resident) {
 +    (void)layer_index; (void)n_total_expert; (void)force_resident;
++    /* Laguna's legacy recipe uses Q4/Q4/Q6 routed experts; the revised
++     * recipe is Q4 throughout.  Keep both on the same model-specific path so
++     * the graph's generic MoE dispatch does not lose the sorted Q4 kernels. */
 +    if (gate_type == 12u && up_type == 12u &&
 +        (down_type == 12u || down_type == 14u)) {
 +        const ds4_gpu_laguna_moe_desc desc = {
@@ -469,7 +523,7 @@ index e66fa36..0fe7115 100644
      if (!out || !mid || !x || !selected || !weights || !model_map ||
          n_tokens == 0 || n_expert == 0 ||
          (expert_in_dim & 255u) != 0u || (expert_mid_dim & 255u) != 0u) {
-@@ -26285,7 +26481,7 @@ extern "C" int ds4_gpu_glm_routed_moe_one_tensor(
+@@ -26285,7 +26499,7 @@ extern "C" int ds4_gpu_glm_routed_moe_one_tensor(
              down_expert_bytes, down_row_bytes,
              expert_in_dim, expert_mid_dim, out_dim,
              selected, weights, n_total_expert, n_expert, layer_index,
@@ -478,7 +532,7 @@ index e66fa36..0fe7115 100644
  }
  
  /* Parallel router select: 256 threads compute sigmoid probs, then top-k
-@@ -26862,6 +27058,263 @@ extern "C" int ds4_gpu_glm_value_project_typed_batch_heads_tensor(
+@@ -26862,6 +27076,263 @@ extern "C" int ds4_gpu_glm_value_project_typed_batch_heads_tensor(
      return cuda_ok(cudaGetLastError(), "glm value project launch");
  }
  
@@ -742,7 +796,7 @@ index e66fa36..0fe7115 100644
  /* Decode-time (n_tok small) quant matvec. The Metal "mpp/model-view"
   * variant is a bandwidth-tuned matvec; on CUDA the generic quant matmul
   * already dispatches per type, so delegate. Revisit in the perf pass. */
-@@ -26918,6 +27371,11 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
+@@ -26918,6 +27389,11 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
          return ds4_gpu_matmul_f16_tensor(out, model_map, model_size,
                                           weight_offset, in_dim, out_dim,
                                           x, n_tok);
@@ -754,7 +808,18 @@ index e66fa36..0fe7115 100644
      default:
          fprintf(stderr, "ds4: matmul_quant: unsupported type %u\n",
                  weight_type);
-@@ -27668,69 +28126,1304 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
+@@ -27375,6 +27851,10 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
+     (void)enabled;
+ }
+ 
++extern "C" void ds4_gpu_set_laguna_revised_q8(bool enabled) {
++    g_laguna_revised_q8 = enabled ? 1 : 0;
++}
++
+ extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
+     g_ssd_streaming_mode = enabled ? 1 : 0;
+     cuda_stream_selected_cache_invalidate();
+@@ -27668,69 +28148,1304 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
      return 0;
  }
  
@@ -1017,8 +1082,6 @@ index e66fa36..0fe7115 100644
  
 -extern "C" int ds4_gpu_laguna_head_rms_norm_rope_tensor(
 -        ds4_gpu_tensor *x, const void *model_map, uint64_t model_size,
--        uint64_t weight_offset, uint32_t n_tokens, uint32_t n_head,
--        uint32_t head_dim, uint32_t n_rot, uint32_t pos0,
 +    float acc0 = 0.0f;
 +    float acc1 = 0.0f;
 +    float acc2 = 0.0f;
@@ -2071,8 +2134,8 @@ index e66fa36..0fe7115 100644
 +
 +extern "C" int ds4_gpu_laguna_head_rms_norm_rope_tensor(
 +        ds4_gpu_tensor *x, const void *model_map, uint64_t model_size,
-+        uint64_t weight_offset, uint32_t n_tokens, uint32_t n_head,
-+        uint32_t head_dim, uint32_t n_rot, uint32_t pos0,
+         uint64_t weight_offset, uint32_t n_tokens, uint32_t n_head,
+         uint32_t head_dim, uint32_t n_rot, uint32_t pos0,
          uint32_t n_ctx_orig, float freq_base, float freq_scale,
          float ext_factor, float attn_factor, float beta_fast,
          float beta_slow, float eps) {
@@ -2115,7 +2178,7 @@ index e66fa36..0fe7115 100644
  }
  
  extern "C" int ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
-@@ -27741,13 +29434,16 @@ extern "C" int ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
+@@ -27741,13 +29456,16 @@ extern "C" int ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
          uint32_t pos0, uint32_t n_ctx_orig, float freq_base,
          float freq_scale, float ext_factor, float attn_factor,
          float beta_fast, float beta_slow, float eps) {
@@ -2139,7 +2202,7 @@ index e66fa36..0fe7115 100644
  }
  
  extern "C" int ds4_gpu_laguna_store_attention_tensor(
-@@ -27757,11 +29453,81 @@ extern "C" int ds4_gpu_laguna_store_attention_tensor(
+@@ -27757,11 +29475,81 @@ extern "C" int ds4_gpu_laguna_store_attention_tensor(
          const ds4_gpu_tensor *gate, uint32_t pos, uint32_t cache_cap,
          uint32_t key_start, uint32_t key_count, uint32_t n_head,
          uint32_t n_head_kv, uint32_t head_dim, float scale) {
@@ -2226,7 +2289,7 @@ index e66fa36..0fe7115 100644
  }
  
  extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
-@@ -27772,10 +29538,92 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
+@@ -27772,10 +29560,92 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
          const ds4_gpu_tensor *gate, uint32_t pos0, uint32_t n_tokens,
          uint32_t cache_cap, uint32_t n_head, uint32_t n_head_kv,
          uint32_t head_dim, float scale) {
@@ -2324,6 +2387,49 @@ index e66fa36..0fe7115 100644
 +    return cuda_ok(cudaGetLastError(), "Laguna commit KV launch");
  }
  #pragma GCC diagnostic pop
+diff --git a/ds4_gpu.h b/ds4_gpu.h
+index 4af4c95..d62bcf3 100644
+--- a/ds4_gpu.h
++++ b/ds4_gpu.h
+@@ -139,6 +139,7 @@ int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t contex
+ void ds4_gpu_set_quality(bool quality);
+ void ds4_gpu_set_tensor_matmul_suppressed(bool suppressed);
+ void ds4_gpu_set_glm_model(bool enabled);
++void ds4_gpu_set_laguna_revised_q8(bool enabled);
+ void ds4_gpu_set_ssd_streaming(bool enabled);
+ void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
+ #ifdef __APPLE__
+diff --git a/ds4_metal.m b/ds4_metal.m
+index 0e154c2..00c7e53 100644
+--- a/ds4_metal.m
++++ b/ds4_metal.m
+@@ -3626,6 +3626,11 @@ void ds4_gpu_set_glm_model(bool enabled) {
+     g_glm_model_mode = enabled ? 1 : 0;
+ }
+ 
++void ds4_gpu_set_laguna_revised_q8(bool enabled) {
++    /* Metal's native Q8 kernels already preserve F32 activations. */
++    (void)enabled;
++}
++
+ void ds4_gpu_set_ssd_streaming(bool enabled) {
+     g_ssd_streaming_mode = enabled ? 1 : 0;
+     ds4_gpu_stream_expert_cache_clear_all(1);
+diff --git a/rocm/ds4_rocm_current_api_compat.cuh b/rocm/ds4_rocm_current_api_compat.cuh
+index e75cc5a..69ab514 100644
+--- a/rocm/ds4_rocm_current_api_compat.cuh
++++ b/rocm/ds4_rocm_current_api_compat.cuh
+@@ -129,6 +129,10 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
+     (void)enabled;
+ }
+ 
++extern "C" void ds4_gpu_set_laguna_revised_q8(bool enabled) {
++    (void)enabled;
++}
++
+ extern "C" void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) {
+     (void)enabled;
+ }
 diff --git a/speed-bench/laguna_s21_gb10.csv b/speed-bench/laguna_s21_gb10.csv
 new file mode 100644
 index 0000000..6643bb9
@@ -2336,10 +2442,10 @@ index 0000000..6643bb9
 +8192,4096,106.95,256,14.56,70.300,255,14.61,0
 diff --git a/tests/cuda_laguna_smoke.c b/tests/cuda_laguna_smoke.c
 new file mode 100644
-index 0000000..2de2b49
+index 0000000..388f967
 --- /dev/null
 +++ b/tests/cuda_laguna_smoke.c
-@@ -0,0 +1,929 @@
+@@ -0,0 +1,951 @@
 +#include "ds4_gpu.h"
 +
 +#include <cuda_runtime_api.h>
@@ -3241,12 +3347,26 @@ index 0000000..2de2b49
 +    shared.gate_offset = blob_alloc(&blob, q4_matrix_bytes);
 +    shared.up_offset = blob_alloc(&blob, q4_matrix_bytes);
 +    shared.down_offset = blob_alloc(&blob, q6_matrix_bytes);
++    ds4_gpu_laguna_moe_desc revised_routed = routed;
++    revised_routed.down_offset =
++        blob_alloc(&blob, 2u * q4_matrix_bytes);
++    revised_routed.down_type = 12u;
++    revised_routed.down_expert_bytes = q4_matrix_bytes;
++    revised_routed.down_row_bytes = sizeof(block_q4_K);
++    ds4_gpu_laguna_moe_desc revised_shared = revised_routed;
++    revised_shared.gate_offset = blob_alloc(&blob, q4_matrix_bytes);
++    revised_shared.up_offset = blob_alloc(&blob, q4_matrix_bytes);
++    revised_shared.down_offset = blob_alloc(&blob, q4_matrix_bytes);
 +    CHECK(routed.gate_offset != UINT64_MAX &&
 +          routed.up_offset != UINT64_MAX &&
 +          routed.down_offset != UINT64_MAX &&
 +          shared.gate_offset != UINT64_MAX &&
 +          shared.up_offset != UINT64_MAX &&
-+          shared.down_offset != UINT64_MAX,
++          shared.down_offset != UINT64_MAX &&
++          revised_routed.down_offset != UINT64_MAX &&
++          revised_shared.gate_offset != UINT64_MAX &&
++          revised_shared.up_offset != UINT64_MAX &&
++          revised_shared.down_offset != UINT64_MAX,
 +          "allocate MoE model ranges");
 +    fill_q4_ones(blob.data + routed.gate_offset,
 +                 2u * dim);
@@ -3257,6 +3377,11 @@ index 0000000..2de2b49
 +    fill_q4_ones(blob.data + shared.gate_offset, dim);
 +    fill_q4_ones(blob.data + shared.up_offset, dim);
 +    fill_q6_ones(blob.data + shared.down_offset, dim);
++    fill_q4_ones(blob.data + revised_routed.down_offset,
++                 2u * dim);
++    fill_q4_ones(blob.data + revised_shared.gate_offset, dim);
++    fill_q4_ones(blob.data + revised_shared.up_offset, dim);
++    fill_q4_ones(blob.data + revised_shared.down_offset, dim);
 +
 +    CHECK(ds4_gpu_set_model_map(blob.data, blob.size), "set synthetic model map");
 +    int rc = check_quant_ops(&blob, q4_offset, q6_offset, embed_offset);
@@ -3264,6 +3389,9 @@ index 0000000..2de2b49
 +    if (rc == 0) rc = check_attention();
 +    if (rc == 0) rc = check_long_decode_attention();
 +    if (rc == 0) rc = check_moe(&blob, &routed, &shared);
++    if (rc == 0) {
++        rc = check_moe(&blob, &revised_routed, &revised_shared);
++    }
 +    ds4_gpu_cleanup();
 +    (void)cudaFreeHost(host);
 +    if (rc == 0) puts("cuda Laguna regression: OK");

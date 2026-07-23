@@ -4281,6 +4281,11 @@ void ds4_gpu_set_glm_model(bool enabled) {
     g_glm_model_mode = enabled ? 1 : 0;
 }
 
+void ds4_gpu_set_laguna_revised_q8(bool enabled) {
+    /* Metal's native Q8 kernels already preserve F32 activations. */
+    (void)enabled;
+}
+
 void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_ssd_streaming_mode = enabled ? 1 : 0;
     ds4_gpu_stream_expert_cache_clear_all(1);

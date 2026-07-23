@@ -899,12 +899,26 @@ int main(void) {
     shared.gate_offset = blob_alloc(&blob, q4_matrix_bytes);
     shared.up_offset = blob_alloc(&blob, q4_matrix_bytes);
     shared.down_offset = blob_alloc(&blob, q6_matrix_bytes);
+    ds4_gpu_laguna_moe_desc revised_routed = routed;
+    revised_routed.down_offset =
+        blob_alloc(&blob, 2u * q4_matrix_bytes);
+    revised_routed.down_type = 12u;
+    revised_routed.down_expert_bytes = q4_matrix_bytes;
+    revised_routed.down_row_bytes = sizeof(block_q4_K);
+    ds4_gpu_laguna_moe_desc revised_shared = revised_routed;
+    revised_shared.gate_offset = blob_alloc(&blob, q4_matrix_bytes);
+    revised_shared.up_offset = blob_alloc(&blob, q4_matrix_bytes);
+    revised_shared.down_offset = blob_alloc(&blob, q4_matrix_bytes);
     CHECK(routed.gate_offset != UINT64_MAX &&
           routed.up_offset != UINT64_MAX &&
           routed.down_offset != UINT64_MAX &&
           shared.gate_offset != UINT64_MAX &&
           shared.up_offset != UINT64_MAX &&
-          shared.down_offset != UINT64_MAX,
+          shared.down_offset != UINT64_MAX &&
+          revised_routed.down_offset != UINT64_MAX &&
+          revised_shared.gate_offset != UINT64_MAX &&
+          revised_shared.up_offset != UINT64_MAX &&
+          revised_shared.down_offset != UINT64_MAX,
           "allocate MoE model ranges");
     fill_q4_ones(blob.data + routed.gate_offset,
                  2u * dim);
@@ -915,6 +929,11 @@ int main(void) {
     fill_q4_ones(blob.data + shared.gate_offset, dim);
     fill_q4_ones(blob.data + shared.up_offset, dim);
     fill_q6_ones(blob.data + shared.down_offset, dim);
+    fill_q4_ones(blob.data + revised_routed.down_offset,
+                 2u * dim);
+    fill_q4_ones(blob.data + revised_shared.gate_offset, dim);
+    fill_q4_ones(blob.data + revised_shared.up_offset, dim);
+    fill_q4_ones(blob.data + revised_shared.down_offset, dim);
 
     CHECK(ds4_gpu_set_model_map(blob.data, blob.size), "set synthetic model map");
     int rc = check_quant_ops(&blob, q4_offset, q6_offset, embed_offset);
@@ -922,6 +941,9 @@ int main(void) {
     if (rc == 0) rc = check_attention();
     if (rc == 0) rc = check_long_decode_attention();
     if (rc == 0) rc = check_moe(&blob, &routed, &shared);
+    if (rc == 0) {
+        rc = check_moe(&blob, &revised_routed, &revised_shared);
+    }
     ds4_gpu_cleanup();
     (void)cudaFreeHost(host);
     if (rc == 0) puts("cuda Laguna regression: OK");

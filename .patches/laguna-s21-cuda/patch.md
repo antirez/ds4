@@ -4,7 +4,7 @@ id: laguna-s21-cuda
 status: ready
 kind: persistent-customization
 upstream:
-    base: 8a927009e61bd7e1ca370cd793c18b2749dbc03c
+    base: 7e3dbef7e336433f487c172a3308e26b39fa75a3
 relationships:
     depends_on: []
     conflicts_with: []
@@ -51,7 +51,7 @@ cannot run end-to-end on NVIDIA GPUs through ds4's CUDA backend.
 # Assumptions
 
 - The `origin/laguna-s2.1` branch at
-  `8a927009e61bd7e1ca370cd793c18b2749dbc03c` is the authoritative Metal
+  `7e3dbef7e336433f487c172a3308e26b39fa75a3` is the authoritative Metal
   reference and integration base.
 - Existing CUDA kernels and graph orchestration for other supported models
   should be reused where their tensor semantics match Laguna S 2.1.
@@ -86,16 +86,30 @@ Laguna-only kernels where semantics are identical.
 
 The Laguna graph already exposes the required backend-neutral hooks. CUDA must
 replace its current no-op Laguna stubs and add the quantized primitives that
-the official GGUF needs: Q4_K token/dense operations, Q6_K dense operations,
-per-head RMSNorm plus prefix NeoX/YaRN RoPE, f16 ring-cache GQA attention with
-the learned softplus gate, and Q4_K gate/up with Q4_K or Q6_K MoE down
-projections. Decode and multi-token prefill both require coverage.
+the official GGUFs need: Q8_0 signal-path operations for the revised recipe,
+legacy Q4_K/Q6_K dense operations, per-head RMSNorm plus prefix NeoX/YaRN
+RoPE, f16 ring-cache GQA attention with the learned softplus gate, and Q4_K
+routed gate/up/down projections. The earlier recipe's Q6_K routed down
+projections remain supported. Decode and multi-token prefill both require
+coverage.
 
 # Decisions
 
 - Keep the shared Laguna graph as the sole owner of model scheduling. CUDA
   implements the graph's existing hooks and extends generic Q4_K/Q6_K tensor
   operations rather than adding a parallel CUDA-only model graph.
+- Route both the revised Q4_K/Q4_K/Q4_K experts and the legacy
+  Q4_K/Q4_K/Q6_K experts through the same Laguna CUDA MoE implementation.
+  The revised graph keeps its shared expert on the Q8_0 matmul path.
+- Preserve the revised checkpoint's signal-path accuracy during prefill.
+  Metal multiplies Q8_0 weights by floating-point activations, whereas CUDA's
+  generic Q8_0 path requantizes activations to Q8_0. Repeating that extra
+  quantization across 48 Laguna layers corrupts generation. Revised Laguna
+  therefore expands Q8_0 signal weights to a bounded F16 cache and uses
+  cuBLAS for multi-token projections. If the cache budget is exhausted, it
+  streams one expanded matrix through reusable scratch rather than falling
+  back to activation requantization. Decode retains the native Q8_0 kernels
+  after the accurate prefill state has been established.
 - Use direct quantized F32-reduction kernels for decode and quality mode.
   Normal multi-token Q4_K/Q6_K matmul dequantizes one matrix at a time into a
   reusable f16 scratch slab and uses cuBLAS, avoiding persistent dequantized
@@ -171,17 +185,27 @@ Verification evidence:
   the new Laguna test.
 - `tests/cuda_laguna_smoke` passes patterned Q4_K/Q6_K batch and decode
   matmuls, Q4_K embedding, YaRN and SWA-compatible head RMSNorm/RoPE, gated
-  GQA prefill/decode including ring wraparound, and decode/batch Q6_K-down
-  routed/shared MoE.
-- The pinned 75,173,103,200-byte Poolside GGUF contains 239 Q4_K, 48 Q6_K,
-  240 F16, and 287 F32 tensors. It loads successfully and runs end-to-end on
-  the GB10 CUDA backend.
-- Short diagnostic runs measure 48.32 tok/s prefill and 14.02 tok/s
-  generation for a 128-token prompt with four generated tokens. At 2,048
-  prompt tokens and 64 generated tokens they measure 48.00 tok/s prefill,
-  9.14 tok/s generation, and 9.19 tok/s steady-state generation. These are
-  smoke/profile measurements rather than representative throughput claims.
-- The original sustained single-process benchmark with 256 generated tokens
+  GQA prefill/decode including ring wraparound, and decode/batch routed/shared
+  MoE with both revised Q4_K and legacy Q6_K down projections.
+- The current pinned 68,248,759,648-byte Poolside GGUF contains 141 Q4_K,
+  386 Q8_0, and 287 F32 tensors. It loads successfully and runs end-to-end on
+  the GB10 CUDA backend. The earlier 75,173,103,200-byte recipe with 239
+  Q4_K, 48 Q6_K, 240 F16, and 287 F32 tensors remains accepted.
+- A deterministic 128-token revised-weight generation remains coherent
+  through the full sample. The default no-thinking smoke answers the
+  one-sentence sky-color prompt directly and coherently. The same GGUF also
+  generates coherent text in Poolside's Laguna llama.cpp branch, confirming
+  the downloaded checkpoint and tokenizer are intact.
+- On the revised weights, the sustained raw sweep with 256 generated tokens
+  per point measures 203.07/21.65 tok/s prefill/generation at 2K context,
+  161.81/21.63 at 4K, and 132.34/20.30 at 8K. Results are stored in
+  `speed-bench/laguna_s21_gb10_revised.csv`.
+- Before the accurate-prefill correction, the same revised-weight sweep
+  appeared to measure 137.22/21.83, 113.51/21.84, and 100.62/20.46 tok/s,
+  but deterministic generation was corrupt. Those invalid measurements are
+  retained only as diagnostic history and are not published as results.
+- On the legacy weights, the original sustained single-process benchmark with
+  256 generated tokens
   per point measured 48.05/9.06 tok/s prefill/generation at 2K context,
   42.57/7.29 at 4K, and 36.79/5.23 at 8K. With expert-sorted MoE, chunked
   Q4_K/Q6_K down, grouped prefill GQA, split-history decode attention, aligned
@@ -222,9 +246,9 @@ Verification evidence:
   model-dependent tool-call/golden/kernel failures on this host. None arose
   from the focused Laguna regression; this non-green aggregate result is
   recorded as a validation exception rather than hidden.
-- Full-model Laguna logits/generation validation was not run because the GGUF
-  is unavailable locally and cannot fit in the remaining download space.
+- Full-model revised-weight prefill and generation complete successfully at
+  all three sustained benchmark frontiers.
 
 # Reference realization
 
-The reference realization is based on upstream 8a927009e61bd7e1ca370cd793c18b2749dbc03c and stored in `reference.patch`.
+The reference realization is based on upstream 7e3dbef7e336433f487c172a3308e26b39fa75a3 and stored in `reference.patch`.
