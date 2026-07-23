@@ -1,0 +1,1 @@
+KV (Key-Value) cache checkpointing is a technique that helps manage memory and computation in **agentic sessions**—long

@@ -1,0 +1,3 @@
+To test a command-line parser effectively, especially with edge cases, follow this structured approach:
+
+### 1. **

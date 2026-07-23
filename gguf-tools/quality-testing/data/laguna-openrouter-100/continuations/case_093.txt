@@ -1,0 +1,1 @@
+A page cache significantly speeds up subsequent file reads by leveraging **in-memory caching** to avoid slower storage I/O operations.

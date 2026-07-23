@@ -112,6 +112,49 @@ static inline void helper_mv_reduce_and_write(
     }
 }
 
+template<short NR0>
+static inline void helper_mv_reduce_add_and_write(
+        device float * dst_f32,
+        device const float * residual,
+        float sumf[NR0],
+        const int r0,
+        const int ne01,
+        ushort tiisg,
+        ushort sgitg,
+        threadgroup char * shmem) {
+    constexpr short NW = N_SIMDWIDTH;
+
+    threadgroup float * shmem_f32[NR0];
+
+    for (short row = 0; row < NR0; ++row) {
+        shmem_f32[row] = (threadgroup float *) shmem + NW*row;
+
+        if (sgitg == 0) {
+            shmem_f32[row][tiisg] = 0.0f;
+        }
+
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem_f32[row][sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short row = 0; row < NR0 && r0 + row < ne01; ++row) {
+        float tot = simd_sum(shmem_f32[row][tiisg]);
+
+        if (tiisg == 0 && sgitg == 0) {
+            dst_f32[r0 + row] = residual[r0 + row] + tot;
+        }
+    }
+}
+
 template<short NR0, typename args_t>
 void kernel_mul_mv_q8_0_f32_impl(
         args_t args,
@@ -905,6 +948,158 @@ typedef decltype(kernel_mul_mv_t_t_4<half, half4, half, half4>) mul_mv_t_t_4;
 // Host-visible vectorized dense matvec variants for F32 and F16 weights.
 template [[host_name("kernel_mul_mv_f32_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<float, float4, float, float4>;
 template [[host_name("kernel_mul_mv_f16_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<half,  half4,  float, float4>;
+
+// Laguna decode consumes the attention projection only through a residual
+// add. Keep the ordinary F16 matvec reduction tree and write that sum once.
+kernel void kernel_laguna_attn_output_residual_f16_f32(
+        constant ds4_metal_args_mul_mv &args,
+        device const half  *weight,
+        device const float *x,
+        device const float *residual,
+        device float       *dst,
+        threadgroup char   *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort simd_group [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NR0 = 2;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NB = 32;
+    constexpr short NF = 16;
+    constexpr short NF4 = NF / 4;
+    const short NSG = FC_mul_mv_nsg;
+
+    const int row0 = (int)tgpig.x * NR0;
+    const int n_blocks = args.ne00 / NB;
+    device const float4 *x4 = (device const float4 *)x;
+    device const half4 *weight4[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; row++) {
+        weight4[row] = (device const half4 *)(weight +
+            (uint64_t)(row0 + row) * args.ne00);
+    }
+
+    float sums[NR0] = {0.0f, 0.0f};
+    const short ix = lane / (NW / NF);
+    const short il = lane % (NW / NF);
+    const int block0 = simd_group * NF + ix;
+    device const float4 *xb = x4 + (block0 * NB + il * NF) / 4;
+
+    for (int block = block0; block < n_blocks; block += NSG * NF) {
+        float4 xv[NF4];
+        FOR_UNROLL (short i = 0; i < NF4; i++) xv[i] = xb[i];
+        FOR_UNROLL (short row = 0; row < NR0; row++) {
+            if (row0 + row >= args.ne01) continue;
+            device const half4 *wb = weight4[row] +
+                (block * NB + il * NF) / 4;
+            float part = 0.0f;
+            FOR_UNROLL (short i = 0; i < NF4; i++) {
+                part += dot(float4(wb[i]), xv[i]);
+            }
+            sums[row] += part;
+        }
+        xb += NSG * NF * NW / 4;
+    }
+
+    helper_mv_reduce_add_and_write<NR0>(
+        dst, residual, sums, row0, args.ne01, lane, simd_group, shmem);
+}
+
+struct ds4_metal_args_laguna_qkvg {
+    uint32_t in_dim;
+    uint32_t q_dim;
+    uint32_t kv_dim;
+    uint32_t gate_dim;
+};
+
+// Laguna decode projects one normalized row through four F16 matrices. The
+// matrix arithmetic and reduction tree match kernel_mul_mv_f16_f32_4; only the
+// dispatch is shared across the four disjoint output ranges.
+kernel void kernel_laguna_qkvg_f16_f32(
+        constant ds4_metal_args_laguna_qkvg &args,
+        device const half  *q_weight,
+        device const half  *k_weight,
+        device const half  *v_weight,
+        device const half  *gate_weight,
+        device const float *x,
+        device float       *q,
+        device float       *k,
+        device float       *v,
+        device float       *gate,
+        threadgroup char   *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort simd_group [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NR0 = 2;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NB = 32;
+    constexpr short NF = 16;
+    constexpr short NF4 = NF / 4;
+    const short NSG = FC_mul_mv_nsg;
+
+    const uint global_row = tgpig.x * NR0;
+    const uint q_end = args.q_dim;
+    const uint k_end = q_end + args.kv_dim;
+    const uint v_end = k_end + args.kv_dim;
+    const uint all_end = v_end + args.gate_dim;
+    if (global_row >= all_end || (args.in_dim % NB) != 0u) return;
+
+    device const half *weight = nullptr;
+    device float *dst = nullptr;
+    uint row = 0u;
+    uint out_dim = 0u;
+    if (global_row < q_end) {
+        weight = q_weight;
+        dst = q;
+        row = global_row;
+        out_dim = args.q_dim;
+    } else if (global_row < k_end) {
+        weight = k_weight;
+        dst = k;
+        row = global_row - q_end;
+        out_dim = args.kv_dim;
+    } else if (global_row < v_end) {
+        weight = v_weight;
+        dst = v;
+        row = global_row - k_end;
+        out_dim = args.kv_dim;
+    } else {
+        weight = gate_weight;
+        dst = gate;
+        row = global_row - v_end;
+        out_dim = args.gate_dim;
+    }
+
+    device const float4 *x4 = (device const float4 *)x;
+    device const half4 *weight4[NR0];
+    FOR_UNROLL (short r = 0; r < NR0; r++) {
+        weight4[r] = (device const half4 *)(weight +
+            (uint64_t)(row + r) * args.in_dim);
+    }
+    float sums[NR0] = {0.0f, 0.0f};
+    const short ix = lane / (NW / NF);
+    const short il = lane % (NW / NF);
+    const int block0 = simd_group * NF + ix;
+    device const float4 *xb = x4 + (block0 * NB + il * NF) / 4;
+    const int n_blocks = args.in_dim / NB;
+
+    for (int block = block0; block < n_blocks; block += NSG * NF) {
+        float4 xv[NF4];
+        FOR_UNROLL (short i = 0; i < NF4; i++) xv[i] = xb[i];
+        FOR_UNROLL (short r = 0; r < NR0; r++) {
+            if (row + r >= out_dim) continue;
+            device const half4 *wb = weight4[r] +
+                (block * NB + il * NF) / 4;
+            float part = 0.0f;
+            FOR_UNROLL (short i = 0; i < NF4; i++) {
+                part += dot(float4(wb[i]), xv[i]);
+            }
+            sums[r] += part;
+        }
+        xb += NSG * NF * NW / 4;
+    }
+
+    helper_mv_reduce_and_write<NR0>(
+        dst, sums, (int)row, (int)out_dim, lane, simd_group, shmem);
+}
 
 // DS4 compressor projections always compute two same-shaped F16 matvecs from
 // the same normalized activation: one for projected KV and one for pooling

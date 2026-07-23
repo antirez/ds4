@@ -1,0 +1,1 @@
+Binary search efficiently finds the insertion point in a sorted array by narrowing down the search space through comparisons. Here's a step

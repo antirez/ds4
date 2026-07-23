@@ -1,0 +1,3 @@
+When addressing generation slowdowns at long contexts, the following five measurements should be prioritized to diagnose the issue:
+
+1. **

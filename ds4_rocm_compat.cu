@@ -395,3 +395,114 @@ extern "C" int ds4_gpu_glm_attention_indexed_batch_typed_tensor(
             value_dim, n_ctx_orig, freq_base, freq_scale, ext_factor,
             attn_factor, beta_fast, beta_slow);
 }
+
+extern "C" int ds4_gpu_matmul_q6_K_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
+    (void)in_dim; (void)out_dim; (void)x; (void)n_tok;
+    return 0;
+}
+
+extern "C" int ds4_gpu_laguna_routed_shared_moe_one_tensor(
+        ds4_gpu_tensor *routed_out, ds4_gpu_tensor *routed_mid,
+        ds4_gpu_tensor *shared_out, ds4_gpu_tensor *shared_mid,
+        const void *model_map, uint64_t model_size,
+        const ds4_gpu_laguna_moe_desc *routed,
+        const ds4_gpu_laguna_moe_desc *shared,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert,
+        const ds4_gpu_tensor *shared_selected,
+        const ds4_gpu_tensor *shared_weight, const ds4_gpu_tensor *x) {
+    (void)routed_out; (void)routed_mid; (void)shared_out; (void)shared_mid;
+    (void)model_map; (void)model_size; (void)routed; (void)shared;
+    (void)expert_in_dim; (void)expert_mid_dim; (void)out_dim;
+    (void)selected; (void)weights; (void)n_total_expert; (void)n_expert;
+    (void)shared_selected; (void)shared_weight; (void)x;
+    return 0;
+}
+
+extern "C" int ds4_gpu_laguna_qkvg_f16_tensor(
+        ds4_gpu_tensor *q, ds4_gpu_tensor *k, ds4_gpu_tensor *v,
+        ds4_gpu_tensor *gate, const void *model_map, uint64_t model_size,
+        uint64_t q_weight_offset, uint64_t k_weight_offset,
+        uint64_t v_weight_offset, uint64_t gate_weight_offset,
+        uint32_t in_dim, uint32_t q_dim, uint32_t kv_dim,
+        uint32_t gate_dim, const ds4_gpu_tensor *x) {
+    (void)q; (void)k; (void)v; (void)gate; (void)model_map; (void)model_size;
+    (void)q_weight_offset; (void)k_weight_offset; (void)v_weight_offset;
+    (void)gate_weight_offset; (void)in_dim; (void)q_dim; (void)kv_dim;
+    (void)gate_dim; (void)x;
+    return 0;
+}
+
+extern "C" int ds4_gpu_laguna_attn_output_residual_f16_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *x, const ds4_gpu_tensor *residual) {
+    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
+    (void)in_dim; (void)out_dim; (void)x; (void)residual;
+    return 0;
+}
+
+extern "C" int ds4_gpu_laguna_head_rms_norm_rope_tensor(
+        ds4_gpu_tensor *x, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t n_tokens, uint32_t n_head,
+        uint32_t head_dim, uint32_t n_rot, uint32_t pos0,
+        uint32_t n_ctx_orig, float freq_base, float freq_scale,
+        float ext_factor, float attn_factor, float beta_fast,
+        float beta_slow, float eps) {
+    (void)x; (void)model_map; (void)model_size; (void)weight_offset;
+    (void)n_tokens; (void)n_head; (void)head_dim; (void)n_rot; (void)pos0;
+    (void)n_ctx_orig; (void)freq_base; (void)freq_scale; (void)ext_factor;
+    (void)attn_factor; (void)beta_fast; (void)beta_slow; (void)eps;
+    return 0;
+}
+
+extern "C" int ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
+        ds4_gpu_tensor *q, ds4_gpu_tensor *k, const void *model_map,
+        uint64_t model_size, uint64_t q_weight_offset,
+        uint64_t k_weight_offset, uint32_t n_tokens, uint32_t n_q_head,
+        uint32_t n_k_head, uint32_t head_dim, uint32_t n_rot,
+        uint32_t pos0, uint32_t n_ctx_orig, float freq_base,
+        float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow, float eps) {
+    (void)q; (void)k; (void)model_map; (void)model_size;
+    (void)q_weight_offset; (void)k_weight_offset; (void)n_tokens;
+    (void)n_q_head; (void)n_k_head; (void)head_dim; (void)n_rot;
+    (void)pos0; (void)n_ctx_orig; (void)freq_base; (void)freq_scale;
+    (void)ext_factor; (void)attn_factor; (void)beta_fast;
+    (void)beta_slow; (void)eps;
+    return 0;
+}
+
+extern "C" int ds4_gpu_laguna_store_attention_tensor(
+        ds4_gpu_tensor *heads, ds4_gpu_tensor *key_cache,
+        ds4_gpu_tensor *value_cache, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *gate, uint32_t pos, uint32_t cache_cap,
+        uint32_t key_start, uint32_t key_count, uint32_t n_head,
+        uint32_t n_head_kv, uint32_t head_dim, float scale) {
+    (void)heads; (void)key_cache; (void)value_cache; (void)q; (void)k;
+    (void)v; (void)gate; (void)pos; (void)cache_cap; (void)key_start;
+    (void)key_count; (void)n_head; (void)n_head_kv; (void)head_dim;
+    (void)scale;
+    return 0;
+}
+
+extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
+        ds4_gpu_tensor *heads, ds4_gpu_tensor *key_cache,
+        ds4_gpu_tensor *value_cache, ds4_gpu_tensor *staged_key,
+        ds4_gpu_tensor *staged_value, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *gate, uint32_t pos0, uint32_t n_tokens,
+        uint32_t cache_cap, uint32_t n_head, uint32_t n_head_kv,
+        uint32_t head_dim, float scale) {
+    (void)heads; (void)key_cache; (void)value_cache; (void)staged_key;
+    (void)staged_value; (void)q; (void)k; (void)v; (void)gate;
+    (void)pos0; (void)n_tokens; (void)cache_cap; (void)n_head;
+    (void)n_head_kv; (void)head_dim; (void)scale;
+    return 0;
+}

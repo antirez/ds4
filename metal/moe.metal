@@ -592,6 +592,35 @@ kernel void kernel_dsv4_moe_sum8_f32(
     }
 }
 
+kernel void kernel_dsv4_moe_sum10_f32(
+        constant ds4_metal_dsv4_moe_sum6_args &args,
+        device const char *src,
+        device       char *dst,
+        uint token[[threadgroup_position_in_grid]],
+        uint tid[[thread_position_in_threadgroup]],
+        uint ntg[[threads_per_threadgroup]]) {
+    if (token >= args.tokens) return;
+
+    device const float *s =
+        (device const float *)(src + (uint64_t)token * args.src_token_stride);
+    device float *d =
+        (device float *)(dst + (uint64_t)token * args.dst_token_stride);
+
+    for (uint col = tid; col < args.width; col += ntg) {
+        float v = s[col];
+        v += s[args.width + col];
+        v += s[2u * args.width + col];
+        v += s[3u * args.width + col];
+        v += s[4u * args.width + col];
+        v += s[5u * args.width + col];
+        v += s[6u * args.width + col];
+        v += s[7u * args.width + col];
+        v += s[8u * args.width + col];
+        v += s[9u * args.width + col];
+        d[col] = v;
+    }
+}
+
 template <typename type4x4>
 void dequantize_q2_K(device const block_q2_K *xb, short il, thread type4x4 & reg) {
     const float d = xb->d;
@@ -1219,6 +1248,45 @@ kernel void kernel_glm_q4_K_pair_swiglu2_f32(
     glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR2_K>(
         args, gate, up, x, weights, mid, scratch,
         tgpig, slot, token, selected_off, expert, tiisg, sgitg);
+}
+
+// Routed and shared Laguna gate/up projections have the same Q4_K geometry
+// and consume the same normalized activation. Put their independent SIMD
+// groups in one grid so the GPU does not serialize two nearly identical
+// dispatches. Each branch calls the exact standalone projection helper.
+kernel void kernel_laguna_q4_K_routed_shared_pair_swiglu_f32(
+        constant ds4_metal_glm_routed_moe_args &routed_args,
+        constant ds4_metal_glm_routed_moe_args &shared_args,
+        device const char *routed_gate,
+        device const char *routed_up,
+        device const char *shared_gate,
+        device const char *shared_up,
+        device const float *x,
+        device const int32_t *selected,
+        device const float *weights,
+        device const int32_t *shared_selected,
+        device const float *shared_weight,
+        device float *routed_mid,
+        device float *shared_mid,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint slot = tgpig.y;
+    if (slot < routed_args.n_expert_used) {
+        const uint64_t selected_off = slot;
+        const int expert = selected[selected_off];
+        glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR2_K>(
+            routed_args, routed_gate, routed_up, x, weights, routed_mid,
+            scratch, tgpig, slot, 0u, selected_off, expert, tiisg, sgitg);
+        return;
+    }
+    if (slot != routed_args.n_expert_used) return;
+
+    const uint3 shared_grid = uint3(tgpig.x, 0u, 0u);
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR2_K>(
+        shared_args, shared_gate, shared_up, x, shared_weight, shared_mid,
+        scratch, shared_grid, 0u, 0u, 0u, shared_selected[0], tiisg, sgitg);
 }
 
 kernel void kernel_glm_q4_K_addr_pair_swiglu_f32(
@@ -2060,15 +2128,15 @@ kernel void kernel_glm_q4_K_addr_down_f32(
     }
 }
 
-kernel void kernel_glm_q4_K_down_simd_f32(
+static inline void glm_q4_K_down_simd_f32_impl(
         constant ds4_metal_glm_routed_moe_args &args,
         device const char *down,
         device const int32_t *selected,
         device const float *mid,
         device float *out,
-        uint3 tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+        uint3 tgpig,
+        ushort tiisg,
+        ushort sgitg) {
     const short NSG = 2;
     const short nr0 = N_R0_Q4_K;
     const int nb = args.mid_dim / QK_K;
@@ -2161,6 +2229,19 @@ kernel void kernel_glm_q4_K_down_simd_f32(
             out[(uint64_t)token * args.out_dim + row0 + (uint)row] = sum_all;
         }
     }
+}
+
+kernel void kernel_glm_q4_K_down_simd_f32(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const char *down,
+        device const int32_t *selected,
+        device const float *mid,
+        device float *out,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    glm_q4_K_down_simd_f32_impl(
+        args, down, selected, mid, out, tgpig, tiisg, sgitg);
 }
 
 kernel void kernel_glm_q4_K_addr_down_simd_f32(
@@ -2267,15 +2348,15 @@ kernel void kernel_glm_q4_K_addr_down_simd_f32(
     }
 }
 
-kernel void kernel_glm_q6_K_down_f32(
+static inline void glm_q6_K_down_f32_impl(
         constant ds4_metal_glm_routed_moe_args &args,
         device const char *down,
         device const int32_t *selected,
         device const float *mid,
         device float *out,
-        uint3 tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+        uint3 tgpig,
+        ushort tiisg,
+        ushort sgitg) {
     const short NSG = 2;
     constexpr uint kmask1 = 0x03u;
     constexpr uint kmask2 = 0x0Cu;
@@ -2357,6 +2438,71 @@ kernel void kernel_glm_q6_K_down_f32(
         if (tiisg == 0u) {
             out[(uint64_t)token * args.out_dim + row0 + (uint)row] = sum_all;
         }
+    }
+}
+
+kernel void kernel_glm_q6_K_down_f32(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const char *down,
+        device const int32_t *selected,
+        device const float *mid,
+        device float *out,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    glm_q6_K_down_f32_impl(
+        args, down, selected, mid, out, tgpig, tiisg, sgitg);
+}
+
+kernel void kernel_laguna_q4_K_routed_shared_down_f32(
+        constant ds4_metal_glm_routed_moe_args &routed_args,
+        constant ds4_metal_glm_routed_moe_args &shared_args,
+        device const char *routed_down,
+        device const char *shared_down,
+        device const int32_t *selected,
+        device const int32_t *shared_selected,
+        device const float *routed_mid,
+        device const float *shared_mid,
+        device float *routed_out,
+        device float *shared_out,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint3 local_grid = uint3(tgpig.x, 0u, 0u);
+    if (tgpig.y == 0u) {
+        glm_q4_K_down_simd_f32_impl(
+            routed_args, routed_down, selected, routed_mid, routed_out,
+            local_grid, tiisg, sgitg);
+    } else if (tgpig.y == 1u) {
+        glm_q4_K_down_simd_f32_impl(
+            shared_args, shared_down, shared_selected, shared_mid, shared_out,
+            local_grid, tiisg, sgitg);
+    }
+}
+
+kernel void kernel_laguna_q6_K_routed_shared_down_f32(
+        constant ds4_metal_glm_routed_moe_args &routed_args,
+        constant ds4_metal_glm_routed_moe_args &shared_args,
+        device const char *routed_down,
+        device const char *shared_down,
+        device const int32_t *selected,
+        device const int32_t *shared_selected,
+        device const float *routed_mid,
+        device const float *shared_mid,
+        device float *routed_out,
+        device float *shared_out,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint3 local_grid = uint3(tgpig.x, 0u, 0u);
+    if (tgpig.y == 0u) {
+        glm_q6_K_down_f32_impl(
+            routed_args, routed_down, selected, routed_mid, routed_out,
+            local_grid, tiisg, sgitg);
+    } else if (tgpig.y == 1u) {
+        glm_q6_K_down_f32_impl(
+            shared_args, shared_down, shared_selected, shared_mid, shared_out,
+            local_grid, tiisg, sgitg);
     }
 }
 

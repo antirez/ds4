@@ -1,0 +1,46 @@
+{
+  "id": "gen-1784794701-QPQ3uNWpAXZTo6JTSNAa",
+  "object": "chat.completion",
+  "created": 1784794701,
+  "model": "poolside/laguna-s-2.1",
+  "provider": "Poolside",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "stop",
+      "native_finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "content": "Il modello dovrebbe rispondere solo dopo aver letto l'intero prompt.",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 58,
+    "completion_tokens": 22,
+    "total_tokens": 80,
+    "cost": 7.32e-06,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 32,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 7.32e-06,
+      "upstream_inference_prompt_cost": 2.92e-06,
+      "upstream_inference_completions_cost": 4.4e-06
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

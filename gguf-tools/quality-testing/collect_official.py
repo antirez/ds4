@@ -139,10 +139,11 @@ def request_one(
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
-        "logprobs": True,
-        "top_logprobs": top_logprobs,
         "stream": False,
     }
+    if top_logprobs > 0:
+        payload["logprobs"] = True
+        payload["top_logprobs"] = top_logprobs
     payload[token_limit_field] = max_tokens
     if thinking != "omit":
         payload["thinking"] = {"type": thinking}
@@ -304,13 +305,20 @@ def main() -> int:
         prompt_path.write_text(prompt, encoding="utf-8")
         cont_path.write_text(content, encoding="utf-8")
         resp_path.write_text(json.dumps(response, ensure_ascii=False, indent=2), encoding="utf-8")
-        rows.append((case_id, prompt_path, cont_path, resp_path))
+        rows.append((case_id, prompt_path, cont_path,
+                     resp_path if args.top_logprobs > 0 else None))
         time.sleep(0.05)
 
     with manifest.open("w", encoding="utf-8") as fp:
-        fp.write("# id\tprompt_file\tcontinuation_file\tresponse_file\n")
+        fp.write("# id\tprompt_file\tcontinuation_file")
+        if args.top_logprobs > 0:
+            fp.write("\tresponse_file")
+        fp.write("\n")
         for row in rows:
-            fp.write("\t".join([row[0], str(row[1]), str(row[2]), str(row[3])]) + "\n")
+            fields = [row[0], str(row[1]), str(row[2])]
+            if row[3] is not None:
+                fields.append(str(row[3]))
+            fp.write("\t".join(fields) + "\n")
     print(f"wrote {manifest}", file=sys.stderr)
     return 0
 

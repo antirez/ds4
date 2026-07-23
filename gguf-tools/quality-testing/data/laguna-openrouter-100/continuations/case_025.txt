@@ -1,0 +1,1 @@
+A **ring buffer** (or circular buffer) is a fixed-size data structure that uses a circular memory layout to efficiently

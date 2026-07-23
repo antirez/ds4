@@ -1,0 +1,1 @@
+Per confrontare due quantizzazioni in modo robusto e non affidarsi a una singola risposta, pu

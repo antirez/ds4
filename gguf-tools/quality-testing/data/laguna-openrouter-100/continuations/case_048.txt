@@ -1,0 +1,4 @@
+# Quantized Model Instruction-Following Validation Checklist
+
+## Pre-Quantization Baseline Testing
+- [ ] **Establish baseline

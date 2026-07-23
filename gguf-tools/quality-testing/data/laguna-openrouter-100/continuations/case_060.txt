@@ -1,0 +1,1 @@
+To find the median of three numbers, we can leverage the fact that the median is the middle value when the numbers are

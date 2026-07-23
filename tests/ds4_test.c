@@ -3148,6 +3148,8 @@ static void test_metal_persistent_zero_attention_mask_exact_case(
 static void test_metal_persistent_zero_attention_mask_exact(void) {
     test_metal_persistent_zero_attention_mask_exact_case(7, 5, 5, 3, 11);
     test_metal_persistent_zero_attention_mask_exact_case(37, 29, 35, 3, 23);
+    test_metal_persistent_zero_attention_mask_exact_case(
+        1, 1, 0, 8192, 31);
 }
 
 typedef enum {
@@ -3458,6 +3460,323 @@ static void test_metal_zero_prefix_prefill_mask_cache_exact(void) {
         TEST_METAL_PREFILL_MASK_CACHE_RATIO4, 43);
     test_metal_zero_prefix_prefill_mask_cache_exact_kind(
         TEST_METAL_PREFILL_MASK_CACHE_RATIO128, 47);
+}
+
+static void test_metal_laguna_gqa3_decode_numeric(void) {
+    const uint32_t head_dim = 128;
+    const uint32_t n_head = 6;
+    const uint32_t n_head_kv = 2;
+    const uint32_t cache_cap = 2048;
+    const uint32_t key_count = 1024;
+    const uint32_t pos = key_count - 1u;
+    const uint32_t cache_width = n_head_kv * head_dim;
+    const float scale = 1.0f / sqrtf((float)head_dim);
+    const uint64_t heads_bytes =
+        (uint64_t)n_head * head_dim * sizeof(float);
+    const uint64_t kv_bytes =
+        (uint64_t)cache_cap * cache_width * sizeof(uint16_t);
+    const uint64_t q_bytes = heads_bytes;
+    const uint64_t current_kv_bytes =
+        (uint64_t)n_head_kv * head_dim * sizeof(float);
+    const uint64_t gate_bytes = (uint64_t)n_head * sizeof(float);
+
+    ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc(heads_bytes);
+    ds4_gpu_tensor *key_cache = ds4_gpu_tensor_alloc(kv_bytes);
+    ds4_gpu_tensor *value_cache = ds4_gpu_tensor_alloc(kv_bytes);
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_bytes);
+    ds4_gpu_tensor *k = ds4_gpu_tensor_alloc(current_kv_bytes);
+    ds4_gpu_tensor *v = ds4_gpu_tensor_alloc(current_kv_bytes);
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc(gate_bytes);
+    uint16_t *key_host = malloc((size_t)kv_bytes);
+    uint16_t *value_host = malloc((size_t)kv_bytes);
+    float *actual = malloc((size_t)heads_bytes);
+    TEST_ASSERT(heads != NULL);
+    TEST_ASSERT(key_cache != NULL);
+    TEST_ASSERT(value_cache != NULL);
+    TEST_ASSERT(q != NULL);
+    TEST_ASSERT(k != NULL);
+    TEST_ASSERT(v != NULL);
+    TEST_ASSERT(gate != NULL);
+    TEST_ASSERT(key_host != NULL);
+    TEST_ASSERT(value_host != NULL);
+    TEST_ASSERT(actual != NULL);
+
+    if (heads && key_cache && value_cache && q && k && v && gate &&
+        key_host && value_host && actual) {
+        float q_host[n_head * head_dim];
+        float k_host[n_head_kv * head_dim];
+        float v_host[n_head_kv * head_dim];
+        float gate_host[n_head];
+        for (uint64_t i = 0; i < (uint64_t)cache_cap * cache_width; i++) {
+            const int key_value =
+                (int)((i * 29u + (i >> 3u) * 17u + 11u) % 193u) - 96;
+            const int value_value =
+                (int)((i * 31u + (i >> 5u) * 13u + 7u) % 181u) - 90;
+            key_host[i] = test_float_to_f16((float)key_value / 160.0f);
+            value_host[i] = test_float_to_f16((float)value_value / 144.0f);
+        }
+        for (uint32_t i = 0; i < n_head * head_dim; i++) {
+            const int value =
+                (int)((i * 37u + (i >> 2u) * 19u + 5u) % 211u) - 105;
+            q_host[i] = (float)value / 176.0f;
+        }
+        for (uint32_t i = 0; i < n_head_kv * head_dim; i++) {
+            const int key_value =
+                (int)((i * 41u + (i >> 4u) * 23u + 3u) % 199u) - 99;
+            const int value_value =
+                (int)((i * 43u + (i >> 3u) * 11u + 17u) % 197u) - 98;
+            k_host[i] = (float)key_value / 168.0f;
+            v_host[i] = (float)value_value / 152.0f;
+        }
+        for (uint32_t h = 0; h < n_head; h++) {
+            gate_host[h] = ((float)h - 2.5f) * 0.375f;
+        }
+
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        key_cache, 0, key_host, kv_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        value_cache, 0, value_host, kv_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(q, 0, q_host, q_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        k, 0, k_host, current_kv_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        v, 0, v_host, current_kv_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        gate, 0, gate_host, gate_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_laguna_store_attention_tensor(
+                        heads, key_cache, value_cache, q, k, v, gate,
+                        pos, cache_cap, 0, key_count,
+                        n_head, n_head_kv, head_dim, scale) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        heads, 0, actual, heads_bytes) != 0);
+
+        const uint64_t current_row = (uint64_t)pos * cache_width;
+        for (uint32_t i = 0; i < n_head_kv * head_dim; i++) {
+            key_host[current_row + i] = test_float_to_f16(k_host[i]);
+            value_host[current_row + i] = test_float_to_f16(v_host[i]);
+        }
+
+        double sum_squared = 0.0;
+        float max_abs = 0.0f;
+        size_t nonfinite = 0;
+        for (uint32_t h = 0; h < n_head; h++) {
+            const uint32_t kv_head = h / (n_head / n_head_kv);
+            double max_score = -DBL_MAX;
+            for (uint32_t row = 0; row < key_count; row++) {
+                const uint64_t kv_base =
+                    (uint64_t)row * cache_width +
+                    (uint64_t)kv_head * head_dim;
+                double dot = 0.0;
+                for (uint32_t d = 0; d < head_dim; d++) {
+                    dot += (double)q_host[h * head_dim + d] *
+                        test_f16_to_f32(key_host[kv_base + d]);
+                }
+                const double score = dot * (double)scale;
+                if (score > max_score) max_score = score;
+            }
+
+            double denominator = 0.0;
+            double numerator[head_dim];
+            memset(numerator, 0, sizeof(numerator));
+            for (uint32_t row = 0; row < key_count; row++) {
+                const uint64_t kv_base =
+                    (uint64_t)row * cache_width +
+                    (uint64_t)kv_head * head_dim;
+                double dot = 0.0;
+                for (uint32_t d = 0; d < head_dim; d++) {
+                    dot += (double)q_host[h * head_dim + d] *
+                        test_f16_to_f32(key_host[kv_base + d]);
+                }
+                const double weight = exp(dot * (double)scale - max_score);
+                denominator += weight;
+                for (uint32_t d = 0; d < head_dim; d++) {
+                    numerator[d] += weight *
+                        test_f16_to_f32(value_host[kv_base + d]);
+                }
+            }
+            const double gate_scale = log1p(exp((double)gate_host[h]));
+            for (uint32_t d = 0; d < head_dim; d++) {
+                const double reference =
+                    numerator[d] / denominator * gate_scale;
+                const float got = actual[h * head_dim + d];
+                if (!isfinite(got)) {
+                    nonfinite++;
+                    continue;
+                }
+                const float error = fabsf(got - (float)reference);
+                if (error > max_abs) max_abs = error;
+                sum_squared += (double)error * error;
+            }
+        }
+        const float rms = sqrtf((float)(sum_squared / (n_head * head_dim)));
+        fprintf(stderr,
+                "ds4-test: Laguna global GQA3 decode numeric "
+                "max_abs=%g rms=%g nonfinite=%zu\n",
+                max_abs, rms, nonfinite);
+        TEST_ASSERT(nonfinite == 0);
+        TEST_ASSERT(max_abs < 5.0e-4f);
+        TEST_ASSERT(rms < 1.0e-4f);
+    }
+
+    free(actual);
+    free(value_host);
+    free(key_host);
+    ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(v);
+    ds4_gpu_tensor_free(k);
+    ds4_gpu_tensor_free(q);
+    ds4_gpu_tensor_free(value_cache);
+    ds4_gpu_tensor_free(key_cache);
+    ds4_gpu_tensor_free(heads);
+}
+
+static void test_metal_laguna_qk_norm_rope_pair_exact(void) {
+    typedef struct {
+        uint32_t n_tokens;
+        uint32_t n_q_head;
+        uint32_t n_k_head;
+        uint32_t pos0;
+        float ext_factor;
+    } qk_case;
+    static const qk_case cases[] = {
+        { 1, 48, 8,    37, 0.0f },
+        { 1, 72, 8, 65533, 1.0f },
+        { 3,  7, 3,  2047, 1.0f },
+    };
+    const uint32_t head_dim = 128;
+    const uint32_t n_rot = 64;
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t k_weight_offset = page;
+    const uint64_t model_size = 2u * page;
+    void *model_raw = NULL;
+    TEST_ASSERT(posix_memalign(
+                    &model_raw, (size_t)page, (size_t)model_size) == 0);
+    if (!model_raw) return;
+    memset(model_raw, 0, (size_t)model_size);
+
+    float *q_weight = model_raw;
+    float *k_weight = (float *)((uint8_t *)model_raw + k_weight_offset);
+    for (uint32_t i = 0; i < head_dim; i++) {
+        q_weight[i] = 0.75f + (float)((i * 17u + 3u) % 29u) / 64.0f;
+        k_weight[i] = 0.625f + (float)((i * 19u + 5u) % 31u) / 56.0f;
+    }
+    TEST_ASSERT(ds4_gpu_set_model_map(model_raw, model_size) != 0);
+
+    size_t q_mismatches = 0;
+    size_t k_mismatches = 0;
+    uint32_t max_ulp = 0;
+    for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
+        const qk_case *c = &cases[ci];
+        const uint64_t q_values =
+            (uint64_t)c->n_tokens * c->n_q_head * head_dim;
+        const uint64_t k_values =
+            (uint64_t)c->n_tokens * c->n_k_head * head_dim;
+        const uint64_t q_bytes = q_values * sizeof(float);
+        const uint64_t k_bytes = k_values * sizeof(float);
+        ds4_gpu_tensor *ref_q = ds4_gpu_tensor_alloc(q_bytes);
+        ds4_gpu_tensor *ref_k = ds4_gpu_tensor_alloc(k_bytes);
+        ds4_gpu_tensor *pair_q = ds4_gpu_tensor_alloc(q_bytes);
+        ds4_gpu_tensor *pair_k = ds4_gpu_tensor_alloc(k_bytes);
+        float *q_input = malloc((size_t)q_bytes);
+        float *k_input = malloc((size_t)k_bytes);
+        float *ref_q_host = malloc((size_t)q_bytes);
+        float *ref_k_host = malloc((size_t)k_bytes);
+        float *pair_q_host = malloc((size_t)q_bytes);
+        float *pair_k_host = malloc((size_t)k_bytes);
+        TEST_ASSERT(ref_q && ref_k && pair_q && pair_k &&
+                    q_input && k_input && ref_q_host && ref_k_host &&
+                    pair_q_host && pair_k_host);
+        if (!ref_q || !ref_k || !pair_q || !pair_k ||
+            !q_input || !k_input || !ref_q_host || !ref_k_host ||
+            !pair_q_host || !pair_k_host) {
+            free(pair_k_host);
+            free(pair_q_host);
+            free(ref_k_host);
+            free(ref_q_host);
+            free(k_input);
+            free(q_input);
+            ds4_gpu_tensor_free(pair_k);
+            ds4_gpu_tensor_free(pair_q);
+            ds4_gpu_tensor_free(ref_k);
+            ds4_gpu_tensor_free(ref_q);
+            continue;
+        }
+
+        for (uint64_t i = 0; i < q_values; i++) {
+            const int v = (int)((i * 37u + (i >> 3u) * 11u +
+                                 ci * 13u + 7u) % 211u) - 105;
+            q_input[i] = (float)v / 137.0f;
+        }
+        for (uint64_t i = 0; i < k_values; i++) {
+            const int v = (int)((i * 41u + (i >> 2u) * 17u +
+                                 ci * 23u + 5u) % 199u) - 99;
+            k_input[i] = (float)v / 149.0f;
+        }
+        TEST_ASSERT(ds4_gpu_tensor_write(ref_q, 0, q_input, q_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(pair_q, 0, q_input, q_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(ref_k, 0, k_input, k_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(pair_k, 0, k_input, k_bytes) != 0);
+
+        const float freq_base = c->ext_factor != 0.0f ? 160000.0f : 10000.0f;
+        const float freq_scale = c->ext_factor != 0.0f ? 1.0f / 16.0f : 1.0f;
+        const uint32_t n_ctx_orig = c->ext_factor != 0.0f ? 65536u : 0u;
+        const float attn_factor = c->ext_factor != 0.0f
+            ? 1.0f / (1.0f + 0.1f * logf(1.0f / freq_scale))
+            : 1.0f;
+        TEST_ASSERT(ds4_gpu_laguna_head_rms_norm_rope_tensor(
+                        ref_q, model_raw, model_size, 0,
+                        c->n_tokens, c->n_q_head, head_dim, n_rot,
+                        c->pos0, n_ctx_orig, freq_base, freq_scale,
+                        c->ext_factor, attn_factor, 32.0f, 1.0f, 1e-6f) != 0);
+        TEST_ASSERT(ds4_gpu_laguna_head_rms_norm_rope_tensor(
+                        ref_k, model_raw, model_size, k_weight_offset,
+                        c->n_tokens, c->n_k_head, head_dim, n_rot,
+                        c->pos0, n_ctx_orig, freq_base, freq_scale,
+                        c->ext_factor, attn_factor, 32.0f, 1.0f, 1e-6f) != 0);
+        TEST_ASSERT(ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
+                        pair_q, pair_k, model_raw, model_size,
+                        0, k_weight_offset, c->n_tokens,
+                        c->n_q_head, c->n_k_head, head_dim, n_rot,
+                        c->pos0, n_ctx_orig, freq_base, freq_scale,
+                        c->ext_factor, attn_factor, 32.0f, 1.0f, 1e-6f) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        ref_q, 0, ref_q_host, q_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        ref_k, 0, ref_k_host, k_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        pair_q, 0, pair_q_host, q_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        pair_k, 0, pair_k_host, k_bytes) != 0);
+
+        const test_float_compare_stats q_stats =
+            test_compare_float_bits(ref_q_host, pair_q_host, (size_t)q_values);
+        const test_float_compare_stats k_stats =
+            test_compare_float_bits(ref_k_host, pair_k_host, (size_t)k_values);
+        q_mismatches += q_stats.mismatch_count;
+        k_mismatches += k_stats.mismatch_count;
+        if (q_stats.max_ulp > max_ulp) max_ulp = q_stats.max_ulp;
+        if (k_stats.max_ulp > max_ulp) max_ulp = k_stats.max_ulp;
+
+        free(pair_k_host);
+        free(pair_q_host);
+        free(ref_k_host);
+        free(ref_q_host);
+        free(k_input);
+        free(q_input);
+        ds4_gpu_tensor_free(pair_k);
+        ds4_gpu_tensor_free(pair_q);
+        ds4_gpu_tensor_free(ref_k);
+        ds4_gpu_tensor_free(ref_q);
+    }
+
+    fprintf(stderr,
+            "ds4-test: Laguna paired Q/K norm/RoPE exact "
+            "q_mismatches=%zu k_mismatches=%zu max_ulp=%u\n",
+            q_mismatches, k_mismatches, max_ulp);
+    TEST_ASSERT(q_mismatches == 0);
+    TEST_ASSERT(k_mismatches == 0);
+    TEST_ASSERT(max_ulp == 0);
+    free(model_raw);
 }
 #endif
 
@@ -4562,6 +4881,8 @@ static void test_metal_kernel_group(void) {
     test_metal_contiguous_compressed_f16_attention_exact();
     test_metal_persistent_zero_attention_mask_exact();
     test_metal_zero_prefix_prefill_mask_cache_exact();
+    test_metal_laguna_gqa3_decode_numeric();
+    test_metal_laguna_qk_norm_rope_pair_exact();
     test_metal_hc_split_weighted_sum_norm_batch_exact();
     test_metal_output_hc_weights4_exact();
     test_metal_hc_rms_scale_project_f16_exact();

@@ -56,9 +56,11 @@ typedef struct {
     int n_predict;
     int ctx_size;
     float temperature;
+    int top_k;
     float top_p;
     float min_p;
     bool temperature_set;
+    bool top_k_set;
     bool top_p_set;
     bool min_p_set;
     uint64_t seed;
@@ -235,6 +237,7 @@ typedef struct {
 typedef enum {
     AGENT_TOOL_SYNTAX_DSML,
     AGENT_TOOL_SYNTAX_GLM,
+    AGENT_TOOL_SYNTAX_LAGUNA,
 } agent_tool_syntax;
 
 typedef enum {
@@ -348,18 +351,18 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
 static int agent_read_default_lines(agent_worker *w);
 
 static agent_tool_syntax agent_tool_syntax_for_engine(ds4_engine *engine) {
-    return ds4_engine_is_glm_dsa(engine) ? AGENT_TOOL_SYNTAX_GLM
-                                         : AGENT_TOOL_SYNTAX_DSML;
+    if (ds4_engine_is_glm_dsa(engine)) return AGENT_TOOL_SYNTAX_GLM;
+    if (ds4_engine_is_laguna(engine)) return AGENT_TOOL_SYNTAX_LAGUNA;
+    return AGENT_TOOL_SYNTAX_DSML;
 }
 
-static bool agent_tool_syntax_assistant_turn_uses_eos(agent_tool_syntax syntax) {
-    return syntax != AGENT_TOOL_SYNTAX_GLM;
+static bool agent_tool_syntax_is_tagged(agent_tool_syntax syntax) {
+    return syntax == AGENT_TOOL_SYNTAX_GLM ||
+           syntax == AGENT_TOOL_SYNTAX_LAGUNA;
 }
 
 static void agent_worker_append_assistant_turn_end(agent_worker *w) {
-    if (agent_tool_syntax_assistant_turn_uses_eos(
-            agent_tool_syntax_for_engine(w->engine)))
-        ds4_tokens_push(&w->transcript, ds4_token_eos(w->engine));
+    ds4_chat_append_assistant_end(w->engine, &w->transcript);
 }
 
 static int agent_worker_effective_ctx_size(const agent_worker *w) {
@@ -647,6 +650,9 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--temp")) {
             c.gen.temperature = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
             c.gen.temperature_set = true;
+        } else if (!strcmp(arg, "--top-k")) {
+            c.gen.top_k = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+            c.gen.top_k_set = true;
         } else if (!strcmp(arg, "--top-p")) {
             c.gen.top_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
             c.gen.top_p_set = true;
@@ -769,11 +775,14 @@ static agent_config parse_options(int argc, char **argv) {
 static void agent_apply_model_sampling_defaults(
         ds4_engine               *engine,
         agent_generation_options *gen) {
-    if (!engine || !gen || !ds4_engine_is_glm_dsa(engine)) return;
-
-    if (!gen->temperature_set) gen->temperature = 1.0f;
-    if (!gen->top_p_set) gen->top_p = 0.95f;
-    if (!gen->min_p_set) gen->min_p = 0.0f;
+    if (!engine || !gen) return;
+    float temperature, top_p, min_p;
+    int top_k;
+    ds4_engine_sampling_defaults(engine, &temperature, &top_k, &top_p, &min_p);
+    if (!gen->temperature_set) gen->temperature = temperature;
+    if (!gen->top_k_set) gen->top_k = top_k;
+    if (!gen->top_p_set) gen->top_p = top_p;
+    if (!gen->min_p_set) gen->min_p = min_p;
 }
 
 static ds4_think_mode effective_think_mode(const agent_config *cfg) {
@@ -1113,9 +1122,55 @@ static char *agent_build_glm_tools_prompt(bool edit_upto) {
     return out;
 }
 
+static const char agent_laguna_tools_prompt_intro[] =
+    "You are a coding agent running in a local workspace. Use tools for local file and system work. "
+    "Avoid printing large file contents or large code blocks as answers; create or edit files with tools, "
+    "then summarize results briefly.\n\n"
+    "### Tools\n\n"
+    "You may call functions to assist with the user query.\n"
+    "All available function signatures are listed below:\n"
+    "<available_tools>\n";
+
+static const char agent_laguna_tools_prompt_after_schemas[] =
+    "</available_tools>\n\n"
+    "For a function call, use exactly this format:\n"
+    "<tool_call>{function-name}<arg_key>{argument-name}</arg_key>"
+    "<arg_value>{argument-value}</arg_value></tool_call>\n\n"
+    "Tool calls are not allowed inside <think></think>; finish thinking before emitting <tool_call>.\n\n"
+    "# Rules\n\n"
+    "- Use Laguna's native <tool_call>, <arg_key>, and <arg_value> tags.\n"
+    "- read path alone returns a context-sized bounded chunk, not the whole file; for first looks at large files, prefer max_lines around 80-160.\n"
+    "- If read says more lines are available, call more with count=<lines> to read the next chunk.\n"
+    "- Use whole=true only when the user explicitly asks for complete file contents or when bounded chunks are insufficient; add raw=true only when line numbers would corrupt the payload.\n"
+    "- " AGENT_EDIT_TARGET_RULE "\n";
+
+static const char agent_laguna_tools_prompt_rules_tail[] =
+    "- For long bash jobs, pass refresh_sec and then poll with bash_status or stop with bash_stop.\n"
+    "- Preserve the current system configuration unless the user explicitly asks otherwise.\n";
+
+static char *agent_build_laguna_tools_prompt(bool edit_upto) {
+    const char *edit = edit_upto ? agent_glm_tools_prompt_edit_upto
+                                 : agent_glm_tools_prompt_edit_exact;
+    size_t a = strlen(agent_laguna_tools_prompt_intro);
+    size_t b = strlen(agent_glm_tool_schemas);
+    size_t c = strlen(agent_laguna_tools_prompt_after_schemas);
+    size_t d = strlen(edit);
+    size_t e = strlen(agent_laguna_tools_prompt_rules_tail);
+    char *out = xmalloc(a + b + c + d + e + 1);
+    memcpy(out, agent_laguna_tools_prompt_intro, a);
+    memcpy(out + a, agent_glm_tool_schemas, b);
+    memcpy(out + a + b, agent_laguna_tools_prompt_after_schemas, c);
+    memcpy(out + a + b + c, edit, d);
+    memcpy(out + a + b + c + d, agent_laguna_tools_prompt_rules_tail, e + 1);
+    return out;
+}
+
 static char *agent_build_tools_prompt(ds4_engine *engine, bool edit_upto) {
-    if (agent_tool_syntax_for_engine(engine) == AGENT_TOOL_SYNTAX_GLM)
+    agent_tool_syntax syntax = agent_tool_syntax_for_engine(engine);
+    if (syntax == AGENT_TOOL_SYNTAX_GLM)
         return agent_build_glm_tools_prompt(edit_upto);
+    if (syntax == AGENT_TOOL_SYNTAX_LAGUNA)
+        return agent_build_laguna_tools_prompt(edit_upto);
     return agent_build_dsml_tools_prompt(edit_upto);
 }
 
@@ -1154,7 +1209,7 @@ static void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
      * supplied -sys text: arbitrary user text containing <｜User｜>, <think>, or
      * ｜DSML｜ must remain plain content, not control tokens. */
     char *tools_prompt = agent_build_tools_prompt(engine, edit_upto);
-    if (agent_tool_syntax_for_engine(engine) == AGENT_TOOL_SYNTAX_GLM)
+    if (agent_tool_syntax_is_tagged(agent_tool_syntax_for_engine(engine)))
         ds4_chat_append_message(engine, tokens, "system", tools_prompt);
     else
         ds4_tokenize_rendered_chat(engine, tools_prompt, tokens);
@@ -1208,7 +1263,8 @@ static void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
     agent_publish_system_status(w, "Re-injecting system prompt reminder...");
     agent_trace(w, "system prompt reminder injected at transcript=%d",
                 w->transcript.len);
-    if (agent_tool_syntax_for_engine(w->engine) == AGENT_TOOL_SYNTAX_GLM) {
+    if (agent_tool_syntax_is_tagged(
+            agent_tool_syntax_for_engine(w->engine))) {
         ds4_chat_append_message(w->engine, &w->transcript, "system", reminder);
     } else {
         ds4_tokenize_rendered_chat(w->engine, reminder, &w->transcript);
@@ -1588,7 +1644,7 @@ static bool agent_glm_arg_value_close_tail(const char *tail, size_t len,
 static bool agent_tool_value_close_tail(agent_tool_syntax syntax,
                                         const char *tail, size_t len,
                                         bool *complete) {
-    if (syntax == AGENT_TOOL_SYNTAX_GLM)
+    if (agent_tool_syntax_is_tagged(syntax))
         return agent_glm_arg_value_close_tail(tail, len, complete);
     return agent_dsml_parameter_close_tail(tail, len, complete);
 }
@@ -1772,7 +1828,7 @@ static void agent_glm_tool_parse(agent_dsml_parser *p) {
 static void agent_dsml_finish(agent_dsml_parser *p) {
     if (!p || p->state == AGENT_DSML_DONE || p->state == AGENT_DSML_ERROR)
         return;
-    if (p->syntax != AGENT_TOOL_SYNTAX_GLM || !p->glm_after_call)
+    if (!agent_tool_syntax_is_tagged(p->syntax) || !p->glm_after_call)
         return;
 
     while (p->parse_pos < p->raw_len &&
@@ -1790,7 +1846,7 @@ static void agent_dsml_finish(agent_dsml_parser *p) {
  * until enough bytes arrive, while malformed completed input switches to
  * AGENT_DSML_ERROR so the model gets a retryable tool error. */
 static void agent_dsml_parse(agent_dsml_parser *p) {
-    if (p->syntax == AGENT_TOOL_SYNTAX_GLM) {
+    if (agent_tool_syntax_is_tagged(p->syntax)) {
         agent_glm_tool_parse(p);
         return;
     }
@@ -1873,7 +1929,7 @@ static void agent_dsml_parse(agent_dsml_parser *p) {
 }
 
 static void agent_dsml_start(agent_dsml_parser *p) {
-    const char *start = p->syntax == AGENT_TOOL_SYNTAX_GLM ?
+    const char *start = agent_tool_syntax_is_tagged(p->syntax) ?
         "<tool_call>" : "<｜DSML｜tool_calls>";
     p->state = AGENT_DSML_STRUCTURAL;
     p->search_len = 0;
@@ -1882,7 +1938,7 @@ static void agent_dsml_start(agent_dsml_parser *p) {
 }
 
 static void agent_dsml_feed(agent_dsml_parser *p, const char *s, size_t n) {
-    const char *start = p->syntax == AGENT_TOOL_SYNTAX_GLM ?
+    const char *start = agent_tool_syntax_is_tagged(p->syntax) ?
         "<tool_call>" : "<｜DSML｜tool_calls>";
     const size_t start_len = strlen(start);
     if (p->state == AGENT_DSML_DONE || p->state == AGENT_DSML_ERROR) return;
@@ -3600,7 +3656,8 @@ static void agent_stream_start_dsml(agent_stream_renderer *sr, bool ignored) {
     sr->dsml_start_len = 0;
     sr->post_think_gap = false;
     agent_trace(sr->renderer->worker, "%s tool start detected%s",
-                sr->syntax == AGENT_TOOL_SYNTAX_GLM ? "glm" : "dsml",
+                sr->syntax == AGENT_TOOL_SYNTAX_LAGUNA ? "laguna" :
+                (sr->syntax == AGENT_TOOL_SYNTAX_GLM ? "glm" : "dsml"),
                 ignored ? " inside thinking" : "");
     agent_dsml_start(sr->parser);
     if (!ignored) {
@@ -3626,7 +3683,7 @@ static bool agent_stream_dsml_start_match(agent_tool_syntax syntax,
                                           const char *tail, size_t len,
                                           bool *complete,
                                           bool *implicit_invoke) {
-    if (syntax == AGENT_TOOL_SYNTAX_GLM) {
+    if (agent_tool_syntax_is_tagged(syntax)) {
         static const char glm_call[] = "<tool_call>";
         size_t form_len = sizeof(glm_call) - 1;
         *complete = false;
@@ -3719,7 +3776,7 @@ static void agent_stream_note_plain_dsml_byte(agent_stream_renderer *sr,
  * can split "<｜DSML｜tool_calls>" across arbitrary tokens. */
 static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
     static const char canonical_invoke[] = "<｜DSML｜invoke";
-    const char *start = sr->syntax == AGENT_TOOL_SYNTAX_GLM ?
+    const char *start = agent_tool_syntax_is_tagged(sr->syntax) ?
         "<tool_call>" : "<｜DSML｜tool_calls>";
     if (sr->parser->state == AGENT_DSML_ERROR) return;
     agent_stream_note_thinking_dsml_byte(sr, c);
@@ -4436,7 +4493,8 @@ static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
     if (agent_tool_syntax_for_engine(w->engine) == AGENT_TOOL_SYNTAX_GLM) {
         const char *effort = ds4_glm_reasoning_effort_text(think_mode);
         if (effort) ds4_chat_append_message(w->engine, out, "system", effort);
-    } else if (w->cfg->gen.think_mode == DS4_THINK_MAX &&
+    } else if (!ds4_engine_is_laguna(w->engine) &&
+               w->cfg->gen.think_mode == DS4_THINK_MAX &&
                think_mode == DS4_THINK_MAX) {
         ds4_chat_append_max_effort_prefix(w->engine, out);
     }
@@ -7003,10 +7061,9 @@ static void test_agent_glm_tools_prompt_is_native(void) {
 }
 
 static void test_agent_glm_template_policy(void) {
-    AGENT_TEST_ASSERT(!agent_tool_syntax_assistant_turn_uses_eos(
-        AGENT_TOOL_SYNTAX_GLM));
-    AGENT_TEST_ASSERT(agent_tool_syntax_assistant_turn_uses_eos(
-        AGENT_TOOL_SYNTAX_DSML));
+    AGENT_TEST_ASSERT(agent_tool_syntax_is_tagged(AGENT_TOOL_SYNTAX_GLM));
+    AGENT_TEST_ASSERT(agent_tool_syntax_is_tagged(AGENT_TOOL_SYNTAX_LAGUNA));
+    AGENT_TEST_ASSERT(!agent_tool_syntax_is_tagged(AGENT_TOOL_SYNTAX_DSML));
     AGENT_TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_HIGH),
                               "Reasoning Effort: High"));
     AGENT_TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_MAX),
@@ -8508,7 +8565,7 @@ static int worker_sample_with_mode(agent_worker *w, const agent_config *cfg,
                                    bool greedy, uint64_t *rng) {
     return ds4_session_sample(w->session,
                               greedy ? 0.0f : cfg->gen.temperature,
-                              0,
+                              greedy ? 0 : cfg->gen.top_k,
                               greedy ? 1.0f : cfg->gen.top_p,
                               greedy ? 0.0f : cfg->gen.min_p,
                               rng);
@@ -8692,9 +8749,9 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             }
             int token = worker_sample_with_mode(w, cfg, greedy_sampling, &rng);
             if (ds4_token_is_stop_for_think_mode(w->engine, token, think_mode)) {
-                if (tool_syntax == AGENT_TOOL_SYNTAX_GLM &&
+                if (agent_tool_syntax_is_tagged(tool_syntax) &&
                     token != ds4_token_eos(w->engine)) {
-                    agent_trace(w, "glm assistant generation stopped before control token id=%d", token);
+                    agent_trace(w, "tagged assistant generation stopped before control token id=%d", token);
                 }
                 break;
             }
@@ -8778,8 +8835,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         {
             malformed_tool = true;
             snprintf(dsml.error, sizeof(dsml.error),
-                     tool_syntax == AGENT_TOOL_SYNTAX_GLM ?
-                     "incomplete GLM tool call" :
+                     agent_tool_syntax_is_tagged(tool_syntax) ?
+                     "incomplete tagged tool call" :
                      "incomplete DSML tool call");
         }
 
@@ -8802,12 +8859,12 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             tool_result = agent_buf_take(&b);
         } else if (malformed_tool) {
             agent_buf b = {0};
-            agent_buf_puts(&b, tool_syntax == AGENT_TOOL_SYNTAX_GLM ?
-                           "Tool error: invalid GLM tool call: " :
+            agent_buf_puts(&b, agent_tool_syntax_is_tagged(tool_syntax) ?
+                           "Tool error: invalid tagged tool call: " :
                            "Tool error: invalid DSML tool call: ");
             agent_buf_puts(&b, dsml.error[0] ? dsml.error : "parse error");
             agent_buf_puts(&b, "\n");
-            agent_buf_puts(&b, tool_syntax == AGENT_TOOL_SYNTAX_GLM ?
+            agent_buf_puts(&b, agent_tool_syntax_is_tagged(tool_syntax) ?
                            agent_glm_syntax_reminder :
                            agent_dsml_syntax_reminder);
             tool_result = agent_buf_take(&b);
@@ -8931,7 +8988,7 @@ static int worker_run_raw_prompt(agent_worker *w, const char *user_text) {
     while (generated < max_tokens && !worker_should_interrupt(w)) {
         int token = ds4_session_sample(w->session,
                                        cfg->gen.temperature,
-                                       0,
+                                       cfg->gen.top_k,
                                        cfg->gen.top_p,
                                        cfg->gen.min_p,
                                        &rng);

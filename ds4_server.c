@@ -540,6 +540,7 @@ typedef enum {
 typedef enum {
     SERVER_MODEL_SYNTAX_DEEPSEEK,
     SERVER_MODEL_SYNTAX_GLM,
+    SERVER_MODEL_SYNTAX_LAGUNA,
 } server_model_syntax;
 
 static void random_tool_id(char *dst, size_t dstlen, api_style api) {
@@ -824,6 +825,16 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->think_mode = DS4_THINK_HIGH;
 }
 
+static void request_apply_model_sampling_defaults(ds4_engine *engine, request *r) {
+    float temperature, top_p, min_p;
+    int top_k;
+    ds4_engine_sampling_defaults(engine, &temperature, &top_k, &top_p, &min_p);
+    if (!r->temperature_set) r->temperature = temperature;
+    if (!r->top_k_set) r->top_k = top_k;
+    if (!r->top_p_set) r->top_p = top_p;
+    if (!r->min_p_set) r->min_p = min_p;
+}
+
 static void request_free(request *r) {
     ds4_tokens_free(&r->prompt);
     free(r->model);
@@ -955,6 +966,9 @@ static bool parse_output_config_effort(const char **p, ds4_think_mode *effort) {
 static bool model_alias_disables_thinking(const char *model) {
     return model &&
            (!strcmp(model, "deepseek-chat") ||
+            !strcmp(model, "laguna-s-2.1-chat") ||
+            !strcmp(model, "laguna-s-2.1-no-think") ||
+            !strcmp(model, "laguna-s-2.1-nothink") ||
             !strcmp(model, "glm-5.2-chat") ||
             !strcmp(model, "glm-5.2-no-think") ||
             !strcmp(model, "glm-5.2-nothink") ||
@@ -964,17 +978,20 @@ static bool model_alias_disables_thinking(const char *model) {
 static bool model_alias_enables_thinking(const char *model) {
     return model &&
            (!strcmp(model, "deepseek-reasoner") ||
+            !strcmp(model, "laguna-s-2.1-reasoner") ||
             !strcmp(model, "glm-5.2-reasoner") ||
             !strcmp(model, "zai/glm-5.2-reasoner"));
 }
 
 static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
-    return ds4_engine_is_glm_dsa(engine) ?
-           SERVER_MODEL_SYNTAX_GLM : SERVER_MODEL_SYNTAX_DEEPSEEK;
+    if (ds4_engine_is_glm_dsa(engine)) return SERVER_MODEL_SYNTAX_GLM;
+    if (ds4_engine_is_laguna(engine)) return SERVER_MODEL_SYNTAX_LAGUNA;
+    return SERVER_MODEL_SYNTAX_DEEPSEEK;
 }
 
 static const char *server_model_id_from_engine(ds4_engine *engine) {
     if (ds4_engine_is_glm_dsa(engine)) return "glm-5.2";
+    if (ds4_engine_is_laguna(engine)) return "laguna-s-2.1";
     return ds4_engine_model_id(engine) == 1 ?
            "deepseek-v4-pro" : "deepseek-v4-flash";
 }
@@ -983,6 +1000,12 @@ static bool server_model_alias_known(const char *id) {
     return id &&
            (!strcmp(id, "deepseek-v4-flash") ||
             !strcmp(id, "deepseek-v4-pro") ||
+            !strcmp(id, "laguna-s-2.1") ||
+            !strcmp(id, "laguna-s-2.1-chat") ||
+            !strcmp(id, "laguna-s-2.1-no-think") ||
+            !strcmp(id, "laguna-s-2.1-nothink") ||
+            !strcmp(id, "laguna-s-2.1-reasoner") ||
+            !strcmp(id, "poolside/laguna-s-2.1") ||
             !strcmp(id, "glm-5.2") ||
             !strcmp(id, "glm-5.2-chat") ||
             !strcmp(id, "glm-5.2-no-think") ||
@@ -2404,12 +2427,36 @@ static void append_glm_tool_calls_text(buf *b, const tool_calls *calls,
     }
 }
 
+static void append_laguna_tool_calls_text(buf *b, const tool_calls *calls,
+                                          const tool_schema_orders *tool_orders) {
+    if (!calls || calls->len == 0) return;
+    if (calls->raw_tool_text && calls->raw_tool_text[0]) {
+        buf_puts(b, calls->raw_tool_text);
+        return;
+    }
+    for (int i = 0; i < calls->len; i++) {
+        const tool_call *tc = &calls->v[i];
+        const tool_schema_order *order =
+            tool_schema_orders_find(tool_orders, tc->name);
+        buf_puts(b, "<tool_call>");
+        buf_puts(b, tc->name ? tc->name : "");
+        if (!append_glm_arguments_from_json(b, tc->arguments, order)) {
+            buf_puts(b, "<arg_key>arguments</arg_key><arg_value>");
+            append_glm_arg_value_text(b, tc->arguments);
+            buf_puts(b, "</arg_value>");
+        }
+        buf_puts(b, "</tool_call>");
+    }
+}
+
 static void append_tool_calls_text_for_syntax(buf *b,
                                               server_model_syntax syntax,
                                               const tool_calls *calls,
                                               const tool_schema_orders *tool_orders) {
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         append_glm_tool_calls_text(b, calls, tool_orders);
+    } else if (syntax == SERVER_MODEL_SYNTAX_LAGUNA) {
+        append_laguna_tool_calls_text(b, calls, tool_orders);
     } else {
         append_dsml_tool_calls_text(b, calls);
     }
@@ -2604,6 +2651,96 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
     return buf_take(&out);
 }
 
+static bool text_has_nonspace(const char *s) {
+    for (s = s ? s : ""; *s; s++) {
+        if (!isspace((unsigned char)*s)) return true;
+    }
+    return false;
+}
+
+static void buf_puts_rstrip(buf *b, const char *s) {
+    const char *start = s ? s : "";
+    const char *end = start + strlen(start);
+    while (end > start && isspace((unsigned char)end[-1])) end--;
+    buf_append(b, start, (size_t)(end - start));
+}
+
+static char *render_laguna_chat_prompt_text(const chat_msgs *msgs,
+                                            const char *tool_schemas,
+                                            const tool_schema_orders *tool_orders,
+                                            ds4_think_mode think_mode) {
+    const bool think = ds4_think_mode_enabled(think_mode);
+    const bool tools = tool_schemas && tool_schemas[0];
+    const char *system =
+        "You are a helpful, conversationally-fluent assistant made by Poolside. "
+        "You are here to be helpful to users through natural language conversations.";
+    int start = 0;
+    if (msgs && msgs->len > 0 && role_is_system(msgs->v[0].role)) {
+        system = msgs->v[0].content ? msgs->v[0].content : "";
+        start = 1;
+    }
+
+    buf out = {0};
+    buf_puts(&out, "〈|EOS|〉");
+    if (text_has_nonspace(system) || tools || think) {
+        buf_puts(&out, "<system>");
+        if (text_has_nonspace(system)) {
+            buf_puts_rstrip(&out, system);
+            if (tools) buf_puts(&out, "\n\n");
+        }
+        if (tools) {
+            buf_puts(&out,
+                     "### Tools\n\n"
+                     "You may call functions to assist with the user query.\n"
+                     "All available function signatures are listed below:\n"
+                     "<available_tools>\n");
+            buf_puts(&out, tool_schemas);
+            if (out.len && out.ptr[out.len - 1] != '\n') buf_putc(&out, '\n');
+            buf_puts(&out, "</available_tools>");
+        }
+        buf_puts(&out, "</system>\n");
+    }
+
+    bool pending_assistant = false;
+    for (int i = start; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_system(m->role)) {
+            buf_puts(&out, "<system>");
+            buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "</system>\n");
+        } else if (!strcmp(m->role, "user")) {
+            buf_puts(&out, "<user>");
+            buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "</user>\n");
+            pending_assistant = true;
+        } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
+            buf_puts(&out, "<tool_response>");
+            append_glm_tool_response_text(&out, m->content);
+            buf_puts(&out, "</tool_response>\n");
+            pending_assistant = true;
+        } else if (!strcmp(m->role, "assistant")) {
+            buf_puts(&out, "<assistant>");
+            if (think) {
+                buf_puts(&out, "<think>");
+                buf_puts(&out, m->reasoning ? m->reasoning : "");
+                buf_puts(&out, "</think>");
+            } else {
+                buf_puts(&out, "</think>");
+            }
+            buf_puts(&out, m->content ? m->content : "");
+            append_laguna_tool_calls_text(&out, &m->calls, tool_orders);
+            buf_puts(&out, "</assistant>\n");
+            pending_assistant = false;
+        }
+    }
+
+    if (pending_assistant) {
+        buf_puts(&out, "<assistant>");
+        buf_puts(&out, think ? "<think>" : "</think>");
+    }
+    return buf_take(&out);
+}
+
 static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
                                                 const chat_msgs *msgs,
                                                 const char *tool_schemas,
@@ -2612,6 +2749,10 @@ static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         return render_glm_chat_prompt_text(msgs, tool_schemas,
                                            tool_orders, think_mode);
+    }
+    if (syntax == SERVER_MODEL_SYNTAX_LAGUNA) {
+        return render_laguna_chat_prompt_text(msgs, tool_schemas,
+                                              tool_orders, think_mode);
     }
     return render_deepseek_chat_prompt_text(msgs, tool_schemas,
                                             tool_orders, think_mode);
@@ -2729,12 +2870,62 @@ static char *render_glm_live_tool_tail(const chat_msgs *msgs, int start,
     return buf_take(&out);
 }
 
+static char *render_laguna_live_tool_tail(const chat_msgs *msgs, int start,
+                                          const tool_schema_orders *tool_orders,
+                                          ds4_think_mode think_mode) {
+    const bool think = ds4_think_mode_enabled(think_mode);
+    buf out = {0};
+    /* The generated stop token is inspected but not accepted into the live KV. */
+    buf_puts(&out, "</assistant>\n");
+    bool pending_assistant = false;
+    for (int i = start; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_system(m->role)) {
+            buf_puts(&out, "<system>");
+            buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "</system>\n");
+        } else if (!strcmp(m->role, "user")) {
+            buf_puts(&out, "<user>");
+            buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "</user>\n");
+            pending_assistant = true;
+        } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
+            buf_puts(&out, "<tool_response>");
+            append_glm_tool_response_text(&out, m->content);
+            buf_puts(&out, "</tool_response>\n");
+            pending_assistant = true;
+        } else if (!strcmp(m->role, "assistant")) {
+            buf_puts(&out, "<assistant>");
+            if (think) {
+                buf_puts(&out, "<think>");
+                buf_puts(&out, m->reasoning ? m->reasoning : "");
+                buf_puts(&out, "</think>");
+            } else {
+                buf_puts(&out, "</think>");
+            }
+            buf_puts(&out, m->content ? m->content : "");
+            append_laguna_tool_calls_text(&out, &m->calls, tool_orders);
+            buf_puts(&out, "</assistant>\n");
+            pending_assistant = false;
+        }
+    }
+    if (pending_assistant) {
+        buf_puts(&out, "<assistant>");
+        buf_puts(&out, think ? "<think>" : "</think>");
+    }
+    return buf_take(&out);
+}
+
 static char *render_live_tool_tail_for_syntax(server_model_syntax syntax,
                                               const chat_msgs *msgs, int start,
                                               const tool_schema_orders *tool_orders,
                                               ds4_think_mode think_mode) {
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         return render_glm_live_tool_tail(msgs, start, tool_orders, think_mode);
+    }
+    if (syntax == SERVER_MODEL_SYNTAX_LAGUNA) {
+        return render_laguna_live_tool_tail(msgs, start, tool_orders,
+                                            think_mode);
     }
     return render_deepseek_live_tool_tail(msgs, start, think_mode);
 }
@@ -5186,7 +5377,8 @@ static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
                                                   char **content_out,
                                                   char **reasoning_out,
                                                   tool_calls *calls) {
-    if (syntax == SERVER_MODEL_SYNTAX_GLM) {
+    if (syntax == SERVER_MODEL_SYNTAX_GLM ||
+        syntax == SERVER_MODEL_SYNTAX_LAGUNA) {
         return parse_glm_generated_message_ex(text, require_thinking_closed,
                                               content_out, reasoning_out,
                                               calls);
@@ -10395,11 +10587,45 @@ static char *build_invalid_glm_tool_error_suffix(const request *r,
     return buf_take(&suffix);
 }
 
+static char *build_invalid_laguna_tool_error_suffix(
+        const request *r,
+        const thinking_state *thinking,
+        const char *detail) {
+    buf tool_error = {0};
+    buf_puts(&tool_error, "Tool error: invalid Laguna tool call");
+    if (detail && detail[0]) {
+        buf_puts(&tool_error, ": ");
+        buf_puts(&tool_error, detail);
+    }
+    buf_puts(&tool_error,
+             "\nThe previous assistant output was not executed because the "
+             "<tool_call> syntax was malformed. Emit a new valid <tool_call>, "
+             "or answer normally if no tool is needed.");
+
+    buf suffix = {0};
+    if (r && ds4_think_mode_enabled(r->think_mode) &&
+        thinking && thinking->inside) {
+        buf_puts(&suffix, "</think>");
+    }
+    buf_puts(&suffix, "</assistant>\n<tool_response>");
+    append_glm_tool_response_text(&suffix, tool_error.ptr ? tool_error.ptr : "");
+    buf_puts(&suffix, "</tool_response>\n<assistant>");
+    buf_puts(&suffix,
+             r && ds4_think_mode_enabled(r->think_mode) ?
+             "<think>" : "</think>");
+
+    buf_free(&tool_error);
+    return buf_take(&suffix);
+}
+
 static char *build_invalid_tool_call_error_suffix(const request *r,
                                                   const thinking_state *thinking,
                                                   const char *detail) {
     if (r && r->model_syntax == SERVER_MODEL_SYNTAX_GLM) {
         return build_invalid_glm_tool_error_suffix(r, thinking, detail);
+    }
+    if (r && r->model_syntax == SERVER_MODEL_SYNTAX_LAGUNA) {
+        return build_invalid_laguna_tool_error_suffix(r, thinking, detail);
     }
     return build_invalid_dsml_tool_error_suffix(r, thinking, detail);
 }
@@ -10709,7 +10935,9 @@ static char *build_tool_checkpoint_suffix(const request *r, const char *content,
     buf_puts(&suffix, content ? content : "");
     append_tool_calls_text_for_syntax(&suffix, syntax, calls,
                                       r ? &r->tool_orders : NULL);
-    if (syntax != SERVER_MODEL_SYNTAX_GLM) {
+    if (syntax == SERVER_MODEL_SYNTAX_LAGUNA) {
+        buf_puts(&suffix, "</assistant>\n");
+    } else if (syntax != SERVER_MODEL_SYNTAX_GLM) {
         buf_puts(&suffix, "<｜end▁of▁sentence｜>");
     }
     return buf_take(&suffix);
@@ -10739,7 +10967,9 @@ static char *build_responses_visible_assistant_suffix(const request *r,
     buf_puts(&suffix, content ? content : "");
     append_tool_calls_text_for_syntax(&suffix, syntax, calls,
                                       r ? &r->tool_orders : NULL);
-    if (syntax != SERVER_MODEL_SYNTAX_GLM) {
+    if (syntax == SERVER_MODEL_SYNTAX_LAGUNA) {
+        buf_puts(&suffix, "</assistant>\n");
+    } else if (syntax != SERVER_MODEL_SYNTAX_GLM) {
         buf_puts(&suffix, "<｜end▁of▁sentence｜>");
     }
     return buf_take(&suffix);
@@ -11649,10 +11879,15 @@ decode_again:
              * only for knobs the client left out: an explicit request value
              * (e.g. temperature 0 from a benchmark harness) must win, or the
              * same greedy request returns different text on every call. */
-            if (!j->req.temperature_set) temperature = DS4_DEFAULT_TEMPERATURE;
-            if (!j->req.top_k_set) top_k = 0;
-            if (!j->req.top_p_set) top_p = DS4_DEFAULT_TOP_P;
-            if (!j->req.min_p_set) min_p = DS4_DEFAULT_MIN_P;
+            float default_temperature, default_top_p, default_min_p;
+            int default_top_k;
+            ds4_engine_sampling_defaults(s->engine, &default_temperature,
+                                         &default_top_k, &default_top_p,
+                                         &default_min_p);
+            if (!j->req.temperature_set) temperature = default_temperature;
+            if (!j->req.top_k_set) top_k = default_top_k;
+            if (!j->req.top_p_set) top_p = default_top_p;
+            if (!j->req.min_p_set) min_p = default_min_p;
         }
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
             temperature = 0.0f;
@@ -12670,7 +12905,13 @@ static bool send_model(server *s, int fd, const char *id) {
 static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    if (ds4_engine_is_glm_dsa(s->engine)) {
+    if (ds4_engine_is_laguna(s->engine)) {
+        append_model_json(&b, s, "laguna-s-2.1");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "laguna-s-2.1-chat");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "laguna-s-2.1-reasoner");
+    } else if (ds4_engine_is_glm_dsa(s->engine)) {
         append_model_json(&b, s, "glm-5.2");
         buf_putc(&b, ',');
         append_model_json(&b, s, "glm-5.2-chat");
@@ -12855,6 +13096,7 @@ static void *client_main(void *arg) {
         free(req.model);
         req.model = xstrdup(server_model_id_from_engine(s->engine));
     }
+    request_apply_model_sampling_defaults(s->engine, &req);
     if (request_exceeds_context(&req, ctx_size)) {
         http_error_context_length_exceeded(fd, s->enable_cors, &req, req.prompt.len, ctx_size);
         request_free(&req);
@@ -14954,11 +15196,17 @@ static void test_model_alias_thinking_controls(void) {
     TEST_ASSERT(model_alias_disables_thinking("glm-5.2-no-think"));
     TEST_ASSERT(model_alias_disables_thinking("zai/glm-5.2-chat"));
     TEST_ASSERT(!model_alias_disables_thinking("glm-5.2"));
+    TEST_ASSERT(model_alias_disables_thinking("laguna-s-2.1-chat"));
+    TEST_ASSERT(model_alias_disables_thinking("laguna-s-2.1-no-think"));
+    TEST_ASSERT(!model_alias_disables_thinking("laguna-s-2.1"));
     TEST_ASSERT(model_alias_enables_thinking("deepseek-reasoner"));
     TEST_ASSERT(model_alias_enables_thinking("glm-5.2-reasoner"));
     TEST_ASSERT(model_alias_enables_thinking("zai/glm-5.2-reasoner"));
+    TEST_ASSERT(model_alias_enables_thinking("laguna-s-2.1-reasoner"));
     TEST_ASSERT(server_model_alias_known("glm-5.2-chat"));
     TEST_ASSERT(server_model_alias_known("glm-5.2-reasoner"));
+    TEST_ASSERT(server_model_alias_known("laguna-s-2.1-chat"));
+    TEST_ASSERT(server_model_alias_known("laguna-s-2.1-reasoner"));
 }
 
 static void test_api_thinking_controls_parse(void) {
@@ -15197,6 +15445,114 @@ static void test_render_glm_preserves_reasoning_with_tools(void) {
     free(prompt);
     tool_schema_orders_free(&orders);
     chat_msgs_free(&msgs);
+}
+
+static void test_render_laguna_chat_prompt_text(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Hello");
+    chat_msgs_push(&msgs, user);
+
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_LAGUNA, &msgs, NULL, NULL, DS4_THINK_NONE);
+    const char *expected =
+        "〈|EOS|〉"
+        "<system>You are a helpful, conversationally-fluent assistant made by Poolside. "
+        "You are here to be helpful to users through natural language conversations.</system>\n"
+        "<user>Hello</user>\n<assistant></think>";
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(!strcmp(prompt, expected));
+    free(prompt);
+
+    prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_LAGUNA, &msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(strstr(prompt, "<assistant><think>") != NULL);
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+static void test_render_laguna_tools_and_reasoning(void) {
+    chat_msgs msgs = {0};
+    chat_msg sys = {0};
+    sys.role = xstrdup("system");
+    sys.content = xstrdup("Code carefully.  \n");
+    chat_msgs_push(&msgs, sys);
+    chat_msg user1 = {0};
+    user1.role = xstrdup("user");
+    user1.content = xstrdup("pwd");
+    chat_msgs_push(&msgs, user1);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.reasoning = xstrdup("Use the shell.");
+    tool_call tc = {0};
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\":\"pwd\"}");
+    tool_calls_push(&assistant.calls, tc);
+    chat_msgs_push(&msgs, assistant);
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.content = xstrdup("/tmp");
+    chat_msgs_push(&msgs, tool);
+
+    tool_schema_orders orders = make_bash_order();
+    const char *schema =
+        "{\"type\":\"function\",\"function\":{\"name\":\"bash\"}}";
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_LAGUNA, &msgs, schema, &orders, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<system>Code carefully.\n\n### Tools\n\n") != NULL);
+    TEST_ASSERT(strstr(prompt, "<available_tools>\n") != NULL);
+    TEST_ASSERT(strstr(prompt, "</available_tools></system>\n") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<assistant><think>Use the shell.</think>"
+        "<tool_call>bash<arg_key>command</arg_key>"
+        "<arg_value>pwd</arg_value></tool_call></assistant>\n") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<tool_response>/tmp</tool_response>\n<assistant><think>") != NULL);
+
+    free(prompt);
+    tool_schema_orders_free(&orders);
+    chat_msgs_free(&msgs);
+}
+
+static void test_render_laguna_live_tool_tail(void) {
+    chat_msgs msgs = {0};
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.content = xstrdup("ok");
+    chat_msgs_push(&msgs, tool);
+    char *tail = render_live_tool_tail_for_syntax(
+        SERVER_MODEL_SYNTAX_LAGUNA, &msgs, 0, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(tail != NULL);
+    TEST_ASSERT(!strcmp(tail,
+        "</assistant>\n<tool_response>ok</tool_response>\n"
+        "<assistant><think>"));
+    free(tail);
+    chat_msgs_free(&msgs);
+}
+
+static void test_parse_laguna_tool_call_message(void) {
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    const char *raw =
+        "plan</think>Done<tool_call>bash"
+        "<arg_key>command</arg_key><arg_value>pwd</arg_value>"
+        "</tool_call>";
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_LAGUNA, raw, true,
+        &content, &reasoning, &calls));
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "plan"));
+    TEST_ASSERT(content && !strcmp(content, "Done"));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
+    TEST_ASSERT(calls.v[0].arguments &&
+                !strcmp(calls.v[0].arguments, "{\"command\": \"pwd\"}"));
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
 }
 
 static void test_dsml_tool_args_preserve_call_order(void) {
@@ -18324,6 +18680,10 @@ static void ds4_server_unit_tests_run(void) {
     test_render_glm_chat_prompt_text();
     test_render_glm_drops_old_reasoning_without_tools();
     test_render_glm_preserves_reasoning_with_tools();
+    test_render_laguna_chat_prompt_text();
+    test_render_laguna_tools_and_reasoning();
+    test_render_laguna_live_tool_tail();
+    test_parse_laguna_tool_call_message();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
     test_tool_schema_order_from_responses_tool_search();

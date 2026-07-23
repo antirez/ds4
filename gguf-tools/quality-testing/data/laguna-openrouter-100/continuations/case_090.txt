@@ -1,0 +1,1 @@
+Calibration data plays a critical role in **post-training quantization (PTQ)**, a technique to reduce model size and improve inference

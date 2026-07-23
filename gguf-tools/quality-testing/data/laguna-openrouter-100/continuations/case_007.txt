@@ -1,0 +1,1 @@
+Speculative decoding is a technique that accelerates inference in large language models (LLMs) by using a faster **draft model

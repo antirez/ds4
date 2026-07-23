@@ -1,0 +1,3 @@
+Here are three examples of useful server metrics, each addressing different aspects of server performance and reliability:
+
+1. **CPU

@@ -1,0 +1,1 @@
+Un **grande buffer Metal** (ad esempio, un buffer di grandi dimensioni utilizzato in

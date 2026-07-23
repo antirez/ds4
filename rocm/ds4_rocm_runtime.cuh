@@ -6385,3 +6385,7 @@ extern "C" void ds4_gpu_set_quality(bool quality) {
         (void)cublasSetMathMode(g_cublas, math_mode);
     }
 }
+
+extern "C" void ds4_gpu_set_tensor_matmul_suppressed(bool suppressed) {
+    (void)suppressed;
+}

@@ -1,0 +1,1 @@
+A good benchmark should measure performance under realistic and consistent conditions, providing standardized metrics that are reproducible, relevant to the intended use

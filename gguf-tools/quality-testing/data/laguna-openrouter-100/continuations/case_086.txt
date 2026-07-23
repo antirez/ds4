@@ -1,0 +1,1 @@
+Checksums detect accidental corruption by generating a unique numerical value (the checksum) from a data set using a mathematical algorithm. When

@@ -1,0 +1,1 @@
+La dimensione della **residenza** (resident set size, RSS) di una mappa di memoria
