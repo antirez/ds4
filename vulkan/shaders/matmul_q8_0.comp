@@ -1,0 +1,77 @@
+#version 460 core
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+/* Q8_0 matrix-vector: out[tok][row] = x[tok][*] · W_Q8[row][*]
+ *
+ * Grid: (y_scale, ceil(out_dim/y_scale), n_tok). 2D grid for out_dim up to 4G.
+ * row = gl_WorkGroupID.x + gl_WorkGroupID.y * pc.y_scale
+ *
+ * Q8_0 block = 36 bytes: float d (4) + int8 qs[32] (32) = 36 bytes = 9 x uint32.
+ */
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer XBuf   { float x_buf[]; };
+layout(set = 0, binding = 1) buffer WBuf   { uint  w_buf[]; };
+layout(set = 0, binding = 2) buffer OutBuf  { float out_buf[]; };
+
+layout(push_constant) uniform PC {
+    uint in_dim;
+    uint out_dim;
+    uint n_tok;
+    uint blocks_per_row;
+    uint y_scale;
+} pc;
+
+shared float sx[8192];
+
+int extract_i8(uint word, uint byte_i) {
+    uint shifted = word >> (byte_i * 8u);
+    uint raw = shifted & 0xFFu;
+    return raw < 128u ? int(raw) : int(raw) - 256;
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * pc.y_scale;
+    uint tok = gl_WorkGroupID.z;
+    uint lid = gl_LocalInvocationIndex;
+
+    if (row >= pc.out_dim || tok >= pc.n_tok) return;
+
+    uint x_off = tok * pc.in_dim;
+    for (uint i = lid; i < pc.in_dim; i += 256u)
+        sx[i] = x_buf[x_off + i];
+    barrier();
+
+    double sum = 0.0;
+    uint row_blk = row * pc.blocks_per_row;
+
+    for (uint b = lid; b < pc.blocks_per_row; b += 256u) {
+        uint blk_off = (row_blk + b) * 9u;
+        float d = uintBitsToFloat(w_buf[blk_off]);
+
+        uint base = b * 32u;
+        for (uint w = 0u; w < 8u; w++) {
+            uint word = w_buf[blk_off + 1u + w];
+            uint byte_base = base + w * 4u;
+            for (uint j = 0u; j < 4u && (byte_base + j) < pc.in_dim; j++) {
+                int q = extract_i8(word, j);
+                sum += double(sx[byte_base + j]) * double(d * float(q));
+            }
+        }
+    }
+
+    double grp = subgroupAdd(sum);
+
+    if (subgroupElect())
+        sx[lid] = float(grp);
+    barrier();
+
+    if (lid == 0u) {
+        double final = 0.0;
+        for (uint i = 0u; i < 256u; i += gl_SubgroupSize)
+            final += double(sx[i]);
+        out_buf[tok * pc.out_dim + row] = float(final);
+    }
+}

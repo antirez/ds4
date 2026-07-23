@@ -147,7 +147,10 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
                                 ds4_help_tool tool, bool full) {
     title(fp, c, "Model And Runtime");
     opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ds4flash.gguf");
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_VULKAN_BUILD)
+    opt(fp, c, "--vulkan | --cpu", "Select the backend explicitly.");
+    opt(fp, c, "--backend NAME", "Backend name: vulkan or cpu.");
+#elif defined(DS4_ROCM_BUILD)
     opt(fp, c, "--metal | --rocm | --cpu", "Select the backend explicitly.");
     opt(fp, c, "--backend NAME", "Backend name: metal, rocm, or cpu.");
 #else

@@ -1,0 +1,25 @@
+#version 460 core
+/* rms_norm_weight_rows_tensor: out_buf[r][i] = x[r][i] / sqrt(mean(x^2) + eps) * w[i]
+ * Workgroup per row. 256 threads cooperatively compute sum(x^2), then apply norm.
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer XBuf   { float x_buf[]; };
+layout(set = 0, binding = 1) buffer WBuf   { float w_buf[]; };
+layout(set = 0, binding = 2) buffer OutBuf  { float out_buf[]; };
+layout(push_constant) uniform PC {
+    uint n; uint rows; float eps;
+} pc;
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationIndex;
+    if (r >= pc.rows) return;
+    uint off = r * pc.n;
+    double sum = 0.0;
+    for (uint i = lid; i < pc.n; i += 256u)
+        sum += double(x_buf[off + i]) * double(x_buf[off + i]);
+    float mean = float(sum / double(pc.n));
+    float rcp = inversesqrt(mean + pc.eps);
+    for (uint i = lid; i < pc.n; i += 256u)
+        out_buf[off + i] = x_buf[off + i] * rcp * w_buf[i];
+}

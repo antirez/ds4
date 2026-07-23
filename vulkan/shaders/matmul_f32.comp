@@ -1,0 +1,45 @@
+#version 460 core
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer XBuf  { float x_buf[];  };
+layout(set = 0, binding = 1) buffer WBuf  { float w_buf[];  };
+layout(set = 0, binding = 2) buffer OutBuf { float out_buf[]; };
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint N;
+    uint K;
+} pc;
+
+shared float tileA[16][16];
+shared float tileB[16][16];
+
+void main() {
+    uint row = gl_WorkGroupID.y * 16 + gl_LocalInvocationID.y;
+    uint col = gl_WorkGroupID.x * 16 + gl_LocalInvocationID.x;
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+
+    float sum = 0.0;
+    for (uint t = 0; t < pc.K; t += 16) {
+        if (row < pc.M && t + tx < pc.K)
+            tileA[ty][tx] = x_buf[row * pc.K + t + tx];
+        else
+            tileA[ty][tx] = 0.0;
+
+        if (col < pc.N && t + ty < pc.K)
+            tileB[tx][ty] = w_buf[col * pc.K + t + ty];
+        else
+            tileB[tx][ty] = 0.0;
+
+        barrier();
+        for (uint k = 0; k < 16; k++) {
+            sum += tileA[ty][k] * tileB[tx][k];
+        }
+        barrier();
+    }
+
+    if (row < pc.M && col < pc.N) {
+        out_buf[row * pc.N + col] = sum;
+    }
+}

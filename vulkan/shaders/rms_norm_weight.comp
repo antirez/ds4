@@ -1,0 +1,38 @@
+#version 460 core
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer InBuf  { float in_val[];   };
+layout(set = 0, binding = 1) buffer WBuf   { float w_val[];    };
+layout(set = 0, binding = 2) buffer OutBuf { float out_val[];  };
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint rows;
+    float eps;
+} pc;
+
+shared float ssum[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationIndex;
+    uint idx = row * pc.n;
+
+    float sum = 0.0;
+    for (uint i = lid; i < pc.n; i += 256) {
+        float v = in_val[idx + i];
+        sum += v * v;
+    }
+    ssum[lid] = sum;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (lid < s) ssum[lid] += ssum[lid + s];
+        barrier();
+    }
+    float rms_rcp = inversesqrt(ssum[0] / float(pc.n) + pc.eps);
+
+    for (uint i = lid; i < pc.n; i += 256) {
+        out_val[idx + i] = in_val[idx + i] * rms_rcp * w_val[i];
+    }
+}

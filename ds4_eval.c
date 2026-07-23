@@ -1482,6 +1482,7 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
 
 static ds4_backend parse_backend(const char *s, const char *opt) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
+    if (!strcmp(s, "vulkan")) return DS4_BACKEND_CUDA;
 #ifdef DS4_ROCM_BUILD
     if (!strcmp(s, "rocm")) return DS4_BACKEND_CUDA;
 #else
@@ -1588,6 +1589,8 @@ static eval_config parse_options(int argc, char **argv) {
             c.backend = parse_backend(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--metal")) {
             c.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--vulkan")) {
+            c.backend = DS4_BACKEND_CUDA;
 #ifdef DS4_ROCM_BUILD
         } else if (!strcmp(arg, "--rocm")) {
             c.backend = DS4_BACKEND_CUDA;

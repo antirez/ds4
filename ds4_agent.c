@@ -662,6 +662,8 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.backend = parse_backend(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--vulkan")) {
+            c.engine.backend = DS4_BACKEND_CUDA;
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
         } else if (!strcmp(arg, "--gpu-vram")) {

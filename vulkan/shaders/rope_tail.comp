@@ -1,0 +1,37 @@
+#version 460 core
+/* rope_tail_tensor: apply rotary position embedding
+ * For each head, apply cos/sin rotation to first n_rot elements.
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer XBuf { float x_buf[]; };
+layout(push_constant) uniform PC {
+    uint n_tok; uint n_head; uint head_dim; uint n_rot;
+    uint pos0; uint n_ctx_orig; int inverse;
+    float freq_base; float freq_scale;
+} pc;
+
+shared float sx[256];
+
+void main() {
+    uint t = gl_WorkGroupID.x / pc.n_head;
+    uint h = gl_WorkGroupID.x % pc.n_head;
+    uint lid = gl_LocalInvocationIndex;
+    if (t >= pc.n_tok) return;
+    uint off = (t * pc.n_head + h) * pc.head_dim;
+    
+    /* Get a pair of elements, apply rotation */
+    for (uint i = lid; i < pc.n_rot; i += 256u) {
+        float theta = pow(pc.freq_base, -2.0 * float(i) / float(pc.head_dim));
+        float cs = cos(float(pc.pos0) * theta * pc.freq_scale);
+        float sn = sin(float(pc.pos0) * theta * pc.freq_scale);
+        float v0 = x_buf[off + i];
+        float v1 = x_buf[off + i + 1u];
+        if (pc.inverse == 0) {
+            x_buf[off + i]     = v0 * cs - v1 * sn;
+            x_buf[off + i + 1u] = v0 * sn + v1 * cs;
+        } else {
+            x_buf[off + i]     = v0 * cs + v1 * sn;
+            x_buf[off + i + 1u] = -v0 * sn + v1 * cs;
+        }
+    }
+}

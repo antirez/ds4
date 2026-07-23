@@ -1,0 +1,24 @@
+#version 460 core
+/* head_rms_norm_tensor: per-head RMS norm on x[n_tok][n_head][head_dim]
+ * x[t][h][i] = x[t][h][i] / sqrt(mean(x^2) + eps) for each head
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer XBuf { float x_buf[]; };
+layout(push_constant) uniform PC { uint n_tok; uint n_head; uint head_dim; float eps; } pc;
+
+shared float ssum[256];
+
+void main() {
+    uint t = gl_WorkGroupID.x / pc.n_head;
+    uint h = gl_WorkGroupID.x % pc.n_head;
+    uint lid = gl_LocalInvocationIndex;
+    if (t >= pc.n_tok) return;
+    uint off = (t * pc.n_head + h) * pc.head_dim;
+    double sum = 0.0;
+    for (uint i = lid; i < pc.head_dim; i += 256u)
+        sum += double(x_buf[off + i]) * double(x_buf[off + i]);
+    float mean = float(sum / double(pc.head_dim));
+    float rcp = inversesqrt(mean + pc.eps);
+    for (uint i = lid; i < pc.head_dim; i += 256u)
+        x_buf[off + i] *= rcp;
+}

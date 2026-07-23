@@ -12631,6 +12631,7 @@ static void usage(FILE *fp, const char *topic) {
 
 static ds4_backend parse_backend_arg(const char *s, const char *arg) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
+    if (!strcmp(s, "vulkan")) return DS4_BACKEND_CUDA;
 #ifdef DS4_ROCM_BUILD
     if (!strcmp(s, "rocm")) return DS4_BACKEND_CUDA;
 #else
@@ -12639,9 +12640,9 @@ static ds4_backend parse_backend_arg(const char *s, const char *arg) {
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     server_log(DS4_LOG_DEFAULT, "ds4-server: invalid %s value: %s", arg, s);
 #ifdef DS4_ROCM_BUILD
-    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, rocm, cpu");
+    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, vulkan, rocm, cpu");
 #else
-    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, cuda, cpu");
+    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, vulkan, cuda, cpu");
 #endif
     exit(2);
 }
@@ -12821,6 +12822,8 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--vulkan")) {
+            c.engine.backend = DS4_BACKEND_CUDA;
 #ifdef DS4_ROCM_BUILD
         } else if (!strcmp(arg, "--rocm")) {
             c.engine.backend = DS4_BACKEND_CUDA;
