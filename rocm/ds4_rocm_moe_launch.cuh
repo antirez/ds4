@@ -238,8 +238,15 @@ static int routed_moe_q2_float_down_launch(
     uint32_t hot_max = 0u;
     const uint32_t hot_threshold = 8u;
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    /* The hot-expert WMMA kernels lay out one matrix fragment per 32 threads
+     * and are launched with 32*MT-thread blocks.  A fragment belongs to a whole
+     * wave, so on wave64 parts those blocks are half the waves the kernel
+     * assumes and the tiling is wrong.  Until they are reshaped for wave64,
+     * CDNA takes the portable expert-batch kernels below, which are correct on
+     * both and are what quality mode already uses. */
     const int use_wmma_hot = hot_experts_dev &&
         !g_quality_mode &&
+        cuda_device_wave_size() == 32 &&
         (expert_mid_dim % 16u) == 0u && (out_dim % 16u) == 0u;
 #else
     const int use_wmma_hot = 0;
@@ -957,10 +964,12 @@ static int routed_moe_launch(
         const uint32_t iq2_gate_hot_threshold = 8u;
         const uint32_t iq2_down_hot_threshold = 8u;
         uint32_t h_iq2_gate_hot[DS4_ROCM_MAX_N_EXPERT] = {0};
+        /* Wave32-shaped fragment tiling, as with use_wmma_hot above. */
         const uint32_t use_iq2_gate_wmma =
             ok && iq2_path && n_tokens > 1u && n_expert == 6u && !write_gate_up &&
             sorted_pairs && sorted_offsets && sorted_counts && tile_experts && iq2_gate_hot_dev && use_expert_tiles &&
             (expert_in_dim % 16u) == 0u && (expert_mid_dim % 16u) == 0u &&
+            cuda_device_wave_size() == 32 &&
             !g_quality_mode;
         if (use_iq2_gate_wmma) {
             uint32_t h_counts[DS4_ROCM_MAX_N_EXPERT] = {0};
