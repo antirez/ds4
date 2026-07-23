@@ -32966,6 +32966,25 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
                 (const __half *)staged_value->ptr,
                 pos0, n_tokens, cache_cap,
                 n_head, n_head_kv, head_dim, scale);
+    } else if (heads_per_kv == 9u &&
+               cuda_laguna_blackwell_ok() &&
+               getenv("DS4_CUDA_DFLASH_NO_BLACKWELL") == NULL &&
+               getenv("DS4_CUDA_LAGUNA_NO_GQA_PREFILL") == NULL) {
+        /* The official Laguna DFlash decoder has 72 query heads over eight
+         * KV heads. On Blackwell, keeping all nine query reductions in one
+         * 128-thread block amortizes each 512-row K/V fetch across the full
+         * group; older devices retain the lower-pressure per-head kernel. */
+        laguna_attention_prefill_gqa_kernel<9><<<
+                dim3(n_head_kv, n_tokens, 1u), head_dim>>>(
+                (float *)heads->ptr,
+                (const float *)q->ptr,
+                (const float *)gate->ptr,
+                (const __half *)key_cache->ptr,
+                (const __half *)value_cache->ptr,
+                (const __half *)staged_key->ptr,
+                (const __half *)staged_value->ptr,
+                pos0, n_tokens, cache_cap,
+                n_head, n_head_kv, head_dim, scale);
     } else if (heads_per_kv == 3u &&
                getenv("DS4_CUDA_LAGUNA_NO_GQA_PREFILL") == NULL) {
         laguna_attention_prefill_gqa_kernel<3><<<

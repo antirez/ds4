@@ -40,7 +40,7 @@ index 81d4881..debc1e9 100644
 -	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 +	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_laguna_smoke
 diff --git a/README.md b/README.md
-index 7d9e5c7..e187c5c 100644
+index 7d9e5c7..1029501 100644
 --- a/README.md
 +++ b/README.md
 @@ -176,11 +176,11 @@ file are not supported for GLM yet.
@@ -60,7 +60,7 @@ index 7d9e5c7..e187c5c 100644
  
  ```sh
  ./download_model.sh laguna-q4
-@@ -189,6 +189,23 @@ reasoning, and tagged tool-call formats:
+@@ -189,6 +189,28 @@ reasoning, and tagged tool-call formats:
  ./ds4-server -m gguf/laguna-s-2.1-Q4_K_M.gguf -c 32768
  ```
  
@@ -80,6 +80,11 @@ index 7d9e5c7..e187c5c 100644
 +buffers. It is not enabled automatically because throughput depends on draft
 +acceptance for the workload and on the cost of the target's small verification
 +batches.
++
++On Blackwell GPUs, DFlash also groups its nine query heads per KV head into one
++attention block so each sliding-window K/V row is loaded once per group.
++`DS4_CUDA_DFLASH_NO_BLACKWELL=1` selects the portable per-query-head kernel for
++comparison or rollback.
 +
  The shipped GGUF is configured for a 262144-token context. Laguna defaults to
  temperature 1.0, top-k 20, top-p 1.0, and min-p 0; explicit sampling options
@@ -1650,7 +1655,7 @@ index 4b2b0d3..5217fa3 100644
                  "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu\n",
                  frontier,
 diff --git a/ds4_cuda.cu b/ds4_cuda.cu
-index e66fa36..4c30153 100644
+index e66fa36..4879d31 100644
 --- a/ds4_cuda.cu
 +++ b/ds4_cuda.cu
 @@ -1,5 +1,6 @@
@@ -3994,7 +3999,7 @@ index e66fa36..4c30153 100644
  }
  
  extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
-@@ -27772,10 +29781,92 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
+@@ -27772,10 +29781,111 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
          const ds4_gpu_tensor *gate, uint32_t pos0, uint32_t n_tokens,
          uint32_t cache_cap, uint32_t n_head, uint32_t n_head_kv,
          uint32_t head_dim, float scale) {
@@ -4044,6 +4049,25 @@ index e66fa36..4c30153 100644
 +    if (heads_per_kv == 6u &&
 +        getenv("DS4_CUDA_LAGUNA_NO_GQA_PREFILL") == NULL) {
 +        laguna_attention_prefill_gqa_kernel<6><<<
++                dim3(n_head_kv, n_tokens, 1u), head_dim>>>(
++                (float *)heads->ptr,
++                (const float *)q->ptr,
++                (const float *)gate->ptr,
++                (const __half *)key_cache->ptr,
++                (const __half *)value_cache->ptr,
++                (const __half *)staged_key->ptr,
++                (const __half *)staged_value->ptr,
++                pos0, n_tokens, cache_cap,
++                n_head, n_head_kv, head_dim, scale);
++    } else if (heads_per_kv == 9u &&
++               cuda_laguna_blackwell_ok() &&
++               getenv("DS4_CUDA_DFLASH_NO_BLACKWELL") == NULL &&
++               getenv("DS4_CUDA_LAGUNA_NO_GQA_PREFILL") == NULL) {
++        /* The official Laguna DFlash decoder has 72 query heads over eight
++         * KV heads. On Blackwell, keeping all nine query reductions in one
++         * 128-thread block amortizes each 512-row K/V fetch across the full
++         * group; older devices retain the lower-pressure per-head kernel. */
++        laguna_attention_prefill_gqa_kernel<9><<<
 +                dim3(n_head_kv, n_tokens, 1u), head_dim>>>(
 +                (float *)heads->ptr,
 +                (const float *)q->ptr,
@@ -4294,10 +4318,10 @@ index 0000000..dcb035c
 +8192,4096,132.48,256,18.27,57.577,255,18.37,0
 diff --git a/tests/cuda_laguna_smoke.c b/tests/cuda_laguna_smoke.c
 new file mode 100644
-index 0000000..c25ae57
+index 0000000..019892b
 --- /dev/null
 +++ b/tests/cuda_laguna_smoke.c
-@@ -0,0 +1,990 @@
+@@ -0,0 +1,1073 @@
 +#include "ds4_gpu.h"
 +
 +#include <cuda_runtime_api.h>
@@ -4908,6 +4932,88 @@ index 0000000..c25ae57
 +    return 0;
 +}
 +
++static int check_dflash_blackwell_attention(void) {
++    enum {
++        n_tokens = 3,
++        n_head = 9,
++        n_head_kv = 1,
++        cache_cap = 4
++    };
++    const uint64_t q_values = (uint64_t)n_tokens * n_head * HEAD_DIM;
++    const uint64_t kv_values =
++        (uint64_t)n_tokens * n_head_kv * HEAD_DIM;
++    float q[q_values], k[kv_values], v[kv_values];
++    float gate[n_tokens * n_head];
++    float portable[q_values], blackwell[q_values];
++    for (uint64_t i = 0; i < q_values; i++) {
++        q[i] = 0.015625f * (float)(1u + i % 13u);
++    }
++    for (uint64_t i = 0; i < kv_values; i++) {
++        k[i] = 0.03125f * (float)(1u + i % 7u);
++        v[i] = 0.0625f * (float)(1u + i % 11u);
++    }
++    for (uint32_t i = 0; i < n_tokens * n_head; i++) {
++        gate[i] = 0.05f * (float)(i % n_head);
++    }
++
++    ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc(sizeof(portable));
++    ds4_gpu_tensor *key_cache =
++        ds4_gpu_tensor_alloc((uint64_t)cache_cap * HEAD_DIM *
++                             sizeof(uint16_t));
++    ds4_gpu_tensor *value_cache =
++        ds4_gpu_tensor_alloc((uint64_t)cache_cap * HEAD_DIM *
++                             sizeof(uint16_t));
++    ds4_gpu_tensor *staged_key =
++        ds4_gpu_tensor_alloc(kv_values * sizeof(uint16_t));
++    ds4_gpu_tensor *staged_value =
++        ds4_gpu_tensor_alloc(kv_values * sizeof(uint16_t));
++    ds4_gpu_tensor *q_t = ds4_gpu_tensor_alloc(sizeof(q));
++    ds4_gpu_tensor *k_t = ds4_gpu_tensor_alloc(sizeof(k));
++    ds4_gpu_tensor *v_t = ds4_gpu_tensor_alloc(sizeof(v));
++    ds4_gpu_tensor *gate_t = ds4_gpu_tensor_alloc(sizeof(gate));
++    CHECK(heads && key_cache && value_cache && staged_key && staged_value &&
++          q_t && k_t && v_t && gate_t,
++          "DFlash attention tensor allocation");
++    CHECK(ds4_gpu_tensor_write(q_t, 0, q, sizeof(q)) &&
++          ds4_gpu_tensor_write(k_t, 0, k, sizeof(k)) &&
++          ds4_gpu_tensor_write(v_t, 0, v, sizeof(v)) &&
++          ds4_gpu_tensor_write(gate_t, 0, gate, sizeof(gate)),
++          "write DFlash attention tensors");
++    CHECK(setenv("DS4_CUDA_DFLASH_NO_BLACKWELL", "1", 1) == 0,
++          "select portable DFlash attention");
++    CHECK(ds4_gpu_laguna_attention_prefill_tensor(
++              heads, key_cache, value_cache, staged_key, staged_value,
++              q_t, k_t, v_t, gate_t, 0u, n_tokens, cache_cap,
++              n_head, n_head_kv, HEAD_DIM,
++              1.0f / sqrtf((float)HEAD_DIM)) &&
++          ds4_gpu_tensor_read(heads, 0, portable, sizeof(portable)),
++          "portable DFlash attention");
++    CHECK(unsetenv("DS4_CUDA_DFLASH_NO_BLACKWELL") == 0,
++          "select Blackwell DFlash attention");
++    CHECK(ds4_gpu_laguna_attention_prefill_tensor(
++              heads, key_cache, value_cache, staged_key, staged_value,
++              q_t, k_t, v_t, gate_t, 0u, n_tokens, cache_cap,
++              n_head, n_head_kv, HEAD_DIM,
++              1.0f / sqrtf((float)HEAD_DIM)) &&
++          ds4_gpu_tensor_read(heads, 0, blackwell, sizeof(blackwell)),
++          "Blackwell DFlash attention");
++    for (uint64_t i = 0; i < q_values; i++) {
++        CHECK(close_enough(blackwell[i], portable[i], 1e-6f, 1e-6f),
++              "Blackwell DFlash attention equivalence");
++    }
++
++    ds4_gpu_tensor_free(gate_t);
++    ds4_gpu_tensor_free(v_t);
++    ds4_gpu_tensor_free(k_t);
++    ds4_gpu_tensor_free(q_t);
++    ds4_gpu_tensor_free(staged_value);
++    ds4_gpu_tensor_free(staged_key);
++    ds4_gpu_tensor_free(value_cache);
++    ds4_gpu_tensor_free(key_cache);
++    ds4_gpu_tensor_free(heads);
++    return 0;
++}
++
 +static int check_long_decode_attention(void) {
 +    enum { n_head = 6, n_head_kv = 1, cache_cap = 4096 };
 +    const uint64_t cache_values =
@@ -5278,6 +5384,7 @@ index 0000000..c25ae57
 +    int rc = check_quant_ops(&blob, q4_offset, q6_offset, embed_offset);
 +    if (rc == 0) rc = check_norm_rope(&blob, norm_offset);
 +    if (rc == 0) rc = check_attention();
++    if (rc == 0) rc = check_dflash_blackwell_attention();
 +    if (rc == 0) rc = check_long_decode_attention();
 +    if (rc == 0) rc = check_moe(&blob, &routed, &shared);
 +    if (rc == 0) {

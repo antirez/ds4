@@ -608,6 +608,88 @@ static int check_attention(void) {
     return 0;
 }
 
+static int check_dflash_blackwell_attention(void) {
+    enum {
+        n_tokens = 3,
+        n_head = 9,
+        n_head_kv = 1,
+        cache_cap = 4
+    };
+    const uint64_t q_values = (uint64_t)n_tokens * n_head * HEAD_DIM;
+    const uint64_t kv_values =
+        (uint64_t)n_tokens * n_head_kv * HEAD_DIM;
+    float q[q_values], k[kv_values], v[kv_values];
+    float gate[n_tokens * n_head];
+    float portable[q_values], blackwell[q_values];
+    for (uint64_t i = 0; i < q_values; i++) {
+        q[i] = 0.015625f * (float)(1u + i % 13u);
+    }
+    for (uint64_t i = 0; i < kv_values; i++) {
+        k[i] = 0.03125f * (float)(1u + i % 7u);
+        v[i] = 0.0625f * (float)(1u + i % 11u);
+    }
+    for (uint32_t i = 0; i < n_tokens * n_head; i++) {
+        gate[i] = 0.05f * (float)(i % n_head);
+    }
+
+    ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc(sizeof(portable));
+    ds4_gpu_tensor *key_cache =
+        ds4_gpu_tensor_alloc((uint64_t)cache_cap * HEAD_DIM *
+                             sizeof(uint16_t));
+    ds4_gpu_tensor *value_cache =
+        ds4_gpu_tensor_alloc((uint64_t)cache_cap * HEAD_DIM *
+                             sizeof(uint16_t));
+    ds4_gpu_tensor *staged_key =
+        ds4_gpu_tensor_alloc(kv_values * sizeof(uint16_t));
+    ds4_gpu_tensor *staged_value =
+        ds4_gpu_tensor_alloc(kv_values * sizeof(uint16_t));
+    ds4_gpu_tensor *q_t = ds4_gpu_tensor_alloc(sizeof(q));
+    ds4_gpu_tensor *k_t = ds4_gpu_tensor_alloc(sizeof(k));
+    ds4_gpu_tensor *v_t = ds4_gpu_tensor_alloc(sizeof(v));
+    ds4_gpu_tensor *gate_t = ds4_gpu_tensor_alloc(sizeof(gate));
+    CHECK(heads && key_cache && value_cache && staged_key && staged_value &&
+          q_t && k_t && v_t && gate_t,
+          "DFlash attention tensor allocation");
+    CHECK(ds4_gpu_tensor_write(q_t, 0, q, sizeof(q)) &&
+          ds4_gpu_tensor_write(k_t, 0, k, sizeof(k)) &&
+          ds4_gpu_tensor_write(v_t, 0, v, sizeof(v)) &&
+          ds4_gpu_tensor_write(gate_t, 0, gate, sizeof(gate)),
+          "write DFlash attention tensors");
+    CHECK(setenv("DS4_CUDA_DFLASH_NO_BLACKWELL", "1", 1) == 0,
+          "select portable DFlash attention");
+    CHECK(ds4_gpu_laguna_attention_prefill_tensor(
+              heads, key_cache, value_cache, staged_key, staged_value,
+              q_t, k_t, v_t, gate_t, 0u, n_tokens, cache_cap,
+              n_head, n_head_kv, HEAD_DIM,
+              1.0f / sqrtf((float)HEAD_DIM)) &&
+          ds4_gpu_tensor_read(heads, 0, portable, sizeof(portable)),
+          "portable DFlash attention");
+    CHECK(unsetenv("DS4_CUDA_DFLASH_NO_BLACKWELL") == 0,
+          "select Blackwell DFlash attention");
+    CHECK(ds4_gpu_laguna_attention_prefill_tensor(
+              heads, key_cache, value_cache, staged_key, staged_value,
+              q_t, k_t, v_t, gate_t, 0u, n_tokens, cache_cap,
+              n_head, n_head_kv, HEAD_DIM,
+              1.0f / sqrtf((float)HEAD_DIM)) &&
+          ds4_gpu_tensor_read(heads, 0, blackwell, sizeof(blackwell)),
+          "Blackwell DFlash attention");
+    for (uint64_t i = 0; i < q_values; i++) {
+        CHECK(close_enough(blackwell[i], portable[i], 1e-6f, 1e-6f),
+              "Blackwell DFlash attention equivalence");
+    }
+
+    ds4_gpu_tensor_free(gate_t);
+    ds4_gpu_tensor_free(v_t);
+    ds4_gpu_tensor_free(k_t);
+    ds4_gpu_tensor_free(q_t);
+    ds4_gpu_tensor_free(staged_value);
+    ds4_gpu_tensor_free(staged_key);
+    ds4_gpu_tensor_free(value_cache);
+    ds4_gpu_tensor_free(key_cache);
+    ds4_gpu_tensor_free(heads);
+    return 0;
+}
+
 static int check_long_decode_attention(void) {
     enum { n_head = 6, n_head_kv = 1, cache_cap = 4096 };
     const uint64_t cache_values =
@@ -978,6 +1060,7 @@ int main(void) {
     int rc = check_quant_ops(&blob, q4_offset, q6_offset, embed_offset);
     if (rc == 0) rc = check_norm_rope(&blob, norm_offset);
     if (rc == 0) rc = check_attention();
+    if (rc == 0) rc = check_dflash_blackwell_attention();
     if (rc == 0) rc = check_long_decode_attention();
     if (rc == 0) rc = check_moe(&blob, &routed, &shared);
     if (rc == 0) {

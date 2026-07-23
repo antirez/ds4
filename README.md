@@ -215,6 +215,11 @@ buffers. It is not enabled automatically because throughput depends on draft
 acceptance for the workload and on the cost of the target's small verification
 batches.
 
+On Blackwell GPUs, DFlash also groups its nine query heads per KV head into one
+attention block so each sliding-window K/V row is loaded once per group.
+`DS4_CUDA_DFLASH_NO_BLACKWELL=1` selects the portable per-query-head kernel for
+comparison or rollback.
+
 The shipped GGUF is configured for a 262144-token context. Laguna defaults to
 temperature 1.0, top-k 20, top-p 1.0, and min-p 0; explicit sampling options
 always take precedence. Use `--nothink` or the `laguna-s-2.1-chat` server alias
