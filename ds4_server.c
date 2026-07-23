@@ -3743,7 +3743,7 @@ item_fail:
             !strcmp(t, "tool_search_call") || !strcmp(t, "image_generation_call");
         bool is_bookkeeping =
             !strcmp(t, "compaction") || !strcmp(t, "context_compaction");
-        if (is_bookkeeping && last_was_compaction) *last_was_compaction = true;
+        if (last_was_compaction) *last_was_compaction = is_bookkeeping;
         if (!consumes_reasoning && !is_bookkeeping && pending_reasoning.len) {
             chat_msg flush_msg = {0};
             flush_msg.role = xstrdup("assistant");
@@ -4261,10 +4261,14 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
         buf_append(&combined_tool_schemas, loaded_tool_schemas.ptr,
                    loaded_tool_schemas.len);
     }
+    /* Compaction requests must not prime the model for tools at all: with
+     * schemas still in the prompt the model keeps emitting DSML stanzas, and
+     * with has_tools disabled nothing parses them, so they leak raw into the
+     * summary text.  Drop the schemas too, like the tool-less chat path. */
     const char *active_tool_schemas =
-        (!tool_choice_none && combined_tool_schemas.len) ?
+        (!tool_choice_none && !last_was_compaction && combined_tool_schemas.len) ?
         combined_tool_schemas.ptr : NULL;
-    r->has_tools = active_tool_schemas && active_tool_schemas[0] && !last_was_compaction;
+    r->has_tools = active_tool_schemas && active_tool_schemas[0];
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
@@ -13886,6 +13890,31 @@ static void test_responses_input_function_call_namespace_round_trips_to_dsml(voi
     tool_schema_orders_free(&orders);
 }
 
+static void test_responses_input_compaction_flag_tracks_last_item(void) {
+    const char *ends_with_compaction =
+        "[{\"type\":\"message\",\"role\":\"user\",\"content\":\"hi\"},"
+        "{\"type\":\"compaction\"}]";
+    const char *p = ends_with_compaction;
+    chat_msgs msgs = {0};
+    bool last_was_compaction = false;
+    TEST_ASSERT(parse_responses_input(&p, &msgs, NULL, NULL, &last_was_compaction));
+    TEST_ASSERT(last_was_compaction);
+    chat_msgs_free(&msgs);
+
+    /* A compaction item earlier in the history must not disable tools for
+     * this request: only the last item decides.  Regression test for the
+     * latch that kept tools off for every turn after the first compaction. */
+    const char *compaction_then_user =
+        "[{\"type\":\"compaction\"},"
+        "{\"type\":\"message\",\"role\":\"user\",\"content\":\"continue\"}]";
+    p = compaction_then_user;
+    memset(&msgs, 0, sizeof(msgs));
+    last_was_compaction = false;
+    TEST_ASSERT(parse_responses_input(&p, &msgs, NULL, NULL, &last_was_compaction));
+    TEST_ASSERT(!last_was_compaction);
+    chat_msgs_free(&msgs);
+}
+
 static void test_responses_output_sends_tool_search_call_item(void) {
     tool_calls calls = {0};
     tool_call tc = {0};
@@ -18337,6 +18366,7 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_input_tool_search_output_loads_tools();
     test_responses_input_tool_search_output_rejects_bad_tools();
     test_responses_input_function_call_namespace_round_trips_to_dsml();
+    test_responses_input_compaction_flag_tracks_last_item();
     test_responses_output_sends_tool_search_call_item();
     test_dsml_tool_args_preserve_call_order();
     test_openai_tool_args_preserve_call_order();
