@@ -195,16 +195,34 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
                                                            n_tok);
 }
 
-static cudaStream_t g_shared_gate_up_stream = NULL;
-static cudaEvent_t g_shared_gate_up_ready_event = NULL;
-static void *g_shared_gate_up_tmp = NULL;
-static uint64_t g_shared_gate_up_tmp_bytes = 0;
-static int g_shared_gate_up_pending = 0;
+/* Per-tier: this stream/event/scratch-buffer set is lazily created once
+ * and then reused across calls to overlap the shared-expert gate/up
+ * projection with other work. All of it is device-bound (a stream/event
+ * created while tier 0 was active cannot be used to launch or synchronize
+ * work while tier 1 is the active device), and the async result lives in
+ * g_shared_gate_up_tmp on whichever device produced it -- sharing a single
+ * instance across tiers means a tier-1 call could reuse tier 0's stream
+ * (invalid cross-device stream use) and/or read back a stale/wrong-device
+ * buffer via g_shared_gate_up_pending, which doesn't distinguish "tier 0
+ * has an outstanding async op" from "tier 1 does". Indexed by
+ * g_current_logical_tier, matching the g_cuda_tmp fix in
+ * ds4_rocm_runtime.cuh. */
+static cudaStream_t g_shared_gate_up_stream[DS4_MAX_GPUS];
+static cudaEvent_t g_shared_gate_up_ready_event[DS4_MAX_GPUS];
+static void *g_shared_gate_up_tmp[DS4_MAX_GPUS];
+static uint64_t g_shared_gate_up_tmp_bytes[DS4_MAX_GPUS];
+static int g_shared_gate_up_pending[DS4_MAX_GPUS];
+
+static inline int cuda_shared_gate_up_tier(void) {
+    return g_current_logical_tier >= 0 && g_current_logical_tier < DS4_MAX_GPUS
+               ? g_current_logical_tier : 0;
+}
 
 static int cuda_shared_gate_up_async_wait_internal(void) {
-    if (!g_shared_gate_up_pending) return 1;
-    cudaError_t err = cudaStreamSynchronize(g_shared_gate_up_stream);
-    g_shared_gate_up_pending = 0;
+    const int t = cuda_shared_gate_up_tier();
+    if (!g_shared_gate_up_pending[t]) return 1;
+    cudaError_t err = cudaStreamSynchronize(g_shared_gate_up_stream[t]);
+    g_shared_gate_up_pending[t] = 0;
     if (err != cudaSuccess) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "shared gate/up async wait failed: %s\n", cudaGetErrorString(err));
         (void)cudaGetLastError();
@@ -215,12 +233,13 @@ static int cuda_shared_gate_up_async_wait_internal(void) {
 
 static void *cuda_shared_gate_up_async_tmp_alloc(uint64_t bytes) {
     if (bytes == 0) return NULL;
-    if (g_shared_gate_up_tmp_bytes >= bytes) return g_shared_gate_up_tmp;
-    if (g_shared_gate_up_tmp) {
+    const int t = cuda_shared_gate_up_tier();
+    if (g_shared_gate_up_tmp_bytes[t] >= bytes) return g_shared_gate_up_tmp[t];
+    if (g_shared_gate_up_tmp[t]) {
         (void)cuda_shared_gate_up_async_wait_internal();
-        (void)cudaFree(g_shared_gate_up_tmp);
-        g_shared_gate_up_tmp = NULL;
-        g_shared_gate_up_tmp_bytes = 0;
+        (void)cudaFree(g_shared_gate_up_tmp[t]);
+        g_shared_gate_up_tmp[t] = NULL;
+        g_shared_gate_up_tmp_bytes[t] = 0;
     }
     void *ptr = NULL;
     cudaError_t err = cudaMalloc(&ptr, (size_t)bytes);
@@ -230,27 +249,32 @@ static void *cuda_shared_gate_up_async_tmp_alloc(uint64_t bytes) {
         (void)cudaGetLastError();
         return NULL;
     }
-    g_shared_gate_up_tmp = ptr;
-    g_shared_gate_up_tmp_bytes = bytes;
-    return g_shared_gate_up_tmp;
+    g_shared_gate_up_tmp[t] = ptr;
+    g_shared_gate_up_tmp_bytes[t] = bytes;
+    return g_shared_gate_up_tmp[t];
 }
 
 static void cuda_shared_gate_up_async_cleanup(void) {
-    if (g_shared_gate_up_stream) {
-        (void)cuda_shared_gate_up_async_wait_internal();
-    }
-    if (g_shared_gate_up_tmp) {
-        (void)cudaFree(g_shared_gate_up_tmp);
-        g_shared_gate_up_tmp = NULL;
-        g_shared_gate_up_tmp_bytes = 0;
-    }
-    if (g_shared_gate_up_ready_event) {
-        (void)cudaEventDestroy(g_shared_gate_up_ready_event);
-        g_shared_gate_up_ready_event = NULL;
-    }
-    if (g_shared_gate_up_stream) {
-        (void)cudaStreamDestroy(g_shared_gate_up_stream);
-        g_shared_gate_up_stream = NULL;
+    for (int t = 0; t < DS4_MAX_GPUS; t++) {
+        if (t < g_n_gpus) (void)ds4_gpu_set_current_device(t);
+        if (g_shared_gate_up_stream[t] && g_shared_gate_up_pending[t]) {
+            cudaError_t err = cudaStreamSynchronize(g_shared_gate_up_stream[t]);
+            (void)err;
+            g_shared_gate_up_pending[t] = 0;
+        }
+        if (g_shared_gate_up_tmp[t]) {
+            (void)cudaFree(g_shared_gate_up_tmp[t]);
+            g_shared_gate_up_tmp[t] = NULL;
+            g_shared_gate_up_tmp_bytes[t] = 0;
+        }
+        if (g_shared_gate_up_ready_event[t]) {
+            (void)cudaEventDestroy(g_shared_gate_up_ready_event[t]);
+            g_shared_gate_up_ready_event[t] = NULL;
+        }
+        if (g_shared_gate_up_stream[t]) {
+            (void)cudaStreamDestroy(g_shared_gate_up_stream[t]);
+            g_shared_gate_up_stream[t] = NULL;
+        }
     }
 }
 
@@ -267,7 +291,8 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_async_tensor(
         const ds4_gpu_tensor *x,
         float                   clamp) {
     if (g_quality_mode || cuda_runtime_config()->graph_dump) return 0;
-    if (g_shared_gate_up_pending && !cuda_shared_gate_up_async_wait_internal()) return 0;
+    const int shared_gu_tier = cuda_shared_gate_up_tier();
+    if (g_shared_gate_up_pending[shared_gu_tier] && !cuda_shared_gate_up_async_wait_internal()) return 0;
     if (!gate || !up || !mid || !model_map || !x ||
         in_dim == 0u || out_dim == 0u || in_dim > UINT32_MAX || out_dim > UINT32_MAX) {
         return 0;
@@ -294,31 +319,31 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_async_tensor(
     const char *wg = cuda_model_range_ptr(model_map, gate_offset, weight_bytes, "shared_gate_q8_pair_async");
     const char *wu = cuda_model_range_ptr(model_map, up_offset, weight_bytes, "shared_up_q8_pair_async");
     if (!wg || !wu) return 0;
-    if (!g_shared_gate_up_stream) {
+    if (!g_shared_gate_up_stream[shared_gu_tier]) {
         int least_priority = 0;
         int greatest_priority = 0;
 #ifdef __HIP_PLATFORM_AMD__
         hipError_t err = hipDeviceGetStreamPriorityRange(&least_priority, &greatest_priority);
         if (err == hipSuccess) {
-            err = hipStreamCreateWithPriority(&g_shared_gate_up_stream, cudaStreamNonBlocking, least_priority);
+            err = hipStreamCreateWithPriority(&g_shared_gate_up_stream[shared_gu_tier], cudaStreamNonBlocking, least_priority);
         } else {
             (void)cudaGetLastError();
-            err = hipStreamCreateWithFlags(&g_shared_gate_up_stream, cudaStreamNonBlocking);
+            err = hipStreamCreateWithFlags(&g_shared_gate_up_stream[shared_gu_tier], cudaStreamNonBlocking);
         }
         if (err != hipSuccess) return 0;
 #else
         cudaError_t err = cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority);
         if (err == cudaSuccess) {
-            err = cudaStreamCreateWithPriority(&g_shared_gate_up_stream, cudaStreamNonBlocking, least_priority);
+            err = cudaStreamCreateWithPriority(&g_shared_gate_up_stream[shared_gu_tier], cudaStreamNonBlocking, least_priority);
         } else {
             (void)cudaGetLastError();
-            err = cudaStreamCreateWithFlags(&g_shared_gate_up_stream, cudaStreamNonBlocking);
+            err = cudaStreamCreateWithFlags(&g_shared_gate_up_stream[shared_gu_tier], cudaStreamNonBlocking);
         }
         if (err != cudaSuccess) return 0;
 #endif
     }
-    if (!g_shared_gate_up_ready_event) {
-        cudaError_t err = cudaEventCreateWithFlags(&g_shared_gate_up_ready_event, cudaEventDisableTiming);
+    if (!g_shared_gate_up_ready_event[shared_gu_tier]) {
+        cudaError_t err = cudaEventCreateWithFlags(&g_shared_gate_up_ready_event[shared_gu_tier], cudaEventDisableTiming);
         if (err != cudaSuccess) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX "shared gate/up async event create failed: %s\n", cudaGetErrorString(err));
             (void)cudaGetLastError();
@@ -331,16 +356,16 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_async_tensor(
      * wait until the default-stream producer of x (ffn_norm) has completed before
      * quantizing it here.
      */
-    cudaError_t dep_err = cudaEventRecord(g_shared_gate_up_ready_event, 0);
+    cudaError_t dep_err = cudaEventRecord(g_shared_gate_up_ready_event[shared_gu_tier], 0);
     if (dep_err != cudaSuccess) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "shared gate/up async dependency record failed: %s\n", cudaGetErrorString(dep_err));
         (void)cudaGetLastError();
         return 0;
     }
 #ifdef __HIP_PLATFORM_AMD__
-    dep_err = hipStreamWaitEvent(g_shared_gate_up_stream, g_shared_gate_up_ready_event, 0);
+    dep_err = hipStreamWaitEvent(g_shared_gate_up_stream[shared_gu_tier], g_shared_gate_up_ready_event[shared_gu_tier], 0);
 #else
-    dep_err = cudaStreamWaitEvent(g_shared_gate_up_stream, g_shared_gate_up_ready_event, 0);
+    dep_err = cudaStreamWaitEvent(g_shared_gate_up_stream[shared_gu_tier], g_shared_gate_up_ready_event[shared_gu_tier], 0);
 #endif
     if (dep_err != cudaSuccess) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "shared gate/up async dependency wait failed: %s\n", cudaGetErrorString(dep_err));
@@ -356,9 +381,9 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_async_tensor(
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = 1;
     dim3 qgrid((unsigned)blocks, 1, 1);
-    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, g_shared_gate_up_stream>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, g_shared_gate_up_stream[shared_gu_tier]>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "shared gate/up async quantize launch")) return 0;
-    matmul_q8_0_pair_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, g_shared_gate_up_stream>>>(
+    matmul_q8_0_pair_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, g_shared_gate_up_stream[shared_gu_tier]>>>(
             (float *)gate->ptr,
             (float *)up->ptr,
             reinterpret_cast<const unsigned char *>(wg),
@@ -371,7 +396,7 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_async_tensor(
             blocks,
             use_dp4a);
     if (!cuda_ok(cudaGetLastError(), "shared gate/up async pair launch")) return 0;
-    swiglu_kernel<<<((unsigned)out_dim + 255u) / 256u, 256, 0, g_shared_gate_up_stream>>>(
+    swiglu_kernel<<<((unsigned)out_dim + 255u) / 256u, 256, 0, g_shared_gate_up_stream[shared_gu_tier]>>>(
             (float *)mid->ptr,
             (const float *)gate->ptr,
             (const float *)up->ptr,
@@ -379,7 +404,7 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_async_tensor(
             clamp,
             1.0f);
     if (!cuda_ok(cudaGetLastError(), "shared gate/up async swiglu launch")) return 0;
-    g_shared_gate_up_pending = 1;
+    g_shared_gate_up_pending[shared_gu_tier] = 1;
     return 1;
 }
 
