@@ -566,6 +566,19 @@ static __strong id<MTLBuffer> g_model_resident_override_buffer;
 static uint64_t g_model_resident_override_buffer_offset;
 static uint64_t g_model_resident_override_buffer_bytes;
 
+/* Q4 dense-requantized sidecars deliberately live in their own immutable
+ * registry. The ordinary resident registry is activated lazily for exact
+ * indexer projections; combining the two would make either publication
+ * replace the other. */
+static ds4_gpu_model_staging_range *g_model_q4_overrides;
+static uint32_t g_model_q4_override_count;
+static const void *g_model_q4_override_map;
+static uint64_t g_model_q4_override_model_size;
+static __strong id<MTLBuffer> g_model_q4_override_buffer;
+static uint64_t g_model_q4_override_buffer_offset;
+static uint64_t g_model_q4_override_buffer_bytes;
+static uint32_t g_model_q4_override_users;
+
 enum {
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER = 80,
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT = 384,
@@ -3363,11 +3376,19 @@ void ds4_gpu_print_memory_report(const char *label) {
             UINT64_MAX :
             g_stream_expert_cache_slab_allocated_bytes +
                 stream_expert_explicit_bytes;
+    const uint64_t q4_resident_tracked =
+        g_model_q4_override_buffer && g_model_q4_override_users != 0 ?
+            g_model_q4_override_buffer_bytes : 0;
     uint64_t tracked_live = tensor_live_snap;
     if (tracked_live > UINT64_MAX - stream_expert_tracked) {
         tracked_live = UINT64_MAX;
     } else {
         tracked_live += stream_expert_tracked;
+    }
+    if (tracked_live > UINT64_MAX - q4_resident_tracked) {
+        tracked_live = UINT64_MAX;
+    } else {
+        tracked_live += q4_resident_tracked;
     }
 
     const bool color = ds4_log_is_tty(stderr);
@@ -3375,12 +3396,14 @@ void ds4_gpu_print_memory_report(const char *label) {
     const char *bright_green = color ? "\x1b[1;32m" : "";
     const char *reset = color ? "\x1b[0m" : "";
     fprintf(stderr,
-            "%sds4: Metal memory%s%s: runtime %.2f GiB + streaming experts %.2f GiB = %s%.2f GiB tracked live%s\n",
+            "%sds4: Metal memory%s%s: runtime %.2f GiB + streaming experts %.2f GiB "
+            "+ dense Q4 %.2f GiB = %s%.2f GiB tracked live%s\n",
             green,
             label && label[0] ? " " : "",
             label && label[0] ? label : "",
             ds4_gpu_gib(tensor_live_snap),
             ds4_gpu_gib(stream_expert_tracked),
+            ds4_gpu_gib(q4_resident_tracked),
             bright_green,
             ds4_gpu_gib(tracked_live),
             reset);
@@ -8137,6 +8160,19 @@ static void ds4_gpu_clear_model_resident_overrides_impl(void) {
     g_model_resident_override_buffer_bytes = 0;
 }
 
+static void ds4_gpu_clear_model_q4_overrides_impl(const void *model_map) {
+    if (model_map && g_model_q4_override_map != model_map) return;
+    free(g_model_q4_overrides);
+    g_model_q4_overrides = NULL;
+    g_model_q4_override_count = 0;
+    g_model_q4_override_map = NULL;
+    g_model_q4_override_model_size = 0;
+    g_model_q4_override_buffer = nil;
+    g_model_q4_override_buffer_offset = 0;
+    g_model_q4_override_buffer_bytes = 0;
+    g_model_q4_override_users = 0;
+}
+
 int ds4_gpu_set_model_staging_overrides(
         const void                        *model_map,
         uint64_t                           model_size,
@@ -8265,6 +8301,163 @@ int ds4_gpu_set_model_resident_overrides(
     g_model_resident_override_buffer = tensor.buffer;
     g_model_resident_override_buffer_offset = tensor.offset;
     g_model_resident_override_buffer_bytes = tensor.bytes;
+    return 1;
+}
+
+int ds4_gpu_model_q4_overrides_active(
+        const void *model_map,
+        uint64_t    model_size) {
+    return model_map && model_size != 0 &&
+           g_model_q4_override_buffer &&
+           g_model_q4_override_map == model_map &&
+           g_model_q4_override_model_size == model_size &&
+           g_model_q4_override_count != 0 &&
+           g_model_q4_override_users != 0;
+}
+
+static int ds4_gpu_model_q4_table_covers(
+        const ds4_gpu_model_staging_range *table,
+        uint32_t                           table_count,
+        const ds4_gpu_model_staging_range *wanted,
+        uint32_t                           wanted_count) {
+    if (!table || table_count == 0 || !wanted || wanted_count == 0) return 0;
+    for (uint32_t i = 0; i < wanted_count; i++) {
+        if (wanted[i].bytes == 0 ||
+            wanted[i].model_offset > UINT64_MAX - wanted[i].bytes) {
+            return 0;
+        }
+        const uint64_t wanted_end =
+            wanted[i].model_offset + wanted[i].bytes;
+        int covered = 0;
+        for (uint32_t j = 0; j < table_count; j++) {
+            if (table[j].bytes == 0 ||
+                table[j].model_offset > UINT64_MAX - table[j].bytes) {
+                continue;
+            }
+            const uint64_t table_end =
+                table[j].model_offset + table[j].bytes;
+            if (wanted[i].model_offset >= table[j].model_offset &&
+                wanted_end <= table_end) {
+                covered = 1;
+                break;
+            }
+        }
+        if (!covered) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_set_model_q4_overrides(
+        const void                        *model_map,
+        uint64_t                           model_size,
+        const ds4_gpu_model_staging_range *ranges,
+        uint32_t                           count,
+        const ds4_gpu_tensor              *resident) {
+    if (!model_map || model_size == 0 || !ranges || count == 0 || !resident) {
+        fprintf(stderr, "ds4: Metal Q4 resident override received an invalid table\n");
+        return 0;
+    }
+    if (g_batch_cb || [g_pending_cbs count] != 0) {
+        fprintf(stderr,
+                "ds4: Metal Q4 resident override changed while commands are in flight\n");
+        return 0;
+    }
+
+    const DS4MetalTensor *tensor = ds4_gpu_tensor_const_obj(resident);
+    if (!tensor.buffer || tensor.bytes == 0) {
+        fprintf(stderr, "ds4: Metal Q4 resident tensor is unavailable\n");
+        return 0;
+    }
+
+    ds4_gpu_model_staging_range *next =
+        calloc((size_t)count, sizeof(next[0]));
+    if (!next) {
+        fprintf(stderr, "ds4: Metal Q4 resident override allocation failed\n");
+        return 0;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        if (ranges[i].bytes == 0 ||
+            ranges[i].model_offset > model_size ||
+            ranges[i].bytes > model_size - ranges[i].model_offset ||
+            ranges[i].staging_offset > tensor.bytes ||
+            ranges[i].bytes > tensor.bytes - ranges[i].staging_offset) {
+            fprintf(stderr,
+                    "ds4: Metal Q4 resident override %u is outside its model or buffer\n",
+                    i);
+            free(next);
+            return 0;
+        }
+        next[i] = ranges[i];
+    }
+
+    uint32_t next_users = 1;
+    if (g_model_q4_override_users != 0) {
+        if (g_model_q4_override_map != model_map ||
+            g_model_q4_override_model_size != model_size ||
+            g_model_q4_override_users == UINT32_MAX ||
+            !ds4_gpu_model_q4_table_covers(next,
+                                           count,
+                                           g_model_q4_overrides,
+                                           g_model_q4_override_count)) {
+            fprintf(stderr,
+                    "ds4: Metal Q4 resident replacement is not a compatible superset\n");
+            free(next);
+            return 0;
+        }
+        next_users = g_model_q4_override_users + 1u;
+    }
+
+    ds4_gpu_clear_model_q4_overrides_impl(NULL);
+    g_model_q4_overrides = next;
+    g_model_q4_override_count = count;
+    g_model_q4_override_map = model_map;
+    g_model_q4_override_model_size = model_size;
+    g_model_q4_override_buffer = tensor.buffer;
+    g_model_q4_override_buffer_offset = tensor.offset;
+    g_model_q4_override_buffer_bytes = tensor.bytes;
+    g_model_q4_override_users = next_users;
+    return 1;
+}
+
+int ds4_gpu_acquire_model_q4_overrides(
+        const void                        *model_map,
+        uint64_t                           model_size,
+        const ds4_gpu_model_staging_range *ranges,
+        uint32_t                           count) {
+    if (!model_map || model_size == 0 || !ranges || count == 0 ||
+        g_model_q4_override_users == 0 ||
+        g_model_q4_override_users == UINT32_MAX ||
+        g_model_q4_override_map != model_map ||
+        g_model_q4_override_model_size != model_size ||
+        !ds4_gpu_model_q4_table_covers(g_model_q4_overrides,
+                                       g_model_q4_override_count,
+                                       ranges,
+                                       count)) {
+        return 0;
+    }
+    g_model_q4_override_users++;
+    return 1;
+}
+
+int ds4_gpu_release_model_q4_overrides(
+        const void *model_map,
+        uint64_t    model_size) {
+    if (!model_map || model_size == 0 ||
+        g_model_q4_override_map != model_map ||
+        g_model_q4_override_model_size != model_size ||
+        g_model_q4_override_users == 0) {
+        return 0;
+    }
+    if (g_model_q4_override_users > 1u) {
+        g_model_q4_override_users--;
+        return 1;
+    }
+    if (g_batch_cb || [g_pending_cbs count] != 0) {
+        fprintf(stderr,
+                "ds4: Metal Q4 resident override cannot release while commands are in flight\n");
+        return 0;
+    }
+    ds4_gpu_clear_model_q4_overrides_impl(model_map);
     return 1;
 }
 
@@ -9400,6 +9593,7 @@ void ds4_gpu_cleanup(void) {
         (void)ds4_gpu_wait_pending_command_buffers("cleanup");
         ds4_gpu_clear_model_staging_overrides_impl(NULL);
         ds4_gpu_clear_model_resident_overrides_impl();
+        ds4_gpu_clear_model_q4_overrides_impl(NULL);
         if (ds4_gpu_stream_expert_timing_summary_enabled() &&
             getenv("DS4_METAL_MEMORY_REPORT") == NULL) {
             ds4_gpu_print_memory_report("at cleanup");
@@ -10652,6 +10846,55 @@ int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
     return 1;
 }
 
+/*
+ * Q4 sidecar ranges deliberately use the source tensor's model offset as
+ * their stable key, but contain different bytes. They must therefore never
+ * participate in the generic model resolver: a Q8 subrange at the same
+ * offset could otherwise alias Q4 data. Only kernels whose declared weight
+ * type is Q4_K call this resolver.
+ */
+static id<MTLBuffer> ds4_gpu_model_q4_override_for_range(
+        const void *model_map,
+        uint64_t    model_size,
+        uint64_t    offset,
+        uint64_t    len,
+        uint64_t   *inner_offset) {
+    if (!model_map || model_size == 0 ||
+        offset > model_size || len > model_size - offset ||
+        !g_model_q4_override_buffer ||
+        g_model_q4_override_map != model_map ||
+        g_model_q4_override_model_size != model_size) {
+        return nil;
+    }
+
+    const uint64_t end = offset + len;
+    for (uint32_t i = 0; i < g_model_q4_override_count; i++) {
+        const ds4_gpu_model_staging_range *resident =
+            &g_model_q4_overrides[i];
+        if (resident->model_offset > UINT64_MAX - resident->bytes) {
+            continue;
+        }
+        const uint64_t resident_end =
+            resident->model_offset + resident->bytes;
+        if (offset >= resident->model_offset && end <= resident_end) {
+            const uint64_t delta = offset - resident->model_offset;
+            const uint64_t local = resident->staging_offset + delta;
+            if (local <= g_model_q4_override_buffer_bytes &&
+                len <= g_model_q4_override_buffer_bytes - local) {
+                if (inner_offset) {
+                    *inner_offset =
+                        g_model_q4_override_buffer_offset + local;
+                }
+                return g_model_q4_override_buffer;
+            }
+            fprintf(stderr,
+                    "ds4: Metal Q4 resident range resolved outside its buffer\n");
+            return nil;
+        }
+    }
+    return nil;
+}
+
 static id<MTLBuffer> ds4_gpu_model_staging_override_for_range(
         const void *model_map,
         uint64_t    model_size,
@@ -10688,8 +10931,8 @@ static id<MTLBuffer> ds4_gpu_model_staging_override_for_range(
         }
     }
 
-    /* The layer staging ring has priority.  Deferred immutable weights that
-     * are absent from that ring fall through to the load-once resident table. */
+    /* The layer staging ring has priority over byte-identical residents.
+     * Lossy Q4 has a separate, weight-type-aware resolver above. */
     if (g_model_resident_override_buffer &&
         g_model_resident_override_map == model_map &&
         g_model_resident_override_model_size == model_size) {
@@ -18261,17 +18504,22 @@ static int ds4_gpu_matmul_quant_impl_tensor(
         }
 
         uint64_t inner_offset = 0;
-        id<MTLBuffer> wbuf = force_model_view ?
-            ds4_gpu_wrap_model_range(model_map,
-                                     model_size,
-                                     weight_offset,
-                                     weight_bytes,
-                                     &inner_offset) :
-            ds4_gpu_wrap_model_range(model_map,
-                                     model_size,
-                                     weight_offset,
-                                     weight_bytes,
-                                     &inner_offset);
+        id<MTLBuffer> wbuf = nil;
+        if (!force_model_view &&
+            weight_type == DS4_METAL_TENSOR_Q4_K) {
+            wbuf = ds4_gpu_model_q4_override_for_range(model_map,
+                                                       model_size,
+                                                       weight_offset,
+                                                       weight_bytes,
+                                                       &inner_offset);
+        }
+        if (!wbuf) {
+            wbuf = ds4_gpu_wrap_model_range(model_map,
+                                            model_size,
+                                            weight_offset,
+                                            weight_bytes,
+                                            &inner_offset);
+        }
         if (!wbuf) return 0;
 
         int owned = 0;
@@ -23313,9 +23561,14 @@ int ds4_gpu_attention_output_q4_K_batch_tensor(
 
         uint64_t out_a_inner = 0;
         id<MTLBuffer> out_a_buf =
-            ds4_gpu_wrap_model_range(model_map, model_size,
-                                     out_a_offset, out_a_bytes,
-                                     &out_a_inner);
+            ds4_gpu_model_q4_override_for_range(model_map, model_size,
+                                                out_a_offset, out_a_bytes,
+                                                &out_a_inner);
+        if (!out_a_buf) {
+            out_a_buf = ds4_gpu_wrap_model_range(model_map, model_size,
+                                                 out_a_offset, out_a_bytes,
+                                                 &out_a_inner);
+        }
         if (!out_a_buf) return 0;
 
         const bool had_batch = g_batch_cb != nil;
@@ -23433,8 +23686,9 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
             return 0;
         }
         uint64_t inner = 0;
-        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map, model_size,
-                                                        weight_offset, weight_bytes, &inner);
+        id<MTLBuffer> wbuf =
+            ds4_gpu_wrap_model_range(model_map, model_size,
+                                     weight_offset, weight_bytes, &inner);
         if (!wbuf) return 0;
 
         int owned = 0;
@@ -23545,8 +23799,18 @@ int ds4_gpu_matmul_quant_kslice_tensor(
             return 0;
         }
         uint64_t inner = 0;
-        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map, model_size,
-                                                        weight_offset, weight_bytes, &inner);
+        id<MTLBuffer> wbuf =
+            weight_type == DS4_METAL_TENSOR_Q4_K ?
+                ds4_gpu_model_q4_override_for_range(model_map,
+                                                    model_size,
+                                                    weight_offset,
+                                                    weight_bytes,
+                                                    &inner) : nil;
+        if (!wbuf) {
+            wbuf = ds4_gpu_wrap_model_range(model_map, model_size,
+                                            weight_offset, weight_bytes,
+                                            &inner);
+        }
         if (!wbuf) return 0;
 
         int owned = 0;
@@ -23867,10 +24131,18 @@ int ds4_gpu_attention_output_low_q4_K_slice_tensor(
 
         uint64_t out_a_inner = 0;
         id<MTLBuffer> out_a_buf =
-            ds4_gpu_wrap_model_range(model_map, model_size,
-                                      out_a_offset + group_skip,
-                                      out_a_bytes,
-                                      &out_a_inner);
+            ds4_gpu_model_q4_override_for_range(
+                    model_map, model_size,
+                    out_a_offset + group_skip,
+                    out_a_bytes,
+                    &out_a_inner);
+        if (!out_a_buf) {
+            out_a_buf = ds4_gpu_wrap_model_range(
+                    model_map, model_size,
+                    out_a_offset + group_skip,
+                    out_a_bytes,
+                    &out_a_inner);
+        }
         if (!out_a_buf) return 0;
 
         const bool had_batch = g_batch_cb != nil;

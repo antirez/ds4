@@ -432,10 +432,20 @@ selected policy and its estimated hot-set/budget values. CUDA and ROCm keep
 their own SSD-streaming implementations and are unchanged by this Metal
 policy.
 
-This path does not create or consume the Swift port's lossy `.q4dense` cache.
-It stages byte-identical GGUF ranges, and falls back to ordinary mmap views if
-setup or an asynchronous read fails. The token embedding path also maps only
-the requested F16 row instead of exposing the full table to Metal.
+The default path remains lossless and stages byte-identical GGUF ranges. An
+explicit Metal-only mode can also consume the Swift port's version-2
+`.q4dense` sidecar. This mode is lossy and never activates unless
+`DS4_DENSE_Q4=1` is selected; that opt-in also enables dense streaming unless
+`DS4_DENSE_STREAM=0` or `DS4_METAL_DISABLE_DENSE_STREAM=1` explicitly rolls
+it back. The C runtime validates the
+sidecar's model size, per-tensor source fingerprint, field key, and expected
+Q4_K byte count before publishing the complete resident set atomically. It
+does not yet create or extend the cache. A missing, partial, structurally
+invalid, or incompatible sidecar leaves the original Q8_0 metadata untouched
+and safely continues with lossless dense streaming. Version 2 has no payload
+checksum, so use a trusted local cache; arbitrary blob corruption cannot
+always be detected after the metadata checks. The token embedding path also
+maps only the requested F16 row instead of exposing the full table to Metal.
 
 On an M1 Pro with 16 GiB, using the same lossless Swift expert bundle, a
 1024-token context and a cold 344-expert cache, the prompt `Rispondi con una
@@ -455,6 +465,22 @@ Useful controls:
   A/B measurements and take precedence over the automatic choice.
 * `DS4_DENSE_IO_DEPTH=1..16` selects parallel reads across a layer's disjoint
   spans; the default is `8` on Apple SSDs.
+* `DS4_DENSE_Q4=1` enables the explicitly lossy Swift-compatible Q4_K sidecar
+  reader and the dense stream it extends. It is currently supported only by
+  the single-tier Metal path. The cache is loaded before prefill, and the same
+  Q4_K metadata is used for both prefill and decode. The base set keeps `attn_q_b`,
+  `attn_output_a`, and `attn_output_b` resident and removes them from the
+  per-token SSD ring. The expected default path is
+  `<model>.gguf.q4dense`.
+* `DS4_QKV_Q4=1` additionally uses resident Q4_K copies of `attn_q_a` and
+  `attn_kv`; it is ignored unless `DS4_DENSE_Q4=1`.
+* `DS4_SHARED_Q4=1` additionally uses resident Q4_K copies of the shared
+  expert gate, up, and down projections; it is ignored unless
+  `DS4_DENSE_Q4=1`.
+* `DS4_Q4_CACHE_DIR=/path` first looks for
+  `/path/<model-basename>.q4dense`, then falls back to the sibling cache. The
+  format and lookup order match DS4Demo. These Q4 controls change model
+  numerics; compare quality as well as throughput before adopting them.
 * `DS4_ASYNC_FFN=0` restores the per-layer GPU wait. By default the dense
   streamer commits each decoded layer without blocking and makes a ring-slot
   worker wait on that exact command buffer before overwriting its bytes.

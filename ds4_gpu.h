@@ -154,6 +154,28 @@ int ds4_gpu_set_model_resident_overrides(
 int ds4_gpu_model_resident_overrides_active(
         const void *model_map,
         uint64_t    model_size);
+/* Lossy Q4-requantized dense weights use a separate immutable registry.
+ * Keeping it distinct from the byte-identical lazy-indexer registry lets the
+ * latter activate after the sparse-attention threshold without replacing the
+ * resident Q4 sidecar. Only Q4_K kernel dispatches consult this registry, so
+ * source Q8 ranges at the same file offsets cannot alias the converted bytes. */
+int ds4_gpu_set_model_q4_overrides(
+        const void                        *model_map,
+        uint64_t                           model_size,
+        const ds4_gpu_model_staging_range *ranges,
+        uint32_t                           count,
+        const ds4_gpu_tensor              *resident);
+int ds4_gpu_acquire_model_q4_overrides(
+        const void                        *model_map,
+        uint64_t                           model_size,
+        const ds4_gpu_model_staging_range *ranges,
+        uint32_t                           count);
+int ds4_gpu_release_model_q4_overrides(
+        const void *model_map,
+        uint64_t    model_size);
+int ds4_gpu_model_q4_overrides_active(
+        const void *model_map,
+        uint64_t    model_size);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_q8_cache_suppressed(void);
