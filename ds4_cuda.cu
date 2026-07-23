@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <mma.h>
 #include <cublas_v2.h>
 #include <cub/block/block_radix_sort.cuh>
@@ -4684,6 +4685,33 @@ __global__ static void matmul_f16_kernel(
     if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
 }
 
+__global__ static void matmul_bf16_kernel(
+        float *out,
+        const __nv_bfloat16 *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok) {
+    const uint64_t row = (uint64_t)blockIdx.x;
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    if (row >= out_dim || tok >= n_tok) return;
+
+    float sum = 0.0f;
+    const __nv_bfloat16 *wr = w + row * in_dim;
+    const float *xr = x + tok * in_dim;
+    for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        sum += __bfloat162float(wr[i]) * xr[i];
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
+}
+
 __global__ static void matmul_f16_serial_kernel(
         float *out,
         const __half *w,
@@ -4922,6 +4950,71 @@ __global__ static void pack_slot_rows_f32_kernel(float *out, const float *slots,
 __global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = __float2half(x[i]);
+}
+
+__global__ static void f32_to_bf16_kernel(
+        __nv_bfloat16 *out, const float *x, uint64_t n) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __float2bfloat16(x[i]);
+}
+
+__global__ static void dflash_pack_features_kernel(
+        float *out,
+        const float *features,
+        const float *norm,
+        uint32_t n_embd,
+        uint32_t n_aux,
+        uint32_t n_rows,
+        float eps) {
+    const uint32_t aux = blockIdx.x;
+    const uint32_t row = blockIdx.y;
+    if (aux >= n_aux || row >= n_rows) return;
+    const float *src = features +
+        ((uint64_t)aux * n_rows + row) * n_embd;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n_embd; i += blockDim.x) {
+        float v = src[i];
+        if (!isfinite(v)) {
+            v = isnan(v) ? 0.0f : copysignf(65504.0f, v);
+        }
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(partial[0] / (float)n_embd + eps);
+    float *dst = out + ((uint64_t)row * n_aux + aux) * n_embd;
+    const float *scale = norm + (uint64_t)aux * n_embd;
+    for (uint32_t i = threadIdx.x; i < n_embd; i += blockDim.x) {
+        float v = src[i];
+        if (!isfinite(v)) {
+            v = isnan(v) ? 0.0f : copysignf(65504.0f, v);
+        }
+        dst[i] = v * inv * scale[i];
+    }
+}
+
+__global__ static void dflash_store_kv_kernel(
+        __half *key_cache,
+        __half *value_cache,
+        const float *k,
+        const float *v,
+        uint32_t pos0,
+        uint32_t n_tokens,
+        uint32_t cache_cap,
+        uint32_t kv_width) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)n_tokens * kv_width;
+    if (i >= n) return;
+    const uint32_t row = (uint32_t)(i / kv_width);
+    const uint32_t col = (uint32_t)(i % kv_width);
+    const uint64_t dst = (uint64_t)((pos0 + row) % cache_cap) * kv_width + col;
+    key_cache[dst] = __float2half(k[i]);
+    value_cache[dst] = __float2half(v[i]);
 }
 
 __device__ static float warp_sum_f32(float v) {
@@ -15654,7 +15747,6 @@ extern "C" int ds4_gpu_matmul_f16_rms_fold_tensor(
         out->bytes < n_tok * out_dim * sizeof(float)) {
         return 0;
     }
-
     const int logical_tier = ds4_tensor_device_idx(out);
     const char *wptr = cuda_resolve_weight_ptr(
         model_map, weight_offset, weight_bytes, logical_tier, "f16 rms fold");
@@ -15685,6 +15777,131 @@ extern "C" int ds4_gpu_matmul_f16_rms_fold_tensor(
         out->ptr, CUDA_R_32F, (int)out_dim,
         CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
     return cublas_ok(st, "f16 rms-fold matmul");
+}
+
+extern "C" int ds4_gpu_matmul_bf16_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    if (!out || !x || !model_map || n_tok == 0u ||
+        weight_offset > model_size || out_dim > UINT64_MAX / in_dim) {
+        return 0;
+    }
+    const uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
+    if (weight_bytes > model_size - weight_offset ||
+        x->bytes < n_tok * in_dim * sizeof(float) ||
+        out->bytes < n_tok * out_dim * sizeof(float)) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(out);
+    if (ds4_tensor_device_idx(x) != logical_tier) return 0;
+    const char *wptr = cuda_resolve_weight_ptr(
+            model_map, weight_offset, weight_bytes, logical_tier, "bf16");
+    if (!wptr) return 0;
+
+    cudaDeviceProp prop = {};
+    int physical = 0;
+    const bool tensor_core =
+        cudaGetDevice(&physical) == cudaSuccess &&
+        cudaGetDeviceProperties(&prop, physical) == cudaSuccess &&
+        prop.major >= 8 && g_cublas_ready &&
+        getenv("DS4_CUDA_DFLASH_NO_BF16_CUBLAS") == NULL;
+    if (tensor_core) {
+        const uint64_t xn = n_tok * in_dim;
+        __nv_bfloat16 *xb = (__nv_bfloat16 *)cuda_tmp_alloc_on(
+                logical_tier, xn * sizeof(__nv_bfloat16),
+                "DFlash BF16 activations");
+        if (!xb) return 0;
+        f32_to_bf16_kernel<<<(xn + 255u) / 256u, 256>>>(
+                xb, (const float *)x->ptr, xn);
+        if (!cuda_ok(cudaGetLastError(), "DFlash BF16 activation convert")) {
+            return 0;
+        }
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        const cublasStatus_t st = cublasGemmEx(
+                cuda_cublas_for_tier(logical_tier),
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                (int)out_dim, (int)n_tok, (int)in_dim,
+                &alpha,
+                wptr, CUDA_R_16BF, (int)in_dim,
+                xb, CUDA_R_16BF, (int)in_dim,
+                &beta,
+                out->ptr, CUDA_R_32F, (int)out_dim,
+                CUDA_R_32F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        return cublas_ok(st, "DFlash BF16 matmul");
+    }
+
+    const dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1u);
+    matmul_bf16_kernel<<<grid, 256>>>(
+            (float *)out->ptr,
+            (const __nv_bfloat16 *)wptr,
+            (const float *)x->ptr,
+            in_dim, out_dim, n_tok);
+    return cuda_ok(cudaGetLastError(), "DFlash portable BF16 matmul");
+}
+
+extern "C" int ds4_gpu_dflash_pack_features_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *features,
+        const void *model_map, uint64_t model_size, uint64_t aux_norm_offset,
+        uint32_t n_embd, uint32_t n_aux, uint32_t n_rows, float eps) {
+    if (!out || !features || !model_map || n_embd == 0u || n_aux == 0u ||
+        n_rows == 0u || !isfinite(eps) || eps <= 0.0f) {
+        return 0;
+    }
+    const uint64_t values = (uint64_t)n_rows * n_aux * n_embd;
+    const uint64_t norm_values = (uint64_t)n_aux * n_embd;
+    if (features->bytes < values * sizeof(float) ||
+        out->bytes < values * sizeof(float) ||
+        aux_norm_offset > model_size ||
+        norm_values * sizeof(float) > model_size - aux_norm_offset) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(out);
+    if (ds4_tensor_device_idx(features) != tier) return 0;
+    const char *norm = cuda_resolve_weight_ptr(
+            model_map, aux_norm_offset, norm_values * sizeof(float),
+            tier, "DFlash aux norm");
+    if (!norm) return 0;
+    dflash_pack_features_kernel<<<dim3(n_aux, n_rows, 1u), 256>>>(
+            (float *)out->ptr,
+            (const float *)features->ptr,
+            (const float *)norm,
+            n_embd, n_aux, n_rows, eps);
+    return cuda_ok(cudaGetLastError(), "DFlash pack features");
+}
+
+extern "C" int ds4_gpu_dflash_store_kv_tensor(
+        ds4_gpu_tensor *key_cache, ds4_gpu_tensor *value_cache,
+        const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
+        uint32_t pos0, uint32_t n_tokens, uint32_t cache_cap,
+        uint32_t kv_width) {
+    if (!key_cache || !value_cache || !k || !v || n_tokens == 0u ||
+        cache_cap == 0u || kv_width == 0u) {
+        return 0;
+    }
+    const uint64_t values = (uint64_t)n_tokens * kv_width;
+    const uint64_t cache_values = (uint64_t)cache_cap * kv_width;
+    if (k->bytes < values * sizeof(float) ||
+        v->bytes < values * sizeof(float) ||
+        key_cache->bytes < cache_values * sizeof(__half) ||
+        value_cache->bytes < cache_values * sizeof(__half)) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(key_cache);
+    if (ds4_tensor_device_idx(value_cache) != tier ||
+        ds4_tensor_device_idx(k) != tier ||
+        ds4_tensor_device_idx(v) != tier) {
+        return 0;
+    }
+    dflash_store_kv_kernel<<<(values + 255u) / 256u, 256>>>(
+            (__half *)key_cache->ptr,
+            (__half *)value_cache->ptr,
+            (const float *)k->ptr,
+            (const float *)v->ptr,
+            pos0, n_tokens, cache_cap, kv_width);
+    return cuda_ok(cudaGetLastError(), "DFlash store target KV");
 }
 
 extern "C" int ds4_gpu_matmul_f16_router_rows_exact_tensor(

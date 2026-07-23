@@ -6,6 +6,7 @@ GLM_ANTIREZ_REPO="antirez/GLM-5.2-GGUF"
 LAGUNA_REPO="poolside/Laguna-S-2.1-GGUF"
 LAGUNA_ANTIREZ_REPO="antirez/Laguna-S-2.1-GGUF"
 LAGUNA_REVISION="706fa69799926b6afde1af9e24ca2a4923f110a1"
+LAGUNA_DFLASH_REVISION="92b968eeba0fbb790ef4216e2a70ef079ed19b07"
 REPO="antirez/deepseek-v4-gguf"
 DS4F_Q2_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
 DS4F_Q4_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf"
@@ -23,6 +24,7 @@ GLM_ANTIREZ_Q2_FILE="GLM-5.2-UD-Q2_K_RoutedQ2K.gguf"
 GLM_ANTIREZ_Q4_FILE="GLM-5.2-UD-Q4_K_RoutedQ4K.gguf"
 LAGUNA_Q4_FILE="laguna-s-2.1-Q4_K_M.gguf"
 LAGUNA_Q2_Q3_FILE="laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf"
+LAGUNA_DFLASH_FILE="gguf/laguna-s-2.1-DFlash-BF16.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -53,6 +55,7 @@ Usage:
   ./download_model.sh glm-antirez-q4 [--token TOKEN]
   ./download_model.sh laguna-q4 [--token TOKEN]
   ./download_model.sh laguna-q2-q3 [--token TOKEN]
+  ./download_model.sh laguna-dflash [--token TOKEN]
 
 Targets:
 
@@ -114,8 +117,11 @@ Targets:
 
   laguna-q4
        Official imatrix-quantized Laguna S 2.1 Q4_K_M GGUF from Poolside.
-       About 68 GB on disk; currently supported by the Metal backend with
-       full model residency.
+       About 68 GB on disk; supported by Metal and CUDA with full residency.
+
+  laguna-dflash
+       Official Laguna S 2.1 DFlash BF16 drafter from Poolside, about 2.1 GB.
+       Use it with the Laguna Q4 model and --mtp on CUDA.
 
   laguna-q2-q3
        Mixed Laguna S 2.1 routed-expert quant for 64 GB systems. Routed
@@ -206,6 +212,14 @@ case "$MODEL" in
         REPO=$LAGUNA_ANTIREZ_REPO
         MODEL_FILE=$LAGUNA_Q2_Q3_FILE
         FORCE_HF_DOWNLOAD=1
+        ;;
+    laguna-dflash)
+        REPO=$LAGUNA_REPO
+        MODEL_FILE=$LAGUNA_DFLASH_FILE
+        FORCE_HF_DOWNLOAD=1
+        FLATTEN_DOWNLOADS=1
+        LINK_MODEL=0
+        HF_REVISION=$LAGUNA_DFLASH_REVISION
         ;;
     -h|--help|help)
         usage
@@ -386,6 +400,10 @@ if [ "$MODEL" = "ds4f-dspark" ]; then
     echo
     echo "DSpark support downloaded. Enable it explicitly in greedy mode:"
     echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp $OUT_DIR/$DS4F_DSPARK_FILE --temp 0"
+elif [ "$MODEL" = "laguna-dflash" ]; then
+    echo
+    echo "Laguna DFlash downloaded. Enable it for greedy CUDA generation:"
+    echo "  ./ds4 -m ./ds4flash.gguf --cuda --mtp $OUT_DIR/$(basename "$LAGUNA_DFLASH_FILE") --mtp-draft 15 --temp 0"
 elif [ "$MODEL" = "pro-q4-layers00-30" ] || [ "$MODEL" = "pro-q4-layers31-output" ] || [ "$MODEL" = "pro-q4-split" ]; then
     echo
     echo "Downloaded PRO Q4 distributed split file(s). Use them with --layers,"

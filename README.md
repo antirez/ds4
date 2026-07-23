@@ -186,10 +186,10 @@ Laguna S 2.1 support targets Poolside's official imatrix-quantized Q4_K_M GGUF.
 The current 63.56 GiB recipe uses Q4_K routed experts and Q8_0 signal-path
 weights. DwarfStar also accepts Poolside's earlier 70.01 GiB recipe with F16
 attention and mixed Q4_K/Q6_K experts. Both layouts support Metal or CUDA with
-full model residency; SSD streaming, distributed inference, ROCm, and the
-DFlash draft model are rejected explicitly. They require at least 96 GiB of
-unified or device memory. CLI, agent, and server use Laguna's native chat,
-interleaved reasoning, and tagged tool-call formats:
+full model residency; SSD streaming, distributed inference, and ROCm are
+rejected explicitly. They require at least 96 GiB of unified or device memory.
+CLI, agent, and server use Laguna's native chat, interleaved reasoning, and
+tagged tool-call formats:
 
 ```sh
 ./download_model.sh laguna-q4
@@ -197,6 +197,23 @@ interleaved reasoning, and tagged tool-call formats:
 ./ds4-agent -m gguf/laguna-s-2.1-Q4_K_M.gguf -c 32768
 ./ds4-server -m gguf/laguna-s-2.1-Q4_K_M.gguf -c 32768
 ```
+
+CUDA also supports Poolside's official BF16 DFlash drafter. The DFlash GGUF
+captures six target-layer residual streams, fuses them into a six-layer
+block-diffusion decoder, and verifies up to 15 proposed tokens in one target
+batch. Greedy decoding remains target-verified:
+
+```sh
+./download_model.sh laguna-dflash
+./ds4 -m gguf/laguna-s-2.1-Q4_K_M.gguf --cuda \
+  --mtp gguf/laguna-s-2.1-DFlash-BF16.gguf --mtp-draft 15 --temp 0
+```
+
+`--mtp-draft` defaults to 15 for this drafter and can be reduced for
+experiments. DFlash needs roughly another 2.1 GiB for weights plus its graph
+buffers. It is not enabled automatically because throughput depends on draft
+acceptance for the workload and on the cost of the target's small verification
+batches.
 
 The shipped GGUF is configured for a 262144-token context. Laguna defaults to
 temperature 1.0, top-k 20, top-p 1.0, and min-p 0; explicit sampling options

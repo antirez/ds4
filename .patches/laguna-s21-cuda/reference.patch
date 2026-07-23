@@ -40,7 +40,7 @@ index 81d4881..debc1e9 100644
 -	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 +	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_laguna_smoke
 diff --git a/README.md b/README.md
-index 7d9e5c7..78ce765 100644
+index 7d9e5c7..e187c5c 100644
 --- a/README.md
 +++ b/README.md
 @@ -176,11 +176,11 @@ file are not supported for GLM yet.
@@ -53,18 +53,507 @@ index 7d9e5c7..78ce765 100644
 -96 or 128 GiB Mac. CLI, agent, and server use Laguna's native chat, interleaved
 -reasoning, and tagged tool-call formats:
 +attention and mixed Q4_K/Q6_K experts. Both layouts support Metal or CUDA with
-+full model residency; SSD streaming, distributed inference, ROCm, and the
-+DFlash draft model are rejected explicitly. They require at least 96 GiB of
-+unified or device memory. CLI, agent, and server use Laguna's native chat,
-+interleaved reasoning, and tagged tool-call formats:
++full model residency; SSD streaming, distributed inference, and ROCm are
++rejected explicitly. They require at least 96 GiB of unified or device memory.
++CLI, agent, and server use Laguna's native chat, interleaved reasoning, and
++tagged tool-call formats:
  
  ```sh
  ./download_model.sh laguna-q4
+@@ -189,6 +189,23 @@ reasoning, and tagged tool-call formats:
+ ./ds4-server -m gguf/laguna-s-2.1-Q4_K_M.gguf -c 32768
+ ```
+ 
++CUDA also supports Poolside's official BF16 DFlash drafter. The DFlash GGUF
++captures six target-layer residual streams, fuses them into a six-layer
++block-diffusion decoder, and verifies up to 15 proposed tokens in one target
++batch. Greedy decoding remains target-verified:
++
++```sh
++./download_model.sh laguna-dflash
++./ds4 -m gguf/laguna-s-2.1-Q4_K_M.gguf --cuda \
++  --mtp gguf/laguna-s-2.1-DFlash-BF16.gguf --mtp-draft 15 --temp 0
++```
++
++`--mtp-draft` defaults to 15 for this drafter and can be reduced for
++experiments. DFlash needs roughly another 2.1 GiB for weights plus its graph
++buffers. It is not enabled automatically because throughput depends on draft
++acceptance for the workload and on the cost of the target's small verification
++batches.
++
+ The shipped GGUF is configured for a 262144-token context. Laguna defaults to
+ temperature 1.0, top-k 20, top-p 1.0, and min-p 0; explicit sampling options
+ always take precedence. Use `--nothink` or the `laguna-s-2.1-chat` server alias
+diff --git a/download_model.sh b/download_model.sh
+index e52da5d..19c764c 100755
+--- a/download_model.sh
++++ b/download_model.sh
+@@ -5,6 +5,7 @@ GLM_UNSLOTH_REPO="unsloth/GLM-5.2-GGUF"
+ GLM_ANTIREZ_REPO="antirez/GLM-5.2-GGUF"
+ LAGUNA_REPO="poolside/Laguna-S-2.1-GGUF"
+ LAGUNA_REVISION="706fa69799926b6afde1af9e24ca2a4923f110a1"
++LAGUNA_DFLASH_REVISION="92b968eeba0fbb790ef4216e2a70ef079ed19b07"
+ REPO="antirez/deepseek-v4-gguf"
+ Q2_IMATRIX_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
+ Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
+@@ -21,6 +22,7 @@ GLM_ANTIREZ_IQ2XXS_FILE="GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf"
+ GLM_ANTIREZ_Q2_FILE="GLM-5.2-UD-Q2_K_RoutedQ2K.gguf"
+ GLM_ANTIREZ_Q4_FILE="GLM-5.2-UD-Q4_K_RoutedQ4K.gguf"
+ LAGUNA_Q4_FILE="laguna-s-2.1-Q4_K_M.gguf"
++LAGUNA_DFLASH_FILE="gguf/laguna-s-2.1-DFlash-BF16.gguf"
+ 
+ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
+@@ -50,6 +52,7 @@ Usage:
+   ./download_model.sh glm-antirez-q2 [--token TOKEN]
+   ./download_model.sh glm-antirez-q4 [--token TOKEN]
+   ./download_model.sh laguna-q4 [--token TOKEN]
++  ./download_model.sh laguna-dflash [--token TOKEN]
+ 
+ Targets:
+ 
+@@ -110,8 +113,11 @@ Targets:
+ 
+   laguna-q4
+        Official imatrix-quantized Laguna S 2.1 Q4_K_M GGUF from Poolside.
+-       About 68 GB on disk; currently supported by the Metal backend with
+-       full model residency.
++       About 68 GB on disk; supported by Metal and CUDA with full residency.
++
++  laguna-dflash
++       Official Laguna S 2.1 DFlash BF16 drafter from Poolside, about 2.1 GB.
++       Use it with the Laguna Q4 model and --mtp on CUDA.
+ 
+ Options:
+   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
+@@ -196,6 +202,14 @@ case "$MODEL" in
+         FORCE_HF_DOWNLOAD=1
+         HF_REVISION=$LAGUNA_REVISION
+         ;;
++    laguna-dflash)
++        REPO=$LAGUNA_REPO
++        MODEL_FILE=$LAGUNA_DFLASH_FILE
++        FORCE_HF_DOWNLOAD=1
++        FLATTEN_DOWNLOADS=1
++        LINK_MODEL=0
++        HF_REVISION=$LAGUNA_DFLASH_REVISION
++        ;;
+     -h|--help|help)
+         usage
+         exit 0
+@@ -380,6 +394,10 @@ elif [ "$MODEL" = "dspark-support" ]; then
+     echo
+     echo "DSpark support downloaded. Enable it explicitly in greedy mode:"
+     echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp $OUT_DIR/$DSPARK_SUPPORT_FILE --temp 0"
++elif [ "$MODEL" = "laguna-dflash" ]; then
++    echo
++    echo "Laguna DFlash downloaded. Enable it for greedy CUDA generation:"
++    echo "  ./ds4 -m ./ds4flash.gguf --cuda --mtp $OUT_DIR/$(basename "$LAGUNA_DFLASH_FILE") --mtp-draft 15 --temp 0"
+ elif [ "$MODEL" = "pro-q4-layers00-30" ] || [ "$MODEL" = "pro-q4-layers31-output" ] || [ "$MODEL" = "pro-q4-split" ]; then
+     echo
+     echo "Downloaded PRO Q4 distributed split file(s). Use them with --layers,"
 diff --git a/ds4.c b/ds4.c
-index 39b39be..aea9aae 100644
+index 39b39be..436c755 100644
 --- a/ds4.c
 +++ b/ds4.c
-@@ -47414,7 +47414,7 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
+@@ -2122,6 +2122,7 @@ enum {
+     DS4_TENSOR_Q8_K     = 15,
+     DS4_TENSOR_IQ2_XXS  = 16,
+     DS4_TENSOR_I32      = 26,
++    DS4_TENSOR_BF16     = 30,
+ };
+ 
+ typedef struct {
+@@ -2578,6 +2579,7 @@ typedef enum {
+     DS4_SUPPORT_NONE = 0,
+     DS4_SUPPORT_MTP_LEGACY,
+     DS4_SUPPORT_DSPARK,
++    DS4_SUPPORT_DFLASH,
+ } ds4_support_kind;
+ 
+ static bool model_get_u32_any(const ds4_model *m, const char *const *keys,
+@@ -2852,6 +2854,7 @@ static const char *support_kind_name(ds4_support_kind kind) {
+     switch (kind) {
+     case DS4_SUPPORT_MTP_LEGACY: return "legacy MTP";
+     case DS4_SUPPORT_DSPARK:     return "DSpark";
++    case DS4_SUPPORT_DFLASH:     return "DFlash";
+     case DS4_SUPPORT_NONE:       return "none";
+     }
+     return "unknown";
+@@ -2865,6 +2868,16 @@ static ds4_support_kind support_model_detect(
+     if (summary_out) memset(summary_out, 0, sizeof(*summary_out));
+     if (!m) return DS4_SUPPORT_NONE;
+ 
++    ds4_str arch = {0};
++    if (model_get_string(m, "general.architecture", &arch) &&
++        ds4_streq(arch, "dflash") &&
++        model_find_tensor(m, "fc.weight") &&
++        model_find_tensor(m, "enc.aux_norm.weight") &&
++        model_find_tensor(m, "blk.0.attn_q.weight")) {
++        if (stages_out) *stages_out = 6u;
++        return DS4_SUPPORT_DFLASH;
++    }
++
+     ds4_dspark_summary s = model_dspark_summary(m);
+     if (summary_out) *summary_out = s;
+     if (stages_out) *stages_out = s.stages;
+@@ -4225,6 +4238,28 @@ typedef struct {
+     ds4_dspark_stage_weights stage[DS4_DSPARK_MAX_STAGES];
+ } ds4_dspark_weights;
+ 
++#define DS4_DFLASH_N_LAYER 6u
++#define DS4_DFLASH_N_AUX 6u
++#define DS4_DFLASH_BLOCK_SIZE 16u
++#define DS4_DFLASH_MASK_TOKEN 12u
++#define DS4_DFLASH_N_HEAD 72u
++#define DS4_DFLASH_N_HEAD_KV 8u
++#define DS4_DFLASH_HEAD_DIM 128u
++#define DS4_DFLASH_N_FF 12288u
++#define DS4_DFLASH_SWA 512u
++
++typedef struct {
++    ds4_tensor *fc;
++    ds4_tensor *enc_aux_norm;
++    ds4_tensor *enc_output_norm;
++    ds4_tensor *output_norm;
++    ds4_layer_weights layer[DS4_DFLASH_N_LAYER];
++    uint32_t target_layers[DS4_DFLASH_N_AUX];
++    uint32_t target_layer_count;
++    uint32_t block_size;
++    uint32_t mask_token_id;
++} ds4_dflash_weights;
++
+ /* =========================================================================
+  * Fixed Weight Binding and Model Validation.
+  * =========================================================================
+@@ -6871,6 +6906,133 @@ static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
+     mtp_weights_validate_layout(w);
+ }
+ 
++static void dflash_expect_tensor(const ds4_tensor *t,
++                                 uint32_t ndim,
++                                 uint64_t d0,
++                                 uint64_t d1,
++                                 uint32_t type) {
++    if (!t || t->ndim != ndim || t->type != type ||
++        t->dim[0] != d0 || (ndim > 1u && t->dim[1] != d1)) {
++        fprintf(stderr,
++                "ds4: invalid DFlash tensor %.*s: expected %s [%" PRIu64
++                "%s%" PRIu64 "]\n",
++                t ? (int)t->name.len : 7,
++                t ? t->name.ptr : "missing",
++                tensor_type_name(type),
++                d0,
++                ndim > 1u ? ", " : "",
++                ndim > 1u ? d1 : 0u);
++        exit(1);
++    }
++}
++
++static void dflash_weights_bind(ds4_dflash_weights *w, const ds4_model *m) {
++    memset(w, 0, sizeof(*w));
++
++    w->fc = required_tensor(m, "fc.weight");
++    w->enc_aux_norm = required_tensor(m, "enc.aux_norm.weight");
++    w->enc_output_norm = required_tensor(m, "enc.output_norm.weight");
++    w->output_norm = required_tensor(m, "output_norm.weight");
++
++    dflash_expect_tensor(w->fc, 2, DS4_N_EMBD * DS4_DFLASH_N_AUX,
++                         DS4_N_EMBD, DS4_TENSOR_BF16);
++    dflash_expect_tensor(w->enc_aux_norm, 2, DS4_N_EMBD,
++                         DS4_DFLASH_N_AUX, DS4_TENSOR_F32);
++    dflash_expect_tensor(w->enc_output_norm, 1, DS4_N_EMBD, 0,
++                         DS4_TENSOR_F32);
++    dflash_expect_tensor(w->output_norm, 1, DS4_N_EMBD, 0,
++                         DS4_TENSOR_F32);
++
++    for (uint32_t il = 0; il < DS4_DFLASH_N_LAYER; il++) {
++        ds4_layer_weights *l = &w->layer[il];
++        l->attn_norm = required_tensorf(m, "blk.%u.attn_norm.weight", il);
++        l->attn_q = required_tensorf(m, "blk.%u.attn_q.weight", il);
++        l->attn_k = required_tensorf(m, "blk.%u.attn_k.weight", il);
++        l->attn_v = required_tensorf(m, "blk.%u.attn_v.weight", il);
++        l->attn_gate = required_tensorf(m, "blk.%u.attn_gate.weight", il);
++        l->attn_q_norm = required_tensorf(m, "blk.%u.attn_q_norm.weight", il);
++        l->attn_k_norm = required_tensorf(m, "blk.%u.attn_k_norm.weight", il);
++        l->attn_output = required_tensorf(m, "blk.%u.attn_output.weight", il);
++        l->ffn_norm = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
++        l->ffn_gate = required_tensorf(m, "blk.%u.ffn_gate.weight", il);
++        l->ffn_up = required_tensorf(m, "blk.%u.ffn_up.weight", il);
++        l->ffn_down = required_tensorf(m, "blk.%u.ffn_down.weight", il);
++
++        dflash_expect_tensor(l->attn_norm, 1, DS4_N_EMBD, 0, DS4_TENSOR_F32);
++        dflash_expect_tensor(l->attn_q, 2, DS4_N_EMBD,
++                             DS4_DFLASH_N_HEAD * DS4_DFLASH_HEAD_DIM,
++                             DS4_TENSOR_BF16);
++        dflash_expect_tensor(l->attn_k, 2, DS4_N_EMBD,
++                             DS4_DFLASH_N_HEAD_KV * DS4_DFLASH_HEAD_DIM,
++                             DS4_TENSOR_BF16);
++        dflash_expect_tensor(l->attn_v, 2, DS4_N_EMBD,
++                             DS4_DFLASH_N_HEAD_KV * DS4_DFLASH_HEAD_DIM,
++                             DS4_TENSOR_BF16);
++        dflash_expect_tensor(l->attn_gate, 2, DS4_N_EMBD,
++                             DS4_DFLASH_N_HEAD, DS4_TENSOR_BF16);
++        dflash_expect_tensor(l->attn_q_norm, 1, DS4_DFLASH_HEAD_DIM, 0,
++                             DS4_TENSOR_F32);
++        dflash_expect_tensor(l->attn_k_norm, 1, DS4_DFLASH_HEAD_DIM, 0,
++                             DS4_TENSOR_F32);
++        dflash_expect_tensor(l->attn_output, 2,
++                             DS4_DFLASH_N_HEAD * DS4_DFLASH_HEAD_DIM,
++                             DS4_N_EMBD, DS4_TENSOR_BF16);
++        dflash_expect_tensor(l->ffn_norm, 1, DS4_N_EMBD, 0, DS4_TENSOR_F32);
++        dflash_expect_tensor(l->ffn_gate, 2, DS4_N_EMBD,
++                             DS4_DFLASH_N_FF, DS4_TENSOR_BF16);
++        dflash_expect_tensor(l->ffn_up, 2, DS4_N_EMBD,
++                             DS4_DFLASH_N_FF, DS4_TENSOR_BF16);
++        dflash_expect_tensor(l->ffn_down, 2, DS4_DFLASH_N_FF,
++                             DS4_N_EMBD, DS4_TENSOR_BF16);
++    }
++
++    const uint32_t n_layer = required_u32(m, "dflash.block_count");
++    const uint32_t n_embd = required_u32(m, "dflash.embedding_length");
++    const uint32_t n_ff = required_u32(m, "dflash.feed_forward_length");
++    const uint32_t n_head = required_u32(m, "dflash.attention.head_count");
++    const uint32_t n_head_kv = required_u32(m, "dflash.attention.head_count_kv");
++    const uint32_t head_dim = required_u32(m, "dflash.attention.key_length");
++    const uint32_t swa = required_u32(m, "dflash.attention.sliding_window");
++    w->block_size = required_u32(m, "dflash.block_size");
++    if (n_layer != DS4_DFLASH_N_LAYER || n_embd != DS4_N_EMBD ||
++        n_ff != DS4_DFLASH_N_FF || n_head != DS4_DFLASH_N_HEAD ||
++        n_head_kv != DS4_DFLASH_N_HEAD_KV ||
++        head_dim != DS4_DFLASH_HEAD_DIM || swa != DS4_DFLASH_SWA ||
++        w->block_size != DS4_DFLASH_BLOCK_SIZE) {
++        ds4_die("official Laguna DFlash metadata has an unsupported layout");
++    }
++
++    ds4_array_ref layers = {0};
++    if (!model_get_array(m, "dflash.target_layers", &layers) ||
++        (layers.type != GGUF_VALUE_UINT32 && layers.type != GGUF_VALUE_INT32) ||
++        layers.len != DS4_DFLASH_N_AUX) {
++        ds4_die("DFlash target_layers must contain six integer layer IDs");
++    }
++    ds4_cursor lc = cursor_at(m, layers.data_pos);
++    for (uint32_t i = 0; i < DS4_DFLASH_N_AUX; i++) {
++        int32_t v = 0;
++        if (layers.type == GGUF_VALUE_UINT32) {
++            uint32_t uv = 0;
++            if (!cursor_u32(&lc, &uv) || uv > DS4_N_LAYER) {
++                ds4_die("DFlash target layer is out of range");
++            }
++            v = (int32_t)uv;
++        } else if (!cursor_read(&lc, &v, sizeof(v)) ||
++                   v <= 0 || v > (int32_t)DS4_N_LAYER) {
++            ds4_die("DFlash target layer is out of range");
++        }
++        w->target_layers[i] = (uint32_t)v;
++    }
++    w->target_layer_count = DS4_DFLASH_N_AUX;
++    int mask_token_id = -1;
++    if (!model_get_token_id(m, "tokenizer.ggml.mask_token_id",
++                            &mask_token_id) ||
++        mask_token_id != DS4_DFLASH_MASK_TOKEN) {
++        ds4_die("DFlash mask token does not match the official Laguna drafter");
++    }
++    w->mask_token_id = (uint32_t)mask_token_id;
++}
++
+ static ds4_tensor *dspark_bind_tensor(
+         ds4_dspark_weights *dw,
+         const ds4_model    *m,
+@@ -35713,6 +35875,7 @@ struct ds4_engine {
+     ds4_weights weights;
+     ds4_mtp_weights mtp_weights;
+     ds4_dspark_weights dspark_weights;
++    ds4_dflash_weights dflash_weights;
+     ds4_backend backend;
+     ds4_support_kind support_kind;
+     int dspark_exec_tier;
+@@ -35748,6 +35911,7 @@ struct ds4_engine {
+     ds4_engine_tp_state tp;
+     bool metal_ready;
+     bool mtp_ready;
++    bool dflash_ready;
+     bool share_session_prefill_workspace;
+ #ifndef DS4_NO_GPU
+     bool shared_prefill_workspace_ready;
+@@ -47247,6 +47411,43 @@ static int generate_glm_metal_argmax(
+  * full-attention and sliding-window layers with different query geometry.
+  * Keep this graph separate from DeepSeek's compressed-attention graph and
+  * GLM's DSA graph so their mature scheduling paths remain untouched. */
++typedef struct {
++    uint32_t ctx_size;
++    uint32_t capture_cap;
++    uint64_t scratch_bytes;
++    uint64_t kv_bytes;
++
++    ds4_gpu_tensor *features;
++    ds4_gpu_tensor *packed_features;
++    ds4_gpu_tensor *fused;
++    ds4_gpu_tensor *norm;
++    ds4_gpu_tensor *tokens;
++    ds4_gpu_tensor *cur;
++    ds4_gpu_tensor *next;
++    ds4_gpu_tensor *q;
++    ds4_gpu_tensor *k;
++    ds4_gpu_tensor *v;
++    ds4_gpu_tensor *gate;
++    ds4_gpu_tensor *heads;
++    ds4_gpu_tensor *attn_out;
++    ds4_gpu_tensor *after_attn;
++    ds4_gpu_tensor *ffn_norm;
++    ds4_gpu_tensor *ffn_gate;
++    ds4_gpu_tensor *ffn_up;
++    ds4_gpu_tensor *ffn_mid;
++    ds4_gpu_tensor *ffn_out;
++    ds4_gpu_tensor *staged_key;
++    ds4_gpu_tensor *staged_value;
++    ds4_gpu_tensor *output_norm;
++    ds4_gpu_tensor *logits;
++    ds4_gpu_tensor *tops;
++    ds4_gpu_tensor *target_norm;
++    ds4_gpu_tensor *target_logits;
++    ds4_gpu_tensor *target_tops;
++    ds4_gpu_tensor *key_cache[DS4_DFLASH_N_LAYER];
++    ds4_gpu_tensor *value_cache[DS4_DFLASH_N_LAYER];
++} ds4_dflash_gpu_graph;
++
+ typedef struct {
+     uint32_t ctx_size;
+     uint32_t prefill_cap;
+@@ -47284,6 +47485,10 @@ typedef struct {
+     ds4_gpu_tensor *key_cache[DS4_MAX_LAYER];
+     ds4_gpu_tensor *value_cache[DS4_MAX_LAYER];
+     uint32_t cache_cap[DS4_MAX_LAYER];
++    ds4_gpu_tensor *dflash_features;
++    ds4_gpu_tensor *dflash_target_norm;
++    ds4_gpu_tensor *dflash_target_logits;
++    ds4_gpu_tensor *dflash_target_tops;
+ } ds4_laguna_gpu_graph;
+ 
+ static void laguna_graph_free(ds4_laguna_gpu_graph *g) {
+@@ -47331,6 +47536,121 @@ static void laguna_graph_free(ds4_laguna_gpu_graph *g) {
+     memset(g, 0, sizeof(*g));
+ }
+ 
++static void dflash_graph_free(ds4_dflash_gpu_graph *g) {
++    if (!g) return;
++#define DS4_DFLASH_FREE(name) do { \
++        ds4_gpu_tensor_free(g->name); \
++        g->name = NULL; \
++    } while (0)
++    DS4_DFLASH_FREE(features);
++    DS4_DFLASH_FREE(packed_features);
++    DS4_DFLASH_FREE(fused);
++    DS4_DFLASH_FREE(norm);
++    DS4_DFLASH_FREE(tokens);
++    DS4_DFLASH_FREE(cur);
++    DS4_DFLASH_FREE(next);
++    DS4_DFLASH_FREE(q);
++    DS4_DFLASH_FREE(k);
++    DS4_DFLASH_FREE(v);
++    DS4_DFLASH_FREE(gate);
++    DS4_DFLASH_FREE(heads);
++    DS4_DFLASH_FREE(attn_out);
++    DS4_DFLASH_FREE(after_attn);
++    DS4_DFLASH_FREE(ffn_norm);
++    DS4_DFLASH_FREE(ffn_gate);
++    DS4_DFLASH_FREE(ffn_up);
++    DS4_DFLASH_FREE(ffn_mid);
++    DS4_DFLASH_FREE(ffn_out);
++    DS4_DFLASH_FREE(staged_key);
++    DS4_DFLASH_FREE(staged_value);
++    DS4_DFLASH_FREE(output_norm);
++    DS4_DFLASH_FREE(logits);
++    DS4_DFLASH_FREE(tops);
++    DS4_DFLASH_FREE(target_norm);
++    DS4_DFLASH_FREE(target_logits);
++    DS4_DFLASH_FREE(target_tops);
++#undef DS4_DFLASH_FREE
++    for (uint32_t il = 0; il < DS4_DFLASH_N_LAYER; il++) {
++        ds4_gpu_tensor_free(g->key_cache[il]);
++        ds4_gpu_tensor_free(g->value_cache[il]);
++    }
++    memset(g, 0, sizeof(*g));
++}
++
++static bool dflash_graph_alloc(ds4_dflash_gpu_graph *g, uint32_t ctx_size) {
++    if (!g || ctx_size == 0u) return false;
++    memset(g, 0, sizeof(*g));
++    g->ctx_size = ctx_size;
++    g->capture_cap = ctx_size < 1024u ? ctx_size : 1024u;
++
++    const uint64_t cap = g->capture_cap;
++    const uint64_t block = DS4_DFLASH_BLOCK_SIZE;
++    const uint64_t embd = DS4_N_EMBD;
++    const uint64_t q_dim = DS4_DFLASH_N_HEAD * DS4_DFLASH_HEAD_DIM;
++    const uint64_t kv_dim = DS4_DFLASH_N_HEAD_KV * DS4_DFLASH_HEAD_DIM;
++#define DS4_DFLASH_ALLOC(name, bytes) do { \
++        const uint64_t ds4_dflash_bytes_ = (uint64_t)(bytes); \
++        g->name = ds4_gpu_tensor_alloc(ds4_dflash_bytes_); \
++        if (!g->name) goto fail; \
++        g->scratch_bytes += ds4_dflash_bytes_; \
++    } while (0)
++    DS4_DFLASH_ALLOC(features,
++                     cap * DS4_DFLASH_N_AUX * embd * sizeof(float));
++    DS4_DFLASH_ALLOC(packed_features,
++                     cap * DS4_DFLASH_N_AUX * embd * sizeof(float));
++    DS4_DFLASH_ALLOC(fused, cap * embd * sizeof(float));
++    DS4_DFLASH_ALLOC(norm, cap * embd * sizeof(float));
++    DS4_DFLASH_ALLOC(tokens, block * sizeof(uint32_t));
++    DS4_DFLASH_ALLOC(cur, block * embd * sizeof(float));
++    DS4_DFLASH_ALLOC(next, block * embd * sizeof(float));
++    DS4_DFLASH_ALLOC(q, block * q_dim * sizeof(float));
++    DS4_DFLASH_ALLOC(k, cap * kv_dim * sizeof(float));
++    DS4_DFLASH_ALLOC(v, cap * kv_dim * sizeof(float));
++    DS4_DFLASH_ALLOC(gate, block * DS4_DFLASH_N_HEAD * sizeof(float));
++    DS4_DFLASH_ALLOC(heads, block * q_dim * sizeof(float));
++    DS4_DFLASH_ALLOC(attn_out, block * embd * sizeof(float));
++    DS4_DFLASH_ALLOC(after_attn, block * embd * sizeof(float));
++    DS4_DFLASH_ALLOC(ffn_norm, block * embd * sizeof(float));
++    DS4_DFLASH_ALLOC(ffn_gate,
++                     block * DS4_DFLASH_N_FF * sizeof(float));
++    DS4_DFLASH_ALLOC(ffn_up,
++                     block * DS4_DFLASH_N_FF * sizeof(float));
++    DS4_DFLASH_ALLOC(ffn_mid,
++                     block * DS4_DFLASH_N_FF * sizeof(float));
++    DS4_DFLASH_ALLOC(ffn_out, block * embd * sizeof(float));
++    DS4_DFLASH_ALLOC(staged_key, block * kv_dim * sizeof(uint16_t));
++    DS4_DFLASH_ALLOC(staged_value, block * kv_dim * sizeof(uint16_t));
++    DS4_DFLASH_ALLOC(output_norm, block * embd * sizeof(float));
++    DS4_DFLASH_ALLOC(logits, block * DS4_N_VOCAB * sizeof(float));
++    DS4_DFLASH_ALLOC(tops, block * sizeof(uint32_t));
++    DS4_DFLASH_ALLOC(target_norm, block * embd * sizeof(float));
++    DS4_DFLASH_ALLOC(target_logits,
++                     block * DS4_N_VOCAB * sizeof(float));
++    DS4_DFLASH_ALLOC(target_tops, block * sizeof(uint32_t));
++#undef DS4_DFLASH_ALLOC
++
++    const uint64_t cache_bytes =
++        (uint64_t)DS4_DFLASH_SWA * kv_dim * sizeof(uint16_t);
++    for (uint32_t il = 0; il < DS4_DFLASH_N_LAYER; il++) {
++        g->key_cache[il] = ds4_gpu_tensor_alloc(cache_bytes);
++        g->value_cache[il] = ds4_gpu_tensor_alloc(cache_bytes);
++        if (!g->key_cache[il] || !g->value_cache[il]) goto fail;
++        g->kv_bytes += 2u * cache_bytes;
++    }
++    fprintf(stderr,
++            "ds4: DFlash CUDA graph: capture=%u block=%u KV %.2f MiB "
++            "scratch %.2f MiB\n",
++            g->capture_cap,
++            DS4_DFLASH_BLOCK_SIZE,
++            (double)g->kv_bytes / 1048576.0,
++            (double)g->scratch_bytes / 1048576.0);
++    return true;
++fail:
++    fprintf(stderr, "ds4: failed to allocate DFlash CUDA graph\n");
++    dflash_graph_free(g);
++    return false;
++}
++
+ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
+     if (!g || ctx_size == 0 || ctx_size > DS4_CONTEXT_LENGTH ||
+         DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_LAGUNA) {
+@@ -47414,7 +47734,7 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
      }
  
      fprintf(stderr,
@@ -73,7 +562,7 @@ index 39b39be..aea9aae 100644
              ctx_size,
              g->prefill_cap,
              (double)g->kv_bytes / 1073741824.0,
-@@ -47422,7 +47422,7 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
+@@ -47422,7 +47742,7 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
      return true;
  
  fail:
@@ -82,16 +571,542 @@ index 39b39be..aea9aae 100644
      laguna_graph_free(g);
      return false;
  }
-@@ -48319,7 +48319,7 @@ static bool laguna_graph_forward_batch(
+@@ -47444,6 +47764,16 @@ static bool laguna_graph_matmul(
+                                          x,
+                                          n_tokens) != 0;
+     }
++    if (weight->type == DS4_TENSOR_BF16) {
++        return ds4_gpu_matmul_bf16_tensor(out,
++                                          model->map,
++                                          model->size,
++                                          weight->abs_offset,
++                                          weight->dim[0],
++                                          weight->dim[1],
++                                          x,
++                                          n_tokens) != 0;
++    }
+     if (weight->type == DS4_TENSOR_Q6_K) {
+         return ds4_gpu_matmul_q6_K_tensor(out,
+                                           model->map,
+@@ -47465,10 +47795,54 @@ static bool laguna_graph_matmul(
+                                        n_tokens) != 0;
+ }
+ 
++static bool laguna_graph_capture_dflash(
++        ds4_laguna_gpu_graph   *g,
++        const ds4_dflash_weights *weights,
++        uint32_t                target_layer,
++        uint32_t                n_rows) {
++    if (!g || !weights || !g->dflash_features) return true;
++    for (uint32_t aux = 0; aux < weights->target_layer_count; aux++) {
++        if (weights->target_layers[aux] != target_layer) continue;
++        const uint64_t row_bytes =
++            (uint64_t)n_rows * DS4_N_EMBD * sizeof(float);
++        return ds4_gpu_tensor_copy(
++                g->dflash_features,
++                (uint64_t)aux * row_bytes,
++                g->cur,
++                0,
++                row_bytes) != 0;
++    }
++    return true;
++}
++
++static void dflash_debug_tensor_stats(const char *label,
++                                      const ds4_gpu_tensor *tensor,
++                                      uint64_t count) {
++    if (!getenv("DS4_DFLASH_DEBUG_LOGITS") || !tensor || count == 0u) return;
++    float *v = xmalloc((size_t)count * sizeof(*v));
++    if (ds4_gpu_tensor_read(tensor, 0, v, count * sizeof(*v))) {
++        uint64_t finite = 0, zeros = 0;
++        float lo = INFINITY, hi = -INFINITY;
++        for (uint64_t i = 0; i < count; i++) {
++            if (!isfinite(v[i])) continue;
++            finite++;
++            zeros += v[i] == 0.0f;
++            if (v[i] < lo) lo = v[i];
++            if (v[i] > hi) hi = v[i];
++        }
++        fprintf(stderr,
++                "ds4: DFlash debug %s finite=%" PRIu64 "/%" PRIu64
++                " zero=%" PRIu64 " range=[%g,%g]\n",
++                label, finite, count, zeros, (double)lo, (double)hi);
++    }
++    free(v);
++}
++
+ static bool laguna_graph_forward_token(
+         ds4_laguna_gpu_graph *g,
+         const ds4_model      *model,
+         const ds4_weights    *weights,
++        const ds4_dflash_weights *dflash_weights,
+         int                   token,
+         uint32_t              pos,
+         float                *logits_out) {
+@@ -47826,6 +48200,10 @@ static bool laguna_graph_forward_token(
+             ds4_gpu_tensor *tmp = g->cur;
+             g->cur = g->next;
+             g->next = tmp;
++            ok = laguna_graph_capture_dflash(g,
++                                             dflash_weights,
++                                             il + 1u,
++                                             1u);
+         }
+     }
+ 
+@@ -47882,13 +48260,15 @@ static bool laguna_graph_forward_batch(
+         ds4_laguna_gpu_graph *g,
+         const ds4_model      *model,
+         const ds4_weights    *weights,
++        const ds4_dflash_weights *dflash_weights,
+         const int            *tokens,
+         uint32_t              n_tokens,
+         uint32_t              pos0,
+         float                *logits_out,
+         ds4_session_progress_fn display_progress,
+         void                 *display_progress_ud,
+-        int                   display_total) {
++        int                   display_total,
++        bool                  logits_all) {
+     if (!g || !model || !weights || !tokens || n_tokens == 0 ||
+         n_tokens > g->prefill_cap || pos0 > g->ctx_size - n_tokens) {
+         return false;
+@@ -48242,6 +48622,10 @@ static bool laguna_graph_forward_batch(
+             g->cur = g->next;
+             g->next = tmp;
+             completed_layers = il + 1u;
++            ok = laguna_graph_capture_dflash(g,
++                                             dflash_weights,
++                                             il + 1u,
++                                             n_tokens);
+         }
+         if (ok && live_progress) {
+             ok = ds4_gpu_end_commands() != 0;
+@@ -48274,6 +48658,39 @@ static bool laguna_graph_forward_batch(
+     }
+ 
+     ds4_gpu_tensor *last = NULL;
++    if (ok && logits_all) {
++        if (!g->dflash_target_norm || !g->dflash_target_logits ||
++            !g->dflash_target_tops ||
++            n_tokens > DS4_DFLASH_BLOCK_SIZE) {
++            ok = false;
++        }
++        if (ok) {
++            ok = ds4_gpu_rms_norm_weight_rows_tensor(
++                    g->dflash_target_norm,
++                    g->cur,
++                    model->map,
++                    model->size,
++                    weights->output_norm->abs_offset,
++                    DS4_N_EMBD,
++                    n_tokens,
++                    DS4_RMS_EPS) != 0;
++        }
++        if (ok) {
++            ok = laguna_graph_matmul(g->dflash_target_logits,
++                                     model,
++                                     weights->output,
++                                     g->dflash_target_norm,
++                                     n_tokens);
++        }
++        if (ok) {
++            ok = ds4_gpu_indexer_topk_tensor(
++                    g->dflash_target_tops,
++                    g->dflash_target_logits,
++                    DS4_N_VOCAB,
++                    n_tokens,
++                    1u) != 0;
++        }
++    }
+     if (ok && logits_out) {
+         last = ds4_gpu_tensor_view(
+                 g->cur,
+@@ -48319,7 +48736,354 @@ static bool laguna_graph_forward_batch(
      return ok;
  }
  
 -static int generate_laguna_metal_argmax(
++static bool dflash_graph_inject(
++        ds4_dflash_gpu_graph   *g,
++        const ds4_model        *model,
++        const ds4_dflash_weights *weights,
++        uint32_t                pos0,
++        uint32_t                n_tokens) {
++    if (!g || !model || !weights || n_tokens == 0u ||
++        n_tokens > g->capture_cap || pos0 > g->ctx_size - n_tokens) {
++        return false;
++    }
++    bool ok = ds4_gpu_begin_commands() != 0;
++    if (ok) {
++        ok = ds4_gpu_dflash_pack_features_tensor(
++                g->packed_features,
++                g->features,
++                model->map,
++                model->size,
++                weights->enc_aux_norm->abs_offset,
++                DS4_N_EMBD,
++                DS4_DFLASH_N_AUX,
++                n_tokens,
++                DS4_RMS_EPS) != 0;
++    }
++    if (ok) {
++        ok = laguna_graph_matmul(g->fused,
++                                 model,
++                                 weights->fc,
++                                 g->packed_features,
++                                 n_tokens);
++    }
++    if (ok) {
++        ok = ds4_gpu_rms_norm_weight_rows_tensor(
++                g->fused,
++                g->fused,
++                model->map,
++                model->size,
++                weights->enc_output_norm->abs_offset,
++                DS4_N_EMBD,
++                n_tokens,
++                DS4_RMS_EPS) != 0;
++    }
++    if (ok) {
++        dflash_debug_tensor_stats("encoder fused",
++                                  g->fused,
++                                  (uint64_t)n_tokens * DS4_N_EMBD);
++    }
++    for (uint32_t il = 0; ok && il < DS4_DFLASH_N_LAYER; il++) {
++        const ds4_layer_weights *l = &weights->layer[il];
++        ok = ds4_gpu_rms_norm_weight_rows_tensor(
++                g->norm,
++                g->fused,
++                model->map,
++                model->size,
++                l->attn_norm->abs_offset,
++                DS4_N_EMBD,
++                n_tokens,
++                DS4_RMS_EPS) != 0;
++        if (ok) {
++            ok = laguna_graph_matmul(g->k, model, l->attn_k,
++                                     g->norm, n_tokens) &&
++                 laguna_graph_matmul(g->v, model, l->attn_v,
++                                     g->norm, n_tokens);
++        }
++        if (ok) {
++            ok = ds4_gpu_laguna_head_rms_norm_rope_tensor(
++                    g->k,
++                    model->map,
++                    model->size,
++                    l->attn_k_norm->abs_offset,
++                    n_tokens,
++                    DS4_DFLASH_N_HEAD_KV,
++                    DS4_DFLASH_HEAD_DIM,
++                    DS4_DFLASH_HEAD_DIM,
++                    pos0,
++                    1048576u,
++                    500000.0f,
++                    1.0f,
++                    0.0f,
++                    1.0f,
++                    0.0f,
++                    0.0f,
++                    DS4_RMS_EPS) != 0;
++        }
++        if (ok && il == 0u) {
++            dflash_debug_tensor_stats("inject layer0 k",
++                                      g->k,
++                                      (uint64_t)n_tokens *
++                                          DS4_DFLASH_N_HEAD_KV *
++                                          DS4_DFLASH_HEAD_DIM);
++            dflash_debug_tensor_stats("inject layer0 v",
++                                      g->v,
++                                      (uint64_t)n_tokens *
++                                          DS4_DFLASH_N_HEAD_KV *
++                                          DS4_DFLASH_HEAD_DIM);
++        }
++        if (ok) {
++            ok = ds4_gpu_dflash_store_kv_tensor(
++                    g->key_cache[il],
++                    g->value_cache[il],
++                    g->k,
++                    g->v,
++                    pos0,
++                    n_tokens,
++                    DS4_DFLASH_SWA,
++                    DS4_DFLASH_N_HEAD_KV * DS4_DFLASH_HEAD_DIM) != 0;
++        }
++    }
++    if (ds4_gpu_commands_active() && ds4_gpu_end_commands() == 0) ok = false;
++    return ok;
++}
++
++static bool dflash_graph_draft(
++        ds4_dflash_gpu_graph   *g,
++        const ds4_model        *target_model,
++        const ds4_weights      *target_weights,
++        const ds4_model        *model,
++        const ds4_dflash_weights *weights,
++        int                     last_token,
++        uint32_t                pos0,
++        uint32_t                n_draft,
++        int                    *drafts) {
++    if (!g || !target_model || !target_weights || !model || !weights ||
++        !drafts || last_token < 0 || last_token >= (int)DS4_N_VOCAB ||
++        n_draft == 0u || n_draft >= DS4_DFLASH_BLOCK_SIZE ||
++        pos0 > g->ctx_size - (n_draft + 1u)) {
++        return false;
++    }
++    const uint32_t n_tokens = n_draft + 1u;
++    uint32_t ids[DS4_DFLASH_BLOCK_SIZE];
++    ids[0] = (uint32_t)last_token;
++    for (uint32_t i = 1; i < n_tokens; i++) {
++        ids[i] = weights->mask_token_id;
++    }
++    bool ok = ds4_gpu_tensor_write(
++            g->tokens, 0, ids, (uint64_t)n_tokens * sizeof(ids[0])) != 0;
++    if (ok) ok = ds4_gpu_begin_commands() != 0;
++    if (ok) {
++        ok = ds4_gpu_embed_tokens_quant_tensor(
++                g->cur,
++                g->tokens,
++                target_model->map,
++                target_model->size,
++                target_weights->token_embd->abs_offset,
++                target_weights->token_embd->type,
++                DS4_N_VOCAB,
++                n_tokens,
++                DS4_N_EMBD) != 0;
++    }
++    if (ok) {
++        dflash_debug_tensor_stats("decoder embedding",
++                                  g->cur,
++                                  (uint64_t)n_tokens * DS4_N_EMBD);
++    }
++    for (uint32_t il = 0; ok && il < DS4_DFLASH_N_LAYER; il++) {
++        const ds4_layer_weights *l = &weights->layer[il];
++        ok = ds4_gpu_rms_norm_weight_rows_tensor(
++                g->norm, g->cur,
++                model->map, model->size,
++                l->attn_norm->abs_offset,
++                DS4_N_EMBD, n_tokens, DS4_RMS_EPS) != 0;
++        if (ok) {
++            ok = laguna_graph_matmul(g->q, model, l->attn_q,
++                                     g->norm, n_tokens) &&
++                 laguna_graph_matmul(g->k, model, l->attn_k,
++                                     g->norm, n_tokens) &&
++                 laguna_graph_matmul(g->v, model, l->attn_v,
++                                     g->norm, n_tokens) &&
++                 laguna_graph_matmul(g->gate, model, l->attn_gate,
++                                     g->norm, n_tokens);
++        }
++        if (ok && il == 0u) {
++            dflash_debug_tensor_stats("layer0 q",
++                                      g->q,
++                                      (uint64_t)n_tokens *
++                                          DS4_DFLASH_N_HEAD *
++                                          DS4_DFLASH_HEAD_DIM);
++            dflash_debug_tensor_stats("layer0 k",
++                                      g->k,
++                                      (uint64_t)n_tokens *
++                                          DS4_DFLASH_N_HEAD_KV *
++                                          DS4_DFLASH_HEAD_DIM);
++            dflash_debug_tensor_stats("layer0 v",
++                                      g->v,
++                                      (uint64_t)n_tokens *
++                                          DS4_DFLASH_N_HEAD_KV *
++                                          DS4_DFLASH_HEAD_DIM);
++            dflash_debug_tensor_stats("layer0 gate",
++                                      g->gate,
++                                      (uint64_t)n_tokens *
++                                          DS4_DFLASH_N_HEAD);
++        }
++        if (ok) {
++            ok = ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
++                    g->q, g->k,
++                    model->map, model->size,
++                    l->attn_q_norm->abs_offset,
++                    l->attn_k_norm->abs_offset,
++                    n_tokens,
++                    DS4_DFLASH_N_HEAD,
++                    DS4_DFLASH_N_HEAD_KV,
++                    DS4_DFLASH_HEAD_DIM,
++                    DS4_DFLASH_HEAD_DIM,
++                    pos0,
++                    1048576u,
++                    500000.0f,
++                    1.0f,
++                    0.0f,
++                    1.0f,
++                    0.0f,
++                    0.0f,
++                    DS4_RMS_EPS) != 0;
++        }
++        if (ok && il == 0u) {
++            dflash_debug_tensor_stats("layer0 q norm rope",
++                                      g->q,
++                                      (uint64_t)n_tokens *
++                                          DS4_DFLASH_N_HEAD *
++                                          DS4_DFLASH_HEAD_DIM);
++            dflash_debug_tensor_stats("layer0 k norm rope",
++                                      g->k,
++                                      (uint64_t)n_tokens *
++                                          DS4_DFLASH_N_HEAD_KV *
++                                          DS4_DFLASH_HEAD_DIM);
++        }
++        if (ok) {
++            ok = ds4_gpu_laguna_attention_prefill_tensor(
++                    g->heads,
++                    g->key_cache[il],
++                    g->value_cache[il],
++                    g->staged_key,
++                    g->staged_value,
++                    g->q, g->k, g->v, g->gate,
++                    pos0, n_tokens,
++                    DS4_DFLASH_SWA,
++                    DS4_DFLASH_N_HEAD,
++                    DS4_DFLASH_N_HEAD_KV,
++                    DS4_DFLASH_HEAD_DIM,
++                    1.0f / sqrtf((float)DS4_DFLASH_HEAD_DIM)) != 0;
++        }
++        if (ok && il == 0u) {
++            dflash_debug_tensor_stats("layer0 heads",
++                                      g->heads,
++                                      (uint64_t)n_tokens *
++                                          DS4_DFLASH_N_HEAD *
++                                          DS4_DFLASH_HEAD_DIM);
++        }
++        if (ok) {
++            ok = laguna_graph_matmul(g->attn_out, model, l->attn_output,
++                                     g->heads, n_tokens) &&
++                 ds4_gpu_add_tensor(g->after_attn, g->cur, g->attn_out,
++                                    (uint64_t)n_tokens * DS4_N_EMBD) != 0;
++        }
++        if (ok && il == 0u) {
++            dflash_debug_tensor_stats("layer0 after attention",
++                                      g->after_attn,
++                                      (uint64_t)n_tokens * DS4_N_EMBD);
++        }
++        if (ok) {
++            ok = ds4_gpu_rms_norm_weight_rows_tensor(
++                    g->ffn_norm, g->after_attn,
++                    model->map, model->size,
++                    l->ffn_norm->abs_offset,
++                    DS4_N_EMBD, n_tokens, DS4_RMS_EPS) != 0;
++        }
++        if (ok) {
++            ok = laguna_graph_matmul(g->ffn_gate, model, l->ffn_gate,
++                                     g->ffn_norm, n_tokens) &&
++                 laguna_graph_matmul(g->ffn_up, model, l->ffn_up,
++                                     g->ffn_norm, n_tokens);
++        }
++        if (ok) {
++            ok = ds4_gpu_swiglu_tensor(
++                    g->ffn_mid, g->ffn_gate, g->ffn_up,
++                    (uint64_t)n_tokens * DS4_DFLASH_N_FF,
++                    0.0f, 1.0f) != 0;
++        }
++        if (ok) {
++            ok = laguna_graph_matmul(g->ffn_out, model, l->ffn_down,
++                                     g->ffn_mid, n_tokens) &&
++                 ds4_gpu_add_tensor(g->next, g->after_attn, g->ffn_out,
++                                    (uint64_t)n_tokens * DS4_N_EMBD) != 0;
++        }
++        if (ok) {
++            ds4_gpu_tensor *tmp = g->cur;
++            g->cur = g->next;
++            g->next = tmp;
++            char label[48];
++            snprintf(label, sizeof(label), "decoder layer %u", il);
++            dflash_debug_tensor_stats(label,
++                                      g->cur,
++                                      (uint64_t)n_tokens * DS4_N_EMBD);
++        }
++    }
++    if (ok) {
++        ok = ds4_gpu_rms_norm_weight_rows_tensor(
++                g->output_norm, g->cur,
++                model->map, model->size,
++                weights->output_norm->abs_offset,
++                DS4_N_EMBD, n_tokens, DS4_RMS_EPS) != 0;
++    }
++    if (ok) {
++        ok = laguna_graph_matmul(g->logits,
++                                 target_model,
++                                 target_weights->output,
++                                 g->output_norm,
++                                 n_tokens);
++    }
++    if (ok) {
++        ok = ds4_gpu_indexer_topk_tensor(
++                g->tops, g->logits, DS4_N_VOCAB, n_tokens, 1u) != 0;
++    }
++    if (ds4_gpu_commands_active() && ds4_gpu_end_commands() == 0) ok = false;
++    if (ok && getenv("DS4_DFLASH_DEBUG_LOGITS")) {
++        float *dbg = xmalloc((size_t)DS4_N_VOCAB * sizeof(*dbg));
++        if (ds4_gpu_tensor_read(g->logits,
++                                (uint64_t)DS4_N_VOCAB * sizeof(float),
++                                dbg,
++                                (uint64_t)DS4_N_VOCAB * sizeof(float))) {
++            uint64_t finite = 0, zeros = 0;
++            float lo = INFINITY, hi = -INFINITY;
++            for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
++                if (!isfinite(dbg[i])) continue;
++                finite++;
++                zeros += dbg[i] == 0.0f;
++                if (dbg[i] < lo) lo = dbg[i];
++                if (dbg[i] > hi) hi = dbg[i];
++            }
++            fprintf(stderr,
++                    "ds4: DFlash debug logits row=1 finite=%" PRIu64
++                    " zero=%" PRIu64 " range=[%g,%g]\n",
++                    finite, zeros, (double)lo, (double)hi);
++        }
++        free(dbg);
++    }
++    uint32_t tops[DS4_DFLASH_BLOCK_SIZE] = {0};
++    if (ok) {
++        ok = ds4_gpu_tensor_read(g->tops, 0, tops,
++                                 (uint64_t)n_tokens * sizeof(tops[0])) != 0;
++    }
++    if (ok) {
++        for (uint32_t i = 0; i < n_draft; i++) {
++            drafts[i] = (int)tops[i + 1u];
++        }
++    }
++    return ok;
++}
++
 +static int generate_laguna_gpu_argmax(
          const ds4_model   *model,
          const ds4_vocab   *vocab,
          const ds4_weights *weights,
-@@ -48459,17 +48459,17 @@ static int generate_metal_graph_raw_swa(
+@@ -48346,6 +49110,7 @@ static int generate_laguna_metal_argmax(
+         ok = laguna_graph_forward_batch(&g,
+                                         model,
+                                         weights,
++                                        NULL,
+                                         prompt->v + i,
+                                         n,
+                                         (uint32_t)i,
+@@ -48353,7 +49118,8 @@ static int generate_laguna_metal_argmax(
+                                             logits : NULL,
+                                         NULL,
+                                         NULL,
+-                                        prompt->len);
++                                        prompt->len,
++                                        false);
+         i += (int)n;
+         if (progress) progress(progress_ud, "prefill_chunk", i, prompt->len);
+     }
+@@ -48373,7 +49139,8 @@ static int generate_laguna_metal_argmax(
+         if (emit) emit(emit_ud, token);
+         generated++;
+         if (i + 1 == n_predict || pos + 1u >= (uint32_t)ctx_size) break;
+-        ok = laguna_graph_forward_token(&g, model, weights, token, pos, logits);
++        ok = laguna_graph_forward_token(&g, model, weights, NULL,
++                                        token, pos, logits);
+         pos++;
+     }
+     const double decode_t1 = now_sec();
+@@ -48459,17 +49226,17 @@ static int generate_metal_graph_raw_swa(
                                           progress_ud);
      }
      if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
@@ -120,7 +1135,24 @@ index 39b39be..aea9aae 100644
      }
  
      const uint32_t prefill_cap =
-@@ -57480,9 +57480,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
+@@ -49274,6 +50041,8 @@ struct ds4_session {
+     bool glm_graph_ready;
+     ds4_laguna_gpu_graph laguna_graph;
+     bool laguna_graph_ready;
++    ds4_dflash_gpu_graph dflash_graph;
++    bool dflash_graph_ready;
+     uint32_t glm_dense_cache_len;
+     /* GLM MTP speculative state (--glm-mtp, greedy only). */
+     int glm_mtp_draft;
+@@ -51080,6 +51849,7 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
+         return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 ? 2 : 0;
+     }
+     if (ds4_engine_has_mtp(e)) return e->mtp_draft_tokens;
++    if (e && e->dflash_ready) return e->mtp_draft_tokens;
+ #ifndef DS4_NO_GPU
+     if (e &&
+         e->backend != DS4_BACKEND_CPU &&
+@@ -57480,9 +58250,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
              *out = e;
              return 0;
          }
@@ -133,16 +1165,58 @@ index 39b39be..aea9aae 100644
              ds4_engine_close(e);
              *out = NULL;
              return 1;
-@@ -57512,7 +57513,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
-             (opt->mtp_path && opt->mtp_path[0]) ||
+@@ -57509,12 +58280,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
+             opt->directional_steering_ffn != 0.0f ||
+             e->power_percent < 100 ||
+             opt->prefill_chunk != 0 ||
+-            (opt->mtp_path && opt->mtp_path[0]) ||
              opt->dspark || opt->glm_mtp || opt->first_token_test) {
              fprintf(stderr,
 -                    "ds4: Laguna S 2.1 currently supports the standard Metal "
 +                    "ds4: Laguna S 2.1 currently supports the standard GPU "
                      "generation path only (no steering, power cap, custom "
-                     "prefill chunk, MTP/DSpark, or first-token diagnostic)\n");
+-                    "prefill chunk, MTP/DSpark, or first-token diagnostic)\n");
++                    "prefill chunk, DSpark, or first-token diagnostic)\n");
              ds4_engine_close(e);
-@@ -57867,6 +57868,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
+             *out = NULL;
+             return 1;
+@@ -57770,10 +58540,34 @@ static int ds4_engine_open_internal(ds4_engine **out,
+                     e->dspark_weights.missing_tensors,
+                     e->dspark_weights.invalid_tensors,
+                     e->dspark_weights.metadata_errors);
++        } else if (e->support_kind == DS4_SUPPORT_DFLASH) {
++            if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_LAGUNA ||
++                e->backend != DS4_BACKEND_CUDA) {
++                fprintf(stderr,
++                        "ds4: DFlash currently requires Laguna S 2.1 with --cuda\n");
++                ds4_engine_close(e);
++                *out = NULL;
++                return 1;
++            }
++            dflash_weights_bind(&e->dflash_weights, &e->mtp_model);
++            e->dflash_ready = true;
++            if (e->mtp_draft_tokens <= 1) {
++                e->mtp_draft_tokens = (int)DS4_DFLASH_BLOCK_SIZE - 1;
++            }
++            if (e->mtp_draft_tokens > (int)DS4_DFLASH_BLOCK_SIZE - 1) {
++                e->mtp_draft_tokens = (int)DS4_DFLASH_BLOCK_SIZE - 1;
++            }
++            fprintf(stderr,
++                    "ds4: official Laguna DFlash model loaded: %s "
++                    "(layers=%u block=%u draft=%d)\n",
++                    opt->mtp_path,
++                    DS4_DFLASH_N_LAYER,
++                    e->dflash_weights.block_size,
++                    e->mtp_draft_tokens);
+         } else {
+             fprintf(stderr,
+                     "ds4: unsupported --mtp support model %s (detected=%s); "
+-                    "expected legacy MTP or DSpark tensors\n",
++                    "expected legacy MTP, DSpark, or DFlash tensors\n",
+                     opt->mtp_path,
+                     support_kind_name(e->support_kind));
+             ds4_engine_close(e);
+@@ -57867,6 +58661,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
          }
          ds4_gpu_set_quality(e->quality);
          ds4_gpu_set_glm_model(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA);
@@ -153,7 +1227,102 @@ index 39b39be..aea9aae 100644
          ds4_gpu_set_ssd_streaming(e->ssd_streaming);
          if (!ds4_engine_configure_streaming_auto_cache(e)) {
              ds4_engine_close(e);
-@@ -61758,7 +61763,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
+@@ -58129,6 +58927,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
+         }
+         const bool support_model_runtime_ready =
+             e->mtp_ready ||
++            e->dflash_ready ||
+             (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark);
+         if (support_model_runtime_ready &&
+             !ds4_gpu_set_model_map_range(e->mtp_model.map,
+@@ -58708,7 +59507,22 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
+             return 1;
+         }
+         s->laguna_graph_ready = true;
+-        s->prefill_cap = (uint32_t)ctx_size;
++        if (e->dflash_ready) {
++            if (!dflash_graph_alloc(&s->dflash_graph, (uint32_t)ctx_size)) {
++                laguna_graph_free(&s->laguna_graph);
++                free(s);
++                return 1;
++            }
++            s->dflash_graph_ready = true;
++            s->laguna_graph.dflash_features = s->dflash_graph.features;
++            s->laguna_graph.dflash_target_norm = s->dflash_graph.target_norm;
++            s->laguna_graph.dflash_target_logits = s->dflash_graph.target_logits;
++            s->laguna_graph.dflash_target_tops = s->dflash_graph.target_tops;
++            if (s->laguna_graph.prefill_cap > s->dflash_graph.capture_cap) {
++                s->laguna_graph.prefill_cap = s->dflash_graph.capture_cap;
++            }
++        }
++        s->prefill_cap = s->laguna_graph.prefill_cap;
+         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+         s->sample_probs =
+             xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
+@@ -59001,6 +59815,7 @@ void ds4_session_free(ds4_session *s) {
+ #ifndef DS4_NO_GPU
+     else {
+         if (ds4_session_is_laguna(s)) {
++            dflash_graph_free(&s->dflash_graph);
+             laguna_graph_free(&s->laguna_graph);
+         } else if (ds4_session_is_glm(s)) {
+             glm_graph_free(&s->glm_graph);
+@@ -60130,19 +60945,24 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
+                 laguna_graph_forward_token(&s->laguna_graph,
+                                            &e->model,
+                                            &e->weights,
++                                           e->dflash_ready ?
++                                               &e->dflash_weights : NULL,
+                                            prompt->v[i],
+                                            (uint32_t)i,
+                                            last ? s->logits : NULL) :
+                 laguna_graph_forward_batch(&s->laguna_graph,
+                                            &e->model,
+                                            &e->weights,
++                                           e->dflash_ready ?
++                                               &e->dflash_weights : NULL,
+                                            prompt->v + i,
+                                            n,
+                                            (uint32_t)i,
+                                            last ? s->logits : NULL,
+                                            s->display_progress,
+                                            s->display_progress_ud,
+-                                           prompt->len);
++                                           prompt->len,
++                                           false);
+             if (!ok) {
+                 snprintf(err, errlen,
+                          "%s Laguna prefill failed at token %d",
+@@ -60151,6 +60971,19 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
+                 s->checkpoint_valid = false;
+                 return 1;
+             }
++            if (e->dflash_ready &&
++                !dflash_graph_inject(&s->dflash_graph,
++                                     &e->mtp_model,
++                                     &e->dflash_weights,
++                                     (uint32_t)i,
++                                     n)) {
++                snprintf(err, errlen,
++                         "%s DFlash prefill injection failed at token %d",
++                         backend_name,
++                         i);
++                s->checkpoint_valid = false;
++                return 1;
++            }
+             for (uint32_t j = 0; j < n; j++) {
+                 token_vec_push(&s->checkpoint, prompt->v[i + (int)j]);
+             }
+@@ -61698,6 +62531,8 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
+     case DS4_SUPPORT_DSPARK:
+         (void)ds4_session_prepare_dspark_draft(s, token, pos);
+         break;
++    case DS4_SUPPORT_DFLASH:
++        break;
+     case DS4_SUPPORT_NONE:
+     default:
+         break;
+@@ -61758,13 +62593,15 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
          }
          if ((uint32_t)s->checkpoint.len >= s->laguna_graph.ctx_size) {
              if (errlen) snprintf(err, errlen,
@@ -162,11 +1331,336 @@ index 39b39be..aea9aae 100644
                                   s->laguna_graph.ctx_size);
              return 1;
          }
+         if (!laguna_graph_forward_token(&s->laguna_graph,
+                                         &e->model,
+                                         &e->weights,
++                                        e->dflash_ready ?
++                                            &e->dflash_weights : NULL,
+                                         token,
+                                         (uint32_t)s->checkpoint.len,
+                                         s->logits)) {
+@@ -61773,6 +62610,18 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
+             s->checkpoint_valid = false;
+             return 1;
+         }
++        if (e->dflash_ready &&
++            !dflash_graph_inject(&s->dflash_graph,
++                                 &e->mtp_model,
++                                 &e->dflash_weights,
++                                 (uint32_t)s->checkpoint.len,
++                                 1u)) {
++            if (errlen) snprintf(err, errlen,
++                                 "%s DFlash KV injection failed",
++                                 ds4_backend_name(e->backend));
++            s->checkpoint_valid = false;
++            return 1;
++        }
+         token_vec_push(&s->checkpoint, token);
+         s->checkpoint_valid = true;
+         s->mtp_draft_valid = false;
+@@ -66135,6 +66984,136 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
+     return rc;
+ }
+ 
++#ifndef DS4_NO_GPU
++static int ds4_session_eval_dflash_argmax(
++        ds4_session *s,
++        int          first_token,
++        int          max_tokens,
++        int          eos_token,
++        int         *accepted,
++        int          accepted_cap,
++        char        *err,
++        size_t       errlen) {
++    ds4_engine *e = s->engine;
++    int draft_n = e->mtp_draft_tokens;
++    if (draft_n > max_tokens - 1) draft_n = max_tokens - 1;
++    if (draft_n > accepted_cap - 1) draft_n = accepted_cap - 1;
++    int room = s->ctx_size - s->checkpoint.len - 1;
++    if (draft_n > room) draft_n = room;
++    if (draft_n <= 0) {
++        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
++        accepted[0] = first_token;
++        return 1;
++    }
++
++    int drafts[DS4_DFLASH_BLOCK_SIZE] = {0};
++    const double t0 = now_sec();
++    if (!dflash_graph_draft(&s->dflash_graph,
++                            &e->model,
++                            &e->weights,
++                            &e->mtp_model,
++                            &e->dflash_weights,
++                            first_token,
++                            (uint32_t)s->checkpoint.len,
++                            (uint32_t)draft_n,
++                            drafts)) {
++        snprintf(err, errlen, "DFlash draft pass failed");
++        return -1;
++    }
++    const double td = now_sec();
++
++    for (int i = 0; i < draft_n; i++) {
++        if (drafts[i] == eos_token) {
++            draft_n = i + 1;
++            break;
++        }
++    }
++
++    const int start = s->checkpoint.len;
++    int target_tokens[DS4_DFLASH_BLOCK_SIZE] = {0};
++    target_tokens[0] = first_token;
++    for (int i = 0; i < draft_n; i++) {
++        target_tokens[i + 1] = drafts[i];
++    }
++    if (!laguna_graph_forward_batch(&s->laguna_graph,
++                                    &e->model,
++                                    &e->weights,
++                                    &e->dflash_weights,
++                                    target_tokens,
++                                    (uint32_t)draft_n + 1u,
++                                    (uint32_t)start,
++                                    NULL,
++                                    NULL,
++                                    NULL,
++                                    start + draft_n + 1,
++                                    true)) {
++        snprintf(err, errlen, "DFlash target block verification failed");
++        s->checkpoint_valid = false;
++        return -1;
++    }
++    const double tt = now_sec();
++    if (!dflash_graph_inject(&s->dflash_graph,
++                             &e->mtp_model,
++                             &e->dflash_weights,
++                             (uint32_t)start,
++                             (uint32_t)draft_n + 1u)) {
++        snprintf(err, errlen, "DFlash verified-feature injection failed");
++        s->checkpoint_valid = false;
++        return -1;
++    }
++    const double ti = now_sec();
++
++    uint32_t target_tops[DS4_DFLASH_BLOCK_SIZE] = {0};
++    if (!ds4_gpu_tensor_read(s->dflash_graph.target_tops,
++                             0,
++                             target_tops,
++                             ((uint64_t)draft_n + 1u) *
++                                 sizeof(target_tops[0]))) {
++        snprintf(err, errlen, "DFlash target top-token readback failed");
++        s->checkpoint_valid = false;
++        return -1;
++    }
++    int matched = 0;
++    while (matched < draft_n &&
++           (int)target_tops[matched] == drafts[matched]) {
++        matched++;
++    }
++    if (!ds4_gpu_tensor_read(
++            s->dflash_graph.target_logits,
++            (uint64_t)matched * DS4_N_VOCAB * sizeof(float),
++            s->logits,
++            (uint64_t)DS4_N_VOCAB * sizeof(float))) {
++        snprintf(err, errlen, "DFlash committed logits readback failed");
++        s->checkpoint_valid = false;
++        return -1;
++    }
++    token_vec_push(&s->checkpoint, first_token);
++    accepted[0] = first_token;
++    int n_accept = 1;
++    for (int i = 0; i < matched; i++) {
++        token_vec_push(&s->checkpoint, drafts[i]);
++        accepted[n_accept++] = drafts[i];
++        if (drafts[i] == eos_token) break;
++    }
++    s->checkpoint_valid = true;
++    const double tv = now_sec();
++    if (getenv("DS4_DFLASH_LOG")) {
++        fprintf(stderr,
++                "ds4: DFlash drafted=%d matched=%d committed=%d draft=%.3f ms "
++                "target=%.3f ms inject=%.3f ms finish=%.3f ms total=%.3f ms\n",
++                draft_n,
++                matched,
++                n_accept,
++                (td - t0) * 1000.0,
++                (tt - td) * 1000.0,
++                (ti - tt) * 1000.0,
++                (tv - ti) * 1000.0,
++                (tv - t0) * 1000.0);
++    }
++    return n_accept;
++}
++#endif
++
+ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
+                                         int max_tokens, int eos_token,
+                                         int *accepted, int accepted_cap,
+@@ -66191,6 +67170,17 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
+     return -1;
+ #else
+     ds4_engine *e = s->engine;
++    if (e->support_kind == DS4_SUPPORT_DFLASH && e->dflash_ready &&
++        first_token != eos_token && max_tokens > 1 && accepted_cap > 1) {
++        return ds4_session_eval_dflash_argmax(s,
++                                              first_token,
++                                              max_tokens,
++                                              eos_token,
++                                              accepted,
++                                              accepted_cap,
++                                              err,
++                                              errlen);
++    }
+     if (ds4_session_is_glm(s) && ds4_engine_glm_mtp_spec_enabled(e)) {
+         int cycle_cap = accepted_cap;
+         if (cycle_cap > max_tokens) cycle_cap = max_tokens;
+diff --git a/ds4_bench.c b/ds4_bench.c
+index 4b2b0d3..5217fa3 100644
+--- a/ds4_bench.c
++++ b/ds4_bench.c
+@@ -27,6 +27,7 @@
+ 
+ typedef struct {
+     const char *model_path;
++    const char *mtp_path;
+     const char *prompt_path;
+     const char *chat_prompt_path;
+     const char *system;
+@@ -41,6 +42,7 @@ typedef struct {
+     int ctx_alloc;
+     int step_incr;
+     int gen_tokens;
++    int mtp_draft_tokens;
+     int power_percent;
+     uint32_t prefill_chunk;
+     uint32_t ssd_streaming_cache_experts;
+@@ -206,6 +208,7 @@ static bench_config parse_options(int argc, char **argv) {
+         .ctx_max = 32768,
+         .step_incr = 2048,
+         .gen_tokens = 128,
++        .mtp_draft_tokens = 1,
+         .step_mul = 1.0,
+     };
+ 
+@@ -236,6 +239,11 @@ static bench_config parse_options(int argc, char **argv) {
+ 
+         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
+             c.model_path = need_arg(&i, argc, argv, arg);
++        } else if (!strcmp(arg, "--mtp")) {
++            c.mtp_path = need_arg(&i, argc, argv, arg);
++        } else if (!strcmp(arg, "--mtp-draft")) {
++            c.mtp_draft_tokens =
++                parse_int(need_arg(&i, argc, argv, arg), arg);
+         } else if (!strcmp(arg, "--prompt-file")) {
+             c.prompt_path = need_arg(&i, argc, argv, arg);
+         } else if (!strcmp(arg, "--chat-prompt-file")) {
+@@ -576,10 +584,12 @@ int main(int argc, char **argv) {
+ 
+     ds4_engine_options opt = {
+         .model_path = cfg.model_path,
++        .mtp_path = cfg.mtp_path,
+         .backend = cfg.backend,
+         .n_threads = cfg.threads,
+         .context_size = cfg.ctx_alloc,
+         .prefill_chunk = cfg.prefill_chunk,
++        .mtp_draft_tokens = cfg.mtp_draft_tokens,
+         .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
+         .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
+         .ssd_streaming_full_layers = cfg.ssd_streaming_full_layers,
+@@ -732,12 +742,13 @@ int main(int argc, char **argv) {
+         const double gen_t0 = bench_now_sec();
+         double gen_first_sec = 0.0;
+         double gen_steady_sec = 0.0;
++        int gen_first_tokens = 0;
+         int gen_done = 0;
+         int *gen_token_buf = cfg.show_output && cfg.gen_tokens > 0
+             ? malloc((size_t)cfg.gen_tokens * sizeof(gen_token_buf[0]))
+             : NULL;
+         int gen_token_count = 0;
+-        for (int i = 0; i < cfg.gen_tokens; i++) {
++        while (gen_done < cfg.gen_tokens) {
+             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
+                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
+                 rc = 1;
+@@ -750,16 +761,51 @@ int main(int argc, char **argv) {
+                 break;
+             }
+             const double token_t0 = bench_now_sec();
+-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+-                fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
++            int cycle_tokens[17];
++            int cycle_n = 1;
++            cycle_tokens[0] = token;
++            if (ds4_engine_mtp_draft_tokens(engine) > 1) {
++                cycle_n = ds4_session_eval_speculative_argmax(
++                        session,
++                        token,
++                        cfg.gen_tokens - gen_done,
++                        -1,
++                        cycle_tokens,
++                        (int)(sizeof(cycle_tokens) /
++                              sizeof(cycle_tokens[0])),
++                        err,
++                        sizeof(err));
++                if (cycle_n < 0) {
++                    fprintf(stderr,
++                            "ds4-bench: speculative decode at frontier %d "
++                            "failed: %s\n",
++                            frontier,
++                            err);
++                    rc = 1;
++                    break;
++                }
++            } else if (ds4_session_eval(session, token,
++                                        err, sizeof(err)) != 0) {
++                fprintf(stderr,
++                        "ds4-bench: decode at frontier %d failed: %s\n",
++                        frontier,
++                        err);
+                 rc = 1;
+                 break;
+             }
+             const double token_t1 = bench_now_sec();
+-            if (i == 0) gen_first_sec = token_t1 - token_t0;
+-            else gen_steady_sec += token_t1 - token_t0;
+-            if (gen_token_buf) gen_token_buf[gen_token_count++] = token;
+-            gen_done++;
++            if (gen_done == 0) {
++                gen_first_sec = token_t1 - token_t0;
++                gen_first_tokens = cycle_n;
++            } else {
++                gen_steady_sec += token_t1 - token_t0;
++            }
++            for (int i = 0; i < cycle_n; i++) {
++                if (gen_token_buf && gen_token_count < cfg.gen_tokens) {
++                    gen_token_buf[gen_token_count++] = cycle_tokens[i];
++                }
++            }
++            gen_done += cycle_n;
+         }
+         const double gen_t1 = bench_now_sec();
+         if (cfg.show_output && gen_token_buf && gen_token_count > 0) {
+@@ -795,7 +841,8 @@ int main(int argc, char **argv) {
+         }
+ 
+         const double gen_sec = gen_t1 - gen_t0;
+-        const int gen_steady_tokens = gen_done > 1 ? gen_done - 1 : 0;
++        const int gen_steady_tokens =
++            gen_done > gen_first_tokens ? gen_done - gen_first_tokens : 0;
+         fprintf(out,
+                 "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu\n",
+                 frontier,
 diff --git a/ds4_cuda.cu b/ds4_cuda.cu
-index e66fa36..0e6f8f1 100644
+index e66fa36..4c30153 100644
 --- a/ds4_cuda.cu
 +++ b/ds4_cuda.cu
-@@ -60,6 +60,13 @@ typedef struct {
+@@ -1,5 +1,6 @@
+ #include <cuda_runtime.h>
+ #include <cuda_fp16.h>
++#include <cuda_bf16.h>
+ #include <mma.h>
+ #include <cublas_v2.h>
+ #include <cub/block/block_radix_sort.cuh>
+@@ -60,6 +61,13 @@ typedef struct {
      uint8_t qs[CUDA_QK_K / 2];
  } cuda_block_q4_K;
  
@@ -180,7 +1674,7 @@ index e66fa36..0e6f8f1 100644
  typedef struct {
      float d;
      int8_t qs[CUDA_QK_K];
-@@ -71,6 +78,23 @@ typedef struct {
+@@ -71,6 +79,23 @@ typedef struct {
      uint16_t qs[CUDA_QK_K / 8];
  } cuda_block_iq2_xxs;
  
@@ -204,7 +1698,7 @@ index e66fa36..0e6f8f1 100644
  #include "ds4_gpu_mgpu.h"
  #include "ds4_iq2_tables_cuda.inc"
  
-@@ -122,6 +146,7 @@ static int g_cuda_exact_score_split_fuse_inv_rope;
+@@ -122,6 +147,7 @@ static int g_cuda_exact_score_split_fuse_inv_rope;
  static int g_cuda_moe_decode_graph;
  static int g_current_logical_tier = -1;
  static int g_ssd_streaming_mode;
@@ -212,7 +1706,7 @@ index e66fa36..0e6f8f1 100644
  
  typedef struct {
      int valid;
-@@ -225,6 +250,24 @@ static int cuda_q4_mma_ok(void) {
+@@ -225,6 +251,24 @@ static int cuda_q4_mma_ok(void) {
      return cached;
  }
  
@@ -237,7 +1731,7 @@ index e66fa36..0e6f8f1 100644
  
  
  
-@@ -998,6 +1041,16 @@ static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_
+@@ -998,6 +1042,16 @@ static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_
      if (getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL) return 0;
      if (cuda_q8_f16_cache_limit_bytes() == 0) return 0;
      if (getenv("DS4_CUDA_Q8_F16_ALL") != NULL) return 1;
@@ -254,7 +1748,113 @@ index e66fa36..0e6f8f1 100644
      if (!label) return 0;
      if (strstr(label, "attn_output_a") != NULL ||
          strstr(label, "attn_output_b") != NULL ||
-@@ -12159,8 +12212,12 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
+@@ -3900,6 +3954,33 @@ __global__ static void matmul_f16_kernel(
+     if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
+ }
+ 
++__global__ static void matmul_bf16_kernel(
++        float *out,
++        const __nv_bfloat16 *w,
++        const float *x,
++        uint64_t in_dim,
++        uint64_t out_dim,
++        uint64_t n_tok) {
++    const uint64_t row = (uint64_t)blockIdx.x;
++    const uint64_t tok = (uint64_t)blockIdx.y;
++    if (row >= out_dim || tok >= n_tok) return;
++
++    float sum = 0.0f;
++    const __nv_bfloat16 *wr = w + row * in_dim;
++    const float *xr = x + tok * in_dim;
++    for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
++        sum += __bfloat162float(wr[i]) * xr[i];
++    }
++    __shared__ float partial[256];
++    partial[threadIdx.x] = sum;
++    __syncthreads();
++    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
++        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
++        __syncthreads();
++    }
++    if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
++}
++
+ __global__ static void matmul_f16_serial_kernel(
+         float *out,
+         const __half *w,
+@@ -4140,6 +4221,71 @@ __global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n
+     if (i < n) out[i] = __float2half(x[i]);
+ }
+ 
++__global__ static void f32_to_bf16_kernel(
++        __nv_bfloat16 *out, const float *x, uint64_t n) {
++    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    if (i < n) out[i] = __float2bfloat16(x[i]);
++}
++
++__global__ static void dflash_pack_features_kernel(
++        float *out,
++        const float *features,
++        const float *norm,
++        uint32_t n_embd,
++        uint32_t n_aux,
++        uint32_t n_rows,
++        float eps) {
++    const uint32_t aux = blockIdx.x;
++    const uint32_t row = blockIdx.y;
++    if (aux >= n_aux || row >= n_rows) return;
++    const float *src = features +
++        ((uint64_t)aux * n_rows + row) * n_embd;
++    float sum = 0.0f;
++    for (uint32_t i = threadIdx.x; i < n_embd; i += blockDim.x) {
++        float v = src[i];
++        if (!isfinite(v)) {
++            v = isnan(v) ? 0.0f : copysignf(65504.0f, v);
++        }
++        sum += v * v;
++    }
++    __shared__ float partial[256];
++    partial[threadIdx.x] = sum;
++    __syncthreads();
++    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
++        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
++        __syncthreads();
++    }
++    const float inv = rsqrtf(partial[0] / (float)n_embd + eps);
++    float *dst = out + ((uint64_t)row * n_aux + aux) * n_embd;
++    const float *scale = norm + (uint64_t)aux * n_embd;
++    for (uint32_t i = threadIdx.x; i < n_embd; i += blockDim.x) {
++        float v = src[i];
++        if (!isfinite(v)) {
++            v = isnan(v) ? 0.0f : copysignf(65504.0f, v);
++        }
++        dst[i] = v * inv * scale[i];
++    }
++}
++
++__global__ static void dflash_store_kv_kernel(
++        __half *key_cache,
++        __half *value_cache,
++        const float *k,
++        const float *v,
++        uint32_t pos0,
++        uint32_t n_tokens,
++        uint32_t cache_cap,
++        uint32_t kv_width) {
++    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    const uint64_t n = (uint64_t)n_tokens * kv_width;
++    if (i >= n) return;
++    const uint32_t row = (uint32_t)(i / kv_width);
++    const uint32_t col = (uint32_t)(i % kv_width);
++    const uint64_t dst = (uint64_t)((pos0 + row) % cache_cap) * kv_width + col;
++    key_cache[dst] = __float2half(k[i]);
++    value_cache[dst] = __float2half(v[i]);
++}
++
+ __device__ static float warp_sum_f32(float v) {
+     for (int offset = 16; offset > 0; offset >>= 1) {
+         v += __shfl_down_sync(0xffffffffu, v, offset);
+@@ -12159,8 +12305,12 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
               * operation through the native Q8 kernels below. */
          }
      }
@@ -269,7 +1869,139 @@ index e66fa36..0e6f8f1 100644
          /* Streaming dequant + f16 GEMM: the exact-q8 batched kernels only
           * cover blocks <= 32 (DS4 TP shard widths); the per-token fallback
           * re-reads the full weight per token (~30x the bytes at GLM dims).
-@@ -16387,6 +16444,58 @@ __device__ static void dev_q4_K_get_scale_min(
+@@ -13163,6 +13313,131 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
+     return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
+ }
+ 
++extern "C" int ds4_gpu_matmul_bf16_tensor(
++        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
++        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
++        const ds4_gpu_tensor *x, uint64_t n_tok) {
++    if (!out || !x || !model_map || n_tok == 0u ||
++        weight_offset > model_size || out_dim > UINT64_MAX / in_dim) {
++        return 0;
++    }
++    const uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
++    if (weight_bytes > model_size - weight_offset ||
++        x->bytes < n_tok * in_dim * sizeof(float) ||
++        out->bytes < n_tok * out_dim * sizeof(float)) {
++        return 0;
++    }
++    const int logical_tier = ds4_tensor_device_idx(out);
++    if (ds4_tensor_device_idx(x) != logical_tier) return 0;
++    const char *wptr = cuda_resolve_weight_ptr(
++            model_map, weight_offset, weight_bytes, logical_tier, "bf16");
++    if (!wptr) return 0;
++
++    cudaDeviceProp prop = {};
++    int physical = 0;
++    const bool tensor_core =
++        cudaGetDevice(&physical) == cudaSuccess &&
++        cudaGetDeviceProperties(&prop, physical) == cudaSuccess &&
++        prop.major >= 8 && g_cublas_ready &&
++        getenv("DS4_CUDA_DFLASH_NO_BF16_CUBLAS") == NULL;
++    if (tensor_core) {
++        const uint64_t xn = n_tok * in_dim;
++        __nv_bfloat16 *xb = (__nv_bfloat16 *)cuda_tmp_alloc_on(
++                logical_tier, xn * sizeof(__nv_bfloat16),
++                "DFlash BF16 activations");
++        if (!xb) return 0;
++        f32_to_bf16_kernel<<<(xn + 255u) / 256u, 256>>>(
++                xb, (const float *)x->ptr, xn);
++        if (!cuda_ok(cudaGetLastError(), "DFlash BF16 activation convert")) {
++            return 0;
++        }
++        const float alpha = 1.0f;
++        const float beta = 0.0f;
++        const cublasStatus_t st = cublasGemmEx(
++                cuda_cublas_for_tier(logical_tier),
++                CUBLAS_OP_T, CUBLAS_OP_N,
++                (int)out_dim, (int)n_tok, (int)in_dim,
++                &alpha,
++                wptr, CUDA_R_16BF, (int)in_dim,
++                xb, CUDA_R_16BF, (int)in_dim,
++                &beta,
++                out->ptr, CUDA_R_32F, (int)out_dim,
++                CUDA_R_32F,
++                CUBLAS_GEMM_DEFAULT_TENSOR_OP);
++        return cublas_ok(st, "DFlash BF16 matmul");
++    }
++
++    const dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1u);
++    matmul_bf16_kernel<<<grid, 256>>>(
++            (float *)out->ptr,
++            (const __nv_bfloat16 *)wptr,
++            (const float *)x->ptr,
++            in_dim, out_dim, n_tok);
++    return cuda_ok(cudaGetLastError(), "DFlash portable BF16 matmul");
++}
++
++extern "C" int ds4_gpu_dflash_pack_features_tensor(
++        ds4_gpu_tensor *out, const ds4_gpu_tensor *features,
++        const void *model_map, uint64_t model_size, uint64_t aux_norm_offset,
++        uint32_t n_embd, uint32_t n_aux, uint32_t n_rows, float eps) {
++    if (!out || !features || !model_map || n_embd == 0u || n_aux == 0u ||
++        n_rows == 0u || !isfinite(eps) || eps <= 0.0f) {
++        return 0;
++    }
++    const uint64_t values = (uint64_t)n_rows * n_aux * n_embd;
++    const uint64_t norm_values = (uint64_t)n_aux * n_embd;
++    if (features->bytes < values * sizeof(float) ||
++        out->bytes < values * sizeof(float) ||
++        aux_norm_offset > model_size ||
++        norm_values * sizeof(float) > model_size - aux_norm_offset) {
++        return 0;
++    }
++    const int tier = ds4_tensor_device_idx(out);
++    if (ds4_tensor_device_idx(features) != tier) return 0;
++    const char *norm = cuda_resolve_weight_ptr(
++            model_map, aux_norm_offset, norm_values * sizeof(float),
++            tier, "DFlash aux norm");
++    if (!norm) return 0;
++    dflash_pack_features_kernel<<<dim3(n_aux, n_rows, 1u), 256>>>(
++            (float *)out->ptr,
++            (const float *)features->ptr,
++            (const float *)norm,
++            n_embd, n_aux, n_rows, eps);
++    return cuda_ok(cudaGetLastError(), "DFlash pack features");
++}
++
++extern "C" int ds4_gpu_dflash_store_kv_tensor(
++        ds4_gpu_tensor *key_cache, ds4_gpu_tensor *value_cache,
++        const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
++        uint32_t pos0, uint32_t n_tokens, uint32_t cache_cap,
++        uint32_t kv_width) {
++    if (!key_cache || !value_cache || !k || !v || n_tokens == 0u ||
++        cache_cap == 0u || kv_width == 0u) {
++        return 0;
++    }
++    const uint64_t values = (uint64_t)n_tokens * kv_width;
++    const uint64_t cache_values = (uint64_t)cache_cap * kv_width;
++    if (k->bytes < values * sizeof(float) ||
++        v->bytes < values * sizeof(float) ||
++        key_cache->bytes < cache_values * sizeof(__half) ||
++        value_cache->bytes < cache_values * sizeof(__half)) {
++        return 0;
++    }
++    const int tier = ds4_tensor_device_idx(key_cache);
++    if (ds4_tensor_device_idx(value_cache) != tier ||
++        ds4_tensor_device_idx(k) != tier ||
++        ds4_tensor_device_idx(v) != tier) {
++        return 0;
++    }
++    dflash_store_kv_kernel<<<(values + 255u) / 256u, 256>>>(
++            (__half *)key_cache->ptr,
++            (__half *)value_cache->ptr,
++            (const float *)k->ptr,
++            (const float *)v->ptr,
++            pos0, n_tokens, cache_cap, kv_width);
++    return cuda_ok(cudaGetLastError(), "DFlash store target KV");
++}
++
+ extern "C" int ds4_gpu_matmul_f16_router_rows_exact_tensor(
+         ds4_gpu_tensor *out,
+         const void *model_map,
+@@ -16387,6 +16662,58 @@ __device__ static void dev_q4_K_get_scale_min(
      }
  }
  
@@ -328,7 +2060,7 @@ index e66fa36..0e6f8f1 100644
  __device__ __forceinline__ static int32_t dev_dot_q4_32(const uint8_t *qs, const int8_t *q8, int shift) {
      int32_t sum = 0;
      #pragma unroll
-@@ -16414,6 +16523,17 @@ __device__ static float dev_dot_q4_K_q8_K_block(const cuda_block_q4_K *x, const
+@@ -16414,6 +16741,17 @@ __device__ static float dev_dot_q4_K_q8_K_block(const cuda_block_q4_K *x, const
      return y->d * xd * (float)isum - y->d * xmin * (float)summs;
  }
  
@@ -346,7 +2078,7 @@ index e66fa36..0e6f8f1 100644
  /* Vector-load variant of dev_dot_q4_K_q8_K_block: loads the whole 144-byte
   * Q4_K block with nine 16B loads (requires a 16B-aligned tensor base; block
   * stride 144 and row strides are 16B multiples), then computes the exact same
-@@ -23237,6 +23357,17 @@ __global__ static void glm_embed_token_q8_0_kernel(
+@@ -23237,6 +23575,17 @@ __global__ static void glm_embed_token_q8_0_kernel(
      out[d] = scale * (float)((const int8_t *)(blk + 2))[d & 31u];
  }
  
@@ -364,7 +2096,7 @@ index e66fa36..0e6f8f1 100644
  extern "C" int ds4_gpu_embed_token_quant_tensor(
          ds4_gpu_tensor *out,
          const void       *model_map,
-@@ -23250,12 +23381,15 @@ extern "C" int ds4_gpu_embed_token_quant_tensor(
+@@ -23250,12 +23599,15 @@ extern "C" int ds4_gpu_embed_token_quant_tensor(
          token >= n_vocab) {
          return 0;
      }
@@ -382,7 +2114,7 @@ index e66fa36..0e6f8f1 100644
      if (weight_offset > model_size ||
          (uint64_t)n_vocab * row_bytes > model_size - weight_offset ||
          out->bytes < (uint64_t)n_embd * sizeof(float)) {
-@@ -23266,6 +23400,14 @@ extern "C" int ds4_gpu_embed_token_quant_tensor(
+@@ -23266,6 +23618,14 @@ extern "C" int ds4_gpu_embed_token_quant_tensor(
              model_map, weight_offset, (uint64_t)n_vocab * row_bytes,
              logical_tier, "glm_token_embd");
      if (!w) return 0;
@@ -397,7 +2129,7 @@ index e66fa36..0e6f8f1 100644
      glm_embed_token_q8_0_kernel<<<(n_embd + 255) / 256, 256>>>(
              (float *)out->ptr, w, token, n_embd);
      return cuda_ok(cudaGetLastError(), "glm embed token launch");
-@@ -23289,6 +23431,22 @@ __global__ static void glm_embed_tokens_q8_0_kernel(
+@@ -23289,6 +23649,22 @@ __global__ static void glm_embed_tokens_q8_0_kernel(
      out[gid] = scale * (float)((const int8_t *)(blk + 2))[d & 31u];
  }
  
@@ -420,7 +2152,7 @@ index e66fa36..0e6f8f1 100644
  extern "C" int ds4_gpu_embed_tokens_quant_tensor(
          ds4_gpu_tensor       *out,
          const ds4_gpu_tensor *tokens,
-@@ -23303,12 +23461,15 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
+@@ -23303,12 +23679,15 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
          (n_embd & 31u) != 0u) {
          return 0;
      }
@@ -438,7 +2170,7 @@ index e66fa36..0e6f8f1 100644
      if (weight_offset > model_size ||
          (uint64_t)n_vocab * row_bytes > model_size - weight_offset ||
          out->bytes < (uint64_t)n_tokens * n_embd * sizeof(float) ||
-@@ -23321,10 +23482,20 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
+@@ -23321,10 +23700,20 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
              logical_tier, "glm_token_embd");
      if (!w) return 0;
      uint64_t n = (uint64_t)n_tokens * n_embd;
@@ -462,7 +2194,7 @@ index e66fa36..0e6f8f1 100644
      return cuda_ok(cudaGetLastError(), "glm embed tokens launch");
  }
  
-@@ -25895,6 +26066,22 @@ static int glm_routed_moe_finish_batch(
+@@ -25895,6 +26284,22 @@ static int glm_routed_moe_finish_batch(
                     "glm routed moe local output copy");
  }
  
@@ -485,7 +2217,7 @@ index e66fa36..0e6f8f1 100644
  extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
          ds4_gpu_tensor       *out,
          ds4_gpu_tensor       *mid,
-@@ -25922,8 +26109,35 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
+@@ -25922,8 +26327,35 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
          uint32_t                layer_index,
          const ds4_gpu_tensor *x,
          uint32_t                n_tokens,
@@ -523,7 +2255,7 @@ index e66fa36..0e6f8f1 100644
      if (!out || !mid || !x || !selected || !weights || !model_map ||
          n_tokens == 0 || n_expert == 0 ||
          (expert_in_dim & 255u) != 0u || (expert_mid_dim & 255u) != 0u) {
-@@ -26285,7 +26499,7 @@ extern "C" int ds4_gpu_glm_routed_moe_one_tensor(
+@@ -26285,7 +26717,7 @@ extern "C" int ds4_gpu_glm_routed_moe_one_tensor(
              down_expert_bytes, down_row_bytes,
              expert_in_dim, expert_mid_dim, out_dim,
              selected, weights, n_total_expert, n_expert, layer_index,
@@ -532,7 +2264,7 @@ index e66fa36..0e6f8f1 100644
  }
  
  /* Parallel router select: 256 threads compute sigmoid probs, then top-k
-@@ -26862,6 +27076,263 @@ extern "C" int ds4_gpu_glm_value_project_typed_batch_heads_tensor(
+@@ -26862,6 +27294,263 @@ extern "C" int ds4_gpu_glm_value_project_typed_batch_heads_tensor(
      return cuda_ok(cudaGetLastError(), "glm value project launch");
  }
  
@@ -796,7 +2528,7 @@ index e66fa36..0e6f8f1 100644
  /* Decode-time (n_tok small) quant matvec. The Metal "mpp/model-view"
   * variant is a bandwidth-tuned matvec; on CUDA the generic quant matmul
   * already dispatches per type, so delegate. Revisit in the perf pass. */
-@@ -26918,6 +27389,11 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
+@@ -26918,6 +27607,11 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
          return ds4_gpu_matmul_f16_tensor(out, model_map, model_size,
                                           weight_offset, in_dim, out_dim,
                                           x, n_tok);
@@ -808,7 +2540,7 @@ index e66fa36..0e6f8f1 100644
      default:
          fprintf(stderr, "ds4: matmul_quant: unsupported type %u\n",
                  weight_type);
-@@ -27375,6 +27851,10 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
+@@ -27375,6 +28069,10 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
      (void)enabled;
  }
  
@@ -819,7 +2551,7 @@ index e66fa36..0e6f8f1 100644
  extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
      g_ssd_streaming_mode = enabled ? 1 : 0;
      cuda_stream_selected_cache_invalidate();
-@@ -27668,69 +28148,1304 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
+@@ -27668,17 +28366,1128 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
      return 0;
  }
  
@@ -834,22 +2566,6 @@ index e66fa36..0e6f8f1 100644
 -
 -extern "C" int ds4_gpu_laguna_routed_shared_moe_one_tensor(
 -        ds4_gpu_tensor *routed_out, ds4_gpu_tensor *routed_mid,
--        ds4_gpu_tensor *shared_out, ds4_gpu_tensor *shared_mid,
--        const void *model_map, uint64_t model_size,
--        const ds4_gpu_laguna_moe_desc *routed,
--        const ds4_gpu_laguna_moe_desc *shared,
--        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
--        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
--        uint32_t n_total_expert, uint32_t n_expert,
--        const ds4_gpu_tensor *shared_selected,
--        const ds4_gpu_tensor *shared_weight, const ds4_gpu_tensor *x) {
--    (void)routed_out; (void)routed_mid; (void)shared_out; (void)shared_mid;
--    (void)model_map; (void)model_size; (void)routed; (void)shared;
--    (void)expert_in_dim; (void)expert_mid_dim; (void)out_dim;
--    (void)selected; (void)weights; (void)n_total_expert; (void)n_expert;
--    (void)shared_selected; (void)shared_weight; (void)x;
--    return 0;
--}
 +__global__ static void laguna_head_rms_norm_rope_kernel(
 +        float *x,
 +        const float *weight,
@@ -888,19 +2604,7 @@ index e66fa36..0e6f8f1 100644
 +        row[i] = row[i] * inv * weight[i];
 +    }
 +    __syncthreads();
- 
--extern "C" int ds4_gpu_laguna_qkvg_f16_tensor(
--        ds4_gpu_tensor *q, ds4_gpu_tensor *k, ds4_gpu_tensor *v,
--        ds4_gpu_tensor *gate, const void *model_map, uint64_t model_size,
--        uint64_t q_weight_offset, uint64_t k_weight_offset,
--        uint64_t v_weight_offset, uint64_t gate_weight_offset,
--        uint32_t in_dim, uint32_t q_dim, uint32_t kv_dim,
--        uint32_t gate_dim, const ds4_gpu_tensor *x) {
--    (void)q; (void)k; (void)v; (void)gate; (void)model_map; (void)model_size;
--    (void)q_weight_offset; (void)k_weight_offset; (void)v_weight_offset;
--    (void)gate_weight_offset; (void)in_dim; (void)q_dim; (void)kv_dim;
--    (void)gate_dim; (void)x;
--    return 0;
++
 +    const uint32_t half_rot = n_rot >> 1u;
 +    if (tid >= half_rot) return;
 +    const uint32_t rel_i0 = tid * 2u;
@@ -1043,16 +2747,8 @@ index e66fa36..0e6f8f1 100644
 +        gate_value : log1pf(expf(gate_value));
 +    out[(uint64_t)head * head_dim + d] =
 +        acc * (score_sum > 0.0f ? 1.0f / score_sum : 0.0f) * gate_scale;
- }
- 
--extern "C" int ds4_gpu_laguna_attn_output_residual_f16_tensor(
--        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
--        uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
--        const ds4_gpu_tensor *x, const ds4_gpu_tensor *residual) {
--    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
--    (void)in_dim; (void)out_dim; (void)x; (void)residual;
--    return 0;
--}
++}
++
 +/* Keep one block per query head, but stripe longer histories over independent
 + * warps. Each warp performs an online softmax over its key subsequence, then
 + * warp 0 merges the partials. The portable path uses eight warps; Blackwell
@@ -1079,9 +2775,7 @@ index e66fa36..0e6f8f1 100644
 +    const uint32_t kv_head = head / heads_per_kv;
 +    const uint32_t width = n_head_kv * head_dim;
 +    const float *qh = q + (uint64_t)head * head_dim;
- 
--extern "C" int ds4_gpu_laguna_head_rms_norm_rope_tensor(
--        ds4_gpu_tensor *x, const void *model_map, uint64_t model_size,
++
 +    float acc0 = 0.0f;
 +    float acc1 = 0.0f;
 +    float acc2 = 0.0f;
@@ -1994,15 +3688,19 @@ index e66fa36..0e6f8f1 100644
 +
 +extern "C" int ds4_gpu_laguna_routed_shared_moe_one_tensor(
 +        ds4_gpu_tensor *routed_out, ds4_gpu_tensor *routed_mid,
-+        ds4_gpu_tensor *shared_out, ds4_gpu_tensor *shared_mid,
-+        const void *model_map, uint64_t model_size,
-+        const ds4_gpu_laguna_moe_desc *routed,
-+        const ds4_gpu_laguna_moe_desc *shared,
-+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
-+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
-+        uint32_t n_total_expert, uint32_t n_expert,
-+        const ds4_gpu_tensor *shared_selected,
-+        const ds4_gpu_tensor *shared_weight, const ds4_gpu_tensor *x) {
+         ds4_gpu_tensor *shared_out, ds4_gpu_tensor *shared_mid,
+         const void *model_map, uint64_t model_size,
+         const ds4_gpu_laguna_moe_desc *routed,
+@@ -27688,12 +29497,14 @@ extern "C" int ds4_gpu_laguna_routed_shared_moe_one_tensor(
+         uint32_t n_total_expert, uint32_t n_expert,
+         const ds4_gpu_tensor *shared_selected,
+         const ds4_gpu_tensor *shared_weight, const ds4_gpu_tensor *x) {
+-    (void)routed_out; (void)routed_mid; (void)shared_out; (void)shared_mid;
+-    (void)model_map; (void)model_size; (void)routed; (void)shared;
+-    (void)expert_in_dim; (void)expert_mid_dim; (void)out_dim;
+-    (void)selected; (void)weights; (void)n_total_expert; (void)n_expert;
+-    (void)shared_selected; (void)shared_weight; (void)x;
+-    return 0;
 +    return cuda_laguna_routed_moe(
 +                   routed_out, routed_mid, model_map, model_size, routed,
 +                   expert_in_dim, expert_mid_dim, out_dim,
@@ -2011,15 +3709,18 @@ index e66fa36..0e6f8f1 100644
 +                   shared_out, shared_mid, model_map, model_size, shared,
 +                   expert_in_dim, expert_mid_dim, out_dim,
 +                   shared_selected, shared_weight, 1u, 1u, x, 1u);
-+}
-+
-+extern "C" int ds4_gpu_laguna_qkvg_f16_tensor(
-+        ds4_gpu_tensor *q, ds4_gpu_tensor *k, ds4_gpu_tensor *v,
-+        ds4_gpu_tensor *gate, const void *model_map, uint64_t model_size,
-+        uint64_t q_weight_offset, uint64_t k_weight_offset,
-+        uint64_t v_weight_offset, uint64_t gate_weight_offset,
-+        uint32_t in_dim, uint32_t q_dim, uint32_t kv_dim,
-+        uint32_t gate_dim, const ds4_gpu_tensor *x) {
+ }
+ 
+ extern "C" int ds4_gpu_laguna_qkvg_f16_tensor(
+@@ -27703,20 +29514,116 @@ extern "C" int ds4_gpu_laguna_qkvg_f16_tensor(
+         uint64_t v_weight_offset, uint64_t gate_weight_offset,
+         uint32_t in_dim, uint32_t q_dim, uint32_t kv_dim,
+         uint32_t gate_dim, const ds4_gpu_tensor *x) {
+-    (void)q; (void)k; (void)v; (void)gate; (void)model_map; (void)model_size;
+-    (void)q_weight_offset; (void)k_weight_offset; (void)v_weight_offset;
+-    (void)gate_weight_offset; (void)in_dim; (void)q_dim; (void)kv_dim;
+-    (void)gate_dim; (void)x;
+-    return 0;
 +    const bool shared_activation_cublas =
 +        q && k && v && gate && x && model_map &&
 +        g_cublas_ready &&
@@ -2116,12 +3817,15 @@ index e66fa36..0e6f8f1 100644
 +           ds4_gpu_matmul_f16_tensor(
 +                   gate, model_map, model_size, gate_weight_offset,
 +                   in_dim, gate_dim, x, 1u);
-+}
-+
-+extern "C" int ds4_gpu_laguna_attn_output_residual_f16_tensor(
-+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
-+        uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
-+        const ds4_gpu_tensor *x, const ds4_gpu_tensor *residual) {
+ }
+ 
+ extern "C" int ds4_gpu_laguna_attn_output_residual_f16_tensor(
+         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+         uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
+         const ds4_gpu_tensor *x, const ds4_gpu_tensor *residual) {
+-    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
+-    (void)in_dim; (void)out_dim; (void)x; (void)residual;
+-    return 0;
 +    if (!residual ||
 +        residual->bytes < (uint64_t)out_dim * sizeof(float)) {
 +        return 0;
@@ -2130,12 +3834,10 @@ index e66fa36..0e6f8f1 100644
 +                   out, model_map, model_size, weight_offset,
 +                   in_dim, out_dim, x, 1u) &&
 +           ds4_gpu_add_tensor(out, residual, out, out_dim);
-+}
-+
-+extern "C" int ds4_gpu_laguna_head_rms_norm_rope_tensor(
-+        ds4_gpu_tensor *x, const void *model_map, uint64_t model_size,
-         uint64_t weight_offset, uint32_t n_tokens, uint32_t n_head,
-         uint32_t head_dim, uint32_t n_rot, uint32_t pos0,
+ }
+ 
+ extern "C" int ds4_gpu_laguna_head_rms_norm_rope_tensor(
+@@ -27726,11 +29633,37 @@ extern "C" int ds4_gpu_laguna_head_rms_norm_rope_tensor(
          uint32_t n_ctx_orig, float freq_base, float freq_scale,
          float ext_factor, float attn_factor, float beta_fast,
          float beta_slow, float eps) {
@@ -2178,7 +3880,7 @@ index e66fa36..0e6f8f1 100644
  }
  
  extern "C" int ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
-@@ -27741,13 +29456,16 @@ extern "C" int ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
+@@ -27741,13 +29674,16 @@ extern "C" int ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
          uint32_t pos0, uint32_t n_ctx_orig, float freq_base,
          float freq_scale, float ext_factor, float attn_factor,
          float beta_fast, float beta_slow, float eps) {
@@ -2202,7 +3904,7 @@ index e66fa36..0e6f8f1 100644
  }
  
  extern "C" int ds4_gpu_laguna_store_attention_tensor(
-@@ -27757,11 +29475,84 @@ extern "C" int ds4_gpu_laguna_store_attention_tensor(
+@@ -27757,11 +29693,84 @@ extern "C" int ds4_gpu_laguna_store_attention_tensor(
          const ds4_gpu_tensor *gate, uint32_t pos, uint32_t cache_cap,
          uint32_t key_start, uint32_t key_count, uint32_t n_head,
          uint32_t n_head_kv, uint32_t head_dim, float scale) {
@@ -2292,7 +3994,7 @@ index e66fa36..0e6f8f1 100644
  }
  
  extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
-@@ -27772,10 +29563,92 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
+@@ -27772,10 +29781,92 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
          const ds4_gpu_tensor *gate, uint32_t pos0, uint32_t n_tokens,
          uint32_t cache_cap, uint32_t n_head, uint32_t n_head_kv,
          uint32_t head_dim, float scale) {
@@ -2391,7 +4093,7 @@ index e66fa36..0e6f8f1 100644
  }
  #pragma GCC diagnostic pop
 diff --git a/ds4_gpu.h b/ds4_gpu.h
-index 4af4c95..d62bcf3 100644
+index 4af4c95..03c09af 100644
 --- a/ds4_gpu.h
 +++ b/ds4_gpu.h
 @@ -139,6 +139,7 @@ int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t contex
@@ -2402,8 +4104,63 @@ index 4af4c95..d62bcf3 100644
  void ds4_gpu_set_ssd_streaming(bool enabled);
  void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
  #ifdef __APPLE__
+@@ -733,6 +734,37 @@ int ds4_gpu_matmul_f16_tensor(
+         const ds4_gpu_tensor *x,
+         uint64_t                n_tok);
+ 
++int ds4_gpu_matmul_bf16_tensor(
++        ds4_gpu_tensor       *out,
++        const void           *model_map,
++        uint64_t              model_size,
++        uint64_t              weight_offset,
++        uint64_t              in_dim,
++        uint64_t              out_dim,
++        const ds4_gpu_tensor *x,
++        uint64_t              n_tok);
++
++int ds4_gpu_dflash_pack_features_tensor(
++        ds4_gpu_tensor       *out,
++        const ds4_gpu_tensor *features,
++        const void           *model_map,
++        uint64_t              model_size,
++        uint64_t              aux_norm_offset,
++        uint32_t              n_embd,
++        uint32_t              n_aux,
++        uint32_t              n_rows,
++        float                 eps);
++
++int ds4_gpu_dflash_store_kv_tensor(
++        ds4_gpu_tensor       *key_cache,
++        ds4_gpu_tensor       *value_cache,
++        const ds4_gpu_tensor *k,
++        const ds4_gpu_tensor *v,
++        uint32_t              pos0,
++        uint32_t              n_tokens,
++        uint32_t              cache_cap,
++        uint32_t              kv_width);
++
+ /* Exact multi-row form of the DeepSeek 4096x256 F16 router projection. */
+ int ds4_gpu_matmul_f16_router_rows_exact_tensor(
+         ds4_gpu_tensor       *out,
+diff --git a/ds4_help.c b/ds4_help.c
+index a5c66a9..4f861e2 100644
+--- a/ds4_help.c
++++ b/ds4_help.c
+@@ -176,10 +176,10 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
+     opt(fp, c, "--prefill-chunk N", "Graph prefill chunk size. Default: CUDA TP 2048; PRO 8192; Laguna 16384; others 4096.");
+     if (full) {
+         if (tool != DS4_HELP_BENCH) {
+-            opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");
++            opt(fp, c, "--mtp FILE", "Optional MTP, DSpark, or Laguna DFlash support GGUF.");
+         }
+         if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
+-            opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens. Default: 1");
++            opt(fp, c, "--mtp-draft N", "Maximum draft tokens. Default: 1 (15 for Laguna DFlash)");
+             opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
+             opt(fp, c, "--glm-mtp", "Enable integrated greedy GLM MTP speculation.");
+             opt(fp, c, "--glm-mtp-timing", "Enable GLM MTP and print acceptance/timing counters.");
 diff --git a/ds4_metal.m b/ds4_metal.m
-index 0e154c2..00c7e53 100644
+index 0e154c2..b2c3c68 100644
 --- a/ds4_metal.m
 +++ b/ds4_metal.m
 @@ -3626,6 +3626,11 @@ void ds4_gpu_set_glm_model(bool enabled) {
@@ -2418,8 +4175,44 @@ index 0e154c2..00c7e53 100644
  void ds4_gpu_set_ssd_streaming(bool enabled) {
      g_ssd_streaming_mode = enabled ? 1 : 0;
      ds4_gpu_stream_expert_cache_clear_all(1);
+@@ -41051,3 +41056,35 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
+ void ds4_gpu_set_glm_mtp_verify_mode(bool enabled) {
+     (void)enabled;
+ }
++
++/* Laguna DFlash is CUDA-only. These keep the shared graph code linkable on
++ * Metal while engine validation rejects the support model before evaluation. */
++int ds4_gpu_matmul_bf16_tensor(
++        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
++        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
++        const ds4_gpu_tensor *x, uint64_t n_tok) {
++    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
++    (void)in_dim; (void)out_dim; (void)x; (void)n_tok;
++    return 0;
++}
++
++int ds4_gpu_dflash_pack_features_tensor(
++        ds4_gpu_tensor *out, const ds4_gpu_tensor *features,
++        const void *model_map, uint64_t model_size,
++        uint64_t aux_norm_offset, uint32_t n_embd, uint32_t n_aux,
++        uint32_t n_rows, float eps) {
++    (void)out; (void)features; (void)model_map; (void)model_size;
++    (void)aux_norm_offset; (void)n_embd; (void)n_aux; (void)n_rows;
++    (void)eps;
++    return 0;
++}
++
++int ds4_gpu_dflash_store_kv_tensor(
++        ds4_gpu_tensor *key_cache, ds4_gpu_tensor *value_cache,
++        const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
++        uint32_t pos0, uint32_t n_tokens, uint32_t cache_cap,
++        uint32_t kv_width) {
++    (void)key_cache; (void)value_cache; (void)k; (void)v; (void)pos0;
++    (void)n_tokens; (void)cache_cap; (void)kv_width;
++    return 0;
++}
 diff --git a/rocm/ds4_rocm_current_api_compat.cuh b/rocm/ds4_rocm_current_api_compat.cuh
-index e75cc5a..69ab514 100644
+index e75cc5a..6ee21cf 100644
 --- a/rocm/ds4_rocm_current_api_compat.cuh
 +++ b/rocm/ds4_rocm_current_api_compat.cuh
 @@ -129,6 +129,10 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
@@ -2433,6 +4226,42 @@ index e75cc5a..69ab514 100644
  extern "C" void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) {
      (void)enabled;
  }
+@@ -316,3 +320,35 @@ extern "C" int ds4_gpu_routed_moe_set_selected_override(
+     g_routed_moe_selected_override_n = n_selected;
+     return 1;
+ }
++
++/* Laguna DFlash is CUDA-only. Engine validation rejects it on ROCm; these
++ * stubs keep the shared Laguna graph linkable. */
++extern "C" int ds4_gpu_matmul_bf16_tensor(
++        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
++        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
++        const ds4_gpu_tensor *x, uint64_t n_tok) {
++    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
++    (void)in_dim; (void)out_dim; (void)x; (void)n_tok;
++    return 0;
++}
++
++extern "C" int ds4_gpu_dflash_pack_features_tensor(
++        ds4_gpu_tensor *out, const ds4_gpu_tensor *features,
++        const void *model_map, uint64_t model_size,
++        uint64_t aux_norm_offset, uint32_t n_embd, uint32_t n_aux,
++        uint32_t n_rows, float eps) {
++    (void)out; (void)features; (void)model_map; (void)model_size;
++    (void)aux_norm_offset; (void)n_embd; (void)n_aux; (void)n_rows;
++    (void)eps;
++    return 0;
++}
++
++extern "C" int ds4_gpu_dflash_store_kv_tensor(
++        ds4_gpu_tensor *key_cache, ds4_gpu_tensor *value_cache,
++        const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
++        uint32_t pos0, uint32_t n_tokens, uint32_t cache_cap,
++        uint32_t kv_width) {
++    (void)key_cache; (void)value_cache; (void)k; (void)v; (void)pos0;
++    (void)n_tokens; (void)cache_cap; (void)kv_width;
++    return 0;
++}
 diff --git a/speed-bench/laguna_s21_gb10.csv b/speed-bench/laguna_s21_gb10.csv
 new file mode 100644
 index 0000000..6643bb9
@@ -2453,6 +4282,16 @@ index 0000000..2cb582c
 +2048,2048,201.87,256,22.36,45.551,255,22.49,176570420
 +4096,2048,160.93,256,21.64,48.988,255,21.77,277241908
 +8192,4096,132.42,256,20.33,50.927,255,20.44,0
+diff --git a/speed-bench/laguna_s21_gb10_revised_portable.csv b/speed-bench/laguna_s21_gb10_revised_portable.csv
+new file mode 100644
+index 0000000..dcb035c
+--- /dev/null
++++ b/speed-bench/laguna_s21_gb10_revised_portable.csv
+@@ -0,0 +1,4 @@
++ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes
++2048,2048,199.16,256,21.71,47.727,255,21.84,176570420
++4096,2048,162.08,256,20.38,49.655,255,20.49,277241908
++8192,4096,132.48,256,18.27,57.577,255,18.37,0
 diff --git a/tests/cuda_laguna_smoke.c b/tests/cuda_laguna_smoke.c
 new file mode 100644
 index 0000000..c25ae57

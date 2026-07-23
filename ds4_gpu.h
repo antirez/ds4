@@ -832,6 +832,37 @@ int ds4_gpu_matmul_f16_rms_fold_tensor(
         uint64_t                n_tok,
         float                   norm_eps);
 
+int ds4_gpu_matmul_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok);
+
+int ds4_gpu_dflash_pack_features_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *features,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              aux_norm_offset,
+        uint32_t              n_embd,
+        uint32_t              n_aux,
+        uint32_t              n_rows,
+        float                 eps);
+
+int ds4_gpu_dflash_store_kv_tensor(
+        ds4_gpu_tensor       *key_cache,
+        ds4_gpu_tensor       *value_cache,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_cap,
+        uint32_t              kv_width);
+
 /* Exact multi-row form of the DeepSeek 4096x256 F16 router projection. */
 int ds4_gpu_matmul_f16_router_rows_exact_tensor(
         ds4_gpu_tensor       *out,
