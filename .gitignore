@@ -25,6 +25,7 @@
 /tests/test_layer_pack
 /tests/test_metal_session_batch
 /tests/test_q4k_dot
+/tests/test_rocm_matmul_q8
 /tests/test_sampling
 *.o
 *.dSYM/
