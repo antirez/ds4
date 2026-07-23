@@ -130,6 +130,12 @@ projections. Decode and multi-token prefill both require coverage.
   shared memory. This increases parallelism without repeating the rejected
   grouped-head schedule; `DS4_CUDA_LAGUNA_NO_SPLIT_DECODE=1` retains the
   original serial-history kernel.
+- On Blackwell (`sm_120+`), use sixteen warps for histories of at least 4K.
+  The wider schedule is capability- and shape-gated; either
+  `DS4_CUDA_LAGUNA_NO_BLACKWELL=1` or
+  `DS4_CUDA_LAGUNA_NO_BLACKWELL_SPLIT16=1` restores the portable eight-warp
+  path. Both schedules explicitly broadcast each warp's complete query/key
+  dot product before the online-softmax update.
 - Use aligned 16-byte Q4_K loads in Laguna's one-token gate/up and Q4_K-down
   kernels, guarded by tensor stride checks and
   `DS4_CUDA_LAGUNA_NO_VEC_Q4=1`. Convert the normalized attention activation
@@ -180,9 +186,9 @@ Verification evidence:
   42.57/7.29 at 4K, and 36.79/5.23 at 8K. With expert-sorted MoE, chunked
   Q4_K/Q6_K down, grouped prefill GQA, split-history decode attention, aligned
   Q4_K decode loads, and a shared Q/K/V/gate f16 activation, the same sweep
-  measures 148.91/15.24, 125.60/14.56, and 107.28/13.43 tok/s. Relative to
-  the original baseline, prefill improves by 210%, 195%, and 192%, while
-  generation improves by 68%, 100%, and 157%. Results are stored in
+  measures 148.08/15.25, 125.52/15.25, and 106.95/14.56 tok/s. Relative to
+  the original baseline, prefill improves by 208%, 195%, and 191%, while
+  generation improves by 68%, 109%, and 178%. Results are stored in
   `speed-bench/laguna_s21_gb10.csv`.
 - Initial Nsight Systems profiling attributed 89.7% of 512-token prefill GPU
   time to routed experts: 60.7% to Q4_K gate/up and 29.0% to Q4_K/Q6_K down.
@@ -195,11 +201,17 @@ Verification evidence:
   gate/up, 12% to MoE down, 8% to split attention, and 6% to the Q6_K output
   matmul. The existing direct CUDA f16 matvec was rejected after lowering a
   2K/64-token diagnostic from 15.19 to 12.06 tok/s.
+- In a paired 256-token GB10 comparison, Blackwell's sixteen-warp attention
+  raises 4K generation from 14.58 to 15.21 tok/s and 8K generation from 13.45
+  to 14.55 tok/s over the portable eight-warp schedule. At a 4K prompt it
+  also reproduces the scalar attention path's complete 32-token greedy
+  continuation.
 - The optimized and rollback paths produce byte-identical full-model logits
   for sorted gate/up, chunked Q4_K/Q6_K down, grouped prefill GQA, aligned
-  Q4_K decode loads, and the shared Q/K/V/gate activation. A 661-token prompt
-  followed by 32 greedy decode steps produces identical text and dumped
-  logits with split-history attention enabled or disabled.
+  Q4_K decode loads, and the shared Q/K/V/gate activation. The synthetic CUDA
+  regression compares every output element from the scalar, portable
+  eight-warp, and default (sixteen-warp on GB10) attention paths across 4,096
+  keys within a 2e-4 absolute/relative tolerance.
   A grouped decode experiment was rejected despite identical logits because
   it regressed sustained generation to 8.10/6.17/4.17 tok/s.
 - `sh -n download_model.sh` passes. The Laguna download target accepts the

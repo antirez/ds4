@@ -253,6 +253,24 @@ static int cuda_q4_mma_ok(void) {
     return cached;
 }
 
+static int cuda_laguna_blackwell_ok(void) {
+    /* Laguna is single-GPU today, so cache the active device capability. */
+    static int cached = -1;
+    if (cached < 0) {
+        if (getenv("DS4_CUDA_LAGUNA_NO_BLACKWELL") != NULL) {
+            cached = 0;
+        } else {
+            int dev = 0;
+            int major = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(
+                &major, cudaDevAttrComputeCapabilityMajor, dev);
+            cached = major >= 12 ? 1 : 0;
+        }
+    }
+    return cached;
+}
+
 
 
 
@@ -31426,12 +31444,12 @@ __global__ static void laguna_attention_decode_kernel(
         acc * (score_sum > 0.0f ? 1.0f / score_sum : 0.0f) * gate_scale;
 }
 
-/* Keep one block per query head, but stripe longer histories over eight
+/* Keep one block per query head, but stripe longer histories over independent
  * warps. Each warp performs an online softmax over its key subsequence, then
- * warp 0 merges the independently normalized partials. This raises decode
- * parallelism without grouping GQA heads (which reduces block-level
- * parallelism on GB10). */
-__global__ static void laguna_attention_decode_split8_kernel(
+ * warp 0 merges the partials. The portable path uses eight warps; Blackwell
+ * can use sixteen for long global histories without grouping GQA heads. */
+template <uint32_t SPLITS>
+__global__ static void laguna_attention_decode_split_kernel(
         float *out,
         const float *q,
         const float *gate,
@@ -31447,7 +31465,7 @@ __global__ static void laguna_attention_decode_split8_kernel(
     const uint32_t head = blockIdx.x;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
-    if (head >= n_head || warp >= 8u || head_dim != 128u) return;
+    if (head >= n_head || warp >= SPLITS || head_dim != 128u) return;
     const uint32_t heads_per_kv = n_head / n_head_kv;
     const uint32_t kv_head = head / heads_per_kv;
     const uint32_t width = n_head_kv * head_dim;
@@ -31459,7 +31477,7 @@ __global__ static void laguna_attention_decode_split8_kernel(
     float acc3 = 0.0f;
     float max_score = -INFINITY;
     float score_sum = 0.0f;
-    for (uint32_t i = warp; i < key_count; i += 8u) {
+    for (uint32_t i = warp; i < key_count; i += SPLITS) {
         const uint32_t cache_row = (key_start + i) % cache_cap;
         const uint64_t kv_base =
             (uint64_t)cache_row * width + (uint64_t)kv_head * head_dim;
@@ -31471,7 +31489,8 @@ __global__ static void laguna_attention_decode_split8_kernel(
                 __half2float(key_cache[kv_base + lane + 64u]) +
             qh[lane + 96u] *
                 __half2float(key_cache[kv_base + lane + 96u]);
-        score = warp_sum_f32(score) * scale;
+        score = __shfl_sync(
+            0xffffffffu, warp_sum_f32(score), 0) * scale;
         const float next_max = fmaxf(max_score, score);
         const float old_scale = isinf(max_score) ?
             0.0f : expf(max_score - next_max);
@@ -31488,9 +31507,9 @@ __global__ static void laguna_attention_decode_split8_kernel(
         max_score = next_max;
     }
 
-    __shared__ float partial_max[8];
-    __shared__ float partial_sum[8];
-    __shared__ float partial_value[8 * 128];
+    __shared__ float partial_max[SPLITS];
+    __shared__ float partial_sum[SPLITS];
+    __shared__ float partial_value[SPLITS * 128];
     if (lane == 0u) {
         partial_max[warp] = max_score;
         partial_sum[warp] = score_sum;
@@ -31505,7 +31524,7 @@ __global__ static void laguna_attention_decode_split8_kernel(
 
     float global_max = partial_max[0];
     #pragma unroll
-    for (uint32_t w = 1u; w < 8u; w++) {
+    for (uint32_t w = 1u; w < SPLITS; w++) {
         global_max = fmaxf(global_max, partial_max[w]);
     }
     float merged_sum = 0.0f;
@@ -31514,7 +31533,7 @@ __global__ static void laguna_attention_decode_split8_kernel(
     float merged2 = 0.0f;
     float merged3 = 0.0f;
     #pragma unroll
-    for (uint32_t w = 0u; w < 8u; w++) {
+    for (uint32_t w = 0u; w < SPLITS; w++) {
         const float weight = partial_sum[w] > 0.0f ?
             expf(partial_max[w] - global_max) : 0.0f;
         merged_sum += partial_sum[w] * weight;
@@ -32610,14 +32629,29 @@ extern "C" int ds4_gpu_laguna_store_attention_tensor(
         key_count > 256u &&
         getenv("DS4_CUDA_LAGUNA_NO_SPLIT_DECODE") == NULL;
     if (split_attention) {
-        laguna_attention_decode_split8_kernel<<<n_head, 256>>>(
-                (float *)heads->ptr,
-                (const float *)q->ptr,
-                (const float *)gate->ptr,
-                (const __half *)key_cache->ptr,
-                (const __half *)value_cache->ptr,
-                cache_cap, key_start, key_count,
-                n_head, n_head_kv, head_dim, scale);
+        const bool blackwell_split16 =
+            key_count >= 4096u &&
+            cuda_laguna_blackwell_ok() &&
+            getenv("DS4_CUDA_LAGUNA_NO_BLACKWELL_SPLIT16") == NULL;
+        if (blackwell_split16) {
+            laguna_attention_decode_split_kernel<16><<<n_head, 512>>>(
+                    (float *)heads->ptr,
+                    (const float *)q->ptr,
+                    (const float *)gate->ptr,
+                    (const __half *)key_cache->ptr,
+                    (const __half *)value_cache->ptr,
+                    cache_cap, key_start, key_count,
+                    n_head, n_head_kv, head_dim, scale);
+        } else {
+            laguna_attention_decode_split_kernel<8><<<n_head, 256>>>(
+                    (float *)heads->ptr,
+                    (const float *)q->ptr,
+                    (const float *)gate->ptr,
+                    (const __half *)key_cache->ptr,
+                    (const __half *)value_cache->ptr,
+                    cache_cap, key_start, key_count,
+                    n_head, n_head_kv, head_dim, scale);
+        }
     } else {
         laguna_attention_decode_kernel<<<n_head, head_dim>>>(
                 (float *)heads->ptr,

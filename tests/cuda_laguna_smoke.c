@@ -608,6 +608,119 @@ static int check_attention(void) {
     return 0;
 }
 
+static int check_long_decode_attention(void) {
+    enum { n_head = 6, n_head_kv = 1, cache_cap = 4096 };
+    const uint64_t cache_values =
+        (uint64_t)cache_cap * n_head_kv * HEAD_DIM;
+    uint16_t *key_cache_host =
+        malloc((size_t)cache_values * sizeof(uint16_t));
+    uint16_t *value_cache_host =
+        malloc((size_t)cache_values * sizeof(uint16_t));
+    CHECK(key_cache_host && value_cache_host,
+          "long attention host allocation");
+    const uint16_t key_bits[] = {0x3000u, 0x3400u, 0x3800u};
+    const uint16_t value_bits[] = {
+        0x3800u, 0x3c00u, 0x3e00u, 0x4000u
+    };
+    for (uint32_t t = 0; t < cache_cap; t++) {
+        for (uint32_t d = 0; d < HEAD_DIM; d++) {
+            const uint64_t i = (uint64_t)t * HEAD_DIM + d;
+            key_cache_host[i] = key_bits[(t + d) % 3u];
+            value_cache_host[i] = value_bits[(3u * t + d) % 4u];
+        }
+    }
+    float q[n_head * HEAD_DIM];
+    float k[HEAD_DIM];
+    float v[HEAD_DIM];
+    float gate[n_head];
+    float scalar[n_head * HEAD_DIM];
+    float split8[n_head * HEAD_DIM];
+    float split_default[n_head * HEAD_DIM];
+    for (uint32_t h = 0; h < n_head; h++) {
+        gate[h] = 0.1f * (float)h;
+        for (uint32_t d = 0; d < HEAD_DIM; d++) {
+            q[(uint64_t)h * HEAD_DIM + d] =
+                0.015625f * (float)(1u + (d + 3u * h) % 11u);
+        }
+    }
+    for (uint32_t d = 0; d < HEAD_DIM; d++) {
+        k[d] = f16_ref(key_bits[(cache_cap - 1u + d) % 3u]);
+        v[d] = f16_ref(value_bits[
+            (3u * (cache_cap - 1u) + d) % 4u]);
+    }
+
+    ds4_gpu_tensor *heads =
+        ds4_gpu_tensor_alloc(sizeof(scalar));
+    ds4_gpu_tensor *key_cache =
+        ds4_gpu_tensor_alloc(cache_values * sizeof(uint16_t));
+    ds4_gpu_tensor *value_cache =
+        ds4_gpu_tensor_alloc(cache_values * sizeof(uint16_t));
+    ds4_gpu_tensor *q_t = ds4_gpu_tensor_alloc(sizeof(q));
+    ds4_gpu_tensor *k_t = ds4_gpu_tensor_alloc(sizeof(k));
+    ds4_gpu_tensor *v_t = ds4_gpu_tensor_alloc(sizeof(v));
+    ds4_gpu_tensor *gate_t = ds4_gpu_tensor_alloc(sizeof(gate));
+    CHECK(heads && key_cache && value_cache && q_t && k_t && v_t && gate_t,
+          "long attention tensor allocation");
+    CHECK(ds4_gpu_tensor_write(
+              key_cache, 0, key_cache_host,
+              cache_values * sizeof(uint16_t)) &&
+          ds4_gpu_tensor_write(
+              value_cache, 0, value_cache_host,
+              cache_values * sizeof(uint16_t)) &&
+          ds4_gpu_tensor_write(q_t, 0, q, sizeof(q)) &&
+          ds4_gpu_tensor_write(k_t, 0, k, sizeof(k)) &&
+          ds4_gpu_tensor_write(v_t, 0, v, sizeof(v)) &&
+          ds4_gpu_tensor_write(gate_t, 0, gate, sizeof(gate)),
+          "write long attention tensors");
+
+    CHECK(setenv("DS4_CUDA_LAGUNA_NO_SPLIT_DECODE", "1", 1) == 0,
+          "disable split attention");
+    CHECK(ds4_gpu_laguna_store_attention_tensor(
+              heads, key_cache, value_cache, q_t, k_t, v_t, gate_t,
+              cache_cap - 1u, cache_cap, 0u, cache_cap,
+              n_head, n_head_kv, HEAD_DIM,
+              1.0f / sqrtf((float)HEAD_DIM)) &&
+          ds4_gpu_tensor_read(heads, 0, scalar, sizeof(scalar)),
+          "long scalar attention");
+    CHECK(unsetenv("DS4_CUDA_LAGUNA_NO_SPLIT_DECODE") == 0 &&
+          setenv("DS4_CUDA_LAGUNA_NO_BLACKWELL_SPLIT16", "1", 1) == 0,
+          "select portable split attention");
+    CHECK(ds4_gpu_laguna_store_attention_tensor(
+              heads, key_cache, value_cache, q_t, k_t, v_t, gate_t,
+              cache_cap - 1u, cache_cap, 0u, cache_cap,
+              n_head, n_head_kv, HEAD_DIM,
+              1.0f / sqrtf((float)HEAD_DIM)) &&
+          ds4_gpu_tensor_read(heads, 0, split8, sizeof(split8)),
+          "long portable split attention");
+    CHECK(unsetenv("DS4_CUDA_LAGUNA_NO_BLACKWELL_SPLIT16") == 0,
+          "select default split attention");
+    CHECK(ds4_gpu_laguna_store_attention_tensor(
+              heads, key_cache, value_cache, q_t, k_t, v_t, gate_t,
+              cache_cap - 1u, cache_cap, 0u, cache_cap,
+              n_head, n_head_kv, HEAD_DIM,
+              1.0f / sqrtf((float)HEAD_DIM)) &&
+          ds4_gpu_tensor_read(
+              heads, 0, split_default, sizeof(split_default)),
+          "long default split attention");
+    for (uint32_t i = 0; i < n_head * HEAD_DIM; i++) {
+        CHECK(close_enough(split8[i], scalar[i], 2e-4f, 2e-4f),
+              "long portable split attention numeric");
+        CHECK(close_enough(split_default[i], scalar[i], 2e-4f, 2e-4f),
+              "long default split attention numeric");
+    }
+
+    ds4_gpu_tensor_free(gate_t);
+    ds4_gpu_tensor_free(v_t);
+    ds4_gpu_tensor_free(k_t);
+    ds4_gpu_tensor_free(q_t);
+    ds4_gpu_tensor_free(value_cache);
+    ds4_gpu_tensor_free(key_cache);
+    ds4_gpu_tensor_free(heads);
+    free(value_cache_host);
+    free(key_cache_host);
+    return 0;
+}
+
 static int check_moe(model_blob *blob,
                      const ds4_gpu_laguna_moe_desc *routed,
                      const ds4_gpu_laguna_moe_desc *shared) {
@@ -807,6 +920,7 @@ int main(void) {
     int rc = check_quant_ops(&blob, q4_offset, q6_offset, embed_offset);
     if (rc == 0) rc = check_norm_rope(&blob, norm_offset);
     if (rc == 0) rc = check_attention();
+    if (rc == 0) rc = check_long_decode_attention();
     if (rc == 0) rc = check_moe(&blob, &routed, &shared);
     ds4_gpu_cleanup();
     (void)cudaFreeHost(host);
