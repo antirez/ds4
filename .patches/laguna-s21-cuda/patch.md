@@ -107,10 +107,39 @@ projections. Decode and multi-token prefill both require coverage.
 - Reuse CUDA's Q8_K activation quantization for Laguna MoE gate/up and down
   dot products. Routed weights are fused into the intermediate values; each
   output row then reduces selected experts in slot order.
-- Optimize the raw Laguna path first. Reuse the generic CUDA Q4_K
-  expert-sorting and tensor-core kernels where its tensor semantics match;
-  extend them for Laguna's top-10 routing and Q6_K down projections instead
-  of masking direct-path performance with speculative decoding.
+- Optimize the raw Laguna path first. Reuse generic CUDA expert sorting as a
+  reference, but specialize execution for Laguna's top-10 routing, Q4_K/Q6_K
+  down projections, and 1024-wide expert intermediates instead of masking
+  direct-path performance with speculative decoding.
+- Treat other model backends as references, not constraints. Prefer a
+  Laguna-specific kernel or schedule when its top-10 routing, alternating
+  Q4_K/Q6_K down weights, 1024-wide experts, or shared-expert structure allows
+  a measurably better implementation without weakening correctness.
+- For multi-token sparse MoE, sort routed pairs by expert and evaluate eight
+  pairs per weight row. Process each down projection in 1024-row chunks,
+  reusing the already-quantized mid buffer for pair terms and reducing top-10
+  slots in their original order. This covers both Q4_K and Q6_K down layers
+  without atomics or a full token-by-slot-by-output scratch allocation.
+- During prefill, evaluate the three or six query heads sharing a Laguna KV
+  head in one CUDA block. Preserve each head's original 128-thread reduction
+  tree and causal key order while loading the common K/V row once per group.
+  Keep decode head-parallel: grouping decode heads reduced block-level
+  parallelism and lost throughput at every sustained frontier.
+- For decode histories longer than 256 keys, retain one block per query head
+  and stripe keys over eight warps. Merge the eight online-softmax partials in
+  shared memory. This increases parallelism without repeating the rejected
+  grouped-head schedule; `DS4_CUDA_LAGUNA_NO_SPLIT_DECODE=1` retains the
+  original serial-history kernel.
+- Use aligned 16-byte Q4_K loads in Laguna's one-token gate/up and Q4_K-down
+  kernels, guarded by tensor stride checks and
+  `DS4_CUDA_LAGUNA_NO_VEC_Q4=1`. Convert the normalized attention activation
+  to f16 once and reuse it across the four cuBLAS Q/K/V/gate projections;
+  `DS4_CUDA_LAGUNA_NO_SHARED_QKVG_ACTIVATION=1` restores the generic calls.
+- Finish portable raw-kernel optimization before adding hardware-specific
+  paths. Any later Blackwell/GB10 specialization must be capability- and
+  shape-gated, retain a rollback switch and portable fallback, preserve the
+  validated logits contract, and demonstrate a measured win on supported
+  hardware.
 
 # Provenance
 
@@ -146,17 +175,33 @@ Verification evidence:
   prompt tokens and 64 generated tokens they measure 48.00 tok/s prefill,
   9.14 tok/s generation, and 9.19 tok/s steady-state generation. These are
   smoke/profile measurements rather than representative throughput claims.
-- A sustained single-process benchmark with 256 generated tokens per point
-  measures 48.05/9.06 tok/s prefill/generation at 2K context,
-  42.57/7.29 at 4K, and 36.79/5.23 at 8K. The 4K and 8K prefill rows measure
-  incremental suffixes of 2K and 4K tokens respectively. Results are stored
-  in `speed-bench/laguna_s21_gb10.csv`.
-- Nsight Systems attributes 89.7% of 512-token prefill GPU time to the routed
-  expert kernels: 60.7% to Q4_K gate/up and 29.0% to Q4_K/Q6_K down.
-  The direct causal attention kernel accounts for another 9.2%; cuBLAS
-  projections, dequantization, norms, and copies together account for less
-  than 1%. A separate decode diagnostic similarly attributes 75.8% of total
-  GPU time to routed expert gate/up/down, with F16 signal-path GEMV next.
+- The original sustained single-process benchmark with 256 generated tokens
+  per point measured 48.05/9.06 tok/s prefill/generation at 2K context,
+  42.57/7.29 at 4K, and 36.79/5.23 at 8K. With expert-sorted MoE, chunked
+  Q4_K/Q6_K down, grouped prefill GQA, split-history decode attention, aligned
+  Q4_K decode loads, and a shared Q/K/V/gate f16 activation, the same sweep
+  measures 148.91/15.24, 125.60/14.56, and 107.28/13.43 tok/s. Relative to
+  the original baseline, prefill improves by 210%, 195%, and 192%, while
+  generation improves by 68%, 100%, and 157%. Results are stored in
+  `speed-bench/laguna_s21_gb10.csv`.
+- Initial Nsight Systems profiling attributed 89.7% of 512-token prefill GPU
+  time to routed experts: 60.7% to Q4_K gate/up and 29.0% to Q4_K/Q6_K down.
+  After expert sorting and chunked down, a follow-up profile measured 19.3%
+  gate/up, 38.0% Q6_K down, 7.4% Q4_K down, and 31.4% causal attention.
+  This motivated grouped prefill GQA, which raises sustained 8K prefill from
+  69.65 to 107.50 tok/s by avoiding repeated K/V loads.
+- A decode-focused profile after split-history attention attributes about
+  44% of decode GPU time to the five f16 cuBLAS projections, 19% to Q4_K
+  gate/up, 12% to MoE down, 8% to split attention, and 6% to the Q6_K output
+  matmul. The existing direct CUDA f16 matvec was rejected after lowering a
+  2K/64-token diagnostic from 15.19 to 12.06 tok/s.
+- The optimized and rollback paths produce byte-identical full-model logits
+  for sorted gate/up, chunked Q4_K/Q6_K down, grouped prefill GQA, aligned
+  Q4_K decode loads, and the shared Q/K/V/gate activation. A 661-token prompt
+  followed by 32 greedy decode steps produces identical text and dumped
+  logits with split-history attention enabled or disabled.
+  A grouped decode experiment was rejected despite identical logits because
+  it regressed sustained generation to 8.10/6.17/4.17 tok/s.
 - `sh -n download_model.sh` passes. The Laguna download target accepts the
   pinned model's exact byte size and rejects an existing file with a different
   size before invoking the Hugging Face client.

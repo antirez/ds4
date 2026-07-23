@@ -454,7 +454,7 @@ static void attention_ref(float *out,
 
 static int check_attention(void) {
     const uint32_t n_tokens = 3;
-    const uint32_t n_head = 2;
+    const uint32_t n_head = 6;
     const uint32_t n_head_kv = 1;
     const uint32_t cache_cap = 4;
     const uint64_t q_values = (uint64_t)n_tokens * n_head * HEAD_DIM;
@@ -467,8 +467,9 @@ static int check_attention(void) {
             k[(uint64_t)t * HEAD_DIM + d] = 0.125f * (float)(t + 1u);
             v[(uint64_t)t * HEAD_DIM + d] = (float)(t + 1u);
         }
-        gate[t * n_head] = 0.0f;
-        gate[t * n_head + 1u] = 0.5f;
+        for (uint32_t h = 0; h < n_head; h++) {
+            gate[t * n_head + h] = 0.1f * (float)h;
+        }
     }
     attention_ref(expected, q, k, v, gate, 0u, n_tokens, cache_cap,
                   n_head, n_head_kv);
@@ -515,8 +516,9 @@ static int check_attention(void) {
         k_decode[i] = 0.5f;
         v_decode[i] = 4.0f;
     }
-    gate_decode[0] = 0.0f;
-    gate_decode[1] = 0.5f;
+    for (uint32_t h = 0; h < n_head; h++) {
+        gate_decode[h] = 0.1f * (float)h;
+    }
     CHECK(ds4_gpu_tensor_write(q_t, 0, q_decode, sizeof(q_decode)) &&
           ds4_gpu_tensor_write(k_t, 0, k_decode, sizeof(k_decode)) &&
           ds4_gpu_tensor_write(v_t, 0, v_decode, sizeof(v_decode)) &&
