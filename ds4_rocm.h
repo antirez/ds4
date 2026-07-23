@@ -21,7 +21,14 @@
 
 #define cudaGetDevice hipGetDevice
 #define cudaSetDevice hipSetDevice
+#define cudaGetDeviceCount hipGetDeviceCount
 #define cudaDeviceSynchronize hipDeviceSynchronize
+#define cudaDeviceCanAccessPeer hipDeviceCanAccessPeer
+#define cudaDeviceEnablePeerAccess hipDeviceEnablePeerAccess
+#define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
+#define cudaMemcpyPeer hipMemcpyPeer
+#define cudaMemcpyPeerAsync hipMemcpyPeerAsync
+#define cudaStreamWaitEvent hipStreamWaitEvent
 #define cudaDeviceGetAttribute hipDeviceGetAttribute
 #define cudaGetDeviceProperties hipGetDeviceProperties
 #define cudaDevAttrPageableMemoryAccess hipDeviceAttributePageableMemoryAccess
