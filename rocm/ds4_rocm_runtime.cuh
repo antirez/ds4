@@ -5711,6 +5711,30 @@ static void cuda_model_range_release_all(void) {
     cuda_model_load_progress_reset();
 }
 
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+/* Wavefront size of the current device, cached after the first query.
+ *
+ * Host-side kernel selection needs this because the host compilation pass has
+ * no target-arch macros: RDNA3/RDNA4 report 32 and take the WMMA kernels, CDNA
+ * reports 64 and takes the MFMA kernels.  Returns 0 if the device cannot be
+ * queried, which callers treat as "use the portable path".  The race on first
+ * call is benign; every racing caller computes the same value. */
+static int cuda_device_wave_size(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        int dev = 0;
+        cudaDeviceProp prop;
+        if (cudaGetDevice(&dev) == cudaSuccess &&
+            cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
+            cached = prop.warpSize;
+        } else {
+            cached = 0;
+        }
+    }
+    return cached;
+}
+#endif
+
 static int cublas_ok(cublasStatus_t st, const char *what) {
     if (st == CUBLAS_STATUS_SUCCESS) return 1;
     fprintf(stderr, "ds4: " DS4_GPU_BLAS_NAME " %s failed: status %d\n", what, (int)st);
