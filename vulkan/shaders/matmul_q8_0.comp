@@ -4,10 +4,22 @@
 
 /* Q8_0 matrix-vector: out[tok][row] = x[tok][*] · W_Q8[row][*]
  *
- * Grid: (y_scale, ceil(out_dim/y_scale), n_tok). 2D grid for out_dim up to 4G.
+ * Grid: (y_scale, ceil(out_dim/y_scale), n_tok).
  * row = gl_WorkGroupID.x + gl_WorkGroupID.y * pc.y_scale
  *
- * Q8_0 block = 36 bytes: float d (4) + int8 qs[32] (32) = 36 bytes = 9 x uint32.
+ * Q8_0 block = 34 bytes: uint16_t d (f16) + int8 qs[32].
+ * Stored verbatim (no padding).  34 bytes = 8.5 uint32s.
+ * Each PAIR of blocks = 68 bytes = 17 uint32s.
+ *
+ * Even block (b & 1 == 0): word_off = b * 8 + b / 2, byte sub = 0
+ *   word[0] low  16 bits: d_f16
+ *   word[0] high 16 bits: qs[0..1]
+ *   word[1..7]:           qs[2..29]
+ *   word[8] low  16 bits: qs[30..31]
+ *
+ * Odd  block (b & 1 == 1): word_off = b * 8 + b / 2, byte sub = 2
+ *   word[0] high 16 bits: d_f16 (cross-block: word[0] low 16 = prev block's qs tail)
+ *   word[1..8]:           qs[0..31]
  */
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
@@ -26,10 +38,26 @@ layout(push_constant) uniform PC {
 
 shared float sx[8192];
 
-int extract_i8(uint word, uint byte_i) {
-    uint shifted = word >> (byte_i * 8u);
-    uint raw = shifted & 0xFFu;
-    return raw < 128u ? int(raw) : int(raw) - 256;
+float f16_to_f32(uint raw16) {
+    uint sign = (raw16 >> 15u) & 0x1u;
+    uint exp  = (raw16 >> 10u) & 0x1Fu;
+    uint mant = raw16 & 0x3FFu;
+    if (exp == 0u) {
+        if (mant == 0u) return 0.0;
+        while ((mant & 0x400u) == 0u) { mant <<= 1u; exp--; }
+        exp = 1u - exp + 112u;
+        mant = (mant & 0x3FFu) << 13u;
+    } else if (exp == 31u) {
+        exp = 255u; mant <<= 13u;
+    } else {
+        exp += 112u; mant <<= 13u;
+    }
+    return uintBitsToFloat((sign << 31u) | (exp << 23u) | mant);
+}
+
+int extract_i8(uint word, uint j) {
+    uint raw = (word >> (j * 8u)) & 0xFFu;
+    return int(raw) - (raw < 128u ? 0 : 256);
 }
 
 void main() {
@@ -45,27 +73,52 @@ void main() {
     barrier();
 
     double sum = 0.0;
-    uint row_blk = row * pc.blocks_per_row;
 
     for (uint b = lid; b < pc.blocks_per_row; b += 256u) {
-        uint blk_off = (row_blk + b) * 9u;
-        float d = uintBitsToFloat(w_buf[blk_off]);
+        uint blk = row * pc.blocks_per_row + b;
+        uint word_off = blk * 8u + blk / 2u;
+        uint byte_base = b * 32u;
+        float d;
 
-        uint base = b * 32u;
-        for (uint w = 0u; w < 8u; w++) {
-            uint word = w_buf[blk_off + 1u + w];
-            uint byte_base = base + w * 4u;
-            for (uint j = 0u; j < 4u && (byte_base + j) < pc.in_dim; j++) {
-                int q = extract_i8(word, j);
-                sum += double(sx[byte_base + j]) * double(d * float(q));
+        if ((blk & 1u) == 0u) {
+            /* Even block — aligned start */
+            uint w0 = w_buf[word_off];
+            d = f16_to_f32(w0 & 0xFFFFu);
+            /* qs[0..1] from high 16 bits */
+            uint q01 = (w0 >> 16u) & 0xFFFFu;
+            if (byte_base < pc.in_dim)
+                sum += double(sx[byte_base]) * double(d * float(extract_i8(q01, 0u)));
+            if (byte_base + 1u < pc.in_dim)
+                sum += double(sx[byte_base + 1u]) * double(d * float(extract_i8(q01, 1u)));
+            /* qs[2..29] from words 1..7 */
+            for (uint w = 1u; w < 8u; w++) {
+                uint word = w_buf[word_off + w];
+                uint bb = byte_base + w * 4u + 2u;
+                for (uint j = 0u; j < 4u && (bb + j) < pc.in_dim; j++)
+                    sum += double(sx[bb + j]) * double(d * float(extract_i8(word, j)));
+            }
+            /* qs[30..31] from word 8 low 16 bits */
+            uint q89 = w_buf[word_off + 8u] & 0xFFFFu;
+            if (byte_base + 30u < pc.in_dim)
+                sum += double(sx[byte_base + 30u]) * double(d * float(extract_i8(q89, 0u)));
+            if (byte_base + 31u < pc.in_dim)
+                sum += double(sx[byte_base + 31u]) * double(d * float(extract_i8(q89, 1u)));
+        } else {
+            /* Odd block — starts at byte offset 2 of word_off */
+            uint w0 = w_buf[word_off];
+            d = f16_to_f32((w0 >> 16u) & 0xFFFFu);
+            /* qs[0..31] from words 1..8 (8 words x 4 quants = 32 quants) */
+            for (uint w = 1u; w < 9u; w++) {
+                uint word = w_buf[word_off + w];
+                uint bb = byte_base + (w - 1u) * 4u;
+                for (uint j = 0u; j < 4u && (bb + j) < pc.in_dim; j++)
+                    sum += double(sx[bb + j]) * double(d * float(extract_i8(word, j)));
             }
         }
     }
 
     double grp = subgroupAdd(sum);
-
-    if (subgroupElect())
-        sx[lid] = float(grp);
+    if (subgroupElect()) sx[lid] = float(grp);
     barrier();
 
     if (lid == 0u) {

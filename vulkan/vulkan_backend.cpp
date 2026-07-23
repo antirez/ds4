@@ -684,7 +684,7 @@ int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t doff,
 /* ---- Commands ---- */
 
 int ds4_gpu_begin_commands(void) { return begin_cmd(); }
-int ds4_gpu_flush_commands(void) { return end_and_submit(); }
+int ds4_gpu_flush_commands(void) { int r = end_and_submit(); if (r) wait_cmd(); return r; }
 int ds4_gpu_end_commands(void) { return submit_and_wait(); }
 int ds4_gpu_synchronize(void) { VK_CHECK_RAW(vkDeviceWaitIdle(g_vk.device)); return 1; }
 
@@ -925,199 +925,72 @@ int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_g
  * =========================================================================
  * Dispatches the GLSL matmul_q8_0 shader. Caches Q8_0 weight spans in
  * VkBuffer at first use. Uses thread-local descriptor set for efficiency.
- * ========================================================================= */
+ /* ---- Q8_0 matmul (CPU fallback) ---- */
 
-int ds4_gpu_matmul_q8_0_tensor(
+ static float f16_to_f32(uint16_t raw) {
+     uint32_t sign = (raw >> 15) & 1;
+     uint32_t exp  = (raw >> 10) & 0x1F;
+     uint32_t mant = raw & 0x3FF;
+     if (exp == 0) {
+         if (mant == 0) return 0.0f;
+         while ((mant & 0x400) == 0) { mant <<= 1; exp--; }
+         exp = 1 - exp + 112;
+         mant = (mant & 0x3FF) << 13;
+     } else if (exp == 31) {
+         exp = 255; mant <<= 13;
+     } else {
+         exp += 112; mant <<= 13;
+     }
+     uint32_t bits = (sign << 31) | (exp << 23) | mant;
+     float f; memcpy(&f, &bits, 4); return f;
+ }
+
+ int ds4_gpu_matmul_q8_0_tensor(
     ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
     uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
     const ds4_gpu_tensor *x, uint64_t n_tok)
 {
+    /* CPU fallback: model weights are read from the mmap, compute on host.
+     * GPU dispatch disabled due to RADV driver instability on Strix Halo. */
     (void)model_map; (void)model_size;
     if (!out || !x) return 0;
     uint64_t n_blocks = (in_dim + 31) / 32;
-
-    /* Get shader */
-    /* Skip dispatch for very large out_dim (e.g. output head, n_vocab=129280) */
-    if (out_dim > 100000) return 1;
-    auto si = g_vk.shader_map.find("matmul_q8_0");
-    if (si == g_vk.shader_map.end()) return 0;
-    auto &sh = g_vk.shaders[si->second];
-    auto &c = get_cmd_ctx();
-    vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sh.pipeline);
-
-    /* Find tensor buffers */
-    auto find_buf = [](const void *ptr, VkBuffer &buf, VkDeviceSize &off) -> bool {
-        auto it = g_vk.tensor_headers.find(const_cast<void*>(ptr));
-        if (it != g_vk.tensor_headers.end()) { buf = it->second->buffer; off = 0; return true; }
-        for (auto &[base, h] : g_vk.tensor_headers)
-            if (ptr >= base && (const char*)ptr < (const char*)base + (int64_t)h->bytes) {
-                buf = h->buffer; off = (const char*)ptr - (const char*)base; return true; }
-        return false;
-    };
-    VkBuffer xbuf, obuf; VkDeviceSize xoff, ooff;
-    if (!find_buf(x->ptr, xbuf, xoff) || !find_buf(out->ptr, obuf, ooff)) return 0;
-
-    /* Find weight buffer in cache - search by offset range, not exact match */
-    auto wit = g_vk.weight_cache.end();
-    for (auto it = g_vk.weight_cache.begin(); it != g_vk.weight_cache.end(); ++it) {
-        if (weight_offset >= it->first && weight_offset < it->first + it->second.size) {
-            wit = it; break;
+    const float *xp = (const float*)x->ptr;
+    float *op = (float*)out->ptr;
+    const char *base = (const char*)model_map + weight_offset;
+    for (uint64_t o = 0; o < out_dim; o++) {
+        double sum = 0.0;
+        for (uint64_t b = 0; b < n_blocks; b++) {
+            uint64_t blk = (o * n_blocks + b) * 34u;
+            uint16_t d_raw; memcpy(&d_raw, base + blk, 2);
+            float d = f16_to_f32(d_raw);
+            const int8_t *qs = (const int8_t*)(base + blk + 2);
+            for (uint32_t j = 0; j < 32; j++)
+                sum += (double)xp[b * 32u + j] * (double)d * (double)qs[j];
         }
+        op[o] = (float)sum;
     }
-    if (wit == g_vk.weight_cache.end()) return 0;
-    VkBuffer wbuf = wit->second.buffer;
-    uint64_t wbuf_off = weight_offset - wit->first;
-
-    /* Per-dispatch descriptor set (fresh each call) */
-    VkDescriptorSetAllocateInfo dai{};
-    dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dai.descriptorPool = g_vk.desc_pool; dai.descriptorSetCount = 1;
-    dai.pSetLayouts = &sh.desc_layout;
-    VkDescriptorSet ds;
-    if (vkAllocateDescriptorSets(g_vk.device, &dai, &ds) != VK_SUCCESS) return 0;
-
-    VkDeviceSize x_size = std::min<VkDeviceSize>(xbuf == obuf ? (ooff - xoff) : VK_WHOLE_SIZE, in_dim * n_tok * sizeof(float));
-    VkDeviceSize w_size = std::min<VkDeviceSize>(
-        wit->second.size - (wbuf_off > wit->second.size ? 0 : wbuf_off),
-        (uint64_t)out_dim * n_blocks * 36u);
-    VkDeviceSize o_size = out_dim * n_tok * sizeof(float);
-    VkDescriptorBufferInfo bufs[3] = {
-        {xbuf, xoff, x_size},
-        {wbuf, wbuf_off, w_size},
-        {obuf, ooff, o_size},
-    };
-    VkWriteDescriptorSet w[3];
-    for (int i = 0; i < 3; i++) {
-        w[i] = {}; w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[i].dstSet = ds; w[i].dstBinding = i; w[i].descriptorCount = 1;
-        w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bufs[i];
-    }
-    vkUpdateDescriptorSets(g_vk.device, 3, w, 0, nullptr);
-    vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sh.layout, 0, 1, &ds, 0, nullptr);
-
-    if (n_tok == 1) {
-        /* For decode: 1 token, use 2D grid like prefill */
-        const uint32_t y_scale = std::min((uint32_t)out_dim, 65534u);
-        const uint32_t y_cnt = ((uint32_t)out_dim + y_scale - 1) / y_scale;
-        struct { uint32_t in_dim, out_dim, n_tok, blocks, y_scale; } pc = {
-            (uint32_t)in_dim, (uint32_t)out_dim, 1u, (uint32_t)n_blocks, y_scale
-        };
-        vkCmdPushConstants(c.cmd, sh.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(c.cmd, y_scale, y_cnt, 1);
-    } else {
-        /* Prefill: 2D grid with n_tok in Z */
-        const uint32_t y_scale = std::min((uint32_t)out_dim, 65534u);
-        const uint32_t y_cnt = ((uint32_t)out_dim + y_scale - 1) / y_scale;
-        struct { uint32_t in_dim, out_dim, n_tok, blocks, y_scale; } pc = {
-            (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)n_blocks, y_scale
-        };
-        vkCmdPushConstants(c.cmd, sh.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(c.cmd, y_scale, y_cnt, (uint32_t)n_tok);
-    }
-    c.command_count++;
-
-    /* Memory barrier: visibility for subsequent dispatches */
-    VkMemoryBarrier mb{};
-    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(c.cmd,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 1, &mb, 0, nullptr, 0, nullptr);
-
     return 1;
 }
 
+    /* Find tensor buffers */
 /* ---- matmul_f16_tensor dispatch ---- */
 int ds4_gpu_matmul_f16_tensor(
     ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
     uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
     const ds4_gpu_tensor *x, uint64_t n_tok)
 {
-    (void)model_map; (void)model_size;
-    if (!out || !x) return 0;
-
-    auto si = g_vk.shader_map.find("matmul_f16");
-    if (si == g_vk.shader_map.end()) return 0;
-    auto &sh = g_vk.shaders[si->second];
-    auto &c = get_cmd_ctx();
-    vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sh.pipeline);
-
-    auto find_buf = [](const void *ptr, VkBuffer &buf, VkDeviceSize &off) -> bool {
-        auto it = g_vk.tensor_headers.find(const_cast<void*>(ptr));
-        if (it != g_vk.tensor_headers.end()) { buf = it->second->buffer; off = 0; return true; }
-        for (auto &[base, h] : g_vk.tensor_headers)
-            if (ptr >= base && (const char*)ptr < (const char*)base + (int64_t)h->bytes) {
-                buf = h->buffer; off = (const char*)ptr - (const char*)base; return true; }
-        return false;
-    };
-    VkBuffer xbuf, obuf; VkDeviceSize xoff, ooff;
-    if (!find_buf(x->ptr, xbuf, xoff) || !find_buf(out->ptr, obuf, ooff)) return 0;
-    /* Find weight buffer - search by offset range */
-    auto wit = g_vk.weight_cache.end();
-    for (auto it = g_vk.weight_cache.begin(); it != g_vk.weight_cache.end(); ++it) {
-        if (weight_offset >= it->first && weight_offset < it->first + it->second.size) {
-            wit = it; break;
-        }
+    (void)model_size;
+    if (!out || !x || !model_map) return 0;
+    const float *xp = (const float*)x->ptr;
+    float *op = (float*)out->ptr;
+    const uint16_t *w = (const uint16_t*)((const char*)model_map + weight_offset);
+    for (uint64_t o = 0; o < out_dim; o++) {
+        double sum = 0.0;
+        for (uint64_t i = 0; i < in_dim; i++)
+            sum += (double)xp[i] * (double)f16_to_f32(w[o * in_dim + i]);
+        op[o] = (float)sum;
     }
-    if (wit == g_vk.weight_cache.end()) return 0;
-    VkBuffer wbuf = wit->second.buffer;
-    uint64_t wbuf_off = weight_offset - wit->first;
-    const bool is_decode = (n_tok == 1);
-    /* Per-dispatch descriptor set (fresh each call) */
-    VkDescriptorSet &ds = c.ds_f16;
-    if (ds == VK_NULL_HANDLE) {
-        VkDescriptorSetAllocateInfo dai{};
-        dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        dai.descriptorPool = g_vk.desc_pool; dai.descriptorSetCount = 1;
-        dai.pSetLayouts = &sh.desc_layout;
-        if (vkAllocateDescriptorSets(g_vk.device, &dai, &ds) != VK_SUCCESS) return 0;
-    }
-    VkDeviceSize x_size = std::min<VkDeviceSize>(xbuf == obuf ? (ooff - xoff) : VK_WHOLE_SIZE, in_dim * n_tok * sizeof(float));
-    VkDeviceSize w_size = std::min<VkDeviceSize>(
-        wit->second.size - (wbuf_off > wit->second.size ? 0 : wbuf_off),
-        (uint64_t)out_dim * in_dim * sizeof(float));  /* f16 = 2 bytes per element but buffer holds floats */
-    VkDeviceSize o_size = out_dim * n_tok * sizeof(float);
-    VkDescriptorBufferInfo bufs[3] = {
-        {xbuf, xoff, x_size}, {wbuf, wbuf_off, w_size}, {obuf, ooff, o_size},
-    };
-    VkWriteDescriptorSet w[3];
-    for (int i = 0; i < 3; i++) {
-        w[i] = {}; w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[i].dstSet = ds; w[i].dstBinding = i; w[i].descriptorCount = 1;
-        w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bufs[i];
-    }
-    vkUpdateDescriptorSets(g_vk.device, 3, w, 0, nullptr);
-    vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sh.layout, 0, 1, &ds, 0, nullptr);
-
-    struct { uint32_t in_dim, out_dim, n_tok; } pc = {
-        (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok
-    };
-    vkCmdPushConstants(c.cmd, sh.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    if ((uint32_t)out_dim <= 65534) {
-        vkCmdDispatch(c.cmd, (uint32_t)out_dim, (uint32_t)n_tok, 1);
-    } else {
-        const uint32_t max_wg = 65534;
-        uint32_t dispatched = 0;
-        while (dispatched < (uint32_t)out_dim) {
-            uint32_t chunk = std::min((uint32_t)out_dim - dispatched, max_wg);
-            vkCmdDispatch(c.cmd, chunk, (uint32_t)n_tok, 1);
-            dispatched += chunk;
-        }
-    }
-    c.command_count++;
-
-    /* Memory barrier: visibility for subsequent dispatches */
-    VkMemoryBarrier mb{};
-    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(c.cmd,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 1, &mb, 0, nullptr, 0, nullptr);
-
     return 1;
 }
 
