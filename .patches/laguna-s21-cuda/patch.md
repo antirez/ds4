@@ -45,6 +45,8 @@ cannot run end-to-end on NVIDIA GPUs through ds4's CUDA backend.
 - Redesigning Laguna S 2.1 architecture or its GGUF layout.
 - Introducing a generic model runtime or C++.
 - Optimizing unrelated model backends.
+- Adding DFlash or another speculative decoder before raw Laguna prefill and
+  decode performance are competitive.
 
 # Assumptions
 
@@ -105,6 +107,10 @@ projections. Decode and multi-token prefill both require coverage.
 - Reuse CUDA's Q8_K activation quantization for Laguna MoE gate/up and down
   dot products. Routed weights are fused into the intermediate values; each
   output row then reduces selected experts in slot order.
+- Optimize the raw Laguna path first. Reuse the generic CUDA Q4_K
+  expert-sorting and tensor-core kernels where its tensor semantics match;
+  extend them for Laguna's top-10 routing and Q6_K down projections instead
+  of masking direct-path performance with speculative decoding.
 
 # Provenance
 
