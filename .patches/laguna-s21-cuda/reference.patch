@@ -1513,6 +1513,16 @@ index e66fa36..b51e740 100644
 +    return cuda_ok(cudaGetLastError(), "Laguna commit KV launch");
  }
  #pragma GCC diagnostic pop
+diff --git a/speed-bench/laguna_s21_gb10.csv b/speed-bench/laguna_s21_gb10.csv
+new file mode 100644
+index 0000000..b928e8f
+--- /dev/null
++++ b/speed-bench/laguna_s21_gb10.csv
+@@ -0,0 +1,4 @@
++ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes
++2048,2048,48.05,256,9.06,121.979,255,9.08,176570420
++4096,2048,42.57,256,7.29,135.451,255,7.30,277241908
++8192,4096,36.79,256,5.23,193.969,255,5.24,0
 diff --git a/tests/cuda_laguna_smoke.c b/tests/cuda_laguna_smoke.c
 new file mode 100644
 index 0000000..65e3bf9

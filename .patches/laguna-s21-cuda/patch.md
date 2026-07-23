@@ -68,9 +68,9 @@ None.
 - Run focused CUDA unit/regression tests that do not require the full model.
 - With a Laguna S 2.1 GGUF, run a deterministic prompt or logits comparison
   against a trusted backend and exercise decode plus multi-token prefill.
-  This is an allowed validation exception for this realization: the model is
-  absent and the filesystem has only 65 GiB free, less than the approximately
-  75 GB download.
+- Report sustained performance with at least 2K, 4K, and 8K prompt contexts
+  and 256 generated tokens per point. Short smoke/profile runs are diagnostic
+  evidence only, not representative throughput claims.
 - Inspect model dispatch and compile/test existing CUDA paths to guard against
   regressions.
 
@@ -132,6 +132,28 @@ Verification evidence:
   matmuls, Q4_K embedding, YaRN and SWA-compatible head RMSNorm/RoPE, gated
   GQA prefill/decode including ring wraparound, and decode/batch Q6_K-down
   routed/shared MoE.
+- The pinned 75,173,103,200-byte Poolside GGUF contains 239 Q4_K, 48 Q6_K,
+  240 F16, and 287 F32 tensors. It loads successfully and runs end-to-end on
+  the GB10 CUDA backend.
+- Short diagnostic runs measure 48.32 tok/s prefill and 14.02 tok/s
+  generation for a 128-token prompt with four generated tokens. At 2,048
+  prompt tokens and 64 generated tokens they measure 48.00 tok/s prefill,
+  9.14 tok/s generation, and 9.19 tok/s steady-state generation. These are
+  smoke/profile measurements rather than representative throughput claims.
+- A sustained single-process benchmark with 256 generated tokens per point
+  measures 48.05/9.06 tok/s prefill/generation at 2K context,
+  42.57/7.29 at 4K, and 36.79/5.23 at 8K. The 4K and 8K prefill rows measure
+  incremental suffixes of 2K and 4K tokens respectively. Results are stored
+  in `speed-bench/laguna_s21_gb10.csv`.
+- Nsight Systems attributes 89.7% of 512-token prefill GPU time to the routed
+  expert kernels: 60.7% to Q4_K gate/up and 29.0% to Q4_K/Q6_K down.
+  The direct causal attention kernel accounts for another 9.2%; cuBLAS
+  projections, dequantization, norms, and copies together account for less
+  than 1%. A separate decode diagnostic similarly attributes 75.8% of total
+  GPU time to routed expert gate/up/down, with F16 signal-path GEMV next.
+- `sh -n download_model.sh` passes. The Laguna download target accepts the
+  pinned model's exact byte size and rejects an existing file with a different
+  size before invoking the Hugging Face client.
 - The broader `make test -j2` run completed its long-context, tensor
   equivalence, local-golden, server, and other checks, but returned six
   model-dependent tool-call/golden/kernel failures on this host. None arose
