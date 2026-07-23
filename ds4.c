@@ -49252,7 +49252,7 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
     }
 
     fprintf(stderr,
-            "ds4: Laguna Metal graph: ctx=%u, prefill=%u, KV %.2f GiB, scratch %.2f MiB\n",
+            "ds4: Laguna GPU graph: ctx=%u, prefill=%u, KV %.2f GiB, scratch %.2f MiB\n",
             ctx_size,
             g->prefill_cap,
             (double)g->kv_bytes / 1073741824.0,
@@ -49260,7 +49260,7 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
     return true;
 
 fail:
-    fprintf(stderr, "ds4: failed to allocate Laguna Metal graph\n");
+    fprintf(stderr, "ds4: failed to allocate Laguna GPU graph\n");
     laguna_graph_free(g);
     return false;
 }
@@ -50157,7 +50157,7 @@ static bool laguna_graph_forward_batch(
     return ok;
 }
 
-static int generate_laguna_metal_argmax(
+static int generate_laguna_gpu_argmax(
         const ds4_model   *model,
         const ds4_vocab   *vocab,
         const ds4_weights *weights,
@@ -50297,17 +50297,17 @@ static int generate_metal_graph_raw_swa(
                                          progress_ud);
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
-        return generate_laguna_metal_argmax(model,
-                                            vocab,
-                                            weights,
-                                            prompt,
-                                            n_predict,
-                                            ctx_size,
-                                            emit,
-                                            done,
-                                            emit_ud,
-                                            progress,
-                                            progress_ud);
+        return generate_laguna_gpu_argmax(model,
+                                          vocab,
+                                          weights,
+                                          prompt,
+                                          n_predict,
+                                          ctx_size,
+                                          emit,
+                                          done,
+                                          emit_ud,
+                                          progress,
+                                          progress_ud);
     }
 
     const uint32_t prefill_cap =
@@ -59524,9 +59524,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = e;
             return 0;
         }
-        if (e->backend != DS4_BACKEND_METAL) {
+        if (e->backend != DS4_BACKEND_METAL &&
+            e->backend != DS4_BACKEND_CUDA) {
             fprintf(stderr,
-                    "ds4: Laguna S 2.1 inference currently requires --metal\n");
+                    "ds4: Laguna S 2.1 inference currently requires --metal or --cuda\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -59556,7 +59557,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             (opt->mtp_path && opt->mtp_path[0]) ||
             opt->dspark || opt->glm_mtp || opt->first_token_test) {
             fprintf(stderr,
-                    "ds4: Laguna S 2.1 currently supports the standard Metal "
+                    "ds4: Laguna S 2.1 currently supports the standard GPU "
                     "generation path only (no steering, power cap, custom "
                     "prefill chunk, MTP/DSpark, or first-token diagnostic)\n");
             ds4_engine_close(e);
@@ -63885,7 +63886,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         }
         if ((uint32_t)s->checkpoint.len >= s->laguna_graph.ctx_size) {
             if (errlen) snprintf(err, errlen,
-                                 "Laguna Metal context reached (%u)",
+                                 "Laguna GPU context reached (%u)",
                                  s->laguna_graph.ctx_size);
             return 1;
         }

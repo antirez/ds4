@@ -37,3 +37,4 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+.patchmd/
