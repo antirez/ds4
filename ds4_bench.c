@@ -593,6 +593,7 @@ int main(int argc, char **argv) {
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
         .expert_profile_path = cfg.expert_profile_path,
+        .placement_ctx_hint = placement_ctx_hint,
         .distributed = cfg.dist,
     };
     char dist_err[256];

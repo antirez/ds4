@@ -3114,6 +3114,25 @@ extern "C" int ds4_gpu_pack_slot_rows_f32_tensor(
 
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
+struct ds4_gpu_command_ticket { int unused; };
+extern "C" int ds4_gpu_commit_commands_async(
+        ds4_gpu_command_ticket **ticket, int begin_next) {
+    (void)begin_next;
+    if (ticket) *ticket = NULL;
+    return 0; /* Metal-only scheduling path; callers gate it on __APPLE__. */
+}
+extern "C" int ds4_gpu_wait_command_ticket(
+        ds4_gpu_command_ticket *ticket, const char *label) {
+    (void)ticket; (void)label; return 0;
+}
+extern "C" int ds4_gpu_publish_command_ticket_completion(
+        ds4_gpu_command_ticket *ticket) {
+    (void)ticket; return 0;
+}
+extern "C" void ds4_gpu_command_ticket_free(
+        ds4_gpu_command_ticket *ticket) {
+    (void)ticket;
+}
 extern "C" int ds4_gpu_end_commands(void) {
     if (g_cuda_end_stream_sync) {
         return cuda_ok(cudaStreamSynchronize(0), "end commands stream");

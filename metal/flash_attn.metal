@@ -1414,11 +1414,15 @@ kernel void kernel_flash_attn_ext_vec_reduce(
 
     device const float  * ss    = (device const float  *) htmp + (uint64_t)args.nrows*DV*NWG;
 
-    float S = ss[rid*(2*NWG) + 2*iwg + 0];
-    float M = ss[rid*(2*NWG) + 2*iwg + 1];
+    /* A SIMD group always has 32 lanes even when adaptive split-K specializes
+     * NWG below 32.  Lanes outside NWG must contribute the same neutral values
+     * as the empty workgroups in the historical fixed-NWG launch, without
+     * reading the next row's partial state. */
+    float S = iwg < NWG ? ss[rid*(2*NWG) + 2*iwg + 0] : 0.0f;
+    float M = iwg < NWG ? ss[rid*(2*NWG) + 2*iwg + 1] : -FLT_MAX/2;
 
     const float m  = simd_max(M);
-    const float ms = exp(M - m);
+    const float ms = iwg < NWG ? exp(M - m) : 0.0f;
 
     S = simd_sum(S*ms);
     S = S == 0.0f ? 0.0f : 1.0f/S;
@@ -1429,7 +1433,9 @@ kernel void kernel_flash_attn_ext_vec_reduce(
     device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
 
     for (short i = sgitg; i < DV4; i += NWG) {
-        const float4 v = simd_sum(htmp4[i*NWG + iwg]*ms);
+        const float4 v = simd_sum(iwg < NWG
+                                  ? htmp4[i*NWG + iwg]*ms
+                                  : (float4) 0.0f);
 
         if (iwg == 0) {
             dst4[i] = v*S;

@@ -32,6 +32,8 @@
 #define FNV1A64_OFFSET 0xcbf29ce484222325ull
 #define FNV1A64_PRIME 0x100000001b3ull
 #define SWIFT_V1_PRIME 0x10000000001b3ull
+#define DSEI_MAGIC 0x49455344u
+#define GIB (1024ull * 1024ull * 1024ull)
 
 static int g_failures;
 
@@ -120,6 +122,33 @@ static int pread_full(int fd, void *dst, uint64_t bytes, uint64_t offset) {
     return 1;
 }
 
+static uint64_t identity_offset(void) {
+    const uint64_t hb = 56ull + 8ull * LAYER_COUNT;
+    return (hb + 7ull) & ~7ull;
+}
+
+static int clear_identity_extension(const char *bundle_path) {
+    const uint64_t off = identity_offset();
+    uint8_t zeros[ALIGN];
+    memset(zeros, 0, sizeof(zeros));
+    const int fd = open(bundle_path, O_WRONLY);
+    if (fd < 0) return 0;
+    const ssize_t n = pwrite(fd, zeros, (size_t)(ALIGN - off), (off_t)off);
+    return close(fd) == 0 && n == (ssize_t)(ALIGN - off);
+}
+
+static int has_identity_extension(const char *bundle_path) {
+    uint8_t magic[4];
+    const int fd = open(bundle_path, O_RDONLY);
+    if (fd < 0) return 0;
+    const int ok = pread_full(fd, magic, sizeof(magic), identity_offset());
+    close(fd);
+    return ok && magic[0] == (uint8_t)DSEI_MAGIC &&
+           magic[1] == (uint8_t)(DSEI_MAGIC >> 8) &&
+           magic[2] == (uint8_t)(DSEI_MAGIC >> 16) &&
+           magic[3] == (uint8_t)(DSEI_MAGIC >> 24);
+}
+
 static uint32_t get_u32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -176,13 +205,19 @@ static int rewrite_bundle_hashes(const char             *bundle_path,
     return close(fd) == 0;
 }
 
-static int open_bundle(ds4_expert_bundle *b, const char *model_path,
-                       int model_fd, const model_layout *m) {
+static int open_bundle_with_io(ds4_expert_bundle *b, const char *model_path,
+                               int model_fd, const model_layout *m,
+                               bool use_direct_io) {
     return ds4_expert_bundle_open_or_build(b, model_path, model_fd,
                                            m->model_size,
                                            LAYER_LO, LAYER_COUNT, N_EXPERT,
                                            GATE_BYTES, UP_BYTES, DOWN_BYTES,
-                                           m->layers);
+                                           m->layers, use_direct_io);
+}
+
+static int open_bundle(ds4_expert_bundle *b, const char *model_path,
+                       int model_fd, const model_layout *m) {
+    return open_bundle_with_io(b, model_path, model_fd, m, true);
 }
 
 static void check_records(const ds4_expert_bundle *b, const uint8_t *expect_or_null,
@@ -221,7 +256,146 @@ next_record:;
     free(rec);
 }
 
+static void check_record_byte(const ds4_expert_bundle *b,
+                              uint32_t layer, uint32_t kind,
+                              uint32_t expert, uint64_t index,
+                              uint8_t want) {
+    const uint64_t kind_off = kind == KIND_DOWN ? GATE_BYTES + UP_BYTES :
+                              kind == KIND_UP ? GATE_BYTES : 0;
+    const uint64_t off = ds4_expert_bundle_record_offset(
+                             b, LAYER_LO + layer, expert) +
+                         kind_off + index;
+    uint8_t got = 0;
+    CHECK(pread_full(b->fd, &got, 1, off) && got == want,
+          "rebuilt record contains same-size model mutation");
+}
+
+static void check_io_policy(void) {
+    static const struct {
+        uint64_t host_gib;
+        uint64_t reserve_gib;
+        uint64_t budget_gib;
+    } memory_tiers[] = {
+        {  32,  8,  24 },
+        {  48,  8,  40 },
+        {  64,  8,  56 },
+        {  96, 12,  84 },
+        { 128, 16, 112 },
+        { 256, 32, 224 },
+        { 512, 64, 448 },
+    };
+
+    ds4_ssd_io_plan p =
+        ds4_ssd_io_plan_compute(16ull * GIB, 0, 8ull * GIB);
+    CHECK(p.inputs_valid, "16 GiB page-cache plan is valid");
+    CHECK(p.reserve_bytes == 8ull * GIB, "16 GiB reserves 8 GiB");
+    CHECK(p.budget_bytes == 8ull * GIB, "16 GiB host budget is 8 GiB");
+    CHECK(p.hot_bytes == 8ull * GIB, "16 GiB plan records hot bytes");
+    CHECK(!p.use_direct_io, "hot set equal to budget uses page cache");
+
+    p = ds4_ssd_io_plan_compute(16ull * GIB, 0, 8ull * GIB + 1ull);
+    CHECK(p.inputs_valid && p.use_direct_io,
+          "hot set one byte above 16 GiB budget uses direct I/O");
+
+    /*
+     * Keep every currently shipping/high-memory Apple Silicon tier covered.
+     * These checks intentionally omit the Metal recommendation so they
+     * isolate the physical-RAM reserve; the recommended-limit cap is tested
+     * separately below.
+     */
+    for (size_t i = 0;
+         i < sizeof(memory_tiers) / sizeof(memory_tiers[0]);
+         i++) {
+        const uint64_t host = memory_tiers[i].host_gib * GIB;
+        const uint64_t reserve = memory_tiers[i].reserve_gib * GIB;
+        const uint64_t budget = memory_tiers[i].budget_gib * GIB;
+
+        p = ds4_ssd_io_plan_compute(host, 0, budget);
+        CHECK(p.inputs_valid,
+              "memory-tier page-cache plan is valid");
+        CHECK(p.reserve_bytes == reserve,
+              "memory-tier host reserve scales correctly");
+        CHECK(p.budget_bytes == budget,
+              "memory-tier host budget scales correctly");
+        CHECK(!p.use_direct_io,
+              "memory-tier hot set equal to budget uses page cache");
+
+        p = ds4_ssd_io_plan_compute(host, 0, budget + 1ull);
+        CHECK(p.inputs_valid && p.use_direct_io,
+              "memory-tier hot set above budget uses direct I/O");
+    }
+
+    /*
+     * Representative recurring sets for the 80.76 GiB DeepSeek report.
+     * The 344-expert case is about 10.56 GiB and remains cacheable on 32/48
+     * GiB hosts. The 32 GiB expert-budget case is about 41.06 GiB: it does not
+     * fit the safe 32/48 GiB host budgets, while 64 GiB and larger hosts
+     * retain mmap/page-cache reuse. The real boundary may be lower when Metal
+     * reports a tighter recommended working-set limit.
+     */
+    p = ds4_ssd_io_plan_compute(32ull * GIB, 0, 11ull * GIB);
+    CHECK(p.inputs_valid && !p.use_direct_io,
+          "32 GiB compact DeepSeek hot set uses page cache");
+    p = ds4_ssd_io_plan_compute(48ull * GIB, 0, 11ull * GIB);
+    CHECK(p.inputs_valid && !p.use_direct_io,
+          "48 GiB compact DeepSeek hot set uses page cache");
+    p = ds4_ssd_io_plan_compute(32ull * GIB, 0, 42ull * GIB);
+    CHECK(p.inputs_valid && p.use_direct_io,
+          "32 GiB DeepSeek-sized hot set uses direct I/O");
+    p = ds4_ssd_io_plan_compute(48ull * GIB, 0, 42ull * GIB);
+    CHECK(p.inputs_valid && p.use_direct_io,
+          "48 GiB DeepSeek-sized hot set uses direct I/O");
+    static const uint64_t page_cache_tiers[] = {
+        64, 96, 128, 256, 512,
+    };
+    for (size_t i = 0;
+         i < sizeof(page_cache_tiers) / sizeof(page_cache_tiers[0]);
+         i++) {
+        p = ds4_ssd_io_plan_compute(page_cache_tiers[i] * GIB,
+                                    0,
+                                    42ull * GIB);
+        CHECK(p.inputs_valid && !p.use_direct_io,
+              "64+ GiB DeepSeek-sized hot set uses page cache");
+    }
+
+    p = ds4_ssd_io_plan_compute(64ull * GIB, 60ull * GIB, 54ull * GIB);
+    CHECK(p.inputs_valid, "64 GiB recommended-limit plan is valid");
+    CHECK(p.reserve_bytes == 8ull * GIB, "64 GiB reserves one eighth");
+    CHECK(p.budget_bytes == 54ull * GIB,
+          "64 GiB budget is capped at 90 percent recommended");
+    CHECK(!p.use_direct_io,
+          "64 GiB hot set equal to recommended budget uses page cache");
+
+    p = ds4_ssd_io_plan_compute(64ull * GIB, 60ull * GIB,
+                                54ull * GIB + 1ull);
+    CHECK(p.inputs_valid && p.use_direct_io,
+          "hot set above 64 GiB recommended budget uses direct I/O");
+
+    p = ds4_ssd_io_plan_compute(64ull * GIB, 0, 56ull * GIB);
+    CHECK(p.inputs_valid && p.budget_bytes == 56ull * GIB &&
+              !p.use_direct_io,
+          "missing recommended limit falls back to host-minus-reserve");
+
+    p = ds4_ssd_io_plan_compute(0, 0, 1ull * GIB);
+    CHECK(!p.inputs_valid && p.use_direct_io,
+          "unknown host RAM conservatively uses direct I/O");
+
+    p = ds4_ssd_io_plan_compute(16ull * GIB, 0, 0);
+    CHECK(!p.inputs_valid && p.use_direct_io,
+          "unknown hot working set conservatively uses direct I/O");
+
+    p = ds4_ssd_io_plan_compute(64ull * GIB, UINT64_MAX, 1ull * GIB);
+    CHECK(!p.inputs_valid && p.use_direct_io,
+          "overflow sentinel conservatively uses direct I/O");
+
+    p = ds4_ssd_io_plan_compute(UINT64_MAX, 0, 1ull * GIB);
+    CHECK(!p.inputs_valid && p.use_direct_io,
+          "overflowed host RAM conservatively uses direct I/O");
+}
+
 int main(void) {
+    check_io_policy();
+
     static const uint8_t hello[] = "hello";
     CHECK(fnv1a64(hello, sizeof(hello) - 1, FNV1A64_PRIME) ==
               0xa430d84680aabd0bull,
@@ -277,6 +451,11 @@ int main(void) {
     check_records(&b, NULL, 0, 0, 0);
     ds4_expert_bundle_close(&b);
     CHECK(b.fd == -1, "close resets fd");
+    CHECK(has_identity_extension(bundle_path), "new bundle carries DSEI");
+    CHECK(open_bundle_with_io(&b, model_path, model_fd, &m, false),
+          "page-cache bundle reopen");
+    check_records(&b, NULL, 0, 0, 0);
+    ds4_expert_bundle_close(&b);
 
     /* Mark the padding of the first record: a REUSED bundle keeps the mark,
      * a rebuilt one zeroes it. */
@@ -286,21 +465,25 @@ int main(void) {
     uint8_t mark = 0xAB;
     CHECK(wfd >= 0 && pwrite(wfd, &mark, 1, (off_t)mark_off) == 1, "mark");
     close(wfd);
-    CHECK(open_bundle(&b, model_path, model_fd, &m), "reopen");
+    CHECK(clear_identity_extension(bundle_path), "strip DSEI for legacy upgrade");
+    CHECK(open_bundle(&b, model_path, model_fd, &m), "upgrade legacy C v1");
     uint8_t got = 0;
     CHECK(pread_full(b.fd, &got, 1, mark_off) && got == 0xAB,
-          "existing bundle reused without rebuild");
+          "legacy C v1 reused without rebuild");
     ds4_expert_bundle_close(&b);
+    CHECK(has_identity_extension(bundle_path), "legacy C v1 upgraded with DSEI");
 
     /* A bundle written by the original Swift v1 code must be reused as-is:
      * the padding marker proves open_or_build did not replace the file. */
     CHECK(rewrite_bundle_hashes(bundle_path, model_fd, &m, HASH_SWIFT_V1),
           "write legacy Swift v1 fingerprints");
+    CHECK(clear_identity_extension(bundle_path), "strip DSEI from Swift v1 fixture");
     CHECK(open_bundle(&b, model_path, model_fd, &m),
           "open legacy Swift v1 bundle");
     CHECK(pread_full(b.fd, &got, 1, mark_off) && got == 0xAB,
           "legacy Swift v1 bundle reused without rebuild");
     ds4_expert_bundle_close(&b);
+    CHECK(has_identity_extension(bundle_path), "Swift v1 upgraded with DSEI");
 
     /* Compatibility is selected for the complete table, not independently
      * per layer. A hybrid header is corrupt and must be rebuilt. */
@@ -329,15 +512,129 @@ int main(void) {
     check_records(&b, &tampered, 1, 0, 123);
     ds4_expert_bundle_close(&b);
 
+    /* DSEI must catch same-size edits that the Swift v1 prefix hash cannot:
+     * a late gate byte plus independent up/down bytes. */
+    static const struct {
+        uint32_t layer, kind, expert;
+        uint64_t index;
+        uint8_t mask;
+    } late_tampers[] = {
+        { 0, KIND_GATE, 0, 5000, 0x11 },
+        { 0, KIND_UP,   2, 5000, 0x22 },
+        { 1, KIND_DOWN, 3, 6000, 0x44 },
+    };
+    for (size_t i = 0; i < sizeof(late_tampers) / sizeof(late_tampers[0]); i++) {
+        const uint32_t layer = late_tampers[i].layer;
+        const uint32_t kind = late_tampers[i].kind;
+        const uint32_t expert = late_tampers[i].expert;
+        const uint64_t index = late_tampers[i].index;
+        const uint64_t model_off = tensor_offset(&m, layer, kind) +
+                                   (uint64_t)expert * kind_bytes(kind) + index;
+        uint8_t changed = 0;
+        CHECK(pread_full(model_fd, &changed, 1, model_off),
+              "read byte before late same-size tamper");
+        changed ^= late_tampers[i].mask;
+        CHECK(pwrite(model_fd, &changed, 1, (off_t)model_off) == 1,
+              "write late same-size tamper");
+        wfd = open(bundle_path, O_WRONLY);
+        CHECK(wfd >= 0 && pwrite(wfd, &mark, 1, (off_t)mark_off) == 1,
+              "mark before late same-size tamper validation");
+        if (wfd >= 0) close(wfd);
+        CHECK(open_bundle(&b, model_path, model_fd, &m),
+              "rebuild after late same-size tamper");
+        CHECK(pread_full(b.fd, &got, 1, mark_off) && got == 0,
+              "late same-size tamper triggers rebuild");
+        check_record_byte(&b, layer, kind, expert, index, changed);
+        ds4_expert_bundle_close(&b);
+    }
+
     /* $DS4_BUNDLE_DIR: with no sibling present, the build must land there. */
     CHECK(unlink(bundle_path) == 0, "remove sibling bundle");
     setenv("DS4_BUNDLE_DIR", bundle_dir, 1);
     CHECK(open_bundle(&b, model_path, model_fd, &m), "build in DS4_BUNDLE_DIR");
     CHECK(strncmp(b.path, bundle_dir, strlen(bundle_dir)) == 0,
           "bundle path is under DS4_BUNDLE_DIR");
-    check_records(&b, &tampered, 1, 0, 123);
+    check_record_byte(&b, 1, KIND_GATE, 0, 123, tampered);
+    for (size_t i = 0; i < sizeof(late_tampers) / sizeof(late_tampers[0]); i++) {
+        const uint64_t model_off = tensor_offset(&m,
+                                                 late_tampers[i].layer,
+                                                 late_tampers[i].kind) +
+            (uint64_t)late_tampers[i].expert * kind_bytes(late_tampers[i].kind) +
+            late_tampers[i].index;
+        uint8_t expected = 0;
+        CHECK(pread_full(model_fd, &expected, 1, model_off),
+              "read final same-size mutation");
+        check_record_byte(&b,
+                          late_tampers[i].layer,
+                          late_tampers[i].kind,
+                          late_tampers[i].expert,
+                          late_tampers[i].index,
+                          expected);
+    }
     ds4_expert_bundle_close(&b);
     unsetenv("DS4_BUNDLE_DIR");
+
+    /* At 124 layers DSEI no longer fits in the original 4 KiB header page.
+     * The sidecar must remain a usable, record-compatible plain v1 file. */
+    enum { LARGE_LAYER_COUNT = 124 };
+    char large_model_path[192];
+    snprintf(large_model_path, sizeof(large_model_path),
+             "%s/large-layer-table.gguf", dir);
+    const int large_fd = open(large_model_path,
+                              O_RDWR | O_CREAT | O_TRUNC,
+                              0600);
+    uint8_t large_model[LARGE_LAYER_COUNT * 3];
+    ds4_expert_bundle_layer large_layers[LARGE_LAYER_COUNT];
+    for (uint32_t il = 0; il < LARGE_LAYER_COUNT; il++) {
+        large_layers[il].gate_offset = (uint64_t)il * 3;
+        large_layers[il].up_offset = (uint64_t)il * 3 + 1;
+        large_layers[il].down_offset = (uint64_t)il * 3 + 2;
+        large_model[il * 3] = (uint8_t)il;
+        large_model[il * 3 + 1] = (uint8_t)(il + 1);
+        large_model[il * 3 + 2] = (uint8_t)(il + 2);
+    }
+    CHECK(large_fd >= 0 &&
+          write(large_fd, large_model, sizeof(large_model)) ==
+              (ssize_t)sizeof(large_model),
+          "write 124-layer synthetic model");
+    ds4_expert_bundle large_bundle;
+    CHECK(ds4_expert_bundle_open_or_build(&large_bundle,
+                                          large_model_path,
+                                          large_fd,
+                                          sizeof(large_model),
+                                          0,
+                                          LARGE_LAYER_COUNT,
+                                          1,
+                                          1,
+                                          1,
+                                          1,
+                                          large_layers,
+                                          true),
+          "124-layer plain v1 bundle builds without DSEI");
+    uint8_t large_magic[4] = {0};
+    const uint64_t large_id_off =
+        (56ull + 8ull * LARGE_LAYER_COUNT + 7ull) & ~7ull;
+    CHECK(pread_full(large_bundle.fd, large_magic, sizeof(large_magic),
+                     large_id_off) &&
+              !(large_magic[0] == 'D' && large_magic[1] == 'S' &&
+                large_magic[2] == 'E' && large_magic[3] == 'I'),
+          "124-layer bundle leaves DSEI optional");
+    ds4_expert_bundle_close(&large_bundle);
+    CHECK(ds4_expert_bundle_open_or_build(&large_bundle,
+                                          large_model_path,
+                                          large_fd,
+                                          sizeof(large_model),
+                                          0,
+                                          LARGE_LAYER_COUNT,
+                                          1,
+                                          1,
+                                          1,
+                                          1,
+                                          large_layers,
+                                          true),
+          "124-layer plain v1 bundle reopens");
+    ds4_expert_bundle_close(&large_bundle);
+    if (large_fd >= 0) close(large_fd);
 
     close(model_fd);
     if (g_failures == 0) {

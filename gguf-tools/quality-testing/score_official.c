@@ -560,6 +560,8 @@ int main(int argc, char **argv) {
         .backend = DS4_BACKEND_CUDA,
 #endif
         .n_threads = 0,
+        .context_size = ctx_size,
+        .placement_ctx_hint = ctx_size,
         .ssd_streaming_cache_experts = ssd_streaming_cache_experts,
         .ssd_streaming_cache_bytes = ssd_streaming_cache_bytes,
         .ssd_streaming_preload_experts = ssd_streaming_preload_experts,

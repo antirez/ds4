@@ -4529,14 +4529,10 @@ static bool ds4_streaming_prefill_headroom_bytes(
     return true;
 }
 
-/*
- * Mixed-precision ("boosted") GGUFs upcast a few layers' routed experts to a
- * bigger quant (e.g. Q4_K among IQ2 layers). The streaming expert cache is a
- * single-size-class slab allocator sized from the FIRST routed layer, so those
- * layers can never be served from it: they must read expert weights through the
- * mapped-model views instead. A layer is "uniform" iff its per-expert bytes
- * match the slab class.
- */
+/* Mixed-precision ("boosted") GGUFs upcast some routed layers (for example,
+ * Q4_K among IQ2 layers).  The default cache has exact size classes for them;
+ * this predicate remains useful for the legacy single-class mode and the v1
+ * expert-bundle format, whose records are uniform. */
 static DS4_MAYBE_UNUSED bool weights_streaming_layer_experts_uniform(
         const ds4_weights *w,
         uint32_t           il) {
@@ -14863,7 +14859,10 @@ typedef struct {
 enum {
     DS4_DENSE_STREAM_MAX_AHEAD = 3,
     DS4_DENSE_STREAM_MAX_SLOTS = DS4_DENSE_STREAM_MAX_AHEAD + 1,
-    DS4_DENSE_STREAM_MAX_IO_DEPTH = 4,
+    /* The Swift streamer reaches the Apple NVMe ceiling with more than four
+     * independent ranges per layer.  Keep the depth bounded and configurable,
+     * but allow the C pread fan-out to use the same queue-depth regime. */
+    DS4_DENSE_STREAM_MAX_IO_DEPTH = 16,
 };
 
 typedef struct metal_graph_dense_stream metal_graph_dense_stream;
@@ -14872,6 +14871,7 @@ typedef struct {
     pthread_t thread;
     metal_graph_dense_stream *stream;
     uint8_t *dst;
+    ds4_gpu_command_ticket *reuse_ticket;
     uint32_t layer;
     uint32_t worker_index;
     uint32_t worker_count;
@@ -14881,10 +14881,23 @@ typedef struct {
 
 typedef struct {
     metal_graph_dense_stream_worker worker[DS4_DENSE_STREAM_MAX_IO_DEPTH];
+    ds4_gpu_command_ticket *reuse_ticket;
     uint32_t layer;
     uint32_t worker_count;
     bool pending;
 } metal_graph_dense_stream_job;
+
+typedef struct {
+    pthread_t thread;
+    int fd;
+    uint8_t *dst;
+    const metal_graph_dense_stream_range *ranges;
+    uint32_t range_count;
+    uint32_t worker_index;
+    uint32_t worker_count;
+    int error_code;
+    bool started;
+} metal_graph_lazy_indexer_worker;
 
 typedef struct {
     void *ptr;
@@ -14911,6 +14924,8 @@ struct metal_graph_dense_stream {
     bool active;
     bool resident_comp;
     bool lazy_idx;
+    bool lazy_idx_activated;
+    bool lazy_idx_failure_reported;
 };
 
 static void metal_graph_dense_stream_join_jobs_for_cleanup(
@@ -15200,6 +15215,9 @@ typedef struct {
     uint32_t prefill_selected_profile_max_unique;
     uint32_t streaming_preload_experts;
     bool ssd_streaming_cold;
+    /* Engine-selected default. Explicit DS4_DENSE_STREAM=0/1 and the legacy
+     * DS4_METAL_DISABLE_DENSE_STREAM rollback still take precedence. */
+    bool dense_stream_default_enabled;
     bool streaming_static_decode_map_current;
     metal_graph_dense_stream dense_stream;
     float *cpu_router_norm;
@@ -16842,6 +16860,10 @@ static bool metal_graph_alloc_raw_cap(
     memset(g, 0, sizeof(*g));
     g->dspark_exec_tier = saved_dspark_exec_tier;
     g->dense_stream.fd = -1;
+    /* Diagnostic graphs that do not come from an engine retain the
+     * conservative low-memory behavior. Engine-owned graphs overwrite this
+     * after allocation with the model-aware SSD I/O plan. */
+    g->dense_stream_default_enabled = true;
     g->owns_prefill_workspace = shared_prefill_workspace == NULL;
     g->cpu_router_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(g->cpu_router_norm[0]));
     g->active_tier = placement ? -1 : 0;
@@ -20185,6 +20207,18 @@ static bool metal_graph_use_iq2_selected_async_early_commit(
 #endif
 }
 
+static bool metal_graph_use_in_order_async_route(
+        const ds4_gpu_graph *g) {
+#if defined(__APPLE__)
+    const char *env = getenv("DS4_ASYNC_ROUTE");
+    return g && g->ssd_streaming &&
+           (!env || !env[0] || strcmp(env, "0") != 0);
+#else
+    (void)g;
+    return false;
+#endif
+}
+
 static bool metal_graph_use_pro_q4_expert_table_auto(const ds4_gpu_graph *g) {
     if (getenv("DS4_METAL_DISABLE_PRO_Q4_EXPERT_TABLE_AUTO") != NULL ||
         getenv("DS4_METAL_DISABLE_Q4_EXPERT_TABLE") != NULL) {
@@ -23497,14 +23531,27 @@ static bool metal_graph_encode_decode_layer_phase(
         return ok;
     }
     if (overlap_selected_shared) {
+        const bool in_order_async_route =
+            metal_graph_use_in_order_async_route(g);
         uint64_t selected_event = 0;
-        if (ok) ok = ds4_gpu_signal_selected_readback_ready(&selected_event) != 0;
+        ds4_gpu_command_ticket *route_ticket = NULL;
+        ds4_gpu_command_ticket *shared_ticket = NULL;
+        if (ok && in_order_async_route) {
+            /* Commit route/attention as its own command buffer.  The shared
+             * FFN is encoded immediately behind it on the same in-order queue;
+             * after that commit the CPU waits for this exact route ticket,
+             * avoiding the pre-M5 shared-event scheduling stall. */
+            ok = ds4_gpu_commit_commands_async(&route_ticket, 1) != 0;
+        } else if (ok) {
+            ok = ds4_gpu_signal_selected_readback_ready(&selected_event) != 0;
+        }
         metal_graph_selected_async_load async_load = {0};
         bool async_load_started = false;
         const bool async_early_commit =
+            !in_order_async_route &&
             async_selected_load &&
             metal_graph_use_iq2_selected_async_early_commit(g);
-        if (ok && async_selected_load) {
+        if (ok && !in_order_async_route && async_selected_load) {
             ok = metal_graph_selected_async_load_start(&async_load,
                                                        g,
                                                        model,
@@ -23559,7 +23606,44 @@ static bool metal_graph_encode_decode_layer_phase(
                                                        1);
         }
         DS4_METAL_PROFILE_DECODE_STAGE("shared_down");
-        if (async_load_started) {
+        if (ok && in_order_async_route) {
+            /* Put the independent shared FFN behind route before joining the
+             * latter.  While the CPU reads the selected IDs and fills cache
+             * misses, Metal executes shared FFN; routed FFN is then committed
+             * behind it without a CPU-side shared-FFN join. */
+            ok = ds4_gpu_commit_commands_async(&shared_ticket, 1) != 0;
+            if (ok) {
+                ok = ds4_gpu_wait_command_ticket(
+                         route_ticket,
+                         "decode route selection") != 0 &&
+                     ds4_gpu_publish_command_ticket_completion(
+                         route_ticket) != 0;
+            }
+            if (ok) {
+                int32_t selected_ids[DS4_MAX_EXPERT_USED];
+                ok = ds4_gpu_tensor_read(
+                         metal_graph_router_selected(g),
+                         0,
+                         selected_ids,
+                         (uint64_t)DS4_N_EXPERT_USED *
+                             sizeof(selected_ids[0])) != 0 &&
+                     ds4_gpu_routed_moe_set_selected_override(
+                         selected_ids,
+                         DS4_N_EXPERT_USED) != 0;
+                if (ok) {
+                    const ds4_gpu_stream_expert_table table =
+                        graph_stream_expert_table_make(model,
+                                                       layer,
+                                                       il,
+                                                       gate_expert_bytes,
+                                                       down_expert_bytes);
+                    ok = ds4_gpu_stream_expert_cache_begin_selected_load(
+                                 &table,
+                                 selected_ids,
+                                 DS4_N_EXPERT_USED) != 0;
+                }
+            }
+        } else if (async_load_started) {
             const bool flush_ok = ds4_gpu_flush_commands() != 0;
             bool finish_ok =
                 metal_graph_selected_async_load_finish(&async_load);
@@ -23587,7 +23671,7 @@ static bool metal_graph_encode_decode_layer_phase(
             ok = ds4_gpu_commit_and_wait_selected_readback(selected_event,
                                                            "selected-id shared-overlap") != 0;
         }
-        if (ok && !async_load_started) {
+        if (ok && !in_order_async_route && !async_load_started) {
             int32_t selected_ids[DS4_MAX_EXPERT_USED];
             ok = ds4_gpu_tensor_read(metal_graph_router_selected(g),
                                      0,
@@ -23608,6 +23692,8 @@ static bool metal_graph_encode_decode_layer_phase(
                             DS4_N_EXPERT_USED) != 0;
             }
         }
+        ds4_gpu_command_ticket_free(route_ticket);
+        ds4_gpu_command_ticket_free(shared_ticket);
         if (ok) ok = ds4_gpu_routed_moe_one_tensor(metal_graph_routed_out(g),
                                                      metal_graph_routed_gate(g),
                                                      metal_graph_routed_up(g),
@@ -29206,15 +29292,30 @@ static bool metal_graph_encode_layer_batch(
 
 static bool metal_graph_dense_stream_requested(const ds4_gpu_graph *g) {
 #if defined(__APPLE__)
-    const char *value = getenv("DS4_DENSE_STREAM");
     if (!g || !g->ssd_streaming ||
-        getenv("DS4_METAL_DISABLE_DENSE_STREAM") != NULL ||
-        (value && strcmp(value, "0") == 0)) {
+        getenv("DS4_METAL_DISABLE_DENSE_STREAM") != NULL) {
         return false;
     }
-    /* Opt-in for the first lossless tranche.  Keeping the explicit disable
-     * gates above makes a future default-on policy a one-line change. */
-    return value && strcmp(value, "1") == 0;
+    const char *value = getenv("DS4_DENSE_STREAM");
+    if (value && strcmp(value, "0") == 0) return false;
+    if (value && strcmp(value, "1") == 0) return true;
+    /* In auto mode the engine compares the recurring hot working set with
+     * physical/Metal budgets. Low-memory configurations use the byte-exact
+     * F_NOCACHE staging ring; configurations whose hot set fits retain mmap
+     * page-cache residency. */
+    return g->dense_stream_default_enabled;
+#else
+    (void)g;
+    return false;
+#endif
+}
+
+static bool metal_graph_dense_stream_async_ffn_enabled(
+        const ds4_gpu_graph *g) {
+#if defined(__APPLE__)
+    const char *value = getenv("DS4_ASYNC_FFN");
+    return g && g->dense_stream.active && !g->decode_stage_profile &&
+           (!value || !value[0] || strcmp(value, "0") != 0);
 #else
     (void)g;
     return false;
@@ -29239,6 +29340,16 @@ static void metal_graph_dense_stream_join_jobs_for_cleanup(
                 }
                 worker->started = false;
             }
+        }
+        if (job->reuse_ticket) {
+            if (ds4_gpu_wait_command_ticket(
+                    job->reuse_ticket,
+                    "dense staging cleanup") != 0) {
+                (void)ds4_gpu_publish_command_ticket_completion(
+                    job->reuse_ticket);
+            }
+            ds4_gpu_command_ticket_free(job->reuse_ticket);
+            job->reuse_ticket = NULL;
         }
         job->pending = false;
     }
@@ -29363,6 +29474,17 @@ static void *metal_graph_dense_stream_worker_main(void *opaque) {
         &stream->layer[worker->layer];
     worker->error_code = 0;
 
+    /* A ring slot may still be referenced by the asynchronously committed
+     * layer that previously occupied it.  All workers share the ticket; its
+     * internal condition variable makes exactly one thread perform the Metal
+     * wait before any pread can overwrite the slot. */
+    if (worker->reuse_ticket &&
+        ds4_gpu_wait_command_ticket(worker->reuse_ticket,
+                                    "dense staging slot reuse") == 0) {
+        worker->error_code = EIO;
+        return NULL;
+    }
+
     for (uint32_t i = worker->worker_index;
          i < plan->count;
          i += worker->worker_count) {
@@ -29398,7 +29520,8 @@ finished:
 
 static bool metal_graph_dense_stream_start_layer(
         metal_graph_dense_stream *stream,
-        uint32_t layer) {
+        uint32_t layer,
+        ds4_gpu_command_ticket *reuse_ticket) {
     if (!stream || !stream->active || layer >= DS4_N_LAYER ||
         stream->slot_count == 0) {
         return false;
@@ -29415,10 +29538,12 @@ static bool metal_graph_dense_stream_start_layer(
 
     memset(job, 0, sizeof(*job));
     job->layer = layer;
+    job->reuse_ticket = reuse_ticket;
     job->worker_count = plan->count < stream->io_depth ?
         plan->count : stream->io_depth;
     if (job->worker_count == 0 ||
         job->worker_count > DS4_DENSE_STREAM_MAX_IO_DEPTH) {
+        job->reuse_ticket = NULL;
         return false;
     }
     job->pending = true;
@@ -29426,6 +29551,7 @@ static bool metal_graph_dense_stream_start_layer(
         metal_graph_dense_stream_worker *worker = &job->worker[i];
         worker->stream = stream;
         worker->dst = dst;
+        worker->reuse_ticket = reuse_ticket;
         worker->layer = layer;
         worker->worker_index = i;
         worker->worker_count = job->worker_count;
@@ -29435,6 +29561,21 @@ static bool metal_graph_dense_stream_start_layer(
                                       worker);
         if (rc != 0) {
             worker->error_code = rc;
+            for (uint32_t j = 0; j < i; j++) {
+                metal_graph_dense_stream_worker *started = &job->worker[j];
+                if (started->started) {
+                    const int join_rc = pthread_join(started->thread, NULL);
+                    if (join_rc != 0) {
+                        fprintf(stderr,
+                                "ds4: dense stream rollback pthread_join failed: %s\n",
+                                strerror(join_rc));
+                        ds4_die("dense stream rollback pthread_join invariant failed");
+                    }
+                    started->started = false;
+                }
+            }
+            job->reuse_ticket = NULL;
+            job->pending = false;
             return false;
         }
         worker->started = true;
@@ -29445,8 +29586,10 @@ static bool metal_graph_dense_stream_start_layer(
 static bool metal_graph_dense_stream_join_layer(
         metal_graph_dense_stream *stream,
         uint32_t layer,
-        int *error_code) {
+        int *error_code,
+        bool *gpu_error) {
     if (error_code) *error_code = 0;
+    if (gpu_error) *gpu_error = false;
     if (!stream || stream->slot_count == 0) return false;
     const uint32_t slot = layer % stream->slot_count;
     metal_graph_dense_stream_job *job = &stream->job[slot];
@@ -29471,9 +29614,246 @@ static bool metal_graph_dense_stream_join_layer(
             first_error = worker->error_code;
         }
     }
+    if (job->reuse_ticket) {
+        const int wait_ok = ds4_gpu_wait_command_ticket(
+            job->reuse_ticket,
+            "dense staging slot reuse");
+        if (wait_ok) {
+            (void)ds4_gpu_publish_command_ticket_completion(
+                job->reuse_ticket);
+        } else {
+            if (gpu_error) *gpu_error = true;
+            if (first_error == 0) first_error = EIO;
+        }
+        ds4_gpu_command_ticket_free(job->reuse_ticket);
+        job->reuse_ticket = NULL;
+    }
     job->pending = false;
     if (error_code) *error_code = first_error;
     return first_error == 0;
+}
+
+static void *metal_graph_lazy_indexer_worker_main(void *opaque) {
+    metal_graph_lazy_indexer_worker *worker = opaque;
+    worker->error_code = 0;
+    for (uint32_t i = worker->worker_index;
+         i < worker->range_count;
+         i += worker->worker_count) {
+        const metal_graph_dense_stream_range *range = &worker->ranges[i];
+        uint64_t done = 0;
+        while (done < range->bytes) {
+            const uint64_t file_offset = range->model_offset + done;
+            if (file_offset > (uint64_t)INT64_MAX) {
+                worker->error_code = EOVERFLOW;
+                return NULL;
+            }
+            const uint64_t remaining = range->bytes - done;
+            const size_t want = remaining > (uint64_t)SSIZE_MAX ?
+                (size_t)SSIZE_MAX : (size_t)remaining;
+            ssize_t got;
+            do {
+                got = pread(worker->fd,
+                            worker->dst + range->staging_offset + done,
+                            want,
+                            (off_t)file_offset);
+            } while (got < 0 && errno == EINTR);
+            if (got <= 0) {
+                worker->error_code = got == 0 ? EIO : errno;
+                return NULL;
+            }
+            done += (uint64_t)got;
+        }
+    }
+    return NULL;
+}
+
+static bool metal_graph_dense_stream_lazy_indexer_due(
+        const ds4_gpu_graph *g) {
+    if (!g || !g->dense_stream.active || !g->dense_stream.lazy_idx ||
+        g->dense_stream.lazy_idx_activated) {
+        return false;
+    }
+    const uint32_t sparse_threshold =
+        metal_graph_decode_indexer_sparse_threshold(g);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (ds4_layer_compress_ratio(il) == 4u &&
+            g->layer_n_comp[il] >= sparse_threshold &&
+            g->layer_n_index_comp[il] >= DS4_N_INDEXER_TOP_K) {
+            /* Both counters can advance in the layer command below.  Activate
+             * on equality so the first token that changes the strict `>`
+             * scoring condition already sees resident projections. */
+            return true;
+        }
+    }
+    return false;
+}
+
+static void metal_graph_dense_stream_lazy_indexer_failure(
+        metal_graph_dense_stream *stream,
+        const char               *reason,
+        int                       error_code) {
+    if (!stream || stream->lazy_idx_failure_reported) return;
+    if (error_code != 0) {
+        fprintf(stderr,
+                "ds4: lazy indexer resident activation failed (%s: %s); "
+                "using byte-identical mmap weights and retrying next token\n",
+                reason,
+                strerror(error_code));
+    } else {
+        fprintf(stderr,
+                "ds4: lazy indexer resident activation failed (%s); "
+                "using byte-identical mmap weights and retrying next token\n",
+                reason);
+    }
+    stream->lazy_idx_failure_reported = true;
+}
+
+static void metal_graph_dense_stream_activate_lazy_indexer(
+        ds4_gpu_graph          *g,
+        const ds4_model        *model,
+        const ds4_weights      *weights) {
+    if (!metal_graph_dense_stream_lazy_indexer_due(g)) return;
+    metal_graph_dense_stream *stream = &g->dense_stream;
+    if (!model || !weights || !model->map || model->size == 0 ||
+        stream->fd < 0) {
+        metal_graph_dense_stream_lazy_indexer_failure(
+            stream, "model source unavailable", 0);
+        return;
+    }
+    if (ds4_gpu_model_resident_overrides_active(model->map, model->size)) {
+        stream->lazy_idx_activated = true;
+        return;
+    }
+
+    uint32_t range_count = 0;
+    uint64_t resident_bytes = 0;
+    const uint64_t alignment = 4096u;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (ds4_layer_compress_ratio(il) != 4u) continue;
+        const ds4_layer_weights *layer = &weights->layer[il];
+        const ds4_tensor *scoring[2] = {
+            layer->indexer_attn_q_b,
+            layer->indexer_proj,
+        };
+        for (uint32_t i = 0; i < 2; i++) {
+            const ds4_tensor *tensor = scoring[i];
+            if (!tensor || tensor->bytes == 0 ||
+                tensor->abs_offset > model->size ||
+                tensor->bytes > model->size - tensor->abs_offset ||
+                resident_bytes > UINT64_MAX - (alignment - 1u)) {
+                metal_graph_dense_stream_lazy_indexer_failure(
+                    stream, "invalid scorer tensor metadata", 0);
+                return;
+            }
+            resident_bytes = align_up(resident_bytes, alignment);
+            if (resident_bytes > UINT64_MAX - tensor->bytes) {
+                metal_graph_dense_stream_lazy_indexer_failure(
+                    stream, "resident size overflow", 0);
+                return;
+            }
+            resident_bytes += tensor->bytes;
+            range_count++;
+        }
+    }
+    if (range_count == 0 || resident_bytes == 0 ||
+        resident_bytes > (uint64_t)SIZE_MAX) {
+        metal_graph_dense_stream_lazy_indexer_failure(
+            stream, "empty or oversized scorer plan", 0);
+        return;
+    }
+
+    metal_graph_dense_stream_range *ranges =
+        calloc((size_t)range_count, sizeof(ranges[0]));
+    if (!ranges) {
+        metal_graph_dense_stream_lazy_indexer_failure(
+            stream, "range allocation", ENOMEM);
+        return;
+    }
+    uint32_t range_index = 0;
+    uint64_t cursor = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (ds4_layer_compress_ratio(il) != 4u) continue;
+        const ds4_layer_weights *layer = &weights->layer[il];
+        const ds4_tensor *scoring[2] = {
+            layer->indexer_attn_q_b,
+            layer->indexer_proj,
+        };
+        for (uint32_t i = 0; i < 2; i++) {
+            cursor = align_up(cursor, alignment);
+            ranges[range_index++] = (metal_graph_dense_stream_range) {
+                .model_offset = scoring[i]->abs_offset,
+                .bytes = scoring[i]->bytes,
+                .staging_offset = cursor,
+            };
+            cursor += scoring[i]->bytes;
+        }
+    }
+
+    ds4_gpu_tensor *resident = ds4_gpu_tensor_alloc(resident_bytes);
+    uint8_t *dst = resident ? ds4_gpu_tensor_contents(resident) : NULL;
+    if (!resident || !dst) {
+        ds4_gpu_tensor_free(resident);
+        free(ranges);
+        metal_graph_dense_stream_lazy_indexer_failure(
+            stream, "shared buffer allocation", ENOMEM);
+        return;
+    }
+
+    const uint32_t worker_count = range_count < stream->io_depth ?
+        range_count : stream->io_depth;
+    metal_graph_lazy_indexer_worker workers[DS4_DENSE_STREAM_MAX_IO_DEPTH];
+    memset(workers, 0, sizeof(workers));
+    int first_error = 0;
+    for (uint32_t i = 0; i < worker_count; i++) {
+        metal_graph_lazy_indexer_worker *worker = &workers[i];
+        worker->fd = stream->fd;
+        worker->dst = dst;
+        worker->ranges = ranges;
+        worker->range_count = range_count;
+        worker->worker_index = i;
+        worker->worker_count = worker_count;
+        const int rc = pthread_create(&worker->thread,
+                                      NULL,
+                                      metal_graph_lazy_indexer_worker_main,
+                                      worker);
+        if (rc != 0) {
+            first_error = rc;
+            break;
+        }
+        worker->started = true;
+    }
+    for (uint32_t i = 0; i < worker_count; i++) {
+        metal_graph_lazy_indexer_worker *worker = &workers[i];
+        if (!worker->started) continue;
+        const int rc = pthread_join(worker->thread, NULL);
+        if (rc != 0) {
+            fprintf(stderr,
+                    "ds4: lazy indexer pthread_join failed: %s\n",
+                    strerror(rc));
+            ds4_die("lazy indexer pthread_join invariant failed");
+        }
+        if (first_error == 0 && worker->error_code != 0) {
+            first_error = worker->error_code;
+        }
+    }
+
+    if (first_error == 0 &&
+        ds4_gpu_set_model_resident_overrides(model->map,
+                                             model->size,
+                                             ranges,
+                                             range_count,
+                                             resident)) {
+        stream->lazy_idx_activated = true;
+        stream->lazy_idx_failure_reported = false;
+    } else if (first_error != 0) {
+        metal_graph_dense_stream_lazy_indexer_failure(
+            stream, "pread", first_error);
+    } else {
+        metal_graph_dense_stream_lazy_indexer_failure(
+            stream, "Metal publication", 0);
+    }
+    ds4_gpu_tensor_free(resident);
+    free(ranges);
 }
 #endif
 
@@ -29504,35 +29884,19 @@ static bool metal_graph_dense_stream_init(
     const bool mlock_requested = mlock_env && strcmp(mlock_env, "1") == 0;
     /* Keeping the compressor mmap views resident is not a free win on a
      * memory-constrained Mac: even when mlock succeeds, the extra pressure
-     * can slow expert and dense reads.  Leave it as an explicit experiment;
-     * DS4_MLOCK by itself only pins the output head and staging ring. */
+     * can slow expert and dense reads. Leave it as an explicit experiment;
+     * DS4_MLOCK independently pins the output head, staging ring, and a
+     * bounded share of the expert-cache slabs. */
     stream->resident_comp = resident_comp_env && resident_comp_env[0] &&
                             strcmp(resident_comp_env, "0") != 0;
     const bool lazy_idx_requested =
         metal_graph_dense_stream_default_on("DS4_LAZY_IDX");
     stream->lazy_idx = lazy_idx_requested;
-    if (stream->lazy_idx) {
-        const uint32_t sparse_threshold =
-            metal_graph_decode_indexer_sparse_threshold(g);
-        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-            /* The current C path deliberately omits the scorer only when it
-             * cannot be reached at this configured context.  At longer
-             * contexts keep staging it until a load-once resident scorer is
-             * available; otherwise crossing the sparse boundary would turn
-             * the omitted weights back into evictable mmap traffic. */
-            if (ds4_layer_compress_ratio(il) == 4u &&
-                g->layer_comp_cap[il] > 2u &&
-                g->layer_comp_cap[il] - 2u > sparse_threshold) {
-                stream->lazy_idx = false;
-                break;
-            }
-        }
-    }
     stream->ahead = metal_graph_dense_stream_env_u32(
-        "DS4_DENSE_AHEAD", 1u, DS4_DENSE_STREAM_MAX_AHEAD);
+        "DS4_DENSE_AHEAD", 2u, DS4_DENSE_STREAM_MAX_AHEAD);
     stream->slot_count = stream->ahead + 1u;
     stream->io_depth = metal_graph_dense_stream_env_u32(
-        "DS4_DENSE_IO_DEPTH", 3u, DS4_DENSE_STREAM_MAX_IO_DEPTH);
+        "DS4_DENSE_IO_DEPTH", 8u, DS4_DENSE_STREAM_MAX_IO_DEPTH);
     stream->model_map = model ? model->map : NULL;
     stream->model_size = model ? model->size : 0;
     if (!model || !weights || model->fd < 0 || !model->map || model->size == 0) {
@@ -29664,7 +30028,7 @@ static bool metal_graph_dense_stream_prepare_token(ds4_gpu_graph *g) {
     const uint32_t initial = stream->slot_count < DS4_N_LAYER ?
         stream->slot_count : DS4_N_LAYER;
     for (uint32_t il = 0; il < initial; il++) {
-        if (!metal_graph_dense_stream_start_layer(stream, il)) {
+        if (!metal_graph_dense_stream_start_layer(stream, il, NULL)) {
             metal_graph_dense_stream_fallback(
                 g, "initial asynchronous prefetch launch failed");
             return true;
@@ -29698,9 +30062,19 @@ static bool metal_graph_dense_stream_publish_layer(
     }
 
     int error_code = 0;
+    bool gpu_error = false;
     if (!metal_graph_dense_stream_join_layer(stream,
                                              il,
-                                             &error_code)) {
+                                             &error_code,
+                                             &gpu_error)) {
+        if (gpu_error) {
+            metal_graph_dense_stream_fallback(
+                g, "Metal command ticket failed during staging-slot reuse");
+            /* A failed GPU command buffer is not a recoverable staging read
+             * miss.  Teardown drains the queue, but this token must fail so it
+             * cannot continue from partially updated graph state. */
+            return false;
+        }
         char reason[192];
         snprintf(reason,
                  sizeof(reason),
@@ -29727,26 +30101,39 @@ static bool metal_graph_dense_stream_publish_layer(
 
 static bool metal_graph_dense_stream_schedule_after_layer(
         ds4_gpu_graph *g,
-        uint32_t il) {
+        uint32_t il,
+        ds4_gpu_command_ticket *reuse_ticket) {
     metal_graph_dense_stream *stream = &g->dense_stream;
-    if (!stream->active) return true;
+    if (!stream->active) {
+        ds4_gpu_command_ticket_free(reuse_ticket);
+        return true;
+    }
 #if defined(__APPLE__)
-    /* The layer command buffer has completed before this function is called.
-     * Stop exposing the slot through model-range resolution before its pread
-     * worker reuses the memory for a future layer. */
+    /* Encoding has captured the current MTLBuffer bindings, so the registry
+     * can stop exposing this slot immediately.  In async mode the pread
+     * workers carry reuse_ticket and wait for the layer command buffer before
+     * overwriting any byte; the synchronous path passes NULL. */
     if (!ds4_gpu_clear_model_staging_overrides(stream->model_map)) {
+        ds4_gpu_command_ticket_free(reuse_ticket);
         metal_graph_dense_stream_fallback(
             g, "Metal staging override clear before ring reuse failed");
         return true;
     }
     const uint32_t next = il + stream->slot_count;
-    if (next < DS4_N_LAYER &&
-        !metal_graph_dense_stream_start_layer(stream, next)) {
-        metal_graph_dense_stream_fallback(
-            g, "asynchronous prefetch ring advance failed");
+    if (next < DS4_N_LAYER) {
+        if (!metal_graph_dense_stream_start_layer(stream,
+                                                  next,
+                                                  reuse_ticket)) {
+            ds4_gpu_command_ticket_free(reuse_ticket);
+            metal_graph_dense_stream_fallback(
+                g, "asynchronous prefetch ring advance failed");
+        }
+    } else {
+        ds4_gpu_command_ticket_free(reuse_ticket);
     }
 #else
     (void)il;
+    ds4_gpu_command_ticket_free(reuse_ticket);
 #endif
     return true;
 }
@@ -29786,6 +30173,13 @@ static bool metal_graph_eval_token_raw_swa_streaming(
 
     const bool dense_stream_active =
         metal_graph_dense_stream_init(g, model, weights);
+#if defined(__APPLE__)
+    if (dense_stream_active) {
+        metal_graph_dense_stream_activate_lazy_indexer(g, model, weights);
+    }
+#endif
+    const bool async_ffn =
+        metal_graph_dense_stream_async_ffn_enabled(g);
     const bool static_decode_map = metal_graph_stream_decode_static_map_enabled();
     const bool static_map_state_cache =
         static_decode_map && metal_graph_stream_decode_static_map_state_cache_enabled();
@@ -29894,10 +30288,22 @@ static bool metal_graph_eval_token_raw_swa_streaming(
             g->after_ffn_hc_by_tier[g->active_tier] = tmp;
             if (ok) ok = metal_graph_dspark_capture_decode_layer(g, il);
         }
-        if (ok) ok = ds4_gpu_end_commands() != 0;
-        if (ok && g->dense_stream.active) {
-            ok = metal_graph_dense_stream_schedule_after_layer(g, il);
+        ds4_gpu_command_ticket *layer_ticket = NULL;
+        if (ok && async_ffn) {
+            /* Leave the routed-FFN tail in flight.  The next layer is queued
+             * on the same in-order Metal queue, while the staging worker owns
+             * this ticket and cannot overwrite the slot before completion. */
+            ok = ds4_gpu_commit_commands_async(&layer_ticket, 0) != 0;
+        } else if (ok) {
+            ok = ds4_gpu_end_commands() != 0;
         }
+        if (ok && g->dense_stream.active) {
+            ok = metal_graph_dense_stream_schedule_after_layer(g,
+                                                                 il,
+                                                                 layer_ticket);
+            layer_ticket = NULL; /* schedule consumes or releases it */
+        }
+        ds4_gpu_command_ticket_free(layer_ticket);
     }
 
 #if defined(__APPLE__)
@@ -29910,6 +30316,9 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     if (ok && logits) ok = ds4_gpu_begin_commands() != 0;
     if (ok && logits) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
     if (ok && logits) ok = ds4_gpu_end_commands() != 0;
+    if (ok && async_ffn && !logits) {
+        ok = ds4_gpu_synchronize() != 0;
+    }
     if (ok && logits) {
         ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
@@ -35969,6 +36378,7 @@ struct ds4_engine {
     uint64_t ssd_streaming_full_layer_bytes;
     uint32_t ssd_streaming_full_layers;
     uint32_t ssd_streaming_preload_experts;
+    ds4_ssd_io_plan ssd_streaming_io_plan;
     uint64_t startup_model_span_bytes;
     ds4_locked_model_range *locked_output_ranges;
     uint32_t locked_output_range_count;
@@ -36135,6 +36545,98 @@ static uint64_t ds4_engine_streaming_transient_guard_bytes(
     total = ds4_add_sat_u64(total, e->ssd_streaming_full_layer_bytes);
     total = ds4_add_sat_u64(total, e->ssd_streaming_prefill_headroom_bytes);
     return total;
+}
+
+static uint64_t ds4_host_memory_bytes(void) {
+#if defined(__APPLE__)
+    uint64_t mem = 0;
+    size_t len = sizeof(mem);
+    if (sysctlbyname("hw.memsize", &mem, &len, NULL, 0) != 0 ||
+        len != sizeof(mem)) {
+        return 0;
+    }
+    return mem;
+#else
+    return 0;
+#endif
+}
+
+/*
+ * Select the lossless SSD I/O strategy from the recurring hot working set.
+ *
+ * Direct F_NOCACHE reads avoid page-cache churn on memory-constrained Macs.
+ * When non-routed weights, the routed cache, and context storage fit with a
+ * safety reserve, mmap/page-cache reuse is substantially faster and must not
+ * be bypassed. Unknown accounting remains conservative and keeps direct I/O.
+ */
+static void ds4_engine_configure_streaming_io_policy(ds4_engine *e,
+                                                      int         ctx_size) {
+    if (!e) return;
+    memset(&e->ssd_streaming_io_plan, 0,
+           sizeof(e->ssd_streaming_io_plan));
+    e->ssd_streaming_io_plan.use_direct_io = true;
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (!e->ssd_streaming || e->backend != DS4_BACKEND_METAL) return;
+
+    uint64_t non_routed_bytes = 0;
+    if (!weights_streaming_non_routed_bytes(&e->weights,
+                                            &non_routed_bytes) ||
+        non_routed_bytes == 0) {
+        fprintf(stderr,
+                "ds4: Metal SSD I/O policy: direct F_NOCACHE "
+                "(non-routed working set unavailable)\n");
+        return;
+    }
+
+    const int effective_ctx =
+        ctx_size > 0 ? ctx_size :
+        (e->placement_ctx_hint > 0 ? e->placement_ctx_hint : 4096);
+    const ds4_context_memory context =
+        ds4_context_memory_estimate_with_prefill_mode(
+                e->backend,
+                effective_ctx,
+                e->prefill_chunk,
+                true);
+    uint64_t hot_bytes = non_routed_bytes;
+    hot_bytes = ds4_add_sat_u64(hot_bytes, context.total_bytes);
+    hot_bytes = ds4_add_sat_u64(
+            hot_bytes,
+            ds4_engine_streaming_transient_guard_bytes(e));
+
+    uint64_t host_bytes = ds4_host_memory_bytes();
+    uint64_t recommended_bytes =
+        ds4_gpu_recommended_working_set_size();
+    const uint64_t simulated_bytes = e->simulated_memory.bytes;
+    if (simulated_bytes != 0) {
+        host_bytes = simulated_bytes >= host_bytes ?
+            0 : host_bytes - simulated_bytes;
+        recommended_bytes = simulated_bytes >= recommended_bytes ?
+            0 : recommended_bytes - simulated_bytes;
+    }
+    e->ssd_streaming_io_plan = ds4_ssd_io_plan_compute(
+            host_bytes,
+            recommended_bytes,
+            hot_bytes);
+
+    if (!e->ssd_streaming_io_plan.inputs_valid) {
+        fprintf(stderr,
+                "ds4: Metal SSD I/O policy: direct F_NOCACHE "
+                "(working-set budget unavailable)\n");
+        return;
+    }
+
+    fprintf(stderr,
+            "ds4: Metal SSD I/O policy: %s "
+            "(hot %.2f GiB, budget %.2f GiB, reserve %.2f GiB)\n",
+            e->ssd_streaming_io_plan.use_direct_io ?
+                "direct F_NOCACHE" : "mmap/page cache",
+            ds4_bytes_to_gib(e->ssd_streaming_io_plan.hot_bytes),
+            ds4_bytes_to_gib(e->ssd_streaming_io_plan.budget_bytes),
+            ds4_bytes_to_gib(e->ssd_streaming_io_plan.reserve_bytes));
+#else
+    (void)ctx_size;
+#endif
 }
 
 static void ds4_engine_print_startup_memory(
@@ -38121,14 +38623,7 @@ static double glm_graph_env_double(
 }
 
 static uint64_t glm_graph_host_memory_bytes(void) {
-#if defined(__APPLE__)
-    uint64_t mem = 0;
-    size_t len = sizeof(mem);
-    if (sysctlbyname("hw.memsize", &mem, &len, NULL, 0) != 0) return 0;
-    return mem;
-#else
-    return 0;
-#endif
+    return ds4_host_memory_bytes();
 }
 
 static uint64_t glm_graph_streaming_active_model_bytes(
@@ -47383,6 +47878,7 @@ static int generate_metal_graph_raw_swa(
         uint32_t            ssd_streaming_preload_experts,
         uint64_t            ssd_streaming_cache_bytes,
         uint64_t            ssd_streaming_prefill_headroom_bytes,
+        bool                dense_stream_default_enabled,
         int                 power_percent,
         uint32_t            prefill_chunk,
         const char        * directional_steering_file,
@@ -47458,6 +47954,7 @@ static int generate_metal_graph_raw_swa(
     g.ssd_streaming = ssd_streaming;
     g.ssd_streaming_cold = ssd_streaming_cold;
     g.streaming_preload_experts = ssd_streaming_preload_experts;
+    g.dense_stream_default_enabled = dense_stream_default_enabled;
     g.power_percent = power_percent > 0 ? (uint32_t)power_percent : 100u;
     if (!metal_graph_load_directional_steering(&g,
                                                directional_steering_file,
@@ -51249,6 +51746,8 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     g.ssd_streaming = e->ssd_streaming;
     g.ssd_streaming_cold = e->ssd_streaming_cold;
     g.streaming_preload_experts = e->ssd_streaming_preload_experts;
+    g.dense_stream_default_enabled =
+        e->ssd_streaming_io_plan.use_direct_io;
     g.power_percent = (uint32_t)e->power_percent;
 
     ds4_imatrix_collector collector;
@@ -52082,6 +52581,7 @@ int ds4_engine_generate_argmax(
                                             e->ssd_streaming_preload_experts,
                                             e->ssd_streaming_cache_bytes,
                                             e->ssd_streaming_prefill_headroom_bytes,
+                                            e->ssd_streaming_io_plan.use_direct_io,
                                             e->power_percent,
                                             e->prefill_chunk,
                                             e->directional_steering_file,
@@ -54666,27 +55166,33 @@ static bool ds4_engine_preload_pro_q4_expert_tables(
 
 #ifndef DS4_NO_GPU
 /*
- * DS4_EXPERT_BUNDLE=1: serve streaming expert-cache misses from a sidecar
- * file (<gguf>.expbundle, or $DS4_BUNDLE_DIR) where each routed expert's
- * gate|up|down slabs are contiguous, so a miss becomes one sequential burst
- * instead of three reads scattered across the GGUF. Same bytes, same
- * numerics; built one-time on the first streaming run. Any validation or
- * build failure just leaves the plain GGUF read path in place.
+ * By default, serve Metal streaming expert-cache misses from a sidecar file
+ * (<gguf>.expbundle, or $DS4_BUNDLE_DIR) where each routed expert's gate|up|down
+ * slabs are contiguous, so a miss becomes one sequential burst instead of
+ * three reads scattered across the GGUF. Same bytes, same numerics; built
+ * one-time on the first streaming run. Any validation or build failure just
+ * leaves the plain GGUF read path in place. DS4_EXPERT_BUNDLE=0 is the
+ * diagnostic rollback.
  */
 static void ds4_engine_setup_streaming_expert_bundle(ds4_engine *e,
                                                      const char *model_path) {
     const char *env = getenv("DS4_EXPERT_BUNDLE");
-    if (!env || strcmp(env, "1") != 0) return;
+    if (env && strcmp(env, "0") == 0) return;
     if (!ds4_gpu_streaming_expert_bundle_supported()) {
-        fprintf(stderr,
-                "ds4: DS4_EXPERT_BUNDLE is not supported by this GPU backend "
-                "yet; ignored\n");
+        /* Keep non-Metal SSD streaming unchanged and quiet by default. An
+         * explicit request still reports why it cannot take effect. */
+        if (env && strcmp(env, "1") == 0) {
+            fprintf(stderr,
+                    "ds4: DS4_EXPERT_BUNDLE is not supported by this GPU "
+                    "backend yet; ignored\n");
+        }
         return;
     }
 
-    /* The bundle covers one contiguous run of routed layers with uniform
-     * slab sizes. Mixed-precision (boosted) layers are off the slab size
-     * class and already bypass the expert cache, so they are not bundled. */
+    /* The v1 bundle covers one contiguous run of routed layers with uniform
+     * slab sizes. Mixed-precision layers still use the exact multi-quant cache,
+     * but their misses come from the GGUF until the bundle format grows a
+     * per-layer geometry table. */
     uint32_t lo = UINT32_MAX;
     uint32_t hi = 0;
     uint32_t routed = 0;
@@ -54761,11 +55267,9 @@ static void ds4_engine_setup_streaming_expert_bundle(ds4_engine *e,
                                         e->model.fd, e->model.size,
                                         lo, routed, DS4_N_EXPERT,
                                         gate_bytes, up_bytes, down_bytes,
-                                        layers)) {
-        if (ds4_gpu_set_streaming_expert_bundle(&e->expert_bundle, layers)) {
-            fprintf(stderr, "ds4: expert bundle active: %s\n",
-                    e->expert_bundle.path);
-        } else {
+                                        layers,
+                                        e->ssd_streaming_io_plan.use_direct_io)) {
+        if (!ds4_gpu_set_streaming_expert_bundle(&e->expert_bundle, layers)) {
             fprintf(stderr,
                     "ds4: expert bundle rejected by the GPU backend; "
                     "using plain GGUF reads\n");
@@ -56572,17 +57076,18 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
+        ds4_engine_configure_streaming_io_policy(e, opt->context_size);
         ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
         if (e->ssd_streaming) {
-            /*
-             * Pin the expert cache's slab size class to the model's uniform
-             * per-expert bytes, and count mixed-precision (boosted) layers:
-             * those are served through mapped model views instead of the
-             * cache (see weights_streaming_layer_experts_uniform).
-             */
+            /* The first routed class defines the CLI count's byte equivalent.
+             * Default mixed-quant mode admits every other exact record size
+             * under that global byte budget; the legacy flag keeps one class. */
             uint64_t slab_expert_bytes = 0;
             if (ds4_streaming_routed_expert_bytes(&e->weights, &slab_expert_bytes)) {
                 ds4_gpu_set_streaming_expert_cache_expert_bytes(slab_expert_bytes);
+                const char *multi_env = getenv("DS4_MULTI_QUANT_CACHE");
+                const bool multi_quant =
+                    !multi_env || strcmp(multi_env, "0") != 0;
                 uint32_t routed = 0, boosted = 0;
                 for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
                     const ds4_layer_weights *l = &e->weights.layer[il];
@@ -56591,13 +57096,21 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     if (!weights_streaming_layer_experts_uniform(&e->weights, il)) boosted++;
                 }
                 if (boosted > 0) {
-                    fprintf(stderr,
-                            "ds4: SSD streaming mixed-precision model: %u/%u routed layers "
-                            "off the slab size class will bypass the expert cache and read "
-                            "experts via mapped model views\n",
-                            boosted, routed);
+                    if (multi_quant) {
+                        fprintf(stderr,
+                                "ds4: SSD streaming mixed-precision model: %u/%u routed "
+                                "layers use exact secondary expert-cache size classes; "
+                                "v1 expert bundles remain uniform-only\n",
+                                boosted, routed);
+                    } else {
+                        fprintf(stderr,
+                                "ds4: SSD streaming mixed-precision model: %u/%u routed "
+                                "layers are off the legacy slab class and bypass the "
+                                "expert cache\n",
+                                boosted, routed);
+                    }
                 }
-                if (boosted * 2 > routed) {
+                if (!multi_quant && boosted * 2 > routed) {
                     fprintf(stderr,
                             "ds4: WARNING: the majority of routed layers (%u/%u) are off the "
                             "slab size class (is the FIRST routed layer itself boosted?); "
@@ -56612,22 +57125,39 @@ static int ds4_engine_open_internal(ds4_engine **out,
                  * (the addr-table kernels read the same bytes either way);
                  * only throughput collapses, so warn instead of refusing.
                  */
-                const uint64_t min_experts =
-                    (uint64_t)(routed - boosted) * DS4_N_EXPERT_USED;
-                if (min_experts != 0 &&
-                    e->ssd_streaming_cache_experts != 0 &&
-                    e->ssd_streaming_cache_experts < 2u * min_experts) {
+                uint64_t token_working_bytes = 0;
+                for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                    const ds4_layer_weights *l = &e->weights.layer[il];
+                    uint64_t layer_expert_bytes = 0;
+                    if (!streaming_layer_routed_expert_bytes(
+                            l, &layer_expert_bytes) ||
+                        (!multi_quant &&
+                         !weights_streaming_layer_experts_uniform(
+                             &e->weights, il))) {
+                        continue;
+                    }
+                    token_working_bytes = ds4_add_sat_u64(
+                        token_working_bytes,
+                        ds4_mul_sat_u64(layer_expert_bytes,
+                                        DS4_N_EXPERT_USED));
+                }
+                const uint64_t configured_cache_bytes = ds4_mul_sat_u64(
+                    e->ssd_streaming_cache_experts,
+                    slab_expert_bytes);
+                const uint64_t target_working_bytes = ds4_mul_sat_u64(
+                    token_working_bytes, 2u);
+                if (token_working_bytes != 0 &&
+                    configured_cache_bytes != 0 &&
+                    configured_cache_bytes < target_working_bytes) {
                     fprintf(stderr,
-                            "ds4: WARNING: SSD streaming expert cache (%u experts) is "
-                            "under twice the per-token routed working set (%u layers "
-                            "x %u experts = %llu); expect heavy thrashing below "
+                            "ds4: WARNING: SSD streaming expert cache (%u base-expert "
+                            "equivalents, %.2f GiB) is under twice the per-token routed "
+                            "working set (%.2f GiB); expect heavy thrashing below "
                             "%.2f GiB\n",
                             e->ssd_streaming_cache_experts,
-                            routed - boosted,
-                            DS4_N_EXPERT_USED,
-                            (unsigned long long)min_experts,
-                            (double)(2u * min_experts * slab_expert_bytes) /
-                                1073741824.0);
+                            ds4_bytes_to_gib(configured_cache_bytes),
+                            ds4_bytes_to_gib(token_working_bytes),
+                            ds4_bytes_to_gib(target_working_bytes));
                 }
             }
         }
@@ -57511,6 +58041,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->graph.ssd_streaming = e->ssd_streaming;
     s->graph.ssd_streaming_cold = e->ssd_streaming_cold;
     s->graph.streaming_preload_experts = e->ssd_streaming_preload_experts;
+    s->graph.dense_stream_default_enabled =
+        e->ssd_streaming_io_plan.use_direct_io;
     if (e->tp.active) {
         s->graph.tp_world = 2;
         s->graph.tp_rank = (uint32_t)e->tp.rank;

@@ -51,9 +51,12 @@ It also consumes the local golden fixture:
 
 The Metal SSD-streaming cache-pressure repro for issue #384 is a focused
 variant of the official-vector check. It forces a 16GiB routed-expert cache and
-runs only the `short_code_completion` case that exposes wrong logits when
-layer-batched decode reuses expert-cache buffers before the command buffer has
-completed:
+runs only the `short_code_completion` case that exposes wrong logits when the
+legacy mmap layer-batched decode reuses expert-cache buffers before the command
+buffer has completed. It disables the stable dense streamer internally to
+preserve that reproduction path. Because it intentionally reserves 16GiB, it
+is excluded from the default no-argument test run and must be selected
+explicitly:
 
 ```sh
 DS4_TEST_MODEL=gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \

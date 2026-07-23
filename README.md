@@ -303,40 +303,55 @@ the hot expert preload enabled for normal use; use `--ssd-streaming-cold` and
 ### Expert bundle sidecar
 
 In the GGUF an expert's gate, up, and down slabs live in three different
-tensors, so every cache miss is three reads scattered across the file. With
-`DS4_EXPERT_BUNDLE=1` the engine builds (once) and then reuses a sidecar file
-next to the model, `<gguf>.expbundle`, where each routed expert's three slabs
-are contiguous: a miss becomes one sequential burst. Same bytes, same
-numerics; only the on-disk layout changes.
+tensors, so every cache miss is three reads scattered across the file. On
+Metal, `--ssd-streaming` builds (once) and then reuses a sidecar file next to
+the model, `<gguf>.expbundle`, where each routed expert's three slabs are
+contiguous: a miss becomes one sequential burst. Same bytes, same numerics;
+only the on-disk layout changes.
 
 ```sh
-DS4_EXPERT_BUNDLE=1 ./ds4 -m ./ds4flash.gguf --ssd-streaming
+./ds4 -m ./ds4flash.gguf --ssd-streaming
 ```
 
-Things to know before enabling it:
+Things to know about the default:
 
 * The first run copies the whole expert region of the model, which takes a
   few minutes and duplicates it on disk (tens of GB for the Flash GGUFs).
   The build is skipped when free space is short, and any validation failure
-  falls back silently to plain GGUF reads.
+  falls back to plain GGUF reads.
+* Set `DS4_EXPERT_BUNDLE=0` to disable sidecar loading/building for diagnostics
+  or controlled A/B benchmarks.
+* The bundle descriptor follows the adaptive Metal I/O policy described below:
+  low-memory runs use `F_NOCACHE`, while runs whose recurring working set fits
+  use the normal page cache. The contiguous bundle layout is retained in both
+  cases.
 * Set `DS4_BUNDLE_DIR=/path/dir` to build and look up bundles in a separate
   directory (useful when the model directory is read-only). A valid sidecar
   next to the GGUF is always preferred for reading. Bundles in the directory
   are keyed by the model file name, so use distinct directories for
   different models that share a name.
 * The sidecar is fingerprinted against the model bytes and rebuilt
-  automatically when the GGUF changes. Mixed-precision (boosted) models are
-  not bundled: their off-class layers bypass the expert cache anyway.
-* Metal only for now; CUDA and ROCm builds ignore the variable. Distributed
-  workers that load different layer slices of the same GGUF each want their
-  own `DS4_BUNDLE_DIR`, since the bundle covers the loaded layer range.
+  automatically when the GGUF changes. The v1 format requires uniform expert
+  records, so mixed-precision (boosted) models currently read misses from the
+  GGUF; their layers can still populate the default multi-quant cache.
+  Existing v1 sidecars are compared fully with the GGUF once and receive a
+  backward-compatible identity extension in the unused header padding. This
+  first validation can take several minutes for a large model; later opens do
+  not rescan the expert payload. If the sidecar is read-only, the validation
+  remains safe but repeats on the next launch.
+* Treat `.expbundle` as immutable derived data. If it is edited independently
+  of the GGUF or storage corruption is suspected, delete it and let DS4 rebuild
+  it. Prefer a local `DS4_BUNDLE_DIR` over filesystems with coarse timestamps.
+* Metal only for now; CUDA and ROCm keep their existing streaming paths.
+  Distributed workers that load different layer slices of the same GGUF each
+  want their own `DS4_BUNDLE_DIR`, since the bundle covers the loaded layer
+  range.
 
 The startup log prints `expert bundle loaded`/`written` when the sidecar is
 validated or created; serving records from it is intentionally silent.
-The file format is shared with the DwarfStar Swift port, so a bundle built by
-either implementation is reused by the other. The C reader also recognizes
-the fingerprints emitted by the original Swift v1 writer, so existing large
-sidecars are reused rather than rebuilt.
+The record layout is shared with the DwarfStar Swift port. The C reader also
+recognizes the fingerprints emitted by the original Swift v1 writer, so
+existing large Swift sidecars are reused rather than rebuilt.
 
 Measured on an M1 Pro with 16 GiB of RAM (2-bit Flash imatrix GGUF, auto
 cache budget of 193 experts, `--ssd-streaming-cold`, page cache purged, 200
@@ -345,23 +360,77 @@ serving every miss. That configuration is nearly all misses, so it isolates
 the per-miss read improvement; machines where decode is less I/O-bound will
 see a smaller end-to-end delta.
 
-### Lossless dense streaming on low-memory Macs
+### Adaptive lossless dense streaming on Metal
 
 On a 16GB Mac, the non-routed weights can churn through the macOS page cache
 once per generated token even though routed experts already use SSD streaming.
-The opt-in dense streamer reads the exact model bytes through a dedicated
-`F_NOCACHE` descriptor into an asynchronous per-layer staging ring:
+The low-memory Metal SSD-streaming path reads the exact model bytes through a
+dedicated `F_NOCACHE` descriptor into an asynchronous per-layer staging ring.
+On Macs where the recurring working set fits, repeatedly bypassing the page
+cache is slower, so `--ssd-streaming` now selects the path automatically:
+
+```text
+hot working set =
+    non-routed weights + dynamic expert cache + resident full layers
+  + prefill expert reserve + KV/scratch
+
+page-cache budget =
+    min(90% of Metal's recommended working set,
+        physical RAM - max(8 GiB, physical RAM / 8))
+```
+
+The physical-memory side of the policy is continuous rather than a hard-coded
+device allowlist. The Apple Silicon memory tiers requested for validation map
+to these safe ceilings before Metal's usually tighter recommendation is
+applied:
+
+| Unified memory | Host reserve | Host-derived page-cache ceiling |
+|---:|---:|---:|
+| 32 GiB | 8 GiB | 24 GiB |
+| 48 GiB | 8 GiB | 40 GiB |
+| 64 GiB | 8 GiB | 56 GiB |
+| 96 GiB | 12 GiB | 84 GiB |
+| 128 GiB | 16 GiB | 112 GiB |
+| 256 GiB | 32 GiB | 224 GiB |
+| 512 GiB | 64 GiB | 448 GiB |
+
+This does not assume that every model fits merely because the Mac has a given
+RAM tier. A large cache, context, or quantization can still select direct I/O
+on a 48 GiB Mac, while a smaller recurring set can retain page-cache reuse.
+The exact same boundary and one-byte-over-boundary cases are unit-tested for
+every tier in the table.
+
+For the 80.76 GiB DeepSeek GGUF used in the M1 Max report, the estimated
+recurring sets are about 10.56 GiB with 344 cached experts and 41.06 GiB with
+the 32 GiB expert budget. Before any tighter Metal recommendation, that yields:
+
+| Unified memory | ~10.56 GiB hot set | ~41.06 GiB hot set |
+|---:|:---:|:---:|
+| 32 GiB | page cache | direct I/O |
+| 48 GiB | page cache | direct I/O |
+| 64–512 GiB | page cache | page cache |
+
+The runtime always uses the measured model/cache/context values and the
+device-reported Metal limit; these rows are an example, not a chip-name
+allowlist.
+
+The dense staging ring and uncached bundle reads are selected only when the hot
+working set exceeds that budget. Otherwise dense weights use mmap/page-cache
+views and the expert bundle remains cacheable. If an input or byte calculation
+is unavailable, the conservative fallback is direct I/O.
 
 ```sh
-DS4_EXPERT_BUNDLE=1 \
-DS4_DENSE_STREAM=1 \
-DS4_DENSE_AHEAD=2 \
 ./ds4 \
   -m ./ds4flash.gguf \
   --ssd-streaming \
   --ssd-streaming-cache-experts 320 \
   --nothink
 ```
+
+No activation environment variable is required. The startup log reports the
+selected policy and its estimated hot-set/budget values. CUDA and ROCm keep
+their own SSD-streaming implementations and are unchanged by this Metal
+policy.
 
 This path does not create or consume the Swift port's lossy `.q4dense` cache.
 It stages byte-identical GGUF ranges, and falls back to ordinary mmap views if
@@ -371,26 +440,46 @@ the requested F16 row instead of exposing the full table to Metal.
 On an M1 Pro with 16 GiB, using the same lossless Swift expert bundle, a
 1024-token context and a cold 344-expert cache, the prompt `Rispondi con una
 sola parola: Roma.` improved from about 0.225 token/s to about 0.60 token/s
-with `DS4_DENSE_AHEAD=2`. The selected tokens (`R`, `oma`, EOS) and the dumped
-top-20 logprobs were byte-identical. SSD and cache state can move these timings,
-so use them as a controlled comparison rather than a universal throughput
-claim.
+with read-ahead depth `2`, which is now the default. The selected tokens (`R`,
+`oma`, EOS) and the dumped top-20 logprobs were byte-identical. SSD and cache
+state can move these timings, so use them as a controlled comparison rather
+than a universal throughput claim.
 
 Useful controls:
 
-* `DS4_DENSE_AHEAD=1..3` selects the read-ahead depth. `1` is the conservative
-  default; `2` was faster on an M1 Pro and costs one extra staging slot.
-* `DS4_DENSE_IO_DEPTH=1..4` selects parallel reads across a layer's disjoint
-  spans; the default is `3`.
-* `DS4_LAZY_IDX=0` disables the default lossless omission of indexer scoring
-  weights when the configured context cannot reach the sparse-attention
-  boundary. Longer contexts keep those weights in the stream.
-* `DS4_MLOCK=1` best-effort pins the output head and staging ring.
+* `DS4_DENSE_AHEAD=1..3` selects the read-ahead depth. The stable default is
+  `2`, which was faster on an M1 Pro and costs one extra staging slot; `1`
+  remains available for lower-memory diagnostics.
+* `DS4_DENSE_STREAM=1` forces the byte-exact dense staging ring.
+  `DS4_DENSE_STREAM=0` forces mmap; these overrides are useful for controlled
+  A/B measurements and take precedence over the automatic choice.
+* `DS4_DENSE_IO_DEPTH=1..16` selects parallel reads across a layer's disjoint
+  spans; the default is `8` on Apple SSDs.
+* `DS4_ASYNC_FFN=0` restores the per-layer GPU wait. By default the dense
+  streamer commits each decoded layer without blocking and makes a ring-slot
+  worker wait on that exact command buffer before overwriting its bytes.
+* `DS4_ASYNC_ROUTE=0` restores the shared-event selected-expert handshake. The
+  default SSD-streaming path instead queues route/attention, shared FFN, and
+  routed FFN in order, overlapping the selected-expert read with the shared
+  FFN without changing their mathematical order.
+* `DS4_LAZY_IDX=0` disables lazy indexer residency. By default the byte-exact
+  scorer projections stay out of the per-token ring until sparse attention is
+  actually due, then are read once into an immutable shared buffer. A failed
+  load safely falls back to the original mmap weights.
+* `DS4_METAL_ADAPTIVE_SPLIT_K=0` restores the fixed 32-way FlashAttention
+  reduction. The default uses only the number of workgroups required by the
+  current key count and keeps the same reduction result.
+* `DS4_MULTI_QUANT_CACHE=0` restores the single-size expert cache. The default
+  admits exact IQ2/Q4 record classes under the same global byte budget, so
+  boosted expert layers are cacheable without reinterpreting their layout.
+* `DS4_MLOCK=1` best-effort pins the output head, staging ring, and expert-pool
+  slabs. The expert-pool share defaults to the smaller of 2 GiB and one eighth
+  of physical RAM; `DS4_MLOCK_EXPERT_CACHE_MB=N` adjusts that capped share.
   `DS4_RESIDENT_COMP=1` additionally excludes compressor weights from the
   stream and is experimental: on a 16GB M1 Pro the extra resident pressure
   was slower even though it reduced SSD bytes.
-* `DS4_DENSE_STREAM=0` or `DS4_METAL_DISABLE_DENSE_STREAM=1` restores the mmap
-  path. Keep that path when the working set fits or is already warm.
+* `DS4_METAL_DISABLE_DENSE_STREAM=1` is the legacy force-mmap rollback and has
+  the same precedence as `DS4_DENSE_STREAM=0`.
 
 ### Practical SSD streaming examples
 
@@ -1630,7 +1719,7 @@ The core local tests are driven by the C runner, with a small `ds4-eval`
 extractor self-test run first:
 
 ```sh
-make test                  # ./ds4-eval --self-test-extractors && ./ds4_test --all
+make test                  # ./ds4-eval --self-test-extractors && ./ds4_test
 ./ds4_test --logprob-vectors
 ./ds4_test --server
 ```

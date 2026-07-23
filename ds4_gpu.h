@@ -80,6 +80,24 @@ int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_encoder(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_commands_active(void);
+typedef struct ds4_gpu_command_ticket ds4_gpu_command_ticket;
+/* Commit the open Metal batch without waiting for it.  When begin_next is
+ * non-zero a fresh batch is opened immediately on the same in-order queue.
+ * The opaque ticket retains the committed command buffer so a CPU worker can
+ * wait for exactly that batch without draining later GPU work. */
+int ds4_gpu_commit_commands_async(ds4_gpu_command_ticket **ticket,
+                                  int begin_next);
+int ds4_gpu_wait_command_ticket(ds4_gpu_command_ticket *ticket,
+                                const char *label);
+/* Publish completion to the streaming-expert cache sequence tracker.  This
+ * must be called by the serialized graph thread after a successful wait; I/O
+ * workers may wait on a ticket but must not mutate global cache state. */
+int ds4_gpu_publish_command_ticket_completion(
+        ds4_gpu_command_ticket *ticket);
+/* The owner must join every concurrent waiter before freeing the ticket.
+ * Dense-stream jobs enforce that ownership rule by joining all slot workers;
+ * route tickets are waited and released only by the serialized graph thread. */
+void ds4_gpu_command_ticket_free(ds4_gpu_command_ticket *ticket);
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);
 int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label);
@@ -106,7 +124,9 @@ int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, cons
  *
  * This registry is process-global backend state, not session-local state.
  * Callers must serialize set/clear with every model-range resolver and may
- * change it only when no command buffer is open or in flight. */
+ * change it only when no command buffer is being encoded. Already committed
+ * command buffers retain the resolved MTLBuffer binding; the caller must gate
+ * CPU reuse of its bytes with a command ticket. */
 typedef struct {
     uint64_t model_offset;
     uint64_t bytes;
@@ -120,6 +140,20 @@ int ds4_gpu_set_model_staging_overrides(
         uint32_t                           count,
         const ds4_gpu_tensor              *staging);
 int ds4_gpu_clear_model_staging_overrides(const void *model_map);
+/* Permanently serve immutable model-file ranges from one shared tensor.  This
+ * is the resident counterpart of the per-layer staging table above: transient
+ * entries take precedence, while resident entries survive staging clears and
+ * are released by ds4_gpu_cleanup().  Publication replaces the whole table so
+ * callers can prepare all bytes first and expose them atomically. */
+int ds4_gpu_set_model_resident_overrides(
+        const void                        *model_map,
+        uint64_t                           model_size,
+        const ds4_gpu_model_staging_range *ranges,
+        uint32_t                           count,
+        const ds4_gpu_tensor              *resident);
+int ds4_gpu_model_resident_overrides_active(
+        const void *model_map,
+        uint64_t    model_size);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_q8_cache_suppressed(void);
@@ -166,6 +200,10 @@ void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
 #ifdef __APPLE__
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 #endif
+/* `experts` is a base-record equivalent.  Metal's default-on mixed-quant cache
+ * uses experts*bytes as one global byte budget while allocating exact
+ * per-layer record classes; DS4_MULTI_QUANT_CACHE=0 restores the legacy
+ * single-class/count behavior. */
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
 uint64_t ds4_gpu_recommended_working_set_size(void);
@@ -230,9 +268,9 @@ int ds4_gpu_stream_expert_cache_seed_experts(
         const int32_t                     *expert_ids,
         const uint32_t                    *expert_priorities,
         uint32_t                           n_experts);
-/* SSD streaming expert-bundle sidecar (DS4_EXPERT_BUNDLE=1): the backend
- * serves streaming-cache misses from the repacked contiguous records instead
- * of three reads scattered across the GGUF. `bundle` is the validated
+/* Default Metal SSD-streaming expert-bundle sidecar: the backend serves
+ * streaming-cache misses from the repacked contiguous records instead of
+ * three reads scattered across the GGUF. `bundle` is the validated
  * geometry from ds4_expert_bundle_open_or_build (the backend copies it and
  * borrows the fd; the engine keeps ownership); `layers` carries
  * bundle->layer_count entries with the model-file offsets of each bundled

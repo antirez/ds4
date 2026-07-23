@@ -3056,6 +3056,135 @@ static void test_metal_contiguous_compressed_f16_attention_exact(void) {
     ds4_gpu_tensor_free(raw);
 }
 
+static void test_metal_adaptive_split_k_exact_case(
+        uint32_t n_raw,
+        uint32_t n_comp,
+        uint32_t raw_start,
+        uint32_t seed) {
+    const uint32_t head_dim = 512;
+    const uint32_t n_head = 2;
+    const uint32_t raw_cap = n_raw + 7u;
+    const uint32_t n_keys = n_raw + n_comp;
+    const uint64_t raw_bytes =
+        (uint64_t)raw_cap * head_dim * sizeof(float);
+    const uint64_t comp_bytes =
+        (uint64_t)n_comp * head_dim * sizeof(uint16_t);
+    const uint64_t q_bytes =
+        (uint64_t)n_head * head_dim * sizeof(float);
+    const uint64_t page = (uint64_t)getpagesize();
+
+    ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(raw_bytes);
+    ds4_gpu_tensor *comp = n_comp ? ds4_gpu_tensor_alloc(comp_bytes) : NULL;
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_bytes);
+    ds4_gpu_tensor *fixed = ds4_gpu_tensor_alloc(q_bytes);
+    ds4_gpu_tensor *adaptive = ds4_gpu_tensor_alloc(q_bytes);
+    float *raw_host = malloc((size_t)raw_bytes);
+    uint16_t *comp_host = n_comp ? malloc((size_t)comp_bytes) : NULL;
+    float *q_host = malloc((size_t)q_bytes);
+    float *fixed_host = malloc((size_t)q_bytes);
+    float *adaptive_host = malloc((size_t)q_bytes);
+    void *model_raw = NULL;
+    TEST_ASSERT(posix_memalign(&model_raw, (size_t)page, (size_t)page) == 0);
+
+    TEST_ASSERT(raw != NULL);
+    TEST_ASSERT(n_comp == 0 || comp != NULL);
+    TEST_ASSERT(q != NULL);
+    TEST_ASSERT(fixed != NULL);
+    TEST_ASSERT(adaptive != NULL);
+    TEST_ASSERT(raw_host != NULL);
+    TEST_ASSERT(n_comp == 0 || comp_host != NULL);
+    TEST_ASSERT(q_host != NULL);
+    TEST_ASSERT(fixed_host != NULL);
+    TEST_ASSERT(adaptive_host != NULL);
+    TEST_ASSERT(model_raw != NULL);
+
+    test_float_compare_stats stats = {0};
+    const bool allocated = raw && (!n_comp || comp) && q && fixed && adaptive &&
+        raw_host && (!n_comp || comp_host) && q_host && fixed_host &&
+        adaptive_host && model_raw;
+    if (allocated) {
+        memset(model_raw, 0, (size_t)page);
+        float *sinks = model_raw;
+        sinks[0] = -0.34375f;
+        sinks[1] = 0.15625f;
+        for (uint64_t i = 0; i < (uint64_t)raw_cap * head_dim; i++) {
+            const int value = (int)((i * 17u + (i ^ (i >> 6u)) * 5u +
+                                     seed * 13u) % 191u) - 95;
+            raw_host[i] = (float)value / 128.0f;
+        }
+        for (uint64_t i = 0; i < (uint64_t)n_comp * head_dim; i++) {
+            const int value = (int)((i * 23u + (i ^ (i >> 5u)) * 7u +
+                                     seed * 11u) % 181u) - 90;
+            comp_host[i] = test_float_to_f16((float)value / 112.0f);
+        }
+        for (uint32_t i = 0; i < n_head * head_dim; i++) {
+            const int value = (int)((i * 29u + (i ^ (i >> 3u)) * 3u +
+                                     seed * 17u) % 223u) - 111;
+            q_host[i] = (float)value / 104.0f;
+        }
+
+        TEST_ASSERT(ds4_gpu_tensor_write(raw, 0, raw_host, raw_bytes) != 0);
+        if (n_comp) {
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                            comp, 0, comp_host, comp_bytes) != 0);
+        }
+        TEST_ASSERT(ds4_gpu_tensor_write(q, 0, q_host, q_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_set_model_map(model_raw, page) != 0);
+        ds4_gpu_set_quality(false);
+
+        TEST_ASSERT(setenv("DS4_METAL_ADAPTIVE_SPLIT_K", "0", 1) == 0);
+        TEST_ASSERT(ds4_gpu_attention_decode_heads_tensor(
+            fixed, model_raw, page, 0, q, raw,
+            n_raw, raw_cap, raw_start % raw_cap,
+            comp, 1, n_comp, NULL, 0, n_head, head_dim) != 0);
+
+        TEST_ASSERT(unsetenv("DS4_METAL_ADAPTIVE_SPLIT_K") == 0);
+        TEST_ASSERT(ds4_gpu_attention_decode_heads_tensor(
+            adaptive, model_raw, page, 0, q, raw,
+            n_raw, raw_cap, raw_start % raw_cap,
+            comp, 1, n_comp, NULL, 0, n_head, head_dim) != 0);
+
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        fixed, 0, fixed_host, q_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        adaptive, 0, adaptive_host, q_bytes) != 0);
+        stats = test_compare_float_bits(
+            fixed_host, adaptive_host, (size_t)n_head * head_dim);
+    }
+
+    fprintf(stderr,
+            "ds4-test: adaptive split-K exact keys=%u nwg=%u "
+            "mismatches=%zu/%u max_ulp=%u max_abs=%g\n",
+            n_keys, n_keys < 1024u ? (n_keys + 31u) / 32u : 32u,
+            stats.mismatch_count, n_head * head_dim,
+            stats.max_ulp, stats.max_abs);
+    TEST_ASSERT(stats.mismatch_count == 0);
+
+    free(model_raw);
+    free(adaptive_host);
+    free(fixed_host);
+    free(q_host);
+    free(comp_host);
+    free(raw_host);
+    ds4_gpu_tensor_free(adaptive);
+    ds4_gpu_tensor_free(fixed);
+    ds4_gpu_tensor_free(q);
+    ds4_gpu_tensor_free(comp);
+    ds4_gpu_tensor_free(raw);
+}
+
+static void test_metal_adaptive_split_k_exact(void) {
+    char *saved = test_save_env("DS4_METAL_ADAPTIVE_SPLIT_K");
+    test_metal_adaptive_split_k_exact_case(1, 0, 0, 7);
+    test_metal_adaptive_split_k_exact_case(33, 0, 29, 11);
+    test_metal_adaptive_split_k_exact_case(129, 0, 127, 13);
+    test_metal_adaptive_split_k_exact_case(17, 48, 19, 17);
+    test_metal_adaptive_split_k_exact_case(257, 254, 251, 19);
+    test_metal_adaptive_split_k_exact_case(1024, 0, 1019, 23);
+    test_metal_adaptive_split_k_exact_case(1025, 0, 1021, 29);
+    test_restore_env("DS4_METAL_ADAPTIVE_SPLIT_K", saved);
+}
+
 static void test_metal_persistent_zero_attention_mask_exact_case(
         uint32_t raw_cap,
         uint32_t n_raw,
@@ -4872,6 +5001,121 @@ static void test_metal_router_weights_batch_exact(void) {
     ds4_gpu_tensor_free(logits);
     free(model_raw);
 }
+
+typedef struct {
+    ds4_gpu_command_ticket *ticket;
+    int ok;
+} test_metal_ticket_wait_args;
+
+static void *test_metal_ticket_wait_worker(void *opaque) {
+    test_metal_ticket_wait_args *args = opaque;
+    args->ok = ds4_gpu_wait_command_ticket(args->ticket,
+                                            "command-ticket regression");
+    return NULL;
+}
+
+static void test_metal_command_ticket_exact(void) {
+    enum { N = 64, N_WAITERS = 2 };
+    float a_host[N];
+    float b_host[N];
+    float route_host[N];
+    float shared_host[N];
+    for (uint32_t i = 0; i < N; i++) {
+        a_host[i] = (float)i;
+        b_host[i] = (float)(i * 2u + 1u);
+    }
+
+    ds4_gpu_tensor *a = ds4_gpu_tensor_alloc(sizeof(a_host));
+    ds4_gpu_tensor *b = ds4_gpu_tensor_alloc(sizeof(b_host));
+    ds4_gpu_tensor *route = ds4_gpu_tensor_alloc(sizeof(route_host));
+    ds4_gpu_tensor *shared = ds4_gpu_tensor_alloc(sizeof(shared_host));
+    TEST_ASSERT(a != NULL);
+    TEST_ASSERT(b != NULL);
+    TEST_ASSERT(route != NULL);
+    TEST_ASSERT(shared != NULL);
+    if (!a || !b || !route || !shared) goto cleanup;
+
+    TEST_ASSERT(ds4_gpu_synchronize() != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(a, 0, a_host, sizeof(a_host)) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(b, 0, b_host, sizeof(b_host)) != 0);
+
+    ds4_gpu_command_ticket *route_ticket = NULL;
+    ds4_gpu_command_ticket *shared_ticket = NULL;
+    int encoded = ds4_gpu_begin_commands() != 0 &&
+                  ds4_gpu_add_tensor(route, a, b, N) != 0 &&
+                  ds4_gpu_commit_commands_async(&route_ticket, 1) != 0 &&
+                  /* This batch consumes the previous batch's result.  Queue
+                   * ordering must make the cross-command-buffer dependency
+                   * exact without a CPU join between the two encodes. */
+                  ds4_gpu_add_tensor(shared, route, a, N) != 0 &&
+                  ds4_gpu_commit_commands_async(&shared_ticket, 0) != 0;
+    TEST_ASSERT(encoded);
+    if (!encoded) {
+        (void)ds4_gpu_synchronize();
+        ds4_gpu_command_ticket_free(route_ticket);
+        ds4_gpu_command_ticket_free(shared_ticket);
+        goto cleanup;
+    }
+
+    pthread_t waiters[N_WAITERS];
+    test_metal_ticket_wait_args args[N_WAITERS];
+    bool started[N_WAITERS] = { false, false };
+    for (uint32_t i = 0; i < N_WAITERS; i++) {
+        args[i].ticket = route_ticket;
+        args[i].ok = 0;
+        const int rc = pthread_create(&waiters[i],
+                                      NULL,
+                                      test_metal_ticket_wait_worker,
+                                      &args[i]);
+        TEST_ASSERT(rc == 0);
+        started[i] = rc == 0;
+    }
+    for (uint32_t i = 0; i < N_WAITERS; i++) {
+        if (!started[i]) continue;
+        const int rc = pthread_join(waiters[i], NULL);
+        TEST_ASSERT(rc == 0);
+        if (rc != 0) {
+            fprintf(stderr,
+                    "ds4-test: command-ticket pthread_join failed: %s\n",
+                    strerror(rc));
+            abort();
+        }
+        TEST_ASSERT(args[i].ok != 0);
+    }
+    TEST_ASSERT(ds4_gpu_wait_command_ticket(route_ticket,
+                                             "command-ticket route") != 0);
+    TEST_ASSERT(ds4_gpu_publish_command_ticket_completion(route_ticket) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(route,
+                                    0,
+                                    route_host,
+                                    sizeof(route_host)) != 0);
+
+    TEST_ASSERT(ds4_gpu_wait_command_ticket(shared_ticket,
+                                             "command-ticket shared") != 0);
+    TEST_ASSERT(ds4_gpu_publish_command_ticket_completion(shared_ticket) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(shared,
+                                    0,
+                                    shared_host,
+                                    sizeof(shared_host)) != 0);
+    for (uint32_t i = 0; i < N; i++) {
+        TEST_ASSERT(route_host[i] == a_host[i] + b_host[i]);
+        TEST_ASSERT(shared_host[i] == route_host[i] + a_host[i]);
+    }
+    fprintf(stderr,
+            "ds4-test: async command tickets exact waiters=%u values=%u\n",
+            N_WAITERS,
+            N);
+
+    ds4_gpu_command_ticket_free(route_ticket);
+    ds4_gpu_command_ticket_free(shared_ticket);
+    TEST_ASSERT(ds4_gpu_synchronize() != 0);
+
+cleanup:
+    ds4_gpu_tensor_free(shared);
+    ds4_gpu_tensor_free(route);
+    ds4_gpu_tensor_free(b);
+    ds4_gpu_tensor_free(a);
+}
 #endif
 
 static void test_metal_kernel_group(void) {
@@ -4893,6 +5137,8 @@ static void test_metal_kernel_group(void) {
     test_metal_contiguous_f32_f16_roundtrip_exact();
     test_metal_gathered_kv_stage_exact();
     test_metal_contiguous_compressed_f16_attention_exact();
+    test_metal_adaptive_split_k_exact();
+    test_metal_command_ticket_exact();
     test_metal_persistent_zero_attention_mask_exact();
     test_metal_zero_prefix_prefill_mask_cache_exact();
     test_metal_hc_split_weighted_sum_norm_batch_exact();
@@ -5419,12 +5665,18 @@ static void test_metal_ssd_streaming_cache_pressure(void) {
         test_save_env("DS4_METAL_DISABLE_STREAMING_LAYER_BATCH");
     char *saved_disable_static_decode =
         test_save_env("DS4_METAL_DISABLE_STREAMING_STATIC_DECODE_MAP");
+    char *saved_disable_dense =
+        test_save_env("DS4_METAL_DISABLE_DENSE_STREAM");
+    char *saved_expert_bundle =
+        test_save_env("DS4_EXPERT_BUNDLE");
     char *saved_one_stage =
         test_save_env("DS4_METAL_MOE_ONE_STAGE_PROFILE");
 
     setenv("DS4_TEST_SSD_STREAMING", "1", 1);
     setenv("DS4_TEST_SSD_STREAMING_CACHE_GB", "16", 1);
     unsetenv("DS4_TEST_SSD_STREAMING_CACHE_EXPERTS");
+    setenv("DS4_METAL_DISABLE_DENSE_STREAM", "1", 1);
+    setenv("DS4_EXPERT_BUNDLE", "0", 1);
     unsetenv("DS4_METAL_DISABLE_STREAMING_LAYER_BATCH");
     unsetenv("DS4_METAL_DISABLE_STREAMING_STATIC_DECODE_MAP");
     unsetenv("DS4_METAL_MOE_ONE_STAGE_PROFILE");
@@ -5437,6 +5689,9 @@ static void test_metal_ssd_streaming_cache_pressure(void) {
     test_restore_env("DS4_METAL_MOE_ONE_STAGE_PROFILE", saved_one_stage);
     test_restore_env("DS4_METAL_DISABLE_STREAMING_STATIC_DECODE_MAP",
                      saved_disable_static_decode);
+    test_restore_env("DS4_EXPERT_BUNDLE", saved_expert_bundle);
+    test_restore_env("DS4_METAL_DISABLE_DENSE_STREAM",
+                     saved_disable_dense);
     test_restore_env("DS4_METAL_DISABLE_STREAMING_LAYER_BATCH",
                      saved_disable_layer_batch);
     test_restore_env("DS4_TEST_SSD_STREAMING_CACHE_EXPERTS",
@@ -6710,7 +6965,7 @@ static const ds4_test_entry test_entries[] = {
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
     {"--think-tool-recovery", "think-tool-recovery", "forced </think> recovery when a tool call starts inside thinking", test_think_tool_recovery},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard Metal path", test_official_logprob_vectors},
-    {"--metal-ssd-streaming-cache-pressure", "metal-ssd-streaming-cache-pressure", "Metal SSD-streaming layer-batched decode cache-pressure repro for issue #384", test_metal_ssd_streaming_cache_pressure},
+    {"--metal-ssd-streaming-cache-pressure", "metal-ssd-streaming-cache-pressure", "explicit 16GiB Metal SSD-streaming cache-pressure repro for issue #384", test_metal_ssd_streaming_cache_pressure},
     {"--local-golden-vectors", "local-golden-vectors", "local top-k/logit drift regression for long Metal prefill", test_local_golden_vectors},
     {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
@@ -6725,8 +6980,10 @@ static const ds4_test_entry test_entries[] = {
 static void test_print_help(const char *prog) {
     printf("Usage: %s [--all | TEST...]\n\n", prog);
     puts("Tests:");
+    puts("  (no arguments)");
+    puts("      Run the standard suite, excluding explicit resource-pressure repros.");
     puts("  --all");
-    puts("      Run every test. This is the default, ordered from slower to faster.");
+    puts("      Run every test, including explicit resource-pressure repros.");
     for (size_t i = 0; i < sizeof(test_entries) / sizeof(test_entries[0]); i++) {
         printf("  %-20s %s\n", test_entries[i].flag, test_entries[i].desc);
     }
@@ -6766,6 +7023,11 @@ static const ds4_test_entry *test_find_entry(const char *arg) {
     return NULL;
 }
 
+static bool test_entry_is_explicit_only(const ds4_test_entry *entry) {
+    return entry &&
+           !strcmp(entry->flag, "--metal-ssd-streaming-cache-pressure");
+}
+
 static void test_run_entry(const ds4_test_entry *entry) {
     int before = test_failures;
     fprintf(stderr, "%s:\n", entry->name);
@@ -6780,11 +7042,13 @@ static void test_run_entry(const ds4_test_entry *entry) {
 
 int main(int argc, char **argv) {
     bool run_all = argc == 1;
+    bool include_explicit_only = false;
     bool selected[sizeof(test_entries) / sizeof(test_entries[0])] = {0};
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--all")) {
             run_all = true;
+            include_explicit_only = true;
         } else if (!strcmp(argv[i], "--list")) {
             for (size_t j = 0; j < sizeof(test_entries) / sizeof(test_entries[0]); j++) {
                 puts(test_entries[j].flag);
@@ -6806,6 +7070,14 @@ int main(int argc, char **argv) {
 
     if (run_all) {
         for (size_t i = 0; i < sizeof(test_entries) / sizeof(test_entries[0]); i++) {
+            if (!include_explicit_only &&
+                test_entry_is_explicit_only(&test_entries[i])) {
+                fprintf(stderr,
+                        "%s: SKIP (resource-intensive; run %s explicitly)\n",
+                        test_entries[i].name,
+                        test_entries[i].flag);
+                continue;
+            }
             test_run_entry(&test_entries[i]);
         }
     } else {
