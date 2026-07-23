@@ -709,6 +709,45 @@ static int check_long_decode_attention(void) {
               "long default split attention numeric");
     }
 
+    /* Exercise the Blackwell split-16 threshold itself, not only the
+     * full-cache case above. */
+    const uint32_t threshold_count = 2048u;
+    CHECK(setenv("DS4_CUDA_LAGUNA_NO_SPLIT_DECODE", "1", 1) == 0,
+          "disable threshold split attention");
+    CHECK(ds4_gpu_laguna_store_attention_tensor(
+              heads, key_cache, value_cache, q_t, k_t, v_t, gate_t,
+              threshold_count - 1u, cache_cap, 0u, threshold_count,
+              n_head, n_head_kv, HEAD_DIM,
+              1.0f / sqrtf((float)HEAD_DIM)) &&
+          ds4_gpu_tensor_read(heads, 0, scalar, sizeof(scalar)),
+          "threshold scalar attention");
+    CHECK(unsetenv("DS4_CUDA_LAGUNA_NO_SPLIT_DECODE") == 0 &&
+          setenv("DS4_CUDA_LAGUNA_NO_BLACKWELL_SPLIT16", "1", 1) == 0,
+          "select threshold portable split attention");
+    CHECK(ds4_gpu_laguna_store_attention_tensor(
+              heads, key_cache, value_cache, q_t, k_t, v_t, gate_t,
+              threshold_count - 1u, cache_cap, 0u, threshold_count,
+              n_head, n_head_kv, HEAD_DIM,
+              1.0f / sqrtf((float)HEAD_DIM)) &&
+          ds4_gpu_tensor_read(heads, 0, split8, sizeof(split8)),
+          "threshold portable split attention");
+    CHECK(unsetenv("DS4_CUDA_LAGUNA_NO_BLACKWELL_SPLIT16") == 0,
+          "select threshold default split attention");
+    CHECK(ds4_gpu_laguna_store_attention_tensor(
+              heads, key_cache, value_cache, q_t, k_t, v_t, gate_t,
+              threshold_count - 1u, cache_cap, 0u, threshold_count,
+              n_head, n_head_kv, HEAD_DIM,
+              1.0f / sqrtf((float)HEAD_DIM)) &&
+          ds4_gpu_tensor_read(
+              heads, 0, split_default, sizeof(split_default)),
+          "threshold default split attention");
+    for (uint32_t i = 0; i < n_head * HEAD_DIM; i++) {
+        CHECK(close_enough(split8[i], scalar[i], 2e-4f, 2e-4f),
+              "threshold portable split attention numeric");
+        CHECK(close_enough(split_default[i], scalar[i], 2e-4f, 2e-4f),
+              "threshold default split attention numeric");
+    }
+
     ds4_gpu_tensor_free(gate_t);
     ds4_gpu_tensor_free(v_t);
     ds4_gpu_tensor_free(k_t);

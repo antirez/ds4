@@ -144,7 +144,7 @@ coverage.
   shared memory. This increases parallelism without repeating the rejected
   grouped-head schedule; `DS4_CUDA_LAGUNA_NO_SPLIT_DECODE=1` retains the
   original serial-history kernel.
-- On Blackwell (`sm_120+`), use sixteen warps for histories of at least 4K.
+- On Blackwell (`sm_120+`), use sixteen warps for histories of at least 2K.
   The wider schedule is capability- and shape-gated; either
   `DS4_CUDA_LAGUNA_NO_BLACKWELL=1` or
   `DS4_CUDA_LAGUNA_NO_BLACKWELL_SPLIT16=1` restores the portable eight-warp
@@ -197,8 +197,8 @@ Verification evidence:
   generates coherent text in Poolside's Laguna llama.cpp branch, confirming
   the downloaded checkpoint and tokenizer are intact.
 - On the revised weights, the sustained raw sweep with 256 generated tokens
-  per point measures 203.07/21.65 tok/s prefill/generation at 2K context,
-  161.81/21.63 at 4K, and 132.34/20.30 at 8K. Results are stored in
+  per point measures 201.87/22.36 tok/s prefill/generation at 2K context,
+  160.93/21.64 at 4K, and 132.42/20.33 at 8K. Results are stored in
   `speed-bench/laguna_s21_gb10_revised.csv`.
 - Before the accurate-prefill correction, the same revised-weight sweep
   appeared to measure 137.22/21.83, 113.51/21.84, and 100.62/20.46 tok/s,
@@ -226,16 +226,19 @@ Verification evidence:
   matmul. The existing direct CUDA f16 matvec was rejected after lowering a
   2K/64-token diagnostic from 15.19 to 12.06 tok/s.
 - In a paired 256-token GB10 comparison, Blackwell's sixteen-warp attention
-  raises 4K generation from 14.58 to 15.21 tok/s and 8K generation from 13.45
-  to 14.55 tok/s over the portable eight-warp schedule. At a 4K prompt it
-  also reproduces the scalar attention path's complete 32-token greedy
-  continuation.
+  raises revised-weight steady generation from 21.84 to 22.49 tok/s at 2K,
+  20.49 to 21.77 at 4K, and 18.37 to 20.44 at 8K over the portable
+  eight-warp schedule: gains of 3.0%, 6.2%, and 11.3%. The paired control is
+  stored in `speed-bench/laguna_s21_gb10_revised_portable.csv`. At a 4K
+  prompt it also reproduces the scalar attention path's complete 32-token
+  greedy continuation.
 - The optimized and rollback paths produce byte-identical full-model logits
   for sorted gate/up, chunked Q4_K/Q6_K down, grouped prefill GQA, aligned
   Q4_K decode loads, and the shared Q/K/V/gate activation. The synthetic CUDA
   regression compares every output element from the scalar, portable
-  eight-warp, and default (sixteen-warp on GB10) attention paths across 4,096
-  keys within a 2e-4 absolute/relative tolerance.
+  eight-warp, and default (sixteen-warp on GB10) attention paths at the 2,048
+  key activation threshold and across 4,096 keys within a 2e-4
+  absolute/relative tolerance.
   A grouped decode experiment was rejected despite identical logits because
   it regressed sustained generation to 8.10/6.17/4.17 tok/s.
 - `sh -n download_model.sh` passes. The Laguna download target accepts the

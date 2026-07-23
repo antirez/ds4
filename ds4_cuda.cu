@@ -32651,8 +32651,11 @@ extern "C" int ds4_gpu_laguna_store_attention_tensor(
         key_count > 256u &&
         getenv("DS4_CUDA_LAGUNA_NO_SPLIT_DECODE") == NULL;
     if (split_attention) {
+        /* GB10 measurements show that 16 warps amortize their larger merge
+         * from 2K keys onward: +3% steady decode at 2K, +6% at 4K, and +11%
+         * at 8K versus the portable eight-warp schedule. */
         const bool blackwell_split16 =
-            key_count >= 4096u &&
+            key_count >= 2048u &&
             cuda_laguna_blackwell_ok() &&
             getenv("DS4_CUDA_LAGUNA_NO_BLACKWELL_SPLIT16") == NULL;
         if (blackwell_split16) {

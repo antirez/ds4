@@ -163,7 +163,7 @@ index 39b39be..aea9aae 100644
              return 1;
          }
 diff --git a/ds4_cuda.cu b/ds4_cuda.cu
-index e66fa36..1761e50 100644
+index e66fa36..0e6f8f1 100644
 --- a/ds4_cuda.cu
 +++ b/ds4_cuda.cu
 @@ -60,6 +60,13 @@ typedef struct {
@@ -2202,7 +2202,7 @@ index e66fa36..1761e50 100644
  }
  
  extern "C" int ds4_gpu_laguna_store_attention_tensor(
-@@ -27757,11 +29475,81 @@ extern "C" int ds4_gpu_laguna_store_attention_tensor(
+@@ -27757,11 +29475,84 @@ extern "C" int ds4_gpu_laguna_store_attention_tensor(
          const ds4_gpu_tensor *gate, uint32_t pos, uint32_t cache_cap,
          uint32_t key_start, uint32_t key_count, uint32_t n_head,
          uint32_t n_head_kv, uint32_t head_dim, float scale) {
@@ -2252,8 +2252,11 @@ index e66fa36..1761e50 100644
 +        key_count > 256u &&
 +        getenv("DS4_CUDA_LAGUNA_NO_SPLIT_DECODE") == NULL;
 +    if (split_attention) {
++        /* GB10 measurements show that 16 warps amortize their larger merge
++         * from 2K keys onward: +3% steady decode at 2K, +6% at 4K, and +11%
++         * at 8K versus the portable eight-warp schedule. */
 +        const bool blackwell_split16 =
-+            key_count >= 4096u &&
++            key_count >= 2048u &&
 +            cuda_laguna_blackwell_ok() &&
 +            getenv("DS4_CUDA_LAGUNA_NO_BLACKWELL_SPLIT16") == NULL;
 +        if (blackwell_split16) {
@@ -2289,7 +2292,7 @@ index e66fa36..1761e50 100644
  }
  
  extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
-@@ -27772,10 +29560,92 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
+@@ -27772,10 +29563,92 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
          const ds4_gpu_tensor *gate, uint32_t pos0, uint32_t n_tokens,
          uint32_t cache_cap, uint32_t n_head, uint32_t n_head_kv,
          uint32_t head_dim, float scale) {
@@ -2440,12 +2443,22 @@ index 0000000..6643bb9
 +2048,2048,148.08,256,15.25,79.301,255,15.33,176570420
 +4096,2048,125.52,256,15.25,65.905,255,15.31,277241908
 +8192,4096,106.95,256,14.56,70.300,255,14.61,0
+diff --git a/speed-bench/laguna_s21_gb10_revised.csv b/speed-bench/laguna_s21_gb10_revised.csv
+new file mode 100644
+index 0000000..2cb582c
+--- /dev/null
++++ b/speed-bench/laguna_s21_gb10_revised.csv
+@@ -0,0 +1,4 @@
++ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes
++2048,2048,201.87,256,22.36,45.551,255,22.49,176570420
++4096,2048,160.93,256,21.64,48.988,255,21.77,277241908
++8192,4096,132.42,256,20.33,50.927,255,20.44,0
 diff --git a/tests/cuda_laguna_smoke.c b/tests/cuda_laguna_smoke.c
 new file mode 100644
-index 0000000..388f967
+index 0000000..c25ae57
 --- /dev/null
 +++ b/tests/cuda_laguna_smoke.c
-@@ -0,0 +1,951 @@
+@@ -0,0 +1,990 @@
 +#include "ds4_gpu.h"
 +
 +#include <cuda_runtime_api.h>
@@ -3155,6 +3168,45 @@ index 0000000..388f967
 +              "long portable split attention numeric");
 +        CHECK(close_enough(split_default[i], scalar[i], 2e-4f, 2e-4f),
 +              "long default split attention numeric");
++    }
++
++    /* Exercise the Blackwell split-16 threshold itself, not only the
++     * full-cache case above. */
++    const uint32_t threshold_count = 2048u;
++    CHECK(setenv("DS4_CUDA_LAGUNA_NO_SPLIT_DECODE", "1", 1) == 0,
++          "disable threshold split attention");
++    CHECK(ds4_gpu_laguna_store_attention_tensor(
++              heads, key_cache, value_cache, q_t, k_t, v_t, gate_t,
++              threshold_count - 1u, cache_cap, 0u, threshold_count,
++              n_head, n_head_kv, HEAD_DIM,
++              1.0f / sqrtf((float)HEAD_DIM)) &&
++          ds4_gpu_tensor_read(heads, 0, scalar, sizeof(scalar)),
++          "threshold scalar attention");
++    CHECK(unsetenv("DS4_CUDA_LAGUNA_NO_SPLIT_DECODE") == 0 &&
++          setenv("DS4_CUDA_LAGUNA_NO_BLACKWELL_SPLIT16", "1", 1) == 0,
++          "select threshold portable split attention");
++    CHECK(ds4_gpu_laguna_store_attention_tensor(
++              heads, key_cache, value_cache, q_t, k_t, v_t, gate_t,
++              threshold_count - 1u, cache_cap, 0u, threshold_count,
++              n_head, n_head_kv, HEAD_DIM,
++              1.0f / sqrtf((float)HEAD_DIM)) &&
++          ds4_gpu_tensor_read(heads, 0, split8, sizeof(split8)),
++          "threshold portable split attention");
++    CHECK(unsetenv("DS4_CUDA_LAGUNA_NO_BLACKWELL_SPLIT16") == 0,
++          "select threshold default split attention");
++    CHECK(ds4_gpu_laguna_store_attention_tensor(
++              heads, key_cache, value_cache, q_t, k_t, v_t, gate_t,
++              threshold_count - 1u, cache_cap, 0u, threshold_count,
++              n_head, n_head_kv, HEAD_DIM,
++              1.0f / sqrtf((float)HEAD_DIM)) &&
++          ds4_gpu_tensor_read(
++              heads, 0, split_default, sizeof(split_default)),
++          "threshold default split attention");
++    for (uint32_t i = 0; i < n_head * HEAD_DIM; i++) {
++        CHECK(close_enough(split8[i], scalar[i], 2e-4f, 2e-4f),
++              "threshold portable split attention numeric");
++        CHECK(close_enough(split_default[i], scalar[i], 2e-4f, 2e-4f),
++              "threshold default split attention numeric");
 +    }
 +
 +    ds4_gpu_tensor_free(gate_t);
