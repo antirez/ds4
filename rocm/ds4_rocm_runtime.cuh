@@ -294,6 +294,10 @@ static uint64_t g_model_range_bytes;
 static uint64_t g_q8_f16_bytes[DS4_MAX_GPUS];
 static int g_q8_f16_disabled_after_oom[DS4_MAX_GPUS];
 static int g_q8_f16_disabled_for_multi_model;
+/* Per-tier: a denial while preloading tier 0 (budget-tight under multi-GPU)
+ * must not permanently stop the preload sweep from ever trying tier 1,
+ * which may still have headroom. */
+static int g_q8_f16_preload_disabled[DS4_MAX_GPUS];
 
 static inline int cuda_q8_f16_tier(void) {
     return g_current_logical_tier >= 0 && g_current_logical_tier < DS4_MAX_GPUS
@@ -6397,8 +6401,8 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
 extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
-    static int optional_q8_preload_disabled = 0;
-    if (optional_q8_preload_disabled) return 1;
+    const int preload_tier = cuda_q8_f16_tier();
+    if (g_q8_f16_preload_disabled[preload_tier]) return 1;
     const char *cache_label = label ? label : "q8_0";
     if (!cuda_q8_f16_preload_allowed(cache_label, in_dim, out_dim)) return 1;
     const int preload_transposed_b = !g_quality_mode &&
@@ -6420,13 +6424,16 @@ extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_
             return 1;
         }
     }
-    optional_q8_preload_disabled = 1;
+    g_q8_f16_preload_disabled[preload_tier] = 1;
     return 1;
 }
 
 extern "C" void ds4_gpu_release_q8_f16_cache(void) {
     cuda_q8_f16_cache_release_all();
-    for (int t = 0; t < DS4_MAX_GPUS; t++) g_q8_f16_disabled_after_oom[t] = 0;
+    for (int t = 0; t < DS4_MAX_GPUS; t++) {
+        g_q8_f16_disabled_after_oom[t] = 0;
+        g_q8_f16_preload_disabled[t] = 0;
+    }
     g_q8_f16_budget_notice_printed = 0;
 }
 
