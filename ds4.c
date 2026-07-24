@@ -29353,28 +29353,6 @@ static uint32_t metal_graph_streaming_decode_prefill_max_tokens(
         }
     }
 
-#ifndef DS4_NO_GPU
-    /* CDNA-specific workaround, not a tuning choice: the SSD-streaming
-     * batched graph-prefill path (metal_graph_prefill_layer_major's
-     * split_commands branch) produces content-independent garbage logits on
-     * wave64 hardware -- confirmed on an MI210 down to a 2-token prompt, with
-     * the fast attention kernel and quality mode both ruled out as the cause,
-     * so the bug sits somewhere in the ROCm-specific SSD expert-paging
-     * machinery in that branch (rocm_graph_stream_layer_expert_load and
-     * friends), not in a kernel already covered by the wave64 shuffle-mask
-     * fixes. The per-token streaming decode-prefill path immediately above is
-     * confirmed correct at any length -- it was verified against the CPU
-     * backend for prompts well past this file's normal 18-token cutoff.
-     * Until the batch path itself is fixed, prefer streaming unconditionally
-     * on wave64 so ROCm output stays correct; this costs throughput on long
-     * prompts (streaming is sequential per token) but wrong output is worse
-     * than slow output. RDNA (wave32, Strix Halo) is unaffected and keeps the
-     * batched path's original 18/64-token cutoff. */
-    if (ds4_gpu_wave_size() == 64) {
-        return UINT32_MAX;
-    }
-#endif
-
     if (DS4_MODEL_VARIANT != DS4_VARIANT_PRO &&
         DS4_MODEL_VARIANT != DS4_VARIANT_FLASH) {
         return 0u;
@@ -29388,25 +29366,9 @@ static bool metal_graph_use_streaming_decode_prefill(
         uint32_t             n_tokens) {
     const uint32_t max_tokens =
         metal_graph_streaming_decode_prefill_max_tokens(g, weights);
-    /* Quality mode normally stays off the streaming path in favor of the
-     * batch path's more thorough numerics. On wave64 CDNA the batch path is
-     * the one that's actually broken (see the comment in
-     * metal_graph_streaming_decode_prefill_max_tokens()), and that's true in
-     * quality mode too -- confirmed by comparing quality-mode batch-path
-     * logits against the CPU backend on the same prompt, same garbage as
-     * default mode. So this exclusion is skipped there; everywhere else it's
-     * unchanged. */
-    const bool quality_excludes_streaming =
-        g->quality;
-#ifndef DS4_NO_GPU
-    const bool quality_excludes_streaming_effective =
-        quality_excludes_streaming && ds4_gpu_wave_size() != 64;
-#else
-    const bool quality_excludes_streaming_effective = quality_excludes_streaming;
-#endif
     return g &&
            g->ssd_streaming &&
-           !quality_excludes_streaming_effective &&
+           !g->quality &&
            n_tokens != 0 &&
            max_tokens != 0 &&
            n_tokens <= max_tokens;

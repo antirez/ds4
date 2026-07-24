@@ -282,6 +282,11 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_from_layer_selected(
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_release_layer_cache(void) {
+    /* The last prefill layer can leave an async selected-expert read pending
+     * with no following layer to consume it. Drain that work before hotlist
+     * seeding reuses the shared read pool. */
+    cuda_stream_batch_selected_abort_pending();
+    cuda_stream_selected_abort_pending();
     cuda_stream_layer_expert_cache_release();
     return 1;
 }
