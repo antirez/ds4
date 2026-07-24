@@ -707,6 +707,15 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     }
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
     if (ordered_decode) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+        /* The w32 kernel launches a 32-thread block; on wave64 (CDNA) that
+         * leaves half of every dispatched wavefront idle. See
+         * matmul_f16_ordered_chunks_w64_kernel for detail. */
+        if (cuda_device_wave_size() == 64 && !getenv("DS4_ROCM_DISABLE_F16_ORDERED_W64")) {
+            matmul_f16_ordered_chunks_w64_kernel<<<grid, 64>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
+            return cuda_ok(cudaGetLastError(), "matmul_f16_ordered_chunks w64 launch");
+        }
+#endif
         matmul_f16_ordered_chunks_kernel<<<grid, 32>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
         return cuda_ok(cudaGetLastError(), "matmul_f16_ordered_chunks launch");
     }
