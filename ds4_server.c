@@ -2511,7 +2511,9 @@ static chat_msgs sanitize_messages_for_compaction(const chat_msgs *msgs) {
         chat_msg copy = {0};
         copy.role = xstrdup(m->role);
         copy.content = strip_dsml_markup(m->content);
-        copy.reasoning = xstrdup(m->reasoning);
+        /* chat-completions messages usually have reasoning == NULL (only the
+         * Responses parser always populates it), and xstrdup is NULL-unsafe. */
+        copy.reasoning = m->reasoning ? xstrdup(m->reasoning) : NULL;
         chat_msgs_push(&out, copy);
     }
     return out;
@@ -14056,6 +14058,20 @@ static void test_chat_request_detects_opencode_compaction(void) {
     plain.content = xstrdup("please summarize this file for me");
     chat_msgs_push(&msgs, plain);
     TEST_ASSERT(!chat_msgs_look_like_compaction(&msgs));
+    chat_msgs_free(&msgs);
+
+    /* sanitize_messages_for_compaction must survive reasoning == NULL, which
+     * is the norm for chat-completions messages (xstrdup is NULL-unsafe). */
+    memset(&msgs, 0, sizeof(msgs));
+    chat_msg bare = {0};
+    bare.role = xstrdup("user");
+    bare.content = xstrdup("no reasoning field here");
+    chat_msgs_push(&msgs, bare);
+    chat_msgs clean = sanitize_messages_for_compaction(&msgs);
+    TEST_ASSERT(clean.len == 2);
+    TEST_ASSERT(!strcmp(clean.v[1].role, "user"));
+    TEST_ASSERT(clean.v[1].reasoning == NULL);
+    chat_msgs_free(&clean);
     chat_msgs_free(&msgs);
 }
 
