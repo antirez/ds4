@@ -8163,6 +8163,8 @@ static void server_log(ds4_log_type type, const char *fmt, ...) {
 
 typedef struct job job;
 typedef struct server_slot server_slot;
+static bool server_prefill_enter(server *s, server_slot *slot);
+static void server_prefill_leave(server *s);
 
 typedef ds4_kvstore_entry kv_entry;
 typedef ds4_kvstore_options kv_cache_options;
@@ -9353,6 +9355,19 @@ static void kv_cache_store_current(server *s, server_slot *slot,
     }
 }
 
+/* Replacing a resident session with a disk checkpoint first persists the
+ * current frontier. Treat that eviction save as model work so a long prefill
+ * cannot repeatedly reacquire inference_mu ahead of another resident slot.
+ * The raw store helper remains recursive because prefill progress callbacks
+ * also use it while their slot already owns the model turn. */
+static bool kv_cache_store_current_scheduled(server *s, server_slot *slot,
+                                             const char *reason) {
+    if (!server_prefill_enter(s, slot)) return false;
+    kv_cache_store_current(s, slot, reason);
+    server_prefill_leave(s);
+    return true;
+}
+
 #ifdef DS4_SERVER_TEST
 static int kv_cache_suppress_continued_store(kv_disk_cache *kc, int tokens) {
     return ds4_kvstore_suppress_continued_store(kc, tokens);
@@ -9447,13 +9462,13 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
-    pthread_mutex_lock(&s->inference_mu);
+    if (!server_prefill_enter(s, slot)) return 0;
     pthread_mutex_lock(&s->kv_mu);
     int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, slot->session,
                                            prompt_text, effective_prompt, &lr,
                                            &hooks, responses_protocol);
     pthread_mutex_unlock(&s->kv_mu);
-    pthread_mutex_unlock(&s->inference_mu);
+    server_prefill_leave(s);
     if (loaded > 0) {
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
@@ -10327,10 +10342,8 @@ static int server_session_sync(server *s, server_slot *slot,
         return rc;
     }
 
-    pthread_mutex_lock(&s->inference_mu);
     int live = ds4_session_pos(slot->session);
     int common = ds4_session_common_prefix(slot->session, prompt);
-    pthread_mutex_unlock(&s->inference_mu);
     int done = common == live && prompt->len >= live ? live : 0;
     bool called = false;
 
@@ -11100,7 +11113,10 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
-        kv_cache_store_current(s, slot, "evict");
+        if (!kv_cache_store_current_scheduled(s, slot, "evict")) {
+            ds4_tokens_free(&effective_prompt);
+            return;
+        }
     }
     if (cached == 0) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
