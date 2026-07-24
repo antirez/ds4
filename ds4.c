@@ -16810,6 +16810,7 @@ static bool metal_graph_alloc_raw_cap(
                 "ds4: CUDA tensor parallelism requires an even multi-GPU placement; "
                 "have %d GPU tiers\n",
                 g_n_gpus);
+        metal_graph_free(g);
         return false;
     }
     if (g->cuda_tp_ep &&
@@ -16817,6 +16818,7 @@ static bool metal_graph_alloc_raw_cap(
          (DS4_N_EXPERT & 1u) != 0u)) {
         fprintf(stderr,
                 "ds4: CUDA tensor parallelism requires an even-expert DeepSeek model\n");
+        metal_graph_free(g);
         return false;
     }
     if (g->cuda_tp_ep) {
@@ -16918,6 +16920,7 @@ static bool metal_graph_alloc_raw_cap(
                         "ds4: CUDA tensor parallelism expects layer homes in lower-half "
                         "tiers; placement already uses tier %d\n",
                         t);
+                metal_graph_free(g);
                 return false;
             }
         }
@@ -56335,6 +56338,10 @@ void ds4_engine_close(ds4_engine *e) {
     if (e->mtp_model.map) model_close(&e->mtp_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
+    if (e->shared_prefill_workspace_ready) {
+        metal_graph_free_prefill_workspace(&e->shared_prefill_workspace);
+        e->shared_prefill_workspace_ready = false;
+    }
     ds4_gpu_cleanup();
 #endif
     ds4_ssd_memory_lock_release(&e->simulated_memory);
@@ -63370,14 +63377,19 @@ static bool metal_graph_eval_mixed_prefill_decode(
             metal_graph_prefill_tokens(g), prompt, start, prefill_rows);
     if (ok) {
         int32_t *tokens = malloc((size_t)decode_count * sizeof(*tokens));
-        if (!tokens) return false;
-        for (int i = 0; i < decode_count; i++) tokens[i] = decode_items[i].token;
-        ok = ds4_gpu_tensor_write(
-                metal_graph_prefill_tokens(g),
-                (uint64_t)prefill_rows * sizeof(int32_t),
-                tokens,
-                (uint64_t)decode_count * sizeof(*tokens)) != 0;
-        free(tokens);
+        if (!tokens) {
+            ok = false;
+        } else {
+            for (int i = 0; i < decode_count; i++) {
+                tokens[i] = decode_items[i].token;
+            }
+            ok = ds4_gpu_tensor_write(
+                    metal_graph_prefill_tokens(g),
+                    (uint64_t)prefill_rows * sizeof(int32_t),
+                    tokens,
+                    (uint64_t)decode_count * sizeof(*tokens)) != 0;
+            free(tokens);
+        }
     }
     if (ok) {
         ok = metal_graph_warmup_prefill_kernels(
@@ -63527,10 +63539,12 @@ static bool metal_graph_eval_mixed_prefill_decode(
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const int prefill_src_tier = g->active_tier;
-    ds4_gpu_tensor *saved_prefill_cur = NULL;
+    ds4_gpu_tensor *saved_prefill_cur =
+        prefill_src_tier >= 0 && prefill_src_tier < DS4_MAX_GPUS
+            ? g->cur_hc_by_tier[prefill_src_tier] : NULL;
     ds4_gpu_tensor *last_prefill_hc = NULL;
+    if (ok && !saved_prefill_cur) ok = false;
     if (ok) {
-        saved_prefill_cur = g->cur_hc_by_tier[prefill_src_tier];
         last_prefill_hc = metal_graph_tensor_row_view(
                 metal_graph_batch_cur_hc(g), prefill_rows - 1u, hc_dim);
         ok = last_prefill_hc != NULL;
@@ -63548,7 +63562,9 @@ static bool metal_graph_eval_mixed_prefill_decode(
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
-    g->cur_hc_by_tier[prefill_src_tier] = saved_prefill_cur;
+    if (saved_prefill_cur) {
+        g->cur_hc_by_tier[prefill_src_tier] = saved_prefill_cur;
+    }
     ds4_gpu_tensor_free(last_prefill_hc);
     g->batch_token_offset = 0;
 
