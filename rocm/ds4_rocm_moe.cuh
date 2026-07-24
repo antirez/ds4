@@ -917,6 +917,99 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
     }
 }
 
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+/* Wave64-native counterpart of moe_gate_up_mid_decode_lut_qwarp32_kernel above,
+ * for models whose xq_blocks divides evenly into 16 (this project's iq2_xxs
+ * decode models currently run with xq_blocks == 16).
+ *
+ * A 64-lane wavefront executes all its lanes in lockstep regardless of how
+ * they're sub-grouped for reduction, so widening the group from 8 lanes to
+ * 16 lanes alone does NOT reduce wavefront-cycles per row: qwarp32's 8
+ * groups of 8 lanes compute 8 rows per wavefront in 2 serial b-loop
+ * iterations (throughput 4 rows/iteration); this kernel's 4 groups of 16
+ * lanes compute only 4 rows per wavefront, now in 1 iteration (still 4
+ * rows/iteration) -- a wash, confirmed by an earlier attempt that left the
+ * grid/block tiling unchanged and measured a ~13% *regression* (deeper
+ * 16-wide reduction tree, no offsetting throughput gain).
+ *
+ * The actual lever, mirrored from matmul_q8_0_pair_f32_sharedx_warp_rows_w64_kernel's
+ * real win: that kernel's grid/occupancy also changed (rows_per_block halved,
+ * block count doubled) when its lane group widened, not just the reduction
+ * width. Applied here: since this kernel computes half as many rows per
+ * wavefront as qwarp32 (4 vs 8), rows-per-block is halved to match (64 vs
+ * qwarp32's 128 -- 16 row_lane groups x 4 rr-iterations instead of x8), and
+ * the call site launches twice as many blocks ((expert_mid_dim+63)/64
+ * instead of +127)/128) to cover the same total rows. This trades a smaller
+ * per-block workload for more, smaller blocks -- an occupancy lever, not an
+ * ALU-efficiency one. Falls back to the qwarp32 kernel above whenever
+ * xq_blocks doesn't divide evenly into 16. */
+__global__ static void moe_gate_up_mid_decode_lut_hwarp32_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t write_aux,
+        uint32_t active_mask,
+        float clamp) {
+    uint32_t lane = threadIdx.x & 15u;
+    uint32_t row_lane = threadIdx.x >> 4u;
+    uint32_t pair = blockIdx.y;
+    uint32_t tok = pair / n_expert;
+    uint32_t slot = pair - tok * n_expert;
+    if ((active_mask & (1u << slot)) == 0) return;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    uint32_t expert = (uint32_t)expert_i;
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    __shared__ cuda_block_q8_K sxq[16];
+    __shared__ uint64_t s_iq2_grid[256];
+    __shared__ uint8_t s_iq2_signs[128];
+    if (xq_blocks <= 16u) {
+        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
+        for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+        __syncthreads();
+        xqb = sxq;
+    }
+    for (uint32_t rr = 0; rr < 4u; rr++) {
+        uint32_t row = blockIdx.x * 64u + row_lane + rr * 16u;
+        if (row >= expert_mid_dim) continue;
+        const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        float gate = 0.0f;
+        float up = 0.0f;
+        for (uint32_t b = lane; b < xq_blocks; b += 16u) {
+            gate += dev_dot_iq2_xxs_q8_K_block_lut(gr + b, xqb + b, s_iq2_grid, s_iq2_signs);
+            up += dev_dot_iq2_xxs_q8_K_block_lut(ur + b, xqb + b, s_iq2_grid, s_iq2_signs);
+        }
+        gate = half_warp_sum_f32(gate, lane);
+        up = half_warp_sum_f32(up, lane);
+        if (lane == 0) {
+            if (clamp > 1.0e-6f) {
+                if (gate > clamp) gate = clamp;
+                if (up > clamp) up = clamp;
+                if (up < -clamp) up = -clamp;
+            }
+            const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+            if (write_aux) {
+                gate_out[off] = gate;
+                up_out[off] = up;
+            }
+            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        }
+    }
+}
+#endif
+
 __global__ static void moe_gate_up_mid_decode_lut_qwarp32_ptrs_kernel(
         float *gate_out,
         float *up_out,

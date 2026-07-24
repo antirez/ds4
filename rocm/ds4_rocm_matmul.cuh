@@ -514,6 +514,32 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     if (!w0 || !w1) return 0;
     const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
     if ((in_dim & 31u) == 0u && in_dim <= 8192u) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+        /* On wave64 parts, one wavefront can compute one row using both
+         * 32-lane halves together (see matmul_q8_0_pair_f32_sharedx_warp_rows_w64_kernel)
+         * instead of splitting a wavefront into two independent w32 rows.
+         * Same row count per launch, so the grid doubles to match rows_per_block
+         * halving. Any other/unrecognized wave size falls through to the w32
+         * kernel below, which is correct (if not w64-optimal) everywhere. */
+        if (cuda_device_wave_size() == 64 && !getenv("DS4_ROCM_DISABLE_PAIR_W64")) {
+            const unsigned rows_per_block = 16u;
+            const unsigned threads = rows_per_block * 64u;
+            matmul_q8_0_pair_f32_sharedx_warp_rows_w64_kernel<<<
+                    (unsigned)((max_out + rows_per_block - 1u) / rows_per_block),
+                    threads,
+                    (size_t)in_dim * sizeof(float)>>>(
+                    (float *)out0->ptr,
+                    (float *)out1->ptr,
+                    reinterpret_cast<const unsigned char *>(w0),
+                    reinterpret_cast<const unsigned char *>(w1),
+                    (const float *)x->ptr,
+                    (uint32_t)blocks,
+                    out0_dim,
+                    out1_dim,
+                    blocks * 34u);
+            return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair f32 sharedx w64 launch");
+        }
+#endif
         const unsigned rows_per_block = 32u;
         const unsigned threads = rows_per_block * 32u;
         matmul_q8_0_pair_f32_sharedx_warp_rows_w32_kernel<<<

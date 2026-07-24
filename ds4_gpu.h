@@ -604,6 +604,29 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Test-only direct entry point for the MoE gate/up/mid decode-LUT kernels
+ * (qwarp32 baseline vs the wave64-native hwarp32 variant); see
+ * ds4_gpu_test_moe_gate_up_mid_decode_lut_tensor's definition for the
+ * force_kernel values. Not used by production code. */
+int ds4_gpu_test_moe_gate_up_mid_decode_lut_tensor(
+        ds4_gpu_tensor       *gate_out,
+        ds4_gpu_tensor       *up_out,
+        ds4_gpu_tensor       *mid_out,
+        const ds4_gpu_tensor *gate_base,
+        const ds4_gpu_tensor *up_base,
+        const ds4_gpu_tensor *xq,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint32_t                xq_blocks,
+        uint32_t                expert_mid_dim,
+        uint32_t                n_expert,
+        uint32_t                n_tok,
+        uint32_t                write_aux,
+        float                   clamp,
+        int                     force_kernel);
+
 /* Multi-row decode projections that preserve the one-row reduction order. */
 int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out,
