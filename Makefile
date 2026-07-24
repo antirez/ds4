@@ -193,6 +193,18 @@ test-rocm-moe-gate-up-mid-hwarp32:
 	$(MAKE) tests/test_rocm_moe_gate_up_mid_hwarp32 $(ROCM_BUILD_VARS)
 	./tests/test_rocm_moe_gate_up_mid_hwarp32
 
+tests/test_rocm_moe_down_sum6.o: tests/test_rocm_moe_down_sum6.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_rocm_moe_down_sum6: tests/test_rocm_moe_down_sum6.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+# Needs a real GPU.  Run after a ROCm build, e.g.
+#   make mi200 && make test-rocm-moe-down-sum6 ROCM_ARCH=gfx90a
+test-rocm-moe-down-sum6:
+	$(MAKE) tests/test_rocm_moe_down_sum6 $(ROCM_BUILD_VARS)
+	./tests/test_rocm_moe_down_sum6
+
 ds4: ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 

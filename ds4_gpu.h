@@ -627,6 +627,22 @@ int ds4_gpu_test_moe_gate_up_mid_decode_lut_tensor(
         float                   clamp,
         int                     force_kernel);
 
+/* Test-only direct entry point for the MoE routed-down-projection sum6
+ * kernels (qwarp32 baseline vs the wave64-native hwarp32 variant); see
+ * ds4_gpu_test_moe_down_sum6_tensor's definition for the force_kernel
+ * values. Not used by production code. */
+int ds4_gpu_test_moe_down_sum6_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *down_base,
+        const ds4_gpu_tensor *midq,
+        const ds4_gpu_tensor *selected,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                midq_blocks,
+        uint32_t                out_dim,
+        uint32_t                n_expert,
+        int                     force_kernel);
+
 /* Multi-row decode projections that preserve the one-row reduction order. */
 int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out,

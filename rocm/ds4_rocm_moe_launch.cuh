@@ -1676,6 +1676,21 @@ static int routed_moe_launch(
                         out_dim,
                         n_expert);
                 } else {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+                    if (cuda_device_wave_size() == 64 && !getenv("DS4_ROCM_DISABLE_MOE_DOWN_SUM6_HWARP32")) {
+                        dim3 sgrid_hwarp32((out_dim + 15u) / 16u, 1, 1);
+                        moe_down_sum6_hwarp32_kernel<<<sgrid_hwarp32, 256>>>(
+                            (float *)out->ptr,
+                            down_w,
+                            midq,
+                            (const int32_t *)selected_exec->ptr,
+                            down_expert_bytes,
+                            down_row_bytes,
+                            midq_blocks,
+                            out_dim,
+                            n_expert);
+                    } else
+#endif
                     moe_down_sum6_qwarp32_kernel<<<sgrid, 256>>>(
                         (float *)out->ptr,
                         down_w,
@@ -2435,6 +2450,20 @@ static int routed_moe_launch(
                             out_dim,
                             n_expert);
                 } else {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+                    if (cuda_device_wave_size() == 64 && !getenv("DS4_ROCM_DISABLE_MOE_DOWN_SUM6_HWARP32")) {
+                        moe_down_sum6_hwarp32_kernel<<<(out_dim + 15u) / 16u, 256>>>(
+                                (float *)out->ptr,
+                                down_w,
+                                midq,
+                                (const int32_t *)selected_exec->ptr,
+                                down_expert_bytes,
+                                down_row_bytes,
+                                midq_blocks,
+                                out_dim,
+                                n_expert);
+                    } else
+#endif
                     moe_down_sum6_qwarp32_kernel<<<(out_dim + 31u) / 32u, 256>>>(
                             (float *)out->ptr,
                             down_w,
@@ -2646,4 +2675,43 @@ extern "C" int ds4_gpu_test_moe_gate_up_mid_decode_lut_tensor(
             gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
             write_aux, 0xffffffffu, clamp);
     return cuda_ok(cudaGetLastError(), "test moe_gate_up_mid_decode_lut_qwarp32 launch");
+}
+
+/* Test-only direct entry point for moe_down_sum6_qwarp32_kernel /
+ * moe_down_sum6_hwarp32_kernel, bypassing the routed-MoE dispatch machinery
+ * so tests/test_rocm_moe_down_sum6.c can drive either kernel directly with
+ * synthetic data. force_kernel: 0 = auto-dispatch (matches the real call
+ * site), 1 = force qwarp32, 2 = force hwarp32. */
+extern "C" int ds4_gpu_test_moe_down_sum6_tensor(
+        ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *down_base,
+        const ds4_gpu_tensor *midq,
+        const ds4_gpu_tensor *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        int force_kernel) {
+    if (!out || !down_base || !midq || !selected) return 0;
+    dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    const int use_hwarp32 = force_kernel == 2 ||
+        (force_kernel == 0 && cuda_device_wave_size() == 64);
+    if (use_hwarp32) {
+        dim3 sgrid_hwarp32((out_dim + 15u) / 16u, 1, 1);
+        moe_down_sum6_hwarp32_kernel<<<sgrid_hwarp32, 256>>>(
+                (float *)out->ptr, (const char *)down_base->ptr,
+                (const cuda_block_q8_K *)midq->ptr, (const int32_t *)selected->ptr,
+                down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert);
+        return cuda_ok(cudaGetLastError(), "test moe_down_sum6_hwarp32 launch");
+    }
+#else
+    (void)force_kernel;
+#endif
+    moe_down_sum6_qwarp32_kernel<<<sgrid, 256>>>(
+            (float *)out->ptr, (const char *)down_base->ptr,
+            (const cuda_block_q8_K *)midq->ptr, (const int32_t *)selected->ptr,
+            down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert);
+    return cuda_ok(cudaGetLastError(), "test moe_down_sum6_qwarp32 launch");
 }
