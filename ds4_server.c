@@ -13335,15 +13335,19 @@ int main(int argc, char **argv) {
     if (cfg.batched_sessions > 0) {
         const uint32_t reserve_pc =
             cfg.engine.prefill_chunk ? cfg.engine.prefill_chunk : 4096u;
+        /* Estimate with the CUDA layout regardless of the backend configured
+         * so far (the final backend may be assigned later during engine
+         * setup): only the CUDA cache reads this env, and the CUDA estimate
+         * is the largest. */
         const ds4_context_memory rm =
-            ds4_context_memory_estimate_with_prefill_mode(cfg.engine.backend,
+            ds4_context_memory_estimate_with_prefill_mode(DS4_BACKEND_CUDA,
                                                           cfg.ctx_size,
                                                           reserve_pc,
                                                           cfg.engine.ssd_streaming);
         const uint64_t reserve_mib = 768ull +
-                (rm.total_bytes / (1024ull * 1024ull) + 64ull) *
+                (rm.total_bytes / (1024ull * 1024ull) + 128ull) *
                         (uint64_t)cfg.batched_sessions +
-                (uint64_t)reserve_pc + 256ull;
+                512ull;
         char reserve_buf[32];
         snprintf(reserve_buf, sizeof(reserve_buf), "%llu",
                  (unsigned long long)reserve_mib);
