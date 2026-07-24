@@ -2465,6 +2465,34 @@ static char *strip_dsml_markup(const char *s) {
     return buf_take(&out);
 }
 
+/* opencode and other chat-completions clients send compaction/summarization
+ * requests through /v1/chat/completions, not the Responses API, so the
+ * last_was_compaction bookkeeping never fires for them.  Detect those
+ * requests by their distinctive summarization instructions instead:
+ * opencode's compaction system prompt ("anchored context summarization
+ * assistant") or the trailing user instruction asking for the anchored
+ * summary.  Without this, compaction requests arrive with full tool schemas
+ * and a DSML-saturated history, the model emits tool-call stanzas as its
+ * "summary", and the session stalls on a corrupted compaction. */
+static bool chat_msgs_look_like_compaction(const chat_msgs *msgs) {
+    if (!msgs) return false;
+    static const char *const markers[] = {
+        "anchored context summarization assistant",
+        "<previous-summary>",
+        "Create a new anchored summary from the conversation history",
+        "Update the anchored summary below using the conversation history above",
+    };
+    for (int i = 0; i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (!m->content) continue;
+        if (!role_is_system(m->role) && strcmp(m->role, "user")) continue;
+        for (size_t k = 0; k < sizeof(markers) / sizeof(markers[0]); k++) {
+            if (strstr(m->content, markers[k])) return true;
+        }
+    }
+    return false;
+}
+
 /* Build a compaction-safe copy of the conversation history:
  *   - adds an explicit plain-text instruction,
  *   - strips any raw DSML blocks stored in assistant content,
@@ -3171,7 +3199,15 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         request_free(r);
         return false;
     }
-    r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
+    /* Compaction/summarization requests must not be primed for tools: with
+     * schemas rendered and a DSML-heavy history, the model emits tool-call
+     * stanzas as its "summary", corrupting the compacted context.  Mirror
+     * the Responses-path handling: drop the schemas, sanitize the history,
+     * and mark the request so any leaked DSML is stripped from the reply. */
+    const bool compaction_request = chat_msgs_look_like_compaction(&msgs);
+    r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none &&
+                   !compaction_request;
+    r->compaction = compaction_request;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
@@ -3179,12 +3215,16 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
+    chat_msgs prompt_msgs = compaction_request
+        ? sanitize_messages_for_compaction(&msgs)
+        : msgs;
     r->prompt_preserves_reasoning =
-        chat_history_uses_tool_context(&msgs, active_tool_schemas);
+        chat_history_uses_tool_context(&prompt_msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text_for_syntax(
-        r->model_syntax, &msgs, active_tool_schemas,
+        r->model_syntax, &prompt_msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    if (compaction_request) chat_msgs_free(&prompt_msgs);
     chat_msgs_free(&msgs);
     free(tool_schemas);
     return true;
@@ -13980,6 +14020,45 @@ static void test_responses_input_compaction_flag_tracks_last_item(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_chat_request_detects_opencode_compaction(void) {
+    /* opencode sends compaction through /v1/chat/completions with a
+     * distinctive summarization system prompt and full tool schemas; the
+     * chat path must detect it independently of the Responses bookkeeping. */
+    chat_msgs msgs = {0};
+    chat_msg sys = {0};
+    sys.role = xstrdup("system");
+    sys.content = xstrdup(
+        "You are an anchored context summarization assistant for coding sessions.\n"
+        "Summarize only the conversation history you are given.");
+    chat_msgs_push(&msgs, sys);
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Create a new anchored summary from the conversation history.");
+    chat_msgs_push(&msgs, user);
+    TEST_ASSERT(chat_msgs_look_like_compaction(&msgs));
+    chat_msgs_free(&msgs);
+
+    /* A previous-summary update prompt is also compaction. */
+    memset(&msgs, 0, sizeof(msgs));
+    chat_msg upd = {0};
+    upd.role = xstrdup("user");
+    upd.content = xstrdup(
+        "Update the anchored summary below using the conversation history above.\n"
+        "<previous-summary>\nold\n</previous-summary>");
+    chat_msgs_push(&msgs, upd);
+    TEST_ASSERT(chat_msgs_look_like_compaction(&msgs));
+    chat_msgs_free(&msgs);
+
+    /* Ordinary chat that merely mentions summarizing must not be flagged. */
+    memset(&msgs, 0, sizeof(msgs));
+    chat_msg plain = {0};
+    plain.role = xstrdup("user");
+    plain.content = xstrdup("please summarize this file for me");
+    chat_msgs_push(&msgs, plain);
+    TEST_ASSERT(!chat_msgs_look_like_compaction(&msgs));
+    chat_msgs_free(&msgs);
+}
+
 static void test_responses_output_sends_tool_search_call_item(void) {
     tool_calls calls = {0};
     tool_call tc = {0};
@@ -18432,6 +18511,7 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_input_tool_search_output_rejects_bad_tools();
     test_responses_input_function_call_namespace_round_trips_to_dsml();
     test_responses_input_compaction_flag_tracks_last_item();
+    test_chat_request_detects_opencode_compaction();
     test_responses_output_sends_tool_search_call_item();
     test_dsml_tool_args_preserve_call_order();
     test_openai_tool_args_preserve_call_order();
