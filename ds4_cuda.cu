@@ -6889,6 +6889,23 @@ __global__ static void rope_tail_decode_rows_kernel(
     tail[i + 1u] = x0 * s + x1 * c;
 }
 
+/* Batched-decode limits and per-sequence KV view.  ds4_cuda.cu does not
+ * include ds4_gpu.h, so these mirror the definitions there and must stay in
+ * sync (DS4_GPU_DECODE_MULTI_MAX, ds4_gpu_attn_seqview). */
+#ifndef DS4_GPU_DECODE_MULTI_MAX
+#define DS4_GPU_DECODE_MULTI_MAX 4u
+#endif
+
+typedef struct {
+    const ds4_gpu_tensor *raw_kv;
+    const ds4_gpu_tensor *comp_kv;     /* NULL when the layer keeps no compressed cache */
+    const ds4_gpu_tensor *comp_mask;   /* per-sequence mask row (n_comp floats), NULL = none */
+    uint32_t                n_raw;
+    uint32_t                raw_cap;
+    uint32_t                raw_start;
+    uint32_t                n_comp;
+} ds4_gpu_attn_seqview;
+
 /* pos-vector twins of the two RoPE kernels above, for batched decode where
  * each token belongs to a different sequence at an arbitrary position.  The
  * per-element arithmetic is kept identical so token t matches a single-token
