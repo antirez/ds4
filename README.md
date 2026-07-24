@@ -236,7 +236,8 @@ comparison or rollback. For narrower A/B tests,
 `DS4_CUDA_LAGUNA_NO_TILED_GQA_PREFILL=1` retains the warp-per-head kernel but
 stages one K/V row at a time, while
 `DS4_CUDA_LAGUNA_NO_Q4_MMA_TILE16=1` retains the eight-pair tensor-core MoE
-tile.
+tile for both projections. To isolate only the down projection,
+`DS4_CUDA_LAGUNA_NO_Q4_MMA_DOWN_TILE16=1` retains its eight-pair tile.
 
 The shipped GGUF is configured for a 262144-token context. Laguna defaults to
 temperature 1.0, top-k 20, top-p 1.0, and min-p 0; explicit sampling options

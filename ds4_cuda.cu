@@ -33030,6 +33030,12 @@ static int cuda_laguna_routed_moe(
         cuda_laguna_blackwell_ok() &&
         getenv("DS4_CUDA_LAGUNA_NO_Q4_MMA_TILE16") == NULL &&
         cuda_q4_mma_tile16_shmem_ok(0);
+    const bool use_q4_mma_down_tile16 =
+        use_q4_mma_gate_up_tile16 &&
+        use_q4_mma_down &&
+        out_dim % expert_mid_dim == 0u &&
+        getenv("DS4_CUDA_LAGUNA_NO_Q4_MMA_DOWN_TILE16") == NULL &&
+        cuda_q4_mma_tile16_shmem_ok(1);
     const uint64_t xq_bytes =
         (uint64_t)n_tokens * xq_blocks * sizeof(cuda_block_q8_K);
     const uint64_t midq_offset = (xq_bytes + 255u) & ~255ull;
@@ -33409,7 +33415,33 @@ static int cuda_laguna_routed_moe(
             }
             dim3 down_grid((chunk_rows + 511u) / 512u,
                            (uint32_t)tile_capacity, 1u);
-            if (desc->down_type == 14u) {
+            if (use_q4_mma_down_tile16) {
+                /* Every full Laguna output chunk has the same width as the
+                 * compact term stride.  Rebase the weights to this chunk and
+                 * reuse the exact generic tile16 kernel, halving Q4_K weight
+                 * traffic without allocating the full down tensor. */
+                dim3 down16_grid(
+                        (chunk_rows + 511u) / 512u,
+                        (uint32_t)tile16_capacity, 1u);
+                const size_t tile16_shmem =
+                    16u * midq_blocks * sizeof(cuda_block_q8_K);
+                moe_down_q4K_tile16_mma_kernel<512>
+                        <<<down16_grid, 256, tile16_shmem>>>(
+                        (float *)mid->ptr,
+                        down + (uint64_t)row0 * desc->down_row_bytes,
+                        midq,
+                        sorted_pairs,
+                        sorted_offsets,
+                        sorted_counts,
+                        tile16_total,
+                        tile16_experts,
+                        tile16_starts,
+                        desc->down_expert_bytes,
+                        desc->down_row_bytes,
+                        midq_blocks,
+                        expert_mid_dim,
+                        n_expert);
+            } else if (desc->down_type == 14u) {
                 laguna_moe_down_expert_tile8_chunk_kernel<true, 512>
                         <<<down_grid, 256>>>(
                         (float *)mid->ptr,
