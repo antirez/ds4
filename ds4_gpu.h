@@ -2022,6 +2022,13 @@ typedef struct {
     uint32_t                n_comp;
 } ds4_gpu_attn_seqview;
 
+/* True when the multi-sequence decode attention kernel can serve a sequence
+ * with n_comp visible compressed rows (score buffer bound, no online variant
+ * yet) and the compressed cache layout it supports. */
+int ds4_gpu_attention_decode_multi_supported(
+        uint32_t                n_comp,
+        uint32_t                comp_kv_f16);
+
 int ds4_gpu_attention_decode_heads_multi_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,

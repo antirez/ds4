@@ -17691,6 +17691,10 @@ extern "C" int ds4_gpu_attention_decode_rows_rope_tensor(
                    "attention decode rows inverse rope launch");
 }
 
+extern "C" int ds4_gpu_attention_decode_multi_supported(uint32_t n_comp, uint32_t comp_kv_f16) {
+    return comp_kv_f16 == 0 && cuda_attention_score_buffer_fits(n_comp) ? 1 : 0;
+}
+
 extern "C" int ds4_gpu_attention_decode_heads_multi_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
