@@ -13325,6 +13325,34 @@ int main(int argc, char **argv) {
     cfg.engine.placement_session_count_hint =
         cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;
     cfg.engine.share_session_prefill_workspace = cfg.batched_sessions > 0;
+    /* Resident sessions allocate their context buffers after the engine has
+     * warmed its lazy Q8->F16 weight caches, and those caches grow until only
+     * the default reserve (~1% of VRAM) stays free — leaving no room for the
+     * sessions and failing creation even at modest ctx sizes.  Raise the
+     * reserve so cache growth leaves space for every resident session, the
+     * shared prefill workspace and some slack.  An explicit
+     * DS4_CUDA_Q8_F16_CACHE_RESERVE_MB in the environment always wins. */
+    if (cfg.batched_sessions > 0) {
+        const uint32_t reserve_pc =
+            cfg.engine.prefill_chunk ? cfg.engine.prefill_chunk : 4096u;
+        const ds4_context_memory rm =
+            ds4_context_memory_estimate_with_prefill_mode(cfg.engine.backend,
+                                                          cfg.ctx_size,
+                                                          reserve_pc,
+                                                          cfg.engine.ssd_streaming);
+        const uint64_t reserve_mib = 768ull +
+                (rm.total_bytes / (1024ull * 1024ull) + 64ull) *
+                        (uint64_t)cfg.batched_sessions +
+                (uint64_t)reserve_pc + 256ull;
+        char reserve_buf[32];
+        snprintf(reserve_buf, sizeof(reserve_buf), "%llu",
+                 (unsigned long long)reserve_mib);
+        setenv("DS4_CUDA_Q8_F16_CACHE_RESERVE_MB", reserve_buf, 0);
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: reserving %llu MiB of VRAM from the weight cache for %d resident sessions",
+                   (unsigned long long)reserve_mib,
+                   cfg.batched_sessions);
+    }
     ds4_engine *engine = NULL;
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
         ds4_gpu_config gpu_cfg = {0};
