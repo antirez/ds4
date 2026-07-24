@@ -51916,6 +51916,13 @@ struct ds4_session {
     bool laguna_graph_ready;
     ds4_dflash_gpu_graph dflash_graph;
     bool dflash_graph_ready;
+    uint32_t dflash_adapt_depth;
+    uint32_t dflash_adapt_cooldown;
+    uint32_t dflash_adapt_backoff;
+    uint32_t dflash_adapt_good_cycles;
+    uint32_t dflash_adapt_next_pos;
+    double dflash_adapt_baseline_ms;
+    bool dflash_adapt_initialized;
     uint32_t glm_dense_cache_len;
     /* GLM MTP speculative state (--glm-mtp, greedy only). */
     int glm_mtp_draft;
@@ -69208,6 +69215,69 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
 }
 
 #ifndef DS4_NO_GPU
+static bool ds4_dflash_adaptive_enabled(void) {
+    const char *env = getenv("DS4_DFLASH_ADAPTIVE");
+    return !env || !env[0] ||
+           (strcmp(env, "0") != 0 && strcasecmp(env, "false") != 0);
+}
+
+static uint32_t ds4_dflash_adaptive_start(uint32_t ceiling) {
+    return ceiling < 4u ? ceiling : 4u;
+}
+
+static void ds4_session_dflash_adaptive_reset(
+        ds4_session *s, uint32_t ceiling) {
+    if (!s) return;
+    s->dflash_adapt_depth = ds4_dflash_adaptive_start(ceiling);
+    s->dflash_adapt_cooldown = 0u;
+    s->dflash_adapt_backoff = 8u;
+    s->dflash_adapt_good_cycles = 0u;
+    s->dflash_adapt_next_pos =
+        s->checkpoint.len > 0 ? (uint32_t)s->checkpoint.len : 0u;
+    s->dflash_adapt_baseline_ms = 0.0;
+    s->dflash_adapt_initialized = true;
+}
+
+static void ds4_session_dflash_note_baseline(
+        ds4_session *s, double elapsed_ms) {
+    if (!s || !isfinite(elapsed_ms) || elapsed_ms <= 0.0) return;
+    if (s->dflash_adapt_baseline_ms <= 0.0) {
+        s->dflash_adapt_baseline_ms = elapsed_ms;
+    } else {
+        s->dflash_adapt_baseline_ms =
+            0.75 * s->dflash_adapt_baseline_ms + 0.25 * elapsed_ms;
+    }
+}
+
+static int ds4_session_eval_dflash_baseline(
+        ds4_session *s,
+        int          first_token,
+        int         *accepted,
+        char        *err,
+        size_t       errlen,
+        const char  *reason) {
+    const double t0 = now_sec();
+    if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+    const double elapsed_ms = (now_sec() - t0) * 1000.0;
+    ds4_session_dflash_note_baseline(s, elapsed_ms);
+    accepted[0] = first_token;
+    s->dflash_adapt_next_pos = (uint32_t)s->checkpoint.len;
+    if (getenv("DS4_DFLASH_LOG") &&
+        (strcmp(reason, "calibrate") == 0 ||
+         s->dflash_adapt_cooldown == 0u ||
+         getenv("DS4_DFLASH_LOG_VERBOSE") != NULL)) {
+        fprintf(stderr,
+                "ds4: DFlash adaptive baseline reason=%s elapsed=%.3f ms "
+                "ewma=%.3f ms cooldown=%u next_depth=%u\n",
+                reason,
+                elapsed_ms,
+                s->dflash_adapt_baseline_ms,
+                s->dflash_adapt_cooldown,
+                s->dflash_adapt_depth);
+    }
+    return 1;
+}
+
 static int ds4_session_eval_dflash_argmax(
         ds4_session *s,
         int          first_token,
@@ -69218,7 +69288,26 @@ static int ds4_session_eval_dflash_argmax(
         char        *err,
         size_t       errlen) {
     ds4_engine *e = s->engine;
-    int draft_n = e->mtp_draft_tokens;
+    const uint32_t ceiling = (uint32_t)e->mtp_draft_tokens;
+    const bool adaptive = ds4_dflash_adaptive_enabled();
+    if (adaptive &&
+        (!s->dflash_adapt_initialized ||
+         s->dflash_adapt_next_pos != (uint32_t)s->checkpoint.len)) {
+        ds4_session_dflash_adaptive_reset(s, ceiling);
+    }
+    if (adaptive && s->dflash_adapt_baseline_ms <= 0.0) {
+        return ds4_session_eval_dflash_baseline(
+                s, first_token, accepted, err, errlen, "calibrate");
+    }
+    if (adaptive && s->dflash_adapt_cooldown != 0u) {
+        s->dflash_adapt_cooldown--;
+        return ds4_session_eval_dflash_baseline(
+                s, first_token, accepted, err, errlen, "cooldown");
+    }
+
+    const uint32_t requested_depth =
+        adaptive ? s->dflash_adapt_depth : ceiling;
+    int draft_n = (int)requested_depth;
     if (draft_n > max_tokens - 1) draft_n = max_tokens - 1;
     if (draft_n > accepted_cap - 1) draft_n = accepted_cap - 1;
     int room = s->ctx_size - s->checkpoint.len - 1;
@@ -69320,18 +69409,82 @@ static int ds4_session_eval_dflash_argmax(
     }
     s->checkpoint_valid = true;
     const double tv = now_sec();
+    const double cycle_ms = (tv - t0) * 1000.0;
+    uint32_t next_depth = requested_depth;
+    double ms_per_token = cycle_ms / (double)n_accept;
+    if (adaptive) {
+        const bool full_depth = (uint32_t)draft_n == requested_depth;
+        const double baseline_ms = s->dflash_adapt_baseline_ms;
+        const bool unprofitable =
+            full_depth && baseline_ms > 0.0 &&
+            ms_per_token > baseline_ms * 1.05;
+        const bool strongly_profitable =
+            full_depth && baseline_ms > 0.0 &&
+            ms_per_token < baseline_ms * 0.90;
+
+        if (unprofitable) {
+            s->dflash_adapt_good_cycles = 0u;
+            if (requested_depth > 4u) {
+                next_depth = requested_depth / 2u;
+                if (next_depth < 4u) next_depth = 4u;
+            } else {
+                s->dflash_adapt_depth =
+                    ds4_dflash_adaptive_start(ceiling);
+                s->dflash_adapt_cooldown = s->dflash_adapt_backoff;
+                if (s->dflash_adapt_backoff < 64u) {
+                    s->dflash_adapt_backoff *= 2u;
+                    if (s->dflash_adapt_backoff > 64u) {
+                        s->dflash_adapt_backoff = 64u;
+                    }
+                }
+                next_depth = s->dflash_adapt_depth;
+            }
+        } else if (strongly_profitable &&
+                   matched == draft_n &&
+                   requested_depth < ceiling) {
+            s->dflash_adapt_good_cycles++;
+            if (s->dflash_adapt_good_cycles >= 2u) {
+                uint32_t growth = requested_depth / 2u;
+                if (growth == 0u) growth = 1u;
+                next_depth = requested_depth + growth;
+                if (next_depth > ceiling) next_depth = ceiling;
+                s->dflash_adapt_good_cycles = 0u;
+                s->dflash_adapt_backoff = 8u;
+            }
+        } else {
+            s->dflash_adapt_good_cycles = 0u;
+        }
+        if (s->dflash_adapt_cooldown == 0u) {
+            s->dflash_adapt_depth = next_depth;
+        }
+        s->dflash_adapt_next_pos = (uint32_t)s->checkpoint.len;
+    }
     if (getenv("DS4_DFLASH_LOG")) {
         fprintf(stderr,
-                "ds4: DFlash drafted=%d matched=%d committed=%d draft=%.3f ms "
+                "ds4: DFlash drafted=%d matched=%d committed=%d "
+                "depth=%u next_depth=%u cooldown=%u "
+                "draft=%.3f ms "
                 "target=%.3f ms inject=%.3f ms finish=%.3f ms total=%.3f ms\n",
                 draft_n,
                 matched,
                 n_accept,
+                requested_depth,
+                adaptive ? s->dflash_adapt_depth : requested_depth,
+                adaptive ? s->dflash_adapt_cooldown : 0u,
                 (td - t0) * 1000.0,
                 (tt - td) * 1000.0,
                 (ti - tt) * 1000.0,
                 (tv - ti) * 1000.0,
-                (tv - t0) * 1000.0);
+                cycle_ms);
+        if (adaptive) {
+            fprintf(stderr,
+                    "ds4: DFlash adaptive cost=%.3f ms/token "
+                    "baseline=%.3f ms/token ratio=%.3f\n",
+                    ms_per_token,
+                    s->dflash_adapt_baseline_ms,
+                    s->dflash_adapt_baseline_ms > 0.0 ?
+                        ms_per_token / s->dflash_adapt_baseline_ms : 0.0);
+        }
     }
     return n_accept;
 }

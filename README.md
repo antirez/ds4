@@ -217,11 +217,14 @@ batch. Greedy decoding remains target-verified:
   --mtp gguf/laguna-s-2.1-DFlash-BF16.gguf --mtp-draft 15 --temp 0
 ```
 
-`--mtp-draft` defaults to 15 for this drafter and can be reduced for
-experiments. DFlash needs roughly another 2.1 GiB for weights plus its graph
-buffers. It is not enabled automatically because throughput depends on draft
-acceptance for the workload and on the cost of the target's small verification
-batches.
+`--mtp-draft` defaults to 15 for this drafter and sets the adaptive scheduler's
+ceiling. Each session calibrates ordinary target decode, starts speculation at
+depth four, backs off when verified cost per committed token is worse, and
+grows after repeated full, profitable accepts. Set `DS4_DFLASH_ADAPTIVE=0` to
+use the fixed requested depth. DFlash needs roughly another 2.1 GiB for weights
+plus its graph buffers. It is not enabled automatically because throughput
+depends on draft acceptance for the workload and on the cost of the target's
+small verification batches.
 
 On Blackwell GPUs, DFlash also groups its nine query heads per KV head into one
 attention block so each sliding-window K/V row is loaded once per group.
