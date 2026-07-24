@@ -5420,6 +5420,103 @@ __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
     }
 }
 
+/* Revised Laguna decode projects one Q8_0 signal activation through Q, K, V,
+ * and the learned attention gate. Keep the exact per-row reduction used by
+ * matmul_q8_0_pair_preq_warp8_kernel, but share activation loads across all
+ * live projections and collapse two paired launches into one. */
+__global__ static void laguna_qkvg_q8_0_preq_warp8_kernel(
+        float *q,
+        float *k,
+        float *v,
+        float *gate,
+        const unsigned char *qw,
+        const unsigned char *kw,
+        const unsigned char *vw,
+        const unsigned char *gw,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t q_dim,
+        uint64_t kv_dim,
+        uint64_t gate_dim,
+        uint64_t blocks,
+        int use_dp4a) {
+    const uint64_t row =
+        (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= q_dim && row >= kv_dim && row >= gate_dim) return;
+
+    /* Q is much wider than K/V/gate in Laguna. Avoid carrying four
+     * accumulators and issuing three empty reductions for its Q-only tail. */
+    if (row < q_dim && row >= kv_dim && row >= gate_dim) {
+        float q_acc = 0.0f;
+        const unsigned char *qrow = qw + row * blocks * 34u;
+        for (uint64_t b = lane; b < blocks; b += 32u) {
+            const uint64_t i0 = b * 32u;
+            const uint64_t bn =
+                in_dim - i0 < 32u ? in_dim - i0 : 32u;
+            const __half *scale_h =
+                (const __half *)(qrow + b * 34u);
+            const int8_t *qs =
+                (const int8_t *)(qrow + b * 34u + 2u);
+            const int dot = dot_i8_block(
+                qs, xq + b * 32u, bn, use_dp4a);
+            q_acc += __half2float(*scale_h) *
+                     xscale[b] * (float)dot;
+        }
+        q_acc = warp_sum_f32(q_acc);
+        if (lane == 0u) q[row] = q_acc;
+        return;
+    }
+
+    float q_acc = 0.0f;
+    float k_acc = 0.0f;
+    float v_acc = 0.0f;
+    float g_acc = 0.0f;
+    const unsigned char *qrow =
+        row < q_dim ? qw + row * blocks * 34u : NULL;
+    const unsigned char *krow =
+        row < kv_dim ? kw + row * blocks * 34u : NULL;
+    const unsigned char *vrow =
+        row < kv_dim ? vw + row * blocks * 34u : NULL;
+    const unsigned char *grow =
+        row < gate_dim ? gw + row * blocks * 34u : NULL;
+
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const uint64_t i0 = b * 32u;
+        const uint64_t bn = in_dim - i0 < 32u ? in_dim - i0 : 32u;
+        const int8_t *xqb = xq + b * 32u;
+        const float xs = xscale[b];
+#define DS4_LAGUNA_Q8_ACCUM(row_ptr, acc) do { \
+            if ((row_ptr) != NULL) { \
+                const __half *scale_h = \
+                    (const __half *)((row_ptr) + b * 34u); \
+                const int8_t *qs = \
+                    (const int8_t *)((row_ptr) + b * 34u + 2u); \
+                const int dot = dot_i8_block(qs, xqb, bn, use_dp4a); \
+                (acc) += __half2float(*scale_h) * xs * (float)dot; \
+            } \
+        } while (0)
+        DS4_LAGUNA_Q8_ACCUM(qrow, q_acc);
+        DS4_LAGUNA_Q8_ACCUM(krow, k_acc);
+        DS4_LAGUNA_Q8_ACCUM(vrow, v_acc);
+        DS4_LAGUNA_Q8_ACCUM(grow, g_acc);
+#undef DS4_LAGUNA_Q8_ACCUM
+    }
+    q_acc = warp_sum_f32(q_acc);
+    k_acc = warp_sum_f32(k_acc);
+    v_acc = warp_sum_f32(v_acc);
+    g_acc = warp_sum_f32(g_acc);
+    if (lane == 0u) {
+        if (row < q_dim) q[row] = q_acc;
+        if (row < kv_dim) {
+            k[row] = k_acc;
+            v[row] = v_acc;
+        }
+        if (row < gate_dim) gate[row] = g_acc;
+    }
+}
+
 __global__ static void shared_mid_q8_0_preq_warp8_exact_kernel(
         float *mid,
         const unsigned char *gate_w,
@@ -31647,6 +31744,89 @@ __global__ static void laguna_head_rms_norm_rope_kernel(
     row[tid + half_rot] = x0 * s + x1 * c;
 }
 
+/* Q and K use the same per-head operation. Keep each head in its own block,
+ * as above, but put both block sets in one launch. */
+__global__ static void laguna_qk_head_rms_norm_rope_kernel(
+        float *q,
+        float *k,
+        const float *q_weight,
+        const float *k_weight,
+        uint32_t n_tokens,
+        uint32_t n_q_head,
+        uint32_t n_k_head,
+        uint32_t head_dim,
+        uint32_t n_rot,
+        uint32_t pos0,
+        uint32_t n_ctx_orig,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow,
+        float eps) {
+    const bool is_q = blockIdx.x < n_q_head;
+    const uint32_t head =
+        is_q ? blockIdx.x : blockIdx.x - n_q_head;
+    const uint32_t n_head = is_q ? n_q_head : n_k_head;
+    const uint32_t token = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    if (head >= n_head || token >= n_tokens || tid >= 128u) return;
+    float *row = (is_q ? q : k) +
+        ((uint64_t)token * n_head + head) * head_dim;
+    const float *weight = is_q ? q_weight : k_weight;
+    __shared__ float partial[128];
+    float sum = 0.0f;
+    for (uint32_t i = tid; i < head_dim; i += 128u) {
+        const float value = row[i];
+        sum += value * value;
+    }
+    partial[tid] = sum;
+    __syncthreads();
+    for (uint32_t stride = 64u; stride != 0u; stride >>= 1u) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(partial[0] / (float)head_dim + eps);
+    for (uint32_t i = tid; i < head_dim; i += 128u) {
+        row[i] = row[i] * inv * weight[i];
+    }
+    __syncthreads();
+
+    const uint32_t half_rot = n_rot >> 1u;
+    if (tid >= half_rot) return;
+    const uint32_t rel_i0 = tid * 2u;
+    const uint32_t pos = pos0 + token;
+    const float theta_extrap =
+        (float)pos * powf(freq_base, -(float)rel_i0 / (float)n_rot);
+    const float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    float magnitude = attn_factor;
+    if (ext_factor != 0.0f) {
+        const float denom = 2.0f * logf(freq_base);
+        const float corr0 = fmaxf(
+                0.0f,
+                floorf((float)n_rot *
+                       logf((float)n_ctx_orig /
+                            (beta_fast * 2.0f * (float)M_PI)) / denom));
+        const float corr1 = fminf(
+                (float)(n_rot - 1u),
+                ceilf((float)n_rot *
+                      logf((float)n_ctx_orig /
+                           (beta_slow * 2.0f * (float)M_PI)) / denom));
+        const float mix = rope_yarn_ramp_cpu_equiv_dev(
+                corr0, corr1, (int)rel_i0) * ext_factor;
+        theta = theta_interp * (1.0f - mix) + theta_extrap * mix;
+        magnitude *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    const float c = cosf(theta) * magnitude;
+    const float s = sinf(theta) * magnitude;
+    const float x0 = row[tid];
+    const float x1 = row[tid + half_rot];
+    row[tid] = x0 * c - x1 * s;
+    row[tid + half_rot] = x0 * s + x1 * c;
+}
+
 __global__ static void laguna_store_kv_f16_kernel(
         __half *key_cache,
         __half *value_cache,
@@ -33705,6 +33885,98 @@ extern "C" int ds4_gpu_laguna_qkvg_f16_tensor(
                    in_dim, gate_dim, x, 1u);
 }
 
+extern "C" int ds4_gpu_laguna_qkvg_q8_0_tensor(
+        ds4_gpu_tensor *q, ds4_gpu_tensor *k, ds4_gpu_tensor *v,
+        ds4_gpu_tensor *gate, const void *model_map, uint64_t model_size,
+        uint64_t q_weight_offset, uint64_t k_weight_offset,
+        uint64_t v_weight_offset, uint64_t gate_weight_offset,
+        uint32_t in_dim, uint32_t q_dim, uint32_t kv_dim,
+        uint32_t gate_dim, const ds4_gpu_tensor *x) {
+    if (!cuda_laguna_blackwell_ok() ||
+        getenv("DS4_CUDA_LAGUNA_NO_Q8_QKVG_FUSION") != NULL) {
+        return 0;
+    }
+    if (!q || !k || !v || !gate || !model_map || !x ||
+        in_dim == 0u || q_dim == 0u || kv_dim == 0u || gate_dim == 0u ||
+        (in_dim & 31u) != 0u) {
+        return 0;
+    }
+    const uint64_t blocks = in_dim / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+    const uint64_t q_weight_bytes = (uint64_t)q_dim * row_bytes;
+    const uint64_t kv_weight_bytes = (uint64_t)kv_dim * row_bytes;
+    const uint64_t gate_weight_bytes = (uint64_t)gate_dim * row_bytes;
+    if (q_weight_offset > model_size ||
+        q_weight_bytes > model_size - q_weight_offset ||
+        k_weight_offset > model_size ||
+        kv_weight_bytes > model_size - k_weight_offset ||
+        v_weight_offset > model_size ||
+        kv_weight_bytes > model_size - v_weight_offset ||
+        gate_weight_offset > model_size ||
+        gate_weight_bytes > model_size - gate_weight_offset ||
+        x->bytes < (uint64_t)in_dim * sizeof(float) ||
+        q->bytes < (uint64_t)q_dim * sizeof(float) ||
+        k->bytes < (uint64_t)kv_dim * sizeof(float) ||
+        v->bytes < (uint64_t)kv_dim * sizeof(float) ||
+        gate->bytes < (uint64_t)gate_dim * sizeof(float)) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(q);
+    if (ds4_tensor_device_idx(k) != logical_tier ||
+        ds4_tensor_device_idx(v) != logical_tier ||
+        ds4_tensor_device_idx(gate) != logical_tier ||
+        ds4_tensor_device_idx(x) != logical_tier) {
+        return 0;
+    }
+    const unsigned char *qw =
+        reinterpret_cast<const unsigned char *>(cuda_resolve_weight_ptr(
+            model_map, q_weight_offset, q_weight_bytes, logical_tier,
+            "Laguna Q8 Q"));
+    const unsigned char *kw =
+        reinterpret_cast<const unsigned char *>(cuda_resolve_weight_ptr(
+            model_map, k_weight_offset, kv_weight_bytes, logical_tier,
+            "Laguna Q8 K"));
+    const unsigned char *vw =
+        reinterpret_cast<const unsigned char *>(cuda_resolve_weight_ptr(
+            model_map, v_weight_offset, kv_weight_bytes, logical_tier,
+            "Laguna Q8 V"));
+    const unsigned char *gw =
+        reinterpret_cast<const unsigned char *>(cuda_resolve_weight_ptr(
+            model_map, gate_weight_offset, gate_weight_bytes, logical_tier,
+            "Laguna Q8 attention gate"));
+    if (!qw || !kw || !vw || !gw) return 0;
+
+    const uint64_t xq_bytes = blocks * 32u;
+    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+    const uint64_t tmp_bytes = scale_offset + blocks * sizeof(float);
+    void *tmp = cuda_tmp_alloc_on(
+            logical_tier, tmp_bytes, "Laguna Q8 QKVG prequant");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_offset);
+    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(
+            xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    if (!cuda_ok(cudaGetLastError(),
+                 "Laguna Q8 QKVG quantize launch")) {
+        return 0;
+    }
+    const uint64_t max_dim =
+        q_dim > kv_dim ? (q_dim > gate_dim ? q_dim : gate_dim) :
+                         (kv_dim > gate_dim ? kv_dim : gate_dim);
+    laguna_qkvg_q8_0_preq_warp8_kernel<<<
+            (unsigned)((max_dim + 7u) / 8u), 256>>>(
+            (float *)q->ptr,
+            (float *)k->ptr,
+            (float *)v->ptr,
+            (float *)gate->ptr,
+            qw, kw, vw, gw,
+            xq, xscale,
+            in_dim, q_dim, kv_dim, gate_dim, blocks,
+            cuda_q8_use_dp4a());
+    return cuda_ok(cudaGetLastError(),
+                   "Laguna Q8 QKVG fused launch");
+}
+
 extern "C" int ds4_gpu_laguna_attn_output_residual_f16_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
@@ -33767,6 +34039,66 @@ extern "C" int ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
         uint32_t pos0, uint32_t n_ctx_orig, float freq_base,
         float freq_scale, float ext_factor, float attn_factor,
         float beta_fast, float beta_slow, float eps) {
+    if (n_tokens == 1u &&
+        cuda_laguna_blackwell_ok() &&
+        getenv("DS4_CUDA_LAGUNA_NO_QK_NORM_ROPE_FUSION") == NULL &&
+        q && k && model_map && n_tokens != 0u && n_q_head != 0u &&
+        n_k_head != 0u && head_dim != 0u && head_dim <= 128u &&
+        n_rot != 0u && n_rot <= head_dim && (n_rot & 1u) == 0u &&
+        pos0 <= UINT32_MAX - n_tokens &&
+        isfinite(freq_base) && freq_base > 0.0f &&
+        isfinite(freq_scale) && freq_scale > 0.0f &&
+        isfinite(ext_factor) && isfinite(attn_factor) &&
+        isfinite(beta_fast) && isfinite(beta_slow) &&
+        isfinite(eps) && eps > 0.0f) {
+        const uint64_t q_values =
+            (uint64_t)n_tokens * n_q_head * head_dim;
+        const uint64_t k_values =
+            (uint64_t)n_tokens * n_k_head * head_dim;
+        const uint64_t weight_bytes =
+            (uint64_t)head_dim * sizeof(float);
+        if (q->bytes >= q_values * sizeof(float) &&
+            k->bytes >= k_values * sizeof(float) &&
+            q_weight_offset <= model_size &&
+            weight_bytes <= model_size - q_weight_offset &&
+            k_weight_offset <= model_size &&
+            weight_bytes <= model_size - k_weight_offset &&
+            ds4_tensor_device_idx(q) == ds4_tensor_device_idx(k)) {
+            const int logical_tier = ds4_tensor_device_idx(q);
+            const float *q_weight =
+                (const float *)cuda_resolve_weight_ptr(
+                    model_map, q_weight_offset, weight_bytes, logical_tier,
+                    "Laguna Q head norm");
+            const float *k_weight =
+                (const float *)cuda_resolve_weight_ptr(
+                    model_map, k_weight_offset, weight_bytes, logical_tier,
+                    "Laguna K head norm");
+            if (q_weight && k_weight) {
+                laguna_qk_head_rms_norm_rope_kernel<<<
+                        dim3(n_q_head + n_k_head, n_tokens, 1u), 128>>>(
+                        (float *)q->ptr,
+                        (float *)k->ptr,
+                        q_weight,
+                        k_weight,
+                        n_tokens,
+                        n_q_head,
+                        n_k_head,
+                        head_dim,
+                        n_rot,
+                        pos0,
+                        n_ctx_orig,
+                        freq_base,
+                        freq_scale,
+                        ext_factor,
+                        attn_factor,
+                        beta_fast,
+                        beta_slow,
+                        eps);
+                return cuda_ok(cudaGetLastError(),
+                               "Laguna fused Q/K head RMSNorm/RoPE launch");
+            }
+        }
+    }
     return ds4_gpu_laguna_head_rms_norm_rope_tensor(
                    q, model_map, model_size, q_weight_offset,
                    n_tokens, n_q_head, head_dim, n_rot, pos0, n_ctx_orig,

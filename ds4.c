@@ -49747,30 +49747,48 @@ static bool laguna_graph_forward_token(
                         n_head,
                         g->attn_norm) != 0;
             } else {
-                ok = ds4_gpu_matmul_q8_0_pair_tensor(
+                ok = ds4_gpu_laguna_qkvg_q8_0_tensor(
                         g->q,
                         g->k,
-                        model->map,
-                        model->size,
-                        l->attn_q->abs_offset,
-                        l->attn_k->abs_offset,
-                        DS4_N_EMBD,
-                        q_dim,
-                        DS4_N_HEAD_KV * DS4_N_HEAD_DIM,
-                        g->attn_norm,
-                        1) != 0 &&
-                     ds4_gpu_matmul_q8_0_pair_tensor(
                         g->v,
                         g->gate,
                         model->map,
                         model->size,
+                        l->attn_q->abs_offset,
+                        l->attn_k->abs_offset,
                         l->attn_v->abs_offset,
                         l->attn_gate->abs_offset,
                         DS4_N_EMBD,
+                        q_dim,
                         DS4_N_HEAD_KV * DS4_N_HEAD_DIM,
                         n_head,
-                        g->attn_norm,
-                        1) != 0;
+                        g->attn_norm) != 0;
+                if (!ok) {
+                    ok = ds4_gpu_matmul_q8_0_pair_tensor(
+                            g->q,
+                            g->k,
+                            model->map,
+                            model->size,
+                            l->attn_q->abs_offset,
+                            l->attn_k->abs_offset,
+                            DS4_N_EMBD,
+                            q_dim,
+                            DS4_N_HEAD_KV * DS4_N_HEAD_DIM,
+                            g->attn_norm,
+                            1) != 0 &&
+                         ds4_gpu_matmul_q8_0_pair_tensor(
+                            g->v,
+                            g->gate,
+                            model->map,
+                            model->size,
+                            l->attn_v->abs_offset,
+                            l->attn_gate->abs_offset,
+                            DS4_N_EMBD,
+                            DS4_N_HEAD_KV * DS4_N_HEAD_DIM,
+                            n_head,
+                            g->attn_norm,
+                            1) != 0;
+                }
             }
         }
         if (ok) {

@@ -34049,6 +34049,30 @@ int ds4_gpu_laguna_qkvg_f16_tensor(
     return 1;
 }
 
+int ds4_gpu_laguna_qkvg_q8_0_tensor(
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *k,
+        ds4_gpu_tensor       *v,
+        ds4_gpu_tensor       *gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_weight_offset,
+        uint64_t              k_weight_offset,
+        uint64_t              v_weight_offset,
+        uint64_t              gate_weight_offset,
+        uint32_t              in_dim,
+        uint32_t              q_dim,
+        uint32_t              kv_dim,
+        uint32_t              gate_dim,
+        const ds4_gpu_tensor *x) {
+    (void)q; (void)k; (void)v; (void)gate;
+    (void)model_map; (void)model_size;
+    (void)q_weight_offset; (void)k_weight_offset;
+    (void)v_weight_offset; (void)gate_weight_offset;
+    (void)in_dim; (void)q_dim; (void)kv_dim; (void)gate_dim; (void)x;
+    return 0;
+}
+
 int ds4_gpu_laguna_attn_output_residual_f16_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,

@@ -230,6 +230,12 @@ comparison or rollback.
 
 CUDA Laguna prefill similarly runs one warp per query head on Blackwell and
 uses exact INT8 tensor-core kernels for large Q4_K routed-expert batches.
+For revised Q8 checkpoints, single-token decode also quantizes the shared
+attention input once and projects Q, K, V, and the learned gate in one launch;
+`DS4_CUDA_LAGUNA_NO_Q8_QKVG_FUSION=1` restores the two paired launches.
+Single-token Q/K head normalization and RoPE share a launch on Blackwell as
+well; batched prefill and DFlash retain their established kernels.
+`DS4_CUDA_LAGUNA_NO_QK_NORM_ROPE_FUSION=1` restores separate launches.
 `DS4_CUDA_LAGUNA_NO_WARP_GQA_PREFILL=1` and
 `DS4_CUDA_LAGUNA_NO_Q4_MMA=1` select the respective portable kernels for
 comparison or rollback. For narrower A/B tests,

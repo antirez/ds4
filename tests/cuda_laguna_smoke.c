@@ -49,6 +49,11 @@ typedef struct {
 } block_q6_K;
 
 typedef struct {
+    uint16_t d;
+    int8_t qs[32];
+} block_q8_0;
+
+typedef struct {
     uint8_t *data;
     uint64_t size;
     uint64_t used;
@@ -160,6 +165,17 @@ static void fill_q6_pattern(void *ptr, uint64_t blocks) {
         for (uint32_t j = 0; j < sizeof(out[i].scales); j++) {
             out[i].scales[j] = (int8_t)((int32_t)((7u * j + 5u * i) % 15u) -
                                         7);
+        }
+    }
+}
+
+static void fill_q8_pattern(void *ptr, uint64_t blocks, uint32_t seed) {
+    block_q8_0 *out = (block_q8_0 *)ptr;
+    for (uint64_t i = 0; i < blocks; i++) {
+        out[i].d = (uint16_t)(0x3000u + ((seed + (uint32_t)i) & 3u) * 0x0100u);
+        for (uint32_t j = 0; j < 32u; j++) {
+            out[i].qs[j] = (int8_t)((int32_t)(
+                (seed * 17u + (uint32_t)i * 13u + j * 7u) % 31u) - 15);
         }
     }
 }
@@ -491,6 +507,137 @@ static int check_norm_rope(model_blob *blob, uint64_t norm_offset) {
         CHECK(close_enough(got[i], expected[i], 4e-4f, 4e-4f),
               "Laguna SWA norm/RoPE numeric");
     }
+
+    enum { qk_tokens = 1, n_k_head = 2 };
+    float k_input[qk_tokens * n_k_head * HEAD_DIM];
+    float q_ref[qk_tokens * n_head * HEAD_DIM];
+    float k_ref[sizeof(k_input) / sizeof(k_input[0])];
+    float q_got[qk_tokens * n_head * HEAD_DIM];
+    float k_got[sizeof(k_input) / sizeof(k_input[0])];
+    for (uint32_t i = 0; i < qk_tokens * n_k_head * HEAD_DIM; i++) {
+        k_input[i] = ((int32_t)(i % 19u) - 9) * 0.046875f;
+    }
+    ds4_gpu_tensor *q0 = ds4_gpu_tensor_alloc(sizeof(q_ref));
+    ds4_gpu_tensor *k0 = ds4_gpu_tensor_alloc(sizeof(k_input));
+    ds4_gpu_tensor *q1 = ds4_gpu_tensor_alloc(sizeof(q_got));
+    ds4_gpu_tensor *k1 = ds4_gpu_tensor_alloc(sizeof(k_input));
+    CHECK(q0 && k0 && q1 && k1, "Q/K norm/RoPE tensor allocation");
+    CHECK(ds4_gpu_tensor_write(q0, 0, input, sizeof(q_ref)) &&
+          ds4_gpu_tensor_write(k0, 0, k_input, sizeof(k_input)) &&
+          ds4_gpu_tensor_write(q1, 0, input, sizeof(q_got)) &&
+          ds4_gpu_tensor_write(k1, 0, k_input, sizeof(k_input)),
+          "write Q/K norm/RoPE inputs");
+    CHECK(ds4_gpu_laguna_head_rms_norm_rope_tensor(
+              q0, blob->data, blob->size, norm_offset,
+              qk_tokens, n_head, HEAD_DIM, n_rot, 17u, 8192u,
+              500000.0f, freq_scale, ext_factor, attn_factor,
+              beta_fast, beta_slow, 1e-6f) &&
+          ds4_gpu_laguna_head_rms_norm_rope_tensor(
+              k0, blob->data, blob->size, norm_offset,
+              qk_tokens, n_k_head, HEAD_DIM, n_rot, 17u, 8192u,
+              500000.0f, freq_scale, ext_factor, attn_factor,
+              beta_fast, beta_slow, 1e-6f),
+          "reference separate Q/K norm/RoPE");
+    CHECK(ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
+              q1, k1, blob->data, blob->size, norm_offset, norm_offset,
+              qk_tokens, n_head, n_k_head, HEAD_DIM, n_rot, 17u, 8192u,
+              500000.0f, freq_scale, ext_factor, attn_factor,
+              beta_fast, beta_slow, 1e-6f),
+          "fused Q/K norm/RoPE");
+    CHECK(ds4_gpu_tensor_read(q0, 0, q_ref, sizeof(q_ref)) &&
+          ds4_gpu_tensor_read(k0, 0, k_ref, sizeof(k_ref)) &&
+          ds4_gpu_tensor_read(q1, 0, q_got, sizeof(q_got)) &&
+          ds4_gpu_tensor_read(k1, 0, k_got, sizeof(k_got)),
+          "read fused Q/K norm/RoPE outputs");
+    CHECK(memcmp(q_got, q_ref, sizeof(q_ref)) == 0,
+          "fused Q norm/RoPE exactness");
+    CHECK(memcmp(k_got, k_ref, sizeof(k_ref)) == 0,
+          "fused K norm/RoPE exactness");
+    ds4_gpu_tensor_free(k1);
+    ds4_gpu_tensor_free(q1);
+    ds4_gpu_tensor_free(k0);
+    ds4_gpu_tensor_free(q0);
+    ds4_gpu_tensor_free(x);
+    return 0;
+}
+
+static int check_q8_qkvg(model_blob *blob,
+                         uint64_t q_offset,
+                         uint64_t k_offset,
+                         uint64_t v_offset,
+                         uint64_t gate_offset) {
+    int device = 0;
+    int major = 0;
+    CHECK(cudaGetDevice(&device) == cudaSuccess &&
+          cudaDeviceGetAttribute(
+              &major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess,
+          "query CUDA capability for fused Q8 QKVG");
+    if (major < 12) return 0;
+
+    enum {
+        in_dim = QK_K,
+        q_dim = 33,
+        kv_dim = 17,
+        gate_dim = 9,
+    };
+    float input[in_dim];
+    float q_ref[q_dim], k_ref[kv_dim], v_ref[kv_dim], gate_ref[gate_dim];
+    float q_got[q_dim], k_got[kv_dim], v_got[kv_dim], gate_got[gate_dim];
+    for (uint32_t i = 0; i < in_dim; i++) {
+        input[i] = ((int32_t)(i % 29u) - 14) * 0.03125f;
+    }
+
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(sizeof(input));
+    ds4_gpu_tensor *q0 = ds4_gpu_tensor_alloc(sizeof(q_ref));
+    ds4_gpu_tensor *k0 = ds4_gpu_tensor_alloc(sizeof(k_ref));
+    ds4_gpu_tensor *v0 = ds4_gpu_tensor_alloc(sizeof(v_ref));
+    ds4_gpu_tensor *g0 = ds4_gpu_tensor_alloc(sizeof(gate_ref));
+    ds4_gpu_tensor *q1 = ds4_gpu_tensor_alloc(sizeof(q_got));
+    ds4_gpu_tensor *k1 = ds4_gpu_tensor_alloc(sizeof(k_got));
+    ds4_gpu_tensor *v1 = ds4_gpu_tensor_alloc(sizeof(v_got));
+    ds4_gpu_tensor *g1 = ds4_gpu_tensor_alloc(sizeof(gate_got));
+    CHECK(x && q0 && k0 && v0 && g0 && q1 && k1 && v1 && g1,
+          "Q8 QKVG tensor allocation");
+    CHECK(ds4_gpu_tensor_write(x, 0, input, sizeof(input)),
+          "write Q8 QKVG input");
+    CHECK(ds4_gpu_matmul_q8_0_pair_tensor(
+              q0, k0, blob->data, blob->size, q_offset, k_offset,
+              in_dim, q_dim, kv_dim, x, 1u) &&
+          ds4_gpu_matmul_q8_0_pair_tensor(
+              v0, g0, blob->data, blob->size, v_offset, gate_offset,
+              in_dim, kv_dim, gate_dim, x, 1u),
+          "reference paired Q8 QKVG");
+    CHECK(ds4_gpu_laguna_qkvg_q8_0_tensor(
+              q1, k1, v1, g1, blob->data, blob->size,
+              q_offset, k_offset, v_offset, gate_offset,
+              in_dim, q_dim, kv_dim, gate_dim, x),
+          "fused Blackwell Q8 QKVG");
+    CHECK(ds4_gpu_tensor_read(q0, 0, q_ref, sizeof(q_ref)) &&
+          ds4_gpu_tensor_read(k0, 0, k_ref, sizeof(k_ref)) &&
+          ds4_gpu_tensor_read(v0, 0, v_ref, sizeof(v_ref)) &&
+          ds4_gpu_tensor_read(g0, 0, gate_ref, sizeof(gate_ref)) &&
+          ds4_gpu_tensor_read(q1, 0, q_got, sizeof(q_got)) &&
+          ds4_gpu_tensor_read(k1, 0, k_got, sizeof(k_got)) &&
+          ds4_gpu_tensor_read(v1, 0, v_got, sizeof(v_got)) &&
+          ds4_gpu_tensor_read(g1, 0, gate_got, sizeof(gate_got)),
+          "read Q8 QKVG outputs");
+    CHECK(memcmp(q_got, q_ref, sizeof(q_ref)) == 0,
+          "fused Q8 Q projection exactness");
+    CHECK(memcmp(k_got, k_ref, sizeof(k_ref)) == 0,
+          "fused Q8 K projection exactness");
+    CHECK(memcmp(v_got, v_ref, sizeof(v_ref)) == 0,
+          "fused Q8 V projection exactness");
+    CHECK(memcmp(gate_got, gate_ref, sizeof(gate_ref)) == 0,
+          "fused Q8 gate projection exactness");
+
+    ds4_gpu_tensor_free(g1);
+    ds4_gpu_tensor_free(v1);
+    ds4_gpu_tensor_free(k1);
+    ds4_gpu_tensor_free(q1);
+    ds4_gpu_tensor_free(g0);
+    ds4_gpu_tensor_free(v0);
+    ds4_gpu_tensor_free(k0);
+    ds4_gpu_tensor_free(q0);
     ds4_gpu_tensor_free(x);
     return 0;
 }
@@ -1129,8 +1276,24 @@ int main(void) {
         blob_alloc(&blob, 2u * sizeof(block_q4_K));
     const uint64_t norm_offset =
         blob_alloc(&blob, HEAD_DIM * sizeof(float));
+    enum {
+        q8_q_dim = 33,
+        q8_kv_dim = 17,
+        q8_gate_dim = 9,
+        q8_blocks_per_row = QK_K / 32,
+    };
+    const uint64_t q8_q_offset = blob_alloc(
+        &blob, (uint64_t)q8_q_dim * q8_blocks_per_row * sizeof(block_q8_0));
+    const uint64_t q8_k_offset = blob_alloc(
+        &blob, (uint64_t)q8_kv_dim * q8_blocks_per_row * sizeof(block_q8_0));
+    const uint64_t q8_v_offset = blob_alloc(
+        &blob, (uint64_t)q8_kv_dim * q8_blocks_per_row * sizeof(block_q8_0));
+    const uint64_t q8_gate_offset = blob_alloc(
+        &blob, (uint64_t)q8_gate_dim * q8_blocks_per_row * sizeof(block_q8_0));
     CHECK(q4_offset != UINT64_MAX && q6_offset != UINT64_MAX &&
-          embed_offset != UINT64_MAX && norm_offset != UINT64_MAX,
+          embed_offset != UINT64_MAX && norm_offset != UINT64_MAX &&
+          q8_q_offset != UINT64_MAX && q8_k_offset != UINT64_MAX &&
+          q8_v_offset != UINT64_MAX && q8_gate_offset != UINT64_MAX,
           "allocate basic model ranges");
     fill_q4_pattern(blob.data + q4_offset, 2u);
     fill_q6_pattern(blob.data + q6_offset, 2u);
@@ -1139,6 +1302,14 @@ int main(void) {
     for (uint32_t i = 0; i < HEAD_DIM; i++) {
         norm[i] = 0.75f + (float)(i % 7u) * 0.03125f;
     }
+    fill_q8_pattern(blob.data + q8_q_offset,
+                    (uint64_t)q8_q_dim * q8_blocks_per_row, 1u);
+    fill_q8_pattern(blob.data + q8_k_offset,
+                    (uint64_t)q8_kv_dim * q8_blocks_per_row, 2u);
+    fill_q8_pattern(blob.data + q8_v_offset,
+                    (uint64_t)q8_kv_dim * q8_blocks_per_row, 3u);
+    fill_q8_pattern(blob.data + q8_gate_offset,
+                    (uint64_t)q8_gate_dim * q8_blocks_per_row, 4u);
 
     const uint32_t dim = QK_K;
     const uint64_t q4_matrix_bytes =
@@ -1268,6 +1439,10 @@ int main(void) {
 
     CHECK(ds4_gpu_set_model_map(blob.data, blob.size), "set synthetic model map");
     int rc = check_quant_ops(&blob, q4_offset, q6_offset, embed_offset);
+    if (rc == 0) {
+        rc = check_q8_qkvg(
+                &blob, q8_q_offset, q8_k_offset, q8_v_offset, q8_gate_offset);
+    }
     if (rc == 0) rc = check_norm_rope(&blob, norm_offset);
     if (rc == 0) rc = check_attention();
     if (rc == 0) rc = check_dflash_blackwell_attention();
