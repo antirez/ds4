@@ -817,6 +817,9 @@ __global__ static void matmul_q8_0_f32_batch_wmma_rowtile_kernel(
             const _Float16 *xb = lds_x + nt * K_TILE;
             const ds4_q8_half16_t b0 = *(const ds4_q8_half16_t *)(xb);
             const ds4_q8_half16_t b1 = *(const ds4_q8_half16_t *)(xb + 16u);
+            /* gfx12xx (RDNA4) uses WMMA v2; the dispatch skips this kernel
+             * via g_wmma_v1, but the device code must compile on all arches. */
+#if !defined(__gfx1200__) && !defined(__gfx1201__)
             if (ntile == 0u) {
                 acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc0);
                 acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc0);
@@ -830,6 +833,7 @@ __global__ static void matmul_q8_0_f32_batch_wmma_rowtile_kernel(
                 acc3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc3);
                 acc3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc3);
             }
+#endif
         }
         __syncthreads();
     }

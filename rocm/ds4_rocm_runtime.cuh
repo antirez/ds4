@@ -34,6 +34,9 @@ static int g_rocblas_attention_b_solution_disabled;
 #endif
 static int g_quality_mode;
 static int g_glm_model;
+/* 1 if device supports RDNA3 WMMA v1 (__builtin_amdgcn_wmma_*_w32).
+ * 0 for RDNA4 (gfx12xx) which uses WMMA v2 — skip the _4w kernel. */
+static int g_wmma_v1;
 
 enum {
     DS4_ROCM_N_EXPERT = 256u,
@@ -5844,6 +5847,15 @@ extern "C" int ds4_gpu_init(void) {
     if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "backend initialized on %s (sm_%d%d)\n",
                 prop.name, prop.major, prop.minor);
+#ifdef __HIP_PLATFORM_AMD__
+        /* RDNA4 (gfx12xx) needs WMMA v2; gfx11xx (RDNA3/3.5) uses v1 builtins. */
+        g_wmma_v1 = (strstr(prop.gcnArchName, "gfx12") == NULL);
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "WMMA v1 support: %s (arch: %s)\n",
+                g_wmma_v1 ? "yes" : "no (gfx12 RDNA4, using non-WMMA path)",
+                prop.gcnArchName);
+#else
+        g_wmma_v1 = 1;
+#endif
     }
     if (!g_cublas_ready) {
         if (!cublas_ok(cublasCreate(&g_cublas), "create handle")) return 0;
