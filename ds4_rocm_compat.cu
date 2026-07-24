@@ -85,6 +85,21 @@ extern "C" int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst,
                           hipMemcpyDeviceToDevice, 0) == hipSuccess;
 }
 
+extern "C" int ds4_gpu_tensor_copy_range_async(
+        ds4_gpu_tensor *dst, uint64_t dst_offset,
+        const ds4_gpu_tensor *src, uint64_t src_offset,
+        uint64_t bytes) {
+    if (!dst || !src || dst_offset > dst->bytes || src_offset > src->bytes ||
+        bytes > dst->bytes - dst_offset || bytes > src->bytes - src_offset) {
+        return 0;
+    }
+    if (bytes == 0) return 1;
+    return hipMemcpyAsync((char *)dst->ptr + dst_offset,
+                          (const char *)src->ptr + src_offset,
+                          (size_t)bytes, hipMemcpyDeviceToDevice, 0) ==
+           hipSuccess;
+}
+
 extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
                                           const ds4_gpu_tensor *src,
                                           uint64_t bytes) {
@@ -499,7 +514,8 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
         const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
         const ds4_gpu_tensor *gate, uint32_t pos0, uint32_t n_tokens,
         uint32_t cache_cap, uint32_t n_head, uint32_t n_head_kv,
-        uint32_t head_dim, float scale) {
+        uint32_t head_dim, float scale, bool commit_kv) {
+    (void)commit_kv;
     (void)heads; (void)key_cache; (void)value_cache; (void)staged_key;
     (void)staged_value; (void)q; (void)k; (void)v; (void)gate;
     (void)pos0; (void)n_tokens; (void)cache_cap; (void)n_head;

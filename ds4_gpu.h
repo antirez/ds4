@@ -56,6 +56,10 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
+int ds4_gpu_tensor_copy_range_async(
+        ds4_gpu_tensor *dst, uint64_t dst_offset,
+        const ds4_gpu_tensor *src, uint64_t src_offset,
+        uint64_t bytes);
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);
@@ -851,6 +855,7 @@ int ds4_gpu_dflash_pack_features_tensor(
         uint32_t              n_embd,
         uint32_t              n_aux,
         uint32_t              n_rows,
+        uint32_t              feature_rows,
         float                 eps);
 
 int ds4_gpu_dflash_store_kv_tensor(
@@ -1338,7 +1343,8 @@ int ds4_gpu_laguna_attention_prefill_tensor(
         uint32_t              n_head,
         uint32_t              n_head_kv,
         uint32_t              head_dim,
-        float                 scale);
+        float                 scale,
+        bool                  commit_kv);
 
 int ds4_gpu_glm_kv_lora_rms_norm_tensor(
         ds4_gpu_tensor       *out,

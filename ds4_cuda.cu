@@ -3237,6 +3237,27 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     return ok;
 }
 
+extern "C" int ds4_gpu_tensor_copy_range_async(
+        ds4_gpu_tensor *dst, uint64_t dst_offset,
+        const ds4_gpu_tensor *src, uint64_t src_offset,
+        uint64_t bytes) {
+    if (!dst || !src || dst_offset > dst->bytes || src_offset > src->bytes ||
+        bytes > dst->bytes - dst_offset || bytes > src->bytes - src_offset) {
+        return 0;
+    }
+    if (bytes == 0) return 1;
+    int d = ds4_tensor_device_idx(dst);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        ok = cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
+                                     (const char *)src->ptr + src_offset,
+                                     (size_t)bytes,
+                                     cudaMemcpyDeviceToDevice, 0),
+                     "tensor range copy async");
+    }
+    return ok;
+}
+
 __global__ static void moe_handoff_pack_kernel(
         unsigned char *packed,
         const float *ffn_norm,
@@ -4974,12 +4995,13 @@ __global__ static void dflash_pack_features_kernel(
         uint32_t n_embd,
         uint32_t n_aux,
         uint32_t n_rows,
+        uint32_t feature_rows,
         float eps) {
     const uint32_t aux = blockIdx.x;
     const uint32_t row = blockIdx.y;
     if (aux >= n_aux || row >= n_rows) return;
     const float *src = features +
-        ((uint64_t)aux * n_rows + row) * n_embd;
+        ((uint64_t)aux * feature_rows + row) * n_embd;
     float sum = 0.0f;
     for (uint32_t i = threadIdx.x; i < n_embd; i += blockDim.x) {
         float v = src[i];
@@ -15951,14 +15973,18 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(
 extern "C" int ds4_gpu_dflash_pack_features_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *features,
         const void *model_map, uint64_t model_size, uint64_t aux_norm_offset,
-        uint32_t n_embd, uint32_t n_aux, uint32_t n_rows, float eps) {
+        uint32_t n_embd, uint32_t n_aux, uint32_t n_rows,
+        uint32_t feature_rows, float eps) {
     if (!out || !features || !model_map || n_embd == 0u || n_aux == 0u ||
-        n_rows == 0u || !isfinite(eps) || eps <= 0.0f) {
+        n_rows == 0u || feature_rows < n_rows ||
+        !isfinite(eps) || eps <= 0.0f) {
         return 0;
     }
     const uint64_t values = (uint64_t)n_rows * n_aux * n_embd;
+    const uint64_t feature_values =
+        (uint64_t)feature_rows * n_aux * n_embd;
     const uint64_t norm_values = (uint64_t)n_aux * n_embd;
-    if (features->bytes < values * sizeof(float) ||
+    if (features->bytes < feature_values * sizeof(float) ||
         out->bytes < values * sizeof(float) ||
         aux_norm_offset > model_size ||
         norm_values * sizeof(float) > model_size - aux_norm_offset) {
@@ -15974,7 +16000,7 @@ extern "C" int ds4_gpu_dflash_pack_features_tensor(
             (float *)out->ptr,
             (const float *)features->ptr,
             (const float *)norm,
-            n_embd, n_aux, n_rows, eps);
+            n_embd, n_aux, n_rows, feature_rows, eps);
     return cuda_ok(cudaGetLastError(), "DFlash pack features");
 }
 
@@ -34205,7 +34231,7 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
         const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
         const ds4_gpu_tensor *gate, uint32_t pos0, uint32_t n_tokens,
         uint32_t cache_cap, uint32_t n_head, uint32_t n_head_kv,
-        uint32_t head_dim, float scale) {
+        uint32_t head_dim, float scale, bool commit_kv) {
     if (!heads || !key_cache || !value_cache || !staged_key ||
         !staged_value || !q || !k || !v || !gate ||
         n_tokens == 0u || cache_cap == 0u ||
@@ -34339,12 +34365,15 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
     if (!cuda_ok(cudaGetLastError(), "Laguna prefill attention launch")) {
         return 0;
     }
-    laguna_commit_kv_f16_kernel<<<(kv_values + 255u) / 256u, 256>>>(
-            (__half *)key_cache->ptr,
-            (__half *)value_cache->ptr,
-            (const __half *)staged_key->ptr,
-            (const __half *)staged_value->ptr,
-            pos0, n_tokens, cache_cap, (uint32_t)kv_row_values);
-    return cuda_ok(cudaGetLastError(), "Laguna commit KV launch");
+    if (commit_kv) {
+        laguna_commit_kv_f16_kernel<<<(kv_values + 255u) / 256u, 256>>>(
+                (__half *)key_cache->ptr,
+                (__half *)value_cache->ptr,
+                (const __half *)staged_key->ptr,
+                (const __half *)staged_value->ptr,
+                pos0, n_tokens, cache_cap, (uint32_t)kv_row_values);
+        return cuda_ok(cudaGetLastError(), "Laguna commit KV launch");
+    }
+    return 1;
 }
 #pragma GCC diagnostic pop

@@ -49284,6 +49284,8 @@ typedef struct {
     ds4_gpu_tensor *target_tops;
     ds4_gpu_tensor *key_cache[DS4_DFLASH_N_LAYER];
     ds4_gpu_tensor *value_cache[DS4_DFLASH_N_LAYER];
+    ds4_gpu_tensor *target_key_backup[DS4_MAX_LAYER];
+    ds4_gpu_tensor *target_value_backup[DS4_MAX_LAYER];
 } ds4_dflash_gpu_graph;
 
 typedef struct {
@@ -49412,6 +49414,10 @@ static void dflash_graph_free(ds4_dflash_gpu_graph *g) {
         ds4_gpu_tensor_free(g->key_cache[il]);
         ds4_gpu_tensor_free(g->value_cache[il]);
     }
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        ds4_gpu_tensor_free(g->target_key_backup[il]);
+        ds4_gpu_tensor_free(g->target_value_backup[il]);
+    }
     memset(g, 0, sizeof(*g));
 }
 
@@ -49474,6 +49480,26 @@ static bool dflash_graph_alloc(ds4_dflash_gpu_graph *g, uint32_t ctx_size) {
         g->value_cache[il] = ds4_gpu_tensor_alloc(cache_bytes);
         if (!g->key_cache[il] || !g->value_cache[il]) goto fail;
         g->kv_bytes += 2u * cache_bytes;
+    }
+    /*
+     * A verification block is wider than the accepted prefix. SWA uses a
+     * 512-row ring, so committing rejected future rows can overwrite history
+     * that the next target step still needs. Keep a tiny per-layer snapshot
+     * (36 SWA layers * 16 rows * K/V = 2.25 MiB) for rollback.
+     */
+    const uint64_t target_backup_bytes =
+        block * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(uint16_t);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!ds4_laguna_layer_is_swa(il)) continue;
+        g->target_key_backup[il] =
+            ds4_gpu_tensor_alloc(target_backup_bytes);
+        g->target_value_backup[il] =
+            ds4_gpu_tensor_alloc(target_backup_bytes);
+        if (!g->target_key_backup[il] ||
+            !g->target_value_backup[il]) {
+            goto fail;
+        }
+        g->scratch_bytes += 2u * target_backup_bytes;
     }
     fprintf(stderr,
             "ds4: DFlash CUDA graph: capture=%u block=%u KV %.2f MiB "
@@ -50294,7 +50320,8 @@ static bool laguna_graph_forward_batch(
                     n_head,
                     DS4_N_HEAD_KV,
                     DS4_N_HEAD_DIM,
-                    1.0f / sqrtf((float)DS4_N_HEAD_DIM)) != 0;
+                    1.0f / sqrtf((float)DS4_N_HEAD_DIM),
+                    true) != 0;
         }
         if (ok) {
             failed_stage = "attention output projection";
@@ -50597,9 +50624,11 @@ static bool dflash_graph_inject(
         const ds4_model        *model,
         const ds4_dflash_weights *weights,
         uint32_t                pos0,
-        uint32_t                n_tokens) {
+        uint32_t                n_tokens,
+        uint32_t                feature_rows) {
     if (!g || !model || !weights || n_tokens == 0u ||
-        n_tokens > g->capture_cap || pos0 > g->ctx_size - n_tokens) {
+        feature_rows < n_tokens || feature_rows > g->capture_cap ||
+        pos0 > g->ctx_size - n_tokens) {
         return false;
     }
     bool ok = ds4_gpu_begin_commands() != 0;
@@ -50613,6 +50642,7 @@ static bool dflash_graph_inject(
                 DS4_N_EMBD,
                 DS4_DFLASH_N_AUX,
                 n_tokens,
+                feature_rows,
                 DS4_RMS_EPS) != 0;
     }
     if (ok) {
@@ -50829,7 +50859,8 @@ static bool dflash_graph_draft(
                     DS4_DFLASH_N_HEAD,
                     DS4_DFLASH_N_HEAD_KV,
                     DS4_DFLASH_HEAD_DIM,
-                    1.0f / sqrtf((float)DS4_DFLASH_HEAD_DIM)) != 0;
+                    1.0f / sqrtf((float)DS4_DFLASH_HEAD_DIM),
+                    false) != 0;
         }
         if (ok && il == 0u) {
             dflash_debug_tensor_stats("layer0 heads",
@@ -61045,12 +61076,24 @@ static int ds4_engine_open_internal(ds4_engine **out,
             e->mtp_ready ||
             e->dflash_ready ||
             (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark);
+        /*
+         * CUDA has one primary model mapping. Replacing it with the support
+         * checkpoint unregisters the target mapping, releases the target Q8
+         * caches, and can even free a DS4_CUDA_COPY_MODEL device copy. The
+         * support checkpoint is intentionally auxiliary on CUDA: its tensor
+         * launchers resolve weights through the per-map range/FD cache while
+         * the target remains the primary mapping.
+         *
+         * Metal can register the support mapping independently, so preserve
+         * its existing setup there.
+         */
         if (support_model_runtime_ready &&
+            e->backend != DS4_BACKEND_CUDA &&
             !ds4_gpu_set_model_map_range(e->mtp_model.map,
-                                           e->mtp_model.size,
-                                           e->mtp_model.tensor_data_pos,
-                                           e->mtp_model.size - e->mtp_model.tensor_data_pos,
-                                           e->mtp_model.max_tensor_bytes))
+                                         e->mtp_model.size,
+                                         e->mtp_model.tensor_data_pos,
+                                         e->mtp_model.size - e->mtp_model.tensor_data_pos,
+                                         e->mtp_model.max_tensor_bytes))
         {
             fprintf(stderr,
                     "ds4: %s failed to map support model views; aborting startup. "
@@ -63114,6 +63157,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                      &e->mtp_model,
                                      &e->dflash_weights,
                                      (uint32_t)i,
+                                     n,
                                      n)) {
                 snprintf(err, errlen,
                          "%s DFlash prefill injection failed at token %d",
@@ -64767,6 +64811,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                  &e->mtp_model,
                                  &e->dflash_weights,
                                  (uint32_t)s->checkpoint.len,
+                                 1u,
                                  1u)) {
             if (errlen) snprintf(err, errlen,
                                  "%s DFlash KV injection failed",
@@ -69278,6 +69323,99 @@ static int ds4_session_eval_dflash_baseline(
     return 1;
 }
 
+static bool dflash_target_swa_backup(
+        ds4_session *s,
+        uint32_t     pos0,
+        uint32_t     n_rows) {
+    if (!s || n_rows == 0u || n_rows > DS4_DFLASH_BLOCK_SIZE) return false;
+    const uint64_t row_bytes =
+        (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(uint16_t);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor *backup_k = s->dflash_graph.target_key_backup[il];
+        ds4_gpu_tensor *backup_v = s->dflash_graph.target_value_backup[il];
+        if (!backup_k && !backup_v) continue;
+        const uint32_t cap = s->laguna_graph.cache_cap[il];
+        if (!backup_k || !backup_v || cap == 0u || n_rows > cap) return false;
+        const uint32_t ring_row = pos0 % cap;
+        uint32_t first = cap - ring_row;
+        if (first > n_rows) first = n_rows;
+        const uint64_t first_bytes = (uint64_t)first * row_bytes;
+        if (!ds4_gpu_tensor_copy_range_async(
+                    backup_k, 0, s->laguna_graph.key_cache[il],
+                    (uint64_t)ring_row * row_bytes, first_bytes) ||
+            !ds4_gpu_tensor_copy_range_async(
+                    backup_v, 0, s->laguna_graph.value_cache[il],
+                    (uint64_t)ring_row * row_bytes, first_bytes)) {
+            return false;
+        }
+        const uint32_t second = n_rows - first;
+        if (second != 0u) {
+            const uint64_t second_bytes = (uint64_t)second * row_bytes;
+            if (!ds4_gpu_tensor_copy_range_async(
+                        backup_k, first_bytes,
+                        s->laguna_graph.key_cache[il], 0, second_bytes) ||
+                !ds4_gpu_tensor_copy_range_async(
+                        backup_v, first_bytes,
+                        s->laguna_graph.value_cache[il], 0, second_bytes)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool dflash_target_swa_restore_rejected(
+        ds4_session *s,
+        uint32_t     pos0,
+        uint32_t     n_rows,
+        uint32_t     accepted_rows) {
+    if (!s || accepted_rows > n_rows ||
+        n_rows > DS4_DFLASH_BLOCK_SIZE) {
+        return false;
+    }
+    const uint32_t rejected = n_rows - accepted_rows;
+    if (rejected == 0u) return true;
+    const uint64_t row_bytes =
+        (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(uint16_t);
+    const uint64_t backup_offset = (uint64_t)accepted_rows * row_bytes;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor *backup_k = s->dflash_graph.target_key_backup[il];
+        ds4_gpu_tensor *backup_v = s->dflash_graph.target_value_backup[il];
+        if (!backup_k && !backup_v) continue;
+        const uint32_t cap = s->laguna_graph.cache_cap[il];
+        if (!backup_k || !backup_v || cap == 0u || rejected > cap) {
+            return false;
+        }
+        const uint32_t ring_row = (pos0 + accepted_rows) % cap;
+        uint32_t first = cap - ring_row;
+        if (first > rejected) first = rejected;
+        const uint64_t first_bytes = (uint64_t)first * row_bytes;
+        if (!ds4_gpu_tensor_copy_range_async(
+                    s->laguna_graph.key_cache[il],
+                    (uint64_t)ring_row * row_bytes,
+                    backup_k, backup_offset, first_bytes) ||
+            !ds4_gpu_tensor_copy_range_async(
+                    s->laguna_graph.value_cache[il],
+                    (uint64_t)ring_row * row_bytes,
+                    backup_v, backup_offset, first_bytes)) {
+            return false;
+        }
+        const uint32_t second = rejected - first;
+        if (second != 0u) {
+            const uint64_t second_bytes = (uint64_t)second * row_bytes;
+            if (!ds4_gpu_tensor_copy_range_async(
+                        s->laguna_graph.key_cache[il], 0, backup_k,
+                        backup_offset + first_bytes, second_bytes) ||
+                !ds4_gpu_tensor_copy_range_async(
+                        s->laguna_graph.value_cache[il], 0, backup_v,
+                        backup_offset + first_bytes, second_bytes)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static int ds4_session_eval_dflash_argmax(
         ds4_session *s,
         int          first_token,
@@ -69347,6 +69485,12 @@ static int ds4_session_eval_dflash_argmax(
     for (int i = 0; i < draft_n; i++) {
         target_tokens[i + 1] = drafts[i];
     }
+    if (!dflash_target_swa_backup(
+                s, (uint32_t)start, (uint32_t)draft_n + 1u)) {
+        snprintf(err, errlen, "DFlash target SWA backup failed");
+        s->checkpoint_valid = false;
+        return -1;
+    }
     if (!laguna_graph_forward_batch(&s->laguna_graph,
                                     &e->model,
                                     &e->weights,
@@ -69364,16 +69508,6 @@ static int ds4_session_eval_dflash_argmax(
         return -1;
     }
     const double tt = now_sec();
-    if (!dflash_graph_inject(&s->dflash_graph,
-                             &e->mtp_model,
-                             &e->dflash_weights,
-                             (uint32_t)start,
-                             (uint32_t)draft_n + 1u)) {
-        snprintf(err, errlen, "DFlash verified-feature injection failed");
-        s->checkpoint_valid = false;
-        return -1;
-    }
-    const double ti = now_sec();
 
     uint32_t target_tops[DS4_DFLASH_BLOCK_SIZE] = {0};
     if (!ds4_gpu_tensor_read(s->dflash_graph.target_tops,
@@ -69390,6 +69524,37 @@ static int ds4_session_eval_dflash_argmax(
            (int)target_tops[matched] == drafts[matched]) {
         matched++;
     }
+    const double tvfy = now_sec();
+    if (!dflash_target_swa_restore_rejected(
+                s,
+                (uint32_t)start,
+                (uint32_t)draft_n + 1u,
+                (uint32_t)matched + 1u)) {
+        snprintf(err, errlen, "DFlash target SWA rollback failed");
+        s->checkpoint_valid = false;
+        return -1;
+    }
+
+    /*
+     * Only the target-accepted prefix can become history for the next draft.
+     * Packing and projecting the rejected suffix wasted most of the encoder
+     * injection on low-acceptance blocks and populated cache rows that were
+     * immediately overwritten. Reading target tops first introduces no extra
+     * required synchronization: verification must be complete before the
+     * host can decide the prefix in either schedule.
+     */
+    if (!dflash_graph_inject(&s->dflash_graph,
+                             &e->mtp_model,
+                             &e->dflash_weights,
+                             (uint32_t)start,
+                             (uint32_t)matched + 1u,
+                             (uint32_t)draft_n + 1u)) {
+        snprintf(err, errlen, "DFlash verified-feature injection failed");
+        s->checkpoint_valid = false;
+        return -1;
+    }
+    const double ti = now_sec();
+
     if (!ds4_gpu_tensor_read(
             s->dflash_graph.target_logits,
             (uint64_t)matched * DS4_N_VOCAB * sizeof(float),
@@ -69461,10 +69626,15 @@ static int ds4_session_eval_dflash_argmax(
     }
     if (getenv("DS4_DFLASH_LOG")) {
         fprintf(stderr,
-                "ds4: DFlash drafted=%d matched=%d committed=%d "
+                "ds4: DFlash first=%d draft0=%d target0=%u "
+                "drafted=%d matched=%d committed=%d "
                 "depth=%u next_depth=%u cooldown=%u "
                 "draft=%.3f ms "
-                "target=%.3f ms inject=%.3f ms finish=%.3f ms total=%.3f ms\n",
+                "target=%.3f ms verify=%.3f ms "
+                "inject=%.3f ms finish=%.3f ms total=%.3f ms\n",
+                first_token,
+                draft_n > 0 ? drafts[0] : -1,
+                target_tops[0],
                 draft_n,
                 matched,
                 n_accept,
@@ -69473,7 +69643,8 @@ static int ds4_session_eval_dflash_argmax(
                 adaptive ? s->dflash_adapt_cooldown : 0u,
                 (td - t0) * 1000.0,
                 (tt - td) * 1000.0,
-                (ti - tt) * 1000.0,
+                (tvfy - tt) * 1000.0,
+                (ti - tvfy) * 1000.0,
                 (tv - ti) * 1000.0,
                 cycle_ms);
         if (adaptive) {

@@ -738,7 +738,7 @@ static int check_attention(void) {
                   heads, key_cache, value_cache, staged_key, staged_value,
                   q_t, k_t, v_t, gate_t, 0u, n_tokens, cache_cap,
                   n_head, n_head_kv, HEAD_DIM,
-                  1.0f / sqrtf((float)HEAD_DIM)),
+                  1.0f / sqrtf((float)HEAD_DIM), true),
           "Laguna prefill attention");
     CHECK(ds4_gpu_tensor_read(heads, 0, got, sizeof(got)),
           "read prefill attention");
@@ -828,7 +828,7 @@ static int check_attention(void) {
                   heads, key_cache, value_cache, staged_key, staged_value,
                   q_t, k_t, v_t, gate_t, 4u, n_tokens, cache_cap,
                   n_head, n_head_kv, HEAD_DIM,
-                  1.0f / sqrtf((float)HEAD_DIM)),
+                  1.0f / sqrtf((float)HEAD_DIM), true),
           "Laguna wrapped prefill attention");
     CHECK(ds4_gpu_tensor_read(heads, 0, got, sizeof(got)),
           "read wrapped prefill attention");
@@ -836,6 +836,35 @@ static int check_attention(void) {
         CHECK(close_enough(got[i], expected[i], 5e-4f, 5e-4f),
               "Laguna wrapped prefill attention numeric");
     }
+
+    uint16_t key_before[cache_cap * HEAD_DIM];
+    uint16_t value_before[cache_cap * HEAD_DIM];
+    uint16_t key_after[cache_cap * HEAD_DIM];
+    uint16_t value_after[cache_cap * HEAD_DIM];
+    CHECK(ds4_gpu_tensor_read(key_cache, 0, key_before,
+                              sizeof(key_before)) &&
+          ds4_gpu_tensor_read(value_cache, 0, value_before,
+                              sizeof(value_before)),
+          "read committed Laguna KV");
+    for (uint64_t i = 0; i < kv_values; i++) {
+        k[i] = -3.0f;
+        v[i] = 17.0f;
+    }
+    CHECK(ds4_gpu_tensor_write(k_t, 0, k, sizeof(k)) &&
+          ds4_gpu_tensor_write(v_t, 0, v, sizeof(v)) &&
+          ds4_gpu_laguna_attention_prefill_tensor(
+                  heads, key_cache, value_cache, staged_key, staged_value,
+                  q_t, k_t, v_t, gate_t, 4u, n_tokens, cache_cap,
+                  n_head, n_head_kv, HEAD_DIM,
+                  1.0f / sqrtf((float)HEAD_DIM), false),
+          "Laguna transient prefill attention");
+    CHECK(ds4_gpu_tensor_read(key_cache, 0, key_after, sizeof(key_after)) &&
+          ds4_gpu_tensor_read(value_cache, 0, value_after,
+                              sizeof(value_after)),
+          "read KV after transient attention");
+    CHECK(memcmp(key_before, key_after, sizeof(key_before)) == 0 &&
+          memcmp(value_before, value_after, sizeof(value_before)) == 0,
+          "Laguna transient attention preserves KV cache");
 
     ds4_gpu_tensor_free(gate_t);
     ds4_gpu_tensor_free(v_t);
@@ -902,7 +931,7 @@ static int check_dflash_blackwell_attention(void) {
               heads, key_cache, value_cache, staged_key, staged_value,
               q_t, k_t, v_t, gate_t, 0u, n_tokens, cache_cap,
               n_head, n_head_kv, HEAD_DIM,
-              1.0f / sqrtf((float)HEAD_DIM)) &&
+              1.0f / sqrtf((float)HEAD_DIM), true) &&
           ds4_gpu_tensor_read(heads, 0, portable, sizeof(portable)),
           "portable DFlash attention");
     CHECK(unsetenv("DS4_CUDA_DFLASH_NO_BLACKWELL") == 0,
@@ -913,7 +942,7 @@ static int check_dflash_blackwell_attention(void) {
               heads, key_cache, value_cache, staged_key, staged_value,
               q_t, k_t, v_t, gate_t, 0u, n_tokens, cache_cap,
               n_head, n_head_kv, HEAD_DIM,
-              1.0f / sqrtf((float)HEAD_DIM)) &&
+              1.0f / sqrtf((float)HEAD_DIM), true) &&
           ds4_gpu_tensor_read(heads, 0, untiled, sizeof(untiled)),
           "untiled Blackwell DFlash attention");
     CHECK(unsetenv("DS4_CUDA_LAGUNA_NO_TILED_GQA_PREFILL") == 0,
@@ -922,7 +951,7 @@ static int check_dflash_blackwell_attention(void) {
               heads, key_cache, value_cache, staged_key, staged_value,
               q_t, k_t, v_t, gate_t, 0u, n_tokens, cache_cap,
               n_head, n_head_kv, HEAD_DIM,
-              1.0f / sqrtf((float)HEAD_DIM)) &&
+              1.0f / sqrtf((float)HEAD_DIM), true) &&
           ds4_gpu_tensor_read(heads, 0, blackwell, sizeof(blackwell)),
           "Blackwell DFlash attention");
     for (uint64_t i = 0; i < q_values; i++) {

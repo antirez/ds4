@@ -9064,6 +9064,13 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     return 1;
 }
 
+int ds4_gpu_tensor_copy_range_async(
+        ds4_gpu_tensor *dst, uint64_t dst_offset,
+        const ds4_gpu_tensor *src, uint64_t src_offset,
+        uint64_t bytes) {
+    return ds4_gpu_tensor_copy(dst, dst_offset, src, src_offset, bytes);
+}
+
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count) {
@@ -34686,7 +34693,8 @@ int ds4_gpu_laguna_attention_prefill_tensor(
         uint32_t              n_head,
         uint32_t              n_head_kv,
         uint32_t              head_dim,
-        float                 scale) {
+        float                 scale,
+        bool                  commit_kv) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!heads || !key_cache || !value_cache || !staged_key ||
         !staged_value || !q || !k || !v || !gate || n_tokens == 0 ||
@@ -34793,18 +34801,20 @@ int ds4_gpu_laguna_attention_prefill_tensor(
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
-        enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:commit_pipeline];
-        [enc setBytes:&args length:sizeof(args) atIndex:0];
-        [enc setBuffer:stagedkeybuf offset:ds4_gpu_tensor_offset(staged_key)
-                atIndex:1];
-        [enc setBuffer:stagedvaluebuf offset:ds4_gpu_tensor_offset(staged_value)
-                atIndex:2];
-        [enc setBuffer:keybuf offset:ds4_gpu_tensor_offset(key_cache) atIndex:3];
-        [enc setBuffer:valuebuf offset:ds4_gpu_tensor_offset(value_cache) atIndex:4];
-        [enc dispatchThreads:MTLSizeMake((NSUInteger)kv_values, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        ds4_gpu_end_compute_encoder(cb, enc);
+        if (commit_kv) {
+            enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:commit_pipeline];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:stagedkeybuf offset:ds4_gpu_tensor_offset(staged_key)
+                    atIndex:1];
+            [enc setBuffer:stagedvaluebuf offset:ds4_gpu_tensor_offset(staged_value)
+                    atIndex:2];
+            [enc setBuffer:keybuf offset:ds4_gpu_tensor_offset(key_cache) atIndex:3];
+            [enc setBuffer:valuebuf offset:ds4_gpu_tensor_offset(value_cache) atIndex:4];
+            [enc dispatchThreads:MTLSizeMake((NSUInteger)kv_values, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+        }
 
         if (!ds4_gpu_finish_command_buffer(cb, owned,
                                             "Laguna prefill attention")) {
@@ -44784,10 +44794,10 @@ int ds4_gpu_dflash_pack_features_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *features,
         const void *model_map, uint64_t model_size,
         uint64_t aux_norm_offset, uint32_t n_embd, uint32_t n_aux,
-        uint32_t n_rows, float eps) {
+        uint32_t n_rows, uint32_t feature_rows, float eps) {
     (void)out; (void)features; (void)model_map; (void)model_size;
     (void)aux_norm_offset; (void)n_embd; (void)n_aux; (void)n_rows;
-    (void)eps;
+    (void)feature_rows; (void)eps;
     return 0;
 }
 

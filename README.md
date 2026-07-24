@@ -226,6 +226,12 @@ plus its graph buffers. It is not enabled automatically because throughput
 depends on draft acceptance for the workload and on the cost of the target's
 small verification batches.
 
+The CUDA path keeps the target checkpoint as the primary device mapping while
+resolving DFlash weights through the auxiliary mapping. Draft mask-block K/V is
+transient: only the target-verified prefix is injected into draft history.
+Rejected target rows are also rolled back in Laguna's 512-token sliding-window
+cache, so a speculative block cannot evict still-live target history.
+
 On Blackwell GPUs, DFlash also groups its nine query heads per KV head into one
 attention block so each sliding-window K/V row is loaded once per group.
 `DS4_CUDA_DFLASH_NO_BLACKWELL=1` selects the portable per-query-head kernel for
