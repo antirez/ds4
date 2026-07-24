@@ -184,6 +184,48 @@ __global__ static void matmul_f16_ordered_chunks_kernel(
     }
 }
 
+/* Wave64-native counterpart of matmul_f16_ordered_chunks_kernel. The w32
+ * version launches a 32-thread block, which on a native-64-lane wavefront
+ * (CDNA/gfx9xx) leaves the other 32 lanes of every dispatched wavefront
+ * completely idle -- not a two-independent-rows tradeoff like the other w32
+ * kernels this session touched, just unused capacity. This version divides
+ * the same row's dot product across all 64 threads instead of 32, halving
+ * the per-lane chunk length. Reduction is still done by shared-memory +
+ * single-thread sum (matches the original's approach, not a shuffle
+ * reduction) to keep this a minimal, low-risk change isolated to the launch
+ * width. */
+__global__ static void matmul_f16_ordered_chunks_w64_kernel(
+        float *out,
+        const __half *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok) {
+    uint64_t row = (uint64_t)blockIdx.x;
+    uint64_t tok = (uint64_t)blockIdx.y;
+    if (row >= out_dim || tok >= n_tok) return;
+
+    __shared__ float partial[64];
+    const uint32_t tid = threadIdx.x;
+    float sum = 0.0f;
+    const uint64_t chunk = (in_dim + 63u) / 64u;
+    const uint64_t k0 = (uint64_t)tid * chunk;
+    uint64_t k1 = k0 + chunk;
+    if (k1 > in_dim) k1 = in_dim;
+    const __half *wr = w + row * in_dim;
+    const float *xr = x + tok * in_dim;
+    for (uint64_t i = k0; i < k1; i++) {
+        sum += __half2float(wr[i]) * xr[i];
+    }
+    partial[tid] = sum;
+    __syncthreads();
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint32_t i = 0; i < 64u; i++) total += partial[i];
+        out[tok * out_dim + row] = total;
+    }
+}
+
 __global__ static void matmul_f16_f32_sharedx_warp_rows_w32_kernel(
         float *out,
         const __half *w,

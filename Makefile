@@ -205,6 +205,18 @@ test-rocm-moe-down-sum6:
 	$(MAKE) tests/test_rocm_moe_down_sum6 $(ROCM_BUILD_VARS)
 	./tests/test_rocm_moe_down_sum6
 
+tests/test_rocm_matmul_f16_ordered.o: tests/test_rocm_matmul_f16_ordered.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_rocm_matmul_f16_ordered: tests/test_rocm_matmul_f16_ordered.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+# Needs a real GPU.  Run after a ROCm build, e.g.
+#   make mi200 && make test-rocm-matmul-f16-ordered ROCM_ARCH=gfx90a
+test-rocm-matmul-f16-ordered:
+	$(MAKE) tests/test_rocm_matmul_f16_ordered $(ROCM_BUILD_VARS)
+	./tests/test_rocm_matmul_f16_ordered
+
 ds4: ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
