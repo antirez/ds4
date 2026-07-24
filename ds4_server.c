@@ -8262,9 +8262,6 @@ static void id_list_push_unique(stop_list *ids, const char *id);
 
 struct server {
     ds4_engine *engine;
-    /* Alias of slots[0].session. Kept for the legacy, non-batched path and
-     * parser-only context queries while slot-aware code is explicit. */
-    ds4_session *session;
     server_slot *slots;
     int slot_count;
     int ctx_size;
@@ -10083,7 +10080,11 @@ static thinking_state thinking_state_from_prompt(const request *r) {
  *
  * Returns 1 when an injection was performed (text extended, thinking closed),
  * 0 when there is nothing to do or no budget, -1 on eval failure. */
+static int server_eval_token(server *s, server_slot *slot, int token,
+                             char *err, size_t errlen);
+
 static int chat_think_tool_recovery(server *s,
+                                    server_slot *slot,
                                     buf *text,
                                     thinking_state *thinking,
                                     size_t *scan_from,
@@ -10104,7 +10105,8 @@ static int chat_think_tool_recovery(server *s,
     ds4_tokens toks = {0};
     ds4_tokenize_rendered_chat(s->engine, inject, &toks);
 
-    const int room = ds4_session_ctx(s->session) - ds4_session_pos(s->session);
+    const int room = ds4_session_ctx(slot->session) -
+                     ds4_session_pos(slot->session);
     if (toks.len <= 0 ||
         toks.len >= room ||
         *completion + toks.len >= max_tokens) {
@@ -10117,7 +10119,7 @@ static int chat_think_tool_recovery(server *s,
     }
 
     for (int i = 0; i < toks.len; i++) {
-        if (ds4_session_eval(s->session, toks.v[i], err, errlen) != 0) {
+        if (server_eval_token(s, slot, toks.v[i], err, errlen) != 0) {
             ds4_tokens_free(&toks);
             return -1;
         }
@@ -11520,7 +11522,7 @@ decode_again:
                      * close so the model restarts the call on the executable
                      * side. */
                     const int recovered = think_tool_recovery_enabled ?
-                        chat_think_tool_recovery(s, &text, &thinking,
+                        chat_think_tool_recovery(s, slot, &text, &thinking,
                                                  &think_recovery_scan_from,
                                                  &completion, max_tokens,
                                                  err, sizeof(err)) : 0;
@@ -12989,7 +12991,6 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    s.session = s.slots[0].session;
 
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
