@@ -1103,7 +1103,7 @@ __global__ static void glm_attention_indexed_decode_split_group8_partial_valid_k
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
             score = __shfl(score, 0, 32);
 #else
-            score = __shfl_sync(FULL_WARP_MASK, score, 0, 32);
+            score = __shfl_sync(DS4_WARP32_MASK, score, 0, 32);
 #endif
             const float new_m = fmaxf(M, score);
             const float old_scale = expf(M - new_m);
@@ -2508,9 +2508,9 @@ __global__ static void glm_router_select_warp_topk_kernel(
 
         #pragma unroll
         for (uint32_t mask = 16u; mask > 0u; mask >>= 1u) {
-            const float other_score = __shfl_xor_sync(FULL_WARP_MASK, best_score, mask);
-            const float other_prob = __shfl_xor_sync(FULL_WARP_MASK, best_prob, mask);
-            const uint32_t other_idx = __shfl_xor_sync(FULL_WARP_MASK, best_idx, mask);
+            const float other_score = __shfl_xor_sync(DS4_WARP32_MASK, best_score, mask);
+            const float other_prob = __shfl_xor_sync(DS4_WARP32_MASK, best_prob, mask);
+            const uint32_t other_idx = __shfl_xor_sync(DS4_WARP32_MASK, best_idx, mask);
             if (glm_router_score_better(other_score, other_idx, best_score, best_idx)) {
                 best_score = other_score;
                 best_prob = other_prob;

@@ -3,6 +3,46 @@
 // Included from ds4_cuda.cu before more specialized modules; these helpers are
 // intentionally kept static in the single translation unit.
 
+/* Lane index inside the hardware wavefront.
+ *
+ * Sub-wave reductions have to build their __shfl_*_sync masks from this rather
+ * than from threadIdx.x.  HIP validates the mask against the actual active
+ * lane set, and on a wave64 part a mask derived from threadIdx.x names lanes
+ * in the wrong half of the wave: threads 32..39 of a block compute the mask
+ * for lanes 0..7.  The check then fails and aborts the queue with a hardware
+ * exception.  It happens to agree with threadIdx.x on wave32 parts, which is
+ * why the threadIdx.x form survived on RDNA. */
+__device__ static __forceinline__ uint32_t ds4_lane_in_wave(void) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    return __lane_id();
+#else
+    return threadIdx.x & 31u;
+#endif
+}
+
+/* Mask naming the WIDTH-lane group that contains this lane, for the
+ * fixed-width sub-wave shuffles used by the score and gate/up reductions.
+ * Callers must keep every lane of the group on the same side of any branch
+ * around the shuffle, which the reductions below do. */
+template <uint32_t WIDTH>
+__device__ static __forceinline__ MASK_T ds4_subwave_mask(void) {
+    static_assert(WIDTH > 0u && WIDTH <= 8u * sizeof(MASK_T),
+                  "sub-wave width must fit inside the mask type");
+    const MASK_T ones = (WIDTH == 8u * sizeof(MASK_T))
+                            ? (MASK_T)~(MASK_T)0
+                            : (MASK_T)(((MASK_T)1 << (WIDTH % (8u * sizeof(MASK_T)))) - (MASK_T)1);
+    return (MASK_T)(ones << (ds4_lane_in_wave() & ~(WIDTH - 1u)));
+}
+
+/* The whole backend treats a "warp" as 32 lanes and passes an explicit width
+ * of 32 to its shuffles, which HIP maps correctly onto either wave size.  The
+ * accompanying mask must name that 32-lane group and nothing else: on wave64 a
+ * literal all-ones mask claims 64 lanes, and any kernel where only part of the
+ * wave reaches the shuffle -- a tail token, a short row -- then fails HIP's
+ * mask check and faults the queue.  On wave32 and on CUDA this is exactly the
+ * old all-ones constant, so behaviour there is unchanged. */
+#define DS4_WARP32_MASK ds4_subwave_mask<32u>()
+
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] = v;
@@ -352,7 +392,7 @@ __device__ static float warp_sum_f32(float v) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         v += __shfl_down(v, offset, 32);
 #else
-        v += __shfl_down_sync(FULL_WARP_MASK, v, offset, 32);
+        v += __shfl_down_sync(DS4_WARP32_MASK, v, offset, 32);
 #endif
     }
     return v;
@@ -363,7 +403,7 @@ __device__ static float warp_max_f32(float v) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         v = fmaxf(v, __shfl_down(v, offset, 32));
 #else
-        v = fmaxf(v, __shfl_down_sync(FULL_WARP_MASK, v, offset, 32));
+        v = fmaxf(v, __shfl_down_sync(DS4_WARP32_MASK, v, offset, 32));
 #endif
     }
     return v;

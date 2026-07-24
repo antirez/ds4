@@ -463,18 +463,18 @@ __device__ static void dev_dot_q2_K_q8_K_block8(
 }
 
 __device__ static float half_warp_sum_f32(float v, uint32_t lane16) {
-    uint32_t mask = 0xffffu << (threadIdx.x & 16u);
+    const MASK_T mask = ds4_subwave_mask<16u>();
     for (int offset = 8; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(static_cast<MASK_T>(mask), v, offset, 16);
+        v += __shfl_down_sync(mask, v, offset, 16);
     }
     (void)lane16;
     return v;
 }
 
 __device__ static float quarter_warp_sum_f32(float v, uint32_t lane8) {
-    uint32_t mask = 0xffu << (threadIdx.x & 24u);
+    const MASK_T mask = ds4_subwave_mask<8u>();
     for (int offset = 4; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(static_cast<MASK_T>(mask), v, offset, 8);
+        v += __shfl_down_sync(mask, v, offset, 8);
     }
     (void)lane8;
     return v;
@@ -2842,8 +2842,8 @@ __device__ __forceinline__ static void q2_K_scale_broadcast_w32(const unsigned c
     *d = __shfl(vd, 0, 32);
     *dmin = __shfl(vm, 0, 32);
 #else
-    *d = __shfl_sync(FULL_WARP_MASK, vd, 0, 32);
-    *dmin = __shfl_sync(FULL_WARP_MASK, vm, 0, 32);
+    *d = __shfl_sync(DS4_WARP32_MASK, vd, 0, 32);
+    *dmin = __shfl_sync(DS4_WARP32_MASK, vm, 0, 32);
 #endif
 }
 
