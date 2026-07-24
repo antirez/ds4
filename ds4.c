@@ -28971,8 +28971,14 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("routed_moe");
+    if (ok && getenv("DS4_FFN_FORCE_SYNC")) {
+        if (ds4_gpu_synchronize() == 0) ok = false;
+    }
     if (!shared_done) {
         DS4_METAL_ENCODE_PREFILL_SHARED_EXPERT();
+    }
+    if (ok && getenv("DS4_FFN_FORCE_SYNC")) {
+        if (ds4_gpu_synchronize() == 0) ok = false;
     }
 #undef DS4_METAL_ENCODE_PREFILL_SHARED_EXPERT
 #undef DS4_METAL_TRY_SHARED_DOWN_F16
