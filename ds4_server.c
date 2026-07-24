@@ -8280,6 +8280,11 @@ struct server {
     pthread_cond_t model_cv;
     bool model_busy;
     bool model_stopping;
+    /* A bounded prefill quantum must hand the next model turn to an already
+     * active generator. Without an explicit handoff, the prefill worker can
+     * repeatedly reacquire model_mu before decode workers enqueue their next
+     * token, turning a 128-token quantum into an unbounded decode stall. */
+    bool decode_handoff;
     int decode_pending;
     int active_generations;
     int last_prefill_slot;
@@ -10245,7 +10250,7 @@ static bool server_prefill_enter(server *s, server_slot *slot) {
     slot->prefill_waiting = true;
     pthread_cond_broadcast(&s->model_cv);
     while (!g_stop_requested &&
-           (s->model_busy || s->decode_pending > 0 ||
+           (s->model_busy || s->decode_handoff || s->decode_pending > 0 ||
             server_next_prefill_slot_locked(s) != slot->id)) {
         pthread_cond_wait(&s->model_cv, &s->model_mu);
     }
@@ -10268,7 +10273,20 @@ static void server_prefill_leave(server *s) {
     if (!s->batched_mode) return;
     pthread_mutex_lock(&s->model_mu);
     s->model_busy = false;
+    if (s->active_generations > 0 && !s->model_stopping &&
+        !g_stop_requested) {
+        s->decode_handoff = true;
+    }
     pthread_cond_broadcast(&s->model_cv);
+    while (s->decode_handoff && s->active_generations > 0 &&
+           !s->model_stopping && !g_stop_requested) {
+        pthread_cond_wait(&s->model_cv, &s->model_mu);
+    }
+    if (s->active_generations == 0 || s->model_stopping ||
+        g_stop_requested) {
+        s->decode_handoff = false;
+        pthread_cond_broadcast(&s->model_cv);
+    }
     pthread_mutex_unlock(&s->model_mu);
 }
 
@@ -10803,6 +10821,7 @@ static void server_generation_leave(server *s) {
     if (!s || !s->batched_mode) return;
     pthread_mutex_lock(&s->model_mu);
     if (s->active_generations > 0) s->active_generations--;
+    if (s->active_generations == 0) s->decode_handoff = false;
     pthread_cond_broadcast(&s->model_cv);
     pthread_mutex_unlock(&s->model_mu);
 }
@@ -10926,6 +10945,7 @@ static void *decode_worker_main(void *arg) {
 
         pthread_mutex_lock(&s->model_mu);
         s->model_busy = false;
+        s->decode_handoff = false;
         for (int i = 0; i < count; i++) {
             server_slot *slot = members[i];
             slot->decode_in_flight = false;
@@ -13179,6 +13199,94 @@ static void test_batched_prefill_round_robin(void) {
     slots[0].prefill_waiting = false;
     slots[2].prefill_waiting = false;
     TEST_ASSERT(server_next_prefill_slot_locked(&s) == -1);
+}
+
+typedef struct {
+    server *srv;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool entered;
+    bool done;
+} test_prefill_handoff_state;
+
+static void *test_prefill_handoff_worker(void *arg) {
+    test_prefill_handoff_state *state = arg;
+    pthread_mutex_lock(&state->srv->inference_mu);
+    pthread_mutex_lock(&state->mu);
+    state->entered = true;
+    pthread_cond_broadcast(&state->cv);
+    pthread_mutex_unlock(&state->mu);
+
+    server_prefill_leave(state->srv);
+
+    pthread_mutex_lock(&state->mu);
+    state->done = true;
+    pthread_cond_broadcast(&state->cv);
+    pthread_mutex_unlock(&state->mu);
+    return NULL;
+}
+
+static void test_batched_prefill_hands_off_to_active_decode(void) {
+    server s = {0};
+    s.batched_mode = true;
+    s.model_busy = true;
+    s.active_generations = 1;
+    pthread_mutex_init(&s.inference_mu, NULL);
+    pthread_mutex_init(&s.model_mu, NULL);
+    pthread_cond_init(&s.model_cv, NULL);
+
+    test_prefill_handoff_state state = {.srv = &s};
+    pthread_mutex_init(&state.mu, NULL);
+    pthread_cond_init(&state.cv, NULL);
+
+    /* Hold model_mu until the worker has entered server_prefill_leave(), then
+     * observe the handoff while that worker waits for a decode completion. */
+    pthread_mutex_lock(&s.model_mu);
+    pthread_t thread;
+    int create_rc = pthread_create(&thread, NULL,
+                                   test_prefill_handoff_worker, &state);
+    TEST_ASSERT(create_rc == 0);
+    if (create_rc != 0) {
+        pthread_mutex_unlock(&s.model_mu);
+        pthread_cond_destroy(&state.cv);
+        pthread_mutex_destroy(&state.mu);
+        pthread_cond_destroy(&s.model_cv);
+        pthread_mutex_destroy(&s.model_mu);
+        pthread_mutex_destroy(&s.inference_mu);
+        return;
+    }
+    pthread_mutex_lock(&state.mu);
+    while (!state.entered) pthread_cond_wait(&state.cv, &state.mu);
+    pthread_mutex_unlock(&state.mu);
+    pthread_mutex_unlock(&s.model_mu);
+
+    pthread_mutex_lock(&s.model_mu);
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    timespec_add_us(&deadline, 1000000);
+    while (!s.decode_handoff) {
+        int rc = pthread_cond_timedwait(&s.model_cv, &s.model_mu, &deadline);
+        if (rc == ETIMEDOUT) break;
+    }
+    TEST_ASSERT(s.decode_handoff);
+    pthread_mutex_lock(&state.mu);
+    TEST_ASSERT(!state.done);
+    pthread_mutex_unlock(&state.mu);
+
+    /* This is the state transition performed after a decode batch. */
+    s.decode_handoff = false;
+    pthread_cond_broadcast(&s.model_cv);
+    pthread_mutex_unlock(&s.model_mu);
+    pthread_join(thread, NULL);
+
+    pthread_mutex_lock(&state.mu);
+    TEST_ASSERT(state.done);
+    pthread_mutex_unlock(&state.mu);
+    pthread_cond_destroy(&state.cv);
+    pthread_mutex_destroy(&state.mu);
+    pthread_cond_destroy(&s.model_cv);
+    pthread_mutex_destroy(&s.model_mu);
+    pthread_mutex_destroy(&s.inference_mu);
 }
 
 static void test_batched_live_continuation_slot_binding(void) {
@@ -17413,6 +17521,7 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
 
 static void ds4_server_unit_tests_run(void) {
     test_batched_prefill_round_robin();
+    test_batched_prefill_hands_off_to_active_decode();
     test_batched_live_continuation_slot_binding();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
