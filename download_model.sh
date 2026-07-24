@@ -121,7 +121,7 @@ Targets:
 
   laguna-dflash
        Official Laguna S 2.1 DFlash BF16 drafter from Poolside, about 2.1 GB.
-       Use it with the Laguna Q4 model and --mtp on CUDA.
+       Use it with a Laguna Q4 or mixed Q2_K/Q3_K model and --mtp on CUDA.
 
   laguna-q2-q3
        Mixed Laguna S 2.1 routed-expert quant for 64 GB systems. Routed

@@ -59,6 +59,15 @@ typedef struct {
 } cuda_block_q2_K;
 
 typedef struct {
+    uint8_t hmask[CUDA_QK_K / 8];
+    uint8_t qs[CUDA_QK_K / 4];
+    uint8_t scales[12];
+    uint16_t d;
+} cuda_block_q3_K;
+static_assert(sizeof(cuda_block_q2_K) == 84, "unexpected Q2_K block size");
+static_assert(sizeof(cuda_block_q3_K) == 110, "unexpected Q3_K block size");
+
+typedef struct {
     uint16_t d;
     uint16_t dmin;
     uint8_t scales[12];
@@ -19548,6 +19557,63 @@ __device__ static float dev_dot_q2_K_q8_K_block(const cuda_block_q2_K *x, const 
     return dall * (float)isum - dmin * (float)summs;
 }
 
+__device__ static int dev_q3_K_scale(const uint8_t *scales, uint32_t i) {
+    uint32_t value;
+    if (i < 4u) {
+        value = (scales[i] & 0x0fu) |
+                (((scales[i + 8u] >> 0u) & 0x03u) << 4u);
+    } else if (i < 8u) {
+        value = (scales[i] & 0x0fu) |
+                (((scales[i + 4u] >> 2u) & 0x03u) << 4u);
+    } else if (i < 12u) {
+        value = (scales[i - 8u] >> 4u) |
+                (((scales[i] >> 4u) & 0x03u) << 4u);
+    } else {
+        value = (scales[i - 8u] >> 4u) |
+                (((scales[i - 4u] >> 6u) & 0x03u) << 4u);
+    }
+    return (int)value - 32;
+}
+
+__device__ static float dev_dot_q3_K_q8_K_block(
+        const cuda_block_q3_K *x,
+        const cuda_block_q8_K *y) {
+    int isum = 0;
+    #pragma unroll
+    for (uint32_t group = 0u; group < 16u; group++) {
+        const uint32_t half = group >> 3u;
+        const uint32_t within_half = group & 7u;
+        const uint32_t plane = within_half >> 1u;
+        const uint32_t q_base =
+            half * 32u + (within_half & 1u) * 16u;
+        const uint32_t y_base = group * 16u;
+        const uint32_t shift = plane * 2u;
+        const uint8_t high_mask =
+            (uint8_t)(1u << (half * 4u + plane));
+        int group_sum = 0;
+        #pragma unroll
+        for (uint32_t lane = 0u; lane < 16u; lane += 4u) {
+            uint32_t packed_q = 0u;
+            #pragma unroll
+            for (uint32_t i = 0u; i < 4u; i++) {
+                const int q =
+                    (int)((x->qs[q_base + lane + i] >> shift) & 0x03u) -
+                    ((x->hmask[
+                        (within_half & 1u) * 16u + lane + i] &
+                      high_mask) ? 0 : 4);
+                packed_q |=
+                    (uint32_t)(uint8_t)(int8_t)q << (8u * i);
+            }
+            group_sum = __dp4a(
+                    (int32_t)packed_q,
+                    *(const int32_t *)(y->qs + y_base + lane),
+                    group_sum);
+        }
+        isum += dev_q3_K_scale(x->scales, group) * group_sum;
+    }
+    return dev_f16_to_f32(x->d) * y->d * (float)isum;
+}
+
 __device__ static void dev_dot_q2_K_q8_K_block4(
         const cuda_block_q2_K *x,
         const cuda_block_q8_K *y0,
@@ -29464,11 +29530,13 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         uint32_t                mid_token_stride,
         bool                    force_resident) {
     (void)layer_index; (void)n_total_expert; (void)force_resident;
-    /* Laguna's legacy recipe uses Q4/Q4/Q6 routed experts; the revised
-     * recipe is Q4 throughout.  Keep both on the same model-specific path so
-     * the graph's generic MoE dispatch does not lose the sorted Q4 kernels. */
-    if (gate_type == 12u && up_type == 12u &&
-        (down_type == 12u || down_type == 14u)) {
+    /* Keep all coherent Laguna routed recipes on the model-specific path:
+     * Q2_K/Q3_K/Q4_K for the released variants, plus legacy Q4_K/Q4_K/Q6_K. */
+    const bool coherent_laguna =
+        gate_type == up_type && up_type == down_type &&
+        (gate_type == 10u || gate_type == 11u || gate_type == 12u);
+    if (coherent_laguna ||
+        (gate_type == 12u && up_type == 12u && down_type == 14u)) {
         const ds4_gpu_laguna_moe_desc desc = {
             gate_offset,
             up_offset,
@@ -32048,6 +32116,199 @@ __global__ static void laguna_moe_gate_up_q4_K_kernel(
     }
 }
 
+__device__ static float laguna_moe_dot_lowbit(
+        const char *row,
+        const cuda_block_q8_K *activation,
+        uint32_t block,
+        uint32_t weight_type) {
+    if (weight_type == 10u) {
+        return dev_dot_q2_K_q8_K_block(
+                (const cuda_block_q2_K *)row + block,
+                activation + block);
+    }
+    return dev_dot_q3_K_q8_K_block(
+            (const cuda_block_q3_K *)row + block,
+            activation + block);
+}
+
+__device__ static void laguna_moe_dot_lowbit8(
+        const char *row,
+        const cuda_block_q8_K *const activation[8],
+        uint32_t block,
+        uint32_t count,
+        uint32_t weight_type,
+        float acc[8]) {
+    if (weight_type == 10u) {
+        dev_dot_q2_K_q8_K_block8(
+                (const cuda_block_q2_K *)row + block,
+                count > 0u ? activation[0] + block : NULL,
+                count > 1u ? activation[1] + block : NULL,
+                count > 2u ? activation[2] + block : NULL,
+                count > 3u ? activation[3] + block : NULL,
+                count > 4u ? activation[4] + block : NULL,
+                count > 5u ? activation[5] + block : NULL,
+                count > 6u ? activation[6] + block : NULL,
+                count > 7u ? activation[7] + block : NULL,
+                count,
+                acc);
+        return;
+    }
+    const cuda_block_q3_K *weight =
+        (const cuda_block_q3_K *)row + block;
+    for (uint32_t p = 0u; p < count; p++) {
+        acc[p] += dev_dot_q3_K_q8_K_block(
+                weight, activation[p] + block);
+    }
+}
+
+__global__ static void laguna_moe_gate_up_lowbit_kernel(
+        float *mid,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t up_expert_bytes,
+        uint64_t up_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        uint32_t n_tokens,
+        uint32_t weight_type) {
+    const uint32_t rows_per_block = 32u;
+    const uint32_t row_tiles =
+        (expert_mid_dim + rows_per_block - 1u) / rows_per_block;
+    const uint64_t flat = blockIdx.x;
+    const uint64_t pair = flat / row_tiles;
+    const uint32_t row_tile = (uint32_t)(flat - pair * row_tiles);
+    if (pair >= (uint64_t)n_tokens * n_expert) return;
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t row = row_tile * rows_per_block + row_lane;
+    if (row >= expert_mid_dim) return;
+    const uint32_t token = (uint32_t)(pair / n_expert);
+    const uint32_t slot = (uint32_t)(pair - (uint64_t)token * n_expert);
+    const int32_t expert_i = selected[pair];
+    if (expert_i < 0 || (uint32_t)expert_i >= n_total_expert) return;
+    const uint32_t expert = (uint32_t)expert_i;
+    const char *gate_row =
+        gate_base + (uint64_t)expert * gate_expert_bytes +
+        (uint64_t)row * gate_row_bytes;
+    const char *up_row =
+        up_base + (uint64_t)expert * up_expert_bytes +
+        (uint64_t)row * up_row_bytes;
+    const cuda_block_q8_K *xrow = xq + (uint64_t)token * xq_blocks;
+    float gate_value = 0.0f;
+    float up_value = 0.0f;
+    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+        gate_value +=
+            laguna_moe_dot_lowbit(gate_row, xrow, b, weight_type);
+        up_value +=
+            laguna_moe_dot_lowbit(up_row, xrow, b, weight_type);
+    }
+    gate_value = quarter_warp_sum_f32(gate_value, lane);
+    up_value = quarter_warp_sum_f32(up_value, lane);
+    if (lane == 0u) {
+        mid[pair * expert_mid_dim + row] =
+            (gate_value / (1.0f + expf(-gate_value))) * up_value *
+            weights[(uint64_t)token * n_expert + slot];
+    }
+}
+
+template <uint32_t ROW_SPAN>
+__global__ static void laguna_moe_gate_up_lowbit_expert_tile8_kernel(
+        float *mid,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const uint32_t *sorted_pairs,
+        const uint32_t *offsets,
+        const uint32_t *counts,
+        const uint32_t *tile_total,
+        const uint32_t *tile_experts,
+        const uint32_t *tile_starts,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t up_expert_bytes,
+        uint64_t up_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t weight_type) {
+    const uint32_t tile = blockIdx.y;
+    if (tile >= *tile_total) return;
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t expert = tile_experts[tile];
+    const uint32_t local_start = tile_starts[tile];
+    __shared__ cuda_block_q8_K shared_xq[8][16];
+    uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t token[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t slot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    const cuda_block_q8_K *xrows[8] = {
+        NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+    };
+    uint32_t np = 0u;
+    for (; np < 8u; np++) {
+        const uint32_t local_pair = local_start + np;
+        if (local_pair >= counts[expert]) break;
+        pair[np] = sorted_pairs[offsets[expert] + local_pair];
+        token[np] = pair[np] / n_expert;
+        slot[np] = pair[np] - token[np] * n_expert;
+        xrows[np] = xq + (uint64_t)token[np] * xq_blocks;
+    }
+    if (xq_blocks <= 16u) {
+        for (uint32_t i = threadIdx.x; i < np * xq_blocks;
+             i += blockDim.x) {
+            const uint32_t p = i / xq_blocks;
+            const uint32_t b = i - p * xq_blocks;
+            shared_xq[p][b] = xrows[p][b];
+        }
+        __syncthreads();
+        for (uint32_t p = 0u; p < np; p++) xrows[p] = shared_xq[p];
+    }
+    for (uint32_t rr = 0u; rr < ROW_SPAN / 32u; rr++) {
+        const uint32_t row =
+            blockIdx.x * ROW_SPAN + row_lane + rr * 32u;
+        if (row >= expert_mid_dim) continue;
+        const char *gate_row =
+            gate_base + (uint64_t)expert * gate_expert_bytes +
+            (uint64_t)row * gate_row_bytes;
+        const char *up_row =
+            up_base + (uint64_t)expert * up_expert_bytes +
+            (uint64_t)row * up_row_bytes;
+        float gate[8] = {
+            0.0f, 0.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 0.0f
+        };
+        float up[8] = {
+            0.0f, 0.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 0.0f
+        };
+        for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+            laguna_moe_dot_lowbit8(
+                    gate_row, xrows, b, np, weight_type, gate);
+            laguna_moe_dot_lowbit8(
+                    up_row, xrows, b, np, weight_type, up);
+        }
+        for (uint32_t p = 0u; p < np; p++) {
+            gate[p] = quarter_warp_sum_f32(gate[p], lane);
+            up[p] = quarter_warp_sum_f32(up[p], lane);
+            if (lane == 0u) {
+                const uint64_t off =
+                    (uint64_t)pair[p] * expert_mid_dim + row;
+                mid[off] =
+                    (gate[p] / (1.0f + expf(-gate[p]))) * up[p] *
+                    weights[(uint64_t)token[p] * n_expert + slot[p]];
+            }
+        }
+    }
+}
+
 template <bool Q6_DOWN>
 __global__ static void laguna_moe_down_kernel(
         float *out,
@@ -32103,6 +32364,51 @@ __global__ static void laguna_moe_down_kernel(
                         (const cuda_block_q4_K *)row_ptr + b,
                         mid_row + b);
             }
+        }
+        part = quarter_warp_sum_f32(part, lane);
+        if (lane == 0u) total += part;
+    }
+    if (lane == 0u) out[(uint64_t)token * out_dim + row] = total;
+}
+
+__global__ static void laguna_moe_down_lowbit_kernel(
+        float *out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        uint32_t n_tokens,
+        uint32_t weight_type) {
+    const uint32_t rows_per_block = 32u;
+    const uint32_t row_tiles =
+        (out_dim + rows_per_block - 1u) / rows_per_block;
+    const uint64_t flat = blockIdx.x;
+    const uint32_t token = (uint32_t)(flat / row_tiles);
+    const uint32_t row_tile =
+        (uint32_t)(flat - (uint64_t)token * row_tiles);
+    if (token >= n_tokens) return;
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t row = row_tile * rows_per_block + row_lane;
+    if (row >= out_dim) return;
+    float total = 0.0f;
+    for (uint32_t slot = 0; slot < n_expert; slot++) {
+        const uint64_t pair = (uint64_t)token * n_expert + slot;
+        const int32_t expert_i = selected[pair];
+        if (expert_i < 0 || (uint32_t)expert_i >= n_total_expert) continue;
+        const char *row_ptr =
+            down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes +
+            (uint64_t)row * down_row_bytes;
+        const cuda_block_q8_K *mid_row = midq + pair * midq_blocks;
+        float part = 0.0f;
+        for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+            part += laguna_moe_dot_lowbit(
+                    row_ptr, mid_row, b, weight_type);
         }
         part = quarter_warp_sum_f32(part, lane);
         if (lane == 0u) total += part;
@@ -32206,6 +32512,80 @@ __global__ static void laguna_moe_down_expert_tile8_chunk_kernel(
     }
 }
 
+template <uint32_t ROW_SPAN>
+__global__ static void laguna_moe_down_lowbit_expert_tile8_chunk_kernel(
+        float *terms,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const uint32_t *sorted_pairs,
+        const uint32_t *offsets,
+        const uint32_t *counts,
+        const uint32_t *tile_total,
+        const uint32_t *tile_experts,
+        const uint32_t *tile_starts,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t term_stride,
+        uint32_t row0,
+        uint32_t weight_type) {
+    const uint32_t tile = blockIdx.y;
+    if (tile >= *tile_total) return;
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t expert = tile_experts[tile];
+    const uint32_t local_start = tile_starts[tile];
+    __shared__ cuda_block_q8_K shared_midq[8][8];
+    uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    const cuda_block_q8_K *mid_rows[8] = {
+        NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+    };
+    uint32_t np = 0u;
+    for (; np < 8u; np++) {
+        const uint32_t local_pair = local_start + np;
+        if (local_pair >= counts[expert]) break;
+        pair[np] = sorted_pairs[offsets[expert] + local_pair];
+        mid_rows[np] = midq + (uint64_t)pair[np] * midq_blocks;
+    }
+    if (midq_blocks <= 8u) {
+        for (uint32_t i = threadIdx.x; i < np * midq_blocks;
+             i += blockDim.x) {
+            const uint32_t p = i / midq_blocks;
+            const uint32_t b = i - p * midq_blocks;
+            shared_midq[p][b] = mid_rows[p][b];
+        }
+        __syncthreads();
+        for (uint32_t p = 0u; p < np; p++) {
+            mid_rows[p] = shared_midq[p];
+        }
+    }
+    for (uint32_t rr = 0u; rr < ROW_SPAN / 32u; rr++) {
+        const uint32_t local_row =
+            blockIdx.x * ROW_SPAN + row_lane + rr * 32u;
+        const uint32_t row = row0 + local_row;
+        if (local_row >= term_stride || row >= out_dim) continue;
+        const char *row_ptr =
+            down_base + (uint64_t)expert * down_expert_bytes +
+            (uint64_t)row * down_row_bytes;
+        float acc[8] = {
+            0.0f, 0.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 0.0f
+        };
+        for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+            laguna_moe_dot_lowbit8(
+                    row_ptr, mid_rows, b, np, weight_type, acc);
+        }
+        for (uint32_t p = 0u; p < np; p++) {
+            acc[p] = quarter_warp_sum_f32(acc[p], lane);
+            if (lane == 0u) {
+                terms[(uint64_t)pair[p] * term_stride + local_row] =
+                    acc[p];
+            }
+        }
+    }
+}
+
 __global__ static void laguna_moe_down_chunk_reduce_kernel(
         float *out,
         const float *terms,
@@ -32245,10 +32625,18 @@ static int cuda_laguna_routed_moe(
         uint32_t                       n_expert,
         const ds4_gpu_tensor          *x,
         uint32_t                       n_tokens) {
+    const bool coherent_laguna =
+        desc && desc->gate_type == desc->up_type &&
+        desc->up_type == desc->down_type &&
+        (desc->gate_type == 10u ||
+         desc->gate_type == 11u ||
+         desc->gate_type == 12u);
+    const bool legacy_laguna =
+        desc && desc->gate_type == 12u && desc->up_type == 12u &&
+        desc->down_type == 14u;
     if (!out || !mid || !model_map || !desc || !selected || !weights || !x ||
         n_tokens == 0u || n_total_expert == 0u || n_expert == 0u ||
-        desc->gate_type != 12u || desc->up_type != 12u ||
-        (desc->down_type != 12u && desc->down_type != 14u) ||
+        (!coherent_laguna && !legacy_laguna) ||
         (expert_in_dim & 255u) != 0u ||
         (expert_mid_dim & 255u) != 0u ||
         desc->gate_expert_bytes == 0u || desc->gate_row_bytes == 0u ||
@@ -32426,75 +32814,145 @@ static int cuda_laguna_routed_moe(
         if (n_tokens >= 128u) {
             dim3 grid((expert_mid_dim + 511u) / 512u,
                       (uint32_t)tile_capacity, 1u);
-            moe_gate_up_mid_q4K_expert_tile8_rowspan_kernel<512>
-                    <<<grid, 256>>>(
-                    (float *)mid->ptr,
-                    (float *)mid->ptr,
-                    (float *)mid->ptr,
-                    gate,
-                    up,
-                    xq,
-                    sorted_pairs,
-                    sorted_offsets,
-                    sorted_counts,
-                    tile_total,
-                    tile_experts,
-                    tile_starts,
-                    (const float *)weights->ptr,
-                    desc->gate_expert_bytes,
-                    desc->gate_row_bytes,
-                    xq_blocks,
-                    expert_mid_dim,
-                    n_expert,
-                    0u,
-                    0.0f);
+            if (desc->gate_type == 12u) {
+                moe_gate_up_mid_q4K_expert_tile8_rowspan_kernel<512>
+                        <<<grid, 256>>>(
+                        (float *)mid->ptr,
+                        (float *)mid->ptr,
+                        (float *)mid->ptr,
+                        gate,
+                        up,
+                        xq,
+                        sorted_pairs,
+                        sorted_offsets,
+                        sorted_counts,
+                        tile_total,
+                        tile_experts,
+                        tile_starts,
+                        (const float *)weights->ptr,
+                        desc->gate_expert_bytes,
+                        desc->gate_row_bytes,
+                        xq_blocks,
+                        expert_mid_dim,
+                        n_expert,
+                        0u,
+                        0.0f);
+            } else {
+                laguna_moe_gate_up_lowbit_expert_tile8_kernel<512>
+                        <<<grid, 256>>>(
+                        (float *)mid->ptr,
+                        gate,
+                        up,
+                        xq,
+                        sorted_pairs,
+                        sorted_offsets,
+                        sorted_counts,
+                        tile_total,
+                        tile_experts,
+                        tile_starts,
+                        (const float *)weights->ptr,
+                        desc->gate_expert_bytes,
+                        desc->gate_row_bytes,
+                        desc->up_expert_bytes,
+                        desc->up_row_bytes,
+                        xq_blocks,
+                        expert_mid_dim,
+                        n_expert,
+                        desc->gate_type);
+            }
         } else {
             dim3 grid((expert_mid_dim + 31u) / 32u,
                       (uint32_t)tile_capacity, 1u);
-            moe_gate_up_mid_q4K_expert_tile8_rowspan_kernel<32>
-                    <<<grid, 256>>>(
-                    (float *)mid->ptr,
-                    (float *)mid->ptr,
-                    (float *)mid->ptr,
-                    gate,
-                    up,
-                    xq,
-                    sorted_pairs,
-                    sorted_offsets,
-                    sorted_counts,
-                    tile_total,
-                    tile_experts,
-                    tile_starts,
-                    (const float *)weights->ptr,
-                    desc->gate_expert_bytes,
-                    desc->gate_row_bytes,
-                    xq_blocks,
-                    expert_mid_dim,
-                    n_expert,
-                    0u,
-                    0.0f);
+            if (desc->gate_type == 12u) {
+                moe_gate_up_mid_q4K_expert_tile8_rowspan_kernel<32>
+                        <<<grid, 256>>>(
+                        (float *)mid->ptr,
+                        (float *)mid->ptr,
+                        (float *)mid->ptr,
+                        gate,
+                        up,
+                        xq,
+                        sorted_pairs,
+                        sorted_offsets,
+                        sorted_counts,
+                        tile_total,
+                        tile_experts,
+                        tile_starts,
+                        (const float *)weights->ptr,
+                        desc->gate_expert_bytes,
+                        desc->gate_row_bytes,
+                        xq_blocks,
+                        expert_mid_dim,
+                        n_expert,
+                        0u,
+                        0.0f);
+            } else {
+                laguna_moe_gate_up_lowbit_expert_tile8_kernel<32>
+                        <<<grid, 256>>>(
+                        (float *)mid->ptr,
+                        gate,
+                        up,
+                        xq,
+                        sorted_pairs,
+                        sorted_offsets,
+                        sorted_counts,
+                        tile_total,
+                        tile_experts,
+                        tile_starts,
+                        (const float *)weights->ptr,
+                        desc->gate_expert_bytes,
+                        desc->gate_row_bytes,
+                        desc->up_expert_bytes,
+                        desc->up_row_bytes,
+                        xq_blocks,
+                        expert_mid_dim,
+                        n_expert,
+                        desc->gate_type);
+            }
         }
     } else {
         const uint64_t gate_blocks =
             pairs * ((expert_mid_dim + 31u) / 32u);
         if (gate_blocks > UINT32_MAX) return 0;
-        laguna_moe_gate_up_q4_K_kernel<<<(uint32_t)gate_blocks, 256>>>(
-                (float *)mid->ptr,
-                gate,
-                up,
-                xq,
-                (const int32_t *)selected->ptr,
-                (const float *)weights->ptr,
-                desc->gate_expert_bytes,
-                desc->gate_row_bytes,
-                desc->up_expert_bytes,
-                desc->up_row_bytes,
-                xq_blocks,
-                expert_mid_dim,
-                n_total_expert,
-                n_expert,
-                n_tokens,
-                vector_q4);
+        if (desc->gate_type == 12u) {
+            laguna_moe_gate_up_q4_K_kernel<<<
+                    (uint32_t)gate_blocks, 256>>>(
+                    (float *)mid->ptr,
+                    gate,
+                    up,
+                    xq,
+                    (const int32_t *)selected->ptr,
+                    (const float *)weights->ptr,
+                    desc->gate_expert_bytes,
+                    desc->gate_row_bytes,
+                    desc->up_expert_bytes,
+                    desc->up_row_bytes,
+                    xq_blocks,
+                    expert_mid_dim,
+                    n_total_expert,
+                    n_expert,
+                    n_tokens,
+                    vector_q4);
+        } else {
+            laguna_moe_gate_up_lowbit_kernel<<<
+                    (uint32_t)gate_blocks, 256>>>(
+                    (float *)mid->ptr,
+                    gate,
+                    up,
+                    xq,
+                    (const int32_t *)selected->ptr,
+                    (const float *)weights->ptr,
+                    desc->gate_expert_bytes,
+                    desc->gate_row_bytes,
+                    desc->up_expert_bytes,
+                    desc->up_row_bytes,
+                    xq_blocks,
+                    expert_mid_dim,
+                    n_total_expert,
+                    n_expert,
+                    n_tokens,
+                    desc->gate_type);
+        }
     }
     if (!cuda_ok(cudaGetLastError(), "Laguna MoE gate/up launch")) return 0;
     if (pairs > UINT32_MAX) return 0;
@@ -32545,7 +33003,7 @@ static int cuda_laguna_routed_moe(
                         out_dim,
                         expert_mid_dim,
                         row0);
-            } else {
+            } else if (desc->down_type == 12u) {
                 laguna_moe_down_expert_tile8_chunk_kernel<false, 512>
                         <<<down_grid, 256>>>(
                         (float *)mid->ptr,
@@ -32563,6 +33021,25 @@ static int cuda_laguna_routed_moe(
                         out_dim,
                         expert_mid_dim,
                         row0);
+            } else {
+                laguna_moe_down_lowbit_expert_tile8_chunk_kernel<512>
+                        <<<down_grid, 256>>>(
+                        (float *)mid->ptr,
+                        down,
+                        midq,
+                        sorted_pairs,
+                        sorted_offsets,
+                        sorted_counts,
+                        tile_total,
+                        tile_experts,
+                        tile_starts,
+                        desc->down_expert_bytes,
+                        desc->down_row_bytes,
+                        midq_blocks,
+                        out_dim,
+                        expert_mid_dim,
+                        row0,
+                        desc->down_type);
             }
             if (!cuda_ok(cudaGetLastError(),
                          "Laguna sorted MoE down launch")) {
@@ -32598,7 +33075,7 @@ static int cuda_laguna_routed_moe(
                     desc->down_expert_bytes, desc->down_row_bytes,
                     midq_blocks, out_dim, n_total_expert, n_expert,
                     n_tokens, vector_q4);
-        } else {
+        } else if (desc->down_type == 12u) {
             laguna_moe_down_kernel<false>
                     <<<(uint32_t)down_blocks, 256>>>(
                     (float *)out->ptr, down, midq,
@@ -32606,6 +33083,14 @@ static int cuda_laguna_routed_moe(
                     desc->down_expert_bytes, desc->down_row_bytes,
                     midq_blocks, out_dim, n_total_expert, n_expert,
                     n_tokens, vector_q4);
+        } else {
+            laguna_moe_down_lowbit_kernel<<<
+                    (uint32_t)down_blocks, 256>>>(
+                    (float *)out->ptr, down, midq,
+                    (const int32_t *)selected->ptr,
+                    desc->down_expert_bytes, desc->down_row_bytes,
+                    midq_blocks, out_dim, n_total_expert, n_expert,
+                    n_tokens, desc->down_type);
         }
     }
     return cuda_ok(cudaGetLastError(), "Laguna MoE down launch");

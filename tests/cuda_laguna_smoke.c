@@ -21,6 +21,20 @@ enum {
 };
 
 typedef struct {
+    uint8_t scales[QK_K / 16];
+    uint8_t qs[QK_K / 4];
+    uint16_t d;
+    uint16_t dmin;
+} block_q2_K;
+
+typedef struct {
+    uint8_t hmask[QK_K / 8];
+    uint8_t qs[QK_K / 4];
+    uint8_t scales[12];
+    uint16_t d;
+} block_q3_K;
+
+typedef struct {
     uint16_t d;
     uint16_t dmin;
     uint8_t scales[12];
@@ -45,6 +59,56 @@ static uint64_t blob_alloc(model_blob *blob, uint64_t bytes) {
     if (offset > blob->size || bytes > blob->size - offset) return UINT64_MAX;
     blob->used = offset + bytes;
     return offset;
+}
+
+static void fill_q2_ones(void *ptr, uint64_t blocks) {
+    block_q2_K *out = (block_q2_K *)ptr;
+    for (uint64_t i = 0; i < blocks; i++) {
+        memset(&out[i], 0, sizeof(out[i]));
+        memset(out[i].scales, 0x01, sizeof(out[i].scales));
+        memset(out[i].qs, 0x55, sizeof(out[i].qs));
+        out[i].d = 0x3c00u;
+    }
+}
+
+static void q3_pack_scales(uint8_t packed[12], const uint8_t values[16]) {
+    memset(packed, 0, 12u);
+    for (uint32_t i = 0u; i < 16u; i++) {
+        const uint8_t value = values[i] & 63u;
+        if (i < 8u) {
+            packed[i] |= value & 15u;
+        } else {
+            packed[i - 8u] |= (value & 15u) << 4u;
+        }
+        if (i < 4u) {
+            packed[i + 8u] |= (value >> 4u) & 3u;
+        } else if (i < 8u) {
+            packed[i + 4u] |= ((value >> 4u) & 3u) << 2u;
+        } else if (i < 12u) {
+            packed[i] |= ((value >> 4u) & 3u) << 4u;
+        } else {
+            packed[i - 4u] |= ((value >> 4u) & 3u) << 6u;
+        }
+    }
+}
+
+static void fill_q3_pattern(void *ptr, uint64_t blocks) {
+    block_q3_K *out = (block_q3_K *)ptr;
+    uint8_t scale_values[16];
+    for (uint32_t i = 0u; i < 16u; i++) {
+        scale_values[i] = (uint8_t)(25u + (7u * i) % 17u);
+    }
+    for (uint64_t i = 0; i < blocks; i++) {
+        memset(&out[i], 0, sizeof(out[i]));
+        for (uint32_t j = 0u; j < sizeof(out[i].hmask); j++) {
+            out[i].hmask[j] = (uint8_t)(0x5au ^ (j * 13u));
+        }
+        for (uint32_t j = 0u; j < sizeof(out[i].qs); j++) {
+            out[i].qs[j] = (uint8_t)(0xe4u ^ (j * 29u));
+        }
+        q3_pack_scales(out[i].scales, scale_values);
+        out[i].d = 0x2c00u;
+    }
 }
 
 static void fill_q4_ones(void *ptr, uint64_t blocks) {
@@ -162,6 +226,36 @@ static float q6_value_ref(const block_q6_K *block, uint32_t k) {
         scale = block->scales[scale_base + lane / 16u + 6u];
     }
     return f16_ref(block->d) * (float)scale * (float)((int32_t)q - 32);
+}
+
+static float q3_value_ref(const block_q3_K *block, uint32_t k) {
+    const uint32_t half = k >> 7u;
+    const uint32_t within = k & 127u;
+    const uint32_t plane = within >> 5u;
+    const uint32_t lane = within & 31u;
+    const uint32_t group =
+        half * 8u + plane * 2u + (lane >= 16u ? 1u : 0u);
+    uint32_t scale;
+    if (group < 4u) {
+        scale = (block->scales[group] & 15u) |
+                (((block->scales[group + 8u] >> 0u) & 3u) << 4u);
+    } else if (group < 8u) {
+        scale = (block->scales[group] & 15u) |
+                (((block->scales[group + 4u] >> 2u) & 3u) << 4u);
+    } else if (group < 12u) {
+        scale = (block->scales[group - 8u] >> 4u) |
+                (((block->scales[group] >> 4u) & 3u) << 4u);
+    } else {
+        scale = (block->scales[group - 8u] >> 4u) |
+                (((block->scales[group - 4u] >> 6u) & 3u) << 4u);
+    }
+    const uint32_t q_index = half * 32u + lane;
+    const uint32_t low =
+        (block->qs[q_index] >> (2u * plane)) & 3u;
+    const uint8_t high_mask = (uint8_t)(1u << (4u * half + plane));
+    const int32_t q = (int32_t)low -
+        ((block->hmask[lane] & high_mask) ? 0 : 4);
+    return f16_ref(block->d) * ((float)scale - 32.0f) * (float)q;
 }
 
 static int close_enough(float got, float expected, float atol, float rtol) {
@@ -844,7 +938,8 @@ static int check_long_decode_attention(void) {
 
 static int check_moe(model_blob *blob,
                      const ds4_gpu_laguna_moe_desc *routed,
-                     const ds4_gpu_laguna_moe_desc *shared) {
+                     const ds4_gpu_laguna_moe_desc *shared,
+                     float row_sum) {
     const uint32_t dim = QK_K;
     enum { n_tokens = 2 };
     float x_host[dim];
@@ -890,9 +985,10 @@ static int check_moe(model_blob *blob,
           ds4_gpu_tensor_read(shared_out, 0, shared_host,
                               sizeof(shared_host)),
           "read MoE outputs");
-    const float projection = 2.56f;
+    const float projection = 0.01f * row_sum;
     const float expected =
-        (projection / (1.0f + expf(-projection))) * projection * dim;
+        (projection / (1.0f + expf(-projection))) *
+        projection * row_sum;
     for (uint32_t i = 0; i < dim; i++) {
         CHECK(close_enough(routed_host[i], expected, 0.08f, 2e-3f),
               "Laguna routed MoE numeric");
@@ -943,10 +1039,11 @@ static int check_moe(model_blob *blob,
                               sizeof(batch_out_host)),
           "read batch MoE output");
     for (uint32_t t = 0; t < n_tokens; t++) {
-        const float batch_projection = 2.56f * (float)(t + 1u);
+        const float batch_projection =
+            0.01f * (float)(t + 1u) * row_sum;
         const float batch_expected =
             (batch_projection / (1.0f + expf(-batch_projection))) *
-            batch_projection * dim;
+            batch_projection * row_sum;
         for (uint32_t i = 0; i < dim; i++) {
             CHECK(close_enough(batch_out_host[(uint64_t)t * dim + i],
                                batch_expected, 0.20f, 2e-3f),
@@ -1003,6 +1100,10 @@ int main(void) {
         (uint64_t)dim * sizeof(block_q4_K);
     const uint64_t q6_matrix_bytes =
         (uint64_t)dim * sizeof(block_q6_K);
+    const uint64_t q2_matrix_bytes =
+        (uint64_t)dim * sizeof(block_q2_K);
+    const uint64_t q3_matrix_bytes =
+        (uint64_t)dim * sizeof(block_q3_K);
     ds4_gpu_laguna_moe_desc routed = {0};
     routed.gate_offset = blob_alloc(&blob, 2u * q4_matrix_bytes);
     routed.up_offset = blob_alloc(&blob, 2u * q4_matrix_bytes);
@@ -1030,6 +1131,40 @@ int main(void) {
     revised_shared.gate_offset = blob_alloc(&blob, q4_matrix_bytes);
     revised_shared.up_offset = blob_alloc(&blob, q4_matrix_bytes);
     revised_shared.down_offset = blob_alloc(&blob, q4_matrix_bytes);
+    ds4_gpu_laguna_moe_desc q2_routed = {0};
+    q2_routed.gate_offset = blob_alloc(&blob, 2u * q2_matrix_bytes);
+    q2_routed.up_offset = blob_alloc(&blob, 2u * q2_matrix_bytes);
+    q2_routed.down_offset = blob_alloc(&blob, 2u * q2_matrix_bytes);
+    q2_routed.gate_type = 10u;
+    q2_routed.up_type = 10u;
+    q2_routed.down_type = 10u;
+    q2_routed.gate_expert_bytes = q2_matrix_bytes;
+    q2_routed.gate_row_bytes = sizeof(block_q2_K);
+    q2_routed.up_expert_bytes = q2_matrix_bytes;
+    q2_routed.up_row_bytes = sizeof(block_q2_K);
+    q2_routed.down_expert_bytes = q2_matrix_bytes;
+    q2_routed.down_row_bytes = sizeof(block_q2_K);
+    ds4_gpu_laguna_moe_desc q2_shared = q2_routed;
+    q2_shared.gate_offset = blob_alloc(&blob, q2_matrix_bytes);
+    q2_shared.up_offset = blob_alloc(&blob, q2_matrix_bytes);
+    q2_shared.down_offset = blob_alloc(&blob, q2_matrix_bytes);
+    ds4_gpu_laguna_moe_desc q3_routed = {0};
+    q3_routed.gate_offset = blob_alloc(&blob, 2u * q3_matrix_bytes);
+    q3_routed.up_offset = blob_alloc(&blob, 2u * q3_matrix_bytes);
+    q3_routed.down_offset = blob_alloc(&blob, 2u * q3_matrix_bytes);
+    q3_routed.gate_type = 11u;
+    q3_routed.up_type = 11u;
+    q3_routed.down_type = 11u;
+    q3_routed.gate_expert_bytes = q3_matrix_bytes;
+    q3_routed.gate_row_bytes = sizeof(block_q3_K);
+    q3_routed.up_expert_bytes = q3_matrix_bytes;
+    q3_routed.up_row_bytes = sizeof(block_q3_K);
+    q3_routed.down_expert_bytes = q3_matrix_bytes;
+    q3_routed.down_row_bytes = sizeof(block_q3_K);
+    ds4_gpu_laguna_moe_desc q3_shared = q3_routed;
+    q3_shared.gate_offset = blob_alloc(&blob, q3_matrix_bytes);
+    q3_shared.up_offset = blob_alloc(&blob, q3_matrix_bytes);
+    q3_shared.down_offset = blob_alloc(&blob, q3_matrix_bytes);
     CHECK(routed.gate_offset != UINT64_MAX &&
           routed.up_offset != UINT64_MAX &&
           routed.down_offset != UINT64_MAX &&
@@ -1039,7 +1174,19 @@ int main(void) {
           revised_routed.down_offset != UINT64_MAX &&
           revised_shared.gate_offset != UINT64_MAX &&
           revised_shared.up_offset != UINT64_MAX &&
-          revised_shared.down_offset != UINT64_MAX,
+          revised_shared.down_offset != UINT64_MAX &&
+          q2_routed.gate_offset != UINT64_MAX &&
+          q2_routed.up_offset != UINT64_MAX &&
+          q2_routed.down_offset != UINT64_MAX &&
+          q2_shared.gate_offset != UINT64_MAX &&
+          q2_shared.up_offset != UINT64_MAX &&
+          q2_shared.down_offset != UINT64_MAX &&
+          q3_routed.gate_offset != UINT64_MAX &&
+          q3_routed.up_offset != UINT64_MAX &&
+          q3_routed.down_offset != UINT64_MAX &&
+          q3_shared.gate_offset != UINT64_MAX &&
+          q3_shared.up_offset != UINT64_MAX &&
+          q3_shared.down_offset != UINT64_MAX,
           "allocate MoE model ranges");
     fill_q4_ones(blob.data + routed.gate_offset,
                  2u * dim);
@@ -1055,6 +1202,24 @@ int main(void) {
     fill_q4_ones(blob.data + revised_shared.gate_offset, dim);
     fill_q4_ones(blob.data + revised_shared.up_offset, dim);
     fill_q4_ones(blob.data + revised_shared.down_offset, dim);
+    fill_q2_ones(blob.data + q2_routed.gate_offset, 2u * dim);
+    fill_q2_ones(blob.data + q2_routed.up_offset, 2u * dim);
+    fill_q2_ones(blob.data + q2_routed.down_offset, 2u * dim);
+    fill_q2_ones(blob.data + q2_shared.gate_offset, dim);
+    fill_q2_ones(blob.data + q2_shared.up_offset, dim);
+    fill_q2_ones(blob.data + q2_shared.down_offset, dim);
+    fill_q3_pattern(blob.data + q3_routed.gate_offset, 2u * dim);
+    fill_q3_pattern(blob.data + q3_routed.up_offset, 2u * dim);
+    fill_q3_pattern(blob.data + q3_routed.down_offset, 2u * dim);
+    fill_q3_pattern(blob.data + q3_shared.gate_offset, dim);
+    fill_q3_pattern(blob.data + q3_shared.up_offset, dim);
+    fill_q3_pattern(blob.data + q3_shared.down_offset, dim);
+    float q3_row_sum = 0.0f;
+    const block_q3_K *q3_row =
+        (const block_q3_K *)(blob.data + q3_routed.gate_offset);
+    for (uint32_t i = 0u; i < dim; i++) {
+        q3_row_sum += q3_value_ref(q3_row, i);
+    }
 
     CHECK(ds4_gpu_set_model_map(blob.data, blob.size), "set synthetic model map");
     int rc = check_quant_ops(&blob, q4_offset, q6_offset, embed_offset);
@@ -1062,9 +1227,16 @@ int main(void) {
     if (rc == 0) rc = check_attention();
     if (rc == 0) rc = check_dflash_blackwell_attention();
     if (rc == 0) rc = check_long_decode_attention();
-    if (rc == 0) rc = check_moe(&blob, &routed, &shared);
+    if (rc == 0) rc = check_moe(&blob, &routed, &shared, (float)dim);
     if (rc == 0) {
-        rc = check_moe(&blob, &revised_routed, &revised_shared);
+        rc = check_moe(
+                &blob, &revised_routed, &revised_shared, (float)dim);
+    }
+    if (rc == 0) {
+        rc = check_moe(&blob, &q2_routed, &q2_shared, (float)dim);
+    }
+    if (rc == 0) {
+        rc = check_moe(&blob, &q3_routed, &q3_shared, q3_row_sum);
     }
     ds4_gpu_cleanup();
     (void)cudaFreeHost(host);

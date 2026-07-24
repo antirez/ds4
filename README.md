@@ -185,9 +185,12 @@ file are not supported for GLM yet.
 Laguna S 2.1 support targets Poolside's official imatrix-quantized Q4_K_M GGUF.
 The current 63.56 GiB recipe uses Q4_K routed experts and Q8_0 signal-path
 weights. DwarfStar also accepts Poolside's earlier 70.01 GiB recipe with F16
-attention and mixed Q4_K/Q6_K experts. Both layouts support Metal or CUDA with
-full model residency; SSD streaming, distributed inference, and ROCm are
-rejected explicitly. They require at least 96 GiB of unified or device memory.
+attention and mixed Q4_K/Q6_K experts, plus the 44.95 GiB mixed recipe whose
+routed layers 1..20 use Q2_K and layers 21..47 use Q3_K. All three layouts
+support Metal or CUDA with full model residency; SSD streaming, distributed
+inference, and ROCm are rejected explicitly. The Q4 recipes require at least
+96 GiB of unified or device memory, while the mixed Q2_K/Q3_K recipe targets
+64 GiB systems.
 CLI, agent, and server use Laguna's native chat, interleaved reasoning, and
 tagged tool-call formats:
 
@@ -196,9 +199,14 @@ tagged tool-call formats:
 ./ds4 -m gguf/laguna-s-2.1-Q4_K_M.gguf -c 32768 -p "Explain this repository"
 ./ds4-agent -m gguf/laguna-s-2.1-Q4_K_M.gguf -c 32768
 ./ds4-server -m gguf/laguna-s-2.1-Q4_K_M.gguf -c 32768
+
+./download_model.sh laguna-q2-q3
+./ds4 -m gguf/laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf \
+  --cuda -c 32768 -p "Explain this repository"
 ```
 
-CUDA also supports Poolside's official BF16 DFlash drafter. The DFlash GGUF
+CUDA also supports Poolside's official BF16 DFlash drafter with either the Q4
+or mixed Q2_K/Q3_K target. The DFlash GGUF
 captures six target-layer residual streams, fuses them into a six-layer
 block-diffusion decoder, and verifies up to 15 proposed tokens in one target
 batch. Greedy decoding remains target-verified:
