@@ -21,7 +21,14 @@
 
 #define cudaGetDevice hipGetDevice
 #define cudaSetDevice hipSetDevice
+#define cudaGetDeviceCount hipGetDeviceCount
 #define cudaDeviceSynchronize hipDeviceSynchronize
+#define cudaDeviceCanAccessPeer hipDeviceCanAccessPeer
+#define cudaDeviceEnablePeerAccess hipDeviceEnablePeerAccess
+#define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
+#define cudaMemcpyPeer hipMemcpyPeer
+#define cudaMemcpyPeerAsync hipMemcpyPeerAsync
+#define cudaStreamWaitEvent hipStreamWaitEvent
 #define cudaDeviceGetAttribute hipDeviceGetAttribute
 #define cudaGetDeviceProperties hipGetDeviceProperties
 #define cudaDevAttrPageableMemoryAccess hipDeviceAttributePageableMemoryAccess
@@ -91,6 +98,29 @@
 #define cublasGemmStridedBatchedEx hipblasGemmStridedBatchedEx
 
 namespace cub = hipcub;
+
+// Matrix-core capability, resolved separately in each device compilation pass.
+//
+// RDNA3/RDNA4 (gfx11xx/gfx12xx) run wave32 and expose the WMMA builtins.
+// CDNA2/CDNA3 (gfx90a, gfx94x, gfx950) run wave64 and expose MFMA instead.
+// The two are not interchangeable: the builtins differ in fragment shape and
+// in the wave size they require, so the few kernels built directly on them are
+// written once per family and selected with these macros.
+//
+// Host code cannot test them -- the host compilation pass has no target arch --
+// so host-side kernel selection dispatches on the runtime wavefront size
+// instead; see cuda_device_wave_size() in rocm/ds4_rocm_runtime.cuh.
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+    defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || \
+    defined(__gfx1152__) || defined(__gfx1153__) || defined(__gfx1200__) || \
+    defined(__gfx1201__)
+#define DS4_ROCM_HAS_WMMA_W32 1
+#endif
+
+#if defined(__gfx90a__) || defined(__gfx940__) || defined(__gfx941__) || \
+    defined(__gfx942__) || defined(__gfx950__)
+#define DS4_ROCM_HAS_MFMA_W64 1
+#endif
 
 static __device__ __forceinline__ int32_t __vcmpne4(uint32_t a, uint32_t b) {
     // For each byte: 0xFF if a != b, 0x00 if a == b

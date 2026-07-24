@@ -60,7 +60,67 @@ struct ds4_gpu_tensor {
     void *ptr;
     uint64_t bytes;
     int owner;
+    /* Logical tier (index into g_gpu[]) this allocation lives on; -1 means
+     * legacy/untagged -> treat as tier 0. Field order/layout must match the
+     * struct definition ds4_rocm_compat.cu sees via ds4_gpu_mgpu.h, since
+     * tensor pointers cross that translation-unit boundary. */
+    int device_id;
 };
+
+/* Internal helper: resolve a tensor's device index. device_id <= 0
+ * (untagged legacy allocations, or explicit tier 0) is treated as tier 0.
+ * Defined this early so the tensor-op functions in ds4_rocm_runtime.cuh
+ * below can use it; the full multi-GPU device/tier machinery that owns
+ * g_gpu[]/g_n_gpus lives in rocm/ds4_rocm_mgpu.cuh, included later. */
+static inline int ds4_tensor_device_idx(const struct ds4_gpu_tensor *t) {
+    if (!t) return 0;
+    return t->device_id < 0 ? 0 : t->device_id;
+}
+
+/* WITH_DEVICE(d) { ... } scope macro: save the calling thread's current
+ * device, switch to device `d`, run the body exactly once, then restore
+ * the previous device. If the switch fails the body still runs (a macro
+ * can't cleanly early-exit its containing function), but the next HIP call
+ * inside the body will surface the error naturally. */
+#define WITH_DEVICE(d)                                                      \
+    for (int _wd_prev = -1, _wd_first = 1;                                  \
+         _wd_first;                                                          \
+         _wd_first = 0,                                                      \
+         (_wd_prev >= 0 ? (void)cudaSetDevice(_wd_prev) : (void)0))         \
+        if (cudaGetDevice(&_wd_prev) != cudaSuccess) { /* leave */ } else   \
+        if (cudaSetDevice(d)           != cudaSuccess) { /* leave */ } else
+
+/* Multi-GPU device table. Declared here (ahead of ds4_rocm_runtime.cuh) so
+ * the tensor-op functions defined there can already read
+ * g_gpu[tier].device_id; storage is defined in rocm/ds4_rocm_mgpu.cuh,
+ * included near the end of this file's include chain once every helper it
+ * depends on (cuda_ok, cublas_ok, g_model_host_base, ...) is in scope. See
+ * that file's header comment for why these use locally-named struct types
+ * instead of #include "ds4_gpu_mgpu.h" directly. */
+struct ds4_rocm_gpu_ctx {
+    int      device_id;
+    void    *stream;
+    void    *cublas;
+    int      cublas_ready;
+    void    *scratch;
+    size_t   scratch_bytes;
+    size_t   budget_bytes;
+    size_t   used_bytes;
+    void    *boundary_event;
+};
+extern "C" {
+extern ds4_rocm_gpu_ctx g_gpu[DS4_MAX_GPUS];
+extern int              g_n_gpus;
+extern int              g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
+}
+
+struct ds4_rocm_gpu_config {
+    int    device_indices[DS4_MAX_GPUS];
+    size_t vram_bytes[DS4_MAX_GPUS];
+    int    n_gpus;
+    size_t safety_margin_bytes;
+};
+extern "C" int ds4_gpu_init_multi(const ds4_rocm_gpu_config *cfg);
 
 typedef struct {
     uint8_t scales[CUDA_QK_K / 16];
@@ -90,6 +150,8 @@ typedef struct {
 #include "ds4_iq2_tables_cuda.inc"
 
 #include "rocm/ds4_rocm_runtime.cuh"
+
+#include "rocm/ds4_rocm_mgpu.cuh"
 
 #include "rocm/ds4_rocm_common.cuh"
 

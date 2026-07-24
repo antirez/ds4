@@ -44,6 +44,12 @@ typedef struct {
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
 
+/* Hardware wavefront size: 32 on RDNA, 64 on CDNA, 0 if unknown or not
+ * applicable to this backend (Metal, CUDA). ds4.c uses this to work around
+ * a CDNA-specific correctness bug in the ROCm batched graph-prefill path;
+ * see metal_graph_streaming_decode_prefill_max_tokens(). */
+int ds4_gpu_wave_size(void);
+
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
@@ -597,6 +603,45 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
         uint64_t                out1_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+
+/* Test-only direct entry point for the MoE gate/up/mid decode-LUT kernels
+ * (qwarp32 baseline vs the wave64-native hwarp32 variant); see
+ * ds4_gpu_test_moe_gate_up_mid_decode_lut_tensor's definition for the
+ * force_kernel values. Not used by production code. */
+int ds4_gpu_test_moe_gate_up_mid_decode_lut_tensor(
+        ds4_gpu_tensor       *gate_out,
+        ds4_gpu_tensor       *up_out,
+        ds4_gpu_tensor       *mid_out,
+        const ds4_gpu_tensor *gate_base,
+        const ds4_gpu_tensor *up_base,
+        const ds4_gpu_tensor *xq,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint32_t                xq_blocks,
+        uint32_t                expert_mid_dim,
+        uint32_t                n_expert,
+        uint32_t                n_tok,
+        uint32_t                write_aux,
+        float                   clamp,
+        int                     force_kernel);
+
+/* Test-only direct entry point for the MoE routed-down-projection sum6
+ * kernels (qwarp32 baseline vs the wave64-native hwarp32 variant); see
+ * ds4_gpu_test_moe_down_sum6_tensor's definition for the force_kernel
+ * values. Not used by production code. */
+int ds4_gpu_test_moe_down_sum6_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *down_base,
+        const ds4_gpu_tensor *midq,
+        const ds4_gpu_tensor *selected,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                midq_blocks,
+        uint32_t                out_dim,
+        uint32_t                n_expert,
+        int                     force_kernel);
 
 /* Multi-row decode projections that preserve the one-row reduction order. */
 int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(

@@ -40,8 +40,15 @@ CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
+# hipcc links PIE by default while some distro gcc builds compile non-PIE by
+# default; without this the mixed gcc/clang link fails on R_X86_64_32
+# relocations.  Compiling the C side as -fPIE links either way.
+ROCM_PIC_FLAG ?= -fPIE
 ROCM_CFLAGS ?= -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
-ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt
+# Not every distro drops the ROCm lib directory into ld.so.conf, so record it
+# in the binary rather than making users export LD_LIBRARY_PATH.
+ROCM_PATH ?= /opt/rocm
+ROCM_LDLIBS ?= -lm -pthread -L$(ROCM_PATH)/lib -Wl,-rpath,$(ROCM_PATH)/lib -lhipblas -lhipblaslt
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
@@ -107,6 +114,10 @@ help:
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
 	@echo "  make strix-halo          Build ROCm for Strix Halo / gfx1151"
 	@echo "  make rocm                Alias for make strix-halo"
+	@echo "  make rocm ROCM_ARCH=gfxN Build ROCm for an explicit AMD arch"
+	@echo "  make mi200               Build ROCm for CDNA2 / MI210 / MI250 (gfx90a)"
+	@echo "  make mi300               Build ROCm for CDNA3 / MI300 (gfx942)"
+	@echo "  make test-rocm-matmul-q8 Check the matrix-core Q8_0 GEMM against a CPU reference"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test                Build and run tests"
 	@echo "  make dspark-verify-depth Run DSpark speculative verification smoke if support GGUF is present"
@@ -127,14 +138,84 @@ cuda:
 	fi
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH="$(CUDA_ARCH)"
 
+ROCM_BUILD_VARS = \
+	CORE_OBJS="ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o" \
+	CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD $(ROCM_PIC_FLAG)" \
+	DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
+	DS4_LINK_LIBS="$(ROCM_LDLIBS)"
+
 strix-halo:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
-		CORE_OBJS="ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o" \
-		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD" \
-		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
-		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent $(ROCM_BUILD_VARS)
 
 rocm: strix-halo
+
+# CDNA data-center parts: MI210/MI250 are gfx90a, MI300 is gfx942.  These run
+# wave64 and use the MFMA kernels rather than the RDNA WMMA ones.
+mi200:
+	$(MAKE) strix-halo ROCM_ARCH=gfx90a
+
+mi300:
+	$(MAKE) strix-halo ROCM_ARCH=gfx942
+
+tests/test_rocm_matmul_q8.o: tests/test_rocm_matmul_q8.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_rocm_matmul_q8: tests/test_rocm_matmul_q8.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+# Needs a real GPU.  Run after a ROCm build, e.g.
+#   make mi200 && make test-rocm-matmul-q8 ROCM_ARCH=gfx90a
+test-rocm-matmul-q8:
+	$(MAKE) tests/test_rocm_matmul_q8 $(ROCM_BUILD_VARS)
+	./tests/test_rocm_matmul_q8
+
+tests/test_rocm_matmul_pair_q8.o: tests/test_rocm_matmul_pair_q8.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_rocm_matmul_pair_q8: tests/test_rocm_matmul_pair_q8.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+# Needs a real GPU.  Run after a ROCm build, e.g.
+#   make mi200 && make test-rocm-matmul-pair-q8 ROCM_ARCH=gfx90a
+test-rocm-matmul-pair-q8:
+	$(MAKE) tests/test_rocm_matmul_pair_q8 $(ROCM_BUILD_VARS)
+	./tests/test_rocm_matmul_pair_q8
+
+tests/test_rocm_moe_gate_up_mid_hwarp32.o: tests/test_rocm_moe_gate_up_mid_hwarp32.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_rocm_moe_gate_up_mid_hwarp32: tests/test_rocm_moe_gate_up_mid_hwarp32.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+# Needs a real GPU.  Run after a ROCm build, e.g.
+#   make mi200 && make test-rocm-moe-gate-up-mid-hwarp32 ROCM_ARCH=gfx90a
+test-rocm-moe-gate-up-mid-hwarp32:
+	$(MAKE) tests/test_rocm_moe_gate_up_mid_hwarp32 $(ROCM_BUILD_VARS)
+	./tests/test_rocm_moe_gate_up_mid_hwarp32
+
+tests/test_rocm_moe_down_sum6.o: tests/test_rocm_moe_down_sum6.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_rocm_moe_down_sum6: tests/test_rocm_moe_down_sum6.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+# Needs a real GPU.  Run after a ROCm build, e.g.
+#   make mi200 && make test-rocm-moe-down-sum6 ROCM_ARCH=gfx90a
+test-rocm-moe-down-sum6:
+	$(MAKE) tests/test_rocm_moe_down_sum6 $(ROCM_BUILD_VARS)
+	./tests/test_rocm_moe_down_sum6
+
+tests/test_rocm_matmul_f16_ordered.o: tests/test_rocm_matmul_f16_ordered.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_rocm_matmul_f16_ordered: tests/test_rocm_matmul_f16_ordered.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+# Needs a real GPU.  Run after a ROCm build, e.g.
+#   make mi200 && make test-rocm-matmul-f16-ordered ROCM_ARCH=gfx90a
+test-rocm-matmul-f16-ordered:
+	$(MAKE) tests/test_rocm_matmul_f16_ordered $(ROCM_BUILD_VARS)
+	./tests/test_rocm_matmul_f16_ordered
 
 ds4: ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)

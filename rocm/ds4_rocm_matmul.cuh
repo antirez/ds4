@@ -282,15 +282,34 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             const dim3 grid((uint32_t)((out_dim + 63u) / 64u),
                             (uint32_t)((n_tok + 63u) / 64u),
                             1u);
-            matmul_q8_0_f32_batch_wmma_4w_kernel<<<grid, 128u>>>(
-                    (float *)out->ptr,
-                    reinterpret_cast<const unsigned char *>(wptr),
-                    (const float *)x->ptr,
-                    (uint32_t)n_tok,
-                    (uint32_t)in_dim,
-                    (uint32_t)out_dim,
-                    blocks * 34u);
-            return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch wmma 4w launch");
+            /* Both variants compute the same 64x64 tile with four waves, so the
+             * block is 128 threads on wave32 parts and 256 on wave64 parts.  An
+             * unrecognized wave size falls through to the portable kernel below
+             * rather than launching a matrix-core kernel that compiled to a
+             * no-op for this target. */
+            const int wave = cuda_device_wave_size();
+            if (wave == 64) {
+                matmul_q8_0_f32_batch_mfma_4w_kernel<<<grid, 256u>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        (const float *)x->ptr,
+                        (uint32_t)n_tok,
+                        (uint32_t)in_dim,
+                        (uint32_t)out_dim,
+                        blocks * 34u);
+                return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch mfma 4w launch");
+            }
+            if (wave == 32) {
+                matmul_q8_0_f32_batch_wmma_4w_kernel<<<grid, 128u>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        (const float *)x->ptr,
+                        (uint32_t)n_tok,
+                        (uint32_t)in_dim,
+                        (uint32_t)out_dim,
+                        blocks * 34u);
+                return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch wmma 4w launch");
+            }
         }
 #endif
         if ((in_dim & 31u) == 0u && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
@@ -495,6 +514,32 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     if (!w0 || !w1) return 0;
     const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
     if ((in_dim & 31u) == 0u && in_dim <= 8192u) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+        /* On wave64 parts, one wavefront can compute one row using both
+         * 32-lane halves together (see matmul_q8_0_pair_f32_sharedx_warp_rows_w64_kernel)
+         * instead of splitting a wavefront into two independent w32 rows.
+         * Same row count per launch, so the grid doubles to match rows_per_block
+         * halving. Any other/unrecognized wave size falls through to the w32
+         * kernel below, which is correct (if not w64-optimal) everywhere. */
+        if (cuda_device_wave_size() == 64 && !getenv("DS4_ROCM_DISABLE_PAIR_W64")) {
+            const unsigned rows_per_block = 16u;
+            const unsigned threads = rows_per_block * 64u;
+            matmul_q8_0_pair_f32_sharedx_warp_rows_w64_kernel<<<
+                    (unsigned)((max_out + rows_per_block - 1u) / rows_per_block),
+                    threads,
+                    (size_t)in_dim * sizeof(float)>>>(
+                    (float *)out0->ptr,
+                    (float *)out1->ptr,
+                    reinterpret_cast<const unsigned char *>(w0),
+                    reinterpret_cast<const unsigned char *>(w1),
+                    (const float *)x->ptr,
+                    (uint32_t)blocks,
+                    out0_dim,
+                    out1_dim,
+                    blocks * 34u);
+            return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair f32 sharedx w64 launch");
+        }
+#endif
         const unsigned rows_per_block = 32u;
         const unsigned threads = rows_per_block * 32u;
         matmul_q8_0_pair_f32_sharedx_warp_rows_w32_kernel<<<
@@ -662,6 +707,15 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     }
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
     if (ordered_decode) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+        /* The w32 kernel launches a 32-thread block; on wave64 (CDNA) that
+         * leaves half of every dispatched wavefront idle. See
+         * matmul_f16_ordered_chunks_w64_kernel for detail. */
+        if (cuda_device_wave_size() == 64 && !getenv("DS4_ROCM_DISABLE_F16_ORDERED_W64")) {
+            matmul_f16_ordered_chunks_w64_kernel<<<grid, 64>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
+            return cuda_ok(cudaGetLastError(), "matmul_f16_ordered_chunks w64 launch");
+        }
+#endif
         matmul_f16_ordered_chunks_kernel<<<grid, 32>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
         return cuda_ok(cudaGetLastError(), "matmul_f16_ordered_chunks launch");
     }

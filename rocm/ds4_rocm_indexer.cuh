@@ -147,8 +147,20 @@ __global__ static void indexer_scores_wmma128_kernel(
     const uint32_t tile_c = blockIdx.x * 128u;
     const uint32_t tile_t = blockIdx.y * 16u;
     const uint32_t tid = threadIdx.x;
-    const uint32_t warp = tid >> 5u;
     if (tid >= 256u || head_dim != 128u) return;
+
+    /* One matrix fragment is owned by a whole hardware wave, so the number of
+     * 16-wide column tiles a wave must cover depends on the wave size: eight
+     * waves of 32 take one tile each, four waves of 64 take two each.  The
+     * c_sh layout below is the same either way. */
+#if defined(DS4_ROCM_HAS_MFMA_W64)
+    constexpr uint32_t WAVE_SIZE = 64u;
+#else
+    constexpr uint32_t WAVE_SIZE = 32u;
+#endif
+    constexpr uint32_t N_WAVES = 256u / WAVE_SIZE;
+    constexpr uint32_t TILES_PER_WAVE = 8u / N_WAVES;
+    const uint32_t wave = tid / WAVE_SIZE;
 
     if (causal) {
         const uint32_t last_token = min(tile_t + 16u, n_tokens);
@@ -203,14 +215,17 @@ __global__ static void indexer_scores_wmma128_kernel(
         wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a_frag;
         wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b_frag;
         wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
-        wmma::fill_fragment(c_frag, 0.0f);
-        const uint32_t col0 = warp * 16u;
-        for (uint32_t k0 = 0; k0 < 128u; k0 += 16u) {
-            wmma::load_matrix_sync(a_frag, a_sh + k0, 128);
-            wmma::load_matrix_sync(b_frag, b_sh + col0 * 128u + k0, 128);
-            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        for (uint32_t t = 0; t < TILES_PER_WAVE; t++) {
+            const uint32_t tile = wave * TILES_PER_WAVE + t;
+            const uint32_t col0 = tile * 16u;
+            wmma::fill_fragment(c_frag, 0.0f);
+            for (uint32_t k0 = 0; k0 < 128u; k0 += 16u) {
+                wmma::load_matrix_sync(a_frag, a_sh + k0, 128);
+                wmma::load_matrix_sync(b_frag, b_sh + col0 * 128u + k0, 128);
+                wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+            }
+            wmma::store_matrix_sync(c_sh + tile * 16u * 16u, c_frag, 16, wmma::mem_row_major);
         }
-        wmma::store_matrix_sync(c_sh + warp * 16u * 16u, c_frag, 16, wmma::mem_row_major);
         __syncthreads();
 
         const uint32_t local0 = tid & 255u;

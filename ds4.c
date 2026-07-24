@@ -15432,10 +15432,22 @@ static bool metal_graph_set_active_tier_decode(ds4_gpu_graph *g, int tier) {
     if (g->active_tier >= 0) {
         ds4_gpu_tensor *src = g->cur_hc_by_tier[g->active_tier];
         ds4_gpu_tensor *dst = g->cur_hc_by_tier[tier];
+        if (getenv("DS4_MGPU_TRACE")) {
+            fprintf(stderr, "ds4: mgpu-trace decode %d->%d src=%p dst=%p\n",
+                    g->active_tier, tier, (void *)src, (void *)dst);
+        }
         if (src && dst) {
             const uint64_t hc_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
-            if (!ds4_gpu_tensor_copy_xdev(dst, src, hc_bytes)) return false;
+            if (!ds4_gpu_tensor_copy_xdev(dst, src, hc_bytes)) {
+                if (getenv("DS4_MGPU_TRACE")) {
+                    fprintf(stderr, "ds4: mgpu-trace decode copy FAILED %d->%d\n",
+                            g->active_tier, tier);
+                }
+                return false;
+            }
         }
+    } else if (getenv("DS4_MGPU_TRACE")) {
+        fprintf(stderr, "ds4: mgpu-trace decode ->%d (active_tier was -1, no copy)\n", tier);
     }
     g->active_tier = tier;
     return true;
@@ -15457,11 +15469,23 @@ static bool metal_graph_set_active_tier_batch(ds4_gpu_graph *g, int tier, uint32
     if (g->active_tier >= 0) {
         ds4_gpu_tensor *src = g->batch_cur_hc_by_tier[g->active_tier];
         ds4_gpu_tensor *dst = g->batch_cur_hc_by_tier[tier];
+        if (getenv("DS4_MGPU_TRACE")) {
+            fprintf(stderr, "ds4: mgpu-trace batch %d->%d chunk=%u src=%p dst=%p\n",
+                    g->active_tier, tier, chunk_tokens, (void *)src, (void *)dst);
+        }
         if (src && dst) {
             const uint64_t hc_bytes =
                 (uint64_t)chunk_tokens * DS4_N_HC * DS4_N_EMBD * sizeof(float);
-            if (!ds4_gpu_tensor_copy_xdev(dst, src, hc_bytes)) return false;
+            if (!ds4_gpu_tensor_copy_xdev(dst, src, hc_bytes)) {
+                if (getenv("DS4_MGPU_TRACE")) {
+                    fprintf(stderr, "ds4: mgpu-trace batch copy FAILED %d->%d\n",
+                            g->active_tier, tier);
+                }
+                return false;
+            }
         }
+    } else if (getenv("DS4_MGPU_TRACE")) {
+        fprintf(stderr, "ds4: mgpu-trace batch ->%d (active_tier was -1, no copy)\n", tier);
     }
     g->active_tier = tier;
     return true;
@@ -16027,6 +16051,8 @@ typedef struct {
     uint32_t layer;
     int pos_set;
     uint32_t pos;
+    int row_set;
+    uint32_t row;
 } metal_graph_debug_config;
 
 static const metal_graph_debug_config *metal_graph_debug_get_config(void) {
@@ -16052,6 +16078,16 @@ static const metal_graph_debug_config *metal_graph_debug_get_config(void) {
         if (pos_env && pos_env[0]) {
             cfg.pos_set = 1;
             cfg.pos = (uint32_t)strtoul(pos_env, NULL, 10);
+        }
+
+        /* PR5 diagnostic: dump a specific token ROW of a [n_tokens][per_row]
+         * tensor instead of always row 0. Byte offset = row * n_f32 * 4. Only
+         * meaningful for row-major batch tensors (hc_attn_post/hc_ffn_post). */
+        const char *row_env = glm_graph_env_value("DS4_ROCM_GRAPH_DUMP_ROW",
+                                                  "DS4_METAL_GRAPH_DUMP_ROW");
+        if (row_env && row_env[0]) {
+            cfg.row_set = 1;
+            cfg.row = (uint32_t)strtoul(row_env, NULL, 10);
         }
     }
     return &cfg;
@@ -16084,15 +16120,23 @@ static void metal_graph_debug_dump_tensor(
                 metal_graph_debug_wants(name, il, pos));
     if (!t || n_f32 == 0 || !metal_graph_debug_wants(name, il, pos)) return;
 
+    const metal_graph_debug_config *cfg = metal_graph_debug_get_config();
+    const uint64_t row_off = (cfg->row_set && cfg->row)
+        ? (uint64_t)cfg->row * n_f32 * sizeof(float) : 0u;
+
     if (ds4_gpu_synchronize() == 0) {
         fprintf(stderr, "ds4: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
         return;
     }
 
     float *buf = xmalloc((size_t)n_f32 * sizeof(buf[0]));
-    if (ds4_gpu_tensor_read(t, 0, buf, n_f32 * sizeof(buf[0])) != 0) {
+    if (ds4_gpu_tensor_read(t, row_off, buf, n_f32 * sizeof(buf[0])) != 0) {
         char path[1024];
-        snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
+        if (cfg->row_set && cfg->row) {
+            snprintf(path, sizeof(path), "%s_%s-%u_pos%u_row%u.bin", prefix, name, il, pos, cfg->row);
+        } else {
+            snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
+        }
         if (write_f32_binary_file(path, buf, n_f32)) {
             fprintf(stderr, "ds4: dumped %s layer %u pos %u to %s\n", name, il, pos, path);
         }
@@ -28930,8 +28974,14 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("routed_moe");
+    if (ok && getenv("DS4_FFN_FORCE_SYNC")) {
+        if (ds4_gpu_synchronize() == 0) ok = false;
+    }
     if (!shared_done) {
         DS4_METAL_ENCODE_PREFILL_SHARED_EXPERT();
+    }
+    if (ok && getenv("DS4_FFN_FORCE_SYNC")) {
+        if (ds4_gpu_synchronize() == 0) ok = false;
     }
 #undef DS4_METAL_ENCODE_PREFILL_SHARED_EXPERT
 #undef DS4_METAL_TRY_SHARED_DOWN_F16

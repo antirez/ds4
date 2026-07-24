@@ -8,66 +8,17 @@
 #include "ds4_gpu.h"
 #include "ds4_gpu_args.h"
 
-ds4_gpu_ctx g_gpu[DS4_MAX_GPUS] = {};
-int g_n_gpus = 1;
-int g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS] = {{1}};
-
-static int rocm_tier_valid(int tier) {
-    return tier == 0 && g_n_gpus == 1;
-}
-
-extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
-    if (!cfg || cfg->n_gpus != 1) {
-        fprintf(stderr, "ds4: ROCm supports one GPU per process\n");
-        return 0;
-    }
-    g_gpu[0].device_id = cfg->device_indices[0];
-    if (hipSetDevice(g_gpu[0].device_id) != hipSuccess) return 0;
-    return ds4_gpu_init();
-}
-
-extern "C" int ds4_gpu_set_current_device(int tier) {
-    if (!rocm_tier_valid(tier)) return 1;
-    return hipSetDevice(g_gpu[0].device_id) == hipSuccess ? 0 : 1;
-}
-
-extern "C" int ds4_gpu_set_current_device_fenced(int tier) {
-    return ds4_gpu_set_current_device(tier);
-}
-
-extern "C" int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int tier,
-                                         uint64_t bytes) {
-    if (!t) return 1;
-    if (!rocm_tier_valid(tier)) return 2;
-    if (bytes == 0) bytes = 1;
-    if (hipMalloc(&t->ptr, (size_t)bytes) != hipSuccess) return 3;
-    t->bytes = bytes;
-    t->owner = 1;
-    t->device_id = 0;
-    return 0;
-}
-
-extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_ptr_on(int tier,
-                                                         uint64_t bytes) {
-    if (!rocm_tier_valid(tier)) return NULL;
-    return ds4_gpu_tensor_alloc(bytes);
-}
-
-extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_on(int tier,
-                                                             uint64_t bytes) {
-    if (!rocm_tier_valid(tier)) return NULL;
-    return ds4_gpu_tensor_alloc_managed(bytes);
-}
-
-extern "C" void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t) {
-    if (!t) return;
-    if (t->owner && t->ptr) (void)hipFree(t->ptr);
-    memset(t, 0, sizeof(*t));
-}
-
-extern "C" int ds4_gpu_tensor_device(const ds4_gpu_tensor *t) {
-    return t ? 0 : -1;
-}
+/* g_gpu / g_n_gpus / g_gpu_peer_ok storage, ds4_gpu_init_multi,
+ * ds4_gpu_set_current_device[_fenced], the tensor_alloc_on family,
+ * tensor_free_in_place, tensor_device, the tensor_copy_xdev/wait_xdev
+ * families, and ds4_gpu_tier_free_vram now live in rocm/ds4_rocm_mgpu.cuh
+ * (included from ds4_rocm.cu). That header needs direct access to
+ * runtime internals (the model-map cache, per-device selective weight
+ * cache, hipBLAS/hipBLASLt state) that only exist in ds4_rocm.cu's
+ * translation unit -- this file (ds4_rocm_compat.cu) is a separate TU with
+ * no visibility into those statics, so it can only host functions that
+ * are self-contained HIP calls or thin wrappers around the public
+ * ds4_gpu.h API. */
 
 extern "C" int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst,
                                            const ds4_gpu_tensor *src,
@@ -76,61 +27,6 @@ extern "C" int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst,
     if (bytes == 0) return 1;
     return hipMemcpyAsync(dst->ptr, src->ptr, (size_t)bytes,
                           hipMemcpyDeviceToDevice, 0) == hipSuccess;
-}
-
-extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
-                                          const ds4_gpu_tensor *src,
-                                          uint64_t bytes) {
-    return ds4_gpu_tensor_copy(dst, 0, src, 0, bytes);
-}
-
-extern "C" int ds4_gpu_tensor_copy_xdev_default(ds4_gpu_tensor *dst,
-                                                  const ds4_gpu_tensor *src,
-                                                  uint64_t bytes) {
-    return ds4_gpu_tensor_copy_xdev(dst, src, bytes);
-}
-
-extern "C" int ds4_gpu_tensor_copy_xdev_ordered(ds4_gpu_tensor *dst,
-                                                  const ds4_gpu_tensor *src,
-                                                  uint64_t bytes) {
-    return ds4_gpu_tensor_copy_xdev(dst, src, bytes);
-}
-
-extern "C" int ds4_gpu_tensor_copy_xdev3(
-        ds4_gpu_tensor *dst0, const ds4_gpu_tensor *src0, uint64_t bytes0,
-        ds4_gpu_tensor *dst1, const ds4_gpu_tensor *src1, uint64_t bytes1,
-        ds4_gpu_tensor *dst2, const ds4_gpu_tensor *src2, uint64_t bytes2) {
-    return (bytes0 == 0 || ds4_gpu_tensor_copy_xdev(dst0, src0, bytes0)) &&
-           (bytes1 == 0 || ds4_gpu_tensor_copy_xdev(dst1, src1, bytes1)) &&
-           (bytes2 == 0 || ds4_gpu_tensor_copy_xdev(dst2, src2, bytes2));
-}
-
-extern "C" int ds4_gpu_tensor_copy_xdev3_default_dst(
-        ds4_gpu_tensor *dst0, const ds4_gpu_tensor *src0, uint64_t bytes0,
-        ds4_gpu_tensor *dst1, const ds4_gpu_tensor *src1, uint64_t bytes1,
-        ds4_gpu_tensor *dst2, const ds4_gpu_tensor *src2, uint64_t bytes2) {
-    return ds4_gpu_tensor_copy_xdev3(dst0, src0, bytes0, dst1, src1, bytes1,
-                                     dst2, src2, bytes2);
-}
-
-extern "C" int ds4_gpu_tensor_wait_xdev(const ds4_gpu_tensor *src,
-                                          int dst_tier) {
-    return src && rocm_tier_valid(dst_tier);
-}
-
-extern "C" int ds4_gpu_tensor_wait_xdev_default(const ds4_gpu_tensor *src,
-                                                  int dst_tier) {
-    return ds4_gpu_tensor_wait_xdev(src, dst_tier);
-}
-
-extern "C" uint64_t ds4_gpu_tier_free_vram(int tier) {
-    size_t free_bytes = 0;
-    size_t total_bytes = 0;
-    if (!rocm_tier_valid(tier) ||
-        hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) {
-        return 0;
-    }
-    return (uint64_t)free_bytes;
 }
 
 extern "C" int ds4_gpu_args_probe_auto_cuda(
@@ -149,38 +45,63 @@ extern "C" int ds4_gpu_args_probe_auto_cuda(
         }
         return 1;
     }
-    if (filter_len > 1 || (!device_filter && visible > 1)) {
-        if (errbuf && errbuflen) {
-            snprintf(errbuf, errbuflen,
-                     "ROCm supports one GPU per process; select one device");
+    /* Build the device list: either the explicit filter or 0..visible-1. */
+    int devs[DS4_MAX_GPUS];
+    int n_dev = 0;
+    if (device_filter && filter_len > 0) {
+        if (filter_len > DS4_MAX_GPUS) {
+            if (errbuf && errbuflen) {
+                snprintf(errbuf, errbuflen,
+                         "--gpu-devices filter has %d entries (max %d)",
+                         filter_len, DS4_MAX_GPUS);
+            }
+            return 1;
         }
-        return 1;
-    }
-    const int device = device_filter && filter_len == 1 ? device_filter[0] : 0;
-    if (device < 0 || device >= visible || hipSetDevice(device) != hipSuccess) {
-        if (errbuf && errbuflen) {
-            snprintf(errbuf, errbuflen, "invalid ROCm device %d", device);
+        for (int i = 0; i < filter_len; i++) {
+            int d = device_filter[i];
+            if (d < 0 || d >= visible) {
+                if (errbuf && errbuflen) {
+                    snprintf(errbuf, errbuflen,
+                             "--gpu-devices: device %d not in 0..%d",
+                             d, visible - 1);
+                }
+                return 1;
+            }
+            devs[n_dev++] = d;
         }
-        return 1;
+    } else {
+        int cap = visible < DS4_MAX_GPUS ? visible : DS4_MAX_GPUS;
+        for (int i = 0; i < cap; i++) devs[n_dev++] = i;
     }
-    size_t free_bytes = 0;
-    size_t total_bytes = 0;
-    rc = hipMemGetInfo(&free_bytes, &total_bytes);
-    if (rc != hipSuccess) {
-        if (errbuf && errbuflen) {
-            snprintf(errbuf, errbuflen, "hipMemGetInfo failed: %s",
-                     hipGetErrorString(rc));
-        }
-        return 1;
-    }
-    const size_t reserve_floor = (size_t)2ull * 1024ull * 1024ull * 1024ull;
-    const size_t reserve_pct = free_bytes / 20u;
-    const size_t reserve = reserve_floor > reserve_pct ? reserve_floor : reserve_pct;
     memset(out, 0, sizeof(*out));
-    out->device_indices[0] = device;
-    out->vram_bytes[0] = free_bytes > reserve ? free_bytes - reserve : 0;
-    out->n_gpus = 1;
+    out->n_gpus = n_dev;
     out->safety_margin_bytes = safety_margin_bytes;
+    for (int i = 0; i < n_dev; i++) {
+        int d = devs[i];
+        if (hipSetDevice(d) != hipSuccess) {
+            if (errbuf && errbuflen) {
+                snprintf(errbuf, errbuflen, "hipSetDevice(%d) failed", d);
+            }
+            return 1;
+        }
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        rc = hipMemGetInfo(&free_bytes, &total_bytes);
+        if (rc != hipSuccess) {
+            if (errbuf && errbuflen) {
+                snprintf(errbuf, errbuflen, "hipMemGetInfo on device %d failed: %s",
+                         d, hipGetErrorString(rc));
+            }
+            return 1;
+        }
+        /* Reserve = max(2 GiB, 5% of free); mirrors CUDA's auto-probe
+         * reserve. Explicit --gpu-vram budgets bypass this probe. */
+        const size_t reserve_floor = (size_t)2ull * 1024ull * 1024ull * 1024ull;
+        const size_t reserve_pct = free_bytes / 20u;
+        const size_t reserve = reserve_floor > reserve_pct ? reserve_floor : reserve_pct;
+        out->device_indices[i] = d;
+        out->vram_bytes[i] = free_bytes > reserve ? free_bytes - reserve : 0;
+    }
     return 0;
 }
 

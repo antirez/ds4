@@ -1,3 +1,169 @@
+static inline void ds4_moe_layer_force_sync(uint32_t layer_index) {
+    const char *env = getenv("DS4_FORCE_SYNC_LAYER");
+    if (!env || !env[0]) return;
+    char *endp = NULL;
+    long want = strtol(env, &endp, 10);
+    if (endp == env) return;
+    if (want >= 0 && (uint32_t)want != layer_index) return;
+    (void)cudaDeviceSynchronize();
+}
+
+static uint64_t ds4_moe_integrity_hash64(const unsigned char *p, size_t n) {
+    uint64_t h = UINT64_C(14695981039346656037);
+    for (size_t i = 0; i < n; i++) {
+        h ^= (uint64_t)p[i];
+        h *= UINT64_C(1099511628211);
+    }
+    return h;
+}
+
+static int ds4_moe_integrity_dump_device(
+        const char *prefix,
+        const char *name,
+        uint32_t layer_index,
+        uint32_t n_tokens,
+        const void *device_ptr,
+        size_t bytes) {
+    if (!prefix || !prefix[0] || !name || !device_ptr || bytes == 0) return 0;
+    std::vector<unsigned char> host(bytes);
+    cudaError_t err = cudaMemcpy(host.data(), device_ptr, bytes, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "MOE_INTEGRITY dump copy failed layer=%u tok=%u name=%s bytes=%zu: %s\n",
+                layer_index, n_tokens, name, bytes, cudaGetErrorString(err));
+        return 0;
+    }
+    char path[768];
+    snprintf(path, sizeof(path), "%s_layer%u_tok%u_%s.bin",
+             prefix, layer_index, n_tokens, name);
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "MOE_INTEGRITY dump open failed: %s\n", path);
+        return 0;
+    }
+    const size_t written = fwrite(host.data(), 1, host.size(), f);
+    fclose(f);
+    const uint64_t hash = ds4_moe_integrity_hash64(host.data(), host.size());
+    fprintf(stderr,
+            "MOE_INTEGRITY dump layer=%u tok=%u name=%s bytes=%zu hash=%016llx path=%s%s\n",
+            layer_index, n_tokens, name, bytes, (unsigned long long)hash, path,
+            written == host.size() ? "" : " SHORT_WRITE");
+    return written == host.size();
+}
+
+static int ds4_moe_integrity_compare_selected_weights(
+        const char *prefix,
+        uint32_t layer_index,
+        uint32_t n_tokens,
+        const void *model_map,
+        uint64_t model_size,
+        const ds4_gpu_tensor *selected,
+        uint32_t pair_count,
+        uint32_t n_total_expert,
+        const char *gate_w,
+        const char *up_w,
+        const char *down_w,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes) {
+    if (!prefix || !prefix[0] || !model_map || !selected || !selected->ptr ||
+        !gate_w || !up_w || !down_w || pair_count == 0 ||
+        gate_expert_bytes == 0 || down_expert_bytes == 0) {
+        return 0;
+    }
+    std::vector<int32_t> selected_host(pair_count);
+    cudaError_t err = cudaMemcpy(selected_host.data(), selected->ptr,
+                                 selected_host.size() * sizeof(selected_host[0]),
+                                 cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "MOE_INTEGRITY selected copy failed layer=%u tok=%u: %s\n",
+                layer_index, n_tokens, cudaGetErrorString(err));
+        return 0;
+    }
+    std::vector<uint32_t> experts;
+    for (size_t i = 0; i < selected_host.size(); i++) {
+        const int32_t expert_i = selected_host[i];
+        if (expert_i < 0 || (uint32_t)expert_i >= n_total_expert) continue;
+        const uint32_t expert = (uint32_t)expert_i;
+        if (std::find(experts.begin(), experts.end(), expert) == experts.end()) {
+            experts.push_back(expert);
+        }
+    }
+    std::sort(experts.begin(), experts.end());
+
+    char path[768];
+    snprintf(path, sizeof(path), "%s_layer%u_tok%u_weights.txt",
+             prefix, layer_index, n_tokens);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        fprintf(stderr, "MOE_INTEGRITY weights open failed: %s\n", path);
+        return 0;
+    }
+    fprintf(f, "layer=%u n_tokens=%u pair_count=%u unique_experts=%zu\n",
+            layer_index, n_tokens, pair_count, experts.size());
+
+    struct weight_kind {
+        const char *name;
+        const char *device_base;
+        uint64_t model_offset;
+        uint64_t expert_bytes;
+    };
+    const weight_kind kinds[] = {
+        {"gate", gate_w, gate_offset, gate_expert_bytes},
+        {"up", up_w, up_offset, gate_expert_bytes},
+        {"down", down_w, down_offset, down_expert_bytes},
+    };
+    uint32_t checked = 0;
+    uint32_t mismatches = 0;
+    uint32_t errors = 0;
+    for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
+        const weight_kind &kind = kinds[k];
+        std::vector<unsigned char> device_bytes((size_t)kind.expert_bytes);
+        for (size_t i = 0; i < experts.size(); i++) {
+            const uint32_t expert = experts[i];
+            const uint64_t relative = (uint64_t)expert * kind.expert_bytes;
+            if (relative > UINT64_MAX - kind.model_offset ||
+                kind.model_offset + relative > model_size ||
+                kind.expert_bytes > model_size - (kind.model_offset + relative)) {
+                fprintf(f, "%s expert=%u ERROR=model_bounds\n", kind.name, expert);
+                errors++;
+                continue;
+            }
+            err = cudaMemcpy(device_bytes.data(), kind.device_base + relative,
+                             device_bytes.size(), cudaMemcpyDeviceToHost);
+            if (err != cudaSuccess) {
+                fprintf(f, "%s expert=%u ERROR=device_copy status=%s\n",
+                        kind.name, expert, cudaGetErrorString(err));
+                errors++;
+                continue;
+            }
+            const unsigned char *model_bytes =
+                (const unsigned char *)model_map + kind.model_offset + relative;
+            const int match = memcmp(device_bytes.data(), model_bytes,
+                                     device_bytes.size()) == 0;
+            const uint64_t device_hash =
+                ds4_moe_integrity_hash64(device_bytes.data(), device_bytes.size());
+            const uint64_t model_hash =
+                ds4_moe_integrity_hash64(model_bytes, device_bytes.size());
+            fprintf(f,
+                    "%s expert=%u bytes=%llu match=%d device_hash=%016llx model_hash=%016llx\n",
+                    kind.name, expert, (unsigned long long)kind.expert_bytes, match,
+                    (unsigned long long)device_hash, (unsigned long long)model_hash);
+            checked++;
+            if (!match) mismatches++;
+        }
+    }
+    fprintf(f, "SUMMARY checked=%u mismatches=%u errors=%u\n",
+            checked, mismatches, errors);
+    fclose(f);
+    fprintf(stderr,
+            "MOE_INTEGRITY weights layer=%u tok=%u unique=%zu checked=%u mismatches=%u errors=%u path=%s\n",
+            layer_index, n_tokens, experts.size(), checked, mismatches, errors, path);
+    return mismatches == 0 && errors == 0;
+}
+
 static int routed_moe_u64_add_checked(uint64_t a, uint64_t b, uint64_t *out) {
     if (!out || a > UINT64_MAX - b) return 0;
     *out = a + b;
@@ -238,8 +404,15 @@ static int routed_moe_q2_float_down_launch(
     uint32_t hot_max = 0u;
     const uint32_t hot_threshold = 8u;
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    /* The hot-expert WMMA kernels lay out one matrix fragment per 32 threads
+     * and are launched with 32*MT-thread blocks.  A fragment belongs to a whole
+     * wave, so on wave64 parts those blocks are half the waves the kernel
+     * assumes and the tiling is wrong.  Until they are reshaped for wave64,
+     * CDNA takes the portable expert-batch kernels below, which are correct on
+     * both and are what quality mode already uses. */
     const int use_wmma_hot = hot_experts_dev &&
         !g_quality_mode &&
+        cuda_device_wave_size() == 32 &&
         (expert_mid_dim % 16u) == 0u && (out_dim % 16u) == 0u;
 #else
     const int use_wmma_hot = 0;
@@ -422,6 +595,7 @@ static int routed_moe_q2_float_down_launch(
         if (!cuda_ok(cudaGetLastError(), "routed_moe iq2/q2 float-down wmma launch")) return 0;
     }
 #endif
+    if (getenv("DS4_FORCE_SYNC_LAYER")) (void)cudaDeviceSynchronize();
 
     const uint64_t n = (uint64_t)n_tokens * out_dim;
     if (use_f16_down && (out_dim & 1u) == 0u) {
@@ -721,6 +895,26 @@ static int routed_moe_launch(
     }
     if (compact_selected && !cuda_stream_selected_wait_upload_ready()) return 0;
 
+    const char *integrity_prefix = getenv("DS4_MOE_INTEGRITY_PREFIX");
+    const int integrity_layer =
+        integrity_prefix && integrity_prefix[0] && layer_index == 40u;
+    if (integrity_layer) {
+        (void)ds4_moe_integrity_dump_device(
+            integrity_prefix, "x_f32", layer_index, n_tokens, x->ptr,
+            (size_t)n_tokens * expert_in_dim * sizeof(float));
+        (void)ds4_moe_integrity_dump_device(
+            integrity_prefix, "selected_i32", layer_index, n_tokens,
+            selected_exec->ptr, (size_t)pair_count * sizeof(int32_t));
+        (void)ds4_moe_integrity_dump_device(
+            integrity_prefix, "router_weights_f32", layer_index, n_tokens,
+            weights->ptr, (size_t)pair_count * sizeof(float));
+        (void)ds4_moe_integrity_compare_selected_weights(
+            integrity_prefix, layer_index, n_tokens, model_map, model_size,
+            selected_exec, pair_count, n_total_expert, gate_w, up_w, down_w,
+            gate_offset, up_offset, down_offset,
+            gate_expert_bytes, down_expert_bytes);
+    }
+
     int ok = 1;
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
     const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
@@ -918,10 +1112,12 @@ static int routed_moe_launch(
                         pair_count,
                         bucket_count);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted count launch");
+                    if (ok) ds4_moe_layer_force_sync(layer_index);
                 }
                 if (ok) {
                     moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts, bucket_count);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted prefix launch");
+                    if (ok) ds4_moe_layer_force_sync(layer_index);
                 }
                 if (ok) {
                     moe_scatter_sorted_pairs_deterministic_kernel<<<bucket_count, 1u>>>(
@@ -931,15 +1127,18 @@ static int routed_moe_launch(
                         pair_count,
                         bucket_count);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted scatter launch");
+                    if (ok) ds4_moe_layer_force_sync(layer_index);
                 }
                 if (ok && use_expert_tiles) {
                     moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile_offsets, tile_total, counts, expert_tile_m, bucket_count);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile offsets launch");
+                    if (ok) ds4_moe_layer_force_sync(layer_index);
                 }
                 if (ok && use_expert_tiles) {
                     moe_build_expert_tiles_kernel<<<(bucket_count + 255u) / 256u, 256>>>(
                             tile_experts, tile_starts, tile_offsets, counts, expert_tile_m, bucket_count);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tiles launch");
+                    if (ok) ds4_moe_layer_force_sync(layer_index);
                 }
                 if (ok && use_expert_tiles && use_down_tile16) {
                     moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile16_offsets, tile16_total, counts, 16u, bucket_count);
@@ -957,10 +1156,12 @@ static int routed_moe_launch(
         const uint32_t iq2_gate_hot_threshold = 8u;
         const uint32_t iq2_down_hot_threshold = 8u;
         uint32_t h_iq2_gate_hot[DS4_ROCM_MAX_N_EXPERT] = {0};
+        /* Wave32-shaped fragment tiling, as with use_wmma_hot above. */
         const uint32_t use_iq2_gate_wmma =
             ok && iq2_path && n_tokens > 1u && n_expert == 6u && !write_gate_up &&
             sorted_pairs && sorted_offsets && sorted_counts && tile_experts && iq2_gate_hot_dev && use_expert_tiles &&
             (expert_in_dim % 16u) == 0u && (expert_mid_dim % 16u) == 0u &&
+            cuda_device_wave_size() == 32 &&
             !g_quality_mode;
         if (use_iq2_gate_wmma) {
             uint32_t h_counts[DS4_ROCM_MAX_N_EXPERT] = {0};
@@ -1227,6 +1428,36 @@ static int routed_moe_launch(
                         write_gate_up,
                         clamp);
                 } else if (use_decode_lut_gate) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+                    /* See moe_gate_up_mid_decode_lut_hwarp32_kernel's comment:
+                     * only a win when xq_blocks divides evenly into 16, so
+                     * every lane of the wider group does useful work every
+                     * iteration. Any other wave size or shape falls through
+                     * to the always-correct qwarp32 kernel below. This kernel
+                     * covers half as many rows per block as qwarp32 (64 vs
+                     * 128), so its grid needs twice as many blocks to cover
+                     * the same expert_mid_dim range -- do not reuse qgrid. */
+                    if (cuda_device_wave_size() == 64 && (xq_blocks % 16u) == 0u) {
+                        dim3 qgrid_hwarp32((expert_mid_dim + 63u) / 64u, pair_count, 1);
+                        moe_gate_up_mid_decode_lut_hwarp32_kernel<<<qgrid_hwarp32, 256>>>(
+                            (float *)gate->ptr,
+                            (float *)up->ptr,
+                            (float *)mid->ptr,
+                            gate_w,
+                            up_w,
+                            xq,
+                            (const int32_t *)selected_exec->ptr,
+                            (const float *)weights->ptr,
+                            gate_expert_bytes,
+                            gate_row_bytes,
+                            xq_blocks,
+                            expert_mid_dim,
+                            n_expert,
+                            write_gate_up,
+                            0xffffffffu,
+                            clamp);
+                    } else
+#endif
                     moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
@@ -1264,6 +1495,7 @@ static int routed_moe_launch(
                 }
             }
             ok = cuda_ok(cudaGetLastError(), "routed_moe gate/up launch");
+            if (ok) ds4_moe_layer_force_sync(layer_index);
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
             if (ok && use_iq2_gate_wmma && iq2_gate_hot_count != 0u) {
                 constexpr uint32_t bm = 16u, bn = 16u, bk = 16u;
@@ -1339,6 +1571,11 @@ static int routed_moe_launch(
             }
 #endif
         }
+        if (ok && integrity_layer) {
+            (void)ds4_moe_integrity_dump_device(
+                integrity_prefix, "mid_f32", layer_index, n_tokens, mid->ptr,
+                (size_t)pair_count * expert_mid_dim * sizeof(float));
+        }
         const uint32_t use_iq2_q2_float_down =
             ok && iq2_path && n_tokens > 1u &&
             n_expert <= DS4_ROCM_N_EXPERT_USED &&
@@ -1370,6 +1607,49 @@ static int routed_moe_launch(
                         sorted_counts, sorted_offsets, sorted_pairs, tile_experts,
                         n_tokens, n_total_expert, n_expert, expert_mid_dim, out_dim,
                         down_expert_bytes, down_row_bytes);
+                if (ok) ds4_moe_layer_force_sync(layer_index);
+                if (ok && integrity_layer) {
+                    (void)ds4_moe_integrity_dump_device(
+                        integrity_prefix, "down_f16", layer_index, n_tokens,
+                        down->ptr,
+                        (size_t)pair_count * out_dim * sizeof(uint16_t));
+                }
+                if (ok) {
+                    const char *dump_env = getenv("DS4_MOE_DOWN_DUMP");
+                    if (dump_env && dump_env[0]) {
+                        const int dump_all = strncmp(dump_env, "all:", 4) == 0;
+                        char *endp = NULL;
+                        long want_layer = dump_all ? -1 : strtol(dump_env, &endp, 10);
+                        const char *path_prefix = dump_all ? dump_env + 4 :
+                                ((endp && *endp == ':') ? endp + 1 : NULL);
+                        if (path_prefix && (dump_all || want_layer == (long)layer_index)) {
+                            const int dump_f16 = (out_dim & 1u) == 0u;
+                            uint64_t n_elems = (uint64_t)n_tokens * (uint64_t)n_expert * (uint64_t)out_dim;
+                            const size_t elem_bytes = dump_f16 ? sizeof(uint16_t) : sizeof(float);
+                            std::vector<unsigned char> h_down((size_t)n_elems * elem_bytes, 0);
+                            cudaError_t derr = cudaMemcpy(h_down.data(), down->ptr,
+                                                           h_down.size(),
+                                                           cudaMemcpyDeviceToHost);
+                            if (derr == cudaSuccess) {
+                                char path[512];
+                                snprintf(path, sizeof(path), "%s_tier%d_layer%u_%s.bin",
+                                         path_prefix, g_current_logical_tier, layer_index,
+                                         dump_f16 ? "f16" : "f32");
+                                FILE *f = fopen(path, "wb");
+                                if (f) {
+                                    fwrite(h_down.data(), 1, h_down.size(), f);
+                                    fclose(f);
+                                    fprintf(stderr, "MOE_DOWN_DUMP wrote %s (%llu elems, %s)\n",
+                                            path, (unsigned long long)n_elems,
+                                            dump_f16 ? "f16" : "f32");
+                                }
+                            } else {
+                                fprintf(stderr, "MOE_DOWN_DUMP cudaMemcpy failed: %s\n",
+                                        cudaGetErrorString(derr));
+                            }
+                        }
+                    }
+                }
             } else {
             dim3 dgrid((out_dim + 31u) / 32u, pair_count, 1);
             uint32_t *down_tile_total = tile_total;
@@ -1396,6 +1676,21 @@ static int routed_moe_launch(
                         out_dim,
                         n_expert);
                 } else {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+                    if (cuda_device_wave_size() == 64 && !getenv("DS4_ROCM_DISABLE_MOE_DOWN_SUM6_HWARP32")) {
+                        dim3 sgrid_hwarp32((out_dim + 15u) / 16u, 1, 1);
+                        moe_down_sum6_hwarp32_kernel<<<sgrid_hwarp32, 256>>>(
+                            (float *)out->ptr,
+                            down_w,
+                            midq,
+                            (const int32_t *)selected_exec->ptr,
+                            down_expert_bytes,
+                            down_row_bytes,
+                            midq_blocks,
+                            out_dim,
+                            n_expert);
+                    } else
+#endif
                     moe_down_sum6_qwarp32_kernel<<<sgrid, 256>>>(
                         (float *)out->ptr,
                         down_w,
@@ -1548,6 +1843,11 @@ static int routed_moe_launch(
             uint64_t n = (uint64_t)n_tokens * out_dim;
             moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
             ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
+        }
+        if (ok && integrity_layer) {
+            (void)ds4_moe_integrity_dump_device(
+                integrity_prefix, "routed_out_f32", layer_index, n_tokens,
+                out->ptr, (size_t)n_tokens * out_dim * sizeof(float));
         }
         if (ok && compact_selected) ok = cuda_stream_selected_mark_inflight();
         return ok;
@@ -2150,6 +2450,20 @@ static int routed_moe_launch(
                             out_dim,
                             n_expert);
                 } else {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+                    if (cuda_device_wave_size() == 64 && !getenv("DS4_ROCM_DISABLE_MOE_DOWN_SUM6_HWARP32")) {
+                        moe_down_sum6_hwarp32_kernel<<<(out_dim + 15u) / 16u, 256>>>(
+                                (float *)out->ptr,
+                                down_w,
+                                midq,
+                                (const int32_t *)selected_exec->ptr,
+                                down_expert_bytes,
+                                down_row_bytes,
+                                midq_blocks,
+                                out_dim,
+                                n_expert);
+                    } else
+#endif
                     moe_down_sum6_qwarp32_kernel<<<(out_dim + 31u) / 32u, 256>>>(
                             (float *)out->ptr,
                             down_w,
@@ -2307,4 +2621,97 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x, layer_index, n_tokens,
                              force_resident);
+}
+
+/* Test-only direct entry point for moe_gate_up_mid_decode_lut_qwarp32_kernel
+ * / moe_gate_up_mid_decode_lut_hwarp32_kernel, bypassing the routed-MoE
+ * expert-selection/sorting machinery above so tests/test_rocm_moe_gate_up_mid_hwarp32.c
+ * can drive either kernel directly with synthetic data. force_kernel: 0 = use
+ * the same auto-dispatch condition as the real call site, 1 = force qwarp32,
+ * 2 = force hwarp32 (undefined/asserts out on non-wave64 builds since the
+ * kernel doesn't exist there). */
+extern "C" int ds4_gpu_test_moe_gate_up_mid_decode_lut_tensor(
+        ds4_gpu_tensor *gate_out,
+        ds4_gpu_tensor *up_out,
+        ds4_gpu_tensor *mid_out,
+        const ds4_gpu_tensor *gate_base,
+        const ds4_gpu_tensor *up_base,
+        const ds4_gpu_tensor *xq,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t n_tok,
+        uint32_t write_aux,
+        float clamp,
+        int force_kernel) {
+    if (!gate_out || !up_out || !mid_out || !gate_base || !up_base || !xq || !selected || !weights) return 0;
+    dim3 qgrid((expert_mid_dim + 127u) / 128u, n_tok * n_expert, 1);
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    const int use_hwarp32 = force_kernel == 2 ||
+        (force_kernel == 0 && cuda_device_wave_size() == 64 && (xq_blocks % 16u) == 0u);
+    if (use_hwarp32) {
+        dim3 qgrid_hwarp32((expert_mid_dim + 63u) / 64u, n_tok * n_expert, 1);
+        moe_gate_up_mid_decode_lut_hwarp32_kernel<<<qgrid_hwarp32, 256>>>(
+                (float *)gate_out->ptr, (float *)up_out->ptr, (float *)mid_out->ptr,
+                (const char *)gate_base->ptr, (const char *)up_base->ptr,
+                (const cuda_block_q8_K *)xq->ptr, (const int32_t *)selected->ptr,
+                (const float *)weights->ptr,
+                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                write_aux, 0xffffffffu, clamp);
+        return cuda_ok(cudaGetLastError(), "test moe_gate_up_mid_decode_lut_hwarp32 launch");
+    }
+#else
+    (void)force_kernel;
+#endif
+    moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256>>>(
+            (float *)gate_out->ptr, (float *)up_out->ptr, (float *)mid_out->ptr,
+            (const char *)gate_base->ptr, (const char *)up_base->ptr,
+            (const cuda_block_q8_K *)xq->ptr, (const int32_t *)selected->ptr,
+            (const float *)weights->ptr,
+            gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+            write_aux, 0xffffffffu, clamp);
+    return cuda_ok(cudaGetLastError(), "test moe_gate_up_mid_decode_lut_qwarp32 launch");
+}
+
+/* Test-only direct entry point for moe_down_sum6_qwarp32_kernel /
+ * moe_down_sum6_hwarp32_kernel, bypassing the routed-MoE dispatch machinery
+ * so tests/test_rocm_moe_down_sum6.c can drive either kernel directly with
+ * synthetic data. force_kernel: 0 = auto-dispatch (matches the real call
+ * site), 1 = force qwarp32, 2 = force hwarp32. */
+extern "C" int ds4_gpu_test_moe_down_sum6_tensor(
+        ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *down_base,
+        const ds4_gpu_tensor *midq,
+        const ds4_gpu_tensor *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        int force_kernel) {
+    if (!out || !down_base || !midq || !selected) return 0;
+    dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    const int use_hwarp32 = force_kernel == 2 ||
+        (force_kernel == 0 && cuda_device_wave_size() == 64);
+    if (use_hwarp32) {
+        dim3 sgrid_hwarp32((out_dim + 15u) / 16u, 1, 1);
+        moe_down_sum6_hwarp32_kernel<<<sgrid_hwarp32, 256>>>(
+                (float *)out->ptr, (const char *)down_base->ptr,
+                (const cuda_block_q8_K *)midq->ptr, (const int32_t *)selected->ptr,
+                down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert);
+        return cuda_ok(cudaGetLastError(), "test moe_down_sum6_hwarp32 launch");
+    }
+#else
+    (void)force_kernel;
+#endif
+    moe_down_sum6_qwarp32_kernel<<<sgrid, 256>>>(
+            (float *)out->ptr, (const char *)down_base->ptr,
+            (const cuda_block_q8_K *)midq->ptr, (const int32_t *)selected->ptr,
+            down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert);
+    return cuda_ok(cudaGetLastError(), "test moe_down_sum6_qwarp32 launch");
 }

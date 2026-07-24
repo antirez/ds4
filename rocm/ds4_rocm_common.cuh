@@ -3,6 +3,46 @@
 // Included from ds4_cuda.cu before more specialized modules; these helpers are
 // intentionally kept static in the single translation unit.
 
+/* Lane index inside the hardware wavefront.
+ *
+ * Sub-wave reductions have to build their __shfl_*_sync masks from this rather
+ * than from threadIdx.x.  HIP validates the mask against the actual active
+ * lane set, and on a wave64 part a mask derived from threadIdx.x names lanes
+ * in the wrong half of the wave: threads 32..39 of a block compute the mask
+ * for lanes 0..7.  The check then fails and aborts the queue with a hardware
+ * exception.  It happens to agree with threadIdx.x on wave32 parts, which is
+ * why the threadIdx.x form survived on RDNA. */
+__device__ static __forceinline__ uint32_t ds4_lane_in_wave(void) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    return __lane_id();
+#else
+    return threadIdx.x & 31u;
+#endif
+}
+
+/* Mask naming the WIDTH-lane group that contains this lane, for the
+ * fixed-width sub-wave shuffles used by the score and gate/up reductions.
+ * Callers must keep every lane of the group on the same side of any branch
+ * around the shuffle, which the reductions below do. */
+template <uint32_t WIDTH>
+__device__ static __forceinline__ MASK_T ds4_subwave_mask(void) {
+    static_assert(WIDTH > 0u && WIDTH <= 8u * sizeof(MASK_T),
+                  "sub-wave width must fit inside the mask type");
+    const MASK_T ones = (WIDTH == 8u * sizeof(MASK_T))
+                            ? (MASK_T)~(MASK_T)0
+                            : (MASK_T)(((MASK_T)1 << (WIDTH % (8u * sizeof(MASK_T)))) - (MASK_T)1);
+    return (MASK_T)(ones << (ds4_lane_in_wave() & ~(WIDTH - 1u)));
+}
+
+/* The whole backend treats a "warp" as 32 lanes and passes an explicit width
+ * of 32 to its shuffles, which HIP maps correctly onto either wave size.  The
+ * accompanying mask must name that 32-lane group and nothing else: on wave64 a
+ * literal all-ones mask claims 64 lanes, and any kernel where only part of the
+ * wave reaches the shuffle -- a tail token, a short row -- then fails HIP's
+ * mask check and faults the queue.  On wave32 and on CUDA this is exactly the
+ * old all-ones constant, so behaviour there is unchanged. */
+#define DS4_WARP32_MASK ds4_subwave_mask<32u>()
+
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] = v;
@@ -140,6 +180,48 @@ __global__ static void matmul_f16_ordered_chunks_kernel(
     if (tid == 0) {
         float total = 0.0f;
         for (uint32_t i = 0; i < 32u; i++) total += partial[i];
+        out[tok * out_dim + row] = total;
+    }
+}
+
+/* Wave64-native counterpart of matmul_f16_ordered_chunks_kernel. The w32
+ * version launches a 32-thread block, which on a native-64-lane wavefront
+ * (CDNA/gfx9xx) leaves the other 32 lanes of every dispatched wavefront
+ * completely idle -- not a two-independent-rows tradeoff like the other w32
+ * kernels this session touched, just unused capacity. This version divides
+ * the same row's dot product across all 64 threads instead of 32, halving
+ * the per-lane chunk length. Reduction is still done by shared-memory +
+ * single-thread sum (matches the original's approach, not a shuffle
+ * reduction) to keep this a minimal, low-risk change isolated to the launch
+ * width. */
+__global__ static void matmul_f16_ordered_chunks_w64_kernel(
+        float *out,
+        const __half *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok) {
+    uint64_t row = (uint64_t)blockIdx.x;
+    uint64_t tok = (uint64_t)blockIdx.y;
+    if (row >= out_dim || tok >= n_tok) return;
+
+    __shared__ float partial[64];
+    const uint32_t tid = threadIdx.x;
+    float sum = 0.0f;
+    const uint64_t chunk = (in_dim + 63u) / 64u;
+    const uint64_t k0 = (uint64_t)tid * chunk;
+    uint64_t k1 = k0 + chunk;
+    if (k1 > in_dim) k1 = in_dim;
+    const __half *wr = w + row * in_dim;
+    const float *xr = x + tok * in_dim;
+    for (uint64_t i = k0; i < k1; i++) {
+        sum += __half2float(wr[i]) * xr[i];
+    }
+    partial[tid] = sum;
+    __syncthreads();
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint32_t i = 0; i < 64u; i++) total += partial[i];
         out[tok * out_dim + row] = total;
     }
 }
@@ -352,7 +434,7 @@ __device__ static float warp_sum_f32(float v) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         v += __shfl_down(v, offset, 32);
 #else
-        v += __shfl_down_sync(FULL_WARP_MASK, v, offset, 32);
+        v += __shfl_down_sync(DS4_WARP32_MASK, v, offset, 32);
 #endif
     }
     return v;
@@ -363,7 +445,7 @@ __device__ static float warp_max_f32(float v) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         v = fmaxf(v, __shfl_down(v, offset, 32));
 #else
-        v = fmaxf(v, __shfl_down_sync(FULL_WARP_MASK, v, offset, 32));
+        v = fmaxf(v, __shfl_down_sync(DS4_WARP32_MASK, v, offset, 32));
 #endif
     }
     return v;

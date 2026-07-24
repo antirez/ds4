@@ -97,7 +97,7 @@ __global__ static void quantize_q8_0_f32_kernel(
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
     const float d = __shfl(a, 0, 32) / 127.0f;
 #else
-    const float d = __shfl_sync(FULL_WARP_MASK, a, 0, 32) / 127.0f;
+    const float d = __shfl_sync(DS4_WARP32_MASK, a, 0, 32) / 127.0f;
 #endif
     const float id = d != 0.0f ? 1.0f / d : 0.0f;
     if (threadIdx.x == 0) xscale[tok * blocks + b] = d;
@@ -392,7 +392,7 @@ __device__ static float q8_0_scale_broadcast_w32(const unsigned char *blk) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
     return __shfl(d, 0, 32);
 #else
-    return __shfl_sync(FULL_WARP_MASK, d, 0, 32);
+    return __shfl_sync(DS4_WARP32_MASK, d, 0, 32);
 #endif
 }
 
@@ -672,13 +672,19 @@ __global__ static void matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kerne
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 typedef _Float16 __attribute__((ext_vector_type(16))) ds4_q8_half16_t;
 typedef float    __attribute__((ext_vector_type(8)))  ds4_q8_float8_t;
+typedef _Float16 __attribute__((ext_vector_type(4)))  ds4_q8_half4_t;
+typedef float    __attribute__((ext_vector_type(4)))  ds4_q8_float4_t;
 
 /* Four-wave, 64x64 output-tile Q8_0 batched GEMM for large prefill chunks.
  * This is the hipfire/llama.cpp-style MMQ shape adapted to DS4's existing
  * F32 activation buffers: each block stages a 64-token x 32-K activation tile
  * into LDS as f16, while each wave owns 16 output rows and computes four
  * 16-token WMMA columns.  It is opt-in from host code because it only wins once
- * the token batch is large enough to amortize the bigger tile. */
+ * the token batch is large enough to amortize the bigger tile.
+ *
+ * RDNA3/RDNA4 only: the WMMA builtin requires wave32.  CDNA parts take
+ * matmul_q8_0_f32_batch_mfma_4w_kernel below instead, and the body compiles
+ * away there so the symbol still exists for the host dispatch stub. */
 __launch_bounds__(128, 2)
 __global__ static void matmul_q8_0_f32_batch_wmma_4w_kernel(
         float *out,
@@ -688,6 +694,10 @@ __global__ static void matmul_q8_0_f32_batch_wmma_4w_kernel(
         uint32_t in_dim,
         uint32_t out_dim,
         uint64_t row_bytes) {
+#if defined(DS4_ROCM_HAS_MFMA_W64)
+    (void)out; (void)w; (void)x;
+    (void)n_tokens; (void)in_dim; (void)out_dim; (void)row_bytes;
+#else
     constexpr uint32_t M_TILE = 64u;
     constexpr uint32_t N_TILE = 64u;
     constexpr uint32_t K_TILE = 32u;
@@ -779,6 +789,135 @@ __global__ static void matmul_q8_0_f32_batch_wmma_4w_kernel(
             if (row < out_dim) out[(uint64_t)tok * out_dim + row] = acc[j];
         }
     }
+#endif /* !DS4_ROCM_HAS_MFMA_W64 */
+}
+
+/* CDNA counterpart of the 4-wave kernel above, for gfx90a / gfx94x / gfx950.
+ *
+ * Same 64-row x 64-token output tile and the same K_TILE=32 activation staging,
+ * but built on MFMA rather than WMMA.  The families differ in more than the
+ * builtin name.  CDNA runs wave64, and v_mfma_f32_16x16x16f16 spreads one
+ * 16x16x16 fragment across all 64 lanes as four halves per lane, where RDNA's
+ * wave32 v_wmma_f32_16x16x16_f16 hands every lane the full 16-deep K vector.
+ * So a block here is 4 waves of 64 threads rather than 4 waves of 32, and each
+ * lane dequantizes a quarter of the K range instead of all of it.
+ *
+ * Fragment layout, verified against a CPU reference on gfx90a:
+ *   A[m][k] : m = lane % 16, k = 4 * (lane / 16) + i
+ *   B[k][n] : n = lane % 16, k = 4 * (lane / 16) + i
+ *   D[m][n] : n = lane % 16, m = 4 * (lane / 16) + i
+ * Note that the output row is a function of lane / 16 while the weight row fed
+ * in is a function of lane % 16; they are deliberately not the same row. */
+__launch_bounds__(256, 2)
+__global__ static void matmul_q8_0_f32_batch_mfma_4w_kernel(
+        float *out,
+        const unsigned char *w,
+        const float *x,
+        uint32_t n_tokens,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint64_t row_bytes) {
+#if defined(DS4_ROCM_HAS_MFMA_W64)
+    constexpr uint32_t M_TILE = 64u;
+    constexpr uint32_t N_TILE = 64u;
+    constexpr uint32_t K_TILE = 32u;
+    constexpr uint32_t WAVES = 4u;
+    constexpr uint32_t M_PER_WAVE = M_TILE / WAVES;
+    constexpr uint32_t N_TILES_PER_WAVE = N_TILE / 16u;
+
+    const uint32_t block_m = (uint32_t)blockIdx.x * M_TILE;
+    const uint32_t block_n = (uint32_t)blockIdx.y * N_TILE;
+    if (block_m >= out_dim || block_n >= n_tokens) return;
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t wave_id = tid >> 6u;
+    const uint32_t lane = tid & 63u;
+    const uint32_t lane16 = lane & 15u;  /* A row within the tile, B column */
+    const uint32_t kgrp = lane >> 4u;    /* which 4 of the 16 K this lane holds */
+    const uint32_t wave_m = block_m + wave_id * M_PER_WAVE;
+    const uint32_t my_row = wave_m + lane16;
+    const uint32_t safe_row = my_row < out_dim ? my_row : (out_dim - 1u);
+    const unsigned char *row_base = w + (uint64_t)safe_row * row_bytes;
+    const uint32_t n_blocks = in_dim >> 5u;
+
+    ds4_q8_float4_t acc0 = {0.0f, 0.0f, 0.0f, 0.0f};
+    ds4_q8_float4_t acc1 = acc0;
+    ds4_q8_float4_t acc2 = acc0;
+    ds4_q8_float4_t acc3 = acc0;
+
+    __shared__ _Float16 lds_x[N_TILE * K_TILE];
+
+    for (uint32_t bi = 0; bi < n_blocks; bi++) {
+        for (uint32_t j = tid; j < N_TILE * K_TILE; j += blockDim.x) {
+            const uint32_t nt = j >> 5u;
+            const uint32_t kk = j & 31u;
+            const uint32_t tok = block_n + nt;
+            float xv = 0.0f;
+            if (tok < n_tokens) xv = x[(uint64_t)tok * in_dim + bi * 32u + kk];
+            lds_x[j] = (_Float16)xv;
+        }
+        __syncthreads();
+
+        const unsigned char *bp = row_base + (uint64_t)bi * 34u;
+        _Float16 sc;
+        {
+            uint16_t s_bits;
+            __builtin_memcpy(&s_bits, bp, 2);
+            __builtin_memcpy(&sc, &s_bits, 2);
+        }
+
+        /* Only this lane's four K values of each 16-wide K half, unlike the
+         * WMMA path which needs all sixteen. */
+        const int8_t *w0 = (const int8_t *)(bp + 2u) + kgrp * 4u;
+        const int8_t *w1 = (const int8_t *)(bp + 18u) + kgrp * 4u;
+        ds4_q8_half4_t a0;
+        ds4_q8_half4_t a1;
+#pragma unroll
+        for (uint32_t i = 0; i < 4u; i++) {
+            a0[i] = sc * (_Float16)(float)(int)w0[i];
+            a1[i] = sc * (_Float16)(float)(int)w1[i];
+        }
+
+#pragma unroll
+        for (uint32_t ntile = 0; ntile < N_TILES_PER_WAVE; ntile++) {
+            const uint32_t nt = ntile * 16u + lane16;
+            /* nt * K_TILE and kgrp * 4 are both multiples of four halves, so
+             * these stay 8-byte aligned for the vector load. */
+            const _Float16 *xb = lds_x + nt * K_TILE + kgrp * 4u;
+            const ds4_q8_half4_t b0 = *(const ds4_q8_half4_t *)(xb);
+            const ds4_q8_half4_t b1 = *(const ds4_q8_half4_t *)(xb + 16u);
+            if (ntile == 0u) {
+                acc0 = __builtin_amdgcn_mfma_f32_16x16x16f16(a0, b0, acc0, 0, 0, 0);
+                acc0 = __builtin_amdgcn_mfma_f32_16x16x16f16(a1, b1, acc0, 0, 0, 0);
+            } else if (ntile == 1u) {
+                acc1 = __builtin_amdgcn_mfma_f32_16x16x16f16(a0, b0, acc1, 0, 0, 0);
+                acc1 = __builtin_amdgcn_mfma_f32_16x16x16f16(a1, b1, acc1, 0, 0, 0);
+            } else if (ntile == 2u) {
+                acc2 = __builtin_amdgcn_mfma_f32_16x16x16f16(a0, b0, acc2, 0, 0, 0);
+                acc2 = __builtin_amdgcn_mfma_f32_16x16x16f16(a1, b1, acc2, 0, 0, 0);
+            } else {
+                acc3 = __builtin_amdgcn_mfma_f32_16x16x16f16(a0, b0, acc3, 0, 0, 0);
+                acc3 = __builtin_amdgcn_mfma_f32_16x16x16f16(a1, b1, acc3, 0, 0, 0);
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (uint32_t ntile = 0; ntile < N_TILES_PER_WAVE; ntile++) {
+        const uint32_t tok = block_n + ntile * 16u + lane16;
+        if (tok >= n_tokens) continue;
+        ds4_q8_float4_t acc = ntile == 0u ? acc0 : (ntile == 1u ? acc1 : (ntile == 2u ? acc2 : acc3));
+#pragma unroll
+        for (uint32_t i = 0; i < 4u; i++) {
+            const uint32_t row = wave_m + 4u * kgrp + i;
+            if (row < out_dim) out[(uint64_t)tok * out_dim + row] = acc[i];
+        }
+    }
+#else
+    (void)out; (void)w; (void)x;
+    (void)n_tokens; (void)in_dim; (void)out_dim; (void)row_bytes;
+#endif /* DS4_ROCM_HAS_MFMA_W64 */
 }
 
 template <int TILES_N=8, int BM=16, int BN=16, int BK=16>
@@ -944,6 +1083,85 @@ __global__ static void matmul_q8_0_pair_f32_sharedx_warp_rows_w32_kernel(
         if (row < out1_dim) out1[row] = acc1;
     }
 }
+
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+/* Full-wavefront reduction for the wave64-native pair kernel below: same
+ * shuffle-down tree as warp_sum_f32, just spanning all 64 lanes of a CDNA
+ * wavefront instead of a masked 32-lane half. Only ever compiled/launched on
+ * wave64 parts, so no CUDA/wave32 fallback branch is needed here. */
+__device__ static float warp_sum_f32_w64(float v) {
+    for (int offset = 32; offset > 0; offset >>= 1) {
+        v += __shfl_down(v, offset, 64);
+    }
+    return v;
+}
+
+/* Wave64-native counterpart of matmul_q8_0_pair_f32_sharedx_warp_rows_w32_kernel
+ * above. That kernel assigns one Q8_0 block (32 elements) per 32-lane group and
+ * treats each 32-lane half of a 64-lane wavefront as an independent row, which
+ * is correct on CDNA (via the sub-wave shuffle masking in q8_0_scale_broadcast_w32
+ * / warp_sum_f32) but never uses the two halves' results together. This variant
+ * instead has every lane of a 64-lane wavefront cooperate on ONE row: lanes 0-31
+ * consume even-indexed Q8_0 blocks and lanes 32-63 consume odd-indexed blocks in
+ * the same iteration (each half still reads one whole block per iteration, same
+ * as the w32 kernel, so q8_0_scale_broadcast_w32's existing 32-lane-group
+ * broadcast stays correct unchanged), halving the number of loop iterations per
+ * row, then combines both halves with one 64-wide reduction at the end instead
+ * of two independent 32-wide reductions for two separate rows. */
+__global__ static void matmul_q8_0_pair_f32_sharedx_warp_rows_w64_kernel(
+        float *out0,
+        float *out1,
+        const unsigned char *w0,
+        const unsigned char *w1,
+        const float *x,
+        uint32_t n_blocks,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        uint64_t row_bytes) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 63u;
+    const uint32_t wave = tid >> 6u;
+    const uint32_t rows_per_block = blockDim.x >> 6u;
+    const uint32_t in_dim = n_blocks << 5u;
+    for (uint32_t i = tid; i < in_dim; i += blockDim.x) shx[i] = x[i];
+    __syncthreads();
+
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + wave;
+    if (row >= out0_dim && row >= out1_dim) return;
+    const unsigned char *wr0 = row < out0_dim ? w0 + row * row_bytes : NULL;
+    const unsigned char *wr1 = row < out1_dim ? w1 + row * row_bytes : NULL;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint32_t half = lane >> 5u;
+    const uint32_t sub_lane = lane & 31u;
+    const uint32_t n_pairs = (n_blocks + 1u) >> 1u;
+    for (uint32_t p = 0; p < n_pairs; p++) {
+        const uint32_t b = p * 2u + half;
+        if (b < n_blocks) {
+            const float xv = shx[(b << 5u) + sub_lane];
+            if (wr0) {
+                const unsigned char *blk = wr0 + (uint64_t)b * 34u;
+                const float d = q8_0_scale_broadcast_w32(blk);
+                const int8_t q = ((const int8_t *)(blk + 2u))[sub_lane];
+                acc0 += d * (float)q * xv;
+            }
+            if (wr1) {
+                const unsigned char *blk = wr1 + (uint64_t)b * 34u;
+                const float d = q8_0_scale_broadcast_w32(blk);
+                const int8_t q = ((const int8_t *)(blk + 2u))[sub_lane];
+                acc1 += d * (float)q * xv;
+            }
+        }
+    }
+    acc0 = warp_sum_f32_w64(acc0);
+    acc1 = warp_sum_f32_w64(acc1);
+    if (lane == 0u) {
+        if (row < out0_dim) out0[row] = acc0;
+        if (row < out1_dim) out1[row] = acc1;
+    }
+}
+#endif
 
 __global__ static void shared_gate_up_swiglu_q8_0_rows_w32_kernel(
         float *gate,
@@ -1150,7 +1368,7 @@ __device__ static float warp_sum_f32_oldhip_w32(float v) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         v += __shfl_down(v, offset, 32);
 #else
-        v += __shfl_down_sync(FULL_WARP_MASK, v, offset, 32);
+        v += __shfl_down_sync(DS4_WARP32_MASK, v, offset, 32);
 #endif
     }
     return v;
@@ -1162,7 +1380,7 @@ __device__ static float q8_0_scale_broadcast_oldhip_w32(const unsigned char *blk
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
     return __shfl(d, 0, 32);
 #else
-    return __shfl_sync(FULL_WARP_MASK, d, 0, 32);
+    return __shfl_sync(DS4_WARP32_MASK, d, 0, 32);
 #endif
 }
 
