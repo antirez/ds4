@@ -812,7 +812,7 @@ static int g_ds4_lock_fd = -1;
  *
  * These layouts and IQ2 tables match the GGUF quantized tensor format,
  * reduced to only the formats ds4.c currently reads or sizes:
- *   - Q2_K routed down experts
+ *   - Q2_K/Q3_K routed experts
  *   - Q4_K routed experts in the high-memory variant
  *   - Q5_K/Q6_K GLM routed experts
  *   - IQ2_XXS routed gate/up experts
@@ -828,6 +828,13 @@ typedef struct {
     uint16_t d;
     uint16_t dmin;
 } block_q2_K;
+
+typedef struct {
+    uint8_t  hmask[QK_K / 8];
+    uint8_t  qs[QK_K / 4];
+    uint8_t  scales[12];
+    uint16_t d;
+} block_q3_K;
 
 typedef struct {
     uint16_t d;
@@ -869,6 +876,7 @@ typedef struct {
 
 #define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
 DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
+DS4_STATIC_ASSERT(ds4_block_q3_k_size, sizeof(block_q3_K) == 110);
 DS4_STATIC_ASSERT(ds4_block_q4_k_size, sizeof(block_q4_K) == 144);
 DS4_STATIC_ASSERT(ds4_block_q5_k_size, sizeof(block_q5_K) == 176);
 DS4_STATIC_ASSERT(ds4_block_q6_k_size, sizeof(block_q6_K) == 210);
@@ -2131,6 +2139,7 @@ enum {
     DS4_TENSOR_Q4_0     = 2,
     DS4_TENSOR_Q8_0     = 8,
     DS4_TENSOR_Q2_K     = 10,
+    DS4_TENSOR_Q3_K     = 11,
     DS4_TENSOR_Q4_K     = 12,
     DS4_TENSOR_Q5_K     = 13,
     DS4_TENSOR_Q6_K     = 14,
@@ -4506,6 +4515,7 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 ||
            type == DS4_TENSOR_IQ2_XXS ||
            type == DS4_TENSOR_Q2_K ||
+           type == DS4_TENSOR_Q3_K ||
            type == DS4_TENSOR_Q4_K ||
            type == DS4_TENSOR_Q5_K ||
            type == DS4_TENSOR_Q6_K ||
@@ -4517,6 +4527,7 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     case DS4_TENSOR_Q8_0:    return 34;
     case DS4_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
     case DS4_TENSOR_Q2_K:    return sizeof(block_q2_K);
+    case DS4_TENSOR_Q3_K:    return sizeof(block_q3_K);
     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
     case DS4_TENSOR_Q5_K:    return sizeof(block_q5_K);
     case DS4_TENSOR_Q6_K:    return sizeof(block_q6_K);
@@ -5171,7 +5182,6 @@ static void weights_validate_laguna_layout(
                              2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
 
-    uint32_t routed_type = UINT32_MAX;
     for (uint32_t il = layer_start; il <= layer_end; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (!weights_laguna_layer_has_required(l, il)) {
@@ -5220,31 +5230,24 @@ static void weights_validate_laguna_layout(
                              2, DS4_N_EMBD, DS4_N_EXPERT, 0);
         tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32,
                              1, DS4_N_EXPERT, 0, 0);
+        /* Mixed files may spend more bits on selected layers, but all three
+         * routed projections within one layer must use a coherent layout. */
         const uint32_t layer_routed_type = l->ffn_gate_exps->type;
         if (layer_routed_type != DS4_TENSOR_Q4_K &&
+            layer_routed_type != DS4_TENSOR_Q3_K &&
             layer_routed_type != DS4_TENSOR_Q2_K) {
             fprintf(stderr,
                     "ds4: Laguna routed experts for layer %u have unsupported type %s\n",
                     il, tensor_type_name(layer_routed_type));
             exit(1);
         }
-        if (routed_type == UINT32_MAX) {
-            routed_type = layer_routed_type;
-        } else if (layer_routed_type != routed_type) {
-            fprintf(stderr,
-                    "ds4: Laguna routed expert quantization changes from %s to %s at layer %u\n",
-                    tensor_type_name(routed_type),
-                    tensor_type_name(layer_routed_type),
-                    il);
-            exit(1);
-        }
-        tensor_expect_layout(l->ffn_gate_exps, routed_type,
+        tensor_expect_layout(l->ffn_gate_exps, layer_routed_type,
                              3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        tensor_expect_layout(l->ffn_up_exps, routed_type,
+        tensor_expect_layout(l->ffn_up_exps, layer_routed_type,
                              3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
         const bool down_supported =
-            l->ffn_down_exps->type == routed_type ||
-            (routed_type == DS4_TENSOR_Q4_K &&
+            l->ffn_down_exps->type == layer_routed_type ||
+            (layer_routed_type == DS4_TENSOR_Q4_K &&
              !signal_q8 &&
              l->ffn_down_exps->type == DS4_TENSOR_Q6_K);
         if (!down_supported) {
@@ -5253,7 +5256,7 @@ static void weights_validate_laguna_layout(
                     "incompatible with %s gate/up experts\n",
                     il,
                     tensor_type_name(l->ffn_down_exps->type),
-                    tensor_type_name(routed_type));
+                    tensor_type_name(layer_routed_type));
             exit(1);
         }
         tensor_expect_layout(l->ffn_down_exps, l->ffn_down_exps->type,
