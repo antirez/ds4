@@ -20788,6 +20788,45 @@ __global__ static void moe_down_f32_kernel(
     }
     if (threadIdx.x == 0) down_out[(uint64_t)pair * out_dim + row] = partial[0];
 }
+__global__ static void moe_down_iq2_xxs_f32_kernel(
+        float *down_out,
+        const char *down_base,
+        const float *mid,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        uint32_t n_expert) {
+    uint32_t row = blockIdx.x;
+    uint32_t pair = blockIdx.y;
+    if (row >= out_dim) return;
+    uint32_t tok = pair / n_expert;
+    uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    const uint32_t nb = expert_mid_dim / CUDA_QK_K;
+    const cuda_block_iq2_xxs *wr =
+        (const cuda_block_iq2_xxs *)(down_base +
+            (uint64_t)(uint32_t)expert_i * down_expert_bytes +
+            (uint64_t)row * down_row_bytes);
+    const float *xr = mid + (uint64_t)pair * expert_mid_dim;
+    float acc = 0.0f;
+    for (uint32_t b = threadIdx.x; b < nb; b += blockDim.x) {
+        acc += dev_iq2_xxs_dot_f32(
+                wr + b, xr + (uint64_t)b * CUDA_QK_K, 1);
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = acc;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        down_out[(uint64_t)pair * out_dim + row] = partial[0];
+    }
+}
 
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
@@ -20834,7 +20873,9 @@ static int routed_moe_launch(
         return 0;
     }
     const int q4k_path = (gate_type == 12u && down_type == 12u);
-    if (!q4k_path && (gate_type != 16u || down_type != 10u)) return 0;
+    const int iq2_xxs_path = (gate_type == 16u && down_type == 16u);
+    if (!q4k_path && !iq2_xxs_path &&
+        (gate_type != 16u || down_type != 10u)) return 0;
     /* Q4_K routed-MoE dispatch:
      *   n_tokens == 1 and n_expert == 6:
      *                  use_direct_down_sum + moe_gate_up_mid_decode_q4K_qwarp32
@@ -20902,6 +20943,50 @@ static int routed_moe_launch(
         cuda_resolve_weight_ptr(model_map, down_offset, down_bytes,
                                 logical_tier, "moe_down");
     if (!gate_w || !up_w || !down_w) return 0;
+    if (iq2_xxs_path) {
+        dim3 mgrid(expert_mid_dim, n_tokens * n_expert, 1);
+        moe_gate_up_mid_f32_kernel<<<mgrid, 256>>>(
+            (float *)gate->ptr,
+            (float *)up->ptr,
+            (float *)mid->ptr,
+            gate_w,
+            up_w,
+            (const float *)x->ptr,
+            (const int32_t *)selected->ptr,
+            (const float *)weights->ptr,
+            gate_expert_bytes,
+            gate_row_bytes,
+            expert_in_dim,
+            expert_mid_dim,
+            n_expert,
+            clamp);
+        int ok = cuda_ok(cudaGetLastError(), "routed_moe IQ2_XXS gate/up launch");
+        if (ok) {
+            dim3 dgrid(out_dim, n_tokens * n_expert, 1);
+            moe_down_iq2_xxs_f32_kernel<<<dgrid, 256>>>(
+                (float *)down->ptr,
+                down_w,
+                (const float *)mid->ptr,
+                (const int32_t *)selected->ptr,
+                down_expert_bytes,
+                down_row_bytes,
+                expert_mid_dim,
+                out_dim,
+                n_expert);
+            ok = cuda_ok(cudaGetLastError(), "routed_moe IQ2_XXS down launch");
+        }
+        if (ok) {
+            const uint64_t n = (uint64_t)n_tokens * out_dim;
+            moe_sum_kernel<<<(n + 255) / 256, 256>>>(
+                (float *)out->ptr,
+                (const float *)down->ptr,
+                out_dim,
+                n_expert,
+                n_tokens);
+            ok = cuda_ok(cudaGetLastError(), "routed_moe IQ2_XXS sum launch");
+        }
+        return ok;
+    }
 
     int ok = 1;
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;

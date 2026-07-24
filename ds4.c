@@ -3808,6 +3808,16 @@ static float ds4_vec_dot_iq2_xxs_f32(int n, const block_iq2_xxs *x, const float 
 
     return sumf;
 }
+#ifdef DS4_TEST_HOOKS
+float ds4_test_iq2_xxs_dot_f32(uint32_t n, const void *blocks, const float *values) {
+    if (!blocks || !values || n == 0 || n % QK_K != 0 || n > INT_MAX) {
+        return NAN;
+    }
+    return ds4_vec_dot_iq2_xxs_f32((int)n,
+                                   (const block_iq2_xxs *)blocks,
+                                   values);
+}
+#endif
 
 static void ds4_vec_dot_q8_K_q8_K(int n, float *s,
                                   const block_q8_K *x,
