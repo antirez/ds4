@@ -5171,6 +5171,7 @@ static void weights_validate_laguna_layout(
                              2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
 
+    uint32_t routed_type = UINT32_MAX;
     for (uint32_t il = layer_start; il <= layer_end; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (!weights_laguna_layer_has_required(l, il)) {
@@ -5219,15 +5220,40 @@ static void weights_validate_laguna_layout(
                              2, DS4_N_EMBD, DS4_N_EXPERT, 0);
         tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32,
                              1, DS4_N_EXPERT, 0, 0);
-        tensor_expect_layout(l->ffn_gate_exps, DS4_TENSOR_Q4_K,
-                             3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        tensor_expect_layout(l->ffn_up_exps, DS4_TENSOR_Q4_K,
-                             3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        if (l->ffn_down_exps->type != DS4_TENSOR_Q4_K &&
-            (signal_q8 || l->ffn_down_exps->type != DS4_TENSOR_Q6_K)) {
+        const uint32_t layer_routed_type = l->ffn_gate_exps->type;
+        if (layer_routed_type != DS4_TENSOR_Q4_K &&
+            layer_routed_type != DS4_TENSOR_Q2_K) {
             fprintf(stderr,
-                    "ds4: Laguna routed down tensor for layer %u has unsupported type %s\n",
-                    il, tensor_type_name(l->ffn_down_exps->type));
+                    "ds4: Laguna routed experts for layer %u have unsupported type %s\n",
+                    il, tensor_type_name(layer_routed_type));
+            exit(1);
+        }
+        if (routed_type == UINT32_MAX) {
+            routed_type = layer_routed_type;
+        } else if (layer_routed_type != routed_type) {
+            fprintf(stderr,
+                    "ds4: Laguna routed expert quantization changes from %s to %s at layer %u\n",
+                    tensor_type_name(routed_type),
+                    tensor_type_name(layer_routed_type),
+                    il);
+            exit(1);
+        }
+        tensor_expect_layout(l->ffn_gate_exps, routed_type,
+                             3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_layout(l->ffn_up_exps, routed_type,
+                             3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        const bool down_supported =
+            l->ffn_down_exps->type == routed_type ||
+            (routed_type == DS4_TENSOR_Q4_K &&
+             !signal_q8 &&
+             l->ffn_down_exps->type == DS4_TENSOR_Q6_K);
+        if (!down_supported) {
+            fprintf(stderr,
+                    "ds4: Laguna routed down tensor for layer %u has type %s, "
+                    "incompatible with %s gate/up experts\n",
+                    il,
+                    tensor_type_name(l->ffn_down_exps->type),
+                    tensor_type_name(routed_type));
             exit(1);
         }
         tensor_expect_layout(l->ffn_down_exps, l->ffn_down_exps->type,
@@ -49552,8 +49578,8 @@ static bool laguna_graph_forward_token(
                 .down_row_bytes = shared_down_row_bytes,
             };
             /* The legacy recipe can co-dispatch routed and shared Q4 work.
-             * The replacement keeps routed experts Q4 but makes the shared
-             * expert Q8, so each uses its native fast kernel family. */
+             * Revised layouts keep one routed quantization but make the
+             * shared expert Q8, so each uses its native fast kernel family. */
             if (ok && l->ffn_gate_shexp->type == DS4_TENSOR_Q4_K) {
                 ok = ds4_gpu_laguna_routed_shared_moe_one_tensor(
                         g->ffn_out,
