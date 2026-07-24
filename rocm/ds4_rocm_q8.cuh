@@ -1084,6 +1084,85 @@ __global__ static void matmul_q8_0_pair_f32_sharedx_warp_rows_w32_kernel(
     }
 }
 
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+/* Full-wavefront reduction for the wave64-native pair kernel below: same
+ * shuffle-down tree as warp_sum_f32, just spanning all 64 lanes of a CDNA
+ * wavefront instead of a masked 32-lane half. Only ever compiled/launched on
+ * wave64 parts, so no CUDA/wave32 fallback branch is needed here. */
+__device__ static float warp_sum_f32_w64(float v) {
+    for (int offset = 32; offset > 0; offset >>= 1) {
+        v += __shfl_down(v, offset, 64);
+    }
+    return v;
+}
+
+/* Wave64-native counterpart of matmul_q8_0_pair_f32_sharedx_warp_rows_w32_kernel
+ * above. That kernel assigns one Q8_0 block (32 elements) per 32-lane group and
+ * treats each 32-lane half of a 64-lane wavefront as an independent row, which
+ * is correct on CDNA (via the sub-wave shuffle masking in q8_0_scale_broadcast_w32
+ * / warp_sum_f32) but never uses the two halves' results together. This variant
+ * instead has every lane of a 64-lane wavefront cooperate on ONE row: lanes 0-31
+ * consume even-indexed Q8_0 blocks and lanes 32-63 consume odd-indexed blocks in
+ * the same iteration (each half still reads one whole block per iteration, same
+ * as the w32 kernel, so q8_0_scale_broadcast_w32's existing 32-lane-group
+ * broadcast stays correct unchanged), halving the number of loop iterations per
+ * row, then combines both halves with one 64-wide reduction at the end instead
+ * of two independent 32-wide reductions for two separate rows. */
+__global__ static void matmul_q8_0_pair_f32_sharedx_warp_rows_w64_kernel(
+        float *out0,
+        float *out1,
+        const unsigned char *w0,
+        const unsigned char *w1,
+        const float *x,
+        uint32_t n_blocks,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        uint64_t row_bytes) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 63u;
+    const uint32_t wave = tid >> 6u;
+    const uint32_t rows_per_block = blockDim.x >> 6u;
+    const uint32_t in_dim = n_blocks << 5u;
+    for (uint32_t i = tid; i < in_dim; i += blockDim.x) shx[i] = x[i];
+    __syncthreads();
+
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + wave;
+    if (row >= out0_dim && row >= out1_dim) return;
+    const unsigned char *wr0 = row < out0_dim ? w0 + row * row_bytes : NULL;
+    const unsigned char *wr1 = row < out1_dim ? w1 + row * row_bytes : NULL;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint32_t half = lane >> 5u;
+    const uint32_t sub_lane = lane & 31u;
+    const uint32_t n_pairs = (n_blocks + 1u) >> 1u;
+    for (uint32_t p = 0; p < n_pairs; p++) {
+        const uint32_t b = p * 2u + half;
+        if (b < n_blocks) {
+            const float xv = shx[(b << 5u) + sub_lane];
+            if (wr0) {
+                const unsigned char *blk = wr0 + (uint64_t)b * 34u;
+                const float d = q8_0_scale_broadcast_w32(blk);
+                const int8_t q = ((const int8_t *)(blk + 2u))[sub_lane];
+                acc0 += d * (float)q * xv;
+            }
+            if (wr1) {
+                const unsigned char *blk = wr1 + (uint64_t)b * 34u;
+                const float d = q8_0_scale_broadcast_w32(blk);
+                const int8_t q = ((const int8_t *)(blk + 2u))[sub_lane];
+                acc1 += d * (float)q * xv;
+            }
+        }
+    }
+    acc0 = warp_sum_f32_w64(acc0);
+    acc1 = warp_sum_f32_w64(acc1);
+    if (lane == 0u) {
+        if (row < out0_dim) out0[row] = acc0;
+        if (row < out1_dim) out1[row] = acc1;
+    }
+}
+#endif
+
 __global__ static void shared_gate_up_swiglu_q8_0_rows_w32_kernel(
         float *gate,
         float *up,

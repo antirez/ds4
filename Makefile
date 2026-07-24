@@ -169,6 +169,30 @@ test-rocm-matmul-q8:
 	$(MAKE) tests/test_rocm_matmul_q8 $(ROCM_BUILD_VARS)
 	./tests/test_rocm_matmul_q8
 
+tests/test_rocm_matmul_pair_q8.o: tests/test_rocm_matmul_pair_q8.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_rocm_matmul_pair_q8: tests/test_rocm_matmul_pair_q8.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+# Needs a real GPU.  Run after a ROCm build, e.g.
+#   make mi200 && make test-rocm-matmul-pair-q8 ROCM_ARCH=gfx90a
+test-rocm-matmul-pair-q8:
+	$(MAKE) tests/test_rocm_matmul_pair_q8 $(ROCM_BUILD_VARS)
+	./tests/test_rocm_matmul_pair_q8
+
+tests/test_rocm_moe_gate_up_mid_hwarp32.o: tests/test_rocm_moe_gate_up_mid_hwarp32.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_rocm_moe_gate_up_mid_hwarp32: tests/test_rocm_moe_gate_up_mid_hwarp32.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+# Needs a real GPU.  Run after a ROCm build, e.g.
+#   make mi200 && make test-rocm-moe-gate-up-mid-hwarp32 ROCM_ARCH=gfx90a
+test-rocm-moe-gate-up-mid-hwarp32:
+	$(MAKE) tests/test_rocm_moe_gate_up_mid_hwarp32 $(ROCM_BUILD_VARS)
+	./tests/test_rocm_moe_gate_up_mid_hwarp32
+
 ds4: ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 

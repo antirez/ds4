@@ -1428,6 +1428,36 @@ static int routed_moe_launch(
                         write_gate_up,
                         clamp);
                 } else if (use_decode_lut_gate) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+                    /* See moe_gate_up_mid_decode_lut_hwarp32_kernel's comment:
+                     * only a win when xq_blocks divides evenly into 16, so
+                     * every lane of the wider group does useful work every
+                     * iteration. Any other wave size or shape falls through
+                     * to the always-correct qwarp32 kernel below. This kernel
+                     * covers half as many rows per block as qwarp32 (64 vs
+                     * 128), so its grid needs twice as many blocks to cover
+                     * the same expert_mid_dim range -- do not reuse qgrid. */
+                    if (cuda_device_wave_size() == 64 && (xq_blocks % 16u) == 0u) {
+                        dim3 qgrid_hwarp32((expert_mid_dim + 63u) / 64u, pair_count, 1);
+                        moe_gate_up_mid_decode_lut_hwarp32_kernel<<<qgrid_hwarp32, 256>>>(
+                            (float *)gate->ptr,
+                            (float *)up->ptr,
+                            (float *)mid->ptr,
+                            gate_w,
+                            up_w,
+                            xq,
+                            (const int32_t *)selected_exec->ptr,
+                            (const float *)weights->ptr,
+                            gate_expert_bytes,
+                            gate_row_bytes,
+                            xq_blocks,
+                            expert_mid_dim,
+                            n_expert,
+                            write_gate_up,
+                            0xffffffffu,
+                            clamp);
+                    } else
+#endif
                     moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
@@ -2562,4 +2592,58 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x, layer_index, n_tokens,
                              force_resident);
+}
+
+/* Test-only direct entry point for moe_gate_up_mid_decode_lut_qwarp32_kernel
+ * / moe_gate_up_mid_decode_lut_hwarp32_kernel, bypassing the routed-MoE
+ * expert-selection/sorting machinery above so tests/test_rocm_moe_gate_up_mid_hwarp32.c
+ * can drive either kernel directly with synthetic data. force_kernel: 0 = use
+ * the same auto-dispatch condition as the real call site, 1 = force qwarp32,
+ * 2 = force hwarp32 (undefined/asserts out on non-wave64 builds since the
+ * kernel doesn't exist there). */
+extern "C" int ds4_gpu_test_moe_gate_up_mid_decode_lut_tensor(
+        ds4_gpu_tensor *gate_out,
+        ds4_gpu_tensor *up_out,
+        ds4_gpu_tensor *mid_out,
+        const ds4_gpu_tensor *gate_base,
+        const ds4_gpu_tensor *up_base,
+        const ds4_gpu_tensor *xq,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t n_tok,
+        uint32_t write_aux,
+        float clamp,
+        int force_kernel) {
+    if (!gate_out || !up_out || !mid_out || !gate_base || !up_base || !xq || !selected || !weights) return 0;
+    dim3 qgrid((expert_mid_dim + 127u) / 128u, n_tok * n_expert, 1);
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    const int use_hwarp32 = force_kernel == 2 ||
+        (force_kernel == 0 && cuda_device_wave_size() == 64 && (xq_blocks % 16u) == 0u);
+    if (use_hwarp32) {
+        dim3 qgrid_hwarp32((expert_mid_dim + 63u) / 64u, n_tok * n_expert, 1);
+        moe_gate_up_mid_decode_lut_hwarp32_kernel<<<qgrid_hwarp32, 256>>>(
+                (float *)gate_out->ptr, (float *)up_out->ptr, (float *)mid_out->ptr,
+                (const char *)gate_base->ptr, (const char *)up_base->ptr,
+                (const cuda_block_q8_K *)xq->ptr, (const int32_t *)selected->ptr,
+                (const float *)weights->ptr,
+                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                write_aux, 0xffffffffu, clamp);
+        return cuda_ok(cudaGetLastError(), "test moe_gate_up_mid_decode_lut_hwarp32 launch");
+    }
+#else
+    (void)force_kernel;
+#endif
+    moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256>>>(
+            (float *)gate_out->ptr, (float *)up_out->ptr, (float *)mid_out->ptr,
+            (const char *)gate_base->ptr, (const char *)up_base->ptr,
+            (const cuda_block_q8_K *)xq->ptr, (const int32_t *)selected->ptr,
+            (const float *)weights->ptr,
+            gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+            write_aux, 0xffffffffu, clamp);
+    return cuda_ok(cudaGetLastError(), "test moe_gate_up_mid_decode_lut_qwarp32 launch");
 }
