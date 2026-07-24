@@ -704,17 +704,17 @@ static int check_attention(void) {
 
 static int check_dflash_blackwell_attention(void) {
     enum {
-        n_tokens = 3,
+        n_tokens = 17,
         n_head = 72,
         n_head_kv = 8,
-        cache_cap = 4
+        cache_cap = 20
     };
     const uint64_t q_values = (uint64_t)n_tokens * n_head * HEAD_DIM;
     const uint64_t kv_values =
         (uint64_t)n_tokens * n_head_kv * HEAD_DIM;
     float q[q_values], k[kv_values], v[kv_values];
     float gate[n_tokens * n_head];
-    float portable[q_values], blackwell[q_values];
+    float portable[q_values], untiled[q_values], blackwell[q_values];
     for (uint64_t i = 0; i < q_values; i++) {
         q[i] = 0.015625f * (float)(1u + i % 13u);
     }
@@ -760,6 +760,17 @@ static int check_dflash_blackwell_attention(void) {
           "portable DFlash attention");
     CHECK(unsetenv("DS4_CUDA_DFLASH_NO_BLACKWELL") == 0,
           "select Blackwell DFlash attention");
+    CHECK(setenv("DS4_CUDA_LAGUNA_NO_TILED_GQA_PREFILL", "1", 1) == 0,
+          "select untiled Blackwell DFlash attention");
+    CHECK(ds4_gpu_laguna_attention_prefill_tensor(
+              heads, key_cache, value_cache, staged_key, staged_value,
+              q_t, k_t, v_t, gate_t, 0u, n_tokens, cache_cap,
+              n_head, n_head_kv, HEAD_DIM,
+              1.0f / sqrtf((float)HEAD_DIM)) &&
+          ds4_gpu_tensor_read(heads, 0, untiled, sizeof(untiled)),
+          "untiled Blackwell DFlash attention");
+    CHECK(unsetenv("DS4_CUDA_LAGUNA_NO_TILED_GQA_PREFILL") == 0,
+          "select tiled Blackwell DFlash attention");
     CHECK(ds4_gpu_laguna_attention_prefill_tensor(
               heads, key_cache, value_cache, staged_key, staged_value,
               q_t, k_t, v_t, gate_t, 0u, n_tokens, cache_cap,
@@ -768,6 +779,8 @@ static int check_dflash_blackwell_attention(void) {
           ds4_gpu_tensor_read(heads, 0, blackwell, sizeof(blackwell)),
           "Blackwell DFlash attention");
     for (uint64_t i = 0; i < q_values; i++) {
+        CHECK(close_enough(blackwell[i], untiled[i], 1e-6f, 1e-6f),
+              "tiled Blackwell DFlash attention equivalence");
         CHECK(close_enough(blackwell[i], portable[i], 1e-6f, 1e-6f),
               "Blackwell DFlash attention equivalence");
     }

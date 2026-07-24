@@ -232,7 +232,11 @@ CUDA Laguna prefill similarly runs one warp per query head on Blackwell and
 uses exact INT8 tensor-core kernels for large Q4_K routed-expert batches.
 `DS4_CUDA_LAGUNA_NO_WARP_GQA_PREFILL=1` and
 `DS4_CUDA_LAGUNA_NO_Q4_MMA=1` select the respective portable kernels for
-comparison or rollback.
+comparison or rollback. For narrower A/B tests,
+`DS4_CUDA_LAGUNA_NO_TILED_GQA_PREFILL=1` retains the warp-per-head kernel but
+stages one K/V row at a time, while
+`DS4_CUDA_LAGUNA_NO_Q4_MMA_TILE16=1` retains the eight-pair tensor-core MoE
+tile.
 
 The shipped GGUF is configured for a 262144-token context. Laguna defaults to
 temperature 1.0, top-k 20, top-p 1.0, and min-p 0; explicit sampling options

@@ -23289,7 +23289,13 @@ static int cuda_q4_mma_tile16_shmem_ok(int which_down) {
     cudaError_t err = which_down
         ? cudaFuncGetAttributes(&fn_attr, moe_down_q4K_tile16_mma_kernel<512>)
         : cudaFuncGetAttributes(&fn_attr, moe_gate_up_mid_q4K_tile16_mma_kernel<512>);
-    if (err != cudaSuccess || fn_attr.binaryVersion < 80) {
+    /* A lower virtual architecture can be forward-JITed to a Blackwell
+     * binaryVersion even though the __CUDA_ARCH__-guarded mma16 body compiled
+     * to a no-op.  Require both attributes so sm_75 compatibility builds
+     * cannot accidentally select the sm_80+ tile16 kernels. */
+    if (err != cudaSuccess ||
+        fn_attr.binaryVersion < 80 ||
+        fn_attr.ptxVersion < 80) {
         failed = 1;
         return 0;
     }
@@ -32054,7 +32060,8 @@ __global__ static void laguna_attention_prefill_gqa_kernel(
  * reductions behind eight block-wide barriers per key.  Here the warps run
  * those reductions concurrently.  K/V still enters shared memory only once
  * per group and key, so the extra parallelism does not multiply global-memory
- * traffic.
+ * traffic.  KEY_TILE stages consecutive rows together, amortizing the two
+ * block-wide barriers while retaining the original per-key softmax order.
  *
  * Build the first two reduction levels explicitly in the same order as the
  * 128-thread tree:
@@ -32064,7 +32071,7 @@ __global__ static void laguna_attention_prefill_gqa_kernel(
  * The remaining warp shuffle tree corresponds to strides 16..1.  The explicit
  * round-to-nearest intrinsics prevent contraction from changing that order,
  * retaining the established prefill arithmetic. */
-template <uint32_t HEADS_PER_KV>
+template <uint32_t HEADS_PER_KV, uint32_t KEY_TILE>
 __global__ static void laguna_attention_prefill_warp_gqa_kernel(
         float *out,
         const float *q,
@@ -32099,8 +32106,8 @@ __global__ static void laguna_attention_prefill_warp_gqa_kernel(
     const uint32_t head = head0 + head_in_group;
     const float *qh =
         q + ((uint64_t)token * n_head + head) * head_dim;
-    __shared__ __half shared_key[128];
-    __shared__ __half shared_value[128];
+    __shared__ __align__(16) __half shared_key[KEY_TILE][128];
+    __shared__ __align__(16) __half shared_value[KEY_TILE][128];
 
     float acc0 = 0.0f;
     float acc1 = 0.0f;
@@ -32108,55 +32115,77 @@ __global__ static void laguna_attention_prefill_warp_gqa_kernel(
     float acc3 = 0.0f;
     float score_sum = 0.0f;
     float max_score = -INFINITY;
-    for (uint32_t key_pos = key_start; key_pos <= query_pos; key_pos++) {
-        const bool current = key_pos >= pos0;
-        const uint32_t source_row =
-            current ? key_pos - pos0 : key_pos % cache_cap;
-        const uint64_t kv_base =
-            (uint64_t)source_row * width +
-            (uint64_t)kv_head * head_dim;
-        for (uint32_t d = tid; d < 128u;
-             d += HEADS_PER_KV * 32u) {
-            shared_key[d] = current ?
-                staged_key[kv_base + d] : key_cache[kv_base + d];
-            shared_value[d] = current ?
-                staged_value[kv_base + d] : value_cache[kv_base + d];
+    for (uint32_t key_tile = key_start; key_tile <= query_pos;
+         key_tile += KEY_TILE) {
+        uint32_t tile_keys = query_pos - key_tile + 1u;
+        if (tile_keys > KEY_TILE) tile_keys = KEY_TILE;
+        const uint32_t loader_group = tid >> 4u;
+        const uint32_t vec = tid & 15u;
+        const uint32_t loader_groups = HEADS_PER_KV * 2u;
+        for (uint32_t kt = loader_group; kt < tile_keys;
+             kt += loader_groups) {
+            const uint32_t key_pos = key_tile + kt;
+            const bool current = key_pos >= pos0;
+            const uint32_t source_row =
+                current ? key_pos - pos0 : key_pos % cache_cap;
+            const uint64_t kv_base =
+                (uint64_t)source_row * width +
+                (uint64_t)kv_head * head_dim;
+            const __half *key_src =
+                (current ? staged_key : key_cache) + kv_base;
+            const __half *value_src =
+                (current ? staged_value : value_cache) + kv_base;
+            ((uint4 *)shared_key[kt])[vec] =
+                ((const uint4 *)key_src)[vec];
+            ((uint4 *)shared_value[kt])[vec] =
+                ((const uint4 *)value_src)[vec];
         }
         __syncthreads();
 
-        const float key0 = __half2float(shared_key[lane]);
-        const float key1 = __half2float(shared_key[lane + 32u]);
-        const float key2 = __half2float(shared_key[lane + 64u]);
-        const float key3 = __half2float(shared_key[lane + 96u]);
-        const float pair0 = __fadd_rn(
-                __fmul_rn(qh[lane], key0),
-                __fmul_rn(qh[lane + 64u], key2));
-        const float pair1 = __fadd_rn(
-                __fmul_rn(qh[lane + 32u], key1),
-                __fmul_rn(qh[lane + 96u], key3));
-        float score = warp_sum_f32(__fadd_rn(pair0, pair1));
+        for (uint32_t kt = 0u; kt < tile_keys; kt++) {
+            const float key0 =
+                __half2float(shared_key[kt][lane]);
+            const float key1 =
+                __half2float(shared_key[kt][lane + 32u]);
+            const float key2 =
+                __half2float(shared_key[kt][lane + 64u]);
+            const float key3 =
+                __half2float(shared_key[kt][lane + 96u]);
+            const float pair0 = __fadd_rn(
+                    __fmul_rn(qh[lane], key0),
+                    __fmul_rn(qh[lane + 64u], key2));
+            const float pair1 = __fadd_rn(
+                    __fmul_rn(qh[lane + 32u], key1),
+                    __fmul_rn(qh[lane + 96u], key3));
+            float score = warp_sum_f32(__fadd_rn(pair0, pair1));
 
-        float old_scale = 0.0f;
-        float value_scale = 0.0f;
-        if (lane == 0u) {
-            score *= scale;
-            const float next_max = fmaxf(max_score, score);
-            old_scale = isinf(max_score) ?
-                0.0f : expf(max_score - next_max);
-            value_scale = expf(score - next_max);
-            score_sum = score_sum * old_scale + value_scale;
-            max_score = next_max;
+            float old_scale = 0.0f;
+            float value_scale = 0.0f;
+            if (lane == 0u) {
+                score *= scale;
+                const float next_max = fmaxf(max_score, score);
+                old_scale = isinf(max_score) ?
+                    0.0f : expf(max_score - next_max);
+                value_scale = expf(score - next_max);
+                score_sum = score_sum * old_scale + value_scale;
+                max_score = next_max;
+            }
+            old_scale =
+                __shfl_sync(0xffffffffu, old_scale, 0);
+            value_scale =
+                __shfl_sync(0xffffffffu, value_scale, 0);
+            acc0 = acc0 * old_scale +
+                __half2float(shared_value[kt][lane]) * value_scale;
+            acc1 = acc1 * old_scale +
+                __half2float(shared_value[kt][lane + 32u]) *
+                    value_scale;
+            acc2 = acc2 * old_scale +
+                __half2float(shared_value[kt][lane + 64u]) *
+                    value_scale;
+            acc3 = acc3 * old_scale +
+                __half2float(shared_value[kt][lane + 96u]) *
+                    value_scale;
         }
-        old_scale = __shfl_sync(0xffffffffu, old_scale, 0);
-        value_scale = __shfl_sync(0xffffffffu, value_scale, 0);
-        acc0 = acc0 * old_scale +
-            __half2float(shared_value[lane]) * value_scale;
-        acc1 = acc1 * old_scale +
-            __half2float(shared_value[lane + 32u]) * value_scale;
-        acc2 = acc2 * old_scale +
-            __half2float(shared_value[lane + 64u]) * value_scale;
-        acc3 = acc3 * old_scale +
-            __half2float(shared_value[lane + 96u]) * value_scale;
         __syncthreads();
     }
 
@@ -32994,6 +33023,13 @@ static int cuda_laguna_routed_moe(
         desc->gate_expert_bytes == desc->up_expert_bytes &&
         desc->gate_row_bytes == desc->up_row_bytes &&
         getenv("DS4_CUDA_LAGUNA_NO_SORTED_MOE") == NULL;
+    const bool use_q4_mma_gate_up_tile16 =
+        use_sorted_gate_up &&
+        use_q4_mma_gate_up &&
+        n_tokens >= 128u &&
+        cuda_laguna_blackwell_ok() &&
+        getenv("DS4_CUDA_LAGUNA_NO_Q4_MMA_TILE16") == NULL &&
+        cuda_q4_mma_tile16_shmem_ok(0);
     const uint64_t xq_bytes =
         (uint64_t)n_tokens * xq_blocks * sizeof(cuda_block_q8_K);
     const uint64_t midq_offset = (xq_bytes + 255u) & ~255ull;
@@ -33019,10 +33055,22 @@ static int cuda_laguna_routed_moe(
     const uint64_t tile_experts_bytes =
         tile_capacity * sizeof(uint32_t);
     const uint64_t tile_starts_bytes = tile_experts_bytes;
+    const uint64_t tile16_offsets_bytes =
+        use_q4_mma_gate_up_tile16 ? offsets_bytes : 0u;
+    const uint64_t tile16_capacity =
+        use_q4_mma_gate_up_tile16 ?
+            (pairs + 15u) / 16u + n_total_expert : 0u;
+    const uint64_t tile16_total_bytes =
+        use_q4_mma_gate_up_tile16 ? sizeof(uint32_t) : 0u;
+    const uint64_t tile16_experts_bytes =
+        tile16_capacity * sizeof(uint32_t);
+    const uint64_t tile16_starts_bytes = tile16_experts_bytes;
     const uint64_t sorted_bytes =
         counts_bytes + offsets_bytes + cursors_bytes +
         sorted_pairs_bytes + tile_offsets_bytes + tile_total_bytes +
-        tile_experts_bytes + tile_starts_bytes;
+        tile_experts_bytes + tile_starts_bytes +
+        tile16_offsets_bytes + tile16_total_bytes +
+        tile16_experts_bytes + tile16_starts_bytes;
     if (sorted_base > UINT64_MAX - sorted_bytes) return 0;
     uint8_t *scratch = (uint8_t *)cuda_tmp_alloc_on(
             logical_tier, sorted_base + sorted_bytes, "Laguna MoE");
@@ -33036,6 +33084,9 @@ static int cuda_laguna_routed_moe(
     uint32_t *tile_total = NULL;
     uint32_t *tile_experts = NULL;
     uint32_t *tile_starts = NULL;
+    uint32_t *tile16_total = NULL;
+    uint32_t *tile16_experts = NULL;
+    uint32_t *tile16_starts = NULL;
     q8_K_quantize_kernel<<<dim3(xq_blocks, n_tokens, 1u), 256>>>(
             xq, (const float *)x->ptr, expert_in_dim, n_tokens);
     if (!cuda_ok(cudaGetLastError(), "Laguna MoE input quantize launch")) {
@@ -33059,7 +33110,19 @@ static int cuda_laguna_routed_moe(
             (uint8_t *)tile_total + tile_total_bytes);
         tile_starts = (uint32_t *)(
             (uint8_t *)tile_experts + tile_experts_bytes);
-        if (pairs > UINT32_MAX || tile_capacity > UINT32_MAX) return 0;
+        uint32_t *tile16_offsets = (uint32_t *)(
+            (uint8_t *)tile_starts + tile_starts_bytes);
+        tile16_total = (uint32_t *)(
+            (uint8_t *)tile16_offsets + tile16_offsets_bytes);
+        tile16_experts = (uint32_t *)(
+            (uint8_t *)tile16_total + tile16_total_bytes);
+        tile16_starts = (uint32_t *)(
+            (uint8_t *)tile16_experts + tile16_experts_bytes);
+        if (pairs > UINT32_MAX ||
+            tile_capacity > UINT32_MAX ||
+            tile16_capacity > UINT32_MAX) {
+            return 0;
+        }
         if (!cuda_ok(cudaMemsetAsync(sorted_counts, 0, counts_bytes),
                      "Laguna sorted MoE counts clear")) {
             return 0;
@@ -33105,10 +33168,54 @@ static int cuda_laguna_routed_moe(
                      "Laguna sorted MoE tile launch")) {
             return 0;
         }
+        if (use_q4_mma_gate_up_tile16) {
+            moe_build_expert_tile_offsets_kernel<<<1, 1>>>(
+                    tile16_offsets, tile16_total, sorted_counts,
+                    16u, n_total_expert);
+            if (!cuda_ok(cudaGetLastError(),
+                         "Laguna sorted MoE tile16-offset launch")) {
+                return 0;
+            }
+            moe_build_expert_tiles_kernel<<<
+                    (n_total_expert + 255u) / 256u, 256>>>(
+                    tile16_experts, tile16_starts, tile16_offsets,
+                    sorted_counts, 16u, n_total_expert);
+            if (!cuda_ok(cudaGetLastError(),
+                         "Laguna sorted MoE tile16 launch")) {
+                return 0;
+            }
+        }
         if (n_tokens >= 128u) {
             dim3 grid((expert_mid_dim + 511u) / 512u,
                       (uint32_t)tile_capacity, 1u);
-            if (use_q4_mma_gate_up) {
+            if (use_q4_mma_gate_up_tile16) {
+                const size_t tile16_shmem =
+                    16u * 16u * sizeof(cuda_block_q8_K);
+                dim3 grid16((expert_mid_dim + 511u) / 512u,
+                            (uint32_t)tile16_capacity, 1u);
+                moe_gate_up_mid_q4K_tile16_mma_kernel<512>
+                        <<<grid16, 256, tile16_shmem>>>(
+                        (float *)mid->ptr,
+                        (float *)mid->ptr,
+                        (float *)mid->ptr,
+                        gate,
+                        up,
+                        xq,
+                        sorted_pairs,
+                        sorted_offsets,
+                        sorted_counts,
+                        tile16_total,
+                        tile16_experts,
+                        tile16_starts,
+                        (const float *)weights->ptr,
+                        desc->gate_expert_bytes,
+                        desc->gate_row_bytes,
+                        xq_blocks,
+                        expert_mid_dim,
+                        n_expert,
+                        0u,
+                        0.0f);
+            } else if (use_q4_mma_gate_up) {
                 moe_gate_up_mid_q4K_tile8_mma_kernel<512>
                         <<<grid, 256>>>(
                         (float *)mid->ptr,
@@ -33778,31 +33885,34 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
         n_head >= 48u &&
         getenv("DS4_CUDA_LAGUNA_NO_GQA_PREFILL") == NULL &&
         getenv("DS4_CUDA_LAGUNA_NO_WARP_GQA_PREFILL") == NULL;
+    const bool use_tiled_warp_gqa =
+        getenv("DS4_CUDA_LAGUNA_NO_TILED_GQA_PREFILL") == NULL;
+#define DS4_LAGUNA_WARP_GQA_LAUNCH(HEADS, KEYS) do { \
+        laguna_attention_prefill_warp_gqa_kernel<HEADS, KEYS><<< \
+                dim3(n_head_kv, n_tokens, 1u), HEADS * 32u>>>( \
+                (float *)heads->ptr, \
+                (const float *)q->ptr, \
+                (const float *)gate->ptr, \
+                (const __half *)key_cache->ptr, \
+                (const __half *)value_cache->ptr, \
+                (const __half *)staged_key->ptr, \
+                (const __half *)staged_value->ptr, \
+                pos0, n_tokens, cache_cap, \
+                n_head, n_head_kv, head_dim, scale); \
+    } while (0)
     if (heads_per_kv == 6u && use_warp_gqa) {
-        laguna_attention_prefill_warp_gqa_kernel<6><<<
-                dim3(n_head_kv, n_tokens, 1u), 6u * 32u>>>(
-                (float *)heads->ptr,
-                (const float *)q->ptr,
-                (const float *)gate->ptr,
-                (const __half *)key_cache->ptr,
-                (const __half *)value_cache->ptr,
-                (const __half *)staged_key->ptr,
-                (const __half *)staged_value->ptr,
-                pos0, n_tokens, cache_cap,
-                n_head, n_head_kv, head_dim, scale);
+        if (use_tiled_warp_gqa) {
+            DS4_LAGUNA_WARP_GQA_LAUNCH(6, 16);
+        } else {
+            DS4_LAGUNA_WARP_GQA_LAUNCH(6, 1);
+        }
     } else if (heads_per_kv == 9u && use_warp_gqa &&
                getenv("DS4_CUDA_DFLASH_NO_BLACKWELL") == NULL) {
-        laguna_attention_prefill_warp_gqa_kernel<9><<<
-                dim3(n_head_kv, n_tokens, 1u), 9u * 32u>>>(
-                (float *)heads->ptr,
-                (const float *)q->ptr,
-                (const float *)gate->ptr,
-                (const __half *)key_cache->ptr,
-                (const __half *)value_cache->ptr,
-                (const __half *)staged_key->ptr,
-                (const __half *)staged_value->ptr,
-                pos0, n_tokens, cache_cap,
-                n_head, n_head_kv, head_dim, scale);
+        if (use_tiled_warp_gqa) {
+            DS4_LAGUNA_WARP_GQA_LAUNCH(9, 16);
+        } else {
+            DS4_LAGUNA_WARP_GQA_LAUNCH(9, 1);
+        }
     } else if (heads_per_kv == 6u &&
         getenv("DS4_CUDA_LAGUNA_NO_GQA_PREFILL") == NULL) {
         laguna_attention_prefill_gqa_kernel<6><<<
@@ -33849,7 +33959,7 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
                 pos0, n_tokens, cache_cap,
                 n_head, n_head_kv, head_dim, scale);
     } else {
-        laguna_attention_prefill_kernel<<<
+            laguna_attention_prefill_kernel<<<
                 dim3(n_head, n_tokens, 1u), head_dim>>>(
                 (float *)heads->ptr,
                 (const float *)q->ptr,
@@ -33861,6 +33971,7 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
                 pos0, n_tokens, cache_cap,
                 n_head, n_head_kv, head_dim, scale);
     }
+#undef DS4_LAGUNA_WARP_GQA_LAUNCH
     if (!cuda_ok(cudaGetLastError(), "Laguna prefill attention launch")) {
         return 0;
     }
