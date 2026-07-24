@@ -22,6 +22,21 @@ static int g_cublas_ready;
 #endif
 static int g_quality_mode;
 
+/* Multi-GPU placement (rocm/ds4_rocm_mgpu.cuh, included later in this
+ * translation unit) forward-declares its device count and strict cache
+ * lookup here so cuda_model_range_ptr below -- the single chokepoint every
+ * kernel launcher already funnels weight lookups through -- can consult
+ * the per-device selective cache without needing mgpu.cuh's full
+ * definitions to exist yet at this point in the file. */
+extern "C" int g_n_gpus;
+extern "C" int ds4_gpu_lookup_cache_strict(uint64_t source_offset, uint64_t bytes,
+                                            int expected_device, void **out_device_ptr);
+static void rocm_mgpu_cleanup(void);
+/* Tracks which tier's device is currently cudaSetDevice'd; set by
+ * ds4_gpu_set_current_device (rocm/ds4_rocm_mgpu.cuh). Declared this early
+ * so cuda_tmp_alloc below can key its per-tier scratch cache off it. */
+static int g_current_logical_tier = -1;
+
 enum {
     DS4_ROCM_N_EXPERT = 256u,
     DS4_ROCM_MAX_N_EXPERT = 384u,
@@ -66,6 +81,7 @@ struct cuda_q8_f16_range {
     uint64_t in_dim;
     uint64_t out_dim;
     __half *device_ptr;
+    int device_id;
 };
 
 struct cuda_q8_f16_transpose_range {
@@ -75,6 +91,7 @@ struct cuda_q8_f16_transpose_range {
     uint64_t in_dim;
     uint64_t out_dim;
     __half *device_ptr;
+    int device_id;
 };
 
 struct cuda_stream_selected_cache {
@@ -267,16 +284,39 @@ static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
 static std::vector<cuda_q8_f16_transpose_range> g_q8_f16_transpose_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f16_transpose_by_offset;
 static uint64_t g_model_range_bytes;
-static uint64_t g_q8_f16_bytes;
-static int g_q8_f16_disabled_after_oom;
+/* Per-tier: how much this device's q8->f16 dequant cache has consumed, and
+ * whether it's been disabled after that device hit an allocation failure.
+ * Sharing a single counter/flag across tiers meant one tier's cache filling
+ * up (or OOMing) incorrectly throttled or disabled the OTHER tier's cache
+ * too, and cuda_q8_f16_cache_release_all's cross-device cudaFree (fixed
+ * separately below) could tear down a live tier's cache out from under a
+ * still-running computation on it. */
+static uint64_t g_q8_f16_bytes[DS4_MAX_GPUS];
+static int g_q8_f16_disabled_after_oom[DS4_MAX_GPUS];
 static int g_q8_f16_disabled_for_multi_model;
+
+static inline int cuda_q8_f16_tier(void) {
+    return g_current_logical_tier >= 0 && g_current_logical_tier < DS4_MAX_GPUS
+               ? g_current_logical_tier : 0;
+}
+static inline uint64_t cuda_q8_f16_bytes_total(void) {
+    uint64_t total = 0;
+    for (int t = 0; t < DS4_MAX_GPUS; t++) total += g_q8_f16_bytes[t];
+    return total;
+}
 static int g_q8_f16_budget_notice_printed;
 static uint64_t g_model_load_progress_next;
 static double g_model_load_progress_last;
 static int g_model_load_progress_started;
 static int g_model_load_progress_tty;
-static void *g_cuda_tmp;
-static uint64_t g_cuda_tmp_bytes;
+/* Per-tier: this scratch buffer is lazily allocated and then reused/grown
+ * in place across calls (see cuda_tmp_alloc below). A single shared buffer
+ * would silently hand back a tier-0-resident pointer to a caller currently
+ * running on tier 1's device -- the kernel it feeds would then dereference
+ * a pointer its own device can't see and fault. Indexed by
+ * g_current_logical_tier so each tier gets (and keeps) its own. */
+static void *g_cuda_tmp[DS4_MAX_GPUS];
+static uint64_t g_cuda_tmp_bytes[DS4_MAX_GPUS];
 static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
@@ -565,11 +605,13 @@ static void cuda_shared_gate_up_async_cleanup(void);
 
 static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
-    if (g_cuda_tmp_bytes >= bytes) return g_cuda_tmp;
-    if (g_cuda_tmp) {
-        (void)cudaFree(g_cuda_tmp);
-        g_cuda_tmp = NULL;
-        g_cuda_tmp_bytes = 0;
+    const int tier = g_current_logical_tier >= 0 && g_current_logical_tier < DS4_MAX_GPUS
+                          ? g_current_logical_tier : 0;
+    if (g_cuda_tmp_bytes[tier] >= bytes) return g_cuda_tmp[tier];
+    if (g_cuda_tmp[tier]) {
+        (void)cudaFree(g_cuda_tmp[tier]);
+        g_cuda_tmp[tier] = NULL;
+        g_cuda_tmp_bytes[tier] = 0;
     }
     void *ptr = NULL;
     cudaError_t err = cudaMalloc(&ptr, (size_t)bytes);
@@ -579,9 +621,15 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
         (void)cudaGetLastError();
         return NULL;
     }
-    g_cuda_tmp = ptr;
-    g_cuda_tmp_bytes = bytes;
-    return g_cuda_tmp;
+    g_cuda_tmp[tier] = ptr;
+    g_cuda_tmp_bytes[tier] = bytes;
+    return g_cuda_tmp[tier];
+}
+
+static uint64_t cuda_tmp_alloc_total_bytes(void) {
+    uint64_t total = 0;
+    for (int t = 0; t < DS4_MAX_GPUS; t++) total += g_cuda_tmp_bytes[t];
+    return total;
 }
 
 static int cuda_attention_score_buffer_fits(uint32_t n_comp) {
@@ -4572,6 +4620,32 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
     if (cuda_model_image_owned(model_map)) return cuda_model_ptr(model_map, offset);
 
+    /* Multi-tier placement: consult the per-device selective weight cache
+     * for whichever device is currently active before falling through to
+     * the legacy single-copy lookup below. ds4.c calls
+     * ds4_gpu_set_current_device(tier) before dispatching a layer's
+     * kernels, so "currently active device" is exactly the tier that
+     * layer's weights were cached on -- this is what lets every existing
+     * kernel launcher in the rocm headers stay tier-agnostic. Single-GPU
+     * (g_n_gpus <= 1) builds skip this and are byte-equivalent to before. */
+    if (g_n_gpus > 1) {
+        int active_device = -1;
+        if (cudaGetDevice(&active_device) == cudaSuccess) {
+            void *cached = NULL;
+            if (ds4_gpu_lookup_cache_strict(offset, bytes, active_device, &cached)) {
+                return (const char *)cached;
+            }
+            if (getenv("DS4_Q8F16_TRACE")) {
+                fprintf(stderr,
+                        DS4_GPU_LOG_PREFIX "[trace] cuda_model_range_ptr STRICT MISS "
+                        "what=%s offset=%llu bytes=%llu active_device=%d "
+                        "tier=%d falling through to legacy cache\n",
+                        what ? what : "?", (unsigned long long)offset,
+                        (unsigned long long)bytes, active_device, cuda_q8_f16_tier());
+            }
+        }
+    }
+
     const uint64_t end = offset + bytes;
     auto exact = g_model_range_by_offset.find(offset);
     if (exact != g_model_range_by_offset.end()) {
@@ -4693,18 +4767,71 @@ static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, ui
     return 0;
 }
 
+/* Frees every cached entry on its OWNING device, not whichever device
+ * happens to be active when this runs -- cudaFree on a pointer that
+ * belongs to a different device than the current one fails (or worse,
+ * silently misbehaves) rather than actually freeing the memory, which
+ * both leaks VRAM and leaves g_q8_f16_bytes/the range vectors out of sync
+ * with what's actually still resident. */
 static void cuda_q8_f16_cache_release_all(void) {
+    int prev_device = -1;
+    (void)cudaGetDevice(&prev_device);
     for (const cuda_q8_f16_transpose_range &r : g_q8_f16_transpose_ranges) {
+        (void)cudaSetDevice(r.device_id);
         (void)cudaFree(r.device_ptr);
     }
     for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
+        (void)cudaSetDevice(r.device_id);
         (void)cudaFree(r.device_ptr);
     }
+    if (prev_device >= 0) (void)cudaSetDevice(prev_device);
     g_q8_f16_transpose_ranges.clear();
     g_q8_f16_transpose_by_offset.clear();
     g_q8_f16_ranges.clear();
     g_q8_f16_by_offset.clear();
-    g_q8_f16_bytes = 0;
+    for (int t = 0; t < DS4_MAX_GPUS; t++) g_q8_f16_bytes[t] = 0;
+}
+
+/* Releases only the entries cached on one tier's device (its OWN cudaFree,
+ * same as above), leaving every other tier's cache untouched. Used when a
+ * single tier hits an allocation failure -- that tier's cache is no longer
+ * trustworthy, but another tier's already-cached, still-valid weights have
+ * no reason to be torn down along with it. */
+static void cuda_q8_f16_cache_release_tier(int tier) {
+    if (tier < 0 || tier >= g_n_gpus) return;
+    const int device_id = g_gpu[tier].device_id;
+    int prev_device = -1;
+    (void)cudaGetDevice(&prev_device);
+    (void)cudaSetDevice(device_id);
+    for (const cuda_q8_f16_transpose_range &r : g_q8_f16_transpose_ranges) {
+        if (r.device_id == device_id) (void)cudaFree(r.device_ptr);
+    }
+    for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
+        if (r.device_id == device_id) (void)cudaFree(r.device_ptr);
+    }
+    if (prev_device >= 0) (void)cudaSetDevice(prev_device);
+
+    std::vector<cuda_q8_f16_transpose_range> kept_t;
+    for (const cuda_q8_f16_transpose_range &r : g_q8_f16_transpose_ranges) {
+        if (r.device_id != device_id) kept_t.push_back(r);
+    }
+    g_q8_f16_transpose_ranges.swap(kept_t);
+    g_q8_f16_transpose_by_offset.clear();
+    for (size_t i = 0; i < g_q8_f16_transpose_ranges.size(); i++) {
+        g_q8_f16_transpose_by_offset[g_q8_f16_transpose_ranges[i].offset] = i;
+    }
+
+    std::vector<cuda_q8_f16_range> kept;
+    for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
+        if (r.device_id != device_id) kept.push_back(r);
+    }
+    g_q8_f16_ranges.swap(kept);
+    g_q8_f16_by_offset.clear();
+    for (size_t i = 0; i < g_q8_f16_ranges.size(); i++) {
+        g_q8_f16_by_offset[g_q8_f16_ranges[i].offset] = i;
+    }
+
+    g_q8_f16_bytes[tier] = 0;
 }
 
 static int cuda_env_present(const char *env) {
@@ -4833,13 +4960,14 @@ static void cuda_q8_f16_cache_budget_notice(
         uint64_t limit_bytes) {
     if (g_q8_f16_budget_notice_printed) return;
     g_q8_f16_budget_notice_printed = 1;
+    const uint64_t cached_bytes = g_q8_f16_bytes[cuda_q8_f16_tier()];
     if (limit_bytes != UINT64_MAX && free_bytes == 0 && total_bytes == 0 && reserve_bytes == 0) {
         fprintf(stderr,
                 DS4_GPU_LOG_PREFIX "q8 fp16 cache %s; using q8 kernels "
                 "(request=%.2f MiB cached=%.2f GiB limit=%.2f GiB)\n",
                 reason,
                 (double)request_bytes / 1048576.0,
-                (double)g_q8_f16_bytes / 1073741824.0,
+                (double)cached_bytes / 1073741824.0,
                 (double)limit_bytes / 1073741824.0);
     } else if (limit_bytes == UINT64_MAX) {
         fprintf(stderr,
@@ -4847,7 +4975,7 @@ static void cuda_q8_f16_cache_budget_notice(
                 "(request=%.2f MiB cached=%.2f GiB free=%.2f GiB reserve=%.2f GiB total=%.2f GiB)\n",
                 reason,
                 (double)request_bytes / 1048576.0,
-                (double)g_q8_f16_bytes / 1073741824.0,
+                (double)cached_bytes / 1073741824.0,
                 (double)free_bytes / 1073741824.0,
                 (double)reserve_bytes / 1073741824.0,
                 (double)total_bytes / 1073741824.0);
@@ -4857,7 +4985,7 @@ static void cuda_q8_f16_cache_budget_notice(
                 "(request=%.2f MiB cached=%.2f GiB limit=%.2f GiB free=%.2f GiB reserve=%.2f GiB total=%.2f GiB)\n",
                 reason,
                 (double)request_bytes / 1048576.0,
-                (double)g_q8_f16_bytes / 1073741824.0,
+                (double)cached_bytes / 1073741824.0,
                 (double)limit_bytes / 1073741824.0,
                 (double)free_bytes / 1073741824.0,
                 (double)reserve_bytes / 1073741824.0,
@@ -4867,9 +4995,10 @@ static void cuda_q8_f16_cache_budget_notice(
 
 static int cuda_q8_f16_cache_has_budget(uint64_t request_bytes, const char *label) {
     (void)label;
+    const int tier = cuda_q8_f16_tier();
     const uint64_t limit = cuda_q8_f16_cache_limit_bytes();
     if (limit == 0) return 0;
-    if (g_q8_f16_bytes > limit || request_bytes > limit - g_q8_f16_bytes) {
+    if (g_q8_f16_bytes[tier] > limit || request_bytes > limit - g_q8_f16_bytes[tier]) {
         cuda_q8_f16_cache_budget_notice("limit reached", request_bytes, 0, 0, 0, limit);
         return 0;
     }
@@ -4898,25 +5027,28 @@ static int cuda_q8_f16_cache_has_budget(uint64_t request_bytes, const char *labe
 }
 
 static void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t request_bytes) {
-    if (!g_q8_f16_disabled_after_oom) {
+    const int tier = cuda_q8_f16_tier();
+    if (!g_q8_f16_disabled_after_oom[tier]) {
         fprintf(stderr,
-                DS4_GPU_LOG_PREFIX "q8 fp16 cache disabled after %s "
+                DS4_GPU_LOG_PREFIX "q8 fp16 cache disabled on tier %d after %s "
                 "(request=%.2f MiB cached=%.2f GiB); using q8 kernels\n",
-                what ? what : "allocation failure",
+                tier, what ? what : "allocation failure",
                 (double)request_bytes / 1048576.0,
-                (double)g_q8_f16_bytes / 1073741824.0);
+                (double)g_q8_f16_bytes[tier] / 1073741824.0);
     }
-    g_q8_f16_disabled_after_oom = 1;
-    if (!g_q8_f16_ranges.empty() || !g_q8_f16_transpose_ranges.empty()) {
-        (void)cudaDeviceSynchronize();
-        cuda_q8_f16_cache_release_all();
-    }
+    g_q8_f16_disabled_after_oom[tier] = 1;
+    /* Only tear down THIS tier's cache -- another tier's already-cached,
+     * still-valid weights have no reason to be released along with it, and
+     * releasing them out from under a still-running computation on that
+     * tier would be its own bug. */
+    (void)cudaDeviceSynchronize();
+    cuda_q8_f16_cache_release_tier(tier);
     (void)cudaGetLastError();
 }
 
 static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
     if (g_quality_mode) return 0;
-    if (g_q8_f16_disabled_after_oom) return 0;
+    if (g_q8_f16_disabled_after_oom[cuda_q8_f16_tier()]) return 0;
     if (g_q8_f16_disabled_for_multi_model) return 0;
     if (getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL) return 0;
     if (!label) return 0;
@@ -4964,18 +5096,29 @@ static const __half *cuda_q8_f16_ptr(
         uint64_t in_dim,
         uint64_t out_dim,
         const char *label) {
+    /* Multi-tier: this cache is process-wide but the dequantized buffer it
+     * hands back is device-resident. Filter every match on the currently
+     * active device -- a weight cached while tier 0 was active is a
+     * dangling/foreign pointer to a kernel running on tier 1, and unlike a
+     * raw cross-device kernel-argument fault, using it here produces
+     * silently wrong matmul output rather than a crash (this is what was
+     * behind the garbled multi-GPU generation output). */
+    int active_device = -1;
+    (void)cudaGetDevice(&active_device);
     auto exact = g_q8_f16_by_offset.find(offset);
     if (exact != g_q8_f16_by_offset.end()) {
         const cuda_q8_f16_range &r = g_q8_f16_ranges[exact->second];
         if (r.host_base == model_map && r.weight_bytes == weight_bytes &&
-            r.in_dim == in_dim && r.out_dim == out_dim) {
+            r.in_dim == in_dim && r.out_dim == out_dim &&
+            r.device_id == active_device) {
             return r.device_ptr;
         }
     }
     for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
         if (r.host_base == model_map && r.offset == offset &&
             r.weight_bytes == weight_bytes &&
-            r.in_dim == in_dim && r.out_dim == out_dim) {
+            r.in_dim == in_dim && r.out_dim == out_dim &&
+            r.device_id == active_device) {
             return r.device_ptr;
         }
     }
@@ -5009,9 +5152,18 @@ static const __half *cuda_q8_f16_ptr(
         cuda_q8_f16_cache_disable_after_failure("dequant launch failure", out_bytes);
         return NULL;
     }
-    g_q8_f16_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev});
+    g_q8_f16_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev,
+                                active_device});
     g_q8_f16_by_offset[offset] = g_q8_f16_ranges.size() - 1u;
-    g_q8_f16_bytes += out_bytes;
+    g_q8_f16_bytes[cuda_q8_f16_tier()] += out_bytes;
+    if (getenv("DS4_Q8F16_TRACE")) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "[trace] q8_f16_ptr STORE label=%s offset=%llu"
+                " in=%llu out=%llu active_device=%d tier=%d dev_ptr=%p\n",
+                label ? label : "?", (unsigned long long)offset,
+                (unsigned long long)in_dim, (unsigned long long)out_dim, active_device,
+                cuda_q8_f16_tier(), (void *)dev);
+    }
     return dev;
 }
 
@@ -5022,18 +5174,25 @@ static const __half *cuda_q8_f16_transpose_ptr(
         uint64_t in_dim,
         uint64_t out_dim,
         const char *label) {
+    /* See cuda_q8_f16_ptr above: must filter on the currently active
+     * device, or a multi-tier session can hand back another tier's
+     * device-resident dequant buffer and silently corrupt matmul output. */
+    int active_device = -1;
+    (void)cudaGetDevice(&active_device);
     auto exact = g_q8_f16_transpose_by_offset.find(offset);
     if (exact != g_q8_f16_transpose_by_offset.end()) {
         const cuda_q8_f16_transpose_range &r = g_q8_f16_transpose_ranges[exact->second];
         if (r.host_base == model_map && r.weight_bytes == weight_bytes &&
-            r.in_dim == in_dim && r.out_dim == out_dim) {
+            r.in_dim == in_dim && r.out_dim == out_dim &&
+            r.device_id == active_device) {
             return r.device_ptr;
         }
     }
     for (const cuda_q8_f16_transpose_range &r : g_q8_f16_transpose_ranges) {
         if (r.host_base == model_map && r.offset == offset &&
             r.weight_bytes == weight_bytes &&
-            r.in_dim == in_dim && r.out_dim == out_dim) {
+            r.in_dim == in_dim && r.out_dim == out_dim &&
+            r.device_id == active_device) {
             return r.device_ptr;
         }
     }
@@ -5064,9 +5223,18 @@ static const __half *cuda_q8_f16_transpose_ptr(
         cuda_q8_f16_cache_disable_after_failure("transpose launch failure", out_bytes);
         return NULL;
     }
-    g_q8_f16_transpose_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev});
+    g_q8_f16_transpose_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev,
+                                          active_device});
     g_q8_f16_transpose_by_offset[offset] = g_q8_f16_transpose_ranges.size() - 1u;
-    g_q8_f16_bytes += out_bytes;
+    g_q8_f16_bytes[cuda_q8_f16_tier()] += out_bytes;
+    if (getenv("DS4_Q8F16_TRACE")) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "[trace] q8_f16_transpose_ptr STORE label=%s offset=%llu"
+                " in=%llu out=%llu active_device=%d tier=%d dev_ptr=%p\n",
+                label ? label : "?", (unsigned long long)offset,
+                (unsigned long long)in_dim, (unsigned long long)out_dim, active_device,
+                cuda_q8_f16_tier(), (void *)dev);
+    }
     return dev;
 }
 
@@ -5416,7 +5584,7 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
 static int cuda_stream_model_cache_prepare_memory(
         uint64_t request_bytes,
         const char *what) {
-    if (!g_ssd_streaming_mode || request_bytes == 0 || g_q8_f16_bytes == 0) {
+    if (!g_ssd_streaming_mode || request_bytes == 0 || g_q8_f16_bytes[cuda_q8_f16_tier()] == 0) {
         return 1;
     }
 
@@ -5440,7 +5608,7 @@ static int cuda_stream_model_cache_prepare_memory(
     fprintf(stderr,
             DS4_GPU_LOG_PREFIX "releasing %.2f GiB q8 fp16 cache for %s "
             "(request=%.2f GiB free=%.2f GiB reserve=%.2f GiB)\n",
-            (double)g_q8_f16_bytes / 1073741824.0,
+            (double)g_q8_f16_bytes[cuda_q8_f16_tier()] / 1073741824.0,
             what ? what : "streaming model spans",
             (double)request_bytes / 1073741824.0,
             (double)free_bytes / 1073741824.0,
@@ -5751,27 +5919,17 @@ extern "C" int ds4_gpu_wave_size(void) {
 }
 
 extern "C" int ds4_gpu_init(void) {
-    int dev = 0;
-    if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
-    cudaDeviceProp prop;
-    if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
-        fprintf(stderr, DS4_GPU_LOG_PREFIX "backend initialized on %s (sm_%d%d)\n",
-                prop.name, prop.major, prop.minor);
-    }
-    if (!g_cublas_ready) {
-        if (!cublas_ok(cublasCreate(&g_cublas), "create handle")) return 0;
-        const cublasMath_t math_mode = g_quality_mode ? CUBLAS_DEFAULT_MATH : CUBLAS_TF32_TENSOR_OP_MATH;
-        (void)cublasSetMathMode(g_cublas, math_mode);
-        g_cublas_ready = 1;
-    }
-#ifdef __HIP_PLATFORM_AMD__
-    if (!g_hipblaslt_ready) {
-        if (hipblaslt_ok(hipblasLtCreate(&g_hipblaslt), "create handle")) {
-            g_hipblaslt_ready = 1;
-        }
-    }
-#endif
-    return 1;
+    /* Thin single-device shim: builds a 1-GPU config for device 0 and
+     * routes through the same multi-device init path ds4.c uses for
+     * explicit --gpu-devices/--gpu-vram placements, so there is exactly
+     * one code path that creates per-device streams/events/hipBLAS/
+     * hipBLASLt state (see rocm/ds4_rocm_mgpu.cuh). Mirrors CUDA's
+     * ds4_gpu_init/ds4_gpu_init_multi split. */
+    ds4_rocm_gpu_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.device_indices[0] = 0;
+    cfg.n_gpus = 1;
+    return ds4_gpu_init_multi(&cfg);
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
@@ -5781,28 +5939,22 @@ extern "C" void ds4_gpu_cleanup(void) {
 #ifdef __HIP_PLATFORM_AMD__
     hipblaslt_gemm_plan_clear();
 #endif
-    if (g_cublas_ready) {
-        (void)cublasDestroy(g_cublas);
-        g_cublas_ready = 0;
-        g_cublas = NULL;
-    }
-#ifdef __HIP_PLATFORM_AMD__
-    if (g_hipblaslt_ready) {
-        (void)hipblasLtDestroy(g_hipblaslt);
-        g_hipblaslt_ready = 0;
-        g_hipblaslt = NULL;
-    }
-#endif
+    /* Per-device hipBLAS/hipBLASLt handles (including tier 0's, which
+     * g_cublas/g_hipblaslt currently alias) are destroyed by
+     * rocm_mgpu_cleanup() below -- destroying them here too would be a
+     * double-free of the same handle. */
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     cuda_stream_selected_cache_release();
-    g_q8_f16_disabled_after_oom = 0;
+    for (int t = 0; t < DS4_MAX_GPUS; t++) g_q8_f16_disabled_after_oom[t] = 0;
     g_q8_f16_disabled_for_multi_model = 0;
     g_q8_f16_budget_notice_printed = 0;
-    if (g_cuda_tmp) {
-        (void)cudaFree(g_cuda_tmp);
-        g_cuda_tmp = NULL;
-        g_cuda_tmp_bytes = 0;
+    for (int t = 0; t < DS4_MAX_GPUS; t++) {
+        if (g_cuda_tmp[t]) {
+            WITH_DEVICE(g_gpu[t].device_id) { (void)cudaFree(g_cuda_tmp[t]); }
+            g_cuda_tmp[t] = NULL;
+            g_cuda_tmp_bytes[t] = 0;
+        }
     }
     for (size_t i = 0; i < 4; i++) {
         if (g_model_stage_event[i]) {
@@ -5847,6 +5999,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_direct_align = 1;
     g_model_file_size = 0;
     g_model_cache_full = 0;
+    rocm_mgpu_cleanup();
 }
 
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
@@ -5855,12 +6008,24 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
-    if (!cuda_ok(cudaMalloc(&t->ptr, (size_t)bytes), "tensor alloc")) {
+    /* Legacy (non-tiered) allocations always land on tier 0, regardless of
+     * which device happens to be active when called -- matches CUDA's
+     * ds4_gpu_tensor_alloc. Multi-tier-aware callers use
+     * ds4_gpu_tensor_alloc_ptr_on(tier, bytes) instead (ds4_rocm_mgpu.cuh).
+     * For single-GPU sessions g_gpu[0].device_id == 0, so this is
+     * byte-equivalent to the previous plain cudaMalloc-on-whatever's-active
+     * behavior. */
+    int ok = 0;
+    WITH_DEVICE(g_gpu[0].device_id) {
+        ok = cuda_ok(cudaMalloc(&t->ptr, (size_t)bytes), "tensor alloc");
+    }
+    if (!ok) {
         free(t);
         return NULL;
     }
     t->bytes = bytes;
     t->owner = 1;
+    t->device_id = 0;
     return t;
 }
 
@@ -5868,12 +6033,17 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
-    if (!cuda_ok(cudaMallocManaged(&t->ptr, (size_t)bytes), "managed tensor alloc")) {
+    int ok = 0;
+    WITH_DEVICE(g_gpu[0].device_id) {
+        ok = cuda_ok(cudaMallocManaged(&t->ptr, (size_t)bytes), "managed tensor alloc");
+    }
+    if (!ok) {
         free(t);
         return NULL;
     }
     t->bytes = bytes;
     t->owner = 1;
+    t->device_id = 0;
     return t;
 }
 
@@ -5920,12 +6090,16 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint6
     t->ptr = (char *)base->ptr + offset;
     t->bytes = bytes;
     t->owner = 0;
+    t->device_id = base->device_id;  /* inherit owning device */
     return t;
 }
 
 extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     if (!tensor) return;
-    if (tensor->owner && tensor->ptr) (void)cudaFree(tensor->ptr);
+    int d = ds4_tensor_device_idx(tensor);
+    if (tensor->owner && tensor->ptr) {
+        WITH_DEVICE(g_gpu[d].device_id) { (void)cudaFree(tensor->ptr); }
+    }
     free(tensor);
 }
 
@@ -5942,18 +6116,33 @@ extern "C" void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
 extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {
     if (!tensor || count > tensor->bytes / sizeof(float)) return 0;
     if (count == 0) return 1;
-    fill_f32_kernel<<<(count + 255u) / 256u, 256>>>((float *)tensor->ptr, count, value);
-    return cuda_ok(cudaGetLastError(), "tensor fill f32 launch");
+    int d = ds4_tensor_device_idx(tensor);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        fill_f32_kernel<<<(count + 255u) / 256u, 256>>>((float *)tensor->ptr, count, value);
+        ok = cuda_ok(cudaGetLastError(), "tensor fill f32 launch");
+    }
+    return ok;
 }
 
 extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
-    return cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes, cudaMemcpyHostToDevice), "tensor write");
+    int d = ds4_tensor_device_idx(tensor);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        ok = cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes, cudaMemcpyHostToDevice), "tensor write");
+    }
+    return ok;
 }
 
 extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
-    return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");
+    int d = ds4_tensor_device_idx(tensor);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        ok = cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");
+    }
+    return ok;
 }
 
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
@@ -5964,12 +6153,21 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
         return 0;
     }
     if (bytes == 0) return 1;
-    return cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
-                                   (const char *)src->ptr + src_offset,
-                                   (size_t)bytes,
-                                   cudaMemcpyDeviceToDevice,
-                                   0),
-                   "tensor copy enqueue");
+    /* Same-device fast path; cross-device callers should use
+     * ds4_gpu_tensor_copy_xdev (ds4_rocm_mgpu.cuh) instead. We still
+     * tolerate cross-device callers here by routing to a D2D copy on the
+     * destination's device, matching CUDA's ds4_gpu_tensor_copy. */
+    int d = ds4_tensor_device_idx(dst);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        ok = cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
+                                     (const char *)src->ptr + src_offset,
+                                     (size_t)bytes,
+                                     cudaMemcpyDeviceToDevice,
+                                     0),
+                     "tensor copy enqueue");
+    }
+    return ok;
 }
 
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
@@ -6025,7 +6223,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         (g_model_host_base != model_map || g_model_registered_size != model_size);
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
-    g_q8_f16_disabled_after_oom = 0;
+    for (int t = 0; t < DS4_MAX_GPUS; t++) g_q8_f16_disabled_after_oom[t] = 0;
     g_q8_f16_budget_notice_printed = 0;
     if (multi_model) {
         /*
@@ -6228,7 +6426,7 @@ extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_
 
 extern "C" void ds4_gpu_release_q8_f16_cache(void) {
     cuda_q8_f16_cache_release_all();
-    g_q8_f16_disabled_after_oom = 0;
+    for (int t = 0; t < DS4_MAX_GPUS; t++) g_q8_f16_disabled_after_oom[t] = 0;
     g_q8_f16_budget_notice_printed = 0;
 }
 
@@ -6254,8 +6452,8 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
             placement,
             (double)cuda_model_image_bytes() / 1073741824.0,
             (double)g_model_range_bytes / 1073741824.0,
-            (double)g_q8_f16_bytes / 1073741824.0,
-            (double)g_cuda_tmp_bytes / 1073741824.0);
+            (double)cuda_q8_f16_bytes_total() / 1073741824.0,
+            (double)cuda_tmp_alloc_total_bytes() / 1073741824.0);
     fprintf(stderr, "\n");
 }
 

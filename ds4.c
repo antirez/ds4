@@ -15432,10 +15432,22 @@ static bool metal_graph_set_active_tier_decode(ds4_gpu_graph *g, int tier) {
     if (g->active_tier >= 0) {
         ds4_gpu_tensor *src = g->cur_hc_by_tier[g->active_tier];
         ds4_gpu_tensor *dst = g->cur_hc_by_tier[tier];
+        if (getenv("DS4_MGPU_TRACE")) {
+            fprintf(stderr, "ds4: mgpu-trace decode %d->%d src=%p dst=%p\n",
+                    g->active_tier, tier, (void *)src, (void *)dst);
+        }
         if (src && dst) {
             const uint64_t hc_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
-            if (!ds4_gpu_tensor_copy_xdev(dst, src, hc_bytes)) return false;
+            if (!ds4_gpu_tensor_copy_xdev(dst, src, hc_bytes)) {
+                if (getenv("DS4_MGPU_TRACE")) {
+                    fprintf(stderr, "ds4: mgpu-trace decode copy FAILED %d->%d\n",
+                            g->active_tier, tier);
+                }
+                return false;
+            }
         }
+    } else if (getenv("DS4_MGPU_TRACE")) {
+        fprintf(stderr, "ds4: mgpu-trace decode ->%d (active_tier was -1, no copy)\n", tier);
     }
     g->active_tier = tier;
     return true;
@@ -15457,11 +15469,23 @@ static bool metal_graph_set_active_tier_batch(ds4_gpu_graph *g, int tier, uint32
     if (g->active_tier >= 0) {
         ds4_gpu_tensor *src = g->batch_cur_hc_by_tier[g->active_tier];
         ds4_gpu_tensor *dst = g->batch_cur_hc_by_tier[tier];
+        if (getenv("DS4_MGPU_TRACE")) {
+            fprintf(stderr, "ds4: mgpu-trace batch %d->%d chunk=%u src=%p dst=%p\n",
+                    g->active_tier, tier, chunk_tokens, (void *)src, (void *)dst);
+        }
         if (src && dst) {
             const uint64_t hc_bytes =
                 (uint64_t)chunk_tokens * DS4_N_HC * DS4_N_EMBD * sizeof(float);
-            if (!ds4_gpu_tensor_copy_xdev(dst, src, hc_bytes)) return false;
+            if (!ds4_gpu_tensor_copy_xdev(dst, src, hc_bytes)) {
+                if (getenv("DS4_MGPU_TRACE")) {
+                    fprintf(stderr, "ds4: mgpu-trace batch copy FAILED %d->%d\n",
+                            g->active_tier, tier);
+                }
+                return false;
+            }
         }
+    } else if (getenv("DS4_MGPU_TRACE")) {
+        fprintf(stderr, "ds4: mgpu-trace batch ->%d (active_tier was -1, no copy)\n", tier);
     }
     g->active_tier = tier;
     return true;
@@ -28947,8 +28971,14 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("routed_moe");
+    if (ok && getenv("DS4_FFN_FORCE_SYNC")) {
+        if (ds4_gpu_synchronize() == 0) ok = false;
+    }
     if (!shared_done) {
         DS4_METAL_ENCODE_PREFILL_SHARED_EXPERT();
+    }
+    if (ok && getenv("DS4_FFN_FORCE_SYNC")) {
+        if (ds4_gpu_synchronize() == 0) ok = false;
     }
 #undef DS4_METAL_ENCODE_PREFILL_SHARED_EXPERT
 #undef DS4_METAL_TRY_SHARED_DOWN_F16

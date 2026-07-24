@@ -85,11 +85,24 @@ extern "C" int ds4_gpu_tensor_copy_f32_to_f16(
     uint64_t src_bytes = count * sizeof(float);
     if (dst_bytes > dst->bytes - dst_offset || src_bytes > src->bytes - src_offset) return 0;
     if (count == 0) return 1;
-    f32_to_f16_kernel<<<(count + 255u) / 256u, 256>>>(
-            (__half *)((char *)dst->ptr + dst_offset),
-            (const float *)((const char *)src->ptr + src_offset),
-            count);
-    return cuda_ok(cudaGetLastError(), "tensor copy f32 to f16 launch");
+    int d = ds4_tensor_device_idx(dst);
+    if (d != ds4_tensor_device_idx(src)) {
+        /* Cross-device src/dst: launching on dst's device would read src's
+         * VRAM pointer from a device that can't dereference it (no peer
+         * access between these two tiers) and fault. Matches CUDA's
+         * reference ds4_gpu_tensor_copy_f32_to_f16, which refuses the same
+         * way rather than attempting a kernel launch across devices. */
+        return 0;
+    }
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        f32_to_f16_kernel<<<(count + 255u) / 256u, 256>>>(
+                (__half *)((char *)dst->ptr + dst_offset),
+                (const float *)((const char *)src->ptr + src_offset),
+                count);
+        ok = cuda_ok(cudaGetLastError(), "tensor copy f32 to f16 launch");
+    }
+    return ok;
 }
 
 extern "C" int ds4_gpu_pro_q4_expert_table_auto_available(void) {
