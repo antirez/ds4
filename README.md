@@ -228,6 +228,12 @@ attention block so each sliding-window K/V row is loaded once per group.
 `DS4_CUDA_DFLASH_NO_BLACKWELL=1` selects the portable per-query-head kernel for
 comparison or rollback.
 
+CUDA Laguna prefill similarly runs one warp per query head on Blackwell and
+uses exact INT8 tensor-core kernels for large Q4_K routed-expert batches.
+`DS4_CUDA_LAGUNA_NO_WARP_GQA_PREFILL=1` and
+`DS4_CUDA_LAGUNA_NO_Q4_MMA=1` select the respective portable kernels for
+comparison or rollback.
+
 The shipped GGUF is configured for a 262144-token context. Laguna defaults to
 temperature 1.0, top-k 20, top-p 1.0, and min-p 0; explicit sampling options
 always take precedence. Use `--nothink` or the `laguna-s-2.1-chat` server alias
@@ -1557,10 +1563,11 @@ The default graph backend is Metal on macOS and CUDA in CUDA builds:
 ```
 
 On Linux, plain `make` prints the available build targets instead of selecting a
-CUDA target implicitly. Use `make cuda-spark` for DGX Spark / GB10. It omits an
-explicit `nvcc -arch` because that is currently the fastest path on GB10. Use
-`make cuda-generic` for a normal local CUDA build, or set `CUDA_ARCH` explicitly
-when cross-building or when you need a known target:
+CUDA target implicitly. Use `make cuda-spark` for DGX Spark / GB10. It uses
+`nvcc -arch=native` so CUDA emits native `sm_121` kernels on the Spark; CUDA 13
+measures about 5% faster than its architecture-unspecified fallback for Laguna
+prefill. Use `make cuda-generic` for a normal local CUDA build, or set
+`CUDA_ARCH` explicitly when cross-building or when you need a known target:
 
 ```sh
 make cuda CUDA_ARCH=sm_120

@@ -705,8 +705,8 @@ static int check_attention(void) {
 static int check_dflash_blackwell_attention(void) {
     enum {
         n_tokens = 3,
-        n_head = 9,
-        n_head_kv = 1,
+        n_head = 72,
+        n_head_kv = 8,
         cache_cap = 4
     };
     const uint64_t q_values = (uint64_t)n_tokens * n_head * HEAD_DIM;
@@ -728,11 +728,11 @@ static int check_dflash_blackwell_attention(void) {
 
     ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc(sizeof(portable));
     ds4_gpu_tensor *key_cache =
-        ds4_gpu_tensor_alloc((uint64_t)cache_cap * HEAD_DIM *
-                             sizeof(uint16_t));
+        ds4_gpu_tensor_alloc((uint64_t)cache_cap * n_head_kv *
+                             HEAD_DIM * sizeof(uint16_t));
     ds4_gpu_tensor *value_cache =
-        ds4_gpu_tensor_alloc((uint64_t)cache_cap * HEAD_DIM *
-                             sizeof(uint16_t));
+        ds4_gpu_tensor_alloc((uint64_t)cache_cap * n_head_kv *
+                             HEAD_DIM * sizeof(uint16_t));
     ds4_gpu_tensor *staged_key =
         ds4_gpu_tensor_alloc(kv_values * sizeof(uint16_t));
     ds4_gpu_tensor *staged_value =
@@ -941,7 +941,7 @@ static int check_moe(model_blob *blob,
                      const ds4_gpu_laguna_moe_desc *shared,
                      float row_sum) {
     const uint32_t dim = QK_K;
-    enum { n_tokens = 2 };
+    enum { n_tokens = 128 };
     float x_host[dim];
     for (uint32_t i = 0; i < dim; i++) x_host[i] = 0.01f;
     const int32_t selected_host[2] = {0, 1};
@@ -997,13 +997,19 @@ static int check_moe(model_blob *blob,
     }
 
     float batch_x_host[n_tokens * dim];
-    const int32_t batch_selected_host[n_tokens * 2u] = {0, 1, 1, 0};
-    const float batch_weights_host[n_tokens * 2u] = {
-        0.25f, 0.75f, 0.60f, 0.40f
-    };
+    int32_t batch_selected_host[n_tokens * 2u];
+    float batch_weights_host[n_tokens * 2u];
     for (uint32_t t = 0; t < n_tokens; t++) {
+        const float token_scale =
+            0.001f * (float)(1u + t % 5u);
+        batch_selected_host[2u * t] = (int32_t)(t & 1u);
+        batch_selected_host[2u * t + 1u] =
+            (int32_t)(1u - (t & 1u));
+        batch_weights_host[2u * t] = (t & 1u) ? 0.60f : 0.25f;
+        batch_weights_host[2u * t + 1u] =
+            1.0f - batch_weights_host[2u * t];
         for (uint32_t i = 0; i < dim; i++) {
-            batch_x_host[(uint64_t)t * dim + i] = 0.01f * (float)(t + 1u);
+            batch_x_host[(uint64_t)t * dim + i] = token_scale;
         }
     }
     ds4_gpu_tensor *batch_x = ds4_gpu_tensor_alloc(sizeof(batch_x_host));
@@ -1038,9 +1044,35 @@ static int check_moe(model_blob *blob,
     CHECK(ds4_gpu_tensor_read(batch_out, 0, batch_out_host,
                               sizeof(batch_out_host)),
           "read batch MoE output");
+    if (routed->gate_type == 12u) {
+        float batch_fallback_host[n_tokens * dim];
+        CHECK(setenv("DS4_CUDA_LAGUNA_NO_Q4_MMA", "1", 1) == 0,
+              "set Laguna Q4 MMA rollback");
+        CHECK(ds4_gpu_glm_routed_moe_batch_tensor(
+                      batch_out, batch_mid, blob->data, blob->size,
+                      routed->gate_offset, routed->up_offset,
+                      routed->down_offset, routed->gate_type,
+                      routed->up_type, routed->down_type,
+                      routed->gate_expert_bytes, routed->gate_row_bytes,
+                      routed->up_expert_bytes, routed->up_row_bytes,
+                      routed->down_expert_bytes, routed->down_row_bytes,
+                      dim, dim, dim, batch_selected, batch_weights,
+                      2u, 2u, 0u, batch_x, n_tokens, 2u * dim, false),
+              "Laguna routed batch MoE rollback");
+        CHECK(ds4_gpu_tensor_read(batch_out, 0, batch_fallback_host,
+                                  sizeof(batch_fallback_host)),
+              "read batch MoE rollback output");
+        CHECK(unsetenv("DS4_CUDA_LAGUNA_NO_Q4_MMA") == 0,
+              "clear Laguna Q4 MMA rollback");
+        for (uint32_t i = 0; i < n_tokens * dim; i++) {
+            CHECK(close_enough(batch_out_host[i],
+                               batch_fallback_host[i], 1e-6f, 1e-6f),
+                  "Laguna Q4 MMA rollback equivalence");
+        }
+    }
     for (uint32_t t = 0; t < n_tokens; t++) {
         const float batch_projection =
-            0.01f * (float)(t + 1u) * row_sum;
+            0.001f * (float)(1u + t % 5u) * row_sum;
         const float batch_expected =
             (batch_projection / (1.0f + expf(-batch_projection))) *
             batch_projection * row_sum;
