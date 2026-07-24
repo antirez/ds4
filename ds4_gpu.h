@@ -44,6 +44,12 @@ typedef struct {
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
 
+/* Hardware wavefront size: 32 on RDNA, 64 on CDNA, 0 if unknown or not
+ * applicable to this backend (Metal, CUDA). ds4.c uses this to work around
+ * a CDNA-specific correctness bug in the ROCm batched graph-prefill path;
+ * see metal_graph_streaming_decode_prefill_max_tokens(). */
+int ds4_gpu_wave_size(void);
+
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);

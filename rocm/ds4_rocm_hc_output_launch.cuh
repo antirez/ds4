@@ -201,13 +201,19 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
                 n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps);
         return cuda_ok(cudaGetLastError(), "hc split weighted sum norm launch");
     }
+    /* Multi-row fallback: norm EVERY row (rms_norm_weight_tensor is the
+     * single-row entry and would leave rows 1..n-1 of norm_out untouched). */
     return ds4_gpu_hc_split_weighted_sum_tensor(out, split, mix, residual_hc,
                                                   model_map, model_size,
                                                   scale_offset, base_offset,
                                                   n_embd, n_hc,
                                                   sinkhorn_iters, eps) &&
-           ds4_gpu_rms_norm_weight_tensor(norm_out, out, model_map, model_size,
-                                            norm_weight_offset, n_embd, norm_eps);
+           ds4_gpu_rms_norm_weight_rows_tensor(
+                   norm_out, out, model_map, model_size,
+                   norm_weight_offset, n_embd,
+                   (uint32_t)(out->bytes /
+                              ((uint64_t)n_embd * sizeof(float))),
+                   norm_eps);
 }
 extern "C" int ds4_gpu_output_hc_weights_tensor(
         ds4_gpu_tensor       *out,

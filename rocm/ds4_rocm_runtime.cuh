@@ -5742,6 +5742,14 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
 }
 
 
+extern "C" int ds4_gpu_wave_size(void) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    return cuda_device_wave_size();
+#else
+    return 0;
+#endif
+}
+
 extern "C" int ds4_gpu_init(void) {
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;

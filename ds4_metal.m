@@ -5695,6 +5695,12 @@ typedef struct {
  * session uses. Shape-dependent kernels with function constants are built
  * lazily by the small ds4_gpu_get_* caches, so startup stays predictable
  * while long-context prefill and decode can still pick specialized variants. */
+/* Metal has no wave-size-dependent kernel selection; the concept doesn't
+ * apply here. See ds4_gpu.h. */
+int ds4_gpu_wave_size(void) {
+    return 0;
+}
+
 int ds4_gpu_init(void) {
     if (g_initialized) return 1;
 
