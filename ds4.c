@@ -58901,6 +58901,32 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
         (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+        /* The lazy Q8->F16 weight caches warmed below grow until only the
+         * default reserve (~1% of VRAM) stays free, but the batched server
+         * creates its resident sessions after this point and their context
+         * buffers must still fit.  The model shape is loaded here, so the
+         * per-session estimate is exact.  An explicit
+         * DS4_CUDA_Q8_F16_CACHE_RESERVE_MB in the environment always wins. */
+        if (opt->resident_sessions > 0) {
+            const uint32_t reserve_pc =
+                opt->prefill_chunk ? opt->prefill_chunk : 4096u;
+            const ds4_context_memory rm =
+                ds4_context_memory_estimate_with_prefill_mode(
+                        e->backend, opt->context_size, reserve_pc,
+                        opt->ssd_streaming);
+            const uint64_t reserve_mib = 768ull +
+                    (rm.total_bytes / (1024ull * 1024ull) + 128ull) *
+                            (uint64_t)opt->resident_sessions +
+                    512ull;
+            char reserve_buf[32];
+            snprintf(reserve_buf, sizeof(reserve_buf), "%llu",
+                     (unsigned long long)reserve_mib);
+            setenv("DS4_CUDA_Q8_F16_CACHE_RESERVE_MB", reserve_buf, 0);
+            fprintf(stderr,
+                    "ds4: reserving %llu MiB of VRAM from the weight cache for %d resident sessions\n",
+                    (unsigned long long)reserve_mib,
+                    opt->resident_sessions);
+        }
         if (!accelerator_cache_model_tensors(e->backend, &e->model,
                                              load_offsets, load_sizes,
                                              load_span_count)) {
