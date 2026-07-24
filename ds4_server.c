@@ -10813,6 +10813,11 @@ static void server_generation_enter(server *s) {
     if (!s || !s->batched_mode) return;
     pthread_mutex_lock(&s->model_mu);
     s->active_generations++;
+    /* Reserve the next model turn immediately. A different prefill may have
+     * acquired the executor after this request's final prefill quantum but
+     * before it registered as a generator; waiting until that prefill leaves
+     * can otherwise repeat the first-token starvation race. */
+    s->decode_handoff = true;
     pthread_cond_broadcast(&s->model_cv);
     pthread_mutex_unlock(&s->model_mu);
 }
@@ -13230,10 +13235,13 @@ static void test_batched_prefill_hands_off_to_active_decode(void) {
     server s = {0};
     s.batched_mode = true;
     s.model_busy = true;
-    s.active_generations = 1;
     pthread_mutex_init(&s.inference_mu, NULL);
     pthread_mutex_init(&s.model_mu, NULL);
     pthread_cond_init(&s.model_cv, NULL);
+
+    server_generation_enter(&s);
+    TEST_ASSERT(s.active_generations == 1);
+    TEST_ASSERT(s.decode_handoff);
 
     test_prefill_handoff_state state = {.srv = &s};
     pthread_mutex_init(&state.mu, NULL);
@@ -13264,10 +13272,11 @@ static void test_batched_prefill_hands_off_to_active_decode(void) {
     struct timespec deadline;
     clock_gettime(CLOCK_REALTIME, &deadline);
     timespec_add_us(&deadline, 1000000);
-    while (!s.decode_handoff) {
+    while (s.model_busy || !s.decode_handoff) {
         int rc = pthread_cond_timedwait(&s.model_cv, &s.model_mu, &deadline);
         if (rc == ETIMEDOUT) break;
     }
+    TEST_ASSERT(!s.model_busy);
     TEST_ASSERT(s.decode_handoff);
     pthread_mutex_lock(&state.mu);
     TEST_ASSERT(!state.done);
@@ -13282,6 +13291,9 @@ static void test_batched_prefill_hands_off_to_active_decode(void) {
     pthread_mutex_lock(&state.mu);
     TEST_ASSERT(state.done);
     pthread_mutex_unlock(&state.mu);
+    server_generation_leave(&s);
+    TEST_ASSERT(s.active_generations == 0);
+    TEST_ASSERT(!s.decode_handoff);
     pthread_cond_destroy(&state.cv);
     pthread_mutex_destroy(&state.mu);
     pthread_cond_destroy(&s.model_cv);
