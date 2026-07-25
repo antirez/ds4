@@ -1755,12 +1755,20 @@ static int cuda_model_copy_to_device_streamed_ex(
         return 0;
     }
     if (bytes == 0) return 1;
-    /* DS4_CUDA_STREAM_MISS_PLAIN_COPY=1: upload straight from the (pageable)
-     * model map and let the driver stage internally — measurement switch for
-     * page-cache/tmpfs maps where the pread bounce is the bottleneck. */
+    /* Upload straight from the (pageable) model map when there is no
+     * O_DIRECT read path: for page-cache/tmpfs-backed maps the driver's
+     * pageable upload runs ~3x faster than the pread bounce (measured
+     * ~2.3ms -> ~0.8ms per 13.5 MiB expert, decode 23.5 -> 30 tok/s).
+     * Real direct-I/O SSD streaming keeps the staged pread path.
+     * DS4_CUDA_STREAM_MISS_PLAIN_COPY=1/0 forces either way. */
     static int plain_copy = -1;
     if (plain_copy < 0) {
-        plain_copy = getenv("DS4_CUDA_STREAM_MISS_PLAIN_COPY") != NULL;
+        const char *env = getenv("DS4_CUDA_STREAM_MISS_PLAIN_COPY");
+        if (env && env[0]) {
+            plain_copy = strcmp(env, "0") != 0;
+        } else {
+            plain_copy = g_model_direct_fd < 0 ? 1 : 0;
+        }
     }
     if (g_model_fd < 0 || plain_copy ||
         (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base)) {
