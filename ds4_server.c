@@ -6718,6 +6718,12 @@ static bool request_uses_structured_stream(const request *r) {
                          request_uses_openai_structured_stream(r));
 }
 
+static bool request_can_retry_uncommitted_tool_call(const request *r) {
+    if (!r->stream) return true;
+    return request_uses_openai_structured_stream(r) &&
+           !request_uses_openai_live_stream(r);
+}
+
 /* Codex' Responses API uses 24-hex suffixes for response/item ids. Prefix
  * controls the variant (resp_, rs_, msg_, fc_) so each event references a
  * stable identifier across output_item.added / .done. */
@@ -11938,7 +11944,8 @@ decode_again:
             tool_calls_free(&test_calls);
         }
         if (!completed_truncation) {
-            if (!j->req.stream && !dsml_recovery_attempted) {
+            if (request_can_retry_uncommitted_tool_call(&j->req) &&
+                !dsml_recovery_attempted) {
                 int recovery_tokens = 0;
                 char recovery_err[160] = {0};
                 server_log(DS4_LOG_WARNING,
@@ -12021,7 +12028,8 @@ decode_again:
              * Semantic repair is intentionally avoided: if the parser cannot
              * execute the block, feed the model a tool error and the protocol
              * reminder so it owns the corrected next action. */
-            if (!j->req.stream && !dsml_recovery_attempted) {
+            if (request_can_retry_uncommitted_tool_call(&j->req) &&
+                !dsml_recovery_attempted) {
                 int recovery_tokens = 0;
                 char recovery_err[160] = {0};
                 const char *detail = err[0] ? err : "invalid tool call";
@@ -14307,6 +14315,7 @@ static void test_laguna_repeated_thinking_close_uses_authoritative_final_stream(
 
     TEST_ASSERT(request_uses_structured_stream(&r));
     TEST_ASSERT(!request_uses_openai_live_stream(&r));
+    TEST_ASSERT(request_can_retry_uncommitted_tool_call(&r));
     TEST_ASSERT(parse_generated_message_ex_for_syntax(
         SERVER_MODEL_SYNTAX_LAGUNA, raw, true,
         &content, &reasoning, &calls));
