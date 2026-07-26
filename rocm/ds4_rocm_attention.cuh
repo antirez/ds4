@@ -1630,3 +1630,114 @@ __global__ static void attention_prefill_tiled_raw_online_kernel(
         out4[lane + 96u] = o3;
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// Tiled fused single-pass prefill — online softmax with double-precision
+// correction.  Loads KV into shared memory ONCE per group of 4 rows for
+// both score and accumulation.  head_dim=512 only.
+// ---------------------------------------------------------------------------
+
+__global__ static void attention_prefill_sp_online_kernel(
+        float *heads,
+        const float *sinks,
+        const float *q,
+        const float *raw_kv,
+        uint32_t n_tokens,
+        uint32_t window,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    uint32_t t = blockIdx.x;
+    uint32_t head_group = blockIdx.y;
+    if (t >= n_tokens || head_dim != 512u) return;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t head = head_group * 8u + warp;
+    const bool valid_head = head < n_head;
+
+    const uint32_t raw_count = window != 0u && t + 1u > window ? window : t + 1u;
+    const uint32_t raw_start = t + 1u - raw_count;
+    const float scale = rsqrtf((float)head_dim);
+
+    const float4 *q4 = valid_head
+        ? (const float4 *)(q + ((uint64_t)t * n_head + head) * head_dim)
+        : NULL;
+    float4 qv[4];
+    if (valid_head) {
+        qv[0] = q4[lane +  0u];
+        qv[1] = q4[lane + 32u];
+        qv[2] = q4[lane + 64u];
+        qv[3] = q4[lane + 96u];
+    }
+
+    double running_max  = valid_head ? (double)sinks[head] : -INFINITY;
+    double running_denom = valid_head ? 1.0 : 0.0;
+    float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 o1 = o0, o2 = o0, o3 = o0;
+
+    __shared__ float4 kv_shared[4 * 128];
+
+    for (uint32_t row0 = 0; row0 < raw_count; row0 += 4u) {
+        const uint32_t nr = raw_count - row0 < 4u ? raw_count - row0 : 4u;
+        for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
+            const uint32_t rr = off >> 7u;
+            const uint32_t c4 = off & 127u;
+            const uint32_t sr = raw_start + row0 + rr;
+            const float4 *src = (const float4 *)(raw_kv + (uint64_t)sr * head_dim);
+            kv_shared[off] = src[c4];
+        }
+        __syncthreads();
+        if (valid_head) {
+            for (uint32_t rr = 0; rr < nr; rr++) {
+                const float4 *kv4 = kv_shared + rr * 128u;
+                float4 k0 = kv4[lane +  0u];
+                float4 k1 = kv4[lane + 32u];
+                float4 k2 = kv4[lane + 64u];
+                float4 k3 = kv4[lane + 96u];
+                float score = (dot4_f32(qv[0], k0) + dot4_f32(qv[1], k1) +
+                               dot4_f32(qv[2], k2) + dot4_f32(qv[3], k3))
+                              * scale;
+                score = __shfl_sync(FULL_WARP_MASK, score, 0);
+
+                const double sd = (double)score;
+                const double new_max = fmax(running_max, sd);
+                const double rescale = exp(running_max - new_max);
+                const double row_scale = exp(sd - new_max);
+
+                running_denom = running_denom * rescale + row_scale;
+                o0.x = (float)((double)o0.x * rescale) + k0.x * (float)row_scale;
+                o0.y = (float)((double)o0.y * rescale) + k0.y * (float)row_scale;
+                o0.z = (float)((double)o0.z * rescale) + k0.z * (float)row_scale;
+                o0.w = (float)((double)o0.w * rescale) + k0.w * (float)row_scale;
+                o1.x = (float)((double)o1.x * rescale) + k1.x * (float)row_scale;
+                o1.y = (float)((double)o1.y * rescale) + k1.y * (float)row_scale;
+                o1.z = (float)((double)o1.z * rescale) + k1.z * (float)row_scale;
+                o1.w = (float)((double)o1.w * rescale) + k1.w * (float)row_scale;
+                o2.x = (float)((double)o2.x * rescale) + k2.x * (float)row_scale;
+                o2.y = (float)((double)o2.y * rescale) + k2.y * (float)row_scale;
+                o2.z = (float)((double)o2.z * rescale) + k2.z * (float)row_scale;
+                o2.w = (float)((double)o2.w * rescale) + k2.w * (float)row_scale;
+                o3.x = (float)((double)o3.x * rescale) + k3.x * (float)row_scale;
+                o3.y = (float)((double)o3.y * rescale) + k3.y * (float)row_scale;
+                o3.z = (float)((double)o3.z * rescale) + k3.z * (float)row_scale;
+                o3.w = (float)((double)o3.w * rescale) + k3.w * (float)row_scale;
+
+                running_max = new_max;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (valid_head) {
+        const double inv_s = running_denom == 0.0 ? 0.0 : 1.0 / running_denom;
+        float4 *out4 = (float4 *)(heads + ((uint64_t)t * n_head + head) * head_dim);
+        out4[lane +  0u] = make_float4((float)(o0.x * inv_s), (float)(o0.y * inv_s),
+                                        (float)(o0.z * inv_s), (float)(o0.w * inv_s));
+        out4[lane + 32u] = make_float4((float)(o1.x * inv_s), (float)(o1.y * inv_s),
+                                        (float)(o1.z * inv_s), (float)(o1.w * inv_s));
+        out4[lane + 64u] = make_float4((float)(o2.x * inv_s), (float)(o2.y * inv_s),
+                                        (float)(o2.z * inv_s), (float)(o2.w * inv_s));
+        out4[lane + 96u] = make_float4((float)(o3.x * inv_s), (float)(o3.y * inv_s),
+                                        (float)(o3.z * inv_s), (float)(o3.w * inv_s));
+    }
+}

@@ -140,17 +140,17 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
         return cuda_ok(cudaGetLastError(), "attention raw window launch");
     }
     /* Tiled fused online-prefill for larger windows (head_dim=512).
-     * Replaces the cublas pack → SGEMM → softmax → SGEMM → unpack pipeline
-     * with a single kernel that tiles KV rows and keeps scores on-chip. */
+     * Single-pass variant: online softmax with double-precision correction.
+     * Loads KV once, no separate score/softmax/value passes. */
     if (n_tokens > 1 && head_dim == 512 && !g_quality_mode) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
-        attention_prefill_tiled_raw_online_kernel<<<grid, 256>>>(
+        attention_prefill_sp_online_kernel<<<grid, 256>>>(
                 (float *)heads->ptr,
                 sinks,
                 (const float *)q->ptr,
                 (const float *)raw_kv->ptr,
                 n_tokens, window, n_head, head_dim);
-        return cuda_ok(cudaGetLastError(), "attention tiled online launch");
+        return cuda_ok(cudaGetLastError(), "attention sp online launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512) {
         const uint32_t n_keys = n_tokens;
