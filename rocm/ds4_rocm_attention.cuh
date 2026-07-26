@@ -186,9 +186,6 @@ __global__ static void attention_prefill_raw_softmax_kernel(
     uint32_t h = blockIdx.y;
     if (t >= n_tokens) return;
     float *row = scores + ((uint64_t)h * n_tokens + t) * n_keys;
-    __shared__ float partial[256];
-    __shared__ float max_s;
-    __shared__ float denom;
     float local_max = sinks[h];
     for (uint32_t k = threadIdx.x; k < n_keys; k += blockDim.x) {
         bool valid = k <= t && (window == 0 || t - k < window);
@@ -196,28 +193,14 @@ __global__ static void attention_prefill_raw_softmax_kernel(
         row[k] = s;
         local_max = fmaxf(local_max, s);
     }
-    partial[threadIdx.x] = local_max;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) max_s = partial[0];
-    __syncthreads();
+    const float max_s = block_reduce_f32_max(local_max);
     float den_local = 0.0f;
     for (uint32_t k = threadIdx.x; k < n_keys; k += blockDim.x) {
         float p = isfinite(row[k]) ? expf(row[k] - max_s) : 0.0f;
         row[k] = p;
         den_local += p;
     }
-    partial[threadIdx.x] = den_local;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) denom = partial[0] + expf(sinks[h] - max_s);
-    __syncthreads();
+    const float denom = block_reduce_f32_sum(den_local) + expf(sinks[h] - max_s);
     for (uint32_t k = threadIdx.x; k < n_keys; k += blockDim.x) row[k] /= denom;
 }
 
@@ -235,9 +218,6 @@ __global__ static void attention_prefill_mixed_softmax_kernel(
     uint32_t h = blockIdx.y;
     if (t >= n_tokens || ratio == 0) return;
     float *row = scores + ((uint64_t)h * n_tokens + t) * n_keys;
-    __shared__ float partial[256];
-    __shared__ float max_s;
-    __shared__ float denom;
     float local_max = sinks[h];
     const uint32_t visible_comp = (t + 1u) / ratio;
     for (uint32_t k = threadIdx.x; k < n_keys; k += blockDim.x) {
@@ -254,28 +234,14 @@ __global__ static void attention_prefill_mixed_softmax_kernel(
         row[k] = s;
         local_max = fmaxf(local_max, s);
     }
-    partial[threadIdx.x] = local_max;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) max_s = partial[0];
-    __syncthreads();
+    const float max_s = block_reduce_f32_max(local_max);
     float den_local = 0.0f;
     for (uint32_t k = threadIdx.x; k < n_keys; k += blockDim.x) {
         float p = isfinite(row[k]) ? expf(row[k] - max_s) : 0.0f;
         row[k] = p;
         den_local += p;
     }
-    partial[threadIdx.x] = den_local;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) denom = partial[0] + expf(sinks[h] - max_s);
-    __syncthreads();
+    const float denom = block_reduce_f32_sum(den_local) + expf(sinks[h] - max_s);
     for (uint32_t k = threadIdx.x; k < n_keys; k += blockDim.x) row[k] /= denom;
 }
 
@@ -296,9 +262,6 @@ __global__ static void attention_prefill_mixed_softmax_tile_kernel(
     if (t >= tile_tokens || ratio == 0) return;
     const uint32_t global_t = tile_start + t;
     float *row = scores + ((uint64_t)h * tile_tokens + t) * n_keys;
-    __shared__ float partial[256];
-    __shared__ float max_s;
-    __shared__ float denom;
     float local_max = sinks[h];
     const uint32_t visible_comp = (global_t + 1u) / ratio;
     for (uint32_t k = threadIdx.x; k < n_keys; k += blockDim.x) {
@@ -315,28 +278,14 @@ __global__ static void attention_prefill_mixed_softmax_tile_kernel(
         row[k] = s;
         local_max = fmaxf(local_max, s);
     }
-    partial[threadIdx.x] = local_max;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) max_s = partial[0];
-    __syncthreads();
+    const float max_s = block_reduce_f32_max(local_max);
     float den_local = 0.0f;
     for (uint32_t k = threadIdx.x; k < n_keys; k += blockDim.x) {
         float p = isfinite(row[k]) ? expf(row[k] - max_s) : 0.0f;
         row[k] = p;
         den_local += p;
     }
-    partial[threadIdx.x] = den_local;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) denom = partial[0] + expf(sinks[h] - max_s);
-    __syncthreads();
+    const float denom = block_reduce_f32_sum(den_local) + expf(sinks[h] - max_s);
     for (uint32_t k = threadIdx.x; k < n_keys; k += blockDim.x) row[k] /= denom;
 }
 
