@@ -626,14 +626,21 @@ kernel void kernel_laguna_commit_kv_f16(
         device half *value_cache,
         uint gid [[thread_position_in_grid]]) {
     const uint width = args.n_head_kv * args.head_dim;
-    const uint values = args.n_tokens * width;
+    // Only the newest cache_cap rows survive in the ring. Dispatching older
+    // rows as well races multiple threads onto the same destination when a
+    // prefill chunk is wider than the sliding window.
+    const uint commit_tokens = min(args.n_tokens, args.cache_cap);
+    const uint token0 = args.n_tokens - commit_tokens;
+    const uint values = commit_tokens * width;
     if (gid >= values) return;
-    const uint token = gid / width;
-    const uint col = gid - token * width;
+    const uint local_token = gid / width;
+    const uint token = token0 + local_token;
+    const uint col = gid - local_token * width;
     const uint cache_row = (args.pos0 + token) % args.cache_cap;
     const uint64_t dst = (uint64_t)cache_row * width + col;
-    key_cache[dst] = staged_key[gid];
-    value_cache[dst] = staged_value[gid];
+    const uint64_t src = (uint64_t)token * width + col;
+    key_cache[dst] = staged_key[src];
+    value_cache[dst] = staged_value[src];
 }
 
 struct ds4_metal_args_laguna_attention {
