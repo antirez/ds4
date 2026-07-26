@@ -4408,6 +4408,7 @@ extern "C" void ds4_gpu_cleanup(void) {
 #ifdef __HIP_PLATFORM_AMD__
     hipblaslt_gemm_plan_clear();
     hipblaslt_sb_plan_clear();
+    hipblaslt_f16_f32_plan_clear();
 #endif
     if (g_cublas_ready) {
         (void)cublasDestroy(g_cublas);

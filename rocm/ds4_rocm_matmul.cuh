@@ -128,6 +128,12 @@ static int cuda_matmul_q8_0_tensor_f16_gemm(
     if (!xh) return 0;
     f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256>>>(xh, (const float *)x->ptr, xh_count);
     if (!cuda_ok(cudaGetLastError(), "q8 f16 activation convert launch")) return 0;
+#ifdef __HIP_PLATFORM_AMD__
+    if (g_hipblaslt_ready &&
+        hipblaslt_gemm_tn_f16_out_f32((float *)out->ptr, w_f16, xh,
+                                      (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)in_dim, "q8_matmulf16"))
+        return 1;
+#endif
     const float alpha = 1.0f;
     const float beta = 0.0f;
     cublasStatus_t st = cublasGemmEx(g_cublas,
@@ -645,6 +651,12 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         if (!xh) return 0;
         f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
         if (!cuda_ok(cudaGetLastError(), "f16 activation convert launch")) return 0;
+#ifdef __HIP_PLATFORM_AMD__
+        if (g_hipblaslt_ready &&
+            hipblaslt_gemm_tn_f16_out_f32((float *)out->ptr, w, xh,
+                                          (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)in_dim, "f16_matmulf16"))
+            return 1;
+#endif
         const float alpha = 1.0f;
         const float beta = 0.0f;
         cublasStatus_t st = cublasGemmEx(g_cublas,

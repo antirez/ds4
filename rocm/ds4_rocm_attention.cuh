@@ -47,9 +47,9 @@ __global__ static void attention_prefill_raw_kernel(
         for (uint32_t i = 0; i < n4; i++) {
             const float4 qv  = q4[i];
             const float4 kvv = kv4[i];
-            dot += qv.x * kvv.x + qv.y * kvv.y + qv.z * kvv.z + qv.w * kvv.w;
+            dot += dot4_f32(qv, kvv);
         }
-        for (uint32_t d = tail; d < head_dim; d++) dot += qh[d] * (raw_kv[(uint64_t)(raw_start + r) * head_dim + d]);
+        if (head_dim & 3) for (uint32_t d = tail; d < head_dim; d++) dot += qh[d] * (raw_kv[(uint64_t)(raw_start + r) * head_dim + d]);
         scores[r] = dot * scale;
         local_max = fmaxf(local_max, scores[r]);
     }
@@ -121,9 +121,9 @@ __global__ static void attention_prefill_mixed_kernel(
         for (uint32_t i = 0; i < n4; i++) {
             const float4 qv  = q4[i];
             const float4 kvv = kv4[i];
-            dot += qv.x * kvv.x + qv.y * kvv.y + qv.z * kvv.z + qv.w * kvv.w;
+            dot += dot4_f32(qv, kvv);
         }
-        for (uint32_t d = tail; d < head_dim; d++) dot += qh[d] * (raw_kv[(uint64_t)(raw_start + r) * head_dim + d]);
+        if (head_dim & 3) for (uint32_t d = tail; d < head_dim; d++) dot += qh[d] * (raw_kv[(uint64_t)(raw_start + r) * head_dim + d]);
         scores[r] = dot * scale;
         local_max = fmaxf(local_max, scores[r]);
     }
@@ -138,9 +138,9 @@ __global__ static void attention_prefill_mixed_kernel(
             for (uint32_t i = 0; i < n4; i++) {
                 const float4 qv  = q4[i];
                 const float4 kvv = kv4[i];
-                dot += qv.x * kvv.x + qv.y * kvv.y + qv.z * kvv.z + qv.w * kvv.w;
+                dot += dot4_f32(qv, kvv);
             }
-            for (uint32_t d = tail; d < head_dim; d++) dot += qh[d] * (comp_kv[(uint64_t)c * head_dim + d]);
+            if (head_dim & 3) for (uint32_t d = tail; d < head_dim; d++) dot += qh[d] * (comp_kv[(uint64_t)c * head_dim + d]);
             s = dot * scale + add;
         }
         scores[raw_count + c] = s;
@@ -1465,172 +1465,6 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
         out4[lane + 96u] = o3;
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tiled fused prefill kernel  —  tile KV rows with two-pass softmax per tile,
-// never write scores to global memory.  Replaces the cublas pack → SGEMM →
-// softmax → SGEMM → unpack pipeline with a single kernel for head_dim=512.
-// ---------------------------------------------------------------------------
-
-__global__ static void attention_prefill_tiled_raw_online_kernel(
-        float *heads,
-        const float *sinks,
-        const float *q,
-        const float *raw_kv,
-        uint32_t n_tokens,
-        uint32_t window,
-        uint32_t n_head,
-        uint32_t head_dim) {
-    uint32_t t = blockIdx.x;
-    uint32_t head_group = blockIdx.y;
-    if (t >= n_tokens || head_dim != 512u) return;
-    const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t warp = threadIdx.x >> 5u;
-    const uint32_t head = head_group * 8u + warp;
-    const bool valid_head = head < n_head;
-
-    const uint32_t raw_count = window != 0u && t + 1u > window ? window : t + 1u;
-    const uint32_t raw_start = t + 1u - raw_count;
-    const uint32_t n_score = raw_count;
-    const float scale = rsqrtf((float)head_dim);
-
-    // Per-warp Q load (into registers)
-    const float4 *q4 = valid_head
-        ? (const float4 *)(q + ((uint64_t)t * n_head + head) * head_dim)
-        : NULL;
-    float4 qv0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float4 qv1 = qv0, qv2 = qv0, qv3 = qv0;
-    if (valid_head) {
-        qv0 = q4[lane +  0u];
-        qv1 = q4[lane + 32u];
-        qv2 = q4[lane + 64u];
-        qv3 = q4[lane + 96u];
-    }
-
-    // Running online-softmax state (per-warp)
-    float running_max  = valid_head ? sinks[head] : -INFINITY;
-    float running_denom = valid_head ? 1.0f : 0.0f;
-    float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float4 o1 = o0, o2 = o0, o3 = o0;
-
-    const uint32_t TILE = 384u;
-    __shared__ float4 kv_shared[4 * 128];
-    __shared__ float tile_scores[8 * TILE];  // 8 warps × TILE = 12 KiB
-
-    for (uint32_t tile0 = 0; tile0 < n_score; tile0 += TILE) {
-        const uint32_t tile_nr = n_score - tile0 < TILE ? n_score - tile0 : TILE;
-
-        // --- Pass 1: score computation for this tile ---
-        for (uint32_t row0 = 0; row0 < tile_nr; row0 += 4u) {
-            const uint32_t nr = tile_nr - row0 < 4u ? tile_nr - row0 : 4u;
-            for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
-                const uint32_t rr = off >> 7u;
-                const uint32_t c4 = off & 127u;
-                const uint32_t sr = tile0 + row0 + rr;
-                const float4 *src = (const float4 *)(raw_kv + (uint64_t)(raw_start + sr) * head_dim);
-                kv_shared[off] = src[c4];
-            }
-            __syncthreads();
-            if (valid_head) {
-                for (uint32_t rr = 0; rr < nr; rr++) {
-                    const float4 *kv4 = kv_shared + rr * 128u;
-                    float4 k0 = kv4[lane +  0u];
-                    float4 k1 = kv4[lane + 32u];
-                    float4 k2 = kv4[lane + 64u];
-                    float4 k3 = kv4[lane + 96u];
-                    float score = dot4_f32(qv0, k0) +
-                                  dot4_f32(qv1, k1) +
-                                  dot4_f32(qv2, k2) +
-                                  dot4_f32(qv3, k3);
-                    score = warp_sum_f32(score) * scale;
-                    score = __shfl_sync(FULL_WARP_MASK, score, 0);
-                    if (lane == 0u)
-                        tile_scores[warp * TILE + row0 + rr] = score;
-                }
-            }
-            __syncthreads();
-        }
-
-        // --- Reduce: tile max ---
-        float tile_max = -INFINITY;
-        if (valid_head) {
-            const float *ts = tile_scores + warp * TILE;
-            for (uint32_t i = lane; i < tile_nr; i += 32u)
-                tile_max = fmaxf(tile_max, ts[i]);
-            tile_max = warp_max_f32(tile_max);
-            tile_max = __shfl_sync(FULL_WARP_MASK, tile_max, 0);
-        }
-
-        // --- Rescale running accumulator ---
-        const float new_max = fmaxf(running_max, tile_max);
-        const float old_scale = expf(running_max - new_max);
-        const float sink_add  = expf(sinks[head] - new_max) - expf(sinks[head] - running_max) * old_scale;
-        running_denom = running_denom * old_scale;
-        o0.x *= old_scale; o0.y *= old_scale; o0.z *= old_scale; o0.w *= old_scale;
-        o1.x *= old_scale; o1.y *= old_scale; o1.z *= old_scale; o1.w *= old_scale;
-        o2.x *= old_scale; o2.y *= old_scale; o2.z *= old_scale; o2.w *= old_scale;
-        o3.x *= old_scale; o3.y *= old_scale; o3.z *= old_scale; o3.w *= old_scale;
-
-        // --- Softmax the tile scores, then accumulate weighted values ---
-        float tile_denom = 0.0f;
-        if (valid_head) {
-            float *ts = tile_scores + warp * TILE;
-            for (uint32_t i = lane; i < tile_nr; i += 32u) {
-                float p = expf(ts[i] - new_max);
-                ts[i] = p;
-                tile_denom += p;
-            }
-            tile_denom = warp_sum_f32(tile_denom);
-            tile_denom = __shfl_sync(FULL_WARP_MASK, tile_denom, 0);
-        }
-        running_denom += tile_denom + sink_add;
-        running_max = new_max;
-
-        // --- Pass 2: weighted value accumulation ---
-        for (uint32_t row0 = 0; row0 < tile_nr; row0 += 4u) {
-            const uint32_t nr = tile_nr - row0 < 4u ? tile_nr - row0 : 4u;
-            for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
-                const uint32_t rr = off >> 7u;
-                const uint32_t c4 = off & 127u;
-                const uint32_t sr = tile0 + row0 + rr;
-                const float4 *src = (const float4 *)(raw_kv + (uint64_t)(raw_start + sr) * head_dim);
-                kv_shared[off] = src[c4];
-            }
-            __syncthreads();
-            if (valid_head) {
-                const float *ts = tile_scores + warp * TILE;
-                for (uint32_t rr = 0; rr < nr; rr++) {
-                    const float p = ts[row0 + rr];
-                    const float4 *kv4 = kv_shared + rr * 128u;
-                    float4 k0 = kv4[lane +  0u];
-                    float4 k1 = kv4[lane + 32u];
-                    float4 k2 = kv4[lane + 64u];
-                    float4 k3 = kv4[lane + 96u];
-                    o0.x += k0.x * p; o0.y += k0.y * p; o0.z += k0.z * p; o0.w += k0.w * p;
-                    o1.x += k1.x * p; o1.y += k1.y * p; o1.z += k1.z * p; o1.w += k1.w * p;
-                    o2.x += k2.x * p; o2.y += k2.y * p; o2.z += k2.z * p; o2.w += k2.w * p;
-                    o3.x += k3.x * p; o3.y += k3.y * p; o3.z += k3.z * p; o3.w += k3.w * p;
-                }
-            }
-            __syncthreads();
-        }
-    }
-
-    // Final normalization and write-back
-    if (valid_head) {
-        const float inv_s = running_denom == 0.0f ? 0.0f : 1.0f / running_denom;
-        o0.x *= inv_s; o0.y *= inv_s; o0.z *= inv_s; o0.w *= inv_s;
-        o1.x *= inv_s; o1.y *= inv_s; o1.z *= inv_s; o1.w *= inv_s;
-        o2.x *= inv_s; o2.y *= inv_s; o2.z *= inv_s; o2.w *= inv_s;
-        o3.x *= inv_s; o3.y *= inv_s; o3.z *= inv_s; o3.w *= inv_s;
-        float4 *out4 = (float4 *)(heads + ((uint64_t)t * n_head + head) * head_dim);
-        out4[lane +  0u] = o0;
-        out4[lane + 32u] = o1;
-        out4[lane + 64u] = o2;
-        out4[lane + 96u] = o3;
-    }
-}
-
 
 // ---------------------------------------------------------------------------
 // Tiled fused single-pass prefill — online softmax with double-precision

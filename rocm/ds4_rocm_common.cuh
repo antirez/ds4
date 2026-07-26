@@ -347,6 +347,60 @@ __device__ static float warp_max_f32(float v) {
     return v;
 }
 
+// Block-wide parallel reduction using intra-warp shfl + one shared-mem barrier.
+// Replaces the sequential stride-based reduction loop with O(log(warps)) steps,
+// reducing __syncthreads() calls from ~9 to just 2 while guaranteeing every thread
+// gets the correct result via a final broadcast.
+__device__ static float block_reduce_f32_sum(float v) {
+    const uint32_t tid = threadIdx.x;
+    // Intra-warp parallel reduction via shfl_down_sync — mask selects all lanes.
+    for (int offset = 16; offset > 0; offset >>= 1)
+        v += __shfl_down_sync((uint64_t)(-1), v, offset);
+
+    const uint32_t lane = tid & 31u;   // 0..31 within warp
+    const uint32_t wid  = tid >> 5u;    // 0..7 for blockDim.x=256
+
+    __shared__ float partial[8];        // one entry per warp (up to 8 warps)
+
+    if (lane == 0u) partial[wid] = v;
+    __syncthreads();
+
+    // First warp finishes the final reduction using shfl.
+    float r = (tid < 8u) ? partial[tid] : 0.0f;
+    for (int offset = 4; offset > 0; offset >>= 1) {
+        r += __shfl_down_sync((uint64_t)(-1), r, offset);
+    }
+    // Only thread 0 has the correct sum — broadcast to all threads.
+    if (tid == 0u) partial[0] = r;
+    __syncthreads();
+    return partial[0];
+}
+
+__device__ static float block_reduce_f32_max(float v) {
+    const uint32_t tid = threadIdx.x;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v = fmaxf(v, __shfl_down_sync((uint64_t)(-1), v, offset));
+    }
+
+    const uint32_t lane = tid & 31u;
+    const uint32_t wid  = tid >> 5u;
+
+    __shared__ float partial[8];
+    if (lane == 0u) partial[wid] = v;
+    __syncthreads();
+
+    float r = (tid < 8u) ? partial[tid] : -INFINITY;
+    for (int offset = 4; offset > 0; offset >>= 1) {
+        r = fmaxf(r, __shfl_down_sync((uint64_t)(-1), r, offset));
+    }
+    // Only thread 0 has the correct max — broadcast to all threads.
+    if (tid == 0u) partial[0] = r;
+    __syncthreads();
+    return partial[0];
+}
+
+
+
 __device__ static uint16_t f32_to_f16_bits_hip_round(float f) {
     union { float f; uint32_t u; } v;
     v.f = f;

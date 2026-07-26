@@ -298,3 +298,116 @@ static int hipblaslt_gemm_strided_batched_f32(
                                         NULL, 0, 0),
                         label ? label : "sb_gemm");
 }
+
+// ---------------------------------------------------------------------------
+// FP16→FP32 GEMM via hipBLASLt  (for MoE prefill matmuls: FP16 weights +
+// FP16 activations → FP32 output).  Keyed on (out_dim, n_tok, in_dim).
+// ---------------------------------------------------------------------------
+
+struct cuda_hipblaslt_gemm_plan_f16_out_f32 {
+    uint32_t out_dim, n_tok, in_dim;
+    hipblasLtMatmulDesc_t desc;
+    hipblasLtMatrixLayout_t a_desc, b_desc, c_desc, d_desc;
+    hipblasLtMatmulAlgo_t algo;
+};
+
+static std::vector<cuda_hipblaslt_gemm_plan_f16_out_f32> g_hipblaslt_f16_f32_plans;
+
+static void hipblaslt_f16_f32_plan_clear(void) {
+    for (auto &p : g_hipblaslt_f16_f32_plans) {
+        if (p.d_desc) (void)hipblasLtMatrixLayoutDestroy(p.d_desc);
+        if (p.c_desc) (void)hipblasLtMatrixLayoutDestroy(p.c_desc);
+        if (p.b_desc) (void)hipblasLtMatrixLayoutDestroy(p.b_desc);
+        if (p.a_desc) (void)hipblasLtMatrixLayoutDestroy(p.a_desc);
+        if (p.desc) (void)hipblasLtMatmulDescDestroy(p.desc);
+    }
+    g_hipblaslt_f16_f32_plans.clear();
+}
+
+static cuda_hipblaslt_gemm_plan_f16_out_f32 *hipblaslt_gemm_plan_get_f16_f32(
+        uint32_t out_dim, uint32_t n_tok, uint32_t in_dim, const char *label) {
+    for (auto &p : g_hipblaslt_f16_f32_plans)
+        if (p.out_dim == out_dim && p.n_tok == n_tok && p.in_dim == in_dim)
+            return &p;
+
+    hipblasLtMatmulDesc_t desc = NULL;
+    hipblasLtMatrixLayout_t a_desc = NULL, b_desc = NULL, c_desc = NULL, d_desc = NULL;
+    hipblasLtMatmulPreference_t pref = NULL;
+    hipblasLtMatmulHeuristicResult_t heur[8];
+    int returned = 0, ok = 0;
+    do {
+        if (!hipblaslt_ok(hipblasLtMatmulDescCreate(&desc, HIPBLAS_COMPUTE_32F, HIP_R_32F),
+                          "f16_f32 desc")) break;
+        hipblasOperation_t op_a = HIPBLAS_OP_T;
+        hipblasOperation_t op_b = HIPBLAS_OP_N;
+        if (!hipblaslt_ok(hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSA,
+                                                          &op_a, sizeof(op_a)), "set transA")) break;
+        if (!hipblaslt_ok(hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSB,
+                                                          &op_b, sizeof(op_b)), "set transB")) break;
+        // A = FP16 weight (in_dim × out_dim, transposed)
+        if (!hipblaslt_ok(hipblasLtMatrixLayoutCreate(&a_desc, HIP_R_16F, in_dim, out_dim, in_dim),
+                          "f16_f32 A")) break;
+        // B = FP16 activation (in_dim × n_tok)
+        if (!hipblaslt_ok(hipblasLtMatrixLayoutCreate(&b_desc, HIP_R_16F, in_dim, n_tok, in_dim),
+                          "f16_f32 B")) break;
+        // C = FP32 output (out_dim × n_tok)
+        if (!hipblaslt_ok(hipblasLtMatrixLayoutCreate(&c_desc, HIP_R_32F, out_dim, n_tok, out_dim),
+                          "f16_f32 C")) break;
+        if (!hipblaslt_ok(hipblasLtMatrixLayoutCreate(&d_desc, HIP_R_32F, out_dim, n_tok, out_dim),
+                          "f16_f32 D")) break;
+        if (!hipblaslt_ok(hipblasLtMatmulPreferenceCreate(&pref), "f16_f32 pref")) break;
+        const size_t max_workspace = 0;
+        if (!hipblaslt_ok(hipblasLtMatmulPreferenceSetAttribute(
+                pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                &max_workspace, sizeof(max_workspace)), "f16_f32 ws")) break;
+        if (!hipblaslt_ok(hipblasLtMatmulAlgoGetHeuristic(g_hipblaslt, desc,
+                    a_desc, b_desc, c_desc, d_desc, pref, 8, heur, &returned),
+                    "f16_f32 heuristic")) break;
+        if (returned <= 0 || heur[0].state != HIPBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "ds4: hipBLASLt no f16_f32 algo for %s m=%u n=%u k=%u\n",
+                    label ? label : "gemm", out_dim, n_tok, in_dim);
+            break;
+        }
+        ok = 1;
+    } while (0);
+    if (pref) (void)hipblasLtMatmulPreferenceDestroy(pref);
+    if (!ok) {
+        if (d_desc) (void)hipblasLtMatrixLayoutDestroy(d_desc);
+        if (c_desc) (void)hipblasLtMatrixLayoutDestroy(c_desc);
+        if (b_desc) (void)hipblasLtMatrixLayoutDestroy(b_desc);
+        if (a_desc) (void)hipblasLtMatrixLayoutDestroy(a_desc);
+        if (desc) (void)hipblasLtMatmulDescDestroy(desc);
+        return NULL;
+    }
+    cuda_hipblaslt_gemm_plan_f16_out_f32 p;
+    p.out_dim = out_dim; p.n_tok = n_tok; p.in_dim = in_dim;
+    p.desc = desc;
+    p.a_desc = a_desc; p.b_desc = b_desc; p.c_desc = c_desc; p.d_desc = d_desc;
+    p.algo = heur[0].algo;
+    g_hipblaslt_f16_f32_plans.push_back(p);
+    return &g_hipblaslt_f16_f32_plans.back();
+}
+
+static int hipblaslt_gemm_tn_f16_out_f32(
+        float *out,
+        const __half *w_rowmajor_out_in,
+        const __half *x_rowmajor_tok_in,
+        uint32_t out_dim,
+        uint32_t n_tok,
+        uint32_t in_dim,
+        const char *label) {
+    if (!g_hipblaslt_ready || !out || !w_rowmajor_out_in || !x_rowmajor_tok_in ||
+        out_dim == 0 || n_tok == 0 || in_dim == 0) return 0;
+    cuda_hipblaslt_gemm_plan_f16_out_f32 *p = hipblaslt_gemm_plan_get_f16_f32(
+            out_dim, n_tok, in_dim, label);
+    if (!p) return 0;
+    const float alpha = 1.0f, beta = 0.0f;
+    return hipblaslt_ok(hipblasLtMatmul(g_hipblaslt, p->desc, &alpha,
+                    w_rowmajor_out_in, p->a_desc,
+                    x_rowmajor_tok_in, p->b_desc,
+                    &beta,
+                    out, p->c_desc,
+                    out, p->d_desc,
+                    &p->algo, NULL, 0, 0),
+            label ? label : "gemm_f16_f32");
+}
