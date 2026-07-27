@@ -142,14 +142,14 @@ void layer_forward_self_one(
     const uint32_t n_hc = DS4_N_HC;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
 
-    float *attn_cur = xmalloc((size_t)DS4_N_EMBD * sizeof(attn_cur[0]));
-    float *attn_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(attn_norm[0]));
-    float *attn_residual = xmalloc((size_t)n_hc * DS4_N_EMBD * sizeof(attn_residual[0]));
-    float *q = xmalloc((size_t)q_dim * sizeof(q[0]));
-    float *kv = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(kv[0]));
-    float *heads = xmalloc((size_t)q_dim * sizeof(heads[0]));
-    float *attn_out = xmalloc((size_t)DS4_N_EMBD * sizeof(attn_out[0]));
-    float *after_attn_hc = xmalloc((size_t)n_hc * DS4_N_EMBD * sizeof(after_attn_hc[0]));
+    float *attn_cur = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(attn_cur[0]));
+    float *attn_norm = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(attn_norm[0]));
+    float *attn_residual = (float *)xmalloc((size_t)n_hc * DS4_N_EMBD * sizeof(attn_residual[0]));
+    float *q = (float *)xmalloc((size_t)q_dim * sizeof(q[0]));
+    float *kv = (float *)xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(kv[0]));
+    float *heads = (float *)xmalloc((size_t)q_dim * sizeof(heads[0]));
+    float *attn_out = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(attn_out[0]));
+    float *after_attn_hc = (float *)xmalloc((size_t)n_hc * DS4_N_EMBD * sizeof(after_attn_hc[0]));
     float post[4];
     float comb[16];
 
@@ -200,15 +200,15 @@ static void output_hc_head_one(
         const float       * inp_hc) {
     const uint32_t n_hc = DS4_N_HC;
     const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * n_hc;
-    float *flat = xmalloc((size_t)hc_dim * sizeof(flat[0]));
-    float *pre = xmalloc((size_t)n_hc * sizeof(pre[0]));
-    float *w = xmalloc((size_t)n_hc * sizeof(w[0]));
+    float *flat = (float *)xmalloc((size_t)hc_dim * sizeof(flat[0]));
+    float *pre = (float *)xmalloc((size_t)n_hc * sizeof(pre[0]));
+    float *w = (float *)xmalloc((size_t)n_hc * sizeof(w[0]));
 
     rms_norm_no_weight(flat, inp_hc, hc_dim, DS4_RMS_EPS);
     matvec_f16(pre, model, weights->output_hc_fn, flat);
 
-    const float *scale = tensor_data(model, weights->output_hc_scale);
-    const float *base = tensor_data(model, weights->output_hc_base);
+    const float *scale = (const float *)tensor_data(model, weights->output_hc_scale);
+    const float *base = (const float *)tensor_data(model, weights->output_hc_base);
     for (uint32_t i = 0; i < n_hc; i++) {
         w[i] = sigmoid_stable(pre[i] * scale[0] + base[i]) + DS4_HC_EPS;
     }
@@ -228,11 +228,11 @@ void output_logits_one(
         const ds4_model   * model,
         const ds4_weights * weights,
         const float       * inp_hc) {
-    float *embd = xmalloc((size_t)DS4_N_EMBD * sizeof(embd[0]));
-    float *norm = xmalloc((size_t)DS4_N_EMBD * sizeof(norm[0]));
+    float *embd = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(embd[0]));
+    float *norm = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(norm[0]));
 
     output_hc_head_one(embd, model, weights, inp_hc);
-    rms_norm_weight(norm, embd, tensor_data(model, weights->output_norm), DS4_N_EMBD, DS4_RMS_EPS);
+    rms_norm_weight(norm, embd, (const float *)tensor_data(model, weights->output_norm), DS4_N_EMBD, DS4_RMS_EPS);
 
     matvec_q8_0(logits, model, weights->output, norm);
 

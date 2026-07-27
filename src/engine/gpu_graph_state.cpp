@@ -224,7 +224,7 @@ bool gpu_graph_load_directional_steering(
     }
 
     const uint64_t n = (uint64_t)DS4_N_LAYER * DS4_N_EMBD;
-    float *dirs = xmalloc((size_t)n * sizeof(dirs[0]));
+    float *dirs = (float *)xmalloc((size_t)n * sizeof(dirs[0]));
     bool ok = read_f32_binary_file(path, dirs, n);
     if (ok) {
         g->directional_steering_dirs = ds4_gpu_tensor_alloc(n * sizeof(dirs[0]));
