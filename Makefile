@@ -191,7 +191,12 @@ warm-partial-fork-3way: ds4-server
 #      engine/kernels may differ), builds there, and dumps the blob.
 #   2. `make cuda-prefill-gate`           — after every D2R increment.
 # Each step loads the model once (~35 s) and prefills 2*(512+2048+4096) tokens.
-PREFILL_BASELINE_REF ?= 8aa9d35
+# Re-baselined 2026-07-26 to the v0.3.1 shipped commit: the old 8aa9d35 blob
+# predated the v0.2.3 type-40/MXFP8_LT model repack, so its header no longer
+# matched the shipped ds4flash.gguf ("baseline header mismatch — different
+# model") AND the 8aa9d35 engine cannot even run the repacked tensors. The
+# baseline now protects drift from the current shipped line.
+PREFILL_BASELINE_REF ?= 536466c
 PREFILL_BASELINE     ?= temp/prefill_bitexact_baseline.bin
 PREFILL_BASELINE_WT  ?= temp/wt-prefill-baseline
 # The blob stamps `git rev-parse --short HEAD` as resolved INSIDE the baseline

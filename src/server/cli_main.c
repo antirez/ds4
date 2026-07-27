@@ -1005,20 +1005,31 @@ int main(int argc, char **argv) {
      * p99 824 ms vs 9341 ms), large chunk keeps median but worsens the tail. NO
      * chunk is net-positive on all axes; stream-overlap can't help (the step is
      * bandwidth-saturated on GB10's unified bus — 8 prefill tokens 4.7x the decode
-     * median). So it's a genuine multi-user tail/throughput TRADE, not a free win:
-     * opt-in via DS4_MIXED_BATCH=1 (+DS4_MIXED_CHUNK, c8 for the tail/throughput
-     * point). Phase-1 warm-fork TTFT is v0.3.0's headline continuous-batching win.
-     * One startup read, no hot-path getenv. Only engages in pool mode. */
+     * median). So it's a genuine multi-user tail/throughput TRADE, not a free
+     * win — DEFAULT-ON in pool mode since 2026-07-26 for this box's subagent-burst
+     * workload (see the enable block below; DS4_MIXED_CHUNK overrides the c8
+     * default). Phase-1 warm-fork TTFT is v0.3.0's headline continuous-batching
+     * win. One startup read, no hot-path getenv. Only engages in pool mode. */
     {
+        /* Default ON in pool mode as of 2026-07-26 (Tyler): this box's workload
+         * is few-users + regular subagent BURSTS = the multi-user tail/throughput
+         * regime this targets (no freeze while a burst's prompts prefill; +25%
+         * concurrent throughput). The single-stream median trade only bites
+         * DURING a concurrent prefill; steady-state decode is unaffected. Default
+         * chunk = 8 (the measured tail/throughput sweet point). DS4_MIXED_BATCH=0
+         * (or =off) reverts to the classic time-sliced path (good single-stream
+         * median, multi-second p99 tail under concurrent prefill). One startup
+         * read, no hot-path getenv. Only engages in pool mode. */
         const char *mb = getenv("DS4_MIXED_BATCH");
-        s.mixed_batch_enabled = s.pool_banks > 0 &&
-                                mb && (mb[0] == '1' || !strcasecmp(mb, "on"));
+        const int mb_off = mb && (mb[0] == '0' || !strcasecmp(mb, "off"));
+        s.mixed_batch_enabled = s.pool_banks > 0 && !mb_off;
         const char *mc = getenv("DS4_MIXED_CHUNK");
-        int kc = mc ? atoi(mc) : 32;
+        int kc = mc ? atoi(mc) : 8;
         if (kc < 1) kc = 1;
         s.mixed_chunk_tokens = kc;
         server_log(DS4_LOG_DEFAULT, "ds4-server: fused mixed-batch lane %s (chunk=%d/step)",
-                   s.mixed_batch_enabled ? "ENABLED (DS4_MIXED_BATCH)" : "disabled (default)",
+                   s.mixed_batch_enabled ? "ENABLED (default; DS4_MIXED_BATCH=0 to disable)"
+                                         : "disabled (DS4_MIXED_BATCH=0)",
                    s.mixed_chunk_tokens);
     }
     /* plan-33 inc B: warm full-prefix fork routing kill-switch. Default ON in
