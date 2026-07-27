@@ -98,7 +98,7 @@ bool gpu_graph_upload_prompt_tokens(
         return false;
     }
 
-    int32_t *tokens = xmalloc((size_t)n_tokens * sizeof(tokens[0]));
+    int32_t *tokens = (int32_t *)xmalloc((size_t)n_tokens * sizeof(tokens[0]));
     for (uint32_t i = 0; i < n_tokens; i++) tokens[i] = prompt->v[pos0 + i];
 
     const bool ok = ds4_gpu_tensor_write(out_tokens,
@@ -197,8 +197,8 @@ static bool gpu_graph_upload_prompt_embeddings_hc_cpu(
     /* out_hc is an HC residual CARRIER (BF16 storage; task #62) — stage in the
      * carrier's element size, NOT f32, or this write overflows the device buffer
      * by 2x. Rounding matches the GPU store path (__float2bfloat16 = RNE). */
-    unsigned char *hc = xmalloc((size_t)total * DS4_HC_ELT_SIZE);
-    float *plain = xmalloc((size_t)DS4_N_EMBD * sizeof(plain[0]));
+    unsigned char *hc = (unsigned char *)xmalloc((size_t)total * DS4_HC_ELT_SIZE);
+    float *plain = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(plain[0]));
 
     for (uint32_t t = 0; t < n_tokens; t++) {
         embed_token_f16(model, weights, prompt->v[pos0 + t], plain);
@@ -467,8 +467,8 @@ bool gpu_graph_encode_layer_attention_batch(
     if (ext_factor != 0.0f && freq_scale > 0.0f) {
         attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
     }
-    uint32_t *comp_counts = compressed ? xcalloc(n_tokens, sizeof(comp_counts[0])) : NULL;
-    uint32_t *index_counts = ratio == 4 ? xcalloc(n_tokens, sizeof(index_counts[0])) : NULL;
+    uint32_t *comp_counts = compressed ? (uint32_t *)xcalloc(n_tokens, sizeof(comp_counts[0])) : NULL;
+    uint32_t *index_counts = ratio == 4 ? (uint32_t *)xcalloc(n_tokens, sizeof(index_counts[0])) : NULL;
     const bool qkv_rms_fused = !gpu_graph_use_reference_qkv_norm();
     ds4_gpu_tensor *hc_mix_view = ds4_gpu_tensor_view(
             g->batch_hc_mix, 0, (uint64_t)n_tokens * mix_hc * sizeof(float));

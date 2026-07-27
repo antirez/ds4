@@ -38,7 +38,7 @@ int ds4_read_hc_carrier_f32(const ds4_gpu_tensor *t, uint64_t off_elems,
     return ds4_gpu_tensor_read((ds4_gpu_tensor *)t, off_elems * sizeof(float),
                                out, n * sizeof(float));
 #else
-    uint16_t *tmp = xmalloc((size_t)n * sizeof(uint16_t));
+    uint16_t *tmp = (uint16_t *)xmalloc((size_t)n * sizeof(uint16_t));
     int rc = ds4_gpu_tensor_read((ds4_gpu_tensor *)t, off_elems * DS4_HC_ELT_SIZE,
                                  tmp, n * DS4_HC_ELT_SIZE);
     if (rc == 0) {
@@ -243,10 +243,10 @@ static bool gpu_graph_check_hc_norm_fusion(
     float *fused_norm_cpu = NULL;
     float *ref_norm_cpu = NULL;
     if (ok) {
-        fused_out_cpu = xmalloc((size_t)n_embd * sizeof(float));
-        ref_out_cpu = xmalloc((size_t)n_embd * sizeof(float));
-        fused_norm_cpu = xmalloc((size_t)n_embd * sizeof(float));
-        ref_norm_cpu = xmalloc((size_t)n_embd * sizeof(float));
+        fused_out_cpu = (float *)xmalloc((size_t)n_embd * sizeof(float));
+        ref_out_cpu = (float *)xmalloc((size_t)n_embd * sizeof(float));
+        fused_norm_cpu = (float *)xmalloc((size_t)n_embd * sizeof(float));
+        ref_norm_cpu = (float *)xmalloc((size_t)n_embd * sizeof(float));
         ok = ds4_gpu_tensor_read(fused_out, 0, fused_out_cpu, n_embd * sizeof(float)) != 0 &&
              ds4_gpu_tensor_read(ref_out, 0, ref_out_cpu, n_embd * sizeof(float)) != 0 &&
              ds4_gpu_tensor_read(fused_norm, 0, fused_norm_cpu, n_embd * sizeof(float)) != 0 &&
@@ -421,7 +421,7 @@ static int gpu_graph_read_raw_row_f32(ds4_gpu_graph *g, uint32_t il, uint32_t ph
                                    (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
                                    out, (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     }
-    uint16_t *tmp = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(uint16_t));
+    uint16_t *tmp = (uint16_t *)xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(uint16_t));
     int ok = ds4_gpu_tensor_read(g->layer_raw_cache[il],
                                  (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(uint16_t),
                                  tmp, (uint64_t)DS4_N_HEAD_DIM * sizeof(uint16_t));
@@ -2309,47 +2309,47 @@ int gpu_graph_decode_test(
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
     const uint64_t vocab_dim = weights->output->dim[1];
 
-    float *plain = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-    float *cpu_hc = xmalloc((size_t)hc_dim * sizeof(float));
-    float *cpu_attn_cur = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-    float *cpu_post = xmalloc((size_t)DS4_N_HC * sizeof(float));
-    float *cpu_comb = xmalloc((size_t)DS4_N_HC * DS4_N_HC * sizeof(float));
-    float *cpu_attn_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-    float *cpu_qr_norm = xmalloc((size_t)q_rank * sizeof(float));
-    float *cpu_q = xmalloc((size_t)q_dim * sizeof(float));
-    float *cpu_kv = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(float));
-    float *cpu_heads = xmalloc((size_t)q_dim * sizeof(float));
-    float *cpu_attn_out = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-    float *cpu_after_attn_hc = xmalloc((size_t)hc_dim * sizeof(float));
-    float *cpu_ffn_cur = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-    float *cpu_ffn_post = xmalloc((size_t)DS4_N_HC * sizeof(float));
-    float *cpu_ffn_comb = xmalloc((size_t)DS4_N_HC * DS4_N_HC * sizeof(float));
-    float *cpu_ffn_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-    float *cpu_shared = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-    float *cpu_routed = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-    float *cpu_ffn_out = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-    float *cpu_after_ffn_hc = xmalloc((size_t)hc_dim * sizeof(float));
-    float *cpu_logits = xmalloc((size_t)vocab_dim * sizeof(float));
-    float *gpu_hc = xmalloc((size_t)hc_dim * sizeof(float));
-    float *gpu_attn_cur = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-    float *gpu_attn_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-    float *gpu_q = xmalloc((size_t)q_dim * sizeof(float));
-    float *gpu_kv = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(float));
-    float *gpu_raw = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(float));
-    float *gpu_attn_out = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-    float *gpu_after_attn_hc = xmalloc((size_t)hc_dim * sizeof(float));
-    float *gpu_ffn_cur = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-    float *gpu_ffn_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-    float *gpu_shared = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-    float *gpu_routed = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-    float *gpu_ffn_out = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-    float *gpu_after_ffn_hc = xmalloc((size_t)hc_dim * sizeof(float));
-    float *gpu_logits = xmalloc((size_t)vocab_dim * sizeof(float));
+    float *plain = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *cpu_hc = (float *)xmalloc((size_t)hc_dim * sizeof(float));
+    float *cpu_attn_cur = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *cpu_post = (float *)xmalloc((size_t)DS4_N_HC * sizeof(float));
+    float *cpu_comb = (float *)xmalloc((size_t)DS4_N_HC * DS4_N_HC * sizeof(float));
+    float *cpu_attn_norm = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *cpu_qr_norm = (float *)xmalloc((size_t)q_rank * sizeof(float));
+    float *cpu_q = (float *)xmalloc((size_t)q_dim * sizeof(float));
+    float *cpu_kv = (float *)xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(float));
+    float *cpu_heads = (float *)xmalloc((size_t)q_dim * sizeof(float));
+    float *cpu_attn_out = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *cpu_after_attn_hc = (float *)xmalloc((size_t)hc_dim * sizeof(float));
+    float *cpu_ffn_cur = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *cpu_ffn_post = (float *)xmalloc((size_t)DS4_N_HC * sizeof(float));
+    float *cpu_ffn_comb = (float *)xmalloc((size_t)DS4_N_HC * DS4_N_HC * sizeof(float));
+    float *cpu_ffn_norm = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *cpu_shared = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *cpu_routed = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *cpu_ffn_out = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *cpu_after_ffn_hc = (float *)xmalloc((size_t)hc_dim * sizeof(float));
+    float *cpu_logits = (float *)xmalloc((size_t)vocab_dim * sizeof(float));
+    float *gpu_hc = (float *)xmalloc((size_t)hc_dim * sizeof(float));
+    float *gpu_attn_cur = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *gpu_attn_norm = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *gpu_q = (float *)xmalloc((size_t)q_dim * sizeof(float));
+    float *gpu_kv = (float *)xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(float));
+    float *gpu_raw = (float *)xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(float));
+    float *gpu_attn_out = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *gpu_after_attn_hc = (float *)xmalloc((size_t)hc_dim * sizeof(float));
+    float *gpu_ffn_cur = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *gpu_ffn_norm = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *gpu_shared = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *gpu_routed = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *gpu_ffn_out = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *gpu_after_ffn_hc = (float *)xmalloc((size_t)hc_dim * sizeof(float));
+    float *gpu_logits = (float *)xmalloc((size_t)vocab_dim * sizeof(float));
     int gpu_selected[DS4_MAX_EXPERT_USED];
     float gpu_expert_weight[DS4_MAX_EXPERT_USED];
-    float *routed_mid_all = xmalloc((size_t)DS4_N_EXPERT_USED * down_in_dim * sizeof(float));
-    block_q8_K *routed_xq = xmalloc((size_t)(expert_in_dim / QK_K) * sizeof(block_q8_K));
-    block_q8_K *routed_midq = xmalloc((size_t)DS4_N_EXPERT_USED * (down_in_dim / QK_K) * sizeof(block_q8_K));
+    float *routed_mid_all = (float *)xmalloc((size_t)DS4_N_EXPERT_USED * down_in_dim * sizeof(float));
+    block_q8_K *routed_xq = (block_q8_K *)xmalloc((size_t)(expert_in_dim / QK_K) * sizeof(block_q8_K));
+    block_q8_K *routed_midq = (block_q8_K *)xmalloc((size_t)DS4_N_EXPERT_USED * (down_in_dim / QK_K) * sizeof(block_q8_K));
     int selected[DS4_MAX_EXPERT_USED];
     float expert_weight[DS4_MAX_EXPERT_USED];
 
@@ -2376,7 +2376,7 @@ int gpu_graph_decode_test(
                           layer->hc_ffn_scale,
                           layer->hc_ffn_base,
                           cpu_after_attn_hc, cpu_ffn_cur, cpu_ffn_post, cpu_ffn_comb);
-    rms_norm_weight(cpu_ffn_norm, cpu_ffn_cur, tensor_data(model, layer->ffn_norm), DS4_N_EMBD, DS4_RMS_EPS);
+    rms_norm_weight(cpu_ffn_norm, cpu_ffn_cur, (const float *)tensor_data(model, layer->ffn_norm), DS4_N_EMBD, DS4_RMS_EPS);
     layer_shared_ffn_one(cpu_shared, model, layer, cpu_ffn_norm);
     layer_routed_moe_one_prealloc(cpu_routed,
                                   model,

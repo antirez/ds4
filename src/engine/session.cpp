@@ -263,7 +263,7 @@ static uint32_t payload_get_u32(const uint8_t in[4]) {
 
 
 static int payload_write_bytes(FILE *fp, const void *ptr, uint64_t bytes, char *err, size_t errlen) {
-    const uint8_t *p = ptr;
+    const uint8_t *p = (const uint8_t *)ptr;
     while (bytes != 0) {
         const size_t n = bytes > (uint64_t)SIZE_MAX ? SIZE_MAX : (size_t)bytes;
         if (fwrite(p, 1, n, fp) != n) {
@@ -284,7 +284,7 @@ static DS4_MAYBE_UNUSED int payload_read_bytes(FILE *fp, void *ptr, uint64_t byt
         return 1;
     }
     const uint64_t original = bytes;
-    uint8_t *p = ptr;
+    uint8_t *p = (uint8_t *)ptr;
     while (bytes != 0) {
         const size_t n = bytes > (uint64_t)SIZE_MAX ? SIZE_MAX : (size_t)bytes;
         if (fread(p, 1, n, fp) != n) {
@@ -326,7 +326,7 @@ static DS4_MAYBE_UNUSED int payload_read_u32(FILE *fp, uint32_t *v, uint64_t *re
 
 
 static int payload_copy_file_bytes(FILE *src, FILE *dst, uint64_t bytes, char *err, size_t errlen) {
-    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    uint8_t *buf = (uint8_t *)xmalloc(DS4_SESSION_IO_CHUNK);
     int rc = 0;
     while (bytes != 0) {
         const size_t n = bytes > DS4_SESSION_IO_CHUNK ? DS4_SESSION_IO_CHUNK : (size_t)bytes;
@@ -1003,7 +1003,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         if (payload_write_u32(fp, g->layer_n_index_comp[il], err, errlen) != 0) return 1;
     }
 
-    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    uint8_t *buf = (uint8_t *)xmalloc(DS4_SESSION_IO_CHUNK);
     int rc = 0;
     for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
         /* Write the raw ring in logical position order.  The file does not care
@@ -1191,7 +1191,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     }
     s->checkpoint_valid = false;
 
-    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    uint8_t *buf = (uint8_t *)xmalloc(DS4_SESSION_IO_CHUNK);
     int rc = 0;
     for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
         /* Rebuild the physical raw ring expected by the current graph.  This is
@@ -1324,7 +1324,7 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
         return 1;
     }
     if (snap->cap < bytes) {
-        uint8_t *p = realloc(snap->ptr, (size_t)bytes);
+        uint8_t *p = (uint8_t *)realloc(snap->ptr, (size_t)bytes);
         if (!p) {
             payload_set_err(err, errlen, "out of memory while allocating session snapshot");
             return 1;
@@ -1426,7 +1426,7 @@ static bool imatrix_read_text_file(const char *path, char **out, size_t *len_out
         return false;
     }
     size_t n = (size_t)st.st_size;
-    char *buf = xmalloc(n + 1);
+    char *buf = (char *)xmalloc(n + 1);
     if (n != 0 && fread(buf, 1, n, fp) != n) {
         fprintf(stderr, "ds4: failed to read imatrix dataset %s\n", path);
         fclose(fp);
@@ -1650,12 +1650,12 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
     const ds4_weights *weights = &e->weights;
     const ds4_layer_weights *layer0 = &weights->layer[0];
 
-    float *prompt_embd = xmalloc((size_t)prompt->len * DS4_N_EMBD * sizeof(prompt_embd[0]));
+    float *prompt_embd = (float *)xmalloc((size_t)prompt->len * DS4_N_EMBD * sizeof(prompt_embd[0]));
     embed_prompt(model, weights, prompt, DS4_N_EMBD, prompt_embd);
 
     const uint32_t n_hc = DS4_N_HC;
-    float *hc0 = xmalloc((size_t)DS4_N_EMBD * sizeof(hc0[0]));
-    float *residual_hc = xmalloc((size_t)n_hc * DS4_N_EMBD * sizeof(residual_hc[0]));
+    float *hc0 = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(hc0[0]));
+    float *residual_hc = (float *)xmalloc((size_t)n_hc * DS4_N_EMBD * sizeof(residual_hc[0]));
     float hc_post[4];
     float hc_comb[16];
     layer_attn_pre_one(model, layer0,
@@ -1663,15 +1663,15 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
         hc0, residual_hc, hc_post, hc_comb);
     print_vec_stats("blk.0 attn_pre", hc0, DS4_N_EMBD);
 
-    float *attn_norm0 = xmalloc((size_t)DS4_N_EMBD * sizeof(attn_norm0[0]));
+    float *attn_norm0 = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(attn_norm0[0]));
     layer_attn_norm_one(attn_norm0, model, layer0, hc0);
 
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
-    float *q0 = xmalloc((size_t)q_dim * sizeof(q0[0]));
+    float *q0 = (float *)xmalloc((size_t)q_dim * sizeof(q0[0]));
     layer_q_projection_normed_one(model, layer0, attn_norm0, q0);
     print_vec_stats("blk.0 q", q0, q_dim);
 
-    float *kv0 = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(kv0[0]));
+    float *kv0 = (float *)xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(kv0[0]));
     layer_kv_projection_normed_one(model, layer0, attn_norm0, kv0);
     print_vec_stats("blk.0 kv", kv0, DS4_N_HEAD_DIM);
     rope_tail_layer_inplace(q0, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, (uint32_t)(prompt->len - 1), 0, false);
@@ -1679,25 +1679,25 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
     dsv4_fp8_kv_quantize_row_inplace_cpu(kv0, DS4_N_HEAD_DIM, DS4_N_ROT);
     f16_round_inplace_cpu(kv0, DS4_N_HEAD_DIM);
 
-    float *attn_heads = xmalloc((size_t)q_dim * sizeof(attn_heads[0]));
+    float *attn_heads = (float *)xmalloc((size_t)q_dim * sizeof(attn_heads[0]));
     layer_attention_one(attn_heads, model, layer0, q0, kv0);
     print_vec_stats("blk.0 attn_heads", attn_heads, q_dim);
     rope_tail_layer_inplace(attn_heads, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, (uint32_t)(prompt->len - 1), 0, true);
 
-    float *attn_out = xmalloc((size_t)DS4_N_EMBD * sizeof(attn_out[0]));
+    float *attn_out = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(attn_out[0]));
     layer_grouped_out_one(attn_out, model, layer0, attn_heads);
     print_vec_stats("blk.0 attn_out", attn_out, DS4_N_EMBD);
 
-    float *after_attn_hc = xmalloc((size_t)n_hc * DS4_N_EMBD * sizeof(after_attn_hc[0]));
+    float *after_attn_hc = (float *)xmalloc((size_t)n_hc * DS4_N_EMBD * sizeof(after_attn_hc[0]));
     hc_post_one(after_attn_hc, attn_out, residual_hc, hc_post, hc_comb, DS4_N_EMBD, n_hc);
     print_vec_stats("blk.0 after_attn_hc", after_attn_hc, (uint64_t)n_hc * DS4_N_EMBD);
 
-    float *after_ffn_hc = xmalloc((size_t)n_hc * DS4_N_EMBD * sizeof(after_ffn_hc[0]));
+    float *after_ffn_hc = (float *)xmalloc((size_t)n_hc * DS4_N_EMBD * sizeof(after_ffn_hc[0]));
     layer_ffn_one(after_ffn_hc, model, layer0, after_attn_hc, 0, prompt->v[prompt->len - 1],
                   NULL, 0.0f, true);
     print_vec_stats("blk.0 after_ffn_hc", after_ffn_hc, (uint64_t)n_hc * DS4_N_EMBD);
 
-    float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
+    float *logits = (float *)xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
     output_logits_one(logits, model, weights, after_ffn_hc);
     print_vec_stats("logits", logits, DS4_N_VOCAB);
 
@@ -1742,7 +1742,7 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
 
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
-    ds4_engine *e = xcalloc(1, sizeof(*e));
+    ds4_engine *e = (ds4_engine *)xcalloc(1, sizeof(*e));
     e->model.fd = -1;
     e->dspark_model.fd = -1;
     e->backend = opt->backend;
@@ -2109,7 +2109,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
     if (!ds4_backend_uses_graph(e->backend) || !e->gpu_ready) return 1;
 
-    ds4_session *s = xcalloc(1, sizeof(*s));
+    ds4_session *s = (ds4_session *)xcalloc(1, sizeof(*s));
     s->engine = e;
     s->ctx_size = ctx_size;
     s->prefill_cap = gpu_graph_prefill_cap_for_prompt(ctx_size,
@@ -2140,7 +2140,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         free(s);
         return 1;
     }
-    s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+    s->logits = (float *)xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
     if (e->dspark_ready) {
         if (!gpu_graph_init_dspark_target(&s->graph, e->dspark_weights.target_layer_ids)) {
             fprintf(stderr, "ds4: failed to allocate DSpark graph buffers\n");
@@ -2260,13 +2260,13 @@ static void bank_carry_copy(ds4_bank_carry *d, const ds4_bank_carry *sc) {
     *d = *sc;                                    /* scalars + (aliased) heap ptrs — fixed below */
     d->checkpoint = d_ck;
     ds4_tokens_copy(&d->checkpoint, &sc->checkpoint);
-    d->logits = d_logits ? d_logits : xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    d->logits = d_logits ? d_logits : (float *)xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     if (sc->logits) memcpy(d->logits, sc->logits, (size_t)DS4_N_VOCAB * sizeof(float));
     d->dspark_pending_qrows = d_qrows;
     d->dspark_pending_qrows_cap = d_qcap;
     if (sc->dspark_pending_qrows && sc->dspark_pending_qrows_cap > 0) {
         if (d->dspark_pending_qrows_cap < sc->dspark_pending_qrows_cap) {
-            d->dspark_pending_qrows = xrealloc(d->dspark_pending_qrows,
+            d->dspark_pending_qrows = (float *)xrealloc(d->dspark_pending_qrows,
                 (size_t)sc->dspark_pending_qrows_cap * sizeof(float));
             d->dspark_pending_qrows_cap = sc->dspark_pending_qrows_cap;
         }
@@ -2478,7 +2478,7 @@ int ds4_session_bank_kv_save(ds4_session *s, uint32_t bank, FILE *fp,
         if (ratio == 0) continue;
         const uint64_t csz = (uint64_t)g->ms_n_comp[bank][il] * attn_row;
         if (csz) {
-            uint8_t *buf = xmalloc((size_t)csz);
+            uint8_t *buf = (uint8_t *)xmalloc((size_t)csz);
             ds4_gpu_tensor *v = gpu_graph_bank_attn_comp_view(g, il, bank);
             int ok = v && ds4_gpu_tensor_read(v, 0, buf, csz) != 0;
             ds4_gpu_tensor_free(v);
@@ -2489,7 +2489,7 @@ int ds4_session_bank_kv_save(ds4_session *s, uint32_t bank, FILE *fp,
         if (ratio == 4) {
             const uint64_t isz = (uint64_t)g->ms_n_index_comp[bank][il] * idx_row;
             if (isz) {
-                uint8_t *buf = xmalloc((size_t)isz);
+                uint8_t *buf = (uint8_t *)xmalloc((size_t)isz);
                 ds4_gpu_tensor *v = gpu_graph_bank_index_comp_view(g, il, bank);
                 int ok = v && ds4_gpu_tensor_read(v, 0, buf, isz) != 0;
                 ds4_gpu_tensor_free(v);
@@ -2549,7 +2549,7 @@ int ds4_session_bank_kv_load(ds4_session *s, uint32_t bank, FILE *fp,
         if (ratio == 0) continue;
         const uint64_t csz = (uint64_t)comp_cnt[il] * attn_row;
         if (csz) {
-            uint8_t *buf = xmalloc((size_t)csz);
+            uint8_t *buf = (uint8_t *)xmalloc((size_t)csz);
             int ok = fread(buf, 1, (size_t)csz, fp) == (size_t)csz;
             if (ok) { ds4_gpu_tensor *v = gpu_graph_bank_attn_comp_view(g, il, bank);
                       ok = v && ds4_gpu_tensor_write(v, 0, buf, csz) != 0;
@@ -2560,7 +2560,7 @@ int ds4_session_bank_kv_load(ds4_session *s, uint32_t bank, FILE *fp,
         if (ratio == 4) {
             const uint64_t isz = (uint64_t)idx_cnt[il] * idx_row;
             if (isz) {
-                uint8_t *buf = xmalloc((size_t)isz);
+                uint8_t *buf = (uint8_t *)xmalloc((size_t)isz);
                 int ok = fread(buf, 1, (size_t)isz, fp) == (size_t)isz;
                 if (ok) { ds4_gpu_tensor *v = gpu_graph_bank_index_comp_view(g, il, bank);
                           ok = v && ds4_gpu_tensor_write(v, 0, buf, isz) != 0;
@@ -2633,7 +2633,7 @@ static bool ds4_session_cancelled(ds4_session *s) {
 
 
 static bool ds4_session_cancelled_cb(void *ud) {
-    return ds4_session_cancelled(ud);
+    return ds4_session_cancelled((ds4_session *)ud);
 }
 
 
@@ -2645,7 +2645,7 @@ void ds4_session_report_progress(ds4_session *s, const char *event, int current,
 
 
 static void ds4_session_note_prefill_progress(void *ud, const char *event, int current, int total) {
-    ds4_sync_progress *p = ud;
+    ds4_sync_progress *p = (ds4_sync_progress *)ud;
     if (!p || !p->session || !p->prompt) return;
     if (!strcmp(event, "prefill_chunk") && current > 0 && current <= p->prompt->len) {
         p->session->checkpoint.len = 0;
@@ -3170,9 +3170,9 @@ int ds4_session_decode_mixed(ds4_session *s, const ds4_multiseq_req *reqs,
     ds4_engine *e = s->engine;
     /* HEAP descriptor scratch (positions / seq_id / tokens), sized to n_rows —
      * this is the whole point of the refactor: no [DS4_MSEQ_MAX] stack ceiling. */
-    int32_t *pos    = xmalloc((size_t)n_rows * sizeof(*pos));
-    int32_t *bank   = xmalloc((size_t)n_rows * sizeof(*bank));
-    int     *tokens = xmalloc((size_t)n_rows * sizeof(*tokens));
+    int32_t *pos = (int32_t *)xmalloc((size_t)n_rows * sizeof(*pos));
+    int32_t *bank = (int32_t *)xmalloc((size_t)n_rows * sizeof(*bank));
+    int *tokens = (int *)xmalloc((size_t)n_rows * sizeof(*tokens));
     for (uint32_t k = 0; k < n_rows; k++) {
         pos[k]    = reqs[k].pos;
         bank[k]   = (int32_t)reqs[k].bank;
@@ -3235,7 +3235,7 @@ static bool bank_carry_ensure(ds4_session *s) {
     const uint32_t n = gpu_graph_bank_pool_count(&s->graph);
     if (s->bank_carry && s->bank_carry_n == n) return true;
     if (s->bank_carry) ds4_session_bank_carry_free(s);
-    s->bank_carry = xcalloc(n, sizeof(*s->bank_carry));
+    s->bank_carry = (ds4_bank_carry *)xcalloc(n, sizeof(*s->bank_carry));
     s->bank_carry_n = n;
     return true;
 }
@@ -3261,11 +3261,11 @@ void ds4_session_bank_state_save(ds4_session *s, uint32_t bank) {
     ds4_bank_carry *c = &s->bank_carry[bank];
     /* heap-backed deep copies */
     ds4_tokens_copy(&c->checkpoint, &s->checkpoint);
-    if (!c->logits) c->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    if (!c->logits) c->logits = (float *)xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     memcpy(c->logits, s->logits, (size_t)DS4_N_VOCAB * sizeof(float));
     if (s->dspark_pending_qrows && s->dspark_pending_qrows_cap > 0) {
         if (c->dspark_pending_qrows_cap < s->dspark_pending_qrows_cap) {
-            c->dspark_pending_qrows = xrealloc(
+            c->dspark_pending_qrows = (float *)xrealloc(
                 c->dspark_pending_qrows,
                 (size_t)s->dspark_pending_qrows_cap * sizeof(float));
             c->dspark_pending_qrows_cap = s->dspark_pending_qrows_cap;
@@ -3307,7 +3307,7 @@ bool ds4_session_bank_state_restore(ds4_session *s, uint32_t bank) {
     memcpy(s->logits, c->logits, (size_t)DS4_N_VOCAB * sizeof(float));
     if (c->dspark_pending_qrows_cap > 0) {
         if (s->dspark_pending_qrows_cap < c->dspark_pending_qrows_cap) {
-            s->dspark_pending_qrows = xrealloc(
+            s->dspark_pending_qrows = (float *)xrealloc(
                 s->dspark_pending_qrows,
                 (size_t)c->dspark_pending_qrows_cap * sizeof(float));
             s->dspark_pending_qrows_cap = c->dspark_pending_qrows_cap;
@@ -3397,9 +3397,9 @@ static void dspark_dump_step(ds4_gpu_graph *g, int pos, int first_token,
     if (dumped >= max_steps) return;
 
     const uint64_t hcw = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    float *emb = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-    float *voc = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
-    float *hc = xmalloc((size_t)hcw * sizeof(float));
+    float *emb = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *voc = (float *)xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    float *hc = (float *)xmalloc((size_t)hcw * sizeof(float));
     FILE *f = fopen(path, dumped == 0 ? "wb" : "ab");
     if (!f) { free(emb); free(voc); free(hc); return; }
     /* Lean mode (DS4_DSPARK_DUMP_LEAN=1): confidence-head training records only —
@@ -3643,7 +3643,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
         while (commit < (int)K && row_tops[commit] == (int)pend[commit]) commit++;
     } else {
         if (!s->spec_row_scratch)
-            s->spec_row_scratch = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+            s->spec_row_scratch = (float *)xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
         float *row_logits = s->spec_row_scratch;
         bool walk_ok = true;
         while (commit < (int)K) {
@@ -3937,7 +3937,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
         const uint32_t need = n_draft * DS4_N_VOCAB;
         if (s->dspark_pending_qrows_cap < need) {
             free(s->dspark_pending_qrows);
-            s->dspark_pending_qrows = xmalloc((size_t)need * sizeof(float));
+            s->dspark_pending_qrows = (float *)xmalloc((size_t)need * sizeof(float));
             s->dspark_pending_qrows_cap = need;
         }
     }
@@ -4013,7 +4013,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
                                     (int32_t)n_draft, (int32_t)n_batch, (int32_t)commit };
                 fwrite(hdr2, sizeof(int32_t), 5, f2);
                 fwrite(refined, sizeof(int32_t), (size_t)n_draft + 1, f2);
-                float *row2 = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+                float *row2 = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(float));
                 for (uint32_t m2 = 0; m2 < n_batch; m2++) {
                     for (int sl = 0; sl < 3; sl++) {
                         memset(row2, 0, (size_t)DS4_N_EMBD * sizeof(float));
@@ -4036,7 +4036,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
                 if (dump_ring) {
                     const uint64_t ring_bytes =
                         (uint64_t)DS4_DSPARK_DRAFT_WINDOW * DS4_N_HEAD_DIM * sizeof(float);
-                    float *ring = xmalloc(ring_bytes);
+                    float *ring = (float *)xmalloc(ring_bytes);
                     for (int li2 = 0; li2 < 3; li2++) {
                         int32_t nr = (int32_t)g->dspark_n_raw[li2];
                         fwrite(&nr, sizeof(int32_t), 1, f2);
@@ -4046,7 +4046,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
                     }
                     free(ring);
                     const uint64_t hcw2 = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-                    float *hcrow = xmalloc(hcw2 * sizeof(float));
+                    float *hcrow = (float *)xmalloc(hcw2 * sizeof(float));
                     for (uint32_t p2 = 0; p2 < n_draft; p2++) {
                         memset(hcrow, 0, hcw2 * sizeof(float));
                         (void)ds4_read_hc_carrier_f32(g->batch_cur_hc, (uint64_t)p2 * hcw2,
@@ -4301,12 +4301,12 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
     if (dspark_stats) {
         (void)ds4_gpu_synchronize();
         dspark_draft_ms = (now_sec() - dspark_draft_t0) * 1000.0;
-        float *r0 = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+        float *r0 = (float *)xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
         if (gpu_graph_read_spec_logits_row(g, 0, r0))
             dspark_base0 = sample_argmax(r0, DS4_N_VOCAB);
         free(r0);
         /* conditioning diagnostics: is target_h captured, main_x sane, KV seeded? */
-        float *tmp = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+        float *tmp = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(float));
         double mn = 0.0, th[3] = {0, 0, 0};
         if (ds4_gpu_tensor_read(g->dspark_main_x, 0, tmp, (uint64_t)DS4_N_EMBD * 4))
             for (int j = 0; j < (int)DS4_N_EMBD; j++) mn += (double)tmp[j] * tmp[j];
@@ -4432,7 +4432,7 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
     for (int i = 0; i < draft_n; i++)
         token_vec_push(&s->checkpoint, refined_ids[i + 1]);
 
-    int *row_tops = xmalloc((size_t)draft_n * sizeof(int));
+    int *row_tops = (int *)xmalloc((size_t)draft_n * sizeof(int));
     const double dspark_verify_t0 = dspark_stats ? now_sec() : 0.0;
     bool verify_ok = gpu_graph_verify_suffix_tops(g, &e->model, &e->weights,
                                                     &s->checkpoint,
@@ -4484,7 +4484,7 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
          * draft_n-1).
          */
         if (!s->spec_row_scratch)
-            s->spec_row_scratch = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->spec_row_scratch[0]));
+            s->spec_row_scratch = (float *)xmalloc((size_t)DS4_N_VOCAB * sizeof(s->spec_row_scratch[0]));
         float *row_logits = s->spec_row_scratch;
         ok_state = gpu_graph_read_spec_logits_row(g, (uint32_t)(draft_n - 1), row_logits);
         if (ok_state)
