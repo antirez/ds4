@@ -33,7 +33,7 @@ static int g_fail;
 
 static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
 static char *read_file(const char *p, size_t *n){ FILE *f=fopen(p,"rb"); if(!f)return NULL;
-    fseek(f,0,SEEK_END); long s=ftell(f); fseek(f,0,SEEK_SET); char *b=malloc(s+1);
+    fseek(f,0,SEEK_END); long s=ftell(f); fseek(f,0,SEEK_SET); char *b=(char *)malloc(s+1);
     if(!b||fread(b,1,s,f)!=(size_t)s){fclose(f);free(b);return NULL;} fclose(f); b[s]=0; if(n)*n=s; return b; }
 
 /* greedy-decode NGEN tokens on bank 0, continuing from a frontier at F with the
@@ -41,7 +41,7 @@ static char *read_file(const char *p, size_t *n){ FILE *f=fopen(p,"rb"); if(!f)r
 static bool decode_cont(ds4_session *s, int F, int t0, int *out){
     out[0]=t0;
     const int vocab=(int)DS4_N_VOCAB;
-    float *lg=malloc((size_t)vocab*sizeof(float));
+    float *lg = (float *)malloc((size_t)vocab*sizeof(float));
     char e[256]; bool ok=true;
     for(int i=1; i<NGEN && ok; i++){
         ds4_multiseq_req r={.bank=0,.pos=F+i-1,.token=out[i-1]};
@@ -81,8 +81,8 @@ static bool mixed_stream(int c0, int K, int *out, double *secs, float *out_lg){
     if(ds4_session_sync(s,&p,e,sizeof e)!=0){ fprintf(stderr,"mixed first-chunk sync: %s\n",e); ok=false; }
     if(ok) gpu_graph_bank_counters_capture(g,0);
     const int vocab=(int)DS4_N_VOCAB;
-    float *lg=malloc((size_t)vocab*sizeof(float));    /* 1 run => 1 logit row */
-    ds4_multiseq_req *rq=malloc((size_t)K*sizeof(*rq));
+    float *lg = (float *)malloc((size_t)vocab*sizeof(float));    /* 1 run => 1 logit row */
+    ds4_multiseq_req *rq = (ds4_multiseq_req *)malloc((size_t)K*sizeof(*rq));
     for(int j=0;j<K;j++){ rq[j].bank=0; rq[j].pos=c0+j; rq[j].token=g_toks.v[c0+j]; }
     uint32_t nr=0;
     double t0=secs?now_s():0.0;
@@ -134,7 +134,7 @@ int main(int argc,char**argv){
      *       match classic past the drift point. */
     const int vocab=(int)DS4_N_VOCAB;
     int ref[NGEN], mix[NGEN];
-    float *ref_lg=malloc((size_t)vocab*sizeof(float)), *mix_lg=malloc((size_t)vocab*sizeof(float));
+    float *ref_lg = (float *)malloc((size_t)vocab*sizeof(float)), *mix_lg=(float *)malloc((size_t)vocab*sizeof(float));
     if(!classic_stream(C0, C0+K1, ref, ref_lg)){ fprintf(stderr,"GATE FAIL: classic-resume reference failed\n"); g_fail=1; free(ref_lg);free(mix_lg); goto done; }
     if(!mixed_stream(C0, K1, mix, NULL, mix_lg)){ fprintf(stderr,"GATE FAIL: mixed prefill failed (step_end/coherence)\n"); g_fail=1; free(ref_lg);free(mix_lg); goto done; }
     {
@@ -157,7 +157,8 @@ int main(int argc,char**argv){
     free(ref_lg); free(mix_lg);
 
     /* GATE 3: SPEED — mixed K-run vs classic prefill of K, at K in {512,2048}. */
-    int Ks[2]={512,2048};
+    int Ks[2];
+    Ks[0]=512; Ks[1]=2048;
     for(int ki=0; ki<2; ki++){
         int K=Ks[ki];
         if(C0+K+NGEN > g_toks.len){ printf("GATE 3: K=%d skipped (prompt too short)\n",K); continue; }

@@ -269,7 +269,7 @@ static ds4_cutlass_ffn_scratch_layout cutlass_ffn_scratch_layout(int T, int in_d
 // to a single expert. Callers size one buffer for their layer's (in_dim,mid_dim,out_dim) shape
 // at T=max_tokens_per_expert once (e.g. via cuda_tmp_alloc) and reuse it across every expert
 // and every layer that shares that shape -- this is deliberately NOT malloc'd per call.
-extern "C" size_t ds4_cutlass_expert_ffn_scratch_bytes(int T, int in_dim, int mid_dim, int out_dim){
+size_t ds4_cutlass_expert_ffn_scratch_bytes(int T, int in_dim, int mid_dim, int out_dim){
   return cutlass_ffn_scratch_layout(T, in_dim, mid_dim, out_dim).total_bytes;
 }
 
@@ -283,7 +283,7 @@ extern "C" size_t ds4_cutlass_expert_ffn_scratch_bytes(int T, int in_dim, int mi
 // callers outside this TU -- e.g. ds4_cuda_moe.cu, which has no CUTLASS header visibility --
 // can call this without depending on CUTLASS types. ElementSF (cutlass::float_ue8m0_t) is a
 // 1-byte POD; the reinterpret below is exact.
-extern "C" int ds4_cutlass_expert_ffn_scratch(
+int ds4_cutlass_expert_ffn_scratch(
     float *out, const float *x,
     const uint8_t *Wg_d, const uint8_t *Wg_sf,
     const uint8_t *Wu_d, const uint8_t *Wu_sf,
@@ -339,10 +339,10 @@ static size_t proj_scratch_layout(int T, int in_dim, int out_dim,
   *ws_off=off; off=align_up_bytes(off+(*ws_bytes), a);
   return off;
 }
-extern "C" size_t ds4_cutlass_proj_scratch_bytes(int T, int in_dim, int out_dim){
+size_t ds4_cutlass_proj_scratch_bytes(int T, int in_dim, int out_dim){
   size_t a,b,c,d,e; return proj_scratch_layout(T,in_dim,out_dim,&a,&b,&c,&d,&e);
 }
-extern "C" int ds4_cutlass_proj_scratch(float *out, const float *x,
+int ds4_cutlass_proj_scratch(float *out, const float *x,
     const uint8_t *W_d, const uint8_t *W_sf, int T, int in_dim, int out_dim,
     uint8_t *scratch, size_t scratch_bytes){
   size_t xA_off,xSF_off,xSF_n,ws_off,ws_bytes;
@@ -360,7 +360,7 @@ extern "C" int ds4_cutlass_proj_scratch(float *out, const float *x,
 // synchronizes before returning. The engine never calls this -- it calls the scratch variant
 // above with a pre-sized, reused buffer, since a per-call cudaMalloc/cudaFree/cudaDeviceSynchronize
 // here is exactly the hot-path cost the engine path exists to avoid. ----
-extern "C" int ds4_cutlass_expert_ffn(
+int ds4_cutlass_expert_ffn(
     float *out, const float *x,
     const uint8_t *Wg_d, const ElementSF *Wg_sf,
     const uint8_t *Wu_d, const ElementSF *Wu_sf,
@@ -539,7 +539,7 @@ static ds4_grouped_scratch_layout grouped_scratch_layout(int padded_total, int n
   return L;
 }
 
-extern "C" size_t ds4_cutlass_grouped_moe_scratch_bytes(
+size_t ds4_cutlass_grouped_moe_scratch_bytes(
     int padded_total, int n_total_expert, int in_dim, int mid_dim, int out_dim){
   return grouped_scratch_layout(padded_total, n_total_expert, in_dim, mid_dim, out_dim).total_bytes;
 }
@@ -547,7 +547,7 @@ extern "C" size_t ds4_cutlass_grouped_moe_scratch_bytes(
 // Grouped MXFP4 FFN. x_gathered/w_gathered are the per-slot activations gathered to 128-padded
 // row offsets (padding rows must be pre-zeroed by the caller). Writes ffn_out[padded_total,out_dim]
 // (the caller scatters the real rows into the flat down buffer, then moe_sum reduces). No host sync.
-extern "C" int ds4_cutlass_grouped_moe(
+int ds4_cutlass_grouped_moe(
     float *ffn_out, const float *x_gathered, const float *w_gathered,
     const uint8_t *gate_w, const uint8_t *up_w, const uint8_t *down_w,
     uint64_t gate_stride, uint64_t gate_data_bytes,
@@ -624,11 +624,11 @@ static size_t grouped_proj_layout(int padded_total, int n_total_expert, int in_d
   *ws_off = off;  off = align_up_bytes(off + *ws_bytes, a);
   return off;
 }
-extern "C" size_t ds4_cutlass_grouped_proj_scratch_bytes(int padded_total, int n_total_expert, int in_dim, int out_dim){
+size_t ds4_cutlass_grouped_proj_scratch_bytes(int padded_total, int n_total_expert, int in_dim, int out_dim){
   (void)out_dim;   /* grouped WS is shape-independent; D buffer is caller-owned */
   size_t a,b,c,d,e,f; return grouped_proj_layout(padded_total, n_total_expert, in_dim, &a,&b,&c,&d,&e,&f);
 }
-extern "C" int ds4_cutlass_grouped_proj(
+int ds4_cutlass_grouped_proj(
     float *out, const float *x_gathered,
     const uint8_t *W_base, uint64_t W_stride, uint64_t W_data_bytes,
     int n_total_expert, int in_dim, int out_dim,
@@ -822,7 +822,7 @@ static size_t g_fp4_gemv_actbuf_floats = 0;
 // Small-batch (n_tokens 2..4) rich-expert FFN over the packed CUTLASS weights.
 // down_out gets one pre-weighted FFN result per (token, slot); the caller sums the
 // n_expert slices per token (moe_sum_kernel). mid_scratch: [n_tokens*n_expert, mid_dim].
-extern "C" int ds4_cutlass_expert_ffn_gemv_small(
+int ds4_cutlass_expert_ffn_gemv_small(
     float *down_out, float *mid_scratch, const float *x,
     const int32_t *selected, const float *rweights,
     const uint8_t *gate_w, const uint8_t *up_w, const uint8_t *down_w,
@@ -888,7 +888,7 @@ static int gemv_actbuf_ensure(size_t need_floats) {
   return 1;
 }
 /* gate/up W4A8 GEMV -> mid[n_slots,mid_dim] = silu(clamp(gate))*clamp(up)*rw (pair layout). */
-extern "C" int ds4_cutlass_gemv_gateup(
+int ds4_cutlass_gemv_gateup(
     float *mid, const float *x, const int32_t *selected, const float *rweights,
     const uint8_t *gate_w, const uint8_t *up_w, uint64_t gate_stride, uint64_t gate_data_bytes,
     float clamp, int n_tokens, int n_expert, unsigned n_total_expert, int in_dim, int mid_dim) {
@@ -906,7 +906,7 @@ extern "C" int ds4_cutlass_gemv_gateup(
   return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
 /* down W4A8 GEMV -> down_out[n_slots,out_dim] (pair layout, NO routing weight -- applied at gate/up). */
-extern "C" int ds4_cutlass_gemv_down(
+int ds4_cutlass_gemv_down(
     float *down_out, const float *mid, const int32_t *selected,
     const uint8_t *down_w, uint64_t down_stride, uint64_t down_data_bytes,
     int n_tokens, int n_expert, unsigned n_total_expert, int mid_dim, int out_dim) {
@@ -929,7 +929,7 @@ extern "C" int ds4_cutlass_gemv_down(
 // DeepSeek-V4-Flash source stores rich experts — into CUTLASS B layout (ColumnMajor packed E2M1
 // data + swizzled SFB). Host-side, lossless (copies nibbles+scale verbatim). This is the permanent
 // source->CUTLASS packer; nothing consumes ds4's 17-byte format.
-extern "C" void ds4_cutlass_pack_source(uint8_t *Bd, ElementSF *Bsf, const uint8_t *e2m1, const uint8_t *e8m0, int N, int K){
+void ds4_cutlass_pack_source(uint8_t *Bd, ElementSF *Bsf, const uint8_t *e2m1, const uint8_t *e8m0, int N, int K){
   auto lB   = cutlass::make_cute_packed_stride(typename GemmKernel::StrideB{}, {N,K,1});
   auto layB = make_layout(make_shape(N,K,1), lB);
   auto lSFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1,N,K,1));
@@ -946,13 +946,13 @@ extern "C" void ds4_cutlass_pack_source(uint8_t *Bd, ElementSF *Bsf, const uint8
 }
 
 // Physical element count of the swizzled SF tensor for a weight of shape (N=out, K=in).
-extern "C" size_t ds4_cutlass_weight_sf_count(int N, int K){
+size_t ds4_cutlass_weight_sf_count(int N, int K){
   auto lSFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1,N,K,1));
   return cute::size(cute::filter_zeros(lSFB));
 }
 
 // Packed E2M1 weight-data byte count for a weight of shape (N=out, K=in): 2 nibbles/byte.
-extern "C" size_t ds4_cutlass_weight_data_bytes(int N, int K){ return (size_t)N * (size_t)K / 2; }
+size_t ds4_cutlass_weight_data_bytes(int N, int K){ return (size_t)N * (size_t)K / 2; }
 
 // ---- Runtime dequant->fp4 weight packer (2-bit prefill path). Quantizes a DEQUANTIZED f32
 // weight [N,K] (RowMajor: N rows of K) to MXFP4 on-device (LOSSY) directly into CUTLASS B layout.
@@ -983,7 +983,7 @@ __global__ void pack_weight_f32_kernel(uint8_t *B_data, TSFB tSFB, const float *
   }
 }
 
-extern "C" void ds4_cutlass_pack_weight_f32(uint8_t *Bd, uint8_t *Bsf, const float *W, int N, int K){
+void ds4_cutlass_pack_weight_f32(uint8_t *Bd, uint8_t *Bsf, const float *W, int N, int K){
   auto lSFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1,N,K,1));
   auto tSFB = make_tensor(reinterpret_cast<ElementSF*>(Bsf), lSFB);
   int nb = N*(K/32), t=128, b=(nb+t-1)/t;

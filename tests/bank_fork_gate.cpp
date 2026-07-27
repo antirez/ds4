@@ -21,6 +21,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
+/* seed for greedy ds4_session_sample calls (was &(uint64_t){7} compound literals;
+ * greedy never consumes RNG state, so one shared object is behavior-identical). */
+static uint64_t g_seed7 = 7;
+
 
 static int g_fail;
 #define CHECK(c, ...) do { if(!(c)){ fprintf(stderr,"FORK FAIL: " __VA_ARGS__); fprintf(stderr,"\n"); g_fail=1; } } while(0)
@@ -28,7 +32,7 @@ static int g_fail;
 static char *read_file(const char *path, size_t *len_out) {
     FILE *fp = fopen(path, "rb"); if (!fp) return NULL;
     fseek(fp, 0, SEEK_END); long n = ftell(fp); fseek(fp, 0, SEEK_SET);
-    char *b = malloc((size_t)n + 1);
+    char *b = (char *)malloc((size_t)n + 1);
     if (!b || fread(b, 1, (size_t)n, fp) != (size_t)n) { fclose(fp); free(b); return NULL; }
     fclose(fp); b[n] = '\0'; if (len_out) *len_out = (size_t)n; return b;
 }
@@ -40,7 +44,7 @@ static uint64_t checksum_bank_kv(ds4_session *s, uint32_t bank) {
     const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
         ? DS4_ENGINE_IDXFP4_ROWBYTES : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
     uint64_t h = 1469598103934665603ull;
-    uint8_t *buf = malloc(64u * 1024u * 1024u);
+    uint8_t *buf = (uint8_t *)malloc(64u * 1024u * 1024u);
     if (!buf) return 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
@@ -86,7 +90,7 @@ static void decode_stream_greedy(ds4_session *s, uint32_t bank, int *toks,
                                  int len, int ngen, int *out) {
     ds4_tokens p; memset(&p, 0, sizeof p); p.v = toks;
     for (int i = 0; i < ngen; i++) {
-        const int t = ds4_session_sample(s, 0.0f, 0, 1.0f, 0.0f, &(uint64_t){7});
+        const int t = ds4_session_sample(s, 0.0f, 0, 1.0f, 0.0f, &g_seed7);
         out[i] = t;
         toks[len + i] = t;
         p.len = p.cap = len + i + 1;
@@ -134,7 +138,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "fork_gate: pool banks=%u ctx=%d n_cached=%d L=%d\n", pool, ctx, n_cached, L);
     if (pool < 3) { fprintf(stderr, "need DS4_MSEQ_BANKS>=3\n"); return 1; }
 
-    int *toks = malloc((size_t)L * sizeof(int));
+    int *toks = (int *)malloc((size_t)L * sizeof(int));
     for (int i = 0; i < L; i++) toks[i] = base.v[i % base.len];
 
     /* 1. SRC = bank 0 prefilled to the shared prefix [0, n_cached). */
@@ -146,7 +150,7 @@ int main(int argc, char **argv) {
 
     /* 2. NEGATIVE: a fork whose prefix does NOT match src is REFUSED (no write). */
     {
-        int *wrong = malloc((size_t)n_cached * sizeof(int));
+        int *wrong = (int *)malloc((size_t)n_cached * sizeof(int));
         for (int i = 0; i < n_cached; i++) wrong[i] = toks[i];
         wrong[n_cached / 2] ^= 0x1;   /* one token differs */
         const int rc = ds4_session_bank_fork(s, 0, 2, wrong, n_cached);
@@ -189,7 +193,7 @@ int main(int argc, char **argv) {
               ds4_session_pos(s), L);
         gpu_graph_bank_counters_capture(&s->graph, 1);
     }
-    const int tok_fork = ds4_session_sample(s, 0.0f, 0, 1.0f, 0.0f, &(uint64_t){7});
+    const int tok_fork = ds4_session_sample(s, 0.0f, 0, 1.0f, 0.0f, &g_seed7);
     ds4_gpu_synchronize();
     const uint64_t sum_fork_full = checksum_bank_kv(s, 1);
     /* SAVE bank 1's live state before switching away — the final bank_pos(1)
@@ -199,7 +203,7 @@ int main(int argc, char **argv) {
 
     /* cold: bank 2 full prefill of [0, L). */
     CHECK(prefill_bank_cold(s, 2, toks, L), "cold full prefill bank 2");
-    const int tok_cold = ds4_session_sample(s, 0.0f, 0, 1.0f, 0.0f, &(uint64_t){7});
+    const int tok_cold = ds4_session_sample(s, 0.0f, 0, 1.0f, 0.0f, &g_seed7);
     ds4_gpu_synchronize();
     const uint64_t sum_cold = checksum_bank_kv(s, 2);
 
@@ -225,7 +229,7 @@ int main(int argc, char **argv) {
          * 4300) computes it in a 204-token batch whose last-ulp GEMM deltas make
          * the stash source differ from cold before any fork logic runs. */
         const int SLEN = 8192, NC = 4102, RCUT = 4096, L2 = 8192;
-        int *toks2 = malloc((size_t)L2 * sizeof(int));
+        int *toks2 = (int *)malloc((size_t)L2 * sizeof(int));
         for (int i = 0; i < L2; i++)
             toks2[i] = i < NC ? toks[i] : base.v[(i + 7777) % base.len];
 
@@ -268,7 +272,7 @@ int main(int argc, char **argv) {
             CHECK(ds4_session_pos(s) == L2, "P2 live pos %d != %d", ds4_session_pos(s), L2);
             gpu_graph_bank_counters_capture(&s->graph, 1);
         }
-        const int tok_pf = ds4_session_sample(s, 0.0f, 0, 1.0f, 0.0f, &(uint64_t){7});
+        const int tok_pf = ds4_session_sample(s, 0.0f, 0, 1.0f, 0.0f, &g_seed7);
         ds4_gpu_synchronize();
         const uint64_t sum_pf = checksum_bank_kv(s, 1);
         ds4_session_bank_state_save(s, 1);
@@ -276,7 +280,7 @@ int main(int argc, char **argv) {
         /* cold control on bank 2 */
         CHECK(prefill_bank_cold(s, 2, toks2, L2), "P2 cold control bank2");
         ds4_session_bank_state_save(s, 2);
-        const int tok_pc = ds4_session_sample(s, 0.0f, 0, 1.0f, 0.0f, &(uint64_t){7});
+        const int tok_pc = ds4_session_sample(s, 0.0f, 0, 1.0f, 0.0f, &g_seed7);
         ds4_gpu_synchronize();
         const uint64_t sum_pc = checksum_bank_kv(s, 2);
 
@@ -316,7 +320,7 @@ int main(int argc, char **argv) {
             const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
             const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
                 ? DS4_ENGINE_IDXFP4_ROWBYTES : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
-            uint8_t *ra = malloc((size_t)attn_row), *rb = malloc((size_t)attn_row);
+            uint8_t *ra = (uint8_t *)malloc((size_t)attn_row), *rb = (uint8_t *)malloc((size_t)attn_row);
             int diffc = 0, diffi = 0, checked = 0;
             for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
                 if (ds4_layer_compress_ratio(il) != 4u) continue;
@@ -393,7 +397,7 @@ int main(int argc, char **argv) {
         CHECK(NC5 < SLEN5 && L5 > SLEN5, "P5 length ordering");
         const int R5 = ((NC5 - 4) / 128) * 128;   /* engine's ratio-4 align-down */
 
-        int *toks5 = malloc((size_t)(L5 + NGEN) * sizeof(int));
+        int *toks5 = (int *)malloc((size_t)(L5 + NGEN) * sizeof(int));
         for (int i = 0; i < L5; i++)
             toks5[i] = i < NC5 ? toks[i] : base.v[(i + 31337) % base.len];
 
@@ -416,7 +420,7 @@ int main(int argc, char **argv) {
         }
         const uint64_t sum_pf5 = checksum_bank_kv(s, 1);
         /* decode the fork's stream (bank 1 installed at L5). */
-        int *fbuf = malloc((size_t)(L5 + NGEN) * sizeof(int));
+        int *fbuf = (int *)malloc((size_t)(L5 + NGEN) * sizeof(int));
         memcpy(fbuf, toks5, (size_t)L5 * sizeof(int));
         int fork_stream[64];
         decode_stream_greedy(s, 1, fbuf, L5, NGEN, fork_stream);
@@ -425,7 +429,7 @@ int main(int argc, char **argv) {
         /* COLD control: bank 2 full prefill of the identical text, same decode. */
         CHECK(prefill_bank_cold(s, 2, toks5, L5), "P5 cold prefill @%d", L5);
         const uint64_t sum_pc5 = checksum_bank_kv(s, 2);
-        int *cbuf = malloc((size_t)(L5 + NGEN) * sizeof(int));
+        int *cbuf = (int *)malloc((size_t)(L5 + NGEN) * sizeof(int));
         memcpy(cbuf, toks5, (size_t)L5 * sizeof(int));
         int cold_stream[64];
         decode_stream_greedy(s, 2, cbuf, L5, NGEN, cold_stream);
@@ -477,7 +481,7 @@ int main(int argc, char **argv) {
 
         /* ---- PARTIAL fork, dst==cur: bank_pos(dst) must be R, and the tail
          *      [R,L) re-prefill lands byte-identical to cold (aligned oracle) --- */
-        int *toks6 = malloc((size_t)L6 * sizeof(int));
+        int *toks6 = (int *)malloc((size_t)L6 * sizeof(int));
         for (int i = 0; i < L6; i++)
             toks6[i] = i < NC6 ? toks[i] : base.v[(i + 5150) % base.len];
         CHECK(prefill_bank_cold(s, 0, toks, SLEN6), "P6 partial src prefill");

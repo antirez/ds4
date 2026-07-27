@@ -1723,7 +1723,7 @@ __global__ static void indexed_topk_sort_512_asc_kernel(
 }
 
 
-extern "C" int ds4_gpu_attention_decode_heads_tensor(
+int ds4_gpu_attention_decode_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
@@ -1809,7 +1809,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
 
 
 
-extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim, uint32_t raw_f16) {
+int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim, uint32_t raw_f16) {
     if (!heads || !q || !raw_kv || !model_map || sinks_offset > model_size ||
         model_size - sinks_offset < (uint64_t)n_head * sizeof(float) ||
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
@@ -2109,7 +2109,7 @@ static int attention_decode_batch_launch(
 
 
 
-extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
+int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
@@ -2139,7 +2139,7 @@ extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
 
 
 
-extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
+int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
@@ -2179,7 +2179,7 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
 
 
 
-extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
@@ -2551,7 +2551,7 @@ static int attention_prefill_mixed_launch(
 
 
 
-extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
+int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
@@ -2576,7 +2576,7 @@ extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
 
 
 
-extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
+int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,

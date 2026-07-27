@@ -1003,7 +1003,7 @@ __global__ static void compressor_shift_ratio4_kernel(float *state_kv, float *st
 
 
 
-extern "C" int ds4_gpu_rms_norm_plain_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t n, float eps) {
+int ds4_gpu_rms_norm_plain_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t n, float eps) {
     if (!out || !x || out->bytes < (uint64_t)n * sizeof(float) ||
         x->bytes < (uint64_t)n * DS4_HC_ELT_SIZE) return 0;   /* x is an HC residual carrier */
     rms_norm_plain_kernel<256, 8><<<1, 256>>>((float *)out->ptr, (const ds4_hc_t *)x->ptr, n, 1, eps);
@@ -1011,7 +1011,7 @@ extern "C" int ds4_gpu_rms_norm_plain_tensor(ds4_gpu_tensor *out, const ds4_gpu_
 }
 
 
-extern "C" int ds4_gpu_rms_norm_plain_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t n, uint32_t rows, float eps) {
+int ds4_gpu_rms_norm_plain_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t n, uint32_t rows, float eps) {
     if (!out || !x || out->bytes < (uint64_t)n * rows * sizeof(float) ||
         x->bytes < (uint64_t)n * rows * DS4_HC_ELT_SIZE) return 0;   /* x is an HC residual carrier */
     rms_norm_plain_kernel<256, 8><<<rows, 256>>>((float *)out->ptr, (const ds4_hc_t *)x->ptr, n, rows, eps);
@@ -1019,7 +1019,7 @@ extern "C" int ds4_gpu_rms_norm_plain_rows_tensor(ds4_gpu_tensor *out, const ds4
 }
 
 
-extern "C" int ds4_gpu_rms_norm_weight_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps) {
+int ds4_gpu_rms_norm_weight_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps) {
     if (!out || !x || !model_map || weight_offset > model_size ||
         model_size - weight_offset < (uint64_t)n * sizeof(float) ||
         out->bytes < (uint64_t)n * sizeof(float) ||
@@ -1032,7 +1032,7 @@ extern "C" int ds4_gpu_rms_norm_weight_tensor(ds4_gpu_tensor *out, const ds4_gpu
 }
 
 
-extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
+int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
     if (!out || !x || !model_map || weight_offset > model_size ||
         model_size - weight_offset < (uint64_t)n * sizeof(float) ||
         out->bytes < (uint64_t)n * rows * sizeof(float) ||
@@ -1045,7 +1045,7 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds
 }
 
 
-extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
+int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         ds4_gpu_tensor       *q_out,
         const ds4_gpu_tensor *q,
         const void             *model_map,
@@ -1097,14 +1097,14 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
 }
 
 
-extern "C" int ds4_gpu_head_rms_norm_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, float eps) {
+int ds4_gpu_head_rms_norm_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, float eps) {
     if (!x || x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
     head_rms_norm_kernel<<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, eps);
     return cuda_ok(cudaGetLastError(), "head_rms_norm launch");
 }
 
 
-extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps, const ds4_gpu_tensor *positions) {
+int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps, const ds4_gpu_tensor *positions) {
     if (positions && positions->bytes < (uint64_t)n_tok * sizeof(int32_t)) return 0;
     if (!x || n_rot > head_dim || (n_rot & 1u) ||
         x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
@@ -1114,13 +1114,13 @@ extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x, uint32_
 
 
 
-extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
+int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
     if (!x || n_rot > head_dim || x->bytes < (uint64_t)n_tok * head_dim * sizeof(float)) return 0;
     fp8_kv_quantize_kernel<<<n_tok, 64>>>((float *)x->ptr, n_tok, head_dim, n_rot);
     return cuda_ok(cudaGetLastError(), "fp8_kv_quantize launch");
 }
 
-extern "C" int ds4_gpu_dsv4_fp8_kv_pack_tensor(
+int ds4_gpu_dsv4_fp8_kv_pack_tensor(
         const ds4_gpu_tensor *x,
         ds4_gpu_tensor       *packed,
         ds4_gpu_tensor       *scales,
@@ -1200,7 +1200,7 @@ __global__ static void mxkv_dequant_kernel(const uint8_t *in, float *out,
     }
 }
 
-extern "C" int ds4_gpu_mxkv_pack_tensor(const ds4_gpu_tensor *x, ds4_gpu_tensor *out,
+int ds4_gpu_mxkv_pack_tensor(const ds4_gpu_tensor *x, ds4_gpu_tensor *out,
                                         uint32_t fmt, uint32_t n_tok, uint32_t head_dim) {
     if (!x || !out || n_tok == 0 || (head_dim % DS4_MXKV_BLOCK) != 0 ||
         (fmt != DS4_MXKV_FMT_FP8 && fmt != DS4_MXKV_FMT_FP4) ||
@@ -1210,7 +1210,7 @@ extern "C" int ds4_gpu_mxkv_pack_tensor(const ds4_gpu_tensor *x, ds4_gpu_tensor 
     return cuda_ok(cudaGetLastError(), "mxkv_pack launch");
 }
 
-extern "C" int ds4_gpu_mxkv_dequant_tensor(const ds4_gpu_tensor *in, ds4_gpu_tensor *out,
+int ds4_gpu_mxkv_dequant_tensor(const ds4_gpu_tensor *in, ds4_gpu_tensor *out,
                                            uint32_t fmt, uint32_t n_tok, uint32_t head_dim) {
     if (!in || !out || n_tok == 0 || (head_dim % DS4_MXKV_BLOCK) != 0 ||
         (fmt != DS4_MXKV_FMT_FP8 && fmt != DS4_MXKV_FMT_FP4) ||
@@ -1223,7 +1223,7 @@ extern "C" int ds4_gpu_mxkv_dequant_tensor(const ds4_gpu_tensor *in, ds4_gpu_ten
 /* DS4_ATTN_PACK quantize+store: fp8-roundtrip the nope dims of n_rows f32 rows
  * of x IN PLACE (identical to ds4_gpu_dsv4_fp8_kv_quantize_tensor) and store
  * the packed rows into `packed` at rows [out_row0, out_row0+n_rows). */
-extern "C" int ds4_gpu_attn_pack_quantize_store_tensor(ds4_gpu_tensor *x,
+int ds4_gpu_attn_pack_quantize_store_tensor(ds4_gpu_tensor *x,
                                                        ds4_gpu_tensor *packed,
                                                        uint32_t out_row0,
                                                        uint32_t n_rows,
@@ -1242,7 +1242,7 @@ extern "C" int ds4_gpu_attn_pack_quantize_store_tensor(ds4_gpu_tensor *x,
 }
 
 /* DS4_ATTN_PACK dequant: the first n_rows packed rows -> f32 rows in `out`. */
-extern "C" int ds4_gpu_attn_pack_dequant_tensor(const ds4_gpu_tensor *in,
+int ds4_gpu_attn_pack_dequant_tensor(const ds4_gpu_tensor *in,
                                                 ds4_gpu_tensor *out,
                                                 uint32_t n_rows,
                                                 uint32_t head_dim,
@@ -1264,7 +1264,7 @@ extern "C" int ds4_gpu_attn_pack_dequant_tensor(const ds4_gpu_tensor *in,
  * `packed` at [out_row0, out_row0+n_rows), using the exact integer-math scale
  * bucket — value-idempotent, unlike the fast-math quantize path which can
  * misround the bucket at scale boundaries.  x is not modified. */
-extern "C" int ds4_gpu_attn_pack_repack_tensor(const ds4_gpu_tensor *x,
+int ds4_gpu_attn_pack_repack_tensor(const ds4_gpu_tensor *x,
                                                ds4_gpu_tensor *packed,
                                                uint32_t out_row0,
                                                uint32_t n_rows,
@@ -1320,7 +1320,7 @@ __global__ static void mxkv_gather_dequant_kernel(const uint8_t *cache, float *o
 
 /* out is [n_sel][head_dim] contiguous when transpose==0, or [head_dim][n_sel]
  * (column i strided) when transpose!=0 — the latter builds a PV V^T operand. */
-extern "C" int ds4_gpu_mxkv_gather_dequant_tensor(const ds4_gpu_tensor *cache, ds4_gpu_tensor *out,
+int ds4_gpu_mxkv_gather_dequant_tensor(const ds4_gpu_tensor *cache, ds4_gpu_tensor *out,
                                                   const ds4_gpu_tensor *rows, uint32_t n_sel,
                                                   uint32_t cap_rows, uint32_t head_dim, uint32_t fmt,
                                                   uint32_t transpose) {
@@ -1339,7 +1339,7 @@ extern "C" int ds4_gpu_mxkv_gather_dequant_tensor(const ds4_gpu_tensor *cache, d
 }
 
 
-extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_rows, uint32_t head_dim) {
+int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_rows, uint32_t head_dim) {
     if (!x || n_rows == 0 || head_dim != 128u ||
         x->bytes < (uint64_t)n_rows * head_dim * sizeof(float)) {
         return 0;
@@ -1351,7 +1351,7 @@ extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_row
 /* QAT + pack: roundtrip n_rows f32 rows of x in place (identical to
  * ds4_gpu_dsv4_indexer_qat_tensor) and store the MXKV FP4 packed rows into
  * `packed` at rows [out_row0, out_row0 + n_rows). */
-extern "C" int ds4_gpu_dsv4_indexer_qat_pack_tensor(ds4_gpu_tensor *x,
+int ds4_gpu_dsv4_indexer_qat_pack_tensor(ds4_gpu_tensor *x,
                                                     ds4_gpu_tensor *packed,
                                                     uint32_t out_row0,
                                                     uint32_t n_rows,
@@ -1370,7 +1370,7 @@ extern "C" int ds4_gpu_dsv4_indexer_qat_pack_tensor(ds4_gpu_tensor *x,
 }
 
 
-extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, const ds4_gpu_tensor *positions) {
+int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, const ds4_gpu_tensor *positions) {
     if (!x || n_rot > head_dim || (n_rot & 1) || x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
     if (positions && positions->bytes < (uint64_t)n_tok * sizeof(int32_t)) return 0;
     uint32_t pairs = n_tok * n_head * (n_rot / 2);
@@ -1379,10 +1379,10 @@ extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint3
 }
 
 
-extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim, uint32_t raw_f16);
+int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim, uint32_t raw_f16);
 
 
-extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
+int ds4_gpu_kv_fp8_store_raw_tensor(
         ds4_gpu_tensor *kv,
         ds4_gpu_tensor *raw_cache,
         uint32_t          raw_cap,
@@ -1399,7 +1399,7 @@ extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
 }
 
 
-extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim, uint32_t raw_f16) {
+int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim, uint32_t raw_f16) {
     if (!raw_cache || !kv || raw_cap == 0 ||
         raw_cache->bytes < (uint64_t)raw_cap * head_dim * (raw_f16 ? sizeof(__half) : sizeof(float)) ||
         kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
@@ -1409,7 +1409,7 @@ extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_
 }
 
 
-extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim, uint32_t raw_f16,
+int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim, uint32_t raw_f16,
                                                  const ds4_gpu_tensor *positions, const ds4_gpu_tensor *seq_id, uint32_t n_banks) {
     /* Descriptor (banked) mode: both arrays or neither; the raw cache operand
      * is the whole bank pool (byte bound scales by n_banks) and the uint32
@@ -1440,7 +1440,7 @@ extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, cons
 }
 
 
-extern "C" int ds4_gpu_compressor_store_batch_tensor(
+int ds4_gpu_compressor_store_batch_tensor(
         const ds4_gpu_tensor *kv,
         const ds4_gpu_tensor *sc,
         ds4_gpu_tensor       *state_kv,
@@ -1490,7 +1490,7 @@ extern "C" int ds4_gpu_compressor_store_batch_tensor(
 
 
 
-extern "C" int ds4_gpu_compressor_update_tensor(
+int ds4_gpu_compressor_update_tensor(
         const ds4_gpu_tensor *kv_cur,
         const ds4_gpu_tensor *sc_cur,
         ds4_gpu_tensor       *state_kv,
@@ -1574,7 +1574,7 @@ extern "C" int ds4_gpu_compressor_update_tensor(
 }
 
 
-extern "C" int ds4_gpu_compressor_prefill_tensor(
+int ds4_gpu_compressor_prefill_tensor(
         ds4_gpu_tensor       *comp_cache,
         ds4_gpu_tensor       *state_kv,
         ds4_gpu_tensor       *state_score,
@@ -1692,7 +1692,7 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
 }
 
 
-extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
+int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
         ds4_gpu_tensor       *comp_cache,
         ds4_gpu_tensor       *state_kv,
         ds4_gpu_tensor       *state_score,
@@ -1781,7 +1781,7 @@ extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
 }
 
 
-extern "C" int ds4_gpu_compressor_prefill_state_ratio4_tensor(
+int ds4_gpu_compressor_prefill_state_ratio4_tensor(
         ds4_gpu_tensor       *state_kv,
         ds4_gpu_tensor       *state_score,
         const ds4_gpu_tensor *kv_tail,

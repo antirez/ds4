@@ -108,7 +108,7 @@ static char *read_file(const char *path, size_t *len_out) {
     fseek(fp, 0, SEEK_END);
     long n = ftell(fp);
     fseek(fp, 0, SEEK_SET);
-    char *buf = malloc((size_t)n + 1);
+    char *buf = (char *)malloc((size_t)n + 1);
     if (!buf || fread(buf, 1, (size_t)n, fp) != (size_t)n) { fclose(fp); free(buf); return NULL; }
     fclose(fp);
     buf[n] = '\0';
@@ -120,7 +120,7 @@ static bool make_prompt(int k, ds4_tokens *p) {
     memset(p, 0, sizeof(*p));
     const int off = g_prompt_off[k], len = g_prompt_len[k];
     if (off + len > g_toks.len) return false;
-    p->v = malloc((size_t)len * sizeof(int));
+    p->v = (int *)malloc((size_t)len * sizeof(int));
     if (!p->v) return false;
     memcpy(p->v, g_toks.v + off, (size_t)len * sizeof(int));
     p->len = p->cap = len;
@@ -205,7 +205,7 @@ static bool multi_run(int n, int steps, int **streams, int *const *solo,
         }
         ds4_tokens_free(&p);
     }
-    float *logits = ok ? malloc((size_t)n * vocab * sizeof(float)) : NULL;
+    float *logits = ok ? (float *)malloc((size_t)n * vocab * sizeof(float)) : NULL;
     if (ok && !logits) ok = false;
     if (ok) {
         const double t0 = now_s();
@@ -290,7 +290,7 @@ static bool check_stale_classic_fails_loud(void) {
         }
         ds4_tokens_free(&p);
     }
-    float *logits = ok ? malloc((size_t)2 * vocab * sizeof(float)) : NULL;
+    float *logits = ok ? (float *)malloc((size_t)2 * vocab * sizeof(float)) : NULL;
     if (ok && !logits) ok = false;
     if (ok) {
         /* Sanity: eval works BEFORE any multiseq step (so a later failure is
@@ -482,7 +482,7 @@ int main(int argc, char **argv) {
     int *solo[GATE_MAX_N];
     double solo_secs[GATE_MAX_N];
     for (int k = 0; k < maxn; k++) {
-        solo[k] = malloc((size_t)(steps + 1) * sizeof(int));
+        solo[k] = (int *)malloc((size_t)(steps + 1) * sizeof(int));
         if (!solo[k] || !solo_stream(k, steps, solo[k], &solo_secs[k])) {
             fprintf(stderr, "solo reference %d failed\n", k);
             return 1;
@@ -504,8 +504,8 @@ int main(int argc, char **argv) {
         int flip_step[GATE_MAX_N];
         float flip_gap[GATE_MAX_N];
         memset(flip_gap, 0, sizeof(flip_gap));
-        for (int k = 0; k < n; k++) multi[n - 1][k] = malloc((size_t)(steps + 1) * sizeof(int));
-        ref_l1[n - 1] = malloc((size_t)n * vocab_w * sizeof(float));
+        for (int k = 0; k < n; k++) multi[n - 1][k] = (int *)malloc((size_t)(steps + 1) * sizeof(int));
+        ref_l1[n - 1] = (float *)malloc((size_t)n * vocab_w * sizeof(float));
         double secs = 0.0;
         if (!multi_run(n, steps, multi[n - 1], solo, flip_step, flip_gap, &secs,
                        false, ref_l1[n - 1])) {
@@ -566,8 +566,8 @@ int main(int argc, char **argv) {
         if (!have[n - 1]) continue;
         int *mix[GATE_MAX_N];
         memset(mix, 0, sizeof(mix));
-        for (int k = 0; k < n; k++) mix[k] = malloc((size_t)(steps + 1) * sizeof(int));
-        float *mix_l1 = malloc((size_t)n * vocab_w * sizeof(float));
+        for (int k = 0; k < n; k++) mix[k] = (int *)malloc((size_t)(steps + 1) * sizeof(int));
+        float *mix_l1 = (float *)malloc((size_t)n * vocab_w * sizeof(float));
         double secs = 0.0;
         if (!multi_run(n, steps, mix, NULL, NULL, NULL, &secs, true, mix_l1)) {
             CHECK(0, "N=%d: mixed-entry run failed", n);

@@ -180,7 +180,7 @@ static int dspark_markov_reduce_blocks(const ds4_gpu_tensor *id_dev,
 }
 
 
-extern "C" int ds4_gpu_dspark_markov_step_model(
+int ds4_gpu_dspark_markov_step_model(
         ds4_gpu_tensor *refined_logits,
         int32_t *refined_id_dst,
         int32_t *refined_id2_dst,
@@ -291,7 +291,7 @@ __global__ static void dspark_confidence_score_kernel(
 }
 
 
-extern "C" int ds4_gpu_dspark_confidence_score_model(
+int ds4_gpu_dspark_confidence_score_model(
         ds4_gpu_tensor *scores,
         const ds4_gpu_tensor *hidden,
         const ds4_gpu_tensor *token_ids,
@@ -335,7 +335,7 @@ __global__ static void dspark_hc_mean_reduce_kernel(
     }
 }
 
-extern "C" int ds4_gpu_dspark_hc_mean_reduce(
+int ds4_gpu_dspark_hc_mean_reduce(
         ds4_gpu_tensor *out,
         const ds4_gpu_tensor *after_ffn_hc,
         uint32_t n_embd,
@@ -377,7 +377,7 @@ __global__ static void dspark_hc_mean_reduce_batch_kernel(
 }
 
 
-extern "C" int ds4_gpu_dspark_hc_mean_reduce_batch(
+int ds4_gpu_dspark_hc_mean_reduce_batch(
         ds4_gpu_tensor *out,
         const ds4_gpu_tensor *hc_batch,
         uint32_t n_embd,

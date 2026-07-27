@@ -1100,7 +1100,7 @@ static int cuda_tu_archs_ok(const cudaDeviceProp *prop) {
 
 
 
-extern "C" int ds4_gpu_init(void) {
+int ds4_gpu_init(void) {
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
     cudaDeviceProp prop;
@@ -1127,7 +1127,7 @@ extern "C" int ds4_gpu_init(void) {
 
 
 
-extern "C" void ds4_gpu_cleanup(void) {
+void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
     if (g_decode_graph_exec) {
         (void)cudaGraphExecDestroy(g_decode_graph_exec);
@@ -1209,11 +1209,11 @@ __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
  * accompanies. */
 static uint64_t g_tensor_alloc_bytes;
 
-extern "C" uint64_t ds4_gpu_tensor_alloc_bytes_current(void) {
+uint64_t ds4_gpu_tensor_alloc_bytes_current(void) {
     return __atomic_load_n(&g_tensor_alloc_bytes, __ATOMIC_RELAXED);
 }
 
-extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
+ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
@@ -1229,7 +1229,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
 
 
 
-extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
@@ -1256,7 +1256,7 @@ static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
 
 
 
-extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
+int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
     if (kv_cache_bytes == 0) return 0;
 
     /* Very large KV caches are where device-only cudaMalloc() can make a
@@ -1285,7 +1285,7 @@ extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint
 
 
 
-extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
+ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
     if (!base || offset > base->bytes || bytes > base->bytes - offset) return NULL;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
@@ -1297,7 +1297,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint6
 
 
 
-extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
+void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     if (!tensor) return;
     if (tensor->owner && tensor->ptr) {
         (void)cudaFree(tensor->ptr);
@@ -1308,13 +1308,13 @@ extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
 
 
 
-extern "C" uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
+uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
     return tensor ? tensor->bytes : 0;
 }
 
 
 
-extern "C" void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
+void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
     if (!tensor) return NULL;
     (void)cudaDeviceSynchronize();
     return tensor->ptr;
@@ -1325,13 +1325,13 @@ extern "C" void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
 /* Raw device pointer WITHOUT a synchronize — for building device pointer tables
  * (Tier-2 per-bank comp/index base tables) at allocation time, where the caller
  * controls ordering. Do NOT use to read tensor contents on the host. */
-extern "C" void *ds4_gpu_tensor_device_ptr(const ds4_gpu_tensor *tensor) {
+void *ds4_gpu_tensor_device_ptr(const ds4_gpu_tensor *tensor) {
     return tensor ? tensor->ptr : NULL;
 }
 
 
 
-extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {
+int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {
     if (!tensor || count > tensor->bytes / sizeof(float)) return 0;
     if (count == 0) return 1;
     fill_f32_kernel<<<(count + 255u) / 256u, 256>>>((float *)tensor->ptr, count, value);
@@ -1340,14 +1340,14 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint
 
 
 
-extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
+int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     return cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes, cudaMemcpyHostToDevice), "tensor write");
 }
 
 
 
-extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
+int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");
 }
@@ -1355,7 +1355,7 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
 
 
 
-extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
+int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                      const ds4_gpu_tensor *src, uint64_t src_offset,
                                      uint64_t bytes) {
     if (!dst || !src || dst_offset > dst->bytes || src_offset > src->bytes ||
@@ -1396,7 +1396,7 @@ __global__ static void batched_copy_kernel(const ds4_copy_desc *descs, uint32_t 
     }
 }
 
-extern "C" void *ds4_gpu_batched_copy_prepare(
+void *ds4_gpu_batched_copy_prepare(
         ds4_gpu_tensor **dst,
         ds4_gpu_tensor **src,
         const uint64_t *bytes,
@@ -1427,11 +1427,11 @@ extern "C" void *ds4_gpu_batched_copy_prepare(
     return d;
 }
 
-extern "C" void ds4_gpu_batched_copy_free(void *handle) {
+void ds4_gpu_batched_copy_free(void *handle) {
     if (handle) cudaFree(handle);
 }
 
-extern "C" int ds4_gpu_batched_copy_run(void *handle, uint32_t n_descs, uint64_t max_bytes) {
+int ds4_gpu_batched_copy_run(void *handle, uint32_t n_descs, uint64_t max_bytes) {
     if (!handle || n_descs == 0) return 0;
     uint32_t chunks = (uint32_t)(((max_bytes >> 4) + 255) / 256);
     if (chunks < 1u) chunks = 1u;
@@ -1443,10 +1443,10 @@ extern "C" int ds4_gpu_batched_copy_run(void *handle, uint32_t n_descs, uint64_t
 
 
 
-extern "C" int ds4_gpu_begin_commands(void) { return 1; }
+int ds4_gpu_begin_commands(void) { return 1; }
 
 
-extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
+int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 
 
 /* =========================================================================
@@ -1461,7 +1461,7 @@ extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchroni
  * again when the topology changes (context-tier boundaries). Opt-in via
  * DS4_CUDA_GRAPHS=1; see the note in ds4_gpu_decode_graph_begin.
  * ========================================================================= */
-extern "C" int ds4_gpu_decode_graph_begin(void) {
+int ds4_gpu_decode_graph_begin(void) {
     /* Opt-in (DS4_CUDA_GRAPHS=1): capture-per-token measured ~2% SLOWER than
      * direct submission (ExecUpdate on a ~500-node graph outweighs the
      * launch-gap savings when the tape is re-encoded every token anyway).
@@ -1482,7 +1482,7 @@ extern "C" int ds4_gpu_decode_graph_begin(void) {
     return 1;
 }
 
-extern "C" int ds4_gpu_decode_graph_end(void) {
+int ds4_gpu_decode_graph_end(void) {
     if (!g_decode_graph_capturing) return 0;
     g_decode_graph_capturing = 0;
     cudaGraph_t graph = NULL;
@@ -1520,13 +1520,13 @@ extern "C" int ds4_gpu_decode_graph_end(void) {
     return ok;
 }
 
-extern "C" int ds4_gpu_end_commands(void) {
+int ds4_gpu_end_commands(void) {
     cuda_model_load_progress_finish();
     return cuda_ok(cudaDeviceSynchronize(), "end commands");
 }
 
 
-extern "C" int ds4_gpu_synchronize(void) {
+int ds4_gpu_synchronize(void) {
     cuda_model_load_progress_finish();
     return cuda_ok(cudaDeviceSynchronize(), "synchronize");
 }
@@ -1569,7 +1569,7 @@ static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
 
 
 
-extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
+int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!cuda_model_set_host_map(model_map, model_size)) return 0;
 
     const char *copy_env = getenv("DS4_CUDA_COPY_MODEL");
@@ -1635,7 +1635,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
 
 
 
-extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
+int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
     (void)max_tensor_bytes;
     if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
     if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL &&
@@ -1648,7 +1648,7 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
 
 
 
-extern "C" int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
+int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
     g_model_fd = fd;
     g_model_fd_host_base = model_map;
     g_model_file_size = 0;
@@ -1686,13 +1686,13 @@ extern "C" int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
 
 
 
-extern "C" int ds4_gpu_set_model_fd(int fd) {
+int ds4_gpu_set_model_fd(int fd) {
     return ds4_gpu_set_model_fd_for_map(fd, g_model_host_base);
 }
 
 
 
-extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
+int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
     if (cuda_model_range_is_cached(model_map, offset, bytes)) return 1;
@@ -1717,7 +1717,7 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
  * fd through a pinned staging buffer, then registered in g_model_ranges under
  * the overlay's host map so cuda_model_range_ptr resolves them like any other
  * cached range. Runs at startup only (synchronous). */
-extern "C" int ds4_gpu_cache_external_range(const void *host_base_key, int fd,
+int ds4_gpu_cache_external_range(const void *host_base_key, int fd,
                                             uint64_t offset, uint64_t bytes,
                                             const char *label) {
     if (!host_base_key || fd < 0 || bytes == 0) return 0;
@@ -1782,7 +1782,7 @@ extern "C" int ds4_gpu_cache_external_range(const void *host_base_key, int fd,
 
 
 
-extern "C" void ds4_gpu_mem_info(uint64_t *free_out, uint64_t *total_out) {
+void ds4_gpu_mem_info(uint64_t *free_out, uint64_t *total_out) {
     size_t free_b = 0, total_b = 0;
     (void)cudaMemGetInfo(&free_b, &total_b);
     if (free_out) *free_out = (uint64_t)free_b;
@@ -1791,7 +1791,7 @@ extern "C" void ds4_gpu_mem_info(uint64_t *free_out, uint64_t *total_out) {
 
 
 
-extern "C" void ds4_gpu_print_memory_report(const char *label) {
+void ds4_gpu_print_memory_report(const char *label) {
     size_t free_b = 0, total_b = 0;
     (void)cudaMemGetInfo(&free_b, &total_b);
     fprintf(stderr, "ds4: CUDA memory report %s: free %.2f MiB total %.2f MiB\n",
@@ -1800,7 +1800,7 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
 
 
 
-extern "C" void ds4_gpu_set_quality(bool quality) {
+void ds4_gpu_set_quality(bool quality) {
     g_quality_mode = quality ? 1 : 0;
     if (g_cublas_ready) {
         const cublasMath_t math_mode =

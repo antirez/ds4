@@ -47,7 +47,7 @@ static char *read_file(const char *path, size_t *len_out) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return NULL;
     fseek(fp, 0, SEEK_END); long n = ftell(fp); fseek(fp, 0, SEEK_SET);
-    char *buf = malloc((size_t)n + 1);
+    char *buf = (char *)malloc((size_t)n + 1);
     if (!buf || fread(buf, 1, (size_t)n, fp) != (size_t)n) { fclose(fp); free(buf); return NULL; }
     fclose(fp); buf[n] = '\0'; if (len_out) *len_out = (size_t)n; return buf;
 }
@@ -56,7 +56,7 @@ static bool make_prompt(int k, ds4_tokens *p) {
     memset(p, 0, sizeof(*p));
     const int off = g_prompt_off[k], len = g_prompt_len[k];
     if (off + len > g_toks.len) return false;
-    p->v = malloc((size_t)len * sizeof(int));
+    p->v = (int *)malloc((size_t)len * sizeof(int));
     if (!p->v) return false;
     memcpy(p->v, g_toks.v + off, (size_t)len * sizeof(int));
     p->len = p->cap = len;
@@ -86,7 +86,7 @@ static bool bank0_logits_at_width(int M, float *row0_out) {
         if (ok) { gpu_graph_bank_counters_capture(g, (uint32_t)k); argtok[k] = ds4_session_argmax(s); }
         ds4_tokens_free(&p);
     }
-    float *logits = ok ? malloc((size_t)M * vocab * sizeof(float)) : NULL;
+    float *logits = ok ? (float *)malloc((size_t)M * vocab * sizeof(float)) : NULL;
     if (ok && !logits) ok = false;
     if (ok) {
         ds4_multiseq_req reqs[GATE_MAX_N];
@@ -134,7 +134,7 @@ int main(int argc, char **argv) {
     const int nW = (int)(sizeof(widths) / sizeof(widths[0]));
     float *row[8]; memset(row, 0, sizeof row);
     for (int wi = 0; wi < nW; wi++) {
-        row[wi] = malloc((size_t)vocab * sizeof(float));
+        row[wi] = (float *)malloc((size_t)vocab * sizeof(float));
         if (!bank0_logits_at_width(widths[wi], row[wi])) {
             fprintf(stderr, "ALGO-STABILITY GATE FAIL: width %d run failed\n", widths[wi]);
             g_fail = 1; goto done;
@@ -143,7 +143,8 @@ int main(int argc, char **argv) {
 
     /* Reference = M=2 (the smallest BATCHED-tier width; M=1 is the single-row
      * kernel tier). HARD: every batched-tier width byte-identical to it. */
-    int ref = 1;   /* widths[1] == 2 */
+    int ref;   /* widths[1] == 2 */
+    ref = 1;
     for (int wi = 0; wi < nW; wi++) {
         const long d = first_diff(row[wi], row[ref], vocab);
         const bool batched = widths[wi] >= 2;

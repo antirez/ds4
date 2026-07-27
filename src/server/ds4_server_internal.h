@@ -44,9 +44,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
 
 /* Build-time version string (Makefile passes -DDS4_VERSION_STR from
  * `git describe`); fall back to "unknown" for non-Makefile/ad-hoc builds. */
@@ -1614,8 +1611,5 @@ void usage(FILE *fp, const char *topic);
 
 /* ---- shared inline helpers ---- */
 
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* DS4_SERVER_INTERNAL_H */

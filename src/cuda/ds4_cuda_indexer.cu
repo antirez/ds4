@@ -7,7 +7,7 @@
  * mode only changes storage and read traffic.  head_dim must be 128. */
 static int g_indexer_fp4 = 0;
 
-extern "C" void ds4_gpu_indexer_set_fp4(int on) { g_indexer_fp4 = on ? 1 : 0; }
+void ds4_gpu_indexer_set_fp4(int on) { g_indexer_fp4 = on ? 1 : 0; }
 
 __device__ static inline float idx_e2m1_value_dev(int i) {
     switch (i & 7) {
@@ -1002,7 +1002,7 @@ static int indexer_scores_launch(
 
 
 
-extern "C" int ds4_gpu_indexer_score_one_tensor(
+int ds4_gpu_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *weights,
@@ -1018,7 +1018,7 @@ extern "C" int ds4_gpu_indexer_score_one_tensor(
 
 
 
-extern "C" int ds4_gpu_indexer_scores_prefill_tensor(
+int ds4_gpu_indexer_scores_prefill_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *weights,
@@ -1036,7 +1036,7 @@ extern "C" int ds4_gpu_indexer_scores_prefill_tensor(
 
 
 
-extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
+int ds4_gpu_indexer_scores_decode_batch_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *weights,
@@ -1060,7 +1060,7 @@ extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
 
 
 
-extern "C" int ds4_gpu_indexer_topk_tensor(
+int ds4_gpu_indexer_topk_tensor(
         ds4_gpu_tensor       *selected,
         const ds4_gpu_tensor *scores,
         uint32_t                n_comp,
@@ -1240,7 +1240,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
 
 
 
-extern "C" int ds4_gpu_argmax_tensor(
+int ds4_gpu_argmax_tensor(
         ds4_gpu_tensor       *out_idx,
         const ds4_gpu_tensor *logits,
         uint32_t                n_vocab) {
@@ -1257,7 +1257,7 @@ extern "C" int ds4_gpu_argmax_tensor(
 
 
 
-extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
+int ds4_gpu_dsv4_topk_mask_tensor(
         ds4_gpu_tensor       *mask,
         const ds4_gpu_tensor *topk,
         uint32_t                n_comp,

@@ -458,7 +458,7 @@ __global__ static void grouped_fp8mx_a_nt_kernel(
 
 
 
-extern "C" int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
+int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !model_map || weight_offset >= model_size || n_vocab == 0) return 0;
     /* The kernel writes n_embd*n_hc carrier samples; validate like the batched
      * sibling does. Before the BF16 narrowing an undersized out_hc still had 2x
@@ -475,7 +475,7 @@ extern "C" int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void 
 
 
 
-extern "C" int ds4_gpu_embed_tokens_hc_tensor(
+int ds4_gpu_embed_tokens_hc_tensor(
         ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *tokens_t,
         const void             *model_map,
@@ -713,7 +713,7 @@ struct mxfp8_act_cache_t {
 };
 static thread_local mxfp8_act_cache_t g_act_cache;
 
-extern "C" void ds4_gpu_mxfp8_act_cache_arm(const ds4_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim) {
+void ds4_gpu_mxfp8_act_cache_arm(const ds4_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim) {
     /* Operational kill switch / A-B measurement handle. Read ONCE (this runs
      * per layer, not per token), and disarming restores the exact pre-cache
      * code path in the GEMMs below. */
@@ -729,7 +729,7 @@ extern "C" void ds4_gpu_mxfp8_act_cache_arm(const ds4_gpu_tensor *x, uint64_t n_
     g_act_cache.key_in_dim = in_dim;
 }
 
-extern "C" void ds4_gpu_mxfp8_act_cache_disarm(void) {
+void ds4_gpu_mxfp8_act_cache_disarm(void) {
     g_act_cache.key_ptr = NULL;
     g_act_cache.valid   = 0;
     g_act_cache.valid_h = 0;
@@ -887,7 +887,7 @@ static int cuda_matmul_fp8_mx_tensor_labeled(ds4_gpu_tensor *out, const void *mo
 }
 
 
-extern "C" int ds4_gpu_matmul_fp8_mx_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+int ds4_gpu_matmul_fp8_mx_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     return cuda_matmul_fp8_mx_tensor_labeled(out, model_map, model_size, weight_offset,
                                              in_dim, out_dim, x, n_tok, "fp8_mx");
@@ -1162,10 +1162,10 @@ __global__ static void mxfp8_mmvq_deint_nt_kernel(float *out, const __nv_fp8_e4m
 std::unordered_set<uint64_t> g_fp8_offsets;
 
 
-extern "C" void ds4_gpu_register_fp8_weight(uint64_t weight_offset) { g_fp8_offsets.insert(weight_offset); }
+void ds4_gpu_register_fp8_weight(uint64_t weight_offset) { g_fp8_offsets.insert(weight_offset); }
 
 
-extern "C" void ds4_gpu_register_fp8_lt_weight(uint64_t weight_offset) { g_mxfp8_lt_offsets.insert(weight_offset); }
+void ds4_gpu_register_fp8_lt_weight(uint64_t weight_offset) { g_mxfp8_lt_offsets.insert(weight_offset); }
 
 
 /* Drop every process-global fp8 weight-cache entry. MUST run at backend
@@ -1217,12 +1217,12 @@ void cuda_fp8_weight_cache_clear(void) {
  * emits, and the prefill suffix is the same tensor-core GEMM a pure-prefill step
  * emits at that width. No kernel logic is duplicated. */
 static int g_mneutral_rows = 0;
-extern "C" void ds4_gpu_matmul_set_batch_mneutral(int n) { g_mneutral_rows = (n > 0) ? n : 0; }
+void ds4_gpu_matmul_set_batch_mneutral(int n) { g_mneutral_rows = (n > 0) ? n : 0; }
 /* Queried cross-TU by the MoE dispatch (ds4_cuda_moe.cu): the number of leading
  * decode rows that must take the M-independent per-token expert path (the trailing
  * prefill rows take the grouped GEMM). 0 = not armed. Nonzero = armed (inc-2/3
  * read it as a boolean; inc-4 MoE two-pass reads the count to place the split). */
-extern "C" int ds4_gpu_matmul_batch_mneutral(void) { return g_mneutral_rows; }
+int ds4_gpu_matmul_batch_mneutral(void) { return g_mneutral_rows; }
 
 static int cuda_matmul_mxfp8_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
     if (!out || !x || !model_map) return 0;
@@ -1363,14 +1363,14 @@ static int cuda_matmul_mxfp8_tensor_labeled(ds4_gpu_tensor *out, const void *mod
 
 
 
-extern "C" int ds4_gpu_matmul_mxfp8_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+int ds4_gpu_matmul_mxfp8_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     return cuda_matmul_mxfp8_tensor_labeled(out, model_map, model_size, weight_offset,
                                            in_dim, out_dim, x, n_tok, "mxfp8");
 }
 
 
 
-extern "C" int ds4_gpu_matmul_mxfp8_pair_tensor(
+int ds4_gpu_matmul_mxfp8_pair_tensor(
         ds4_gpu_tensor *out0,
         ds4_gpu_tensor *out1,
         const void *model_map,
@@ -1495,7 +1495,7 @@ int cuda_matmul_fp8_hc_expand_tensor_labeled(
 
 
 
-extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map) return 0;
     /* inc 4 prefix-split (see the mxfp8 twin): decode prefix [0,n_dec) custom-nt,
      * prefill suffix [n_dec,n_tok) cuBLAS tensor-core, via pure-regime recursion. */
@@ -1609,7 +1609,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
 
 
 
-extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map) return 0;
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
     const uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
@@ -1645,7 +1645,7 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
 
 
 
-extern "C" int ds4_gpu_matmul_f16_pair_tensor(
+int ds4_gpu_matmul_f16_pair_tensor(
         ds4_gpu_tensor *out0,
         ds4_gpu_tensor *out1,
         const void *model_map,
@@ -1668,7 +1668,7 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
 
 
 
-extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
     uint64_t weight_elems = out_dim * in_dim;
@@ -1744,7 +1744,7 @@ static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t ou
 }
 
 
-extern "C" int ds4_gpu_attention_output_batch_tensor(
+int ds4_gpu_attention_output_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
         const void             *model_map,
@@ -1851,7 +1851,7 @@ extern "C" int ds4_gpu_attention_output_batch_tensor(
 
 
 
-extern "C" int ds4_gpu_attention_output_low_tensor(
+int ds4_gpu_attention_output_low_tensor(
         ds4_gpu_tensor       *low,
         const void             *model_map,
         uint64_t                model_size,

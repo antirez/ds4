@@ -253,7 +253,7 @@ cuda-prefill-gate-baseline:
 	rm -rf $(PREFILL_BASELINE_WT)
 	git worktree prune
 	git worktree add --detach $(PREFILL_BASELINE_WT) $(PREFILL_BASELINE_REF)
-	cp tests/prefill_bitexact_gate.c $(PREFILL_BASELINE_WT)/tests/
+	cp tests/prefill_bitexact_gate.cpp $(PREFILL_BASELINE_WT)/tests/
 	cp Makefile $(PREFILL_BASELINE_WT)/
 	cp tests/long_context_story_prompt.txt $(PREFILL_BASELINE_WT)/tests/
 	$(MAKE) -C $(PREFILL_BASELINE_WT) tests/prefill_bitexact_gate \
@@ -313,35 +313,35 @@ tests/ds4_test.o: tests/ds4_test.cpp $(SERVER_SRCS) src/server/ds4_server_intern
 tests/ds4_agent_test.o: tests/ds4_agent_test.cpp $(AGENT_SRCS) src/agent/ds4_agent_internal.h src/ds4.h $(LIB_HDRS) src/vendor/linenoise.h
 	$(CXX) $(CXXFLAGS) $(DS4_INC) -Wno-unused-function -c -o $@ tests/ds4_agent_test.cpp
 
-tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c src/ds4_gpu.h
-	$(CC) $(CFLAGS) -Isrc -c -o $@ tests/cuda_long_context_smoke.c
+tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.cpp src/ds4_gpu.h
+	$(CC) $(CFLAGS) -Isrc -c -o $@ tests/cuda_long_context_smoke.cpp
 
-tests/multiseq_frontier_gate.o: tests/multiseq_frontier_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
-	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/multiseq_frontier_gate.c
+tests/multiseq_frontier_gate.o: tests/multiseq_frontier_gate.cpp src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/multiseq_frontier_gate.cpp
 
-tests/multiseq_decode_gate.o: tests/multiseq_decode_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
-	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/multiseq_decode_gate.c
+tests/multiseq_decode_gate.o: tests/multiseq_decode_gate.cpp src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/multiseq_decode_gate.cpp
 
-tests/bank_spec_gate.o: tests/bank_spec_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
-	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/bank_spec_gate.c
+tests/bank_spec_gate.o: tests/bank_spec_gate.cpp src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/bank_spec_gate.cpp
 
-tests/accounting_gate.o: tests/accounting_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
-	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/accounting_gate.c
+tests/accounting_gate.o: tests/accounting_gate.cpp src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/accounting_gate.cpp
 
-tests/bank_evict_restore_gate.o: tests/bank_evict_restore_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
-	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/bank_evict_restore_gate.c
+tests/bank_evict_restore_gate.o: tests/bank_evict_restore_gate.cpp src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/bank_evict_restore_gate.cpp
 
-tests/bank_fork_gate.o: tests/bank_fork_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
-	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/bank_fork_gate.c
+tests/bank_fork_gate.o: tests/bank_fork_gate.cpp src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/bank_fork_gate.cpp
 
-tests/algo_stability_gate.o: tests/algo_stability_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
-	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/algo_stability_gate.c
+tests/algo_stability_gate.o: tests/algo_stability_gate.cpp src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/algo_stability_gate.cpp
 
-tests/mixed_prefill_gate.o: tests/mixed_prefill_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
-	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/mixed_prefill_gate.c
+tests/mixed_prefill_gate.o: tests/mixed_prefill_gate.cpp src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/mixed_prefill_gate.cpp
 
-tests/mixed_neutrality_gate.o: tests/mixed_neutrality_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
-	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/mixed_neutrality_gate.c
+tests/mixed_neutrality_gate.o: tests/mixed_neutrality_gate.cpp src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/mixed_neutrality_gate.cpp
 
 # Public-API only (ds4.h): the gate must build unchanged against the baseline
 # ref's tree, so it must not depend on engine internals that may have drifted.
@@ -350,11 +350,11 @@ tests/mixed_neutrality_gate.o: tests/mixed_neutrality_gate.c src/engine/ds4_engi
 # file header).  cuda-prefill-gate force-rebuilds this object so the stamp is
 # never stale.
 GATE_BUILD_REF := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
-tests/prefill_bitexact_gate.o: tests/prefill_bitexact_gate.c src/ds4.h
-	$(CC) $(CFLAGS) $(DS4_INC) -DDS4_GATE_BUILD_REF='"$(GATE_BUILD_REF)"' \
-		-c -o $@ tests/prefill_bitexact_gate.c
-tests/spec_sampling_gate.o: tests/spec_sampling_gate.c src/ds4.h
-	$(CC) $(CFLAGS) $(DS4_INC) -c -o $@ tests/spec_sampling_gate.c
+tests/prefill_bitexact_gate.o: tests/prefill_bitexact_gate.cpp src/ds4.h
+	$(CXX) $(CXXFLAGS) $(DS4_INC) -DDS4_GATE_BUILD_REF='"$(GATE_BUILD_REF)"' \
+		-c -o $@ tests/prefill_bitexact_gate.cpp
+tests/spec_sampling_gate.o: tests/spec_sampling_gate.cpp src/ds4.h
+	$(CC) $(CFLAGS) $(DS4_INC) -c -o $@ tests/spec_sampling_gate.cpp
 
 src/cuda/%.o: src/cuda/%.cu src/cuda/ds4_cuda_internal.h src/ds4_gpu.h src/cuda/ds4_iq2_tables_cuda.inc
 	$(NVCC) $(NVCCFLAGS) -Isrc -c -o $@ $<

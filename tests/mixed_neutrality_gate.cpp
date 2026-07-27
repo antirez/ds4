@@ -47,7 +47,7 @@ static const int g_len[N_DEC] = {130, 258};
 static char *read_file(const char *p, size_t *n) {
     FILE *f = fopen(p, "rb"); if (!f) return NULL;
     fseek(f, 0, SEEK_END); long s = ftell(f); fseek(f, 0, SEEK_SET);
-    char *b = malloc((size_t)s + 1);
+    char *b = (char *)malloc((size_t)s + 1);
     if (!b || fread(b, 1, (size_t)s, f) != (size_t)s) { fclose(f); free(b); return NULL; }
     fclose(f); b[s] = 0; if (n) *n = (size_t)s; return b;
 }
@@ -99,8 +99,8 @@ static bool fused_step_logits(int K, uint32_t head_cap, float *dec_rows, float *
     }
 
     const uint32_t n_rows = (uint32_t)N_DEC + (K > 0 ? (uint32_t)K : 0u);
-    ds4_multiseq_req *reqs = ok ? malloc((size_t)n_rows * sizeof(*reqs)) : NULL;
-    float *logits = ok ? malloc((size_t)n_rows * vocab * sizeof(float)) : NULL;
+    ds4_multiseq_req *reqs = ok ? (ds4_multiseq_req *)malloc((size_t)n_rows * sizeof(*reqs)) : NULL;
+    float *logits = ok ? (float *)malloc((size_t)n_rows * vocab * sizeof(float)) : NULL;
     if (ok && (!reqs || !logits)) ok = false;
     if (ok) {
         for (int k = 0; k < N_DEC; k++) {
@@ -182,11 +182,11 @@ int main(int argc, char **argv) {
     if (g_toks.len < need) { fprintf(stderr, "prompt too short (%d<%d)\n", g_toks.len, need); return 1; }
 
     const int vocab = (int)DS4_N_VOCAB;
-    float *ref_dec = malloc((size_t)N_DEC * vocab * sizeof(float));   /* decode-only M=N_DEC */
-    float *mix_dec = malloc((size_t)N_DEC * vocab * sizeof(float));   /* fused M=N_DEC+K, full head */
-    float *lv1_dec = malloc((size_t)N_DEC * vocab * sizeof(float));   /* fused M=N_DEC+K, LEVER-1 head */
-    float *mix_pre = malloc((size_t)vocab * sizeof(float));           /* fused prefill last */
-    float *cls_pre = malloc((size_t)vocab * sizeof(float));           /* classic-resume last */
+    float *ref_dec = (float *)malloc((size_t)N_DEC * vocab * sizeof(float));   /* decode-only M=N_DEC */
+    float *mix_dec = (float *)malloc((size_t)N_DEC * vocab * sizeof(float));   /* fused M=N_DEC+K, full head */
+    float *lv1_dec = (float *)malloc((size_t)N_DEC * vocab * sizeof(float));   /* fused M=N_DEC+K, LEVER-1 head */
+    float *mix_pre = (float *)malloc((size_t)vocab * sizeof(float));           /* fused prefill last */
+    float *cls_pre = (float *)malloc((size_t)vocab * sizeof(float));           /* classic-resume last */
     int cls_next = -1;
 
     if (!fused_step_logits(0,     0u,             ref_dec, NULL))    { fprintf(stderr, "GATE FAIL: decode-only reference run failed\n"); g_fail = 1; goto done; }

@@ -39,9 +39,6 @@
 #ifndef __LINENOISE_H
 #define __LINENOISE_H
 
-#ifdef __cplusplus
-extern "C" {
-#endif
 
 #include <stddef.h> /* For size_t. */
 
@@ -142,8 +139,5 @@ void linenoiseMaskModeDisable(void);
 /* Re-enable raw mode if a child process changed the terminal state. */
 void linenoiseRestoreRawMode(void);
 
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* __LINENOISE_H */

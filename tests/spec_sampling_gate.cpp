@@ -83,7 +83,8 @@ static const char *PROMPT =
 typedef struct { int id; long a, b; } bucket;
 
 static int bucket_cmp(const void *x, const void *y) {
-    const bucket *p = x, *q = y;
+    const bucket *p = (const bucket *)x;
+    const bucket *q = (const bucket *)y;
     return (int)((q->a + q->b) - (p->a + p->b));
 }
 
@@ -158,7 +159,7 @@ int main(int argc, char **argv) {
     char *user = NULL;
     if (filler > 0) {
         const size_t cap = (size_t)filler * 8u + strlen(PROMPT) + 64u;
-        user = malloc(cap);
+        user = (char *)malloc(cap);
         size_t off = 0;
         for (int i = 0; i < filler && off + 8 < cap; i++)
             off += (size_t)snprintf(user + off, cap - off, "port%d ", i % 997);

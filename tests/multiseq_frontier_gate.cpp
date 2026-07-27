@@ -109,7 +109,7 @@ static char *read_file(const char *path, size_t *len_out) {
     fseek(fp, 0, SEEK_END);
     long n = ftell(fp);
     fseek(fp, 0, SEEK_SET);
-    char *buf = malloc((size_t)n + 1);
+    char *buf = (char *)malloc((size_t)n + 1);
     if (!buf || fread(buf, 1, (size_t)n, fp) != (size_t)n) { fclose(fp); free(buf); return NULL; }
     fclose(fp);
     buf[n] = '\0';
@@ -128,7 +128,7 @@ static bool populate_bank(ds4_session *s, uint32_t bank, int stream, int len) {
     if (g->banks.n_banks && !gpu_graph_bank_repoint(g, bank)) return false;
     ds4_tokens p;
     memset(&p, 0, sizeof(p));
-    p.v = malloc((size_t)len * sizeof(int));
+    p.v = (int *)malloc((size_t)len * sizeof(int));
     p.len = p.cap = len;
     for (int i = 0; i < len; i++) p.v[i] = stream_tok(stream, i);
     char err[256];
@@ -146,10 +146,10 @@ static bool run_step(ds4_session *s, const step_row *rows, uint32_t n) {
     ds4_gpu_graph *g = &s->graph;
     ds4_tokens vec;
     memset(&vec, 0, sizeof(vec));
-    vec.v = malloc((size_t)n * sizeof(int));
+    vec.v = (int *)malloc((size_t)n * sizeof(int));
     vec.len = vec.cap = (int)n;
-    int32_t *pos = malloc((size_t)n * sizeof(int32_t));
-    int32_t *seq = malloc((size_t)n * sizeof(int32_t));
+    int32_t *pos = (int32_t *)malloc((size_t)n * sizeof(int32_t));
+    int32_t *seq = (int32_t *)malloc((size_t)n * sizeof(int32_t));
     for (uint32_t t = 0; t < n; t++) {
         vec.v[t] = rows[t].token;
         pos[t] = rows[t].pos;
@@ -215,12 +215,12 @@ static bool snap_bank(ds4_gpu_graph *g, uint32_t bank, uint32_t rows, bank_snap 
         if (ratio == 0) continue;
         uint32_t n = rows;
         if (n > g->layer_comp_cap[il]) n = g->layer_comp_cap[il];
-        snap->attn[il] = malloc((size_t)(n * attn_row_bytes()));
+        snap->attn[il] = (uint8_t *)malloc((size_t)(n * attn_row_bytes()));
         if (!snap->attn[il] ||
             !read_bank_rows(g, 0, il, bank, 0, n, snap->attn[il], attn_row_bytes()))
             return false;
         if (ratio == 4) {
-            snap->index[il] = malloc((size_t)(n * index_row_bytes()));
+            snap->index[il] = (uint8_t *)malloc((size_t)(n * index_row_bytes()));
             if (!snap->index[il] ||
                 !read_bank_rows(g, 1, il, bank, 0, n, snap->index[il], index_row_bytes()))
                 return false;
@@ -247,7 +247,7 @@ static void check_bank_vs_snap(ds4_gpu_graph *g, uint32_t bank, const bank_snap 
         if (ratio == 0) continue;
         uint32_t n = snap->rows;
         if (n > g->layer_comp_cap[il]) n = g->layer_comp_cap[il];
-        uint8_t *now = malloc((size_t)(n * attn_row_bytes()));
+        uint8_t *now = (uint8_t *)malloc((size_t)(n * attn_row_bytes()));
         if (!now || !read_bank_rows(g, 0, il, bank, 0, n, now, attn_row_bytes())) {
             CHECK(0, "%s: bank %u layer %u readback failed", what, bank, il);
             free(now);
@@ -264,7 +264,7 @@ static void check_bank_vs_snap(ds4_gpu_graph *g, uint32_t bank, const bank_snap 
         }
         free(now);
         if (ratio == 4 && snap->index[il]) {
-            uint8_t *inow = malloc((size_t)(n * index_row_bytes()));
+            uint8_t *inow = (uint8_t *)malloc((size_t)(n * index_row_bytes()));
             if (!inow || !read_bank_rows(g, 1, il, bank, 0, n, inow, index_row_bytes())) {
                 CHECK(0, "%s: bank %u layer %u indexer readback failed", what, bank, il);
                 free(inow);
@@ -298,12 +298,12 @@ static bool collect_emit_rows(ds4_gpu_graph *g, uint32_t bank,
         if (ratio == 0) continue;
         const int row = ratio == 4 ? row_r4 : row_r128;
         if (row < 0) continue;
-        er->attn[il] = malloc((size_t)attn_row_bytes());
+        er->attn[il] = (uint8_t *)malloc((size_t)attn_row_bytes());
         if (!er->attn[il] ||
             !read_bank_rows(g, 0, il, bank, (uint32_t)row, 1, er->attn[il], attn_row_bytes()))
             return false;
         if (ratio == 4) {
-            er->index[il] = malloc((size_t)index_row_bytes());
+            er->index[il] = (uint8_t *)malloc((size_t)index_row_bytes());
             if (!er->index[il] ||
                 !read_bank_rows(g, 1, il, bank, (uint32_t)row, 1, er->index[il], index_row_bytes()))
                 return false;

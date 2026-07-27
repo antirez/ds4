@@ -58,7 +58,7 @@ static char *read_file(const char *path, size_t *len_out) {
     fseek(fp, 0, SEEK_END);
     long n = ftell(fp);
     fseek(fp, 0, SEEK_SET);
-    char *buf = malloc((size_t)n + 1);
+    char *buf = (char *)malloc((size_t)n + 1);
     if (!buf || fread(buf, 1, (size_t)n, fp) != (size_t)n) { fclose(fp); free(buf); return NULL; }
     fclose(fp);
     buf[n] = '\0';
@@ -70,7 +70,7 @@ static bool make_prompt(int k, ds4_tokens *p) {
     memset(p, 0, sizeof(*p));
     const int off = g_prompt_off[k], len = g_prompt_len[k];
     if (off + len > g_toks.len) return false;
-    p->v = malloc((size_t)len * sizeof(int));
+    p->v = (int *)malloc((size_t)len * sizeof(int));
     if (!p->v) return false;
     memcpy(p->v, g_toks.v + off, (size_t)len * sizeof(int));
     p->len = p->cap = len;
@@ -277,7 +277,7 @@ int main(int argc, char **argv) {
             ok = ds4_session_bank_state_restore(s, (uint32_t)k);
             if (ok) first[k] = ds4_session_argmax(s);
         }
-        float *logits = ok ? malloc((size_t)2 * vocab * sizeof(float)) : NULL;
+        float *logits = ok ? (float *)malloc((size_t)2 * vocab * sizeof(float)) : NULL;
         if (ok && logits) {
             ds4_multiseq_req reqs[2];
             for (int k = 0; k < 2; k++) {

@@ -322,7 +322,7 @@ static void scrub_numerics_env(void) {
                     "certify.  Raise the cap in scrub_numerics_env().\n", cap);
             exit(2);
         }
-        char *nm = malloc(len + 1);
+        char *nm = (char *)malloc(len + 1);
         if (!nm) {
             fprintf(stderr,
                     "PREFILL GATE FAIL: out of memory collecting the env scrub list "
@@ -369,7 +369,7 @@ static char *read_file(const char *path, size_t *len_out) {
     if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return NULL; }
     long n = ftell(fp);
     if (n < 0 || fseek(fp, 0, SEEK_SET) != 0) { fclose(fp); return NULL; }
-    char *buf = malloc((size_t)n + 1);
+    char *buf = (char *)malloc((size_t)n + 1);
     if (!buf || fread(buf, 1, (size_t)n, fp) != (size_t)n) { fclose(fp); free(buf); return NULL; }
     fclose(fp);
     buf[n] = '\0';
@@ -394,7 +394,7 @@ static int prefill_logits(uint32_t depth, float *out, int width) {
     }
     ds4_tokens p;
     memset(&p, 0, sizeof(p));
-    p.v = malloc((size_t)depth * sizeof(int));
+    p.v = (int *)malloc((size_t)depth * sizeof(int));
     if (!p.v) { ds4_session_free(s); return 0; }
     p.len = p.cap = (int)depth;
     memcpy(p.v, g_toks.v, (size_t)depth * sizeof(int));
@@ -596,7 +596,7 @@ static int load_baseline(const char *path, const char *expect_ref,
         return 0;
     }
     const size_t n = (size_t)bh.n_depths * (size_t)width;
-    float *base = calloc(n, sizeof(float));
+    float *base = (float *)calloc(n, sizeof(float));
     if (!base) { fclose(fp); fprintf(stderr, "oom\n"); return 0; }
     if (fread(base, sizeof(float), n, fp) != n) {
         fprintf(stderr, "baseline %s: short body\n", path);
@@ -723,8 +723,8 @@ int main(int argc, char **argv) {
     for (uint32_t i = 0; i < N_DEPTHS; i++) printf("%s%u", i ? "," : "", g_depths[i]);
     printf("\n");
 
-    float *rows = calloc((size_t)N_DEPTHS * (size_t)width, sizeof(float));
-    float *again = calloc((size_t)width, sizeof(float));
+    float *rows = (float *)calloc((size_t)N_DEPTHS * (size_t)width, sizeof(float));
+    float *again = (float *)calloc((size_t)width, sizeof(float));
     if (!rows || !again) { fprintf(stderr, "oom\n"); return 1; }
 
     /* Validate and load the baseline BEFORE prefilling: a stale blob, a wrong

@@ -25,9 +25,6 @@
 #define DS4_HC_ELT_SIZE 2u
 #endif
 
-#ifdef __cplusplus
-extern "C" {
-#endif
 
 /* =========================================================================
  * GPU Tensor and Command Lifetime.
@@ -1337,9 +1334,6 @@ int ds4_gpu_dspark_confidence_score_model(
         uint32_t                embed_dim,
         uint32_t                vocab_size);
 
-#ifdef __cplusplus
-}
-#endif
 
 /* ===========================================================================
  * Wrong-arch build trap (checked at startup by ds4_gpu_init).

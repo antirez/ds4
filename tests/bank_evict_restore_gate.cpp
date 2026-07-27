@@ -45,7 +45,7 @@ static int g_fail;
 static char *read_file(const char *path, size_t *len_out) {
     FILE *fp = fopen(path, "rb"); if (!fp) return NULL;
     fseek(fp, 0, SEEK_END); long n = ftell(fp); fseek(fp, 0, SEEK_SET);
-    char *buf = malloc((size_t)n + 1);
+    char *buf = (char *)malloc((size_t)n + 1);
     if (!buf || fread(buf, 1, (size_t)n, fp) != (size_t)n) { fclose(fp); free(buf); return NULL; }
     fclose(fp); buf[n] = '\0'; if (len_out) *len_out = (size_t)n; return buf;
 }
@@ -58,7 +58,7 @@ static uint64_t checksum_bank_kv(ds4_session *s, uint32_t bank) {
     const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
         ? DS4_ENGINE_IDXFP4_ROWBYTES : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
     uint64_t h = 1469598103934665603ull;
-    uint8_t *buf = malloc(64u * 1024u * 1024u);   /* per-layer row block scratch */
+    uint8_t *buf = (uint8_t *)malloc(64u * 1024u * 1024u);   /* per-layer row block scratch */
     if (!buf) return 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
@@ -107,7 +107,7 @@ int main(int argc, char **argv) {
     if (pool < 2) { fprintf(stderr, "need DS4_MSEQ_BANKS>=2\n"); return 1; }
 
     /* 1. Prefill bank 0 (cur=0), capture its frontier, checksum its KV. */
-    int *toks = malloc((size_t)L * sizeof(int));
+    int *toks = (int *)malloc((size_t)L * sizeof(int));
     for (int i = 0; i < L; i++) toks[i] = base.v[i % base.len];
     ds4_tokens p; memset(&p, 0, sizeof(p)); p.v = toks; p.len = p.cap = L;
     char err[256];

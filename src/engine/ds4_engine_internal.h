@@ -49,9 +49,6 @@
 #include <arm_neon.h>
 #endif
 
-#ifdef __cplusplus
-extern "C" {
-#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -2813,8 +2810,5 @@ static inline void scale_f32(float *x, float a, uint32_t n) {
 #endif
 }
 
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* DS4_ENGINE_INTERNAL_H */

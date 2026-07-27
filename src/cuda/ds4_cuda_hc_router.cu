@@ -650,7 +650,7 @@ __global__ static void directional_steering_project_kernel(
 }
 
 
-extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint32_t n, float clamp, float weight) {
+int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint32_t n, float clamp, float weight) {
     if (!out || !gate || !up ||
         out->bytes < (uint64_t)n * sizeof(float) ||
         gate->bytes < (uint64_t)n * sizeof(float) ||
@@ -660,7 +660,7 @@ extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *
 }
 
 
-extern "C" int ds4_gpu_shared_gate_up_swiglu_mxfp8_tensor(
+int ds4_gpu_shared_gate_up_swiglu_mxfp8_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
         ds4_gpu_tensor       *mid,
@@ -680,7 +680,7 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_mxfp8_tensor(
 }
 
 
-extern "C" int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t n) {
+int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t n) {
     if (!out || !a || !b ||
         out->bytes < (uint64_t)n * sizeof(float) ||
         a->bytes < (uint64_t)n * sizeof(float) ||
@@ -690,7 +690,7 @@ extern "C" int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, 
 }
 
 
-extern "C" int ds4_gpu_directional_steering_project_tensor(
+int ds4_gpu_directional_steering_project_tensor(
         ds4_gpu_tensor       *x,
         const ds4_gpu_tensor *directions,
         uint32_t                layer,
@@ -715,7 +715,7 @@ extern "C" int ds4_gpu_directional_steering_project_tensor(
 }
 
 
-extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits) {
+int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits) {
     if (!selected || !weights || !probs || !logits || !model_map || n_expert_groups > 1u || n_group_used > 0u) return 0;
     if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
     int32_t tok = (int32_t)token;
@@ -757,7 +757,7 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
 }
 
 
-extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
+int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
     if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
     if (!selected || !weights || !probs || !logits || !tokens || !model_map || n_tokens == 0 ||
         n_expert_groups > 1u || n_group_used > 0u ||
@@ -828,7 +828,7 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
 }
 
 
-extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
+int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;
     const uint64_t mix_bytes = 24ull * sizeof(float);
     if (scale_offset > model_size || model_size - scale_offset < 3ull * sizeof(float) ||
@@ -848,7 +848,7 @@ extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_g
 }
 
 
-extern "C" int ds4_gpu_hc_weighted_sum_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *weights, uint32_t n_embd, uint32_t n_hc) {
+int ds4_gpu_hc_weighted_sum_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *weights, uint32_t n_embd, uint32_t n_hc) {
     if (!out || !residual_hc || !weights || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out->bytes / ((uint64_t)n_embd * sizeof(float)));
     /* n_tokens comes from the OUTPUT; bound the carrier input too, mirroring
@@ -863,7 +863,7 @@ extern "C" int ds4_gpu_hc_weighted_sum_tensor(ds4_gpu_tensor *out, const ds4_gpu
 }
 
 
-extern "C" int ds4_gpu_hc_weighted_sum_split_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+int ds4_gpu_hc_weighted_sum_split_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out->bytes / ((uint64_t)n_embd * sizeof(float)));
     uint32_t stride = (uint32_t)(2u * n_hc + n_hc * n_hc);
@@ -877,7 +877,7 @@ extern "C" int ds4_gpu_hc_weighted_sum_split_tensor(ds4_gpu_tensor *out, const d
 }
 
 
-extern "C" int ds4_gpu_hc_split_weighted_sum_tensor(
+int ds4_gpu_hc_split_weighted_sum_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *split,
         const ds4_gpu_tensor *mix,
@@ -924,7 +924,7 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_tensor(
 }
 
 
-extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
+int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *norm_out,
         ds4_gpu_tensor       *split,
@@ -999,7 +999,7 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
 }
 
 
-extern "C" int ds4_gpu_output_hc_weights_tensor(
+int ds4_gpu_output_hc_weights_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *pre,
         const void             *model_map,
@@ -1033,7 +1033,7 @@ extern "C" int ds4_gpu_output_hc_weights_tensor(
 }
 
 
-extern "C" int ds4_gpu_hc_expand_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *post, const ds4_gpu_tensor *comb, uint32_t n_embd, uint32_t n_hc) {
+int ds4_gpu_hc_expand_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *post, const ds4_gpu_tensor *comb, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !block_out || !residual_hc || !post || !comb || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * DS4_HC_ELT_SIZE));
     uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
@@ -1049,7 +1049,7 @@ extern "C" int ds4_gpu_hc_expand_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_te
 }
 
 
-extern "C" int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !block_out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * DS4_HC_ELT_SIZE));
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
@@ -1068,7 +1068,7 @@ extern "C" int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_
 
 
 
-extern "C" int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !block_out || !block_add || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * DS4_HC_ELT_SIZE));
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
@@ -1087,7 +1087,7 @@ extern "C" int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const 
 
 
 
-extern "C" int ds4_gpu_shared_down_hc_expand_mxfp8_tensor(
+int ds4_gpu_shared_down_hc_expand_mxfp8_tensor(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *shared_out,
         const void             *model_map,
@@ -1110,7 +1110,7 @@ extern "C" int ds4_gpu_shared_down_hc_expand_mxfp8_tensor(
 
 
 
-extern "C" int ds4_gpu_matmul_fp8_hc_expand_tensor(
+int ds4_gpu_matmul_fp8_hc_expand_tensor(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *block_out,
         const void             *model_map,
@@ -1245,7 +1245,7 @@ __global__ static void hc_norm_mix_f16_kernel(
 }
 
 
-extern "C" int ds4_gpu_hc_norm_mix_f16_tensor(
+int ds4_gpu_hc_norm_mix_f16_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,

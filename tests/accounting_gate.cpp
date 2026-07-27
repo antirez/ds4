@@ -49,7 +49,7 @@ static char *read_file(const char *path, size_t *len_out) {
     fseek(fp, 0, SEEK_END);
     long n = ftell(fp);
     fseek(fp, 0, SEEK_SET);
-    char *buf = malloc((size_t)n + 1);
+    char *buf = (char *)malloc((size_t)n + 1);
     if (!buf || fread(buf, 1, (size_t)n, fp) != (size_t)n) { fclose(fp); free(buf); return NULL; }
     fclose(fp);
     buf[n] = '\0';
@@ -109,7 +109,7 @@ int main(int argc, char **argv) {
     }
 
     /* A tiled token buffer of `peak` tokens, prefixes reused as we grow. */
-    int *toks = malloc((size_t)peak * sizeof(int));
+    int *toks = (int *)malloc((size_t)peak * sizeof(int));
     if (!toks) { fprintf(stderr, "oom\n"); return 1; }
     for (int i = 0; i < peak; i++) toks[i] = base.v[i % base.len];
 

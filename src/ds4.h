@@ -6,9 +6,6 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
 
 /* Public engine boundary.
  *
@@ -499,8 +496,5 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen);
 void ds4_session_snapshot_free(ds4_session_snapshot *snap);
 
-#ifdef __cplusplus
-}
-#endif
 
 #endif

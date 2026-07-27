@@ -1686,8 +1686,7 @@ static int linenoiseEditInsertNoRefresh(struct linenoiseState *l, const char *c,
  * This handles both single-byte ASCII and multi-byte UTF-8 sequences.
  *
  * On error writing to the terminal -1 is returned, otherwise 0. */
-/* Not in linenoise.h by upstream design; the agent editor calls it, so pin C linkage. */
-extern "C" int linenoiseEditInsert(struct linenoiseState *l, const char *c, size_t clen) {
+int linenoiseEditInsert(struct linenoiseState *l, const char *c, size_t clen) {
     if (l->len == l->pos) {
         int needs_refresh = memchr(c, '\n', clen) != NULL ||
                              memchr(c, '\r', clen) != NULL;
