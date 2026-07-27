@@ -1,6 +1,6 @@
 # Agent Notes
 
-DwarfStar (`ds4`) is a DeepSeek V4 Flash specific inference engine, not a
+Pulsar (`pulsar`) is a DeepSeek V4 Flash specific inference engine, not a
 generic GGUF runner. This tree is the **CUDA-only fork** of antirez's upstream
 project, targeting the NVIDIA DGX Spark (GB10, `sm_121`, ~121 GB usable
 unified memory). The Metal, ROCm, and CPU inference backends were fully
@@ -29,41 +29,41 @@ that the live GPU path calls — it is not dead CPU-backend code.
 - Keep public APIs narrow. CLI/server code should not know tensor internals.
 - Do not add permanent semantic variants behind flags. Diagnostic switches are
   fine when they validate the one release path.
-- C++ is confined to the single CUTLASS TU (`src/cuda/ds4_mxfp4_cutlass.cu`).
+- C++ is confined to the single CUTLASS TU (`src/cuda/pulsar_mxfp4_cutlass.cu`).
   Everything else is C (or CUDA C).
 
 ## Layout
 
-Public headers: `src/ds4.h` (engine API) and `src/ds4_gpu.h` (GPU graph API).
+Public headers: `src/pulsar.h` (engine API) and `src/pulsar_gpu.h` (GPU graph API).
 
-- `src/engine/` — 21 TUs + `ds4_engine_internal.h`: GGUF parsing, tokenizer,
+- `src/engine/` — 21 TUs + `pulsar_engine_internal.h`: GGUF parsing, tokenizer,
   weight binder (`weights.c`), quant format/kernel tables, GPU graph
   orchestration (`gpu_graph_alloc.c`, `gpu_graph_state.c`, `gpu_prefill.c`,
   `gpu_decode.c`, `gpu_diag.c`), sessions + KV payload serialization, imatrix
   collection, steering, and the shared host math TUs.
-- `src/cuda/` — 7 kernel TUs + `ds4_cuda_internal.h`: runtime/memory
-  (`ds4_cuda_runtime.cu`), matmuls incl. the cuBLASLt MXFP8 path
-  (`ds4_cuda_matmul.cu`), attention, MoE, indexer, norm/KV, HC router; plus
-  `ds4_mxfp4_cutlass.cu` (CUTLASS grouped GEMM for MXFP4 experts) and
-  `ds4_iq2_tables_cuda.inc`.
-- `src/server/` — 14 TUs + `ds4_server_internal.h`: HTTP server,
+- `src/cuda/` — 7 kernel TUs + `pulsar_cuda_internal.h`: runtime/memory
+  (`pulsar_cuda_runtime.cu`), matmuls incl. the cuBLASLt MXFP8 path
+  (`pulsar_cuda_matmul.cu`), attention, MoE, indexer, norm/KV, HC router; plus
+  `pulsar_mxfp4_cutlass.cu` (CUTLASS grouped GEMM for MXFP4 experts) and
+  `pulsar_iq2_tables_cuda.inc`.
+- `src/server/` — 14 TUs + `pulsar_server_internal.h`: HTTP server,
   OpenAI/Responses/Anthropic endpoints and streaming, prompt rendering, disk
   KV cache, exact-DSML tool replay.
-- `src/agent/` — 20 TUs + `ds4_agent_internal.h`: native coding agent (tools,
+- `src/agent/` — 20 TUs + `pulsar_agent_internal.h`: native coding agent (tools,
   terminal UI, sessions, compaction).
-- `src/cli/` — `ds4_cli.c`, `ds4_bench.c`, `ds4_eval.c` entry points.
+- `src/cli/` — `pulsar_cli.c`, `pulsar_bench.c`, `pulsar_eval.c` entry points.
 - `src/lib/` — shared pieces: help text, kvstore.
 - `src/vendor/` — linenoise, rax.
-- `tests/` — C runners; `ds4_test.c` and `ds4_agent_test.c` are unity builds
+- `tests/` — C runners; `pulsar_test.c` and `pulsar_agent_test.c` are unity builds
   that `#include` the server/agent source lists.
 - `cutlass/` — git submodule (v4.5.2), **required** for the MXFP4 expert path.
 - `gguf-tools/` — offline quantization/imatrix tooling that produces the GGUFs
   this fork loads.
 
 Internal-header convention: a symbol is de-static'd and declared in the
-module's `ds4_*_internal.h` only when another TU of the same module needs it.
-Everything else stays `static`. The cross-module surface is `src/ds4.h`,
-`src/ds4_gpu.h`, and the `src/lib/*.h` headers only.
+module's `pulsar_*_internal.h` only when another TU of the same module needs it.
+Everything else stays `static`. The cross-module surface is `src/pulsar.h`,
+`src/pulsar_gpu.h`, and the `src/lib/*.h` headers only.
 
 ## Build
 
@@ -74,16 +74,16 @@ make cuda-generic        # other local CUDA GPUs (CUDA_ARCH=native)
 make cuda CUDA_ARCH=sm_N # explicit -arch, e.g. cross-builds
 ```
 
-Binaries land in the repo root: `ds4`, `ds4-server`, `ds4-agent`, `ds4-bench`,
-`ds4-eval`. Note `ds4_mxfp4_cutlass.cu` needs the `sm_120f` family for the
+Binaries land in the repo root: `pulsar`, `pulsar-server`, `pulsar-agent`, `pulsar-bench`,
+`pulsar-eval`. Note `pulsar_mxfp4_cutlass.cu` needs the `sm_120f` family for the
 mxf4 block-scale MMA; the Makefile handles its flags.
 
 ## Testing
 
-- `make test` runs `./ds4-eval --self-test-extractors`, `./ds4_agent_test`,
-  and `./ds4_test`. The eval self-test and agent test need no model;
-  `ds4_test` loads a model (`DS4_TEST_MODEL`, default `./ds4flash.gguf`).
-- `ds4_test` distinguishes **gating** internal-correctness tests (any failure
+- `make test` runs `./pulsar-eval --self-test-extractors`, `./pulsar_agent_test`,
+  and `./pulsar_test`. The eval self-test and agent test need no model;
+  `pulsar_test` loads a model (`DS4_TEST_MODEL`, default `./ds4flash.gguf`).
+- `pulsar_test` distinguishes **gating** internal-correctness tests (any failure
   fails the suite) from **informational** ones: `logprob-vectors` compares
   the 2-bit production model against full-precision official-API logprobs (a
   drift dashboard, expected mismatches), and `think-tool-recovery` is
@@ -91,7 +91,7 @@ mxf4 block-scale MMA; the Makefile handles its flags.
   down-sum. Informational mismatches are reported but exit 0.
 - `make cuda-regression` runs `tests/cuda_long_context_smoke`: GPU kernel
   smoke tests, no model required.
-- `./ds4_test --logprob-vectors` compares against official-API vectors and
+- `./pulsar_test --logprob-vectors` compares against official-API vectors and
   pins `DS4_CUDA_PREFILL_CHUNK=2048`.
 - imatrix collection (`--imatrix-dataset` / `--imatrix-out`) requires `--cuda`.
 
@@ -100,10 +100,10 @@ mxf4 block-scale MMA; the Makefile handles its flags.
 - **Refactors** (code movement, TU splits, renames) must produce byte-identical
   greedy output versus the pre-change binary.
 - **Numerics changes** (kernels, quantization, activation formats) are
-  perplexity-gated (`--perplexity-file`) plus the deterministic `ds4-eval`
+  perplexity-gated (`--perplexity-file`) plus the deterministic `pulsar-eval`
   q1..q4 token-count gate; recent reference point on the 97 GB zero-Q8 Flash
   oracle: ppl 7.3216, decode 12.35 t/s, long-prompt prefill 162 t/s.
-- **One ds4 process at a time on the GB10.** Two ~97 GB model mappings OOM the
+- **One pulsar process at a time on the GB10.** Two ~97 GB model mappings OOM the
   box; the instance lock (`DS4_LOCK_FILE`) is intentional.
 
 ## Supported Weight Formats (binder-enforced)

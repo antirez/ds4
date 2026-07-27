@@ -1,4 +1,4 @@
-#include "ds4_agent_internal.h"
+#include "pulsar_agent_internal.h"
 
 
 
@@ -12,7 +12,7 @@ char *agent_session_title_from_text(const char *text, size_t text_len,
 
 
 
-/* Agent sessions deliberately use a different policy from ds4-server:
+/* Agent sessions deliberately use a different policy from pulsar-server:
  *
  * - sysprompt.kv is a fixed bootstrap checkpoint for the current tool/system
  *   prompt.  Because its name is fixed, the current rendered text is compared
@@ -48,7 +48,7 @@ bool agent_kv_write_title_trailer(FILE *fp, const char *title,
         return false;
     }
     uint8_t tb[4];
-    ds4_kvstore_le_put32(tb, (uint32_t)title_len);
+    pulsar_kvstore_le_put32(tb, (uint32_t)title_len);
     return fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
            fwrite(title ? title : "", 1, title_len, fp) == title_len;
 }
@@ -57,8 +57,8 @@ bool agent_kv_write_title_trailer(FILE *fp, const char *title,
 
 /* Read the optional agent title trailer without disturbing the payload cursor.
  * The caller is positioned just after rendered text, which is also the payload
- * start expected by ds4_session_load_payload(). */
-bool agent_kv_read_title_trailer(FILE *fp, const ds4_kvstore_entry *hdr,
+ * start expected by pulsar_session_load_payload(). */
+bool agent_kv_read_title_trailer(FILE *fp, const pulsar_kvstore_entry *hdr,
                                         char **title_out,
                                         char *err, size_t err_len) {
     off_t payload_pos = ftello(fp);
@@ -79,7 +79,7 @@ bool agent_kv_read_title_trailer(FILE *fp, const ds4_kvstore_entry *hdr,
         fseeko(fp, payload_pos, SEEK_SET);
         return false;
     }
-    uint32_t title_bytes = ds4_kvstore_le_get32(tb);
+    uint32_t title_bytes = pulsar_kvstore_le_get32(tb);
     char *title = (char *)agent_xmalloc((size_t)title_bytes + 1);
     if (fread(title, 1, title_bytes, fp) != title_bytes) {
         if (err && err_len) snprintf(err, err_len, "truncated agent session title trailer");
@@ -99,14 +99,14 @@ bool agent_kv_read_title_trailer(FILE *fp, const ds4_kvstore_entry *hdr,
 
 
 
-void agent_kv_identity_sha(const ds4_kvstore_entry *hdr,
+void agent_kv_identity_sha(const pulsar_kvstore_entry *hdr,
                                   const char *text, uint32_t text_bytes,
                                   const char *title,
                                   char sha_out[41]) {
-    if (hdr->ext_flags & DS4_KVSTORE_EXT_SESSION_TITLE) {
+    if (hdr->ext_flags & PULSAR_KVSTORE_EXT_SESSION_TITLE) {
         agent_session_identity_sha(title ? title : "", hdr->created_at, sha_out);
     } else {
-        ds4_kvstore_sha1_bytes_hex(text, text_bytes, sha_out);
+        pulsar_kvstore_sha1_bytes_hex(text, text_bytes, sha_out);
     }
 }
 
@@ -120,7 +120,7 @@ bool agent_kv_load_path(agent_worker *w, const char *path,
                                const char *expected_sha,
                                const char *expected_text,
                                size_t expected_text_len,
-                               ds4_tokens *loaded_tokens,
+                               pulsar_tokens *loaded_tokens,
                                agent_kv_session_meta *meta_out,
                                char *err, size_t err_len) {
     FILE *fp = fopen(path, "rb");
@@ -129,26 +129,26 @@ bool agent_kv_load_path(agent_worker *w, const char *path,
         return false;
     }
 
-    ds4_kvstore_entry hdr = {0};
+    pulsar_kvstore_entry hdr = {0};
     uint32_t text_bytes = 0;
-    bool ok = ds4_kvstore_read_header(fp, &hdr, &text_bytes);
+    bool ok = pulsar_kvstore_read_header(fp, &hdr, &text_bytes);
     if (!ok) snprintf(err, err_len, "invalid KV header");
 
     char *text = NULL;
     if (ok) ok = agent_kv_read_text(fp, text_bytes, &text, err, err_len);
     char *title = NULL;
-    bool has_title = ok && (hdr.ext_flags & DS4_KVSTORE_EXT_SESSION_TITLE);
+    bool has_title = ok && (hdr.ext_flags & PULSAR_KVSTORE_EXT_SESSION_TITLE);
     if (has_title)
         ok = agent_kv_read_title_trailer(fp, &hdr, &title, err, err_len);
     uint32_t expected_tokens = hdr.tokens;
     if (ok && hdr.payload_bytes != 0 &&
-        hdr.model_id != (uint8_t)ds4_engine_model_id(w->engine))
+        hdr.model_id != (uint8_t)pulsar_engine_model_id(w->engine))
     {
         snprintf(err, err_len, "KV checkpoint was written for a different model");
         ok = false;
     }
     if (ok && hdr.payload_bytes != 0 &&
-        hdr.quant_bits != (uint8_t)ds4_engine_routed_quant_bits(w->engine))
+        hdr.quant_bits != (uint8_t)pulsar_engine_routed_quant_bits(w->engine))
     {
         snprintf(err, err_len, "KV checkpoint was written for a different quantization");
         ok = false;
@@ -172,33 +172,33 @@ bool agent_kv_load_path(agent_worker *w, const char *path,
 
     char load_err[160] = {0};
     if (ok && hdr.payload_bytes == 0) {
-        ds4_tokens rebuilt = {0};
-        ds4_tokenize_rendered_chat(w->engine, text, &rebuilt);
+        pulsar_tokens rebuilt = {0};
+        pulsar_tokenize_rendered_chat(w->engine, text, &rebuilt);
         expected_tokens = (uint32_t)rebuilt.len;
         if (agent_worker_sync_tokens(w, &rebuilt, true, err, err_len) != 0) {
-            ds4_session_invalidate(w->session);
+            pulsar_session_invalidate(w->session);
             ok = false;
         }
-        ds4_tokens_free(&rebuilt);
+        pulsar_tokens_free(&rebuilt);
     } else if (ok &&
-               ds4_session_load_payload(w->session, fp, hdr.payload_bytes,
+               pulsar_session_load_payload(w->session, fp, hdr.payload_bytes,
                                         load_err, sizeof(load_err)) != 0)
     {
         snprintf(err, err_len, "%s", load_err[0] ? load_err : "failed to load KV payload");
-        ds4_session_invalidate(w->session);
+        pulsar_session_invalidate(w->session);
         ok = false;
     }
     fclose(fp);
 
     if (ok) {
-        const ds4_tokens *live = ds4_session_tokens(w->session);
+        const pulsar_tokens *live = pulsar_session_tokens(w->session);
         if (!live || live->len != (int)expected_tokens) {
             snprintf(err, err_len, "KV payload token count mismatch");
-            ds4_session_invalidate(w->session);
+            pulsar_session_invalidate(w->session);
             ok = false;
         } else if (loaded_tokens) {
-            ds4_tokens_free(loaded_tokens);
-            ds4_tokens_copy(loaded_tokens, live);
+            pulsar_tokens_free(loaded_tokens);
+            pulsar_tokens_copy(loaded_tokens, live);
         }
         if (meta_out) {
             agent_kv_session_meta_free(meta_out);
@@ -221,26 +221,26 @@ bool agent_kv_load_path(agent_worker *w, const char *path,
 /* Save the current live KV under the rendered transcript identity.  The caller
  * decides the policy: fixed sysprompt path or SHA-named session path. */
 static bool agent_kv_save_path(agent_worker *w, const char *path,
-                               const ds4_tokens *tokens,
+                               const pulsar_tokens *tokens,
                                const char *reason,
                                char sha_out[41],
                                const char *session_title,
                                uint64_t session_created_at,
                                char *err, size_t err_len) {
-    const ds4_tokens *live = ds4_session_tokens(w->session);
+    const pulsar_tokens *live = pulsar_session_tokens(w->session);
     if (!agent_tokens_equal(live, tokens)) {
         snprintf(err, err_len, "live KV state does not match session transcript");
         return false;
     }
-    const int quant_bits = ds4_engine_routed_quant_bits(w->engine);
+    const int quant_bits = pulsar_engine_routed_quant_bits(w->engine);
     if (quant_bits != 2 && quant_bits != 4) {
         snprintf(err, err_len, "unsupported routed quantization for KV save");
         return false;
     }
-    const int model_id = ds4_engine_model_id(w->engine);
+    const int model_id = pulsar_engine_model_id(w->engine);
 
     size_t text_len = 0;
-    char *text = ds4_kvstore_render_tokens_text(w->engine, tokens, &text_len);
+    char *text = pulsar_kvstore_render_tokens_text(w->engine, tokens, &text_len);
     if (!text) {
         snprintf(err, err_len, "failed to render KV text key");
         return false;
@@ -258,12 +258,12 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     if (session_identity)
         agent_session_identity_sha(session_title, created_at, sha);
     else
-        ds4_kvstore_sha1_bytes_hex(text, text_len, sha);
+        pulsar_kvstore_sha1_bytes_hex(text, text_len, sha);
     if (sha_out) memcpy(sha_out, sha, sizeof(sha));
 
-    ds4_session_payload_file staged = {0};
+    pulsar_session_payload_file staged = {0};
     char save_err[160] = {0};
-    if (ds4_session_stage_payload(w->session, &staged,
+    if (pulsar_session_stage_payload(w->session, &staged,
                                   save_err, sizeof(save_err)) != 0) {
         snprintf(err, err_len, "%s",
                  save_err[0] ? save_err : "session has no valid KV payload");
@@ -279,7 +279,7 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     int fd = mkstemp(tmp);
     if (fd < 0) {
         snprintf(err, err_len, "%s", strerror(errno));
-        ds4_session_payload_file_free(&staged);
+        pulsar_session_payload_file_free(&staged);
         free(tmp);
         free(text);
         return false;
@@ -290,27 +290,27 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
         snprintf(err, err_len, "%s", strerror(errno));
         close(fd);
         unlink(tmp);
-        ds4_session_payload_file_free(&staged);
+        pulsar_session_payload_file_free(&staged);
         free(tmp);
         free(text);
         return false;
     }
 
-    uint8_t h[DS4_KVSTORE_FIXED_HEADER];
-    ds4_kvstore_fill_header(h, (uint8_t)model_id, (uint8_t)quant_bits,
-                            ds4_kvstore_reason_code(reason),
-                            session_identity ? DS4_KVSTORE_EXT_SESSION_TITLE : 0,
+    uint8_t h[PULSAR_KVSTORE_FIXED_HEADER];
+    pulsar_kvstore_fill_header(h, (uint8_t)model_id, (uint8_t)quant_bits,
+                            pulsar_kvstore_reason_code(reason),
+                            session_identity ? PULSAR_KVSTORE_EXT_SESSION_TITLE : 0,
                             (uint32_t)tokens->len, 0,
-                            (uint32_t)ds4_session_ctx(w->session),
+                            (uint32_t)pulsar_session_ctx(w->session),
                             created_at, now, payload_bytes);
     uint8_t tb[4];
-    ds4_kvstore_le_put32(tb, (uint32_t)text_len);
+    pulsar_kvstore_le_put32(tb, (uint32_t)text_len);
 
     errno = 0;
     bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
               fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
               fwrite(text, 1, text_len, fp) == text_len &&
-              ds4_session_write_staged_payload(&staged, fp,
+              pulsar_session_write_staged_payload(&staged, fp,
                                                save_err, sizeof(save_err)) == 0 &&
               (!session_identity ||
                agent_kv_write_title_trailer(fp, session_title,
@@ -332,7 +332,7 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
         unlink(tmp);
     }
 
-    ds4_session_payload_file_free(&staged);
+    pulsar_session_payload_file_free(&staged);
     free(tmp);
     free(text);
     return ok;
@@ -340,11 +340,11 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
 
 
 
-void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
-    ds4_chat_begin(w->engine, out);
-    if (w->cfg->gen.think_mode == DS4_THINK_MAX &&
-        effective_think_mode(w->cfg) == DS4_THINK_MAX)
-        ds4_chat_append_max_effort_prefix(w->engine, out);
+void agent_worker_build_system_tokens(agent_worker *w, pulsar_tokens *out) {
+    pulsar_chat_begin(w->engine, out);
+    if (w->cfg->gen.think_mode == PULSAR_THINK_MAX &&
+        effective_think_mode(w->cfg) == PULSAR_THINK_MAX)
+        pulsar_chat_append_max_effort_prefix(w->engine, out);
     agent_append_system_prompt(w->engine, out, w->cfg->gen.system);
 }
 
@@ -441,11 +441,11 @@ void worker_answer_queued_user_drain(agent_worker *w, char *text) {
  * cache-saving operation: if the requested transcript extends the live session,
  * only the suffix is prefetched; otherwise the DS4 session rebuilds from the
  * longest common prefix it can retain. */
-int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
+int agent_worker_sync_tokens(agent_worker *w, const pulsar_tokens *tokens,
                                     bool publish_progress,
                                     char *err, size_t err_len) {
-    int old_pos = ds4_session_pos(w->session);
-    int common = ds4_session_common_prefix(w->session, tokens);
+    int old_pos = pulsar_session_pos(w->session);
+    int common = pulsar_session_common_prefix(w->session, tokens);
     int cached = common == old_pos && tokens->len >= old_pos ? common : 0;
     int suffix = tokens->len - cached;
     if (suffix < 0) suffix = tokens->len;
@@ -467,16 +467,16 @@ int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
         pthread_mutex_unlock(&w->mu);
     }
 
-    ds4_session_set_progress(w->session, publish_progress ? worker_progress_cb : NULL,
+    pulsar_session_set_progress(w->session, publish_progress ? worker_progress_cb : NULL,
                              publish_progress ? w : NULL);
-    ds4_session_set_display_progress(w->session,
+    pulsar_session_set_display_progress(w->session,
                                      publish_progress ? worker_progress_cb : NULL,
                                      publish_progress ? w : NULL);
-    ds4_session_set_cancel(w->session, worker_cancel_session_cb, w);
-    int rc = ds4_session_sync(w->session, tokens, err, err_len);
-    ds4_session_set_cancel(w->session, NULL, NULL);
-    ds4_session_set_progress(w->session, NULL, NULL);
-    ds4_session_set_display_progress(w->session, NULL, NULL);
+    pulsar_session_set_cancel(w->session, worker_cancel_session_cb, w);
+    int rc = pulsar_session_sync(w->session, tokens, err, err_len);
+    pulsar_session_set_cancel(w->session, NULL, NULL);
+    pulsar_session_set_progress(w->session, NULL, NULL);
+    pulsar_session_set_display_progress(w->session, NULL, NULL);
     return rc;
 }
 
@@ -488,14 +488,14 @@ int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
  * by Flash and Pro; agent_kv_load_path() checks the model id, so switching
  * model families rebuilds this cache instead of restoring incompatible KV. */
 bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t err_len) {
-    ds4_tokens sys = {0};
+    pulsar_tokens sys = {0};
     agent_worker_build_system_tokens(w, &sys);
 
     size_t text_len = 0;
-    char *text = ds4_kvstore_render_tokens_text(w->engine, &sys, &text_len);
+    char *text = pulsar_kvstore_render_tokens_text(w->engine, &sys, &text_len);
     if (!text) {
         snprintf(err, err_len, "failed to render system prompt");
-        ds4_tokens_free(&sys);
+        pulsar_tokens_free(&sys);
         return false;
     }
 
@@ -515,11 +515,11 @@ bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t err_len)
     if (!loaded) {
         if (w->sysprompt_path)
             agent_publish_system_status(w, "Updating system prompt cache...");
-        ds4_tokens_free(&w->transcript);
-        ds4_tokens_copy(&w->transcript, &sys);
+        pulsar_tokens_free(&w->transcript);
+        pulsar_tokens_copy(&w->transcript, &sys);
         if (agent_worker_sync_tokens(w, &w->transcript, true, err, err_len) != 0) {
             free(text);
-            ds4_tokens_free(&sys);
+            pulsar_tokens_free(&sys);
             return false;
         }
         if (w->sysprompt_path) {
@@ -531,11 +531,11 @@ bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t err_len)
                                     save_err, sizeof(save_err)))
             {
                 if (w->cfg->non_interactive) {
-                    fprintf(stderr, "ds4-agent: failed to save system prompt KV: %s\n",
+                    fprintf(stderr, "pulsar-agent: failed to save system prompt KV: %s\n",
                             save_err);
                 } else {
                     agent_buf b = {0};
-                    agent_buf_puts(&b, "\nds4-agent: failed to save system prompt KV: ");
+                    agent_buf_puts(&b, "\npulsar-agent: failed to save system prompt KV: ");
                     agent_buf_puts(&b, save_err);
                     agent_buf_puts(&b, "\n");
                     char *msg = agent_buf_take(&b);
@@ -566,7 +566,7 @@ bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t err_len)
     w->datetime_context_injected = false;
     agent_worker_clear_session_identity(w);
     free(text);
-    ds4_tokens_free(&sys);
+    pulsar_tokens_free(&sys);
     return true;
 }
 
@@ -609,7 +609,7 @@ bool agent_worker_save_session_now(agent_worker *w, char sha_out[41],
     }
 
     size_t text_len = 0;
-    char *text = ds4_kvstore_render_tokens_text(w->engine, &w->transcript,
+    char *text = pulsar_kvstore_render_tokens_text(w->engine, &w->transcript,
                                                 &text_len);
     if (!text) {
         snprintf(err, err_len, "failed to render session text");

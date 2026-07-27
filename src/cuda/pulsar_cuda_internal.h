@@ -1,12 +1,12 @@
-/* ds4_cuda_internal.h — internal shared declarations for the cuda/ translation units.
- * Produced by the multi-TU split of ds4_cuda.cu; edit freely (the
+/* pulsar_cuda_internal.h — internal shared declarations for the cuda/ translation units.
+ * Produced by the multi-TU split of pulsar_cuda.cu; edit freely (the
  * generator is not part of the build).
  *
  * No -rdc: __global__/__device__/__constant__ symbols never cross TU
  * boundaries. The shared __device__ helpers below are static
  * __forceinline__, so each TU gets its own copy. */
-#ifndef DS4_CUDA_INTERNAL_H
-#define DS4_CUDA_INTERNAL_H
+#ifndef PULSAR_CUDA_INTERNAL_H
+#define PULSAR_CUDA_INTERNAL_H
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -32,14 +32,14 @@
 #include <unordered_set>
 #include <vector>
 
-#include "ds4_gpu.h"
+#include "pulsar_gpu.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
 #define CUDA_QK_K 256
-#define DS4_CUDA_UNUSED __attribute__((unused))
+#define PULSAR_CUDA_UNUSED __attribute__((unused))
 
 enum {
     /* attention_decode_mixed_kernel stores raw-window scores plus visible
@@ -47,14 +47,14 @@ enum {
      * decode calls to the online attention kernel so this fixed buffer never
      * becomes an out-of-bounds write at long context.  11712 fits under the
      * GB10 48 KB shared-memory limit. */
-    DS4_CUDA_ATTENTION_SCORE_CAP = 11712u,
-    DS4_CUDA_ATTENTION_RAW_SCORE_CAP = 256u,
-    DS4_CUDA_TOPK_MERGE_GROUP = 8u
+    PULSAR_CUDA_ATTENTION_SCORE_CAP = 11712u,
+    PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP = 256u,
+    PULSAR_CUDA_TOPK_MERGE_GROUP = 8u
 };
 
-#define DS4_FP8_KV_BLOCK 64u
-#define DS4_FP8_KV_NBLK(HD) (((HD) + DS4_FP8_KV_BLOCK - 1u) / DS4_FP8_KV_BLOCK)
-#define DS4_FP8_KV_ROWBYTES(HD) ((HD) + DS4_FP8_KV_NBLK(HD) * sizeof(float))
+#define PULSAR_FP8_KV_BLOCK 64u
+#define PULSAR_FP8_KV_NBLK(HD) (((HD) + PULSAR_FP8_KV_BLOCK - 1u) / PULSAR_FP8_KV_BLOCK)
+#define PULSAR_FP8_KV_ROWBYTES(HD) ((HD) + PULSAR_FP8_KV_NBLK(HD) * sizeof(float))
 
 /*
  * Microscaling (MX / OCP) compressed-KV storage.  One E8M0 (power-of-two)
@@ -64,21 +64,21 @@ enum {
  * This is the CUTLASS-consumable layout (float_ue8m0_t scales, block 32); the
  * GEMM path re-tiles the scales into CUTLASS's swizzled SF layout at use time.
  */
-#define DS4_MXKV_BLOCK 32u
-#define DS4_MXKV_NBLK(HD) (((HD) + DS4_MXKV_BLOCK - 1u) / DS4_MXKV_BLOCK)
-#define DS4_MXKV_FP8_ROWBYTES(HD) ((HD) + DS4_MXKV_NBLK(HD))
-#define DS4_MXKV_FP4_ROWBYTES(HD) (((HD) + 1u) / 2u + DS4_MXKV_NBLK(HD))
+#define PULSAR_MXKV_BLOCK 32u
+#define PULSAR_MXKV_NBLK(HD) (((HD) + PULSAR_MXKV_BLOCK - 1u) / PULSAR_MXKV_BLOCK)
+#define PULSAR_MXKV_FP8_ROWBYTES(HD) ((HD) + PULSAR_MXKV_NBLK(HD))
+#define PULSAR_MXKV_FP4_ROWBYTES(HD) (((HD) + 1u) / 2u + PULSAR_MXKV_NBLK(HD))
 /* KV cache storage format selector (compile/runtime). */
-#define DS4_MXKV_FMT_NONE 0u
-#define DS4_MXKV_FMT_FP8  1u
-#define DS4_MXKV_FMT_FP4  2u
-#define DS4_MXKV_ROWBYTES(FMT, HD) \
-    ((FMT) == DS4_MXKV_FMT_FP4 ? DS4_MXKV_FP4_ROWBYTES(HD) \
-   : (FMT) == DS4_MXKV_FMT_FP8 ? DS4_MXKV_FP8_ROWBYTES(HD) \
+#define PULSAR_MXKV_FMT_NONE 0u
+#define PULSAR_MXKV_FMT_FP8  1u
+#define PULSAR_MXKV_FMT_FP4  2u
+#define PULSAR_MXKV_ROWBYTES(FMT, HD) \
+    ((FMT) == PULSAR_MXKV_FMT_FP4 ? PULSAR_MXKV_FP4_ROWBYTES(HD) \
+   : (FMT) == PULSAR_MXKV_FMT_FP8 ? PULSAR_MXKV_FP8_ROWBYTES(HD) \
    : (HD) * sizeof(float))
 
 /*
- * DS4_ATTN_PACK compressed-KV storage (value-preserving).  A comp row today is
+ * PULSAR_ATTN_PACK compressed-KV storage (value-preserving).  A comp row today is
  * f32 with the nope dims already fp8-roundtripped in place (fp8_kv_quantize:
  * per-64 block scale = exp2f(ceilf(log2f(fmaxf(amax,1e-4)/448))), e4m3
  * clamp-roundtrip) and the n_rot rope tail untouched f32.  The packed row
@@ -87,39 +87,39 @@ enum {
  * head_dim 512 / n_rot 64 -> 448 + 7 + 1 + 256 = 712 B/row (vs 2048 f32).
  * The E8M0 byte is the scale exponent + 127 (power-of-two by construction),
  * so decode (e4m3 value * 2^(e8-127); rope read f32) is bit-identical to the
- * f32 cache.  Must stay in sync with DS4_ENGINE_ATTN_PACK_ROWBYTES.
+ * f32 cache.  Must stay in sync with PULSAR_ENGINE_ATTN_PACK_ROWBYTES.
  */
-#define DS4_ATTN_PACK_NROT 64u
-#define DS4_ATTN_PACK_NOPE(HD) ((HD) - DS4_ATTN_PACK_NROT)
-#define DS4_ATTN_PACK_SCALES_PAD(HD) \
-    ((DS4_ATTN_PACK_NOPE(HD) / DS4_FP8_KV_BLOCK + 3u) & ~3u)
-#define DS4_ATTN_PACK_ROWBYTES(HD) \
-    ((uint64_t)DS4_ATTN_PACK_NOPE(HD) + DS4_ATTN_PACK_SCALES_PAD(HD) + \
-     (uint64_t)DS4_ATTN_PACK_NROT * 4u)
+#define PULSAR_ATTN_PACK_NROT 64u
+#define PULSAR_ATTN_PACK_NOPE(HD) ((HD) - PULSAR_ATTN_PACK_NROT)
+#define PULSAR_ATTN_PACK_SCALES_PAD(HD) \
+    ((PULSAR_ATTN_PACK_NOPE(HD) / PULSAR_FP8_KV_BLOCK + 3u) & ~3u)
+#define PULSAR_ATTN_PACK_ROWBYTES(HD) \
+    ((uint64_t)PULSAR_ATTN_PACK_NOPE(HD) + PULSAR_ATTN_PACK_SCALES_PAD(HD) + \
+     (uint64_t)PULSAR_ATTN_PACK_NROT * 4u)
 
-struct ds4_gpu_tensor {
+struct pulsar_gpu_tensor {
     void *ptr;
     uint64_t bytes;
     int owner;
 };
 
 /* Hyper-connection residual-stream stored sample type (task #62; see the
- * DS4_HC_ELT_SIZE note in ds4_gpu.h). ds4_hc_t is the on-device STORAGE type of
+ * PULSAR_HC_ELT_SIZE note in pulsar_gpu.h). pulsar_hc_t is the on-device STORAGE type of
  * the six swap-coupled HC residual carriers; loads promote to f32 and stores
  * round from f32 so all in-kernel accumulation stays f32 (torch semantics:
  * bf16 storage, f32 math). Only the carriers use this — flat_hc (RMSNorm out)
- * and hc_mix/hc_split (Sinkhorn control weights) stay f32. sizeof(ds4_hc_t)
- * MUST equal DS4_HC_ELT_SIZE. */
-#ifdef DS4_HC_F32
-typedef float ds4_hc_t;
-__device__ __forceinline__ static float ds4_hc_load(const ds4_hc_t *p, uint64_t i) { return p[i]; }
-__device__ __forceinline__ static void  ds4_hc_store(ds4_hc_t *p, uint64_t i, float v) { p[i] = v; }
+ * and hc_mix/hc_split (Sinkhorn control weights) stay f32. sizeof(pulsar_hc_t)
+ * MUST equal PULSAR_HC_ELT_SIZE. */
+#ifdef PULSAR_HC_F32
+typedef float pulsar_hc_t;
+__device__ __forceinline__ static float pulsar_hc_load(const pulsar_hc_t *p, uint64_t i) { return p[i]; }
+__device__ __forceinline__ static void  pulsar_hc_store(pulsar_hc_t *p, uint64_t i, float v) { p[i] = v; }
 #else
-typedef __nv_bfloat16 ds4_hc_t;
-__device__ __forceinline__ static float ds4_hc_load(const ds4_hc_t *p, uint64_t i) { return __bfloat162float(p[i]); }
-__device__ __forceinline__ static void  ds4_hc_store(ds4_hc_t *p, uint64_t i, float v) { p[i] = __float2bfloat16(v); }
+typedef __nv_bfloat16 pulsar_hc_t;
+__device__ __forceinline__ static float pulsar_hc_load(const pulsar_hc_t *p, uint64_t i) { return __bfloat162float(p[i]); }
+__device__ __forceinline__ static void  pulsar_hc_store(pulsar_hc_t *p, uint64_t i, float v) { p[i] = __float2bfloat16(v); }
 #endif
-static_assert(sizeof(ds4_hc_t) == DS4_HC_ELT_SIZE, "ds4_hc_t size must match DS4_HC_ELT_SIZE");
+static_assert(sizeof(pulsar_hc_t) == PULSAR_HC_ELT_SIZE, "pulsar_hc_t size must match PULSAR_HC_ELT_SIZE");
 
 typedef struct {
     uint8_t scales[CUDA_QK_K / 16];
@@ -178,17 +178,17 @@ const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_
 int cuda_ok(cudaError_t err, const char *what);
 int cublas_ok(cublasStatus_t st, const char *what);
 int cuda_matmul_fp8_hc_expand_tensor_labeled(
-        ds4_gpu_tensor       *out_hc,
-        ds4_gpu_tensor       *block_out,
+        pulsar_gpu_tensor       *out_hc,
+        pulsar_gpu_tensor       *block_out,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        const ds4_gpu_tensor *block_add,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *split,
+        const pulsar_gpu_tensor *x,
+        const pulsar_gpu_tensor *block_add,
+        const pulsar_gpu_tensor *residual_hc,
+        const pulsar_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc,
         const char             *label);
@@ -213,4 +213,4 @@ __device__ static __forceinline__ float dot4_f32(float4 a, float4 b) {
     return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
 }
 
-#endif /* DS4_CUDA_INTERNAL_H */
+#endif /* PULSAR_CUDA_INTERNAL_H */

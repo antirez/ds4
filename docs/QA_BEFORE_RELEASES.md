@@ -1,6 +1,6 @@
 # QA Before Releases
 
-This is the release gate for DwarfStar.  Run it before tagging or pushing a
+This is the release gate for Pulsar.  Run it before tagging or pushing a
 release build.  The goal is not to prove every code path exhaustively; it is to
 exercise the paths that have historically regressed: CUDA graph inference,
 disk KV cache, server APIs, and the agent TUI/tool state
@@ -19,7 +19,7 @@ and any non-default flags for every manual run.
   `make clean && make cuda-spark`.
 - Run whitespace checks before committing:
   `git diff --check`.
-- Confirm `./ds4 --help`, `./ds4-server --help`, and `./ds4-agent --help` render
+- Confirm `./pulsar --help`, `./pulsar-server --help`, and `./pulsar-agent --help` render
   cleanly, with readable section colors and no broken wrapping.
 
 ## 2. Core Regression Tests
@@ -30,29 +30,29 @@ and any non-default flags for every manual run.
   `make cuda-regression`.
 - Run the vector checks explicitly after any tokenizer, template, KV, kernel,
   quantization, or prompt-rendering change:
-  `./ds4_test --logprob-vectors`
-  and `./ds4_test --local-golden-vectors`.
+  `./pulsar_test --logprob-vectors`
+  and `./pulsar_test --local-golden-vectors`.
 - Run server tests when HTTP, SSE, prompt rendering, cache policy, or tool-call
   replay changed:
-  `./ds4_test --server`.
-- Run `./ds4-eval --self-test-extractors`.
+  `./pulsar_test --server`.
+- Run `./pulsar-eval --self-test-extractors`.
 
 ## 3. Flash Inference Path
 
 Use the normal Flash GGUF that 128 GB users run.
 
 - One-shot CLI:
-  `./ds4 -m ds4flash.gguf --ctx 32768 --nothink -p "Explain C pointers in one paragraph."`
+  `./pulsar -m ds4flash.gguf --ctx 32768 --nothink -p "Explain C pointers in one paragraph."`
 - Thinking and max-thinking prompts:
   run one short coding prompt with default thinking and one with max thinking.
 - Long-context recall:
   run the long name/number or archive recall test used for catching attention
   and MoE routing drift.
 - Logprob sanity:
-  `./ds4 --nothink --temp 0 --dump-logprobs /tmp/ds4-logprobs.json --logprobs-top-k 20 -p "..."`
+  `./pulsar --nothink --temp 0 --dump-logprobs /tmp/ds4-logprobs.json --logprobs-top-k 20 -p "..."`
   and inspect that the continuation is sane.
 - Speed sanity:
-  run `ds4-bench` with `speed-bench/promessi_sposi.txt` and compare prefill,
+  run `pulsar-bench` with `speed-bench/promessi_sposi.txt` and compare prefill,
   generation speed, and KV bytes with the last known good numbers for the same
   machine.
 - Run a longer prompt that exercises routed experts past a few thousand tokens.
@@ -62,7 +62,7 @@ Use the normal Flash GGUF that 128 GB users run.
 Disk KV cache bugs are high impact for server users.
 
 - Start the server with:
-  `./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192`.
+  `./pulsar-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192`.
 - Run the same request twice and verify the second request hits cache.
 - Fill the cache enough to trigger eviction; verify the newly-written entry is
   not evicted and useful anchors are retained.
@@ -84,7 +84,7 @@ clients.
 - Test `--trace` and confirm rendered prompts, cache decisions, generated text,
   and tool-parser events are useful without leaking unrelated state.
 
-## 6. ds4-agent
+## 6. pulsar-agent
 
 The agent is the most stateful component.  Test it manually, not only by build.
 
@@ -98,7 +98,7 @@ The agent is the most stateful component.  Test it manually, not only by build.
   create a temp project, ask for edits, verify old/new and `[upto]` anchored
   edits fail safely on ambiguous matches and do not require retyping whole files.
 - Real coding edit loop:
-  delete `/tmp/mymandel`, ask ds4-agent to create a small C ASCII Mandelbrot
+  delete `/tmp/mymandel`, ask pulsar-agent to create a small C ASCII Mandelbrot
   program there, build and run it, then in a second user turn ask for a small
   modification that should naturally use the edit tool, such as changing the
   ASCII character ramp or output dimensions.  Verify the agent edits the
@@ -123,7 +123,7 @@ The agent is the most stateful component.  Test it manually, not only by build.
 
 ## 8. Performance And Power
 
-- Run `ds4-bench` on the release machine and compare with tracked CSV baselines.
+- Run `pulsar-bench` on the release machine and compare with tracked CSV baselines.
 - Test `--power 100` is not throttled.
 - Test `--power 50` visibly reduces duty cycle in CLI, server, agent, eval, and
   bench where practical.

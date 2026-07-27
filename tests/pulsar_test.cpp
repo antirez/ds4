@@ -1,5 +1,5 @@
-#define DS4_SERVER_TEST
-#define DS4_SERVER_TEST_NO_MAIN
+#define PULSAR_SERVER_TEST
+#define PULSAR_SERVER_TEST_NO_MAIN
 #include "../src/server/util.cpp"
 #include "../src/server/request.cpp"
 #include "../src/server/prompt_render.cpp"
@@ -16,13 +16,13 @@
 #include "../src/server/cli_main.cpp"
 /* engine internals: the sampler byte-exactness gate builds distributions
  * directly and pins them against a copy of the pre-radix implementation. */
-#include "../src/engine/ds4_engine_internal.h"
-#ifndef DS4_NO_GPU
-#include "../src/ds4_gpu.h"
+#include "../src/engine/pulsar_engine_internal.h"
+#ifndef PULSAR_NO_GPU
+#include "../src/pulsar_gpu.h"
 #include <math.h>
 
-static ds4_engine *test_engine_fast;
-static ds4_engine *test_engine_quality;
+static pulsar_engine *test_engine_fast;
+static pulsar_engine *test_engine_quality;
 
 static const char *test_model_path(void) {
     const char *model_path = getenv("DS4_TEST_MODEL");
@@ -49,19 +49,19 @@ static void test_restore_env(const char *name, char *saved) {
     }
 }
 
-static ds4_engine *test_open_engine(bool quality) {
-    ds4_engine *engine = NULL;
-    ds4_engine_options opt = {
+static pulsar_engine *test_open_engine(bool quality) {
+    pulsar_engine *engine = NULL;
+    pulsar_engine_options opt = {
         .model_path = test_model_path(),
-        .backend = DS4_BACKEND_CUDA,
+        .backend = PULSAR_BACKEND_CUDA,
         .quality = quality,
     };
-    TEST_ASSERT(ds4_engine_open(&engine, &opt) == 0);
+    TEST_ASSERT(pulsar_engine_open(&engine, &opt) == 0);
     return engine;
 }
 
-static ds4_engine *test_get_engine(bool quality) {
-    ds4_engine **slot = quality ? &test_engine_quality : &test_engine_fast;
+static pulsar_engine *test_get_engine(bool quality) {
+    pulsar_engine **slot = quality ? &test_engine_quality : &test_engine_fast;
     if (*slot) return *slot;
 
     *slot = test_open_engine(quality);
@@ -69,15 +69,15 @@ static ds4_engine *test_get_engine(bool quality) {
 }
 
 static void test_close_engines(void) {
-    ds4_engine_close(test_engine_fast);
-    ds4_engine_close(test_engine_quality);
+    pulsar_engine_close(test_engine_fast);
+    pulsar_engine_close(test_engine_quality);
     test_engine_fast = NULL;
     test_engine_quality = NULL;
 }
 
 static void test_close_engine(bool quality) {
-    ds4_engine **slot = quality ? &test_engine_quality : &test_engine_fast;
-    ds4_engine_close(*slot);
+    pulsar_engine **slot = quality ? &test_engine_quality : &test_engine_fast;
+    pulsar_engine_close(*slot);
     *slot = NULL;
 }
 
@@ -163,13 +163,13 @@ static void test_f16_matvec_fast_nr0_4(void) {
         }
     }
 
-    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)in_dim * sizeof(float));
-    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)out_dim * sizeof(float));
+    pulsar_gpu_tensor *x = pulsar_gpu_tensor_alloc((uint64_t)in_dim * sizeof(float));
+    pulsar_gpu_tensor *out = pulsar_gpu_tensor_alloc((uint64_t)out_dim * sizeof(float));
     TEST_ASSERT(x != NULL);
     TEST_ASSERT(out != NULL);
     if (!x || !out) {
-        ds4_gpu_tensor_free(x);
-        ds4_gpu_tensor_free(out);
+        pulsar_gpu_tensor_free(x);
+        pulsar_gpu_tensor_free(out);
         free(weights_raw);
         return;
     }
@@ -181,8 +181,8 @@ static void test_f16_matvec_fast_nr0_4(void) {
     if (!x_host || !out_host) {
         free(x_host);
         free(out_host);
-        ds4_gpu_tensor_free(x);
-        ds4_gpu_tensor_free(out);
+        pulsar_gpu_tensor_free(x);
+        pulsar_gpu_tensor_free(out);
         free(weights_raw);
         return;
     }
@@ -191,12 +191,12 @@ static void test_f16_matvec_fast_nr0_4(void) {
         x_host[i] = (float)((int)(i % 31u) - 15) / 32.0f;
     }
 
-    TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_host, (uint64_t)in_dim * sizeof(float)) != 0);
-    TEST_ASSERT(ds4_gpu_set_model_map(weights_raw, weight_alloc) != 0);
-    ds4_gpu_set_quality(false);
-    TEST_ASSERT(ds4_gpu_matmul_f16_tensor(out, weights_raw, weight_alloc, 0,
+    TEST_ASSERT(pulsar_gpu_tensor_write(x, 0, x_host, (uint64_t)in_dim * sizeof(float)) != 0);
+    TEST_ASSERT(pulsar_gpu_set_model_map(weights_raw, weight_alloc) != 0);
+    pulsar_gpu_set_quality(false);
+    TEST_ASSERT(pulsar_gpu_matmul_f16_tensor(out, weights_raw, weight_alloc, 0,
                                             in_dim, out_dim, x, 1) != 0);
-    TEST_ASSERT(ds4_gpu_tensor_read(out, 0, out_host, (uint64_t)out_dim * sizeof(float)) != 0);
+    TEST_ASSERT(pulsar_gpu_tensor_read(out, 0, out_host, (uint64_t)out_dim * sizeof(float)) != 0);
 
     float max_abs = 0.0f;
     for (uint32_t o = 0; o < out_dim; o++) {
@@ -212,8 +212,8 @@ static void test_f16_matvec_fast_nr0_4(void) {
 
     free(x_host);
     free(out_host);
-    ds4_gpu_tensor_free(x);
-    ds4_gpu_tensor_free(out);
+    pulsar_gpu_tensor_free(x);
+    pulsar_gpu_tensor_free(out);
     free(weights_raw);
 }
 
@@ -239,13 +239,13 @@ static void test_f16_prefill_matmul(void) {
         }
     }
 
-    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_bytes);
-    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_bytes);
+    pulsar_gpu_tensor *x = pulsar_gpu_tensor_alloc(x_bytes);
+    pulsar_gpu_tensor *out = pulsar_gpu_tensor_alloc(out_bytes);
     TEST_ASSERT(x != NULL);
     TEST_ASSERT(out != NULL);
     if (!x || !out) {
-        ds4_gpu_tensor_free(x);
-        ds4_gpu_tensor_free(out);
+        pulsar_gpu_tensor_free(x);
+        pulsar_gpu_tensor_free(out);
         free(weights_raw);
         return;
     }
@@ -257,8 +257,8 @@ static void test_f16_prefill_matmul(void) {
     if (!x_host || !out_host) {
         free(x_host);
         free(out_host);
-        ds4_gpu_tensor_free(x);
-        ds4_gpu_tensor_free(out);
+        pulsar_gpu_tensor_free(x);
+        pulsar_gpu_tensor_free(out);
         free(weights_raw);
         return;
     }
@@ -273,13 +273,13 @@ static void test_f16_prefill_matmul(void) {
         out_host[i] = 12345.0f;
     }
 
-    TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_host, x_bytes) != 0);
-    TEST_ASSERT(ds4_gpu_tensor_write(out, 0, out_host, out_bytes) != 0);
-    TEST_ASSERT(ds4_gpu_set_model_map(weights_raw, weight_alloc) != 0);
-    ds4_gpu_set_quality(false);
-    TEST_ASSERT(ds4_gpu_matmul_f16_tensor(out, weights_raw, weight_alloc, 0,
+    TEST_ASSERT(pulsar_gpu_tensor_write(x, 0, x_host, x_bytes) != 0);
+    TEST_ASSERT(pulsar_gpu_tensor_write(out, 0, out_host, out_bytes) != 0);
+    TEST_ASSERT(pulsar_gpu_set_model_map(weights_raw, weight_alloc) != 0);
+    pulsar_gpu_set_quality(false);
+    TEST_ASSERT(pulsar_gpu_matmul_f16_tensor(out, weights_raw, weight_alloc, 0,
                                           in_dim, out_dim, x, n_tok) != 0);
-    TEST_ASSERT(ds4_gpu_tensor_read(out, 0, out_host, out_bytes) != 0);
+    TEST_ASSERT(pulsar_gpu_tensor_read(out, 0, out_host, out_bytes) != 0);
 
     float max_abs = 0.0f;
     float rms = 0.0f;
@@ -303,8 +303,8 @@ static void test_f16_prefill_matmul(void) {
 
     free(x_host);
     free(out_host);
-    ds4_gpu_tensor_free(x);
-    ds4_gpu_tensor_free(out);
+    pulsar_gpu_tensor_free(x);
+    pulsar_gpu_tensor_free(out);
     free(weights_raw);
 }
 
@@ -314,13 +314,13 @@ static void test_f16_kernel_group(void) {
 }
 
 static void test_short_prefill_ratio4(void) {
-    ds4_engine *engine = test_get_engine(false);
+    pulsar_engine *engine = test_get_engine(false);
     if (!engine) return;
 
     const int tokens[] = {
-        ds4_token_user(engine),
-        ds4_token_assistant(engine),
-        ds4_token_eos(engine),
+        pulsar_token_user(engine),
+        pulsar_token_assistant(engine),
+        pulsar_token_eos(engine),
     };
     for (size_t i = 0; i < sizeof(tokens) / sizeof(tokens[0]); i++) {
         TEST_ASSERT(tokens[i] >= 0);
@@ -328,29 +328,29 @@ static void test_short_prefill_ratio4(void) {
     }
 
     for (size_t n = 1; n <= 3; n++) {
-        ds4_tokens prompt = {0};
+        pulsar_tokens prompt = {0};
         for (size_t i = 0; i < n; i++) {
-            ds4_tokens_push(&prompt, tokens[i]);
+            pulsar_tokens_push(&prompt, tokens[i]);
         }
         TEST_ASSERT(prompt.len == (int)n);
 
-        ds4_session *session = NULL;
-        TEST_ASSERT(ds4_session_create(&session, engine, 2048) == 0);
+        pulsar_session *session = NULL;
+        TEST_ASSERT(pulsar_session_create(&session, engine, 2048) == 0);
         if (!session) {
-            ds4_tokens_free(&prompt);
+            pulsar_tokens_free(&prompt);
             return;
         }
 
         char err[160] = {0};
-        const int rc = ds4_session_sync(session, &prompt, err, sizeof(err));
+        const int rc = pulsar_session_sync(session, &prompt, err, sizeof(err));
         if (rc != 0) {
-            fprintf(stderr, "ds4-test: short prefill failed for %zu token(s): %s\n",
+            fprintf(stderr, "pulsar-test: short prefill failed for %zu token(s): %s\n",
                     n, err);
         }
         TEST_ASSERT(rc == 0);
 
-        ds4_session_free(session);
-        ds4_tokens_free(&prompt);
+        pulsar_session_free(session);
+        pulsar_tokens_free(&prompt);
     }
 }
 
@@ -452,11 +452,11 @@ static bool test_output_has_fact(const char *text, const test_long_fact *fact) {
 
     if (saw_wrong_assignment) {
         fprintf(stderr,
-                "ds4-test: long-context wrong assignment for %s: got %d expected %d\n",
+                "pulsar-test: long-context wrong assignment for %s: got %d expected %d\n",
                 fact->name, wrong_value, fact->number);
     } else {
         fprintf(stderr,
-                "ds4-test: long-context missing assignment for %s=%d\n",
+                "pulsar-test: long-context missing assignment for %s=%d\n",
                 fact->name, fact->number);
     }
     return false;
@@ -482,10 +482,10 @@ static bool test_hex_to_bytes(const char *hex, unsigned char *out, int cap, int 
     return true;
 }
 
-static bool test_token_bytes_equal(ds4_engine *engine, int token,
+static bool test_token_bytes_equal(pulsar_engine *engine, int token,
                                    const unsigned char *want, int want_len) {
     size_t got_len = 0;
-    char *got = ds4_token_text(engine, token, &got_len);
+    char *got = pulsar_token_text(engine, token, &got_len);
     bool eq = got && got_len == (size_t)want_len &&
               memcmp(got, want, (size_t)want_len) == 0;
     free(got);
@@ -496,7 +496,7 @@ static void test_long_prefill_progress(void *ud, const char *event, int current,
     (void)ud;
     if (strcmp(event, "prefill_chunk")) return;
     if (current == 0 || current == total || current % 8192 == 0) {
-        fprintf(stderr, "ds4-test: long-context prefill %d/%d\n", current, total);
+        fprintf(stderr, "pulsar-test: long-context prefill %d/%d\n", current, total);
     }
 }
 
@@ -509,43 +509,43 @@ static void test_long_story_fact_recall(void) {
     TEST_ASSERT(prompt_text != NULL);
     if (!prompt_text) return;
 
-    ds4_engine *engine = test_get_engine(false);
+    pulsar_engine *engine = test_get_engine(false);
     if (!engine) {
         free(prompt_text);
         return;
     }
 
-    ds4_tokens prompt = {0};
-    ds4_tokenize_rendered_chat(engine, prompt_text, &prompt);
+    pulsar_tokens prompt = {0};
+    pulsar_tokenize_rendered_chat(engine, prompt_text, &prompt);
     TEST_ASSERT(prompt.len > 30000);
 
-    ds4_session *session = NULL;
-    TEST_ASSERT(ds4_session_create(&session, engine, 100000) == 0);
+    pulsar_session *session = NULL;
+    TEST_ASSERT(pulsar_session_create(&session, engine, 100000) == 0);
     if (!session) {
-        ds4_tokens_free(&prompt);
+        pulsar_tokens_free(&prompt);
         free(prompt_text);
         return;
     }
 
     char err[160];
-    ds4_session_set_progress(session, test_long_prefill_progress, NULL);
-    TEST_ASSERT(ds4_session_sync(session, &prompt, err, sizeof(err)) == 0);
-    ds4_session_set_progress(session, NULL, NULL);
+    pulsar_session_set_progress(session, test_long_prefill_progress, NULL);
+    TEST_ASSERT(pulsar_session_sync(session, &prompt, err, sizeof(err)) == 0);
+    pulsar_session_set_progress(session, NULL, NULL);
 
     buf out = {0};
     uint64_t rng = 12345;
     int generated = 0;
     bool decode_ok = true;
     for (; generated < 350; generated++) {
-        int token = ds4_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
-        if (token == ds4_token_eos(engine)) break;
+        int token = pulsar_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
+        if (token == pulsar_token_eos(engine)) break;
 
         size_t piece_len = 0;
-        char *piece = ds4_token_text(engine, token, &piece_len);
+        char *piece = pulsar_token_text(engine, token, &piece_len);
         buf_append(&out, piece, piece_len);
         free(piece);
 
-        if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+        if (pulsar_session_eval(session, token, err, sizeof(err)) != 0) {
             decode_ok = false;
             break;
         }
@@ -559,8 +559,8 @@ static void test_long_story_fact_recall(void) {
     }
 
     buf_free(&out);
-    ds4_session_free(session);
-    ds4_tokens_free(&prompt);
+    pulsar_session_free(session);
+    pulsar_tokens_free(&prompt);
     free(prompt_text);
 }
 
@@ -664,32 +664,32 @@ static bool test_fill_vector_case(FILE *fp, test_vec_case *vc) {
     return false;
 }
 
-static void test_logprob_vector_case(ds4_engine *engine, const test_vec_case *vc) {
+static void test_logprob_vector_case(pulsar_engine *engine, const test_vec_case *vc) {
     char *prompt_text = test_read_file(vc->prompt_path);
     TEST_ASSERT(prompt_text != NULL);
     if (!prompt_text) return;
 
-    ds4_tokens prompt = {0};
-    ds4_encode_chat_prompt(engine, "", prompt_text, DS4_THINK_NONE, &prompt);
+    pulsar_tokens prompt = {0};
+    pulsar_encode_chat_prompt(engine, "", prompt_text, PULSAR_THINK_NONE, &prompt);
     free(prompt_text);
 
-    ds4_session *session = NULL;
-    TEST_ASSERT(ds4_session_create(&session, engine, vc->ctx) == 0);
+    pulsar_session *session = NULL;
+    TEST_ASSERT(pulsar_session_create(&session, engine, vc->ctx) == 0);
     if (!session) {
-        ds4_tokens_free(&prompt);
+        pulsar_tokens_free(&prompt);
         return;
     }
 
     char err[160];
-    TEST_ASSERT(ds4_session_sync(session, &prompt, err, sizeof(err)) == 0);
+    TEST_ASSERT(pulsar_session_sync(session, &prompt, err, sizeof(err)) == 0);
 
-    ds4_token_score scores[20];
+    pulsar_token_score scores[20];
     for (int i = 0; i < vc->nsteps; i++) {
         const test_vec_step *step = &vc->steps[i];
-        int nscore = ds4_session_top_logprobs(session, scores, 20);
-        int token = ds4_session_argmax(session);
+        int nscore = pulsar_session_top_logprobs(session, scores, 20);
+        int token = pulsar_session_argmax(session);
         if (!test_token_bytes_equal(engine, token, step->selected, step->selected_len)) {
-            fprintf(stderr, "ds4-test: vector %s step %d selected token mismatch\n",
+            fprintf(stderr, "pulsar-test: vector %s step %d selected token mismatch\n",
                     vc->id, i);
             TEST_ASSERT(false);
         }
@@ -708,24 +708,24 @@ static void test_logprob_vector_case(ds4_engine *engine, const test_vec_case *vc
                 }
             }
             if (!found) {
-                fprintf(stderr, "ds4-test: vector %s step %d official top token missing locally\n",
+                fprintf(stderr, "pulsar-test: vector %s step %d official top token missing locally\n",
                         vc->id, i);
                 TEST_ASSERT(false);
             } else if (fabsf(local_lp - step->top[t].logprob) > 4.0f) {
                 fprintf(stderr,
-                        "ds4-test: vector %s step %d logprob delta too high: local=%g official=%g\n",
+                        "pulsar-test: vector %s step %d logprob delta too high: local=%g official=%g\n",
                         vc->id, i, local_lp, step->top[t].logprob);
                 TEST_ASSERT(false);
             }
         }
 
         if (i + 1 < vc->nsteps) {
-            TEST_ASSERT(ds4_session_eval(session, token, err, sizeof(err)) == 0);
+            TEST_ASSERT(pulsar_session_eval(session, token, err, sizeof(err)) == 0);
         }
     }
 
-    ds4_session_free(session);
-    ds4_tokens_free(&prompt);
+    pulsar_session_free(session);
+    pulsar_tokens_free(&prompt);
 }
 
 static bool test_logprob_vector_case_disabled(const test_vec_case *vc) {
@@ -748,7 +748,7 @@ static void test_official_logprob_vectors_run(const char *case_filter) {
 
     char *saved_prefill_chunk = test_save_env("DS4_CUDA_PREFILL_CHUNK");
     setenv("DS4_CUDA_PREFILL_CHUNK", "2048", 1);
-    ds4_engine *engine = test_open_engine(false);
+    pulsar_engine *engine = test_open_engine(false);
     if (!engine) {
         test_restore_env("DS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
         fclose(fp);
@@ -763,16 +763,16 @@ static void test_official_logprob_vectors_run(const char *case_filter) {
             continue;
         }
         if (test_logprob_vector_case_disabled(&vc)) {
-            fprintf(stderr, "ds4-test: vector %s skipped (API/official graph mismatch)\n",
+            fprintf(stderr, "pulsar-test: vector %s skipped (API/official graph mismatch)\n",
                     vc.id);
             continue;
         }
-        fprintf(stderr, "ds4-test: vector %s\n", vc.id);
+        fprintf(stderr, "pulsar-test: vector %s\n", vc.id);
         test_logprob_vector_case(engine, &vc);
         ran++;
     }
     TEST_ASSERT(!case_filter || !case_filter[0] || ran == 1);
-    ds4_engine_close(engine);
+    pulsar_engine_close(engine);
     test_restore_env("DS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
     fclose(fp);
 }
@@ -874,50 +874,50 @@ static float test_local_golden_max_abs(const test_local_golden_case *tc,
     return max_abs;
 }
 
-static void test_local_golden_case_run(ds4_engine *engine,
+static void test_local_golden_case_run(pulsar_engine *engine,
                                        const test_local_golden_case *tc) {
     char *prompt_text = test_read_file(tc->prompt_path);
     TEST_ASSERT(prompt_text != NULL);
     if (!prompt_text) return;
 
-    ds4_tokens prompt = {0};
+    pulsar_tokens prompt = {0};
     if (!strcmp(tc->mode, "text")) {
-        ds4_tokenize_text(engine, prompt_text, &prompt);
+        pulsar_tokenize_text(engine, prompt_text, &prompt);
     } else if (!strcmp(tc->mode, "rendered")) {
-        ds4_tokenize_rendered_chat(engine, prompt_text, &prompt);
+        pulsar_tokenize_rendered_chat(engine, prompt_text, &prompt);
     } else if (!strcmp(tc->mode, "chat")) {
-        ds4_encode_chat_prompt(engine, "", prompt_text, DS4_THINK_NONE, &prompt);
+        pulsar_encode_chat_prompt(engine, "", prompt_text, PULSAR_THINK_NONE, &prompt);
     } else {
         TEST_ASSERT(!"unknown local golden prompt mode");
     }
     free(prompt_text);
     TEST_ASSERT(prompt.len >= tc->frontier);
     if (prompt.len < tc->frontier) {
-        ds4_tokens_free(&prompt);
+        pulsar_tokens_free(&prompt);
         return;
     }
 
-    ds4_tokens prefix = {
+    pulsar_tokens prefix = {
         .v = prompt.v,
         .len = tc->frontier,
         .cap = tc->frontier,
     };
 
-    ds4_session *session = NULL;
-    TEST_ASSERT(ds4_session_create(&session, engine, tc->ctx) == 0);
+    pulsar_session *session = NULL;
+    TEST_ASSERT(pulsar_session_create(&session, engine, tc->ctx) == 0);
     if (!session) {
-        ds4_tokens_free(&prompt);
+        pulsar_tokens_free(&prompt);
         return;
     }
 
     char err[160];
-    TEST_ASSERT(ds4_session_sync(session, &prefix, err, sizeof(err)) == 0);
+    TEST_ASSERT(pulsar_session_sync(session, &prefix, err, sizeof(err)) == 0);
 
-    const int vocab = ds4_engine_vocab_size(engine);
+    const int vocab = pulsar_engine_vocab_size(engine);
     float *cand_logits = (float *)malloc((size_t)vocab * sizeof(cand_logits[0]));
     TEST_ASSERT(cand_logits != NULL);
     if (cand_logits &&
-        ds4_session_copy_logits(session, cand_logits, vocab) == vocab) {
+        pulsar_session_copy_logits(session, cand_logits, vocab) == vocab) {
         int cand_top[TEST_LOCAL_GOLDEN_MAX_TOP];
         const int ntop = tc->ntop < TEST_LOCAL_GOLDEN_MAX_TOP ?
                          tc->ntop : TEST_LOCAL_GOLDEN_MAX_TOP;
@@ -930,7 +930,7 @@ static void test_local_golden_case_run(ds4_engine *engine,
             test_local_golden_max_abs(tc, cand_logits, 20);
 
         fprintf(stderr,
-                "ds4-test: local golden %s top1 ref=%d cand=%d "
+                "pulsar-test: local golden %s top1 ref=%d cand=%d "
                 "top5_overlap=%d/5 top20_overlap=%d/20 top64_overlap=%d/64 "
                 "top20_max_abs=%g\n",
                 tc->id, tc->top[0].id, cand_top[0],
@@ -951,8 +951,8 @@ static void test_local_golden_case_run(ds4_engine *engine,
     }
 
     free(cand_logits);
-    ds4_session_free(session);
-    ds4_tokens_free(&prompt);
+    pulsar_session_free(session);
+    pulsar_tokens_free(&prompt);
 }
 
 static void test_local_golden_vectors(void) {
@@ -965,7 +965,7 @@ static void test_local_golden_vectors(void) {
     char *saved_prefill_chunk = test_save_env("DS4_CUDA_PREFILL_CHUNK");
     setenv("DS4_CUDA_PREFILL_CHUNK", "4096", 1);
 
-    ds4_engine *engine = test_open_engine(false);
+    pulsar_engine *engine = test_open_engine(false);
     if (!engine) {
         test_restore_env("DS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
         fclose(fp);
@@ -978,7 +978,7 @@ static void test_local_golden_vectors(void) {
         test_local_golden_case_run(engine, &tc);
     }
 
-    ds4_engine_close(engine);
+    pulsar_engine_close(engine);
     test_restore_env("DS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
     fclose(fp);
 }
@@ -993,7 +993,7 @@ typedef struct {
     int ctx;
     int vocab_size;
     int gen_steps;
-    ds4_tokens prompt;
+    pulsar_tokens prompt;
     float *ref_logits;
     int ref_gen[TEST_VEC_MAX_STEPS];
     int ref_gen_len;
@@ -1030,7 +1030,7 @@ typedef struct {
 
 static void test_mpp_eq_case_free(test_mpp_eq_case *tc) {
     if (!tc) return;
-    ds4_tokens_free(&tc->prompt);
+    pulsar_tokens_free(&tc->prompt);
     free(tc->ref_logits);
     memset(tc, 0, sizeof(*tc));
 }
@@ -1178,12 +1178,12 @@ static test_mpp_eq_result test_compare_mpp_logits(const test_mpp_eq_case *tc,
     };
 
     fprintf(stderr,
-            "ds4-test: Tensor equivalence %s top1 ref=%d cand=%d top5_overlap=%d/%d overlap=%d/%d max_rank_delta=%d rms=%g max_abs=%g top20_max_abs=%g\n",
+            "pulsar-test: Tensor equivalence %s top1 ref=%d cand=%d top5_overlap=%d/%d overlap=%d/%d max_rank_delta=%d rms=%g max_abs=%g top20_max_abs=%g\n",
             tc->id, ref_top[0], cand_top[0],
             top5_overlap, TEST_MPP_EQ_TOP5,
             overlap, TEST_MPP_EQ_TOPK,
             max_rank_delta, rms, max_abs, top_abs);
-    fprintf(stderr, "ds4-test: Tensor equivalence %s largest deltas:", tc->id);
+    fprintf(stderr, "pulsar-test: Tensor equivalence %s largest deltas:", tc->id);
     for (int i = 0; i < TEST_MPP_EQ_DELTAS && delta_ids[i] >= 0; i++) {
         fprintf(stderr, " id=%d ref=%g cand=%g abs=%g",
                 delta_ids[i], delta_ref[i], delta_cand[i], delta_abs[i]);
@@ -1197,51 +1197,51 @@ static test_mpp_eq_result test_compare_mpp_logits(const test_mpp_eq_case *tc,
     return result;
 }
 
-static bool test_mpp_capture(ds4_engine *engine, const test_mpp_eq_case *tc,
+static bool test_mpp_capture(pulsar_engine *engine, const test_mpp_eq_case *tc,
                              float *logits, int *gen, int *gen_len) {
-    ds4_session *session = NULL;
-    TEST_ASSERT(ds4_session_create(&session, engine, tc->ctx) == 0);
+    pulsar_session *session = NULL;
+    TEST_ASSERT(pulsar_session_create(&session, engine, tc->ctx) == 0);
     if (!session) return false;
 
     char err[160];
-    bool ok = ds4_session_sync(session, &tc->prompt, err, sizeof(err)) == 0;
+    bool ok = pulsar_session_sync(session, &tc->prompt, err, sizeof(err)) == 0;
     TEST_ASSERT(ok);
     if (ok) {
-        ok = ds4_session_copy_logits(session, logits, tc->vocab_size) == tc->vocab_size;
+        ok = pulsar_session_copy_logits(session, logits, tc->vocab_size) == tc->vocab_size;
         TEST_ASSERT(ok);
     }
 
     int n = 0;
     while (ok && n < tc->gen_steps) {
-        const int token = ds4_session_argmax(session);
+        const int token = pulsar_session_argmax(session);
         gen[n++] = token;
-        if (n < tc->gen_steps && ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+        if (n < tc->gen_steps && pulsar_session_eval(session, token, err, sizeof(err)) != 0) {
             ok = false;
             TEST_ASSERT(false);
         }
     }
     *gen_len = n;
 
-    ds4_session_free(session);
+    pulsar_session_free(session);
     return ok;
 }
 
-static bool test_mpp_capture_logits_only(ds4_engine *engine,
+static bool test_mpp_capture_logits_only(pulsar_engine *engine,
                                          const test_mpp_eq_case *tc,
                                          float *logits) {
-    ds4_session *session = NULL;
-    TEST_ASSERT(ds4_session_create(&session, engine, tc->ctx) == 0);
+    pulsar_session *session = NULL;
+    TEST_ASSERT(pulsar_session_create(&session, engine, tc->ctx) == 0);
     if (!session) return false;
 
     char err[160];
-    bool ok = ds4_session_sync(session, &tc->prompt, err, sizeof(err)) == 0;
+    bool ok = pulsar_session_sync(session, &tc->prompt, err, sizeof(err)) == 0;
     TEST_ASSERT(ok);
     if (ok) {
-        ok = ds4_session_copy_logits(session, logits, tc->vocab_size) == tc->vocab_size;
+        ok = pulsar_session_copy_logits(session, logits, tc->vocab_size) == tc->vocab_size;
         TEST_ASSERT(ok);
     }
 
-    ds4_session_free(session);
+    pulsar_session_free(session);
     return ok;
 }
 
@@ -1258,7 +1258,7 @@ static bool test_mpp_eq_case_selected(const char *id) {
     return false;
 }
 
-static int test_load_mpp_cases(ds4_engine *engine, test_mpp_eq_case *cases, int cap) {
+static int test_load_mpp_cases(pulsar_engine *engine, test_mpp_eq_case *cases, int cap) {
     const char *path = getenv("DS4_TEST_VECTOR_FILE");
     if (!path || !path[0]) path = "tests/test-vectors/official.vec";
     FILE *fp = fopen(path, "rb");
@@ -1277,9 +1277,9 @@ static int test_load_mpp_cases(ds4_engine *engine, test_mpp_eq_case *cases, int 
         test_mpp_eq_case *tc = &cases[ncase++];
         snprintf(tc->id, sizeof(tc->id), "%s", vc.id);
         tc->ctx = vc.ctx;
-        tc->vocab_size = ds4_engine_vocab_size(engine);
+        tc->vocab_size = pulsar_engine_vocab_size(engine);
         tc->gen_steps = vc.nsteps < TEST_VEC_MAX_STEPS ? vc.nsteps : TEST_VEC_MAX_STEPS;
-        ds4_encode_chat_prompt(engine, "", prompt_text, DS4_THINK_NONE, &tc->prompt);
+        pulsar_encode_chat_prompt(engine, "", prompt_text, PULSAR_THINK_NONE, &tc->prompt);
         free(prompt_text);
         TEST_ASSERT(tc->prompt.len > 0);
     }
@@ -1314,7 +1314,7 @@ static void test_mpp_summary_note_logits(test_mpp_eq_summary *summary,
 
 static void test_mpp_summary_print(const test_mpp_eq_summary *summary) {
     fprintf(stderr,
-            "ds4-test: Tensor summary route=%s cases=%d capture_fail=%d logits_fail=%d greedy_fail=%d top1_mismatch=%d min_top5_overlap=%d/%d min_overlap=%d/%d worst_rank_delta=%d worst_rms=%g worst_max_abs=%g worst_top20_max_abs=%g\n",
+            "pulsar-test: Tensor summary route=%s cases=%d capture_fail=%d logits_fail=%d greedy_fail=%d top1_mismatch=%d min_top5_overlap=%d/%d min_overlap=%d/%d worst_rank_delta=%d worst_rms=%g worst_max_abs=%g worst_top20_max_abs=%g\n",
             summary->label,
             summary->cases,
             summary->capture_failures,
@@ -1334,10 +1334,10 @@ static void test_mpp_summary_print(const test_mpp_eq_summary *summary) {
 static void test_run_mpp_candidate(const char *label,
                                    test_mpp_eq_case *cases,
                                    int ncase) {
-    fprintf(stderr, "ds4-test: Tensor equivalence candidate route=%s\n", label);
+    fprintf(stderr, "pulsar-test: Tensor equivalence candidate route=%s\n", label);
     test_mpp_eq_summary summary;
     test_mpp_summary_init(&summary, label);
-    ds4_engine *cand_engine = test_open_engine(false);
+    pulsar_engine *cand_engine = test_open_engine(false);
     if (cand_engine) {
         const int vocab_size = ncase > 0 ? cases[0].vocab_size : 0;
         float *cand_logits = (float *)malloc((size_t)vocab_size * sizeof(cand_logits[0]));
@@ -1360,7 +1360,7 @@ static void test_run_mpp_candidate(const char *label,
                 for (int j = 0; j < tc->ref_gen_len && j < cand_gen_len; j++) {
                     if (cand_gen[j] != tc->ref_gen[j]) {
                         fprintf(stderr,
-                                "ds4-test: Tensor equivalence %s greedy token mismatch step=%d ref=%d cand=%d\n",
+                                "pulsar-test: Tensor equivalence %s greedy token mismatch step=%d ref=%d cand=%d\n",
                                 tc->id, j, tc->ref_gen[j], cand_gen[j]);
                         summary.greedy_failures++;
                     }
@@ -1369,7 +1369,7 @@ static void test_run_mpp_candidate(const char *label,
             }
             free(cand_logits);
         }
-        ds4_engine_close(cand_engine);
+        pulsar_engine_close(cand_engine);
     }
     test_mpp_summary_print(&summary);
 }
@@ -1380,7 +1380,7 @@ static void test_mpp_equivalence(void) {
     test_mpp_eq_case cases[TEST_MPP_EQ_MAX_CASES];
     memset(cases, 0, sizeof(cases));
 
-    ds4_engine *ref_engine = test_open_engine(false);
+    pulsar_engine *ref_engine = test_open_engine(false);
     if (!ref_engine) {
         return;
     }
@@ -1397,7 +1397,7 @@ static void test_mpp_equivalence(void) {
                                      tc->ref_gen,
                                      &tc->ref_gen_len));
     }
-    ds4_engine_close(ref_engine);
+    pulsar_engine_close(ref_engine);
 
     test_run_mpp_candidate("auto", cases, ncase);
 
@@ -1450,7 +1450,7 @@ static const char *test_think_recovery_request_json(void) {
  * malformed prefix is teacher-forced so the regression is deterministic and
  * does not depend on coaxing the model into misbehaving. */
 static void test_think_tool_recovery(void) {
-    ds4_engine *engine = test_get_engine(false);
+    pulsar_engine *engine = test_get_engine(false);
     if (!engine) return;
 
     request r;
@@ -1458,13 +1458,13 @@ static void test_think_tool_recovery(void) {
     TEST_ASSERT(parse_chat_request(engine, NULL, test_think_recovery_request_json(),
                                    512, 32768, &r, err, sizeof(err)));
 
-    ds4_session *session = NULL;
-    TEST_ASSERT(ds4_session_create(&session, engine, 32768) == 0);
+    pulsar_session *session = NULL;
+    TEST_ASSERT(pulsar_session_create(&session, engine, 32768) == 0);
     if (!session) {
         request_free(&r);
         return;
     }
-    TEST_ASSERT(ds4_session_sync(session, &r.prompt, err, sizeof(err)) == 0);
+    TEST_ASSERT(pulsar_session_sync(session, &r.prompt, err, sizeof(err)) == 0);
 
     if (getenv("DS4_TEST_RECOVERY_PROBE") != NULL) {
         /* Diagnostic: print the model's natural tool-call turn for this
@@ -1472,20 +1472,20 @@ static void test_think_tool_recovery(void) {
         buf nat = {0};
         uint64_t prng = 7;
         for (int i = 0; i < 300; i++) {
-            int token = ds4_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &prng);
-            if (token == ds4_token_eos(engine)) break;
+            int token = pulsar_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &prng);
+            if (token == pulsar_token_eos(engine)) break;
             size_t plen = 0;
-            char *p = ds4_token_text(engine, token, &plen);
+            char *p = pulsar_token_text(engine, token, &plen);
             buf_append(&nat, p, plen);
             free(p);
             bool ps = false, pe = false;
             observe_tool_markers(nat.ptr, &ps, &pe, NULL);
             if (pe) break;
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) break;
+            if (pulsar_session_eval(session, token, err, sizeof(err)) != 0) break;
         }
-        fprintf(stderr, "ds4-test: natural turn=[%s]\n", nat.ptr ? nat.ptr : "");
+        fprintf(stderr, "pulsar-test: natural turn=[%s]\n", nat.ptr ? nat.ptr : "");
         buf_free(&nat);
-        ds4_session_free(session);
+        pulsar_session_free(session);
         request_free(&r);
         test_close_engine(false);
         return;
@@ -1497,13 +1497,13 @@ static void test_think_tool_recovery(void) {
     if (!thinking.inside) buf_append(&forced, "<think>", 7);
     const char *body =
         "The user wants a directory listing. I will call the "
-        "list_files tool right away.\n\n" DS4_TOOL_CALLS_START;
+        "list_files tool right away.\n\n" PULSAR_TOOL_CALLS_START;
     buf_append(&forced, body, strlen(body));
 
     server srv;
     memset(&srv, 0, sizeof(srv));
     srv.engine = engine;
-    srv.n_slots = DS4_SESSION_POOL_CAP;
+    srv.n_slots = PULSAR_SESSION_POOL_CAP;
     srv.sess = session;
     srv.slots[0].provisioned = true;
 
@@ -1513,17 +1513,17 @@ static void test_think_tool_recovery(void) {
      * not depend on how the marker happens to be tokenized: recovery must
      * stay quiet on every partial prefix and trigger exactly when the
      * opening completes. */
-    ds4_tokens toks = {0};
-    ds4_tokenize_rendered_chat(engine, forced.ptr, &toks);
+    pulsar_tokens toks = {0};
+    pulsar_tokenize_rendered_chat(engine, forced.ptr, &toks);
     TEST_ASSERT(toks.len > 1);
     size_t scan_from = 0;
     int completion = 0;
     int rec = 0;
     int triggered_at = -1;
     for (int i = 0; i < toks.len; i++) {
-        TEST_ASSERT(ds4_session_eval(session, toks.v[i], err, sizeof(err)) == 0);
+        TEST_ASSERT(pulsar_session_eval(session, toks.v[i], err, sizeof(err)) == 0);
         size_t piece_len = 0;
-        char *piece = ds4_token_text(engine, toks.v[i], &piece_len);
+        char *piece = pulsar_token_text(engine, toks.v[i], &piece_len);
         buf_append(&text, piece, piece_len);
         thinking_state_feed(&thinking, piece, piece_len);
         free(piece);
@@ -1538,11 +1538,11 @@ static void test_think_tool_recovery(void) {
         }
     }
     fprintf(stderr,
-            "ds4-test: think-tool-recovery trigger=%d/%d injected_tokens=%d\n",
+            "pulsar-test: think-tool-recovery trigger=%d/%d injected_tokens=%d\n",
             triggered_at, toks.len, completion);
     TEST_ASSERT(rec == 1);
     TEST_ASSERT(triggered_at == toks.len - 1);
-    ds4_tokens_free(&toks);
+    pulsar_tokens_free(&toks);
     buf_free(&forced);
     TEST_ASSERT(!thinking.inside);
     TEST_ASSERT(completion > 0);
@@ -1555,20 +1555,20 @@ static void test_think_tool_recovery(void) {
     bool saw_start = false;
     bool saw_end = false;
     for (int i = 0; i < 256 && !saw_end; i++) {
-        int token = ds4_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
-        if (token == ds4_token_eos(engine)) break;
+        int token = pulsar_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
+        if (token == pulsar_token_eos(engine)) break;
         size_t piece_len = 0;
-        char *piece = ds4_token_text(engine, token, &piece_len);
+        char *piece = pulsar_token_text(engine, token, &piece_len);
         buf_append(&text, piece, piece_len);
         free(piece);
         observe_tool_markers(text.ptr, &saw_start, &saw_end, NULL);
         if (saw_end) break;
-        if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+        if (pulsar_session_eval(session, token, err, sizeof(err)) != 0) {
             decode_ok = false;
             break;
         }
     }
-    fprintf(stderr, "ds4-test: think-tool-recovery continuation=[%s]\n",
+    fprintf(stderr, "pulsar-test: think-tool-recovery continuation=[%s]\n",
             text.ptr ? text.ptr : "");
     TEST_ASSERT(decode_ok);
     TEST_ASSERT(saw_end);
@@ -1583,20 +1583,20 @@ static void test_think_tool_recovery(void) {
     TEST_ASSERT(reasoning && strstr(reasoning, "list_files tool right away"));
 
     fprintf(stderr,
-            "ds4-test: think-tool-recovery recovered=%d gen_tokens=%d calls=%d name=%s\n",
+            "pulsar-test: think-tool-recovery recovered=%d gen_tokens=%d calls=%d name=%s\n",
             rec, completion, calls.len, calls.len ? calls.v[0].name : "-");
 
     free(content);
     free(reasoning);
     tool_calls_free(&calls);
     buf_free(&text);
-    ds4_session_free(session);
+    pulsar_session_free(session);
     request_free(&r);
     test_close_engine(false);
 }
 
 static void test_tool_call_quality_one(bool quality) {
-    ds4_engine *engine = test_get_engine(quality);
+    pulsar_engine *engine = test_get_engine(quality);
     if (!engine) return;
 
     request r;
@@ -1604,13 +1604,13 @@ static void test_tool_call_quality_one(bool quality) {
     TEST_ASSERT(parse_chat_request(engine, NULL, test_tool_call_request_json(),
                                    512, 32768, &r, err, sizeof(err)));
 
-    ds4_session *session = NULL;
-    TEST_ASSERT(ds4_session_create(&session, engine, 32768) == 0);
+    pulsar_session *session = NULL;
+    TEST_ASSERT(pulsar_session_create(&session, engine, 32768) == 0);
     if (!session) {
         request_free(&r);
         return;
     }
-    TEST_ASSERT(ds4_session_sync(session, &r.prompt, err, sizeof(err)) == 0);
+    TEST_ASSERT(pulsar_session_sync(session, &r.prompt, err, sizeof(err)) == 0);
 
     buf text = {0};
     uint64_t rng = 123;
@@ -1618,15 +1618,15 @@ static void test_tool_call_quality_one(bool quality) {
     bool saw_tool_start = false;
     bool saw_tool_end = false;
     for (int i = 0; i < r.max_tokens; i++) {
-        int token = ds4_session_sample(session, r.temperature, r.top_k,
+        int token = pulsar_session_sample(session, r.temperature, r.top_k,
                                        r.top_p, r.min_p, &rng);
         size_t piece_len = 0;
-        char *piece = ds4_token_text(engine, token, &piece_len);
+        char *piece = pulsar_token_text(engine, token, &piece_len);
         buf_append(&text, piece, piece_len);
         free(piece);
         observe_tool_markers(text.ptr ? text.ptr : "", &saw_tool_start, &saw_tool_end, NULL);
         if (saw_tool_end) break;
-        if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+        if (pulsar_session_eval(session, token, err, sizeof(err)) != 0) {
             decode_ok = false;
             break;
         }
@@ -1646,15 +1646,15 @@ static void test_tool_call_quality_one(bool quality) {
     free(reasoning);
     tool_calls_free(&calls);
     buf_free(&text);
-    ds4_session_free(session);
+    pulsar_session_free(session);
     request_free(&r);
 }
 
 static void test_tool_call_quality(void) {
-    fprintf(stderr, "ds4-test: tool-call quality fast path\n");
+    fprintf(stderr, "pulsar-test: tool-call quality fast path\n");
     test_tool_call_quality_one(false);
     test_close_engine(false);
-    fprintf(stderr, "ds4-test: tool-call quality exact path\n");
+    fprintf(stderr, "pulsar-test: tool-call quality exact path\n");
     test_tool_call_quality_one(true);
     test_close_engine(true);
 }
@@ -1663,7 +1663,7 @@ static void test_tool_call_quality(void) {
 #endif
 
 /* ===== Sampler byte-exactness gate =============================================
- * ds4_sample_dist_build's full-vocab path replaced a qsort over the whole
+ * pulsar_sample_dist_build's full-vocab path replaced a qsort over the whole
  * 129k vocab with a stable radix sort + reused scratch (it ran once per
  * accepted position in the sampled speculative walk, ~10.6 ms a call). The
  * rewrite claims BYTE-EXACT equivalence, which is subtle: the sort's result
@@ -1731,7 +1731,7 @@ static int ref_cand_cmp_desc(const void *a, const void *b) {
  * bounded prob delta; on all other paths it still agrees bit-for-bit. */
 static int ref_sample_dist_build_sortsum(const float *logits, uint32_t n_vocab,
                                          float temperature, int top_k, float top_p, float min_p,
-                                         ds4_sample_dist *out) {
+                                         pulsar_sample_dist *out) {
     memset(out, 0, sizeof(*out));
     if (temperature <= 0.0f) {
         out->ids = (int *)malloc(sizeof(int));
@@ -1828,7 +1828,7 @@ static int ref_sample_dist_build_sortsum(const float *logits, uint32_t n_vocab,
  * would drop, or perturbs order/probs in any way fails the memcmp below. */
 static int ref_sample_dist_build(const float *logits, uint32_t n_vocab,
                                  float temperature, int top_k, float top_p, float min_p,
-                                 ds4_sample_dist *out) {
+                                 pulsar_sample_dist *out) {
     memset(out, 0, sizeof(*out));
     if (temperature <= 0.0f) {
         out->ids = (int *)malloc(sizeof(int));
@@ -1968,7 +1968,7 @@ static int ref_full_vocab(
         float        top_p,
         float        min_p,
         uint64_t    *rng) {
-    float max_logit = DS4_NEG_INF;
+    float max_logit = PULSAR_NEG_INF;
     int best = 0;
     uint32_t finite = 0;
     for (uint32_t i = 0; i < n_vocab; i++) {
@@ -2284,7 +2284,7 @@ static void sampler_warn_if_flush_to_zero(void) {
     __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
     if (fpcr & (1u << 24)) {
         fprintf(stderr,
-                "ds4_test: WARNING: FPCR.FZ is set (fpcr=0x%llx) — this binary was "
+                "pulsar_test: WARNING: FPCR.FZ is set (fpcr=0x%llx) — this binary was "
                 "linked with crtfastmath.o (gcc -ffast-math), so the float reference "
                 "comparator flushes subnormals while the production integer key does "
                 "not. A subnormal-shape id diff below is REFERENCE drift, not a "
@@ -2299,7 +2299,7 @@ static void test_sampler_dist_equivalence(void) {
     float *logits = (float *)malloc((size_t)n * sizeof(float));
     TEST_ASSERT(logits != NULL);
     sampler_warn_if_flush_to_zero();
-    ds4_sample_scratch scratch;
+    pulsar_sample_scratch scratch;
     memset(&scratch, 0, sizeof(scratch));
 
     int checked = 0;
@@ -2308,9 +2308,9 @@ static void test_sampler_dist_equivalence(void) {
         samp_fill_shape(logits, n, shape, &sname);
         for (size_t c = 0; c < sizeof(samp_cfgs) / sizeof(samp_cfgs[0]); c++) {
             const samp_cfg *cfg = &samp_cfgs[c];
-            ds4_sample_dist ref, got;
+            pulsar_sample_dist ref, got;
             ref_sample_dist_build(logits, n, cfg->temp, cfg->top_k, cfg->top_p, cfg->min_p, &ref);
-            ds4_sample_dist_build(logits, n, cfg->temp, cfg->top_k, cfg->top_p, cfg->min_p,
+            pulsar_sample_dist_build(logits, n, cfg->temp, cfg->top_k, cfg->top_p, cfg->min_p,
                                   &scratch, &got);
 
             /* (a) the distribution itself, bit-for-bit */
@@ -2335,15 +2335,15 @@ static void test_sampler_dist_equivalence(void) {
                 const uint64_t seed = 0x5EED0000u + (uint64_t)trial * 7919u;
                 uint64_t r1 = seed, r2 = seed;
                 const int probe = ref.ids[(uint32_t)trial % ref.n];
-                TEST_ASSERT(ds4_sample_dist_accept(&ref, probe, &r1) ==
-                            ds4_sample_dist_accept(&got, probe, &r2));
+                TEST_ASSERT(pulsar_sample_dist_accept(&ref, probe, &r1) ==
+                            pulsar_sample_dist_accept(&got, probe, &r2));
                 TEST_ASSERT(r1 == r2);
-                TEST_ASSERT(ds4_sample_dist_draw(&ref, &r1) == ds4_sample_dist_draw(&got, &r2));
+                TEST_ASSERT(pulsar_sample_dist_draw(&ref, &r1) == pulsar_sample_dist_draw(&got, &r2));
                 TEST_ASSERT(r1 == r2);
-                TEST_ASSERT(ds4_sample_dist_draw_excluding(&ref, probe, &r1) ==
-                            ds4_sample_dist_draw_excluding(&got, probe, &r2));
+                TEST_ASSERT(pulsar_sample_dist_draw_excluding(&ref, probe, &r1) ==
+                            pulsar_sample_dist_draw_excluding(&got, probe, &r2));
                 TEST_ASSERT(r1 == r2);
-                TEST_ASSERT(ds4_sample_dist_prob(&ref, probe) == ds4_sample_dist_prob(&got, probe));
+                TEST_ASSERT(pulsar_sample_dist_prob(&ref, probe) == pulsar_sample_dist_prob(&got, probe));
             }
 
             /* (c) the PLAIN sampling path (sample_full_vocab), pinned against
@@ -2362,8 +2362,8 @@ static void test_sampler_dist_equivalence(void) {
                 TEST_ASSERT(r1 == r2);
             }
 
-            ds4_sample_dist_free(&ref);
-            ds4_sample_dist_free(&got);
+            pulsar_sample_dist_free(&ref);
+            pulsar_sample_dist_free(&got);
             checked++;
         }
     }
@@ -2373,25 +2373,25 @@ static void test_sampler_dist_equivalence(void) {
     {
         const char *sname = "?";
         samp_fill_shape(logits, n, 0, &sname);
-        ds4_sample_dist hot, cold;
-        ds4_sample_scratch fresh;
+        pulsar_sample_dist hot, cold;
+        pulsar_sample_scratch fresh;
         memset(&fresh, 0, sizeof(fresh));
-        ds4_sample_dist_build(logits, n, 1.0f, 40, 1.0f, 0.05f, &fresh, &cold);
-        ds4_sample_dist_free(&cold);
+        pulsar_sample_dist_build(logits, n, 1.0f, 40, 1.0f, 0.05f, &fresh, &cold);
+        pulsar_sample_dist_free(&cold);
         /* now a full-vocab build on a scratch previously sized for top_k=40 */
-        ds4_sample_dist_build(logits, n, 1.0f, 0, 1.0f, 0.05f, &fresh, &hot);
-        ds4_sample_dist_build(logits, n, 1.0f, 0, 1.0f, 0.05f, &scratch, &cold);
+        pulsar_sample_dist_build(logits, n, 1.0f, 0, 1.0f, 0.05f, &fresh, &hot);
+        pulsar_sample_dist_build(logits, n, 1.0f, 0, 1.0f, 0.05f, &scratch, &cold);
         TEST_ASSERT(hot.n == cold.n);
         for (uint32_t i = 0; i < hot.n; i++) {
             TEST_ASSERT(hot.ids[i] == cold.ids[i]);
             TEST_ASSERT(memcmp(&hot.probs[i], &cold.probs[i], sizeof(float)) == 0);
         }
-        ds4_sample_dist_free(&hot);
-        ds4_sample_dist_free(&cold);
-        ds4_sample_scratch_free(&fresh);
+        pulsar_sample_dist_free(&hot);
+        pulsar_sample_dist_free(&cold);
+        pulsar_sample_scratch_free(&fresh);
     }
 
-    ds4_sample_scratch_free(&scratch);
+    pulsar_sample_scratch_free(&scratch);
     free(logits);
     printf("  sampler: %d shape x config combinations byte-exact vs re-derived reference\n",
            checked);
@@ -2400,7 +2400,7 @@ static void test_sampler_dist_equivalence(void) {
 
 
 /* ===== min-p prefilter equivalence gate ========================================
- * The shipped ds4_sample_dist_build (top_k <= 0, min_p > 0) vs the OLD
+ * The shipped pulsar_sample_dist_build (top_k <= 0, min_p > 0) vs the OLD
  * sorted-order-sum semantics (ref_sample_dist_build_sortsum): the survivor
  * SET, ids and order must be IDENTICAL wherever the old top_p crossing is
  * reproducible at all (always when top_p >= 1; see the in-loop comment for
@@ -2420,7 +2420,7 @@ static void test_sampler_prefilter_equivalence(void) {
     float *logits = (float *)malloc((size_t)n * sizeof(float));
     TEST_ASSERT(logits != NULL);
     sampler_warn_if_flush_to_zero();
-    ds4_sample_scratch scratch;
+    pulsar_sample_scratch scratch;
     memset(&scratch, 0, sizeof(scratch));
 
     int checked = 0;
@@ -2432,10 +2432,10 @@ static void test_sampler_prefilter_equivalence(void) {
         samp_fill_shape(logits, n, shape, &sname);
         for (size_t c = 0; c < sizeof(samp_cfgs) / sizeof(samp_cfgs[0]); c++) {
             const samp_cfg *cfg = &samp_cfgs[c];
-            ds4_sample_dist old, got;
+            pulsar_sample_dist old, got;
             ref_sample_dist_build_sortsum(logits, n, cfg->temp, cfg->top_k,
                                           cfg->top_p, cfg->min_p, &old);
-            ds4_sample_dist_build(logits, n, cfg->temp, cfg->top_k,
+            pulsar_sample_dist_build(logits, n, cfg->temp, cfg->top_k,
                                   cfg->top_p, cfg->min_p, &scratch, &got);
             /* MIN-P membership vs the old semantics is identical (the
              * prefilter is a superset under ANY sum and the exact cutoff
@@ -2481,8 +2481,8 @@ static void test_sampler_prefilter_equivalence(void) {
                     max_rel_shifted = rel;
                 }
             }
-            ds4_sample_dist_free(&old);
-            ds4_sample_dist_free(&got);
+            pulsar_sample_dist_free(&old);
+            pulsar_sample_dist_free(&got);
             checked++;
         }
     }
@@ -2545,16 +2545,16 @@ static void test_sampler_prefilter_equivalence(void) {
          * min_prob = (1.0/2.0)*0.5 = 0.25 exact and pr = 0.5/2.0 = 0.25
          * exact: pr == min_prob, and `pr < min_prob` false must INCLUDE both
          * boundary candidates. Old semantics agree bit-for-bit here. */
-        ds4_sample_dist old, got;
-        ds4_sample_dist_build(logits, n, 1.0f, 0, 1.0f, 0.5f, &scratch, &got);
+        pulsar_sample_dist old, got;
+        pulsar_sample_dist_build(logits, n, 1.0f, 0, 1.0f, 0.5f, &scratch, &got);
         ref_sample_dist_build_sortsum(logits, n, 1.0f, 0, 1.0f, 0.5f, &old);
         TEST_ASSERT(got.n == 3);
         TEST_ASSERT(got.ids[0] == 100 && got.ids[1] == 200 && got.ids[2] == 300);
         TEST_ASSERT(old.n == 3 && old.ids[1] == 200 && old.ids[2] == 300);
         for (uint32_t i = 0; i < 3; i++)
             TEST_ASSERT(memcmp(&old.probs[i], &got.probs[i], sizeof(float)) == 0);
-        ds4_sample_dist_free(&old);
-        ds4_sample_dist_free(&got);
+        pulsar_sample_dist_free(&old);
+        pulsar_sample_dist_free(&got);
 
         /* Shape B: add prob = 0.5 - (1..3)ulp at id 400. sum = 2.5 exact both
          * orders; the boundary pair still sits exactly AT min_prob
@@ -2563,7 +2563,7 @@ static void test_sampler_prefilter_equivalence(void) {
          * (within slack) but the exact cutoff must trim it. n == 4 here
          * would mean prefilter slack leaked into membership. */
         logits[400] = L_below;
-        ds4_sample_dist_build(logits, n, 1.0f, 0, 1.0f, 0.5f, &scratch, &got);
+        pulsar_sample_dist_build(logits, n, 1.0f, 0, 1.0f, 0.5f, &scratch, &got);
         ref_sample_dist_build_sortsum(logits, n, 1.0f, 0, 1.0f, 0.5f, &old);
         TEST_ASSERT(got.n == 3);
         TEST_ASSERT(got.ids[0] == 100 && got.ids[1] == 200 && got.ids[2] == 300);
@@ -2572,13 +2572,13 @@ static void test_sampler_prefilter_equivalence(void) {
             TEST_ASSERT(old.ids[i] == got.ids[i]);
             TEST_ASSERT(memcmp(&old.probs[i], &got.probs[i], sizeof(float)) == 0);
         }
-        ds4_sample_dist_free(&old);
-        ds4_sample_dist_free(&got);
+        pulsar_sample_dist_free(&old);
+        pulsar_sample_dist_free(&got);
         printf("  prefilter: boundary teeth: AT-threshold pair included, "
                "ulp-below trimmed post-prefilter\n");
     }
 
-    ds4_sample_scratch_free(&scratch);
+    pulsar_sample_scratch_free(&scratch);
     free(logits);
 }
 
@@ -2594,7 +2594,7 @@ static void test_sampler_prefilter_equivalence(void) {
  * q, including one that proposes tokens p rules out. That is what lets the
  * drafter propose from a temperature-matched q without biasing the output.
  *
- * Also pins the two bugs fixed in ds4_sample_dist_accept_pq / _draw_residual
+ * Also pins the two bugs fixed in pulsar_sample_dist_accept_pq / _draw_residual
  * (see the block comment in tokenizer.c), which are silent-corruption bugs:
  * both emit a *plausible* wrong token, so only a distributional test catches
  * them.
@@ -2602,17 +2602,17 @@ static void test_sampler_prefilter_equivalence(void) {
 #define SPEC_V 64u
 
 /* total (p-q)+ mass, computed independently of _draw_residual's own loop */
-static float spec_residual_mass(const ds4_sample_dist *p, const ds4_sample_dist *q) {
+static float spec_residual_mass(const pulsar_sample_dist *p, const pulsar_sample_dist *q) {
     float m = 0.0f;
     for (uint32_t i = 0; i < p->n; i++) {
-        const float r = p->probs[i] - ds4_sample_dist_prob(q, p->ids[i]);
+        const float r = p->probs[i] - pulsar_sample_dist_prob(q, p->ids[i]);
         if (r > 0.0f) m += r;
     }
     return m;
 }
 
 static void test_spec_pq_math(void) {
-    ds4_sample_scratch scratch;
+    pulsar_sample_scratch scratch;
     memset(&scratch, 0, sizeof(scratch));
     sampler_warn_if_flush_to_zero();
     float pl[SPEC_V], ql[SPEC_V];
@@ -2646,31 +2646,31 @@ static void test_spec_pq_math(void) {
         const int   topk = (trial % 4 == 3) ? 8 : 0;
         const float minp = (trial == 5) ? 0.05f : 0.0f;
 
-        ds4_sample_dist p, q;
-        ds4_sample_dist_build(pl, SPEC_V, temp, topk, topp, minp, &scratch, &p);
-        ds4_sample_dist_build(ql, SPEC_V, temp, topk, topp, minp, &scratch, &q);
+        pulsar_sample_dist p, q;
+        pulsar_sample_dist_build(pl, SPEC_V, temp, topk, topp, minp, &scratch, &p);
+        pulsar_sample_dist_build(ql, SPEC_V, temp, topk, topp, minp, &scratch, &q);
         const float rmass = spec_residual_mass(&p, &q);
 
         memset(counts, 0, sizeof(counts));
         const long N = 400000;
         long accepts = 0, zero_p = 0, zero_resid = 0;
         for (long it = 0; it < N; it++) {
-            const int x = ds4_sample_dist_draw(&q, &rng);
+            const int x = pulsar_sample_dist_draw(&q, &rng);
             int tok;
-            if (ds4_sample_dist_accept_pq(&p, x, ds4_sample_dist_prob(&q, x), &rng)) {
+            if (pulsar_sample_dist_accept_pq(&p, x, pulsar_sample_dist_prob(&q, x), &rng)) {
                 tok = x;
                 accepts++;
             } else {
-                tok = ds4_sample_dist_draw_residual(&p, &q, &scratch, &rng);
+                tok = pulsar_sample_dist_draw_residual(&p, &q, &scratch, &rng);
                 /* bug (b): a residual draw must carry strictly positive
                  * residual mass. Only the mass<=0 fallback (plain draw from p)
                  * is exempt, and it cannot occur while rmass > 0. */
                 if (rmass > 0.0f &&
-                    ds4_sample_dist_prob(&p, tok) - ds4_sample_dist_prob(&q, tok) <= 0.0f)
+                    pulsar_sample_dist_prob(&p, tok) - pulsar_sample_dist_prob(&q, tok) <= 0.0f)
                     zero_resid++;
             }
             /* bug (a): an emitted token must be possible under the target. */
-            if (ds4_sample_dist_prob(&p, tok) <= 0.0f) zero_p++;
+            if (pulsar_sample_dist_prob(&p, tok) <= 0.0f) zero_p++;
             counts[tok]++;
         }
 
@@ -2700,8 +2700,8 @@ static void test_spec_pq_math(void) {
             fails++;
         }
         checked++;
-        ds4_sample_dist_free(&p);
-        ds4_sample_dist_free(&q);
+        pulsar_sample_dist_free(&p);
+        pulsar_sample_dist_free(&q);
     }
 
     /* Deterministic guards for the two reference bugs. The distributional loop
@@ -2716,17 +2716,17 @@ static void test_spec_pq_math(void) {
         samp_seed(0x5AFE01u);
         for (uint32_t i = 0; i < SPEC_V; i++) l[i] = (float)(samp_u01() * 8.0 - 4.0);
         l[0] = 20.0f;                      /* one dominant token */
-        ds4_sample_dist p;
+        pulsar_sample_dist p;
         /* top_p=0.5 with a dominant token => a small nucleus, so most of the
          * vocab sits strictly outside it with p(x) == 0. */
-        ds4_sample_dist_build(l, SPEC_V, 1.0f, 0, 0.5f, 0.0f, &scratch, &p);
+        pulsar_sample_dist_build(l, SPEC_V, 1.0f, 0, 0.5f, 0.0f, &scratch, &p);
         int off = -1;
         for (uint32_t i = 0; i < SPEC_V && off < 0; i++)
-            if (ds4_sample_dist_prob(&p, (int)i) <= 0.0f) off = (int)i;
+            if (pulsar_sample_dist_prob(&p, (int)i) <= 0.0f) off = (int)i;
         TEST_ASSERT(off >= 0);
 
         uint64_t r_before = 0xD15EA5Eull, r_after = 0xD15EA5Eull;
-        const int acc = ds4_sample_dist_accept_pq(&p, off, 0.5f, &r_after);
+        const int acc = pulsar_sample_dist_accept_pq(&p, off, 0.5f, &r_after);
         TEST_ASSERT(acc == 0);             /* bug (a): p(x)==0 is never accepted */
         TEST_ASSERT(r_after == r_before);  /* ...and the guard fired before the rng */
 
@@ -2735,10 +2735,10 @@ static void test_spec_pq_math(void) {
          * masses of 1.0 at the argmax. */
         r_after = r_before;
         const float pmode = p.probs[0];
-        const int acc2 = ds4_sample_dist_accept_pq(&p, p.ids[0], pmode * 0.5f, &r_after);
+        const int acc2 = pulsar_sample_dist_accept_pq(&p, p.ids[0], pmode * 0.5f, &r_after);
         TEST_ASSERT(acc2 == 1);
         TEST_ASSERT(r_after == r_before);
-        ds4_sample_dist_free(&p);
+        pulsar_sample_dist_free(&p);
     }
     {
         /* bug (b): the residual must never return a zero-(p-q)+ token. Build a
@@ -2749,31 +2749,31 @@ static void test_spec_pq_math(void) {
         samp_seed(0x5AFE02u);
         for (uint32_t i = 0; i < SPEC_V; i++) pl2[i] = (float)(samp_u01() * 4.0 - 2.0);
         memcpy(ql2, pl2, sizeof(pl2));
-        ds4_sample_dist p2, q2;
-        ds4_sample_dist_build(pl2, SPEC_V, 1.0f, 4, 1.0f, 0.0f, &scratch, &p2);
+        pulsar_sample_dist p2, q2;
+        pulsar_sample_dist_build(pl2, SPEC_V, 1.0f, 4, 1.0f, 0.0f, &scratch, &p2);
         /* q2 == p2 on the tail but heavier there => tail residual is <= 0 */
         ql2[p2.ids[p2.n - 1]] += 3.0f;
-        ds4_sample_dist_build(ql2, SPEC_V, 1.0f, 4, 1.0f, 0.0f, &scratch, &q2);
+        pulsar_sample_dist_build(ql2, SPEC_V, 1.0f, 4, 1.0f, 0.0f, &scratch, &q2);
         const int tail = p2.ids[p2.n - 1];
-        TEST_ASSERT(ds4_sample_dist_prob(&p2, tail) -
-                    ds4_sample_dist_prob(&q2, tail) <= 0.0f);
+        TEST_ASSERT(pulsar_sample_dist_prob(&p2, tail) -
+                    pulsar_sample_dist_prob(&q2, tail) <= 0.0f);
         uint64_t r2 = 777;
         int tail_emits = 0;
         for (int it = 0; it < 200000; it++) {
-            const int tok = ds4_sample_dist_draw_residual(&p2, &q2, &scratch, &r2);
+            const int tok = pulsar_sample_dist_draw_residual(&p2, &q2, &scratch, &r2);
             if (tok == tail) tail_emits++;
-            if (ds4_sample_dist_prob(&p2, tok) <= 0.0f) tail_emits++;
+            if (pulsar_sample_dist_prob(&p2, tok) <= 0.0f) tail_emits++;
         }
         if (tail_emits)
             printf("  spec-math: residual emitted a zero-residual token %d times\n",
                    tail_emits);
         TEST_ASSERT(tail_emits == 0);
-        ds4_sample_dist_free(&p2);
-        ds4_sample_dist_free(&q2);
+        pulsar_sample_dist_free(&p2);
+        pulsar_sample_dist_free(&q2);
     }
 
     TEST_ASSERT(fails == 0);
-    ds4_sample_scratch_free(&scratch);
+    pulsar_sample_scratch_free(&scratch);
     printf("  spec-math: %d p/q accept+residual trials reproduce the target "
            "distribution; p=0 reject and zero-residual guards pinned\n", checked);
 }
@@ -2786,7 +2786,7 @@ static void test_spec_pq_math(void) {
  * (gen_resolve_sampling in generate.c) can distinguish "explicitly 1.0" from
  * "absent". Parse-only; the engine is used just to tokenize the prompt. */
 static void test_api_sampling_presence_flags(void) {
-    ds4_engine *engine = test_get_engine(false);
+    pulsar_engine *engine = test_get_engine(false);
     if (!engine) return;
     char err[160];
     request r;
@@ -2806,10 +2806,10 @@ static void test_api_sampling_presence_flags(void) {
     TEST_ASSERT(parse_chat_request(engine, NULL,
         "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
         128, 32768, &r, err, sizeof(err)));
-    TEST_ASSERT(!r.has_temperature && r.temperature == DS4_DEFAULT_TEMPERATURE);
+    TEST_ASSERT(!r.has_temperature && r.temperature == PULSAR_DEFAULT_TEMPERATURE);
     TEST_ASSERT(!r.has_top_k && r.top_k == 0);
-    TEST_ASSERT(!r.has_top_p && r.top_p == DS4_DEFAULT_TOP_P);
-    TEST_ASSERT(!r.has_min_p && r.min_p == DS4_DEFAULT_MIN_P);
+    TEST_ASSERT(!r.has_top_p && r.top_p == PULSAR_DEFAULT_TOP_P);
+    TEST_ASSERT(!r.has_min_p && r.min_p == PULSAR_DEFAULT_MIN_P);
     request_free(&r);
 
     /* Anthropic messages: temperature/top_p/top_k (the API has no min_p) */
@@ -2820,7 +2820,7 @@ static void test_api_sampling_presence_flags(void) {
     TEST_ASSERT(r.has_temperature && r.temperature == 0.35f);
     TEST_ASSERT(r.has_top_k && r.top_k == 40);
     TEST_ASSERT(r.has_top_p && r.top_p == 0.9f);
-    TEST_ASSERT(!r.has_min_p && r.min_p == DS4_DEFAULT_MIN_P);
+    TEST_ASSERT(!r.has_min_p && r.min_p == PULSAR_DEFAULT_MIN_P);
     request_free(&r);
 
     /* Responses: temperature/top_p */
@@ -2838,10 +2838,10 @@ static void test_api_sampling_presence_flags(void) {
         "{\"prompt\":\"hi\",\"temperature\":1.0,\"top_k\":0,"
         "\"top_p\":1.0,\"min_p\":0.05}",
         128, 32768, &r, err, sizeof(err)));
-    TEST_ASSERT(r.has_temperature && r.temperature == DS4_DEFAULT_TEMPERATURE);
+    TEST_ASSERT(r.has_temperature && r.temperature == PULSAR_DEFAULT_TEMPERATURE);
     TEST_ASSERT(r.has_top_k && r.top_k == 0);
-    TEST_ASSERT(r.has_top_p && r.top_p == DS4_DEFAULT_TOP_P);
-    TEST_ASSERT(r.has_min_p && r.min_p == DS4_DEFAULT_MIN_P);
+    TEST_ASSERT(r.has_top_p && r.top_p == PULSAR_DEFAULT_TOP_P);
+    TEST_ASSERT(r.has_min_p && r.min_p == PULSAR_DEFAULT_MIN_P);
     request_free(&r);
 }
 
@@ -2852,10 +2852,10 @@ static void test_api_sampling_presence_flags(void) {
  * convention in the engine samplers; unvalidated, min_p > 1 silently
  * collapsed sampling to greedy.  In-range values pass through untouched,
  * and the presence flag is set either way (the client DID send it, so
- * think-mode defaulting must not re-assert DS4_DEFAULT_MIN_P).  Covers
+ * think-mode defaulting must not re-assert PULSAR_DEFAULT_MIN_P).  Covers
  * both surfaces that parse min_p (OpenAI chat + legacy completions). */
 static void test_api_min_p_range_validation(void) {
-    ds4_engine *engine = test_get_engine(false);
+    pulsar_engine *engine = test_get_engine(false);
     if (!engine) return;
     char err[160];
     request r;
@@ -2899,7 +2899,7 @@ static void test_api_min_p_range_validation(void) {
 
 
 static void test_server_unit_group(void) {
-    ds4_server_unit_tests_run();
+    pulsar_server_unit_tests_run();
 }
 
 typedef void (*test_fn)(void);
@@ -2909,10 +2909,10 @@ typedef struct {
     const char *name;
     const char *desc;
     test_fn fn;
-} ds4_test_entry;
+} pulsar_test_entry;
 
-static const ds4_test_entry test_entries[] = {
-#ifndef DS4_NO_GPU
+static const pulsar_test_entry test_entries[] = {
+#ifndef PULSAR_NO_GPU
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
     {"--think-tool-recovery", "think-tool-recovery", "forced </think> recovery when a tool call starts inside thinking", test_think_tool_recovery},
@@ -2940,7 +2940,7 @@ static void test_print_help(const char *prog) {
     }
     puts("  --list");
     puts("      Print test names only.");
-#ifndef DS4_NO_GPU
+#ifndef PULSAR_NO_GPU
     puts("  --mpp-equivalence");
     puts("      Compatibility alias for --tensor-equivalence.");
 #endif
@@ -2953,8 +2953,8 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
 }
 
-static const ds4_test_entry *test_find_entry(const char *arg) {
-#ifndef DS4_NO_GPU
+static const pulsar_test_entry *test_find_entry(const char *arg) {
+#ifndef PULSAR_NO_GPU
     if (!strcmp(arg, "--mpp-equivalence")) {
         arg = "--tensor-equivalence";
     }
@@ -2975,14 +2975,14 @@ static const ds4_test_entry *test_find_entry(const char *arg) {
  *   down-sum uses float atomics (nondeterministic order); see the
  *   determinism item in the release notes. Internal-correctness gates
  *   (tensor-equivalence, golden vectors, server, ...) remain gating. */
-static bool test_entry_is_informational(const ds4_test_entry *entry) {
+static bool test_entry_is_informational(const pulsar_test_entry *entry) {
     return !strcmp(entry->name, "logprob-vectors") ||
            !strcmp(entry->name, "think-tool-recovery");
 }
 
 static int test_informational_failures;
 
-static void test_run_entry(const ds4_test_entry *entry) {
+static void test_run_entry(const pulsar_test_entry *entry) {
     int before = test_failures;
     fprintf(stderr, "%s:\n", entry->name);
     entry->fn();
@@ -2991,12 +2991,12 @@ static void test_run_entry(const ds4_test_entry *entry) {
     if (delta != 0 && test_entry_is_informational(entry)) {
         test_failures = before;
         test_informational_failures += delta;
-        ds4_log(stderr, DS4_LOG_WARNING,
+        pulsar_log(stderr, PULSAR_LOG_WARNING,
                 "INFORMATIONAL (%d expected-parity/flaky mismatches, non-gating)",
                 delta);
     } else {
-        ds4_log(stderr,
-                delta == 0 ? DS4_LOG_OK : DS4_LOG_ERROR,
+        pulsar_log(stderr,
+                delta == 0 ? PULSAR_LOG_OK : PULSAR_LOG_ERROR,
                 "%s",
                 delta == 0 ? "OK" : "ERR");
     }
@@ -3019,9 +3019,9 @@ int main(int argc, char **argv) {
             test_print_help(argv[0]);
             return 0;
         } else {
-            const ds4_test_entry *entry = test_find_entry(argv[i]);
+            const pulsar_test_entry *entry = test_find_entry(argv[i]);
             if (!entry) {
-                fprintf(stderr, "ds4-test: unknown test switch: %s\n", argv[i]);
+                fprintf(stderr, "pulsar-test: unknown test switch: %s\n", argv[i]);
                 test_print_help(argv[0]);
                 return 2;
             }
@@ -3039,21 +3039,21 @@ int main(int argc, char **argv) {
         }
     }
 
-#ifndef DS4_NO_GPU
+#ifndef PULSAR_NO_GPU
     test_close_engines();
 #endif
 
     if (test_failures) {
-        fprintf(stderr, "ds4 tests: %d failure(s)\n", test_failures);
+        fprintf(stderr, "pulsar tests: %d failure(s)\n", test_failures);
         return 1;
     }
     if (test_informational_failures) {
         fprintf(stderr,
-                "ds4 tests: PASS (%d informational mismatches: official-parity "
+                "pulsar tests: PASS (%d informational mismatches: official-parity "
                 "on the 2-bit model and/or the known-flaky recovery case)\n",
                 test_informational_failures);
         return 0;
     }
-    puts("ds4 tests: ok");
+    puts("pulsar tests: ok");
     return 0;
 }

@@ -1,13 +1,13 @@
 /* Tier-2 ACCOUNTING-EXACTNESS gate (task #55 overcommit/preemption, increment 1).
  *
- * Proves the exact-frontier touched-KV number (ds4_session_touched_kv_bytes /
+ * Proves the exact-frontier touched-KV number (pulsar_session_touched_kv_bytes /
  * gpu_graph_touched_kv_bytes) that the increment-2 eviction guard will TRIGGER
  * on can be trusted: it must track the REAL physical footprint of the
  * demand-paged comp/index caches, measured independently via cudaMemGetInfo
- * (ds4_gpu_mem_info) on GB10 unified memory.
+ * (pulsar_gpu_mem_info) on GB10 unified memory.
  *
  * METHOD.  A pooled session (comp/index are cudaMallocManaged, physical on
- * touch — DS4_MSEQ_BANKS>=2) has bank 0 prefilled through INCREASING fill
+ * touch — PULSAR_MSEQ_BANKS>=2) has bank 0 prefilled through INCREASING fill
  * levels.  At each level we read BOTH (a) the frontier-derived touched-KV and
  * (b) cudaMemGetInfo free.  We compare the INCREMENTAL deltas between
  * consecutive levels:
@@ -29,12 +29,12 @@
  * `make test`.  Increment 1 keeps fills MODEST (default peak ~64k tokens,
  * ~1-2 GiB physical) — well under budget; it does not exercise eviction.
  *
- * usage: DS4_MSEQ_BANKS=2 ./tests/accounting_gate MODEL [L1 L2 L3 ...]
+ * usage: PULSAR_MSEQ_BANKS=2 ./tests/accounting_gate MODEL [L1 L2 L3 ...]
  *        (levels in tokens, ascending; default 8192 24576 65536)
  */
-#include "ds4.h"
-#include "ds4_engine_internal.h"
-#include "ds4_gpu.h"
+#include "pulsar.h"
+#include "pulsar_engine_internal.h"
+#include "pulsar_gpu.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -76,33 +76,33 @@ int main(int argc, char **argv) {
     const int peak = levels[n_levels - 1];
     const int ctx = peak + 4096;   /* headroom over the deepest fill */
 
-    ds4_engine *e = NULL;
-    ds4_engine_options opt;
+    pulsar_engine *e = NULL;
+    pulsar_engine_options opt;
     memset(&opt, 0, sizeof(opt));
     opt.model_path = argv[1];
-    opt.backend = DS4_BACKEND_CUDA;
-    if (ds4_engine_open(&e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
+    opt.backend = PULSAR_BACKEND_CUDA;
+    if (pulsar_engine_open(&e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
 
     /* Base tokens to tile the long fill from (content is irrelevant to the
      * comp/index physical footprint — the frontier is position-driven). */
     size_t text_len = 0;
     char *text = read_file("tests/long_context_story_prompt.txt", &text_len);
     if (!text) { fprintf(stderr, "prompt file read failed\n"); return 1; }
-    ds4_tokens base;
+    pulsar_tokens base;
     memset(&base, 0, sizeof(base));
-    ds4_tokenize_text(e, text, &base);
+    pulsar_tokenize_text(e, text, &base);
     free(text);
     if (base.len < 256) { fprintf(stderr, "prompt too short\n"); return 1; }
 
-    ds4_session *s = NULL;
-    if (ds4_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session create failed\n"); return 1; }
+    pulsar_session *s = NULL;
+    if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session create failed\n"); return 1; }
 
     const uint32_t pool = gpu_graph_bank_pool_count(&s->graph);
     fprintf(stderr, "accounting_gate: pool banks=%u ctx=%d peak=%d "
                     "attn_row=%" PRIu64 " idx_row=%" PRIu64 "\n",
             pool, ctx, peak, gpu_graph_attn_comp_cache_row_bytes(),
-            gpu_graph_idx_fp4_enabled() ? DS4_ENGINE_IDXFP4_ROWBYTES
-                                        : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+            gpu_graph_idx_fp4_enabled() ? PULSAR_ENGINE_IDXFP4_ROWBYTES
+                                        : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float));
     if (pool < 2) {
         fprintf(stderr, "accounting_gate: WARNING pool<2 — comp/index may be "
                         "device-resident (not demand-paged); set DS4_MSEQ_BANKS>=2\n");
@@ -124,27 +124,27 @@ int main(int argc, char **argv) {
     if (n_levels < 2) { fprintf(stderr, "accounting_gate: need >=2 fill levels\n"); return 2; }
     {
         const int warm = levels[0];
-        ds4_tokens p;
+        pulsar_tokens p;
         memset(&p, 0, sizeof(p));
         p.v = toks;
         p.len = p.cap = warm;
         char err[256];
-        if (ds4_session_sync(s, &p, err, sizeof(err)) != 0) {
+        if (pulsar_session_sync(s, &p, err, sizeof(err)) != 0) {
             fprintf(stderr, "accounting_gate: warmup sync to %d failed: %s\n", warm, err);
             return 1;
         }
         gpu_graph_bank_counters_capture(&s->graph, s->graph.banks.n_banks ? s->graph.banks.cur_bank : 0);
-        (void)ds4_gpu_synchronize();
+        (void)pulsar_gpu_synchronize();
         fprintf(stderr, "accounting_gate: warmup prefill %d tokens done\n", warm);
     }
 
     uint64_t free_prev = 0, total0 = 0;
     uint64_t touched_prev = 0;
     uint64_t free0 = 0;
-    (void)ds4_gpu_synchronize();
-    ds4_gpu_mem_info(&free0, &total0);
+    (void)pulsar_gpu_synchronize();
+    pulsar_gpu_mem_info(&free0, &total0);
     free_prev = free0;
-    touched_prev = ds4_session_touched_kv_bytes(s);
+    touched_prev = pulsar_session_touched_kv_bytes(s);
     const uint64_t touched_base0 = touched_prev;
 
     int fail = 0;
@@ -153,12 +153,12 @@ int main(int argc, char **argv) {
 
     for (int i = 1; i < n_levels; i++) {   /* level 0 is the warm baseline */
         const int len = levels[i];
-        ds4_tokens p;
+        pulsar_tokens p;
         memset(&p, 0, sizeof(p));
         p.v = toks;               /* prefix [0,len) of the tiled buffer */
         p.len = p.cap = len;
         char err[256];
-        if (ds4_session_sync(s, &p, err, sizeof(err)) != 0) {
+        if (pulsar_session_sync(s, &p, err, sizeof(err)) != 0) {
             fprintf(stderr, "accounting_gate: sync to %d failed: %s\n", len, err);
             fail = 1;
             break;
@@ -166,11 +166,11 @@ int main(int argc, char **argv) {
         /* Capture the current bank's frontier so idle-bank readers agree; the
          * touched getter already uses the live layer_n_comp for the cur bank. */
         gpu_graph_bank_counters_capture(&s->graph, s->graph.banks.n_banks ? s->graph.banks.cur_bank : 0);
-        (void)ds4_gpu_synchronize();
+        (void)pulsar_gpu_synchronize();
 
         uint64_t free_now = 0, total_now = 0;
-        ds4_gpu_mem_info(&free_now, &total_now);
-        const uint64_t touched = ds4_session_touched_kv_bytes(s);
+        pulsar_gpu_mem_info(&free_now, &total_now);
+        const uint64_t touched = pulsar_session_touched_kv_bytes(s);
 
         const int64_t phys_delta = (int64_t)free_prev - (int64_t)free_now;      /* physical grew */
         const int64_t touched_delta = (int64_t)touched - (int64_t)touched_prev; /* frontier grew */
@@ -223,9 +223,9 @@ int main(int argc, char **argv) {
      * total physical the run consumed. */
     {
         uint64_t free_now = 0, total_now = 0;
-        ds4_gpu_mem_info(&free_now, &total_now);
+        pulsar_gpu_mem_info(&free_now, &total_now);
         const uint64_t phys_used = free0 > free_now ? free0 - free_now : 0;
-        const uint64_t touched = ds4_session_touched_kv_bytes(s);
+        const uint64_t touched = pulsar_session_touched_kv_bytes(s);
         const uint64_t touched_grown = touched - touched_base0;   /* since warm baseline */
         const int ok = touched_grown <= phys_used + (uint64_t)(256ull * 1024 * 1024);
         if (!ok) fail = 1;
@@ -242,22 +242,22 @@ int main(int argc, char **argv) {
      * LAST (the session is torn down right after); the freed slots are nulled so
      * gpu_graph_free does not double-free. */
     if (s->graph.banks.n_banks) {
-        ds4_gpu_graph *g = &s->graph;
-        (void)ds4_gpu_synchronize();
-        const uint64_t touched_bank0 = ds4_session_touched_kv_bytes(s); /* only bank 0 prefilled */
+        pulsar_gpu_graph *g = &s->graph;
+        (void)pulsar_gpu_synchronize();
+        const uint64_t touched_bank0 = pulsar_session_touched_kv_bytes(s); /* only bank 0 prefilled */
         uint64_t f_before = 0, tt = 0;
-        ds4_gpu_mem_info(&f_before, &tt);
-        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-            ds4_gpu_tensor_free(g->banks.comp[il][0]);
+        pulsar_gpu_mem_info(&f_before, &tt);
+        for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+            pulsar_gpu_tensor_free(g->banks.comp[il][0]);
             g->banks.comp[il][0] = NULL;
-            if (ds4_layer_compress_ratio(il) == 4) {
-                ds4_gpu_tensor_free(g->banks.index[il][0]);
+            if (pulsar_layer_compress_ratio(il) == 4) {
+                pulsar_gpu_tensor_free(g->banks.index[il][0]);
                 g->banks.index[il][0] = NULL;
             }
         }
-        (void)ds4_gpu_synchronize();
+        (void)pulsar_gpu_synchronize();
         uint64_t f_after = 0;
-        ds4_gpu_mem_info(&f_after, &tt);
+        pulsar_gpu_mem_info(&f_after, &tt);
         const int64_t reclaimed = (int64_t)f_after - (int64_t)f_before;
         /* Physical returned must be ~the bank's touched comp/index (page-rounded);
          * require it be POSITIVE and within tolerance of touched (not zero — the

@@ -1,4 +1,4 @@
-#include "ds4_engine_internal.h"
+#include "pulsar_engine_internal.h"
 
 
 
@@ -54,7 +54,7 @@ static const gguf_type_info gguf_types[] = {
     /* MXFP8_LT (pre-stored MXFP8): de-interleaved E4M3 data + swizzled E8M0
      * scale. For the shipped 128-aligned shapes the total byte size equals the
      * type-38 size (out*(in/32)*33), so it reuses the {32,33} accounting here
-     * and loads/mmaps through the generic path. See DS4_TENSOR_MXFP8_LT. */
+     * and loads/mmaps through the generic path. See PULSAR_TENSOR_MXFP8_LT. */
     /*41*/ {"mxfp8_lt", 32, 33},
 };
 
@@ -87,7 +87,7 @@ static uint64_t scalar_value_size(uint32_t type) {
 
 
 
-static bool skip_value(ds4_cursor *c, uint32_t type, int depth) {
+static bool skip_value(pulsar_cursor *c, uint32_t type, int depth) {
     if (depth > 8) {
         cursor_error(c, "metadata array nesting is too deep");
         return false;
@@ -97,7 +97,7 @@ static bool skip_value(ds4_cursor *c, uint32_t type, int depth) {
     if (scalar != 0) return cursor_skip(c, scalar);
 
     if (type == GGUF_VALUE_STRING) {
-        ds4_str ignored;
+        pulsar_str ignored;
         return cursor_string(c, &ignored);
     }
 
@@ -175,8 +175,8 @@ void cutlass_mxfp4_expert_layout(uint64_t k, uint64_t n,
 
 
 
-ds4_cursor cursor_at(const ds4_model *m, uint64_t pos) {
-    ds4_cursor c = {
+pulsar_cursor cursor_at(const pulsar_model *m, uint64_t pos) {
+    pulsar_cursor c = {
         .base = m->map,
         .size = m->size,
         .pos = pos,
@@ -187,46 +187,46 @@ ds4_cursor cursor_at(const ds4_model *m, uint64_t pos) {
 
 
 
-static ds4_kv *model_find_kv(const ds4_model *m, const char *key) {
+static pulsar_kv *model_find_kv(const pulsar_model *m, const char *key) {
     for (uint64_t i = 0; i < m->n_kv; i++) {
-        if (ds4_streq(m->kv[i].key, key)) return &m->kv[i];
+        if (pulsar_streq(m->kv[i].key, key)) return &m->kv[i];
     }
     return NULL;
 }
 
 
 
-static bool model_get_string(const ds4_model *m, const char *key, ds4_str *out) {
-    ds4_kv *kv = model_find_kv(m, key);
+static bool model_get_string(const pulsar_model *m, const char *key, pulsar_str *out) {
+    pulsar_kv *kv = model_find_kv(m, key);
     if (!kv || kv->type != GGUF_VALUE_STRING) return false;
-    ds4_cursor c = cursor_at(m, kv->value_pos);
+    pulsar_cursor c = cursor_at(m, kv->value_pos);
     return cursor_string(&c, out);
 }
 
 
 
-bool model_get_u32(const ds4_model *m, const char *key, uint32_t *out) {
-    ds4_kv *kv = model_find_kv(m, key);
+bool model_get_u32(const pulsar_model *m, const char *key, uint32_t *out) {
+    pulsar_kv *kv = model_find_kv(m, key);
     if (!kv || kv->type != GGUF_VALUE_UINT32) return false;
-    ds4_cursor c = cursor_at(m, kv->value_pos);
+    pulsar_cursor c = cursor_at(m, kv->value_pos);
     return cursor_u32(&c, out);
 }
 
 
 
-static bool model_get_u64(const ds4_model *m, const char *key, uint64_t *out) {
-    ds4_kv *kv = model_find_kv(m, key);
+static bool model_get_u64(const pulsar_model *m, const char *key, uint64_t *out) {
+    pulsar_kv *kv = model_find_kv(m, key);
     if (!kv || kv->type != GGUF_VALUE_UINT64) return false;
-    ds4_cursor c = cursor_at(m, kv->value_pos);
+    pulsar_cursor c = cursor_at(m, kv->value_pos);
     return cursor_u64(&c, out);
 }
 
 
 
-bool model_get_u64_compat(const ds4_model *m, const char *key, uint64_t *out) {
-    ds4_kv *kv = model_find_kv(m, key);
+bool model_get_u64_compat(const pulsar_model *m, const char *key, uint64_t *out) {
+    pulsar_kv *kv = model_find_kv(m, key);
     if (!kv) return false;
-    ds4_cursor c = cursor_at(m, kv->value_pos);
+    pulsar_cursor c = cursor_at(m, kv->value_pos);
     if (kv->type == GGUF_VALUE_UINT64) {
         return cursor_u64(&c, out);
     }
@@ -241,10 +241,10 @@ bool model_get_u64_compat(const ds4_model *m, const char *key, uint64_t *out) {
 
 
 
-bool model_get_f32_compat(const ds4_model *m, const char *key, float *out) {
-    ds4_kv *kv = model_find_kv(m, key);
+bool model_get_f32_compat(const pulsar_model *m, const char *key, float *out) {
+    pulsar_kv *kv = model_find_kv(m, key);
     if (!kv) return false;
-    ds4_cursor c = cursor_at(m, kv->value_pos);
+    pulsar_cursor c = cursor_at(m, kv->value_pos);
     if (kv->type == GGUF_VALUE_FLOAT32) {
         return cursor_read(&c, out, sizeof(*out));
     }
@@ -271,10 +271,10 @@ bool model_get_f32_compat(const ds4_model *m, const char *key, float *out) {
 
 
 
-bool model_get_bool(const ds4_model *m, const char *key, bool *out) {
-    ds4_kv *kv = model_find_kv(m, key);
+bool model_get_bool(const pulsar_model *m, const char *key, bool *out) {
+    pulsar_kv *kv = model_find_kv(m, key);
     if (!kv || kv->type != GGUF_VALUE_BOOL) return false;
-    ds4_cursor c = cursor_at(m, kv->value_pos);
+    pulsar_cursor c = cursor_at(m, kv->value_pos);
     uint8_t v = 0;
     if (!cursor_read(&c, &v, sizeof(v))) return false;
     *out = v != 0;
@@ -283,11 +283,11 @@ bool model_get_bool(const ds4_model *m, const char *key, bool *out) {
 
 
 
-bool model_get_array(const ds4_model *m, const char *key, ds4_array_ref *out) {
-    ds4_kv *kv = model_find_kv(m, key);
+bool model_get_array(const pulsar_model *m, const char *key, pulsar_array_ref *out) {
+    pulsar_kv *kv = model_find_kv(m, key);
     if (!kv || kv->type != GGUF_VALUE_ARRAY) return false;
 
-    ds4_cursor c = cursor_at(m, kv->value_pos);
+    pulsar_cursor c = cursor_at(m, kv->value_pos);
     if (!cursor_u32(&c, &out->type)) return false;
     if (!cursor_u64(&c, &out->len)) return false;
     out->data_pos = c.pos;
@@ -296,7 +296,7 @@ bool model_get_array(const ds4_model *m, const char *key, ds4_array_ref *out) {
 
 
 
-void model_close(ds4_model *m) {
+void model_close(pulsar_model *m) {
     if (!m) return;
     free(m->kv);
     free(m->tensors);
@@ -308,7 +308,7 @@ void model_close(ds4_model *m) {
 
 
 
-static void model_prefetch_cpu_mapping(const ds4_model *m) {
+static void model_prefetch_cpu_mapping(const pulsar_model *m) {
     if (!m || !m->map || m->size == 0) return;
 
     /*
@@ -322,9 +322,9 @@ static void model_prefetch_cpu_mapping(const ds4_model *m) {
 #if defined(POSIX_MADV_WILLNEED)
     const int rc = posix_madvise((void *)m->map, (size_t)m->size, POSIX_MADV_WILLNEED);
     if (rc != 0) {
-        ds4_log(stderr,
-                DS4_LOG_WARNING,
-                "ds4: warning: POSIX_MADV_WILLNEED failed for CPU model mapping: %s\n",
+        pulsar_log(stderr,
+                PULSAR_LOG_WARNING,
+                "pulsar: warning: POSIX_MADV_WILLNEED failed for CPU model mapping: %s\n",
                 strerror(rc));
     }
 #else
@@ -336,31 +336,31 @@ static void model_prefetch_cpu_mapping(const ds4_model *m) {
 
 /* Read the GGUF metadata table.  Values stay in the mmap; we store offsets so
  * later validation can decode only the keys it needs. */
-static void parse_metadata(ds4_model *m, ds4_cursor *c) {
-    m->kv = (ds4_kv *)calloc((size_t)m->n_kv, sizeof(m->kv[0]));
-    if (!m->kv) ds4_die("out of memory while allocating metadata table");
+static void parse_metadata(pulsar_model *m, pulsar_cursor *c) {
+    m->kv = (pulsar_kv *)calloc((size_t)m->n_kv, sizeof(m->kv[0]));
+    if (!m->kv) pulsar_die("out of memory while allocating metadata table");
 
     m->alignment = 32;
 
     for (uint64_t i = 0; i < m->n_kv; i++) {
-        ds4_kv *kv = &m->kv[i];
+        pulsar_kv *kv = &m->kv[i];
 
-        if (!cursor_string(c, &kv->key)) ds4_die(c->error);
-        if (!cursor_u32(c, &kv->type)) ds4_die(c->error);
+        if (!cursor_string(c, &kv->key)) pulsar_die(c->error);
+        if (!cursor_u32(c, &kv->type)) pulsar_die(c->error);
 
         kv->value_pos = c->pos;
 
-        if (ds4_streq(kv->key, "general.alignment") &&
+        if (pulsar_streq(kv->key, "general.alignment") &&
             kv->type == GGUF_VALUE_UINT32)
         {
-            ds4_cursor tmp = cursor_at(m, kv->value_pos);
+            pulsar_cursor tmp = cursor_at(m, kv->value_pos);
             uint32_t alignment;
             if (cursor_u32(&tmp, &alignment) && alignment != 0) {
                 m->alignment = alignment;
             }
         }
 
-        if (!skip_value(c, kv->type, 0)) ds4_die(c->error);
+        if (!skip_value(c, kv->type, 0)) pulsar_die(c->error);
     }
 }
 
@@ -368,43 +368,43 @@ static void parse_metadata(ds4_model *m, ds4_cursor *c) {
 
 /* Read the tensor directory and convert relative GGUF offsets to absolute
  * mmap offsets.  Tensor bytes are still never copied here. */
-static void parse_tensors(ds4_model *m, ds4_cursor *c) {
-    m->tensors = (ds4_tensor *)calloc((size_t)m->n_tensors, sizeof(m->tensors[0]));
-    if (!m->tensors) ds4_die("out of memory while allocating tensor table");
+static void parse_tensors(pulsar_model *m, pulsar_cursor *c) {
+    m->tensors = (pulsar_tensor *)calloc((size_t)m->n_tensors, sizeof(m->tensors[0]));
+    if (!m->tensors) pulsar_die("out of memory while allocating tensor table");
 
     for (uint64_t i = 0; i < m->n_tensors; i++) {
-        ds4_tensor *t = &m->tensors[i];
+        pulsar_tensor *t = &m->tensors[i];
 
-        if (!cursor_string(c, &t->name)) ds4_die(c->error);
-        if (!cursor_u32(c, &t->ndim)) ds4_die(c->error);
-        if (t->ndim == 0 || t->ndim > DS4_MAX_DIMS) {
-            ds4_die("tensor has an unsupported number of dimensions");
+        if (!cursor_string(c, &t->name)) pulsar_die(c->error);
+        if (!cursor_u32(c, &t->ndim)) pulsar_die(c->error);
+        if (t->ndim == 0 || t->ndim > PULSAR_MAX_DIMS) {
+            pulsar_die("tensor has an unsupported number of dimensions");
         }
 
         t->elements = 1;
         for (uint32_t d = 0; d < t->ndim; d++) {
-            if (!cursor_u64(c, &t->dim[d])) ds4_die(c->error);
+            if (!cursor_u64(c, &t->dim[d])) pulsar_die(c->error);
             if (t->dim[d] != 0 && t->elements > UINT64_MAX / t->dim[d]) {
-                ds4_die("tensor element count overflow");
+                pulsar_die("tensor element count overflow");
             }
             t->elements *= t->dim[d];
         }
 
-        if (!cursor_u32(c, &t->type)) ds4_die(c->error);
-        if (!cursor_u64(c, &t->rel_offset)) ds4_die(c->error);
+        if (!cursor_u32(c, &t->type)) pulsar_die(c->error);
+        if (!cursor_u64(c, &t->rel_offset)) pulsar_die(c->error);
 
-        if (t->type == DS4_TENSOR_CUTLASS_MXFP4) {
-            if (t->ndim != 3) ds4_die("CUTLASS MXFP4 tensor must be 3D [K,N,n_expert]");
+        if (t->type == PULSAR_TENSOR_CUTLASS_MXFP4) {
+            if (t->ndim != 3) pulsar_die("CUTLASS MXFP4 tensor must be 3D [K,N,n_expert]");
             uint64_t data_bytes, sf_bytes, stride;
             cutlass_mxfp4_expert_layout(t->dim[0], t->dim[1], &data_bytes, &sf_bytes, &stride);
             if (t->dim[2] != 0 && stride > UINT64_MAX / t->dim[2]) {
-                ds4_die("tensor element count overflow");
+                pulsar_die("tensor element count overflow");
             }
             t->bytes = stride * t->dim[2];
         } else if (!tensor_nbytes(t->type, t->elements, &t->bytes)) {
-            ds4_log(stderr,
-                DS4_LOG_WARNING,
-                "ds4: warning: tensor %.*s has unsupported GGUF type %u\n",
+            pulsar_log(stderr,
+                PULSAR_LOG_WARNING,
+                "pulsar: warning: tensor %.*s has unsupported GGUF type %u\n",
                 (int)t->name.len, t->name.ptr, t->type);
         }
     }
@@ -412,15 +412,15 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
     m->tensor_data_pos = align_up(c->pos, m->alignment);
 
     for (uint64_t i = 0; i < m->n_tensors; i++) {
-        ds4_tensor *t = &m->tensors[i];
+        pulsar_tensor *t = &m->tensors[i];
         if (t->rel_offset > UINT64_MAX - m->tensor_data_pos) {
-            ds4_die("tensor offset overflow");
+            pulsar_die("tensor offset overflow");
         }
         t->abs_offset = m->tensor_data_pos + t->rel_offset;
         if (t->bytes != 0 &&
             (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset))
         {
-            ds4_die("tensor points outside GGUF file");
+            pulsar_die("tensor points outside GGUF file");
         }
         if (t->bytes > m->max_tensor_bytes) {
             m->max_tensor_bytes = t->bytes;
@@ -434,17 +434,17 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
  * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress.
  * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
  * walks the huge tensor payload. */
-void model_open(ds4_model *m, const char *path, bool gpu_mapping,
+void model_open(pulsar_model *m, const char *path, bool gpu_mapping,
                        bool prefetch_cpu) {
     memset(m, 0, sizeof(*m));
     m->fd = -1;
 
     int fd = open(path, O_RDONLY);
-    if (fd == -1) ds4_die_errno("cannot open model", path);
+    if (fd == -1) pulsar_die_errno("cannot open model", path);
 
     struct stat st;
-    if (fstat(fd, &st) == -1) ds4_die_errno("cannot stat model", path);
-    if (st.st_size < 32) ds4_die("model file is too small to be GGUF");
+    if (fstat(fd, &st) == -1) pulsar_die_errno("cannot stat model", path);
+    if (st.st_size < 32) pulsar_die("model file is too small to be GGUF");
 
     /*
      * GPU wraps slices of this mapping as no-copy MTLBuffers, so the GPU
@@ -460,27 +460,27 @@ void model_open(ds4_model *m, const char *path, bool gpu_mapping,
      */
     const int mmap_flags = gpu_mapping ? MAP_SHARED : MAP_PRIVATE;
     void *map = (void *)mmap(NULL, (size_t)st.st_size, PROT_READ, mmap_flags, fd, 0);
-    if (map == MAP_FAILED) ds4_die_errno("cannot mmap model", path);
+    if (map == MAP_FAILED) pulsar_die_errno("cannot mmap model", path);
 
     m->fd = fd;
     m->map = (const uint8_t *)map;
     m->size = (uint64_t)st.st_size;
 
-    ds4_cursor c = cursor_at(m, 0);
+    pulsar_cursor c = cursor_at(m, 0);
     uint32_t magic;
-    if (!cursor_u32(&c, &magic)) ds4_die(c.error);
-    if (magic != DS4_GGUF_MAGIC) ds4_die("model is not a GGUF file");
-    if (!cursor_u32(&c, &m->version)) ds4_die(c.error);
-    if (!cursor_u64(&c, &m->n_tensors)) ds4_die(c.error);
-    if (!cursor_u64(&c, &m->n_kv)) ds4_die(c.error);
+    if (!cursor_u32(&c, &magic)) pulsar_die(c.error);
+    if (magic != PULSAR_GGUF_MAGIC) pulsar_die("model is not a GGUF file");
+    if (!cursor_u32(&c, &m->version)) pulsar_die(c.error);
+    if (!cursor_u64(&c, &m->n_tensors)) pulsar_die(c.error);
+    if (!cursor_u64(&c, &m->n_kv)) pulsar_die(c.error);
 
-    if (m->version != 3) ds4_die("only GGUF v3 is supported");
+    if (m->version != 3) pulsar_die("only GGUF v3 is supported");
 
     /* Sanity-cap the 64-bit header counts before they size calloc()s: every
      * metadata entry and tensor record needs well over 24 bytes of file, so
      * counts beyond size/24 can only come from a corrupt or hostile header. */
     if (m->n_kv > m->size / 24 || m->n_tensors > m->size / 24) {
-        ds4_die("GGUF header kv/tensor counts exceed what the file could hold");
+        pulsar_die("GGUF header kv/tensor counts exceed what the file could hold");
     }
 
     parse_metadata(m, &c);
@@ -498,9 +498,9 @@ static void print_size(uint64_t bytes) {
 
 
 
-void model_summary(const ds4_model *m) {
-    ds4_str name = {0, 0};
-    ds4_str arch = {0, 0};
+void model_summary(const pulsar_model *m) {
+    pulsar_str name = {0, 0};
+    pulsar_str arch = {0, 0};
     uint32_t layers = 0;
     uint64_t ctx_train = 0;
     uint32_t n_head = 0;
@@ -585,7 +585,7 @@ void model_summary(const ds4_model *m) {
 
 
 
-ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
+pulsar_tensor *model_find_tensor(const pulsar_model *m, const char *name) {
     const size_t len = strlen(name);
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         if (m->tensors[i].name.len == len &&
@@ -644,7 +644,7 @@ static bool accelerator_span_filter_contains(uint64_t off,
 
 
 
-static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
+static bool accelerator_prepare_model_tensor_spans(const pulsar_model *m,
                                                    const uint64_t *span_offsets,
                                                    const uint64_t *span_sizes,
                                                    uint32_t span_count,
@@ -667,7 +667,7 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
         }
     }
     for (uint64_t i = 0; i < m->n_tensors; i++) {
-        const ds4_tensor *t = &m->tensors[i];
+        const pulsar_tensor *t = &m->tensors[i];
         if (t->bytes == 0) continue;
         /* --expert-overlay swapped tensors live in the donor file's mapping
          * (donor-relative offsets that can exceed this model's size); they are
@@ -698,7 +698,7 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
     qsort(spans, (size_t)nspan, sizeof(spans[0]), accelerator_tensor_span_cmp);
 
     const uint64_t max_span = accelerator_cuda_preload_span_bytes();
-    const int tty = ds4_log_is_tty(stderr);
+    const int tty = pulsar_log_is_tty(stderr);
     const uint64_t progress_step = (tty ? 2ull : 16ull) * 1073741824ull;
     uint64_t next_progress = progress_step;
     double last_progress = now_sec();
@@ -707,7 +707,7 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
 
     const char *accelerator_name = "CUDA";
 
-    fprintf(stderr, "%sds4: %s preparing model tensor mappings%s",
+    fprintf(stderr, "%spulsar: %s preparing model tensor mappings%s",
             tty ? "\r\033[K" : "",
             accelerator_name,
             tty ? ": 0.00 GiB" : "\n");
@@ -725,10 +725,10 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
         }
         char label[96];
         snprintf(label, sizeof(label), "tensor-span:%" PRIu64, merged);
-        if (ds4_gpu_cache_model_range(m->map, m->size, off, end - off, label) == 0) {
+        if (pulsar_gpu_cache_model_range(m->map, m->size, off, end - off, label) == 0) {
             if (tty) fputc('\n', stderr);
             fprintf(stderr,
-                    "ds4: accelerator failed to prepare model tensor span %" PRIu64
+                    "pulsar: accelerator failed to prepare model tensor span %" PRIu64
                     " at offset %" PRIu64 "\n",
                     merged, off);
             free(spans);
@@ -740,11 +740,11 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
         const double now = now_sec();
         if (prepared >= next_progress || now - last_progress >= (tty ? 2.0 : 10.0)) {
             if (tty) {
-                fprintf(stderr, "\r\033[Kds4: %s preparing model tensor mappings: %.2f GiB",
+                fprintf(stderr, "\r\033[Kpulsar: %s preparing model tensor mappings: %.2f GiB",
                         accelerator_name,
                         (double)prepared / 1073741824.0);
             } else {
-                fprintf(stderr, "ds4: %s prepared model tensor mappings %.2f GiB\n",
+                fprintf(stderr, "pulsar: %s prepared model tensor mappings %.2f GiB\n",
                         accelerator_name,
                         (double)prepared / 1073741824.0);
             }
@@ -762,13 +762,13 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
 
 
 
-bool accelerator_cache_model_tensors(ds4_backend backend,
-                                            const ds4_model *m,
+bool accelerator_cache_model_tensors(pulsar_backend backend,
+                                            const pulsar_model *m,
                                             const uint64_t *span_offsets,
                                             const uint64_t *span_sizes,
                                             uint32_t span_count,
                                      const char *skip_prefix) {
-    if (backend != DS4_BACKEND_CUDA) return true;
+    if (backend != PULSAR_BACKEND_CUDA) return true;
     if (!m || !m->map || m->size == 0) return false;
     /* Register each MXFP8 weight's offset so the workhorse matmul executes
      * ONLY registered tensors (per-tensor routing; unregistered offsets are
@@ -776,21 +776,21 @@ bool accelerator_cache_model_tensors(ds4_backend backend,
      * applies in the mmap path too. */
     uint64_t n_fp8 = 0, n_fp8_lt = 0;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
-        const ds4_tensor *t = &m->tensors[i];
-        if (t->type == DS4_TENSOR_FP8_E4M3) {
-            ds4_gpu_register_fp8_weight(t->abs_offset);
+        const pulsar_tensor *t = &m->tensors[i];
+        if (t->type == PULSAR_TENSOR_FP8_E4M3) {
+            pulsar_gpu_register_fp8_weight(t->abs_offset);
             n_fp8++;
-        } else if (t->type == DS4_TENSOR_MXFP8_LT) {
+        } else if (t->type == PULSAR_TENSOR_MXFP8_LT) {
             /* Same FP8 matmul path, but flag the offset as pre-stored so the
              * resolver points cuBLASLt at the mmap instead of converting. */
-            ds4_gpu_register_fp8_weight(t->abs_offset);
-            ds4_gpu_register_fp8_lt_weight(t->abs_offset);
+            pulsar_gpu_register_fp8_weight(t->abs_offset);
+            pulsar_gpu_register_fp8_lt_weight(t->abs_offset);
             n_fp8++;
             n_fp8_lt++;
         }
     }
     if (n_fp8 > 0)
-        fprintf(stderr, "ds4: %llu MXFP8 workhorse weights detected -> FP8 matmul path"
+        fprintf(stderr, "pulsar: %llu MXFP8 workhorse weights detected -> FP8 matmul path"
                 " (%llu pre-stored MXFP8_LT, zero-copy)\n",
                 (unsigned long long)n_fp8, (unsigned long long)n_fp8_lt);
     if (getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
@@ -805,7 +805,7 @@ bool accelerator_cache_model_tensors(ds4_backend backend,
     const double t1 = now_sec();
     const char *accelerator_name = "CUDA";
     fprintf(stderr,
-            "ds4: %s startup model preparation covered %.2f GiB of tensor spans in %.3fs\n",
+            "pulsar: %s startup model preparation covered %.2f GiB of tensor spans in %.3fs\n",
             accelerator_name, (double)prepared / 1073741824.0, t1 - t0);
     return true;
 }
@@ -814,7 +814,7 @@ bool accelerator_cache_model_tensors(ds4_backend backend,
 
 /* Return the in-place tensor payload inside the mapped GGUF (or inside the
  * overlay file's mapping for --expert-overlay swapped tensors). */
-const void *tensor_data(const ds4_model *m, const ds4_tensor *t) {
+const void *tensor_data(const pulsar_model *m, const pulsar_tensor *t) {
     return (const uint8_t *)tensor_map_base(m, t) + t->abs_offset;
 }
 
@@ -824,26 +824,26 @@ const void *tensor_data(const ds4_model *m, const ds4_tensor *t) {
  * Must run at startup: the lazy weight-cache copy path cannot execute inside
  * GPU graph encode (synchronous cudaMemcpy during capture fails), which is
  * where an unprepared overlay span would otherwise first be touched. */
-bool accelerator_prepare_expert_overlay(ds4_backend backend,
-                                        const ds4_model *base,
-                                        const ds4_model *overlay) {
-    if (backend != DS4_BACKEND_CUDA) return true;
+bool accelerator_prepare_expert_overlay(pulsar_backend backend,
+                                        const pulsar_model *base,
+                                        const pulsar_model *overlay) {
+    if (backend != PULSAR_BACKEND_CUDA) return true;
     uint64_t prepared = 0;
     for (uint64_t i = 0; i < base->n_tensors; i++) {
-        const ds4_tensor *t = &base->tensors[i];
+        const pulsar_tensor *t = &base->tensors[i];
         if (t->ext_map != overlay->map || t->bytes == 0) continue;
         char label[96];
         snprintf(label, sizeof(label), "overlay:%.*s",
                  (int)(t->name.len < 80 ? t->name.len : 80), t->name.ptr);
-        if (ds4_gpu_cache_external_range(overlay->map, overlay->fd,
+        if (pulsar_gpu_cache_external_range(overlay->map, overlay->fd,
                                          t->abs_offset, t->bytes, label) == 0) {
-            fprintf(stderr, "ds4: failed to prepare expert-overlay span for %.*s\n",
+            fprintf(stderr, "pulsar: failed to prepare expert-overlay span for %.*s\n",
                     (int)t->name.len, t->name.ptr);
             return false;
         }
         prepared += t->bytes;
     }
-    fprintf(stderr, "ds4: expert overlay prepared %.2f GiB for device access\n",
+    fprintf(stderr, "pulsar: expert overlay prepared %.2f GiB for device access\n",
             (double)prepared / 1073741824.0);
     return true;
 }
@@ -866,19 +866,19 @@ static bool str_span_contains(const char *s, size_t len, const char *needle) {
     return false;
 }
 
-uint32_t model_apply_expert_overlay(ds4_model *base, const ds4_model *overlay,
+uint32_t model_apply_expert_overlay(pulsar_model *base, const pulsar_model *overlay,
                                     const char *prefix) {
     const size_t plen = strlen(prefix);
     uint32_t swapped = 0;
     for (uint64_t i = 0; i < base->n_tensors; i++) {
-        ds4_tensor *t = &base->tensors[i];
+        pulsar_tensor *t = &base->tensors[i];
         if (t->name.len < plen || memcmp(t->name.ptr, prefix, plen) != 0) continue;
         /* GGUF names are length-prefixed, not NUL-terminated: every match
          * below must stay bounded by name.len. */
         if (t->ndim != 3 || !str_span_contains(t->name.ptr, t->name.len, "_exps.")) continue;
-        const ds4_tensor *ov = NULL;
+        const pulsar_tensor *ov = NULL;
         for (uint64_t j = 0; j < overlay->n_tensors; j++) {
-            const ds4_tensor *c = &overlay->tensors[j];
+            const pulsar_tensor *c = &overlay->tensors[j];
             if (c->name.len == t->name.len &&
                 memcmp(c->name.ptr, t->name.ptr, t->name.len) == 0) {
                 ov = c;
@@ -886,22 +886,22 @@ uint32_t model_apply_expert_overlay(ds4_model *base, const ds4_model *overlay,
             }
         }
         if (!ov) {
-            fprintf(stderr, "ds4: expert overlay is missing tensor: %.*s\n",
+            fprintf(stderr, "pulsar: expert overlay is missing tensor: %.*s\n",
                     (int)t->name.len, t->name.ptr);
             exit(1);
         }
         if (ov->ndim != t->ndim ||
             memcmp(ov->dim, t->dim, sizeof(ov->dim)) != 0) {
-            fprintf(stderr, "ds4: expert overlay shape mismatch for %.*s\n",
+            fprintf(stderr, "pulsar: expert overlay shape mismatch for %.*s\n",
                     (int)t->name.len, t->name.ptr);
             exit(1);
         }
-        if (ov->type == DS4_TENSOR_CUTLASS_MXFP4) {
+        if (ov->type == PULSAR_TENSOR_CUTLASS_MXFP4) {
             /* The CUTLASS grouped-GEMM prefill path device-asserts when its
              * expert weights come from an overlay range (observed 2026-07-02,
              * root cause not yet chased). The measurement harness only needs
              * plain MXFP4/IQ2/Q2K donors, so refuse rather than corrupt. */
-            fprintf(stderr, "ds4: expert overlay does not support CUTLASS "
+            fprintf(stderr, "pulsar: expert overlay does not support CUTLASS "
                             "type-40 donor tensors yet (%.*s)\n",
                     (int)t->name.len, t->name.ptr);
             exit(1);
@@ -922,7 +922,7 @@ uint32_t model_apply_expert_overlay(ds4_model *base, const ds4_model *overlay,
 
 
 /* Optional startup pass that touches tensor pages before timing generation. */
-void model_warm_weights(const ds4_model *m) {
+void model_warm_weights(const pulsar_model *m) {
     const uint64_t start = m->tensor_data_pos;
     const uint64_t end = m->size;
     if (start >= end) return;
@@ -932,7 +932,7 @@ void model_warm_weights(const ds4_model *m) {
     volatile uint64_t checksum = 0;
     const double t0 = now_sec();
 
-    fprintf(stderr, "ds4: warming mapped tensor pages: %.2f GiB\n",
+    fprintf(stderr, "pulsar: warming mapped tensor pages: %.2f GiB\n",
             (double)(end - start) / (1024.0 * 1024.0 * 1024.0));
 
 #if defined(POSIX_MADV_WILLNEED)
@@ -945,7 +945,7 @@ void model_warm_weights(const ds4_model *m) {
     checksum += p[end - 1];
 
     const double t1 = now_sec();
-    fprintf(stderr, "ds4: warmed tensor pages in %.3fs (checksum=%llu)\n",
+    fprintf(stderr, "pulsar: warmed tensor pages in %.3fs (checksum=%llu)\n",
             t1 - t0, (unsigned long long)checksum);
 }
 

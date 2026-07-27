@@ -1,4 +1,4 @@
-#include "ds4_agent_internal.h"
+#include "pulsar_agent_internal.h"
 
 
 
@@ -24,7 +24,7 @@ static void agent_progress_append(char *buf, size_t len, size_t *pos,
 
 void build_prompt_text(const agent_status *st, char *buf, size_t len) {
     (void)st;
-    snprintf(buf, len, "ds4-agent> ");
+    snprintf(buf, len, "pulsar-agent> ");
 }
 
 
@@ -680,7 +680,7 @@ static void editor_clear_prompt_region(agent_editor *ed) {
     for (int row = ed->prompt_row; row <= ed->term_rows; row++)
         editor_clear_row(row);
 
-    /* In scroll-region mode ds4-agent owns the absolute prompt/status rows.
+    /* In scroll-region mode pulsar-agent owns the absolute prompt/status rows.
      * Clearing them directly is more reliable than asking linenoise to clean
      * relative to whatever cursor position the last worker/status transition
      * left behind.  Reset linenoise's render bookkeeping so the next show is a
@@ -903,7 +903,7 @@ int editor_start(agent_editor *ed, const char *prompt,
 /* Stop the live editor and restore stdin flags. */
 void editor_stop(agent_editor *ed) {
     if (!ed->active) return;
-    /* ds4-agent treats linenoise as a live input widget, not as persistent
+    /* pulsar-agent treats linenoise as a live input widget, not as persistent
      * command scrollback.  Clear it before shutdown so submitting a line and
      * immediately reopening the editor does not leave the accepted
      * prompt+input duplicated above the fresh prompt. */
@@ -1176,7 +1176,7 @@ static void agent_format_welcome_banner(const agent_config *cfg,
                  "\x1b[1;97mDwarf\x1b[1;94mStar\x1b[0m 🐋 Agent, context %s tokens\n\n",
                  ctx);
     } else {
-        snprintf(buf, len, "DwarfStar Agent, context %s tokens\n\n", ctx);
+        snprintf(buf, len, "Pulsar Agent, context %s tokens\n\n", ctx);
     }
 }
 
@@ -1196,7 +1196,7 @@ void editor_write_welcome_banner(agent_editor *editor,
 /* Initialize the worker, cache directory, sysprompt checkpoint path, trace file,
  * and model thread.  After this returns, all DS4 session mutation happens on
  * the worker thread. */
-int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *cfg) {
+int agent_worker_init(agent_worker *w, pulsar_engine *engine, agent_config *cfg) {
     memset(w, 0, sizeof(*w));
     w->engine = engine;
     w->cfg = cfg;
@@ -1209,21 +1209,21 @@ int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *cfg) {
     int old_flags;
     set_nonblock(w->wake_fd[0], true, &old_flags);
     set_nonblock(w->wake_fd[1], true, &old_flags);
-    if (ds4_session_create(&w->session, engine, cfg->gen.ctx_size) != 0) {
-        fprintf(stderr, "ds4-agent: session backend is required\n");
+    if (pulsar_session_create(&w->session, engine, cfg->gen.ctx_size) != 0) {
+        fprintf(stderr, "pulsar-agent: session backend is required\n");
         return -1;
     }
     w->cache_dir = agent_default_cache_dir();
     if (!agent_mkdir_p(w->cache_dir)) {
-        fprintf(stderr, "ds4-agent: failed to create %s: %s\n",
+        fprintf(stderr, "pulsar-agent: failed to create %s: %s\n",
                 w->cache_dir, strerror(errno));
         return -1;
     }
-    w->sysprompt_path = ds4_kvstore_path_join(w->cache_dir, "sysprompt.kv");
+    w->sysprompt_path = pulsar_kvstore_path_join(w->cache_dir, "sysprompt.kv");
     if (cfg->gen.trace_path && cfg->gen.trace_path[0]) {
         w->trace = fopen(cfg->gen.trace_path, "ab");
         if (!w->trace) {
-            fprintf(stderr, "ds4-agent: failed to open trace %s: %s\n",
+            fprintf(stderr, "pulsar-agent: failed to open trace %s: %s\n",
                     cfg->gen.trace_path, strerror(errno));
             return -1;
         }
@@ -1240,8 +1240,8 @@ void agent_worker_free(agent_worker *w) {
     worker_stop(w);
     if (w->thread) pthread_join(w->thread, NULL);
     agent_bash_jobs_free(w);
-    ds4_session_free(w->session);
-    ds4_tokens_free(&w->transcript);
+    pulsar_session_free(w->session);
+    pulsar_tokens_free(&w->transcript);
     free(w->cache_dir);
     free(w->sysprompt_path);
     free(w->session_title);

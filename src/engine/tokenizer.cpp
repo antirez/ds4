@@ -1,4 +1,4 @@
-#include "ds4_engine_internal.h"
+#include "pulsar_engine_internal.h"
 
 
 
@@ -25,12 +25,12 @@ static void table_free(str_i32_table *t) {
 
 
 
-static void table_put(str_i32_table *t, ds4_str key, int value) {
+static void table_put(str_i32_table *t, pulsar_str key, int value) {
     uint64_t mask = t->cap - 1;
     uint64_t i = hash_bytes(key.ptr, key.len) & mask;
 
     while (t->entry[i].used) {
-        if (ds4_str_eq(t->entry[i].key, key)) {
+        if (pulsar_str_eq(t->entry[i].key, key)) {
             t->entry[i].value = value;
             return;
         }
@@ -52,7 +52,7 @@ static bool table_get(const str_i32_table *t, const char *ptr, uint64_t len, int
     uint64_t i = hash_bytes(ptr, len) & mask;
 
     while (t->entry[i].used) {
-        ds4_str key = t->entry[i].key;
+        pulsar_str key = t->entry[i].key;
         if (key.len == len && memcmp(key.ptr, ptr, len) == 0) {
             *value = t->entry[i].value;
             return true;
@@ -81,26 +81,26 @@ void token_vec_free(token_vec *tv) {
 
 
 
-void ds4_tokens_push(ds4_tokens *tv, int token) {
+void pulsar_tokens_push(pulsar_tokens *tv, int token) {
     token_vec_push(tv, token);
 }
 
 
 
-void ds4_tokens_free(ds4_tokens *tv) {
+void pulsar_tokens_free(pulsar_tokens *tv) {
     token_vec_free(tv);
 }
 
 
 
-void ds4_tokens_copy(ds4_tokens *dst, const ds4_tokens *src) {
+void pulsar_tokens_copy(pulsar_tokens *dst, const pulsar_tokens *src) {
     dst->len = 0;
     for (int i = 0; i < src->len; i++) token_vec_push(dst, src->v[i]);
 }
 
 
 
-bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix) {
+bool pulsar_tokens_starts_with(const pulsar_tokens *tokens, const pulsar_tokens *prefix) {
     if (prefix->len > tokens->len) return false;
     for (int i = 0; i < prefix->len; i++) {
         if (tokens->v[i] != prefix->v[i]) return false;
@@ -126,15 +126,15 @@ void cpu_directional_steering_project_rows(
         float        scale) {
     if (!cpu_directional_steering_enabled(dirs, scale) || !x || rows == 0) return;
 
-    const float *dir = dirs + (uint64_t)il * DS4_N_EMBD;
+    const float *dir = dirs + (uint64_t)il * PULSAR_N_EMBD;
     for (uint32_t row = 0; row < rows; row++) {
-        float *xr = x + (uint64_t)row * DS4_N_EMBD;
+        float *xr = x + (uint64_t)row * PULSAR_N_EMBD;
         float dot = 0.0f;
-        for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
+        for (uint32_t i = 0; i < PULSAR_N_EMBD; i++) {
             dot += xr[i] * dir[i];
         }
         const float coeff = scale * dot;
-        for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
+        for (uint32_t i = 0; i < PULSAR_N_EMBD; i++) {
             xr[i] -= coeff * dir[i];
         }
     }
@@ -185,7 +185,7 @@ static uint32_t gpt2_byte_to_codepoint(uint8_t b) {
 
 /* GPT-2 byte-level BPE first maps raw bytes to printable Unicode codepoints
  * so merges can operate on UTF-8 strings without losing byte identity. */
-static char *byte_encode(ds4_str in, uint64_t *out_len) {
+static char *byte_encode(pulsar_str in, uint64_t *out_len) {
     char *out = (char *)xmalloc((size_t)in.len * 4 + 1);
     char *p = out;
 
@@ -220,7 +220,7 @@ static owned_str owned_copy(const char *ptr, uint64_t len) {
 
 
 /* Look up the merge rank for two adjacent BPE symbols. */
-static int bpe_rank(const ds4_vocab *vocab, const owned_str *a, const owned_str *b) {
+static int bpe_rank(const pulsar_vocab *vocab, const owned_str *a, const owned_str *b) {
     uint64_t len = a->len + 1 + b->len;
     char stack[512];
     char *buf = len <= sizeof(stack) ? stack : (char *)xmalloc((size_t)len);
@@ -239,7 +239,7 @@ static int bpe_rank(const ds4_vocab *vocab, const owned_str *a, const owned_str 
 
 
 /* Apply byte-level BPE to one regex-like pre-tokenized piece and emit token ids. */
-static void bpe_emit_piece(const ds4_vocab *vocab, ds4_str raw_piece, token_vec *out) {
+static void bpe_emit_piece(const pulsar_vocab *vocab, pulsar_str raw_piece, token_vec *out) {
     uint64_t encoded_len = 0;
     char *encoded = byte_encode(raw_piece, &encoded_len);
 
@@ -438,7 +438,7 @@ static bool joyai_cjk_at(const char *s, uint64_t len, uint64_t pos) {
  */
 /* JoyAI/DeepSeek pre-tokenization.  The split shape matters: different pieces
  * lead to different BPE merges even when the final text bytes are identical. */
-static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
+static void bpe_tokenize_text(const pulsar_vocab *vocab, const char *text, token_vec *out) {
     const uint64_t len = strlen(text);
     uint64_t pos = 0;
 
@@ -504,16 +504,16 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
         }
 
         if (pos == start) pos = next_utf8_char(text, len, pos);
-        bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+        bpe_emit_piece(vocab, (pulsar_str){ text + start, pos - start }, out);
     }
 }
 
 
 
-static int vocab_lookup(const ds4_vocab *vocab, const char *text) {
+static int vocab_lookup(const pulsar_vocab *vocab, const char *text) {
     int token = -1;
     if (!table_get(&vocab->token_to_id, text, strlen(text), &token)) {
-        fprintf(stderr, "ds4: required tokenizer token is missing: %s\n", text);
+        fprintf(stderr, "pulsar: required tokenizer token is missing: %s\n", text);
         exit(1);
     }
     return token;
@@ -522,36 +522,36 @@ static int vocab_lookup(const ds4_vocab *vocab, const char *text) {
 
 
 /* Load token strings, special token ids, and merge ranks from GGUF metadata. */
-void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
+void vocab_load(pulsar_vocab *vocab, const pulsar_model *model) {
     memset(vocab, 0, sizeof(*vocab));
 
-    ds4_array_ref tokens;
-    ds4_array_ref merges;
+    pulsar_array_ref tokens;
+    pulsar_array_ref merges;
     if (!model_get_array(model, "tokenizer.ggml.tokens", &tokens) ||
         tokens.type != GGUF_VALUE_STRING ||
         tokens.len > INT32_MAX) {
-        ds4_die("GGUF tokenizer token table is missing or invalid");
+        pulsar_die("GGUF tokenizer token table is missing or invalid");
     }
     if (!model_get_array(model, "tokenizer.ggml.merges", &merges) ||
         merges.type != GGUF_VALUE_STRING) {
-        ds4_die("GGUF tokenizer merge table is missing or invalid");
+        pulsar_die("GGUF tokenizer merge table is missing or invalid");
     }
 
     vocab->n_vocab = (int)tokens.len;
-    vocab->token = (ds4_str *)xcalloc((size_t)vocab->n_vocab, sizeof(vocab->token[0]));
+    vocab->token = (pulsar_str *)xcalloc((size_t)vocab->n_vocab, sizeof(vocab->token[0]));
     table_init(&vocab->token_to_id, tokens.len);
 
-    ds4_cursor c = cursor_at(model, tokens.data_pos);
+    pulsar_cursor c = cursor_at(model, tokens.data_pos);
     for (int i = 0; i < vocab->n_vocab; i++) {
-        if (!cursor_string(&c, &vocab->token[i])) ds4_die(c.error);
+        if (!cursor_string(&c, &vocab->token[i])) pulsar_die(c.error);
         table_put(&vocab->token_to_id, vocab->token[i], i);
     }
 
     table_init(&vocab->merge_rank, merges.len);
     c = cursor_at(model, merges.data_pos);
     for (uint64_t i = 0; i < merges.len; i++) {
-        ds4_str merge;
-        if (!cursor_string(&c, &merge)) ds4_die(c.error);
+        pulsar_str merge;
+        if (!cursor_string(&c, &merge)) pulsar_die(c.error);
         table_put(&vocab->merge_rank, merge, (int)i);
     }
 
@@ -566,7 +566,7 @@ void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
 
 
 
-void vocab_free(ds4_vocab *vocab) {
+void vocab_free(pulsar_vocab *vocab) {
     free(vocab->token);
     table_free(&vocab->token_to_id);
     table_free(&vocab->merge_rank);
@@ -579,14 +579,14 @@ void vocab_free(ds4_vocab *vocab) {
  * marker, and either <think> or </think> depending on the requested mode.  Max
  * thinking is only a prompt prefix: the model still enters through <think>. */
 static void encode_chat_prompt(
-        const ds4_vocab *vocab,
+        const pulsar_vocab *vocab,
         const char      *system,
         const char      *prompt,
-        ds4_think_mode   think_mode,
+        pulsar_think_mode   think_mode,
         token_vec       *out) {
     token_vec_push(out, vocab->bos_id);
-    if (think_mode == DS4_THINK_MAX) {
-        bpe_tokenize_text(vocab, DS4_REASONING_EFFORT_MAX_PREFIX, out);
+    if (think_mode == PULSAR_THINK_MAX) {
+        bpe_tokenize_text(vocab, PULSAR_REASONING_EFFORT_MAX_PREFIX, out);
     }
     if (system && system[0]) {
         bpe_tokenize_text(vocab, system, out);
@@ -594,7 +594,7 @@ static void encode_chat_prompt(
     token_vec_push(out, vocab->user_id);
     bpe_tokenize_text(vocab, prompt, out);
     token_vec_push(out, vocab->assistant_id);
-    if (ds4_think_mode_enabled(think_mode)) {
+    if (pulsar_think_mode_enabled(think_mode)) {
         token_vec_push(out, vocab->think_start_id);
     } else {
         token_vec_push(out, vocab->think_end_id);
@@ -603,13 +603,13 @@ static void encode_chat_prompt(
 
 
 
-void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out) {
+void pulsar_tokenize_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
     bpe_tokenize_text(&e->vocab, text ? text : "", out);
 }
 
 
 
-static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, size_t *len) {
+static bool special_token_at(const pulsar_vocab *vocab, const char *p, int *token, size_t *len) {
     struct special {
         const char *text;
         int token;
@@ -636,7 +636,7 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
 
 
 
-static void tokenize_span(const ds4_vocab *vocab, const char *p, size_t n, token_vec *out) {
+static void tokenize_span(const pulsar_vocab *vocab, const char *p, size_t n, token_vec *out) {
     if (!n) return;
     char *tmp = (char *)xmalloc(n + 1);
     memcpy(tmp, p, n);
@@ -647,7 +647,7 @@ static void tokenize_span(const ds4_vocab *vocab, const char *p, size_t n, token
 
 
 
-void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
+void tokenize_rendered_chat_vocab(const pulsar_vocab *vocab, const char *text,
                                          token_vec *out) {
     if (!text) text = "";
 
@@ -670,36 +670,36 @@ void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
 
 
 
-void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out) {
+void pulsar_tokenize_rendered_chat(pulsar_engine *e, const char *text, pulsar_tokens *out) {
     tokenize_rendered_chat_vocab(&e->vocab, text, out);
 }
 
 
 
-void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
+void pulsar_chat_begin(pulsar_engine *e, pulsar_tokens *tokens) {
     token_vec_push(tokens, e->vocab.bos_id);
 }
 
 
 
-void ds4_encode_chat_prompt(
-        ds4_engine *e,
+void pulsar_encode_chat_prompt(
+        pulsar_engine *e,
         const char *system,
         const char *prompt,
-        ds4_think_mode think_mode,
-        ds4_tokens *out) {
+        pulsar_think_mode think_mode,
+        pulsar_tokens *out) {
     encode_chat_prompt(&e->vocab, system, prompt ? prompt : "", think_mode, out);
 }
 
 
 
-void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens) {
-    bpe_tokenize_text(&e->vocab, DS4_REASONING_EFFORT_MAX_PREFIX, tokens);
+void pulsar_chat_append_max_effort_prefix(pulsar_engine *e, pulsar_tokens *tokens) {
+    bpe_tokenize_text(&e->vocab, PULSAR_REASONING_EFFORT_MAX_PREFIX, tokens);
 }
 
 
 
-static void bpe_tokenize_tool_result_text(ds4_vocab *vocab, const char *content, token_vec *out) {
+static void bpe_tokenize_tool_result_text(pulsar_vocab *vocab, const char *content, token_vec *out) {
     /* Tool output is plain data inside <tool_result>...</tool_result>.
      * Preserve literal '<', '>' and '&' so shell output and file snippets stay
      * intact, but escape the exact closing sentinel so a malicious or accidental
@@ -723,8 +723,8 @@ static void bpe_tokenize_tool_result_text(ds4_vocab *vocab, const char *content,
 
 
 
-void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role, const char *content) {
-    ds4_vocab *vocab = &e->vocab;
+void pulsar_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, const char *role, const char *content) {
+    pulsar_vocab *vocab = &e->vocab;
     if (!role) role = "user";
     if (!content) content = "";
 
@@ -749,15 +749,15 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 
 
 
-void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
+void pulsar_chat_append_assistant_prefix(pulsar_engine *e, pulsar_tokens *tokens, pulsar_think_mode think_mode) {
     token_vec_push(tokens, e->vocab.assistant_id);
-    token_vec_push(tokens, ds4_think_mode_enabled(think_mode) ?
+    token_vec_push(tokens, pulsar_think_mode_enabled(think_mode) ?
                    e->vocab.think_start_id : e->vocab.think_end_id);
 }
 
 
 
-void dump_tokens_fp(FILE *fp, const ds4_vocab *vocab, const token_vec *tokens) {
+void dump_tokens_fp(FILE *fp, const pulsar_vocab *vocab, const token_vec *tokens) {
     fprintf(fp, "[");
     for (int i = 0; i < tokens->len; i++) {
         if (i) fprintf(fp, ", ");
@@ -775,7 +775,7 @@ void dump_tokens_fp(FILE *fp, const ds4_vocab *vocab, const token_vec *tokens) {
 
 
 
-void dump_tokens(const ds4_vocab *vocab, const token_vec *tokens) {
+void dump_tokens(const pulsar_vocab *vocab, const token_vec *tokens) {
     dump_tokens_fp(stdout, vocab, tokens);
 }
 
@@ -831,7 +831,7 @@ static int gpt2_codepoint_to_byte(uint32_t cp) {
 
 
 
-static bool vocab_token_is_literal_special(ds4_str s) {
+static bool vocab_token_is_literal_special(pulsar_str s) {
     const unsigned char bar[] = {0xef, 0xbd, 0x9c}; /* U+FF5C fullwidth vertical bar. */
     if (s.len < sizeof(bar)) return false;
     for (uint64_t i = 0; i + sizeof(bar) <= s.len; i++) {
@@ -842,8 +842,8 @@ static bool vocab_token_is_literal_special(ds4_str s) {
 
 
 
-char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
-    ds4_vocab *vocab = &e->vocab;
+char *pulsar_token_text(pulsar_engine *e, int token, size_t *len) {
+    pulsar_vocab *vocab = &e->vocab;
     if (token < 0 || token >= vocab->n_vocab) {
         if (len) *len = 0;
         char *out = (char *)xmalloc(1);
@@ -851,7 +851,7 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
         return out;
     }
 
-    ds4_str s = vocab->token[token];
+    pulsar_str s = vocab->token[token];
     char *out = (char *)xmalloc((size_t)s.len + 1);
     if (vocab_token_is_literal_special(s)) {
         memcpy(out, s.ptr, (size_t)s.len);
@@ -874,19 +874,19 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
 
 
 
-int ds4_token_eos(ds4_engine *e) {
+int pulsar_token_eos(pulsar_engine *e) {
     return e->vocab.eos_id;
 }
 
 
 
-int ds4_token_user(ds4_engine *e) {
+int pulsar_token_user(pulsar_engine *e) {
     return e->vocab.user_id;
 }
 
 
 
-int ds4_token_assistant(ds4_engine *e) {
+int pulsar_token_assistant(pulsar_engine *e) {
     return e->vocab.assistant_id;
 }
 
@@ -894,7 +894,7 @@ int ds4_token_assistant(ds4_engine *e) {
 
 int sample_argmax(const float *logits, uint32_t n_vocab) {
     int best = 0;
-    float best_v = DS4_NEG_INF;
+    float best_v = PULSAR_NEG_INF;
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = logits[i];
         if (v > best_v) {
@@ -942,11 +942,11 @@ static float sample_rng_f32(uint64_t *state) {
  * recording because it is a trap. -ffast-math would set FPCR.FZ (flushing
  * subnormal FCMP inputs, making the comparator tie them) — but ONLY via
  * crtfastmath.o, which the LINKER pulls in, and every binary carrying this
- * code (ds4, ds4-server, ds4_test) is linked by nvcc, not by gcc -ffast-math.
+ * code (ds4, pulsar-server, pulsar_test) is linked by nvcc, not by gcc -ffast-math.
  * Measured in the real link config: FPCR = 0x0, FZ = 0, and the comparator
  * ORDERS subnormals. So keying them strictly is what matches. A gcc-linked
  * probe of the same source reports FPCR = 0x1000000 and the opposite answer —
- * do not test this outside the real linkage. tests/ds4_test.c --sampler
+ * do not test this outside the real linkage. tests/pulsar_test.c --sampler
  * covers it (shape "subnormals + zeros (FZ range)"). */
 static inline uint32_t sample_desc_key(float f) {
     uint32_t u;
@@ -974,8 +974,8 @@ static inline uint32_t sample_desc_key(float f) {
  * MEMBERSHIP, not just order within the nucleus. Concretely, all-equal logits
  * with top_p=0.5 give filtered=64640 of 129280: ascending ties yield
  * ids [0..64639], descending ties yield ids [64640..129279] — disjoint.
- * ds4_sample_dist_prob returns 0 for an id outside the nucleus, so
- * ds4_sample_dist_accept would then REJECT a draft the other order ACCEPTS,
+ * pulsar_sample_dist_prob returns 0 for an id outside the nucleus, so
+ * pulsar_sample_dist_accept would then REJECT a draft the other order ACCEPTS,
  * changing the emitted token stream.
  *
  * So: the caller fills `a` in ascending-id order and this sort is stable,
@@ -983,7 +983,7 @@ static inline uint32_t sample_desc_key(float f) {
  * replaced qsort produced at this size (glibc takes its stable msort_with_tmp
  * path for a 129280 x 12B array -- verified), but nothing here depends on that
  * unspecified detail: this sort is stable by construction and libc-independent.
- * tests/ds4_test.c --sampler pins the order explicitly (and catches a
+ * tests/pulsar_test.c --sampler pins the order explicitly (and catches a
  * tie-order flip on a realistic shape -- ties are common, not adversarial).
  *
  * Requires n >= 1. */
@@ -1023,7 +1023,7 @@ static void sample_radix_sort_desc(uint64_t *a, uint64_t *tmp, uint32_t n) {
 
 /* =====
  * min-p prefilter threshold (shared by sample_full_vocab and
- * ds4_sample_dist_build's full-vocab paths).
+ * pulsar_sample_dist_build's full-vocab paths).
  *
  * The min-p cutoff both paths apply post-sort keeps candidate i (i > 0) iff
  *
@@ -1065,13 +1065,13 @@ static void sample_radix_sort_desc(uint64_t *a, uint64_t *tmp, uint32_t n) {
 
 
 /* NOTE: the free below also drops `qmap` (and its all-zero invariant with it),
- * because ds4_sample_scratch_free clears the whole struct. That is safe only
+ * because pulsar_sample_scratch_free clears the whole struct. That is safe only
  * because no caller holds live qmap state across a dist_build — the residual
  * draw scatters, reads and re-zeros within one call. Do not cache anything in
  * qmap across calls without decoupling this. */
-static void sample_scratch_reserve(ds4_sample_scratch *s, uint32_t cap) {
+static void sample_scratch_reserve(pulsar_sample_scratch *s, uint32_t cap) {
     if (s->cap >= cap) return;
-    ds4_sample_scratch_free(s);
+    pulsar_sample_scratch_free(s);
     s->cand = (sample_candidate *)xmalloc((size_t)cap * sizeof(*s->cand));
     s->keys = (uint64_t *)xmalloc((size_t)cap * sizeof(*s->keys));
     s->tmp = (uint64_t *)xmalloc((size_t)cap * sizeof(*s->tmp));
@@ -1081,7 +1081,7 @@ static void sample_scratch_reserve(ds4_sample_scratch *s, uint32_t cap) {
 
 
 
-void ds4_sample_scratch_free(ds4_sample_scratch *s) {
+void pulsar_sample_scratch_free(pulsar_sample_scratch *s) {
     free(s->cand);
     free(s->keys);
     free(s->tmp);
@@ -1096,7 +1096,7 @@ void ds4_sample_scratch_free(ds4_sample_scratch *s) {
  * sample_scratch_reserve's `cap` (which is top_k on the preselect path). Grows
  * by free+calloc: callers restore every entry they set, so a fresh all-zero
  * buffer preserves the invariant. */
-static void sample_qmap_reserve(ds4_sample_scratch *s, uint32_t cap) {
+static void sample_qmap_reserve(pulsar_sample_scratch *s, uint32_t cap) {
     if (s->qmap_cap >= cap) return;
     free(s->qmap);
     s->qmap = (float *)xcalloc((size_t)cap, sizeof(*s->qmap));
@@ -1112,7 +1112,7 @@ static int sample_full_vocab(
         float        top_p,
         float        min_p,
         uint64_t    *rng) {
-    float max_logit = DS4_NEG_INF;
+    float max_logit = PULSAR_NEG_INF;
     int best = 0;
     uint32_t finite = 0;
     for (uint32_t i = 0; i < n_vocab; i++) {
@@ -1250,7 +1250,7 @@ static int sample_full_vocab(
  * (cand[0].prob/sum)*min_p; the top_p test is filtered_sum/sum). Dropping
  * candidates from `sum` — the NAIVE min-p pre-filter — therefore changes
  * `sum`, hence `filtered`, hence `filtered_sum`, hence EVERY output
- * probability. It is not an equivalent rewrite; tests/ds4_test.c --sampler
+ * probability. It is not an equivalent rewrite; tests/pulsar_test.c --sampler
  * catches it (n 6 != 5). The full-vocab sum is load-bearing.
  *
  * What the top_k <= 0, min_p > 0 path DOES do (the LEGAL prefilter): the sum
@@ -1265,7 +1265,7 @@ static int sample_full_vocab(
  * summing in index order instead of the old sorted-descending order rounds
  * differently (~1e-7 relative), so every output prob moves by that much and
  * rng draws near a bucket edge can flip. Survivor membership and order are
- * unchanged (tests/ds4_test.c --sampler-prefilter pins set/order identity
+ * unchanged (tests/pulsar_test.c --sampler-prefilter pins set/order identity
  * against the old-sum reference and characterizes the prob delta; --sampler
  * is byte-exact against the re-derived index-order-sum reference). The
  * min_p <= 0 full sort and the top_k > 0 preselect keep the old sorted-order
@@ -1277,9 +1277,9 @@ static int sample_full_vocab(
  * malloc would be silently wrong the moment two dists overlap — and the
  * --sampler gate builds one dist at a time, so it would NOT catch it.
  */
-int ds4_sample_dist_build(const float *logits, uint32_t n_vocab,
+int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
                           float temperature, int top_k, float top_p, float min_p,
-                          ds4_sample_scratch *scratch, ds4_sample_dist *out) {
+                          pulsar_sample_scratch *scratch, pulsar_sample_dist *out) {
     memset(out, 0, sizeof(*out));
     if (temperature <= 0.0f) {
         out->ids = (int *)xmalloc(sizeof(int));
@@ -1455,26 +1455,26 @@ int ds4_sample_dist_build(const float *logits, uint32_t n_vocab,
 #undef SC_ID
 }
 
-void ds4_sample_dist_free(ds4_sample_dist *d) {
+void pulsar_sample_dist_free(pulsar_sample_dist *d) {
     free(d->ids);
     free(d->probs);
     memset(d, 0, sizeof(*d));
 }
 
-float ds4_sample_dist_prob(const ds4_sample_dist *d, int token) {
+float pulsar_sample_dist_prob(const pulsar_sample_dist *d, int token) {
     for (uint32_t i = 0; i < d->n; i++)
         if (d->ids[i] == token) return d->probs[i];
     return 0.0f;
 }
 
-int ds4_sample_dist_accept(const ds4_sample_dist *d, int token, uint64_t *rng) {
-    const float pd = ds4_sample_dist_prob(d, token);
+int pulsar_sample_dist_accept(const pulsar_sample_dist *d, int token, uint64_t *rng) {
+    const float pd = pulsar_sample_dist_prob(d, token);
     if (pd >= 1.0f) return 1;
     if (pd <= 0.0f) return 0;
     return sample_rng_f32(rng) < pd;
 }
 
-int ds4_sample_dist_draw(const ds4_sample_dist *d, uint64_t *rng) {
+int pulsar_sample_dist_draw(const pulsar_sample_dist *d, uint64_t *rng) {
     float r = sample_rng_f32(rng);
     for (uint32_t i = 0; i < d->n; i++) {
         r -= d->probs[i];
@@ -1492,15 +1492,15 @@ int ds4_sample_dist_draw(const ds4_sample_dist *d, uint64_t *rng) {
  *
  * Two bugs in the reference implementation this is modelled on
  * (xangel82/DS4-GB10-GX10-DSpark-CUDA — technique only, no code taken) are
- * fixed here, and the unit gate tests/ds4_test.c --spec-math pins both:
+ * fixed here, and the unit gate tests/pulsar_test.c --spec-math pins both:
  *   (a) its `u <= ap` accept test can emit a token with p(x) == 0 (u==0 draws
  *       accept an impossible token). We reject p <= 0 outright and use a
- *       strict `<`, matching ds4_sample_dist_accept's discipline.
+ *       strict `<`, matching pulsar_sample_dist_accept's discipline.
  *   (b) its residual fallback can land on a token whose residual mass is zero.
  *       We track the last STRICTLY POSITIVE residual index instead.
  */
-int ds4_sample_dist_accept_pq(const ds4_sample_dist *p, int token, float q, uint64_t *rng) {
-    const float pd = ds4_sample_dist_prob(p, token);
+int pulsar_sample_dist_accept_pq(const pulsar_sample_dist *p, int token, float q, uint64_t *rng) {
+    const float pd = pulsar_sample_dist_prob(p, token);
     /* bug (a): a token outside p's nucleus is impossible under the target and
      * must never be emitted, whatever u is. */
     if (pd <= 0.0f) return 0;
@@ -1517,8 +1517,8 @@ int ds4_sample_dist_accept_pq(const ds4_sample_dist *p, int token, float q, uint
     return sample_rng_f32(rng) * q < pd;
 }
 
-int ds4_sample_dist_draw_residual(const ds4_sample_dist *p, const ds4_sample_dist *q,
-                                  ds4_sample_scratch *scratch, uint64_t *rng) {
+int pulsar_sample_dist_draw_residual(const pulsar_sample_dist *p, const pulsar_sample_dist *q,
+                                  pulsar_sample_scratch *scratch, uint64_t *rng) {
     /* r(x) = max(0, p(x) - q(x)). r(x) > 0 requires p(x) > 0, so the union of
      * the two supports collapses to p's support: an x in q but not in p has
      * r = max(0, 0 - q(x)) = 0 and cannot be drawn. Iterating p alone is
@@ -1545,7 +1545,7 @@ int ds4_sample_dist_draw_residual(const ds4_sample_dist *p, const ds4_sample_dis
         /* Degenerate: q dominates p across p's whole support. Exactness is
          * already lost in the numerics here; emit SOMETHING p can produce
          * rather than an impossible token. */
-        out = ds4_sample_dist_draw(p, rng);
+        out = pulsar_sample_dist_draw(p, rng);
     } else {
         float r_acc = sample_rng_f32(rng) * mass;
         int last = -1;
@@ -1571,7 +1571,7 @@ int ds4_sample_dist_draw_residual(const ds4_sample_dist *p, const ds4_sample_dis
     return out;
 }
 
-int ds4_sample_dist_draw_excluding(const ds4_sample_dist *d, int excluded, uint64_t *rng) {
+int pulsar_sample_dist_draw_excluding(const pulsar_sample_dist *d, int excluded, uint64_t *rng) {
     /* residual of a rejected deterministic proposal: p with `excluded`
      * removed, renormalized. If the nucleus is exactly {excluded}, there is
      * no residual mass — the caller treats that as accept-forced. */
@@ -1659,7 +1659,7 @@ int sample_top_p_min_p(
 static void print_top_logits(
         FILE          * fp,
         const char    * label,
-        const ds4_vocab * vocab,
+        const pulsar_vocab * vocab,
         const float   * logits,
         uint32_t        n_vocab,
         int             k) {
@@ -1677,7 +1677,7 @@ static void print_top_logits(
         }
     }
 
-    fprintf(fp, "ds4: top logits %s:\n", label);
+    fprintf(fp, "pulsar: top logits %s:\n", label);
     for (int i = 0; i < k && best[i] >= 0; i++) {
         const int id = best[i];
         fprintf(fp, "  %2d %7d % .9g  ", i, id, logits[id]);
@@ -1697,9 +1697,9 @@ static void print_top_logits(
  * pipeline: graph prefill followed by graph decode steps.  Streaming PRO may
  * use decode-style prefill for short prompts. */
 int generate_gpu_graph_raw_swa(
-        const ds4_model   * model,
-        const ds4_vocab   * vocab,
-        const ds4_weights * weights,
+        const pulsar_model   * model,
+        const pulsar_vocab   * vocab,
+        const pulsar_weights * weights,
         const token_vec   * prompt,
         int                 n_predict,
         int                 ctx_size,
@@ -1708,15 +1708,15 @@ int generate_gpu_graph_raw_swa(
         const char        * directional_steering_file,
         float               directional_steering_attn,
         float               directional_steering_ffn,
-        ds4_token_emit_fn   emit,
-        ds4_generation_done_fn done,
+        pulsar_token_emit_fn   emit,
+        pulsar_generation_done_fn done,
         void              * emit_ud,
-        ds4_session_progress_fn progress,
+        pulsar_session_progress_fn progress,
         void              * progress_ud) {
-    fprintf(stderr, "ds4: using GPU graph generation with graph prefill\n");
+    fprintf(stderr, "pulsar: using GPU graph generation with graph prefill\n");
 
     if (prompt->len <= 0 || prompt->len > ctx_size) {
-        fprintf(stderr, "ds4: prompt is empty or exceeds context size\n");
+        fprintf(stderr, "pulsar: prompt is empty or exceeds context size\n");
         return 1;
     }
 
@@ -1725,15 +1725,15 @@ int generate_gpu_graph_raw_swa(
     const uint32_t raw_cap = gpu_graph_raw_cap_for_context(ctx_size, prefill_cap);
     if (prefill_cap < (uint32_t)prompt->len) {
         fprintf(stderr,
-                "ds4: using chunked GPU prefill (%u-token chunks for %d prompt tokens)\n",
+                "pulsar: using chunked GPU prefill (%u-token chunks for %d prompt tokens)\n",
                 prefill_cap,
                 prompt->len);
     }
-    ds4_gpu_graph g;
+    pulsar_gpu_graph g;
     bool ok = gpu_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size, prefill_cap, false);
     if (!ok) {
-        fprintf(stderr, "ds4: failed to allocate GPU graph runtime\n");
+        fprintf(stderr, "pulsar: failed to allocate GPU graph runtime\n");
         return 1;
     }
     g.quality = quality;
@@ -1745,9 +1745,9 @@ int generate_gpu_graph_raw_swa(
         return 1;
     }
     const bool memory_report = getenv("DS4_CUDA_MEMORY_REPORT") != NULL;
-    if (memory_report) ds4_gpu_print_memory_report("after graph alloc");
+    if (memory_report) pulsar_gpu_print_memory_report("after graph alloc");
 
-    float *logits = (float *)xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
+    float *logits = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(logits[0]));
     const bool trace_top = getenv("DS4_TRACE_TOP") != NULL;
     const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
 
@@ -1765,7 +1765,7 @@ int generate_gpu_graph_raw_swa(
                                          NULL, NULL, NULL);
     }
     const double t_prefill1 = now_sec();
-    if (memory_report) ds4_gpu_print_memory_report("after prefill");
+    if (memory_report) pulsar_gpu_print_memory_report("after prefill");
 
     if (!ok) {
         free(logits);
@@ -1774,12 +1774,12 @@ int generate_gpu_graph_raw_swa(
     }
     const char *dump_prefill_logits = getenv("DS4_CUDA_DUMP_PREFILL_LOGITS");
     if (dump_prefill_logits && dump_prefill_logits[0]) {
-        if (!write_f32_binary_file(dump_prefill_logits, logits, DS4_N_VOCAB)) {
+        if (!write_f32_binary_file(dump_prefill_logits, logits, PULSAR_N_VOCAB)) {
             free(logits);
             gpu_graph_free(&g);
             return 1;
         }
-        fprintf(stderr, "ds4: wrote GPU prefill logits to %s\n", dump_prefill_logits);
+        fprintf(stderr, "pulsar: wrote GPU prefill logits to %s\n", dump_prefill_logits);
     }
 
     int pos = prompt->len;
@@ -1790,10 +1790,10 @@ int generate_gpu_graph_raw_swa(
         if (trace_top) {
             char label[64];
             snprintf(label, sizeof(label), "step %d", i);
-            print_top_logits(stderr, label, vocab, logits, DS4_N_VOCAB, 10);
+            print_top_logits(stderr, label, vocab, logits, PULSAR_N_VOCAB, 10);
         }
 
-        int token = sample_argmax(logits, DS4_N_VOCAB);
+        int token = sample_argmax(logits, PULSAR_N_VOCAB);
         if (token == vocab->eos_id) break;
 
         if (emit) emit(emit_ud, token);
@@ -1814,7 +1814,7 @@ int generate_gpu_graph_raw_swa(
         if (!ok) break;
         if (token_timing) {
             const double t_eval1 = now_sec();
-            fprintf(stderr, "ds4: gpu decode eval %d took %.3f ms\n", n_decode_eval + 1, (t_eval1 - t_eval0) * 1000.0);
+            fprintf(stderr, "pulsar: gpu decode eval %d took %.3f ms\n", n_decode_eval + 1, (t_eval1 - t_eval0) * 1000.0);
         }
         n_decode_eval++;
         pos++;
@@ -1824,13 +1824,13 @@ int generate_gpu_graph_raw_swa(
 
     const double prefill_s = t_prefill1 - t_prefill0;
     const double decode_s = t_decode1 - t_decode0;
-    ds4_log(stderr,
-            DS4_LOG_TIMING,
-            "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
+    pulsar_log(stderr,
+            PULSAR_LOG_TIMING,
+            "pulsar: prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
             decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
 
-    if (memory_report) ds4_gpu_print_memory_report("before graph free");
+    if (memory_report) pulsar_gpu_print_memory_report("before graph free");
     free(logits);
     gpu_graph_free(&g);
     return ok ? 0 : 1;
@@ -1848,9 +1848,9 @@ int generate_gpu_graph_raw_swa(
  * to the CLI and server.
  */
 
-const char *ds4_backend_name(ds4_backend backend) {
+const char *pulsar_backend_name(pulsar_backend backend) {
     switch (backend) {
-    case DS4_BACKEND_CUDA:  return "cuda";
+    case PULSAR_BACKEND_CUDA:  return "cuda";
     }
     return "unknown";
 }

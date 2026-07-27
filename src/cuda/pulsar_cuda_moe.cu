@@ -1,6 +1,6 @@
-#include "ds4_cuda_internal.h"
+#include "pulsar_cuda_internal.h"
 
-#include "ds4_iq2_tables_cuda.inc"
+#include "pulsar_iq2_tables_cuda.inc"
 
 
 
@@ -1087,12 +1087,12 @@ static uint32_t moe_mxfp4_gate_up_resolve_tile_width(void) {
     if (cudaGetDevice(&dev) != cudaSuccess ||
         cudaDeviceGetAttribute(&optin_cap, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess) {
         (void)cudaGetLastError();
-        fprintf(stderr, "ds4: MoE MXFP4 gate/up: device SMEM query failed; using the NT=8 tile\n");
+        fprintf(stderr, "pulsar: MoE MXFP4 gate/up: device SMEM query failed; using the NT=8 tile\n");
         return 8u;
     }
     if ((uint32_t)optin_cap < MOE_MXFP4_GATE_UP_NT16_SMEM_MAX) {
         fprintf(stderr,
-                "ds4: MoE MXFP4 gate/up: device dynamic-SMEM opt-in cap %d B < %u B needed for the "
+                "pulsar: MoE MXFP4 gate/up: device dynamic-SMEM opt-in cap %d B < %u B needed for the "
                 "NT=16 tile; using the NT=8 tile (~2.3x slower on this stage)\n",
                 optin_cap, MOE_MXFP4_GATE_UP_NT16_SMEM_MAX);
         return 8u;
@@ -1105,7 +1105,7 @@ static uint32_t moe_mxfp4_gate_up_resolve_tile_width(void) {
     (void)cudaGetLastError();       /* clear: a FAILED setattr is sticky and would surface as the next launch's error */
     if (at != cudaSuccess) {
         fprintf(stderr,
-                "ds4: MoE MXFP4 gate/up: dynamic-SMEM opt-in for %u B refused (%s); "
+                "pulsar: MoE MXFP4 gate/up: dynamic-SMEM opt-in for %u B refused (%s); "
                 "using the NT=8 tile\n",
                 MOE_MXFP4_GATE_UP_NT16_SMEM_MAX, cudaGetErrorString(at));
         return 8u;
@@ -1130,7 +1130,7 @@ static uint32_t moe_mxfp4_gate_up_tile_width(void) {
 /* Boot-line accessor for the resolved gate/up MXFP4 tile width at the production
  * <1024u> row span.  Same cached value the prefill launcher reads at :2756;
  * calling it early only warms the cache (idempotent) -- generation is unchanged. */
-uint32_t ds4_gpu_moe_mxfp4_tile_width(void) {
+uint32_t pulsar_gpu_moe_mxfp4_tile_width(void) {
     return moe_mxfp4_gate_up_tile_width<1024u>();
 }
 
@@ -1941,8 +1941,8 @@ static uint64_t cutlass_moe_align_up(uint64_t n, uint64_t a) { return (n + a - 1
  * [data+SF] block size, *_data_bytes is where the SF blob starts within that block (the
  * "row_bytes" parameter slot, repurposed -- see that function's comment in weights.c). */
 static int routed_moe_launch_cutlass(
-        ds4_gpu_tensor *out,
-        ds4_gpu_tensor *down,
+        pulsar_gpu_tensor *out,
+        pulsar_gpu_tensor *down,
         const void *model_map,
         uint64_t model_size,
         uint64_t gate_offset,
@@ -1955,12 +1955,12 @@ static int routed_moe_launch_cutlass(
         uint32_t expert_in_dim,
         uint32_t expert_mid_dim,
         uint32_t out_dim,
-        const ds4_gpu_tensor *selected,
-        const ds4_gpu_tensor *weights,
+        const pulsar_gpu_tensor *selected,
+        const pulsar_gpu_tensor *weights,
         uint32_t n_total_expert,
         uint32_t n_expert,
         float clamp,
-        const ds4_gpu_tensor *x,
+        const pulsar_gpu_tensor *x,
         uint32_t n_tokens) {
     if (!out || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
@@ -2000,7 +2000,7 @@ static int routed_moe_launch_cutlass(
     const uint64_t gather_x_bytes = (uint64_t)T_max * expert_in_dim * sizeof(float);
     const uint64_t gather_w_bytes = (uint64_t)T_max * sizeof(float);
     const uint64_t ffn_out_bytes = (uint64_t)T_max * out_dim * sizeof(float);
-    const uint64_t ffn_scratch_bytes = ds4_cutlass_expert_ffn_scratch_bytes(
+    const uint64_t ffn_scratch_bytes = pulsar_cutlass_expert_ffn_scratch_bytes(
             (int)T_max, (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim);
 
     const uint64_t align = 256;
@@ -2078,7 +2078,7 @@ static int routed_moe_launch_cutlass(
                     sorted_pairs, pair_offset, count, n_expert, expert_in_dim);
             if (!cuda_ok(cudaGetLastError(), "routed_moe_cutlass gather launch")) return 0;
 
-            const int rc = ds4_cutlass_expert_ffn_scratch(ffn_out, x_gathered,
+            const int rc = pulsar_cutlass_expert_ffn_scratch(ffn_out, x_gathered,
                     Wg_d, Wg_sf, Wu_d, Wu_sf, Wd_d, Wd_sf,
                     w_gathered, clamp,
                     (int)count, (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim,
@@ -2101,8 +2101,8 @@ static int routed_moe_launch_cutlass(
 
 /* ---- Grouped MXFP4 prefill path (single ptr-array grouped GEMM per gate/up/down; no host
  * readback, no host sync). Mirrors routed_moe_launch_cutlass but replaces the per-expert loop
- * with ds4_cutlass_grouped_moe. Experts' tokens are gathered to 128-ROW-PADDED offsets so each
- * group's block-scaled SF starts on a 128-row atom boundary (see ds4_cutlass_grouped_moe). ---- */
+ * with pulsar_cutlass_grouped_moe. Experts' tokens are gathered to 128-ROW-PADDED offsets so each
+ * group's block-scaled SF starts on a 128-row atom boundary (see pulsar_cutlass_grouped_moe). ---- */
 
 /* padded_offsets[e] = sum_{e'<e} ceil(counts[e']/128)*128 (per-group 128-row-padded row base). */
 __global__ static void moe_padded_offsets_kernel(uint32_t *padded_off, const uint32_t *counts, uint32_t n_total) {
@@ -2156,8 +2156,8 @@ __global__ static void moe_padded_scatter_kernel(
 }
 
 static int routed_moe_launch_cutlass_grouped(
-        ds4_gpu_tensor *out,
-        ds4_gpu_tensor *down,
+        pulsar_gpu_tensor *out,
+        pulsar_gpu_tensor *down,
         const void *model_map,
         uint64_t model_size,
         uint64_t gate_offset,
@@ -2170,12 +2170,12 @@ static int routed_moe_launch_cutlass_grouped(
         uint32_t expert_in_dim,
         uint32_t expert_mid_dim,
         uint32_t out_dim,
-        const ds4_gpu_tensor *selected,
-        const ds4_gpu_tensor *weights,
+        const pulsar_gpu_tensor *selected,
+        const pulsar_gpu_tensor *weights,
         uint32_t n_total_expert,
         uint32_t n_expert,
         float clamp,
-        const ds4_gpu_tensor *x,
+        const pulsar_gpu_tensor *x,
         uint32_t n_tokens) {
     if (!out || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
@@ -2213,7 +2213,7 @@ static int routed_moe_launch_cutlass_grouped(
     const uint64_t wg_bytes = padded_upper * sizeof(float);
     const uint64_t ppair_bytes = padded_upper * sizeof(int32_t);
     const uint64_t ffn_bytes = padded_upper * out_dim * sizeof(float);
-    const uint64_t grp_bytes = ds4_cutlass_grouped_moe_scratch_bytes(
+    const uint64_t grp_bytes = pulsar_cutlass_grouped_moe_scratch_bytes(
             (int)padded_upper, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim);
 
     const uint64_t align = 256;
@@ -2273,7 +2273,7 @@ static int routed_moe_launch_cutlass_grouped(
         ok = cuda_ok(cudaGetLastError(), "moe_grouped gather launch");
     }
     if (ok) {
-        int rc = ds4_cutlass_grouped_moe(ffn_out, x_gathered, w_gathered,
+        int rc = pulsar_cutlass_grouped_moe(ffn_out, x_gathered, w_gathered,
                 (const uint8_t *)gate_w, (const uint8_t *)up_w, (const uint8_t *)down_w,
                 gate_stride, gate_data_bytes, down_stride, down_data_bytes,
                 clamp, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim,
@@ -2293,16 +2293,16 @@ static int routed_moe_launch_cutlass_grouped(
     return cuda_ok(cudaGetLastError(), "moe_grouped sum launch");
 }
 
-/* A/B dispatcher: DS4_MOE_FP4_GROUPED=0 forces the legacy per-expert loop (routed_moe_launch_cutlass);
+/* A/B dispatcher: PULSAR_MOE_FP4_GROUPED=0 forces the legacy per-expert loop (routed_moe_launch_cutlass);
  * default (unset or !=0) uses the grouped single-launch path. Same result, bit-exact. */
 static int routed_moe_launch_cutlass_dispatch(
-        ds4_gpu_tensor *out, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size,
+        pulsar_gpu_tensor *out, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
         uint64_t gate_stride, uint64_t gate_data_bytes, uint64_t down_stride, uint64_t down_data_bytes,
         uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
-        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
-        const ds4_gpu_tensor *x, uint32_t n_tokens) {
+        const pulsar_gpu_tensor *x, uint32_t n_tokens) {
     static int grouped = -1;
     if (grouped < 0) {
         const char *e = getenv("DS4_MOE_FP4_GROUPED");
@@ -2318,19 +2318,19 @@ static int routed_moe_launch_cutlass_dispatch(
             if (glog < 0) glog = getenv("DS4_MOE_GROUPED_LOG") != NULL ? 1 : 0;
             static int logged = 0;
             if (glog && !logged) { logged = 1;
-                fprintf(stderr, "ds4: moe grouped path rc=%d n_tok=%u n_total=%u n_exp=%u -> %s\n",
+                fprintf(stderr, "pulsar: moe grouped path rc=%d n_tok=%u n_total=%u n_exp=%u -> %s\n",
                         rc, n_tokens, n_total_expert, n_expert, rc ? "USED grouped" : "FELL BACK to per-expert"); }
         }
         if (rc) return rc;   /* any failure falls through to the legacy loop (safety net) */
     }
     /* Reached only when the grouped path was disabled or failed -> the ~4x
      * slower per-expert loop.  Announce once, unconditionally (was gated behind
-     * the unset DS4_MOE_GROUPED_LOG), so this slow tier is never silent. */
+     * the unset PULSAR_MOE_GROUPED_LOG), so this slow tier is never silent. */
     {
         static int fb_logged = 0;
         if (!fb_logged) { fb_logged = 1;
             fprintf(stderr,
-                    "ds4: WARNING MoE grouped GEMM %s -> per-expert loop (~4x slower prefill)\n",
+                    "pulsar: WARNING MoE grouped GEMM %s -> per-expert loop (~4x slower prefill)\n",
                     grouped ? "failed" : "disabled");
         }
     }
@@ -2347,7 +2347,7 @@ static int routed_moe_launch_cutlass_dispatch(
  * others as iq2/q2k. The grouped path needs all-three-same-type, and the dp4a kernels cannot read
  * the type-40 swizzle, so we run each projection in its native precision and compose in f32. The
  * CUTLASS side runs as a GROUPED single-projection GEMM over 128-row-padded gathered activations
- * (ds4_cutlass_grouped_proj) -- device-built ptr-array, NO host readback, NO per-expert sync -- the
+ * (pulsar_cutlass_grouped_proj) -- device-built ptr-array, NO host readback, NO per-expert sync -- the
  * same machinery the uniform grouped path uses. The dp4a side stays in the per-(token,expert) pair
  * layout with the existing kernels; padded gather/scatter bridge the two layouts:
  *   Case A (gate/up type-40, down dp4a): padded-gather x -> grouped W4A8 gate & up GEMMs -> swiglu
@@ -2392,17 +2392,17 @@ __global__ static void moe_padded_gather_pairflat_kernel(
 }
 
 static int routed_moe_launch_mixed40(
-        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
-        ds4_gpu_tensor *mid, ds4_gpu_tensor *down,
+        pulsar_gpu_tensor *out, pulsar_gpu_tensor *gate, pulsar_gpu_tensor *up,
+        pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down,
         const void *model_map, uint64_t model_size,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
         uint32_t gate_type, uint32_t down_type,
         uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
         uint64_t down_expert_bytes, uint64_t down_row_bytes,
         uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
-        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
-        const ds4_gpu_tensor *x, uint32_t n_tokens) {
+        const pulsar_gpu_tensor *x, uint32_t n_tokens) {
     const int caseA = (gate_type == 40u);       /* gate/up type-40, down dp4a */
     const int caseB = (down_type == 40u);       /* gate/up dp4a, down type-40 */
     if (caseA == caseB) return 0;               /* exactly one side must be cutlass */
@@ -2432,13 +2432,13 @@ static int routed_moe_launch_mixed40(
      * so its memset/pack/grouped-launch overhead dominates. Big batches (prefill) use the grouped,
      * no-host-sync path. `rows` sizes the gather/proj buffers for whichever path is active. */
     /* plan-34 inc 2: a batched multiseq/mixed step forces the M-INDEPENDENT
-     * per-token (non-grouped) path across the whole row range (<=DS4_MSEQ_MAX=8):
+     * per-token (non-grouped) path across the whole row range (<=PULSAR_MSEQ_MAX=8):
      * the grouped path's per-expert group sizes depend on the batch composition,
      * so a co-scheduled decode bank's expert output would shift with the batch
      * width. The non-grouped CUTLASS proj uses fixed compile-time tiles (per-row
      * output independent of M); buffers are sized by n_tokens, so 5..8 are safe.
      * Classic prefill (never armed) keeps the grouped, no-host-sync path at >4. */
-    const int use_grouped = ds4_gpu_matmul_batch_mneutral()
+    const int use_grouped = pulsar_gpu_matmul_batch_mneutral()
             ? (n_tokens > 8u) : (n_tokens > 4u);
     const uint64_t rows = use_grouped ? padded_upper : (uint64_t)n_tokens;
     /* The dp4a side (iq2/q2k) must use the production SORTED-TILED kernels at prefill, not the slow
@@ -2483,10 +2483,10 @@ static int routed_moe_launch_mixed40(
     const uint64_t xq_b   = caseB ? (uint64_t)n_tokens * xq_blocks * sizeof(cuda_block_q8_K) : 0;
     const uint64_t midq_b = caseA ? (uint64_t)pair_count * midq_blocks * sizeof(cuda_block_q8_K) : 0;
     const uint64_t proj_b = use_grouped
-        ? (caseA ? ds4_cutlass_grouped_proj_scratch_bytes((int)padded_upper, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim)
-                 : ds4_cutlass_grouped_proj_scratch_bytes((int)padded_upper, (int)n_total_expert, (int)expert_mid_dim, (int)out_dim))
-        : (caseA ? ds4_cutlass_proj_scratch_bytes((int)n_tokens, (int)expert_in_dim, (int)expert_mid_dim)
-                 : ds4_cutlass_proj_scratch_bytes((int)n_tokens, (int)expert_mid_dim, (int)out_dim));
+        ? (caseA ? pulsar_cutlass_grouped_proj_scratch_bytes((int)padded_upper, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim)
+                 : pulsar_cutlass_grouped_proj_scratch_bytes((int)padded_upper, (int)n_total_expert, (int)expert_mid_dim, (int)out_dim))
+        : (caseA ? pulsar_cutlass_proj_scratch_bytes((int)n_tokens, (int)expert_in_dim, (int)expert_mid_dim)
+                 : pulsar_cutlass_proj_scratch_bytes((int)n_tokens, (int)expert_mid_dim, (int)out_dim));
 
     uint64_t off = 0;
     const uint64_t counts_o  = off; off = cutlass_moe_align_up(off + counts_b, A);
@@ -2580,10 +2580,10 @@ static int routed_moe_launch_mixed40(
                     (const float *)x->ptr, (const float *)weights->ptr,
                     sorted_pairs, offsets, padded_off, pair_count, n_total_expert, n_expert, expert_in_dim);
             ok = cuda_ok(cudaGetLastError(), "mixed40A gather");
-            if (ok && ds4_cutlass_grouped_proj(gate_g, x_gathered, (const uint8_t *)gate_w,
+            if (ok && pulsar_cutlass_grouped_proj(gate_g, x_gathered, (const uint8_t *)gate_w,
                     gate_expert_bytes, gate_row_bytes, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim,
                     counts, padded_off, (int)padded_upper, proj_scratch, proj_b) != 0) ok = 0;
-            if (ok && ds4_cutlass_grouped_proj(up_g, x_gathered, (const uint8_t *)up_w,
+            if (ok && pulsar_cutlass_grouped_proj(up_g, x_gathered, (const uint8_t *)up_w,
                     gate_expert_bytes, gate_row_bytes, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim,
                     counts, padded_off, (int)padded_upper, proj_scratch, proj_b) != 0) ok = 0;
             if (ok) {
@@ -2601,7 +2601,7 @@ static int routed_moe_launch_mixed40(
             /* decode/verify (n<=4): lean W4A8 GEMV -> mid_flat (fused swiglu+routing weight), pair
              * layout, ONE launch over all slots -- no gather/scatter, no host sync, no TC underfill. */
             (void)gate_g; (void)up_g; (void)mid_g;
-            if (ds4_cutlass_gemv_gateup(mid_flat, (const float *)x->ptr, selected_ptr, (const float *)weights->ptr,
+            if (pulsar_cutlass_gemv_gateup(mid_flat, (const float *)x->ptr, selected_ptr, (const float *)weights->ptr,
                     (const uint8_t *)gate_w, (const uint8_t *)up_w, gate_expert_bytes, gate_row_bytes,
                     clamp, (int)n_tokens, (int)n_expert, n_total_expert, (int)expert_in_dim, (int)expert_mid_dim) != 0) ok = 0;
         }
@@ -2663,7 +2663,7 @@ static int routed_moe_launch_mixed40(
             moe_padded_gather_pairflat_kernel<<<pair_count, 256>>>(mid_g, padded_pair, mid_flat,
                     sorted_pairs, offsets, padded_off, pair_count, n_total_expert, expert_mid_dim);
             ok = cuda_ok(cudaGetLastError(), "mixed40B mid gather");
-            if (ok && ds4_cutlass_grouped_proj(out_g, mid_g, (const uint8_t *)down_w,
+            if (ok && pulsar_cutlass_grouped_proj(out_g, mid_g, (const uint8_t *)down_w,
                     down_expert_bytes, down_row_bytes, (int)n_total_expert, (int)expert_mid_dim, (int)out_dim,
                     counts, padded_off, (int)padded_upper, proj_scratch, proj_b) != 0) ok = 0;
             if (ok) {
@@ -2675,7 +2675,7 @@ static int routed_moe_launch_mixed40(
             /* decode/verify (n<=4): lean W4A8 GEMV -> down_flat, pair layout, ONE launch over all
              * slots (routing weight already applied by the dp4a gate/up swiglu into mid_flat). */
             (void)mid_g; (void)out_g;
-            if (ds4_cutlass_gemv_down(down_flat, mid_flat, selected_ptr,
+            if (pulsar_cutlass_gemv_down(down_flat, mid_flat, selected_ptr,
                     (const uint8_t *)down_w, down_expert_bytes, down_row_bytes,
                     (int)n_tokens, (int)n_expert, n_total_expert, (int)expert_mid_dim, (int)out_dim) != 0) ok = 0;
         }
@@ -2690,11 +2690,11 @@ static int routed_moe_launch_mixed40(
 
 
 static int routed_moe_launch(
-        ds4_gpu_tensor *out,
-        ds4_gpu_tensor *gate,
-        ds4_gpu_tensor *up,
-        ds4_gpu_tensor *mid,
-        ds4_gpu_tensor *down,
+        pulsar_gpu_tensor *out,
+        pulsar_gpu_tensor *gate,
+        pulsar_gpu_tensor *up,
+        pulsar_gpu_tensor *mid,
+        pulsar_gpu_tensor *down,
         const void *model_map,
         uint64_t model_size,
         uint64_t gate_offset,
@@ -2709,12 +2709,12 @@ static int routed_moe_launch(
         uint32_t expert_in_dim,
         uint32_t expert_mid_dim,
         uint32_t out_dim,
-        const ds4_gpu_tensor *selected,
-        const ds4_gpu_tensor *weights,
+        const pulsar_gpu_tensor *selected,
+        const pulsar_gpu_tensor *weights,
         uint32_t n_total_expert,
         uint32_t n_expert,
         float clamp,
-        const ds4_gpu_tensor *x,
+        const pulsar_gpu_tensor *x,
         uint32_t layer_index,
         uint32_t n_tokens) {
     if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
@@ -2738,7 +2738,7 @@ static int routed_moe_launch(
     const int gate_q2k = gate_type == 10u;
     const int down_mxfp4 = down_type == 39u;
     const int down_iq2 = down_type == 16u;
-    /* MXFP4 (type-39) big-batch expert-tiled prefill path (DS4_MOE_FP4_TILED, default on;
+    /* MXFP4 (type-39) big-batch expert-tiled prefill path (PULSAR_MOE_FP4_TILED, default on;
      * =0 restores the per-pair qwarp32 kernels). Bit-identical, ~10x faster at prefill. */
     static int fp4_tiled = -1;
     if (fp4_tiled < 0) { const char *e = getenv("DS4_MOE_FP4_TILED"); fp4_tiled = !(e && e[0] == '0'); }
@@ -2780,7 +2780,7 @@ static int routed_moe_launch(
             if (prof_ev[0]) (void)cudaEventRecord(prof_ev[0], 0);
         }
         /* One release configuration (the tuned production values from the old
-         * DS4_CUDA_MOE_* env matrix): expert-major sorted pair tiles, 16-row
+         * PULSAR_CUDA_MOE_* env matrix): expert-major sorted pair tiles, 16-row
          * down tiles + row-span kernels for big prefill batches, LUT gate for
          * decode, direct down-sum for the 6-expert decode case.  (This said
          * "atomic down accumulation" until this commit; there is no atomicAdd
@@ -3178,7 +3178,7 @@ static int routed_moe_launch(
                 (void)cudaEventElapsedTime(&ms_sum, prof_ev[5], prof_ev[6]);
                 (void)cudaEventElapsedTime(&ms_total, prof_ev[0], prof_ev[6]);
                 fprintf(stderr,
-                        "ds4: CUDA MoE profile tokens=%u pairs=%u xq=%.3f sort=%.3f gateup=%.3f midq=%.3f down=%.3f sum=%.3f total=%.3f ms\n",
+                        "pulsar: CUDA MoE profile tokens=%u pairs=%u xq=%.3f sort=%.3f gateup=%.3f midq=%.3f down=%.3f sum=%.3f total=%.3f ms\n",
                         n_tokens, pair_count, ms_xq, ms_sort, ms_gate, ms_midq, ms_down, ms_sum, ms_total);
             }
             for (uint32_t i = 0; i < 7u; i++) (void)cudaEventDestroy(prof_ev[i]);
@@ -3229,14 +3229,14 @@ static int routed_moe_launch(
 
 
 
-int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index) {
+int pulsar_gpu_routed_moe_one_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *gate, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index) {
     if (gate_type == 40u && down_type == 40u) {
         /* Decode (n=1) takes the same direct fp4 GEMV as small verify batches:
          * 4 launches with no host round-trip, vs the grouped path's BLOCKING
          * per-layer offsets readback -- required for CUDA graph capture of the
          * decode tape, and computes the exact same function (see the batch
          * path's comment; bit-exact oracle in temp/fp4gemv_test.cu covers
-         * n_tokens>=1). DS4_MOE_FP4_GEMV=0 restores the grouped dispatch. */
+         * n_tokens>=1). PULSAR_MOE_FP4_GEMV=0 restores the grouped dispatch. */
         static int fp4_gemv = -1;
         if (fp4_gemv < 0) {
             const char *e = getenv("DS4_MOE_FP4_GEMV");
@@ -3257,7 +3257,7 @@ int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4
             const char *up_w   = cuda_model_range_ptr(model_map, up_offset, gate_total, "moe_fp4_gemv_up");
             const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_total, "moe_fp4_gemv_down");
             if (gate_w && up_w && down_w &&
-                ds4_cutlass_expert_ffn_gemv_small(
+                pulsar_cutlass_expert_ffn_gemv_small(
                         (float *)down->ptr, (float *)mid->ptr, (const float *)x->ptr,
                         (const int32_t *)selected->ptr, (const float *)weights->ptr,
                         (const uint8_t *)gate_w, (const uint8_t *)up_w, (const uint8_t *)down_w,
@@ -3278,7 +3278,7 @@ int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4
             static int gemv_dec_logged = 0;
             if (!gemv_dec_logged) { gemv_dec_logged = 1;
                 fprintf(stderr,
-                        "ds4: WARNING MoE fp4 GEMV decode path not taken -> per-expert loop (slower decode)\n");
+                        "pulsar: WARNING MoE fp4 GEMV decode path not taken -> per-expert loop (slower decode)\n");
             }
         }
         return routed_moe_launch_cutlass(out, down, model_map, model_size,
@@ -3311,8 +3311,8 @@ int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4
 /* plan-34 inc 4: row-offset sub-view of a per-token MoE tensor for the two-pass
  * split (byte offset into a row-major [n_tokens x stride] buffer). Reads ptr/bytes
  * only; owner=0 (never freed). NULL/empty tensors pass through as empty. */
-static inline ds4_gpu_tensor moe_subrow(const ds4_gpu_tensor *t, uint64_t off_bytes) {
-    ds4_gpu_tensor s; s.ptr = NULL; s.bytes = 0; s.owner = 0;
+static inline pulsar_gpu_tensor moe_subrow(const pulsar_gpu_tensor *t, uint64_t off_bytes) {
+    pulsar_gpu_tensor s; s.ptr = NULL; s.bytes = 0; s.owner = 0;
     if (t && t->ptr) {
         s.ptr = (char *)t->ptr + off_bytes;
         s.bytes = t->bytes > off_bytes ? t->bytes - off_bytes : 0;
@@ -3320,7 +3320,7 @@ static inline ds4_gpu_tensor moe_subrow(const ds4_gpu_tensor *t, uint64_t off_by
     return s;
 }
 
-static int routed_moe_batch_impl(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
+static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *gate, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
     /* plan-34 inc 4 — MoE TWO-PASS split of a fused mixed step. Row layout is
      * [decode rows 0..n_dec) then one K-row prefill run [n_dec..n_tokens). The MoE
@@ -3337,29 +3337,29 @@ static int routed_moe_batch_impl(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_
      *     which reads no flag). The flag is restored before returning so the rest of
      *     the layer/step still splits its dense GEMMs. */
     {
-        const uint32_t n_dec = (uint32_t)ds4_gpu_matmul_batch_mneutral();
+        const uint32_t n_dec = (uint32_t)pulsar_gpu_matmul_batch_mneutral();
         if (n_dec > 0 && n_dec < n_tokens && x && selected && weights && out) {
             const uint64_t f = sizeof(float), i4 = sizeof(int32_t);
-            ds4_gpu_tensor x_s    = moe_subrow(x,        (uint64_t)n_dec * expert_in_dim * f);
-            ds4_gpu_tensor sel_s  = moe_subrow(selected, (uint64_t)n_dec * n_expert * i4);
-            ds4_gpu_tensor w_s    = moe_subrow(weights,  (uint64_t)n_dec * n_expert * f);
-            ds4_gpu_tensor out_s  = moe_subrow(out,      (uint64_t)n_dec * out_dim * f);
-            ds4_gpu_tensor gate_s = moe_subrow(gate,     (uint64_t)n_dec * n_expert * expert_mid_dim * f);
-            ds4_gpu_tensor up_s   = moe_subrow(up,       (uint64_t)n_dec * n_expert * expert_mid_dim * f);
-            ds4_gpu_tensor mid_s  = moe_subrow(mid,      (uint64_t)n_dec * n_expert * expert_mid_dim * f);
-            ds4_gpu_tensor down_s = moe_subrow(down,     (uint64_t)n_dec * n_expert * out_dim * f);
+            pulsar_gpu_tensor x_s    = moe_subrow(x,        (uint64_t)n_dec * expert_in_dim * f);
+            pulsar_gpu_tensor sel_s  = moe_subrow(selected, (uint64_t)n_dec * n_expert * i4);
+            pulsar_gpu_tensor w_s    = moe_subrow(weights,  (uint64_t)n_dec * n_expert * f);
+            pulsar_gpu_tensor out_s  = moe_subrow(out,      (uint64_t)n_dec * out_dim * f);
+            pulsar_gpu_tensor gate_s = moe_subrow(gate,     (uint64_t)n_dec * n_expert * expert_mid_dim * f);
+            pulsar_gpu_tensor up_s   = moe_subrow(up,       (uint64_t)n_dec * n_expert * expert_mid_dim * f);
+            pulsar_gpu_tensor mid_s  = moe_subrow(mid,      (uint64_t)n_dec * n_expert * expert_mid_dim * f);
+            pulsar_gpu_tensor down_s = moe_subrow(down,     (uint64_t)n_dec * n_expert * out_dim * f);
             const int r1 = routed_moe_batch_impl(out, gate, up, mid, down, model_map, model_size,
                     gate_offset, up_offset, down_offset, gate_type, down_type,
                     gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
                     expert_in_dim, expert_mid_dim, out_dim, selected, weights,
                     n_total_expert, n_expert, clamp, x, layer_index, n_dec, mid_is_f16);
-            ds4_gpu_matmul_set_batch_mneutral(0);
+            pulsar_gpu_matmul_set_batch_mneutral(0);
             const int r2 = routed_moe_batch_impl(&out_s, &gate_s, &up_s, &mid_s, &down_s,
                     model_map, model_size, gate_offset, up_offset, down_offset, gate_type, down_type,
                     gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
                     expert_in_dim, expert_mid_dim, out_dim, &sel_s, &w_s,
                     n_total_expert, n_expert, clamp, &x_s, layer_index, n_tokens - n_dec, mid_is_f16);
-            ds4_gpu_matmul_set_batch_mneutral((int)n_dec);
+            pulsar_gpu_matmul_set_batch_mneutral((int)n_dec);
             return (r1 && r2) ? 1 : 0;
         }
     }
@@ -3367,7 +3367,7 @@ static int routed_moe_batch_impl(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_
         static int entry_log = -1;
         if (entry_log < 0) entry_log = getenv("DS4_MOE_PATH_LOG") != NULL ? 200 : 0;
         if (entry_log > 0) { entry_log--;
-            fprintf(stderr, "ds4: moe_batch ENTRY layer=%u gate_type=%u down_type=%u n_tok=%u\n",
+            fprintf(stderr, "pulsar: moe_batch ENTRY layer=%u gate_type=%u down_type=%u n_tok=%u\n",
                     layer_index, gate_type, down_type, n_tokens); }
     }
     if (gate_type == 40u && down_type == 40u) {
@@ -3381,7 +3381,7 @@ static int routed_moe_batch_impl(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_
          * on-model. Measured verify(3) step 118.2 -> 116.5 ms; the bigger win is
          * removing the per-rich-layer host sync from the verify path (CUDA-graph
          * prerequisite). n_tokens==1 (decode) keeps the grouped path unchanged.
-         * DS4_MOE_FP4_GEMV=0 restores the grouped dispatch. */
+         * PULSAR_MOE_FP4_GEMV=0 restores the grouped dispatch. */
         static int fp4_gemv = -1;
         if (fp4_gemv < 0) {
             const char *e = getenv("DS4_MOE_FP4_GEMV");
@@ -3392,14 +3392,14 @@ static int routed_moe_batch_impl(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_
         if (path_log > 0) {
             path_log--;
             fprintf(stderr,
-                    "ds4: moe40 layer=%u n_tok=%u n_total=%u stride=%llu split=%llu mid=%d down=%d midb=%llu need=%llu\n",
+                    "pulsar: moe40 layer=%u n_tok=%u n_total=%u stride=%llu split=%llu mid=%d down=%d midb=%llu need=%llu\n",
                     layer_index, n_tokens, n_total_expert,
                     (unsigned long long)gate_expert_bytes, (unsigned long long)gate_row_bytes,
                     mid && mid->ptr ? 1 : 0, down && down->ptr ? 1 : 0,
                     (unsigned long long)(mid ? mid->bytes : 0),
                     (unsigned long long)((uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float)));
         }
-        /* inc 2: raise the M-independent GEMV cap to DS4_MSEQ_MAX (8) for a batched
+        /* inc 2: raise the M-independent GEMV cap to PULSAR_MSEQ_MAX (8) for a batched
          * step so 5..8 keep the per-token path instead of the grouped GEMM. */
         /* 2026-07-21: the un-armed default was 4, so spec-verify at --dspark-draft 5
          * (w=6) fell off the per-token GEMV onto the grouped expert GEMM with its
@@ -3409,7 +3409,7 @@ static int routed_moe_batch_impl(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_
          * and 8 (byte-identical logits + token stream, 3 fresh loads per arm), and
          * width 4 is untouched. Median verify: w=6 258.0 -> 180.7 ms (-30.0%),
          * w=8 290.4 -> 213.9 ms (-26.4%); layers_encode 213 -> 130 ms. The three
-         * sibling caps in ds4_cuda_matmul.cu were tried alongside this and are NOT
+         * sibling caps in pulsar_cuda_matmul.cu were tried alongside this and are NOT
          * bit-exact -- they stay at 4; do not re-couple them to this one. */
         const uint32_t moe_gemv_cap = 8u;
         if (fp4_gemv && n_tokens >= 2u && n_tokens <= moe_gemv_cap &&
@@ -3427,7 +3427,7 @@ static int routed_moe_batch_impl(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_
             const char *up_w   = cuda_model_range_ptr(model_map, up_offset, gate_total, "moe_fp4_gemv_up");
             const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_total, "moe_fp4_gemv_down");
             if (gate_w && up_w && down_w &&
-                ds4_cutlass_expert_ffn_gemv_small(
+                pulsar_cutlass_expert_ffn_gemv_small(
                         (float *)down->ptr, (float *)mid->ptr, (const float *)x->ptr,
                         (const int32_t *)selected->ptr, (const float *)weights->ptr,
                         (const uint8_t *)gate_w, (const uint8_t *)up_w, (const uint8_t *)down_w,
@@ -3439,13 +3439,13 @@ static int routed_moe_batch_impl(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_
                 moe_sum_kernel<<<(uint32_t)((sum_n + 255u) / 256u), 256>>>(
                         (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
                 if (cuda_ok(cudaGetLastError(), "moe fp4 gemv sum")) {
-                    if (path_log > 0) fprintf(stderr, "ds4: moe40 layer=%u -> gemv\n", layer_index);
+                    if (path_log > 0) fprintf(stderr, "pulsar: moe40 layer=%u -> gemv\n", layer_index);
                     return 1;
                 }
             }
             /* any failure: fall through to the grouped CUTLASS path */
         }
-        if (path_log > 0) fprintf(stderr, "ds4: moe40 layer=%u -> grouped\n", layer_index);
+        if (path_log > 0) fprintf(stderr, "pulsar: moe40 layer=%u -> grouped\n", layer_index);
         /* A small verify batch (n_tokens 2..4) that was ELIGIBLE for the fp4
          * GEMV fast path but fell through is a genuine (if minor) silent
          * fallback -- announce once, unconditionally.  n_tokens>4 (prefill)
@@ -3456,7 +3456,7 @@ static int routed_moe_batch_impl(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_
             if (fp4_gemv && n_tokens >= 2u && n_tokens <= 4u && !gemv_batch_logged) {
                 gemv_batch_logged = 1;
                 fprintf(stderr,
-                        "ds4: WARNING MoE fp4 GEMV verify(%u) path not taken -> grouped dispatch\n",
+                        "pulsar: WARNING MoE fp4 GEMV verify(%u) path not taken -> grouped dispatch\n",
                         n_tokens);
             }
         }
@@ -3486,7 +3486,7 @@ static int routed_moe_batch_impl(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_
                              layer_index, n_tokens);
 }
 
-/* ---- Per-format MoE prefill timing (DS4_MOE_TIME=1). Buckets each batch MoE call's GPU time
+/* ---- Per-format MoE prefill timing (PULSAR_MOE_TIME=1). Buckets each batch MoE call's GPU time
  * by (gate_type,down_type) via a CUDA-event pair around the impl, and dumps a table at exit.
  * The event sync perturbs host wall-time but the measured per-call GPU interval is accurate;
  * this is a diagnostic-only path (one getenv read, no per-token flag branching in production). */
@@ -3518,7 +3518,7 @@ static void moe_time_accum(uint32_t gt, uint32_t dt, double ms){
     }
 }
 
-int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
+int pulsar_gpu_routed_moe_batch_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *gate, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
     static int time_moe = -1;
     if (time_moe < 0) time_moe = getenv("DS4_MOE_TIME") != NULL ? 1 : 0;
     if (!time_moe) {

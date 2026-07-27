@@ -1,4 +1,4 @@
-#include "ds4_engine_internal.h"
+#include "pulsar_engine_internal.h"
 
 
 
@@ -123,7 +123,7 @@ static void dsv4_hadamard128_inplace_cpu(float *x) {
 
 
 static void dsv4_fp4_act_quantize_row_inplace_cpu(float *x, uint32_t n) {
-    if ((n % 32u) != 0) ds4_die("DSV4 FP4 activation quantization requires 32-aligned rows");
+    if ((n % 32u) != 0) pulsar_die("DSV4 FP4 activation quantization requires 32-aligned rows");
     for (uint32_t off = 0; off < n; off += 32) {
         float amax = 0.0f;
         for (uint32_t i = 0; i < 32; i++) {
@@ -149,7 +149,7 @@ static void dsv4_fp4_act_quantize_row_inplace_cpu(float *x, uint32_t n) {
  * round trip. This applies to both indexer Q and the indexer compressor KV;
  * without it, the top-k compressed-row selection is not the model's graph. */
 void dsv4_indexer_qat_row_inplace_cpu(float *x, uint32_t head_dim) {
-    if (head_dim != 128) ds4_die("DSV4 indexer QAT expects 128-wide indexer rows");
+    if (head_dim != 128) pulsar_die("DSV4 indexer QAT expects 128-wide indexer rows");
     dsv4_hadamard128_inplace_cpu(x);
     dsv4_fp4_act_quantize_row_inplace_cpu(x, head_dim);
 }
@@ -166,8 +166,8 @@ void dsv4_indexer_qat_rows_inplace_cpu(float *x, uint32_t rows, uint32_t head_di
 
 /* Quantize a float activation into Q8_K blocks so GGUF Q2_K/IQ2_XXS expert
  * kernels can reuse the same activation for many expert rows. */
-void ds4_quantize_row_q8_K(const float *x, block_q8_K *y, int64_t k) {
-    if (k % QK_K != 0) ds4_die("Q8_K quantization length is not QK_K aligned");
+void pulsar_quantize_row_q8_K(const float *x, block_q8_K *y, int64_t k) {
+    if (k % QK_K != 0) pulsar_die("Q8_K quantization length is not QK_K aligned");
     const int64_t nb = k / QK_K;
 
     for (int64_t b = 0; b < nb; b++) {
@@ -208,7 +208,7 @@ void ds4_quantize_row_q8_K(const float *x, block_q8_K *y, int64_t k) {
 
 
 
-void ds4_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const block_q8_K *y) {
+void pulsar_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const block_q8_K *y) {
     const int nb = n / QK_K;
 
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
@@ -250,7 +250,7 @@ void ds4_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const block_q8_
             const uint8x16x2_t q2bits = vld1q_u8_x2(q2);
             q2 += 32;
 
-#define DS4_Q2_DOT_NOSHIFT(scale_index) do {                                           \
+#define PULSAR_Q2_DOT_NOSHIFT(scale_index) do {                                           \
                 const int8x16x2_t q8bytes = vld1q_s8_x2(q8);                           \
                 q8 += 32;                                                              \
                 const int8x16_t q2lo = vreinterpretq_s8_u8(vandq_u8(q2bits.val[0], m3));\
@@ -261,7 +261,7 @@ void ds4_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const block_q8_
                         scale_lanes[is + 1 + (scale_index)];                           \
             } while (0)
 
-#define DS4_Q2_DOT_SHIFT(shift, scale_index) do {                                      \
+#define PULSAR_Q2_DOT_SHIFT(shift, scale_index) do {                                      \
                 const int8x16x2_t q8bytes = vld1q_s8_x2(q8);                           \
                 q8 += 32;                                                              \
                 const int8x16_t q2lo = vreinterpretq_s8_u8(                            \
@@ -274,14 +274,14 @@ void ds4_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const block_q8_
                         scale_lanes[is + 1 + (scale_index)];                           \
             } while (0)
 
-            DS4_Q2_DOT_NOSHIFT(0);
-            DS4_Q2_DOT_SHIFT(2, 2);
-            DS4_Q2_DOT_SHIFT(4, 4);
-            DS4_Q2_DOT_SHIFT(6, 6);
+            PULSAR_Q2_DOT_NOSHIFT(0);
+            PULSAR_Q2_DOT_SHIFT(2, 2);
+            PULSAR_Q2_DOT_SHIFT(4, 4);
+            PULSAR_Q2_DOT_SHIFT(6, 6);
             is += 8;
 
-#undef DS4_Q2_DOT_NOSHIFT
-#undef DS4_Q2_DOT_SHIFT
+#undef PULSAR_Q2_DOT_NOSHIFT
+#undef PULSAR_Q2_DOT_SHIFT
         }
 
         sum += d * (float)isum;
@@ -330,7 +330,7 @@ void ds4_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const block_q8_
 
 
 
-static DS4_MAYBE_UNUSED void ds4_vec_dot_iq2_xxs_q8_K(int n, float *s, const block_iq2_xxs *x, const block_q8_K *y) {
+static PULSAR_MAYBE_UNUSED void pulsar_vec_dot_iq2_xxs_q8_K(int n, float *s, const block_iq2_xxs *x, const block_q8_K *y) {
     const int nb = n / QK_K;
 
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
@@ -421,7 +421,7 @@ static DS4_MAYBE_UNUSED void ds4_vec_dot_iq2_xxs_q8_K(int n, float *s, const blo
 
 
 
-void ds4_vec_dot_iq2_xxs_pair_q8_K(
+void pulsar_vec_dot_iq2_xxs_pair_q8_K(
         int n,
         float *s0,
         float *s1,
@@ -457,7 +457,7 @@ void ds4_vec_dot_iq2_xxs_pair_q8_K(
             const uint8_t *a0 = (const uint8_t *)aux0;
             const uint8_t *a1 = (const uint8_t *)aux1;
 
-#define DS4_IQ2_PAIR_DOT(aux, aux8, accum_a, accum_b) do {                                              \
+#define PULSAR_IQ2_PAIR_DOT(aux, aux8, accum_a, accum_b) do {                                              \
                 int8x16_t u0 = vcombine_s8(vld1_s8((const int8_t *)(iq2xxs_grid + (aux8)[0])),          \
                                            vld1_s8((const int8_t *)(iq2xxs_grid + (aux8)[1])));          \
                 int8x16_t u1 = vcombine_s8(vld1_s8((const int8_t *)(iq2xxs_grid + (aux8)[2])),          \
@@ -484,10 +484,10 @@ void ds4_vec_dot_iq2_xxs_pair_q8_K(
                 (accum_b) += (float)vaddvq_s32(p2) * (0.5f + (float)((aux)[3] >> 28));                  \
             } while (0)
 
-            DS4_IQ2_PAIR_DOT(aux0, a0, sum01, sum02);
-            DS4_IQ2_PAIR_DOT(aux1, a1, sum11, sum12);
+            PULSAR_IQ2_PAIR_DOT(aux0, a0, sum01, sum02);
+            PULSAR_IQ2_PAIR_DOT(aux1, a1, sum11, sum12);
 
-#undef DS4_IQ2_PAIR_DOT
+#undef PULSAR_IQ2_PAIR_DOT
         }
 
         total0 += d0 * (sum01 + sum02);
@@ -497,8 +497,8 @@ void ds4_vec_dot_iq2_xxs_pair_q8_K(
     *s0 = 0.25f * total0;
     *s1 = 0.25f * total1;
 #else
-    ds4_vec_dot_iq2_xxs_q8_K(n, s0, x0, y);
-    ds4_vec_dot_iq2_xxs_q8_K(n, s1, x1, y);
+    pulsar_vec_dot_iq2_xxs_q8_K(n, s0, x0, y);
+    pulsar_vec_dot_iq2_xxs_q8_K(n, s1, x1, y);
 #endif
 }
 
@@ -514,10 +514,10 @@ void ds4_vec_dot_iq2_xxs_pair_q8_K(
  * lookup.  Shape validation is intentionally strict.
  */
 
-uint32_t required_u32(const ds4_model *m, const char *key) {
+uint32_t required_u32(const pulsar_model *m, const char *key) {
     uint32_t v = 0;
     if (!model_get_u32(m, key, &v)) {
-        fprintf(stderr, "ds4: required metadata key is missing: %s\n", key);
+        fprintf(stderr, "pulsar: required metadata key is missing: %s\n", key);
         exit(1);
     }
     return v;

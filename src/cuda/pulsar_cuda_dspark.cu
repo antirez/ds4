@@ -1,4 +1,4 @@
-#include "ds4_cuda_internal.h"
+#include "pulsar_cuda_internal.h"
 
 
 /*
@@ -156,11 +156,11 @@ __global__ static void dspark_markov_reduce_kernel(
     }
 }
 
-static int dspark_markov_reduce_blocks(const ds4_gpu_tensor *id_dev,
-                                        const ds4_gpu_tensor *val_dev,
-                                        const ds4_gpu_tensor *id2_dev,
-                                        const ds4_gpu_tensor *val2_dev,
-                                        ds4_gpu_tensor *out_dev, /* 2 x int32 */
+static int dspark_markov_reduce_blocks(const pulsar_gpu_tensor *id_dev,
+                                        const pulsar_gpu_tensor *val_dev,
+                                        const pulsar_gpu_tensor *id2_dev,
+                                        const pulsar_gpu_tensor *val2_dev,
+                                        pulsar_gpu_tensor *out_dev, /* 2 x int32 */
                                         uint32_t grid_dim,
                                         int32_t *refined_id_dst,
                                         int32_t *refined_id2_dst) {
@@ -173,18 +173,18 @@ static int dspark_markov_reduce_blocks(const ds4_gpu_tensor *id_dev,
         grid_dim);
     if (cudaGetLastError() != cudaSuccess) return 0;
     int32_t out[2];
-    if (!ds4_gpu_tensor_read(out_dev, 0, out, sizeof(out))) return 0;
+    if (!pulsar_gpu_tensor_read(out_dev, 0, out, sizeof(out))) return 0;
     *refined_id_dst = out[0];
     if (refined_id2_dst) *refined_id2_dst = out[1];
     return 1;
 }
 
 
-int ds4_gpu_dspark_markov_step_model(
-        ds4_gpu_tensor *refined_logits,
+int pulsar_gpu_dspark_markov_step_model(
+        pulsar_gpu_tensor *refined_logits,
         int32_t *refined_id_dst,
         int32_t *refined_id2_dst,
-        const ds4_gpu_tensor *base_logits,
+        const pulsar_gpu_tensor *base_logits,
         const void *dspark_model_map,
         uint64_t dspark_model_size,
         uint64_t markov_w1_offset,
@@ -222,21 +222,21 @@ int ds4_gpu_dspark_markov_step_model(
      * dspark) -- same alloc sizes, free order, and grow-on-demand logic as the
      * prior loose statics, so the launches are byte-identical. */
     struct DsparkReduceBufs {
-        ds4_gpu_tensor *id, *val, *id2, *val2, *out;
+        pulsar_gpu_tensor *id, *val, *id2, *val2, *out;
         uint32_t cap;
     };
     static DsparkReduceBufs rb = {};
     if (grid_dim > rb.cap) {
-        ds4_gpu_tensor_free(rb.id);
-        ds4_gpu_tensor_free(rb.val);
-        ds4_gpu_tensor_free(rb.id2);
-        ds4_gpu_tensor_free(rb.val2);
-        ds4_gpu_tensor_free(rb.out);
-        rb.id   = ds4_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(int32_t));
-        rb.val  = ds4_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(float));
-        rb.id2  = ds4_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(int32_t));
-        rb.val2 = ds4_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(float));
-        rb.out  = ds4_gpu_tensor_alloc(2u * sizeof(int32_t));
+        pulsar_gpu_tensor_free(rb.id);
+        pulsar_gpu_tensor_free(rb.val);
+        pulsar_gpu_tensor_free(rb.id2);
+        pulsar_gpu_tensor_free(rb.val2);
+        pulsar_gpu_tensor_free(rb.out);
+        rb.id   = pulsar_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(int32_t));
+        rb.val  = pulsar_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(float));
+        rb.id2  = pulsar_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(int32_t));
+        rb.val2 = pulsar_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(float));
+        rb.out  = pulsar_gpu_tensor_alloc(2u * sizeof(int32_t));
         rb.cap  = (rb.id && rb.val && rb.id2 && rb.val2 && rb.out) ? grid_dim : 0;
     }
     if (!rb.id || !rb.val || !rb.id2 || !rb.val2 || !rb.out) return 0;
@@ -291,10 +291,10 @@ __global__ static void dspark_confidence_score_kernel(
 }
 
 
-int ds4_gpu_dspark_confidence_score_model(
-        ds4_gpu_tensor *scores,
-        const ds4_gpu_tensor *hidden,
-        const ds4_gpu_tensor *token_ids,
+int pulsar_gpu_dspark_confidence_score_model(
+        pulsar_gpu_tensor *scores,
+        const pulsar_gpu_tensor *hidden,
+        const pulsar_gpu_tensor *token_ids,
         const void *dspark_model_map,
         uint64_t dspark_model_size,
         uint64_t markov_w1_offset,
@@ -320,36 +320,36 @@ int ds4_gpu_dspark_confidence_score_model(
 
 
 /* after_ffn_hc is an HC residual CARRIER (BF16 storage; task #62) — load via
- * ds4_hc_load, accumulate in f32. Output is a plain f32 embedding row. */
+ * pulsar_hc_load, accumulate in f32. Output is a plain f32 embedding row. */
 __global__ static void dspark_hc_mean_reduce_kernel(
         float *out,
-        const ds4_hc_t *after_ffn_hc,
+        const pulsar_hc_t *after_ffn_hc,
         uint32_t n_embd,
         uint32_t n_hc) {
     for (uint32_t d = threadIdx.x + blockIdx.x * blockDim.x; d < n_embd;
          d += blockDim.x * gridDim.x) {
         float sum = 0.0f;
         for (uint32_t hc = 0; hc < n_hc; hc++)
-            sum += ds4_hc_load(after_ffn_hc, (uint64_t)hc * n_embd + d);
+            sum += pulsar_hc_load(after_ffn_hc, (uint64_t)hc * n_embd + d);
         out[d] = sum / (float)n_hc;
     }
 }
 
-int ds4_gpu_dspark_hc_mean_reduce(
-        ds4_gpu_tensor *out,
-        const ds4_gpu_tensor *after_ffn_hc,
+int pulsar_gpu_dspark_hc_mean_reduce(
+        pulsar_gpu_tensor *out,
+        const pulsar_gpu_tensor *after_ffn_hc,
         uint32_t n_embd,
         uint32_t n_hc) {
     if (!out || !after_ffn_hc || n_embd == 0 || n_hc == 0) return 0;
     if (out->bytes < (uint64_t)n_embd * sizeof(float)) return 0;
-    if (after_ffn_hc->bytes < (uint64_t)n_hc * n_embd * DS4_HC_ELT_SIZE) return 0;   /* carrier */
+    if (after_ffn_hc->bytes < (uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE) return 0;   /* carrier */
 
     const uint32_t block_dim = 256;
     const uint32_t grid_dim = (n_embd + block_dim - 1) / block_dim;
 
     dspark_hc_mean_reduce_kernel<<<grid_dim, block_dim>>>(
         (float *)out->ptr,
-        (const ds4_hc_t *)after_ffn_hc->ptr,
+        (const pulsar_hc_t *)after_ffn_hc->ptr,
         n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "dspark hc mean reduce");
 }
@@ -361,37 +361,37 @@ int ds4_gpu_dspark_hc_mean_reduce(
  * hidden without replaying. */
 __global__ static void dspark_hc_mean_reduce_batch_kernel(
         float *out,
-        const ds4_hc_t *hc_batch,   /* HC residual carrier (BF16); task #62 */
+        const pulsar_hc_t *hc_batch,   /* HC residual carrier (BF16); task #62 */
         uint32_t n_embd,
         uint32_t n_hc) {
     const uint32_t p = blockIdx.y;
-    const ds4_hc_t *in = hc_batch + (uint64_t)p * n_hc * n_embd;
+    const pulsar_hc_t *in = hc_batch + (uint64_t)p * n_hc * n_embd;
     float *op = out + (uint64_t)p * n_embd;
     for (uint32_t d = threadIdx.x + blockIdx.x * blockDim.x; d < n_embd;
          d += blockDim.x * gridDim.x) {
         float sum = 0.0f;
         for (uint32_t hc = 0; hc < n_hc; hc++)
-            sum += ds4_hc_load(in, (uint64_t)hc * n_embd + d);
+            sum += pulsar_hc_load(in, (uint64_t)hc * n_embd + d);
         op[d] = sum / (float)n_hc;
     }
 }
 
 
-int ds4_gpu_dspark_hc_mean_reduce_batch(
-        ds4_gpu_tensor *out,
-        const ds4_gpu_tensor *hc_batch,
+int pulsar_gpu_dspark_hc_mean_reduce_batch(
+        pulsar_gpu_tensor *out,
+        const pulsar_gpu_tensor *hc_batch,
         uint32_t n_embd,
         uint32_t n_hc,
         uint32_t n_tokens) {
     if (!out || !hc_batch || n_embd == 0 || n_hc == 0 || n_tokens == 0) return 0;
     if (out->bytes < (uint64_t)n_tokens * n_embd * sizeof(float)) return 0;
-    if (hc_batch->bytes < (uint64_t)n_tokens * n_hc * n_embd * DS4_HC_ELT_SIZE) return 0;   /* carrier */
+    if (hc_batch->bytes < (uint64_t)n_tokens * n_hc * n_embd * PULSAR_HC_ELT_SIZE) return 0;   /* carrier */
 
     const uint32_t block_dim = 256;
     dim3 grid((n_embd + block_dim - 1) / block_dim, n_tokens, 1);
     dspark_hc_mean_reduce_batch_kernel<<<grid, block_dim>>>(
         (float *)out->ptr,
-        (const ds4_hc_t *)hc_batch->ptr,
+        (const pulsar_hc_t *)hc_batch->ptr,
         n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "dspark hc mean reduce batch");
 }

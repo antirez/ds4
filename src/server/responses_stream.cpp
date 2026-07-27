@@ -1,4 +1,4 @@
-#include "ds4_server_internal.h"
+#include "pulsar_server_internal.h"
 
 
 
@@ -11,7 +11,7 @@ static void responses_random_id(char *dst, size_t dstlen, const char *prefix) {
     if (pos >= dstlen) return;
     if (!random_bytes(bytes, sizeof(bytes))) {
         /* Fail closed like random_tool_id: ids must not be predictable. */
-        ds4_die("random_bytes failed; cannot generate response ids");
+        pulsar_die("random_bytes failed; cannot generate response ids");
     }
     static const char hex[] = "0123456789abcdef";
     for (size_t i = 0; i < sizeof(bytes) && pos + 2 < dstlen; i++) {
@@ -25,7 +25,7 @@ static void responses_random_id(char *dst, size_t dstlen, const char *prefix) {
 
 void responses_stream_init(const request *r, responses_stream *st) {
     memset(st, 0, sizeof(*st));
-    st->mode = ds4_think_mode_enabled(r->think_mode) ? RESP_STREAM_THINKING : RESP_STREAM_TEXT;
+    st->mode = pulsar_think_mode_enabled(r->think_mode) ? RESP_STREAM_THINKING : RESP_STREAM_TEXT;
     responses_random_id(st->response_id, sizeof(st->response_id), "resp_");
     responses_random_id(st->reasoning_id, sizeof(st->reasoning_id), "rs_");
     responses_random_id(st->message_id, sizeof(st->message_id), "msg_");

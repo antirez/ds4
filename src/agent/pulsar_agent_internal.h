@@ -1,12 +1,12 @@
-/* ds4_agent_internal.h — internal shared declarations for the agent sources.
- * Produced by the multi-TU split of ds4_agent.c; edit freely (the
+/* pulsar_agent_internal.h — internal shared declarations for the agent sources.
+ * Produced by the multi-TU split of pulsar_agent.c; edit freely (the
  * generator is not part of the build). */
-#ifndef DS4_AGENT_INTERNAL_H
-#define DS4_AGENT_INTERNAL_H
+#ifndef PULSAR_AGENT_INTERNAL_H
+#define PULSAR_AGENT_INTERNAL_H
 
-#include "ds4.h"
-#include "ds4_help.h"
-#include "ds4_kvstore.h"
+#include "pulsar.h"
+#include "pulsar_help.h"
+#include "pulsar_kvstore.h"
 #include "linenoise.h"
 
 #include <errno.h>
@@ -132,11 +132,11 @@ typedef struct {
     float top_p;
     float min_p;
     uint64_t seed;
-    ds4_think_mode think_mode;
+    pulsar_think_mode think_mode;
 } agent_generation_options;
 
 typedef struct {
-    ds4_engine_options engine;
+    pulsar_engine_options engine;
     agent_generation_options gen;
     const char *chdir_path;
     bool non_interactive;
@@ -169,10 +169,10 @@ typedef struct {
 typedef struct agent_bash_job agent_bash_job;
 
 typedef struct {
-    ds4_engine *engine;
+    pulsar_engine *engine;
     agent_config *cfg;
-    ds4_session *session;
-    ds4_tokens transcript;
+    pulsar_session *session;
+    pulsar_tokens transcript;
     char *cache_dir;
     char *sysprompt_path;
     char session_sha[41];
@@ -230,7 +230,7 @@ typedef enum {
 typedef struct agent_syntax agent_syntax;
 
 typedef struct {
-    ds4_engine *engine;
+    pulsar_engine *engine;
     agent_worker *worker;
     bool format_thinking;
     bool format_markdown;
@@ -420,7 +420,7 @@ typedef struct {
 } agent_history_ptrs;
 
 typedef struct {
-    ds4_kvstore_entry entry;
+    pulsar_kvstore_entry entry;
     char *title;
 } agent_session_list_item;
 
@@ -465,7 +465,7 @@ struct agent_bash_job {
     pid_t pid;
     int pipe_fd;
     int tmp_fd;
-    /* Always the mkstemp template "/tmp/ds4_agent_output_XXXXXX" (27 chars +
+    /* Always the mkstemp template "/tmp/pulsar_agent_output_XXXXXX" (27 chars +
      * NUL) from agent_bash_start — mkstemp only substitutes the X's, so it can
      * never lengthen.  Sized for exactly that, not PATH_MAX. */
     char path[32];
@@ -563,11 +563,11 @@ bool agent_slash_command_known(const char *cmd);
 double agent_now_sec(void);
 void usage(FILE *fp, const char *topic);
 agent_config parse_options(int argc, char **argv);
-void log_context_memory(ds4_backend backend,
+void log_context_memory(pulsar_backend backend,
                                int         ctx_size,
                                uint32_t    prefill_chunk);
-ds4_think_mode effective_think_mode(const agent_config *cfg);
-void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
+pulsar_think_mode effective_think_mode(const agent_config *cfg);
+void agent_append_system_prompt(pulsar_engine *engine, pulsar_tokens *tokens,
                                        const char *extra);
 void agent_worker_note_system_prompt_seen(agent_worker *w);
 void agent_worker_maybe_append_datetime_context(agent_worker *w);
@@ -581,7 +581,7 @@ void agent_trace(agent_worker *w, const char *fmt, ...);
 void agent_trace_token(agent_worker *w, int token, const char *text,
                               size_t text_len, int index);
 void agent_trace_tokens(agent_worker *w, const char *label,
-                               const ds4_tokens *tokens, int start);
+                               const pulsar_tokens *tokens, int start);
 void agent_trace_text(agent_worker *w, const char *label,
                              const char *text, size_t len);
 bool bytes_has_prefix(const char *p, size_t n, const char *prefix);
@@ -622,7 +622,7 @@ bool worker_cancel_session_cb(void *ud);
 void agent_buf_append(agent_buf *b, const char *s, size_t n);
 void agent_buf_puts(agent_buf *b, const char *s);
 char *agent_buf_take(agent_buf *b);
-bool agent_tokens_equal(const ds4_tokens *a, const ds4_tokens *b);
+bool agent_tokens_equal(const pulsar_tokens *a, const pulsar_tokens *b);
 bool agent_mkdir_p(const char *path);
 char *agent_default_cache_dir(void);
 char *agent_kv_path_for_sha(const char *dir, const char sha[41]);
@@ -634,10 +634,10 @@ bool agent_kv_read_text(FILE *fp, uint32_t text_bytes,
                                char **text_out, char *err, size_t err_len);
 bool agent_kv_write_title_trailer(FILE *fp, const char *title,
                                          char *err, size_t err_len);
-bool agent_kv_read_title_trailer(FILE *fp, const ds4_kvstore_entry *hdr,
+bool agent_kv_read_title_trailer(FILE *fp, const pulsar_kvstore_entry *hdr,
                                         char **title_out,
                                         char *err, size_t err_len);
-void agent_kv_identity_sha(const ds4_kvstore_entry *hdr,
+void agent_kv_identity_sha(const pulsar_kvstore_entry *hdr,
                                   const char *text, uint32_t text_bytes,
                                   const char *title,
                                   char sha_out[41]);
@@ -645,16 +645,16 @@ bool agent_kv_load_path(agent_worker *w, const char *path,
                                const char *expected_sha,
                                const char *expected_text,
                                size_t expected_text_len,
-                               ds4_tokens *loaded_tokens,
+                               pulsar_tokens *loaded_tokens,
                                agent_kv_session_meta *meta_out,
                                char *err, size_t err_len);
-void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out);
+void agent_worker_build_system_tokens(agent_worker *w, pulsar_tokens *out);
 void agent_publish_system_status(agent_worker *w, const char *msg);
 void agent_publishf_system_status(agent_worker *w, const char *fmt, ...);
 char *worker_request_queued_user_drain(agent_worker *w);
 bool worker_take_queued_user_drain_request(agent_worker *w);
 void worker_answer_queued_user_drain(agent_worker *w, char *text);
-int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
+int agent_worker_sync_tokens(agent_worker *w, const pulsar_tokens *tokens,
                                     bool publish_progress,
                                     char *err, size_t err_len);
 bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t err_len);
@@ -799,7 +799,7 @@ void editor_write_welcome_banner(agent_editor *editor,
                                         const agent_config *cfg,
                                         const char *prompt,
                                         const char *statusline);
-int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *cfg);
+int agent_worker_init(agent_worker *w, pulsar_engine *engine, agent_config *cfg);
 void agent_worker_free(agent_worker *w);
 bool agent_prompt_yes_no_ex(const char *prompt,
                                    const agent_yes_no_options *opts,
@@ -810,4 +810,4 @@ agent_exit_save_result agent_maybe_save_before_exiting(agent_worker *w);
 /* ---- shared inline helpers ---- */
 
 
-#endif /* DS4_AGENT_INTERNAL_H */
+#endif /* PULSAR_AGENT_INTERNAL_H */

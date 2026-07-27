@@ -1,4 +1,4 @@
-#include "ds4_server_internal.h"
+#include "pulsar_server_internal.h"
 
 
 
@@ -62,7 +62,7 @@ static bool read_http_request(int fd, http_request *r) {
     /* Whole-request read deadline: SO_RCVTIMEO only bounds a single recv, so
      * a client trickling one byte per interval could hold this thread
      * forever. The deadline bounds total arrival time for headers + body. */
-    const time_t deadline = time(NULL) + DS4_SERVER_REQUEST_READ_DEADLINE_SEC;
+    const time_t deadline = time(NULL) + PULSAR_SERVER_REQUEST_READ_DEADLINE_SEC;
 
     while (hend < 0 && b.len < max_header) {
         char tmp[4096];
@@ -126,7 +126,7 @@ void append_model_json_values(buf *b, const char *id, const char *name,
     buf_puts(b,
         ",\"object\":\"model\","
         "\"created\":1767225600,"
-        "\"owned_by\":\"ds4.c\","
+        "\"owned_by\":\"pulsar\","
         "\"name\":");
     json_escape(b, name);
     buf_printf(b,
@@ -159,7 +159,7 @@ static void append_model_json(buf *b, const server *s, const char *id) {
     append_model_json_values(b,
                              id,
                              server_served_model_name(s),
-                             ds4_session_ctx(s->sess),
+                             pulsar_session_ctx(s->sess),
                              s->default_tokens);
 }
 
@@ -231,7 +231,7 @@ static bool send_health(server *s, int fd) {
         "{\"status\":\"%s\",\"version\":\"%s\",\"model\":\"%s\","
         "\"uptime_s\":%ld,\"slots\":{\"total\":%d,\"running\":%d,\"waiting\":%d},"
         "\"kv_cache_usage\":%.6f}\n",
-        draining ? "draining" : "ok", DS4_VERSION_STR, model,
+        draining ? "draining" : "ok", PULSAR_VERSION_STR, model,
         uptime, n_slots, running, waiting, kv);
     bool ok = http_response(fd, s->enable_cors, draining ? 503 : 200,
                             "application/json", b.ptr);
@@ -244,12 +244,12 @@ static bool send_health(server *s, int fd) {
 static bool send_version(server *s, int fd) {
     buf b = {0};
     buf_printf(&b,
-        "{\"version\":\"%s\",\"engine\":\"ds4\",\"cuda_arch\":\"sm_120f\","
+        "{\"version\":\"%s\",\"engine\":\"pulsar\",\"cuda_arch\":\"sm_120f\","
         "\"model\":\"%s\",\"model_name\":\"%s\",\"context\":%d}\n",
-        DS4_VERSION_STR,
+        PULSAR_VERSION_STR,
         server_served_model_id(s),
         server_served_model_name(s),
-        ds4_session_ctx(s->sess));
+        pulsar_session_ctx(s->sess));
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
@@ -260,11 +260,11 @@ static bool send_version(server *s, int fd) {
 static bool send_root(server *s, int fd) {
     buf b = {0};
     buf_printf(&b,
-        "{\"service\":\"ds4-server\",\"version\":\"%s\",\"status\":\"ok\","
+        "{\"service\":\"pulsar-server\",\"version\":\"%s\",\"status\":\"ok\","
         "\"endpoints\":[\"/health\",\"/version\",\"/v1/models\","
         "\"/v1/chat/completions\",\"/v1/completions\",\"/v1/messages\","
         "\"/v1/responses\",\"/metrics\"]}\n",
-        DS4_VERSION_STR);
+        PULSAR_VERSION_STR);
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
@@ -276,14 +276,14 @@ static bool send_root(server *s, int fd) {
  * counters are cumulative since engine open; gauges are point-in-time. */
 static bool send_metrics(server *s, int fd) {
     /* This runs on a client thread: it must not call into the engine
-     * (CUDA-state audit, ds4_server_internal.h). Everything below reads the
+     * (CUDA-state audit, pulsar_server_internal.h). Everything below reads the
      * snapshots the worker publishes under mu (m_spec/m_slot_pos/m_slot_ctx,
      * server_publish_metrics_snapshot — refreshed at bind time and once per
      * quantum, so gauges lag live state by at most one quantum). */
     const char *model = server_served_model_id(s);
-    ds4_spec_metrics m;
+    pulsar_spec_metrics m;
     int n_slots;
-    double slot_kv[DS4_SESSION_POOL_CAP];
+    double slot_kv[PULSAR_SESSION_POOL_CAP];
     pthread_mutex_lock(&s->mu);
     m = s->m_spec;
     n_slots = s->n_slots;
@@ -451,7 +451,7 @@ void *client_main(void *arg) {
     bool ok;
     ok = false;
     int ctx_size;
-    ctx_size = ds4_session_ctx(s->sess);
+    ctx_size = pulsar_session_ctx(s->sess);
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
@@ -547,7 +547,7 @@ int listen_on(const char *host, int port) {
 
 void configure_client_socket(int fd) {
     struct timeval tv;
-    tv.tv_sec = DS4_SERVER_IO_TIMEOUT_SEC;
+    tv.tv_sec = PULSAR_SERVER_IO_TIMEOUT_SEC;
     tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));

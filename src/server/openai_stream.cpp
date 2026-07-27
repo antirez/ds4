@@ -1,4 +1,4 @@
-#include "ds4_server_internal.h"
+#include "pulsar_server_internal.h"
 
 
 
@@ -60,7 +60,7 @@ static const char *context_length_error_param(const request *r) {
 
 
 bool request_exceeds_context(const request *r, int ctx_size) {
-    /* ds4_session_sync() rejects prompt->len >= ctx_size because generation
+    /* pulsar_session_sync() rejects prompt->len >= ctx_size because generation
      * needs at least one free context slot.  Catch the same boundary here so
      * clients get a normal protocol error instead of a later backend failure. */
     return r && r->prompt.len >= ctx_size;
@@ -323,7 +323,7 @@ bool sse_chat_finish(int fd, const request *r, const char *id, const char *conte
 void openai_stream_start(const request *r, openai_stream *st) {
     memset(st, 0, sizeof(*st));
     st->active = true;
-    st->mode = ds4_think_mode_enabled(r->think_mode) ? OPENAI_STREAM_THINKING : OPENAI_STREAM_TEXT;
+    st->mode = pulsar_think_mode_enabled(r->think_mode) ? OPENAI_STREAM_THINKING : OPENAI_STREAM_TEXT;
 }
 
 
@@ -488,14 +488,14 @@ const char *find_lit_bounded(const char *s, size_t n, const char *lit) {
 
 const dsml_syntax dsml_syntaxes[3] = {
     {
-        DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_END,
-        DS4_INVOKE_START, DS4_INVOKE_END,
-        DS4_PARAM_START, DS4_PARAM_END,
+        PULSAR_TOOL_CALLS_START, PULSAR_TOOL_CALLS_END,
+        PULSAR_INVOKE_START, PULSAR_INVOKE_END,
+        PULSAR_PARAM_START, PULSAR_PARAM_END,
     },
     {
-        DS4_TOOL_CALLS_START_SHORT, DS4_TOOL_CALLS_END_SHORT,
-        DS4_INVOKE_START_SHORT, DS4_INVOKE_END_SHORT,
-        DS4_PARAM_START_SHORT, DS4_PARAM_END_SHORT,
+        PULSAR_TOOL_CALLS_START_SHORT, PULSAR_TOOL_CALLS_END_SHORT,
+        PULSAR_INVOKE_START_SHORT, PULSAR_INVOKE_END_SHORT,
+        PULSAR_PARAM_START_SHORT, PULSAR_PARAM_END_SHORT,
     },
     {
         "<tool_calls>", "</tool_calls>",
@@ -575,7 +575,7 @@ static bool dsml_attr_is_string_true(const char *raw, size_t raw_len,
 
 
 
-#ifdef DS4_SERVER_TEST
+#ifdef PULSAR_SERVER_TEST
 
 static bool raw_suffix_partial_lit(const char *raw, size_t raw_len,
                                    const char *lit, size_t min_len) {
@@ -950,20 +950,20 @@ static bool openai_tool_stream_init(openai_tool_stream *ts, const char *raw,
     ts->active = true;
     ts->state = DSML_TOOL_BETWEEN_INVOKES;
     ts->parse_pos = pos;
-    if (raw_full_lit(raw, raw_len, pos, DS4_TOOL_CALLS_START)) {
-        ts->parse_pos += strlen(DS4_TOOL_CALLS_START);
-        ts->tool_calls_end = DS4_TOOL_CALLS_END;
-        ts->invoke_start = DS4_INVOKE_START;
-        ts->invoke_end = DS4_INVOKE_END;
-        ts->param_start = DS4_PARAM_START;
-        ts->param_end = DS4_PARAM_END;
-    } else if (raw_full_lit(raw, raw_len, pos, DS4_TOOL_CALLS_START_SHORT)) {
-        ts->parse_pos += strlen(DS4_TOOL_CALLS_START_SHORT);
-        ts->tool_calls_end = DS4_TOOL_CALLS_END_SHORT;
-        ts->invoke_start = DS4_INVOKE_START_SHORT;
-        ts->invoke_end = DS4_INVOKE_END_SHORT;
-        ts->param_start = DS4_PARAM_START_SHORT;
-        ts->param_end = DS4_PARAM_END_SHORT;
+    if (raw_full_lit(raw, raw_len, pos, PULSAR_TOOL_CALLS_START)) {
+        ts->parse_pos += strlen(PULSAR_TOOL_CALLS_START);
+        ts->tool_calls_end = PULSAR_TOOL_CALLS_END;
+        ts->invoke_start = PULSAR_INVOKE_START;
+        ts->invoke_end = PULSAR_INVOKE_END;
+        ts->param_start = PULSAR_PARAM_START;
+        ts->param_end = PULSAR_PARAM_END;
+    } else if (raw_full_lit(raw, raw_len, pos, PULSAR_TOOL_CALLS_START_SHORT)) {
+        ts->parse_pos += strlen(PULSAR_TOOL_CALLS_START_SHORT);
+        ts->tool_calls_end = PULSAR_TOOL_CALLS_END_SHORT;
+        ts->invoke_start = PULSAR_INVOKE_START_SHORT;
+        ts->invoke_end = PULSAR_INVOKE_END_SHORT;
+        ts->param_start = PULSAR_PARAM_START_SHORT;
+        ts->param_end = PULSAR_PARAM_END_SHORT;
     } else if (raw_full_lit(raw, raw_len, pos, "<tool_calls>")) {
         ts->parse_pos += strlen("<tool_calls>");
         ts->tool_calls_end = "</tool_calls>";

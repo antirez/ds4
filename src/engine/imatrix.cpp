@@ -1,27 +1,27 @@
-#include "ds4_engine_internal.h"
+#include "pulsar_engine_internal.h"
 
 
 
-bool imatrix_collector_init(ds4_imatrix_collector *c, uint32_t cap_tokens, const char *dataset_path) {
+bool imatrix_collector_init(pulsar_imatrix_collector *c, uint32_t cap_tokens, const char *dataset_path) {
     memset(c, 0, sizeof(*c));
     c->cap_tokens = cap_tokens ? cap_tokens : 1u;
     c->dataset_path = dataset_path;
-    const size_t gate_n = (size_t)DS4_N_LAYER * DS4_N_EXPERT * DS4_N_EMBD;
-    const size_t down_n = (size_t)DS4_N_LAYER * DS4_N_EXPERT * DS4_N_FF_EXP;
+    const size_t gate_n = (size_t)PULSAR_N_LAYER * PULSAR_N_EXPERT * PULSAR_N_EMBD;
+    const size_t down_n = (size_t)PULSAR_N_LAYER * PULSAR_N_EXPERT * PULSAR_N_FF_EXP;
     c->gate_up_sum2 = (float *)xcalloc(gate_n, sizeof(c->gate_up_sum2[0]));
     c->down_sum2 = (float *)xcalloc(down_n, sizeof(c->down_sum2[0]));
-    c->ffn_norm_buf = (float *)xmalloc((size_t)c->cap_tokens * DS4_N_EMBD * sizeof(c->ffn_norm_buf[0]));
-    c->routed_mid_buf = (float *)xmalloc((size_t)c->cap_tokens * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(c->routed_mid_buf[0]));
-    c->routed_mid_f16_buf = (uint16_t *)xmalloc((size_t)c->cap_tokens * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(c->routed_mid_f16_buf[0]));
-    c->selected_buf = (int *)xmalloc((size_t)c->cap_tokens * DS4_N_EXPERT_USED * sizeof(c->selected_buf[0]));
-    c->sq_tmp = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(c->sq_tmp[0]));
+    c->ffn_norm_buf = (float *)xmalloc((size_t)c->cap_tokens * PULSAR_N_EMBD * sizeof(c->ffn_norm_buf[0]));
+    c->routed_mid_buf = (float *)xmalloc((size_t)c->cap_tokens * PULSAR_N_EXPERT_USED * PULSAR_N_FF_EXP * sizeof(c->routed_mid_buf[0]));
+    c->routed_mid_f16_buf = (uint16_t *)xmalloc((size_t)c->cap_tokens * PULSAR_N_EXPERT_USED * PULSAR_N_FF_EXP * sizeof(c->routed_mid_f16_buf[0]));
+    c->selected_buf = (int *)xmalloc((size_t)c->cap_tokens * PULSAR_N_EXPERT_USED * sizeof(c->selected_buf[0]));
+    c->sq_tmp = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(c->sq_tmp[0]));
     return c->gate_up_sum2 && c->down_sum2 && c->ffn_norm_buf &&
            c->routed_mid_buf && c->routed_mid_f16_buf && c->selected_buf && c->sq_tmp;
 }
 
 
 
-void imatrix_collector_free(ds4_imatrix_collector *c) {
+void imatrix_collector_free(pulsar_imatrix_collector *c) {
     if (!c) return;
     free(c->gate_up_sum2);
     free(c->down_sum2);
@@ -35,63 +35,63 @@ void imatrix_collector_free(ds4_imatrix_collector *c) {
 
 
 
-static float *imatrix_gate_up_ptr(ds4_imatrix_collector *c, uint32_t il, uint32_t expert) {
-    return c->gate_up_sum2 + ((size_t)il * DS4_N_EXPERT + expert) * DS4_N_EMBD;
+static float *imatrix_gate_up_ptr(pulsar_imatrix_collector *c, uint32_t il, uint32_t expert) {
+    return c->gate_up_sum2 + ((size_t)il * PULSAR_N_EXPERT + expert) * PULSAR_N_EMBD;
 }
 
 
 
-static float *imatrix_down_ptr(ds4_imatrix_collector *c, uint32_t il, uint32_t expert) {
-    return c->down_sum2 + ((size_t)il * DS4_N_EXPERT + expert) * DS4_N_FF_EXP;
+static float *imatrix_down_ptr(pulsar_imatrix_collector *c, uint32_t il, uint32_t expert) {
+    return c->down_sum2 + ((size_t)il * PULSAR_N_EXPERT + expert) * PULSAR_N_FF_EXP;
 }
 
 
 
 static bool imatrix_collect_layer_batch(
-        ds4_imatrix_collector *c,
-        ds4_gpu_graph         *g,
+        pulsar_imatrix_collector *c,
+        pulsar_gpu_graph         *g,
         uint32_t               il,
         uint32_t               n_tokens) {
     if (!c || n_tokens == 0) return true;
     if (n_tokens > c->cap_tokens) return false;
 
-    const uint64_t norm_bytes = (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
-    const uint64_t mid_elems = (uint64_t)n_tokens * DS4_N_EXPERT_USED * DS4_N_FF_EXP;
+    const uint64_t norm_bytes = (uint64_t)n_tokens * PULSAR_N_EMBD * sizeof(float);
+    const uint64_t mid_elems = (uint64_t)n_tokens * PULSAR_N_EXPERT_USED * PULSAR_N_FF_EXP;
     const uint64_t mid_bytes = mid_elems * (g->batch_routed_mid_is_f16 ? sizeof(uint16_t) : sizeof(float));
-    const uint64_t sel_bytes = (uint64_t)n_tokens * DS4_N_EXPERT_USED * sizeof(int);
+    const uint64_t sel_bytes = (uint64_t)n_tokens * PULSAR_N_EXPERT_USED * sizeof(int);
     void *mid_dst = g->batch_routed_mid_is_f16
         ? (void *)c->routed_mid_f16_buf
         : (void *)c->routed_mid_buf;
-    if (ds4_gpu_tensor_read(g->batch_ffn_norm, 0, c->ffn_norm_buf, norm_bytes) == 0 ||
-        ds4_gpu_tensor_read(g->batch_routed_mid, 0, mid_dst, mid_bytes) == 0 ||
-        ds4_gpu_tensor_read(g->batch_router_selected, 0, c->selected_buf, sel_bytes) == 0)
+    if (pulsar_gpu_tensor_read(g->batch_ffn_norm, 0, c->ffn_norm_buf, norm_bytes) == 0 ||
+        pulsar_gpu_tensor_read(g->batch_routed_mid, 0, mid_dst, mid_bytes) == 0 ||
+        pulsar_gpu_tensor_read(g->batch_router_selected, 0, c->selected_buf, sel_bytes) == 0)
     {
         return false;
     }
 
     for (uint32_t t = 0; t < n_tokens; t++) {
-        const float *x = c->ffn_norm_buf + (size_t)t * DS4_N_EMBD;
-        for (uint32_t i = 0; i < DS4_N_EMBD; i++) c->sq_tmp[i] = x[i] * x[i];
+        const float *x = c->ffn_norm_buf + (size_t)t * PULSAR_N_EMBD;
+        for (uint32_t i = 0; i < PULSAR_N_EMBD; i++) c->sq_tmp[i] = x[i] * x[i];
 
-        for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
-            const int expert = c->selected_buf[(size_t)t * DS4_N_EXPERT_USED + slot];
-            if (expert < 0 || (uint32_t)expert >= DS4_N_EXPERT) continue;
+        for (uint32_t slot = 0; slot < PULSAR_N_EXPERT_USED; slot++) {
+            const int expert = c->selected_buf[(size_t)t * PULSAR_N_EXPERT_USED + slot];
+            if (expert < 0 || (uint32_t)expert >= PULSAR_N_EXPERT) continue;
 
             float *gate_up = imatrix_gate_up_ptr(c, il, (uint32_t)expert);
-            for (uint32_t i = 0; i < DS4_N_EMBD; i++) gate_up[i] += c->sq_tmp[i];
+            for (uint32_t i = 0; i < PULSAR_N_EMBD; i++) gate_up[i] += c->sq_tmp[i];
             c->gate_up_count[il][expert]++;
 
             float *down = imatrix_down_ptr(c, il, (uint32_t)expert);
-            const size_t mid_off = ((size_t)t * DS4_N_EXPERT_USED + slot) * DS4_N_FF_EXP;
+            const size_t mid_off = ((size_t)t * PULSAR_N_EXPERT_USED + slot) * PULSAR_N_FF_EXP;
             if (g->batch_routed_mid_is_f16) {
                 const uint16_t *mid = c->routed_mid_f16_buf + mid_off;
-                for (uint32_t i = 0; i < DS4_N_FF_EXP; i++) {
+                for (uint32_t i = 0; i < PULSAR_N_FF_EXP; i++) {
                     const float v = f16_to_f32(mid[i]);
                     down[i] += v * v;
                 }
             } else {
                 const float *mid = c->routed_mid_buf + mid_off;
-                for (uint32_t i = 0; i < DS4_N_FF_EXP; i++) down[i] += mid[i] * mid[i];
+                for (uint32_t i = 0; i < PULSAR_N_FF_EXP; i++) down[i] += mid[i] * mid[i];
             }
             c->down_count[il][expert]++;
             c->observed_routes++;
@@ -105,7 +105,7 @@ static bool imatrix_collect_layer_batch(
 
 
 static void imatrix_write_i32(FILE *fp, int32_t v) {
-    if (fwrite(&v, sizeof(v), 1, fp) != 1) ds4_die("failed to write imatrix");
+    if (fwrite(&v, sizeof(v), 1, fp) != 1) pulsar_die("failed to write imatrix");
 }
 
 
@@ -121,7 +121,7 @@ static void imatrix_write_entry(
     const int32_t ncall = 1;
     const int32_t nval = (int32_t)((uint64_t)n_expert * n_col);
     imatrix_write_i32(fp, len);
-    if (fwrite(name, 1, (size_t)len, fp) != (size_t)len) ds4_die("failed to write imatrix name");
+    if (fwrite(name, 1, (size_t)len, fp) != (size_t)len) pulsar_die("failed to write imatrix name");
     imatrix_write_i32(fp, ncall);
     imatrix_write_i32(fp, nval);
 
@@ -135,7 +135,7 @@ static void imatrix_write_entry(
             const float inv = 1.0f / (float)count;
             for (uint32_t i = 0; i < n_col; i++) tmp[i] = src[i] * inv;
         }
-        if (fwrite(tmp, sizeof(tmp[0]), n_col, fp) != n_col) ds4_die("failed to write imatrix values");
+        if (fwrite(tmp, sizeof(tmp[0]), n_col, fp) != n_col) pulsar_die("failed to write imatrix values");
     }
     free(tmp);
 }
@@ -143,38 +143,38 @@ static void imatrix_write_entry(
 
 
 bool imatrix_collector_save(
-        const ds4_imatrix_collector *c,
-        const ds4_weights           *weights,
+        const pulsar_imatrix_collector *c,
+        const pulsar_weights           *weights,
         const char                  *path) {
     FILE *fp = fopen(path, "wb");
     if (!fp) {
-        fprintf(stderr, "ds4: failed to open imatrix output %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "pulsar: failed to open imatrix output %s: %s\n", path, strerror(errno));
         return false;
     }
 
-    const int32_t entries = (int32_t)(DS4_N_LAYER * 3);
+    const int32_t entries = (int32_t)(PULSAR_N_LAYER * 3);
     imatrix_write_i32(fp, entries);
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const ds4_layer_weights *layer = &weights->layer[il];
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const pulsar_layer_weights *layer = &weights->layer[il];
         char name[256];
         snprintf(name, sizeof(name), "%.*s", (int)layer->ffn_gate_exps->name.len, layer->ffn_gate_exps->name.ptr);
         imatrix_write_entry(fp, name,
-                            c->gate_up_sum2 + (size_t)il * DS4_N_EXPERT * DS4_N_EMBD,
+                            c->gate_up_sum2 + (size_t)il * PULSAR_N_EXPERT * PULSAR_N_EMBD,
                             c->gate_up_count[il],
-                            DS4_N_EXPERT,
-                            DS4_N_EMBD);
+                            PULSAR_N_EXPERT,
+                            PULSAR_N_EMBD);
         snprintf(name, sizeof(name), "%.*s", (int)layer->ffn_up_exps->name.len, layer->ffn_up_exps->name.ptr);
         imatrix_write_entry(fp, name,
-                            c->gate_up_sum2 + (size_t)il * DS4_N_EXPERT * DS4_N_EMBD,
+                            c->gate_up_sum2 + (size_t)il * PULSAR_N_EXPERT * PULSAR_N_EMBD,
                             c->gate_up_count[il],
-                            DS4_N_EXPERT,
-                            DS4_N_EMBD);
+                            PULSAR_N_EXPERT,
+                            PULSAR_N_EMBD);
         snprintf(name, sizeof(name), "%.*s", (int)layer->ffn_down_exps->name.len, layer->ffn_down_exps->name.ptr);
         imatrix_write_entry(fp, name,
-                            c->down_sum2 + (size_t)il * DS4_N_EXPERT * DS4_N_FF_EXP,
+                            c->down_sum2 + (size_t)il * PULSAR_N_EXPERT * PULSAR_N_FF_EXP,
                             c->down_count[il],
-                            DS4_N_EXPERT,
-                            DS4_N_FF_EXP);
+                            PULSAR_N_EXPERT,
+                            PULSAR_N_FF_EXP);
     }
 
     const int32_t chunks = (int32_t)c->chunks;
@@ -183,11 +183,11 @@ bool imatrix_collector_save(
     const int32_t dataset_len = (int32_t)strlen(dataset);
     imatrix_write_i32(fp, dataset_len);
     if (dataset_len && fwrite(dataset, 1, (size_t)dataset_len, fp) != (size_t)dataset_len) {
-        ds4_die("failed to write imatrix dataset name");
+        pulsar_die("failed to write imatrix dataset name");
     }
 
     if (fclose(fp) != 0) {
-        fprintf(stderr, "ds4: failed to close imatrix output %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "pulsar: failed to close imatrix output %s: %s\n", path, strerror(errno));
         return false;
     }
     return true;
@@ -195,22 +195,22 @@ bool imatrix_collector_save(
 
 
 
-bool gpu_graph_reset_prefill_state(ds4_gpu_graph *g) {
+bool gpu_graph_reset_prefill_state(pulsar_gpu_graph *g) {
     memset(g->layer_n_comp, 0, sizeof(g->layer_n_comp));
     memset(g->layer_n_index_comp, 0, sizeof(g->layer_n_index_comp));
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint32_t coff = ratio == 4 ? 2u : 1u;
-        const uint64_t attn_width = (uint64_t)coff * DS4_N_HEAD_DIM;
+        const uint64_t attn_width = (uint64_t)coff * PULSAR_N_HEAD_DIM;
         const uint64_t attn_rows = (uint64_t)coff * ratio;
         if (!gpu_tensor_fill_f32(g->layer_attn_state_kv[il], 0.0f, attn_width * attn_rows)) return false;
-        if (!gpu_tensor_fill_f32(g->layer_attn_state_score[il], DS4_NEG_INF, attn_width * attn_rows)) return false;
+        if (!gpu_tensor_fill_f32(g->layer_attn_state_score[il], PULSAR_NEG_INF, attn_width * attn_rows)) return false;
         if (ratio == 4) {
-            const uint64_t index_width = (uint64_t)coff * DS4_N_INDEXER_HEAD_DIM;
+            const uint64_t index_width = (uint64_t)coff * PULSAR_N_INDEXER_HEAD_DIM;
             const uint64_t index_rows = (uint64_t)coff * ratio;
             if (!gpu_tensor_fill_f32(g->layer_index_state_kv[il], 0.0f, index_width * index_rows)) return false;
-            if (!gpu_tensor_fill_f32(g->layer_index_state_score[il], DS4_NEG_INF, index_width * index_rows)) return false;
+            if (!gpu_tensor_fill_f32(g->layer_index_state_score[il], PULSAR_NEG_INF, index_width * index_rows)) return false;
         }
     }
     return true;
@@ -221,16 +221,16 @@ bool gpu_graph_reset_prefill_state(ds4_gpu_graph *g) {
 /* Execute graph-backend prefill in layer-major order so intermediate
  * activations stay on the GPU and cache state is built exactly once. */
 static void gpu_graph_report_prefill_display_progress(
-        ds4_session_progress_fn display_progress,
+        pulsar_session_progress_fn display_progress,
         void                   *display_progress_ud,
         uint32_t                start,
         uint32_t                n_tokens,
         uint32_t                layer_done,
         int                     total) {
     if (!display_progress) return;
-    if (layer_done > (uint32_t)DS4_N_LAYER) layer_done = (uint32_t)DS4_N_LAYER;
-    uint64_t done = (uint64_t)n_tokens * layer_done / (uint32_t)DS4_N_LAYER;
-    if (layer_done == (uint32_t)DS4_N_LAYER) done = n_tokens;
+    if (layer_done > (uint32_t)PULSAR_N_LAYER) layer_done = (uint32_t)PULSAR_N_LAYER;
+    uint64_t done = (uint64_t)n_tokens * layer_done / (uint32_t)PULSAR_N_LAYER;
+    if (layer_done == (uint32_t)PULSAR_N_LAYER) done = n_tokens;
     display_progress(display_progress_ud, "prefill_display",
                      (int)(start + (uint32_t)done), total);
 }
@@ -238,7 +238,7 @@ static void gpu_graph_report_prefill_display_progress(
 
 
 /* Bulk anchor-hidden dump for drafter retraining: after a chunk syncs, append
- * one record to DS4_DSPARK_PREFILL_DUMP -- {u32 n, u32 start, i32 ids[n],
+ * one record to PULSAR_DSPARK_PREFILL_DUMP -- {u32 n, u32 start, i32 ids[n],
  * f32 h0[n*4096], f32 h1[...], f32 h2[...]} -- and clear the arm flag. Records
  * with start==0 mark request boundaries for the trainer. Failure paths clear
  * the arm without writing so the verify batch path never sees a stale arm. */
@@ -251,7 +251,7 @@ static void dspark_bulk_dump_close(void) {
     }
 }
 
-static void dspark_bulk_drain(ds4_gpu_graph *g, const token_vec *prompt,
+static void dspark_bulk_drain(pulsar_gpu_graph *g, const token_vec *prompt,
                               uint32_t start, uint32_t n, bool ok) {
     if (!g->dspark_bulk_n) return;
     const uint32_t cap_n = g->dspark_bulk_n < n ? g->dspark_bulk_n : n;
@@ -261,7 +261,7 @@ static void dspark_bulk_drain(ds4_gpu_graph *g, const token_vec *prompt,
      * the position%128 ring so generation can seed the drafter's context
      * window (contiguous positions -> at most two segment copies per layer). */
     if (g->dspark_prompt_h[0] && cap_n > 0) {
-        const uint32_t win = DS4_DSPARK_DRAFT_WINDOW;
+        const uint32_t win = PULSAR_DSPARK_DRAFT_WINDOW;
         const uint32_t take = cap_n < win ? cap_n : win;
         const uint32_t p0 = start + cap_n - take;
         for (int s2 = 0; s2 < 3; s2++) {
@@ -271,11 +271,11 @@ static void dspark_bulk_drain(ds4_gpu_graph *g, const token_vec *prompt,
                 const uint32_t slot = pos % win;
                 uint32_t run = win - slot;
                 if (run > take - done) run = take - done;
-                (void)ds4_gpu_tensor_copy(g->dspark_prompt_h[s2],
-                                          (uint64_t)slot * DS4_N_EMBD * sizeof(float),
+                (void)pulsar_gpu_tensor_copy(g->dspark_prompt_h[s2],
+                                          (uint64_t)slot * PULSAR_N_EMBD * sizeof(float),
                                           g->dspark_bulk_h[s2],
-                                          (uint64_t)(pos - start) * DS4_N_EMBD * sizeof(float),
-                                          (uint64_t)run * DS4_N_EMBD * sizeof(float));
+                                          (uint64_t)(pos - start) * PULSAR_N_EMBD * sizeof(float),
+                                          (uint64_t)run * PULSAR_N_EMBD * sizeof(float));
                 done += run;
             }
         }
@@ -302,43 +302,43 @@ static void dspark_bulk_drain(ds4_gpu_graph *g, const token_vec *prompt,
     }
     if (!f) return;
     g_dspark_bulk_dump = f;
-    if (!host) host = (float *)xmalloc((size_t)g->prefill_cap * DS4_N_EMBD * sizeof(float));
+    if (!host) host = (float *)xmalloc((size_t)g->prefill_cap * PULSAR_N_EMBD * sizeof(float));
     uint32_t hdr[2] = { cap_n, start };
     fwrite(hdr, sizeof(uint32_t), 2, f);
     fwrite(prompt->v + start, sizeof(int32_t), cap_n, f);
     for (int s = 0; s < 3; s++) {
-        if (!ds4_gpu_tensor_read(g->dspark_bulk_h[s], 0, host,
-                                 (uint64_t)cap_n * DS4_N_EMBD * sizeof(float)))
+        if (!pulsar_gpu_tensor_read(g->dspark_bulk_h[s], 0, host,
+                                 (uint64_t)cap_n * PULSAR_N_EMBD * sizeof(float)))
             return;
-        fwrite(host, sizeof(float), (size_t)cap_n * DS4_N_EMBD, f);
+        fwrite(host, sizeof(float), (size_t)cap_n * PULSAR_N_EMBD, f);
     }
     fflush(f);
 }
 
 static bool gpu_graph_prefill_layer_major_inner(
-        ds4_gpu_graph *g,
-        const ds4_model       *model,
-        const ds4_weights     *weights,
+        pulsar_gpu_graph *g,
+        const pulsar_model       *model,
+        const pulsar_weights     *weights,
         const token_vec       *prompt,
         uint32_t               start,
         uint32_t               n_tokens,
         float                 *logits,
         bool                   show_progress,
-        ds4_imatrix_collector *imatrix,
-        ds4_session_progress_fn display_progress,
+        pulsar_imatrix_collector *imatrix,
+        pulsar_session_progress_fn display_progress,
         void                  *display_progress_ud);
 
 bool gpu_graph_prefill_layer_major(
-        ds4_gpu_graph *g,
-        const ds4_model       *model,
-        const ds4_weights     *weights,
+        pulsar_gpu_graph *g,
+        const pulsar_model       *model,
+        const pulsar_weights     *weights,
         const token_vec       *prompt,
         uint32_t               start,
         uint32_t               n_tokens,
         float                 *logits,
         bool                   show_progress,
-        ds4_imatrix_collector *imatrix,
-        ds4_session_progress_fn display_progress,
+        pulsar_imatrix_collector *imatrix,
+        pulsar_session_progress_fn display_progress,
         void                  *display_progress_ud) {
     const bool ok = gpu_graph_prefill_layer_major_inner(g, model, weights, prompt,
                                                         start, n_tokens, logits,
@@ -350,16 +350,16 @@ bool gpu_graph_prefill_layer_major(
 }
 
 static bool gpu_graph_prefill_layer_major_inner(
-        ds4_gpu_graph *g,
-        const ds4_model       *model,
-        const ds4_weights     *weights,
+        pulsar_gpu_graph *g,
+        const pulsar_model       *model,
+        const pulsar_weights     *weights,
         const token_vec       *prompt,
         uint32_t               start,
         uint32_t               n_tokens,
         float                 *logits,
         bool                   show_progress,
-        ds4_imatrix_collector *imatrix,
-        ds4_session_progress_fn display_progress,
+        pulsar_imatrix_collector *imatrix,
+        pulsar_session_progress_fn display_progress,
         void                  *display_progress_ud) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
     if (start > (uint32_t)prompt->len) return false;
@@ -407,8 +407,8 @@ static bool gpu_graph_prefill_layer_major_inner(
                                                      prompt,
                                                      start,
                                                      n_tokens);
-        if (ok) ok = ds4_gpu_begin_commands() != 0;
-        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        if (ok) ok = pulsar_gpu_begin_commands() != 0;
+        for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {
             ok = gpu_graph_encode_layer_batch(g,
                                                 model,
                                                 &weights->layer[il],
@@ -416,10 +416,10 @@ static bool gpu_graph_prefill_layer_major_inner(
                                                 start,
                                                 n_tokens);
             if (!ok) {
-                fprintf(stderr, "ds4: gpu whole-prefill layer %u encode failed\n", il);
+                fprintf(stderr, "pulsar: gpu whole-prefill layer %u encode failed\n", il);
             }
             if (show_progress) {
-                fprintf(stderr, "ds4: gpu prefill layer %u/%u\r", il + 1, (uint32_t)DS4_N_LAYER);
+                fprintf(stderr, "pulsar: gpu prefill layer %u/%u\r", il + 1, (uint32_t)PULSAR_N_LAYER);
                 fflush(stderr);
             }
         }
@@ -428,7 +428,7 @@ static bool gpu_graph_prefill_layer_major_inner(
             display_progress(display_progress_ud, "prefill_display",
                              (int)(start + n_tokens), prompt->len);
 
-        const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+        const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
         uint32_t output_row = (uint32_t)n_tokens - 1u;
         const char *output_row_env = getenv("DS4_CUDA_GRAPH_OUTPUT_ROW");
         if (output_row_env && output_row_env[0]) {
@@ -438,8 +438,8 @@ static bool gpu_graph_prefill_layer_major_inner(
                 output_row = (uint32_t)v;
             }
         }
-        ds4_gpu_tensor *saved_cur = g->cur_hc;
-        ds4_gpu_tensor *last_hc = NULL;
+        pulsar_gpu_tensor *saved_cur = g->cur_hc;
+        pulsar_gpu_tensor *last_hc = NULL;
         if (ok && logits) {
             last_hc = gpu_graph_hc_row_view(g->batch_cur_hc, output_row, hc_dim);
             ok = last_hc != NULL;
@@ -451,25 +451,25 @@ static bool gpu_graph_prefill_layer_major_inner(
         }
 
         const double t_encoded = profile ? now_sec() : 0.0;
-        if (ok) ok = ds4_gpu_end_commands() != 0;
+        if (ok) ok = pulsar_gpu_end_commands() != 0;
         const double t_done = profile ? now_sec() : 0.0;
         g->cur_hc = saved_cur;
-        if (last_hc) ds4_gpu_tensor_free(last_hc);
+        if (last_hc) pulsar_gpu_tensor_free(last_hc);
         if (!ok) {
-            if (ds4_gpu_synchronize() == 0) {
-                fprintf(stderr, "ds4: GPU synchronize after whole-prefill graph failure also failed\n");
+            if (pulsar_gpu_synchronize() == 0) {
+                fprintf(stderr, "pulsar: GPU synchronize after whole-prefill graph failure also failed\n");
             }
             return false;
         }
 
         const double t_before_read = profile ? now_sec() : 0.0;
         if (logits) {
-            ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+            ok = pulsar_gpu_tensor_read(g->logits, 0, logits, (uint64_t)PULSAR_N_VOCAB * sizeof(float)) != 0;
         }
         if (profile) {
             const double t_read = now_sec();
             fprintf(stderr,
-                    "ds4: gpu graph prefill total tokens=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms\n",
+                    "pulsar: gpu graph prefill total tokens=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms\n",
                     n_tokens,
                     (t_encoded - t0) * 1000.0,
                     (t_done - t_encoded) * 1000.0,
@@ -494,22 +494,22 @@ static bool gpu_graph_prefill_layer_major_inner(
         execute_s += t_embed_done - t_embed_encoded;
         if (split_profile) {
             fprintf(stderr,
-                    "ds4: GPU layer-major prefill embed encode=%.3f ms execute=%.3f ms\n",
+                    "pulsar: GPU layer-major prefill embed encode=%.3f ms execute=%.3f ms\n",
                     (t_embed_encoded - t_layer0) * 1000.0,
                     (t_embed_done - t_embed_encoded) * 1000.0);
         }
     }
     if (!ok) {
-        if (ds4_gpu_synchronize() == 0) {
-            fprintf(stderr, "ds4: GPU synchronize after layer-major prefill embed failure also failed\n");
+        if (pulsar_gpu_synchronize() == 0) {
+            fprintf(stderr, "pulsar: GPU synchronize after layer-major prefill embed failure also failed\n");
         }
         return false;
     }
 
-    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+    for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {
         if (split_profile) {
             const double t_attn0 = now_sec();
-            ok = ds4_gpu_begin_commands() != 0;
+            ok = pulsar_gpu_begin_commands() != 0;
             if (ok) ok = gpu_graph_encode_layer_attention_batch(g,
                                                                   model,
                                                                   &weights->layer[il],
@@ -517,14 +517,14 @@ static bool gpu_graph_prefill_layer_major_inner(
                                                                   start,
                                                                   n_tokens);
             if (!ok) {
-                fprintf(stderr, "ds4: gpu layer-major prefill layer %u attention encode failed\n", il);
+                fprintf(stderr, "pulsar: gpu layer-major prefill layer %u attention encode failed\n", il);
             }
             const double t_attn_encoded = now_sec();
-            if (ok) ok = ds4_gpu_end_commands() != 0;
+            if (ok) ok = pulsar_gpu_end_commands() != 0;
             const double t_attn_done = now_sec();
 
             const double t_ffn0 = now_sec();
-            if (ok) ok = ds4_gpu_begin_commands() != 0;
+            if (ok) ok = pulsar_gpu_begin_commands() != 0;
             if (ok) ok = gpu_graph_encode_layer_ffn_batch(g,
                                                             model,
                                                             &weights->layer[il],
@@ -532,22 +532,22 @@ static bool gpu_graph_prefill_layer_major_inner(
                                                             start,
                                                             n_tokens);
             if (!ok) {
-                fprintf(stderr, "ds4: gpu layer-major prefill layer %u ffn encode failed\n", il);
+                fprintf(stderr, "pulsar: gpu layer-major prefill layer %u ffn encode failed\n", il);
             }
             if (ok) {
-                ds4_gpu_tensor *tmp = g->batch_cur_hc;
+                pulsar_gpu_tensor *tmp = g->batch_cur_hc;
                 g->batch_cur_hc = g->batch_next_hc;
                 g->batch_next_hc = tmp;
             }
             const double t_ffn_encoded = now_sec();
-            if (ok) ok = ds4_gpu_end_commands() != 0;
+            if (ok) ok = pulsar_gpu_end_commands() != 0;
             const double t_ffn_done = now_sec();
             if (ok && imatrix) ok = imatrix_collect_layer_batch(imatrix, g, il, (uint32_t)n_tokens);
 
             encode_s += (t_attn_encoded - t_attn0) + (t_ffn_encoded - t_ffn0);
             execute_s += (t_attn_done - t_attn_encoded) + (t_ffn_done - t_ffn_encoded);
             fprintf(stderr,
-                    "ds4: GPU layer-major prefill layer %u attn encode=%.3f execute=%.3f ms ffn encode=%.3f execute=%.3f ms\n",
+                    "pulsar: GPU layer-major prefill layer %u attn encode=%.3f execute=%.3f ms ffn encode=%.3f execute=%.3f ms\n",
                     il,
                     (t_attn_encoded - t_attn0) * 1000.0,
                     (t_attn_done - t_attn_encoded) * 1000.0,
@@ -555,7 +555,7 @@ static bool gpu_graph_prefill_layer_major_inner(
                     (t_ffn_done - t_ffn_encoded) * 1000.0);
         } else {
             const double t_chunk0 = profile ? now_sec() : 0.0;
-            ok = ds4_gpu_begin_commands() != 0;
+            ok = pulsar_gpu_begin_commands() != 0;
             if (ok) ok = gpu_graph_encode_layer_batch(g,
                                                         model,
                                                         &weights->layer[il],
@@ -563,25 +563,25 @@ static bool gpu_graph_prefill_layer_major_inner(
                                                         start,
                                                         n_tokens);
             if (!ok) {
-                fprintf(stderr, "ds4: gpu layer-major prefill layer %u encode failed\n", il);
+                fprintf(stderr, "pulsar: gpu layer-major prefill layer %u encode failed\n", il);
             }
             const double t_encoded = profile ? now_sec() : 0.0;
-            if (ok) ok = ds4_gpu_end_commands() != 0;
+            if (ok) ok = pulsar_gpu_end_commands() != 0;
             const double t_done = profile ? now_sec() : 0.0;
             if (ok && imatrix) ok = imatrix_collect_layer_batch(imatrix, g, il, (uint32_t)n_tokens);
             if (profile) {
                 encode_s += t_encoded - t_chunk0;
                 execute_s += t_done - t_encoded;
                 fprintf(stderr,
-                        "ds4: gpu layer-major prefill layer %u encode=%.3f ms execute=%.3f ms\n",
+                        "pulsar: gpu layer-major prefill layer %u encode=%.3f ms execute=%.3f ms\n",
                         il,
                         (t_encoded - t_chunk0) * 1000.0,
                         (t_done - t_encoded) * 1000.0);
             }
         }
         if (!ok) {
-            if (ds4_gpu_synchronize() == 0) {
-                fprintf(stderr, "ds4: GPU synchronize after layer-major prefill failure also failed\n");
+            if (pulsar_gpu_synchronize() == 0) {
+                fprintf(stderr, "pulsar: GPU synchronize after layer-major prefill failure also failed\n");
             }
             return false;
         }
@@ -592,19 +592,19 @@ static bool gpu_graph_prefill_layer_major_inner(
                                                   il + 1,
                                                   prompt->len);
         if (show_progress) {
-            fprintf(stderr, "ds4: gpu prefill layer %u/%u\r", il + 1, (uint32_t)DS4_N_LAYER);
+            fprintf(stderr, "pulsar: gpu prefill layer %u/%u\r", il + 1, (uint32_t)PULSAR_N_LAYER);
             fflush(stderr);
         }
     }
     if (!ok) {
-        if (ds4_gpu_synchronize() == 0) {
-            fprintf(stderr, "ds4: GPU synchronize after layer-major prefill failure also failed\n");
+        if (pulsar_gpu_synchronize() == 0) {
+            fprintf(stderr, "pulsar: GPU synchronize after layer-major prefill failure also failed\n");
         }
         return false;
     }
     if (show_progress) fputc('\n', stderr);
 
-    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
     uint32_t output_row = (uint32_t)n_tokens - 1u;
     const char *output_row_env = getenv("DS4_CUDA_GRAPH_OUTPUT_ROW");
     if (output_row_env && output_row_env[0]) {
@@ -614,8 +614,8 @@ static bool gpu_graph_prefill_layer_major_inner(
             output_row = (uint32_t)v;
         }
     }
-    ds4_gpu_tensor *saved_cur = g->cur_hc;
-    ds4_gpu_tensor *last_hc = NULL;
+    pulsar_gpu_tensor *saved_cur = g->cur_hc;
+    pulsar_gpu_tensor *last_hc = NULL;
 
     const double t_head0 = profile ? now_sec() : 0.0;
     if (logits) {
@@ -626,19 +626,19 @@ static bool gpu_graph_prefill_layer_major_inner(
     }
     if (ok && logits) {
         g->cur_hc = last_hc;
-        ok = ds4_gpu_begin_commands() != 0;
+        ok = pulsar_gpu_begin_commands() != 0;
     }
     if (ok && logits) ok = gpu_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
     const double t_head_encoded = profile ? now_sec() : 0.0;
-    if (ok && logits) ok = ds4_gpu_end_commands() != 0;
+    if (ok && logits) ok = pulsar_gpu_end_commands() != 0;
     const double t_head_done = profile ? now_sec() : 0.0;
     g->cur_hc = saved_cur;
-    if (last_hc) ds4_gpu_tensor_free(last_hc);
+    if (last_hc) pulsar_gpu_tensor_free(last_hc);
     if (!ok) return false;
 
     const double t_before_read = profile ? now_sec() : 0.0;
     if (logits) {
-        ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+        ok = pulsar_gpu_tensor_read(g->logits, 0, logits, (uint64_t)PULSAR_N_VOCAB * sizeof(float)) != 0;
     }
     if (profile) {
         const double t_read = now_sec();
@@ -646,12 +646,12 @@ static bool gpu_graph_prefill_layer_major_inner(
         execute_s += t_head_done - t_head_encoded;
         if (split_profile) {
             fprintf(stderr,
-                    "ds4: gpu layer-major prefill head encode=%.3f ms execute=%.3f ms\n",
+                    "pulsar: gpu layer-major prefill head encode=%.3f ms execute=%.3f ms\n",
                     (t_head_encoded - t_head0) * 1000.0,
                     (t_head_done - t_head_encoded) * 1000.0);
         }
         fprintf(stderr,
-                "ds4: gpu layer-major prefill total tokens=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms\n",
+                "pulsar: gpu layer-major prefill total tokens=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms\n",
                 n_tokens,
                 encode_s * 1000.0,
                 execute_s * 1000.0,
@@ -664,16 +664,16 @@ static bool gpu_graph_prefill_layer_major_inner(
 
 
 bool gpu_graph_prefill_raw_swa(
-        ds4_gpu_graph *g,
-        const ds4_model       *model,
-        const ds4_weights     *weights,
+        pulsar_gpu_graph *g,
+        const pulsar_model       *model,
+        const pulsar_weights     *weights,
         const token_vec       *prompt,
         int                    n_tokens,
         float                 *logits,
         bool                   show_progress,
-        ds4_session_progress_fn display_progress,
+        pulsar_session_progress_fn display_progress,
         void                  *display_progress_ud,
-        ds4_session_cancel_fn  cancel,
+        pulsar_session_cancel_fn  cancel,
         void                  *cancel_ud,
         bool                  *cancelled) {
     if (n_tokens <= 0 || n_tokens > prompt->len) return false;
@@ -715,20 +715,20 @@ static uint32_t gcd_u32(uint32_t a, uint32_t b) {
 }
 
 bool gpu_graph_prefill_chunked_range(
-        ds4_gpu_graph *g,
-        const ds4_model       *model,
-        const ds4_weights     *weights,
+        pulsar_gpu_graph *g,
+        const pulsar_model       *model,
+        const pulsar_weights     *weights,
         const token_vec       *prompt,
         uint32_t               start,
         uint32_t               n_tokens,
         float                 *logits,
         bool                   show_progress,
-        ds4_session_progress_fn progress,
+        pulsar_session_progress_fn progress,
         void                  *progress_ud,
-        ds4_session_progress_fn display_progress,
+        pulsar_session_progress_fn display_progress,
         void                  *display_progress_ud,
-        ds4_imatrix_collector *imatrix,
-        ds4_session_cancel_fn  cancel,
+        pulsar_imatrix_collector *imatrix,
+        pulsar_session_cancel_fn  cancel,
         void                  *cancel_ud,
         bool                  *cancelled) {
     if (n_tokens == 0 || g->prefill_cap == 0) return false;
@@ -775,8 +775,8 @@ bool gpu_graph_prefill_chunked_range(
          * chunk still ENDS on an aligned boundary. */
         if (chunk < remaining) {
             uint32_t align = 1;
-            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-                const uint32_t r = ds4_layer_compress_ratio(il);
+            for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+                const uint32_t r = pulsar_layer_compress_ratio(il);
                 if (r > 1 && align % r != 0) align *= r / gcd_u32(align, r);
             }
             if (align > 1) {
@@ -802,8 +802,8 @@ bool gpu_graph_prefill_chunked_range(
                                                   display_progress,
                                                   display_progress_ud);
         if (!ok) {
-            if (ds4_gpu_synchronize() == 0) {
-                fprintf(stderr, "ds4: GPU synchronize after chunked prefill failure also failed\n");
+            if (pulsar_gpu_synchronize() == 0) {
+                fprintf(stderr, "pulsar: GPU synchronize after chunked prefill failure also failed\n");
             }
             return false;
         }
@@ -823,7 +823,7 @@ bool gpu_graph_prefill_chunked_range(
     if (profile) {
         const double t_read = now_sec();
         fprintf(stderr,
-                "ds4: gpu chunked prefill start=%u tokens=%u chunk=%u total=%.3f ms\n",
+                "pulsar: gpu chunked prefill start=%u tokens=%u chunk=%u total=%.3f ms\n",
                 start,
                 n_tokens,
                 chunk_cap,
@@ -837,18 +837,18 @@ bool gpu_graph_prefill_chunked_range(
 /* Long prompts are prefetched in fixed-size chunks.  Chunks bound transient
  * attention buffers while preserving the same final KV/cache state. */
 bool gpu_graph_prefill_chunked(
-        ds4_gpu_graph *g,
-        const ds4_model       *model,
-        const ds4_weights     *weights,
+        pulsar_gpu_graph *g,
+        const pulsar_model       *model,
+        const pulsar_weights     *weights,
         const token_vec       *prompt,
         int                    n_tokens,
         float                 *logits,
         bool                   show_progress,
-        ds4_session_progress_fn progress,
+        pulsar_session_progress_fn progress,
         void                  *progress_ud,
-        ds4_session_progress_fn display_progress,
+        pulsar_session_progress_fn display_progress,
         void                  *display_progress_ud,
-        ds4_session_cancel_fn  cancel,
+        pulsar_session_cancel_fn  cancel,
         void                  *cancel_ud,
         bool                  *cancelled) {
     if (n_tokens <= 0) return false;
@@ -883,9 +883,9 @@ bool gpu_graph_prefill_chunked(
  * the final hand-written N=2/N=4 decode microbatch, but it exercises the right
  * verifier contract and removes the obvious diagnostic overheads first. */
 bool gpu_graph_verify_suffix_tops(
-        ds4_gpu_graph *g,
-        const ds4_model       *model,
-        const ds4_weights     *weights,
+        pulsar_gpu_graph *g,
+        const pulsar_model       *model,
+        const pulsar_weights     *weights,
         const token_vec       *prompt,
         uint32_t               start,
         uint32_t               n_tokens,
@@ -913,7 +913,7 @@ bool gpu_graph_verify_suffix_tops(
     const double t_uploaded = timing ? now_sec() : 0.0;
     if (!ok) return false;
 
-    /* DS4_DECODE_DESCR level 2 (Tier-2 diagnostic): run this verify batch
+    /* PULSAR_DECODE_DESCR level 2 (Tier-2 diagnostic): run this verify batch
      * through the banked multiseq machinery as a one-bank batch over the
      * current bank — per-bank frontiers, banked emit loop, banked kernels.
      * Byte-gated vs classic with the generic kernel tiers pinned (see
@@ -937,8 +937,8 @@ bool gpu_graph_verify_suffix_tops(
     }
 
     const double t_layers_encode0 = timing ? now_sec() : 0.0;
-    ok = ds4_gpu_begin_commands() != 0;
-    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+    ok = pulsar_gpu_begin_commands() != 0;
+    for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {
         ok = gpu_graph_encode_layer_batch(g,
                                             model,
                                             &weights->layer[il],
@@ -948,9 +948,9 @@ bool gpu_graph_verify_suffix_tops(
     }
     const double t_layers_encoded = timing ? now_sec() : 0.0;
     if (ok) {
-        ok = ds4_gpu_end_commands() != 0;
+        ok = pulsar_gpu_end_commands() != 0;
     } else {
-        (void)ds4_gpu_synchronize();
+        (void)pulsar_gpu_synchronize();
     }
     if (mseq_diag) {
         /* Disarm + frontier self-check even when the sweep failed. */
@@ -961,7 +961,7 @@ bool gpu_graph_verify_suffix_tops(
     if (!ok) return false;
 
     const double t_head_encode0 = timing ? now_sec() : 0.0;
-    ok = ds4_gpu_begin_commands() != 0;
+    ok = pulsar_gpu_begin_commands() != 0;
     if (ok) ok = gpu_graph_encode_output_head_batch(g,
                                                       model,
                                                       weights,
@@ -972,9 +972,9 @@ bool gpu_graph_verify_suffix_tops(
             /* Common K=2 verify case: top_k=1 over n_vocab → use the dedicated
              * argmax kernel (single-block tree-reduce) instead of the legacy
              * indexer_topk_kernel's single-thread O(n_vocab * top_k) fall-through. */
-            ok = ds4_gpu_argmax_tensor(g->comp_selected,
+            ok = pulsar_gpu_argmax_tensor(g->comp_selected,
                                        g->spec_logits,
-                                       DS4_N_VOCAB) != 0;
+                                       PULSAR_N_VOCAB) != 0;
         } else if (top_rows) {
             /* top-1 of each of the top_rows rows. The legacy
              * indexer_topk_tensor fall-through for this shape launches ONE
@@ -982,45 +982,45 @@ bool gpu_graph_verify_suffix_tops(
              * per-row argmax launches (1024-thread tree-reduce each) do the
              * same job in <1ms and write the same [top_rows] i32 layout. */
             for (uint32_t r = 0; ok && r < top_rows; r++) {
-                ds4_gpu_tensor *row = ds4_gpu_tensor_view(
+                pulsar_gpu_tensor *row = pulsar_gpu_tensor_view(
                         g->spec_logits,
-                        (uint64_t)r * DS4_N_VOCAB * sizeof(float),
-                        (uint64_t)DS4_N_VOCAB * sizeof(float));
-                ds4_gpu_tensor *dst = ds4_gpu_tensor_view(
+                        (uint64_t)r * PULSAR_N_VOCAB * sizeof(float),
+                        (uint64_t)PULSAR_N_VOCAB * sizeof(float));
+                pulsar_gpu_tensor *dst = pulsar_gpu_tensor_view(
                         g->comp_selected,
                         (uint64_t)r * sizeof(int32_t),
                         sizeof(int32_t));
                 ok = row && dst &&
-                     ds4_gpu_argmax_tensor(dst, row, DS4_N_VOCAB) != 0;
-                ds4_gpu_tensor_free(row);
-                ds4_gpu_tensor_free(dst);
+                     pulsar_gpu_argmax_tensor(dst, row, PULSAR_N_VOCAB) != 0;
+                pulsar_gpu_tensor_free(row);
+                pulsar_gpu_tensor_free(dst);
             }
         }
     }
     const double t_head_encoded = timing ? now_sec() : 0.0;
     if (ok) {
-        ok = ds4_gpu_end_commands() != 0;
+        ok = pulsar_gpu_end_commands() != 0;
     } else {
-        (void)ds4_gpu_synchronize();
+        (void)pulsar_gpu_synchronize();
     }
     const double t_head_done = timing ? now_sec() : 0.0;
     const double t_read0 = timing ? now_sec() : 0.0;
     if (ok && top_rows) {
-        ok = ds4_gpu_tensor_read(g->comp_selected,
+        ok = pulsar_gpu_tensor_read(g->comp_selected,
                                    0,
                                    row_tops,
                                    (uint64_t)top_rows * sizeof(row_tops[0])) != 0;
     }
     if (ok && row_logits) {
-        ok = ds4_gpu_tensor_read(g->spec_logits,
+        ok = pulsar_gpu_tensor_read(g->spec_logits,
                                    0,
                                    row_logits,
-                                   (uint64_t)n_tokens * DS4_N_VOCAB * sizeof(row_logits[0])) != 0;
+                                   (uint64_t)n_tokens * PULSAR_N_VOCAB * sizeof(row_logits[0])) != 0;
     }
     if (timing) {
         const double t_done = now_sec();
         fprintf(stderr,
-                "ds4: spec verify suffix tokens=%u start=%u upload=%.3f ms layers_encode=%.3f ms layers_execute=%.3f ms head_encode=%.3f ms head_execute=%.3f ms read=%.3f ms total=%.3f ms ok=%d\n",
+                "pulsar: spec verify suffix tokens=%u start=%u upload=%.3f ms layers_encode=%.3f ms layers_execute=%.3f ms head_encode=%.3f ms head_execute=%.3f ms read=%.3f ms total=%.3f ms ok=%d\n",
                 n_tokens,
                 start,
                 (t_uploaded - t0) * 1000.0,
@@ -1045,7 +1045,7 @@ bool gpu_graph_verify_suffix_tops(
  * independent sessions at unrelated positions rather than one session's
  * speculative suffix, so the sweep runs armed as a banked multiseq step
  * (per-row positions/seq_id descriptors, per-bank compressor frontiers,
- * emit-before-attention per the driver contract in ds4_gpu.h).
+ * emit-before-attention per the driver contract in pulsar_gpu.h).
  *
  * Inputs are packed row-major: row k carries session bank[k]'s current token
  * tokens[k] at absolute position pos[k].  Rows must satisfy the step_begin
@@ -1059,7 +1059,7 @@ bool gpu_graph_verify_suffix_tops(
  * single-bank work resumes.  NEVER co-schedule speculation with n_active >= 2
  * (contract; the scheduler's alone->spec / shared->plain switch).
  *
- * logits: out [n_active * DS4_N_VOCAB] host rows, row k = bank[k]'s
+ * logits: out [n_active * PULSAR_N_VOCAB] host rows, row k = bank[k]'s
  * next-token distribution; sampling stays per-session on the host with that
  * session's own sampler state.
  *
@@ -1070,9 +1070,9 @@ bool gpu_graph_verify_suffix_tops(
  * per-bank KV state can no longer be trusted; the session must be torn
  * down). */
 int gpu_graph_decode_multiseq_batch(
-        ds4_gpu_graph *g,
-        const ds4_model       *model,
-        const ds4_weights     *weights,
+        pulsar_gpu_graph *g,
+        const pulsar_model       *model,
+        const pulsar_weights     *weights,
         const int             *tokens,
         const int32_t         *pos,
         const int32_t         *bank,
@@ -1081,15 +1081,15 @@ int gpu_graph_decode_multiseq_batch(
         uint32_t              *out_n_rows,
         uint32_t               max_head_runs) {
     /* plan-34 inc 3: the ROW count (n_active) is bounded by prefill_cap (a K-row
-     * prefill chunk rides this entry); DS4_MSEQ_MAX bounds only the BANK count,
-     * enforced per-row in step_begin (seq[t] >= DS4_MSEQ_MAX). The pool-count
-     * clause below is the bank ceiling; do NOT reinstate an n_active>DS4_MSEQ_MAX
+     * prefill chunk rides this entry); PULSAR_MSEQ_MAX bounds only the BANK count,
+     * enforced per-row in step_begin (seq[t] >= PULSAR_MSEQ_MAX). The pool-count
+     * clause below is the bank ceiling; do NOT reinstate an n_active>PULSAR_MSEQ_MAX
      * row ceiling. */
     if (!g || !model || !weights || !tokens || !pos || !bank || !logits ||
         n_active == 0 ||
         n_active > gpu_graph_bank_pool_count(g) * g->prefill_cap ||
         n_active > g->prefill_cap || !g->spec_logits) {
-        fprintf(stderr, "ds4: multiseq decode rejected: bad args (n_active=%u"
+        fprintf(stderr, "pulsar: multiseq decode rejected: bad args (n_active=%u"
                         " pool=%u prefill_cap=%u logits_slab=%s)\n", n_active,
                 g ? gpu_graph_bank_pool_count(g) : 0u,
                 g ? g->prefill_cap : 0u,
@@ -1101,10 +1101,10 @@ int gpu_graph_decode_multiseq_batch(
      * token embedding is position/bank-independent, so the existing prompt
      * uploader runs unmodified over a stack copy of the caller's array (this
      * is exactly how classic decode feeds the graph, batched).  The copy
-     * (<= DS4_MSEQ_MAX ints) keeps the caller's `const int *` honest — the
+     * (<= PULSAR_MSEQ_MAX ints) keeps the caller's `const int *` honest — the
      * token_vec ABI is non-const and casting it away here would license a
      * write we do not make. */
-    /* inc 3: heap the row-indexed token copy (was [DS4_MSEQ_MAX]) so a K-row
+    /* inc 3: heap the row-indexed token copy (was [PULSAR_MSEQ_MAX]) so a K-row
      * prefill chunk fits. n_active <= prefill_cap. */
     int *cur_tokens = (int *)xmalloc((size_t)n_active * sizeof(int));
     memcpy(cur_tokens, tokens, (size_t)n_active * sizeof(cur_tokens[0]));
@@ -1130,15 +1130,15 @@ int gpu_graph_decode_multiseq_batch(
      * A K-row prefill run advances the KV by K but only its last row's logits
      * are consumed (the continuation); computing all K vocab GEMMs would be the
      * single biggest GEMM in the model AND overflow the 16-row spec_logits slab.
-     * n_runs == n_banks <= DS4_MSEQ_MAX <= 16, so the head always fits.
+     * n_runs == n_banks <= PULSAR_MSEQ_MAX <= 16, so the head always fits.
      * DECODE-ONLY (every run length 1 => n_runs == n_active) keeps the identity
      * layout and the SINGLE-BLOCK layers+head path => byte-identical to before
      * (the inc-1/inc-2 gates must stay green). */
-    int last_idx[DS4_MSEQ_MAX];
+    int last_idx[PULSAR_MSEQ_MAX];
     uint32_t n_runs = 0;
     for (uint32_t t = 0; t < n_active; t++) {
         if (t + 1 == n_active || bank[t + 1] != bank[t]) {
-            if (n_runs < DS4_MSEQ_MAX) last_idx[n_runs] = (int)t;
+            if (n_runs < PULSAR_MSEQ_MAX) last_idx[n_runs] = (int)t;
             n_runs++;
         }
     }
@@ -1158,8 +1158,8 @@ int gpu_graph_decode_multiseq_batch(
     for (uint32_t r = 0; r < head_runs; r++)
         if ((uint32_t)last_idx[r] != r) { head_single_block = false; break; }
 
-    bool ok = ds4_gpu_begin_commands() != 0;
-    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+    bool ok = pulsar_gpu_begin_commands() != 0;
+    for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {
         ok = gpu_graph_encode_layer_batch(g, model, &weights->layer[il], il,
                                           (uint32_t)pos[0], n_active);
     }
@@ -1171,25 +1171,25 @@ int gpu_graph_decode_multiseq_batch(
          * decode banks and skips the whole prefill-head two-block. */
         if (ok) ok = gpu_graph_encode_output_head_batch(g, model, weights,
                                                         head_runs, weights->output->dim[1]);
-        if (ok) ok = ds4_gpu_end_commands() != 0; else (void)ds4_gpu_synchronize();
+        if (ok) ok = pulsar_gpu_end_commands() != 0; else (void)pulsar_gpu_synchronize();
     } else {
         /* Prefill/mixed final: close the layer block so batch_cur_hc is final,
          * GATHER each emitted run's LAST row to the front of batch_cur_hc, then run
          * the head on the compact head_runs rows in a second block. last_idx is
          * ascending with last_idx[r] >= r, so front-compaction never clobbers an
          * un-copied source. The extra synchronize is amortized over the prefill. */
-        if (ok) ok = ds4_gpu_end_commands() != 0; else (void)ds4_gpu_synchronize();
-        const uint64_t hc_row_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * DS4_HC_ELT_SIZE;   /* carrier */
+        if (ok) ok = pulsar_gpu_end_commands() != 0; else (void)pulsar_gpu_synchronize();
+        const uint64_t hc_row_bytes = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD * PULSAR_HC_ELT_SIZE;   /* carrier */
         for (uint32_t r = 0; ok && r < head_runs; r++) {
             if ((uint32_t)last_idx[r] != r)
-                ok = ds4_gpu_tensor_copy(g->batch_cur_hc, (uint64_t)r * hc_row_bytes,
+                ok = pulsar_gpu_tensor_copy(g->batch_cur_hc, (uint64_t)r * hc_row_bytes,
                                          g->batch_cur_hc, (uint64_t)last_idx[r] * hc_row_bytes,
                                          hc_row_bytes) != 0;
         }
-        if (ok) ok = ds4_gpu_begin_commands() != 0;
+        if (ok) ok = pulsar_gpu_begin_commands() != 0;
         if (ok) ok = gpu_graph_encode_output_head_batch(g, model, weights,
                                                         head_runs, weights->output->dim[1]);
-        if (ok) ok = ds4_gpu_end_commands() != 0; else (void)ds4_gpu_synchronize();
+        if (ok) ok = pulsar_gpu_end_commands() != 0; else (void)pulsar_gpu_synchronize();
     }
     /* Disarm + per-bank frontier self-check even when the sweep failed. The
      * step_end check covers EVERY bank (incl. a prefill run whose head we skipped),
@@ -1201,8 +1201,8 @@ int gpu_graph_decode_multiseq_batch(
      * first-appearance). Decode-only => head_runs == n_runs == n_active, row k ==
      * bank[k]. */
     if (out_n_rows) *out_n_rows = head_runs;
-    ok = ds4_gpu_tensor_read(g->spec_logits, 0, logits,
-                             (uint64_t)head_runs * DS4_N_VOCAB * sizeof(float)) != 0;
+    ok = pulsar_gpu_tensor_read(g->spec_logits, 0, logits,
+                             (uint64_t)head_runs * PULSAR_N_VOCAB * sizeof(float)) != 0;
     /* The banks' KV/frontiers committed correctly (step_end passed); a
      * readback failure still leaves the caller without this step's logits,
      * which desynchronizes its sampling from the committed KV — treat as
@@ -1212,10 +1212,10 @@ int gpu_graph_decode_multiseq_batch(
 
 
 
-bool gpu_graph_read_spec_logits_row(ds4_gpu_graph *g, uint32_t row, float *logits) {
+bool gpu_graph_read_spec_logits_row(pulsar_gpu_graph *g, uint32_t row, float *logits) {
     if (!g || !g->spec_logits || !logits || row >= g->prefill_cap) return false;
-    const uint64_t row_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float);
-    return ds4_gpu_tensor_read(g->spec_logits,
+    const uint64_t row_bytes = (uint64_t)PULSAR_N_VOCAB * sizeof(float);
+    return pulsar_gpu_tensor_read(g->spec_logits,
                                  (uint64_t)row * row_bytes,
                                  logits,
                                  row_bytes) != 0;
@@ -1226,7 +1226,7 @@ bool gpu_graph_read_spec_logits_row(ds4_gpu_graph *g, uint32_t row, float *logit
 /* Pick a raw SWA cache size for GPU.  During batched prefill it must cover
  * the previous window plus the current ubatch. */
 uint32_t gpu_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_cap) {
-    uint32_t raw_window = DS4_N_SWA;
+    uint32_t raw_window = PULSAR_N_SWA;
     if (raw_window > (uint32_t)ctx_size) raw_window = (uint32_t)ctx_size;
     if (raw_window == 0) raw_window = 1;
 
@@ -1265,7 +1265,7 @@ uint32_t gpu_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_cap) {
  * Long Flash prompts default to 4096-token chunks; PRO defaults to 8192. */
 uint32_t gpu_graph_prefill_cap_for_prompt(int prompt_len,
                                                    uint32_t prefill_chunk) {
-    return ds4_prefill_cap_for_prompt(prompt_len, prefill_chunk);
+    return pulsar_prefill_cap_for_prompt(prompt_len, prefill_chunk);
 }
 
 
@@ -1289,48 +1289,48 @@ uint32_t gpu_graph_resume_prefill_min_tokens(void) {
 
 
 
-ds4_context_memory ds4_context_memory_estimate_with_prefill(
-        ds4_backend backend,
+pulsar_context_memory pulsar_context_memory_estimate_with_prefill(
+        pulsar_backend backend,
         int         ctx_size,
         uint32_t    prefill_chunk) {
-    ds4_context_memory m = {0};
+    pulsar_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
 
-    if (ds4_backend_uses_graph(backend)) {
+    if (pulsar_backend_uses_graph(backend)) {
         m.prefill_cap = gpu_graph_prefill_cap_for_prompt((int)ctx,
                                                            prefill_chunk);
         m.raw_cap = gpu_graph_raw_cap_for_context((int)ctx, m.prefill_cap);
 
         uint32_t min_ratio = UINT32_MAX;
-        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-            const uint32_t ratio = ds4_layer_compress_ratio(il);
+        for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+            const uint32_t ratio = pulsar_layer_compress_ratio(il);
             if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
         }
         if (min_ratio == UINT32_MAX) min_ratio = ctx;
         m.comp_cap = ctx / min_ratio + 2u;
         if (m.comp_cap < 2u) m.comp_cap = 2u;
 
-        m.raw_bytes = (uint64_t)DS4_N_LAYER *
+        m.raw_bytes = (uint64_t)PULSAR_N_LAYER *
                       m.raw_cap *
-                      DS4_N_HEAD_DIM *
+                      PULSAR_N_HEAD_DIM *
                       sizeof(float);
-        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-            const uint32_t ratio = ds4_layer_compress_ratio(il);
+        for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+            const uint32_t ratio = pulsar_layer_compress_ratio(il);
             if (ratio == 0) continue;
             const uint32_t layer_comp_cap = ctx / ratio + 2u;
             m.compressed_bytes += (uint64_t)layer_comp_cap *
-                                  DS4_N_HEAD_DIM *
+                                  PULSAR_N_HEAD_DIM *
                                   sizeof(float);
             if (ratio == 4) {
                 m.compressed_bytes += (uint64_t)layer_comp_cap *
-                                      DS4_N_INDEXER_HEAD_DIM *
+                                      PULSAR_N_INDEXER_HEAD_DIM *
                                       sizeof(float);
             }
         }
         uint64_t attn_stage_cap = (uint64_t)(m.prefill_cap / min_ratio + 2u);
         if (attn_stage_cap < 2u) attn_stage_cap = 2u;
         /* indexer_scores/comp_mask token rows shrink to the slice size under
-         * DS4_PREFILL_SLICE (see gpu_graph_prefill_slice / gpu_diag alloc). */
+         * PULSAR_PREFILL_SLICE (see gpu_graph_prefill_slice / gpu_diag alloc). */
         uint64_t score_rows = (uint64_t)m.prefill_cap;
         if (gpu_graph_prefill_slice() != 0u &&
             (uint64_t)gpu_graph_prefill_slice() < score_rows) {
@@ -1340,24 +1340,24 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill(
                           m.comp_cap *
                           score_rows *
                           sizeof(float) +
-                          attn_stage_cap * DS4_N_HEAD_DIM * sizeof(float);
+                          attn_stage_cap * PULSAR_N_HEAD_DIM * sizeof(float);
     } else {
-        m.raw_cap = ds4_default_raw_cap(ctx);
-        m.raw_bytes = (uint64_t)DS4_N_LAYER *
+        m.raw_cap = pulsar_default_raw_cap(ctx);
+        m.raw_bytes = (uint64_t)PULSAR_N_LAYER *
                       m.raw_cap *
-                      DS4_N_HEAD_DIM *
+                      PULSAR_N_HEAD_DIM *
                       sizeof(float);
-        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-            const uint32_t ratio = ds4_layer_compress_ratio(il);
+        for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+            const uint32_t ratio = pulsar_layer_compress_ratio(il);
             if (ratio == 0) continue;
             const uint32_t comp_cap = ctx / ratio + 2u;
             if (ratio == 4) m.comp_cap = comp_cap;
             m.compressed_bytes += (uint64_t)comp_cap *
-                                  DS4_N_HEAD_DIM *
+                                  PULSAR_N_HEAD_DIM *
                                   sizeof(float);
             if (ratio == 4) {
                 m.compressed_bytes += (uint64_t)comp_cap *
-                                      DS4_N_INDEXER_HEAD_DIM *
+                                      PULSAR_N_INDEXER_HEAD_DIM *
                                       sizeof(float);
             }
         }
@@ -1373,9 +1373,9 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill(
 
 
 
-ds4_context_memory ds4_context_memory_estimate(ds4_backend backend,
+pulsar_context_memory pulsar_context_memory_estimate(pulsar_backend backend,
                                                int         ctx_size) {
-    return ds4_context_memory_estimate_with_prefill(backend, ctx_size, 0);
+    return pulsar_context_memory_estimate_with_prefill(backend, ctx_size, 0);
 }
 
 
@@ -1386,29 +1386,29 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend,
  * than the sizeof(float) pessimistic upper bound the base estimate uses.  The
  * f32 scratch working set (batch_* buffers etc.) is not packed and carries
  * through from the base estimate unchanged. */
-ds4_context_memory ds4_context_memory_estimate_packed(
-        ds4_backend backend,
+pulsar_context_memory pulsar_context_memory_estimate_packed(
+        pulsar_backend backend,
         int         ctx_size,
         uint32_t    prefill_chunk) {
-    ds4_context_memory m =
-        ds4_context_memory_estimate_with_prefill(backend, ctx_size, prefill_chunk);
-    if (!ds4_backend_uses_graph(backend)) return m;
+    pulsar_context_memory m =
+        pulsar_context_memory_estimate_with_prefill(backend, ctx_size, prefill_chunk);
+    if (!pulsar_backend_uses_graph(backend)) return m;
 
     const uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
 
-    /* Raw SWA ring: f16 rows under DS4_RAW_F16 (default on), else f32. */
+    /* Raw SWA ring: f16 rows under PULSAR_RAW_F16 (default on), else f32. */
     const uint64_t raw_elem_bytes = gpu_graph_raw_f16_enabled() ? sizeof(uint16_t)
                                                                  : sizeof(float);
-    m.raw_bytes = (uint64_t)DS4_N_LAYER * m.raw_cap * DS4_N_HEAD_DIM * raw_elem_bytes;
+    m.raw_bytes = (uint64_t)PULSAR_N_LAYER * m.raw_cap * PULSAR_N_HEAD_DIM * raw_elem_bytes;
 
-    /* Compressed caches: DS4_ATTN_PACK attn comp row + MXFP4 indexer row. */
+    /* Compressed caches: PULSAR_ATTN_PACK attn comp row + MXFP4 indexer row. */
     const uint64_t attn_row_bytes  = gpu_graph_attn_comp_cache_row_bytes();
     const uint64_t index_row_bytes = gpu_graph_idx_fp4_enabled()
-        ? DS4_ENGINE_IDXFP4_ROWBYTES
-        : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+        ? PULSAR_ENGINE_IDXFP4_ROWBYTES
+        : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
     m.compressed_bytes = 0;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint32_t layer_comp_cap = ctx / ratio + 2u;
         m.compressed_bytes += (uint64_t)layer_comp_cap * attn_row_bytes;
@@ -1427,8 +1427,8 @@ ds4_context_memory ds4_context_memory_estimate_packed(
 
 
 void embed_prompt(
-        const ds4_model   * model,
-        const ds4_weights * weights,
+        const pulsar_model   * model,
+        const pulsar_weights * weights,
         const token_vec   * tokens,
         uint32_t            n_embd,
         float             * out) {

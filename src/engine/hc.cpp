@@ -1,4 +1,4 @@
-#include "ds4_engine_internal.h"
+#include "pulsar_engine_internal.h"
 
 
 
@@ -26,23 +26,23 @@ void hc_weighted_sum_one(
  * The caller supplies scratch buffers (out/post/comb/flat); shared by the GPU
  * decode path via hc_pre_from_state_one. */
 void hc_pre_from_state_one_scratch(
-        const ds4_model   * model,
-        const ds4_tensor  * fn,
-        const ds4_tensor  * scale_tensor,
-        const ds4_tensor  * base_tensor,
+        const pulsar_model   * model,
+        const pulsar_tensor  * fn,
+        const pulsar_tensor  * scale_tensor,
+        const pulsar_tensor  * base_tensor,
         const float       * residual_hc,
         float             * out,
         float             * post,
         float             * comb,
         float             * flat,
         bool                serial_fn) {
-    const uint32_t n_hc = DS4_N_HC;
-    const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * n_hc;
+    const uint32_t n_hc = PULSAR_N_HC;
+    const uint64_t hc_dim = (uint64_t)PULSAR_N_EMBD * n_hc;
 
     float mix[24];
     float split[24];
 
-    rms_norm_no_weight(flat, residual_hc, hc_dim, DS4_RMS_EPS);
+    rms_norm_no_weight(flat, residual_hc, hc_dim, PULSAR_RMS_EPS);
     if (serial_fn) {
         matvec_f16_serial(mix, model, fn, flat);
     } else {
@@ -51,8 +51,8 @@ void hc_pre_from_state_one_scratch(
 
     const float *scale = (const float *)tensor_data(model, scale_tensor);
     const float *base = (const float *)tensor_data(model, base_tensor);
-    hc_split_sinkhorn_one(split, mix, scale, base, (int)n_hc, DS4_N_HC_SINKHORN_ITER, 1.0e-6f);
-    hc_weighted_sum_one(out, residual_hc, split, DS4_N_EMBD, n_hc);
+    hc_split_sinkhorn_one(split, mix, scale, base, (int)n_hc, PULSAR_N_HC_SINKHORN_ITER, 1.0e-6f);
+    hc_weighted_sum_one(out, residual_hc, split, PULSAR_N_EMBD, n_hc);
 
     memcpy(post, split + n_hc, n_hc * sizeof(post[0]));
     memcpy(comb, split + 2 * n_hc, n_hc * n_hc * sizeof(comb[0]));
@@ -61,15 +61,15 @@ void hc_pre_from_state_one_scratch(
 
 
 void hc_pre_from_state_one(
-        const ds4_model   * model,
-        const ds4_tensor  * fn,
-        const ds4_tensor  * scale_tensor,
-        const ds4_tensor  * base_tensor,
+        const pulsar_model   * model,
+        const pulsar_tensor  * fn,
+        const pulsar_tensor  * scale_tensor,
+        const pulsar_tensor  * base_tensor,
         const float       * residual_hc,
         float             * out,
         float             * post,
         float             * comb) {
-    const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
+    const uint64_t hc_dim = (uint64_t)PULSAR_N_EMBD * PULSAR_N_HC;
     float *flat = (float *)xmalloc((size_t)hc_dim * sizeof(flat[0]));
 
     hc_pre_from_state_one_scratch(model,
@@ -82,17 +82,17 @@ void hc_pre_from_state_one(
 
 
 void layer_attn_pre_one(
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
+        const pulsar_model   * model,
+        const pulsar_layer_weights * layer,
         const float       * token_embd,
         float             * out,
         float             * residual_hc,
         float             * post,
         float             * comb) {
-    const uint32_t n_hc = DS4_N_HC;
+    const uint32_t n_hc = PULSAR_N_HC;
 
     for (uint32_t h = 0; h < n_hc; h++) {
-        memcpy(residual_hc + (uint64_t)h * DS4_N_EMBD, token_embd, (size_t)DS4_N_EMBD * sizeof(token_embd[0]));
+        memcpy(residual_hc + (uint64_t)h * PULSAR_N_EMBD, token_embd, (size_t)PULSAR_N_EMBD * sizeof(token_embd[0]));
     }
 
     hc_pre_from_state_one(model,
@@ -173,7 +173,7 @@ void hc_post_batch(
         .n_embd = n_embd,
         .n_hc = n_hc,
     };
-    ds4_parallel_for_min_rows(n_tok, hc_post_batch_worker, &ctx, 1);
+    pulsar_parallel_for_min_rows(n_tok, hc_post_batch_worker, &ctx, 1);
 }
 
 
@@ -224,7 +224,7 @@ void hc_post_sum_batch(
         .n_embd = n_embd,
         .n_hc = n_hc,
     };
-    ds4_parallel_for_min_rows(n_tok, hc_post_sum_batch_worker, &ctx, 1);
+    pulsar_parallel_for_min_rows(n_tok, hc_post_sum_batch_worker, &ctx, 1);
 }
 
 
@@ -247,16 +247,16 @@ static void hc_pre_norm_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
                                       ctx->scale,
                                       ctx->base,
                                       residual,
-                                      ctx->cur + t * DS4_N_EMBD,
+                                      ctx->cur + t * PULSAR_N_EMBD,
                                       ctx->post + t * ctx->n_hc,
                                       ctx->comb + t * ctx->n_hc * ctx->n_hc,
                                       flat,
                                       true);
-        rms_norm_weight(ctx->norm + t * DS4_N_EMBD,
-                        ctx->cur + t * DS4_N_EMBD,
+        rms_norm_weight(ctx->norm + t * PULSAR_N_EMBD,
+                        ctx->cur + t * PULSAR_N_EMBD,
                         norm_w,
-                        DS4_N_EMBD,
-                        DS4_RMS_EPS);
+                        PULSAR_N_EMBD,
+                        PULSAR_RMS_EPS);
     }
 
     free(flat);
@@ -267,11 +267,11 @@ static void hc_pre_norm_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
 /* Batched HC pre plus RMSNorm.  Prefill uses this to keep the layer-major
  * token batch in contiguous arrays. */
 void hc_pre_norm_batch(
-        const ds4_model  * model,
-        const ds4_tensor * fn,
-        const ds4_tensor * scale,
-        const ds4_tensor * base,
-        const ds4_tensor * norm_w,
+        const pulsar_model  * model,
+        const pulsar_tensor * fn,
+        const pulsar_tensor * scale,
+        const pulsar_tensor * base,
+        const pulsar_tensor * norm_w,
         const float      * inp_hc,
         float            * residual_hc,
         float            * cur,
@@ -291,21 +291,21 @@ void hc_pre_norm_batch(
         .norm = norm,
         .post = post,
         .comb = comb,
-        .hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD,
-        .n_hc = DS4_N_HC,
+        .hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD,
+        .n_hc = PULSAR_N_HC,
     };
-    ds4_parallel_for_min_rows(n_tok, hc_pre_norm_batch_worker, &ctx, 1);
+    pulsar_parallel_for_min_rows(n_tok, hc_pre_norm_batch_worker, &ctx, 1);
 }
 
 
 
 void layer_attn_norm_one(
         float             * out,
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
+        const pulsar_model   * model,
+        const pulsar_layer_weights * layer,
         const float       * x) {
     const float *attn_norm = (const float *)tensor_data(model, layer->attn_norm);
-    rms_norm_weight(out, x, attn_norm, DS4_N_EMBD, DS4_RMS_EPS);
+    rms_norm_weight(out, x, attn_norm, PULSAR_N_EMBD, PULSAR_RMS_EPS);
 }
 
 
@@ -323,20 +323,20 @@ void layer_attn_norm_one(
 /* Q projection is low-rank: Q8_0 into the model-specific LoRA-Q rank,
  * RMSNorm, then Q8_0 back to all attention heads. */
 void layer_q_projection_normed_one(
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
+        const pulsar_model   * model,
+        const pulsar_layer_weights * layer,
         const float       * norm,
         float             * q) {
-    const uint32_t q_rank = DS4_N_LORA_Q;
+    const uint32_t q_rank = PULSAR_N_LORA_Q;
     float *qr = (float *)xmalloc((size_t)q_rank * sizeof(qr[0]));
     float *qr_norm = (float *)xmalloc((size_t)q_rank * sizeof(qr_norm[0]));
 
     const float *q_a_norm = (const float *)tensor_data(model, layer->attn_q_a_norm);
 
     matvec_q8_0(qr, model, layer->attn_q_a, norm);
-    rms_norm_weight(qr_norm, qr, q_a_norm, q_rank, DS4_RMS_EPS);
+    rms_norm_weight(qr_norm, qr, q_a_norm, q_rank, PULSAR_RMS_EPS);
     matvec_q8_0(q, model, layer->attn_q_b, qr_norm);
-    head_rms_norm_inplace(q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS);
+    head_rms_norm_inplace(q, PULSAR_N_HEAD, PULSAR_N_HEAD_DIM, PULSAR_RMS_EPS);
 
     free(qr_norm);
     free(qr);

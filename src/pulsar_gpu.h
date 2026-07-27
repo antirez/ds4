@@ -1,5 +1,5 @@
-#ifndef DS4_GPU_H
-#define DS4_GPU_H
+#ifndef PULSAR_GPU_H
+#define PULSAR_GPU_H
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -13,16 +13,16 @@
  * their batched twins) to BF16, while every kernel keeps accumulating in f32 —
  * exactly what torch does (bf16 storage, f32 math). This macro is the element
  * size of a stored HC residual sample, shared by the CUDA kernels (typed via
- * ds4_hc_t in ds4_cuda_internal.h) and the C host stride/offset math.
+ * pulsar_hc_t in pulsar_cuda_internal.h) and the C host stride/offset math.
  *
- * Define DS4_HC_F32 (compile flag) to restore f32 carriers — the fallback, and
+ * Define PULSAR_HC_F32 (compile flag) to restore f32 carriers — the fallback, and
  * the intermediate used to prove the storage-narrowing plumbing is a pure
  * no-op (f32 build must be byte-identical to the pre-change build) before the
  * BF16 flip. One compile-time switch; NO per-token/per-layer runtime branch. */
-#ifdef DS4_HC_F32
-#define DS4_HC_ELT_SIZE 4u
+#ifdef PULSAR_HC_F32
+#define PULSAR_HC_ELT_SIZE 4u
 #else
-#define DS4_HC_ELT_SIZE 2u
+#define PULSAR_HC_ELT_SIZE 2u
 #endif
 
 
@@ -35,34 +35,34 @@
  * The public GPU API is tensor-resident: activations, KV state, and scratch
  * buffers stay device-owned across the whole prefill/decode command sequence.
  */
-typedef struct ds4_gpu_tensor ds4_gpu_tensor;
+typedef struct pulsar_gpu_tensor pulsar_gpu_tensor;
 
-int ds4_gpu_init(void);
-void ds4_gpu_cleanup(void);
+int pulsar_gpu_init(void);
+void pulsar_gpu_cleanup(void);
 
 /* Boot-time observability: the resolved gate/up MXFP4 tile width (NT=16 where
  * the device accepts the dynamic-SMEM opt-in, else NT=8) -- the same cached
  * value the mxfp4 prefill path launches at <1024u>.  Resolving it is idempotent
  * (a single cudaFuncSetAttribute) and does not alter any generated token. */
-uint32_t ds4_gpu_moe_mxfp4_tile_width(void);
+uint32_t pulsar_gpu_moe_mxfp4_tile_width(void);
 
 /* Running total of live tensor-alloc bytes (owned allocations only, views
  * excluded).  Snapshot around a session create to measure its true resident
  * cost; the server ledger commits that actual. */
-uint64_t ds4_gpu_tensor_alloc_bytes_current(void);
-ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
-ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
-ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
-void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
-uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
-void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
+uint64_t pulsar_gpu_tensor_alloc_bytes_current(void);
+pulsar_gpu_tensor *pulsar_gpu_tensor_alloc(uint64_t bytes);
+pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_managed(uint64_t bytes);
+pulsar_gpu_tensor *pulsar_gpu_tensor_view(const pulsar_gpu_tensor *base, uint64_t offset, uint64_t bytes);
+void pulsar_gpu_tensor_free(pulsar_gpu_tensor *tensor);
+uint64_t pulsar_gpu_tensor_bytes(const pulsar_gpu_tensor *tensor);
+void *pulsar_gpu_tensor_contents(pulsar_gpu_tensor *tensor);
 /* Raw device pointer without a synchronize (for building device pointer tables). */
-void *ds4_gpu_tensor_device_ptr(const ds4_gpu_tensor *tensor);
-int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
-int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
-int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
-int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
-                          const ds4_gpu_tensor *src, uint64_t src_offset,
+void *pulsar_gpu_tensor_device_ptr(const pulsar_gpu_tensor *tensor);
+int pulsar_gpu_tensor_fill_f32(pulsar_gpu_tensor *tensor, float value, uint64_t count);
+int pulsar_gpu_tensor_write(pulsar_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
+int pulsar_gpu_tensor_read(const pulsar_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
+int pulsar_gpu_tensor_copy(pulsar_gpu_tensor *dst, uint64_t dst_offset,
+                          const pulsar_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
 
 /* Batched D2D copy: prepare a device-side descriptor table over fixed tensor
@@ -70,33 +70,33 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
  * NULL on any violation), then replay all copies with one kernel launch.
  * max_bytes is the largest descriptor's byte count (grid sizing). Built for the
  * spec-frontier snapshot/restore paths (~126 tiny per-layer copies per step). */
-void *ds4_gpu_batched_copy_prepare(ds4_gpu_tensor **dst, ds4_gpu_tensor **src,
+void *pulsar_gpu_batched_copy_prepare(pulsar_gpu_tensor **dst, pulsar_gpu_tensor **src,
                                    const uint64_t *bytes, uint32_t n);
-int ds4_gpu_batched_copy_run(void *handle, uint32_t n_descs, uint64_t max_bytes);
-void ds4_gpu_batched_copy_free(void *handle);
+int pulsar_gpu_batched_copy_run(void *handle, uint32_t n_descs, uint64_t max_bytes);
+void pulsar_gpu_batched_copy_free(void *handle);
 
-int ds4_gpu_begin_commands(void);
-int ds4_gpu_flush_commands(void);
-int ds4_gpu_end_commands(void);
+int pulsar_gpu_begin_commands(void);
+int pulsar_gpu_flush_commands(void);
+int pulsar_gpu_end_commands(void);
 /* Decode CUDA-graph capture pair: begin returns 1 when the tape is being
  * captured (end replays it as one graph launch and syncs); 0 means graphs
- * are disabled (DS4_CUDA_NO_GRAPHS / unsupported) and the caller must use
+ * are disabled (PULSAR_CUDA_NO_GRAPHS / unsupported) and the caller must use
  * the plain begin/end_commands pair instead. */
-int ds4_gpu_decode_graph_begin(void);
-int ds4_gpu_decode_graph_end(void);
-int ds4_gpu_synchronize(void);
+int pulsar_gpu_decode_graph_begin(void);
+int pulsar_gpu_decode_graph_end(void);
+int pulsar_gpu_synchronize(void);
 
-int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
-int ds4_gpu_set_model_fd(int fd);
-int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
-int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
-int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
-int ds4_gpu_cache_external_range(const void *host_base_key, int fd, uint64_t offset, uint64_t bytes, const char *label);
-int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
-void ds4_gpu_set_quality(bool quality);
-void ds4_gpu_print_memory_report(const char *label);
+int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size);
+int pulsar_gpu_set_model_fd(int fd);
+int pulsar_gpu_set_model_fd_for_map(int fd, const void *model_map);
+int pulsar_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
+int pulsar_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
+int pulsar_gpu_cache_external_range(const void *host_base_key, int fd, uint64_t offset, uint64_t bytes, const char *label);
+int pulsar_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
+void pulsar_gpu_set_quality(bool quality);
+void pulsar_gpu_print_memory_report(const char *label);
 /* cudaMemGetInfo passthrough (0/0 on failure) for diagnostics/samplers. */
-void ds4_gpu_mem_info(uint64_t *free_out, uint64_t *total_out);
+void pulsar_gpu_mem_info(uint64_t *free_out, uint64_t *total_out);
 
 /* =========================================================================
  * Embeddings and Indexer Helpers.
@@ -106,8 +106,8 @@ void ds4_gpu_mem_info(uint64_t *free_out, uint64_t *total_out);
  * compressed-attention indexer that chooses visible compressed rows.
  */
 
-int ds4_gpu_embed_token_hc_tensor(
-        ds4_gpu_tensor *out_hc,
+int pulsar_gpu_embed_token_hc_tensor(
+        pulsar_gpu_tensor *out_hc,
         const void       *model_map,
         uint64_t          model_size,
         uint64_t          weight_offset,
@@ -116,9 +116,9 @@ int ds4_gpu_embed_token_hc_tensor(
         uint32_t          n_embd,
         uint32_t          n_hc);
 
-int ds4_gpu_embed_tokens_hc_tensor(
-        ds4_gpu_tensor       *out_hc,
-        const ds4_gpu_tensor *tokens,
+int pulsar_gpu_embed_tokens_hc_tensor(
+        pulsar_gpu_tensor       *out_hc,
+        const pulsar_gpu_tensor *tokens,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight_offset,
@@ -127,21 +127,21 @@ int ds4_gpu_embed_tokens_hc_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
-int ds4_gpu_indexer_score_one_tensor(
-        ds4_gpu_tensor       *scores,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *weights,
-        const ds4_gpu_tensor *index_comp,
+int pulsar_gpu_indexer_score_one_tensor(
+        pulsar_gpu_tensor       *scores,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *weights,
+        const pulsar_gpu_tensor *index_comp,
         uint32_t                n_comp,
         uint32_t                n_head,
         uint32_t                head_dim,
         float                   scale);
 
-int ds4_gpu_indexer_scores_prefill_tensor(
-        ds4_gpu_tensor       *scores,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *weights,
-        const ds4_gpu_tensor *index_comp,
+int pulsar_gpu_indexer_scores_prefill_tensor(
+        pulsar_gpu_tensor       *scores,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *weights,
+        const pulsar_gpu_tensor *index_comp,
         uint32_t                n_comp,
         uint32_t                n_tokens,
         uint32_t                n_head,
@@ -159,11 +159,11 @@ int ds4_gpu_indexer_scores_prefill_tensor(
  * Banked multi-token rows run the generic kernel (the WMMA tier stays
  * single-bank); banked n_tokens==1 keeps the direct-one fast tier so the
  * scan is bit-identical to classic single-token decode. */
-int ds4_gpu_indexer_scores_decode_batch_tensor(
-        ds4_gpu_tensor       *scores,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *weights,
-        const ds4_gpu_tensor *index_comp,
+int pulsar_gpu_indexer_scores_decode_batch_tensor(
+        pulsar_gpu_tensor       *scores,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *weights,
+        const pulsar_gpu_tensor *index_comp,
         uint32_t                n_comp,
         uint32_t                n_tokens,
         uint32_t                pos0,
@@ -171,29 +171,29 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
         uint32_t                head_dim,
         uint32_t                ratio,
         float                   scale,
-        const ds4_gpu_tensor *positions,
-        const ds4_gpu_tensor *seq_id,
-        const ds4_gpu_tensor *index_bank_ptrs,
+        const pulsar_gpu_tensor *positions,
+        const pulsar_gpu_tensor *seq_id,
+        const pulsar_gpu_tensor *index_bank_ptrs,
         uint32_t                comp_cap,
         uint32_t                n_banks);
 
-int ds4_gpu_indexer_topk_tensor(
-        ds4_gpu_tensor       *selected,
-        const ds4_gpu_tensor *scores,
+int pulsar_gpu_indexer_topk_tensor(
+        pulsar_gpu_tensor       *selected,
+        const pulsar_gpu_tensor *scores,
         uint32_t                n_comp,
         uint32_t                n_tokens,
         uint32_t                top_k);
 
 /* GPU argmax over n_vocab F32 logits. Writes the winning index as int32 at
  * out_idx[0]. Tie-break: lower index wins (matches host sample_argmax). */
-int ds4_gpu_argmax_tensor(
-        ds4_gpu_tensor       *out_idx,
-        const ds4_gpu_tensor *logits,
+int pulsar_gpu_argmax_tensor(
+        pulsar_gpu_tensor       *out_idx,
+        const pulsar_gpu_tensor *logits,
         uint32_t                n_vocab);
 
-int ds4_gpu_dsv4_topk_mask_tensor(
-        ds4_gpu_tensor       *mask,
-        const ds4_gpu_tensor *topk,
+int pulsar_gpu_dsv4_topk_mask_tensor(
+        pulsar_gpu_tensor       *mask,
+        const pulsar_gpu_tensor *topk,
         uint32_t                n_comp,
         uint32_t                n_tokens,
         uint32_t                top_k);
@@ -206,25 +206,25 @@ int ds4_gpu_dsv4_topk_mask_tensor(
  * attention output projections, and DS4's tail-only RoPE.
  */
 
-int ds4_gpu_matmul_mxfp8_tensor(
-        ds4_gpu_tensor       *out,
+int pulsar_gpu_matmul_mxfp8_tensor(
+        pulsar_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
+        const pulsar_gpu_tensor *x,
         uint64_t                n_tok);
 
 /* Register one MXFP8 workhorse weight (attn_kv/q, attn_output, shared experts,
  * output head) by offset so the matmul above executes it; done once at load. */
-void ds4_gpu_register_fp8_weight(uint64_t weight_offset);
+void pulsar_gpu_register_fp8_weight(uint64_t weight_offset);
 
 /* Mark an already-fp8-registered offset as a pre-stored MXFP8_LT weight: the
  * device layout (de-interleaved E4M3 data + swizzled E8M0 scale) is already in
  * the mmap, so the matmul resolver skips the cudaMalloc+convert and points
  * cuBLASLt directly at g_model_device_base+offset. Done once at load. */
-void ds4_gpu_register_fp8_lt_weight(uint64_t weight_offset);
+void pulsar_gpu_register_fp8_lt_weight(uint64_t weight_offset);
 
 /* Batched-prefill activation quantization cache.
  *
@@ -237,8 +237,8 @@ void ds4_gpu_register_fp8_lt_weight(uint64_t weight_offset);
  * optimization may implement both as no-ops.  Purely a traffic optimization:
  * results are bit-identical either way.
  */
-void ds4_gpu_mxfp8_act_cache_arm(const ds4_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim);
-void ds4_gpu_mxfp8_act_cache_disarm(void);
+void pulsar_gpu_mxfp8_act_cache_arm(const pulsar_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim);
+void pulsar_gpu_mxfp8_act_cache_disarm(void);
 
 /* Optional fused GPU operations.
  *
@@ -246,9 +246,9 @@ void ds4_gpu_mxfp8_act_cache_disarm(void);
  * that does not provide the fused kernel must still define the symbol and
  * return 0.  Callers then use the portable sequence of required primitives.
  */
-int ds4_gpu_matmul_mxfp8_pair_tensor(
-        ds4_gpu_tensor       *out0,
-        ds4_gpu_tensor       *out1,
+int pulsar_gpu_matmul_mxfp8_pair_tensor(
+        pulsar_gpu_tensor       *out0,
+        pulsar_gpu_tensor       *out1,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight0_offset,
@@ -256,30 +256,30 @@ int ds4_gpu_matmul_mxfp8_pair_tensor(
         uint64_t                in_dim,
         uint64_t                out0_dim,
         uint64_t                out1_dim,
-        const ds4_gpu_tensor *x,
+        const pulsar_gpu_tensor *x,
         uint64_t                n_tok);
 
-int ds4_gpu_shared_gate_up_swiglu_mxfp8_tensor(
-        ds4_gpu_tensor       *gate,
-        ds4_gpu_tensor       *up,
-        ds4_gpu_tensor       *mid,
+int pulsar_gpu_shared_gate_up_swiglu_mxfp8_tensor(
+        pulsar_gpu_tensor       *gate,
+        pulsar_gpu_tensor       *up,
+        pulsar_gpu_tensor       *mid,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                gate_offset,
         uint64_t                up_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
+        const pulsar_gpu_tensor *x,
         float                   clamp);
 
-int ds4_gpu_matmul_f16_tensor(
-        ds4_gpu_tensor       *out,
+int pulsar_gpu_matmul_f16_tensor(
+        pulsar_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
+        const pulsar_gpu_tensor *x,
         uint64_t                n_tok);
 
 /* plan-34 phase-2 inc 2/4: arm the M-neutral batched-matmul mode with a PREFIX
@@ -291,66 +291,66 @@ int ds4_gpu_matmul_f16_tensor(
  * multiseq_step_begin, cleared at step_end — never on a per-token path.
  * The query returns the count (MoE two-pass reads it to place the split;
  * inc-2/3 dense-GEMM callers treat nonzero as "armed"). */
-void ds4_gpu_matmul_set_batch_mneutral(int n);
-int  ds4_gpu_matmul_batch_mneutral(void);   /* query: decode-prefix row count (0 = disarmed) */
+void pulsar_gpu_matmul_set_batch_mneutral(int n);
+int  pulsar_gpu_matmul_batch_mneutral(void);   /* query: decode-prefix row count (0 = disarmed) */
 
-int ds4_gpu_matmul_bf16_tensor(
-        ds4_gpu_tensor       *out,
+int pulsar_gpu_matmul_bf16_tensor(
+        pulsar_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
+        const pulsar_gpu_tensor *x,
         uint64_t                n_tok);
 
-int ds4_gpu_matmul_f16_pair_tensor(
-        ds4_gpu_tensor       *out_a,
-        ds4_gpu_tensor       *out_b,
+int pulsar_gpu_matmul_f16_pair_tensor(
+        pulsar_gpu_tensor       *out_a,
+        pulsar_gpu_tensor       *out_b,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight_a_offset,
         uint64_t                weight_b_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
+        const pulsar_gpu_tensor *x,
         uint64_t                n_tok);
 
-int ds4_gpu_matmul_f32_tensor(
-        ds4_gpu_tensor       *out,
+int pulsar_gpu_matmul_f32_tensor(
+        pulsar_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
+        const pulsar_gpu_tensor *x,
         uint64_t                n_tok);
 
-int ds4_gpu_rms_norm_plain_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *x,
+int pulsar_gpu_rms_norm_plain_tensor(
+        pulsar_gpu_tensor       *out,
+        const pulsar_gpu_tensor *x,
         uint32_t                n,
         float                   eps);
 
-int ds4_gpu_rms_norm_plain_rows_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *x,
+int pulsar_gpu_rms_norm_plain_rows_tensor(
+        pulsar_gpu_tensor       *out,
+        const pulsar_gpu_tensor *x,
         uint32_t                n,
         uint32_t                rows,
         float                   eps);
 
-int ds4_gpu_rms_norm_weight_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *x,
+int pulsar_gpu_rms_norm_weight_tensor(
+        pulsar_gpu_tensor       *out,
+        const pulsar_gpu_tensor *x,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight_offset,
         uint32_t                n,
         float                   eps);
 
-int ds4_gpu_rms_norm_weight_rows_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *x,
+int pulsar_gpu_rms_norm_weight_rows_tensor(
+        pulsar_gpu_tensor       *out,
+        const pulsar_gpu_tensor *x,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight_offset,
@@ -358,22 +358,22 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
         uint32_t                rows,
         float                   eps);
 
-int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
-        ds4_gpu_tensor       *q_out,
-        const ds4_gpu_tensor *q,
+int pulsar_gpu_dsv4_qkv_rms_norm_rows_tensor(
+        pulsar_gpu_tensor       *q_out,
+        const pulsar_gpu_tensor *q,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                q_weight_offset,
         uint32_t                q_n,
-        ds4_gpu_tensor       *kv_out,
-        const ds4_gpu_tensor *kv,
+        pulsar_gpu_tensor       *kv_out,
+        const pulsar_gpu_tensor *kv,
         uint64_t                kv_weight_offset,
         uint32_t                kv_n,
         uint32_t                rows,
         float                   eps);
 
-int ds4_gpu_head_rms_norm_tensor(
-        ds4_gpu_tensor *x,
+int pulsar_gpu_head_rms_norm_tensor(
+        pulsar_gpu_tensor *x,
         uint32_t          n_tok,
         uint32_t          n_head,
         uint32_t          head_dim,
@@ -389,8 +389,8 @@ int ds4_gpu_head_rms_norm_tensor(
  * uint32 rotation positions: a negative entry rotates at a garbage angle
  * rather than faulting.  gpu_graph_multiseq_step_begin is the host-side
  * validator that every position is > 0 before any launch sees the array. */
-int ds4_gpu_head_rms_norm_rope_tail_tensor(
-        ds4_gpu_tensor *x,
+int pulsar_gpu_head_rms_norm_rope_tail_tensor(
+        pulsar_gpu_tensor *x,
         uint32_t          n_tok,
         uint32_t          n_head,
         uint32_t          head_dim,
@@ -405,68 +405,68 @@ int ds4_gpu_head_rms_norm_rope_tail_tensor(
         float             beta_fast,
         float             beta_slow,
         float             eps,
-        const ds4_gpu_tensor *positions);
+        const pulsar_gpu_tensor *positions);
 
-int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
-        ds4_gpu_tensor *x,
+int pulsar_gpu_dsv4_fp8_kv_quantize_tensor(
+        pulsar_gpu_tensor *x,
         uint32_t          n_tok,
         uint32_t          head_dim,
         uint32_t          n_rot);
 
-int ds4_gpu_dsv4_fp8_kv_pack_tensor(
-        const ds4_gpu_tensor *x,
-        ds4_gpu_tensor       *packed,
-        ds4_gpu_tensor       *scales,
+int pulsar_gpu_dsv4_fp8_kv_pack_tensor(
+        const pulsar_gpu_tensor *x,
+        pulsar_gpu_tensor       *packed,
+        pulsar_gpu_tensor       *scales,
         uint32_t               n_tok,
         uint32_t               head_dim);
 
-/* Microscaling (MX) compressed-KV pack/dequant. fmt is DS4_MXKV_FMT_FP8/FP4.
+/* Microscaling (MX) compressed-KV pack/dequant. fmt is PULSAR_MXKV_FMT_FP8/FP4.
  * Row layout [data][E8M0 scales], block 32; head_dim must be a multiple of 32.
- * `out` (pack) / `in` (dequant) is sized n_tok * DS4_MXKV_ROWBYTES(fmt,head_dim). */
-int ds4_gpu_mxkv_pack_tensor(
-        const ds4_gpu_tensor *x,
-        ds4_gpu_tensor       *out,
+ * `out` (pack) / `in` (dequant) is sized n_tok * PULSAR_MXKV_ROWBYTES(fmt,head_dim). */
+int pulsar_gpu_mxkv_pack_tensor(
+        const pulsar_gpu_tensor *x,
+        pulsar_gpu_tensor       *out,
         uint32_t               fmt,
         uint32_t               n_tok,
         uint32_t               head_dim);
 
-int ds4_gpu_mxkv_dequant_tensor(
-        const ds4_gpu_tensor *in,
-        ds4_gpu_tensor       *out,
+int pulsar_gpu_mxkv_dequant_tensor(
+        const pulsar_gpu_tensor *in,
+        pulsar_gpu_tensor       *out,
         uint32_t               fmt,
         uint32_t               n_tok,
         uint32_t               head_dim);
 
-/* DS4_ATTN_PACK compressed-KV storage (value-preserving).  One packed row is
+/* PULSAR_ATTN_PACK compressed-KV storage (value-preserving).  One packed row is
  * [n_nope e4m3 bytes][n_nope/64 E8M0 scale bytes][pad to 4B][n_rot f32 rope]
  * (712 B at head_dim 512 / n_rot 64).  The stored values are exactly the
- * ds4_gpu_dsv4_fp8_kv_quantize_tensor roundtrip for the nope dims and the
+ * pulsar_gpu_dsv4_fp8_kv_quantize_tensor roundtrip for the nope dims and the
  * untouched f32 rope tail, so read-back is bit-identical to the f32 cache.
  * quantize_store additionally roundtrips the f32 source rows IN PLACE
  * (identical to the plain quantize entry) so stages/dumps stay consistent.
  * Requires n_rot == 64 and (head_dim - n_rot) % 64 == 0. */
-int ds4_gpu_attn_pack_quantize_store_tensor(
-        ds4_gpu_tensor *x,
-        ds4_gpu_tensor *packed,
+int pulsar_gpu_attn_pack_quantize_store_tensor(
+        pulsar_gpu_tensor *x,
+        pulsar_gpu_tensor *packed,
         uint32_t          out_row0,
         uint32_t          n_rows,
         uint32_t          head_dim,
         uint32_t          n_rot);
 
-int ds4_gpu_attn_pack_dequant_tensor(
-        const ds4_gpu_tensor *in,
-        ds4_gpu_tensor       *out,
+int pulsar_gpu_attn_pack_dequant_tensor(
+        const pulsar_gpu_tensor *in,
+        pulsar_gpu_tensor       *out,
         uint32_t               n_rows,
         uint32_t               head_dim,
         uint32_t               n_rot);
 
 /* Repack-only variant for session load: packs ALREADY-roundtripped f32 rows
  * with an exact integer-math scale bucket (value-idempotent; x unmodified).
- * The live emit path must keep using ds4_gpu_attn_pack_quantize_store_tensor,
- * whose fast-math scale matches ds4_gpu_dsv4_fp8_kv_quantize_tensor exactly. */
-int ds4_gpu_attn_pack_repack_tensor(
-        const ds4_gpu_tensor *x,
-        ds4_gpu_tensor       *packed,
+ * The live emit path must keep using pulsar_gpu_attn_pack_quantize_store_tensor,
+ * whose fast-math scale matches pulsar_gpu_dsv4_fp8_kv_quantize_tensor exactly. */
+int pulsar_gpu_attn_pack_repack_tensor(
+        const pulsar_gpu_tensor *x,
+        pulsar_gpu_tensor       *packed,
         uint32_t               out_row0,
         uint32_t               n_rows,
         uint32_t               head_dim,
@@ -475,34 +475,34 @@ int ds4_gpu_attn_pack_repack_tensor(
 /* Gathered dequant of n_sel rows selected by `rows` (indices into a cap_rows MX
  * cache) into f32 `out`: [n_sel][head_dim] when transpose==0, or [head_dim][n_sel]
  * when transpose!=0 (builds a PV V^T operand). The attention gather primitive. */
-int ds4_gpu_mxkv_gather_dequant_tensor(
-        const ds4_gpu_tensor *cache,
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *rows,
+int pulsar_gpu_mxkv_gather_dequant_tensor(
+        const pulsar_gpu_tensor *cache,
+        pulsar_gpu_tensor       *out,
+        const pulsar_gpu_tensor *rows,
         uint32_t               n_sel,
         uint32_t               cap_rows,
         uint32_t               head_dim,
         uint32_t               fmt,
         uint32_t               transpose);
 
-int ds4_gpu_dsv4_indexer_qat_tensor(
-        ds4_gpu_tensor *x,
+int pulsar_gpu_dsv4_indexer_qat_tensor(
+        pulsar_gpu_tensor *x,
         uint32_t          n_rows,
         uint32_t          head_dim);
 
 /* QAT-roundtrip n_rows f32 rows of x in place AND store them MXKV-FP4-packed
  * into `packed` at rows [out_row0, out_row0+n_rows).  The f32 result in x is
- * bit-identical to ds4_gpu_dsv4_indexer_qat_tensor. */
-int ds4_gpu_dsv4_indexer_qat_pack_tensor(
-        ds4_gpu_tensor *x,
-        ds4_gpu_tensor *packed,
+ * bit-identical to pulsar_gpu_dsv4_indexer_qat_tensor. */
+int pulsar_gpu_dsv4_indexer_qat_pack_tensor(
+        pulsar_gpu_tensor *x,
+        pulsar_gpu_tensor *packed,
         uint32_t          out_row0,
         uint32_t          n_rows,
         uint32_t          head_dim);
 
 /* Tell the indexer score kernels the indexer compressed cache is stored
  * MXKV-FP4-packed (68 B/row at head_dim 128) instead of f32. */
-void ds4_gpu_indexer_set_fp4(int on);
+void pulsar_gpu_indexer_set_fp4(int on);
 
 /* raw_f16 parameter convention (attention readers / raw KV writers below):
  * the flag describes the STORAGE FORMAT OF THE PASSED raw tensor for THIS
@@ -513,8 +513,8 @@ void ds4_gpu_indexer_set_fp4(int on);
  * the specific buffer they hand in (the persistent layer ring may be __half
  * while e.g. batch/drafter buffers stay f32). */
 
-int ds4_gpu_rope_tail_tensor(
-        ds4_gpu_tensor *x,
+int pulsar_gpu_rope_tail_tensor(
+        pulsar_gpu_tensor *x,
         uint32_t          n_tok,
         uint32_t          n_head,
         uint32_t          head_dim,
@@ -528,14 +528,14 @@ int ds4_gpu_rope_tail_tensor(
         float             attn_factor,
         float             beta_fast,
         float             beta_slow,
-        const ds4_gpu_tensor *positions);
+        const pulsar_gpu_tensor *positions);
 
 /* Release decode fused KV finalizer: after the standalone RoPE kernel, this
  * performs DS4's FP8 non-RoPE KV round trip and writes the F16-rounded raw
  * attention cache row in one dispatch. */
-int ds4_gpu_kv_fp8_store_raw_tensor(
-        ds4_gpu_tensor *kv,
-        ds4_gpu_tensor *raw_cache,
+int pulsar_gpu_kv_fp8_store_raw_tensor(
+        pulsar_gpu_tensor *kv,
+        pulsar_gpu_tensor *raw_cache,
         uint32_t          raw_cap,
         uint32_t          row,
         uint32_t          head_dim,
@@ -543,11 +543,11 @@ int ds4_gpu_kv_fp8_store_raw_tensor(
         uint32_t          raw_f16);
 
 /* Reference/raw-cache primitive kept for prefill and diagnostics.  Decode uses
- * ds4_gpu_kv_fp8_store_raw_tensor unless a diagnostic reference path is
+ * pulsar_gpu_kv_fp8_store_raw_tensor unless a diagnostic reference path is
  * explicitly selected by the graph driver. */
-int ds4_gpu_store_raw_kv_tensor(
-        ds4_gpu_tensor       *raw_cache,
-        const ds4_gpu_tensor *kv,
+int pulsar_gpu_store_raw_kv_tensor(
+        pulsar_gpu_tensor       *raw_cache,
+        const pulsar_gpu_tensor *kv,
         uint32_t                raw_cap,
         uint32_t                row,
         uint32_t                head_dim,
@@ -557,16 +557,16 @@ int ds4_gpu_store_raw_kv_tensor(
  * ring at slot positions[t] %% raw_cap over the whole pool (raw_cache = the
  * bank slab, byte-bounded by n_banks); pos0 is ignored.  Dead rows (seq_id
  * out of pool) store nothing.  NULL/NULL/1 = classic consecutive store. */
-int ds4_gpu_store_raw_kv_batch_tensor(
-        ds4_gpu_tensor       *raw_cache,
-        const ds4_gpu_tensor *kv,
+int pulsar_gpu_store_raw_kv_batch_tensor(
+        pulsar_gpu_tensor       *raw_cache,
+        const pulsar_gpu_tensor *kv,
         uint32_t                raw_cap,
         uint32_t                pos0,
         uint32_t                n_tokens,
         uint32_t                head_dim,
         uint32_t                raw_f16,
-        const ds4_gpu_tensor *positions,
-        const ds4_gpu_tensor *seq_id,
+        const pulsar_gpu_tensor *positions,
+        const pulsar_gpu_tensor *seq_id,
         uint32_t                n_banks);
 
 /* =========================================================================
@@ -578,12 +578,12 @@ int ds4_gpu_store_raw_kv_batch_tensor(
  * and optional indexer masks.
  */
 
-int ds4_gpu_compressor_update_tensor(
-        const ds4_gpu_tensor *kv_cur,
-        const ds4_gpu_tensor *sc_cur,
-        ds4_gpu_tensor       *state_kv,
-        ds4_gpu_tensor       *state_score,
-        ds4_gpu_tensor       *comp_cache,
+int pulsar_gpu_compressor_update_tensor(
+        const pulsar_gpu_tensor *kv_cur,
+        const pulsar_gpu_tensor *sc_cur,
+        pulsar_gpu_tensor       *state_kv,
+        pulsar_gpu_tensor       *state_score,
+        pulsar_gpu_tensor       *comp_cache,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                ape_offset,
@@ -604,11 +604,11 @@ int ds4_gpu_compressor_update_tensor(
         float                   beta_slow,
         float                   rms_eps);
 
-int ds4_gpu_compressor_store_batch_tensor(
-        const ds4_gpu_tensor *kv,
-        const ds4_gpu_tensor *sc,
-        ds4_gpu_tensor       *state_kv,
-        ds4_gpu_tensor       *state_score,
+int pulsar_gpu_compressor_store_batch_tensor(
+        const pulsar_gpu_tensor *kv,
+        const pulsar_gpu_tensor *sc,
+        pulsar_gpu_tensor       *state_kv,
+        pulsar_gpu_tensor       *state_score,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                ape_offset,
@@ -618,12 +618,12 @@ int ds4_gpu_compressor_store_batch_tensor(
         uint32_t                pos0,
         uint32_t                n_tokens);
 
-int ds4_gpu_compressor_prefill_tensor(
-        ds4_gpu_tensor       *comp_cache,
-        ds4_gpu_tensor       *state_kv,
-        ds4_gpu_tensor       *state_score,
-        const ds4_gpu_tensor *kv,
-        const ds4_gpu_tensor *sc,
+int pulsar_gpu_compressor_prefill_tensor(
+        pulsar_gpu_tensor       *comp_cache,
+        pulsar_gpu_tensor       *state_kv,
+        pulsar_gpu_tensor       *state_score,
+        const pulsar_gpu_tensor *kv,
+        const pulsar_gpu_tensor *sc,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                ape_offset,
@@ -645,12 +645,12 @@ int ds4_gpu_compressor_prefill_tensor(
         float                   beta_slow,
         float                   rms_eps);
 
-int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
-        ds4_gpu_tensor       *comp_cache,
-        ds4_gpu_tensor       *state_kv,
-        ds4_gpu_tensor       *state_score,
-        const ds4_gpu_tensor *kv,
-        const ds4_gpu_tensor *sc,
+int pulsar_gpu_compressor_prefill_ratio4_replay_tensor(
+        pulsar_gpu_tensor       *comp_cache,
+        pulsar_gpu_tensor       *state_kv,
+        pulsar_gpu_tensor       *state_score,
+        const pulsar_gpu_tensor *kv,
+        const pulsar_gpu_tensor *sc,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                ape_offset,
@@ -671,11 +671,11 @@ int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
         float                   beta_slow,
         float                   rms_eps);
 
-int ds4_gpu_compressor_prefill_state_ratio4_tensor(
-        ds4_gpu_tensor       *state_kv,
-        ds4_gpu_tensor       *state_score,
-        const ds4_gpu_tensor *kv_tail,
-        const ds4_gpu_tensor *sc_tail,
+int pulsar_gpu_compressor_prefill_state_ratio4_tensor(
+        pulsar_gpu_tensor       *state_kv,
+        pulsar_gpu_tensor       *state_score,
+        const pulsar_gpu_tensor *kv_tail,
+        const pulsar_gpu_tensor *sc_tail,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                ape_offset,
@@ -683,34 +683,34 @@ int ds4_gpu_compressor_prefill_state_ratio4_tensor(
         uint32_t                head_dim,
         uint32_t                pos0);
 
-int ds4_gpu_attention_decode_heads_tensor(
-        ds4_gpu_tensor       *heads,
+int pulsar_gpu_attention_decode_heads_tensor(
+        pulsar_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *raw_kv,
         uint32_t                n_raw,
         uint32_t                raw_cap,
         uint32_t                raw_start,
-        const ds4_gpu_tensor *comp_kv,
+        const pulsar_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
         uint32_t                comp_kv_fp8,
         uint32_t                comp_kv_pack,
         uint32_t                n_comp,
-        const ds4_gpu_tensor *comp_mask,
+        const pulsar_gpu_tensor *comp_mask,
         uint32_t                use_mask,
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                raw_f16);
 
-int ds4_gpu_attention_prefill_raw_heads_tensor(
-        ds4_gpu_tensor       *heads,
+int pulsar_gpu_attention_prefill_raw_heads_tensor(
+        pulsar_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *raw_kv,
         uint32_t                n_tokens,
         uint32_t                window,
         uint32_t                n_head,
@@ -741,13 +741,13 @@ int ds4_gpu_attention_prefill_raw_heads_tensor(
  * nonzero window <= 256 (the kernels' per-row raw scratch bound); banked
  * argument rejections return 0 and print the reason to stderr.  Pass
  * NULL/NULL/0/1 for the classic single-cache behavior — bit-exact. */
-int ds4_gpu_attention_decode_raw_batch_heads_tensor(
-        ds4_gpu_tensor       *heads,
+int pulsar_gpu_attention_decode_raw_batch_heads_tensor(
+        pulsar_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *raw_kv,
         uint32_t                n_tokens,
         uint32_t                pos0,
         uint32_t                n_raw,
@@ -758,23 +758,23 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                head_dim,
         uint32_t                non_causal,
         uint32_t                raw_f16,
-        const ds4_gpu_tensor *positions,
-        const ds4_gpu_tensor *seq_id,
+        const pulsar_gpu_tensor *positions,
+        const pulsar_gpu_tensor *seq_id,
         uint32_t                comp_cap,
         uint32_t                n_banks);
 
-int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
-        ds4_gpu_tensor       *heads,
+int pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
+        pulsar_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
-        const ds4_gpu_tensor *comp_kv,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *raw_kv,
+        const pulsar_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
         uint32_t                comp_kv_fp8,
         uint32_t                comp_kv_pack,
-        const ds4_gpu_tensor *comp_mask,
+        const pulsar_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
         uint32_t                n_tokens,
         uint32_t                pos0,
@@ -788,24 +788,24 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                head_dim,
         uint32_t                non_causal,
         uint32_t                raw_f16,
-        const ds4_gpu_tensor *positions,
-        const ds4_gpu_tensor *seq_id,
-        const ds4_gpu_tensor *comp_bank_ptrs,
+        const pulsar_gpu_tensor *positions,
+        const pulsar_gpu_tensor *seq_id,
+        const pulsar_gpu_tensor *comp_bank_ptrs,
         uint32_t                comp_cap,
         uint32_t                n_banks);
 
-int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
-        ds4_gpu_tensor       *heads,
+int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
+        pulsar_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
-        const ds4_gpu_tensor *comp_kv,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *raw_kv,
+        const pulsar_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
         uint32_t                comp_kv_fp8,
         uint32_t                comp_kv_pack,
-        const ds4_gpu_tensor *topk,
+        const pulsar_gpu_tensor *topk,
         uint32_t                n_tokens,
         uint32_t                pos0,
         uint32_t                n_raw,
@@ -818,20 +818,20 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                raw_f16,
-        const ds4_gpu_tensor *positions,
-        const ds4_gpu_tensor *seq_id,
-        const ds4_gpu_tensor *comp_bank_ptrs,
+        const pulsar_gpu_tensor *positions,
+        const pulsar_gpu_tensor *seq_id,
+        const pulsar_gpu_tensor *comp_bank_ptrs,
         uint32_t                comp_cap,
         uint32_t                n_banks);
 
-int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
-        ds4_gpu_tensor       *heads,
+int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(
+        pulsar_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
-        const ds4_gpu_tensor *comp_kv,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *raw_kv,
+        const pulsar_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
         uint32_t                comp_kv_fp8,
         uint32_t                n_tokens,
@@ -842,17 +842,17 @@ int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                head_dim,
         uint32_t                raw_f16);
 
-int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
-        ds4_gpu_tensor       *heads,
+int pulsar_gpu_attention_prefill_masked_mixed_heads_tensor(
+        pulsar_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
-        const ds4_gpu_tensor *comp_kv,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *raw_kv,
+        const pulsar_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
         uint32_t                comp_kv_fp8,
-        const ds4_gpu_tensor *comp_mask,
+        const pulsar_gpu_tensor *comp_mask,
         uint32_t                n_tokens,
         uint32_t                n_comp,
         uint32_t                window,
@@ -861,9 +861,9 @@ int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         uint32_t                head_dim,
         uint32_t                raw_f16);
 
-int ds4_gpu_attention_output_batch_tensor(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *low,
+int pulsar_gpu_attention_output_batch_tensor(
+        pulsar_gpu_tensor       *out,
+        pulsar_gpu_tensor       *low,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                out_a_offset,
@@ -872,18 +872,18 @@ int ds4_gpu_attention_output_batch_tensor(
         uint64_t                rank,
         uint32_t                n_groups,
         uint64_t                out_dim,
-        const ds4_gpu_tensor *heads,
+        const pulsar_gpu_tensor *heads,
         uint32_t                n_tokens);
 
-int ds4_gpu_attention_output_low_tensor(
-        ds4_gpu_tensor       *low,
+int pulsar_gpu_attention_output_low_tensor(
+        pulsar_gpu_tensor       *low,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                out_a_offset,
         uint64_t                group_dim,
         uint64_t                rank,
         uint32_t                n_groups,
-        const ds4_gpu_tensor *heads);
+        const pulsar_gpu_tensor *heads);
 
 /* =========================================================================
  * Router, Shared Expert, and Routed MoE.
@@ -893,32 +893,32 @@ int ds4_gpu_attention_output_low_tensor(
  * routing, shared SwiGLU, and the IQ2_XXS/Q2_K/MXFP4 routed experts.
  */
 
-int ds4_gpu_swiglu_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *gate,
-        const ds4_gpu_tensor *up,
+int pulsar_gpu_swiglu_tensor(
+        pulsar_gpu_tensor       *out,
+        const pulsar_gpu_tensor *gate,
+        const pulsar_gpu_tensor *up,
         uint32_t                n,
         float                   clamp,
         float                   weight);
 
-int ds4_gpu_add_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *a,
-        const ds4_gpu_tensor *b,
+int pulsar_gpu_add_tensor(
+        pulsar_gpu_tensor       *out,
+        const pulsar_gpu_tensor *a,
+        const pulsar_gpu_tensor *b,
         uint32_t                n);
 
-int ds4_gpu_directional_steering_project_tensor(
-        ds4_gpu_tensor       *x,
-        const ds4_gpu_tensor *directions,
+int pulsar_gpu_directional_steering_project_tensor(
+        pulsar_gpu_tensor       *x,
+        const pulsar_gpu_tensor *directions,
         uint32_t                layer,
         uint32_t                width,
         uint32_t                rows,
         float                   scale);
 
-int ds4_gpu_router_select_tensor(
-        ds4_gpu_tensor       *selected,
-        ds4_gpu_tensor       *weights,
-        ds4_gpu_tensor       *probs,
+int pulsar_gpu_router_select_tensor(
+        pulsar_gpu_tensor       *selected,
+        pulsar_gpu_tensor       *weights,
+        pulsar_gpu_tensor       *probs,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                bias_offset,
@@ -932,12 +932,12 @@ int ds4_gpu_router_select_tensor(
         uint32_t                n_group_used,
         bool                    has_bias,
         bool                    hash_mode,
-        const ds4_gpu_tensor *logits);
+        const pulsar_gpu_tensor *logits);
 
-int ds4_gpu_router_select_batch_tensor(
-        ds4_gpu_tensor       *selected,
-        ds4_gpu_tensor       *weights,
-        ds4_gpu_tensor       *probs,
+int pulsar_gpu_router_select_batch_tensor(
+        pulsar_gpu_tensor       *selected,
+        pulsar_gpu_tensor       *weights,
+        pulsar_gpu_tensor       *probs,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                bias_offset,
@@ -947,20 +947,20 @@ int ds4_gpu_router_select_batch_tensor(
         uint32_t                n_group_used,
         bool                    has_bias,
         bool                    hash_mode,
-        const ds4_gpu_tensor *logits,
-        const ds4_gpu_tensor *tokens,
+        const pulsar_gpu_tensor *logits,
+        const pulsar_gpu_tensor *tokens,
         uint32_t                n_expert,
         uint32_t                n_expert_used,
         float                   expert_weight_scale,
         uint32_t                n_tokens);
 
 
-int ds4_gpu_routed_moe_one_tensor(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *gate,
-        ds4_gpu_tensor       *up,
-        ds4_gpu_tensor       *mid,
-        ds4_gpu_tensor       *experts,
+int pulsar_gpu_routed_moe_one_tensor(
+        pulsar_gpu_tensor       *out,
+        pulsar_gpu_tensor       *gate,
+        pulsar_gpu_tensor       *up,
+        pulsar_gpu_tensor       *mid,
+        pulsar_gpu_tensor       *experts,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                gate_offset,
@@ -975,20 +975,20 @@ int ds4_gpu_routed_moe_one_tensor(
         uint32_t                expert_in_dim,
         uint32_t                expert_mid_dim,
         uint32_t                out_dim,
-        const ds4_gpu_tensor *selected,
-        const ds4_gpu_tensor *weights,
+        const pulsar_gpu_tensor *selected,
+        const pulsar_gpu_tensor *weights,
         uint32_t                n_total_expert,
         uint32_t                n_expert,
         float                   clamp,
-        const ds4_gpu_tensor *x,
+        const pulsar_gpu_tensor *x,
         uint32_t                layer_index);
 
-int ds4_gpu_routed_moe_batch_tensor(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *gate,
-        ds4_gpu_tensor       *up,
-        ds4_gpu_tensor       *mid,
-        ds4_gpu_tensor       *experts,
+int pulsar_gpu_routed_moe_batch_tensor(
+        pulsar_gpu_tensor       *out,
+        pulsar_gpu_tensor       *gate,
+        pulsar_gpu_tensor       *up,
+        pulsar_gpu_tensor       *mid,
+        pulsar_gpu_tensor       *experts,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                gate_offset,
@@ -1003,27 +1003,27 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                expert_in_dim,
         uint32_t                expert_mid_dim,
         uint32_t                out_dim,
-        const ds4_gpu_tensor *selected,
-        const ds4_gpu_tensor *weights,
+        const pulsar_gpu_tensor *selected,
+        const pulsar_gpu_tensor *weights,
         uint32_t                n_total_expert,
         uint32_t                n_expert,
         float                   clamp,
-        const ds4_gpu_tensor *x,
+        const pulsar_gpu_tensor *x,
         uint32_t                layer_index,
         uint32_t                n_tokens,
         bool                   *mid_is_f16);
 
-/* CUTLASS Sm120 block-scaled MXFP4 grouped-expert FFN (DS4_TENSOR_CUTLASS_MXFP4, type 40).
+/* CUTLASS Sm120 block-scaled MXFP4 grouped-expert FFN (PULSAR_TENSOR_CUTLASS_MXFP4, type 40).
  * out[T,out_dim] = down(swiglu(x.Wg^T, x.Wu^T)).Wd^T for T tokens ALL ROUTED TO ONE EXPERT
  * (the caller gathers per-expert rows via sorted_pairs before calling this, and scatters the
  * result back). Wg/Wu/Wd are that expert's CUTLASS-packed [data, then SF] blob pointers, sliced
  * by the caller from cutlass_mxfp4_expert_layout()'s stride/split-point. `scratch` must be at
- * least ds4_cutlass_expert_ffn_scratch_bytes(T,in_dim,mid_dim,out_dim) bytes; size once for the
+ * least pulsar_cutlass_expert_ffn_scratch_bytes(T,in_dim,mid_dim,out_dim) bytes; size once for the
  * layer's shape at the largest T a single expert can see and reuse across every expert and
  * every CUTLASS-typed layer sharing that shape -- this function does no allocation and no
- * synchronization, unlike ds4_cutlass_expert_ffn (used only by the standalone test). */
-size_t ds4_cutlass_expert_ffn_scratch_bytes(int T, int in_dim, int mid_dim, int out_dim);
-int ds4_cutlass_expert_ffn_scratch(
+ * synchronization, unlike pulsar_cutlass_expert_ffn (used only by the standalone test). */
+size_t pulsar_cutlass_expert_ffn_scratch_bytes(int T, int in_dim, int mid_dim, int out_dim);
+int pulsar_cutlass_expert_ffn_scratch(
         float          *out,
         const float    *x,
         const uint8_t  *Wg_d,
@@ -1047,7 +1047,7 @@ int ds4_cutlass_expert_ffn_scratch(
  * per slot at [slot*out_dim]; the caller sums the n_expert slices per token (moe_sum).
  * mid_scratch must hold n_tokens*n_expert*mid_dim floats. selected/rweights are the
  * device [n_tokens,n_expert] routing outputs. Returns 0 on success. */
-int ds4_cutlass_expert_ffn_gemv_small(
+int pulsar_cutlass_expert_ffn_gemv_small(
         float          *down_out,
         float          *mid_scratch,
         const float    *x,
@@ -1080,9 +1080,9 @@ int ds4_cutlass_expert_ffn_gemv_small(
  * row; the caller scatters the real rows into the flat down buffer (via the same padded map),
  * then moe_sum reduces. `padded_total` is a host upper bound (multiple of 128); inactive experts
  * carry M=0 and contribute nothing. `scratch` must be >= the *_scratch_bytes value. No host sync. */
-size_t ds4_cutlass_grouped_moe_scratch_bytes(
+size_t pulsar_cutlass_grouped_moe_scratch_bytes(
         int padded_total, int n_total_expert, int in_dim, int mid_dim, int out_dim);
-int ds4_cutlass_grouped_moe(
+int pulsar_cutlass_grouped_moe(
         float          *ffn_out,
         const float    *x_gathered,
         const float    *w_gathered,
@@ -1108,9 +1108,9 @@ int ds4_cutlass_grouped_moe(
  * x[T,in_dim] . W[out_dim,in_dim]^T for ONE expert's type-40 CUTLASS weight (data at W_d, swizzled
  * SFB at W_sf), packing x to E4M3 dynamic block-scaled activations -- bit-identical to a single
  * projection of the uniform grouped path. Caller gathers x contiguously (T = tokens for that
- * expert) and sizes scratch once via ds4_cutlass_proj_scratch_bytes(). No allocation, no sync. */
-size_t ds4_cutlass_proj_scratch_bytes(int T, int in_dim, int out_dim);
-int ds4_cutlass_proj_scratch(float *out, const float *x,
+ * expert) and sizes scratch once via pulsar_cutlass_proj_scratch_bytes(). No allocation, no sync. */
+size_t pulsar_cutlass_proj_scratch_bytes(int T, int in_dim, int out_dim);
+int pulsar_cutlass_proj_scratch(float *out, const float *x,
         const uint8_t *W_d, const uint8_t *W_sf, int T, int in_dim, int out_dim,
         uint8_t *scratch, size_t scratch_bytes);
 
@@ -1118,9 +1118,9 @@ int ds4_cutlass_proj_scratch(float *out, const float *x,
  * over 128-padded gathered activations: out[padded_total,out_dim] = x_gathered . W^T for every
  * active expert (W_base+e*W_stride data, +W_data_bytes swizzled SFB). No host readback, no per-expert
  * sync; bit-identical to the per-expert single-proj path (same pack + gather order + GEMM). Padding
- * rows must be pre-zeroed. Caller sizes scratch once via ds4_cutlass_grouped_proj_scratch_bytes(). */
-size_t ds4_cutlass_grouped_proj_scratch_bytes(int padded_total, int n_total_expert, int in_dim, int out_dim);
-int ds4_cutlass_grouped_proj(float *out, const float *x_gathered,
+ * rows must be pre-zeroed. Caller sizes scratch once via pulsar_cutlass_grouped_proj_scratch_bytes(). */
+size_t pulsar_cutlass_grouped_proj_scratch_bytes(int padded_total, int n_total_expert, int in_dim, int out_dim);
+int pulsar_cutlass_grouped_proj(float *out, const float *x_gathered,
         const uint8_t *W_base, uint64_t W_stride, uint64_t W_data_bytes,
         int n_total_expert, int in_dim, int out_dim,
         const uint32_t *counts, const uint32_t *padded_offsets, int padded_total,
@@ -1129,20 +1129,20 @@ int ds4_cutlass_grouped_proj(float *out, const float *x_gathered,
 /* Single-projection W4A8 GEMV for MIXED type-40 layers at decode/small-batch (n<=4): lean fp4-weight
  * GEMV with E4M3-roundtripped f32 activations (same function as the prefill grouped GEMM), one launch
  * over all (token,expert) slots, no per-expert loop/host sync. mid/down_out are pair-layout f32. */
-int ds4_cutlass_gemv_gateup(float *mid, const float *x, const int32_t *selected, const float *rweights,
+int pulsar_cutlass_gemv_gateup(float *mid, const float *x, const int32_t *selected, const float *rweights,
         const uint8_t *gate_w, const uint8_t *up_w, uint64_t gate_stride, uint64_t gate_data_bytes,
         float clamp, int n_tokens, int n_expert, unsigned n_total_expert, int in_dim, int mid_dim);
-int ds4_cutlass_gemv_down(float *down_out, const float *mid, const int32_t *selected,
+int pulsar_cutlass_gemv_down(float *down_out, const float *mid, const int32_t *selected,
         const uint8_t *down_w, uint64_t down_stride, uint64_t down_data_bytes,
         int n_tokens, int n_expert, unsigned n_total_expert, int mid_dim, int out_dim);
 
 /* Runtime dequant->fp4 weight packer for the 2-bit prefill path: quantizes a dequantized f32
  * weight [N,K] (N rows of K, RowMajor) to MXFP4 on-device (LOSSY) into CUTLASS B layout
- * (packed E2M1 `Bd` + swizzled ue8m0 `Bsf`), byte-identical to ds4_cutlass_pack_source so the
+ * (packed E2M1 `Bd` + swizzled ue8m0 `Bsf`), byte-identical to pulsar_cutlass_pack_source so the
  * FFN above consumes it unchanged. N must be even. Sizes below give the two output regions. */
-size_t ds4_cutlass_weight_data_bytes(int N, int K);
-size_t ds4_cutlass_weight_sf_count(int N, int K);
-void   ds4_cutlass_pack_weight_f32(uint8_t *Bd, uint8_t *Bsf, const float *W, int N, int K);
+size_t pulsar_cutlass_weight_data_bytes(int N, int K);
+size_t pulsar_cutlass_weight_sf_count(int N, int K);
+void   pulsar_cutlass_pack_weight_f32(uint8_t *Bd, uint8_t *Bsf, const float *W, int N, int K);
 
 /* =========================================================================
  * Hyper-Connection Kernels.
@@ -1152,9 +1152,9 @@ void   ds4_cutlass_pack_weight_f32(uint8_t *Bd, uint8_t *Bsf, const float *W, in
  * sublayer output back into four streams afterward.
  */
 
-int ds4_gpu_hc_split_sinkhorn_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *mix,
+int pulsar_gpu_hc_split_sinkhorn_tensor(
+        pulsar_gpu_tensor       *out,
+        const pulsar_gpu_tensor *mix,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                scale_offset,
@@ -1163,27 +1163,27 @@ int ds4_gpu_hc_split_sinkhorn_tensor(
         uint32_t                sinkhorn_iters,
         float                   eps);
 
-int ds4_gpu_hc_weighted_sum_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *weights,
+int pulsar_gpu_hc_weighted_sum_tensor(
+        pulsar_gpu_tensor       *out,
+        const pulsar_gpu_tensor *residual_hc,
+        const pulsar_gpu_tensor *weights,
         uint32_t                n_embd,
         uint32_t                n_hc);
 
-int ds4_gpu_hc_weighted_sum_split_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *split,
+int pulsar_gpu_hc_weighted_sum_split_tensor(
+        pulsar_gpu_tensor       *out,
+        const pulsar_gpu_tensor *residual_hc,
+        const pulsar_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
 
 /* Release decode fused HC pre-sublayer operation: split the HC mixer and
  * immediately reduce four HC streams into the active 4096-wide sublayer row. */
-int ds4_gpu_hc_split_weighted_sum_tensor(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *split,
-        const ds4_gpu_tensor *mix,
-        const ds4_gpu_tensor *residual_hc,
+int pulsar_gpu_hc_split_weighted_sum_tensor(
+        pulsar_gpu_tensor       *out,
+        pulsar_gpu_tensor       *split,
+        const pulsar_gpu_tensor *mix,
+        const pulsar_gpu_tensor *residual_hc,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                scale_offset,
@@ -1193,12 +1193,12 @@ int ds4_gpu_hc_split_weighted_sum_tensor(
         uint32_t                sinkhorn_iters,
         float                   eps);
 
-int ds4_gpu_hc_split_weighted_sum_norm_tensor(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *norm_out,
-        ds4_gpu_tensor       *split,
-        const ds4_gpu_tensor *mix,
-        const ds4_gpu_tensor *residual_hc,
+int pulsar_gpu_hc_split_weighted_sum_norm_tensor(
+        pulsar_gpu_tensor       *out,
+        pulsar_gpu_tensor       *norm_out,
+        pulsar_gpu_tensor       *split,
+        const pulsar_gpu_tensor *mix,
+        const pulsar_gpu_tensor *residual_hc,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                scale_offset,
@@ -1212,21 +1212,21 @@ int ds4_gpu_hc_split_weighted_sum_norm_tensor(
 
 /* Fused plain-RMSNorm + f16 HC-mix GEMV (decode, n_tok == 1).  Byte-identical
  * to rms_norm_plain_tensor() followed by matmul_f16_tensor(); see the kernel
- * comment in ds4_cuda_hc_router.cu for the order argument.  `x` is an HC
- * residual CARRIER (ds4_hc_t storage, DS4_HC_ELT_SIZE bytes/sample), not f32. */
-int ds4_gpu_hc_norm_mix_f16_tensor(
-        ds4_gpu_tensor       *out,
+ * comment in pulsar_cuda_hc_router.cu for the order argument.  `x` is an HC
+ * residual CARRIER (pulsar_hc_t storage, PULSAR_HC_ELT_SIZE bytes/sample), not f32. */
+int pulsar_gpu_hc_norm_mix_f16_tensor(
+        pulsar_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
+        const pulsar_gpu_tensor *x,
         float                   eps);
 
-int ds4_gpu_output_hc_weights_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *pre,
+int pulsar_gpu_output_hc_weights_tensor(
+        pulsar_gpu_tensor       *out,
+        const pulsar_gpu_tensor *pre,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                scale_offset,
@@ -1234,68 +1234,68 @@ int ds4_gpu_output_hc_weights_tensor(
         uint32_t                n_hc,
         float                   eps);
 
-int ds4_gpu_hc_expand_tensor(
-        ds4_gpu_tensor       *out_hc,
-        const ds4_gpu_tensor *block_out,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *post,
-        const ds4_gpu_tensor *comb,
+int pulsar_gpu_hc_expand_tensor(
+        pulsar_gpu_tensor       *out_hc,
+        const pulsar_gpu_tensor *block_out,
+        const pulsar_gpu_tensor *residual_hc,
+        const pulsar_gpu_tensor *post,
+        const pulsar_gpu_tensor *comb,
         uint32_t                n_embd,
         uint32_t                n_hc);
 
-int ds4_gpu_hc_expand_split_tensor(
-        ds4_gpu_tensor       *out_hc,
-        const ds4_gpu_tensor *block_out,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *split,
+int pulsar_gpu_hc_expand_split_tensor(
+        pulsar_gpu_tensor       *out_hc,
+        const pulsar_gpu_tensor *block_out,
+        const pulsar_gpu_tensor *residual_hc,
+        const pulsar_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
 
-int ds4_gpu_hc_expand_add_split_tensor(
-        ds4_gpu_tensor       *out_hc,
-        const ds4_gpu_tensor *block_out,
-        const ds4_gpu_tensor *block_add,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *split,
+int pulsar_gpu_hc_expand_add_split_tensor(
+        pulsar_gpu_tensor       *out_hc,
+        const pulsar_gpu_tensor *block_out,
+        const pulsar_gpu_tensor *block_add,
+        const pulsar_gpu_tensor *residual_hc,
+        const pulsar_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
 
-int ds4_gpu_shared_down_hc_expand_mxfp8_tensor(
-        ds4_gpu_tensor       *out_hc,
-        ds4_gpu_tensor       *shared_out,
+int pulsar_gpu_shared_down_hc_expand_mxfp8_tensor(
+        pulsar_gpu_tensor       *out_hc,
+        pulsar_gpu_tensor       *shared_out,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
-        const ds4_gpu_tensor *shared_mid,
-        const ds4_gpu_tensor *routed_out,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *split,
+        const pulsar_gpu_tensor *shared_mid,
+        const pulsar_gpu_tensor *routed_out,
+        const pulsar_gpu_tensor *residual_hc,
+        const pulsar_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
 
-int ds4_gpu_matmul_fp8_hc_expand_tensor(
-        ds4_gpu_tensor       *out_hc,
-        ds4_gpu_tensor       *block_out,
+int pulsar_gpu_matmul_fp8_hc_expand_tensor(
+        pulsar_gpu_tensor       *out_hc,
+        pulsar_gpu_tensor       *block_out,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *split,
+        const pulsar_gpu_tensor *x,
+        const pulsar_gpu_tensor *residual_hc,
+        const pulsar_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
 
 /* DSpark Markov + confidence heads */
 
-int ds4_gpu_dspark_markov_step_model(
-        ds4_gpu_tensor       *refined_logits,
+int pulsar_gpu_dspark_markov_step_model(
+        pulsar_gpu_tensor       *refined_logits,
         int32_t               *refined_id_dst,
         int32_t               *refined_id2_dst,
-        const ds4_gpu_tensor *base_logits,
+        const pulsar_gpu_tensor *base_logits,
         const void             *dspark_model_map,
         uint64_t                dspark_model_size,
         uint64_t                markov_w1_offset,
@@ -1304,15 +1304,15 @@ int ds4_gpu_dspark_markov_step_model(
         uint32_t               vocab_size,
         uint32_t               embed_dim);
 
-int ds4_gpu_dspark_hc_mean_reduce(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *after_ffn_hc,
+int pulsar_gpu_dspark_hc_mean_reduce(
+        pulsar_gpu_tensor       *out,
+        const pulsar_gpu_tensor *after_ffn_hc,
         uint32_t               n_embd,
         uint32_t               n_hc);
 
-int ds4_gpu_dspark_hc_mean_reduce_batch(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *hc_batch,
+int pulsar_gpu_dspark_hc_mean_reduce_batch(
+        pulsar_gpu_tensor       *out,
+        const pulsar_gpu_tensor *hc_batch,
         uint32_t               n_embd,
         uint32_t               n_hc,
         uint32_t               n_tokens);
@@ -1321,10 +1321,10 @@ int ds4_gpu_dspark_hc_mean_reduce_batch(
  * accepted. hidden = post-hc_head drafter hidden [n_positions, hidden_dim];
  * token_ids = block token per position; markov_w1/proj resolved from the dspark
  * model map. Drives confidence-scheduled verification (sizing the draft length). */
-int ds4_gpu_dspark_confidence_score_model(
-        ds4_gpu_tensor       *scores,
-        const ds4_gpu_tensor *hidden,
-        const ds4_gpu_tensor *token_ids,
+int pulsar_gpu_dspark_confidence_score_model(
+        pulsar_gpu_tensor       *scores,
+        const pulsar_gpu_tensor *hidden,
+        const pulsar_gpu_tensor *token_ids,
         const void             *dspark_model_map,
         uint64_t                dspark_model_size,
         uint64_t                markov_w1_offset,
@@ -1336,15 +1336,15 @@ int ds4_gpu_dspark_confidence_score_model(
 
 
 /* ===========================================================================
- * Wrong-arch build trap (checked at startup by ds4_gpu_init).
+ * Wrong-arch build trap (checked at startup by pulsar_gpu_init).
  *
  * A plain `make` rebuilds stale CUDA objects WITHOUT CUDA_ARCH=sm_120f, so
  * they compile for nvcc's default arch (sm_75 on CUDA 13).  The binary still
  * links and loads on the GB10, then dies mid-run with an opaque device assert
  * the first time a kernel needing sm_120f features launches — and `make test`
  * cannot catch it.  Every nvcc-compiled TU that includes this header (all of
- * src/cuda/ does, directly or via ds4_cuda_internal.h) registers the
- * __CUDA_ARCH_LIST__ it was compiled with; ds4_gpu_init() verifies each TU
+ * src/cuda/ does, directly or via pulsar_cuda_internal.h) registers the
+ * __CUDA_ARCH_LIST__ it was compiled with; pulsar_gpu_init() verifies each TU
  * carries code for the device's SM family and aborts startup with an
  * actionable message instead.  Per-TU registration also catches MIXED builds
  * (one stale object rebuilt default-arch by a plain `make`).  Host C compiles
@@ -1353,22 +1353,22 @@ int ds4_gpu_dspark_confidence_score_model(
  * links (no central symbol required).
  */
 #if defined(__cplusplus) && defined(__CUDA_ARCH_LIST__)
-typedef struct ds4_tu_archs {
+typedef struct pulsar_tu_archs {
     const char            *file;    /* __BASE_FILE__ of the registering TU */
     const int             *archs;   /* __CUDA_ARCH_LIST__ entries, e.g. 1200 */
     int                     n_archs;
-    struct ds4_tu_archs   *next;
-} ds4_tu_archs;
-inline ds4_tu_archs *ds4_tu_archs_head = nullptr;
+    struct pulsar_tu_archs   *next;
+} pulsar_tu_archs;
+inline pulsar_tu_archs *pulsar_tu_archs_head = nullptr;
 namespace {
-const int ds4_tu_arch_list_[] = { __CUDA_ARCH_LIST__ };
-ds4_tu_archs ds4_tu_archs_rec_ = {
-    __BASE_FILE__, ds4_tu_arch_list_,
-    (int)(sizeof(ds4_tu_arch_list_) / sizeof(ds4_tu_arch_list_[0])), nullptr
+const int pulsar_tu_arch_list_[] = { __CUDA_ARCH_LIST__ };
+pulsar_tu_archs pulsar_tu_archs_rec_ = {
+    __BASE_FILE__, pulsar_tu_arch_list_,
+    (int)(sizeof(pulsar_tu_arch_list_) / sizeof(pulsar_tu_arch_list_[0])), nullptr
 };
-__attribute__((constructor)) void ds4_tu_archs_register_(void) {
-    ds4_tu_archs_rec_.next = ds4_tu_archs_head;
-    ds4_tu_archs_head = &ds4_tu_archs_rec_;
+__attribute__((constructor)) void pulsar_tu_archs_register_(void) {
+    pulsar_tu_archs_rec_.next = pulsar_tu_archs_head;
+    pulsar_tu_archs_head = &pulsar_tu_archs_rec_;
 }
 }
 #endif

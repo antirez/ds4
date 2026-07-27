@@ -1,4 +1,4 @@
-#include "ds4_server_internal.h"
+#include "pulsar_server_internal.h"
 
 
 
@@ -141,7 +141,7 @@ bool anthropic_sse_start_live(int fd, const request *r, const char *id,
 
     memset(st, 0, sizeof(*st));
     st->active = ok;
-    st->mode = ds4_think_mode_enabled(r->think_mode) ? ANTH_STREAM_THINKING : ANTH_STREAM_TEXT;
+    st->mode = pulsar_think_mode_enabled(r->think_mode) ? ANTH_STREAM_THINKING : ANTH_STREAM_TEXT;
     return ok;
 }
 

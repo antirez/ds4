@@ -21,11 +21,11 @@
  * MODEL-DEPENDENT, GPU-resident; run manually under the memory discipline (hold
  * temp/gpu.lock, drop_caches, no foreign ds4 process). NOT part of `make test`.
  *
- * usage: DS4_MSEQ_BANKS=2 ./tests/bank_evict_restore_gate MODEL [L]
+ * usage: PULSAR_MSEQ_BANKS=2 ./tests/bank_evict_restore_gate MODEL [L]
  */
-#include "ds4.h"
-#include "ds4_engine_internal.h"
-#include "ds4_gpu.h"
+#include "pulsar.h"
+#include "pulsar_engine_internal.h"
+#include "pulsar_gpu.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,30 +52,30 @@ static char *read_file(const char *path, size_t *len_out) {
 
 /* FNV-1a fold of bank `bank`'s captured comp+index frontier rows (raw D2H). 0 on
  * a read failure (e.g. an evicted bank) — the caller only checksums resident banks. */
-static uint64_t checksum_bank_kv(ds4_session *s, uint32_t bank) {
-    ds4_gpu_graph *g = &s->graph;
+static uint64_t checksum_bank_kv(pulsar_session *s, uint32_t bank) {
+    pulsar_gpu_graph *g = &s->graph;
     const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
     const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
-        ? DS4_ENGINE_IDXFP4_ROWBYTES : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+        ? PULSAR_ENGINE_IDXFP4_ROWBYTES : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
     uint64_t h = 1469598103934665603ull;
     uint8_t *buf = (uint8_t *)malloc(64u * 1024u * 1024u);   /* per-layer row block scratch */
     if (!buf) return 0;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint32_t ncomp = g->ms_n_comp[bank][il];
         if (ncomp) {
-            ds4_gpu_tensor *v = gpu_graph_bank_attn_comp_view(g, il, bank);
-            if (!v || ds4_gpu_tensor_read(v, 0, buf, (uint64_t)ncomp * attn_row) == 0) { ds4_gpu_tensor_free(v); free(buf); return 0; }
-            ds4_gpu_tensor_free(v);
+            pulsar_gpu_tensor *v = gpu_graph_bank_attn_comp_view(g, il, bank);
+            if (!v || pulsar_gpu_tensor_read(v, 0, buf, (uint64_t)ncomp * attn_row) == 0) { pulsar_gpu_tensor_free(v); free(buf); return 0; }
+            pulsar_gpu_tensor_free(v);
             for (uint64_t i = 0; i < (uint64_t)ncomp * attn_row; i++) { h ^= buf[i]; h *= 1099511628211ull; }
         }
         if (ratio == 4) {
             const uint32_t nidx = g->ms_n_index_comp[bank][il];
             if (nidx) {
-                ds4_gpu_tensor *v = gpu_graph_bank_index_comp_view(g, il, bank);
-                if (!v || ds4_gpu_tensor_read(v, 0, buf, (uint64_t)nidx * idx_row) == 0) { ds4_gpu_tensor_free(v); free(buf); return 0; }
-                ds4_gpu_tensor_free(v);
+                pulsar_gpu_tensor *v = gpu_graph_bank_index_comp_view(g, il, bank);
+                if (!v || pulsar_gpu_tensor_read(v, 0, buf, (uint64_t)nidx * idx_row) == 0) { pulsar_gpu_tensor_free(v); free(buf); return 0; }
+                pulsar_gpu_tensor_free(v);
                 for (uint64_t i = 0; i < (uint64_t)nidx * idx_row; i++) { h ^= buf[i]; h *= 1099511628211ull; }
             }
         }
@@ -89,19 +89,19 @@ int main(int argc, char **argv) {
     const int L = argc > 2 ? atoi(argv[2]) : 24576;
     const int ctx = L + 4096;
 
-    ds4_engine *e = NULL;
-    ds4_engine_options opt; memset(&opt, 0, sizeof(opt));
-    opt.model_path = argv[1]; opt.backend = DS4_BACKEND_CUDA;
-    if (ds4_engine_open(&e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
+    pulsar_engine *e = NULL;
+    pulsar_engine_options opt; memset(&opt, 0, sizeof(opt));
+    opt.model_path = argv[1]; opt.backend = PULSAR_BACKEND_CUDA;
+    if (pulsar_engine_open(&e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
 
     size_t tl = 0; char *text = read_file("tests/long_context_story_prompt.txt", &tl);
     if (!text) { fprintf(stderr, "prompt read failed\n"); return 1; }
-    ds4_tokens base; memset(&base, 0, sizeof(base));
-    ds4_tokenize_text(e, text, &base); free(text);
+    pulsar_tokens base; memset(&base, 0, sizeof(base));
+    pulsar_tokenize_text(e, text, &base); free(text);
     if (base.len < 256) { fprintf(stderr, "prompt too short\n"); return 1; }
 
-    ds4_session *s = NULL;
-    if (ds4_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session create failed\n"); return 1; }
+    pulsar_session *s = NULL;
+    if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session create failed\n"); return 1; }
     const uint32_t pool = gpu_graph_bank_pool_count(&s->graph);
     fprintf(stderr, "evict_restore_gate: pool banks=%u ctx=%d L=%d\n", pool, ctx, L);
     if (pool < 2) { fprintf(stderr, "need DS4_MSEQ_BANKS>=2\n"); return 1; }
@@ -109,41 +109,41 @@ int main(int argc, char **argv) {
     /* 1. Prefill bank 0 (cur=0), capture its frontier, checksum its KV. */
     int *toks = (int *)malloc((size_t)L * sizeof(int));
     for (int i = 0; i < L; i++) toks[i] = base.v[i % base.len];
-    ds4_tokens p; memset(&p, 0, sizeof(p)); p.v = toks; p.len = p.cap = L;
+    pulsar_tokens p; memset(&p, 0, sizeof(p)); p.v = toks; p.len = p.cap = L;
     char err[256];
-    if (ds4_session_sync(s, &p, err, sizeof(err)) != 0) { fprintf(stderr, "sync failed: %s\n", err); return 1; }
+    if (pulsar_session_sync(s, &p, err, sizeof(err)) != 0) { fprintf(stderr, "sync failed: %s\n", err); return 1; }
     gpu_graph_bank_counters_capture(&s->graph, 0);
-    (void)ds4_gpu_synchronize();
+    (void)pulsar_gpu_synchronize();
     const uint64_t sum_before = checksum_bank_kv(s, 0);
-    const uint64_t touched0 = ds4_session_bank_touched_kv_bytes(s, 0);
+    const uint64_t touched0 = pulsar_session_bank_touched_kv_bytes(s, 0);
     CHECK(sum_before != 0, "checksum_before failed");
     fprintf(stderr, "evict_restore_gate: bank0 prefilled pos=%d touched=%.3f GiB checksum=%016" PRIx64 "\n",
-            ds4_session_pos(s), (double)touched0 / GIB, sum_before);
+            pulsar_session_pos(s), (double)touched0 / GIB, sum_before);
 
     /* 2. Save bank 0's comp/index KV to a DISK file (the real server mechanism;
      * bank 0 is cur). Measure disk-snapshot latency (an eviction stalls the
      * evicted session's next turn by save+reload time). */
-    ds4_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = &s->graph;
     const char *snap_path = "/home/tyler/Projects/AI/temp/tier2-inc1/bank0.kvsnap";
     { double t0 = now_ms();
       FILE *fp = fopen(snap_path, "wb");
       CHECK(fp != NULL, "open snap for write");
-      if (fp) { CHECK(ds4_session_bank_kv_save(s, 0, fp, err, sizeof err) == 0, "kv_save: %s", err); fclose(fp); }
+      if (fp) { CHECK(pulsar_session_bank_kv_save(s, 0, fp, err, sizeof err) == 0, "kv_save: %s", err); fclose(fp); }
       double t1 = now_ms();
       fprintf(stderr, "evict_restore_gate: kv_save %.1f ms\n", (t1 - t0)); }
 
-    uint64_t f_prefill = 0, tt = 0; (void)ds4_gpu_synchronize(); ds4_gpu_mem_info(&f_prefill, &tt);
+    uint64_t f_prefill = 0, tt = 0; (void)pulsar_gpu_synchronize(); pulsar_gpu_mem_info(&f_prefill, &tt);
 
     /* 3. Repoint to bank 1 so bank 0 is idle (free_physical refuses cur). */
-    CHECK(ds4_session_bank_state_restore(s, 1), "repoint to bank 1 failed");
-    uint64_t f_repoint = 0; (void)ds4_gpu_synchronize(); ds4_gpu_mem_info(&f_repoint, &tt);
+    CHECK(pulsar_session_bank_state_restore(s, 1), "repoint to bank 1 failed");
+    uint64_t f_repoint = 0; (void)pulsar_gpu_synchronize(); pulsar_gpu_mem_info(&f_repoint, &tt);
 
     /* 4. free_physical(bank 0) — DIRECT cudaFree; physical must return. */
-    CHECK(ds4_session_bank_free_physical(s, 0), "free_physical failed");
-    (void)ds4_gpu_synchronize();
-    uint64_t f_free = 0; ds4_gpu_mem_info(&f_free, &tt);
+    CHECK(pulsar_session_bank_free_physical(s, 0), "free_physical failed");
+    (void)pulsar_gpu_synchronize();
+    uint64_t f_free = 0; pulsar_gpu_mem_info(&f_free, &tt);
     const int64_t reclaimed = (int64_t)f_free - (int64_t)f_repoint;
-    CHECK(ds4_session_bank_is_evicted(s, 0), "bank 0 not marked evicted after free");
+    CHECK(pulsar_session_bank_is_evicted(s, 0), "bank 0 not marked evicted after free");
     fprintf(stderr, "evict_restore_gate: free[GiB] prefill=%.3f repoint=%.3f afterfree=%.3f reclaimed=%.3f (touched=%.3f)\n",
             (double)f_prefill/GIB, (double)f_repoint/GIB, (double)f_free/GIB, (double)reclaimed/GIB, (double)touched0/GIB);
     /* Reclaim must be POSITIVE (physical returned; refutes #50). The exact amount
@@ -157,22 +157,22 @@ int main(int argc, char **argv) {
     { double t0 = now_ms();
       FILE *fp = fopen(snap_path, "rb");
       CHECK(fp != NULL, "open snap for read");
-      if (fp) { CHECK(ds4_session_bank_kv_load(s, 0, fp, err, sizeof err) == 0, "kv_load: %s", err); fclose(fp); }
+      if (fp) { CHECK(pulsar_session_bank_kv_load(s, 0, fp, err, sizeof err) == 0, "kv_load: %s", err); fclose(fp); }
       double t1 = now_ms();
       fprintf(stderr, "evict_restore_gate: kv_load %.1f ms\n", (t1 - t0)); }
-    CHECK(!ds4_session_bank_is_evicted(s, 0), "bank 0 still evicted after restore");
+    CHECK(!pulsar_session_bank_is_evicted(s, 0), "bank 0 still evicted after restore");
     /* base-table entry must point at the fresh comp[il][0]. */
     { int checked = 0;
-      for (uint32_t il = 0; il < DS4_N_LAYER && checked < 4; il++) {
-          if (ds4_layer_compress_ratio(il) == 0) continue;
-          void *want = ds4_gpu_tensor_device_ptr(g->banks.comp[il][0]);
-          void *got = NULL; (void)ds4_gpu_synchronize();
-          ds4_gpu_tensor_read(g->banks.comp_bases[il], 0, &got, sizeof(void *));
+      for (uint32_t il = 0; il < PULSAR_N_LAYER && checked < 4; il++) {
+          if (pulsar_layer_compress_ratio(il) == 0) continue;
+          void *want = pulsar_gpu_tensor_device_ptr(g->banks.comp[il][0]);
+          void *got = NULL; (void)pulsar_gpu_synchronize();
+          pulsar_gpu_tensor_read(g->banks.comp_bases[il], 0, &got, sizeof(void *));
           CHECK(got == want, "comp_bases[%u][0] rebuild mismatch", il);
           checked++; } }
 
     /* 7. checksum again — must be bit-identical to before evict. */
-    (void)ds4_gpu_synchronize();
+    (void)pulsar_gpu_synchronize();
     const uint64_t sum_after = checksum_bank_kv(s, 0);
     CHECK(sum_after == sum_before, "KV NOT bit-identical after evict/restore (%016" PRIx64 " vs %016" PRIx64 ")",
           sum_after, sum_before);
@@ -183,24 +183,24 @@ int main(int argc, char **argv) {
      * guard evicts exactly the minimum, not the whole idle set / cascade). Prefill
      * bank 1 too; with bank 0 cur, free bank 1 and assert touched drops by EXACTLY
      * bank 1's frontier (bank 0's contribution remains). ===== */
-    CHECK(ds4_session_bank_state_restore(s, 1), "finding2: repoint to bank 1");
-    ds4_session_invalidate(s);   /* clear the carried-over bank-0 checkpoint so the
+    CHECK(pulsar_session_bank_state_restore(s, 1), "finding2: repoint to bank 1");
+    pulsar_session_invalidate(s);   /* clear the carried-over bank-0 checkpoint so the
                                   * sync actually prefills bank 1 from scratch */
-    { ds4_tokens p1; memset(&p1, 0, sizeof p1); p1.v = toks; p1.len = p1.cap = L;
+    { pulsar_tokens p1; memset(&p1, 0, sizeof p1); p1.v = toks; p1.len = p1.cap = L;
       char e2[256];
-      CHECK(ds4_session_sync(s, &p1, e2, sizeof e2) == 0, "finding2: bank1 sync: %s", e2); }
+      CHECK(pulsar_session_sync(s, &p1, e2, sizeof e2) == 0, "finding2: bank1 sync: %s", e2); }
     gpu_graph_bank_counters_capture(&s->graph, 1);
-    CHECK(ds4_session_bank_pos(s, 1) == L, "finding2: bank1 prefill pos=%d != %d (test setup)",
-          ds4_session_bank_pos(s, 1), L);
-    CHECK(ds4_session_bank_state_restore(s, 0), "finding2: repoint back to bank 0");
-    (void)ds4_gpu_synchronize();
-    const uint64_t t_b0 = ds4_session_bank_touched_kv_bytes(s, 0);
-    const uint64_t t_b1 = ds4_session_bank_touched_kv_bytes(s, 1);
-    const uint64_t t_both = ds4_session_touched_kv_bytes(s);
+    CHECK(pulsar_session_bank_pos(s, 1) == L, "finding2: bank1 prefill pos=%d != %d (test setup)",
+          pulsar_session_bank_pos(s, 1), L);
+    CHECK(pulsar_session_bank_state_restore(s, 0), "finding2: repoint back to bank 0");
+    (void)pulsar_gpu_synchronize();
+    const uint64_t t_b0 = pulsar_session_bank_touched_kv_bytes(s, 0);
+    const uint64_t t_b1 = pulsar_session_bank_touched_kv_bytes(s, 1);
+    const uint64_t t_both = pulsar_session_touched_kv_bytes(s);
     CHECK(t_both == t_b0 + t_b1, "finding2: pool touched (%.3f) != bank0+bank1 (%.3f+%.3f) GiB",
           (double)t_both/GIB, (double)t_b0/GIB, (double)t_b1/GIB);
-    CHECK(ds4_session_bank_free_physical(s, 1), "finding2: free bank 1 (cur is 0)");
-    const uint64_t t_after = ds4_session_touched_kv_bytes(s);
+    CHECK(pulsar_session_bank_free_physical(s, 1), "finding2: free bank 1 (cur is 0)");
+    const uint64_t t_after = pulsar_session_touched_kv_bytes(s);
     CHECK(t_after == t_b0,
           "finding2 (CASCADE BUG): touched after free bank1 = %.3f GiB, expected bank0-only %.3f GiB "
           "— a freed bank still counts, so the guard would spill every idle bank on one breach",
@@ -215,32 +215,32 @@ int main(int argc, char **argv) {
     const char *cpath = "/home/tyler/Projects/AI/temp/tier2-inc1/corrupt.kvsnap";
     /* (a) count > cap. */
     { FILE *fp = fopen(cpath, "wb");
-      uint32_t hdr[4] = { 0x4B564232u, 1u, 1u, (uint32_t)DS4_N_LAYER };
+      uint32_t hdr[4] = { 0x4B564232u, 1u, 1u, (uint32_t)PULSAR_N_LAYER };
       fwrite(hdr, sizeof hdr, 1, fp);
-      for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) { uint32_t c[2] = { 0xFFFFFFFFu, 0u }; fwrite(c, sizeof c, 1, fp); }
+      for (uint32_t il = 0; il < (uint32_t)PULSAR_N_LAYER; il++) { uint32_t c[2] = { 0xFFFFFFFFu, 0u }; fwrite(c, sizeof c, 1, fp); }
       fclose(fp);
       fp = fopen(cpath, "rb");
-      const int rc = ds4_session_bank_kv_load(s, 1, fp, err, sizeof err);
+      const int rc = pulsar_session_bank_kv_load(s, 1, fp, err, sizeof err);
       fclose(fp);
       CHECK(rc != 0, "finding3(a): kv_load ACCEPTED a count > cap");
-      CHECK(ds4_session_bank_touched_kv_bytes(s, 1) == 0, "finding3(a): bank1 advertises rows after failed load");
+      CHECK(pulsar_session_bank_touched_kv_bytes(s, 1) == 0, "finding3(a): bank1 advertises rows after failed load");
       fprintf(stderr, "evict_restore_gate: finding-3(a) count>cap rejected: rc=%d touched(1)=%.3f : %s\n",
-              rc, (double)ds4_session_bank_touched_kv_bytes(s, 1)/GIB, (rc != 0) ? "OK" : "FAIL"); }
+              rc, (double)pulsar_session_bank_touched_kv_bytes(s, 1)/GIB, (rc != 0) ? "OK" : "FAIL"); }
     /* (b) truncated: valid small counts but the row bytes are missing (short read). */
     { FILE *fp = fopen(cpath, "wb");
-      uint32_t hdr[4] = { 0x4B564232u, 1u, 1u, (uint32_t)DS4_N_LAYER };
+      uint32_t hdr[4] = { 0x4B564232u, 1u, 1u, (uint32_t)PULSAR_N_LAYER };
       fwrite(hdr, sizeof hdr, 1, fp);
-      for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
-          uint32_t c[2] = { ds4_layer_compress_ratio(il) ? 4u : 0u, 0u }; fwrite(c, sizeof c, 1, fp); }
+      for (uint32_t il = 0; il < (uint32_t)PULSAR_N_LAYER; il++) {
+          uint32_t c[2] = { pulsar_layer_compress_ratio(il) ? 4u : 0u, 0u }; fwrite(c, sizeof c, 1, fp); }
       /* no row data written -> fread of rows fails */
       fclose(fp);
       fp = fopen(cpath, "rb");
-      const int rc = ds4_session_bank_kv_load(s, 1, fp, err, sizeof err);
+      const int rc = pulsar_session_bank_kv_load(s, 1, fp, err, sizeof err);
       fclose(fp);
       CHECK(rc != 0, "finding3(b): kv_load ACCEPTED a truncated file");
-      CHECK(ds4_session_bank_touched_kv_bytes(s, 1) == 0, "finding3(b): bank1 advertises rows after truncated load");
+      CHECK(pulsar_session_bank_touched_kv_bytes(s, 1) == 0, "finding3(b): bank1 advertises rows after truncated load");
       fprintf(stderr, "evict_restore_gate: finding-3(b) truncated rejected: rc=%d touched(1)=%.3f : %s\n",
-              rc, (double)ds4_session_bank_touched_kv_bytes(s, 1)/GIB, (rc != 0) ? "OK" : "FAIL"); }
+              rc, (double)pulsar_session_bank_touched_kv_bytes(s, 1)/GIB, (rc != 0) ? "OK" : "FAIL"); }
     remove(cpath);
 
     remove(snap_path);

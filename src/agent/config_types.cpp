@@ -1,4 +1,4 @@
-#include "ds4_agent_internal.h"
+#include "pulsar_agent_internal.h"
 
 
 
@@ -34,7 +34,7 @@ bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
                                      char *err, size_t err_len);
 
 
-int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
+int agent_worker_sync_tokens(agent_worker *w, const pulsar_tokens *tokens,
                                     bool publish_progress,
                                     char *err, size_t err_len);
 

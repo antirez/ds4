@@ -7,7 +7,7 @@ an already-quantized *oracle* intermediate, and the final mixed-quant pass uses
 that compacted file as its template. The full ordering is below.
 
 Everything here is offline (no GPU needed) except the imatrix collection in
-stage (d), which runs the ds4 prefill graph.
+stage (d), which runs the pulsar prefill graph.
 
 ## Two external inputs
 
@@ -82,14 +82,14 @@ stage (f): it carries the compacted 192-expert shapes and the `reap.*` KV.
 
 ### (d) Imatrix — routed-MoE activation importance
 
-The IQ2_XXS floor needs a real importance vector. Collect one with the ds4
+The IQ2_XXS floor needs a real importance vector. Collect one with the pulsar
 runtime over the calibration corpus (or download the published `.dat`).
 
 ```sh
 # calibration corpus (already in-tree; regenerate if desired)
 python3 gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py
 
-./ds4 -m oracle-reap25-compact.gguf \
+./pulsar -m oracle-reap25-compact.gguf \
   --imatrix-dataset gguf-tools/imatrix/dataset/rendered_prompts.txt \
   --imatrix-out routed-moe.dat --ctx 32768
 ```
@@ -153,7 +153,7 @@ flags are needed. `bench`/`eval`/`agent` paths opt out via `--no-dspark`.
 ## Serve
 
 ```sh
-./ds4-server -m ds4flash-v5mx-reap25-type40-mxfp8lt-dspark-v1.gguf --ctx 1048576
+./pulsar-server -m ds4flash-v5mx-reap25-type40-mxfp8lt-dspark-v1.gguf --ctx 1048576
 ```
 
 ## Reproducibility statement
@@ -170,6 +170,6 @@ Two honest caveats:
 - **type-41 native emit** is still landing (stage (f) note). The bytes are
   identical; only *where* the swizzle is applied moves. This doc will be
   slightly ahead of the tree until that change merges.
-- Bit-exact model output depends on the ds4 engine build (`CUDA_ARCH=sm_120f`)
+- Bit-exact model output depends on the pulsar engine build (`CUDA_ARCH=sm_120f`)
   and the driver/CUDA stack; same-seed reproducibility is guaranteed only on
   identical hardware/build.

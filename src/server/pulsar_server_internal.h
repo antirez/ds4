@@ -1,19 +1,19 @@
-/* ds4_server_internal.h — internal shared declarations for the server sources.
- * Produced by the multi-TU split of ds4_server.c; edit freely (the
+/* pulsar_server_internal.h — internal shared declarations for the server sources.
+ * Produced by the multi-TU split of pulsar_server.c; edit freely (the
  * generator is not part of the build). */
-#ifndef DS4_SERVER_INTERNAL_H
-#define DS4_SERVER_INTERNAL_H
+#ifndef PULSAR_SERVER_INTERNAL_H
+#define PULSAR_SERVER_INTERNAL_H
 
-#include "ds4.h"
-#include "ds4_help.h"
-#include "ds4_kvstore.h"
+#include "pulsar.h"
+#include "pulsar_help.h"
+#include "pulsar_kvstore.h"
 #include "rax.h"
 
 /* OpenAI/Anthropic compatible local server.
  *
  * HTTP is intentionally simple: each client connection is handled by a small
  * blocking thread that parses one request, then queues a job to the single
- * GPU worker.  The worker owns the ds4_session and therefore owns all live KV
+ * GPU worker.  The worker owns the pulsar_session and therefore owns all live KV
  * cache state.  That keeps session reuse, disk checkpointing, and future
  * batching decisions in one place instead of spreading graph mutations across
  * client threads. */
@@ -47,24 +47,24 @@
 
 /* Build-time version string (Makefile passes -DDS4_VERSION_STR from
  * `git describe`); fall back to "unknown" for non-Makefile/ad-hoc builds. */
-#ifndef DS4_VERSION_STR
-#define DS4_VERSION_STR "unknown"
+#ifndef PULSAR_VERSION_STR
+#define PULSAR_VERSION_STR "unknown"
 #endif
 
 /* ---- shared macros ---- */
 
 
 
-#define DS4_SERVER_IO_TIMEOUT_SEC 10
-#define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
+#define PULSAR_SERVER_IO_TIMEOUT_SEC 10
+#define PULSAR_SERVER_SEND_STALL_TIMEOUT_MS 2000
 /* Trusted-LAN posture, but a single stuck or hostile peer must not exhaust
  * threads (one thread per connection) or hold a socket open forever while
  * trickling bytes (slowloris). The cap bounds concurrent client threads;
  * the read deadline bounds the total time a request may take to ARRIVE
  * (generation time is not counted - streaming responses run as long as the
  * model needs). */
-#define DS4_SERVER_MAX_CLIENTS 64
-#define DS4_SERVER_REQUEST_READ_DEADLINE_SEC 30
+#define PULSAR_SERVER_MAX_CLIENTS 64
+#define PULSAR_SERVER_REQUEST_READ_DEADLINE_SEC 30
 
 /* Multi-session serving increment 2: the worker steps each job as a resumable
  * state machine in bounded quanta instead of running it to completion. A
@@ -75,12 +75,12 @@
  * machinery). With one slot the quanta run back-to-back and behavior is
  * identical to run-to-completion; increment 3 interleaves slots at these
  * boundaries. */
-#define DS4_SERVER_DECODE_QUANTUM_TOKENS 16
+#define PULSAR_SERVER_DECODE_QUANTUM_TOKENS 16
 
 /* Ceiling for bytes queued in a slot_writer for a client that stops reading.
  * The stall timeout is the real slow-client guard; this cap only bounds worst
  * case memory if a client keeps draining just enough to defeat it. */
-#define DS4_SERVER_WRITER_MAX_PENDING_BYTES (64u * 1024u * 1024u)
+#define PULSAR_SERVER_WRITER_MAX_PENDING_BYTES (64u * 1024u * 1024u)
 
 
 /* The request parser only understands the API fields we use and skips the
@@ -90,20 +90,20 @@
 #define JSON_MAX_NESTING 256
 
 
-#define DS4_DSML "｜DSML｜"
-#define DS4_DSML_SHORT "DSML｜"
-#define DS4_TOOL_CALLS_START "<" DS4_DSML "tool_calls>"
-#define DS4_TOOL_CALLS_END "</" DS4_DSML "tool_calls>"
-#define DS4_INVOKE_START "<" DS4_DSML "invoke"
-#define DS4_INVOKE_END "</" DS4_DSML "invoke>"
-#define DS4_PARAM_START "<" DS4_DSML "parameter"
-#define DS4_PARAM_END "</" DS4_DSML "parameter>"
-#define DS4_TOOL_CALLS_START_SHORT "<" DS4_DSML_SHORT "tool_calls>"
-#define DS4_TOOL_CALLS_END_SHORT "</" DS4_DSML_SHORT "tool_calls>"
-#define DS4_INVOKE_START_SHORT "<" DS4_DSML_SHORT "invoke"
-#define DS4_INVOKE_END_SHORT "</" DS4_DSML_SHORT "invoke>"
-#define DS4_PARAM_START_SHORT "<" DS4_DSML_SHORT "parameter"
-#define DS4_PARAM_END_SHORT "</" DS4_DSML_SHORT "parameter>"
+#define PULSAR_DSML "｜DSML｜"
+#define PULSAR_DSML_SHORT "DSML｜"
+#define PULSAR_TOOL_CALLS_START "<" PULSAR_DSML "tool_calls>"
+#define PULSAR_TOOL_CALLS_END "</" PULSAR_DSML "tool_calls>"
+#define PULSAR_INVOKE_START "<" PULSAR_DSML "invoke"
+#define PULSAR_INVOKE_END "</" PULSAR_DSML "invoke>"
+#define PULSAR_PARAM_START "<" PULSAR_DSML "parameter"
+#define PULSAR_PARAM_END "</" PULSAR_DSML "parameter>"
+#define PULSAR_TOOL_CALLS_START_SHORT "<" PULSAR_DSML_SHORT "tool_calls>"
+#define PULSAR_TOOL_CALLS_END_SHORT "</" PULSAR_DSML_SHORT "tool_calls>"
+#define PULSAR_INVOKE_START_SHORT "<" PULSAR_DSML_SHORT "invoke"
+#define PULSAR_INVOKE_END_SHORT "</" PULSAR_DSML_SHORT "invoke>"
+#define PULSAR_PARAM_START_SHORT "<" PULSAR_DSML_SHORT "parameter"
+#define PULSAR_PARAM_END_SHORT "</" PULSAR_DSML_SHORT "parameter>"
 
 
 /* =========================================================================
@@ -120,8 +120,8 @@
  * state.
  */
 
-#define DS4_TOOL_MEMORY_DEFAULT_MAX_IDS 100000
-#define DS4_TOOL_MEMORY_MAX_BYTES (512u * 1024u * 1024u)
+#define PULSAR_TOOL_MEMORY_DEFAULT_MAX_IDS 100000
+#define PULSAR_TOOL_MEMORY_MAX_BYTES (512u * 1024u * 1024u)
 
 
 /* =========================================================================
@@ -151,7 +151,7 @@
  *   quant bits, save reason, token count, hit count, context size
  *   creation time, last-used time, payload byte count
  *   rendered text byte count + rendered text for human inspection
- *   DS4 engine payload written by ds4_session_save_payload()
+ *   DS4 engine payload written by pulsar_session_save_payload()
  *   optional tool-id map section
  *
  * The filename is SHA1(cache text bytes), not SHA1(token ids).  For ordinary
@@ -165,11 +165,11 @@
  * persist only mappings whose DSML block appears in the saved cache text.
  */
 
-#define KV_CACHE_FIXED_HEADER DS4_KVSTORE_FIXED_HEADER
-#define KV_CACHE_HIT_HALF_LIFE_SECONDS DS4_KVSTORE_HIT_HALF_LIFE_SECONDS
-#define KV_EXT_TOOL_MAP DS4_KVSTORE_EXT_TOOL_MAP
-#define KV_EXT_RESPONSES_VISIBLE DS4_KVSTORE_EXT_RESPONSES_VISIBLE
-#define KV_EXT_THINKING_VISIBLE DS4_KVSTORE_EXT_THINKING_VISIBLE
+#define KV_CACHE_FIXED_HEADER PULSAR_KVSTORE_FIXED_HEADER
+#define KV_CACHE_HIT_HALF_LIFE_SECONDS PULSAR_KVSTORE_HIT_HALF_LIFE_SECONDS
+#define KV_EXT_TOOL_MAP PULSAR_KVSTORE_EXT_TOOL_MAP
+#define KV_EXT_RESPONSES_VISIBLE PULSAR_KVSTORE_EXT_RESPONSES_VISIBLE
+#define KV_EXT_THINKING_VISIBLE PULSAR_KVSTORE_EXT_THINKING_VISIBLE
 #define KV_TOOL_MAP_MAGIC0 'K'
 #define KV_TOOL_MAP_MAGIC1 'T'
 #define KV_TOOL_MAP_MAGIC2 'M'
@@ -305,7 +305,7 @@ typedef struct {
 typedef struct {
     req_kind kind;
     api_style api;
-    ds4_tokens prompt;
+    pulsar_tokens prompt;
     char *model;
     bool model_from_request;
     stop_list stops;
@@ -333,7 +333,7 @@ typedef struct {
     int cache_read_tokens;
     int cache_write_tokens;
     req_timings timings;
-    ds4_think_mode think_mode;
+    pulsar_think_mode think_mode;
     bool has_tools;
     /* tool_choice="required" (OpenAI) / {"type":"any"|"tool"} (Anthropic):
      * force a tool call. The prompt is prefilled into an open DSML tool_calls
@@ -562,7 +562,7 @@ typedef struct job job;
  * install a writer, so their send_all() keeps the bounded-blocking behavior.
  * Failure semantics match the blocking path: a hard socket error fails
  * immediately, and a peer that accepts no bytes for
- * DS4_SERVER_SEND_STALL_TIMEOUT_MS (or overflows the pending cap) fails the
+ * PULSAR_SERVER_SEND_STALL_TIMEOUT_MS (or overflows the pending cap) fails the
  * stream, which the generation loop reports exactly as before. */
 typedef struct {
     int fd;
@@ -578,11 +578,11 @@ bool slot_writer_flush(slot_writer *w);     /* non-blocking best effort */
 bool slot_writer_drain(slot_writer *w);     /* blocking, stall-timeout bounded */
 void slot_writer_free(slot_writer *w);
 
-typedef ds4_kvstore_entry kv_entry;
+typedef pulsar_kvstore_entry kv_entry;
 
-typedef ds4_kvstore_options kv_cache_options;
+typedef pulsar_kvstore_options kv_cache_options;
 
-typedef ds4_kvstore kv_disk_cache;
+typedef pulsar_kvstore kv_disk_cache;
 
 typedef enum {
     TOOL_MEMORY_RAM = 0,
@@ -660,14 +660,14 @@ typedef struct {
  * All GPU work in this server runs on the SINGLE worker thread (worker_main in
  * generate.c). Client threads only parse HTTP and block on a per-job condvar
  * until the worker finishes (http_server.c handle path); they never touch a
- * ds4_session_* or ds4_gpu_* entry point. Verified by grepping every
- * ds4_session_/ds4_gpu_ call site under src/server: all of them are reached
+ * pulsar_session_* or pulsar_gpu_* entry point. Verified by grepping every
+ * pulsar_session_/pulsar_gpu_ call site under src/server: all of them are reached
  * only from the generation state machine (gen_* in generate.c) driven by
  * worker_main (or from cli_main startup/shutdown, before the worker starts and
  * after it joins) — with two deliberate exceptions, both plain loads of data
  * immutable after startup (no CUDA behind them): http_server.c reads
- * ds4_session_ctx(server.sess) on client threads, and client paths read the
- * model id via server_model_id_from_engine (ds4_engine_model_id, a static
+ * pulsar_session_ctx(server.sess) on client threads, and client paths read the
+ * model id via server_model_id_from_engine (pulsar_engine_model_id, a static
  * shape constant). Nothing else: /metrics in particular makes NO engine
  * calls — the worker publishes per-slot KV positions and the spec-decode
  * counters into plain server fields under mu (m_slot_pos/m_slot_ctx/m_spec,
@@ -678,12 +678,12 @@ typedef struct {
  *
  * It matters because the CUDA layer keeps process-global, NON-thread-safe state
  * that all sessions share:
- *   - g_cublas / g_cublaslt handles (ds4_cuda_runtime.cu, ds4_cuda_matmul.cu),
+ *   - g_cublas / g_cublaslt handles (pulsar_cuda_runtime.cu, pulsar_cuda_matmul.cu),
  *     bound to cudaStreamPerThread;
  *   - the MXFP8 weight map g_fp8_mx_by_offset (std::unordered_map) plus its
- *     direct-mapped front cache fc_off/fc_ptr (ds4_cuda_matmul.cu);
- *   - the function-local static lt_shape_cache (ds4_cuda_matmul.cu);
- *   - the determinism setting CUBLASLT_REDUCTION_SCHEME_NONE (ds4_cuda_matmul.cu).
+ *     direct-mapped front cache fc_off/fc_ptr (pulsar_cuda_matmul.cu);
+ *   - the function-local static lt_shape_cache (pulsar_cuda_matmul.cu);
+ *   - the determinism setting CUBLASLT_REDUCTION_SCHEME_NONE (pulsar_cuda_matmul.cu).
  *
  * Because these are shared and unlocked, Tier 1 keeps ONE GPU worker thread and
  * multiplexes sessions by time-slicing on that thread. Tier 2 must NOT naively
@@ -695,7 +695,7 @@ typedef struct {
  * Increment 1 was pure structural plumbing (pool of capacity 1). Increment 2
  * made the generation path re-entrant: each job runs as a per-slot resumable
  * state machine (gen_state in generate.c) that the worker steps in bounded
- * quanta — one prefill chunk, or up to DS4_SERVER_DECODE_QUANTUM_TOKENS decode
+ * quanta — one prefill chunk, or up to PULSAR_SERVER_DECODE_QUANTUM_TOKENS decode
  * tokens, per step. All GPU work still happens on the single worker thread.
  * Increment 3 adds the scheduler: the worker binds queued jobs to free slots
  * (FIFO, warmest-prefix slot choice, lazily provisioning extra slots under the
@@ -716,21 +716,21 @@ typedef struct {
  * conversation's warm KV) AND the packed-KV admission budget still has room.
  * A single client therefore always runs on slot 0, byte-identical to the
  * increment-2 single-session server. */
-#define DS4_SESSION_POOL_CAP 5
+#define PULSAR_SESSION_POOL_CAP 5
 
 /* Default context for lazily provisioned secondary slots (plan Tier 1 §1.4:
  * keep the default per-session context far below the lone-session maximum;
  * compressed-KV cost scales with ctx, so concurrency is bounded by the sum of
  * context sizes). A request that needs more than this gets a slot sized to
  * its need (capped at slot 0's ctx), admission permitting. */
-#define DS4_SERVER_EXTRA_SLOT_CTX_TOKENS 65536
+#define PULSAR_SERVER_EXTRA_SLOT_CTX_TOKENS 65536
 
 /* The rendered-prompt BOS marker. One definition for every render site AND
  * the startup trivial-match-threshold derivation (cli_main.c), so the
  * derived threshold can never silently drift from what rendered prompts
  * actually begin with. (Unit tests keep independent string literals on
  * purpose — they pin the wire bytes, not this macro.) */
-#define DS4_SERVER_RENDER_BOS "<｜begin▁of▁sentence｜>"
+#define PULSAR_SERVER_RENDER_BOS "<｜begin▁of▁sentence｜>"
 
 /* Slot-routing trivial-match allowance (task #30, 2026-07-16). The router's
  * choose-vs-provision gate treats a candidate slot's common token prefix as
@@ -747,10 +747,10 @@ typedef struct {
  * multi-thousand-token preambles the session pool exists for. Used only by
  * the routing decision (server_slot_match_is_trivial); prefill reuse of a
  * chosen slot still honors arbitrarily short common prefixes. */
-#define DS4_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS 64
+#define PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS 64
 
 /* Admission-control budget (Tier 1 §1.4). GB10 unified memory is ~121 GiB
- * usable; weights are queried at runtime (ds4_engine_weights_resident_bytes).
+ * usable; weights are queried at runtime (pulsar_engine_weights_resident_bytes).
  * The overhead reserve is the fixed process footprint measured on the GB10,
  * independent of session count. Re-measured 2026-07-15 over three clean
  * server restarts (production v5mx gguf, ctx=98304, prefill_chunk=2048,
@@ -765,7 +765,7 @@ typedef struct {
  * No further erosion after the first generation (MemAvailable flat within
  * ±0.01 GiB over subsequent generations and minutes of idle), so 18 GiB IS
  * the steady-state reserve; MemAvailable-based checks made after warm-up
- * must not re-reserve any part of it (see DS4_SERVER_MEM_FLOOR_BYTES).
+ * must not re-reserve any part of it (see PULSAR_SERVER_MEM_FLOOR_BYTES).
  *
  * F1 addendum (task #32, 2026-07-17): the lazy first-request component had
  * grown to ~9.2 GiB (instrumented 3-client greedy burst: MemAvailable fell
@@ -780,13 +780,13 @@ typedef struct {
  *     constants are an upper bound rather than the load-bearing estimate.
  * Re-measure the constants when the measured/static gap logged at startup
  * ("session admission: measured budget") exceeds ~2 GiB. */
-#define DS4_SERVER_USABLE_BYTES          (121ull * 1024ull * 1024ull * 1024ull)
-#define DS4_SERVER_PROCESS_OVERHEAD_BYTES (18ull * 1024ull * 1024ull * 1024ull)
+#define PULSAR_SERVER_USABLE_BYTES          (121ull * 1024ull * 1024ull * 1024ull)
+#define PULSAR_SERVER_PROCESS_OVERHEAD_BYTES (18ull * 1024ull * 1024ull * 1024ull)
 
 /* Free-memory floor (2026-07-13 lockup postmortem; re-sized 2026-07-15):
  * kernel/OS breathing room ONLY — the last-resort backstop for when other
  * accounting is wrong. It deliberately does NOT cover any process overhead:
- * that is DS4_SERVER_PROCESS_OVERHEAD_BYTES' job. The original 6 GiB was
+ * that is PULSAR_SERVER_PROCESS_OVERHEAD_BYTES' job. The original 6 GiB was
  * sized before the 18 GiB overhead constant existed and double-counted
  * caution on a warmed box: the ~8.7 GiB lazy first-request allocations
  * erode MemAvailable inside the reserve the ledger already subtracted, so
@@ -815,7 +815,7 @@ typedef struct {
  * 11.23 GiB avail before either faulted), so the floor bounds intent, not
  * the instantaneous worst case. One /proc/meminfo read per provisioning
  * attempt, never on a hot path. */
-#define DS4_SERVER_MEM_FLOOR_BYTES        (4ull * 1024ull * 1024ull * 1024ull)
+#define PULSAR_SERVER_MEM_FLOOR_BYTES        (4ull * 1024ull * 1024ull * 1024ull)
 
 typedef enum {
     SLOT_IDLE = 0,     /* no live job; the slot's KV may be warm and reusable */
@@ -848,7 +848,7 @@ typedef struct {
                                              shared pool (slot i -> bank i). 0 in
                                              classic (non-pooled) mode. */
     int          committed_pos;           /* Tier-2: this bank's committed KV
-                                             frontier length (== ds4_session_pos
+                                             frontier length (== pulsar_session_pos
                                              when this bank is the live one).
                                              Kept current at every op boundary so
                                              routing/metrics can read a non-live
@@ -864,7 +864,7 @@ typedef struct {
     uint64_t     tokens_emitted;          /* decode bookkeeping for the scheduler */
     uint64_t     last_serviced_us;        /* last quantum wall-clock (scheduler) */
     /* Per-conversation continued-store frontier (see kv_cache_tracker_bind):
-     * the shared ds4_kvstore keeps one continued_last_store_tokens field, but
+     * the shared pulsar_kvstore keeps one continued_last_store_tokens field, but
      * the schedule it tracks belongs to this slot's conversation. */
     int          continued_last_store_tokens;
     /* Tier-2 task #55 increment 2b — proactive-eviction guard. `spilled` means this
@@ -883,22 +883,22 @@ typedef struct {
 } session_slot;
 
 struct server {
-    ds4_engine *engine;
+    pulsar_engine *engine;
     /* The ONE session (created at startup, freed once at shutdown): classic
      * mode == 1 bank-less slot (slot 0), pool mode == pool_banks banks over
      * it. Slots are pure bank descriptors; all engine work goes through this
      * pointer. */
-    ds4_session *sess;
+    pulsar_session *sess;
     /* Advertised id override (server_config.served_model_id); NULL => built-in
      * server_model_id_from_engine. Read via server_served_model_id. */
     const char *served_model_id;
     /* Advertised display-name override (server_config.served_model_name); NULL
-     * => ds4_engine_model_name. Read via server_served_model_name. */
+     * => pulsar_engine_model_name. Read via server_served_model_name. */
     const char *served_model_name;
     /* Session pool. slots[0..n_slots) are provisioned; the worker thread is
      * the only mutator of slot fields and n_slots (n_slots additionally
      * published under mu for readers on client threads). */
-    session_slot slots[DS4_SESSION_POOL_CAP];
+    session_slot slots[PULSAR_SESSION_POOL_CAP];
     int          n_slots;            /* provisioned slots (worker-owned; published under mu) */
     /* Tier-2 bank-pool state (worker thread only). `pool_banks` > 0 means the
      * shared-pool flip is active: all live slots share server.sess and each
@@ -911,27 +911,27 @@ struct server {
     int          pool_banks;
     int          live_bank;
     int          spec_max_live;
-    /* plan-34 phase-2 inc 5: fused mixed-batch lane (DS4_MIXED_BATCH, default OFF,
+    /* plan-34 phase-2 inc 5: fused mixed-batch lane (PULSAR_MIXED_BATCH, default OFF,
      * read once at startup). When ON, the worker folds ONE prefilling slot's next
      * chunk (a K-row prefill run) into the decode quantum's first mixed step
-     * (ds4_session_decode_mixed) instead of advancing it as a separate classic
+     * (pulsar_session_decode_mixed) instead of advancing it as a separate classic
      * sweep — true continuous batching (P=1). OFF => today's exact decode-quantum +
      * separate one-prefill-chunk time-slice (byte-identical). Only meaningful in
      * pool mode (pool_banks>0). */
     bool         mixed_batch_enabled;
-    /* Prefill rows folded into EACH decode step of a fused quantum (DS4_MIXED_CHUNK,
+    /* Prefill rows folded into EACH decode step of a fused quantum (PULSAR_MIXED_CHUNK,
      * read once; default 32). Spreading the prefill uniformly across the quantum's
      * steps (vs one big chunk on one step) is what trades the time-slice's per-
      * interval decode STALL for a small uniform per-token cost — the p99 lever. */
     int          mixed_chunk_tokens;
-    /* plan-33 inc B: warm full-prefix FORK routing (DS4_WARM_FORK, default on;
+    /* plan-33 inc B: warm full-prefix FORK routing (PULSAR_WARM_FORK, default on;
      * read once at startup). When a request's prompt token-extends an idle warm
      * bank's committed history, the router forks that trunk into a FREE bank and
      * continues there, leaving the trunk intact for siblings. */
     bool         warm_fork_enabled;
     /* plan-33 inc D: minimum shared-prefix TOKEN count for a PARTIAL fork-cut to
      * be worth it (below this, reusing so few tokens loses to a plain cold
-     * prefill; a full-prefix match still forks regardless). DS4_WARM_PARTIAL_MIN,
+     * prefill; a full-prefix match still forks regardless). PULSAR_WARM_PARTIAL_MIN,
      * read once at startup; floored to the ratio-4 align (partial cuts below R
      * reuse nothing). */
     int          warm_partial_min;
@@ -955,7 +955,7 @@ struct server {
     char         spill_dir[512];
     /* Trivial-match threshold for the choose-vs-provision routing decision:
      * template-header tokens measured at startup +
-     * DS4_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS (cli_main.c; immutable after
+     * PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS (cli_main.c; immutable after
      * startup, worker thread reads only). */
     int slot_trivial_common_tokens;
     int default_tokens;
@@ -987,9 +987,9 @@ struct server {
      * per-slot KV positions/contexts and the engine spec-decode counters here
      * (server_publish_metrics_snapshot, at bind time and once per quantum);
      * send_metrics reads only these. */
-    int m_slot_pos[DS4_SESSION_POOL_CAP];  /* ds4_session_pos per provisioned slot */
-    int m_slot_ctx[DS4_SESSION_POOL_CAP];  /* ctx_size per provisioned slot */
-    ds4_spec_metrics m_spec;               /* engine spec-decode counters */
+    int m_slot_pos[PULSAR_SESSION_POOL_CAP];  /* pulsar_session_pos per provisioned slot */
+    int m_slot_ctx[PULSAR_SESSION_POOL_CAP];  /* ctx_size per provisioned slot */
+    pulsar_spec_metrics m_spec;               /* engine spec-decode counters */
     uint64_t seq;
     FILE *trace;
     pthread_mutex_t trace_mu;
@@ -1009,11 +1009,11 @@ struct job {
 };
 
 typedef enum {
-    KV_REASON_UNKNOWN   = DS4_KVSTORE_REASON_UNKNOWN,
-    KV_REASON_COLD      = DS4_KVSTORE_REASON_COLD,
-    KV_REASON_CONTINUED = DS4_KVSTORE_REASON_CONTINUED,
-    KV_REASON_EVICT     = DS4_KVSTORE_REASON_EVICT,
-    KV_REASON_SHUTDOWN  = DS4_KVSTORE_REASON_SHUTDOWN,
+    KV_REASON_UNKNOWN   = PULSAR_KVSTORE_REASON_UNKNOWN,
+    KV_REASON_COLD      = PULSAR_KVSTORE_REASON_COLD,
+    KV_REASON_CONTINUED = PULSAR_KVSTORE_REASON_CONTINUED,
+    KV_REASON_EVICT     = PULSAR_KVSTORE_REASON_EVICT,
+    KV_REASON_SHUTDOWN  = PULSAR_KVSTORE_REASON_SHUTDOWN,
 } kv_cache_reason;
 
 typedef struct {
@@ -1072,7 +1072,7 @@ typedef struct {
 } client_arg;
 
 typedef struct {
-    ds4_engine_options engine;
+    pulsar_engine_options engine;
     const char *host;
     int port;
     int ctx_size;
@@ -1113,7 +1113,7 @@ void *server_xmalloc(size_t n);
 void *server_xrealloc(void *p, size_t n);
 char *xstrdup(const char *s);
 bool random_bytes(void *dst, size_t len);
-void ds4_die(const char *msg); /* engine util.c; aborts the process */
+void pulsar_die(const char *msg); /* engine util.c; aborts the process */
 char *xstrndup(const char *s, size_t n);
 void buf_append(buf *b, const void *p, size_t n);
 void buf_putc(buf *b, char c);
@@ -1141,14 +1141,14 @@ void tool_schema_orders_free(tool_schema_orders *orders);
 const tool_schema_order *tool_schema_orders_find(const tool_schema_orders *orders, const char *name);
 void request_init(request *r, req_kind kind, int max_tokens);
 void request_free(request *r);
-ds4_think_mode think_mode_from_enabled(bool enabled, ds4_think_mode effort);
-bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out);
-bool parse_reasoning_effort_value(const char **p, ds4_think_mode *out);
+pulsar_think_mode think_mode_from_enabled(bool enabled, pulsar_think_mode effort);
+bool parse_reasoning_effort_name(const char *s, pulsar_think_mode *out);
+bool parse_reasoning_effort_value(const char **p, pulsar_think_mode *out);
 bool parse_thinking_control_value(const char **p, bool *thinking_enabled);
-bool parse_output_config_effort(const char **p, ds4_think_mode *effort);
+bool parse_output_config_effort(const char **p, pulsar_think_mode *effort);
 bool model_alias_disables_thinking(const char *model);
 bool model_alias_enables_thinking(const char *model);
-const char *server_model_id_from_engine(ds4_engine *engine);
+const char *server_model_id_from_engine(pulsar_engine *engine);
 /* Advertised model id ("id"/"root"/metrics): --served-model-id override if set,
  * else the built-in id. Must be HF-resolvable for HF-convention tokenizer tools. */
 const char *server_served_model_id(const server *s);
@@ -1179,9 +1179,9 @@ bool chat_history_preserves_reasoning(const chat_msgs *msgs,
                                              const char *tool_schemas);
 char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                      const tool_schema_orders *tool_orders,
-                                     ds4_think_mode think_mode);
+                                     pulsar_think_mode think_mode);
 bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
-                                            ds4_think_mode think_mode,
+                                            pulsar_think_mode think_mode,
                                             bool *requires_live_tool_state,
                                             bool *requires_live_reasoning,
                                             char *err, size_t errlen);
@@ -1192,16 +1192,16 @@ bool anthropic_validate_tool_results(server *s, const chat_msgs *msgs,
                                             char *err, size_t errlen);
 void anthropic_prepare_live_continuation(request *r,
                                                 const chat_msgs *msgs);
-bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
+bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                int ctx_size, request *r, char *err, size_t errlen);
-bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, int def_tokens,
+bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                     int ctx_size, request *r, char *err, size_t errlen);
 bool parse_responses_input(const char **p, chat_msgs *msgs,
                                   buf *loaded_tool_schemas,
                                   tool_schema_orders *orders);
-bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def_tokens,
+bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                     int ctx_size, request *r, char *err, size_t errlen);
-bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
+bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens,
                                      int ctx_size, request *r, char *err, size_t errlen);
 bool send_all(int fd, const void *p, size_t n);
 void json_escape(buf *b, const char *s);
@@ -1344,7 +1344,7 @@ bool anthropic_sse_finish_live(int fd, server *s, const request *r, const char *
                                       size_t raw_len, const tool_calls *calls,
                                       const char *finish, int completion_tokens);
 double server_now_sec(void);
-void server_log(ds4_log_type type, const char *fmt, ...);
+void server_log(pulsar_log_type type, const char *fmt, ...);
 int tool_memory_max_entries(const tool_memory *m);
 tool_memory_block *tool_memory_find_block_locked(tool_memory *m,
                                                         const char *dsml,
@@ -1405,25 +1405,25 @@ void kv_fill_header(uint8_t h[KV_CACHE_FIXED_HEADER], uint8_t quant_bits,
                            uint64_t created_at, uint64_t last_used,
                            uint64_t payload_bytes);
 void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs);
-double kv_entry_eviction_score(const kv_entry *e, const ds4_tokens *live,
+double kv_entry_eviction_score(const kv_entry *e, const pulsar_tokens *live,
                                       uint64_t now,
-                                      const ds4_kvstore_eviction_context *incoming);
-void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live,
+                                      const pulsar_kvstore_eviction_context *incoming);
+void kv_cache_evict(kv_disk_cache *kc, const pulsar_tokens *live,
                            uint64_t extra_bytes,
-                           const ds4_kvstore_eviction_context *incoming);
+                           const pulsar_kvstore_eviction_context *incoming);
 bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb,
                           bool reject_different_quant, kv_cache_options opt);
 void kv_cache_close(kv_disk_cache *kc);
-char *render_tokens_text(ds4_engine *engine, const ds4_tokens *tokens, size_t *out_len);
-void tokens_copy_prefix(ds4_tokens *dst, const ds4_tokens *src, int n);
+char *render_tokens_text(pulsar_engine *engine, const pulsar_tokens *tokens, size_t *out_len);
+void tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, int n);
 void build_prompt_from_exact_prefix_and_text_suffix(
-        ds4_engine *engine,
-        const ds4_tokens *exact_prefix,
+        pulsar_engine *engine,
+        const pulsar_tokens *exact_prefix,
         const char *suffix_text,
-        ds4_tokens *out);
+        pulsar_tokens *out);
 int kv_cache_store_len(const kv_disk_cache *kc, int tokens);
 int kv_cache_chat_anchor_pos(const kv_disk_cache *kc,
-                                    const ds4_tokens *prompt,
+                                    const pulsar_tokens *prompt,
                                     int user_token_id,
                                     int assistant_token_id);
 int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tokens);
@@ -1434,7 +1434,7 @@ bool kv_cache_file_size_fits(const kv_disk_cache *kc,
                                     uint64_t *file_bytes_out,
                                     uint64_t *required_bytes_out);
 bool kv_cache_store_live_prefix(server *s, session_slot *sl,
-                                       const ds4_tokens *tokens,
+                                       const pulsar_tokens *tokens,
                                        int store_len, const char *reason);
 /* Returns whether a checkpoint file was actually written — eviction uses this
  * for failure honesty (evict-without-snapshot falls back to client re-prefill;
@@ -1460,34 +1460,34 @@ void kv_cache_maybe_store_continued(server *s, session_slot *sl);
 int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
                                      int quant_bits, int ctx_size);
 int kv_cache_try_load_text(server *s, session_slot *sl, const char *prompt_text,
-                                  ds4_tokens *effective_prompt,
+                                  pulsar_tokens *effective_prompt,
                                   char **loaded_path_out,
                                   uint8_t *loaded_ext_flags_out,
                                   bool responses_protocol);
 int kv_cache_try_load(server *s, session_slot *sl, const request *req,
-                             ds4_tokens *effective_prompt,
+                             pulsar_tokens *effective_prompt,
                              char **loaded_path_out,
                              uint8_t *loaded_ext_flags_out);
 int live_text_prefix_prompt(server *s, session_slot *sl, const request *req,
-                                   ds4_tokens *effective_prompt);
+                                   pulsar_tokens *effective_prompt);
 int responses_live_continuation_prompt(server *s, session_slot *sl,
                                               const request *req,
                                               int live_pos,
-                                              ds4_tokens *effective_prompt,
+                                              pulsar_tokens *effective_prompt,
                                               int *matched_ids);
 int anthropic_live_continuation_prompt(server *s, session_slot *sl,
                                               const request *req,
                                               int live_pos,
-                                              ds4_tokens *effective_prompt,
+                                              pulsar_tokens *effective_prompt,
                                               int *matched_ids);
 int responses_live_visible_prefix_prompt(server *s, session_slot *sl,
                                                 const request *req,
                                                 int live_pos,
-                                                ds4_tokens *effective_prompt);
+                                                pulsar_tokens *effective_prompt);
 int thinking_live_visible_prefix_prompt(server *s, session_slot *sl,
                                                const request *req,
                                                int live_pos,
-                                               ds4_tokens *effective_prompt);
+                                               pulsar_tokens *effective_prompt);
 /* Routing probe: does this slot's live thinking binding mark it as the warm
  * continuation of req's visible transcript? Same guards as
  * thinking_live_visible_prefix_prompt but byte-prefix check only — no
@@ -1527,10 +1527,10 @@ uint64_t server_reconciled_session_cost(int slot_idx, int ctx,
 uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost);
 /* Tier-2 bank-aware frontier position of `sl`, correct whether or not sl->bank
  * is the currently-installed bank of the shared pool session (a non-live bank
- * reads its saved host carry via ds4_session_bank_pos; the live bank reads the
- * live checkpoint). In classic (non-pooled) mode == ds4_session_pos(s->sess).
+ * reads its saved host carry via pulsar_session_bank_pos; the live bank reads the
+ * live checkpoint). In classic (non-pooled) mode == pulsar_session_pos(s->sess).
  * Worker-thread scheduling reads AND the client/worker tool-id lookups use this
- * instead of ds4_session_pos so a non-live bank's frontier is never misread as
+ * instead of pulsar_session_pos so a non-live bank's frontier is never misread as
  * the pool's live cursor (defined in generate.c). */
 /* Install `bank` on the shared pool session: lazily saves the outgoing bank's
  * carry, reloads a guard-spilled target from disk, and repoints the graph's
@@ -1547,8 +1547,8 @@ int server_evict_pick_victim(const session_slot *slots, int n_slots,
                                     const bool *protect);
 void trace_cache_capture(
         trace_cache_diag *d,
-        const ds4_tokens *live,
-        const ds4_tokens *prompt,
+        const pulsar_tokens *live,
+        const pulsar_tokens *prompt,
         int old_pos,
         int common);
 const char *trace_cache_miss_reason(const trace_cache_diag *d);
@@ -1616,4 +1616,4 @@ void usage(FILE *fp, const char *topic);
 /* ---- shared inline helpers ---- */
 
 
-#endif /* DS4_SERVER_INTERNAL_H */
+#endif /* PULSAR_SERVER_INTERNAL_H */

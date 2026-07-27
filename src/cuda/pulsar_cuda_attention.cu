@@ -1,4 +1,4 @@
-#include "ds4_cuda_internal.h"
+#include "pulsar_cuda_internal.h"
 
 /* raw_f16: per-call flag describing the storage format of the PASSED raw KV
  * operand (__half when set, f32 otherwise).  The store kernels already round
@@ -25,28 +25,28 @@ __device__ static inline float4 raw_kv_ld4(const float *raw_kv, int f16, uint64_
     return ((const float4 *)(raw_kv + row_base))[c4];
 }
 
-__device__ static float ds4a_e4m3_value(int i) {
+__device__ static float pulsar_attn_e4m3_value(int i) {
     int exp = (i >> 3) & 15;
     int mant = i & 7;
     if (exp == 0) return (float)mant * 0.001953125f;
     return (1.0f + (float)mant * 0.125f) * exp2f((float)exp - 7.0f);
 }
 
-__device__ static float ds4a_fp8_kv_dequant(uint8_t byte, float scale) {
+__device__ static float pulsar_attn_fp8_kv_dequant(uint8_t byte, float scale) {
     int idx = byte & 0x7f;
-    float val = ds4a_e4m3_value(idx);
+    float val = pulsar_attn_e4m3_value(idx);
     return (byte & 0x80) ? (-val * scale) : (val * scale);
 }
 
-/* comp_kv_pack: per-call flag — the comp cache operand is DS4_ATTN_PACK rows
- * (see DS4_ATTN_PACK_* in ds4_cuda_internal.h): [n_nope e4m3][n_nope/64 E8M0]
+/* comp_kv_pack: per-call flag — the comp cache operand is PULSAR_ATTN_PACK rows
+ * (see PULSAR_ATTN_PACK_* in pulsar_cuda_internal.h): [n_nope e4m3][n_nope/64 E8M0]
  * [pad][n_rot f32 rope].  Nope dims decode e4m3_value * 2^(e8-127) — exactly
  * the fp8_kv_quantize roundtrip value the f32 cache holds — and rope dims read
  * f32 directly, so scores/outputs are bit-identical to the f32 comp cache.
  * The 2^(e8-127) scale is built as a float exponent; the pack amax floor
  * (1e-4 -> e8 >= 105) rules out byte 0. */
 /* e4m3 byte * scale by pure bit math — bit-identical to
- * ds4a_e4m3_value(b & 0x7f) * scale with the sign applied (normals become the
+ * pulsar_attn_e4m3_value(b & 0x7f) * scale with the sign applied (normals become the
  * exact float (1 + mant/8)*2^(exp-7) built directly from its bit pattern;
  * subnormals use the same mant*2^-9 product; scale is an exact power of two,
  * and (-v)*s == -(v*s) in IEEE), but with no exp2f in the inner loops. */
@@ -60,13 +60,13 @@ __device__ static inline float attn_pack_e4m3(uint32_t b, float scale) {
 }
 
 __device__ static inline float attn_comp_pack_ld(const float *comp_kv, uint64_t row, uint32_t d, uint32_t head_dim) {
-    const uint32_t n_nope = head_dim - DS4_ATTN_PACK_NROT;
-    const uint8_t *r = (const uint8_t *)comp_kv + row * DS4_ATTN_PACK_ROWBYTES(head_dim);
+    const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
+    const uint8_t *r = (const uint8_t *)comp_kv + row * PULSAR_ATTN_PACK_ROWBYTES(head_dim);
     if (d < n_nope) {
-        const float scale = __uint_as_float((uint32_t)r[n_nope + (d / DS4_FP8_KV_BLOCK)] << 23);
+        const float scale = __uint_as_float((uint32_t)r[n_nope + (d / PULSAR_FP8_KV_BLOCK)] << 23);
         return attn_pack_e4m3(r[d], scale);
     }
-    return ((const float *)(r + n_nope + DS4_ATTN_PACK_SCALES_PAD(head_dim)))[d - n_nope];
+    return ((const float *)(r + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(head_dim)))[d - n_nope];
 }
 
 /* Packed-row dot walked d = 0..head_dim-1 by one thread: per-64-block scale
@@ -74,13 +74,13 @@ __device__ static inline float attn_comp_pack_ld(const float *comp_kv, uint64_t 
  * aligned: 712-byte stride).  Accumulation order is identical to the scalar
  * d-ascending loop, so the result is bit-identical. */
 __device__ static inline float attn_pack_dot_full(const float *qh, const float *comp_kv, uint64_t row, uint32_t head_dim, float dot) {
-    const uint32_t n_nope = head_dim - DS4_ATTN_PACK_NROT;
-    const uint8_t *pr = (const uint8_t *)comp_kv + row * DS4_ATTN_PACK_ROWBYTES(head_dim);
+    const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
+    const uint8_t *pr = (const uint8_t *)comp_kv + row * PULSAR_ATTN_PACK_ROWBYTES(head_dim);
     const uint8_t *psc = pr + n_nope;
-    for (uint32_t off = 0; off < n_nope; off += DS4_FP8_KV_BLOCK) {
-        const float scale = __uint_as_float((uint32_t)psc[off / DS4_FP8_KV_BLOCK] << 23);
+    for (uint32_t off = 0; off < n_nope; off += PULSAR_FP8_KV_BLOCK) {
+        const float scale = __uint_as_float((uint32_t)psc[off / PULSAR_FP8_KV_BLOCK] << 23);
         const uint32_t *pw = (const uint32_t *)(pr + off);
-        for (uint32_t i = 0; i < DS4_FP8_KV_BLOCK / 4u; i++) {
+        for (uint32_t i = 0; i < PULSAR_FP8_KV_BLOCK / 4u; i++) {
             const uint32_t w = pw[i];
             const uint32_t d = off + i * 4u;
             dot += qh[d + 0u] * attn_pack_e4m3(w & 0xffu, scale);
@@ -89,8 +89,8 @@ __device__ static inline float attn_pack_dot_full(const float *qh, const float *
             dot += qh[d + 3u] * attn_pack_e4m3(w >> 24, scale);
         }
     }
-    const float *rope = (const float *)(pr + n_nope + DS4_ATTN_PACK_SCALES_PAD(head_dim));
-    for (uint32_t d = 0; d < DS4_ATTN_PACK_NROT; d++) dot += qh[n_nope + d] * rope[d];
+    const float *rope = (const float *)(pr + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(head_dim));
+    for (uint32_t d = 0; d < PULSAR_ATTN_PACK_NROT; d++) dot += qh[n_nope + d] * rope[d];
     return dot;
 }
 
@@ -98,16 +98,16 @@ __device__ static inline float attn_pack_dot_full(const float *qh, const float *
  * kernels): per-64-block scale hoisted (8 dims per block per thread share it).
  * Same d-ascending visit order as the plain strided loop — bit-identical. */
 __device__ static inline float attn_pack_dot_lane8(const float *qh, const float *comp_kv, uint64_t row, uint32_t lane, uint32_t head_dim, float dot) {
-    const uint32_t n_nope = head_dim - DS4_ATTN_PACK_NROT;
-    const uint8_t *pr = (const uint8_t *)comp_kv + row * DS4_ATTN_PACK_ROWBYTES(head_dim);
+    const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
+    const uint8_t *pr = (const uint8_t *)comp_kv + row * PULSAR_ATTN_PACK_ROWBYTES(head_dim);
     const uint8_t *psc = pr + n_nope;
-    for (uint32_t off = 0; off < n_nope; off += DS4_FP8_KV_BLOCK) {
-        const float scale = __uint_as_float((uint32_t)psc[off / DS4_FP8_KV_BLOCK] << 23);
-        for (uint32_t d = off + lane; d < off + DS4_FP8_KV_BLOCK; d += 8u) {
+    for (uint32_t off = 0; off < n_nope; off += PULSAR_FP8_KV_BLOCK) {
+        const float scale = __uint_as_float((uint32_t)psc[off / PULSAR_FP8_KV_BLOCK] << 23);
+        for (uint32_t d = off + lane; d < off + PULSAR_FP8_KV_BLOCK; d += 8u) {
             dot += qh[d] * attn_pack_e4m3(pr[d], scale);
         }
     }
-    const float *rope = (const float *)(pr + n_nope + DS4_ATTN_PACK_SCALES_PAD(head_dim));
+    const float *rope = (const float *)(pr + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(head_dim));
     for (uint32_t d = n_nope + lane; d < head_dim; d += 8u) dot += qh[d] * rope[d - n_nope];
     return dot;
 }
@@ -399,7 +399,7 @@ __global__ static void attention_prefill_unpack_heads_kernel(
 
 /* positions/seq_id/comp_cap (all descriptor-aware decode kernels): per-row
  * multi-session banking (design adapted from the MIT-licensed Entrpi/ds4
- * fork, v0.2 c71a49a — see ds4_bank_slabs in the engine; reimplemented, no
+ * fork, v0.2 c71a49a — see pulsar_bank_slabs in the engine; reimplemented, no
  * code copied).  positions[t] is row t's absolute query position, seq_id[t]
  * its TRUE bank id (never a packed row ordinal); raw window, ring start and
  * the visible compressed count are derived per row from the position because
@@ -485,9 +485,9 @@ __global__ static void attention_decode_mixed_kernel(
     uint32_t visible_comp = single_all ? n_comp : (n_comp ? (qpos + 1u) / ratio : 0u);
     if (visible_comp > n_comp) visible_comp = n_comp;
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
-    const uint32_t comp_row_bytes = comp_kv_fp8 ? DS4_FP8_KV_ROWBYTES(head_dim) : head_dim * sizeof(float);
+    const uint32_t comp_row_bytes = comp_kv_fp8 ? PULSAR_FP8_KV_ROWBYTES(head_dim) : head_dim * sizeof(float);
     if (comp_kv_fp8 && n_comp) { (void)comp_row_bytes; }
-    __shared__ float scores[DS4_CUDA_ATTENTION_SCORE_CAP];
+    __shared__ float scores[PULSAR_CUDA_ATTENTION_SCORE_CAP];
     __shared__ uint32_t raw_rows[256];
     __shared__ float partial[256];
     __shared__ float max_s;
@@ -541,7 +541,7 @@ __global__ static void attention_decode_mixed_kernel(
                     const uint8_t *kv_u8 = (const uint8_t *)comp_src + (comp_base + c) * comp_row_bytes;
                     const float *sc = (const float *)(kv_u8 + head_dim);
                     for (uint32_t d = 0; d < head_dim; d++)
-                        dot += qh[d] * ds4a_fp8_kv_dequant(kv_u8[d], sc[d >> 6]);
+                        dot += qh[d] * pulsar_attn_fp8_kv_dequant(kv_u8[d], sc[d >> 6]);
                 } else if (comp_kv_pack) {
                     dot = attn_pack_dot_full(qh, comp_src, comp_base + c, head_dim, dot);
                 } else {
@@ -578,7 +578,7 @@ __global__ static void attention_decode_mixed_kernel(
                     } else if (comp_kv_fp8) {
                         const uint8_t *kv_u8 = (const uint8_t *)comp_src + (comp_base + c_idx) * comp_row_bytes;
                         const float *sc = (const float *)(kv_u8 + head_dim);
-                        for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * ds4a_fp8_kv_dequant(kv_u8[d], sc[d >> 6]);
+                        for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * pulsar_attn_fp8_kv_dequant(kv_u8[d], sc[d >> 6]);
                     } else if (comp_kv_pack) {
                         dot = attn_pack_dot_lane8(qh, comp_src, comp_base + c_idx, qlane, head_dim, dot);
                     } else {
@@ -637,8 +637,8 @@ __global__ static void attention_decode_mixed_kernel(
             if (comp_kv_fp8) {
                 const uint8_t *kv_u8 = (const uint8_t *)comp_src + (comp_base + c) * comp_row_bytes;
                 const float *sc = (const float *)(kv_u8 + head_dim);
-                acc0 += ds4a_fp8_kv_dequant(kv_u8[d0], sc[d0 >> 6]) * s;
-                acc1 += ds4a_fp8_kv_dequant(kv_u8[d1], sc[d1 >> 6]) * s;
+                acc0 += pulsar_attn_fp8_kv_dequant(kv_u8[d0], sc[d0 >> 6]) * s;
+                acc1 += pulsar_attn_fp8_kv_dequant(kv_u8[d1], sc[d1 >> 6]) * s;
             } else if (comp_kv_pack) {
                 acc0 += attn_comp_pack_ld(comp_src, comp_base + c, d0, head_dim) * s;
                 acc1 += attn_comp_pack_ld(comp_src, comp_base + c, d1, head_dim) * s;
@@ -658,7 +658,7 @@ __global__ static void attention_decode_mixed_kernel(
                 if (comp_kv_fp8) {
                     const uint8_t *kv_u8 = (const uint8_t *)comp_src + (comp_base + c) * comp_row_bytes;
                     const float *sc = (const float *)(kv_u8 + head_dim);
-                    acc += ds4a_fp8_kv_dequant(kv_u8[d], sc[d >> 6]) * scores[raw_count + c];
+                    acc += pulsar_attn_fp8_kv_dequant(kv_u8[d], sc[d >> 6]) * scores[raw_count + c];
                 } else if (comp_kv_pack) {
                     acc += attn_comp_pack_ld(comp_src, comp_base + c, d, head_dim) * scores[raw_count + c];
                 } else {
@@ -1219,20 +1219,20 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
                 /* ATTN_PACK comp row -> f32 float4 in smem, byte-identical to the
                  * pack dequant in attention_decode_mixed_heads8_online_kernel; the
                  * indexed row id is the top-k comp_idx, not sr-raw_count. */
-                const uint32_t n_nope = head_dim - DS4_ATTN_PACK_NROT;
+                const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
                 const uint8_t *pr = (const uint8_t *)comp_src +
-                    (comp_base + (uint64_t)comp_idx) * DS4_ATTN_PACK_ROWBYTES(head_dim);
+                    (comp_base + (uint64_t)comp_idx) * PULSAR_ATTN_PACK_ROWBYTES(head_dim);
                 const uint32_t base = c4 << 2;
                 float4 v;
                 if (base < n_nope) {
-                    const float scale = __uint_as_float((uint32_t)pr[n_nope + (base / DS4_FP8_KV_BLOCK)] << 23);
+                    const float scale = __uint_as_float((uint32_t)pr[n_nope + (base / PULSAR_FP8_KV_BLOCK)] << 23);
                     const uint32_t w = *(const uint32_t *)(pr + base);
                     v.x = attn_pack_e4m3(w & 0xffu, scale);
                     v.y = attn_pack_e4m3((w >> 8) & 0xffu, scale);
                     v.z = attn_pack_e4m3((w >> 16) & 0xffu, scale);
                     v.w = attn_pack_e4m3(w >> 24, scale);
                 } else {
-                    const float *rope = (const float *)(pr + n_nope + DS4_ATTN_PACK_SCALES_PAD(head_dim));
+                    const float *rope = (const float *)(pr + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(head_dim));
                     v.x = rope[base - n_nope + 0u];
                     v.y = rope[base - n_nope + 1u];
                     v.z = rope[base - n_nope + 2u];
@@ -1558,7 +1558,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
 
     const uint32_t n_score = raw_count + comp_count;
     const float scale = rsqrtf((float)head_dim);
-    const uint32_t comp_row_bytes = comp_kv_fp8 ? DS4_FP8_KV_ROWBYTES(head_dim) : head_dim * sizeof(float);
+    const uint32_t comp_row_bytes = comp_kv_fp8 ? PULSAR_FP8_KV_ROWBYTES(head_dim) : head_dim * sizeof(float);
     const float4 *q4 = valid_head
         ? (const float4 *)(q + ((uint64_t)t * n_head + head) * head_dim)
         : NULL;
@@ -1589,28 +1589,28 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
                 const float *sc = (const float *)(kv_u8 + head_dim);
                 uint32_t base = c4 << 2;
                 float4 v;
-                v.x = ds4a_fp8_kv_dequant(kv_u8[base + 0], sc[(base + 0) >> 6]);
-                v.y = ds4a_fp8_kv_dequant(kv_u8[base + 1], sc[(base + 1) >> 6]);
-                v.z = ds4a_fp8_kv_dequant(kv_u8[base + 2], sc[(base + 2) >> 6]);
-                v.w = ds4a_fp8_kv_dequant(kv_u8[base + 3], sc[(base + 3) >> 6]);
+                v.x = pulsar_attn_fp8_kv_dequant(kv_u8[base + 0], sc[(base + 0) >> 6]);
+                v.y = pulsar_attn_fp8_kv_dequant(kv_u8[base + 1], sc[(base + 1) >> 6]);
+                v.z = pulsar_attn_fp8_kv_dequant(kv_u8[base + 2], sc[(base + 2) >> 6]);
+                v.w = pulsar_attn_fp8_kv_dequant(kv_u8[base + 3], sc[(base + 3) >> 6]);
                 kv_shared[off] = v;
             } else if (comp_kv_pack) {
-                const uint32_t n_nope = head_dim - DS4_ATTN_PACK_NROT;
+                const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
                 const uint8_t *pr = (const uint8_t *)comp_src +
-                    (comp_base + (sr - raw_count)) * DS4_ATTN_PACK_ROWBYTES(head_dim);
+                    (comp_base + (sr - raw_count)) * PULSAR_ATTN_PACK_ROWBYTES(head_dim);
                 const uint32_t base = c4 << 2;
                 float4 v;
                 if (base < n_nope) {
                     /* base%4 == 0 and blocks are 64-aligned, so the four dims
                      * share one scale and one aligned uint32 of e4m3 bytes. */
-                    const float scale = __uint_as_float((uint32_t)pr[n_nope + (base / DS4_FP8_KV_BLOCK)] << 23);
+                    const float scale = __uint_as_float((uint32_t)pr[n_nope + (base / PULSAR_FP8_KV_BLOCK)] << 23);
                     const uint32_t w = *(const uint32_t *)(pr + base);
                     v.x = attn_pack_e4m3(w & 0xffu, scale);
                     v.y = attn_pack_e4m3((w >> 8) & 0xffu, scale);
                     v.z = attn_pack_e4m3((w >> 16) & 0xffu, scale);
                     v.w = attn_pack_e4m3(w >> 24, scale);
                 } else {
-                    const float *rope = (const float *)(pr + n_nope + DS4_ATTN_PACK_SCALES_PAD(head_dim));
+                    const float *rope = (const float *)(pr + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(head_dim));
                     v.x = rope[base - n_nope + 0u];
                     v.y = rope[base - n_nope + 1u];
                     v.z = rope[base - n_nope + 2u];
@@ -1723,22 +1723,22 @@ __global__ static void indexed_topk_sort_512_asc_kernel(
 }
 
 
-int ds4_gpu_attention_decode_heads_tensor(
-        ds4_gpu_tensor       *heads,
+int pulsar_gpu_attention_decode_heads_tensor(
+        pulsar_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *raw_kv,
         uint32_t                n_raw,
         uint32_t                raw_cap,
         uint32_t                raw_start,
-        const ds4_gpu_tensor *comp_kv,
+        const pulsar_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
         uint32_t                comp_kv_fp8,
         uint32_t                comp_kv_pack,
         uint32_t                n_comp,
-        const ds4_gpu_tensor *comp_mask,
+        const pulsar_gpu_tensor *comp_mask,
         uint32_t                use_mask,
         uint32_t                n_head,
         uint32_t                head_dim,
@@ -1751,11 +1751,11 @@ int ds4_gpu_attention_decode_heads_tensor(
         heads->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < (uint64_t)raw_cap * head_dim * (raw_f16 ? sizeof(__half) : sizeof(float)) ||
-        (comp_kv_pack && (comp_kv_f16 || comp_kv_fp8 || head_dim <= DS4_ATTN_PACK_NROT ||
-         ((head_dim - DS4_ATTN_PACK_NROT) % DS4_FP8_KV_BLOCK) != 0)) ||
+        (comp_kv_pack && (comp_kv_f16 || comp_kv_fp8 || head_dim <= PULSAR_ATTN_PACK_NROT ||
+         ((head_dim - PULSAR_ATTN_PACK_NROT) % PULSAR_FP8_KV_BLOCK) != 0)) ||
         (n_comp && comp_kv->bytes < (uint64_t)n_comp *
-         (comp_kv_fp8 ? DS4_FP8_KV_ROWBYTES(head_dim)
-                      : comp_kv_pack ? DS4_ATTN_PACK_ROWBYTES(head_dim)
+         (comp_kv_fp8 ? PULSAR_FP8_KV_ROWBYTES(head_dim)
+                      : comp_kv_pack ? PULSAR_ATTN_PACK_ROWBYTES(head_dim)
                                      : head_dim * sizeof(float))) ||
         (use_mask && comp_mask->bytes < (uint64_t)n_comp * sizeof(float))) {
         return 0;
@@ -1788,7 +1788,7 @@ int ds4_gpu_attention_decode_heads_tensor(
                                                                               NULL, NULL, NULL, 0, 1);
             return cuda_ok(cudaGetLastError(), "attention decode online launch");
         }
-        fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
+        fprintf(stderr, "pulsar: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
         return 0;
     }
     dim3 grid(1, n_head, 1);
@@ -1809,7 +1809,7 @@ int ds4_gpu_attention_decode_heads_tensor(
 
 
 
-int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim, uint32_t raw_f16) {
+int pulsar_gpu_attention_prefill_raw_heads_tensor(pulsar_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const pulsar_gpu_tensor *q, const pulsar_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim, uint32_t raw_f16) {
     if (!heads || !q || !raw_kv || !model_map || sinks_offset > model_size ||
         model_size - sinks_offset < (uint64_t)n_head * sizeof(float) ||
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
@@ -1934,17 +1934,17 @@ int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads, const void
 
 
 static int attention_decode_batch_launch(
-        ds4_gpu_tensor       *heads,
+        pulsar_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
-        const ds4_gpu_tensor *comp_kv,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *raw_kv,
+        const pulsar_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
         uint32_t                comp_kv_fp8,
         uint32_t                comp_kv_pack,
-        const ds4_gpu_tensor *comp_mask,
+        const pulsar_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
         uint32_t                non_causal,
         uint32_t                n_tokens,
@@ -1958,9 +1958,9 @@ static int attention_decode_batch_launch(
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                raw_f16,
-        const ds4_gpu_tensor *positions,
-        const ds4_gpu_tensor *seq_id,
-        const ds4_gpu_tensor *comp_bank_ptrs,
+        const pulsar_gpu_tensor *positions,
+        const pulsar_gpu_tensor *seq_id,
+        const pulsar_gpu_tensor *comp_bank_ptrs,
         uint32_t                comp_cap,
         uint32_t                n_banks) {
     /* Descriptor (banked) mode: both per-row arrays or neither; the KV
@@ -1980,14 +1980,14 @@ static int attention_decode_batch_launch(
          seq_id->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
          (n_comp != 0 && comp_cap < n_comp) ||
          /* Per-row derivation clamps the raw span to `window`, and the
-          * kernels' raw_rows scratch holds DS4_CUDA_ATTENTION_RAW_SCORE_CAP
+          * kernels' raw_rows scratch holds PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP
           * rows.  A zero (unbounded) or over-cap window would be silently
           * truncated to the OLDEST rows — fail loud instead. */
-         window == 0u || window > DS4_CUDA_ATTENTION_RAW_SCORE_CAP ||
+         window == 0u || window > PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP ||
          (uint64_t)n_banks * raw_cap > 4294967296ull ||
          (uint64_t)n_banks * comp_cap > 4294967296ull)) {
         fprintf(stderr,
-                "ds4: banked decode attention rejected: bad descriptor args "
+                "pulsar: banked decode attention rejected: bad descriptor args "
                 "(n_tokens=%u n_banks=%u raw_cap=%u comp_cap=%u n_comp=%u window=%u)\n",
                 n_tokens, n_banks, raw_cap, comp_cap, n_comp, window);
         return 0;
@@ -2010,11 +2010,11 @@ static int attention_decode_batch_launch(
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < kv_banks * raw_cap * head_dim * (raw_f16 ? sizeof(__half) : sizeof(float)) ||
-        (comp_kv_pack && (comp_kv_f16 || comp_kv_fp8 || head_dim <= DS4_ATTN_PACK_NROT ||
-         ((head_dim - DS4_ATTN_PACK_NROT) % DS4_FP8_KV_BLOCK) != 0)) ||
+        (comp_kv_pack && (comp_kv_f16 || comp_kv_fp8 || head_dim <= PULSAR_ATTN_PACK_NROT ||
+         ((head_dim - PULSAR_ATTN_PACK_NROT) % PULSAR_FP8_KV_BLOCK) != 0)) ||
         (n_comp && comp_kv->bytes < comp_rows_min *
-         (comp_kv_fp8 ? DS4_FP8_KV_ROWBYTES(head_dim)
-                      : comp_kv_pack ? DS4_ATTN_PACK_ROWBYTES(head_dim)
+         (comp_kv_fp8 ? PULSAR_FP8_KV_ROWBYTES(head_dim)
+                      : comp_kv_pack ? PULSAR_ATTN_PACK_ROWBYTES(head_dim)
                                      : head_dim * sizeof(float))) ||
         (use_comp_mask && comp_mask->bytes < (uint64_t)n_tokens * n_comp * sizeof(float))) {
         return 0;
@@ -2058,7 +2058,7 @@ static int attention_decode_batch_launch(
                                                                               kernel_n_banks);
             return cuda_ok(cudaGetLastError(), "attention decode online launch");
         }
-        fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
+        fprintf(stderr, "pulsar: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
         return 0;
     }
     /* Launch-path dispatch flags: read the environment once per process. */
@@ -2109,13 +2109,13 @@ static int attention_decode_batch_launch(
 
 
 
-int ds4_gpu_attention_decode_raw_batch_heads_tensor(
-        ds4_gpu_tensor       *heads,
+int pulsar_gpu_attention_decode_raw_batch_heads_tensor(
+        pulsar_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *raw_kv,
         uint32_t                n_tokens,
         uint32_t                pos0,
         uint32_t                n_raw,
@@ -2126,8 +2126,8 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                head_dim,
         uint32_t                non_causal,
         uint32_t                raw_f16,
-        const ds4_gpu_tensor *positions,
-        const ds4_gpu_tensor *seq_id,
+        const pulsar_gpu_tensor *positions,
+        const pulsar_gpu_tensor *seq_id,
         uint32_t                comp_cap,
         uint32_t                n_banks) {
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
@@ -2139,18 +2139,18 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
 
 
 
-int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
-        ds4_gpu_tensor       *heads,
+int pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
+        pulsar_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
-        const ds4_gpu_tensor *comp_kv,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *raw_kv,
+        const pulsar_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
         uint32_t                comp_kv_fp8,
         uint32_t                comp_kv_pack,
-        const ds4_gpu_tensor *comp_mask,
+        const pulsar_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
         uint32_t                n_tokens,
         uint32_t                pos0,
@@ -2164,9 +2164,9 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                head_dim,
         uint32_t                non_causal,
         uint32_t                raw_f16,
-        const ds4_gpu_tensor *positions,
-        const ds4_gpu_tensor *seq_id,
-        const ds4_gpu_tensor *comp_bank_ptrs,
+        const pulsar_gpu_tensor *positions,
+        const pulsar_gpu_tensor *seq_id,
+        const pulsar_gpu_tensor *comp_bank_ptrs,
         uint32_t                comp_cap,
         uint32_t                n_banks) {
     if (comp_kv_f16) return 0;
@@ -2179,18 +2179,18 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
 
 
 
-int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
-        ds4_gpu_tensor       *heads,
+int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
+        pulsar_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
-        const ds4_gpu_tensor *comp_kv,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *raw_kv,
+        const pulsar_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
         uint32_t                comp_kv_fp8,
         uint32_t                comp_kv_pack,
-        const ds4_gpu_tensor *topk,
+        const pulsar_gpu_tensor *topk,
         uint32_t                n_tokens,
         uint32_t                pos0,
         uint32_t                n_raw,
@@ -2203,9 +2203,9 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                raw_f16,
-        const ds4_gpu_tensor *positions,
-        const ds4_gpu_tensor *seq_id,
-        const ds4_gpu_tensor *comp_bank_ptrs,
+        const pulsar_gpu_tensor *positions,
+        const pulsar_gpu_tensor *seq_id,
+        const pulsar_gpu_tensor *comp_bank_ptrs,
         uint32_t                comp_cap,
         uint32_t                n_banks) {
     /* Descriptor (banked) mode: same contract as attention_decode_batch_launch
@@ -2223,11 +2223,11 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
          seq_id->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
          comp_cap < n_comp ||
          /* raw_rows scratch bound — see attention_decode_batch_launch. */
-         window == 0u || window > DS4_CUDA_ATTENTION_RAW_SCORE_CAP ||
+         window == 0u || window > PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP ||
          (uint64_t)n_banks * raw_cap > 4294967296ull ||
          (uint64_t)n_banks * comp_cap > 4294967296ull)) {
         fprintf(stderr,
-                "ds4: banked indexed attention rejected: bad descriptor args "
+                "pulsar: banked indexed attention rejected: bad descriptor args "
                 "(n_tokens=%u n_banks=%u raw_cap=%u comp_cap=%u n_comp=%u window=%u ratio=%u)\n",
                 n_tokens, n_banks, raw_cap, comp_cap, n_comp, window, ratio);
         return 0;
@@ -2248,9 +2248,9 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < kv_banks * raw_cap * head_dim * (raw_f16 ? sizeof(__half) : sizeof(float)) ||
-        (comp_kv_pack && (head_dim <= DS4_ATTN_PACK_NROT ||
-         ((head_dim - DS4_ATTN_PACK_NROT) % DS4_FP8_KV_BLOCK) != 0)) ||
-        comp_kv->bytes < comp_rows_min * (comp_kv_pack ? DS4_ATTN_PACK_ROWBYTES(head_dim)
+        (comp_kv_pack && (head_dim <= PULSAR_ATTN_PACK_NROT ||
+         ((head_dim - PULSAR_ATTN_PACK_NROT) % PULSAR_FP8_KV_BLOCK) != 0)) ||
+        comp_kv->bytes < comp_rows_min * (comp_kv_pack ? PULSAR_ATTN_PACK_ROWBYTES(head_dim)
                                                        : head_dim * sizeof(float)) ||
         topk->bytes < (uint64_t)n_tokens * top_k * sizeof(int32_t)) {
         return 0;
@@ -2399,14 +2399,14 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
 
 
 static int attention_prefill_mixed_launch(
-        ds4_gpu_tensor       *heads,
+        pulsar_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
-        const ds4_gpu_tensor *comp_kv,
-        const ds4_gpu_tensor *comp_mask,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *raw_kv,
+        const pulsar_gpu_tensor *comp_kv,
+        const pulsar_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
         uint32_t                n_tokens,
         uint32_t                n_comp,
@@ -2551,14 +2551,14 @@ static int attention_prefill_mixed_launch(
 
 
 
-int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
-        ds4_gpu_tensor       *heads,
+int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(
+        pulsar_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
-        const ds4_gpu_tensor *comp_kv,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *raw_kv,
+        const pulsar_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
         uint32_t                comp_kv_fp8,
         uint32_t                n_tokens,
@@ -2576,17 +2576,17 @@ int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
 
 
 
-int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
-        ds4_gpu_tensor       *heads,
+int pulsar_gpu_attention_prefill_masked_mixed_heads_tensor(
+        pulsar_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
-        const ds4_gpu_tensor *comp_kv,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *raw_kv,
+        const pulsar_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
         uint32_t                comp_kv_fp8,
-        const ds4_gpu_tensor *comp_mask,
+        const pulsar_gpu_tensor *comp_mask,
         uint32_t                n_tokens,
         uint32_t                n_comp,
         uint32_t                window,

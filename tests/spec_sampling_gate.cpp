@@ -7,8 +7,8 @@
  * target distribution.
  *
  * From one frozen session state, generates N short trajectories two ways:
- *   A) plain sampling (ds4_session_sample + eval per token)
- *   B) speculative   (ds4_session_generate_speculative, drafter active)
+ *   A) plain sampling (pulsar_session_sample + eval per token)
+ *   B) speculative   (pulsar_session_generate_speculative, drafter active)
  * and chi-square-compares the per-position token marginals. If the acceptance +
  * residual-carry scheme is exact, the two are the same distribution; a biased
  * sampler shows up as a fat chi-square at position 1+ (position 0 is the same
@@ -63,7 +63,7 @@
  * min_p 0. top_p is not a knob to turn down casually — see the note at its
  * parse below; too low makes the nucleus a single token and the chi-square
  * passes vacuously. min_p > 0 is what makes this gate NON-VACUOUS for the
- * min-p prefilter in ds4_sample_dist_build (dev-minp): at min_p == 0 the
+ * min-p prefilter in pulsar_sample_dist_build (dev-minp): at min_p == 0 the
  * prefilter path is not even entered. The server default is 0.05.
  */
 #include <math.h>
@@ -71,7 +71,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "ds4.h"
+#include "pulsar.h"
 
 #define TRAJ 2500
 #define DEPTH 4
@@ -91,10 +91,10 @@ static int bucket_cmp(const void *x, const void *y) {
 /* alpha over a window of the engine's cumulative spec counters */
 typedef struct { uint64_t drafted, accepted, rounds, gen; } spec_snap;
 
-static spec_snap spec_take(ds4_engine *e) {
-    ds4_spec_metrics m;
+static spec_snap spec_take(pulsar_engine *e) {
+    pulsar_spec_metrics m;
     memset(&m, 0, sizeof(m));
-    ds4_engine_spec_metrics(e, &m);
+    pulsar_engine_spec_metrics(e, &m);
     spec_snap s = { m.draft_tokens, m.accepted_tokens, m.num_drafts, m.gen_tokens };
     return s;
 }
@@ -148,11 +148,11 @@ int main(int argc, char **argv) {
     const char *dump_path = argc > 6 ? argv[6] : NULL;
     if (dump_path && (!dump_path[0] || !strcmp(dump_path, "-"))) dump_path = NULL;
 
-    ds4_engine_options opt = { .model_path = model, .backend = DS4_BACKEND_CUDA };
-    ds4_engine *engine = NULL;
-    if (ds4_engine_open(&engine, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
-    ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, 16384) != 0) { fprintf(stderr, "session failed\n"); return 1; }
+    pulsar_engine_options opt = { .model_path = model, .backend = PULSAR_BACKEND_CUDA };
+    pulsar_engine *engine = NULL;
+    if (pulsar_engine_open(&engine, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
+    pulsar_session *session = NULL;
+    if (pulsar_session_create(&session, engine, 16384) != 0) { fprintf(stderr, "session failed\n"); return 1; }
 
     /* Optional context filler: alpha falls with depth (77.6% shallow -> 61.7%
      * at 9.4k on v5mx), so a single shallow number is not the whole story. */
@@ -166,24 +166,24 @@ int main(int argc, char **argv) {
         snprintf(user + off, cap - off, "%s", PROMPT);
     }
 
-    ds4_tokens prompt = {0};
-    ds4_chat_begin(engine, &prompt);
-    ds4_chat_append_message(engine, &prompt, "user", user ? user : PROMPT);
-    ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+    pulsar_tokens prompt = {0};
+    pulsar_chat_begin(engine, &prompt);
+    pulsar_chat_append_message(engine, &prompt, "user", user ? user : PROMPT);
+    pulsar_chat_append_assistant_prefix(engine, &prompt, PULSAR_THINK_NONE);
     char err[256];
-    if (ds4_session_sync(session, &prompt, err, sizeof(err)) != 0) {
+    if (pulsar_session_sync(session, &prompt, err, sizeof(err)) != 0) {
         fprintf(stderr, "sync failed: %s\n", err);
         return 1;
     }
     printf("model=%s temp=%.2f top_p=%.2f min_p=%.2f ctx_depth=%d traj=%d\n",
            model, (double)TEMP, (double)TOP_P, (double)MIN_P,
-           ds4_session_pos(session), traj);
-    ds4_session_snapshot snap = {0};
-    if (ds4_session_save_snapshot(session, &snap, err, sizeof(err)) != 0) {
+           pulsar_session_pos(session), traj);
+    pulsar_session_snapshot snap = {0};
+    if (pulsar_session_save_snapshot(session, &snap, err, sizeof(err)) != 0) {
         fprintf(stderr, "snapshot failed: %s\n", err);
         return 1;
     }
-    const int eos = ds4_token_eos(engine);
+    const int eos = pulsar_token_eos(engine);
 
     /* ---- greedy gates ----
      * The batched verifier is documented near-greedy (batch reductions can
@@ -199,20 +199,20 @@ int main(int argc, char **argv) {
         int nref = 0, ngot = 0, ngot2 = 0;
         uint64_t rng = 7;
         for (int t = 0; t < 24; t++) {
-            int tok = ds4_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
+            int tok = pulsar_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
             if (tok == eos) break;
             ref[nref++] = tok;
-            if (ds4_session_eval(session, tok, err, sizeof(err)) != 0) return 1;
+            if (pulsar_session_eval(session, tok, err, sizeof(err)) != 0) return 1;
         }
         const spec_snap g0 = spec_take(engine);
         for (int rep = 0; rep < 2; rep++) {
-            if (ds4_session_load_snapshot(session, &snap, err, sizeof(err)) != 0) return 1;
+            if (pulsar_session_load_snapshot(session, &snap, err, sizeof(err)) != 0) return 1;
             int *dst = rep == 0 ? got : got2;
             int *n = rep == 0 ? &ngot : &ngot2;
             rng = 7;
             while (*n < nref) {
                 int toks[17];
-                int k = ds4_session_generate_speculative(session, 0.0f, 0, 1.0f, 0.0f, &rng,
+                int k = pulsar_session_generate_speculative(session, 0.0f, 0, 1.0f, 0.0f, &rng,
                                                          nref - *n, eos, toks, 17,
                                                          err, sizeof(err));
                 if (k <= 0) { fprintf(stderr, "greedy spec failed: %s\n", err); return 1; }
@@ -245,21 +245,21 @@ int main(int argc, char **argv) {
     for (int mode = 0; mode < 2; mode++) {
         if (mode == 1) s0 = spec_take(engine);
         for (int t = 0; t < traj; t++) {
-            if (ds4_session_load_snapshot(session, &snap, err, sizeof(err)) != 0) return 1;
+            if (pulsar_session_load_snapshot(session, &snap, err, sizeof(err)) != 0) return 1;
             uint64_t rng = 0x9E3779B97F4A7C15ull * (uint64_t)(t + 1) + (uint64_t)mode * 77777u;
             int *dst = mode == 0 ? seqA[t] : seqB[t];
             int got = 0;
             if (mode == 0) {
                 while (got < DEPTH) {
-                    int tok = ds4_session_sample(session, TEMP, 0, TOP_P, MIN_P, &rng);
+                    int tok = pulsar_session_sample(session, TEMP, 0, TOP_P, MIN_P, &rng);
                     dst[got++] = tok;
                     if (tok == eos) break;
-                    if (got < DEPTH && ds4_session_eval(session, tok, err, sizeof(err)) != 0) return 1;
+                    if (got < DEPTH && pulsar_session_eval(session, tok, err, sizeof(err)) != 0) return 1;
                 }
             } else {
                 while (got < DEPTH) {
                     int toks[17];
-                    int n = ds4_session_generate_speculative(session, TEMP, 0, TOP_P, MIN_P, &rng,
+                    int n = pulsar_session_generate_speculative(session, TEMP, 0, TOP_P, MIN_P, &rng,
                                                              DEPTH - got, eos, toks, 17,
                                                              err, sizeof(err));
                     if (n <= 0) { fprintf(stderr, "spec step failed: %s\n", err); return 1; }

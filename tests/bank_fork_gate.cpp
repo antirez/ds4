@@ -7,21 +7,21 @@
  * Also checks the STRUCTURAL anti-contamination: a fork whose request prefix does
  * NOT match the source's committed history is REFUSED (no device write).
  *
- * MODEL-DEPENDENT, GPU-resident, needs DS4_MSEQ_BANKS>=3 (src + fork-dst + cold-dst).
+ * MODEL-DEPENDENT, GPU-resident, needs PULSAR_MSEQ_BANKS>=3 (src + fork-dst + cold-dst).
  * Run manually under the memory discipline (hold temp/gpu.lock, drop_caches, no
  * foreign ds4 process). NOT part of `make test`.
  *
- * usage: DS4_MSEQ_BANKS=3 ./tests/bank_fork_gate MODEL [N_CACHED L]
+ * usage: PULSAR_MSEQ_BANKS=3 ./tests/bank_fork_gate MODEL [N_CACHED L]
  */
-#include "ds4.h"
-#include "ds4_engine_internal.h"
-#include "ds4_gpu.h"
+#include "pulsar.h"
+#include "pulsar_engine_internal.h"
+#include "pulsar_gpu.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
-/* seed for greedy ds4_session_sample calls (was &(uint64_t){7} compound literals;
+/* seed for greedy pulsar_session_sample calls (was &(uint64_t){7} compound literals;
  * greedy never consumes RNG state, so one shared object is behavior-identical). */
 static uint64_t g_seed7 = 7;
 
@@ -38,30 +38,30 @@ static char *read_file(const char *path, size_t *len_out) {
 }
 
 /* FNV-1a fold of bank `bank`'s captured comp+index frontier rows (raw D2H). */
-static uint64_t checksum_bank_kv(ds4_session *s, uint32_t bank) {
-    ds4_gpu_graph *g = &s->graph;
+static uint64_t checksum_bank_kv(pulsar_session *s, uint32_t bank) {
+    pulsar_gpu_graph *g = &s->graph;
     const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
     const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
-        ? DS4_ENGINE_IDXFP4_ROWBYTES : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+        ? PULSAR_ENGINE_IDXFP4_ROWBYTES : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
     uint64_t h = 1469598103934665603ull;
     uint8_t *buf = (uint8_t *)malloc(64u * 1024u * 1024u);
     if (!buf) return 0;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint32_t ncomp = g->ms_n_comp[bank][il];
         if (ncomp) {
-            ds4_gpu_tensor *v = gpu_graph_bank_attn_comp_view(g, il, bank);
-            if (!v || ds4_gpu_tensor_read(v, 0, buf, (uint64_t)ncomp * attn_row) == 0) { ds4_gpu_tensor_free(v); free(buf); return 0; }
-            ds4_gpu_tensor_free(v);
+            pulsar_gpu_tensor *v = gpu_graph_bank_attn_comp_view(g, il, bank);
+            if (!v || pulsar_gpu_tensor_read(v, 0, buf, (uint64_t)ncomp * attn_row) == 0) { pulsar_gpu_tensor_free(v); free(buf); return 0; }
+            pulsar_gpu_tensor_free(v);
             for (uint64_t i = 0; i < (uint64_t)ncomp * attn_row; i++) { h ^= buf[i]; h *= 1099511628211ull; }
         }
         if (ratio == 4) {
             const uint32_t nidx = g->ms_n_index_comp[bank][il];
             if (nidx) {
-                ds4_gpu_tensor *v = gpu_graph_bank_index_comp_view(g, il, bank);
-                if (!v || ds4_gpu_tensor_read(v, 0, buf, (uint64_t)nidx * idx_row) == 0) { ds4_gpu_tensor_free(v); free(buf); return 0; }
-                ds4_gpu_tensor_free(v);
+                pulsar_gpu_tensor *v = gpu_graph_bank_index_comp_view(g, il, bank);
+                if (!v || pulsar_gpu_tensor_read(v, 0, buf, (uint64_t)nidx * idx_row) == 0) { pulsar_gpu_tensor_free(v); free(buf); return 0; }
+                pulsar_gpu_tensor_free(v);
                 for (uint64_t i = 0; i < (uint64_t)nidx * idx_row; i++) { h ^= buf[i]; h *= 1099511628211ull; }
             }
         }
@@ -71,12 +71,12 @@ static uint64_t checksum_bank_kv(ds4_session *s, uint32_t bank) {
 }
 
 /* Prefill bank `bank` (fresh) to the first `len` tokens of toks. */
-static bool prefill_bank_cold(ds4_session *s, uint32_t bank, int *toks, int len) {
-    if (!ds4_session_bank_state_restore(s, bank)) return false;
-    ds4_session_invalidate(s);
-    ds4_tokens p; memset(&p, 0, sizeof p); p.v = toks; p.len = p.cap = len;
+static bool prefill_bank_cold(pulsar_session *s, uint32_t bank, int *toks, int len) {
+    if (!pulsar_session_bank_state_restore(s, bank)) return false;
+    pulsar_session_invalidate(s);
+    pulsar_tokens p; memset(&p, 0, sizeof p); p.v = toks; p.len = p.cap = len;
     char err[256];
-    if (ds4_session_sync(s, &p, err, sizeof err) != 0) { fprintf(stderr, "sync bank %u: %s\n", bank, err); return false; }
+    if (pulsar_session_sync(s, &p, err, sizeof err) != 0) { fprintf(stderr, "sync bank %u: %s\n", bank, err); return false; }
     gpu_graph_bank_counters_capture(&s->graph, bank);
     return true;
 }
@@ -86,16 +86,16 @@ static bool prefill_bank_cold(ds4_session *s, uint32_t bank, int *toks, int len)
  * in out[0..ngen). Mirrors the server's decode loop (sample -> feed the token
  * back -> sync -> sample again). `toks` must have capacity >= len+ngen. On a sync
  * failure the stream is truncated with a -1 sentinel. */
-static void decode_stream_greedy(ds4_session *s, uint32_t bank, int *toks,
+static void decode_stream_greedy(pulsar_session *s, uint32_t bank, int *toks,
                                  int len, int ngen, int *out) {
-    ds4_tokens p; memset(&p, 0, sizeof p); p.v = toks;
+    pulsar_tokens p; memset(&p, 0, sizeof p); p.v = toks;
     for (int i = 0; i < ngen; i++) {
-        const int t = ds4_session_sample(s, 0.0f, 0, 1.0f, 0.0f, &g_seed7);
+        const int t = pulsar_session_sample(s, 0.0f, 0, 1.0f, 0.0f, &g_seed7);
         out[i] = t;
         toks[len + i] = t;
         p.len = p.cap = len + i + 1;
         char err[256];
-        if (ds4_session_sync(s, &p, err, sizeof err) != 0) { out[i] = -1; break; }
+        if (pulsar_session_sync(s, &p, err, sizeof err) != 0) { out[i] = -1; break; }
         gpu_graph_bank_counters_capture(&s->graph, bank);
     }
 }
@@ -122,18 +122,18 @@ int main(int argc, char **argv) {
     const int ctx = L + 4096;
     if (n_cached >= L) { fprintf(stderr, "need N_CACHED < L\n"); return 2; }
 
-    ds4_engine *e = NULL; ds4_engine_options opt; memset(&opt, 0, sizeof opt);
-    opt.model_path = argv[1]; opt.backend = DS4_BACKEND_CUDA;
-    if (ds4_engine_open(&e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
+    pulsar_engine *e = NULL; pulsar_engine_options opt; memset(&opt, 0, sizeof opt);
+    opt.model_path = argv[1]; opt.backend = PULSAR_BACKEND_CUDA;
+    if (pulsar_engine_open(&e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
 
     size_t tl = 0; char *text = read_file("tests/long_context_story_prompt.txt", &tl);
     if (!text) { fprintf(stderr, "prompt read failed\n"); return 1; }
-    ds4_tokens base; memset(&base, 0, sizeof base);
-    ds4_tokenize_text(e, text, &base); free(text);
+    pulsar_tokens base; memset(&base, 0, sizeof base);
+    pulsar_tokenize_text(e, text, &base); free(text);
     if (base.len < 256) { fprintf(stderr, "prompt too short\n"); return 1; }
 
-    ds4_session *s = NULL;
-    if (ds4_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session create failed\n"); return 1; }
+    pulsar_session *s = NULL;
+    if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session create failed\n"); return 1; }
     const uint32_t pool = gpu_graph_bank_pool_count(&s->graph);
     fprintf(stderr, "fork_gate: pool banks=%u ctx=%d n_cached=%d L=%d\n", pool, ctx, n_cached, L);
     if (pool < 3) { fprintf(stderr, "need DS4_MSEQ_BANKS>=3\n"); return 1; }
@@ -143,7 +143,7 @@ int main(int argc, char **argv) {
 
     /* 1. SRC = bank 0 prefilled to the shared prefix [0, n_cached). */
     CHECK(prefill_bank_cold(s, 0, toks, n_cached), "src prefill");
-    ds4_gpu_synchronize();
+    pulsar_gpu_synchronize();
     const uint64_t sum_src = checksum_bank_kv(s, 0);
     CHECK(sum_src != 0, "src checksum");
     fprintf(stderr, "fork_gate: src(bank0) prefilled to %d, checksum=%016" PRIx64 "\n", n_cached, sum_src);
@@ -153,25 +153,25 @@ int main(int argc, char **argv) {
         int *wrong = (int *)malloc((size_t)n_cached * sizeof(int));
         for (int i = 0; i < n_cached; i++) wrong[i] = toks[i];
         wrong[n_cached / 2] ^= 0x1;   /* one token differs */
-        const int rc = ds4_session_bank_fork(s, 0, 2, wrong, n_cached);
+        const int rc = pulsar_session_bank_fork(s, 0, 2, wrong, n_cached);
         CHECK(rc != 0, "fork ACCEPTED a mismatched prefix (anti-contamination broken)");
-        CHECK(!ds4_session_bank_fork_pinned(s, 0), "src left fork-pinned after refusal");
+        CHECK(!pulsar_session_bank_fork_pinned(s, 0), "src left fork-pinned after refusal");
         fprintf(stderr, "fork_gate: mismatch-prefix fork refused rc=%d : %s\n", rc, rc != 0 ? "OK" : "FAIL");
         free(wrong);
         /* src must be untouched by the refused fork. */
         gpu_graph_bank_counters_capture(&s->graph, 0);
-        ds4_gpu_synchronize();
+        pulsar_gpu_synchronize();
         CHECK(checksum_bank_kv(s, 0) == sum_src, "src KV changed by a REFUSED fork");
     }
 
     /* 3. FORK src(0) -> dst(1). Must validate + clone + mirror counters. */
     {
         /* src is cur (bank 0 installed); its committed history is s->checkpoint. */
-        const int rc = ds4_session_bank_fork(s, 0, 1, toks, n_cached);
+        const int rc = pulsar_session_bank_fork(s, 0, 1, toks, n_cached);
         CHECK(rc == 0, "full-prefix fork refused rc=%d", rc);
-        CHECK(!ds4_session_bank_fork_pinned(s, 0), "src still pinned after fork");
+        CHECK(!pulsar_session_bank_fork_pinned(s, 0), "src still pinned after fork");
         /* immediate fork bit-identity: dst frontier == src frontier. */
-        ds4_gpu_synchronize();
+        pulsar_gpu_synchronize();
         const uint64_t sum_fork = checksum_bank_kv(s, 1);
         CHECK(sum_fork == sum_src, "forked dst KV != src KV immediately after clone (%016" PRIx64 " vs %016" PRIx64 ")", sum_fork, sum_src);
         fprintf(stderr, "fork_gate: fork(0->1) rc=%d immediate dst checksum=%016" PRIx64 " (==src: %s)\n",
@@ -181,30 +181,30 @@ int main(int argc, char **argv) {
     /* 4. Prefill the IDENTICAL suffix [n_cached, L) into the FORKED dst (bank 1)
      *    and a COLD full prefill into bank 2. */
     /* fork dst: install bank 1 (carries src's checkpoint at n_cached), sync to L. */
-    CHECK(ds4_session_bank_state_restore(s, 1), "install forked bank 1");
+    CHECK(pulsar_session_bank_state_restore(s, 1), "install forked bank 1");
     {
-        ds4_tokens p; memset(&p, 0, sizeof p); p.v = toks; p.len = p.cap = L;
+        pulsar_tokens p; memset(&p, 0, sizeof p); p.v = toks; p.len = p.cap = L;
         char err[256];
-        CHECK(ds4_session_sync(s, &p, err, sizeof err) == 0, "fork-dst suffix sync: %s", err);
+        CHECK(pulsar_session_sync(s, &p, err, sizeof err) == 0, "fork-dst suffix sync: %s", err);
         /* LIVE frontier assert (catches a silently short-circuited sync HERE,
-         * while bank 1 is still installed — ds4_session_pos reads the live
+         * while bank 1 is still installed — pulsar_session_pos reads the live
          * checkpoint, not a possibly-stale carry). */
-        CHECK(ds4_session_pos(s) == L, "fork-dst live pos %d != %d after suffix sync",
-              ds4_session_pos(s), L);
+        CHECK(pulsar_session_pos(s) == L, "fork-dst live pos %d != %d after suffix sync",
+              pulsar_session_pos(s), L);
         gpu_graph_bank_counters_capture(&s->graph, 1);
     }
-    const int tok_fork = ds4_session_sample(s, 0.0f, 0, 1.0f, 0.0f, &g_seed7);
-    ds4_gpu_synchronize();
+    const int tok_fork = pulsar_session_sample(s, 0.0f, 0, 1.0f, 0.0f, &g_seed7);
+    pulsar_gpu_synchronize();
     const uint64_t sum_fork_full = checksum_bank_kv(s, 1);
     /* SAVE bank 1's live state before switching away — the final bank_pos(1)
      * read below reads the CARRY once bank 2 is installed; without this save it
      * reads the stale fork-time carry (the original gate-A false "pos" failure). */
-    ds4_session_bank_state_save(s, 1);
+    pulsar_session_bank_state_save(s, 1);
 
     /* cold: bank 2 full prefill of [0, L). */
     CHECK(prefill_bank_cold(s, 2, toks, L), "cold full prefill bank 2");
-    const int tok_cold = ds4_session_sample(s, 0.0f, 0, 1.0f, 0.0f, &g_seed7);
-    ds4_gpu_synchronize();
+    const int tok_cold = pulsar_session_sample(s, 0.0f, 0, 1.0f, 0.0f, &g_seed7);
+    pulsar_gpu_synchronize();
     const uint64_t sum_cold = checksum_bank_kv(s, 2);
 
     /* 5. THE ORACLE: fork+suffix must be byte-identical to cold full prefill. */
@@ -212,7 +212,7 @@ int main(int argc, char **argv) {
           "fork+suffix KV NOT byte-identical to cold (%016" PRIx64 " vs %016" PRIx64 ")",
           sum_fork_full, sum_cold);
     CHECK(tok_fork == tok_cold, "fork+suffix next-token %d != cold %d", tok_fork, tok_cold);
-    CHECK(ds4_session_bank_pos(s, 1) == L, "fork-dst pos %d != %d", ds4_session_bank_pos(s, 1), L);
+    CHECK(pulsar_session_bank_pos(s, 1) == L, "fork-dst pos %d != %d", pulsar_session_bank_pos(s, 1), L);
     fprintf(stderr, "fork_gate: fork+suffix checksum=%016" PRIx64 " cold=%016" PRIx64 " (byte-identical: %s); next-token fork=%d cold=%d\n",
             sum_fork_full, sum_cold, sum_fork_full == sum_cold ? "YES" : "NO", tok_fork, tok_cold);
 
@@ -235,72 +235,72 @@ int main(int argc, char **argv) {
 
         /* fresh short src on bank 0 */
         CHECK(prefill_bank_cold(s, 0, toks, SLEN), "P2 src prefill bank0@%d", SLEN);
-        ds4_session_bank_state_save(s, 0);
+        pulsar_session_bank_state_save(s, 0);
 
         /* shallow-cut refusal (R would be 0) */
-        CHECK(ds4_session_bank_fork_partial(s, 0, 1, toks2, 100) != 0,
+        CHECK(pulsar_session_bank_fork_partial(s, 0, 1, toks2, 100) != 0,
               "P2 shallow cut not refused");
 
         /* partial fork 0->1 and replay toks2 to L2 */
-        const int prc = ds4_session_bank_fork_partial(s, 0, 1, toks2, NC);
+        const int prc = pulsar_session_bank_fork_partial(s, 0, 1, toks2, NC);
         CHECK(prc == 0, "P2 partial fork refused rc=%d", prc);
         /* TRIAGE memcmp: stash slot vs SRC row 1024 (capture correctness). */
         {
-            ds4_gpu_graph *g = &s->graph;
+            pulsar_gpu_graph *g = &s->graph;
             const uint64_t ar = gpu_graph_attn_comp_cache_row_bytes();
             uint8_t sa[4096], sb[4096];
             int bad = 0;
-            for (uint32_t il = 0; il < DS4_N_LAYER && bad < 3; il++) {
-                if (ds4_layer_compress_ratio(il) != 4u) continue;
-                ds4_gpu_tensor *v = gpu_graph_bank_attn_comp_view(g, il, 0);
-                ds4_gpu_synchronize();
-                if (v && ds4_gpu_tensor_read(g->emit_stash_comp, ((uint64_t)1 * DS4_N_LAYER + il) * ar, sa, ar) &&
-                    ds4_gpu_tensor_read(v, (uint64_t)(RCUT/4) * ar, sb, ar) &&
+            for (uint32_t il = 0; il < PULSAR_N_LAYER && bad < 3; il++) {
+                if (pulsar_layer_compress_ratio(il) != 4u) continue;
+                pulsar_gpu_tensor *v = gpu_graph_bank_attn_comp_view(g, il, 0);
+                pulsar_gpu_synchronize();
+                if (v && pulsar_gpu_tensor_read(g->emit_stash_comp, ((uint64_t)1 * PULSAR_N_LAYER + il) * ar, sa, ar) &&
+                    pulsar_gpu_tensor_read(v, (uint64_t)(RCUT/4) * ar, sb, ar) &&
                     memcmp(sa, sb, (size_t)ar) != 0) bad++;
-                ds4_gpu_tensor_free(v);
+                pulsar_gpu_tensor_free(v);
             }
             CHECK(bad == 0, "TRIAGE: stash != src row %d on %d layer(s) (CAPTURE bug)", RCUT/4, bad);
             fprintf(stderr, "fork_gate: TRIAGE stash==src row %d : %s\n", RCUT/4, bad ? "NO" : "YES");
         }
-        CHECK(!ds4_session_bank_fork_pinned(s, 0), "P2 src left pinned");
-        CHECK(ds4_session_bank_state_restore(s, 1), "P2 install fork dst");
-        CHECK(ds4_session_pos(s) == RCUT, "P2 dst pos %d != R %d", ds4_session_pos(s), RCUT);
+        CHECK(!pulsar_session_bank_fork_pinned(s, 0), "P2 src left pinned");
+        CHECK(pulsar_session_bank_state_restore(s, 1), "P2 install fork dst");
+        CHECK(pulsar_session_pos(s) == RCUT, "P2 dst pos %d != R %d", pulsar_session_pos(s), RCUT);
         {
-            ds4_tokens p; memset(&p, 0, sizeof p); p.v = toks2; p.len = p.cap = L2;
+            pulsar_tokens p; memset(&p, 0, sizeof p); p.v = toks2; p.len = p.cap = L2;
             char e2[256];
-            CHECK(ds4_session_sync(s, &p, e2, sizeof e2) == 0, "P2 replay sync: %s", e2);
-            CHECK(ds4_session_pos(s) == L2, "P2 live pos %d != %d", ds4_session_pos(s), L2);
+            CHECK(pulsar_session_sync(s, &p, e2, sizeof e2) == 0, "P2 replay sync: %s", e2);
+            CHECK(pulsar_session_pos(s) == L2, "P2 live pos %d != %d", pulsar_session_pos(s), L2);
             gpu_graph_bank_counters_capture(&s->graph, 1);
         }
-        const int tok_pf = ds4_session_sample(s, 0.0f, 0, 1.0f, 0.0f, &g_seed7);
-        ds4_gpu_synchronize();
+        const int tok_pf = pulsar_session_sample(s, 0.0f, 0, 1.0f, 0.0f, &g_seed7);
+        pulsar_gpu_synchronize();
         const uint64_t sum_pf = checksum_bank_kv(s, 1);
-        ds4_session_bank_state_save(s, 1);
+        pulsar_session_bank_state_save(s, 1);
 
         /* cold control on bank 2 */
         CHECK(prefill_bank_cold(s, 2, toks2, L2), "P2 cold control bank2");
-        ds4_session_bank_state_save(s, 2);
-        const int tok_pc = ds4_session_sample(s, 0.0f, 0, 1.0f, 0.0f, &g_seed7);
-        ds4_gpu_synchronize();
+        pulsar_session_bank_state_save(s, 2);
+        const int tok_pc = pulsar_session_sample(s, 0.0f, 0, 1.0f, 0.0f, &g_seed7);
+        pulsar_gpu_synchronize();
         const uint64_t sum_pc = checksum_bank_kv(s, 2);
 
         /* TRIAGE memcmp: SRC row 1024 vs COLD row 1024 (source-shape validity —
          * if these differ the oracle's stash source diverges from cold before
          * any fork logic; see SLEN note above). */
         {
-            ds4_gpu_graph *g = &s->graph;
+            pulsar_gpu_graph *g = &s->graph;
             const uint64_t ar = gpu_graph_attn_comp_cache_row_bytes();
             uint8_t sa[4096], sb[4096];
             int bad = 0;
-            for (uint32_t il = 0; il < DS4_N_LAYER && bad < 3; il++) {
-                if (ds4_layer_compress_ratio(il) != 4u) continue;
-                ds4_gpu_tensor *va = gpu_graph_bank_attn_comp_view(g, il, 0);
-                ds4_gpu_tensor *vb = gpu_graph_bank_attn_comp_view(g, il, 2);
-                ds4_gpu_synchronize();
-                if (va && vb && ds4_gpu_tensor_read(va, (uint64_t)(RCUT/4) * ar, sa, ar) &&
-                    ds4_gpu_tensor_read(vb, (uint64_t)(RCUT/4) * ar, sb, ar) &&
+            for (uint32_t il = 0; il < PULSAR_N_LAYER && bad < 3; il++) {
+                if (pulsar_layer_compress_ratio(il) != 4u) continue;
+                pulsar_gpu_tensor *va = gpu_graph_bank_attn_comp_view(g, il, 0);
+                pulsar_gpu_tensor *vb = gpu_graph_bank_attn_comp_view(g, il, 2);
+                pulsar_gpu_synchronize();
+                if (va && vb && pulsar_gpu_tensor_read(va, (uint64_t)(RCUT/4) * ar, sa, ar) &&
+                    pulsar_gpu_tensor_read(vb, (uint64_t)(RCUT/4) * ar, sb, ar) &&
                     memcmp(sa, sb, (size_t)ar) != 0) bad++;
-                ds4_gpu_tensor_free(va); ds4_gpu_tensor_free(vb);
+                pulsar_gpu_tensor_free(va); pulsar_gpu_tensor_free(vb);
             }
             fprintf(stderr, "fork_gate: TRIAGE src==cold row %d : %s\n", RCUT/4, bad ? "NO (source-shape divergence)" : "YES");
         }
@@ -316,30 +316,30 @@ int main(int argc, char **argv) {
          * single half-restored row only if another row compensates; this
          * cannot). */
         {
-            ds4_gpu_graph *g = &s->graph;
+            pulsar_gpu_graph *g = &s->graph;
             const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
             const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
-                ? DS4_ENGINE_IDXFP4_ROWBYTES : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+                ? PULSAR_ENGINE_IDXFP4_ROWBYTES : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
             uint8_t *ra = (uint8_t *)malloc((size_t)attn_row), *rb = (uint8_t *)malloc((size_t)attn_row);
             int diffc = 0, diffi = 0, checked = 0;
-            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-                if (ds4_layer_compress_ratio(il) != 4u) continue;
-                ds4_gpu_tensor *va = gpu_graph_bank_attn_comp_view(g, il, 1);
-                ds4_gpu_tensor *vb = gpu_graph_bank_attn_comp_view(g, il, 2);
+            for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+                if (pulsar_layer_compress_ratio(il) != 4u) continue;
+                pulsar_gpu_tensor *va = gpu_graph_bank_attn_comp_view(g, il, 1);
+                pulsar_gpu_tensor *vb = gpu_graph_bank_attn_comp_view(g, il, 2);
                 if (va && vb &&
-                    ds4_gpu_tensor_read(va, (uint64_t)(RCUT/4) * attn_row, ra, attn_row) &&
-                    ds4_gpu_tensor_read(vb, (uint64_t)(RCUT/4) * attn_row, rb, attn_row)) {
+                    pulsar_gpu_tensor_read(va, (uint64_t)(RCUT/4) * attn_row, ra, attn_row) &&
+                    pulsar_gpu_tensor_read(vb, (uint64_t)(RCUT/4) * attn_row, rb, attn_row)) {
                     if (memcmp(ra, rb, (size_t)attn_row) != 0) diffc++;
                 } else diffc += 1000;   /* read failure = loud */
-                ds4_gpu_tensor_free(va); ds4_gpu_tensor_free(vb);
+                pulsar_gpu_tensor_free(va); pulsar_gpu_tensor_free(vb);
                 va = gpu_graph_bank_index_comp_view(g, il, 1);
                 vb = gpu_graph_bank_index_comp_view(g, il, 2);
                 if (va && vb &&
-                    ds4_gpu_tensor_read(va, (uint64_t)(RCUT/4) * idx_row, ra, idx_row) &&
-                    ds4_gpu_tensor_read(vb, (uint64_t)(RCUT/4) * idx_row, rb, idx_row)) {
+                    pulsar_gpu_tensor_read(va, (uint64_t)(RCUT/4) * idx_row, ra, idx_row) &&
+                    pulsar_gpu_tensor_read(vb, (uint64_t)(RCUT/4) * idx_row, rb, idx_row)) {
                     if (memcmp(ra, rb, (size_t)idx_row) != 0) diffi++;
                 } else diffi += 1000;
-                ds4_gpu_tensor_free(va); ds4_gpu_tensor_free(vb);
+                pulsar_gpu_tensor_free(va); pulsar_gpu_tensor_free(vb);
                 checked++;
             }
             free(ra); free(rb);
@@ -352,17 +352,17 @@ int main(int argc, char **argv) {
 
         /* P3: src==dst TRUNCATE-reuse — rewind bank 1 (@L2) to R and replay the
          * SAME tokens; must again be byte-identical to the cold control. */
-        CHECK(ds4_session_bank_state_restore(s, 1), "P3 install bank1");
-        const int trc = ds4_session_bank_fork_partial(s, 1, 1, toks2, NC);
+        CHECK(pulsar_session_bank_state_restore(s, 1), "P3 install bank1");
+        const int trc = pulsar_session_bank_fork_partial(s, 1, 1, toks2, NC);
         CHECK(trc == 0, "P3 truncate refused rc=%d", trc);
-        CHECK(ds4_session_pos(s) == RCUT, "P3 truncated pos %d != %d", ds4_session_pos(s), RCUT);
+        CHECK(pulsar_session_pos(s) == RCUT, "P3 truncated pos %d != %d", pulsar_session_pos(s), RCUT);
         {
-            ds4_tokens p; memset(&p, 0, sizeof p); p.v = toks2; p.len = p.cap = L2;
+            pulsar_tokens p; memset(&p, 0, sizeof p); p.v = toks2; p.len = p.cap = L2;
             char e2[256];
-            CHECK(ds4_session_sync(s, &p, e2, sizeof e2) == 0, "P3 replay sync: %s", e2);
+            CHECK(pulsar_session_sync(s, &p, e2, sizeof e2) == 0, "P3 replay sync: %s", e2);
             gpu_graph_bank_counters_capture(&s->graph, 1);
         }
-        ds4_gpu_synchronize();
+        pulsar_gpu_synchronize();
         const uint64_t sum_tr = checksum_bank_kv(s, 1);
         CHECK(sum_tr == sum_pc, "P3 truncate-replay KV != cold (%016" PRIx64 " vs %016" PRIx64 ")",
               sum_tr, sum_pc);
@@ -403,19 +403,19 @@ int main(int argc, char **argv) {
 
         /* trunk on bank 0, prefilled to the UNALIGNED SLEN5. */
         CHECK(prefill_bank_cold(s, 0, toks, SLEN5), "P5 trunk prefill @%d", SLEN5);
-        ds4_session_bank_state_save(s, 0);
+        pulsar_session_bank_state_save(s, 0);
 
         /* partial fork 0->1 at NC5 (cut R5), replay the divergent suffix to L5. */
-        const int prc5 = ds4_session_bank_fork_partial(s, 0, 1, toks5, NC5);
+        const int prc5 = pulsar_session_bank_fork_partial(s, 0, 1, toks5, NC5);
         CHECK(prc5 == 0, "P5 partial fork refused rc=%d", prc5);
-        CHECK(!ds4_session_bank_fork_pinned(s, 0), "P5 src left pinned");
-        CHECK(ds4_session_bank_state_restore(s, 1), "P5 install fork dst");
-        CHECK(ds4_session_pos(s) == R5, "P5 dst pos %d != R %d", ds4_session_pos(s), R5);
+        CHECK(!pulsar_session_bank_fork_pinned(s, 0), "P5 src left pinned");
+        CHECK(pulsar_session_bank_state_restore(s, 1), "P5 install fork dst");
+        CHECK(pulsar_session_pos(s) == R5, "P5 dst pos %d != R %d", pulsar_session_pos(s), R5);
         {
-            ds4_tokens p; memset(&p, 0, sizeof p); p.v = toks5; p.len = p.cap = L5;
+            pulsar_tokens p; memset(&p, 0, sizeof p); p.v = toks5; p.len = p.cap = L5;
             char e5[256];
-            CHECK(ds4_session_sync(s, &p, e5, sizeof e5) == 0, "P5 replay sync: %s", e5);
-            CHECK(ds4_session_pos(s) == L5, "P5 live pos %d != %d", ds4_session_pos(s), L5);
+            CHECK(pulsar_session_sync(s, &p, e5, sizeof e5) == 0, "P5 replay sync: %s", e5);
+            CHECK(pulsar_session_pos(s) == L5, "P5 live pos %d != %d", pulsar_session_pos(s), L5);
             gpu_graph_bank_counters_capture(&s->graph, 1);
         }
         const uint64_t sum_pf5 = checksum_bank_kv(s, 1);
@@ -424,7 +424,7 @@ int main(int argc, char **argv) {
         memcpy(fbuf, toks5, (size_t)L5 * sizeof(int));
         int fork_stream[64];
         decode_stream_greedy(s, 1, fbuf, L5, NGEN, fork_stream);
-        ds4_session_bank_state_save(s, 1);
+        pulsar_session_bank_state_save(s, 1);
 
         /* COLD control: bank 2 full prefill of the identical text, same decode. */
         CHECK(prefill_bank_cold(s, 2, toks5, L5), "P5 cold prefill @%d", L5);
@@ -466,18 +466,18 @@ int main(int argc, char **argv) {
 
         /* ---- FULL fork, dst==cur: bank_pos(dst) must be n_cached, not 0 ---- */
         CHECK(prefill_bank_cold(s, 0, toks, FLEN), "P6 full src prefill");
-        ds4_session_bank_state_save(s, 0);
-        CHECK(ds4_session_bank_state_restore(s, 1), "P6 install dst(1) as cur");
-        ds4_session_invalidate(s);                    /* mimic provision: cur len -> 0 */
-        CHECK(ds4_session_pos(s) == 0, "P6 precondition: dst==cur must start at 0");
-        CHECK(ds4_session_bank_fork(s, 0, 1, toks, FLEN) == 0, "P6 full fork (dst==cur) refused");
-        CHECK(ds4_session_bank_pos(s, 1) == FLEN,
+        pulsar_session_bank_state_save(s, 0);
+        CHECK(pulsar_session_bank_state_restore(s, 1), "P6 install dst(1) as cur");
+        pulsar_session_invalidate(s);                    /* mimic provision: cur len -> 0 */
+        CHECK(pulsar_session_pos(s) == 0, "P6 precondition: dst==cur must start at 0");
+        CHECK(pulsar_session_bank_fork(s, 0, 1, toks, FLEN) == 0, "P6 full fork (dst==cur) refused");
+        CHECK(pulsar_session_bank_pos(s, 1) == FLEN,
               "P6 FULL dst==cur bank_pos %d != %d (WORK-SKIPPED REGRESSION: "
-              "server would re-prefill from 0)", ds4_session_bank_pos(s, 1), FLEN);
-        CHECK(ds4_session_pos(s) == FLEN, "P6 full live pos %d != %d", ds4_session_pos(s), FLEN);
+              "server would re-prefill from 0)", pulsar_session_bank_pos(s, 1), FLEN);
+        CHECK(pulsar_session_pos(s) == FLEN, "P6 full live pos %d != %d", pulsar_session_pos(s), FLEN);
         fprintf(stderr, "fork_gate: P6 FULL fork dst==cur bank_pos=%d (==%d: %s)\n",
-                ds4_session_bank_pos(s, 1), FLEN,
-                ds4_session_bank_pos(s, 1) == FLEN ? "YES" : "NO");
+                pulsar_session_bank_pos(s, 1), FLEN,
+                pulsar_session_bank_pos(s, 1) == FLEN ? "YES" : "NO");
 
         /* ---- PARTIAL fork, dst==cur: bank_pos(dst) must be R, and the tail
          *      [R,L) re-prefill lands byte-identical to cold (aligned oracle) --- */
@@ -485,27 +485,27 @@ int main(int argc, char **argv) {
         for (int i = 0; i < L6; i++)
             toks6[i] = i < NC6 ? toks[i] : base.v[(i + 5150) % base.len];
         CHECK(prefill_bank_cold(s, 0, toks, SLEN6), "P6 partial src prefill");
-        ds4_session_bank_state_save(s, 0);
-        CHECK(ds4_session_bank_state_restore(s, 1), "P6 install dst(1) as cur (partial)");
-        ds4_session_invalidate(s);
-        CHECK(ds4_session_bank_fork_partial(s, 0, 1, toks6, NC6) == 0,
+        pulsar_session_bank_state_save(s, 0);
+        CHECK(pulsar_session_bank_state_restore(s, 1), "P6 install dst(1) as cur (partial)");
+        pulsar_session_invalidate(s);
+        CHECK(pulsar_session_bank_fork_partial(s, 0, 1, toks6, NC6) == 0,
               "P6 partial fork (dst==cur) refused");
-        CHECK(ds4_session_bank_pos(s, 1) == R6,
+        CHECK(pulsar_session_bank_pos(s, 1) == R6,
               "P6 PARTIAL dst==cur bank_pos %d != R %d (WORK-SKIPPED REGRESSION)",
-              ds4_session_bank_pos(s, 1), R6);
-        CHECK(ds4_session_pos(s) == R6, "P6 partial live pos %d != %d", ds4_session_pos(s), R6);
+              pulsar_session_bank_pos(s, 1), R6);
+        CHECK(pulsar_session_pos(s) == R6, "P6 partial live pos %d != %d", pulsar_session_pos(s), R6);
         {   /* replay ONLY the tail [R6,L6) — the (L6-R6) tokens actually skipped */
-            ds4_tokens p; memset(&p, 0, sizeof p); p.v = toks6; p.len = p.cap = L6;
+            pulsar_tokens p; memset(&p, 0, sizeof p); p.v = toks6; p.len = p.cap = L6;
             char e6[256];
-            CHECK(ds4_session_sync(s, &p, e6, sizeof e6) == 0, "P6 tail replay: %s", e6);
-            CHECK(ds4_session_pos(s) == L6, "P6 post-replay pos %d != %d", ds4_session_pos(s), L6);
+            CHECK(pulsar_session_sync(s, &p, e6, sizeof e6) == 0, "P6 tail replay: %s", e6);
+            CHECK(pulsar_session_pos(s) == L6, "P6 post-replay pos %d != %d", pulsar_session_pos(s), L6);
             gpu_graph_bank_counters_capture(&s->graph, 1);
         }
-        ds4_gpu_synchronize();
+        pulsar_gpu_synchronize();
         const uint64_t sum_p6 = checksum_bank_kv(s, 1);
-        ds4_session_bank_state_save(s, 1);
+        pulsar_session_bank_state_save(s, 1);
         CHECK(prefill_bank_cold(s, 2, toks6, L6), "P6 cold control");
-        ds4_gpu_synchronize();
+        pulsar_gpu_synchronize();
         const uint64_t sum_c6 = checksum_bank_kv(s, 2);
         CHECK(sum_p6 == sum_c6,
               "P6 partial(dst==cur)+tail KV != cold (%016" PRIx64 " vs %016" PRIx64 ")",

@@ -1,4 +1,4 @@
-#include "ds4_engine_internal.h"
+#include "pulsar_engine_internal.h"
 
 
 
@@ -28,12 +28,12 @@ void swiglu(float *out, const float *gate, const float *up, uint64_t n, float cl
 /* The shared expert is a normal Q8_0 SwiGLU MLP that runs for every token. */
 void layer_shared_ffn_one(
         float             * out,
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
+        const pulsar_model   * model,
+        const pulsar_layer_weights * layer,
         const float       * x) {
-    float *gate = (float *)xmalloc((size_t)DS4_N_FF_EXP * sizeof(gate[0]));
-    float *up = (float *)xmalloc((size_t)DS4_N_FF_EXP * sizeof(up[0]));
-    float *mid = (float *)xmalloc((size_t)DS4_N_FF_EXP * sizeof(mid[0]));
+    float *gate = (float *)xmalloc((size_t)PULSAR_N_FF_EXP * sizeof(gate[0]));
+    float *up = (float *)xmalloc((size_t)PULSAR_N_FF_EXP * sizeof(up[0]));
+    float *mid = (float *)xmalloc((size_t)PULSAR_N_FF_EXP * sizeof(mid[0]));
     const uint64_t in_dim = layer->ffn_gate_shexp->dim[0];
     const uint64_t blocks = (in_dim + 31) / 32;
     int8_t *xq = (int8_t *)xmalloc((size_t)blocks * 32);
@@ -42,7 +42,7 @@ void layer_shared_ffn_one(
     if (layer->ffn_up_shexp->type != 8 ||
         layer->ffn_gate_shexp->type != 8 ||
         layer->ffn_up_shexp->dim[0] != in_dim) {
-        ds4_die("shared expert gate/up tensors do not share a Q8_0 input layout");
+        pulsar_die("shared expert gate/up tensors do not share a Q8_0 input layout");
     }
 
     quantize_q8_0_activation(x, xq, xscale, in_dim);
@@ -50,7 +50,7 @@ void layer_shared_ffn_one(
                               layer->ffn_gate_shexp,
                               layer->ffn_up_shexp,
                               xq, xscale);
-    swiglu(mid, gate, up, DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP);
+    swiglu(mid, gate, up, PULSAR_N_FF_EXP, PULSAR_SWIGLU_CLAMP_EXP);
     matvec_q8_0(out, model, layer->ffn_down_shexp, mid);
 
     free(xscale);
@@ -80,8 +80,8 @@ static void swiglu_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
 
 static void layer_shared_ffn_batch(
         float             * out,
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
+        const pulsar_model   * model,
+        const pulsar_layer_weights * layer,
         const float       * x,
         uint32_t            n_tok) {
     const uint64_t in_dim = layer->ffn_gate_shexp->dim[0];
@@ -93,7 +93,7 @@ static void layer_shared_ffn_batch(
         layer->ffn_up_shexp->dim[0] != in_dim ||
         layer->ffn_up_shexp->dim[1] != hidden ||
         layer->ffn_down_shexp->dim[0] != hidden) {
-        ds4_die("shared expert tensors do not share the expected Q8_0 layout");
+        pulsar_die("shared expert tensors do not share the expected Q8_0 layout");
     }
 
     float *gate = (float *)xmalloc((size_t)n_tok * hidden * sizeof(gate[0]));
@@ -111,9 +111,9 @@ static void layer_shared_ffn_batch(
         .gate = gate,
         .up = up,
         .n = hidden,
-        .clamp = DS4_SWIGLU_CLAMP_EXP,
+        .clamp = PULSAR_SWIGLU_CLAMP_EXP,
     };
-    ds4_parallel_for(n_tok, swiglu_batch_worker, &swiglu_ctx);
+    pulsar_parallel_for(n_tok, swiglu_batch_worker, &swiglu_ctx);
 
     matmul_q8_0_batch(out, model, layer->ffn_down_shexp, mid, n_tok);
 
@@ -126,22 +126,22 @@ static void layer_shared_ffn_batch(
 
 /* Early DS4 layers use token-id hash routing instead of top-k routing. */
 void layer_hash_selected_experts(
-        int                    selected[DS4_MAX_EXPERT_USED],
-        const ds4_model       *model,
-        const ds4_layer_weights *layer,
+        int                    selected[PULSAR_MAX_EXPERT_USED],
+        const pulsar_model       *model,
+        const pulsar_layer_weights *layer,
         int                    token) {
-    ds4_tensor *t = layer->ffn_gate_tid2eid;
-    if (!t) ds4_die("hash routing table is missing for this layer");
-    if (t->type != 26 || t->ndim != 2 || t->dim[0] != DS4_N_EXPERT_USED) {
-        ds4_die("ffn_gate_tid2eid.weight has an unexpected layout");
+    pulsar_tensor *t = layer->ffn_gate_tid2eid;
+    if (!t) pulsar_die("hash routing table is missing for this layer");
+    if (t->type != 26 || t->ndim != 2 || t->dim[0] != PULSAR_N_EXPERT_USED) {
+        pulsar_die("ffn_gate_tid2eid.weight has an unexpected layout");
     }
     if (token < 0 || (uint64_t)token >= t->dim[1]) {
-        ds4_die("token id is outside the hash routing table");
+        pulsar_die("token id is outside the hash routing table");
     }
 
     const int32_t *table = (const int32_t *)tensor_data(model, t);
-    const int32_t *row = table + (uint64_t)token * DS4_N_EXPERT_USED;
-    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) selected[i] = row[i];
+    const int32_t *row = table + (uint64_t)token * PULSAR_N_EXPERT_USED;
+    for (uint32_t i = 0; i < PULSAR_N_EXPERT_USED; i++) selected[i] = row[i];
 }
 
 
@@ -149,14 +149,14 @@ void layer_hash_selected_experts(
 /* Router scores use sqrt(softplus(logit)); normalization happens only after
  * the six selected experts are known. */
 static void layer_router_probs_one(
-        float             probs[DS4_MAX_EXPERT],
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
+        float             probs[PULSAR_MAX_EXPERT],
+        const pulsar_model   * model,
+        const pulsar_layer_weights * layer,
         const float       * x) {
-    float logits[DS4_MAX_EXPERT];
+    float logits[PULSAR_MAX_EXPERT];
 
     matvec_any(logits, model, layer->ffn_gate_inp, x);
-    for (uint32_t i = 0; i < DS4_N_EXPERT; i++) {
+    for (uint32_t i = 0; i < PULSAR_N_EXPERT; i++) {
         probs[i] = sqrtf(softplus_stable(logits[i]));
     }
 }
@@ -164,31 +164,31 @@ static void layer_router_probs_one(
 
 
 void layer_hash_router_weights_from_probs(
-        float             weights_out[DS4_MAX_EXPERT_USED],
-        const float       probs[DS4_MAX_EXPERT],
-        const int          selected[DS4_MAX_EXPERT_USED]) {
+        float             weights_out[PULSAR_MAX_EXPERT_USED],
+        const float       probs[PULSAR_MAX_EXPERT],
+        const int          selected[PULSAR_MAX_EXPERT_USED]) {
     float sum = 0.0f;
-    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
-        if (selected[i] < 0 || (uint32_t)selected[i] >= DS4_N_EXPERT) ds4_die("hash-selected expert is outside router range");
+    for (uint32_t i = 0; i < PULSAR_N_EXPERT_USED; i++) {
+        if (selected[i] < 0 || (uint32_t)selected[i] >= PULSAR_N_EXPERT) pulsar_die("hash-selected expert is outside router range");
         weights_out[i] = probs[selected[i]];
         sum += weights_out[i];
     }
 
     if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
-    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
-        weights_out[i] = weights_out[i] / sum * DS4_EXPERT_WEIGHT_SCALE;
+    for (uint32_t i = 0; i < PULSAR_N_EXPERT_USED; i++) {
+        weights_out[i] = weights_out[i] / sum * PULSAR_EXPERT_WEIGHT_SCALE;
     }
 }
 
 
 
 void layer_hash_router_weights_one(
-        float             weights_out[DS4_MAX_EXPERT_USED],
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
+        float             weights_out[PULSAR_MAX_EXPERT_USED],
+        const pulsar_model   * model,
+        const pulsar_layer_weights * layer,
         const float       * x,
-        const int          selected[DS4_MAX_EXPERT_USED]) {
-    float probs[DS4_MAX_EXPERT];
+        const int          selected[PULSAR_MAX_EXPERT_USED]) {
+    float probs[PULSAR_MAX_EXPERT];
 
     layer_router_probs_one(probs, model, layer, x);
     layer_hash_router_weights_from_probs(weights_out, probs, selected);
@@ -215,21 +215,21 @@ static void topk_desc(const float *score, int n, int k, int *idx) {
 /* Later layers choose the six experts by biased top-k, but weight them using
  * the unbiased router probabilities. */
 void layer_topk_selected_experts_from_probs(
-        int                    selected[DS4_MAX_EXPERT_USED],
-        float                  expert_weight[DS4_MAX_EXPERT_USED],
-        const ds4_model       *model,
-        const ds4_layer_weights *layer,
-        const float           probs[DS4_MAX_EXPERT]);
+        int                    selected[PULSAR_MAX_EXPERT_USED],
+        float                  expert_weight[PULSAR_MAX_EXPERT_USED],
+        const pulsar_model       *model,
+        const pulsar_layer_weights *layer,
+        const float           probs[PULSAR_MAX_EXPERT]);
 
 
 
 void layer_topk_selected_experts(
-        int                    selected[DS4_MAX_EXPERT_USED],
-        float                  expert_weight[DS4_MAX_EXPERT_USED],
-        const ds4_model       *model,
-        const ds4_layer_weights *layer,
+        int                    selected[PULSAR_MAX_EXPERT_USED],
+        float                  expert_weight[PULSAR_MAX_EXPERT_USED],
+        const pulsar_model       *model,
+        const pulsar_layer_weights *layer,
         const float           *x) {
-    float probs[DS4_MAX_EXPERT];
+    float probs[PULSAR_MAX_EXPERT];
 
     layer_router_probs_one(probs, model, layer, x);
     layer_topk_selected_experts_from_probs(selected, expert_weight, model, layer, probs);
@@ -238,30 +238,30 @@ void layer_topk_selected_experts(
 
 
 void layer_topk_selected_experts_from_probs(
-        int                    selected[DS4_MAX_EXPERT_USED],
-        float                  expert_weight[DS4_MAX_EXPERT_USED],
-        const ds4_model       *model,
-        const ds4_layer_weights *layer,
-        const float           probs[DS4_MAX_EXPERT]) {
-    float selection[DS4_MAX_EXPERT];
+        int                    selected[PULSAR_MAX_EXPERT_USED],
+        float                  expert_weight[PULSAR_MAX_EXPERT_USED],
+        const pulsar_model       *model,
+        const pulsar_layer_weights *layer,
+        const float           probs[PULSAR_MAX_EXPERT]) {
+    float selection[PULSAR_MAX_EXPERT];
 
     memcpy(selection, probs, sizeof(selection));
 
     if (layer->ffn_exp_probs_b) {
         const float *bias = (const float *)tensor_data(model, layer->ffn_exp_probs_b);
-        for (uint32_t i = 0; i < DS4_N_EXPERT; i++) selection[i] += bias[i];
+        for (uint32_t i = 0; i < PULSAR_N_EXPERT; i++) selection[i] += bias[i];
     }
 
-    topk_desc(selection, (int)DS4_N_EXPERT, (int)DS4_N_EXPERT_USED, selected);
+    topk_desc(selection, (int)PULSAR_N_EXPERT, (int)PULSAR_N_EXPERT_USED, selected);
 
     float sum = 0.0f;
-    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+    for (uint32_t i = 0; i < PULSAR_N_EXPERT_USED; i++) {
         expert_weight[i] = probs[selected[i]];
         sum += expert_weight[i];
     }
     if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
-    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
-        expert_weight[i] = expert_weight[i] / sum * DS4_EXPERT_WEIGHT_SCALE;
+    for (uint32_t i = 0; i < PULSAR_N_EXPERT_USED; i++) {
+        expert_weight[i] = expert_weight[i] / sum * PULSAR_EXPERT_WEIGHT_SCALE;
     }
 }
 
@@ -275,29 +275,29 @@ void print_vec_stats(const char *name, const float *x, uint64_t n);
  * applies SwiGLU and router weights, then accumulates Q2_K down projections. */
 static void layer_routed_moe_one(
         float             * out,
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
+        const pulsar_model   * model,
+        const pulsar_layer_weights * layer,
         const float       * x,
         uint32_t            il,
         int                 token,
         float               clamp,
         bool                trace) {
-    int selected[DS4_MAX_EXPERT_USED];
-    float expert_weight[DS4_MAX_EXPERT_USED];
-    float *gate = trace ? (float *)xmalloc((size_t)DS4_N_FF_EXP * sizeof(gate[0])) : NULL;
-    float *up = trace ? (float *)xmalloc((size_t)DS4_N_FF_EXP * sizeof(up[0])) : NULL;
-    float *mid = trace ? (float *)xmalloc((size_t)DS4_N_FF_EXP * sizeof(mid[0])) : NULL;
-    float *mid_all = trace ? NULL : (float *)xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(mid_all[0]));
-    float *down = trace ? (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(down[0])) : NULL;
+    int selected[PULSAR_MAX_EXPERT_USED];
+    float expert_weight[PULSAR_MAX_EXPERT_USED];
+    float *gate = trace ? (float *)xmalloc((size_t)PULSAR_N_FF_EXP * sizeof(gate[0])) : NULL;
+    float *up = trace ? (float *)xmalloc((size_t)PULSAR_N_FF_EXP * sizeof(up[0])) : NULL;
+    float *mid = trace ? (float *)xmalloc((size_t)PULSAR_N_FF_EXP * sizeof(mid[0])) : NULL;
+    float *mid_all = trace ? NULL : (float *)xmalloc((size_t)PULSAR_N_EXPERT_USED * PULSAR_N_FF_EXP * sizeof(mid_all[0]));
+    float *down = trace ? (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(down[0])) : NULL;
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
-    if (expert_in_dim % QK_K != 0) ds4_die("routed expert input is not QK_K aligned");
-    if (down_in_dim != DS4_N_FF_EXP || down_in_dim % QK_K != 0) ds4_die("routed expert down input has an unexpected layout");
+    if (expert_in_dim % QK_K != 0) pulsar_die("routed expert input is not QK_K aligned");
+    if (down_in_dim != PULSAR_N_FF_EXP || down_in_dim % QK_K != 0) pulsar_die("routed expert down input has an unexpected layout");
     block_q8_K *xq = (block_q8_K *)xmalloc((size_t)(expert_in_dim / QK_K) * sizeof(xq[0]));
-    block_q8_K *midq = trace ? NULL : (block_q8_K *)xmalloc((size_t)DS4_N_EXPERT_USED * (down_in_dim / QK_K) * sizeof(midq[0]));
+    block_q8_K *midq = trace ? NULL : (block_q8_K *)xmalloc((size_t)PULSAR_N_EXPERT_USED * (down_in_dim / QK_K) * sizeof(midq[0]));
 
-    memset(out, 0, (size_t)DS4_N_EMBD * sizeof(out[0]));
-    ds4_quantize_row_q8_K(x, xq, (int64_t)expert_in_dim);
+    memset(out, 0, (size_t)PULSAR_N_EMBD * sizeof(out[0]));
+    pulsar_quantize_row_q8_K(x, xq, (int64_t)expert_in_dim);
 
     if (layer->ffn_gate_tid2eid) {
         layer_hash_selected_experts(selected, model, layer, token);
@@ -313,16 +313,16 @@ static void layer_routed_moe_one(
                                     xq,
                                     selected,
                                     expert_weight,
-                                    DS4_N_EXPERT_USED,
+                                    PULSAR_N_EXPERT_USED,
                                     clamp);
-        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
-            ds4_quantize_row_q8_K(mid_all + (uint64_t)i * down_in_dim,
+        for (uint32_t i = 0; i < PULSAR_N_EXPERT_USED; i++) {
+            pulsar_quantize_row_q8_K(mid_all + (uint64_t)i * down_in_dim,
                                   midq + (uint64_t)i * (down_in_dim / QK_K),
                                   (int64_t)down_in_dim);
         }
-        matvec_experts_down_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, DS4_N_EXPERT_USED);
+        matvec_experts_down_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, PULSAR_N_EXPERT_USED);
     } else {
-        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+        for (uint32_t i = 0; i < PULSAR_N_EXPERT_USED; i++) {
             const uint32_t expert = (uint32_t)selected[i];
 
             matvec_expert_pair_prequant(gate, up, model,
@@ -332,16 +332,16 @@ static void layer_routed_moe_one(
                                         expert);
             char name[64];
             snprintf(name, sizeof(name), "blk.%u expert %u gate", il, expert);
-            print_vec_stats(name, gate, DS4_N_FF_EXP);
+            print_vec_stats(name, gate, PULSAR_N_FF_EXP);
             snprintf(name, sizeof(name), "blk.%u expert %u up", il, expert);
-            print_vec_stats(name, up, DS4_N_FF_EXP);
+            print_vec_stats(name, up, PULSAR_N_FF_EXP);
 
             /*
              * DeepSeek V4 clamps routed expert gate/up values before SwiGLU and
              * applies the router weight before the down projection.
              */
             const float limit = clamp;
-            for (uint32_t j = 0; j < DS4_N_FF_EXP; j++) {
+            for (uint32_t j = 0; j < PULSAR_N_FF_EXP; j++) {
                 if (limit > 1.0e-6f) {
                     if (gate[j] > limit) gate[j] = limit;
                     if (up[j] > limit) up[j] = limit;
@@ -351,12 +351,12 @@ static void layer_routed_moe_one(
             }
 
             snprintf(name, sizeof(name), "blk.%u expert %u mid", il, expert);
-            print_vec_stats(name, mid, DS4_N_FF_EXP);
+            print_vec_stats(name, mid, PULSAR_N_FF_EXP);
 
             matvec_expert_down(down, model, layer->ffn_down_exps, mid, expert);
             snprintf(name, sizeof(name), "blk.%u expert %u down", il, expert);
-            print_vec_stats(name, down, DS4_N_EMBD);
-            for (uint32_t j = 0; j < DS4_N_EMBD; j++) out[j] += down[j];
+            print_vec_stats(name, down, PULSAR_N_EMBD);
+            for (uint32_t j = 0; j < PULSAR_N_EMBD; j++) out[j] += down[j];
         }
     }
 
@@ -375,8 +375,8 @@ static void layer_routed_moe_one(
  * large temporaries come from the persistent scratch arena. */
 void layer_routed_moe_one_prealloc(
         float             * out,
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
+        const pulsar_model   * model,
+        const pulsar_layer_weights * layer,
         const float       * x,
         uint32_t            il,
         int                 token,
@@ -384,16 +384,16 @@ void layer_routed_moe_one_prealloc(
         float              * mid_all,
         block_q8_K         * xq,
         block_q8_K         * midq) {
-    int selected[DS4_MAX_EXPERT_USED];
-    float expert_weight[DS4_MAX_EXPERT_USED];
+    int selected[PULSAR_MAX_EXPERT_USED];
+    float expert_weight[PULSAR_MAX_EXPERT_USED];
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
 
-    if (expert_in_dim % QK_K != 0) ds4_die("routed expert input is not QK_K aligned");
-    if (down_in_dim != DS4_N_FF_EXP || down_in_dim % QK_K != 0) ds4_die("routed expert down input has an unexpected layout");
+    if (expert_in_dim % QK_K != 0) pulsar_die("routed expert input is not QK_K aligned");
+    if (down_in_dim != PULSAR_N_FF_EXP || down_in_dim % QK_K != 0) pulsar_die("routed expert down input has an unexpected layout");
 
-    memset(out, 0, (size_t)DS4_N_EMBD * sizeof(out[0]));
-    ds4_quantize_row_q8_K(x, xq, (int64_t)expert_in_dim);
+    memset(out, 0, (size_t)PULSAR_N_EMBD * sizeof(out[0]));
+    pulsar_quantize_row_q8_K(x, xq, (int64_t)expert_in_dim);
 
     if (layer->ffn_gate_tid2eid) {
         layer_hash_selected_experts(selected, model, layer, token);
@@ -408,15 +408,15 @@ void layer_routed_moe_one_prealloc(
                                 xq,
                                 selected,
                                 expert_weight,
-                                DS4_N_EXPERT_USED,
+                                PULSAR_N_EXPERT_USED,
                                 clamp);
 
-    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
-        ds4_quantize_row_q8_K(mid_all + (uint64_t)i * down_in_dim,
+    for (uint32_t i = 0; i < PULSAR_N_EXPERT_USED; i++) {
+        pulsar_quantize_row_q8_K(mid_all + (uint64_t)i * down_in_dim,
                               midq + (uint64_t)i * (down_in_dim / QK_K),
                               (int64_t)down_in_dim);
     }
-    matvec_experts_down_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, DS4_N_EXPERT_USED);
+    matvec_experts_down_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, PULSAR_N_EXPERT_USED);
 
     (void)il;
 }
@@ -427,8 +427,8 @@ void layer_routed_moe_one_prealloc(
  * rows are scanned once for the whole token batch. */
 static void layer_routed_moe_batch(
         float             * moe,
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
+        const pulsar_model   * model,
+        const pulsar_layer_weights * layer,
         const float       * norm,
         const int         * token_ids,
         uint32_t            n_tok,
@@ -438,31 +438,31 @@ static void layer_routed_moe_batch(
     const uint64_t expert_out_dim = layer->ffn_gate_exps->dim[1];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
     const uint64_t down_out_dim = layer->ffn_down_exps->dim[1];
-    if (expert_in_dim % QK_K != 0) ds4_die("routed expert input is not QK_K aligned");
-    if (down_in_dim % QK_K != 0) ds4_die("routed expert down input is not QK_K aligned");
-    if (expert_out_dim != down_in_dim || down_out_dim != DS4_N_EMBD) {
-        ds4_die("routed expert tensor layout is unexpected");
+    if (expert_in_dim % QK_K != 0) pulsar_die("routed expert input is not QK_K aligned");
+    if (down_in_dim % QK_K != 0) pulsar_die("routed expert down input is not QK_K aligned");
+    if (expert_out_dim != down_in_dim || down_out_dim != PULSAR_N_EMBD) {
+        pulsar_die("routed expert tensor layout is unexpected");
     }
 
-    const uint32_t total_pairs = n_tok * DS4_N_EXPERT_USED;
-    uint32_t counts[DS4_MAX_EXPERT + 1] = {0};
-    uint32_t cursor[DS4_MAX_EXPERT] = {0};
-    uint32_t active_expert[DS4_MAX_EXPERT];
+    const uint32_t total_pairs = n_tok * PULSAR_N_EXPERT_USED;
+    uint32_t counts[PULSAR_MAX_EXPERT + 1] = {0};
+    uint32_t cursor[PULSAR_MAX_EXPERT] = {0};
+    uint32_t active_expert[PULSAR_MAX_EXPERT];
     uint32_t n_active = 0;
 
     int *selected = (int *)xmalloc((size_t)total_pairs * sizeof(selected[0]));
     float *pair_weight = (float *)xmalloc((size_t)total_pairs * sizeof(pair_weight[0]));
-    ds4_expert_pair *pairs = (ds4_expert_pair *)xmalloc((size_t)total_pairs * sizeof(pairs[0]));
+    pulsar_expert_pair *pairs = (pulsar_expert_pair *)xmalloc((size_t)total_pairs * sizeof(pairs[0]));
 
     const uint64_t xq_blocks = expert_in_dim / QK_K;
     block_q8_K *xq = (block_q8_K *)xmalloc((size_t)n_tok * xq_blocks * sizeof(xq[0]));
     for (uint32_t t = 0; t < n_tok; t++) {
-        ds4_quantize_row_q8_K(norm + (uint64_t)t * expert_in_dim,
+        pulsar_quantize_row_q8_K(norm + (uint64_t)t * expert_in_dim,
                               xq + (uint64_t)t * xq_blocks,
                               (int64_t)expert_in_dim);
 
-        int sel[DS4_MAX_EXPERT_USED];
-        float weights[DS4_MAX_EXPERT_USED];
+        int sel[PULSAR_MAX_EXPERT_USED];
+        float weights[PULSAR_MAX_EXPERT_USED];
         if (layer->ffn_gate_tid2eid) {
             layer_hash_selected_experts(sel, model, layer, token_ids[t]);
             layer_hash_router_weights_one(weights, model, layer, norm + (uint64_t)t * expert_in_dim, sel);
@@ -470,17 +470,17 @@ static void layer_routed_moe_batch(
             layer_topk_selected_experts(sel, weights, model, layer, norm + (uint64_t)t * expert_in_dim);
         }
 
-        for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
-            const uint32_t pair_id = t * DS4_N_EXPERT_USED + slot;
+        for (uint32_t slot = 0; slot < PULSAR_N_EXPERT_USED; slot++) {
+            const uint32_t pair_id = t * PULSAR_N_EXPERT_USED + slot;
             selected[pair_id] = sel[slot];
             pair_weight[pair_id] = weights[slot];
-            pairs[pair_id] = (ds4_expert_pair){ .token = t, .slot = slot };
-            if (sel[slot] < 0 || (uint32_t)sel[slot] >= DS4_N_EXPERT) ds4_die("selected expert is outside range");
+            pairs[pair_id] = (pulsar_expert_pair){ .token = t, .slot = slot };
+            if (sel[slot] < 0 || (uint32_t)sel[slot] >= PULSAR_N_EXPERT) pulsar_die("selected expert is outside range");
             counts[(uint32_t)sel[slot] + 1]++;
         }
     }
 
-    for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+    for (uint32_t e = 0; e < PULSAR_N_EXPERT; e++) {
         counts[e + 1] += counts[e];
         cursor[e] = counts[e];
         if (counts[e + 1] != counts[e]) active_expert[n_active++] = e;
@@ -497,7 +497,7 @@ static void layer_routed_moe_batch(
     const uint32_t gate_type = layer->ffn_gate_exps->type;
 
     /* Build mid vectors: dispatch based on gate/up tensor type. */
-    if (gate_type == DS4_TENSOR_IQ2_XXS) {
+    if (gate_type == PULSAR_TENSOR_IQ2_XXS) {
         matvec_iq2_xxs_batch_mid_ctx mid_ctx = {
             .mid = mid,
             .gate_base = {},   /* filled per active expert below */
@@ -526,13 +526,13 @@ static void layer_routed_moe_batch(
                                                      &up_in_dim, &up_out_dim, &mid_ctx.up_row_bytes[e]);
             if (gate_in_dim != expert_in_dim || up_in_dim != expert_in_dim ||
                 gate_out_dim != expert_out_dim || up_out_dim != expert_out_dim) {
-                ds4_die("batch expert tensor layout mismatch");
+                pulsar_die("batch expert tensor layout mismatch");
             }
         }
 
-        ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_iq2_xxs_batch_mid_worker, &mid_ctx);
+        pulsar_parallel_for((uint64_t)n_active * expert_out_dim, matvec_iq2_xxs_batch_mid_worker, &mid_ctx);
     } else {
-        ds4_die("unsupported gate/up expert tensor type for batch");
+        pulsar_die("unsupported gate/up expert tensor type for batch");
     }
 
     const uint64_t midq_blocks = down_in_dim / QK_K;
@@ -543,13 +543,13 @@ static void layer_routed_moe_batch(
         .down_in_dim = down_in_dim,
         .down_blocks = midq_blocks,
     };
-    ds4_parallel_for(total_pairs, quantize_mid_pairs_worker, &quant_ctx);
+    pulsar_parallel_for(total_pairs, quantize_mid_pairs_worker, &quant_ctx);
     free(mid);
 
     /* Down projection: dispatch based on down tensor type. */
     const uint32_t down_type = layer->ffn_down_exps->type;
 
-    if (down_type == DS4_TENSOR_Q2_K) {
+    if (down_type == PULSAR_TENSOR_Q2_K) {
         matvec_q2_k_batch_accum_rows_ctx down_ctx = {
             .moe = moe,
             .base = {},   /* filled per active expert below */
@@ -572,13 +572,13 @@ static void layer_routed_moe_batch(
             down_ctx.base[e] = tensor_expert_bytes(model, layer->ffn_down_exps, e,
                                                    &in_dim, &out_dim, &down_ctx.row_bytes[e]);
             if (in_dim != down_in_dim || out_dim != down_out_dim) {
-                ds4_die("batch expert tensor layout mismatch");
+                pulsar_die("batch expert tensor layout mismatch");
             }
         }
 
-        ds4_parallel_for(down_out_dim, matvec_q2_k_batch_accum_rows_worker, &down_ctx);
+        pulsar_parallel_for(down_out_dim, matvec_q2_k_batch_accum_rows_worker, &down_ctx);
     } else {
-        ds4_die("unsupported down expert tensor type for batch");
+        pulsar_die("unsupported down expert tensor type for batch");
     }
 
     free(midq);
@@ -601,15 +601,15 @@ void print_vec_stats(const char *name, const float *x, uint64_t n);
  * sum, and HC post. */
 void layer_ffn_one(
         float             * out_hc,
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
+        const pulsar_model   * model,
+        const pulsar_layer_weights * layer,
         const float       * inp_hc,
         uint32_t            il,
         int                 token,
         const float       * steering_dirs,
         float               steering_scale,
         bool                trace) {
-    const uint32_t n_hc = DS4_N_HC;
+    const uint32_t n_hc = PULSAR_N_HC;
     static int profile_env = -1;
     const bool profile = gpu_graph_env_flag("DS4_DECODE_PROFILE_DETAIL", &profile_env);
     const double t_start = profile ? now_sec() : 0.0;
@@ -618,11 +618,11 @@ void layer_ffn_one(
     double t_routed = 0.0;
     double t_shared = 0.0;
     double t_post = 0.0;
-    float *ffn_cur = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(ffn_cur[0]));
-    float *norm = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(norm[0]));
-    float *moe = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(moe[0]));
-    float *shared = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(shared[0]));
-    float *ffn_out = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(ffn_out[0]));
+    float *ffn_cur = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(ffn_cur[0]));
+    float *norm = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(norm[0]));
+    float *moe = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(moe[0]));
+    float *shared = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(shared[0]));
+    float *ffn_out = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(ffn_out[0]));
     float post[4];
     float comb[16];
 
@@ -636,26 +636,26 @@ void layer_ffn_one(
     if (trace) {
         char name[64];
         snprintf(name, sizeof(name), "blk.%u ffn_cur", il);
-        print_vec_stats(name, ffn_cur, DS4_N_EMBD);
+        print_vec_stats(name, ffn_cur, PULSAR_N_EMBD);
     }
 
     t0 = profile ? now_sec() : 0.0;
     const float *ffn_norm = (const float *)tensor_data(model, layer->ffn_norm);
-    rms_norm_weight(norm, ffn_cur, ffn_norm, DS4_N_EMBD, DS4_RMS_EPS);
+    rms_norm_weight(norm, ffn_cur, ffn_norm, PULSAR_N_EMBD, PULSAR_RMS_EPS);
     if (profile) t_norm = now_sec() - t0;
     if (trace) {
         char name[64];
         snprintf(name, sizeof(name), "blk.%u ffn_norm", il);
-        print_vec_stats(name, norm, DS4_N_EMBD);
+        print_vec_stats(name, norm, PULSAR_N_EMBD);
     }
 
     t0 = profile ? now_sec() : 0.0;
-    layer_routed_moe_one(moe, model, layer, norm, il, token, DS4_SWIGLU_CLAMP_EXP, trace);
+    layer_routed_moe_one(moe, model, layer, norm, il, token, PULSAR_SWIGLU_CLAMP_EXP, trace);
     if (profile) t_routed = now_sec() - t0;
     if (trace) {
         char name[64];
         snprintf(name, sizeof(name), "blk.%u routed_moe", il);
-        print_vec_stats(name, moe, DS4_N_EMBD);
+        print_vec_stats(name, moe, PULSAR_N_EMBD);
     }
     t0 = profile ? now_sec() : 0.0;
     layer_shared_ffn_one(shared, model, layer, norm);
@@ -663,31 +663,31 @@ void layer_ffn_one(
     if (trace) {
         char name[64];
         snprintf(name, sizeof(name), "blk.%u shared_ffn", il);
-        print_vec_stats(name, shared, DS4_N_EMBD);
+        print_vec_stats(name, shared, PULSAR_N_EMBD);
     }
 
     t0 = profile ? now_sec() : 0.0;
-    for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
+    for (uint32_t i = 0; i < PULSAR_N_EMBD; i++) {
         ffn_out[i] = moe[i] + shared[i];
     }
     cpu_directional_steering_project_rows(ffn_out, steering_dirs, il, 1, steering_scale);
     if (trace) {
         char name[64];
         snprintf(name, sizeof(name), "blk.%u ffn_out", il);
-        print_vec_stats(name, ffn_out, DS4_N_EMBD);
+        print_vec_stats(name, ffn_out, PULSAR_N_EMBD);
     }
 
-    hc_post_one(out_hc, ffn_out, inp_hc, post, comb, DS4_N_EMBD, n_hc);
+    hc_post_one(out_hc, ffn_out, inp_hc, post, comb, PULSAR_N_EMBD, n_hc);
     if (profile) t_post = now_sec() - t0;
     if (trace) {
         char name[64];
         snprintf(name, sizeof(name), "blk.%u ffn_post_hc", il);
-        print_vec_stats(name, out_hc, (uint64_t)n_hc * DS4_N_EMBD);
+        print_vec_stats(name, out_hc, (uint64_t)n_hc * PULSAR_N_EMBD);
     }
 
     if (profile) {
         fprintf(stderr,
-                "ds4: decode detail layer %u ffn hc=%.3f norm=%.3f routed=%.3f shared=%.3f post=%.3f total=%.3f ms\n",
+                "pulsar: decode detail layer %u ffn hc=%.3f norm=%.3f routed=%.3f shared=%.3f post=%.3f total=%.3f ms\n",
                 il,
                 t_hc * 1000.0,
                 t_norm * 1000.0,
@@ -712,8 +712,8 @@ void layer_ffn_one(
 
 void layer_ffn_batch(
         float             * out_hc,
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
+        const pulsar_model   * model,
+        const pulsar_layer_weights * layer,
         const float       * inp_hc,
         const int         * token_ids,
         uint32_t            n_tok,
@@ -721,12 +721,12 @@ void layer_ffn_batch(
         const float       * steering_dirs,
         float               steering_scale) {
     if (n_tok == 0) return;
-    const uint32_t n_hc = DS4_N_HC;
-    const uint64_t hc_dim = (uint64_t)n_hc * DS4_N_EMBD;
-    float *ffn_cur = (float *)xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(ffn_cur[0]));
-    float *norm = (float *)xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(norm[0]));
-    float *moe = (float *)xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(moe[0]));
-    float *shared = (float *)xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(shared[0]));
+    const uint32_t n_hc = PULSAR_N_HC;
+    const uint64_t hc_dim = (uint64_t)n_hc * PULSAR_N_EMBD;
+    float *ffn_cur = (float *)xmalloc((size_t)n_tok * PULSAR_N_EMBD * sizeof(ffn_cur[0]));
+    float *norm = (float *)xmalloc((size_t)n_tok * PULSAR_N_EMBD * sizeof(norm[0]));
+    float *moe = (float *)xmalloc((size_t)n_tok * PULSAR_N_EMBD * sizeof(moe[0]));
+    float *shared = (float *)xmalloc((size_t)n_tok * PULSAR_N_EMBD * sizeof(shared[0]));
     float *post = (float *)xmalloc((size_t)n_tok * n_hc * sizeof(post[0]));
     float *comb = (float *)xmalloc((size_t)n_tok * n_hc * n_hc * sizeof(comb[0]));
     const float *ffn_norm = (const float *)tensor_data(model, layer->ffn_norm);
@@ -737,22 +737,22 @@ void layer_ffn_batch(
                               layer->hc_ffn_scale,
                               layer->hc_ffn_base,
                               inp_hc + (uint64_t)t * hc_dim,
-                              ffn_cur + (uint64_t)t * DS4_N_EMBD,
+                              ffn_cur + (uint64_t)t * PULSAR_N_EMBD,
                               post + (uint64_t)t * n_hc,
                               comb + (uint64_t)t * n_hc * n_hc);
-        rms_norm_weight(norm + (uint64_t)t * DS4_N_EMBD,
-                        ffn_cur + (uint64_t)t * DS4_N_EMBD,
+        rms_norm_weight(norm + (uint64_t)t * PULSAR_N_EMBD,
+                        ffn_cur + (uint64_t)t * PULSAR_N_EMBD,
                         ffn_norm,
-                        DS4_N_EMBD,
-                        DS4_RMS_EPS);
+                        PULSAR_N_EMBD,
+                        PULSAR_RMS_EPS);
     }
 
-    layer_routed_moe_batch(moe, model, layer, norm, token_ids, n_tok, il, DS4_SWIGLU_CLAMP_EXP);
+    layer_routed_moe_batch(moe, model, layer, norm, token_ids, n_tok, il, PULSAR_SWIGLU_CLAMP_EXP);
     layer_shared_ffn_batch(shared, model, layer, norm, n_tok);
 
     if (cpu_directional_steering_enabled(steering_dirs, steering_scale)) {
-        float *ffn_out = (float *)xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(ffn_out[0]));
-        for (uint64_t i = 0; i < (uint64_t)n_tok * DS4_N_EMBD; i++) {
+        float *ffn_out = (float *)xmalloc((size_t)n_tok * PULSAR_N_EMBD * sizeof(ffn_out[0]));
+        for (uint64_t i = 0; i < (uint64_t)n_tok * PULSAR_N_EMBD; i++) {
             ffn_out[i] = moe[i] + shared[i];
         }
         cpu_directional_steering_project_rows(ffn_out, steering_dirs, il, n_tok, steering_scale);
@@ -762,7 +762,7 @@ void layer_ffn_batch(
                       post,
                       comb,
                       n_tok,
-                      DS4_N_EMBD,
+                      PULSAR_N_EMBD,
                       n_hc);
         free(ffn_out);
     } else {
@@ -773,7 +773,7 @@ void layer_ffn_batch(
                           post,
                           comb,
                           n_tok,
-                          DS4_N_EMBD,
+                          PULSAR_N_EMBD,
                           n_hc);
     }
 
@@ -789,18 +789,18 @@ void layer_ffn_batch(
 
 static void routed_moe_tokens_worker(void *vctx, uint64_t t0, uint64_t t1) {
     routed_moe_tokens_ctx *ctx = static_cast<routed_moe_tokens_ctx *>(vctx);
-    float *routed_mid = (float *)xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(routed_mid[0]));
+    float *routed_mid = (float *)xmalloc((size_t)PULSAR_N_EXPERT_USED * PULSAR_N_FF_EXP * sizeof(routed_mid[0]));
     block_q8_K *routed_xq = (block_q8_K *)xmalloc((size_t)(ctx->expert_in_dim / QK_K) * sizeof(routed_xq[0]));
-    block_q8_K *routed_midq = (block_q8_K *)xmalloc((size_t)DS4_N_EXPERT_USED * (ctx->down_in_dim / QK_K) * sizeof(routed_midq[0]));
+    block_q8_K *routed_midq = (block_q8_K *)xmalloc((size_t)PULSAR_N_EXPERT_USED * (ctx->down_in_dim / QK_K) * sizeof(routed_midq[0]));
 
     for (uint64_t t = t0; t < t1; t++) {
-        layer_routed_moe_one_prealloc(ctx->moe + t * DS4_N_EMBD,
+        layer_routed_moe_one_prealloc(ctx->moe + t * PULSAR_N_EMBD,
                                       ctx->model,
                                       ctx->layer,
-                                      ctx->norm + t * DS4_N_EMBD,
+                                      ctx->norm + t * PULSAR_N_EMBD,
                                       ctx->il,
                                       ctx->token_ids[t],
-                                      DS4_SWIGLU_CLAMP_EXP,
+                                      PULSAR_SWIGLU_CLAMP_EXP,
                                       routed_mid,
                                       routed_xq,
                                       routed_midq);
@@ -815,8 +815,8 @@ static void routed_moe_tokens_worker(void *vctx, uint64_t t0, uint64_t t1) {
 
 static void layer_routed_moe_tokens_parallel(
         float             * moe,
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
+        const pulsar_model   * model,
+        const pulsar_layer_weights * layer,
         const float       * norm,
         const int         * token_ids,
         uint32_t            n_tok,
@@ -831,7 +831,7 @@ static void layer_routed_moe_tokens_parallel(
         .down_in_dim = layer->ffn_down_exps->dim[0],
         .il = il,
     };
-    ds4_parallel_for_min_rows(n_tok, routed_moe_tokens_worker, &ctx, 1);
+    pulsar_parallel_for_min_rows(n_tok, routed_moe_tokens_worker, &ctx, 1);
 }
 
 
@@ -840,8 +840,8 @@ static void layer_routed_moe_tokens_parallel(
  * experts can run either token-parallel or expert-grouped depending on size. */
 void layer_ffn_shared_batch(
         float             * out_hc,
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
+        const pulsar_model   * model,
+        const pulsar_layer_weights * layer,
         const float       * inp_hc,
         const int         * token_ids,
         uint32_t            n_tok,
@@ -855,11 +855,11 @@ void layer_ffn_shared_batch(
     double t_routed = 0.0;
     double t_shared = 0.0;
     double t_post = 0.0;
-    const uint32_t n_hc = DS4_N_HC;
-    float *ffn_cur = (float *)xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(ffn_cur[0]));
-    float *norm = (float *)xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(norm[0]));
-    float *moe = (float *)xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(moe[0]));
-    float *shared = (float *)xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(shared[0]));
+    const uint32_t n_hc = PULSAR_N_HC;
+    float *ffn_cur = (float *)xmalloc((size_t)n_tok * PULSAR_N_EMBD * sizeof(ffn_cur[0]));
+    float *norm = (float *)xmalloc((size_t)n_tok * PULSAR_N_EMBD * sizeof(norm[0]));
+    float *moe = (float *)xmalloc((size_t)n_tok * PULSAR_N_EMBD * sizeof(moe[0]));
+    float *shared = (float *)xmalloc((size_t)n_tok * PULSAR_N_EMBD * sizeof(shared[0]));
     float *post = (float *)xmalloc((size_t)n_tok * n_hc * sizeof(post[0]));
     float *comb = (float *)xmalloc((size_t)n_tok * n_hc * n_hc * sizeof(comb[0]));
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
@@ -868,9 +868,9 @@ void layer_ffn_shared_batch(
     const bool routed_token_parallel =
         !gpu_graph_env_flag("DS4_NO_ROUTED_TOKEN_PARALLEL", &no_routed_parallel_env) &&
         n_tok >= 64;
-    float *routed_mid = routed_token_parallel ? NULL : (float *)xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(routed_mid[0]));
+    float *routed_mid = routed_token_parallel ? NULL : (float *)xmalloc((size_t)PULSAR_N_EXPERT_USED * PULSAR_N_FF_EXP * sizeof(routed_mid[0]));
     block_q8_K *routed_xq = routed_token_parallel ? NULL : (block_q8_K *)xmalloc((size_t)(expert_in_dim / QK_K) * sizeof(routed_xq[0]));
-    block_q8_K *routed_midq = routed_token_parallel ? NULL : (block_q8_K *)xmalloc((size_t)DS4_N_EXPERT_USED * (down_in_dim / QK_K) * sizeof(routed_midq[0]));
+    block_q8_K *routed_midq = routed_token_parallel ? NULL : (block_q8_K *)xmalloc((size_t)PULSAR_N_EXPERT_USED * (down_in_dim / QK_K) * sizeof(routed_midq[0]));
 
     double t0 = profile ? now_sec() : 0.0;
     hc_pre_norm_batch(model,
@@ -892,13 +892,13 @@ void layer_ffn_shared_batch(
         layer_routed_moe_tokens_parallel(moe, model, layer, norm, token_ids, n_tok, il);
     } else {
         for (uint32_t t = 0; t < n_tok; t++) {
-            layer_routed_moe_one_prealloc(moe + (uint64_t)t * DS4_N_EMBD,
+            layer_routed_moe_one_prealloc(moe + (uint64_t)t * PULSAR_N_EMBD,
                                           model,
                                           layer,
-                                          norm + (uint64_t)t * DS4_N_EMBD,
+                                          norm + (uint64_t)t * PULSAR_N_EMBD,
                                           il,
                                           token_ids[t],
-                                          DS4_SWIGLU_CLAMP_EXP,
+                                          PULSAR_SWIGLU_CLAMP_EXP,
                                           routed_mid,
                                           routed_xq,
                                           routed_midq);
@@ -912,8 +912,8 @@ void layer_ffn_shared_batch(
 
     t0 = profile ? now_sec() : 0.0;
     if (cpu_directional_steering_enabled(steering_dirs, steering_scale)) {
-        float *ffn_out = (float *)xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(ffn_out[0]));
-        for (uint64_t i = 0; i < (uint64_t)n_tok * DS4_N_EMBD; i++) {
+        float *ffn_out = (float *)xmalloc((size_t)n_tok * PULSAR_N_EMBD * sizeof(ffn_out[0]));
+        for (uint64_t i = 0; i < (uint64_t)n_tok * PULSAR_N_EMBD; i++) {
             ffn_out[i] = moe[i] + shared[i];
         }
         cpu_directional_steering_project_rows(ffn_out, steering_dirs, il, n_tok, steering_scale);
@@ -923,7 +923,7 @@ void layer_ffn_shared_batch(
                       post,
                       comb,
                       n_tok,
-                      DS4_N_EMBD,
+                      PULSAR_N_EMBD,
                       n_hc);
         free(ffn_out);
     } else {
@@ -934,14 +934,14 @@ void layer_ffn_shared_batch(
                           post,
                           comb,
                           n_tok,
-                          DS4_N_EMBD,
+                          PULSAR_N_EMBD,
                           n_hc);
     }
     if (profile) t_post = now_sec() - t0;
 
     if (profile) {
         fprintf(stderr,
-                "ds4: prefill detail layer %u ffn hc_norm=%.3f routed=%.3f shared=%.3f post=%.3f total=%.3f\n",
+                "pulsar: prefill detail layer %u ffn hc_norm=%.3f routed=%.3f shared=%.3f post=%.3f total=%.3f\n",
                 il, t_hc_norm, t_routed, t_shared, t_post, now_sec() - t_start);
     }
 
@@ -977,8 +977,8 @@ static void layer_ffn_tokens_worker(void *vctx, uint64_t t0, uint64_t t1) {
 
 void layer_ffn_tokens_parallel(
         float             * out_hc,
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
+        const pulsar_model   * model,
+        const pulsar_layer_weights * layer,
         const float       * inp_hc,
         const int         * token_ids,
         uint32_t            n_tok,
@@ -993,17 +993,17 @@ void layer_ffn_tokens_parallel(
         .token_ids = token_ids,
         .steering_dirs = steering_dirs,
         .steering_scale = steering_scale,
-        .hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD,
+        .hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD,
         .il = il,
     };
-    ds4_parallel_for(n_tok, layer_ffn_tokens_worker, &ctx);
+    pulsar_parallel_for(n_tok, layer_ffn_tokens_worker, &ctx);
 }
 
 
 
 void output_logits_one(
         float             * logits,
-        const ds4_model   * model,
-        const ds4_weights * weights,
+        const pulsar_model   * model,
+        const pulsar_weights * weights,
         const float       * inp_hc);
 

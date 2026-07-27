@@ -1,4 +1,4 @@
-#include "ds4_agent_internal.h"
+#include "pulsar_agent_internal.h"
 
 
 
@@ -220,11 +220,11 @@ static void agent_worker_set_more(agent_worker *w, const char *path,
 bool agent_tool_result_fits_context(agent_worker *w, const char *result,
                                            int reserve_tokens,
                                            int *tokens_out) {
-    ds4_tokens tmp = {0};
-    ds4_tokens_copy(&tmp, &w->transcript);
-    ds4_chat_append_message(w->engine, &tmp, "tool", result ? result : "");
+    pulsar_tokens tmp = {0};
+    pulsar_tokens_copy(&tmp, &w->transcript);
+    pulsar_chat_append_message(w->engine, &tmp, "tool", result ? result : "");
     int tokens = tmp.len;
-    ds4_tokens_free(&tmp);
+    pulsar_tokens_free(&tmp);
     if (tokens_out) *tokens_out = tokens;
     return tokens + reserve_tokens < w->cfg->gen.ctx_size;
 }

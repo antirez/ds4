@@ -1,4 +1,4 @@
-#include "ds4_cuda_internal.h"
+#include "pulsar_cuda_internal.h"
 
 
 static const void *g_model_host_base;
@@ -153,7 +153,7 @@ void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     void *ptr = NULL;
     cudaError_t err = cudaMalloc(&ptr, (size_t)bytes);
     if (err != cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA temp alloc failed for %s (%.2f MiB): %s\n",
+        fprintf(stderr, "pulsar: CUDA temp alloc failed for %s (%.2f MiB): %s\n",
                 what ? what : "scratch", (double)bytes / 1048576.0, cudaGetErrorString(err));
         (void)cudaGetLastError();
         return NULL;
@@ -166,7 +166,7 @@ void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
 
 
 int cuda_attention_score_buffer_fits(uint32_t n_comp) {
-    return n_comp <= DS4_CUDA_ATTENTION_SCORE_CAP - DS4_CUDA_ATTENTION_RAW_SCORE_CAP;
+    return n_comp <= PULSAR_CUDA_ATTENTION_SCORE_CAP - PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP;
 }
 
 
@@ -226,13 +226,13 @@ static const char *cuda_model_range_register_mapped(const void *model_map,
             g_model_ranges.push_back({model_map, offset, bytes, dev_ptr, (void *)reg_addr, (char *)reg_dev, reg_bytes, 1, 0});
             g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
             if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-                fprintf(stderr, "ds4: CUDA mapped %s %.2f MiB\n",
+                fprintf(stderr, "pulsar: CUDA mapped %s %.2f MiB\n",
                         what ? what : "weights",
                         (double)bytes / 1048576.0);
             }
             return dev_ptr;
         }
-        fprintf(stderr, "ds4: CUDA model range map pointer failed for %s: %s\n",
+        fprintf(stderr, "pulsar: CUDA model range map pointer failed for %s: %s\n",
                 what ? what : "weights", cudaGetErrorString(err));
         (void)cudaHostUnregister((void *)reg_addr);
         (void)cudaGetLastError();
@@ -243,7 +243,7 @@ static const char *cuda_model_range_register_mapped(const void *model_map,
         g_model_range_mapping_supported = 0;
     }
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-        fprintf(stderr, "ds4: CUDA model range map skipped for %s: %s\n",
+        fprintf(stderr, "pulsar: CUDA model range map skipped for %s: %s\n",
                 what ? what : "weights", cudaGetErrorString(err));
     }
     (void)cudaGetLastError();
@@ -263,7 +263,7 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
         if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-            fprintf(stderr, "ds4: CUDA skipped device copy for %s %.2f MiB (cache budget %.2f GiB exhausted)\n",
+            fprintf(stderr, "pulsar: CUDA skipped device copy for %s %.2f MiB (cache budget %.2f GiB exhausted)\n",
                     what ? what : "weights",
                     (double)bytes / 1048576.0,
                     (double)limit / 1073741824.0);
@@ -275,7 +275,7 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
     cudaError_t err = cudaMalloc(&dev, (size_t)bytes);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
-        fprintf(stderr, "ds4: CUDA model range alloc failed for %s (%.2f MiB): %s\n",
+        fprintf(stderr, "pulsar: CUDA model range alloc failed for %s (%.2f MiB): %s\n",
                 what ? what : "weights", (double)bytes / 1048576.0, cudaGetErrorString(err));
         return NULL;
     }
@@ -286,7 +286,7 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
         uint64_t n = bytes - done < chunk ? bytes - done : chunk;
         err = cudaMemcpy((char *)dev + done, src + done, (size_t)n, cudaMemcpyHostToDevice);
         if (err != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA model range copy failed for %s at %.2f/%.2f MiB: %s\n",
+            fprintf(stderr, "pulsar: CUDA model range copy failed for %s at %.2f/%.2f MiB: %s\n",
                     what ? what : "weights",
                     (double)done / 1048576.0,
                     (double)bytes / 1048576.0,
@@ -300,7 +300,7 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-        fprintf(stderr, "ds4: CUDA cached %s %.2f MiB (total %.2f GiB)\n",
+        fprintf(stderr, "pulsar: CUDA cached %s %.2f MiB (total %.2f GiB)\n",
                 what ? what : "weights",
                 (double)bytes / 1048576.0,
                 (double)g_model_range_bytes / 1073741824.0);
@@ -392,7 +392,7 @@ static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, ui
 
 int cuda_ok(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
-    fprintf(stderr, "ds4: CUDA %s failed: %s\n", what, cudaGetErrorString(err));
+    fprintf(stderr, "pulsar: CUDA %s failed: %s\n", what, cudaGetErrorString(err));
     return 0;
 }
 
@@ -463,13 +463,13 @@ static void cuda_model_load_progress_note(uint64_t cached_bytes) {
     g_model_load_progress_started = 1;
     g_model_load_progress_tty = tty;
     if (g_model_load_progress_tty) {
-        fprintf(stderr, "\r\033[Kds4: CUDA loading model tensors into device cache: %.2f GiB",
+        fprintf(stderr, "\r\033[Kpulsar: CUDA loading model tensors into device cache: %.2f GiB",
                 (double)cached_bytes / 1073741824.0);
     } else {
         if (g_model_load_progress_last == 0.0) {
-            fprintf(stderr, "ds4: CUDA loading model tensors into device cache\n");
+            fprintf(stderr, "pulsar: CUDA loading model tensors into device cache\n");
         } else {
-            fprintf(stderr, "ds4: CUDA loading model tensors %.2f GiB cached\n",
+            fprintf(stderr, "pulsar: CUDA loading model tensors %.2f GiB cached\n",
                     (double)cached_bytes / 1073741824.0);
         }
     }
@@ -521,13 +521,13 @@ static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size,
     const double t0 = cuda_wall_sec();
     err = cudaMemAdvise(pre_ptr, (size_t)pre_bytes, cudaMemAdviseSetReadMostly, loc);
     if (err != cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA model read-mostly advise skipped: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "pulsar: CUDA model read-mostly advise skipped: %s\n", cudaGetErrorString(err));
         (void)cudaGetLastError();
         return 0;
     }
     err = cudaMemAdvise(pre_ptr, (size_t)pre_bytes, cudaMemAdviseSetPreferredLocation, loc);
     if (err != cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA model preferred-location advise skipped: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "pulsar: CUDA model preferred-location advise skipped: %s\n", cudaGetErrorString(err));
         (void)cudaGetLastError();
         return 0;
     }
@@ -535,7 +535,7 @@ static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size,
     if (!g_model_prefetch_stream) {
         err = cudaStreamCreateWithFlags(&g_model_prefetch_stream, cudaStreamNonBlocking);
         if (err != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA model prefetch stream creation skipped: %s\n", cudaGetErrorString(err));
+            fprintf(stderr, "pulsar: CUDA model prefetch stream creation skipped: %s\n", cudaGetErrorString(err));
             (void)cudaGetLastError();
             return 0;
         }
@@ -543,21 +543,21 @@ static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size,
 
     err = cudaMemPrefetchAsync(pre_ptr, (size_t)pre_bytes, loc, 0, g_model_prefetch_stream);
     if (err != cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA model prefetch skipped: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "pulsar: CUDA model prefetch skipped: %s\n", cudaGetErrorString(err));
         (void)cudaGetLastError();
         return 0;
     }
     if (getenv("DS4_CUDA_MODEL_PREFETCH_SYNC") != NULL) {
         err = cudaStreamSynchronize(g_model_prefetch_stream);
         if (err != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA model prefetch sync failed: %s\n", cudaGetErrorString(err));
+            fprintf(stderr, "pulsar: CUDA model prefetch sync failed: %s\n", cudaGetErrorString(err));
             (void)cudaGetLastError();
             return 0;
         }
     }
     const double t1 = cuda_wall_sec();
     fprintf(stderr,
-            "ds4: CUDA ATS/HMM prefetch queued %.2f GiB of model tensors in %.3fs\n",
+            "pulsar: CUDA ATS/HMM prefetch queued %.2f GiB of model tensors in %.3fs\n",
             (double)map_size / 1073741824.0,
             t1 - t0);
     g_model_hmm_direct = 1;
@@ -655,7 +655,7 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
     if (!g_model_upload_stream) {
         cudaError_t err = cudaStreamCreateWithFlags(&g_model_upload_stream, cudaStreamNonBlocking);
         if (err != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA model upload stream creation failed: %s\n", cudaGetErrorString(err));
+            fprintf(stderr, "pulsar: CUDA model upload stream creation failed: %s\n", cudaGetErrorString(err));
             (void)cudaGetLastError();
             return 0;
         }
@@ -663,14 +663,14 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
     for (size_t i = 0; i < 4; i++) {
         cudaError_t err = cudaMallocHost(&g_model_stage_raw[i], (size_t)bytes);
         if (err != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA pinned model staging allocation failed: %s\n", cudaGetErrorString(err));
+            fprintf(stderr, "pulsar: CUDA pinned model staging allocation failed: %s\n", cudaGetErrorString(err));
             (void)cudaGetLastError();
             return 0;
         }
         g_model_stage[i] = cuda_align_ptr(g_model_stage_raw[i], g_model_direct_align);
         err = cudaEventCreateWithFlags(&g_model_stage_event[i], cudaEventDisableTiming);
         if (err != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA model staging event creation failed: %s\n", cudaGetErrorString(err));
+            fprintf(stderr, "pulsar: CUDA model staging event creation failed: %s\n", cudaGetErrorString(err));
             (void)cudaGetLastError();
             return 0;
         }
@@ -720,7 +720,7 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
             const int direct_errno = errno;
             if (direct_errno == EINVAL || direct_errno == EFAULT || direct_errno == ENOTSUP || direct_errno == EOPNOTSUPP) {
                 if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-                    fprintf(stderr, "ds4: CUDA direct model read disabled: %s\n", strerror(direct_errno));
+                    fprintf(stderr, "pulsar: CUDA direct model read disabled: %s\n", strerror(direct_errno));
                 }
                 (void)close(g_model_direct_fd);
                 g_model_direct_fd = -1;
@@ -818,7 +818,7 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
     if (err != cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA model arena alloc failed for %s (%.2f MiB chunk): %s\n",
+        fprintf(stderr, "pulsar: CUDA model arena alloc failed for %s (%.2f MiB chunk): %s\n",
                 what ? what : "weights",
                 (double)chunk / 1048576.0,
                 cudaGetErrorString(err));
@@ -830,7 +830,7 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
         uint64_t arena_bytes = 0;
         for (const cuda_model_arena &a : g_model_arenas) arena_bytes += a.bytes;
-        fprintf(stderr, "ds4: CUDA model arena allocated %.2f MiB (arenas %.2f GiB)\n",
+        fprintf(stderr, "pulsar: CUDA model arena allocated %.2f MiB (arenas %.2f GiB)\n",
                 (double)chunk / 1048576.0,
                 (double)arena_bytes / 1073741824.0);
     }
@@ -862,7 +862,7 @@ static const char *cuda_model_range_ptr_from_fd(
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
         if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-            fprintf(stderr, "ds4: CUDA direct %s %.2f MiB (cache budget %.2f GiB exhausted)\n",
+            fprintf(stderr, "pulsar: CUDA direct %s %.2f MiB (cache budget %.2f GiB exhausted)\n",
                     what ? what : "weights",
                     (double)bytes / 1048576.0,
                     (double)limit / 1073741824.0);
@@ -889,7 +889,7 @@ static const char *cuda_model_range_ptr_from_fd(
         if (chunk_idx >= 4u) {
             err = cudaEventSynchronize(g_model_stage_event[bi]);
             if (err != cudaSuccess) {
-                fprintf(stderr, "ds4: CUDA model staging wait failed for %s: %s\n",
+                fprintf(stderr, "pulsar: CUDA model staging wait failed for %s: %s\n",
                         what ? what : "weights", cudaGetErrorString(err));
                 (void)cudaGetLastError();
                 return NULL;
@@ -898,7 +898,7 @@ static const char *cuda_model_range_ptr_from_fd(
         const char *payload = NULL;
         if (!cuda_model_stage_read(g_model_stage[bi], g_model_stage_bytes,
                                    offset + copied, n, &payload)) {
-            fprintf(stderr, "ds4: CUDA model range read failed for %s at %.2f MiB: %s\n",
+            fprintf(stderr, "pulsar: CUDA model range read failed for %s at %.2f MiB: %s\n",
                     what ? what : "weights",
                     (double)copied / 1048576.0,
                     strerror(errno));
@@ -907,7 +907,7 @@ static const char *cuda_model_range_ptr_from_fd(
         err = cudaMemcpyAsync(dev + copied, payload, (size_t)n,
                               cudaMemcpyHostToDevice, g_model_upload_stream);
         if (err != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA model range copy failed for %s at %.2f MiB: %s\n",
+            fprintf(stderr, "pulsar: CUDA model range copy failed for %s at %.2f MiB: %s\n",
                     what ? what : "weights",
                     (double)copied / 1048576.0,
                     cudaGetErrorString(err));
@@ -916,7 +916,7 @@ static const char *cuda_model_range_ptr_from_fd(
         }
         err = cudaEventRecord(g_model_stage_event[bi], g_model_upload_stream);
         if (err != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA model staging record failed for %s: %s\n",
+            fprintf(stderr, "pulsar: CUDA model staging record failed for %s: %s\n",
                     what ? what : "weights", cudaGetErrorString(err));
             (void)cudaGetLastError();
             return NULL;
@@ -929,7 +929,7 @@ static const char *cuda_model_range_ptr_from_fd(
     }
     err = cudaStreamSynchronize(g_model_upload_stream);
     if (err != cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA model range upload sync failed for %s: %s\n",
+        fprintf(stderr, "pulsar: CUDA model range upload sync failed for %s: %s\n",
                 what ? what : "weights", cudaGetErrorString(err));
         (void)cudaGetLastError();
         return NULL;
@@ -940,7 +940,7 @@ static const char *cuda_model_range_ptr_from_fd(
     g_model_range_bytes += bytes;
     cuda_model_load_progress_note(g_model_range_bytes);
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-        fprintf(stderr, "ds4: CUDA fd-cached %s %.2f MiB (total %.2f GiB)\n",
+        fprintf(stderr, "pulsar: CUDA fd-cached %s %.2f MiB (total %.2f GiB)\n",
                 what ? what : "weights",
                 (double)bytes / 1048576.0,
                 (double)g_model_range_bytes / 1073741824.0);
@@ -964,19 +964,19 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
     const double t0 = cuda_wall_sec();
     cudaError_t err = cudaMalloc(&dev, (size_t)model_size);
     if (err != cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA model allocation skipped: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "pulsar: CUDA model allocation skipped: %s\n", cudaGetErrorString(err));
         (void)cudaGetLastError();
         return 0;
     }
 
-    fprintf(stderr, "ds4: CUDA chunk-copying %.2f GiB model image\n",
+    fprintf(stderr, "pulsar: CUDA chunk-copying %.2f GiB model image\n",
             (double)model_size / 1073741824.0);
 
     const uint64_t chunk = cuda_model_copy_chunk_bytes();
     void *stage = NULL;
     err = cudaMallocHost(&stage, (size_t)chunk);
     if (err != cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA pinned model staging allocation failed: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "pulsar: CUDA pinned model staging allocation failed: %s\n", cudaGetErrorString(err));
         (void)cudaFree(dev);
         (void)cudaGetLastError();
         return 0;
@@ -989,7 +989,7 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
             memcpy(stage, (const char *)model_map + copied_header, (size_t)n);
             err = cudaMemcpy((char *)dev + copied_header, stage, (size_t)n, cudaMemcpyHostToDevice);
             if (err != cudaSuccess) {
-                fprintf(stderr, "ds4: CUDA model header copy failed: %s\n", cudaGetErrorString(err));
+                fprintf(stderr, "pulsar: CUDA model header copy failed: %s\n", cudaGetErrorString(err));
                 (void)cudaFreeHost(stage);
                 (void)cudaFree(dev);
                 (void)cudaGetLastError();
@@ -1007,7 +1007,7 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
         memcpy(stage, (const char *)model_map + off, (size_t)n);
         err = cudaMemcpy((char *)dev + off, stage, (size_t)n, cudaMemcpyHostToDevice);
         if (err != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA model chunk copy failed at %.2f GiB: %s\n",
+            fprintf(stderr, "pulsar: CUDA model chunk copy failed at %.2f GiB: %s\n",
                     (double)copied / 1073741824.0, cudaGetErrorString(err));
             (void)cudaFreeHost(stage);
             (void)cudaFree(dev);
@@ -1018,7 +1018,7 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
         copied += n;
         const double now = cuda_wall_sec();
         if (getenv("DS4_CUDA_MODEL_COPY_VERBOSE") != NULL && now - last_report >= 2.0) {
-            fprintf(stderr, "ds4: CUDA model chunk copy %.2f/%.2f GiB\n",
+            fprintf(stderr, "pulsar: CUDA model chunk copy %.2f/%.2f GiB\n",
                     (double)copied / 1073741824.0,
                     (double)map_size / 1073741824.0);
             last_report = now;
@@ -1031,7 +1031,7 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
     g_model_hmm_direct = 0;
     const double t1 = cuda_wall_sec();
     fprintf(stderr,
-            "ds4: CUDA model chunk copy complete in %.3fs (%.2f GiB tensors)\n",
+            "pulsar: CUDA model chunk copy complete in %.3fs (%.2f GiB tensors)\n",
             t1 - t0,
             (double)map_size / 1073741824.0);
     return 1;
@@ -1064,13 +1064,13 @@ static void cuda_model_range_release_all(void) {
 
 int cublas_ok(cublasStatus_t st, const char *what) {
     if (st == CUBLAS_STATUS_SUCCESS) return 1;
-    fprintf(stderr, "ds4: cuBLAS %s failed: status %d\n", what, (int)st);
+    fprintf(stderr, "pulsar: cuBLAS %s failed: status %d\n", what, (int)st);
     return 0;
 }
 
 
 
-/* Wrong-arch build trap (registration block at the bottom of ds4_gpu.h):
+/* Wrong-arch build trap (registration block at the bottom of pulsar_gpu.h):
  * every nvcc-compiled TU must carry device code for this GPU's SM family
  * (same SM major — sm_120f serves every sm_12x device, so the family match
  * cannot false-positive on the correct GB10 build).  Walk the registered TUs
@@ -1078,13 +1078,13 @@ int cublas_ok(cublasStatus_t st, const char *what) {
  * instead of dying mid-run in an opaque device assert. */
 static int cuda_tu_archs_ok(const cudaDeviceProp *prop) {
 #ifdef __CUDA_ARCH_LIST__
-    for (const ds4_tu_archs *r = ds4_tu_archs_head; r; r = r->next) {
+    for (const pulsar_tu_archs *r = pulsar_tu_archs_head; r; r = r->next) {
         int ok = 0;
         for (int i = 0; i < r->n_archs; i++)
             if (r->archs[i] / 100 == prop->major) ok = 1;
         if (!ok) {
             fprintf(stderr,
-                    "ds4: wrong-arch build: %s was compiled for sm_%d but this GPU "
+                    "pulsar: wrong-arch build: %s was compiled for sm_%d but this GPU "
                     "(%s) is sm_%d%d — rebuild with `make cuda-spark` (a plain "
                     "`make` drops CUDA_ARCH=sm_120f)\n",
                     r->file, r->n_archs > 0 ? r->archs[0] / 10 : 0,
@@ -1100,12 +1100,12 @@ static int cuda_tu_archs_ok(const cudaDeviceProp *prop) {
 
 
 
-int ds4_gpu_init(void) {
+int pulsar_gpu_init(void) {
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d)\n",
+        fprintf(stderr, "pulsar: CUDA backend initialized on %s (sm_%d%d)\n",
                 prop.name, prop.major, prop.minor);
         if (!cuda_tu_archs_ok(&prop)) return 0;
     }
@@ -1127,7 +1127,7 @@ int ds4_gpu_init(void) {
 
 
 
-void ds4_gpu_cleanup(void) {
+void pulsar_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
     if (g_decode_graph_exec) {
         (void)cudaGraphExecDestroy(g_decode_graph_exec);
@@ -1200,22 +1200,22 @@ __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
 
 
 
-/* Running total of live ds4_gpu_tensor_alloc/_managed bytes (views excluded:
+/* Running total of live pulsar_gpu_tensor_alloc/_managed bytes (views excluded:
  * they don't own memory).  This is the ground truth the server's per-session
- * memory ledger reconciles against (ds4_session_create snapshots it around the
+ * memory ledger reconciles against (pulsar_session_create snapshots it around the
  * graph allocation), catching drift between the sizing estimate and what the
  * allocator really did.  Atomic because drafter conf/token staging tensors are
  * allocated per spec step; one relaxed add is noise next to the cudaMalloc it
  * accompanies. */
 static uint64_t g_tensor_alloc_bytes;
 
-uint64_t ds4_gpu_tensor_alloc_bytes_current(void) {
+uint64_t pulsar_gpu_tensor_alloc_bytes_current(void) {
     return __atomic_load_n(&g_tensor_alloc_bytes, __ATOMIC_RELAXED);
 }
 
-ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
+pulsar_gpu_tensor *pulsar_gpu_tensor_alloc(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
-    ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
+    pulsar_gpu_tensor *t = (pulsar_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
     if (!cuda_ok(cudaMalloc(&t->ptr, (size_t)bytes), "tensor alloc")) {
         free(t);
@@ -1229,9 +1229,9 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
 
 
 
-ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
+pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_managed(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
-    ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
+    pulsar_gpu_tensor *t = (pulsar_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
     if (!cuda_ok(cudaMallocManaged(&t->ptr, (size_t)bytes), "managed tensor alloc")) {
         free(t);
@@ -1256,7 +1256,7 @@ static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
 
 
 
-int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
+int pulsar_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
     if (kv_cache_bytes == 0) return 0;
 
     /* Very large KV caches are where device-only cudaMalloc() can make a
@@ -1285,9 +1285,9 @@ int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t contex
 
 
 
-ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
+pulsar_gpu_tensor *pulsar_gpu_tensor_view(const pulsar_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
     if (!base || offset > base->bytes || bytes > base->bytes - offset) return NULL;
-    ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
+    pulsar_gpu_tensor *t = (pulsar_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
     t->ptr = (char *)base->ptr + offset;
     t->bytes = bytes;
@@ -1297,7 +1297,7 @@ ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset,
 
 
 
-void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
+void pulsar_gpu_tensor_free(pulsar_gpu_tensor *tensor) {
     if (!tensor) return;
     if (tensor->owner && tensor->ptr) {
         (void)cudaFree(tensor->ptr);
@@ -1308,13 +1308,13 @@ void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
 
 
 
-uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
+uint64_t pulsar_gpu_tensor_bytes(const pulsar_gpu_tensor *tensor) {
     return tensor ? tensor->bytes : 0;
 }
 
 
 
-void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
+void *pulsar_gpu_tensor_contents(pulsar_gpu_tensor *tensor) {
     if (!tensor) return NULL;
     (void)cudaDeviceSynchronize();
     return tensor->ptr;
@@ -1325,13 +1325,13 @@ void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
 /* Raw device pointer WITHOUT a synchronize — for building device pointer tables
  * (Tier-2 per-bank comp/index base tables) at allocation time, where the caller
  * controls ordering. Do NOT use to read tensor contents on the host. */
-void *ds4_gpu_tensor_device_ptr(const ds4_gpu_tensor *tensor) {
+void *pulsar_gpu_tensor_device_ptr(const pulsar_gpu_tensor *tensor) {
     return tensor ? tensor->ptr : NULL;
 }
 
 
 
-int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {
+int pulsar_gpu_tensor_fill_f32(pulsar_gpu_tensor *tensor, float value, uint64_t count) {
     if (!tensor || count > tensor->bytes / sizeof(float)) return 0;
     if (count == 0) return 1;
     fill_f32_kernel<<<(count + 255u) / 256u, 256>>>((float *)tensor->ptr, count, value);
@@ -1340,14 +1340,14 @@ int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count)
 
 
 
-int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
+int pulsar_gpu_tensor_write(pulsar_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     return cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes, cudaMemcpyHostToDevice), "tensor write");
 }
 
 
 
-int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
+int pulsar_gpu_tensor_read(const pulsar_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");
 }
@@ -1355,8 +1355,8 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
 
 
 
-int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
-                                     const ds4_gpu_tensor *src, uint64_t src_offset,
+int pulsar_gpu_tensor_copy(pulsar_gpu_tensor *dst, uint64_t dst_offset,
+                                     const pulsar_gpu_tensor *src, uint64_t src_offset,
                                      uint64_t bytes) {
     if (!dst || !src || dst_offset > dst->bytes || src_offset > src->bytes ||
         bytes > dst->bytes - dst_offset || bytes > src->bytes - src_offset) {
@@ -1382,12 +1382,12 @@ typedef struct {
     void *dst;
     const void *src;
     uint64_t bytes;
-} ds4_copy_desc;
+} pulsar_copy_desc;
 
-__global__ static void batched_copy_kernel(const ds4_copy_desc *descs, uint32_t n_descs) {
+__global__ static void batched_copy_kernel(const pulsar_copy_desc *descs, uint32_t n_descs) {
     const uint32_t d = blockIdx.y;
     if (d >= n_descs) return;
-    const ds4_copy_desc dc = descs[d];
+    const pulsar_copy_desc dc = descs[d];
     const uint64_t n16 = dc.bytes >> 4;
     for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
          i < n16;
@@ -1396,13 +1396,13 @@ __global__ static void batched_copy_kernel(const ds4_copy_desc *descs, uint32_t 
     }
 }
 
-void *ds4_gpu_batched_copy_prepare(
-        ds4_gpu_tensor **dst,
-        ds4_gpu_tensor **src,
+void *pulsar_gpu_batched_copy_prepare(
+        pulsar_gpu_tensor **dst,
+        pulsar_gpu_tensor **src,
         const uint64_t *bytes,
         uint32_t n) {
     if (!dst || !src || !bytes || n == 0) return NULL;
-    ds4_copy_desc *h = (ds4_copy_desc *)malloc(n * sizeof(ds4_copy_desc));
+    pulsar_copy_desc *h = (pulsar_copy_desc *)malloc(n * sizeof(pulsar_copy_desc));
     if (!h) return NULL;
     for (uint32_t i = 0; i < n; i++) {
         if (!dst[i] || !src[i] || !dst[i]->ptr || !src[i]->ptr ||
@@ -1415,9 +1415,9 @@ void *ds4_gpu_batched_copy_prepare(
         h[i].src = src[i]->ptr;
         h[i].bytes = bytes[i];
     }
-    ds4_copy_desc *d = NULL;
-    if (cudaMalloc(&d, n * sizeof(ds4_copy_desc)) != cudaSuccess) { free(h); return NULL; }
-    if (!cuda_ok(cudaMemcpy(d, h, n * sizeof(ds4_copy_desc), cudaMemcpyHostToDevice),
+    pulsar_copy_desc *d = NULL;
+    if (cudaMalloc(&d, n * sizeof(pulsar_copy_desc)) != cudaSuccess) { free(h); return NULL; }
+    if (!cuda_ok(cudaMemcpy(d, h, n * sizeof(pulsar_copy_desc), cudaMemcpyHostToDevice),
                  "batched copy descs")) {
         cudaFree(d);
         free(h);
@@ -1427,26 +1427,26 @@ void *ds4_gpu_batched_copy_prepare(
     return d;
 }
 
-void ds4_gpu_batched_copy_free(void *handle) {
+void pulsar_gpu_batched_copy_free(void *handle) {
     if (handle) cudaFree(handle);
 }
 
-int ds4_gpu_batched_copy_run(void *handle, uint32_t n_descs, uint64_t max_bytes) {
+int pulsar_gpu_batched_copy_run(void *handle, uint32_t n_descs, uint64_t max_bytes) {
     if (!handle || n_descs == 0) return 0;
     uint32_t chunks = (uint32_t)(((max_bytes >> 4) + 255) / 256);
     if (chunks < 1u) chunks = 1u;
     if (chunks > 64u) chunks = 64u;
     dim3 grid(chunks, n_descs);
-    batched_copy_kernel<<<grid, 256>>>((const ds4_copy_desc *)handle, n_descs);
+    batched_copy_kernel<<<grid, 256>>>((const pulsar_copy_desc *)handle, n_descs);
     return cuda_ok(cudaGetLastError(), "batched copy launch");
 }
 
 
 
-int ds4_gpu_begin_commands(void) { return 1; }
+int pulsar_gpu_begin_commands(void) { return 1; }
 
 
-int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
+int pulsar_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 
 
 /* =========================================================================
@@ -1459,10 +1459,10 @@ int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flus
  * mallocs execute immediately and are not part of the graph), then reuse one
  * instantiated exec via cudaGraphExecUpdate — instantiation only happens
  * again when the topology changes (context-tier boundaries). Opt-in via
- * DS4_CUDA_GRAPHS=1; see the note in ds4_gpu_decode_graph_begin.
+ * PULSAR_CUDA_GRAPHS=1; see the note in pulsar_gpu_decode_graph_begin.
  * ========================================================================= */
-int ds4_gpu_decode_graph_begin(void) {
-    /* Opt-in (DS4_CUDA_GRAPHS=1): capture-per-token measured ~2% SLOWER than
+int pulsar_gpu_decode_graph_begin(void) {
+    /* Opt-in (PULSAR_CUDA_GRAPHS=1): capture-per-token measured ~2% SLOWER than
      * direct submission (ExecUpdate on a ~500-node graph outweighs the
      * launch-gap savings when the tape is re-encoded every token anyway).
      * The capture path is kept as working infrastructure for the follow-up
@@ -1474,7 +1474,7 @@ int ds4_gpu_decode_graph_begin(void) {
                                cudaStreamCaptureModeRelaxed) != cudaSuccess) {
         (void)cudaGetLastError();
         fprintf(stderr,
-                "ds4: CUDA decode graph capture unavailable; using direct submission\n");
+                "pulsar: CUDA decode graph capture unavailable; using direct submission\n");
         g_decode_graphs_off = 1;
         return 0;
     }
@@ -1482,7 +1482,7 @@ int ds4_gpu_decode_graph_begin(void) {
     return 1;
 }
 
-int ds4_gpu_decode_graph_end(void) {
+int pulsar_gpu_decode_graph_end(void) {
     if (!g_decode_graph_capturing) return 0;
     g_decode_graph_capturing = 0;
     cudaGraph_t graph = NULL;
@@ -1513,20 +1513,20 @@ int ds4_gpu_decode_graph_end(void) {
                          "decode graph sync");
     if (ok && getenv("DS4_CUDA_GRAPH_STATS") != NULL &&
         (g_decode_graph_updates + g_decode_graph_instantiates) % 256 == 0) {
-        fprintf(stderr, "ds4: decode graphs: %llu updates, %llu instantiates\n",
+        fprintf(stderr, "pulsar: decode graphs: %llu updates, %llu instantiates\n",
                 (unsigned long long)g_decode_graph_updates,
                 (unsigned long long)g_decode_graph_instantiates);
     }
     return ok;
 }
 
-int ds4_gpu_end_commands(void) {
+int pulsar_gpu_end_commands(void) {
     cuda_model_load_progress_finish();
     return cuda_ok(cudaDeviceSynchronize(), "end commands");
 }
 
 
-int ds4_gpu_synchronize(void) {
+int pulsar_gpu_synchronize(void) {
     cuda_model_load_progress_finish();
     return cuda_ok(cudaDeviceSynchronize(), "synchronize");
 }
@@ -1569,7 +1569,7 @@ static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
 
 
 
-int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
+int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!cuda_model_set_host_map(model_map, model_size)) return 0;
 
     const char *copy_env = getenv("DS4_CUDA_COPY_MODEL");
@@ -1578,21 +1578,21 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
         const double t0 = clock() / (double)CLOCKS_PER_SEC;
         cudaError_t err = cudaMalloc(&dev, (size_t)model_size);
         if (err == cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA copying %.2f GiB model to device memory\n",
+            fprintf(stderr, "pulsar: CUDA copying %.2f GiB model to device memory\n",
                     (double)model_size / 1073741824.0);
             err = cudaMemcpy(dev, model_map, (size_t)model_size, cudaMemcpyHostToDevice);
             if (err == cudaSuccess) {
                 g_model_device_base = (const char *)dev;
                 g_model_device_owned = 1;
                 const double t1 = clock() / (double)CLOCKS_PER_SEC;
-                fprintf(stderr, "ds4: CUDA model copy complete in %.3fs\n", t1 - t0);
+                fprintf(stderr, "pulsar: CUDA model copy complete in %.3fs\n", t1 - t0);
                 return 1;
             }
-            fprintf(stderr, "ds4: CUDA model copy failed: %s\n", cudaGetErrorString(err));
+            fprintf(stderr, "pulsar: CUDA model copy failed: %s\n", cudaGetErrorString(err));
             (void)cudaFree(dev);
             (void)cudaGetLastError();
         } else {
-            fprintf(stderr, "ds4: CUDA model allocation skipped: %s\n", cudaGetErrorString(err));
+            fprintf(stderr, "pulsar: CUDA model allocation skipped: %s\n", cudaGetErrorString(err));
             (void)cudaGetLastError();
         }
     }
@@ -1609,19 +1609,19 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
         if (err == cudaSuccess && dev) {
             g_model_device_base = (const char *)dev;
             g_model_registered = 1;
-            fprintf(stderr, "ds4: CUDA registered %.2f GiB model mapping for device access\n",
+            fprintf(stderr, "pulsar: CUDA registered %.2f GiB model mapping for device access\n",
                     (double)model_size / 1073741824.0);
         } else {
-            fprintf(stderr, "ds4: CUDA host registration pointer lookup failed: %s\n", cudaGetErrorString(err));
+            fprintf(stderr, "pulsar: CUDA host registration pointer lookup failed: %s\n", cudaGetErrorString(err));
             (void)cudaGetLastError();
         }
     } else {
-        fprintf(stderr, "ds4: CUDA host registration skipped: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "pulsar: CUDA host registration skipped: %s\n", cudaGetErrorString(err));
         (void)cudaGetLastError();
         const uint64_t limit = cuda_model_local_model_limit_bytes();
         if (!cuda_model_cache_limit_explicit() && model_size > limit) {
             fprintf(stderr,
-                    "ds4: CUDA model %.2f GiB exceeds the default single-GPU "
+                    "pulsar: CUDA model %.2f GiB exceeds the default single-GPU "
                     "startup cache budget %.2f GiB; set "
                     "DS4_CUDA_WEIGHT_CACHE_LIMIT_GB explicitly if the model "
                     "plus scratch and KV still fit in memory\n",
@@ -1635,9 +1635,9 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
 
 
 
-int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
+int pulsar_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
     (void)max_tensor_bytes;
-    if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
+    if (!pulsar_gpu_set_model_map(model_map, model_size)) return 0;
     if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL &&
         !cuda_model_copy_chunked(model_map, model_size, map_offset, map_size)) {
         (void)cuda_model_prefetch_range(model_map, model_size, map_offset, map_size);
@@ -1648,7 +1648,7 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
 
 
 
-int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
+int pulsar_gpu_set_model_fd_for_map(int fd, const void *model_map) {
     g_model_fd = fd;
     g_model_fd_host_base = model_map;
     g_model_file_size = 0;
@@ -1672,11 +1672,11 @@ int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
                 g_model_direct_fd = direct_fd;
                 if (g_model_direct_align < 512) g_model_direct_align = 512;
                 if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-                    fprintf(stderr, "ds4: CUDA model direct I/O enabled (align=%llu)\n",
+                    fprintf(stderr, "pulsar: CUDA model direct I/O enabled (align=%llu)\n",
                             (unsigned long long)g_model_direct_align);
                 }
             } else if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-                fprintf(stderr, "ds4: CUDA model direct I/O unavailable: %s\n", strerror(errno));
+                fprintf(stderr, "pulsar: CUDA model direct I/O unavailable: %s\n", strerror(errno));
             }
         }
 #endif
@@ -1686,13 +1686,13 @@ int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
 
 
 
-int ds4_gpu_set_model_fd(int fd) {
-    return ds4_gpu_set_model_fd_for_map(fd, g_model_host_base);
+int pulsar_gpu_set_model_fd(int fd) {
+    return pulsar_gpu_set_model_fd_for_map(fd, g_model_host_base);
 }
 
 
 
-int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
+int pulsar_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
     if (cuda_model_range_is_cached(model_map, offset, bytes)) return 1;
@@ -1701,7 +1701,7 @@ int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64
     if (!ptr || !cuda_model_range_is_cached(model_map, offset, bytes)) {
         if (!g_model_mapping_failure_notice_printed) {
             fprintf(stderr,
-                    "ds4: CUDA failed to prepare model tensor spans for device access\n");
+                    "pulsar: CUDA failed to prepare model tensor spans for device access\n");
             g_model_mapping_failure_notice_printed = 1;
         }
         return 0;
@@ -1717,7 +1717,7 @@ int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64
  * fd through a pinned staging buffer, then registered in g_model_ranges under
  * the overlay's host map so cuda_model_range_ptr resolves them like any other
  * cached range. Runs at startup only (synchronous). */
-int ds4_gpu_cache_external_range(const void *host_base_key, int fd,
+int pulsar_gpu_cache_external_range(const void *host_base_key, int fd,
                                             uint64_t offset, uint64_t bytes,
                                             const char *label) {
     if (!host_base_key || fd < 0 || bytes == 0) return 0;
@@ -1725,7 +1725,7 @@ int ds4_gpu_cache_external_range(const void *host_base_key, int fd,
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)bytes);
     if (err != cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA overlay range alloc failed for %s (%.2f MiB): %s\n",
+        fprintf(stderr, "pulsar: CUDA overlay range alloc failed for %s (%.2f MiB): %s\n",
                 label ? label : "overlay", (double)bytes / 1048576.0,
                 cudaGetErrorString(err));
         (void)cudaGetLastError();
@@ -1736,7 +1736,7 @@ int ds4_gpu_cache_external_range(const void *host_base_key, int fd,
     void *stage = NULL;
     err = cudaMallocHost(&stage, (size_t)(bytes < chunk ? bytes : chunk));
     if (err != cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA overlay staging alloc failed: %s\n",
+        fprintf(stderr, "pulsar: CUDA overlay staging alloc failed: %s\n",
                 cudaGetErrorString(err));
         (void)cudaFree(dev);
         (void)cudaGetLastError();
@@ -1750,7 +1750,7 @@ int ds4_gpu_cache_external_range(const void *host_base_key, int fd,
             const ssize_t r = pread(fd, (char *)stage + got, (size_t)(n - got),
                                     (off_t)(offset + done + got));
             if (r <= 0) {
-                fprintf(stderr, "ds4: CUDA overlay read failed for %s at %.2f MiB: %s\n",
+                fprintf(stderr, "pulsar: CUDA overlay read failed for %s at %.2f MiB: %s\n",
                         label ? label : "overlay", (double)(done + got) / 1048576.0,
                         r == 0 ? "unexpected EOF" : strerror(errno));
                 (void)cudaFreeHost(stage);
@@ -1761,7 +1761,7 @@ int ds4_gpu_cache_external_range(const void *host_base_key, int fd,
         }
         err = cudaMemcpy((char *)dev + done, stage, (size_t)n, cudaMemcpyHostToDevice);
         if (err != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA overlay upload failed for %s at %.2f MiB: %s\n",
+            fprintf(stderr, "pulsar: CUDA overlay upload failed for %s at %.2f MiB: %s\n",
                     label ? label : "overlay", (double)done / 1048576.0,
                     cudaGetErrorString(err));
             (void)cudaFreeHost(stage);
@@ -1782,7 +1782,7 @@ int ds4_gpu_cache_external_range(const void *host_base_key, int fd,
 
 
 
-void ds4_gpu_mem_info(uint64_t *free_out, uint64_t *total_out) {
+void pulsar_gpu_mem_info(uint64_t *free_out, uint64_t *total_out) {
     size_t free_b = 0, total_b = 0;
     (void)cudaMemGetInfo(&free_b, &total_b);
     if (free_out) *free_out = (uint64_t)free_b;
@@ -1791,16 +1791,16 @@ void ds4_gpu_mem_info(uint64_t *free_out, uint64_t *total_out) {
 
 
 
-void ds4_gpu_print_memory_report(const char *label) {
+void pulsar_gpu_print_memory_report(const char *label) {
     size_t free_b = 0, total_b = 0;
     (void)cudaMemGetInfo(&free_b, &total_b);
-    fprintf(stderr, "ds4: CUDA memory report %s: free %.2f MiB total %.2f MiB\n",
+    fprintf(stderr, "pulsar: CUDA memory report %s: free %.2f MiB total %.2f MiB\n",
             label ? label : "", (double)free_b / 1048576.0, (double)total_b / 1048576.0);
 }
 
 
 
-void ds4_gpu_set_quality(bool quality) {
+void pulsar_gpu_set_quality(bool quality) {
     g_quality_mode = quality ? 1 : 0;
     if (g_cublas_ready) {
         const cublasMath_t math_mode =

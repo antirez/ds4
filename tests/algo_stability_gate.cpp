@@ -10,7 +10,7 @@
  *
  * METHOD: bank 0 is the fixed TARGET. Populate banks 0..M-1 from distinct prompts
  * (per-bank isolation means bank 0's output depends only on bank 0's KV), then run
- * ONE batched step through ds4_session_decode_mixed at width M and capture bank 0's
+ * ONE batched step through pulsar_session_decode_mixed at width M and capture bank 0's
  * logit row. Repeat for M in {1,2,4,5,8} on a FRESH session each time (no
  * idempotency/poisoning artifacts). Bank 0's prompt/pos/token are identical every
  * time; only M (and which OTHER banks pad the batch) changes.
@@ -24,20 +24,20 @@
  * The first differing float index + the two values are printed so a real algo
  * divergence (large, systematic) is never hidden behind a pass/fail bit.
  *
- * Run pack on/off + idx-fp4 on/off (DS4_ATTN_PACK / DS4_IDX_FP4) via the harness.
- * MODEL-DEPENDENT, needs DS4_MSEQ_BANKS>=8. Run under GPU discipline.
- *   usage: DS4_MSEQ_BANKS=8 ./tests/algo_stability_gate MODEL
+ * Run pack on/off + idx-fp4 on/off (PULSAR_ATTN_PACK / PULSAR_IDX_FP4) via the harness.
+ * MODEL-DEPENDENT, needs PULSAR_MSEQ_BANKS>=8. Run under GPU discipline.
+ *   usage: PULSAR_MSEQ_BANKS=8 ./tests/algo_stability_gate MODEL
  */
-#include "ds4.h"
-#include "ds4_engine_internal.h"
+#include "pulsar.h"
+#include "pulsar_engine_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define GATE_MAX_N 8
-static ds4_engine *g_e;
-static ds4_tokens g_toks;
+static pulsar_engine *g_e;
+static pulsar_tokens g_toks;
 static int g_fail;
 
 static const int g_prompt_off[GATE_MAX_N] = {0, 401, 907, 233, 601, 811, 101, 499};
@@ -52,7 +52,7 @@ static char *read_file(const char *path, size_t *len_out) {
     fclose(fp); buf[n] = '\0'; if (len_out) *len_out = (size_t)n; return buf;
 }
 
-static bool make_prompt(int k, ds4_tokens *p) {
+static bool make_prompt(int k, pulsar_tokens *p) {
     memset(p, 0, sizeof(*p));
     const int off = g_prompt_off[k], len = g_prompt_len[k];
     if (off + len > g_toks.len) return false;
@@ -64,12 +64,12 @@ static bool make_prompt(int k, ds4_tokens *p) {
 }
 
 /* Run ONE batched decode step at width M on a fresh session; copy bank 0's logit
- * row (DS4_N_VOCAB floats) into row0_out. Returns false on any engine failure. */
+ * row (PULSAR_N_VOCAB floats) into row0_out. Returns false on any engine failure. */
 static bool bank0_logits_at_width(int M, float *row0_out) {
-    ds4_session *s = NULL;
-    if (ds4_session_create(&s, g_e, 4096) != 0) return false;
-    ds4_gpu_graph *g = &s->graph;
-    const int vocab = (int)DS4_N_VOCAB;
+    pulsar_session *s = NULL;
+    if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
+    pulsar_gpu_graph *g = &s->graph;
+    const int vocab = (int)PULSAR_N_VOCAB;
     bool ok = (int)gpu_graph_bank_pool_count(g) >= M;
     if (!ok) fprintf(stderr, "pool too small: %u < %d (set DS4_MSEQ_BANKS)\n",
                      gpu_graph_bank_pool_count(g), M);
@@ -77,31 +77,31 @@ static bool bank0_logits_at_width(int M, float *row0_out) {
     int argtok[GATE_MAX_N];
     for (int k = 0; ok && k < M; k++) {
         if (g->banks.n_banks && !gpu_graph_bank_repoint(g, (uint32_t)k)) { ok = false; break; }
-        ds4_session_invalidate(s);
-        ds4_tokens p;
+        pulsar_session_invalidate(s);
+        pulsar_tokens p;
         ok = make_prompt(k, &p);
-        if (ok && ds4_session_sync(s, &p, err, sizeof err) != 0) {
+        if (ok && pulsar_session_sync(s, &p, err, sizeof err) != 0) {
             fprintf(stderr, "populate bank %d failed: %s\n", k, err); ok = false;
         }
-        if (ok) { gpu_graph_bank_counters_capture(g, (uint32_t)k); argtok[k] = ds4_session_argmax(s); }
-        ds4_tokens_free(&p);
+        if (ok) { gpu_graph_bank_counters_capture(g, (uint32_t)k); argtok[k] = pulsar_session_argmax(s); }
+        pulsar_tokens_free(&p);
     }
     float *logits = ok ? (float *)malloc((size_t)M * vocab * sizeof(float)) : NULL;
     if (ok && !logits) ok = false;
     if (ok) {
-        ds4_multiseq_req reqs[GATE_MAX_N];
+        pulsar_multiseq_req reqs[GATE_MAX_N];
         for (int k = 0; k < M; k++) {
             reqs[k].bank = (uint32_t)k;
             reqs[k].pos = g_prompt_len[k];      /* bank 0 ALWAYS at the same pos */
             reqs[k].token = argtok[k];
         }
-        const int rc = ds4_session_decode_mixed(s, reqs, (uint32_t)M, logits,
+        const int rc = pulsar_session_decode_mixed(s, reqs, (uint32_t)M, logits,
                                                 M * vocab, NULL, 0u, err, sizeof err);
         if (rc != 0) { fprintf(stderr, "decode_mixed(M=%d) failed rc=%d: %s\n", M, rc, err); ok = false; }
         else memcpy(row0_out, logits, (size_t)vocab * sizeof(float));  /* row 0 == bank 0 */
     }
     free(logits);
-    ds4_session_free(s);
+    pulsar_session_free(s);
     return ok;
 }
 
@@ -113,9 +113,9 @@ static long first_diff(const float *a, const float *b, long n) {
 
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL\n", argv[0]); return 2; }
-    ds4_engine_options opt; memset(&opt, 0, sizeof opt);
-    opt.model_path = argv[1]; opt.backend = DS4_BACKEND_CUDA;
-    if (ds4_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
+    pulsar_engine_options opt; memset(&opt, 0, sizeof opt);
+    opt.model_path = argv[1]; opt.backend = PULSAR_BACKEND_CUDA;
+    if (pulsar_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
     printf("CONFIG: DS4_ATTN_PACK=%s DS4_IDX_FP4=%s\n",
            getenv("DS4_ATTN_PACK") ? getenv("DS4_ATTN_PACK") : "(unset)",
            getenv("DS4_IDX_FP4") ? getenv("DS4_IDX_FP4") : "(unset)");
@@ -123,13 +123,13 @@ int main(int argc, char **argv) {
     size_t tl = 0; char *text = read_file("tests/long_context_story_prompt.txt", &tl);
     if (!text) { fprintf(stderr, "prompt read failed\n"); return 1; }
     memset(&g_toks, 0, sizeof g_toks);
-    ds4_tokenize_text(g_e, text, &g_toks); free(text);
+    pulsar_tokenize_text(g_e, text, &g_toks); free(text);
     int need = 0;
     for (int k = 0; k < GATE_MAX_N; k++)
         if (g_prompt_off[k] + g_prompt_len[k] > need) need = g_prompt_off[k] + g_prompt_len[k];
     if (g_toks.len < need) { fprintf(stderr, "prompt too short (%d<%d)\n", g_toks.len, need); return 1; }
 
-    const int vocab = (int)DS4_N_VOCAB;
+    const int vocab = (int)PULSAR_N_VOCAB;
     const int widths[] = {1, 2, 4, 5, 8};
     const int nW = (int)(sizeof(widths) / sizeof(widths[0]));
     float *row[8]; memset(row, 0, sizeof row);
@@ -166,7 +166,7 @@ int main(int argc, char **argv) {
 
 done:
     for (int wi = 0; wi < 8; wi++) free(row[wi]);
-    ds4_engine_close(g_e);
+    pulsar_engine_close(g_e);
     if (g_fail) { fprintf(stderr, "ALGO-STABILITY GATE: FAIL\n"); return 1; }
     printf("ALGO-STABILITY GATE: PASS\n");
     return 0;

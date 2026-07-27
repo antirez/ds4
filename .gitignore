@@ -25,6 +25,14 @@ __pycache__/
 /converter/*_test
 /converter/__pycache__/
 /ds4_agent_test
+# Pulsar rebrand binary names (ds4-* entries above stay: transitional symlinks)
+/pulsar
+/pulsar-server
+/pulsar-bench
+/pulsar-eval
+/pulsar-agent
+/pulsar_test
+/pulsar_agent_test
 /tests/test_q4k_dot
 /tests/cuda_long_context_smoke
 /tests/multiseq_frontier_gate

@@ -1,32 +1,32 @@
-#include "ds4_server_internal.h"
+#include "pulsar_server_internal.h"
 
 
 
 
 kv_cache_options kv_cache_default_options(void) {
-    return ds4_kvstore_default_options();
+    return pulsar_kvstore_default_options();
 }
 
 
 
 void le_put32(uint8_t *p, uint32_t v) {
-    ds4_kvstore_le_put32(p, v);
+    pulsar_kvstore_le_put32(p, v);
 }
 
 
 
 
 static uint32_t le_get32(const uint8_t *p) {
-    return ds4_kvstore_le_get32(p);
+    return pulsar_kvstore_le_get32(p);
 }
 
 
 
 
-#ifdef DS4_SERVER_TEST
+#ifdef PULSAR_SERVER_TEST
 
 void sha1_bytes_hex(const void *ptr, size_t len, char out[41]) {
-    ds4_kvstore_sha1_bytes_hex(ptr, len, out);
+    pulsar_kvstore_sha1_bytes_hex(ptr, len, out);
 }
 
 
@@ -75,13 +75,13 @@ void collect_tool_call_ids(const chat_msgs *msgs, stop_list *ids) {
 
 
 static bool sha_hex_name(const char *name, char sha[41]) {
-    return ds4_kvstore_sha_hex_name(name, sha);
+    return pulsar_kvstore_sha_hex_name(name, sha);
 }
 
 
 
 char *path_join(const char *dir, const char *name) {
-    return ds4_kvstore_path_join(dir, name);
+    return pulsar_kvstore_path_join(dir, name);
 }
 
 
@@ -96,10 +96,10 @@ static const char *find_next_dsml_tool_block(const char *p, const char **end_out
         const char *start;
         const char *end;
     } forms[] = {
-        {"\n\n" DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_END},
-        {DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_END},
-        {"\n\n" DS4_TOOL_CALLS_START_SHORT, DS4_TOOL_CALLS_END_SHORT},
-        {DS4_TOOL_CALLS_START_SHORT, DS4_TOOL_CALLS_END_SHORT},
+        {"\n\n" PULSAR_TOOL_CALLS_START, PULSAR_TOOL_CALLS_END},
+        {PULSAR_TOOL_CALLS_START, PULSAR_TOOL_CALLS_END},
+        {"\n\n" PULSAR_TOOL_CALLS_START_SHORT, PULSAR_TOOL_CALLS_END_SHORT},
+        {PULSAR_TOOL_CALLS_START_SHORT, PULSAR_TOOL_CALLS_END_SHORT},
         {"\n\n<tool_calls>", "</tool_calls>"},
         {"<tool_calls>", "</tool_calls>"},
     };
@@ -248,7 +248,7 @@ int kv_tool_map_load_from_pos(server *s, FILE *fp, const stop_list *wanted) {
         uint32_t id_len = le_get32(lens);
         uint32_t dsml_len = le_get32(lens + 4);
         if (id_len == 0 || id_len > 256 || dsml_len == 0 ||
-            dsml_len > DS4_TOOL_MEMORY_MAX_BYTES) return loaded;
+            dsml_len > PULSAR_TOOL_MEMORY_MAX_BYTES) return loaded;
         char *id = (char *)server_xmalloc((size_t)id_len + 1);
         char *dsml = (char *)server_xmalloc((size_t)dsml_len + 1);
         bool ok = fread(id, 1, id_len, fp) == id_len &&
@@ -268,14 +268,14 @@ int kv_tool_map_load_from_pos(server *s, FILE *fp, const stop_list *wanted) {
 
 
 
-#ifdef DS4_SERVER_TEST
+#ifdef PULSAR_SERVER_TEST
 
 void kv_fill_header(uint8_t h[KV_CACHE_FIXED_HEADER], uint8_t quant_bits,
                            uint8_t reason, uint8_t ext_flags,
                            uint32_t tokens, uint32_t hits, uint32_t ctx_size,
                            uint64_t created_at, uint64_t last_used,
                            uint64_t payload_bytes) {
-    ds4_kvstore_fill_header(h, 0, quant_bits, reason, ext_flags, tokens, hits,
+    pulsar_kvstore_fill_header(h, 0, quant_bits, reason, ext_flags, tokens, hits,
                             ctx_size, created_at, last_used, payload_bytes);
 }
 
@@ -284,7 +284,7 @@ void kv_fill_header(uint8_t h[KV_CACHE_FIXED_HEADER], uint8_t quant_bits,
 
 
 static bool kv_read_header(FILE *fp, kv_entry *e, uint32_t *text_bytes) {
-    return ds4_kvstore_read_header(fp, e, text_bytes);
+    return pulsar_kvstore_read_header(fp, e, text_bytes);
 }
 
 
@@ -319,7 +319,7 @@ void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs)
     /* Tool replay payloads are stored next to KV checkpoints; keep them model
      * scoped too, since token positions and graph state are not portable across
      * Flash/Pro shapes even when the rendered chat text is identical. */
-    uint8_t model_id = s->engine ? (uint8_t)ds4_engine_model_id(s->engine) : 0;
+    uint8_t model_id = s->engine ? (uint8_t)pulsar_engine_model_id(s->engine) : 0;
 
     DIR *d = opendir(s->kv.dir);
     if (!d) {
@@ -361,35 +361,35 @@ void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs)
 
 
 
-#ifdef DS4_SERVER_TEST
+#ifdef PULSAR_SERVER_TEST
 
-double kv_entry_eviction_score(const kv_entry *e, const ds4_tokens *live,
+double kv_entry_eviction_score(const kv_entry *e, const pulsar_tokens *live,
                                       uint64_t now,
-                                      const ds4_kvstore_eviction_context *incoming) {
-    return ds4_kvstore_entry_eviction_score(e, live, now, incoming);
+                                      const pulsar_kvstore_eviction_context *incoming) {
+    return pulsar_kvstore_entry_eviction_score(e, live, now, incoming);
 }
 
 
 #endif
 
 
-#ifdef DS4_SERVER_TEST
+#ifdef PULSAR_SERVER_TEST
 
-void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live,
+void kv_cache_evict(kv_disk_cache *kc, const pulsar_tokens *live,
                            uint64_t extra_bytes,
-                           const ds4_kvstore_eviction_context *incoming) {
-    ds4_kvstore_evict(kc, live, extra_bytes, incoming);
+                           const pulsar_kvstore_eviction_context *incoming) {
+    pulsar_kvstore_evict(kc, live, extra_bytes, incoming);
 }
 
 
 #endif
 
 
-static void kv_cache_log_cb(void *ud, ds4_kvstore_log_type type, const char *msg) {
+static void kv_cache_log_cb(void *ud, pulsar_kvstore_log_type type, const char *msg) {
     (void)ud;
-    ds4_log_type stype = DS4_LOG_KVCACHE;
-    if (type == DS4_KVSTORE_LOG_DEFAULT) stype = DS4_LOG_DEFAULT;
-    else if (type == DS4_KVSTORE_LOG_WARNING) stype = DS4_LOG_WARNING;
+    pulsar_log_type stype = PULSAR_LOG_KVCACHE;
+    if (type == PULSAR_KVSTORE_LOG_DEFAULT) stype = PULSAR_LOG_DEFAULT;
+    else if (type == PULSAR_KVSTORE_LOG_WARNING) stype = PULSAR_LOG_WARNING;
     server_log(stype, "%s", msg);
 }
 
@@ -397,69 +397,69 @@ static void kv_cache_log_cb(void *ud, ds4_kvstore_log_type type, const char *msg
 
 bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb,
                           bool reject_different_quant, kv_cache_options opt) {
-    return ds4_kvstore_open(kc, dir, budget_mb, reject_different_quant, opt,
-                            "ds4-server", kv_cache_log_cb, NULL);
+    return pulsar_kvstore_open(kc, dir, budget_mb, reject_different_quant, opt,
+                            "pulsar-server", kv_cache_log_cb, NULL);
 }
 
 
 
 void kv_cache_close(kv_disk_cache *kc) {
-    ds4_kvstore_close(kc);
+    pulsar_kvstore_close(kc);
 }
 
 
 
-char *render_tokens_text(ds4_engine *engine, const ds4_tokens *tokens, size_t *out_len) {
-    return ds4_kvstore_render_tokens_text(engine, tokens, out_len);
+char *render_tokens_text(pulsar_engine *engine, const pulsar_tokens *tokens, size_t *out_len) {
+    return pulsar_kvstore_render_tokens_text(engine, tokens, out_len);
 }
 
 
 
 static bool byte_prefix_match(const char *text, size_t text_len,
                               const char *prefix, size_t prefix_len) {
-    return ds4_kvstore_byte_prefix_match(text, text_len, prefix, prefix_len);
+    return pulsar_kvstore_byte_prefix_match(text, text_len, prefix, prefix_len);
 }
 
 
 
 
-void tokens_copy_prefix(ds4_tokens *dst, const ds4_tokens *src, int n) {
-    ds4_kvstore_tokens_copy_prefix(dst, src, n);
+void tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, int n) {
+    pulsar_kvstore_tokens_copy_prefix(dst, src, n);
 }
 
 
 
 
 void build_prompt_from_exact_prefix_and_text_suffix(
-        ds4_engine *engine,
-        const ds4_tokens *exact_prefix,
+        pulsar_engine *engine,
+        const pulsar_tokens *exact_prefix,
         const char *suffix_text,
-        ds4_tokens *out)
+        pulsar_tokens *out)
 {
-    ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+    pulsar_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
         engine, exact_prefix, suffix_text, out);
 }
 
 
 
 int kv_cache_store_len(const kv_disk_cache *kc, int tokens) {
-    return ds4_kvstore_store_len(kc, tokens);
+    return pulsar_kvstore_store_len(kc, tokens);
 }
 
 
 
 int kv_cache_chat_anchor_pos(const kv_disk_cache *kc,
-                                    const ds4_tokens *prompt,
+                                    const pulsar_tokens *prompt,
                                     int user_token_id,
                                     int assistant_token_id) {
-    return ds4_kvstore_chat_anchor_pos(kc, prompt, user_token_id, assistant_token_id);
+    return pulsar_kvstore_chat_anchor_pos(kc, prompt, user_token_id, assistant_token_id);
 }
 
 
 
 
 int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tokens) {
-    return ds4_kvstore_continued_store_target(kc, live_tokens);
+    return pulsar_kvstore_continued_store_target(kc, live_tokens);
 }
 
 
@@ -471,7 +471,7 @@ int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tokens) {
 
 
 
-#ifdef DS4_SERVER_TEST
+#ifdef PULSAR_SERVER_TEST
 
 bool kv_cache_file_size_fits(const kv_disk_cache *kc,
                                     uint64_t text_bytes,
@@ -479,7 +479,7 @@ bool kv_cache_file_size_fits(const kv_disk_cache *kc,
                                     uint64_t tool_map_bytes,
                                     uint64_t *file_bytes_out,
                                     uint64_t *required_bytes_out) {
-    return ds4_kvstore_file_size_fits(kc, text_bytes, payload_bytes,
+    return pulsar_kvstore_file_size_fits(kc, text_bytes, payload_bytes,
                                       tool_map_bytes, file_bytes_out,
                                       required_bytes_out);
 }
@@ -510,9 +510,9 @@ static int kv_cache_tool_map_load_cb(void *ud, FILE *fp, const void *wanted) {
 
 
 
-static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
+static pulsar_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
                                                          const stop_list *wanted) {
-    return (ds4_kvstore_trailer_hooks){
+    return (pulsar_kvstore_trailer_hooks){
         .ud = s,
         .ext_flag = KV_EXT_TOOL_MAP,
         .serialized_size = kv_cache_tool_map_size_cb,
@@ -525,15 +525,15 @@ static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
 
 
 static bool kv_cache_store_live_prefix_text(server *s, session_slot *sl,
-                                            const ds4_tokens *tokens,
+                                            const pulsar_tokens *tokens,
                                             int store_len, const char *reason,
                                             const char *cache_text_override,
                                             uint8_t cache_text_ext,
                                             const char *cache_text_key) {
     (void)sl; /* slot is a pure bank descriptor; the session is s->sess */
     char err[160] = {0};
-    ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
-    return ds4_kvstore_store_live_prefix_text(&s->kv, s->engine, s->sess,
+    pulsar_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
+    return pulsar_kvstore_store_live_prefix_text(&s->kv, s->engine, s->sess,
                                               tokens, store_len, reason,
                                               cache_text_override,
                                               cache_text_ext,
@@ -544,7 +544,7 @@ static bool kv_cache_store_live_prefix_text(server *s, session_slot *sl,
 
 
 bool kv_cache_store_live_prefix(server *s, session_slot *sl,
-                                       const ds4_tokens *tokens,
+                                       const pulsar_tokens *tokens,
                                        int store_len, const char *reason) {
     return kv_cache_store_live_prefix_text(s, sl, tokens, store_len, reason,
                                            NULL, 0, NULL);
@@ -553,7 +553,7 @@ bool kv_cache_store_live_prefix(server *s, session_slot *sl,
 
 
 bool kv_cache_store_current(server *s, session_slot *sl, const char *reason) {
-    const ds4_tokens *tokens = ds4_session_tokens(s->sess);
+    const pulsar_tokens *tokens = pulsar_session_tokens(s->sess);
     if (!tokens) return false;
 
     char *visible_text = NULL;
@@ -599,13 +599,13 @@ bool kv_cache_store_current(server *s, session_slot *sl, const char *reason) {
 
 
 void kv_cache_note_store(kv_disk_cache *kc, int tokens) {
-    ds4_kvstore_note_store(kc, tokens);
+    pulsar_kvstore_note_store(kc, tokens);
 }
 
 
 
 int kv_cache_suppress_continued_store(kv_disk_cache *kc, int tokens) {
-    return ds4_kvstore_suppress_continued_store(kc, tokens);
+    return pulsar_kvstore_suppress_continued_store(kc, tokens);
 }
 
 
@@ -613,7 +613,7 @@ int kv_cache_suppress_continued_store(kv_disk_cache *kc, int tokens) {
 void kv_cache_restore_suppressed_continued(kv_disk_cache *kc,
                                                   int old_tokens,
                                                   int suppressed_tokens) {
-    ds4_kvstore_restore_suppressed_continued(kc, old_tokens, suppressed_tokens);
+    pulsar_kvstore_restore_suppressed_continued(kc, old_tokens, suppressed_tokens);
 }
 
 
@@ -622,16 +622,16 @@ void kv_cache_discard_failed_disk_entry(server *s, session_slot *sl,
                                                const char *path) {
     if (!s || !path) return;
     if (unlink(path) == 0) {
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: kv cache discarded reason=prefill-failed file=%s",
+        server_log(PULSAR_LOG_KVCACHE,
+                   "pulsar-server: kv cache discarded reason=prefill-failed file=%s",
                    path);
     } else if (errno != ENOENT) {
-        server_log(DS4_LOG_WARNING,
-                   "ds4-server: kv cache failed to discard prefill-failed file=%s: %s",
+        server_log(PULSAR_LOG_WARNING,
+                   "pulsar-server: kv cache failed to discard prefill-failed file=%s: %s",
                    path, strerror(errno));
     }
     sl->continued_last_store_tokens = 0;
-    ds4_session_invalidate(s->sess);
+    pulsar_session_invalidate(s->sess);
 }
 
 
@@ -650,7 +650,7 @@ void kv_cache_tracker_flush(server *s, session_slot *sl) {
 
 void kv_cache_maybe_store_continued(server *s, session_slot *sl) {
     kv_disk_cache *kc = &s->kv;
-    const ds4_tokens *tokens = ds4_session_tokens(s->sess);
+    const pulsar_tokens *tokens = pulsar_session_tokens(s->sess);
     if (!tokens) return;
     kv_cache_tracker_bind(s, sl);
     const int target = kv_cache_continued_store_target(kc, tokens->len);
@@ -663,11 +663,11 @@ void kv_cache_maybe_store_continued(server *s, session_slot *sl) {
 
 
 
-#ifdef DS4_SERVER_TEST
+#ifdef PULSAR_SERVER_TEST
 
 int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
                                      int quant_bits, int ctx_size) {
-    return ds4_kvstore_find_text_prefix(kc, prompt_text, 0, quant_bits, ctx_size);
+    return pulsar_kvstore_find_text_prefix(kc, prompt_text, 0, quant_bits, ctx_size);
 }
 
 
@@ -675,18 +675,18 @@ int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
 
 
 int kv_cache_try_load_text(server *s, session_slot *sl, const char *prompt_text,
-                                  ds4_tokens *effective_prompt,
+                                  pulsar_tokens *effective_prompt,
                                   char **loaded_path_out,
                                   uint8_t *loaded_ext_flags_out,
                                   bool responses_protocol) {
     if (loaded_path_out) *loaded_path_out = NULL;
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
-    ds4_kvstore_load_result lr = {0};
-    ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
+    pulsar_kvstore_load_result lr = {0};
+    pulsar_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     /* A successful load advances the continued-store frontier (the lib sets
      * kc->continued_last_store_tokens = loaded) — bracket it per slot. */
     kv_cache_tracker_bind(s, sl);
-    int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, s->sess,
+    int loaded = pulsar_kvstore_try_load_text(&s->kv, s->engine, s->sess,
                                            prompt_text, effective_prompt, &lr,
                                            &hooks, responses_protocol);
     kv_cache_tracker_flush(s, sl);
@@ -694,14 +694,14 @@ int kv_cache_try_load_text(server *s, session_slot *sl, const char *prompt_text,
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
     }
-    ds4_kvstore_load_result_free(&lr);
+    pulsar_kvstore_load_result_free(&lr);
     return loaded;
 }
 
 
 
 int kv_cache_try_load(server *s, session_slot *sl, const request *req,
-                             ds4_tokens *effective_prompt,
+                             pulsar_tokens *effective_prompt,
                              char **loaded_path_out,
                              uint8_t *loaded_ext_flags_out) {
     return kv_cache_try_load_text(s, sl, req ? req->prompt_text : NULL,
@@ -714,10 +714,10 @@ int kv_cache_try_load(server *s, session_slot *sl, const request *req,
 
 
 int live_text_prefix_prompt(server *s, session_slot *sl, const request *req,
-                                   ds4_tokens *effective_prompt) {
+                                   pulsar_tokens *effective_prompt) {
     (void)sl; /* slot is a pure bank descriptor; the session is s->sess */
     if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
-    const ds4_tokens *live_tokens = ds4_session_tokens(s->sess);
+    const pulsar_tokens *live_tokens = pulsar_session_tokens(s->sess);
     if (!live_tokens || live_tokens->len <= 0) return 0;
 
     size_t live_text_len = 0;
@@ -752,7 +752,7 @@ int live_text_prefix_prompt(server *s, session_slot *sl, const request *req,
 int responses_live_continuation_prompt(server *s, session_slot *sl,
                                               const request *req,
                                               int live_pos,
-                                              ds4_tokens *effective_prompt,
+                                              pulsar_tokens *effective_prompt,
                                               int *matched_ids) {
     if (!s || !req || !effective_prompt) return 0;
     if (req->api != API_RESPONSES || !req->responses_live_suffix_text) return 0;
@@ -760,7 +760,7 @@ int responses_live_continuation_prompt(server *s, session_slot *sl,
     if (!responses_live_matches_request(s, sl, &req->responses_live_call_ids,
                                         live_pos)) return 0;
 
-    const ds4_tokens *live_tokens = ds4_session_tokens(s->sess);
+    const pulsar_tokens *live_tokens = pulsar_session_tokens(s->sess);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
     build_prompt_from_exact_prefix_and_text_suffix(
@@ -781,7 +781,7 @@ int responses_live_continuation_prompt(server *s, session_slot *sl,
 int anthropic_live_continuation_prompt(server *s, session_slot *sl,
                                               const request *req,
                                               int live_pos,
-                                              ds4_tokens *effective_prompt,
+                                              pulsar_tokens *effective_prompt,
                                               int *matched_ids) {
     if (!s || !req || !effective_prompt) return 0;
     if (req->api != API_ANTHROPIC || !req->anthropic_live_suffix_text) return 0;
@@ -789,7 +789,7 @@ int anthropic_live_continuation_prompt(server *s, session_slot *sl,
     if (!anthropic_live_matches_request(s, sl, &req->anthropic_live_call_ids,
                                         live_pos)) return 0;
 
-    const ds4_tokens *live_tokens = ds4_session_tokens(s->sess);
+    const pulsar_tokens *live_tokens = pulsar_session_tokens(s->sess);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
     build_prompt_from_exact_prefix_and_text_suffix(
@@ -817,7 +817,7 @@ int anthropic_live_continuation_prompt(server *s, session_slot *sl,
 int responses_live_visible_prefix_prompt(server *s, session_slot *sl,
                                                 const request *req,
                                                 int live_pos,
-                                                ds4_tokens *effective_prompt) {
+                                                pulsar_tokens *effective_prompt) {
     if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
     if (req->api != API_RESPONSES) return 0;
 
@@ -835,7 +835,7 @@ int responses_live_visible_prefix_prompt(server *s, session_slot *sl,
     pthread_mutex_unlock(&s->tool_mu);
     if (!ok) return 0;
 
-    const ds4_tokens *live_tokens = ds4_session_tokens(s->sess);
+    const pulsar_tokens *live_tokens = pulsar_session_tokens(s->sess);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
     build_prompt_from_exact_prefix_and_text_suffix(
@@ -862,7 +862,7 @@ int responses_live_visible_prefix_prompt(server *s, session_slot *sl,
 int thinking_live_visible_prefix_prompt(server *s, session_slot *sl,
                                                const request *req,
                                                int live_pos,
-                                               ds4_tokens *effective_prompt) {
+                                               pulsar_tokens *effective_prompt) {
     if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
     if (req->kind != REQ_CHAT || req->api == API_RESPONSES) return 0;
 
@@ -880,7 +880,7 @@ int thinking_live_visible_prefix_prompt(server *s, session_slot *sl,
     pthread_mutex_unlock(&s->tool_mu);
     if (!ok) return 0;
 
-    const ds4_tokens *live_tokens = ds4_session_tokens(s->sess);
+    const pulsar_tokens *live_tokens = pulsar_session_tokens(s->sess);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
     build_prompt_from_exact_prefix_and_text_suffix(

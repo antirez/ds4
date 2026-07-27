@@ -1,4 +1,4 @@
-#include "ds4_server_internal.h"
+#include "pulsar_server_internal.h"
 
 
 
@@ -324,9 +324,9 @@ bool chat_history_preserves_reasoning(const chat_msgs *msgs,
 
 char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                      const tool_schema_orders *tool_orders,
-                                     ds4_think_mode think_mode) {
+                                     pulsar_think_mode think_mode) {
     (void)tool_orders;
-    const bool think = ds4_think_mode_enabled(think_mode);
+    const bool think = pulsar_think_mode_enabled(think_mode);
     const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
     int last_user_idx = -1;
     buf system = {0};
@@ -348,8 +348,8 @@ char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
     }
 
     buf out = {0};
-    buf_puts(&out, DS4_SERVER_RENDER_BOS);
-    if (think_mode == DS4_THINK_MAX) buf_puts(&out, ds4_think_max_prefix());
+    buf_puts(&out, PULSAR_SERVER_RENDER_BOS);
+    if (think_mode == PULSAR_THINK_MAX) buf_puts(&out, pulsar_think_max_prefix());
     buf_puts(&out, system.ptr ? system.ptr : "");
 
     bool pending_assistant = false;
@@ -421,8 +421,8 @@ char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
  * token prefix as the boundary.  That avoids BPE merges across the visible
  * replay/live-KV boundary. */
 static char *render_live_tool_tail(const chat_msgs *msgs, int start,
-                                   ds4_think_mode think_mode) {
-    const bool think = ds4_think_mode_enabled(think_mode);
+                                   pulsar_think_mode think_mode) {
+    const bool think = pulsar_think_mode_enabled(think_mode);
     buf out = {0};
     buf_puts(&out, "<｜end▁of▁sentence｜>");
 
@@ -521,14 +521,14 @@ static const chat_msg *responses_find_prior_call_msg(const chat_msgs *msgs,
  * warning if it must fall back to visible replay instead of aborting the
  * session. */
 bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
-                                            ds4_think_mode think_mode,
+                                            pulsar_think_mode think_mode,
                                             bool *requires_live_tool_state,
                                             bool *requires_live_reasoning,
                                             char *err, size_t errlen) {
     if (!msgs) return true;
     if (requires_live_tool_state) *requires_live_tool_state = false;
     if (requires_live_reasoning) *requires_live_reasoning = false;
-    const bool needs_reasoning = ds4_think_mode_enabled(think_mode);
+    const bool needs_reasoning = pulsar_think_mode_enabled(think_mode);
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (strcmp(m->role, "tool") && strcmp(m->role, "function")) continue;

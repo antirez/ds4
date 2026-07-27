@@ -1,4 +1,4 @@
-#include "ds4_engine_internal.h"
+#include "pulsar_engine_internal.h"
 
 /* Checked allocators and the CPU-decode allocation guard. Split out of
  * util.c in the C++ port. The guard is process-wide state armed around
@@ -21,7 +21,7 @@ public:
     void check(const char *op, size_t size) const {
         if (!enabled_) return;
         fprintf(stderr,
-                "ds4: internal allocation during %s: %s(%zu). "
+                "pulsar: internal allocation during %s: %s(%zu). "
                 "CPU decode is expected to reuse preallocated scratch buffers.\n",
                 phase_ ? phase_ : "guarded phase",
                 op,
@@ -40,13 +40,13 @@ static AllocGuard g_alloc_guard;
 
 
 
-void ds4_alloc_guard_begin(const char *phase) {
+void pulsar_alloc_guard_begin(const char *phase) {
     pulsar::g_alloc_guard.begin(phase);
 }
 
 
 
-void ds4_alloc_guard_end(void) {
+void pulsar_alloc_guard_end(void) {
     pulsar::g_alloc_guard.end();
 }
 
@@ -55,7 +55,7 @@ void ds4_alloc_guard_end(void) {
 void *xcalloc(size_t n, size_t size) {
     pulsar::g_alloc_guard.check("calloc", n * size);
     void *p = calloc(n, size);
-    if (!p) ds4_die("out of memory");
+    if (!p) pulsar_die("out of memory");
     return p;
 }
 
@@ -64,7 +64,7 @@ void *xcalloc(size_t n, size_t size) {
 void *xmalloc(size_t size) {
     pulsar::g_alloc_guard.check("malloc", size);
     void *p = malloc(size);
-    if (!p) ds4_die("out of memory");
+    if (!p) pulsar_die("out of memory");
     return p;
 }
 
@@ -73,14 +73,14 @@ void *xmalloc(size_t size) {
 void *xrealloc(void *ptr, size_t size) {
     pulsar::g_alloc_guard.check("realloc", size);
     void *p = realloc(ptr, size);
-    if (!p) ds4_die("out of memory");
+    if (!p) pulsar_die("out of memory");
     return p;
 }
 
 
 
 void *xmalloc_zeroed(size_t n, size_t size) {
-    if (size != 0 && n > SIZE_MAX / size) ds4_die("allocation size overflow");
+    if (size != 0 && n > SIZE_MAX / size) pulsar_die("allocation size overflow");
     const size_t total = n * size;
     void *p = xmalloc(total ? total : 1);
     /*
@@ -99,7 +99,7 @@ void *xmalloc_zeroed(size_t n, size_t size) {
 
 
 
-char *ds4_strdup(const char *s) {
+char *pulsar_strdup(const char *s) {
     size_t n = strlen(s);
     char *p = static_cast<char *>(xmalloc(n + 1));
     memcpy(p, s, n + 1);

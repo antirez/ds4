@@ -1479,7 +1479,7 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
         }
     }
 
-    /* Some multiplexed users, such as ds4-agent, keep linenoise in a reserved
+    /* Some multiplexed users, such as pulsar-agent, keep linenoise in a reserved
      * terminal area below an output scroll region.  The reserved area depends
      * on how many rows the edited input currently occupies.  Flush the cleanup
      * phase first, then let the owner resize/reposition the prompt area before

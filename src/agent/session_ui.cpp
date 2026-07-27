@@ -1,4 +1,4 @@
-#include "ds4_agent_internal.h"
+#include "pulsar_agent_internal.h"
 
 
 
@@ -101,13 +101,13 @@ static char *agent_session_title_clip(const char *title, size_t max_bytes) {
 static char *agent_session_title_from_file(const char *path, size_t max_bytes) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return xstrdup("(unreadable session)");
-    ds4_kvstore_entry hdr = {0};
+    pulsar_kvstore_entry hdr = {0};
     uint32_t text_bytes = 0;
     char *text = NULL;
     char *trailer_title = NULL;
-    bool ok = ds4_kvstore_read_header(fp, &hdr, &text_bytes) &&
+    bool ok = pulsar_kvstore_read_header(fp, &hdr, &text_bytes) &&
               agent_kv_read_text(fp, text_bytes, &text, NULL, 0);
-    if (ok && (hdr.ext_flags & DS4_KVSTORE_EXT_SESSION_TITLE))
+    if (ok && (hdr.ext_flags & PULSAR_KVSTORE_EXT_SESSION_TITLE))
         ok = agent_kv_read_title_trailer(fp, &hdr, &trailer_title, NULL, 0);
     fclose(fp);
     char *title = ok ?
@@ -310,7 +310,7 @@ static bool agent_history_latest_compaction_summary(const char *text,
                                                     const char **sum_start,
                                                     const char **sum_end) {
     static const char start_mark[] =
-        "[ds4-agent compacted earlier conversation. Durable task-state summary follows.]";
+        "[pulsar-agent compacted earlier conversation. Durable task-state summary follows.]";
     static const char end_mark[] =
         "[End compacted summary. Recent conversation continues verbatim below.]";
     const char *end = text + len;
@@ -583,7 +583,7 @@ bool agent_worker_show_history(agent_worker *w, int user_turns,
         return false;
     }
     size_t text_len = 0;
-    char *text = ds4_kvstore_render_tokens_text(w->engine, &w->transcript,
+    char *text = pulsar_kvstore_render_tokens_text(w->engine, &w->transcript,
                                                 &text_len);
     if (!text) {
         snprintf(err, err_len, "failed to render session text");
@@ -610,7 +610,7 @@ static int agent_session_list_cmp_recent(const void *a, const void *b) {
 
 static void agent_session_list_free(agent_session_list_item *v, int n) {
     for (int i = 0; i < n; i++) {
-        ds4_kvstore_entry_free(&v[i].entry);
+        pulsar_kvstore_entry_free(&v[i].entry);
         free(v[i].title);
     }
     free(v);
@@ -619,7 +619,7 @@ static void agent_session_list_free(agent_session_list_item *v, int n) {
 
 
 static void agent_session_list_push(agent_session_list_item **v, int *len,
-                                    int *cap, ds4_kvstore_entry entry,
+                                    int *cap, pulsar_kvstore_entry entry,
                                     char *title) {
     if (*len == *cap) {
         *cap = *cap ? *cap * 2 : 16;
@@ -648,20 +648,20 @@ void agent_worker_list_sessions(agent_worker *w) {
 
     agent_session_list_item *sessions = NULL;
     int sessions_len = 0, sessions_cap = 0;
-    const uint8_t model_id = (uint8_t)ds4_engine_model_id(w->engine);
+    const uint8_t model_id = (uint8_t)pulsar_engine_model_id(w->engine);
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         char sha[41];
-        if (!ds4_kvstore_sha_hex_name(de->d_name, sha)) continue;
-        char *path = ds4_kvstore_path_join(w->cache_dir, de->d_name);
-        ds4_kvstore_entry e = {0};
-        if (ds4_kvstore_read_entry_file(path, sha, &e)) {
+        if (!pulsar_kvstore_sha_hex_name(de->d_name, sha)) continue;
+        char *path = pulsar_kvstore_path_join(w->cache_dir, de->d_name);
+        pulsar_kvstore_entry e = {0};
+        if (pulsar_kvstore_read_entry_file(path, sha, &e)) {
             if (e.model_id == model_id) {
                 char *title = agent_session_title_from_file(path, title_budget);
                 agent_session_list_push(&sessions, &sessions_len, &sessions_cap,
                                         e, title);
             } else {
-                ds4_kvstore_entry_free(&e);
+                pulsar_kvstore_entry_free(&e);
             }
         }
         free(path);
@@ -683,7 +683,7 @@ void agent_worker_list_sessions(agent_worker *w) {
     const char *reset = color ? "\x1b[0m" : "";
 
     for (int i = 0; i < sessions_len; i++) {
-        ds4_kvstore_entry *e = &sessions[i].entry;
+        pulsar_kvstore_entry *e = &sessions[i].entry;
         char age[32];
         agent_format_age(e->last_used ? e->last_used : e->created_at,
                          age, sizeof(age));
@@ -752,20 +752,20 @@ void agent_switch_completion_callback(const char *buf,
     if (!d) return;
 
     agent_completion_sessions sessions = {0};
-    const uint8_t model_id = (uint8_t)ds4_engine_model_id(w->engine);
+    const uint8_t model_id = (uint8_t)pulsar_engine_model_id(w->engine);
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         char sha[41];
-        if (!ds4_kvstore_sha_hex_name(de->d_name, sha)) continue;
+        if (!pulsar_kvstore_sha_hex_name(de->d_name, sha)) continue;
         if (prefix_len && strncasecmp(sha, prefix, prefix_len) != 0) continue;
 
         uint64_t last_used = 0;
-        char *path = ds4_kvstore_path_join(w->cache_dir, de->d_name);
-        ds4_kvstore_entry e = {0};
-        if (ds4_kvstore_read_entry_file(path, sha, &e)) {
+        char *path = pulsar_kvstore_path_join(w->cache_dir, de->d_name);
+        pulsar_kvstore_entry e = {0};
+        if (pulsar_kvstore_read_entry_file(path, sha, &e)) {
             if (e.model_id == model_id) last_used = e.last_used;
             else last_used = UINT64_MAX;
-            ds4_kvstore_entry_free(&e);
+            pulsar_kvstore_entry_free(&e);
         } else {
             last_used = UINT64_MAX;
         }
@@ -813,17 +813,17 @@ static bool agent_worker_find_session(agent_worker *w, const char *prefix,
     int matches = 0;
     char match_sha[41] = {0};
     char *match_path = NULL;
-    const uint8_t model_id = (uint8_t)ds4_engine_model_id(w->engine);
+    const uint8_t model_id = (uint8_t)pulsar_engine_model_id(w->engine);
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         char sha[41];
-        if (!ds4_kvstore_sha_hex_name(de->d_name, sha)) continue;
+        if (!pulsar_kvstore_sha_hex_name(de->d_name, sha)) continue;
         if (strncasecmp(sha, prefix, plen) != 0) continue;
-        char *path = ds4_kvstore_path_join(w->cache_dir, de->d_name);
-        ds4_kvstore_entry e = {0};
-        bool same_model = ds4_kvstore_read_entry_file(path, sha, &e) &&
+        char *path = pulsar_kvstore_path_join(w->cache_dir, de->d_name);
+        pulsar_kvstore_entry e = {0};
+        bool same_model = pulsar_kvstore_read_entry_file(path, sha, &e) &&
                           e.model_id == model_id;
-        ds4_kvstore_entry_free(&e);
+        pulsar_kvstore_entry_free(&e);
         if (!same_model) {
             free(path);
             continue;
@@ -892,13 +892,13 @@ bool agent_worker_strip_session(agent_worker *w, const char *prefix,
         return false;
     }
 
-    ds4_kvstore_entry hdr = {0};
+    pulsar_kvstore_entry hdr = {0};
     uint32_t text_bytes = 0;
     char *text = NULL;
     char *title = NULL;
-    bool ok = ds4_kvstore_read_header(fp, &hdr, &text_bytes) &&
+    bool ok = pulsar_kvstore_read_header(fp, &hdr, &text_bytes) &&
               agent_kv_read_text(fp, text_bytes, &text, err, err_len);
-    if (ok && (hdr.ext_flags & DS4_KVSTORE_EXT_SESSION_TITLE))
+    if (ok && (hdr.ext_flags & PULSAR_KVSTORE_EXT_SESSION_TITLE))
         ok = agent_kv_read_title_trailer(fp, &hdr, &title, err, err_len);
     fclose(fp);
     if (!ok) {
@@ -919,10 +919,10 @@ bool agent_worker_strip_session(agent_worker *w, const char *prefix,
         return false;
     }
 
-    ds4_tokens stripped_tokens = {0};
-    ds4_tokenize_rendered_chat(w->engine, text, &stripped_tokens);
+    pulsar_tokens stripped_tokens = {0};
+    pulsar_tokenize_rendered_chat(w->engine, text, &stripped_tokens);
     uint32_t stripped_token_count = (uint32_t)stripped_tokens.len;
-    ds4_tokens_free(&stripped_tokens);
+    pulsar_tokens_free(&stripped_tokens);
 
     agent_buf tmpl = {0};
     agent_buf_puts(&tmpl, path);
@@ -948,19 +948,19 @@ bool agent_worker_strip_session(agent_worker *w, const char *prefix,
         return false;
     }
 
-    uint8_t h[DS4_KVSTORE_FIXED_HEADER];
+    uint8_t h[PULSAR_KVSTORE_FIXED_HEADER];
     uint64_t now = (uint64_t)time(NULL);
-    ds4_kvstore_fill_header(h, hdr.model_id, hdr.quant_bits, hdr.reason, hdr.ext_flags,
+    pulsar_kvstore_fill_header(h, hdr.model_id, hdr.quant_bits, hdr.reason, hdr.ext_flags,
                             stripped_token_count, hdr.hits, hdr.ctx_size,
                             hdr.created_at, now, 0);
     uint8_t tb[4];
-    ds4_kvstore_le_put32(tb, text_bytes);
+    pulsar_kvstore_le_put32(tb, text_bytes);
 
     errno = 0;
     ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
          fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
          fwrite(text, 1, text_bytes, fp) == text_bytes &&
-         (!(hdr.ext_flags & DS4_KVSTORE_EXT_SESSION_TITLE) ||
+         (!(hdr.ext_flags & PULSAR_KVSTORE_EXT_SESSION_TITLE) ||
           agent_kv_write_title_trailer(fp, title, err, err_len)) &&
          fflush(fp) == 0;
     int saved_errno = errno;
@@ -1005,22 +1005,22 @@ bool agent_worker_switch_session(agent_worker *w, const char *prefix,
         return false;
 
     bool stripped = false;
-    ds4_kvstore_entry entry = {0};
-    if (ds4_kvstore_read_entry_file(path, sha, &entry)) {
+    pulsar_kvstore_entry entry = {0};
+    if (pulsar_kvstore_read_entry_file(path, sha, &entry)) {
         stripped = entry.payload_bytes == 0;
-        ds4_kvstore_entry_free(&entry);
+        pulsar_kvstore_entry_free(&entry);
     }
     if (stripped) {
         printf("rebuilding stripped session %.8s from rendered text...\n", sha);
         fflush(stdout);
     }
 
-    ds4_tokens loaded = {0};
+    pulsar_tokens loaded = {0};
     agent_kv_session_meta meta = {0};
     bool ok = agent_kv_load_path(w, path, sha, NULL, 0, &loaded, &meta,
                                  err, err_len);
     if (ok) {
-        ds4_tokens_free(&w->transcript);
+        pulsar_tokens_free(&w->transcript);
         w->transcript = loaded;
         free(w->session_title);
         w->session_title = meta.title ? xstrdup(meta.title) : xstrdup("(no user prompt)");
@@ -1046,7 +1046,7 @@ bool agent_worker_switch_session(agent_worker *w, const char *prefix,
         if (history_turns > 0)
             (void)agent_worker_show_history(w, history_turns, err, err_len);
     } else {
-        ds4_tokens_free(&loaded);
+        pulsar_tokens_free(&loaded);
     }
     agent_kv_session_meta_free(&meta);
     free(path);

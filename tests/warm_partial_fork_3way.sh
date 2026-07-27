@@ -54,7 +54,7 @@ TT="$P
 Probe-Gamma: name a mountain."     # dedicated TTFT tail (fresh partial fork)
 jreq(){ python3 -c "import json,sys;print(json.dumps({'prompt':sys.argv[1],'max_tokens':int(sys.argv[2]),'temperature':0.0,'stream':False}))" "$1" "$2"; }
 # 4 banks: trunk + 2 branches fill 3, leaving a FREE bank so the TTFT probe forks.
-start(){ DS4_WARM_FORK=$1 DS4_MSEQ_BANKS=4 DS4_WARM_PARTIAL_MIN=256 ./ds4-server -m "$MODEL" \
+start(){ DS4_WARM_FORK=$1 DS4_MSEQ_BANKS=4 DS4_WARM_PARTIAL_MIN=256 ./pulsar-server -m "$MODEL" \
         --host 127.0.0.1 --port $PORT -c 32768 --kv-disk-dir "" >"$LOG" 2>&1 & SP=$!
   for i in $(seq 1 300); do [ "$(curl -s -m2 -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/health)" = 200 ] && return 0; sleep 1; done; return 1; }
 stop(){ kill -INT $SP 2>/dev/null; sleep 2; kill -9 $SP 2>/dev/null; }

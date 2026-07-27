@@ -14,7 +14,7 @@
  * construction: the MoE path uses per-pair stores into a flat `down` buffer
  * plus a fixed-order `moe_sum_kernel` and NO float atomicAdd, precisely so
  * float reduction order cannot vary with tile scheduling
- * (src/cuda/ds4_cuda_moe.cu — "no atomicAdd so numerics stay run-to-run
+ * (src/cuda/pulsar_cuda_moe.cu — "no atomicAdd so numerics stay run-to-run
  * deterministic").  Check (c) below re-asserts that property every run; if a
  * future change reintroduces a float atomic, (c) fails before the byte-compare
  * has a chance to produce a confusing result.
@@ -27,10 +27,10 @@
  * MULTIPLE depths is the cheapest probe that is not.
  *
  * WHAT THE DEPTHS BUY.  With opt.prefill_chunk pinned to 4096,
- * ds4_session_create computes prefill_cap = ds4_prefill_cap_for_prompt(ctx_size,
+ * pulsar_session_create computes prefill_cap = pulsar_prefill_cap_for_prompt(ctx_size,
  * 4096) = 4096 (src/engine/session.c:1813, src/engine/layers.c:14) — note it is
  * derived from ctx_size at CREATE, so it is 4096 for every depth here, not a
- * function of the prompt.  ds4_session_sync then tests `prefill_cap <
+ * function of the prompt.  pulsar_session_sync then tests `prefill_cap <
  * prompt->len` (session.c:2063):
  *   - 512/2048/4096  -> FALSE (4096 included, at the boundary): the NON-chunked
  *     one-shot gpu_graph_prefill_raw_swa path.  Depth D is a single routed-MoE
@@ -49,7 +49,7 @@
  * switch there — and a change that moved every logit at n_tok=6 passed all four
  * original depths.  4102 gives a 6-token final chunk.  See g_depths below.
  * All depths clear the `use_big_batch = ... && n_tokens >= 128` bar in
- * routed_moe (src/cuda/ds4_cuda_moe.cu) — including every chunk of the 6144 row
+ * routed_moe (src/cuda/pulsar_cuda_moe.cu) — including every chunk of the 6144 row
  * — i.e. they exercise the expert-tiled rowspan/tile16 kernels that D2R
  * replaces, NOT the per-pair qwarp32 decode path.  The ONE exception is 4102's
  * 6-token final chunk, which falls UNDER that bar and is the only row here that
@@ -61,12 +61,12 @@
  * coverage.
  *
  * ...WHICH IS WHY THE ENV IS SCRUBBED.  That coverage claim is only true at the
- * DEFAULT env.  DS4_MOE_FP4_TILED=0 (src/cuda/ds4_cuda_moe.cu, static-cached
+ * DEFAULT env.  PULSAR_MOE_FP4_TILED=0 (src/cuda/pulsar_cuda_moe.cu, static-cached
  * getenv) forces use_sorted_pairs=0 for both-mxfp4 layers, so all 12 type-39
  * layers fall back to the per-pair qwarp32 path.  Exported for BOTH the dump and
  * the check, that would make the gate agree with itself having never run the
  * MXFP4 tiled kernels at all — a vacuous PASS.  scrub_numerics_env() below
- * unsets that whole class of knob and says so loudly — the whole DS4_ namespace,
+ * unsets that whole class of knob and says so loudly — the whole PULSAR_ namespace,
  * plus the numerics knobs that live OUTSIDE it and are read by cuBLAS/the CUDA
  * runtime rather than by our code (NVIDIA_TF32_OVERRIDE, CUBLAS_WORKSPACE_CONFIG),
  * which no namespace sweep could find.  (Differing env between dump and check
@@ -123,7 +123,7 @@
  *
  * TEETH (each seeded as a local kernel edit, gate re-run, edit reverted;
  * verified on this tree 2026-07-15 — see the commit message):
- *   T1  MXFP4 gate/up block->lane REPARTITION — src/cuda/ds4_cuda_moe.cu,
+ *   T1  MXFP4 gate/up block->lane REPARTITION — src/cuda/pulsar_cuda_moe.cu,
  *       moe_gate_up_mid_mxfp4_expert_ntile_rowspan_kernel: give lane l the
  *       blocks {2l, 2l+1} instead of {l, l+8}
  *           for (uint32_t b = lane * 2u; b < lane * 2u + 2u && b < xq_blocks; b++)
@@ -178,7 +178,7 @@
  *        (from the repo root — reads tests/long_context_story_prompt.txt;
  *         or `make cuda-prefill-gate` / `make cuda-prefill-gate-baseline`)
  */
-#include "ds4.h"
+#include "pulsar.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -187,8 +187,8 @@
 #include <unistd.h>   /* environ */
 
 /* Injected by the Makefile: git short HEAD of the tree that built this binary. */
-#ifndef DS4_GATE_BUILD_REF
-#define DS4_GATE_BUILD_REF "unknown"
+#ifndef PULSAR_GATE_BUILD_REF
+#define PULSAR_GATE_BUILD_REF "unknown"
 #endif
 
 /* Depths: 512/2048/4096 are single-chunk; 6144 and 4102 exceed the pinned 4096
@@ -204,8 +204,8 @@
  * prompt_len mod chunk lands there -- and every short continuation prefill off
  * the prefix-cache/partial-prefix path lands there by construction.  That is
  * also precisely the window the n_tok-conditional GEMV dispatches switch on
- * (gemv_max_n / f16_gemv_max_n / a_gemv_max_n in ds4_cuda_matmul.cu,
- * moe_gemv_cap in ds4_cuda_moe.cu, all capped at 4).  Raising those caps to 8
+ * (gemv_max_n / f16_gemv_max_n / a_gemv_max_n in pulsar_cuda_matmul.cu,
+ * moe_gemv_cap in pulsar_cuda_moe.cu, all capped at 4).  Raising those caps to 8
  * moved 129280/129280 logits by up to 1.876 at 4102 while 4100 (n_tok=4) stayed
  * byte-identical -- and all four original depths, plus the bank/multiseq gates
  * (draft 3, width <= 4), passed clean through it.  4102 -> final chunk n_tok=6,
@@ -226,31 +226,31 @@ typedef struct {
     char     magic[8];
     uint32_t version;
     uint32_t n_depths;
-    uint32_t width;        /* ds4_engine_logits_width — the row stride, NOT vocab_size */
+    uint32_t width;        /* pulsar_engine_logits_width — the row stride, NOT vocab_size */
     uint32_t reserved;
     uint64_t prompt_fnv;   /* FNV-1a over the token ids actually prefilled */
     uint32_t depths[MAX_DEPTHS];
     char     build_ref[REF_LEN];  /* git short HEAD of the tree that BUILT the dumper */
 } blob_header;
 
-static ds4_engine *g_e;
-static ds4_tokens g_toks;
+static pulsar_engine *g_e;
+static pulsar_tokens g_toks;
 
-/* The engine reads ~90 DS4_* env knobs; many of them change prefill numerics
- * (DS4_CUDA_NO_TF32 flips cuBLAS off the TF32 tensor-op math mode) or delete
- * kernel coverage outright (DS4_MOE_FP4_TILED=0 sends every type-39 layer down
+/* The engine reads ~90 PULSAR_* env knobs; many of them change prefill numerics
+ * (PULSAR_CUDA_NO_TF32 flips cuBLAS off the TF32 tensor-op math mode) or delete
+ * kernel coverage outright (PULSAR_MOE_FP4_TILED=0 sends every type-39 layer down
  * the per-pair qwarp32 path).  A knob set DIFFERENTLY between the dump and the
  * check fails loud, which is the safe direction; the danger is the SAME wrong
  * knob on both sides, where the gate agrees with itself having certified a
  * configuration that is not the one we ship.  Enumerating the offenders by hand
  * does not scale and silently rots, so scrub the whole namespace and keep only
  * what selects WHERE things are rather than WHAT is computed.
- * (DS4_CUDA_PREFILL_CHUNK needs no entry here: opt.prefill_chunk is pinned and
+ * (PULSAR_CUDA_PREFILL_CHUNK needs no entry here: opt.prefill_chunk is pinned and
  * takes precedence over the env.)
  *
  * Keep this list SHORT and re-verify each entry against THIS binary's link graph
- * (tests/prefill_bitexact_gate = the gate .o + src/lib/ds4_help.o + CORE_OBJS —
- * engine + cuda, NO server objects).  It already rotted once: DS4_MODEL_DIR sat
+ * (tests/prefill_bitexact_gate = the gate .o + src/lib/pulsar_help.o + CORE_OBJS —
+ * engine + cuda, NO server objects).  It already rotted once: PULSAR_MODEL_DIR sat
  * here until a 2026-07 review found it dead — it is read only by
  * src/server/cli_main.c, which this binary does not link, and the gate takes the
  * model as argv[1] anyway.  A hand-maintained keep-list is exactly the thing this
@@ -261,14 +261,14 @@ static const char *const g_env_keep[] = {
     "DS4_LOCK_FILE",
 };
 
-/* Numerics knobs OUTSIDE the DS4_ namespace.  The scrub below sweeps DS4_* by
+/* Numerics knobs OUTSIDE the PULSAR_ namespace.  The scrub below sweeps PULSAR_* by
  * prefix, which is exactly the wrong shape for these: they are read by the CUDA
  * runtime and by cuBLAS themselves, not by our code, so they appear nowhere in
  * this tree and no namespace sweep can find them — yet they change the arithmetic
  * the gate certifies:
  *   - NVIDIA_TF32_OVERRIDE=0 disables TF32 GLOBALLY, overriding the driver's
  *     default regardless of what cublasSetMathMode() asks for.  That is the same
- *     effect as DS4_CUDA_NO_TF32, one namespace over — the very knob this scrub
+ *     effect as PULSAR_CUDA_NO_TF32, one namespace over — the very knob this scrub
  *     was written to close.
  *   - CUBLAS_WORKSPACE_CONFIG changes cuBLAS workspace sizing and with it
  *     reduction split/determinism.
@@ -311,7 +311,7 @@ static void scrub_numerics_env(void) {
         if (!eq) continue;
         const size_t len = (size_t)(eq - *e);
         /* Both of the following would otherwise leave a knob SET while the gate
-         * reported nothing and went on to print PASS.  The engine reads ~90 DS4_*
+         * reported nothing and went on to print PASS.  The engine reads ~90 PULSAR_*
          * knobs, so neither is reachable today — but "unreachable" is what this
          * whole file refuses to take on faith.  Fail loud instead. */
         if (n == cap) {
@@ -339,7 +339,7 @@ static void scrub_numerics_env(void) {
         scrub_one(names[i], getenv(names[i]));
         free(names[i]);
     }
-    /* Named explicitly: these are not DS4_* and the sweep above cannot see them. */
+    /* Named explicitly: these are not PULSAR_* and the sweep above cannot see them. */
     for (size_t i = 0; i < sizeof(g_env_scrub_foreign) / sizeof(g_env_scrub_foreign[0]); i++) {
         const char *v = getenv(g_env_scrub_foreign[i]);
         if (v) scrub_one(g_env_scrub_foreign[i], v);
@@ -387,28 +387,28 @@ static uint64_t fnv1a(const void *data, size_t len) {
 /* One from-scratch prefill of `depth` tokens through a FRESH session; the
  * session is torn down before returning so nothing carries between depths. */
 static int prefill_logits(uint32_t depth, float *out, int width) {
-    ds4_session *s = NULL;
-    if (ds4_session_create(&s, g_e, GATE_CTX) != 0) {
+    pulsar_session *s = NULL;
+    if (pulsar_session_create(&s, g_e, GATE_CTX) != 0) {
         fprintf(stderr, "PREFILL GATE: session_create failed (depth %u)\n", depth);
         return 0;
     }
-    ds4_tokens p;
+    pulsar_tokens p;
     memset(&p, 0, sizeof(p));
     p.v = (int *)malloc((size_t)depth * sizeof(int));
-    if (!p.v) { ds4_session_free(s); return 0; }
+    if (!p.v) { pulsar_session_free(s); return 0; }
     p.len = p.cap = (int)depth;
     memcpy(p.v, g_toks.v, (size_t)depth * sizeof(int));
 
     char err[256];
-    const int rc = ds4_session_sync(s, &p, err, sizeof(err));
+    const int rc = pulsar_session_sync(s, &p, err, sizeof(err));
     free(p.v);
     if (rc != 0) {
         fprintf(stderr, "PREFILL GATE: sync failed at depth %u: %s\n", depth, err);
-        ds4_session_free(s);
+        pulsar_session_free(s);
         return 0;
     }
-    const int got = ds4_session_copy_logits(s, out, width);
-    ds4_session_free(s);
+    const int got = pulsar_session_copy_logits(s, out, width);
+    pulsar_session_free(s);
     if (got != width) {
         fprintf(stderr, "PREFILL GATE: copy_logits returned %d, want %d (depth %u)\n",
                 got, width, depth);
@@ -502,7 +502,7 @@ static int fidelity_row(const float *cur, const float *ref, int width,
 }
 
 /* Everything about the blob that does NOT need the engine: magic, version and
- * provenance.  Called before ds4_engine_open so the likeliest misuses (a stale
+ * provenance.  Called before pulsar_engine_open so the likeliest misuses (a stale
  * blob, or one re-dumped from the tree under test) fail instantly instead of
  * after a 35 s model load. */
 static int precheck_baseline(const char *path, const char *expect_ref) {
@@ -532,7 +532,7 @@ static int precheck_baseline(const char *path, const char *expect_ref) {
                 "  A blob re-dumped from the tree under test would be compared against "
                 "ITSELF and pass vacuously; rebuild the baseline with\n"
                 "  `make cuda-prefill-gate-baseline PREFILL_BASELINE_REF=%s`\n",
-                path, bh.build_ref, expect_ref, DS4_GATE_BUILD_REF, expect_ref);
+                path, bh.build_ref, expect_ref, PULSAR_GATE_BUILD_REF, expect_ref);
         return 0;
     }
     printf("  baseline provenance: blob built from ref '%s' (expected '%s') OK\n",
@@ -576,7 +576,7 @@ static int load_baseline(const char *path, const char *expect_ref,
                 "  A blob re-dumped from the tree under test would be compared against "
                 "ITSELF and pass vacuously; rebuild the baseline with\n"
                 "  `make cuda-prefill-gate-baseline PREFILL_BASELINE_REF=%s`\n",
-                path, bh.build_ref, expect_ref, DS4_GATE_BUILD_REF, expect_ref);
+                path, bh.build_ref, expect_ref, PULSAR_GATE_BUILD_REF, expect_ref);
         fclose(fp);
         return 0;
     }
@@ -672,30 +672,30 @@ int main(int argc, char **argv) {
 
     scrub_numerics_env();
     printf("prefill bit-exactness gate: this binary built from ref '%s'\n",
-           DS4_GATE_BUILD_REF);
+           PULSAR_GATE_BUILD_REF);
 
     /* Cheap blob checks first — before the 35 s model load. */
     if (!dumping && !precheck_baseline(blob_path, expect_ref)) return 1;
 
-    ds4_engine_options opt;
+    pulsar_engine_options opt;
     memset(&opt, 0, sizeof(opt));
     opt.model_path = model;
-    opt.backend = DS4_BACKEND_CUDA;
-    /* Pin the chunk so the gate is immune to DS4_CUDA_PREFILL_CHUNK in the
+    opt.backend = PULSAR_BACKEND_CUDA;
+    /* Pin the chunk so the gate is immune to PULSAR_CUDA_PREFILL_CHUNK in the
      * environment: every depth stays a single routed-MoE call. */
     opt.prefill_chunk = 4096;
     /* The drafter cannot affect prefill logits and only costs memory here. */
     opt.dspark_disable = true;
-    if (ds4_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
+    if (pulsar_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
 
-    const int width = ds4_engine_logits_width(g_e);
+    const int width = pulsar_engine_logits_width(g_e);
     if (width <= 0) { fprintf(stderr, "bad logits width %d\n", width); return 1; }
 
     size_t text_len = 0;
     char *text = read_file("tests/long_context_story_prompt.txt", &text_len);
     if (!text) { fprintf(stderr, "prompt file read failed (run from the repo root)\n"); return 1; }
     memset(&g_toks, 0, sizeof(g_toks));
-    ds4_tokenize_text(g_e, text, &g_toks);
+    pulsar_tokenize_text(g_e, text, &g_toks);
     free(text);
 
     const uint32_t deepest = g_depths[N_DEPTHS - 1];
@@ -712,14 +712,14 @@ int main(int argc, char **argv) {
     hdr.width = (uint32_t)width;
     hdr.prompt_fnv = fnv1a(g_toks.v, (size_t)deepest * sizeof(int));
     for (uint32_t i = 0; i < N_DEPTHS; i++) hdr.depths[i] = g_depths[i];
-    if (strlen(DS4_GATE_BUILD_REF) >= REF_LEN) {
-        fprintf(stderr, "build ref '%s' too long (max %u)\n", DS4_GATE_BUILD_REF, REF_LEN - 1u);
+    if (strlen(PULSAR_GATE_BUILD_REF) >= REF_LEN) {
+        fprintf(stderr, "build ref '%s' too long (max %u)\n", PULSAR_GATE_BUILD_REF, REF_LEN - 1u);
         return 1;
     }
-    snprintf(hdr.build_ref, REF_LEN, "%s", DS4_GATE_BUILD_REF);
+    snprintf(hdr.build_ref, REF_LEN, "%s", PULSAR_GATE_BUILD_REF);
 
     printf("prefill bit-exactness gate: model=%s width=%d prompt_fnv=%016llx depths=",
-           ds4_engine_model_name(g_e), width, (unsigned long long)hdr.prompt_fnv);
+           pulsar_engine_model_name(g_e), width, (unsigned long long)hdr.prompt_fnv);
     for (uint32_t i = 0; i < N_DEPTHS; i++) printf("%s%u", i ? "," : "", g_depths[i]);
     printf("\n");
 
@@ -770,8 +770,8 @@ int main(int argc, char **argv) {
                blob_path, N_DEPTHS, width);
         free(again);
         free(rows);
-        ds4_tokens_free(&g_toks);
-        ds4_engine_close(g_e);
+        pulsar_tokens_free(&g_toks);
+        pulsar_engine_close(g_e);
         return 0;
     }
 
@@ -786,8 +786,8 @@ int main(int argc, char **argv) {
         free(base);
         free(again);
         free(rows);
-        ds4_tokens_free(&g_toks);
-        ds4_engine_close(g_e);
+        pulsar_tokens_free(&g_toks);
+        pulsar_engine_close(g_e);
         return fail ? 1 : 0;
     }
 
@@ -809,7 +809,7 @@ int main(int argc, char **argv) {
     free(base);
     free(again);
     free(rows);
-    ds4_tokens_free(&g_toks);
-    ds4_engine_close(g_e);
+    pulsar_tokens_free(&g_toks);
+    pulsar_engine_close(g_e);
     return fail ? 1 : 0;
 }

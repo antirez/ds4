@@ -1,4 +1,4 @@
-#include "ds4_server_internal.h"
+#include "pulsar_server_internal.h"
 
 
 
@@ -14,7 +14,7 @@
 bool server_bank_switch(server *s, int bank);
 /* Bank-aware common-prefix of `sl` against `prompt` (scheduling reads). */
 static int server_slot_common_prefix(const server *s, const session_slot *sl,
-                                     const ds4_tokens *prompt);
+                                     const pulsar_tokens *prompt);
 /* plan-33 inc D: evict ONE non-trunk victim (LRU-superseded preferred, else
  * plain LRU) so a warm fork has a free bank — trunk always protected. Defined
  * near worker_evict_one; forward-declared for the routing path above it. */
@@ -48,7 +48,7 @@ thinking_state thinking_state_from_prompt(const request *r) {
     thinking_state st = {0};
     if (r && r->prompt_text) {
         thinking_state_feed(&st, r->prompt_text, strlen(r->prompt_text));
-    } else if (r && ds4_think_mode_enabled(r->think_mode)) {
+    } else if (r && pulsar_think_mode_enabled(r->think_mode)) {
         st.inside = true;
     }
     return st;
@@ -99,24 +99,24 @@ static int chat_think_tool_recovery(server *s,
 
     const char *inject = "</think>\n\n";
     const size_t inject_len = strlen(inject);
-    ds4_tokens toks = {0};
-    ds4_tokenize_rendered_chat(s->engine, inject, &toks);
+    pulsar_tokens toks = {0};
+    pulsar_tokenize_rendered_chat(s->engine, inject, &toks);
 
-    const int room = ds4_session_ctx(s->sess) - ds4_session_pos(s->sess);
+    const int room = pulsar_session_ctx(s->sess) - pulsar_session_pos(s->sess);
     if (toks.len <= 0 ||
         toks.len >= room ||
         *completion + toks.len >= max_tokens) {
         /* Not enough budget to recover; leave the stream as generated and let
          * the parse-time fallback deal with it.  Skip past this marker so the
          * scan does not retry it every token. */
-        ds4_tokens_free(&toks);
+        pulsar_tokens_free(&toks);
         *scan_from = text->len;
         return 0;
     }
 
     for (int i = 0; i < toks.len; i++) {
-        if (ds4_session_eval(s->sess, toks.v[i], err, errlen) != 0) {
-            ds4_tokens_free(&toks);
+        if (pulsar_session_eval(s->sess, toks.v[i], err, errlen) != 0) {
+            pulsar_tokens_free(&toks);
             return -1;
         }
         (*completion)++;
@@ -124,7 +124,7 @@ static int chat_think_tool_recovery(server *s,
     buf_append(text, inject, inject_len);
     thinking_state_feed(thinking, inject, inject_len);
     *scan_from = text->len;
-    ds4_tokens_free(&toks);
+    pulsar_tokens_free(&toks);
     return 1;
 }
 
@@ -133,10 +133,10 @@ static int chat_think_tool_recovery(server *s,
 static char *rendered_chat_system_region(const char *prompt_text) {
     if (!prompt_text) return xstrdup("");
     const char *p = prompt_text;
-    const char *bos = DS4_SERVER_RENDER_BOS;
+    const char *bos = PULSAR_SERVER_RENDER_BOS;
     const size_t bos_len = strlen(bos);
     if (!strncmp(p, bos, bos_len)) p += bos_len;
-    const char *max_prefix = ds4_think_max_prefix();
+    const char *max_prefix = pulsar_think_max_prefix();
     const size_t max_prefix_len = strlen(max_prefix);
     if (max_prefix_len && !strncmp(p, max_prefix, max_prefix_len)) {
         p += max_prefix_len;
@@ -174,13 +174,13 @@ char *build_invalid_dsml_tool_error_suffix(const request *r,
     }
 
     buf suffix = {0};
-    if (r && ds4_think_mode_enabled(r->think_mode) && thinking && thinking->inside) {
+    if (r && pulsar_think_mode_enabled(r->think_mode) && thinking && thinking->inside) {
         buf_puts(&suffix, "</think>");
     }
     buf_puts(&suffix, "<｜end▁of▁sentence｜><｜User｜><tool_result>");
     append_tool_result_text(&suffix, tool_error.ptr ? tool_error.ptr : "");
     buf_puts(&suffix, "</tool_result><｜Assistant｜>");
-    buf_puts(&suffix, r && ds4_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
+    buf_puts(&suffix, r && pulsar_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
 
     free(system);
     buf_free(&tool_error);
@@ -196,21 +196,21 @@ static bool append_rendered_suffix_to_live_session(server *s, session_slot *sl,
     (void)sl; /* slot is a pure bank descriptor; the session is s->sess */
     if (tokens_appended) *tokens_appended = 0;
     if (!s || !suffix || !suffix[0]) return true;
-    const ds4_tokens *live = ds4_session_tokens(s->sess);
+    const pulsar_tokens *live = pulsar_session_tokens(s->sess);
     if (!live) {
         if (err && errlen) snprintf(err, errlen, "live session is unavailable");
         return false;
     }
 
-    ds4_tokens target = {0};
+    pulsar_tokens target = {0};
     build_prompt_from_exact_prefix_and_text_suffix(s->engine, live, suffix, &target);
-    const int before = ds4_session_pos(s->sess);
-    bool ok = ds4_session_sync(s->sess, &target, err, errlen) == 0;
+    const int before = pulsar_session_pos(s->sess);
+    bool ok = pulsar_session_sync(s->sess, &target, err, errlen) == 0;
     if (ok && tokens_appended) {
-        int delta = ds4_session_pos(s->sess) - before;
+        int delta = pulsar_session_pos(s->sess) - before;
         *tokens_appended = delta > 0 ? delta : 0;
     }
-    ds4_tokens_free(&target);
+    pulsar_tokens_free(&target);
     return ok;
 }
 
@@ -241,7 +241,7 @@ bool should_remember_thinking_checkpoint(const request *r,
      * reflects the client's ACTUAL replay behavior, so it is the sole gate;
      * remember_thinking_checkpoint renders the tool-context vs toolless form. */
     if (r->prompt_preserves_reasoning) return false;
-    if (!ds4_think_mode_enabled(r->think_mode)) return false;
+    if (!pulsar_think_mode_enabled(r->think_mode)) return false;
     if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
     if (thinking && thinking->inside) return false;
     return true;
@@ -262,8 +262,8 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
     }
     char flags[32];
     log_flags(flags, sizeof(flags), responses_protocol, false, false, false, false);
-    server_log(DS4_LOG_TOOL,
-               "ds4-server: tool calls ctx=%s%s%s n=%d raw_dsml=%d ids=[%s] names=[%s]",
+    server_log(PULSAR_LOG_TOOL,
+               "pulsar-server: tool calls ctx=%s%s%s n=%d raw_dsml=%d ids=[%s] names=[%s]",
                ctx,
                flags[0] ? " " : "",
                flags,
@@ -339,8 +339,8 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     log_flags(flags, sizeof(flags), p->responses_protocol,
               p->has_tools, false, false, false);
     const char *phase = p->phase ? p->phase : "prefill";
-    server_log(DS4_LOG_PREFILL,
-               "ds4-server: %s ctx=%s%s%s %s chunk %d/%d (%.1f%%) chunk=%.2f t/s avg=%.2f t/s %.3fs",
+    server_log(PULSAR_LOG_PREFILL,
+               "pulsar-server: %s ctx=%s%s%s %s chunk %d/%d (%.1f%%) chunk=%.2f t/s avg=%.2f t/s %.3fs",
                p->kind == REQ_CHAT ? "chat" : "completion",
                p->ctx,
                flags[0] ? " " : "",
@@ -366,15 +366,15 @@ static void send_prefill_failure_response(server *s, const job *j,
     const char *kind = j->req.kind == REQ_CHAT ? "chat" : "completion";
     if (j->req.stream && progress && progress->headers_sent) {
         if (progress->stream_failed) {
-            server_log(DS4_LOG_GENERATION,
-                       "ds4-server: %s ctx=%s%s%s prefill failed after stream closed: %s",
+            server_log(PULSAR_LOG_GENERATION,
+                       "pulsar-server: %s ctx=%s%s%s prefill failed after stream closed: %s",
                        kind, ctx, flags && flags[0] ? " " : "",
                        flags && flags[0] ? flags : "", err);
             return;
         }
         if (!sse_error_event(j->fd, &j->req, err)) {
-            server_log(DS4_LOG_GENERATION,
-                       "ds4-server: %s ctx=%s%s%s prefill SSE error failed: %s",
+            server_log(PULSAR_LOG_GENERATION,
+                       "pulsar-server: %s ctx=%s%s%s prefill SSE error failed: %s",
                        kind, ctx, flags && flags[0] ? " " : "",
                        flags && flags[0] ? flags : "", err);
         }
@@ -388,7 +388,7 @@ static void send_prefill_failure_response(server *s, const job *j,
 char *build_tool_checkpoint_suffix(const request *r, const char *content,
                                           const char *reasoning, const tool_calls *calls) {
     buf suffix = {0};
-    if (ds4_think_mode_enabled(r->think_mode)) {
+    if (pulsar_think_mode_enabled(r->think_mode)) {
         buf_puts(&suffix, reasoning ? reasoning : "");
         buf_puts(&suffix, "</think>");
     }
@@ -413,7 +413,7 @@ char *build_responses_visible_assistant_suffix(const request *r,
      * reasoning in the remembered visible prefix when this assistant turn ended
      * in tool calls.  A client that does replay final-answer reasoning will not
      * match this visible shortcut and can still use exact token-prefix replay. */
-    if (ds4_think_mode_enabled(r->think_mode)) {
+    if (pulsar_think_mode_enabled(r->think_mode)) {
         if (r->reasoning_summary_emit && calls && calls->len > 0) {
             buf_puts(&suffix, reasoning ? reasoning : "");
         }
@@ -443,7 +443,7 @@ char *build_responses_visible_assistant_suffix(const request *r,
 char *build_toolless_thinking_visible_text(const request *r,
                                                   const char *content) {
     if (!r || !r->prompt_text) return NULL;
-    if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
+    if (!pulsar_think_mode_enabled(r->think_mode)) return NULL;
 
     size_t pt_len = strlen(r->prompt_text);
     const char *think_tag = "<think>";
@@ -474,7 +474,7 @@ static void remember_thinking_checkpoint(server *s, session_slot *sl,
      * renders "</think>{content}<eos>" (no "<think>") — the toolless form. */
     char *visible = NULL;
     if (j->req.has_tools) {
-        if (!j->req.prompt_text || !ds4_think_mode_enabled(j->req.think_mode))
+        if (!j->req.prompt_text || !pulsar_think_mode_enabled(j->req.think_mode))
             return;
         char *suffix = build_tool_checkpoint_suffix(&j->req, content, "", NULL);
         buf b = {0};
@@ -488,12 +488,12 @@ static void remember_thinking_checkpoint(server *s, session_slot *sl,
     if (!visible) return;
 
     thinking_live_remember(s, sl, visible);
-    server_log(DS4_LOG_KVCACHE,
-               "ds4-server: thinking live checkpoint remembered ctx=%s live=%d visible=%zu",
-               ctx, ds4_session_pos(s->sess), strlen(visible));
+    server_log(PULSAR_LOG_KVCACHE,
+               "pulsar-server: thinking live checkpoint remembered ctx=%s live=%d visible=%zu",
+               ctx, pulsar_session_pos(s->sess), strlen(visible));
     trace_event(s, trace_id,
                 "thinking live checkpoint remembered: live=%d visible=%zu",
-                ds4_session_pos(s->sess), strlen(visible));
+                pulsar_session_pos(s->sess), strlen(visible));
     free(visible);
 }
 
@@ -522,7 +522,7 @@ static void remember_tool_thinking_checkpoint(server *s, session_slot *sl,
                                               const char *reasoning,
                                               const tool_calls *calls) {
     if (!calls || calls->len == 0 || !j->req.prompt_text) return;
-    if (!ds4_think_mode_enabled(j->req.think_mode)) return;
+    if (!pulsar_think_mode_enabled(j->req.think_mode)) return;
 
     /* Visible key = prompt_text (ends "<｜Assistant｜><think>") + reasoning-preserved
      * suffix "{reasoning}</think>{content}{DSML}<EOS>" — byte-identical to what
@@ -536,12 +536,12 @@ static void remember_tool_thinking_checkpoint(server *s, session_slot *sl,
     buf_puts(&visible, suffix);
     if (visible.ptr) {
         thinking_live_remember(s, sl, visible.ptr);
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: tool thinking checkpoint remembered ctx=%s live=%d visible=%zu",
-                   ctx, ds4_session_pos(s->sess), visible.len);
+        server_log(PULSAR_LOG_KVCACHE,
+                   "pulsar-server: tool thinking checkpoint remembered ctx=%s live=%d visible=%zu",
+                   ctx, pulsar_session_pos(s->sess), visible.len);
         trace_event(s, trace_id,
                     "tool thinking checkpoint remembered: live=%d visible=%zu",
-                    ds4_session_pos(s->sess), visible.len);
+                    pulsar_session_pos(s->sess), visible.len);
     }
     free(suffix);
     buf_free(&visible);
@@ -566,16 +566,16 @@ static void canonicalize_tool_checkpoint(server *s, session_slot *sl,
     buf_puts(&rendered, j->req.prompt_text);
     buf_puts(&rendered, suffix_text);
 
-    ds4_tokens canonical = {0};
-    ds4_tokenize_rendered_chat(s->engine, rendered.ptr ? rendered.ptr : "", &canonical);
-    const int live_len = ds4_session_pos(s->sess);
-    const int common = ds4_session_common_prefix(s->sess, &canonical);
+    pulsar_tokens canonical = {0};
+    pulsar_tokenize_rendered_chat(s->engine, rendered.ptr ? rendered.ptr : "", &canonical);
+    const int live_len = pulsar_session_pos(s->sess);
+    const int common = pulsar_session_common_prefix(s->sess, &canonical);
     if (common == live_len && canonical.len == live_len) goto done;
 
     size_t live_text_len;
     live_text_len = 0;
     char *live_text;
-    live_text = render_tokens_text(s->engine, ds4_session_tokens(s->sess), &live_text_len);
+    live_text = render_tokens_text(s->engine, pulsar_session_tokens(s->sess), &live_text_len);
     if (live_text_len == rendered.len &&
         (live_text_len == 0 || memcmp(live_text, rendered.ptr, live_text_len) == 0))
     {
@@ -596,29 +596,29 @@ static void canonicalize_tool_checkpoint(server *s, session_slot *sl,
 
     char err[160];
     memset(err, 0, sizeof(err));
-    ds4_session_rewrite_result rr;
-    rr = ds4_session_rewrite_from_common(s->sess, &canonical, common,
+    pulsar_session_rewrite_result rr;
+    rr = pulsar_session_rewrite_from_common(s->sess, &canonical, common,
                                          err, sizeof(err));
-    if (rr == DS4_SESSION_REWRITE_OK) {
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: tool checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d",
+    if (rr == PULSAR_SESSION_REWRITE_OK) {
+        server_log(PULSAR_LOG_KVCACHE,
+                   "pulsar-server: tool checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d",
                    ctx, common, live_len, canonical.len);
         trace_event(s, trace_id,
                     "tool checkpoint canonicalized: common=%d live=%d canonical=%d",
                     common, live_len, canonical.len);
-    } else if (rr == DS4_SESSION_REWRITE_REBUILD_NEEDED) {
+    } else if (rr == PULSAR_SESSION_REWRITE_REBUILD_NEEDED) {
         /* The generated DSML suffix and the canonical prompt share a prefix,
          * but the generated tail is too large to overwrite safely inside the
          * live raw-window ring.  Prefer an older disk checkpoint over replaying
          * a very long conversation from token zero. */
         char *path = NULL;
-        ds4_tokens effective = {0};
+        pulsar_tokens effective = {0};
         int loaded = kv_cache_try_load_text(s, sl, rendered.ptr ? rendered.ptr : "",
                                             &effective, &path, NULL, false);
-        if (loaded == 0) ds4_session_invalidate(s->sess);
+        if (loaded == 0) pulsar_session_invalidate(s->sess);
 
         char sync_err[160] = {0};
-        const ds4_tokens *sync_prompt = loaded > 0 ? &effective : &canonical;
+        const pulsar_tokens *sync_prompt = loaded > 0 ? &effective : &canonical;
         char rebuild_ctx[48];
         request_ctx_span(rebuild_ctx, sizeof(rebuild_ctx), loaded, sync_prompt->len);
         int replay_tokens = sync_prompt->len - loaded;
@@ -629,8 +629,8 @@ static void canonicalize_tool_checkpoint(server *s, session_slot *sl,
         if (discarded_live_tokens < 0) discarded_live_tokens = 0;
         const char *source = loaded > 0 ? "disk" : "full";
         const double rebuild_t0 = server_now_sec();
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: tool checkpoint canonicalization needs %d tokens rebuild ctx=%s request_ctx=%s reason=canonical-tail-rewrite tail=%d discard=%d common=%d live=%d target=%d cached=%d source=%s%s%s",
+        server_log(PULSAR_LOG_KVCACHE,
+                   "pulsar-server: tool checkpoint canonicalization needs %d tokens rebuild ctx=%s request_ctx=%s reason=canonical-tail-rewrite tail=%d discard=%d common=%d live=%d target=%d cached=%d source=%s%s%s",
                    replay_tokens,
                    rebuild_ctx,
                    ctx,
@@ -662,47 +662,47 @@ static void canonicalize_tool_checkpoint(server *s, session_slot *sl,
             .headers_sent = true,
         };
         snprintf(rebuild_progress.ctx, sizeof(rebuild_progress.ctx), "%s", rebuild_ctx);
-        ds4_session_set_progress(s->sess, server_progress_cb, &rebuild_progress);
-        ds4_session_set_display_progress(s->sess, server_progress_cb, &rebuild_progress);
-        if (ds4_session_sync(s->sess, sync_prompt, sync_err, sizeof(sync_err)) == 0) {
-            ds4_session_set_progress(s->sess, NULL, NULL);
-            ds4_session_set_display_progress(s->sess, NULL, NULL);
+        pulsar_session_set_progress(s->sess, server_progress_cb, &rebuild_progress);
+        pulsar_session_set_display_progress(s->sess, server_progress_cb, &rebuild_progress);
+        if (pulsar_session_sync(s->sess, sync_prompt, sync_err, sizeof(sync_err)) == 0) {
+            pulsar_session_set_progress(s->sess, NULL, NULL);
+            pulsar_session_set_display_progress(s->sess, NULL, NULL);
             const double rebuild_sec = server_now_sec() - rebuild_t0;
             if (loaded > 0) {
-                server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: tool checkpoint rebuild done ctx=%s request_ctx=%s source=disk cached=%d replay=%d target=%d %.3fs",
+                server_log(PULSAR_LOG_KVCACHE,
+                           "pulsar-server: tool checkpoint rebuild done ctx=%s request_ctx=%s source=disk cached=%d replay=%d target=%d %.3fs",
                            rebuild_ctx, ctx, loaded, replay_tokens, canonical.len, rebuild_sec);
                 trace_event(s, trace_id,
                             "tool checkpoint canonicalized via disk: common=%d live=%d canonical=%d cached=%d file=%s",
                             common, live_len, canonical.len, loaded, path ? path : "");
             } else {
-                server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: tool checkpoint rebuild done ctx=%s request_ctx=%s source=full cached=0 replay=%d target=%d %.3fs",
+                server_log(PULSAR_LOG_KVCACHE,
+                           "pulsar-server: tool checkpoint rebuild done ctx=%s request_ctx=%s source=full cached=0 replay=%d target=%d %.3fs",
                            rebuild_ctx, ctx, replay_tokens, canonical.len, rebuild_sec);
                 trace_event(s, trace_id,
                             "tool checkpoint canonicalized via rebuild: common=%d live=%d canonical=%d reason=%s",
                             common, live_len, canonical.len, err);
             }
         } else {
-            ds4_session_set_progress(s->sess, NULL, NULL);
-            ds4_session_set_display_progress(s->sess, NULL, NULL);
-            server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: tool checkpoint rebuild failed ctx=%s request_ctx=%s source=%s cached=%d replay=%d target=%d error=\"%s\"",
+            pulsar_session_set_progress(s->sess, NULL, NULL);
+            pulsar_session_set_display_progress(s->sess, NULL, NULL);
+            server_log(PULSAR_LOG_KVCACHE,
+                       "pulsar-server: tool checkpoint rebuild failed ctx=%s request_ctx=%s source=%s cached=%d replay=%d target=%d error=\"%s\"",
                        rebuild_ctx, ctx, source, loaded, replay_tokens,
                        canonical.len, sync_err);
             trace_event(s, trace_id, "tool checkpoint canonicalization failed after rebuild request: %s", sync_err);
         }
-        ds4_tokens_free(&effective);
+        pulsar_tokens_free(&effective);
         free(path);
     } else {
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: tool checkpoint canonicalization failed ctx=%s common=%d live=%d canonical=%d error=\"%s\"",
+        server_log(PULSAR_LOG_KVCACHE,
+                   "pulsar-server: tool checkpoint canonicalization failed ctx=%s common=%d live=%d canonical=%d error=\"%s\"",
                    ctx, common, live_len, canonical.len, err);
         trace_event(s, trace_id, "tool checkpoint canonicalization failed: %s", err);
     }
 
 done:
-    ds4_tokens_free(&canonical);
+    pulsar_tokens_free(&canonical);
     buf_free(&rendered);
     free(suffix_text);
 }
@@ -739,11 +739,11 @@ bool should_canonicalize_tool_checkpoint(const server *s, const tool_calls *call
  *
  * Everything that must survive across quanta lives in gen_state, hung off the
  * slot. A prefill quantum uses the engine's own chunk boundaries: a cancel
- * callback interrupts ds4_session_sync() after one completed chunk (only when
- * ds4_session_prefill_quantum_min_suffix() says resumption is bit-exact) and
+ * callback interrupts pulsar_session_sync() after one completed chunk (only when
+ * pulsar_session_prefill_quantum_min_suffix() says resumption is bit-exact) and
  * the next quantum re-issues the sync, which resumes from the checkpoint.
  * A decode quantum runs the sampling loop for at most
- * DS4_SERVER_DECODE_QUANTUM_TOKENS tokens. Between quanta the session is not
+ * PULSAR_SERVER_DECODE_QUANTUM_TOKENS tokens. Between quanta the session is not
  * touched, so the spec-decode carry (spec_carry_* in session.c) and sampling
  * rng stay valid; with one slot the quanta run back-to-back and the output is
  * byte-identical to the old function.
@@ -756,14 +756,14 @@ bool should_canonicalize_tool_checkpoint(const server *s, const tool_calls *call
  * simply waits out the (bounded) repair. The final logits-writing prefill
  * chunk likewise always completes within its quantum — the engine's cancel
  * check only interrupts when enough suffix remains for a bit-exact resume
- * (ds4_session_prefill_quantum_min_suffix).
+ * (pulsar_session_prefill_quantum_min_suffix).
  *
  * The largest quantum overshoot in the system is none of the above: it is
  * lazy slot provisioning (provision_slot in the scheduler below), whose
- * ds4_session_create is a multi-GiB allocation that can take SECONDS and
+ * pulsar_session_create is a multi-GiB allocation that can take SECONDS and
  * stalls every bound slot for its duration — larger than the DSpark fused
  * step's ≤17-token burst. Deliberate: all GPU work stays on this one thread
- * (CUDA-state audit, ds4_server_internal.h).
+ * (CUDA-state audit, pulsar_server_internal.h).
  */
 
 typedef enum {
@@ -781,8 +781,8 @@ struct gen_state {
 
     /* prompt/cache resolution (owned by gen_begin, read by later phases) */
     char err[160];
-    ds4_tokens effective_prompt;
-    const ds4_tokens *prompt_for_sync; /* &j->req.prompt or &effective_prompt */
+    pulsar_tokens effective_prompt;
+    const pulsar_tokens *prompt_for_sync; /* &j->req.prompt or &effective_prompt */
     bool responses_protocol;
     bool responses_live_continuation;
     bool anthropic_live_continuation;
@@ -799,7 +799,7 @@ struct gen_state {
     server_prefill_progress progress; /* stable address: callback userdata */
     int cold_store_len;
     int suppressed_continued_last;
-    ds4_tokens cold_prefix;
+    pulsar_tokens cold_prefix;
 
     /* prefill quantum policy (see gen_prefill_cancel_cb) */
     uint32_t prefill_min_suffix; /* 0 = interrupting is never exact */
@@ -834,7 +834,7 @@ struct gen_state {
     int next_tool_progress;
     int next_decode_log;
     double decode_t0;
-    ds4_spec_metrics spec_start; /* per-session DSpark counters snapshotted at
+    pulsar_spec_metrics spec_start; /* per-session DSpark counters snapshotted at
                                   * decode start; diffed at finish for this
                                   * request's accept-rate/tokens-per-step */
     double last_decode_log_t;
@@ -859,7 +859,7 @@ struct gen_state {
     bool batch_feed_valid;
     int  batch_feed_token;
     int  batch_feed_pos;
-    ds4_tokens batch_pending;
+    pulsar_tokens batch_pending;
     /* plan-34 inc 5: this prefill slot is not fusable (a fused step rejected its
      * run as not-position-true, e.g. a cache-warm resume); route it CLASSIC. Set
      * once by the fused quantum on giveup; the classic path handles it correctly. */
@@ -874,7 +874,7 @@ static void gen_stream_begin(server *s, session_slot *sl);
 
 
 /* Chunk-note wrapper around server_progress_cb: counts completed prefill
- * chunks in the CURRENT ds4_session_sync call so the cancel callback can
+ * chunks in the CURRENT pulsar_session_sync call so the cancel callback can
  * interrupt after exactly one chunk. Counters are reset before each sync. */
 static void gen_prefill_progress_cb(void *ud, const char *event, int current, int total) {
     gen_state *g = (gen_state *)ud;
@@ -893,7 +893,7 @@ static void gen_prefill_progress_cb(void *ud, const char *event, int current, in
 /* One prefill chunk per quantum. Only interrupt when the engine guarantees
  * bit-exact resumption AND enough suffix remains that the resumed sync takes
  * the batched chunk path rather than the single-token tail path (see
- * ds4_session_prefill_quantum_min_suffix). */
+ * pulsar_session_prefill_quantum_min_suffix). */
 /* Has the client gone away?  A request whose peer has disconnected is pure
  * waste: on this box a single stream is ~16 t/s, so an abandoned long generation
  * burns minutes of EXCLUSIVE GPU that a live request could have used.  Streaming
@@ -909,7 +909,7 @@ static void gen_prefill_progress_cb(void *ud, const char *event, int current, in
  * full teardown/RST).  The deliberate trade: a client that half-closes its write
  * side while still reading the response would be treated as gone.  HTTP clients
  * do not do that while awaiting a response, and the same assumption is standard
- * in production servers — but DS4_ABORT_ON_DISCONNECT=0 restores the old
+ * in production servers — but PULSAR_ABORT_ON_DISCONNECT=0 restores the old
  * run-to-completion behavior without a rebuild if some client ever misbehaves.
  * The env is read ONCE (project rule: no per-token getenv). */
 static bool gen_client_disconnected(int fd) {
@@ -945,13 +945,13 @@ static bool gen_prefill_cancel_cb(void *ud) {
 
 
 /* Shared failure epilogue for both prefill phases (the old duplicated blocks
- * after each ds4_session_sync failure). Token vectors and the disk path are
+ * after each pulsar_session_sync failure). Token vectors and the disk path are
  * freed centrally by gen_state_free. */
 static void gen_prefill_fail(server *s, session_slot *sl) {
     gen_state *g = sl->gen;
-    ds4_session_set_cancel(s->sess, NULL, NULL);
-    ds4_session_set_progress(s->sess, NULL, NULL);
-    ds4_session_set_display_progress(s->sess, NULL, NULL);
+    pulsar_session_set_cancel(s->sess, NULL, NULL);
+    pulsar_session_set_progress(s->sess, NULL, NULL);
+    pulsar_session_set_display_progress(s->sess, NULL, NULL);
     kv_cache_tracker_bind(s, sl);
     kv_cache_restore_suppressed_continued(&s->kv, g->suppressed_continued_last,
                                           g->cold_store_len);
@@ -991,13 +991,13 @@ static void gen_begin(server *s, session_slot *sl) {
         gen_prefill_fail(s, sl);
         return;
     }
-    const int old_pos = ds4_session_pos(s->sess);
-    const int common = ds4_session_common_prefix(s->sess, &j->req.prompt);
+    const int old_pos = pulsar_session_pos(s->sess);
+    const int common = pulsar_session_common_prefix(s->sess, &j->req.prompt);
     trace_cache_diag cache_diag = {0};
-    trace_cache_capture(&cache_diag, ds4_session_tokens(s->sess),
+    trace_cache_capture(&cache_diag, pulsar_session_tokens(s->sess),
                         &j->req.prompt, old_pos, common);
-    ds4_tokens effective_prompt = {0};
-    const ds4_tokens *prompt_for_sync = &j->req.prompt;
+    pulsar_tokens effective_prompt = {0};
+    const pulsar_tokens *prompt_for_sync = &j->req.prompt;
     const bool responses_protocol = j->req.api == API_RESPONSES;
     bool responses_live_continuation = false;
     bool anthropic_live_continuation = false;
@@ -1049,7 +1049,7 @@ static void gen_begin(server *s, session_slot *sl) {
          * live frontier no longer matches.  Since the request did not replay
          * the prior assistant call, there is no stateless prefix to match and
          * no disk key to search by. */
-        ds4_tokens_free(&effective_prompt);
+        pulsar_tokens_free(&effective_prompt);
         http_error(j->fd, s->enable_cors, 409,
                    "Responses continuation state is not available; retry by replaying the full input history");
         g->phase = GEN_DONE;
@@ -1057,7 +1057,7 @@ static void gen_begin(server *s, session_slot *sl) {
     } else if (cached == 0 && j->req.api == API_ANTHROPIC &&
                j->req.anthropic_requires_live_tool_state)
     {
-        ds4_tokens_free(&effective_prompt);
+        pulsar_tokens_free(&effective_prompt);
         http_error(j->fd, s->enable_cors, 409,
                    "Anthropic continuation state is not available; retry by replaying the full messages history");
         g->phase = GEN_DONE;
@@ -1088,8 +1088,8 @@ static void gen_begin(server *s, session_slot *sl) {
         }
     }
     if (cached == 0 && old_pos > 0) {
-        server_log(DS4_LOG_WARNING,
-                   "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d reason=%s",
+        server_log(PULSAR_LOG_WARNING,
+                   "pulsar-server: live kv cache miss%s live=%d prompt=%d common=%d reason=%s",
                    responses_protocol ? " RESPPROTO" : "",
                    old_pos, j->req.prompt.len, common,
                    trace_cache_miss_reason(&cache_diag));
@@ -1123,7 +1123,7 @@ static void gen_begin(server *s, session_slot *sl) {
         !responses_reasoning_state_preserved;
     const int prompt_tokens = prompt_for_sync->len;
     /* OpenAI usage details: the reusable prefix is a cache read, while the
-     * effective prompt suffix evaluated by ds4_session_sync() is written into
+     * effective prompt suffix evaluated by pulsar_session_sync() is written into
      * the live KV cache and can be reused by the next request. */
     j->req.cache_read_tokens = cached;
     j->req.cache_write_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
@@ -1157,21 +1157,21 @@ static void gen_begin(server *s, session_slot *sl) {
     log_flags(g->req_flags, sizeof(g->req_flags), responses_protocol,
               j->req.has_tools, false, false, false);
     if (responses_live_continuation) {
-        server_log(DS4_LOG_PREFILL,
-                   "ds4-server: responses live continuation RESPPROTO match=%s ids=%d cached=%d prompt=%d",
+        server_log(PULSAR_LOG_PREFILL,
+                   "pulsar-server: responses live continuation RESPPROTO match=%s ids=%d cached=%d prompt=%d",
                    responses_live_match ? responses_live_match : "unknown",
                    responses_live_match_ids,
                    cached,
                    prompt_tokens);
     } else if (anthropic_live_continuation) {
-        server_log(DS4_LOG_PREFILL,
-                   "ds4-server: anthropic live continuation match=tool-output-ids ids=%d cached=%d prompt=%d",
+        server_log(PULSAR_LOG_PREFILL,
+                   "pulsar-server: anthropic live continuation match=tool-output-ids ids=%d cached=%d prompt=%d",
                    anthropic_live_match_ids,
                    cached,
                    prompt_tokens);
     } else if (thinking_live_continuation) {
-        server_log(DS4_LOG_PREFILL,
-                   "ds4-server: thinking live continuation match=visible-prefix cached=%d prompt=%d",
+        server_log(PULSAR_LOG_PREFILL,
+                   "pulsar-server: thinking live continuation match=visible-prefix cached=%d prompt=%d",
                    cached,
                    prompt_tokens);
     }
@@ -1183,8 +1183,8 @@ static void gen_begin(server *s, session_slot *sl) {
          * of surfacing a hard error to the user.  This is lower fidelity, but it
          * lets old / restarted agent sessions recover and is exactly what the
          * client asked us to prefill. */
-        server_log(DS4_LOG_WARNING,
-                   "ds4-server: responses replay RESPPROTO missing reasoning state; continuing from visible history source=%s cached=%d prompt=%d",
+        server_log(PULSAR_LOG_WARNING,
+                   "pulsar-server: responses replay RESPPROTO missing reasoning state; continuing from visible history source=%s cached=%d prompt=%d",
                    cache_source,
                    cached,
                    prompt_tokens);
@@ -1192,14 +1192,14 @@ static void gen_begin(server *s, session_slot *sl) {
                     "responses replay missing reasoning state; continuing from visible history source=%s cached=%d",
                     cache_source, cached);
     }
-    server_log(DS4_LOG_PREFILL,
-               "ds4-server: %s ctx=%s%s%s prompt start",
+    server_log(PULSAR_LOG_PREFILL,
+               "pulsar-server: %s ctx=%s%s%s prompt start",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
                g->ctx_span,
                g->req_flags[0] ? " " : "",
                g->req_flags);
-    ds4_session_set_progress(s->sess, gen_prefill_progress_cb, g);
-    ds4_session_set_display_progress(s->sess, server_progress_cb, &g->progress);
+    pulsar_session_set_progress(s->sess, gen_prefill_progress_cb, g);
+    pulsar_session_set_display_progress(s->sess, server_progress_cb, &g->progress);
 
     int cold_store_len = 0;
     if (cached == 0 &&
@@ -1209,8 +1209,8 @@ static void gen_begin(server *s, session_slot *sl) {
         prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
     {
         const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
-                                                    ds4_token_user(s->engine),
-                                                    ds4_token_assistant(s->engine));
+                                                    pulsar_token_user(s->engine),
+                                                    pulsar_token_assistant(s->engine));
         cold_store_len = anchor >= s->kv.opt.min_tokens ?
                          anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
     }
@@ -1244,7 +1244,7 @@ static void gen_begin(server *s, session_slot *sl) {
      * cancel callback itself is armed per-sync in gen_step_prefill, NOT here: in
      * pool mode every slot shares the one pool session (s->sess), so a once-per-job set would be
      * clobbered by the next job the worker binds before prefilling this one. */
-    g->prefill_min_suffix = ds4_session_prefill_quantum_min_suffix(s->sess);
+    g->prefill_min_suffix = pulsar_session_prefill_quantum_min_suffix(s->sess);
 
     if (s->kv.enabled &&
         g->cold_store_len >= s->kv.opt.min_tokens &&
@@ -1265,7 +1265,7 @@ static void gen_begin(server *s, session_slot *sl) {
 static void gen_step_prefill(server *s, session_slot *sl) {
     gen_state *g = sl->gen;
     const bool cold = g->phase == GEN_PREFILL_COLD;
-    const ds4_tokens *target = cold ? &g->cold_prefix : g->prompt_for_sync;
+    const pulsar_tokens *target = cold ? &g->cold_prefix : g->prompt_for_sync;
 
     /* Arm the cancel callback on THIS slot's gen_state right before the sync.
      * In pool mode every slot shares the one pool session (s->sess), and the worker binds several
@@ -1275,19 +1275,19 @@ static void gen_step_prefill(server *s, session_slot *sl) {
      * slot's progress and, interrupted before its own first chunk, be misread as a
      * fatal error ("interrupted", HTTP 500). The worker prefills serially, so
      * setting it here binds the correct callback for this exact sync. */
-    ds4_session_set_cancel(s->sess, gen_prefill_cancel_cb, g);
+    pulsar_session_set_cancel(s->sess, gen_prefill_cancel_cb, g);
 
     g->prefill_chunks_done = 0;
     g->prefill_last_current = -1;
     g->prefill_total = 0;
-    const int rc = ds4_session_sync(s->sess, target, g->err, sizeof(g->err));
-    if (rc == DS4_SESSION_SYNC_INTERRUPTED) {
+    const int rc = pulsar_session_sync(s->sess, target, g->err, sizeof(g->err));
+    if (rc == PULSAR_SESSION_SYNC_INTERRUPTED) {
         if (gen_client_disconnected(g->j->fd)) {
             /* Client cancelled mid-prefill: abandon rather than resume or fail, so
              * a long deep-context prefill stops promptly on disconnect instead of
              * running to completion (the decode loop already abandons this way). */
-            server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: client disconnected during prefill, abandoning");
+            server_log(PULSAR_LOG_DEFAULT,
+                       "pulsar-server: client disconnected during prefill, abandoning");
             snprintf(g->err, sizeof(g->err), "client disconnected");
             gen_prefill_fail(s, sl);
             return;
@@ -1314,12 +1314,12 @@ static void gen_step_prefill(server *s, session_slot *sl) {
             g->suppressed_continued_last = -1;
         }
         kv_cache_tracker_flush(s, sl);
-        ds4_tokens_free(&g->cold_prefix);
+        pulsar_tokens_free(&g->cold_prefix);
         g->phase = GEN_PREFILL_MAIN;
         return; /* the cold store is a quantum boundary of its own */
     }
 
-    ds4_session_set_cancel(s->sess, NULL, NULL);
+    pulsar_session_set_cancel(s->sess, NULL, NULL);
     gen_stream_begin(s, sl);
 }
 
@@ -1336,11 +1336,11 @@ static void gen_stream_begin(server *s, session_slot *sl) {
     if (!g->responses_live_continuation) responses_live_clear(s, sl);
     if (!g->anthropic_live_continuation) anthropic_live_clear(s, sl);
     if (!g->thinking_live_continuation) thinking_live_clear(s, sl);
-    ds4_session_set_progress(s->sess, NULL, NULL);
-    ds4_session_set_display_progress(s->sess, NULL, NULL);
+    pulsar_session_set_progress(s->sess, NULL, NULL);
+    pulsar_session_set_display_progress(s->sess, NULL, NULL);
     kv_cache_maybe_store_continued(s, sl);
-    server_log(DS4_LOG_PREFILL,
-               "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
+    server_log(PULSAR_LOG_PREFILL,
+               "pulsar-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
                g->ctx_span,
                g->req_flags[0] ? " " : "",
@@ -1367,8 +1367,8 @@ static void gen_stream_begin(server *s, session_slot *sl) {
     g->responses_created_at = (long)time(NULL);
     if (j->req.stream) {
         if (g->progress.stream_failed) {
-            server_log(DS4_LOG_GENERATION,
-                       "ds4-server: %s ctx=%s%s%s stream closed during prefill",
+            server_log(PULSAR_LOG_GENERATION,
+                       "pulsar-server: %s ctx=%s%s%s stream closed during prefill",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
                        g->ctx_span,
                        g->req_flags[0] ? " " : "",
@@ -1380,8 +1380,8 @@ static void gen_stream_begin(server *s, session_slot *sl) {
          * to keep the connection alive during a long prefill. Only emit them
          * here when prefill never fired (e.g. fully cached prompt). */
         if (!g->progress.headers_sent && !sse_headers(j->fd, s->enable_cors)) {
-            server_log(DS4_LOG_GENERATION,
-                       "ds4-server: %s ctx=%s%s%s sse headers failed",
+            server_log(PULSAR_LOG_GENERATION,
+                       "pulsar-server: %s ctx=%s%s%s sse headers failed",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
                        g->ctx_span,
                        g->req_flags[0] ? " " : "",
@@ -1393,13 +1393,13 @@ static void gen_stream_begin(server *s, session_slot *sl) {
         if (j->req.api == API_ANTHROPIC &&
             !anthropic_sse_start_live(j->fd, &j->req, g->id,
                                       g->prompt_tokens, &g->anthropic_live)) {
-            server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", g->ctx_span);
+            server_log(PULSAR_LOG_GENERATION, "pulsar-server: chat ctx=%s anthropic stream start failed", g->ctx_span);
             g->phase = GEN_DONE;
             return;
         }
         if (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT &&
             !sse_chunk(j->fd, &j->req, g->id, NULL, NULL)) {
-            server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s openai role chunk failed", g->ctx_span);
+            server_log(PULSAR_LOG_GENERATION, "pulsar-server: chat ctx=%s openai role chunk failed", g->ctx_span);
             g->phase = GEN_DONE;
             return;
         }
@@ -1408,8 +1408,8 @@ static void gen_stream_begin(server *s, session_slot *sl) {
             responses_stream_init(&j->req, &g->responses_live);
             g->responses_live.active = true;
             if (!responses_sse_created(j->fd, &j->req, &g->responses_live, g->responses_created_at)) {
-                server_log(DS4_LOG_GENERATION,
-                           "ds4-server: chat ctx=%s%s%s responses created event failed",
+                server_log(PULSAR_LOG_GENERATION,
+                           "pulsar-server: chat ctx=%s%s%s responses created event failed",
                            g->ctx_span,
                            g->req_flags[0] ? " " : "",
                            g->req_flags);
@@ -1439,7 +1439,7 @@ static void gen_decode_init(server *s, session_slot *sl) {
     g->finish = "length";
     g->completion = 0;
     g->max_tokens = j->req.max_tokens;
-    int room = ds4_session_ctx(s->sess) - ds4_session_pos(s->sess);
+    int room = pulsar_session_ctx(s->sess) - pulsar_session_pos(s->sess);
     g->saw_tool_start = false;
     g->saw_tool_end = false;
     g->saw_orphan_tool_end = false;
@@ -1454,11 +1454,11 @@ static void gen_decode_init(server *s, session_slot *sl) {
      * diff them into this request's accept-rate/tokens-per-step. Re-snapshotting
      * here (decode_again also lands here) keeps the diff consistent with the
      * reset completion/decode_t0 for the attempt that actually finishes. */
-    ds4_session_spec_metrics(s->sess, &g->spec_start);
+    pulsar_session_spec_metrics(s->sess, &g->spec_start);
     g->last_decode_log_t = g->decode_t0;
     g->last_decode_log_completion = 0;
     g->thinking = thinking_state_from_prompt(&j->req);
-    g->thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
+    g->thinking_gates_tool_markers = pulsar_think_mode_enabled(j->req.think_mode);
     g->tool_scan_waiting_for_think_close =
         g->thinking_gates_tool_markers && g->thinking.inside;
     g->think_recovery_scan_from = 0;
@@ -1501,11 +1501,11 @@ static void gen_resolve_sampling(const request *req, float *temperature,
     *top_k = req->top_k;
     *top_p = req->top_p;
     *min_p = req->min_p;
-    if (ds4_think_mode_enabled(req->think_mode)) {
-        if (!req->has_temperature) *temperature = DS4_DEFAULT_TEMPERATURE;
+    if (pulsar_think_mode_enabled(req->think_mode)) {
+        if (!req->has_temperature) *temperature = PULSAR_DEFAULT_TEMPERATURE;
         if (!req->has_top_k) *top_k = 0;
-        if (!req->has_top_p) *top_p = DS4_DEFAULT_TOP_P;
-        if (!req->has_min_p) *min_p = DS4_DEFAULT_MIN_P;
+        if (!req->has_top_p) *top_p = PULSAR_DEFAULT_TOP_P;
+        if (!req->has_min_p) *min_p = PULSAR_DEFAULT_MIN_P;
     }
 }
 
@@ -1523,20 +1523,20 @@ static void gen_resolve_sampling(const request *req, float *temperature,
  * below AND the batched multi-session scatter (which samples each live bank's
  * row on the host, then calls this to stream that bank's slot). It touches
  * ONLY host state hung off sl->gen + j->req + the client fd — no engine/CUDA
- * call except ds4_token_text and the tool-recovery sync (chat_think_tool_
+ * call except pulsar_token_text and the tool-recovery sync (chat_think_tool_
  * recovery, which the batched path never reaches because n>=2 is plain,
  * tool-gated decode by contract). Behavior for the single-session path is
  * byte-identical to the pre-factoring inner loop. */
 static bool gen_emit_token(server *s, session_slot *sl, int token) {
     gen_state *g = sl->gen;
     job *j = g->j;
-    if (token == ds4_token_eos(s->engine)) {
+    if (token == pulsar_token_eos(s->engine)) {
         g->finish = "stop";
         return true;
     }
 
     size_t piece_len = 0;
-    char *piece = ds4_token_text(s->engine, token, &piece_len);
+    char *piece = pulsar_token_text(s->engine, token, &piece_len);
     g->completion++;
 
     trace_piece(s, g->trace_id, piece, piece_len);
@@ -1620,8 +1620,8 @@ static bool gen_emit_token(server *s, session_slot *sl, int token) {
                 return true;
             }
             if (recovered) {
-                server_log(DS4_LOG_WARNING,
-                           "ds4-server: chat ctx=%s%s%s tool call inside unclosed <think>; "
+                server_log(PULSAR_LOG_WARNING,
+                           "pulsar-server: chat ctx=%s%s%s tool call inside unclosed <think>; "
                            "forced </think> after %d generated tokens",
                            g->ctx_span,
                            g->req_flags[0] ? " " : "",
@@ -1651,8 +1651,8 @@ static bool gen_emit_token(server *s, session_slot *sl, int token) {
             observe_tool_markers(tool_scan, &g->saw_tool_start, &g->saw_tool_end, &orphan_end);
             if (orphan_end && !g->saw_orphan_tool_end) {
                 g->saw_orphan_tool_end = true;
-                server_log(DS4_LOG_WARNING,
-                           "ds4-server: chat ctx=%s%s%s ignored orphan tool-call end marker after %d generated tokens",
+                server_log(PULSAR_LOG_WARNING,
+                           "pulsar-server: chat ctx=%s%s%s ignored orphan tool-call end marker after %d generated tokens",
                            g->ctx_span,
                            g->req_flags[0] ? " " : "",
                            g->req_flags,
@@ -1697,7 +1697,7 @@ static bool gen_emit_token(server *s, session_slot *sl, int token) {
         g->finish = "stop";
         g->text.len = stop_pos;
         g->text.ptr[g->text.len] = '\0';
-        ds4_session_invalidate(s->sess);
+        pulsar_session_invalidate(s->sess);
         return true;
     }
 
@@ -1711,7 +1711,7 @@ static bool gen_emit_token(server *s, session_slot *sl, int token) {
 
 
 /* One decode quantum: run the sampling loop for at most
- * DS4_SERVER_DECODE_QUANTUM_TOKENS generated tokens, then yield with all loop
+ * PULSAR_SERVER_DECODE_QUANTUM_TOKENS generated tokens, then yield with all loop
  * state parked in gen_state. The session is untouched between quanta, so
  * resuming is exactly the next iteration of the old run-to-completion loop. */
 static void gen_step_decode(server *s, session_slot *sl) {
@@ -1725,16 +1725,16 @@ static void gen_step_decode(server *s, session_slot *sl) {
      * metrics are released exactly as on a natural stop; the final write simply
      * fails harmlessly on the dead fd. */
     if (gen_client_disconnected(j->fd)) {
-        server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: client disconnected, abandoning generation after %d tokens",
+        server_log(PULSAR_LOG_DEFAULT,
+                   "pulsar-server: client disconnected, abandoning generation after %d tokens",
                    g->completion);
         g->phase = GEN_FINISH;
         return;
     }
 
     while (!g_stop_requested && g->completion < g->max_tokens &&
-           ds4_session_pos(s->sess) < ds4_session_ctx(s->sess)) {
-        if (g->completion - quantum_start >= DS4_SERVER_DECODE_QUANTUM_TOKENS) {
+           pulsar_session_pos(s->sess) < pulsar_session_ctx(s->sess)) {
+        if (g->completion - quantum_start >= PULSAR_SERVER_DECODE_QUANTUM_TOKENS) {
             sl->tokens_emitted += (uint64_t)(g->completion - quantum_start);
             return; /* quantum exhausted; phase stays GEN_DECODE */
         }
@@ -1753,14 +1753,14 @@ static void gen_step_decode(server *s, session_slot *sl) {
         int token;
         int toks[17];
         int ntok = 0;
-        if (ds4_engine_has_dspark(s->engine) && g->dspark_spec_enabled) {
+        if (pulsar_engine_has_dspark(s->engine) && g->dspark_spec_enabled) {
             /* the speculative block owns sampling (exact sampled acceptance at
              * any temperature; greedy degenerates to the argmax rule) */
-            ntok = ds4_session_generate_speculative(s->sess,
+            ntok = pulsar_session_generate_speculative(s->sess,
                                                     temperature, top_k, top_p, min_p,
                                                     &g->rng,
                                                     g->max_tokens - g->completion,
-                                                    ds4_token_eos(s->engine),
+                                                    pulsar_token_eos(s->engine),
                                                     toks,
                                                     (int)(sizeof(toks) / sizeof(toks[0])),
                                                     g->err,
@@ -1770,12 +1770,12 @@ static void gen_step_decode(server *s, session_slot *sl) {
                 break;
             }
         } else {
-            token = ds4_session_sample(s->sess, temperature, top_k, top_p, min_p, &g->rng);
-            if (token == ds4_token_eos(s->engine)) {
+            token = pulsar_session_sample(s->sess, temperature, top_k, top_p, min_p, &g->rng);
+            if (token == pulsar_token_eos(s->engine)) {
                 g->finish = "stop";
                 break;
             }
-            if (ds4_session_eval(s->sess, token, g->err, sizeof(g->err)) != 0) {
+            if (pulsar_session_eval(s->sess, token, g->err, sizeof(g->err)) != 0) {
                 g->finish = "error";
                 break;
             }
@@ -1840,8 +1840,8 @@ static void gen_step_finish(server *s, session_slot *sl) {
                 g->text.cap = g->text.len ? g->text.len + 1 : 0;
                 g->saw_tool_end = true;
                 completed_truncation = true;
-                server_log(DS4_LOG_WARNING,
-                           "ds4-server: chat ctx=%s%s%s repaired unterminated tool call (%d calls recovered)",
+                server_log(PULSAR_LOG_WARNING,
+                           "pulsar-server: chat ctx=%s%s%s repaired unterminated tool call (%d calls recovered)",
                            g->ctx_span,
                            g->req_flags[0] ? " " : "",
                            g->req_flags,
@@ -1854,8 +1854,8 @@ static void gen_step_finish(server *s, session_slot *sl) {
             if (!j->req.stream && !g->dsml_recovery_attempted) {
                 int recovery_tokens = 0;
                 char recovery_err[160] = {0};
-                server_log(DS4_LOG_WARNING,
-                           "ds4-server: chat ctx=%s%s%s unterminated tool call; continuing with model-visible tool error",
+                server_log(PULSAR_LOG_WARNING,
+                           "pulsar-server: chat ctx=%s%s%s unterminated tool call; continuing with model-visible tool error",
                            g->ctx_span,
                            g->req_flags[0] ? " " : "",
                            g->req_flags);
@@ -1868,8 +1868,8 @@ static void gen_step_finish(server *s, session_slot *sl) {
                                                 sizeof(recovery_err)))
                 {
                     g->dsml_recovery_attempted = true;
-                    server_log(DS4_LOG_GENERATION,
-                               "ds4-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
+                    server_log(PULSAR_LOG_GENERATION,
+                               "pulsar-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
                                g->ctx_span,
                                g->req_flags[0] ? " " : "",
                                g->req_flags,
@@ -1921,7 +1921,7 @@ static void gen_step_finish(server *s, session_slot *sl) {
             g->text.ptr ? g->text.ptr : "",
             j->req.has_tools,
             g->saw_tool_start,
-            ds4_think_mode_enabled(j->req.think_mode),
+            pulsar_think_mode_enabled(j->req.think_mode),
             &final_finish,
             g->err,
             sizeof(g->err),
@@ -1938,8 +1938,8 @@ static void gen_step_finish(server *s, session_slot *sl) {
                 int recovery_tokens = 0;
                 char recovery_err[160] = {0};
                 const char *detail = g->err[0] ? g->err : "invalid tool call";
-                server_log(DS4_LOG_WARNING,
-                           "ds4-server: chat ctx=%s%s%s invalid tool call; continuing with model-visible tool error",
+                server_log(PULSAR_LOG_WARNING,
+                           "pulsar-server: chat ctx=%s%s%s invalid tool call; continuing with model-visible tool error",
                            g->ctx_span,
                            g->req_flags[0] ? " " : "",
                            g->req_flags);
@@ -1952,8 +1952,8 @@ static void gen_step_finish(server *s, session_slot *sl) {
                                                 sizeof(recovery_err)))
                 {
                     g->dsml_recovery_attempted = true;
-                    server_log(DS4_LOG_GENERATION,
-                               "ds4-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
+                    server_log(PULSAR_LOG_GENERATION,
+                               "pulsar-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
                                g->ctx_span,
                                g->req_flags[0] ? " " : "",
                                g->req_flags,
@@ -1978,8 +1978,8 @@ static void gen_step_finish(server *s, session_slot *sl) {
                 const char *dsml_start = NULL;
                 const char *p;
                 for (p = g->text.ptr; p && (size_t)(p - g->text.ptr) < g->text.len - 20; p++) {
-                    if ((strncmp(p, DS4_TOOL_CALLS_START, strlen(DS4_TOOL_CALLS_START)) == 0) ||
-                        (strncmp(p, DS4_TOOL_CALLS_START_SHORT, strlen(DS4_TOOL_CALLS_START_SHORT)) == 0) ||
+                    if ((strncmp(p, PULSAR_TOOL_CALLS_START, strlen(PULSAR_TOOL_CALLS_START)) == 0) ||
+                        (strncmp(p, PULSAR_TOOL_CALLS_START_SHORT, strlen(PULSAR_TOOL_CALLS_START_SHORT)) == 0) ||
                         (strncmp(p, "<tool_calls>", 12) == 0)) {
                         dsml_start = p;
                         break;
@@ -1991,8 +1991,8 @@ static void gen_step_finish(server *s, session_slot *sl) {
                 }
                 /* Also log a snippet of the full text to see what the model output */
                 size_t text_snippet_len = g->text.len > 300 ? 300 : g->text.len;
-                server_log(DS4_LOG_WARNING,
-                           "ds4-server: chat ctx=%s%s%s invalid tool call returned as assistant text finish=%s [text_len=%zu saw_start=%d saw_end=%d text_snippet: %.*s]",
+                server_log(PULSAR_LOG_WARNING,
+                           "pulsar-server: chat ctx=%s%s%s invalid tool call returned as assistant text finish=%s [text_len=%zu saw_start=%d saw_end=%d text_snippet: %.*s]",
                            g->ctx_span,
                            g->req_flags[0] ? " " : "",
                            g->req_flags,
@@ -2002,8 +2002,8 @@ static void gen_step_finish(server *s, session_slot *sl) {
                            g->saw_tool_end,
                            (int)text_snippet_len,
                            g->text.ptr ? g->text.ptr : "(null)");
-                server_log(DS4_LOG_WARNING,
-                           "ds4-server: chat ctx=%s%s%s invalid tool call dsml_snippet: %.*s",
+                server_log(PULSAR_LOG_WARNING,
+                           "pulsar-server: chat ctx=%s%s%s invalid tool call dsml_snippet: %.*s",
                            g->ctx_span,
                            g->req_flags[0] ? " " : "",
                            g->req_flags,
@@ -2040,8 +2040,8 @@ static void gen_step_finish(server *s, session_slot *sl) {
         t->prompt_n = g->prompt_tokens;
         t->cached_n = j->req.cache_read_tokens;
         t->decode_n = g->completion;
-        ds4_spec_metrics spec_end;
-        ds4_session_spec_metrics(s->sess, &spec_end);
+        pulsar_spec_metrics spec_end;
+        pulsar_session_spec_metrics(s->sess, &spec_end);
         t->spec_gen = spec_end.gen_tokens - g->spec_start.gen_tokens;
         t->spec_accepted = spec_end.accepted_tokens - g->spec_start.accepted_tokens;
         t->spec_draft = spec_end.draft_tokens - g->spec_start.draft_tokens;
@@ -2089,7 +2089,7 @@ static void gen_step_finish(server *s, session_slot *sl) {
 
     if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
-        ds4_think_mode_enabled(j->req.think_mode) &&
+        pulsar_think_mode_enabled(j->req.think_mode) &&
         !j->req.force_tool_call)
     {
         /* Tool call with thinking on: the reasoning is in the live KV, and the
@@ -2161,8 +2161,8 @@ static void gen_step_finish(server *s, session_slot *sl) {
                           sse_done(j->fd, &j->req, g->id, g->prompt_tokens, g->completion);
         }
         if (!response_ok) {
-            server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: %s ctx=%s%s%s final stream failed",
+            server_log(PULSAR_LOG_DEFAULT,
+                       "pulsar-server: %s ctx=%s%s%s final stream failed",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
                        g->ctx_span,
                        g->req_flags[0] ? " " : "",
@@ -2196,8 +2196,8 @@ static void gen_step_finish(server *s, session_slot *sl) {
                   g->saw_tool_start,
                   g->saw_tool_end);
         if (!strcmp(final_finish, "error") && g->err[0]) {
-            server_log(DS4_LOG_GENERATION,
-                       "ds4-server: chat ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
+            server_log(PULSAR_LOG_GENERATION,
+                       "pulsar-server: chat ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
                        g->ctx_span,
                        g->completion,
                        flags[0] ? " " : "",
@@ -2206,8 +2206,8 @@ static void gen_step_finish(server *s, session_slot *sl) {
                        g->err,
                        server_now_sec() - g->t0);
         } else {
-            server_log(DS4_LOG_GENERATION,
-                       "ds4-server: chat ctx=%s gen=%d%s%s finish=%s %.3fs",
+            server_log(PULSAR_LOG_GENERATION,
+                       "pulsar-server: chat ctx=%s gen=%d%s%s finish=%s %.3fs",
                        g->ctx_span,
                        g->completion,
                        flags[0] ? " " : "",
@@ -2224,8 +2224,8 @@ static void gen_step_finish(server *s, session_slot *sl) {
                   false,
                   false);
         if (!strcmp(final_finish, "error") && g->err[0]) {
-            server_log(DS4_LOG_GENERATION,
-                       "ds4-server: %s ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
+            server_log(PULSAR_LOG_GENERATION,
+                       "pulsar-server: %s ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
                        g->ctx_span,
                        g->completion,
@@ -2235,8 +2235,8 @@ static void gen_step_finish(server *s, session_slot *sl) {
                        g->err,
                        server_now_sec() - g->t0);
         } else {
-            server_log(DS4_LOG_GENERATION,
-                       "ds4-server: %s ctx=%s gen=%d%s%s finish=%s %.3fs",
+            server_log(PULSAR_LOG_GENERATION,
+                       "pulsar-server: %s ctx=%s gen=%d%s%s finish=%s %.3fs",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
                        g->ctx_span,
                        g->completion,
@@ -2261,16 +2261,16 @@ static void gen_state_free(server *s, session_slot *sl) {
     if (!g) return;
     (void)s;
     /* Callback safety: no gen_state pointer may remain installed anywhere. */
-    ds4_session_set_cancel(s->sess, NULL, NULL);
-    ds4_session_set_progress(s->sess, NULL, NULL);
-    ds4_session_set_display_progress(s->sess, NULL, NULL);
+    pulsar_session_set_cancel(s->sess, NULL, NULL);
+    pulsar_session_set_progress(s->sess, NULL, NULL);
+    pulsar_session_set_display_progress(s->sess, NULL, NULL);
     anthropic_stream_free(&g->anthropic_live);
     openai_stream_free(&g->openai_live);
     responses_stream_free(&g->responses_live);
     buf_free(&g->text);
-    ds4_tokens_free(&g->effective_prompt);
-    ds4_tokens_free(&g->cold_prefix);
-    ds4_tokens_free(&g->batch_pending);
+    pulsar_tokens_free(&g->effective_prompt);
+    pulsar_tokens_free(&g->cold_prefix);
+    pulsar_tokens_free(&g->batch_pending);
     free(g->disk_cache_path);
     slot_writer_free(&g->writer);
     free(g);
@@ -2321,9 +2321,9 @@ static void generate_job_step(server *s, session_slot *sl) {
      * store/continuation see the true frontier. */
     if (g->batch_active) {
         if (g->batch_pending.len > 0)
-            ds4_session_note_committed_tokens(s->sess, g->batch_pending.v,
+            pulsar_session_note_committed_tokens(s->sess, g->batch_pending.v,
                                               g->batch_pending.len);
-        ds4_tokens_free(&g->batch_pending);
+        pulsar_tokens_free(&g->batch_pending);
         g->batch_active = false;
         g->batch_feed_valid = false;
     }
@@ -2393,9 +2393,9 @@ bool enqueue(server *s, job *j) {
  *
  * Everything below runs on the single GPU worker thread. Client threads only
  * enqueue jobs (enqueue above, under mu) and block on the per-job condvar;
- * they never touch a slot or a ds4_session. Over-capacity requests stay in
+ * they never touch a slot or a pulsar_session. Over-capacity requests stay in
  * the FIFO queue until a slot frees (plan Tier 1 §1.4 "queue them until a
- * slot frees"); the queue is bounded by DS4_SERVER_MAX_CLIENTS, since every
+ * slot frees"); the queue is bounded by PULSAR_SERVER_MAX_CLIENTS, since every
  * queued job is one connected client thread.
  * ========================================================================= */
 
@@ -2424,16 +2424,16 @@ uint64_t server_reconciled_session_cost(int slot_idx, int ctx,
                                         uint64_t est_bytes,
                                         uint64_t actual_bytes) {
     const double gib = 1024.0 * 1024.0 * 1024.0;
-    server_log(DS4_LOG_DEFAULT,
-               "ds4-server: slot %d session cost: est=%.2f GiB actual=%.2f GiB (ctx=%d)",
+    server_log(PULSAR_LOG_DEFAULT,
+               "pulsar-server: slot %d session cost: est=%.2f GiB actual=%.2f GiB (ctx=%d)",
                slot_idx, (double)est_bytes / gib, (double)actual_bytes / gib, ctx);
     if (actual_bytes == 0) return est_bytes;
     if (est_bytes > 0 &&
         (actual_bytes > est_bytes + est_bytes / 10 ||
          est_bytes > actual_bytes + actual_bytes / 10))
     {
-        server_log(DS4_LOG_WARNING,
-                   "ds4-server: SESSION COST DRIFT >10%%: est=%.2f GiB vs actual=%.2f GiB "
+        server_log(PULSAR_LOG_WARNING,
+                   "pulsar-server: SESSION COST DRIFT >10%%: est=%.2f GiB vs actual=%.2f GiB "
                    "— gpu_graph_session_bytes is out of sync with gpu_graph_alloc_raw_cap "
                    "(or a deliberately unaccounted allocation is enabled: directional-"
                    "steering dirs are in the measured delta but excluded from the "
@@ -2497,7 +2497,7 @@ typedef enum {
  * the currently-installed bank's host carry + frontier counters and installs
  * bank b's (device views + carry). Idempotent when b is already live, and a
  * no-op in classic mode. The switch-away save is what keeps every idle bank's
- * carry current, so the per-bank frontier readers (ds4_session_bank_*) and
+ * carry current, so the per-bank frontier readers (pulsar_session_bank_*) and
  * server_slot_frontier_pos are always correct for non-live banks. */
 /* Tier-2 2b: restore a guard-spilled bank's physical + raw KV from disk before it
  * is installed. Defined below (near the guard); forward-declared for the switch. */
@@ -2507,15 +2507,15 @@ bool server_bank_switch(server *s, int bank) {
     if (s->pool_banks <= 0) return true;          /* classic mode */
     if (bank < 0 || bank >= s->pool_banks) return true;
     if (bank == s->live_bank && !s->slots[bank].spilled) return true; /* already installed */
-    ds4_session *pool = s->sess;
+    pulsar_session *pool = s->sess;
     /* Snapshot the outgoing bank so its carry stays readable while idle, and
      * record its committed frontier for metrics/routing. live_bank < 0 is the
      * post-batched-quantum sentinel: the pool holds no single bank's clean
      * state (multiseq left a cross-bank superset), so there is nothing safe to
      * save — just install the target (bank_state_restore clears the poison). */
     if (s->live_bank >= 0 && s->live_bank != bank) {
-        s->slots[s->live_bank].committed_pos = ds4_session_pos(pool);
-        ds4_session_bank_state_save(pool, (uint32_t)s->live_bank);
+        s->slots[s->live_bank].committed_pos = pulsar_session_pos(pool);
+        pulsar_session_bank_state_save(pool, (uint32_t)s->live_bank);
     }
     /* Tier-2 2b: a guard-spilled target has no physical — reallocate + reload its
      * KV bit-identically from disk before installing (the reload-stall cost). On
@@ -2530,24 +2530,24 @@ bool server_bank_switch(server *s, int bank) {
      * unchanged, so the caller ran engine work against mixed banks instead of
      * failing the request.  Fail loud here — this is the one check that catches
      * a bad repoint before any token is generated. */
-    if (!ds4_session_bank_state_restore(pool, (uint32_t)bank)) return false;
+    if (!pulsar_session_bank_state_restore(pool, (uint32_t)bank)) return false;
     s->live_bank = bank;
-    s->slots[bank].committed_pos = ds4_session_pos(pool);
+    s->slots[bank].committed_pos = pulsar_session_pos(pool);
     return true;
 }
 
 int server_slot_frontier_pos(const server *s, const session_slot *sl) {
     if (!sl || !sl->provisioned) return 0;
-    if (s->pool_banks > 0) return ds4_session_bank_pos(s->sess, sl->bank);
-    return ds4_session_pos(s->sess);
+    if (s->pool_banks > 0) return pulsar_session_bank_pos(s->sess, sl->bank);
+    return pulsar_session_pos(s->sess);
 }
 
 static int server_slot_common_prefix(const server *s, const session_slot *sl,
-                                     const ds4_tokens *prompt) {
+                                     const pulsar_tokens *prompt) {
     if (!sl || !sl->provisioned) return 0;
     if (s->pool_banks > 0)
-        return ds4_session_bank_common_prefix(s->sess, sl->bank, prompt);
-    return ds4_session_common_prefix(s->sess, prompt);
+        return pulsar_session_bank_common_prefix(s->sess, sl->bank, prompt);
+    return pulsar_session_common_prefix(s->sess, prompt);
 }
 
 /* Provision a bank in the shared pool (Tier-2). No GPU allocation happens here:
@@ -2574,8 +2574,8 @@ static session_slot *provision_bank(server *s, provision_refusal *refusal) {
         static bool warned; /* single worker thread */
         if (!warned) {
             warned = true;
-            server_log(DS4_LOG_WARNING,
-                       "ds4-server: bank provisioning refused: MemAvailable %.2f GiB "
+            server_log(PULSAR_LOG_WARNING,
+                       "pulsar-server: bank provisioning refused: MemAvailable %.2f GiB "
                        "below floor for marginal %.2f GiB (job queued)",
                        (double)avail / (1024.0 * 1024.0 * 1024.0),
                        (double)s->bank_marginal_bytes / (1024.0 * 1024.0 * 1024.0));
@@ -2584,15 +2584,15 @@ static session_slot *provision_bank(server *s, provision_refusal *refusal) {
         return NULL;
     }
     session_slot *sl = &s->slots[idx];
-    ds4_session *pool = s->sess;
+    pulsar_session *pool = s->sess;
     /* Install and reset the bank to an empty conversation with a valid (empty)
      * host carry, so routing/metrics read pos 0 and gen_begin cold-prefills. A
      * free (SLOT_EVICTED) bank is never guard-spilled (spilled banks stay
      * provisioned), so this switch never restores — the result is
      * unconditionally true. */
     (void)server_bank_switch(s, idx);
-    ds4_session_invalidate(pool);
-    ds4_session_bank_state_save(pool, (uint32_t)idx);
+    pulsar_session_invalidate(pool);
+    pulsar_session_bank_state_save(pool, (uint32_t)idx);
     sl->provisioned = true;
     sl->bank = (uint32_t)idx;
     sl->committed_pos = 0;
@@ -2606,8 +2606,8 @@ static session_slot *provision_bank(server *s, provision_refusal *refusal) {
     s->kv_committed_bytes += s->bank_marginal_bytes;
     if (idx >= s->n_slots) s->n_slots = idx + 1;
     pthread_mutex_unlock(&s->mu);
-    server_log(DS4_LOG_DEFAULT,
-               "ds4-server: provisioned bank %d (pooled) marginal=%.2f GiB "
+    server_log(PULSAR_LOG_DEFAULT,
+               "pulsar-server: provisioned bank %d (pooled) marginal=%.2f GiB "
                "total committed=%.2f GiB / %.2f GiB",
                idx,
                (double)s->bank_marginal_bytes / (1024.0 * 1024.0 * 1024.0),
@@ -2634,7 +2634,7 @@ static session_slot *provision_slot(server *s, int ctx,
  * Shared by the provisioning path and the eviction could-it-help precheck so
  * they price the same session shape. */
 static int provision_ctx_for_job(const server *s, const job *j) {
-    int ctx = DS4_SERVER_EXTRA_SLOT_CTX_TOKENS;
+    int ctx = PULSAR_SERVER_EXTRA_SLOT_CTX_TOKENS;
     if (ctx > s->slots[0].ctx_size) ctx = s->slots[0].ctx_size;
     const int needed = job_needed_ctx(s, j);
     if (ctx < needed) ctx = needed;
@@ -2649,7 +2649,7 @@ static int provision_ctx_for_job(const server *s, const job *j) {
  * clobbering) the candidate — only when BOTH hold:
  *   - common < trivial_tokens: the match is no deeper than the rendered
  *     template header plus incidental prologue overlap (threshold derived at
- *     startup, cli_main.c / DS4_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS), so it
+ *     startup, cli_main.c / PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS), so it
  *     does not indicate the same conversation;
  *   - slot_pos - common >= trivial_tokens: reuse would destroy a meaningful
  *     amount of some conversation's warm KV. When the slot holds less than
@@ -2761,8 +2761,8 @@ static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx,
                                              s->slot_trivial_common_tokens);
     if (!best || best_clobbers_warm_state) {
         if (best_clobbers_warm_state) {
-            server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: slot routing: best match is trivial "
+            server_log(PULSAR_LOG_KVCACHE,
+                       "pulsar-server: slot routing: best match is trivial "
                        "(common=%d pos=%d threshold=%d); preferring a fresh slot",
                        best_common, server_slot_frontier_pos(s, best),
                        s->slot_trivial_common_tokens);
@@ -2777,10 +2777,10 @@ static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx,
      * consumes the trunk — today's behavior), fork the trunk into another bank
      * and continue there, leaving the trunk INTACT so a divergent sibling keeps
      * matching it:
-     *   - inc B FULL fork   : best_common == trunk frontier  -> ds4_session_bank_fork
+     *   - inc B FULL fork   : best_common == trunk frontier  -> pulsar_session_bank_fork
      *                         (dst resumes at the exact frontier; re-prefill suffix).
      *   - inc D PARTIAL cut : warm_partial_min <= best_common < frontier
-     *                         -> ds4_session_bank_fork_partial (engine aligns down
+     *                         -> pulsar_session_bank_fork_partial (engine aligns down
      *                         to R, byte-stashes the ratio-4 boundary row; dst's
      *                         committed history becomes tokens[0..R), re-prefill [R..).
      * A free bank is used first; else one non-trunk victim is evicted (make_room,
@@ -2799,8 +2799,8 @@ static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx,
      * best_common < frontier (the PARTIAL path) is the common case; full is the
      * rare exact-continuation. */
     if (s->pool_banks > 0 && s->warm_fork_enabled)
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: route: best bank %d common %d frontier %d prompt %d "
+        server_log(PULSAR_LOG_KVCACHE,
+                   "pulsar-server: route: best bank %d common %d frontier %d prompt %d "
                    "partial_min %d -> %s%s%s",
                    best ? (int)best->bank : -1, best_common, frontier,
                    j->req.prompt.len, s->warm_partial_min,
@@ -2816,19 +2816,19 @@ static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx,
             dst = provision_slot(s, provision_ctx_for_job(s, j), &fr);
         }
         if (dst && dst != best) {
-            ds4_session *pool = s->sess;
+            pulsar_session *pool = s->sess;
             const int rc = full
-                ? ds4_session_bank_fork(pool, best->bank, dst->bank,
+                ? pulsar_session_bank_fork(pool, best->bank, dst->bank,
                                         j->req.prompt.v, best_common)
-                : ds4_session_bank_fork_partial(pool, best->bank, dst->bank,
+                : pulsar_session_bank_fork_partial(pool, best->bank, dst->bank,
                                                 j->req.prompt.v, best_common);
             if (rc == 0) {
                 /* FULL resumes at best_common; PARTIAL resumes at the engine's
                  * R-aligned cut (read it back rather than recompute the align). */
                 dst->committed_pos = full ? best_common
-                                          : ds4_session_bank_pos(pool, dst->bank);
-                server_log(DS4_LOG_DEFAULT,
-                           "ds4-server: warm-fork-%s: trunk bank %u (frontier %d, "
+                                          : pulsar_session_bank_pos(pool, dst->bank);
+                server_log(PULSAR_LOG_DEFAULT,
+                           "pulsar-server: warm-fork-%s: trunk bank %u (frontier %d, "
                            "common %d) -> bank %u (resume %d); trunk preserved",
                            full ? "full" : "partial", best->bank, frontier,
                            best_common, dst->bank, dst->committed_pos);
@@ -2837,8 +2837,8 @@ static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx,
             }
             /* Refused (history moved / evicted src / cut below R): dst stays a
              * fresh empty bank — cold on it is safe and beats clobbering best. */
-            server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: warm-fork-%s refused (bank %u); cold on bank %u",
+            server_log(PULSAR_LOG_KVCACHE,
+                       "pulsar-server: warm-fork-%s refused (bank %u); cold on bank %u",
                        full ? "full" : "partial", best->bank, dst->bank);
             *clobbers = false;
             return dst;
@@ -2846,8 +2846,8 @@ static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx,
         /* No free/evictable bank for the fork: fall through to the divergent
          * guard below (reuses in place only for a linear continuation; otherwise
          * queues rather than clobber). */
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: warm-fork-%s wanted (bank %u common %d) but no free bank",
+        server_log(PULSAR_LOG_KVCACHE,
+                   "pulsar-server: warm-fork-%s wanted (bank %u common %d) but no free bank",
                    full ? "full" : "partial", best->bank, best_common);
     }
     /* CROSS-WIRE ROOT FIX: in-place continuation is safe ONLY for a linear
@@ -2863,8 +2863,8 @@ static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx,
     if (best && best_common < frontier) {
         session_slot *fresh = provision_slot(s, provision_ctx_for_job(s, j), refusal);
         if (fresh) {
-            server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: divergent match bank %u (common %d < frontier %d): "
+            server_log(PULSAR_LOG_KVCACHE,
+                       "pulsar-server: divergent match bank %u (common %d < frontier %d): "
                        "fresh bank %u, no in-place clobber",
                        best->bank, best_common, frontier, fresh->bank);
             *clobbers = false;
@@ -2933,7 +2933,7 @@ static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx,
  * (their sampled frontier is gone), exactly like a server restart.
  *
  * Slot 0 is PINNED — never evicted: (a) client threads read
- * ds4_session_ctx(s->sess) lock-free (http_server.c) under the
+ * pulsar_session_ctx(s->sess) lock-free (http_server.c) under the
  * CUDA-state audit's immutable-after-startup exception, so freeing that
  * session would be a data race; (b) slot 0 is the only slot guaranteed to fit
  * any admissible request (job_needed_ctx caps at its ctx), which preserves
@@ -2945,15 +2945,15 @@ static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx,
  *
  * Like lazy provisioning, eviction is a deliberate multi-second quantum
  * overshoot on the single GPU worker thread: the snapshot forces a full
- * device sync + a multi-GiB D2H copy + a disk write, and ds4_session_free
+ * device sync + a multi-GiB D2H copy + a disk write, and pulsar_session_free
  * tears down the graph. It happens only at a scheduling boundary (bind time),
  * and only when the alternative is queueing forever.
  * ========================================================================= */
 
 uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost) {
     if (slot_cost > committed_total) {
-        server_log(DS4_LOG_WARNING,
-                   "ds4-server: EVICTION LEDGER UNDERFLOW: releasing %.2f GiB from "
+        server_log(PULSAR_LOG_WARNING,
+                   "pulsar-server: EVICTION LEDGER UNDERFLOW: releasing %.2f GiB from "
                    "%.2f GiB committed — provision/evict pairing is out of sync; "
                    "clamping the ledger to 0 (the MemAvailable floor remains the "
                    "backstop against the resulting over-admission)",
@@ -2994,12 +2994,12 @@ int server_evict_pick_victim(const session_slot *slots, int n_slots,
  * owner lookups (tool_mu + session pos) run after mu is released — the two
  * locks are never nested. */
 static void worker_protect_queued_owner_slots(server *s,
-                                              bool protect[DS4_SESSION_POOL_CAP]) {
-    memset(protect, 0, sizeof(protect[0]) * DS4_SESSION_POOL_CAP);
-    job *queued[DS4_SERVER_MAX_CLIENTS];
+                                              bool protect[PULSAR_SESSION_POOL_CAP]) {
+    memset(protect, 0, sizeof(protect[0]) * PULSAR_SESSION_POOL_CAP);
+    job *queued[PULSAR_SERVER_MAX_CLIENTS];
     int n = 0;
     pthread_mutex_lock(&s->mu);
-    for (job *q = s->head; q && n < DS4_SERVER_MAX_CLIENTS; q = q->next) {
+    for (job *q = s->head; q && n < PULSAR_SERVER_MAX_CLIENTS; q = q->next) {
         queued[n++] = q;
     }
     pthread_mutex_unlock(&s->mu);
@@ -3023,13 +3023,13 @@ static void worker_protect_queued_owner_slots(server *s,
  * If even reclaiming EVERY unprotected idle slot leaves admission refusing,
  * skip eviction entirely — the head is genuinely waiting for a busy slot to
  * free, and evicting warm idle sessions would only churn snapshots. (Host
- * arithmetic only: ds4_engine_session_cost_bytes is the same sizing code the
+ * arithmetic only: pulsar_engine_session_cost_bytes is the same sizing code the
  * allocator uses, no CUDA work; runs only on failed bind attempts. Guard #1
  * is the provisioning-refusal reason check in worker_try_bind.) */
 static bool worker_eviction_could_help(server *s, const job *j,
                                        const bool *protect) {
     const uint64_t est =
-        ds4_engine_session_cost_bytes(s->engine, provision_ctx_for_job(s, j));
+        pulsar_engine_session_cost_bytes(s->engine, provision_ctx_for_job(s, j));
     if (est == 0) return false;
     /* Model the MemAvailable floor too (2026-07-15 review): a POOL_FULL
      * refusal never consulted it, so on a physically tight box the gate
@@ -3066,14 +3066,14 @@ static bool worker_eviction_could_help(server *s, const job *j,
  * eviction itself proceeds, and the response always belongs to the right
  * conversation because the freed KV can never be read again. Returns false
  * when nothing is evictable. Worker thread only. */
-static bool worker_evict_one(server *s, bool protect[DS4_SESSION_POOL_CAP]) {
+static bool worker_evict_one(server *s, bool protect[PULSAR_SESSION_POOL_CAP]) {
     /* plan-33: protect any bank that is a live fork SOURCE mid-clone from disk
      * eviction (belt-and-suspenders — fork and evict are both worker-thread ops
      * and never interleave, but the invariant "a pinned source is never freed"
      * must hold for both eviction paths). */
     if (s->pool_banks > 0 && s->sess) {
-        for (int i = 1; i < s->n_slots && i < DS4_SESSION_POOL_CAP; i++) {
-            if (ds4_session_bank_fork_pinned(s->sess, s->slots[i].bank)) protect[i] = true;
+        for (int i = 1; i < s->n_slots && i < PULSAR_SESSION_POOL_CAP; i++) {
+            if (pulsar_session_bank_fork_pinned(s->sess, s->slots[i].bank)) protect[i] = true;
         }
     }
     const int vi = server_evict_pick_victim(s->slots, s->n_slots, protect);
@@ -3085,15 +3085,15 @@ static bool worker_evict_one(server *s, bool protect[DS4_SESSION_POOL_CAP]) {
      * guard-spilled victim first; if that restore fails we cannot snapshot its KV,
      * so skip it (this path is discarding the conversation anyway). */
     const bool switched = server_bank_switch(s, sl->bank);
-    const ds4_tokens *tokens = switched ? ds4_session_tokens(s->sess) : NULL;
+    const pulsar_tokens *tokens = switched ? pulsar_session_tokens(s->sess) : NULL;
     const int live_tokens = tokens ? tokens->len : 0;
     bool stored = false;
     if (switched && s->kv.enabled && live_tokens >= s->kv.opt.min_tokens) {
         stored = kv_cache_store_current(s, sl, "evict");
     }
     if (!stored && live_tokens > 0) {
-        server_log(DS4_LOG_WARNING,
-                   "ds4-server: slot %d evicting WITHOUT a disk snapshot (%s); "
+        server_log(PULSAR_LOG_WARNING,
+                   "pulsar-server: slot %d evicting WITHOUT a disk snapshot (%s); "
                    "a returning client re-prefills (correctness unaffected)",
                    vi,
                    !s->kv.enabled ? "kv disk cache disabled"
@@ -3114,11 +3114,11 @@ static bool worker_evict_one(server *s, bool protect[DS4_SESSION_POOL_CAP]) {
      * picker returns -1 above): the pool session (s->sess, shared by every
      * bank) persists. "Evicting" bank vi means reset it to an empty
      * conversation and drop its host carry so a fresh conversation can reuse
-     * it — no ds4_session_free (that would tear down the whole pool). The
+     * it — no pulsar_session_free (that would tear down the whole pool). The
      * demand-paged comp/index pages this bank touched stay resident; the
      * ledger releases only this bank's even-split marginal. */
-    ds4_session_invalidate(s->sess);
-    ds4_session_bank_state_save(s->sess, (uint32_t)sl->bank);
+    pulsar_session_invalidate(s->sess);
+    pulsar_session_bank_state_save(s->sess, (uint32_t)sl->bank);
     freed = committed; /* logical release; no allocator delta to verify */
     const int evicted_ctx = sl->ctx_size;
     sl->provisioned = false;
@@ -3138,7 +3138,7 @@ static bool worker_evict_one(server *s, bool protect[DS4_SESSION_POOL_CAP]) {
         char spath[600];
         snprintf(spath, sizeof spath, "%s/spill-bank-%u.kv", s->spill_dir, (unsigned)sl->bank);
         remove(spath);
-        (void)ds4_session_bank_alloc_physical(s->sess, sl->bank); /* empty physical for reuse */
+        (void)pulsar_session_bank_alloc_physical(s->sess, sl->bank); /* empty physical for reuse */
         sl->spilled = false;
     }
     pthread_mutex_lock(&s->mu);
@@ -3146,8 +3146,8 @@ static bool worker_evict_one(server *s, bool protect[DS4_SESSION_POOL_CAP]) {
     const uint64_t committed_now = s->kv_committed_bytes;
     pthread_mutex_unlock(&s->mu);
     protect[vi] = true; /* freed hole; never a candidate again this round */
-    server_log(DS4_LOG_DEFAULT,
-               "ds4-server: evicted slot %d ctx=%d tokens=%d snapshot=%s "
+    server_log(PULSAR_LOG_DEFAULT,
+               "pulsar-server: evicted slot %d ctx=%d tokens=%d snapshot=%s "
                "released=%.2f GiB (allocator freed %.2f GiB) "
                "committed now %.2f / %.2f GiB, MemAvailable %.2f GiB",
                vi, evicted_ctx, live_tokens, stored ? "disk" : "none",
@@ -3165,17 +3165,17 @@ static bool worker_evict_one(server *s, bool protect[DS4_SESSION_POOL_CAP]) {
  * committed history is a token-prefix of ANOTHER live bank's history (a sibling
  * that already extends past it) — its KV is redundant, so evicting it loses the
  * least. Returns such a slot's index (the least-recently-served among them), or
- * -1. Pure host reads (ds4_session_bank_tokens / _common_prefix are the same
+ * -1. Pure host reads (pulsar_session_bank_tokens / _common_prefix are the same
  * host-carry reads routing already uses on idle banks; no CUDA, no install). */
 static int server_pick_superseded_idle(server *s, const bool *protect) {
-    ds4_session *pool = s->sess;
+    pulsar_session *pool = s->sess;
     if (!pool) return -1;
     int victim = -1;
     for (int i = 1; i < s->n_slots; i++) {
         session_slot *a = &s->slots[i];
         if (!a->provisioned || a->active_job || (protect && protect[i])) continue;
-        if (ds4_session_bank_fork_pinned(pool, a->bank)) continue;
-        const ds4_tokens *at = ds4_session_bank_tokens(pool, a->bank);
+        if (pulsar_session_bank_fork_pinned(pool, a->bank)) continue;
+        const pulsar_tokens *at = pulsar_session_bank_tokens(pool, a->bank);
         if (!at || at->len == 0) continue;              /* empty: LRU handles it */
         bool superseded = false;
         for (int k = 1; k < s->n_slots && !superseded; k++) {
@@ -3185,7 +3185,7 @@ static int server_pick_superseded_idle(server *s, const bool *protect) {
             /* b supersedes a iff a's whole history is b's prefix AND b is strictly
              * longer (b can reconstruct everything a holds). */
             if (server_slot_frontier_pos(s, b) > at->len &&
-                ds4_session_bank_common_prefix(pool, b->bank, at) >= at->len) {
+                pulsar_session_bank_common_prefix(pool, b->bank, at) >= at->len) {
                 superseded = true;
             }
         }
@@ -3205,17 +3205,17 @@ static int server_pick_superseded_idle(server *s, const bool *protect) {
  * true when a bank was freed. */
 static bool server_fork_make_room(server *s, const session_slot *trunk) {
     if (s->pool_banks <= 0 || !trunk) return false;
-    bool protect[DS4_SESSION_POOL_CAP];
+    bool protect[PULSAR_SESSION_POOL_CAP];
     worker_protect_queued_owner_slots(s, protect);      /* live-tool owners */
     const int ti = (int)(trunk - s->slots);
-    if (ti >= 0 && ti < DS4_SESSION_POOL_CAP) protect[ti] = true;  /* NEVER the trunk */
+    if (ti >= 0 && ti < PULSAR_SESSION_POOL_CAP) protect[ti] = true;  /* NEVER the trunk */
     const int sup = server_pick_superseded_idle(s, protect);
     if (sup >= 0) {
         /* Force worker_evict_one onto the superseded pick by protecting all others. */
-        bool only[DS4_SESSION_POOL_CAP];
-        for (int i = 0; i < DS4_SESSION_POOL_CAP; i++) only[i] = (i != sup);
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: warm-fork make-room: evicting LRU-superseded bank %u "
+        bool only[PULSAR_SESSION_POOL_CAP];
+        for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) only[i] = (i != sup);
+        server_log(PULSAR_LOG_KVCACHE,
+                   "pulsar-server: warm-fork make-room: evicting LRU-superseded bank %u "
                    "(trunk bank %u preserved)", s->slots[sup].bank, trunk->bank);
         return worker_evict_one(s, only);
     }
@@ -3253,7 +3253,7 @@ static bool worker_try_bind(server *s) {
         (refusal == PROVISION_REFUSED_POOL_FULL ||
          refusal == PROVISION_REFUSED_ADMISSION))
     {
-        bool protect[DS4_SESSION_POOL_CAP];
+        bool protect[PULSAR_SESSION_POOL_CAP];
         worker_protect_queued_owner_slots(s, protect);
         if (worker_eviction_could_help(s, j, protect)) {
             while ((!sl || clobbers) &&
@@ -3262,7 +3262,7 @@ static bool worker_try_bind(server *s) {
             {
                 /* Refresh owner protection every iteration (2026-07-15
                  * review): each pass through choose_slot_for_job can stall
-                 * for seconds inside ds4_session_create, and a live-tool
+                 * for seconds inside pulsar_session_create, and a live-tool
                  * continuation enqueued during that stall would be invisible
                  * to a one-shot snapshot — its owner could then be evicted
                  * into an avoidable 409. Holes are re-derived from
@@ -3316,12 +3316,12 @@ static bool worker_try_bind(server *s) {
 /* Publish the /metrics snapshots — per-slot KV position/context and the
  * engine spec-decode counters — into plain server fields under mu. Client
  * threads must never call into the engine (CUDA-state audit,
- * ds4_server_internal.h), so the worker exports these at startup (cli_main,
+ * pulsar_server_internal.h), so the worker exports these at startup (cli_main,
  * before the worker thread runs), after binds, and once per quantum;
  * send_metrics reads only the snapshots. Host-int copies, no GPU work. */
 void server_publish_metrics_snapshot(server *s) {
-    ds4_spec_metrics m;
-    ds4_engine_spec_metrics(s->engine, &m);
+    pulsar_spec_metrics m;
+    pulsar_engine_spec_metrics(s->engine, &m);
     pthread_mutex_lock(&s->mu);
     for (int i = 0; i < s->n_slots; i++) {
         /* Bank-aware: a non-live bank's pos is its saved carry, never the pool's
@@ -3353,23 +3353,23 @@ static void worker_finish_slot(server *s, session_slot *sl) {
 /* The single GPU worker (increment 3): a round-robin scheduler over the slot
  * pool. Each pass binds queued jobs to free slots (FIFO), then advances ONE
  * runnable slot by one quantum — a prefill chunk, or up to
- * DS4_SERVER_DECODE_QUANTUM_TOKENS decode tokens — and flushes that slot's
+ * PULSAR_SERVER_DECODE_QUANTUM_TOKENS decode tokens — and flushes that slot's
  * deferred client bytes. With a single active job this degenerates to the
  * increment-2 loop (quantum after quantum on one slot, with only a queue
  * peek — one mutex op, no GPU work — between quanta), so single-client
- * output is byte-identical. All ds4_session_* and CUDA work stays on this
+ * output is byte-identical. All pulsar_session_* and CUDA work stays on this
  * thread. On shutdown the scheduler keeps stepping bound jobs (the decode
  * loop observes g_stop_requested) and drains the queue, exactly like the
  * increment-2 worker.
  *
  * Quantum overshoot: binding may lazily provision a slot, and
- * provision_slot's ds4_session_create is a multi-GiB allocation that can
+ * provision_slot's pulsar_session_create is a multi-GiB allocation that can
  * take SECONDS — every bound slot stalls for its duration. Binding may also
  * EVICT idle slots first (increment 4): snapshot-to-disk (full device sync +
  * multi-GiB D2H + disk write) plus session teardown, then the provisioning
  * on top. These are the largest quantum overshoots in the system (larger
  * than the DSpark ≤17-token fused burst) and are deliberate single-thread
- * design: the CUDA-state audit (ds4_server_internal.h) rules out a second
+ * design: the CUDA-state audit (pulsar_server_internal.h) rules out a second
  * GPU thread, and both happen only at a scheduling boundary. */
 /* A slot is eligible for the batched (plain multiseq) decode lane when it is in
  * steady-state decode and is NOT a tool-call request. Tool requests keep the
@@ -3383,7 +3383,7 @@ static bool slot_is_batchable_decode(const session_slot *sl) {
 }
 
 /* Tier-2 §5 batched decode quantum: ONE shared multiseq weight sweep drives up
- * to DS4_SERVER_DECODE_QUANTUM_TOKENS steps across every supplied decode slot.
+ * to PULSAR_SERVER_DECODE_QUANTUM_TOKENS steps across every supplied decode slot.
  * Each slot samples its OWN logits row with its OWN sampler/RNG and streams
  * through gen_emit_token (the shared emit path), so per-request
  * output/stop/streaming is byte-identical in shape to the classic lane; only the
@@ -3413,27 +3413,27 @@ static bool slot_is_batchable_decode(const session_slot *sl) {
  * Worker thread only. */
 
 static bool server_bank_restore_spilled(server *s, int bank) {
-    ds4_session *pool = s->sess;
+    pulsar_session *pool = s->sess;
     char path[600];
     snprintf(path, sizeof path, "%s/spill-bank-%d.kv", s->spill_dir, bank);
     FILE *fp = fopen(path, "rb");
     if (!fp) {
-        server_log(DS4_LOG_WARNING, "ds4-server: guard: restore open %s failed: %s",
+        server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: restore open %s failed: %s",
                    path, strerror(errno));
         return false;
     }
     char err[128];
     const double t0 = server_now_sec();
-    const int rc = ds4_session_bank_kv_load(pool, (uint32_t)bank, fp, err, sizeof err);
+    const int rc = pulsar_session_bank_kv_load(pool, (uint32_t)bank, fp, err, sizeof err);
     fclose(fp);
     if (rc != 0) {
-        server_log(DS4_LOG_WARNING, "ds4-server: guard: kv_load bank %d failed: %s", bank, err);
+        server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: kv_load bank %d failed: %s", bank, err);
         return false;
     }
     s->slots[bank].spilled = false;
     remove(path);
-    server_log(DS4_LOG_DEFAULT,
-               "ds4-server: guard RESTORED bank %d from disk (%.1f ms reload stall)",
+    server_log(PULSAR_LOG_DEFAULT,
+               "pulsar-server: guard RESTORED bank %d from disk (%.1f ms reload stall)",
                bank, (server_now_sec() - t0) * 1e3);
     return true;
 }
@@ -3441,37 +3441,37 @@ static bool server_bank_restore_spilled(server *s, int bank) {
 /* Spill one idle bank: install it, snapshot its KV to disk, save its host carry,
  * repoint AWAY (free_physical refuses the cur bank), then cudaFree its physical. */
 static bool server_spill_bank(server *s, session_slot *victim) {
-    ds4_session *pool = s->sess;
+    pulsar_session *pool = s->sess;
     const uint32_t vb = victim->bank;
     (void)server_bank_switch(s, (int)vb);         /* victim never spilled (pick excludes) → true */
     char path[600];
     snprintf(path, sizeof path, "%s/spill-bank-%u.kv", s->spill_dir, vb);
     FILE *fp = fopen(path, "wb");
     if (!fp) {
-        server_log(DS4_LOG_WARNING, "ds4-server: guard: spill open %s failed: %s",
+        server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: spill open %s failed: %s",
                    path, strerror(errno));
         return false;
     }
     char err[128];
     const double t0 = server_now_sec();
-    const int rc = ds4_session_bank_kv_save(pool, vb, fp, err, sizeof err);
+    const int rc = pulsar_session_bank_kv_save(pool, vb, fp, err, sizeof err);
     const int fc = fclose(fp);
     if (rc != 0 || fc != 0) {
-        server_log(DS4_LOG_WARNING, "ds4-server: guard: kv_save bank %u failed: %s",
+        server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: kv_save bank %u failed: %s",
                    vb, rc ? err : "close");
         remove(path);
         return false;
     }
-    ds4_session_bank_state_save(pool, vb);         /* preserve host carry for restore */
-    if (!ds4_session_bank_state_restore(pool, 0)) { remove(path); return false; }
+    pulsar_session_bank_state_save(pool, vb);         /* preserve host carry for restore */
+    if (!pulsar_session_bank_state_restore(pool, 0)) { remove(path); return false; }
     s->live_bank = 0;
     /* Finding 4: free_physical returns false ONLY on a precondition refusal (nothing
      * freed, bank still live) — abort the spill and drop the unused disk snapshot.
      * A true return means the bank IS evicted (slabs freed), so mark it spilled
      * unconditionally — no half-evicted state (spilled=false over freed slabs). */
-    if (!ds4_session_bank_free_physical(pool, vb)) {
-        server_log(DS4_LOG_WARNING,
-                   "ds4-server: guard: free_physical bank %u refused (still cur?) — spill aborted", vb);
+    if (!pulsar_session_bank_free_physical(pool, vb)) {
+        server_log(PULSAR_LOG_WARNING,
+                   "pulsar-server: guard: free_physical bank %u refused (still cur?) — spill aborted", vb);
         remove(path);
         return false;
     }
@@ -3479,11 +3479,11 @@ static bool server_spill_bank(server *s, session_slot *victim) {
     victim->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
     s->guard_evictions++;
     const double gib = 1024.0 * 1024.0 * 1024.0;
-    server_log(DS4_LOG_DEFAULT,
-               "ds4-server: guard EVICTED bank %u -> disk (%.1f ms save, physical freed); "
+    server_log(PULSAR_LOG_DEFAULT,
+               "pulsar-server: guard EVICTED bank %u -> disk (%.1f ms save, physical freed); "
                "touched %.2f GiB / budget %.2f GiB, evictions %llu",
                vb, (server_now_sec() - t0) * 1e3,
-               (double)ds4_session_touched_kv_bytes(pool) / gib,
+               (double)pulsar_session_touched_kv_bytes(pool) / gib,
                (double)s->guard_touched_budget / gib,
                (unsigned long long)s->guard_evictions);
     return true;
@@ -3492,18 +3492,18 @@ static bool server_spill_bank(server *s, session_slot *victim) {
 /* LRU-idle smallest-frontier victim: NOT bank 0 (pinned), NOT in the live decode
  * set, no active job, not already spilled. -1 if none. */
 static int server_guard_pick_victim(server *s, session_slot **dec, int n) {
-    ds4_session *pool = s->sess;
+    pulsar_session *pool = s->sess;
     int best = -1;
     uint64_t best_us = UINT64_MAX, best_touched = UINT64_MAX;
     for (int i = 1; i < s->n_slots; i++) {         /* bank 0 pinned */
         session_slot *sl = &s->slots[i];
         if (!sl->provisioned || sl->spilled || sl->active_job) continue;
         /* plan-33: never free a bank that is a live fork SOURCE mid-clone. */
-        if (ds4_session_bank_fork_pinned(pool, sl->bank)) continue;
+        if (pulsar_session_bank_fork_pinned(pool, sl->bank)) continue;
         bool live = false;
         for (int k = 0; k < n; k++) if (dec[k] == sl) { live = true; break; }
         if (live) continue;
-        const uint64_t t = ds4_session_bank_touched_kv_bytes(pool, sl->bank);
+        const uint64_t t = pulsar_session_bank_touched_kv_bytes(pool, sl->bank);
         if (sl->last_serviced_us < best_us ||
             (sl->last_serviced_us == best_us && t < best_touched)) {
             best = i; best_us = sl->last_serviced_us; best_touched = t;
@@ -3514,9 +3514,9 @@ static int server_guard_pick_victim(server *s, session_slot **dec, int n) {
 
 static void server_guard_maybe_evict(server *s, session_slot **dec, int n) {
     if (!s->guard_enabled || s->pool_banks <= 0 || n <= 0) return;
-    ds4_session *pool = s->sess;
-    const uint64_t dpb = ds4_session_quantum_growth_bytes_per_bank(
-            pool, (uint32_t)DS4_SERVER_DECODE_QUANTUM_TOKENS);
+    pulsar_session *pool = s->sess;
+    const uint64_t dpb = pulsar_session_quantum_growth_bytes_per_bank(
+            pool, (uint32_t)PULSAR_SERVER_DECODE_QUANTUM_TOKENS);
     const uint64_t delta = (uint64_t)n * dpb;      /* all n live banks grow */
     const uint64_t bound = s->guard_touched_budget;
     /* Finding 2: free_physical zeroes a spilled bank's frontier so touched drops
@@ -3525,7 +3525,7 @@ static void server_guard_maybe_evict(server *s, session_slot **dec, int n) {
      * per-quantum count log lets the smoke assert no cascade. */
     int spilled_this_quantum = 0;
     for (;;) {
-        const uint64_t projected = ds4_session_touched_kv_bytes(pool) + delta;
+        const uint64_t projected = pulsar_session_touched_kv_bytes(pool) + delta;
         if (projected <= bound) break;             /* fits */
         const int vi = server_guard_pick_victim(s, dec, n);
         if (vi < 0) {
@@ -3537,8 +3537,8 @@ static void server_guard_maybe_evict(server *s, session_slot **dec, int n) {
             if (now_us - last_warn_us > 5000000ull) {
                 last_warn_us = now_us;
                 const double gib = 1024.0 * 1024.0 * 1024.0;
-                server_log(DS4_LOG_WARNING,
-                    "ds4-server: guard: projected touched %.2f GiB > budget %.2f GiB but NO "
+                server_log(PULSAR_LOG_WARNING,
+                    "pulsar-server: guard: projected touched %.2f GiB > budget %.2f GiB but NO "
                     "idle victim — back-pressure (MemAvailable floor is the backstop)",
                     (double)projected / gib, (double)bound / gib);
             }
@@ -3548,18 +3548,18 @@ static void server_guard_maybe_evict(server *s, session_slot **dec, int n) {
         spilled_this_quantum++;
     }
     if (spilled_this_quantum > 0) {
-        server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: guard: spilled %d bank(s) this quantum (touched now %.2f GiB / %.2f GiB)",
+        server_log(PULSAR_LOG_DEFAULT,
+                   "pulsar-server: guard: spilled %d bank(s) this quantum (touched now %.2f GiB / %.2f GiB)",
                    spilled_this_quantum,
-                   (double)ds4_session_touched_kv_bytes(pool) / (1024.0*1024.0*1024.0),
+                   (double)pulsar_session_touched_kv_bytes(pool) / (1024.0*1024.0*1024.0),
                    (double)bound / (1024.0*1024.0*1024.0));
     }
 }
 
 static void worker_batched_decode_quantum(server *s, session_slot **dec, int n) {
     if (n <= 0) return;
-    ds4_session *pool = s->sess;
-    const int vocab = ds4_engine_logits_width(s->engine);
+    pulsar_session *pool = s->sess;
+    const int vocab = pulsar_engine_logits_width(s->engine);
 
     /* Tier-2 2b: proactive-eviction guard — BEFORE the weight sweep grows the live
      * banks, spill LRU-idle banks if this quantum's projected growth would breach
@@ -3594,27 +3594,27 @@ static void worker_batched_decode_quantum(server *s, session_slot **dec, int n) 
         float temp, top_p, min_p; int top_k;
         gen_resolve_sampling(&g->j->req, &temp, &top_k, &top_p, &min_p);
         g->batch_feed_token =
-            ds4_session_sample(pool, temp, top_k, top_p, min_p, &g->rng);
-        g->batch_feed_pos = ds4_session_pos(pool);
-        ds4_session_bank_state_save(pool, (uint32_t)sl->bank);
+            pulsar_session_sample(pool, temp, top_k, top_p, min_p, &g->rng);
+        g->batch_feed_pos = pulsar_session_pos(pool);
+        pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
         g->batch_feed_valid = true;
         g->batch_active = true;
     }
 
     float *logits = (float *)server_xmalloc((size_t)n * (size_t)vocab * sizeof(float));
-    ds4_multiseq_req reqs[DS4_SESSION_POOL_CAP];
-    int live_idx[DS4_SESSION_POOL_CAP];
+    pulsar_multiseq_req reqs[PULSAR_SESSION_POOL_CAP];
+    int live_idx[PULSAR_SESSION_POOL_CAP];
 
-    for (int step = 0; step < DS4_SERVER_DECODE_QUANTUM_TOKENS; step++) {
+    for (int step = 0; step < PULSAR_SERVER_DECODE_QUANTUM_TOKENS; step++) {
         int m = 0;
-        for (int i = 0; i < n && m < DS4_SESSION_POOL_CAP; i++) {
+        for (int i = 0; i < n && m < PULSAR_SESSION_POOL_CAP; i++) {
             session_slot *sl = dec[i];
             gen_state *g = sl->gen;
             if (!g->batch_feed_valid) continue;            /* already stopped */
             if (g_stop_requested || g->completion >= g->max_tokens) {
                 g->batch_feed_valid = false; g->phase = GEN_FINISH; continue;
             }
-            if (g->batch_feed_pos >= ds4_session_ctx(pool)) {
+            if (g->batch_feed_pos >= pulsar_session_ctx(pool)) {
                 g->batch_feed_valid = false; g->finish = "length";
                 g->phase = GEN_FINISH; continue;
             }
@@ -3629,9 +3629,9 @@ static void worker_batched_decode_quantum(server *s, session_slot **dec, int n) 
         char err[96];
         /* plan-34 inc 1: route the decode-only lane through the mixed entry
          * (n_rows == n_dec, still exactly 1 row per bank — no prefill rows, no
-         * mixing yet). Byte-identical to ds4_session_decode_multiseq; the only
+         * mixing yet). Byte-identical to pulsar_session_decode_multiseq; the only
          * change is the heap descriptor scratch. */
-        const int rc = ds4_session_decode_mixed(pool, reqs, (uint32_t)m,
+        const int rc = pulsar_session_decode_mixed(pool, reqs, (uint32_t)m,
                                                  logits, (uint32_t)m * vocab,
                                                  NULL, 0u, err, sizeof(err));
         s->live_bank = -1;   /* pool is multiseq-poisoned: no clean live bank */
@@ -3652,7 +3652,7 @@ static void worker_batched_decode_quantum(server *s, session_slot **dec, int n) 
             const int committed = g->batch_feed_token; /* committed at batch_feed_pos */
             g->batch_feed_pos++;
             sl->committed_pos = g->batch_feed_pos;
-            ds4_tokens_push(&g->batch_pending, committed);
+            pulsar_tokens_push(&g->batch_pending, committed);
             if (g->first_token_t == 0.0) g->first_token_t = server_now_sec();
             /* Route THIS slot's stream writes through its own deferral queue
              * (the worker-thread-local writer is shared across slots). */
@@ -3666,7 +3666,7 @@ static void worker_batched_decode_quantum(server *s, session_slot **dec, int n) 
             float temp, top_p, min_p; int top_k;
             gen_resolve_sampling(&g->j->req, &temp, &top_k, &top_p, &min_p);
             g->batch_feed_token =
-                ds4_sample_logits(row, vocab, temp, top_k, top_p, min_p, &g->rng);
+                pulsar_sample_logits(row, vocab, temp, top_k, top_p, min_p, &g->rng);
         }
     }
     free(logits);
@@ -3686,14 +3686,14 @@ static void worker_batched_decode_quantum(server *s, session_slot **dec, int n) 
  * when the flag is off, not in pool mode, or nothing qualifies. */
 static session_slot *worker_find_fuse_prefill(server *s) {
     if (!s->mixed_batch_enabled || s->pool_banks <= 0) return NULL;
-    ds4_session *pool = s->sess;
+    pulsar_session *pool = s->sess;
     for (int i = 0; i < s->n_slots; i++) {
         session_slot *sl = &s->slots[i];
         gen_state *g = sl->gen;
         if (!sl->active_job || !g || g->phase != GEN_PREFILL_MAIN || !g->prompt_for_sync ||
             g->no_fuse)
             continue;
-        const int P = ds4_session_bank_pos(pool, sl->bank);
+        const int P = pulsar_session_bank_pos(pool, sl->bank);
         const int len = g->prompt_for_sync->len;
         if (P <= 0 || P >= len) continue;                       /* first chunk / done: classic */
         return sl;                                              /* P=1: first qualifier */
@@ -3703,23 +3703,23 @@ static session_slot *worker_find_fuse_prefill(server *s) {
 
 /* plan-34 phase-2 inc 5 — FUSED mixed-batch quantum. One decode quantum whose EVERY
  * step folds a small (s->mixed_chunk_tokens) prefill run for `pf` into the SAME
- * ds4_session_decode_mixed sweep as the decode banks (true continuous batching,
+ * pulsar_session_decode_mixed sweep as the decode banks (true continuous batching,
  * P=1). Decode banks advance exactly as worker_batched_decode_quantum — the inc-4
  * neutrality gate proves a co-scheduled prefill does not perturb them — so their
  * per-request output is unchanged in shape. The prefill advances up to
  * QUANTUM*chunk tokens, SPREAD uniformly across the steps so no single decode step
  * eats a whole chunk (the p99 lever vs the time-slice's per-interval decode stall).
  * pf's FIRST chunk (pos 0) and FINAL tail (<= chunk) stay CLASSIC: the tail's
- * ds4_session_sync carries the prefill->decode completion (kv-cache store,
+ * pulsar_session_sync carries the prefill->decode completion (kv-cache store,
  * gen_stream_begin), so this never reimplements that handoff. Reconciliation of
  * pf's bank is the exact recipe the decode lane uses (bank_state_restore +
  * note_committed_tokens). */
 static void worker_mixed_batch_quantum(server *s, session_slot **dec, int n, session_slot *pf) {
     if (n <= 0 || !pf || !pf->gen || !pf->gen->prompt_for_sync) return;
-    ds4_session *pool = s->sess;
-    const int vocab = ds4_engine_logits_width(s->engine);
+    pulsar_session *pool = s->sess;
+    const int vocab = pulsar_engine_logits_width(s->engine);
     gen_state *pg = pf->gen;
-    const ds4_tokens *pp = pg->prompt_for_sync;
+    const pulsar_tokens *pp = pg->prompt_for_sync;
 
     server_guard_maybe_evict(s, dec, n);
 
@@ -3736,9 +3736,9 @@ static void worker_mixed_batch_quantum(server *s, session_slot **dec, int n, ses
         }
         float temp, top_p, min_p; int top_k;
         gen_resolve_sampling(&g->j->req, &temp, &top_k, &top_p, &min_p);
-        g->batch_feed_token = ds4_session_sample(pool, temp, top_k, top_p, min_p, &g->rng);
-        g->batch_feed_pos = ds4_session_pos(pool);
-        ds4_session_bank_state_save(pool, (uint32_t)sl->bank);
+        g->batch_feed_token = pulsar_session_sample(pool, temp, top_k, top_p, min_p, &g->rng);
+        g->batch_feed_pos = pulsar_session_pos(pool);
+        pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
         g->batch_feed_valid = true; g->batch_active = true;
     }
 
@@ -3748,46 +3748,46 @@ static void worker_mixed_batch_quantum(server *s, session_slot **dec, int n, ses
         snprintf(pg->err, sizeof pg->err, "prefill bank %u restore failed", (unsigned)pf->bank);
         pg->finish = "error"; pg->phase = GEN_FINISH; return;
     }
-    const int P0 = ds4_session_pos(pool);
-    ds4_session_bank_state_save(pool, (uint32_t)pf->bank);
+    const int P0 = pulsar_session_pos(pool);
+    pulsar_session_bank_state_save(pool, (uint32_t)pf->bank);
     {   /* one-shot observability: confirm the fused lane actually engaged. */
         static int logged = 0;
         if (logged < 3) { logged++;
-            server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: FUSED mixed quantum engaged (prefill bank %u at pos %d/%d, "
+            server_log(PULSAR_LOG_DEFAULT,
+                       "pulsar-server: FUSED mixed quantum engaged (prefill bank %u at pos %d/%d, "
                        "%d decode banks, chunk %d/step)",
                        (unsigned)pf->bank, P0, pp->len, n, s->mixed_chunk_tokens);
         }
     }
 
     int kstep = s->mixed_chunk_tokens;
-    const int cap = ds4_session_prefill_cap(pool);   /* mixed-step row ceiling */
-    if (kstep > cap - DS4_SESSION_POOL_CAP) kstep = cap - DS4_SESSION_POOL_CAP;
+    const int cap = pulsar_session_prefill_cap(pool);   /* mixed-step row ceiling */
+    if (kstep > cap - PULSAR_SESSION_POOL_CAP) kstep = cap - PULSAR_SESSION_POOL_CAP;
     if (kstep < 1) kstep = 1;
     const int len = pp->len;
     int pf_done = 0;
     bool reached_end = false;                     /* prefill reached len this quantum */
     bool pf_giveup = false;                        /* prefill rejected -> stop folding it */
 
-    const size_t reqcap = (size_t)DS4_SESSION_POOL_CAP + (size_t)kstep;
-    ds4_multiseq_req *reqs = (ds4_multiseq_req *)server_xmalloc(reqcap * sizeof(*reqs));
-    float *logits = (float *)server_xmalloc((size_t)(DS4_SESSION_POOL_CAP + 1) * (size_t)vocab * sizeof(float));
+    const size_t reqcap = (size_t)PULSAR_SESSION_POOL_CAP + (size_t)kstep;
+    pulsar_multiseq_req *reqs = (pulsar_multiseq_req *)server_xmalloc(reqcap * sizeof(*reqs));
+    float *logits = (float *)server_xmalloc((size_t)(PULSAR_SESSION_POOL_CAP + 1) * (size_t)vocab * sizeof(float));
     /* last-position (len-1) logits captured from the final fused prefill run — the
      * decode seed for the prefill->decode handoff (byte-identical to classic per
      * the inc-4 gate: the fused run's last-of-run logits match classic-resume). */
     float *pf_last_logits = (float *)server_xmalloc((size_t)vocab * sizeof(float));
-    int live_idx[DS4_SESSION_POOL_CAP];
+    int live_idx[PULSAR_SESSION_POOL_CAP];
 
-    for (int step = 0; step < DS4_SERVER_DECODE_QUANTUM_TOKENS; step++) {
+    for (int step = 0; step < PULSAR_SERVER_DECODE_QUANTUM_TOKENS; step++) {
         int m = 0;
-        for (int i = 0; i < n && m < DS4_SESSION_POOL_CAP; i++) {
+        for (int i = 0; i < n && m < PULSAR_SESSION_POOL_CAP; i++) {
             session_slot *sl = dec[i];
             gen_state *g = sl->gen;
             if (!g->batch_feed_valid) continue;
             if (g_stop_requested || g->completion >= g->max_tokens) {
                 g->batch_feed_valid = false; g->phase = GEN_FINISH; continue;
             }
-            if (g->batch_feed_pos >= ds4_session_ctx(pool)) {
+            if (g->batch_feed_pos >= pulsar_session_ctx(pool)) {
                 g->batch_feed_valid = false; g->finish = "length"; g->phase = GEN_FINISH; continue;
             }
             reqs[m].bank = sl->bank; reqs[m].pos = g->batch_feed_pos;
@@ -3821,7 +3821,7 @@ static void worker_mixed_batch_quantum(server *s, session_slot **dec, int n, ses
          * OR a pure-decode step, pass 0 = all runs (the prefill head IS consumed). */
         const uint32_t head_cap =
             (kthis > 0 && m > 0 && pos_now + kthis < len) ? (uint32_t)m : 0u;
-        int rc = ds4_session_decode_mixed(pool, reqs, (uint32_t)nrows, logits,
+        int rc = pulsar_session_decode_mixed(pool, reqs, (uint32_t)nrows, logits,
                 (int)((size_t)(m + (kthis > 0 ? 1 : 0)) * (size_t)vocab), &n_runs, head_cap, err, sizeof err);
         if (rc == 1 && kthis > 0) {
             /* RECOVERABLE reject (nothing committed) caused by the PREFILL run — e.g.
@@ -3830,7 +3830,7 @@ static void worker_mixed_batch_quantum(server *s, session_slot **dec, int n, ses
              * classic via no_fuse) and retry this step DECODE-ONLY. */
             pf_giveup = true; pg->no_fuse = true;
             if (m > 0) {
-                rc = ds4_session_decode_mixed(pool, reqs, (uint32_t)m, logits,
+                rc = pulsar_session_decode_mixed(pool, reqs, (uint32_t)m, logits,
                         (int)((size_t)m * (size_t)vocab), &n_runs, 0u, err, sizeof err);
             } else { s->live_bank = -1; break; }   /* only prefill this step: just stop */
             kthis = 0;                              /* prefill did not advance */
@@ -3858,7 +3858,7 @@ static void worker_mixed_batch_quantum(server *s, session_slot **dec, int n, ses
             gen_state *g = sl->gen;
             const int committed = g->batch_feed_token;
             g->batch_feed_pos++; sl->committed_pos = g->batch_feed_pos;
-            ds4_tokens_push(&g->batch_pending, committed);
+            pulsar_tokens_push(&g->batch_pending, committed);
             if (g->first_token_t == 0.0) g->first_token_t = server_now_sec();
             slot_writer_install(&g->writer);
             if (gen_emit_token(s, sl, committed)) {
@@ -3867,7 +3867,7 @@ static void worker_mixed_batch_quantum(server *s, session_slot **dec, int n, ses
             const float *row = logits + (size_t)q * (size_t)vocab;
             float temp, top_p, min_p; int top_k;
             gen_resolve_sampling(&g->j->req, &temp, &top_k, &top_p, &min_p);
-            g->batch_feed_token = ds4_sample_logits(row, vocab, temp, top_k, top_p, min_p, &g->rng);
+            g->batch_feed_token = pulsar_sample_logits(row, vocab, temp, top_k, top_p, min_p, &g->rng);
         }
     }
     free(reqs); free(logits);
@@ -3877,8 +3877,8 @@ static void worker_mixed_batch_quantum(server *s, session_slot **dec, int n, ses
      * checkpoint by exactly the committed prefill tokens, so its next chunk resumes
      * correctly and any store sees the true frontier. */
     if (pf_done > 0 && pg->phase == GEN_PREFILL_MAIN) {
-        if (ds4_session_bank_state_restore(pool, pf->bank)) {
-            ds4_session_note_committed_tokens(pool, &pp->v[P0], pf_done);
+        if (pulsar_session_bank_state_restore(pool, pf->bank)) {
+            pulsar_session_note_committed_tokens(pool, &pp->v[P0], pf_done);
             pf->committed_pos = P0 + pf_done;
             s->live_bank = (int)pf->bank;
             if (reached_end) {
@@ -3887,7 +3887,7 @@ static void worker_mixed_batch_quantum(server *s, session_slot **dec, int n, ses
                  * decode handoff the classic path uses (kv-cache store, SSE start,
                  * GEN_DECODE_INIT). No non-aligned classic tail resume => the
                  * request's decode is byte-identical to a cold classic prefill. */
-                ds4_session_set_logits(pool, pf_last_logits, vocab);
+                pulsar_session_set_logits(pool, pf_last_logits, vocab);
                 slot_writer_install(&pg->writer);
                 gen_stream_begin(s, pf);
                 slot_writer_flush(&pg->writer);
@@ -3939,8 +3939,8 @@ void *worker_main(void *arg) {
          * when the batchable decode count exceeds spec_max_live, OR whenever a
          * batch is already active. Otherwise the classic per-slot round-robin
          * runs unchanged: n_active==1 -> spec (N=1 byte-identical), n<=spec_max_live
-         * -> spec time-slice. Env DS4_SERVER_SPEC_MAX_LIVE tunes the crossover. */
-        session_slot *dec[DS4_SESSION_POOL_CAP];
+         * -> spec time-slice. Env PULSAR_SERVER_SPEC_MAX_LIVE tunes the crossover. */
+        session_slot *dec[PULSAR_SESSION_POOL_CAP];
         int n_dec = 0, n_batched = 0;
         if (s->pool_banks > 0) {
             for (int i = 0; i < s->n_slots; i++) {

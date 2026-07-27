@@ -1,4 +1,4 @@
-#include "ds4_server_internal.h"
+#include "pulsar_server_internal.h"
 
 #include <sys/random.h>
 
@@ -23,7 +23,7 @@ void stop_signal_handler(int sig) {
 
 
 void die(const char *msg) {
-    fprintf(stderr, "ds4-server: %s\n", msg);
+    fprintf(stderr, "pulsar-server: %s\n", msg);
     exit(1);
 }
 

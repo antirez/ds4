@@ -1,4 +1,4 @@
-#include "ds4_agent_internal.h"
+#include "pulsar_agent_internal.h"
 
 
 
@@ -263,7 +263,7 @@ static char *agent_build_system_prompt_reminder(void) {
 
 
 
-void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
+void agent_append_system_prompt(pulsar_engine *engine, pulsar_tokens *tokens,
                                        const char *extra) {
     /* The built-in tool prompt is trusted DS4 control text.  Tokenize it like a
      * rendered chat prompt so the literal ｜DSML｜ markers in the examples become
@@ -271,7 +271,7 @@ void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
      * supplied -sys text: arbitrary user text containing <｜User｜>, <think>, or
      * ｜DSML｜ must remain plain content, not control tokens. */
     char *tools_prompt = agent_build_tools_prompt();
-    ds4_tokenize_rendered_chat(engine, tools_prompt, tokens);
+    pulsar_tokenize_rendered_chat(engine, tools_prompt, tokens);
     free(tools_prompt);
 
     if (!extra || !extra[0]) return;
@@ -279,7 +279,7 @@ void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
     char *plain = (char *)agent_xmalloc(n + 3);
     memcpy(plain, "\n\n", 2);
     memcpy(plain + 2, extra, n + 1);
-    ds4_chat_append_message(engine, tokens, "system", plain);
+    pulsar_chat_append_message(engine, tokens, "system", plain);
     free(plain);
 }
 
@@ -306,7 +306,7 @@ void agent_worker_maybe_append_datetime_context(agent_worker *w) {
     snprintf(msg, sizeof(msg),
              "Current local date and time at session start: %s. "
              "Use this only when date or time matters.", when);
-    ds4_chat_append_message(w->engine, &w->transcript, "system", msg);
+    pulsar_chat_append_message(w->engine, &w->transcript, "system", msg);
     agent_trace_text(w, "datetime-context", msg, strlen(msg));
     w->datetime_context_injected = true;
 }
@@ -332,15 +332,15 @@ void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
     agent_publish_system_status(w, "Re-injecting system prompt reminder...");
     agent_trace(w, "system prompt reminder injected at transcript=%d",
                 w->transcript.len);
-    ds4_tokenize_rendered_chat(w->engine, reminder, &w->transcript);
+    pulsar_tokenize_rendered_chat(w->engine, reminder, &w->transcript);
     free(reminder);
 
     const char *extra = w->cfg->gen.system;
     if (extra && extra[0]) {
-        ds4_tokenize_text(w->engine,
+        pulsar_tokenize_text(w->engine,
             "\nAdditional system instructions reminder:\n", &w->transcript);
-        ds4_tokenize_text(w->engine, extra, &w->transcript);
-        ds4_tokenize_text(w->engine,
+        pulsar_tokenize_text(w->engine, extra, &w->transcript);
+        pulsar_tokenize_text(w->engine,
             "\n[End additional system instructions reminder.]\n\n",
             &w->transcript);
     }

@@ -1,12 +1,12 @@
-#include "ds4_engine_internal.h"
+#include "pulsar_engine_internal.h"
 
 
 
 bool gpu_graph_alloc(
-        ds4_gpu_graph *g,
-        const ds4_weights     *weights,
-        const ds4_layer_weights *layer) {
-    return gpu_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false);
+        pulsar_gpu_graph *g,
+        const pulsar_weights     *weights,
+        const pulsar_layer_weights *layer) {
+    return gpu_graph_alloc_raw_cap(g, weights, layer, PULSAR_N_SWA, PULSAR_N_SWA, 1, false);
 }
 
 
@@ -15,12 +15,12 @@ bool gpu_graph_alloc(
 
 
 uint32_t gpu_graph_raw_span_for_batch(
-        const ds4_gpu_graph *g,
+        const pulsar_gpu_graph *g,
         uint32_t               pos0,
         uint32_t               n_tokens) {
     if (!g || g->raw_cap == 0 || n_tokens == 0) return 0;
 
-    const uint32_t window = g->raw_window ? g->raw_window : DS4_N_SWA;
+    const uint32_t window = g->raw_window ? g->raw_window : PULSAR_N_SWA;
     const uint32_t last_pos = pos0 + n_tokens - 1u;
     uint64_t needed = (uint64_t)n_tokens;
     if (window != 0) {
@@ -35,7 +35,7 @@ uint32_t gpu_graph_raw_span_for_batch(
 
 
 uint32_t gpu_graph_raw_start_for_span(
-        const ds4_gpu_graph *g,
+        const pulsar_gpu_graph *g,
         uint32_t               last_pos,
         uint32_t               n_raw) {
     if (!g || g->raw_cap == 0 || n_raw == 0) return 0;
@@ -45,7 +45,7 @@ uint32_t gpu_graph_raw_start_for_span(
 
 
 
-uint32_t gpu_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph *g) {
+uint32_t gpu_graph_decode_indexer_sparse_threshold(const pulsar_gpu_graph *g) {
     (void)g;
     static int parsed = -1;
     static uint32_t cached = 0;
@@ -63,7 +63,7 @@ uint32_t gpu_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph *g) {
                 parsed = 1;
             } else {
                 fprintf(stderr,
-                        "ds4: invalid DS4_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD=%s; "
+                        "pulsar: invalid DS4_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD=%s; "
                         "expected 64, 128, 256, 512, 1024, 2048, or 4096\n",
                         env);
             }
@@ -76,7 +76,7 @@ uint32_t gpu_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph *g) {
      * the smaller attention scan, while larger contexts benefit from sparse
      * indexed attention.  This threshold changes only the implementation used
      * to consume the compressed rows; it must not lower the 512-row indexer
-     * selection defined by DS4_N_INDEXER_TOP_K. */
+     * selection defined by PULSAR_N_INDEXER_TOP_K. */
     return 1024u;
 }
 
@@ -88,7 +88,7 @@ uint32_t gpu_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph *g) {
  *
  * The normal generation path uses the fused helpers below.  The older unfused
  * kernels remain available as diagnostic reference paths selected only by the
- * DS4_CUDA_DISABLE_*_FUSION environment switches.
+ * PULSAR_CUDA_DISABLE_*_FUSION environment switches.
  */
 
 bool gpu_graph_env_flag(const char *name, int *cache) {

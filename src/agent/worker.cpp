@@ -1,4 +1,4 @@
-#include "ds4_agent_internal.h"
+#include "pulsar_agent_internal.h"
 
 
 
@@ -42,7 +42,7 @@ static bool agent_stream_wants_greedy_sampling(const agent_stream_renderer *sr) 
 
 static int worker_sample_with_mode(agent_worker *w, const agent_config *cfg,
                                    bool greedy, uint64_t *rng) {
-    return ds4_session_sample(w->session,
+    return pulsar_session_sample(w->session,
                               greedy ? 0.0f : cfg->gen.temperature,
                               0,
                               greedy ? 1.0f : cfg->gen.top_p,
@@ -68,7 +68,7 @@ static void worker_set_greedy_sampling(agent_worker *w, bool greedy) {
  * the model native DSML tool iteration without a client/server protocol. */
 static int worker_run_turn(agent_worker *w, const char *user_text) {
     agent_config *cfg = w->cfg;
-    ds4_think_mode think_mode = effective_think_mode(cfg);
+    pulsar_think_mode think_mode = effective_think_mode(cfg);
     pthread_mutex_lock(&w->mu);
     w->interrupt = false;
     w->status.error[0] = '\0';
@@ -96,7 +96,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         agent_session_identity_sha(w->session_title, w->session_created_at,
                                    w->session_sha);
     }
-    ds4_chat_append_message(w->engine, &w->transcript, "user", user_text);
+    pulsar_chat_append_message(w->engine, &w->transcript, "user", user_text);
 
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
@@ -127,17 +127,17 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             return 1;
         }
         agent_worker_maybe_append_system_prompt_reminder(w);
-        ds4_chat_append_assistant_prefix(w->engine, &w->transcript, think_mode);
+        pulsar_chat_append_assistant_prefix(w->engine, &w->transcript, think_mode);
 
-        const ds4_tokens *prompt_for_sync = &w->transcript;
-        int old_pos = ds4_session_pos(w->session);
-        int common = ds4_session_common_prefix(w->session, &w->transcript);
+        const pulsar_tokens *prompt_for_sync = &w->transcript;
+        int old_pos = pulsar_session_pos(w->session);
+        int common = pulsar_session_common_prefix(w->session, &w->transcript);
         int cached = common == old_pos && w->transcript.len >= old_pos ? common : 0;
 
         int suffix = prompt_for_sync->len - cached;
         agent_trace(w, "prefill tool_round=%d transcript=%d prompt=%d cached=%d suffix=%d think=%s",
                     tool_round, w->transcript.len, prompt_for_sync->len,
-                    cached, suffix, ds4_think_mode_name(think_mode));
+                    cached, suffix, pulsar_think_mode_name(think_mode));
         agent_trace_tokens(w, "prefill_suffix", prompt_for_sync, cached);
 
         pthread_mutex_lock(&w->mu);
@@ -157,17 +157,17 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         pthread_mutex_unlock(&w->mu);
 
         char err[160];
-        ds4_session_set_progress(w->session, worker_progress_cb, w);
-        ds4_session_set_display_progress(w->session, worker_progress_cb, w);
-        ds4_session_set_cancel(w->session, worker_cancel_session_cb, w);
-        int sync_rc = ds4_session_sync(w->session, prompt_for_sync, err, sizeof(err));
-        ds4_session_set_cancel(w->session, NULL, NULL);
-        ds4_session_set_progress(w->session, NULL, NULL);
-        ds4_session_set_display_progress(w->session, NULL, NULL);
-        if (sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+        pulsar_session_set_progress(w->session, worker_progress_cb, w);
+        pulsar_session_set_display_progress(w->session, worker_progress_cb, w);
+        pulsar_session_set_cancel(w->session, worker_cancel_session_cb, w);
+        int sync_rc = pulsar_session_sync(w->session, prompt_for_sync, err, sizeof(err));
+        pulsar_session_set_cancel(w->session, NULL, NULL);
+        pulsar_session_set_progress(w->session, NULL, NULL);
+        pulsar_session_set_display_progress(w->session, NULL, NULL);
+        if (sync_rc == PULSAR_SESSION_SYNC_INTERRUPTED) {
             agent_publish_system_status(
                 w, "Model reading interrupted; the model may only be aware of the prefix processed so far.");
-            ds4_tokens_push(&w->transcript, ds4_token_eos(w->engine));
+            pulsar_tokens_push(&w->transcript, pulsar_token_eos(w->engine));
             worker_clear_interrupt(w);
             agent_set_status(w, AGENT_WORKER_IDLE);
             return 0;
@@ -178,7 +178,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         }
 
         int max_tokens = cfg->gen.n_predict;
-        int room = ds4_session_ctx(w->session) - ds4_session_pos(w->session);
+        int room = pulsar_session_ctx(w->session) - pulsar_session_pos(w->session);
         if (room <= 1) max_tokens = 0;
         else if (max_tokens > room - 1) max_tokens = room - 1;
 
@@ -186,9 +186,9 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         agent_token_renderer renderer = {
             .engine = w->engine,
             .worker = w,
-            .format_thinking = ds4_think_mode_enabled(think_mode),
+            .format_thinking = pulsar_think_mode_enabled(think_mode),
             .format_markdown = use_color,
-            .in_think = ds4_think_mode_enabled(think_mode),
+            .in_think = pulsar_think_mode_enabled(think_mode),
             .use_color = use_color,
             .last_output_newline = true,
         };
@@ -196,7 +196,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         agent_stream_renderer stream = {
             .renderer = &renderer,
             .parser = &dsml,
-            .in_think = ds4_think_mode_enabled(think_mode),
+            .in_think = pulsar_think_mode_enabled(think_mode),
         };
         agent_edit_upto_forcer upto_forcer = {0};
         bool got_tool = false;
@@ -220,10 +220,10 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 status_greedy_sampling = greedy_sampling;
             }
             int token = worker_sample_with_mode(w, cfg, greedy_sampling, &rng);
-            if (token == ds4_token_eos(w->engine)) break;
+            if (token == pulsar_token_eos(w->engine)) break;
 
             size_t text_len = 0;
-            char *text = ds4_token_text(w->engine, token, &text_len);
+            char *text = pulsar_token_text(w->engine, token, &text_len);
             if (agent_edit_upto_forcer_should_replace(&upto_forcer, &dsml,
                                                        text, text_len))
             {
@@ -276,7 +276,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         renderer_finish(&renderer);
         worker_set_greedy_sampling(w, false);
         if (interrupted) {
-            ds4_tokens_push(&w->transcript, ds4_token_eos(w->engine));
+            pulsar_tokens_push(&w->transcript, pulsar_token_eos(w->engine));
             agent_dsml_parser_free(&dsml);
             agent_publish_system_status(w, "Stopped by user");
             worker_clear_interrupt(w);
@@ -301,7 +301,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                      "incomplete DSML tool call");
         }
 
-        ds4_tokens_push(&w->transcript, ds4_token_eos(w->engine));
+        pulsar_tokens_push(&w->transcript, pulsar_token_eos(w->engine));
 
         if (!got_tool && !malformed_tool && !early_tool_error) {
             agent_dsml_parser_free(&dsml);
@@ -369,14 +369,14 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 }
             }
         }
-        ds4_chat_append_message(w->engine, &w->transcript, "tool", tool_result);
+        pulsar_chat_append_message(w->engine, &w->transcript, "tool", tool_result);
         free(tool_result);
         agent_dsml_parser_free(&dsml);
 
         char *queued_user = worker_request_queued_user_drain(w);
         if (queued_user && queued_user[0]) {
             agent_trace_text(w, "queued_user", queued_user, strlen(queued_user));
-            ds4_chat_append_message(w->engine, &w->transcript, "user", queued_user);
+            pulsar_chat_append_message(w->engine, &w->transcript, "user", queued_user);
             pthread_mutex_lock(&w->mu);
             w->user_activity = true;
             w->session_dirty = true;
@@ -481,7 +481,7 @@ void *worker_main(void *arg) {
     agent_worker *w = (agent_worker *)arg;
     agent_trace(w, "agent worker start ctx=%d backend=%s model=%s trace=%s",
                 w->cfg->gen.ctx_size,
-                ds4_backend_name(w->cfg->engine.backend),
+                pulsar_backend_name(w->cfg->engine.backend),
                 w->cfg->engine.model_path ? w->cfg->engine.model_path : "",
                 w->cfg->gen.trace_path ? w->cfg->gen.trace_path : "");
     char init_err[160] = {0};

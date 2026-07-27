@@ -1,23 +1,23 @@
-#include "ds4_engine_internal.h"
+#include "pulsar_engine_internal.h"
 
 
 
 /* Dispatch: call the right gate/up mid builder based on tensor type. */
 void matvec_experts_mid_prequant(
         float            *mid,
-        const ds4_model  *m,
-        const ds4_tensor *gate_w,
-        const ds4_tensor *up_w,
+        const pulsar_model  *m,
+        const pulsar_tensor *gate_w,
+        const pulsar_tensor *up_w,
         const block_q8_K *xq,
         const int        *selected,
         const float      *expert_weight,
         int               n_expert,
         float             clamp) {
-    if (gate_w->type == DS4_TENSOR_IQ2_XXS) {
+    if (gate_w->type == PULSAR_TENSOR_IQ2_XXS) {
         matvec_iq2_xxs_experts_mid_prequant(mid, m, gate_w, up_w, xq,
                                             selected, expert_weight, n_expert, clamp);
     } else {
-        ds4_die("unsupported gate/up expert tensor type");
+        pulsar_die("unsupported gate/up expert tensor type");
     }
 }
 
@@ -26,15 +26,15 @@ void matvec_experts_mid_prequant(
 /* Dispatch: call the right down-projection accumulator based on tensor type. */
 void matvec_experts_down_accum_prequant(
         float            *out,
-        const ds4_model  *m,
-        const ds4_tensor *w,
+        const pulsar_model  *m,
+        const pulsar_tensor *w,
         const block_q8_K *xq,
         const int        *selected,
         int               n_expert) {
-    if (w->type == DS4_TENSOR_Q2_K) {
+    if (w->type == PULSAR_TENSOR_Q2_K) {
         matvec_q2_k_experts_accum_prequant(out, m, w, xq, selected, n_expert);
     } else {
-        ds4_die("unsupported down expert tensor type");
+        pulsar_die("unsupported down expert tensor type");
     }
 }
 
@@ -44,15 +44,15 @@ void matvec_experts_down_accum_prequant(
 void matvec_expert_pair_prequant(
         float            *out0,
         float            *out1,
-        const ds4_model  *m,
-        const ds4_tensor *w0,
-        const ds4_tensor *w1,
+        const pulsar_model  *m,
+        const pulsar_tensor *w0,
+        const pulsar_tensor *w1,
         const block_q8_K *xq,
         uint32_t          expert) {
-    if (w0->type == DS4_TENSOR_IQ2_XXS) {
+    if (w0->type == PULSAR_TENSOR_IQ2_XXS) {
         matvec_iq2_xxs_expert_pair_prequant(out0, out1, m, w0, w1, xq, expert);
     } else {
-        ds4_die("unsupported gate/up expert tensor type");
+        pulsar_die("unsupported gate/up expert tensor type");
     }
 }
 
@@ -61,27 +61,27 @@ void matvec_expert_pair_prequant(
 /* Dispatch: single-expert down projection for tracing. */
 void matvec_expert_down(
         float            *out,
-        const ds4_model  *m,
-        const ds4_tensor *w,
+        const pulsar_model  *m,
+        const pulsar_tensor *w,
         const float      *x,
         uint32_t          expert) {
-    if (w->type == DS4_TENSOR_Q2_K) {
+    if (w->type == PULSAR_TENSOR_Q2_K) {
         matvec_q2_k_expert(out, m, w, x, expert);
     } else {
-        ds4_die("unsupported down expert tensor type");
+        pulsar_die("unsupported down expert tensor type");
     }
 }
 
 
 
-static DS4_MAYBE_UNUSED void sum_down_pairs_worker(void *vctx, uint64_t row0, uint64_t row1) {
+static PULSAR_MAYBE_UNUSED void sum_down_pairs_worker(void *vctx, uint64_t row0, uint64_t row1) {
     sum_down_pairs_ctx *ctx = static_cast<sum_down_pairs_ctx *>(vctx);
     for (uint64_t idx = row0; idx < row1; idx++) {
         const uint32_t token = (uint32_t)(idx / ctx->out_dim);
         const uint64_t row = idx - (uint64_t)token * ctx->out_dim;
         float acc = 0.0f;
-        for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
-            const uint64_t pair_id = (uint64_t)token * DS4_N_EXPERT_USED + slot;
+        for (uint32_t slot = 0; slot < PULSAR_N_EXPERT_USED; slot++) {
+            const uint64_t pair_id = (uint64_t)token * PULSAR_N_EXPERT_USED + slot;
             acc += ctx->down_pair[pair_id * ctx->out_dim + row];
         }
         ctx->moe[idx] = acc;
@@ -128,7 +128,7 @@ void hc_split_sinkhorn_one(
     float c[16 * 16];
 
     for (int dst = 0; dst < n_hc; dst++) {
-        float row_max = DS4_NEG_INF;
+        float row_max = PULSAR_NEG_INF;
         for (int src = 0; src < n_hc; src++) {
             const int idx = src + dst * n_hc;
             const int off = 2 * n_hc + idx;

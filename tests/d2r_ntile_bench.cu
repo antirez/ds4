@@ -16,7 +16,7 @@
  * projected D2R tensor-core win, which is why D2R was redirected rather than built.
  *
  * Replicates moe_gate_up_mid_mxfp4_expert_tile8_rowspan_kernel and
- * moe_down_mxfp4_expert_tile16_row2048_kernel from src/cuda/ds4_cuda_moe.cu
+ * moe_down_mxfp4_expert_tile16_row2048_kernel from src/cuda/pulsar_cuda_moe.cu
  * verbatim, but templated on the N (token) tile width, to answer:
  *   does widening the N tile capture the D2R win without a tensor core?
  *
@@ -81,9 +81,9 @@ typedef struct {
 #define CHECK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     fprintf(stderr, "CUDA ERROR %s @ %s:%d: %s\n", #x, __FILE__, __LINE__, cudaGetErrorString(e_)); exit(1); } } while (0)
 
-/* ---- verbatim from src/cuda/ds4_cuda_moe.cu ---- */
+/* ---- verbatim from src/cuda/pulsar_cuda_moe.cu ---- */
 
-/* VERBATIM from src/cuda/ds4_cuda_moe.cu:184.  Do NOT "improve" this into a table:
+/* VERBATIM from src/cuda/pulsar_cuda_moe.cu:184.  Do NOT "improve" this into a table:
  * a `static const int8_t lut[16]` looks equivalent (and IS numerically -- the values are
  * exactly {0,+-1,+-2,+-3,+-4,+-6,+-8,+-12}) but nvcc lowers it to GLOBAL gather loads
  * (LDG.E.U8.CONSTANT), which is a different kernel with a different cost.  Measuring the

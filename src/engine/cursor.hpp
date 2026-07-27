@@ -1,10 +1,10 @@
 #ifndef PULSAR_CURSOR_HPP
 #define PULSAR_CURSOR_HPP
 
-#include "ds4_engine_internal.h"
+#include "pulsar_engine_internal.h"
 
 /* Bounds-checked byte cursor over the mmapped GGUF file (C++ port of the
- * ds4_cursor free functions). The state stays in the C ds4_cursor struct so
+ * pulsar_cursor free functions). The state stays in the C pulsar_cursor struct so
  * the still-C gguf.c can hold and pass cursors; this class is a typed view
  * over one. When gguf.c ports, the struct folds into the class. */
 
@@ -12,7 +12,7 @@ namespace pulsar {
 
 class Cursor {
 public:
-    explicit Cursor(ds4_cursor &c) : c_(c) {}
+    explicit Cursor(pulsar_cursor &c) : c_(c) {}
 
     void set_error(const char *msg) {
         if (c_.error[0] == '\0') {
@@ -44,7 +44,7 @@ public:
     bool u32(uint32_t *v) { return read(v, sizeof(*v)); }
     bool u64(uint64_t *v) { return read(v, sizeof(*v)); }
 
-    bool string(ds4_str *s) {
+    bool string(pulsar_str *s) {
         uint64_t len;
         if (!u64(&len)) return false;
         if (!has(len)) return false;
@@ -55,7 +55,7 @@ public:
     }
 
 private:
-    ds4_cursor &c_;
+    pulsar_cursor &c_;
 };
 
 } // namespace pulsar

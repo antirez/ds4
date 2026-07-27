@@ -1,4 +1,4 @@
-#include "ds4_agent_internal.h"
+#include "pulsar_agent_internal.h"
 
 
 
@@ -27,11 +27,11 @@ static bool agent_worker_should_compact(agent_worker *w) {
 
 
 
-static int agent_special_token_id(ds4_engine *engine, const char *rendered) {
-    ds4_tokens t = {0};
-    ds4_tokenize_rendered_chat(engine, rendered, &t);
+static int agent_special_token_id(pulsar_engine *engine, const char *rendered) {
+    pulsar_tokens t = {0};
+    pulsar_tokenize_rendered_chat(engine, rendered, &t);
     int id = t.len == 1 ? t.v[0] : -1;
-    ds4_tokens_free(&t);
+    pulsar_tokens_free(&t);
     return id;
 }
 
@@ -59,11 +59,11 @@ static int agent_compact_tail_start(agent_worker *w, int bottom, int sys_len) {
 
 
 
-static void agent_tokens_append_range(ds4_tokens *dst, const ds4_tokens *src,
+static void agent_tokens_append_range(pulsar_tokens *dst, const pulsar_tokens *src,
                                       int start, int end) {
     if (start < 0) start = 0;
     if (end > src->len) end = src->len;
-    for (int i = start; i < end; i++) ds4_tokens_push(dst, src->v[i]);
+    for (int i = start; i < end; i++) pulsar_tokens_push(dst, src->v[i]);
 }
 
 
@@ -74,7 +74,7 @@ static void agent_tokens_append_range(ds4_tokens *dst, const ds4_tokens *src,
 static char *agent_compact_make_prompt(const char *reason) {
     agent_buf b = {0};
     agent_buf_puts(&b,
-        "Internal ds4-agent context compaction request. This is not a user request.\n"
+        "Internal pulsar-agent context compaction request. This is not a user request.\n"
         "Write a durable task-state summary of the conversation so far. Preserve only facts that matter for continuing the work:\n"
         "- user goals, constraints, and preferences\n"
         "- files inspected or edited\n"
@@ -103,10 +103,10 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
     const int bottom = w->transcript.len;
     if (bottom <= 0) return true;
 
-    ds4_tokens sys = {0};
+    pulsar_tokens sys = {0};
     agent_worker_build_system_tokens(w, &sys);
     if (bottom <= sys.len) {
-        ds4_tokens_free(&sys);
+        pulsar_tokens_free(&sys);
         return true;
     }
 
@@ -115,11 +115,11 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
         reason && reason[0] ? reason : "context");
 
     char *prompt_text = agent_compact_make_prompt(reason);
-    ds4_tokens prompt = {0};
-    ds4_tokens_copy(&prompt, &w->transcript);
-    ds4_chat_append_message(w->engine, &prompt, "user", prompt_text);
+    pulsar_tokens prompt = {0};
+    pulsar_tokens_copy(&prompt, &w->transcript);
+    pulsar_chat_append_message(w->engine, &prompt, "user", prompt_text);
     free(prompt_text);
-    ds4_chat_append_assistant_prefix(w->engine, &prompt, DS4_THINK_NONE);
+    pulsar_chat_append_assistant_prefix(w->engine, &prompt, PULSAR_THINK_NONE);
 
     pthread_mutex_lock(&w->mu);
     w->status.state = AGENT_WORKER_COMPACTING;
@@ -136,36 +136,36 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
     int summary_room = w->cfg->gen.ctx_size - prompt.len - 1;
     if (summary_room < 256) {
         snprintf(err, err_len, "not enough context left to request compaction summary");
-        ds4_tokens_free(&prompt);
-        ds4_tokens_free(&sys);
+        pulsar_tokens_free(&prompt);
+        pulsar_tokens_free(&sys);
         agent_publish(w, "\x1b[0m\n", 5);
         return false;
     }
     int summary_max = summary_room < AGENT_COMPACT_SUMMARY_MAX_TOKENS ?
                       summary_room : AGENT_COMPACT_SUMMARY_MAX_TOKENS;
 
-    ds4_session_set_progress(w->session, worker_progress_cb, w);
-    ds4_session_set_display_progress(w->session, worker_progress_cb, w);
-    ds4_session_set_cancel(w->session, worker_cancel_session_cb, w);
-    int sync_rc = ds4_session_sync(w->session, &prompt, err, err_len);
-    ds4_session_set_cancel(w->session, NULL, NULL);
-    ds4_session_set_progress(w->session, NULL, NULL);
-    ds4_session_set_display_progress(w->session, NULL, NULL);
-    if (sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
-        ds4_session_invalidate(w->session);
+    pulsar_session_set_progress(w->session, worker_progress_cb, w);
+    pulsar_session_set_display_progress(w->session, worker_progress_cb, w);
+    pulsar_session_set_cancel(w->session, worker_cancel_session_cb, w);
+    int sync_rc = pulsar_session_sync(w->session, &prompt, err, err_len);
+    pulsar_session_set_cancel(w->session, NULL, NULL);
+    pulsar_session_set_progress(w->session, NULL, NULL);
+    pulsar_session_set_display_progress(w->session, NULL, NULL);
+    if (sync_rc == PULSAR_SESSION_SYNC_INTERRUPTED) {
+        pulsar_session_invalidate(w->session);
         snprintf(err, err_len, "interrupted");
         agent_publish_system_status(
             w, "Compaction interrupted; keeping the previous conversation state.");
-        ds4_tokens_free(&prompt);
-        ds4_tokens_free(&sys);
+        pulsar_tokens_free(&prompt);
+        pulsar_tokens_free(&sys);
         agent_publish(w, "\x1b[0m\n", 5);
         worker_clear_interrupt(w);
         return false;
     }
     if (sync_rc != 0) {
-        ds4_session_invalidate(w->session);
-        ds4_tokens_free(&prompt);
-        ds4_tokens_free(&sys);
+        pulsar_session_invalidate(w->session);
+        pulsar_tokens_free(&prompt);
+        pulsar_tokens_free(&sys);
         agent_publish(w, "\x1b[0m\n", 5);
         return false;
     }
@@ -182,9 +182,9 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
     for (int i = 0; i < summary_max; i++) {
         if (worker_should_interrupt(w)) {
             snprintf(err, err_len, "interrupted");
-            ds4_session_invalidate(w->session);
-            ds4_tokens_free(&prompt);
-            ds4_tokens_free(&sys);
+            pulsar_session_invalidate(w->session);
+            pulsar_tokens_free(&prompt);
+            pulsar_tokens_free(&sys);
             free(summary.ptr);
             agent_publish(w, "\x1b[0m\n", 5);
             agent_publish_system_status(
@@ -192,8 +192,8 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
             worker_clear_interrupt(w);
             return false;
         }
-        int token = ds4_session_argmax(w->session);
-        if (token == ds4_token_eos(w->engine)) break;
+        int token = pulsar_session_argmax(w->session);
+        if (token == pulsar_token_eos(w->engine)) break;
         if (token == think_end_id || token == dsml_id) {
             if (token == dsml_id && summary.len && summary.ptr[summary.len - 1] == '<') {
                 summary.ptr[--summary.len] = '\0';
@@ -201,18 +201,18 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
             agent_trace(w, "compaction summary stopped before control token id=%d", token);
             break;
         }
-        if (ds4_session_eval(w->session, token, eval_err, sizeof(eval_err)) != 0) {
+        if (pulsar_session_eval(w->session, token, eval_err, sizeof(eval_err)) != 0) {
             snprintf(err, err_len, "%s", eval_err);
-            ds4_session_invalidate(w->session);
-            ds4_tokens_free(&prompt);
-            ds4_tokens_free(&sys);
+            pulsar_session_invalidate(w->session);
+            pulsar_tokens_free(&prompt);
+            pulsar_tokens_free(&sys);
             free(summary.ptr);
             agent_publish(w, "\x1b[0m\n", 5);
             return false;
         }
 
         size_t text_len = 0;
-        char *text = ds4_token_text(w->engine, token, &text_len);
+        char *text = pulsar_token_text(w->engine, token, &text_len);
         agent_buf_append(&summary, text, text_len);
         agent_publish(w, text, text_len);
         free(text);
@@ -226,28 +226,28 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
         pthread_mutex_unlock(&w->mu);
     }
     agent_publish(w, "\x1b[0m\n", 5);
-    ds4_tokens_free(&prompt);
+    pulsar_tokens_free(&prompt);
 
     if (!summary.ptr || !summary.ptr[0]) {
         snprintf(err, err_len, "compaction summary was empty");
-        ds4_session_invalidate(w->session);
-        ds4_tokens_free(&sys);
+        pulsar_session_invalidate(w->session);
+        pulsar_tokens_free(&sys);
         free(summary.ptr);
         return false;
     }
 
     int tail_start = agent_compact_tail_start(w, bottom, sys.len);
-    ds4_tokens compacted = {0};
-    ds4_tokens_copy(&compacted, &sys);
+    pulsar_tokens compacted = {0};
+    pulsar_tokens_copy(&compacted, &sys);
 
     agent_buf summary_msg = {0};
     agent_buf_puts(&summary_msg,
-        "\n\n[ds4-agent compacted earlier conversation. Durable task-state summary follows.]\n");
+        "\n\n[pulsar-agent compacted earlier conversation. Durable task-state summary follows.]\n");
     agent_buf_puts(&summary_msg, summary.ptr);
     if (summary_msg.len && summary_msg.ptr[summary_msg.len - 1] != '\n')
         agent_buf_puts(&summary_msg, "\n");
     agent_buf_puts(&summary_msg, "[End compacted summary. Recent conversation continues verbatim below.]\n\n");
-    ds4_chat_append_message(w->engine, &compacted, "system", summary_msg.ptr);
+    pulsar_chat_append_message(w->engine, &compacted, "system", summary_msg.ptr);
     free(summary_msg.ptr);
     free(summary.ptr);
 
@@ -257,23 +257,23 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
         "\x1b[1;95mCOMPACTING\x1b[0m rebuilding context: old=%d summary+tail=%d tail=%d\n",
         bottom, compacted.len, bottom - tail_start);
 
-    ds4_tokens old_transcript = {0};
-    ds4_tokens_copy(&old_transcript, &w->transcript);
-    ds4_tokens_free(&w->transcript);
+    pulsar_tokens old_transcript = {0};
+    pulsar_tokens_copy(&old_transcript, &w->transcript);
+    pulsar_tokens_free(&w->transcript);
     w->transcript = compacted;
     if (agent_worker_sync_tokens(w, &w->transcript, true, err, err_len) != 0) {
-        ds4_session_invalidate(w->session);
-        ds4_tokens_free(&w->transcript);
+        pulsar_session_invalidate(w->session);
+        pulsar_tokens_free(&w->transcript);
         w->transcript = old_transcript;
-        ds4_tokens_free(&sys);
+        pulsar_tokens_free(&sys);
         return false;
     }
     agent_worker_note_system_prompt_seen(w);
-    ds4_tokens_free(&old_transcript);
-    ds4_tokens_free(&sys);
+    pulsar_tokens_free(&old_transcript);
+    pulsar_tokens_free(&sys);
     char *bash_update = agent_bash_jobs_compaction_observation(w);
     if (bash_update) {
-        ds4_chat_append_message(w->engine, &w->transcript, "tool", bash_update);
+        pulsar_chat_append_message(w->engine, &w->transcript, "tool", bash_update);
         w->session_dirty = true;
         agent_trace_text(w, "tool-after-compaction", bash_update, strlen(bash_update));
         agent_publish(w, "\x1b[90mCOMPACTING added bash job update after rebuild\x1b[0m\n",
@@ -303,13 +303,13 @@ int worker_accept_generated_token(agent_worker *w,
                                          agent_stream_renderer *stream,
                                          char *err,
                                          size_t err_len) {
-    if (ds4_session_eval(w->session, token, err, err_len) != 0)
+    if (pulsar_session_eval(w->session, token, err, err_len) != 0)
         return 1;
 
-    ds4_tokens_push(&w->transcript, token);
+    pulsar_tokens_push(&w->transcript, token);
 
     size_t text_len = 0;
-    char *text = ds4_token_text(w->engine, token, &text_len);
+    char *text = pulsar_token_text(w->engine, token, &text_len);
     agent_trace_token(w, token, text, text_len, *generated + 1);
     agent_stream_text(stream, text, text_len, false);
     free(text);
@@ -334,21 +334,21 @@ int worker_force_generated_text(agent_worker *w,
                                        agent_stream_renderer *stream,
                                        char *err,
                                        size_t err_len) {
-    ds4_tokens tokens = {0};
-    ds4_tokenize_text(w->engine, text, &tokens);
+    pulsar_tokens tokens = {0};
+    pulsar_tokenize_text(w->engine, text, &tokens);
     if (tokens.len > max_tokens - *generated) {
         snprintf(err, err_len, "not enough generation room to force %s", text);
-        ds4_tokens_free(&tokens);
+        pulsar_tokens_free(&tokens);
         return 1;
     }
     for (int i = 0; i < tokens.len && *generated < max_tokens; i++) {
         if (worker_accept_generated_token(w, tokens.v[i], generated, t0,
                                           stream, err, err_len) != 0) {
-            ds4_tokens_free(&tokens);
+            pulsar_tokens_free(&tokens);
             return 1;
         }
     }
-    ds4_tokens_free(&tokens);
+    pulsar_tokens_free(&tokens);
     return 0;
 }
 

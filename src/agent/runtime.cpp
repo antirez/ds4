@@ -1,4 +1,4 @@
-#include "ds4_agent_internal.h"
+#include "pulsar_agent_internal.h"
 
 
 
@@ -28,7 +28,7 @@ static int agent_read_stdin_available(agent_input_buf *in, bool *eof) {
         }
         if (errno == EINTR) continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-        perror("ds4-agent: read stdin");
+        perror("pulsar-agent: read stdin");
         return -1;
     }
 }
@@ -40,7 +40,7 @@ static int agent_read_stdin_available(agent_input_buf *in, bool *eof) {
  * stdin protocol: announce readiness on stderr, collect bytes until stdin has
  * been quiet for 200 ms, submit that buffer as one prompt, and keep reading so
  * later input can be queued while the model is still working. */
-static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
+static int run_agent_non_interactive(pulsar_engine *engine, agent_config *cfg) {
     agent_worker worker;
     if (agent_worker_init(&worker, engine, cfg) != 0) return 1;
 
@@ -57,7 +57,7 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
 
     if (!one_shot) {
         if (set_nonblock(STDIN_FILENO, true, &old_stdin_flags) != 0) {
-            perror("ds4-agent: nonblocking stdin");
+            perror("pulsar-agent: nonblocking stdin");
             agent_worker_free(&worker);
             return 1;
         }
@@ -111,7 +111,7 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
         int prc = poll(pfd, (nfds_t)nfds, timeout_ms);
         if (prc < 0) {
             if (errno == EINTR) continue;
-            perror("ds4-agent: poll");
+            perror("pulsar-agent: poll");
             rc = 1;
             break;
         }
@@ -144,7 +144,7 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
         }
 
         if (st.state == AGENT_WORKER_ERROR) {
-            fprintf(stderr, "ds4-agent: %s\n",
+            fprintf(stderr, "pulsar-agent: %s\n",
                     st.error[0] ? st.error : "worker error");
             rc = 1;
             break;
@@ -196,7 +196,7 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
 /* Main UI loop.  poll() multiplexes stdin with the worker wake pipe; all
  * terminal writes go through editor_write_async() so linenoise, status footer,
  * model output, and tool output never race each other. */
-static int run_agent(ds4_engine *engine, agent_config *cfg) {
+static int run_agent(pulsar_engine *engine, agent_config *cfg) {
     agent_worker worker;
     if (agent_worker_init(&worker, engine, cfg) != 0) return 1;
 
@@ -224,7 +224,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     agent_editor editor = {0};
     agent_prompt_queue queue = {0};
     if (editor_start(&editor, prompt, statusline, NULL) != 0) {
-        fprintf(stderr, "ds4-agent: failed to start line editor\n");
+        fprintf(stderr, "pulsar-agent: failed to start line editor\n");
         agent_worker_free(&worker);
         return 1;
     }
@@ -298,7 +298,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
         }
         if (st.state == AGENT_WORKER_ERROR && st.error[0]) {
             char msg[320];
-            int n = snprintf(msg, sizeof(msg), "\nds4-agent: %s\n", st.error);
+            int n = snprintf(msg, sizeof(msg), "\npulsar-agent: %s\n", st.error);
             editor_write_async(&editor, msg, n > 0 ? (size_t)n : 0,
                                prompt, statusline, true);
             pthread_mutex_lock(&worker.mu);
@@ -579,17 +579,17 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 
 
 
-#ifndef DS4_AGENT_TEST_NO_MAIN
+#ifndef PULSAR_AGENT_TEST_NO_MAIN
 
 int main(int argc, char **argv) {
     agent_config cfg = parse_options(argc, argv);
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
-        fprintf(stderr, "ds4-agent: failed to chdir to %s: %s\n",
+        fprintf(stderr, "pulsar-agent: failed to chdir to %s: %s\n",
                 cfg.chdir_path, strerror(errno));
         return 1;
     }
-    ds4_engine *engine = NULL;
-    if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
+    pulsar_engine *engine = NULL;
+    if (pulsar_engine_open(&engine, &cfg.engine) != 0) return 1;
     log_context_memory(cfg.engine.backend,
                        cfg.gen.ctx_size,
                        cfg.engine.prefill_chunk);
@@ -607,7 +607,7 @@ int main(int argc, char **argv) {
         run_agent(engine, &cfg);
 
     if (sigint_installed) sigaction(SIGINT, &old_int, NULL);
-    ds4_engine_close(engine);
+    pulsar_engine_close(engine);
     return rc;
 }
 

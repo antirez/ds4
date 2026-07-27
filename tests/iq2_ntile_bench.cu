@@ -5,7 +5,7 @@
  * and checks bit-exactness vs NT=8.
  *
  * The kernel body is copied verbatim from moe_gate_up_mid_expert_ntile_rowspan_kernel
- * in src/cuda/ds4_cuda_moe.cu (dev_dot_iq2_xxs_q8_K_blockN + the ntile kernel).
+ * in src/cuda/pulsar_cuda_moe.cu (dev_dot_iq2_xxs_q8_K_blockN + the ntile kernel).
  *
  *   nvcc -O3 --use_fast_math -arch=sm_120f -Isrc -o /tmp/iq2_ntile_bench iq2_ntile_bench.cu
  *   flock -w 3600 temp/gpu.lock /tmp/iq2_ntile_bench 2048 20
@@ -27,7 +27,7 @@
 typedef struct { uint16_t d; uint16_t qs[CUDA_QK_K/8]; } cuda_block_iq2_xxs;
 typedef struct { float d; int8_t qs[CUDA_QK_K]; int16_t bsums[CUDA_QK_K/16]; } cuda_block_q8_K;
 
-#include "cuda/ds4_iq2_tables_cuda.inc"   /* cuda_iq2xxs_grid[256], cuda_ksigns_iq2xs[128] */
+#include "cuda/pulsar_iq2_tables_cuda.inc"   /* cuda_iq2xxs_grid[256], cuda_ksigns_iq2xs[128] */
 
 __device__ static float dev_f16_to_f32(uint16_t v){ return __half2float(*reinterpret_cast<const __half*>(&v)); }
 __device__ __forceinline__ static uint32_t dev_unpack_iq2_signs(uint32_t v){ const uint32_t p=__popc(v)&1u; const uint32_t s=v^(p<<7u); return s*0x01010101u; }

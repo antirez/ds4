@@ -48,8 +48,8 @@
  * gate's S6 (batchmate-position independence) is the check with teeth for
  * the position path.
  *
- * DSPARK: `DS4_GATE_NO_DSPARK=1` opens the engine with speculation disabled
- * (the ds4-bench/ds4-eval/agent and `ds4-server --no-dspark` config, and a
+ * DSPARK: `PULSAR_GATE_NO_DSPARK=1` opens the engine with speculation disabled
+ * (the pulsar-bench/pulsar-eval/agent and `pulsar-server --no-dspark` config, and a
  * different allocation shape).  The driver must work there — it is plain
  * decode by contract at n >= 2 and must not depend on the speculation
  * machinery having been initialized.  Run via `make cuda-multiseq-gate-nodspark`.
@@ -65,11 +65,11 @@
  * = N*STEPS/elapsed, vs the timed classic baseline.  Server wiring
  * (increment 4) adds scheduling overhead on top.
  *
- * usage: DS4_MSEQ_BANKS=3 ./tests/multiseq_decode_gate MODEL [MAXN] [STEPS]
+ * usage: PULSAR_MSEQ_BANKS=3 ./tests/multiseq_decode_gate MODEL [MAXN] [STEPS]
  *        (from the repo root — reads tests/long_context_story_prompt.txt)
  */
-#include "ds4.h"
-#include "ds4_engine_internal.h"
+#include "pulsar.h"
+#include "pulsar_engine_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -79,8 +79,8 @@
 #define GATE_MAX_N 8
 #define GATE_MAX_STEPS 2048
 
-static ds4_engine *g_e;
-static ds4_tokens g_toks;
+static pulsar_engine *g_e;
+static pulsar_tokens g_toks;
 static int g_fail;
 
 /* Distinct prompts: different offsets AND different lengths so co-scheduled
@@ -116,7 +116,7 @@ static char *read_file(const char *path, size_t *len_out) {
     return buf;
 }
 
-static bool make_prompt(int k, ds4_tokens *p) {
+static bool make_prompt(int k, pulsar_tokens *p) {
     memset(p, 0, sizeof(*p));
     const int off = g_prompt_off[k], len = g_prompt_len[k];
     if (off + len > g_toks.len) return false;
@@ -131,30 +131,30 @@ static bool make_prompt(int k, ds4_tokens *p) {
  * steps; stream[j] = argmax emitted at position len+j (stream[0] is the
  * prefill continuation).  *secs = the timed classic decode loop. */
 static bool solo_stream(int k, int steps, int *stream, double *secs) {
-    ds4_session *s = NULL;
-    if (ds4_session_create(&s, g_e, 4096) != 0) return false;
-    ds4_tokens p;
+    pulsar_session *s = NULL;
+    if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
+    pulsar_tokens p;
     bool ok = make_prompt(k, &p);
     char err[256];
-    if (ok && ds4_session_sync(s, &p, err, sizeof(err)) != 0) {
+    if (ok && pulsar_session_sync(s, &p, err, sizeof(err)) != 0) {
         fprintf(stderr, "solo sync failed: %s\n", err);
         ok = false;
     }
     if (ok) {
-        stream[0] = ds4_session_argmax(s);
+        stream[0] = pulsar_session_argmax(s);
         const double t0 = now_s();
         for (int j = 1; ok && j <= steps; j++) {
-            if (ds4_session_eval(s, stream[j - 1], err, sizeof(err)) != 0) {
+            if (pulsar_session_eval(s, stream[j - 1], err, sizeof(err)) != 0) {
                 fprintf(stderr, "solo eval failed at %d: %s\n", j, err);
                 ok = false;
                 break;
             }
-            stream[j] = ds4_session_argmax(s);
+            stream[j] = pulsar_session_argmax(s);
         }
         if (secs) *secs = now_s() - t0;
     }
-    ds4_tokens_free(&p);
-    ds4_session_free(s);
+    pulsar_tokens_free(&p);
+    pulsar_session_free(s);
     return ok;
 }
 
@@ -166,24 +166,24 @@ static bool solo_stream(int k, int steps, int *stream, double *secs) {
  * solo[k] is recorded in flip_step[k], and the LIVE logits row of that step
  * yields flip_gap[k] = logit(multi's pick) - logit(solo's pick) — measured in
  * the real run, at the real batch composition, with no re-decode. */
-/* use_mixed: route the batched step through ds4_session_decode_mixed (the plan-34
+/* use_mixed: route the batched step through pulsar_session_decode_mixed (the plan-34
  * heap-descriptor entry the server worker now uses) instead of
- * ds4_session_decode_multiseq. Increment-1 refactor must be byte-identical.
+ * pulsar_session_decode_multiseq. Increment-1 refactor must be byte-identical.
  * first_logits_out (optional, n*vocab floats): the STEP-1 logits, copied out for
  * a byte-level cross-entry comparison. */
 static bool multi_run(int n, int steps, int **streams, int *const *solo,
                       int *flip_step, float *flip_gap, double *secs,
                       bool use_mixed, float *first_logits_out) {
-    ds4_session *s = NULL;
-    if (ds4_session_create(&s, g_e, 4096) != 0) return false;
-    ds4_gpu_graph *g = &s->graph;
+    pulsar_session *s = NULL;
+    if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
+    pulsar_gpu_graph *g = &s->graph;
     if ((int)gpu_graph_bank_pool_count(g) < n) {
         fprintf(stderr, "pool too small: %u < %d (set DS4_MSEQ_BANKS)\n",
                 gpu_graph_bank_pool_count(g), n);
-        ds4_session_free(s);
+        pulsar_session_free(s);
         return false;
     }
-    const int vocab = (int)DS4_N_VOCAB;   /* the engine's logits row width */
+    const int vocab = (int)PULSAR_N_VOCAB;   /* the engine's logits row width */
     char err[256];
     bool ok = true;
     for (int k = 0; k < n; k++) {
@@ -192,34 +192,34 @@ static bool multi_run(int n, int steps, int **streams, int *const *solo,
          * through the classic path (invalidate: no prefix reuse across
          * banks), and capture its frontier into the bank's ms counters. */
         if (g->banks.n_banks && !gpu_graph_bank_repoint(g, (uint32_t)k)) { ok = false; break; }
-        ds4_session_invalidate(s);
-        ds4_tokens p;
+        pulsar_session_invalidate(s);
+        pulsar_tokens p;
         ok = make_prompt(k, &p);
-        if (ok && ds4_session_sync(s, &p, err, sizeof(err)) != 0) {
+        if (ok && pulsar_session_sync(s, &p, err, sizeof(err)) != 0) {
             fprintf(stderr, "populate bank %d failed: %s\n", k, err);
             ok = false;
         }
         if (ok) {
             gpu_graph_bank_counters_capture(g, (uint32_t)k);
-            streams[k][0] = ds4_session_argmax(s);
+            streams[k][0] = pulsar_session_argmax(s);
         }
-        ds4_tokens_free(&p);
+        pulsar_tokens_free(&p);
     }
     float *logits = ok ? (float *)malloc((size_t)n * vocab * sizeof(float)) : NULL;
     if (ok && !logits) ok = false;
     if (ok) {
         const double t0 = now_s();
         for (int j = 1; ok && j <= steps; j++) {
-            ds4_multiseq_req reqs[GATE_MAX_N];
+            pulsar_multiseq_req reqs[GATE_MAX_N];
             for (int k = 0; k < n; k++) {
                 reqs[k].bank = (uint32_t)k;
                 reqs[k].pos = g_prompt_len[k] + (j - 1);
                 reqs[k].token = streams[k][j - 1];
             }
             const int rc = use_mixed
-                ? ds4_session_decode_mixed(s, reqs, (uint32_t)n,
+                ? pulsar_session_decode_mixed(s, reqs, (uint32_t)n,
                                            logits, n * vocab, NULL, 0u, err, sizeof(err))
-                : ds4_session_decode_multiseq(s, reqs, (uint32_t)n,
+                : pulsar_session_decode_multiseq(s, reqs, (uint32_t)n,
                                               logits, n * vocab, err, sizeof(err));
             if (rc != 0) {
                 fprintf(stderr, "%s step %d failed (rc=%d): %s\n",
@@ -242,7 +242,7 @@ static bool multi_run(int n, int steps, int **streams, int *const *solo,
         if (secs) *secs = now_s() - t0;
     }
     free(logits);
-    ds4_session_free(s);
+    pulsar_session_free(s);
     return ok;
 }
 
@@ -250,73 +250,73 @@ static bool multi_run(int n, int steps, int **streams, int *const *solo,
  * step, not silently corrupt.
  *
  * After a multiseq step the graph's scalar frontier counters hold a
- * cross-bank SUPERSET, not any single bank's truth.  ds4_session_eval decodes
+ * cross-bank SUPERSET, not any single bank's truth.  pulsar_session_eval decodes
  * against those scalars unconditionally (it never consulted checkpoint_valid,
  * so clearing that flag never covered this path): it would emit its
  * compressor row at the superset index and attend over the rows below it — a
  * previous tenant's bytes when the live bank's frontier is lower.  Wrong
- * logits, silently.  ds4_session_decode_multiseq is public, so a server is
+ * logits, silently.  pulsar_session_decode_multiseq is public, so a server is
  * exactly the caller that hits this.
  *
  * Asserted here: (1) eval fails after a multiseq step, (2) the speculative
- * entries fail too (same counters), (3) a fresh ds4_session_sync — the
+ * entries fail too (same counters), (3) a fresh pulsar_session_sync — the
  * documented escape hatch, and one available to public callers — clears the
  * condition and eval works again. */
 static bool check_stale_classic_fails_loud(void) {
-    ds4_session *s = NULL;
-    if (ds4_session_create(&s, g_e, 4096) != 0) return false;
-    ds4_gpu_graph *g = &s->graph;
+    pulsar_session *s = NULL;
+    if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
+    pulsar_gpu_graph *g = &s->graph;
     if ((int)gpu_graph_bank_pool_count(g) < 2) {
         printf("STALE-GUARD: skipped (pool %u < 2)\n", gpu_graph_bank_pool_count(g));
-        ds4_session_free(s);
+        pulsar_session_free(s);
         return true;
     }
-    const int vocab = ds4_engine_logits_width(g_e);
+    const int vocab = pulsar_engine_logits_width(g_e);
     char err[256];
     bool ok = true;
     int last[2] = {0, 0};
     for (int k = 0; ok && k < 2; k++) {
         if (g->banks.n_banks && !gpu_graph_bank_repoint(g, (uint32_t)k)) { ok = false; break; }
-        ds4_session_invalidate(s);
-        ds4_tokens p;
+        pulsar_session_invalidate(s);
+        pulsar_tokens p;
         ok = make_prompt(k, &p);
-        if (ok && ds4_session_sync(s, &p, err, sizeof(err)) != 0) {
+        if (ok && pulsar_session_sync(s, &p, err, sizeof(err)) != 0) {
             fprintf(stderr, "stale-guard populate bank %d failed: %s\n", k, err);
             ok = false;
         }
         if (ok) {
             gpu_graph_bank_counters_capture(g, (uint32_t)k);
-            last[k] = ds4_session_argmax(s);
+            last[k] = pulsar_session_argmax(s);
         }
-        ds4_tokens_free(&p);
+        pulsar_tokens_free(&p);
     }
     float *logits = ok ? (float *)malloc((size_t)2 * vocab * sizeof(float)) : NULL;
     if (ok && !logits) ok = false;
     if (ok) {
         /* Sanity: eval works BEFORE any multiseq step (so a later failure is
          * the guard firing, not an unrelated broken session). */
-        if (ds4_session_eval(s, last[1], err, sizeof(err)) != 0) {
+        if (pulsar_session_eval(s, last[1], err, sizeof(err)) != 0) {
             CHECK(0, "stale-guard: eval failed BEFORE any multiseq step (%s)", err);
             ok = false;
         }
     }
     if (ok) {
         /* Re-establish bank 1's frontier: the eval above advanced it. */
-        ds4_tokens p;
+        pulsar_tokens p;
         ok = make_prompt(1, &p);
-        if (ok && ds4_session_sync(s, &p, err, sizeof(err)) != 0) ok = false;
+        if (ok && pulsar_session_sync(s, &p, err, sizeof(err)) != 0) ok = false;
         if (ok) gpu_graph_bank_counters_capture(g, 1u);
-        ds4_tokens_free(&p);
+        pulsar_tokens_free(&p);
         if (!ok) CHECK(0, "stale-guard: bank 1 re-sync failed");
     }
     if (ok) {
-        ds4_multiseq_req reqs[2];
+        pulsar_multiseq_req reqs[2];
         for (int k = 0; k < 2; k++) {
             reqs[k].bank = (uint32_t)k;
             reqs[k].pos = g_prompt_len[k];
             reqs[k].token = last[k];
         }
-        const int rc = ds4_session_decode_multiseq(s, reqs, 2, logits,
+        const int rc = pulsar_session_decode_multiseq(s, reqs, 2, logits,
                                                    2 * vocab, err, sizeof(err));
         if (rc != 0) {
             CHECK(0, "stale-guard: multiseq step failed (rc=%d): %s", rc, err);
@@ -325,43 +325,43 @@ static bool check_stale_classic_fails_loud(void) {
     }
     if (ok) {
         err[0] = '\0';
-        const int rc = ds4_session_eval(s, last[0], err, sizeof(err));
+        const int rc = pulsar_session_eval(s, last[0], err, sizeof(err));
         CHECK(rc != 0,
-              "STALE CLASSIC STATE NOT CAUGHT: ds4_session_eval SUCCEEDED after "
+              "STALE CLASSIC STATE NOT CAUGHT: pulsar_session_eval SUCCEEDED after "
               "a multiseq step — it decoded against cross-bank superset frontier "
               "counters and silently corrupted KV");
         if (rc != 0) printf("STALE-GUARD: eval after multiseq fails loud OK (%s)\n", err);
 
         err[0] = '\0';
         int acc[4];
-        const int rcs = ds4_session_eval_speculative_block(s, last[0], 4, -1, acc,
+        const int rcs = pulsar_session_eval_speculative_block(s, last[0], 4, -1, acc,
                                                            4, err, sizeof(err));
         CHECK(rcs <= 0,
-              "STALE CLASSIC STATE NOT CAUGHT: ds4_session_eval_speculative_block "
+              "STALE CLASSIC STATE NOT CAUGHT: pulsar_session_eval_speculative_block "
               "SUCCEEDED after a multiseq step (returned %d)", rcs);
         if (rcs <= 0) printf("STALE-GUARD: spec block eval after multiseq fails loud OK\n");
     }
     if (ok) {
         /* The escape hatch: a fresh sync rebuilds per-bank state (reset zeroes
          * the counters) and classic decode must work again. */
-        ds4_tokens p;
+        pulsar_tokens p;
         bool ok2 = make_prompt(0, &p);
-        if (ok2 && ds4_session_sync(s, &p, err, sizeof(err)) != 0) {
+        if (ok2 && pulsar_session_sync(s, &p, err, sizeof(err)) != 0) {
             CHECK(0, "stale-guard: re-sync after multiseq failed: %s", err);
             ok2 = false;
         }
         if (ok2) {
-            CHECK(ds4_session_eval(s, ds4_session_argmax(s), err, sizeof(err)) == 0,
+            CHECK(pulsar_session_eval(s, pulsar_session_argmax(s), err, sizeof(err)) == 0,
                   "stale-guard: eval still refused after a re-sync — the "
                   "documented recovery path does not clear the condition (%s)",
                   err);
             printf("STALE-GUARD: re-sync clears the condition, classic eval "
                    "works again OK\n");
         }
-        ds4_tokens_free(&p);
+        pulsar_tokens_free(&p);
     }
     free(logits);
-    ds4_session_free(s);
+    pulsar_session_free(s);
     return ok;
 }
 
@@ -374,24 +374,24 @@ static bool check_stale_classic_fails_loud(void) {
  * emitted/elapsed) so the crossover is measured on THIS v0.2.3 build rather
  * than assumed.  Greedy (temp=0): exact-under-argmax spec, so each session's
  * stream matches its solo reference.  Returns false (caller skips + reports)
- * if the engine has no drafter — the DS4_GATE_NO_DSPARK / --no-dspark config,
+ * if the engine has no drafter — the PULSAR_GATE_NO_DSPARK / --no-dspark config,
  * where the scheduler has no spec lane and batches at every width. */
 static bool spec_timeslice_run(int n, int steps, double *secs,
                                uint64_t *out_emitted) {
-    if (!ds4_engine_has_dspark(g_e)) return false;
-    ds4_session *ss[GATE_MAX_N];
+    if (!pulsar_engine_has_dspark(g_e)) return false;
+    pulsar_session *ss[GATE_MAX_N];
     memset(ss, 0, sizeof(ss));
     char err[256];
     bool ok = true;
     for (int k = 0; k < n && ok; k++) {
-        if (ds4_session_create(&ss[k], g_e, 4096) != 0) { ok = false; break; }
-        ds4_tokens p;
+        if (pulsar_session_create(&ss[k], g_e, 4096) != 0) { ok = false; break; }
+        pulsar_tokens p;
         ok = make_prompt(k, &p);
-        if (ok && ds4_session_sync(ss[k], &p, err, sizeof(err)) != 0) {
+        if (ok && pulsar_session_sync(ss[k], &p, err, sizeof(err)) != 0) {
             fprintf(stderr, "spec populate %d failed: %s\n", k, err);
             ok = false;
         }
-        ds4_tokens_free(&p);
+        pulsar_tokens_free(&p);
     }
     uint64_t emitted_total = 0;
     if (ok) {
@@ -399,14 +399,14 @@ static bool spec_timeslice_run(int n, int steps, double *secs,
         memset(emitted, 0, sizeof(emitted));
         int acc[32];
         uint64_t rng = 0x2545F4914F6CDD1Dull;
-        const int eos = ds4_token_eos(g_e);
+        const int eos = pulsar_token_eos(g_e);
         const double t0 = now_s();
         bool more = true;
         while (ok && more) {
             more = false;
             for (int k = 0; k < n && ok; k++) {
                 if (emitted[k] >= steps) continue;
-                const int ntok = ds4_session_generate_speculative(
+                const int ntok = pulsar_session_generate_speculative(
                         ss[k], 0.0f, 0, 1.0f, 0.0f, &rng,
                         steps - emitted[k], eos, acc,
                         (int)(sizeof(acc) / sizeof(acc[0])), err, sizeof(err));
@@ -423,7 +423,7 @@ static bool spec_timeslice_run(int n, int steps, double *secs,
         }
         if (secs) *secs = now_s() - t0;
     }
-    for (int k = 0; k < n; k++) if (ss[k]) ds4_session_free(ss[k]);
+    for (int k = 0; k < n; k++) if (ss[k]) pulsar_session_free(ss[k]);
     if (out_emitted) *out_emitted = emitted_total;
     return ok;
 }
@@ -440,12 +440,12 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    ds4_engine_options opt;
+    pulsar_engine_options opt;
     memset(&opt, 0, sizeof(opt));
     opt.model_path = argv[1];
-    opt.backend = DS4_BACKEND_CUDA;
-    /* DS4_GATE_NO_DSPARK: run the whole gate with speculation DISABLED, the
-     * way ds4-bench/ds4-eval/ds4-agent and `ds4-server --no-dspark` open the
+    opt.backend = PULSAR_BACKEND_CUDA;
+    /* PULSAR_GATE_NO_DSPARK: run the whole gate with speculation DISABLED, the
+     * way pulsar-bench/pulsar-eval/pulsar-agent and `pulsar-server --no-dspark` open the
      * engine.  This is a real serving config (and the one increment 4's
      * server will plausibly run), and it is a DIFFERENT allocation shape: the
      * DSpark graph state is never allocated.  The driver used to reject every
@@ -458,8 +458,8 @@ int main(int argc, char **argv) {
         printf("CONFIG: DSpark DISABLED (dspark_disable=1) — the driver must "
                "work with no speculation machinery allocated\n");
     }
-    if (ds4_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
-    if (getenv("DS4_GATE_NO_DSPARK") != NULL && ds4_engine_has_dspark(g_e)) {
+    if (pulsar_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
+    if (getenv("DS4_GATE_NO_DSPARK") != NULL && pulsar_engine_has_dspark(g_e)) {
         fprintf(stderr, "MULTISEQ GATE FAIL: DS4_GATE_NO_DSPARK set but the "
                         "engine still reports a drafter — the no-dspark case "
                         "is not actually being exercised\n");
@@ -470,7 +470,7 @@ int main(int argc, char **argv) {
     char *text = read_file("tests/long_context_story_prompt.txt", &text_len);
     if (!text) { fprintf(stderr, "prompt file read failed\n"); return 1; }
     memset(&g_toks, 0, sizeof(g_toks));
-    ds4_tokenize_text(g_e, text, &g_toks);
+    pulsar_tokenize_text(g_e, text, &g_toks);
     free(text);
     int need = 0;
     for (int k = 0; k < maxn; k++) {
@@ -495,7 +495,7 @@ int main(int argc, char **argv) {
     /* Multi runs at N = 1..maxn; every stream is kept for the cross-N gate. */
     int *multi[GATE_MAX_N][GATE_MAX_N];   /* [n-1][bank] */
     bool have[GATE_MAX_N];
-    const int vocab_w = (int)DS4_N_VOCAB;
+    const int vocab_w = (int)PULSAR_N_VOCAB;
     float *ref_l1[GATE_MAX_N];            /* [n-1] step-1 logits, multiseq entry */
     memset(multi, 0, sizeof(multi));
     memset(have, 0, sizeof(have));
@@ -537,7 +537,7 @@ int main(int argc, char **argv) {
      * Informational, like the batched throughput lines; compare SPEC N=k
      * aggregate against the "N=k ... aggregate" batched line above.  Skipped
      * with no drafter (the scheduler then batches at every width). */
-    if (ds4_engine_has_dspark(g_e)) {
+    if (pulsar_engine_has_dspark(g_e)) {
         for (int n = 1; n <= maxn; n++) {
             double secs = 0.0;
             uint64_t emitted = 0;
@@ -556,8 +556,8 @@ int main(int argc, char **argv) {
     }
 
     /* HARD GATE (plan-34 inc 1): the mixed-descriptor entry
-     * (ds4_session_decode_mixed, heap scratch) the server worker now routes
-     * through must be BYTE-IDENTICAL to ds4_session_decode_multiseq (fixed stack
+     * (pulsar_session_decode_mixed, heap scratch) the server worker now routes
+     * through must be BYTE-IDENTICAL to pulsar_session_decode_multiseq (fixed stack
      * scratch) for a decode-only batch. Re-run each width through the mixed entry
      * and assert (a) the full per-bank token STREAM is identical (all steps) and
      * (b) the STEP-1 logits are byte-identical (memcmp of the float rows). A
@@ -624,7 +624,7 @@ int main(int argc, char **argv) {
     for (int n = 0; n < GATE_MAX_N; n++) free(ref_l1[n]);
     for (int n = 0; n < GATE_MAX_N; n++)
         for (int k = 0; k < GATE_MAX_N; k++) free(multi[n][k]);
-    ds4_engine_close(g_e);
+    pulsar_engine_close(g_e);
     if (g_fail) { fprintf(stderr, "MULTISEQ DECODE GATE: FAIL\n"); return 1; }
     printf("MULTISEQ DECODE GATE: PASS\n");
     return 0;

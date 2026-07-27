@@ -1,17 +1,17 @@
-#include "ds4_kvstore.h"
+#include "pulsar_kvstore.h"
 
 #include "sha1.hpp"
 
 /* Shared disk KV checkpoint file support (C++ port).
  *
  * The low-level file layout and payload helpers are intentionally shared.  The
- * ds4-server still owns the automatic byte-prefix cache policy built on top of
- * this file; ds4-agent uses only the same durable format for explicit sessions,
- * with its own policy in ds4_agent.c.  Protocol-specific extras, such as the
+ * pulsar-server still owns the automatic byte-prefix cache policy built on top of
+ * this file; pulsar-agent uses only the same durable format for explicit sessions,
+ * with its own policy in pulsar_agent.c.  Protocol-specific extras, such as the
  * server's tool-id -> exact DSML trailer, are attached through trailer hooks and
  * still live with the protocol code that owns those mappings.
  *
- * Structure: pulsar::KvStore is a typed view over the C ds4_kvstore struct
+ * Structure: pulsar::KvStore is a typed view over the C pulsar_kvstore struct
  * (the state stays C so the still-C server/agent own it inline); the public
  * extern "C" functions at the bottom are one-line facades. */
 
@@ -36,7 +36,7 @@
 #define KV_CACHE_VERSION 1u
 /* Header byte 20 carries the graph-payload ABI.  It is separate from the outer
  * file version because the KVC envelope can remain stable while the serialized
- * ds4_session internals become unsafe to restore across runtime changes. */
+ * pulsar_session internals become unsafe to restore across runtime changes. */
 #define KV_CACHE_PAYLOAD_ABI 2u
 #define KV_CACHE_DEFAULT_MIN_TOKENS 512
 #define KV_CACHE_DEFAULT_COLD_MAX_TOKENS 30000
@@ -67,7 +67,7 @@ namespace pulsar {
 namespace {
 
 [[noreturn]] void kv_die(const char *msg) {
-    fprintf(stderr, "ds4-kvstore: %s\n", msg);
+    fprintf(stderr, "pulsar-kvstore: %s\n", msg);
     exit(1);
 }
 
@@ -199,16 +199,16 @@ bool kv_cache_tmp_is_orphan(const char *name) {
 }
 
 bool kv_cache_reason_is_anchor(uint8_t reason) {
-    return reason == DS4_KVSTORE_REASON_COLD ||
-           reason == DS4_KVSTORE_REASON_EVICT ||
-           reason == DS4_KVSTORE_REASON_SHUTDOWN;
+    return reason == PULSAR_KVSTORE_REASON_COLD ||
+           reason == PULSAR_KVSTORE_REASON_EVICT ||
+           reason == PULSAR_KVSTORE_REASON_SHUTDOWN;
 }
 
 bool kv_cache_file_size_bytes(uint64_t text_bytes,
                               uint64_t payload_bytes,
                               uint64_t trailer_bytes,
                               uint64_t *file_bytes) {
-    const uint64_t fixed = DS4_KVSTORE_FIXED_HEADER + 4ull;
+    const uint64_t fixed = PULSAR_KVSTORE_FIXED_HEADER + 4ull;
     if (UINT64_MAX - fixed < text_bytes ||
         UINT64_MAX - fixed - text_bytes < payload_bytes ||
         UINT64_MAX - fixed - text_bytes - payload_bytes < trailer_bytes)
@@ -230,10 +230,10 @@ bool kv_cache_budget_required(uint64_t file_bytes,
 }
 
 bool kv_cache_incoming_supersedes_continued(
-        const ds4_kvstore_entry *e,
-        const ds4_kvstore_eviction_context *incoming) {
+        const pulsar_kvstore_entry *e,
+        const pulsar_kvstore_eviction_context *incoming) {
     if (!e || !incoming || !incoming->text) return false;
-    if (e->reason != DS4_KVSTORE_REASON_CONTINUED) return false;
+    if (e->reason != PULSAR_KVSTORE_REASON_CONTINUED) return false;
     if (e->text_bytes == 0 || e->text_bytes > SIZE_MAX) return false;
     if ((size_t)e->text_bytes >= incoming->text_len) return false;
     if (e->model_id != incoming->model_id) return false;
@@ -256,9 +256,9 @@ bool kv_cache_file_text_matches(const char *path, const char sha[41],
     FILE *fp = fopen(path, "rb");
     if (!fp) return false;
 
-    ds4_kvstore_entry hdr = {};
+    pulsar_kvstore_entry hdr = {};
     uint32_t text_bytes = 0;
-    bool ok = ds4_kvstore_read_header(fp, &hdr, &text_bytes) &&
+    bool ok = pulsar_kvstore_read_header(fp, &hdr, &text_bytes) &&
               text_bytes == (uint32_t)text_len;
     char *stored = NULL;
     if (ok) {
@@ -279,7 +279,7 @@ bool kv_cache_file_text_matches(const char *path, const char sha[41],
     return ok;
 }
 
-bool kv_trailer_serialized_size(const ds4_kvstore_trailer_hooks *hooks,
+bool kv_trailer_serialized_size(const pulsar_kvstore_trailer_hooks *hooks,
                                 const char *text,
                                 uint64_t *bytes_out) {
     if (bytes_out) *bytes_out = 0;
@@ -287,7 +287,7 @@ bool kv_trailer_serialized_size(const ds4_kvstore_trailer_hooks *hooks,
     return hooks->serialized_size(hooks->ud, text, bytes_out);
 }
 
-bool kv_trailer_write(const ds4_kvstore_trailer_hooks *hooks,
+bool kv_trailer_write(const pulsar_kvstore_trailer_hooks *hooks,
                       FILE *fp, const char *text,
                       uint64_t *written_bytes) {
     if (written_bytes) *written_bytes = 0;
@@ -295,23 +295,23 @@ bool kv_trailer_write(const ds4_kvstore_trailer_hooks *hooks,
     return hooks->write(hooks->ud, fp, text, written_bytes);
 }
 
-void tokens_append(ds4_tokens *dst, const ds4_tokens *src) {
+void tokens_append(pulsar_tokens *dst, const pulsar_tokens *src) {
     if (!dst || !src) return;
-    for (int i = 0; i < src->len; i++) ds4_tokens_push(dst, src->v[i]);
+    for (int i = 0; i < src->len; i++) pulsar_tokens_push(dst, src->v[i]);
 }
 
-/* Typed view over the C ds4_kvstore struct: policy and stateful flows live
+/* Typed view over the C pulsar_kvstore struct: policy and stateful flows live
  * here; stateless format helpers stay free functions above. */
 class KvStore {
 public:
-    explicit KvStore(ds4_kvstore &kc) : kc_(kc) {}
+    explicit KvStore(pulsar_kvstore &kc) : kc_(kc) {}
 
     const char *log_name() const {
-        return kc_.log_name ? kc_.log_name : "ds4";
+        return kc_.log_name ? kc_.log_name : "pulsar";
     }
 
     __attribute__((format(printf, 3, 4)))
-    void logf(ds4_kvstore_log_type type, const char *fmt, ...) {
+    void logf(pulsar_kvstore_log_type type, const char *fmt, ...) {
         if (!kc_.log) return;
         va_list ap;
         va_start(ap, fmt);
@@ -334,11 +334,11 @@ public:
         char name[44];
         memcpy(name, sha, 40);
         memcpy(name + 40, ".kv", 4);
-        return ds4_kvstore_path_join(kc_.dir, name);
+        return pulsar_kvstore_path_join(kc_.dir, name);
     }
 
     void clear() {
-        for (int i = 0; i < kc_.len; i++) ds4_kvstore_entry_free(&kc_.entry[i]);
+        for (int i = 0; i < kc_.len; i++) pulsar_kvstore_entry_free(&kc_.entry[i]);
         free(kc_.entry);
         kc_.entry = NULL;
         kc_.len = 0;
@@ -346,9 +346,9 @@ public:
     }
 
     bool open(const char *dir, uint64_t budget_mb,
-              bool reject_different_quant, ds4_kvstore_options opt,
+              bool reject_different_quant, pulsar_kvstore_options opt,
               const char *log_name,
-              void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg),
+              void (*log)(void *ud, pulsar_kvstore_log_type type, const char *msg),
               void *log_ud) {
         memset(&kc_, 0, sizeof(kc_));
         if (!dir) return false;
@@ -356,7 +356,7 @@ public:
         kc_.log = log;
         kc_.log_ud = log_ud;
         if (!kv_mkdir_p(dir)) {
-            logf(DS4_KVSTORE_LOG_DEFAULT,
+            logf(PULSAR_KVSTORE_LOG_DEFAULT,
                  "%s: failed to create KV cache directory %s: %s",
                  this->log_name(), dir, strerror(errno));
             return false;
@@ -370,19 +370,19 @@ public:
          * AT_EACCESS: check the EFFECTIVE credentials, the ones fopen/rename
          * will actually use. */
         if (faccessat(AT_FDCWD, dir, W_OK | X_OK, AT_EACCESS) != 0) {
-            logf(DS4_KVSTORE_LOG_DEFAULT,
+            logf(PULSAR_KVSTORE_LOG_DEFAULT,
                  "%s: KV cache directory %s is not writable: %s",
                  this->log_name(), dir, strerror(errno));
             return false;
         }
         kc_.enabled = true;
         kc_.dir = kv_xstrdup(dir);
-        if (budget_mb == 0) budget_mb = DS4_KVSTORE_DEFAULT_MB;
+        if (budget_mb == 0) budget_mb = PULSAR_KVSTORE_DEFAULT_MB;
         kc_.budget_bytes = budget_mb * 1024ull * 1024ull;
         kc_.reject_different_quant = reject_different_quant;
         kc_.opt = opt;
         evict(NULL, 0, NULL);
-        logf(DS4_KVSTORE_LOG_KVCACHE,
+        logf(PULSAR_KVSTORE_LOG_KVCACHE,
              "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus)",
              this->log_name(),
              kc_.dir,
@@ -393,7 +393,7 @@ public:
              kc_.opt.continued_interval_tokens,
              kc_.opt.boundary_trim_tokens,
              kc_.opt.boundary_align_tokens,
-             (unsigned long long)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
+             (unsigned long long)PULSAR_KVSTORE_HIT_HALF_LIFE_SECONDS);
         return true;
     }
 
@@ -411,11 +411,11 @@ public:
         struct dirent *de;
         while ((de = readdir(d)) != NULL) {
             char sha[41];
-            if (!ds4_kvstore_sha_hex_name(de->d_name, sha)) {
+            if (!pulsar_kvstore_sha_hex_name(de->d_name, sha)) {
                 if (kv_cache_tmp_is_orphan(de->d_name)) {
-                    char *path = ds4_kvstore_path_join(kc_.dir, de->d_name);
+                    char *path = pulsar_kvstore_path_join(kc_.dir, de->d_name);
                     if (unlink(path) == 0) {
-                        logf(DS4_KVSTORE_LOG_KVCACHE,
+                        logf(PULSAR_KVSTORE_LOG_KVCACHE,
                              "%s: kv cache removed orphaned temp file %s",
                              log_name(), de->d_name);
                     }
@@ -423,16 +423,16 @@ public:
                 }
                 continue;
             }
-            char *path = ds4_kvstore_path_join(kc_.dir, de->d_name);
-            ds4_kvstore_entry e = {};
-            if (ds4_kvstore_read_entry_file(path, sha, &e)) push(e);
+            char *path = pulsar_kvstore_path_join(kc_.dir, de->d_name);
+            pulsar_kvstore_entry e = {};
+            if (pulsar_kvstore_read_entry_file(path, sha, &e)) push(e);
             free(path);
         }
         closedir(d);
     }
 
-    void evict(const ds4_tokens *live, uint64_t extra_bytes,
-               const ds4_kvstore_eviction_context *incoming) {
+    void evict(const pulsar_tokens *live, uint64_t extra_bytes,
+               const pulsar_kvstore_eviction_context *incoming) {
         if (!kc_.enabled || kc_.budget_bytes == 0) return;
         if (extra_bytes > kc_.budget_bytes) return;
         refresh();
@@ -443,11 +443,11 @@ public:
         while (total > target && kc_.len > 0) {
             int victim = 0;
             double victim_score =
-                ds4_kvstore_entry_eviction_score(&kc_.entry[0], live, now,
+                pulsar_kvstore_entry_eviction_score(&kc_.entry[0], live, now,
                                                  incoming);
             for (int i = 1; i < kc_.len; i++) {
                 double score =
-                    ds4_kvstore_entry_eviction_score(&kc_.entry[i], live, now,
+                    pulsar_kvstore_entry_eviction_score(&kc_.entry[i], live, now,
                                                      incoming);
                 if (score < victim_score ||
                     (score == victim_score &&
@@ -457,9 +457,9 @@ public:
                     victim_score = score;
                 }
             }
-            ds4_kvstore_entry e = kc_.entry[victim];
+            pulsar_kvstore_entry e = kc_.entry[victim];
             if (unlink(e.path) == 0) {
-                logf(DS4_KVSTORE_LOG_KVCACHE,
+                logf(PULSAR_KVSTORE_LOG_KVCACHE,
                      "%s: kv cache evicted reason=disk-cache-full tokens=%u hits=%u size=%.2f MiB file=%s",
                      log_name(),
                      e.tokens,
@@ -471,7 +471,7 @@ public:
             } else {
                 total = 0;
             }
-            ds4_kvstore_entry_free(&e);
+            pulsar_kvstore_entry_free(&e);
             memmove(kc_.entry + victim, kc_.entry + victim + 1,
                     (size_t)(kc_.len - victim - 1) * sizeof(kc_.entry[0]));
             kc_.len--;
@@ -489,7 +489,7 @@ public:
         return tokens;
     }
 
-    int chat_anchor_pos(const ds4_tokens *prompt,
+    int chat_anchor_pos(const pulsar_tokens *prompt,
                         int user_token_id,
                         int assistant_token_id) const {
         if (!prompt || user_token_id < 0 || assistant_token_id < 0) return -1;
@@ -572,14 +572,14 @@ public:
         refresh();
         int best = -1;
         for (int i = 0; i < kc_.len; i++) {
-            ds4_kvstore_entry *e = &kc_.entry[i];
+            pulsar_kvstore_entry *e = &kc_.entry[i];
             if (e->text_bytes > prompt_bytes || e->text_bytes > SIZE_MAX) continue;
             if ((int)e->tokens < kc_.opt.min_tokens) continue;
             if (e->model_id != (uint8_t)model_id) continue;
             if ((uint32_t)ctx_size < e->ctx_size) continue;
             if (kc_.reject_different_quant && e->quant_bits != (uint8_t)quant_bits) continue;
             if (best >= 0) {
-                ds4_kvstore_entry *b = &kc_.entry[best];
+                pulsar_kvstore_entry *b = &kc_.entry[best];
                 if (e->text_bytes < b->text_bytes) continue;
                 if (e->text_bytes == b->text_bytes && e->tokens <= b->tokens) continue;
             }
@@ -594,17 +594,17 @@ public:
                              const char *text, size_t text_len,
                              int model_id, int quant_bits, int ctx_size) {
         if (access(path, F_OK) != 0) return false;
-        ds4_kvstore_entry e = {};
-        if (!ds4_kvstore_read_entry_file(path, sha, &e)) return false;
+        pulsar_kvstore_entry e = {};
+        if (!pulsar_kvstore_read_entry_file(path, sha, &e)) return false;
         bool compatible = e.model_id == (uint8_t)model_id &&
                           (!kc_.reject_different_quant ||
                            e.quant_bits == (uint8_t)quant_bits) &&
                           e.ctx_size <= (uint32_t)ctx_size &&
                           kv_cache_file_text_matches(path, sha, text, text_len);
-        ds4_kvstore_entry_free(&e);
+        pulsar_kvstore_entry_free(&e);
         if (!compatible) {
             if (unlink(path) == 0) {
-                logf(DS4_KVSTORE_LOG_KVCACHE,
+                logf(PULSAR_KVSTORE_LOG_KVCACHE,
                      "%s: kv cache replaced incompatible file %s",
                      log_name(), path);
             }
@@ -614,7 +614,7 @@ public:
     }
 
     void rewrite_trailer(const char *path, const char *text,
-                         const ds4_kvstore_trailer_hooks *hooks) {
+                         const pulsar_kvstore_trailer_hooks *hooks) {
         uint64_t trailer_est = 0;
         if (!hooks || !hooks->write || !hooks->serialized_size ||
             !kv_trailer_serialized_size(hooks, text, &trailer_est) ||
@@ -624,10 +624,10 @@ public:
         }
         FILE *fp = fopen(path, "r+b");
         if (!fp) return;
-        ds4_kvstore_entry hdr = {};
+        pulsar_kvstore_entry hdr = {};
         uint32_t text_bytes = 0;
-        bool ok = ds4_kvstore_read_header(fp, &hdr, &text_bytes);
-        uint64_t end = DS4_KVSTORE_FIXED_HEADER + 4ull +
+        bool ok = pulsar_kvstore_read_header(fp, &hdr, &text_bytes);
+        uint64_t end = PULSAR_KVSTORE_FIXED_HEADER + 4ull +
                        (uint64_t)text_bytes + hdr.payload_bytes;
         if (ok && end <= (uint64_t)INT64_MAX &&
             fseeko(fp, (off_t)end, SEEK_SET) == 0 &&
@@ -636,9 +636,9 @@ public:
             uint64_t ignored = 0;
             ok = kv_trailer_write(hooks, fp, text, &ignored) && fflush(fp) == 0;
             if (ok && ignored > 0) {
-                uint8_t h[DS4_KVSTORE_FIXED_HEADER];
+                uint8_t h[PULSAR_KVSTORE_FIXED_HEADER];
                 uint64_t now = (uint64_t)time(NULL);
-                ds4_kvstore_fill_header(h, hdr.model_id, hdr.quant_bits, hdr.reason,
+                pulsar_kvstore_fill_header(h, hdr.model_id, hdr.quant_bits, hdr.reason,
                                         (uint8_t)(hdr.ext_flags | hooks->ext_flag),
                                         hdr.tokens, hdr.hits, hdr.ctx_size,
                                         hdr.created_at, now, hdr.payload_bytes);
@@ -651,44 +651,44 @@ public:
         (void)ok;
     }
 
-    bool store_live_prefix_text(ds4_engine *engine,
-                                ds4_session *session,
-                                const ds4_tokens *tokens,
+    bool store_live_prefix_text(pulsar_engine *engine,
+                                pulsar_session *session,
+                                const pulsar_tokens *tokens,
                                 int store_len,
                                 const char *reason,
                                 const char *cache_text_override,
                                 uint8_t cache_text_ext,
                                 const char *cache_text_key,
-                                const ds4_kvstore_trailer_hooks *hooks,
+                                const pulsar_kvstore_trailer_hooks *hooks,
                                 char *err,
                                 size_t err_len) {
         if (!kc_.enabled) return false;
         if (!tokens || store_len < kc_.opt.min_tokens) return false;
         const int original_len = tokens->len;
 
-        ds4_tokens store_tokens = {};
-        ds4_kvstore_tokens_copy_prefix(&store_tokens, tokens, store_len);
+        pulsar_tokens store_tokens = {};
+        pulsar_kvstore_tokens_copy_prefix(&store_tokens, tokens, store_len);
 
-        const int quant_bits = ds4_engine_routed_quant_bits(engine);
+        const int quant_bits = pulsar_engine_routed_quant_bits(engine);
         if (quant_bits != 2 && quant_bits != 4) {
-            ds4_tokens_free(&store_tokens);
+            pulsar_tokens_free(&store_tokens);
             return false;
         }
-        const int model_id = ds4_engine_model_id(engine);
+        const int model_id = pulsar_engine_model_id(engine);
 
         char save_err[160] = {};
-        const ds4_tokens *live_tokens = ds4_session_tokens(session);
+        const pulsar_tokens *live_tokens = pulsar_session_tokens(session);
         if (!live_tokens ||
             live_tokens->len != store_tokens.len ||
-            !ds4_tokens_starts_with(live_tokens, &store_tokens))
+            !pulsar_tokens_starts_with(live_tokens, &store_tokens))
         {
-            logf(DS4_KVSTORE_LOG_KVCACHE,
+            logf(PULSAR_KVSTORE_LOG_KVCACHE,
                  "%s: kv cache skipped tokens=%d reason=%s because live checkpoint is at %d",
                  log_name(),
                  store_tokens.len,
                  reason,
                  live_tokens ? live_tokens->len : -1);
-            ds4_tokens_free(&store_tokens);
+            pulsar_tokens_free(&store_tokens);
             return false;
         }
 
@@ -699,45 +699,45 @@ public:
             text = kv_xstrdup(cache_text_override);
             text_len = strlen(text);
         } else {
-            text = ds4_kvstore_render_tokens_text(engine, &store_tokens, &text_len);
+            text = pulsar_kvstore_render_tokens_text(engine, &store_tokens, &text_len);
         }
         if (text_len > UINT32_MAX) {
-            logf(DS4_KVSTORE_LOG_KVCACHE,
+            logf(PULSAR_KVSTORE_LOG_KVCACHE,
                  "%s: kv cache skipped tokens=%d because rendered text is too large",
                  log_name(), store_tokens.len);
             free(text);
-            ds4_tokens_free(&store_tokens);
+            pulsar_tokens_free(&store_tokens);
             return false;
         }
 
         uint64_t trailer_est_bytes = 0;
         if (!kv_trailer_serialized_size(hooks, text, &trailer_est_bytes)) {
-            logf(DS4_KVSTORE_LOG_KVCACHE,
+            logf(PULSAR_KVSTORE_LOG_KVCACHE,
                  "%s: kv cache skipped tokens=%d reason=%s because tool map size overflowed",
                  log_name(), store_tokens.len, reason);
             free(text);
-            ds4_tokens_free(&store_tokens);
+            pulsar_tokens_free(&store_tokens);
             return false;
         }
         char sha[41];
         Sha1::bytes_hex(text, text_len, sha);
         char *path = path_for_sha(sha);
-        const uint8_t reason_code = ds4_kvstore_reason_code(reason);
+        const uint8_t reason_code = pulsar_kvstore_reason_code(reason);
 
         if (existing_compatible(path, sha, text, text_len,
                                 model_id,
-                                quant_bits, ds4_session_ctx(session))) {
+                                quant_bits, pulsar_session_ctx(session))) {
             rewrite_trailer(path, text, hooks);
             free(text);
             free(path);
-            ds4_tokens_free(&store_tokens);
+            pulsar_tokens_free(&store_tokens);
             return true;
         }
 
-        ds4_session_payload_file staged = {};
-        if (ds4_session_stage_payload(session, &staged,
+        pulsar_session_payload_file staged = {};
+        if (pulsar_session_stage_payload(session, &staged,
                                       save_err, sizeof(save_err)) != 0) {
-            logf(DS4_KVSTORE_LOG_KVCACHE,
+            logf(PULSAR_KVSTORE_LOG_KVCACHE,
                  "%s: kv cache skipped tokens=%d reason=%s because KV payload staging failed: %s",
                  log_name(),
                  store_tokens.len,
@@ -747,7 +747,7 @@ public:
                                          save_err[0] ? save_err : "unknown error");
             free(text);
             free(path);
-            ds4_tokens_free(&store_tokens);
+            pulsar_tokens_free(&store_tokens);
             return false;
         }
         uint64_t payload_bytes = staged.bytes;
@@ -756,7 +756,7 @@ public:
         if (!file_size_fits((uint64_t)text_len, payload_bytes,
                             trailer_est_bytes,
                             &est_file_bytes, &est_required_bytes)) {
-            logf(DS4_KVSTORE_LOG_KVCACHE,
+            logf(PULSAR_KVSTORE_LOG_KVCACHE,
                  "%s: kv cache skipped tokens=%d reason=%s because estimated file size %.2f MiB (%.2f MiB with safety) exceeds budget %.2f MiB",
                  log_name(),
                  store_tokens.len,
@@ -764,19 +764,19 @@ public:
                  (double)est_file_bytes / (1024.0 * 1024.0),
                  (double)est_required_bytes / (1024.0 * 1024.0),
                  (double)kc_.budget_bytes / (1024.0 * 1024.0));
-            ds4_session_payload_file_free(&staged);
+            pulsar_session_payload_file_free(&staged);
             free(text);
             free(path);
-            ds4_tokens_free(&store_tokens);
+            pulsar_tokens_free(&store_tokens);
             return false;
         }
 
-        ds4_kvstore_eviction_context incoming = {};
+        pulsar_kvstore_eviction_context incoming = {};
         incoming.text = text;
         incoming.text_len = text_len;
         incoming.model_id = (uint8_t)model_id;
         incoming.quant_bits = (uint8_t)quant_bits;
-        incoming.ctx_size = (uint32_t)ds4_session_ctx(session);
+        incoming.ctx_size = (uint32_t)pulsar_session_ctx(session);
         incoming.reject_different_quant = kc_.reject_different_quant;
         evict(live_tokens, est_file_bytes, &incoming);
 
@@ -786,35 +786,35 @@ public:
         const double save_t0 = kv_now_sec();
         FILE *fp = fopen(tmp, "wb");
         if (!fp) {
-            logf(DS4_KVSTORE_LOG_KVCACHE,
+            logf(PULSAR_KVSTORE_LOG_KVCACHE,
                  "%s: kv cache failed to create %s: %s save=%.1f ms",
                  log_name(), tmp, strerror(errno),
                  (kv_now_sec() - save_t0) * 1000.0);
-            ds4_session_payload_file_free(&staged);
+            pulsar_session_payload_file_free(&staged);
             free(tmp);
             free(text);
             free(path);
-            ds4_tokens_free(&store_tokens);
+            pulsar_tokens_free(&store_tokens);
             return false;
         }
 
         const uint64_t now = (uint64_t)time(NULL);
-        uint8_t h[DS4_KVSTORE_FIXED_HEADER];
+        uint8_t h[PULSAR_KVSTORE_FIXED_HEADER];
         uint8_t ext_flags = trailer_est_bytes > 0 && hooks ? hooks->ext_flag : 0;
         if (text_override) ext_flags |= cache_text_ext;
-        ds4_kvstore_fill_header(h, (uint8_t)model_id, (uint8_t)quant_bits,
+        pulsar_kvstore_fill_header(h, (uint8_t)model_id, (uint8_t)quant_bits,
                                 reason_code, ext_flags,
                                 (uint32_t)store_tokens.len, 0,
-                                (uint32_t)ds4_session_ctx(session),
+                                (uint32_t)pulsar_session_ctx(session),
                                 now, now, payload_bytes);
         uint8_t tb[4];
-        ds4_kvstore_le_put32(tb, (uint32_t)text_len);
+        pulsar_kvstore_le_put32(tb, (uint32_t)text_len);
         uint64_t trailer_bytes = 0;
         errno = 0;
         bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
                   fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
                   fwrite(text, 1, text_len, fp) == text_len &&
-                  ds4_session_write_staged_payload(&staged, fp,
+                  pulsar_session_write_staged_payload(&staged, fp,
                                                    save_err, sizeof(save_err)) == 0 &&
                   kv_trailer_write(hooks, fp, text, &trailer_bytes) &&
                   fflush(fp) == 0 &&
@@ -858,7 +858,7 @@ public:
         const double save_ms = (kv_now_sec() - save_t0) * 1000.0;
         if (!ok) {
             if (final_size_over_budget) {
-                logf(DS4_KVSTORE_LOG_KVCACHE,
+                logf(PULSAR_KVSTORE_LOG_KVCACHE,
                      "%s: kv cache skipped tokens=%d reason=%s because final file size %.2f MiB (%.2f MiB with safety) exceeds budget %.2f MiB save=%.1f ms",
                      log_name(),
                      store_tokens.len,
@@ -868,7 +868,7 @@ public:
                      (double)kc_.budget_bytes / (1024.0 * 1024.0),
                      save_ms);
             } else {
-                logf(DS4_KVSTORE_LOG_KVCACHE,
+                logf(PULSAR_KVSTORE_LOG_KVCACHE,
                      "%s: kv cache store failed (%s): %s save=%.1f ms",
                      log_name(),
                      reason,
@@ -883,43 +883,43 @@ public:
             }
             unlink(tmp);
         } else {
-            logf(DS4_KVSTORE_LOG_KVCACHE,
+            logf(PULSAR_KVSTORE_LOG_KVCACHE,
                  "%s: kv cache stored tokens=%d trimmed=%d reason=%s key=%s size=%.2f MiB save=%.1f ms",
                  log_name(),
                  store_tokens.len,
                  original_len - store_tokens.len,
                  reason,
                  text_override ? (cache_text_key ? cache_text_key : "visible-transcript") : "token-text",
-                 (double)(DS4_KVSTORE_FIXED_HEADER + 4ull + text_len + payload_bytes + trailer_bytes) / (1024.0 * 1024.0),
+                 (double)(PULSAR_KVSTORE_FIXED_HEADER + 4ull + text_len + payload_bytes + trailer_bytes) / (1024.0 * 1024.0),
                  save_ms);
         }
-        ds4_session_payload_file_free(&staged);
+        pulsar_session_payload_file_free(&staged);
         free(tmp);
         free(text);
         free(path);
-        ds4_tokens_free(&store_tokens);
+        pulsar_tokens_free(&store_tokens);
         return ok;
     }
 
-    int try_load_text(ds4_engine *engine,
-                      ds4_session *session,
+    int try_load_text(pulsar_engine *engine,
+                      pulsar_session *session,
                       const char *prompt_text,
-                      ds4_tokens *effective_prompt,
-                      ds4_kvstore_load_result *result,
-                      const ds4_kvstore_trailer_hooks *hooks,
+                      pulsar_tokens *effective_prompt,
+                      pulsar_kvstore_load_result *result,
+                      const pulsar_kvstore_trailer_hooks *hooks,
                       bool responses_protocol) {
         if (result) memset(result, 0, sizeof(*result));
         if (effective_prompt) effective_prompt->len = 0;
         if (!kc_.enabled || !prompt_text) return 0;
-        const int quant_bits = ds4_engine_routed_quant_bits(engine);
+        const int quant_bits = pulsar_engine_routed_quant_bits(engine);
         if (quant_bits != 2 && quant_bits != 4) return 0;
-        const int model_id = ds4_engine_model_id(engine);
+        const int model_id = pulsar_engine_model_id(engine);
         const size_t prompt_bytes = strlen(prompt_text);
         int idx = find_text_prefix(prompt_text, model_id, quant_bits,
-                                   ds4_session_ctx(session));
+                                   pulsar_session_ctx(session));
         if (idx < 0) return 0;
 
-        ds4_kvstore_entry e = kc_.entry[idx];
+        pulsar_kvstore_entry e = kc_.entry[idx];
         char *path = kv_xstrdup(e.path);
         const double load_t0 = kv_now_sec();
         FILE *fp = fopen(path, "rb");
@@ -928,9 +928,9 @@ public:
             return 0;
         }
         uint32_t text_bytes = 0;
-        ds4_kvstore_entry hdr = {};
+        pulsar_kvstore_entry hdr = {};
         const char *fail_reason = "invalid header";
-        bool header_ok = ds4_kvstore_read_header(fp, &hdr, &text_bytes);
+        bool header_ok = pulsar_kvstore_read_header(fp, &hdr, &text_bytes);
         char *cached_text = NULL;
         if (header_ok) {
             if (hdr.model_id != (uint8_t)model_id) {
@@ -951,7 +951,7 @@ public:
                     if (strcmp(text_sha, e.sha)) {
                         header_ok = false;
                         fail_reason = "cached text hash mismatch";
-                    } else if (!ds4_kvstore_byte_prefix_match(prompt_text, prompt_bytes,
+                    } else if (!pulsar_kvstore_byte_prefix_match(prompt_text, prompt_bytes,
                                                               cached_text, text_bytes)) {
                         header_ok = false;
                         fail_reason = "cached text prefix mismatch";
@@ -962,9 +962,9 @@ public:
         char err[160] = {};
         int loaded = 0;
         if (header_ok &&
-            ds4_session_load_payload(session, fp, hdr.payload_bytes, err, sizeof(err)) == 0)
+            pulsar_session_load_payload(session, fp, hdr.payload_bytes, err, sizeof(err)) == 0)
         {
-            const ds4_tokens *loaded_tokens = ds4_session_tokens(session);
+            const pulsar_tokens *loaded_tokens = pulsar_session_tokens(session);
             if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens) {
                 loaded = (int)hdr.tokens;
                 if (effective_prompt) {
@@ -972,7 +972,7 @@ public:
                      * still the exact token history stored in the payload.
                      * Build the prompt from that exact history and tokenize
                      * only the text suffix after the byte prefix. */
-                    ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+                    pulsar_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
                         engine, loaded_tokens, prompt_text + text_bytes,
                         effective_prompt);
                 }
@@ -980,9 +980,9 @@ public:
                     hooks->load(hooks->ud, fp, hooks->load_wanted);
                 }
             } else {
-                ds4_session_invalidate(session);
+                pulsar_session_invalidate(session);
                 unlink(path);
-                logf(DS4_KVSTORE_LOG_KVCACHE,
+                logf(PULSAR_KVSTORE_LOG_KVCACHE,
                      "%s: kv cache discarded corrupt text-prefix payload%s%s %s",
                      log_name(),
                      responses_protocol ? " " : "",
@@ -990,8 +990,8 @@ public:
                      path);
             }
         } else {
-            if (header_ok) ds4_session_invalidate(session);
-            logf(DS4_KVSTORE_LOG_KVCACHE,
+            if (header_ok) pulsar_session_invalidate(session);
+            logf(PULSAR_KVSTORE_LOG_KVCACHE,
                  "%s: kv cache load failed%s%s %s: %s load=%.1f ms",
                  log_name(),
                  responses_protocol ? " " : "",
@@ -1005,20 +1005,20 @@ public:
         if (loaded > 0) {
             const double load_ms = (kv_now_sec() - load_t0) * 1000.0;
             kc_.continued_last_store_tokens = loaded;
-            const char *key_kind = ds4_kvstore_key_kind(hdr.ext_flags);
+            const char *key_kind = pulsar_kvstore_key_kind(hdr.ext_flags);
             bool consumed = false;
             if (kc_.opt.cold_max_tokens > 0 && loaded > kc_.opt.cold_max_tokens) {
                 unlink(path);
                 consumed = true;
-                logf(DS4_KVSTORE_LOG_KVCACHE,
+                logf(PULSAR_KVSTORE_LOG_KVCACHE,
                      "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms consumed file=%s",
                      log_name(),
                      responses_protocol ? " " : "",
                      responses_protocol ? "RESPPROTO" : "",
                      loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
             } else {
-                ds4_kvstore_touch_file(path, hdr.hits + 1);
-                logf(DS4_KVSTORE_LOG_KVCACHE,
+                pulsar_kvstore_touch_file(path, hdr.hits + 1);
+                logf(PULSAR_KVSTORE_LOG_KVCACHE,
                      "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms file=%s",
                      log_name(),
                      responses_protocol ? " " : "",
@@ -1041,16 +1041,16 @@ public:
     }
 
 private:
-    void push(ds4_kvstore_entry e) {
+    void push(pulsar_kvstore_entry e) {
         if (kc_.len == kc_.cap) {
             kc_.cap = kc_.cap ? kc_.cap * 2 : 16;
-            kc_.entry = static_cast<ds4_kvstore_entry *>(
+            kc_.entry = static_cast<pulsar_kvstore_entry *>(
                 kv_xrealloc(kc_.entry, (size_t)kc_.cap * sizeof(kc_.entry[0])));
         }
         kc_.entry[kc_.len++] = e;
     }
 
-    ds4_kvstore &kc_;
+    pulsar_kvstore &kc_;
 };
 
 } // namespace
@@ -1060,8 +1060,8 @@ using pulsar::KvStore;
 
 /* ---- stateless format/helper API ---- */
 
-ds4_kvstore_options ds4_kvstore_default_options(void) {
-    ds4_kvstore_options o = {};
+pulsar_kvstore_options pulsar_kvstore_default_options(void) {
+    pulsar_kvstore_options o = {};
     o.min_tokens = KV_CACHE_DEFAULT_MIN_TOKENS;
     o.cold_max_tokens = KV_CACHE_DEFAULT_COLD_MAX_TOKENS;
     o.continued_interval_tokens = KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS;
@@ -1070,42 +1070,42 @@ ds4_kvstore_options ds4_kvstore_default_options(void) {
     return o;
 }
 
-uint8_t ds4_kvstore_reason_code(const char *reason) {
-    if (!reason) return DS4_KVSTORE_REASON_UNKNOWN;
-    if (!strcmp(reason, "cold")) return DS4_KVSTORE_REASON_COLD;
-    if (!strcmp(reason, "continued")) return DS4_KVSTORE_REASON_CONTINUED;
-    if (!strcmp(reason, "evict")) return DS4_KVSTORE_REASON_EVICT;
-    if (!strcmp(reason, "shutdown")) return DS4_KVSTORE_REASON_SHUTDOWN;
-    if (!strcmp(reason, "agent-system")) return DS4_KVSTORE_REASON_AGENT_SYSTEM;
-    if (!strcmp(reason, "agent-session")) return DS4_KVSTORE_REASON_AGENT_SESSION;
-    return DS4_KVSTORE_REASON_UNKNOWN;
+uint8_t pulsar_kvstore_reason_code(const char *reason) {
+    if (!reason) return PULSAR_KVSTORE_REASON_UNKNOWN;
+    if (!strcmp(reason, "cold")) return PULSAR_KVSTORE_REASON_COLD;
+    if (!strcmp(reason, "continued")) return PULSAR_KVSTORE_REASON_CONTINUED;
+    if (!strcmp(reason, "evict")) return PULSAR_KVSTORE_REASON_EVICT;
+    if (!strcmp(reason, "shutdown")) return PULSAR_KVSTORE_REASON_SHUTDOWN;
+    if (!strcmp(reason, "agent-system")) return PULSAR_KVSTORE_REASON_AGENT_SYSTEM;
+    if (!strcmp(reason, "agent-session")) return PULSAR_KVSTORE_REASON_AGENT_SESSION;
+    return PULSAR_KVSTORE_REASON_UNKNOWN;
 }
 
-const char *ds4_kvstore_key_kind(uint8_t ext_flags) {
-    if (ext_flags & DS4_KVSTORE_EXT_RESPONSES_VISIBLE) return "responses-visible";
-    if (ext_flags & DS4_KVSTORE_EXT_THINKING_VISIBLE) return "thinking-visible";
+const char *pulsar_kvstore_key_kind(uint8_t ext_flags) {
+    if (ext_flags & PULSAR_KVSTORE_EXT_RESPONSES_VISIBLE) return "responses-visible";
+    if (ext_flags & PULSAR_KVSTORE_EXT_THINKING_VISIBLE) return "thinking-visible";
     return "token-text";
 }
 
-void ds4_kvstore_le_put32(uint8_t *p, uint32_t v) {
+void pulsar_kvstore_le_put32(uint8_t *p, uint32_t v) {
     p[0] = (uint8_t)v;
     p[1] = (uint8_t)(v >> 8);
     p[2] = (uint8_t)(v >> 16);
     p[3] = (uint8_t)(v >> 24);
 }
 
-uint32_t ds4_kvstore_le_get32(const uint8_t *p) {
+uint32_t pulsar_kvstore_le_get32(const uint8_t *p) {
     return (uint32_t)p[0] |
            ((uint32_t)p[1] << 8) |
            ((uint32_t)p[2] << 16) |
            ((uint32_t)p[3] << 24);
 }
 
-void ds4_kvstore_sha1_bytes_hex(const void *ptr, size_t len, char out[41]) {
+void pulsar_kvstore_sha1_bytes_hex(const void *ptr, size_t len, char out[41]) {
     pulsar::Sha1::bytes_hex(ptr, len, out);
 }
 
-bool ds4_kvstore_sha_hex_name(const char *name, char sha[41]) {
+bool pulsar_kvstore_sha_hex_name(const char *name, char sha[41]) {
     if (strlen(name) != 43 || strcmp(name + 40, ".kv")) return false;
     for (int i = 0; i < 40; i++) {
         if (!isxdigit((unsigned char)name[i])) return false;
@@ -1115,7 +1115,7 @@ bool ds4_kvstore_sha_hex_name(const char *name, char sha[41]) {
     return true;
 }
 
-char *ds4_kvstore_path_join(const char *dir, const char *name) {
+char *pulsar_kvstore_path_join(const char *dir, const char *name) {
     pulsar::KvBuf b;
     b.puts(dir);
     if (b.len() == 0 || b.data()[b.len() - 1] != '/') b.putc('/');
@@ -1123,22 +1123,22 @@ char *ds4_kvstore_path_join(const char *dir, const char *name) {
     return b.take();
 }
 
-char *ds4_kvstore_path_for_sha(ds4_kvstore *kc, const char sha[41]) {
+char *pulsar_kvstore_path_for_sha(pulsar_kvstore *kc, const char sha[41]) {
     return KvStore(*kc).path_for_sha(sha);
 }
 
-void ds4_kvstore_entry_free(ds4_kvstore_entry *e) {
+void pulsar_kvstore_entry_free(pulsar_kvstore_entry *e) {
     free(e->path);
     memset(e, 0, sizeof(*e));
 }
 
-void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
+void pulsar_kvstore_fill_header(uint8_t h[PULSAR_KVSTORE_FIXED_HEADER],
                              uint8_t model_id, uint8_t quant_bits,
                              uint8_t reason, uint8_t ext_flags,
                              uint32_t tokens, uint32_t hits, uint32_t ctx_size,
                              uint64_t created_at, uint64_t last_used,
                              uint64_t payload_bytes) {
-    memset(h, 0, DS4_KVSTORE_FIXED_HEADER);
+    memset(h, 0, PULSAR_KVSTORE_FIXED_HEADER);
     h[0] = KV_CACHE_MAGIC0;
     h[1] = KV_CACHE_MAGIC1;
     h[2] = KV_CACHE_MAGIC2;
@@ -1147,54 +1147,54 @@ void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
     h[5] = reason;
     h[6] = ext_flags;
     h[7] = model_id;
-    ds4_kvstore_le_put32(h + 8, tokens);
-    ds4_kvstore_le_put32(h + 12, hits);
-    ds4_kvstore_le_put32(h + 16, ctx_size);
+    pulsar_kvstore_le_put32(h + 8, tokens);
+    pulsar_kvstore_le_put32(h + 12, hits);
+    pulsar_kvstore_le_put32(h + 16, ctx_size);
     h[20] = KV_CACHE_PAYLOAD_ABI;
     pulsar::kv_le_put64(h + 24, created_at);
     pulsar::kv_le_put64(h + 32, last_used);
     pulsar::kv_le_put64(h + 40, payload_bytes);
 }
 
-bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
+bool pulsar_kvstore_read_header(FILE *fp, pulsar_kvstore_entry *e,
                              uint32_t *text_bytes) {
-    uint8_t h[DS4_KVSTORE_FIXED_HEADER];
+    uint8_t h[PULSAR_KVSTORE_FIXED_HEADER];
     if (fread(h, 1, sizeof(h), fp) != sizeof(h)) return false;
     if (h[0] != KV_CACHE_MAGIC0 || h[1] != KV_CACHE_MAGIC1 ||
         h[2] != KV_CACHE_MAGIC2 || h[3] != KV_CACHE_VERSION) return false;
     if (h[20] != KV_CACHE_PAYLOAD_ABI) return false;
     e->quant_bits = h[4];
-    e->reason = h[5] <= DS4_KVSTORE_REASON_AGENT_SESSION ? h[5] :
-                (uint8_t)DS4_KVSTORE_REASON_UNKNOWN;
+    e->reason = h[5] <= PULSAR_KVSTORE_REASON_AGENT_SESSION ? h[5] :
+                (uint8_t)PULSAR_KVSTORE_REASON_UNKNOWN;
     e->ext_flags = h[6];
     e->model_id = h[7];
-    e->tokens = ds4_kvstore_le_get32(h + 8);
-    e->hits = ds4_kvstore_le_get32(h + 12);
-    e->ctx_size = ds4_kvstore_le_get32(h + 16);
+    e->tokens = pulsar_kvstore_le_get32(h + 8);
+    e->hits = pulsar_kvstore_le_get32(h + 12);
+    e->ctx_size = pulsar_kvstore_le_get32(h + 16);
     e->created_at = pulsar::kv_le_get64(h + 24);
     e->last_used = pulsar::kv_le_get64(h + 32);
     e->payload_bytes = pulsar::kv_le_get64(h + 40);
     uint8_t tb[4];
     if (fread(tb, 1, sizeof(tb), fp) != sizeof(tb)) return false;
-    *text_bytes = ds4_kvstore_le_get32(tb);
+    *text_bytes = pulsar_kvstore_le_get32(tb);
     e->text_bytes = *text_bytes;
     return e->tokens != 0 && (e->quant_bits == 2 || e->quant_bits == 4);
 }
 
-bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
-                                 ds4_kvstore_entry *out) {
+bool pulsar_kvstore_read_entry_file(const char *path, const char sha[41],
+                                 pulsar_kvstore_entry *out) {
     struct stat st;
     if (stat(path, &st) != 0 ||
-        st.st_size < (off_t)(DS4_KVSTORE_FIXED_HEADER + 4))
+        st.st_size < (off_t)(PULSAR_KVSTORE_FIXED_HEADER + 4))
         return false;
     FILE *fp = fopen(path, "rb");
     if (!fp) return false;
-    ds4_kvstore_entry e = {};
+    pulsar_kvstore_entry e = {};
     uint32_t text_bytes = 0;
-    bool ok = ds4_kvstore_read_header(fp, &e, &text_bytes);
+    bool ok = pulsar_kvstore_read_header(fp, &e, &text_bytes);
     fclose(fp);
     if (!ok) return false;
-    const uint64_t fixed = DS4_KVSTORE_FIXED_HEADER + 4ull;
+    const uint64_t fixed = PULSAR_KVSTORE_FIXED_HEADER + 4ull;
     if (UINT64_MAX - fixed < (uint64_t)text_bytes ||
         UINT64_MAX - fixed - (uint64_t)text_bytes < e.payload_bytes)
         return false;
@@ -1207,16 +1207,16 @@ bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
     return true;
 }
 
-bool ds4_kvstore_touch_file(const char *path, uint32_t hits) {
+bool pulsar_kvstore_touch_file(const char *path, uint32_t hits) {
     FILE *fp = fopen(path, "r+b");
     if (!fp) return false;
-    ds4_kvstore_entry e = {};
+    pulsar_kvstore_entry e = {};
     uint32_t text_bytes = 0;
-    bool ok = ds4_kvstore_read_header(fp, &e, &text_bytes);
+    bool ok = pulsar_kvstore_read_header(fp, &e, &text_bytes);
     if (ok) {
-        uint8_t h[DS4_KVSTORE_FIXED_HEADER];
+        uint8_t h[PULSAR_KVSTORE_FIXED_HEADER];
         uint64_t now = (uint64_t)time(NULL);
-        ds4_kvstore_fill_header(h, e.model_id, e.quant_bits, e.reason, e.ext_flags,
+        pulsar_kvstore_fill_header(h, e.model_id, e.quant_bits, e.reason, e.ext_flags,
                                 e.tokens, hits, e.ctx_size,
                                 e.created_at, now, e.payload_bytes);
         ok = fseek(fp, 0, SEEK_SET) == 0 &&
@@ -1226,11 +1226,11 @@ bool ds4_kvstore_touch_file(const char *path, uint32_t hits) {
     return ok;
 }
 
-double ds4_kvstore_entry_eviction_score(
-        const ds4_kvstore_entry *e,
-        const ds4_tokens *live,
+double pulsar_kvstore_entry_eviction_score(
+        const pulsar_kvstore_entry *e,
+        const pulsar_tokens *live,
         uint64_t now,
-        const ds4_kvstore_eviction_context *incoming) {
+        const pulsar_kvstore_eviction_context *incoming) {
     if (!e || e->file_size == 0) return 0.0;
     (void)live;
     double effective_hits = (double)e->hits;
@@ -1239,7 +1239,7 @@ double ds4_kvstore_entry_eviction_score(
         effective_hits = 0.0;
     } else if (now > used_at) {
         double elapsed = (double)(now - used_at);
-        effective_hits *= exp2(-elapsed / (double)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
+        effective_hits *= exp2(-elapsed / (double)PULSAR_KVSTORE_HIT_HALF_LIFE_SECONDS);
         if (effective_hits < KV_CACHE_MIN_EFFECTIVE_HITS) effective_hits = 0.0;
     }
     double score = (effective_hits + 1.0) *
@@ -1255,13 +1255,13 @@ double ds4_kvstore_entry_eviction_score(
     return score;
 }
 
-char *ds4_kvstore_render_tokens_text(ds4_engine *engine,
-                                     const ds4_tokens *tokens,
+char *pulsar_kvstore_render_tokens_text(pulsar_engine *engine,
+                                     const pulsar_tokens *tokens,
                                      size_t *out_len) {
     pulsar::KvBuf b;
     for (int i = 0; i < tokens->len; i++) {
         size_t len = 0;
-        char *piece = ds4_token_text(engine, tokens->v[i], &len);
+        char *piece = pulsar_token_text(engine, tokens->v[i], &len);
         b.append(piece, len);
         free(piece);
     }
@@ -1269,35 +1269,35 @@ char *ds4_kvstore_render_tokens_text(ds4_engine *engine,
     return b.take();
 }
 
-bool ds4_kvstore_byte_prefix_match(const char *text, size_t text_len,
+bool pulsar_kvstore_byte_prefix_match(const char *text, size_t text_len,
                                    const char *prefix, size_t prefix_len) {
     return prefix_len <= text_len &&
            (prefix_len == 0 || memcmp(text, prefix, prefix_len) == 0);
 }
 
-void ds4_kvstore_tokens_copy_prefix(ds4_tokens *dst, const ds4_tokens *src, int n) {
+void pulsar_kvstore_tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, int n) {
     dst->len = 0;
     if (!src) return;
     if (n > src->len) n = src->len;
-    for (int i = 0; i < n; i++) ds4_tokens_push(dst, src->v[i]);
+    for (int i = 0; i < n; i++) pulsar_tokens_push(dst, src->v[i]);
 }
 
-void ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
-        ds4_engine *engine,
-        const ds4_tokens *exact_prefix,
+void pulsar_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+        pulsar_engine *engine,
+        const pulsar_tokens *exact_prefix,
         const char *suffix_text,
-        ds4_tokens *out) {
-    ds4_tokens_copy(out, exact_prefix);
+        pulsar_tokens *out) {
+    pulsar_tokens_copy(out, exact_prefix);
 
-    ds4_tokens suffix = {};
+    pulsar_tokens suffix = {};
     /* The suffix may start with DS4 chat markers such as <｜User｜> or
      * </think>, so use the rendered-chat tokenizer, not plain text BPE. */
-    ds4_tokenize_rendered_chat(engine, suffix_text ? suffix_text : "", &suffix);
+    pulsar_tokenize_rendered_chat(engine, suffix_text ? suffix_text : "", &suffix);
     pulsar::tokens_append(out, &suffix);
-    ds4_tokens_free(&suffix);
+    pulsar_tokens_free(&suffix);
 }
 
-void ds4_kvstore_load_result_free(ds4_kvstore_load_result *result) {
+void pulsar_kvstore_load_result_free(pulsar_kvstore_load_result *result) {
     if (!result) return;
     free(result->path);
     memset(result, 0, sizeof(*result));
@@ -1305,54 +1305,54 @@ void ds4_kvstore_load_result_free(ds4_kvstore_load_result *result) {
 
 /* ---- stateful facade over pulsar::KvStore ---- */
 
-bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
-                      bool reject_different_quant, ds4_kvstore_options opt,
+bool pulsar_kvstore_open(pulsar_kvstore *kc, const char *dir, uint64_t budget_mb,
+                      bool reject_different_quant, pulsar_kvstore_options opt,
                       const char *log_name,
-                      void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg),
+                      void (*log)(void *ud, pulsar_kvstore_log_type type, const char *msg),
                       void *log_ud) {
     return KvStore(*kc).open(dir, budget_mb, reject_different_quant, opt,
                              log_name, log, log_ud);
 }
 
-void ds4_kvstore_close(ds4_kvstore *kc) {
+void pulsar_kvstore_close(pulsar_kvstore *kc) {
     KvStore(*kc).close();
 }
 
-void ds4_kvstore_clear(ds4_kvstore *kc) {
+void pulsar_kvstore_clear(pulsar_kvstore *kc) {
     KvStore(*kc).clear();
 }
 
-int ds4_kvstore_store_len(const ds4_kvstore *kc, int tokens) {
-    return KvStore(*const_cast<ds4_kvstore *>(kc)).store_len(tokens);
+int pulsar_kvstore_store_len(const pulsar_kvstore *kc, int tokens) {
+    return KvStore(*const_cast<pulsar_kvstore *>(kc)).store_len(tokens);
 }
 
-int ds4_kvstore_chat_anchor_pos(const ds4_kvstore *kc,
-                                const ds4_tokens *prompt,
+int pulsar_kvstore_chat_anchor_pos(const pulsar_kvstore *kc,
+                                const pulsar_tokens *prompt,
                                 int user_token_id,
                                 int assistant_token_id) {
-    return KvStore(*const_cast<ds4_kvstore *>(kc))
+    return KvStore(*const_cast<pulsar_kvstore *>(kc))
         .chat_anchor_pos(prompt, user_token_id, assistant_token_id);
 }
 
-int ds4_kvstore_continued_store_target(const ds4_kvstore *kc, int live_tokens) {
-    return KvStore(*const_cast<ds4_kvstore *>(kc)).continued_store_target(live_tokens);
+int pulsar_kvstore_continued_store_target(const pulsar_kvstore *kc, int live_tokens) {
+    return KvStore(*const_cast<pulsar_kvstore *>(kc)).continued_store_target(live_tokens);
 }
 
-void ds4_kvstore_note_store(ds4_kvstore *kc, int tokens) {
+void pulsar_kvstore_note_store(pulsar_kvstore *kc, int tokens) {
     KvStore(*kc).note_store(tokens);
 }
 
-int ds4_kvstore_suppress_continued_store(ds4_kvstore *kc, int tokens) {
+int pulsar_kvstore_suppress_continued_store(pulsar_kvstore *kc, int tokens) {
     return KvStore(*kc).suppress_continued_store(tokens);
 }
 
-void ds4_kvstore_restore_suppressed_continued(ds4_kvstore *kc,
+void pulsar_kvstore_restore_suppressed_continued(pulsar_kvstore *kc,
                                               int old_tokens,
                                               int suppressed_tokens) {
     KvStore(*kc).restore_suppressed_continued(old_tokens, suppressed_tokens);
 }
 
-bool ds4_kvstore_file_size_fits(const ds4_kvstore *kc,
+bool pulsar_kvstore_file_size_fits(const pulsar_kvstore *kc,
                                 uint64_t text_bytes,
                                 uint64_t payload_bytes,
                                 uint64_t trailer_bytes,
@@ -1363,32 +1363,32 @@ bool ds4_kvstore_file_size_fits(const ds4_kvstore *kc,
         return pulsar::kv_cache_file_size_bytes(text_bytes, payload_bytes,
                                                 trailer_bytes, file_bytes_out);
     }
-    return KvStore(*const_cast<ds4_kvstore *>(kc))
+    return KvStore(*const_cast<pulsar_kvstore *>(kc))
         .file_size_fits(text_bytes, payload_bytes, trailer_bytes,
                         file_bytes_out, required_bytes_out);
 }
 
-void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
+void pulsar_kvstore_evict(pulsar_kvstore *kc, const pulsar_tokens *live,
                        uint64_t extra_bytes,
-                       const ds4_kvstore_eviction_context *incoming) {
+                       const pulsar_kvstore_eviction_context *incoming) {
     KvStore(*kc).evict(live, extra_bytes, incoming);
 }
 
-int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
+int pulsar_kvstore_find_text_prefix(pulsar_kvstore *kc, const char *prompt_text,
                                  int model_id, int quant_bits, int ctx_size) {
     return KvStore(*kc).find_text_prefix(prompt_text, model_id, quant_bits, ctx_size);
 }
 
-bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
-                                        ds4_engine *engine,
-                                        ds4_session *session,
-                                        const ds4_tokens *tokens,
+bool pulsar_kvstore_store_live_prefix_text(pulsar_kvstore *kc,
+                                        pulsar_engine *engine,
+                                        pulsar_session *session,
+                                        const pulsar_tokens *tokens,
                                         int store_len,
                                         const char *reason,
                                         const char *cache_text_override,
                                         uint8_t cache_text_ext,
                                         const char *cache_text_key,
-                                        const ds4_kvstore_trailer_hooks *hooks,
+                                        const pulsar_kvstore_trailer_hooks *hooks,
                                         char *err,
                                         size_t err_len) {
     return KvStore(*kc).store_live_prefix_text(engine, session, tokens, store_len,
@@ -1397,46 +1397,46 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                                hooks, err, err_len);
 }
 
-bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
-                                   ds4_engine *engine,
-                                   ds4_session *session,
-                                   const ds4_tokens *tokens,
+bool pulsar_kvstore_store_live_prefix(pulsar_kvstore *kc,
+                                   pulsar_engine *engine,
+                                   pulsar_session *session,
+                                   const pulsar_tokens *tokens,
                                    int store_len,
                                    const char *reason,
-                                   const ds4_kvstore_trailer_hooks *hooks,
+                                   const pulsar_kvstore_trailer_hooks *hooks,
                                    char *err,
                                    size_t err_len) {
-    return ds4_kvstore_store_live_prefix_text(kc, engine, session, tokens,
+    return pulsar_kvstore_store_live_prefix_text(kc, engine, session, tokens,
                                               store_len, reason, NULL, 0, NULL,
                                               hooks, err, err_len);
 }
 
-bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
-                                       ds4_engine *engine,
-                                       ds4_session *session,
-                                       const ds4_kvstore_trailer_hooks *hooks,
+bool pulsar_kvstore_maybe_store_continued(pulsar_kvstore *kc,
+                                       pulsar_engine *engine,
+                                       pulsar_session *session,
+                                       const pulsar_kvstore_trailer_hooks *hooks,
                                        char *err,
                                        size_t err_len) {
-    const ds4_tokens *tokens = ds4_session_tokens(session);
+    const pulsar_tokens *tokens = pulsar_session_tokens(session);
     if (!tokens) return false;
-    const int target = ds4_kvstore_continued_store_target(kc, tokens->len);
+    const int target = pulsar_kvstore_continued_store_target(kc, tokens->len);
     if (target == 0) return false;
-    if (ds4_kvstore_store_live_prefix(kc, engine, session, tokens, target,
+    if (pulsar_kvstore_store_live_prefix(kc, engine, session, tokens, target,
                                       "continued", hooks, err, err_len))
     {
-        ds4_kvstore_note_store(kc, target);
+        pulsar_kvstore_note_store(kc, target);
         return true;
     }
     return false;
 }
 
-int ds4_kvstore_try_load_text(ds4_kvstore *kc,
-                              ds4_engine *engine,
-                              ds4_session *session,
+int pulsar_kvstore_try_load_text(pulsar_kvstore *kc,
+                              pulsar_engine *engine,
+                              pulsar_session *session,
                               const char *prompt_text,
-                              ds4_tokens *effective_prompt,
-                              ds4_kvstore_load_result *result,
-                              const ds4_kvstore_trailer_hooks *hooks,
+                              pulsar_tokens *effective_prompt,
+                              pulsar_kvstore_load_result *result,
+                              const pulsar_kvstore_trailer_hooks *hooks,
                               bool responses_protocol) {
     return KvStore(*kc).try_load_text(engine, session, prompt_text,
                                       effective_prompt, result, hooks,

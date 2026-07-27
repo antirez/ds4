@@ -19,12 +19,12 @@
  *    prefill suffix), BOTH row classes are correct — gate 4 proves the decode prefix,
  *    gate 2 proves the prefill suffix, and the split lands at row n_dec (asserted).
  *
- * Run pack on/off x idx-fp4 on/off (DS4_ATTN_PACK / DS4_IDX_FP4). CONFIG surfaced.
- * MODEL-DEPENDENT, needs DS4_MSEQ_BANKS >= n_dec+1. Run under GPU discipline.
- *   usage: DS4_MSEQ_BANKS=3 ./tests/mixed_neutrality_gate MODEL
+ * Run pack on/off x idx-fp4 on/off (PULSAR_ATTN_PACK / PULSAR_IDX_FP4). CONFIG surfaced.
+ * MODEL-DEPENDENT, needs PULSAR_MSEQ_BANKS >= n_dec+1. Run under GPU discipline.
+ *   usage: PULSAR_MSEQ_BANKS=3 ./tests/mixed_neutrality_gate MODEL
  */
-#include "ds4.h"
-#include "ds4_engine_internal.h"
+#include "pulsar.h"
+#include "pulsar_engine_internal.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -36,8 +36,8 @@
 #define K_PRE 64                /* prefill run length; >8 => grouped MoE suffix taken */
 #define PBASE 700               /* prefill bank token region (distinct from decode banks) */
 
-static ds4_engine *g_e;
-static ds4_tokens g_toks;
+static pulsar_engine *g_e;
+static pulsar_tokens g_toks;
 static int g_fail;
 
 /* decode banks 0..N_DEC-1: distinct prompt regions (isolated KV). */
@@ -55,15 +55,15 @@ static char *read_file(const char *p, size_t *n) {
 /* Populate decode banks + (if K>0) the prefill bank on a FRESH session, run ONE
  * fused decode_mixed step, and copy back: each decode bank's logit row into
  * dec_rows[k] (N_DEC * vocab), and (K>0) the prefill run's last-position logits
- * into pre_row (vocab). head_cap is forwarded to ds4_session_decode_mixed's
+ * into pre_row (vocab). head_cap is forwarded to pulsar_session_decode_mixed's
  * max_head_runs (0 = all runs; N_DEC = LEVER-1 intermediate path: decode banks
  * only, prefill head skipped — pre_row is then unavailable). Returns false on any
  * engine failure. */
 static bool fused_step_logits(int K, uint32_t head_cap, float *dec_rows, float *pre_row) {
-    ds4_session *s = NULL;
-    if (ds4_session_create(&s, g_e, 4096) != 0) return false;
-    ds4_gpu_graph *g = &s->graph;
-    const int vocab = (int)DS4_N_VOCAB;
+    pulsar_session *s = NULL;
+    if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
+    pulsar_gpu_graph *g = &s->graph;
+    const int vocab = (int)PULSAR_N_VOCAB;
     const uint32_t n_pre_bank = (K > 0) ? 1u : 0u;
     const uint32_t need_banks = (uint32_t)N_DEC + n_pre_bank;
     bool ok = gpu_graph_bank_pool_count(g) >= need_banks;
@@ -75,13 +75,13 @@ static bool fused_step_logits(int K, uint32_t head_cap, float *dec_rows, float *
     /* decode banks: sync prompt, capture frontier, record next token. */
     for (int k = 0; ok && k < N_DEC; k++) {
         if (g->banks.n_banks && !gpu_graph_bank_repoint(g, (uint32_t)k)) { ok = false; break; }
-        ds4_session_invalidate(s);
-        ds4_tokens p = { .v = g_toks.v + g_off[k], .len = g_len[k], .cap = g_len[k] };
-        if (ds4_session_sync(s, &p, err, sizeof err) != 0) {
+        pulsar_session_invalidate(s);
+        pulsar_tokens p = { .v = g_toks.v + g_off[k], .len = g_len[k], .cap = g_len[k] };
+        if (pulsar_session_sync(s, &p, err, sizeof err) != 0) {
             fprintf(stderr, "decode bank %d sync failed: %s\n", k, err); ok = false; break;
         }
         gpu_graph_bank_counters_capture(g, (uint32_t)k);
-        argtok[k] = ds4_session_argmax(s);
+        argtok[k] = pulsar_session_argmax(s);
     }
     /* prefill bank (bank N_DEC): classic first chunk [0,C0) to lift its frontier
      * off 0 (step_begin rejects pos-0), then the K prefill rows extend [C0,C0+K). */
@@ -89,9 +89,9 @@ static bool fused_step_logits(int K, uint32_t head_cap, float *dec_rows, float *
     if (ok && K > 0) {
         if (g->banks.n_banks && !gpu_graph_bank_repoint(g, (uint32_t)N_DEC)) ok = false;
         if (ok) {
-            ds4_session_invalidate(s);
-            ds4_tokens p = { .v = (int *)pptr, .len = C0, .cap = C0 };
-            if (ds4_session_sync(s, &p, err, sizeof err) != 0) {
+            pulsar_session_invalidate(s);
+            pulsar_tokens p = { .v = (int *)pptr, .len = C0, .cap = C0 };
+            if (pulsar_session_sync(s, &p, err, sizeof err) != 0) {
                 fprintf(stderr, "prefill bank first-chunk sync failed: %s\n", err); ok = false;
             }
         }
@@ -99,7 +99,7 @@ static bool fused_step_logits(int K, uint32_t head_cap, float *dec_rows, float *
     }
 
     const uint32_t n_rows = (uint32_t)N_DEC + (K > 0 ? (uint32_t)K : 0u);
-    ds4_multiseq_req *reqs = ok ? (ds4_multiseq_req *)malloc((size_t)n_rows * sizeof(*reqs)) : NULL;
+    pulsar_multiseq_req *reqs = ok ? (pulsar_multiseq_req *)malloc((size_t)n_rows * sizeof(*reqs)) : NULL;
     float *logits = ok ? (float *)malloc((size_t)n_rows * vocab * sizeof(float)) : NULL;
     if (ok && (!reqs || !logits)) ok = false;
     if (ok) {
@@ -112,7 +112,7 @@ static bool fused_step_logits(int K, uint32_t head_cap, float *dec_rows, float *
             reqs[N_DEC + j].token = pptr[C0 + j];
         }
         uint32_t n_runs = 0;
-        const int rc = ds4_session_decode_mixed(s, reqs, n_rows, logits, (int)(n_rows * vocab),
+        const int rc = pulsar_session_decode_mixed(s, reqs, n_rows, logits, (int)(n_rows * vocab),
                                                 &n_runs, head_cap, err, sizeof err);
         if (rc != 0) { fprintf(stderr, "decode_mixed(K=%d) failed rc=%d: %s\n", K, rc, err); ok = false; }
         else {
@@ -132,30 +132,30 @@ static bool fused_step_logits(int K, uint32_t head_cap, float *dec_rows, float *
         }
     }
     free(reqs); free(logits);
-    ds4_session_free(s);
+    pulsar_session_free(s);
     return ok;
 }
 
 /* classic RESUME reference for the prefill bank: fresh session, prefill [0,C0)
  * then resume to [0,C0+K), copy last-position logits + next token. */
 static bool classic_resume(int K, float *out_lg, int *next_tok) {
-    ds4_session *s = NULL;
-    if (ds4_session_create(&s, g_e, 4096) != 0) return false;
-    ds4_gpu_graph *g = &s->graph;
+    pulsar_session *s = NULL;
+    if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
+    pulsar_gpu_graph *g = &s->graph;
     char err[256]; bool ok = true;
     const int *pptr = g_toks.v + PBASE;
-    if (g->banks.n_banks && !gpu_graph_bank_repoint(g, 0)) { ds4_session_free(s); return false; }
-    ds4_session_invalidate(s);
-    ds4_tokens p0 = { .v = (int *)pptr, .len = C0, .cap = C0 };
-    if (ds4_session_sync(s, &p0, err, sizeof err) != 0) { fprintf(stderr, "classic chunk: %s\n", err); ok = false; }
-    ds4_tokens p1 = { .v = (int *)pptr, .len = C0 + K, .cap = C0 + K };
-    if (ok && ds4_session_sync(s, &p1, err, sizeof err) != 0) { fprintf(stderr, "classic resume: %s\n", err); ok = false; }
+    if (g->banks.n_banks && !gpu_graph_bank_repoint(g, 0)) { pulsar_session_free(s); return false; }
+    pulsar_session_invalidate(s);
+    pulsar_tokens p0 = { .v = (int *)pptr, .len = C0, .cap = C0 };
+    if (pulsar_session_sync(s, &p0, err, sizeof err) != 0) { fprintf(stderr, "classic chunk: %s\n", err); ok = false; }
+    pulsar_tokens p1 = { .v = (int *)pptr, .len = C0 + K, .cap = C0 + K };
+    if (ok && pulsar_session_sync(s, &p1, err, sizeof err) != 0) { fprintf(stderr, "classic resume: %s\n", err); ok = false; }
     if (ok) {
         gpu_graph_bank_counters_capture(g, 0);
-        ds4_session_copy_logits(s, out_lg, (int)DS4_N_VOCAB);
-        *next_tok = ds4_session_argmax(s);
+        pulsar_session_copy_logits(s, out_lg, (int)PULSAR_N_VOCAB);
+        *next_tok = pulsar_session_argmax(s);
     }
-    ds4_session_free(s);
+    pulsar_session_free(s);
     return ok;
 }
 
@@ -166,9 +166,9 @@ static long first_diff(const float *a, const float *b, long n) {
 
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL\n", argv[0]); return 2; }
-    ds4_engine_options o; memset(&o, 0, sizeof o);
-    o.model_path = argv[1]; o.backend = DS4_BACKEND_CUDA;
-    if (ds4_engine_open(&g_e, &o) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
+    pulsar_engine_options o; memset(&o, 0, sizeof o);
+    o.model_path = argv[1]; o.backend = PULSAR_BACKEND_CUDA;
+    if (pulsar_engine_open(&g_e, &o) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
     printf("CONFIG: DS4_ATTN_PACK=%s DS4_IDX_FP4=%s  (n_dec=%d K=%d)\n",
            getenv("DS4_ATTN_PACK") ? getenv("DS4_ATTN_PACK") : "(unset,default 1)",
            getenv("DS4_IDX_FP4") ? getenv("DS4_IDX_FP4") : "(unset,default 1)", N_DEC, K_PRE);
@@ -176,12 +176,12 @@ int main(int argc, char **argv) {
     size_t tl = 0; char *txt = read_file("tests/long_context_story_prompt.txt", &tl);
     if (!txt) { fprintf(stderr, "prompt read failed\n"); return 1; }
     memset(&g_toks, 0, sizeof g_toks);
-    ds4_tokenize_text(g_e, txt, &g_toks); free(txt);
+    pulsar_tokenize_text(g_e, txt, &g_toks); free(txt);
     int need = PBASE + C0 + K_PRE + 1;
     for (int k = 0; k < N_DEC; k++) if (g_off[k] + g_len[k] > need) need = g_off[k] + g_len[k];
     if (g_toks.len < need) { fprintf(stderr, "prompt too short (%d<%d)\n", g_toks.len, need); return 1; }
 
-    const int vocab = (int)DS4_N_VOCAB;
+    const int vocab = (int)PULSAR_N_VOCAB;
     float *ref_dec = (float *)malloc((size_t)N_DEC * vocab * sizeof(float));   /* decode-only M=N_DEC */
     float *mix_dec = (float *)malloc((size_t)N_DEC * vocab * sizeof(float));   /* fused M=N_DEC+K, full head */
     float *lv1_dec = (float *)malloc((size_t)N_DEC * vocab * sizeof(float));   /* fused M=N_DEC+K, LEVER-1 head */
@@ -247,7 +247,7 @@ int main(int argc, char **argv) {
 
 done:
     free(ref_dec); free(mix_dec); free(lv1_dec); free(mix_pre); free(cls_pre);
-    ds4_engine_close(g_e);
+    pulsar_engine_close(g_e);
     if (g_fail) { fprintf(stderr, "MIXED-NEUTRALITY GATE: FAIL\n"); return 1; }
     printf("MIXED-NEUTRALITY GATE: PASS\n");
     return 0;

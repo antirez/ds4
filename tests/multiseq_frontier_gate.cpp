@@ -11,7 +11,7 @@
  * GB10 via `make cuda-frontier-gate` (see the Makefile target for the
  * memory discipline) — it is NOT part of `make test`.
  *
- * Two banks of a DS4_MSEQ_BANKS=2 pool are populated with DIFFERENT
+ * Two banks of a PULSAR_MSEQ_BANKS=2 pool are populated with DIFFERENT
  * sequences of DIFFERENT lengths through the classic per-bank path
  * (repoint + session sync), then ONE banked multiseq batched step carries
  * rows of both banks through the full layer sweep.  Verified:
@@ -72,7 +72,7 @@
  *       single-cache call (drop the banked scatter)
  *       -> S1 "emitted rows depend on populate order (cur-bank leak)" FAIL.
  *   T4  ignored per-row positions (Part A) — make BOTH RoPE kernels drop the
- *       positions array, src/cuda/ds4_cuda_norm_kv.cu:
+ *       positions array, src/cuda/pulsar_cuda_norm_kv.cu:
  *           const uint32_t rope_pos = pos0 + t;               (~:142)
  *           const uint32_t rope_pos = pos0 + t * pos_stride;  (~:238)
  *       -> S6 "bank B's emitted rows changed when only its BATCHMATE's
@@ -80,19 +80,19 @@
  *       S1-S5 all still PASS under this seed — S6 is the only check in
  *       either gate with teeth for the position path.
  *
- * usage: DS4_MSEQ_BANKS=2 ./tests/multiseq_frontier_gate MODEL
+ * usage: PULSAR_MSEQ_BANKS=2 ./tests/multiseq_frontier_gate MODEL
  *        (from the repo root — reads tests/long_context_story_prompt.txt;
  *        or `make cuda-frontier-gate FRONTIER_MODEL=path/to/model.gguf`)
  */
-#include "ds4.h"
-#include "ds4_engine_internal.h"
+#include "pulsar.h"
+#include "pulsar_engine_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static ds4_engine *g_e;
-static ds4_tokens g_toks;      /* whole tokenized story prompt */
+static pulsar_engine *g_e;
+static pulsar_tokens g_toks;      /* whole tokenized story prompt */
 static int g_fail;
 
 #define CHECK(cond, ...) do { \
@@ -123,16 +123,16 @@ static int stream_tok(int stream, int i) {
     return g_toks.v[(stream ? 500 : 0) + i];
 }
 
-static bool populate_bank(ds4_session *s, uint32_t bank, int stream, int len) {
-    ds4_gpu_graph *g = &s->graph;
+static bool populate_bank(pulsar_session *s, uint32_t bank, int stream, int len) {
+    pulsar_gpu_graph *g = &s->graph;
     if (g->banks.n_banks && !gpu_graph_bank_repoint(g, bank)) return false;
-    ds4_tokens p;
+    pulsar_tokens p;
     memset(&p, 0, sizeof(p));
     p.v = (int *)malloc((size_t)len * sizeof(int));
     p.len = p.cap = len;
     for (int i = 0; i < len; i++) p.v[i] = stream_tok(stream, i);
     char err[256];
-    const int rc = ds4_session_sync(s, &p, err, sizeof(err));
+    const int rc = pulsar_session_sync(s, &p, err, sizeof(err));
     free(p.v);
     if (rc != 0) { fprintf(stderr, "populate sync failed: %s\n", err); return false; }
     gpu_graph_bank_counters_capture(g, bank);
@@ -142,9 +142,9 @@ static bool populate_bank(ds4_session *s, uint32_t bank, int stream, int len) {
 /* One banked multiseq step: rows[t] = {bank, pos, token}. */
 typedef struct { int bank; int pos; int token; } step_row;
 
-static bool run_step(ds4_session *s, const step_row *rows, uint32_t n) {
-    ds4_gpu_graph *g = &s->graph;
-    ds4_tokens vec;
+static bool run_step(pulsar_session *s, const step_row *rows, uint32_t n) {
+    pulsar_gpu_graph *g = &s->graph;
+    pulsar_tokens vec;
     memset(&vec, 0, sizeof(vec));
     vec.v = (int *)malloc((size_t)n * sizeof(int));
     vec.len = vec.cap = (int)n;
@@ -160,17 +160,17 @@ static bool run_step(ds4_session *s, const step_row *rows, uint32_t n) {
                                                     &g_e->model, &g_e->weights, &vec, 0, n) &&
               gpu_graph_multiseq_step_begin(g, pos, seq, n, false);
     if (ok) {
-        ok = ds4_gpu_begin_commands() != 0;
-        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        ok = pulsar_gpu_begin_commands() != 0;
+        for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {
             ok = gpu_graph_encode_layer_batch(g, &g_e->model,
                                               &g_e->weights.layer[il], il,
                                               (uint32_t)rows[0].pos, n);
         }
-        if (ok) ok = ds4_gpu_end_commands() != 0;
-        else (void)ds4_gpu_synchronize();
+        if (ok) ok = pulsar_gpu_end_commands() != 0;
+        else (void)pulsar_gpu_synchronize();
         const bool end_ok = gpu_graph_multiseq_step_end(g);
         ok = ok && end_ok;
-        if (ok) ok = ds4_gpu_synchronize() != 0;
+        if (ok) ok = pulsar_gpu_synchronize() != 0;
     }
     free(seq);
     free(pos);
@@ -181,37 +181,37 @@ static bool run_step(ds4_session *s, const step_row *rows, uint32_t n) {
 /* D2H read of bank rows [first, first+count) of a comp cache.  Increment 2a: the
  * comp/index caches are now ONE allocation PER BANK, so read through the per-bank
  * view accessor (comp[il][bank] at offset 0) instead of pool + bank*stride. */
-static bool read_bank_rows(ds4_gpu_graph *g, int index_cache, uint32_t il,
+static bool read_bank_rows(pulsar_gpu_graph *g, int index_cache, uint32_t il,
                            uint32_t bank, uint32_t first, uint32_t count,
                            void *out, uint64_t row_bytes) {
-    ds4_gpu_tensor *view = index_cache ? gpu_graph_bank_index_comp_view(g, il, bank)
+    pulsar_gpu_tensor *view = index_cache ? gpu_graph_bank_index_comp_view(g, il, bank)
                                        : gpu_graph_bank_attn_comp_view(g, il, bank);
     if (!view) return false;
-    const bool ok = ds4_gpu_tensor_read(view,
+    const bool ok = pulsar_gpu_tensor_read(view,
                                         (uint64_t)first * row_bytes,
                                         out, (uint64_t)count * row_bytes) != 0;
-    ds4_gpu_tensor_free(view);
+    pulsar_gpu_tensor_free(view);
     return ok;
 }
 
 static uint64_t attn_row_bytes(void) { return gpu_graph_attn_comp_cache_row_bytes(); }
 static uint64_t index_row_bytes(void) {
-    return gpu_graph_idx_fp4_enabled() ? DS4_ENGINE_IDXFP4_ROWBYTES
-                                       : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    return gpu_graph_idx_fp4_enabled() ? PULSAR_ENGINE_IDXFP4_ROWBYTES
+                                       : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
 }
 
 /* Snapshot every compressed layer's rows [0, upto_rows) of one bank. */
 typedef struct {
-    uint8_t *attn[DS4_MAX_LAYER];
-    uint8_t *index[DS4_MAX_LAYER];
+    uint8_t *attn[PULSAR_MAX_LAYER];
+    uint8_t *index[PULSAR_MAX_LAYER];
     uint32_t rows;
 } bank_snap;
 
-static bool snap_bank(ds4_gpu_graph *g, uint32_t bank, uint32_t rows, bank_snap *snap) {
+static bool snap_bank(pulsar_gpu_graph *g, uint32_t bank, uint32_t rows, bank_snap *snap) {
     memset(snap, 0, sizeof(*snap));
     snap->rows = rows;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
         uint32_t n = rows;
         if (n > g->layer_comp_cap[il]) n = g->layer_comp_cap[il];
@@ -230,7 +230,7 @@ static bool snap_bank(ds4_gpu_graph *g, uint32_t bank, uint32_t rows, bank_snap 
 }
 
 static void snap_free(bank_snap *snap) {
-    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+    for (uint32_t il = 0; il < PULSAR_MAX_LAYER; il++) {
         free(snap->attn[il]);
         free(snap->index[il]);
     }
@@ -239,11 +239,11 @@ static void snap_free(bank_snap *snap) {
 
 /* Compare one bank's rows [0, rows) against a snapshot; rows listed in
  * skip_attn/skip_index (per ratio) are allowed (expected) to differ. */
-static void check_bank_vs_snap(ds4_gpu_graph *g, uint32_t bank, const bank_snap *snap,
+static void check_bank_vs_snap(pulsar_gpu_graph *g, uint32_t bank, const bank_snap *snap,
                                int expect_new_r4, int expect_new_r128,
                                const char *what) {
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
         uint32_t n = snap->rows;
         if (n > g->layer_comp_cap[il]) n = g->layer_comp_cap[il];
@@ -286,15 +286,15 @@ static void check_bank_vs_snap(ds4_gpu_graph *g, uint32_t bank, const bank_snap 
 /* Collect one emitted row (attn + indexer where present) per compressed
  * layer of a bank into caller buffers keyed by layer. */
 typedef struct {
-    uint8_t *attn[DS4_MAX_LAYER];    /* NULL where no row expected */
-    uint8_t *index[DS4_MAX_LAYER];
+    uint8_t *attn[PULSAR_MAX_LAYER];    /* NULL where no row expected */
+    uint8_t *index[PULSAR_MAX_LAYER];
 } emit_rows;
 
-static bool collect_emit_rows(ds4_gpu_graph *g, uint32_t bank,
+static bool collect_emit_rows(pulsar_gpu_graph *g, uint32_t bank,
                               int row_r4, int row_r128, emit_rows *er) {
     memset(er, 0, sizeof(*er));
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const int row = ratio == 4 ? row_r4 : row_r128;
         if (row < 0) continue;
@@ -313,7 +313,7 @@ static bool collect_emit_rows(ds4_gpu_graph *g, uint32_t bank,
 }
 
 static void emit_rows_free(emit_rows *er) {
-    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+    for (uint32_t il = 0; il < PULSAR_MAX_LAYER; il++) {
         free(er->attn[il]);
         free(er->index[il]);
     }
@@ -322,7 +322,7 @@ static void emit_rows_free(emit_rows *er) {
 
 static int emit_rows_equal(const emit_rows *a, const emit_rows *b, const char *what) {
     int equal = 1;
-    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+    for (uint32_t il = 0; il < PULSAR_MAX_LAYER; il++) {
         if ((a->attn[il] != NULL) != (b->attn[il] != NULL)) { equal = 0; continue; }
         if (a->attn[il] && memcmp(a->attn[il], b->attn[il], attn_row_bytes()) != 0) {
             fprintf(stderr, "  %s: attn emitted row differs at layer %u\n", what, il);
@@ -338,10 +338,10 @@ static int emit_rows_equal(const emit_rows *a, const emit_rows *b, const char *w
 }
 
 /* Frontier counter checks. */
-static void check_frontiers(ds4_gpu_graph *g, uint32_t bank, uint32_t end_pos,
+static void check_frontiers(pulsar_gpu_graph *g, uint32_t bank, uint32_t end_pos,
                             const char *what) {
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint32_t want = (end_pos + 1u) / ratio;
         CHECK(g->ms_n_comp[bank][il] == want,
@@ -354,9 +354,9 @@ static void check_frontiers(ds4_gpu_graph *g, uint32_t bank, uint32_t end_pos,
     }
 }
 
-static void check_superset(ds4_gpu_graph *g, const char *what) {
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
+static void check_superset(pulsar_gpu_graph *g, const char *what) {
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
         uint32_t mx = 0;
         for (uint32_t b = 0; b < gpu_graph_bank_pool_count(g); b++)
@@ -372,15 +372,15 @@ static void check_superset(ds4_gpu_graph *g, const char *what) {
  * at (row_r4, row_r128) of bank 0. */
 static bool solo_reference(int stream, int len, int steps,
                            int row_r4, int row_r128, emit_rows *er) {
-    ds4_session *s = NULL;
-    if (ds4_session_create(&s, g_e, 4096) != 0) return false;
+    pulsar_session *s = NULL;
+    if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
     bool ok = populate_bank(s, 0, stream, len);
     for (int i = 0; ok && i < steps; i++) {
         const step_row r = {0, len + i, stream_tok(stream, len + i)};
         ok = run_step(s, &r, 1);
     }
     if (ok) ok = collect_emit_rows(&s->graph, 0, row_r4, row_r128, er);
-    ds4_session_free(s);
+    pulsar_session_free(s);
     return ok;
 }
 
@@ -394,9 +394,9 @@ static bool mixed_scenario_order(int a_bank, int a_len, int b_bank, int b_len,
                            const char *what,
                            emit_rows *a_out, emit_rows *b_out,
                            int check_a_untouched, int populate_b_first) {
-    ds4_session *s = NULL;
-    if (ds4_session_create(&s, g_e, 4096) != 0) return false;
-    ds4_gpu_graph *g = &s->graph;
+    pulsar_session *s = NULL;
+    if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
+    pulsar_gpu_graph *g = &s->graph;
     /* populate_b_first flips which bank the graph's views are repointed at
      * when the step runs (cur_bank) — the banked step must be bit-invariant
      * to it (any cur-bank leakage in stores/reads/emits breaks this). */
@@ -423,7 +423,7 @@ static bool mixed_scenario_order(int a_bank, int a_len, int b_bank, int b_len,
         CHECK(0, "%s: scenario execution failed", what);
     }
     snap_free(&a_pre);
-    ds4_session_free(s);
+    pulsar_session_free(s);
     return ok;
 }
 
@@ -444,17 +444,17 @@ static bool mixed_scenario(int a_bank, int a_len, int b_bank, int b_len,
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL\n", argv[0]); return 2; }
 
-    ds4_engine_options opt;
+    pulsar_engine_options opt;
     memset(&opt, 0, sizeof(opt));
     opt.model_path = argv[1];
-    opt.backend = DS4_BACKEND_CUDA;
-    if (ds4_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
+    opt.backend = PULSAR_BACKEND_CUDA;
+    if (pulsar_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
 
     size_t text_len = 0;
     char *text = read_file("tests/long_context_story_prompt.txt", &text_len);
     if (!text) { fprintf(stderr, "prompt file read failed\n"); return 1; }
     memset(&g_toks, 0, sizeof(g_toks));
-    ds4_tokenize_text(g_e, text, &g_toks);
+    pulsar_tokenize_text(g_e, text, &g_toks);
     free(text);
     if (g_toks.len < 1200) { fprintf(stderr, "prompt too short\n"); return 1; }
 
@@ -695,7 +695,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    ds4_engine_close(g_e);
+    pulsar_engine_close(g_e);
     if (g_fail) { fprintf(stderr, "FRONTIER GATE: FAIL\n"); return 1; }
     printf("FRONTIER GATE: PASS\n");
     return 0;

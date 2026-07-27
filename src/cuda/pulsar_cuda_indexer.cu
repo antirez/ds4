@@ -1,13 +1,13 @@
-#include "ds4_cuda_internal.h"
+#include "pulsar_cuda_internal.h"
 
 /* When set, the indexer compressed cache is stored MXKV-FP4-packed
- * (DS4_MXKV_FP4_ROWBYTES(128) = 68 B/row: 64 E2M1 nibble pairs low-nibble-first
+ * (PULSAR_MXKV_FP4_ROWBYTES(128) = 68 B/row: 64 E2M1 nibble pairs low-nibble-first
  * + 4 E8M0 block-32 scales) instead of f32.  The cache rows are QAT-roundtripped
  * to exactly these values in both modes, so the scores are bit-identical; packed
  * mode only changes storage and read traffic.  head_dim must be 128. */
 static int g_indexer_fp4 = 0;
 
-void ds4_gpu_indexer_set_fp4(int on) { g_indexer_fp4 = on ? 1 : 0; }
+void pulsar_gpu_indexer_set_fp4(int on) { g_indexer_fp4 = on ? 1 : 0; }
 
 __device__ static inline float idx_e2m1_value_dev(int i) {
     switch (i & 7) {
@@ -26,7 +26,7 @@ __device__ static inline float idx_comp_load_dev(const float *index_comp, int fp
                                                  uint64_t row, uint32_t d,
                                                  uint32_t head_dim) {
     if (!fp4) return index_comp[row * head_dim + d];
-    const uint8_t *r = (const uint8_t *)index_comp + row * DS4_MXKV_FP4_ROWBYTES(128u);
+    const uint8_t *r = (const uint8_t *)index_comp + row * PULSAR_MXKV_FP4_ROWBYTES(128u);
     /* 2^(e8-127) built directly as a float exponent — exact for e8 in [1,254],
      * and the pack amax floor (7e-38 -> e8 >= 2) rules out byte 0. ~20% cheaper
      * per scan call than exp2f in the occupancy-bound small-ctx regime. */
@@ -41,7 +41,7 @@ __device__ static inline float idx_comp_load_dev(const float *index_comp, int fp
 
 /* positions/seq_id/comp_cap/n_banks (descriptor-aware indexer kernels): the
  * same per-row multi-session banking as the decode attention kernels
- * (ds4_cuda_attention.cu — design adapted from the MIT-licensed Entrpi/ds4
+ * (pulsar_cuda_attention.cu — design adapted from the MIT-licensed Entrpi/ds4
  * fork, v0.2 c71a49a; reimplemented, no code copied).  positions[t] is row
  * t's absolute query position, seq_id[t] its TRUE bank id; the row's visible
  * compressed count derives per row as (qpos+1)/ratio — the SAME emit-
@@ -121,7 +121,7 @@ __global__ static void indexer_scores_kernel(
 /* Descriptor-aware variant of the single-token fast tier: the banked entry
  * keeps this kernel (rather than forcing the generic per-(row,comp) kernel)
  * because its reduction order is what the classic single-token decode uses —
- * the DS4_DECODE_DESCR byte-gate and any per-session solo/banked comparison
+ * the PULSAR_DECODE_DESCR byte-gate and any per-session solo/banked comparison
  * depend on the banked n_tokens==1 scan being bit-identical to classic.
  * (Documented deviation from the Tier-2 spec's "generic only" note; the WMMA
  * multi-token tier does stay single-bank.)  Descriptor semantics match
@@ -899,10 +899,10 @@ static int indexer_topk_cub_smem(void) {
 
 
 static int indexer_scores_launch(
-        ds4_gpu_tensor       *scores,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *weights,
-        const ds4_gpu_tensor *index_comp,
+        pulsar_gpu_tensor       *scores,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *weights,
+        const pulsar_gpu_tensor *index_comp,
         uint32_t                n_comp,
         uint32_t                n_tokens,
         uint32_t                pos0,
@@ -911,9 +911,9 @@ static int indexer_scores_launch(
         uint32_t                ratio,
         float                   scale,
         uint32_t                causal,
-        const ds4_gpu_tensor *positions,
-        const ds4_gpu_tensor *seq_id,
-        const ds4_gpu_tensor *index_bank_ptrs,
+        const pulsar_gpu_tensor *positions,
+        const pulsar_gpu_tensor *seq_id,
+        const pulsar_gpu_tensor *index_bank_ptrs,
         uint32_t                comp_cap,
         uint32_t                n_banks) {
     const int fp4 = g_indexer_fp4;
@@ -933,7 +933,7 @@ static int indexer_scores_launch(
          seq_id->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
          (uint64_t)n_banks * comp_cap > 4294967296ull)) {
         fprintf(stderr,
-                "ds4: banked indexer scores rejected: bad descriptor args "
+                "pulsar: banked indexer scores rejected: bad descriptor args "
                 "(n_tokens=%u n_banks=%u comp_cap=%u n_comp=%u ratio=%u causal=%u)\n",
                 n_tokens, n_banks, comp_cap, n_comp, ratio, causal);
         return 0;
@@ -944,7 +944,7 @@ static int indexer_scores_launch(
                                  : descr ? (uint64_t)n_banks * comp_cap
                                          : (uint64_t)n_comp;
     const uint64_t comp_bytes = fp4
-        ? comp_rows_min * DS4_MXKV_FP4_ROWBYTES(128u)
+        ? comp_rows_min * PULSAR_MXKV_FP4_ROWBYTES(128u)
         : comp_rows_min * head_dim * sizeof(float);
     if (!scores || !q || !weights || !index_comp ||
         n_comp == 0 || n_tokens == 0 || n_head == 0 || head_dim == 0 ||
@@ -1002,11 +1002,11 @@ static int indexer_scores_launch(
 
 
 
-int ds4_gpu_indexer_score_one_tensor(
-        ds4_gpu_tensor       *scores,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *weights,
-        const ds4_gpu_tensor *index_comp,
+int pulsar_gpu_indexer_score_one_tensor(
+        pulsar_gpu_tensor       *scores,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *weights,
+        const pulsar_gpu_tensor *index_comp,
         uint32_t                n_comp,
         uint32_t                n_head,
         uint32_t                head_dim,
@@ -1018,11 +1018,11 @@ int ds4_gpu_indexer_score_one_tensor(
 
 
 
-int ds4_gpu_indexer_scores_prefill_tensor(
-        ds4_gpu_tensor       *scores,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *weights,
-        const ds4_gpu_tensor *index_comp,
+int pulsar_gpu_indexer_scores_prefill_tensor(
+        pulsar_gpu_tensor       *scores,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *weights,
+        const pulsar_gpu_tensor *index_comp,
         uint32_t                n_comp,
         uint32_t                n_tokens,
         uint32_t                n_head,
@@ -1036,11 +1036,11 @@ int ds4_gpu_indexer_scores_prefill_tensor(
 
 
 
-int ds4_gpu_indexer_scores_decode_batch_tensor(
-        ds4_gpu_tensor       *scores,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *weights,
-        const ds4_gpu_tensor *index_comp,
+int pulsar_gpu_indexer_scores_decode_batch_tensor(
+        pulsar_gpu_tensor       *scores,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *weights,
+        const pulsar_gpu_tensor *index_comp,
         uint32_t                n_comp,
         uint32_t                n_tokens,
         uint32_t                pos0,
@@ -1048,9 +1048,9 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
         uint32_t                head_dim,
         uint32_t                ratio,
         float                   scale,
-        const ds4_gpu_tensor *positions,
-        const ds4_gpu_tensor *seq_id,
-        const ds4_gpu_tensor *index_bank_ptrs,
+        const pulsar_gpu_tensor *positions,
+        const pulsar_gpu_tensor *seq_id,
+        const pulsar_gpu_tensor *index_bank_ptrs,
         uint32_t                comp_cap,
         uint32_t                n_banks) {
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, n_tokens, pos0,
@@ -1060,9 +1060,9 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
 
 
 
-int ds4_gpu_indexer_topk_tensor(
-        ds4_gpu_tensor       *selected,
-        const ds4_gpu_tensor *scores,
+int pulsar_gpu_indexer_topk_tensor(
+        pulsar_gpu_tensor       *selected,
+        const pulsar_gpu_tensor *scores,
         uint32_t                n_comp,
         uint32_t                n_tokens,
         uint32_t                top_k) {
@@ -1163,15 +1163,15 @@ int ds4_gpu_indexer_topk_tensor(
          * it; a NaN score already makes the selection arbitrary.
          *
          * Either width keeps the final merge inside SORT_N=4096: the tree loop
-         * below reduces to at most DS4_CUDA_TOPK_MERGE_GROUP(=8) * 512 = 4096
+         * below reduces to at most PULSAR_CUDA_TOPK_MERGE_GROUP(=8) * 512 = 4096
          * candidates. */
         const uint32_t chunk_n = (n_tokens == 1u) ? 2048u : 4096u;
         const uint32_t n_chunks = (n_comp + chunk_n - 1u) / chunk_n;
         const uint32_t candidate_stride = n_chunks * top_k;
         uint32_t n_sets = n_chunks;
         uint64_t scratch_u32_per_token = candidate_stride;
-        while (n_sets > DS4_CUDA_TOPK_MERGE_GROUP) {
-            n_sets = (n_sets + DS4_CUDA_TOPK_MERGE_GROUP - 1u) / DS4_CUDA_TOPK_MERGE_GROUP;
+        while (n_sets > PULSAR_CUDA_TOPK_MERGE_GROUP) {
+            n_sets = (n_sets + PULSAR_CUDA_TOPK_MERGE_GROUP - 1u) / PULSAR_CUDA_TOPK_MERGE_GROUP;
             scratch_u32_per_token += (uint64_t)n_sets * top_k;
         }
         if (scratch_u32_per_token > UINT64_MAX / n_tokens / sizeof(uint32_t)) return 0;
@@ -1200,8 +1200,8 @@ int ds4_gpu_indexer_topk_tensor(
         }
         if (!cuda_ok(cudaGetLastError(), "indexer topk chunk launch")) return 0;
 
-        while (n_sets > DS4_CUDA_TOPK_MERGE_GROUP) {
-            const uint32_t next_sets = (n_sets + DS4_CUDA_TOPK_MERGE_GROUP - 1u) / DS4_CUDA_TOPK_MERGE_GROUP;
+        while (n_sets > PULSAR_CUDA_TOPK_MERGE_GROUP) {
+            const uint32_t next_sets = (n_sets + PULSAR_CUDA_TOPK_MERGE_GROUP - 1u) / PULSAR_CUDA_TOPK_MERGE_GROUP;
             const uint32_t next_stride = next_sets * top_k;
             uint32_t *next = cur + (uint64_t)n_tokens * cur_stride;
             dim3 grid_merge(n_tokens, next_sets, 1);
@@ -1213,7 +1213,7 @@ int ds4_gpu_indexer_topk_tensor(
                     n_tokens,
                     top_k,
                     n_sets,
-                    DS4_CUDA_TOPK_MERGE_GROUP,
+                    PULSAR_CUDA_TOPK_MERGE_GROUP,
                     cur_stride,
                     next_stride);
             if (!cuda_ok(cudaGetLastError(), "indexer topk tree merge launch")) return 0;
@@ -1240,9 +1240,9 @@ int ds4_gpu_indexer_topk_tensor(
 
 
 
-int ds4_gpu_argmax_tensor(
-        ds4_gpu_tensor       *out_idx,
-        const ds4_gpu_tensor *logits,
+int pulsar_gpu_argmax_tensor(
+        pulsar_gpu_tensor       *out_idx,
+        const pulsar_gpu_tensor *logits,
         uint32_t                n_vocab) {
     if (!out_idx || !logits || n_vocab == 0 ||
         out_idx->bytes < sizeof(int32_t) ||
@@ -1257,9 +1257,9 @@ int ds4_gpu_argmax_tensor(
 
 
 
-int ds4_gpu_dsv4_topk_mask_tensor(
-        ds4_gpu_tensor       *mask,
-        const ds4_gpu_tensor *topk,
+int pulsar_gpu_dsv4_topk_mask_tensor(
+        pulsar_gpu_tensor       *mask,
+        const pulsar_gpu_tensor *topk,
         uint32_t                n_comp,
         uint32_t                n_tokens,
         uint32_t                top_k) {

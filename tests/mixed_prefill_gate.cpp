@@ -1,7 +1,7 @@
 /* plan-34 phase-2 increment 3 — K-row single-bank PREFILL through the mixed entry.
  *
  * Routes a K-row prefill chunk (one bank, positions p0..p0+K-1) through
- * ds4_session_decode_mixed and checks it is (1) COHERENT vs classic chunked
+ * pulsar_session_decode_mixed and checks it is (1) COHERENT vs classic chunked
  * prefill, (2) correct across the K>ratio compressor read-after-write boundary,
  * and (3) TENSOR-CORE FAST (prefix=0 => no forced-custom kernel). NO decode
  * co-scheduling (that + the decode/prefill split + neutrality is inc 4).
@@ -15,18 +15,18 @@
  * greedy-decode NGEN tokens (1-row decode_mixed steps) and compare to a fully
  * classic-prefilled reference decoded the same way.
  *
- * Run under DS4_MSEQ_BANKS>=1, pack on/off x idx-fp4 on/off. GPU discipline.
- *   usage: DS4_MSEQ_BANKS=2 ./tests/mixed_prefill_gate MODEL
+ * Run under PULSAR_MSEQ_BANKS>=1, pack on/off x idx-fp4 on/off. GPU discipline.
+ *   usage: PULSAR_MSEQ_BANKS=2 ./tests/mixed_prefill_gate MODEL
  */
-#include "ds4.h"
-#include "ds4_engine_internal.h"
+#include "pulsar.h"
+#include "pulsar_engine_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-static ds4_engine *g_e;
-static ds4_tokens g_toks;
+static pulsar_engine *g_e;
+static pulsar_tokens g_toks;
 static int g_fail;
 #define NGEN 24
 #define C0   128            /* first (classic) chunk: lifts frontier off 0, ratio-aligned */
@@ -38,89 +38,89 @@ static char *read_file(const char *p, size_t *n){ FILE *f=fopen(p,"rb"); if(!f)r
 
 /* greedy-decode NGEN tokens on bank 0, continuing from a frontier at F with the
  * prefill's first predicted token t0 already in out[0]; uses 1-row decode_mixed. */
-static bool decode_cont(ds4_session *s, int F, int t0, int *out){
+static bool decode_cont(pulsar_session *s, int F, int t0, int *out){
     out[0]=t0;
-    const int vocab=(int)DS4_N_VOCAB;
+    const int vocab=(int)PULSAR_N_VOCAB;
     float *lg = (float *)malloc((size_t)vocab*sizeof(float));
     char e[256]; bool ok=true;
     for(int i=1; i<NGEN && ok; i++){
-        ds4_multiseq_req r={.bank=0,.pos=F+i-1,.token=out[i-1]};
+        pulsar_multiseq_req r={.bank=0,.pos=F+i-1,.token=out[i-1]};
         uint32_t nr=0;
-        if(ds4_session_decode_mixed(s,&r,1,lg,vocab,&nr,0u,e,sizeof e)!=0){ fprintf(stderr,"cont step %d: %s\n",i,e); ok=false; break; }
+        if(pulsar_session_decode_mixed(s,&r,1,lg,vocab,&nr,0u,e,sizeof e)!=0){ fprintf(stderr,"cont step %d: %s\n",i,e); ok=false; break; }
         out[i]=(int)argmax_f32(lg,(uint64_t)vocab);
     }
     free(lg); return ok;
 }
 
-/* classic RESUME reference: prefill [0,F) via ds4_session_sync (the second sync
+/* classic RESUME reference: prefill [0,F) via pulsar_session_sync (the second sync
  * resumes at c0>0 = same decode-attention kernel as the mixed path), copy the
  * last-position full-vocab logits, then decode NGEN. */
 static bool classic_stream(int c0, int F, int *out, float *out_lg){
-    ds4_session *s=NULL; if(ds4_session_create(&s,g_e,4096)!=0) return false;
-    ds4_gpu_graph *g=&s->graph; char e[256]; bool ok=true;
-    if(g->banks.n_banks && !gpu_graph_bank_repoint(g,0)){ ds4_session_free(s); return false; }
-    ds4_session_invalidate(s);
-    ds4_tokens p0={.v=g_toks.v,.len=c0,.cap=c0};
-    if(ds4_session_sync(s,&p0,e,sizeof e)!=0){ fprintf(stderr,"classic first-chunk: %s\n",e); ok=false; }
-    ds4_tokens p={.v=g_toks.v,.len=F,.cap=F};           /* RESUMES at c0 (pos0>0) */
-    if(ok && ds4_session_sync(s,&p,e,sizeof e)!=0){ fprintf(stderr,"classic resume: %s\n",e); ok=false; }
+    pulsar_session *s=NULL; if(pulsar_session_create(&s,g_e,4096)!=0) return false;
+    pulsar_gpu_graph *g=&s->graph; char e[256]; bool ok=true;
+    if(g->banks.n_banks && !gpu_graph_bank_repoint(g,0)){ pulsar_session_free(s); return false; }
+    pulsar_session_invalidate(s);
+    pulsar_tokens p0={.v=g_toks.v,.len=c0,.cap=c0};
+    if(pulsar_session_sync(s,&p0,e,sizeof e)!=0){ fprintf(stderr,"classic first-chunk: %s\n",e); ok=false; }
+    pulsar_tokens p={.v=g_toks.v,.len=F,.cap=F};           /* RESUMES at c0 (pos0>0) */
+    if(ok && pulsar_session_sync(s,&p,e,sizeof e)!=0){ fprintf(stderr,"classic resume: %s\n",e); ok=false; }
     if(ok){ gpu_graph_bank_counters_capture(g,0);
-            ds4_session_copy_logits(s,out_lg,(int)DS4_N_VOCAB);   /* last-position logits */
-            ok=decode_cont(s,F,ds4_session_argmax(s),out); }
-    ds4_session_free(s); return ok;
+            pulsar_session_copy_logits(s,out_lg,(int)PULSAR_N_VOCAB);   /* last-position logits */
+            ok=decode_cont(s,F,pulsar_session_argmax(s),out); }
+    pulsar_session_free(s); return ok;
 }
 
 /* mixed: classic [0,c0), then K-row mixed run [c0,c0+K); decode NGEN. *secs = the
  * timed mixed-run seconds when non-NULL. */
 static bool mixed_stream(int c0, int K, int *out, double *secs, float *out_lg){
-    ds4_session *s=NULL; if(ds4_session_create(&s,g_e,4096)!=0) return false;
-    ds4_gpu_graph *g=&s->graph; char e[256]; bool ok=true;
-    if(g->banks.n_banks && !gpu_graph_bank_repoint(g,0)){ ds4_session_free(s); return false; }
-    ds4_session_invalidate(s);
-    ds4_tokens p={.v=g_toks.v,.len=c0,.cap=c0};
-    if(ds4_session_sync(s,&p,e,sizeof e)!=0){ fprintf(stderr,"mixed first-chunk sync: %s\n",e); ok=false; }
+    pulsar_session *s=NULL; if(pulsar_session_create(&s,g_e,4096)!=0) return false;
+    pulsar_gpu_graph *g=&s->graph; char e[256]; bool ok=true;
+    if(g->banks.n_banks && !gpu_graph_bank_repoint(g,0)){ pulsar_session_free(s); return false; }
+    pulsar_session_invalidate(s);
+    pulsar_tokens p={.v=g_toks.v,.len=c0,.cap=c0};
+    if(pulsar_session_sync(s,&p,e,sizeof e)!=0){ fprintf(stderr,"mixed first-chunk sync: %s\n",e); ok=false; }
     if(ok) gpu_graph_bank_counters_capture(g,0);
-    const int vocab=(int)DS4_N_VOCAB;
+    const int vocab=(int)PULSAR_N_VOCAB;
     float *lg = (float *)malloc((size_t)vocab*sizeof(float));    /* 1 run => 1 logit row */
-    ds4_multiseq_req *rq = (ds4_multiseq_req *)malloc((size_t)K*sizeof(*rq));
+    pulsar_multiseq_req *rq = (pulsar_multiseq_req *)malloc((size_t)K*sizeof(*rq));
     for(int j=0;j<K;j++){ rq[j].bank=0; rq[j].pos=c0+j; rq[j].token=g_toks.v[c0+j]; }
     uint32_t nr=0;
     double t0=secs?now_s():0.0;
-    if(ok && ds4_session_decode_mixed(s,rq,(uint32_t)K,lg,vocab,&nr,0u,e,sizeof e)!=0){ fprintf(stderr,"mixed K-run: %s\n",e); ok=false; }
+    if(ok && pulsar_session_decode_mixed(s,rq,(uint32_t)K,lg,vocab,&nr,0u,e,sizeof e)!=0){ fprintf(stderr,"mixed K-run: %s\n",e); ok=false; }
     if(secs) *secs=now_s()-t0;
     if(ok && nr!=1){ fprintf(stderr,"mixed run n_rows=%u expected 1\n",nr); ok=false; }
     if(ok && out_lg) memcpy(out_lg,lg,(size_t)vocab*sizeof(float));   /* last-position logits */
     if(ok) ok=decode_cont(s,c0+K,(int)argmax_f32(lg,(uint64_t)vocab),out);
-    free(lg); free(rq); ds4_session_free(s); return ok;
+    free(lg); free(rq); pulsar_session_free(s); return ok;
 }
 
 /* classic prefill of K tokens from a c0 frontier (for the speed baseline). */
 static bool classic_prefill_time(int c0, int K, double *secs){
-    ds4_session *s=NULL; if(ds4_session_create(&s,g_e,4096)!=0) return false;
-    ds4_gpu_graph *g=&s->graph; char e[256]; bool ok=true;
-    if(g->banks.n_banks && !gpu_graph_bank_repoint(g,0)){ ds4_session_free(s); return false; }
-    ds4_session_invalidate(s);
-    ds4_tokens p0={.v=g_toks.v,.len=c0,.cap=c0};
-    if(ds4_session_sync(s,&p0,e,sizeof e)!=0) ok=false;              /* untimed first chunk */
-    ds4_tokens p1={.v=g_toks.v,.len=c0+K,.cap=c0+K};
+    pulsar_session *s=NULL; if(pulsar_session_create(&s,g_e,4096)!=0) return false;
+    pulsar_gpu_graph *g=&s->graph; char e[256]; bool ok=true;
+    if(g->banks.n_banks && !gpu_graph_bank_repoint(g,0)){ pulsar_session_free(s); return false; }
+    pulsar_session_invalidate(s);
+    pulsar_tokens p0={.v=g_toks.v,.len=c0,.cap=c0};
+    if(pulsar_session_sync(s,&p0,e,sizeof e)!=0) ok=false;              /* untimed first chunk */
+    pulsar_tokens p1={.v=g_toks.v,.len=c0+K,.cap=c0+K};
     double t0=now_s();
-    if(ok && ds4_session_sync(s,&p1,e,sizeof e)!=0) ok=false;        /* resumes at c0, prefills K */
+    if(ok && pulsar_session_sync(s,&p1,e,sizeof e)!=0) ok=false;        /* resumes at c0, prefills K */
     *secs=now_s()-t0;
-    ds4_session_free(s); return ok;
+    pulsar_session_free(s); return ok;
 }
 
 static int firstdiff(const int*a,const int*b,int n){ for(int i=0;i<n;i++) if(a[i]!=b[i]) return i; return -1; }
 
 int main(int argc,char**argv){
     if(argc<2){ fprintf(stderr,"usage: %s MODEL\n",argv[0]); return 2; }
-    ds4_engine_options o; memset(&o,0,sizeof o); o.model_path=argv[1]; o.backend=DS4_BACKEND_CUDA;
-    if(ds4_engine_open(&g_e,&o)!=0){ fprintf(stderr,"engine open failed\n"); return 1; }
+    pulsar_engine_options o; memset(&o,0,sizeof o); o.model_path=argv[1]; o.backend=PULSAR_BACKEND_CUDA;
+    if(pulsar_engine_open(&g_e,&o)!=0){ fprintf(stderr,"engine open failed\n"); return 1; }
     printf("CONFIG: DS4_ATTN_PACK=%s DS4_IDX_FP4=%s\n",
         getenv("DS4_ATTN_PACK")?getenv("DS4_ATTN_PACK"):"(unset,default 1)",
         getenv("DS4_IDX_FP4")?getenv("DS4_IDX_FP4"):"(unset,default 1)");
     size_t tl=0; char*txt=read_file("tests/long_context_story_prompt.txt",&tl);
     if(!txt){ fprintf(stderr,"prompt read failed\n"); return 1; }
-    memset(&g_toks,0,sizeof g_toks); ds4_tokenize_text(g_e,txt,&g_toks); free(txt);
+    memset(&g_toks,0,sizeof g_toks); pulsar_tokenize_text(g_e,txt,&g_toks); free(txt);
 
     const int K1=512;                 /* gates 1&2: spans many ratio-4 (and ratio-128) groups */
     if(C0+K1+NGEN > g_toks.len){ fprintf(stderr,"prompt too short (%d)\n",g_toks.len); return 1; }
@@ -132,7 +132,7 @@ int main(int argc,char**argv){
      *   (2) last-position full-vocab logit rel-RMS < 1e-2 (corruption => large error),
      *   (3) the NGEN continuation is coherent (valid, non-degenerate), not required to
      *       match classic past the drift point. */
-    const int vocab=(int)DS4_N_VOCAB;
+    const int vocab=(int)PULSAR_N_VOCAB;
     int ref[NGEN], mix[NGEN];
     float *ref_lg = (float *)malloc((size_t)vocab*sizeof(float)), *mix_lg=(float *)malloc((size_t)vocab*sizeof(float));
     if(!classic_stream(C0, C0+K1, ref, ref_lg)){ fprintf(stderr,"GATE FAIL: classic-resume reference failed\n"); g_fail=1; free(ref_lg);free(mix_lg); goto done; }
@@ -180,7 +180,7 @@ int main(int argc,char**argv){
     }
 
 done:
-    ds4_engine_close(g_e);
+    pulsar_engine_close(g_e);
     if(g_fail){ fprintf(stderr,"MIXED-PREFILL GATE: FAIL\n"); return 1; }
     printf("MIXED-PREFILL GATE: PASS\n"); return 0;
 }

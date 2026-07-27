@@ -1,13 +1,13 @@
-# DwarfStar
+# Pulsar
 
-**DwarfStar** is a small native inference engine built for **DeepSeek V4
+**Pulsar** is a small native inference engine built for **DeepSeek V4
 Flash** on a single **NVIDIA GB10 (DGX Spark, ~128 GB unified memory)**. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
 runtime: it is completely self-contained. Other than running the model in a
 correct and fast way, the project goal is to provide DeepSeek specific loading,
 prompt rendering, tool calling, and KV state handling (RAM and on-disk) behind an
 OpenAI- and Anthropic-compatible server API, ready to work with local coding
-agents. The shipped release is a single binary — **`ds4-server`** — that serves
+agents. The shipped release is a single binary — **`pulsar-server`** — that serves
 that API; that is the product. There are also offline tools for GGUF and imatrix
 generation, plus development tools for quality and speed testing (see the
 Development tools note under Building).
@@ -33,7 +33,7 @@ not a permanent commitment.
 
 ## Acknowledgements to llama.cpp and GGML
 
-DwarfStar does not link against GGML, but it **exists thanks to the path opened by the
+Pulsar does not link against GGML, but it **exists thanks to the path opened by the
 llama.cpp project and the kernels, quantization formats, GGUF ecosystem, and hard-won
 engineering knowledge developed there**.
 We are thankful and indebted to [`llama.cpp`](https://github.com/ggml-org/llama.cpp)
@@ -65,7 +65,7 @@ This fork also stands on:
 
 This is **beta quality**, but a first release has shipped: the
 measured-allocation DeepSeek-V4-Flash GGUF (the `v5mx` build) and the
-`ds4-server` engine that serves it. The inference path, the MXFP4/MXFP8/IQ2
+`pulsar-server` engine that serves it. The inference path, the MXFP4/MXFP8/IQ2
 quantization, and speculative decoding are validated against the tests in this
 tree and the `tool-eval-bench` quality suite — a 4-seed run of the
 shipping build averages ~90/100 with hardmode included (range 87–92 across seeds).
@@ -84,7 +84,7 @@ eliminate deep cold re-prefills for agentic clients that replay reasoning
 (4 concurrent conversations plus the pinned base).
 Model serving is
 a large surface, so rough edges remain; we keep the project usable and are
-actively hardening it. If you hit a problem, run `ds4-server --trace
+actively hardening it. If you hit a problem, run `pulsar-server --trace
 /tmp/ds4-trace.txt` to capture the session and open an issue with the full
 trace.
 
@@ -111,7 +111,7 @@ next sections.
   v5mx GGUF (templates → oracle → REAP transplant → imatrix → allocation →
   mixed-quant → DSpark merge).
 - [docs/MODEL_CARD.md](docs/MODEL_CARD.md): synopsis of the official DeepSeek
-  V4 model card, with the architecture details that matter for DS4.
+  V4 model card, with the architecture details that matter for Pulsar.
 - [gguf-tools/quality-testing/README.md](gguf-tools/quality-testing/README.md):
   how local GGUFs are scored against official DeepSeek V4 Flash/PRO continuations.
 - [dir-steering/README.md](dir-steering/README.md): directional steering data,
@@ -209,12 +209,12 @@ git submodule update --init cutlass
 make cuda-spark            # Linux CUDA, DGX Spark / GB10 (sm_120f)
 ```
 
-`./ds4flash.gguf` is the default model path used by `ds4-server`. Pass `-m` to
-select another supported GGUF from `./gguf/`. Run `./ds4-server --help` for the
+`./ds4flash.gguf` is the default model path used by `pulsar-server`. Pass `-m` to
+select another supported GGUF from `./gguf/`. Run `./pulsar-server --help` for the
 full flag list, and start serving with:
 
 ```sh
-./ds4-server -m ds4flash.gguf --ctx 100000
+./pulsar-server -m ds4flash.gguf --ctx 100000
 ```
 
 ## Speed
@@ -283,7 +283,7 @@ is stochastic run-to-run under sampling; the numbers above are `--temp 0`.)
 
 ## Model residency
 
-DwarfStar is a fully resident engine for **weights**: the CUDA path makes the
+Pulsar is a fully resident engine for **weights**: the CUDA path makes the
 whole model (~85 GiB of tensor spans + merged DSpark drafter) resident in
 GPU-addressable memory at load time. A model that does not fit is rejected at
 startup with a clear error instead of silently degrading — there is no
@@ -356,12 +356,12 @@ for debugging comparisons against the plain f32 layouts.
 
 ## Speculative decoding (DSpark)
 
-DwarfStar has exactly one drafter: **DSpark**. The earlier MTP drafter path
+Pulsar has exactly one drafter: **DSpark**. The earlier MTP drafter path
 was removed rather than kept as a semi-supported variant. The drafter's
 tensors ship merged inside the main model GGUF and the engine auto-enables
 speculative decoding when it detects them at load — no extra file or flag
 needed. `--no-dspark` opts out, and `--dspark PATH` still loads a split
-drafter file. The `ds4-bench` development tool intentionally measures the
+drafter file. The `pulsar-bench` development tool intentionally measures the
 plain-decode baseline.
 
 Acceptance is **exact sampled acceptance at all temperatures**: a draft token
@@ -396,7 +396,7 @@ claim is therefore **"speculation's downside is now capped to a few percent,"**
 not "speculation never hurts." When quench fires it logs, e.g.:
 
 ```text
-ds4: dspark yield-quench pos=330 steps=13 debt=5.92 ewma=-0.60 -> plain decode for request remainder
+pulsar: dspark yield-quench pos=330 steps=13 debt=5.92 ewma=-0.60 -> plain decode for request remainder
 ```
 
 The min-p draft prefilter on the speculative path is bit-exact at the production
@@ -420,14 +420,14 @@ avoiding the old per-layer chunk dispatch path.
 Start a local OpenAI/Anthropic-compatible server:
 
 ```sh
-./ds4-server --ctx 100000
+./pulsar-server --ctx 100000
 ```
 
 The disk KV cache is on by default (see [Disk KV Cache](#disk-kv-cache));
 add `--kv-disk-dir DIR` / `--kv-disk-space-mb N` only to relocate or resize it,
 or `--no-kv-disk` to turn it off.
 
-Use `--chdir /path/to/ds4` when launching `ds4-server` from another directory,
+Use `--chdir /path/to/pulsar` when launching `pulsar-server` from another directory,
 so relative runtime paths such as the default `./ds4flash.gguf` model and
 `dir-steering/` data resolve from the project tree.
 
@@ -543,7 +543,7 @@ For browser JavaScript clients served from another origin, start the server with
 `--cors` to emit `Access-Control-Allow-*` headers. This only changes HTTP
 headers; it is independent of which interfaces the server binds.
 
-> **Network exposure.** `ds4-server` binds **`0.0.0.0` (all interfaces) by
+> **Network exposure.** `pulsar-server` binds **`0.0.0.0` (all interfaces) by
 > default** and has **no authentication** — any host that can reach the port can
 > use the model, the agent tools, and `/metrics`. This is a deliberate
 > single-node, trusted-LAN design: run it only on a network you control. To
@@ -597,12 +597,12 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 ### Agent Client Usage
 
-`ds4-server` can be used by local coding agents that speak OpenAI-compatible
+`pulsar-server` can be used by local coding agents that speak OpenAI-compatible
 chat completions. Start the server first, and set the client context limit no
 higher than the `--ctx` value you started the server with:
 
 ```sh
-./ds4-server --ctx 100000
+./pulsar-server --ctx 100000
 ```
 
 You can use larger context and larger cache if you wish, up to the model's
@@ -623,8 +623,8 @@ For **opencode**, add a provider and agent entry to
 {
   "$schema": "https://opencode.ai/config.json",
   "provider": {
-    "ds4": {
-      "name": "ds4 (local)",
+    "pulsar": {
+      "name": "pulsar (local)",
       "npm": "@ai-sdk/openai-compatible",
       "options": {
         "baseURL": "http://127.0.0.1:8000/v1",
@@ -632,7 +632,7 @@ For **opencode**, add a provider and agent entry to
       },
       "models": {
         "deepseek-v4-flash": {
-          "name": "DeepSeek V4 Flash (ds4 local)",
+          "name": "DeepSeek V4 Flash (pulsar local)",
           "limit": {
             "context": 100000,
             "output": 384000
@@ -642,9 +642,9 @@ For **opencode**, add a provider and agent entry to
     }
   },
   "agent": {
-    "ds4": {
-      "description": "DeepSeek V4 Flash served by local ds4-server",
-      "model": "ds4/deepseek-v4-flash",
+    "pulsar": {
+      "description": "DeepSeek V4 Flash served by local pulsar-server",
+      "model": "pulsar/deepseek-v4-flash",
       "temperature": 0
     }
   }
@@ -656,8 +656,8 @@ For **Pi**, add a provider to `~/.pi/agent/models.json`:
 ```json
 {
   "providers": {
-    "ds4": {
-      "name": "ds4 local",
+    "pulsar": {
+      "name": "pulsar local",
       "baseUrl": "http://127.0.0.1:8000/v1",
       "api": "openai-completions",
       "apiKey": "dsv4-local",
@@ -674,7 +674,7 @@ For **Pi**, add a provider to `~/.pi/agent/models.json`:
       "models": [
         {
           "id": "deepseek-v4-flash",
-          "name": "DeepSeek V4 Flash (ds4 local)",
+          "name": "DeepSeek V4 Flash (pulsar local)",
           "reasoning": true,
           "thinkingLevelMap": {
             "off": null,
@@ -704,7 +704,7 @@ Optionally make it the default Pi model in `~/.pi/agent/settings.json`:
 
 ```json
 {
-  "defaultProvider": "ds4",
+  "defaultProvider": "pulsar",
   "defaultModel": "deepseek-v4-flash"
 }
 ```
@@ -712,8 +712,8 @@ Optionally make it the default Pi model in `~/.pi/agent/settings.json`:
 For **Codex CLI**, use the Responses wire API:
 
 ```toml
-[model_providers.ds4]
-name = "DS4"
+[model_providers.pulsar]
+name = "Pulsar"
 base_url = "http://127.0.0.1:8000/v1"
 wire_api = "responses"
 stream_idle_timeout_ms = 1000000
@@ -722,7 +722,7 @@ stream_idle_timeout_ms = 1000000
 Then run:
 
 ```sh
-codex --model deepseek-v4-flash -c model_provider=ds4
+codex --model deepseek-v4-flash -c model_provider=pulsar
 ```
 
 For **Claude Code**, use the Anthropic-compatible endpoint. A wrapper like this
@@ -737,8 +737,8 @@ export ANTHROPIC_AUTH_TOKEN="${DS4_API_KEY:-dsv4-local}"
 export ANTHROPIC_MODEL="deepseek-v4-flash"
 
 export ANTHROPIC_CUSTOM_MODEL_OPTION="deepseek-v4-flash"
-export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="DeepSeek V4 Flash local ds4"
-export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="ds4 local GGUF"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="DeepSeek V4 Flash local pulsar"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="pulsar local GGUF"
 
 export ANTHROPIC_DEFAULT_SONNET_MODEL="deepseek-v4-flash"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="deepseek-v4-flash"
@@ -772,7 +772,7 @@ non-thinking model alias such as `deepseek-chat`.
 ## Disk KV Cache
 
 Chat/completion APIs are stateless: agent clients usually resend the whole
-conversation every request. `ds4-server` first tries the cheap exact token-prefix
+conversation every request. `pulsar-server` first tries the cheap exact token-prefix
 check, then falls back to comparing rendered prompt bytes with decoded
 checkpoint bytes. The live in-memory checkpoint covers the current session; the
 disk KV cache makes useful prefixes survive session switches and server
@@ -794,9 +794,9 @@ logs that once and keeps serving with the disk cache disabled — it never fails
 to start over cache placement.
 
 ```sh
-./ds4-server                                        # default-on, default dir
-./ds4-server --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192   # custom
-./ds4-server --no-kv-disk                           # opt out (or --kv-disk-dir "")
+./pulsar-server                                        # default-on, default dir
+./pulsar-server --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192   # custom
+./pulsar-server --no-kv-disk                           # opt out (or --kv-disk-dir "")
 ```
 
 The disk budget defaults to 4096 MiB (`--kv-disk-space-mb`); least-valuable
@@ -812,7 +812,7 @@ a model load still applies; pass `--no-kv-disk` if you want none of that
 pressure.
 
 The cache key is the SHA1 of the rendered byte prefix, and files are named
-`<sha1>.kv`. The DS4 payload still stores the exact token IDs and graph state
+`<sha1>.kv`. The Pulsar payload still stores the exact token IDs and graph state
 for that prefix. This matters for continued chats: the model may have generated
 one token whose decoded text is later sent back by a client as two canonical
 prompt tokens. A rendered byte-prefix hit can still reuse the checkpoint and
@@ -833,7 +833,7 @@ On disk, a cache file is:
 KVC fixed header, 48 bytes
 u32 rendered_text_bytes
 rendered_text_bytes of UTF-8-ish token text
-DS4 session payload, payload_bytes from the KVC header
+Pulsar session payload, payload_bytes from the KVC header
 optional tool-id map section
 ```
 
@@ -852,13 +852,13 @@ The fixed header is little-endian:
 20  u8[4]  reserved
 24  u64    creation Unix time
 32  u64    last-used Unix time
-40  u64    DS4 session payload byte count
+40  u64    Pulsar session payload byte count
 ```
 
 The rendered text is the tokenizer-decoded text for the cached token prefix.
 It is both the human-inspectable prefix and the lookup identity: its SHA1 is
 the filename, and a file is reusable only when those bytes are a prefix of the
-incoming rendered prompt. After load, the exact checkpoint tokens from the DS4
+incoming rendered prompt. After load, the exact checkpoint tokens from the Pulsar
 payload remain authoritative, and only the incoming text suffix after the cached
 bytes is tokenized.
 
@@ -891,7 +891,7 @@ client history and load just those mappings, so an exact DSML replay can survive
 server restarts even when the matching KV snapshot is not the one ultimately
 used for the rendered-prefix hit.
 
-The DS4 session payload starts with thirteen little-endian `u32` fields:
+The Pulsar session payload starts with thirteen little-endian `u32` fields:
 
 ```text
 0   magic = "DSV4"
@@ -922,14 +922,14 @@ Then it stores:
 - For ratio-4 compressed layers: live indexer compressed rows and indexer
   frontier tensors.
 
-The logits are raw IEEE-754 `float32` values from the host `ds4_session`
+The logits are raw IEEE-754 `float32` values from the host `pulsar_session`
 buffer. They are saved immediately after the checkpoint tokens so a loaded
 snapshot can sample or continue from the exact next-token distribution without
 running one extra decode step. Speculative draft state is not persisted; after
 loading a disk checkpoint it is invalidated and rebuilt by normal generation.
 
-The tensor payload is DS4-specific KV/session state, not a generic inference
-graph dump. It is expected to be portable only across compatible DwarfStar
+The tensor payload is Pulsar-specific KV/session state, not a generic inference
+graph dump. It is expected to be portable only across compatible Pulsar
 builds for this model layout.
 
 The cache stores checkpoints at four moments:
@@ -969,7 +969,7 @@ the kv cache files include the verbatim prompt cached.
 
 ## Building
 
-DwarfStar is **CUDA-only**; the whole model runs as a single CUDA-graph
+Pulsar is **CUDA-only**; the whole model runs as a single CUDA-graph
 inference path. Plain `make` prints the available build targets instead of
 selecting one implicitly. For the DGX Spark / GB10 (the validated production
 target) build with:
@@ -981,7 +981,7 @@ make cuda-spark
 The CUTLASS MXFP4 expert path requires the **`sm_120f`** family arch for its
 block-scaled tensor-core MMA, so `cuda-spark` builds with `CUDA_ARCH=sm_120f`.
 This fork targets the GB10 only; there is a single build target, and
-`make cuda-spark` builds only the shipped binary, `ds4-server`.
+`make cuda-spark` builds only the shipped binary, `pulsar-server`.
 
 If a binary is run on a GPU whose architecture it was not built for, it **fails
 fast at startup**: every translation unit's compiled arch list is checked at
@@ -990,9 +990,9 @@ inside a kernel launch.
 
 ### Development tools
 
-The tree also builds `ds4` (the CLI), `ds4-bench` (speed microbench), `ds4-eval`
-(embedded capability check), and `ds4-agent` (native coding agent) via
-`make <name>` — for example `make ds4-bench`. These are development tools for
+The tree also builds `pulsar` (the CLI), `pulsar-bench` (speed microbench), `pulsar-eval`
+(embedded capability check), and `pulsar-agent` (native coding agent) via
+`make <name>` — for example `make pulsar-bench`. These are development tools for
 contributors; they are not part of the release and are not built by
 `make cuda-spark`. Some are untested after the pre-release cleanup.
 
@@ -1007,12 +1007,12 @@ and so forth, much faster than fine-tuning.
 This is also useful for cybersecurity researchers who want to reduce a model's
 willingness to provide dual-use or offensive security guidance.
 
-`ds4-server` exposes steering directly: point it at a direction file and set the
+`pulsar-server` exposes steering directly: point it at a direction file and set the
 per-path scales (`--dir-steering-ffn` after FFN outputs, `--dir-steering-attn`
 after attention outputs):
 
 ```sh
-./ds4-server -m ds4flash.gguf --ctx 100000 \
+./pulsar-server -m ds4flash.gguf --ctx 100000 \
   --dir-steering-file dir-steering/out/verbosity.f32 \
   --dir-steering-ffn -4.0
 ```
@@ -1026,7 +1026,7 @@ path.
 captured from the official DeepSeek V4 Flash API. The requests use
 `deepseek-v4-flash`, greedy decoding, thinking disabled, and the maximum
 `top_logprobs` slice exposed by the API. Local vectors are generated with
-`./ds4 --dump-logprobs` (the `ds4` development CLI, built with `make ds4`) and
+`./pulsar --dump-logprobs` (the `pulsar` development CLI, built with `make pulsar`) and
 compared by token bytes, so tokenizer/template or
 attention regressions show up before they become long generation failures. The
 C runner pins `DS4_CUDA_PREFILL_CHUNK=2048` for this strict API-vector
@@ -1035,36 +1035,36 @@ comparison.
 All project tests are driven by the C runners:
 
 ```sh
-make test                  # ds4_test
-./ds4_test --logprob-vectors
-./ds4_test --server
+make test                  # pulsar_test
+./pulsar_test --logprob-vectors
+./pulsar_test --server
 ```
 
-`ds4_test` loads a model (`DS4_TEST_MODEL`, default `./ds4flash.gguf`);
-`ds4_agent_test` and the eval self-test run without one. `make
+`pulsar_test` loads a model (`DS4_TEST_MODEL`, default `./ds4flash.gguf`);
+`pulsar_agent_test` and the eval self-test run without one. `make
 cuda-regression` runs a GPU kernel smoke test that needs no model.
 
 ## Debugging Notes
 
 When a generation looks wrong, a few small tools are usually enough to get a
-first answer. `ds4-server --trace` is the one that works against the shipped
-binary; the `--dump-*` probes live on the `ds4` development CLI (`make ds4`):
+first answer. `pulsar-server --trace` is the one that works against the shipped
+binary; the `--dump-*` probes live on the `pulsar` development CLI (`make pulsar`):
 
 ```sh
-./ds4-server --trace /tmp/ds4-trace.txt ...
-./ds4 --dump-tokens -p "..."
-./ds4 --dump-logprobs /tmp/out.json --logprobs-top-k 20 --temp 0 -p "..."
-./ds4 --dump-logits /tmp/logits.json --cuda --nothink --prompt-file prompt.txt
+./pulsar-server --trace /tmp/ds4-trace.txt ...
+./pulsar --dump-tokens -p "..."
+./pulsar --dump-logprobs /tmp/out.json --logprobs-top-k 20 --temp 0 -p "..."
+./pulsar --dump-logits /tmp/logits.json --cuda --nothink --prompt-file prompt.txt
 ```
 
 - `--dump-tokens` tokenizes the `-p` or `--prompt-file` string exactly as
-  written, recognizes DS4 protocol specials, and then exits before inference
+  written, recognizes Pulsar protocol specials, and then exits before inference
   starts. For example, the DSML tool close marker starts as two tokens: `</`
   and `｜DSML｜`.
 - `--dump-logprobs` stores a greedy continuation with the top local
   alternatives at each step, which helps separate sampling choices from
   logit/model issues.
-- `ds4-server --trace` writes the rendered prompts, cache decisions, generated
+- `pulsar-server --trace` writes the rendered prompts, cache decisions, generated
   text, and tool-parser events for a whole agent session.
 
 ## Roadmap

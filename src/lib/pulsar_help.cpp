@@ -1,4 +1,4 @@
-#include "ds4_help.h"
+#include "pulsar_help.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -100,65 +100,65 @@ static bool topic_is(const char *topic, const char *name) {
     return topic && strcmp(topic, name) == 0;
 }
 
-static const char *tool_name(ds4_help_tool tool) {
+static const char *tool_name(pulsar_help_tool tool) {
     switch (tool) {
-    case DS4_HELP_DS4: return "ds4";
-    case DS4_HELP_SERVER: return "ds4-server";
-    case DS4_HELP_AGENT: return "ds4-agent";
-    case DS4_HELP_BENCH: return "ds4-bench";
-    case DS4_HELP_EVAL: return "ds4-eval";
+    case PULSAR_HELP_DS4: return "pulsar";
+    case PULSAR_HELP_SERVER: return "pulsar-server";
+    case PULSAR_HELP_AGENT: return "pulsar-agent";
+    case PULSAR_HELP_BENCH: return "pulsar-bench";
+    case PULSAR_HELP_EVAL: return "pulsar-eval";
     }
-    return "ds4";
+    return "pulsar";
 }
 
-static const char *tool_usage(ds4_help_tool tool) {
+static const char *tool_usage(pulsar_help_tool tool) {
     switch (tool) {
-    case DS4_HELP_DS4:
-        return "Usage: ds4 [(-p PROMPT | --prompt-file FILE)] [options]";
-    case DS4_HELP_SERVER:
-        return "Usage: ds4-server [options]";
-    case DS4_HELP_AGENT:
-        return "Usage: ds4-agent [options]";
-    case DS4_HELP_BENCH:
-        return "Usage: ds4-bench (--prompt-file FILE | --chat-prompt-file FILE) [options]";
-    case DS4_HELP_EVAL:
-        return "Usage: ds4-eval [options]";
+    case PULSAR_HELP_DS4:
+        return "Usage: pulsar [(-p PROMPT | --prompt-file FILE)] [options]";
+    case PULSAR_HELP_SERVER:
+        return "Usage: pulsar-server [options]";
+    case PULSAR_HELP_AGENT:
+        return "Usage: pulsar-agent [options]";
+    case PULSAR_HELP_BENCH:
+        return "Usage: pulsar-bench (--prompt-file FILE | --chat-prompt-file FILE) [options]";
+    case PULSAR_HELP_EVAL:
+        return "Usage: pulsar-eval [options]";
     }
-    return "Usage: ds4 [options]";
+    return "Usage: pulsar [options]";
 }
 
-static const char *tool_summary(ds4_help_tool tool) {
+static const char *tool_summary(pulsar_help_tool tool) {
     switch (tool) {
-    case DS4_HELP_DS4:
-        return "Chat with a local DwarfStar model, run one-shot prompts, or inspect models.";
-    case DS4_HELP_SERVER:
-        return "Serve one loaded DwarfStar model through OpenAI, Responses, Anthropic, and completion-compatible HTTP APIs.";
-    case DS4_HELP_AGENT:
+    case PULSAR_HELP_DS4:
+        return "Chat with a local Pulsar model, run one-shot prompts, or inspect models.";
+    case PULSAR_HELP_SERVER:
+        return "Serve one loaded Pulsar model through OpenAI, Responses, Anthropic, and completion-compatible HTTP APIs.";
+    case PULSAR_HELP_AGENT:
         return "Run the native terminal coding agent with live tools, session save/restore, and a responsive prompt while the model works.";
-    case DS4_HELP_BENCH:
+    case PULSAR_HELP_BENCH:
         return "Measure prefill, decode, context growth, and KV-cache size across repeatable context frontiers.";
-    case DS4_HELP_EVAL:
+    case PULSAR_HELP_EVAL:
         return "Run the built-in reasoning, math, science, and security evaluation harness with a live terminal UI.";
     }
     return "";
 }
 
 static void print_model_runtime(FILE *fp, const help_colors *c,
-                                ds4_help_tool tool, bool full) {
+                                pulsar_help_tool tool, bool full) {
     title(fp, c, "Model And Runtime");
     opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ds4flash.gguf");
     opt(fp, c, "--served-model-id ID", "Model id in /v1/models(id,root),/version,/metrics (default deepseek-v4-flash). Set to an HF repo path so HF tools (llama-benchy tokenizer) resolve it.");
     opt(fp, c, "--served-model-name NAME", "Human display name in /v1/models(name)/version (default: model shape name). Free-form; never used as a tokenizer id.");
-    if (tool != DS4_HELP_BENCH) {
+    if (tool != PULSAR_HELP_BENCH) {
         opt(fp, c, "-c, --ctx N", "Allocated context tokens.");
     }
-    if (tool == DS4_HELP_SERVER) {
+    if (tool == PULSAR_HELP_SERVER) {
         opt(fp, c, "-n, --tokens N", "Default max output tokens when clients omit a limit.");
     }
     opt(fp, c, "-t, --threads N", "CPU helper threads for host-side/reference work.");
     opt(fp, c, "--prefill-chunk N", "GPU graph prefill chunk size. Default: auto (PRO long prompts use 8192; others use 4096).");
     if (full) {
-        if (tool != DS4_HELP_BENCH) {
+        if (tool != PULSAR_HELP_BENCH) {
             opt(fp, c, "--no-dspark", "Disable the DSpark speculative drafter bundled in the model GGUF.");
             opt(fp, c, "--expert-overlay FILE:PFX", "Swap routed-expert tensors matching PFX for the same tensors in donor GGUF FILE (quant-format measurement).");
         }
@@ -198,9 +198,9 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c);
 
 static void print_cli_specific(FILE *fp, const help_colors *c, bool full) {
     title(fp, c, "CLI Modes");
-    opt(fp, c, "ds4", "Start the interactive prompt.");
-    opt(fp, c, "ds4 -p TEXT", "Run one prompt and exit.");
-    opt(fp, c, "ds4 --prompt-file FILE", "Run a long prompt from a file and exit.");
+    opt(fp, c, "pulsar", "Start the interactive prompt.");
+    opt(fp, c, "pulsar -p TEXT", "Run one prompt and exit.");
+    opt(fp, c, "pulsar --prompt-file FILE", "Run a long prompt from a file and exit.");
     fputc('\n', fp);
     if (full) {
         print_cli_diagnostics(fp, c);
@@ -231,7 +231,7 @@ static void print_cli_commands(FILE *fp, const help_colors *c) {
     opt(fp, c, "/ctx N", "Restart the interactive session with a new context size.");
     opt(fp, c, "/read FILE", "Read FILE and submit it as the next user message.");
     opt(fp, c, "/quit, /exit", "Leave the prompt.");
-    opt(fp, c, "Ctrl+C", "Stop current generation and return to ds4>.");
+    opt(fp, c, "Ctrl+C", "Stop current generation and return to pulsar>.");
     fputc('\n', fp);
 }
 
@@ -330,24 +330,24 @@ static void print_eval_specific(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
 }
 
-static bool tool_has_topic(ds4_help_tool tool, const char *topic) {
+static bool tool_has_topic(pulsar_help_tool tool, const char *topic) {
     if (!topic) return true;
     if (streq(topic, "all")) return true;
     if (streq(topic, "runtime")) return true;
     if (streq(topic, "sampling"))
-        return tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_EVAL;
+        return tool == PULSAR_HELP_DS4 || tool == PULSAR_HELP_AGENT || tool == PULSAR_HELP_EVAL;
     if (streq(topic, "steering"))
-        return tool == DS4_HELP_DS4 || tool == DS4_HELP_SERVER || tool == DS4_HELP_AGENT;
+        return tool == PULSAR_HELP_DS4 || tool == PULSAR_HELP_SERVER || tool == PULSAR_HELP_AGENT;
     switch (tool) {
-    case DS4_HELP_DS4:
+    case PULSAR_HELP_DS4:
         return streq(topic, "diagnostics") || streq(topic, "commands");
-    case DS4_HELP_SERVER:
+    case PULSAR_HELP_SERVER:
         return streq(topic, "api") || streq(topic, "kv-cache") || streq(topic, "thinking");
-    case DS4_HELP_AGENT:
+    case PULSAR_HELP_AGENT:
         return streq(topic, "sessions") || streq(topic, "commands") || streq(topic, "tools");
-    case DS4_HELP_BENCH:
+    case PULSAR_HELP_BENCH:
         return streq(topic, "benchmark");
-    case DS4_HELP_EVAL:
+    case PULSAR_HELP_EVAL:
         return streq(topic, "evaluation");
     }
     return false;
@@ -365,87 +365,87 @@ static void more_line(FILE *fp, const help_colors *c, const char *label, const c
     fprintf(fp, "    %s%-26s%s --help %s\n", on, label, off, topic);
 }
 
-static void print_more_info(FILE *fp, const help_colors *c, ds4_help_tool tool) {
+static void print_more_info(FILE *fp, const help_colors *c, pulsar_help_tool tool) {
     title(fp, c, "More Info");
     more_line(fp, c, "Runtime full info:", "runtime");
     if (tool_has_topic(tool, "sampling"))
         more_line(fp, c, "Sampling full info:", "sampling");
     if (tool_has_topic(tool, "steering"))
         more_line(fp, c, "Steering full info:", "steering");
-    if (tool == DS4_HELP_DS4) {
+    if (tool == PULSAR_HELP_DS4) {
         more_line(fp, c, "Interactive commands:", "commands");
         more_line(fp, c, "Diagnostics:", "diagnostics");
-    } else if (tool == DS4_HELP_SERVER) {
+    } else if (tool == PULSAR_HELP_SERVER) {
         more_line(fp, c, "HTTP API:", "api");
         more_line(fp, c, "Disk KV cache:", "kv-cache");
         more_line(fp, c, "Thinking behavior:", "thinking");
-    } else if (tool == DS4_HELP_AGENT) {
+    } else if (tool == PULSAR_HELP_AGENT) {
         more_line(fp, c, "Agent sessions:", "sessions");
         more_line(fp, c, "Agent commands:", "commands");
         more_line(fp, c, "Agent tool system:", "tools");
-    } else if (tool == DS4_HELP_BENCH) {
+    } else if (tool == PULSAR_HELP_BENCH) {
         more_line(fp, c, "Benchmark sweep:", "benchmark");
-    } else if (tool == DS4_HELP_EVAL) {
+    } else if (tool == PULSAR_HELP_EVAL) {
         more_line(fp, c, "Evaluation options:", "evaluation");
     }
     fputc('\n', fp);
 }
 
-static void print_examples(FILE *fp, const help_colors *c, ds4_help_tool tool, const char *topic) {
+static void print_examples(FILE *fp, const help_colors *c, pulsar_help_tool tool, const char *topic) {
     title(fp, c, "Examples");
     if (topic_is(topic, "runtime")) {
-        if (tool == DS4_HELP_SERVER) {
-            opt(fp, c, "CUDA API", "./ds4-server -m ds4flash.gguf --cuda --ctx 100000");
-        } else if (tool == DS4_HELP_AGENT) {
-            opt(fp, c, "agent", "./ds4-agent -m ds4flash.gguf --ctx 100000");
-        } else if (tool == DS4_HELP_BENCH) {
-            opt(fp, c, "bench", "./ds4-bench --prompt-file long.txt --ctx-max 32768");
-        } else if (tool == DS4_HELP_EVAL) {
-            opt(fp, c, "eval", "./ds4-eval --questions 10 --ctx 100000");
-            opt(fp, c, "CPU debug", "./ds4-eval --cpu --questions 1 --tokens 32");
+        if (tool == PULSAR_HELP_SERVER) {
+            opt(fp, c, "CUDA API", "./pulsar-server -m ds4flash.gguf --cuda --ctx 100000");
+        } else if (tool == PULSAR_HELP_AGENT) {
+            opt(fp, c, "agent", "./pulsar-agent -m ds4flash.gguf --ctx 100000");
+        } else if (tool == PULSAR_HELP_BENCH) {
+            opt(fp, c, "bench", "./pulsar-bench --prompt-file long.txt --ctx-max 32768");
+        } else if (tool == PULSAR_HELP_EVAL) {
+            opt(fp, c, "eval", "./pulsar-eval --questions 10 --ctx 100000");
+            opt(fp, c, "CPU debug", "./pulsar-eval --cpu --questions 1 --tokens 32");
         } else {
-            opt(fp, c, "CUDA", "./ds4 -m ds4flash.gguf --cuda -c 100000");
+            opt(fp, c, "CUDA", "./pulsar -m ds4flash.gguf --cuda -c 100000");
         }
     } else if (topic_is(topic, "steering")) {
-        opt(fp, c, "steer FFN", "./ds4 -p \"Write tersely\" --dir-steering-file dir.bin --dir-steering-ffn 0.8");
-    } else if (tool == DS4_HELP_SERVER || topic_is(topic, "api") || topic_is(topic, "kv-cache")) {
-        opt(fp, c, "local API", "./ds4-server --ctx 100000 --kv-disk-space-mb 8192");
+        opt(fp, c, "steer FFN", "./pulsar -p \"Write tersely\" --dir-steering-file dir.bin --dir-steering-ffn 0.8");
+    } else if (tool == PULSAR_HELP_SERVER || topic_is(topic, "api") || topic_is(topic, "kv-cache")) {
+        opt(fp, c, "local API", "./pulsar-server --ctx 100000 --kv-disk-space-mb 8192");
         opt(fp, c, "curl", "curl http://127.0.0.1:8000/v1/models");
-    } else if (tool == DS4_HELP_AGENT || topic_is(topic, "sessions") || topic_is(topic, "tools")) {
-        opt(fp, c, "interactive", "./ds4-agent");
-        opt(fp, c, "one shot", "./ds4-agent --non-interactive -p \"Create /tmp/hello.c\"");
-    } else if (tool == DS4_HELP_BENCH || topic_is(topic, "benchmark")) {
-        opt(fp, c, "csv", "./ds4-bench --prompt-file long.txt --ctx-max 32768 --csv speed.csv");
-        opt(fp, c, "prefill only", "./ds4-bench --prompt-file long.txt --gen-tokens 0");
-    } else if (tool == DS4_HELP_EVAL || topic_is(topic, "evaluation")) {
-        opt(fp, c, "first 10", "./ds4-eval --questions 10 --trace eval.trace");
-        opt(fp, c, "plain", "./ds4-eval --plain --nothink --tokens 512");
+    } else if (tool == PULSAR_HELP_AGENT || topic_is(topic, "sessions") || topic_is(topic, "tools")) {
+        opt(fp, c, "interactive", "./pulsar-agent");
+        opt(fp, c, "one shot", "./pulsar-agent --non-interactive -p \"Create /tmp/hello.c\"");
+    } else if (tool == PULSAR_HELP_BENCH || topic_is(topic, "benchmark")) {
+        opt(fp, c, "csv", "./pulsar-bench --prompt-file long.txt --ctx-max 32768 --csv speed.csv");
+        opt(fp, c, "prefill only", "./pulsar-bench --prompt-file long.txt --gen-tokens 0");
+    } else if (tool == PULSAR_HELP_EVAL || topic_is(topic, "evaluation")) {
+        opt(fp, c, "first 10", "./pulsar-eval --questions 10 --trace eval.trace");
+        opt(fp, c, "plain", "./pulsar-eval --plain --nothink --tokens 512");
     } else {
-        opt(fp, c, "chat", "./ds4");
-        opt(fp, c, "one shot", "./ds4 -p \"Explain mmap in C\"");
-        opt(fp, c, "long prompt", "./ds4 --think-max --prompt-file prompt.txt --ctx 393216");
+        opt(fp, c, "chat", "./pulsar");
+        opt(fp, c, "one shot", "./pulsar -p \"Explain mmap in C\"");
+        opt(fp, c, "long prompt", "./pulsar --think-max --prompt-file prompt.txt --ctx 393216");
     }
     fputc('\n', fp);
 }
 
-static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, const char *topic) {
+static void print_topic(FILE *fp, const help_colors *c, pulsar_help_tool tool, const char *topic) {
     if (streq(topic, "all")) {
         print_model_runtime(fp, c, tool, true);
         if (tool_has_topic(tool, "sampling")) print_sampling(fp, c, true);
         if (tool_has_topic(tool, "steering")) print_steering(fp, c);
-        if (tool == DS4_HELP_DS4) {
+        if (tool == PULSAR_HELP_DS4) {
             print_cli_specific(fp, c, true);
             print_cli_commands(fp, c);
-        } else if (tool == DS4_HELP_SERVER) {
+        } else if (tool == PULSAR_HELP_SERVER) {
             print_server_api(fp, c);
             print_server_thinking(fp, c);
             print_kv_cache(fp, c);
-        } else if (tool == DS4_HELP_AGENT) {
+        } else if (tool == PULSAR_HELP_AGENT) {
             print_agent_specific(fp, c);
             print_agent_sessions(fp, c);
-        } else if (tool == DS4_HELP_BENCH) {
+        } else if (tool == PULSAR_HELP_BENCH) {
             print_bench_specific(fp, c);
-        } else if (tool == DS4_HELP_EVAL) {
+        } else if (tool == PULSAR_HELP_EVAL) {
             print_eval_specific(fp, c);
         }
         return;
@@ -454,43 +454,43 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
     if (streq(topic, "runtime")) print_model_runtime(fp, c, tool, true);
     else if (streq(topic, "sampling")) print_sampling(fp, c, true);
     else if (streq(topic, "steering")) print_steering(fp, c);
-    else if (tool == DS4_HELP_DS4 && streq(topic, "diagnostics")) print_cli_diagnostics(fp, c);
-    else if (tool == DS4_HELP_DS4 && streq(topic, "commands")) print_cli_commands(fp, c);
-    else if (tool == DS4_HELP_SERVER && streq(topic, "api")) print_server_api(fp, c);
-    else if (tool == DS4_HELP_SERVER && streq(topic, "kv-cache")) print_kv_cache(fp, c);
-    else if (tool == DS4_HELP_SERVER && streq(topic, "thinking")) print_server_thinking(fp, c);
-    else if (tool == DS4_HELP_AGENT && streq(topic, "sessions")) print_agent_sessions(fp, c);
-    else if (tool == DS4_HELP_AGENT && streq(topic, "commands")) print_agent_sessions(fp, c);
-    else if (tool == DS4_HELP_AGENT && streq(topic, "tools")) {
+    else if (tool == PULSAR_HELP_DS4 && streq(topic, "diagnostics")) print_cli_diagnostics(fp, c);
+    else if (tool == PULSAR_HELP_DS4 && streq(topic, "commands")) print_cli_commands(fp, c);
+    else if (tool == PULSAR_HELP_SERVER && streq(topic, "api")) print_server_api(fp, c);
+    else if (tool == PULSAR_HELP_SERVER && streq(topic, "kv-cache")) print_kv_cache(fp, c);
+    else if (tool == PULSAR_HELP_SERVER && streq(topic, "thinking")) print_server_thinking(fp, c);
+    else if (tool == PULSAR_HELP_AGENT && streq(topic, "sessions")) print_agent_sessions(fp, c);
+    else if (tool == PULSAR_HELP_AGENT && streq(topic, "commands")) print_agent_sessions(fp, c);
+    else if (tool == PULSAR_HELP_AGENT && streq(topic, "tools")) {
         title(fp, c, "Agent Tool System");
         para(fp, c, "The agent can read, search, write, edit files, and run bash commands.");
         para(fp, c, "Tool calls are emitted by the model as DSML and rendered live in the terminal.");
         para(fp, c, "Edit uses exact old/new replacement; [upto] can bridge a unique head and tail for large anchored edits.");
         fputc('\n', fp);
-    } else if (tool == DS4_HELP_BENCH && streq(topic, "benchmark")) print_bench_specific(fp, c);
-    else if (tool == DS4_HELP_EVAL && streq(topic, "evaluation")) print_eval_specific(fp, c);
+    } else if (tool == PULSAR_HELP_BENCH && streq(topic, "benchmark")) print_bench_specific(fp, c);
+    else if (tool == PULSAR_HELP_EVAL && streq(topic, "evaluation")) print_eval_specific(fp, c);
 }
 
-static void print_default(FILE *fp, const help_colors *c, ds4_help_tool tool) {
+static void print_default(FILE *fp, const help_colors *c, pulsar_help_tool tool) {
     print_model_runtime(fp, c, tool, false);
 
-    if (tool == DS4_HELP_DS4) {
+    if (tool == PULSAR_HELP_DS4) {
         print_cli_specific(fp, c, true);
         print_sampling(fp, c, false);
-    } else if (tool == DS4_HELP_SERVER) {
+    } else if (tool == PULSAR_HELP_SERVER) {
         print_server_api(fp, c);
         print_kv_cache(fp, c);
-    } else if (tool == DS4_HELP_AGENT) {
+    } else if (tool == PULSAR_HELP_AGENT) {
         print_agent_specific(fp, c);
         print_agent_sessions(fp, c);
-    } else if (tool == DS4_HELP_BENCH) {
+    } else if (tool == PULSAR_HELP_BENCH) {
         print_bench_specific(fp, c);
-    } else if (tool == DS4_HELP_EVAL) {
+    } else if (tool == PULSAR_HELP_EVAL) {
         print_eval_specific(fp, c);
     }
 }
 
-void ds4_help_print(FILE *fp, ds4_help_tool tool, const char *topic) {
+void pulsar_help_print(FILE *fp, pulsar_help_tool tool, const char *topic) {
     help_colors c = help_make_colors(fp);
     if (topic && !tool_has_topic(tool, topic)) {
         fprintf(fp, "%s: unknown help topic '%s'\n\n", tool_name(tool), topic);

@@ -1,4 +1,4 @@
-#include "ds4_server_internal.h"
+#include "pulsar_server_internal.h"
 
 
 
@@ -6,7 +6,7 @@
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
  * prompt plus the small amount of protocol state needed to translate the reply. */
-bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
+bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     const char *p = body;
@@ -15,7 +15,7 @@ bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_toke
     bool tool_choice_required = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    pulsar_think_mode reasoning_effort = PULSAR_THINK_HIGH;
     chat_msgs msgs = {0};
     char *tool_schemas = NULL;
 
@@ -171,7 +171,7 @@ bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_toke
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = ds4_think_mode_for_context(
+    r->think_mode = pulsar_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
@@ -190,7 +190,7 @@ bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_toke
         r->force_tool_call = true;
         request_apply_forced_tool_prefill(r);
     }
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    pulsar_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(tool_schemas);
     return true;
@@ -204,7 +204,7 @@ bad:
 
 
 
-bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, int def_tokens,
+bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                     int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     r->api = API_ANTHROPIC;
@@ -214,7 +214,7 @@ bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, int def
     bool tool_choice_forced = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    pulsar_think_mode reasoning_effort = PULSAR_THINK_HIGH;
     chat_msgs msgs = {0};
     char *system = NULL;
     char *tool_schemas = NULL;
@@ -399,7 +399,7 @@ bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, int def
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = ds4_think_mode_for_context(
+    r->think_mode = pulsar_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     if (!anthropic_validate_tool_results(s, &msgs,
                                          &r->anthropic_requires_live_tool_state,
@@ -424,7 +424,7 @@ bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, int def
         r->force_tool_call = true;
         request_apply_forced_tool_prefill(r);
     }
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    pulsar_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(system);
     free(tool_schemas);
@@ -1055,7 +1055,7 @@ fail:
  * controls thinking depth; summary mode (auto/concise/detailed) controls
  * whether the wire emits summary deltas at all — per the spec, no reasoning
  * summary is surfaced unless the client opts in. */
-static bool parse_responses_reasoning(const char **p, ds4_think_mode *effort,
+static bool parse_responses_reasoning(const char **p, pulsar_think_mode *effort,
                                       bool *summary_opted_in,
                                       bool *effort_seen) {
     json_ws(p);
@@ -1124,7 +1124,7 @@ static bool parse_responses_reasoning(const char **p, ds4_think_mode *effort,
 
 
 
-bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def_tokens,
+bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                     int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     r->api = API_RESPONSES;
@@ -1133,7 +1133,7 @@ bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def
     bool tool_choice_none = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    pulsar_think_mode reasoning_effort = PULSAR_THINK_HIGH;
     chat_msgs msgs = {0};
     buf loaded_tool_schemas = {0};
     char *instructions = NULL;
@@ -1277,7 +1277,7 @@ bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def
                 got_thinking = true;
                 /* Responses-API effort of "minimal" / "none" maps to disabled
                  * thinking. Other effort values choose between HIGH and MAX. */
-                if (reasoning_effort == DS4_THINK_NONE) thinking_enabled = false;
+                if (reasoning_effort == PULSAR_THINK_NONE) thinking_enabled = false;
             }
         } else if (!strcmp(key, "previous_response_id") ||
                    !strcmp(key, "conversation"))
@@ -1355,7 +1355,7 @@ bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def
     r->has_tools = active_tool_schemas && active_tool_schemas[0];
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = ds4_think_mode_for_context(
+    r->think_mode = pulsar_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     if (!responses_validate_tool_outputs(s, &msgs, r->think_mode,
                                          &r->responses_requires_live_tool_state,
@@ -1376,7 +1376,7 @@ bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def
     responses_prepare_live_continuation(r, &msgs);
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    pulsar_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     buf_free(&combined_tool_schemas);
     buf_free(&loaded_tool_schemas);
@@ -1427,14 +1427,14 @@ static bool parse_prompt(const char **p, char **out) {
 
 
 
-bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
+bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens,
                                      int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_COMPLETION, def_tokens);
     const char *p = body;
     char *prompt = NULL;
     bool got_thinking = false;
     bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    pulsar_think_mode reasoning_effort = PULSAR_THINK_HIGH;
 
     json_ws(&p);
     if (*p != '{') goto bad;
@@ -1562,18 +1562,18 @@ bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
     }
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = ds4_think_mode_for_context(
+    r->think_mode = pulsar_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     buf rendered;
     rendered = {};
-    buf_puts(&rendered, DS4_SERVER_RENDER_BOS);
-    if (r->think_mode == DS4_THINK_MAX) buf_puts(&rendered, ds4_think_max_prefix());
+    buf_puts(&rendered, PULSAR_SERVER_RENDER_BOS);
+    if (r->think_mode == PULSAR_THINK_MAX) buf_puts(&rendered, pulsar_think_max_prefix());
     buf_puts(&rendered, "You are a helpful assistant<｜User｜>");
     buf_puts(&rendered, prompt);
     buf_puts(&rendered, "<｜Assistant｜>");
-    buf_puts(&rendered, ds4_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
+    buf_puts(&rendered, pulsar_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
     r->prompt_text = buf_take(&rendered);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    pulsar_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     free(prompt);
     return true;
 bad:

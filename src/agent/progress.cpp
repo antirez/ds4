@@ -1,4 +1,4 @@
-#include "ds4_agent_internal.h"
+#include "pulsar_agent_internal.h"
 
 
 
@@ -95,7 +95,7 @@ char *agent_buf_take(agent_buf *b) {
 
 
 
-bool agent_tokens_equal(const ds4_tokens *a, const ds4_tokens *b) {
+bool agent_tokens_equal(const pulsar_tokens *a, const pulsar_tokens *b) {
     if (!a || !b || a->len != b->len) return false;
     for (int i = 0; i < a->len; i++) {
         if (a->v[i] != b->v[i]) return false;
@@ -140,7 +140,7 @@ char *agent_kv_path_for_sha(const char *dir, const char sha[41]) {
     char name[44];
     memcpy(name, sha, 40);
     memcpy(name + 40, ".kv", 4);
-    return ds4_kvstore_path_join(dir, name);
+    return pulsar_kvstore_path_join(dir, name);
 }
 
 
@@ -162,7 +162,7 @@ void agent_session_identity_sha(const char *title, uint64_t created_at,
     uint8_t ts[8];
     agent_le_put64(ts, created_at);
     agent_buf_append(&b, (const char *)ts, sizeof(ts));
-    ds4_kvstore_sha1_bytes_hex(b.ptr ? b.ptr : "", b.len, sha_out);
+    pulsar_kvstore_sha1_bytes_hex(b.ptr ? b.ptr : "", b.len, sha_out);
     free(b.ptr);
 }
 

@@ -1,4 +1,4 @@
-#include "ds4_agent_internal.h"
+#include "pulsar_agent_internal.h"
 
 
 
@@ -349,7 +349,7 @@ static bool agent_edit_find_old_span(const char *data, size_t len,
 
 
 
-#ifdef DS4_AGENT_TEST
+#ifdef PULSAR_AGENT_TEST
 
 static int agent_test_failures;
 
@@ -422,7 +422,7 @@ static void test_agent_edit_upto_requires_tail_after_newline_strip(void) {
 
 
 
-static void ds4_agent_unit_tests_run(void) {
+static void pulsar_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
 }

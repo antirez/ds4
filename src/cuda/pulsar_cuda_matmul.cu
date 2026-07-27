@@ -1,20 +1,20 @@
-#include "ds4_cuda_internal.h"
+#include "pulsar_cuda_internal.h"
 
 
 
-__global__ static void embed_token_hc_kernel(ds4_hc_t *out, const unsigned short *w, uint32_t token, uint32_t n_vocab, uint32_t n_embd, uint32_t n_hc) {
+__global__ static void embed_token_hc_kernel(pulsar_hc_t *out, const unsigned short *w, uint32_t token, uint32_t n_vocab, uint32_t n_embd, uint32_t n_hc) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t n = n_embd * n_hc;
     if (i >= n) return;
     uint32_t e = i % n_embd;
     uint32_t tok = token < n_vocab ? token : n_vocab - 1; /* clamp: an OOB token id is a wild global read */
-    ds4_hc_store(out, i, __half2float(reinterpret_cast<const __half *>(w)[(uint64_t)tok * n_embd + e]));
+    pulsar_hc_store(out, i, __half2float(reinterpret_cast<const __half *>(w)[(uint64_t)tok * n_embd + e]));
 }
 
 
 
 __global__ static void embed_tokens_hc_kernel(
-        ds4_hc_t *out,
+        pulsar_hc_t *out,
         const int32_t *tokens,
         const __half *w,
         uint32_t n_vocab,
@@ -30,7 +30,7 @@ __global__ static void embed_tokens_hc_kernel(
     int32_t tok_i = tokens[t];
     uint32_t tok = tok_i < 0 ? 0u : (uint32_t)tok_i;
     if (tok >= n_vocab) tok = 0;
-    ds4_hc_store(out, gid, __half2float(w[(uint64_t)tok * n_embd + d]));
+    pulsar_hc_store(out, gid, __half2float(w[(uint64_t)tok * n_embd + d]));
 }
 
 
@@ -243,21 +243,21 @@ __device__ __forceinline__ static float dev_dot_fp8mx_xreg_block(
 
 
 /* Fused attn-output kernels: MXFP8 weight rows dotted against RAW f32
- * activations. Each warp covers DS4_FP8MX_ROWS consecutive output rows and
+ * activations. Each warp covers PULSAR_FP8MX_ROWS consecutive output rows and
  * loads every 32-float activation block into registers ONCE for all of them,
  * so per-row activation traffic drops to int8-path parity (per-row f32 reads
  * straight from global measured ~13% slower end-to-end at decode; a shared-
  * memory staging variant measured worse still). */
-enum { DS4_FP8MX_ROWS = 4 };
+enum { PULSAR_FP8MX_ROWS = 4 };
 
 
 
 template<bool DEINT>
 __global__ static void matmul_fp8mx_hc_expand_warp8_kernel(
-        ds4_hc_t *out_hc,
+        pulsar_hc_t *out_hc,
         float *block_out,
         const float *block_add,
-        const ds4_hc_t *residual_hc,
+        const pulsar_hc_t *residual_hc,
         const float *split,
         const unsigned char *w,
         const __nv_fp8_e4m3 *wdata,
@@ -270,13 +270,13 @@ __global__ static void matmul_fp8mx_hc_expand_warp8_kernel(
         uint32_t n_hc,
         uint64_t blocks,
         int has_add) {
-    const uint64_t row0 = ((uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u)) * DS4_FP8MX_ROWS;
+    const uint64_t row0 = ((uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u)) * PULSAR_FP8MX_ROWS;
     const uint32_t lane = threadIdx.x & 31u;
     if (row0 >= out_dim) return;
-    const uint32_t nr = out_dim - row0 < DS4_FP8MX_ROWS ? (uint32_t)(out_dim - row0)
-                                                        : (uint32_t)DS4_FP8MX_ROWS;
+    const uint32_t nr = out_dim - row0 < PULSAR_FP8MX_ROWS ? (uint32_t)(out_dim - row0)
+                                                        : (uint32_t)PULSAR_FP8MX_ROWS;
     const unsigned char *wr = w + row0 * blocks * 33u;
-    float acc[DS4_FP8MX_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc[PULSAR_FP8MX_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (uint64_t b = lane; b < blocks; b += 32u) {
         const uint64_t i0 = b * 32;
         const uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
@@ -287,7 +287,7 @@ __global__ static void matmul_fp8mx_hc_expand_warp8_kernel(
                 *(float4 *)&xb[k * 4] = *(const float4 *)&x[i0 + (uint32_t)k * 4u];
             }
 #pragma unroll
-            for (uint32_t r = 0; r < DS4_FP8MX_ROWS; r++) {
+            for (uint32_t r = 0; r < PULSAR_FP8MX_ROWS; r++) {
                 if (r >= nr) continue;
                 if (DEINT) {
                     const uint32_t rw = (uint32_t)(row0 + r);
@@ -316,10 +316,10 @@ __global__ static void matmul_fp8mx_hc_expand_warp8_kernel(
             float hc_acc = block_v * post[dst_hc];
             for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
                 const float comb_v = comb[dst_hc + (uint64_t)src_hc * n_hc];
-                const float res_v = ds4_hc_load(residual_hc, (uint64_t)src_hc * n_embd + d);
+                const float res_v = pulsar_hc_load(residual_hc, (uint64_t)src_hc * n_embd + d);
                 hc_acc += comb_v * res_v;
             }
-            ds4_hc_store(out_hc, (uint64_t)dst_hc * n_embd + d, hc_acc);
+            pulsar_hc_store(out_hc, (uint64_t)dst_hc * n_embd + d, hc_acc);
         }
     }
 }
@@ -339,19 +339,19 @@ __global__ static void grouped_fp8mx_a_warp8_kernel(
         uint32_t n_groups,
         uint32_t n_tokens,
         uint64_t blocks) {
-    const uint64_t row0 = ((uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u)) * DS4_FP8MX_ROWS;
+    const uint64_t row0 = ((uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u)) * PULSAR_FP8MX_ROWS;
     const uint64_t tok = (uint64_t)blockIdx.y;
     const uint32_t lane = threadIdx.x & 31u;
     const uint64_t low_dim = (uint64_t)n_groups * rank;
     if (row0 >= low_dim || tok >= n_tokens) return;
-    const uint32_t nr = low_dim - row0 < DS4_FP8MX_ROWS ? (uint32_t)(low_dim - row0)
-                                                        : (uint32_t)DS4_FP8MX_ROWS;
+    const uint32_t nr = low_dim - row0 < PULSAR_FP8MX_ROWS ? (uint32_t)(low_dim - row0)
+                                                        : (uint32_t)PULSAR_FP8MX_ROWS;
     const unsigned char *wr = w + row0 * blocks * 33u;
     const uint64_t group = row0 / rank;
-    float acc[DS4_FP8MX_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc[PULSAR_FP8MX_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     if ((row0 + nr - 1) / rank == group) {
-        /* Common case (rank % DS4_FP8MX_ROWS == 0): all rows share the
+        /* Common case (rank % PULSAR_FP8MX_ROWS == 0): all rows share the
          * group's activation row, so its blocks are loaded once per warp. */
         const float *xr = x + (tok * (uint64_t)n_groups + group) * group_dim;
         for (uint64_t b = lane; b < blocks; b += 32u) {
@@ -364,7 +364,7 @@ __global__ static void grouped_fp8mx_a_warp8_kernel(
                     *(float4 *)&xb[k * 4] = *(const float4 *)&xr[i0 + (uint32_t)k * 4u];
                 }
 #pragma unroll
-                for (uint32_t r = 0; r < DS4_FP8MX_ROWS; r++) {
+                for (uint32_t r = 0; r < PULSAR_FP8MX_ROWS; r++) {
                     if (r >= nr) continue;
                     if (DEINT) {
                         const uint32_t rw = (uint32_t)(row0 + r);
@@ -403,7 +403,7 @@ __global__ static void grouped_fp8mx_a_warp8_kernel(
  * spec-verify launch storm (8 GEMMs/layer at 2-4 rows each). Per-(row,token)
  * block order and dot helper match grouped_fp8mx_a_warp8_kernel's DEINT fast
  * path exactly, so each token's output is bit-identical to the n=1 kernel.
- * Caller guarantees: deint weight available, rank % DS4_FP8MX_ROWS == 0 (row
+ * Caller guarantees: deint weight available, rank % PULSAR_FP8MX_ROWS == 0 (row
  * quads never straddle a group), group_dim % 32 == 0 (whole blocks). */
 template <int NT>
 __global__ static void grouped_fp8mx_a_nt_kernel(
@@ -416,14 +416,14 @@ __global__ static void grouped_fp8mx_a_nt_kernel(
         uint64_t rank,
         uint32_t n_groups,
         uint64_t blocks) {
-    const uint64_t row0 = ((uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u)) * DS4_FP8MX_ROWS;
+    const uint64_t row0 = ((uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u)) * PULSAR_FP8MX_ROWS;
     const uint32_t lane = threadIdx.x & 31u;
     const uint64_t low_dim = (uint64_t)n_groups * rank;
     if (row0 >= low_dim) return;
     const uint64_t group = row0 / rank;
-    float acc[DS4_FP8MX_ROWS][NT];
+    float acc[PULSAR_FP8MX_ROWS][NT];
 #pragma unroll
-    for (uint32_t r = 0; r < DS4_FP8MX_ROWS; r++)
+    for (uint32_t r = 0; r < PULSAR_FP8MX_ROWS; r++)
 #pragma unroll
         for (int t = 0; t < NT; t++) acc[r][t] = 0.0f;
     const float *xg = x + group * group_dim;
@@ -439,7 +439,7 @@ __global__ static void grouped_fp8mx_a_nt_kernel(
                 *(float4 *)&xb[k * 4] = *(const float4 *)&xr[(uint32_t)k * 4u];
             }
 #pragma unroll
-            for (uint32_t r = 0; r < DS4_FP8MX_ROWS; r++) {
+            for (uint32_t r = 0; r < PULSAR_FP8MX_ROWS; r++) {
                 const uint32_t rw = (uint32_t)(row0 + r);
                 acc[r][t] += dev_dot_fp8mx_deint_block(wdata + (uint64_t)rw * group_dim + i0,
                                                        wscale[mx_sfoff((int)rw, (int)b, KBp)], xb);
@@ -447,7 +447,7 @@ __global__ static void grouped_fp8mx_a_nt_kernel(
         }
     }
 #pragma unroll
-    for (uint32_t r = 0; r < DS4_FP8MX_ROWS; r++) {
+    for (uint32_t r = 0; r < PULSAR_FP8MX_ROWS; r++) {
 #pragma unroll
         for (int t = 0; t < NT; t++) {
             const float red = warp_sum_f32(acc[r][t]);
@@ -458,26 +458,26 @@ __global__ static void grouped_fp8mx_a_nt_kernel(
 
 
 
-int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
+int pulsar_gpu_embed_token_hc_tensor(pulsar_gpu_tensor *out_hc, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !model_map || weight_offset >= model_size || n_vocab == 0) return 0;
     /* The kernel writes n_embd*n_hc carrier samples; validate like the batched
      * sibling does. Before the BF16 narrowing an undersized out_hc still had 2x
      * slack — it does not any more, so this check is load-bearing (task #62). */
-    if (out_hc->bytes < (uint64_t)n_embd * n_hc * DS4_HC_ELT_SIZE) return 0;
+    if (out_hc->bytes < (uint64_t)n_embd * n_hc * PULSAR_HC_ELT_SIZE) return 0;
     uint64_t weight_bytes = (uint64_t)n_vocab * n_embd * sizeof(uint16_t);
     if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "token_embd");
     if (!wptr) return 0;
     uint32_t n = n_embd * n_hc;
-    embed_token_hc_kernel<<<(n + 255) / 256, 256>>>((ds4_hc_t *)out_hc->ptr, (const unsigned short *)wptr, token, n_vocab, n_embd, n_hc);
+    embed_token_hc_kernel<<<(n + 255) / 256, 256>>>((pulsar_hc_t *)out_hc->ptr, (const unsigned short *)wptr, token, n_vocab, n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "embed token launch");
 }
 
 
 
-int ds4_gpu_embed_tokens_hc_tensor(
-        ds4_gpu_tensor       *out_hc,
-        const ds4_gpu_tensor *tokens_t,
+int pulsar_gpu_embed_tokens_hc_tensor(
+        pulsar_gpu_tensor       *out_hc,
+        const pulsar_gpu_tensor *tokens_t,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight_offset,
@@ -489,7 +489,7 @@ int ds4_gpu_embed_tokens_hc_tensor(
         weight_offset > model_size ||
         (uint64_t)n_vocab * n_embd * sizeof(uint16_t) > model_size - weight_offset ||
         tokens_t->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
-        out_hc->bytes < (uint64_t)n_tokens * n_hc * n_embd * DS4_HC_ELT_SIZE) {
+        out_hc->bytes < (uint64_t)n_tokens * n_hc * n_embd * PULSAR_HC_ELT_SIZE) {
         return 0;
     }
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset,
@@ -498,7 +498,7 @@ int ds4_gpu_embed_tokens_hc_tensor(
     if (!wptr) return 0;
     uint64_t n = (uint64_t)n_tokens * n_hc * n_embd;
     embed_tokens_hc_kernel<<<(n + 255) / 256, 256>>>(
-        (ds4_hc_t *)out_hc->ptr,
+        (pulsar_hc_t *)out_hc->ptr,
         (const int32_t *)tokens_t->ptr,
         (const __half *)wptr,
         n_vocab, n_tokens, n_embd, n_hc);
@@ -639,7 +639,7 @@ static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t o
          * to the generic convert path: that path reads 33B-interleaved blocks,
          * but LT bytes are already de-interleaved, so a convert would be
          * garbage. Fail cleanly instead (dispatch will report the error). */
-        fprintf(stderr, "ds4: MXFP8_LT weight at offset %llu did not resolve to "
+        fprintf(stderr, "pulsar: MXFP8_LT weight at offset %llu did not resolve to "
                 "device-accessible mmap pointers\n", (unsigned long long)offset);
         return NULL;
     }
@@ -675,7 +675,7 @@ static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t o
  * and it drops ~6/7 of the activation quant traffic on those layers.
  *
  * ALIASING: the cached buffers must NOT come from cuda_tmp_alloc.  That is one
- * process-global scratch region (ds4_cuda_runtime.cu) that later callers --
+ * process-global scratch region (pulsar_cuda_runtime.cu) that later callers --
  * attention, MoE, the indexer top-k -- freely overwrite or realloc, and such
  * calls DO run between the consumers above.  Dedicated cudaMalloc'd storage is
  * the only safe home for a value that must survive across unrelated kernels.
@@ -684,7 +684,7 @@ static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t o
  * on its own -- batch_attn_norm keeps its pointer and shape while its CONTENTS
  * change every layer.  So a hit additionally requires that the engine has armed
  * the cache for that exact buffer since the last write to it
- * (ds4_gpu_mxfp8_act_cache_arm, called immediately after the norm that produces
+ * (pulsar_gpu_mxfp8_act_cache_arm, called immediately after the norm that produces
  * it).  Arming invalidates, so a stale hit would require a write with no arm.
  *
  * THREADING: per-thread state, matching the per-thread CUDA streams -- two
@@ -692,7 +692,7 @@ static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t o
  *
  * TWO ENCODINGS, ONE ARMING.  The same activation also feeds F16 cuBLAS GEMMs
  * (this model stores the compressor/indexer projections as F16 while q_a/kv are
- * MXFP8), and ds4_gpu_matmul_f16_tensor re-runs f32_to_f16_kernel over the whole
+ * MXFP8), and pulsar_gpu_matmul_f16_tensor re-runs f32_to_f16_kernel over the whole
  * activation on every call for exactly the same reason.  That conversion is
  * likewise pure, so the cache carries an f16 copy alongside the MXFP8 one and
  * both are filled lazily -- a layer pays for only the encodings it actually
@@ -713,7 +713,7 @@ struct mxfp8_act_cache_t {
 };
 static thread_local mxfp8_act_cache_t g_act_cache;
 
-void ds4_gpu_mxfp8_act_cache_arm(const ds4_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim) {
+void pulsar_gpu_mxfp8_act_cache_arm(const pulsar_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim) {
     /* Operational kill switch / A-B measurement handle. Read ONCE (this runs
      * per layer, not per token), and disarming restores the exact pre-cache
      * code path in the GEMMs below. */
@@ -729,7 +729,7 @@ void ds4_gpu_mxfp8_act_cache_arm(const ds4_gpu_tensor *x, uint64_t n_tok, uint64
     g_act_cache.key_in_dim = in_dim;
 }
 
-void ds4_gpu_mxfp8_act_cache_disarm(void) {
+void pulsar_gpu_mxfp8_act_cache_disarm(void) {
     g_act_cache.key_ptr = NULL;
     g_act_cache.valid   = 0;
     g_act_cache.valid_h = 0;
@@ -743,7 +743,7 @@ static int mxfp8_act_cache_reserve(void **buf, size_t *cap, size_t need, const c
     if (*buf) { (void)cudaFree(*buf); *buf = NULL; *cap = 0; }
     if (cudaMalloc(&p, need) != cudaSuccess) {
         (void)cudaGetLastError();
-        fprintf(stderr, "ds4: MXFP8 activation cache alloc failed for %s (%.2f MiB)\n",
+        fprintf(stderr, "pulsar: MXFP8 activation cache alloc failed for %s (%.2f MiB)\n",
                 what ? what : "act", (double)need / 1048576.0);
         return 0;
     }
@@ -752,8 +752,8 @@ static int mxfp8_act_cache_reserve(void **buf, size_t *cap, size_t need, const c
 }
 
 
-static int cuda_matmul_fp8_mx_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
-        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x,
+static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x,
         uint64_t n_tok, const char *label) {
     if (!out || !x || !model_map || in_dim % 32 != 0 || !cublaslt_ensure()) return 0;
     uint64_t KB = in_dim / 32, weight_bytes = out_dim * KB * 33;
@@ -881,14 +881,14 @@ static int cuda_matmul_fp8_mx_tensor_labeled(ds4_gpu_tensor *out, const void *mo
                                            out->ptr, e->ld, out->ptr, e->ld, &e->h.algo, ws, wz,
                                            cudaStreamPerThread);
         ok = (st == CUBLAS_STATUS_SUCCESS);
-        if (!ok) fprintf(stderr, "ds4: cuBLASLt MXFP8 matmul failed: status %d\n", (int)st);
+        if (!ok) fprintf(stderr, "pulsar: cuBLASLt MXFP8 matmul failed: status %d\n", (int)st);
     }
     return ok;
 }
 
 
-int ds4_gpu_matmul_fp8_mx_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
-        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+int pulsar_gpu_matmul_fp8_mx_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok) {
     return cuda_matmul_fp8_mx_tensor_labeled(out, model_map, model_size, weight_offset,
                                              in_dim, out_dim, x, n_tok, "fp8_mx");
 }
@@ -906,14 +906,14 @@ int ds4_gpu_matmul_fp8_mx_tensor(ds4_gpu_tensor *out, const void *model_map, uin
  * the n_groups (8/16) GEMMs writes straight into low[tok][g*rank + r] via ldd,
  * so no epilogue pass is needed. */
 static int cuda_attention_output_a_mx_gemm(
-        ds4_gpu_tensor *low,
+        pulsar_gpu_tensor *low,
         const void *model_map,
         uint64_t model_size,
         uint64_t out_a_offset,
         uint64_t group_dim,
         uint64_t rank,
         uint32_t n_groups,
-        const ds4_gpu_tensor *heads,
+        const pulsar_gpu_tensor *heads,
         uint32_t n_tokens) {
     if (group_dim % 32 != 0 || rank % 128 != 0 || !cublaslt_ensure()) return 0;
     const uint64_t low_dim = (uint64_t)n_groups * rank;
@@ -1019,7 +1019,7 @@ static int cuda_attention_output_a_mx_gemm(
                                                dg, ld, dg, ld, &h.algo, ws, wz,
                                                cudaStreamPerThread);
             ok = (st == CUBLAS_STATUS_SUCCESS);
-            if (!ok) fprintf(stderr, "ds4: cuBLASLt attn_out_a MXFP8 matmul failed: status %d\n", (int)st);
+            if (!ok) fprintf(stderr, "pulsar: cuBLASLt attn_out_a MXFP8 matmul failed: status %d\n", (int)st);
         }
     }
     return ok;
@@ -1162,14 +1162,14 @@ __global__ static void mxfp8_mmvq_deint_nt_kernel(float *out, const __nv_fp8_e4m
 std::unordered_set<uint64_t> g_fp8_offsets;
 
 
-void ds4_gpu_register_fp8_weight(uint64_t weight_offset) { g_fp8_offsets.insert(weight_offset); }
+void pulsar_gpu_register_fp8_weight(uint64_t weight_offset) { g_fp8_offsets.insert(weight_offset); }
 
 
-void ds4_gpu_register_fp8_lt_weight(uint64_t weight_offset) { g_mxfp8_lt_offsets.insert(weight_offset); }
+void pulsar_gpu_register_fp8_lt_weight(uint64_t weight_offset) { g_mxfp8_lt_offsets.insert(weight_offset); }
 
 
 /* Drop every process-global fp8 weight-cache entry. MUST run at backend
- * cleanup (ds4_gpu_cleanup): pre-stored MXFP8_LT entries point straight into
+ * cleanup (pulsar_gpu_cleanup): pre-stored MXFP8_LT entries point straight into
  * the per-engine model arena that cleanup frees, and a subsequent engine open
  * in the same process typically mmaps the model at the SAME base address --
  * the cache's (host_base, offset, dims) guard then false-positives and serves
@@ -1195,7 +1195,7 @@ void cuda_fp8_weight_cache_clear(void) {
 
 /* plan-34 phase-2 inc 2 — cuBLASLt ALGO-STABILITY. When armed (a batched
  * multiseq/mixed step), force the M-INDEPENDENT custom per-token GEMV kernels for
- * the whole batched row range [2..DS4_MSEQ_MAX=8] instead of switching to a
+ * the whole batched row range [2..PULSAR_MSEQ_MAX=8] instead of switching to a
  * cuBLAS(Lt) tensor-core GEMM at n_tok>=5. cuBLAS(Lt) resolves an M-dependent
  * (ntok-keyed heuristic) algo, so a co-scheduled decode bank's logits would shift
  * with the batch width (measured: M=5/8 differ from M=2). The custom deint_nt /
@@ -1217,14 +1217,14 @@ void cuda_fp8_weight_cache_clear(void) {
  * emits, and the prefill suffix is the same tensor-core GEMM a pure-prefill step
  * emits at that width. No kernel logic is duplicated. */
 static int g_mneutral_rows = 0;
-void ds4_gpu_matmul_set_batch_mneutral(int n) { g_mneutral_rows = (n > 0) ? n : 0; }
-/* Queried cross-TU by the MoE dispatch (ds4_cuda_moe.cu): the number of leading
+void pulsar_gpu_matmul_set_batch_mneutral(int n) { g_mneutral_rows = (n > 0) ? n : 0; }
+/* Queried cross-TU by the MoE dispatch (pulsar_cuda_moe.cu): the number of leading
  * decode rows that must take the M-independent per-token expert path (the trailing
  * prefill rows take the grouped GEMM). 0 = not armed. Nonzero = armed (inc-2/3
  * read it as a boolean; inc-4 MoE two-pass reads the count to place the split). */
-int ds4_gpu_matmul_batch_mneutral(void) { return g_mneutral_rows; }
+int pulsar_gpu_matmul_batch_mneutral(void) { return g_mneutral_rows; }
 
-static int cuda_matmul_mxfp8_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
+static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok, const char *label) {
     if (!out || !x || !model_map) return 0;
     /* inc 4 prefix-split: 0<n_dec<n_tok => mixed decode+prefill batch. Run the
      * decode prefix [0,n_dec) in the M-independent (decode) regime and the prefill
@@ -1234,11 +1234,11 @@ static int cuda_matmul_mxfp8_tensor_labeled(ds4_gpu_tensor *out, const void *mod
         const uint64_t n_dec = (uint64_t)g_mneutral_rows;
         if (n_dec > 0 && n_dec < n_tok) {
             const uint64_t inb = in_dim * sizeof(float), outb = out_dim * sizeof(float);
-            ds4_gpu_tensor out_pre = { out->ptr, out->bytes, 0 };
-            ds4_gpu_tensor x_pre   = { x->ptr,   x->bytes,   0 };
-            ds4_gpu_tensor out_suf = { (char *)out->ptr + n_dec * outb,
+            pulsar_gpu_tensor out_pre = { out->ptr, out->bytes, 0 };
+            pulsar_gpu_tensor x_pre   = { x->ptr,   x->bytes,   0 };
+            pulsar_gpu_tensor out_suf = { (char *)out->ptr + n_dec * outb,
                                        out->bytes - n_dec * outb, 0 };
-            ds4_gpu_tensor x_suf   = { (char *)x->ptr + n_dec * inb,
+            pulsar_gpu_tensor x_suf   = { (char *)x->ptr + n_dec * inb,
                                        x->bytes - n_dec * inb, 0 };
             const int saved = g_mneutral_rows;
             g_mneutral_rows = (int)n_dec;   /* decode prefix: n_dec == n_tok' => all custom */
@@ -1262,7 +1262,7 @@ static int cuda_matmul_mxfp8_tensor_labeled(ds4_gpu_tensor *out, const void *mod
          * tensor-core tile path which is latency-bound at these shapes (the
          * measured "CUTLASS launch storm" that made verify(3) cost ~2x a decode
          * token). Bit-identical per token to the n=1 deint mmvq, so verify logits
-         * match the decode path's numerics. DS4_FP8_GEMV_MAX_N=1 restores the
+         * match the decode path's numerics. PULSAR_FP8_GEMV_MAX_N=1 restores the
          * tensor-core dispatch for all n_tok>1. */
         /* 2026-07-21: raising this default 4 -> 8 was TRIED and REVERTED. The
          * "bit-identical" claim above is GEMV-n vs GEMV-1 -- it does NOT extend to
@@ -1275,11 +1275,11 @@ static int cuda_matmul_mxfp8_tensor_labeled(ds4_gpu_tensor *out, const void *mod
          * prefill byte-exact gate pins chunk 4096 with depths 512/2048/4096/6144
          * and never lands a 5..8 remainder, so it does NOT cover this. Keep 4.
          * The width-6 verify win is real but belongs entirely to moe_gemv_cap
-         * (see ds4_cuda_moe.cu) -- these three caps cost ~28 ms/verify on top. */
+         * (see pulsar_cuda_moe.cu) -- these three caps cost ~28 ms/verify on top. */
         static const int gemv_max_n = []{ const char *e = getenv("DS4_FP8_GEMV_MAX_N");
                 return e ? atoi(e) : 4; }();
         static const int nt_fp8_raw = getenv("DS4_FP8_MMVQ_RAW") != NULL;
-        /* inc 2: raise the custom-nt cap to DS4_MSEQ_MAX (8) for a batched step so
+        /* inc 2: raise the custom-nt cap to PULSAR_MSEQ_MAX (8) for a batched step so
          * n_tok 5..8 keep the M-independent kernel instead of cuBLASLt. Default cap
          * (gemv_max_n=4) is unchanged for classic prefill (never armed) and for the
          * decode-only lane (n_tok<=4), which take the identical cases 2/3/4 below. */
@@ -1292,24 +1292,24 @@ static int cuda_matmul_mxfp8_tensor_labeled(ds4_gpu_tensor *out, const void *mod
                 const int KBp = mx_rup((int)(in_dim / 32), 4);
                 const unsigned wpb = 8;
                 dim3 grid(((unsigned)out_dim + wpb - 1) / wpb);
-                #define DS4_FP8_NT(N) mxfp8_mmvq_deint_nt_kernel<N><<<grid, wpb * 32>>>( \
+                #define PULSAR_FP8_NT(N) mxfp8_mmvq_deint_nt_kernel<N><<<grid, wpb * 32>>>( \
                         (float *)out->ptr, bw->data, bw->scale, (const float *)x->ptr, \
                         (int)in_dim, (int)out_dim, KBp)
                 switch (n_tok) {
-                case 2: DS4_FP8_NT(2); break;
-                case 3: DS4_FP8_NT(3); break;
-                case 4: DS4_FP8_NT(4); break;
-                case 5: DS4_FP8_NT(5); break;
-                case 6: DS4_FP8_NT(6); break;
-                case 7: DS4_FP8_NT(7); break;
-                default: DS4_FP8_NT(8); break;   /* n_tok == 8 */
+                case 2: PULSAR_FP8_NT(2); break;
+                case 3: PULSAR_FP8_NT(3); break;
+                case 4: PULSAR_FP8_NT(4); break;
+                case 5: PULSAR_FP8_NT(5); break;
+                case 6: PULSAR_FP8_NT(6); break;
+                case 7: PULSAR_FP8_NT(7); break;
+                default: PULSAR_FP8_NT(8); break;   /* n_tok == 8 */
                 }
-                #undef DS4_FP8_NT
+                #undef PULSAR_FP8_NT
                 return cuda_ok(cudaGetLastError(), "fp8_mx mmvq deint nt");
             }
         }
         /* Prefill (n_tok>1) uses the cuBLASLt MX tensor-core GEMM; decode falls
-         * through to the per-token mmvq kernel below. DS4_FP8_NO_MXCORE forces
+         * through to the per-token mmvq kernel below. PULSAR_FP8_NO_MXCORE forces
          * the mmvq path everywhere as an operational fallback. */
         if (n_tok > 1 && getenv("DS4_FP8_NO_MXCORE") == NULL &&
                 cuda_matmul_fp8_mx_tensor_labeled(out, model_map, model_size,
@@ -1319,7 +1319,7 @@ static int cuda_matmul_mxfp8_tensor_labeled(ds4_gpu_tensor *out, const void *mod
         /* Prefer the de-interleaved cached weight (contiguous E4M3 -> coalesced 128-wide
          * loads, vs the raw 33B-interleaved kernel's misaligned 1-byte/thread reads).
          * Bit-exact vs the raw kernel (verified: rel 0 across all workhorse shapes);
-         * ~+8% decode. DS4_FP8_MMVQ_RAW forces the raw path as an operational fallback. */
+         * ~+8% decode. PULSAR_FP8_MMVQ_RAW forces the raw path as an operational fallback. */
         static const int fp8_mmvq_raw = getenv("DS4_FP8_MMVQ_RAW") != NULL;
         const fp8_mx_weight *w = (in_dim % 128 == 0 && !fp8_mmvq_raw)
                 ? cuda_fp8_mx_weight(model_map, weight_offset, fbytes, in_dim, out_dim, label)
@@ -1336,10 +1336,10 @@ static int cuda_matmul_mxfp8_tensor_labeled(ds4_gpu_tensor *out, const void *mod
          * MXFP8_LT weight is already de-interleaved, so it must NEVER reach this
          * path — fail closed (rather than run the deint path's `w == NULL`
          * fallthrough on LT bytes, which would be garbage). This also means
-         * DS4_FP8_MMVQ_RAW (which forces w == NULL above) is incompatible with an
+         * PULSAR_FP8_MMVQ_RAW (which forces w == NULL above) is incompatible with an
          * MXFP8_LT gguf. */
         if (g_mxfp8_lt_offsets.count(weight_offset)) {
-            fprintf(stderr, "ds4: MXFP8_LT weight at offset %llu cannot use the raw "
+            fprintf(stderr, "pulsar: MXFP8_LT weight at offset %llu cannot use the raw "
                     "interleaved mmvq path (DS4_FP8_MMVQ_RAW must not be set with a "
                     "pre-stored MXFP8_LT gguf)\n", (unsigned long long)weight_offset);
             return 0;
@@ -1354,7 +1354,7 @@ static int cuda_matmul_mxfp8_tensor_labeled(ds4_gpu_tensor *out, const void *mod
         return cuda_ok(cudaGetLastError(), "fp8_mx mmvq");
     }
     fprintf(stderr,
-            "ds4: matmul %s at offset %llu is not a registered MXFP8 weight "
+            "pulsar: matmul %s at offset %llu is not a registered MXFP8 weight "
             "(legacy q8_0 weights are no longer supported)\n",
             label ? label : "mxfp8",
             (unsigned long long)weight_offset);
@@ -1363,16 +1363,16 @@ static int cuda_matmul_mxfp8_tensor_labeled(ds4_gpu_tensor *out, const void *mod
 
 
 
-int ds4_gpu_matmul_mxfp8_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+int pulsar_gpu_matmul_mxfp8_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok) {
     return cuda_matmul_mxfp8_tensor_labeled(out, model_map, model_size, weight_offset,
                                            in_dim, out_dim, x, n_tok, "mxfp8");
 }
 
 
 
-int ds4_gpu_matmul_mxfp8_pair_tensor(
-        ds4_gpu_tensor *out0,
-        ds4_gpu_tensor *out1,
+int pulsar_gpu_matmul_mxfp8_pair_tensor(
+        pulsar_gpu_tensor *out0,
+        pulsar_gpu_tensor *out1,
         const void *model_map,
         uint64_t model_size,
         uint64_t weight0_offset,
@@ -1380,7 +1380,7 @@ int ds4_gpu_matmul_mxfp8_pair_tensor(
         uint64_t in_dim,
         uint64_t out0_dim,
         uint64_t out1_dim,
-        const ds4_gpu_tensor *x,
+        const pulsar_gpu_tensor *x,
         uint64_t n_tok) {
     if (!out0 || !out1 || !x || !model_map || in_dim == 0 || out0_dim == 0 || out1_dim == 0 || n_tok == 0) {
         return 0;
@@ -1429,17 +1429,17 @@ int ds4_gpu_matmul_mxfp8_pair_tensor(
 
 
 int cuda_matmul_fp8_hc_expand_tensor_labeled(
-        ds4_gpu_tensor       *out_hc,
-        ds4_gpu_tensor       *block_out,
+        pulsar_gpu_tensor       *out_hc,
+        pulsar_gpu_tensor       *block_out,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        const ds4_gpu_tensor *block_add,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *split,
+        const pulsar_gpu_tensor *x,
+        const pulsar_gpu_tensor *block_add,
+        const pulsar_gpu_tensor *residual_hc,
+        const pulsar_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc,
         const char             *label) {
@@ -1453,7 +1453,7 @@ int cuda_matmul_fp8_hc_expand_tensor_labeled(
     const uint64_t blocks = (in_dim + 31) / 32;
     if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * wstride)) return 0;
     const uint64_t weight_bytes = out_dim * blocks * wstride;
-    const uint64_t hc_bytes = (uint64_t)n_hc * n_embd * DS4_HC_ELT_SIZE;   /* residual_hc + out_hc are carriers */
+    const uint64_t hc_bytes = (uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE;   /* residual_hc + out_hc are carriers */
     const uint64_t split_bytes = (uint64_t)(2u * n_hc + n_hc * n_hc) * sizeof(float);
     if (weight_bytes > model_size - weight_offset ||
         x->bytes < in_dim * sizeof(float) ||
@@ -1468,7 +1468,7 @@ int cuda_matmul_fp8_hc_expand_tensor_labeled(
     if (!wptr) return 0;
 
     /* Decode uses the de-interleaved cached weight (coalesced vectorized loads); raw
-     * 33B path retained as DS4_FP8_MMVQ_RAW fallback. Same weight buffers as mmvq. */
+     * 33B path retained as PULSAR_FP8_MMVQ_RAW fallback. Same weight buffers as mmvq. */
     static const int fp8_raw = getenv("DS4_FP8_MMVQ_RAW") != NULL;
     const fp8_mx_weight *dw = (in_dim % 32 == 0 && !fp8_raw)
             ? cuda_fp8_mx_weight(model_map, weight_offset, weight_bytes, in_dim, out_dim,
@@ -1479,14 +1479,14 @@ int cuda_matmul_fp8_hc_expand_tensor_labeled(
     const float *ba = block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr;
     if (dw) {
         matmul_fp8mx_hc_expand_warp8_kernel<true><<<hg, 256>>>(
-                (ds4_hc_t *)out_hc->ptr, (float *)block_out->ptr, ba,
-                (const ds4_hc_t *)residual_hc->ptr, (const float *)split->ptr,
+                (pulsar_hc_t *)out_hc->ptr, (float *)block_out->ptr, ba,
+                (const pulsar_hc_t *)residual_hc->ptr, (const float *)split->ptr,
                 (const unsigned char *)wptr, dw->data, dw->scale, KBp, (const float *)x->ptr,
                 in_dim, out_dim, n_embd, n_hc, blocks, block_add ? 1 : 0);
     } else {
         matmul_fp8mx_hc_expand_warp8_kernel<false><<<hg, 256>>>(
-                (ds4_hc_t *)out_hc->ptr, (float *)block_out->ptr, ba,
-                (const ds4_hc_t *)residual_hc->ptr, (const float *)split->ptr,
+                (pulsar_hc_t *)out_hc->ptr, (float *)block_out->ptr, ba,
+                (const pulsar_hc_t *)residual_hc->ptr, (const float *)split->ptr,
                 (const unsigned char *)wptr, (const __nv_fp8_e4m3 *)NULL, (const unsigned char *)NULL, 0,
                 (const float *)x->ptr, in_dim, out_dim, n_embd, n_hc, blocks, block_add ? 1 : 0);
     }
@@ -1495,7 +1495,7 @@ int cuda_matmul_fp8_hc_expand_tensor_labeled(
 
 
 
-int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+int pulsar_gpu_matmul_f16_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map) return 0;
     /* inc 4 prefix-split (see the mxfp8 twin): decode prefix [0,n_dec) custom-nt,
      * prefill suffix [n_dec,n_tok) cuBLAS tensor-core, via pure-regime recursion. */
@@ -1503,18 +1503,18 @@ int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64
         const uint64_t n_dec = (uint64_t)g_mneutral_rows;
         if (n_dec > 0 && n_dec < n_tok) {
             const uint64_t inb = in_dim * sizeof(float), outb = out_dim * sizeof(float);
-            ds4_gpu_tensor out_pre = { out->ptr, out->bytes, 0 };
-            ds4_gpu_tensor x_pre   = { x->ptr,   x->bytes,   0 };
-            ds4_gpu_tensor out_suf = { (char *)out->ptr + n_dec * outb,
+            pulsar_gpu_tensor out_pre = { out->ptr, out->bytes, 0 };
+            pulsar_gpu_tensor x_pre   = { x->ptr,   x->bytes,   0 };
+            pulsar_gpu_tensor out_suf = { (char *)out->ptr + n_dec * outb,
                                        out->bytes - n_dec * outb, 0 };
-            ds4_gpu_tensor x_suf   = { (char *)x->ptr + n_dec * inb,
+            pulsar_gpu_tensor x_suf   = { (char *)x->ptr + n_dec * inb,
                                        x->bytes - n_dec * inb, 0 };
             const int saved = g_mneutral_rows;
             g_mneutral_rows = (int)n_dec;
-            int r1 = ds4_gpu_matmul_f16_tensor(&out_pre, model_map, model_size,
+            int r1 = pulsar_gpu_matmul_f16_tensor(&out_pre, model_map, model_size,
                     weight_offset, in_dim, out_dim, &x_pre, n_dec);
             g_mneutral_rows = 0;
-            int r2 = ds4_gpu_matmul_f16_tensor(&out_suf, model_map, model_size,
+            int r2 = pulsar_gpu_matmul_f16_tensor(&out_suf, model_map, model_size,
                     weight_offset, in_dim, out_dim, &x_suf, n_tok - n_dec);
             g_mneutral_rows = saved;
             return r1 && r2;
@@ -1531,7 +1531,7 @@ int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64
     /* Small batches (spec-decode verify, n_tok 2..4): batched f16 GEMV. One
      * weight-row read serves all tokens and there is no f32->f16 activation
      * convert or tmp alloc; per-token output is bit-identical to the n=1
-     * matmul_f16_kernel. DS4_F16_GEMV_MAX_N=1 restores the cuBLAS dispatch. */
+     * matmul_f16_kernel. PULSAR_F16_GEMV_MAX_N=1 restores the cuBLAS dispatch. */
     /* 2026-07-21: raising to 8 was TRIED and REVERTED, same as the mxfp8 twin
      * above. This one is the clearest case: the cuBLAS side converts activations
      * to __half for cublasGemmEx while the GEMV stays f32, so the two dispatches
@@ -1543,18 +1543,18 @@ int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64
     const uint64_t f16_nt_cap = (g_mneutral_rows > 0) ? 8u : (uint64_t)f16_gemv_max_n;
     if (n_tok >= 2 && n_tok <= f16_nt_cap && n_tok <= 8) {
         dim3 g((unsigned)out_dim);
-        #define DS4_F16_NT(N) matmul_f16_nt_kernel<N><<<g, 256>>>( \
+        #define PULSAR_F16_NT(N) matmul_f16_nt_kernel<N><<<g, 256>>>( \
                 (float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim)
         switch (n_tok) {
-        case 2: DS4_F16_NT(2); break;
-        case 3: DS4_F16_NT(3); break;
-        case 4: DS4_F16_NT(4); break;
-        case 5: DS4_F16_NT(5); break;
-        case 6: DS4_F16_NT(6); break;
-        case 7: DS4_F16_NT(7); break;
-        default: DS4_F16_NT(8); break;   /* n_tok == 8 */
+        case 2: PULSAR_F16_NT(2); break;
+        case 3: PULSAR_F16_NT(3); break;
+        case 4: PULSAR_F16_NT(4); break;
+        case 5: PULSAR_F16_NT(5); break;
+        case 6: PULSAR_F16_NT(6); break;
+        case 7: PULSAR_F16_NT(7); break;
+        default: PULSAR_F16_NT(8); break;   /* n_tok == 8 */
         }
-        #undef DS4_F16_NT
+        #undef PULSAR_F16_NT
         return cuda_ok(cudaGetLastError(), "matmul_f16 nt launch");
     }
     if (g_cublas_ready && n_tok > 1) {
@@ -1609,7 +1609,7 @@ int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64
 
 
 
-int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map) return 0;
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
     const uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
@@ -1645,30 +1645,30 @@ int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model_map, uint6
 
 
 
-int ds4_gpu_matmul_f16_pair_tensor(
-        ds4_gpu_tensor *out0,
-        ds4_gpu_tensor *out1,
+int pulsar_gpu_matmul_f16_pair_tensor(
+        pulsar_gpu_tensor *out0,
+        pulsar_gpu_tensor *out1,
         const void *model_map,
         uint64_t model_size,
         uint64_t weight0_offset,
         uint64_t weight1_offset,
         uint64_t in_dim,
         uint64_t out_dim,
-        const ds4_gpu_tensor *x,
+        const pulsar_gpu_tensor *x,
         uint64_t n_tok) {
     if (!out0 || !out1 || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) {
         return 0;
     }
     /* Two separate coalesced matmuls (each fast via matmul_f16_kernel). */
-    return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
+    return pulsar_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
                                        in_dim, out_dim, x, n_tok) &&
-           ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
+           pulsar_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
                                        in_dim, out_dim, x, n_tok);
 }
 
 
 
-int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+int pulsar_gpu_matmul_f32_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
     uint64_t weight_elems = out_dim * in_dim;
@@ -1707,7 +1707,7 @@ int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64
 
 
 /* Decode grouped "a" projection: prefer the de-interleaved cached weight (vectorized
- * coalesced loads) over the raw 33B kernel. Bit-exact; DS4_FP8_MMVQ_RAW forces raw. */
+ * coalesced loads) over the raw 33B kernel. Bit-exact; PULSAR_FP8_MMVQ_RAW forces raw. */
 static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t out_a_offset,
         uint64_t out_a_bytes, const unsigned char *out_a, uint64_t group_dim, uint64_t rank,
         uint32_t n_groups, uint32_t n_tokens, uint64_t blocks_a, uint64_t low_dim,
@@ -1720,7 +1720,7 @@ static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t ou
     /* Small verify batches: one nt launch, weight blocks L1-shared across tokens;
      * per-token bit-identical to the n=1 DEINT kernel below. */
     if (dw && n_tokens >= 2u && n_tokens <= 4u &&
-        rank % DS4_FP8MX_ROWS == 0 && low_dim % DS4_FP8MX_ROWS == 0) {
+        rank % PULSAR_FP8MX_ROWS == 0 && low_dim % PULSAR_FP8MX_ROWS == 0) {
         const dim3 g(((unsigned)low_dim + 31u) / 32u);
         switch (n_tokens) {
         case 2: grouped_fp8mx_a_nt_kernel<2><<<g, 256>>>(low, dw->data, dw->scale, KBp,
@@ -1744,9 +1744,9 @@ static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t ou
 }
 
 
-int ds4_gpu_attention_output_batch_tensor(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *low,
+int pulsar_gpu_attention_output_batch_tensor(
+        pulsar_gpu_tensor       *out,
+        pulsar_gpu_tensor       *low,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                out_a_offset,
@@ -1755,7 +1755,7 @@ int ds4_gpu_attention_output_batch_tensor(
         uint64_t                rank,
         uint32_t                n_groups,
         uint64_t                out_dim,
-        const ds4_gpu_tensor *heads,
+        const pulsar_gpu_tensor *heads,
         uint32_t                n_tokens) {
     if (!out || !low || !heads || !model_map ||
         group_dim == 0 || rank == 0 || n_groups == 0 || out_dim == 0 || n_tokens == 0) {
@@ -1773,19 +1773,19 @@ int ds4_gpu_attention_output_batch_tensor(
             const uint64_t headb = (uint64_t)n_groups * group_dim * sizeof(float);
             const uint64_t lowb  = low_dim * sizeof(float);
             const uint64_t outb  = out_dim * sizeof(float);
-            ds4_gpu_tensor out_pre = { out->ptr, out->bytes, 0 };
-            ds4_gpu_tensor low_pre = { low->ptr, low->bytes, 0 };
-            ds4_gpu_tensor hd_pre  = { heads->ptr, heads->bytes, 0 };
-            ds4_gpu_tensor out_suf = { (char *)out->ptr + n_dec * outb, out->bytes - n_dec * outb, 0 };
-            ds4_gpu_tensor low_suf = { (char *)low->ptr + n_dec * lowb, low->bytes - n_dec * lowb, 0 };
-            ds4_gpu_tensor hd_suf  = { (char *)heads->ptr + n_dec * headb, heads->bytes - n_dec * headb, 0 };
+            pulsar_gpu_tensor out_pre = { out->ptr, out->bytes, 0 };
+            pulsar_gpu_tensor low_pre = { low->ptr, low->bytes, 0 };
+            pulsar_gpu_tensor hd_pre  = { heads->ptr, heads->bytes, 0 };
+            pulsar_gpu_tensor out_suf = { (char *)out->ptr + n_dec * outb, out->bytes - n_dec * outb, 0 };
+            pulsar_gpu_tensor low_suf = { (char *)low->ptr + n_dec * lowb, low->bytes - n_dec * lowb, 0 };
+            pulsar_gpu_tensor hd_suf  = { (char *)heads->ptr + n_dec * headb, heads->bytes - n_dec * headb, 0 };
             const int saved = g_mneutral_rows;
             g_mneutral_rows = (int)n_dec;
-            int r1 = ds4_gpu_attention_output_batch_tensor(&out_pre, &low_pre, model_map,
+            int r1 = pulsar_gpu_attention_output_batch_tensor(&out_pre, &low_pre, model_map,
                     model_size, out_a_offset, out_b_offset, group_dim, rank, n_groups,
                     out_dim, &hd_pre, (uint32_t)n_dec);
             g_mneutral_rows = 0;
-            int r2 = ds4_gpu_attention_output_batch_tensor(&out_suf, &low_suf, model_map,
+            int r2 = pulsar_gpu_attention_output_batch_tensor(&out_suf, &low_suf, model_map,
                     model_size, out_a_offset, out_b_offset, group_dim, rank, n_groups,
                     out_dim, &hd_suf, n_tokens - (uint32_t)n_dec);
             g_mneutral_rows = saved;
@@ -1811,10 +1811,10 @@ int ds4_gpu_attention_output_batch_tensor(
      * GEMMs; decode and small verify batches (n_tokens<=4) take the
      * register-blocked GEMV path (launch_grouped_fp8mx_a dispatches the nt
      * variant at 2..4 -- one launch vs 8 per-group GEMMs, bit-identical per
-     * token to decode's kernel). DS4_FP8_GEMV_MAX_N=1 restores the tensor-core
+     * token to decode's kernel). PULSAR_FP8_GEMV_MAX_N=1 restores the tensor-core
      * dispatch for all n_tokens>1, same as the dense-matmul gate. */
     /* 2026-07-21: raising to 8 was TRIED and REVERTED (see the dense-matmul gate
-     * for the measurement). Shares DS4_FP8_GEMV_MAX_N with that gate, so the two
+     * for the measurement). Shares PULSAR_FP8_GEMV_MAX_N with that gate, so the two
      * defaults must move together. */
     static const int a_gemv_max_n = []{ const char *e = getenv("DS4_FP8_GEMV_MAX_N");
             return e ? atoi(e) : 4; }();
@@ -1851,15 +1851,15 @@ int ds4_gpu_attention_output_batch_tensor(
 
 
 
-int ds4_gpu_attention_output_low_tensor(
-        ds4_gpu_tensor       *low,
+int pulsar_gpu_attention_output_low_tensor(
+        pulsar_gpu_tensor       *low,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                out_a_offset,
         uint64_t                group_dim,
         uint64_t                rank,
         uint32_t                n_groups,
-        const ds4_gpu_tensor *heads) {
+        const pulsar_gpu_tensor *heads) {
     if (!low || !heads || !model_map || group_dim == 0 || rank == 0 || n_groups == 0) {
         return 0;
     }

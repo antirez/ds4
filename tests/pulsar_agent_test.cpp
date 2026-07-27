@@ -1,5 +1,5 @@
-#define DS4_AGENT_TEST
-#define DS4_AGENT_TEST_NO_MAIN
+#define PULSAR_AGENT_TEST
+#define PULSAR_AGENT_TEST_NO_MAIN
 #include "../src/agent/config_types.cpp"
 #include "../src/agent/util_cli.cpp"
 #include "../src/agent/prompt_queue.cpp"
@@ -21,12 +21,12 @@
 #include "../src/agent/runtime.cpp"
 
 int main(void) {
-    ds4_agent_unit_tests_run();
+    pulsar_agent_unit_tests_run();
     if (agent_test_failures) {
-        fprintf(stderr, "ds4-agent tests: %d failure(s)\n",
+        fprintf(stderr, "pulsar-agent tests: %d failure(s)\n",
                 agent_test_failures);
         return 1;
     }
-    puts("ds4-agent tests: ok");
+    puts("pulsar-agent tests: ok");
     return 0;
 }

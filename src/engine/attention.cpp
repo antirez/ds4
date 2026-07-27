@@ -1,21 +1,21 @@
-#include "ds4_engine_internal.h"
+#include "pulsar_engine_internal.h"
 
 
 
 void layer_q_projection_with_lora_one(
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
+        const pulsar_model   * model,
+        const pulsar_layer_weights * layer,
         const float       * norm,
         float             * q,
         float             * qr_norm) {
-    const uint32_t q_rank = DS4_N_LORA_Q;
+    const uint32_t q_rank = PULSAR_N_LORA_Q;
     float *qr = (float *)xmalloc((size_t)q_rank * sizeof(qr[0]));
     const float *q_a_norm = (const float *)tensor_data(model, layer->attn_q_a_norm);
 
     matvec_q8_0(qr, model, layer->attn_q_a, norm);
-    rms_norm_weight(qr_norm, qr, q_a_norm, q_rank, DS4_RMS_EPS);
+    rms_norm_weight(qr_norm, qr, q_a_norm, q_rank, PULSAR_RMS_EPS);
     matvec_q8_0(q, model, layer->attn_q_b, qr_norm);
-    head_rms_norm_inplace(q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS);
+    head_rms_norm_inplace(q, PULSAR_N_HEAD, PULSAR_N_HEAD_DIM, PULSAR_RMS_EPS);
 
     free(qr);
 }
@@ -24,16 +24,16 @@ void layer_q_projection_with_lora_one(
 
 /* KV projection has one KV head of width 512, followed by a learned RMSNorm. */
 void layer_kv_projection_normed_one(
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
+        const pulsar_model   * model,
+        const pulsar_layer_weights * layer,
         const float       * normed,
         float             * kv) {
-    float *raw = (float *)xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(raw[0]));
+    float *raw = (float *)xmalloc((size_t)PULSAR_N_HEAD_DIM * sizeof(raw[0]));
 
     const float *kv_norm = (const float *)tensor_data(model, layer->attn_kv_a_norm);
 
     matvec_q8_0(raw, model, layer->attn_kv, normed);
-    rms_norm_weight(kv, raw, kv_norm, DS4_N_HEAD_DIM, DS4_RMS_EPS);
+    rms_norm_weight(kv, raw, kv_norm, PULSAR_N_HEAD_DIM, PULSAR_RMS_EPS);
 
     free(raw);
 }
@@ -125,18 +125,18 @@ static void rope_tail_ext_inplace(
 
 /* Dense layers and compressed layers use different RoPE bases. */
 float layer_rope_freq_base(uint32_t il) {
-    return ds4_layer_compress_ratio(il) != 0 && DS4_COMPRESS_ROPE_FREQ_BASE > 0.0f
-        ? DS4_COMPRESS_ROPE_FREQ_BASE
-        : DS4_ROPE_FREQ_BASE;
+    return pulsar_layer_compress_ratio(il) != 0 && PULSAR_COMPRESS_ROPE_FREQ_BASE > 0.0f
+        ? PULSAR_COMPRESS_ROPE_FREQ_BASE
+        : PULSAR_ROPE_FREQ_BASE;
 }
 
 
 
 float layer_rope_freq_scale(uint32_t il) {
-    if (ds4_layer_compress_ratio(il) == 0 || DS4_ROPE_SCALE_FACTOR <= 0.0f) {
+    if (pulsar_layer_compress_ratio(il) == 0 || PULSAR_ROPE_SCALE_FACTOR <= 0.0f) {
         return 1.0f;
     }
-    return 1.0f / DS4_ROPE_SCALE_FACTOR;
+    return 1.0f / PULSAR_ROPE_SCALE_FACTOR;
 }
 
 
@@ -149,10 +149,10 @@ void rope_tail_layer_inplace(
         uint32_t           pos,
         uint32_t           il,
         bool               inverse) {
-    const bool compressed = ds4_layer_compress_ratio(il) != 0;
+    const bool compressed = pulsar_layer_compress_ratio(il) != 0;
     const float freq_base = layer_rope_freq_base(il);
     const float freq_scale = layer_rope_freq_scale(il);
-    const float ext_factor = compressed && DS4_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
+    const float ext_factor = compressed && PULSAR_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
     float attn_factor = 1.0f;
     if (ext_factor != 0.0f && freq_scale > 0.0f) {
         /*
@@ -164,13 +164,13 @@ void rope_tail_layer_inplace(
     }
 
     rope_tail_ext_inplace(x, n_head, head_dim, n_rot, pos,
-                          compressed ? DS4_ROPE_ORIG_CTX : 0,
+                          compressed ? PULSAR_ROPE_ORIG_CTX : 0,
                           freq_base,
                           freq_scale,
                           ext_factor,
                           attn_factor,
-                          DS4_ROPE_YARN_BETA_FAST,
-                          DS4_ROPE_YARN_BETA_SLOW,
+                          PULSAR_ROPE_YARN_BETA_FAST,
+                          PULSAR_ROPE_YARN_BETA_SLOW,
                           inverse);
 }
 
@@ -211,7 +211,7 @@ void rope_tail_layer_batch_inplace(
         .il = il,
         .inverse = inverse,
     };
-    ds4_parallel_for_min_rows(n_tok, rope_tail_batch_worker, &ctx, 1);
+    pulsar_parallel_for_min_rows(n_tok, rope_tail_batch_worker, &ctx, 1);
 }
 
 
@@ -232,39 +232,39 @@ float sigmoid_stable(float x) {
  * of the softmax denominator but contributes no value vector. */
 void layer_attention_rows_one(
         float             * out_heads,
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
+        const pulsar_model   * model,
+        const pulsar_layer_weights * layer,
         const float       * q,
         const float       * kv_rows,
         uint32_t            n_kv) {
     const float *sinks = (const float *)tensor_data(model, layer->attn_sinks);
-    const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
+    const float kq_scale = 1.0f / sqrtf((float)PULSAR_N_HEAD_DIM);
     float score_stack[512];
     float *score = n_kv <= 512 ? score_stack : (float *)xmalloc((size_t)n_kv * sizeof(score[0]));
 
-    for (uint32_t h = 0; h < DS4_N_HEAD; h++) {
-        const float *qh = q + (uint64_t)h * DS4_N_HEAD_DIM;
+    for (uint32_t h = 0; h < PULSAR_N_HEAD; h++) {
+        const float *qh = q + (uint64_t)h * PULSAR_N_HEAD_DIM;
 
         float max_score = sinks[h];
         for (uint32_t r = 0; r < n_kv; r++) {
-            const float *kv = kv_rows + (uint64_t)r * DS4_N_HEAD_DIM;
-            score[r] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
+            const float *kv = kv_rows + (uint64_t)r * PULSAR_N_HEAD_DIM;
+            score[r] = dot_f32(qh, kv, PULSAR_N_HEAD_DIM) * kq_scale;
             if (score[r] > max_score) max_score = score[r];
         }
 
-        float *oh = out_heads + (uint64_t)h * DS4_N_HEAD_DIM;
-        memset(oh, 0, (size_t)DS4_N_HEAD_DIM * sizeof(oh[0]));
+        float *oh = out_heads + (uint64_t)h * PULSAR_N_HEAD_DIM;
+        memset(oh, 0, (size_t)PULSAR_N_HEAD_DIM * sizeof(oh[0]));
 
         float denom = expf(sinks[h] - max_score);
         for (uint32_t r = 0; r < n_kv; r++) {
             const float weight = expf(score[r] - max_score);
-            const float *kv = kv_rows + (uint64_t)r * DS4_N_HEAD_DIM;
+            const float *kv = kv_rows + (uint64_t)r * PULSAR_N_HEAD_DIM;
             denom += weight;
-            axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
+            axpy_f32(oh, kv, weight, PULSAR_N_HEAD_DIM);
         }
 
         const float inv = 1.0f / denom;
-        scale_f32(oh, inv, DS4_N_HEAD_DIM);
+        scale_f32(oh, inv, PULSAR_N_HEAD_DIM);
     }
 
     if (score != score_stack) free(score);
@@ -274,8 +274,8 @@ void layer_attention_rows_one(
 
 void layer_attention_one(
         float             * out_heads,
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
+        const pulsar_model   * model,
+        const pulsar_layer_weights * layer,
         const float       * q,
         const float       * kv) {
     layer_attention_rows_one(out_heads, model, layer, q, kv, 1);
@@ -287,12 +287,12 @@ void layer_attention_one(
  * a 1024-rank low vector, then all groups are projected back to 4096. */
 void layer_grouped_out_one(
         float             * out,
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
+        const pulsar_model   * model,
+        const pulsar_layer_weights * layer,
         const float       * heads) {
     const uint32_t n_groups = 8;
-    const uint32_t group_heads = DS4_N_HEAD / n_groups;
-    const uint32_t group_dim = DS4_N_HEAD_DIM * group_heads;
+    const uint32_t group_heads = PULSAR_N_HEAD / n_groups;
+    const uint32_t group_dim = PULSAR_N_HEAD_DIM * group_heads;
     const uint32_t rank = 1024;
 
     float *low = (float *)xcalloc((size_t)n_groups * rank, sizeof(low[0]));
@@ -310,13 +310,13 @@ void layer_grouped_out_one(
 
 void layer_grouped_out_batch(
         float             * out,
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
+        const pulsar_model   * model,
+        const pulsar_layer_weights * layer,
         const float       * heads,
         uint32_t            n_tok) {
     const uint32_t n_groups = 8;
-    const uint32_t group_heads = DS4_N_HEAD / n_groups;
-    const uint32_t group_dim = DS4_N_HEAD_DIM * group_heads;
+    const uint32_t group_heads = PULSAR_N_HEAD / n_groups;
+    const uint32_t group_dim = PULSAR_N_HEAD_DIM * group_heads;
     const uint32_t rank = 1024;
 
     float *low = (float *)xcalloc((size_t)n_tok * n_groups * rank, sizeof(low[0]));

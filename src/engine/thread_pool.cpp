@@ -1,4 +1,4 @@
-#include "ds4_engine_internal.h"
+#include "pulsar_engine_internal.h"
 
 /* Persistent CPU worker pool. Split out of util.c in the C++ port.
  *
@@ -38,7 +38,7 @@ public:
             if (v > 0) n_threads = (uint32_t)v;
         }
         if (g_requested_threads > 0) n_threads = g_requested_threads;
-        if (n_threads > DS4_MAX_THREADS) n_threads = DS4_MAX_THREADS;
+        if (n_threads > PULSAR_MAX_THREADS) n_threads = PULSAR_MAX_THREADS;
         if (n_threads == 0) n_threads = 1;
 
         pthread_mutex_init(&mutex_, NULL);
@@ -54,7 +54,7 @@ public:
         for (uint32_t i = 1; i < n_threads; i++) {
             if (pthread_create(&threads_[i], NULL, worker_trampoline,
                                (void *)(uintptr_t)i) != 0) {
-                ds4_die("failed to create worker thread");
+                pulsar_die("failed to create worker thread");
             }
         }
     }
@@ -81,7 +81,7 @@ public:
     /* Run a row-parallel CPU kernel, falling back to serial execution for
      * small jobs or nested calls where spawning more work would only add
      * latency. */
-    void parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void *ctx,
+    void parallel_for_min_rows(uint64_t n_rows, pulsar_parallel_fn fn, void *ctx,
                                uint64_t min_parallel_rows) {
         ensure_init();
 
@@ -133,7 +133,7 @@ private:
             }
 
             seen_generation = generation_;
-            ds4_parallel_fn fn = fn_;
+            pulsar_parallel_fn fn = fn_;
             void *ctx = ctx_;
             const uint64_t n_rows = n_rows_;
             const uint32_t n_threads = n_threads_;
@@ -158,7 +158,7 @@ private:
         }
     }
 
-    pthread_t threads_[DS4_MAX_THREADS] = {};
+    pthread_t threads_[PULSAR_MAX_THREADS] = {};
     pthread_mutex_t mutex_ = {};
     pthread_cond_t work_cond_ = {};
     pthread_cond_t done_cond_ = {};
@@ -168,7 +168,7 @@ private:
     uint32_t done_ = 0;
     bool initialized_ = false;
     bool shutdown_ = false;
-    ds4_parallel_fn fn_ = nullptr;
+    pulsar_parallel_fn fn_ = nullptr;
     void *ctx_ = nullptr;
     uint64_t n_rows_ = 0;
 };
@@ -188,18 +188,18 @@ uint32_t g_requested_threads;
 
 
 
-void ds4_threads_shutdown(void) {
+void pulsar_threads_shutdown(void) {
     pulsar::g_pool.shutdown();
 }
 
 
 
-void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void *ctx, uint64_t min_parallel_rows) {
+void pulsar_parallel_for_min_rows(uint64_t n_rows, pulsar_parallel_fn fn, void *ctx, uint64_t min_parallel_rows) {
     pulsar::g_pool.parallel_for_min_rows(n_rows, fn, ctx, min_parallel_rows);
 }
 
 
 
-void ds4_parallel_for(uint64_t n_rows, ds4_parallel_fn fn, void *ctx) {
-    ds4_parallel_for_min_rows(n_rows, fn, ctx, 512);
+void pulsar_parallel_for(uint64_t n_rows, pulsar_parallel_fn fn, void *ctx) {
+    pulsar_parallel_for_min_rows(n_rows, fn, ctx, 512);
 }

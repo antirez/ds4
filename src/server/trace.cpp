@@ -1,11 +1,11 @@
-#include "ds4_server_internal.h"
+#include "pulsar_server_internal.h"
 
 
 
 void trace_cache_capture(
         trace_cache_diag *d,
-        const ds4_tokens *live,
-        const ds4_tokens *prompt,
+        const pulsar_tokens *live,
+        const pulsar_tokens *prompt,
         int old_pos,
         int common)
 {
@@ -73,13 +73,13 @@ static void trace_write_escaped_bytes(FILE *fp, const char *p, size_t len) {
 
 
 
-static void trace_write_token(FILE *fp, ds4_engine *engine, int token) {
+static void trace_write_token(FILE *fp, pulsar_engine *engine, int token) {
     if (token < 0) {
         fputs("- <none>", fp);
         return;
     }
     size_t len = 0;
-    char *piece = ds4_token_text(engine, token, &len);
+    char *piece = pulsar_token_text(engine, token, &len);
     fprintf(fp, "%d ", token);
     trace_write_escaped_bytes(fp, piece, len);
     free(piece);
@@ -185,7 +185,7 @@ uint64_t trace_begin(
             j->req.model ? j->req.model : "",
             j->req.stream ? 1 : 0,
             j->req.has_tools ? 1 : 0,
-            ds4_think_mode_name(j->req.think_mode),
+            pulsar_think_mode_name(j->req.think_mode),
             j->req.prompt.len,
             effective_prompt_tokens,
             cached,
@@ -341,8 +341,8 @@ void log_decode_progress(req_kind kind, int prompt_tokens, int completion,
     char flags[80];
     log_flags(flags, sizeof(flags), responses_protocol,
               tools, thinking, dsml_start, dsml_end);
-    server_log(DS4_LOG_GENERATION,
-               "ds4-server: %s ctx=%s gen=%d%s%s decoding chunk=%.2f t/s avg=%.2f t/s %.3fs",
+    server_log(PULSAR_LOG_GENERATION,
+               "pulsar-server: %s ctx=%s gen=%d%s%s decoding chunk=%.2f t/s avg=%.2f t/s %.3fs",
                kind == REQ_CHAT ? "chat" : "completion",
                ctx,
                completion,

@@ -1,4 +1,4 @@
-#include "ds4_server_internal.h"
+#include "pulsar_server_internal.h"
 
 
 
@@ -12,7 +12,7 @@ void random_tool_id(char *dst, size_t dstlen, api_style api) {
         /* Fail closed: tool-call IDs must not be predictable, and with
          * getrandom() + /dev/urandom both unavailable something is deeply
          * wrong with the host. */
-        ds4_die("random_bytes failed; cannot generate tool-call ids");
+        pulsar_die("random_bytes failed; cannot generate tool-call ids");
     }
 
     static const char hex[] = "0123456789abcdef";
@@ -31,9 +31,9 @@ void random_tool_id(char *dst, size_t dstlen, api_style api) {
  * output seed - they must stay byte-identical or the DSML tracker and the
  * prompt disagree about parser state. */
 void request_forced_tool_seed(const request *r, buf *out) {
-    buf_puts(out, "</think>\n\n" DS4_TOOL_CALLS_START "\n");
+    buf_puts(out, "</think>\n\n" PULSAR_TOOL_CALLS_START "\n");
     if (r->forced_tool_name && r->forced_tool_name[0]) {
-        buf_puts(out, DS4_INVOKE_START " name=\"");
+        buf_puts(out, PULSAR_INVOKE_START " name=\"");
         buf_puts(out, r->forced_tool_name);
         buf_puts(out, "\">\n");
     }
@@ -235,16 +235,16 @@ void request_init(request *r, req_kind kind, int max_tokens) {
     r->model = xstrdup("deepseek-v4-flash");
     r->max_tokens = max_tokens;
     r->top_k = 0;
-    r->temperature = DS4_DEFAULT_TEMPERATURE;
-    r->top_p = DS4_DEFAULT_TOP_P;
-    r->min_p = DS4_DEFAULT_MIN_P;
-    r->think_mode = DS4_THINK_HIGH;
+    r->temperature = PULSAR_DEFAULT_TEMPERATURE;
+    r->top_p = PULSAR_DEFAULT_TOP_P;
+    r->min_p = PULSAR_DEFAULT_MIN_P;
+    r->think_mode = PULSAR_THINK_HIGH;
 }
 
 
 
 void request_free(request *r) {
-    ds4_tokens_free(&r->prompt);
+    pulsar_tokens_free(&r->prompt);
     free(r->model);
     free(r->forced_tool_name);
     for (int i = 0; i < r->stops.len; i++) free(r->stops.v[i]);
@@ -263,17 +263,17 @@ void request_free(request *r) {
 
 
 
-ds4_think_mode think_mode_from_enabled(bool enabled, ds4_think_mode effort) {
-    if (!enabled || effort == DS4_THINK_NONE) return DS4_THINK_NONE;
-    return effort == DS4_THINK_MAX ? DS4_THINK_MAX : DS4_THINK_HIGH;
+pulsar_think_mode think_mode_from_enabled(bool enabled, pulsar_think_mode effort) {
+    if (!enabled || effort == PULSAR_THINK_NONE) return PULSAR_THINK_NONE;
+    return effort == PULSAR_THINK_MAX ? PULSAR_THINK_MAX : PULSAR_THINK_HIGH;
 }
 
 
 
-bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
+bool parse_reasoning_effort_name(const char *s, pulsar_think_mode *out) {
     if (!s) return false;
     if (!strcmp(s, "max")) {
-        *out = DS4_THINK_MAX;
+        *out = PULSAR_THINK_MAX;
         return true;
     }
     if (!strcmp(s, "xhigh") || !strcmp(s, "high") ||
@@ -283,11 +283,11 @@ bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
         /* DS4 only exposes HIGH and MAX above zero, so "minimal" collapses to
          * the smallest non-zero level (HIGH). Callers that need *no* reasoning
          * must use "none" instead. */
-        *out = DS4_THINK_HIGH;
+        *out = PULSAR_THINK_HIGH;
         return true;
     }
     if (!strcmp(s, "none")) {
-        *out = DS4_THINK_NONE;
+        *out = PULSAR_THINK_NONE;
         return true;
     }
     return false;
@@ -295,7 +295,7 @@ bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
 
 
 
-bool parse_reasoning_effort_value(const char **p, ds4_think_mode *out) {
+bool parse_reasoning_effort_value(const char **p, pulsar_think_mode *out) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
     char *effort = NULL;
@@ -348,7 +348,7 @@ bool parse_thinking_control_value(const char **p, bool *thinking_enabled) {
 
 
 
-bool parse_output_config_effort(const char **p, ds4_think_mode *effort) {
+bool parse_output_config_effort(const char **p, pulsar_think_mode *effort) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
     if (**p != '{') return json_skip_value(p);
@@ -396,8 +396,8 @@ bool model_alias_enables_thinking(const char *model) {
 
 
 
-const char *server_model_id_from_engine(ds4_engine *engine) {
-    return ds4_engine_model_id(engine) == 1 ?
+const char *server_model_id_from_engine(pulsar_engine *engine) {
+    return pulsar_engine_model_id(engine) == 1 ?
            "deepseek-v4-pro" : "deepseek-v4-flash";
 }
 
@@ -408,7 +408,7 @@ const char *server_served_model_id(const server *s) {
 
 const char *server_served_model_name(const server *s) {
     return s->served_model_name ? s->served_model_name
-                                : ds4_engine_model_name(s->engine);
+                                : pulsar_engine_model_name(s->engine);
 }
 
 

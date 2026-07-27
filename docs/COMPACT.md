@@ -1,4 +1,4 @@
-# DS4 Agent Context Compaction
+# Pulsar Agent Context Compaction
 
 The agent should compact context before long sessions become brittle, and also
 when a tool result would otherwise not fit.

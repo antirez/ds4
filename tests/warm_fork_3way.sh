@@ -27,7 +27,7 @@ MODEL=${1:-gguf/model.gguf}; PORT=${2:-8901}
 DIR=$(mktemp -d /tmp/warmfork.XXXX); LOG=$DIR/server.log
 TRUNK=$(python3 -c "print('Shared preamble sentence. '*380)")   # ~2.7k-token trunk
 jreq(){ python3 -c "import json,sys;print(json.dumps({'prompt':sys.argv[1],'max_tokens':int(sys.argv[2]),'temperature':0.0,'stream':False}))" "$1" "$2"; }
-start(){ DS4_WARM_FORK=$1 DS4_MSEQ_BANKS=3 ./ds4-server -m "$MODEL" --host 127.0.0.1 --port $PORT \
+start(){ DS4_WARM_FORK=$1 DS4_MSEQ_BANKS=3 ./pulsar-server -m "$MODEL" --host 127.0.0.1 --port $PORT \
         -c 32768 --kv-disk-dir "" >"$LOG" 2>&1 & SP=$!
   for i in $(seq 1 240); do [ "$(curl -s -m2 -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/health)" = 200 ] && return 0; sleep 1; done; return 1; }
 stop(){ kill -INT $SP 2>/dev/null; sleep 2; kill -9 $SP 2>/dev/null; }

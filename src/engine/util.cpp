@@ -1,18 +1,18 @@
-#include "ds4_engine_internal.h"
+#include "pulsar_engine_internal.h"
 
 /* Small leaf helpers with no state: string views, hashing, alignment,
  * wall-clock, and f32 blob file I/O. Everything with a real concern of its
  * own moved to its own TU in the C++ port (log.cpp, alloc.cpp,
  * thread_pool.cpp, gguf_cursor.cpp, model_layout.cpp). */
 
-bool ds4_streq(ds4_str s, const char *z) {
+bool pulsar_streq(pulsar_str s, const char *z) {
     size_t n = strlen(z);
     return s.len == n && memcmp(s.ptr, z, n) == 0;
 }
 
 
 
-bool ds4_str_eq(ds4_str a, ds4_str b) {
+bool pulsar_str_eq(pulsar_str a, pulsar_str b) {
     return a.len == b.len && memcmp(a.ptr, b.ptr, a.len) == 0;
 }
 
@@ -64,13 +64,13 @@ void sleep_sec(double sec) {
 bool write_f32_binary_file(const char *path, const float *data, uint64_t n) {
     FILE *fp = fopen(path, "wb");
     if (!fp) {
-        fprintf(stderr, "ds4: failed to open %s for writing: %s\n", path, strerror(errno));
+        fprintf(stderr, "pulsar: failed to open %s for writing: %s\n", path, strerror(errno));
         return false;
     }
     const size_t nw = fwrite(data, sizeof(float), (size_t)n, fp);
     const bool ok = nw == (size_t)n && fclose(fp) == 0;
     if (!ok) {
-        fprintf(stderr, "ds4: failed to write %s\n", path);
+        fprintf(stderr, "pulsar: failed to write %s\n", path);
         return false;
     }
     return true;
@@ -81,12 +81,12 @@ bool write_f32_binary_file(const char *path, const float *data, uint64_t n) {
 bool read_f32_binary_file(const char *path, float *data, uint64_t n) {
     struct stat st;
     if (stat(path, &st) != 0) {
-        fprintf(stderr, "ds4: failed to stat %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "pulsar: failed to stat %s: %s\n", path, strerror(errno));
         return false;
     }
     if (st.st_size < 0 || (uint64_t)st.st_size != n * sizeof(float)) {
         fprintf(stderr,
-                "ds4: %s has size %llu bytes, expected %llu bytes\n",
+                "pulsar: %s has size %llu bytes, expected %llu bytes\n",
                 path,
                 (unsigned long long)st.st_size,
                 (unsigned long long)(n * sizeof(float)));
@@ -95,13 +95,13 @@ bool read_f32_binary_file(const char *path, float *data, uint64_t n) {
 
     FILE *fp = fopen(path, "rb");
     if (!fp) {
-        fprintf(stderr, "ds4: failed to open %s for reading: %s\n", path, strerror(errno));
+        fprintf(stderr, "pulsar: failed to open %s for reading: %s\n", path, strerror(errno));
         return false;
     }
     const size_t nr = fread(data, sizeof(float), (size_t)n, fp);
     const bool ok = nr == (size_t)n && fclose(fp) == 0;
     if (!ok) {
-        fprintf(stderr, "ds4: failed to read %s\n", path);
+        fprintf(stderr, "pulsar: failed to read %s\n", path);
         return false;
     }
     return true;

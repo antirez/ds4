@@ -1,4 +1,4 @@
-#include "ds4_agent_internal.h"
+#include "pulsar_agent_internal.h"
 
 
 
@@ -30,7 +30,7 @@ static void agent_bash_job_free(agent_bash_job *job) {
     if (job->tmp_fd >= 0) close(job->tmp_fd);
     /* Remove the mkstemp output file.  Only the three spawn-time error paths
      * unlinked it before, so every COMPLETED bash tool call left a
-     * /tmp/ds4_agent_output_* behind for the life of the box — a long agent
+     * /tmp/pulsar_agent_output_* behind for the life of the box — a long agent
      * session orphaned one per command, sized by that command's full output. */
     if (job->path[0]) unlink(job->path);
     free(job->cmd);

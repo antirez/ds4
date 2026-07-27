@@ -1,4 +1,4 @@
-// ds4_mxfp4_cutlass.cu — CUTLASS MXFP4 tensor-core expert FFN for the ds4 MoE (sm_120f).
+// pulsar_mxfp4_cutlass.cu — CUTLASS MXFP4 tensor-core expert FFN for the ds4 MoE (sm_120f).
 // Weights arrive pre-packed in CUTLASS B layout (from the offline converter); activations are
 // packed to MXFP4 on-device at runtime. Path: pack(x) -> gate/up GEMM -> SwiGLU -> pack(mid) -> down GEMM.
 // Build (standalone test):  nvcc -std=c++17 -arch=sm_120f --expt-relaxed-constexpr --expt-extended-lambda
@@ -6,7 +6,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>
-#include "ds4_gpu.h"
+#include "pulsar_gpu.h"
 #include "cutlass/cutlass.h"
 #include "cute/tensor.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
@@ -125,7 +125,7 @@ __global__ void pack_act_e4m3_rowmajor(uint8_t *A_data, TSFA tSFA, const float *
  * byte the same conversion on the same float. Only the load/store WIDTH changes.
  * Alignment: per-expert K is a 128-multiple, kb*32 floats = 128 B, so
  * act+m*K+kb*32 is 16-B aligned (float4) and the e4m3 out is 16-B aligned (int4).
- * DS4_ACT_PACK_SCALAR=1 selects the scalar path for the bit-exact A/B. */
+ * PULSAR_ACT_PACK_SCALAR=1 selects the scalar path for the bit-exact A/B. */
 template<class TSFA>
 __global__ void pack_act_e4m3_rowmajor_vec(uint8_t *A_data, TSFA tSFA, const float *act, int M, int K){
   int nblk=K/32; long idx=(long)blockIdx.x*blockDim.x+threadIdx.x; if(idx>=(long)M*nblk) return;
@@ -155,7 +155,7 @@ __global__ void pack_act_e4m3_rowmajor_vec(uint8_t *A_data, TSFA tSFA, const flo
 // LOSSY dequant->fp4 weight packer still needs the E2M1 nearest-value helper (below); keep it.
 __device__ __constant__ float d_kE2M1[16] = {0.f,0.5f,1.f,1.5f,2.f,3.f,4.f,6.f, 0.f,-0.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
 __device__ __forceinline__ uint8_t d_to_e2m1(float v){ float best=1e30f; uint8_t bn=0; for(uint8_t n=0;n<16;n++){ float d=fabsf(v-d_kE2M1[n]); if(d<best){best=d;bn=n;} } return bn; }
-// mid = silu(clamp(gate)) * clamp(up) * routing_weight  — matches engine ds4_cuda.cu:10827-10835
+// mid = silu(clamp(gate)) * clamp(up) * routing_weight  — matches engine pulsar_cuda.cu:10827-10835
 __global__ void swiglu_kernel(float *mid, const float *gate, const float *up, const float *w, float clamp, int mid_dim, long n){
   long i=(long)blockIdx.x*blockDim.x+threadIdx.x; if(i>=n) return;
   float g=gate[i], u=up[i];
@@ -169,7 +169,7 @@ static void pack_activation(uint8_t *A_data, ElementSF *A_sf, const float *x, in
   auto layoutSF = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(M, 0, K, 1));
   auto tSFA = make_tensor(make_gmem_ptr(A_sf), layoutSF);
   int nb=M*(K/32), t=128, b=(nb+t-1)/t;
-  /* Vectorized pack is default; DS4_ACT_PACK_SCALAR=1 forces the scalar twin
+  /* Vectorized pack is default; PULSAR_ACT_PACK_SCALAR=1 forces the scalar twin
    * (bit-exact) for the A/B. Env read ONCE (init-time static), not per launch. */
   static int scalar = -1;
   if (scalar < 0) { const char *e = getenv("DS4_ACT_PACK_SCALAR"); scalar = (e && e[0]=='1') ? 1 : 0; }
@@ -232,7 +232,7 @@ static int run_gemm(float *D, const uint8_t *A_data, const ElementSF *A_sf,
 // Everything the FFN needs beyond the weight/activation pointers it's called with: packed
 // activation buffers, their SF tables, the three GEMMs' float outputs, and the three GEMMs'
 // (usually zero-size, but not guaranteed) CUTLASS workspaces.
-struct ds4_cutlass_ffn_scratch_layout {
+struct pulsar_cutlass_ffn_scratch_layout {
   size_t xA_off, xSF_off, midA_off, midSF_off, gate_off, up_off, mid_off;
   size_t ws_gate_off, ws_up_off, ws_down_off;
   size_t xSF_n, midSF_n;
@@ -242,8 +242,8 @@ struct ds4_cutlass_ffn_scratch_layout {
 
 static size_t align_up_bytes(size_t n, size_t a){ return (n + a - 1) / a * a; }
 
-static ds4_cutlass_ffn_scratch_layout cutlass_ffn_scratch_layout(int T, int in_dim, int mid_dim, int out_dim){
-  ds4_cutlass_ffn_scratch_layout L{};
+static pulsar_cutlass_ffn_scratch_layout cutlass_ffn_scratch_layout(int T, int in_dim, int mid_dim, int out_dim){
+  pulsar_cutlass_ffn_scratch_layout L{};
   const size_t align = 256;
   size_t off = 0;
   L.xA_off = off; off = align_up_bytes(off + (size_t)T*in_dim, align);   /* E4M3: 1 byte/elem */
@@ -265,25 +265,25 @@ static ds4_cutlass_ffn_scratch_layout cutlass_ffn_scratch_layout(int T, int in_d
   return L;
 }
 
-// Scratch bytes ds4_cutlass_expert_ffn_scratch() needs for the worst case of T tokens routed
+// Scratch bytes pulsar_cutlass_expert_ffn_scratch() needs for the worst case of T tokens routed
 // to a single expert. Callers size one buffer for their layer's (in_dim,mid_dim,out_dim) shape
 // at T=max_tokens_per_expert once (e.g. via cuda_tmp_alloc) and reuse it across every expert
 // and every layer that shares that shape -- this is deliberately NOT malloc'd per call.
-size_t ds4_cutlass_expert_ffn_scratch_bytes(int T, int in_dim, int mid_dim, int out_dim){
+size_t pulsar_cutlass_expert_ffn_scratch_bytes(int T, int in_dim, int mid_dim, int out_dim){
   return cutlass_ffn_scratch_layout(T, in_dim, mid_dim, out_dim).total_bytes;
 }
 
 // Core FFN, no allocation and no synchronization: out[T,out_dim] = down(swiglu(x.Wg^T, x.Wu^T)).Wd^T.
 // Weights pre-packed (data+sf) in B layout; x is f32 [T,in_dim]. `scratch` must be at least
-// ds4_cutlass_expert_ffn_scratch_bytes(T,in_dim,mid_dim,out_dim) bytes, 256-byte aligned.
+// pulsar_cutlass_expert_ffn_scratch_bytes(T,in_dim,mid_dim,out_dim) bytes, 256-byte aligned.
 // Launches into the caller's current stream (legacy default stream); the caller is responsible
 // for ordering/synchronizing against its own subsequent work, same as every other kernel in
 // this engine's decode/prefill graphs.
 // SF weight pointers are typed as raw bytes at this extern "C" boundary (not ElementSF*) so
-// callers outside this TU -- e.g. ds4_cuda_moe.cu, which has no CUTLASS header visibility --
+// callers outside this TU -- e.g. pulsar_cuda_moe.cu, which has no CUTLASS header visibility --
 // can call this without depending on CUTLASS types. ElementSF (cutlass::float_ue8m0_t) is a
 // 1-byte POD; the reinterpret below is exact.
-int ds4_cutlass_expert_ffn_scratch(
+int pulsar_cutlass_expert_ffn_scratch(
     float *out, const float *x,
     const uint8_t *Wg_d, const uint8_t *Wg_sf,
     const uint8_t *Wu_d, const uint8_t *Wu_sf,
@@ -291,7 +291,7 @@ int ds4_cutlass_expert_ffn_scratch(
     const float *weights, float clamp,
     int T, int in_dim, int mid_dim, int out_dim,
     uint8_t *scratch, size_t scratch_bytes){
-  ds4_cutlass_ffn_scratch_layout L = cutlass_ffn_scratch_layout(T, in_dim, mid_dim, out_dim);
+  pulsar_cutlass_ffn_scratch_layout L = cutlass_ffn_scratch_layout(T, in_dim, mid_dim, out_dim);
   if (!scratch || scratch_bytes < L.total_bytes) return -1;
   const ElementSF *Wg_sf_e = reinterpret_cast<const ElementSF*>(Wg_sf);
   const ElementSF *Wu_sf_e = reinterpret_cast<const ElementSF*>(Wu_sf);
@@ -339,10 +339,10 @@ static size_t proj_scratch_layout(int T, int in_dim, int out_dim,
   *ws_off=off; off=align_up_bytes(off+(*ws_bytes), a);
   return off;
 }
-size_t ds4_cutlass_proj_scratch_bytes(int T, int in_dim, int out_dim){
+size_t pulsar_cutlass_proj_scratch_bytes(int T, int in_dim, int out_dim){
   size_t a,b,c,d,e; return proj_scratch_layout(T,in_dim,out_dim,&a,&b,&c,&d,&e);
 }
-int ds4_cutlass_proj_scratch(float *out, const float *x,
+int pulsar_cutlass_proj_scratch(float *out, const float *x,
     const uint8_t *W_d, const uint8_t *W_sf, int T, int in_dim, int out_dim,
     uint8_t *scratch, size_t scratch_bytes){
   size_t xA_off,xSF_off,xSF_n,ws_off,ws_bytes;
@@ -360,17 +360,17 @@ int ds4_cutlass_proj_scratch(float *out, const float *x,
 // synchronizes before returning. The engine never calls this -- it calls the scratch variant
 // above with a pre-sized, reused buffer, since a per-call cudaMalloc/cudaFree/cudaDeviceSynchronize
 // here is exactly the hot-path cost the engine path exists to avoid. ----
-int ds4_cutlass_expert_ffn(
+int pulsar_cutlass_expert_ffn(
     float *out, const float *x,
     const uint8_t *Wg_d, const ElementSF *Wg_sf,
     const uint8_t *Wu_d, const ElementSF *Wu_sf,
     const uint8_t *Wd_d, const ElementSF *Wd_sf,
     const float *weights, float clamp,
     int T, int in_dim, int mid_dim, int out_dim){
-  size_t scratch_bytes = ds4_cutlass_expert_ffn_scratch_bytes(T, in_dim, mid_dim, out_dim);
+  size_t scratch_bytes = pulsar_cutlass_expert_ffn_scratch_bytes(T, in_dim, mid_dim, out_dim);
   uint8_t *scratch=nullptr;
   cudaMalloc(&scratch, scratch_bytes);
-  int rc = ds4_cutlass_expert_ffn_scratch(out,x,Wg_d,reinterpret_cast<const uint8_t*>(Wg_sf),
+  int rc = pulsar_cutlass_expert_ffn_scratch(out,x,Wg_d,reinterpret_cast<const uint8_t*>(Wg_sf),
                                           Wu_d,reinterpret_cast<const uint8_t*>(Wu_sf),
                                           Wd_d,reinterpret_cast<const uint8_t*>(Wd_sf),
                                           weights,clamp,
@@ -509,15 +509,15 @@ static int run_grouped_gemm(int n_total, const GArrays &g, void *workspace, int 
 }
 
 // ---- Scratch layout for the grouped FFN (sizing and execution stay in lock-step). ----
-struct ds4_grouped_scratch_layout {
+struct pulsar_grouped_scratch_layout {
   size_t xA_off, xSF_off, gate_off, up_off, mid_off, midA_off, midSF_off;
   size_t gu_arr_off, dn_arr_off, ws_gu_off, ws_dn_off;
   size_t xSF_bytes, midSF_bytes, ws_bytes, total_bytes;
 };
 
-static ds4_grouped_scratch_layout grouped_scratch_layout(int padded_total, int n_total,
+static pulsar_grouped_scratch_layout grouped_scratch_layout(int padded_total, int n_total,
                                                          int in_dim, int mid_dim, int out_dim){
-  ds4_grouped_scratch_layout L{};
+  pulsar_grouped_scratch_layout L{};
   const size_t a = 256; size_t off = 0;
   int sm = grouped_sm_count();
   int tiles = padded_total / 128;
@@ -539,7 +539,7 @@ static ds4_grouped_scratch_layout grouped_scratch_layout(int padded_total, int n
   return L;
 }
 
-size_t ds4_cutlass_grouped_moe_scratch_bytes(
+size_t pulsar_cutlass_grouped_moe_scratch_bytes(
     int padded_total, int n_total_expert, int in_dim, int mid_dim, int out_dim){
   return grouped_scratch_layout(padded_total, n_total_expert, in_dim, mid_dim, out_dim).total_bytes;
 }
@@ -547,7 +547,7 @@ size_t ds4_cutlass_grouped_moe_scratch_bytes(
 // Grouped MXFP4 FFN. x_gathered/w_gathered are the per-slot activations gathered to 128-padded
 // row offsets (padding rows must be pre-zeroed by the caller). Writes ffn_out[padded_total,out_dim]
 // (the caller scatters the real rows into the flat down buffer, then moe_sum reduces). No host sync.
-int ds4_cutlass_grouped_moe(
+int pulsar_cutlass_grouped_moe(
     float *ffn_out, const float *x_gathered, const float *w_gathered,
     const uint8_t *gate_w, const uint8_t *up_w, const uint8_t *down_w,
     uint64_t gate_stride, uint64_t gate_data_bytes,
@@ -556,7 +556,7 @@ int ds4_cutlass_grouped_moe(
     int in_dim, int mid_dim, int out_dim,
     const uint32_t *counts, const uint32_t *padded_offsets, int padded_total,
     uint8_t *scratch, size_t scratch_bytes){
-  ds4_grouped_scratch_layout L = grouped_scratch_layout(padded_total, n_total_expert, in_dim, mid_dim, out_dim);
+  pulsar_grouped_scratch_layout L = grouped_scratch_layout(padded_total, n_total_expert, in_dim, mid_dim, out_dim);
   if (!scratch || scratch_bytes < L.total_bytes) return -1;
   int sm = grouped_sm_count();
   uint8_t   *xA   = scratch + L.xA_off;
@@ -607,7 +607,7 @@ int ds4_cutlass_grouped_moe(
 // One device-built ptr-array grouped GEMM over the 128-padded gathered activations, for ONE
 // logical matmul out[padded_total,out_dim] = x_gathered . W^T (W = type-40 expert weight, data at
 // W_base+e*W_stride, swizzled SFB at +W_data_bytes). This is exactly the gate/up/down sub-step of
-// ds4_cutlass_grouped_moe factored out: same pack + same g_build_arrays gather order + same
+// pulsar_cutlass_grouped_moe factored out: same pack + same g_build_arrays gather order + same
 // run_grouped_gemm, so it is bit-identical to the per-expert single-projection path it replaces,
 // with NO host readback and NO per-expert sync. Padding rows (padded_offsets leave <128-row gaps)
 // must be pre-zeroed by the caller. `ws` is folded into scratch (shape-independent grouped WS). ----
@@ -624,11 +624,11 @@ static size_t grouped_proj_layout(int padded_total, int n_total_expert, int in_d
   *ws_off = off;  off = align_up_bytes(off + *ws_bytes, a);
   return off;
 }
-size_t ds4_cutlass_grouped_proj_scratch_bytes(int padded_total, int n_total_expert, int in_dim, int out_dim){
+size_t pulsar_cutlass_grouped_proj_scratch_bytes(int padded_total, int n_total_expert, int in_dim, int out_dim){
   (void)out_dim;   /* grouped WS is shape-independent; D buffer is caller-owned */
   size_t a,b,c,d,e,f; return grouped_proj_layout(padded_total, n_total_expert, in_dim, &a,&b,&c,&d,&e,&f);
 }
-int ds4_cutlass_grouped_proj(
+int pulsar_cutlass_grouped_proj(
     float *out, const float *x_gathered,
     const uint8_t *W_base, uint64_t W_stride, uint64_t W_data_bytes,
     int n_total_expert, int in_dim, int out_dim,
@@ -659,7 +659,7 @@ int ds4_cutlass_grouped_proj(
 // These GEMVs read the packed weights directly: one launch for gate+up+swiglu, one for
 // down, no readback, no sort, and f32 activations (no fp4 activation quant -- tighter
 // numerics than the GEMM path's fp4 x fp4).
-// Data layout (see ds4_cutlass_pack_source): B is ColumnMajor packed E2M1 -- logical
+// Data layout (see pulsar_cutlass_pack_source): B is ColumnMajor packed E2M1 -- logical
 // (n,k) lives at nibble n + k*N, so byte (n + k*N)/2. A thread owning row-pair
 // (2p, 2p+1) owns whole bytes, and a warp reads 32 consecutive bytes at each k ->
 // coalesced. SF is the swizzled tile-atom layout, indexed with the same layout object
@@ -674,7 +674,7 @@ __device__ __forceinline__ static float gemv_sf_val(uint8_t b) {
 }
 
 // v3: the CUTLASS B data section is ROW-MAJOR K-contiguous packed nibbles --
-// verified empirically (temp/fp4gemv_test.cu): ds4_cutlass_pack_source's data
+// verified empirically (temp/fp4gemv_test.cu): pulsar_cutlass_pack_source's data
 // section is an IDENTITY COPY of the source's row-major e2m1 bytes, i.e. logical
 // (n,k) lives at nibble k + n*K, byte n*(K/2) + k/2. (pack_weight_f32's manual
 // "n + k*N" math -- and its byte-for-byte comment -- does NOT match pack_source;
@@ -822,7 +822,7 @@ static size_t g_fp4_gemv_actbuf_floats = 0;
 // Small-batch (n_tokens 2..4) rich-expert FFN over the packed CUTLASS weights.
 // down_out gets one pre-weighted FFN result per (token, slot); the caller sums the
 // n_expert slices per token (moe_sum_kernel). mid_scratch: [n_tokens*n_expert, mid_dim].
-int ds4_cutlass_expert_ffn_gemv_small(
+int pulsar_cutlass_expert_ffn_gemv_small(
     float *down_out, float *mid_scratch, const float *x,
     const int32_t *selected, const float *rweights,
     const uint8_t *gate_w, const uint8_t *up_w, const uint8_t *down_w,
@@ -888,7 +888,7 @@ static int gemv_actbuf_ensure(size_t need_floats) {
   return 1;
 }
 /* gate/up W4A8 GEMV -> mid[n_slots,mid_dim] = silu(clamp(gate))*clamp(up)*rw (pair layout). */
-int ds4_cutlass_gemv_gateup(
+int pulsar_cutlass_gemv_gateup(
     float *mid, const float *x, const int32_t *selected, const float *rweights,
     const uint8_t *gate_w, const uint8_t *up_w, uint64_t gate_stride, uint64_t gate_data_bytes,
     float clamp, int n_tokens, int n_expert, unsigned n_total_expert, int in_dim, int mid_dim) {
@@ -906,7 +906,7 @@ int ds4_cutlass_gemv_gateup(
   return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
 /* down W4A8 GEMV -> down_out[n_slots,out_dim] (pair layout, NO routing weight -- applied at gate/up). */
-int ds4_cutlass_gemv_down(
+int pulsar_cutlass_gemv_down(
     float *down_out, const float *mid, const int32_t *selected,
     const uint8_t *down_w, uint64_t down_stride, uint64_t down_data_bytes,
     int n_tokens, int n_expert, unsigned n_total_expert, int mid_dim, int out_dim) {
@@ -929,7 +929,7 @@ int ds4_cutlass_gemv_down(
 // DeepSeek-V4-Flash source stores rich experts — into CUTLASS B layout (ColumnMajor packed E2M1
 // data + swizzled SFB). Host-side, lossless (copies nibbles+scale verbatim). This is the permanent
 // source->CUTLASS packer; nothing consumes ds4's 17-byte format.
-void ds4_cutlass_pack_source(uint8_t *Bd, ElementSF *Bsf, const uint8_t *e2m1, const uint8_t *e8m0, int N, int K){
+void pulsar_cutlass_pack_source(uint8_t *Bd, ElementSF *Bsf, const uint8_t *e2m1, const uint8_t *e8m0, int N, int K){
   auto lB   = cutlass::make_cute_packed_stride(typename GemmKernel::StrideB{}, {N,K,1});
   auto layB = make_layout(make_shape(N,K,1), lB);
   auto lSFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1,N,K,1));
@@ -946,21 +946,21 @@ void ds4_cutlass_pack_source(uint8_t *Bd, ElementSF *Bsf, const uint8_t *e2m1, c
 }
 
 // Physical element count of the swizzled SF tensor for a weight of shape (N=out, K=in).
-size_t ds4_cutlass_weight_sf_count(int N, int K){
+size_t pulsar_cutlass_weight_sf_count(int N, int K){
   auto lSFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1,N,K,1));
   return cute::size(cute::filter_zeros(lSFB));
 }
 
 // Packed E2M1 weight-data byte count for a weight of shape (N=out, K=in): 2 nibbles/byte.
-size_t ds4_cutlass_weight_data_bytes(int N, int K){ return (size_t)N * (size_t)K / 2; }
+size_t pulsar_cutlass_weight_data_bytes(int N, int K){ return (size_t)N * (size_t)K / 2; }
 
 // ---- Runtime dequant->fp4 weight packer (2-bit prefill path). Quantizes a DEQUANTIZED f32
 // weight [N,K] (RowMajor: N rows of K) to MXFP4 on-device (LOSSY) directly into CUTLASS B layout.
 // LAYOUT FIX (2026-07-08): the CUTLASS B data section is ROW-MAJOR K-contiguous packed nibbles
 // -- logical (n,k) at nibble k + n*K, byte n*(K/2) + k/2 -- verified empirically against
-// ds4_cutlass_pack_source, whose data section is an identity copy of the source's row-major
+// pulsar_cutlass_pack_source, whose data section is an identity copy of the source's row-major
 // e2m1 bytes (temp/fp4gemv_test.cu). The previous "(n + k*N)/2 ColumnMajor" math here did NOT
-// match pack_source despite the old comment's claim, so the opt-in DS4_MOE_FP4_PREFILL path
+// match pack_source despite the old comment's claim, so the opt-in PULSAR_MOE_FP4_PREFILL path
 // was feeding scrambled weights to the GEMM. One thread per (row, 32-block) owns 16 whole
 // output bytes -> no cross-thread nibble RMW race. ----
 template<class TSFB>
@@ -983,14 +983,14 @@ __global__ void pack_weight_f32_kernel(uint8_t *B_data, TSFB tSFB, const float *
   }
 }
 
-void ds4_cutlass_pack_weight_f32(uint8_t *Bd, uint8_t *Bsf, const float *W, int N, int K){
+void pulsar_cutlass_pack_weight_f32(uint8_t *Bd, uint8_t *Bsf, const float *W, int N, int K){
   auto lSFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1,N,K,1));
   auto tSFB = make_tensor(reinterpret_cast<ElementSF*>(Bsf), lSFB);
   int nb = N*(K/32), t=128, b=(nb+t-1)/t;
   pack_weight_f32_kernel<<<b,t>>>(Bd, tSFB, W, N, K);   // legacy default stream
 }
 
-#ifdef DS4_MXFP4_REPACK_CLI
+#ifdef PULSAR_MXFP4_REPACK_CLI
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
@@ -1006,13 +1006,13 @@ int main(int argc, char **argv){
     std::vector<uint8_t> e2(e2each*ne), e8(e8each*ne);
     FILE*f1=fopen(argv[2],"rb"); if(!f1||fread(e2.data(),1,e2.size(),f1)!=e2.size()){ fprintf(stderr,"e2m1 read fail\n"); return 1; } fclose(f1);
     FILE*f2=fopen(argv[3],"rb"); if(!f2||fread(e8.data(),1,e8.size(),f2)!=e8.size()){ fprintf(stderr,"e8m0 read fail\n"); return 1; } fclose(f2);
-    size_t sfn=ds4_cutlass_weight_sf_count(N,K);
+    size_t sfn=pulsar_cutlass_weight_sf_count(N,K);
     FILE*fo=fopen(argv[7],"wb"); if(!fo){ fprintf(stderr,"out open fail\n"); return 1; }
     std::vector<uint8_t> Bd((size_t)N*K/2); std::vector<ElementSF> Bsf(sfn);
     for(int i=0;i<ne;i++){
       std::fill(Bd.begin(),Bd.end(),(uint8_t)0);
       std::fill(Bsf.begin(),Bsf.end(),ElementSF::bitcast(127));
-      ds4_cutlass_pack_source(Bd.data(), Bsf.data(), e2.data()+(size_t)i*e2each, e8.data()+(size_t)i*e8each, N, K);
+      pulsar_cutlass_pack_source(Bd.data(), Bsf.data(), e2.data()+(size_t)i*e2each, e8.data()+(size_t)i*e8each, N, K);
       fwrite(Bd.data(),1,Bd.size(),fo); fwrite(Bsf.data(),sizeof(ElementSF),sfn,fo);
     }
     fclose(fo);
@@ -1027,9 +1027,9 @@ int main(int argc, char **argv){
   FILE*f1=fopen(argv[1],"rb"); if(!f1||fread(e2.data(),1,e2n,f1)!=e2n){ fprintf(stderr,"e2m1 read fail %s\n",argv[1]); return 1; } fclose(f1);
   FILE*f2=fopen(argv[2],"rb"); if(!f2||fread(e8.data(),1,e8n,f2)!=e8n){ fprintf(stderr,"e8m0 read fail %s\n",argv[2]); return 1; } fclose(f2);
   std::vector<uint8_t> Bd((size_t)N*K/2,0);
-  size_t sfn=ds4_cutlass_weight_sf_count(N,K);
+  size_t sfn=pulsar_cutlass_weight_sf_count(N,K);
   std::vector<ElementSF> Bsf(sfn, ElementSF::bitcast(127));
-  ds4_cutlass_pack_source(Bd.data(), Bsf.data(), e2.data(), e8.data(), N, K);
+  pulsar_cutlass_pack_source(Bd.data(), Bsf.data(), e2.data(), e8.data(), N, K);
   FILE*fd=fopen(argv[5],"wb"); fwrite(Bd.data(),1,Bd.size(),fd); fclose(fd);
   FILE*fs=fopen(argv[6],"wb"); fwrite(Bsf.data(),sizeof(ElementSF),sfn,fs); fclose(fs);
   printf("packed N=%d K=%d -> data=%zuB sf=%zuB\n",N,K,Bd.size(),sfn*sizeof(ElementSF));
@@ -1037,7 +1037,7 @@ int main(int argc, char **argv){
 }
 #endif
 
-#ifdef DS4_MXFP4_STANDALONE
+#ifdef PULSAR_MXFP4_STANDALONE
 #include <vector>
 #include <random>
 #include <cmath>
@@ -1138,9 +1138,9 @@ static int run_grouped_selfcheck(){
   cudaMemcpy(dXg,xg.data(),xg.size()*4,cudaMemcpyHostToDevice); cudaMemcpy(dWg2,wg.data(),wg.size()*4,cudaMemcpyHostToDevice);
   uint32_t *dCounts,*dPadoff; cudaMalloc(&dCounts,E*4); cudaMalloc(&dPadoff,E*4);
   cudaMemcpy(dCounts,counts.data(),E*4,cudaMemcpyHostToDevice); cudaMemcpy(dPadoff,padoff.data(),E*4,cudaMemcpyHostToDevice);
-  size_t sb=ds4_cutlass_grouped_moe_scratch_bytes(padded_total,E,in_dim,mid_dim,out_dim);
+  size_t sb=pulsar_cutlass_grouped_moe_scratch_bytes(padded_total,E,in_dim,mid_dim,out_dim);
   uint8_t *dScr; cudaMalloc(&dScr,sb);
-  int rc=ds4_cutlass_grouped_moe(dFfn,dXg,dWg2,dGate,dUp,dDown,gstride,gdata,dstride,ddata,
+  int rc=pulsar_cutlass_grouped_moe(dFfn,dXg,dWg2,dGate,dUp,dDown,gstride,gdata,dstride,ddata,
         clamp,E,in_dim,mid_dim,out_dim,dCounts,dPadoff,padded_total,dScr,sb);
   cudaDeviceSynchronize();
   std::vector<float> ffn((size_t)padded_total*out_dim); cudaMemcpy(ffn.data(),dFfn,ffn.size()*4,cudaMemcpyDeviceToHost);
@@ -1168,7 +1168,7 @@ int main(int argc,char**argv){
   // validate source packer: float->(E2M1,E8M0)->CUTLASS must equal float->CUTLASS (byte-identical)
   { std::vector<uint8_t> e2,e8; host_to_source(Wg,e2,e8,mid_dim,in_dim);
     std::vector<uint8_t> Bd2(Wgd.size(),0); std::vector<ElementSF> Bsf2(Wgsf.size(),ElementSF::bitcast(127));
-    ds4_cutlass_pack_source(Bd2.data(),Bsf2.data(),e2.data(),e8.data(),mid_dim,in_dim);
+    pulsar_cutlass_pack_source(Bd2.data(),Bsf2.data(),e2.data(),e8.data(),mid_dim,in_dim);
     int dd=memcmp(Bd2.data(),Wgd.data(),Wgd.size());
     int ds=memcmp(Bsf2.data(),Wgsf.data(),Wgsf.size()*sizeof(ElementSF));
     printf("pack_source(E2M1+E8M0->CUTLASS) check: data=%s sf=%s\n", dd==0?"MATCH":"DIFFER", ds==0?"MATCH":"DIFFER"); }
@@ -1189,7 +1189,7 @@ int main(int argc,char**argv){
   cudaMalloc(&dWgs,Wgsf.size()*sizeof(ElementSF)); cudaMalloc(&dWus,Wusf.size()*sizeof(ElementSF)); cudaMalloc(&dWds,Wdsf.size()*sizeof(ElementSF));
   cudaMemcpy(dWg,Wgd.data(),Wgd.size(),cudaMemcpyHostToDevice); cudaMemcpy(dWu,Wud.data(),Wud.size(),cudaMemcpyHostToDevice); cudaMemcpy(dWd,Wdd.data(),Wdd.size(),cudaMemcpyHostToDevice);
   cudaMemcpy(dWgs,Wgsf.data(),Wgsf.size()*sizeof(ElementSF),cudaMemcpyHostToDevice); cudaMemcpy(dWus,Wusf.data(),Wusf.size()*sizeof(ElementSF),cudaMemcpyHostToDevice); cudaMemcpy(dWds,Wdsf.data(),Wdsf.size()*sizeof(ElementSF),cudaMemcpyHostToDevice);
-  int rc=ds4_cutlass_expert_ffn(dOut,dX,dWg,dWgs,dWu,dWus,dWd,dWds,dWr,clamp,T,in_dim,mid_dim,out_dim);
+  int rc=pulsar_cutlass_expert_ffn(dOut,dX,dWg,dWgs,dWu,dWus,dWd,dWds,dWr,clamp,T,in_dim,mid_dim,out_dim);
   std::vector<float> got((size_t)T*out_dim); cudaMemcpy(got.data(),dOut,(size_t)T*out_dim*4,cudaMemcpyDeviceToHost);
   double maxrel=0,maxabs=0; int bad=0;
   for(size_t i=0;i<got.size();i++){ double a=fabs((double)got[i]-ref[i]); double r=a/(fabs(ref[i])+1e-3); if(r>maxrel)maxrel=r; if(a>maxabs)maxabs=a; if(r>0.05&&a>0.1)bad++; }

@@ -1,4 +1,4 @@
-#include "ds4_server_internal.h"
+#include "pulsar_server_internal.h"
 
 
 
@@ -10,7 +10,7 @@ double server_now_sec(void) {
 
 
 
-void server_log(ds4_log_type type, const char *fmt, ...) {
+void server_log(pulsar_log_type type, const char *fmt, ...) {
     time_t now = time(NULL);
     struct tm tm;
     localtime_r(&now, &tm);
@@ -26,11 +26,11 @@ void server_log(ds4_log_type type, const char *fmt, ...) {
 
     fprintf(stderr, "%s ", ts);
     if (n < 0) {
-        ds4_log(stderr, type, "%s", fmt);
+        pulsar_log(stderr, type, "%s", fmt);
     } else {
         char *line = (char *)server_xmalloc((size_t)n + 1);
         vsnprintf(line, (size_t)n + 1, fmt, ap);
-        ds4_log(stderr, type, "%s", line);
+        pulsar_log(stderr, type, "%s", line);
         free(line);
     }
     va_end(ap);
@@ -46,13 +46,13 @@ void id_list_push_unique(stop_list *ids, const char *id);
 
 
 int tool_memory_max_entries(const tool_memory *m) {
-    return m && m->max_entries > 0 ? m->max_entries : DS4_TOOL_MEMORY_DEFAULT_MAX_IDS;
+    return m && m->max_entries > 0 ? m->max_entries : PULSAR_TOOL_MEMORY_DEFAULT_MAX_IDS;
 }
 
 
 
 static size_t tool_memory_max_bytes(const tool_memory *m) {
-    return m && m->max_bytes > 0 ? m->max_bytes : DS4_TOOL_MEMORY_MAX_BYTES;
+    return m && m->max_bytes > 0 ? m->max_bytes : PULSAR_TOOL_MEMORY_MAX_BYTES;
 }
 
 
@@ -533,7 +533,7 @@ void tool_memory_put_source(server *s, const char *id, const char *dsml,
 
 
 
-#ifdef DS4_SERVER_TEST
+#ifdef PULSAR_SERVER_TEST
 
 void tool_memory_put(server *s, const char *id, const char *dsml) {
     tool_memory_put_source(s, id, dsml, TOOL_MEMORY_RAM);

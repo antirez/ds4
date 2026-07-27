@@ -1,4 +1,4 @@
-#include "ds4_cuda_internal.h"
+#include "pulsar_cuda_internal.h"
 
 
 
@@ -125,7 +125,7 @@ __global__ static void hc_split_sinkhorn_kernel(float *out, const float *mix, co
 
 
 
-__global__ static void hc_weighted_sum_kernel(float *out, const ds4_hc_t *x, const float *w, uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens, uint32_t weight_stride_f32) {
+__global__ static void hc_weighted_sum_kernel(float *out, const pulsar_hc_t *x, const float *w, uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens, uint32_t weight_stride_f32) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_embd * n_tokens;
     if (gid >= n) return;
@@ -133,7 +133,7 @@ __global__ static void hc_weighted_sum_kernel(float *out, const ds4_hc_t *x, con
     uint32_t t = gid / n_embd;
     float acc = 0.0f;
     for (uint32_t h = 0; h < n_hc; h++) {
-        acc += ds4_hc_load(x, (uint64_t)t * n_hc * n_embd + (uint64_t)h * n_embd + d) *
+        acc += pulsar_hc_load(x, (uint64_t)t * n_hc * n_embd + (uint64_t)h * n_embd + d) *
                w[(uint64_t)t * weight_stride_f32 + h];
     }
     out[(uint64_t)t * n_embd + d] = acc;
@@ -142,10 +142,10 @@ __global__ static void hc_weighted_sum_kernel(float *out, const ds4_hc_t *x, con
 
 
 __global__ static void hc_expand_kernel(
-        ds4_hc_t *out_hc,
+        pulsar_hc_t *out_hc,
         const float *block_out,
         const float *block_add,
-        const ds4_hc_t *residual_hc,
+        const pulsar_hc_t *residual_hc,
         const float *post,
         const float *comb,
         uint32_t n_embd,
@@ -167,10 +167,10 @@ __global__ static void hc_expand_kernel(
     float acc = block_v * post[(uint64_t)t * post_stride + dst_hc];
     for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
         float comb_v = comb[(uint64_t)t * comb_stride + dst_hc + (uint64_t)src_hc * n_hc];
-        float res_v = ds4_hc_load(residual_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)src_hc * n_embd + d);
+        float res_v = pulsar_hc_load(residual_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)src_hc * n_embd + d);
         acc += comb_v * res_v;
     }
-    ds4_hc_store(out_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d, acc);
+    pulsar_hc_store(out_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d, acc);
 }
 
 
@@ -179,7 +179,7 @@ __global__ static void hc_split_weighted_sum_fused_kernel(
         float *out,
         float *split,
         const float *mix,
-        const ds4_hc_t *residual_hc,
+        const pulsar_hc_t *residual_hc,
         const float *scale,
         const float *base,
         uint32_t n_embd,
@@ -198,7 +198,7 @@ __global__ static void hc_split_weighted_sum_fused_kernel(
     for (uint32_t col = d; col < n_embd; col += blockDim.x) {
         float acc = 0.0f;
         for (uint32_t h = 0; h < 4; h++) {
-            acc += ds4_hc_load(residual_hc, (uint64_t)t * 4u * n_embd + (uint64_t)h * n_embd + col) * sp[h];
+            acc += pulsar_hc_load(residual_hc, (uint64_t)t * 4u * n_embd + (uint64_t)h * n_embd + col) * sp[h];
         }
         out[(uint64_t)t * n_embd + col] = acc;
     }
@@ -221,14 +221,14 @@ __global__ static void hc_split_weighted_sum_fused_kernel(
  * still written with the same values.  Only the reload disappears.
  *
  * `residual_hc` is an HC CARRIER (BF16 storage under task #62) and is read
- * through ds4_hc_load exactly as the generic kernel below does. */
+ * through pulsar_hc_load exactly as the generic kernel below does. */
 template <uint32_t BLK, uint32_t VEC>
 __global__ static void hc_split_weighted_sum_norm_fused_kernel(
         float *out,
         float *norm_out,
         float *split,
         const float *mix,
-        const ds4_hc_t *residual_hc,
+        const pulsar_hc_t *residual_hc,
         const float *scale,
         const float *base,
         const float *norm_w,
@@ -258,7 +258,7 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
             float acc = 0.0f;
             #pragma unroll
             for (uint32_t h = 0; h < 4; h++) {
-                acc += ds4_hc_load(residual_hc, rbase + (uint64_t)h * n_embd + col) * sp[h];
+                acc += pulsar_hc_load(residual_hc, rbase + (uint64_t)h * n_embd + col) * sp[h];
             }
             out[obase + col] = acc;
             accs[u] = acc;
@@ -291,7 +291,7 @@ __global__ static void hc_split_weighted_sum_norm_fused_generic_kernel(
         float *norm_out,
         float *split,
         const float *mix,
-        const ds4_hc_t *residual_hc,
+        const pulsar_hc_t *residual_hc,
         const float *scale,
         const float *base,
         const float *norm_w,
@@ -314,7 +314,7 @@ __global__ static void hc_split_weighted_sum_norm_fused_generic_kernel(
     for (uint32_t col = d; col < n_embd; col += blockDim.x) {
         float acc = 0.0f;
         for (uint32_t h = 0; h < 4; h++) {
-            acc += ds4_hc_load(residual_hc, (uint64_t)t * 4u * n_embd + (uint64_t)h * n_embd + col) * sp[h];
+            acc += pulsar_hc_load(residual_hc, (uint64_t)t * 4u * n_embd + (uint64_t)h * n_embd + col) * sp[h];
         }
         out[(uint64_t)t * n_embd + col] = acc;
         sum += acc * acc;
@@ -650,7 +650,7 @@ __global__ static void directional_steering_project_kernel(
 }
 
 
-int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint32_t n, float clamp, float weight) {
+int pulsar_gpu_swiglu_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *gate, const pulsar_gpu_tensor *up, uint32_t n, float clamp, float weight) {
     if (!out || !gate || !up ||
         out->bytes < (uint64_t)n * sizeof(float) ||
         gate->bytes < (uint64_t)n * sizeof(float) ||
@@ -660,27 +660,27 @@ int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const
 }
 
 
-int ds4_gpu_shared_gate_up_swiglu_mxfp8_tensor(
-        ds4_gpu_tensor       *gate,
-        ds4_gpu_tensor       *up,
-        ds4_gpu_tensor       *mid,
+int pulsar_gpu_shared_gate_up_swiglu_mxfp8_tensor(
+        pulsar_gpu_tensor       *gate,
+        pulsar_gpu_tensor       *up,
+        pulsar_gpu_tensor       *mid,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                gate_offset,
         uint64_t                up_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
+        const pulsar_gpu_tensor *x,
         float                   clamp) {
-    return ds4_gpu_matmul_mxfp8_tensor(gate, model_map, model_size,
+    return pulsar_gpu_matmul_mxfp8_tensor(gate, model_map, model_size,
                                         gate_offset, in_dim, out_dim, x, 1) &&
-           ds4_gpu_matmul_mxfp8_tensor(up, model_map, model_size,
+           pulsar_gpu_matmul_mxfp8_tensor(up, model_map, model_size,
                                         up_offset, in_dim, out_dim, x, 1) &&
-           ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, clamp, 1.0f);
+           pulsar_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, clamp, 1.0f);
 }
 
 
-int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t n) {
+int pulsar_gpu_add_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *a, const pulsar_gpu_tensor *b, uint32_t n) {
     if (!out || !a || !b ||
         out->bytes < (uint64_t)n * sizeof(float) ||
         a->bytes < (uint64_t)n * sizeof(float) ||
@@ -690,9 +690,9 @@ int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_g
 }
 
 
-int ds4_gpu_directional_steering_project_tensor(
-        ds4_gpu_tensor       *x,
-        const ds4_gpu_tensor *directions,
+int pulsar_gpu_directional_steering_project_tensor(
+        pulsar_gpu_tensor       *x,
+        const pulsar_gpu_tensor *directions,
         uint32_t                layer,
         uint32_t                width,
         uint32_t                rows,
@@ -715,7 +715,7 @@ int ds4_gpu_directional_steering_project_tensor(
 }
 
 
-int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits) {
+int pulsar_gpu_router_select_tensor(pulsar_gpu_tensor *selected, pulsar_gpu_tensor *weights, pulsar_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const pulsar_gpu_tensor *logits) {
     if (!selected || !weights || !probs || !logits || !model_map || n_expert_groups > 1u || n_group_used > 0u) return 0;
     if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
     int32_t tok = (int32_t)token;
@@ -757,7 +757,7 @@ int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weigh
 }
 
 
-int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
+int pulsar_gpu_router_select_batch_tensor(pulsar_gpu_tensor *selected, pulsar_gpu_tensor *weights, pulsar_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const pulsar_gpu_tensor *logits, const pulsar_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
     if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
     if (!selected || !weights || !probs || !logits || !tokens || !model_map || n_tokens == 0 ||
         n_expert_groups > 1u || n_group_used > 0u ||
@@ -828,7 +828,7 @@ int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor 
 }
 
 
-int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
+int pulsar_gpu_hc_split_sinkhorn_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;
     const uint64_t mix_bytes = 24ull * sizeof(float);
     if (scale_offset > model_size || model_size - scale_offset < 3ull * sizeof(float) ||
@@ -848,40 +848,40 @@ int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *
 }
 
 
-int ds4_gpu_hc_weighted_sum_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *weights, uint32_t n_embd, uint32_t n_hc) {
+int pulsar_gpu_hc_weighted_sum_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *residual_hc, const pulsar_gpu_tensor *weights, uint32_t n_embd, uint32_t n_hc) {
     if (!out || !residual_hc || !weights || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out->bytes / ((uint64_t)n_embd * sizeof(float)));
     /* n_tokens comes from the OUTPUT; bound the carrier input too, mirroring
-     * ds4_gpu_hc_split_weighted_sum_tensor. The BF16 narrowing removed the
+     * pulsar_gpu_hc_split_weighted_sum_tensor. The BF16 narrowing removed the
      * accidental 2x margin that made an over-read harmless (task #62). */
-    if (residual_hc->bytes < (uint64_t)n_tokens * n_hc * n_embd * DS4_HC_ELT_SIZE ||
+    if (residual_hc->bytes < (uint64_t)n_tokens * n_hc * n_embd * PULSAR_HC_ELT_SIZE ||
         weights->bytes < (uint64_t)n_tokens * n_hc * sizeof(float)) return 0;
     hc_weighted_sum_kernel<<<((uint64_t)n_embd * n_tokens + 255) / 256, 256>>>(
-        (float *)out->ptr, (const ds4_hc_t *)residual_hc->ptr, (const float *)weights->ptr,
+        (float *)out->ptr, (const pulsar_hc_t *)residual_hc->ptr, (const float *)weights->ptr,
         n_embd, n_hc, n_tokens, n_hc);
     return cuda_ok(cudaGetLastError(), "hc_weighted_sum launch");
 }
 
 
-int ds4_gpu_hc_weighted_sum_split_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+int pulsar_gpu_hc_weighted_sum_split_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *residual_hc, const pulsar_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out->bytes / ((uint64_t)n_embd * sizeof(float)));
     uint32_t stride = (uint32_t)(2u * n_hc + n_hc * n_hc);
     /* Bound the carrier input as well as the output (see the sibling above). */
-    if (residual_hc->bytes < (uint64_t)n_tokens * n_hc * n_embd * DS4_HC_ELT_SIZE ||
+    if (residual_hc->bytes < (uint64_t)n_tokens * n_hc * n_embd * PULSAR_HC_ELT_SIZE ||
         split->bytes < (uint64_t)n_tokens * stride * sizeof(float)) return 0;
     hc_weighted_sum_kernel<<<((uint64_t)n_embd * n_tokens + 255) / 256, 256>>>(
-        (float *)out->ptr, (const ds4_hc_t *)residual_hc->ptr, (const float *)split->ptr,
+        (float *)out->ptr, (const pulsar_hc_t *)residual_hc->ptr, (const float *)split->ptr,
         n_embd, n_hc, n_tokens, stride);
     return cuda_ok(cudaGetLastError(), "hc_weighted_sum_split launch");
 }
 
 
-int ds4_gpu_hc_split_weighted_sum_tensor(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *split,
-        const ds4_gpu_tensor *mix,
-        const ds4_gpu_tensor *residual_hc,
+int pulsar_gpu_hc_split_weighted_sum_tensor(
+        pulsar_gpu_tensor       *out,
+        pulsar_gpu_tensor       *split,
+        const pulsar_gpu_tensor *mix,
+        const pulsar_gpu_tensor *residual_hc,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                scale_offset,
@@ -897,7 +897,7 @@ int ds4_gpu_hc_split_weighted_sum_tensor(
     const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
     const uint64_t mix_bytes = mix_hc * sizeof(float);
     const uint64_t out_row_bytes = (uint64_t)n_embd * sizeof(float);
-    const uint64_t residual_row_bytes = (uint64_t)n_hc * n_embd * DS4_HC_ELT_SIZE;
+    const uint64_t residual_row_bytes = (uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE;
     if (out->bytes < out_row_bytes || out->bytes % out_row_bytes != 0 ||
         scale_offset > model_size || 3ull * sizeof(float) > model_size - scale_offset ||
         base_offset > model_size || mix_bytes > model_size - base_offset) {
@@ -916,7 +916,7 @@ int ds4_gpu_hc_split_weighted_sum_tensor(
             (float *)out->ptr,
             (float *)split->ptr,
             (const float *)mix->ptr,
-            (const ds4_hc_t *)residual_hc->ptr,
+            (const pulsar_hc_t *)residual_hc->ptr,
             scale,
             base,
             n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps);
@@ -924,12 +924,12 @@ int ds4_gpu_hc_split_weighted_sum_tensor(
 }
 
 
-int ds4_gpu_hc_split_weighted_sum_norm_tensor(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *norm_out,
-        ds4_gpu_tensor       *split,
-        const ds4_gpu_tensor *mix,
-        const ds4_gpu_tensor *residual_hc,
+int pulsar_gpu_hc_split_weighted_sum_norm_tensor(
+        pulsar_gpu_tensor       *out,
+        pulsar_gpu_tensor       *norm_out,
+        pulsar_gpu_tensor       *split,
+        const pulsar_gpu_tensor *mix,
+        const pulsar_gpu_tensor *residual_hc,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                scale_offset,
@@ -947,7 +947,7 @@ int ds4_gpu_hc_split_weighted_sum_norm_tensor(
     const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
     const uint64_t mix_bytes = mix_hc * sizeof(float);
     const uint64_t out_row_bytes = (uint64_t)n_embd * sizeof(float);
-    const uint64_t residual_row_bytes = (uint64_t)n_hc * n_embd * DS4_HC_ELT_SIZE;
+    const uint64_t residual_row_bytes = (uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE;
     if (out->bytes < out_row_bytes || out->bytes % out_row_bytes != 0 ||
         norm_out->bytes < out->bytes ||
         scale_offset > model_size || 3ull * sizeof(float) > model_size - scale_offset ||
@@ -969,16 +969,16 @@ int ds4_gpu_hc_split_weighted_sum_norm_tensor(
     const float *norm_w = (const float *)cuda_model_range_ptr(model_map, norm_weight_offset,
             (uint64_t)n_embd * sizeof(float), "hc_norm_weight");
     if (!scale || !base || !norm_w) return 0;
-#define DS4_HCFUSED_BLK 256u
-#define DS4_HCFUSED_VEC 16u
-    if (n_embd <= DS4_HCFUSED_BLK * DS4_HCFUSED_VEC) {
-        hc_split_weighted_sum_norm_fused_kernel<DS4_HCFUSED_BLK, DS4_HCFUSED_VEC>
-                <<<(uint32_t)n_rows, DS4_HCFUSED_BLK>>>(
+#define PULSAR_HCFUSED_BLK 256u
+#define PULSAR_HCFUSED_VEC 16u
+    if (n_embd <= PULSAR_HCFUSED_BLK * PULSAR_HCFUSED_VEC) {
+        hc_split_weighted_sum_norm_fused_kernel<PULSAR_HCFUSED_BLK, PULSAR_HCFUSED_VEC>
+                <<<(uint32_t)n_rows, PULSAR_HCFUSED_BLK>>>(
                 (float *)out->ptr,
                 (float *)norm_out->ptr,
                 (float *)split->ptr,
                 (const float *)mix->ptr,
-                (const ds4_hc_t *)residual_hc->ptr,
+                (const pulsar_hc_t *)residual_hc->ptr,
                 scale,
                 base,
                 norm_w,
@@ -990,7 +990,7 @@ int ds4_gpu_hc_split_weighted_sum_norm_tensor(
             (float *)norm_out->ptr,
             (float *)split->ptr,
             (const float *)mix->ptr,
-            (const ds4_hc_t *)residual_hc->ptr,
+            (const pulsar_hc_t *)residual_hc->ptr,
             scale,
             base,
             norm_w,
@@ -999,9 +999,9 @@ int ds4_gpu_hc_split_weighted_sum_norm_tensor(
 }
 
 
-int ds4_gpu_output_hc_weights_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *pre,
+int pulsar_gpu_output_hc_weights_tensor(
+        pulsar_gpu_tensor       *out,
+        const pulsar_gpu_tensor *pre,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                scale_offset,
@@ -1033,14 +1033,14 @@ int ds4_gpu_output_hc_weights_tensor(
 }
 
 
-int ds4_gpu_hc_expand_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *post, const ds4_gpu_tensor *comb, uint32_t n_embd, uint32_t n_hc) {
+int pulsar_gpu_hc_expand_tensor(pulsar_gpu_tensor *out_hc, const pulsar_gpu_tensor *block_out, const pulsar_gpu_tensor *residual_hc, const pulsar_gpu_tensor *post, const pulsar_gpu_tensor *comb, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !block_out || !residual_hc || !post || !comb || n_embd == 0 || n_hc == 0) return 0;
-    uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * DS4_HC_ELT_SIZE));
+    uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE));
     uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
-    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((ds4_hc_t *)out_hc->ptr,
+    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((pulsar_hc_t *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_out->ptr,
-                                                    (const ds4_hc_t *)residual_hc->ptr,
+                                                    (const pulsar_hc_t *)residual_hc->ptr,
                                                     (const float *)post->ptr,
                                                     (const float *)comb->ptr,
                                                     n_embd, n_hc, n_tokens,
@@ -1049,16 +1049,16 @@ int ds4_gpu_hc_expand_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block
 }
 
 
-int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+int pulsar_gpu_hc_expand_split_tensor(pulsar_gpu_tensor *out_hc, const pulsar_gpu_tensor *block_out, const pulsar_gpu_tensor *residual_hc, const pulsar_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !block_out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
-    uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * DS4_HC_ELT_SIZE));
+    uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE));
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
     uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
     const float *base = (const float *)split->ptr;
-    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((ds4_hc_t *)out_hc->ptr,
+    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((pulsar_hc_t *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_out->ptr,
-                                                    (const ds4_hc_t *)residual_hc->ptr,
+                                                    (const pulsar_hc_t *)residual_hc->ptr,
                                                     base + n_hc,
                                                     base + 2u * n_hc,
                                                     n_embd, n_hc, n_tokens,
@@ -1068,16 +1068,16 @@ int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor 
 
 
 
-int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+int pulsar_gpu_hc_expand_add_split_tensor(pulsar_gpu_tensor *out_hc, const pulsar_gpu_tensor *block_out, const pulsar_gpu_tensor *block_add, const pulsar_gpu_tensor *residual_hc, const pulsar_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !block_out || !block_add || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
-    uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * DS4_HC_ELT_SIZE));
+    uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE));
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
     uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
     const float *base = (const float *)split->ptr;
-    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((ds4_hc_t *)out_hc->ptr,
+    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((pulsar_hc_t *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_add->ptr,
-                                                    (const ds4_hc_t *)residual_hc->ptr,
+                                                    (const pulsar_hc_t *)residual_hc->ptr,
                                                     base + n_hc,
                                                     base + 2u * n_hc,
                                                     n_embd, n_hc, n_tokens,
@@ -1087,40 +1087,40 @@ int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_ten
 
 
 
-int ds4_gpu_shared_down_hc_expand_mxfp8_tensor(
-        ds4_gpu_tensor       *out_hc,
-        ds4_gpu_tensor       *shared_out,
+int pulsar_gpu_shared_down_hc_expand_mxfp8_tensor(
+        pulsar_gpu_tensor       *out_hc,
+        pulsar_gpu_tensor       *shared_out,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
-        const ds4_gpu_tensor *shared_mid,
-        const ds4_gpu_tensor *routed_out,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *split,
+        const pulsar_gpu_tensor *shared_mid,
+        const pulsar_gpu_tensor *routed_out,
+        const pulsar_gpu_tensor *residual_hc,
+        const pulsar_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
-    return ds4_gpu_matmul_mxfp8_tensor(shared_out, model_map, model_size,
+    return pulsar_gpu_matmul_mxfp8_tensor(shared_out, model_map, model_size,
                                         weight_offset, in_dim, out_dim,
                                         shared_mid, 1) &&
-           ds4_gpu_hc_expand_add_split_tensor(out_hc, shared_out, routed_out,
+           pulsar_gpu_hc_expand_add_split_tensor(out_hc, shared_out, routed_out,
                                                 residual_hc, split, n_embd, n_hc);
 }
 
 
 
-int ds4_gpu_matmul_fp8_hc_expand_tensor(
-        ds4_gpu_tensor       *out_hc,
-        ds4_gpu_tensor       *block_out,
+int pulsar_gpu_matmul_fp8_hc_expand_tensor(
+        pulsar_gpu_tensor       *out_hc,
+        pulsar_gpu_tensor       *block_out,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *split,
+        const pulsar_gpu_tensor *x,
+        const pulsar_gpu_tensor *residual_hc,
+        const pulsar_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
     static const int disable_fused = getenv("DS4_CUDA_DISABLE_FP8_HC_EXPAND_FUSED") != NULL;
@@ -1136,9 +1136,9 @@ int ds4_gpu_matmul_fp8_hc_expand_tensor(
                                                         n_embd, n_hc,
                                                         "fp8_hc_expand");
     }
-    return ds4_gpu_matmul_mxfp8_tensor(block_out, model_map, model_size,
+    return pulsar_gpu_matmul_mxfp8_tensor(block_out, model_map, model_size,
                                         weight_offset, in_dim, out_dim, x, 1) &&
-           ds4_gpu_hc_expand_split_tensor(out_hc, block_out, residual_hc,
+           pulsar_gpu_hc_expand_split_tensor(out_hc, block_out, residual_hc,
                                             split, n_embd, n_hc);
 }
 
@@ -1163,7 +1163,7 @@ int ds4_gpu_matmul_fp8_hc_expand_tensor(
  * loops get compile-time strides so UNROLL loads are in flight per warp.
  *
  * `x` is an HC residual CARRIER (cur_hc / after_attn_hc), so it is read through
- * ds4_hc_load -- BF16 storage promoted to f32 -- matching rms_norm_plain_kernel
+ * pulsar_hc_load -- BF16 storage promoted to f32 -- matching rms_norm_plain_kernel
  * exactly (task #62).  Reading it as float* would be silent corruption.
  *
  * WHY IT IS BIT-EXACT, not merely close:
@@ -1181,7 +1181,7 @@ template <uint32_t BLK, uint32_t UNROLL>
 __global__ static void hc_norm_mix_f16_kernel(
         float *out,
         const __half *w,
-        const ds4_hc_t *x,
+        const pulsar_hc_t *x,
         uint32_t n,
         uint32_t out_dim,
         float eps) {
@@ -1196,12 +1196,12 @@ __global__ static void hc_norm_mix_f16_kernel(
     for (; i + (UNROLL - 1u) * BLK < n; i += BLK * UNROLL) {
         float v[UNROLL];
         #pragma unroll
-        for (uint32_t u = 0; u < UNROLL; u++) v[u] = ds4_hc_load(x, i + u * BLK);
+        for (uint32_t u = 0; u < UNROLL; u++) v[u] = pulsar_hc_load(x, i + u * BLK);
         #pragma unroll
         for (uint32_t u = 0; u < UNROLL; u++) sum += v[u] * v[u];
     }
     for (; i < n; i += BLK) {
-        float v = ds4_hc_load(x, i);
+        float v = pulsar_hc_load(x, i);
         sum += v * v;
     }
     partial[tid] = sum;
@@ -1221,7 +1221,7 @@ __global__ static void hc_norm_mix_f16_kernel(
         float xv[UNROLL];
         float wv[UNROLL];
         #pragma unroll
-        for (uint32_t u = 0; u < UNROLL; u++) xv[u] = ds4_hc_load(x, i + u * BLK);
+        for (uint32_t u = 0; u < UNROLL; u++) xv[u] = pulsar_hc_load(x, i + u * BLK);
         #pragma unroll
         for (uint32_t u = 0; u < UNROLL; u++) wv[u] = __half2float(wr[i + u * BLK]);
         /* pinned roundings: __fmul_rn reproduces the f32 that rms_norm_plain
@@ -1233,7 +1233,7 @@ __global__ static void hc_norm_mix_f16_kernel(
         for (uint32_t u = 0; u < UNROLL; u++) dot = __fmaf_rn(wv[u], __fmul_rn(xv[u], scale), dot);
     }
     for (; i < n; i += BLK) {
-        dot = __fmaf_rn(__half2float(wr[i]), __fmul_rn(ds4_hc_load(x, i), scale), dot);
+        dot = __fmaf_rn(__half2float(wr[i]), __fmul_rn(pulsar_hc_load(x, i), scale), dot);
     }
     partial[tid] = dot;
     __syncthreads();
@@ -1245,26 +1245,26 @@ __global__ static void hc_norm_mix_f16_kernel(
 }
 
 
-int ds4_gpu_hc_norm_mix_f16_tensor(
-        ds4_gpu_tensor       *out,
+int pulsar_gpu_hc_norm_mix_f16_tensor(
+        pulsar_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
+        const pulsar_gpu_tensor *x,
         float                   eps) {
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0) return 0;
     if (in_dim > UINT32_MAX || out_dim > UINT32_MAX) return 0;
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
     const uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
     if (weight_bytes > model_size - weight_offset) return 0;
-    /* x is an HC residual carrier: DS4_HC_ELT_SIZE bytes per sample. */
-    if (x->bytes < in_dim * DS4_HC_ELT_SIZE || out->bytes < out_dim * sizeof(float)) return 0;
+    /* x is an HC residual carrier: PULSAR_HC_ELT_SIZE bytes per sample. */
+    if (x->bytes < in_dim * PULSAR_HC_ELT_SIZE || out->bytes < out_dim * sizeof(float)) return 0;
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "f16");
     if (!wptr) return 0;
     hc_norm_mix_f16_kernel<256, 8><<<(uint32_t)out_dim, 256>>>(
-            (float *)out->ptr, (const __half *)wptr, (const ds4_hc_t *)x->ptr,
+            (float *)out->ptr, (const __half *)wptr, (const pulsar_hc_t *)x->ptr,
             (uint32_t)in_dim, (uint32_t)out_dim, eps);
     return cuda_ok(cudaGetLastError(), "hc norm mix f16 launch");
 }

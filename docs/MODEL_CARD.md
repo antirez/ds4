@@ -2,7 +2,7 @@
 
 This document extracts the most important information from the official
 DeepSeek-V4-Flash Hugging Face model card, with emphasis on facts that matter
-for local inference, DS4 development, and benchmark interpretation.
+for local inference, Pulsar development, and benchmark interpretation.
 
 Source: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash
 
@@ -24,12 +24,12 @@ remaining behind Pro on pure knowledge and the most complex agentic tasks.
 
 DeepSeek-V4 uses long-context compressed attention. The model card calls the
 hybrid design Compressed Sparse Attention (CSA) plus Heavily Compressed
-Attention (HCA). In DS4 terms, each layer keeps a raw sliding-window KV cache
+Attention (HCA). In Pulsar terms, each layer keeps a raw sliding-window KV cache
 for the latest 128 tokens. This is the high-resolution local context.
 
 After that raw window, the model uses layer-dependent compressed KV rows:
 
-| 0-based layer indexes | DS4 ratio | Extra state | Meaning |
+| 0-based layer indexes | Pulsar ratio | Extra state | Meaning |
 |---|---:|---|---|
 | 0, 1 | none | none | Raw 128-token sliding window only |
 | even layers from 2 onward | 4 | compressed KV + indexer KV | One compressed row per 4 tokens, with an indexer selecting visible compressed rows |
@@ -44,12 +44,12 @@ compressed rows can be consumed by the same mixed-attention computation.
 
 Ratio-4 layers are the selective compressed-attention layers. They maintain a
 second compressed stream for the indexer, and when the compressed history is
-larger than the configured top-k, DS4 scores the compressed rows and selects up
+larger than the configured top-k, Pulsar scores the compressed rows and selects up
 to 512 of them for attention. Ratio-128 layers are the heavily compressed path:
 they do not have the indexer stream and use the available ratio-128 compressed
 rows directly.
 
-DS4 validates these details from the GGUF metadata. The relevant fixed
+Pulsar validates these details from the GGUF metadata. The relevant fixed
 implementation constants are:
 
 - Layers: 43
@@ -222,7 +222,7 @@ For local deployment, it recommends:
 - At least 384K context for Think Max
 
 These are deployment recommendations from the model card, not necessarily the
-same settings used for deterministic benchmarking. DS4 keeps `top_p=1.0` but
+same settings used for deterministic benchmarking. Pulsar keeps `top_p=1.0` but
 adds a local `min_p=0.05` default to avoid sampling tokens whose probability is
 far below the best token.
 

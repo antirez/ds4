@@ -1,4 +1,4 @@
-#include "ds4_server_internal.h"
+#include "pulsar_server_internal.h"
 
 
 
@@ -49,7 +49,7 @@ bool slot_writer_flush(slot_writer *w) {
         ssize_t r = send(w->fd, w->pending.ptr + w->off, w->pending.len - w->off, 0);
         if (r > 0) {
             w->off += (size_t)r;
-            w->stall_deadline_ms = wall_ms() + DS4_SERVER_SEND_STALL_TIMEOUT_MS;
+            w->stall_deadline_ms = wall_ms() + PULSAR_SERVER_SEND_STALL_TIMEOUT_MS;
             continue;
         }
         if (r < 0 && errno == EINTR) continue;
@@ -107,12 +107,12 @@ static bool slot_writer_send(slot_writer *w, const void *p, size_t n) {
         w->off = 0;
     }
     buf_append(&w->pending, s, n);
-    if (w->pending.len - w->off > DS4_SERVER_WRITER_MAX_PENDING_BYTES) {
+    if (w->pending.len - w->off > PULSAR_SERVER_WRITER_MAX_PENDING_BYTES) {
         w->failed = true;
         return false;
     }
     if (!w->stall_deadline_ms) {
-        w->stall_deadline_ms = wall_ms() + DS4_SERVER_SEND_STALL_TIMEOUT_MS;
+        w->stall_deadline_ms = wall_ms() + PULSAR_SERVER_SEND_STALL_TIMEOUT_MS;
     }
     return slot_writer_flush(w);
 }
@@ -155,7 +155,7 @@ bool send_all(int fd, const void *p, size_t n) {
         return slot_writer_send(g_slot_writer, p, n);
     }
     const char *s = (const char *)p;
-    long long deadline = wall_ms() + DS4_SERVER_SEND_STALL_TIMEOUT_MS;
+    long long deadline = wall_ms() + PULSAR_SERVER_SEND_STALL_TIMEOUT_MS;
     while (n) {
         if (g_stop_requested) return false;
         ssize_t w = send(fd, s, n, 0);
@@ -175,7 +175,7 @@ bool send_all(int fd, const void *p, size_t n) {
         if (w <= 0) return false;
         s += w;
         n -= (size_t)w;
-        deadline = wall_ms() + DS4_SERVER_SEND_STALL_TIMEOUT_MS;
+        deadline = wall_ms() + PULSAR_SERVER_SEND_STALL_TIMEOUT_MS;
     }
     return true;
 }
@@ -238,8 +238,8 @@ void json_escape_fragment_n(buf *b, const char *s, size_t n) {
 const char *find_any_tool_start(const char *s) {
     const char *best = NULL;
     const char *candidates[] = {
-        strstr(s, DS4_TOOL_CALLS_START),
-        strstr(s, DS4_TOOL_CALLS_START_SHORT),
+        strstr(s, PULSAR_TOOL_CALLS_START),
+        strstr(s, PULSAR_TOOL_CALLS_START_SHORT),
         strstr(s, "<tool_calls>"),
     };
     for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
@@ -253,8 +253,8 @@ const char *find_any_tool_start(const char *s) {
 static const char *find_any_tool_end(const char *s) {
     const char *best = NULL;
     const char *candidates[] = {
-        strstr(s, DS4_TOOL_CALLS_END),
-        strstr(s, DS4_TOOL_CALLS_END_SHORT),
+        strstr(s, PULSAR_TOOL_CALLS_END),
+        strstr(s, PULSAR_TOOL_CALLS_END_SHORT),
         strstr(s, "</tool_calls>"),
     };
     for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
@@ -506,7 +506,7 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
              * think block) — the whole text is reasoning, even when the
              * <think> opener lives in the prompt rather than the generation.
              * Ignore any DSML in it, and keep it off the content channel. */
-            server_log(DS4_LOG_TOOL, "thinking not closed, ignoring DSML in reasoning");
+            server_log(PULSAR_LOG_TOOL, "thinking not closed, ignoring DSML in reasoning");
             const char *body = !strncmp(text, "<think>", 7) ? text + 7 : text;
             *reasoning_out = xstrdup(body);
             *content_out = xstrdup("");
@@ -515,15 +515,15 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
         tool_search = think_end + 8;
     }
 
-    const char *start = strstr(tool_search, "\n\n" DS4_TOOL_CALLS_START);
+    const char *start = strstr(tool_search, "\n\n" PULSAR_TOOL_CALLS_START);
     int style = 0; /* 0: DSML, 1: plain XML, 2: DSML with the first vertical bar omitted. */
-    if (!start) start = strstr(tool_search, DS4_TOOL_CALLS_START);
+    if (!start) start = strstr(tool_search, PULSAR_TOOL_CALLS_START);
     if (!start) {
-        start = strstr(tool_search, "\n\n" DS4_TOOL_CALLS_START_SHORT);
+        start = strstr(tool_search, "\n\n" PULSAR_TOOL_CALLS_START_SHORT);
         style = start ? 2 : style;
     }
     if (!start) {
-        start = strstr(tool_search, DS4_TOOL_CALLS_START_SHORT);
+        start = strstr(tool_search, PULSAR_TOOL_CALLS_START_SHORT);
         style = start ? 2 : style;
     }
     if (!start) {
@@ -541,12 +541,12 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
 
     size_t content_len = trim_tool_separator_ws(text, 0, (size_t)(start - text));
     const char *raw_block_start = start;
-    const char *tool_calls_start = DS4_TOOL_CALLS_START;
-    const char *tool_calls_end = DS4_TOOL_CALLS_END;
-    const char *invoke_start = DS4_INVOKE_START;
-    const char *invoke_end = DS4_INVOKE_END;
-    const char *param_start = DS4_PARAM_START;
-    const char *param_end = DS4_PARAM_END;
+    const char *tool_calls_start = PULSAR_TOOL_CALLS_START;
+    const char *tool_calls_end = PULSAR_TOOL_CALLS_END;
+    const char *invoke_start = PULSAR_INVOKE_START;
+    const char *invoke_end = PULSAR_INVOKE_END;
+    const char *param_start = PULSAR_PARAM_START;
+    const char *param_end = PULSAR_PARAM_END;
     if (style == 1) {
         tool_calls_start = "<tool_calls>";
         tool_calls_end = "</tool_calls>";
@@ -555,12 +555,12 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
         param_start = "<parameter";
         param_end = "</parameter>";
     } else if (style == 2) {
-        tool_calls_start = DS4_TOOL_CALLS_START_SHORT;
-        tool_calls_end = DS4_TOOL_CALLS_END_SHORT;
-        invoke_start = DS4_INVOKE_START_SHORT;
-        invoke_end = DS4_INVOKE_END_SHORT;
-        param_start = DS4_PARAM_START_SHORT;
-        param_end = DS4_PARAM_END_SHORT;
+        tool_calls_start = PULSAR_TOOL_CALLS_START_SHORT;
+        tool_calls_end = PULSAR_TOOL_CALLS_END_SHORT;
+        invoke_start = PULSAR_INVOKE_START_SHORT;
+        invoke_end = PULSAR_INVOKE_END_SHORT;
+        param_start = PULSAR_PARAM_START_SHORT;
+        param_end = PULSAR_PARAM_END_SHORT;
     }
 
     const char *p = strstr(start, tool_calls_start);
@@ -694,14 +694,14 @@ bool try_repair_dsml(const char *s, size_t len, buf *out) {
 
     /* Detect style from first <tool_calls> tag */
     const char *ts, *te, *is, *ie, *ps, *pe;
-    if (strstr(scan_start, DS4_TOOL_CALLS_START)) {
-        ts = DS4_TOOL_CALLS_START;  te = DS4_TOOL_CALLS_END;
-        is = DS4_INVOKE_START;      ie = DS4_INVOKE_END;
-        ps = DS4_PARAM_START;       pe = DS4_PARAM_END;
-    } else if (strstr(scan_start, DS4_TOOL_CALLS_START_SHORT)) {
-        ts = DS4_TOOL_CALLS_START_SHORT;  te = DS4_TOOL_CALLS_END_SHORT;
-        is = DS4_INVOKE_START_SHORT;      ie = DS4_INVOKE_END_SHORT;
-        ps = DS4_PARAM_START_SHORT;       pe = DS4_PARAM_END_SHORT;
+    if (strstr(scan_start, PULSAR_TOOL_CALLS_START)) {
+        ts = PULSAR_TOOL_CALLS_START;  te = PULSAR_TOOL_CALLS_END;
+        is = PULSAR_INVOKE_START;      ie = PULSAR_INVOKE_END;
+        ps = PULSAR_PARAM_START;       pe = PULSAR_PARAM_END;
+    } else if (strstr(scan_start, PULSAR_TOOL_CALLS_START_SHORT)) {
+        ts = PULSAR_TOOL_CALLS_START_SHORT;  te = PULSAR_TOOL_CALLS_END_SHORT;
+        is = PULSAR_INVOKE_START_SHORT;      ie = PULSAR_INVOKE_END_SHORT;
+        ps = PULSAR_PARAM_START_SHORT;       pe = PULSAR_PARAM_END_SHORT;
     } else if (strstr(scan_start, "<tool_calls>")) {
         ts = "<tool_calls>";   te = "</tool_calls>";
         is = "<invoke";        ie = "</invoke>";

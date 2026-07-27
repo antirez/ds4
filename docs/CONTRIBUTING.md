@@ -1,6 +1,6 @@
 # Contributing
 
-DwarfStar4 changes should be tested against the failure mode they can realistically
+Pulsar changes should be tested against the failure mode they can realistically
 affect. The project has two regression tracks: correctness and speed. Please
 include the commands you ran, the machine/backend, the model quant, and any
 notable failures in the PR or commit notes.
@@ -19,7 +19,7 @@ make clean
 make cuda-spark
 ```
 
-The C test runner is `ds4_test`. Running it without arguments is equivalent to
+The C test runner is `pulsar_test`. Running it without arguments is equivalent to
 `--all`:
 
 ```sh
@@ -29,10 +29,10 @@ make test
 Useful narrower checks:
 
 ```sh
-./ds4_test --server
-./ds4_test --logprob-vectors
-./ds4_test --long-context
-./ds4_test --tool-call-quality
+./pulsar_test --server
+./pulsar_test --logprob-vectors
+./pulsar_test --long-context
+./pulsar_test --tool-call-quality
 ```
 
 What they cover:
@@ -53,9 +53,9 @@ What they cover:
 The runner defaults to `ds4flash.gguf`. Override paths when needed:
 
 ```sh
-DS4_TEST_MODEL=/path/to/model.gguf ./ds4_test --logprob-vectors
-DS4_TEST_VECTOR_FILE=/path/to/official.vec ./ds4_test --logprob-vectors
-DS4_TEST_LONG_PROMPT=/path/to/prompt.txt ./ds4_test --long-context
+DS4_TEST_MODEL=/path/to/model.gguf ./pulsar_test --logprob-vectors
+DS4_TEST_VECTOR_FILE=/path/to/official.vec ./pulsar_test --logprob-vectors
+DS4_TEST_LONG_PROMPT=/path/to/prompt.txt ./pulsar_test --long-context
 ```
 
 For kernel or GPU-path changes, also run the CUDA smoke regression:
@@ -94,7 +94,7 @@ continuations.
 
 ## Speed Regression Tests
 
-Use `ds4-bench` for throughput regressions. It reports instantaneous prefill and
+Use `pulsar-bench` for throughput regressions. It reports instantaneous prefill and
 generation speed at context frontiers, not one whole-run average. Prefill is
 incremental: each row measures only the newly processed suffix since the
 previous frontier.
@@ -102,7 +102,7 @@ previous frontier.
 Default linear sweep:
 
 ```sh
-./ds4-bench \
+./pulsar-bench \
   -m ds4flash.gguf \
   --prompt-file speed-bench/promessi_sposi.txt \
   --ctx-start 2048 \
@@ -128,5 +128,5 @@ python3 speed-bench/plot_speed.py /tmp/ds4-speed.csv --title "Machine t/s"
 For debugging a failing generation, keep the trace:
 
 ```sh
-./ds4-server --trace /tmp/ds4-trace.txt ...
+./pulsar-server --trace /tmp/ds4-trace.txt ...
 ```

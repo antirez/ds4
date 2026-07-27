@@ -1,30 +1,30 @@
-#include "ds4_engine_internal.h"
+#include "pulsar_engine_internal.h"
 
 
 
-bool gpu_graph_directional_steering_attn_enabled(const ds4_gpu_graph *g) {
+bool gpu_graph_directional_steering_attn_enabled(const pulsar_gpu_graph *g) {
     return g && g->directional_steering_dirs && g->directional_steering_attn_scale != 0.0f;
 }
 
 
 
-bool gpu_graph_directional_steering_ffn_enabled(const ds4_gpu_graph *g) {
+bool gpu_graph_directional_steering_ffn_enabled(const pulsar_gpu_graph *g) {
     return g && g->directional_steering_dirs && g->directional_steering_ffn_scale != 0.0f;
 }
 
 
 
 static bool gpu_graph_apply_directional_steering(
-        ds4_gpu_graph  *g,
-        ds4_gpu_tensor *x,
+        pulsar_gpu_graph  *g,
+        pulsar_gpu_tensor *x,
         uint32_t          il,
         uint32_t          rows,
         float             scale) {
     if (!g || !g->directional_steering_dirs || scale == 0.0f) return true;
-    return ds4_gpu_directional_steering_project_tensor(x,
+    return pulsar_gpu_directional_steering_project_tensor(x,
                                             g->directional_steering_dirs,
                                             il,
-                                            DS4_N_EMBD,
+                                            PULSAR_N_EMBD,
                                             rows,
                                             scale) != 0;
 }
@@ -32,8 +32,8 @@ static bool gpu_graph_apply_directional_steering(
 
 
 bool gpu_graph_apply_directional_steering_attn(
-        ds4_gpu_graph  *g,
-        ds4_gpu_tensor *x,
+        pulsar_gpu_graph  *g,
+        pulsar_gpu_tensor *x,
         uint32_t          il,
         uint32_t          rows) {
     return gpu_graph_apply_directional_steering(g, x, il, rows, g ? g->directional_steering_attn_scale : 0.0f);
@@ -42,8 +42,8 @@ bool gpu_graph_apply_directional_steering_attn(
 
 
 bool gpu_graph_apply_directional_steering_ffn(
-        ds4_gpu_graph  *g,
-        ds4_gpu_tensor *x,
+        pulsar_gpu_graph  *g,
+        pulsar_gpu_tensor *x,
         uint32_t          il,
         uint32_t          rows) {
     return gpu_graph_apply_directional_steering(g, x, il, rows, g ? g->directional_steering_ffn_scale : 0.0f);
@@ -58,14 +58,14 @@ static uint64_t gpu_graph_kv_cache_bytes_for_context(uint32_t ctx_size, uint32_t
      * at the 512k+ contexts where performance matters most. */
     const uint64_t raw_elem = gpu_graph_raw_f16_enabled() ? sizeof(uint16_t)
                                                           : sizeof(float);
-    uint64_t bytes = (uint64_t)DS4_N_LAYER * raw_cap * DS4_N_HEAD_DIM * raw_elem;
+    uint64_t bytes = (uint64_t)PULSAR_N_LAYER * raw_cap * PULSAR_N_HEAD_DIM * raw_elem;
 
     const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
     const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
-        ? DS4_ENGINE_IDXFP4_ROWBYTES
-        : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        ? PULSAR_ENGINE_IDXFP4_ROWBYTES
+        : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint64_t comp_cap = (uint64_t)(ctx_size / ratio + 2u);
         bytes += comp_cap * attn_row;
@@ -84,8 +84,8 @@ uint64_t gpu_graph_context_bytes_for_kv_policy(
         uint32_t  prefill_cap,
         uint64_t *kv_cache_bytes_out) {
     uint32_t min_ratio = UINT32_MAX;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
     }
     if (min_ratio == UINT32_MAX) min_ratio = ctx_size ? ctx_size : 1u;
@@ -94,7 +94,7 @@ uint64_t gpu_graph_context_bytes_for_kv_policy(
     const uint64_t kv_cache_bytes = gpu_graph_kv_cache_bytes_for_context(ctx_size, raw_cap);
     if (kv_cache_bytes_out) *kv_cache_bytes_out = kv_cache_bytes;
     /* indexer_scores/comp_mask token rows shrink to the slice size under
-     * DS4_PREFILL_SLICE (see gpu_graph_prefill_slice / the gpu_diag alloc). */
+     * PULSAR_PREFILL_SLICE (see gpu_graph_prefill_slice / the gpu_diag alloc). */
     uint64_t score_rows = (uint64_t)prefill_cap;
     if (gpu_graph_prefill_slice() != 0u && (uint64_t)gpu_graph_prefill_slice() < score_rows) {
         score_rows = (uint64_t)gpu_graph_prefill_slice();
@@ -106,8 +106,8 @@ uint64_t gpu_graph_context_bytes_for_kv_policy(
 
 
 
-ds4_gpu_tensor *gpu_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes) {
-    return managed ? ds4_gpu_tensor_alloc_managed(bytes) : ds4_gpu_tensor_alloc(bytes);
+pulsar_gpu_tensor *gpu_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes) {
+    return managed ? pulsar_gpu_tensor_alloc_managed(bytes) : pulsar_gpu_tensor_alloc(bytes);
 }
 
 
@@ -117,7 +117,7 @@ ds4_gpu_tensor *gpu_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes) {
  * =========================================================================
  *
  * The release path calls these after important stages, but they are no-ops
- * unless DS4_CUDA_GRAPH_DUMP_PREFIX is set.  Dumping synchronizes and restarts
+ * unless PULSAR_CUDA_GRAPH_DUMP_PREFIX is set.  Dumping synchronizes and restarts
  * the command batch, so it is intentionally isolated here.
  */
 

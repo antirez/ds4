@@ -1,4 +1,4 @@
-#include "ds4_engine_internal.h"
+#include "pulsar_engine_internal.h"
 
 
 /* Confidence-scheduled draft trim threshold.  Defaults to tau=0.25.  At the
@@ -12,7 +12,7 @@
  * shifts float accumulation ~1 ULP and can flip near-tie greedy argmax on flat
  * (prose) distributions (benign numerical tie, same class as yield-quench) — so
  * tau is distribution-preserving but NOT byte-identical on greedy prose.
- * DS4_DSPARK_CONF_SCHED=<tau> overrides; "0"/"off" disables (verify all
+ * PULSAR_DSPARK_CONF_SCHED=<tau> overrides; "0"/"off" disables (verify all
  * n_draft).  Adaptive tau is not worth building at k=3 (payoff ~2-6%, mostly
  * captured by 0.25). */
 static float dspark_conf_sched_tau(void) {
@@ -38,7 +38,7 @@ static float dspark_conf_sched_tau(void) {
  * (terminal; a new request re-arms).
  *
  * Breakeven derivation (calibrated 2026-07-17 against per-step
- * DS4_DSPARK_STATS traces of the production v5mx serving path — 2585 steps
+ * PULSAR_DSPARK_STATS traces of the production v5mx serving path — 2585 steps
  * across prose/structured x greedy/T1.0, least-squares, resid rms 7.2 ms;
  * offline method after Entrpi's dspark_trace_replay, tool:
  * temp/quench/quench_replay.py):
@@ -79,7 +79,7 @@ static float dspark_conf_sched_tau(void) {
  * quality — charging it was measured (2026-07-17, first Load-2 gate run) to
  * book ~4.9 debt by step 6 at 2.3k ctx and spuriously quench the WINNING
  * sweep-prose cell (16.6 -> 14.8 t/s). The controller therefore ignores the
- * first DS4_QUENCH_WARMUP steps entirely, and MINEV=8 (Entrpi's replay
+ * first PULSAR_QUENCH_WARMUP steps entirely, and MINEV=8 (Entrpi's replay
  * default) delays the verdict until the EWMA reflects steady state.
  * Re-validated offline over all 17 Load-1 traces + deep synthetic steady
  * states: losers (shallow y~2.05, deep y~2.5) fire at tokens ~11-25;
@@ -135,12 +135,12 @@ static float dspark_conf_sched_tau(void) {
  * slows" is NOT what was measured: the step's depth slope (0.17 ms/1k) is close
  * to plain's (0.20). The guard ratio still improves with depth, but because the
  * step is 2-3x larger, not because it is flat. */
-#define DS4_QUENCH_FLAT_MS    57.0f
-#define DS4_QUENCH_ROW_MS     18.37f
-#define DS4_QUENCH_ALPHA      0.125f   /* EWMA weight (Entrpi default) */
-#define DS4_QUENCH_WARMUP     3u      /* ramp steps charged to no one (below) */
-#define DS4_QUENCH_MINEV      8u      /* min spec steps before quench */
-#define DS4_QUENCH_BUDGET     4.0f    /* plain-token equivalents */
+#define PULSAR_QUENCH_FLAT_MS    57.0f
+#define PULSAR_QUENCH_ROW_MS     18.37f
+#define PULSAR_QUENCH_ALPHA      0.125f   /* EWMA weight (Entrpi default) */
+#define PULSAR_QUENCH_WARMUP     3u      /* ramp steps charged to no one (below) */
+#define PULSAR_QUENCH_MINEV      8u      /* min spec steps before quench */
+#define PULSAR_QUENCH_BUDGET     4.0f    /* plain-token equivalents */
 
 /* Served plain-decode ms/token vs request depth: piecewise-linear through the
  * measured depth table (re-measured 2026-07-21 — see the block below for the
@@ -150,7 +150,7 @@ static float dspark_conf_sched_tau(void) {
  * depth, so beyond the last anchor we project that segment's slope rather than
  * flat-lining — a flat clamp under-estimates plain, which inflates the guard
  * and biases TOWARD quenching exactly where spec advantage is already marginal.
- * The projection is bounded at ~256k (DS4_QUENCH_PLAIN_CAP_POS), well past the
+ * The projection is bounded at ~256k (PULSAR_QUENCH_PLAIN_CAP_POS), well past the
  * measured range, rather than extrapolating without limit. Deterministic
  * (constants only) so the quench point stays reproducible for a fixed stream. */
 /* RE-MEASURED 2026-07-21 (medians of 3, run-to-run spread 0.01-0.11%), matching
@@ -192,7 +192,7 @@ static float dspark_conf_sched_tau(void) {
  * a real 100k point instead of a 38k one. Past 100k is UNMEASURED: the 256k cap
  * (~105.9 ms) is a bounded guess. Also unmeasured: whether structured/tool
  * output shifts plain ms/token at depth (all five anchors are prose). */
-#define DS4_QUENCH_PLAIN_CAP_POS 256000.0f
+#define PULSAR_QUENCH_PLAIN_CAP_POS 256000.0f
 static float spec_quench_plain_ms(int pos) {
     static const float px[5] = { 300.0f, 2300.0f, 9300.0f, 38000.0f, 100000.0f };
     static const float py[5] = { 55.7f, 62.9f, 65.8f, 70.0f, 80.2f };
@@ -204,25 +204,25 @@ static float spec_quench_plain_ms(int pos) {
                                    (px[i] - px[i - 1]);
     /* pos > 100000: extend the last segment's slope, capped at the 256k value. */
     const float slope = (py[4] - py[3]) / (px[4] - px[3]);
-    const float q = p < DS4_QUENCH_PLAIN_CAP_POS ? p : DS4_QUENCH_PLAIN_CAP_POS;
+    const float q = p < PULSAR_QUENCH_PLAIN_CAP_POS ? p : PULSAR_QUENCH_PLAIN_CAP_POS;
     return py[4] + slope * (q - px[4]);
 }
 
 static float spec_quench_guard(uint32_t n_batch, int pos) {
-    return (DS4_QUENCH_FLAT_MS + DS4_QUENCH_ROW_MS * (float)n_batch) /
+    return (PULSAR_QUENCH_FLAT_MS + PULSAR_QUENCH_ROW_MS * (float)n_batch) /
            spec_quench_plain_ms(pos);
 }
 
 /* Re-arm at request boundaries (the same sites that drop the carry and
  * pendings). All-zero == armed, matching the xcalloc'd session. */
-static void spec_quench_reset(ds4_session *s) {
+static void spec_quench_reset(pulsar_session *s) {
     s->spec.spec_quench_debt = 0.0f;
     s->spec.spec_quench_ewma = 0.0f;
     s->spec.spec_quench_steps = 0;
     s->spec.spec_quenched = false;
 }
 
-/* Test-only (identity gates): DS4_QUENCH_FORCE_STEP=<N> latches the quench
+/* Test-only (identity gates): PULSAR_QUENCH_FORCE_STEP=<N> latches the quench
  * unconditionally once N fused spec steps have run, and disables the policy
  * decision. The check runs inside the fused step after steps++, so the
  * earliest possible latch is after step 1 completes: N=0 behaves like N=1
@@ -278,7 +278,7 @@ static int payload_write_bytes(FILE *fp, const void *ptr, uint64_t bytes, char *
 
 
 
-static DS4_MAYBE_UNUSED int payload_read_bytes(FILE *fp, void *ptr, uint64_t bytes, uint64_t *remaining, char *err, size_t errlen) {
+static PULSAR_MAYBE_UNUSED int payload_read_bytes(FILE *fp, void *ptr, uint64_t bytes, uint64_t *remaining, char *err, size_t errlen) {
     if (remaining && *remaining < bytes) {
         payload_set_err(err, errlen, "truncated session payload");
         return 1;
@@ -300,7 +300,7 @@ static DS4_MAYBE_UNUSED int payload_read_bytes(FILE *fp, void *ptr, uint64_t byt
 
 
 
-static DS4_MAYBE_UNUSED int payload_write_u32(FILE *fp, uint32_t v, char *err, size_t errlen) {
+static PULSAR_MAYBE_UNUSED int payload_write_u32(FILE *fp, uint32_t v, char *err, size_t errlen) {
     uint8_t b[4];
     payload_put_u32(b, v);
     return payload_write_bytes(fp, b, sizeof(b), err, errlen);
@@ -308,7 +308,7 @@ static DS4_MAYBE_UNUSED int payload_write_u32(FILE *fp, uint32_t v, char *err, s
 
 
 
-static DS4_MAYBE_UNUSED int payload_read_u32(FILE *fp, uint32_t *v, uint64_t *remaining, char *err, size_t errlen) {
+static PULSAR_MAYBE_UNUSED int payload_read_u32(FILE *fp, uint32_t *v, uint64_t *remaining, char *err, size_t errlen) {
     uint8_t b[4];
     if (remaining && *remaining < sizeof(b)) {
         payload_set_err(err, errlen, "truncated session payload");
@@ -326,10 +326,10 @@ static DS4_MAYBE_UNUSED int payload_read_u32(FILE *fp, uint32_t *v, uint64_t *re
 
 
 static int payload_copy_file_bytes(FILE *src, FILE *dst, uint64_t bytes, char *err, size_t errlen) {
-    uint8_t *buf = (uint8_t *)xmalloc(DS4_SESSION_IO_CHUNK);
+    uint8_t *buf = (uint8_t *)xmalloc(PULSAR_SESSION_IO_CHUNK);
     int rc = 0;
     while (bytes != 0) {
-        const size_t n = bytes > DS4_SESSION_IO_CHUNK ? DS4_SESSION_IO_CHUNK : (size_t)bytes;
+        const size_t n = bytes > PULSAR_SESSION_IO_CHUNK ? PULSAR_SESSION_IO_CHUNK : (size_t)bytes;
         if (fread(buf, 1, n, src) != n) {
             payload_set_err(err, errlen, "failed to read staged session payload");
             rc = 1;
@@ -348,16 +348,16 @@ static int payload_copy_file_bytes(FILE *src, FILE *dst, uint64_t bytes, char *e
 
 
 
-static DS4_MAYBE_UNUSED uint64_t layer_attn_state_bytes(uint32_t ratio) {
+static PULSAR_MAYBE_UNUSED uint64_t layer_attn_state_bytes(uint32_t ratio) {
     const uint32_t coff = ratio == 4 ? 2u : 1u;
-    return (uint64_t)coff * DS4_N_HEAD_DIM * coff * ratio * sizeof(float);
+    return (uint64_t)coff * PULSAR_N_HEAD_DIM * coff * ratio * sizeof(float);
 }
 
 
 
-static DS4_MAYBE_UNUSED uint64_t layer_index_state_bytes(uint32_t ratio) {
+static PULSAR_MAYBE_UNUSED uint64_t layer_index_state_bytes(uint32_t ratio) {
     const uint32_t coff = ratio == 4 ? 2u : 1u;
-    return (uint64_t)coff * DS4_N_INDEXER_HEAD_DIM * coff * ratio * sizeof(float);
+    return (uint64_t)coff * PULSAR_N_INDEXER_HEAD_DIM * coff * ratio * sizeof(float);
 }
 
 
@@ -367,8 +367,8 @@ static DS4_MAYBE_UNUSED uint64_t layer_index_state_bytes(uint32_t ratio) {
  * the next suffix chunk will write its own raw rows before any attention read.
  * Compressed rows are different: sparse attention can select any row from the
  * prefix, so those are persisted up to their live row counts. */
-static uint32_t session_raw_live_rows(const ds4_gpu_graph *g, uint32_t checkpoint_len) {
-    uint32_t rows = g->raw_window ? g->raw_window : DS4_N_SWA;
+static uint32_t session_raw_live_rows(const pulsar_gpu_graph *g, uint32_t checkpoint_len) {
+    uint32_t rows = g->raw_window ? g->raw_window : PULSAR_N_SWA;
     if (rows > g->raw_cap) rows = g->raw_cap;
     if (rows > checkpoint_len) rows = checkpoint_len;
     return rows;
@@ -380,21 +380,21 @@ static uint32_t session_raw_live_rows(const ds4_gpu_graph *g, uint32_t checkpoin
  * header and observability text.  This is deliberately based on live row counts
  * rather than capacities so the disk cache scales with saved tokens, not with
  * the maximum context size used to allocate the graph. */
-static uint64_t session_payload_live_tensor_bytes(const ds4_gpu_graph *g, uint32_t checkpoint_len) {
+static uint64_t session_payload_live_tensor_bytes(const pulsar_gpu_graph *g, uint32_t checkpoint_len) {
     uint64_t bytes = 0;
     const uint32_t raw_live = session_raw_live_rows(g, checkpoint_len);
     /* Session files always store comp rows as f32 (packed caches dequant to
      * the f32 shadow on save), so payload sizing is format-independent. */
-    const uint64_t comp_row = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        bytes += (uint64_t)raw_live * DS4_N_HEAD_DIM * sizeof(float);
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
+    const uint64_t comp_row = (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float);
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        bytes += (uint64_t)raw_live * PULSAR_N_HEAD_DIM * sizeof(float);
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
         bytes += (uint64_t)g->layer_n_comp[il] * comp_row;
         bytes += layer_attn_state_bytes(ratio);
         bytes += layer_attn_state_bytes(ratio);
         if (ratio == 4) {
-            bytes += (uint64_t)g->layer_n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+            bytes += (uint64_t)g->layer_n_index_comp[il] * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
             bytes += layer_index_state_bytes(ratio);
             bytes += layer_index_state_bytes(ratio);
         }
@@ -407,11 +407,11 @@ static uint64_t session_payload_live_tensor_bytes(const ds4_gpu_graph *g, uint32
 /* Accelerator tensors are copied through a fixed-size CPU buffer.  We do not mmap the
  * cache file and we do not allocate a second graph-sized blob just to serialize
  * it; both would be poor fits for this very large model. */
-static int payload_write_tensor_span(FILE *fp, const ds4_gpu_tensor *tensor,
+static int payload_write_tensor_span(FILE *fp, const pulsar_gpu_tensor *tensor,
                                      uint64_t offset, uint64_t bytes,
                                      uint8_t *buf, size_t cap, char *err, size_t errlen) {
-    if (!tensor || offset > ds4_gpu_tensor_bytes(tensor) ||
-        bytes > ds4_gpu_tensor_bytes(tensor) - offset)
+    if (!tensor || offset > pulsar_gpu_tensor_bytes(tensor) ||
+        bytes > pulsar_gpu_tensor_bytes(tensor) - offset)
     {
         payload_set_err(err, errlen, "session tensor is smaller than the payload");
         return 1;
@@ -419,7 +419,7 @@ static int payload_write_tensor_span(FILE *fp, const ds4_gpu_tensor *tensor,
     uint64_t done = 0;
     while (done < bytes) {
         const size_t n = bytes - done > (uint64_t)cap ? cap : (size_t)(bytes - done);
-        if (ds4_gpu_tensor_read(tensor, offset + done, buf, n) == 0) {
+        if (pulsar_gpu_tensor_read(tensor, offset + done, buf, n) == 0) {
             payload_set_err(err, errlen, "failed to read accelerator session tensor");
             return 1;
         }
@@ -431,12 +431,12 @@ static int payload_write_tensor_span(FILE *fp, const ds4_gpu_tensor *tensor,
 
 
 
-static int payload_read_tensor_span(FILE *fp, ds4_gpu_tensor *tensor,
+static int payload_read_tensor_span(FILE *fp, pulsar_gpu_tensor *tensor,
                                     uint64_t offset, uint64_t bytes,
                                     uint8_t *buf, size_t cap, uint64_t *remaining,
                                     char *err, size_t errlen) {
-    if (!tensor || offset > ds4_gpu_tensor_bytes(tensor) ||
-        bytes > ds4_gpu_tensor_bytes(tensor) - offset)
+    if (!tensor || offset > pulsar_gpu_tensor_bytes(tensor) ||
+        bytes > pulsar_gpu_tensor_bytes(tensor) - offset)
     {
         payload_set_err(err, errlen, "session tensor is smaller than the payload");
         return 1;
@@ -445,7 +445,7 @@ static int payload_read_tensor_span(FILE *fp, ds4_gpu_tensor *tensor,
     while (done < bytes) {
         const size_t n = bytes - done > (uint64_t)cap ? cap : (size_t)(bytes - done);
         if (payload_read_bytes(fp, buf, n, remaining, err, errlen) != 0) return 1;
-        if (ds4_gpu_tensor_write(tensor, offset + done, buf, n) == 0) {
+        if (pulsar_gpu_tensor_write(tensor, offset + done, buf, n) == 0) {
             payload_set_err(err, errlen, "failed to restore accelerator session tensor");
             return 1;
         }
@@ -457,24 +457,24 @@ static int payload_read_tensor_span(FILE *fp, ds4_gpu_tensor *tensor,
 
 
 /* Session files always store the indexer comp cache as f32 rows.  Under
- * DS4_IDX_FP4 the persistent cache is MXKV-FP4-packed, so save dequantizes
+ * PULSAR_IDX_FP4 the persistent cache is MXKV-FP4-packed, so save dequantizes
  * into the f32 staging first and load repacks from it.  The repack is
  * value-exact for all realistic rows (QAT-roundtripped fp4 values on
  * power-of-two block scales survive re-encoding); the one exception is a
  * 32-block whose amax sits below the mxkv encode floor (1e-20), which would
  * flush to zero — unreachable for RMS-normed indexer rows. */
-static int payload_write_index_comp(FILE *fp, ds4_gpu_graph *g, uint32_t il,
+static int payload_write_index_comp(FILE *fp, pulsar_gpu_graph *g, uint32_t il,
                                     uint32_t n_rows, uint8_t *buf, size_t cap,
                                     char *err, size_t errlen) {
-    const uint64_t bytes = (uint64_t)n_rows * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
-    ds4_gpu_tensor *src = g->layer_index_comp_cache[il];
+    const uint64_t bytes = (uint64_t)n_rows * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
+    pulsar_gpu_tensor *src = g->layer_index_comp_cache[il];
     if (gpu_graph_idx_fp4_enabled() && n_rows != 0) {
         if (!g->idx_comp_stage ||
-            ds4_gpu_mxkv_dequant_tensor(g->layer_index_comp_cache[il],
+            pulsar_gpu_mxkv_dequant_tensor(g->layer_index_comp_cache[il],
                                         g->idx_comp_stage,
-                                        DS4_ENGINE_MXKV_FMT_FP4,
+                                        PULSAR_ENGINE_MXKV_FMT_FP4,
                                         n_rows,
-                                        DS4_N_INDEXER_HEAD_DIM) == 0) {
+                                        PULSAR_N_INDEXER_HEAD_DIM) == 0) {
             payload_set_err(err, errlen, "failed to dequantize fp4 indexer cache for session save");
             return 1;
         }
@@ -483,10 +483,10 @@ static int payload_write_index_comp(FILE *fp, ds4_gpu_graph *g, uint32_t il,
     return payload_write_tensor_span(fp, src, 0, bytes, buf, cap, err, errlen);
 }
 
-static int payload_read_index_comp(FILE *fp, ds4_gpu_graph *g, uint32_t il,
+static int payload_read_index_comp(FILE *fp, pulsar_gpu_graph *g, uint32_t il,
                                    uint32_t n_rows, uint8_t *buf, size_t cap,
                                    uint64_t *remaining, char *err, size_t errlen) {
-    const uint64_t bytes = (uint64_t)n_rows * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    const uint64_t bytes = (uint64_t)n_rows * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
     if (!gpu_graph_idx_fp4_enabled() || n_rows == 0) {
         return payload_read_tensor_span(fp, g->layer_index_comp_cache[il], 0, bytes,
                                         buf, cap, remaining, err, errlen);
@@ -498,18 +498,18 @@ static int payload_read_index_comp(FILE *fp, ds4_gpu_graph *g, uint32_t il,
     int rc = payload_read_tensor_span(fp, g->idx_comp_stage, 0, bytes,
                                       buf, cap, remaining, err, errlen);
     if (rc != 0) return rc;
-    if (ds4_gpu_mxkv_pack_tensor(g->idx_comp_stage,
+    if (pulsar_gpu_mxkv_pack_tensor(g->idx_comp_stage,
                                  g->layer_index_comp_cache[il],
-                                 DS4_ENGINE_MXKV_FMT_FP4,
+                                 PULSAR_ENGINE_MXKV_FMT_FP4,
                                  n_rows,
-                                 DS4_N_INDEXER_HEAD_DIM) == 0) {
+                                 PULSAR_N_INDEXER_HEAD_DIM) == 0) {
         payload_set_err(err, errlen, "failed to repack fp4 indexer cache on session load");
         return 1;
     }
     return 0;
 }
 
-/* Attn comp cache spans under DS4_ATTN_PACK: session files always store f32
+/* Attn comp cache spans under PULSAR_ATTN_PACK: session files always store f32
  * rows, so save dequantizes the packed cache into the f32 shadow first and
  * load repacks from it.  Save is bit-exact by construction (packed rows decode
  * to exactly the fp8-roundtripped values the f32 pipeline holds).  Load
@@ -519,16 +519,16 @@ static int payload_read_index_comp(FILE *fp, ds4_gpu_graph *g, uint32_t il,
  * non-idempotency that forced quantize_fp8=false in the pack prefill paths).
  * Sub-1e-3-relative on isolated dims; acceptable for session restore, but do
  * NOT rely on save/load being bit-exact under pack. */
-static int payload_write_attn_comp_pack(FILE *fp, ds4_gpu_graph *g, uint32_t il,
+static int payload_write_attn_comp_pack(FILE *fp, pulsar_gpu_graph *g, uint32_t il,
                                         uint32_t n_rows, uint8_t *buf, size_t cap,
                                         char *err, size_t errlen) {
-    const uint64_t bytes = (uint64_t)n_rows * DS4_N_HEAD_DIM * sizeof(float);
-    ds4_gpu_tensor *src = g->attn_comp_dequant;
+    const uint64_t bytes = (uint64_t)n_rows * PULSAR_N_HEAD_DIM * sizeof(float);
+    pulsar_gpu_tensor *src = g->attn_comp_dequant;
     if (n_rows != 0) {
         if (!src ||
-            ds4_gpu_attn_pack_dequant_tensor(g->layer_attn_comp_cache[il],
+            pulsar_gpu_attn_pack_dequant_tensor(g->layer_attn_comp_cache[il],
                                              src, n_rows,
-                                             DS4_N_HEAD_DIM, DS4_N_ROT) == 0) {
+                                             PULSAR_N_HEAD_DIM, PULSAR_N_ROT) == 0) {
             payload_set_err(err, errlen, "failed to dequantize packed attn comp cache for session save");
             return 1;
         }
@@ -537,11 +537,11 @@ static int payload_write_attn_comp_pack(FILE *fp, ds4_gpu_graph *g, uint32_t il,
     return payload_write_tensor_span(fp, src, 0, bytes, buf, cap, err, errlen);
 }
 
-static int payload_read_attn_comp_pack(FILE *fp, ds4_gpu_graph *g, uint32_t il,
+static int payload_read_attn_comp_pack(FILE *fp, pulsar_gpu_graph *g, uint32_t il,
                                        uint32_t n_rows, uint8_t *buf, size_t cap,
                                        uint64_t *remaining, char *err, size_t errlen) {
     if (n_rows == 0) return 0;
-    const uint64_t bytes = (uint64_t)n_rows * DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t bytes = (uint64_t)n_rows * PULSAR_N_HEAD_DIM * sizeof(float);
     if (!g->attn_comp_dequant) {
         payload_set_err(err, errlen, "packed attn comp cache staging missing on session load");
         return 1;
@@ -551,10 +551,10 @@ static int payload_read_attn_comp_pack(FILE *fp, ds4_gpu_graph *g, uint32_t il,
     if (rc != 0) return rc;
     /* Exact-scale repack: file rows are already roundtripped, and the
      * fast-math quantize bucket is not bit-idempotent at scale boundaries. */
-    if (ds4_gpu_attn_pack_repack_tensor(g->attn_comp_dequant,
+    if (pulsar_gpu_attn_pack_repack_tensor(g->attn_comp_dequant,
                                         g->layer_attn_comp_cache[il],
                                         0, n_rows,
-                                        DS4_N_HEAD_DIM, DS4_N_ROT) == 0) {
+                                        PULSAR_N_HEAD_DIM, PULSAR_N_ROT) == 0) {
         payload_set_err(err, errlen, "failed to repack attn comp cache on session load");
         return 1;
     }
@@ -563,14 +563,14 @@ static int payload_read_attn_comp_pack(FILE *fp, ds4_gpu_graph *g, uint32_t il,
 
 
 
-static DS4_MAYBE_UNUSED int payload_write_tensor_span_f16_as_f32(FILE *fp, const ds4_gpu_tensor *tensor,
+static PULSAR_MAYBE_UNUSED int payload_write_tensor_span_f16_as_f32(FILE *fp, const pulsar_gpu_tensor *tensor,
                                                                  uint64_t offset_f16, uint64_t count,
                                                                  uint8_t *buf, size_t cap, char *err, size_t errlen) {
     if (!tensor ||
         count > (UINT64_MAX / sizeof(uint16_t)) ||
         count > (UINT64_MAX / sizeof(float)) ||
-        offset_f16 > ds4_gpu_tensor_bytes(tensor) ||
-        count * sizeof(uint16_t) > ds4_gpu_tensor_bytes(tensor) - offset_f16)
+        offset_f16 > pulsar_gpu_tensor_bytes(tensor) ||
+        count * sizeof(uint16_t) > pulsar_gpu_tensor_bytes(tensor) - offset_f16)
     {
         payload_set_err(err, errlen, "session tensor is smaller than the F16 payload");
         return 1;
@@ -590,7 +590,7 @@ static DS4_MAYBE_UNUSED int payload_write_tensor_span_f16_as_f32(FILE *fp, const
         const size_t n = count - done > (uint64_t)cap_elems
             ? cap_elems
             : (size_t)(count - done);
-        if (ds4_gpu_tensor_read(tensor, offset_f16 + done * sizeof(uint16_t),
+        if (pulsar_gpu_tensor_read(tensor, offset_f16 + done * sizeof(uint16_t),
                                 h, n * sizeof(uint16_t)) == 0) {
             payload_set_err(err, errlen, "failed to read GPU F16 session tensor");
             return 1;
@@ -604,15 +604,15 @@ static DS4_MAYBE_UNUSED int payload_write_tensor_span_f16_as_f32(FILE *fp, const
 
 
 
-static DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_f16(FILE *fp, ds4_gpu_tensor *tensor,
+static PULSAR_MAYBE_UNUSED int payload_read_tensor_span_f32_as_f16(FILE *fp, pulsar_gpu_tensor *tensor,
                                                                 uint64_t offset_f16, uint64_t count,
                                                                 uint8_t *buf, size_t cap, uint64_t *remaining,
                                                                 char *err, size_t errlen) {
     if (!tensor ||
         count > (UINT64_MAX / sizeof(uint16_t)) ||
         count > (UINT64_MAX / sizeof(float)) ||
-        offset_f16 > ds4_gpu_tensor_bytes(tensor) ||
-        count * sizeof(uint16_t) > ds4_gpu_tensor_bytes(tensor) - offset_f16)
+        offset_f16 > pulsar_gpu_tensor_bytes(tensor) ||
+        count * sizeof(uint16_t) > pulsar_gpu_tensor_bytes(tensor) - offset_f16)
     {
         payload_set_err(err, errlen, "session tensor is smaller than the F16 payload");
         return 1;
@@ -634,7 +634,7 @@ static DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_f16(FILE *fp, ds4_gp
             : (size_t)(count - done);
         if (payload_read_bytes(fp, f, (uint64_t)n * sizeof(float), remaining, err, errlen) != 0) return 1;
         for (size_t i = 0; i < n; i++) h[i] = f32_to_f16(f[i]);
-        if (ds4_gpu_tensor_write(tensor, offset_f16 + done * sizeof(uint16_t),
+        if (pulsar_gpu_tensor_write(tensor, offset_f16 + done * sizeof(uint16_t),
                                  h, n * sizeof(uint16_t)) == 0) {
             payload_set_err(err, errlen, "failed to restore GPU F16 session tensor");
             return 1;
@@ -644,40 +644,40 @@ static DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_f16(FILE *fp, ds4_gp
     return 0;
 }
 
-/* Raw-ring row spans: session files always store f32 rows.  Under DS4_RAW_F16
+/* Raw-ring row spans: session files always store f32 rows.  Under PULSAR_RAW_F16
  * the ring holds __half containers, so save expands f16->f32 and load packs
  * f32->f16 — bit-exact both ways because the values are f16-rounded at store
  * time in both modes. */
-static int payload_write_raw_row(FILE *fp, ds4_gpu_graph *g, uint32_t il, uint32_t phys,
+static int payload_write_raw_row(FILE *fp, pulsar_gpu_graph *g, uint32_t il, uint32_t phys,
                                  uint8_t *buf, size_t cap, char *err, size_t errlen) {
     if (gpu_graph_raw_f16_enabled()) {
         return payload_write_tensor_span_f16_as_f32(fp, g->layer_raw_cache[il],
-                (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(uint16_t),
-                (uint64_t)DS4_N_HEAD_DIM, buf, cap, err, errlen);
+                (uint64_t)phys * PULSAR_N_HEAD_DIM * sizeof(uint16_t),
+                (uint64_t)PULSAR_N_HEAD_DIM, buf, cap, err, errlen);
     }
     return payload_write_tensor_span(fp, g->layer_raw_cache[il],
-            (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
-            (uint64_t)DS4_N_HEAD_DIM * sizeof(float), buf, cap, err, errlen);
+            (uint64_t)phys * PULSAR_N_HEAD_DIM * sizeof(float),
+            (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float), buf, cap, err, errlen);
 }
 
-static int payload_read_raw_row(FILE *fp, ds4_gpu_graph *g, uint32_t il, uint32_t phys,
+static int payload_read_raw_row(FILE *fp, pulsar_gpu_graph *g, uint32_t il, uint32_t phys,
                                 uint8_t *buf, size_t cap, uint64_t *remaining,
                                 char *err, size_t errlen) {
     if (gpu_graph_raw_f16_enabled()) {
         return payload_read_tensor_span_f32_as_f16(fp, g->layer_raw_cache[il],
-                (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(uint16_t),
-                (uint64_t)DS4_N_HEAD_DIM, buf, cap, remaining, err, errlen);
+                (uint64_t)phys * PULSAR_N_HEAD_DIM * sizeof(uint16_t),
+                (uint64_t)PULSAR_N_HEAD_DIM, buf, cap, remaining, err, errlen);
     }
     return payload_read_tensor_span(fp, g->layer_raw_cache[il],
-            (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
-            (uint64_t)DS4_N_HEAD_DIM * sizeof(float), buf, cap, remaining, err, errlen);
+            (uint64_t)phys * PULSAR_N_HEAD_DIM * sizeof(float),
+            (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float), buf, cap, remaining, err, errlen);
 }
 
 
 
 
 
-int ds4_engine_routed_quant_bits(ds4_engine *e) {
+int pulsar_engine_routed_quant_bits(pulsar_engine *e) {
     if (!e) return 0;
     /* Report the routed-expert precision tier actually present, derived from
      * the loaded tensor types (was hardcoded 2, which under-reported the mixed
@@ -685,21 +685,21 @@ int ds4_engine_routed_quant_bits(ds4_engine *e) {
      * (MXFP4 E2M1 / CUTLASS type-40) anywhere in gate/up/down makes this a
      * 4-bit-tier model; otherwise the 2-bit floor (IQ2_XXS / Q2_K); 0 if no
      * routed experts. The kvstore snapshot-compat guards accept {2,4} and
-     * ds4_engine_model_id() is a compile-time constant, so this is the only
+     * pulsar_engine_model_id() is a compile-time constant, so this is the only
      * model-variant discriminator in the disk-KV key — a value change
      * invalidates old snapshots (one-time re-prefill; fine in dev). */
     int bits = 0;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const ds4_tensor *proj[3] = {
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const pulsar_tensor *proj[3] = {
             e->weights.layer[il].ffn_gate_exps,
             e->weights.layer[il].ffn_up_exps,
             e->weights.layer[il].ffn_down_exps,
         };
         for (int k = 0; k < 3; k++) {
-            const ds4_tensor *t = proj[k];
+            const pulsar_tensor *t = proj[k];
             if (!t) continue;
-            if (t->type == DS4_TENSOR_FP4_E2M1 ||
-                t->type == DS4_TENSOR_CUTLASS_MXFP4)
+            if (t->type == PULSAR_TENSOR_FP4_E2M1 ||
+                t->type == PULSAR_TENSOR_CUTLASS_MXFP4)
                 return 4;
             if (bits == 0) bits = 2;
         }
@@ -709,7 +709,7 @@ int ds4_engine_routed_quant_bits(ds4_engine *e) {
 
 
 
-bool ds4_engine_has_output_head(ds4_engine *e) {
+bool pulsar_engine_has_output_head(pulsar_engine *e) {
     return e && weights_have_output_head(&e->weights);
 }
 
@@ -717,23 +717,23 @@ bool ds4_engine_has_output_head(ds4_engine *e) {
 
 
 
-bool ds4_engine_has_dspark(ds4_engine *e) {
+bool pulsar_engine_has_dspark(pulsar_engine *e) {
     return e && e->dspark_ready;
 }
 
-int ds4_engine_dspark_draft_tokens(ds4_engine *e) {
-    return ds4_engine_has_dspark(e) ? e->dspark_draft_tokens : 0;
+int pulsar_engine_dspark_draft_tokens(pulsar_engine *e) {
+    return pulsar_engine_has_dspark(e) ? e->dspark_draft_tokens : 0;
 }
 
 
 
-const ds4_tokens *ds4_session_tokens(ds4_session *s) {
+const pulsar_tokens *pulsar_session_tokens(pulsar_session *s) {
     return s ? &s->checkpoint : NULL;
 }
 
 
 
-static void spec_frontier_free(ds4_spec_frontier *f) {
+static void spec_frontier_free(pulsar_spec_frontier *f) {
     if (!f) return;
     memset(f, 0, sizeof(*f));
 }
@@ -745,71 +745,71 @@ static void spec_frontier_free(ds4_spec_frontier *f) {
  * tables are built once and replayed with one kernel launch per direction
  * (previously ~126 cudaMemcpy launches per snapshot, again per restore). A
  * NULL handle (prepare rejected a size, or alloc failed) keeps the loop path. */
-static void spec_frontier_copy_tables_init(ds4_gpu_graph *g) {
+static void spec_frontier_copy_tables_init(pulsar_gpu_graph *g) {
     if (g->spec_frontier_copy_init) return;
     g->spec_frontier_copy_init = 1;
-    ds4_gpu_tensor *dst[DS4_MAX_LAYER * 4];
-    ds4_gpu_tensor *src[DS4_MAX_LAYER * 4];
-    uint64_t bytes[DS4_MAX_LAYER * 4];
+    pulsar_gpu_tensor *dst[PULSAR_MAX_LAYER * 4];
+    pulsar_gpu_tensor *src[PULSAR_MAX_LAYER * 4];
+    uint64_t bytes[PULSAR_MAX_LAYER * 4];
     uint32_t n = 0;
     uint64_t mx = 0;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
-        const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
+        const uint64_t ab = pulsar_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
         dst[n] = g->spec_attn_state_kv[il];    src[n] = g->layer_attn_state_kv[il];    bytes[n++] = ab;
         dst[n] = g->spec_attn_state_score[il]; src[n] = g->layer_attn_state_score[il]; bytes[n++] = ab;
         if (ab > mx) mx = ab;
         if (ratio == 4) {
-            const uint64_t ib = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
+            const uint64_t ib = pulsar_gpu_tensor_bytes(g->layer_index_state_kv[il]);
             dst[n] = g->spec_index_state_kv[il];    src[n] = g->layer_index_state_kv[il];    bytes[n++] = ib;
             dst[n] = g->spec_index_state_score[il]; src[n] = g->layer_index_state_score[il]; bytes[n++] = ib;
             if (ib > mx) mx = ib;
         }
     }
     if (n == 0) return;
-    g->spec_snap_copies = ds4_gpu_batched_copy_prepare(dst, src, bytes, n);
+    g->spec_snap_copies = pulsar_gpu_batched_copy_prepare(dst, src, bytes, n);
     /* restore = the same set with src/dst swapped */
-    g->spec_restore_copies = ds4_gpu_batched_copy_prepare(src, dst, bytes, n);
+    g->spec_restore_copies = pulsar_gpu_batched_copy_prepare(src, dst, bytes, n);
     g->spec_frontier_copy_n = n;
     g->spec_frontier_copy_max_bytes = mx;
 }
 
-static bool spec_frontier_snapshot(ds4_spec_frontier *f, ds4_session *s) {
+static bool spec_frontier_snapshot(pulsar_spec_frontier *f, pulsar_session *s) {
     memset(f, 0, sizeof(*f));
-    ds4_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = &s->graph;
     spec_frontier_copy_tables_init(g);
 
-    bool ok = ds4_gpu_begin_commands() != 0;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    bool ok = pulsar_gpu_begin_commands() != 0;
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         f->n_comp[il] = g->layer_n_comp[il];
         f->n_index_comp[il] = g->layer_n_index_comp[il];
     }
     if (ok && g->spec_snap_copies) {
-        ok = ds4_gpu_batched_copy_run(g->spec_snap_copies,
+        ok = pulsar_gpu_batched_copy_run(g->spec_snap_copies,
                                       g->spec_frontier_copy_n,
                                       g->spec_frontier_copy_max_bytes) != 0;
     } else {
-        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-            const uint32_t ratio = ds4_layer_compress_ratio(il);
+        for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {
+            const uint32_t ratio = pulsar_layer_compress_ratio(il);
             if (ratio == 0) continue;
-            const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
-            ok = ds4_gpu_tensor_copy(g->spec_attn_state_kv[il], 0,
+            const uint64_t ab = pulsar_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
+            ok = pulsar_gpu_tensor_copy(g->spec_attn_state_kv[il], 0,
                                        g->layer_attn_state_kv[il], 0, ab) != 0 &&
-                 ds4_gpu_tensor_copy(g->spec_attn_state_score[il], 0,
+                 pulsar_gpu_tensor_copy(g->spec_attn_state_score[il], 0,
                                        g->layer_attn_state_score[il], 0, ab) != 0;
             if (ratio == 4) {
-                const uint64_t ib = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
+                const uint64_t ib = pulsar_gpu_tensor_bytes(g->layer_index_state_kv[il]);
                 ok = ok &&
-                     ds4_gpu_tensor_copy(g->spec_index_state_kv[il], 0,
+                     pulsar_gpu_tensor_copy(g->spec_index_state_kv[il], 0,
                                            g->layer_index_state_kv[il], 0, ib) != 0 &&
-                     ds4_gpu_tensor_copy(g->spec_index_state_score[il], 0,
+                     pulsar_gpu_tensor_copy(g->spec_index_state_score[il], 0,
                                            g->layer_index_state_score[il], 0, ib) != 0;
             }
         }
     }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    else (void)ds4_gpu_synchronize();
+    if (ok) ok = pulsar_gpu_end_commands() != 0;
+    else (void)pulsar_gpu_synchronize();
     if (ok) return true;
 
     spec_frontier_free(f);
@@ -818,57 +818,57 @@ static bool spec_frontier_snapshot(ds4_spec_frontier *f, ds4_session *s) {
 
 
 
-static bool spec_frontier_restore(ds4_spec_frontier *f, ds4_session *s) {
-    ds4_gpu_graph *g = &s->graph;
-    bool ok = ds4_gpu_begin_commands() != 0;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+static bool spec_frontier_restore(pulsar_spec_frontier *f, pulsar_session *s) {
+    pulsar_gpu_graph *g = &s->graph;
+    bool ok = pulsar_gpu_begin_commands() != 0;
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         g->layer_n_comp[il] = f->n_comp[il];
         g->layer_n_index_comp[il] = f->n_index_comp[il];
     }
     if (ok && g->spec_restore_copies) {
-        ok = ds4_gpu_batched_copy_run(g->spec_restore_copies,
+        ok = pulsar_gpu_batched_copy_run(g->spec_restore_copies,
                                       g->spec_frontier_copy_n,
                                       g->spec_frontier_copy_max_bytes) != 0;
     } else {
-        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-            const uint32_t ratio = ds4_layer_compress_ratio(il);
+        for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {
+            const uint32_t ratio = pulsar_layer_compress_ratio(il);
             if (ratio == 0) continue;
-            const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
-            ok = ds4_gpu_tensor_copy(g->layer_attn_state_kv[il], 0,
+            const uint64_t ab = pulsar_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
+            ok = pulsar_gpu_tensor_copy(g->layer_attn_state_kv[il], 0,
                                        g->spec_attn_state_kv[il], 0, ab) != 0 &&
-                 ds4_gpu_tensor_copy(g->layer_attn_state_score[il], 0,
+                 pulsar_gpu_tensor_copy(g->layer_attn_state_score[il], 0,
                                        g->spec_attn_state_score[il], 0, ab) != 0;
             if (ok && ratio == 4) {
-                const uint64_t ib = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
-                ok = ds4_gpu_tensor_copy(g->layer_index_state_kv[il], 0,
+                const uint64_t ib = pulsar_gpu_tensor_bytes(g->layer_index_state_kv[il]);
+                ok = pulsar_gpu_tensor_copy(g->layer_index_state_kv[il], 0,
                                            g->spec_index_state_kv[il], 0, ib) != 0 &&
-                     ds4_gpu_tensor_copy(g->layer_index_state_score[il], 0,
+                     pulsar_gpu_tensor_copy(g->layer_index_state_score[il], 0,
                                            g->spec_index_state_score[il], 0, ib) != 0;
             }
         }
     }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    else (void)ds4_gpu_synchronize();
+    if (ok) ok = pulsar_gpu_end_commands() != 0;
+    else (void)pulsar_gpu_synchronize();
     return ok;
 }
 
 
 
-uint64_t ds4_session_payload_bytes(ds4_session *s) {
+uint64_t pulsar_session_payload_bytes(pulsar_session *s) {
     if (!s || !s->checkpoint_valid) return 0;
-    const ds4_gpu_graph *g = &s->graph;
-    uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
+    const pulsar_gpu_graph *g = &s->graph;
+    uint64_t bytes = (uint64_t)PULSAR_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
     bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
-    bytes += (uint64_t)DS4_N_VOCAB * sizeof(float);
-    bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
-    bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
+    bytes += (uint64_t)PULSAR_N_VOCAB * sizeof(float);
+    bytes += (uint64_t)PULSAR_N_LAYER * sizeof(uint32_t);
+    bytes += (uint64_t)PULSAR_N_LAYER * sizeof(uint32_t);
     bytes += session_payload_live_tensor_bytes(g, (uint32_t)s->checkpoint.len);
     return bytes;
 }
 
 
 
-int ds4_session_write_staged_payload(const ds4_session_payload_file *payload,
+int pulsar_session_write_staged_payload(const pulsar_session_payload_file *payload,
                                      FILE *fp, char *err, size_t errlen) {
     if (!payload || !payload->path || !fp) {
         payload_set_err(err, errlen, "invalid staged session payload");
@@ -889,7 +889,7 @@ int ds4_session_write_staged_payload(const ds4_session_payload_file *payload,
 
 
 
-void ds4_session_payload_file_free(ds4_session_payload_file *payload) {
+void pulsar_session_payload_file_free(pulsar_session_payload_file *payload) {
     if (!payload) return;
     if (payload->path) {
         unlink(payload->path);
@@ -900,7 +900,7 @@ void ds4_session_payload_file_free(ds4_session_payload_file *payload) {
 
 
 
-int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
+int pulsar_session_stage_payload(pulsar_session *s, pulsar_session_payload_file *out,
                               char *err, size_t errlen) {
     if (!out) {
         payload_set_err(err, errlen, "invalid session payload staging request");
@@ -928,7 +928,7 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
         return 1;
     }
 
-    int rc = ds4_session_save_payload(s, fp, err, errlen);
+    int rc = pulsar_session_save_payload(s, fp, err, errlen);
     if (rc == 0 && fflush(fp) != 0) {
         payload_set_err(err, errlen, "failed to flush staged session payload");
         rc = 1;
@@ -949,24 +949,24 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
         unlink(tmpl);
         return 1;
     }
-    out->path = ds4_strdup(tmpl);
+    out->path = pulsar_strdup(tmpl);
     out->bytes = (uint64_t)pos;
     return 0;
 }
 
 
 
-int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+int pulsar_session_save_payload(pulsar_session *s, FILE *fp, char *err, size_t errlen) {
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
     }
-    if (ds4_gpu_synchronize() == 0) {
+    if (pulsar_gpu_synchronize() == 0) {
         payload_set_err(err, errlen, "failed to synchronize accelerator before snapshot");
         return 1;
     }
 
-    ds4_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = &s->graph;
     const uint32_t raw_live = session_raw_live_rows(g, (uint32_t)s->checkpoint.len);
     /* Header fields:
      *   0 magic, 1 version, 2 ctx, 3 prefill chunk, 4 raw cap,
@@ -974,38 +974,38 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
      *   8 layers, 9 raw head dim, 10 indexer head dim, 11 vocab,
      *   12 live raw rows serialized below.
      */
-    uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
-        DS4_SESSION_PAYLOAD_MAGIC,
-        DS4_SESSION_PAYLOAD_VERSION,
+    uint32_t header[PULSAR_SESSION_PAYLOAD_U32_FIELDS] = {
+        PULSAR_SESSION_PAYLOAD_MAGIC,
+        PULSAR_SESSION_PAYLOAD_VERSION,
         (uint32_t)s->ctx_size,
         s->prefill_cap,
         g->raw_cap,
         g->raw_window,
         g->comp_cap,
         (uint32_t)s->checkpoint.len,
-        DS4_N_LAYER,
-        DS4_N_HEAD_DIM,
-        DS4_N_INDEXER_HEAD_DIM,
-        DS4_N_VOCAB,
+        PULSAR_N_LAYER,
+        PULSAR_N_HEAD_DIM,
+        PULSAR_N_INDEXER_HEAD_DIM,
+        PULSAR_N_VOCAB,
         raw_live,
     };
-    for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
+    for (uint32_t i = 0; i < PULSAR_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
     }
     for (int i = 0; i < s->checkpoint.len; i++) {
         if (payload_write_u32(fp, (uint32_t)s->checkpoint.v[i], err, errlen) != 0) return 1;
     }
-    if (payload_write_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), err, errlen) != 0) return 1;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    if (payload_write_bytes(fp, s->logits, (uint64_t)PULSAR_N_VOCAB * sizeof(float), err, errlen) != 0) return 1;
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (payload_write_u32(fp, g->layer_n_comp[il], err, errlen) != 0) return 1;
     }
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (payload_write_u32(fp, g->layer_n_index_comp[il], err, errlen) != 0) return 1;
     }
 
-    uint8_t *buf = (uint8_t *)xmalloc(DS4_SESSION_IO_CHUNK);
+    uint8_t *buf = (uint8_t *)xmalloc(PULSAR_SESSION_IO_CHUNK);
     int rc = 0;
-    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+    for (uint32_t il = 0; rc == 0 && il < PULSAR_N_LAYER; il++) {
         /* Write the raw ring in logical position order.  The file does not care
          * where the rows happened to live physically in the source graph. */
         const uint32_t raw_first = (uint32_t)s->checkpoint.len - raw_live;
@@ -1013,9 +1013,9 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
             const uint32_t pos = raw_first + r;
             const uint32_t phys = pos % g->raw_cap;
             rc = payload_write_raw_row(fp, g, il, phys,
-                                       buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                                       buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
         }
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
         /* Compressed rows are append-only from row zero, so the live prefix is
          * contiguous.  The two compressor state tensors hold the partial window
@@ -1024,16 +1024,16 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
             rc = payload_write_attn_comp_pack(fp, g, il,
                                               g->layer_n_comp[il],
                                               buf,
-                                              DS4_SESSION_IO_CHUNK,
+                                              PULSAR_SESSION_IO_CHUNK,
                                               err,
                                               errlen);
         } else {
             rc = payload_write_tensor_span(fp,
                                            g->layer_attn_comp_cache[il],
                                            0,
-                                           (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM * sizeof(float),
+                                           (uint64_t)g->layer_n_comp[il] * PULSAR_N_HEAD_DIM * sizeof(float),
                                            buf,
-                                           DS4_SESSION_IO_CHUNK,
+                                           PULSAR_SESSION_IO_CHUNK,
                                            err,
                                            errlen);
         }
@@ -1042,7 +1042,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
                                                     0,
                                                     layer_attn_state_bytes(ratio),
                                                     buf,
-                                                    DS4_SESSION_IO_CHUNK,
+                                                    PULSAR_SESSION_IO_CHUNK,
                                                     err,
                                                     errlen);
         if (rc == 0) rc = payload_write_tensor_span(fp,
@@ -1050,14 +1050,14 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
                                                     0,
                                                     layer_attn_state_bytes(ratio),
                                                     buf,
-                                                    DS4_SESSION_IO_CHUNK,
+                                                    PULSAR_SESSION_IO_CHUNK,
                                                     err,
                                                     errlen);
         if (rc == 0 && ratio == 4) {
             rc = payload_write_index_comp(fp, g, il,
                                           g->layer_n_index_comp[il],
                                           buf,
-                                          DS4_SESSION_IO_CHUNK,
+                                          PULSAR_SESSION_IO_CHUNK,
                                           err,
                                           errlen);
             if (rc == 0) rc = payload_write_tensor_span(fp,
@@ -1065,7 +1065,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
                                                         0,
                                                         layer_index_state_bytes(ratio),
                                                         buf,
-                                                        DS4_SESSION_IO_CHUNK,
+                                                        PULSAR_SESSION_IO_CHUNK,
                                                         err,
                                                         errlen);
             if (rc == 0) rc = payload_write_tensor_span(fp,
@@ -1073,7 +1073,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
                                                         0,
                                                         layer_index_state_bytes(ratio),
                                                         buf,
-                                                        DS4_SESSION_IO_CHUNK,
+                                                        PULSAR_SESSION_IO_CHUNK,
                                                         err,
                                                         errlen);
         }
@@ -1084,7 +1084,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 
 
 
-int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
+int pulsar_session_load_payload(pulsar_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
@@ -1096,15 +1096,15 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     s->spec.dspark_n_pending = 0;
     spec_quench_reset(s);
     uint64_t remaining = payload_bytes;
-    uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS];
-    for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
+    uint32_t h[PULSAR_SESSION_PAYLOAD_U32_FIELDS];
+    for (uint32_t i = 0; i < PULSAR_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (payload_read_u32(fp, &h[i], &remaining, err, errlen) != 0) return 1;
     }
-    if (h[0] != DS4_SESSION_PAYLOAD_MAGIC || h[1] != DS4_SESSION_PAYLOAD_VERSION) {
+    if (h[0] != PULSAR_SESSION_PAYLOAD_MAGIC || h[1] != PULSAR_SESSION_PAYLOAD_VERSION) {
         payload_set_err(err, errlen, "unsupported session payload version");
         return 1;
     }
-    ds4_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = &s->graph;
     const uint32_t saved_ctx = h[2];
     const uint32_t saved_prefill_cap = h[3];
     const uint32_t saved_raw_cap = h[4];
@@ -1116,10 +1116,10 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         payload_set_err(err, errlen, "KV checkpoint does not fit current context");
         return 1;
     }
-    if (h[8] != DS4_N_LAYER || h[9] != DS4_N_HEAD_DIM ||
-        h[10] != DS4_N_INDEXER_HEAD_DIM || h[11] != DS4_N_VOCAB)
+    if (h[8] != PULSAR_N_LAYER || h[9] != PULSAR_N_HEAD_DIM ||
+        h[10] != PULSAR_N_INDEXER_HEAD_DIM || h[11] != PULSAR_N_VOCAB)
     {
-        payload_set_err(err, errlen, "KV checkpoint was written for a different DS4 layout");
+        payload_set_err(err, errlen, "KV checkpoint was written for a different Pulsar layout");
         return 1;
     }
     /* prefill_cap is scratch scheduling capacity, not durable KV layout.
@@ -1153,15 +1153,15 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         }
         token_vec_push(&new_checkpoint, (int)tok);
     }
-    if (payload_read_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float),
+    if (payload_read_bytes(fp, s->logits, (uint64_t)PULSAR_N_VOCAB * sizeof(float),
                            &remaining, err, errlen) != 0)
     {
         token_vec_free(&new_checkpoint);
         return 1;
     }
-    uint32_t n_comp[DS4_MAX_LAYER];
-    uint32_t n_index_comp[DS4_MAX_LAYER];
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    uint32_t n_comp[PULSAR_MAX_LAYER];
+    uint32_t n_index_comp[PULSAR_MAX_LAYER];
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (payload_read_u32(fp, &n_comp[il], &remaining, err, errlen) != 0) {
             token_vec_free(&new_checkpoint);
             return 1;
@@ -1172,7 +1172,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
             return 1;
         }
     }
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (payload_read_u32(fp, &n_index_comp[il], &remaining, err, errlen) != 0) {
             token_vec_free(&new_checkpoint);
             return 1;
@@ -1184,16 +1184,16 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         }
     }
 
-    if (ds4_gpu_synchronize() == 0) {
+    if (pulsar_gpu_synchronize() == 0) {
         token_vec_free(&new_checkpoint);
         payload_set_err(err, errlen, "failed to synchronize accelerator before KV restore");
         return 1;
     }
     s->checkpoint_valid = false;
 
-    uint8_t *buf = (uint8_t *)xmalloc(DS4_SESSION_IO_CHUNK);
+    uint8_t *buf = (uint8_t *)xmalloc(PULSAR_SESSION_IO_CHUNK);
     int rc = 0;
-    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+    for (uint32_t il = 0; rc == 0 && il < PULSAR_N_LAYER; il++) {
         /* Rebuild the physical raw ring expected by the current graph.  This is
          * why the file stores rows in logical order instead of dumping bytes from
          * the old ring layout. */
@@ -1202,15 +1202,15 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
             const uint32_t pos = raw_first + r;
             const uint32_t phys = pos % g->raw_cap;
             rc = payload_read_raw_row(fp, g, il, phys,
-                                      buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+                                      buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
         }
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
         if (gpu_graph_attn_pack_enabled()) {
             rc = payload_read_attn_comp_pack(fp, g, il,
                                              n_comp[il],
                                              buf,
-                                             DS4_SESSION_IO_CHUNK,
+                                             PULSAR_SESSION_IO_CHUNK,
                                              &remaining,
                                              err,
                                              errlen);
@@ -1218,9 +1218,9 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
             rc = payload_read_tensor_span(fp,
                                           g->layer_attn_comp_cache[il],
                                           0,
-                                          (uint64_t)n_comp[il] * DS4_N_HEAD_DIM * sizeof(float),
+                                          (uint64_t)n_comp[il] * PULSAR_N_HEAD_DIM * sizeof(float),
                                           buf,
-                                          DS4_SESSION_IO_CHUNK,
+                                          PULSAR_SESSION_IO_CHUNK,
                                           &remaining,
                                           err,
                                           errlen);
@@ -1230,7 +1230,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                                                    0,
                                                    layer_attn_state_bytes(ratio),
                                                    buf,
-                                                   DS4_SESSION_IO_CHUNK,
+                                                   PULSAR_SESSION_IO_CHUNK,
                                                    &remaining,
                                                    err,
                                                    errlen);
@@ -1239,7 +1239,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                                                    0,
                                                    layer_attn_state_bytes(ratio),
                                                    buf,
-                                                   DS4_SESSION_IO_CHUNK,
+                                                   PULSAR_SESSION_IO_CHUNK,
                                                    &remaining,
                                                    err,
                                                    errlen);
@@ -1247,7 +1247,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
             rc = payload_read_index_comp(fp, g, il,
                                          n_index_comp[il],
                                          buf,
-                                         DS4_SESSION_IO_CHUNK,
+                                         PULSAR_SESSION_IO_CHUNK,
                                          &remaining,
                                          err,
                                          errlen);
@@ -1256,7 +1256,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                                                        0,
                                                        layer_index_state_bytes(ratio),
                                                        buf,
-                                                       DS4_SESSION_IO_CHUNK,
+                                                       PULSAR_SESSION_IO_CHUNK,
                                                        &remaining,
                                                        err,
                                                        errlen);
@@ -1265,7 +1265,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                                                        0,
                                                        layer_index_state_bytes(ratio),
                                                        buf,
-                                                       DS4_SESSION_IO_CHUNK,
+                                                       PULSAR_SESSION_IO_CHUNK,
                                                        &remaining,
                                                        err,
                                                        errlen);
@@ -1281,7 +1281,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         payload_set_err(err, errlen, "KV checkpoint has trailing payload bytes");
         return 1;
     }
-    if (ds4_gpu_synchronize() == 0) {
+    if (pulsar_gpu_synchronize() == 0) {
         token_vec_free(&new_checkpoint);
         payload_set_err(err, errlen, "failed to synchronize accelerator after KV restore");
         return 1;
@@ -1289,7 +1289,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
 
     token_vec_free(&s->checkpoint);
     s->checkpoint = new_checkpoint;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         g->layer_n_comp[il] = n_comp[il];
         g->layer_n_index_comp[il] = n_index_comp[il];
     }
@@ -1309,12 +1309,12 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
 
 
 
-int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen) {
+int pulsar_session_save_snapshot(pulsar_session *s, pulsar_session_snapshot *snap, char *err, size_t errlen) {
     if (!s || !snap) {
         payload_set_err(err, errlen, "invalid session snapshot save");
         return 1;
     }
-    const uint64_t bytes = ds4_session_payload_bytes(s);
+    const uint64_t bytes = pulsar_session_payload_bytes(s);
     if (bytes == 0) {
         payload_set_err(err, errlen, "session has no valid checkpoint to snapshot");
         return 1;
@@ -1338,7 +1338,7 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
         payload_set_err(err, errlen, "failed to open memory stream for session snapshot");
         return 1;
     }
-    const int rc = ds4_session_save_payload(s, fp, err, errlen);
+    const int rc = pulsar_session_save_payload(s, fp, err, errlen);
     if (fclose(fp) != 0 && rc == 0) {
         payload_set_err(err, errlen, "failed to finalize memory session snapshot");
         return 1;
@@ -1350,7 +1350,7 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
 
 
 
-int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen) {
+int pulsar_session_load_snapshot(pulsar_session *s, const pulsar_session_snapshot *snap, char *err, size_t errlen) {
     if (!s || !snap || !snap->ptr || snap->len == 0) {
         payload_set_err(err, errlen, "invalid session snapshot load");
         return 1;
@@ -1365,7 +1365,7 @@ int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, 
         payload_set_err(err, errlen, "failed to open memory stream for session snapshot restore");
         return 1;
     }
-    const int rc = ds4_session_load_payload(s, fp, snap->len, err, errlen);
+    const int rc = pulsar_session_load_payload(s, fp, snap->len, err, errlen);
     if (fclose(fp) != 0 && rc == 0) {
         payload_set_err(err, errlen, "failed to close memory session snapshot");
         return 1;
@@ -1375,7 +1375,7 @@ int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, 
 
 
 
-void ds4_session_snapshot_free(ds4_session_snapshot *snap) {
+void pulsar_session_snapshot_free(pulsar_session_snapshot *snap) {
     if (!snap) return;
     free(snap->ptr);
     memset(snap, 0, sizeof(*snap));
@@ -1383,15 +1383,15 @@ void ds4_session_snapshot_free(ds4_session_snapshot *snap) {
 
 
 
-void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens) {
+void pulsar_engine_dump_tokens(pulsar_engine *e, const pulsar_tokens *tokens) {
     dump_tokens(&e->vocab, tokens);
 }
 
 
 
-int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp) {
-    ds4_model model;
-    ds4_vocab vocab;
+int pulsar_dump_text_tokenization(const char *model_path, const char *text, FILE *fp) {
+    pulsar_model model;
+    pulsar_vocab vocab;
     token_vec tokens = {0};
 
     if (!fp) fp = stdout;
@@ -1413,28 +1413,28 @@ static bool imatrix_read_text_file(const char *path, char **out, size_t *len_out
     *len_out = 0;
     struct stat st;
     if (stat(path, &st) != 0) {
-        fprintf(stderr, "ds4: failed to stat imatrix dataset %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "pulsar: failed to stat imatrix dataset %s: %s\n", path, strerror(errno));
         return false;
     }
     if (st.st_size < 0 || (uint64_t)st.st_size > SIZE_MAX - 1) {
-        fprintf(stderr, "ds4: imatrix dataset is too large: %s\n", path);
+        fprintf(stderr, "pulsar: imatrix dataset is too large: %s\n", path);
         return false;
     }
     FILE *fp = fopen(path, "rb");
     if (!fp) {
-        fprintf(stderr, "ds4: failed to open imatrix dataset %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "pulsar: failed to open imatrix dataset %s: %s\n", path, strerror(errno));
         return false;
     }
     size_t n = (size_t)st.st_size;
     char *buf = (char *)xmalloc(n + 1);
     if (n != 0 && fread(buf, 1, n, fp) != n) {
-        fprintf(stderr, "ds4: failed to read imatrix dataset %s\n", path);
+        fprintf(stderr, "pulsar: failed to read imatrix dataset %s\n", path);
         fclose(fp);
         free(buf);
         return false;
     }
     if (fclose(fp) != 0) {
-        fprintf(stderr, "ds4: failed to close imatrix dataset %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "pulsar: failed to close imatrix dataset %s: %s\n", path, strerror(errno));
         free(buf);
         return false;
     }
@@ -1455,15 +1455,15 @@ static char *imatrix_trim_block(char *p, char *end) {
 
 
 
-int ds4_engine_collect_imatrix(ds4_engine *e,
+int pulsar_engine_collect_imatrix(pulsar_engine *e,
                                const char *dataset_path,
                                const char *output_path,
                                int ctx_size,
                                int max_prompts,
                                int max_tokens) {
     if (!e || !dataset_path || !output_path) return 1;
-    if (e->backend != DS4_BACKEND_CUDA || !e->gpu_ready) {
-        fprintf(stderr, "ds4: imatrix collection currently requires --cuda\n");
+    if (e->backend != PULSAR_BACKEND_CUDA || !e->gpu_ready) {
+        fprintf(stderr, "pulsar: imatrix collection currently requires --cuda\n");
         return 1;
     }
     if (ctx_size <= 0) ctx_size = 32768;
@@ -1472,33 +1472,33 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     size_t dataset_len = 0;
     if (!imatrix_read_text_file(dataset_path, &dataset, &dataset_len)) return 1;
 
-    const ds4_model *model = &e->model;
-    const ds4_weights *weights = &e->weights;
+    const pulsar_model *model = &e->model;
+    const pulsar_weights *weights = &e->weights;
     const uint32_t prefill_cap =
         gpu_graph_prefill_cap_for_prompt(ctx_size, e->prefill_chunk);
     const uint32_t raw_cap = gpu_graph_raw_cap_for_context(ctx_size, prefill_cap);
 
-    ds4_gpu_graph g;
+    pulsar_gpu_graph g;
     bool ok = gpu_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size, prefill_cap, false);
     if (!ok) {
-        fprintf(stderr, "ds4: failed to allocate imatrix GPU graph runtime\n");
+        fprintf(stderr, "pulsar: failed to allocate imatrix GPU graph runtime\n");
         free(dataset);
         return 1;
     }
     g.quality = e->quality;
 
-    ds4_imatrix_collector collector;
+    pulsar_imatrix_collector collector;
     if (!imatrix_collector_init(&collector, prefill_cap, dataset_path)) {
-        fprintf(stderr, "ds4: failed to allocate imatrix collector\n");
+        fprintf(stderr, "pulsar: failed to allocate imatrix collector\n");
         gpu_graph_free(&g);
         free(dataset);
         return 1;
     }
 
     fprintf(stderr,
-            "ds4: collecting routed-MoE imatrix from %s (model=%s, layers=%u, experts=%u, ctx=%d, chunk=%u)\n",
-            dataset_path, DS4_MODEL_SHAPE_NAME, DS4_N_LAYER, DS4_N_EXPERT, ctx_size, prefill_cap);
+            "pulsar: collecting routed-MoE imatrix from %s (model=%s, layers=%u, experts=%u, ctx=%d, chunk=%u)\n",
+            dataset_path, PULSAR_MODEL_SHAPE_NAME, PULSAR_N_LAYER, PULSAR_N_EXPERT, ctx_size, prefill_cap);
 
     int prompts_done = 0;
     int tokens_done = 0;
@@ -1521,14 +1521,14 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
         char *prompt_text = imatrix_trim_block(start, end);
         if (prompt_text[0] != '\0') {
             token_vec prompt = {0};
-            ds4_tokenize_rendered_chat(e, prompt_text, &prompt);
+            pulsar_tokenize_rendered_chat(e, prompt_text, &prompt);
             if (prompt.len > ctx_size) prompt.len = ctx_size;
             if (max_tokens > 0 && prompt.len > max_tokens - tokens_done) {
                 prompt.len = max_tokens - tokens_done;
             }
             if (prompt.len > 0) {
                 if (!gpu_graph_reset_prefill_state(&g)) {
-                    fprintf(stderr, "ds4: failed to reset imatrix graph state\n");
+                    fprintf(stderr, "pulsar: failed to reset imatrix graph state\n");
                     ok = false;
                 } else if ((uint32_t)prompt.len > prefill_cap) {
                     ok = gpu_graph_prefill_chunked_range(&g, model, weights,
@@ -1548,7 +1548,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                                                          NULL, NULL);
                 }
                 if (!ok) {
-                    fprintf(stderr, "ds4: imatrix prefill failed at prompt %d\n", prompts_done + 1);
+                    fprintf(stderr, "pulsar: imatrix prefill failed at prompt %d\n", prompts_done + 1);
                     token_vec_free(&prompt);
                     *end = saved;
                     break;
@@ -1557,7 +1557,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                 tokens_done += prompt.len;
                 if (prompts_done % 10 == 0) {
                     fprintf(stderr,
-                            "ds4: imatrix prompts=%d tokens=%d routes=%llu\r",
+                            "pulsar: imatrix prompts=%d tokens=%d routes=%llu\r",
                             prompts_done,
                             tokens_done,
                             (unsigned long long)collector.observed_routes);
@@ -1578,7 +1578,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
         ok = imatrix_collector_save(&collector, weights, output_path);
         if (ok) {
             fprintf(stderr,
-                    "ds4: wrote imatrix %s from %d prompts, %d tokens, %llu routed expert observations\n",
+                    "pulsar: wrote imatrix %s from %d prompts, %d tokens, %llu routed expert observations\n",
                     output_path,
                     prompts_done,
                     tokens_done,
@@ -1594,24 +1594,24 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
 
 
 
-int ds4_engine_generate_argmax(
-        ds4_engine        *e,
-        const ds4_tokens  *prompt,
+int pulsar_engine_generate_argmax(
+        pulsar_engine        *e,
+        const pulsar_tokens  *prompt,
         int                n_predict,
         int                ctx_size,
-        ds4_token_emit_fn  emit,
-        ds4_generation_done_fn done,
+        pulsar_token_emit_fn  emit,
+        pulsar_generation_done_fn done,
         void              *emit_ud,
-        ds4_session_progress_fn progress,
+        pulsar_session_progress_fn progress,
         void              *progress_ud) {
-    const ds4_model *model = &e->model;
-    const ds4_vocab *vocab = &e->vocab;
-    const ds4_weights *weights = &e->weights;
+    const pulsar_model *model = &e->model;
+    const pulsar_vocab *vocab = &e->vocab;
+    const pulsar_weights *weights = &e->weights;
 
-    if (ds4_backend_uses_graph(e->backend)) {
+    if (pulsar_backend_uses_graph(e->backend)) {
         if (!e->gpu_ready) {
-            fprintf(stderr, "ds4: %s generation requested but the graph backend is unavailable\n",
-                    ds4_backend_name(e->backend));
+            fprintf(stderr, "pulsar: %s generation requested but the graph backend is unavailable\n",
+                    pulsar_backend_name(e->backend));
             return 1;
         }
         return generate_gpu_graph_raw_swa(model, vocab, weights, prompt,
@@ -1628,10 +1628,10 @@ int ds4_engine_generate_argmax(
 
 
 
-int ds4_engine_gpu_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
+int pulsar_engine_gpu_graph_test(pulsar_engine *e, const pulsar_tokens *prompt) {
     if (!e->gpu_ready) {
-        fprintf(stderr, "ds4: %s graph test requested but backend is unavailable\n",
-                ds4_backend_name(e->backend));
+        fprintf(stderr, "pulsar: %s graph test requested but backend is unavailable\n",
+                pulsar_backend_name(e->backend));
         return 1;
     }
     return gpu_graph_decode_test(&e->model, &e->weights, prompt, e->quality);
@@ -1639,71 +1639,71 @@ int ds4_engine_gpu_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
 
 
 
-int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
+int pulsar_engine_head_test(pulsar_engine *e, const pulsar_tokens *prompt) {
     if (!prompt || prompt->len <= 0) {
-        fprintf(stderr, "ds4: head test requires a non-empty prompt\n");
+        fprintf(stderr, "pulsar: head test requires a non-empty prompt\n");
         return 1;
     }
 
-    const ds4_model *model = &e->model;
-    const ds4_vocab *vocab = &e->vocab;
-    const ds4_weights *weights = &e->weights;
-    const ds4_layer_weights *layer0 = &weights->layer[0];
+    const pulsar_model *model = &e->model;
+    const pulsar_vocab *vocab = &e->vocab;
+    const pulsar_weights *weights = &e->weights;
+    const pulsar_layer_weights *layer0 = &weights->layer[0];
 
-    float *prompt_embd = (float *)xmalloc((size_t)prompt->len * DS4_N_EMBD * sizeof(prompt_embd[0]));
-    embed_prompt(model, weights, prompt, DS4_N_EMBD, prompt_embd);
+    float *prompt_embd = (float *)xmalloc((size_t)prompt->len * PULSAR_N_EMBD * sizeof(prompt_embd[0]));
+    embed_prompt(model, weights, prompt, PULSAR_N_EMBD, prompt_embd);
 
-    const uint32_t n_hc = DS4_N_HC;
-    float *hc0 = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(hc0[0]));
-    float *residual_hc = (float *)xmalloc((size_t)n_hc * DS4_N_EMBD * sizeof(residual_hc[0]));
+    const uint32_t n_hc = PULSAR_N_HC;
+    float *hc0 = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(hc0[0]));
+    float *residual_hc = (float *)xmalloc((size_t)n_hc * PULSAR_N_EMBD * sizeof(residual_hc[0]));
     float hc_post[4];
     float hc_comb[16];
     layer_attn_pre_one(model, layer0,
-        prompt_embd + (uint64_t)(prompt->len - 1) * DS4_N_EMBD,
+        prompt_embd + (uint64_t)(prompt->len - 1) * PULSAR_N_EMBD,
         hc0, residual_hc, hc_post, hc_comb);
-    print_vec_stats("blk.0 attn_pre", hc0, DS4_N_EMBD);
+    print_vec_stats("blk.0 attn_pre", hc0, PULSAR_N_EMBD);
 
-    float *attn_norm0 = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(attn_norm0[0]));
+    float *attn_norm0 = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(attn_norm0[0]));
     layer_attn_norm_one(attn_norm0, model, layer0, hc0);
 
-    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t q_dim = (uint64_t)PULSAR_N_HEAD * PULSAR_N_HEAD_DIM;
     float *q0 = (float *)xmalloc((size_t)q_dim * sizeof(q0[0]));
     layer_q_projection_normed_one(model, layer0, attn_norm0, q0);
     print_vec_stats("blk.0 q", q0, q_dim);
 
-    float *kv0 = (float *)xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(kv0[0]));
+    float *kv0 = (float *)xmalloc((size_t)PULSAR_N_HEAD_DIM * sizeof(kv0[0]));
     layer_kv_projection_normed_one(model, layer0, attn_norm0, kv0);
-    print_vec_stats("blk.0 kv", kv0, DS4_N_HEAD_DIM);
-    rope_tail_layer_inplace(q0, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, (uint32_t)(prompt->len - 1), 0, false);
-    rope_tail_layer_inplace(kv0, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, (uint32_t)(prompt->len - 1), 0, false);
-    dsv4_fp8_kv_quantize_row_inplace_cpu(kv0, DS4_N_HEAD_DIM, DS4_N_ROT);
-    f16_round_inplace_cpu(kv0, DS4_N_HEAD_DIM);
+    print_vec_stats("blk.0 kv", kv0, PULSAR_N_HEAD_DIM);
+    rope_tail_layer_inplace(q0, PULSAR_N_HEAD, PULSAR_N_HEAD_DIM, PULSAR_N_ROT, (uint32_t)(prompt->len - 1), 0, false);
+    rope_tail_layer_inplace(kv0, PULSAR_N_HEAD_KV, PULSAR_N_HEAD_DIM, PULSAR_N_ROT, (uint32_t)(prompt->len - 1), 0, false);
+    dsv4_fp8_kv_quantize_row_inplace_cpu(kv0, PULSAR_N_HEAD_DIM, PULSAR_N_ROT);
+    f16_round_inplace_cpu(kv0, PULSAR_N_HEAD_DIM);
 
     float *attn_heads = (float *)xmalloc((size_t)q_dim * sizeof(attn_heads[0]));
     layer_attention_one(attn_heads, model, layer0, q0, kv0);
     print_vec_stats("blk.0 attn_heads", attn_heads, q_dim);
-    rope_tail_layer_inplace(attn_heads, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, (uint32_t)(prompt->len - 1), 0, true);
+    rope_tail_layer_inplace(attn_heads, PULSAR_N_HEAD, PULSAR_N_HEAD_DIM, PULSAR_N_ROT, (uint32_t)(prompt->len - 1), 0, true);
 
-    float *attn_out = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(attn_out[0]));
+    float *attn_out = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(attn_out[0]));
     layer_grouped_out_one(attn_out, model, layer0, attn_heads);
-    print_vec_stats("blk.0 attn_out", attn_out, DS4_N_EMBD);
+    print_vec_stats("blk.0 attn_out", attn_out, PULSAR_N_EMBD);
 
-    float *after_attn_hc = (float *)xmalloc((size_t)n_hc * DS4_N_EMBD * sizeof(after_attn_hc[0]));
-    hc_post_one(after_attn_hc, attn_out, residual_hc, hc_post, hc_comb, DS4_N_EMBD, n_hc);
-    print_vec_stats("blk.0 after_attn_hc", after_attn_hc, (uint64_t)n_hc * DS4_N_EMBD);
+    float *after_attn_hc = (float *)xmalloc((size_t)n_hc * PULSAR_N_EMBD * sizeof(after_attn_hc[0]));
+    hc_post_one(after_attn_hc, attn_out, residual_hc, hc_post, hc_comb, PULSAR_N_EMBD, n_hc);
+    print_vec_stats("blk.0 after_attn_hc", after_attn_hc, (uint64_t)n_hc * PULSAR_N_EMBD);
 
-    float *after_ffn_hc = (float *)xmalloc((size_t)n_hc * DS4_N_EMBD * sizeof(after_ffn_hc[0]));
+    float *after_ffn_hc = (float *)xmalloc((size_t)n_hc * PULSAR_N_EMBD * sizeof(after_ffn_hc[0]));
     layer_ffn_one(after_ffn_hc, model, layer0, after_attn_hc, 0, prompt->v[prompt->len - 1],
                   NULL, 0.0f, true);
-    print_vec_stats("blk.0 after_ffn_hc", after_ffn_hc, (uint64_t)n_hc * DS4_N_EMBD);
+    print_vec_stats("blk.0 after_ffn_hc", after_ffn_hc, (uint64_t)n_hc * PULSAR_N_EMBD);
 
-    float *logits = (float *)xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
+    float *logits = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(logits[0]));
     output_logits_one(logits, model, weights, after_ffn_hc);
-    print_vec_stats("logits", logits, DS4_N_VOCAB);
+    print_vec_stats("logits", logits, PULSAR_N_VOCAB);
 
     int best[8];
     for (int i = 0; i < 8; i++) best[i] = -1;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+    for (uint32_t i = 0; i < PULSAR_N_VOCAB; i++) {
         for (int j = 0; j < 8; j++) {
             if (best[j] < 0 || logits[i] > logits[best[j]]) {
                 for (int k = 7; k > j; k--) best[k] = best[k - 1];
@@ -1741,8 +1741,8 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
 
 
 
-int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
-    ds4_engine *e = (ds4_engine *)xcalloc(1, sizeof(*e));
+int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt) {
+    pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
     e->model.fd = -1;
     e->dspark_model.fd = -1;
     e->backend = opt->backend;
@@ -1765,21 +1765,21 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
         (!opt->directional_steering_file || !opt->directional_steering_file[0]))
     {
-        fprintf(stderr, "ds4: directional steering needs --dir-steering-file\n");
+        fprintf(stderr, "pulsar: directional steering needs --dir-steering-file\n");
         free(e);
         *out = NULL;
         return 1;
     }
     if (opt->directional_steering_file && opt->directional_steering_file[0]) {
-        e->directional_steering_file = ds4_strdup(opt->directional_steering_file);
+        e->directional_steering_file = pulsar_strdup(opt->directional_steering_file);
         e->directional_steering_attn_scale = opt->directional_steering_attn;
         e->directional_steering_ffn_scale = opt->directional_steering_ffn;
     }
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
-    ds4_acquire_instance_lock();
+    pulsar_acquire_instance_lock();
 
-    const bool graph_backend = ds4_backend_uses_graph(opt->backend);
-    if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
+    const bool graph_backend = pulsar_backend_uses_graph(opt->backend);
+    if (graph_backend) pulsar_linux_graph_backend_set_oom_score(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
     if (opt->warm_weights) model_warm_weights(&e->model);
     if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
@@ -1787,16 +1787,16 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (opt->expert_overlay && opt->expert_overlay[0]) {
         const char *sep = strrchr(opt->expert_overlay, ':');
         if (!sep || sep == opt->expert_overlay || !sep[1]) {
-            fprintf(stderr, "ds4: --expert-overlay expects FILE:PREFIX (e.g. donor.gguf:blk.17.)\n");
-            ds4_engine_close(e);
+            fprintf(stderr, "pulsar: --expert-overlay expects FILE:PREFIX (e.g. donor.gguf:blk.17.)\n");
+            pulsar_engine_close(e);
             *out = NULL;
             return 1;
         }
         char overlay_path[4096];
         const size_t path_len = (size_t)(sep - opt->expert_overlay);
         if (path_len >= sizeof(overlay_path)) {
-            fprintf(stderr, "ds4: --expert-overlay path is too long\n");
-            ds4_engine_close(e);
+            fprintf(stderr, "pulsar: --expert-overlay path is too long\n");
+            pulsar_engine_close(e);
             *out = NULL;
             return 1;
         }
@@ -1810,8 +1810,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         char prefixes[2048];
         const size_t plist_len = strlen(sep + 1);
         if (plist_len >= sizeof(prefixes)) {
-            fprintf(stderr, "ds4: --expert-overlay prefix list is too long\n");
-            ds4_engine_close(e);
+            fprintf(stderr, "pulsar: --expert-overlay prefix list is too long\n");
+            pulsar_engine_close(e);
             *out = NULL;
             return 1;
         }
@@ -1820,15 +1820,15 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         for (char *p = strtok(prefixes, ","); p; p = strtok(NULL, ",")) {
             const uint32_t n = model_apply_expert_overlay(&e->model, &e->overlay_model, p);
             if (n == 0) {
-                fprintf(stderr, "ds4: --expert-overlay prefix '%s' matched no routed-expert tensors\n",
+                fprintf(stderr, "pulsar: --expert-overlay prefix '%s' matched no routed-expert tensors\n",
                         p);
-                ds4_engine_close(e);
+                pulsar_engine_close(e);
                 *out = NULL;
                 return 1;
             }
             swapped += n;
         }
-        fprintf(stderr, "ds4: expert overlay: %u tensors swapped in from %s (prefixes %s)\n",
+        fprintf(stderr, "pulsar: expert overlay: %u tensors swapped in from %s (prefixes %s)\n",
                 swapped, overlay_path, sep + 1);
     }
     weights_bind(&e->weights, &e->model);
@@ -1845,7 +1845,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         e->dspark_model = e->model;
         e->dspark_external = false;
         e->dspark_ready = true;
-        fprintf(stderr, "ds4: DSpark drafter found in model (draft=%d, confidence=%.2f)\n",
+        fprintf(stderr, "pulsar: DSpark drafter found in model (draft=%d, confidence=%.2f)\n",
                 e->dspark_draft_tokens,
                 (double)e->dspark_confidence);
     } else if (!opt->dspark_disable && opt->dspark_path && opt->dspark_path[0]) {
@@ -1853,86 +1853,86 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         dspark_weights_bind(&e->dspark_weights, &e->dspark_model);
         e->dspark_external = true;
         e->dspark_ready = true;
-        fprintf(stderr, "ds4: DSpark support model loaded: %s (draft=%d, confidence=%.2f)\n",
+        fprintf(stderr, "pulsar: DSpark support model loaded: %s (draft=%d, confidence=%.2f)\n",
                 opt->dspark_path,
                 e->dspark_draft_tokens,
                 (double)e->dspark_confidence);
     }
 
     if (graph_backend) {
-        e->gpu_ready = ds4_gpu_init() != 0;
+        e->gpu_ready = pulsar_gpu_init() != 0;
         if (!e->gpu_ready) {
-            fprintf(stderr, "ds4: %s backend unavailable; aborting startup\n",
-                    ds4_backend_name(e->backend));
-            ds4_engine_close(e);
+            fprintf(stderr, "pulsar: %s backend unavailable; aborting startup\n",
+                    pulsar_backend_name(e->backend));
+            pulsar_engine_close(e);
             *out = NULL;
             return 1;
         }
-        ds4_gpu_set_quality(e->quality);
-        (void)ds4_gpu_set_model_fd(e->model.fd);
+        pulsar_gpu_set_quality(e->quality);
+        (void)pulsar_gpu_set_model_fd(e->model.fd);
         const int model_map_ok =
-            ds4_gpu_set_model_map_range(e->model.map,
+            pulsar_gpu_set_model_map_range(e->model.map,
                                         e->model.size,
                                         e->model.tensor_data_pos,
                                         e->model.size - e->model.tensor_data_pos,
                                         e->model.max_tensor_bytes);
         if (!model_map_ok) {
             fprintf(stderr,
-                    "ds4: %s failed to map model views; aborting startup. "
+                    "pulsar: %s failed to map model views; aborting startup. "
                     "This is commonly caused by insufficient memory or accelerator VM budget.\n",
-                    ds4_backend_name(e->backend));
-            ds4_engine_close(e);
+                    pulsar_backend_name(e->backend));
+            pulsar_engine_close(e);
             *out = NULL;
             return 1;
         }
         if (e->dspark_ready && e->dspark_external &&
-            !ds4_gpu_set_model_map_range(e->dspark_model.map,
+            !pulsar_gpu_set_model_map_range(e->dspark_model.map,
                                            e->dspark_model.size,
                                            e->dspark_model.tensor_data_pos,
                                            e->dspark_model.size - e->dspark_model.tensor_data_pos,
                                            e->dspark_model.max_tensor_bytes))
         {
             fprintf(stderr,
-                    "ds4: %s failed to map DSpark model views; aborting startup. "
+                    "pulsar: %s failed to map DSpark model views; aborting startup. "
                     "This is commonly caused by insufficient memory or accelerator VM budget.\n",
-                    ds4_backend_name(e->backend));
-            ds4_engine_close(e);
+                    pulsar_backend_name(e->backend));
+            pulsar_engine_close(e);
             *out = NULL;
             return 1;
         }
-        (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+        (void)pulsar_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
         if (!accelerator_cache_model_tensors(e->backend, &e->model,
                                              NULL, NULL, 0,
                                              e->dspark_ready ? NULL : "dspark.")) {
-            fprintf(stderr, "ds4: %s failed to prepare optional model cache\n",
-                    ds4_backend_name(e->backend));
-            ds4_engine_close(e);
+            fprintf(stderr, "pulsar: %s failed to prepare optional model cache\n",
+                    pulsar_backend_name(e->backend));
+            pulsar_engine_close(e);
             *out = NULL;
             return 1;
         }
         if (e->dspark_ready && e->dspark_external) {
-            (void)ds4_gpu_set_model_fd_for_map(e->dspark_model.fd, e->dspark_model.map);
+            (void)pulsar_gpu_set_model_fd_for_map(e->dspark_model.fd, e->dspark_model.map);
             if (!accelerator_cache_model_tensors(e->backend, &e->dspark_model,
                                                  NULL, NULL, 0, NULL)) {
-                fprintf(stderr, "ds4: %s failed to prepare optional DSpark model cache\n",
-                        ds4_backend_name(e->backend));
-                ds4_engine_close(e);
+                fprintf(stderr, "pulsar: %s failed to prepare optional DSpark model cache\n",
+                        pulsar_backend_name(e->backend));
+                pulsar_engine_close(e);
                 *out = NULL;
                 return 1;
             }
-            (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+            (void)pulsar_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
         }
         if (e->overlay_ready &&
             !accelerator_prepare_expert_overlay(e->backend, &e->model,
                                                 &e->overlay_model)) {
-            fprintf(stderr, "ds4: %s failed to prepare expert-overlay spans\n",
-                    ds4_backend_name(e->backend));
-            ds4_engine_close(e);
+            fprintf(stderr, "pulsar: %s failed to prepare expert-overlay spans\n",
+                    pulsar_backend_name(e->backend));
+            pulsar_engine_close(e);
             *out = NULL;
             return 1;
         }
-        fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
-                ds4_backend_name(e->backend));
+        fprintf(stderr, "pulsar: %s backend initialized for graph diagnostics\n",
+                pulsar_backend_name(e->backend));
 
         /* One MoE-tier boot line so a silent slow tier is no longer silent:
          * resolved expert weight type (grouped-CUTLASS type-40 vs per-expert
@@ -1948,28 +1948,28 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
              * exists to catch a SILENT fall to a slow tier, so it has to be
              * truthful about the mix or it defeats its own purpose. */
             uint32_t n_grouped = 0, n_tiled = 0, n_routed = 0;
-            const ds4_layer_weights *ml = NULL;
-            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-                const ds4_layer_weights *l = &e->weights.layer[il];
+            const pulsar_layer_weights *ml = NULL;
+            for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+                const pulsar_layer_weights *l = &e->weights.layer[il];
                 if (!l->ffn_gate_exps || !l->ffn_down_exps) continue;
                 if (!ml) ml = l;                    /* first routed layer, for the type sample */
                 n_routed++;
                 /* The grouped/GEMV CUTLASS dispatch is entered only when BOTH
                  * gate and down experts are type-40 (see the moe.cu batch
                  * predicate); any other mix takes the per-expert tiled path. */
-                if (l->ffn_gate_exps->type == DS4_TENSOR_CUTLASS_MXFP4 &&
-                    l->ffn_down_exps->type == DS4_TENSOR_CUTLASS_MXFP4) n_grouped++;
+                if (l->ffn_gate_exps->type == PULSAR_TENSOR_CUTLASS_MXFP4 &&
+                    l->ffn_down_exps->type == PULSAR_TENSOR_CUTLASS_MXFP4) n_grouped++;
                 else n_tiled++;
             }
             if (ml) {
                 const uint32_t gt = ml->ffn_gate_exps->type;
                 const uint32_t dt = ml->ffn_down_exps->type;
                 fprintf(stderr,
-                        "ds4: MoE expert tier: %u/%u layers grouped-CUTLASS, %u/%u per-expert-tiled "
+                        "pulsar: MoE expert tier: %u/%u layers grouped-CUTLASS, %u/%u per-expert-tiled "
                         "(first routed layer gate=%s(%u) down=%s(%u)) mxfp4 tile=NT%u\n",
                         n_grouped, n_routed, n_tiled, n_routed,
                         tensor_type_name(gt), gt, tensor_type_name(dt), dt,
-                        ds4_gpu_moe_mxfp4_tile_width());
+                        pulsar_gpu_moe_mxfp4_tile_width());
             }
         }
     }
@@ -1980,13 +1980,13 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 
 
 
-void ds4_engine_summary(ds4_engine *e) {
+void pulsar_engine_summary(pulsar_engine *e) {
     model_summary(&e->model);
 }
 
 
 
-int ds4_engine_vocab_size(ds4_engine *e) {
+int pulsar_engine_vocab_size(pulsar_engine *e) {
     return e ? e->vocab.n_vocab : 0;
 }
 
@@ -1994,21 +1994,21 @@ int ds4_engine_vocab_size(ds4_engine *e) {
 
 /* The engine's logits ROW WIDTH — the shape profile's n_vocab, which is what
  * every logits buffer the engine writes is strided by.  This is NOT
- * ds4_engine_vocab_size (the tokenizer table length): the loader never checks
+ * pulsar_engine_vocab_size (the tokenizer table length): the loader never checks
  * the two against each other, and sizing a logits buffer from the tokenizer
  * length is exactly the mismatch that produced an unbounded-logits write. */
-int ds4_engine_logits_width(const ds4_engine *e) {
-    return e ? (int)DS4_N_VOCAB : 0;
+int pulsar_engine_logits_width(const pulsar_engine *e) {
+    return e ? (int)PULSAR_N_VOCAB : 0;
 }
 
 
 
-const char *ds4_engine_model_name(ds4_engine *e) {
+const char *pulsar_engine_model_name(pulsar_engine *e) {
     (void)e;
-    return DS4_MODEL_SHAPE_NAME;
+    return PULSAR_MODEL_SHAPE_NAME;
 }
 
-void ds4_engine_spec_metrics(ds4_engine *e, ds4_spec_metrics *out) {
+void pulsar_engine_spec_metrics(pulsar_engine *e, pulsar_spec_metrics *out) {
     if (!out) return;
     memset(out, 0, sizeof(*out));
     if (!e) return;
@@ -2024,11 +2024,11 @@ void ds4_engine_spec_metrics(ds4_engine *e, ds4_spec_metrics *out) {
 
 
 /* Per-SESSION cumulative DSpark counters (accepted/draft/drafts/gen). Same
- * semantics as ds4_engine_spec_metrics but scoped to one session, so a caller
+ * semantics as pulsar_engine_spec_metrics but scoped to one session, so a caller
  * can diff a snapshot across a single request for a per-response accept-rate.
  * accepted_per_pos is left zero (the per-position waterfall stays a /metrics,
  * cross-request concern). */
-void ds4_session_spec_metrics(const ds4_session *s, ds4_spec_metrics *out) {
+void pulsar_session_spec_metrics(const pulsar_session *s, pulsar_spec_metrics *out) {
     if (!out) return;
     memset(out, 0, sizeof(*out));
     if (!s) return;
@@ -2042,14 +2042,14 @@ void ds4_session_spec_metrics(const ds4_session *s, ds4_spec_metrics *out) {
 
 
 
-int ds4_engine_layer_count(ds4_engine *e) {
+int pulsar_engine_layer_count(pulsar_engine *e) {
     (void)e;
-    return (int)DS4_N_LAYER;
+    return (int)PULSAR_N_LAYER;
 }
 
 
 
-uint64_t ds4_engine_weights_resident_bytes(ds4_engine *e) {
+uint64_t pulsar_engine_weights_resident_bytes(pulsar_engine *e) {
     if (!e) return 0;
     /* The GGUF(s) are mmap'd read-only and shared across every session, so this
      * is a single resident copy competing with per-session KV for the unified
@@ -2064,40 +2064,40 @@ uint64_t ds4_engine_weights_resident_bytes(ds4_engine *e) {
 
 
 
-uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer) {
+uint32_t pulsar_engine_layer_compress_ratio(pulsar_engine *e, uint32_t layer) {
     (void)e;
-    if (layer >= DS4_N_LAYER) return 0;
-    return ds4_layer_compress_ratio(layer);
+    if (layer >= PULSAR_N_LAYER) return 0;
+    return pulsar_layer_compress_ratio(layer);
 }
 
 
 
-uint64_t ds4_engine_hidden_f32_values(ds4_engine *e) {
+uint64_t pulsar_engine_hidden_f32_values(pulsar_engine *e) {
     (void)e;
-    return (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    return (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
 }
 
 
 
-int ds4_engine_model_id(ds4_engine *e) {
+int pulsar_engine_model_id(pulsar_engine *e) {
     (void)e;
-    return (int)DS4_MODEL_VARIANT;
+    return (int)PULSAR_MODEL_VARIANT;
 }
 
 
 
-void ds4_engine_close(ds4_engine *e) {
+void pulsar_engine_close(pulsar_engine *e) {
     if (!e) return;
     weights_free(&e->weights);
     vocab_free(&e->vocab);
-    ds4_threads_shutdown();
+    pulsar_threads_shutdown();
     /* Tear down GPU state (which cudaHostUnregisters the mmap'd weight ranges)
      * before munmap'ing the model — unmapping still-registered pages is UB. */
-    ds4_gpu_cleanup();
+    pulsar_gpu_cleanup();
     if (e->dspark_ready && e->dspark_external) model_close(&e->dspark_model);
     if (e->overlay_ready) model_close(&e->overlay_model);
     model_close(&e->model);
-    ds4_release_instance_lock();
+    pulsar_release_instance_lock();
     free(e->directional_steering_dirs);
     free(e->directional_steering_file);
     free(e);
@@ -2105,25 +2105,25 @@ void ds4_engine_close(ds4_engine *e) {
 
 
 
-int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
+int pulsar_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
-    if (!ds4_backend_uses_graph(e->backend) || !e->gpu_ready) return 1;
+    if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 1;
 
-    ds4_session *s = (ds4_session *)xcalloc(1, sizeof(*s));
+    pulsar_session *s = (pulsar_session *)xcalloc(1, sizeof(*s));
     s->engine = e;
     s->ctx_size = ctx_size;
     s->prefill_cap = gpu_graph_prefill_cap_for_prompt(ctx_size,
                                                         e->prefill_chunk);
     const uint32_t raw_cap = gpu_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
-    const ds4_layer_weights *shape_layer = weights_first_bound_layer(&e->weights);
+    const pulsar_layer_weights *shape_layer = weights_first_bound_layer(&e->weights);
     if (!shape_layer) {
-        fprintf(stderr, "ds4: no transformer layers are loaded\n");
+        fprintf(stderr, "pulsar: no transformer layers are loaded\n");
         free(s);
         return 1;
     }
     /* Measure the true GPU cost of this session (allocator delta across the
      * create) so callers can reconcile admission estimates against reality. */
-    const uint64_t alloc_before = ds4_gpu_tensor_alloc_bytes_current();
+    const uint64_t alloc_before = pulsar_gpu_tensor_alloc_bytes_current();
     if (!gpu_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap,
                                    e->dspark_ready))
@@ -2140,70 +2140,70 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         free(s);
         return 1;
     }
-    s->logits = (float *)xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+    s->logits = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(s->logits[0]));
     if (e->dspark_ready) {
         if (!gpu_graph_init_dspark_target(&s->graph, e->dspark_weights.target_layer_ids)) {
-            fprintf(stderr, "ds4: failed to allocate DSpark graph buffers\n");
+            fprintf(stderr, "pulsar: failed to allocate DSpark graph buffers\n");
             gpu_graph_free(&s->graph);
             free(s->logits);
             free(s);
             return 1;
         }
     }
-    s->resident_bytes = ds4_gpu_tensor_alloc_bytes_current() - alloc_before;
+    s->resident_bytes = pulsar_gpu_tensor_alloc_bytes_current() - alloc_before;
     *out = s;
     return 0;
 }
 
 
 
-uint64_t ds4_session_resident_bytes(const ds4_session *s) {
+uint64_t pulsar_session_resident_bytes(const pulsar_session *s) {
     return s ? s->resident_bytes : 0;
 }
 
 
 
-/* TRUE total per-session GPU byte cost of ds4_session_create at this context
+/* TRUE total per-session GPU byte cost of pulsar_session_create at this context
  * size — the admission-control price of a session.  Derives prefill/raw caps
- * exactly like ds4_session_create and includes the DSpark drafter graph state
+ * exactly like pulsar_session_create and includes the DSpark drafter graph state
  * when the engine has a drafter loaded, so callers cannot pass mismatched
  * parameters.  Built on the same sizing code as the allocator
  * (gpu_graph_session_bytes, gpu_diag.c); reconcile against
- * ds4_session_resident_bytes after the create. */
-uint64_t ds4_engine_session_cost_bytes(ds4_engine *e, int ctx_size) {
+ * pulsar_session_resident_bytes after the create. */
+uint64_t pulsar_engine_session_cost_bytes(pulsar_engine *e, int ctx_size) {
     if (!e || ctx_size <= 0) return 0;
-    if (!ds4_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
+    if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
     const uint32_t prefill_cap = gpu_graph_prefill_cap_for_prompt(ctx_size,
                                                                   e->prefill_chunk);
     const uint32_t raw_cap = gpu_graph_raw_cap_for_context(ctx_size, prefill_cap);
-    const ds4_layer_weights *shape_layer = weights_first_bound_layer(&e->weights);
+    const pulsar_layer_weights *shape_layer = weights_first_bound_layer(&e->weights);
     if (!shape_layer) return 0;
     return gpu_graph_session_bytes(&e->weights, shape_layer, raw_cap,
                                    (uint32_t)ctx_size, prefill_cap,
                                    e->dspark_ready);
 }
 
-uint64_t ds4_engine_session_cost_bytes_banked(ds4_engine *e, int ctx_size,
+uint64_t pulsar_engine_session_cost_bytes_banked(pulsar_engine *e, int ctx_size,
                                               int n_banks) {
     if (!e || ctx_size <= 0 || n_banks < 1) return 0;
-    if (!ds4_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
+    if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
     const uint32_t prefill_cap = gpu_graph_prefill_cap_for_prompt(ctx_size,
                                                                   e->prefill_chunk);
     const uint32_t raw_cap = gpu_graph_raw_cap_for_context(ctx_size, prefill_cap);
-    const ds4_layer_weights *shape_layer = weights_first_bound_layer(&e->weights);
+    const pulsar_layer_weights *shape_layer = weights_first_bound_layer(&e->weights);
     if (!shape_layer) return 0;
     return gpu_graph_session_bytes_banked(&e->weights, shape_layer, raw_cap,
                                           (uint32_t)ctx_size, prefill_cap,
                                           e->dspark_ready, (uint32_t)n_banks);
 }
 
-uint64_t ds4_engine_demand_paged_bytes_per_bank(ds4_engine *e, int ctx_size) {
+uint64_t pulsar_engine_demand_paged_bytes_per_bank(pulsar_engine *e, int ctx_size) {
     if (!e || ctx_size <= 0) return 0;
-    if (!ds4_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
+    if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
     return gpu_graph_demand_paged_bytes_per_bank((uint32_t)ctx_size);
 }
 
-uint64_t ds4_session_touched_kv_bytes(const ds4_session *s) {
+uint64_t pulsar_session_touched_kv_bytes(const pulsar_session *s) {
     if (!s) return 0;
     return gpu_graph_touched_kv_bytes(&s->graph);
 }
@@ -2212,32 +2212,32 @@ uint64_t ds4_session_touched_kv_bytes(const ds4_session *s) {
  * (server guard) must have snapshotted the bank's KV to DISK before evict (host
  * RAM reclaims nothing on unified memory) and repointed away from it; and after
  * restore-alloc it reloads the KV H2D from that snapshot. */
-bool ds4_session_bank_free_physical(ds4_session *s, uint32_t bank) {
+bool pulsar_session_bank_free_physical(pulsar_session *s, uint32_t bank) {
     if (!s) return false;
     return gpu_graph_bank_free_physical(&s->graph, bank);
 }
 
-bool ds4_session_bank_alloc_physical(ds4_session *s, uint32_t bank) {
+bool pulsar_session_bank_alloc_physical(pulsar_session *s, uint32_t bank) {
     if (!s) return false;
     return gpu_graph_bank_alloc_physical(&s->graph, bank);
 }
 
-bool ds4_session_bank_is_evicted(const ds4_session *s, uint32_t bank) {
+bool pulsar_session_bank_is_evicted(const pulsar_session *s, uint32_t bank) {
     if (!s) return false;
     return gpu_graph_bank_is_evicted(&s->graph, bank);
 }
 
-uint64_t ds4_session_bank_touched_kv_bytes(ds4_session *s, uint32_t bank) {
+uint64_t pulsar_session_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank) {
     if (!s) return 0;
     return gpu_graph_bank_touched_kv_bytes(&s->graph, bank);
 }
 
-uint64_t ds4_session_quantum_growth_bytes_per_bank(ds4_session *s, uint32_t q) {
+uint64_t pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, uint32_t q) {
     (void)s;
     return gpu_graph_quantum_growth_bytes_per_bank(q);
 }
 
-static bool bank_carry_ensure(ds4_session *s);   /* defined below */
+static bool bank_carry_ensure(pulsar_session *s);   /* defined below */
 
 /* Set d's token contents to EXACTLY toks[0..n) (reusing d's owned buffer). The
  * fork paths use this to stamp a dst's committed frontier from the VALIDATED
@@ -2252,16 +2252,16 @@ static void token_vec_set_prefix(token_vec *d, const int *toks, int n) {
 
 /* Tier-2 PATH-A (plan-33 inc A) — deep-copy one bank carry into another (src's
  * conversation continues on dst). Reuses d's owned heap buffers; no alias/leak. */
-static void bank_carry_copy(ds4_bank_carry *d, const ds4_bank_carry *sc) {
+static void bank_carry_copy(pulsar_bank_carry *d, const pulsar_bank_carry *sc) {
     token_vec d_ck = d->checkpoint;              /* keep d's own token buffer */
     float   *d_logits = d->logits;
     float   *d_qrows = d->dspark_pending_qrows;
     uint32_t d_qcap = d->dspark_pending_qrows_cap;
     *d = *sc;                                    /* scalars + (aliased) heap ptrs — fixed below */
     d->checkpoint = d_ck;
-    ds4_tokens_copy(&d->checkpoint, &sc->checkpoint);
-    d->logits = d_logits ? d_logits : (float *)xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
-    if (sc->logits) memcpy(d->logits, sc->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    pulsar_tokens_copy(&d->checkpoint, &sc->checkpoint);
+    d->logits = d_logits ? d_logits : (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(float));
+    if (sc->logits) memcpy(d->logits, sc->logits, (size_t)PULSAR_N_VOCAB * sizeof(float));
     d->dspark_pending_qrows = d_qrows;
     d->dspark_pending_qrows_cap = d_qcap;
     if (sc->dspark_pending_qrows && sc->dspark_pending_qrows_cap > 0) {
@@ -2285,10 +2285,10 @@ static void bank_carry_copy(ds4_bank_carry *d, const ds4_bank_carry *sc) {
  * committed length (a shorter shared prefix is the partial case, increment C).
  * Pins src against the eviction guard for the duration of the clone. Returns 0 on
  * success, non-zero on refusal/failure (caller falls back to cold prefill). */
-int ds4_session_bank_fork(ds4_session *s, uint32_t src, uint32_t dst,
+int pulsar_session_bank_fork(pulsar_session *s, uint32_t src, uint32_t dst,
                           const int *tokens, int n_cached) {
     if (!s || !tokens || n_cached < 0) return 1;
-    ds4_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = &s->graph;
     if (g->banks.n_banks == 0 || src >= g->banks.n_banks ||
         dst >= g->banks.n_banks || src == dst) return 1;
     /* 1. VALIDATE against src's committed history BEFORE any device write. */
@@ -2313,14 +2313,14 @@ int ds4_session_bank_fork(ds4_session *s, uint32_t src, uint32_t dst,
     if (!gpu_graph_bank_fork_copy(g, src, dst)) { g->fork_pin[src] = 0u; return 1; }
     /* 6. Copy src host carry -> dst so dst owns src's conversation state. */
     if (!bank_carry_ensure(s)) { g->fork_pin[src] = 0u; return 1; }
-    if (src == cur) ds4_session_bank_state_save(s, src);      /* refresh from live session */
+    if (src == cur) pulsar_session_bank_state_save(s, src);      /* refresh from live session */
     if (src < s->bank_carry_n && dst < s->bank_carry_n) {
         bank_carry_copy(&s->bank_carry[dst], &s->bank_carry[src]);
     }
     /* dst owns tokens[0..n_cached) as its committed frontier. SET it explicitly
      * from the validated request prefix (do not trust the copied carry alone). */
     if (dst < s->bank_carry_n) {
-        ds4_bank_carry *c = &s->bank_carry[dst];
+        pulsar_bank_carry *c = &s->bank_carry[dst];
         token_vec_set_prefix(&c->checkpoint, tokens, n_cached);
         c->checkpoint_valid = true;
         c->valid = true;
@@ -2352,12 +2352,12 @@ int ds4_session_bank_fork(ds4_session *s, uint32_t src, uint32_t dst,
     return 0;
 }
 
-bool ds4_session_bank_fork_pinned(const ds4_session *s, uint32_t bank) {
+bool pulsar_session_bank_fork_pinned(const pulsar_session *s, uint32_t bank) {
     if (!s || bank >= gpu_graph_bank_pool_count(&s->graph)) return false;
     return s->graph.fork_pin[bank] != 0u;
 }
 
-/* Tier-2 PATH-A PARTIAL-CUT FORK (plan-33 increment C). Like ds4_session_bank_fork
+/* Tier-2 PATH-A PARTIAL-CUT FORK (plan-33 increment C). Like pulsar_session_bank_fork
  * but for a request that shares only tokens[0..n_cached) with src's committed
  * history: the cut is ALIGNED DOWN to R = ((n_cached-4)/align)*align (align = 128,
  * the ratio LCM) so every ratio-128 layer cuts on a closed group and only ratio-4
@@ -2369,13 +2369,13 @@ bool ds4_session_bank_fork_pinned(const ds4_session *s, uint32_t bank) {
  * the stash. src==dst is the in-place truncate-reuse degenerate (no copies).
  * Returns 0 on success; non-zero refusal (mismatch, unaligned/short cut, evicted
  * src, wrapped-out ring) -> caller cold-prefills. */
-int ds4_session_bank_fork_partial(ds4_session *s, uint32_t src, uint32_t dst,
+int pulsar_session_bank_fork_partial(pulsar_session *s, uint32_t src, uint32_t dst,
                                   const int *tokens, int n_cached) {
     if (!s || !tokens || n_cached < 4) return 1;
-    ds4_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = &s->graph;
     if (g->banks.n_banks == 0 || src >= g->banks.n_banks || dst >= g->banks.n_banks)
         return 1;
-    const uint32_t align = ds4_partial_fork_base_align();
+    const uint32_t align = pulsar_partial_fork_base_align();
     const uint32_t R = (uint32_t)((n_cached - 4) / (int)align) * align;
     if (R < align) return 1;                        /* cut too shallow */
     /* 1. VALIDATE tokens[0..R+4) vs src's committed history BEFORE any write. */
@@ -2398,7 +2398,7 @@ int ds4_session_bank_fork_partial(ds4_session *s, uint32_t src, uint32_t dst,
     g->fork_pin[src] = 1u;
     if (gpu_graph_bank_is_evicted(g, src)) { g->fork_pin[src] = 0u; return 1; }
     if (!bank_carry_ensure(s)) { g->fork_pin[src] = 0u; return 1; }
-    if (src == cur) ds4_session_bank_state_save(s, src);
+    if (src == cur) pulsar_session_bank_state_save(s, src);
     /* 3-4. Clone-with-cut (cut counters + boundary stash + keep threshold). */
     if (!gpu_graph_bank_fork_copy_cut(g, src, dst, R, (uint32_t)hist->len)) {
         g->fork_pin[src] = 0u;
@@ -2413,7 +2413,7 @@ int ds4_session_bank_fork_partial(ds4_session *s, uint32_t src, uint32_t dst,
         bank_carry_copy(&s->bank_carry[dst], &s->bank_carry[src]);
     }
     if (dst < s->bank_carry_n) {
-        ds4_bank_carry *c = &s->bank_carry[dst];
+        pulsar_bank_carry *c = &s->bank_carry[dst];
         token_vec_set_prefix(&c->checkpoint, tokens, (int)R);
         c->checkpoint_valid = true;
         c->valid = true;
@@ -2453,35 +2453,35 @@ int ds4_session_bank_fork_partial(ds4_session *s, uint32_t src, uint32_t dst,
  * rows to a TRANSIENT staging buffer, write to `fp`, and FREE it immediately —
  * holding KV in host RAM reclaims nothing (unified pool). Precondition: `bank`
  * is the installed (cur) bank so its live frontier is captured. */
-#define DS4_BANK_KV_MAGIC   0x4B564232u   /* "KVB2" */
-#define DS4_BANK_KV_VERSION 1u
+#define PULSAR_BANK_KV_MAGIC   0x4B564232u   /* "KVB2" */
+#define PULSAR_BANK_KV_VERSION 1u
 
-int ds4_session_bank_kv_save(ds4_session *s, uint32_t bank, FILE *fp,
+int pulsar_session_bank_kv_save(pulsar_session *s, uint32_t bank, FILE *fp,
                              char *err, size_t errlen) {
     if (!s || !fp) { payload_set_err(err, errlen, "bank kv save: bad args"); return 1; }
-    ds4_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = &s->graph;
     if (g->banks.n_banks == 0 || bank >= g->banks.n_banks) {
         payload_set_err(err, errlen, "bank kv save: no pool / bad bank"); return 1;
     }
     gpu_graph_bank_counters_capture(g, bank);   /* ms_n_*[bank] <- live layer_n_* */
     const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
     const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
-        ? DS4_ENGINE_IDXFP4_ROWBYTES : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
-    uint32_t hdr[4] = { DS4_BANK_KV_MAGIC, DS4_BANK_KV_VERSION, bank, (uint32_t)DS4_N_LAYER };
+        ? PULSAR_ENGINE_IDXFP4_ROWBYTES : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
+    uint32_t hdr[4] = { PULSAR_BANK_KV_MAGIC, PULSAR_BANK_KV_VERSION, bank, (uint32_t)PULSAR_N_LAYER };
     if (fwrite(hdr, sizeof hdr, 1, fp) != 1) { payload_set_err(err, errlen, "bank kv save: header write"); return 1; }
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         uint32_t cnt[2] = { g->ms_n_comp[bank][il], g->ms_n_index_comp[bank][il] };
         if (fwrite(cnt, sizeof cnt, 1, fp) != 1) { payload_set_err(err, errlen, "bank kv save: count write"); return 1; }
     }
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint64_t csz = (uint64_t)g->ms_n_comp[bank][il] * attn_row;
         if (csz) {
             uint8_t *buf = (uint8_t *)xmalloc((size_t)csz);
-            ds4_gpu_tensor *v = gpu_graph_bank_attn_comp_view(g, il, bank);
-            int ok = v && ds4_gpu_tensor_read(v, 0, buf, csz) != 0;
-            ds4_gpu_tensor_free(v);
+            pulsar_gpu_tensor *v = gpu_graph_bank_attn_comp_view(g, il, bank);
+            int ok = v && pulsar_gpu_tensor_read(v, 0, buf, csz) != 0;
+            pulsar_gpu_tensor_free(v);
             if (ok) ok = fwrite(buf, 1, (size_t)csz, fp) == (size_t)csz;
             free(buf);   /* TRANSIENT: freed before free_physical so RAM is reclaimed */
             if (!ok) { payload_set_err(err, errlen, "bank kv save: comp D2H/write"); return 1; }
@@ -2490,9 +2490,9 @@ int ds4_session_bank_kv_save(ds4_session *s, uint32_t bank, FILE *fp,
             const uint64_t isz = (uint64_t)g->ms_n_index_comp[bank][il] * idx_row;
             if (isz) {
                 uint8_t *buf = (uint8_t *)xmalloc((size_t)isz);
-                ds4_gpu_tensor *v = gpu_graph_bank_index_comp_view(g, il, bank);
-                int ok = v && ds4_gpu_tensor_read(v, 0, buf, isz) != 0;
-                ds4_gpu_tensor_free(v);
+                pulsar_gpu_tensor *v = gpu_graph_bank_index_comp_view(g, il, bank);
+                int ok = v && pulsar_gpu_tensor_read(v, 0, buf, isz) != 0;
+                pulsar_gpu_tensor_free(v);
                 if (ok) ok = fwrite(buf, 1, (size_t)isz, fp) == (size_t)isz;
                 free(buf);
                 if (!ok) { payload_set_err(err, errlen, "bank kv save: index D2H/write"); return 1; }
@@ -2505,21 +2505,21 @@ int ds4_session_bank_kv_save(ds4_session *s, uint32_t bank, FILE *fp,
 /* Restore a bank's comp/index KV from a raw snapshot: realloc physical (+base
  * table rebuild), reinstall the frontier counters, and H2D each layer's rows.
  * Leaves `bank` installed (cur). Host conversation state (checkpoint/pos) is the
- * caller's bank_carry, restored separately by ds4_session_bank_state_restore. */
-int ds4_session_bank_kv_load(ds4_session *s, uint32_t bank, FILE *fp,
+ * caller's bank_carry, restored separately by pulsar_session_bank_state_restore. */
+int pulsar_session_bank_kv_load(pulsar_session *s, uint32_t bank, FILE *fp,
                              char *err, size_t errlen) {
     if (!s || !fp) { payload_set_err(err, errlen, "bank kv load: bad args"); return 1; }
-    ds4_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = &s->graph;
     if (g->banks.n_banks == 0 || bank >= g->banks.n_banks) {
         payload_set_err(err, errlen, "bank kv load: no pool / bad bank"); return 1;
     }
     uint32_t hdr[4];
-    if (fread(hdr, sizeof hdr, 1, fp) != 1 || hdr[0] != DS4_BANK_KV_MAGIC ||
-        hdr[1] != DS4_BANK_KV_VERSION || hdr[3] != (uint32_t)DS4_N_LAYER) {
+    if (fread(hdr, sizeof hdr, 1, fp) != 1 || hdr[0] != PULSAR_BANK_KV_MAGIC ||
+        hdr[1] != PULSAR_BANK_KV_VERSION || hdr[3] != (uint32_t)PULSAR_N_LAYER) {
         payload_set_err(err, errlen, "bank kv load: bad header"); return 1;
     }
-    uint32_t comp_cnt[DS4_MAX_LAYER] = {0}, idx_cnt[DS4_MAX_LAYER] = {0};
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    uint32_t comp_cnt[PULSAR_MAX_LAYER] = {0}, idx_cnt[PULSAR_MAX_LAYER] = {0};
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         uint32_t cnt[2];
         if (fread(cnt, sizeof cnt, 1, fp) != 1) { payload_set_err(err, errlen, "bank kv load: count read"); return 1; }
         comp_cnt[il] = cnt[0]; idx_cnt[il] = cnt[1];
@@ -2528,8 +2528,8 @@ int ds4_session_bank_kv_load(ds4_session *s, uint32_t bank, FILE *fp,
      * against the per-layer cap BEFORE any device change: a short read or corrupt
      * header must never leave the bank advertising row counts over unwritten KV
      * (an OOB managed read on the next decode). */
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        if (ds4_layer_compress_ratio(il) == 0) continue;
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        if (pulsar_layer_compress_ratio(il) == 0) continue;
         if (comp_cnt[il] > g->layer_comp_cap[il] || idx_cnt[il] > g->layer_comp_cap[il]) {
             payload_set_err(err, errlen,
                             "bank kv load: frontier count exceeds cap (corrupt snapshot)");
@@ -2543,17 +2543,17 @@ int ds4_session_bank_kv_load(ds4_session *s, uint32_t bank, FILE *fp,
      * an EMPTY frontier — no OOB — and the caller fails the request. */
     const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
     const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
-        ? DS4_ENGINE_IDXFP4_ROWBYTES : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        ? PULSAR_ENGINE_IDXFP4_ROWBYTES : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint64_t csz = (uint64_t)comp_cnt[il] * attn_row;
         if (csz) {
             uint8_t *buf = (uint8_t *)xmalloc((size_t)csz);
             int ok = fread(buf, 1, (size_t)csz, fp) == (size_t)csz;
-            if (ok) { ds4_gpu_tensor *v = gpu_graph_bank_attn_comp_view(g, il, bank);
-                      ok = v && ds4_gpu_tensor_write(v, 0, buf, csz) != 0;
-                      ds4_gpu_tensor_free(v); }
+            if (ok) { pulsar_gpu_tensor *v = gpu_graph_bank_attn_comp_view(g, il, bank);
+                      ok = v && pulsar_gpu_tensor_write(v, 0, buf, csz) != 0;
+                      pulsar_gpu_tensor_free(v); }
             free(buf);
             if (!ok) { payload_set_err(err, errlen, "bank kv load: comp read/H2D"); return 1; }
         }
@@ -2562,9 +2562,9 @@ int ds4_session_bank_kv_load(ds4_session *s, uint32_t bank, FILE *fp,
             if (isz) {
                 uint8_t *buf = (uint8_t *)xmalloc((size_t)isz);
                 int ok = fread(buf, 1, (size_t)isz, fp) == (size_t)isz;
-                if (ok) { ds4_gpu_tensor *v = gpu_graph_bank_index_comp_view(g, il, bank);
-                          ok = v && ds4_gpu_tensor_write(v, 0, buf, isz) != 0;
-                          ds4_gpu_tensor_free(v); }
+                if (ok) { pulsar_gpu_tensor *v = gpu_graph_bank_index_comp_view(g, il, bank);
+                          ok = v && pulsar_gpu_tensor_write(v, 0, buf, isz) != 0;
+                          pulsar_gpu_tensor_free(v); }
                 free(buf);
                 if (!ok) { payload_set_err(err, errlen, "bank kv load: index read/H2D"); return 1; }
             }
@@ -2575,7 +2575,7 @@ int ds4_session_bank_kv_load(ds4_session *s, uint32_t bank, FILE *fp,
      * rows, and each is backed by written KV. If repoint fails the ms counters stay
      * 0 (empty, safe). */
     if (!gpu_graph_bank_repoint(g, bank)) { payload_set_err(err, errlen, "bank kv load: repoint"); return 1; }
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         g->ms_n_comp[bank][il] = comp_cnt[il];
         g->ms_n_index_comp[bank][il] = idx_cnt[il];
     }
@@ -2588,12 +2588,12 @@ int ds4_session_bank_kv_load(ds4_session *s, uint32_t bank, FILE *fp,
 
 
 
-void ds4_session_free(ds4_session *s) {
+void pulsar_session_free(pulsar_session *s) {
     if (!s) return;
     gpu_graph_free(&s->graph);
     token_vec_free(&s->checkpoint);
-    ds4_sample_scratch_free(&s->sample_scratch);
-    ds4_session_bank_carry_free(s);
+    pulsar_sample_scratch_free(&s->sample_scratch);
+    pulsar_session_bank_carry_free(s);
     free(s->dspark_pending_qrows);
     free(s->spec_row_scratch);
     free(s->logits);
@@ -2602,7 +2602,7 @@ void ds4_session_free(ds4_session *s) {
 
 
 
-void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud) {
+void pulsar_session_set_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) {
     if (!s) return;
     s->progress = fn;
     s->progress_ud = ud;
@@ -2610,7 +2610,7 @@ void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *
 
 
 
-void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud) {
+void pulsar_session_set_display_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) {
     if (!s) return;
     s->display_progress = fn;
     s->display_progress_ud = ud;
@@ -2618,7 +2618,7 @@ void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn
 
 
 
-void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud) {
+void pulsar_session_set_cancel(pulsar_session *s, pulsar_session_cancel_fn fn, void *ud) {
     if (!s) return;
     s->cancel = fn;
     s->cancel_ud = ud;
@@ -2626,26 +2626,26 @@ void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud) 
 
 
 
-static bool ds4_session_cancelled(ds4_session *s) {
+static bool pulsar_session_cancelled(pulsar_session *s) {
     return s && s->cancel && s->cancel(s->cancel_ud);
 }
 
 
 
-static bool ds4_session_cancelled_cb(void *ud) {
-    return ds4_session_cancelled((ds4_session *)ud);
+static bool pulsar_session_cancelled_cb(void *ud) {
+    return pulsar_session_cancelled((pulsar_session *)ud);
 }
 
 
 
-void ds4_session_report_progress(ds4_session *s, const char *event, int current, int total) {
+void pulsar_session_report_progress(pulsar_session *s, const char *event, int current, int total) {
     if (!s || !s->progress || !event) return;
     s->progress(s->progress_ud, event, current, total);
 }
 
 
-static void ds4_session_note_prefill_progress(void *ud, const char *event, int current, int total) {
-    ds4_sync_progress *p = (ds4_sync_progress *)ud;
+static void pulsar_session_note_prefill_progress(void *ud, const char *event, int current, int total) {
+    pulsar_sync_progress *p = (pulsar_sync_progress *)ud;
     if (!p || !p->session || !p->prompt) return;
     if (!strcmp(event, "prefill_chunk") && current > 0 && current <= p->prompt->len) {
         p->session->checkpoint.len = 0;
@@ -2659,7 +2659,7 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
 
 /* Bring the live backend state to exactly the supplied token prefix.
  *
- * ds4-server and the REPL are stateless at the text/API layer but stateful here:
+ * pulsar-server and the REPL are stateless at the text/API layer but stateful here:
  * they resend or rebuild the full transcript, and this function decides whether
  * the live checkpoint is a prefix.  A matching prefix is extended in one of two
  * ways:
@@ -2672,17 +2672,17 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
  *
  * A non-matching prompt discards the checkpoint and prefills from token zero.
  */
-int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *err, size_t errlen) {
     if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
         snprintf(err, errlen, "prompt exceeds context");
         return 1;
     }
-    if (ds4_session_cancelled(s)) {
+    if (pulsar_session_cancelled(s)) {
         snprintf(err, errlen, "interrupted");
-        return DS4_SESSION_SYNC_INTERRUPTED;
+        return PULSAR_SESSION_SYNC_INTERRUPTED;
     }
-    ds4_engine *e = s->engine;
-    const char *backend_name = ds4_backend_name(e->backend);
+    pulsar_engine *e = s->engine;
+    const char *backend_name = pulsar_backend_name(e->backend);
 
     /* a sync begins a new request: any carry left by a max-tokens/stop-string
      * truncated generation belongs to the previous request's distribution.
@@ -2698,13 +2698,13 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
 
     if (s->checkpoint_valid &&
         prompt->len >= s->checkpoint.len &&
-        ds4_tokens_starts_with(prompt, &s->checkpoint))
+        pulsar_tokens_starts_with(prompt, &s->checkpoint))
     {
         const int suffix = prompt->len - s->checkpoint.len;
         const uint32_t resume_min = gpu_graph_resume_prefill_min_tokens();
         if (suffix > 0 && (uint32_t)suffix >= resume_min) {
             bool cancelled = false;
-            ds4_sync_progress progress = {
+            pulsar_sync_progress progress = {
                 .session = s,
                 .prompt = prompt,
                 .user = s->progress,
@@ -2718,34 +2718,34 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                                         (uint32_t)suffix,
                                                         s->logits,
                                                         false,
-                                                        ds4_session_note_prefill_progress,
+                                                        pulsar_session_note_prefill_progress,
                                                         &progress,
                                                         s->display_progress,
                                                         s->display_progress_ud,
                                                         NULL,
-                                                        ds4_session_cancelled_cb,
+                                                        pulsar_session_cancelled_cb,
                                                         s,
                                                         &cancelled);
             if (cancelled) {
                 snprintf(err, errlen, "interrupted");
                 s->checkpoint_valid = true;
-                return DS4_SESSION_SYNC_INTERRUPTED;
+                return PULSAR_SESSION_SYNC_INTERRUPTED;
             }
             if (!ok) {
                 snprintf(err, errlen, "%s resumed prefill failed while extending checkpoint", backend_name);
                 s->checkpoint_valid = false;
                 return 1;
             }
-            ds4_tokens_copy(&s->checkpoint, prompt);
+            pulsar_tokens_copy(&s->checkpoint, prompt);
             s->checkpoint_valid = true;
             return 0;
         }
 
         for (int i = s->checkpoint.len; i < prompt->len; i++) {
-            if (ds4_session_cancelled(s)) {
+            if (pulsar_session_cancelled(s)) {
                 snprintf(err, errlen, "interrupted");
                 s->checkpoint_valid = true;
-                return DS4_SESSION_SYNC_INTERRUPTED;
+                return PULSAR_SESSION_SYNC_INTERRUPTED;
             }
             if (!gpu_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
                                                 (uint32_t)prompt->v[i],
@@ -2777,7 +2777,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     s->mseq_dirty = false;
     if (s->prefill_cap < (uint32_t)prompt->len) {
         bool cancelled = false;
-        ds4_sync_progress progress = {
+        pulsar_sync_progress progress = {
             .session = s,
             .prompt = prompt,
             .user = s->progress,
@@ -2785,16 +2785,16 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         };
         ok = gpu_graph_prefill_chunked(&s->graph, &e->model, &e->weights,
                                          prompt, prompt->len, s->logits, false,
-                                         ds4_session_note_prefill_progress, &progress,
+                                         pulsar_session_note_prefill_progress, &progress,
                                          s->display_progress,
                                          s->display_progress_ud,
-                                         ds4_session_cancelled_cb,
+                                         pulsar_session_cancelled_cb,
                                          s,
                                          &cancelled);
         if (cancelled) {
             snprintf(err, errlen, "interrupted");
             s->checkpoint_valid = s->checkpoint.len > 0;
-            return DS4_SESSION_SYNC_INTERRUPTED;
+            return PULSAR_SESSION_SYNC_INTERRUPTED;
         }
     } else {
         bool cancelled = false;
@@ -2802,12 +2802,12 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                          prompt, prompt->len, s->logits, false,
                                          s->display_progress,
                                          s->display_progress_ud,
-                                         ds4_session_cancelled_cb,
+                                         pulsar_session_cancelled_cb,
                                          s,
                                          &cancelled);
         if (cancelled) {
             snprintf(err, errlen, "interrupted");
-            return DS4_SESSION_SYNC_INTERRUPTED;
+            return PULSAR_SESSION_SYNC_INTERRUPTED;
         }
     }
     if (!ok) {
@@ -2815,7 +2815,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         s->checkpoint_valid = false;
         return 1;
     }
-    ds4_tokens_copy(&s->checkpoint, prompt);
+    pulsar_tokens_copy(&s->checkpoint, prompt);
     s->checkpoint_valid = true;
     return 0;
 }
@@ -2829,7 +2829,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
  * frontiers.  Replacing any part of the live tail requires restoring that whole
  * frontier first.  Extending exactly at the live end is safe; rewriting behind
  * it is not an in-place operation. */
-bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common) {
+bool pulsar_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common) {
     if (live_len < 0 || canonical_len < 0 || common < 0) return true;
     if (common > live_len || common > canonical_len) return true;
     return common < live_len;
@@ -2847,46 +2847,46 @@ bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int c
  * rewrite point, any replacement behind the live end reports that a rebuild is
  * needed without mutating the session.  The server may still find an older disk KV
  * checkpoint before falling back to a full replay. */
-ds4_session_rewrite_result ds4_session_rewrite_from_common(
-        ds4_session *s, const ds4_tokens *prompt, int common,
+pulsar_session_rewrite_result pulsar_session_rewrite_from_common(
+        pulsar_session *s, const pulsar_tokens *prompt, int common,
         char *err, size_t errlen) {
     if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
         snprintf(err, errlen, "prompt exceeds context");
-        return DS4_SESSION_REWRITE_ERROR;
+        return PULSAR_SESSION_REWRITE_ERROR;
     }
     if (!s->checkpoint_valid) {
         snprintf(err, errlen, "session has no valid checkpoint");
-        return DS4_SESSION_REWRITE_ERROR;
+        return PULSAR_SESSION_REWRITE_ERROR;
     }
     if (common < 0 || common > s->checkpoint.len || common > prompt->len) {
         snprintf(err, errlen, "invalid rewrite prefix");
-        return DS4_SESSION_REWRITE_ERROR;
+        return PULSAR_SESSION_REWRITE_ERROR;
     }
     for (int i = 0; i < common; i++) {
         if (s->checkpoint.v[i] != prompt->v[i]) {
             snprintf(err, errlen, "rewrite prefix does not match live checkpoint");
-            return DS4_SESSION_REWRITE_ERROR;
+            return PULSAR_SESSION_REWRITE_ERROR;
         }
     }
 
     if (common == s->checkpoint.len) {
-        return ds4_session_sync(s, prompt, err, errlen) == 0 ?
-            DS4_SESSION_REWRITE_OK : DS4_SESSION_REWRITE_ERROR;
+        return pulsar_session_sync(s, prompt, err, errlen) == 0 ?
+            PULSAR_SESSION_REWRITE_OK : PULSAR_SESSION_REWRITE_ERROR;
     }
 
-    if (ds4_session_rewrite_requires_rebuild(s->checkpoint.len, prompt->len, common)) {
+    if (pulsar_session_rewrite_requires_rebuild(s->checkpoint.len, prompt->len, common)) {
         snprintf(err, errlen, "rewrite needs rebuild: common=%d live=%d canonical=%d",
                  common, s->checkpoint.len, prompt->len);
-        return DS4_SESSION_REWRITE_REBUILD_NEEDED;
+        return PULSAR_SESSION_REWRITE_REBUILD_NEEDED;
     }
 
     snprintf(err, errlen, "unexpected canonical rewrite state");
-    return DS4_SESSION_REWRITE_ERROR;
+    return PULSAR_SESSION_REWRITE_ERROR;
 }
 
 
 
-int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
+int pulsar_session_common_prefix(pulsar_session *s, const pulsar_tokens *prompt) {
     if (!s->checkpoint_valid) return 0;
     int n = s->checkpoint.len < prompt->len ? s->checkpoint.len : prompt->len;
     int i = 0;
@@ -2896,17 +2896,17 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
 
 
 
-int ds4_session_argmax(ds4_session *s) {
-    return sample_argmax(s->logits, DS4_N_VOCAB);
+int pulsar_session_argmax(pulsar_session *s) {
+    return sample_argmax(s->logits, PULSAR_N_VOCAB);
 }
 
 
 
-int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
+int pulsar_session_argmax_excluding(pulsar_session *s, int excluded_id) {
     if (!s || !s->logits) return -1;
     int best = -1;
-    float best_logit = DS4_NEG_INF;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+    float best_logit = PULSAR_NEG_INF;
+    for (uint32_t i = 0; i < PULSAR_N_VOCAB; i++) {
         if ((int)i == excluded_id) continue;
         const float v = s->logits[i];
         if (best < 0 || v > best_logit) {
@@ -2919,7 +2919,7 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
 
 
 
-int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
+int pulsar_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!logits || n_vocab <= 0) return 0;
     return sample_top_p_min_p(logits, (uint32_t)n_vocab, temperature, top_k, top_p, min_p, rng);
@@ -2927,23 +2927,23 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 
 
 
-int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
-    return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k, top_p, min_p, rng);
+int pulsar_session_sample(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+    return sample_top_p_min_p(s->logits, PULSAR_N_VOCAB, temperature, top_k, top_p, min_p, rng);
 }
 
 
 
-int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
+int pulsar_session_top_logprobs(pulsar_session *s, pulsar_token_score *out, int k) {
     if (!s || !out || k <= 0) return 0;
-    if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
+    if (k > (int)PULSAR_N_VOCAB) k = (int)PULSAR_N_VOCAB;
     for (int i = 0; i < k; i++) {
         out[i].id = -1;
-        out[i].logit = DS4_NEG_INF;
-        out[i].logprob = DS4_NEG_INF;
+        out[i].logit = PULSAR_NEG_INF;
+        out[i].logprob = PULSAR_NEG_INF;
     }
 
-    float max_logit = DS4_NEG_INF;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+    float max_logit = PULSAR_NEG_INF;
+    for (uint32_t i = 0; i < PULSAR_N_VOCAB; i++) {
         const float v = s->logits[i];
         if (!isfinite(v)) continue;
         if (v > max_logit) max_logit = v;
@@ -2959,65 +2959,65 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     if (!isfinite(max_logit)) return 0;
 
     double sum = 0.0;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+    for (uint32_t i = 0; i < PULSAR_N_VOCAB; i++) {
         const float v = s->logits[i];
         if (isfinite(v)) sum += exp((double)v - (double)max_logit);
     }
     const double logsum = (double)max_logit + log(sum);
     for (int i = 0; i < k && out[i].id >= 0; i++) {
-        out[i].logprob = isfinite(out[i].logit) ? (float)((double)out[i].logit - logsum) : DS4_NEG_INF;
+        out[i].logprob = isfinite(out[i].logit) ? (float)((double)out[i].logit - logsum) : PULSAR_NEG_INF;
     }
     return k;
 }
 
 
 
-int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
-    if (!s || !out || token < 0 || token >= (int)DS4_N_VOCAB) return 0;
+int pulsar_session_token_logprob(pulsar_session *s, int token, pulsar_token_score *out) {
+    if (!s || !out || token < 0 || token >= (int)PULSAR_N_VOCAB) return 0;
 
-    float max_logit = DS4_NEG_INF;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+    float max_logit = PULSAR_NEG_INF;
+    for (uint32_t i = 0; i < PULSAR_N_VOCAB; i++) {
         const float v = s->logits[i];
         if (isfinite(v) && v > max_logit) max_logit = v;
     }
     if (!isfinite(max_logit)) return 0;
 
     double sum = 0.0;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+    for (uint32_t i = 0; i < PULSAR_N_VOCAB; i++) {
         const float v = s->logits[i];
         if (isfinite(v)) sum += exp((double)v - (double)max_logit);
     }
     const double logsum = (double)max_logit + log(sum);
     out->id = token;
     out->logit = s->logits[token];
-    out->logprob = isfinite(out->logit) ? (float)((double)out->logit - logsum) : DS4_NEG_INF;
+    out->logprob = isfinite(out->logit) ? (float)((double)out->logit - logsum) : PULSAR_NEG_INF;
     return 1;
 }
 
 
 
-int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
-    if (!s || !out || cap < (int)DS4_N_VOCAB) return 0;
-    memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));
-    return (int)DS4_N_VOCAB;
+int pulsar_session_copy_logits(pulsar_session *s, float *out, int cap) {
+    if (!s || !out || cap < (int)PULSAR_N_VOCAB) return 0;
+    memcpy(out, s->logits, (size_t)PULSAR_N_VOCAB * sizeof(out[0]));
+    return (int)PULSAR_N_VOCAB;
 }
 
 
 
-int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
-    if (!s || !logits || n != (int)DS4_N_VOCAB) return 1;
-    memcpy(s->logits, logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+int pulsar_session_set_logits(pulsar_session *s, const float *logits, int n) {
+    if (!s || !logits || n != (int)PULSAR_N_VOCAB) return 1;
+    memcpy(s->logits, logits, (size_t)PULSAR_N_VOCAB * sizeof(s->logits[0]));
     return 0;
 }
 
 
 
-int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
+int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen) {
     if (!s) return 1;
     /* Fail loud rather than corrupt: after a multiseq step the graph's scalar
      * frontier counters hold a cross-bank superset, so this decode would emit
      * its compressor row at the superset index and attend over another bank's
-     * rows — wrong logits, silently.  ds4_session_sync re-establishes per-bank
+     * rows — wrong logits, silently.  pulsar_session_sync re-establishes per-bank
      * state (rebuild path) and clears the flag. */
     if (s->mseq_dirty) {
         snprintf(err, errlen,
@@ -3026,13 +3026,13 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
                  "superset); re-sync the session first");
         return 1;
     }
-    ds4_engine *e = s->engine;
+    pulsar_engine *e = s->engine;
     if (!gpu_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
                                         (uint32_t)token,
                                         (uint32_t)s->checkpoint.len,
                                         s->logits))
     {
-        snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
+        snprintf(err, errlen, "%s decode failed", pulsar_backend_name(e->backend));
         s->checkpoint_valid = false;
         return 1;
     }
@@ -3045,7 +3045,7 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
 
 
 
-/* Batched multi-session decode over the session's bank pool — see the ds4.h
+/* Batched multi-session decode over the session's bank pool — see the pulsar.h
  * declaration for the caller contract and gpu_graph_decode_multiseq_batch
  * (imatrix.c) for the step mechanics.
  *
@@ -3056,13 +3056,13 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
  *
  * TWO separate guards are needed, because they cover different callers:
  *
- *   checkpoint_valid = false  stops ds4_session_sync from taking its
+ *   checkpoint_valid = false  stops pulsar_session_sync from taking its
  *       prefix-resume path (it gates on checkpoint_valid alone), forcing the
  *       rebuild path — which resets the graph's prefill state and so
  *       re-establishes per-bank truth.
  *
- *   mseq_dirty = true  stops ds4_session_eval.  checkpoint_valid does NOT
- *       cover it: ds4_session_eval never reads checkpoint_valid — it calls
+ *   mseq_dirty = true  stops pulsar_session_eval.  checkpoint_valid does NOT
+ *       cover it: pulsar_session_eval never reads checkpoint_valid — it calls
  *       gpu_graph_eval_token_raw_swa(..., s->checkpoint.len, ...)
  *       unconditionally, which reads g->layer_n_comp[il] (the cross-bank
  *       superset) as its emit row, writes the compressor row there, and
@@ -3071,31 +3071,31 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
  *       eval fails loud while dirty instead of corrupting.
  *
  * The caller owns per-bank histories and must re-establish per-bank state
- * explicitly to resume classic work on a bank: a fresh ds4_session_sync
+ * explicitly to resume classic work on a bank: a fresh pulsar_session_sync
  * (rebuild path) clears both flags. */
-#define DS4_MULTISEQ_ERR(...) do { \
+#define PULSAR_MULTISEQ_ERR(...) do { \
         if (err && errlen) snprintf(err, errlen, __VA_ARGS__); \
     } while (0)
-int ds4_session_decode_multiseq(ds4_session *s, const ds4_multiseq_req *reqs,
+int pulsar_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *reqs,
                                 uint32_t n, float *logits, int logits_cap,
                                 char *err, size_t errlen) {
-    if (!s || !reqs || !logits || n == 0 || n > DS4_MSEQ_MAX) {
-        DS4_MULTISEQ_ERR("multiseq decode: bad args (n=%u)", n);
+    if (!s || !reqs || !logits || n == 0 || n > PULSAR_MSEQ_MAX) {
+        PULSAR_MULTISEQ_ERR("multiseq decode: bad args (n=%u)", n);
         return 1;
     }
-    /* The engine writes n rows of DS4_N_VOCAB floats; without a capacity the
+    /* The engine writes n rows of PULSAR_N_VOCAB floats; without a capacity the
      * readback would overflow a caller buffer sized from a different vocab
-     * notion (ds4_engine_vocab_size is the tokenizer table length, which the
+     * notion (pulsar_engine_vocab_size is the tokenizer table length, which the
      * loader never checks against the shape profile's n_vocab). */
-    if (logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)n * DS4_N_VOCAB) {
-        DS4_MULTISEQ_ERR("multiseq decode: logits capacity %d < %u rows x %u",
-                         logits_cap, n, (unsigned)DS4_N_VOCAB);
+    if (logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)n * PULSAR_N_VOCAB) {
+        PULSAR_MULTISEQ_ERR("multiseq decode: logits capacity %d < %u rows x %u",
+                         logits_cap, n, (unsigned)PULSAR_N_VOCAB);
         return 1;
     }
-    ds4_engine *e = s->engine;
-    int32_t pos[DS4_MSEQ_MAX];
-    int32_t bank[DS4_MSEQ_MAX];
-    int tokens[DS4_MSEQ_MAX];
+    pulsar_engine *e = s->engine;
+    int32_t pos[PULSAR_MSEQ_MAX];
+    int32_t bank[PULSAR_MSEQ_MAX];
+    int tokens[PULSAR_MSEQ_MAX];
     for (uint32_t k = 0; k < n; k++) {
         pos[k] = reqs[k].pos;
         bank[k] = (int32_t)reqs[k].bank;
@@ -3113,7 +3113,7 @@ int ds4_session_decode_multiseq(ds4_session *s, const ds4_multiseq_req *reqs,
          * first scalar write (the superset refresh) and its cur-bank capture.
          * The classic view is therefore still true: leave both flags alone so
          * the caller can fix the batch and retry, or fall back to classic. */
-        DS4_MULTISEQ_ERR("multiseq decode step rejected (recoverable; "
+        PULSAR_MULTISEQ_ERR("multiseq decode step rejected (recoverable; "
                          "reason on stderr)");
         return 1;
     }
@@ -3124,52 +3124,52 @@ int ds4_session_decode_multiseq(ds4_session *s, const ds4_multiseq_req *reqs,
     s->mseq_dirty = true;
     s->spec.spec_carry_valid = false;
     if (rc == 1) return 0;
-    DS4_MULTISEQ_ERR("multiseq decode step failed mid-sweep "
+    PULSAR_MULTISEQ_ERR("multiseq decode step failed mid-sweep "
                      "(session state fatal)");
     return -1;
 }
-#undef DS4_MULTISEQ_ERR
+#undef PULSAR_MULTISEQ_ERR
 
 /* plan-34 phase-2 increment 1 — mixed prefill+decode descriptor entry.
  *
- * BYTE-IDENTICAL to ds4_session_decode_multiseq for a decode-only (1-row-per-bank)
+ * BYTE-IDENTICAL to pulsar_session_decode_multiseq for a decode-only (1-row-per-bank)
  * batch: the ONLY difference is that the per-row descriptor scratch
  * (positions / seq_id / tokens) lives on the HEAP, sized to n_rows up to
- * prefill_cap, instead of the fixed [DS4_MSEQ_MAX] stack arrays. This establishes
- * the >DS4_MSEQ_MAX-row representation the fused mixed-batch step grows into over
+ * prefill_cap, instead of the fixed [PULSAR_MSEQ_MAX] stack arrays. This establishes
+ * the >PULSAR_MSEQ_MAX-row representation the fused mixed-batch step grows into over
  * increments 2-5. The kernel path (gpu_graph_decode_multiseq_batch + step_begin)
- * is UNCHANGED: it still bounds the current ROW count to DS4_MSEQ_MAX and keeps
- * DS4_MSEQ_MAX as the BANK-count bound. No mixing, no scheduler change, no algo
+ * is UNCHANGED: it still bounds the current ROW count to PULSAR_MSEQ_MAX and keeps
+ * PULSAR_MSEQ_MAX as the BANK-count bound. No mixing, no scheduler change, no algo
  * work this increment — the descriptor container is the only thing that moved. */
-#define DS4_MIXED_ERR(...) do { \
+#define PULSAR_MIXED_ERR(...) do { \
         if (err && errlen) snprintf(err, errlen, __VA_ARGS__); \
     } while (0)
-int ds4_session_decode_mixed(ds4_session *s, const ds4_multiseq_req *reqs,
+int pulsar_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *reqs,
                              uint32_t n_rows, float *logits, int logits_cap,
                              uint32_t *out_n_rows, uint32_t max_head_runs,
                              char *err, size_t errlen) {
     if (out_n_rows) *out_n_rows = 0;
     if (!s || !reqs || !logits || n_rows == 0 ||
         n_rows > s->graph.prefill_cap) {
-        DS4_MIXED_ERR("mixed decode: bad args (n_rows=%u prefill_cap=%u)",
+        PULSAR_MIXED_ERR("mixed decode: bad args (n_rows=%u prefill_cap=%u)",
                       n_rows, s ? s->graph.prefill_cap : 0u);
         return 1;
     }
     /* plan-34 inc 3: the engine emits ONE logit row per BANK RUN (last-of-run),
      * not one per token-row, so the caller need only size `logits` for n_runs =
-     * the number of contiguous per-bank runs (<= DS4_MSEQ_MAX). Compute it here
+     * the number of contiguous per-bank runs (<= PULSAR_MSEQ_MAX). Compute it here
      * for the capacity check; the engine returns it via out_n_rows. */
     uint32_t n_runs = 0;
     for (uint32_t k = 0; k < n_rows; k++)
         if (k + 1 == n_rows || reqs[k + 1].bank != reqs[k].bank) n_runs++;
-    if (logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)n_runs * DS4_N_VOCAB) {
-        DS4_MIXED_ERR("mixed decode: logits capacity %d < %u runs x %u",
-                      logits_cap, n_runs, (unsigned)DS4_N_VOCAB);
+    if (logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)n_runs * PULSAR_N_VOCAB) {
+        PULSAR_MIXED_ERR("mixed decode: logits capacity %d < %u runs x %u",
+                      logits_cap, n_runs, (unsigned)PULSAR_N_VOCAB);
         return 1;
     }
-    ds4_engine *e = s->engine;
+    pulsar_engine *e = s->engine;
     /* HEAP descriptor scratch (positions / seq_id / tokens), sized to n_rows —
-     * this is the whole point of the refactor: no [DS4_MSEQ_MAX] stack ceiling. */
+     * this is the whole point of the refactor: no [PULSAR_MSEQ_MAX] stack ceiling. */
     int32_t *pos = (int32_t *)xmalloc((size_t)n_rows * sizeof(*pos));
     int32_t *bank = (int32_t *)xmalloc((size_t)n_rows * sizeof(*bank));
     int *tokens = (int *)xmalloc((size_t)n_rows * sizeof(*tokens));
@@ -3187,10 +3187,10 @@ int ds4_session_decode_mixed(ds4_session *s, const ds4_multiseq_req *reqs,
      * dead now regardless of rc. */
     free(pos); free(bank); free(tokens);
     if (rc == 0) {
-        /* Recoverable rejection: nothing mutated (see ds4_session_decode_multiseq
+        /* Recoverable rejection: nothing mutated (see pulsar_session_decode_multiseq
          * for the precise argument — every step_begin reject precedes its first
          * scalar write). Leave the classic view flags alone. */
-        DS4_MIXED_ERR("mixed decode step rejected (recoverable; reason on stderr)");
+        PULSAR_MIXED_ERR("mixed decode step rejected (recoverable; reason on stderr)");
         return 1;
     }
     /* Step was armed: scalar counters now hold a cross-bank superset; the classic
@@ -3199,14 +3199,14 @@ int ds4_session_decode_mixed(ds4_session *s, const ds4_multiseq_req *reqs,
     s->mseq_dirty = true;
     s->spec.spec_carry_valid = false;
     if (rc == 1) return 0;
-    DS4_MIXED_ERR("mixed decode step failed mid-sweep (session state fatal)");
+    PULSAR_MIXED_ERR("mixed decode step failed mid-sweep (session state fatal)");
     return -1;
 }
-#undef DS4_MIXED_ERR
+#undef PULSAR_MIXED_ERR
 
 
 
-/* ===== Tier-2 PATH A: per-bank HOST carry (ds4_bank_carry) ================
+/* ===== Tier-2 PATH A: per-bank HOST carry (pulsar_bank_carry) ================
  *
  * gpu_graph_bank_repoint swaps only the DEVICE cache views; the session's HOST
  * per-conversation state (checkpoint history, host logits, the DSpark fused-
@@ -3215,7 +3215,7 @@ int ds4_session_decode_mixed(ds4_session *s, const ds4_multiseq_req *reqs,
  * host half; the graph frontier counters ride gpu_graph_bank_counters_*, and
  * (Option F) the per-bank drafter ring rides gpu_graph_bank_repoint. */
 
-static void bank_carry_free_one(ds4_bank_carry *c) {
+static void bank_carry_free_one(pulsar_bank_carry *c) {
     if (!c) return;
     token_vec_free(&c->checkpoint);
     free(c->logits);
@@ -3223,7 +3223,7 @@ static void bank_carry_free_one(ds4_bank_carry *c) {
     memset(c, 0, sizeof(*c));
 }
 
-void ds4_session_bank_carry_free(ds4_session *s) {
+void pulsar_session_bank_carry_free(pulsar_session *s) {
     if (!s || !s->bank_carry) return;
     for (uint32_t i = 0; i < s->bank_carry_n; i++) bank_carry_free_one(&s->bank_carry[i]);
     free(s->bank_carry);
@@ -3231,38 +3231,38 @@ void ds4_session_bank_carry_free(ds4_session *s) {
     s->bank_carry_n = 0;
 }
 
-static bool bank_carry_ensure(ds4_session *s) {
+static bool bank_carry_ensure(pulsar_session *s) {
     const uint32_t n = gpu_graph_bank_pool_count(&s->graph);
     if (s->bank_carry && s->bank_carry_n == n) return true;
-    if (s->bank_carry) ds4_session_bank_carry_free(s);
-    s->bank_carry = (ds4_bank_carry *)xcalloc(n, sizeof(*s->bank_carry));
+    if (s->bank_carry) pulsar_session_bank_carry_free(s);
+    s->bank_carry = (pulsar_bank_carry *)xcalloc(n, sizeof(*s->bank_carry));
     s->bank_carry_n = n;
     return true;
 }
 
-int ds4_session_bank_count(ds4_session *s) {
+int pulsar_session_bank_count(pulsar_session *s) {
     return s ? (int)gpu_graph_bank_pool_count(&s->graph) : 0;
 }
 
-int ds4_session_bank_repoint(ds4_session *s, uint32_t bank) {
+int pulsar_session_bank_repoint(pulsar_session *s, uint32_t bank) {
     if (!s || bank >= gpu_graph_bank_pool_count(&s->graph)) return 1;
     /* Pool disabled: bank 0 is the classic tensors, nothing to repoint. */
     if (s->graph.banks.n_banks == 0) return bank == 0 ? 0 : 1;
     return gpu_graph_bank_repoint(&s->graph, bank) ? 0 : 1;
 }
 
-void ds4_session_bank_state_save(ds4_session *s, uint32_t bank) {
+void pulsar_session_bank_state_save(pulsar_session *s, uint32_t bank) {
     if (!s || bank >= gpu_graph_bank_pool_count(&s->graph)) return;
     if (!bank_carry_ensure(s)) return;
     /* Graph frontier counters (attn/index comp; Option F also the drafter ring
      * counters) are captured on the graph side so a later install re-arms this
      * bank's per-bank truth. */
     gpu_graph_bank_counters_capture(&s->graph, bank);
-    ds4_bank_carry *c = &s->bank_carry[bank];
+    pulsar_bank_carry *c = &s->bank_carry[bank];
     /* heap-backed deep copies */
-    ds4_tokens_copy(&c->checkpoint, &s->checkpoint);
-    if (!c->logits) c->logits = (float *)xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
-    memcpy(c->logits, s->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    pulsar_tokens_copy(&c->checkpoint, &s->checkpoint);
+    if (!c->logits) c->logits = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(float));
+    memcpy(c->logits, s->logits, (size_t)PULSAR_N_VOCAB * sizeof(float));
     if (s->dspark_pending_qrows && s->dspark_pending_qrows_cap > 0) {
         if (c->dspark_pending_qrows_cap < s->dspark_pending_qrows_cap) {
             c->dspark_pending_qrows = (float *)xrealloc(
@@ -3276,7 +3276,7 @@ void ds4_session_bank_state_save(ds4_session *s, uint32_t bank) {
     /* scalar mirrors */
     c->checkpoint_valid       = s->checkpoint_valid;
     /* Whole speculative/DSpark shadow in one assignment — a new field added to
-     * ds4_spec_carry_state is carried here for free (the old field-by-field
+     * pulsar_spec_carry_state is carried here for free (the old field-by-field
      * mirror was a silent-corruption footgun: miss one and the entering bank
      * inherits another conversation's speculative state).
      * s->mseq_dirty is NOT saved: it describes the graph's scalar frontier
@@ -3286,7 +3286,7 @@ void ds4_session_bank_state_save(ds4_session *s, uint32_t bank) {
     c->valid = true;
 }
 
-bool ds4_session_bank_state_restore(ds4_session *s, uint32_t bank) {
+bool pulsar_session_bank_state_restore(pulsar_session *s, uint32_t bank) {
     if (!s || bank >= gpu_graph_bank_pool_count(&s->graph)) return false;
     /* Point device views (incl. Option F drafter ring) at this bank, and
      * re-arm its frontier counters — this is what makes clearing mseq_dirty
@@ -3302,9 +3302,9 @@ bool ds4_session_bank_state_restore(ds4_session *s, uint32_t bank) {
         s->mseq_dirty = false;
         return true;
     }
-    ds4_bank_carry *c = &s->bank_carry[bank];
-    ds4_tokens_copy(&s->checkpoint, &c->checkpoint);
-    memcpy(s->logits, c->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    pulsar_bank_carry *c = &s->bank_carry[bank];
+    pulsar_tokens_copy(&s->checkpoint, &c->checkpoint);
+    memcpy(s->logits, c->logits, (size_t)PULSAR_N_VOCAB * sizeof(float));
     if (c->dspark_pending_qrows_cap > 0) {
         if (s->dspark_pending_qrows_cap < c->dspark_pending_qrows_cap) {
             s->dspark_pending_qrows = (float *)xrealloc(
@@ -3328,8 +3328,8 @@ bool ds4_session_bank_state_restore(ds4_session *s, uint32_t bank) {
 
 /* ===== Tier-2 per-bank frontier READERS (server routing/metrics) ==========
  *
- * A bank-pooled server shares one ds4_session across N conversation banks, so
- * ds4_session_pos / _tokens / _common_prefix (which read the single live host
+ * A bank-pooled server shares one pulsar_session across N conversation banks, so
+ * pulsar_session_pos / _tokens / _common_prefix (which read the single live host
  * checkpoint) describe ONLY the currently-installed bank.  Reading them for a
  * non-live bank returns the wrong conversation's frontier.  These readers give
  * the correct per-bank answer without repointing the device or disturbing the
@@ -3337,7 +3337,7 @@ bool ds4_session_bank_state_restore(ds4_session *s, uint32_t bank) {
  * checkpoint; every other bank reads its saved host carry (which the server
  * keeps current for idle banks by bank_state_save'ing at job end).  Pure host
  * reads — no CUDA, safe on the worker thread at routing/publish time. */
-static const ds4_tokens *bank_frontier_tokens(ds4_session *s, uint32_t bank) {
+static const pulsar_tokens *bank_frontier_tokens(pulsar_session *s, uint32_t bank) {
     if (!s || bank >= gpu_graph_bank_pool_count(&s->graph)) return NULL;
     const uint32_t cur = s->graph.banks.n_banks ? s->graph.banks.cur_bank : 0u;
     if (bank == cur) return s->checkpoint_valid ? &s->checkpoint : NULL;
@@ -3347,18 +3347,18 @@ static const ds4_tokens *bank_frontier_tokens(ds4_session *s, uint32_t bank) {
     return NULL;
 }
 
-int ds4_session_bank_pos(ds4_session *s, uint32_t bank) {
-    const ds4_tokens *t = bank_frontier_tokens(s, bank);
+int pulsar_session_bank_pos(pulsar_session *s, uint32_t bank) {
+    const pulsar_tokens *t = bank_frontier_tokens(s, bank);
     return t ? t->len : 0;
 }
 
-const ds4_tokens *ds4_session_bank_tokens(ds4_session *s, uint32_t bank) {
+const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank) {
     return bank_frontier_tokens(s, bank);
 }
 
-int ds4_session_bank_common_prefix(ds4_session *s, uint32_t bank,
-                                   const ds4_tokens *prompt) {
-    const ds4_tokens *t = bank_frontier_tokens(s, bank);
+int pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank,
+                                   const pulsar_tokens *prompt) {
+    const pulsar_tokens *t = bank_frontier_tokens(s, bank);
     if (!t || !prompt) return 0;
     int n = t->len < prompt->len ? t->len : prompt->len;
     int i = 0;
@@ -3366,7 +3366,7 @@ int ds4_session_bank_common_prefix(ds4_session *s, uint32_t bank,
     return i;
 }
 
-void ds4_session_note_committed_tokens(ds4_session *s, const int *toks, int n) {
+void pulsar_session_note_committed_tokens(pulsar_session *s, const int *toks, int n) {
     if (!s || !toks || n <= 0) return;
     for (int i = 0; i < n; i++) token_vec_push(&s->checkpoint, toks[i]);
 }
@@ -3384,10 +3384,10 @@ static float dspark_base_top1_prob(const float *logits, int n) {
 /* Diagnostic: dump the DSpark drafter's per-step inputs (target_h[3], main_x)
  * and pre-markov base logits (spec_logits row 0) so an off-box reference forward
  * can be diffed against ds4 to localize acceptance loss. Enabled by
- * DS4_DSPARK_DUMP=<path>; caps at DS4_DSPARK_DUMP_STEPS (default 8) records.
+ * PULSAR_DSPARK_DUMP=<path>; caps at PULSAR_DSPARK_DUMP_STEPS (default 8) records.
  * Record layout (little-endian): pos i32, first_token i32, then f32 arrays
- * target_h[0..2] (DS4_N_EMBD each), main_x (DS4_N_EMBD), base0 (DS4_N_VOCAB). */
-static void dspark_dump_step(ds4_gpu_graph *g, int pos, int first_token,
+ * target_h[0..2] (PULSAR_N_EMBD each), main_x (PULSAR_N_EMBD), base0 (PULSAR_N_VOCAB). */
+static void dspark_dump_step(pulsar_gpu_graph *g, int pos, int first_token,
                              const int32_t *refined_ids, int n_draft) {
     const char *path = getenv("DS4_DSPARK_DUMP");
     if (!path || !path[0]) return;
@@ -3396,13 +3396,13 @@ static void dspark_dump_step(ds4_gpu_graph *g, int pos, int first_token,
     const int max_steps = lim ? atoi(lim) : 8;
     if (dumped >= max_steps) return;
 
-    const uint64_t hcw = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    float *emb = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-    float *voc = (float *)xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    const uint64_t hcw = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
+    float *emb = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(float));
+    float *voc = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(float));
     float *hc = (float *)xmalloc((size_t)hcw * sizeof(float));
     FILE *f = fopen(path, dumped == 0 ? "wb" : "ab");
     if (!f) { free(emb); free(voc); free(hc); return; }
-    /* Lean mode (DS4_DSPARK_DUMP_LEAN=1): confidence-head training records only —
+    /* Lean mode (PULSAR_DSPARK_DUMP_LEAN=1): confidence-head training records only —
      * hdr + refined_ids + the post-hc_head hidden rows (batch_ffn_cur) that the
      * engine's confidence kernel consumes (Step 5c), ~64 KB/step at draft=4
      * instead of ~1 MB. Bulk-collectable for the drafter-retune Phase 0. */
@@ -3413,15 +3413,15 @@ static void dspark_dump_step(ds4_gpu_graph *g, int pos, int first_token,
         fwrite(hdr, sizeof(int32_t), 3, f);
         fwrite(refined_ids, sizeof(int32_t), (size_t)n_draft + 1, f);
         for (int p = 0; p < n_draft; p++) {
-            memset(emb, 0, (size_t)DS4_N_EMBD * sizeof(float));
-            (void)ds4_gpu_tensor_read(g->batch_ffn_cur, (uint64_t)p * DS4_N_EMBD * 4,
-                                      emb, (uint64_t)DS4_N_EMBD * 4);
-            fwrite(emb, sizeof(float), DS4_N_EMBD, f);
+            memset(emb, 0, (size_t)PULSAR_N_EMBD * sizeof(float));
+            (void)pulsar_gpu_tensor_read(g->batch_ffn_cur, (uint64_t)p * PULSAR_N_EMBD * 4,
+                                      emb, (uint64_t)PULSAR_N_EMBD * 4);
+            fwrite(emb, sizeof(float), PULSAR_N_EMBD, f);
         }
         fclose(f);
         dumped++;
         if ((dumped & 1023) == 1)
-            fprintf(stderr, "ds4: dspark lean dump step %d pos=%d -> %s\n", dumped, pos, path);
+            fprintf(stderr, "pulsar: dspark lean dump step %d pos=%d -> %s\n", dumped, pos, path);
         free(emb); free(voc); free(hc);
         return;
     }
@@ -3433,25 +3433,25 @@ static void dspark_dump_step(ds4_gpu_graph *g, int pos, int first_token,
     fwrite(hdr, sizeof(int32_t), 3, f);
     fwrite(refined_ids, sizeof(int32_t), (size_t)n_draft + 1, f);
     for (int i = 0; i < 3; i++) {
-        memset(emb, 0, (size_t)DS4_N_EMBD * sizeof(float));
-        (void)ds4_gpu_tensor_read(g->dspark_target_h[i], 0, emb, (uint64_t)DS4_N_EMBD * 4);
-        fwrite(emb, sizeof(float), DS4_N_EMBD, f);
+        memset(emb, 0, (size_t)PULSAR_N_EMBD * sizeof(float));
+        (void)pulsar_gpu_tensor_read(g->dspark_target_h[i], 0, emb, (uint64_t)PULSAR_N_EMBD * 4);
+        fwrite(emb, sizeof(float), PULSAR_N_EMBD, f);
     }
-    memset(emb, 0, (size_t)DS4_N_EMBD * sizeof(float));
-    (void)ds4_gpu_tensor_read(g->dspark_main_x, 0, emb, (uint64_t)DS4_N_EMBD * 4);
-    fwrite(emb, sizeof(float), DS4_N_EMBD, f);
-    memset(voc, 0, (size_t)DS4_N_VOCAB * sizeof(float));
+    memset(emb, 0, (size_t)PULSAR_N_EMBD * sizeof(float));
+    (void)pulsar_gpu_tensor_read(g->dspark_main_x, 0, emb, (uint64_t)PULSAR_N_EMBD * 4);
+    fwrite(emb, sizeof(float), PULSAR_N_EMBD, f);
+    memset(voc, 0, (size_t)PULSAR_N_VOCAB * sizeof(float));
     (void)gpu_graph_read_spec_logits_row(g, 0, voc);
-    fwrite(voc, sizeof(float), DS4_N_VOCAB, f);
+    fwrite(voc, sizeof(float), PULSAR_N_VOCAB, f);
     /* block-2 output hidden (pre-hc_head) for each draft position [HC, EMBD]. */
     for (int p = 0; p < n_draft; p++) {
         memset(hc, 0, (size_t)hcw * sizeof(float));
-        (void)ds4_read_hc_carrier_f32(g->batch_cur_hc, (uint64_t)p * hcw, hc, hcw);
+        (void)pulsar_read_hc_carrier_f32(g->batch_cur_hc, (uint64_t)p * hcw, hc, hcw);
         fwrite(hc, sizeof(float), (size_t)hcw, f);
     }
     fclose(f);
     dumped++;
-    fprintf(stderr, "ds4: dspark dump step %d pos=%d tok=%d n_draft=%d -> %s\n",
+    fprintf(stderr, "pulsar: dspark dump step %d pos=%d tok=%d n_draft=%d -> %s\n",
             dumped, pos, first_token, n_draft, path);
     free(emb); free(voc); free(hc);
 }
@@ -3459,22 +3459,22 @@ static void dspark_dump_step(ds4_gpu_graph *g, int pos, int first_token,
 /* Fused-loop helper: make batch row `row`'s captured anchor hidden the current
  * drafter conditioning (target_h -> main_x) and seed one drafter-KV row from it.
  * Mirrors the reference invariant "drafter KV row j = f(hidden at position j)". */
-static bool dspark_seed_from_batch_row(ds4_session *s, uint32_t row) {
-    ds4_gpu_graph *g = &s->graph;
-    ds4_engine *e = s->engine;
+static bool dspark_seed_from_batch_row(pulsar_session *s, uint32_t row) {
+    pulsar_gpu_graph *g = &s->graph;
+    pulsar_engine *e = s->engine;
     for (int i = 0; i < 3; i++) {
         if (!g->dspark_target_h_batch[i] || !g->dspark_target_h[i]) return false;
-        if (!ds4_gpu_tensor_copy(g->dspark_target_h[i], 0,
+        if (!pulsar_gpu_tensor_copy(g->dspark_target_h[i], 0,
                                  g->dspark_target_h_batch[i],
-                                 (uint64_t)row * DS4_N_EMBD * sizeof(float),
-                                 (uint64_t)DS4_N_EMBD * sizeof(float))) return false;
+                                 (uint64_t)row * PULSAR_N_EMBD * sizeof(float),
+                                 (uint64_t)PULSAR_N_EMBD * sizeof(float))) return false;
     }
     if (!gpu_graph_dspark_project_main_x(g, &e->dspark_model, &e->dspark_weights)) return false;
     gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, &e->dspark_weights, 1);
     return true;
 }
 
-/* Fused DSpark loop (P2, DS4_DSPARK_FUSED=1): ONE batched target forward per
+/* Fused DSpark loop (P2, PULSAR_DSPARK_FUSED=1): ONE batched target forward per
  * step instead of Step-1 decode + separate verify. The forward runs over
  * [first_token, pending_drafts...] (drafts made LAST step -- EAGLE pipeline
  * inversion), so position 0 is the base decode, positions 1..K verify the
@@ -3487,16 +3487,16 @@ static bool dspark_seed_from_batch_row(ds4_session *s, uint32_t row) {
  * Greedy-only, like the legacy block (generate.c gates on temperature<=0).
  * Partial/zero accepts restore the frontier and replay the committed prefix
  * (Stage A; the Stage-B transactional state removes the replay). */
-static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
+static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_token,
                                               int max_tokens, int eos_token,
                                               float temperature, int top_k,
                                               float top_p, float min_p,
                                               uint64_t *rng,
                                               int *accepted, int accepted_cap,
                                               char *err, size_t errlen) {
-    ds4_engine *e = s->engine;
-    ds4_gpu_graph *g = &s->graph;
-    const ds4_dspark_weights *w = &e->dspark_weights;
+    pulsar_engine *e = s->engine;
+    pulsar_gpu_graph *g = &s->graph;
+    const pulsar_dspark_weights *w = &e->dspark_weights;
     const uint32_t embed_dim = 256;
     const uint32_t vocab_size = w->vocab_size;
     const uint64_t vocab_bytes = (uint64_t)vocab_size * sizeof(float);
@@ -3534,7 +3534,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
      * denominator and the residual name one proposal q_X, and the p/q rule
      * returns exactly p_Y for any q. What a param change costs is acceptance —
      * q_X is a poor proposal for p_Y — so we drop them and draft afresh.
-     * Mirrors the spec_carry_* params guard in ds4_session_generate_speculative.
+     * Mirrors the spec_carry_* params guard in pulsar_session_generate_speculative.
      *
      * The same holds for argmax drafts (dspark_pending_sampled == false), which
      * carry no q: a temp<=0 -> temp>0 change cannot misroute them, because the
@@ -3571,7 +3571,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
      * stale from the previous request), and the drafter is near-useless
      * without a valid window (masked-window eval: 4.7% vs 86% top-1). */
     if (g->dspark_n_raw[0] == 0 && g->dspark_prompt_n > 0 && g->dspark_prompt_h[0]) {
-        const uint32_t win = DS4_DSPARK_DRAFT_WINDOW;
+        const uint32_t win = PULSAR_DSPARK_DRAFT_WINDOW;
         uint32_t avail = g->dspark_prompt_n - g->dspark_prompt_lo;
         const uint32_t take = avail < win ? avail : win;
         const uint32_t first = g->dspark_prompt_n - take;
@@ -3579,21 +3579,21 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
         for (uint32_t j = 0; seed_ok && j < take; j++) {
             const uint32_t slot = (first + j) % win;
             for (int i = 0; seed_ok && i < 3; i++) {
-                seed_ok = ds4_gpu_tensor_copy(g->dspark_target_h[i], 0,
+                seed_ok = pulsar_gpu_tensor_copy(g->dspark_target_h[i], 0,
                                               g->dspark_prompt_h[i],
-                                              (uint64_t)slot * DS4_N_EMBD * sizeof(float),
-                                              (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+                                              (uint64_t)slot * PULSAR_N_EMBD * sizeof(float),
+                                              (uint64_t)PULSAR_N_EMBD * sizeof(float)) != 0;
             }
             if (seed_ok && gpu_graph_dspark_project_main_x(g, &e->dspark_model, w))
                 gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, w, 1);
         }
         if (dspark_stats)
-            fprintf(stderr, "ds4: dspark prompt-window seeded %u rows (prompt_n=%u)\n",
+            fprintf(stderr, "pulsar: dspark prompt-window seeded %u rows (prompt_n=%u)\n",
                     take, g->dspark_prompt_n);
         g->dspark_prompt_n = 0;   /* consumed; commits take over from here */
     }
 
-    ds4_spec_frontier frontier;
+    pulsar_spec_frontier frontier;
     memset(&frontier, 0, sizeof(frontier));
     if (!spec_frontier_snapshot(&frontier, s)) {
         snprintf(err, errlen, "DSpark fused frontier snapshot failed");
@@ -3643,7 +3643,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
         while (commit < (int)K && row_tops[commit] == (int)pend[commit]) commit++;
     } else {
         if (!s->spec_row_scratch)
-            s->spec_row_scratch = (float *)xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+            s->spec_row_scratch = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(float));
         float *row_logits = s->spec_row_scratch;
         bool walk_ok = true;
         while (commit < (int)K) {
@@ -3651,15 +3651,15 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
                 walk_ok = false;
                 break;
             }
-            ds4_sample_dist dist;
-            ds4_sample_dist_build(row_logits, DS4_N_VOCAB, temperature, top_k,
+            pulsar_sample_dist dist;
+            pulsar_sample_dist_build(row_logits, PULSAR_N_VOCAB, temperature, top_k,
                                   top_p, min_p, &s->sample_scratch, &dist);
             const bool accepted_row = pend_sampled
-                ? ds4_sample_dist_accept_pq(&dist, (int)pend[commit],
+                ? pulsar_sample_dist_accept_pq(&dist, (int)pend[commit],
                                             s->spec.dspark_pending_q[commit], rng)
-                : ds4_sample_dist_accept(&dist, (int)pend[commit], rng);
+                : pulsar_sample_dist_accept(&dist, (int)pend[commit], rng);
             if (accepted_row) {
-                ds4_sample_dist_free(&dist);
+                pulsar_sample_dist_free(&dist);
                 commit++;
                 continue;
             }
@@ -3675,22 +3675,22 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
                  * (never recomputed from live drafter state, which has advanced).
                  * Only the one rejecting position pays this — the walk stops
                  * here. */
-                ds4_sample_dist qd;
-                ds4_sample_dist_build(s->dspark_pending_qrows +
-                                          (size_t)commit * DS4_N_VOCAB,
-                                      DS4_N_VOCAB, s->spec.dspark_pending_temp,
+                pulsar_sample_dist qd;
+                pulsar_sample_dist_build(s->dspark_pending_qrows +
+                                          (size_t)commit * PULSAR_N_VOCAB,
+                                      PULSAR_N_VOCAB, s->spec.dspark_pending_temp,
                                       s->spec.dspark_pending_top_k, s->spec.dspark_pending_top_p,
                                       s->spec.dspark_pending_min_p,
                                       &s->sample_scratch, &qd);
                 /* Holding two dists over one scratch is safe by dist_build's
                  * aliasing contract: out->ids/probs never point into scratch. */
-                carry_tok = ds4_sample_dist_draw_residual(&dist, &qd,
+                carry_tok = pulsar_sample_dist_draw_residual(&dist, &qd,
                                                           &s->sample_scratch, rng);
-                ds4_sample_dist_free(&qd);
+                pulsar_sample_dist_free(&qd);
             } else {
-                carry_tok = ds4_sample_dist_draw_excluding(&dist, (int)pend[commit], rng);
+                carry_tok = pulsar_sample_dist_draw_excluding(&dist, (int)pend[commit], rng);
             }
-            ds4_sample_dist_free(&dist);
+            pulsar_sample_dist_free(&dist);
             break;
         }
         /* row_logits is the session-owned reusable row — not freed here. */
@@ -3732,20 +3732,20 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
         bool fire = false;
         if (force >= 0) {
             fire = s->spec.spec_quench_steps >= (uint32_t)force;
-        } else if (s->spec.spec_quench_steps > DS4_QUENCH_WARMUP) {
+        } else if (s->spec.spec_quench_steps > PULSAR_QUENCH_WARMUP) {
             const float margin = (1.0f + (float)commit) -
                                  spec_quench_guard(n_batch, saved_len);
-            s->spec.spec_quench_ewma = (1.0f - DS4_QUENCH_ALPHA) * s->spec.spec_quench_ewma +
-                                  DS4_QUENCH_ALPHA * margin;
+            s->spec.spec_quench_ewma = (1.0f - PULSAR_QUENCH_ALPHA) * s->spec.spec_quench_ewma +
+                                  PULSAR_QUENCH_ALPHA * margin;
             s->spec.spec_quench_debt -= margin;   /* unclamped: NET tokens lost */
-            fire = s->spec.spec_quench_steps >= DS4_QUENCH_MINEV &&
+            fire = s->spec.spec_quench_steps >= PULSAR_QUENCH_MINEV &&
                    s->spec.spec_quench_ewma < 0.0f &&
-                   s->spec.spec_quench_debt > DS4_QUENCH_BUDGET;
+                   s->spec.spec_quench_debt > PULSAR_QUENCH_BUDGET;
         }
         if (fire) {
             s->spec.spec_quenched = true;
             fprintf(stderr,
-                    "ds4: dspark yield-quench pos=%d steps=%u debt=%.2f ewma=%.2f "
+                    "pulsar: dspark yield-quench pos=%d steps=%u debt=%.2f ewma=%.2f "
                     "-> plain decode for request remainder%s\n",
                     saved_len + 1 + commit, s->spec.spec_quench_steps,
                     (double)s->spec.spec_quench_debt, (double)s->spec.spec_quench_ewma,
@@ -3787,13 +3787,13 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
      * draw from the last accepted row's distribution. */
     if (carry_tok < 0) {
         if (temperature <= 0.0f) {
-            carry_tok = sample_argmax(s->logits, DS4_N_VOCAB);
+            carry_tok = sample_argmax(s->logits, PULSAR_N_VOCAB);
         } else {
-            ds4_sample_dist bonus;
-            ds4_sample_dist_build(s->logits, DS4_N_VOCAB, temperature, top_k,
+            pulsar_sample_dist bonus;
+            pulsar_sample_dist_build(s->logits, PULSAR_N_VOCAB, temperature, top_k,
                                   top_p, min_p, &s->sample_scratch, &bonus);
-            carry_tok = ds4_sample_dist_draw(&bonus, rng);
-            ds4_sample_dist_free(&bonus);
+            carry_tok = pulsar_sample_dist_draw(&bonus, rng);
+            pulsar_sample_dist_free(&bonus);
         }
     }
 
@@ -3838,7 +3838,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
             replay[0] = (int32_t)first_token;
             for (int i = 0; i < commit; i++) replay[1 + i] = pend[i];
             for (int i = 0; ok_state && i < 1 + commit; i++) {
-                if (ds4_session_eval(s, (int)replay[i], err, errlen) != 0) {
+                if (pulsar_session_eval(s, (int)replay[i], err, errlen) != 0) {
                     ok_state = false;
                     break;
                 }
@@ -3881,7 +3881,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
          * still the correctly-distributed next base, which the next
          * generate_speculative call consumes before routing plain. */
         if (dspark_stats)
-            fprintf(stderr, "ds4: dspark fused n_batch=%u committed=%d nodraft step_ms=%.1f\n",
+            fprintf(stderr, "pulsar: dspark fused n_batch=%u committed=%d nodraft step_ms=%.1f\n",
                     n_batch, commit, (now_sec() - t0) * 1000.0);
         return n_accept;
     }
@@ -3895,14 +3895,14 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
         return n_accept;   /* drafting is best-effort; the step already succeeded */
     int32_t draft_ids[16];
     draft_ids[0] = (int32_t)next_base;
-    for (uint32_t i = 1; i < n_draft; i++) draft_ids[i] = DS4_DSPARK_NOISE_TOKEN_ID;
+    for (uint32_t i = 1; i < n_draft; i++) draft_ids[i] = PULSAR_DSPARK_NOISE_TOKEN_ID;
     if (!gpu_graph_dspark_draft_forward(g, &e->model, &e->weights,
                                         &e->dspark_model, &e->dspark_weights,
                                         g->spec_logits, draft_ids, n_draft))
         return n_accept;
 
-    ds4_gpu_tensor *dspark_logits = g->dspark_markov_logits;   /* persistent scratch */
-    if (!dspark_logits || ds4_gpu_tensor_bytes(dspark_logits) < vocab_bytes) return n_accept;
+    pulsar_gpu_tensor *dspark_logits = g->dspark_markov_logits;   /* persistent scratch */
+    if (!dspark_logits || pulsar_gpu_tensor_bytes(dspark_logits) < vocab_bytes) return n_accept;
     int32_t refined[17];
     /* DTree Phase 0: markov runner-up per draft position. CAVEAT since drafts
      * are sampled: this is the runner-up to the markov ARGMAX, which is no
@@ -3921,20 +3921,20 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
      * temperature <= 0 keeps the argmax path untouched: no readback, no
      * dist_build, and — critically — no rng draw, so the greedy token stream
      * stays byte-identical (dist_build would collapse to a point mass, but
-     * ds4_sample_dist_draw would still consume an rng word and shift the
+     * pulsar_sample_dist_draw would still consume an rng word and shift the
      * stream). It is also the fast path we do not want to slow down.
      *
      * The vocab check is a correctness guard, not an optimization: p is built
-     * over DS4_N_VOCAB target logits and q over the drafter's vocab_size. If
+     * over PULSAR_N_VOCAB target logits and q over the drafter's vocab_size. If
      * they disagree the two are not distributions over the same space (and the
      * row copy would overrun), so fall back to argmax proposals + the
      * deterministic accept rule, which needs no q. */
-    const bool sample_drafts = temperature > 0.0f && vocab_size == DS4_N_VOCAB;
+    const bool sample_drafts = temperature > 0.0f && vocab_size == PULSAR_N_VOCAB;
     if (sample_drafts) {
         /* n_draft rows, not 16: the depth is fixed per engine
          * (e->dspark_draft_tokens, 3 by default), so this is 1.6 MB rather than
          * 8.3 MB per session. Grow-only, so a depth change is still safe. */
-        const uint32_t need = n_draft * DS4_N_VOCAB;
+        const uint32_t need = n_draft * PULSAR_N_VOCAB;
         if (s->dspark_pending_qrows_cap < need) {
             free(s->dspark_pending_qrows);
             s->dspark_pending_qrows = (float *)xmalloc((size_t)need * sizeof(float));
@@ -3943,33 +3943,33 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
     }
     bool draft_ok = true;
     for (uint32_t pos = 0; pos < n_draft && draft_ok; pos++) {
-        ds4_gpu_tensor *base_row = ds4_gpu_tensor_view(
+        pulsar_gpu_tensor *base_row = pulsar_gpu_tensor_view(
             g->spec_logits, (uint64_t)pos * vocab_bytes, vocab_bytes);
         draft_ok = base_row &&
-            ds4_gpu_dspark_markov_step_model(dspark_logits, &refined[pos + 1],
+            pulsar_gpu_dspark_markov_step_model(dspark_logits, &refined[pos + 1],
                                              dtree_stats ? &refined2[pos + 1] : NULL,
                                              base_row, dmap, dsize,
                                              w->markov_w1->abs_offset,
                                              w->markov_w2->abs_offset,
                                              refined[pos], vocab_size, embed_dim);
-        ds4_gpu_tensor_free(base_row);
+        pulsar_gpu_tensor_free(base_row);
         if (!draft_ok || !sample_drafts) continue;
         /* Read this position's refined logits back BEFORE the next markov step
          * overwrites the single-row scratch, and keep the row: the residual
          * needs the full q of whichever position rejects, which is not known
          * until verify. (This full-vocab D2H per draft position is the
          * deliberate temporary cost Item 2's fused GPU accept kernel removes.) */
-        float *qrow = s->dspark_pending_qrows + (size_t)pos * DS4_N_VOCAB;
-        if (!ds4_gpu_tensor_read(dspark_logits, 0, qrow, vocab_bytes)) {
+        float *qrow = s->dspark_pending_qrows + (size_t)pos * PULSAR_N_VOCAB;
+        if (!pulsar_gpu_tensor_read(dspark_logits, 0, qrow, vocab_bytes)) {
             draft_ok = false;
             break;
         }
-        ds4_sample_dist q;
-        ds4_sample_dist_build(qrow, DS4_N_VOCAB, temperature, top_k, top_p, min_p,
+        pulsar_sample_dist q;
+        pulsar_sample_dist_build(qrow, PULSAR_N_VOCAB, temperature, top_k, top_p, min_p,
                               &s->sample_scratch, &q);
-        const int drawn = ds4_sample_dist_draw(&q, rng);
+        const int drawn = pulsar_sample_dist_draw(&q, rng);
         refined[pos + 1] = (int32_t)drawn;   /* the chain continues SAMPLED */
-        s->spec.dspark_pending_q[pos] = ds4_sample_dist_prob(&q, drawn);
+        s->spec.dspark_pending_q[pos] = pulsar_sample_dist_prob(&q, drawn);
         /* Diagnostic: how much proposal entropy is there actually? The whole
          * premise of temperature-matched drafting is that q is a DISTRIBUTION.
          * If q.n == 1 (or q(top) ~ 1) the draw is the argmax, min(1,p/q)
@@ -3979,7 +3979,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
                             "drawn_is_argmax=%d\n",
                     pos, q.n, (double)q.probs[0],
                     (double)s->spec.dspark_pending_q[pos], drawn == q.ids[0]);
-        ds4_sample_dist_free(&q);
+        pulsar_sample_dist_free(&q);
     }
     if (!draft_ok) return n_accept;
 
@@ -3989,7 +3989,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
      * hidden rows the confidence kernel consumes. */
     dspark_dump_step(g, (int)s->checkpoint.len, (int)next_base, refined, (int)n_draft);
 
-    /* On-policy trajectory dump (DS4_DSPARK_DUMP_ONPOLICY=<max steps>,
+    /* On-policy trajectory dump (PULSAR_DSPARK_DUMP_ONPOLICY=<max steps>,
      * _PATH=<file>): self-contained per-step records for teacher-forcing the
      * offline torch drafter on THE ENGINE'S OWN trajectory — discriminates
      * "remaining acceptance gap is on-policy distribution" (torch matches the
@@ -4013,19 +4013,19 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
                                     (int32_t)n_draft, (int32_t)n_batch, (int32_t)commit };
                 fwrite(hdr2, sizeof(int32_t), 5, f2);
                 fwrite(refined, sizeof(int32_t), (size_t)n_draft + 1, f2);
-                float *row2 = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+                float *row2 = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(float));
                 for (uint32_t m2 = 0; m2 < n_batch; m2++) {
                     for (int sl = 0; sl < 3; sl++) {
-                        memset(row2, 0, (size_t)DS4_N_EMBD * sizeof(float));
-                        (void)ds4_gpu_tensor_read(g->dspark_target_h_batch[sl],
-                                                  (uint64_t)m2 * DS4_N_EMBD * sizeof(float),
+                        memset(row2, 0, (size_t)PULSAR_N_EMBD * sizeof(float));
+                        (void)pulsar_gpu_tensor_read(g->dspark_target_h_batch[sl],
+                                                  (uint64_t)m2 * PULSAR_N_EMBD * sizeof(float),
                                                   row2,
-                                                  (uint64_t)DS4_N_EMBD * sizeof(float));
-                        fwrite(row2, sizeof(float), DS4_N_EMBD, f2);
+                                                  (uint64_t)PULSAR_N_EMBD * sizeof(float));
+                        fwrite(row2, sizeof(float), PULSAR_N_EMBD, f2);
                     }
                 }
                 free(row2);
-                /* Bug-#4 localization payload (DS4_DSPARK_DUMP_RING=1): the
+                /* Bug-#4 localization payload (PULSAR_DSPARK_DUMP_RING=1): the
                  * drafter's context-KV ring + counters as the NEXT draft
                  * forward will read them (post-seeding for this step's
                  * commits), plus this step's block outputs (cur_hc rows).
@@ -4035,21 +4035,21 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
                 if (dump_ring < 0) dump_ring = getenv("DS4_DSPARK_DUMP_RING") != NULL;
                 if (dump_ring) {
                     const uint64_t ring_bytes =
-                        (uint64_t)DS4_DSPARK_DRAFT_WINDOW * DS4_N_HEAD_DIM * sizeof(float);
+                        (uint64_t)PULSAR_DSPARK_DRAFT_WINDOW * PULSAR_N_HEAD_DIM * sizeof(float);
                     float *ring = (float *)xmalloc(ring_bytes);
                     for (int li2 = 0; li2 < 3; li2++) {
                         int32_t nr = (int32_t)g->dspark_n_raw[li2];
                         fwrite(&nr, sizeof(int32_t), 1, f2);
                         memset(ring, 0, ring_bytes);
-                        (void)ds4_gpu_tensor_read(g->dspark_raw_cache[li2], 0, ring, ring_bytes);
+                        (void)pulsar_gpu_tensor_read(g->dspark_raw_cache[li2], 0, ring, ring_bytes);
                         fwrite(ring, sizeof(float), ring_bytes / sizeof(float), f2);
                     }
                     free(ring);
-                    const uint64_t hcw2 = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+                    const uint64_t hcw2 = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
                     float *hcrow = (float *)xmalloc(hcw2 * sizeof(float));
                     for (uint32_t p2 = 0; p2 < n_draft; p2++) {
                         memset(hcrow, 0, hcw2 * sizeof(float));
-                        (void)ds4_read_hc_carrier_f32(g->batch_cur_hc, (uint64_t)p2 * hcw2,
+                        (void)pulsar_read_hc_carrier_f32(g->batch_cur_hc, (uint64_t)p2 * hcw2,
                                                       hcrow, hcw2);
                         fwrite(hcrow, sizeof(float), hcw2, f2);
                     }
@@ -4064,23 +4064,23 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
     /* Confidence-scheduled pending length (P1 head; keep the confident prefix).
      * DTree Phase 0: compute conf even when conf-sched is off, so the p2 table
      * can bucket by the actual confidence at every drafted position (collect
-     * with DS4_DSPARK_CONF_SCHED=off for an unbiased, fully-verified sample). */
+     * with PULSAR_DSPARK_CONF_SCHED=off for an unbiased, fully-verified sample). */
     uint32_t keep = n_draft;
     float conf[16];
     bool have_conf = false;
     {
         const float tau = dspark_conf_sched_tau();
         if (tau > 0.0f || dtree_stats) {
-            ds4_gpu_tensor *conf_dev = ds4_gpu_tensor_alloc((uint64_t)n_draft * sizeof(float));
-            ds4_gpu_tensor *tok_dev = ds4_gpu_tensor_alloc((uint64_t)n_draft * sizeof(int32_t));
+            pulsar_gpu_tensor *conf_dev = pulsar_gpu_tensor_alloc((uint64_t)n_draft * sizeof(float));
+            pulsar_gpu_tensor *tok_dev = pulsar_gpu_tensor_alloc((uint64_t)n_draft * sizeof(int32_t));
             if (conf_dev && tok_dev &&
-                ds4_gpu_tensor_write(tok_dev, 0, refined, (uint64_t)n_draft * sizeof(int32_t)) &&
-                ds4_gpu_dspark_confidence_score_model(conf_dev, g->batch_ffn_cur, tok_dev,
+                pulsar_gpu_tensor_write(tok_dev, 0, refined, (uint64_t)n_draft * sizeof(int32_t)) &&
+                pulsar_gpu_dspark_confidence_score_model(conf_dev, g->batch_ffn_cur, tok_dev,
                                                       dmap, dsize,
                                                       w->markov_w1->abs_offset,
                                                       w->confidence_proj->abs_offset,
-                                                      n_draft, DS4_N_EMBD, embed_dim, vocab_size) &&
-                ds4_gpu_tensor_read(conf_dev, 0, conf, (uint64_t)n_draft * sizeof(float))) {
+                                                      n_draft, PULSAR_N_EMBD, embed_dim, vocab_size) &&
+                pulsar_gpu_tensor_read(conf_dev, 0, conf, (uint64_t)n_draft * sizeof(float))) {
                 have_conf = true;
                 if (tau > 0.0f) {
                     uint32_t k = 0;
@@ -4088,8 +4088,8 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
                     keep = k;   /* 0 pending = next step is a plain n=1 forward */
                 }
             }
-            ds4_gpu_tensor_free(conf_dev);
-            ds4_gpu_tensor_free(tok_dev);
+            pulsar_gpu_tensor_free(conf_dev);
+            pulsar_gpu_tensor_free(tok_dev);
         }
     }
     s->spec.dspark_pending_base = (int32_t)next_base;
@@ -4135,7 +4135,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
     }
 
     if (dspark_stats)
-        fprintf(stderr, "ds4: dspark fused n_batch=%u committed=%d pend=%u step_ms=%.1f\n",
+        fprintf(stderr, "pulsar: dspark fused n_batch=%u committed=%d pend=%u step_ms=%.1f\n",
                 n_batch, commit, keep, (now_sec() - t0) * 1000.0);
     return n_accept;
 }
@@ -4146,13 +4146,13 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
  * leaves the next correctly-distributed base as the carry. temperature <= 0
  * degenerates to the greedy argmax-equality path (byte-identical to the old
  * eval_speculative_block behavior). Returns the number of tokens emitted. */
-int ds4_session_generate_speculative(ds4_session *s, float temperature, int top_k,
+int pulsar_session_generate_speculative(pulsar_session *s, float temperature, int top_k,
                                      float top_p, float min_p, uint64_t *rng,
                                      int max_tokens, int eos_token,
                                      int *accepted, int accepted_cap,
                                      char *err, size_t errlen) {
     if (!s || max_tokens <= 0 || accepted_cap <= 0 || !accepted) return 0;
-    /* Same stale-classic-state guard as ds4_session_eval: the spec loop
+    /* Same stale-classic-state guard as pulsar_session_eval: the spec loop
      * decodes and emits against the graph's scalar frontier counters, which
      * hold a cross-bank superset after a multiseq step. */
     if (s->mseq_dirty) {
@@ -4176,7 +4176,7 @@ int ds4_session_generate_speculative(ds4_session *s, float temperature, int top_
         /* no carry, or params changed mid-stream (e.g. tool-call payloads
          * force greedy): redraw from the current distribution */
         s->spec.spec_carry_valid = false;
-        first = sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
+        first = sample_top_p_min_p(s->logits, PULSAR_N_VOCAB, temperature, top_k,
                                    top_p, min_p, rng);
     }
     if (first == eos_token) {
@@ -4188,24 +4188,24 @@ int ds4_session_generate_speculative(ds4_session *s, float temperature, int top_
     /* Yield-quenched requests run plain for their remainder — the same route
      * as a drafterless engine, chosen per request. The carry consumed above is
      * already correctly distributed, so this is a pure speed decision. */
-    if (!ds4_engine_has_dspark(s->engine) || s->spec.spec_quenched) {
-        if (ds4_session_eval(s, first, err, errlen) != 0) return -1;
+    if (!pulsar_engine_has_dspark(s->engine) || s->spec.spec_quenched) {
+        if (pulsar_session_eval(s, first, err, errlen) != 0) return -1;
         accepted[0] = first;
         return 1;
     }
-    return ds4_session_eval_speculative_fused(s, first, max_tokens, eos_token,
+    return pulsar_session_eval_speculative_fused(s, first, max_tokens, eos_token,
                                               temperature, top_k, top_p, min_p, rng,
                                               accepted, accepted_cap, err, errlen);
 }
 
 
 
-int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
+int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
     if (!s || max_tokens <= 0 || accepted_cap <= 0 || !accepted) return 0;
-    /* Same stale-classic-state guard as ds4_session_eval (which the no-dspark
+    /* Same stale-classic-state guard as pulsar_session_eval (which the no-dspark
      * fallback below would otherwise hit one frame deeper). */
     if (s->mseq_dirty) {
         snprintf(err, errlen,
@@ -4213,26 +4213,26 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
                  "per-bank state is stale; re-sync the session first");
         return -1;
     }
-    if (!ds4_engine_has_dspark(s->engine) || s->spec.spec_quenched) {
-        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+    if (!pulsar_engine_has_dspark(s->engine) || s->spec.spec_quenched) {
+        if (pulsar_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         return 1;
     }
     /* The fused loop (one batched forward/step + transactional no-replay
      * rollback) is the default: measured 16.4 vs 15.2 t/s legacy-vs-baseline
-     * and byte-identical deterministic output. DS4_DSPARK_LEGACY_LOOP restores
+     * and byte-identical deterministic output. PULSAR_DSPARK_LEGACY_LOOP restores
      * the old Step1+verify loop as an operational fallback. */
     static int fused_cache = -1;
     if (fused_cache < 0) fused_cache = getenv("DS4_DSPARK_LEGACY_LOOP") == NULL;
     /* an externally chosen first_token invalidates any pending carry */
     s->spec.spec_carry_valid = false;
     if (fused_cache)
-        return ds4_session_eval_speculative_fused(s, first_token, max_tokens, eos_token,
+        return pulsar_session_eval_speculative_fused(s, first_token, max_tokens, eos_token,
                                                   0.0f, 0, 1.0f, 0.0f, NULL,
                                                   accepted, accepted_cap, err, errlen);
 
-    ds4_engine *e = s->engine;
-    ds4_gpu_graph *g = &s->graph;
+    pulsar_engine *e = s->engine;
+    pulsar_gpu_graph *g = &s->graph;
     const uint32_t n_draft = (uint32_t)e->dspark_draft_tokens;
     int n_accept = 0;
     static int dspark_stats_env = -1;
@@ -4244,7 +4244,7 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
     const int dump_pos = s->checkpoint.len;  /* first_token's sequence position */
 
     /* Step 1: run target decode for the first token */
-    if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+    if (pulsar_session_eval(s, first_token, err, errlen) != 0) return -1;
 
     /* Step 2: project main_x from captured target hidden states */
     if (!gpu_graph_dspark_project_main_x(g, &e->dspark_model, &e->dspark_weights))
@@ -4261,7 +4261,7 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
     int32_t draft_ids[16];
     draft_ids[0] = (int32_t)first_token;
     for (uint32_t i = 1; i < n_draft; i++)
-        draft_ids[i] = DS4_DSPARK_NOISE_TOKEN_ID;
+        draft_ids[i] = PULSAR_DSPARK_NOISE_TOKEN_ID;
 
     /* Step 3b: confidence gate. Draft acceptance tracks the base model's own
      * certainty (the drafter is trained to mimic it), so only spend the
@@ -4270,7 +4270,7 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
      * Skipping here costs exactly a plain decode (first_token already committed
      * in Step 1, s->logits intact). Steps 2/2b already seeded this position into
      * the drafter KV, so its rolling context stays complete for later steps.
-     * DS4_DSPARK_MIN_CONF=0 (default) preserves the old always-draft behavior. */
+     * PULSAR_DSPARK_MIN_CONF=0 (default) preserves the old always-draft behavior. */
     {
         static float min_conf = -1.0f;
         if (min_conf < 0.0f) {
@@ -4279,10 +4279,10 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
             min_conf = v > 0.0f ? v : 0.0f;
         }
         if (min_conf > 0.0f) {
-            const float p = dspark_base_top1_prob(s->logits, DS4_N_VOCAB);
+            const float p = dspark_base_top1_prob(s->logits, PULSAR_N_VOCAB);
             if (p < min_conf) {
                 if (dspark_stats)
-                    fprintf(stderr, "ds4: dspark step draft_n=%d committed=0 conf_skip p=%.3f min=%.3f "
+                    fprintf(stderr, "pulsar: dspark step draft_n=%d committed=0 conf_skip p=%.3f min=%.3f "
                                     "step_ms=%.1f\n",
                             (int)n_draft, (double)p, (double)min_conf,
                             (now_sec() - dspark_t0) * 1000.0);
@@ -4299,36 +4299,36 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
                                          g->spec_logits, draft_ids, n_draft))
         return -1;
     if (dspark_stats) {
-        (void)ds4_gpu_synchronize();
+        (void)pulsar_gpu_synchronize();
         dspark_draft_ms = (now_sec() - dspark_draft_t0) * 1000.0;
-        float *r0 = (float *)xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+        float *r0 = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(float));
         if (gpu_graph_read_spec_logits_row(g, 0, r0))
-            dspark_base0 = sample_argmax(r0, DS4_N_VOCAB);
+            dspark_base0 = sample_argmax(r0, PULSAR_N_VOCAB);
         free(r0);
         /* conditioning diagnostics: is target_h captured, main_x sane, KV seeded? */
-        float *tmp = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+        float *tmp = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(float));
         double mn = 0.0, th[3] = {0, 0, 0};
-        if (ds4_gpu_tensor_read(g->dspark_main_x, 0, tmp, (uint64_t)DS4_N_EMBD * 4))
-            for (int j = 0; j < (int)DS4_N_EMBD; j++) mn += (double)tmp[j] * tmp[j];
+        if (pulsar_gpu_tensor_read(g->dspark_main_x, 0, tmp, (uint64_t)PULSAR_N_EMBD * 4))
+            for (int j = 0; j < (int)PULSAR_N_EMBD; j++) mn += (double)tmp[j] * tmp[j];
         for (int i = 0; i < 3; i++)
-            if (ds4_gpu_tensor_read(g->dspark_target_h[i], 0, tmp, (uint64_t)DS4_N_EMBD * 4))
-                for (int j = 0; j < (int)DS4_N_EMBD; j++) th[i] += (double)tmp[j] * tmp[j];
+            if (pulsar_gpu_tensor_read(g->dspark_target_h[i], 0, tmp, (uint64_t)PULSAR_N_EMBD * 4))
+                for (int j = 0; j < (int)PULSAR_N_EMBD; j++) th[i] += (double)tmp[j] * tmp[j];
         free(tmp);
-        fprintf(stderr, "ds4: dspark cond main_x=%.3f target_h=[%.2f,%.2f,%.2f] n_raw=[%u,%u,%u]\n",
+        fprintf(stderr, "pulsar: dspark cond main_x=%.3f target_h=[%.2f,%.2f,%.2f] n_raw=[%u,%u,%u]\n",
                 sqrt(mn), sqrt(th[0]), sqrt(th[1]), sqrt(th[2]),
                 g->dspark_n_raw[0], g->dspark_n_raw[1], g->dspark_n_raw[2]);
     }
 
     /* Step 5: Markov refine — sequential over N positions */
-    const ds4_dspark_weights *w = &e->dspark_weights;
+    const pulsar_dspark_weights *w = &e->dspark_weights;
     const uint32_t embed_dim = 256;
     const uint32_t vocab_size = w->vocab_size;
     const uint64_t vocab_bytes = (uint64_t)vocab_size * sizeof(float);
     const void *dmap = e->dspark_model.map;
     const uint64_t dsize = e->dspark_model.size;
 
-    ds4_gpu_tensor *dspark_logits = g->dspark_markov_logits;   /* persistent scratch */
-    if (!dspark_logits || ds4_gpu_tensor_bytes(dspark_logits) < vocab_bytes) return -1;
+    pulsar_gpu_tensor *dspark_logits = g->dspark_markov_logits;   /* persistent scratch */
+    if (!dspark_logits || pulsar_gpu_tensor_bytes(dspark_logits) < vocab_bytes) return -1;
     const double dspark_mk_t0 = dspark_stats ? now_sec() : 0.0;
 
     /* refined_ids[0] holds first_token; positions 1..n_draft hold the refined
@@ -4337,19 +4337,19 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
     refined_ids[0] = (int32_t)first_token;
     for (uint32_t pos = 0; pos < n_draft; pos++) {
         /* Create view of spec_logits row [pos] as base logits */
-        ds4_gpu_tensor *base_row = ds4_gpu_tensor_view(
+        pulsar_gpu_tensor *base_row = pulsar_gpu_tensor_view(
             g->spec_logits, (uint64_t)pos * vocab_bytes, vocab_bytes);
         if (!base_row) return -1;
 
         int32_t prev = refined_ids[pos];
-        bool step_ok = ds4_gpu_dspark_markov_step_model(dspark_logits, &refined_ids[pos + 1],
+        bool step_ok = pulsar_gpu_dspark_markov_step_model(dspark_logits, &refined_ids[pos + 1],
                                                NULL,
                                                base_row,
                                                dmap, dsize,
                                                w->markov_w1->abs_offset,
                                                w->markov_w2->abs_offset,
                                                (int32_t)prev, vocab_size, embed_dim);
-        ds4_gpu_tensor_free(base_row);
+        pulsar_gpu_tensor_free(base_row);
         if (!step_ok) return -1;
     }
     if (dspark_stats) dspark_markov_ms = (now_sec() - dspark_mk_t0) * 1000.0;
@@ -4361,7 +4361,7 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
      * accepted (from the post-hc_head hidden in batch_ffn_cur + the drafted
      * token's markov embed). Size the verify budget to the confident prefix so
      * we don't spend the batch verify on low-confidence tail drafts. Threshold
-     * DS4_DSPARK_CONF_SCHED (defaults to the measured tau in
+     * PULSAR_DSPARK_CONF_SCHED (defaults to the measured tau in
      * dspark_conf_sched_tau(); "0"/"off" = verify all n_draft, classic behavior).
      * OUTPUT-PRESERVING: reducing the budget only limits how many drafts we
      * verify/commit; the emitted tokens are still exact greedy. */
@@ -4369,30 +4369,30 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
     {
         const float tau = dspark_conf_sched_tau();
         if (tau > 0.0f) {
-            ds4_gpu_tensor *conf_dev = ds4_gpu_tensor_alloc((uint64_t)n_draft * sizeof(float));
-            ds4_gpu_tensor *tok_dev  = ds4_gpu_tensor_alloc((uint64_t)n_draft * sizeof(int32_t));
+            pulsar_gpu_tensor *conf_dev = pulsar_gpu_tensor_alloc((uint64_t)n_draft * sizeof(float));
+            pulsar_gpu_tensor *tok_dev  = pulsar_gpu_tensor_alloc((uint64_t)n_draft * sizeof(int32_t));
             if (conf_dev && tok_dev &&
-                ds4_gpu_tensor_write(tok_dev, 0, refined_ids, (uint64_t)n_draft * sizeof(int32_t)) &&
-                ds4_gpu_dspark_confidence_score_model(conf_dev, g->batch_ffn_cur, tok_dev,
+                pulsar_gpu_tensor_write(tok_dev, 0, refined_ids, (uint64_t)n_draft * sizeof(int32_t)) &&
+                pulsar_gpu_dspark_confidence_score_model(conf_dev, g->batch_ffn_cur, tok_dev,
                                                       dmap, dsize,
                                                       w->markov_w1->abs_offset,
                                                       w->confidence_proj->abs_offset,
-                                                      n_draft, DS4_N_EMBD, embed_dim, vocab_size)) {
+                                                      n_draft, PULSAR_N_EMBD, embed_dim, vocab_size)) {
                 float conf[16];
-                if (ds4_gpu_tensor_read(conf_dev, 0, conf, (uint64_t)n_draft * sizeof(float))) {
+                if (pulsar_gpu_tensor_read(conf_dev, 0, conf, (uint64_t)n_draft * sizeof(float))) {
                     uint32_t k = 0;
                     while (k < n_draft && conf[k] >= tau) k++;
                     eff_draft = k < 1 ? 1u : k;   /* floor 1: draft_1 is free-validated below */
                     if (dspark_stats)
-                        fprintf(stderr, "ds4: dspark conf_sched tau=%.2f conf=[%.2f,%.2f,%.2f,%.2f] eff=%u/%u\n",
+                        fprintf(stderr, "pulsar: dspark conf_sched tau=%.2f conf=[%.2f,%.2f,%.2f,%.2f] eff=%u/%u\n",
                                 (double)tau, (double)conf[0],
                                 n_draft > 1 ? (double)conf[1] : 0.0,
                                 n_draft > 2 ? (double)conf[2] : 0.0,
                                 n_draft > 3 ? (double)conf[3] : 0.0, eff_draft, n_draft);
                 }
             }
-            ds4_gpu_tensor_free(conf_dev);
-            ds4_gpu_tensor_free(tok_dev);
+            pulsar_gpu_tensor_free(conf_dev);
+            pulsar_gpu_tensor_free(tok_dev);
         }
     }
 
@@ -4402,9 +4402,9 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
      * matter what the verify says -- so skip the snapshot/verify/restore
      * entirely (~100-150ms saved) and emit just first_token. Nothing beyond
      * Step 1 is allocated here (dspark_logits already freed). */
-    if (sample_argmax(s->logits, DS4_N_VOCAB) != refined_ids[1]) {
+    if (sample_argmax(s->logits, PULSAR_N_VOCAB) != refined_ids[1]) {
         if (dspark_stats)
-            fprintf(stderr, "ds4: dspark step draft_n=%d committed=0 verify_skip "
+            fprintf(stderr, "pulsar: dspark step draft_n=%d committed=0 verify_skip "
                             "draft_ms=%.1f markov_ms=%.1f step_ms=%.1f\n",
                     (int)n_draft, dspark_draft_ms, dspark_markov_ms,
                     (now_sec() - dspark_t0) * 1000.0);
@@ -4423,7 +4423,7 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
     const int saved_len = s->checkpoint.len;
     const int draft_n = (int)eff_draft;   /* confidence-scheduled verify budget (Step 5c) */
 
-    ds4_spec_frontier frontier;
+    pulsar_spec_frontier frontier;
     memset(&frontier, 0, sizeof(frontier));
     const double dspark_snap_t0 = dspark_stats ? now_sec() : 0.0;
     bool have_frontier = spec_frontier_snapshot(&frontier, s);
@@ -4455,7 +4455,7 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
      * verifier's row_tops.  commit_drafts may be 0 when even the first draft
      * disagrees. */
     int commit_drafts = 0;
-    if (sample_argmax(s->logits, DS4_N_VOCAB) == refined_ids[1]) {
+    if (sample_argmax(s->logits, PULSAR_N_VOCAB) == refined_ids[1]) {
         commit_drafts = 1;
         for (int i = 1; i < draft_n; i++) {
             if (row_tops[i - 1] != refined_ids[i + 1]) break;
@@ -4464,13 +4464,13 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
     }
 
     if (dspark_stats)
-        fprintf(stderr, "ds4: dspark step draft_n=%d committed=%d tgt_next=%d base0_top=%d refined1=%d "
+        fprintf(stderr, "pulsar: dspark step draft_n=%d committed=%d tgt_next=%d base0_top=%d refined1=%d "
                         "base0_hit=%d refined1_hit=%d draft_ms=%.1f markov_ms=%.1f snap_ms=%.1f "
                         "verify_ms=%.1f step_ms=%.1f\n",
                 draft_n, commit_drafts,
-                sample_argmax(s->logits, DS4_N_VOCAB), dspark_base0, refined_ids[1],
-                dspark_base0 == sample_argmax(s->logits, DS4_N_VOCAB),
-                refined_ids[1] == sample_argmax(s->logits, DS4_N_VOCAB),
+                sample_argmax(s->logits, PULSAR_N_VOCAB), dspark_base0, refined_ids[1],
+                dspark_base0 == sample_argmax(s->logits, PULSAR_N_VOCAB),
+                refined_ids[1] == sample_argmax(s->logits, PULSAR_N_VOCAB),
                 dspark_draft_ms, dspark_markov_ms, dspark_snap_ms, dspark_verify_ms,
                 (now_sec() - dspark_t0) * 1000.0);
 
@@ -4484,11 +4484,11 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
          * draft_n-1).
          */
         if (!s->spec_row_scratch)
-            s->spec_row_scratch = (float *)xmalloc((size_t)DS4_N_VOCAB * sizeof(s->spec_row_scratch[0]));
+            s->spec_row_scratch = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(s->spec_row_scratch[0]));
         float *row_logits = s->spec_row_scratch;
         ok_state = gpu_graph_read_spec_logits_row(g, (uint32_t)(draft_n - 1), row_logits);
         if (ok_state)
-            memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+            memcpy(s->logits, row_logits, (size_t)PULSAR_N_VOCAB * sizeof(s->logits[0]));
     } else {
         /*
          * Partial accept or full reject: the verifier ran the target over all
@@ -4508,7 +4508,7 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
         s->checkpoint.len = saved_len;
         ok_state = spec_frontier_restore(&frontier, s);
         for (int i = 0; ok_state && i < commit_drafts; i++) {
-            if (ds4_session_eval(s, refined_ids[i + 1], err, errlen) != 0) {
+            if (pulsar_session_eval(s, refined_ids[i + 1], err, errlen) != 0) {
                 ok_state = false;
                 break;
             }
@@ -4552,7 +4552,7 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
 
 
 
-void ds4_session_invalidate(ds4_session *s) {
+void pulsar_session_invalidate(pulsar_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->spec.dspark_n_pending = 0;
@@ -4576,7 +4576,7 @@ void ds4_session_invalidate(ds4_session *s) {
 
 
 
-void ds4_session_rewind(ds4_session *s, int pos) {
+void pulsar_session_rewind(pulsar_session *s, int pos) {
     if (pos < 0) pos = 0;
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;
@@ -4591,25 +4591,25 @@ void ds4_session_rewind(ds4_session *s, int pos) {
 
 
 
-int ds4_session_pos(ds4_session *s) {
+int pulsar_session_pos(pulsar_session *s) {
     return s->checkpoint.len;
 }
 
 
 
-int ds4_session_ctx(ds4_session *s) {
+int pulsar_session_ctx(pulsar_session *s) {
     return s->ctx_size;
 }
 
 
 
-int ds4_session_prefill_cap(ds4_session *s) {
+int pulsar_session_prefill_cap(pulsar_session *s) {
     return s ? (int)s->prefill_cap : 0;
 }
 
 
 
-/* Multi-session serving: is interrupting ds4_session_sync() at a chunk
+/* Multi-session serving: is interrupting pulsar_session_sync() at a chunk
  * boundary (cancel callback) and re-issuing the sync bit-identical to letting
  * it run to completion?
  *
@@ -4622,13 +4622,13 @@ int ds4_session_prefill_cap(ds4_session *s) {
  *     replay is lost. Return 0: the caller must not interrupt at all.
  *
  *   - Below gpu_graph_resume_prefill_min_tokens() remaining tokens,
- *     ds4_session_sync extends the checkpoint by single-token decode evals
+ *     pulsar_session_sync extends the checkpoint by single-token decode evals
  *     instead of a final batched chunk. Interrupting with less than this left
  *     would change which path evaluates the tail. Return that minimum, so the
  *     caller only interrupts while (target - checkpoint) >= the returned
- *     value. (When resume is disabled via DS4_CUDA_RESUME_PREFILL_MIN<=0 the
+ *     value. (When resume is disabled via PULSAR_CUDA_RESUME_PREFILL_MIN<=0 the
  *     minimum is UINT32_MAX and the comparison never permits interruption.) */
-uint32_t ds4_session_prefill_quantum_min_suffix(const ds4_session *s) {
+uint32_t pulsar_session_prefill_quantum_min_suffix(const pulsar_session *s) {
     if (!s) return 0;
     if (s->graph.prefill_cap > s->graph.raw_cap) return 0;
     /* A cold (start==0) chunk loop trims each non-final chunk end DOWN to the
@@ -4637,8 +4637,8 @@ uint32_t ds4_session_prefill_quantum_min_suffix(const ds4_session *s) {
      * prefill_cap itself is LCM-aligned (true for the 4096/8192 defaults; a
      * hand-set --prefill-chunk may not be). */
     uint32_t align = 1;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const uint32_t r = ds4_layer_compress_ratio(il);
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint32_t r = pulsar_layer_compress_ratio(il);
         if (r > 1 && align % r != 0) {
             uint32_t a = align, b = r;
             while (b) { const uint32_t t = a % b; a = b; b = t; }

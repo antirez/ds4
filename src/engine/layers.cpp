@@ -1,9 +1,9 @@
-#include "ds4_engine_internal.h"
+#include "pulsar_engine_internal.h"
 
 
 
-uint32_t ds4_default_raw_cap(uint32_t ctx_size) {
-    uint32_t raw_cap = DS4_N_SWA;
+uint32_t pulsar_default_raw_cap(uint32_t ctx_size) {
+    uint32_t raw_cap = PULSAR_N_SWA;
     if (raw_cap > ctx_size) raw_cap = ctx_size;
     if (raw_cap == 0) raw_cap = 1;
     return raw_cap;
@@ -11,7 +11,7 @@ uint32_t ds4_default_raw_cap(uint32_t ctx_size) {
 
 
 
-uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
+uint32_t pulsar_prefill_cap_for_prompt(int prompt_len,
                                            uint32_t requested_chunk) {
     if (prompt_len <= 0) return 1;
     uint32_t cap = (uint32_t)prompt_len;
@@ -28,7 +28,7 @@ uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
                 cap = (uint32_t)v;
             }
         } else if (prompt_len > 4096) {
-            cap = DS4_MODEL_VARIANT == DS4_VARIANT_PRO ? 8192u : 4096u;
+            cap = PULSAR_MODEL_VARIANT == PULSAR_VARIANT_PRO ? 8192u : 4096u;
         }
     }
 
@@ -133,27 +133,27 @@ uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
  * to itself, useful for checking a minimal end-to-end slice. */
 void layer_forward_self_one(
         float                   * out_hc,
-        const ds4_model         * model,
-        const ds4_layer_weights * layer,
+        const pulsar_model         * model,
+        const pulsar_layer_weights * layer,
         const float             * inp_hc,
         uint32_t                  il,
         uint32_t                  pos,
         int                       token) {
-    const uint32_t n_hc = DS4_N_HC;
-    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint32_t n_hc = PULSAR_N_HC;
+    const uint64_t q_dim = (uint64_t)PULSAR_N_HEAD * PULSAR_N_HEAD_DIM;
 
-    float *attn_cur = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(attn_cur[0]));
-    float *attn_norm = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(attn_norm[0]));
-    float *attn_residual = (float *)xmalloc((size_t)n_hc * DS4_N_EMBD * sizeof(attn_residual[0]));
+    float *attn_cur = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(attn_cur[0]));
+    float *attn_norm = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(attn_norm[0]));
+    float *attn_residual = (float *)xmalloc((size_t)n_hc * PULSAR_N_EMBD * sizeof(attn_residual[0]));
     float *q = (float *)xmalloc((size_t)q_dim * sizeof(q[0]));
-    float *kv = (float *)xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(kv[0]));
+    float *kv = (float *)xmalloc((size_t)PULSAR_N_HEAD_DIM * sizeof(kv[0]));
     float *heads = (float *)xmalloc((size_t)q_dim * sizeof(heads[0]));
-    float *attn_out = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(attn_out[0]));
-    float *after_attn_hc = (float *)xmalloc((size_t)n_hc * DS4_N_EMBD * sizeof(after_attn_hc[0]));
+    float *attn_out = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(attn_out[0]));
+    float *after_attn_hc = (float *)xmalloc((size_t)n_hc * PULSAR_N_EMBD * sizeof(after_attn_hc[0]));
     float post[4];
     float comb[16];
 
-    memcpy(attn_residual, inp_hc, (size_t)n_hc * DS4_N_EMBD * sizeof(inp_hc[0]));
+    memcpy(attn_residual, inp_hc, (size_t)n_hc * PULSAR_N_EMBD * sizeof(inp_hc[0]));
     hc_pre_from_state_one(model,
                           layer->hc_attn_fn,
                           layer->hc_attn_scale,
@@ -163,15 +163,15 @@ void layer_forward_self_one(
     layer_attn_norm_one(attn_norm, model, layer, attn_cur);
     layer_q_projection_normed_one(model, layer, attn_norm, q);
     layer_kv_projection_normed_one(model, layer, attn_norm, kv);
-    rope_tail_layer_inplace(q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false);
-    rope_tail_layer_inplace(kv, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false);
-    dsv4_fp8_kv_quantize_row_inplace_cpu(kv, DS4_N_HEAD_DIM, DS4_N_ROT);
-    f16_round_inplace_cpu(kv, DS4_N_HEAD_DIM);
+    rope_tail_layer_inplace(q, PULSAR_N_HEAD, PULSAR_N_HEAD_DIM, PULSAR_N_ROT, pos, il, false);
+    rope_tail_layer_inplace(kv, PULSAR_N_HEAD_KV, PULSAR_N_HEAD_DIM, PULSAR_N_ROT, pos, il, false);
+    dsv4_fp8_kv_quantize_row_inplace_cpu(kv, PULSAR_N_HEAD_DIM, PULSAR_N_ROT);
+    f16_round_inplace_cpu(kv, PULSAR_N_HEAD_DIM);
 
     layer_attention_one(heads, model, layer, q, kv);
-    rope_tail_layer_inplace(heads, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, true);
+    rope_tail_layer_inplace(heads, PULSAR_N_HEAD, PULSAR_N_HEAD_DIM, PULSAR_N_ROT, pos, il, true);
     layer_grouped_out_one(attn_out, model, layer, heads);
-    hc_post_one(after_attn_hc, attn_out, attn_residual, post, comb, DS4_N_EMBD, n_hc);
+    hc_post_one(after_attn_hc, attn_out, attn_residual, post, comb, PULSAR_N_EMBD, n_hc);
 
     layer_ffn_one(out_hc, model, layer, after_attn_hc, il, token,
                   NULL, 0.0f, false);
@@ -195,25 +195,25 @@ void layer_forward_self_one(
  * output norm and vocabulary projection. */
 static void output_hc_head_one(
         float             * out,
-        const ds4_model   * model,
-        const ds4_weights * weights,
+        const pulsar_model   * model,
+        const pulsar_weights * weights,
         const float       * inp_hc) {
-    const uint32_t n_hc = DS4_N_HC;
-    const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * n_hc;
+    const uint32_t n_hc = PULSAR_N_HC;
+    const uint64_t hc_dim = (uint64_t)PULSAR_N_EMBD * n_hc;
     float *flat = (float *)xmalloc((size_t)hc_dim * sizeof(flat[0]));
     float *pre = (float *)xmalloc((size_t)n_hc * sizeof(pre[0]));
     float *w = (float *)xmalloc((size_t)n_hc * sizeof(w[0]));
 
-    rms_norm_no_weight(flat, inp_hc, hc_dim, DS4_RMS_EPS);
+    rms_norm_no_weight(flat, inp_hc, hc_dim, PULSAR_RMS_EPS);
     matvec_f16(pre, model, weights->output_hc_fn, flat);
 
     const float *scale = (const float *)tensor_data(model, weights->output_hc_scale);
     const float *base = (const float *)tensor_data(model, weights->output_hc_base);
     for (uint32_t i = 0; i < n_hc; i++) {
-        w[i] = sigmoid_stable(pre[i] * scale[0] + base[i]) + DS4_HC_EPS;
+        w[i] = sigmoid_stable(pre[i] * scale[0] + base[i]) + PULSAR_HC_EPS;
     }
 
-    hc_weighted_sum_one(out, inp_hc, w, DS4_N_EMBD, n_hc);
+    hc_weighted_sum_one(out, inp_hc, w, PULSAR_N_EMBD, n_hc);
 
     free(w);
     free(pre);
@@ -225,14 +225,14 @@ static void output_hc_head_one(
 /* Final language-model head: HC collapse, RMSNorm, and Q8_0 vocab projection. */
 void output_logits_one(
         float             * logits,
-        const ds4_model   * model,
-        const ds4_weights * weights,
+        const pulsar_model   * model,
+        const pulsar_weights * weights,
         const float       * inp_hc) {
-    float *embd = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(embd[0]));
-    float *norm = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(norm[0]));
+    float *embd = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(embd[0]));
+    float *norm = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(norm[0]));
 
     output_hc_head_one(embd, model, weights, inp_hc);
-    rms_norm_weight(norm, embd, (const float *)tensor_data(model, weights->output_norm), DS4_N_EMBD, DS4_RMS_EPS);
+    rms_norm_weight(norm, embd, (const float *)tensor_data(model, weights->output_norm), PULSAR_N_EMBD, PULSAR_RMS_EPS);
 
     matvec_q8_0(logits, model, weights->output, norm);
 
