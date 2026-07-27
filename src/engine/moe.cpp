@@ -31,13 +31,13 @@ void layer_shared_ffn_one(
         const ds4_model   * model,
         const ds4_layer_weights * layer,
         const float       * x) {
-    float *gate = xmalloc((size_t)DS4_N_FF_EXP * sizeof(gate[0]));
-    float *up = xmalloc((size_t)DS4_N_FF_EXP * sizeof(up[0]));
-    float *mid = xmalloc((size_t)DS4_N_FF_EXP * sizeof(mid[0]));
+    float *gate = (float *)xmalloc((size_t)DS4_N_FF_EXP * sizeof(gate[0]));
+    float *up = (float *)xmalloc((size_t)DS4_N_FF_EXP * sizeof(up[0]));
+    float *mid = (float *)xmalloc((size_t)DS4_N_FF_EXP * sizeof(mid[0]));
     const uint64_t in_dim = layer->ffn_gate_shexp->dim[0];
     const uint64_t blocks = (in_dim + 31) / 32;
-    int8_t *xq = xmalloc((size_t)blocks * 32);
-    float *xscale = xmalloc((size_t)blocks * sizeof(xscale[0]));
+    int8_t *xq = (int8_t *)xmalloc((size_t)blocks * 32);
+    float *xscale = (float *)xmalloc((size_t)blocks * sizeof(xscale[0]));
 
     if (layer->ffn_up_shexp->type != 8 ||
         layer->ffn_gate_shexp->type != 8 ||
@@ -66,7 +66,7 @@ void layer_shared_ffn_one(
 
 
 static void swiglu_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
-    swiglu_batch_ctx *ctx = vctx;
+    swiglu_batch_ctx *ctx = static_cast<swiglu_batch_ctx *>(vctx);
     for (uint64_t t = t0; t < t1; t++) {
         swiglu(ctx->mid + t * ctx->n,
                ctx->gate + t * ctx->n,
@@ -96,9 +96,9 @@ static void layer_shared_ffn_batch(
         ds4_die("shared expert tensors do not share the expected Q8_0 layout");
     }
 
-    float *gate = xmalloc((size_t)n_tok * hidden * sizeof(gate[0]));
-    float *up = xmalloc((size_t)n_tok * hidden * sizeof(up[0]));
-    float *mid = xmalloc((size_t)n_tok * hidden * sizeof(mid[0]));
+    float *gate = (float *)xmalloc((size_t)n_tok * hidden * sizeof(gate[0]));
+    float *up = (float *)xmalloc((size_t)n_tok * hidden * sizeof(up[0]));
+    float *mid = (float *)xmalloc((size_t)n_tok * hidden * sizeof(mid[0]));
 
     matmul_q8_0_pair_batch(gate, up, model,
                            layer->ffn_gate_shexp,
@@ -139,7 +139,7 @@ void layer_hash_selected_experts(
         ds4_die("token id is outside the hash routing table");
     }
 
-    const int32_t *table = tensor_data(model, t);
+    const int32_t *table = (const int32_t *)tensor_data(model, t);
     const int32_t *row = table + (uint64_t)token * DS4_N_EXPERT_USED;
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) selected[i] = row[i];
 }
@@ -248,7 +248,7 @@ void layer_topk_selected_experts_from_probs(
     memcpy(selection, probs, sizeof(selection));
 
     if (layer->ffn_exp_probs_b) {
-        const float *bias = tensor_data(model, layer->ffn_exp_probs_b);
+        const float *bias = (const float *)tensor_data(model, layer->ffn_exp_probs_b);
         for (uint32_t i = 0; i < DS4_N_EXPERT; i++) selection[i] += bias[i];
     }
 
@@ -284,17 +284,17 @@ static void layer_routed_moe_one(
         bool                trace) {
     int selected[DS4_MAX_EXPERT_USED];
     float expert_weight[DS4_MAX_EXPERT_USED];
-    float *gate = trace ? xmalloc((size_t)DS4_N_FF_EXP * sizeof(gate[0])) : NULL;
-    float *up = trace ? xmalloc((size_t)DS4_N_FF_EXP * sizeof(up[0])) : NULL;
-    float *mid = trace ? xmalloc((size_t)DS4_N_FF_EXP * sizeof(mid[0])) : NULL;
-    float *mid_all = trace ? NULL : xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(mid_all[0]));
-    float *down = trace ? xmalloc((size_t)DS4_N_EMBD * sizeof(down[0])) : NULL;
+    float *gate = trace ? (float *)xmalloc((size_t)DS4_N_FF_EXP * sizeof(gate[0])) : NULL;
+    float *up = trace ? (float *)xmalloc((size_t)DS4_N_FF_EXP * sizeof(up[0])) : NULL;
+    float *mid = trace ? (float *)xmalloc((size_t)DS4_N_FF_EXP * sizeof(mid[0])) : NULL;
+    float *mid_all = trace ? NULL : (float *)xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(mid_all[0]));
+    float *down = trace ? (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(down[0])) : NULL;
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
     if (expert_in_dim % QK_K != 0) ds4_die("routed expert input is not QK_K aligned");
     if (down_in_dim != DS4_N_FF_EXP || down_in_dim % QK_K != 0) ds4_die("routed expert down input has an unexpected layout");
-    block_q8_K *xq = xmalloc((size_t)(expert_in_dim / QK_K) * sizeof(xq[0]));
-    block_q8_K *midq = trace ? NULL : xmalloc((size_t)DS4_N_EXPERT_USED * (down_in_dim / QK_K) * sizeof(midq[0]));
+    block_q8_K *xq = (block_q8_K *)xmalloc((size_t)(expert_in_dim / QK_K) * sizeof(xq[0]));
+    block_q8_K *midq = trace ? NULL : (block_q8_K *)xmalloc((size_t)DS4_N_EXPERT_USED * (down_in_dim / QK_K) * sizeof(midq[0]));
 
     memset(out, 0, (size_t)DS4_N_EMBD * sizeof(out[0]));
     ds4_quantize_row_q8_K(x, xq, (int64_t)expert_in_dim);
@@ -450,12 +450,12 @@ static void layer_routed_moe_batch(
     uint32_t active_expert[DS4_MAX_EXPERT];
     uint32_t n_active = 0;
 
-    int *selected = xmalloc((size_t)total_pairs * sizeof(selected[0]));
-    float *pair_weight = xmalloc((size_t)total_pairs * sizeof(pair_weight[0]));
-    ds4_expert_pair *pairs = xmalloc((size_t)total_pairs * sizeof(pairs[0]));
+    int *selected = (int *)xmalloc((size_t)total_pairs * sizeof(selected[0]));
+    float *pair_weight = (float *)xmalloc((size_t)total_pairs * sizeof(pair_weight[0]));
+    ds4_expert_pair *pairs = (ds4_expert_pair *)xmalloc((size_t)total_pairs * sizeof(pairs[0]));
 
     const uint64_t xq_blocks = expert_in_dim / QK_K;
-    block_q8_K *xq = xmalloc((size_t)n_tok * xq_blocks * sizeof(xq[0]));
+    block_q8_K *xq = (block_q8_K *)xmalloc((size_t)n_tok * xq_blocks * sizeof(xq[0]));
     for (uint32_t t = 0; t < n_tok; t++) {
         ds4_quantize_row_q8_K(norm + (uint64_t)t * expert_in_dim,
                               xq + (uint64_t)t * xq_blocks,
@@ -486,13 +486,13 @@ static void layer_routed_moe_batch(
         if (counts[e + 1] != counts[e]) active_expert[n_active++] = e;
     }
 
-    uint32_t *pair_ids = xmalloc((size_t)total_pairs * sizeof(pair_ids[0]));
+    uint32_t *pair_ids = (uint32_t *)xmalloc((size_t)total_pairs * sizeof(pair_ids[0]));
     for (uint32_t p = 0; p < total_pairs; p++) {
         const uint32_t e = (uint32_t)selected[p];
         pair_ids[cursor[e]++] = p;
     }
 
-    float *mid = xmalloc((size_t)total_pairs * expert_out_dim * sizeof(mid[0]));
+    float *mid = (float *)xmalloc((size_t)total_pairs * expert_out_dim * sizeof(mid[0]));
 
     const uint32_t gate_type = layer->ffn_gate_exps->type;
 
@@ -500,6 +500,8 @@ static void layer_routed_moe_batch(
     if (gate_type == DS4_TENSOR_IQ2_XXS) {
         matvec_iq2_xxs_batch_mid_ctx mid_ctx = {
             .mid = mid,
+            .gate_base = {},   /* filled per active expert below */
+            .up_base = {},
             .xq = xq,
             .pairs = pairs,
             .pair_ids = pair_ids,
@@ -509,6 +511,8 @@ static void layer_routed_moe_batch(
             .clamp = clamp,
             .in_dim = expert_in_dim,
             .out_dim = expert_out_dim,
+            .gate_row_bytes = {},   /* filled per active expert below */
+            .up_row_bytes = {},
             .xq_blocks = xq_blocks,
         };
 
@@ -532,7 +536,7 @@ static void layer_routed_moe_batch(
     }
 
     const uint64_t midq_blocks = down_in_dim / QK_K;
-    block_q8_K *midq = xmalloc((size_t)total_pairs * midq_blocks * sizeof(midq[0]));
+    block_q8_K *midq = (block_q8_K *)xmalloc((size_t)total_pairs * midq_blocks * sizeof(midq[0]));
     quantize_mid_pairs_ctx quant_ctx = {
         .mid = mid,
         .midq = midq,
@@ -548,6 +552,7 @@ static void layer_routed_moe_batch(
     if (down_type == DS4_TENSOR_Q2_K) {
         matvec_q2_k_batch_accum_rows_ctx down_ctx = {
             .moe = moe,
+            .base = {},   /* filled per active expert below */
             .midq = midq,
             .pairs = pairs,
             .pair_ids = pair_ids,
@@ -557,6 +562,7 @@ static void layer_routed_moe_batch(
             .n_tok = n_tok,
             .in_dim = down_in_dim,
             .out_dim = down_out_dim,
+            .row_bytes = {},   /* filled per active expert below */
             .midq_blocks = midq_blocks,
         };
 
@@ -612,11 +618,11 @@ void layer_ffn_one(
     double t_routed = 0.0;
     double t_shared = 0.0;
     double t_post = 0.0;
-    float *ffn_cur = xmalloc((size_t)DS4_N_EMBD * sizeof(ffn_cur[0]));
-    float *norm = xmalloc((size_t)DS4_N_EMBD * sizeof(norm[0]));
-    float *moe = xmalloc((size_t)DS4_N_EMBD * sizeof(moe[0]));
-    float *shared = xmalloc((size_t)DS4_N_EMBD * sizeof(shared[0]));
-    float *ffn_out = xmalloc((size_t)DS4_N_EMBD * sizeof(ffn_out[0]));
+    float *ffn_cur = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(ffn_cur[0]));
+    float *norm = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(norm[0]));
+    float *moe = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(moe[0]));
+    float *shared = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(shared[0]));
+    float *ffn_out = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(ffn_out[0]));
     float post[4];
     float comb[16];
 
@@ -634,7 +640,7 @@ void layer_ffn_one(
     }
 
     t0 = profile ? now_sec() : 0.0;
-    const float *ffn_norm = tensor_data(model, layer->ffn_norm);
+    const float *ffn_norm = (const float *)tensor_data(model, layer->ffn_norm);
     rms_norm_weight(norm, ffn_cur, ffn_norm, DS4_N_EMBD, DS4_RMS_EPS);
     if (profile) t_norm = now_sec() - t0;
     if (trace) {
@@ -717,13 +723,13 @@ void layer_ffn_batch(
     if (n_tok == 0) return;
     const uint32_t n_hc = DS4_N_HC;
     const uint64_t hc_dim = (uint64_t)n_hc * DS4_N_EMBD;
-    float *ffn_cur = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(ffn_cur[0]));
-    float *norm = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(norm[0]));
-    float *moe = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(moe[0]));
-    float *shared = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(shared[0]));
-    float *post = xmalloc((size_t)n_tok * n_hc * sizeof(post[0]));
-    float *comb = xmalloc((size_t)n_tok * n_hc * n_hc * sizeof(comb[0]));
-    const float *ffn_norm = tensor_data(model, layer->ffn_norm);
+    float *ffn_cur = (float *)xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(ffn_cur[0]));
+    float *norm = (float *)xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(norm[0]));
+    float *moe = (float *)xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(moe[0]));
+    float *shared = (float *)xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(shared[0]));
+    float *post = (float *)xmalloc((size_t)n_tok * n_hc * sizeof(post[0]));
+    float *comb = (float *)xmalloc((size_t)n_tok * n_hc * n_hc * sizeof(comb[0]));
+    const float *ffn_norm = (const float *)tensor_data(model, layer->ffn_norm);
 
     for (uint32_t t = 0; t < n_tok; t++) {
         hc_pre_from_state_one(model,
@@ -745,7 +751,7 @@ void layer_ffn_batch(
     layer_shared_ffn_batch(shared, model, layer, norm, n_tok);
 
     if (cpu_directional_steering_enabled(steering_dirs, steering_scale)) {
-        float *ffn_out = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(ffn_out[0]));
+        float *ffn_out = (float *)xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(ffn_out[0]));
         for (uint64_t i = 0; i < (uint64_t)n_tok * DS4_N_EMBD; i++) {
             ffn_out[i] = moe[i] + shared[i];
         }
@@ -782,10 +788,10 @@ void layer_ffn_batch(
 
 
 static void routed_moe_tokens_worker(void *vctx, uint64_t t0, uint64_t t1) {
-    routed_moe_tokens_ctx *ctx = vctx;
-    float *routed_mid = xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(routed_mid[0]));
-    block_q8_K *routed_xq = xmalloc((size_t)(ctx->expert_in_dim / QK_K) * sizeof(routed_xq[0]));
-    block_q8_K *routed_midq = xmalloc((size_t)DS4_N_EXPERT_USED * (ctx->down_in_dim / QK_K) * sizeof(routed_midq[0]));
+    routed_moe_tokens_ctx *ctx = static_cast<routed_moe_tokens_ctx *>(vctx);
+    float *routed_mid = (float *)xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(routed_mid[0]));
+    block_q8_K *routed_xq = (block_q8_K *)xmalloc((size_t)(ctx->expert_in_dim / QK_K) * sizeof(routed_xq[0]));
+    block_q8_K *routed_midq = (block_q8_K *)xmalloc((size_t)DS4_N_EXPERT_USED * (ctx->down_in_dim / QK_K) * sizeof(routed_midq[0]));
 
     for (uint64_t t = t0; t < t1; t++) {
         layer_routed_moe_one_prealloc(ctx->moe + t * DS4_N_EMBD,
@@ -850,21 +856,21 @@ void layer_ffn_shared_batch(
     double t_shared = 0.0;
     double t_post = 0.0;
     const uint32_t n_hc = DS4_N_HC;
-    float *ffn_cur = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(ffn_cur[0]));
-    float *norm = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(norm[0]));
-    float *moe = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(moe[0]));
-    float *shared = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(shared[0]));
-    float *post = xmalloc((size_t)n_tok * n_hc * sizeof(post[0]));
-    float *comb = xmalloc((size_t)n_tok * n_hc * n_hc * sizeof(comb[0]));
+    float *ffn_cur = (float *)xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(ffn_cur[0]));
+    float *norm = (float *)xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(norm[0]));
+    float *moe = (float *)xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(moe[0]));
+    float *shared = (float *)xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(shared[0]));
+    float *post = (float *)xmalloc((size_t)n_tok * n_hc * sizeof(post[0]));
+    float *comb = (float *)xmalloc((size_t)n_tok * n_hc * n_hc * sizeof(comb[0]));
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
     static int no_routed_parallel_env = -1;
     const bool routed_token_parallel =
         !gpu_graph_env_flag("DS4_NO_ROUTED_TOKEN_PARALLEL", &no_routed_parallel_env) &&
         n_tok >= 64;
-    float *routed_mid = routed_token_parallel ? NULL : xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(routed_mid[0]));
-    block_q8_K *routed_xq = routed_token_parallel ? NULL : xmalloc((size_t)(expert_in_dim / QK_K) * sizeof(routed_xq[0]));
-    block_q8_K *routed_midq = routed_token_parallel ? NULL : xmalloc((size_t)DS4_N_EXPERT_USED * (down_in_dim / QK_K) * sizeof(routed_midq[0]));
+    float *routed_mid = routed_token_parallel ? NULL : (float *)xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(routed_mid[0]));
+    block_q8_K *routed_xq = routed_token_parallel ? NULL : (block_q8_K *)xmalloc((size_t)(expert_in_dim / QK_K) * sizeof(routed_xq[0]));
+    block_q8_K *routed_midq = routed_token_parallel ? NULL : (block_q8_K *)xmalloc((size_t)DS4_N_EXPERT_USED * (down_in_dim / QK_K) * sizeof(routed_midq[0]));
 
     double t0 = profile ? now_sec() : 0.0;
     hc_pre_norm_batch(model,
@@ -906,7 +912,7 @@ void layer_ffn_shared_batch(
 
     t0 = profile ? now_sec() : 0.0;
     if (cpu_directional_steering_enabled(steering_dirs, steering_scale)) {
-        float *ffn_out = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(ffn_out[0]));
+        float *ffn_out = (float *)xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(ffn_out[0]));
         for (uint64_t i = 0; i < (uint64_t)n_tok * DS4_N_EMBD; i++) {
             ffn_out[i] = moe[i] + shared[i];
         }
@@ -953,7 +959,7 @@ void layer_ffn_shared_batch(
 
 
 static void layer_ffn_tokens_worker(void *vctx, uint64_t t0, uint64_t t1) {
-    layer_ffn_tokens_ctx *ctx = vctx;
+    layer_ffn_tokens_ctx *ctx = static_cast<layer_ffn_tokens_ctx *>(vctx);
     for (uint64_t t = t0; t < t1; t++) {
         layer_ffn_one(ctx->out_hc + t * ctx->hc_dim,
                       ctx->model,

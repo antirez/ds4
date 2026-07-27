@@ -8,13 +8,13 @@ bool imatrix_collector_init(ds4_imatrix_collector *c, uint32_t cap_tokens, const
     c->dataset_path = dataset_path;
     const size_t gate_n = (size_t)DS4_N_LAYER * DS4_N_EXPERT * DS4_N_EMBD;
     const size_t down_n = (size_t)DS4_N_LAYER * DS4_N_EXPERT * DS4_N_FF_EXP;
-    c->gate_up_sum2 = xcalloc(gate_n, sizeof(c->gate_up_sum2[0]));
-    c->down_sum2 = xcalloc(down_n, sizeof(c->down_sum2[0]));
-    c->ffn_norm_buf = xmalloc((size_t)c->cap_tokens * DS4_N_EMBD * sizeof(c->ffn_norm_buf[0]));
-    c->routed_mid_buf = xmalloc((size_t)c->cap_tokens * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(c->routed_mid_buf[0]));
-    c->routed_mid_f16_buf = xmalloc((size_t)c->cap_tokens * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(c->routed_mid_f16_buf[0]));
-    c->selected_buf = xmalloc((size_t)c->cap_tokens * DS4_N_EXPERT_USED * sizeof(c->selected_buf[0]));
-    c->sq_tmp = xmalloc((size_t)DS4_N_EMBD * sizeof(c->sq_tmp[0]));
+    c->gate_up_sum2 = (float *)xcalloc(gate_n, sizeof(c->gate_up_sum2[0]));
+    c->down_sum2 = (float *)xcalloc(down_n, sizeof(c->down_sum2[0]));
+    c->ffn_norm_buf = (float *)xmalloc((size_t)c->cap_tokens * DS4_N_EMBD * sizeof(c->ffn_norm_buf[0]));
+    c->routed_mid_buf = (float *)xmalloc((size_t)c->cap_tokens * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(c->routed_mid_buf[0]));
+    c->routed_mid_f16_buf = (uint16_t *)xmalloc((size_t)c->cap_tokens * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(c->routed_mid_f16_buf[0]));
+    c->selected_buf = (int *)xmalloc((size_t)c->cap_tokens * DS4_N_EXPERT_USED * sizeof(c->selected_buf[0]));
+    c->sq_tmp = (float *)xmalloc((size_t)DS4_N_EMBD * sizeof(c->sq_tmp[0]));
     return c->gate_up_sum2 && c->down_sum2 && c->ffn_norm_buf &&
            c->routed_mid_buf && c->routed_mid_f16_buf && c->selected_buf && c->sq_tmp;
 }
@@ -125,7 +125,7 @@ static void imatrix_write_entry(
     imatrix_write_i32(fp, ncall);
     imatrix_write_i32(fp, nval);
 
-    float *tmp = xmalloc((size_t)n_col * sizeof(tmp[0]));
+    float *tmp = (float *)xmalloc((size_t)n_col * sizeof(tmp[0]));
     for (uint32_t e = 0; e < n_expert; e++) {
         const uint32_t count = counts[e];
         const float *src = sum2 + (size_t)e * n_col;
@@ -302,7 +302,7 @@ static void dspark_bulk_drain(ds4_gpu_graph *g, const token_vec *prompt,
     }
     if (!f) return;
     g_dspark_bulk_dump = f;
-    if (!host) host = xmalloc((size_t)g->prefill_cap * DS4_N_EMBD * sizeof(float));
+    if (!host) host = (float *)xmalloc((size_t)g->prefill_cap * DS4_N_EMBD * sizeof(float));
     uint32_t hdr[2] = { cap_n, start };
     fwrite(hdr, sizeof(uint32_t), 2, f);
     fwrite(prompt->v + start, sizeof(int32_t), cap_n, f);
@@ -923,8 +923,8 @@ bool gpu_graph_verify_suffix_tops(
      * verifies cannot leave the mirrors stale. */
     const bool mseq_diag = gpu_graph_decode_descr_enabled() >= 2;
     if (mseq_diag) {
-        int32_t *dpos = xmalloc((size_t)n_tokens * sizeof(int32_t));
-        int32_t *dseq = xmalloc((size_t)n_tokens * sizeof(int32_t));
+        int32_t *dpos = (int32_t *)xmalloc((size_t)n_tokens * sizeof(int32_t));
+        int32_t *dseq = (int32_t *)xmalloc((size_t)n_tokens * sizeof(int32_t));
         const int32_t bank = g->banks.n_banks ? (int32_t)g->banks.cur_bank : 0;
         for (uint32_t t = 0; t < n_tokens; t++) {
             dpos[t] = (int32_t)(start + t);

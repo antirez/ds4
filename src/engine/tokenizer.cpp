@@ -13,7 +13,7 @@ static uint64_t next_pow2(uint64_t n) {
 static void table_init(str_i32_table *t, uint64_t expected) {
     t->cap = next_pow2(expected * 2 + 16);
     t->used = 0;
-    t->entry = xcalloc((size_t)t->cap, sizeof(t->entry[0]));
+    t->entry = (str_i32_entry *)xcalloc((size_t)t->cap, sizeof(t->entry[0]));
 }
 
 
@@ -67,7 +67,7 @@ static bool table_get(const str_i32_table *t, const char *ptr, uint64_t len, int
 void token_vec_push(token_vec *tv, int token) {
     if (tv->len == tv->cap) {
         tv->cap = tv->cap ? tv->cap * 2 : 64;
-        tv->v = xrealloc(tv->v, (size_t)tv->cap * sizeof(tv->v[0]));
+        tv->v = (int *)xrealloc(tv->v, (size_t)tv->cap * sizeof(tv->v[0]));
     }
     tv->v[tv->len++] = token;
 }
@@ -186,7 +186,7 @@ static uint32_t gpt2_byte_to_codepoint(uint8_t b) {
 /* GPT-2 byte-level BPE first maps raw bytes to printable Unicode codepoints
  * so merges can operate on UTF-8 strings without losing byte identity. */
 static char *byte_encode(ds4_str in, uint64_t *out_len) {
-    char *out = xmalloc((size_t)in.len * 4 + 1);
+    char *out = (char *)xmalloc((size_t)in.len * 4 + 1);
     char *p = out;
 
     for (uint64_t i = 0; i < in.len; i++) {
@@ -211,7 +211,7 @@ static int utf8_len_from_first_byte(uint8_t c) {
 
 static owned_str owned_copy(const char *ptr, uint64_t len) {
     owned_str s;
-    s.ptr = xmalloc((size_t)len);
+    s.ptr = (char *)xmalloc((size_t)len);
     memcpy(s.ptr, ptr, (size_t)len);
     s.len = len;
     return s;
@@ -223,7 +223,7 @@ static owned_str owned_copy(const char *ptr, uint64_t len) {
 static int bpe_rank(const ds4_vocab *vocab, const owned_str *a, const owned_str *b) {
     uint64_t len = a->len + 1 + b->len;
     char stack[512];
-    char *buf = len <= sizeof(stack) ? stack : xmalloc((size_t)len);
+    char *buf = len <= sizeof(stack) ? stack : (char *)xmalloc((size_t)len);
 
     memcpy(buf, a->ptr, (size_t)a->len);
     buf[a->len] = ' ';
@@ -245,14 +245,14 @@ static void bpe_emit_piece(const ds4_vocab *vocab, ds4_str raw_piece, token_vec 
 
     int n_sym = 0;
     int cap_sym = 32;
-    owned_str *sym = xcalloc((size_t)cap_sym, sizeof(sym[0]));
+    owned_str *sym = (owned_str *)xcalloc((size_t)cap_sym, sizeof(sym[0]));
 
     for (uint64_t off = 0; off < encoded_len;) {
         int n = utf8_len_from_first_byte((uint8_t)encoded[off]);
         if (off + (uint64_t)n > encoded_len) n = 1;
         if (n_sym == cap_sym) {
             cap_sym *= 2;
-            sym = xrealloc(sym, (size_t)cap_sym * sizeof(sym[0]));
+            sym = (owned_str *)xrealloc(sym, (size_t)cap_sym * sizeof(sym[0]));
         }
         sym[n_sym++] = owned_copy(encoded + off, (uint64_t)n);
         off += (uint64_t)n;
@@ -274,7 +274,7 @@ static void bpe_emit_piece(const ds4_vocab *vocab, ds4_str raw_piece, token_vec 
 
         owned_str merged;
         merged.len = sym[best_i].len + sym[best_i + 1].len;
-        merged.ptr = xmalloc((size_t)merged.len);
+        merged.ptr = (char *)xmalloc((size_t)merged.len);
         memcpy(merged.ptr, sym[best_i].ptr, (size_t)sym[best_i].len);
         memcpy(merged.ptr + sym[best_i].len, sym[best_i + 1].ptr, (size_t)sym[best_i + 1].len);
 
@@ -538,7 +538,7 @@ void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     }
 
     vocab->n_vocab = (int)tokens.len;
-    vocab->token = xcalloc((size_t)vocab->n_vocab, sizeof(vocab->token[0]));
+    vocab->token = (ds4_str *)xcalloc((size_t)vocab->n_vocab, sizeof(vocab->token[0]));
     table_init(&vocab->token_to_id, tokens.len);
 
     ds4_cursor c = cursor_at(model, tokens.data_pos);
@@ -638,7 +638,7 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
 
 static void tokenize_span(const ds4_vocab *vocab, const char *p, size_t n, token_vec *out) {
     if (!n) return;
-    char *tmp = xmalloc(n + 1);
+    char *tmp = (char *)xmalloc(n + 1);
     memcpy(tmp, p, n);
     tmp[n] = '\0';
     bpe_tokenize_text(vocab, tmp, out);
@@ -846,13 +846,13 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
     ds4_vocab *vocab = &e->vocab;
     if (token < 0 || token >= vocab->n_vocab) {
         if (len) *len = 0;
-        char *out = xmalloc(1);
+        char *out = (char *)xmalloc(1);
         out[0] = '\0';
         return out;
     }
 
     ds4_str s = vocab->token[token];
-    char *out = xmalloc((size_t)s.len + 1);
+    char *out = (char *)xmalloc((size_t)s.len + 1);
     if (vocab_token_is_literal_special(s)) {
         memcpy(out, s.ptr, (size_t)s.len);
         out[s.len] = '\0';
@@ -1072,10 +1072,10 @@ static void sample_radix_sort_desc(uint64_t *a, uint64_t *tmp, uint32_t n) {
 static void sample_scratch_reserve(ds4_sample_scratch *s, uint32_t cap) {
     if (s->cap >= cap) return;
     ds4_sample_scratch_free(s);
-    s->cand = xmalloc((size_t)cap * sizeof(*s->cand));
-    s->keys = xmalloc((size_t)cap * sizeof(*s->keys));
-    s->tmp = xmalloc((size_t)cap * sizeof(*s->tmp));
-    s->cand2 = xmalloc((size_t)cap * sizeof(*s->cand2));
+    s->cand = (sample_candidate *)xmalloc((size_t)cap * sizeof(*s->cand));
+    s->keys = (uint64_t *)xmalloc((size_t)cap * sizeof(*s->keys));
+    s->tmp = (uint64_t *)xmalloc((size_t)cap * sizeof(*s->tmp));
+    s->cand2 = (sample_candidate *)xmalloc((size_t)cap * sizeof(*s->cand2));
     s->cap = cap;
 }
 
@@ -1099,7 +1099,7 @@ void ds4_sample_scratch_free(ds4_sample_scratch *s) {
 static void sample_qmap_reserve(ds4_sample_scratch *s, uint32_t cap) {
     if (s->qmap_cap >= cap) return;
     free(s->qmap);
-    s->qmap = xcalloc((size_t)cap, sizeof(*s->qmap));
+    s->qmap = (float *)xcalloc((size_t)cap, sizeof(*s->qmap));
     s->qmap_cap = cap;
 }
 
@@ -1169,9 +1169,9 @@ static int sample_full_vocab(
      * tens-of-candidates sort at the default min_p. The cutoff loop below is
      * unchanged and trims the boundary byte-exactly, so this path's output
      * (token and rng stream) is bit-identical to the unfiltered build. */
-    sample_candidate *cand = xmalloc((size_t)finite * sizeof(cand[0]));
-    uint64_t *keys = xmalloc((size_t)finite * sizeof(keys[0]));
-    uint64_t *tmp = xmalloc((size_t)finite * sizeof(tmp[0]));
+    sample_candidate *cand = (sample_candidate *)xmalloc((size_t)finite * sizeof(cand[0]));
+    uint64_t *keys = (uint64_t *)xmalloc((size_t)finite * sizeof(keys[0]));
+    uint64_t *tmp = (uint64_t *)xmalloc((size_t)finite * sizeof(tmp[0]));
     uint32_t n = 0;
     float sum = 0.0f;
     const float prefilter = min_p > SAMPLE_MINP_PREFILTER_MIN
@@ -1197,7 +1197,7 @@ static int sample_full_vocab(
      * requires. Stable over an ascending fill => ties keep ascending vocab id,
      * matching the qsort this replaces. */
     sample_radix_sort_desc(keys, tmp, n);
-    sample_candidate *sorted = xmalloc((size_t)n * sizeof(sorted[0]));
+    sample_candidate *sorted = (sample_candidate *)xmalloc((size_t)n * sizeof(sorted[0]));
     for (uint32_t i = 0; i < n; i++) sorted[i] = cand[(uint32_t)keys[i]];
     free(cand);
     free(keys);
@@ -1282,8 +1282,8 @@ int ds4_sample_dist_build(const float *logits, uint32_t n_vocab,
                           ds4_sample_scratch *scratch, ds4_sample_dist *out) {
     memset(out, 0, sizeof(*out));
     if (temperature <= 0.0f) {
-        out->ids = xmalloc(sizeof(int));
-        out->probs = xmalloc(sizeof(float));
+        out->ids = (int *)xmalloc(sizeof(int));
+        out->probs = (float *)xmalloc(sizeof(float));
         out->ids[0] = sample_argmax(logits, n_vocab);
         out->probs[0] = 1.0f;
         out->n = 1;
@@ -1408,8 +1408,8 @@ int ds4_sample_dist_build(const float *logits, uint32_t n_vocab,
         }
     }
     if (n == 0) {
-        out->ids = xmalloc(sizeof(int));
-        out->probs = xmalloc(sizeof(float));
+        out->ids = (int *)xmalloc(sizeof(int));
+        out->probs = (float *)xmalloc(sizeof(float));
         out->ids[0] = sample_argmax(logits, n_vocab);
         out->probs[0] = 1.0f;
         out->n = 1;
@@ -1424,8 +1424,8 @@ int ds4_sample_dist_build(const float *logits, uint32_t n_vocab,
         }
     }
     if (sum <= 0.0f || !isfinite(sum)) {
-        out->ids = xmalloc(sizeof(int));
-        out->probs = xmalloc(sizeof(float));
+        out->ids = (int *)xmalloc(sizeof(int));
+        out->probs = (float *)xmalloc(sizeof(float));
         out->ids[0] = SC_ID(0);
         out->probs[0] = 1.0f;
         out->n = 1;
@@ -1443,8 +1443,8 @@ int ds4_sample_dist_build(const float *logits, uint32_t n_vocab,
         if (filtered_sum / sum >= top_p) break;
     }
     if (filtered == 0) filtered = 1;
-    out->ids = xmalloc((size_t)filtered * sizeof(int));
-    out->probs = xmalloc((size_t)filtered * sizeof(float));
+    out->ids = (int *)xmalloc((size_t)filtered * sizeof(int));
+    out->probs = (float *)xmalloc((size_t)filtered * sizeof(float));
     out->n = filtered;
     for (uint32_t i = 0; i < filtered; i++) {
         out->ids[i] = SC_ID(i);
@@ -1747,7 +1747,7 @@ int generate_gpu_graph_raw_swa(
     const bool memory_report = getenv("DS4_CUDA_MEMORY_REPORT") != NULL;
     if (memory_report) ds4_gpu_print_memory_report("after graph alloc");
 
-    float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
+    float *logits = (float *)xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
     const bool trace_top = getenv("DS4_TRACE_TOP") != NULL;
     const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
 
