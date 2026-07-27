@@ -5,6 +5,16 @@ DEBUG_FLAGS ?= -g
 CFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 
+# C++ port (pulsar): host TUs migrate .c -> .cpp one at a time. The FP and
+# optimization flags MUST stay identical to CFLAGS so a ported TU generates
+# the same math as its C predecessor (the per-TU bit-exact gate depends on
+# it). -fno-exceptions/-fno-rtti is the project style: hot paths never throw,
+# fatal errors keep the ds4_die() contract.
+CXX ?= g++
+CXXFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c++23
+CXXFLAGS += -D_GNU_SOURCE -fno-finite-math-only -fno-exceptions -fno-rtti
+CXXFLAGS += -DDS4_VERSION_STR='"$(DS4_VERSION_STR)"'
+
 # Version string reported by /version, /health and the startup banner. Derived
 # from git so it never goes stale (e.g. "v0.2.3-8-gec51fb2", "-dirty" if the
 # tree has uncommitted changes); falls back to "unknown" outside a git checkout.
@@ -38,12 +48,12 @@ CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$
 
 DS4_INC = -Isrc -Isrc/lib -Isrc/vendor
 
-ENGINE_SRCS = $(wildcard src/engine/*.c)
-ENGINE_OBJS = $(ENGINE_SRCS:.c=.o)
-AGENT_SRCS = $(wildcard src/agent/*.c)
-AGENT_OBJS = $(AGENT_SRCS:.c=.o)
-SERVER_SRCS = $(wildcard src/server/*.c)
-SERVER_OBJS = $(SERVER_SRCS:.c=.o)
+ENGINE_SRCS = $(wildcard src/engine/*.c) $(wildcard src/engine/*.cpp)
+ENGINE_OBJS = $(patsubst %.cpp,%.o,$(patsubst %.c,%.o,$(ENGINE_SRCS)))
+AGENT_SRCS = $(wildcard src/agent/*.c) $(wildcard src/agent/*.cpp)
+AGENT_OBJS = $(patsubst %.cpp,%.o,$(patsubst %.c,%.o,$(AGENT_SRCS)))
+SERVER_SRCS = $(wildcard src/server/*.c) $(wildcard src/server/*.cpp)
+SERVER_OBJS = $(patsubst %.cpp,%.o,$(patsubst %.c,%.o,$(SERVER_SRCS)))
 # CUTLASS TUs need the CUTLASS include path + c++17; they build via dedicated rules below,
 # so keep them out of the generic src/cuda/%.o rule.
 CUTLASS_CUDA_OBJS = src/cuda/ds4_mxfp4_cutlass.o
@@ -261,6 +271,22 @@ cuda-spec-sampling-gate: tests/spec_sampling_gate
 
 src/engine/%.o: src/engine/%.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
 	$(CC) $(CFLAGS) $(DS4_INC) -c -o $@ $<
+
+# Ported C++ TUs (pulsar). One rule per source dir, mirroring the .c rules.
+src/engine/%.o: src/engine/%.cpp src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+	$(CXX) $(CXXFLAGS) $(DS4_INC) -c -o $@ $<
+
+src/server/%.o: src/server/%.cpp src/server/ds4_server_internal.h src/ds4.h $(LIB_HDRS) src/vendor/rax.h
+	$(CXX) $(CXXFLAGS) $(DS4_INC) -c -o $@ $<
+
+src/agent/%.o: src/agent/%.cpp src/agent/ds4_agent_internal.h src/ds4.h $(LIB_HDRS) src/vendor/linenoise.h
+	$(CXX) $(CXXFLAGS) $(DS4_INC) -c -o $@ $<
+
+src/cli/%.o: src/cli/%.cpp src/ds4.h src/lib/ds4_help.h src/vendor/linenoise.h
+	$(CXX) $(CXXFLAGS) $(DS4_INC) -c -o $@ $<
+
+src/lib/%.o: src/lib/%.cpp src/ds4.h $(LIB_HDRS)
+	$(CXX) $(CXXFLAGS) $(DS4_INC) -c -o $@ $<
 
 src/agent/%.o: src/agent/%.c src/agent/ds4_agent_internal.h src/ds4.h $(LIB_HDRS) src/vendor/linenoise.h
 	$(CC) $(CFLAGS) $(DS4_INC) -c -o $@ $<

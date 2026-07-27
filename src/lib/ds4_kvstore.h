@@ -8,6 +8,10 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define DS4_KVSTORE_FIXED_HEADER 48u
 #define DS4_KVSTORE_DEFAULT_MB 4096
 #define DS4_KVSTORE_HIT_HALF_LIFE_SECONDS (6ull * 60ull * 60ull)
@@ -214,5 +218,9 @@ char *ds4_kvstore_path_join(const char *dir, const char *name);
 char *ds4_kvstore_path_for_sha(ds4_kvstore *kc, const char sha[41]);
 void ds4_kvstore_le_put32(uint8_t *p, uint32_t v);
 uint32_t ds4_kvstore_le_get32(const uint8_t *p);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -3,6 +3,10 @@
 
 #include <stdio.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef enum {
     DS4_HELP_DS4,
     DS4_HELP_SERVER,
@@ -12,5 +16,9 @@ typedef enum {
 } ds4_help_tool;
 
 void ds4_help_print(FILE *fp, ds4_help_tool tool, const char *topic);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

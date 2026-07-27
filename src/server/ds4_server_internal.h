@@ -44,6 +44,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Build-time version string (Makefile passes -DDS4_VERSION_STR from
  * `git describe`); fall back to "unknown" for non-Makefile/ad-hoc builds. */
 #ifndef DS4_VERSION_STR
@@ -239,7 +243,7 @@ typedef struct {
 typedef struct {
     char *name;
     char *wire_name;
-    char *namespace;
+    char *tool_namespace;
     /* Distinguish the Responses hosted tool from a normal function that
      * happens to be named "tool_search". */
     bool responses_tool_search;
@@ -1609,5 +1613,9 @@ void set_client_socket_nonblocking(int fd);
 void usage(FILE *fp, const char *topic);
 
 /* ---- shared inline helpers ---- */
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* DS4_SERVER_INTERNAL_H */

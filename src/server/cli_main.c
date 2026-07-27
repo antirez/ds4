@@ -1444,7 +1444,7 @@ static void test_responses_namespace_tool_schemas_restore_wire_namespace(void) {
     const tool_schema_order *order =
         tool_schema_orders_find(&orders, "mcp__perplexity__perplexity_search");
     TEST_ASSERT(order != NULL);
-    TEST_ASSERT(order && order->namespace && !strcmp(order->namespace, "mcp__perplexity__"));
+    TEST_ASSERT(order && order->tool_namespace && !strcmp(order->tool_namespace, "mcp__perplexity__"));
     TEST_ASSERT(order && order->wire_name && !strcmp(order->wire_name, "perplexity_search"));
     TEST_ASSERT(order && order->len == 2);
 
@@ -1498,7 +1498,7 @@ static void test_responses_input_tool_search_output_loads_tools(void) {
     const tool_schema_order *order =
         tool_schema_orders_find(&orders, "mcp__perplexity__perplexity_search");
     TEST_ASSERT(order != NULL);
-    TEST_ASSERT(order && order->namespace && !strcmp(order->namespace, "mcp__perplexity__"));
+    TEST_ASSERT(order && order->tool_namespace && !strcmp(order->tool_namespace, "mcp__perplexity__"));
     TEST_ASSERT(order && order->wire_name && !strcmp(order->wire_name, "perplexity_search"));
     TEST_ASSERT(msgs.len == 2);
     TEST_ASSERT(msgs.v[0].calls.len == 1);

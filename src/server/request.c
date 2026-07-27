@@ -169,7 +169,7 @@ void chat_msgs_push(chat_msgs *msgs, chat_msg msg) {
 static void tool_schema_order_free(tool_schema_order *o) {
     free(o->name);
     free(o->wire_name);
-    free(o->namespace);
+    free(o->tool_namespace);
     for (int i = 0; i < o->len; i++) free(o->prop[i]);
     free(o->prop);
     memset(o, 0, sizeof(*o));
@@ -987,7 +987,7 @@ static void tool_schema_orders_add_json_wire(tool_schema_orders *orders,
         json_ws(&p);
     }
     if (order.name) {
-        if (namespace && namespace[0]) order.namespace = xstrdup(namespace);
+        if (namespace && namespace[0]) order.tool_namespace = xstrdup(namespace);
         if (wire_name && wire_name[0]) order.wire_name = xstrdup(wire_name);
         order.responses_tool_search = responses_tool_search;
         tool_schema_orders_push(orders, order);

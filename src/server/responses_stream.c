@@ -365,9 +365,9 @@ void responses_append_function_call_item(buf *b, const tool_call *tc,
         item->fc_id, item_type, item_status);
     json_escape(b, order && order->wire_name ? order->wire_name :
                    (tc->name ? tc->name : ""));
-    if (order && order->namespace) {
+    if (order && order->tool_namespace) {
         buf_puts(b, ",\"namespace\":");
-        json_escape(b, order->namespace);
+        json_escape(b, order->tool_namespace);
     }
     buf_puts(b, ",\"call_id\":");
     json_escape(b, item->call_id);
@@ -442,9 +442,9 @@ static bool responses_sse_function_call_arguments_done(int fd, responses_stream 
         item->fc_id, item->output_index);
     json_escape(&b, order && order->wire_name ? order->wire_name :
                     (tc->name ? tc->name : ""));
-    if (order && order->namespace) {
+    if (order && order->tool_namespace) {
         buf_puts(&b, ",\"namespace\":");
-        json_escape(&b, order->namespace);
+        json_escape(&b, order->tool_namespace);
     }
     buf_puts(&b, ",\"arguments\":");
     buf_append(&b, args.ptr ? args.ptr : "\"\"", args.ptr ? args.len : 2);
