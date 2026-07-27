@@ -1246,6 +1246,45 @@ struct pulsar_engine {
     uint64_t spec_num_drafts;              /* draft rounds (verify steps w/ drafts) */
     uint64_t spec_gen_tokens;              /* tokens emitted by the spec loop */
     uint64_t spec_accepted_per_pos[16];    /* accepted count per draft position */
+
+    /* ---- methods (C++ port): 1:1 mirror of the pulsar_engine_* verb family.
+     * The public API in pulsar.h stays the free-function facade (defined in
+     * engine_api.cpp); engine internals call these members directly.  Members
+     * stay public and the struct stays trivially constructible: lifetime is
+     * managed exactly as before via open()/destroy() (xcalloc/free), NOT
+     * constructors/destructors.
+     * NOTE: pulsar_engine_dspark_draft_tokens stays a free function — a member
+     * would collide with the data member of the same name. */
+    static int open(pulsar_engine **out, const pulsar_engine_options *opt);
+    void destroy();                        /* was pulsar_engine_close */
+    void summary();
+    int vocab_size();
+    int logits_width() const;
+    const char *model_name();
+    int layer_count();
+    void spec_metrics(pulsar_spec_metrics *out);
+    uint32_t layer_compress_ratio(uint32_t layer);
+    uint64_t hidden_f32_values();
+    int model_id();
+    uint64_t session_cost_bytes(int ctx_size);
+    uint64_t session_cost_bytes_banked(int ctx_size, int n_banks);
+    uint64_t demand_paged_bytes_per_bank(int ctx_size);
+    uint64_t weights_resident_bytes();
+    int generate_argmax(const pulsar_tokens *prompt,
+                        int n_predict, int ctx_size,
+                        pulsar_token_emit_fn emit,
+                        pulsar_generation_done_fn done,
+                        void *emit_ud,
+                        pulsar_session_progress_fn progress,
+                        void *progress_ud);
+    int collect_imatrix(const char *dataset_path, const char *output_path,
+                        int ctx_size, int max_prompts, int max_tokens);
+    void dump_tokens(const pulsar_tokens *tokens);
+    int head_test(const pulsar_tokens *prompt);
+    int gpu_graph_test(const pulsar_tokens *prompt);
+    int routed_quant_bits();
+    bool has_output_head();
+    bool has_dspark();
 };
 
 typedef struct {
@@ -1520,6 +1559,78 @@ struct pulsar_session {
      * when the pool is disabled (single-session use never touches it). */
     pulsar_bank_carry *bank_carry;
     uint32_t bank_carry_n;
+
+    /* ---- methods (C++ port): 1:1 mirror of the pulsar_session_* verb family.
+     * The public API in pulsar.h stays the free-function facade (defined in
+     * engine_api.cpp); engine internals call these members directly.  Members
+     * stay public and the struct stays trivially constructible: lifetime is
+     * managed exactly as before via create()/destroy() (xcalloc/free), NOT
+     * constructors/destructors.
+     * NOTE: pulsar_session_prefill_cap and pulsar_session_resident_bytes stay
+     * free functions — members would collide with the same-named data members.
+     * pulsar_session_rewrite_requires_rebuild / _write_staged_payload /
+     * _payload_file_free / _snapshot_free do not take a session and stay free. */
+    static int create(pulsar_session **out, pulsar_engine *e, int ctx_size);
+    void destroy();                        /* was pulsar_session_free */
+    void set_progress(pulsar_session_progress_fn fn, void *ud);
+    void set_display_progress(pulsar_session_progress_fn fn, void *ud);
+    void set_cancel(pulsar_session_cancel_fn fn, void *ud);
+    void report_progress(const char *event, int current, int total);
+    void spec_metrics(pulsar_spec_metrics *out) const;
+    uint64_t touched_kv_bytes() const;
+    bool bank_free_physical(uint32_t bank);
+    bool bank_alloc_physical(uint32_t bank);
+    bool bank_is_evicted(uint32_t bank) const;
+    uint64_t bank_touched_kv_bytes(uint32_t bank);
+    int bank_kv_save(uint32_t bank, FILE *fp, char *err, size_t errlen);
+    int bank_kv_load(uint32_t bank, FILE *fp, char *err, size_t errlen);
+    uint64_t quantum_growth_bytes_per_bank(uint32_t q);
+    int bank_fork(uint32_t src, uint32_t dst, const int *tokens, int n_cached);
+    bool bank_fork_pinned(uint32_t bank) const;
+    int bank_fork_partial(uint32_t src, uint32_t dst, const int *tokens, int n_cached);
+    int sync(const pulsar_tokens *prompt, char *err, size_t errlen);
+    pulsar_session_rewrite_result rewrite_from_common(const pulsar_tokens *prompt, int common,
+                                                      char *err, size_t errlen);
+    int common_prefix(const pulsar_tokens *prompt);
+    int argmax();
+    int argmax_excluding(int excluded_id);
+    int sample(float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
+    int top_logprobs(pulsar_token_score *out, int k);
+    int token_logprob(int token, pulsar_token_score *out);
+    int copy_logits(float *out, int cap);
+    int set_logits(const float *logits, int n);
+    int eval(int token, char *err, size_t errlen);
+    int decode_multiseq(const pulsar_multiseq_req *reqs, uint32_t n,
+                        float *logits, int logits_cap, char *err, size_t errlen);
+    int decode_mixed(const pulsar_multiseq_req *reqs, uint32_t n_rows,
+                     float *logits, int logits_cap, uint32_t *out_n_rows,
+                     uint32_t max_head_runs, char *err, size_t errlen);
+    void bank_carry_free();
+    int bank_count();
+    int bank_repoint(uint32_t bank);
+    void bank_state_save(uint32_t bank);
+    bool bank_state_restore(uint32_t bank);
+    int bank_pos(uint32_t bank);
+    const pulsar_tokens *bank_tokens(uint32_t bank);
+    int bank_common_prefix(uint32_t bank, const pulsar_tokens *prompt);
+    void note_committed_tokens(const int *toks, int n);
+    int generate_speculative(float temperature, int top_k, float top_p, float min_p,
+                             uint64_t *rng, int max_tokens, int eos_token,
+                             int *accepted, int accepted_cap, char *err, size_t errlen);
+    int eval_speculative_block(int first_token, int max_tokens, int eos_token,
+                               int *accepted, int accepted_cap, char *err, size_t errlen);
+    void invalidate();
+    void rewind(int pos);
+    int pos();
+    int ctx();
+    uint32_t prefill_quantum_min_suffix() const;
+    const pulsar_tokens *tokens();
+    uint64_t payload_bytes();
+    int stage_payload(pulsar_session_payload_file *out, char *err, size_t errlen);
+    int save_payload(FILE *fp, char *err, size_t errlen);
+    int load_payload(FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
+    int save_snapshot(pulsar_session_snapshot *snap, char *err, size_t errlen);
+    int load_snapshot(const pulsar_session_snapshot *snap, char *err, size_t errlen);
 };
 
 typedef struct {
@@ -2169,7 +2280,8 @@ void gpu_graph_bank_counters_install(pulsar_gpu_graph *g, uint32_t bank);
  * returns false only on a bad bank id or OOM growing an owned buffer. */
 /* pulsar_session_bank_state_save/restore + pulsar_session_bank_count/repoint are the
  * public server-facing API (declared in pulsar.h). */
-void pulsar_session_bank_carry_free(pulsar_session *s);
+/* pulsar_session::bank_carry_free() is the member form of the old
+ * pulsar_session_bank_carry_free free function (internal-only, no facade). */
 /* Arm one banked multiseq batched step over n_rows packed rows: pos[t] is
  * row t's absolute position, seq[t] its TRUE bank id.  Writes the host
  * mirrors + device descriptor arrays (lazily allocated), verifies the

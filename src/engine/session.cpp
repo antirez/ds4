@@ -677,7 +677,8 @@ static int payload_read_raw_row(FILE *fp, pulsar_gpu_graph *g, uint32_t il, uint
 
 
 
-int pulsar_engine_routed_quant_bits(pulsar_engine *e) {
+int pulsar_engine::routed_quant_bits() {
+    auto *e = this;
     if (!e) return 0;
     /* Report the routed-expert precision tier actually present, derived from
      * the loaded tensor types (was hardcoded 2, which under-reported the mixed
@@ -709,7 +710,8 @@ int pulsar_engine_routed_quant_bits(pulsar_engine *e) {
 
 
 
-bool pulsar_engine_has_output_head(pulsar_engine *e) {
+bool pulsar_engine::has_output_head() {
+    auto *e = this;
     return e && weights_have_output_head(&e->weights);
 }
 
@@ -717,17 +719,19 @@ bool pulsar_engine_has_output_head(pulsar_engine *e) {
 
 
 
-bool pulsar_engine_has_dspark(pulsar_engine *e) {
+bool pulsar_engine::has_dspark() {
+    auto *e = this;
     return e && e->dspark_ready;
 }
 
 int pulsar_engine_dspark_draft_tokens(pulsar_engine *e) {
-    return pulsar_engine_has_dspark(e) ? e->dspark_draft_tokens : 0;
+    return e->has_dspark() ? e->dspark_draft_tokens : 0;
 }
 
 
 
-const pulsar_tokens *pulsar_session_tokens(pulsar_session *s) {
+const pulsar_tokens *pulsar_session::tokens() {
+    auto *s = this;
     return s ? &s->checkpoint : NULL;
 }
 
@@ -854,7 +858,8 @@ static bool spec_frontier_restore(pulsar_spec_frontier *f, pulsar_session *s) {
 
 
 
-uint64_t pulsar_session_payload_bytes(pulsar_session *s) {
+uint64_t pulsar_session::payload_bytes() {
+    auto *s = this;
     if (!s || !s->checkpoint_valid) return 0;
     const pulsar_gpu_graph *g = &s->graph;
     uint64_t bytes = (uint64_t)PULSAR_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
@@ -900,8 +905,9 @@ void pulsar_session_payload_file_free(pulsar_session_payload_file *payload) {
 
 
 
-int pulsar_session_stage_payload(pulsar_session *s, pulsar_session_payload_file *out,
+int pulsar_session::stage_payload(pulsar_session_payload_file *out,
                               char *err, size_t errlen) {
+    auto *s = this;
     if (!out) {
         payload_set_err(err, errlen, "invalid session payload staging request");
         return 1;
@@ -928,7 +934,7 @@ int pulsar_session_stage_payload(pulsar_session *s, pulsar_session_payload_file 
         return 1;
     }
 
-    int rc = pulsar_session_save_payload(s, fp, err, errlen);
+    int rc = s->save_payload(fp, err, errlen);
     if (rc == 0 && fflush(fp) != 0) {
         payload_set_err(err, errlen, "failed to flush staged session payload");
         rc = 1;
@@ -956,7 +962,8 @@ int pulsar_session_stage_payload(pulsar_session *s, pulsar_session_payload_file 
 
 
 
-int pulsar_session_save_payload(pulsar_session *s, FILE *fp, char *err, size_t errlen) {
+int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
+    auto *s = this;
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
@@ -1084,7 +1091,8 @@ int pulsar_session_save_payload(pulsar_session *s, FILE *fp, char *err, size_t e
 
 
 
-int pulsar_session_load_payload(pulsar_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
+int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
+    auto *s = this;
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
@@ -1309,12 +1317,13 @@ int pulsar_session_load_payload(pulsar_session *s, FILE *fp, uint64_t payload_by
 
 
 
-int pulsar_session_save_snapshot(pulsar_session *s, pulsar_session_snapshot *snap, char *err, size_t errlen) {
+int pulsar_session::save_snapshot(pulsar_session_snapshot *snap, char *err, size_t errlen) {
+    auto *s = this;
     if (!s || !snap) {
         payload_set_err(err, errlen, "invalid session snapshot save");
         return 1;
     }
-    const uint64_t bytes = pulsar_session_payload_bytes(s);
+    const uint64_t bytes = s->payload_bytes();
     if (bytes == 0) {
         payload_set_err(err, errlen, "session has no valid checkpoint to snapshot");
         return 1;
@@ -1338,7 +1347,7 @@ int pulsar_session_save_snapshot(pulsar_session *s, pulsar_session_snapshot *sna
         payload_set_err(err, errlen, "failed to open memory stream for session snapshot");
         return 1;
     }
-    const int rc = pulsar_session_save_payload(s, fp, err, errlen);
+    const int rc = s->save_payload(fp, err, errlen);
     if (fclose(fp) != 0 && rc == 0) {
         payload_set_err(err, errlen, "failed to finalize memory session snapshot");
         return 1;
@@ -1350,7 +1359,8 @@ int pulsar_session_save_snapshot(pulsar_session *s, pulsar_session_snapshot *sna
 
 
 
-int pulsar_session_load_snapshot(pulsar_session *s, const pulsar_session_snapshot *snap, char *err, size_t errlen) {
+int pulsar_session::load_snapshot(const pulsar_session_snapshot *snap, char *err, size_t errlen) {
+    auto *s = this;
     if (!s || !snap || !snap->ptr || snap->len == 0) {
         payload_set_err(err, errlen, "invalid session snapshot load");
         return 1;
@@ -1365,7 +1375,7 @@ int pulsar_session_load_snapshot(pulsar_session *s, const pulsar_session_snapsho
         payload_set_err(err, errlen, "failed to open memory stream for session snapshot restore");
         return 1;
     }
-    const int rc = pulsar_session_load_payload(s, fp, snap->len, err, errlen);
+    const int rc = s->load_payload(fp, snap->len, err, errlen);
     if (fclose(fp) != 0 && rc == 0) {
         payload_set_err(err, errlen, "failed to close memory session snapshot");
         return 1;
@@ -1383,8 +1393,9 @@ void pulsar_session_snapshot_free(pulsar_session_snapshot *snap) {
 
 
 
-void pulsar_engine_dump_tokens(pulsar_engine *e, const pulsar_tokens *tokens) {
-    dump_tokens(&e->vocab, tokens);
+void pulsar_engine::dump_tokens(const pulsar_tokens *tokens) {
+    auto *e = this;
+    ::dump_tokens(&e->vocab, tokens);  /* global helper; the member name hides it */
 }
 
 
@@ -1455,12 +1466,12 @@ static char *imatrix_trim_block(char *p, char *end) {
 
 
 
-int pulsar_engine_collect_imatrix(pulsar_engine *e,
-                               const char *dataset_path,
+int pulsar_engine::collect_imatrix(const char *dataset_path,
                                const char *output_path,
                                int ctx_size,
                                int max_prompts,
                                int max_tokens) {
+    auto *e = this;
     if (!e || !dataset_path || !output_path) return 1;
     if (e->backend != PULSAR_BACKEND_CUDA || !e->gpu_ready) {
         fprintf(stderr, "pulsar: imatrix collection currently requires --cuda\n");
@@ -1594,9 +1605,7 @@ int pulsar_engine_collect_imatrix(pulsar_engine *e,
 
 
 
-int pulsar_engine_generate_argmax(
-        pulsar_engine        *e,
-        const pulsar_tokens  *prompt,
+int pulsar_engine::generate_argmax(const pulsar_tokens  *prompt,
         int                n_predict,
         int                ctx_size,
         pulsar_token_emit_fn  emit,
@@ -1604,6 +1613,7 @@ int pulsar_engine_generate_argmax(
         void              *emit_ud,
         pulsar_session_progress_fn progress,
         void              *progress_ud) {
+    auto *e = this;
     const pulsar_model *model = &e->model;
     const pulsar_vocab *vocab = &e->vocab;
     const pulsar_weights *weights = &e->weights;
@@ -1628,7 +1638,8 @@ int pulsar_engine_generate_argmax(
 
 
 
-int pulsar_engine_gpu_graph_test(pulsar_engine *e, const pulsar_tokens *prompt) {
+int pulsar_engine::gpu_graph_test(const pulsar_tokens *prompt) {
+    auto *e = this;
     if (!e->gpu_ready) {
         fprintf(stderr, "pulsar: %s graph test requested but backend is unavailable\n",
                 pulsar_backend_name(e->backend));
@@ -1639,7 +1650,8 @@ int pulsar_engine_gpu_graph_test(pulsar_engine *e, const pulsar_tokens *prompt) 
 
 
 
-int pulsar_engine_head_test(pulsar_engine *e, const pulsar_tokens *prompt) {
+int pulsar_engine::head_test(const pulsar_tokens *prompt) {
+    auto *e = this;
     if (!prompt || prompt->len <= 0) {
         fprintf(stderr, "pulsar: head test requires a non-empty prompt\n");
         return 1;
@@ -1741,7 +1753,7 @@ int pulsar_engine_head_test(pulsar_engine *e, const pulsar_tokens *prompt) {
 
 
 
-int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt) {
+int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
     pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
     e->model.fd = -1;
     e->dspark_model.fd = -1;
@@ -1788,7 +1800,7 @@ int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt) {
         const char *sep = strrchr(opt->expert_overlay, ':');
         if (!sep || sep == opt->expert_overlay || !sep[1]) {
             fprintf(stderr, "pulsar: --expert-overlay expects FILE:PREFIX (e.g. donor.gguf:blk.17.)\n");
-            pulsar_engine_close(e);
+            e->destroy();
             *out = NULL;
             return 1;
         }
@@ -1796,7 +1808,7 @@ int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt) {
         const size_t path_len = (size_t)(sep - opt->expert_overlay);
         if (path_len >= sizeof(overlay_path)) {
             fprintf(stderr, "pulsar: --expert-overlay path is too long\n");
-            pulsar_engine_close(e);
+            e->destroy();
             *out = NULL;
             return 1;
         }
@@ -1811,7 +1823,7 @@ int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt) {
         const size_t plist_len = strlen(sep + 1);
         if (plist_len >= sizeof(prefixes)) {
             fprintf(stderr, "pulsar: --expert-overlay prefix list is too long\n");
-            pulsar_engine_close(e);
+            e->destroy();
             *out = NULL;
             return 1;
         }
@@ -1822,7 +1834,7 @@ int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt) {
             if (n == 0) {
                 fprintf(stderr, "pulsar: --expert-overlay prefix '%s' matched no routed-expert tensors\n",
                         p);
-                pulsar_engine_close(e);
+                e->destroy();
                 *out = NULL;
                 return 1;
             }
@@ -1864,7 +1876,7 @@ int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt) {
         if (!e->gpu_ready) {
             fprintf(stderr, "pulsar: %s backend unavailable; aborting startup\n",
                     pulsar_backend_name(e->backend));
-            pulsar_engine_close(e);
+            e->destroy();
             *out = NULL;
             return 1;
         }
@@ -1881,7 +1893,7 @@ int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt) {
                     "pulsar: %s failed to map model views; aborting startup. "
                     "This is commonly caused by insufficient memory or accelerator VM budget.\n",
                     pulsar_backend_name(e->backend));
-            pulsar_engine_close(e);
+            e->destroy();
             *out = NULL;
             return 1;
         }
@@ -1896,7 +1908,7 @@ int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt) {
                     "pulsar: %s failed to map DSpark model views; aborting startup. "
                     "This is commonly caused by insufficient memory or accelerator VM budget.\n",
                     pulsar_backend_name(e->backend));
-            pulsar_engine_close(e);
+            e->destroy();
             *out = NULL;
             return 1;
         }
@@ -1906,7 +1918,7 @@ int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt) {
                                              e->dspark_ready ? NULL : "dspark.")) {
             fprintf(stderr, "pulsar: %s failed to prepare optional model cache\n",
                     pulsar_backend_name(e->backend));
-            pulsar_engine_close(e);
+            e->destroy();
             *out = NULL;
             return 1;
         }
@@ -1916,7 +1928,7 @@ int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt) {
                                                  NULL, NULL, 0, NULL)) {
                 fprintf(stderr, "pulsar: %s failed to prepare optional DSpark model cache\n",
                         pulsar_backend_name(e->backend));
-                pulsar_engine_close(e);
+                e->destroy();
                 *out = NULL;
                 return 1;
             }
@@ -1927,7 +1939,7 @@ int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt) {
                                                 &e->overlay_model)) {
             fprintf(stderr, "pulsar: %s failed to prepare expert-overlay spans\n",
                     pulsar_backend_name(e->backend));
-            pulsar_engine_close(e);
+            e->destroy();
             *out = NULL;
             return 1;
         }
@@ -1980,13 +1992,15 @@ int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt) {
 
 
 
-void pulsar_engine_summary(pulsar_engine *e) {
+void pulsar_engine::summary() {
+    auto *e = this;
     model_summary(&e->model);
 }
 
 
 
-int pulsar_engine_vocab_size(pulsar_engine *e) {
+int pulsar_engine::vocab_size() {
+    auto *e = this;
     return e ? e->vocab.n_vocab : 0;
 }
 
@@ -1997,18 +2011,21 @@ int pulsar_engine_vocab_size(pulsar_engine *e) {
  * pulsar_engine_vocab_size (the tokenizer table length): the loader never checks
  * the two against each other, and sizing a logits buffer from the tokenizer
  * length is exactly the mismatch that produced an unbounded-logits write. */
-int pulsar_engine_logits_width(const pulsar_engine *e) {
+int pulsar_engine::logits_width() const {
+    auto *e = this;
     return e ? (int)PULSAR_N_VOCAB : 0;
 }
 
 
 
-const char *pulsar_engine_model_name(pulsar_engine *e) {
+const char *pulsar_engine::model_name() {
+    auto *e = this;
     (void)e;
     return PULSAR_MODEL_SHAPE_NAME;
 }
 
-void pulsar_engine_spec_metrics(pulsar_engine *e, pulsar_spec_metrics *out) {
+void pulsar_engine::spec_metrics(pulsar_spec_metrics *out) {
+    auto *e = this;
     if (!out) return;
     memset(out, 0, sizeof(*out));
     if (!e) return;
@@ -2028,7 +2045,8 @@ void pulsar_engine_spec_metrics(pulsar_engine *e, pulsar_spec_metrics *out) {
  * can diff a snapshot across a single request for a per-response accept-rate.
  * accepted_per_pos is left zero (the per-position waterfall stays a /metrics,
  * cross-request concern). */
-void pulsar_session_spec_metrics(const pulsar_session *s, pulsar_spec_metrics *out) {
+void pulsar_session::spec_metrics(pulsar_spec_metrics *out) const {
+    auto *s = this;
     if (!out) return;
     memset(out, 0, sizeof(*out));
     if (!s) return;
@@ -2042,14 +2060,16 @@ void pulsar_session_spec_metrics(const pulsar_session *s, pulsar_spec_metrics *o
 
 
 
-int pulsar_engine_layer_count(pulsar_engine *e) {
+int pulsar_engine::layer_count() {
+    auto *e = this;
     (void)e;
     return (int)PULSAR_N_LAYER;
 }
 
 
 
-uint64_t pulsar_engine_weights_resident_bytes(pulsar_engine *e) {
+uint64_t pulsar_engine::weights_resident_bytes() {
+    auto *e = this;
     if (!e) return 0;
     /* The GGUF(s) are mmap'd read-only and shared across every session, so this
      * is a single resident copy competing with per-session KV for the unified
@@ -2064,7 +2084,8 @@ uint64_t pulsar_engine_weights_resident_bytes(pulsar_engine *e) {
 
 
 
-uint32_t pulsar_engine_layer_compress_ratio(pulsar_engine *e, uint32_t layer) {
+uint32_t pulsar_engine::layer_compress_ratio(uint32_t layer) {
+    auto *e = this;
     (void)e;
     if (layer >= PULSAR_N_LAYER) return 0;
     return pulsar_layer_compress_ratio(layer);
@@ -2072,21 +2093,24 @@ uint32_t pulsar_engine_layer_compress_ratio(pulsar_engine *e, uint32_t layer) {
 
 
 
-uint64_t pulsar_engine_hidden_f32_values(pulsar_engine *e) {
+uint64_t pulsar_engine::hidden_f32_values() {
+    auto *e = this;
     (void)e;
     return (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
 }
 
 
 
-int pulsar_engine_model_id(pulsar_engine *e) {
+int pulsar_engine::model_id() {
+    auto *e = this;
     (void)e;
     return (int)PULSAR_MODEL_VARIANT;
 }
 
 
 
-void pulsar_engine_close(pulsar_engine *e) {
+void pulsar_engine::destroy() {
+    auto *e = this;
     if (!e) return;
     weights_free(&e->weights);
     vocab_free(&e->vocab);
@@ -2105,7 +2129,7 @@ void pulsar_engine_close(pulsar_engine *e) {
 
 
 
-int pulsar_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size) {
+int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
     if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 1;
 
@@ -2170,7 +2194,8 @@ uint64_t pulsar_session_resident_bytes(const pulsar_session *s) {
  * parameters.  Built on the same sizing code as the allocator
  * (gpu_graph_session_bytes, gpu_diag.c); reconcile against
  * pulsar_session_resident_bytes after the create. */
-uint64_t pulsar_engine_session_cost_bytes(pulsar_engine *e, int ctx_size) {
+uint64_t pulsar_engine::session_cost_bytes(int ctx_size) {
+    auto *e = this;
     if (!e || ctx_size <= 0) return 0;
     if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
     const uint32_t prefill_cap = gpu_graph_prefill_cap_for_prompt(ctx_size,
@@ -2183,8 +2208,9 @@ uint64_t pulsar_engine_session_cost_bytes(pulsar_engine *e, int ctx_size) {
                                    e->dspark_ready);
 }
 
-uint64_t pulsar_engine_session_cost_bytes_banked(pulsar_engine *e, int ctx_size,
+uint64_t pulsar_engine::session_cost_bytes_banked(int ctx_size,
                                               int n_banks) {
+    auto *e = this;
     if (!e || ctx_size <= 0 || n_banks < 1) return 0;
     if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
     const uint32_t prefill_cap = gpu_graph_prefill_cap_for_prompt(ctx_size,
@@ -2197,13 +2223,15 @@ uint64_t pulsar_engine_session_cost_bytes_banked(pulsar_engine *e, int ctx_size,
                                           e->dspark_ready, (uint32_t)n_banks);
 }
 
-uint64_t pulsar_engine_demand_paged_bytes_per_bank(pulsar_engine *e, int ctx_size) {
+uint64_t pulsar_engine::demand_paged_bytes_per_bank(int ctx_size) {
+    auto *e = this;
     if (!e || ctx_size <= 0) return 0;
     if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
     return gpu_graph_demand_paged_bytes_per_bank((uint32_t)ctx_size);
 }
 
-uint64_t pulsar_session_touched_kv_bytes(const pulsar_session *s) {
+uint64_t pulsar_session::touched_kv_bytes() const {
+    auto *s = this;
     if (!s) return 0;
     return gpu_graph_touched_kv_bytes(&s->graph);
 }
@@ -2212,27 +2240,32 @@ uint64_t pulsar_session_touched_kv_bytes(const pulsar_session *s) {
  * (server guard) must have snapshotted the bank's KV to DISK before evict (host
  * RAM reclaims nothing on unified memory) and repointed away from it; and after
  * restore-alloc it reloads the KV H2D from that snapshot. */
-bool pulsar_session_bank_free_physical(pulsar_session *s, uint32_t bank) {
+bool pulsar_session::bank_free_physical(uint32_t bank) {
+    auto *s = this;
     if (!s) return false;
     return gpu_graph_bank_free_physical(&s->graph, bank);
 }
 
-bool pulsar_session_bank_alloc_physical(pulsar_session *s, uint32_t bank) {
+bool pulsar_session::bank_alloc_physical(uint32_t bank) {
+    auto *s = this;
     if (!s) return false;
     return gpu_graph_bank_alloc_physical(&s->graph, bank);
 }
 
-bool pulsar_session_bank_is_evicted(const pulsar_session *s, uint32_t bank) {
+bool pulsar_session::bank_is_evicted(uint32_t bank) const {
+    auto *s = this;
     if (!s) return false;
     return gpu_graph_bank_is_evicted(&s->graph, bank);
 }
 
-uint64_t pulsar_session_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank) {
+uint64_t pulsar_session::bank_touched_kv_bytes(uint32_t bank) {
+    auto *s = this;
     if (!s) return 0;
     return gpu_graph_bank_touched_kv_bytes(&s->graph, bank);
 }
 
-uint64_t pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, uint32_t q) {
+uint64_t pulsar_session::quantum_growth_bytes_per_bank(uint32_t q) {
+    auto *s = this;
     (void)s;
     return gpu_graph_quantum_growth_bytes_per_bank(q);
 }
@@ -2285,8 +2318,9 @@ static void bank_carry_copy(pulsar_bank_carry *d, const pulsar_bank_carry *sc) {
  * committed length (a shorter shared prefix is the partial case, increment C).
  * Pins src against the eviction guard for the duration of the clone. Returns 0 on
  * success, non-zero on refusal/failure (caller falls back to cold prefill). */
-int pulsar_session_bank_fork(pulsar_session *s, uint32_t src, uint32_t dst,
+int pulsar_session::bank_fork(uint32_t src, uint32_t dst,
                           const int *tokens, int n_cached) {
+    auto *s = this;
     if (!s || !tokens || n_cached < 0) return 1;
     pulsar_gpu_graph *g = &s->graph;
     if (g->banks.n_banks == 0 || src >= g->banks.n_banks ||
@@ -2313,7 +2347,7 @@ int pulsar_session_bank_fork(pulsar_session *s, uint32_t src, uint32_t dst,
     if (!gpu_graph_bank_fork_copy(g, src, dst)) { g->fork_pin[src] = 0u; return 1; }
     /* 6. Copy src host carry -> dst so dst owns src's conversation state. */
     if (!bank_carry_ensure(s)) { g->fork_pin[src] = 0u; return 1; }
-    if (src == cur) pulsar_session_bank_state_save(s, src);      /* refresh from live session */
+    if (src == cur) s->bank_state_save(src);      /* refresh from live session */
     if (src < s->bank_carry_n && dst < s->bank_carry_n) {
         bank_carry_copy(&s->bank_carry[dst], &s->bank_carry[src]);
     }
@@ -2352,7 +2386,8 @@ int pulsar_session_bank_fork(pulsar_session *s, uint32_t src, uint32_t dst,
     return 0;
 }
 
-bool pulsar_session_bank_fork_pinned(const pulsar_session *s, uint32_t bank) {
+bool pulsar_session::bank_fork_pinned(uint32_t bank) const {
+    auto *s = this;
     if (!s || bank >= gpu_graph_bank_pool_count(&s->graph)) return false;
     return s->graph.fork_pin[bank] != 0u;
 }
@@ -2369,8 +2404,9 @@ bool pulsar_session_bank_fork_pinned(const pulsar_session *s, uint32_t bank) {
  * the stash. src==dst is the in-place truncate-reuse degenerate (no copies).
  * Returns 0 on success; non-zero refusal (mismatch, unaligned/short cut, evicted
  * src, wrapped-out ring) -> caller cold-prefills. */
-int pulsar_session_bank_fork_partial(pulsar_session *s, uint32_t src, uint32_t dst,
+int pulsar_session::bank_fork_partial(uint32_t src, uint32_t dst,
                                   const int *tokens, int n_cached) {
+    auto *s = this;
     if (!s || !tokens || n_cached < 4) return 1;
     pulsar_gpu_graph *g = &s->graph;
     if (g->banks.n_banks == 0 || src >= g->banks.n_banks || dst >= g->banks.n_banks)
@@ -2398,7 +2434,7 @@ int pulsar_session_bank_fork_partial(pulsar_session *s, uint32_t src, uint32_t d
     g->fork_pin[src] = 1u;
     if (gpu_graph_bank_is_evicted(g, src)) { g->fork_pin[src] = 0u; return 1; }
     if (!bank_carry_ensure(s)) { g->fork_pin[src] = 0u; return 1; }
-    if (src == cur) pulsar_session_bank_state_save(s, src);
+    if (src == cur) s->bank_state_save(src);
     /* 3-4. Clone-with-cut (cut counters + boundary stash + keep threshold). */
     if (!gpu_graph_bank_fork_copy_cut(g, src, dst, R, (uint32_t)hist->len)) {
         g->fork_pin[src] = 0u;
@@ -2456,8 +2492,9 @@ int pulsar_session_bank_fork_partial(pulsar_session *s, uint32_t src, uint32_t d
 #define PULSAR_BANK_KV_MAGIC   0x4B564232u   /* "KVB2" */
 #define PULSAR_BANK_KV_VERSION 1u
 
-int pulsar_session_bank_kv_save(pulsar_session *s, uint32_t bank, FILE *fp,
+int pulsar_session::bank_kv_save(uint32_t bank, FILE *fp,
                              char *err, size_t errlen) {
+    auto *s = this;
     if (!s || !fp) { payload_set_err(err, errlen, "bank kv save: bad args"); return 1; }
     pulsar_gpu_graph *g = &s->graph;
     if (g->banks.n_banks == 0 || bank >= g->banks.n_banks) {
@@ -2506,8 +2543,9 @@ int pulsar_session_bank_kv_save(pulsar_session *s, uint32_t bank, FILE *fp,
  * table rebuild), reinstall the frontier counters, and H2D each layer's rows.
  * Leaves `bank` installed (cur). Host conversation state (checkpoint/pos) is the
  * caller's bank_carry, restored separately by pulsar_session_bank_state_restore. */
-int pulsar_session_bank_kv_load(pulsar_session *s, uint32_t bank, FILE *fp,
+int pulsar_session::bank_kv_load(uint32_t bank, FILE *fp,
                              char *err, size_t errlen) {
+    auto *s = this;
     if (!s || !fp) { payload_set_err(err, errlen, "bank kv load: bad args"); return 1; }
     pulsar_gpu_graph *g = &s->graph;
     if (g->banks.n_banks == 0 || bank >= g->banks.n_banks) {
@@ -2588,12 +2626,13 @@ int pulsar_session_bank_kv_load(pulsar_session *s, uint32_t bank, FILE *fp,
 
 
 
-void pulsar_session_free(pulsar_session *s) {
+void pulsar_session::destroy() {
+    auto *s = this;
     if (!s) return;
     gpu_graph_free(&s->graph);
     token_vec_free(&s->checkpoint);
     pulsar_sample_scratch_free(&s->sample_scratch);
-    pulsar_session_bank_carry_free(s);
+    s->bank_carry_free();
     free(s->dspark_pending_qrows);
     free(s->spec_row_scratch);
     free(s->logits);
@@ -2602,7 +2641,8 @@ void pulsar_session_free(pulsar_session *s) {
 
 
 
-void pulsar_session_set_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) {
+void pulsar_session::set_progress(pulsar_session_progress_fn fn, void *ud) {
+    auto *s = this;
     if (!s) return;
     s->progress = fn;
     s->progress_ud = ud;
@@ -2610,7 +2650,8 @@ void pulsar_session_set_progress(pulsar_session *s, pulsar_session_progress_fn f
 
 
 
-void pulsar_session_set_display_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) {
+void pulsar_session::set_display_progress(pulsar_session_progress_fn fn, void *ud) {
+    auto *s = this;
     if (!s) return;
     s->display_progress = fn;
     s->display_progress_ud = ud;
@@ -2618,7 +2659,8 @@ void pulsar_session_set_display_progress(pulsar_session *s, pulsar_session_progr
 
 
 
-void pulsar_session_set_cancel(pulsar_session *s, pulsar_session_cancel_fn fn, void *ud) {
+void pulsar_session::set_cancel(pulsar_session_cancel_fn fn, void *ud) {
+    auto *s = this;
     if (!s) return;
     s->cancel = fn;
     s->cancel_ud = ud;
@@ -2638,7 +2680,8 @@ static bool pulsar_session_cancelled_cb(void *ud) {
 
 
 
-void pulsar_session_report_progress(pulsar_session *s, const char *event, int current, int total) {
+void pulsar_session::report_progress(const char *event, int current, int total) {
+    auto *s = this;
     if (!s || !s->progress || !event) return;
     s->progress(s->progress_ud, event, current, total);
 }
@@ -2672,7 +2715,8 @@ static void pulsar_session_note_prefill_progress(void *ud, const char *event, in
  *
  * A non-matching prompt discards the checkpoint and prefills from token zero.
  */
-int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *err, size_t errlen) {
+int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) {
+    auto *s = this;
     if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
         snprintf(err, errlen, "prompt exceeds context");
         return 1;
@@ -2847,9 +2891,9 @@ bool pulsar_session_rewrite_requires_rebuild(int live_len, int canonical_len, in
  * rewrite point, any replacement behind the live end reports that a rebuild is
  * needed without mutating the session.  The server may still find an older disk KV
  * checkpoint before falling back to a full replay. */
-pulsar_session_rewrite_result pulsar_session_rewrite_from_common(
-        pulsar_session *s, const pulsar_tokens *prompt, int common,
+pulsar_session_rewrite_result pulsar_session::rewrite_from_common(const pulsar_tokens *prompt, int common,
         char *err, size_t errlen) {
+    auto *s = this;
     if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
         snprintf(err, errlen, "prompt exceeds context");
         return PULSAR_SESSION_REWRITE_ERROR;
@@ -2870,7 +2914,7 @@ pulsar_session_rewrite_result pulsar_session_rewrite_from_common(
     }
 
     if (common == s->checkpoint.len) {
-        return pulsar_session_sync(s, prompt, err, errlen) == 0 ?
+        return s->sync(prompt, err, errlen) == 0 ?
             PULSAR_SESSION_REWRITE_OK : PULSAR_SESSION_REWRITE_ERROR;
     }
 
@@ -2886,7 +2930,8 @@ pulsar_session_rewrite_result pulsar_session_rewrite_from_common(
 
 
 
-int pulsar_session_common_prefix(pulsar_session *s, const pulsar_tokens *prompt) {
+int pulsar_session::common_prefix(const pulsar_tokens *prompt) {
+    auto *s = this;
     if (!s->checkpoint_valid) return 0;
     int n = s->checkpoint.len < prompt->len ? s->checkpoint.len : prompt->len;
     int i = 0;
@@ -2896,13 +2941,15 @@ int pulsar_session_common_prefix(pulsar_session *s, const pulsar_tokens *prompt)
 
 
 
-int pulsar_session_argmax(pulsar_session *s) {
+int pulsar_session::argmax() {
+    auto *s = this;
     return sample_argmax(s->logits, PULSAR_N_VOCAB);
 }
 
 
 
-int pulsar_session_argmax_excluding(pulsar_session *s, int excluded_id) {
+int pulsar_session::argmax_excluding(int excluded_id) {
+    auto *s = this;
     if (!s || !s->logits) return -1;
     int best = -1;
     float best_logit = PULSAR_NEG_INF;
@@ -2927,13 +2974,15 @@ int pulsar_sample_logits(const float *logits, int n_vocab, float temperature,
 
 
 
-int pulsar_session_sample(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+int pulsar_session::sample(float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+    auto *s = this;
     return sample_top_p_min_p(s->logits, PULSAR_N_VOCAB, temperature, top_k, top_p, min_p, rng);
 }
 
 
 
-int pulsar_session_top_logprobs(pulsar_session *s, pulsar_token_score *out, int k) {
+int pulsar_session::top_logprobs(pulsar_token_score *out, int k) {
+    auto *s = this;
     if (!s || !out || k <= 0) return 0;
     if (k > (int)PULSAR_N_VOCAB) k = (int)PULSAR_N_VOCAB;
     for (int i = 0; i < k; i++) {
@@ -2972,7 +3021,8 @@ int pulsar_session_top_logprobs(pulsar_session *s, pulsar_token_score *out, int 
 
 
 
-int pulsar_session_token_logprob(pulsar_session *s, int token, pulsar_token_score *out) {
+int pulsar_session::token_logprob(int token, pulsar_token_score *out) {
+    auto *s = this;
     if (!s || !out || token < 0 || token >= (int)PULSAR_N_VOCAB) return 0;
 
     float max_logit = PULSAR_NEG_INF;
@@ -2996,7 +3046,8 @@ int pulsar_session_token_logprob(pulsar_session *s, int token, pulsar_token_scor
 
 
 
-int pulsar_session_copy_logits(pulsar_session *s, float *out, int cap) {
+int pulsar_session::copy_logits(float *out, int cap) {
+    auto *s = this;
     if (!s || !out || cap < (int)PULSAR_N_VOCAB) return 0;
     memcpy(out, s->logits, (size_t)PULSAR_N_VOCAB * sizeof(out[0]));
     return (int)PULSAR_N_VOCAB;
@@ -3004,7 +3055,8 @@ int pulsar_session_copy_logits(pulsar_session *s, float *out, int cap) {
 
 
 
-int pulsar_session_set_logits(pulsar_session *s, const float *logits, int n) {
+int pulsar_session::set_logits(const float *logits, int n) {
+    auto *s = this;
     if (!s || !logits || n != (int)PULSAR_N_VOCAB) return 1;
     memcpy(s->logits, logits, (size_t)PULSAR_N_VOCAB * sizeof(s->logits[0]));
     return 0;
@@ -3012,7 +3064,8 @@ int pulsar_session_set_logits(pulsar_session *s, const float *logits, int n) {
 
 
 
-int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen) {
+int pulsar_session::eval(int token, char *err, size_t errlen) {
+    auto *s = this;
     if (!s) return 1;
     /* Fail loud rather than corrupt: after a multiseq step the graph's scalar
      * frontier counters hold a cross-bank superset, so this decode would emit
@@ -3076,9 +3129,10 @@ int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen) 
 #define PULSAR_MULTISEQ_ERR(...) do { \
         if (err && errlen) snprintf(err, errlen, __VA_ARGS__); \
     } while (0)
-int pulsar_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *reqs,
+int pulsar_session::decode_multiseq(const pulsar_multiseq_req *reqs,
                                 uint32_t n, float *logits, int logits_cap,
                                 char *err, size_t errlen) {
+    auto *s = this;
     if (!s || !reqs || !logits || n == 0 || n > PULSAR_MSEQ_MAX) {
         PULSAR_MULTISEQ_ERR("multiseq decode: bad args (n=%u)", n);
         return 1;
@@ -3144,10 +3198,11 @@ int pulsar_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req 
 #define PULSAR_MIXED_ERR(...) do { \
         if (err && errlen) snprintf(err, errlen, __VA_ARGS__); \
     } while (0)
-int pulsar_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *reqs,
+int pulsar_session::decode_mixed(const pulsar_multiseq_req *reqs,
                              uint32_t n_rows, float *logits, int logits_cap,
                              uint32_t *out_n_rows, uint32_t max_head_runs,
                              char *err, size_t errlen) {
+    auto *s = this;
     if (out_n_rows) *out_n_rows = 0;
     if (!s || !reqs || !logits || n_rows == 0 ||
         n_rows > s->graph.prefill_cap) {
@@ -3223,7 +3278,8 @@ static void bank_carry_free_one(pulsar_bank_carry *c) {
     memset(c, 0, sizeof(*c));
 }
 
-void pulsar_session_bank_carry_free(pulsar_session *s) {
+void pulsar_session::bank_carry_free() {
+    auto *s = this;
     if (!s || !s->bank_carry) return;
     for (uint32_t i = 0; i < s->bank_carry_n; i++) bank_carry_free_one(&s->bank_carry[i]);
     free(s->bank_carry);
@@ -3234,24 +3290,27 @@ void pulsar_session_bank_carry_free(pulsar_session *s) {
 static bool bank_carry_ensure(pulsar_session *s) {
     const uint32_t n = gpu_graph_bank_pool_count(&s->graph);
     if (s->bank_carry && s->bank_carry_n == n) return true;
-    if (s->bank_carry) pulsar_session_bank_carry_free(s);
+    if (s->bank_carry) s->bank_carry_free();
     s->bank_carry = (pulsar_bank_carry *)xcalloc(n, sizeof(*s->bank_carry));
     s->bank_carry_n = n;
     return true;
 }
 
-int pulsar_session_bank_count(pulsar_session *s) {
+int pulsar_session::bank_count() {
+    auto *s = this;
     return s ? (int)gpu_graph_bank_pool_count(&s->graph) : 0;
 }
 
-int pulsar_session_bank_repoint(pulsar_session *s, uint32_t bank) {
+int pulsar_session::bank_repoint(uint32_t bank) {
+    auto *s = this;
     if (!s || bank >= gpu_graph_bank_pool_count(&s->graph)) return 1;
     /* Pool disabled: bank 0 is the classic tensors, nothing to repoint. */
     if (s->graph.banks.n_banks == 0) return bank == 0 ? 0 : 1;
     return gpu_graph_bank_repoint(&s->graph, bank) ? 0 : 1;
 }
 
-void pulsar_session_bank_state_save(pulsar_session *s, uint32_t bank) {
+void pulsar_session::bank_state_save(uint32_t bank) {
+    auto *s = this;
     if (!s || bank >= gpu_graph_bank_pool_count(&s->graph)) return;
     if (!bank_carry_ensure(s)) return;
     /* Graph frontier counters (attn/index comp; Option F also the drafter ring
@@ -3286,7 +3345,8 @@ void pulsar_session_bank_state_save(pulsar_session *s, uint32_t bank) {
     c->valid = true;
 }
 
-bool pulsar_session_bank_state_restore(pulsar_session *s, uint32_t bank) {
+bool pulsar_session::bank_state_restore(uint32_t bank) {
+    auto *s = this;
     if (!s || bank >= gpu_graph_bank_pool_count(&s->graph)) return false;
     /* Point device views (incl. Option F drafter ring) at this bank, and
      * re-arm its frontier counters — this is what makes clearing mseq_dirty
@@ -3347,17 +3407,20 @@ static const pulsar_tokens *bank_frontier_tokens(pulsar_session *s, uint32_t ban
     return NULL;
 }
 
-int pulsar_session_bank_pos(pulsar_session *s, uint32_t bank) {
+int pulsar_session::bank_pos(uint32_t bank) {
+    auto *s = this;
     const pulsar_tokens *t = bank_frontier_tokens(s, bank);
     return t ? t->len : 0;
 }
 
-const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank) {
+const pulsar_tokens *pulsar_session::bank_tokens(uint32_t bank) {
+    auto *s = this;
     return bank_frontier_tokens(s, bank);
 }
 
-int pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank,
+int pulsar_session::bank_common_prefix(uint32_t bank,
                                    const pulsar_tokens *prompt) {
+    auto *s = this;
     const pulsar_tokens *t = bank_frontier_tokens(s, bank);
     if (!t || !prompt) return 0;
     int n = t->len < prompt->len ? t->len : prompt->len;
@@ -3366,7 +3429,8 @@ int pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank,
     return i;
 }
 
-void pulsar_session_note_committed_tokens(pulsar_session *s, const int *toks, int n) {
+void pulsar_session::note_committed_tokens(const int *toks, int n) {
+    auto *s = this;
     if (!s || !toks || n <= 0) return;
     for (int i = 0; i < n; i++) token_vec_push(&s->checkpoint, toks[i]);
 }
@@ -3838,7 +3902,7 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
             replay[0] = (int32_t)first_token;
             for (int i = 0; i < commit; i++) replay[1 + i] = pend[i];
             for (int i = 0; ok_state && i < 1 + commit; i++) {
-                if (pulsar_session_eval(s, (int)replay[i], err, errlen) != 0) {
+                if (s->eval((int)replay[i], err, errlen) != 0) {
                     ok_state = false;
                     break;
                 }
@@ -4146,11 +4210,12 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
  * leaves the next correctly-distributed base as the carry. temperature <= 0
  * degenerates to the greedy argmax-equality path (byte-identical to the old
  * eval_speculative_block behavior). Returns the number of tokens emitted. */
-int pulsar_session_generate_speculative(pulsar_session *s, float temperature, int top_k,
+int pulsar_session::generate_speculative(float temperature, int top_k,
                                      float top_p, float min_p, uint64_t *rng,
                                      int max_tokens, int eos_token,
                                      int *accepted, int accepted_cap,
                                      char *err, size_t errlen) {
+    auto *s = this;
     if (!s || max_tokens <= 0 || accepted_cap <= 0 || !accepted) return 0;
     /* Same stale-classic-state guard as pulsar_session_eval: the spec loop
      * decodes and emits against the graph's scalar frontier counters, which
@@ -4188,8 +4253,8 @@ int pulsar_session_generate_speculative(pulsar_session *s, float temperature, in
     /* Yield-quenched requests run plain for their remainder — the same route
      * as a drafterless engine, chosen per request. The carry consumed above is
      * already correctly distributed, so this is a pure speed decision. */
-    if (!pulsar_engine_has_dspark(s->engine) || s->spec.spec_quenched) {
-        if (pulsar_session_eval(s, first, err, errlen) != 0) return -1;
+    if (!s->engine->has_dspark() || s->spec.spec_quenched) {
+        if (s->eval(first, err, errlen) != 0) return -1;
         accepted[0] = first;
         return 1;
     }
@@ -4200,10 +4265,11 @@ int pulsar_session_generate_speculative(pulsar_session *s, float temperature, in
 
 
 
-int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token,
+int pulsar_session::eval_speculative_block(int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
+    auto *s = this;
     if (!s || max_tokens <= 0 || accepted_cap <= 0 || !accepted) return 0;
     /* Same stale-classic-state guard as pulsar_session_eval (which the no-dspark
      * fallback below would otherwise hit one frame deeper). */
@@ -4213,8 +4279,8 @@ int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token,
                  "per-bank state is stale; re-sync the session first");
         return -1;
     }
-    if (!pulsar_engine_has_dspark(s->engine) || s->spec.spec_quenched) {
-        if (pulsar_session_eval(s, first_token, err, errlen) != 0) return -1;
+    if (!s->engine->has_dspark() || s->spec.spec_quenched) {
+        if (s->eval(first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         return 1;
     }
@@ -4244,7 +4310,7 @@ int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token,
     const int dump_pos = s->checkpoint.len;  /* first_token's sequence position */
 
     /* Step 1: run target decode for the first token */
-    if (pulsar_session_eval(s, first_token, err, errlen) != 0) return -1;
+    if (s->eval(first_token, err, errlen) != 0) return -1;
 
     /* Step 2: project main_x from captured target hidden states */
     if (!gpu_graph_dspark_project_main_x(g, &e->dspark_model, &e->dspark_weights))
@@ -4508,7 +4574,7 @@ int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token,
         s->checkpoint.len = saved_len;
         ok_state = spec_frontier_restore(&frontier, s);
         for (int i = 0; ok_state && i < commit_drafts; i++) {
-            if (pulsar_session_eval(s, refined_ids[i + 1], err, errlen) != 0) {
+            if (s->eval(refined_ids[i + 1], err, errlen) != 0) {
                 ok_state = false;
                 break;
             }
@@ -4552,7 +4618,8 @@ int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token,
 
 
 
-void pulsar_session_invalidate(pulsar_session *s) {
+void pulsar_session::invalidate() {
+    auto *s = this;
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->spec.dspark_n_pending = 0;
@@ -4576,7 +4643,8 @@ void pulsar_session_invalidate(pulsar_session *s) {
 
 
 
-void pulsar_session_rewind(pulsar_session *s, int pos) {
+void pulsar_session::rewind(int pos) {
+    auto *s = this;
     if (pos < 0) pos = 0;
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;
@@ -4591,13 +4659,15 @@ void pulsar_session_rewind(pulsar_session *s, int pos) {
 
 
 
-int pulsar_session_pos(pulsar_session *s) {
+int pulsar_session::pos() {
+    auto *s = this;
     return s->checkpoint.len;
 }
 
 
 
-int pulsar_session_ctx(pulsar_session *s) {
+int pulsar_session::ctx() {
+    auto *s = this;
     return s->ctx_size;
 }
 
@@ -4628,7 +4698,8 @@ int pulsar_session_prefill_cap(pulsar_session *s) {
  *     caller only interrupts while (target - checkpoint) >= the returned
  *     value. (When resume is disabled via PULSAR_CUDA_RESUME_PREFILL_MIN<=0 the
  *     minimum is UINT32_MAX and the comparison never permits interruption.) */
-uint32_t pulsar_session_prefill_quantum_min_suffix(const pulsar_session *s) {
+uint32_t pulsar_session::prefill_quantum_min_suffix() const {
+    auto *s = this;
     if (!s) return 0;
     if (s->graph.prefill_cap > s->graph.raw_cap) return 0;
     /* A cold (start==0) chunk loop trims each non-final chunk end DOWN to the
