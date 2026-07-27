@@ -323,7 +323,7 @@ static void model_prefetch_cpu_mapping(const ds4_model *m) {
 /* Read the GGUF metadata table.  Values stay in the mmap; we store offsets so
  * later validation can decode only the keys it needs. */
 static void parse_metadata(ds4_model *m, ds4_cursor *c) {
-    m->kv = calloc((size_t)m->n_kv, sizeof(m->kv[0]));
+    m->kv = (ds4_kv *)calloc((size_t)m->n_kv, sizeof(m->kv[0]));
     if (!m->kv) ds4_die("out of memory while allocating metadata table");
 
     m->alignment = 32;
@@ -355,7 +355,7 @@ static void parse_metadata(ds4_model *m, ds4_cursor *c) {
 /* Read the tensor directory and convert relative GGUF offsets to absolute
  * mmap offsets.  Tensor bytes are still never copied here. */
 static void parse_tensors(ds4_model *m, ds4_cursor *c) {
-    m->tensors = calloc((size_t)m->n_tensors, sizeof(m->tensors[0]));
+    m->tensors = (ds4_tensor *)calloc((size_t)m->n_tensors, sizeof(m->tensors[0]));
     if (!m->tensors) ds4_die("out of memory while allocating tensor table");
 
     for (uint64_t i = 0; i < m->n_tensors; i++) {
@@ -445,11 +445,11 @@ void model_open(ds4_model *m, const char *path, bool gpu_mapping,
      * avoids that VM accounting path while preserving normal file-backed reads.
      */
     const int mmap_flags = gpu_mapping ? MAP_SHARED : MAP_PRIVATE;
-    void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, mmap_flags, fd, 0);
+    void *map = (void *)mmap(NULL, (size_t)st.st_size, PROT_READ, mmap_flags, fd, 0);
     if (map == MAP_FAILED) ds4_die_errno("cannot mmap model", path);
 
     m->fd = fd;
-    m->map = map;
+    m->map = (const uint8_t *)map;
     m->size = (uint64_t)st.st_size;
 
     ds4_cursor c = cursor_at(m, 0);
@@ -485,8 +485,8 @@ static void print_size(uint64_t bytes) {
 
 
 void model_summary(const ds4_model *m) {
-    ds4_str name = {0};
-    ds4_str arch = {0};
+    ds4_str name = {0, 0};
+    ds4_str arch = {0, 0};
     uint32_t layers = 0;
     uint64_t ctx_train = 0;
     uint32_t n_head = 0;
@@ -585,8 +585,8 @@ ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
 
 
 static int accelerator_tensor_span_cmp(const void *a, const void *b) {
-    const accelerator_tensor_span *sa = a;
-    const accelerator_tensor_span *sb = b;
+    const accelerator_tensor_span *sa = (const accelerator_tensor_span *)a;
+    const accelerator_tensor_span *sb = (const accelerator_tensor_span *)b;
     if (sa->off < sb->off) return -1;
     if (sa->off > sb->off) return 1;
     if (sa->end < sb->end) return -1;
@@ -642,7 +642,7 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
         return true;
     }
 
-    accelerator_tensor_span *spans = xmalloc((size_t)cap * sizeof(spans[0]));
+    accelerator_tensor_span *spans = (accelerator_tensor_span *)xmalloc((size_t)cap * sizeof(spans[0]));
     uint64_t nspan = 0;
     for (uint32_t i = 0; i < span_count; i++) {
         if (span_offsets[i] > m->size ||
