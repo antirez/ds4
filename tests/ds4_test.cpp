@@ -1504,7 +1504,8 @@ static void test_think_tool_recovery(void) {
     memset(&srv, 0, sizeof(srv));
     srv.engine = engine;
     srv.n_slots = DS4_SESSION_POOL_CAP;
-    srv.slots[0].sess = session;
+    srv.sess = session;
+    srv.slots[0].provisioned = true;
 
     /* Replay the malformed prefix exactly as the worker loop would see it:
      * token by token, running the recovery scan after each piece.  The stanza

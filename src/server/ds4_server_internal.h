@@ -666,7 +666,7 @@ typedef struct {
  * worker_main (or from cli_main startup/shutdown, before the worker starts and
  * after it joins) — with two deliberate exceptions, both plain loads of data
  * immutable after startup (no CUDA behind them): http_server.c reads
- * ds4_session_ctx(slots[0].sess) on client threads, and client paths read the
+ * ds4_session_ctx(server.sess) on client threads, and client paths read the
  * model id via server_model_id_from_engine (ds4_engine_model_id, a static
  * shape constant). Nothing else: /metrics in particular makes NO engine
  * calls — the worker publishes per-slot KV positions and the spec-decode
@@ -818,14 +818,14 @@ typedef struct {
 #define DS4_SERVER_MEM_FLOOR_BYTES        (4ull * 1024ull * 1024ull * 1024ull)
 
 typedef enum {
-    SLOT_IDLE = 0,     /* no live job; sess may be warm and reusable */
+    SLOT_IDLE = 0,     /* no live job; the slot's KV may be warm and reusable */
     SLOT_PREFILLING,   /* ingesting a prompt (chunked prefill) */
     SLOT_DECODING,     /* generating tokens */
     SLOT_EVICTED,      /* session freed, ledger released; KV state spilled to
                           the disk kv cache (snapshot-on-evict) so a returning
                           client restores via the normal disk-text path instead
-                          of a cold prefill. The slot entry (sess == NULL) is
-                          reusable by the next provisioning. */
+                          of a cold prefill. The slot entry (provisioned ==
+                          false) is reusable by the next provisioning. */
 } slot_state;
 
 /* Resumable per-job generation state (defined in generate.c). Owns everything
@@ -834,17 +834,16 @@ typedef enum {
  * surfaces, decode-loop trackers, and the deferred socket writer. */
 typedef struct gen_state gen_state;
 
-/* A pool slot owns one logical session's GPU state. Slot 0 is provisioned at
- * startup and pinned; slots 1..cap-1 are provisioned lazily and evicted
- * LRU-first by the scheduler (worker thread only) — an evicted slot is a
- * reusable hole (sess == NULL, state SLOT_EVICTED) below the n_slots
- * high-water mark. */
+/* A pool slot is a pure bank descriptor over the server's ONE session
+ * (server.sess). Slot 0 is provisioned at startup and pinned; slots 1..cap-1
+ * are provisioned lazily and evicted LRU-first by the scheduler (worker
+ * thread only) — an evicted slot is a reusable hole (provisioned == false,
+ * state SLOT_EVICTED) below the n_slots high-water mark. */
 typedef struct {
-    ds4_session *sess;                    /* live session; NULL until admitted.
-                                             Tier-2: in bank-pool mode EVERY live
-                                             slot's sess points at the ONE pool
-                                             session (slots[0].sess); the slot is
-                                             distinguished by `bank` below. */
+    bool         provisioned;             /* false until admitted; cleared on
+                                             eviction (the slot is a reusable
+                                             hole). Every reader that used to
+                                             skip sess == NULL skips this. */
     uint32_t     bank;                    /* Tier-2: this slot's bank id in the
                                              shared pool (slot i -> bank i). 0 in
                                              classic (non-pooled) mode. */
@@ -885,6 +884,11 @@ typedef struct {
 
 struct server {
     ds4_engine *engine;
+    /* The ONE session (created at startup, freed once at shutdown): classic
+     * mode == 1 bank-less slot (slot 0), pool mode == pool_banks banks over
+     * it. Slots are pure bank descriptors; all engine work goes through this
+     * pointer. */
+    ds4_session *sess;
     /* Advertised id override (server_config.served_model_id); NULL => built-in
      * server_model_id_from_engine. Read via server_served_model_id. */
     const char *served_model_id;
@@ -897,7 +901,7 @@ struct server {
     session_slot slots[DS4_SESSION_POOL_CAP];
     int          n_slots;            /* provisioned slots (worker-owned; published under mu) */
     /* Tier-2 bank-pool state (worker thread only). `pool_banks` > 0 means the
-     * shared-pool flip is active: all live slots share slots[0].sess and each
+     * shared-pool flip is active: all live slots share server.sess and each
      * owns one bank; `live_bank` is the bank whose device views + host carry are
      * currently installed on that session (server_bank_switch lazily saves the
      * old and restores the new). `spec_max_live` is the three-way scheduler knob
@@ -1524,7 +1528,7 @@ uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost);
 /* Tier-2 bank-aware frontier position of `sl`, correct whether or not sl->bank
  * is the currently-installed bank of the shared pool session (a non-live bank
  * reads its saved host carry via ds4_session_bank_pos; the live bank reads the
- * live checkpoint). In classic (non-pooled) mode == ds4_session_pos(sl->sess).
+ * live checkpoint). In classic (non-pooled) mode == ds4_session_pos(s->sess).
  * Worker-thread scheduling reads AND the client/worker tool-id lookups use this
  * instead of ds4_session_pos so a non-live bank's frontier is never misread as
  * the pool's live cursor (defined in generate.c). */
@@ -1537,7 +1541,7 @@ int server_slot_frontier_pos(const server *s, const session_slot *sl);
 /* LRU eviction victim: least-recently-serviced idle provisioned slot,
  * tie-broken by smallest committed bytes; slot 0 pinned; protect[i] (may be
  * NULL) marks slots a queued live continuation still needs. Returns a slot
- * index or -1. Pure selection over host fields — never dereferences sess
+ * index or -1. Pure selection over host fields — never touches the session
  * (defined in generate.c; unit-tested in cli_main.c). */
 int server_evict_pick_victim(const session_slot *slots, int n_slots,
                                     const bool *protect);

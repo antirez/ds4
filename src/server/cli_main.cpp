@@ -391,20 +391,17 @@ static void server_close_resources(server *s) {
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mu);
-    /* Tier-2: in pooled mode every live slot's sess aliases slots[0].sess (the
-     * one pool session), so free it ONCE (via slot 0) and never per-slot — a
-     * per-slot free would double-free the pool. In classic mode each slot owns
-     * its own session and all are freed. */
-    ds4_session *pool = s->pool_banks > 0 ? s->slots[0].sess : NULL;
+    /* The ONE session (server.sess — classic mode == slot 0 alone, pool mode
+     * == N banks over it) is freed exactly once here; slots are pure bank
+     * descriptors and own nothing to free. */
     for (int i = 0; i < DS4_SESSION_POOL_CAP; i++) {
         live_tool_state_free(&s->slots[i].responses_live);
         live_tool_state_free(&s->slots[i].anthropic_live);
         visible_live_free(&s->slots[i].thinking_live);
-        if (s->slots[i].sess && s->slots[i].sess != pool)
-            ds4_session_free(s->slots[i].sess);
-        s->slots[i].sess = NULL;
+        s->slots[i].provisioned = false;
     }
-    if (pool) ds4_session_free(pool);
+    if (s->sess) ds4_session_free(s->sess);
+    s->sess = NULL;
     /* Tier-2 guard spill files are per-bank snapshots (server_spill_bank in
      * generate.c writes <spill_dir>/spill-bank-<bank>.kv).  A bank that is
      * still spilled when the server exits would otherwise leave a stale
@@ -972,12 +969,12 @@ int main(int argc, char **argv) {
     s.served_model_id = cfg.served_model_id;      /* --served-model-id override (id) */
     s.served_model_name = cfg.served_model_name;  /* --served-model-name override (name) */
     s.started = time(NULL);          /* uptime origin reported by /health */
-    /* Slot 0 is provisioned here at the configured --ctx-size. Tier-2: if the
-     * created session is bank-pooled (DS4_MSEQ_BANKS>1), slot 0 IS the shared
-     * pool and every other slot maps to one of its banks; the scheduler
-     * provisions banks 1..pool_banks-1 lazily as pure host bookkeeping. In
-     * classic mode (pool_banks==0) slots 1..cap-1 are lazily created sessions
-     * under the admission predicate, exactly as before. */
+    /* Slot 0 is provisioned here at the configured --ctx-size over the ONE
+     * session (s.sess). Tier-2: if the created session is bank-pooled
+     * (DS4_MSEQ_BANKS>1), every other slot maps to one of its banks; the
+     * scheduler provisions banks 1..pool_banks-1 lazily as pure host
+     * bookkeeping. In classic mode (pool_banks==0) slot 0 is the only slot —
+     * a job needing another one queues. */
     const int pool_banks = ds4_session_bank_count(session);
     s.pool_banks = pool_banks > 1 ? pool_banks : 0;
     s.live_bank = 0;
@@ -1118,7 +1115,8 @@ int main(int argc, char **argv) {
                    (double)s.guard_eager_bytes / (1024.0*1024.0*1024.0),
                    s.spill_dir);
     }
-    s.slots[0].sess = session;
+    s.sess = session;                /* the one session; slot 0 describes it */
+    s.slots[0].provisioned = true;
     s.slots[0].state = SLOT_IDLE;
     s.slots[0].ctx_size = cfg.ctx_size;
     /* Slot-routing trivial-match threshold (choose_slot_for_job): the token
@@ -1270,7 +1268,7 @@ int main(int argc, char **argv) {
 
     for (int i = 0; i < s.n_slots; i++) {
         session_slot *sl = &s.slots[i];
-        if (!sl->sess) continue;
+        if (!sl->provisioned) continue;
         /* Tier-2: install this slot's bank so tokens/store read ITS frontier,
          * not the pool's last-live cursor (worker has joined; single-threaded).
          * Must go through server_bank_switch, NOT a bare state_restore: a bank
@@ -1288,7 +1286,7 @@ int main(int argc, char **argv) {
                        "skipping its KV persist", i, sl->bank);
             continue;
         }
-        const ds4_tokens *tokens = ds4_session_tokens(sl->sess);
+        const ds4_tokens *tokens = ds4_session_tokens(s.sess);
         if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
             server_log(DS4_LOG_KVCACHE,
                        "ds4-server: persisting slot %d KV cache before shutdown tokens=%d",
@@ -5716,14 +5714,13 @@ static void test_session_eviction_ledger_math(void) {
 
 /* Victim selection: LRU over IDLE provisioned slots, slot 0 pinned, active
  * and protected slots skipped, ties broken by smallest committed bytes
- * (cheapest to bring back). Pure host-field selection — the fake sess
- * pointers are never dereferenced. */
+ * (cheapest to bring back). Pure host-field selection — no session is ever
+ * touched. */
 static void test_session_eviction_victim_selection(void) {
     const uint64_t GiB = 1024ull * 1024ull * 1024ull;
     session_slot slots[DS4_SESSION_POOL_CAP];
     memset(slots, 0, sizeof(slots));
-    ds4_session *fake = (ds4_session *)&slots; /* non-NULL, never dereferenced */
-    for (int i = 0; i < DS4_SESSION_POOL_CAP; i++) slots[i].sess = fake;
+    for (int i = 0; i < DS4_SESSION_POOL_CAP; i++) slots[i].provisioned = true;
     slots[0].last_serviced_us = 1;              /* oldest of all — but pinned */
     slots[0].est_cost_bytes = 9ull * GiB;
     slots[1].last_serviced_us = 100;
@@ -5739,7 +5736,7 @@ static void test_session_eviction_victim_selection(void) {
     TEST_ASSERT(server_evict_pick_victim(slots, 4, protect) == 2); /* protected skipped */
     slots[2].active_job = (struct job *)&slots;                    /* busy skipped */
     TEST_ASSERT(server_evict_pick_victim(slots, 4, protect) == 1);
-    slots[1].sess = NULL;                                          /* hole skipped */
+    slots[1].provisioned = false;                                  /* hole skipped */
     TEST_ASSERT(server_evict_pick_victim(slots, 4, protect) == -1);
     protect[3] = false;
     TEST_ASSERT(server_evict_pick_victim(slots, 4, protect) == 3);
@@ -5802,7 +5799,7 @@ static void test_slot_route_trivial_match_decision(void) {
  * header-short (the client replays visible content; the slot's sampled
  * frontier holds the hidden reasoning). choose_slot_for_job must route such
  * a request back to its slot instead of provisioning a "fresh conversation"
- * slot for it. Host fields only — sess is never dereferenced (the caller
+ * slot for it. Host fields only — the session is never touched (the caller
  * passes the live position). */
 static void test_thinking_binding_routes_visible_continuation(void) {
     server s;

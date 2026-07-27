@@ -465,7 +465,7 @@ static session_slot *live_slot_for_ids(server *s, const stop_list *ids,
                                               : &sl->responses_live;
         /* Bank-aware: match against THIS slot's bank frontier, not the pool's
          * live cursor (Tier-2 shared pool). -1 for an unprovisioned slot. */
-        const int pos = sl->sess ? server_slot_frontier_pos(s, sl) : -1;
+        const int pos = sl->provisioned ? server_slot_frontier_pos(s, sl) : -1;
         if (live_state_matches_ids_locked(st, ids, pos)) found = sl;
     }
     pthread_mutex_unlock(&s->tool_mu);

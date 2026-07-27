@@ -530,9 +530,10 @@ static bool kv_cache_store_live_prefix_text(server *s, session_slot *sl,
                                             const char *cache_text_override,
                                             uint8_t cache_text_ext,
                                             const char *cache_text_key) {
+    (void)sl; /* slot is a pure bank descriptor; the session is s->sess */
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
-    return ds4_kvstore_store_live_prefix_text(&s->kv, s->engine, sl->sess,
+    return ds4_kvstore_store_live_prefix_text(&s->kv, s->engine, s->sess,
                                               tokens, store_len, reason,
                                               cache_text_override,
                                               cache_text_ext,
@@ -552,7 +553,7 @@ bool kv_cache_store_live_prefix(server *s, session_slot *sl,
 
 
 bool kv_cache_store_current(server *s, session_slot *sl, const char *reason) {
-    const ds4_tokens *tokens = ds4_session_tokens(sl->sess);
+    const ds4_tokens *tokens = ds4_session_tokens(s->sess);
     if (!tokens) return false;
 
     char *visible_text = NULL;
@@ -630,7 +631,7 @@ void kv_cache_discard_failed_disk_entry(server *s, session_slot *sl,
                    path, strerror(errno));
     }
     sl->continued_last_store_tokens = 0;
-    ds4_session_invalidate(sl->sess);
+    ds4_session_invalidate(s->sess);
 }
 
 
@@ -649,7 +650,7 @@ void kv_cache_tracker_flush(server *s, session_slot *sl) {
 
 void kv_cache_maybe_store_continued(server *s, session_slot *sl) {
     kv_disk_cache *kc = &s->kv;
-    const ds4_tokens *tokens = ds4_session_tokens(sl->sess);
+    const ds4_tokens *tokens = ds4_session_tokens(s->sess);
     if (!tokens) return;
     kv_cache_tracker_bind(s, sl);
     const int target = kv_cache_continued_store_target(kc, tokens->len);
@@ -685,7 +686,7 @@ int kv_cache_try_load_text(server *s, session_slot *sl, const char *prompt_text,
     /* A successful load advances the continued-store frontier (the lib sets
      * kc->continued_last_store_tokens = loaded) — bracket it per slot. */
     kv_cache_tracker_bind(s, sl);
-    int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, sl->sess,
+    int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, s->sess,
                                            prompt_text, effective_prompt, &lr,
                                            &hooks, responses_protocol);
     kv_cache_tracker_flush(s, sl);
@@ -714,8 +715,9 @@ int kv_cache_try_load(server *s, session_slot *sl, const request *req,
 
 int live_text_prefix_prompt(server *s, session_slot *sl, const request *req,
                                    ds4_tokens *effective_prompt) {
+    (void)sl; /* slot is a pure bank descriptor; the session is s->sess */
     if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
-    const ds4_tokens *live_tokens = ds4_session_tokens(sl->sess);
+    const ds4_tokens *live_tokens = ds4_session_tokens(s->sess);
     if (!live_tokens || live_tokens->len <= 0) return 0;
 
     size_t live_text_len = 0;
@@ -758,7 +760,7 @@ int responses_live_continuation_prompt(server *s, session_slot *sl,
     if (!responses_live_matches_request(s, sl, &req->responses_live_call_ids,
                                         live_pos)) return 0;
 
-    const ds4_tokens *live_tokens = ds4_session_tokens(sl->sess);
+    const ds4_tokens *live_tokens = ds4_session_tokens(s->sess);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
     build_prompt_from_exact_prefix_and_text_suffix(
@@ -787,7 +789,7 @@ int anthropic_live_continuation_prompt(server *s, session_slot *sl,
     if (!anthropic_live_matches_request(s, sl, &req->anthropic_live_call_ids,
                                         live_pos)) return 0;
 
-    const ds4_tokens *live_tokens = ds4_session_tokens(sl->sess);
+    const ds4_tokens *live_tokens = ds4_session_tokens(s->sess);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
     build_prompt_from_exact_prefix_and_text_suffix(
@@ -833,7 +835,7 @@ int responses_live_visible_prefix_prompt(server *s, session_slot *sl,
     pthread_mutex_unlock(&s->tool_mu);
     if (!ok) return 0;
 
-    const ds4_tokens *live_tokens = ds4_session_tokens(sl->sess);
+    const ds4_tokens *live_tokens = ds4_session_tokens(s->sess);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
     build_prompt_from_exact_prefix_and_text_suffix(
@@ -878,7 +880,7 @@ int thinking_live_visible_prefix_prompt(server *s, session_slot *sl,
     pthread_mutex_unlock(&s->tool_mu);
     if (!ok) return 0;
 
-    const ds4_tokens *live_tokens = ds4_session_tokens(sl->sess);
+    const ds4_tokens *live_tokens = ds4_session_tokens(s->sess);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
     build_prompt_from_exact_prefix_and_text_suffix(
@@ -900,7 +902,7 @@ int thinking_live_visible_prefix_prompt(server *s, session_slot *sl,
  * conversation. Returns the matched visible-key length (>0) so the caller
  * can prefer the most recent frontier if several slots hold bindings for
  * prefixes of one conversation, or 0 for no match. Never dereferences
- * sl->sess (the caller passes the slot's live position). */
+ * s->sess (the caller passes the slot's live position). */
 size_t thinking_live_binds_prompt(server *s, session_slot *sl,
                                   const request *req, int live_pos) {
     if (!s || !sl || !req || !req->prompt_text) return 0;

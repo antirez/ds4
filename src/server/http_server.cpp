@@ -159,7 +159,7 @@ static void append_model_json(buf *b, const server *s, const char *id) {
     append_model_json_values(b,
                              id,
                              server_served_model_name(s),
-                             ds4_session_ctx(s->slots[0].sess),
+                             ds4_session_ctx(s->sess),
                              s->default_tokens);
 }
 
@@ -249,7 +249,7 @@ static bool send_version(server *s, int fd) {
         DS4_VERSION_STR,
         server_served_model_id(s),
         server_served_model_name(s),
-        ds4_session_ctx(s->slots[0].sess));
+        ds4_session_ctx(s->sess));
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
@@ -451,7 +451,7 @@ void *client_main(void *arg) {
     bool ok;
     ok = false;
     int ctx_size;
-    ctx_size = ds4_session_ctx(s->slots[0].sess);
+    ctx_size = ds4_session_ctx(s->sess);
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
