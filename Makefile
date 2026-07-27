@@ -304,8 +304,8 @@ src/cli/%.o: src/cli/%.c src/ds4.h src/lib/ds4_help.h src/vendor/linenoise.h
 src/lib/%.o: src/lib/%.c src/ds4.h $(LIB_HDRS)
 	$(CC) $(CFLAGS) $(DS4_INC) -c -o $@ $<
 
-src/vendor/%.o: src/vendor/%.c src/vendor/linenoise.h src/vendor/rax.h src/vendor/rax_malloc.h
-	$(CC) $(CFLAGS) -c -o $@ $<
+src/vendor/%.o: src/vendor/%.cpp src/vendor/linenoise.h src/vendor/rax.h src/vendor/rax_malloc.h
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 tests/ds4_test.o: tests/ds4_test.cpp $(SERVER_SRCS) src/server/ds4_server_internal.h src/ds4.h $(LIB_HDRS) src/vendor/rax.h
 	$(CXX) $(CXXFLAGS) $(DS4_INC) -Wno-unused-function -c -o $@ tests/ds4_test.cpp

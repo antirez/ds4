@@ -863,10 +863,10 @@ void linenoiseAddCompletion(linenoiseCompletions *lc, const char *str) {
     size_t len = strlen(str);
     char *copy, **cvec;
 
-    copy = malloc(len+1);
+    copy = (char *)malloc(len+1);
     if (copy == NULL) return;
     memcpy(copy,str,len+1);
-    cvec = realloc(lc->cvec,sizeof(char*)*(lc->len+1));
+    cvec = (char* *)realloc(lc->cvec,sizeof(char*)*(lc->len+1));
     if (cvec == NULL) {
         free(copy);
         return;
@@ -892,11 +892,11 @@ static void abInit(struct abuf *ab) {
 }
 
 static void abAppend(struct abuf *ab, const char *s, int len) {
-    char *new = realloc(ab->b,ab->len+len);
+    char *newn = (char *)realloc(ab->b,ab->len+len);
 
-    if (new == NULL) return;
-    memcpy(new+ab->len,s,len);
-    ab->b = new;
+    if (newn == NULL) return;
+    memcpy(newn+ab->len,s,len);
+    ab->b = newn;
     ab->len += len;
 }
 
@@ -1118,7 +1118,7 @@ static int linenoiseRenderBuffer(struct linenoiseState *l, char **out, size_t *o
     if (!linenoiseGetRenderFolds(l,&fs)) {
         /* Keep the refresh code simple: it always owns a temporary render
          * buffer, even when the render is identical to the real edit buffer. */
-        r = malloc(l->len+1);
+        r = (char *)malloc(l->len+1);
         if (r == NULL) return -1;
         memcpy(r,l->buf,l->len);
         r[l->len] = '\0';
@@ -1137,7 +1137,7 @@ static int linenoiseRenderBuffer(struct linenoiseState *l, char **out, size_t *o
         len -= f->end - f->start;
         len += f->displaylen;
     }
-    r = malloc(len+1);
+    r = (char *)malloc(len+1);
     if (r == NULL) return -1;
 
     src = dst = 0;
@@ -1653,7 +1653,7 @@ static int linenoiseEditGrow(struct linenoiseState *l, size_t needed) {
     if (newlen < needed || newlen == SIZE_MAX) return -1;
 
     /* Allocate one extra byte for the nul terminator. */
-    newbuf = realloc(l->buf,newlen+1);
+    newbuf = (char *)realloc(l->buf,newlen+1);
     if (newbuf == NULL) return -1;
     l->buf = newbuf;
     l->buflen = newlen;
@@ -1686,7 +1686,8 @@ static int linenoiseEditInsertNoRefresh(struct linenoiseState *l, const char *c,
  * This handles both single-byte ASCII and multi-byte UTF-8 sequences.
  *
  * On error writing to the terminal -1 is returned, otherwise 0. */
-int linenoiseEditInsert(struct linenoiseState *l, const char *c, size_t clen) {
+/* Not in linenoise.h by upstream design; the agent editor calls it, so pin C linkage. */
+extern "C" int linenoiseEditInsert(struct linenoiseState *l, const char *c, size_t clen) {
     if (l->len == l->pos) {
         int needs_refresh = memchr(c, '\n', clen) != NULL ||
                              memchr(c, '\r', clen) != NULL;
@@ -1735,7 +1736,7 @@ int linenoiseEditQueueInput(struct linenoiseState *l, const char *buf, size_t le
             if (next <= cap) return -1;
             cap = next;
         }
-        char *p = realloc(l->queued_input, cap);
+        char *p = (char *)realloc(l->queued_input, cap);
         if (!p) return -1;
         l->queued_input = p;
         l->queued_input_cap = cap;
@@ -2024,7 +2025,7 @@ static int pasteBufferReserve(char **buf, size_t *cap, size_t len, size_t need) 
     if (want < len + need) return -1;
 
     /* realloc(NULL, want) handles the first allocation too. */
-    nb = realloc(*buf, want);
+    nb = (char *)realloc(*buf, want);
     if (nb == NULL) return -1;
     *buf = nb;
     *cap = want;
@@ -2405,7 +2406,7 @@ void linenoiseEditStop(struct linenoiseState *l) {
 static char *linenoiseBlockingEdit(int stdin_fd, int stdout_fd, const char *prompt)
 {
     struct linenoiseState l;
-    char *buf = malloc(LINENOISE_INITIAL_BUFLEN);
+    char *buf = (char *)malloc(LINENOISE_INITIAL_BUFLEN);
     char *res;
 
     if (buf == NULL) {
@@ -2473,7 +2474,7 @@ static char *linenoiseReadLine(FILE *fp, int *err) {
                 errno = ENOMEM;
                 return NULL;
             }
-            line = realloc(line,newcap);
+            line = (char *)realloc(line,newcap);
             if (line == NULL) {
                 if (oldval) free(oldval);
                 if (err) *err = 1;
@@ -2580,7 +2581,7 @@ int linenoiseHistoryAdd(const char *line) {
 
     /* Initialization on first call. */
     if (history == NULL) {
-        history = malloc(sizeof(char*)*history_max_len);
+        history = (char* *)malloc(sizeof(char*)*history_max_len);
         if (history == NULL) return 0;
         memset(history,0,(sizeof(char*)*history_max_len));
     }
@@ -2607,14 +2608,14 @@ int linenoiseHistoryAdd(const char *line) {
  * just the latest 'len' elements if the new history length value is smaller
  * than the amount of items already inside the history. */
 int linenoiseHistorySetMaxLen(int len) {
-    char **new;
+    char **newn;
 
     if (len < 1) return 0;
     if (history) {
         int tocopy = history_len;
 
-        new = malloc(sizeof(char*)*len);
-        if (new == NULL) return 0;
+        newn = (char* *)malloc(sizeof(char*)*len);
+        if (newn == NULL) return 0;
 
         /* If we can't copy everything, free the elements we'll not use. */
         if (len < tocopy) {
@@ -2623,10 +2624,10 @@ int linenoiseHistorySetMaxLen(int len) {
             for (j = 0; j < tocopy-len; j++) free(history[j]);
             tocopy = len;
         }
-        memset(new,0,sizeof(char*)*len);
-        memcpy(new,history+(history_len-tocopy), sizeof(char*)*tocopy);
+        memset(newn,0,sizeof(char*)*len);
+        memcpy(newn,history+(history_len-tocopy), sizeof(char*)*tocopy);
         free(history);
-        history = new;
+        history = newn;
     }
     history_max_len = len;
     if (history_len > history_max_len)
