@@ -1,0 +1,1 @@
+La cache KV (Key-Value) su disco è particolarmente utile nelle **sessioni agentiche** (d

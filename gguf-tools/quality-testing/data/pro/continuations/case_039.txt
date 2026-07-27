@@ -1,0 +1,1 @@
+Confrontare due quantizzazioni senza fidarsi ciecamente di una singola risposta richiede un approccio

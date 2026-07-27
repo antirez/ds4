@@ -39,6 +39,17 @@ __global__ static void add_kernel(float *out, const float *a, const float *b, ui
     out[i] = a[i] + b[i];
 }
 
+__global__ static void add3_kernel(
+        float       *out,
+        const float *a,
+        const float *b,
+        const float *c,
+        uint32_t     n) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = a[i] + b[i] + c[i];
+}
+
 __global__ static void directional_steering_project_kernel(
         float       *x,
         const float *directions,
@@ -74,4 +85,3 @@ __global__ static void zero_kernel(float *out, uint64_t n) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = 0.0f;
 }
-

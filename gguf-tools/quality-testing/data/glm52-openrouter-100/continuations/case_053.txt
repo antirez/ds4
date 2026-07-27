@@ -1,0 +1,2 @@
+Ecco uno schema JSON minimo per una tool call, strutturato secondo lo standard **JSON Schema**:
+

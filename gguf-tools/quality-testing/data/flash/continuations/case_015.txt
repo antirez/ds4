@@ -1,0 +1,1 @@
+Ecco lo pseudocodice per inserire un elemento in un heap binario (min-heap o max-he

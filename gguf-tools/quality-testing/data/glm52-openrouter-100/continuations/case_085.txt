@@ -1,0 +1,1 @@
+A compiler uses an abstract syntax tree (AST) as a structured, hierarchical representation of the source code's logic, stripped

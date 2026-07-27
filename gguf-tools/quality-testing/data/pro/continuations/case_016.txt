@@ -1,0 +1,1 @@
+La scelta tra **Top-P (Nucleus Sampling)** e **Temperatura Zero** dipende interamente

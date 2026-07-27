@@ -1,0 +1,1 @@
+Un utente segnala decode lento a contesto lungo. Elenca cinque misure iniziali.

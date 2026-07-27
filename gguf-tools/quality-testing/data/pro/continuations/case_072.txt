@@ -1,0 +1,1 @@
+Nel contesto dei database distribuiti, la **consistenza eventuale** (dall'inglese *

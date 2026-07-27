@@ -1,0 +1,1 @@
+**Eventual consistency** is a consistency model used in distributed databases (and other distributed systems) where, given enough time

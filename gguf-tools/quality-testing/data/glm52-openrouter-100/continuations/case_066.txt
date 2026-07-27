@@ -1,0 +1,1 @@
+Testing a command-line interface (CLI) parser requires a shift in mindset from traditional unit testing. Instead of just testing business

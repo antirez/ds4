@@ -1,0 +1,1 @@
+Binary search finds the insertion point by narrowing down the position where a target value should be placed to maintain sorted order. Here

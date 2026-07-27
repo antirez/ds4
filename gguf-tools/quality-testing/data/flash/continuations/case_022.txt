@@ -1,0 +1,1 @@
+This is a fundamental question in concurrent programming. The core difference lies in **what they protect** and **how they coordinate

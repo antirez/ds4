@@ -11,6 +11,7 @@ static uint64_t g_model_file_size;
 static int g_model_cache_full;
 static int g_ssd_streaming_mode;
 static cudaStream_t g_model_upload_stream;
+static cudaStream_t g_stream_selected_upload_stream;
 static cudaStream_t g_selected_readback_stream;
 static cudaEvent_t g_selected_readback_event;
 static uint64_t g_selected_readback_event_value;
@@ -24,9 +25,11 @@ static int g_quality_mode;
 enum {
     DS4_ROCM_N_EXPERT = 256u,
     DS4_ROCM_MAX_N_EXPERT = 384u,
-    DS4_ROCM_N_EXPERT_USED = 6u,
+    DS4_ROCM_N_EXPERT_USED = 8u,
     DS4_ROCM_STREAM_READ_WORKERS = DS4_ROCM_N_EXPERT_USED * 3u,
+    DS4_ROCM_STREAM_READ_DEFAULT_WORKERS = 16u,
     DS4_ROCM_STREAM_READ_MAX_JOBS = DS4_ROCM_MAX_N_EXPERT * 3u,
+    DS4_ROCM_STREAM_CACHE_LAYER_STATS_MAX = 128u,
     DS4_ROCM_COMPRESSOR_MAX_RATIO = 128u
 };
 #define DS4_ROCM_EXPERT_WEIGHT_SCALE 1.5f
@@ -92,6 +95,9 @@ struct cuda_stream_selected_cache {
     const char **gate_ptrs;
     const char **up_ptrs;
     const char **down_ptrs;
+    const char **gate_ptrs_stage;
+    const char **up_ptrs_stage;
+    const char **down_ptrs_stage;
     ds4_gpu_tensor slot_tensor;
 };
 
@@ -110,6 +116,19 @@ struct cuda_stream_resident_expert {
     char *down;
     uint64_t bytes;
     uint64_t last_used;
+    int pooled;
+};
+
+/*
+ * Streamed experts share one size class per model (2*gate + down bytes), so
+ * the resident cache carves fixed slots out of large slabs instead of doing a
+ * cudaMalloc/cudaFree round trip per cache miss.  Allocator traffic was a
+ * large fraction of decode time: hundreds of 11.8 MiB device allocations and
+ * frees per generated token, each costing GTT page-table work.
+ */
+struct cuda_stream_expert_slab {
+    char *base;
+    uint64_t bytes;
 };
 
 struct cuda_stream_resident_key {
@@ -173,6 +192,18 @@ struct cuda_stream_batch_selected_cache {
     const char **missing_gate_ptrs;
     const char **missing_up_ptrs;
     uint32_t ptr_capacity;
+    int32_t *selected_stage;
+    uint64_t selected_stage_capacity;
+    uint8_t *pair_missing_stage;
+    uint64_t pair_missing_stage_capacity;
+    const char **gate_ptrs_stage;
+    const char **up_ptrs_stage;
+    const char **down_ptrs_stage;
+    const char **resident_gate_ptrs_stage;
+    const char **resident_up_ptrs_stage;
+    const char **missing_gate_ptrs_stage;
+    const char **missing_up_ptrs_stage;
+    uint32_t ptr_stage_capacity;
     ds4_gpu_tensor selected_tensor;
 };
 
@@ -216,6 +247,17 @@ struct cuda_stream_cache_stats {
     uint64_t max_resident_bytes;
 };
 
+struct cuda_stream_cache_layer_stats {
+    uint64_t selected_calls;
+    uint64_t selected_slots;
+    uint64_t selected_hits;
+    uint64_t selected_misses;
+    uint64_t batch_calls;
+    uint64_t batch_unique;
+    uint64_t batch_hits;
+    uint64_t batch_misses;
+};
+
 static std::vector<cuda_model_range> g_model_ranges;
 static std::vector<cuda_model_arena> g_model_arenas;
 static std::vector<cuda_model_image> g_model_images;
@@ -249,13 +291,26 @@ static std::unordered_map<cuda_stream_resident_key,
                           cuda_stream_resident_key_hash> g_stream_resident_index;
 static uint64_t g_stream_resident_bytes;
 static uint64_t g_stream_resident_clock;
+static std::vector<cuda_stream_expert_slab> g_stream_expert_slabs;
+static std::vector<char *> g_stream_expert_free_slots;
+static uint64_t g_stream_expert_slot_bytes;
+static uint32_t g_stream_expert_slot_count;
 static cuda_stream_cache_stats g_stream_cache_stats;
+static cuda_stream_cache_layer_stats
+    g_stream_cache_layer_stats[DS4_ROCM_STREAM_CACHE_LAYER_STATS_MAX];
 static int g_stream_cache_stats_enabled = -1;
+static int g_stream_cache_layer_stats_enabled = -1;
+static int g_stream_evict_past_layers_first_enabled = -1;
 static int32_t g_routed_moe_selected_override[DS4_ROCM_N_EXPERT_USED];
 static uint32_t g_routed_moe_selected_override_n;
-static uint64_t g_stream_selected_stage_counter;
 static cudaEvent_t g_stream_selected_reuse_event;
 static int g_stream_selected_reuse_event_pending;
+static cudaEvent_t g_stream_selected_upload_ready_event;
+static int g_stream_selected_upload_event_pending;
+static cudaEvent_t g_stream_batch_selected_reuse_event;
+static int g_stream_batch_selected_reuse_event_pending;
+static cudaEvent_t g_stream_batch_selected_upload_ready_event;
+static int g_stream_batch_selected_upload_event_pending;
 static void *g_stream_read_stage_raw[DS4_ROCM_STREAM_READ_WORKERS];
 static uint64_t g_stream_read_stage_bytes[DS4_ROCM_STREAM_READ_WORKERS];
 static cudaStream_t g_stream_read_upload_streams[DS4_ROCM_STREAM_READ_WORKERS];
@@ -265,22 +320,48 @@ static pthread_mutex_t g_stream_read_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_stream_read_work_cond = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t g_stream_read_done_cond = PTHREAD_COND_INITIALIZER;
 static int g_stream_read_pool_started;
+static uint32_t g_stream_read_pool_workers;
 static int g_stream_read_pool_stop;
 static struct cuda_stream_read_job *g_stream_read_active_jobs;
 static uint32_t g_stream_read_active_count;
 static uint32_t g_stream_read_active_next;
 static uint32_t g_stream_read_active_done;
 static int g_stream_read_active_ok;
+static pthread_t g_stream_read_active_owner;
+static int g_stream_read_active_owner_set;
+static int g_stream_read_profile_enabled = -1;
+static int g_stream_read_direct_disabled = -1;
+static int g_stream_read_profile_registered;
+static uint64_t g_stream_read_profile_jobs;
+static uint64_t g_stream_read_profile_bytes;
+static uint64_t g_stream_read_profile_read_us;
+static uint64_t g_stream_read_profile_upload_us;
+static uint64_t g_stream_read_profile_wait_calls;
+static uint64_t g_stream_read_profile_wait_us;
+static uint64_t g_stream_read_profile_start_calls;
+static uint64_t g_stream_read_profile_exact_groups;
+static uint64_t g_stream_read_profile_gap1m_groups;
+static uint64_t g_stream_read_profile_gap4m_groups;
+static uint64_t g_stream_read_profile_gap1m_extra;
+static uint64_t g_stream_read_profile_gap4m_extra;
 
 static int cuda_ok(cudaError_t err, const char *what);
+static double cuda_wall_sec(void);
 static uint64_t cuda_model_copy_chunk_bytes(void);
 static void cuda_model_drop_file_pages(uint64_t offset, uint64_t bytes);
+static uint64_t cuda_round_down(uint64_t v, uint64_t align);
+static uint64_t cuda_round_up(uint64_t v, uint64_t align);
 static int cuda_model_stage_pool_alloc(uint64_t bytes);
 static int cuda_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset);
 static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
                                  uint64_t offset, uint64_t bytes,
                                  const char **payload);
 static int cuda_stream_selected_reuse_wait(const char *what);
+static int cuda_stream_selected_upload_wait_host(const char *what);
+static void cuda_stream_selected_stage_release(void);
+static int cuda_stream_batch_selected_reuse_wait(const char *what);
+static int cuda_stream_batch_selected_upload_wait_host(const char *what);
+static void cuda_stream_batch_selected_stage_release(void);
 static void cuda_stream_read_pool_shutdown(void);
 
 static int cuda_u64_mul_checked(uint64_t a, uint64_t b, uint64_t *out) {
@@ -290,17 +371,41 @@ static int cuda_u64_mul_checked(uint64_t a, uint64_t b, uint64_t *out) {
     return 1;
 }
 
+static int cuda_u64_add_checked(uint64_t a, uint64_t b, uint64_t *out) {
+    if (!out || a > UINT64_MAX - b) return 0;
+    *out = a + b;
+    return 1;
+}
+
 static int cuda_u64_mul3_checked(uint64_t a, uint64_t b, uint64_t c, uint64_t *out) {
     uint64_t tmp = 0;
     return cuda_u64_mul_checked(a, b, &tmp) && cuda_u64_mul_checked(tmp, c, out);
 }
 
+static int cuda_stream_cache_layer_stats_on(void) {
+    if (g_stream_cache_layer_stats_enabled < 0) {
+        g_stream_cache_layer_stats_enabled =
+            getenv("DS4_ROCM_STREAM_CACHE_LAYER_STATS") != NULL ? 1 : 0;
+    }
+    return g_stream_cache_layer_stats_enabled;
+}
+
 static int cuda_stream_cache_stats_on(void) {
     if (g_stream_cache_stats_enabled < 0) {
         g_stream_cache_stats_enabled =
-            getenv("DS4_ROCM_STREAM_CACHE_STATS") != NULL ? 1 : 0;
+            (getenv("DS4_ROCM_STREAM_CACHE_STATS") != NULL ||
+             cuda_stream_cache_layer_stats_on()) ? 1 : 0;
     }
     return g_stream_cache_stats_enabled;
+}
+
+static int cuda_stream_evict_past_layers_first(void) {
+    if (g_stream_evict_past_layers_first_enabled < 0) {
+        const char *env = getenv("DS4_ROCM_STREAM_EVICT_PAST_LAYERS_FIRST");
+        g_stream_evict_past_layers_first_enabled =
+            (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return g_stream_evict_past_layers_first_enabled;
 }
 
 static void cuda_stream_cache_stats_note_resident(void) {
@@ -347,6 +452,38 @@ static void cuda_stream_cache_stats_print(const char *label) {
             (unsigned long long)g_stream_cache_stats.max_resident_count,
             (double)g_stream_cache_stats.max_resident_bytes / 1073741824.0,
             g_stream_expert_cache_budget);
+    if (!cuda_stream_cache_layer_stats_on()) return;
+    for (uint32_t layer = 0;
+         layer < DS4_ROCM_STREAM_CACHE_LAYER_STATS_MAX;
+         layer++) {
+        const cuda_stream_cache_layer_stats *s =
+            &g_stream_cache_layer_stats[layer];
+        if (s->selected_calls == 0 && s->batch_calls == 0) continue;
+        const double selected_hit_pct =
+            s->selected_slots ?
+                100.0 * (double)s->selected_hits /
+                    (double)s->selected_slots : 0.0;
+        const double batch_hit_pct =
+            s->batch_unique ?
+                100.0 * (double)s->batch_hits /
+                    (double)s->batch_unique : 0.0;
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "stream cache layer %u %s: "
+                "selected calls=%llu slots=%llu hits=%llu misses=%llu hit=%.1f%%; "
+                "batch calls=%llu unique=%llu hits=%llu misses=%llu hit=%.1f%%\n",
+                layer,
+                label ? label : "",
+                (unsigned long long)s->selected_calls,
+                (unsigned long long)s->selected_slots,
+                (unsigned long long)s->selected_hits,
+                (unsigned long long)s->selected_misses,
+                selected_hit_pct,
+                (unsigned long long)s->batch_calls,
+                (unsigned long long)s->batch_unique,
+                (unsigned long long)s->batch_hits,
+                (unsigned long long)s->batch_misses,
+                batch_hit_pct);
+    }
 }
 
 static int cuda_model_range_fits(uint64_t model_size, uint64_t offset, uint64_t bytes) {
@@ -396,6 +533,15 @@ static const char *cuda_model_range_ptr_from_fd(
         uint64_t offset,
         uint64_t bytes,
         const char *what);
+static const char *cuda_model_range_ptr(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t bytes,
+        const char *what);
+static int cuda_model_range_is_cached(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t bytes);
 __global__ static void dequant_q8_0_to_f16_kernel(
         __half *out,
         const unsigned char *w,
@@ -475,17 +621,51 @@ static void cuda_model_image_release_all(void) {
     g_model_images.clear();
 }
 
+static int cuda_stream_resident_reclaim_wait(const char *what) {
+    if (!cuda_stream_selected_reuse_wait(what)) return 0;
+    if (!cuda_stream_batch_selected_reuse_wait(what)) return 0;
+    return 1;
+}
+
 static void cuda_stream_resident_cache_release(void) {
+    if (!cuda_stream_resident_reclaim_wait(
+                "streaming resident expert cache release")) {
+        return;
+    }
     for (cuda_stream_resident_expert &e : g_stream_resident_experts) {
-        if (e.base) (void)cudaFree(e.base);
+        if (e.base && !e.pooled) (void)cudaFree(e.base);
     }
     g_stream_resident_experts.clear();
     g_stream_resident_index.clear();
     g_stream_resident_bytes = 0;
     g_stream_resident_clock = 0;
+    for (cuda_stream_expert_slab &slab : g_stream_expert_slabs) {
+        if (slab.base) (void)cudaFree(slab.base);
+    }
+    g_stream_expert_slabs.clear();
+    g_stream_expert_free_slots.clear();
+    g_stream_expert_slot_bytes = 0;
+    g_stream_expert_slot_count = 0;
 }
 
 static void cuda_stream_layer_expert_cache_release(void) {
+    bool any_active = false;
+    for (uint32_t i = 0; i < 2u; i++) {
+        if (g_stream_layer_expert_cache[i].base) {
+            any_active = true;
+            break;
+        }
+    }
+    if (any_active) {
+        cudaError_t sync_err = cudaDeviceSynchronize();
+        if (sync_err != cudaSuccess) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "streaming full-layer expert cache "
+                    "release sync failed: %s\n",
+                    cudaGetErrorString(sync_err));
+            (void)cudaGetLastError();
+        }
+    }
     for (uint32_t i = 0; i < 2u; i++) {
         cuda_stream_layer_expert_cache &c = g_stream_layer_expert_cache[i];
         if (c.base) (void)cudaFree(c.base);
@@ -501,6 +681,8 @@ static void cuda_stream_read_stage_release(void) {
             g_stream_read_stage_raw[i] = NULL;
             g_stream_read_stage_bytes[i] = 0;
         }
+    }
+    for (uint32_t i = 0; i < DS4_ROCM_STREAM_READ_WORKERS; i++) {
         if (g_stream_read_upload_streams[i]) {
             (void)cudaStreamDestroy(g_stream_read_upload_streams[i]);
             g_stream_read_upload_streams[i] = NULL;
@@ -509,6 +691,10 @@ static void cuda_stream_read_stage_release(void) {
 }
 
 static void cuda_stream_batch_selected_cache_release(void) {
+    (void)cuda_stream_batch_selected_reuse_wait(
+            "streaming batch selected cache release");
+    (void)cuda_stream_batch_selected_upload_wait_host(
+            "streaming batch selected cache release upload");
     if (g_stream_batch_selected_cache.selected_ids) {
         (void)cudaFree(g_stream_batch_selected_cache.selected_ids);
     }
@@ -536,11 +722,24 @@ static void cuda_stream_batch_selected_cache_release(void) {
     if (g_stream_batch_selected_cache.missing_up_ptrs) {
         (void)cudaFree(g_stream_batch_selected_cache.missing_up_ptrs);
     }
+    if (g_stream_batch_selected_reuse_event) {
+        (void)cudaEventDestroy(g_stream_batch_selected_reuse_event);
+        g_stream_batch_selected_reuse_event = NULL;
+    }
+    if (g_stream_batch_selected_upload_ready_event) {
+        (void)cudaEventDestroy(g_stream_batch_selected_upload_ready_event);
+        g_stream_batch_selected_upload_ready_event = NULL;
+    }
+    g_stream_batch_selected_reuse_event_pending = 0;
+    g_stream_batch_selected_upload_event_pending = 0;
+    cuda_stream_batch_selected_stage_release();
     memset(&g_stream_batch_selected_cache, 0, sizeof(g_stream_batch_selected_cache));
 }
 
 static void cuda_stream_selected_cache_release(void) {
     (void)cuda_stream_selected_reuse_wait("streaming selected cache release");
+    (void)cuda_stream_selected_upload_wait_host(
+            "streaming selected cache release upload");
     if (g_stream_selected_cache.gate) (void)cudaFree(g_stream_selected_cache.gate);
     if (g_stream_selected_cache.up) (void)cudaFree(g_stream_selected_cache.up);
     if (g_stream_selected_cache.down) (void)cudaFree(g_stream_selected_cache.down);
@@ -552,7 +751,13 @@ static void cuda_stream_selected_cache_release(void) {
         (void)cudaEventDestroy(g_stream_selected_reuse_event);
         g_stream_selected_reuse_event = NULL;
     }
+    if (g_stream_selected_upload_ready_event) {
+        (void)cudaEventDestroy(g_stream_selected_upload_ready_event);
+        g_stream_selected_upload_ready_event = NULL;
+    }
     g_stream_selected_reuse_event_pending = 0;
+    g_stream_selected_upload_event_pending = 0;
+    cuda_stream_selected_stage_release();
     memset(&g_stream_selected_cache, 0, sizeof(g_stream_selected_cache));
     cuda_stream_batch_selected_cache_release();
     cuda_stream_resident_cache_release();
@@ -562,8 +767,8 @@ static void cuda_stream_selected_cache_release(void) {
 }
 
 static int cuda_stream_selected_ensure_stream(void) {
-    if (g_model_upload_stream) return 1;
-    cudaError_t err = cudaStreamCreateWithFlags(&g_model_upload_stream, cudaStreamNonBlocking);
+    if (g_stream_selected_upload_stream) return 1;
+    cudaError_t err = cudaStreamCreateWithFlags(&g_stream_selected_upload_stream, cudaStreamNonBlocking);
     if (err != cudaSuccess) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "streaming selected upload stream creation failed: %s\n",
                 cudaGetErrorString(err));
@@ -603,6 +808,70 @@ static int cuda_stream_selected_reuse_wait(const char *what) {
     return 1;
 }
 
+static int cuda_stream_selected_upload_ensure_event(void) {
+    if (g_stream_selected_upload_ready_event) return 1;
+    cudaError_t err =
+        cudaEventCreateWithFlags(&g_stream_selected_upload_ready_event,
+                                 cudaEventDisableTiming);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "streaming selected upload event creation failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return 1;
+}
+
+static int cuda_stream_selected_upload_wait_host(const char *what) {
+    if (!g_stream_selected_upload_event_pending) return 1;
+    cudaError_t err = cudaEventSynchronize(g_stream_selected_upload_ready_event);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "%s wait failed: %s\n",
+                what ? what : "streaming selected upload",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    g_stream_selected_upload_event_pending = 0;
+    return 1;
+}
+
+static int cuda_stream_selected_upload_record_ready(void) {
+    if (!cuda_stream_selected_upload_ensure_event()) return 0;
+    cudaError_t err = cudaEventRecord(g_stream_selected_upload_ready_event,
+                                      g_stream_selected_upload_stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "streaming selected upload event record failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    g_stream_selected_upload_event_pending = 1;
+    return 1;
+}
+
+static int cuda_stream_selected_wait_upload_ready(void) {
+    if (!g_stream_selected_upload_event_pending) return 1;
+#ifdef __HIP_PLATFORM_AMD__
+    cudaError_t err =
+        hipStreamWaitEvent(0, g_stream_selected_upload_ready_event, 0);
+#else
+    cudaError_t err =
+        cudaStreamWaitEvent(0, g_stream_selected_upload_ready_event, 0);
+#endif
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "streaming selected upload stream wait failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return 1;
+}
+
 static int cuda_stream_selected_mark_inflight(void) {
     if (!g_ssd_streaming_mode) return 1;
     if (!cuda_stream_selected_reuse_ensure_event()) return 0;
@@ -615,11 +884,142 @@ static int cuda_stream_selected_mark_inflight(void) {
         return 0;
     }
     g_stream_selected_reuse_event_pending = 1;
+    g_stream_selected_upload_event_pending = 0;
     return 1;
+}
+
+static int cuda_stream_batch_selected_reuse_ensure_event(void) {
+    if (g_stream_batch_selected_reuse_event) return 1;
+    cudaError_t err =
+        cudaEventCreateWithFlags(&g_stream_batch_selected_reuse_event,
+                                 cudaEventDisableTiming);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "streaming batch selected reuse event creation failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return 1;
+}
+
+static int cuda_stream_batch_selected_upload_ensure_event(void) {
+    if (g_stream_batch_selected_upload_ready_event) return 1;
+    cudaError_t err =
+        cudaEventCreateWithFlags(&g_stream_batch_selected_upload_ready_event,
+                                 cudaEventDisableTiming);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "streaming batch selected upload event creation failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return 1;
+}
+
+static int cuda_stream_batch_selected_upload_wait_host(const char *what) {
+    if (!g_stream_batch_selected_upload_event_pending) return 1;
+    cudaError_t err =
+        cudaEventSynchronize(g_stream_batch_selected_upload_ready_event);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "%s wait failed: %s\n",
+                what ? what : "streaming batch selected upload",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    g_stream_batch_selected_upload_event_pending = 0;
+    return 1;
+}
+
+static int cuda_stream_batch_selected_upload_record_ready(void) {
+    if (!cuda_stream_batch_selected_upload_ensure_event()) return 0;
+    cudaError_t err = cudaEventRecord(g_stream_batch_selected_upload_ready_event,
+                                      g_stream_selected_upload_stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "streaming batch selected upload event record failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    g_stream_batch_selected_upload_event_pending = 1;
+    return 1;
+}
+
+static int cuda_stream_batch_selected_wait_upload_ready(void) {
+    if (!g_stream_batch_selected_upload_event_pending) return 1;
+#ifdef __HIP_PLATFORM_AMD__
+    cudaError_t err =
+        hipStreamWaitEvent(0, g_stream_batch_selected_upload_ready_event, 0);
+#else
+    cudaError_t err =
+        cudaStreamWaitEvent(0, g_stream_batch_selected_upload_ready_event, 0);
+#endif
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "streaming batch selected upload stream wait failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return 1;
+}
+
+static int cuda_stream_batch_selected_reuse_wait(const char *what) {
+    if (!g_stream_batch_selected_reuse_event_pending) return 1;
+    cudaError_t err = cudaEventSynchronize(g_stream_batch_selected_reuse_event);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "%s wait failed: %s\n",
+                what ? what : "streaming batch selected cache reuse",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    g_stream_batch_selected_reuse_event_pending = 0;
+    return 1;
+}
+
+static int cuda_stream_batch_selected_mark_inflight(void) {
+    if (!g_ssd_streaming_mode) return 1;
+    if (!cuda_stream_batch_selected_reuse_ensure_event()) return 0;
+    cudaError_t err = cudaEventRecord(g_stream_batch_selected_reuse_event, 0);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "streaming batch selected reuse event record failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    g_stream_batch_selected_reuse_event_pending = 1;
+    g_stream_batch_selected_upload_event_pending = 0;
+    return 1;
+}
+
+static void cuda_stream_selected_stage_release(void) {
+    if (g_stream_selected_cache.gate_ptrs_stage) {
+        (void)cudaFreeHost((void *)g_stream_selected_cache.gate_ptrs_stage);
+    }
+    if (g_stream_selected_cache.up_ptrs_stage) {
+        (void)cudaFreeHost((void *)g_stream_selected_cache.up_ptrs_stage);
+    }
+    if (g_stream_selected_cache.down_ptrs_stage) {
+        (void)cudaFreeHost((void *)g_stream_selected_cache.down_ptrs_stage);
+    }
+    g_stream_selected_cache.gate_ptrs_stage = NULL;
+    g_stream_selected_cache.up_ptrs_stage = NULL;
+    g_stream_selected_cache.down_ptrs_stage = NULL;
 }
 
 static int cuda_stream_selected_ensure_buffers(uint64_t gate_bytes, uint64_t down_bytes) {
     if (gate_bytes == 0 || down_bytes == 0) return 0;
+    if (!cuda_stream_selected_upload_wait_host(
+                "streaming selected cache upload")) {
+        return 0;
+    }
     cudaError_t err = cudaSuccess;
     if (g_stream_selected_cache.gate_capacity < gate_bytes) {
         if (g_stream_selected_cache.gate) (void)cudaFree(g_stream_selected_cache.gate);
@@ -698,13 +1098,89 @@ static int cuda_stream_selected_ensure_buffers(uint64_t gate_bytes, uint64_t dow
             return 0;
         }
     }
+    if (!g_stream_selected_cache.gate_ptrs_stage) {
+        void *stage = NULL;
+        err = cudaMallocHost(&stage, DS4_ROCM_N_EXPERT_USED * sizeof(char *));
+        g_stream_selected_cache.gate_ptrs_stage =
+            err == cudaSuccess ? (const char **)stage : NULL;
+        stage = NULL;
+        if (err == cudaSuccess) {
+            err = cudaMallocHost(&stage, DS4_ROCM_N_EXPERT_USED * sizeof(char *));
+            g_stream_selected_cache.up_ptrs_stage =
+                err == cudaSuccess ? (const char **)stage : NULL;
+            stage = NULL;
+        }
+        if (err == cudaSuccess) {
+            err = cudaMallocHost(&stage, DS4_ROCM_N_EXPERT_USED * sizeof(char *));
+            g_stream_selected_cache.down_ptrs_stage =
+                err == cudaSuccess ? (const char **)stage : NULL;
+        }
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "streaming selected pointer staging alloc failed: %s\n",
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            cuda_stream_selected_stage_release();
+            return 0;
+        }
+    }
     return 1;
+}
+
+static void cuda_stream_batch_selected_stage_release(void) {
+    if (g_stream_batch_selected_cache.selected_stage) {
+        (void)cudaFreeHost(g_stream_batch_selected_cache.selected_stage);
+    }
+    if (g_stream_batch_selected_cache.pair_missing_stage) {
+        (void)cudaFreeHost(g_stream_batch_selected_cache.pair_missing_stage);
+    }
+    if (g_stream_batch_selected_cache.gate_ptrs_stage) {
+        (void)cudaFreeHost((void *)g_stream_batch_selected_cache.gate_ptrs_stage);
+    }
+    if (g_stream_batch_selected_cache.up_ptrs_stage) {
+        (void)cudaFreeHost((void *)g_stream_batch_selected_cache.up_ptrs_stage);
+    }
+    if (g_stream_batch_selected_cache.down_ptrs_stage) {
+        (void)cudaFreeHost((void *)g_stream_batch_selected_cache.down_ptrs_stage);
+    }
+    if (g_stream_batch_selected_cache.resident_gate_ptrs_stage) {
+        (void)cudaFreeHost((void *)g_stream_batch_selected_cache.resident_gate_ptrs_stage);
+    }
+    if (g_stream_batch_selected_cache.resident_up_ptrs_stage) {
+        (void)cudaFreeHost((void *)g_stream_batch_selected_cache.resident_up_ptrs_stage);
+    }
+    if (g_stream_batch_selected_cache.missing_gate_ptrs_stage) {
+        (void)cudaFreeHost((void *)g_stream_batch_selected_cache.missing_gate_ptrs_stage);
+    }
+    if (g_stream_batch_selected_cache.missing_up_ptrs_stage) {
+        (void)cudaFreeHost((void *)g_stream_batch_selected_cache.missing_up_ptrs_stage);
+    }
+    g_stream_batch_selected_cache.selected_stage = NULL;
+    g_stream_batch_selected_cache.selected_stage_capacity = 0;
+    g_stream_batch_selected_cache.pair_missing_stage = NULL;
+    g_stream_batch_selected_cache.pair_missing_stage_capacity = 0;
+    g_stream_batch_selected_cache.gate_ptrs_stage = NULL;
+    g_stream_batch_selected_cache.up_ptrs_stage = NULL;
+    g_stream_batch_selected_cache.down_ptrs_stage = NULL;
+    g_stream_batch_selected_cache.resident_gate_ptrs_stage = NULL;
+    g_stream_batch_selected_cache.resident_up_ptrs_stage = NULL;
+    g_stream_batch_selected_cache.missing_gate_ptrs_stage = NULL;
+    g_stream_batch_selected_cache.missing_up_ptrs_stage = NULL;
+    g_stream_batch_selected_cache.ptr_stage_capacity = 0;
 }
 
 static int cuda_stream_batch_selected_ensure_buffers(
         uint64_t n_ids,
         uint32_t n_unique) {
     if (n_ids == 0 || n_unique == 0) return 0;
+    if (!cuda_stream_batch_selected_reuse_wait(
+                "streaming batch selected cache reuse")) {
+        return 0;
+    }
+    if (!cuda_stream_batch_selected_upload_wait_host(
+                "streaming batch selected cache upload")) {
+        return 0;
+    }
     cudaError_t err = cudaSuccess;
     const uint64_t selected_bytes = n_ids * sizeof(int32_t);
     if (g_stream_batch_selected_cache.selected_capacity < selected_bytes) {
@@ -800,55 +1276,77 @@ static int cuda_stream_batch_selected_ensure_buffers(
         }
         g_stream_batch_selected_cache.ptr_capacity = n_unique;
     }
+    if (g_stream_batch_selected_cache.selected_stage_capacity < selected_bytes ||
+        g_stream_batch_selected_cache.pair_missing_stage_capacity < n_ids ||
+        g_stream_batch_selected_cache.ptr_stage_capacity < n_unique) {
+        cuda_stream_batch_selected_stage_release();
+        err = cudaMallocHost((void **)&g_stream_batch_selected_cache.selected_stage,
+                             (size_t)selected_bytes);
+        if (err == cudaSuccess) {
+            err = cudaMallocHost((void **)&g_stream_batch_selected_cache.pair_missing_stage,
+                                 (size_t)n_ids);
+        }
+        void *stage = NULL;
+        if (err == cudaSuccess) {
+            err = cudaMallocHost(&stage, (size_t)n_unique * sizeof(char *));
+            g_stream_batch_selected_cache.gate_ptrs_stage =
+                err == cudaSuccess ? (const char **)stage : NULL;
+            stage = NULL;
+        }
+        if (err == cudaSuccess) {
+            err = cudaMallocHost(&stage, (size_t)n_unique * sizeof(char *));
+            g_stream_batch_selected_cache.up_ptrs_stage =
+                err == cudaSuccess ? (const char **)stage : NULL;
+            stage = NULL;
+        }
+        if (err == cudaSuccess) {
+            err = cudaMallocHost(&stage, (size_t)n_unique * sizeof(char *));
+            g_stream_batch_selected_cache.down_ptrs_stage =
+                err == cudaSuccess ? (const char **)stage : NULL;
+            stage = NULL;
+        }
+        if (err == cudaSuccess) {
+            err = cudaMallocHost(&stage, (size_t)n_unique * sizeof(char *));
+            g_stream_batch_selected_cache.resident_gate_ptrs_stage =
+                err == cudaSuccess ? (const char **)stage : NULL;
+            stage = NULL;
+        }
+        if (err == cudaSuccess) {
+            err = cudaMallocHost(&stage, (size_t)n_unique * sizeof(char *));
+            g_stream_batch_selected_cache.resident_up_ptrs_stage =
+                err == cudaSuccess ? (const char **)stage : NULL;
+            stage = NULL;
+        }
+        if (err == cudaSuccess) {
+            err = cudaMallocHost(&stage, (size_t)n_unique * sizeof(char *));
+            g_stream_batch_selected_cache.missing_gate_ptrs_stage =
+                err == cudaSuccess ? (const char **)stage : NULL;
+            stage = NULL;
+        }
+        if (err == cudaSuccess) {
+            err = cudaMallocHost(&stage, (size_t)n_unique * sizeof(char *));
+            g_stream_batch_selected_cache.missing_up_ptrs_stage =
+                err == cudaSuccess ? (const char **)stage : NULL;
+        }
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "streaming batch selected staging alloc failed "
+                    "(ids=%.2f MiB unique=%u): %s\n",
+                    (double)selected_bytes / 1048576.0,
+                    n_unique,
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            cuda_stream_batch_selected_stage_release();
+            return 0;
+        }
+        g_stream_batch_selected_cache.selected_stage_capacity = selected_bytes;
+        g_stream_batch_selected_cache.pair_missing_stage_capacity = n_ids;
+        g_stream_batch_selected_cache.ptr_stage_capacity = n_unique;
+    }
     g_stream_batch_selected_cache.selected_tensor.ptr =
         g_stream_batch_selected_cache.selected_ids;
     g_stream_batch_selected_cache.selected_tensor.bytes = selected_bytes;
     g_stream_batch_selected_cache.selected_tensor.owner = 0;
-    return 1;
-}
-
-static int cuda_stream_batch_selected_cache_apply(
-        const void *model_map,
-        uint32_t layer,
-        uint32_t n_total_expert,
-        uint32_t n_selected,
-        uint32_t n_tokens,
-        uint64_t gate_offset,
-        uint64_t up_offset,
-        uint64_t down_offset,
-        uint64_t gate_expert_bytes,
-        uint64_t down_expert_bytes,
-        const ds4_gpu_tensor **selected_exec,
-        const char ***gate_ptrs,
-        const char ***up_ptrs,
-        const char ***down_ptrs,
-        uint32_t *unique_out) {
-    if (!selected_exec || !gate_ptrs || !up_ptrs || !down_ptrs || !unique_out) {
-        return 0;
-    }
-    if (!g_stream_batch_selected_cache.loaded ||
-        g_stream_batch_selected_cache.model_map != model_map ||
-        g_stream_batch_selected_cache.layer != layer ||
-        g_stream_batch_selected_cache.n_total_expert != n_total_expert ||
-        g_stream_batch_selected_cache.n_selected != n_selected ||
-        g_stream_batch_selected_cache.n_tokens != n_tokens ||
-        g_stream_batch_selected_cache.gate_offset != gate_offset ||
-        g_stream_batch_selected_cache.up_offset != up_offset ||
-        g_stream_batch_selected_cache.down_offset != down_offset ||
-        g_stream_batch_selected_cache.gate_expert_bytes != gate_expert_bytes ||
-        g_stream_batch_selected_cache.down_expert_bytes != down_expert_bytes ||
-        !g_stream_batch_selected_cache.selected_ids ||
-        !g_stream_batch_selected_cache.gate_ptrs ||
-        !g_stream_batch_selected_cache.up_ptrs ||
-        !g_stream_batch_selected_cache.down_ptrs ||
-        g_stream_batch_selected_cache.n_unique == 0) {
-        return 0;
-    }
-    *selected_exec = &g_stream_batch_selected_cache.selected_tensor;
-    *gate_ptrs = g_stream_batch_selected_cache.gate_ptrs;
-    *up_ptrs = g_stream_batch_selected_cache.up_ptrs;
-    *down_ptrs = g_stream_batch_selected_cache.down_ptrs;
-    *unique_out = g_stream_batch_selected_cache.n_unique;
     return 1;
 }
 
@@ -923,8 +1421,12 @@ static int cuda_stream_resident_find(
     return -1;
 }
 
-static void cuda_stream_resident_evict_at(size_t idx) {
-    if (idx >= g_stream_resident_experts.size()) return;
+static int cuda_stream_resident_evict_at(size_t idx) {
+    if (idx >= g_stream_resident_experts.size()) return 0;
+    if (!cuda_stream_resident_reclaim_wait(
+                "streaming resident expert cache eviction")) {
+        return 0;
+    }
     cuda_stream_resident_expert &e = g_stream_resident_experts[idx];
     const cuda_stream_resident_key evicted_key =
         cuda_stream_resident_entry_key(e);
@@ -932,7 +1434,10 @@ static void cuda_stream_resident_evict_at(size_t idx) {
         g_stream_cache_stats.evictions++;
         g_stream_cache_stats.evict_bytes += e.bytes;
     }
-    if (e.base) (void)cudaFree(e.base);
+    if (e.base) {
+        if (e.pooled) g_stream_expert_free_slots.push_back(e.base);
+        else (void)cudaFree(e.base);
+    }
     if (g_stream_resident_bytes >= e.bytes) {
         g_stream_resident_bytes -= e.bytes;
     } else {
@@ -946,6 +1451,7 @@ static void cuda_stream_resident_evict_at(size_t idx) {
                 g_stream_resident_experts[idx])] = idx;
     }
     g_stream_resident_experts.pop_back();
+    return 1;
 }
 
 static int cuda_stream_resident_evict_one(
@@ -954,6 +1460,27 @@ static int cuda_stream_resident_evict_one(
         uint32_t n_selected) {
     size_t victim = (size_t)-1;
     uint64_t oldest = UINT64_MAX;
+    if (cuda_stream_evict_past_layers_first()) {
+        for (size_t i = 0; i < g_stream_resident_experts.size(); i++) {
+            const cuda_stream_resident_expert &e =
+                g_stream_resident_experts[i];
+            if (e.layer > layer ||
+                cuda_stream_selected_is_current(e,
+                                                layer,
+                                                selected_ids,
+                                                n_selected)) {
+                continue;
+            }
+            if (e.last_used < oldest) {
+                oldest = e.last_used;
+                victim = i;
+            }
+        }
+        if (victim != (size_t)-1) {
+            return cuda_stream_resident_evict_at(victim);
+        }
+    }
+    oldest = UINT64_MAX;
     for (size_t i = 0; i < g_stream_resident_experts.size(); i++) {
         const cuda_stream_resident_expert &e = g_stream_resident_experts[i];
         if (cuda_stream_selected_is_current(e, layer, selected_ids, n_selected)) {
@@ -965,12 +1492,31 @@ static int cuda_stream_resident_evict_one(
         }
     }
     if (victim == (size_t)-1) return 0;
-    cuda_stream_resident_evict_at(victim);
-    return 1;
+    return cuda_stream_resident_evict_at(victim);
 }
 
 static uint64_t cuda_stream_resident_free_reserve_bytes(void) {
-    return 16ull * 1024ull * 1024ull * 1024ull;
+    /*
+     * Headroom kept free on the (unified-memory) device while growing the
+     * expert cache.  It must cover decode scratch and transient graph buffers
+     * but every reserved GiB is a GiB not spent caching experts, so keep it
+     * tight.  Override with DS4_ROCM_STREAM_FREE_RESERVE_GB.
+     */
+    static int64_t cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_ROCM_STREAM_FREE_RESERVE_GB");
+        uint64_t gib = 16;
+        if (env && env[0]) {
+            char *end = NULL;
+            errno = 0;
+            unsigned long v = strtoul(env, &end, 10);
+            if (end != env && *end == '\0' && errno == 0 && v >= 2 && v <= 64) {
+                gib = (uint64_t)v;
+            }
+        }
+        cached = (int64_t)(gib * 1024ull * 1024ull * 1024ull);
+    }
+    return (uint64_t)cached;
 }
 
 static int cuda_stream_resident_make_room(
@@ -1001,6 +1547,77 @@ static int cuda_stream_resident_make_room(
     return 1;
 }
 
+static int cuda_stream_expert_slab_grow(uint64_t slot_bytes) {
+    const uint64_t slab_target_bytes = 1024ull * 1024ull * 1024ull;
+    if (g_stream_expert_slot_count >= g_stream_expert_cache_budget) return 0;
+    uint32_t slab_slots =
+        slot_bytes >= slab_target_bytes ?
+            1u : (uint32_t)(slab_target_bytes / slot_bytes);
+    const uint32_t want =
+        g_stream_expert_cache_budget - g_stream_expert_slot_count;
+    if (slab_slots > want) slab_slots = want;
+    while (slab_slots != 0) {
+        uint64_t slab_bytes = 0;
+        if (!cuda_u64_mul_checked(slab_slots, slot_bytes, &slab_bytes)) {
+            slab_slots >>= 1u;
+            continue;
+        }
+        size_t free_b = 0;
+        size_t total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+            (void)total_b;
+            const uint64_t reserve = cuda_stream_resident_free_reserve_bytes();
+            if ((uint64_t)free_b < reserve ||
+                slab_bytes > (uint64_t)free_b - reserve) {
+                slab_slots >>= 1u;
+                continue;
+            }
+        } else {
+            (void)cudaGetLastError();
+        }
+        void *base = NULL;
+        cudaError_t err = cudaMalloc(&base, (size_t)slab_bytes);
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+            slab_slots >>= 1u;
+            continue;
+        }
+        g_stream_expert_slabs.push_back({(char *)base, slab_bytes});
+        g_stream_expert_free_slots.reserve(
+                g_stream_expert_free_slots.size() + slab_slots);
+        for (uint32_t i = 0; i < slab_slots; i++) {
+            g_stream_expert_free_slots.push_back(
+                    (char *)base + (uint64_t)i * slot_bytes);
+        }
+        g_stream_expert_slot_count += slab_slots;
+        return 1;
+    }
+    return 0;
+}
+
+static char *cuda_stream_expert_slot_acquire(
+        uint64_t bytes,
+        uint32_t layer,
+        const int32_t *selected_ids,
+        uint32_t n_selected) {
+    if (g_stream_expert_slot_bytes == 0) g_stream_expert_slot_bytes = bytes;
+    if (bytes != g_stream_expert_slot_bytes) return NULL;
+    for (;;) {
+        if (!g_stream_expert_free_slots.empty()) {
+            char *slot = g_stream_expert_free_slots.back();
+            g_stream_expert_free_slots.pop_back();
+            return slot;
+        }
+        if (g_stream_expert_slot_count < g_stream_expert_cache_budget &&
+            cuda_stream_expert_slab_grow(bytes)) {
+            continue;
+        }
+        if (!cuda_stream_resident_evict_one(layer, selected_ids, n_selected)) {
+            return NULL;
+        }
+    }
+}
+
 static int cuda_stream_resident_alloc(
         const void *model_map,
         uint32_t layer,
@@ -1013,6 +1630,10 @@ static int cuda_stream_resident_alloc(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes) {
     if (g_stream_expert_cache_budget == 0) return -1;
+    if (!cuda_stream_resident_reclaim_wait(
+                "streaming resident expert cache allocation")) {
+        return -1;
+    }
     uint64_t bytes = 0;
     uint64_t gate_pair = 0;
     if (!cuda_u64_mul_checked(2u, gate_expert_bytes, &gate_pair) ||
@@ -1021,33 +1642,52 @@ static int cuda_stream_resident_alloc(
     }
     bytes = gate_pair + down_expert_bytes;
 
-    if (!cuda_stream_resident_make_room(bytes, layer, selected_ids, n_selected)) {
+    void *base = cuda_stream_expert_slot_acquire(bytes,
+                                                 layer,
+                                                 selected_ids,
+                                                 n_selected);
+    const int pooled = base != NULL;
+    if (!pooled && bytes == g_stream_expert_slot_bytes) {
         fprintf(stderr,
-                DS4_GPU_LOG_PREFIX "streaming expert cache cannot keep %.2f MiB "
-                "for layer=%u expert=%d while preserving %.2f GiB free\n",
+                DS4_GPU_LOG_PREFIX "streaming expert cache cannot reserve a "
+                "%.2f MiB slot for layer=%u expert=%d\n",
                 (double)bytes / 1048576.0,
                 layer,
-                expert,
-                (double)cuda_stream_resident_free_reserve_bytes() / 1073741824.0);
+                expert);
         return -1;
     }
+    if (!pooled) {
+        /*
+         * Mixed-precision layers whose experts do not match the slab size
+         * class fall back to dedicated allocations.
+         */
+        if (!cuda_stream_resident_make_room(bytes, layer, selected_ids, n_selected)) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "streaming expert cache cannot keep %.2f MiB "
+                    "for layer=%u expert=%d while preserving %.2f GiB free\n",
+                    (double)bytes / 1048576.0,
+                    layer,
+                    expert,
+                    (double)cuda_stream_resident_free_reserve_bytes() / 1073741824.0);
+            return -1;
+        }
 
-    void *base = NULL;
-    cudaError_t err = cudaMalloc(&base, (size_t)bytes);
-    while (err != cudaSuccess && cuda_stream_resident_evict_one(layer, selected_ids, n_selected)) {
-        (void)cudaGetLastError();
-        err = cudaMalloc(&base, (size_t)bytes);
-    }
-    if (err != cudaSuccess) {
-        fprintf(stderr,
-                DS4_GPU_LOG_PREFIX "streaming expert cache allocation failed "
-                "for layer=%u expert=%d (%.2f MiB): %s\n",
-                layer,
-                expert,
-                (double)bytes / 1048576.0,
-                cudaGetErrorString(err));
-        (void)cudaGetLastError();
-        return -1;
+        cudaError_t err = cudaMalloc(&base, (size_t)bytes);
+        while (err != cudaSuccess && cuda_stream_resident_evict_one(layer, selected_ids, n_selected)) {
+            (void)cudaGetLastError();
+            err = cudaMalloc(&base, (size_t)bytes);
+        }
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "streaming expert cache allocation failed "
+                    "for layer=%u expert=%d (%.2f MiB): %s\n",
+                    layer,
+                    expert,
+                    (double)bytes / 1048576.0,
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            return -1;
+        }
     }
 
     cuda_stream_resident_expert e;
@@ -1066,6 +1706,7 @@ static int cuda_stream_resident_alloc(
     e.down = e.base + 2u * gate_expert_bytes;
     e.bytes = bytes;
     e.last_used = ++g_stream_resident_clock;
+    e.pooled = pooled;
     g_stream_resident_experts.push_back(e);
     g_stream_resident_index[cuda_stream_resident_entry_key(e)] =
         g_stream_resident_experts.size() - 1u;
@@ -1087,6 +1728,7 @@ typedef struct cuda_stream_read_job {
     int ok;
     int uploaded;
     int errnum;
+    int direct;
 } cuda_stream_read_job;
 
 struct cuda_stream_batch_selected_pending {
@@ -1130,14 +1772,193 @@ struct cuda_stream_selected_pending {
 
 static cuda_stream_selected_pending g_stream_selected_pending;
 
-static void cuda_stream_read_job_run(cuda_stream_read_job *job) {
+typedef struct cuda_stream_read_profile_span {
+    uint64_t offset;
+    uint64_t end;
+} cuda_stream_read_profile_span;
+
+static uint64_t cuda_stream_read_profile_us(double seconds) {
+    return seconds <= 0.0 ? 0u : (uint64_t)(seconds * 1000000.0 + 0.5);
+}
+
+static void cuda_stream_read_profile_coalesce(
+        cuda_stream_read_profile_span *spans,
+        uint32_t count,
+        uint64_t max_gap,
+        uint64_t *groups_out,
+        uint64_t *extra_out) {
+    uint64_t groups = 0;
+    uint64_t extra = 0;
+    uint64_t cur_end = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (spans[i].end <= spans[i].offset) continue;
+        if (groups == 0) {
+            groups = 1;
+            cur_end = spans[i].end;
+            continue;
+        }
+        if (spans[i].offset <= cur_end) {
+            if (spans[i].end > cur_end) cur_end = spans[i].end;
+            continue;
+        }
+        const uint64_t gap = spans[i].offset - cur_end;
+        if (gap <= max_gap) {
+            extra += gap;
+            if (spans[i].end > cur_end) cur_end = spans[i].end;
+            continue;
+        }
+        groups++;
+        cur_end = spans[i].end;
+    }
+    if (groups_out) *groups_out = groups;
+    if (extra_out) *extra_out = extra;
+}
+
+static void cuda_stream_read_profile_note_jobs(
+        const cuda_stream_read_job *jobs,
+        uint32_t count) {
+    if (g_stream_read_profile_enabled != 1 || !jobs || count == 0) return;
+    if (count > DS4_ROCM_STREAM_READ_MAX_JOBS) return;
+
+    cuda_stream_read_profile_span spans[DS4_ROCM_STREAM_READ_MAX_JOBS];
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (jobs[i].bytes == 0) continue;
+        spans[n].offset = jobs[i].offset;
+        spans[n].end = jobs[i].offset > UINT64_MAX - jobs[i].bytes ?
+            UINT64_MAX : jobs[i].offset + jobs[i].bytes;
+        n++;
+    }
+    for (uint32_t i = 1; i < n; i++) {
+        const cuda_stream_read_profile_span x = spans[i];
+        uint32_t j = i;
+        while (j != 0 && spans[j - 1].offset > x.offset) {
+            spans[j] = spans[j - 1];
+            j--;
+        }
+        spans[j] = x;
+    }
+
+    uint64_t exact_groups = 0;
+    uint64_t gap1m_groups = 0;
+    uint64_t gap4m_groups = 0;
+    uint64_t exact_extra = 0;
+    uint64_t gap1m_extra = 0;
+    uint64_t gap4m_extra = 0;
+    cuda_stream_read_profile_coalesce(spans, n, 0,
+                                      &exact_groups, &exact_extra);
+    cuda_stream_read_profile_coalesce(spans, n, 1ull * 1048576ull,
+                                      &gap1m_groups, &gap1m_extra);
+    cuda_stream_read_profile_coalesce(spans, n, 4ull * 1048576ull,
+                                      &gap4m_groups, &gap4m_extra);
+
+    (void)exact_extra;
+    g_stream_read_profile_start_calls++;
+    g_stream_read_profile_exact_groups += exact_groups;
+    g_stream_read_profile_gap1m_groups += gap1m_groups;
+    g_stream_read_profile_gap4m_groups += gap4m_groups;
+    g_stream_read_profile_gap1m_extra += gap1m_extra;
+    g_stream_read_profile_gap4m_extra += gap4m_extra;
+}
+
+static void cuda_stream_read_profile_print(void) {
+    if (g_stream_read_profile_jobs == 0u &&
+        g_stream_read_profile_wait_calls == 0u) {
+        return;
+    }
+    const double jobs = g_stream_read_profile_jobs ?
+        (double)g_stream_read_profile_jobs : 1.0;
+    const double waits = g_stream_read_profile_wait_calls ?
+        (double)g_stream_read_profile_wait_calls : 1.0;
+    fprintf(stderr,
+            DS4_GPU_LOG_PREFIX "stream read profile jobs=%llu bytes=%.2f GiB "
+            "read=%.3f ms upload=%.3f ms wait=%.3f ms "
+            "avg_job=%.3f ms avg_wait=%.3f ms\n",
+            (unsigned long long)g_stream_read_profile_jobs,
+            (double)g_stream_read_profile_bytes / 1073741824.0,
+            (double)g_stream_read_profile_read_us / 1000.0,
+            (double)g_stream_read_profile_upload_us / 1000.0,
+            (double)g_stream_read_profile_wait_us / 1000.0,
+            (double)(g_stream_read_profile_read_us +
+                     g_stream_read_profile_upload_us) / 1000.0 / jobs,
+            (double)g_stream_read_profile_wait_us / 1000.0 / waits);
+    fprintf(stderr,
+            DS4_GPU_LOG_PREFIX "stream read locality batches=%llu "
+            "exact_jobs=%llu gap1m_jobs=%llu gap1m_extra=%.2f GiB "
+            "gap4m_jobs=%llu gap4m_extra=%.2f GiB\n",
+            (unsigned long long)g_stream_read_profile_start_calls,
+            (unsigned long long)g_stream_read_profile_exact_groups,
+            (unsigned long long)g_stream_read_profile_gap1m_groups,
+            (double)g_stream_read_profile_gap1m_extra / 1073741824.0,
+            (unsigned long long)g_stream_read_profile_gap4m_groups,
+            (double)g_stream_read_profile_gap4m_extra / 1073741824.0);
+}
+
+static int cuda_stream_read_profile_enabled(void) {
+    if (g_stream_read_profile_enabled < 0) {
+        const char *env = getenv("DS4_ROCM_STREAM_READ_PROFILE");
+        g_stream_read_profile_enabled =
+            (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+        if (g_stream_read_profile_enabled &&
+            !g_stream_read_profile_registered) {
+            atexit(cuda_stream_read_profile_print);
+            g_stream_read_profile_registered = 1;
+        }
+    }
+    return g_stream_read_profile_enabled;
+}
+
+static int cuda_stream_read_direct_disabled(void) {
+    if (g_stream_read_direct_disabled < 0) {
+        const char *env = getenv("DS4_ROCM_STREAM_NO_DIRECT");
+        g_stream_read_direct_disabled =
+            (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return g_stream_read_direct_disabled;
+}
+
+static void cuda_stream_read_job_run(cuda_stream_read_job *job,
+                                     void *stage,
+                                     uint64_t stage_bytes) {
+    if (!job) return;
     job->ok = 0;
     job->uploaded = 0;
     job->errnum = 0;
-    if (!job || !job->host_buf || job->bytes == 0 || g_model_fd < 0) {
-        if (job) job->errnum = EINVAL;
+    job->direct = 0;
+    if (!stage || job->bytes == 0 || g_model_fd < 0) {
+        job->errnum = EINVAL;
         return;
     }
+    job->host_raw = stage;
+    job->host_buf = stage;
+#if defined(__linux__) && defined(O_DIRECT)
+    /*
+     * Direct reads skip the page cache: no page allocation, no extra copy and
+     * no POSIX_FADV_DONTNEED churn per streamed expert.  Alignment slack is
+     * pre-reserved in the staging buffers.  On any direct-read failure fall
+     * back to the buffered fd for this job only; the shared direct fd is left
+     * alone so concurrent workers are unaffected.
+     */
+    if (!cuda_stream_read_direct_disabled() &&
+        g_model_direct_fd >= 0 &&
+        g_model_direct_align > 1 &&
+        g_model_file_size != 0) {
+        const uint64_t aligned_off =
+            cuda_round_down(job->offset, g_model_direct_align);
+        const uint64_t delta = job->offset - aligned_off;
+        const uint64_t read_size =
+            cuda_round_up(delta + job->bytes, g_model_direct_align);
+        if (read_size <= stage_bytes &&
+            aligned_off <= g_model_file_size &&
+            read_size <= g_model_file_size - aligned_off &&
+            cuda_pread_full(g_model_direct_fd, stage, read_size, aligned_off)) {
+            job->host_buf = (char *)stage + delta;
+            job->direct = 1;
+            job->ok = 1;
+            return;
+        }
+    }
+#endif
     if (cuda_pread_full(g_model_fd, job->host_buf, job->bytes, job->offset)) {
         job->ok = 1;
     } else {
@@ -1168,7 +1989,7 @@ static int cuda_stream_read_job_upload(
         return 0;
     }
     job->uploaded = 1;
-    cuda_model_drop_file_pages(job->offset, job->bytes);
+    if (!job->direct) cuda_model_drop_file_pages(job->offset, job->bytes);
     return 1;
 }
 
@@ -1188,21 +2009,41 @@ static void *cuda_stream_read_worker(void *arg) {
         }
         const uint32_t idx = g_stream_read_active_next++;
         cuda_stream_read_job *job = &g_stream_read_active_jobs[idx];
+        void *stage = NULL;
+        uint64_t stage_bytes = 0;
         if (worker_id < DS4_ROCM_STREAM_READ_WORKERS) {
-            job->host_raw = g_stream_read_stage_raw[worker_id];
-            job->host_buf = g_stream_read_stage_raw[worker_id];
+            stage = g_stream_read_stage_raw[worker_id];
+            stage_bytes = g_stream_read_stage_bytes[worker_id];
         }
         pthread_mutex_unlock(&g_stream_read_mutex);
 
-        cuda_stream_read_job_run(job);
+        const int profile = g_stream_read_profile_enabled == 1;
+        const double read_t0 = profile ? cuda_wall_sec() : 0.0;
+        cuda_stream_read_job_run(job, stage, stage_bytes);
+        uint64_t read_us = 0;
+        uint64_t upload_us = 0;
+        if (profile) {
+            read_us = cuda_stream_read_profile_us(cuda_wall_sec() - read_t0);
+        }
         if (job->ok) {
+            const double upload_t0 = profile ? cuda_wall_sec() : 0.0;
             (void)cuda_stream_read_job_upload(
                     job,
                     worker_id < DS4_ROCM_STREAM_READ_WORKERS ?
                         g_stream_read_upload_streams[worker_id] : NULL);
+            if (profile) {
+                upload_us =
+                    cuda_stream_read_profile_us(cuda_wall_sec() - upload_t0);
+            }
         }
 
         pthread_mutex_lock(&g_stream_read_mutex);
+        if (profile) {
+            g_stream_read_profile_jobs++;
+            g_stream_read_profile_bytes += job->bytes;
+            g_stream_read_profile_read_us += read_us;
+            g_stream_read_profile_upload_us += upload_us;
+        }
         if (!job->ok) g_stream_read_active_ok = 0;
         g_stream_read_active_done++;
         if (g_stream_read_active_done >= g_stream_read_active_count) {
@@ -1211,6 +2052,23 @@ static void *cuda_stream_read_worker(void *arg) {
         pthread_mutex_unlock(&g_stream_read_mutex);
     }
     return NULL;
+}
+
+static uint32_t cuda_stream_read_worker_count(void) {
+    const char *env = getenv("DS4_ROCM_STREAM_READ_WORKERS");
+    if (env && env[0]) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long v = strtoul(env, &end, 10);
+        if (end != env && errno == 0) {
+            if (v == 0) return 1u;
+            if (v > DS4_ROCM_STREAM_READ_WORKERS) {
+                return DS4_ROCM_STREAM_READ_WORKERS;
+            }
+            return (uint32_t)v;
+        }
+    }
+    return DS4_ROCM_STREAM_READ_DEFAULT_WORKERS;
 }
 
 static void cuda_stream_read_upload_streams_destroy(void) {
@@ -1223,7 +2081,8 @@ static void cuda_stream_read_upload_streams_destroy(void) {
 }
 
 static int cuda_stream_read_upload_streams_ensure(void) {
-    for (uint32_t i = 0; i < DS4_ROCM_STREAM_READ_WORKERS; i++) {
+    const uint32_t workers = cuda_stream_read_worker_count();
+    for (uint32_t i = 0; i < workers; i++) {
         if (g_stream_read_upload_streams[i]) continue;
         cudaError_t err = cudaStreamCreateWithFlags(
                 &g_stream_read_upload_streams[i],
@@ -1253,11 +2112,14 @@ static int cuda_stream_read_pool_ensure(void) {
     g_stream_read_active_next = 0;
     g_stream_read_active_done = 0;
     g_stream_read_active_ok = 1;
+    g_stream_read_active_owner_set = 0;
+    g_stream_read_pool_workers = cuda_stream_read_worker_count();
+    (void)cuda_stream_read_profile_enabled();
     if (!cuda_stream_read_upload_streams_ensure()) {
         pthread_mutex_unlock(&g_stream_read_mutex);
         return 0;
     }
-    for (uint32_t i = 0; i < DS4_ROCM_STREAM_READ_WORKERS; i++) {
+    for (uint32_t i = 0; i < g_stream_read_pool_workers; i++) {
         g_stream_read_thread_ids[i] = i;
         const int rc = pthread_create(&g_stream_read_threads[i],
                                       NULL,
@@ -1288,17 +2150,19 @@ static void cuda_stream_read_pool_shutdown(void) {
     g_stream_read_pool_stop = 1;
     pthread_cond_broadcast(&g_stream_read_work_cond);
     pthread_mutex_unlock(&g_stream_read_mutex);
-    for (uint32_t i = 0; i < DS4_ROCM_STREAM_READ_WORKERS; i++) {
+    for (uint32_t i = 0; i < g_stream_read_pool_workers; i++) {
         (void)pthread_join(g_stream_read_threads[i], NULL);
     }
     pthread_mutex_lock(&g_stream_read_mutex);
     g_stream_read_pool_started = 0;
+    g_stream_read_pool_workers = 0;
     g_stream_read_pool_stop = 0;
     g_stream_read_active_jobs = NULL;
     g_stream_read_active_count = 0;
     g_stream_read_active_next = 0;
     g_stream_read_active_done = 0;
     g_stream_read_active_ok = 1;
+    g_stream_read_active_owner_set = 0;
     pthread_mutex_unlock(&g_stream_read_mutex);
 }
 
@@ -1311,12 +2175,20 @@ static int cuda_stream_read_jobs_prepare(cuda_stream_read_job *jobs, uint32_t co
         jobs[i].ok = 0;
         jobs[i].uploaded = 0;
         jobs[i].errnum = 0;
+        jobs[i].direct = 0;
         jobs[i].host_raw = NULL;
         jobs[i].host_buf = NULL;
         if (jobs[i].bytes > max_bytes) max_bytes = jobs[i].bytes;
     }
+    /* Slack so direct reads can align their offset and length. */
+    if (g_model_direct_align > 1u &&
+        max_bytes <= UINT64_MAX - 2u * g_model_direct_align) {
+        max_bytes += 2u * g_model_direct_align;
+    }
 
-    for (uint32_t i = 0; i < DS4_ROCM_STREAM_READ_WORKERS; i++) {
+    const uint32_t workers = g_stream_read_pool_started ?
+        g_stream_read_pool_workers : cuda_stream_read_worker_count();
+    for (uint32_t i = 0; i < workers; i++) {
         if (g_stream_read_stage_bytes[i] < max_bytes) {
             if (g_stream_read_stage_raw[i]) {
                 (void)cudaFreeHost(g_stream_read_stage_raw[i]);
@@ -1342,19 +2214,31 @@ static int cuda_stream_read_jobs_prepare(cuda_stream_read_job *jobs, uint32_t co
 
 static int cuda_stream_read_jobs_start(cuda_stream_read_job *jobs, uint32_t count) {
     if (!jobs || count == 0) return 1;
-    if (!cuda_stream_read_jobs_prepare(jobs, count)) return 0;
     if (!cuda_stream_read_pool_ensure()) return 0;
+    const pthread_t self = pthread_self();
     pthread_mutex_lock(&g_stream_read_mutex);
-    if (g_stream_read_active_jobs != NULL) {
+    while (g_stream_read_active_jobs != NULL) {
+        if (g_stream_read_active_owner_set &&
+            pthread_equal(g_stream_read_active_owner, self)) {
+            pthread_mutex_unlock(&g_stream_read_mutex);
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "streaming read pool already has active work for this thread\n");
+            return 0;
+        }
+        pthread_cond_wait(&g_stream_read_done_cond, &g_stream_read_mutex);
+    }
+    if (!cuda_stream_read_jobs_prepare(jobs, count)) {
         pthread_mutex_unlock(&g_stream_read_mutex);
-        fprintf(stderr, DS4_GPU_LOG_PREFIX "streaming read pool already has active work\n");
         return 0;
     }
+    cuda_stream_read_profile_note_jobs(jobs, count);
     g_stream_read_active_jobs = jobs;
     g_stream_read_active_count = count;
     g_stream_read_active_next = 0;
     g_stream_read_active_done = 0;
     g_stream_read_active_ok = 1;
+    g_stream_read_active_owner = self;
+    g_stream_read_active_owner_set = 1;
     pthread_cond_broadcast(&g_stream_read_work_cond);
     pthread_mutex_unlock(&g_stream_read_mutex);
     return 1;
@@ -1362,6 +2246,8 @@ static int cuda_stream_read_jobs_start(cuda_stream_read_job *jobs, uint32_t coun
 
 static int cuda_stream_read_jobs_wait(cuda_stream_read_job *jobs, uint32_t count) {
     if (!jobs || count == 0) return 1;
+    const int profile = g_stream_read_profile_enabled == 1;
+    const double wait_t0 = profile ? cuda_wall_sec() : 0.0;
     pthread_mutex_lock(&g_stream_read_mutex);
     if (g_stream_read_active_jobs != jobs) {
         pthread_mutex_unlock(&g_stream_read_mutex);
@@ -1377,6 +2263,13 @@ static int cuda_stream_read_jobs_wait(cuda_stream_read_job *jobs, uint32_t count
     g_stream_read_active_next = 0;
     g_stream_read_active_done = 0;
     g_stream_read_active_ok = 1;
+    g_stream_read_active_owner_set = 0;
+    if (profile) {
+        g_stream_read_profile_wait_calls++;
+        g_stream_read_profile_wait_us +=
+            cuda_stream_read_profile_us(cuda_wall_sec() - wait_t0);
+    }
+    pthread_cond_broadcast(&g_stream_read_done_cond);
     pthread_mutex_unlock(&g_stream_read_mutex);
 
     int ok = 1;
@@ -1407,6 +2300,7 @@ static void cuda_stream_read_jobs_free(cuda_stream_read_job *jobs, uint32_t coun
         jobs[i].host_raw = NULL;
         jobs[i].host_buf = NULL;
         jobs[i].uploaded = 0;
+        jobs[i].direct = 0;
     }
 }
 
@@ -1479,8 +2373,7 @@ static int cuda_stream_batch_selected_apply_split(
         !g_stream_batch_selected_cache.missing_gate_ptrs ||
         !g_stream_batch_selected_cache.missing_up_ptrs ||
         !g_stream_batch_selected_cache.down_ptrs ||
-        !g_stream_batch_selected_cache.pair_missing ||
-        g_stream_batch_selected_pending.missing_count == 0) {
+        !g_stream_batch_selected_cache.pair_missing) {
         return 0;
     }
     *selected_exec = &g_stream_batch_selected_cache.selected_tensor;
@@ -1514,7 +2407,7 @@ static int cuda_stream_batch_selected_finish_pending_missing(void) {
     }
     cuda_stream_read_jobs_free(g_stream_batch_selected_pending.read_jobs,
                                read_job_count);
-    g_stream_batch_selected_cache.loaded = 1;
+    g_stream_batch_selected_cache.loaded = 0;
     memset(&g_stream_batch_selected_pending, 0,
            sizeof(g_stream_batch_selected_pending));
     return 1;
@@ -1530,6 +2423,18 @@ static void cuda_stream_batch_selected_abort_pending(void) {
                                read_job_count);
     memset(&g_stream_batch_selected_pending, 0,
            sizeof(g_stream_batch_selected_pending));
+}
+
+static void cuda_stream_selected_abort_pending(void) {
+    if (!g_stream_selected_pending.active) return;
+    const uint32_t read_job_count = g_stream_selected_pending.read_job_count;
+    if (read_job_count != 0) {
+        (void)cuda_stream_read_jobs_wait(g_stream_selected_pending.read_jobs,
+                                         read_job_count);
+        cuda_stream_read_jobs_free(g_stream_selected_pending.read_jobs,
+                                   read_job_count);
+    }
+    memset(&g_stream_selected_pending, 0, sizeof(g_stream_selected_pending));
 }
 
 static int cuda_stream_selected_upload_read_jobs(
@@ -1551,7 +2456,7 @@ static int cuda_stream_selected_upload_read_jobs(
                                           jobs[i].host_buf,
                                           (size_t)jobs[i].bytes,
                                           cudaMemcpyHostToDevice,
-                                          g_model_upload_stream);
+                                          g_stream_selected_upload_stream);
         if (err != cudaSuccess) {
             fprintf(stderr,
                     DS4_GPU_LOG_PREFIX "streaming selected cached upload failed: %s\n",
@@ -1559,9 +2464,11 @@ static int cuda_stream_selected_upload_read_jobs(
             (void)cudaGetLastError();
             return 0;
         }
-        cuda_model_drop_file_pages(jobs[i].offset, jobs[i].bytes);
+        if (!jobs[i].direct) {
+            cuda_model_drop_file_pages(jobs[i].offset, jobs[i].bytes);
+        }
     }
-    cudaError_t err = cudaStreamSynchronize(g_model_upload_stream);
+    cudaError_t err = cudaStreamSynchronize(g_stream_selected_upload_stream);
     if (err != cudaSuccess) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "streaming selected upload sync failed: %s\n",
                 cudaGetErrorString(err));
@@ -1751,6 +2658,252 @@ static int cuda_stream_layer_expert_cache_load(
     return 1;
 }
 
+static int cuda_stream_resident_seed_experts(
+        const void *model_map,
+        uint64_t model_size,
+        uint32_t layer,
+        const int32_t *expert_ids,
+        const uint32_t *expert_priorities,
+        uint32_t n_experts,
+        uint32_t n_total_expert,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes) {
+    if (!g_ssd_streaming_mode) return 1;
+    if (!model_map || !expert_ids || n_experts == 0 ||
+        n_total_expert == 0 ||
+        n_total_expert > DS4_ROCM_MAX_N_EXPERT ||
+        gate_expert_bytes == 0 ||
+        down_expert_bytes == 0) {
+        return 0;
+    }
+    if (g_stream_expert_cache_budget == 0) return 1;
+
+    uint64_t gate_bytes = 0;
+    uint64_t down_bytes = 0;
+    if (!cuda_u64_mul_checked(n_total_expert, gate_expert_bytes, &gate_bytes) ||
+        !cuda_u64_mul_checked(n_total_expert, down_expert_bytes, &down_bytes) ||
+        gate_offset > model_size ||
+        up_offset > model_size ||
+        down_offset > model_size ||
+        gate_bytes > model_size - gate_offset ||
+        gate_bytes > model_size - up_offset ||
+        down_bytes > model_size - down_offset) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "streaming hotlist seed expert range outside model map\n");
+        return 0;
+    }
+
+    uint32_t seed_cap = n_experts < g_stream_expert_cache_budget ?
+        n_experts : g_stream_expert_cache_budget;
+    if (seed_cap > DS4_ROCM_MAX_N_EXPERT) seed_cap = DS4_ROCM_MAX_N_EXPERT;
+    if (seed_cap == 0) return 1;
+
+    bool seen[DS4_ROCM_MAX_N_EXPERT] = {0};
+    uint32_t best_index[DS4_ROCM_MAX_N_EXPERT];
+    uint32_t best_priority[DS4_ROCM_MAX_N_EXPERT];
+    for (uint32_t i = 0; i < n_experts; i++) {
+        const int32_t expert_i = expert_ids[i];
+        if (expert_i < 0 || (uint32_t)expert_i >= n_total_expert) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "streaming hotlist seed expert id %d outside 0..%u "
+                    "(layer=%u)\n",
+                    expert_i,
+                    n_total_expert,
+                    layer);
+            return 0;
+        }
+        const uint32_t expert = (uint32_t)expert_i;
+        const uint32_t priority =
+            expert_priorities ? expert_priorities[i] : (n_experts - i);
+        if (!seen[expert] || priority > best_priority[expert]) {
+            seen[expert] = true;
+            best_index[expert] = i;
+            best_priority[expert] = priority;
+        }
+    }
+
+    uint32_t chosen_indices[DS4_ROCM_MAX_N_EXPERT];
+    uint32_t chosen_priorities[DS4_ROCM_MAX_N_EXPERT];
+    uint32_t chosen_count = 0;
+    for (uint32_t expert = 0; expert < n_total_expert; expert++) {
+        if (!seen[expert]) continue;
+        const uint32_t priority = best_priority[expert];
+        uint32_t pos = 0;
+        while (pos < chosen_count && priority <= chosen_priorities[pos]) {
+            pos++;
+        }
+        if (chosen_count < seed_cap) {
+            for (uint32_t j = chosen_count; j > pos; j--) {
+                chosen_indices[j] = chosen_indices[j - 1u];
+                chosen_priorities[j] = chosen_priorities[j - 1u];
+            }
+            chosen_indices[pos] = best_index[expert];
+            chosen_priorities[pos] = priority;
+            chosen_count++;
+        } else if (pos < chosen_count) {
+            for (uint32_t j = chosen_count - 1u; j > pos; j--) {
+                chosen_indices[j] = chosen_indices[j - 1u];
+                chosen_priorities[j] = chosen_priorities[j - 1u];
+            }
+            chosen_indices[pos] = best_index[expert];
+            chosen_priorities[pos] = priority;
+        }
+    }
+    if (chosen_count == 0) return 1;
+
+    int32_t protected_ids[DS4_ROCM_MAX_N_EXPERT];
+    for (uint32_t i = 0; i < chosen_count; i++) {
+        protected_ids[i] = expert_ids[chosen_indices[i]];
+    }
+    if (cuda_stream_cache_stats_on()) {
+        g_stream_cache_stats.seed_calls++;
+        g_stream_cache_stats.seed_unique += chosen_count;
+    }
+
+    const int use_fd =
+        g_model_fd >= 0 &&
+        (g_model_fd_host_base == NULL || model_map == g_model_fd_host_base);
+    if (!use_fd && !cuda_stream_selected_ensure_stream()) return 1;
+
+    cuda_stream_read_job read_jobs[DS4_ROCM_STREAM_READ_MAX_JOBS];
+    memset(read_jobs, 0, sizeof(read_jobs));
+    uint32_t read_job_count = 0;
+    int ok = 1;
+    uint32_t loaded = 0;
+
+    for (uint32_t ri = 0; ok && ri < chosen_count; ri++) {
+        const uint32_t chosen_i = chosen_indices[chosen_count - 1u - ri];
+        const int32_t expert_i = expert_ids[chosen_i];
+        int idx = cuda_stream_resident_find(model_map,
+                                            layer,
+                                            expert_i,
+                                            gate_offset,
+                                            up_offset,
+                                            down_offset,
+                                            gate_expert_bytes,
+                                            down_expert_bytes);
+        if (idx >= 0) {
+            g_stream_resident_experts[(size_t)idx].last_used =
+                ++g_stream_resident_clock;
+            loaded++;
+            continue;
+        }
+
+        idx = cuda_stream_resident_alloc(model_map,
+                                         layer,
+                                         expert_i,
+                                         protected_ids,
+                                         chosen_count,
+                                         gate_offset,
+                                         up_offset,
+                                         down_offset,
+                                         gate_expert_bytes,
+                                         down_expert_bytes);
+        if (idx < 0) {
+            ok = 0;
+            break;
+        }
+
+        const uint64_t expert = (uint64_t)(uint32_t)expert_i;
+        uint64_t gate_rel = 0;
+        uint64_t down_rel = 0;
+        if (!cuda_u64_mul_checked(expert, gate_expert_bytes, &gate_rel) ||
+            !cuda_u64_mul_checked(expert, down_expert_bytes, &down_rel)) {
+            ok = 0;
+            break;
+        }
+
+        cuda_stream_resident_expert &entry =
+            g_stream_resident_experts[(size_t)idx];
+        if (use_fd) {
+            if (read_job_count + 3u > DS4_ROCM_STREAM_READ_MAX_JOBS) {
+                ok = 0;
+                break;
+            }
+            read_jobs[read_job_count++] =
+                {entry.gate, gate_offset + gate_rel, gate_expert_bytes,
+                 NULL, NULL, 0, 0};
+            read_jobs[read_job_count++] =
+                {entry.up, up_offset + gate_rel, gate_expert_bytes,
+                 NULL, NULL, 0, 0};
+            read_jobs[read_job_count++] =
+                {entry.down, down_offset + down_rel, down_expert_bytes,
+                 NULL, NULL, 0, 0};
+        } else {
+            cudaError_t err = cudaMemcpyAsync(entry.gate,
+                                              (const char *)model_map + gate_offset + gate_rel,
+                                              (size_t)gate_expert_bytes,
+                                              cudaMemcpyHostToDevice,
+                                              g_stream_selected_upload_stream);
+            if (err == cudaSuccess) {
+                err = cudaMemcpyAsync(entry.up,
+                                      (const char *)model_map + up_offset + gate_rel,
+                                      (size_t)gate_expert_bytes,
+                                      cudaMemcpyHostToDevice,
+                                      g_stream_selected_upload_stream);
+            }
+            if (err == cudaSuccess) {
+                err = cudaMemcpyAsync(entry.down,
+                                      (const char *)model_map + down_offset + down_rel,
+                                      (size_t)down_expert_bytes,
+                                      cudaMemcpyHostToDevice,
+                                      g_stream_selected_upload_stream);
+            }
+            if (err != cudaSuccess) {
+                fprintf(stderr,
+                        DS4_GPU_LOG_PREFIX "streaming hotlist seed upload failed: %s\n",
+                        cudaGetErrorString(err));
+                (void)cudaGetLastError();
+                ok = 0;
+                break;
+            }
+        }
+        loaded++;
+    }
+
+    if (ok && use_fd && read_job_count != 0) {
+        ok = cuda_stream_read_jobs_parallel(read_jobs, read_job_count) &&
+             cuda_stream_selected_upload_read_jobs(read_jobs, read_job_count);
+        cuda_stream_read_jobs_free(read_jobs, read_job_count);
+    } else if (ok && !use_fd) {
+        cudaError_t err = cudaStreamSynchronize(g_stream_selected_upload_stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "streaming hotlist seed upload sync failed: %s\n",
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            ok = 0;
+        }
+    }
+
+    if (!ok) {
+        cuda_stream_read_jobs_free(read_jobs, read_job_count);
+        cuda_stream_resident_cache_release();
+        if (getenv("DS4_ROCM_STREAMING_EXPERT_CACHE_VERBOSE") != NULL) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "streaming hotlist seed skipped after partial load "
+                    "(layer=%u requested=%u loaded=%u)\n",
+                    layer,
+                    n_experts,
+                    loaded);
+        }
+        return 1;
+    }
+
+    if (getenv("DS4_ROCM_STREAMING_EXPERT_CACHE_VERBOSE") != NULL) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "streaming hotlist seeded layer=%u requested=%u cached=%u budget=%u\n",
+                layer,
+                n_experts,
+                chosen_count,
+                g_stream_expert_cache_budget);
+    }
+    return 1;
+}
+
 static void cuda_stream_selected_cache_header(
         const void *model_map,
         uint32_t layer,
@@ -1809,14 +2962,14 @@ static int cuda_stream_selected_compact_mask(
                               entry.gate,
                               (size_t)gate_expert_bytes,
                               cudaMemcpyDeviceToDevice,
-                              g_model_upload_stream);
+                              g_stream_selected_upload_stream);
         if (err == cudaSuccess) {
             err = cudaMemcpyAsync(g_stream_selected_cache.up +
                                       (uint64_t)i * gate_expert_bytes,
                                   entry.up,
                                   (size_t)gate_expert_bytes,
                                   cudaMemcpyDeviceToDevice,
-                                  g_model_upload_stream);
+                                  g_stream_selected_upload_stream);
         }
         if (err == cudaSuccess) {
             err = cudaMemcpyAsync(g_stream_selected_cache.down +
@@ -1824,7 +2977,7 @@ static int cuda_stream_selected_compact_mask(
                                   entry.down,
                                   (size_t)down_expert_bytes,
                                   cudaMemcpyDeviceToDevice,
-                                  g_model_upload_stream);
+                                  g_stream_selected_upload_stream);
         }
         if (err != cudaSuccess) {
             fprintf(stderr,
@@ -1834,12 +2987,9 @@ static int cuda_stream_selected_compact_mask(
             return 0;
         }
     }
-    err = cudaStreamSynchronize(g_model_upload_stream);
-    if (err != cudaSuccess) {
+    if (!cuda_stream_selected_upload_record_ready()) {
         fprintf(stderr,
-                DS4_GPU_LOG_PREFIX "streaming selected compact sync failed: %s\n",
-                cudaGetErrorString(err));
-        (void)cudaGetLastError();
+                DS4_GPU_LOG_PREFIX "streaming selected compact event record failed\n");
         return 0;
     }
     return 1;
@@ -1888,38 +3038,50 @@ static int cuda_stream_selected_prepare_ptrs(
         up_ptrs[i] = entry.up;
         down_ptrs[i] = entry.down;
     }
+    if (!g_stream_selected_cache.gate_ptrs_stage ||
+        !g_stream_selected_cache.up_ptrs_stage ||
+        !g_stream_selected_cache.down_ptrs_stage) {
+        return 0;
+    }
+    const size_t ptr_bytes = n_selected * sizeof(gate_ptrs[0]);
+    memcpy((void *)g_stream_selected_cache.gate_ptrs_stage,
+           gate_ptrs,
+           ptr_bytes);
+    memcpy((void *)g_stream_selected_cache.up_ptrs_stage,
+           up_ptrs,
+           ptr_bytes);
+    memcpy((void *)g_stream_selected_cache.down_ptrs_stage,
+           down_ptrs,
+           ptr_bytes);
     cudaError_t err = cudaMemcpyAsync(g_stream_selected_cache.gate_ptrs,
-                                      gate_ptrs,
-                                      n_selected * sizeof(gate_ptrs[0]),
+                                      g_stream_selected_cache.gate_ptrs_stage,
+                                      ptr_bytes,
                                       cudaMemcpyHostToDevice,
-                                      g_model_upload_stream);
+                                      g_stream_selected_upload_stream);
     if (err == cudaSuccess) {
         err = cudaMemcpyAsync(g_stream_selected_cache.up_ptrs,
-                              up_ptrs,
-                              n_selected * sizeof(up_ptrs[0]),
+                              g_stream_selected_cache.up_ptrs_stage,
+                              ptr_bytes,
                               cudaMemcpyHostToDevice,
-                              g_model_upload_stream);
+                              g_stream_selected_upload_stream);
     }
     if (err == cudaSuccess) {
         err = cudaMemcpyAsync(g_stream_selected_cache.down_ptrs,
-                              down_ptrs,
-                              n_selected * sizeof(down_ptrs[0]),
+                              g_stream_selected_cache.down_ptrs_stage,
+                              ptr_bytes,
                               cudaMemcpyHostToDevice,
-                              g_model_upload_stream);
+                              g_stream_selected_upload_stream);
     }
-    if (err != cudaSuccess) {
-        fprintf(stderr,
-                DS4_GPU_LOG_PREFIX "streaming selected pointer upload failed: %s\n",
-                cudaGetErrorString(err));
-        (void)cudaGetLastError();
-        return 0;
+    int upload_record_ok = 1;
+    if (err == cudaSuccess) {
+        upload_record_ok = cuda_stream_selected_upload_record_ready();
     }
-    err = cudaStreamSynchronize(g_model_upload_stream);
-    if (err != cudaSuccess) {
+    if (err != cudaSuccess || !upload_record_ok) {
         fprintf(stderr,
-                DS4_GPU_LOG_PREFIX "streaming selected pointer upload sync failed: %s\n",
-                cudaGetErrorString(err));
-        (void)cudaGetLastError();
+                DS4_GPU_LOG_PREFIX "streaming selected pointer upload failed%s%s\n",
+                err != cudaSuccess ? ": " : "",
+                err != cudaSuccess ? cudaGetErrorString(err) : "");
+        if (err != cudaSuccess) (void)cudaGetLastError();
         return 0;
     }
     return 1;
@@ -1961,22 +3123,11 @@ static int cuda_stream_batch_selected_prepare_from_host(
         down_expert_bytes == 0) {
         return 0;
     }
-    if (cuda_stream_batch_selected_cache_apply(model_map,
-                                               layer,
-                                               n_total_expert,
-                                               n_selected,
-                                               n_tokens,
-                                               gate_offset,
-                                               up_offset,
-                                               down_offset,
-                                               gate_expert_bytes,
-                                               down_expert_bytes,
-                                               selected_exec,
-                                               gate_ptrs,
-                                               up_ptrs,
-                                               down_ptrs,
-                                               unique_out)) {
-        return 1;
+    if (g_stream_batch_selected_pending.active) {
+        cuda_stream_batch_selected_abort_pending();
+    }
+    if (g_stream_selected_pending.active) {
+        cuda_stream_selected_abort_pending();
     }
     g_stream_batch_selected_cache.loaded = 0;
 
@@ -2033,9 +3184,18 @@ static int cuda_stream_batch_selected_prepare_from_host(
         ok = 0;
     }
     if (ok && !cuda_stream_selected_ensure_stream()) ok = 0;
-    if (ok && cuda_stream_cache_stats_on()) {
+    const int stats_on = cuda_stream_cache_stats_on();
+    const int layer_stats_on =
+        cuda_stream_cache_layer_stats_on() &&
+        layer < DS4_ROCM_STREAM_CACHE_LAYER_STATS_MAX;
+    if (ok && stats_on) {
         g_stream_cache_stats.batch_calls++;
         g_stream_cache_stats.batch_unique += unique_count;
+    }
+    if (ok && layer_stats_on) {
+        cuda_stream_cache_layer_stats *ls = &g_stream_cache_layer_stats[layer];
+        ls->batch_calls++;
+        ls->batch_unique += unique_count;
     }
 
     cuda_stream_read_job read_jobs[DS4_ROCM_STREAM_READ_MAX_JOBS];
@@ -2087,11 +3247,19 @@ static int cuda_stream_batch_selected_prepare_from_host(
                                             gate_expert_bytes,
                                             down_expert_bytes);
         const int was_resident = idx >= 0;
-        if (cuda_stream_cache_stats_on()) {
+        if (stats_on) {
             if (was_resident) {
                 g_stream_cache_stats.batch_hits++;
             } else {
                 g_stream_cache_stats.batch_misses++;
+            }
+        }
+        if (layer_stats_on) {
+            cuda_stream_cache_layer_stats *ls = &g_stream_cache_layer_stats[layer];
+            if (was_resident) {
+                ls->batch_hits++;
+            } else {
+                ls->batch_misses++;
             }
         }
         if (idx < 0) {
@@ -2132,20 +3300,20 @@ static int cuda_stream_batch_selected_prepare_from_host(
                                                   (const char *)model_map + gate_offset + gate_rel,
                                                   (size_t)gate_expert_bytes,
                                                   cudaMemcpyHostToDevice,
-                                                  g_model_upload_stream);
+                                                  g_stream_selected_upload_stream);
                 if (err == cudaSuccess) {
                     err = cudaMemcpyAsync(entry.up,
                                           (const char *)model_map + up_offset + gate_rel,
                                           (size_t)gate_expert_bytes,
                                           cudaMemcpyHostToDevice,
-                                          g_model_upload_stream);
+                                          g_stream_selected_upload_stream);
                 }
                 if (err == cudaSuccess) {
                     err = cudaMemcpyAsync(entry.down,
                                           (const char *)model_map + down_offset + down_rel,
                                           (size_t)down_expert_bytes,
                                           cudaMemcpyHostToDevice,
-                                          g_model_upload_stream);
+                                          g_stream_selected_upload_stream);
                 }
                 if (err != cudaSuccess) {
                     fprintf(stderr,
@@ -2188,7 +3356,7 @@ static int cuda_stream_batch_selected_prepare_from_host(
         }
     }
 
-    if (ok && begin_pending && use_fd && read_job_count != 0) {
+    if (ok && begin_pending) {
         memset(&g_stream_batch_selected_pending, 0,
                sizeof(g_stream_batch_selected_pending));
         g_stream_batch_selected_pending.active = 1;
@@ -2209,12 +3377,14 @@ static int cuda_stream_batch_selected_prepare_from_host(
         memcpy(g_stream_batch_selected_pending.read_jobs,
                read_jobs,
                (size_t)read_job_count * sizeof(read_jobs[0]));
-        if (!cuda_stream_read_jobs_start(g_stream_batch_selected_pending.read_jobs,
-                                         read_job_count)) {
+        if (use_fd && read_job_count != 0 &&
+            !cuda_stream_read_jobs_start(
+                    g_stream_batch_selected_pending.read_jobs,
+                    read_job_count)) {
             memset(&g_stream_batch_selected_pending, 0,
                    sizeof(g_stream_batch_selected_pending));
             ok = 0;
-        } else {
+        } else if (use_fd && read_job_count != 0) {
             read_job_count = 0;
         }
     }
@@ -2222,7 +3392,7 @@ static int cuda_stream_batch_selected_prepare_from_host(
         ok = 0;
     }
     if (ok && !use_fd) {
-        cudaError_t err = cudaStreamSynchronize(g_model_upload_stream);
+        cudaError_t err = cudaStreamSynchronize(g_stream_selected_upload_stream);
         if (err != cudaSuccess) {
             fprintf(stderr,
                     DS4_GPU_LOG_PREFIX "streaming batch selected upload sync failed: %s\n",
@@ -2232,73 +3402,123 @@ static int cuda_stream_batch_selected_prepare_from_host(
         }
     }
     if (ok) {
+        if (!g_stream_batch_selected_cache.selected_stage ||
+            !g_stream_batch_selected_cache.pair_missing_stage ||
+            !g_stream_batch_selected_cache.gate_ptrs_stage ||
+            !g_stream_batch_selected_cache.up_ptrs_stage ||
+            !g_stream_batch_selected_cache.down_ptrs_stage ||
+            !g_stream_batch_selected_cache.resident_gate_ptrs_stage ||
+            !g_stream_batch_selected_cache.resident_up_ptrs_stage ||
+            !g_stream_batch_selected_cache.missing_gate_ptrs_stage ||
+            !g_stream_batch_selected_cache.missing_up_ptrs_stage) {
+            ok = 0;
+        }
+    }
+    if (ok) {
+        const size_t selected_bytes =
+            (size_t)n_ids64 * sizeof(compact_ids[0]);
+        const size_t pair_missing_bytes = (size_t)n_ids64;
+        const size_t ptr_bytes = (size_t)unique_count * sizeof(gate_host[0]);
+        memcpy(g_stream_batch_selected_cache.selected_stage,
+               compact_ids,
+               selected_bytes);
+        memcpy(g_stream_batch_selected_cache.pair_missing_stage,
+               pair_missing,
+               pair_missing_bytes);
+        memcpy((void *)g_stream_batch_selected_cache.gate_ptrs_stage,
+               gate_host,
+               ptr_bytes);
+        memcpy((void *)g_stream_batch_selected_cache.up_ptrs_stage,
+               up_host,
+               ptr_bytes);
+        memcpy((void *)g_stream_batch_selected_cache.down_ptrs_stage,
+               down_host,
+               ptr_bytes);
+        memcpy((void *)g_stream_batch_selected_cache.resident_gate_ptrs_stage,
+               resident_gate_host,
+               ptr_bytes);
+        memcpy((void *)g_stream_batch_selected_cache.resident_up_ptrs_stage,
+               resident_up_host,
+               ptr_bytes);
+        memcpy((void *)g_stream_batch_selected_cache.missing_gate_ptrs_stage,
+               missing_gate_host,
+               ptr_bytes);
+        memcpy((void *)g_stream_batch_selected_cache.missing_up_ptrs_stage,
+               missing_up_host,
+               ptr_bytes);
+
         cudaError_t err = cudaMemcpyAsync(g_stream_batch_selected_cache.selected_ids,
-                                          compact_ids,
-                                          (size_t)n_ids64 * sizeof(compact_ids[0]),
+                                          g_stream_batch_selected_cache.selected_stage,
+                                          selected_bytes,
                                           cudaMemcpyHostToDevice,
-                                          g_model_upload_stream);
+                                          g_stream_selected_upload_stream);
         if (err == cudaSuccess) {
             err = cudaMemcpyAsync(g_stream_batch_selected_cache.pair_missing,
-                                  pair_missing,
-                                  (size_t)n_ids64,
+                                  g_stream_batch_selected_cache.pair_missing_stage,
+                                  pair_missing_bytes,
                                   cudaMemcpyHostToDevice,
-                                  g_model_upload_stream);
+                                  g_stream_selected_upload_stream);
         }
         if (err == cudaSuccess) {
             err = cudaMemcpyAsync(g_stream_batch_selected_cache.gate_ptrs,
-                                  gate_host,
-                                  unique_count * sizeof(gate_host[0]),
+                                  g_stream_batch_selected_cache.gate_ptrs_stage,
+                                  ptr_bytes,
                                   cudaMemcpyHostToDevice,
-                                  g_model_upload_stream);
+                                  g_stream_selected_upload_stream);
         }
         if (err == cudaSuccess) {
             err = cudaMemcpyAsync(g_stream_batch_selected_cache.up_ptrs,
-                                  up_host,
-                                  unique_count * sizeof(up_host[0]),
+                                  g_stream_batch_selected_cache.up_ptrs_stage,
+                                  ptr_bytes,
                                   cudaMemcpyHostToDevice,
-                                  g_model_upload_stream);
+                                  g_stream_selected_upload_stream);
         }
         if (err == cudaSuccess) {
             err = cudaMemcpyAsync(g_stream_batch_selected_cache.down_ptrs,
-                                  down_host,
-                                  unique_count * sizeof(down_host[0]),
+                                  g_stream_batch_selected_cache.down_ptrs_stage,
+                                  ptr_bytes,
                                   cudaMemcpyHostToDevice,
-                                  g_model_upload_stream);
+                                  g_stream_selected_upload_stream);
         }
         if (err == cudaSuccess) {
             err = cudaMemcpyAsync(g_stream_batch_selected_cache.resident_gate_ptrs,
-                                  resident_gate_host,
-                                  unique_count * sizeof(resident_gate_host[0]),
+                                  g_stream_batch_selected_cache.resident_gate_ptrs_stage,
+                                  ptr_bytes,
                                   cudaMemcpyHostToDevice,
-                                  g_model_upload_stream);
+                                  g_stream_selected_upload_stream);
         }
         if (err == cudaSuccess) {
             err = cudaMemcpyAsync(g_stream_batch_selected_cache.resident_up_ptrs,
-                                  resident_up_host,
-                                  unique_count * sizeof(resident_up_host[0]),
+                                  g_stream_batch_selected_cache.resident_up_ptrs_stage,
+                                  ptr_bytes,
                                   cudaMemcpyHostToDevice,
-                                  g_model_upload_stream);
+                                  g_stream_selected_upload_stream);
         }
         if (err == cudaSuccess) {
             err = cudaMemcpyAsync(g_stream_batch_selected_cache.missing_gate_ptrs,
-                                  missing_gate_host,
-                                  unique_count * sizeof(missing_gate_host[0]),
+                                  g_stream_batch_selected_cache.missing_gate_ptrs_stage,
+                                  ptr_bytes,
                                   cudaMemcpyHostToDevice,
-                                  g_model_upload_stream);
+                                  g_stream_selected_upload_stream);
         }
         if (err == cudaSuccess) {
             err = cudaMemcpyAsync(g_stream_batch_selected_cache.missing_up_ptrs,
-                                  missing_up_host,
-                                  unique_count * sizeof(missing_up_host[0]),
+                                  g_stream_batch_selected_cache.missing_up_ptrs_stage,
+                                  ptr_bytes,
                                   cudaMemcpyHostToDevice,
-                                  g_model_upload_stream);
+                                  g_stream_selected_upload_stream);
         }
-        if (err == cudaSuccess) err = cudaStreamSynchronize(g_model_upload_stream);
-        if (err != cudaSuccess) {
+        int upload_record_ok = 1;
+        if (err == cudaSuccess) {
+            upload_record_ok =
+                cuda_stream_batch_selected_upload_record_ready();
+        }
+        if (err != cudaSuccess || !upload_record_ok) {
             fprintf(stderr,
-                    DS4_GPU_LOG_PREFIX "streaming batch selected table upload failed: %s\n",
-                    cudaGetErrorString(err));
-            (void)cudaGetLastError();
+                    DS4_GPU_LOG_PREFIX "streaming batch selected table upload failed%s%s\n",
+                    err != cudaSuccess ? ": " : "",
+                    err != cudaSuccess ? cudaGetErrorString(err) : "");
+            if (err != cudaSuccess) (void)cudaGetLastError();
             if (g_stream_batch_selected_pending.active) {
                 cuda_stream_batch_selected_abort_pending();
             }
@@ -2307,8 +3527,7 @@ static int cuda_stream_batch_selected_prepare_from_host(
     }
 
     if (ok) {
-        g_stream_batch_selected_cache.loaded =
-            g_stream_batch_selected_pending.active ? 0 : 1;
+        g_stream_batch_selected_cache.loaded = 0;
         g_stream_batch_selected_cache.model_map = model_map;
         g_stream_batch_selected_cache.layer = layer;
         g_stream_batch_selected_cache.n_total_expert = n_total_expert;
@@ -2360,24 +3579,6 @@ static int cuda_stream_batch_selected_prepare(
         !cuda_tensor_has_elems2(selected, n_tokens, n_selected, sizeof(int32_t))) {
         return 0;
     }
-    if (cuda_stream_batch_selected_cache_apply(model_map,
-                                               layer,
-                                               n_total_expert,
-                                               n_selected,
-                                               n_tokens,
-                                               gate_offset,
-                                               up_offset,
-                                               down_offset,
-                                               gate_expert_bytes,
-                                               down_expert_bytes,
-                                               selected_exec,
-                                               gate_ptrs,
-                                               up_ptrs,
-                                               down_ptrs,
-                                               unique_out)) {
-        return 1;
-    }
-
     uint64_t n_ids64 = 0;
     if (!cuda_u64_mul_checked(n_tokens, n_selected, &n_ids64) ||
         n_ids64 > SIZE_MAX / sizeof(int32_t)) {
@@ -2447,24 +3648,6 @@ static int cuda_stream_layer_expert_cache_prepare_batch(
         down_expert_bytes == 0) {
         return 0;
     }
-    if (cuda_stream_batch_selected_cache_apply(model_map,
-                                               layer,
-                                               n_total_expert,
-                                               n_selected,
-                                               n_tokens,
-                                               gate_offset,
-                                               up_offset,
-                                               down_offset,
-                                               gate_expert_bytes,
-                                               down_expert_bytes,
-                                               selected_exec,
-                                               gate_ptrs,
-                                               up_ptrs,
-                                               down_ptrs,
-                                               unique_out)) {
-        return 1;
-    }
-
     const char *layer_gate = NULL;
     const char *layer_up = NULL;
     const char *layer_down = NULL;
@@ -2534,6 +3717,7 @@ static int cuda_stream_layer_expert_cache_prepare_batch(
     if (ok && !cuda_stream_batch_selected_ensure_buffers(n_ids64, unique_count)) {
         ok = 0;
     }
+    if (ok && !cuda_stream_selected_ensure_stream()) ok = 0;
 
     const char *gate_host[DS4_ROCM_MAX_N_EXPERT] = {0};
     const char *up_host[DS4_ROCM_MAX_N_EXPERT] = {0};
@@ -2557,29 +3741,29 @@ static int cuda_stream_layer_expert_cache_prepare_batch(
                                           compact_ids,
                                           (size_t)n_ids64 * sizeof(compact_ids[0]),
                                           cudaMemcpyHostToDevice,
-                                          g_model_upload_stream);
+                                          g_stream_selected_upload_stream);
         if (err == cudaSuccess) {
             err = cudaMemcpyAsync(g_stream_batch_selected_cache.gate_ptrs,
                                   gate_host,
                                   unique_count * sizeof(gate_host[0]),
                                   cudaMemcpyHostToDevice,
-                                  g_model_upload_stream);
+                                  g_stream_selected_upload_stream);
         }
         if (err == cudaSuccess) {
             err = cudaMemcpyAsync(g_stream_batch_selected_cache.up_ptrs,
                                   up_host,
                                   unique_count * sizeof(up_host[0]),
                                   cudaMemcpyHostToDevice,
-                                  g_model_upload_stream);
+                                  g_stream_selected_upload_stream);
         }
         if (err == cudaSuccess) {
             err = cudaMemcpyAsync(g_stream_batch_selected_cache.down_ptrs,
                                   down_host,
                                   unique_count * sizeof(down_host[0]),
                                   cudaMemcpyHostToDevice,
-                                  g_model_upload_stream);
+                                  g_stream_selected_upload_stream);
         }
-        if (err == cudaSuccess) err = cudaStreamSynchronize(g_model_upload_stream);
+        if (err == cudaSuccess) err = cudaStreamSynchronize(g_stream_selected_upload_stream);
         if (err != cudaSuccess) {
             fprintf(stderr,
                     DS4_GPU_LOG_PREFIX "streaming full-layer selected table upload failed: %s\n",
@@ -2590,7 +3774,7 @@ static int cuda_stream_layer_expert_cache_prepare_batch(
     }
 
     if (ok) {
-        g_stream_batch_selected_cache.loaded = 1;
+        g_stream_batch_selected_cache.loaded = 0;
         g_stream_batch_selected_cache.model_map = model_map;
         g_stream_batch_selected_cache.layer = layer;
         g_stream_batch_selected_cache.n_total_expert = n_total_expert;
@@ -2618,6 +3802,7 @@ static int cuda_stream_layer_expert_cache_prepare_batch(
 
 static int cuda_stream_layer_expert_cache_seed_selected(
         const void *model_map,
+        uint64_t model_size,
         uint32_t layer,
         const ds4_gpu_tensor *selected,
         uint32_t n_tokens,
@@ -2644,6 +3829,19 @@ static int cuda_stream_layer_expert_cache_seed_selected(
         return 0;
     }
 
+    uint64_t gate_bytes = 0;
+    uint64_t down_bytes = 0;
+    if (!cuda_u64_mul_checked(n_total_expert, gate_expert_bytes, &gate_bytes) ||
+        !cuda_u64_mul_checked(n_total_expert, down_expert_bytes, &down_bytes) ||
+        gate_offset > model_size ||
+        up_offset > model_size ||
+        down_offset > model_size ||
+        gate_bytes > model_size - gate_offset ||
+        gate_bytes > model_size - up_offset ||
+        down_bytes > model_size - down_offset) {
+        return 0;
+    }
+
     const char *layer_gate = NULL;
     const char *layer_up = NULL;
     const char *layer_down = NULL;
@@ -2658,7 +3856,24 @@ static int cuda_stream_layer_expert_cache_seed_selected(
                                               &layer_gate,
                                               &layer_up,
                                               &layer_down)) {
-        return 0;
+        if (!cuda_model_range_is_cached(model_map, gate_offset, gate_bytes) ||
+            !cuda_model_range_is_cached(model_map, up_offset, gate_bytes) ||
+            !cuda_model_range_is_cached(model_map, down_offset, down_bytes)) {
+            return 0;
+        }
+        layer_gate = cuda_model_range_ptr(model_map,
+                                          gate_offset,
+                                          gate_bytes,
+                                          "streaming full-layer seed gate");
+        layer_up = cuda_model_range_ptr(model_map,
+                                        up_offset,
+                                        gate_bytes,
+                                        "streaming full-layer seed up");
+        layer_down = cuda_model_range_ptr(model_map,
+                                          down_offset,
+                                          down_bytes,
+                                          "streaming full-layer seed down");
+        if (!layer_gate || !layer_up || !layer_down) return 0;
     }
 
     if (n_seed_tokens > n_tokens) n_seed_tokens = n_tokens;
@@ -2762,20 +3977,20 @@ static int cuda_stream_layer_expert_cache_seed_selected(
                                           layer_gate + gate_rel,
                                           (size_t)gate_expert_bytes,
                                           cudaMemcpyDeviceToDevice,
-                                          g_model_upload_stream);
+                                          g_stream_selected_upload_stream);
         if (err == cudaSuccess) {
             err = cudaMemcpyAsync(entry.up,
                                   layer_up + gate_rel,
                                   (size_t)gate_expert_bytes,
                                   cudaMemcpyDeviceToDevice,
-                                  g_model_upload_stream);
+                                  g_stream_selected_upload_stream);
         }
         if (err == cudaSuccess) {
             err = cudaMemcpyAsync(entry.down,
                                   layer_down + down_rel,
                                   (size_t)down_expert_bytes,
                                   cudaMemcpyDeviceToDevice,
-                                  g_model_upload_stream);
+                                  g_stream_selected_upload_stream);
         }
         if (err != cudaSuccess) {
             fprintf(stderr,
@@ -2788,7 +4003,7 @@ static int cuda_stream_layer_expert_cache_seed_selected(
     }
 
     if (ok && unique_count != 0) {
-        cudaError_t err = cudaStreamSynchronize(g_model_upload_stream);
+        cudaError_t err = cudaStreamSynchronize(g_stream_selected_upload_stream);
         if (err != cudaSuccess) {
             fprintf(stderr,
                     DS4_GPU_LOG_PREFIX "streaming full-layer seed sync failed: %s\n",
@@ -2804,87 +4019,6 @@ static int cuda_stream_layer_expert_cache_seed_selected(
     return ok;
 }
 
-static int cuda_stream_selected_copy_range(
-        const void *model_map,
-        char *dst,
-        uint64_t offset,
-        uint64_t bytes,
-        const char *what) {
-    if (!model_map || !dst || bytes == 0) return 0;
-    if (!cuda_stream_selected_ensure_stream()) return 0;
-
-    const uint64_t chunk = cuda_model_copy_chunk_bytes();
-    const uint64_t stage_bytes = chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
-    const int use_fd =
-        g_model_fd >= 0 &&
-        (g_model_fd_host_base == NULL || model_map == g_model_fd_host_base);
-    if (use_fd && !cuda_model_stage_pool_alloc(stage_bytes)) return 0;
-
-    uint64_t copied = 0;
-    while (copied < bytes) {
-        const uint64_t n = bytes - copied < chunk ? bytes - copied : chunk;
-        const uint64_t chunk_idx = use_fd ? g_stream_selected_stage_counter++ : 0u;
-        const uint64_t bi = use_fd ? chunk_idx % 4u : 0u;
-        const char *payload = NULL;
-        if (use_fd) {
-            if (chunk_idx >= 4u) {
-                cudaError_t err = cudaEventSynchronize(g_model_stage_event[bi]);
-                if (err != cudaSuccess) {
-                    fprintf(stderr,
-                            DS4_GPU_LOG_PREFIX "streaming selected staging wait failed for %s: %s\n",
-                            what ? what : "expert",
-                            cudaGetErrorString(err));
-                    (void)cudaGetLastError();
-                    return 0;
-                }
-            }
-            if (!cuda_model_stage_read(g_model_stage[bi],
-                                       g_model_stage_bytes,
-                                       offset + copied,
-                                       n,
-                                       &payload)) {
-                fprintf(stderr,
-                        DS4_GPU_LOG_PREFIX "streaming selected read failed for %s at %.2f MiB: %s\n",
-                        what ? what : "expert",
-                        (double)copied / 1048576.0,
-                        strerror(errno));
-                return 0;
-            }
-        } else {
-            payload = (const char *)model_map + offset + copied;
-        }
-        cudaError_t err = cudaMemcpyAsync(dst + copied,
-                                          payload,
-                                          (size_t)n,
-                                          cudaMemcpyHostToDevice,
-                                          g_model_upload_stream);
-        if (err != cudaSuccess) {
-            fprintf(stderr,
-                    DS4_GPU_LOG_PREFIX "streaming selected copy failed for %s at %.2f MiB: %s\n",
-                    what ? what : "expert",
-                    (double)copied / 1048576.0,
-                    cudaGetErrorString(err));
-            (void)cudaGetLastError();
-            return 0;
-        }
-        if (use_fd) {
-            err = cudaEventRecord(g_model_stage_event[bi],
-                                  g_model_upload_stream);
-            if (err != cudaSuccess) {
-                fprintf(stderr,
-                        DS4_GPU_LOG_PREFIX "streaming selected staging record failed for %s at %.2f MiB: %s\n",
-                        what ? what : "expert",
-                        (double)copied / 1048576.0,
-                        cudaGetErrorString(err));
-                (void)cudaGetLastError();
-                return 0;
-            }
-        }
-        copied += n;
-    }
-    return 1;
-}
-
 static int cuda_stream_selected_load(
         const void *model_map,
         uint64_t model_size,
@@ -2898,7 +4032,12 @@ static int cuda_stream_selected_load(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes) {
     g_stream_selected_cache.loaded = 0;
-    memset(&g_stream_selected_pending, 0, sizeof(g_stream_selected_pending));
+    if (g_stream_selected_pending.active) {
+        cuda_stream_selected_abort_pending();
+    }
+    if (g_stream_batch_selected_pending.active) {
+        cuda_stream_batch_selected_abort_pending();
+    }
     if (!g_ssd_streaming_mode) return 1;
     if (!model_map || !selected_ids ||
         n_total_expert == 0 ||
@@ -2927,9 +4066,18 @@ static int cuda_stream_selected_load(
                                       selected_ids,
                                       gate_expert_bytes,
                                       down_expert_bytes);
-    if (cuda_stream_cache_stats_on()) {
+    const int stats_on = cuda_stream_cache_stats_on();
+    const int layer_stats_on =
+        cuda_stream_cache_layer_stats_on() &&
+        layer < DS4_ROCM_STREAM_CACHE_LAYER_STATS_MAX;
+    if (stats_on) {
         g_stream_cache_stats.selected_calls++;
         g_stream_cache_stats.selected_slots += n_selected;
+    }
+    if (layer_stats_on) {
+        cuda_stream_cache_layer_stats *ls = &g_stream_cache_layer_stats[layer];
+        ls->selected_calls++;
+        ls->selected_slots += n_selected;
     }
 
     cuda_stream_read_job read_jobs[DS4_ROCM_N_EXPERT_USED * 3u];
@@ -2945,7 +4093,7 @@ static int cuda_stream_selected_load(
         if (selected_ids[i] < 0 || (uint32_t)selected_ids[i] >= n_total_expert) {
             fprintf(stderr,
                     DS4_GPU_LOG_PREFIX "streaming selected expert id %d outside 0..%u "
-                    "(layer=%u slot=%u selected=[%d,%d,%d,%d,%d,%d])\n",
+                    "(layer=%u slot=%u selected=[%d,%d,%d,%d,%d,%d,%d,%d])\n",
                     selected_ids[i],
                     n_total_expert,
                     layer,
@@ -2955,7 +4103,9 @@ static int cuda_stream_selected_load(
                     n_selected > 2 ? selected_ids[2] : -1,
                     n_selected > 3 ? selected_ids[3] : -1,
                     n_selected > 4 ? selected_ids[4] : -1,
-                    n_selected > 5 ? selected_ids[5] : -1);
+                    n_selected > 5 ? selected_ids[5] : -1,
+                    n_selected > 6 ? selected_ids[6] : -1,
+                    n_selected > 7 ? selected_ids[7] : -1);
             return 0;
         }
         const uint64_t expert = (uint64_t)(uint32_t)selected_ids[i];
@@ -2986,11 +4136,19 @@ static int cuda_stream_selected_load(
                                             down_offset,
                                             gate_expert_bytes,
                                             down_expert_bytes);
-        if (cuda_stream_cache_stats_on()) {
+        if (stats_on) {
             if (idx >= 0) {
                 g_stream_cache_stats.selected_hits++;
             } else {
                 g_stream_cache_stats.selected_misses++;
+            }
+        }
+        if (layer_stats_on) {
+            cuda_stream_cache_layer_stats *ls = &g_stream_cache_layer_stats[layer];
+            if (idx >= 0) {
+                ls->selected_hits++;
+            } else {
+                ls->selected_misses++;
             }
         }
         if (idx >= 0) {
@@ -3031,20 +4189,20 @@ static int cuda_stream_selected_load(
                                               (const char *)model_map + gate_offset + gate_rel,
                                               (size_t)gate_expert_bytes,
                                               cudaMemcpyHostToDevice,
-                                              g_model_upload_stream);
+                                              g_stream_selected_upload_stream);
             if (err == cudaSuccess) {
                 err = cudaMemcpyAsync(entry.up,
                                       (const char *)model_map + up_offset + gate_rel,
                                       (size_t)gate_expert_bytes,
                                       cudaMemcpyHostToDevice,
-                                      g_model_upload_stream);
+                                      g_stream_selected_upload_stream);
             }
             if (err == cudaSuccess) {
                 err = cudaMemcpyAsync(entry.down,
                                       (const char *)model_map + down_offset + down_rel,
                                       (size_t)down_expert_bytes,
                                       cudaMemcpyHostToDevice,
-                                      g_model_upload_stream);
+                                      g_stream_selected_upload_stream);
             }
             if (err != cudaSuccess) {
                 fprintf(stderr,
@@ -3057,7 +4215,41 @@ static int cuda_stream_selected_load(
         }
     }
 
-    if (use_fd && read_job_count != 0 && resident_mask != 0) {
+    if (resident_mask != 0 && missing_mask == 0) {
+        g_stream_selected_pending.active = 1;
+        g_stream_selected_pending.model_map = model_map;
+        g_stream_selected_pending.layer = layer;
+        g_stream_selected_pending.n_total_expert = n_total_expert;
+        g_stream_selected_pending.n_selected = n_selected;
+        g_stream_selected_pending.gate_offset = gate_offset;
+        g_stream_selected_pending.up_offset = up_offset;
+        g_stream_selected_pending.down_offset = down_offset;
+        g_stream_selected_pending.gate_expert_bytes = gate_expert_bytes;
+        g_stream_selected_pending.down_expert_bytes = down_expert_bytes;
+        g_stream_selected_pending.resident_mask = resident_mask;
+        g_stream_selected_pending.missing_mask = 0;
+        g_stream_selected_pending.read_job_count = 0;
+        for (uint32_t i = 0; i < n_selected; i++) {
+            g_stream_selected_pending.selected_ids[i] = selected_ids[i];
+        }
+        if (!cuda_stream_selected_prepare_ptrs(model_map,
+                                               layer,
+                                               selected_ids,
+                                               n_selected,
+                                               gate_offset,
+                                               up_offset,
+                                               down_offset,
+                                               gate_expert_bytes,
+                                               down_expert_bytes)) {
+            memset(&g_stream_selected_pending, 0,
+                   sizeof(g_stream_selected_pending));
+            cuda_stream_resident_cache_release();
+            return 0;
+        }
+        return 1;
+    }
+
+    if (use_fd && read_job_count != 0) {
         g_stream_selected_pending.active = 1;
         g_stream_selected_pending.model_map = model_map;
         g_stream_selected_pending.layer = layer;
@@ -3130,7 +4322,7 @@ static int cuda_stream_selected_load(
             return 0;
         }
     } else {
-        cudaError_t err = cudaStreamSynchronize(g_model_upload_stream);
+        cudaError_t err = cudaStreamSynchronize(g_stream_selected_upload_stream);
         if (err != cudaSuccess) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX "streaming selected upload sync failed: %s\n",
                     cudaGetErrorString(err));
@@ -3228,8 +4420,8 @@ static int cuda_stream_selected_apply_split(
                                               down_expert_bytes)) {
         return 0;
     }
-    if (g_stream_selected_pending.resident_mask == 0 ||
-        g_stream_selected_pending.missing_mask == 0 ||
+    if ((g_stream_selected_pending.resident_mask |
+         g_stream_selected_pending.missing_mask) == 0 ||
         !g_stream_selected_cache.gate_ptrs ||
         !g_stream_selected_cache.up_ptrs ||
         !g_stream_selected_cache.down_ptrs) {
@@ -3257,7 +4449,8 @@ static int cuda_stream_selected_finish_pending_missing(uint32_t compact_mask) {
                                               read_job_count)) {
         cuda_stream_read_jobs_free(g_stream_selected_pending.read_jobs,
                                    read_job_count);
-        memset(&g_stream_selected_pending, 0, sizeof(g_stream_selected_pending));
+        memset(&g_stream_selected_pending, 0,
+               sizeof(g_stream_selected_pending));
         cuda_stream_resident_cache_release();
         return 0;
     }
@@ -3400,6 +4593,14 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
 
     const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
     if (fd_ptr) return fd_ptr;
+    if (g_ssd_streaming_mode && model_map == g_model_host_base) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "streaming model range %s at offset %.2f GiB "
+                "is not device-cached; refusing host-pointer fallback\n",
+                what ? what : "weights",
+                (double)offset / 1073741824.0);
+        return NULL;
+    }
 
     if (model_map != g_model_host_base) {
         return cuda_model_range_copy_uncached(model_map, offset, bytes, what);
@@ -3515,18 +4716,26 @@ static uint32_t cuda_rows_per_block_or_default(uint32_t v, uint32_t def) {
     return (v == 1u || v == 2u || v == 4u || v == 8u || v == 16u || v == 32u) ? v : def;
 }
 
+static uint32_t cuda_rows_per_block_env_or_default(const char *name, uint32_t def) {
+    const char *env = name ? getenv(name) : NULL;
+    if (!env || !env[0]) return def;
+    char *end = NULL;
+    errno = 0;
+    unsigned long v = strtoul(env, &end, 10);
+    if (end == env || errno != 0) return def;
+    return cuda_rows_per_block_or_default((uint32_t)v, def);
+}
+
 struct ds4_rocm_runtime_config {
     int initialized;
-    int q8_prequant_decode;
     int disable_splitk_attn_out_low;
     int disable_shared_gate_up_fused_w32;
     int attention_output_cublas_all;
     int shared_down_cublas;
     int graph_dump;
-    uint32_t q8_decode_rpb;
-    uint32_t q8_hc_decode_rpb;
-    uint32_t attn_out_low_decode_rpb;
     uint32_t moe_decode_rpb;
+    uint32_t moe_decode_gate_rpb;
+    uint32_t moe_decode_down_rpb;
     int oldhip_attention_decode;
 };
 
@@ -3534,16 +4743,32 @@ static ds4_rocm_runtime_config g_rocm_cfg;
 
 static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
     if (!g_rocm_cfg.initialized) {
-        g_rocm_cfg.q8_prequant_decode = !g_quality_mode;
         g_rocm_cfg.disable_splitk_attn_out_low = !g_quality_mode;
         g_rocm_cfg.disable_shared_gate_up_fused_w32 = !g_quality_mode;
         g_rocm_cfg.attention_output_cublas_all = !g_quality_mode;
         g_rocm_cfg.shared_down_cublas = !g_quality_mode;
-        g_rocm_cfg.graph_dump = cuda_env_present(getenv("DS4_METAL_GRAPH_DUMP_PREFIX"));
-        g_rocm_cfg.q8_decode_rpb = g_quality_mode ? 8u : 1u;
-        g_rocm_cfg.q8_hc_decode_rpb = g_quality_mode ? 8u : 16u;
-        g_rocm_cfg.attn_out_low_decode_rpb = g_quality_mode ? 8u : 32u;
-        g_rocm_cfg.moe_decode_rpb = g_quality_mode ? 8u : 1u;
+        g_rocm_cfg.graph_dump =
+            cuda_env_present(getenv("DS4_ROCM_GRAPH_DUMP_PREFIX")) ||
+            cuda_env_present(getenv("DS4_METAL_GRAPH_DUMP_PREFIX"));
+        const char *moe_decode_rpb_env = getenv("DS4_ROCM_MOE_DECODE_RPB");
+        const int moe_decode_rpb_env_present =
+            moe_decode_rpb_env != NULL && moe_decode_rpb_env[0] != '\0';
+        g_rocm_cfg.moe_decode_rpb =
+            cuda_rows_per_block_env_or_default("DS4_ROCM_MOE_DECODE_RPB",
+                                               g_quality_mode ? 8u :
+                                               (g_ssd_streaming_mode ? 2u : 1u));
+        g_rocm_cfg.moe_decode_gate_rpb =
+            cuda_rows_per_block_env_or_default("DS4_ROCM_MOE_DECODE_GATE_RPB",
+                                               (!g_quality_mode &&
+                                                g_ssd_streaming_mode &&
+                                                !moe_decode_rpb_env_present) ?
+                                                    1u : g_rocm_cfg.moe_decode_rpb);
+        g_rocm_cfg.moe_decode_down_rpb =
+            cuda_rows_per_block_env_or_default("DS4_ROCM_MOE_DECODE_DOWN_RPB",
+                                               (!g_quality_mode &&
+                                                g_ssd_streaming_mode &&
+                                                !moe_decode_rpb_env_present) ?
+                                                    2u : g_rocm_cfg.moe_decode_rpb);
         g_rocm_cfg.oldhip_attention_decode = !g_quality_mode;
         g_rocm_cfg.initialized = 1;
     }
@@ -3551,7 +4776,35 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
 }
 
 static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
-    return UINT64_MAX;
+    if (!g_ssd_streaming_mode) return UINT64_MAX;
+    const char *env = getenv("DS4_ROCM_STREAM_Q8_F16_CACHE_GB");
+    if (env && env[0]) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long gib = strtoull(env, &end, 10);
+        if (end != env && *end == '\0' && errno == 0 &&
+            gib <= UINT64_MAX / 1073741824ull) {
+            return (uint64_t)gib * 1073741824ull;
+        }
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "invalid DS4_ROCM_STREAM_Q8_F16_CACHE_GB=%s; "
+                "using automatic q8 fp16 streaming cache limit\n",
+                env);
+    }
+
+    size_t free_b = 0;
+    size_t total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || total_b == 0) {
+        (void)cudaGetLastError();
+        return 8ull * 1073741824ull;
+    }
+    (void)free_b;
+    uint64_t limit = (uint64_t)total_b / 8ull;
+    const uint64_t min_limit = 2ull * 1073741824ull;
+    const uint64_t max_limit = 16ull * 1073741824ull;
+    if (limit < min_limit) limit = min_limit;
+    if (limit > max_limit) limit = max_limit;
+    return limit;
 }
 
 static uint64_t cuda_q8_f16_cache_reserve_bytes(uint64_t total_bytes) {
@@ -3654,7 +4907,7 @@ static void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t r
                 (double)g_q8_f16_bytes / 1073741824.0);
     }
     g_q8_f16_disabled_after_oom = 1;
-    if (!g_q8_f16_ranges.empty()) {
+    if (!g_q8_f16_ranges.empty() || !g_q8_f16_transpose_ranges.empty()) {
         (void)cudaDeviceSynchronize();
         cuda_q8_f16_cache_release_all();
     }
@@ -4128,7 +5381,73 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
 }
 
 static uint64_t cuda_model_cache_limit_bytes(void) {
-    return UINT64_MAX;
+    if (!g_ssd_streaming_mode) return UINT64_MAX;
+    const char *env = getenv("DS4_ROCM_STREAM_MODEL_CACHE_GB");
+    if (env && env[0]) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long gib = strtoull(env, &end, 10);
+        if (end != env && *end == '\0' && errno == 0 && gib != 0 &&
+            gib <= UINT64_MAX / 1073741824ull) {
+            return (uint64_t)gib * 1073741824ull;
+        }
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "invalid DS4_ROCM_STREAM_MODEL_CACHE_GB=%s; "
+                "using automatic streaming model span cache limit\n",
+                env);
+    }
+
+    size_t free_b = 0;
+    size_t total_b = 0;
+    const uint64_t fallback = 32ull * 1073741824ull;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || total_b == 0) {
+        (void)cudaGetLastError();
+        return fallback;
+    }
+    (void)free_b;
+    uint64_t limit = (uint64_t)total_b / 3ull;
+    const uint64_t min_limit = 8ull * 1073741824ull;
+    const uint64_t max_limit = 48ull * 1073741824ull;
+    if (limit < min_limit) limit = min_limit;
+    if (limit > max_limit) limit = max_limit;
+    return limit;
+}
+
+static int cuda_stream_model_cache_prepare_memory(
+        uint64_t request_bytes,
+        const char *what) {
+    if (!g_ssd_streaming_mode || request_bytes == 0 || g_q8_f16_bytes == 0) {
+        return 1;
+    }
+
+    size_t free_b = 0;
+    size_t total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 1;
+    }
+    (void)total_b;
+    const uint64_t reserve = cuda_stream_resident_free_reserve_bytes();
+    const uint64_t free_bytes = (uint64_t)free_b;
+    if (free_bytes >= reserve && request_bytes <= free_bytes - reserve) {
+        return 1;
+    }
+
+    if (!cuda_ok(cudaDeviceSynchronize(),
+                 "streaming model cache q8 fp16 release sync")) {
+        return 0;
+    }
+    fprintf(stderr,
+            DS4_GPU_LOG_PREFIX "releasing %.2f GiB q8 fp16 cache for %s "
+            "(request=%.2f GiB free=%.2f GiB reserve=%.2f GiB)\n",
+            (double)g_q8_f16_bytes / 1073741824.0,
+            what ? what : "streaming model spans",
+            (double)request_bytes / 1073741824.0,
+            (double)free_bytes / 1073741824.0,
+            (double)reserve / 1073741824.0);
+    cuda_q8_f16_cache_release_all();
+    g_q8_f16_budget_notice_printed = 0;
+    return 1;
 }
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
@@ -4183,18 +5502,35 @@ static const char *cuda_model_range_ptr_from_fd(
     if (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base) return NULL;
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
+        if (g_ssd_streaming_mode) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "streaming model cache limit prevents "
+                    "loading %s range %.2f MiB; refusing host-pointer fallback\n",
+                    what ? what : "weights",
+                    (double)bytes / 1048576.0);
+            return NULL;
+        }
         return cuda_model_ptr(model_map, offset);
     }
+
+    const uint64_t chunk = cuda_model_copy_chunk_bytes();
+    const uint64_t stage_bytes =
+        chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
+    if (!cuda_model_stage_pool_alloc(stage_bytes)) return NULL;
 
     char *dev = cuda_model_arena_alloc(bytes, what);
     if (!dev) {
+        if (g_ssd_streaming_mode) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "streaming model cache allocation failed "
+                    "for %s range %.2f MiB; refusing host-pointer fallback\n",
+                    what ? what : "weights",
+                    (double)bytes / 1048576.0);
+            return NULL;
+        }
         return cuda_model_ptr(model_map, offset);
     }
     cudaError_t err = cudaSuccess;
-
-    const uint64_t chunk = cuda_model_copy_chunk_bytes();
-    const uint64_t stage_bytes = chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
-    if (!cuda_model_stage_pool_alloc(stage_bytes)) return NULL;
 
     uint64_t copied = 0;
     uint64_t chunk_idx = 0;
@@ -4350,7 +5686,7 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
     return 1;
 }
 
-static void cuda_model_range_release_all(void) {
+static void cuda_model_range_release_ranges_only(void) {
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_registered && r.registered_base) {
             (void)cudaHostUnregister(r.registered_base);
@@ -4365,6 +5701,11 @@ static void cuda_model_range_release_all(void) {
     g_model_ranges.clear();
     g_model_range_by_offset.clear();
     g_model_range_bytes = 0;
+    g_model_cache_full = 0;
+}
+
+static void cuda_model_range_release_all(void) {
+    cuda_model_range_release_ranges_only();
     g_stream_selected_cache.loaded = 0;
     cuda_stream_resident_cache_release();
     cuda_model_load_progress_reset();
@@ -4446,6 +5787,10 @@ extern "C" void ds4_gpu_cleanup(void) {
     if (g_model_upload_stream) {
         (void)cudaStreamDestroy(g_model_upload_stream);
         g_model_upload_stream = NULL;
+    }
+    if (g_stream_selected_upload_stream) {
+        (void)cudaStreamDestroy(g_stream_selected_upload_stream);
+        g_stream_selected_upload_stream = NULL;
     }
     if (g_selected_readback_stream) {
         (void)cudaStreamDestroy(g_selected_readback_stream);
@@ -4587,15 +5932,54 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
         return 0;
     }
     if (bytes == 0) return 1;
-    return cuda_ok(cudaMemcpy((char *)dst->ptr + dst_offset,
-                              (const char *)src->ptr + src_offset,
-                              (size_t)bytes,
-                              cudaMemcpyDeviceToDevice),
-                   "tensor copy");
+    return cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
+                                   (const char *)src->ptr + src_offset,
+                                   (size_t)bytes,
+                                   cudaMemcpyDeviceToDevice,
+                                   0),
+                   "tensor copy enqueue");
 }
 
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
+extern "C" int ds4_gpu_flush_encoder(void) { return ds4_gpu_flush_commands(); }
+extern "C" int ds4_gpu_commands_active(void) { return 0; }
+extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
+    if (!event_value) return 0;
+    *event_value = 0;
+    if (!g_selected_readback_event) {
+        cudaError_t err =
+            cudaEventCreateWithFlags(&g_selected_readback_event,
+                                     cudaEventDisableTiming);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "selected readback event creation failed: %s\n",
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            return 0;
+        }
+    }
+    cudaError_t err = cudaEventRecord(g_selected_readback_event, 0);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "selected readback event record failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    *event_value = ++g_selected_readback_event_value;
+    return 1;
+}
+extern "C" int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label) {
+    if (event_value == 0 || !g_selected_readback_event) return 0;
+    return cuda_ok(cudaEventSynchronize(g_selected_readback_event),
+                   label ? label : "selected readback");
+}
+extern "C" int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label) {
+    if (event_value == 0 || !g_selected_readback_event) return 0;
+    return cuda_ok(cudaEventSynchronize(g_selected_readback_event),
+                   label ? label : "selected readback wait");
+}
 extern "C" int ds4_gpu_end_commands(void) {
     return cuda_ok(cudaDeviceSynchronize(), "end commands");
 }
@@ -4648,6 +6032,27 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
     }
     if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
     if (g_ssd_streaming_mode) {
+        const uint64_t limit = cuda_model_cache_limit_bytes();
+        if (map_size > limit) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "streaming model range %.2f GiB exceeds "
+                    "cache limit %.2f GiB; increase DS4_ROCM_STREAM_MODEL_CACHE_GB\n",
+                    (double)map_size / 1073741824.0,
+                    (double)limit / 1073741824.0);
+            return 0;
+        }
+        if (g_model_range_bytes > limit ||
+            map_size > limit - g_model_range_bytes) {
+            if (!cuda_ok(cudaDeviceSynchronize(),
+                         "streaming model range cache eviction sync")) {
+                return 0;
+            }
+            cuda_model_range_release_ranges_only();
+        }
+        if (!cuda_stream_model_cache_prepare_memory(map_size,
+                                                    "streaming model range")) {
+            return 0;
+        }
         if (!cuda_model_range_ptr(model_map, map_offset, map_size, "stream_range")) return 0;
         return cuda_model_range_is_cached(model_map, map_offset, map_size);
     }
@@ -4679,6 +6084,35 @@ extern "C" int ds4_gpu_set_model_map_spans(
     }
     if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
     if (g_ssd_streaming_mode) {
+        uint64_t request_bytes = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            if (!cuda_u64_add_checked(request_bytes, sizes[i], &request_bytes)) {
+                fprintf(stderr,
+                        DS4_GPU_LOG_PREFIX "streaming model span byte count overflow\n");
+                return 0;
+            }
+        }
+        const uint64_t limit = cuda_model_cache_limit_bytes();
+        if (request_bytes > limit) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "streaming model spans %.2f GiB exceed "
+                    "cache limit %.2f GiB; increase DS4_ROCM_STREAM_MODEL_CACHE_GB\n",
+                    (double)request_bytes / 1073741824.0,
+                    (double)limit / 1073741824.0);
+            return 0;
+        }
+        if (g_model_range_bytes > limit ||
+            request_bytes > limit - g_model_range_bytes) {
+            if (!cuda_ok(cudaDeviceSynchronize(),
+                         "streaming model span cache eviction sync")) {
+                return 0;
+            }
+            cuda_model_range_release_ranges_only();
+        }
+        if (!cuda_stream_model_cache_prepare_memory(request_bytes,
+                                                    "streaming model spans")) {
+            return 0;
+        }
         for (uint32_t i = 0; i < count; i++) {
             if (!cuda_model_range_ptr(model_map, offsets[i], sizes[i], "stream_span")) return 0;
             if (!cuda_model_range_is_cached(model_map, offsets[i], sizes[i])) return 0;

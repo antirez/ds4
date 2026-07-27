@@ -1,0 +1,3 @@
+Here are a few ways to complete that C comment, depending on the specific lock and what it protects:
+
+**Most common

@@ -1,0 +1,1 @@
+Le sessioni agentiche—dove un modello linguistico (LLM) agisce in modo autonomo,

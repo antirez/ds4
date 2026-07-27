@@ -1,0 +1,1 @@
+A good benchmark should measure **the specific, relevant performance or outcome you aim to improve, under realistic and reproducible conditions.**
