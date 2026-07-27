@@ -114,6 +114,44 @@ __global__ void pack_act_e4m3_rowmajor(uint8_t *A_data, TSFA tSFA, const float *
   for(int i=0;i<32;i++) outb[i]=cutlass::float_e4m3_t(x[i]*inv);
   tSFA(m, kb*32, 0)=ElementSF::bitcast((uint8_t)(se+127));
 }
+
+/* Vectorized twin (2026-07-26): the scalar kernel above is one thread per 32-block
+ * doing 32 serial scalar LDG.32 for the amax + 32 scalar STG.8 — issue/latency
+ * bound (the roofline named it 444 ms = 6.6% of prefill, the biggest dense/MLA
+ * sub-cost). This reads the block as 8x float4 (LDG.128) and writes as 2x int4
+ * (STG.128). BIT-EXACT to the scalar kernel: one thread still owns the whole
+ * 32-block, the amax folds in the SAME sequential order 0..31 (.x/.y/.z/.w per
+ * float4), and each element's `cutlass::float_e4m3_t(v*inv)` encode is byte-for-
+ * byte the same conversion on the same float. Only the load/store WIDTH changes.
+ * Alignment: per-expert K is a 128-multiple, kb*32 floats = 128 B, so
+ * act+m*K+kb*32 is 16-B aligned (float4) and the e4m3 out is 16-B aligned (int4).
+ * DS4_ACT_PACK_SCALAR=1 selects the scalar path for the bit-exact A/B. */
+template<class TSFA>
+__global__ void pack_act_e4m3_rowmajor_vec(uint8_t *A_data, TSFA tSFA, const float *act, int M, int K){
+  int nblk=K/32; long idx=(long)blockIdx.x*blockDim.x+threadIdx.x; if(idx>=(long)M*nblk) return;
+  int m=(int)(idx/nblk), kb=(int)(idx%nblk);
+  const float4 *x4=reinterpret_cast<const float4*>(act+(size_t)m*K+(size_t)kb*32);
+  float4 v[8];
+  #pragma unroll
+  for(int i=0;i<8;i++) v[i]=x4[i];
+  float mx=0.f;
+  #pragma unroll
+  for(int i=0;i<8;i++){ mx=fmaxf(mx,fabsf(v[i].x)); mx=fmaxf(mx,fabsf(v[i].y));
+                        mx=fmaxf(mx,fabsf(v[i].z)); mx=fmaxf(mx,fabsf(v[i].w)); }
+  int se=-127; if(mx>0.f){ int e=(int)floorf(log2f(mx)); se=e-7; }
+  if(se<-127)se=-127; if(se>127)se=127;
+  float inv=exp2f((float)-se);
+  cutlass::float_e4m3_t ob[32];
+  #pragma unroll
+  for(int i=0;i<8;i++){ ob[i*4+0]=cutlass::float_e4m3_t(v[i].x*inv);
+                        ob[i*4+1]=cutlass::float_e4m3_t(v[i].y*inv);
+                        ob[i*4+2]=cutlass::float_e4m3_t(v[i].z*inv);
+                        ob[i*4+3]=cutlass::float_e4m3_t(v[i].w*inv); }
+  int4 *outp=reinterpret_cast<int4*>(reinterpret_cast<cutlass::float_e4m3_t*>(A_data)+(size_t)m*K+(size_t)kb*32);
+  const int4 *obp=reinterpret_cast<const int4*>(ob);
+  outp[0]=obp[0]; outp[1]=obp[1];
+  tSFA(m, kb*32, 0)=ElementSF::bitcast((uint8_t)(se+127));
+}
 // LOSSY dequant->fp4 weight packer still needs the E2M1 nearest-value helper (below); keep it.
 __device__ __constant__ float d_kE2M1[16] = {0.f,0.5f,1.f,1.5f,2.f,3.f,4.f,6.f, 0.f,-0.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
 __device__ __forceinline__ uint8_t d_to_e2m1(float v){ float best=1e30f; uint8_t bn=0; for(uint8_t n=0;n<16;n++){ float d=fabsf(v-d_kE2M1[n]); if(d<best){best=d;bn=n;} } return bn; }
@@ -131,7 +169,12 @@ static void pack_activation(uint8_t *A_data, ElementSF *A_sf, const float *x, in
   auto layoutSF = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(M, 0, K, 1));
   auto tSFA = make_tensor(make_gmem_ptr(A_sf), layoutSF);
   int nb=M*(K/32), t=128, b=(nb+t-1)/t;
-  pack_act_e4m3_rowmajor<<<b,t>>>(A_data, tSFA, x, M, K);
+  /* Vectorized pack is default; DS4_ACT_PACK_SCALAR=1 forces the scalar twin
+   * (bit-exact) for the A/B. Env read ONCE (init-time static), not per launch. */
+  static int scalar = -1;
+  if (scalar < 0) { const char *e = getenv("DS4_ACT_PACK_SCALAR"); scalar = (e && e[0]=='1') ? 1 : 0; }
+  if (scalar) pack_act_e4m3_rowmajor<<<b,t>>>(A_data, tSFA, x, M, K);
+  else        pack_act_e4m3_rowmajor_vec<<<b,t>>>(A_data, tSFA, x, M, K);
 }
 
 static typename Gemm::Arguments make_gemm_args(float *D, const uint8_t *A_data, const ElementSF *A_sf,
