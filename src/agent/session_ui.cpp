@@ -126,8 +126,8 @@ static void agent_history_ptrs_push(agent_history_ptrs *p, const char *s,
                                     agent_history_mark mark) {
     if (p->len == p->cap) {
         p->cap = p->cap ? p->cap * 2 : 16;
-        p->v = agent_xrealloc(p->v, (size_t)p->cap * sizeof(p->v[0]));
-        p->mark = agent_xrealloc(p->mark, (size_t)p->cap * sizeof(p->mark[0]));
+        p->v = (const char* *)agent_xrealloc(p->v, (size_t)p->cap * sizeof(p->v[0]));
+        p->mark = (agent_history_mark *)agent_xrealloc(p->mark, (size_t)p->cap * sizeof(p->mark[0]));
     }
     p->v[p->len] = s;
     p->mark[p->len] = mark;
@@ -597,7 +597,8 @@ bool agent_worker_show_history(agent_worker *w, int user_turns,
 
 
 static int agent_session_list_cmp_recent(const void *a, const void *b) {
-    const agent_session_list_item *sa = a, *sb = b;
+    const agent_session_list_item *sa = (const agent_session_list_item *)a;
+    const agent_session_list_item *sb = (const agent_session_list_item *)b;
     uint64_t ta = sa->entry.last_used ? sa->entry.last_used : sa->entry.created_at;
     uint64_t tb = sb->entry.last_used ? sb->entry.last_used : sb->entry.created_at;
     if (ta < tb) return 1;
@@ -622,7 +623,7 @@ static void agent_session_list_push(agent_session_list_item **v, int *len,
                                     char *title) {
     if (*len == *cap) {
         *cap = *cap ? *cap * 2 : 16;
-        *v = agent_xrealloc(*v, (size_t)*cap * sizeof((*v)[0]));
+        *v = (agent_session_list_item *)agent_xrealloc(*v, (size_t)*cap * sizeof((*v)[0]));
     }
     (*v)[(*len)++] = (agent_session_list_item){
         .entry = entry,
@@ -708,7 +709,7 @@ static void agent_completion_sessions_push(agent_completion_sessions *s,
                                            uint64_t last_used) {
     if (s->len == s->cap) {
         s->cap = s->cap ? s->cap * 2 : 16;
-        s->v = agent_xrealloc(s->v, (size_t)s->cap * sizeof(s->v[0]));
+        s->v = (agent_completion_session *)agent_xrealloc(s->v, (size_t)s->cap * sizeof(s->v[0]));
     }
     memcpy(s->v[s->len].sha, sha, 41);
     s->v[s->len].last_used = last_used;
@@ -718,7 +719,8 @@ static void agent_completion_sessions_push(agent_completion_sessions *s,
 
 
 static int agent_completion_session_cmp(const void *a, const void *b) {
-    const agent_completion_session *sa = a, *sb = b;
+    const agent_completion_session *sa = (const agent_completion_session *)a;
+    const agent_completion_session *sb = (const agent_completion_session *)b;
     if (sa->last_used < sb->last_used) return 1;
     if (sa->last_used > sb->last_used) return -1;
     return strcmp(sa->sha, sb->sha);

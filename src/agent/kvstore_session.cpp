@@ -27,7 +27,7 @@ char *agent_session_title_from_text(const char *text, size_t text_len,
  * text is retained for listing, history rendering, and stripped-session rebuilds. */
 bool agent_kv_read_text(FILE *fp, uint32_t text_bytes,
                                char **text_out, char *err, size_t err_len) {
-    char *text = agent_xmalloc((size_t)text_bytes + 1);
+    char *text = (char *)agent_xmalloc((size_t)text_bytes + 1);
     if (fread(text, 1, text_bytes, fp) != text_bytes) {
         if (err && err_len) snprintf(err, err_len, "truncated cached text");
         free(text);
@@ -80,7 +80,7 @@ bool agent_kv_read_title_trailer(FILE *fp, const ds4_kvstore_entry *hdr,
         return false;
     }
     uint32_t title_bytes = ds4_kvstore_le_get32(tb);
-    char *title = agent_xmalloc((size_t)title_bytes + 1);
+    char *title = (char *)agent_xmalloc((size_t)title_bytes + 1);
     if (fread(title, 1, title_bytes, fp) != title_bytes) {
         if (err && err_len) snprintf(err, err_len, "truncated agent session title trailer");
         free(title);
@@ -378,7 +378,7 @@ void agent_publishf_system_status(agent_worker *w, const char *fmt, ...) {
         return;
     }
 
-    char *heap = agent_xmalloc((size_t)n + 1);
+    char *heap = (char *)agent_xmalloc((size_t)n + 1);
     va_start(ap, fmt);
     vsnprintf(heap, (size_t)n + 1, fmt, ap);
     va_end(ap);

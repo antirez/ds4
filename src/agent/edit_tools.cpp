@@ -467,7 +467,7 @@ static char *agent_apply_file_splice(const char *path,
     if (!insert) insert = "";
     size_t insert_len = strlen(insert);
     size_t out_len = offset + insert_len + (len - offset - remove_len);
-    char *out = agent_xmalloc(out_len + 1);
+    char *out = (char *)agent_xmalloc(out_len + 1);
     memcpy(out, data, offset);
     memcpy(out + offset, insert, insert_len);
     memcpy(out + offset + insert_len, data + offset + remove_len,
@@ -708,7 +708,7 @@ char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
         size_t hdr_len = strlen(hdr);
         if (ctx.out.len + hdr_len + 1 > ctx.out.cap) {
             ctx.out.cap = ctx.out.len + hdr_len + 1;
-            ctx.out.ptr = agent_xrealloc(ctx.out.ptr, ctx.out.cap);
+            ctx.out.ptr = (char *)agent_xrealloc(ctx.out.ptr, ctx.out.cap);
         }
         memmove(ctx.out.ptr + hdr_len, ctx.out.ptr, ctx.out.len + 1);
         memcpy(ctx.out.ptr, hdr, hdr_len);

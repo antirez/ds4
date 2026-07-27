@@ -54,7 +54,7 @@ void agent_line_spans_free(agent_line_spans *spans) {
 static void agent_line_spans_push(agent_line_spans *spans, agent_line_span span) {
     if (spans->len == spans->cap) {
         spans->cap = spans->cap ? spans->cap * 2 : 128;
-        spans->v = agent_xrealloc(spans->v, (size_t)spans->cap * sizeof(spans->v[0]));
+        spans->v = (agent_line_span *)agent_xrealloc(spans->v, (size_t)spans->cap * sizeof(spans->v[0]));
     }
     spans->v[spans->len++] = span;
 }
@@ -108,7 +108,7 @@ int agent_read_file_bytes(const char *path, char **data, size_t *len,
             if (used + n + 1 > cap) {
                 cap = cap ? cap * 2 : 8192;
                 while (cap < used + n + 1) cap *= 2;
-                buf = agent_xrealloc(buf, cap);
+                buf = (char *)agent_xrealloc(buf, cap);
             }
             memcpy(buf + used, tmp, n);
             used += n;

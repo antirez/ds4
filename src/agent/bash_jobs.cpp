@@ -217,7 +217,7 @@ agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
     int old_flags;
     set_nonblock(pipefd[0], true, &old_flags);
 
-    agent_bash_job *job = agent_xmalloc(sizeof(*job));
+    agent_bash_job *job = (agent_bash_job *)agent_xmalloc(sizeof(*job));
     memset(job, 0, sizeof(*job));
     if (w->next_bash_job_id <= 0) w->next_bash_job_id = 1;
     job->id = w->next_bash_job_id++;

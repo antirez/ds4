@@ -229,7 +229,7 @@ static char *agent_build_tools_prompt(void) {
     size_t a = strlen(agent_tools_prompt_intro);
     size_t b = strlen(edit);
     size_t c = strlen(agent_tools_prompt_after_edit);
-    char *out = agent_xmalloc(a + b + c + 1);
+    char *out = (char *)agent_xmalloc(a + b + c + 1);
     memcpy(out, agent_tools_prompt_intro, a);
     memcpy(out + a, edit, b);
     memcpy(out + a + b, agent_tools_prompt_after_edit, c + 1);
@@ -252,7 +252,7 @@ static char *agent_build_system_prompt_reminder(void) {
     const char *start = "\n\n[System prompt reminder follows.]\n";
     const char *end = "[End system prompt reminder.]\n\n";
     size_t len = strlen(start) + strlen(tools) + strlen(end) + 1;
-    char *out = agent_xmalloc(len);
+    char *out = (char *)agent_xmalloc(len);
     out[0] = '\0';
     strcat(out, start);
     strcat(out, tools);
@@ -276,7 +276,7 @@ void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
 
     if (!extra || !extra[0]) return;
     size_t n = strlen(extra);
-    char *plain = agent_xmalloc(n + 3);
+    char *plain = (char *)agent_xmalloc(n + 3);
     memcpy(plain, "\n\n", 2);
     memcpy(plain + 2, extra, n + 1);
     ds4_chat_append_message(engine, tokens, "system", plain);
@@ -370,7 +370,7 @@ void agent_publish(agent_worker *w, const char *s, size_t n) {
     if (w->out_len + n + 1 > w->out_cap) {
         size_t cap = w->out_cap ? w->out_cap * 2 : 4096;
         while (cap < w->out_len + n + 1) cap *= 2;
-        char *p = realloc(w->out, cap);
+        char *p = (char *)realloc(w->out, cap);
         if (!p) {
             pthread_mutex_unlock(&w->mu);
             return;
@@ -399,7 +399,7 @@ void agent_publishf(agent_worker *w, const char *fmt, ...) {
         return;
     }
 
-    char *heap = agent_xmalloc((size_t)n + 1);
+    char *heap = (char *)agent_xmalloc((size_t)n + 1);
     va_start(ap, fmt);
     vsnprintf(heap, (size_t)n + 1, fmt, ap);
     va_end(ap);

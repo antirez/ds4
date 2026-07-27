@@ -310,8 +310,8 @@ src/vendor/%.o: src/vendor/%.c src/vendor/linenoise.h src/vendor/rax.h src/vendo
 tests/ds4_test.o: tests/ds4_test.cpp $(SERVER_SRCS) src/server/ds4_server_internal.h src/ds4.h $(LIB_HDRS) src/vendor/rax.h
 	$(CXX) $(CXXFLAGS) $(DS4_INC) -Wno-unused-function -c -o $@ tests/ds4_test.cpp
 
-tests/ds4_agent_test.o: tests/ds4_agent_test.c $(AGENT_SRCS) src/agent/ds4_agent_internal.h src/ds4.h $(LIB_HDRS) src/vendor/linenoise.h
-	$(CC) $(CFLAGS) $(DS4_INC) -Wno-unused-function -c -o $@ tests/ds4_agent_test.c
+tests/ds4_agent_test.o: tests/ds4_agent_test.cpp $(AGENT_SRCS) src/agent/ds4_agent_internal.h src/ds4.h $(LIB_HDRS) src/vendor/linenoise.h
+	$(CXX) $(CXXFLAGS) $(DS4_INC) -Wno-unused-function -c -o $@ tests/ds4_agent_test.cpp
 
 tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c src/ds4_gpu.h
 	$(CC) $(CFLAGS) -Isrc -c -o $@ tests/cuda_long_context_smoke.c

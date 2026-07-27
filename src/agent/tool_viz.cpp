@@ -808,7 +808,7 @@ void agent_stream_text(agent_stream_renderer *sr, const char *text, size_t len, 
     const char *think_open = "<think>";
     const char *think_close = "</think>";
     size_t total = sr->pending_len + len;
-    char *buf = agent_xmalloc(total ? total : 1);
+    char *buf = (char *)agent_xmalloc(total ? total : 1);
     if (sr->pending_len) memcpy(buf, sr->pending, sr->pending_len);
     if (len) memcpy(buf + sr->pending_len, text, len);
     sr->pending_len = 0;

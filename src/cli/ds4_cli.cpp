@@ -171,7 +171,7 @@ typedef struct {
 
 static void cli_prefill_progress_cb(void *ud, const char *event, int current, int total) {
     (void)total;
-    cli_prefill_progress *p = ud;
+    cli_prefill_progress *p = (cli_prefill_progress *)ud;
     if (!p || !event || p->input_tokens <= 0) return;
     const bool is_display = strcmp(event, "prefill_display") == 0;
     if (strcmp(event, "prefill_chunk") && !is_display) return;
@@ -260,7 +260,7 @@ static void token_printer_process(token_printer *p, const char *text, size_t len
     const char *think_open = "<think>";
     const char *think_close = "</think>";
     size_t total = p->pending_len + len;
-    char *buf = malloc(total ? total : 1);
+    char *buf = (char *)malloc(total ? total : 1);
     if (!buf) return;
     if (p->pending_len) memcpy(buf, p->pending, p->pending_len);
     if (len) memcpy(buf + p->pending_len, text, len);
@@ -311,7 +311,7 @@ static void token_printer_finish(token_printer *p) {
 }
 
 static void generation_done(void *ud) {
-    token_printer *p = ud;
+    token_printer *p = (token_printer *)ud;
     token_printer_finish(p);
     if (!p->last_output_newline) {
         fputc('\n', p->fp);
@@ -330,7 +330,7 @@ static void token_printer_write_text(token_printer *p, const char *text, size_t 
 }
 
 static void print_generated_token(void *ud, int token) {
-    token_printer *p = ud;
+    token_printer *p = (token_printer *)ud;
     size_t len = 0;
     char *text = ds4_token_text(p->engine, token, &len);
     token_printer_write_text(p, text, len);
@@ -556,7 +556,7 @@ static int run_logits_dump(ds4_engine *engine, const cli_config *cfg, const ds4_
     ds4_session_set_display_progress(session, NULL, NULL);
 
     const int vocab = ds4_engine_vocab_size(engine);
-    float *logits = malloc((size_t)vocab * sizeof(logits[0]));
+    float *logits = (float *)malloc((size_t)vocab * sizeof(logits[0]));
     if (!logits) {
         ds4_session_free(session);
         return 1;
@@ -648,7 +648,7 @@ static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4
 
     int k = cfg->gen.dump_logprobs_top_k > 0 ? cfg->gen.dump_logprobs_top_k : 20;
     if (k > 128) k = 128;
-    ds4_token_score *scores = calloc((size_t)k, sizeof(scores[0]));
+    ds4_token_score *scores = (ds4_token_score *)calloc((size_t)k, sizeof(scores[0]));
     if (!scores) {
         fclose(fp);
         ds4_session_free(session);
@@ -887,9 +887,9 @@ static int run_kl_file(ds4_engine *engine, const cli_config *cfg) {
     for (int i = 0; i < prefix_len; i++) ds4_tokens_push(&prefix, tokens.v[i]);
     char err[160];
     int rc = 1;
-    float *logits = malloc((size_t)vocab * sizeof(float));
-    float *ref_logits = scoring ? malloc((size_t)vocab * sizeof(float)) : NULL;
-    double *pos_kl = scoring ? malloc(((size_t)scored / stride + 1) * sizeof(double)) : NULL;
+    float *logits = (float *)malloc((size_t)vocab * sizeof(float));
+    float *ref_logits = scoring ? (float *)malloc((size_t)vocab * sizeof(float)) : NULL;
+    double *pos_kl = scoring ? (double *)malloc(((size_t)scored / stride + 1) * sizeof(double)) : NULL;
     uint32_t n_pos = 0;
     if (!logits || (scoring && (!ref_logits || !pos_kl))) {
         fprintf(stderr, "ds4: --kl-file allocation failed\n");
@@ -1098,7 +1098,7 @@ static void tokens_insert(ds4_tokens *dst, int pos, const ds4_tokens *src) {
     if (pos > dst->len) pos = dst->len;
     while (dst->len + src->len > dst->cap) {
         dst->cap = dst->cap ? dst->cap * 2 : 64;
-        int *next = realloc(dst->v, (size_t)dst->cap * sizeof(dst->v[0]));
+        int *next = (int *)realloc(dst->v, (size_t)dst->cap * sizeof(dst->v[0]));
         if (!next) {
             perror("ds4: realloc");
             exit(1);
@@ -1443,7 +1443,7 @@ static char *read_prompt_file(const char *path, bool fatal) {
     }
     rewind(fp);
 
-    char *buf = malloc((size_t)len + 1);
+    char *buf = (char *)malloc((size_t)len + 1);
     if (!buf) {
         fprintf(stderr, "ds4: out of memory reading prompt file: %s\n", path);
         fclose(fp);

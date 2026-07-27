@@ -122,7 +122,7 @@ static char *read_file(const char *path) {
         fclose(fp);
         exit(1);
     }
-    char *buf = malloc((size_t)n + 1);
+    char *buf = (char *)malloc((size_t)n + 1);
     if (!buf) {
         fprintf(stderr, "ds4-bench: out of memory reading %s\n", path);
         fclose(fp);
@@ -261,7 +261,7 @@ static int write_frontier_logits_json(
     if (!cfg->dump_frontier_logits_dir) return 0;
 
     const int vocab = ds4_engine_vocab_size(engine);
-    float *logits = malloc((size_t)vocab * sizeof(logits[0]));
+    float *logits = (float *)malloc((size_t)vocab * sizeof(logits[0]));
     if (!logits) {
         fprintf(stderr, "ds4-bench: out of memory copying frontier logits\n");
         return 1;
@@ -363,14 +363,14 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+        /* bench measures the plain decode baseline; never bind a merged
+         * drafter (spec-decode throughput has its own timed-server protocol) */
+        .dspark_disable = true,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .prefill_chunk = cfg.prefill_chunk,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
-        /* bench measures the plain decode baseline; never bind a merged
-         * drafter (spec-decode throughput has its own timed-server protocol) */
-        .dspark_disable = true,
     };
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) return 1;

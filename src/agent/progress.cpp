@@ -9,7 +9,7 @@
 
 void worker_progress_cb(void *ud, const char *event, int current, int total) {
     (void)total;
-    agent_worker *w = ud;
+    agent_worker *w = (agent_worker *)ud;
     if (!w || !event) return;
     if (strcmp(event, "prefill_chunk") && strcmp(event, "prefill_display")) return;
     pthread_mutex_lock(&w->mu);
@@ -54,7 +54,7 @@ bool agent_err_is_interrupted(const char *err) {
 
 
 bool worker_cancel_session_cb(void *ud) {
-    return worker_should_interrupt(ud);
+    return worker_should_interrupt((agent_worker *)ud);
 }
 
 
@@ -70,7 +70,7 @@ void agent_buf_append(agent_buf *b, const char *s, size_t n) {
     if (b->len + n + 1 > b->cap) {
         size_t cap = b->cap ? b->cap * 2 : 4096;
         while (cap < b->len + n + 1) cap *= 2;
-        b->ptr = agent_xrealloc(b->ptr, cap);
+        b->ptr = (char *)agent_xrealloc(b->ptr, cap);
         b->cap = cap;
     }
     memcpy(b->ptr + b->len, s, n);

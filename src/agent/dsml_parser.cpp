@@ -53,7 +53,7 @@ static void agent_tool_call_add_arg(agent_tool_call *c, const char *name,
                                     bool is_string) {
     if (c->argc == c->argcap) {
         c->argcap = c->argcap ? c->argcap * 2 : 4;
-        c->args = agent_xrealloc(c->args, (size_t)c->argcap * sizeof(c->args[0]));
+        c->args = (agent_tool_arg *)agent_xrealloc(c->args, (size_t)c->argcap * sizeof(c->args[0]));
     }
     c->args[c->argc++] = (agent_tool_arg){
         .name = xstrdup(name),
@@ -68,7 +68,7 @@ static void agent_tool_calls_push(agent_tool_calls *calls, agent_tool_call *call
     if (!call->name) return;
     if (calls->len == calls->cap) {
         calls->cap = calls->cap ? calls->cap * 2 : 2;
-        calls->v = agent_xrealloc(calls->v, (size_t)calls->cap * sizeof(calls->v[0]));
+        calls->v = (agent_tool_call *)agent_xrealloc(calls->v, (size_t)calls->cap * sizeof(calls->v[0]));
     }
     calls->v[calls->len++] = *call;
     memset(call, 0, sizeof(*call));
@@ -109,7 +109,7 @@ static void agent_dsml_raw_append(agent_dsml_parser *p, const char *s, size_t n)
     if (p->raw_len + n + 1 > p->raw_cap) {
         size_t cap = p->raw_cap ? p->raw_cap * 2 : 512;
         while (cap < p->raw_len + n + 1) cap *= 2;
-        p->raw = agent_xrealloc(p->raw, cap);
+        p->raw = (char *)agent_xrealloc(p->raw, cap);
         p->raw_cap = cap;
     }
     memcpy(p->raw + p->raw_len, s, n);

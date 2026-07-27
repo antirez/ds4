@@ -33,6 +33,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* This is intentionally not in linenoise.h, but it is part of the existing
  * multiplexed editor implementation.  The agent uses it only to restore text
  * after Enter is pressed while the model is still busy. */
@@ -807,5 +811,9 @@ bool agent_maybe_save_before_leaving_session(agent_worker *w);
 agent_exit_save_result agent_maybe_save_before_exiting(agent_worker *w);
 
 /* ---- shared inline helpers ---- */
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* DS4_AGENT_INTERNAL_H */

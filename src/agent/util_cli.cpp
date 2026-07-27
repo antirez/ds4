@@ -15,7 +15,7 @@ void agent_sigint_handler(int sig) {
 
 
 void *agent_xmalloc(size_t n) {
-    void *p = malloc(n ? n : 1);
+    void *p = (void *)malloc(n ? n : 1);
     if (!p) {
         perror("ds4-agent: malloc");
         exit(1);
@@ -28,7 +28,7 @@ void *agent_xmalloc(size_t n) {
 char *xstrdup(const char *s) {
     if (!s) s = "";
     size_t n = strlen(s);
-    char *p = agent_xmalloc(n + 1);
+    char *p = (char *)agent_xmalloc(n + 1);
     memcpy(p, s, n + 1);
     return p;
 }
@@ -36,7 +36,7 @@ char *xstrdup(const char *s) {
 
 
 char *xstrndup(const char *s, size_t n) {
-    char *p = agent_xmalloc(n + 1);
+    char *p = (char *)agent_xmalloc(n + 1);
     memcpy(p, s, n);
     p[n] = '\0';
     return p;
@@ -45,7 +45,7 @@ char *xstrndup(const char *s, size_t n) {
 
 
 void *agent_xrealloc(void *ptr, size_t n) {
-    void *p = realloc(ptr, n ? n : 1);
+    void *p = (void *)realloc(ptr, n ? n : 1);
     if (!p) {
         perror("ds4-agent: realloc");
         exit(1);
@@ -74,7 +74,7 @@ void agent_input_buf_append(agent_input_buf *b, const char *s, size_t n) {
     if (b->len + n + 1 > b->cap) {
         size_t cap = b->cap ? b->cap * 2 : 4096;
         while (cap < b->len + n + 1) cap *= 2;
-        b->ptr = agent_xrealloc(b->ptr, cap);
+        b->ptr = (char *)agent_xrealloc(b->ptr, cap);
         b->cap = cap;
     }
     memcpy(b->ptr + b->len, s, n);

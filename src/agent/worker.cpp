@@ -478,7 +478,7 @@ static void worker_run_deferred_compact(agent_worker *w) {
 /* Worker thread entry point.  The UI thread submits plain user text; this
  * thread owns all DS4 session mutation, tool execution, and compaction. */
 void *worker_main(void *arg) {
-    agent_worker *w = arg;
+    agent_worker *w = (agent_worker *)arg;
     agent_trace(w, "agent worker start ctx=%d backend=%s model=%s trace=%s",
                 w->cfg->gen.ctx_size,
                 ds4_backend_name(w->cfg->engine.backend),

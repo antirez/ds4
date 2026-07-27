@@ -141,7 +141,7 @@ static void build_status_text(const agent_status *st, char *buf, size_t len) {
 void agent_prompt_queue_push(agent_prompt_queue *q, const char *text) {
     if (q->len == q->cap) {
         q->cap = q->cap ? q->cap * 2 : 4;
-        q->v = agent_xrealloc(q->v, q->cap * sizeof(q->v[0]));
+        q->v = (char* *)agent_xrealloc(q->v, q->cap * sizeof(q->v[0]));
     }
     q->v[q->len++] = xstrdup(text ? text : "");
 }
@@ -161,7 +161,7 @@ char *agent_prompt_queue_pop(agent_prompt_queue *q) {
 void agent_prompt_queue_push_front(agent_prompt_queue *q, char *text) {
     if (q->len == q->cap) {
         q->cap = q->cap ? q->cap * 2 : 4;
-        q->v = agent_xrealloc(q->v, q->cap * sizeof(q->v[0]));
+        q->v = (char* *)agent_xrealloc(q->v, q->cap * sizeof(q->v[0]));
     }
     memmove(q->v + 1, q->v, q->len * sizeof(q->v[0]));
     q->v[0] = text;
@@ -786,7 +786,7 @@ static int editor_linenoise_layout_changed(struct linenoiseState *l,
                                            size_t status_rows,
                                            void *privdata) {
     (void)l;
-    agent_editor *ed = privdata;
+    agent_editor *ed = (agent_editor *)privdata;
     if (!ed || !ed->scroll_region) return 0;
     if (prompt_rows < 1) prompt_rows = 1;
     int reserved = (int)(prompt_rows + status_rows);
@@ -852,7 +852,7 @@ void editor_restore_terminal_layout(agent_editor *ed) {
 /* Start linenoise in nonblocking mode and install the status footer. */
 int editor_start(agent_editor *ed, const char *prompt,
                         const char *status, const char *initial) {
-    char *input = agent_xmalloc(AGENT_INPUT_INITIAL_BUFLEN);
+    char *input = (char *)agent_xmalloc(AGENT_INPUT_INITIAL_BUFLEN);
     snprintf(ed->prompt, sizeof(ed->prompt), "%s", prompt);
     snprintf(ed->status, sizeof(ed->status), "%s", status ? status : "");
     bool had_scroll_region = ed->scroll_region;

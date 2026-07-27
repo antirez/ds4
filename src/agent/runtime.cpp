@@ -130,7 +130,7 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
 
         char *out = NULL;
         size_t out_len = 0;
-        agent_status st = {0};
+        agent_status st = {};
         worker_consume(&worker, &out, &out_len, &st);
         if (out && out_len) {
             write_all(STDOUT_FILENO, out, out_len);

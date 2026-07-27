@@ -16,7 +16,7 @@ static void agent_tail_capture_append(agent_tail_capture *t,
                                       const char *s, size_t n) {
     if (!t || !n) return;
     if (!t->cap) return;
-    if (!t->buf) t->buf = agent_xmalloc(t->cap);
+    if (!t->buf) t->buf = (char *)agent_xmalloc(t->cap);
     t->total += n;
 
     if (n >= t->cap) {
@@ -54,7 +54,7 @@ static void agent_tail_capture_append(agent_tail_capture *t,
 
 char *agent_tail_capture_take(agent_tail_capture *t, size_t *len) {
     size_t n = t ? t->len : 0;
-    char *out = agent_xmalloc(n + 1);
+    char *out = (char *)agent_xmalloc(n + 1);
     if (n) {
         size_t right = t->cap - t->start;
         size_t first = n < right ? n : right;
@@ -789,7 +789,7 @@ static void renderer_code_line_append(agent_token_renderer *r,
     if (r->md_code_line_len + n + 1 > r->md_code_line_cap) {
         size_t cap = r->md_code_line_cap ? r->md_code_line_cap * 2 : 256;
         while (cap < r->md_code_line_len + n + 1) cap *= 2;
-        r->md_code_line = agent_xrealloc(r->md_code_line, cap);
+        r->md_code_line = (char *)agent_xrealloc(r->md_code_line, cap);
         r->md_code_line_cap = cap;
     }
     memcpy(r->md_code_line + r->md_code_line_len, s, n);
@@ -1170,7 +1170,7 @@ static void renderer_process(agent_token_renderer *r, const char *text, size_t l
     const char *think_open = "<think>";
     const char *think_close = "</think>";
     size_t total = r->pending_len + len;
-    char *buf = agent_xmalloc(total ? total : 1);
+    char *buf = (char *)agent_xmalloc(total ? total : 1);
     if (r->pending_len) memcpy(buf, r->pending, r->pending_len);
     if (len) memcpy(buf + r->pending_len, text, len);
     r->pending_len = 0;
