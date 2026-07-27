@@ -17049,7 +17049,7 @@ static void test_kv_cache_lookup_rejects_stale_payload_abi(void) {
     if (fp) {
         uint8_t h[KV_CACHE_FIXED_HEADER];
         kv_fill_header(h, 2, KV_REASON_COLD, 0, 512, 0, 32768, 100, 100, 0);
-        h[20] = 0; /* pre-ABI-guard files used this byte as reserved zero. */
+        h[20] = 2; /* Prior Laguna checkpoints may contain raced SWA rows. */
         uint8_t text_len[4];
         le_put32(text_len, (uint32_t)strlen(text));
         TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));

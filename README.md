@@ -1447,7 +1447,8 @@ The fixed header is little-endian:
 8   u32    cached token count
 12  u32    hit count
 16  u32    context size the snapshot was written for
-20  u8[4]  reserved
+20  u8     graph-payload ABI, currently 3
+21  u8[3]  reserved
 24  u64    creation Unix time
 32  u64    last-used Unix time
 40  u64    DS4 session payload byte count
