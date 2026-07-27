@@ -1,0 +1,1 @@
+In a distributed database, **eventual consistency** is a consistency model that guarantees that if no new updates are made to

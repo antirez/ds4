@@ -1,0 +1,3 @@
+## Binary Search for Insertion Point
+
+Binary search finds the insertion point for a target value in a sorted array by maintaining

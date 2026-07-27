@@ -1,0 +1,1 @@
+KV cache checkpointing is a critical optimization for agentic AI sessions because it solves a fundamental tension: **agents are long

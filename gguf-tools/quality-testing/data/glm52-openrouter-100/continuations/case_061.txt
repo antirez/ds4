@@ -1,0 +1,1 @@
+To understand why sorted arrays make membership tests (checking if a specific item exists in a collection) faster, we have to

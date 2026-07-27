@@ -1,3 +1,12 @@
 deepseek4-quantize
+gguf-requantize-dense
 quality-testing/score_official
-quality-testing/data/
+quality-testing/score_llama
+quality-testing/data/*
+!quality-testing/data/README.md
+!quality-testing/data/glm52-openrouter-100/
+!quality-testing/data/glm52-openrouter-100/**
+!quality-testing/data/pro/
+!quality-testing/data/pro/**
+!quality-testing/data/flash/
+!quality-testing/data/flash/**

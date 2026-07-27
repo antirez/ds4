@@ -1,0 +1,4319 @@
+{
+  "schema": "ds4-openrouter-logprobs-v1",
+  "source": "openrouter",
+  "model": "z-ai/glm-5.2",
+  "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+  "created_at": "2026-06-20T17:41:13Z",
+  "id": "long_code_audit",
+  "kind": "long",
+  "prompt": "Review this generated C-code audit log. After the log, complete the sentence with the most likely next words.\n\nFunction f_0 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 0: reject negative sizes before casting.\nFunction f_1 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 1: reject negative sizes before casting.\nFunction f_2 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 2: reject negative sizes before casting.\nFunction f_3 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 3: reject negative sizes before casting.\nFunction f_4 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 4: reject negative sizes before casting.\nFunction f_5 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 5: reject negative sizes before casting.\nFunction f_6 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 6: reject negative sizes before casting.\nFunction f_7 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 7: reject negative sizes before casting.\nFunction f_8 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 8: reject negative sizes before casting.\nFunction f_9 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 9: reject negative sizes before casting.\nFunction f_10 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 10: reject negative sizes before casting.\nFunction f_11 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 11: reject negative sizes before casting.\nFunction f_12 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 12: reject negative sizes before casting.\nFunction f_13 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 13: reject negative sizes before casting.\nFunction f_14 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 14: reject negative sizes before casting.\nFunction f_15 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 15: reject negative sizes before casting.\nFunction f_16 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 16: reject negative sizes before casting.\nFunction f_17 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 17: reject negative sizes before casting.\nFunction f_18 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 18: reject negative sizes before casting.\nFunction f_19 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 19: reject negative sizes before casting.\nFunction f_20 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 20: reject negative sizes before casting.\nFunction f_21 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 21: reject negative sizes before casting.\nFunction f_22 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 22: reject negative sizes before casting.\nFunction f_23 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 23: reject negative sizes before casting.\nFunction f_24 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 24: reject negative sizes before casting.\nFunction f_25 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 25: reject negative sizes before casting.\nFunction f_26 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 26: reject negative sizes before casting.\nFunction f_27 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 27: reject negative sizes before casting.\nFunction f_28 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 28: reject negative sizes before casting.\nFunction f_29 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 29: reject negative sizes before casting.\nFunction f_30 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 30: reject negative sizes before casting.\nFunction f_31 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 31: reject negative sizes before casting.\nFunction f_32 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 32: reject negative sizes before casting.\nFunction f_33 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 33: reject negative sizes before casting.\nFunction f_34 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 34: reject negative sizes before casting.\nFunction f_35 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 35: reject negative sizes before casting.\nFunction f_36 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 36: reject negative sizes before casting.\nFunction f_37 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 37: reject negative sizes before casting.\nFunction f_38 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 38: reject negative sizes before casting.\nFunction f_39 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 39: reject negative sizes before casting.\nFunction f_40 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 40: reject negative sizes before casting.\nFunction f_41 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 41: reject negative sizes before casting.\nFunction f_42 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 42: reject negative sizes before casting.\nFunction f_43 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 43: reject negative sizes before casting.\nFunction f_44 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 44: reject negative sizes before casting.\nFunction f_45 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 45: reject negative sizes before casting.\nFunction f_46 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 46: reject negative sizes before casting.\nFunction f_47 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 47: reject negative sizes before casting.\nFunction f_48 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 48: reject negative sizes before casting.\nFunction f_49 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 49: reject negative sizes before casting.\nFunction f_50 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 50: reject negative sizes before casting.\nFunction f_51 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 51: reject negative sizes before casting.\nFunction f_52 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 52: reject negative sizes before casting.\nFunction f_53 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 53: reject negative sizes before casting.\nFunction f_54 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 54: reject negative sizes before casting.\nFunction f_55 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 55: reject negative sizes before casting.\nFunction f_56 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 56: reject negative sizes before casting.\nFunction f_57 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 57: reject negative sizes before casting.\nFunction f_58 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 58: reject negative sizes before casting.\nFunction f_59 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 59: reject negative sizes before casting.\nFunction f_60 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 60: reject negative sizes before casting.\nFunction f_61 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 61: reject negative sizes before casting.\nFunction f_62 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 62: reject negative sizes before casting.\nFunction f_63 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 63: reject negative sizes before casting.\nFunction f_64 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 64: reject negative sizes before casting.\nFunction f_65 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 65: reject negative sizes before casting.\nFunction f_66 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 66: reject negative sizes before casting.\nFunction f_67 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 67: reject negative sizes before casting.\n\nCompletion target: The most important code quality issue is",
+  "request": {
+    "model": "z-ai/glm-5.2",
+    "temperature": 0,
+    "seed": 1,
+    "token_limit_field": "max_tokens",
+    "max_tokens": 16,
+    "logprobs": true,
+    "top_logprobs": 20,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Review this generated C-code audit log. After the log, complete the sentence with the most likely next words.\n\nFunction f_0 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 0: reject negative sizes before casting.\nFunction f_1 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 1: reject negative sizes before casting.\nFunction f_2 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 2: reject negative sizes before casting.\nFunction f_3 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 3: reject negative sizes before casting.\nFunction f_4 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 4: reject negative sizes before casting.\nFunction f_5 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 5: reject negative sizes before casting.\nFunction f_6 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 6: reject negative sizes before casting.\nFunction f_7 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 7: reject negative sizes before casting.\nFunction f_8 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 8: reject negative sizes before casting.\nFunction f_9 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 9: reject negative sizes before casting.\nFunction f_10 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 10: reject negative sizes before casting.\nFunction f_11 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 11: reject negative sizes before casting.\nFunction f_12 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 12: reject negative sizes before casting.\nFunction f_13 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 13: reject negative sizes before casting.\nFunction f_14 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 14: reject negative sizes before casting.\nFunction f_15 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 15: reject negative sizes before casting.\nFunction f_16 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 16: reject negative sizes before casting.\nFunction f_17 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 17: reject negative sizes before casting.\nFunction f_18 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 18: reject negative sizes before casting.\nFunction f_19 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 19: reject negative sizes before casting.\nFunction f_20 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 20: reject negative sizes before casting.\nFunction f_21 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 21: reject negative sizes before casting.\nFunction f_22 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 22: reject negative sizes before casting.\nFunction f_23 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 23: reject negative sizes before casting.\nFunction f_24 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 24: reject negative sizes before casting.\nFunction f_25 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 25: reject negative sizes before casting.\nFunction f_26 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 26: reject negative sizes before casting.\nFunction f_27 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 27: reject negative sizes before casting.\nFunction f_28 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 28: reject negative sizes before casting.\nFunction f_29 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 29: reject negative sizes before casting.\nFunction f_30 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 30: reject negative sizes before casting.\nFunction f_31 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 31: reject negative sizes before casting.\nFunction f_32 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 32: reject negative sizes before casting.\nFunction f_33 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 33: reject negative sizes before casting.\nFunction f_34 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 34: reject negative sizes before casting.\nFunction f_35 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 35: reject negative sizes before casting.\nFunction f_36 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 36: reject negative sizes before casting.\nFunction f_37 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 37: reject negative sizes before casting.\nFunction f_38 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 38: reject negative sizes before casting.\nFunction f_39 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 39: reject negative sizes before casting.\nFunction f_40 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 40: reject negative sizes before casting.\nFunction f_41 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 41: reject negative sizes before casting.\nFunction f_42 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 42: reject negative sizes before casting.\nFunction f_43 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 43: reject negative sizes before casting.\nFunction f_44 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 44: reject negative sizes before casting.\nFunction f_45 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 45: reject negative sizes before casting.\nFunction f_46 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 46: reject negative sizes before casting.\nFunction f_47 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 47: reject negative sizes before casting.\nFunction f_48 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 48: reject negative sizes before casting.\nFunction f_49 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 49: reject negative sizes before casting.\nFunction f_50 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 50: reject negative sizes before casting.\nFunction f_51 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 51: reject negative sizes before casting.\nFunction f_52 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 52: reject negative sizes before casting.\nFunction f_53 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 53: reject negative sizes before casting.\nFunction f_54 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 54: reject negative sizes before casting.\nFunction f_55 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 55: reject negative sizes before casting.\nFunction f_56 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 56: reject negative sizes before casting.\nFunction f_57 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 57: reject negative sizes before casting.\nFunction f_58 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 58: reject negative sizes before casting.\nFunction f_59 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 59: reject negative sizes before casting.\nFunction f_60 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 60: reject negative sizes before casting.\nFunction f_61 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 61: reject negative sizes before casting.\nFunction f_62 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 62: reject negative sizes before casting.\nFunction f_63 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 63: reject negative sizes before casting.\nFunction f_64 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 64: reject negative sizes before casting.\nFunction f_65 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 65: reject negative sizes before casting.\nFunction f_66 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 66: reject negative sizes before casting.\nFunction f_67 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 67: reject negative sizes before casting.\n\nCompletion target: The most important code quality issue is"
+      }
+    ],
+    "reasoning": {
+      "effort": "none"
+    },
+    "provider": {
+      "require_parameters": true,
+      "order": [
+        "parasail/fp8"
+      ],
+      "allow_fallbacks": false
+    }
+  },
+  "provider": "Parasail",
+  "usage": {
+    "prompt_tokens": 3778,
+    "completion_tokens": 16,
+    "total_tokens": 3794,
+    "cost": 0.0053596,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 0.0053596,
+      "upstream_inference_prompt_cost": 0.0052892,
+      "upstream_inference_completions_cost": 7.04e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  },
+  "finish_reason": "length",
+  "message": {
+    "role": "assistant",
+    "content": "the repetitive boilerplate across f_0 through f_67, which should be",
+    "refusal": null,
+    "reasoning": null
+  },
+  "logits_available": false,
+  "steps": [
+    {
+      "step": 0,
+      "token": {
+        "text": "the",
+        "bytes": [
+          116,
+          104,
+          101
+        ]
+      },
+      "logprob": -0.44469785690307617,
+      "top_logprobs": [
+        {
+          "token": {
+            "text": "the",
+            "bytes": [
+              116,
+              104,
+              101
+            ]
+          },
+          "logprob": -0.44469785690307617
+        },
+        {
+          "token": {
+            "text": "that",
+            "bytes": [
+              116,
+              104,
+              97,
+              116
+            ]
+          },
+          "logprob": -1.1946978569030762
+        },
+        {
+          "token": {
+            "text": "The",
+            "bytes": [
+              84,
+              104,
+              101
+            ]
+          },
+          "logprob": -3.944697856903076
+        },
+        {
+          "token": {
+            "text": "re",
+            "bytes": [
+              114,
+              101
+            ]
+          },
+          "logprob": -4.444697856903076
+        },
+        {
+          "token": {
+            "text": "not",
+            "bytes": [
+              110,
+              111,
+              116
+            ]
+          },
+          "logprob": -5.069697856903076
+        },
+        {
+          "token": {
+            "text": "**",
+            "bytes": [
+              42,
+              42
+            ]
+          },
+          "logprob": -5.069697856903076
+        },
+        {
+          "token": {
+            "text": "ex",
+            "bytes": [
+              101,
+              120
+            ]
+          },
+          "logprob": -5.694697856903076
+        },
+        {
+          "token": {
+            "text": "likely",
+            "bytes": [
+              108,
+              105,
+              107,
+              101,
+              108,
+              121
+            ]
+          },
+          "logprob": -6.194697856903076
+        },
+        {
+          "token": {
+            "text": "a",
+            "bytes": [
+              97
+            ]
+          },
+          "logprob": -7.069697856903076
+        },
+        {
+          "token": {
+            "text": "high",
+            "bytes": [
+              104,
+              105,
+              103,
+              104
+            ]
+          },
+          "logprob": -7.444697856903076
+        },
+        {
+          "token": {
+            "text": "ext",
+            "bytes": [
+              101,
+              120,
+              116
+            ]
+          },
+          "logprob": -7.444697856903076
+        },
+        {
+          "token": {
+            "text": "code",
+            "bytes": [
+              99,
+              111,
+              100,
+              101
+            ]
+          },
+          "logprob": -7.444697856903076
+        },
+        {
+          "token": {
+            "text": "se",
+            "bytes": [
+              115,
+              101
+            ]
+          },
+          "logprob": -7.444697856903076
+        },
+        {
+          "token": {
+            "text": "un",
+            "bytes": [
+              117,
+              110
+            ]
+          },
+          "logprob": -7.569697856903076
+        },
+        {
+          "token": {
+            "text": "an",
+            "bytes": [
+              97,
+              110
+            ]
+          },
+          "logprob": -8.444698333740234
+        },
+        {
+          "token": {
+            "text": "clear",
+            "bytes": [
+              99,
+              108,
+              101,
+              97,
+              114
+            ]
+          },
+          "logprob": -8.444698333740234
+        },
+        {
+          "token": {
+            "text": "mass",
+            "bytes": [
+              109,
+              97,
+              115,
+              115
+            ]
+          },
+          "logprob": -8.569698333740234
+        },
+        {
+          "token": {
+            "text": "its",
+            "bytes": [
+              105,
+              116,
+              115
+            ]
+          },
+          "logprob": -8.757198333740234
+        },
+        {
+          "token": {
+            "text": "r",
+            "bytes": [
+              114
+            ]
+          },
+          "logprob": -8.819698333740234
+        },
+        {
+          "token": {
+            "text": "Code",
+            "bytes": [
+              67,
+              111,
+              100,
+              101
+            ]
+          },
+          "logprob": -9.194698333740234
+        }
+      ]
+    },
+    {
+      "step": 1,
+      "token": {
+        "text": " repetitive",
+        "bytes": [
+          32,
+          114,
+          101,
+          112,
+          101,
+          116,
+          105,
+          116,
+          105,
+          118,
+          101
+        ]
+      },
+      "logprob": -1.5374315977096558,
+      "top_logprobs": [
+        {
+          "token": {
+            "text": " repetitive",
+            "bytes": [
+              32,
+              114,
+              101,
+              112,
+              101,
+              116,
+              105,
+              116,
+              105,
+              118,
+              101
+            ]
+          },
+          "logprob": -1.5374315977096558
+        },
+        {
+          "token": {
+            "text": " repeated",
+            "bytes": [
+              32,
+              114,
+              101,
+              112,
+              101,
+              97,
+              116,
+              101,
+              100
+            ]
+          },
+          "logprob": -2.0374317169189453
+        },
+        {
+          "token": {
+            "text": " massive",
+            "bytes": [
+              32,
+              109,
+              97,
+              115,
+              115,
+              105,
+              118,
+              101
+            ]
+          },
+          "logprob": -2.2874317169189453
+        },
+        {
+          "token": {
+            "text": " pervasive",
+            "bytes": [
+              32,
+              112,
+              101,
+              114,
+              118,
+              97,
+              115,
+              105,
+              118,
+              101
+            ]
+          },
+          "logprob": -2.6624317169189453
+        },
+        {
+          "token": {
+            "text": " un",
+            "bytes": [
+              32,
+              117,
+              110
+            ]
+          },
+          "logprob": -2.7874317169189453
+        },
+        {
+          "token": {
+            "text": " duplicated",
+            "bytes": [
+              32,
+              100,
+              117,
+              112,
+              108,
+              105,
+              99,
+              97,
+              116,
+              101,
+              100
+            ]
+          },
+          "logprob": -2.9124317169189453
+        },
+        {
+          "token": {
+            "text": " excessive",
+            "bytes": [
+              32,
+              101,
+              120,
+              99,
+              101,
+              115,
+              115,
+              105,
+              118,
+              101
+            ]
+          },
+          "logprob": -3.2874317169189453
+        },
+        {
+          "token": {
+            "text": " severe",
+            "bytes": [
+              32,
+              115,
+              101,
+              118,
+              101,
+              114,
+              101
+            ]
+          },
+          "logprob": -3.4124317169189453
+        },
+        {
+          "token": {
+            "text": " rampant",
+            "bytes": [
+              32,
+              114,
+              97,
+              109,
+              112,
+              97,
+              110,
+              116
+            ]
+          },
+          "logprob": -3.4124317169189453
+        },
+        {
+          "token": {
+            "text": " boiler",
+            "bytes": [
+              32,
+              98,
+              111,
+              105,
+              108,
+              101,
+              114
+            ]
+          },
+          "logprob": -3.5374317169189453
+        },
+        {
+          "token": {
+            "text": " code",
+            "bytes": [
+              32,
+              99,
+              111,
+              100,
+              101
+            ]
+          },
+          "logprob": -3.5374317169189453
+        },
+        {
+          "token": {
+            "text": " duplication",
+            "bytes": [
+              32,
+              100,
+              117,
+              112,
+              108,
+              105,
+              99,
+              97,
+              116,
+              105,
+              111,
+              110
+            ]
+          },
+          "logprob": -4.037431716918945
+        },
+        {
+          "token": {
+            "text": " mass",
+            "bytes": [
+              32,
+              109,
+              97,
+              115,
+              115
+            ]
+          },
+          "logprob": -4.287431716918945
+        },
+        {
+          "token": {
+            "text": " highly",
+            "bytes": [
+              32,
+              104,
+              105,
+              103,
+              104,
+              108,
+              121
+            ]
+          },
+          "logprob": -4.287431716918945
+        },
+        {
+          "token": {
+            "text": " extensive",
+            "bytes": [
+              32,
+              101,
+              120,
+              116,
+              101,
+              110,
+              115,
+              105,
+              118,
+              101
+            ]
+          },
+          "logprob": -4.349931716918945
+        },
+        {
+          "token": {
+            "text": " blatant",
+            "bytes": [
+              32,
+              98,
+              108,
+              97,
+              116,
+              97,
+              110,
+              116
+            ]
+          },
+          "logprob": -4.412431716918945
+        },
+        {
+          "token": {
+            "text": " repetition",
+            "bytes": [
+              32,
+              114,
+              101,
+              112,
+              101,
+              116,
+              105,
+              116,
+              105,
+              111,
+              110
+            ]
+          },
+          "logprob": -4.537431716918945
+        },
+        {
+          "token": {
+            "text": " extreme",
+            "bytes": [
+              32,
+              101,
+              120,
+              116,
+              114,
+              101,
+              109,
+              101
+            ]
+          },
+          "logprob": -4.662431716918945
+        },
+        {
+          "token": {
+            "text": " unnecessary",
+            "bytes": [
+              32,
+              117,
+              110,
+              110,
+              101,
+              99,
+              101,
+              115,
+              115,
+              97,
+              114,
+              121
+            ]
+          },
+          "logprob": -4.724931716918945
+        },
+        {
+          "token": {
+            "text": " egregious",
+            "bytes": [
+              32,
+              101,
+              103,
+              114,
+              101,
+              103,
+              105,
+              111,
+              117,
+              115
+            ]
+          },
+          "logprob": -4.912431716918945
+        }
+      ]
+    },
+    {
+      "step": 2,
+      "token": {
+        "text": " boiler",
+        "bytes": [
+          32,
+          98,
+          111,
+          105,
+          108,
+          101,
+          114
+        ]
+      },
+      "logprob": -0.830649733543396,
+      "top_logprobs": [
+        {
+          "token": {
+            "text": " boiler",
+            "bytes": [
+              32,
+              98,
+              111,
+              105,
+              108,
+              101,
+              114
+            ]
+          },
+          "logprob": -0.830649733543396
+        },
+        {
+          "token": {
+            "text": " duplication",
+            "bytes": [
+              32,
+              100,
+              117,
+              112,
+              108,
+              105,
+              99,
+              97,
+              116,
+              105,
+              111,
+              110
+            ]
+          },
+          "logprob": -1.330649733543396
+        },
+        {
+          "token": {
+            "text": " copy",
+            "bytes": [
+              32,
+              99,
+              111,
+              112,
+              121
+            ]
+          },
+          "logprob": -2.0806498527526855
+        },
+        {
+          "token": {
+            "text": " code",
+            "bytes": [
+              32,
+              99,
+              111,
+              100,
+              101
+            ]
+          },
+          "logprob": -2.4556498527526855
+        },
+        {
+          "token": {
+            "text": ",",
+            "bytes": [
+              44
+            ]
+          },
+          "logprob": -2.5806498527526855
+        },
+        {
+          "token": {
+            "text": " manual",
+            "bytes": [
+              32,
+              109,
+              97,
+              110,
+              117,
+              97,
+              108
+            ]
+          },
+          "logprob": -5.5806498527526855
+        },
+        {
+          "token": {
+            "text": " cloning",
+            "bytes": [
+              32,
+              99,
+              108,
+              111,
+              110,
+              105,
+              110,
+              103
+            ]
+          },
+          "logprob": -6.4556498527526855
+        },
+        {
+          "token": {
+            "text": " un",
+            "bytes": [
+              32,
+              117,
+              110
+            ]
+          },
+          "logprob": -6.4556498527526855
+        },
+        {
+          "token": {
+            "text": " violation",
+            "bytes": [
+              32,
+              118,
+              105,
+              111,
+              108,
+              97,
+              116,
+              105,
+              111,
+              110
+            ]
+          },
+          "logprob": -7.0806498527526855
+        },
+        {
+          "token": {
+            "text": " near",
+            "bytes": [
+              32,
+              110,
+              101,
+              97,
+              114
+            ]
+          },
+          "logprob": -7.3306498527526855
+        },
+        {
+          "token": {
+            "text": " and",
+            "bytes": [
+              32,
+              97,
+              110,
+              100
+            ]
+          },
+          "logprob": -7.5806498527526855
+        },
+        {
+          "token": {
+            "text": " copying",
+            "bytes": [
+              32,
+              99,
+              111,
+              112,
+              121,
+              105,
+              110,
+              103
+            ]
+          },
+          "logprob": -7.7056498527526855
+        },
+        {
+          "token": {
+            "text": " cut",
+            "bytes": [
+              32,
+              99,
+              117,
+              116
+            ]
+          },
+          "logprob": -7.7056498527526855
+        },
+        {
+          "token": {
+            "text": " `",
+            "bytes": [
+              32,
+              96
+            ]
+          },
+          "logprob": -7.8306498527526855
+        },
+        {
+          "token": {
+            "text": " clone",
+            "bytes": [
+              32,
+              99,
+              108,
+              111,
+              110,
+              101
+            ]
+          },
+          "logprob": -7.8931498527526855
+        },
+        {
+          "token": {
+            "text": " **",
+            "bytes": [
+              32,
+              42,
+              42
+            ]
+          },
+          "logprob": -8.330649375915527
+        },
+        {
+          "token": {
+            "text": " structural",
+            "bytes": [
+              32,
+              115,
+              116,
+              114,
+              117,
+              99,
+              116,
+              117,
+              114,
+              97,
+              108
+            ]
+          },
+          "logprob": -8.393149375915527
+        },
+        {
+          "token": {
+            "text": " block",
+            "bytes": [
+              32,
+              98,
+              108,
+              111,
+              99,
+              107
+            ]
+          },
+          "logprob": -8.830649375915527
+        },
+        {
+          "token": {
+            "text": " mass",
+            "bytes": [
+              32,
+              109,
+              97,
+              115,
+              115
+            ]
+          },
+          "logprob": -8.830649375915527
+        },
+        {
+          "token": {
+            "text": " nature",
+            "bytes": [
+              32,
+              110,
+              97,
+              116,
+              117,
+              114,
+              101
+            ]
+          },
+          "logprob": -8.830649375915527
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "token": {
+        "text": "plate",
+        "bytes": [
+          112,
+          108,
+          97,
+          116,
+          101
+        ]
+      },
+      "logprob": -1.9907753085135482e-05,
+      "top_logprobs": [
+        {
+          "token": {
+            "text": "plate",
+            "bytes": [
+              112,
+              108,
+              97,
+              116,
+              101
+            ]
+          },
+          "logprob": -1.9907753085135482e-05
+        },
+        {
+          "token": {
+            "text": "-",
+            "bytes": [
+              45
+            ]
+          },
+          "logprob": -11.875020027160645
+        },
+        {
+          "token": {
+            "text": "pl",
+            "bytes": [
+              112,
+              108
+            ]
+          },
+          "logprob": -12.750020027160645
+        },
+        {
+          "token": {
+            "text": " plate",
+            "bytes": [
+              32,
+              112,
+              108,
+              97,
+              116,
+              101
+            ]
+          },
+          "logprob": -12.750020027160645
+        },
+        {
+          "token": {
+            "text": "plates",
+            "bytes": [
+              112,
+              108,
+              97,
+              116,
+              101,
+              115
+            ]
+          },
+          "logprob": -13.250020027160645
+        },
+        {
+          "token": {
+            "text": "plat",
+            "bytes": [
+              112,
+              108,
+              97,
+              116
+            ]
+          },
+          "logprob": -13.375020027160645
+        },
+        {
+          "token": {
+            "text": "place",
+            "bytes": [
+              112,
+              108,
+              97,
+              99,
+              101
+            ]
+          },
+          "logprob": -13.500020027160645
+        },
+        {
+          "token": {
+            "text": "Plate",
+            "bytes": [
+              80,
+              108,
+              97,
+              116,
+              101
+            ]
+          },
+          "logprob": -14.375020027160645
+        },
+        {
+          "token": {
+            "text": "paste",
+            "bytes": [
+              112,
+              97,
+              115,
+              116,
+              101
+            ]
+          },
+          "logprob": -14.812520027160645
+        },
+        {
+          "token": {
+            "text": "‑",
+            "bytes": [
+              226,
+              128,
+              145
+            ]
+          },
+          "logprob": -15.187520027160645
+        },
+        {
+          "token": {
+            "text": "print",
+            "bytes": [
+              112,
+              114,
+              105,
+              110,
+              116
+            ]
+          },
+          "logprob": -15.250020027160645
+        },
+        {
+          "token": {
+            "text": "_plate",
+            "bytes": [
+              95,
+              112,
+              108,
+              97,
+              116,
+              101
+            ]
+          },
+          "logprob": -15.562520027160645
+        },
+        {
+          "token": {
+            "text": "point",
+            "bytes": [
+              112,
+              111,
+              105,
+              110,
+              116
+            ]
+          },
+          "logprob": -16.250019073486328
+        },
+        {
+          "token": {
+            "text": "plit",
+            "bytes": [
+              112,
+              108,
+              105,
+              116
+            ]
+          },
+          "logprob": -16.312519073486328
+        },
+        {
+          "token": {
+            "text": "p",
+            "bytes": [
+              112
+            ]
+          },
+          "logprob": -16.437519073486328
+        },
+        {
+          "token": {
+            "text": "platz",
+            "bytes": [
+              112,
+              108,
+              97,
+              116,
+              122
+            ]
+          },
+          "logprob": -16.687519073486328
+        },
+        {
+          "token": {
+            "text": " Plate",
+            "bytes": [
+              32,
+              80,
+              108,
+              97,
+              116,
+              101
+            ]
+          },
+          "logprob": -17.062519073486328
+        },
+        {
+          "token": {
+            "text": "­",
+            "bytes": [
+              194,
+              173
+            ]
+          },
+          "logprob": -17.125019073486328
+        },
+        {
+          "token": {
+            "text": "pla",
+            "bytes": [
+              112,
+              108,
+              97
+            ]
+          },
+          "logprob": -17.187519073486328
+        },
+        {
+          "token": {
+            "text": "pad",
+            "bytes": [
+              112,
+              97,
+              100
+            ]
+          },
+          "logprob": -17.250019073486328
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "token": {
+        "text": " across",
+        "bytes": [
+          32,
+          97,
+          99,
+          114,
+          111,
+          115,
+          115
+        ]
+      },
+      "logprob": -0.34895026683807373,
+      "top_logprobs": [
+        {
+          "token": {
+            "text": " across",
+            "bytes": [
+              32,
+              97,
+              99,
+              114,
+              111,
+              115,
+              115
+            ]
+          },
+          "logprob": -0.34895026683807373
+        },
+        {
+          "token": {
+            "text": ",",
+            "bytes": [
+              44
+            ]
+          },
+          "logprob": -2.3489503860473633
+        },
+        {
+          "token": {
+            "text": " of",
+            "bytes": [
+              32,
+              111,
+              102
+            ]
+          },
+          "logprob": -3.2239503860473633
+        },
+        {
+          "token": {
+            "text": " and",
+            "bytes": [
+              32,
+              97,
+              110,
+              100
+            ]
+          },
+          "logprob": -3.2239503860473633
+        },
+        {
+          "token": {
+            "text": " in",
+            "bytes": [
+              32,
+              105,
+              110
+            ]
+          },
+          "logprob": -3.4739503860473633
+        },
+        {
+          "token": {
+            "text": ".",
+            "bytes": [
+              46
+            ]
+          },
+          "logprob": -4.348950386047363
+        },
+        {
+          "token": {
+            "text": ":",
+            "bytes": [
+              58
+            ]
+          },
+          "logprob": -4.473950386047363
+        },
+        {
+          "token": {
+            "text": " code",
+            "bytes": [
+              32,
+              99,
+              111,
+              100,
+              101
+            ]
+          },
+          "logprob": -4.598950386047363
+        },
+        {
+          "token": {
+            "text": " that",
+            "bytes": [
+              32,
+              116,
+              104,
+              97,
+              116
+            ]
+          },
+          "logprob": -4.598950386047363
+        },
+        {
+          "token": {
+            "text": " (",
+            "bytes": [
+              32,
+              40
+            ]
+          },
+          "logprob": -4.973950386047363
+        },
+        {
+          "token": {
+            "text": " generated",
+            "bytes": [
+              32,
+              103,
+              101,
+              110,
+              101,
+              114,
+              97,
+              116,
+              101,
+              100
+            ]
+          },
+          "logprob": -4.973950386047363
+        },
+        {
+          "token": {
+            "text": "—",
+            "bytes": [
+              226,
+              128,
+              148
+            ]
+          },
+          "logprob": -5.473950386047363
+        },
+        {
+          "token": {
+            "text": " indicating",
+            "bytes": [
+              32,
+              105,
+              110,
+              100,
+              105,
+              99,
+              97,
+              116,
+              105,
+              110,
+              103
+            ]
+          },
+          "logprob": -5.786450386047363
+        },
+        {
+          "token": {
+            "text": " duplication",
+            "bytes": [
+              32,
+              100,
+              117,
+              112,
+              108,
+              105,
+              99,
+              97,
+              116,
+              105,
+              111,
+              110
+            ]
+          },
+          "logprob": -6.036450386047363
+        },
+        {
+          "token": {
+            "text": " duplicated",
+            "bytes": [
+              32,
+              100,
+              117,
+              112,
+              108,
+              105,
+              99,
+              97,
+              116,
+              101,
+              100
+            ]
+          },
+          "logprob": -6.098950386047363
+        },
+        {
+          "token": {
+            "text": " caused",
+            "bytes": [
+              32,
+              99,
+              97,
+              117,
+              115,
+              101,
+              100
+            ]
+          },
+          "logprob": -6.223950386047363
+        },
+        {
+          "token": {
+            "text": " present",
+            "bytes": [
+              32,
+              112,
+              114,
+              101,
+              115,
+              101,
+              110,
+              116
+            ]
+          },
+          "logprob": -6.473950386047363
+        },
+        {
+          "token": {
+            "text": " logic",
+            "bytes": [
+              32,
+              108,
+              111,
+              103,
+              105,
+              99
+            ]
+          },
+          "logprob": -6.536450386047363
+        },
+        {
+          "token": {
+            "text": "...",
+            "bytes": [
+              46,
+              46,
+              46
+            ]
+          },
+          "logprob": -6.911450386047363
+        },
+        {
+          "token": {
+            "text": " spanning",
+            "bytes": [
+              32,
+              115,
+              112,
+              97,
+              110,
+              110,
+              105,
+              110,
+              103
+            ]
+          },
+          "logprob": -6.973950386047363
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "token": {
+        "text": " f",
+        "bytes": [
+          32,
+          102
+        ]
+      },
+      "logprob": -0.5819194316864014,
+      "top_logprobs": [
+        {
+          "token": {
+            "text": " f",
+            "bytes": [
+              32,
+              102
+            ]
+          },
+          "logprob": -0.5819194316864014
+        },
+        {
+          "token": {
+            "text": " all",
+            "bytes": [
+              32,
+              97,
+              108,
+              108
+            ]
+          },
+          "logprob": -1.8319194316864014
+        },
+        {
+          "token": {
+            "text": " the",
+            "bytes": [
+              32,
+              116,
+              104,
+              101
+            ]
+          },
+          "logprob": -2.2069194316864014
+        },
+        {
+          "token": {
+            "text": " functions",
+            "bytes": [
+              32,
+              102,
+              117,
+              110,
+              99,
+              116,
+              105,
+              111,
+              110,
+              115
+            ]
+          },
+          "logprob": -2.3319194316864014
+        },
+        {
+          "token": {
+            "text": " these",
+            "bytes": [
+              32,
+              116,
+              104,
+              101,
+              115,
+              101
+            ]
+          },
+          "logprob": -3.9569194316864014
+        },
+        {
+          "token": {
+            "text": " ",
+            "bytes": [
+              32
+            ]
+          },
+          "logprob": -3.9569194316864014
+        },
+        {
+          "token": {
+            "text": " `",
+            "bytes": [
+              32,
+              96
+            ]
+          },
+          "logprob": -4.4569196701049805
+        },
+        {
+          "token": {
+            "text": " dozens",
+            "bytes": [
+              32,
+              100,
+              111,
+              122,
+              101,
+              110,
+              115
+            ]
+          },
+          "logprob": -4.5819196701049805
+        },
+        {
+          "token": {
+            "text": " identical",
+            "bytes": [
+              32,
+              105,
+              100,
+              101,
+              110,
+              116,
+              105,
+              99,
+              97,
+              108
+            ]
+          },
+          "logprob": -6.2069196701049805
+        },
+        {
+          "token": {
+            "text": " nearly",
+            "bytes": [
+              32,
+              110,
+              101,
+              97,
+              114,
+              108,
+              121
+            ]
+          },
+          "logprob": -6.4569196701049805
+        },
+        {
+          "token": {
+            "text": " sixty",
+            "bytes": [
+              32,
+              115,
+              105,
+              120,
+              116,
+              121
+            ]
+          },
+          "logprob": -6.4569196701049805
+        },
+        {
+          "token": {
+            "text": " numerous",
+            "bytes": [
+              32,
+              110,
+              117,
+              109,
+              101,
+              114,
+              111,
+              117,
+              115
+            ]
+          },
+          "logprob": -6.9569196701049805
+        },
+        {
+          "token": {
+            "text": " generated",
+            "bytes": [
+              32,
+              103,
+              101,
+              110,
+              101,
+              114,
+              97,
+              116,
+              101,
+              100
+            ]
+          },
+          "logprob": -7.0819196701049805
+        },
+        {
+          "token": {
+            "text": " this",
+            "bytes": [
+              32,
+              116,
+              104,
+              105,
+              115
+            ]
+          },
+          "logprob": -7.2069196701049805
+        },
+        {
+          "token": {
+            "text": " function",
+            "bytes": [
+              32,
+              102,
+              117,
+              110,
+              99,
+              116,
+              105,
+              111,
+              110
+            ]
+          },
+          "logprob": -7.4569196701049805
+        },
+        {
+          "token": {
+            "text": " **",
+            "bytes": [
+              32,
+              42,
+              42
+            ]
+          },
+          "logprob": -7.4569196701049805
+        },
+        {
+          "token": {
+            "text": " every",
+            "bytes": [
+              32,
+              101,
+              118,
+              101,
+              114,
+              121
+            ]
+          },
+          "logprob": -7.5819196701049805
+        },
+        {
+          "token": {
+            "text": " an",
+            "bytes": [
+              32,
+              97,
+              110
+            ]
+          },
+          "logprob": -7.6444196701049805
+        },
+        {
+          "token": {
+            "text": " a",
+            "bytes": [
+              32,
+              97
+            ]
+          },
+          "logprob": -7.7694196701049805
+        },
+        {
+          "token": {
+            "text": " many",
+            "bytes": [
+              32,
+              109,
+              97,
+              110,
+              121
+            ]
+          },
+          "logprob": -8.14441967010498
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "token": {
+        "text": "_",
+        "bytes": [
+          95
+        ]
+      },
+      "logprob": -4.51792984677013e-05,
+      "top_logprobs": [
+        {
+          "token": {
+            "text": "_",
+            "bytes": [
+              95
+            ]
+          },
+          "logprob": -4.51792984677013e-05
+        },
+        {
+          "token": {
+            "text": "\\_",
+            "bytes": [
+              92,
+              95
+            ]
+          },
+          "logprob": -10.625044822692871
+        },
+        {
+          "token": {
+            "text": "0",
+            "bytes": [
+              48
+            ]
+          },
+          "logprob": -11.125044822692871
+        },
+        {
+          "token": {
+            "text": "_*",
+            "bytes": [
+              95,
+              42
+            ]
+          },
+          "logprob": -13.500044822692871
+        },
+        {
+          "token": {
+            "text": "_[",
+            "bytes": [
+              95,
+              91
+            ]
+          },
+          "logprob": -14.000044822692871
+        },
+        {
+          "token": {
+            "text": "₀",
+            "bytes": [
+              226,
+              130,
+              128
+            ]
+          },
+          "logprob": -14.000044822692871
+        },
+        {
+          "token": {
+            "text": "_n",
+            "bytes": [
+              95,
+              110
+            ]
+          },
+          "logprob": -14.312544822692871
+        },
+        {
+          "token": {
+            "text": "_{",
+            "bytes": [
+              95,
+              123
+            ]
+          },
+          "logprob": -14.500044822692871
+        },
+        {
+          "token": {
+            "text": "_<",
+            "bytes": [
+              95,
+              60
+            ]
+          },
+          "logprob": -15.375044822692871
+        },
+        {
+          "token": {
+            "text": "_\\",
+            "bytes": [
+              95,
+              92
+            ]
+          },
+          "logprob": -15.812544822692871
+        },
+        {
+          "token": {
+            "text": "_-",
+            "bytes": [
+              95,
+              45
+            ]
+          },
+          "logprob": -16.000045776367188
+        },
+        {
+          "token": {
+            "text": "_N",
+            "bytes": [
+              95,
+              78
+            ]
+          },
+          "logprob": -16.062545776367188
+        },
+        {
+          "token": {
+            "text": " _",
+            "bytes": [
+              32,
+              95
+            ]
+          },
+          "logprob": -16.062545776367188
+        },
+        {
+          "token": {
+            "text": "_\n",
+            "bytes": [
+              95,
+              10
+            ]
+          },
+          "logprob": -16.125045776367188
+        },
+        {
+          "token": {
+            "text": "...",
+            "bytes": [
+              46,
+              46,
+              46
+            ]
+          },
+          "logprob": -16.187545776367188
+        },
+        {
+          "token": {
+            "text": "_x",
+            "bytes": [
+              95,
+              120
+            ]
+          },
+          "logprob": -16.375045776367188
+        },
+        {
+          "token": {
+            "text": "__",
+            "bytes": [
+              95,
+              95
+            ]
+          },
+          "logprob": -16.562545776367188
+        },
+        {
+          "token": {
+            "text": "_/",
+            "bytes": [
+              95,
+              47
+            ]
+          },
+          "logprob": -16.687545776367188
+        },
+        {
+          "token": {
+            "text": "_'",
+            "bytes": [
+              95,
+              39
+            ]
+          },
+          "logprob": -16.812545776367188
+        },
+        {
+          "token": {
+            "text": "_i",
+            "bytes": [
+              95,
+              105
+            ]
+          },
+          "logprob": -16.937545776367188
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "token": {
+        "text": "0",
+        "bytes": [
+          48
+        ]
+      },
+      "logprob": -2.7418097943154862e-06,
+      "top_logprobs": [
+        {
+          "token": {
+            "text": "0",
+            "bytes": [
+              48
+            ]
+          },
+          "logprob": -2.7418097943154862e-06
+        },
+        {
+          "token": {
+            "text": "64",
+            "bytes": [
+              54,
+              52
+            ]
+          },
+          "logprob": -14.50000286102295
+        },
+        {
+          "token": {
+            "text": "1",
+            "bytes": [
+              49
+            ]
+          },
+          "logprob": -14.87500286102295
+        },
+        {
+          "token": {
+            "text": "67",
+            "bytes": [
+              54,
+              55
+            ]
+          },
+          "logprob": -14.87500286102295
+        },
+        {
+          "token": {
+            "text": "#",
+            "bytes": [
+              35
+            ]
+          },
+          "logprob": -15.25000286102295
+        },
+        {
+          "token": {
+            "text": "2",
+            "bytes": [
+              50
+            ]
+          },
+          "logprob": -15.62500286102295
+        },
+        {
+          "token": {
+            "text": "…",
+            "bytes": [
+              226,
+              128,
+              166
+            ]
+          },
+          "logprob": -15.75000286102295
+        },
+        {
+          "token": {
+            "text": "00",
+            "bytes": [
+              48,
+              48
+            ]
+          },
+          "logprob": -16.000001907348633
+        },
+        {
+          "token": {
+            "text": "68",
+            "bytes": [
+              54,
+              56
+            ]
+          },
+          "logprob": -16.125001907348633
+        },
+        {
+          "token": {
+            "text": "...",
+            "bytes": [
+              46,
+              46,
+              46
+            ]
+          },
+          "logprob": -16.187501907348633
+        },
+        {
+          "token": {
+            "text": "6",
+            "bytes": [
+              54
+            ]
+          },
+          "logprob": -16.625001907348633
+        },
+        {
+          "token": {
+            "text": "66",
+            "bytes": [
+              54,
+              54
+            ]
+          },
+          "logprob": -16.625001907348633
+        },
+        {
+          "token": {
+            "text": "000",
+            "bytes": [
+              48,
+              48,
+              48
+            ]
+          },
+          "logprob": -16.875001907348633
+        },
+        {
+          "token": {
+            "text": "3",
+            "bytes": [
+              51
+            ]
+          },
+          "logprob": -16.937501907348633
+        },
+        {
+          "token": {
+            "text": "–",
+            "bytes": [
+              226,
+              128,
+              147
+            ]
+          },
+          "logprob": -17.250001907348633
+        },
+        {
+          "token": {
+            "text": " ",
+            "bytes": [
+              32
+            ]
+          },
+          "logprob": -17.375001907348633
+        },
+        {
+          "token": {
+            "text": "70",
+            "bytes": [
+              55,
+              48
+            ]
+          },
+          "logprob": -17.562501907348633
+        },
+        {
+          "token": {
+            "text": "7",
+            "bytes": [
+              55
+            ]
+          },
+          "logprob": -17.562501907348633
+        },
+        {
+          "token": {
+            "text": "69",
+            "bytes": [
+              54,
+              57
+            ]
+          },
+          "logprob": -17.625001907348633
+        },
+        {
+          "token": {
+            "text": "..",
+            "bytes": [
+              46,
+              46
+            ]
+          },
+          "logprob": -17.625001907348633
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "token": {
+        "text": " through",
+        "bytes": [
+          32,
+          116,
+          104,
+          114,
+          111,
+          117,
+          103,
+          104
+        ]
+      },
+      "logprob": -0.10952988266944885,
+      "top_logprobs": [
+        {
+          "token": {
+            "text": " through",
+            "bytes": [
+              32,
+              116,
+              104,
+              114,
+              111,
+              117,
+              103,
+              104
+            ]
+          },
+          "logprob": -0.10952988266944885
+        },
+        {
+          "token": {
+            "text": "–",
+            "bytes": [
+              226,
+              128,
+              147
+            ]
+          },
+          "logprob": -2.734529972076416
+        },
+        {
+          "token": {
+            "text": " to",
+            "bytes": [
+              32,
+              116,
+              111
+            ]
+          },
+          "logprob": -3.609529972076416
+        },
+        {
+          "token": {
+            "text": "…",
+            "bytes": [
+              226,
+              128,
+              166
+            ]
+          },
+          "logprob": -5.484529972076416
+        },
+        {
+          "token": {
+            "text": "..",
+            "bytes": [
+              46,
+              46
+            ]
+          },
+          "logprob": -5.734529972076416
+        },
+        {
+          "token": {
+            "text": "...",
+            "bytes": [
+              46,
+              46,
+              46
+            ]
+          },
+          "logprob": -5.984529972076416
+        },
+        {
+          "token": {
+            "text": " …",
+            "bytes": [
+              32,
+              226,
+              128,
+              166
+            ]
+          },
+          "logprob": -6.859529972076416
+        },
+        {
+          "token": {
+            "text": " ...",
+            "bytes": [
+              32,
+              46,
+              46,
+              46
+            ]
+          },
+          "logprob": -7.734529972076416
+        },
+        {
+          "token": {
+            "text": "â",
+            "bytes": [
+              195,
+              162
+            ]
+          },
+          "logprob": -8.859529495239258
+        },
+        {
+          "token": {
+            "text": "-f",
+            "bytes": [
+              45,
+              102
+            ]
+          },
+          "logprob": -9.734529495239258
+        },
+        {
+          "token": {
+            "text": " ..",
+            "bytes": [
+              32,
+              46,
+              46
+            ]
+          },
+          "logprob": -9.859529495239258
+        },
+        {
+          "token": {
+            "text": " –",
+            "bytes": [
+              32,
+              226,
+              128,
+              147
+            ]
+          },
+          "logprob": -10.734529495239258
+        },
+        {
+          "token": {
+            "text": " and",
+            "bytes": [
+              32,
+              97,
+              110,
+              100
+            ]
+          },
+          "logprob": -10.859529495239258
+        },
+        {
+          "token": {
+            "text": "‑",
+            "bytes": [
+              226,
+              128,
+              145
+            ]
+          },
+          "logprob": -11.859529495239258
+        },
+        {
+          "token": {
+            "text": " though",
+            "bytes": [
+              32,
+              116,
+              104,
+              111,
+              117,
+              103,
+              104
+            ]
+          },
+          "logprob": -12.047029495239258
+        },
+        {
+          "token": {
+            "text": " .",
+            "bytes": [
+              32,
+              46
+            ]
+          },
+          "logprob": -12.234529495239258
+        },
+        {
+          "token": {
+            "text": " â",
+            "bytes": [
+              32,
+              195,
+              162
+            ]
+          },
+          "logprob": -12.359529495239258
+        },
+        {
+          "token": {
+            "text": "-",
+            "bytes": [
+              45
+            ]
+          },
+          "logprob": -12.734529495239258
+        },
+        {
+          "token": {
+            "text": " -",
+            "bytes": [
+              32,
+              45
+            ]
+          },
+          "logprob": -12.734529495239258
+        },
+        {
+          "token": {
+            "text": ".",
+            "bytes": [
+              46
+            ]
+          },
+          "logprob": -13.109529495239258
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "token": {
+        "text": " f",
+        "bytes": [
+          32,
+          102
+        ]
+      },
+      "logprob": -1.4662635294371285e-05,
+      "top_logprobs": [
+        {
+          "token": {
+            "text": " f",
+            "bytes": [
+              32,
+              102
+            ]
+          },
+          "logprob": -1.4662635294371285e-05
+        },
+        {
+          "token": {
+            "text": "...",
+            "bytes": [
+              46,
+              46,
+              46
+            ]
+          },
+          "logprob": -12.125014305114746
+        },
+        {
+          "token": {
+            "text": " ...",
+            "bytes": [
+              32,
+              46,
+              46,
+              46
+            ]
+          },
+          "logprob": -13.687514305114746
+        },
+        {
+          "token": {
+            "text": " `",
+            "bytes": [
+              32,
+              96
+            ]
+          },
+          "logprob": -13.812514305114746
+        },
+        {
+          "token": {
+            "text": " ",
+            "bytes": [
+              32
+            ]
+          },
+          "logprob": -14.000014305114746
+        },
+        {
+          "token": {
+            "text": " (",
+            "bytes": [
+              32,
+              40
+            ]
+          },
+          "logprob": -14.125014305114746
+        },
+        {
+          "token": {
+            "text": ",",
+            "bytes": [
+              44
+            ]
+          },
+          "logprob": -14.500014305114746
+        },
+        {
+          "token": {
+            "text": " _",
+            "bytes": [
+              32,
+              95
+            ]
+          },
+          "logprob": -14.562514305114746
+        },
+        {
+          "token": {
+            "text": "f",
+            "bytes": [
+              102
+            ]
+          },
+          "logprob": -14.625014305114746
+        },
+        {
+          "token": {
+            "text": "\n",
+            "bytes": [
+              10
+            ]
+          },
+          "logprob": -14.750014305114746
+        },
+        {
+          "token": {
+            "text": "…",
+            "bytes": [
+              226,
+              128,
+              166
+            ]
+          },
+          "logprob": -14.875014305114746
+        },
+        {
+          "token": {
+            "text": " __",
+            "bytes": [
+              32,
+              95,
+              95
+            ]
+          },
+          "logprob": -14.937514305114746
+        },
+        {
+          "token": {
+            "text": "\n\n",
+            "bytes": [
+              10,
+              10
+            ]
+          },
+          "logprob": -15.062514305114746
+        },
+        {
+          "token": {
+            "text": " F",
+            "bytes": [
+              32,
+              70
+            ]
+          },
+          "logprob": -15.125014305114746
+        },
+        {
+          "token": {
+            "text": " **",
+            "bytes": [
+              32,
+              42,
+              42
+            ]
+          },
+          "logprob": -15.375014305114746
+        },
+        {
+          "token": {
+            "text": "\tf",
+            "bytes": [
+              9,
+              102
+            ]
+          },
+          "logprob": -15.437514305114746
+        },
+        {
+          "token": {
+            "text": " to",
+            "bytes": [
+              32,
+              116,
+              111
+            ]
+          },
+          "logprob": -15.500014305114746
+        },
+        {
+          "token": {
+            "text": " \\(",
+            "bytes": [
+              32,
+              92,
+              40
+            ]
+          },
+          "logprob": -15.875014305114746
+        },
+        {
+          "token": {
+            "text": "...\n",
+            "bytes": [
+              46,
+              46,
+              46,
+              10
+            ]
+          },
+          "logprob": -15.875014305114746
+        },
+        {
+          "token": {
+            "text": "...\n\n",
+            "bytes": [
+              46,
+              46,
+              46,
+              10,
+              10
+            ]
+          },
+          "logprob": -15.937514305114746
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "token": {
+        "text": "_",
+        "bytes": [
+          95
+        ]
+      },
+      "logprob": -5.364403477869928e-06,
+      "top_logprobs": [
+        {
+          "token": {
+            "text": "_",
+            "bytes": [
+              95
+            ]
+          },
+          "logprob": -5.364403477869928e-06
+        },
+        {
+          "token": {
+            "text": "_f",
+            "bytes": [
+              95,
+              102
+            ]
+          },
+          "logprob": -13.500005722045898
+        },
+        {
+          "token": {
+            "text": "_{",
+            "bytes": [
+              95,
+              123
+            ]
+          },
+          "logprob": -13.750005722045898
+        },
+        {
+          "token": {
+            "text": "_*",
+            "bytes": [
+              95,
+              42
+            ]
+          },
+          "logprob": -14.500005722045898
+        },
+        {
+          "token": {
+            "text": "_,",
+            "bytes": [
+              95,
+              44
+            ]
+          },
+          "logprob": -14.625005722045898
+        },
+        {
+          "token": {
+            "text": "_[",
+            "bytes": [
+              95,
+              91
+            ]
+          },
+          "logprob": -15.375005722045898
+        },
+        {
+          "token": {
+            "text": "_N",
+            "bytes": [
+              95,
+              78
+            ]
+          },
+          "logprob": -15.375005722045898
+        },
+        {
+          "token": {
+            "text": "_n",
+            "bytes": [
+              95,
+              110
+            ]
+          },
+          "logprob": -15.437505722045898
+        },
+        {
+          "token": {
+            "text": "67",
+            "bytes": [
+              54,
+              55
+            ]
+          },
+          "logprob": -15.562505722045898
+        },
+        {
+          "token": {
+            "text": "__",
+            "bytes": [
+              95,
+              95
+            ]
+          },
+          "logprob": -15.687505722045898
+        },
+        {
+          "token": {
+            "text": "_<",
+            "bytes": [
+              95,
+              60
+            ]
+          },
+          "logprob": -16.0000057220459
+        },
+        {
+          "token": {
+            "text": "_x",
+            "bytes": [
+              95,
+              120
+            ]
+          },
+          "logprob": -16.3750057220459
+        },
+        {
+          "token": {
+            "text": " _",
+            "bytes": [
+              32,
+              95
+            ]
+          },
+          "logprob": -16.5000057220459
+        },
+        {
+          "token": {
+            "text": "_%",
+            "bytes": [
+              95,
+              37
+            ]
+          },
+          "logprob": -17.0625057220459
+        },
+        {
+          "token": {
+            "text": "_.",
+            "bytes": [
+              95,
+              46
+            ]
+          },
+          "logprob": -17.0625057220459
+        },
+        {
+          "token": {
+            "text": "_X",
+            "bytes": [
+              95,
+              88
+            ]
+          },
+          "logprob": -17.1250057220459
+        },
+        {
+          "token": {
+            "text": "-",
+            "bytes": [
+              45
+            ]
+          },
+          "logprob": -17.3125057220459
+        },
+        {
+          "token": {
+            "text": "_(",
+            "bytes": [
+              95,
+              40
+            ]
+          },
+          "logprob": -17.3750057220459
+        },
+        {
+          "token": {
+            "text": "_v",
+            "bytes": [
+              95,
+              118
+            ]
+          },
+          "logprob": -17.5625057220459
+        },
+        {
+          "token": {
+            "text": "_##",
+            "bytes": [
+              95,
+              35,
+              35
+            ]
+          },
+          "logprob": -17.6250057220459
+        }
+      ]
+    },
+    {
+      "step": 11,
+      "token": {
+        "text": "67",
+        "bytes": [
+          54,
+          55
+        ]
+      },
+      "logprob": -5.781483559985645e-05,
+      "top_logprobs": [
+        {
+          "token": {
+            "text": "67",
+            "bytes": [
+              54,
+              55
+            ]
+          },
+          "logprob": -5.781483559985645e-05
+        },
+        {
+          "token": {
+            "text": "63",
+            "bytes": [
+              54,
+              51
+            ]
+          },
+          "logprob": -10.6250581741333
+        },
+        {
+          "token": {
+            "text": "6",
+            "bytes": [
+              54
+            ]
+          },
+          "logprob": -11.1250581741333
+        },
+        {
+          "token": {
+            "text": "68",
+            "bytes": [
+              54,
+              56
+            ]
+          },
+          "logprob": -11.8750581741333
+        },
+        {
+          "token": {
+            "text": "66",
+            "bytes": [
+              54,
+              54
+            ]
+          },
+          "logprob": -13.0000581741333
+        },
+        {
+          "token": {
+            "text": "64",
+            "bytes": [
+              54,
+              52
+            ]
+          },
+          "logprob": -13.1250581741333
+        },
+        {
+          "token": {
+            "text": "69",
+            "bytes": [
+              54,
+              57
+            ]
+          },
+          "logprob": -13.7500581741333
+        },
+        {
+          "token": {
+            "text": "7",
+            "bytes": [
+              55
+            ]
+          },
+          "logprob": -14.1250581741333
+        },
+        {
+          "token": {
+            "text": "1",
+            "bytes": [
+              49
+            ]
+          },
+          "logprob": -14.1250581741333
+        },
+        {
+          "token": {
+            "text": "57",
+            "bytes": [
+              53,
+              55
+            ]
+          },
+          "logprob": -14.3750581741333
+        },
+        {
+          "token": {
+            "text": "65",
+            "bytes": [
+              54,
+              53
+            ]
+          },
+          "logprob": -14.3750581741333
+        },
+        {
+          "token": {
+            "text": "62",
+            "bytes": [
+              54,
+              50
+            ]
+          },
+          "logprob": -14.5000581741333
+        },
+        {
+          "token": {
+            "text": "0",
+            "bytes": [
+              48
+            ]
+          },
+          "logprob": -14.7500581741333
+        },
+        {
+          "token": {
+            "text": "76",
+            "bytes": [
+              55,
+              54
+            ]
+          },
+          "logprob": -15.1250581741333
+        },
+        {
+          "token": {
+            "text": "47",
+            "bytes": [
+              52,
+              55
+            ]
+          },
+          "logprob": -15.2500581741333
+        },
+        {
+          "token": {
+            "text": "77",
+            "bytes": [
+              55,
+              55
+            ]
+          },
+          "logprob": -15.2500581741333
+        },
+        {
+          "token": {
+            "text": "60",
+            "bytes": [
+              54,
+              48
+            ]
+          },
+          "logprob": -15.3750581741333
+        },
+        {
+          "token": {
+            "text": "_",
+            "bytes": [
+              95
+            ]
+          },
+          "logprob": -15.7500581741333
+        },
+        {
+          "token": {
+            "text": "70",
+            "bytes": [
+              55,
+              48
+            ]
+          },
+          "logprob": -15.7500581741333
+        },
+        {
+          "token": {
+            "text": "167",
+            "bytes": [
+              49,
+              54,
+              55
+            ]
+          },
+          "logprob": -15.7500581741333
+        }
+      ]
+    },
+    {
+      "step": 12,
+      "token": {
+        "text": ",",
+        "bytes": [
+          44
+        ]
+      },
+      "logprob": -0.08659815043210983,
+      "top_logprobs": [
+        {
+          "token": {
+            "text": ",",
+            "bytes": [
+              44
+            ]
+          },
+          "logprob": -0.08659815043210983
+        },
+        {
+          "token": {
+            "text": ".",
+            "bytes": [
+              46
+            ]
+          },
+          "logprob": -2.8365981578826904
+        },
+        {
+          "token": {
+            "text": " (",
+            "bytes": [
+              32,
+              40
+            ]
+          },
+          "logprob": -4.836597919464111
+        },
+        {
+          "token": {
+            "text": ":",
+            "bytes": [
+              58
+            ]
+          },
+          "logprob": -5.461597919464111
+        },
+        {
+          "token": {
+            "text": ";",
+            "bytes": [
+              59
+            ]
+          },
+          "logprob": -5.586597919464111
+        },
+        {
+          "token": {
+            "text": "—",
+            "bytes": [
+              226,
+              128,
+              148
+            ]
+          },
+          "logprob": -6.461597919464111
+        },
+        {
+          "token": {
+            "text": " indicates",
+            "bytes": [
+              32,
+              105,
+              110,
+              100,
+              105,
+              99,
+              97,
+              116,
+              101,
+              115
+            ]
+          },
+          "logprob": -6.586597919464111
+        },
+        {
+          "token": {
+            "text": " that",
+            "bytes": [
+              32,
+              116,
+              104,
+              97,
+              116
+            ]
+          },
+          "logprob": -6.586597919464111
+        },
+        {
+          "token": {
+            "text": " indicating",
+            "bytes": [
+              32,
+              105,
+              110,
+              100,
+              105,
+              99,
+              97,
+              116,
+              105,
+              110,
+              103
+            ]
+          },
+          "logprob": -6.961597919464111
+        },
+        {
+          "token": {
+            "text": " suggests",
+            "bytes": [
+              32,
+              115,
+              117,
+              103,
+              103,
+              101,
+              115,
+              116,
+              115
+            ]
+          },
+          "logprob": -7.086597919464111
+        },
+        {
+          "token": {
+            "text": " instead",
+            "bytes": [
+              32,
+              105,
+              110,
+              115,
+              116,
+              101,
+              97,
+              100
+            ]
+          },
+          "logprob": -7.836597919464111
+        },
+        {
+          "token": {
+            "text": " —",
+            "bytes": [
+              32,
+              226,
+              128,
+              148
+            ]
+          },
+          "logprob": -7.961597919464111
+        },
+        {
+          "token": {
+            "text": " rather",
+            "bytes": [
+              32,
+              114,
+              97,
+              116,
+              104,
+              101,
+              114
+            ]
+          },
+          "logprob": -8.46159839630127
+        },
+        {
+          "token": {
+            "text": " is",
+            "bytes": [
+              32,
+              105,
+              115
+            ]
+          },
+          "logprob": -8.89909839630127
+        },
+        {
+          "token": {
+            "text": " and",
+            "bytes": [
+              32,
+              97,
+              110,
+              100
+            ]
+          },
+          "logprob": -9.02409839630127
+        },
+        {
+          "token": {
+            "text": " which",
+            "bytes": [
+              32,
+              119,
+              104,
+              105,
+              99,
+              104
+            ]
+          },
+          "logprob": -9.08659839630127
+        },
+        {
+          "token": {
+            "text": "...",
+            "bytes": [
+              46,
+              46,
+              46
+            ]
+          },
+          "logprob": -9.21159839630127
+        },
+        {
+          "token": {
+            "text": " should",
+            "bytes": [
+              32,
+              115,
+              104,
+              111,
+              117,
+              108,
+              100
+            ]
+          },
+          "logprob": -9.33659839630127
+        },
+        {
+          "token": {
+            "text": " suggesting",
+            "bytes": [
+              32,
+              115,
+              117,
+              103,
+              103,
+              101,
+              115,
+              116,
+              105,
+              110,
+              103
+            ]
+          },
+          "logprob": -9.33659839630127
+        },
+        {
+          "token": {
+            "text": ".\n\n",
+            "bytes": [
+              46,
+              10,
+              10
+            ]
+          },
+          "logprob": -9.96159839630127
+        }
+      ]
+    },
+    {
+      "step": 13,
+      "token": {
+        "text": " which",
+        "bytes": [
+          32,
+          119,
+          104,
+          105,
+          99,
+          104
+        ]
+      },
+      "logprob": -0.3050808906555176,
+      "top_logprobs": [
+        {
+          "token": {
+            "text": " which",
+            "bytes": [
+              32,
+              119,
+              104,
+              105,
+              99,
+              104
+            ]
+          },
+          "logprob": -0.3050808906555176
+        },
+        {
+          "token": {
+            "text": " indicating",
+            "bytes": [
+              32,
+              105,
+              110,
+              100,
+              105,
+              99,
+              97,
+              116,
+              105,
+              110,
+              103
+            ]
+          },
+          "logprob": -1.6800808906555176
+        },
+        {
+          "token": {
+            "text": " since",
+            "bytes": [
+              32,
+              115,
+              105,
+              110,
+              99,
+              101
+            ]
+          },
+          "logprob": -3.3050808906555176
+        },
+        {
+          "token": {
+            "text": " suggesting",
+            "bytes": [
+              32,
+              115,
+              117,
+              103,
+              103,
+              101,
+              115,
+              116,
+              105,
+              110,
+              103
+            ]
+          },
+          "logprob": -3.8050808906555176
+        },
+        {
+          "token": {
+            "text": " as",
+            "bytes": [
+              32,
+              97,
+              115
+            ]
+          },
+          "logprob": -4.805080890655518
+        },
+        {
+          "token": {
+            "text": " where",
+            "bytes": [
+              32,
+              119,
+              104,
+              101,
+              114,
+              101
+            ]
+          },
+          "logprob": -5.430080890655518
+        },
+        {
+          "token": {
+            "text": " strongly",
+            "bytes": [
+              32,
+              115,
+              116,
+              114,
+              111,
+              110,
+              103,
+              108,
+              121
+            ]
+          },
+          "logprob": -6.680080890655518
+        },
+        {
+          "token": {
+            "text": " likely",
+            "bytes": [
+              32,
+              108,
+              105,
+              107,
+              101,
+              108,
+              121
+            ]
+          },
+          "logprob": -7.305080890655518
+        },
+        {
+          "token": {
+            "text": " because",
+            "bytes": [
+              32,
+              98,
+              101,
+              99,
+              97,
+              117,
+              115,
+              101
+            ]
+          },
+          "logprob": -7.305080890655518
+        },
+        {
+          "token": {
+            "text": " violating",
+            "bytes": [
+              32,
+              118,
+              105,
+              111,
+              108,
+              97,
+              116,
+              105,
+              110,
+              103
+            ]
+          },
+          "logprob": -7.680080890655518
+        },
+        {
+          "token": {
+            "text": " making",
+            "bytes": [
+              32,
+              109,
+              97,
+              107,
+              105,
+              110,
+              103
+            ]
+          },
+          "logprob": -8.24258041381836
+        },
+        {
+          "token": {
+            "text": " all",
+            "bytes": [
+              32,
+              97,
+              108,
+              108
+            ]
+          },
+          "logprob": -8.43008041381836
+        },
+        {
+          "token": {
+            "text": " with",
+            "bytes": [
+              32,
+              119,
+              105,
+              116,
+              104
+            ]
+          },
+          "logprob": -8.80508041381836
+        },
+        {
+          "token": {
+            "text": " caused",
+            "bytes": [
+              32,
+              99,
+              97,
+              117,
+              115,
+              101,
+              100
+            ]
+          },
+          "logprob": -8.99258041381836
+        },
+        {
+          "token": {
+            "text": " and",
+            "bytes": [
+              32,
+              97,
+              110,
+              100
+            ]
+          },
+          "logprob": -9.49258041381836
+        },
+        {
+          "token": {
+            "text": " implying",
+            "bytes": [
+              32,
+              105,
+              109,
+              112,
+              108,
+              121,
+              105,
+              110,
+              103
+            ]
+          },
+          "logprob": -9.61758041381836
+        },
+        {
+          "token": {
+            "text": " so",
+            "bytes": [
+              32,
+              115,
+              111
+            ]
+          },
+          "logprob": -9.61758041381836
+        },
+        {
+          "token": {
+            "text": " meaning",
+            "bytes": [
+              32,
+              109,
+              101,
+              97,
+              110,
+              105,
+              110,
+              103
+            ]
+          },
+          "logprob": -9.74258041381836
+        },
+        {
+          "token": {
+            "text": " generated",
+            "bytes": [
+              32,
+              103,
+              101,
+              110,
+              101,
+              114,
+              97,
+              116,
+              101,
+              100
+            ]
+          },
+          "logprob": -9.93008041381836
+        },
+        {
+          "token": {
+            "text": " each",
+            "bytes": [
+              32,
+              101,
+              97,
+              99,
+              104
+            ]
+          },
+          "logprob": -9.93008041381836
+        }
+      ]
+    },
+    {
+      "step": 14,
+      "token": {
+        "text": " should",
+        "bytes": [
+          32,
+          115,
+          104,
+          111,
+          117,
+          108,
+          100
+        ]
+      },
+      "logprob": -1.196796178817749,
+      "top_logprobs": [
+        {
+          "token": {
+            "text": " should",
+            "bytes": [
+              32,
+              115,
+              104,
+              111,
+              117,
+              108,
+              100
+            ]
+          },
+          "logprob": -1.196796178817749
+        },
+        {
+          "token": {
+            "text": " indicates",
+            "bytes": [
+              32,
+              105,
+              110,
+              100,
+              105,
+              99,
+              97,
+              116,
+              101,
+              115
+            ]
+          },
+          "logprob": -1.196796178817749
+        },
+        {
+          "token": {
+            "text": " strongly",
+            "bytes": [
+              32,
+              115,
+              116,
+              114,
+              111,
+              110,
+              103,
+              108,
+              121
+            ]
+          },
+          "logprob": -1.696796178817749
+        },
+        {
+          "token": {
+            "text": " suggests",
+            "bytes": [
+              32,
+              115,
+              117,
+              103,
+              103,
+              101,
+              115,
+              116,
+              115
+            ]
+          },
+          "logprob": -1.946796178817749
+        },
+        {
+          "token": {
+            "text": " signals",
+            "bytes": [
+              32,
+              115,
+              105,
+              103,
+              110,
+              97,
+              108,
+              115
+            ]
+          },
+          "logprob": -3.946796178817749
+        },
+        {
+          "token": {
+            "text": " violates",
+            "bytes": [
+              32,
+              118,
+              105,
+              111,
+              108,
+              97,
+              116,
+              101,
+              115
+            ]
+          },
+          "logprob": -4.071796417236328
+        },
+        {
+          "token": {
+            "text": " screams",
+            "bytes": [
+              32,
+              115,
+              99,
+              114,
+              101,
+              97,
+              109,
+              115
+            ]
+          },
+          "logprob": -4.821796417236328
+        },
+        {
+          "token": {
+            "text": " obsc",
+            "bytes": [
+              32,
+              111,
+              98,
+              115,
+              99
+            ]
+          },
+          "logprob": -5.321796417236328
+        },
+        {
+          "token": {
+            "text": " is",
+            "bytes": [
+              32,
+              105,
+              115
+            ]
+          },
+          "logprob": -6.196796417236328
+        },
+        {
+          "token": {
+            "text": " makes",
+            "bytes": [
+              32,
+              109,
+              97,
+              107,
+              101,
+              115
+            ]
+          },
+          "logprob": -6.446796417236328
+        },
+        {
+          "token": {
+            "text": " likely",
+            "bytes": [
+              32,
+              108,
+              105,
+              107,
+              101,
+              108,
+              121
+            ]
+          },
+          "logprob": -6.946796417236328
+        },
+        {
+          "token": {
+            "text": " begs",
+            "bytes": [
+              32,
+              98,
+              101,
+              103,
+              115
+            ]
+          },
+          "logprob": -6.946796417236328
+        },
+        {
+          "token": {
+            "text": " points",
+            "bytes": [
+              32,
+              112,
+              111,
+              105,
+              110,
+              116,
+              115
+            ]
+          },
+          "logprob": -7.134296417236328
+        },
+        {
+          "token": {
+            "text": " could",
+            "bytes": [
+              32,
+              99,
+              111,
+              117,
+              108,
+              100
+            ]
+          },
+          "logprob": -7.321796417236328
+        },
+        {
+          "token": {
+            "text": " severely",
+            "bytes": [
+              32,
+              115,
+              101,
+              118,
+              101,
+              114,
+              101,
+              108,
+              121
+            ]
+          },
+          "logprob": -7.321796417236328
+        },
+        {
+          "token": {
+            "text": " duplicates",
+            "bytes": [
+              32,
+              100,
+              117,
+              112,
+              108,
+              105,
+              99,
+              97,
+              116,
+              101,
+              115
+            ]
+          },
+          "logprob": -7.446796417236328
+        },
+        {
+          "token": {
+            "text": " masks",
+            "bytes": [
+              32,
+              109,
+              97,
+              115,
+              107,
+              115
+            ]
+          },
+          "logprob": -7.509296417236328
+        },
+        {
+          "token": {
+            "text": " forces",
+            "bytes": [
+              32,
+              102,
+              111,
+              114,
+              99,
+              101,
+              115
+            ]
+          },
+          "logprob": -7.509296417236328
+        },
+        {
+          "token": {
+            "text": " warrants",
+            "bytes": [
+              32,
+              119,
+              97,
+              114,
+              114,
+              97,
+              110,
+              116,
+              115
+            ]
+          },
+          "logprob": -7.571796417236328
+        },
+        {
+          "token": {
+            "text": " would",
+            "bytes": [
+              32,
+              119,
+              111,
+              117,
+              108,
+              100
+            ]
+          },
+          "logprob": -7.571796417236328
+        }
+      ]
+    },
+    {
+      "step": 15,
+      "token": {
+        "text": " be",
+        "bytes": [
+          32,
+          98,
+          101
+        ]
+      },
+      "logprob": -0.0008437649230472744,
+      "top_logprobs": [
+        {
+          "token": {
+            "text": " be",
+            "bytes": [
+              32,
+              98,
+              101
+            ]
+          },
+          "logprob": -0.0008437649230472744
+        },
+        {
+          "token": {
+            "text": " instead",
+            "bytes": [
+              32,
+              105,
+              110,
+              115,
+              116,
+              101,
+              97,
+              100
+            ]
+          },
+          "logprob": -7.7508440017700195
+        },
+        {
+          "token": {
+            "text": " ideally",
+            "bytes": [
+              32,
+              105,
+              100,
+              101,
+              97,
+              108,
+              108,
+              121
+            ]
+          },
+          "logprob": -8.00084400177002
+        },
+        {
+          "token": {
+            "text": " use",
+            "bytes": [
+              32,
+              117,
+              115,
+              101
+            ]
+          },
+          "logprob": -10.75084400177002
+        },
+        {
+          "token": {
+            "text": " likely",
+            "bytes": [
+              32,
+              108,
+              105,
+              107,
+              101,
+              108,
+              121
+            ]
+          },
+          "logprob": -11.68834400177002
+        },
+        {
+          "token": {
+            "text": " either",
+            "bytes": [
+              32,
+              101,
+              105,
+              116,
+              104,
+              101,
+              114
+            ]
+          },
+          "logprob": -11.87584400177002
+        },
+        {
+          "token": {
+            "text": " have",
+            "bytes": [
+              32,
+              104,
+              97,
+              118,
+              101
+            ]
+          },
+          "logprob": -12.25084400177002
+        },
+        {
+          "token": {
+            "text": " really",
+            "bytes": [
+              32,
+              114,
+              101,
+              97,
+              108,
+              108,
+              121
+            ]
+          },
+          "logprob": -12.37584400177002
+        },
+        {
+          "token": {
+            "text": " ref",
+            "bytes": [
+              32,
+              114,
+              101,
+              102
+            ]
+          },
+          "logprob": -12.68834400177002
+        },
+        {
+          "token": {
+            "text": " replace",
+            "bytes": [
+              32,
+              114,
+              101,
+              112,
+              108,
+              97,
+              99,
+              101
+            ]
+          },
+          "logprob": -12.93834400177002
+        },
+        {
+          "token": {
+            "text": " typically",
+            "bytes": [
+              32,
+              116,
+              121,
+              112,
+              105,
+              99,
+              97,
+              108,
+              108,
+              121
+            ]
+          },
+          "logprob": -13.18834400177002
+        },
+        {
+          "token": {
+            "text": " fact",
+            "bytes": [
+              32,
+              102,
+              97,
+              99,
+              116
+            ]
+          },
+          "logprob": -13.62584400177002
+        },
+        {
+          "token": {
+            "text": " factor",
+            "bytes": [
+              32,
+              102,
+              97,
+              99,
+              116,
+              111,
+              114
+            ]
+          },
+          "logprob": -13.68834400177002
+        },
+        {
+          "token": {
+            "text": " normally",
+            "bytes": [
+              32,
+              110,
+              111,
+              114,
+              109,
+              97,
+              108,
+              108,
+              121
+            ]
+          },
+          "logprob": -13.68834400177002
+        },
+        {
+          "token": {
+            "text": " obviously",
+            "bytes": [
+              32,
+              111,
+              98,
+              118,
+              105,
+              111,
+              117,
+              115,
+              108,
+              121
+            ]
+          },
+          "logprob": -13.68834400177002
+        },
+        {
+          "token": {
+            "text": " never",
+            "bytes": [
+              32,
+              110,
+              101,
+              118,
+              101,
+              114
+            ]
+          },
+          "logprob": -13.93834400177002
+        },
+        {
+          "token": {
+            "text": " probably",
+            "bytes": [
+              32,
+              112,
+              114,
+              111,
+              98,
+              97,
+              98,
+              108,
+              121
+            ]
+          },
+          "logprob": -13.93834400177002
+        },
+        {
+          "token": {
+            "text": " actually",
+            "bytes": [
+              32,
+              97,
+              99,
+              116,
+              117,
+              97,
+              108,
+              108,
+              121
+            ]
+          },
+          "logprob": -14.06334400177002
+        },
+        {
+          "token": {
+            "text": " rather",
+            "bytes": [
+              32,
+              114,
+              97,
+              116,
+              104,
+              101,
+              114
+            ]
+          },
+          "logprob": -14.06334400177002
+        },
+        {
+          "token": {
+            "text": " trigger",
+            "bytes": [
+              32,
+              116,
+              114,
+              105,
+              103,
+              103,
+              101,
+              114
+            ]
+          },
+          "logprob": -14.12584400177002
+        }
+      ]
+    }
+  ]
+}

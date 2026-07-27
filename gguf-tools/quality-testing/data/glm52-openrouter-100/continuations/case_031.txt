@@ -1,0 +1,1 @@
+Ecco una breve funzione in C che limita (o "clampa") un intero all'interno di

@@ -922,10 +922,15 @@ kernel void kernel_flash_attn_ext(
     float,  float4,    simdgroup_float8x8
 
 typedef decltype(kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 512, 512>) flash_attn_ext_dk512_t;
+typedef decltype(kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 256, 256>) flash_attn_ext_dk256_t;
 
 // Host-visible prefill FlashAttention variant for DS4's 512-wide F16 K/V rows.
 template [[host_name("kernel_flash_attn_ext_f16_dk512_dv512")]]
 kernel flash_attn_ext_dk512_t kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 512, 512>;
+
+// Host-visible prefill FlashAttention variant for GLM's 256-wide F16 K/V rows.
+template [[host_name("kernel_flash_attn_ext_f16_dk256_dv256")]]
+kernel flash_attn_ext_dk256_t kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 256, 256>;
 
 #undef FA_NONVEC_TYPES
 
@@ -934,6 +939,7 @@ constant bool FC_flash_attn_ext_vec_has_sinks [[function_constant(FC_FLASH_ATTN_
 constant bool FC_flash_attn_ext_vec_has_bias  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 2)]];
 constant bool FC_flash_attn_ext_vec_has_scap  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 3)]];
 constant bool FC_flash_attn_ext_vec_has_kvpad [[function_constant(FC_FLASH_ATTN_EXT_VEC + 4)]];
+constant bool FC_flash_attn_ext_vec_shared_kvpad [[function_constant(FC_FLASH_ATTN_EXT_VEC + 5)]];
 constant int32_t FC_flash_attn_ext_vec_ns10 [[function_constant(FC_FLASH_ATTN_EXT_VEC + 20)]];
 constant int32_t FC_flash_attn_ext_vec_ns20 [[function_constant(FC_FLASH_ATTN_EXT_VEC + 21)]];
 constant int32_t FC_flash_attn_ext_vec_nsg  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 22)]];
@@ -1069,8 +1075,14 @@ kernel void kernel_flash_attn_ext_vec(
 
             if (FC_flash_attn_ext_vec_has_kvpad && ic + C > args.ne11) {
                 k    = pad;
-                v    = k + args.nb11*C*args.ne_12_2*args.ne_12_3;
-                mask = v + args.nb21*C*args.ne_12_2*args.ne_12_3;
+                if (FC_flash_attn_ext_vec_shared_kvpad) {
+                    v = k;
+                    mask = k + args.nb11*C*args.ne_12_2*args.ne_12_3 +
+                        args.nb21*C*args.ne_12_2*args.ne_12_3;
+                } else {
+                    v = k + args.nb11*C*args.ne_12_2*args.ne_12_3;
+                    mask = v + args.nb21*C*args.ne_12_2*args.ne_12_3;
+                }
 
                 const short ikv2 = iq2/(args.ne02/args.ne_12_2);
                 const short ikv3 = iq3/(args.ne03/args.ne_12_3);

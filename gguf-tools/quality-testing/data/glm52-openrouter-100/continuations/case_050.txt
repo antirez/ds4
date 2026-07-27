@@ -1,0 +1,1 @@
+Quando un utente segnala un rallentamento nella fase di *decoding* (generazione del testo) in

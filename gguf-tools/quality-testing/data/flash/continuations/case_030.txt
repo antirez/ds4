@@ -1,0 +1,3 @@
+## Ricerca Binaria del Punto di Inserimento
+
+La ricerca binaria del punto di inserimento è una

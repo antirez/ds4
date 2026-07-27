@@ -27,6 +27,10 @@ struct ds4_metal_args_bin {
     uint64_t o1[8];
 };
 
+struct ds4_metal_args_add3 {
+    uint32_t n;
+};
+
 constant short FC_bin_op [[function_constant(FC_BIN + 0)]];
 constant short FC_bin_f  [[function_constant(FC_BIN + 1)]];
 constant bool  FC_bin_rb [[function_constant(FC_BIN + 2)]];
@@ -190,3 +194,24 @@ kernel void kernel_bin_fuse_impl(
 typedef decltype(kernel_bin_fuse_impl<float, float, float>) kernel_bin_fuse_t;
 // Host-visible F32 binary op; function constants specialize it per use site.
 template [[host_name("kernel_bin_fuse_f32_f32_f32")]] kernel kernel_bin_fuse_t kernel_bin_fuse_impl<float, float, float>;
+
+kernel void kernel_add2_f32(
+        constant ds4_metal_args_add3 &args,
+        device const float *a,
+        device const float *b,
+        device float *out,
+        uint i [[thread_position_in_grid]]) {
+    if (i >= args.n) return;
+    out[i] = a[i] + b[i];
+}
+
+kernel void kernel_add3_f32(
+        constant ds4_metal_args_add3 &args,
+        device const float *a,
+        device const float *b,
+        device const float *c,
+        device float *out,
+        uint i [[thread_position_in_grid]]) {
+    if (i >= args.n) return;
+    out[i] = a[i] + b[i] + c[i];
+}

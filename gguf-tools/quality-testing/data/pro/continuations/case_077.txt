@@ -1,0 +1,1 @@
+Ottima domanda! La differenza tra la **resident size** (RSS, Resident Set Size) e la

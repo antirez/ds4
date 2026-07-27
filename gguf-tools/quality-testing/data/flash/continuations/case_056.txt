@@ -1,0 +1,1 @@
+In un **layer mixture-of-experts (MoE)**, il **router** (o gate network) svolge

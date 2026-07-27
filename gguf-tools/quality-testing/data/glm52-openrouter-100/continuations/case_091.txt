@@ -1,0 +1,1 @@
+A **confidence interval** is basically a **margin of error** around an estimate. It gives you a range of values
