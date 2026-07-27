@@ -56,7 +56,7 @@ void gpu_graph_debug_dump_tensor(
         return;
     }
 
-    float *buf = xmalloc((size_t)n_f32 * sizeof(buf[0]));
+    float *buf = (float *)xmalloc((size_t)n_f32 * sizeof(buf[0]));
     if (ds4_gpu_tensor_read(t, 0, buf, n_f32 * sizeof(buf[0])) != 0) {
         char path[1024];
         snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
@@ -89,7 +89,7 @@ void gpu_graph_debug_dump_hc_tensor(
         return;
     }
 
-    float *buf = xmalloc((size_t)n_elems * sizeof(buf[0]));
+    float *buf = (float *)xmalloc((size_t)n_elems * sizeof(buf[0]));
     if (ds4_read_hc_carrier_f32(t, 0, buf, n_elems) != 0) {
         char path[1024];
         snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
@@ -120,8 +120,8 @@ void gpu_graph_debug_dump_f16_tensor(
         return;
     }
 
-    uint16_t *hbuf = xmalloc((size_t)n_f16 * sizeof(hbuf[0]));
-    float *fbuf = xmalloc((size_t)n_f16 * sizeof(fbuf[0]));
+    uint16_t *hbuf = (uint16_t *)xmalloc((size_t)n_f16 * sizeof(hbuf[0]));
+    float *fbuf = (float *)xmalloc((size_t)n_f16 * sizeof(fbuf[0]));
     if (ds4_gpu_tensor_read(t, 0, hbuf, n_f16 * sizeof(hbuf[0])) != 0) {
         for (uint64_t i = 0; i < n_f16; i++) fbuf[i] = f16_to_f32(hbuf[i]);
         char path[1024];
@@ -154,7 +154,7 @@ void gpu_graph_debug_dump_i32_tensor(
         return;
     }
 
-    int32_t *buf = xmalloc((size_t)n_i32 * sizeof(buf[0]));
+    int32_t *buf = (int32_t *)xmalloc((size_t)n_i32 * sizeof(buf[0]));
     if (ds4_gpu_tensor_read(t, 0, buf, n_i32 * sizeof(buf[0])) != 0) {
         char path[1024];
         snprintf(path, sizeof(path), "%s_%s-%u_pos%u.i32", prefix, name, il, pos);
@@ -1385,8 +1385,8 @@ bool gpu_graph_multiseq_step_begin(ds4_gpu_graph *g, const int32_t *pos,
      * (transient) device-alloc failure everything is released and reset so a
      * later step re-attempts instead of failing forever. */
     if (!g->ms_positions) {
-        g->ms_positions = xmalloc((size_t)g->prefill_cap * sizeof(int32_t));
-        g->ms_seq_id = xmalloc((size_t)g->prefill_cap * sizeof(int32_t));
+        g->ms_positions = (int32_t *)xmalloc((size_t)g->prefill_cap * sizeof(int32_t));
+        g->ms_seq_id = (int32_t *)xmalloc((size_t)g->prefill_cap * sizeof(int32_t));
         g->batch_positions =
             ds4_gpu_tensor_alloc((uint64_t)g->prefill_cap * sizeof(int32_t));
         g->batch_seq_id =

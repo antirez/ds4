@@ -1206,7 +1206,7 @@ void embed_token_f16(const ds4_model *m, const ds4_weights *w, int token, float 
         ds4_die("token id is outside the embedding table");
     }
 
-    const uint16_t *base = tensor_data(m, te);
+    const uint16_t *base = (const uint16_t *)tensor_data(m, te);
     const uint64_t stride = te->dim[0];
     const uint16_t *row = base + (uint64_t)token * stride;
 
@@ -1279,7 +1279,7 @@ static inline float dot_f16_row(const uint16_t *row, const float *x, uint64_t n)
 
 
 static void matvec_f16_worker(void *vctx, uint64_t row0, uint64_t row1) {
-    matvec_f16_ctx *ctx = vctx;
+    matvec_f16_ctx *ctx = static_cast<matvec_f16_ctx *>(vctx);
 
     for (uint64_t o = row0; o < row1; o++) {
         const uint16_t *row = ctx->data + o * ctx->in_dim;
@@ -1297,7 +1297,7 @@ void matvec_f16(float *out, const ds4_model *m, const ds4_tensor *w, const float
     const uint64_t out_dim = w->dim[1];
     matvec_f16_ctx ctx = {
         .out = out,
-        .data = tensor_data(m, w),
+        .data = (const uint16_t *)tensor_data(m, w),
         .x = x,
         .in_dim = in_dim,
     };
@@ -1314,7 +1314,7 @@ void matvec_f16_serial(float *out, const ds4_model *m, const ds4_tensor *w, cons
 
     const uint64_t in_dim = w->dim[0];
     const uint64_t out_dim = w->dim[1];
-    const uint16_t *data = tensor_data(m, w);
+    const uint16_t *data = (const uint16_t *)tensor_data(m, w);
     for (uint64_t o = 0; o < out_dim; o++) {
         out[o] = dot_f16_row(data + o * in_dim, x, in_dim);
     }
@@ -1609,7 +1609,7 @@ void quantize_q8_0_activation(const float *x, int8_t *xq, float *scale, uint64_t
 
 
 static void quantize_q8_0_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
-    quantize_q8_0_batch_ctx *ctx = vctx;
+    quantize_q8_0_batch_ctx *ctx = static_cast<quantize_q8_0_batch_ctx *>(vctx);
     for (uint64_t t = t0; t < t1; t++) {
         quantize_q8_0_activation(ctx->x + t * ctx->in_dim,
                                  ctx->xq + t * ctx->blocks * 32,
@@ -1639,7 +1639,7 @@ static void quantize_q8_0_activation_batch(
 
 
 static void matvec_q8_0_worker(void *vctx, uint64_t r0, uint64_t r1) {
-    matvec_q8_0_ctx *ctx = vctx;
+    matvec_q8_0_ctx *ctx = static_cast<matvec_q8_0_ctx *>(vctx);
 
     for (uint64_t r = r0; r < r1; r++) {
         const uint64_t o = ctx->row0 + r;
@@ -1651,7 +1651,7 @@ static void matvec_q8_0_worker(void *vctx, uint64_t r0, uint64_t r1) {
 
 
 static void matvec_q8_0_pair_worker(void *vctx, uint64_t r0, uint64_t r1) {
-    matvec_q8_0_pair_ctx *ctx = vctx;
+    matvec_q8_0_pair_ctx *ctx = static_cast<matvec_q8_0_pair_ctx *>(vctx);
 
     for (uint64_t r = r0; r < r1; r++) {
         const uint8_t *row0 = ctx->data0 + r * ctx->blocks * 34;
@@ -1664,7 +1664,7 @@ static void matvec_q8_0_pair_worker(void *vctx, uint64_t r0, uint64_t r1) {
 
 
 static void matvec_q8_0_grouped_worker(void *vctx, uint64_t r0, uint64_t r1) {
-    matvec_q8_0_grouped_ctx *ctx = vctx;
+    matvec_q8_0_grouped_ctx *ctx = static_cast<matvec_q8_0_grouped_ctx *>(vctx);
 
     for (uint64_t idx = r0; idx < r1; idx++) {
         const uint64_t group = idx / ctx->rank;
@@ -1680,7 +1680,7 @@ static void matvec_q8_0_grouped_worker(void *vctx, uint64_t r0, uint64_t r1) {
 
 
 static void matmul_q8_0_grouped_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
-    matmul_q8_0_grouped_batch_ctx *ctx = vctx;
+    matmul_q8_0_grouped_batch_ctx *ctx = static_cast<matmul_q8_0_grouped_batch_ctx *>(vctx);
 
     for (uint64_t idx = r0; idx < r1; idx++) {
         const uint64_t group = idx / ctx->rank;
@@ -1717,7 +1717,7 @@ static void matmul_q8_0_grouped_batch_worker(void *vctx, uint64_t r0, uint64_t r
 
 
 static void matmul_q8_0_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
-    matmul_q8_0_batch_ctx *ctx = vctx;
+    matmul_q8_0_batch_ctx *ctx = static_cast<matmul_q8_0_batch_ctx *>(vctx);
 
     for (uint64_t r = r0; r < r1; r++) {
         const uint8_t *row = ctx->data + r * ctx->blocks * 34;
@@ -1747,7 +1747,7 @@ static void matmul_q8_0_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
 
 
 static void matmul_q8_0_pair_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
-    matmul_q8_0_pair_batch_ctx *ctx = vctx;
+    matmul_q8_0_pair_batch_ctx *ctx = static_cast<matmul_q8_0_pair_batch_ctx *>(vctx);
 
     for (uint64_t r = r0; r < r1; r++) {
         const uint8_t *row0 = ctx->data0 + r * ctx->blocks * 34;
@@ -1796,7 +1796,7 @@ static void matvec_q8_0_rows_prequant(
 
     matvec_q8_0_ctx ctx = {
         .out = out,
-        .data = tensor_data(m, w),
+        .data = (const uint8_t *)tensor_data(m, w),
         .xq = xq,
         .xscale = xscale,
         .in_dim = in_dim,
@@ -1840,8 +1840,8 @@ void matvec_q8_0_pair_prequant(
     matvec_q8_0_pair_ctx ctx = {
         .out0 = out0,
         .out1 = out1,
-        .data0 = tensor_data(m, w0),
-        .data1 = tensor_data(m, w1),
+        .data0 = (const uint8_t *)tensor_data(m, w0),
+        .data1 = (const uint8_t *)tensor_data(m, w1),
         .xq = xq,
         .xscale = xscale,
         .in_dim = in_dim,
@@ -1863,7 +1863,7 @@ static void matmul_q8_0_batch_prequant(
 
     matmul_q8_0_batch_ctx ctx = {
         .out = out,
-        .data = tensor_data(m, w),
+        .data = (const uint8_t *)tensor_data(m, w),
         .xq = xq,
         .xscale = xscale,
         .n_tok = n_tok,
@@ -1895,8 +1895,8 @@ static void matmul_q8_0_pair_batch_prequant(
     matmul_q8_0_pair_batch_ctx ctx = {
         .out0 = out0,
         .out1 = out1,
-        .data0 = tensor_data(m, w0),
-        .data1 = tensor_data(m, w1),
+        .data0 = (const uint8_t *)tensor_data(m, w0),
+        .data1 = (const uint8_t *)tensor_data(m, w1),
         .xq = xq,
         .xscale = xscale,
         .n_tok = n_tok,
@@ -1921,8 +1921,8 @@ void matmul_q8_0_batch(
 
     const uint64_t in_dim = w->dim[0];
     const uint64_t blocks = (in_dim + 31) / 32;
-    int8_t *xq = xmalloc((size_t)n_tok * blocks * 32);
-    float *xscale = xmalloc((size_t)n_tok * blocks * sizeof(xscale[0]));
+    int8_t *xq = (int8_t *)xmalloc((size_t)n_tok * blocks * 32);
+    float *xscale = (float *)xmalloc((size_t)n_tok * blocks * sizeof(xscale[0]));
 
     quantize_q8_0_activation_batch(x, xq, xscale, n_tok, in_dim);
     matmul_q8_0_batch_prequant(out, m, w, xq, xscale, n_tok);
@@ -1950,8 +1950,8 @@ void matmul_q8_0_pair_batch(
 
     const uint64_t in_dim = w0->dim[0];
     const uint64_t blocks = (in_dim + 31) / 32;
-    int8_t *xq = xmalloc((size_t)n_tok * blocks * 32);
-    float *xscale = xmalloc((size_t)n_tok * blocks * sizeof(xscale[0]));
+    int8_t *xq = (int8_t *)xmalloc((size_t)n_tok * blocks * 32);
+    float *xscale = (float *)xmalloc((size_t)n_tok * blocks * sizeof(xscale[0]));
 
     quantize_q8_0_activation_batch(x, xq, xscale, n_tok, in_dim);
     matmul_q8_0_pair_batch_prequant(out0, out1, m, w0, w1, xq, xscale, n_tok);
@@ -1973,8 +1973,8 @@ static void matvec_q8_0_rows(
 
     const uint64_t in_dim = w->dim[0];
     const uint64_t ctx_blocks = (in_dim + 31) / 32;
-    int8_t *xq = xmalloc((size_t)ctx_blocks * 32);
-    float *xscale = xmalloc((size_t)ctx_blocks * sizeof(xscale[0]));
+    int8_t *xq = (int8_t *)xmalloc((size_t)ctx_blocks * 32);
+    float *xscale = (float *)xmalloc((size_t)ctx_blocks * sizeof(xscale[0]));
 
     quantize_q8_0_activation(x, xq, xscale, in_dim);
     matvec_q8_0_rows_prequant(out, m, w, xq, xscale, row0, n_rows);
@@ -2024,8 +2024,8 @@ void matvec_q8_0_grouped_rows(
     }
 
     const uint64_t blocks = (group_dim + 31) / 32;
-    int8_t *xq = xmalloc((size_t)n_groups * blocks * 32);
-    float *xscale = xmalloc((size_t)n_groups * blocks * sizeof(xscale[0]));
+    int8_t *xq = (int8_t *)xmalloc((size_t)n_groups * blocks * 32);
+    float *xscale = (float *)xmalloc((size_t)n_groups * blocks * sizeof(xscale[0]));
 
     for (uint32_t g = 0; g < n_groups; g++) {
         quantize_q8_0_activation(x + (uint64_t)g * group_dim,
@@ -2036,7 +2036,7 @@ void matvec_q8_0_grouped_rows(
 
     matvec_q8_0_grouped_ctx ctx = {
         .out = out,
-        .data = tensor_data(m, w),
+        .data = (const uint8_t *)tensor_data(m, w),
         .xq = xq,
         .xscale = xscale,
         .in_dim = group_dim,
@@ -2069,8 +2069,8 @@ void matmul_q8_0_grouped_batch(
     }
 
     const uint64_t blocks = (group_dim + 31) / 32;
-    int8_t *xq = xmalloc((size_t)n_tok * n_groups * blocks * 32);
-    float *xscale = xmalloc((size_t)n_tok * n_groups * blocks * sizeof(xscale[0]));
+    int8_t *xq = (int8_t *)xmalloc((size_t)n_tok * n_groups * blocks * 32);
+    float *xscale = (float *)xmalloc((size_t)n_tok * n_groups * blocks * sizeof(xscale[0]));
 
     for (uint64_t t = 0; t < n_tok; t++) {
         for (uint32_t g = 0; g < n_groups; g++) {
@@ -2084,7 +2084,7 @@ void matmul_q8_0_grouped_batch(
 
     matmul_q8_0_grouped_batch_ctx ctx = {
         .out = out,
-        .data = tensor_data(m, w),
+        .data = (const uint8_t *)tensor_data(m, w),
         .xq = xq,
         .xscale = xscale,
         .n_tok = n_tok,
@@ -2102,7 +2102,7 @@ void matmul_q8_0_grouped_batch(
 
 
 static void matvec_f32_worker(void *vctx, uint64_t row0, uint64_t row1) {
-    matvec_f32_ctx *ctx = vctx;
+    matvec_f32_ctx *ctx = static_cast<matvec_f32_ctx *>(vctx);
 
     for (uint64_t o = row0; o < row1; o++) {
         double acc = 0.0;
@@ -2121,7 +2121,7 @@ static void matvec_f32(float *out, const ds4_model *m, const ds4_tensor *w, cons
 
     matvec_f32_ctx ctx = {
         .out = out,
-        .data = tensor_data(m, w),
+        .data = (const float *)tensor_data(m, w),
         .x = x,
         .in_dim = w->dim[0],
     };
@@ -2146,11 +2146,11 @@ void matvec_any(float *out, const ds4_model *m, const ds4_tensor *w, const float
 float tensor_1d_value(const ds4_model *m, const ds4_tensor *t, uint64_t i) {
     if (i >= t->elements) ds4_die("tensor scalar index is out of bounds");
     if (t->type == 0) {
-        const float *p = tensor_data(m, t);
+        const float *p = (const float *)tensor_data(m, t);
         return p[i];
     }
     if (t->type == 1) {
-        const uint16_t *p = tensor_data(m, t);
+        const uint16_t *p = (const uint16_t *)tensor_data(m, t);
         return f16_to_f32(p[i]);
     }
     ds4_die("unsupported tensor scalar type");
@@ -2194,7 +2194,7 @@ const uint8_t *tensor_expert_bytes(
 
 
 static void matvec_iq2_xxs_pair_worker(void *vctx, uint64_t row0, uint64_t row1) {
-    matvec_iq2_xxs_pair_ctx *ctx = vctx;
+    matvec_iq2_xxs_pair_ctx *ctx = static_cast<matvec_iq2_xxs_pair_ctx *>(vctx);
     for (uint64_t row = row0; row < row1; row++) {
         const block_iq2_xxs *br0 = (const block_iq2_xxs *)(ctx->base0 + row * ctx->row_bytes0);
         const block_iq2_xxs *br1 = (const block_iq2_xxs *)(ctx->base1 + row * ctx->row_bytes1);
@@ -2243,7 +2243,7 @@ float silu(float x);
 
 
 static void matvec_iq2_xxs_mid_worker(void *vctx, uint64_t row0, uint64_t row1) {
-    matvec_iq2_xxs_mid_ctx *ctx = vctx;
+    matvec_iq2_xxs_mid_ctx *ctx = static_cast<matvec_iq2_xxs_mid_ctx *>(vctx);
 
     for (uint64_t idx = row0; idx < row1; idx++) {
         const int slot = (int)(idx / ctx->out_dim);
@@ -2318,7 +2318,7 @@ void matvec_iq2_xxs_experts_mid_prequant(
 
 
 static void matvec_q2_k_worker(void *vctx, uint64_t row0, uint64_t row1) {
-    matvec_q2_k_ctx *ctx = vctx;
+    matvec_q2_k_ctx *ctx = static_cast<matvec_q2_k_ctx *>(vctx);
     for (uint64_t row = row0; row < row1; row++) {
         const block_q2_K *br = (const block_q2_K *)(ctx->base + row * ctx->row_bytes);
         ds4_vec_dot_q2_K_q8_K((int)ctx->in_dim, &ctx->out[row], br, ctx->xq);
@@ -2340,7 +2340,7 @@ void matvec_q2_k_expert(
     const uint8_t *base = tensor_expert_bytes(m, w, expert, &in_dim, &out_dim, &row_bytes);
     if (in_dim % QK_K != 0) ds4_die("Q2_K expert row is not QK_K aligned");
 
-    block_q8_K *xq = xmalloc((size_t)(in_dim / QK_K) * sizeof(xq[0]));
+    block_q8_K *xq = (block_q8_K *)xmalloc((size_t)(in_dim / QK_K) * sizeof(xq[0]));
     ds4_quantize_row_q8_K(x, xq, (int64_t)in_dim);
 
     matvec_q2_k_ctx ctx = {
@@ -2358,7 +2358,7 @@ void matvec_q2_k_expert(
 
 
 static void matvec_q2_k_accum_worker(void *vctx, uint64_t row0, uint64_t row1) {
-    matvec_q2_k_accum_ctx *ctx = vctx;
+    matvec_q2_k_accum_ctx *ctx = static_cast<matvec_q2_k_accum_ctx *>(vctx);
 
     for (uint64_t row = row0; row < row1; row++) {
         float acc = 0.0f;
@@ -2421,7 +2421,7 @@ void matvec_q2_k_experts_accum_prequant(
 
 
 void matvec_iq2_xxs_batch_mid_worker(void *vctx, uint64_t task0, uint64_t task1) {
-    matvec_iq2_xxs_batch_mid_ctx *ctx = vctx;
+    matvec_iq2_xxs_batch_mid_ctx *ctx = static_cast<matvec_iq2_xxs_batch_mid_ctx *>(vctx);
 
     for (uint64_t task = task0; task < task1; task++) {
         const uint32_t active_idx = (uint32_t)(task / ctx->out_dim);
@@ -2456,7 +2456,7 @@ void matvec_iq2_xxs_batch_mid_worker(void *vctx, uint64_t task0, uint64_t task1)
 
 
 void quantize_mid_pairs_worker(void *vctx, uint64_t p0, uint64_t p1) {
-    quantize_mid_pairs_ctx *ctx = vctx;
+    quantize_mid_pairs_ctx *ctx = static_cast<quantize_mid_pairs_ctx *>(vctx);
     for (uint64_t p = p0; p < p1; p++) {
         ds4_quantize_row_q8_K(ctx->mid + p * ctx->down_in_dim,
                               ctx->midq + p * ctx->down_blocks,
@@ -2467,7 +2467,7 @@ void quantize_mid_pairs_worker(void *vctx, uint64_t p0, uint64_t p1) {
 
 
 static DS4_MAYBE_UNUSED void matvec_q2_k_batch_down_worker(void *vctx, uint64_t task0, uint64_t task1) {
-    matvec_q2_k_batch_down_ctx *ctx = vctx;
+    matvec_q2_k_batch_down_ctx *ctx = static_cast<matvec_q2_k_batch_down_ctx *>(vctx);
 
     for (uint64_t task = task0; task < task1; task++) {
         const uint32_t active_idx = (uint32_t)(task / ctx->out_dim);
@@ -2490,7 +2490,7 @@ static DS4_MAYBE_UNUSED void matvec_q2_k_batch_down_worker(void *vctx, uint64_t 
 
 
 void matvec_q2_k_batch_accum_rows_worker(void *vctx, uint64_t row0, uint64_t row1) {
-    matvec_q2_k_batch_accum_rows_ctx *ctx = vctx;
+    matvec_q2_k_batch_accum_rows_ctx *ctx = static_cast<matvec_q2_k_batch_accum_rows_ctx *>(vctx);
 
     for (uint64_t row = row0; row < row1; row++) {
         for (uint32_t t = 0; t < ctx->n_tok; t++) {

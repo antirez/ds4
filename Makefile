@@ -13,6 +13,10 @@ CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CXX ?= g++
 CXXFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c++23
 CXXFLAGS += -D_GNU_SOURCE -fno-finite-math-only -fno-exceptions -fno-rtti
+# Partial designated initializers (fields filled right after, or {0} zero-init)
+# are a pervasive idiom here; C's -Wextra accepts them silently, C++'s warns.
+# Keep the warning surface identical to the C build.
+CXXFLAGS += -Wno-missing-field-initializers
 CXXFLAGS += -DDS4_VERSION_STR='"$(DS4_VERSION_STR)"'
 
 # Version string reported by /version, /health and the startup banner. Derived
