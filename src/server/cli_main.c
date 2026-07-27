@@ -998,38 +998,36 @@ int main(int argc, char **argv) {
         if (s.pool_banks > 0 && v > s.pool_banks) v = s.pool_banks;
         s.spec_max_live = v;
     }
-    /* plan-34 phase-2 inc 5: fused mixed-batch lane. Default OFF — MEASURED, not
-     * dark-pending. Clean chunk sweep 2026-07-20 (build 0e643eb, K=8000, ndec=3):
-     * prefill GPU-work is conserved, so fusion only REDISTRIBUTES the decode stall
-     * — small chunk trades median up for tail down (c8: median 435 ms vs 93 ms OFF,
-     * p99 824 ms vs 9341 ms), large chunk keeps median but worsens the tail. NO
-     * chunk is net-positive on all axes; stream-overlap can't help (the step is
-     * bandwidth-saturated on GB10's unified bus — 8 prefill tokens 4.7x the decode
-     * median). So it's a genuine multi-user tail/throughput TRADE, not a free
-     * win — DEFAULT-ON in pool mode since 2026-07-26 for this box's subagent-burst
-     * workload (see the enable block below; DS4_MIXED_CHUNK overrides the c8
-     * default). Phase-1 warm-fork TTFT is v0.3.0's headline continuous-batching
-     * win. One startup read, no hot-path getenv. Only engages in pool mode. */
+    /* plan-34 phase-2 inc 5: fused mixed-batch lane. Default OFF (OPT-IN via
+     * DS4_MIXED_BATCH=1). It is a workload-dependent TRADE, not a safe blanket
+     * default — three measured regimes:
+     *   (a) shallow / synchronized concurrent  -> NEUTRAL (teb --perf-only 2026-07-27:
+     *       ON==OFF within noise at d0/d4096, all concurrencies).
+     *   (b) one big prefill overlapping a few shallow decoders (plan-34, K=8000
+     *       ndec=3, chunk 8) -> better tail/throughput (the reason it exists).
+     *   (c) MULTIPLE DEEP concurrent streams -> REGRESSES HARD. teb --perf-only
+     *       d8192/c4 reproduced ON 265 pp / 16.0 tg vs OFF 373 / 30.6 = ~-29%
+     *       prefill, ~-48% decode (the deep KV decode step is already bandwidth-
+     *       saturated, so folding prefill in displaces decode catastrophically).
+     * Was briefly flipped default-ON 2026-07-26 on the (a)/(b) reasoning; the
+     * teb A/B (2026-07-27) found regime (c) and Tyler reverted it to opt-in —
+     * a default that can halve decode t/s at deep-context concurrency is a
+     * footgun on a 1M-capable box. Re-enable per-deployment only for a workload
+     * verified to be shallow-bursty. DO NOT re-flip default-on without a
+     * depth/concurrency guard (auto-disable in regime (c)). DS4_MIXED_CHUNK
+     * overrides the chunk (c8 = plan-34 tail point). Phase-1 warm-fork TTFT is
+     * v0.3.0's headline continuous-batching win. One startup read, no hot-path
+     * getenv. Only engages in pool mode. */
     {
-        /* Default ON in pool mode as of 2026-07-26 (Tyler): this box's workload
-         * is few-users + regular subagent BURSTS = the multi-user tail/throughput
-         * regime this targets (no freeze while a burst's prompts prefill; +25%
-         * concurrent throughput). The single-stream median trade only bites
-         * DURING a concurrent prefill; steady-state decode is unaffected. Default
-         * chunk = 8 (the measured tail/throughput sweet point). DS4_MIXED_BATCH=0
-         * (or =off) reverts to the classic time-sliced path (good single-stream
-         * median, multi-second p99 tail under concurrent prefill). One startup
-         * read, no hot-path getenv. Only engages in pool mode. */
         const char *mb = getenv("DS4_MIXED_BATCH");
-        const int mb_off = mb && (mb[0] == '0' || !strcasecmp(mb, "off"));
-        s.mixed_batch_enabled = s.pool_banks > 0 && !mb_off;
+        s.mixed_batch_enabled = s.pool_banks > 0 &&
+                                mb && (mb[0] == '1' || !strcasecmp(mb, "on"));
         const char *mc = getenv("DS4_MIXED_CHUNK");
         int kc = mc ? atoi(mc) : 8;
         if (kc < 1) kc = 1;
         s.mixed_chunk_tokens = kc;
         server_log(DS4_LOG_DEFAULT, "ds4-server: fused mixed-batch lane %s (chunk=%d/step)",
-                   s.mixed_batch_enabled ? "ENABLED (default; DS4_MIXED_BATCH=0 to disable)"
-                                         : "disabled (DS4_MIXED_BATCH=0)",
+                   s.mixed_batch_enabled ? "ENABLED (DS4_MIXED_BATCH)" : "disabled (default; opt in with DS4_MIXED_BATCH=1)",
                    s.mixed_chunk_tokens);
     }
     /* plan-33 inc B: warm full-prefix fork routing kill-switch. Default ON in
