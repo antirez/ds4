@@ -317,22 +317,6 @@ typedef struct {
 
 typedef void (*ds4_parallel_fn)(void *ctx, uint64_t row0, uint64_t row1);
 
-typedef struct {
-    pthread_t threads[DS4_MAX_THREADS];
-    pthread_mutex_t mutex;
-    pthread_cond_t work_cond;
-    pthread_cond_t done_cond;
-    uint32_t n_threads;
-    uint32_t n_workers;
-    uint32_t generation;
-    uint32_t done;
-    bool initialized;
-    bool shutdown;
-    ds4_parallel_fn fn;
-    void *ctx;
-    uint64_t n_rows;
-} ds4_thread_pool;
-
 /* =========================================================================
  * GGUF Parsing and Model Mapping.
  * =========================================================================

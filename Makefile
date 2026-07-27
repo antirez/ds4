@@ -273,7 +273,7 @@ src/engine/%.o: src/engine/%.c src/engine/ds4_engine_internal.h src/ds4.h src/ds
 	$(CC) $(CFLAGS) $(DS4_INC) -c -o $@ $<
 
 # Ported C++ TUs (pulsar). One rule per source dir, mirroring the .c rules.
-src/engine/%.o: src/engine/%.cpp src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+src/engine/%.o: src/engine/%.cpp src/engine/ds4_engine_internal.h src/engine/cursor.hpp src/ds4.h src/ds4_gpu.h
 	$(CXX) $(CXXFLAGS) $(DS4_INC) -c -o $@ $<
 
 src/server/%.o: src/server/%.cpp src/server/ds4_server_internal.h src/ds4.h $(LIB_HDRS) src/vendor/rax.h
@@ -285,7 +285,7 @@ src/agent/%.o: src/agent/%.cpp src/agent/ds4_agent_internal.h src/ds4.h $(LIB_HD
 src/cli/%.o: src/cli/%.cpp src/ds4.h src/lib/ds4_help.h src/vendor/linenoise.h
 	$(CXX) $(CXXFLAGS) $(DS4_INC) -c -o $@ $<
 
-src/lib/%.o: src/lib/%.cpp src/ds4.h $(LIB_HDRS)
+src/lib/%.o: src/lib/%.cpp src/ds4.h $(LIB_HDRS) src/lib/sha1.hpp
 	$(CXX) $(CXXFLAGS) $(DS4_INC) -c -o $@ $<
 
 src/agent/%.o: src/agent/%.c src/agent/ds4_agent_internal.h src/ds4.h $(LIB_HDRS) src/vendor/linenoise.h
