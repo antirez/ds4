@@ -1,19 +1,19 @@
 #define DS4_SERVER_TEST
 #define DS4_SERVER_TEST_NO_MAIN
-#include "../src/server/util.c"
-#include "../src/server/request.c"
-#include "../src/server/prompt_render.c"
-#include "../src/server/api_parse.c"
-#include "../src/server/genmsg.c"
-#include "../src/server/openai_stream.c"
-#include "../src/server/responses_stream.c"
-#include "../src/server/anthropic_stream.c"
-#include "../src/server/tool_memory.c"
-#include "../src/server/kv_cache.c"
-#include "../src/server/trace.c"
-#include "../src/server/generate.c"
-#include "../src/server/http_server.c"
-#include "../src/server/cli_main.c"
+#include "../src/server/util.cpp"
+#include "../src/server/request.cpp"
+#include "../src/server/prompt_render.cpp"
+#include "../src/server/api_parse.cpp"
+#include "../src/server/genmsg.cpp"
+#include "../src/server/openai_stream.cpp"
+#include "../src/server/responses_stream.cpp"
+#include "../src/server/anthropic_stream.cpp"
+#include "../src/server/tool_memory.cpp"
+#include "../src/server/kv_cache.cpp"
+#include "../src/server/trace.cpp"
+#include "../src/server/generate.cpp"
+#include "../src/server/http_server.cpp"
+#include "../src/server/cli_main.cpp"
 /* engine internals: the sampler byte-exactness gate builds distributions
  * directly and pins them against a copy of the pre-radix implementation. */
 #include "../src/engine/ds4_engine_internal.h"
@@ -33,7 +33,7 @@ static char *test_save_env(const char *name) {
     const char *value = getenv(name);
     if (!value) return NULL;
     size_t len = strlen(value);
-    char *copy = malloc(len + 1);
+    char *copy = (char *)malloc(len + 1);
     TEST_ASSERT(copy != NULL);
     if (!copy) return NULL;
     memcpy(copy, value, len + 1);
@@ -154,7 +154,7 @@ static void test_f16_matvec_fast_nr0_4(void) {
     TEST_ASSERT(posix_memalign(&weights_raw, (size_t)getpagesize(), (size_t)weight_alloc) == 0);
     if (!weights_raw) return;
 
-    uint16_t *weights = weights_raw;
+    uint16_t *weights = (uint16_t *)weights_raw;
     memset(weights, 0, (size_t)weight_alloc);
     for (uint32_t o = 0; o < out_dim; o++) {
         for (uint32_t i = 0; i < in_dim; i++) {
@@ -174,8 +174,8 @@ static void test_f16_matvec_fast_nr0_4(void) {
         return;
     }
 
-    float *x_host = malloc((size_t)in_dim * sizeof(float));
-    float *out_host = malloc((size_t)out_dim * sizeof(float));
+    float *x_host = (float *)malloc((size_t)in_dim * sizeof(float));
+    float *out_host = (float *)malloc((size_t)out_dim * sizeof(float));
     TEST_ASSERT(x_host != NULL);
     TEST_ASSERT(out_host != NULL);
     if (!x_host || !out_host) {
@@ -230,7 +230,7 @@ static void test_f16_prefill_matmul(void) {
     TEST_ASSERT(posix_memalign(&weights_raw, (size_t)getpagesize(), (size_t)weight_alloc) == 0);
     if (!weights_raw) return;
 
-    uint16_t *weights = weights_raw;
+    uint16_t *weights = (uint16_t *)weights_raw;
     memset(weights, 0, (size_t)weight_alloc);
     for (uint32_t o = 0; o < out_dim; o++) {
         for (uint32_t i = 0; i < in_dim; i++) {
@@ -250,8 +250,8 @@ static void test_f16_prefill_matmul(void) {
         return;
     }
 
-    float *x_host = malloc((size_t)x_bytes);
-    float *out_host = malloc((size_t)out_bytes);
+    float *x_host = (float *)malloc((size_t)x_bytes);
+    float *out_host = (float *)malloc((size_t)out_bytes);
     TEST_ASSERT(x_host != NULL);
     TEST_ASSERT(out_host != NULL);
     if (!x_host || !out_host) {
@@ -367,7 +367,7 @@ static char *test_read_file(const char *path) {
         return NULL;
     }
     rewind(fp);
-    char *s = malloc((size_t)len + 1);
+    char *s = (char *)malloc((size_t)len + 1);
     if (!s) {
         fclose(fp);
         return NULL;
@@ -914,7 +914,7 @@ static void test_local_golden_case_run(ds4_engine *engine,
     TEST_ASSERT(ds4_session_sync(session, &prefix, err, sizeof(err)) == 0);
 
     const int vocab = ds4_engine_vocab_size(engine);
-    float *cand_logits = malloc((size_t)vocab * sizeof(cand_logits[0]));
+    float *cand_logits = (float *)malloc((size_t)vocab * sizeof(cand_logits[0]));
     TEST_ASSERT(cand_logits != NULL);
     if (cand_logits &&
         ds4_session_copy_logits(session, cand_logits, vocab) == vocab) {
@@ -1340,7 +1340,7 @@ static void test_run_mpp_candidate(const char *label,
     ds4_engine *cand_engine = test_open_engine(false);
     if (cand_engine) {
         const int vocab_size = ncase > 0 ? cases[0].vocab_size : 0;
-        float *cand_logits = malloc((size_t)vocab_size * sizeof(cand_logits[0]));
+        float *cand_logits = (float *)malloc((size_t)vocab_size * sizeof(cand_logits[0]));
         TEST_ASSERT(cand_logits != NULL);
         if (cand_logits) {
             for (int i = 0; i < ncase; i++) {
@@ -1389,7 +1389,7 @@ static void test_mpp_equivalence(void) {
     TEST_ASSERT(ncase > 0);
     for (int i = 0; i < ncase; i++) {
         test_mpp_eq_case *tc = &cases[i];
-        tc->ref_logits = malloc((size_t)tc->vocab_size * sizeof(tc->ref_logits[0]));
+        tc->ref_logits = (float *)malloc((size_t)tc->vocab_size * sizeof(tc->ref_logits[0]));
         TEST_ASSERT(tc->ref_logits != NULL);
         if (!tc->ref_logits) continue;
         TEST_ASSERT(test_mpp_capture(ref_engine, tc,
@@ -1715,8 +1715,8 @@ static int ref_sample_argmax(const float *logits, uint32_t n_vocab) {
  * a "fix" to the wrong side. This comparator now pins the same order
  * canonically, glibc-independently. */
 static int ref_cand_cmp_desc(const void *a, const void *b) {
-    const sample_candidate *ca = a;
-    const sample_candidate *cb = b;
+    const sample_candidate *ca = (const sample_candidate *)a;
+    const sample_candidate *cb = (const sample_candidate *)b;
     if (ca->logit != cb->logit) {
         return (cb->logit > ca->logit) - (cb->logit < ca->logit);
     }
@@ -1733,8 +1733,8 @@ static int ref_sample_dist_build_sortsum(const float *logits, uint32_t n_vocab,
                                          ds4_sample_dist *out) {
     memset(out, 0, sizeof(*out));
     if (temperature <= 0.0f) {
-        out->ids = malloc(sizeof(int));
-        out->probs = malloc(sizeof(float));
+        out->ids = (int *)malloc(sizeof(int));
+        out->probs = (float *)malloc(sizeof(float));
         out->ids[0] = ref_sample_argmax(logits, n_vocab);
         out->probs[0] = 1.0f;
         out->n = 1;
@@ -1746,7 +1746,7 @@ static int ref_sample_dist_build_sortsum(const float *logits, uint32_t n_vocab,
 
     /* collect candidates: full vocab, or top-k preselect like the sampler */
     uint32_t cap = top_k > 0 ? (uint32_t)top_k : n_vocab;
-    sample_candidate *cand = malloc((size_t)cap * sizeof(cand[0]));
+    sample_candidate *cand = (sample_candidate *)malloc((size_t)cap * sizeof(cand[0]));
     uint32_t n = 0;
     if (top_k > 0) {
         for (uint32_t i = 0; i < n_vocab; i++) {
@@ -1771,8 +1771,8 @@ static int ref_sample_dist_build_sortsum(const float *logits, uint32_t n_vocab,
     }
     if (n == 0) {
         free(cand);
-        out->ids = malloc(sizeof(int));
-        out->probs = malloc(sizeof(float));
+        out->ids = (int *)malloc(sizeof(int));
+        out->probs = (float *)malloc(sizeof(float));
         out->ids[0] = ref_sample_argmax(logits, n_vocab);
         out->probs[0] = 1.0f;
         out->n = 1;
@@ -1786,8 +1786,8 @@ static int ref_sample_dist_build_sortsum(const float *logits, uint32_t n_vocab,
         sum += cand[i].prob;
     }
     if (sum <= 0.0f || !isfinite(sum)) {
-        out->ids = malloc(sizeof(int));
-        out->probs = malloc(sizeof(float));
+        out->ids = (int *)malloc(sizeof(int));
+        out->probs = (float *)malloc(sizeof(float));
         out->ids[0] = cand[0].id;
         out->probs[0] = 1.0f;
         out->n = 1;
@@ -1805,8 +1805,8 @@ static int ref_sample_dist_build_sortsum(const float *logits, uint32_t n_vocab,
         if (filtered_sum / sum >= top_p) break;
     }
     if (filtered == 0) filtered = 1;
-    out->ids = malloc((size_t)filtered * sizeof(int));
-    out->probs = malloc((size_t)filtered * sizeof(float));
+    out->ids = (int *)malloc((size_t)filtered * sizeof(int));
+    out->probs = (float *)malloc((size_t)filtered * sizeof(float));
     out->n = filtered;
     for (uint32_t i = 0; i < filtered; i++) {
         out->ids[i] = cand[i].id;
@@ -1830,8 +1830,8 @@ static int ref_sample_dist_build(const float *logits, uint32_t n_vocab,
                                  ds4_sample_dist *out) {
     memset(out, 0, sizeof(*out));
     if (temperature <= 0.0f) {
-        out->ids = malloc(sizeof(int));
-        out->probs = malloc(sizeof(float));
+        out->ids = (int *)malloc(sizeof(int));
+        out->probs = (float *)malloc(sizeof(float));
         out->ids[0] = ref_sample_argmax(logits, n_vocab);
         out->probs[0] = 1.0f;
         out->n = 1;
@@ -1842,7 +1842,7 @@ static int ref_sample_dist_build(const float *logits, uint32_t n_vocab,
     if (top_k <= 0 || top_k > 1024) top_k = top_k <= 0 ? 0 : 1024;
 
     uint32_t cap = top_k > 0 ? (uint32_t)top_k : n_vocab;
-    sample_candidate *cand = malloc((size_t)cap * sizeof(cand[0]));
+    sample_candidate *cand = (sample_candidate *)malloc((size_t)cap * sizeof(cand[0]));
     uint32_t n = 0;
     int have_probs = 0;
     float sum = 0.0f;
@@ -1888,8 +1888,8 @@ static int ref_sample_dist_build(const float *logits, uint32_t n_vocab,
     }
     if (n == 0) {
         free(cand);
-        out->ids = malloc(sizeof(int));
-        out->probs = malloc(sizeof(float));
+        out->ids = (int *)malloc(sizeof(int));
+        out->probs = (float *)malloc(sizeof(float));
         out->ids[0] = ref_sample_argmax(logits, n_vocab);
         out->probs[0] = 1.0f;
         out->n = 1;
@@ -1904,8 +1904,8 @@ static int ref_sample_dist_build(const float *logits, uint32_t n_vocab,
         }
     }
     if (sum <= 0.0f || !isfinite(sum)) {
-        out->ids = malloc(sizeof(int));
-        out->probs = malloc(sizeof(float));
+        out->ids = (int *)malloc(sizeof(int));
+        out->probs = (float *)malloc(sizeof(float));
         out->ids[0] = cand[0].id;
         out->probs[0] = 1.0f;
         out->n = 1;
@@ -1923,8 +1923,8 @@ static int ref_sample_dist_build(const float *logits, uint32_t n_vocab,
         if (filtered_sum / sum >= top_p) break;
     }
     if (filtered == 0) filtered = 1;
-    out->ids = malloc((size_t)filtered * sizeof(int));
-    out->probs = malloc((size_t)filtered * sizeof(float));
+    out->ids = (int *)malloc((size_t)filtered * sizeof(int));
+    out->probs = (float *)malloc((size_t)filtered * sizeof(float));
     out->n = filtered;
     for (uint32_t i = 0; i < filtered; i++) {
         out->ids[i] = cand[i].id;
@@ -2004,7 +2004,7 @@ static int ref_full_vocab(
         return best;
     }
 
-    sample_candidate *cand = malloc((size_t)finite * sizeof(cand[0]));
+    sample_candidate *cand = (sample_candidate *)malloc((size_t)finite * sizeof(cand[0]));
     uint32_t n = 0;
     float sum = 0.0f;
     for (uint32_t i = 0; i < n_vocab; i++) {
@@ -2295,7 +2295,7 @@ static void sampler_warn_if_flush_to_zero(void) {
 
 static void test_sampler_dist_equivalence(void) {
     const uint32_t n = SAMP_N_VOCAB;
-    float *logits = malloc((size_t)n * sizeof(float));
+    float *logits = (float *)malloc((size_t)n * sizeof(float));
     TEST_ASSERT(logits != NULL);
     sampler_warn_if_flush_to_zero();
     ds4_sample_scratch scratch;
@@ -2416,7 +2416,7 @@ static void test_sampler_dist_equivalence(void) {
  * ============================================================================ */
 static void test_sampler_prefilter_equivalence(void) {
     const uint32_t n = SAMP_N_VOCAB;
-    float *logits = malloc((size_t)n * sizeof(float));
+    float *logits = (float *)malloc((size_t)n * sizeof(float));
     TEST_ASSERT(logits != NULL);
     sampler_warn_if_flush_to_zero();
     ds4_sample_scratch scratch;

@@ -249,8 +249,8 @@ int kv_tool_map_load_from_pos(server *s, FILE *fp, const stop_list *wanted) {
         uint32_t dsml_len = le_get32(lens + 4);
         if (id_len == 0 || id_len > 256 || dsml_len == 0 ||
             dsml_len > DS4_TOOL_MEMORY_MAX_BYTES) return loaded;
-        char *id = server_xmalloc((size_t)id_len + 1);
-        char *dsml = server_xmalloc((size_t)dsml_len + 1);
+        char *id = (char *)server_xmalloc((size_t)id_len + 1);
+        char *dsml = (char *)server_xmalloc((size_t)dsml_len + 1);
         bool ok = fread(id, 1, id_len, fp) == id_len &&
                   fread(dsml, 1, dsml_len, fp) == dsml_len;
         id[id_len] = '\0';

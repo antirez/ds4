@@ -76,17 +76,20 @@ static bool read_http_request(int fd, http_request *r) {
     if (hend < 0) goto fail;
 
     char line[512];
-    size_t i = 0;
+    size_t i;
+    i = 0;
     while (i < b.len && b.ptr[i] != '\n' && i + 1 < sizeof(line)) {
         line[i] = b.ptr[i];
         i++;
     }
     line[i] = '\0';
     if (sscanf(line, "%7s %255s", r->method, r->path) != 2) goto fail;
-    char *q = strchr(r->path, '?');
+    char *q;
+    q = strchr(r->path, '?');
     if (q) *q = '\0';
 
-    long clen = content_length(b.ptr, (size_t)hend);
+    long clen;
+    clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
     while (b.len < (size_t)hend + (size_t)clen) {
         char tmp[8192];
@@ -98,7 +101,7 @@ static bool read_http_request(int fd, http_request *r) {
     }
 
     r->body_len = (size_t)clen;
-    r->body = server_xmalloc(r->body_len + 1);
+    r->body = (char *)server_xmalloc(r->body_len + 1);
     memcpy(r->body, b.ptr + hend, r->body_len);
     r->body[r->body_len] = '\0';
     buf_free(&b);
@@ -381,7 +384,7 @@ void set_client_socket_nonblocking(int fd);
 
 
 void *client_main(void *arg) {
-    client_arg *ca = arg;
+    client_arg *ca = (client_arg *)arg;
     server *s = ca->srv;
     int fd = ca->fd;
     free(ca);
@@ -429,8 +432,10 @@ void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
-    const char *model_path_prefix = "/v1/models/";
-    const size_t model_path_prefix_len = strlen(model_path_prefix);
+    const char *model_path_prefix;
+    model_path_prefix = "/v1/models/";
+    size_t model_path_prefix_len;
+    model_path_prefix_len = strlen(model_path_prefix);
     if (!strcmp(hr.method, "GET") &&
         !strncmp(hr.path, model_path_prefix, model_path_prefix_len) &&
         !strcmp(hr.path + model_path_prefix_len,
@@ -443,8 +448,10 @@ void *client_main(void *arg) {
 
     request req;
     char err[160];
-    bool ok = false;
-    const int ctx_size = ds4_session_ctx(s->slots[0].sess);
+    bool ok;
+    ok = false;
+    int ctx_size;
+    ctx_size = ds4_session_ctx(s->slots[0].sess);
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));

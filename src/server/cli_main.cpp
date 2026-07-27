@@ -44,7 +44,7 @@ static void memdiag_scan_kib(const char *path, const char *const *keys,
 }
 
 static void *memdiag_main(void *ud) {
-    memdiag *d = ud;
+    memdiag *d = (memdiag *)ud;
     server *s = d->s;
     struct timespec t0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -453,7 +453,7 @@ static ds4_backend default_server_backend(void) {
  * intentionally live for the process lifetime (they become engine paths). */
 static const char *resolve_gguf_at(const char *dir, const char *name) {
     size_t n = strlen(dir) + 1 + strlen(name) + 1;
-    char *p = malloc(n);
+    char *p = (char *)malloc(n);
     if (!p) return NULL;
     snprintf(p, n, "%s/%s", dir, name);
     if (access(p, R_OK) == 0) return p;
@@ -1237,7 +1237,7 @@ int main(int argc, char **argv) {
             close(fd);
             continue;
         }
-        client_arg *ca = server_xmalloc(sizeof(*ca));
+        client_arg *ca = (client_arg *)server_xmalloc(sizeof(*ca));
         ca->srv = &s;
         ca->fd = fd;
         pthread_t th;
@@ -3190,7 +3190,7 @@ static void test_tool_parse_failure_returns_recoverable_finish(void) {
 
 
 static void test_invalid_dsml_tool_error_suffix_includes_system_prompt(void) {
-    request r = {0};
+    request r = {};
     r.think_mode = DS4_THINK_HIGH;
     r.prompt_text = xstrdup(
         "<｜begin▁of▁sentence｜>"
@@ -5181,8 +5181,8 @@ static void test_kv_cache_eviction_score_decays_stale_hits(void) {
      * just stored.  The stale hit bonus decays by inactivity, so fresh wins on
      * its better baseline even though stale once had more successful hits. */
     const uint64_t now = 1000u + 14u * KV_CACHE_HIT_HALF_LIFE_SECONDS;
-    kv_entry stale = {.tokens = 1024, .hits = 10, .file_size = 4096, .last_used = 1000};
-    kv_entry fresh = {.tokens = 2048, .hits = 0,  .file_size = 4096, .last_used = now};
+    kv_entry stale = {.tokens = 1024, .hits = 10, .last_used = 1000, .file_size = 4096};
+    kv_entry fresh = {.tokens = 2048, .hits = 0,  .last_used = now, .file_size = 4096};
 
     double s_on = kv_entry_eviction_score(&stale, NULL, now, NULL);
     double f_on = kv_entry_eviction_score(&fresh, NULL, now, NULL);
@@ -5875,11 +5875,11 @@ static void test_slot_writer_defers_and_preserves_order(void) {
     slot_writer_install(&w);
 
     const size_t total = 512 * 1024;
-    char *pattern = server_xmalloc(total);
+    char *pattern = (char *)server_xmalloc(total);
     for (size_t i = 0; i < total; i++) {
         pattern[i] = (char)((i * 31u + (i >> 8)) & 0xff);
     }
-    char *received = server_xmalloc(total);
+    char *received = (char *)server_xmalloc(total);
     size_t sent = 0, got = 0;
     bool deferred = false;
 

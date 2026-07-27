@@ -112,7 +112,7 @@ void tool_calls_free(tool_calls *calls) {
 void tool_calls_push(tool_calls *calls, tool_call tc) {
     if (calls->len == calls->cap) {
         calls->cap = calls->cap ? calls->cap * 2 : 4;
-        calls->v = server_xrealloc(calls->v, (size_t)calls->cap * sizeof(calls->v[0]));
+        calls->v = (tool_call *)server_xrealloc(calls->v, (size_t)calls->cap * sizeof(calls->v[0]));
     }
     calls->v[calls->len++] = tc;
 }
@@ -127,7 +127,7 @@ void chat_msg_add_tool_call_id(chat_msg *m, const char *id) {
     }
     if (m->tool_call_ids_len == m->tool_call_ids_cap) {
         m->tool_call_ids_cap = m->tool_call_ids_cap ? m->tool_call_ids_cap * 2 : 2;
-        m->tool_call_ids = server_xrealloc(m->tool_call_ids,
+        m->tool_call_ids = (char **)server_xrealloc(m->tool_call_ids,
             (size_t)m->tool_call_ids_cap * sizeof(m->tool_call_ids[0]));
     }
     m->tool_call_ids[m->tool_call_ids_len++] = xstrdup(id);
@@ -159,7 +159,7 @@ void chat_msgs_free(chat_msgs *msgs) {
 void chat_msgs_push(chat_msgs *msgs, chat_msg msg) {
     if (msgs->len == msgs->cap) {
         msgs->cap = msgs->cap ? msgs->cap * 2 : 8;
-        msgs->v = server_xrealloc(msgs->v, (size_t)msgs->cap * sizeof(msgs->v[0]));
+        msgs->v = (chat_msg *)server_xrealloc(msgs->v, (size_t)msgs->cap * sizeof(msgs->v[0]));
     }
     msgs->v[msgs->len++] = msg;
 }
@@ -188,7 +188,7 @@ void tool_schema_orders_free(tool_schema_orders *orders) {
 static void tool_schema_order_prop_push(tool_schema_order *o, char *prop) {
     if (o->len == o->cap) {
         o->cap = o->cap ? o->cap * 2 : 8;
-        o->prop = server_xrealloc(o->prop, (size_t)o->cap * sizeof(o->prop[0]));
+        o->prop = (char* *)server_xrealloc(o->prop, (size_t)o->cap * sizeof(o->prop[0]));
     }
     o->prop[o->len++] = prop;
 }
@@ -214,7 +214,7 @@ static void tool_schema_orders_push(tool_schema_orders *orders, tool_schema_orde
     }
     if (orders->len == orders->cap) {
         orders->cap = orders->cap ? orders->cap * 2 : 8;
-        orders->v = server_xrealloc(orders->v, (size_t)orders->cap * sizeof(orders->v[0]));
+        orders->v = (tool_schema_order *)server_xrealloc(orders->v, (size_t)orders->cap * sizeof(orders->v[0]));
     }
     orders->v[orders->len++] = order;
 }
@@ -428,7 +428,7 @@ void stop_list_push(stop_list *stops, char *s) {
     }
     if (stops->len == stops->cap) {
         stops->cap = stops->cap ? stops->cap * 2 : 4;
-        stops->v = server_xrealloc(stops->v, (size_t)stops->cap * sizeof(stops->v[0]));
+        stops->v = (char* *)server_xrealloc(stops->v, (size_t)stops->cap * sizeof(stops->v[0]));
     }
     size_t n = strlen(s);
     if (n > stops->max_len) stops->max_len = n;
@@ -805,7 +805,7 @@ done:
 
 
 static char *responses_namespace_function_schema_from_tool(const char *raw,
-                                                           const char *namespace,
+                                                           const char *tool_namespace,
                                                            char **wire_name) {
     const char *p = raw;
     json_ws(&p);
@@ -862,9 +862,9 @@ static char *responses_namespace_function_schema_from_tool(const char *raw,
         json_ws(&p);
     }
 
-    if ((!type || !strcmp(type, "function")) && namespace && name && name[0]) {
+    if ((!type || !strcmp(type, "function")) && tool_namespace && name && name[0]) {
         buf prompt_name = {0};
-        buf_puts(&prompt_name, namespace);
+        buf_puts(&prompt_name, tool_namespace);
         buf_puts(&prompt_name, name);
 
         buf b = {0};
@@ -944,7 +944,7 @@ static bool parse_schema_properties(const char *json, tool_schema_order *order) 
 
 static void tool_schema_orders_add_json_wire(tool_schema_orders *orders,
                                              const char *json,
-                                             const char *namespace,
+                                             const char *tool_namespace,
                                              const char *wire_name,
                                              bool responses_tool_search) {
     if (!orders || !json) return;
@@ -987,7 +987,7 @@ static void tool_schema_orders_add_json_wire(tool_schema_orders *orders,
         json_ws(&p);
     }
     if (order.name) {
-        if (namespace && namespace[0]) order.tool_namespace = xstrdup(namespace);
+        if (tool_namespace && tool_namespace[0]) order.tool_namespace = xstrdup(tool_namespace);
         if (wire_name && wire_name[0]) order.wire_name = xstrdup(wire_name);
         order.responses_tool_search = responses_tool_search;
         tool_schema_orders_push(orders, order);
@@ -1058,7 +1058,8 @@ static bool append_responses_namespace_tool_schemas(buf *schemas,
 
     if (!type || strcmp(type, "namespace") || !name || !tools) goto done;
 
-    const char *tp = tools;
+    const char *tp;
+    tp = tools;
     json_ws(&tp);
     if (*tp != '[') goto done;
     tp++;

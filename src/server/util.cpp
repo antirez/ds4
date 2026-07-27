@@ -30,7 +30,7 @@ void die(const char *msg) {
 
 
 void *server_xmalloc(size_t n) {
-    void *p = malloc(n ? n : 1);
+    void *p = (void *)malloc(n ? n : 1);
     if (!p) die("out of memory");
     return p;
 }
@@ -47,7 +47,7 @@ void *server_xrealloc(void *p, size_t n) {
 
 char *xstrdup(const char *s) {
     size_t n = strlen(s);
-    char *p = server_xmalloc(n + 1);
+    char *p = (char *)server_xmalloc(n + 1);
     memcpy(p, s, n + 1);
     return p;
 }
@@ -55,7 +55,7 @@ char *xstrdup(const char *s) {
 
 
 bool random_bytes(void *dst, size_t len) {
-    unsigned char *p = dst;
+    unsigned char *p = (unsigned char *)dst;
     /* getrandom() has no fd/chroot failure modes; /dev/urandom stays as the
      * fallback for kernels without the syscall. */
     while (len) {
@@ -85,7 +85,7 @@ bool random_bytes(void *dst, size_t len) {
 
 
 char *xstrndup(const char *s, size_t n) {
-    char *p = server_xmalloc(n + 1);
+    char *p = (char *)server_xmalloc(n + 1);
     memcpy(p, s, n);
     p[n] = '\0';
     return p;
@@ -105,7 +105,7 @@ static void buf_reserve(buf *b, size_t add) {
         }
         cap *= 2;
     }
-    b->ptr = server_xrealloc(b->ptr, cap);
+    b->ptr = (char *)server_xrealloc(b->ptr, cap);
     b->cap = cap;
 }
 
@@ -399,7 +399,7 @@ bool json_raw_value(const char **p, char **out) {
     const char *start = *p;
     if (!json_skip_value(p)) return false;
     size_t n = (size_t)(*p - start);
-    char *s = server_xmalloc(n + 1);
+    char *s = (char *)server_xmalloc(n + 1);
     memcpy(s, start, n);
     s[n] = '\0';
     *out = s;

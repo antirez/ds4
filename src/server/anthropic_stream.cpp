@@ -183,7 +183,7 @@ static const char *anthropic_tool_stream_id(server *s, anthropic_tool_stream *ts
         int old = ts->ids_cap;
         int cap = old ? old : 4;
         while (cap <= index) cap *= 2;
-        ts->ids = server_xrealloc(ts->ids, (size_t)cap * sizeof(ts->ids[0]));
+        ts->ids = (char* *)server_xrealloc(ts->ids, (size_t)cap * sizeof(ts->ids[0]));
         memset(ts->ids + old, 0, (size_t)(cap - old) * sizeof(ts->ids[0]));
         ts->ids_cap = cap;
     }
@@ -412,7 +412,7 @@ static bool anthropic_tool_stream_fail(anthropic_tool_stream *ts) {
 static bool anthropic_tool_start_invoke(int fd, server *s, anthropic_stream *st,
                                         const char *raw, size_t raw_len) {
     anthropic_tool_stream *ts = &st->tool;
-    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+    const char *tag_end = (const char *)memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
     if (!tag_end) return true;
     char *tag = xstrndup(raw + ts->parse_pos,
                          (size_t)(tag_end - (raw + ts->parse_pos) + 1));
@@ -443,7 +443,7 @@ static bool anthropic_tool_start_invoke(int fd, server *s, anthropic_stream *st,
 static bool anthropic_tool_start_param(int fd, anthropic_stream *st,
                                        const char *raw, size_t raw_len) {
     anthropic_tool_stream *ts = &st->tool;
-    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+    const char *tag_end = (const char *)memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
     if (!tag_end) return true;
     char *tag = xstrndup(raw + ts->parse_pos,
                          (size_t)(tag_end - (raw + ts->parse_pos) + 1));

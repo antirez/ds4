@@ -175,7 +175,8 @@ bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_toke
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
-    const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
+    const char *active_tool_schemas;
+    active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_preserves_reasoning(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
@@ -413,7 +414,8 @@ bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, int def
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     anthropic_prepare_live_continuation(r, &msgs);
-    const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
+    const char *active_tool_schemas;
+    active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_preserves_reasoning(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
@@ -592,7 +594,7 @@ bool parse_responses_input(const char **p, chat_msgs *msgs,
         char *role = NULL;
         char *content = NULL;
         char *name = NULL;
-        char *namespace = NULL;
+        char *tool_namespace = NULL;
         char *call_id = NULL;
         char *item_id = NULL;
         char *arguments = NULL;
@@ -638,8 +640,8 @@ bool parse_responses_input(const char **p, chat_msgs *msgs,
                     goto item_fail;
                 }
             } else if (!strcmp(key, "namespace")) {
-                free(namespace);
-                if (!json_string(p, &namespace)) {
+                free(tool_namespace);
+                if (!json_string(p, &tool_namespace)) {
                     free(key);
                     goto item_fail;
                 }
@@ -750,7 +752,7 @@ item_fail:
             free(role);
             free(content);
             free(name);
-            free(namespace);
+            free(tool_namespace);
             free(call_id);
             free(item_id);
             free(arguments);
@@ -769,7 +771,7 @@ item_fail:
             free(role);
             free(content);
             free(name);
-            free(namespace);
+            free(tool_namespace);
             free(call_id);
             free(item_id);
             free(arguments);
@@ -796,7 +798,7 @@ item_fail:
             free(role);
             free(content);
             free(name);
-            free(namespace);
+            free(tool_namespace);
             free(call_id);
             free(item_id);
             free(arguments);
@@ -851,11 +853,11 @@ item_fail:
             const char *args_src = arguments ? arguments :
                                    input_str ? input_str : "{}";
             tc.arguments = xstrdup(args_src);
-            if (strcmp(t, "custom_tool_call") && namespace && namespace[0] &&
+            if (strcmp(t, "custom_tool_call") && tool_namespace && tool_namespace[0] &&
                 name && name[0])
             {
                 buf qualified = {0};
-                buf_puts(&qualified, namespace);
+                buf_puts(&qualified, tool_namespace);
                 buf_puts(&qualified, name);
                 tc.name = buf_take(&qualified);
             } else {
@@ -953,7 +955,7 @@ item_fail:
                     free(role);
                     free(content);
                     free(name);
-                    free(namespace);
+                    free(tool_namespace);
                     free(call_id);
                     free(item_id);
                     free(arguments);
@@ -993,7 +995,7 @@ item_fail:
             free(role);
             free(content);
             free(name);
-            free(namespace);
+            free(tool_namespace);
             free(call_id);
             free(item_id);
             free(arguments);
@@ -1012,7 +1014,7 @@ item_fail:
         free(role);
         free(content);
         free(name);
-        free(namespace);
+        free(tool_namespace);
         free(call_id);
         free(item_id);
         free(arguments);
@@ -1338,14 +1340,16 @@ bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def
             msgs.v[0] = tmp;
         }
     }
-    buf combined_tool_schemas = {0};
+    buf combined_tool_schemas;
+    combined_tool_schemas = {};
     if (tool_schemas && tool_schemas[0]) buf_puts(&combined_tool_schemas, tool_schemas);
     if (loaded_tool_schemas.len) {
         if (combined_tool_schemas.len) buf_putc(&combined_tool_schemas, '\n');
         buf_append(&combined_tool_schemas, loaded_tool_schemas.ptr,
                    loaded_tool_schemas.len);
     }
-    const char *active_tool_schemas =
+    const char *active_tool_schemas;
+    active_tool_schemas =
         (!tool_choice_none && combined_tool_schemas.len) ?
         combined_tool_schemas.ptr : NULL;
     r->has_tools = active_tool_schemas && active_tool_schemas[0];
@@ -1560,7 +1564,8 @@ bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
-    buf rendered = {0};
+    buf rendered;
+    rendered = {};
     buf_puts(&rendered, DS4_SERVER_RENDER_BOS);
     if (r->think_mode == DS4_THINK_MAX) buf_puts(&rendered, ds4_think_max_prefix());
     buf_puts(&rendered, "You are a helpful assistant<｜User｜>");

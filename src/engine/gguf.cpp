@@ -2,50 +2,64 @@
 
 
 
+/* Positional rows (C++ has no array designators); the /(n)/ comments carry
+ * the GGUF type ids, and the {NULL, 0, 0} rows are the id gaps. */
 static const gguf_type_info gguf_types[] = {
-    [0]  = {"f32",      1,   4},
-    [1]  = {"f16",      1,   2},
-    [2]  = {"q4_0",    32,  18},
-    [3]  = {"q4_1",    32,  20},
-    [6]  = {"q5_0",    32,  22},
-    [7]  = {"q5_1",    32,  24},
-    [8]  = {"q8_0",    32,  34},
-    [9]  = {"q8_1",    32,  40},
-    [10] = {"q2_k",   256,  84},
-    [11] = {"q3_k",   256, 110},
-    [12] = {"q4_k",   256, 144},
-    [13] = {"q5_k",   256, 176},
-    [14] = {"q6_k",   256, 210},
-    [15] = {"q8_k",   256, 292},
-    [16] = {"iq2_xxs",256,  66},
-    [17] = {"iq2_xs", 256,  74},
-    [18] = {"iq3_xxs",256,  98},
-    [19] = {"iq1_s",  256,  50},
-    [20] = {"iq4_nl",  32,  18},
-    [21] = {"iq3_s",  256, 110},
-    [22] = {"iq2_s",  256,  82},
-    [23] = {"iq4_xs", 256, 136},
-    [24] = {"i8",       1,   1},
-    [25] = {"i16",      1,   2},
-    [26] = {"i32",      1,   4},
-    [27] = {"i64",      1,   8},
-    [28] = {"f64",      1,   8},
-    [29] = {"iq1_m",  256,  56},
-    [30] = {"bf16",     1,   2},
-    [38] = {"fp8_e4m3", 32,  33},   /* MXFP8: E4M3 + per-32 E8M0 (8.25 bpw) */
-    [39] = {"mxfp4",    32,  17},   /* MXFP4: E2M1 (2/byte) + per-32 E8M0 (4.25 bpw) */
+    /* 0*/ {"f32",      1,   4},
+    /* 1*/ {"f16",      1,   2},
+    /* 2*/ {"q4_0",    32,  18},
+    /* 3*/ {"q4_1",    32,  20},
+    /* 4*/ {NULL,       0,   0},
+    /* 5*/ {NULL,       0,   0},
+    /* 6*/ {"q5_0",    32,  22},
+    /* 7*/ {"q5_1",    32,  24},
+    /* 8*/ {"q8_0",    32,  34},
+    /* 9*/ {"q8_1",    32,  40},
+    /*10*/ {"q2_k",   256,  84},
+    /*11*/ {"q3_k",   256, 110},
+    /*12*/ {"q4_k",   256, 144},
+    /*13*/ {"q5_k",   256, 176},
+    /*14*/ {"q6_k",   256, 210},
+    /*15*/ {"q8_k",   256, 292},
+    /*16*/ {"iq2_xxs",256,  66},
+    /*17*/ {"iq2_xs", 256,  74},
+    /*18*/ {"iq3_xxs",256,  98},
+    /*19*/ {"iq1_s",  256,  50},
+    /*20*/ {"iq4_nl",  32,  18},
+    /*21*/ {"iq3_s",  256, 110},
+    /*22*/ {"iq2_s",  256,  82},
+    /*23*/ {"iq4_xs", 256, 136},
+    /*24*/ {"i8",       1,   1},
+    /*25*/ {"i16",      1,   2},
+    /*26*/ {"i32",      1,   4},
+    /*27*/ {"i64",      1,   8},
+    /*28*/ {"f64",      1,   8},
+    /*29*/ {"iq1_m",  256,  56},
+    /*30*/ {"bf16",     1,   2},
+    /*31*/ {NULL,       0,   0},
+    /*32*/ {NULL,       0,   0},
+    /*33*/ {NULL,       0,   0},
+    /*34*/ {NULL,       0,   0},
+    /*35*/ {NULL,       0,   0},
+    /*36*/ {NULL,       0,   0},
+    /*37*/ {NULL,       0,   0},
+    /*38*/ {"fp8_e4m3", 32,  33},   /* MXFP8: E4M3 + per-32 E8M0 (8.25 bpw) */
+    /*39*/ {"mxfp4",    32,  17},   /* MXFP4: E2M1 (2/byte) + per-32 E8M0 (4.25 bpw) */
     /* CUTLASS block-scaled MXFP4 (see cutlass_mxfp4_expert_layout() below):
      * NOT a uniform per-element byte rate, so block_elems=0 here on purpose
      * -- this entry exists only so tensor_type_name() has something to
      * print; it makes tensor_nbytes() refuse (rather than silently
      * miscompute) if this type is ever routed through the generic path. */
-    [40] = {"cutlass_mxfp4", 0, 0},
+    /*40*/ {"cutlass_mxfp4", 0, 0},
     /* MXFP8_LT (pre-stored MXFP8): de-interleaved E4M3 data + swizzled E8M0
      * scale. For the shipped 128-aligned shapes the total byte size equals the
      * type-38 size (out*(in/32)*33), so it reuses the {32,33} accounting here
      * and loads/mmaps through the generic path. See DS4_TENSOR_MXFP8_LT. */
-    [41] = {"mxfp8_lt", 32, 33},
+    /*41*/ {"mxfp8_lt", 32, 33},
 };
+
+static_assert(sizeof(gguf_types) / sizeof(gguf_types[0]) == 42,
+              "gguf_types rows must line up with GGUF type ids");
 
 
 

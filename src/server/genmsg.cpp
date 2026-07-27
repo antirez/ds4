@@ -86,7 +86,7 @@ static bool slot_writer_send(slot_writer *w, const void *p, size_t n) {
         w->failed = true;
         return false;
     }
-    const char *s = p;
+    const char *s = (const char *)p;
     if (w->off == w->pending.len) {
         /* Nothing queued: try the wire directly so hard errors (EPIPE from a
          * closed peer) surface on this call, exactly like the blocking path. */
@@ -154,7 +154,7 @@ bool send_all(int fd, const void *p, size_t n) {
     if (g_slot_writer && g_slot_writer->fd == fd) {
         return slot_writer_send(g_slot_writer, p, n);
     }
-    const char *s = p;
+    const char *s = (const char *)p;
     long long deadline = wall_ms() + DS4_SERVER_SEND_STALL_TIMEOUT_MS;
     while (n) {
         if (g_stop_requested) return false;

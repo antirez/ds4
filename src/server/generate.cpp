@@ -279,7 +279,7 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
 
 
 static void server_progress_cb(void *ud, const char *event, int current, int total) {
-    server_prefill_progress *p = ud;
+    server_prefill_progress *p = (server_prefill_progress *)ud;
     if (!p || !event) return;
     const bool is_chunk = strcmp(event, "prefill_chunk") == 0;
     const bool is_display = strcmp(event, "prefill_display") == 0;
@@ -573,8 +573,10 @@ static void canonicalize_tool_checkpoint(server *s, session_slot *sl,
     const int common = ds4_session_common_prefix(sl->sess, &canonical);
     if (common == live_len && canonical.len == live_len) goto done;
 
-    size_t live_text_len = 0;
-    char *live_text = render_tokens_text(s->engine, ds4_session_tokens(sl->sess), &live_text_len);
+    size_t live_text_len;
+    live_text_len = 0;
+    char *live_text;
+    live_text = render_tokens_text(s->engine, ds4_session_tokens(sl->sess), &live_text_len);
     if (live_text_len == rendered.len &&
         (live_text_len == 0 || memcmp(live_text, rendered.ptr, live_text_len) == 0))
     {
@@ -593,10 +595,11 @@ static void canonicalize_tool_checkpoint(server *s, session_slot *sl,
         goto done;
     }
 
-    char err[160] = {0};
-    ds4_session_rewrite_result rr =
-        ds4_session_rewrite_from_common(sl->sess, &canonical, common,
-                                        err, sizeof(err));
+    char err[160];
+    memset(err, 0, sizeof(err));
+    ds4_session_rewrite_result rr;
+    rr = ds4_session_rewrite_from_common(sl->sess, &canonical, common,
+                                         err, sizeof(err));
     if (rr == DS4_SESSION_REWRITE_OK) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: tool checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d",
@@ -875,7 +878,7 @@ static void gen_stream_begin(server *s, session_slot *sl);
  * chunks in the CURRENT ds4_session_sync call so the cancel callback can
  * interrupt after exactly one chunk. Counters are reset before each sync. */
 static void gen_prefill_progress_cb(void *ud, const char *event, int current, int total) {
-    gen_state *g = ud;
+    gen_state *g = (gen_state *)ud;
     if (event && strcmp(event, "prefill_chunk") == 0) {
         if (g->prefill_last_current >= 0 && current > g->prefill_last_current) {
             g->prefill_chunks_done++;
@@ -928,7 +931,7 @@ static bool gen_client_disconnected(int fd) {
 
 
 static bool gen_prefill_cancel_cb(void *ud) {
-    const gen_state *g = ud;
+    const gen_state *g = (const gen_state *)ud;
     /* A client that cancelled or hung up during a long prefill must stop the
      * engine — otherwise opencode's deep-context prefills run to completion after
      * a cancel, burning the GPU and a bank. Polled between chunks (not per token);
@@ -2279,7 +2282,7 @@ static void gen_state_free(server *s, session_slot *sl) {
 
 /* Bind a dequeued job to the slot and resolve its prompt (the first quantum). */
 static void generate_job_begin(server *s, session_slot *sl, job *j) {
-    gen_state *g = server_xmalloc(sizeof(*g));
+    gen_state *g = (gen_state *)server_xmalloc(sizeof(*g));
     memset(g, 0, sizeof(*g));
     g->j = j;
     g->prompt_for_sync = &j->req.prompt;
@@ -3718,7 +3721,7 @@ static void worker_batched_decode_quantum(server *s, session_slot **dec, int n) 
         g->batch_active = true;
     }
 
-    float *logits = server_xmalloc((size_t)n * (size_t)vocab * sizeof(float));
+    float *logits = (float *)server_xmalloc((size_t)n * (size_t)vocab * sizeof(float));
     ds4_multiseq_req reqs[DS4_SESSION_POOL_CAP];
     int live_idx[DS4_SESSION_POOL_CAP];
 
@@ -3887,12 +3890,12 @@ static void worker_mixed_batch_quantum(server *s, session_slot **dec, int n, ses
     bool pf_giveup = false;                        /* prefill rejected -> stop folding it */
 
     const size_t reqcap = (size_t)DS4_SESSION_POOL_CAP + (size_t)kstep;
-    ds4_multiseq_req *reqs = server_xmalloc(reqcap * sizeof(*reqs));
-    float *logits = server_xmalloc((size_t)(DS4_SESSION_POOL_CAP + 1) * (size_t)vocab * sizeof(float));
+    ds4_multiseq_req *reqs = (ds4_multiseq_req *)server_xmalloc(reqcap * sizeof(*reqs));
+    float *logits = (float *)server_xmalloc((size_t)(DS4_SESSION_POOL_CAP + 1) * (size_t)vocab * sizeof(float));
     /* last-position (len-1) logits captured from the final fused prefill run — the
      * decode seed for the prefill->decode handoff (byte-identical to classic per
      * the inc-4 gate: the fused run's last-of-run logits match classic-resume). */
-    float *pf_last_logits = server_xmalloc((size_t)vocab * sizeof(float));
+    float *pf_last_logits = (float *)server_xmalloc((size_t)vocab * sizeof(float));
     int live_idx[DS4_SESSION_POOL_CAP];
 
     for (int step = 0; step < DS4_SERVER_DECODE_QUANTUM_TOKENS; step++) {
@@ -4025,7 +4028,7 @@ static void worker_mixed_batch_quantum(server *s, session_slot **dec, int n, ses
 }
 
 void *worker_main(void *arg) {
-    server *s = arg;
+    server *s = (server *)arg;
     int rr = 0; /* round-robin cursor: first slot index to consider next */
     for (;;) {
         bool bound = false;

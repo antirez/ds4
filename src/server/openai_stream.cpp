@@ -364,7 +364,7 @@ static const char *openai_tool_stream_id(server *s, openai_tool_stream *ts,
         int old = ts->ids_cap;
         int cap = old ? old : 4;
         while (cap <= index) cap *= 2;
-        ts->ids = server_xrealloc(ts->ids, (size_t)cap * sizeof(ts->ids[0]));
+        ts->ids = (char* *)server_xrealloc(ts->ids, (size_t)cap * sizeof(ts->ids[0]));
         memset(ts->ids + old, 0, (size_t)(cap - old) * sizeof(ts->ids[0]));
         ts->ids_cap = cap;
     }
@@ -643,14 +643,14 @@ dsml_decode_state dsml_decode_state_for_text(const char *raw, size_t raw_len) {
             continue;
         }
         if (raw_full_lit(raw, raw_len, pos, syn->invoke_start)) {
-            const char *tag_end = memchr(raw + pos, '>', raw_len - pos);
+            const char *tag_end = (const char *)memchr(raw + pos, '>', raw_len - pos);
             if (!tag_end) return DSML_DECODE_STRUCTURAL;
             pos = (size_t)(tag_end - raw) + 1;
             continue;
         }
         if (raw_full_lit(raw, raw_len, pos, syn->param_start)) {
             size_t tag_start = pos;
-            const char *tag_end_ptr = memchr(raw + pos, '>', raw_len - pos);
+            const char *tag_end_ptr = (const char *)memchr(raw + pos, '>', raw_len - pos);
             if (!tag_end_ptr) return DSML_DECODE_STRUCTURAL;
             size_t tag_end = (size_t)(tag_end_ptr - raw) + 1;
             bool string_value = dsml_attr_is_string_true(raw, raw_len, tag_start, tag_end);
@@ -816,7 +816,7 @@ structural:
                 continue;
             }
             if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->invoke_start)) {
-                const char *tag_end = memchr(raw + dt->pos, '>', raw_len - dt->pos);
+                const char *tag_end = (const char *)memchr(raw + dt->pos, '>', raw_len - dt->pos);
                 if (!tag_end) {
                     dt->decode = DSML_DECODE_STRUCTURAL;
                     return;
@@ -826,7 +826,7 @@ structural:
             }
             if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->param_start)) {
                 size_t tag_start = dt->pos;
-                const char *tag_end = memchr(raw + dt->pos, '>', raw_len - dt->pos);
+                const char *tag_end = (const char *)memchr(raw + dt->pos, '>', raw_len - dt->pos);
                 if (!tag_end) {
                     dt->decode = DSML_DECODE_STRUCTURAL;
                     return;
@@ -992,7 +992,7 @@ static bool openai_tool_stream_fail(openai_tool_stream *ts) {
 static bool openai_tool_start_invoke(int fd, server *s, const request *r, const char *id,
                                      openai_tool_stream *ts,
                                      const char *raw, size_t raw_len) {
-    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+    const char *tag_end = (const char *)memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
     if (!tag_end) return true;
     char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
     char *name = dsml_attr(tag, "name");
@@ -1018,7 +1018,7 @@ static bool openai_tool_start_invoke(int fd, server *s, const request *r, const 
 static bool openai_tool_start_param(int fd, const request *r, const char *id,
                                     openai_tool_stream *ts,
                                     const char *raw, size_t raw_len) {
-    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+    const char *tag_end = (const char *)memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
     if (!tag_end) return true;
     char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
     char *name = dsml_attr(tag, "name");

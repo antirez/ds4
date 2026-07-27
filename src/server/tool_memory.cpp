@@ -28,7 +28,7 @@ void server_log(ds4_log_type type, const char *fmt, ...) {
     if (n < 0) {
         ds4_log(stderr, type, "%s", fmt);
     } else {
-        char *line = server_xmalloc((size_t)n + 1);
+        char *line = (char *)server_xmalloc((size_t)n + 1);
         vsnprintf(line, (size_t)n + 1, fmt, ap);
         ds4_log(stderr, type, "%s", line);
         free(line);
@@ -114,7 +114,7 @@ tool_memory_block *tool_memory_find_block_locked(tool_memory *m,
                                                         size_t len) {
     if (!m->by_block || !dsml || len == 0) return NULL;
     void *v = raxFind(m->by_block, (unsigned char *)dsml, len);
-    return v == raxNotFound ? NULL : v;
+    return v == raxNotFound ? NULL : (tool_memory_block *)v;
 }
 
 
@@ -125,7 +125,7 @@ static tool_memory_block *tool_memory_get_block_locked(tool_memory *m,
     tool_memory_block *b = tool_memory_find_block_locked(m, dsml, len);
     if (b) return b;
 
-    b = server_xmalloc(sizeof(*b));
+    b = (tool_memory_block *)server_xmalloc(sizeof(*b));
     memset(b, 0, sizeof(*b));
     b->dsml = xstrndup(dsml, len);
     b->len = len;
@@ -188,7 +188,7 @@ static tool_memory_entry *tool_memory_find_entry_locked(tool_memory *m,
                                                         const char *id) {
     if (!m->by_id || !id || !id[0]) return NULL;
     void *v = raxFind(m->by_id, (unsigned char *)id, strlen(id));
-    return v == raxNotFound ? NULL : v;
+    return v == raxNotFound ? NULL : (tool_memory_entry *)v;
 }
 
 
@@ -211,7 +211,7 @@ static void tool_memory_put_locked(tool_memory *m, const char *id,
     if (old) tool_memory_remove_entry_locked(m, old);
 
     tool_memory_block *b = tool_memory_get_block_locked(m, dsml, dsml_len);
-    tool_memory_entry *e = server_xmalloc(sizeof(*e));
+    tool_memory_entry *e = (tool_memory_entry *)server_xmalloc(sizeof(*e));
     memset(e, 0, sizeof(*e));
     e->id = xstrdup(id);
     e->block = b;

@@ -324,7 +324,7 @@ static void responses_tool_items_build(responses_tool_item **out,
                                        int starting_output_index) {
     *out = NULL;
     if (!calls || calls->len == 0) return;
-    responses_tool_item *items = server_xmalloc((size_t)calls->len * sizeof(*items));
+    responses_tool_item *items = (responses_tool_item *)server_xmalloc((size_t)calls->len * sizeof(*items));
     for (int i = 0; i < calls->len; i++) {
         memset(&items[i], 0, sizeof(items[i]));
         responses_random_id(items[i].fc_id, sizeof(items[i].fc_id), "fc_");

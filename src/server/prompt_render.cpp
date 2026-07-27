@@ -49,7 +49,7 @@ static void json_args_free(json_args *args) {
 static void json_args_push(json_args *args, json_arg arg) {
     if (args->len == args->cap) {
         args->cap = args->cap ? args->cap * 2 : 8;
-        args->v = server_xrealloc(args->v, (size_t)args->cap * sizeof(args->v[0]));
+        args->v = (json_arg *)server_xrealloc(args->v, (size_t)args->cap * sizeof(args->v[0]));
     }
     args->v[args->len++] = arg;
 }
@@ -91,7 +91,8 @@ static bool json_args_parse(const char *json, json_args *args) {
             free(raw);
         }
 
-        json_arg arg = {.key = key, .value = value, .is_string = is_string};
+        json_arg arg;
+        arg = {.key = key, .value = value, .is_string = is_string};
         json_args_push(args, arg);
         key = value = NULL;
         json_ws(&p);
