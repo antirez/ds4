@@ -461,6 +461,32 @@ struct GateUpDotQ2K {
     }
 };
 
+/* 8-wide batch variant of the same per-format decode, for the expert-tiled
+ * prefill kernels (tile16 collapse below). Same addressing rules as the
+ * single-block traits above. */
+struct Dot8Q2K {
+    __device__ static inline void dot8(const char *rowbase, uint32_t b,
+            const cuda_block_q8_K *x0, const cuda_block_q8_K *x1,
+            const cuda_block_q8_K *x2, const cuda_block_q8_K *x3,
+            const cuda_block_q8_K *x4, const cuda_block_q8_K *x5,
+            const cuda_block_q8_K *x6, const cuda_block_q8_K *x7,
+            uint32_t np, float *acc) {
+        dev_dot_q2_K_q8_K_block8((const cuda_block_q2_K *)rowbase + b,
+                                 x0, x1, x2, x3, x4, x5, x6, x7, np, acc);
+    }
+};
+struct Dot8MXFP4 {
+    __device__ static inline void dot8(const char *rowbase, uint32_t b,
+            const cuda_block_q8_K *x0, const cuda_block_q8_K *x1,
+            const cuda_block_q8_K *x2, const cuda_block_q8_K *x3,
+            const cuda_block_q8_K *x4, const cuda_block_q8_K *x5,
+            const cuda_block_q8_K *x6, const cuda_block_q8_K *x7,
+            uint32_t np, float *acc) {
+        dev_dot_mxfp4_q8_K_block8((const unsigned char *)rowbase + (uint64_t)b * 8u * 17u,
+                                  x0, x1, x2, x3, x4, x5, x6, x7, np, acc);
+    }
+};
+
 template <class Dot>
 __global__ static void moe_gate_up_mid_qwarp32_kernel(
         float *gate_out,
@@ -1317,36 +1343,12 @@ __global__ static void moe_down_qwarp32_kernel(
 
 
 /* Fused decode down: the 6 selected experts' down-projections summed straight into
- * the final output row (skips the separate down buffer + moe_sum pass). n_expert==6. */
-__global__ static void moe_down_mxfp4_sum6_qwarp32_kernel(
-        float *out,
-        const char *down_base,
-        const cuda_block_q8_K *midq,
-        const int32_t *selected,
-        uint64_t down_expert_bytes,
-        uint64_t down_row_bytes,
-        uint32_t midq_blocks,
-        uint32_t out_dim) {
-    uint32_t lane = threadIdx.x & 7u;
-    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
-    if (row >= out_dim) return;
-    float total = 0.0f;
-    #pragma unroll
-    for (uint32_t slot = 0; slot < 6u; slot++) {
-        int32_t expert_i = selected[slot];
-        if (expert_i < 0) expert_i = 0;
-        const unsigned char *wr = (const unsigned char *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
-        const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
-        float acc = 0.0f;
-        for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_mxfp4_q8_K_block(wr + (uint64_t)b * 8u * 17u, xq + b);
-        acc = quarter_warp_sum_f32(acc, lane);
-        if (lane == 0) total += acc;
-    }
-    if (lane == 0) out[row] = total;
-}
-
-
-
+ * the final output row (skips the separate down buffer + moe_sum pass). n_expert==6.
+ * Template-collapsed (plan-70 kernel phase): the MXFP4 and Q2_K clones differed only
+ * in the per-format row decode, so they share this body via the GateUpDot* traits.
+ * The iq2_xxs variant stays a separate kernel below: it deliberately uses the
+ * smem-LUT decoder, not the plain block dot. */
+template <class Dot>
 __global__ static void moe_down_sum6_qwarp32_kernel(
         float *out,
         const char *down_base,
@@ -1364,10 +1366,10 @@ __global__ static void moe_down_sum6_qwarp32_kernel(
     for (uint32_t slot = 0; slot < 6u; slot++) {
         int32_t expert_i = selected[slot];
         if (expert_i < 0) expert_i = 0;
-        const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+        const char *wr = down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes;
         const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
         float acc = 0.0f;
-        for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_q2_K_q8_K_block(wr + b, xq + b);
+        for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += Dot::dot(wr, b, xq + b);
         acc = quarter_warp_sum_f32(acc, lane);
         if (lane == 0) total += acc;
     }
@@ -1435,6 +1437,11 @@ __global__ static void moe_down_expert_tile8_row32_kernel(
 
 
 
+/* Template-collapsed (plan-70 kernel phase): the Q2_K and MXFP4 tile16 clones
+ * differed only in the 8-wide row decode (Dot8 traits above). The iq2_xxs
+ * variant stays separate: it uses the smem-LUT decoder and a restructured
+ * midq staging order. Per-pair stores + fixed-order moe_sum, no atomicAdd. */
+template <class Dot8>
 __global__ static void moe_down_expert_tile16_row2048_kernel(
         float *down_out,
         const char *down_base,
@@ -1479,18 +1486,18 @@ __global__ static void moe_down_expert_tile16_row2048_kernel(
     for (uint32_t rr = 0; rr < 64u; rr++) {
         uint32_t row = blockIdx.x * 2048u + row_lane + rr * 32u;
         if (row >= out_dim) continue;
-        const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes);
+        const char *wr = down_base + (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes;
         float acc[16] = {0.0f};
         for (uint32_t b = lane; b < midq_blocks; b += 8u) {
-            dev_dot_q2_K_q8_K_block8(wr + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                                     xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
-                                     xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
-                                     xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np < 8u ? np : 8u, acc);
+            Dot8::dot8(wr, b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
+                       xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
+                       xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
+                       xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np < 8u ? np : 8u, acc);
             if (np > 8u) {
-                dev_dot_q2_K_q8_K_block8(wr + b, xqb[8] ? xqb[8] + b : NULL, xqb[9] ? xqb[9] + b : NULL,
-                                         xqb[10] ? xqb[10] + b : NULL, xqb[11] ? xqb[11] + b : NULL,
-                                         xqb[12] ? xqb[12] + b : NULL, xqb[13] ? xqb[13] + b : NULL,
-                                         xqb[14] ? xqb[14] + b : NULL, xqb[15] ? xqb[15] + b : NULL, np - 8u, acc + 8);
+                Dot8::dot8(wr, b, xqb[8] ? xqb[8] + b : NULL, xqb[9] ? xqb[9] + b : NULL,
+                           xqb[10] ? xqb[10] + b : NULL, xqb[11] ? xqb[11] + b : NULL,
+                           xqb[12] ? xqb[12] + b : NULL, xqb[13] ? xqb[13] + b : NULL,
+                           xqb[14] ? xqb[14] + b : NULL, xqb[15] ? xqb[15] + b : NULL, np - 8u, acc + 8);
             }
         }
         for (uint32_t p = 0; p < np; p++) {
@@ -1698,79 +1705,6 @@ __global__ static void moe_down_iq2_expert_tile16_row2048_kernel(
                  * (deterministic -- see the Q2_K tile16 kernel above). */
                 down_out[(uint64_t)pair[p] * out_dim + row] = acc[p];
             }
-        }
-    }
-}
-
-
-
-/* MXFP4 (type-39) down big-batch expert-tiled kernel: mirror of
- * moe_down_iq2_expert_tile16_row2048_kernel with the MXFP4 dot. Per-pair stores
- * into the flat down buffer + fixed-order moe_sum (NO atomicAdd) -> deterministic,
- * same as the iq2/base tile16 kernels. Bit-identical to the qwarp32 down per pair. */
-__global__ static void moe_down_mxfp4_expert_tile16_row2048_kernel(
-        float *down_out,
-        const char *down_base,
-        const cuda_block_q8_K *midq,
-        const uint32_t *sorted_pairs,
-        const uint32_t *offsets,
-        const uint32_t *counts,
-        const uint32_t *tile_total,
-        const uint32_t *tile_experts,
-        const uint32_t *tile_starts,
-        uint64_t down_expert_bytes,
-        uint64_t down_row_bytes,
-        uint32_t midq_blocks,
-        uint32_t out_dim,
-        uint32_t n_expert) {
-    uint32_t tile = blockIdx.y;
-    if (tile >= *tile_total) return;
-    uint32_t local_start = tile_starts[tile];
-    if (local_start & 8u) return;
-    uint32_t lane = threadIdx.x & 7u;
-    uint32_t row_lane = threadIdx.x >> 3u;
-    uint32_t expert = tile_experts[tile];
-    __shared__ cuda_block_q8_K sxq[16][8];
-    uint32_t pair[16] = {0};
-    const cuda_block_q8_K *xqb[16] = {NULL};
-    uint32_t np = 0;
-    for (; np < 16u; np++) {
-        uint32_t local_pair = local_start + np;
-        if (local_pair >= counts[expert]) break;
-        pair[np] = sorted_pairs[offsets[expert] + local_pair];
-        xqb[np] = midq + (uint64_t)pair[np] * midq_blocks;
-    }
-    if (midq_blocks <= 8u) {
-        for (uint32_t i = threadIdx.x; i < np * midq_blocks; i += blockDim.x) {
-            uint32_t p = i / midq_blocks;
-            uint32_t b = i - p * midq_blocks;
-            sxq[p][b] = xqb[p][b];
-        }
-        __syncthreads();
-        for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
-    }
-    for (uint32_t rr = 0; rr < 64u; rr++) {
-        uint32_t row = blockIdx.x * 2048u + row_lane + rr * 32u;
-        if (row >= out_dim) continue;
-        const unsigned char *wr = (const unsigned char *)(down_base + (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes);
-        float acc[16] = {0.0f};
-        for (uint32_t b = lane; b < midq_blocks; b += 8u) {
-            dev_dot_mxfp4_q8_K_block8(wr + (uint64_t)b * 8u * 17u,
-                                      xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                                      xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
-                                      xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
-                                      xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np < 8u ? np : 8u, acc);
-            if (np > 8u) {
-                dev_dot_mxfp4_q8_K_block8(wr + (uint64_t)b * 8u * 17u,
-                                          xqb[8] ? xqb[8] + b : NULL, xqb[9] ? xqb[9] + b : NULL,
-                                          xqb[10] ? xqb[10] + b : NULL, xqb[11] ? xqb[11] + b : NULL,
-                                          xqb[12] ? xqb[12] + b : NULL, xqb[13] ? xqb[13] + b : NULL,
-                                          xqb[14] ? xqb[14] + b : NULL, xqb[15] ? xqb[15] + b : NULL, np - 8u, acc + 8);
-            }
-        }
-        for (uint32_t p = 0; p < np; p++) {
-            acc[p] = quarter_warp_sum_f32(acc[p], lane);
-            if (lane == 0) down_out[(uint64_t)pair[p] * out_dim + row] = acc[p];
         }
     }
 }
@@ -3118,7 +3052,7 @@ static int routed_moe_launch(
             if (use_direct_down_sum6) {
                 dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
                 if (down_mxfp4) {
-                    moe_down_mxfp4_sum6_qwarp32_kernel<<<sgrid, 256>>>(
+                    moe_down_sum6_qwarp32_kernel<GateUpDotMXFP4><<<sgrid, 256>>>(
                         (float *)out->ptr,
                         down_w,
                         midq,
@@ -3138,7 +3072,7 @@ static int routed_moe_launch(
                         midq_blocks,
                         out_dim);
                 } else {
-                    moe_down_sum6_qwarp32_kernel<<<sgrid, 256>>>(
+                    moe_down_sum6_qwarp32_kernel<GateUpDotQ2K><<<sgrid, 256>>>(
                         (float *)out->ptr,
                         down_w,
                         midq,
@@ -3153,7 +3087,7 @@ static int routed_moe_launch(
                 /* The direct decode kernel writes the final token row. */
             } else if (sorted_pairs && down_mxfp4 && fp4_tiled && use_big_batch) {
                 dim3 tgrid((out_dim + 2047u) / 2048u, tile16_capacity, 1);
-                moe_down_mxfp4_expert_tile16_row2048_kernel<<<tgrid, 256>>>(
+                moe_down_expert_tile16_row2048_kernel<Dot8MXFP4><<<tgrid, 256>>>(
                     (float *)down->ptr,
                     down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                     tile16_total, tile16_experts, tile16_starts, down_expert_bytes, down_row_bytes,
@@ -3167,7 +3101,7 @@ static int routed_moe_launch(
                         tile16_total, tile16_experts, tile16_starts, down_expert_bytes, down_row_bytes,
                         midq_blocks, out_dim, n_expert);
                 } else {
-                    moe_down_expert_tile16_row2048_kernel<<<tgrid, 256>>>(
+                    moe_down_expert_tile16_row2048_kernel<Dot8Q2K><<<tgrid, 256>>>(
                         (float *)down->ptr,
                         down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                         tile16_total, tile16_experts, tile16_starts, down_expert_bytes, down_row_bytes,
