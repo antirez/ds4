@@ -431,7 +431,7 @@ static void agent_history_render_assistant(agent_worker *w,
                                    &source_truncated);
     bool use_color = isatty(STDOUT_FILENO) != 0;
     agent_tail_capture tail = {
-        .cap = source_truncated ? AGENT_HISTORY_ASSISTANT_MAX_BYTES : 0,
+        .cap = source_truncated ? (size_t)AGENT_HISTORY_ASSISTANT_MAX_BYTES : (size_t)0,
     };
     agent_token_renderer renderer = {
         .engine = w->engine,
