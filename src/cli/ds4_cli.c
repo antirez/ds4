@@ -797,8 +797,28 @@ static int run_kl_file(ds4_engine *engine, const cli_config *cfg) {
 
     char *text = read_prompt_file(cfg->gen.kl_file_path, true);
     ds4_tokens tokens = {0};
-    ds4_tokenize_text(engine, text, &tokens);
+    /* Special-token-aware: honors <think>/</think>/DSML/etc. as single special
+     * ids exactly as the served model (and the vLLM reference) do. Identical to
+     * plain BPE on text without special markers, so calibration text is
+     * unaffected; teacher-forced KL over reasoning/tool content now aligns. */
+    ds4_tokenize_rendered_chat(engine, text, &tokens);
     free(text);
+
+    /* Sidecar: dump the full token-id sequence next to the ref dump so an
+     * external aligner can VERIFY this engine's tokenization matches the
+     * reference's byte-for-byte (position alignment is load-bearing for KL). */
+    if (dumping) {
+        char tokpath[1024];
+        snprintf(tokpath, sizeof tokpath, "%s.tokens.json", cfg->gen.kl_ref_dump_path);
+        FILE *tf = fopen(tokpath, "w");
+        if (tf) {
+            fputc('[', tf);
+            for (int i = 0; i < (int)tokens.len; i++)
+                fprintf(tf, "%s%d", i ? "," : "", tokens.v[i]);
+            fputs("]\n", tf);
+            fclose(tf);
+        }
+    }
 
     const int prefix_len = 32;
     if (tokens.len <= prefix_len) {
