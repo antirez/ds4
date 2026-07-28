@@ -668,6 +668,12 @@ static agent_config parse_options(int argc, char **argv) {
             c.gpu_vram_arg = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--gpu-devices")) {
             c.gpu_devices_arg = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--gpu-resident")) {
+            /* CUDA: copy the whole model into VRAM at load instead of the
+             * zero-copy host mapping (which streams weights over PCIe). Maps
+             * to the DS4_CUDA_COPY_MODEL_CHUNKED path; requires VRAM >=
+             * model + KV + buffers, otherwise it falls back to host-mapping. */
+            setenv("DS4_CUDA_COPY_MODEL_CHUNKED", "1", 1);
         } else if (!strcmp(arg, "--cuda-tensor-parallel")) {
             c.engine.cuda_tensor_parallel = true;
         } else if (!strcmp(arg, "--cpu")) {

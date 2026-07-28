@@ -3201,11 +3201,28 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
 
 extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
     (void)max_tensor_bytes;
-    if (!ds4_gpu_register_model_map_no_copy(model_map, model_size)) return 0;
-    if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL &&
-        !cuda_model_copy_chunked(model_map, model_size, map_offset, map_size)) {
-        (void)cuda_model_prefetch_range(model_map, model_size, map_offset, map_size);
+    /* PATCH: full-VRAM residency. Try the chunked device copy BEFORE the
+     * no-copy host registration so cuda_model_copy_chunked()'s guard
+     * (g_model_registered) does not short-circuit it. Active only when
+     * DS4_CUDA_COPY_MODEL_CHUNKED is set; on failure restore state and fall
+     * back to the original no-copy path. */
+    if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL) {
+        g_model_host_base               = model_map;
+        g_model_device_base             = (const char *)model_map;
+        g_model_registered_size         = model_size;
+        g_model_range_mapping_supported = 1;
+        g_model_hmm_direct              = 0;
+        g_model_cache_full              = 0;
+        if (g_model_fd >= 0 && g_model_fd_host_base == NULL) {
+            g_model_fd_host_base = model_map;
+        }
+        if (cuda_model_copy_chunked(model_map, model_size, map_offset, map_size)) {
+            return 1;
+        }
+        g_model_host_base       = NULL;
+        g_model_registered_size = 0;
     }
+    if (!ds4_gpu_register_model_map_no_copy(model_map, model_size)) return 0;
     return 1;
 }
 
