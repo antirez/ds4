@@ -19,6 +19,9 @@
 #include <float.h>
 #include <inttypes.h>
 #include <ctype.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #include <limits.h>
 #include <math.h>
 #include <pthread.h>
@@ -358,6 +361,9 @@ int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
 #endif
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
+#endif
+#if defined(__x86_64__) && defined(__AVX512F__)
+#include <immintrin.h>
 #endif
 
 #ifndef M_PI
@@ -973,7 +979,21 @@ static void iq2xxs_signed_grid_init(void) {
 }
 
 static inline DS4_MAYBE_UNUSED int32_t dot_iq2_pair_16(const int8_t *grid0, const int8_t *grid1, const int8_t *q8) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#if defined(__AVX512F__)
+    __m128i g0 = _mm_loadl_epi64((const __m128i*)grid0);
+    __m128i g1 = _mm_loadl_epi64((const __m128i*)grid1);
+    __m128i gv = _mm_unpacklo_epi64(g0, g1);
+    __m128i qv = _mm_loadu_si128((const __m128i*)q8);
+    __m256i g16 = _mm256_cvtepi8_epi16(gv);
+    __m256i q16 = _mm256_cvtepi8_epi16(qv);
+    __m256i p32 = _mm256_madd_epi16(g16, q16);
+    __m128i lo = _mm256_castsi256_si128(p32);
+    __m128i hi = _mm256_extracti128_si256(p32, 1);
+    __m128i s128 = _mm_add_epi32(lo, hi);
+    s128 = _mm_hadd_epi32(s128, s128);
+    s128 = _mm_hadd_epi32(s128, s128);
+    return _mm_extract_epi32(s128, 0);
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     const int8x16_t gv = vcombine_s8(vld1_s8(grid0), vld1_s8(grid1));
     const int32x4_t acc = vdotq_s32(vdupq_n_s32(0), gv, vld1q_s8(q8));
     return vaddvq_s32(acc);
@@ -992,7 +1012,23 @@ static inline DS4_MAYBE_UNUSED int32_t dot_iq2_pair_16(const int8_t *grid0, cons
 }
 
 static inline DS4_MAYBE_UNUSED int32_t dot_q2_16(const uint8_t *q2, const int8_t *q8, int shift) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#if defined(__AVX512F__) && defined(__AVX512VBMI__)
+    __m128i packed = _mm_loadu_si128((const __m128i*)q2);
+    __m256i wide = _mm256_cvtepu8_epi16(packed);
+    wide = _mm256_srli_epi16(wide, shift);
+    __m128i shifted = _mm256_cvtepi16_epi8(wide);
+    shifted = _mm_and_si128(shifted, _mm_set1_epi8(3));
+    __m128i q8v = _mm_loadu_si128((const __m128i*)q8);
+    __m256i vals_16 = _mm256_cvtepu8_epi16(shifted);
+    __m256i q8_16 = _mm256_cvtepi8_epi16(q8v);
+    __m256i p32 = _mm256_madd_epi16(q8_16, vals_16);
+    __m128i lo = _mm256_castsi256_si128(p32);
+    __m128i hi = _mm256_extracti128_si256(p32, 1);
+    __m128i s128 = _mm_add_epi32(lo, hi);
+    s128 = _mm_hadd_epi32(s128, s128);
+    s128 = _mm_hadd_epi32(s128, s128);
+    return _mm_extract_epi32(s128, 0);
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     const uint8x16_t packed = vld1q_u8(q2);
     uint8x16_t shifted;
     switch (shift) {
@@ -1763,6 +1799,40 @@ static void cpu_directional_steering_project_rows(
 
 typedef void (*ds4_parallel_fn)(void *ctx, uint64_t row0, uint64_t row1);
 
+static uint32_t g_requested_threads;
+
+#if defined(__AMX_INT8__)
+static bool g_amx_supported;
+#endif
+
+#ifdef DS4_USE_TBB
+
+#include "ds4_tbb.h"
+
+/* TBB-backed parallel dispatch — handles nesting, work-stealing */
+static void ds4_threads_init(void) {
+    ds4_tbb_init(g_requested_threads);
+}
+
+static void ds4_threads_shutdown(void) {
+    ds4_tbb_shutdown();
+}
+
+static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void *ctx, uint64_t min_parallel_rows) {
+    ds4_threads_init();
+    if (n_rows < min_parallel_rows) {
+        fn(ctx, 0, n_rows);
+        return;
+    }
+    ds4_tbb_parallel_for(n_rows, (ds4_tbb_parallel_fn)fn, ctx);
+}
+
+static void ds4_parallel_for(uint64_t n_rows, ds4_parallel_fn fn, void *ctx) {
+    ds4_parallel_for_min_rows(n_rows, fn, ctx, 512);
+}
+
+#else /* !DS4_USE_TBB — fallback pthread pool */
+
 #define DS4_MAX_THREADS 32
 
 typedef struct {
@@ -1783,7 +1853,6 @@ typedef struct {
 
 static ds4_thread_pool g_pool;
 static __thread int g_parallel_depth;
-static uint32_t g_requested_threads;
 
 static void *ds4_worker_main(void *arg) {
     const uint32_t tid = (uint32_t)(uintptr_t)arg;
@@ -1922,6 +1991,8 @@ static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void 
 static void ds4_parallel_for(uint64_t n_rows, ds4_parallel_fn fn, void *ctx) {
     ds4_parallel_for_min_rows(n_rows, fn, ctx, 512);
 }
+
+#endif /* DS4_USE_TBB */
 
 static void cursor_error(ds4_cursor *c, const char *msg) {
     if (c->error[0] == '\0') {
@@ -2313,6 +2384,31 @@ static void model_close(ds4_model *m) {
     m->fd = -1;
 }
 
+#ifdef __linux__
+static void model_numa_interleave(void *addr, size_t length) {
+    long n_nodes = 1;
+    FILE *f = fopen("/sys/devices/system/node/possible", "r");
+    if (f) {
+        unsigned first, last;
+        if (fscanf(f, "%u-%u", &first, &last) == 2)
+            n_nodes = (long)(last - first + 1);
+        fclose(f);
+    }
+    if (n_nodes < 2) return;
+
+    unsigned long nodemask = (n_nodes >= (long)sizeof(nodemask) * 8)
+                                 ? ~0UL
+                                 : (1UL << n_nodes) - 1;
+
+    long ret = syscall(__NR_mbind, addr, length, 3 /* MPOL_INTERLEAVE */,
+                       &nodemask, (unsigned long)n_nodes, 0);
+    if (ret != 0)
+        ds4_log(stderr, DS4_LOG_WARNING,
+                "ds4: warning: mbind(MPOL_INTERLEAVE) failed: %s\n",
+                strerror(errno));
+}
+#endif
+
 static void model_prefetch_cpu_mapping(const ds4_model *m) {
     if (!m || !m->map || m->size == 0) return;
 
@@ -2452,6 +2548,9 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     const int mmap_flags = metal_mapping ? MAP_SHARED : MAP_PRIVATE;
     void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, mmap_flags, fd, 0);
     if (map == MAP_FAILED) ds4_die_errno("cannot mmap model", path);
+
+    /* Interleave model pages across NUMA nodes before prefetch/page-fault */
+    if (!metal_mapping) model_numa_interleave(map, (size_t)st.st_size);
 
     m->fd = fd;
     m->map = map;
@@ -3495,7 +3594,78 @@ static inline void q4_k_get_scale_min(int j, const uint8_t *q, uint8_t *sc, uint
     }
 }
 
+/* ========== Intel AMX-accelerated Q4_K dot product ========== */
+#if defined(__AMX_INT8__)
+
+static bool amx_check_support(void) {
+    unsigned eax, ebx, ecx, edx;
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(7), "c"(0));
+    if (!(edx & (1 << 24))) return false;
+    if (!(edx & (1 << 25))) return false;
+    uint32_t xcr0_low, xcr0_high;
+    __asm__ volatile("xgetbv" : "=a"(xcr0_low), "=d"(xcr0_high) : "c"(0));
+    if (!(xcr0_low & (1 << 18))) return false;
+    if (!(xcr0_low & (1 << 19))) return false;
+    return true;
+}
+
+/* Configure tiles for Q4_K dot: tmm0=1×1 int32, tmm1=1×32 uint8, tmm2=32×1 int8 */
+static void amx_configure_q4k(void) {
+    uint8_t cfg[64] __attribute__((aligned(64)));
+    memset(cfg, 0, sizeof(cfg));
+    cfg[0] = 1;
+    *(uint16_t*)(cfg + 16) = 4;  cfg[24] = 1;
+    *(uint16_t*)(cfg + 18) = 32; cfg[26] = 1;
+    *(uint16_t*)(cfg + 20) = 1;  cfg[28] = 32;
+    __asm__ volatile("ldtilecfg %0" : : "m"(*(const uint8_t(*)[64])cfg) : "memory");
+}
+
+static void ds4_vec_dot_q4_K_q8_K_amx(int n, float *s, const block_q4_K *x, const block_q8_K *y) {
+    const int nb = n / QK_K;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const float d  = y[i].d * f16_to_f32(x[i].d);
+        const float dm = -y[i].d * f16_to_f32(x[i].dmin);
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *sc = x[i].scales;
+        const int8_t  *q8 = y[i].qs;
+        uint8_t sc_vals[8], m_vals[8];
+        for (int j = 0; j < 8; j++)
+            q4_k_get_scale_min(j, sc, &sc_vals[j], &m_vals[j]);
+        int summs = 0;
+        for (int j = 0; j < 8; j++)
+            summs += (int)m_vals[j] * ((int32_t)y[i].bsums[j*2] + (int32_t)y[i].bsums[j*2+1]);
+        amx_configure_q4k();
+        int isum = 0;
+        uint8_t unpacked[32] __attribute__((aligned(64)));
+        for (int j = 0; j < 8; j++) {
+            const int byte_off = (j >> 1) * 32;
+            const int shift = (j & 1) * 4;
+            for (int l = 0; l < 32; l++)
+                unpacked[l] = (qs[byte_off + l] >> shift) & 0xF;
+            _tile_zero(0);
+            _tile_loadd(1, unpacked, 32);
+            _tile_loadd(2, q8 + j * 32, 1);
+            _tile_dpbusd(0, 1, 2);
+            int32_t raw;
+            _tile_stored(0, &raw, 4);
+            isum += raw * (int)sc_vals[j];
+        }
+        __asm__ volatile("tilerelease" : : : "memory");
+        sumf += d * (float)isum + dm * (float)summs;
+    }
+    *s = sumf;
+}
+
+#endif /* __AMX_INT8__ */
+
 static void ds4_vec_dot_q4_K_q8_K(int n, float *s, const block_q4_K *x, const block_q8_K *y) {
+#if defined(__AMX_INT8__)
+    if (g_amx_supported) {
+        ds4_vec_dot_q4_K_q8_K_amx(n, s, x, y);
+        return;
+    }
+#endif
     const int nb = n / QK_K;
 
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
@@ -3510,19 +3680,18 @@ static void ds4_vec_dot_q4_K_q8_K(int n, float *s, const block_q4_K *x, const bl
         const uint8_t *sc = x[i].scales;
         const int8_t  *q8 = y[i].qs;
 
+        uint8_t sc_vals[8], m_vals[8];
+        for (int j = 0; j < 8; j++)
+            q4_k_get_scale_min(j, sc, &sc_vals[j], &m_vals[j]);
+
         int32_t summs = 0;
-        for (int j = 0; j < QK_K / 32; j++) {
-            uint8_t sc_val, m_val;
-            q4_k_get_scale_min(j, sc, &sc_val, &m_val);
+        for (int j = 0; j < 8; j++) {
             int32_t gsum = (int32_t)y[i].bsums[j * 2] + (int32_t)y[i].bsums[j * 2 + 1];
-            summs += m_val * gsum;
+            summs += m_vals[j] * gsum;
         }
 
         int isum = 0;
-        for (int j = 0; j < QK_K / 32; j++) {
-            uint8_t sc_val, m_val;
-            q4_k_get_scale_min(j, sc, &sc_val, &m_val);
-
+        for (int j = 0; j < 8; j++) {
             const int byte_off = (j >> 1) * 32;
             const int shift = (j & 1) * 4;
 
@@ -3540,9 +3709,58 @@ static void ds4_vec_dot_q4_K_q8_K(int n, float *s, const block_q4_K *x, const bl
             const int8x16_t q4a = vreinterpretq_s8_u8(vld1q_u8(q4_u));
             const int8x16_t q4b = vreinterpretq_s8_u8(vld1q_u8(q4_u + 16));
 
-            isum += vaddvq_s32(vdotq_s32(zero, q4a, q8v.val[0])) * sc_val;
-            isum += vaddvq_s32(vdotq_s32(zero, q4b, q8v.val[1])) * sc_val;
+            isum += vaddvq_s32(vdotq_s32(zero, q4a, q8v.val[0])) * sc_vals[j];
+            isum += vaddvq_s32(vdotq_s32(zero, q4b, q8v.val[1])) * sc_vals[j];
         }
+
+        sumf += d * (float)isum + dm * (float)summs;
+    }
+
+    *s = sumf;
+#elif defined(__AVX512VNNI__) && defined(__AVX512VL__)
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float d  = y[i].d * f16_to_f32(x[i].d);
+        const float dm = -y[i].d * f16_to_f32(x[i].dmin);
+
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *sc = x[i].scales;
+        const int8_t  *q8 = y[i].qs;
+
+        uint8_t sc_vals[8], m_vals[8];
+        for (int j = 0; j < 8; j++)
+            q4_k_get_scale_min(j, sc, &sc_vals[j], &m_vals[j]);
+
+        int summs = 0;
+        for (int j = 0; j < 8; j++) {
+            int32_t gsum = (int32_t)y[i].bsums[j * 2] + (int32_t)y[i].bsums[j * 2 + 1];
+            summs += m_vals[j] * gsum;
+        }
+
+        __m256i acc = _mm256_setzero_si256();
+        for (int j = 0; j < 8; j++) {
+            const int byte_off = (j >> 1) * 32;
+            __m256i q4p = _mm256_loadu_si256((const __m256i*)(qs + byte_off));
+            if (j & 1) {
+                q4p = _mm256_srli_epi16(q4p, 4);
+                q4p = _mm256_and_si256(q4p, _mm256_set1_epi8(0x0F));
+            } else {
+                q4p = _mm256_and_si256(q4p, _mm256_set1_epi8(0x0F));
+            }
+
+            __m256i q8v = _mm256_loadu_si256((const __m256i*)(q8 + j * 32));
+
+            __m256i p = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q4p, q8v);
+            acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(p, _mm256_set1_epi32(sc_vals[j])));
+        }
+
+        __m128i lo = _mm256_castsi256_si128(acc);
+        __m128i hi = _mm256_extracti128_si256(acc, 1);
+        __m128i s128 = _mm_add_epi32(lo, hi);
+        s128 = _mm_hadd_epi32(s128, s128);
+        s128 = _mm_hadd_epi32(s128, s128);
+        int isum = _mm_extract_epi32(s128, 0);
 
         sumf += d * (float)isum + dm * (float)summs;
     }
@@ -3559,24 +3777,23 @@ static void ds4_vec_dot_q4_K_q8_K(int n, float *s, const block_q4_K *x, const bl
         const uint8_t *sc = x[i].scales;
         const int8_t  *q8 = y[i].qs;
 
+        uint8_t sc_vals[8], m_vals[8];
+        for (int j = 0; j < 8; j++)
+            q4_k_get_scale_min(j, sc, &sc_vals[j], &m_vals[j]);
+
         int summs = 0;
-        for (int j = 0; j < QK_K / 32; j++) {
-            uint8_t sc_val, m_val;
-            q4_k_get_scale_min(j, sc, &sc_val, &m_val);
+        for (int j = 0; j < 8; j++) {
             int32_t gsum = (int32_t)y[i].bsums[j * 2] + (int32_t)y[i].bsums[j * 2 + 1];
-            summs += m_val * gsum;
+            summs += m_vals[j] * gsum;
         }
 
         int isum = 0;
-        for (int j = 0; j < QK_K / 32; j++) {
-            uint8_t sc_val, m_val;
-            q4_k_get_scale_min(j, sc, &sc_val, &m_val);
-
+        for (int j = 0; j < 8; j++) {
             const int byte_off = (j >> 1) * 32;
             const int shift = (j & 1) * 4;
 
             for (int l = 0; l < 32; l++) {
-                isum += ((qs[byte_off + l] >> shift) & 0xF) * (int)q8[j * 32 + l] * sc_val;
+                isum += ((qs[byte_off + l] >> shift) & 0xF) * (int)q8[j * 32 + l] * sc_vals[j];
             }
         }
 
@@ -6626,31 +6843,114 @@ static void embed_token_any(const ds4_model *m, const ds4_weights *w, int token,
 
 /* RMSNorm without a learned scale, used by hyper-connection control vectors. */
 static void rms_norm_no_weight(float *out, const float *x, uint64_t n, float eps) {
+    uint64_t i = 0;
+#if defined(__AVX512F__)
+    __m512 vsum = _mm512_setzero_ps();
+    for (; i + 16 <= n; i += 16) {
+        __m512 vx = _mm512_loadu_ps(&x[i]);
+        vsum = _mm512_fmadd_ps(vx, vx, vsum);
+    }
+    __m128 lo = _mm512_castps512_ps128(vsum);
+    __m128 hi = _mm512_extractf32x4_ps(vsum, 1);
+    __m128 hi2 = _mm512_extractf32x4_ps(vsum, 2);
+    __m128 hi3 = _mm512_extractf32x4_ps(vsum, 3);
+    __m128 s128 = _mm_add_ps(_mm_add_ps(lo, hi), _mm_add_ps(hi2, hi3));
+    s128 = _mm_hadd_ps(s128, s128);
+    s128 = _mm_hadd_ps(s128, s128);
+    double ss = (double)_mm_cvtss_f32(s128);
+#else
     double ss = 0.0;
-    for (uint64_t i = 0; i < n; i++) ss += (double)x[i] * x[i];
+    for (; i < n; i++) ss += (double)x[i] * x[i];
+#endif
+    for (; i < n; i++) ss += (double)x[i] * x[i];
 
     const float scale = 1.0f / sqrtf((float)(ss / (double)n) + eps);
-    for (uint64_t i = 0; i < n; i++) out[i] = x[i] * scale;
+
+#if defined(__AVX512F__)
+    i = 0;
+    const __m512 vscale = _mm512_set1_ps(scale);
+    for (; i + 16 <= n; i += 16) {
+        __m512 vx = _mm512_loadu_ps(&x[i]);
+        _mm512_storeu_ps(&out[i], _mm512_mul_ps(vx, vscale));
+    }
+#endif
+    for (; i < n; i++) out[i] = x[i] * scale;
 }
 
 /* Standard DS4 RMSNorm with learned per-channel scale. */
-static void rms_norm_weight(float *out, const float *x, const float *weight, uint64_t n, float eps) {
+static void rms_norm_weight(float *restrict out, const float *restrict x,
+                            const float *restrict weight, uint64_t n, float eps) {
+    uint64_t i = 0;
+#if defined(__AVX512F__)
+    __m512 vsum = _mm512_setzero_ps();
+    for (; i + 16 <= n; i += 16) {
+        __m512 vx = _mm512_loadu_ps(&x[i]);
+        vsum = _mm512_fmadd_ps(vx, vx, vsum);
+    }
+    __m128 lo = _mm512_castps512_ps128(vsum);
+    __m128 hi = _mm512_extractf32x4_ps(vsum, 1);
+    __m128 hi2 = _mm512_extractf32x4_ps(vsum, 2);
+    __m128 hi3 = _mm512_extractf32x4_ps(vsum, 3);
+    __m128 s128 = _mm_add_ps(_mm_add_ps(lo, hi), _mm_add_ps(hi2, hi3));
+    s128 = _mm_hadd_ps(s128, s128);
+    s128 = _mm_hadd_ps(s128, s128);
+    double ss = (double)_mm_cvtss_f32(s128);
+#else
     double ss = 0.0;
-    for (uint64_t i = 0; i < n; i++) ss += (double)x[i] * x[i];
+    for (; i < n; i++) ss += (double)x[i] * x[i];
+#endif
+    for (; i < n; i++) ss += (double)x[i] * x[i];
 
     const float scale = 1.0f / sqrtf((float)(ss / (double)n) + eps);
-    for (uint64_t i = 0; i < n; i++) out[i] = x[i] * scale * weight[i];
+
+#if defined(__AVX512F__)
+    i = 0;
+    const __m512 vscale = _mm512_set1_ps(scale);
+    for (; i + 16 <= n; i += 16) {
+        __m512 vx = _mm512_loadu_ps(&x[i]);
+        __m512 vw = _mm512_loadu_ps(&weight[i]);
+        _mm512_storeu_ps(&out[i], _mm512_mul_ps(_mm512_mul_ps(vx, vscale), vw));
+    }
+#endif
+    for (; i < n; i++) out[i] = x[i] * scale * weight[i];
 }
 
 /* Normalize each attention head independently after Q projection. */
 static void head_rms_norm_inplace(float *x, uint32_t n_head, uint32_t head_dim, float eps) {
     for (uint32_t h = 0; h < n_head; h++) {
         float *head = x + (uint64_t)h * head_dim;
-        double ss = 0.0;
-        for (uint32_t i = 0; i < head_dim; i++) ss += (double)head[i] * head[i];
+#if defined(__AVX512F__)
+        __m512 vsum = _mm512_setzero_ps();
+        uint32_t i = 0;
+        for (; i + 16 <= head_dim; i += 16) {
+            __m512 vx = _mm512_loadu_ps(&head[i]);
+            vsum = _mm512_fmadd_ps(vx, vx, vsum);
+        }
+        __m128 lo = _mm512_castps512_ps128(vsum);
+        __m128 hi = _mm512_extractf32x4_ps(vsum, 1);
+        __m128 hi2 = _mm512_extractf32x4_ps(vsum, 2);
+        __m128 hi3 = _mm512_extractf32x4_ps(vsum, 3);
+        __m128 s128 = _mm_add_ps(_mm_add_ps(lo, hi), _mm_add_ps(hi2, hi3));
+        s128 = _mm_hadd_ps(s128, s128);
+        s128 = _mm_hadd_ps(s128, s128);
+        double ss = (double)_mm_cvtss_f32(s128);
+
+        for (; i < head_dim; i++) ss += (double)head[i] * head[i];
 
         const float scale = 1.0f / sqrtf((float)(ss / (double)head_dim) + eps);
+        const __m512 vscale = _mm512_set1_ps(scale);
+        i = 0;
+        for (; i + 16 <= head_dim; i += 16) {
+            __m512 vx = _mm512_loadu_ps(&head[i]);
+            _mm512_storeu_ps(&head[i], _mm512_mul_ps(vx, vscale));
+        }
+        for (; i < head_dim; i++) head[i] *= scale;
+#else
+        double ss = 0.0;
+        for (uint32_t i = 0; i < head_dim; i++) ss += (double)head[i] * head[i];
+        const float scale = 1.0f / sqrtf((float)(ss / (double)head_dim) + eps);
         for (uint32_t i = 0; i < head_dim; i++) head[i] *= scale;
+#endif
     }
 }
 
@@ -6662,7 +6962,18 @@ typedef struct {
 } matvec_f16_ctx;
 
 static inline float dot_f16_row(const uint16_t *row, const float *x, uint64_t n) {
-#if defined(__ARM_NEON)
+#if defined(__AVX512F__)
+    uint64_t i = 0;
+    __m512 acc = _mm512_setzero_ps();
+    for (; i + 16 <= n; i += 16) {
+        __m256i h = _mm256_loadu_si256((const __m256i*)(row + i));
+        __m512 f = _mm512_cvtph_ps(h);
+        acc = _mm512_fmadd_ps(f, _mm512_loadu_ps(x + i), acc);
+    }
+    float result = _mm512_reduce_add_ps(acc);
+    for (; i < n; i++) result += f16_to_f32(row[i]) * x[i];
+    return result;
+#elif defined(__ARM_NEON)
     uint64_t i = 0;
     float32x4_t acc0 = vdupq_n_f32(0.0f);
     float32x4_t acc1 = vdupq_n_f32(0.0f);
@@ -6798,7 +7109,22 @@ typedef struct {
 } quantize_q8_0_batch_ctx;
 
 static inline int32_t dot_i8_32(const int8_t *a, const int8_t *b, uint64_t n) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#if defined(__AVX512F__)
+    if (n == 32) {
+        __m256i a8 = _mm256_loadu_si256((const __m256i*)a);
+        __m256i b8 = _mm256_loadu_si256((const __m256i*)b);
+        __m512i a16 = _mm512_cvtepi8_epi16(a8);
+        __m512i b16 = _mm512_cvtepi8_epi16(b8);
+        __m512i p32 = _mm512_madd_epi16(a16, b16);
+        __m256i lo = _mm512_castsi512_si256(p32);
+        __m256i hi = _mm512_extracti32x8_epi32(p32, 1);
+        __m256i s256 = _mm256_add_epi32(lo, hi);
+        __m128i s128 = _mm_add_epi32(_mm256_castsi256_si128(s256), _mm256_extracti128_si256(s256, 1));
+        s128 = _mm_hadd_epi32(s128, s128);
+        s128 = _mm_hadd_epi32(s128, s128);
+        return _mm_extract_epi32(s128, 0);
+    }
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     if (n == 32) {
         int32x4_t acc = vdupq_n_s32(0);
         acc = vdotq_s32(acc, vld1q_s8(a),      vld1q_s8(b));
@@ -6817,7 +7143,34 @@ static inline float dot_q8_0_row(
         const float   *xscale,
         uint64_t       in_dim,
         uint64_t       blocks) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#if defined(__AVX512F__)
+    if ((in_dim & 31u) == 0) {
+        __m512 acc_f = _mm512_setzero_ps();
+        uint64_t b = 0;
+        for (; b + 1 < blocks; b += 2) {
+            uint16_t sb0; memcpy(&sb0, row + b * 34, 2);
+            uint16_t sb1; memcpy(&sb1, row + (b + 1) * 34, 2);
+            float s0 = f16_to_f32(sb0) * xscale[b];
+            float s1 = f16_to_f32(sb1) * xscale[b + 1];
+            __m256i qs0 = _mm256_loadu_si256((const __m256i*)(row + b * 34 + 2));
+            __m256i qs1 = _mm256_loadu_si256((const __m256i*)(row + (b + 1) * 34 + 2));
+            __m256i xq0 = _mm256_loadu_si256((const __m256i*)(xq + b * 32));
+            __m256i xq1 = _mm256_loadu_si256((const __m256i*)(xq + (b + 1) * 32));
+            __m512i p0 = _mm512_madd_epi16(_mm512_cvtepi8_epi16(qs0), _mm512_cvtepi8_epi16(xq0));
+            __m512i p1 = _mm512_madd_epi16(_mm512_cvtepi8_epi16(qs1), _mm512_cvtepi8_epi16(xq1));
+            acc_f = _mm512_fmadd_ps(_mm512_set1_ps(s0), _mm512_cvtepi32_ps(p0), acc_f);
+            acc_f = _mm512_fmadd_ps(_mm512_set1_ps(s1), _mm512_cvtepi32_ps(p1), acc_f);
+        }
+        if (b < blocks) {
+            uint16_t sb; memcpy(&sb, row + b * 34, 2);
+            __m256i qs = _mm256_loadu_si256((const __m256i*)(row + b * 34 + 2));
+            __m256i xqb = _mm256_loadu_si256((const __m256i*)(xq + b * 32));
+            __m512i p = _mm512_madd_epi16(_mm512_cvtepi8_epi16(qs), _mm512_cvtepi8_epi16(xqb));
+            acc_f = _mm512_fmadd_ps(_mm512_set1_ps(f16_to_f32(sb) * xscale[b]), _mm512_cvtepi32_ps(p), acc_f);
+        }
+        return _mm512_reduce_add_ps(acc_f);
+    }
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     if ((in_dim & 31u) == 0) {
         float32x4_t accv0 = vdupq_n_f32(0.0f);
         float32x4_t accv1 = vdupq_n_f32(0.0f);
@@ -6959,7 +7312,54 @@ static inline DS4_MAYBE_UNUSED void dot_q8_0_row_pair(
         uint64_t       blocks,
         float         *out0,
         float         *out1) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#if defined(__AVX512F__)
+    if ((in_dim & 31u) == 0) {
+        __m512 acc00 = _mm512_setzero_ps();
+        __m512 acc01 = _mm512_setzero_ps();
+        __m512 acc10 = _mm512_setzero_ps();
+        __m512 acc11 = _mm512_setzero_ps();
+        uint64_t b = 0;
+        for (; b + 1 < blocks; b += 2) {
+            uint16_t s00, s01, s10, s11;
+            memcpy(&s00, row0 + b * 34, 2);
+            memcpy(&s01, row0 + (b + 1) * 34, 2);
+            memcpy(&s10, row1 + b * 34, 2);
+            memcpy(&s11, row1 + (b + 1) * 34, 2);
+            __m256i xqv0 = _mm256_loadu_si256((const __m256i*)(xq + b * 32));
+            __m256i xqv1 = _mm256_loadu_si256((const __m256i*)(xq + (b + 1) * 32));
+            __m512i xqv0_16 = _mm512_cvtepi8_epi16(xqv0);
+            __m512i xqv1_16 = _mm512_cvtepi8_epi16(xqv1);
+            __m256i q00v = _mm256_loadu_si256((const __m256i*)(row0 + b * 34 + 2));
+            __m256i q01v = _mm256_loadu_si256((const __m256i*)(row0 + (b + 1) * 34 + 2));
+            __m256i q10v = _mm256_loadu_si256((const __m256i*)(row1 + b * 34 + 2));
+            __m256i q11v = _mm256_loadu_si256((const __m256i*)(row1 + (b + 1) * 34 + 2));
+            __m512i d00 = _mm512_madd_epi16(_mm512_cvtepi8_epi16(q00v), xqv0_16);
+            __m512i d01 = _mm512_madd_epi16(_mm512_cvtepi8_epi16(q01v), xqv1_16);
+            __m512i d10 = _mm512_madd_epi16(_mm512_cvtepi8_epi16(q10v), xqv0_16);
+            __m512i d11 = _mm512_madd_epi16(_mm512_cvtepi8_epi16(q11v), xqv1_16);
+            acc00 = _mm512_fmadd_ps(_mm512_set1_ps(f16_to_f32(s00) * xscale[b]), _mm512_cvtepi32_ps(d00), acc00);
+            acc01 = _mm512_fmadd_ps(_mm512_set1_ps(f16_to_f32(s01) * xscale[b + 1]), _mm512_cvtepi32_ps(d01), acc01);
+            acc10 = _mm512_fmadd_ps(_mm512_set1_ps(f16_to_f32(s10) * xscale[b]), _mm512_cvtepi32_ps(d10), acc10);
+            acc11 = _mm512_fmadd_ps(_mm512_set1_ps(f16_to_f32(s11) * xscale[b + 1]), _mm512_cvtepi32_ps(d11), acc11);
+        }
+        if (b < blocks) {
+            uint16_t s0, s1;
+            memcpy(&s0, row0 + b * 34, 2);
+            memcpy(&s1, row1 + b * 34, 2);
+            __m256i xqb = _mm256_loadu_si256((const __m256i*)(xq + b * 32));
+            __m512i xqb_16 = _mm512_cvtepi8_epi16(xqb);
+            __m256i q0v = _mm256_loadu_si256((const __m256i*)(row0 + b * 34 + 2));
+            __m256i q1v = _mm256_loadu_si256((const __m256i*)(row1 + b * 34 + 2));
+            __m512i d0 = _mm512_madd_epi16(_mm512_cvtepi8_epi16(q0v), xqb_16);
+            __m512i d1 = _mm512_madd_epi16(_mm512_cvtepi8_epi16(q1v), xqb_16);
+            acc00 = _mm512_fmadd_ps(_mm512_set1_ps(f16_to_f32(s0) * xscale[b]), _mm512_cvtepi32_ps(d0), acc00);
+            acc10 = _mm512_fmadd_ps(_mm512_set1_ps(f16_to_f32(s1) * xscale[b]), _mm512_cvtepi32_ps(d1), acc10);
+        }
+        *out0 = _mm512_reduce_add_ps(_mm512_add_ps(acc00, acc01));
+        *out1 = _mm512_reduce_add_ps(_mm512_add_ps(acc10, acc11));
+        return;
+    }
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     if ((in_dim & 31u) == 0) {
         float32x4_t acc00 = vdupq_n_f32(0.0f);
         float32x4_t acc01 = vdupq_n_f32(0.0f);
@@ -10244,7 +10644,16 @@ static void rope_tail_layer_batch_inplace(
 }
 
 static inline float dot_f32(const float *a, const float *b, uint32_t n) {
-#if defined(__ARM_NEON)
+#if defined(__AVX512F__)
+    __m512 acc = _mm512_setzero_ps();
+    uint32_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        acc = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), acc);
+    }
+    float res = _mm512_reduce_add_ps(acc);
+    for (; i < n; i++) res += a[i] * b[i];
+    return res;
+#elif defined(__ARM_NEON)
     uint32_t i = 0;
     float32x4_t acc0 = vdupq_n_f32(0.0f);
     float32x4_t acc1 = vdupq_n_f32(0.0f);
@@ -10263,7 +10672,16 @@ static inline float dot_f32(const float *a, const float *b, uint32_t n) {
 }
 
 static inline void axpy_f32(float *y, const float *x, float a, uint32_t n) {
-#if defined(__ARM_NEON)
+#if defined(__AVX512F__)
+    const __m512 av = _mm512_set1_ps(a);
+    uint32_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m512 yv = _mm512_loadu_ps(y + i);
+        __m512 xv = _mm512_loadu_ps(x + i);
+        _mm512_storeu_ps(y + i, _mm512_fmadd_ps(av, xv, yv));
+    }
+    for (; i < n; i++) y[i] += a * x[i];
+#elif defined(__ARM_NEON)
     uint32_t i = 0;
     const float32x4_t av = vdupq_n_f32(a);
     for (; i + 8 <= n; i += 8) {
@@ -10277,7 +10695,15 @@ static inline void axpy_f32(float *y, const float *x, float a, uint32_t n) {
 }
 
 static inline void scale_f32(float *x, float a, uint32_t n) {
-#if defined(__ARM_NEON)
+#if defined(__AVX512F__)
+    const __m512 av = _mm512_set1_ps(a);
+    uint32_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m512 xv = _mm512_loadu_ps(x + i);
+        _mm512_storeu_ps(x + i, _mm512_mul_ps(xv, av));
+    }
+    for (; i < n; i++) x[i] *= a;
+#elif defined(__ARM_NEON)
     uint32_t i = 0;
     const float32x4_t av = vdupq_n_f32(a);
     for (; i + 8 <= n; i += 8) {
@@ -10302,35 +10728,40 @@ static float sigmoid_stable(float x) {
 
 /* Sink-aware attention over a set of KV rows.  The learned sink logit is part
  * of the softmax denominator but contributes no value vector. */
-static void layer_attention_rows_one(
-        float             * out_heads,
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
-        const float       * q,
-        const float       * kv_rows,
-        uint32_t            n_kv) {
-    const float *sinks = tensor_data(model, layer->attn_sinks);
-    const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
-    float score_stack[512];
-    float *score = n_kv <= 512 ? score_stack : xmalloc((size_t)n_kv * sizeof(score[0]));
 
-    for (uint32_t h = 0; h < DS4_N_HEAD; h++) {
-        const float *qh = q + (uint64_t)h * DS4_N_HEAD_DIM;
+typedef struct {
+    float             * out_heads;
+    const ds4_model   * model;
+    const ds4_layer_weights * layer;
+    const float       * q;
+    const float       * kv_rows;
+    uint32_t            n_kv;
+} layer_attention_rows_ctx;
+
+static void layer_attention_rows_worker(void *ctx_ptr, uint64_t h0, uint64_t h1) {
+    const layer_attention_rows_ctx *c = ctx_ptr;
+    const float *sinks = tensor_data(c->model, c->layer->attn_sinks);
+    const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
+    const uint32_t n = c->n_kv;
+    float score[n];
+
+    for (uint32_t h = (uint32_t)h0; h < (uint32_t)h1; h++) {
+        const float *qh = c->q + (uint64_t)h * DS4_N_HEAD_DIM;
 
         float max_score = sinks[h];
-        for (uint32_t r = 0; r < n_kv; r++) {
-            const float *kv = kv_rows + (uint64_t)r * DS4_N_HEAD_DIM;
+        for (uint32_t r = 0; r < n; r++) {
+            const float *kv = c->kv_rows + (uint64_t)r * DS4_N_HEAD_DIM;
             score[r] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
             if (score[r] > max_score) max_score = score[r];
         }
 
-        float *oh = out_heads + (uint64_t)h * DS4_N_HEAD_DIM;
+        float *oh = c->out_heads + (uint64_t)h * DS4_N_HEAD_DIM;
         memset(oh, 0, (size_t)DS4_N_HEAD_DIM * sizeof(oh[0]));
 
         float denom = expf(sinks[h] - max_score);
-        for (uint32_t r = 0; r < n_kv; r++) {
+        for (uint32_t r = 0; r < n; r++) {
             const float weight = expf(score[r] - max_score);
-            const float *kv = kv_rows + (uint64_t)r * DS4_N_HEAD_DIM;
+            const float *kv = c->kv_rows + (uint64_t)r * DS4_N_HEAD_DIM;
             denom += weight;
             axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
         }
@@ -10338,8 +10769,27 @@ static void layer_attention_rows_one(
         const float inv = 1.0f / denom;
         scale_f32(oh, inv, DS4_N_HEAD_DIM);
     }
+}
 
-    if (score != score_stack) free(score);
+static void layer_attention_rows_one(
+        float             * out_heads,
+        const ds4_model   * model,
+        const ds4_layer_weights * layer,
+        const float       * q,
+        const float       * kv_rows,
+        uint32_t            n_kv) {
+    if (n_kv == 0) {
+        memset(out_heads, 0, (size_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(out_heads[0]));
+        return;
+    }
+    layer_attention_rows_ctx ctx;
+    ctx.out_heads = out_heads;
+    ctx.model = model;
+    ctx.layer = layer;
+    ctx.q = q;
+    ctx.kv_rows = kv_rows;
+    ctx.n_kv = n_kv;
+    ds4_parallel_for_min_rows(DS4_N_HEAD, layer_attention_rows_worker, &ctx, 1);
 }
 
 static void layer_attention_one(
@@ -10427,11 +10877,13 @@ static float softplus_stable(float x) {
     return log1pf(expf(x));
 }
 
-static void swiglu(float *out, const float *gate, const float *up, uint64_t n, float clamp) {
+static void swiglu(float *restrict out, const float *restrict gate, const float *restrict up,
+                   uint64_t n, float clamp) {
+    const int use_clamp = clamp > 1.0e-6f;
     for (uint64_t i = 0; i < n; i++) {
         float g = gate[i];
         float u = up[i];
-        if (clamp > 1.0e-6f) {
+        if (use_clamp) {
             if (g > clamp) g = clamp;
             if (u > clamp) u = clamp;
             if (u < -clamp) u = -clamp;
@@ -12564,6 +13016,69 @@ static bool compressor_decode_one_decode_scratch(
 
 /* Attention over raw SWA rows plus optional compressed rows.  Ratio-4 layers
  * pass an indexer mask to hide compressed rows not selected for this token. */
+typedef struct {
+    float             * out_heads;
+    const ds4_model   * model;
+    const ds4_layer_weights * layer;
+    const float       * q;
+    const float       * raw_kv;
+    uint32_t            n_raw;
+    const float       * comp_kv;
+    uint32_t            n_comp;
+    const bool        * comp_allowed;
+} layer_attention_mixed_ctx;
+
+static void layer_attention_mixed_worker(void *ctx_ptr, uint64_t h0, uint64_t h1) {
+    const layer_attention_mixed_ctx *c = ctx_ptr;
+    const float *sinks = tensor_data(c->model, c->layer->attn_sinks);
+    const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
+    const uint32_t n_total = c->n_raw + c->n_comp;
+    float score[n_total];
+
+    for (uint32_t h = (uint32_t)h0; h < (uint32_t)h1; h++) {
+        const float *qh = c->q + (uint64_t)h * DS4_N_HEAD_DIM;
+        float max_score = sinks[h];
+        uint32_t idx = 0;
+
+        for (uint32_t r = 0; r < c->n_raw; r++, idx++) {
+            const float *kv = c->raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
+            score[idx] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
+            if (score[idx] > max_score) max_score = score[idx];
+        }
+        for (uint32_t r = 0; r < c->n_comp; r++, idx++) {
+            if (c->comp_allowed && !c->comp_allowed[r]) {
+                score[idx] = DS4_NEG_INF;
+                continue;
+            }
+            const float *kv = c->comp_kv + (uint64_t)r * DS4_N_HEAD_DIM;
+            score[idx] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
+            if (score[idx] > max_score) max_score = score[idx];
+        }
+
+        float *oh = c->out_heads + (uint64_t)h * DS4_N_HEAD_DIM;
+        memset(oh, 0, (size_t)DS4_N_HEAD_DIM * sizeof(oh[0]));
+
+        float denom = expf(sinks[h] - max_score);
+        idx = 0;
+        for (uint32_t r = 0; r < c->n_raw; r++, idx++) {
+            const float weight = expf(score[idx] - max_score);
+            const float *kv = c->raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
+            denom += weight;
+            axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
+        }
+        for (uint32_t r = 0; r < c->n_comp; r++, idx++) {
+            if (score[idx] <= DS4_NEG_INF * 0.5f) continue;
+            const float weight = expf(score[idx] - max_score);
+            const float *kv = c->comp_kv + (uint64_t)r * DS4_N_HEAD_DIM;
+            denom += weight;
+            axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
+        }
+
+        const float inv = 1.0f / denom;
+        scale_f32(oh, inv, DS4_N_HEAD_DIM);
+    }
+}
+
 static void layer_attention_mixed_one(
         float             * out_heads,
         const ds4_model   * model,
@@ -12574,47 +13089,78 @@ static void layer_attention_mixed_one(
         const float       * comp_kv,
         uint32_t            n_comp,
         const bool        * comp_allowed) {
-    const float *sinks = tensor_data(model, layer->attn_sinks);
-    const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
-    const uint32_t n_total = n_raw + n_comp;
-    float score_stack[512];
-    float *score = n_total <= 512 ? score_stack : xmalloc((size_t)n_total * sizeof(score[0]));
+    if (n_raw + n_comp == 0) {
+        memset(out_heads, 0, (size_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(out_heads[0]));
+        return;
+    }
+    layer_attention_mixed_ctx ctx;
+    ctx.out_heads = out_heads;
+    ctx.model = model;
+    ctx.layer = layer;
+    ctx.q = q;
+    ctx.raw_kv = raw_kv;
+    ctx.n_raw = n_raw;
+    ctx.comp_kv = comp_kv;
+    ctx.n_comp = n_comp;
+    ctx.comp_allowed = comp_allowed;
+    ds4_parallel_for_min_rows(DS4_N_HEAD, layer_attention_mixed_worker, &ctx, 1);
+}
 
-    for (uint32_t h = 0; h < DS4_N_HEAD; h++) {
-        const float *qh = q + (uint64_t)h * DS4_N_HEAD_DIM;
+typedef struct {
+    float                  * out_heads;
+    const ds4_model        * model;
+    const ds4_layer_weights * layer;
+    const float            * q;
+    const float            * raw_kv;
+    uint32_t                 n_raw;
+    const float            * comp_kv;
+    uint32_t                 n_comp;
+    const bool             * comp_allowed;
+    ds4_cpu_decode_scratch * scratch;
+} layer_attention_mixed_scratch_ctx;
+
+static void layer_attention_mixed_scratch_worker(void *ctx_ptr, uint64_t h0, uint64_t h1) {
+    const layer_attention_mixed_scratch_ctx *c = ctx_ptr;
+    const float *sinks = tensor_data(c->model, c->layer->attn_sinks);
+    const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
+    uint32_t n_total = c->n_raw + c->n_comp;
+    float score[n_total];
+
+    for (uint32_t h = (uint32_t)h0; h < (uint32_t)h1; h++) {
+        const float *qh = c->q + (uint64_t)h * DS4_N_HEAD_DIM;
         float max_score = sinks[h];
         uint32_t idx = 0;
 
-        for (uint32_t r = 0; r < n_raw; r++, idx++) {
-            const float *kv = raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
+        for (uint32_t r = 0; r < c->n_raw; r++, idx++) {
+            const float *kv = c->raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
             score[idx] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
             if (score[idx] > max_score) max_score = score[idx];
         }
-        for (uint32_t r = 0; r < n_comp; r++, idx++) {
-            if (comp_allowed && !comp_allowed[r]) {
+        for (uint32_t r = 0; r < c->n_comp; r++, idx++) {
+            if (c->comp_allowed && !c->comp_allowed[r]) {
                 score[idx] = DS4_NEG_INF;
                 continue;
             }
-            const float *kv = comp_kv + (uint64_t)r * DS4_N_HEAD_DIM;
+            const float *kv = c->comp_kv + (uint64_t)r * DS4_N_HEAD_DIM;
             score[idx] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
             if (score[idx] > max_score) max_score = score[idx];
         }
 
-        float *oh = out_heads + (uint64_t)h * DS4_N_HEAD_DIM;
+        float *oh = c->out_heads + (uint64_t)h * DS4_N_HEAD_DIM;
         memset(oh, 0, (size_t)DS4_N_HEAD_DIM * sizeof(oh[0]));
 
         float denom = expf(sinks[h] - max_score);
         idx = 0;
-        for (uint32_t r = 0; r < n_raw; r++, idx++) {
+        for (uint32_t r = 0; r < c->n_raw; r++, idx++) {
             const float weight = expf(score[idx] - max_score);
-            const float *kv = raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
+            const float *kv = c->raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
             denom += weight;
             axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
         }
-        for (uint32_t r = 0; r < n_comp; r++, idx++) {
+        for (uint32_t r = 0; r < c->n_comp; r++, idx++) {
             if (score[idx] <= DS4_NEG_INF * 0.5f) continue;
             const float weight = expf(score[idx] - max_score);
-            const float *kv = comp_kv + (uint64_t)r * DS4_N_HEAD_DIM;
+            const float *kv = c->comp_kv + (uint64_t)r * DS4_N_HEAD_DIM;
             denom += weight;
             axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
         }
@@ -12622,8 +13168,6 @@ static void layer_attention_mixed_one(
         const float inv = 1.0f / denom;
         scale_f32(oh, inv, DS4_N_HEAD_DIM);
     }
-
-    if (score != score_stack) free(score);
 }
 
 static void layer_attention_mixed_one_decode_scratch(
@@ -12637,54 +13181,24 @@ static void layer_attention_mixed_one_decode_scratch(
         uint32_t                 n_comp,
         const bool             * comp_allowed,
         ds4_cpu_decode_scratch * scratch) {
-    const float *sinks = tensor_data(model, layer->attn_sinks);
-    const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
     const uint32_t n_total = n_raw + n_comp;
-    if (n_total > scratch->attn_score_cap) ds4_die("CPU decode attention score scratch buffer is too small");
-    float *score = scratch->attn_score;
-
-    for (uint32_t h = 0; h < DS4_N_HEAD; h++) {
-        const float *qh = q + (uint64_t)h * DS4_N_HEAD_DIM;
-        float max_score = sinks[h];
-        uint32_t idx = 0;
-
-        for (uint32_t r = 0; r < n_raw; r++, idx++) {
-            const float *kv = raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
-            score[idx] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
-            if (score[idx] > max_score) max_score = score[idx];
-        }
-        for (uint32_t r = 0; r < n_comp; r++, idx++) {
-            if (comp_allowed && !comp_allowed[r]) {
-                score[idx] = DS4_NEG_INF;
-                continue;
-            }
-            const float *kv = comp_kv + (uint64_t)r * DS4_N_HEAD_DIM;
-            score[idx] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
-            if (score[idx] > max_score) max_score = score[idx];
-        }
-
-        float *oh = out_heads + (uint64_t)h * DS4_N_HEAD_DIM;
-        memset(oh, 0, (size_t)DS4_N_HEAD_DIM * sizeof(oh[0]));
-
-        float denom = expf(sinks[h] - max_score);
-        idx = 0;
-        for (uint32_t r = 0; r < n_raw; r++, idx++) {
-            const float weight = expf(score[idx] - max_score);
-            const float *kv = raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
-            denom += weight;
-            axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
-        }
-        for (uint32_t r = 0; r < n_comp; r++, idx++) {
-            if (score[idx] <= DS4_NEG_INF * 0.5f) continue;
-            const float weight = expf(score[idx] - max_score);
-            const float *kv = comp_kv + (uint64_t)r * DS4_N_HEAD_DIM;
-            denom += weight;
-            axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
-        }
-
-        const float inv = 1.0f / denom;
-        scale_f32(oh, inv, DS4_N_HEAD_DIM);
+    if (n_total == 0) {
+        memset(out_heads, 0, (size_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(out_heads[0]));
+        return;
     }
+    if (n_total > scratch->attn_score_cap) ds4_die("CPU decode attention score scratch buffer is too small");
+    layer_attention_mixed_scratch_ctx ctx;
+    ctx.out_heads = out_heads;
+    ctx.model = model;
+    ctx.layer = layer;
+    ctx.q = q;
+    ctx.raw_kv = raw_kv;
+    ctx.n_raw = n_raw;
+    ctx.comp_kv = comp_kv;
+    ctx.n_comp = n_comp;
+    ctx.comp_allowed = comp_allowed;
+    ctx.scratch = scratch;
+    ds4_parallel_for_min_rows(DS4_N_HEAD, layer_attention_mixed_scratch_worker, &ctx, 1);
 }
 
 typedef struct {
@@ -55227,6 +55741,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     e->placement_ctx_hint = opt->placement_ctx_hint;
     e->share_session_prefill_workspace = opt->share_session_prefill_workspace;
+#if defined(__AMX_INT8__)
+    g_amx_supported = amx_check_support();
+    if (g_amx_supported)
+        fprintf(stderr, "ds4: Intel AMX detected, using AMX-accelerated Q4_K dot product\n");
+#endif
     ds4_acquire_instance_lock();
 
     if (opt->simulate_used_memory_bytes != 0 &&
