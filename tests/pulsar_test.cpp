@@ -12,8 +12,11 @@
 #include "../src/server/kv_cache.cpp"
 #include "../src/server/trace.cpp"
 #include "../src/server/generate.cpp"
+#include "../src/server/server_jobs.cpp"
+#include "../src/server/server_sched.cpp"
 #include "../src/server/http_server.cpp"
 #include "../src/server/cli_main.cpp"
+#include "../src/server/server_tests.cpp"
 /* engine internals: the sampler byte-exactness gate builds distributions
  * directly and pins them against a copy of the pre-radix implementation. */
 #include "../src/engine/pulsar_engine_internal.h"

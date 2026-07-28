@@ -1059,6 +1059,114 @@ typedef struct {
     int tail_len;
 } thinking_state;
 
+/* Resumable per-job generation state machine (moved verbatim from
+ * generate.c when the scheduler split into its own TU): server_jobs.c owns
+ * the lifecycle, but the scheduler/worker (server_sched.c) steps jobs by
+ * phase and drives the batched/fused decode lanes through the batch_*
+ * fields, so the definition is shared here. */
+typedef enum {
+    GEN_PREFILL_COLD = 0, /* syncing the cold-store prefix, one chunk/quantum */
+    GEN_PREFILL_MAIN,     /* syncing the effective prompt, one chunk/quantum */
+    GEN_DECODE_INIT,      /* (re)initialize a decode attempt (old decode_again) */
+    GEN_DECODE,           /* sampling loop, K tokens per quantum */
+    GEN_FINISH,           /* parse, checkpoints, final response */
+    GEN_DONE,
+} gen_phase;
+
+struct gen_state {
+    job *j;
+    gen_phase phase;
+
+    /* prompt/cache resolution (owned by gen_begin, read by later phases) */
+    char err[160];
+    pulsar_tokens effective_prompt;
+    const pulsar_tokens *prompt_for_sync; /* &j->req.prompt or &effective_prompt */
+    bool responses_protocol;
+    bool responses_live_continuation;
+    bool anthropic_live_continuation;
+    bool thinking_live_continuation;
+    char *disk_cache_path;
+    int prompt_tokens;
+    double t0;
+    double first_token_t;  /* wall time the first output token was produced (TTFT);
+                            * 0 until set. Request-lifetime: survives decode_again
+                            * so it reflects the genuinely first token emitted. */
+    uint64_t trace_id;
+    char ctx_span[48];
+    char req_flags[64];
+    server_prefill_progress progress; /* stable address: callback userdata */
+    int cold_store_len;
+    int suppressed_continued_last;
+    pulsar_tokens cold_prefix;
+
+    /* prefill quantum policy (see gen_prefill_cancel_cb) */
+    uint32_t prefill_min_suffix; /* 0 = interrupting is never exact */
+    int prefill_chunks_done;     /* chunks completed in the current sync call */
+    int prefill_last_current;
+    int prefill_total;
+
+    /* response identity + per-protocol stream projections; these live across
+     * quanta AND across decode_again recovery attempts */
+    char id[96];
+    bool structured_stream;
+    anthropic_stream anthropic_live;
+    openai_stream openai_live;
+    responses_stream responses_live;
+    bool openai_live_chat;
+    bool responses_live_chat;
+    long responses_created_at;
+    bool dsml_recovery_attempted;
+    uint64_t rng;
+
+    /* decode attempt state (reset by GEN_DECODE_INIT) */
+    buf text;
+    size_t plain_stream_pos;
+    size_t stop_scan_from;
+    const char *finish;
+    int completion;
+    int max_tokens;
+    bool saw_tool_start;
+    bool saw_tool_end;
+    bool saw_orphan_tool_end;
+    size_t tool_scan_from;
+    int next_tool_progress;
+    int next_decode_log;
+    double decode_t0;
+    pulsar_spec_metrics spec_start; /* per-session DSpark counters snapshotted at
+                                  * decode start; diffed at finish for this
+                                  * request's accept-rate/tokens-per-step */
+    double last_decode_log_t;
+    int last_decode_log_completion;
+    thinking_state thinking;
+    bool thinking_gates_tool_markers;
+    bool tool_scan_waiting_for_think_close;
+    size_t think_recovery_scan_from;
+    bool think_tool_recovery_enabled;
+    bool dspark_spec_enabled;
+    dsml_decode_tracker dsml_tracker;
+
+    /* Tier-2 batched-decode lane state (worker_batched_decode_quantum). A slot
+     * becomes batch_active when it joins the shared multiseq lane; it stays
+     * there until it finishes (no mid-conversation batched->classic switch, so
+     * no stale-logits hazard). batch_feed_token is the next token to commit at
+     * batch_feed_pos (the bank's KV frontier); batch_pending holds the tokens
+     * committed via multiseq since the bank's last host-checkpoint save, to be
+     * reconciled onto the checkpoint when the slot returns to a classic op
+     * (finish/store). */
+    bool batch_active;
+    bool batch_feed_valid;
+    int  batch_feed_token;
+    int  batch_feed_pos;
+    pulsar_tokens batch_pending;
+    /* plan-34 inc 5: this prefill slot is not fusable (a fused step rejected its
+     * run as not-position-true, e.g. a cache-warm resume); route it CLASSIC. Set
+     * once by the fused quantum on giveup; the classic path handles it correctly. */
+    bool no_fuse;
+
+    /* deferred, non-blocking client writes (installed for send_all) */
+    slot_writer writer;
+};
+
 typedef struct {
     char method[8];
     char path[256];
@@ -1605,6 +1713,17 @@ bool should_canonicalize_tool_checkpoint(const server *s, const tool_calls *call
 bool enqueue(server *s, job *j);
 void *worker_main(void *arg);
 void server_publish_metrics_snapshot(server *s);
+/* Job-lifecycle entry points (server_jobs.c), driven by the scheduler/
+ * worker (server_sched.c): bind/step/unbind plus the three per-token
+ * helpers the batched and fused mixed-batch quanta share with the classic
+ * decode loop. */
+void gen_resolve_sampling(const request *req, float *temperature,
+                          int *top_k, float *top_p, float *min_p);
+bool gen_emit_token(server *s, session_slot *sl, int token);
+void gen_stream_begin(server *s, session_slot *sl);
+void generate_job_begin(server *s, session_slot *sl, job *j);
+void generate_job_step(server *s, session_slot *sl);
+void generate_job_end(server *s, session_slot *sl);
 void append_model_json_values(buf *b, const char *id, const char *name,
                                      int ctx, int default_tokens);
 void *client_main(void *arg);
