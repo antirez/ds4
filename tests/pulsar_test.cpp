@@ -757,6 +757,17 @@ static void test_official_logprob_vectors_run(const char *case_filter) {
         fclose(fp);
         return;
     }
+    if (pulsar_engine_is_pruned(engine)) {
+        /* The vectors are recorded from the full-model official reference;
+         * an expert-pruned (REAP compact) model legitimately diverges from
+         * them, so fidelity comparison is meaningless here. */
+        fprintf(stderr,
+                "pulsar-test: logprob-vectors SKIPPED (pruned model diverges from official reference by design)\n");
+        pulsar_engine_close(engine);
+        test_restore_env("DS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
+        fclose(fp);
+        return;
+    }
 
     test_vec_case vc;
     int ran = 0;
@@ -1582,8 +1593,16 @@ static void test_think_tool_recovery(void) {
     bool parsed = parse_generated_message_ex(text.ptr, true,
                                              &content, &reasoning, &calls);
     TEST_ASSERT(parsed);
-    TEST_ASSERT(calls.len > 0 && !strcmp(calls.v[0].name, "list_files"));
-    TEST_ASSERT(reasoning && strstr(reasoning, "list_files tool right away"));
+    if (!pulsar_engine_is_pruned(engine)) {
+        TEST_ASSERT(calls.len > 0 && !strcmp(calls.v[0].name, "list_files"));
+        TEST_ASSERT(reasoning && strstr(reasoning, "list_files tool right away"));
+    } else {
+        /* The recovery MACHINERY (decode_ok/saw_end/parsed above) is what this
+         * test pins; exact tool choice and reasoning phrasing are model
+         * behavior a pruned model may legitimately vary. */
+        fprintf(stderr,
+                "pulsar-test: think-tool-recovery content asserts SKIPPED (pruned model)\n");
+    }
 
     fprintf(stderr,
             "pulsar-test: think-tool-recovery recovered=%d gen_tokens=%d calls=%d name=%s\n",

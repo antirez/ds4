@@ -31,6 +31,18 @@ uint32_t pulsar_layer_n_expert(uint32_t il) {
 
 
 
+/* REAP compact detection: any layer whose physical routed-expert count was
+ * trimmed below the architecture's n_expert marks the model as pruned. */
+bool pulsar_engine::is_pruned() const {
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint32_t v = g_pulsar_layer_expert_count[il];
+        if (v != 0 && v != PULSAR_N_EXPERT) return true;
+    }
+    return false;
+}
+
+
+
 uint32_t pulsar_expected_layer_compress_ratio(uint32_t il) {
     if (il >= PULSAR_N_LAYER) pulsar_die("DeepSeek4 layer index is outside the loaded model layout");
 

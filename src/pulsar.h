@@ -146,6 +146,10 @@ uint64_t pulsar_engine_hidden_f32_values(pulsar_engine *e);
  * KV files with the previously-zero reserved byte remain Flash-compatible;
  * Pro and later shapes must use nonzero ids. */
 int pulsar_engine_model_id(pulsar_engine *e);
+/* True when the loaded model is expert-pruned (REAP compact: some layers carry
+ * fewer physical routed experts than the architecture's n_expert). Fidelity
+ * tests against full-model reference vectors are meaningless when true. */
+bool pulsar_engine_is_pruned(pulsar_engine *e);
 const char *pulsar_backend_name(pulsar_backend backend);
 bool pulsar_think_mode_enabled(pulsar_think_mode mode);
 const char *pulsar_think_mode_name(pulsar_think_mode mode);

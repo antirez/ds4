@@ -1266,6 +1266,7 @@ struct pulsar_engine {
     uint32_t layer_compress_ratio(uint32_t layer);
     uint64_t hidden_f32_values();
     int model_id();
+    bool is_pruned() const;
     uint64_t session_cost_bytes(int ctx_size);
     uint64_t session_cost_bytes_banked(int ctx_size, int n_banks);
     uint64_t demand_paged_bytes_per_bank(int ctx_size);

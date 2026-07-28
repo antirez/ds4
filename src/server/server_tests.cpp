@@ -3115,7 +3115,12 @@ static void test_thinking_checkpoint_remember_gate(void) {
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
     r.prompt_preserves_reasoning = false;
     r.has_tools = true;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    /* has_tools is NOT a disqualifier since the openwebui/opencode replay
+     * fixes: a client can advertise tools and still strip reasoning on
+     * replay, so prompt_preserves_reasoning is the sole gate (see
+     * should_remember_thinking_checkpoint). The old expectation here was
+     * stale from before that change. */
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
     r.has_tools = false;
     r.think_mode = PULSAR_THINK_NONE;
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));

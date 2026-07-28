@@ -175,6 +175,7 @@ void pulsar_engine_spec_metrics(pulsar_engine *e, pulsar_spec_metrics *out) { if
 uint32_t pulsar_engine_layer_compress_ratio(pulsar_engine *e, uint32_t layer) { return e ? e->layer_compress_ratio(layer) : (layer >= PULSAR_N_LAYER ? 0 : pulsar_layer_compress_ratio(layer)); }
 uint64_t pulsar_engine_hidden_f32_values(pulsar_engine *e) { return e ? e->hidden_f32_values() : (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD; }
 int pulsar_engine_model_id(pulsar_engine *e) { return e ? e->model_id() : (int)PULSAR_MODEL_VARIANT; }
+bool pulsar_engine_is_pruned(pulsar_engine *e) { return e ? e->is_pruned() : false; }
 uint64_t pulsar_engine_session_cost_bytes(pulsar_engine *e, int ctx_size) { return e ? e->session_cost_bytes(ctx_size) : 0; }
 uint64_t pulsar_engine_session_cost_bytes_banked(pulsar_engine *e, int ctx_size, int n_banks) { return e ? e->session_cost_bytes_banked(ctx_size, n_banks) : 0; }
 uint64_t pulsar_engine_demand_paged_bytes_per_bank(pulsar_engine *e, int ctx_size) { return e ? e->demand_paged_bytes_per_bank(ctx_size) : 0; }
