@@ -5,6 +5,28 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* =========================================================================
+ * THE BACKEND SEAM.
+ * =========================================================================
+ *
+ * This header is the ONLY interface between the engine and a GPU backend.
+ * The contract, mechanically enforced by `make seam-check`:
+ *
+ *   - No code outside src/cuda/ may include a CUDA header, name a CUDA
+ *     runtime/driver/cuBLAS symbol, or use kernel-launch syntax. The engine
+ *     talks exclusively in pulsar_gpu_* calls and pulsar_gpu_tensor handles.
+ *   - A future backend (Metal and ROCm were stripped in the CUDA-only fork;
+ *     re-adding one means a new src/<backend>/ implementing these functions)
+ *     must be selectable via pulsar_backend without engine changes.
+ *   - Engine files may read backend TUNING knobs from the environment; the
+ *     legacy DS4_CUDA_* env NAMES are grandfathered as a compatibility
+ *     surface (ops scripts use them), but the questions they answer in
+ *     engine code must stay backend-neutral ("is fusion disabled", "dump
+ *     wanted", "prefill chunk override").
+ *   - Backend-branded log lines (e.g. "CUDA loading model tensors") are
+ *     emitted only by the backend TUs about themselves.
+ */
+
 /* Hyper-connection (HC) residual-stream storage precision (task #62).
  * The source model runs a BF16 residual (config torch_dtype: bfloat16 — see
  * ds4-source-numerics); our HC carriers were f32, i.e. 2x the precision AND
