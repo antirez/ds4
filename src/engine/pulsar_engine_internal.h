@@ -1645,6 +1645,13 @@ typedef struct {
     void *user_ud;
 } pulsar_sync_progress;
 
+/* ---- helpers shared across the session_*.cpp TUs ----
+ * payload_set_err (session_payload.cpp) is the payload/bank-KV error stamper;
+ * spec_quench_reset (session_spec.cpp) re-arms the terminal yield quench at
+ * request boundaries (sync/invalidate/rewind/load_payload). */
+void payload_set_err(char *err, size_t errlen, const char *msg);
+void spec_quench_reset(pulsar_session *s);
+
 /* ---- shared globals ---- */
 
 extern const pulsar_shape PULSAR_SHAPE_FLASH;
