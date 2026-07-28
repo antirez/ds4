@@ -919,6 +919,12 @@ struct server {
      * separate one-prefill-chunk time-slice (byte-identical). Only meaningful in
      * pool mode (pool_banks>0). */
     bool         mixed_batch_enabled;
+    /* Deep-concurrent guard for the fused lane: when the aggregate committed
+     * depth (sum of committed_pos) of the active decode set exceeds this many
+     * rows, worker_find_fuse_prefill refuses to fuse — the decode step is
+     * already bandwidth-saturated and folding prefill in displaces decode
+     * (the measured -48% tg regime). 0 disables the guard. */
+    int          mixed_deep_guard_rows;
     /* Prefill rows folded into EACH decode step of a fused quantum (PULSAR_MIXED_CHUNK,
      * read once; default 32). Spreading the prefill uniformly across the quantum's
      * steps (vs one big chunk on one step) is what trades the time-slice's per-

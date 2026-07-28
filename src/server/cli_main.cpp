@@ -1016,16 +1016,31 @@ int main(int argc, char **argv) {
      * v0.3.0's headline continuous-batching win. One startup read, no hot-path
      * getenv. Only engages in pool mode. */
     {
+        /* Default ON in pool mode WITH the deep-concurrent guard below — the
+         * condition the opt-in revert set for re-flipping ("do NOT re-flip
+         * default-on without a depth/concurrency guard"). The guard bounds the
+         * aggregate committed depth of the active decode set: regime (c)
+         * measured NEUTRAL at 4x4096=16384 aggregate rows and -29% pp/-48% tg
+         * at 4x8192=32768, so the default threshold 16384 stops fusing exactly
+         * where fusing stops paying, and regimes (a)/(b) keep their win.
+         * DS4_MIXED_BATCH=0 still forces the lane fully off;
+         * DS4_MIXED_DEEP_GUARD_ROWS overrides the threshold (0 = no guard). */
         const char *mb = getenv("DS4_MIXED_BATCH");
         s.mixed_batch_enabled = s.pool_banks > 0 &&
-                                mb && (mb[0] == '1' || !strcasecmp(mb, "on"));
+                                !(mb && (mb[0] == '0' || !strcasecmp(mb, "off")));
         const char *mc = getenv("DS4_MIXED_CHUNK");
         int kc = mc ? atoi(mc) : 8;
         if (kc < 1) kc = 1;
         s.mixed_chunk_tokens = kc;
-        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: fused mixed-batch lane %s (chunk=%d/step)",
-                   s.mixed_batch_enabled ? "ENABLED (DS4_MIXED_BATCH)" : "disabled (default; opt in with DS4_MIXED_BATCH=1)",
-                   s.mixed_chunk_tokens);
+        const char *mg = getenv("DS4_MIXED_DEEP_GUARD_ROWS");
+        s.mixed_deep_guard_rows = mg ? atoi(mg) : 16384;
+        if (s.mixed_deep_guard_rows < 0) s.mixed_deep_guard_rows = 0;
+        server_log(PULSAR_LOG_DEFAULT,
+                   "pulsar-server: fused mixed-batch lane %s (chunk=%d/step, deep guard=%d rows)",
+                   s.mixed_batch_enabled ? "ENABLED (default; opt out with DS4_MIXED_BATCH=0)"
+                                         : "disabled (DS4_MIXED_BATCH)",
+                   s.mixed_chunk_tokens,
+                   s.mixed_deep_guard_rows);
     }
     /* plan-33 inc B: warm full-prefix fork routing kill-switch. Default ON in
      * pool mode; PULSAR_WARM_FORK=0 restores today's in-place-continuation routing

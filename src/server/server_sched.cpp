@@ -1342,6 +1342,32 @@ static void worker_batched_decode_quantum(server *s, session_slot **dec, int n) 
  * when the flag is off, not in pool mode, or nothing qualifies. */
 static session_slot *worker_find_fuse_prefill(server *s) {
     if (!s->mixed_batch_enabled || s->pool_banks <= 0) return NULL;
+    /* Deep-concurrent guard (see the enable block in cli_main.cpp): fusing a
+     * prefill chunk into a decode quantum whose banks already read a deep
+     * aggregate KV working set displaces bandwidth-saturated decode. Refuse
+     * to fuse while the active decode set's summed committed depth exceeds
+     * the threshold; those prefills take the classic (unfused) path instead. */
+    if (s->mixed_deep_guard_rows > 0) {
+        long deep = 0;
+        int n_dec = 0;
+        for (int i = 0; i < s->n_slots; i++) {
+            const session_slot *dl = &s->slots[i];
+            if (dl->provisioned && dl->active_job && dl->state == SLOT_DECODING) {
+                deep += dl->committed_pos;
+                n_dec++;
+            }
+        }
+        if (n_dec >= 2 && deep > (long)s->mixed_deep_guard_rows) {
+            static long last_logged = -1;
+            if (deep != last_logged) {
+                server_log(PULSAR_LOG_KVCACHE,
+                           "pulsar-server: fused lane paused by deep guard (%d decoders, %ld aggregate rows > %d)",
+                           n_dec, deep, s->mixed_deep_guard_rows);
+                last_logged = deep;
+            }
+            return NULL;
+        }
+    }
     pulsar_session *pool = s->sess;
     for (int i = 0; i < s->n_slots; i++) {
         session_slot *sl = &s->slots[i];
