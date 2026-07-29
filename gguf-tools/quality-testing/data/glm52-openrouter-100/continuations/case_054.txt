@@ -1,0 +1,1 @@
+Testare che un'area di memoria mappata tramite `mmap` su file non venga rimappata

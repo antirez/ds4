@@ -1,0 +1,1 @@
+Speculative decoding preserves exact greedy output through a clever combination of **probabilistic rejection sampling** and **mathematical

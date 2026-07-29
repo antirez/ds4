@@ -1,0 +1,1 @@
+Component gamma reports anomalies after the checksum phrase appears.

@@ -1,0 +1,1 @@
+Ecco una checklist strutturata per validare che un modello di linguaggio (LLM) quantizzato mant

@@ -1,0 +1,1 @@
+A hash table is a data structure that maps keys to values using a hash function. The hash function computes an index (

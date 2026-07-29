@@ -1,0 +1,3 @@
+Let's break down **online softmax** for attention using simple variables.
+
+## The Problem: Standard Softmax in Attention

@@ -9,6 +9,21 @@ extern "C" int ds4_gpu_repeat_hc_tensor(ds4_gpu_tensor *out, const ds4_gpu_tenso
     return cuda_ok(cudaGetLastError(), "repeat_hc launch");
 }
 
+extern "C" int ds4_gpu_repeat_hc_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *rows, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc) {
+    uint64_t rows_elems = 0;
+    uint64_t n = 0;
+    if (n_tokens == 0 || n_embd == 0 || n_hc == 0 ||
+        !cuda_u64_mul_checked(n_tokens, n_embd, &rows_elems) ||
+        !cuda_u64_mul_checked(rows_elems, n_hc, &n) ||
+        !cuda_tensor_has_f32(rows, rows_elems) || !cuda_tensor_has_f32(out, n)) {
+        return 0;
+    }
+    const uint64_t blocks = (n + 255u) / 256u;
+    if (blocks > UINT32_MAX) return 0;
+    repeat_hc_rows_kernel<<<(unsigned)blocks, 256>>>((float *)out->ptr, (const float *)rows->ptr, n_tokens, n_embd, n_hc);
+    return cuda_ok(cudaGetLastError(), "repeat_hc_rows launch");
+}
+
 extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;
     const uint64_t mix_bytes = 24ull * sizeof(float);
@@ -161,38 +176,29 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         return 0;
     }
     uint64_t n_rows = out->bytes / out_row_bytes;
-    if (n_rows == 1) {
-        if (mix->bytes < n_rows * mix_bytes ||
-            split->bytes < n_rows * mix_bytes ||
-            residual_hc->bytes < n_rows * residual_row_bytes) {
-            return 0;
-        }
-        const float *scale = (const float *)cuda_model_range_ptr(model_map, scale_offset,
-                3ull * sizeof(float), "hc_scale");
-        const float *base = (const float *)cuda_model_range_ptr(model_map, base_offset,
-                mix_bytes, "hc_base");
-        const float *norm_w = (const float *)cuda_model_range_ptr(model_map, norm_weight_offset,
-                (uint64_t)n_embd * sizeof(float), "hc_norm_weight");
-        if (!scale || !base || !norm_w) return 0;
-        hc_split_weighted_sum_norm_fused_kernel<<<(uint32_t)n_rows, 256>>>(
-                (float *)out->ptr,
-                (float *)norm_out->ptr,
-                (float *)split->ptr,
-                (const float *)mix->ptr,
-                (const float *)residual_hc->ptr,
-                scale,
-                base,
-                norm_w,
-                n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps);
-        return cuda_ok(cudaGetLastError(), "hc split weighted sum norm launch");
+    if (mix->bytes < n_rows * mix_bytes ||
+        split->bytes < n_rows * mix_bytes ||
+        residual_hc->bytes < n_rows * residual_row_bytes) {
+        return 0;
     }
-    return ds4_gpu_hc_split_weighted_sum_tensor(out, split, mix, residual_hc,
-                                                  model_map, model_size,
-                                                  scale_offset, base_offset,
-                                                  n_embd, n_hc,
-                                                  sinkhorn_iters, eps) &&
-           ds4_gpu_rms_norm_weight_tensor(norm_out, out, model_map, model_size,
-                                            norm_weight_offset, n_embd, norm_eps);
+    const float *scale = (const float *)cuda_model_range_ptr(model_map, scale_offset,
+            3ull * sizeof(float), "hc_scale");
+    const float *base = (const float *)cuda_model_range_ptr(model_map, base_offset,
+            mix_bytes, "hc_base");
+    const float *norm_w = (const float *)cuda_model_range_ptr(model_map, norm_weight_offset,
+            (uint64_t)n_embd * sizeof(float), "hc_norm_weight");
+    if (!scale || !base || !norm_w) return 0;
+    hc_split_weighted_sum_norm_fused_kernel<<<(uint32_t)n_rows, 256>>>(
+            (float *)out->ptr,
+            (float *)norm_out->ptr,
+            (float *)split->ptr,
+            (const float *)mix->ptr,
+            (const float *)residual_hc->ptr,
+            scale,
+            base,
+            norm_w,
+            n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps);
+    return cuda_ok(cudaGetLastError(), "hc split weighted sum norm launch");
 }
 extern "C" int ds4_gpu_output_hc_weights_tensor(
         ds4_gpu_tensor       *out,

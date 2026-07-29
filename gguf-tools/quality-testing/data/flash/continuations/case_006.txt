@@ -1,0 +1,1 @@
+This is a great question that gets at the core of how modern LLMs generate text. Both **temperature** and **

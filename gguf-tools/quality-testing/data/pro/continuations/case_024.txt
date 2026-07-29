@@ -1,0 +1,5 @@
+Here's a safe format for storing a model checkpoint header:
+
+## Recommended Format: JSON with Cryptographic Verification
+
+```json

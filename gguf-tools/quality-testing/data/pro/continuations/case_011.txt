@@ -1,0 +1,3 @@
+Ecco un progetto conciso per un server TCP echo con client lenti:
+
+## Server TCP Echo con Client Lenti

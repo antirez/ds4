@@ -1,0 +1,1 @@
+Deriva perche RMSNorm richiede somma dei quadrati e riscalamento.

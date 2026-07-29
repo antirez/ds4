@@ -1,0 +1,1 @@
+L'inserimento in un B-tree è un processo affascinante perché, a differenza degli alberi

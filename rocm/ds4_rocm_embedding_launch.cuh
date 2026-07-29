@@ -111,3 +111,41 @@ extern "C" int ds4_gpu_embed_tokens_hc_q8_0_tensor(
             n_hc);
     return cuda_ok(cudaGetLastError(), "embed tokens q8_0 launch");
 }
+
+extern "C" int ds4_gpu_embed_token_q8_0_tensor(
+        ds4_gpu_tensor *out,
+        const void       *model_map,
+        uint64_t          model_size,
+        uint64_t          weight_offset,
+        uint32_t          n_vocab,
+        uint32_t          token,
+        uint32_t          n_embd) {
+    return ds4_gpu_embed_token_hc_q8_0_tensor(out,
+                                              model_map,
+                                              model_size,
+                                              weight_offset,
+                                              n_vocab,
+                                              token,
+                                              n_embd,
+                                              1);
+}
+
+extern "C" int ds4_gpu_embed_tokens_q8_0_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *tokens_t,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n_vocab,
+        uint32_t                n_tokens,
+        uint32_t                n_embd) {
+    return ds4_gpu_embed_tokens_hc_q8_0_tensor(out,
+                                               tokens_t,
+                                               model_map,
+                                               model_size,
+                                               weight_offset,
+                                               n_vocab,
+                                               n_tokens,
+                                               n_embd,
+                                               1);
+}

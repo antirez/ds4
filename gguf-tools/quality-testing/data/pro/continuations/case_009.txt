@@ -1,0 +1,5 @@
+Here are three invariants for a tokenizer special-token table:
+
+---
+
+**1. Unique Token ID Invariant**

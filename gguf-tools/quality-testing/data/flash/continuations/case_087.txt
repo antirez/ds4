@@ -1,0 +1,3 @@
+Here are three examples of useful server metrics, each covering a different critical aspect of server health:
+
+1.  **CPU

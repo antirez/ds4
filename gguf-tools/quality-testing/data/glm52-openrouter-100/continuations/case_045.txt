@@ -1,0 +1,1 @@
+In modern graphics APIs (Vulkan, DirectX 12, Metal) and compute APIs (CUDA, OpenCL), allocating

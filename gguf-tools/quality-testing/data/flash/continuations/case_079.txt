@@ -1,0 +1,1 @@
+Ecco una checklist sintetica per la revisione della **lifetime della memoria** in una Pull Request (focus

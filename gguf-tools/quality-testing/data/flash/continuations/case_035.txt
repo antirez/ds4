@@ -1,0 +1,1 @@
+Ti spiegherò il funzionamento di un **ring buffer** (o buffer circolare) e le tec
