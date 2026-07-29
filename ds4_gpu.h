@@ -246,6 +246,7 @@ int ds4_gpu_set_aux_model_map_range(const void *model_map,
                                     uint64_t map_offset,
                                     uint64_t map_size);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
+int ds4_gpu_release_model_views(void);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_q8_cache_suppressed(void);
@@ -394,6 +395,7 @@ int ds4_gpu_qwen4_batch_mm_q8_tensor(
         const void *model_map, uint64_t model_size, uint64_t weight_offset,
         uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows);
 uint64_t ds4_gpu_recommended_working_set_size(void);
+uint64_t ds4_gpu_tensor_allocated_bytes(void);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
 typedef struct ds4_gpu_stream_expert_table {
@@ -723,6 +725,13 @@ int ds4_gpu_dsv4_topk_mask_tensor(
  * The graph uses these primitives for Q/KV projections, HC/output projections,
  * attention output projections, and DS4's tail-only RoPE.
  */
+
+enum {
+    DS4_GPU_GGML_TYPE_Q8_0 = 8,
+    DS4_GPU_GGML_TYPE_Q2_K = 10,
+    DS4_GPU_GGML_TYPE_IQ2_XXS = 16,
+    DS4_GPU_GGML_TYPE_MXFP4 = 39,
+};
 
 int ds4_gpu_matmul_q8_0_tensor(
         ds4_gpu_tensor       *out,
@@ -2928,6 +2937,60 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                layer_index,
         uint32_t                n_tokens,
         bool                   *mid_is_f16,
+        bool                    force_resident);
+
+/* Kimi K3 routed MoE: IQ2_XXS gate/up, Q2_K down, and SiTU(4, 25). */
+int ds4_gpu_k3_routed_moe_one_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        const ds4_gpu_tensor *x,
+        uint32_t                layer_index,
+        bool                    force_resident);
+
+int ds4_gpu_k3_routed_moe_batch_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        const ds4_gpu_tensor *x,
+        uint32_t                layer_index,
+        uint32_t                n_tokens,
         bool                    force_resident);
 
 /* =========================================================================

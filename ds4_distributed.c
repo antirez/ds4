@@ -63,6 +63,7 @@
 #define DS4_DIST_RESULT_HIDDEN_STATE 1u
 #define DS4_DIST_RESULT_LOGITS 2u
 #define DS4_DIST_ACTIVATION_BITS_DEFAULT 32u
+#define DS4_DIST_MODEL_KIMI_K3 3u
 #define DS4_DIST_ROUTE_F_OUTPUT_LOGITS 0x00000001u
 #define DS4_DIST_ROUTE_RETURN_UPSTREAM 1u
 #define DS4_DIST_RECV_TRANSPORT_ERROR 1
@@ -83,6 +84,7 @@ typedef struct {
     uint32_t has_output;
     uint32_t has_hidden;
     uint32_t ctx_size;
+    uint32_t prefill_cap;
     uint32_t n_layers;
     uint32_t listen_port;
     uint32_t model_name_len;
@@ -217,6 +219,7 @@ typedef struct ds4_dist_worker_entry {
     uint32_t has_output;
     uint32_t has_hidden;
     uint32_t ctx_size;
+    uint32_t prefill_cap;
     uint32_t n_layers;
     uint32_t listen_port;
     struct ds4_dist_worker_entry *next;
@@ -350,6 +353,7 @@ typedef struct {
     uint32_t layer_start;
     uint32_t layer_end;
     uint32_t flags;
+    uint32_t prefill_cap;
     int fd;
 } ds4_dist_route_entry;
 
@@ -790,6 +794,24 @@ static uint32_t dist_activation_bits_or_default(uint32_t bits) {
 static bool dist_activation_bits_valid(uint32_t bits) {
     bits = dist_activation_bits_or_default(bits);
     return bits == 32u || bits == 16u || bits == 8u;
+}
+
+static bool dist_activation_bits_valid_for_model(
+        uint32_t model_id,
+        uint32_t bits) {
+    bits = dist_activation_bits_or_default(bits);
+    return dist_activation_bits_valid(bits) &&
+           (model_id != DS4_DIST_MODEL_KIMI_K3 || bits == 32u);
+}
+
+bool ds4_dist_result_activation_bits_valid(
+        uint32_t model_id,
+        uint32_t expected_bits,
+        uint32_t payload_bits) {
+    expected_bits = dist_activation_bits_or_default(expected_bits);
+    payload_bits = dist_activation_bits_or_default(payload_bits);
+    return dist_activation_bits_valid_for_model(model_id, payload_bits) &&
+           payload_bits == expected_bits;
 }
 
 static bool dist_activation_wire_bytes(uint32_t bits, uint64_t values, uint32_t *out) {
@@ -1464,6 +1486,7 @@ static void dist_hello_to_wire(ds4_dist_hello_fixed *h) {
     h->has_output = htonl(h->has_output);
     h->has_hidden = htonl(h->has_hidden);
     h->ctx_size = htonl(h->ctx_size);
+    h->prefill_cap = htonl(h->prefill_cap);
     h->n_layers = htonl(h->n_layers);
     h->listen_port = htonl(h->listen_port);
     h->model_name_len = htonl(h->model_name_len);
@@ -1477,6 +1500,7 @@ static void dist_hello_from_wire(ds4_dist_hello_fixed *h) {
     h->has_output = ntohl(h->has_output);
     h->has_hidden = ntohl(h->has_hidden);
     h->ctx_size = ntohl(h->ctx_size);
+    h->prefill_cap = ntohl(h->prefill_cap);
     h->n_layers = ntohl(h->n_layers);
     h->listen_port = ntohl(h->listen_port);
     h->model_name_len = ntohl(h->model_name_len);
@@ -1766,17 +1790,25 @@ static int dist_send_hello(ds4_engine *engine, const ds4_dist_options *opt, int 
     size_t model_name_len = strlen(model_name);
     if (model_name_len > DS4_DIST_MAX_MODEL_NAME) model_name_len = DS4_DIST_MAX_MODEL_NAME;
 
+    uint32_t prefill_cap = ds4_engine_prefill_chunk(engine);
+    if (prefill_cap == 0 && ctx_size > 0) {
+        prefill_cap = (uint32_t)ctx_size;
+    }
+    if (ctx_size > 0 && prefill_cap > (uint32_t)ctx_size) {
+        prefill_cap = (uint32_t)ctx_size;
+    }
     ds4_dist_hello_fixed h = {
-        (uint32_t)ds4_engine_model_id(engine),
-        (uint32_t)ds4_engine_routed_quant_bits(engine),
-        opt->layers.start,
-        dist_resolved_layer_end(opt, n_layers),
-        opt->layers.has_output ? 1u : 0u,
-        1u,
-        ctx_size > 0 ? (uint32_t)ctx_size : 0u,
-        n_layers,
-        listen_port,
-        (uint32_t)model_name_len
+        .model_id = (uint32_t)ds4_engine_model_id(engine),
+        .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
+        .layer_start = opt->layers.start,
+        .layer_end = dist_resolved_layer_end(opt, n_layers),
+        .has_output = opt->layers.has_output ? 1u : 0u,
+        .has_hidden = 1u,
+        .ctx_size = ctx_size > 0 ? (uint32_t)ctx_size : 0u,
+        .prefill_cap = prefill_cap,
+        .n_layers = n_layers,
+        .listen_port = listen_port,
+        .model_name_len = (uint32_t)model_name_len,
     };
     ds4_dist_hello_fixed wire = h;
     dist_hello_to_wire(&wire);
@@ -1877,6 +1909,7 @@ static void dist_coordinator_add_worker(
     entry->has_output = hello->has_output;
     entry->has_hidden = hello->has_hidden;
     entry->ctx_size = hello->ctx_size;
+    entry->prefill_cap = hello->prefill_cap;
     entry->n_layers = hello->n_layers;
     entry->listen_port = hello->listen_port;
 
@@ -1917,7 +1950,7 @@ static void dist_coordinator_add_worker(
     if (entry->has_output) snprintf(layer_end, sizeof(layer_end), "output");
     else snprintf(layer_end, sizeof(layer_end), "%u", entry->layer_end);
     DIST_COORD_DEBUG(state,
-                     "ds4: distributed coordinator: registered worker %s:%s data_port=%u model_id=%u quant=Q%u layers=%u:%s hidden=%u ctx=%u\n",
+                     "ds4: distributed coordinator: registered worker %s:%s data_port=%u model_id=%u quant=Q%u layers=%u:%s hidden=%u ctx=%u prefill=%u\n",
                      entry->peer_host,
                      entry->peer_port,
                      entry->listen_port,
@@ -1926,7 +1959,8 @@ static void dist_coordinator_add_worker(
                      entry->layer_start,
                      layer_end,
                      entry->has_hidden,
-                     entry->ctx_size);
+                     entry->ctx_size,
+                     entry->prefill_cap);
     if (dist_coordinator_debug_enabled(state)) dist_coordinator_report_plan(state);
 }
 
@@ -2268,6 +2302,7 @@ static bool dist_coordinator_build_route_plan(
         entry.layer_start = w->layer_start;
         entry.layer_end = w->layer_end;
         entry.flags = w->has_output ? DS4_DIST_ROUTE_F_OUTPUT_LOGITS : 0u;
+        entry.prefill_cap = w->prefill_cap;
         if (state->use_control_for_work && plan->count == 0) {
             entry.fd = dup(w->fd);
             if (entry.fd < 0) {
@@ -2391,6 +2426,22 @@ static int dist_recv_result_alloc(
         dist_discard_bytes(fd, bytes - (uint32_t)sizeof(result));
         if (errlen) snprintf(err, errlen, "distributed result metadata mismatch");
         return 1;
+    }
+    if (result.status == 0 &&
+        result.result_kind == DS4_DIST_RESULT_HIDDEN_STATE) {
+        const uint32_t payload_bits =
+            dist_activation_bits_or_default(result.payload_bits);
+        if (!ds4_dist_result_activation_bits_valid(
+                state->model_id, state->activation_bits, payload_bits)) {
+            dist_discard_bytes(fd, body_bytes);
+            if (errlen) {
+                snprintf(err, errlen,
+                         "distributed worker returned %u-bit boundary "
+                         "activations, expected %u-bit",
+                         payload_bits, state->activation_bits);
+            }
+            return 1;
+        }
     }
 
     if (result.telemetry_bytes != 0) {
@@ -3033,7 +3084,6 @@ static int dist_write_logprobs_dump(
 
     char err[256];
     int rc = 0;
-    const int eos = ds4_token_eos(state->engine);
     for (int generated = 0; generated < max_tokens; generated++) {
         const int n = dist_logits_top_logprobs(logits, ds4_engine_vocab_size(state->engine), scores, k);
         const int token = dist_logits_argmax(logits, ds4_engine_vocab_size(state->engine));
@@ -3049,7 +3099,7 @@ static int dist_write_logprobs_dump(
         }
         fputs("]}", fp);
 
-        if (token == eos) break;
+        if (ds4_token_is_stop(state->engine, token)) break;
         const uint32_t token_pos = (uint32_t)prompt->len + (uint32_t)generated;
         ds4_tokens_push(&transcript, token);
         if (dist_coordinator_eval_span(state, session, plan,
@@ -3440,6 +3490,7 @@ static bool dist_coordinator_can_pipeline_prefill(
 
 static int dist_coordinator_prefill_chunk_cap(
         const ds4_dist_coordinator_state *state,
+        const ds4_dist_route_plan *plan,
         ds4_session *session,
         uint32_t *chunk_cap,
         char *err,
@@ -3468,6 +3519,37 @@ static int dist_coordinator_prefill_chunk_cap(
                      prefill_cap);
         }
         return 1;
+    }
+    if (plan) {
+        for (uint32_t i = 0; i < plan->count; i++) {
+            const uint32_t remote_cap = plan->entry[i].prefill_cap;
+            if (remote_cap != 0 && requested > remote_cap) {
+                requested = remote_cap;
+            }
+        }
+    }
+    const uint64_t hc_values =
+        state && plan && plan->count != 0
+            ? ds4_engine_hidden_f32_values(state->engine) : 0;
+    if (hc_values != 0 &&
+        hc_values <= (UINT64_MAX - sizeof(uint32_t)) / sizeof(float)) {
+        const uint64_t bytes_per_token =
+            hc_values * sizeof(float) + sizeof(uint32_t);
+        const uint64_t wire_overhead =
+            sizeof(ds4_dist_work_fixed) + plan->blob_bytes;
+        const uint64_t wire_cap64 =
+            wire_overhead < UINT32_MAX
+                ? (UINT32_MAX - wire_overhead) / bytes_per_token : 0;
+        if (wire_cap64 == 0) {
+            if (errlen) {
+                snprintf(err, errlen,
+                         "distributed boundary does not fit the wire frame");
+            }
+            return 1;
+        }
+        const uint32_t wire_cap =
+            wire_cap64 > UINT32_MAX ? UINT32_MAX : (uint32_t)wire_cap64;
+        if (requested > wire_cap) requested = wire_cap;
     }
     *chunk_cap = requested;
     return 0;
@@ -3788,7 +3870,8 @@ static int dist_coordinator_prefill_prompt(
         char *err,
         size_t errlen) {
     uint32_t chunk_cap = 0;
-    if (dist_coordinator_prefill_chunk_cap(state, session, &chunk_cap, err, errlen) != 0) {
+    if (dist_coordinator_prefill_chunk_cap(
+            state, plan, session, &chunk_cap, err, errlen) != 0) {
         return 1;
     }
     const uint32_t prompt_len = (uint32_t)prompt->len;
@@ -4027,7 +4110,6 @@ static int dist_run_coordinator_generation(
     else if (max_tokens > room - 1) max_tokens = room - 1;
     uint64_t rng = gen->seed ? gen->seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
-    const int eos = ds4_token_eos(state->engine);
     ds4_tokens transcript = {0};
     ds4_tokens_copy(&transcript, &prompt);
     while (generated < max_tokens) {
@@ -4038,7 +4120,7 @@ static int dist_run_coordinator_generation(
                                       gen->top_p,
                                       gen->min_p,
                                       &rng);
-        if (token == eos) break;
+        if (ds4_token_is_stop(state->engine, token)) break;
 
         size_t len = 0;
         char *text = ds4_token_text(state->engine, token, &len);
@@ -4206,6 +4288,17 @@ static void *dist_coordinator_client_main(void *arg) {
     }
     if (hello.has_hidden > 1u) {
         snprintf(err, sizeof(err), "invalid worker hidden-state flag %u", hello.has_hidden);
+        DIST_COORD_DEBUG(state, "ds4: distributed coordinator: rejecting %s:%s: %s\n", peer_host, peer_port, err);
+        dist_send_error(fd, err);
+        close(fd);
+        return NULL;
+    }
+    if (hello.prefill_cap == 0 || hello.prefill_cap > hello.ctx_size) {
+        snprintf(err,
+                 sizeof(err),
+                 "invalid worker prefill cap %u for context %u",
+                 hello.prefill_cap,
+                 hello.ctx_size);
         DIST_COORD_DEBUG(state, "ds4: distributed coordinator: rejecting %s:%s: %s\n", peer_host, peer_port, err);
         dist_send_error(fd, err);
         close(fd);
@@ -5418,6 +5511,16 @@ int ds4_dist_session_create(
         return 1;
     }
     if (dist_validate_options(opt, err, errlen) != 0) return 1;
+    const uint32_t model_id = (uint32_t)ds4_engine_model_id(engine);
+    if (!dist_activation_bits_valid_for_model(
+            model_id, opt->activation_bits)) {
+        if (errlen) {
+            snprintf(err, errlen,
+                     "Kimi K3 distributed inference requires "
+                     "32-bit boundary activations");
+        }
+        return 1;
+    }
 
     int listen_fd = dist_open_listener(opt->listen_host, opt->listen_port, err, errlen);
     if (listen_fd < 0) return 1;
@@ -5536,7 +5639,9 @@ int ds4_dist_session_sync(
         if (checkpoint->len == prompt->len) return 0;
 
         uint32_t chunk_cap = 0;
-        if (dist_coordinator_prefill_chunk_cap(&d->state, owner, &chunk_cap, err, errlen) != 0) {
+        if (dist_coordinator_prefill_chunk_cap(
+                &d->state, &d->plan, owner,
+                &chunk_cap, err, errlen) != 0) {
             return 1;
         }
         const uint32_t pos0 = (uint32_t)checkpoint->len;
@@ -5706,6 +5811,14 @@ int ds4_dist_session_eval(
 
 static int dist_run_coordinator(ds4_engine *engine, const ds4_dist_options *opt, const ds4_dist_generation_options *gen) {
     char err[256];
+    const uint32_t model_id = (uint32_t)ds4_engine_model_id(engine);
+    if (!dist_activation_bits_valid_for_model(
+            model_id, opt->activation_bits)) {
+        fprintf(stderr,
+                "ds4: distributed coordinator: Kimi K3 requires "
+                "32-bit boundary activations\n");
+        return 1;
+    }
     int listen_fd = dist_open_listener(opt->listen_host, opt->listen_port, err, sizeof(err));
     if (listen_fd < 0) {
         fprintf(stderr, "ds4: distributed coordinator: %s\n", err);
@@ -7293,6 +7406,13 @@ static int dist_worker_process_work_payload(
     }
     const uint32_t expected_hc_bytes = (uint32_t)expected_hc_bytes64;
     const uint32_t input_hc_bits = dist_activation_bits_or_default(work.input_hc_bits);
+    if (!dist_activation_bits_valid_for_model(
+            state->model_id, input_hc_bits)) {
+        free(tokens);
+        return dist_worker_upstream_send_work_error(
+            upstream, request_id,
+            "Kimi K3 requires 32-bit distributed boundary activations");
+    }
 
     float *input_hc = NULL;
     const void *input_hc_wire = NULL;

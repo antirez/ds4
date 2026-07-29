@@ -6,6 +6,8 @@ LLAMA_CPP_BUILD ?= $(LLAMA_CPP_DIR)/build-remote
 LLAMA_CPP_BIN ?= $(LLAMA_CPP_BUILD)/bin
 LLAMA_CPP_CXXFLAGS ?= -O3 -Wall -Wextra -std=c++17 \
 	-I$(LLAMA_CPP_DIR)/include -I$(LLAMA_CPP_DIR)/ggml/include
+K3_LLAMA_CPP_DIR ?= ../misc/llama.cpp
+K3_LLAMA_CPP_BIN ?= $(K3_LLAMA_CPP_DIR)/build/bin
 
 ifeq ($(UNAME_S),Darwin)
 NATIVE_CPU_FLAG ?= -mcpu=native
@@ -45,9 +47,9 @@ endif
 CFLAGS ?= -O3 -Wall -Wextra -std=c11 $(NATIVE_CPU_FLAG)
 CPPFLAGS ?= -D_GNU_SOURCE
 
-.PHONY: all clean quants-shared quality-score quality-llama-score
+.PHONY: all clean quants-shared quality-score quality-llama-score test-k3-quants
 
-all: deepseek4-quantize $(QUANTS_SHARED)
+all: deepseek4-quantize k3-quantize $(QUANTS_SHARED)
 
 quants-shared: $(QUANTS_SHARED)
 
@@ -56,6 +58,21 @@ deepseek4-quantize: deepseek4-quantize.c quants.c quants.h
 
 $(QUANTS_SHARED): quants.c quants.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(SHARED_FLAGS) -fPIC -o $@ quants.c -lm -pthread
+
+k3-quantize: k3-quantize.c quants.c quants.h ../k3_model.c ../k3_model.h ../k3_safetensors.c ../k3_safetensors.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I.. -o $@ k3-quantize.c quants.c ../k3_model.c ../k3_safetensors.c -lm -pthread
+
+test-k3-quants: tests/test_k3_quants
+	./tests/test_k3_quants
+
+tests/test_k3_quants: tests/test_k3_quants.c quants.c quants.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-I$(K3_LLAMA_CPP_DIR)/ggml/include \
+		-I$(K3_LLAMA_CPP_DIR)/ggml/src \
+		-o $@ tests/test_k3_quants.c quants.c \
+		-L$(K3_LLAMA_CPP_BIN) \
+		-Wl,-rpath,$(abspath $(K3_LLAMA_CPP_BIN)) \
+		-lggml-base -lm -pthread
 
 quality-score:
 	$(MAKE) -C .. $(QUALITY_TARGETS)
@@ -67,3 +84,4 @@ quality-llama-score:
 clean:
 	rm -f deepseek4-quantize libds4quants.dylib libds4quants.so \
 		quality-testing/score_official quality-testing/score_llama
+	rm -f k3-quantize tests/test_k3_quants

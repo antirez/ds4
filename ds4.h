@@ -310,6 +310,7 @@ bool ds4_engine_is_glm53(ds4_engine *e);
 bool ds4_engine_is_qwen4(ds4_engine *e);
 /* Qwen3.8 reasoning-effort system instruction for a think mode (NULL when none) */
 const char *ds4_qwen4_reasoning_effort_text(ds4_think_mode mode);
+bool ds4_engine_is_k3(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 int ds4_think_mode_level(ds4_think_mode mode);
@@ -368,6 +369,7 @@ void ds4_tokens_push(ds4_tokens *tv, int token);
 void ds4_tokens_free(ds4_tokens *tv);
 void ds4_tokens_copy(ds4_tokens *dst, const ds4_tokens *src);
 bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix);
+char *ds4_xml_unescape(const char *text, size_t len);
 
 void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out);
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out);
@@ -378,13 +380,24 @@ void ds4_encode_chat_prompt(
         const char *prompt,
         ds4_think_mode think_mode,
         ds4_tokens *out);
+void ds4_chat_append_thinking_effort(ds4_engine *e, ds4_tokens *tokens,
+                                     ds4_think_mode think_mode);
 void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens);
 void ds4_chat_append_think_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode mode);
 void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role, const char *content);
+void ds4_chat_append_tool_declaration(ds4_engine *e, ds4_tokens *tokens,
+                                      const char *tools_json);
+void ds4_chat_append_tool_result(ds4_engine *e, ds4_tokens *tokens,
+                                 const char *tool, uint32_t index,
+                                 const char *content);
+void ds4_chat_append_assistant_close(ds4_engine *e, ds4_tokens *tokens);
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode);
 
 char *ds4_token_text(ds4_engine *e, int token, size_t *len);
 int ds4_token_eos(ds4_engine *e);
+/* Token to append after a completed assistant turn, or -1 when the model's
+ * chat format does not use a turn terminator. */
+int ds4_token_assistant_turn_end(ds4_engine *e);
 bool ds4_token_is_stop(ds4_engine *e, int token);
 bool ds4_token_is_thinking_control(ds4_engine *e, int token);
 bool ds4_token_is_stop_for_think_mode(ds4_engine *e,

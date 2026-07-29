@@ -367,6 +367,7 @@ static bool is_rendered_chat_prompt(const char *prompt) {
         "<|user|>",
         "<|assistant|>",
         "<|observation|>",
+        "<|open|>",
     };
     if (!prompt) return false;
     for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
@@ -381,6 +382,9 @@ typedef struct {
     FILE *fp;
     bool format_thinking;
     bool in_think;
+    bool k3;
+    bool k3_at_response_start;
+    bool k3_suppress_framing;
     bool color_open;
     bool use_color;
     bool last_output_newline;
@@ -421,6 +425,10 @@ static void token_printer_write_char(token_printer *p, char c) {
 static void token_printer_process(token_printer *p, const char *text, size_t len, bool finish) {
     const char *think_open = "<think>";
     const char *think_close = "</think>";
+    const char *response_open = "<response>";
+    const char *response_close = "</response>";
+    const char *message_close = "</message>";
+    const char *tools_open = "<tools>";
     size_t total = p->pending_len + len;
     char *buf = malloc(total ? total : 1);
     if (!buf) return;
@@ -432,13 +440,16 @@ static void token_printer_process(token_printer *p, const char *text, size_t len
     while (i < total) {
         const char *cur = buf + i;
         const size_t rem = total - i;
-        if (bytes_has_prefix(cur, rem, think_open)) {
+        if ((p->format_thinking || p->k3) &&
+            bytes_has_prefix(cur, rem, think_open)) {
             p->in_think = true;
             i += strlen(think_open);
             continue;
         }
-        if (bytes_has_prefix(cur, rem, think_close)) {
+        if ((p->format_thinking || p->k3) &&
+            bytes_has_prefix(cur, rem, think_close)) {
             p->in_think = false;
+            p->k3_at_response_start = true;
             token_printer_reset_color(p);
             if (!p->last_output_newline) {
                 fputc('\n', p->fp);
@@ -447,9 +458,32 @@ static void token_printer_process(token_printer *p, const char *text, size_t len
             i += strlen(think_close);
             continue;
         }
+        if (p->k3 && p->k3_at_response_start &&
+            bytes_has_prefix(cur, rem, response_open)) {
+            p->k3_at_response_start = false;
+            i += strlen(response_open);
+            continue;
+        }
+        if (p->k3 &&
+            (bytes_has_prefix(cur, rem, response_close) ||
+             bytes_has_prefix(cur, rem, message_close) ||
+             bytes_has_prefix(cur, rem, tools_open))) {
+            const char *marker =
+                bytes_has_prefix(cur, rem, response_close) ? response_close :
+                bytes_has_prefix(cur, rem, message_close) ? message_close :
+                tools_open;
+            p->k3_suppress_framing = true;
+            i += strlen(marker);
+            continue;
+        }
         if (!finish && cur[0] == '<' &&
             (bytes_is_partial_prefix(cur, rem, think_open) ||
-             bytes_is_partial_prefix(cur, rem, think_close)))
+             bytes_is_partial_prefix(cur, rem, think_close) ||
+             (p->k3 &&
+              (bytes_is_partial_prefix(cur, rem, response_open) ||
+               bytes_is_partial_prefix(cur, rem, response_close) ||
+               bytes_is_partial_prefix(cur, rem, message_close) ||
+               bytes_is_partial_prefix(cur, rem, tools_open)))))
         {
             if (rem < sizeof(p->pending)) {
                 memcpy(p->pending, cur, rem);
@@ -457,7 +491,19 @@ static void token_printer_process(token_printer *p, const char *text, size_t len
             }
             break;
         }
+        if (finish && p->k3 && cur[0] == '<' &&
+            (bytes_is_partial_prefix(cur, rem, response_open) ||
+             bytes_is_partial_prefix(cur, rem, response_close) ||
+             bytes_is_partial_prefix(cur, rem, message_close) ||
+             bytes_is_partial_prefix(cur, rem, tools_open))) {
+            break;
+        }
+        if (p->k3_suppress_framing) {
+            i++;
+            continue;
+        }
         token_printer_write_char(p, cur[0]);
+        if (p->k3 && !p->in_think) p->k3_at_response_start = false;
         i++;
     }
 
@@ -465,7 +511,7 @@ static void token_printer_process(token_printer *p, const char *text, size_t len
 }
 
 static void token_printer_finish(token_printer *p) {
-    if (p->format_thinking) {
+    if (p->format_thinking || p->k3) {
         token_printer_process(p, NULL, 0, true);
         token_printer_reset_color(p);
     }
@@ -483,7 +529,7 @@ static void generation_done(void *ud) {
 }
 
 static void token_printer_write_text(token_printer *p, const char *text, size_t len) {
-    if (p->format_thinking) {
+    if (p->format_thinking || p->k3) {
         token_printer_process(p, text, len, false);
     } else if (len) {
         fwrite(text, 1, len, p->fp);
@@ -529,7 +575,10 @@ static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, 
 static void cli_apply_model_sampling_defaults(
         ds4_engine             *engine,
         cli_generation_options *gen) {
-    if (!engine || !gen || !ds4_engine_is_glm_dsa(engine)) return;
+    if (!engine || !gen ||
+        (!ds4_engine_is_glm_dsa(engine) && !ds4_engine_is_k3(engine))) {
+        return;
+    }
 
     if (!gen->temperature_set) gen->temperature = 1.0f;
     if (!gen->top_p_set) gen->top_p = 0.95f;
@@ -557,6 +606,8 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         .fp = stdout,
         .format_thinking = ds4_think_mode_enabled(think_mode),
         .in_think = ds4_think_mode_enabled(think_mode),
+        .k3 = ds4_engine_is_k3(engine),
+        .k3_at_response_start = true,
         .use_color = isatty(fileno(stdout)) != 0,
         .last_output_newline = true,
     };
@@ -1239,6 +1290,7 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
     } else {
         if (cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR ||
             cfg->engine.tp.role == DS4_TP_LEADER ||
+            ds4_engine_is_k3(engine) ||
             getenv("DS4_CLI_FORCE_SESSION") != NULL ||
             cfg->gen.temperature > 0.0f ||
             ds4_engine_mtp_draft_tokens(engine) > 1) {
@@ -1253,6 +1305,8 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
                 .fp = stdout,
                 .format_thinking = ds4_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
                 .in_think = ds4_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
+                .k3 = ds4_engine_is_k3(engine),
+                .k3_at_response_start = true,
                 .use_color = isatty(fileno(stdout)) != 0,
                 .last_output_newline = true,
             };
@@ -1388,7 +1442,10 @@ static void tokens_remove(ds4_tokens *dst, int pos, int n) {
 static void repl_chat_build_think_prefix(ds4_engine *engine,
                                          ds4_think_mode mode,
                                          ds4_tokens *prefix) {
-    ds4_chat_append_think_prefix(engine, prefix, mode);
+    if (ds4_engine_is_k3(engine))
+        ds4_chat_append_thinking_effort(engine, prefix, mode);
+    else
+        ds4_chat_append_think_prefix(engine, prefix, mode);
 }
 
 /* Insert/replace the model-family thinking prefix inside the existing
@@ -1503,10 +1560,6 @@ static int repl_chat_set_ctx(ds4_engine *engine, repl_chat *chat, int ctx_size) 
     return repl_chat_create_session(engine, chat, ctx_size);
 }
 
-static bool repl_chat_assistant_turn_uses_eos(ds4_engine *engine) {
-    return !ds4_engine_is_glm_dsa(engine);
-}
-
 /* Run one interactive turn.  The transcript is tentatively extended with user
  * and assistant markers, then ds4_session_sync() decides whether this is a KV
  * continuation.  If prompt processing fails, the transcript rolls back before
@@ -1583,6 +1636,8 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
         .fp = stdout,
         .format_thinking = ds4_think_mode_enabled(think_mode),
         .in_think = ds4_think_mode_enabled(think_mode),
+        .k3 = ds4_engine_is_k3(engine),
+        .k3_at_response_start = true,
         .use_color = isatty(fileno(stdout)) != 0,
         .last_output_newline = true,
     };
@@ -1681,8 +1736,9 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
         chat->transcript.len = rollback_len;
         repl_chat_trim_images(chat, rollback_images);
         ds4_session_invalidate(chat->session);
-    } else if (repl_chat_assistant_turn_uses_eos(engine)) {
-        ds4_tokens_push(&chat->transcript, ds4_token_eos(engine));
+    } else {
+        const int turn_end = ds4_token_assistant_turn_end(engine);
+        if (turn_end >= 0) ds4_tokens_push(&chat->transcript, turn_end);
     }
 
     const double prefill_s = t_prefill1 - t_prefill0;
@@ -2348,6 +2404,13 @@ int main(int argc, char **argv) {
         return 2;
     }
     cli_apply_model_sampling_defaults(engine, &cfg.gen);
+    if (cfg.inspect) {
+        ds4_engine_summary(engine);
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return 0;
+    }
     if (cfg.engine.tp.role == DS4_TP_WORKER) {
         int rc = ds4_tp_worker_run(engine, &cfg.engine.tp);
         ds4_engine_close(engine);
@@ -2403,17 +2466,13 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return rc;
     }
-    if (!cfg.inspect) {
-        log_context_memory(cfg.engine.backend,
-                           cfg.gen.ctx_size,
-                           ds4_engine_prefill_chunk(engine),
-                           cfg.engine.ssd_streaming);
-        cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
-    }
+    log_context_memory(cfg.engine.backend,
+                       cfg.gen.ctx_size,
+                       ds4_engine_prefill_chunk(engine),
+                       cfg.engine.ssd_streaming);
+    cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
     int rc = 0;
-    if (cfg.inspect) {
-        ds4_engine_summary(engine);
-    } else if (cfg.gen.imatrix_output_path) {
+    if (cfg.gen.imatrix_output_path) {
         rc = ds4_engine_collect_imatrix(engine,
                                         cfg.gen.imatrix_dataset_path,
                                         cfg.gen.imatrix_output_path,

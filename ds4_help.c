@@ -146,7 +146,8 @@ static const char *tool_summary(ds4_help_tool tool) {
 static void print_model_runtime(FILE *fp, const help_colors *c,
                                 ds4_help_tool tool, bool full) {
     title(fp, c, "Model And Runtime");
-    opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ds4flash.gguf");
+    opt(fp, c, "-m, --model PATH",
+        "Supported GGUF file or Kimi K3 SafeTensors directory. Default: ds4flash.gguf");
     if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
         opt(fp, c, "--vision FILE", "Vision encoder GGUF for the selected model.");
     }
@@ -211,7 +212,7 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full, ds4_help_t
     opt(fp, c, "--top-p F", "Nucleus sampling probability.");
     opt(fp, c, "--min-p F", "Keep tokens scoring at least F times the top token.");
     opt(fp, c, "--seed N", "Sampling seed for reproducible non-greedy runs.");
-    para(fp, c, "GLM CLI and agent runs default to temperature 1.0, top-p 0.95, and min-p 0 unless those options are set explicitly.");
+    para(fp, c, "GLM CLI/agent and K3 CLI/eval runs default to temperature 1.0, top-p 0.95, and min-p 0. K3 agent runs use top-p 1.0. Explicit options override these defaults.");
     opt(fp, c, "--think", "Use normal thinking mode (V4.1: effort 75).");
     opt(fp, c, "--think-max", "Use maximum thinking (V4.1: 100; V4: requires ctx >= 393216).");
     if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT)
@@ -245,7 +246,7 @@ static void print_distributed(FILE *fp, const help_colors *c) {
     opt(fp, c, "--coordinator HOST PORT", "Coordinator address for --role worker.");
     opt(fp, c, "--dist-prefill-chunk N", "Coordinator prefill pipeline chunk size. Default: session cap.");
     opt(fp, c, "--dist-prefill-window N", "Max prefill chunks in flight. Default: workers+2, capped at 8.");
-    opt(fp, c, "--dist-activation-bits N", "Hidden-state transport width: 32, 16, or 8. Default: 32");
+    opt(fp, c, "--dist-activation-bits N", "Hidden-state transport width: 32, 16, or 8. Kimi K3 requires 32.");
     opt(fp, c, "--dist-replay-check", "Diagnostic: reset and replay prompt, then compare logits.");
     opt(fp, c, "--debug", "Print coordinator route/debug logs.");
     fputc('\n', fp);
@@ -351,7 +352,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
     opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128; GLM-5.3 minimum: 1024");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
-    para(fp, c, "Model endpoint aliases include deepseek-v4-flash and deepseek-v4-pro; both serve the loaded GGUF.");
+    para(fp, c, "Model endpoint aliases are restricted to the loaded family: deepseek-v4-flash/pro, glm-5.2 variants, or kimi-k3.");
     fputc('\n', fp);
 }
 

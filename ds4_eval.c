@@ -1215,6 +1215,9 @@ typedef struct {
     bool list_cases;
     bool retry_incomplete;
     bool max_tokens_set;
+    bool temperature_set;
+    bool top_p_set;
+    bool min_p_set;
 } eval_config;
 
 typedef struct {
@@ -1684,10 +1687,13 @@ static eval_config parse_options(int argc, char **argv) {
             c.retry_incomplete = true;
         } else if (!strcmp(arg, "--temp")) {
             c.temperature = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
+            c.temperature_set = true;
         } else if (!strcmp(arg, "--top-p")) {
             c.top_p = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
+            c.top_p_set = true;
         } else if (!strcmp(arg, "--min-p")) {
             c.min_p = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
+            c.min_p_set = true;
         } else if (!strcmp(arg, "--seed")) {
             c.seed = parse_u64_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--trace")) {
@@ -4814,6 +4820,11 @@ int main(int argc, char **argv) {
         free(case_sequence);
         free(cases);
         return 1;
+    }
+    if (ds4_engine_is_k3(engine)) {
+        if (!cfg.temperature_set) cfg.temperature = 1.0f;
+        if (!cfg.top_p_set) cfg.top_p = 0.95f;
+        if (!cfg.min_p_set) cfg.min_p = 0.0f;
     }
 
     int max_prompt_tokens = 0;

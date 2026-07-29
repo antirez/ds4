@@ -903,9 +903,14 @@ int main(int argc, char **argv) {
             }
             const int token = cfg.teacher_forced_decode
                 ? prompt.v[frontier + gen_done]
-                : ds4_session_argmax_excluding(session, eos);
+                : ds4_engine_is_k3(engine)
+                    ? ds4_session_argmax_ignoring_eos(session, DS4_THINK_HIGH)
+                    : ds4_session_argmax_excluding(session, eos);
             if (token < 0) {
-                fprintf(stderr, "ds4-bench: failed to choose non-EOS token at frontier %d\n", frontier);
+                fprintf(stderr,
+                        "ds4-bench: failed to choose non-stop token at "
+                        "frontier %d\n",
+                        frontier);
                 rc = 1;
                 break;
             }

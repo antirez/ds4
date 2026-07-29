@@ -84,6 +84,11 @@ static ds4_tp *g_tp_block_ctx;
  * the packer in multi-tier mode, but the headers are tiny and C-safe). */
 #include "ds4_layer_pack.h"
 #include "ds4_gpu_mgpu.h"
+#include "k3_model.h"
+#include "k3_tokenizer.h"
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#include "k3_infer.h"
+#endif
 
 #define DS4_CUDA_TP_PEER_TMP_BYTES \
     ((uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float) + 128u)
@@ -40839,6 +40844,42 @@ void ds4_tokens_free(ds4_tokens *tv) {
     token_vec_free(tv);
 }
 
+char *ds4_xml_unescape(const char *text, size_t len) {
+    const char *p = text ? text : "";
+    const char *end = p + (text ? len : 0);
+    char *out = xmalloc(len + 1u);
+    size_t out_len = 0;
+    while (p < end) {
+        if (*p != '&') {
+            out[out_len++] = *p++;
+        } else if ((size_t)(end - p) >= 5 &&
+                   !memcmp(p, "&amp;", 5)) {
+            out[out_len++] = '&';
+            p += 5;
+        } else if ((size_t)(end - p) >= 4 &&
+                   !memcmp(p, "&lt;", 4)) {
+            out[out_len++] = '<';
+            p += 4;
+        } else if ((size_t)(end - p) >= 4 &&
+                   !memcmp(p, "&gt;", 4)) {
+            out[out_len++] = '>';
+            p += 4;
+        } else if ((size_t)(end - p) >= 6 &&
+                   !memcmp(p, "&quot;", 6)) {
+            out[out_len++] = '"';
+            p += 6;
+        } else if ((size_t)(end - p) >= 6 &&
+                   !memcmp(p, "&apos;", 6)) {
+            out[out_len++] = '\'';
+            p += 6;
+        } else {
+            out[out_len++] = *p++;
+        }
+    }
+    out[out_len] = '\0';
+    return out;
+}
+
 void ds4_tokens_copy(ds4_tokens *dst, const ds4_tokens *src) {
     dst->len = 0;
     for (int i = 0; i < src->len; i++) token_vec_push(dst, src->v[i]);
@@ -43235,6 +43276,21 @@ struct ds4_engine {
     bool vision_ready;
     bool vision_map_ready;
     bool share_session_prefill_workspace;
+    bool is_k3;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    k3_context *k3_primary;
+    k3_tokenizer *k3_tokenizer;
+    pthread_mutex_t k3_lifecycle_mutex;
+    pthread_mutex_t k3_tokenizer_mutex;
+    bool k3_lifecycle_mutex_ready;
+    bool k3_tokenizer_mutex_ready;
+    bool k3_primary_leased;
+    bool k3_has_output;
+    bool k3_gguf;
+    uint32_t k3_layer_start;
+    uint32_t k3_layer_end;
+    uint64_t k3_model_bytes;
+#endif
 #ifndef DS4_NO_GPU
     bool shared_prefill_workspace_ready;
     ds4_gpu_graph shared_prefill_workspace;
@@ -44515,7 +44571,33 @@ static void encode_chat_prompt(
     }
 }
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+static void ds4_k3_tokens_commit(k3_tokens *src, token_vec *dst,
+                                 int ok, const char *err) {
+    if (!ok) {
+        k3_tokens_free(src);
+        ds4_die(err && err[0] ? err : "Kimi K3 tokenization failed");
+    }
+    for (uint32_t i = 0; i < src->count; i++) {
+        token_vec_push(dst, src->data[i]);
+    }
+    k3_tokens_free(src);
+}
+#endif
+
 void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (e && e->is_k3) {
+        k3_tokens result = {0};
+        char err[256] = {0};
+        pthread_mutex_lock(&e->k3_tokenizer_mutex);
+        const int ok = k3_tokenizer_encode(
+            e->k3_tokenizer, text ? text : "", &result, err, sizeof(err));
+        pthread_mutex_unlock(&e->k3_tokenizer_mutex);
+        ds4_k3_tokens_commit(&result, out, ok, err);
+        return;
+    }
+#endif
     bpe_tokenize_text(&e->vocab, text ? text : "", out);
 }
 
@@ -44594,10 +44676,28 @@ static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *tex
 }
 
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (e && e->is_k3) {
+        k3_tokens result = {0};
+        char err[256] = {0};
+        pthread_mutex_lock(&e->k3_tokenizer_mutex);
+        const int ok = k3_tokenizer_encode_rendered(
+            e->k3_tokenizer, text ? text : "", &result, err, sizeof(err));
+        pthread_mutex_unlock(&e->k3_tokenizer_mutex);
+        ds4_k3_tokens_commit(&result, out, ok, err);
+        return;
+    }
+#endif
     tokenize_rendered_chat_vocab(&e->vocab, text, out);
 }
 
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (e && e->is_k3) {
+        (void)tokens;
+        return;
+    }
+#endif
     chat_push_bos_sequence(&e->vocab, tokens);
 }
 
@@ -44607,14 +44707,54 @@ void ds4_encode_chat_prompt(
         const char *prompt,
         ds4_think_mode think_mode,
         ds4_tokens *out) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (e && e->is_k3) {
+        k3_tokens result = {0};
+        char err[256] = {0};
+        int ok = 1;
+        pthread_mutex_lock(&e->k3_tokenizer_mutex);
+        if (ds4_think_mode_enabled(think_mode)) {
+            ok = k3_tokenizer_append_thinking_effort(
+                e->k3_tokenizer,
+                think_mode == DS4_THINK_MAX ? "max" : "high",
+                &result, err, sizeof(err));
+        }
+        if (ok && system && system[0]) {
+            ok = k3_tokenizer_append_message(
+                e->k3_tokenizer, "system", system,
+                &result, err, sizeof(err));
+        }
+        if (ok) {
+            ok = k3_tokenizer_append_message(
+                e->k3_tokenizer, "user", prompt ? prompt : "",
+                &result, err, sizeof(err));
+        }
+        if (ok) {
+            ok = k3_tokenizer_append_assistant_prefix(
+                e->k3_tokenizer, ds4_think_mode_enabled(think_mode),
+                &result, err, sizeof(err));
+        }
+        pthread_mutex_unlock(&e->k3_tokenizer_mutex);
+        ds4_k3_tokens_commit(&result, out, ok, err);
+        return;
+    }
+#endif
     encode_chat_prompt(&e->vocab, system, prompt ? prompt : "", think_mode, out);
 }
 
 void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens) {
+    if (e && e->is_k3) {
+        ds4_chat_append_thinking_effort(e, tokens, DS4_THINK_MAX);
+        return;
+    }
     chat_push_think_prefix(&e->vocab, DS4_THINK_MAX, tokens);
 }
 
 void ds4_chat_append_think_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode mode) {
+    if (e && e->is_k3) {
+        ds4_chat_append_thinking_effort(e, tokens, mode);
+        return;
+    }
     chat_push_think_prefix(&e->vocab, mode, tokens);
 }
 
@@ -44630,6 +44770,31 @@ static void ds41_chat_system_marker(const ds4_vocab *vocab, ds4_tokens *tokens) 
         if (tokens->v[i] == vocab->system_id) has_system = true;
     }
     if (!has_system) token_vec_push(tokens, vocab->system_id);
+}
+
+void ds4_chat_append_thinking_effort(ds4_engine *e, ds4_tokens *tokens,
+                                     ds4_think_mode think_mode) {
+    if (!e || !tokens || !ds4_think_mode_enabled(think_mode)) return;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (e->is_k3) {
+        k3_tokens result = {0};
+        char err[256] = {0};
+        pthread_mutex_lock(&e->k3_tokenizer_mutex);
+        const int ok = k3_tokenizer_append_thinking_effort(
+            e->k3_tokenizer,
+            think_mode == DS4_THINK_MAX ? "max" : "high",
+            &result, err, sizeof(err));
+        pthread_mutex_unlock(&e->k3_tokenizer_mutex);
+        ds4_k3_tokens_commit(&result, tokens, ok, err);
+        return;
+    }
+#endif
+    if (ds4_engine_is_glm_dsa(e)) {
+        const char *effort = ds4_glm_reasoning_effort_text(think_mode);
+        if (effort) ds4_chat_append_message(e, tokens, "system", effort);
+    } else if (think_mode == DS4_THINK_MAX) {
+        ds4_chat_append_max_effort_prefix(e, tokens);
+    }
 }
 
 static void bpe_tokenize_wrapped_payload_text(ds4_vocab *vocab, const char *content,
@@ -44662,6 +44827,18 @@ static void bpe_tokenize_tool_response_text(ds4_vocab *vocab, const char *conten
 }
 
 void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role, const char *content) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (e && e->is_k3) {
+        k3_tokens result = {0};
+        char err[256] = {0};
+        pthread_mutex_lock(&e->k3_tokenizer_mutex);
+        const int ok = k3_tokenizer_append_message(
+            e->k3_tokenizer, role, content, &result, err, sizeof(err));
+        pthread_mutex_unlock(&e->k3_tokenizer_mutex);
+        ds4_k3_tokens_commit(&result, tokens, ok, err);
+        return;
+    }
+#endif
     ds4_vocab *vocab = &e->vocab;
     if (!role) role = "user";
     if (!content) content = "";
@@ -44731,7 +44908,77 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     }
 }
 
+void ds4_chat_append_tool_declaration(ds4_engine *e, ds4_tokens *tokens,
+                                      const char *tools_json) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (e && e->is_k3) {
+        k3_tokens result = {0};
+        char err[256] = {0};
+        pthread_mutex_lock(&e->k3_tokenizer_mutex);
+        const int ok = k3_tokenizer_append_tool_declaration(
+            e->k3_tokenizer, tools_json ? tools_json : "[]",
+            &result, err, sizeof(err));
+        pthread_mutex_unlock(&e->k3_tokenizer_mutex);
+        ds4_k3_tokens_commit(&result, tokens, ok, err);
+        return;
+    }
+#endif
+    ds4_chat_append_message(e, tokens, "system", tools_json ? tools_json : "[]");
+}
+
+void ds4_chat_append_tool_result(ds4_engine *e, ds4_tokens *tokens,
+                                 const char *tool, uint32_t index,
+                                 const char *content) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (e && e->is_k3) {
+        k3_tokens result = {0};
+        char err[256] = {0};
+        pthread_mutex_lock(&e->k3_tokenizer_mutex);
+        const int ok = k3_tokenizer_append_tool_result(
+            e->k3_tokenizer, tool, index, content,
+            &result, err, sizeof(err));
+        pthread_mutex_unlock(&e->k3_tokenizer_mutex);
+        ds4_k3_tokens_commit(&result, tokens, ok, err);
+        return;
+    }
+#endif
+    (void)tool;
+    (void)index;
+    ds4_chat_append_message(e, tokens, "tool", content);
+}
+
+void ds4_chat_append_assistant_close(ds4_engine *e, ds4_tokens *tokens) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (e && e->is_k3) {
+        k3_tokens result = {0};
+        char err[256] = {0};
+        pthread_mutex_lock(&e->k3_tokenizer_mutex);
+        const int ok = k3_tokenizer_append_assistant_close(
+            e->k3_tokenizer, &result, err, sizeof(err));
+        pthread_mutex_unlock(&e->k3_tokenizer_mutex);
+        ds4_k3_tokens_commit(&result, tokens, ok, err);
+        return;
+    }
+#endif
+    (void)e;
+    (void)tokens;
+}
+
+
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (e && e->is_k3) {
+        k3_tokens result = {0};
+        char err[256] = {0};
+        pthread_mutex_lock(&e->k3_tokenizer_mutex);
+        const int ok = k3_tokenizer_append_assistant_prefix(
+            e->k3_tokenizer, ds4_think_mode_enabled(think_mode),
+            &result, err, sizeof(err));
+        pthread_mutex_unlock(&e->k3_tokenizer_mutex);
+        ds4_k3_tokens_commit(&result, tokens, ok, err);
+        return;
+    }
+#endif
     if (ds4_model_is_qwen4()) {
         qwen4_chat_assistant_prefix(&e->vocab, think_mode, tokens);
         return;
@@ -44823,6 +45070,29 @@ static bool vocab_token_is_literal_special(ds4_str s) {
 }
 
 char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (e && e->is_k3) {
+        const char *structural = NULL;
+        if (token == K3_TOKEN_OPEN) structural = "<";
+        else if (token == K3_TOKEN_CLOSE) structural = "</";
+        else if (token == K3_TOKEN_SEP) structural = ">";
+        if (structural) {
+            const size_t n = strlen(structural);
+            char *out = xmalloc(n + 1u);
+            memcpy(out, structural, n + 1u);
+            if (len) *len = n;
+            return out;
+        }
+        uint32_t n = 0;
+        const uint8_t *bytes = k3_tokenizer_token_bytes(
+            e->k3_tokenizer, token, &n);
+        char *out = xmalloc((size_t)n + 1u);
+        if (n) memcpy(out, bytes, n);
+        out[n] = '\0';
+        if (len) *len = n;
+        return out;
+    }
+#endif
     ds4_vocab *vocab = &e->vocab;
     if (token < 0 || token >= vocab->n_vocab) {
         if (len) *len = 0;
@@ -44866,15 +45136,29 @@ static bool vocab_token_is_generation_stop(const ds4_vocab *vocab, int token) {
 }
 
 int ds4_token_eos(ds4_engine *e) {
+    if (e && e->is_k3) return K3_TOKEN_END_OF_MSG;
+    return e->vocab.eos_id;
+}
+
+int ds4_token_assistant_turn_end(ds4_engine *e) {
+    if (!e) return -1;
+    if (e->is_k3) return K3_TOKEN_END_OF_MSG;
+    if (ds4_engine_is_glm_dsa(e)) return -1;
     return e->vocab.eos_id;
 }
 
 bool ds4_token_is_stop(ds4_engine *e, int token) {
+    if (e && e->is_k3) {
+        return token == K3_TOKEN_EOS ||
+               token == K3_TOKEN_END_OF_MSG ||
+               token == K3_TOKEN_EOT;
+    }
     return e ? vocab_token_is_generation_stop(&e->vocab, token) : false;
 }
 
 bool ds4_token_is_thinking_control(ds4_engine *e, int token) {
     if (!e || token < 0) return false;
+    if (e->is_k3) return false;
     return (e->vocab.think_start_id >= 0 &&
             token == e->vocab.think_start_id) ||
            (e->vocab.think_end_id >= 0 &&
@@ -61173,6 +61457,10 @@ struct ds4_session {
     ds4_dist_session *distributed;
     uint64_t tp_session_id;
     uint64_t glm_reserved_graph_bytes;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    k3_context *k3;
+    bool k3_primary;
+#endif
 #ifndef DS4_NO_GPU
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     ds41_gpu_graph ds41_graph;
@@ -61694,6 +61982,9 @@ static void ds4_session_dspark_scheduler_note(
  */
 
 #define DS4_SESSION_IO_CHUNK (8u * 1024u * 1024u)
+#define DS4_K3_SESSION_PAYLOAD_MAGIC UINT32_C(0x3356534b) /* "KSV3" */
+#define DS4_K3_SESSION_PAYLOAD_VERSION UINT32_C(1)
+#define DS4_K3_SESSION_PAYLOAD_U32_FIELDS 6u
 
 static void payload_set_err(char *err, size_t errlen, const char *msg) {
     if (errlen != 0) snprintf(err, errlen, "%s", msg);
@@ -62211,7 +62502,12 @@ static bool ds4_session_is_cpu(const ds4_session *s) {
 }
 
 static bool ds4_session_is_ds41(const ds4_session *s) {
-    return s && s->engine && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;
+    return s && s->engine && !s->engine->is_k3 &&
+           DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;
+}
+
+static bool ds4_session_is_k3(const ds4_session *s) {
+    return s && s->engine && s->engine->is_k3;
 }
 
 static void ds4_session_dspark_capture_invalidate(ds4_session *s) {
@@ -62221,7 +62517,7 @@ static void ds4_session_dspark_capture_invalidate(ds4_session *s) {
     s->dspark_draft_valid = false;
     s->dspark_draft_len = 0;
     s->dspark_tp_proposal = false;
-    if (ds4_session_is_cpu(s)) return;
+    if (ds4_session_is_cpu(s) || ds4_session_is_k3(s)) return;
     metal_graph_dspark_capture_invalidate(&s->graph);
 #else
     (void)s;
@@ -62230,7 +62526,7 @@ static void ds4_session_dspark_capture_invalidate(ds4_session *s) {
 
 static void ds4_session_dspark_capture_note_checkpoint(ds4_session *s) {
 #ifndef DS4_NO_GPU
-    if (!s || ds4_session_is_cpu(s)) return;
+    if (!s || ds4_session_is_cpu(s) || ds4_session_is_k3(s)) return;
     ds4_gpu_graph *g = &s->graph;
     if (!g->dspark_capture_enabled) return;
     if (!s->checkpoint_valid || s->checkpoint.len <= 0 || !g->dspark_capture_valid) {
@@ -62244,11 +62540,12 @@ static void ds4_session_dspark_capture_note_checkpoint(ds4_session *s) {
 }
 
 static bool ds4_session_is_glm(const ds4_session *s) {
-    return s && s->engine && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
+    return s && s->engine && !s->engine->is_k3 &&
+           DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
 }
 
 static bool ds4_session_is_qwen4(const ds4_session *s) {
-    return s && s->engine && ds4_model_is_qwen4();
+    return s && s->engine && !s->engine->is_k3 && ds4_model_is_qwen4();
 }
 
 #ifndef DS4_NO_GPU
@@ -62354,6 +62651,7 @@ static bool ds4_layer_payload_range_valid(uint32_t layer_start, uint32_t layer_e
 uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
                                          uint32_t layer_start,
                                          uint32_t layer_end) {
+    if (ds4_session_is_k3(s)) return 0;
     if (!s || !s->checkpoint_valid ||
         !ds4_layer_payload_range_valid(layer_start, layer_end))
         return 0;
@@ -62423,6 +62721,11 @@ uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
 int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
                                    uint32_t layer_start, uint32_t layer_end,
                                    char *err, size_t errlen) {
+    if (ds4_session_is_k3(s)) {
+        payload_set_err(err, errlen,
+                        "Kimi K3 does not support distributed layer payloads");
+        return 1;
+    }
     if (!s || !fp || !s->checkpoint_valid ||
         !ds4_layer_payload_range_valid(layer_start, layer_end)) {
         payload_set_err(err, errlen, "invalid session layer payload save");
@@ -62691,6 +62994,11 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                    const int *tokens, uint32_t n_tokens,
                                    uint32_t layer_start, uint32_t layer_end,
                                    char *err, size_t errlen) {
+    if (ds4_session_is_k3(s)) {
+        payload_set_err(err, errlen,
+                        "Kimi K3 does not support distributed layer payloads");
+        return 1;
+    }
     if (!s || !fp || !tokens ||
         !ds4_layer_payload_range_valid(layer_start, layer_end)) {
         payload_set_err(err, errlen, "invalid session layer payload load");
@@ -63160,6 +63468,13 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
 
 int ds4_engine_routed_quant_bits(ds4_engine *e) {
     if (!e) return 0;
+    if (e->is_k3) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        return e->k3_gguf ? 2 : 4;
+#else
+        return 4;
+#endif
+    }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_tensor *gate = e->weights.layer[il].ffn_gate_exps;
         if (!gate) continue;
@@ -63170,6 +63485,13 @@ int ds4_engine_routed_quant_bits(ds4_engine *e) {
 }
 
 bool ds4_engine_has_output_head(ds4_engine *e) {
+    if (e && e->is_k3) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        return e->k3_has_output;
+#else
+        return false;
+#endif
+    }
     return e && weights_have_output_head(&e->weights);
 }
 
@@ -63528,6 +63850,11 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
 #endif
     }
     if (!s || !s->checkpoint_valid) return 0;
+    if (ds4_session_is_k3(s)) {
+        return (uint64_t)DS4_K3_SESSION_PAYLOAD_U32_FIELDS *
+                   sizeof(uint32_t) +
+               (uint64_t)s->checkpoint.len * sizeof(uint32_t);
+    }
     if (s->distributed) return 0;
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s)) {
@@ -63901,6 +64228,26 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
     }
+    if (ds4_session_is_k3(s)) {
+        const uint32_t header[DS4_K3_SESSION_PAYLOAD_U32_FIELDS] = {
+            DS4_K3_SESSION_PAYLOAD_MAGIC,
+            DS4_K3_SESSION_PAYLOAD_VERSION,
+            (uint32_t)s->ctx_size,
+            s->prefill_cap,
+            (uint32_t)s->checkpoint.len,
+            K3_N_VOCAB,
+        };
+        for (uint32_t i = 0; i < DS4_K3_SESSION_PAYLOAD_U32_FIELDS; i++) {
+            if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
+        }
+        for (int i = 0; i < s->checkpoint.len; i++) {
+            if (payload_write_u32(
+                    fp, (uint32_t)s->checkpoint.v[i], err, errlen) != 0) {
+                return 1;
+            }
+        }
+        return 0;
+    }
     if (s->distributed) {
         return ds4_dist_session_save_payload(s->distributed, s, fp, err, errlen);
     }
@@ -64252,9 +64599,113 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
     }
-    if (s->distributed) {
+    if (s->distributed && !ds4_session_is_k3(s)) {
         return ds4_dist_session_load_payload(s->distributed, s, fp, payload_bytes, err, errlen);
     }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (ds4_session_is_k3(s)) {
+        uint64_t remaining = payload_bytes;
+        uint32_t h[DS4_K3_SESSION_PAYLOAD_U32_FIELDS];
+        for (uint32_t i = 0; i < DS4_K3_SESSION_PAYLOAD_U32_FIELDS; i++) {
+            if (payload_read_u32(
+                    fp, &h[i], &remaining, err, errlen) != 0) {
+                return 1;
+            }
+        }
+        if (h[0] != DS4_K3_SESSION_PAYLOAD_MAGIC ||
+            h[1] != DS4_K3_SESSION_PAYLOAD_VERSION) {
+            payload_set_err(err, errlen,
+                            "unsupported Kimi K3 session payload version");
+            return 1;
+        }
+        const uint32_t saved_tokens = h[4];
+        if (h[2] > (uint32_t)s->ctx_size ||
+            saved_tokens == 0 ||
+            saved_tokens >= (uint32_t)s->ctx_size) {
+            payload_set_err(
+                err, errlen, "Kimi K3 checkpoint does not fit current context");
+            return 1;
+        }
+        if (h[5] != K3_N_VOCAB ||
+            remaining != (uint64_t)saved_tokens * sizeof(uint32_t)) {
+            payload_set_err(
+                err, errlen, "invalid Kimi K3 session payload layout");
+            return 1;
+        }
+
+        token_vec new_checkpoint = {0};
+        for (uint32_t i = 0; i < saved_tokens; i++) {
+            uint32_t token = 0;
+            if (payload_read_u32(
+                    fp, &token, &remaining, err, errlen) != 0) {
+                token_vec_free(&new_checkpoint);
+                return 1;
+            }
+            if (token >= K3_N_VOCAB) {
+                token_vec_free(&new_checkpoint);
+                payload_set_err(
+                    err, errlen, "Kimi K3 checkpoint token is outside vocabulary");
+                return 1;
+            }
+            token_vec_push(&new_checkpoint, (int)token);
+        }
+        if (remaining != 0) {
+            token_vec_free(&new_checkpoint);
+            payload_set_err(
+                err, errlen, "Kimi K3 checkpoint has trailing payload bytes");
+            return 1;
+        }
+
+        s->checkpoint_valid = false;
+        s->mtp_draft_valid = false;
+        if (s->distributed) {
+            s->checkpoint.len = 0;
+            if (!k3_context_reset(s->k3, err, errlen)) {
+                token_vec_free(&new_checkpoint);
+                return 1;
+            }
+            const int rc = ds4_dist_session_sync(
+                s->distributed,
+                s,
+                NULL,
+                &new_checkpoint,
+                s->logits,
+                err,
+                errlen);
+            token_vec_free(&new_checkpoint);
+            if (rc != 0) {
+                s->checkpoint_valid = false;
+                return rc;
+            }
+            s->checkpoint_valid = true;
+            return 0;
+        }
+        if (!k3_context_reset(s->k3, err, errlen)) {
+            token_vec_free(&new_checkpoint);
+            return 1;
+        }
+        uint32_t start = 0;
+        while (start < saved_tokens) {
+            uint32_t rows = saved_tokens - start;
+            if (rows > s->prefill_cap) rows = s->prefill_cap;
+            if (!k3_context_prefill(
+                    s->k3,
+                    (const int32_t *)(new_checkpoint.v + start),
+                    rows,
+                    s->logits,
+                    err,
+                    errlen)) {
+                token_vec_free(&new_checkpoint);
+                return 1;
+            }
+            start += rows;
+        }
+        token_vec_free(&s->checkpoint);
+        s->checkpoint = new_checkpoint;
+        s->checkpoint_valid = true;
+        return 0;
+    }
+#endif
     uint64_t remaining = payload_bytes;
     uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS];
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
@@ -64955,11 +65406,78 @@ void ds4_session_snapshot_free(ds4_session_snapshot *snap) {
     memset(snap, 0, sizeof(*snap));
 }
 
+static bool ds4_model_path_is_k3(const char *path);
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+static void dump_k3_tokens_fp(
+        FILE *fp,
+        const k3_tokenizer *tokenizer,
+        const int32_t *tokens,
+        uint32_t count) {
+    fprintf(fp, "[");
+    for (uint32_t i = 0; i < count; i++) {
+        if (i) fprintf(fp, ", ");
+        fprintf(fp, "%d", tokens[i]);
+    }
+    fprintf(fp, "]\n");
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t len = 0;
+        const uint8_t *text =
+            k3_tokenizer_token_bytes(tokenizer, tokens[i], &len);
+        fprintf(fp, "%6d  ", tokens[i]);
+        if (text && len != 0) fwrite(text, 1, len, fp);
+        fputc('\n', fp);
+    }
+}
+#endif
+
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (e && e->is_k3) {
+        dump_k3_tokens_fp(
+            stdout,
+            e->k3_tokenizer,
+            (const int32_t *)tokens->v,
+            (uint32_t)tokens->len);
+        return;
+    }
+#endif
     dump_tokens(&e->vocab, tokens);
 }
 
 int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp) {
+    if (ds4_model_path_is_k3(model_path)) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        k3_tokenizer *tokenizer = NULL;
+        k3_tokens tokens = {0};
+        char err[256] = {0};
+        if (!fp) fp = stdout;
+        const int ok =
+            k3_tokenizer_open(
+                &tokenizer, model_path, err, sizeof(err)) &&
+            k3_tokenizer_encode_rendered(
+                tokenizer, text ? text : "", &tokens, err, sizeof(err));
+        if (!ok) {
+            fprintf(stderr, "ds4: Kimi K3 tokenizer: %s\n",
+                    err[0] ? err : "tokenization failed");
+            k3_tokens_free(&tokens);
+            k3_tokenizer_close(tokenizer);
+            return 1;
+        }
+        dump_k3_tokens_fp(
+            fp, tokenizer, tokens.data, tokens.count);
+        k3_tokens_free(&tokens);
+        k3_tokenizer_close(tokenizer);
+        return ferror(fp) ? 1 : 0;
+#else
+        (void)text;
+        (void)fp;
+        fprintf(stderr,
+                "ds4: this build does not include the Apple Metal Kimi K3 backend\n");
+        return 1;
+#endif
+    }
+
     ds4_model model;
     ds4_vocab vocab;
     token_vec tokens = {0};
@@ -71644,6 +72162,193 @@ static void tp_dspark_split_meta(const ds4_engine *e, uint8_t meta[DS4_TP_DSPARK
 
 static int engine_install_dspark_support_cache(ds4_engine *e);
 static int engine_install_gpu_placement(ds4_engine *e);
+static bool ds4_model_path_is_k3(const char *path) {
+    if (!path || !path[0]) return false;
+    struct stat st;
+    if (stat(path, &st) != 0) return false;
+    if (S_ISREG(st.st_mode)) {
+        char error[256] = {0};
+        k3_st_shard *gguf = NULL;
+        const bool result =
+            k3_st_open(&gguf, path, error, sizeof(error)) &&
+            k3_st_is_gguf(gguf) &&
+            k3_st_find(gguf, "blk.1.ffn_gate_exps.weight") != NULL &&
+            k3_st_find(
+                gguf,
+                "language_model.model.layers.0.input_layernorm.weight") != NULL;
+        k3_st_close(gguf);
+        return result;
+    }
+    if (!S_ISDIR(st.st_mode)) return false;
+    static const char *required[] = {
+        "config.json",
+        "model.safetensors.index.json",
+        "tiktoken.model",
+    };
+    char filename[PATH_MAX];
+    for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
+        const int n = snprintf(
+            filename, sizeof(filename), "%s%s%s", path,
+            path[strlen(path) - 1u] == '/' ? "" : "/", required[i]);
+        if (n <= 0 || (size_t)n >= sizeof(filename) ||
+            stat(filename, &st) != 0 || !S_ISREG(st.st_mode)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+static uint64_t ds4_k3_checkpoint_bytes(const char *directory) {
+    struct stat model_stat;
+    if (stat(directory, &model_stat) == 0 &&
+        S_ISREG(model_stat.st_mode) && model_stat.st_size >= 0) {
+        return (uint64_t)model_stat.st_size;
+    }
+    uint64_t total = 0;
+    char path[PATH_MAX];
+    for (uint32_t i = 1; i <= 96; i++) {
+        const int n = snprintf(
+            path, sizeof(path), "%s%smodel-%05u-of-000096.safetensors",
+            directory,
+            directory[strlen(directory) - 1u] == '/' ? "" : "/",
+            i);
+        struct stat st;
+        if (n <= 0 || (size_t)n >= sizeof(path) ||
+            stat(path, &st) != 0 || st.st_size < 0) {
+            return 0;
+        }
+        if ((uint64_t)st.st_size > UINT64_MAX - total) return 0;
+        total += (uint64_t)st.st_size;
+    }
+    return total;
+}
+
+static int ds4_engine_open_k3(ds4_engine *e,
+                              const ds4_engine_options *opt) {
+    if (opt->backend != DS4_BACKEND_METAL) {
+        fprintf(stderr,
+                "ds4: Kimi K3 inference currently requires --metal\n");
+        return 0;
+    }
+    const bool distributed =
+        opt->distributed.role != DS4_DISTRIBUTED_NONE;
+    if (opt->mtp_path || opt->tp.role != DS4_TP_NONE ||
+        (opt->load_slice && !distributed) ||
+        opt->directional_steering_file || opt->first_token_test ||
+        opt->metal_graph_test || opt->power_percent < 0 ||
+        (opt->power_percent > 0 && opt->power_percent != 100)) {
+        fprintf(stderr,
+                "ds4: Kimi K3 does not support support-model, tensor-parallel, "
+                "manual slices, steering, graph-test, or reduced-power options\n");
+        return 0;
+    }
+    uint32_t layer_start = 0;
+    uint32_t layer_end = K3_N_LAYER - 1u;
+    bool has_output = true;
+    if (distributed) {
+        if (!opt->distributed.layers.set) {
+            fprintf(stderr,
+                    "ds4: distributed Kimi K3 requires an explicit layer range\n");
+            return 0;
+        }
+        layer_start = opt->distributed.layers.start;
+        layer_end = opt->distributed.layers.has_output
+            ? K3_N_LAYER - 1u
+            : opt->distributed.layers.end;
+        has_output = opt->distributed.layers.has_output;
+        if (layer_start > layer_end || layer_end >= K3_N_LAYER ||
+            (opt->distributed.role == DS4_DISTRIBUTED_COORDINATOR &&
+             layer_start != 0)) {
+            fprintf(stderr,
+                    "ds4: invalid distributed Kimi K3 layer range %u:%u\n",
+                    layer_start, layer_end);
+            return 0;
+        }
+    }
+    const uint32_t requested_prefill =
+        opt->prefill_chunk ? opt->prefill_chunk : 512u;
+    const uint32_t initial_context =
+        opt->context_size > 0 ? (uint32_t)opt->context_size : requested_prefill;
+    e->is_k3 = true;
+    if (pthread_mutex_init(&e->k3_lifecycle_mutex, NULL) != 0) {
+        fprintf(stderr, "ds4: could not initialize Kimi K3 engine locks\n");
+        return 0;
+    }
+    e->k3_lifecycle_mutex_ready = true;
+    if (pthread_mutex_init(&e->k3_tokenizer_mutex, NULL) != 0) {
+        fprintf(stderr, "ds4: could not initialize Kimi K3 engine locks\n");
+        return 0;
+    }
+    e->k3_tokenizer_mutex_ready = true;
+    struct stat k3_path_stat;
+    e->k3_gguf =
+        stat(opt->model_path, &k3_path_stat) == 0 &&
+        S_ISREG(k3_path_stat.st_mode);
+    e->k3_layer_start = layer_start;
+    e->k3_layer_end = layer_end;
+    e->k3_has_output = has_output;
+    e->ssd_streaming = true;
+    e->prefill_chunk = requested_prefill;
+    if (e->prefill_chunk > initial_context) {
+        e->prefill_chunk = initial_context;
+    }
+    e->k3_model_bytes = ds4_k3_checkpoint_bytes(opt->model_path);
+    e->vocab.n_vocab = K3_N_VOCAB;
+    e->vocab.bos_id = K3_TOKEN_BOS;
+    e->vocab.eos_id = K3_TOKEN_END_OF_MSG;
+    e->vocab.system_id = -1;
+    e->vocab.user_id = -1;
+    e->vocab.assistant_id = -1;
+    e->vocab.observation_id = -1;
+    e->vocab.sop_id = -1;
+    e->vocab.think_start_id = -1;
+    e->vocab.think_end_id = -1;
+    e->vocab.tool_call_start_id = -1;
+    e->vocab.tool_call_end_id = -1;
+    e->vocab.tool_response_start_id = -1;
+    e->vocab.tool_response_end_id = -1;
+    e->vocab.arg_key_start_id = -1;
+    e->vocab.arg_key_end_id = -1;
+    e->vocab.arg_value_start_id = -1;
+    e->vocab.arg_value_end_id = -1;
+    e->vocab.dsml_id = -1;
+
+    char err[512] = {0};
+    if (!k3_tokenizer_open(
+            &e->k3_tokenizer, opt->model_path, err, sizeof(err))) {
+        fprintf(stderr, "ds4: Kimi K3 tokenizer: %s\n",
+                err[0] ? err : "open failed");
+        return 0;
+    }
+    if (!opt->inspect_only) {
+        const k3_context_config config = {
+            .model_directory = opt->model_path,
+            .context_capacity = initial_context,
+            .max_prefill_tokens = e->prefill_chunk,
+            .layer_slice = distributed,
+            .layer_start = layer_start,
+            .layer_end = layer_end,
+            .has_output = has_output,
+        };
+        if (!k3_context_create(
+                &e->k3_primary, &config, err, sizeof(err))) {
+            fprintf(stderr, "ds4: Kimi K3 engine: %s\n",
+                    err[0] ? err : "open failed");
+            return 0;
+        }
+        e->metal_ready = true;
+    }
+    const char *k3_format = e->k3_gguf ? "GGUF" : "SafeTensors";
+    fprintf(stderr,
+            "ds4: Kimi K3 %s backend, context=%d, "
+            "layer-major prefill chunk=%u, layers=%u:%u%s\n",
+            k3_format, (int)initial_context, e->prefill_chunk,
+            layer_start, layer_end, has_output ? "+output" : "");
+    return 1;
+}
+#endif
+
 static int ds4_engine_open_internal(ds4_engine **out,
                                     const ds4_engine_options *opt,
                                     const ds4_gpu_config *gpu_cfg);
@@ -71830,6 +72535,28 @@ static int ds4_engine_open_internal(ds4_engine **out,
         ds4_engine_close(e);
         *out = NULL;
         return 1;
+    }
+
+    if (ds4_model_path_is_k3(opt->model_path)) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        if (gpu_cfg || !ds4_engine_open_k3(e, opt)) {
+            if (gpu_cfg) {
+                fprintf(stderr,
+                        "ds4: Kimi K3 does not support explicit multi-GPU placement\n");
+            }
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        *out = e;
+        return 0;
+#else
+        fprintf(stderr,
+                "ds4: this build does not include the Apple Metal Kimi K3 backend\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+#endif
     }
 
     bool load_slice = opt->load_slice;
@@ -73105,6 +73832,27 @@ static int ds4_engine_open_internal(ds4_engine **out,
 }
 
 void ds4_engine_summary(ds4_engine *e) {
+    if (e && e->is_k3) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        printf("model: Kimi K3\n");
+        printf("format: %s\n",
+               e->k3_gguf
+                   ? "GGUF (IQ2_XXS/Q2_K routed, MXFP4 shared experts)"
+                   : "SafeTensors (native MXFP4 experts, BF16 static weights)");
+        printf("layers: %u\n", (uint32_t)K3_N_LAYER);
+        if (e->distributed.role != DS4_DISTRIBUTED_NONE) {
+            printf("loaded layer slice: %u:%u%s\n",
+                   e->k3_layer_start,
+                   e->k3_layer_end,
+                   e->k3_has_output ? "+output" : "");
+        }
+        printf("embedding: %u\n", (uint32_t)K3_N_EMBD);
+        printf("vocabulary: %u\n", (uint32_t)K3_N_VOCAB);
+        printf("checkpoint bytes: %llu\n",
+               (unsigned long long)e->k3_model_bytes);
+#endif
+        return;
+    }
     model_summary(&e->model);
     if (e->mtp_model.map) {
         printf("\nsupport model");
@@ -73145,12 +73893,12 @@ int ds4_engine_set_power(ds4_engine *e, int power_percent) {
 }
 
 const char *ds4_engine_model_name(ds4_engine *e) {
-    (void)e;
+    if (e && e->is_k3) return "Kimi K3";
     return DS4_MODEL_SHAPE_NAME;
 }
 
 int ds4_engine_layer_count(ds4_engine *e) {
-    (void)e;
+    if (e && e->is_k3) return K3_N_LAYER;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (DS4_N_LAYER <= DS4_N_NEXTN_PREDICT) return 0;
         return (int)(DS4_N_LAYER - DS4_N_NEXTN_PREDICT);
@@ -73159,12 +73907,14 @@ int ds4_engine_layer_count(ds4_engine *e) {
 }
 
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer) {
+    if (e && e->is_k3) return layer < K3_N_LAYER ? 1u : 0u;
     (void)e;
     if (layer >= DS4_N_LAYER) return 0;
     return ds4_layer_compress_ratio(layer);
 }
 
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e) {
+    if (e && e->is_k3) return K3_BOUNDARY_F32_VALUES;
     (void)e;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) return DS4_N_EMBD;
     return (uint64_t)DS4_N_HC * DS4_N_EMBD;
@@ -73202,17 +73952,17 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
 }
 
 int ds4_engine_model_id(ds4_engine *e) {
-    (void)e;
+    if (e && e->is_k3) return 3;
     return (int)DS4_MODEL_VARIANT;
 }
 
 bool ds4_engine_is_glm53(ds4_engine *e) {
-    (void)e;
+    if (e && e->is_k3) return false;
     return ds4_model_is_glm53();
 }
 
 bool ds4_engine_is_qwen4(ds4_engine *e) {
-    (void)e;
+    if (e && e->is_k3) return false;
     return ds4_model_is_qwen4();
 }
 
@@ -73278,11 +74028,14 @@ void ds4_engine_tp_gate_schedule(ds4_engine *e,
 }
 
 int ds4_engine_embd_dim(ds4_engine *e) {
-    (void)e;
+    if (e && e->is_k3) return K3_N_EMBD;
     return (int)DS4_N_EMBD;
 }
 
 uint64_t ds4_engine_model_bytes(ds4_engine *e) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (e && e->is_k3) return e->k3_model_bytes;
+#endif
     return e->model.size;
 }
 
@@ -74043,17 +74796,37 @@ void ds4_engine_tp_unbind(ds4_engine *e) {
 }
 
 bool ds4_engine_is_glm_dsa(ds4_engine *e) {
-    (void)e;
+    if (e && e->is_k3) return false;
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
 }
 
 bool ds4_engine_is_deepseek41(ds4_engine *e) {
-    (void)e;
+    if (e && e->is_k3) return false;
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;
+}
+
+bool ds4_engine_is_k3(ds4_engine *e) {
+    return e && e->is_k3;
 }
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (e->is_k3) {
+        k3_context_destroy(e->k3_primary);
+        k3_tokenizer_close(e->k3_tokenizer);
+        if (e->k3_tokenizer_mutex_ready) {
+            pthread_mutex_destroy(&e->k3_tokenizer_mutex);
+        }
+        if (e->k3_lifecycle_mutex_ready) {
+            pthread_mutex_destroy(&e->k3_lifecycle_mutex);
+        }
+        ds4_ssd_memory_lock_release(&e->simulated_memory);
+        ds4_release_instance_lock();
+        free(e);
+        return;
+    }
+#endif
     ds4_engine_tp_unbind(e);
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     /* Built at open but never bound. */
@@ -74264,6 +75037,57 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 #ifdef DS4_NO_GPU
     return 1;
 #else
+#if defined(__APPLE__)
+    if (e->is_k3) {
+        if (!e->k3_primary || !e->metal_ready) return 1;
+        ds4_session *s = xcalloc(1, sizeof(*s));
+        s->engine = e;
+        s->ctx_size = ctx_size;
+        char err[512] = {0};
+        pthread_mutex_lock(&e->k3_lifecycle_mutex);
+        if (!e->k3_primary_leased &&
+            k3_context_capacity(e->k3_primary) == (uint32_t)ctx_size) {
+            if (k3_context_reset(e->k3_primary, err, sizeof(err))) {
+                e->k3_primary_leased = true;
+                s->k3_primary = true;
+                s->k3 = e->k3_primary;
+            }
+        } else if (!k3_context_clone(
+                       &s->k3, e->k3_primary, (uint32_t)ctx_size,
+                       err, sizeof(err))) {
+            s->k3 = NULL;
+        }
+        pthread_mutex_unlock(&e->k3_lifecycle_mutex);
+        if (!s->k3) {
+            fprintf(stderr, "ds4: Kimi K3 session: %s\n",
+                    err[0] ? err : "allocation failed");
+            free(s);
+            return 1;
+        }
+        s->prefill_cap = k3_context_prefill_capacity(s->k3);
+        s->logits = xmalloc((size_t)K3_N_VOCAB * sizeof(s->logits[0]));
+        s->sample_probs =
+            xmalloc((size_t)K3_N_VOCAB * sizeof(s->sample_probs[0]));
+        if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
+            if (ds4_dist_session_create(
+                    &s->distributed,
+                    e,
+                    &e->distributed,
+                    s,
+                    ctx_size,
+                    err,
+                    sizeof(err)) != 0) {
+                fprintf(stderr,
+                        "ds4: failed to create distributed Kimi K3 session: %s\n",
+                        err[0] ? err : "unknown error");
+                ds4_session_free(s);
+                return 1;
+            }
+        }
+        *out = s;
+        return 0;
+    }
+#endif
     if (!ds4_backend_uses_graph(e->backend) || !e->metal_ready) return 1;
 
     ds4_session *s = xcalloc(1, sizeof(*s));
@@ -74733,6 +75557,24 @@ void ds4_session_free(ds4_session *s) {
     ds4_session_print_dspark_stats(s);
 #endif
     ds4_dist_session_free(s->distributed);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (ds4_session_is_k3(s)) {
+        ds4_engine *e = s->engine;
+        pthread_mutex_lock(&e->k3_lifecycle_mutex);
+        if (s->k3_primary) {
+            e->k3_primary_leased = false;
+        } else {
+            k3_context_destroy(s->k3);
+        }
+        pthread_mutex_unlock(&e->k3_lifecycle_mutex);
+        token_vec_free(&s->checkpoint);
+        token_vec_free(&s->greedy_splitkv_segment);
+        free(s->logits);
+        free(s->sample_probs);
+        free(s);
+        return;
+    }
+#endif
     if (ds4_session_is_cpu(s)) {
         kv_cache_free(&s->cpu_cache);
         cpu_decode_scratch_free(&s->cpu_scratch);
@@ -74811,6 +75653,11 @@ int ds4_session_set_power(ds4_session *s, int power_percent) {
         return 1;
     }
 #ifndef DS4_NO_GPU
+    if (ds4_session_is_k3(s) && power_percent != 100) {
+        fprintf(stderr,
+                "ds4: session power throttling is not supported for Kimi K3\n");
+        return 1;
+    }
     if (ds4_session_is_glm(s) && power_percent != 100) {
         fprintf(stderr, "ds4: session power throttling is not supported for GLM 5.2 yet\n");
         return 1;
@@ -74932,6 +75779,9 @@ int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen) {
         return 1;
     }
     ds4_session_invalidate(s);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (ds4_session_is_k3(s)) return 0;
+#endif
     if (ds4_session_is_cpu(s)) {
         session_cpu_reset_cache(s);
         return 0;
@@ -75832,6 +76682,50 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         if (errlen) snprintf(err, errlen, "missing layer-slice session");
         return 1;
     }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (ds4_session_is_k3(s)) {
+        ds4_engine *e = s->engine;
+        if (n_tokens == 0 ||
+            layer_start != e->k3_layer_start ||
+            layer_end != e->k3_layer_end ||
+            layer_start > layer_end ||
+            layer_end >= K3_N_LAYER ||
+            (layer_start != 0 && !input_hc) ||
+            (layer_start == 0 && input_hc) ||
+            (output_logits &&
+             (!logits || !e->k3_has_output ||
+              layer_end + 1u != K3_N_LAYER))) {
+            if (errlen) {
+                snprintf(err, errlen,
+                         "invalid Kimi K3 layer-slice request %u:%u",
+                         layer_start, layer_end);
+            }
+            return 1;
+        }
+        if (ds4_session_slice_check_timeline(
+                s, tokens, n_tokens, pos0, err, errlen) != 0) {
+            return 1;
+        }
+        if (!k3_context_eval_slice(
+                s->k3,
+                (const int32_t *)tokens,
+                n_tokens,
+                pos0,
+                layer_start,
+                layer_end,
+                input_hc,
+                output_hc,
+                output_logits,
+                logits,
+                err,
+                errlen)) {
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        ds4_session_slice_commit_timeline(s, tokens, n_tokens);
+        return 0;
+    }
+#endif
     const uint32_t executable_layers = ds4_model_normal_layer_count();
     if (executable_layers == 0 ||
         layer_start > layer_end ||
@@ -76730,6 +77624,57 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                      err,
                                      errlen);
     }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (ds4_session_is_k3(s)) {
+        int start = 0;
+        const bool extends =
+            s->checkpoint_valid &&
+            prompt->len >= s->checkpoint.len &&
+            ds4_tokens_starts_with(prompt, &s->checkpoint) &&
+            k3_context_position(s->k3) == (uint32_t)s->checkpoint.len;
+        if (extends) {
+            start = s->checkpoint.len;
+        } else {
+            if (!k3_context_reset(s->k3, err, errlen)) {
+                s->checkpoint_valid = false;
+                return 1;
+            }
+            s->checkpoint.len = 0;
+            s->checkpoint_valid = false;
+        }
+        while (start < prompt->len) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            uint32_t rows = (uint32_t)(prompt->len - start);
+            if (rows > s->prefill_cap) rows = s->prefill_cap;
+            if (!k3_context_prefill(
+                    s->k3, (const int32_t *)(prompt->v + start), rows,
+                    s->logits, err, errlen)) {
+                s->checkpoint_valid = false;
+                return 1;
+            }
+            for (uint32_t i = 0; i < rows; i++) {
+                token_vec_push(&s->checkpoint, prompt->v[start + (int)i]);
+            }
+            start += (int)rows;
+            s->checkpoint_valid = true;
+            if (s->progress) {
+                s->progress(
+                    s->progress_ud, "prefill_chunk", start, prompt->len);
+            }
+            if (s->display_progress) {
+                s->display_progress(
+                    s->display_progress_ud,
+                    "prefill_display", start, prompt->len);
+            }
+        }
+        s->mtp_draft_valid = false;
+        session_greedy_splitkv_reset(s);
+        return 0;
+    }
+#endif
 #ifdef DS4_HAS_QWEN4_GPU
     if (ds4_session_is_qwen4(s)) {
         ds4_engine *e = s->engine;
@@ -77901,20 +78846,25 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     return i;
 }
 
+static uint32_t ds4_session_vocab_size(const ds4_session *s) {
+    return s && s->engine ? (uint32_t)s->engine->vocab.n_vocab : 0;
+}
+
 int ds4_session_argmax(ds4_session *s) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
-    return sample_argmax(s->logits, DS4_N_VOCAB);
+    return sample_argmax(s->logits, ds4_session_vocab_size(s));
 }
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
     if (getenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == NULL) {
         return argmax_f32_excluding_unrolled8(
-                s->logits, DS4_N_VOCAB, excluded_id);
+                s->logits, ds4_session_vocab_size(s), excluded_id);
     }
     int best = -1;
     float best_logit = DS4_NEG_INF;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+    const uint32_t n_vocab = ds4_session_vocab_size(s);
+    for (uint32_t i = 0; i < n_vocab; i++) {
         if ((int)i == excluded_id) continue;
         const float v = s->logits[i];
         if (best < 0 || v > best_logit) {
@@ -77930,7 +78880,7 @@ int ds4_session_argmax_ignoring_eos(ds4_session *s,
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
     int best = -1;
     float best_logit = DS4_NEG_INF;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+    for (uint32_t i = 0; i < ds4_session_vocab_size(s); i++) {
         if (ds4_token_is_stop_for_think_mode(s->engine, (int)i,
                                              think_mode)) {
             continue;
@@ -77957,13 +78907,14 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
-    return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
+    return sample_top_p_min_p(s->logits, ds4_session_vocab_size(s), temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     if (!s || !out || k <= 0) return 0;
-    if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
+    const uint32_t n_vocab = ds4_session_vocab_size(s);
+    if (k > (int)n_vocab) k = (int)n_vocab;
     for (int i = 0; i < k; i++) {
         out[i].id = -1;
         out[i].logit = DS4_NEG_INF;
@@ -77971,7 +78922,7 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     }
 
     float max_logit = DS4_NEG_INF;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+    for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = s->logits[i];
         if (!isfinite(v)) continue;
         if (v > max_logit) max_logit = v;
@@ -77987,7 +78938,7 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     if (!isfinite(max_logit)) return 0;
 
     double sum = 0.0;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+    for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = s->logits[i];
         if (isfinite(v)) sum += exp((double)v - (double)max_logit);
     }
@@ -77999,17 +78950,18 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
 }
 
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
-    if (!s || !out || token < 0 || token >= (int)DS4_N_VOCAB) return 0;
+    const uint32_t n_vocab = ds4_session_vocab_size(s);
+    if (!s || !out || token < 0 || token >= (int)n_vocab) return 0;
 
     float max_logit = DS4_NEG_INF;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+    for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = s->logits[i];
         if (isfinite(v) && v > max_logit) max_logit = v;
     }
     if (!isfinite(max_logit)) return 0;
 
     double sum = 0.0;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+    for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = s->logits[i];
         if (isfinite(v)) sum += exp((double)v - (double)max_logit);
     }
@@ -78021,14 +78973,16 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
 }
 
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
-    if (!s || !out || cap < (int)DS4_N_VOCAB) return 0;
-    memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));
-    return (int)DS4_N_VOCAB;
+    const uint32_t n_vocab = ds4_session_vocab_size(s);
+    if (!s || !out || cap < (int)n_vocab) return 0;
+    memcpy(out, s->logits, (size_t)n_vocab * sizeof(out[0]));
+    return (int)n_vocab;
 }
 
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
-    if (!s || !logits || n != (int)DS4_N_VOCAB) return 1;
-    memcpy(s->logits, logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+    const uint32_t n_vocab = ds4_session_vocab_size(s);
+    if (!s || !logits || n != (int)n_vocab) return 1;
+    memcpy(s->logits, logits, (size_t)n_vocab * sizeof(s->logits[0]));
     return 0;
 }
 
@@ -78041,7 +78995,7 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
  * node, which pays the same cost before its timing window starts). */
 void ds4_session_gpu_warmup(ds4_session *s) {
 #ifndef DS4_NO_GPU
-    if (!s || ds4_session_is_cpu(s)) return;
+    if (!s || ds4_session_is_cpu(s) || ds4_session_is_k3(s)) return;
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) return;
     if (!metal_graph_batch_hc_mix(&s->graph) ||
         !metal_graph_batch_flat_hc(&s->graph)) return;
@@ -78915,6 +79869,35 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      err,
                                      errlen);
     }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (ds4_session_is_k3(s)) {
+        (void)probe_mtp;
+        if (!s->checkpoint_valid ||
+            k3_context_position(s->k3) != (uint32_t)s->checkpoint.len) {
+            if (errlen) {
+                snprintf(err, errlen,
+                         "Kimi K3 decode requires a valid synchronized checkpoint");
+            }
+            return 1;
+        }
+        if (s->checkpoint.len >= s->ctx_size) {
+            if (errlen) {
+                snprintf(err, errlen, "Kimi K3 context reached (%d)",
+                         s->ctx_size);
+            }
+            return 1;
+        }
+        if (!k3_context_decode(
+                s->k3, token, s->logits, err, errlen)) {
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        token_vec_push(&s->checkpoint, token);
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        return 0;
+    }
+#endif
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
         forward_token_raw_swa_cpu_decode_scratch(s->logits,
@@ -80640,7 +81623,8 @@ static bool ds4_sessions_eval_batch_metal_supported(
         int count,
         ds4_engine *e) {
     const char *tp_batch = getenv("DS4_METAL_TP_SESSION_BATCH");
-    if (!items || count < 2 || !e || e->backend != DS4_BACKEND_METAL ||
+    if (!items || count < 2 || !e || e->is_k3 ||
+        e->backend != DS4_BACKEND_METAL ||
         e->support_kind != DS4_SUPPORT_NONE ||
         (e->tp.active && tp_batch && strcmp(tp_batch, "0") == 0) ||
         getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL ||
@@ -81270,7 +82254,8 @@ static bool ds4_sessions_eval_batch_with_prefill_metal_supported(
     }
     ds4_engine *e = prefill_session->engine;
     const char *tp_batch = getenv("DS4_METAL_TP_SESSION_BATCH");
-    if (e->backend != DS4_BACKEND_METAL ||
+    if (e->is_k3 ||
+        e->backend != DS4_BACKEND_METAL ||
         e->support_kind != DS4_SUPPORT_NONE ||
         (e->tp.active && tp_batch && strcmp(tp_batch, "0") == 0) ||
         ds4_session_is_cpu(prefill_session) ||
@@ -81735,7 +82720,8 @@ int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
             }
             return 1;
         }
-        if (items[i].token < 0 || items[i].token >= (int)DS4_N_VOCAB) {
+        if (items[i].token < 0 ||
+            items[i].token >= e->vocab.n_vocab) {
             if (err && errlen) {
                 snprintf(err, errlen, "decode batch item %d has an invalid token", i);
             }
@@ -81759,6 +82745,22 @@ int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
             return 1;
         }
     }
+
+#ifndef DS4_NO_GPU
+    if (e->is_k3) {
+        for (int i = 0; i < count; i++) {
+            const int rc = ds4_session_eval(
+                items[i].session, items[i].token, err, errlen);
+            if (rc != 0) {
+                for (int j = 0; j < count; j++) {
+                    ds4_session_invalidate(items[j].session);
+                }
+                return rc;
+            }
+        }
+        return 0;
+    }
+#endif
 
 #ifndef DS4_NO_GPU
     if (e->backend == DS4_BACKEND_CUDA) {
@@ -81811,7 +82813,8 @@ int ds4_sessions_eval_batch_with_prefill(
         if (!s || s == prefill_session ||
             s->engine != prefill_session->engine ||
             !s->checkpoint_valid || s->checkpoint.len >= s->ctx_size ||
-            items[i].token < 0 || items[i].token >= (int)DS4_N_VOCAB) {
+            items[i].token < 0 ||
+            items[i].token >= prefill_session->engine->vocab.n_vocab) {
             if (err && errlen) {
                 snprintf(err, errlen, "invalid mixed decode item %d", i);
             }
@@ -81830,6 +82833,14 @@ int ds4_sessions_eval_batch_with_prefill(
     }
 
 #ifndef DS4_NO_GPU
+    if (prefill_session->engine->is_k3) {
+        int rc = ds4_session_sync(
+            prefill_session, prefill_prompt, err, errlen);
+        if (rc != 0) return rc;
+        rc = ds4_sessions_eval_batch(items, count, err, errlen);
+        if (rc != 0) ds4_session_invalidate(prefill_session);
+        return rc;
+    }
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(prefill_session) &&
         ds41_mixed_batch_supported(items, count, prefill_session, prefill_prompt))
@@ -86218,6 +87229,16 @@ static int ds4_session_eval_speculative_argmax_impl(
         accepted[0] = first_token;
         return 1;
     }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (ds4_session_is_k3(s)) {
+        (void)max_tokens;
+        (void)eos_token;
+        if (!accepted || accepted_cap <= 0) return 0;
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
+#endif
     if (ds4_session_is_cpu(s)) {
         (void)max_tokens;
         (void)eos_token;
@@ -87232,6 +88253,12 @@ void ds4_session_invalidate(ds4_session *s) {
     free(s->checkpoint_images);
     s->checkpoint_images = NULL;
     s->checkpoint_image_count = 0;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (ds4_session_is_k3(s)) {
+        (void)k3_context_reset(s->k3, NULL, 0);
+        return;
+    }
+#endif
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
 #ifdef DS4_HAS_DEEPSEEK41_GPU
@@ -87433,6 +88460,35 @@ void ds4_session_rewind(ds4_session *s, int pos) {
      * counts. Without a saved frontier the caller must rebuild this prefix. */
     if (!state_ok) s->checkpoint_valid = false;
     s->mtp_draft_valid = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (ds4_session_is_k3(s)) {
+        char err[256] = {0};
+        s->checkpoint_valid = false;
+        if (!k3_context_reset(s->k3, err, sizeof(err))) {
+            fprintf(stderr, "ds4: Kimi K3 rewind reset failed: %s\n",
+                    err[0] ? err : "unknown error");
+            s->checkpoint.len = 0;
+            return;
+        }
+        int offset = 0;
+        while (offset < pos) {
+            uint32_t rows = (uint32_t)(pos - offset);
+            if (rows > s->prefill_cap) rows = s->prefill_cap;
+            if (!k3_context_prefill(
+                    s->k3,
+                    (const int32_t *)(s->checkpoint.v + offset),
+                    rows, s->logits, err, sizeof(err))) {
+                fprintf(stderr, "ds4: Kimi K3 rewind replay failed: %s\n",
+                        err[0] ? err : "unknown error");
+                s->checkpoint.len = 0;
+                return;
+            }
+            offset += (int)rows;
+        }
+        s->checkpoint_valid = pos > 0;
+        return;
+    }
+#endif
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
     s->glm_mtp_have = 0;

@@ -673,6 +673,7 @@ typedef enum {
     SERVER_MODEL_SYNTAX_GLM,
     SERVER_MODEL_SYNTAX_DEEPSEEK41,
     SERVER_MODEL_SYNTAX_QWEN,
+    SERVER_MODEL_SYNTAX_K3,
 } server_model_syntax;
 
 #define DS41_TOOL_CALLS_START "<｜DSML｜ calls>"
@@ -1213,6 +1214,7 @@ static bool model_alias_enables_thinking(const char *model) {
 }
 
 static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
+    if (ds4_engine_is_k3(engine)) return SERVER_MODEL_SYNTAX_K3;
     if (ds4_engine_is_qwen4(engine)) return SERVER_MODEL_SYNTAX_QWEN;
     return ds4_engine_is_glm_dsa(engine) ?
            SERVER_MODEL_SYNTAX_GLM : ds4_engine_is_deepseek41(engine) ?
@@ -1223,12 +1225,14 @@ static const char *server_model_id_from_engine(ds4_engine *engine) {
     if (ds4_engine_is_deepseek41(engine)) return "deepseek-v4.1-flash";
     if (ds4_engine_is_qwen4(engine)) return "qwen3.8-flash-next";
     if (ds4_engine_is_glm53(engine)) return "glm-5.3-flash";
+    if (ds4_engine_is_k3(engine)) return "kimi-k3";
     if (ds4_engine_is_glm_dsa(engine)) return "glm-5.2";
     return ds4_engine_model_id(engine) == 1 ?
            "deepseek-v4-pro" : "deepseek-v4-flash";
 }
 
-static bool server_model_alias_known(const char *id) {
+static bool server_model_alias_known(server_model_syntax syntax, const char *id) {
+    if (syntax == SERVER_MODEL_SYNTAX_K3) return id && !strcmp(id, "kimi-k3");
     return id &&
            (!strcmp(id, "deepseek-v4-flash") ||
             !strcmp(id, "deepseek-v4.1-flash") ||
@@ -1257,6 +1261,23 @@ static bool server_model_alias_known(const char *id) {
             !strcmp(id, "zai/glm-5.3-flash") ||
             !strcmp(id, "zai/glm-5.3-flash-chat") ||
             !strcmp(id, "zai/glm-5.3-flash-reasoner"));
+}
+
+static void server_sampling_defaults(server_model_syntax syntax,
+                                     float *temperature,
+                                     float *top_p,
+                                     float *min_p) {
+    *temperature = DS4_DEFAULT_TEMPERATURE;
+    *top_p = syntax == SERVER_MODEL_SYNTAX_K3 ? 0.95f : DS4_DEFAULT_TOP_P;
+    *min_p = syntax == SERVER_MODEL_SYNTAX_K3 ? 0.0f : DS4_DEFAULT_MIN_P;
+}
+
+static void request_apply_engine_defaults(request *r, ds4_engine *engine) {
+    r->model_syntax = server_model_syntax_for_engine(engine);
+    free(r->model);
+    r->model = xstrdup(server_model_id_from_engine(engine));
+    server_sampling_defaults(r->model_syntax,
+                             &r->temperature, &r->top_p, &r->min_p);
 }
 
 static void stop_list_clear(stop_list *stops) {
@@ -3052,6 +3073,8 @@ static void append_qwen_tool_calls_text(buf *b, const tool_calls *calls, bool ha
     }
 }
 
+static void append_k3_tool_calls(buf *out, const tool_calls *calls);
+
 static void append_tool_calls_text_for_syntax(buf *b,
                                               server_model_syntax syntax,
                                               const tool_calls *calls,
@@ -3060,6 +3083,8 @@ static void append_tool_calls_text_for_syntax(buf *b,
         append_glm_tool_calls_text(b, calls, tool_orders);
     } else if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         append_qwen_tool_calls_text(b, calls, b->len > 0, tool_orders);
+    } else if (syntax == SERVER_MODEL_SYNTAX_K3) {
+        append_k3_tool_calls(b, calls);
     } else {
         append_dsml_tool_calls_text(b, calls, syntax == SERVER_MODEL_SYNTAX_DEEPSEEK41);
     }
@@ -3613,6 +3638,244 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
     return buf_take(&out);
 }
 
+static void append_k3_open_tag(buf *out, const char *tag,
+                               const char *role, const char *type) {
+    buf_puts(out, "<|open|>");
+    buf_puts(out, tag);
+    if (role) {
+        buf_puts(out, " role=\"");
+        buf_puts(out, role);
+        buf_putc(out, '"');
+    }
+    if (type) {
+        buf_puts(out, " type=\"");
+        buf_puts(out, type);
+        buf_putc(out, '"');
+    }
+    buf_puts(out, "<|sep|>");
+}
+
+static void append_k3_payload_text(buf *out, const char *value) {
+    static const char *markers[] = {
+        "<|end_of_msg|>", "<|open|>", "<|close|>", "<|sep|>",
+        "[BOS]", "[EOS]", "[EOT]",
+    };
+    const char *p = value ? value : "";
+    while (*p) {
+        size_t marker_length = 0;
+        for (size_t i = 0;
+             i < sizeof(markers) / sizeof(markers[0]); i++) {
+            const size_t n = strlen(markers[i]);
+            if (!strncmp(p, markers[i], n)) {
+                marker_length = n;
+                break;
+            }
+        }
+        if (marker_length) {
+            buf_putc(out, '\\');
+            buf_append(out, p, marker_length);
+            p += marker_length;
+        } else {
+            buf_putc(out, *p++);
+        }
+    }
+}
+
+static void append_k3_attr_value(buf *out, const char *value) {
+    buf escaped = {0};
+    for (const char *p = value ? value : ""; *p; p++) {
+        if (*p == '&') buf_puts(&escaped, "&amp;");
+        else if (*p == '"') buf_puts(&escaped, "&quot;");
+        else buf_putc(&escaped, *p);
+    }
+    append_k3_payload_text(out, escaped.ptr ? escaped.ptr : "");
+    buf_free(&escaped);
+}
+
+static void append_k3_close_tag(buf *out, const char *tag) {
+    buf_puts(out, "<|close|>");
+    buf_puts(out, tag);
+    buf_puts(out, "<|sep|>");
+}
+
+static void append_k3_message(buf *out, const char *role,
+                              const char *content) {
+    append_k3_open_tag(out, "message", role, NULL);
+    append_k3_payload_text(out, content);
+    append_k3_close_tag(out, "message");
+    buf_puts(out, "<|end_of_msg|>");
+}
+
+static void append_k3_tool_declaration(buf *out, const char *tool_schemas) {
+    append_k3_open_tag(out, "message", "system", "tool-declare");
+    buf_puts(out,
+             "# Tools\n"
+             "Here are the available tools, described in JSONSchema.\n\n"
+             "```json\n[");
+    const char *p = tool_schemas;
+    bool wrote = false;
+    while (p && *p) {
+        json_ws(&p);
+        if (!*p) break;
+        char *schema = NULL;
+        if (!json_raw_value(&p, &schema)) break;
+        if (wrote) buf_putc(out, ',');
+        append_k3_payload_text(out, schema);
+        wrote = true;
+        free(schema);
+    }
+    append_k3_payload_text(out, "]\n```");
+    append_k3_close_tag(out, "message");
+    buf_puts(out, "<|end_of_msg|>");
+}
+
+static const char *k3_xtml_type(const json_arg *arg) {
+    if (arg->is_string) return "string";
+    const char *p = arg->value ? arg->value : "";
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p == '{') return "object";
+    if (*p == '[') return "array";
+    if (*p == 't' || *p == 'f') return "boolean";
+    if (*p == 'n') return "null";
+    return "number";
+}
+
+static void append_k3_tool_calls(buf *out, const tool_calls *calls) {
+    if (!calls || calls->len == 0) return;
+    append_k3_open_tag(out, "tools", NULL, NULL);
+    for (int i = 0; i < calls->len; i++) {
+        const tool_call *call = &calls->v[i];
+        buf_puts(out, "<|open|>call tool=\"");
+        append_k3_attr_value(out, call->name);
+        buf_puts(out, "\" index=\"");
+        char index[32];
+        snprintf(index, sizeof(index), "%d", i + 1);
+        buf_puts(out, index);
+        buf_puts(out, "\"<|sep|>");
+
+        json_args args = {0};
+        if (json_args_parse(call->arguments, &args)) {
+            for (int j = 0; j < args.len; j++) {
+                const json_arg *arg = &args.v[j];
+                buf_puts(out, "<|open|>argument key=\"");
+                append_k3_attr_value(out, arg->key);
+                buf_puts(out, "\" type=\"");
+                buf_puts(out, k3_xtml_type(arg));
+                buf_puts(out, "\"<|sep|>");
+                append_k3_payload_text(out, arg->value);
+                append_k3_close_tag(out, "argument");
+            }
+        } else {
+            buf_puts(out, "<|open|>json type=\"object\"<|sep|>");
+            append_k3_payload_text(
+                out, call->arguments ? call->arguments : "{}");
+            append_k3_close_tag(out, "json");
+        }
+        json_args_free(&args);
+        append_k3_close_tag(out, "call");
+    }
+    append_k3_close_tag(out, "tools");
+}
+
+static const tool_call *k3_resolve_tool_result(
+        const tool_calls *calls, const chat_msg *result, int ordinal,
+        int *index_out) {
+    if (!calls || calls->len == 0) return NULL;
+    if (result && result->tool_call_id) {
+        for (int i = 0; i < calls->len; i++) {
+            if (calls->v[i].id &&
+                !strcmp(calls->v[i].id, result->tool_call_id)) {
+                if (index_out) *index_out = i + 1;
+                return &calls->v[i];
+            }
+        }
+    }
+    const int index = ordinal - 1;
+    if (index < 0 || index >= calls->len) return NULL;
+    if (index_out) *index_out = ordinal;
+    return &calls->v[index];
+}
+
+static char *render_k3_chat_prompt_text(const chat_msgs *msgs,
+                                        const char *tool_schemas,
+                                        const tool_schema_orders *tool_orders,
+                                        ds4_think_mode think_mode) {
+    (void)tool_orders;
+    const bool think = ds4_think_mode_enabled(think_mode);
+    buf out = {0};
+    if (tool_schemas && tool_schemas[0]) {
+        append_k3_tool_declaration(&out, tool_schemas);
+    }
+    if (think) {
+        const char *effort =
+            think_mode == DS4_THINK_MAX ? "max" : "high";
+        append_k3_open_tag(
+            &out, "message", "system", "thinking-effort");
+        buf_puts(
+            &out,
+            "`thinking_effort` guides on how much to think in your thinking "
+            "channel (not including the response channel), supported values "
+            "include `low`, `medium`, `high`, and `max`.\n"
+            "Now the system is invoked with `thinking_effort=");
+        buf_puts(&out, effort);
+        buf_puts(&out, "`.");
+        append_k3_close_tag(&out, "message");
+        buf_puts(&out, "<|end_of_msg|>");
+    }
+
+    bool pending_assistant = false;
+    const tool_calls *pending_calls = NULL;
+    int tool_result_ordinal = 0;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_system(m->role)) {
+            append_k3_message(&out, "system", m->content);
+        } else if (!strcmp(m->role, "user")) {
+            append_k3_message(&out, "user", m->content);
+            pending_assistant = true;
+        } else if (!strcmp(m->role, "tool") ||
+                   !strcmp(m->role, "function")) {
+            tool_result_ordinal++;
+            int index = tool_result_ordinal;
+            const tool_call *call = k3_resolve_tool_result(
+                pending_calls, m, tool_result_ordinal, &index);
+            buf_puts(&out, "<|open|>message role=\"tool\" tool=\"");
+            append_k3_attr_value(&out, call ? call->name : "");
+            buf_puts(&out, "\" index=\"");
+            char index_text[32];
+            snprintf(index_text, sizeof(index_text), "%d", index);
+            buf_puts(&out, index_text);
+            buf_puts(&out, "\"<|sep|>");
+            append_k3_payload_text(&out, m->content);
+            append_k3_close_tag(&out, "message");
+            buf_puts(&out, "<|end_of_msg|>");
+            pending_assistant = true;
+        } else if (!strcmp(m->role, "assistant")) {
+            append_k3_open_tag(&out, "message", "assistant", NULL);
+            if (think) {
+                append_k3_open_tag(&out, "think", NULL, NULL);
+                append_k3_payload_text(&out, m->reasoning);
+                append_k3_close_tag(&out, "think");
+            }
+            append_k3_open_tag(&out, "response", NULL, NULL);
+            append_k3_payload_text(&out, m->content);
+            append_k3_close_tag(&out, "response");
+            append_k3_tool_calls(&out, &m->calls);
+            append_k3_close_tag(&out, "message");
+            buf_puts(&out, "<|end_of_msg|>");
+            pending_assistant = false;
+            pending_calls = &m->calls;
+            tool_result_ordinal = 0;
+        }
+    }
+    if (pending_assistant) {
+        append_k3_open_tag(&out, "message", "assistant", NULL);
+        append_k3_open_tag(
+            &out, think ? "think" : "response", NULL, NULL);
+    }
+    return buf_take(&out);
+}
+
 static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
                                                 const chat_msgs *msgs,
                                                 const char *tool_schemas,
@@ -3626,6 +3889,10 @@ static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
         return render_deepseek41_chat(msgs, 0, tool_schemas, think_mode, false);
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return render_qwen_chat_prompt_text(msgs, tool_schemas, tool_orders, think_mode);
+    }
+    if (syntax == SERVER_MODEL_SYNTAX_K3) {
+        return render_k3_chat_prompt_text(msgs, tool_schemas,
+                                          tool_orders, think_mode);
     }
     return render_deepseek_chat_prompt_text(msgs, tool_schemas,
                                             tool_orders, think_mode);
@@ -4099,7 +4366,7 @@ static void anthropic_prepare_live_continuation(server *s, request *r,
 static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
-    r->model_syntax = server_model_syntax_for_engine(e);
+    request_apply_engine_defaults(r, e);
     const char *p = body;
     bool got_messages = false;
     bool tool_choice_none = false;
@@ -4297,7 +4564,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                                     int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     r->api = API_ANTHROPIC;
-    r->model_syntax = server_model_syntax_for_engine(e);
+    request_apply_engine_defaults(r, e);
     const char *p = body;
     bool got_messages = false;
     bool tool_choice_none = false;
@@ -5286,7 +5553,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                                     int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     r->api = API_RESPONSES;
-    r->model_syntax = server_model_syntax_for_engine(e);
+    request_apply_engine_defaults(r, e);
     const char *p = body;
     bool got_input = false;
     bool tool_choice_none = false;
@@ -5591,7 +5858,7 @@ static bool parse_prompt(const char **p, char **out) {
 static bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
                                      int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_COMPLETION, def_tokens);
-    r->model_syntax = server_model_syntax_for_engine(e);
+    request_apply_engine_defaults(r, e);
     const char *p = body;
     char *prompt = NULL;
     bool got_thinking = false;
@@ -5868,6 +6135,36 @@ static const char *find_any_tool_end(const char *s) {
     return best;
 }
 
+static const char *find_tool_start_for_syntax(server_model_syntax syntax,
+                                               const char *s) {
+    return syntax == SERVER_MODEL_SYNTAX_K3 ?
+        strstr(s, "<tools>") : find_any_tool_start(s);
+}
+
+static const char *find_tool_end_for_syntax(server_model_syntax syntax,
+                                             const char *s) {
+    return syntax == SERVER_MODEL_SYNTAX_K3 ?
+        strstr(s, "</tools>") : find_any_tool_end(s);
+}
+
+static void observe_tool_markers_for_syntax(
+        server_model_syntax syntax, const char *scan, bool *saw_start,
+        bool *saw_end, bool *orphan_end) {
+    if (!scan) return;
+    bool had_start = *saw_start;
+    const char *start = find_tool_start_for_syntax(syntax, scan);
+    if (start) *saw_start = true;
+
+    const char *end_scan = had_start ? scan : (start ? start : NULL);
+    const char *end = end_scan ?
+        find_tool_end_for_syntax(syntax, end_scan) : NULL;
+    if (end) {
+        *saw_end = true;
+    } else if (!had_start && !start &&
+               find_tool_end_for_syntax(syntax, scan)) {
+        if (orphan_end) *orphan_end = true;
+    }
+}
 static size_t trim_tool_separator_ws(const char *raw, size_t start, size_t limit) {
     while (limit > start && isspace((unsigned char)raw[limit - 1])) limit--;
     return limit;
@@ -5926,30 +6223,7 @@ static const char *find_tool_structural_text(const char *s, const char *needle,
 /* Attributes are XML-escaped. Argument bodies are literal data and use the
  * narrower closing-delimiter escape from ds4_tool_text.h instead. */
 static char *dsml_unescape_text(const char *s) {
-    buf b = {0};
-    for (s = s ? s : ""; *s; s++) {
-        if (*s != '&') {
-            buf_putc(&b, *s);
-        } else if (!strncmp(s, "&amp;", 5)) {
-            buf_putc(&b, '&');
-            s += 4;
-        } else if (!strncmp(s, "&lt;", 4)) {
-            buf_putc(&b, '<');
-            s += 3;
-        } else if (!strncmp(s, "&gt;", 4)) {
-            buf_putc(&b, '>');
-            s += 3;
-        } else if (!strncmp(s, "&quot;", 6)) {
-            buf_putc(&b, '"');
-            s += 5;
-        } else if (!strncmp(s, "&apos;", 6)) {
-            buf_putc(&b, '\'');
-            s += 5;
-        } else {
-            buf_putc(&b, '&');
-        }
-    }
-    return buf_take(&b);
+    return ds4_xml_unescape(s, strlen(s ? s : ""));
 }
 
 static char *dsml_attr(const char *tag, const char *name) {
@@ -6670,6 +6944,167 @@ static bool parse_qwen_generated_message_ex(const char *text,
     return true;
 }
 
+static bool parse_k3_tool_calls(const char *tools_start,
+                                tool_calls *calls) {
+    const char *tools_end = strstr(tools_start, "</tools>");
+    if (!tools_end) return false;
+    const char *p = tools_start + strlen("<tools>");
+    while (p < tools_end) {
+        p = skip_ascii_ws(p);
+        if (p >= tools_end) break;
+        if (strncmp(p, "<call", strlen("<call")) != 0) return false;
+        const char *tag_end = strchr(p, '>');
+        if (!tag_end || tag_end >= tools_end) return false;
+        char *tag = xstrndup(p, (size_t)(tag_end - p + 1));
+        char *name = dsml_attr(tag, "tool");
+        free(tag);
+        if (!name || !name[0]) {
+            free(name);
+            return false;
+        }
+        const char *call_end = strstr(tag_end + 1, "</call>");
+        if (!call_end || call_end > tools_end) {
+            free(name);
+            return false;
+        }
+
+        buf args = {0};
+        char *json_block = NULL;
+        const char *q = tag_end + 1;
+        while (q < call_end) {
+            q = skip_ascii_ws(q);
+            if (q >= call_end) break;
+            if (!strncmp(q, "<json", strlen("<json"))) {
+                const char *json_tag_end = strchr(q, '>');
+                const char *json_end =
+                    json_tag_end ? strstr(json_tag_end + 1, "</json>") : NULL;
+                if (!json_tag_end || !json_end || json_end > call_end) {
+                    free(name);
+                    free(json_block);
+                    buf_free(&args);
+                    return false;
+                }
+                const char *value_start = json_tag_end + 1;
+                const char *value_end = json_end;
+                trim_const_span(&value_start, &value_end);
+                free(json_block);
+                json_block = xstrndup(
+                    value_start, (size_t)(value_end - value_start));
+                q = json_end + strlen("</json>");
+                continue;
+            }
+            if (strncmp(q, "<argument", strlen("<argument")) != 0) {
+                free(name);
+                free(json_block);
+                buf_free(&args);
+                return false;
+            }
+            const char *arg_tag_end = strchr(q, '>');
+            if (!arg_tag_end || arg_tag_end >= call_end) {
+                free(name);
+                free(json_block);
+                buf_free(&args);
+                return false;
+            }
+            tag = xstrndup(q, (size_t)(arg_tag_end - q + 1));
+            char *key = dsml_attr(tag, "key");
+            char *type = dsml_attr(tag, "type");
+            free(tag);
+            const char *arg_end = strstr(arg_tag_end + 1, "</argument>");
+            if (!key || !type || !arg_end || arg_end > call_end) {
+                free(name);
+                free(key);
+                free(type);
+                free(json_block);
+                buf_free(&args);
+                return false;
+            }
+            char *raw_value =
+                xstrndup(arg_tag_end + 1, (size_t)(arg_end - arg_tag_end - 1));
+            char *value = !strcmp(type, "string") ?
+                dsml_unescape_text(raw_value) : xstrdup(raw_value);
+            tool_call_json_args_add(
+                &args, key, value, !strcmp(type, "string") ? "true" : "false");
+            free(key);
+            free(type);
+            free(raw_value);
+            free(value);
+            q = arg_end + strlen("</argument>");
+        }
+
+        tool_call call = {0};
+        call.name = name;
+        if (json_block) {
+            call.arguments = json_block;
+        } else {
+            buf wrapped = {0};
+            buf_putc(&wrapped, '{');
+            buf_puts(&wrapped, args.ptr ? args.ptr : "");
+            buf_putc(&wrapped, '}');
+            call.arguments = buf_take(&wrapped);
+        }
+        tool_calls_push(calls, call);
+        buf_free(&args);
+        p = call_end + strlen("</call>");
+    }
+    free(calls->raw_tool_text);
+    calls->raw_tool_text = xstrndup(
+        tools_start, (size_t)(tools_end + strlen("</tools>") - tools_start));
+    return calls->len > 0;
+}
+
+static bool parse_k3_generated_message_ex(const char *text,
+                                          bool require_thinking_closed,
+                                          char **content_out,
+                                          char **reasoning_out,
+                                          tool_calls *calls) {
+    text = text ? text : "";
+    const char *surface = text;
+    const char *think_end = strstr(text, "</think>");
+    if (think_end) {
+        const char *reason_start = text;
+        if (!strncmp(reason_start, "<think>", strlen("<think>"))) {
+            reason_start += strlen("<think>");
+        }
+        *reasoning_out =
+            xstrndup(reason_start, (size_t)(think_end - reason_start));
+        surface = think_end + strlen("</think>");
+    } else {
+        *reasoning_out = NULL;
+        if (require_thinking_closed) {
+            const char *reason_start = text;
+            if (!strncmp(reason_start, "<think>", strlen("<think>"))) {
+                reason_start += strlen("<think>");
+            }
+            *reasoning_out = xstrdup(reason_start);
+            *content_out = xstrdup("");
+            return true;
+        }
+    }
+
+    const char *response_start = strstr(surface, "<response>");
+    if (response_start) {
+        response_start += strlen("<response>");
+    } else {
+        response_start = surface;
+    }
+    const char *response_end = strstr(response_start, "</response>");
+    const char *tools_start = strstr(response_start, "<tools>");
+    if (!response_end || (tools_start && tools_start < response_end)) {
+        response_end = tools_start ? tools_start : response_start + strlen(response_start);
+    }
+    *content_out =
+        xstrndup(response_start, (size_t)(response_end - response_start));
+
+    if (!tools_start && response_end) {
+        tools_start = strstr(response_end, "<tools>");
+    }
+    if (tools_start && !parse_k3_tool_calls(tools_start, calls)) {
+        return false;
+    }
+    return true;
+}
+
 static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
                                                   const char *text,
                                                   bool require_thinking_closed,
@@ -6684,6 +7119,11 @@ static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return parse_qwen_generated_message_ex(text, require_thinking_closed,
                                                content_out, reasoning_out, calls, NULL);
+    }
+    if (syntax == SERVER_MODEL_SYNTAX_K3) {
+        return parse_k3_generated_message_ex(text, require_thinking_closed,
+                                             content_out, reasoning_out,
+                                             calls);
     }
     return parse_deepseek_generated_message_ex(text, require_thinking_closed,
                                                content_out, reasoning_out,
@@ -7250,6 +7690,17 @@ static const char *openai_tool_stream_id(server *s, openai_tool_stream *ts,
 static size_t text_stream_safe_limit(const char *raw, size_t start,
                                      size_t raw_len, bool has_tools,
                                      bool final);
+
+typedef struct {
+    size_t start;
+    size_t limit;
+    const char *tool;
+    bool stopped;
+} server_text_stream_window;
+
+static server_text_stream_window text_stream_window(
+    const request *r, const char *raw, size_t start, size_t raw_len,
+    bool final);
 
 static bool sse_chat_delta_n(int fd, const request *r, const char *id,
                              const char *field, const char *text, size_t len) {
@@ -8099,26 +8550,27 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
             }
         }
 
-        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
-        size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
-                                              r->has_tools, final);
+        server_text_stream_window window =
+            text_stream_window(r, raw, st->emit_pos, raw_len, final);
+        st->emit_pos = window.start;
 
-        if (limit > st->emit_pos) {
+        if (window.limit > st->emit_pos) {
             if (!sse_chat_delta_n(fd, r, id, "content",
                                   raw + st->emit_pos,
-                                  limit - st->emit_pos)) return false;
+                                  window.limit - st->emit_pos)) return false;
             st->sent_content = true;
-            st->emit_pos = limit;
+            st->emit_pos = window.limit;
         }
 
-        if (tool) {
-            st->emit_pos = (size_t)(tool - raw);
-            if (openai_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
+        if (window.tool) {
+            st->emit_pos = (size_t)(window.tool - raw);
+            if (r->model_syntax != SERVER_MODEL_SYNTAX_K3 &&
+                openai_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
                 st->mode = OPENAI_STREAM_TOOL;
             } else {
                 st->mode = OPENAI_STREAM_SUPPRESS;
             }
-        } else if (final) {
+        } else if (window.stopped || final) {
             st->mode = OPENAI_STREAM_SUPPRESS;
         }
     }
@@ -8825,11 +9277,11 @@ static bool responses_sse_stream_update(int fd, const request *r,
     }
 
     if (st->mode == RESP_STREAM_TEXT) {
-        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
-        size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
-                                              r->has_tools, final);
+        server_text_stream_window window =
+            text_stream_window(r, raw, st->emit_pos, raw_len, final);
+        st->emit_pos = window.start;
 
-        if (limit > st->emit_pos) {
+        if (window.limit > st->emit_pos) {
             if (!st->message_item_opened) {
                 st->message_index = st->next_output_index++;
                 if (!responses_sse_message_added(fd, st)) return false;
@@ -8841,16 +9293,17 @@ static bool responses_sse_stream_update(int fd, const request *r,
             }
             if (!responses_sse_output_text_delta(fd, st,
                                                  raw + st->emit_pos,
-                                                 limit - st->emit_pos)) return false;
-            buf_append(&st->message_text, raw + st->emit_pos, limit - st->emit_pos);
+                                                 window.limit - st->emit_pos)) return false;
+            buf_append(&st->message_text, raw + st->emit_pos,
+                       window.limit - st->emit_pos);
             st->message_emitted_any = true;
-            st->emit_pos = limit;
+            st->emit_pos = window.limit;
         }
 
-        if (tool) {
-            st->emit_pos = (size_t)(tool - raw);
+        if (window.tool) {
+            st->emit_pos = (size_t)(window.tool - raw);
             st->mode = RESP_STREAM_SUPPRESS;
-        } else if (final) {
+        } else if (window.stopped || final) {
             st->mode = RESP_STREAM_SUPPRESS;
         }
     }
@@ -9639,6 +10092,107 @@ static size_t text_stream_safe_limit(const char *raw, size_t start,
     return utf8_stream_safe_len(raw, start, limit, final);
 }
 
+static bool stream_suffix_is_marker_prefix(const char *raw, size_t start,
+                                           size_t raw_len,
+                                           const char *marker,
+                                           size_t *limit) {
+    const size_t marker_len = strlen(marker);
+    const size_t available = raw_len - start;
+    size_t max = marker_len - 1;
+    if (max > available) max = available;
+    for (size_t len = max; len > 0; len--) {
+        if (!memcmp(raw + raw_len - len, marker, len)) {
+            size_t boundary = raw_len - len;
+            if (boundary < *limit) *limit = boundary;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Return the user-visible text window for all API stream projections. K3's
+ * native XTML closes reasoning with </think>, wraps ordinary output in
+ * <response>, and emits tools in a sibling <tools> block. Keep that framing in
+ * one place so the OpenAI, Responses, and Anthropic streamers agree exactly. */
+static server_text_stream_window text_stream_window(
+    const request *r, const char *raw, size_t start, size_t raw_len,
+    bool final) {
+    server_text_stream_window window = {
+        .start = start,
+        .limit = start,
+        .tool = NULL,
+        .stopped = false,
+    };
+    if (!raw || start >= raw_len) return window;
+
+    if (!r || r->model_syntax != SERVER_MODEL_SYNTAX_K3) {
+        window.tool = r && r->has_tools ?
+            find_any_tool_start(raw + start) : NULL;
+        window.limit = text_stream_safe_limit(
+            raw, start, raw_len, r && r->has_tools, final);
+        window.stopped = window.tool != NULL;
+        return window;
+    }
+
+    static const char response_open[] = "<response>";
+    size_t available = raw_len - start;
+    if (available < sizeof(response_open) - 1 &&
+        !memcmp(raw + start, response_open, available)) {
+        if (!final) return window;
+        window.stopped = true;
+        return window;
+    }
+    if (available >= sizeof(response_open) - 1 &&
+        !memcmp(raw + start, response_open, sizeof(response_open) - 1)) {
+        start += sizeof(response_open) - 1;
+        window.start = start;
+    }
+
+    const char *scan = raw + start;
+    const char *response_close = strstr(scan, "</response>");
+    const char *message_close = strstr(scan, "</message>");
+    /* Hide native tool syntax even when a client did not declare tools. It is
+     * protocol framing, never assistant text. The final response parser decides
+     * whether a structurally valid call can be surfaced. */
+    window.tool = find_tool_start_for_syntax(
+        SERVER_MODEL_SYNTAX_K3, scan);
+
+    const char *boundary = NULL;
+    if (response_close) boundary = response_close;
+    if (message_close && (!boundary || message_close < boundary)) {
+        boundary = message_close;
+    }
+    if (window.tool && (!boundary || window.tool < boundary)) {
+        boundary = window.tool;
+    }
+
+    if (boundary) {
+        window.limit = (size_t)(boundary - raw);
+        if (boundary == window.tool) {
+            window.limit = trim_tool_separator_ws(raw, start, window.limit);
+        }
+        window.limit = utf8_stream_safe_len(
+            raw, start, window.limit, true);
+        window.stopped = true;
+        return window;
+    }
+
+    window.limit = raw_len;
+    if (!final) {
+        stream_suffix_is_marker_prefix(
+            raw, start, raw_len, "<response>", &window.limit);
+        stream_suffix_is_marker_prefix(
+            raw, start, raw_len, "</response>", &window.limit);
+        stream_suffix_is_marker_prefix(
+            raw, start, raw_len, "<tools>", &window.limit);
+        stream_suffix_is_marker_prefix(
+            raw, start, raw_len, "</message>", &window.limit);
+    }
+    window.limit = utf8_stream_safe_len(
+        raw, start, window.limit, final);
+    return window;
+}
+
 static bool anthropic_sse_stream_update(int fd, server *s, const request *r, const char *id,
                                         anthropic_stream *st,
                                         const char *raw, size_t raw_len,
@@ -9734,33 +10288,33 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
             }
         }
 
-        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
-        size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
-                                              r->has_tools, final);
+        server_text_stream_window window =
+            text_stream_window(r, raw, st->emit_pos, raw_len, final);
+        st->emit_pos = window.start;
 
-        if (limit > st->emit_pos) {
+        if (window.limit > st->emit_pos) {
             if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_TEXT)) return false;
             if (!anthropic_sse_delta_live(fd, st, ANTH_BLOCK_TEXT,
                                           raw + st->emit_pos,
-                                          limit - st->emit_pos)) return false;
+                                          window.limit - st->emit_pos)) return false;
             st->sent_text = true;
-            st->emit_pos = limit;
+            st->emit_pos = window.limit;
         }
 
-        if (tool) {
+        if (window.tool) {
             if (!anthropic_sse_close_block_live(fd, id, st)) return false;
-            st->emit_pos = (size_t)(tool - raw);
+            st->emit_pos = (size_t)(window.tool - raw);
             /* On normal token-by-token updates, switch from hidden text to a
              * live tool_use projection as soon as the DSML block starts.  On
              * final catch-up from plain text, leave the block for the existing
              * final emitter so old non-incremental behavior stays unchanged. */
-            if (!final &&
+            if (r->model_syntax != SERVER_MODEL_SYNTAX_K3 && !final &&
                 anthropic_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
                 st->mode = ANTH_STREAM_TOOL;
             } else {
                 st->mode = ANTH_STREAM_SUPPRESS;
             }
-        } else if (final) {
+        } else if (window.stopped || final) {
             if (!anthropic_sse_close_block_live(fd, id, st)) return false;
             st->mode = ANTH_STREAM_SUPPRESS;
         }
@@ -12197,6 +12751,10 @@ static void thinking_state_feed(thinking_state *st, const char *p, size_t len) {
 
 static thinking_state thinking_state_from_prompt(const request *r) {
     thinking_state st = {0};
+    if (r && r->model_syntax == SERVER_MODEL_SYNTAX_K3) {
+        st.inside = ds4_think_mode_enabled(r->think_mode);
+        return st;
+    }
     if (r && r->prompt_text) {
         thinking_state_feed(&st, r->prompt_text, strlen(r->prompt_text));
     } else if (r && ds4_think_mode_enabled(r->think_mode)) {
@@ -12255,6 +12813,42 @@ static char *rendered_chat_system_region(const char *prompt_text) {
     if (!end) end = p + strlen(p);
     while (end > p && isspace((unsigned char)end[-1])) end--;
     return xstrndup(p, (size_t)(end - p));
+}
+
+static char *build_invalid_k3_tool_error_suffix(
+        const request *r, const thinking_state *thinking,
+        const char *detail, bool tool_block_closed) {
+    buf tool_error = {0};
+    buf_puts(&tool_error, "Tool error: invalid Kimi XTML tool call");
+    if (detail && detail[0]) {
+        buf_puts(&tool_error, ": ");
+        buf_puts(&tool_error, detail);
+    }
+    buf_puts(
+        &tool_error,
+        "\nThe previous assistant output was not executed because the XTML "
+        "syntax was malformed. Emit a new valid tool call, or answer normally "
+        "if no tool is needed.");
+
+    buf suffix = {0};
+    if (!tool_block_closed) append_k3_close_tag(&suffix, "tools");
+    if (r && ds4_think_mode_enabled(r->think_mode) &&
+        thinking && thinking->inside) {
+        append_k3_close_tag(&suffix, "think");
+    }
+    append_k3_close_tag(&suffix, "message");
+    buf_puts(&suffix, "<|end_of_msg|>");
+    append_k3_message(
+        &suffix, "system", tool_error.ptr ? tool_error.ptr : "");
+    append_k3_open_tag(&suffix, "message", "assistant", NULL);
+    append_k3_open_tag(
+        &suffix,
+        r && ds4_think_mode_enabled(r->think_mode) ?
+            "think" : "response",
+        NULL, NULL);
+
+    buf_free(&tool_error);
+    return buf_take(&suffix);
 }
 
 static char *build_invalid_dsml_tool_error_suffix(const request *r,
@@ -12345,12 +12939,17 @@ static char *build_invalid_qwen_tool_error_suffix(const request *r,
 
 static char *build_invalid_tool_call_error_suffix(const request *r,
                                                   const thinking_state *thinking,
-                                                  const char *detail) {
+                                                  const char *detail,
+                                                  bool tool_block_closed) {
     if (r && r->model_syntax == SERVER_MODEL_SYNTAX_GLM) {
         return build_invalid_glm_tool_error_suffix(r, thinking, detail);
     }
     if (r && r->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return build_invalid_qwen_tool_error_suffix(r, thinking, detail);
+    }
+    if (r && r->model_syntax == SERVER_MODEL_SYNTAX_K3) {
+        return build_invalid_k3_tool_error_suffix(
+            r, thinking, detail, tool_block_closed);
     }
     return build_invalid_dsml_tool_error_suffix(r, thinking, detail);
 }
@@ -12612,9 +13211,11 @@ static bool continue_after_invalid_dsml(server *s, server_slot *slot,
                                         const request *r,
                                         const thinking_state *thinking,
                                         const char *detail,
+                                        bool tool_block_closed,
                                         int *tokens_appended,
                                         char *err, size_t errlen) {
-    char *suffix = build_invalid_tool_call_error_suffix(r, thinking, detail);
+    char *suffix = build_invalid_tool_call_error_suffix(
+        r, thinking, detail, tool_block_closed);
     bool ok = append_rendered_suffix_to_live_session(s, slot, suffix,
                                                      tokens_appended,
                                                      err, errlen);
@@ -12805,6 +13406,21 @@ static char *build_tool_checkpoint_suffix(const request *r, const char *content,
         return build_qwen_assistant_suffix(r, content, reasoning, true, calls);
     }
     buf suffix = {0};
+    if (syntax == SERVER_MODEL_SYNTAX_K3) {
+        const bool think =
+            r && ds4_think_mode_enabled(r->think_mode);
+        if (think) {
+            append_k3_payload_text(&suffix, reasoning);
+            append_k3_close_tag(&suffix, "think");
+            append_k3_open_tag(&suffix, "response", NULL, NULL);
+        }
+        append_k3_payload_text(&suffix, content);
+        append_k3_close_tag(&suffix, "response");
+        append_k3_tool_calls(&suffix, calls);
+        append_k3_close_tag(&suffix, "message");
+        buf_puts(&suffix, "<|end_of_msg|>");
+        return buf_take(&suffix);
+    }
     if (r && ds4_think_mode_enabled(r->think_mode)) {
         buf_puts(&suffix, reasoning ? reasoning : "");
         buf_puts(&suffix, "</think>");
@@ -12829,6 +13445,23 @@ static char *build_responses_visible_assistant_suffix(const request *r,
                                            r && r->reasoning_summary_emit && calls && calls->len > 0, calls);
     }
     buf suffix = {0};
+    if (syntax == SERVER_MODEL_SYNTAX_K3) {
+        const bool think =
+            r && ds4_think_mode_enabled(r->think_mode);
+        if (think) {
+            if (r->reasoning_summary_emit && calls && calls->len > 0) {
+                append_k3_payload_text(&suffix, reasoning);
+            }
+            append_k3_close_tag(&suffix, "think");
+            append_k3_open_tag(&suffix, "response", NULL, NULL);
+        }
+        append_k3_payload_text(&suffix, content);
+        append_k3_close_tag(&suffix, "response");
+        append_k3_tool_calls(&suffix, calls);
+        append_k3_close_tag(&suffix, "message");
+        buf_puts(&suffix, "<|end_of_msg|>");
+        return buf_take(&suffix);
+    }
     /* This suffix mirrors what a Responses client can replay, not necessarily
      * every token in KV.  Hidden reasoning stays live in the session unless the
      * next client replay is expected to include it.  In practice, pi replays
@@ -12869,6 +13502,18 @@ static char *build_thinking_visible_text(const request *r,
                                          const char *content) {
     if (!r || !r->prompt_text) return NULL;
     if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
+
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_K3) {
+        buf visible = {0};
+        buf_puts(&visible, r->prompt_text);
+        append_k3_close_tag(&visible, "think");
+        append_k3_open_tag(&visible, "response", NULL, NULL);
+        append_k3_payload_text(&visible, content);
+        append_k3_close_tag(&visible, "response");
+        append_k3_close_tag(&visible, "message");
+        buf_puts(&visible, "<|end_of_msg|>");
+        return buf_take(&visible);
+    }
 
     size_t pt_len = strlen(r->prompt_text);
     if (r->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
@@ -13948,14 +14593,21 @@ decode_again:
         float top_p = j->req.top_p;
         float min_p = j->req.min_p;
         if (ds4_think_mode_enabled(j->req.think_mode)) {
-            /* Thinking keeps the fixed DeepSeek-style sampling defaults, but
+            /* Thinking keeps the active model's fixed sampling defaults, but
              * only for knobs the client left out: an explicit request value
              * (e.g. temperature 0 from a benchmark harness) must win, or the
              * same greedy request returns different text on every call. */
-            if (!j->req.temperature_set) temperature = DS4_DEFAULT_TEMPERATURE;
+            float default_temperature;
+            float default_top_p;
+            float default_min_p;
+            server_sampling_defaults(j->req.model_syntax,
+                                     &default_temperature,
+                                     &default_top_p,
+                                     &default_min_p);
+            if (!j->req.temperature_set) temperature = default_temperature;
             if (!j->req.top_k_set) top_k = 0;
-            if (!j->req.top_p_set) top_p = DS4_DEFAULT_TOP_P;
-            if (!j->req.min_p_set) min_p = DS4_DEFAULT_MIN_P;
+            if (!j->req.top_p_set) top_p = default_top_p;
+            if (!j->req.min_p_set) min_p = default_min_p;
         }
         const bool greedy_tool_syntax = !thinking.inside && in_tool_call &&
             !dsml_decode_state_uses_payload_sampling(dsml_state);
@@ -14173,8 +14825,13 @@ decode_again:
                     bool orphan_end = false;
                     bool old_start = saw_tool_start;
                     bool old_end = saw_tool_end;
+                    if (j->req.model_syntax == SERVER_MODEL_SYNTAX_K3) {
+                        observe_tool_markers_for_syntax(j->req.model_syntax, tool_scan,
+                            &saw_tool_start, &saw_tool_end, &orphan_end);
+                    } else {
                     observe_tool_markers(&dsml_tracker, tool_scan,
                                          &saw_tool_start, &saw_tool_end, &orphan_end);
+                    }
                     if (orphan_end && !saw_orphan_tool_end) {
                         saw_orphan_tool_end = true;
                         server_log(DS4_LOG_WARNING,
@@ -14343,6 +15000,7 @@ decode_again:
                             "unterminated tool call; continuing with model-visible tool error");
                 if (continue_after_invalid_dsml(s, slot, &j->req, &thinking,
                                                 "unterminated tool call",
+                                                false,
                                                 &recovery_tokens,
                                                 recovery_err,
                                                 sizeof(recovery_err)))
@@ -14445,6 +15103,7 @@ decode_again:
                             "invalid tool call; continuing with model-visible tool error");
                 if (continue_after_invalid_dsml(s, slot, &j->req, &thinking,
                                                 detail,
+                                                saw_tool_end,
                                                 &recovery_tokens,
                                                 recovery_err,
                                                 sizeof(recovery_err)))
@@ -15146,7 +15805,9 @@ static bool send_model(server *s, int fd, const char *id) {
 static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    if (ds4_engine_is_deepseek41(s->engine)) {
+    if (ds4_engine_is_k3(s->engine)) {
+        append_model_json(&b, s, "kimi-k3");
+    } else if (ds4_engine_is_deepseek41(s->engine)) {
         append_model_json(&b, s, server_model_id_from_engine(s->engine));
     } else if (ds4_engine_is_qwen4(s->engine)) {
         append_model_json(&b, s, "qwen3.8-flash-next");
@@ -15305,7 +15966,9 @@ static void *client_main(void *arg) {
     const size_t model_path_prefix_len = strlen(model_path_prefix);
     if (!strcmp(hr.method, "GET") &&
         !strncmp(hr.path, model_path_prefix, model_path_prefix_len) &&
-        server_model_alias_known(hr.path + model_path_prefix_len))
+        server_model_alias_known(
+            server_model_syntax_for_engine(s->engine),
+            hr.path + model_path_prefix_len))
     {
         send_model(s, fd, hr.path + model_path_prefix_len);
         http_request_free(&hr);
@@ -18218,15 +18881,34 @@ static void test_model_alias_thinking_controls(void) {
     TEST_ASSERT(model_alias_enables_thinking("deepseek-reasoner"));
     TEST_ASSERT(model_alias_enables_thinking("glm-5.2-reasoner"));
     TEST_ASSERT(model_alias_enables_thinking("zai/glm-5.2-reasoner"));
-    TEST_ASSERT(server_model_alias_known("glm-5.2-chat"));
-    TEST_ASSERT(server_model_alias_known("glm-5.2-reasoner"));
+    TEST_ASSERT(server_model_alias_known(SERVER_MODEL_SYNTAX_GLM, "glm-5.2-chat"));
+    TEST_ASSERT(server_model_alias_known(SERVER_MODEL_SYNTAX_GLM, "glm-5.2-reasoner"));
     TEST_ASSERT(model_alias_disables_thinking("glm-5.3-flash-chat"));
     TEST_ASSERT(model_alias_disables_thinking("zai/glm-5.3-flash-chat"));
     TEST_ASSERT(model_alias_enables_thinking("glm-5.3-flash-reasoner"));
     TEST_ASSERT(model_alias_enables_thinking("zai/glm-5.3-flash-reasoner"));
-    TEST_ASSERT(server_model_alias_known("glm-5.3-flash"));
-    TEST_ASSERT(server_model_alias_known("glm-5.3-flash-chat"));
-    TEST_ASSERT(server_model_alias_known("glm-5.3-flash-reasoner"));
+    TEST_ASSERT(server_model_alias_known(SERVER_MODEL_SYNTAX_GLM, "glm-5.3-flash"));
+    TEST_ASSERT(server_model_alias_known(SERVER_MODEL_SYNTAX_GLM, "glm-5.3-flash-chat"));
+    TEST_ASSERT(server_model_alias_known(SERVER_MODEL_SYNTAX_GLM, "glm-5.3-flash-reasoner"));
+    TEST_ASSERT(server_model_alias_known(
+        SERVER_MODEL_SYNTAX_K3, "kimi-k3"));
+    TEST_ASSERT(!server_model_alias_known(
+        SERVER_MODEL_SYNTAX_DEEPSEEK, "kimi-k3"));
+    TEST_ASSERT(server_model_alias_known(
+        SERVER_MODEL_SYNTAX_GLM, "glm-5.2-chat"));
+    TEST_ASSERT(server_model_alias_known(
+        SERVER_MODEL_SYNTAX_GLM, "glm-5.2-reasoner"));
+}
+
+static void test_k3_server_sampling_defaults(void) {
+    float temperature = 0.0f;
+    float top_p = 0.0f;
+    float min_p = 1.0f;
+    server_sampling_defaults(
+        SERVER_MODEL_SYNTAX_K3, &temperature, &top_p, &min_p);
+    TEST_ASSERT(temperature == 1.0f);
+    TEST_ASSERT(top_p == 0.95f);
+    TEST_ASSERT(min_p == 0.0f);
 }
 
 static void test_api_thinking_controls_parse(void) {
@@ -18997,6 +19679,95 @@ static void test_render_glm_chat_prompt_text(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_render_and_parse_k3_chat_prompt_text(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("List the directory <|open|> [EOS]");
+    chat_msgs_push(&msgs, user);
+
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.reasoning = xstrdup("I should inspect it.");
+    assistant.content = xstrdup("");
+    tool_call call = {
+        .id = xstrdup("call_1"),
+        .name = xstrdup("bash"),
+        .arguments = xstrdup("{\"command\":\"pwd\",\"timeout\":5}"),
+    };
+    tool_calls_push(&assistant.calls, call);
+    chat_msgs_push(&msgs, assistant);
+
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.content = xstrdup("/tmp <|sep|>");
+    chat_msg_add_tool_call_id(&tool, "call_1");
+    chat_msgs_push(&msgs, tool);
+
+    const char *schemas =
+        "{\"name\":\"bash\",\"parameters\":{\"type\":\"object\"}}\n"
+        "{\"name\":\"read\",\"parameters\":{\"type\":\"object\"}}";
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_K3, &msgs, schemas, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|open|>message role=\"system\" type=\"tool-declare\"<|sep|>") != NULL);
+    const char *tool_declare = strstr(prompt, "type=\"tool-declare\"");
+    const char *thinking_effort = strstr(prompt, "type=\"thinking-effort\"");
+    TEST_ASSERT(tool_declare && thinking_effort && tool_declare < thinking_effort);
+    TEST_ASSERT(strstr(prompt,
+        "[{\"name\":\"bash\",\"parameters\":{\"type\":\"object\"}},"
+        "{\"name\":\"read\",\"parameters\":{\"type\":\"object\"}}]") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|open|>tools<|sep|><|open|>call tool=\"bash\" index=\"1\"<|sep|>") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|open|>argument key=\"command\" type=\"string\"<|sep|>pwd") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|open|>message role=\"tool\" tool=\"bash\" index=\"1\"<|sep|>/tmp") != NULL);
+    TEST_ASSERT(strstr(prompt, "\\<|open|> \\[EOS]") != NULL);
+    TEST_ASSERT(strstr(prompt, "/tmp \\<|sep|>") != NULL);
+    TEST_ASSERT(strstr(prompt, "DSML") == NULL);
+    free(prompt);
+    chat_msgs_free(&msgs);
+
+    const char *generated =
+        "I should inspect it.</think><response>Done.</response>"
+        "<tools><call tool=\"bash\" index=\"1\">"
+        "<argument key=\"command\" type=\"string\">"
+        "pwd &amp;&amp; echo &quot;ok&quot;</argument>"
+        "<argument key=\"timeout\" type=\"number\">5</argument>"
+        "</call></tools></message>";
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls parsed = {0};
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_K3, generated, true,
+        &content, &reasoning, &parsed));
+    TEST_ASSERT(content && !strcmp(content, "Done."));
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "I should inspect it."));
+    TEST_ASSERT(parsed.len == 1);
+    TEST_ASSERT(parsed.v[0].name && !strcmp(parsed.v[0].name, "bash"));
+    TEST_ASSERT(parsed.v[0].arguments &&
+                !strcmp(parsed.v[0].arguments,
+                        "{\"command\": \"pwd && echo \\\"ok\\\"\", "
+                        "\"timeout\": 5}"));
+    free(content);
+    free(reasoning);
+    tool_calls_free(&parsed);
+
+    content = NULL;
+    reasoning = NULL;
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_K3, "unfinished reasoning", true,
+        &content, &reasoning, &parsed));
+    TEST_ASSERT(content && content[0] == '\0');
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "unfinished reasoning"));
+    TEST_ASSERT(parsed.len == 0);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&parsed);
+}
+
 static void test_render_glm_drops_old_reasoning_without_tools(void) {
     chat_msgs msgs = {0};
     chat_msg user1 = {0};
@@ -19286,6 +20057,44 @@ static void test_parse_glm_tool_call_message(void) {
     free(content);
     free(reasoning);
     tool_calls_free(&calls);
+}
+
+static void test_k3_text_stream_window_hides_xtml(void) {
+    request r = {0};
+    r.model_syntax = SERVER_MODEL_SYNTAX_K3;
+    r.has_tools = true;
+
+    const char *partial_open = "<respon";
+    server_text_stream_window window = text_stream_window(
+        &r, partial_open, 0, strlen(partial_open), false);
+    TEST_ASSERT(window.start == 0);
+    TEST_ASSERT(window.limit == 0);
+    TEST_ASSERT(!window.stopped);
+
+    const char *partial_close = "<response>Hello</res";
+    window = text_stream_window(
+        &r, partial_close, 0, strlen(partial_close), false);
+    TEST_ASSERT(window.start == strlen("<response>"));
+    TEST_ASSERT(window.limit == strlen("<response>Hello"));
+    TEST_ASSERT(!window.stopped);
+
+    const char *with_tool =
+        "<response>Hello</response><tools><call tool=\"bash\" index=\"0\">";
+    window = text_stream_window(
+        &r, with_tool, 0, strlen(with_tool), false);
+    TEST_ASSERT(window.start == strlen("<response>"));
+    TEST_ASSERT(window.limit == strlen("<response>Hello"));
+    TEST_ASSERT(window.tool != NULL);
+    TEST_ASSERT(!strncmp(window.tool, "<tools>", strlen("<tools>")));
+    TEST_ASSERT(window.stopped);
+
+    const char *plain_close = "Hello</response></message>";
+    window = text_stream_window(
+        &r, plain_close, 0, strlen(plain_close), false);
+    TEST_ASSERT(window.start == 0);
+    TEST_ASSERT(window.limit == strlen("Hello"));
+    TEST_ASSERT(window.tool == NULL);
+    TEST_ASSERT(window.stopped);
 }
 
 static void test_dsml_parser_recovers_loose_nested_parameters(void) {
@@ -19580,8 +20389,8 @@ static void test_invalid_glm_tool_error_suffix(void) {
     r.think_mode = DS4_THINK_HIGH;
     thinking_state st = {.inside = true};
 
-    char *suffix = build_invalid_tool_call_error_suffix(&r, &st,
-                                                        "missing arg_value");
+    char *suffix = build_invalid_tool_call_error_suffix(
+        &r, &st, "missing arg_value", true);
     TEST_ASSERT(suffix != NULL);
     TEST_ASSERT(strstr(suffix, "</think><|observation|><tool_response>") == suffix);
     TEST_ASSERT(strstr(suffix,
@@ -19638,6 +20447,84 @@ static void test_incomplete_tool_call_keeps_stop_reason(void) {
     }
 }
 
+static void test_k3_checkpoint_and_recovery_suffixes(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.model_syntax = SERVER_MODEL_SYNTAX_K3;
+    r.think_mode = DS4_THINK_HIGH;
+    r.reasoning_summary_emit = true;
+    r.prompt_text = xstrdup(
+        "<|open|>message role=\"assistant\"<|sep|>"
+        "<|open|>think<|sep|>");
+
+    tool_calls calls = {0};
+    tool_call call = {
+        .name = xstrdup("bash"),
+        .arguments = xstrdup("{\"command\":\"pwd\"}"),
+    };
+    tool_calls_push(&calls, call);
+
+    char *suffix = build_tool_checkpoint_suffix(
+        &r, "done", "need shell", &calls);
+    TEST_ASSERT(suffix != NULL);
+    TEST_ASSERT(strstr(
+        suffix,
+        "need shell<|close|>think<|sep|>"
+        "<|open|>response<|sep|>done"
+        "<|close|>response<|sep|>") == suffix);
+    TEST_ASSERT(strstr(
+        suffix,
+        "<|open|>tools<|sep|>"
+        "<|open|>call tool=\"bash\" index=\"1\"<|sep|>") != NULL);
+    TEST_ASSERT(strstr(suffix, "<|end_of_msg|>") != NULL);
+    TEST_ASSERT(strstr(suffix, "DSML") == NULL);
+    TEST_ASSERT(strstr(suffix, "<｜end▁of▁sentence｜>") == NULL);
+    free(suffix);
+
+    suffix = build_responses_visible_assistant_suffix(
+        &r, "done", "summary", &calls);
+    TEST_ASSERT(strstr(
+        suffix,
+        "summary<|close|>think<|sep|>"
+        "<|open|>response<|sep|>done") == suffix);
+    TEST_ASSERT(strstr(suffix, "DSML") == NULL);
+    free(suffix);
+
+    char *visible = build_thinking_visible_text(&r, "answer");
+    TEST_ASSERT(visible != NULL);
+    TEST_ASSERT(strstr(
+        visible,
+        "<|open|>think<|sep|><|close|>think<|sep|>"
+        "<|open|>response<|sep|>answer"
+        "<|close|>response<|sep|>"
+        "<|close|>message<|sep|><|end_of_msg|>") != NULL);
+    free(visible);
+
+    thinking_state st = {.inside = true};
+    suffix = build_invalid_tool_call_error_suffix(
+        &r, &st, "missing argument", false);
+    TEST_ASSERT(suffix != NULL);
+    TEST_ASSERT(strstr(
+        suffix,
+        "<|close|>tools<|sep|>"
+        "<|close|>think<|sep|>"
+        "<|close|>message<|sep|><|end_of_msg|>") == suffix);
+    TEST_ASSERT(strstr(
+        suffix,
+        "<|open|>message role=\"system\"<|sep|>"
+        "Tool error: invalid Kimi XTML tool call: missing argument") != NULL);
+    TEST_ASSERT(strstr(
+        suffix,
+        "<|open|>message role=\"assistant\"<|sep|>"
+        "<|open|>think<|sep|>") != NULL);
+    TEST_ASSERT(strstr(suffix, "DSML") == NULL);
+    TEST_ASSERT(strstr(suffix, "<｜end▁of▁sentence｜>") == NULL);
+    free(suffix);
+
+    tool_calls_free(&calls);
+    request_free(&r);
+}
+
 static void test_invalid_qwen_tool_error_suffix(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -19645,7 +20532,7 @@ static void test_invalid_qwen_tool_error_suffix(void) {
     r.think_mode = DS4_THINK_HIGH;
     thinking_state st = {.inside = true};
 
-    char *suffix = build_invalid_tool_call_error_suffix(&r, &st, "missing function name");
+    char *suffix = build_invalid_tool_call_error_suffix(&r, &st, "missing function name", false);
     TEST_ASSERT(suffix != NULL);
     TEST_ASSERT(strstr(suffix, "\n</think>\n\n<|im_end|>\n<|im_start|>user") == suffix);
     TEST_ASSERT(strstr(suffix, "Tool error: invalid Qwen tool call: missing function name") != NULL);
@@ -21420,6 +22307,18 @@ static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     st = thinking_state_from_prompt(&r);
     TEST_ASSERT(st.inside == false);
     request_free(&r);
+
+    request_init(&r, REQ_CHAT, 128);
+    r.model_syntax = SERVER_MODEL_SYNTAX_K3;
+    r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = xstrdup(
+        "<|open|>message role=\"assistant\"<|sep|>"
+        "<|open|>think<|sep|>");
+    st = thinking_state_from_prompt(&r);
+    TEST_ASSERT(st.inside == true);
+    thinking_state_feed(&st, "reasoning</think>", strlen("reasoning</think>"));
+    TEST_ASSERT(st.inside == false);
+    request_free(&r);
 }
 
 static void test_thinking_checkpoint_remember_gate(void) {
@@ -21487,6 +22386,25 @@ static void test_tool_marker_state_ignores_orphan_end(void) {
                          &saw_start, &saw_end, &orphan_end);
     TEST_ASSERT(saw_start);
     TEST_ASSERT(saw_end);
+
+    saw_start = false;
+    saw_end = false;
+    orphan_end = false;
+    observe_tool_markers_for_syntax(
+        SERVER_MODEL_SYNTAX_DEEPSEEK,
+        "<tools><call tool=\"bash\"></call></tools>",
+        &saw_start, &saw_end, &orphan_end);
+    TEST_ASSERT(!saw_start);
+    TEST_ASSERT(!saw_end);
+    TEST_ASSERT(!orphan_end);
+
+    observe_tool_markers_for_syntax(
+        SERVER_MODEL_SYNTAX_K3,
+        "<tools><call tool=\"bash\"></call></tools>",
+        &saw_start, &saw_end, &orphan_end);
+    TEST_ASSERT(saw_start);
+    TEST_ASSERT(saw_end);
+    TEST_ASSERT(!orphan_end);
 }
 
 static void test_canonical_rewrite_rebuilds_when_live_tail_changes(void) {
@@ -22951,6 +23869,7 @@ static void ds4_server_unit_tests_run(void) {
     test_chat_ignore_eos_contract();
     test_reasoning_effort_mapping();
     test_model_alias_thinking_controls();
+    test_k3_server_sampling_defaults();
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
     test_render_non_thinking_prompt_closes_think();
@@ -22972,6 +23891,8 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_checkpoint_suffix_matches_render();
     test_qwen_thinking_visible_text_matches_render();
     test_qwen_reasoning_effort_levels();
+    test_render_and_parse_k3_chat_prompt_text();
+    test_k3_text_stream_window_hides_xtml();
     test_render_glm_drops_old_reasoning_without_tools();
     test_render_glm_preserves_reasoning_with_tools();
     test_glm_tool_calls_render_matches_template();
@@ -23021,6 +23942,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_recovery_output_budget();
     test_incomplete_tool_call_keeps_stop_reason();
     test_invalid_qwen_tool_error_suffix();
+    test_k3_checkpoint_and_recovery_suffixes();
     test_thinking_dsml_is_not_executable_before_think_close();
     test_thinking_dsml_after_think_close_is_executable();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();

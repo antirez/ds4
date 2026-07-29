@@ -463,7 +463,29 @@ struct ds4_metal_dsv4_moe_swiglu_weight_args {
     uint64_t weight_stride;
     uint32_t write_clamped;
     float clamp_value;
+    uint32_t activation_kind;
+    float beta;
+    float linear_beta;
 };
+
+static inline float ds4_moe_activation_product(
+        float g,
+        float u,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args &args) {
+    if (args.activation_kind == 1u) {
+        const float bounded_gate =
+            args.beta * tanh(g / args.beta) / (1.0f + exp(-g));
+        const float bounded_up = args.linear_beta > 0.0f
+            ? args.linear_beta * tanh(u / args.linear_beta)
+            : u;
+        return bounded_gate * bounded_up;
+    }
+    if (args.clamp_value > 1.0e-6f) {
+        g = min(g, args.clamp_value);
+        u = clamp(u, -args.clamp_value, args.clamp_value);
+    }
+    return g / (1.0f + exp(-g)) * u;
+}
 
 struct ds4_metal_dsv4_moe_sum6_args {
     uint32_t width;
@@ -498,6 +520,16 @@ kernel void kernel_dsv4_moe_swiglu_weight(
     for (uint i = tid; i < args.width; i += ntg) {
         float g = gate_row[i];
         float u = up_row[i];
+        if (args.activation_kind == 1u) {
+            const float bounded_gate =
+                args.beta * tanh(g / args.beta) /
+                (1.0f + exp(-g));
+            const float bounded_up = args.linear_beta > 0.0f
+                ? args.linear_beta * tanh(u / args.linear_beta)
+                : u;
+            mid_row[i] = bounded_gate * bounded_up * route_weight;
+            continue;
+        }
         if (c > 1.0e-6f) {
             g = min(g, c);
             u = clamp(u, -c, c);
@@ -536,6 +568,17 @@ kernel void kernel_dsv4_moe_swiglu_weight_f16(
     for (uint i = tid; i < args.width; i += ntg) {
         float g = gate_row[i];
         float u = up_row[i];
+        if (args.activation_kind == 1u) {
+            const float bounded_gate =
+                args.beta * tanh(g / args.beta) /
+                (1.0f + exp(-g));
+            const float bounded_up = args.linear_beta > 0.0f
+                ? args.linear_beta * tanh(u / args.linear_beta)
+                : u;
+            mid_row[i] =
+                (half)(bounded_gate * bounded_up * route_weight);
+            continue;
+        }
         if (c > 1.0e-6f) {
             g = min(g, c);
             u = clamp(u, -c, c);
@@ -597,6 +640,41 @@ kernel void kernel_dsv4_moe_sum8_f32(
         v += s[5u * args.width + col];
         v += s[6u * args.width + col];
         v += s[7u * args.width + col];
+        d[col] = v;
+    }
+}
+
+kernel void kernel_dsv4_moe_sum16_f32(
+        constant ds4_metal_dsv4_moe_sum6_args &args,
+        device const char *src,
+        device       char *dst,
+        uint token[[threadgroup_position_in_grid]],
+        uint tid[[thread_position_in_threadgroup]],
+        uint ntg[[threads_per_threadgroup]]) {
+    if (token >= args.tokens) return;
+
+    device const float *s =
+        (device const float *)(src + (uint64_t)token * args.src_token_stride);
+    device float *d =
+        (device float *)(dst + (uint64_t)token * args.dst_token_stride);
+
+    for (uint col = tid; col < args.width; col += ntg) {
+        float v = s[col];
+        v += s[args.width + col];
+        v += s[2u * args.width + col];
+        v += s[3u * args.width + col];
+        v += s[4u * args.width + col];
+        v += s[5u * args.width + col];
+        v += s[6u * args.width + col];
+        v += s[7u * args.width + col];
+        v += s[8u * args.width + col];
+        v += s[9u * args.width + col];
+        v += s[10u * args.width + col];
+        v += s[11u * args.width + col];
+        v += s[12u * args.width + col];
+        v += s[13u * args.width + col];
+        v += s[14u * args.width + col];
+        v += s[15u * args.width + col];
         d[col] = v;
     }
 }
@@ -3685,17 +3763,12 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
         y4 += 32 * 32;
     }
 
-    device float *dst_gate_f32 =
-        (device float *)dst_gate + (uint64_t)i12 * args.ne0 * args.ne1 + (uint64_t)i11 * args.ne0;
-    device float *dst_up_f32 =
-        (device float *)dst_up + (uint64_t)i12 * args.ne0 * args.ne1 + (uint64_t)i11 * args.ne0;
     const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
     device float *dst_mid_f32 =
         (device float *)(dst_mid + pair_row * act.mid_row_stride);
     device const float *route_w =
         (device const float *)(weights + pair_row * act.weight_stride);
 
-    const float c = act.clamp_value;
     const float route_weight = route_w[0];
     float4 reduced_gate;
     float4 reduced_up;
@@ -3707,18 +3780,12 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
         const uint out_row = first_row + tiisg;
         const float gate = reduced_gate[tiisg] * 0.25f;
         const float up = reduced_up[tiisg] * 0.25f;
-        float g = gate;
-        float u = up;
-        if (c > 1.0e-6f) {
-            g = min(g, c);
-            u = clamp(u, -c, c);
-        }
-        dst_gate_f32[out_row] = gate;
-        dst_up_f32[out_row] = up;
-        const float silu = g / (1.0f + exp(-g));
-        dst_mid_f32[out_row] = silu * u * route_weight;
+        dst_mid_f32[out_row] =
+            ds4_moe_activation_product(gate, up, act) * route_weight;
     }
 
+    (void)dst_gate;
+    (void)dst_up;
     (void)tiitg;
 }
 
@@ -3951,20 +4018,14 @@ kernel void kernel_mul_mv_slots6_iq2_xxs_pair_swiglu_f32(
     const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
     device float *mid_f32 = (device float *)(dst_mid + pair_row * act.mid_row_stride);
     device const float *route_w = (device const float *)(weights + pair_row * act.weight_stride);
-    const float c = act.clamp_value;
     const float route_weight = route_w[0];
 
     if (tiisg == 0) {
         for (int row = 0; row < N_R0_IQ2_XXS && first_row + row < args.ne0; ++row) {
             const uint out_row = first_row + row;
-            float g = gate_f32[out_row];
-            float u = up_f32[out_row];
-            if (c > 1.0e-6f) {
-                g = min(g, c);
-                u = clamp(u, -c, c);
-            }
-            const float silu = g / (1.0f + exp(-g));
-            mid_f32[out_row] = silu * u * route_weight;
+            mid_f32[out_row] =
+                ds4_moe_activation_product(
+                    gate_f32[out_row], up_f32[out_row], act) * route_weight;
         }
     }
 
@@ -3992,7 +4053,7 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32(
     tgpig.z = 0;
 
     const int32_t i02 = ((device const int32_t *)(ids + iid1 * args.nbi1))[idx];
-    if (i02 < 0 || i02 >= args.ne02 || i02 >= 384) {
+    if (i02 < 0 || i02 >= args.ne02 || i02 >= 1024) {
         return;
     }
     const uint64_t gate_addr = gate_addrs[(uint)i02];
@@ -4040,20 +4101,14 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32(
     const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
     device float *mid_f32 = (device float *)(dst_mid + pair_row * act.mid_row_stride);
     device const float *route_w = (device const float *)(weights + pair_row * act.weight_stride);
-    const float c = act.clamp_value;
     const float route_weight = route_w[0];
 
     if (tiisg == 0) {
         for (int row = 0; row < N_R0_IQ2_XXS && first_row + row < args.ne0; ++row) {
             const uint out_row = first_row + row;
-            float g = gate_f32[out_row];
-            float u = up_f32[out_row];
-            if (c > 1.0e-6f) {
-                g = min(g, c);
-                u = clamp(u, -c, c);
-            }
-            const float silu = g / (1.0f + exp(-g));
-            mid_f32[out_row] = silu * u * route_weight;
+            mid_f32[out_row] =
+                ds4_moe_activation_product(
+                    gate_f32[out_row], up_f32[out_row], act) * route_weight;
         }
     }
 }
@@ -4077,7 +4132,7 @@ kernel void kernel_mul_mv_addr_iq2_xxs_f32(
     tgpig.z = 0;
 
     const int32_t i02 = ((device const int32_t *)(ids + iid1 * args.nbi1))[idx];
-    if (i02 < 0 || i02 >= args.ne02 || i02 >= 384) {
+    if (i02 < 0 || i02 >= args.ne02 || i02 >= 1024) {
         return;
     }
     const uint64_t addr = addrs[(uint)i02];
@@ -4137,7 +4192,7 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32(
     tgpig.z = 0;
 
     const int32_t i02 = ((device const int32_t *)(ids + iid1 * args.nbi1))[idx];
-    if (i02 < 0 || i02 >= args.ne02 || i02 >= 384) {
+    if (i02 < 0 || i02 >= args.ne02 || i02 >= 1024) {
         return;
     }
     const uint64_t gate_addr = gate_addrs[(uint)i02];
@@ -4185,20 +4240,14 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32(
     const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
     device float *mid_f32 = (device float *)(dst_mid + pair_row * act.mid_row_stride);
     device const float *route_w = (device const float *)(weights + pair_row * act.weight_stride);
-    const float c = act.clamp_value;
     const float route_weight = route_w[0];
 
     if (tiisg == 0) {
         for (int row = 0; row < N_R0_IQ2_XXS && first_row + row < args.ne0; ++row) {
             const uint out_row = first_row + row;
-            float g = gate_f32[out_row];
-            float u = up_f32[out_row];
-            if (c > 1.0e-6f) {
-                g = min(g, c);
-                u = clamp(u, -c, c);
-            }
-            const float silu = g / (1.0f + exp(-g));
-            mid_f32[out_row] = silu * u * route_weight;
+            mid_f32[out_row] =
+                ds4_moe_activation_product(
+                    gate_f32[out_row], up_f32[out_row], act) * route_weight;
         }
     }
 
@@ -4227,7 +4276,7 @@ kernel void kernel_stream_expert_cache_validate(
         if (i >= n_expert) continue;
         if (expert < 0 ||
             (uint32_t)expert >= args.n_total_expert ||
-            (uint32_t)expert >= 384) {
+            (uint32_t)expert >= 1024) {
             invalid_mask |= (1u << i);
             continue;
         }
@@ -6027,7 +6076,7 @@ kernel void kernel_mul_mv_slots6_q2_K_sum6_f32(
     const short ir = it % 4;
     const short is = (8 * ir) / 16;
 
-    for (int expert_slot = 0; expert_slot < 6; expert_slot++) {
+    for (int expert_slot = 0; expert_slot < args.nei0; expert_slot++) {
         device const char *src0_cur = src00;
         switch (expert_slot) {
         case 1: src0_cur = src01; break;
@@ -6128,9 +6177,9 @@ kernel void kernel_mul_mv_addr_q2_K_sum6_f32(
     const short ir = it % 4;
     const short is = (8 * ir) / 16;
 
-    for (int expert_slot = 0; expert_slot < 6; expert_slot++) {
+    for (int expert_slot = 0; expert_slot < args.nei0; expert_slot++) {
         const int32_t expert = token_ids[expert_slot];
-        if (expert < 0 || expert >= args.ne02 || expert >= 384) {
+        if (expert < 0 || expert >= args.ne02 || expert >= 1024) {
             continue;
         }
         const uint64_t addr = addrs[(uint)expert];
@@ -6229,12 +6278,12 @@ kernel void kernel_mul_mv_addr_q2_K_sum6_masked_f32(
     const short ir = it % 4;
     const short is = (8 * ir) / 16;
 
-    for (int expert_slot = 0; expert_slot < 6; expert_slot++) {
+    for (int expert_slot = 0; expert_slot < args.nei0; expert_slot++) {
         if ((split.active_mask & (1u << (uint)expert_slot)) == 0) {
             continue;
         }
         const int32_t expert = token_ids[expert_slot];
-        if (expert < 0 || expert >= args.ne02 || expert >= 384) {
+        if (expert < 0 || expert >= args.ne02 || expert >= 1024) {
             continue;
         }
         const uint64_t addr = addrs[(uint)expert];
@@ -8369,7 +8418,7 @@ kernel void kernel_mul_mm_id_addr(
     }
 }
 
-// Fused routed gate+up grouped matmul with the SwiGLU epilogue, generic over
+// Fused routed gate+up grouped matmul with the weighted activation epilogue, generic over
 // the expert quant block.  Both A streams share one staged B tile per k-step;
 // each output keeps the exact MMA accumulation order of the separate GEMMs,
 // and the epilogue matches kernel_dsv4_moe_swiglu_weight_f16, so the fused
@@ -8553,7 +8602,6 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const float c = act.clamp_value;
     for (short j = sgitg; j < nr1; j += 4) {
         const int idj = ids_i32[im*args.ne21 + r1 + j];
 
@@ -8570,14 +8618,8 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
 
         int i = tiisg;
         for (; i < nr0; i += 32) {
-            float g = Cg[i];
-            float u = Cu[i];
-            if (c > 1.0e-6f) {
-                g = min(g, c);
-                u = clamp(u, -c, c);
-            }
-            const float silu = g / (1.0f + exp(-g));
-            D[i] = (half)(silu * u * route_weight);
+            D[i] = (half)(ds4_moe_activation_product(Cg[i], Cu[i], act) *
+                          route_weight);
         }
     }
 }

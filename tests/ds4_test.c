@@ -9,6 +9,10 @@
 
 bool ds4_test_dspark_cache_window_crop(void);
 bool ds4_test_dspark_prefix_capture(ds4_engine *engine, const ds4_tokens *prompt);
+bool ds4_dist_result_activation_bits_valid(
+        uint32_t model_id,
+        uint32_t expected_bits,
+        uint32_t payload_bits);
 
 static ds4_engine *test_engine_fast;
 static ds4_engine *test_engine_quality;
@@ -7312,6 +7316,16 @@ static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
 
+static void test_distributed_activation_widths(void) {
+    TEST_ASSERT(ds4_dist_result_activation_bits_valid(3u, 32u, 32u));
+    TEST_ASSERT(!ds4_dist_result_activation_bits_valid(3u, 32u, 16u));
+    TEST_ASSERT(!ds4_dist_result_activation_bits_valid(3u, 32u, 8u));
+    TEST_ASSERT(!ds4_dist_result_activation_bits_valid(3u, 32u, 7u));
+    TEST_ASSERT(ds4_dist_result_activation_bits_valid(1u, 16u, 16u));
+    TEST_ASSERT(ds4_dist_result_activation_bits_valid(1u, 8u, 8u));
+    TEST_ASSERT(!ds4_dist_result_activation_bits_valid(1u, 16u, 32u));
+}
+
 typedef void (*test_fn)(void);
 
 typedef struct {
@@ -7342,6 +7356,7 @@ static const ds4_test_entry test_entries[] = {
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
     {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
 #endif
+    {"--distributed-activation-widths", "distributed-activation-widths", "distributed result activation-width validation", test_distributed_activation_widths},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 
