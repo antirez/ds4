@@ -11235,6 +11235,16 @@ static bool send_models(server *s, int fd) {
     return ok;
 }
 
+static bool send_anthropic_count_tokens(int fd, bool enable_cors, int input_tokens) {
+    buf b = {0};
+    buf_puts(&b, "{\"input_tokens\":");
+    buf_printf(&b, "%d", input_tokens);
+    buf_puts(&b, "}\n");
+    bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
 static void client_done(server *s) {
     pthread_mutex_lock(&s->mu);
     if (s->clients > 0) s->clients--;
@@ -11282,7 +11292,18 @@ static void *client_main(void *arg) {
     char err[160];
     bool ok = false;
     const int ctx_size = ds4_session_ctx(s->session);
-    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages/count_tokens")) {
+        ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
+                                     ctx_size, &req, err, sizeof(err));
+        http_request_free(&hr);
+        if (!ok) {
+            http_error(fd, s->enable_cors, 400, err);
+            goto done;
+        }
+        send_anthropic_count_tokens(fd, s->enable_cors, req.prompt.len);
+        request_free(&req);
+        goto done;
+    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {
@@ -12233,6 +12254,24 @@ static void test_cors_preflight_response_is_no_content(void) {
     TEST_ASSERT(strstr(out, "Content-Type:") == NULL);
     TEST_ASSERT(strstr(out, "Access-Control-Allow-Origin: *") != NULL);
 
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_anthropic_count_tokens_response_shape(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    TEST_ASSERT(send_anthropic_count_tokens(sv[0], true, 123));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
+    TEST_ASSERT(strstr(out, "Content-Type: application/json") != NULL);
+    TEST_ASSERT(strstr(out, "Access-Control-Allow-Origin: *") != NULL);
+    TEST_ASSERT(strstr(out, "{\"input_tokens\":123}\n") != NULL);
+    TEST_ASSERT(strstr(out, "\"usage\"") == NULL);
     free(out);
     close(sv[0]);
     close(sv[1]);
@@ -15781,6 +15820,7 @@ static void ds4_server_unit_tests_run(void) {
     test_context_length_error_uses_protocol_standard_shape();
     test_cors_headers_are_opt_in();
     test_cors_preflight_response_is_no_content();
+    test_anthropic_count_tokens_response_shape();
     test_cors_sse_headers();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_usage_reports_cache_details();
