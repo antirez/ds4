@@ -97,38 +97,38 @@ typedef struct {
 
 #include "rocm/ds4_rocm_norm_rope.cuh"
 
-#include "rocm/ds4_rocm_fp8_kv.cuh"
+#include "models/deepseek/rocm/fp8_kv.cuh"
 
-#include "rocm/ds4_rocm_attention.cuh"
+#include "models/deepseek/rocm/attention.cuh"
 
-#include "rocm/ds4_rocm_hc.cuh"
+#include "models/deepseek/rocm/hc.cuh"
 
-#include "rocm/ds4_rocm_output.cuh"
+#include "models/deepseek/rocm/output.cuh"
 
-#include "rocm/ds4_rocm_indexer.cuh"
+#include "models/deepseek/rocm/indexer.cuh"
 
 #include "rocm/ds4_rocm_embedding_launch.cuh"
 
 #include "rocm/ds4_rocm_matmul.cuh"
 
-#include "rocm/ds4_rocm_fp8_kv_launch.cuh"
+#include "models/deepseek/rocm/fp8_kv_launch.cuh"
 
-#include "rocm/ds4_rocm_compressor.cuh"
+#include "models/deepseek/rocm/compressor.cuh"
 
-#include "rocm/ds4_rocm_attention_launch.cuh"
+#include "models/deepseek/rocm/attention_launch.cuh"
 
 #include "rocm/ds4_rocm_shared_expert.cuh"
 
 #include "rocm/ds4_rocm_misc_launch.cuh"
-#include "rocm/ds4_rocm_router.cuh"
+#include "models/deepseek/rocm/router.cuh"
 
 #include "rocm/ds4_rocm_moe.cuh"
 
 #include "rocm/ds4_rocm_moe_launch.cuh"
 
-#include "rocm/ds4_rocm_glm.cuh"
+#include "models/glm/rocm/kernels.cuh"
 
-#include "rocm/ds4_rocm_hc_output_launch.cuh"
+#include "models/deepseek/rocm/hc_output_launch.cuh"
 
 #include "rocm/ds4_rocm_current_api_compat.cuh"
 

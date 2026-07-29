@@ -26,6 +26,7 @@
 /tests/test_metal_session_batch
 /tests/test_q4k_dot
 /tests/test_sampling
+/tests/test_session_snapshot
 *.o
 *.dSYM/
 __pycache__/
