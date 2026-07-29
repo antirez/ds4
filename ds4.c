@@ -43,6 +43,8 @@
 #include "ds4.h"
 #include "ds4_model_provider.h"
 #include "ds4_model_provider_builtin.h"
+#include "models/deepseek/provider.h"
+#include "models/glm/provider.h"
 #include "ds4_distributed.h"
 #include "ds4_tp.h"
 
@@ -5561,8 +5563,8 @@ static void dspark_weights_bind_optional(
 }
 
 #include "kernels/cpu_matmul.inc"
-#include "models/deepseek_cpu.inc"
-#include "models/glm_cpu.inc"
+#include "models/deepseek/cpu.inc"
+#include "models/glm/cpu.inc"
 
 #ifndef DS4_NO_GPU
 static int sample_argmax(const float *logits, uint32_t n_vocab);
@@ -5620,7 +5622,7 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
 }
 
 #ifndef DS4_NO_GPU
-#include "models/deepseek_graph.inc"
+#include "models/deepseek/graph.inc"
 #endif
 
 typedef struct ds4_vocab ds4_vocab;
@@ -7706,7 +7708,7 @@ static int generate_raw_swa_cpu(
 }
 
 #ifndef DS4_NO_GPU
-#include "models/glm_graph.inc"
+#include "models/glm/graph.inc"
 
 /* Metal generation entry point.  The model runs as one local whole-graph
  * pipeline: graph prefill followed by graph decode steps.  Streaming PRO may
@@ -8124,7 +8126,7 @@ static size_t engine_per_layer_kv_bytes_planner(uint32_t il,
 
 /* Per-used-tier Class-P graph overhead estimate. Mirrors the
  * `*_by_tier[t]` allocations in
- * metal_graph_alloc_raw_cap() in models/deepseek_graph.inc, including decode,
+ * metal_graph_alloc_raw_cap() in models/deepseek/graph.inc, including decode,
  * FFN, head, prompt-token, and chunked-prefill scratch.
  *
  * The runtime loop replicates an entire set of Class-P kernel-scratch

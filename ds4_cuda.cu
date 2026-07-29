@@ -235,10 +235,10 @@ static int cuda_q4_mma_tile16_shmem_ok(int which_down);
 static void routed_moe_decode_graph_destroy_one(int logical_tier);
 
 #include "cuda/runtime.inc"
-#include "cuda/deepseek_dense_attention.inc"
-#include "cuda/deepseek_control.inc"
+#include "models/deepseek/cuda/dense_attention.inc"
+#include "models/deepseek/cuda/control.inc"
 #include "cuda/common_dispatch.inc"
-#include "cuda/deepseek_moe.inc"
-#include "cuda/deepseek_hc.inc"
+#include "models/deepseek/cuda/moe.inc"
+#include "models/deepseek/cuda/hc.inc"
 #include "cuda/runtime_services.inc"
-#include "cuda/glm.inc"
+#include "models/glm/cuda/kernels.inc"

@@ -1,18 +1,34 @@
-# Model implementation units
+# Model integrations
 
-These files contain concrete, model-specific inference code:
+Each directory owns one complete, tailored model integration:
 
-- `deepseek_cpu.inc`: DeepSeek V4 CPU reference and decode pipeline.
-- `deepseek_graph.inc`: DeepSeek V4 GPU graph state, allocation, prefill,
-  decode, and diagnostics.
-- `glm_cpu.inc`: GLM CPU reference kernels used by correctness diagnostics.
-- `glm_graph.inc`: GLM DSA GPU graph state, allocation, prefill, decode, MTP,
-  and diagnostics.
+```text
+models/<model>/
+├── provider.c / provider.h
+├── cpu.inc
+├── graph.inc
+├── cuda/
+├── metal/
+│   ├── host/
+│   └── shaders/
+└── rocm/
+```
 
-They are implementation fragments included exactly once by `ds4.c`. This is
-deliberate: the existing pipelines share many private tensor, model, backend,
-and session types. Keeping one translation unit preserves static linkage and
-optimization while giving each model a clear source boundary.
+The engine-facing boundary is the whole-model `ds4_model_provider_v1`
+lifecycle. A provider owns its session orchestration and calls its custom
+kernels directly; there is intentionally no generic kernel, operator, graph,
+or tensor interface between them.
 
-The runtime boundary is `ds4_model_provider_v1`; these files do not implement a
-generic kernel or operator layer.
+The `.inc` implementation fragments are still included exactly once by the
+engine or backend entry point. This preserves the existing single translation
+units, private types, static linkage, and compiler visibility. The directory
+split expresses ownership without adding wrappers to hot paths.
+
+Code belongs under `models/<model>/` when its semantics, tensor layout, or
+launch sequence are specific to that model. Backend runtime, memory management,
+and genuinely reused low-level primitives remain under `cuda/`, `metal/`,
+`rocm/`, and `kernels/`.
+
+To add a model, implement its provider and the backend paths it supports. It is
+fine to duplicate kernels when separate implementations are easier to tune or
+understand.

@@ -1,8 +1,9 @@
 # Agent Notes
 
-`ds4.c` is a DeepSeek V4 Flash specific inference engine. It is not a generic
-GGUF runner. The goal is a small, readable, high-performance C codebase with
-Objective-C only where Metal requires it and Metal kernels under `metal/`.
+DS4 is a model-specific inference engine. It is not a generic GGUF runner. The
+goal is a small, readable, high-performance C codebase with model integrations
+under `models/`, Objective-C only where Metal requires it, and shared backend
+infrastructure kept outside model directories.
 
 ## Goals
 
@@ -30,13 +31,18 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
 
 ## Layout
 
-- `ds4.c`: model loading, tokenizer, CPU reference code, Metal graph scheduling,
-  sessions, disk-cache payload serialization.
+- `ds4.c`: engine loading, tokenizer, sessions, placement, and disk-cache
+  orchestration.
+- `ds4_model_provider.h`: whole-model lifecycle boundary used by the engine.
+- `models/<model>/`: one model's provider, CPU/graph orchestration, and custom
+  CUDA, Metal, and ROCm implementations.
 - `ds4_cli.c`: command line, linenoise REPL, interactive transcript handling.
 - `ds4_server.c`: OpenAI/Anthropic compatible HTTP API, worker queue, streaming,
   tool-call mapping, disk KV cache policy.
-- `ds4_metal.m`: Objective-C Metal runtime and kernel wrappers.
-- `metal/*.metal`: compute kernels.
+- `ds4_cuda.cu`, `ds4_metal.m`, `ds4_rocm.cu`: backend translation-unit entry
+  points.
+- `cuda/`, `metal/`, `rocm/`, `kernels/`: shared backend runtime and reusable
+  low-level primitives.
 - `tests/`: unit and live integration tests.
 - `misc/`: ignored notes, experiments, and old planning material.
 
