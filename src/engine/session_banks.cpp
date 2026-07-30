@@ -49,7 +49,8 @@ static void token_vec_set_prefix(token_vec *d, const int *toks, int n) {
 
 /* Tier-2 PATH-A (plan-33 inc A) — deep-copy one bank carry into another (src's
  * conversation continues on dst). Reuses d's owned heap buffers; no alias/leak. */
-static void bank_carry_copy(pulsar_bank_carry *d, const pulsar_bank_carry *sc) {
+void pulsar_bank_carry::copy(const pulsar_bank_carry *sc) {
+    auto *d = this;
     token_vec d_ck = d->checkpoint;              /* keep d's own token buffer */
     float   *d_logits = d->logits;
     float   *d_qrows = d->dspark_pending_qrows;
@@ -113,7 +114,7 @@ int pulsar_session::bank_fork(uint32_t src, uint32_t dst,
     if (!bank_carry_ensure(s)) { g->fork_pin[src] = 0u; return 1; }
     if (src == cur) s->bank_state_save(src);      /* refresh from live session */
     if (src < s->bank_carry_n && dst < s->bank_carry_n) {
-        bank_carry_copy(&s->bank_carry[dst], &s->bank_carry[src]);
+        s->bank_carry[dst].copy(&s->bank_carry[src]);
     }
     /* dst owns tokens[0..n_cached) as its committed frontier. SET it explicitly
      * from the validated request prefix (do not trust the copied carry alone). */
@@ -210,7 +211,7 @@ int pulsar_session::bank_fork_partial(uint32_t src, uint32_t dst,
      * possibly-stale/short carry (a fresh dst carry starts at len 0, so the old
      * `checkpoint.len = R` set a length past the buffer's real contents). */
     if (src != dst && src < s->bank_carry_n && dst < s->bank_carry_n) {
-        bank_carry_copy(&s->bank_carry[dst], &s->bank_carry[src]);
+        s->bank_carry[dst].copy(&s->bank_carry[src]);
     }
     if (dst < s->bank_carry_n) {
         pulsar_bank_carry *c = &s->bank_carry[dst];
@@ -397,7 +398,8 @@ int pulsar_session::bank_kv_load(uint32_t bank, FILE *fp,
  * host half; the graph frontier counters ride gpu_graph_bank_counters_*, and
  * (Option F) the per-bank drafter ring rides gpu_graph_bank_repoint. */
 
-static void bank_carry_free_one(pulsar_bank_carry *c) {
+void pulsar_bank_carry::free_one() {
+    auto *c = this;
     if (!c) return;
     token_vec_free(&c->checkpoint);
     free(c->logits);
@@ -408,7 +410,7 @@ static void bank_carry_free_one(pulsar_bank_carry *c) {
 void pulsar_session::bank_carry_free() {
     auto *s = this;
     if (!s || !s->bank_carry) return;
-    for (uint32_t i = 0; i < s->bank_carry_n; i++) bank_carry_free_one(&s->bank_carry[i]);
+    for (uint32_t i = 0; i < s->bank_carry_n; i++) s->bank_carry[i].free_one();
     free(s->bank_carry);
     s->bank_carry = NULL;
     s->bank_carry_n = 0;

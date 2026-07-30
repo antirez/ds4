@@ -12,8 +12,8 @@
  * decide whether they are formatting or literal text.
  */
 
-static void agent_tail_capture_append(agent_tail_capture *t,
-                                      const char *s, size_t n) {
+void agent_tail_capture::append(const char *s, size_t n) {
+    auto *t = this;
     if (!t || !n) return;
     if (!t->cap) return;
     if (!t->buf) t->buf = (char *)agent_xmalloc(t->cap);
@@ -52,7 +52,8 @@ static void agent_tail_capture_append(agent_tail_capture *t,
 
 
 
-char *agent_tail_capture_take(agent_tail_capture *t, size_t *len) {
+char *agent_tail_capture::take(size_t *len) {
+    auto *t = this;
     size_t n = t ? t->len : 0;
     char *out = (char *)agent_xmalloc(n + 1);
     if (n) {
@@ -71,7 +72,7 @@ char *agent_tail_capture_take(agent_tail_capture *t, size_t *len) {
 
 
 void renderer_write(agent_token_renderer *r, const char *s, size_t n) {
-    if (r->capture) agent_tail_capture_append(r->capture, s, n);
+    if (r->capture) r->capture->append(s, n);
     else agent_publish(r->worker, s, n);
 }
 
@@ -529,8 +530,8 @@ static bool agent_syntax_separator(char c) {
 
 
 
-static const char *agent_syntax_line_comment(const agent_syntax *syn,
-                                             const char *p) {
+const char *agent_syntax::line_comment(const char *p) const {
+    const auto *syn = this;
     if (!syn) return NULL;
     for (int i = 0; i < 3 && syn->singleline_comments[i]; i++) {
         const char *m = syn->singleline_comments[i];
@@ -600,11 +601,11 @@ static size_t agent_syntax_keyword_len(const char *kw, bool *secondary) {
 
 
 
-static bool agent_syntax_match_keyword(const agent_syntax *syn,
-                                       const char *p,
-                                       const char *line_end,
-                                       size_t *out_len,
-                                       int *out_hl) {
+bool agent_syntax::match_keyword(const char *p,
+                                 const char *line_end,
+                                 size_t *out_len,
+                                 int *out_hl) const {
+    const auto *syn = this;
     if (!syn || !syn->keywords) return false;
     for (int i = 0; syn->keywords[i]; i++) {
         bool secondary = false;
@@ -688,7 +689,7 @@ static void renderer_syntax_emit_line(agent_token_renderer *r,
             return;
         }
 
-        const char *scs = agent_syntax_line_comment(syn, p);
+        const char *scs = syn->line_comment(p);
         if (!in_string && scs) {
             renderer_syntax_write(r, AGENT_HL_COMMENT, p, (size_t)(end - p));
             return;
@@ -765,7 +766,7 @@ static void renderer_syntax_emit_line(agent_token_renderer *r,
         if (prev_sep) {
             size_t klen = 0;
             int khl = AGENT_HL_NORMAL;
-            if (agent_syntax_match_keyword(syn, p, end, &klen, &khl)) {
+            if (syn->match_keyword(p, end, &klen, &khl)) {
                 renderer_syntax_write(r, khl, p, klen);
                 p += klen;
                 prev_sep = false;

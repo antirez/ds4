@@ -76,7 +76,7 @@ int server::chat_think_tool_recovery(session_slot *sl,
         (*completion)++;
     }
     buf_append(text, inject, inject_len);
-    thinking_state_feed(thinking, inject, inject_len);
+    thinking->feed(inject, inject_len);
     *scan_from = text->len;
     pulsar_tokens_free(&toks);
     return 1;
@@ -1236,7 +1236,7 @@ bool server::gen_emit_token(session_slot *sl, int token) {
 
     s->trace_piece(g->trace_id, piece, piece_len);
     buf_append(&g->text, piece, piece_len);
-    thinking_state_feed(&g->thinking, piece, piece_len);
+    g->thinking.feed(piece, piece_len);
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         dsml_decode_tracker_update(&g->dsml_tracker, g->text.ptr, g->text.len);
     }

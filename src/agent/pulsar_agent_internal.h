@@ -219,6 +219,8 @@ typedef struct agent_tail_capture {
     size_t start;
     size_t len;
     size_t total;
+    void append(const char *s, size_t n);   /* was agent_tail_capture_append */
+    char *take(size_t *len);                 /* was agent_tail_capture_take */
 } agent_tail_capture;
 
 typedef enum {
@@ -388,6 +390,8 @@ struct agent_syntax {
     const char *multiline_start;
     const char *multiline_end;
     unsigned flags;
+    const char *line_comment(const char *p) const;                                    /* was agent_syntax_line_comment */
+    bool match_keyword(const char *p, const char *line_end, size_t *out_len, int *out_hl) const; /* was agent_syntax_match_keyword */
 };
 
 typedef struct {
@@ -606,7 +610,6 @@ bool agent_dsml_parameter_close_tail(const char *tail, size_t len,
                                             bool *complete);
 void agent_dsml_start(agent_dsml_parser *p);
 void agent_dsml_feed(agent_dsml_parser *p, const char *s, size_t n);
-char *agent_tail_capture_take(agent_tail_capture *t, size_t *len);
 void renderer_write(agent_token_renderer *r, const char *s, size_t n);
 void renderer_reset_color(agent_token_renderer *r);
 void renderer_restore_text_attrs(agent_token_renderer *r);

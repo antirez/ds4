@@ -1187,6 +1187,8 @@ typedef struct thinking_state {
     bool inside;
     char tail[8]; /* Long enough for "</think>". */
     int tail_len;
+    bool tail_ends_with(const char *s) const;   /* was thinking_tail_ends_with */
+    void feed(const char *p, size_t len);        /* was thinking_state_feed */
 } thinking_state;
 
 /* Resumable per-job generation state machine (moved verbatim from
@@ -1719,7 +1721,6 @@ void log_decode_progress(req_kind kind, int prompt_tokens, int completion,
                                 bool dsml_start, bool dsml_end,
                                 double decode_t0,
                                 double *last_t, int *last_completion);
-void thinking_state_feed(thinking_state *st, const char *p, size_t len);
 thinking_state thinking_state_from_prompt(const request *r);
 char *build_invalid_dsml_tool_error_suffix(const request *r,
                                                   const thinking_state *thinking,

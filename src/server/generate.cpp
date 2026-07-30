@@ -2,14 +2,16 @@
 
 
 
-static bool thinking_tail_ends_with(const thinking_state *st, const char *s) {
+bool thinking_state::tail_ends_with(const char *s) const {
+    const auto *st = this;
     int n = (int)strlen(s);
     return st->tail_len >= n && !memcmp(st->tail + st->tail_len - n, s, (size_t)n);
 }
 
 
 
-void thinking_state_feed(thinking_state *st, const char *p, size_t len) {
+void thinking_state::feed(const char *p, size_t len) {
+    auto *st = this;
     if (!st || !p) return;
     for (size_t i = 0; i < len; i++) {
         if (st->tail_len == (int)sizeof(st->tail)) {
@@ -17,8 +19,8 @@ void thinking_state_feed(thinking_state *st, const char *p, size_t len) {
             st->tail_len--;
         }
         st->tail[st->tail_len++] = p[i];
-        if (thinking_tail_ends_with(st, "<think>")) st->inside = true;
-        else if (thinking_tail_ends_with(st, "</think>")) st->inside = false;
+        if (st->tail_ends_with("<think>")) st->inside = true;
+        else if (st->tail_ends_with("</think>")) st->inside = false;
     }
 }
 
@@ -27,7 +29,7 @@ void thinking_state_feed(thinking_state *st, const char *p, size_t len) {
 thinking_state thinking_state_from_prompt(const request *r) {
     thinking_state st = {0};
     if (r && r->prompt_text) {
-        thinking_state_feed(&st, r->prompt_text, strlen(r->prompt_text));
+        st.feed(r->prompt_text, strlen(r->prompt_text));
     } else if (r && pulsar_think_mode_enabled(r->think_mode)) {
         st.inside = true;
     }

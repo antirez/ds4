@@ -1504,6 +1504,8 @@ typedef struct pulsar_bank_carry {
      * gpu_graph_bank_counters_install and then clears it unconditionally.  The
      * old mirror field was write-only (saved, never read) and has been dropped. */
     pulsar_spec_carry_state spec;
+    void copy(const pulsar_bank_carry *sc);   /* was bank_carry_copy */
+    void free_one();                          /* was bank_carry_free_one */
 } pulsar_bank_carry;
 
 

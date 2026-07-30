@@ -1539,7 +1539,7 @@ static void test_think_tool_recovery(void) {
         size_t piece_len = 0;
         char *piece = pulsar_token_text(engine, toks.v[i], &piece_len);
         buf_append(&text, piece, piece_len);
-        thinking_state_feed(&thinking, piece, piece_len);
+        thinking.feed(piece, piece_len);
         free(piece);
         TEST_ASSERT(thinking.inside);
         rec = srv.chat_think_tool_recovery(&srv.slots[0], &text, &thinking,

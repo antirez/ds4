@@ -462,7 +462,7 @@ static void agent_history_render_assistant(agent_worker *w,
 
     if (source_truncated) {
         size_t tail_len = 0;
-        char *tail_text = agent_tail_capture_take(&tail, &tail_len);
+        char *tail_text = tail.take(&tail_len);
         bool rendered_truncated = tail.total > tail_len;
         bool line_truncated = false;
         const char *tail_start =

@@ -3076,15 +3076,15 @@ static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     r.prompt_text = xstrdup("<｜Assistant｜><think>");
     thinking_state st = thinking_state_from_prompt(&r);
     TEST_ASSERT(st.inside == true);
-    thinking_state_feed(&st, "reasoning body", strlen("reasoning body"));
+    st.feed("reasoning body", strlen("reasoning body"));
     TEST_ASSERT(st.inside == true);
-    thinking_state_feed(&st, "</thi", strlen("</thi"));
+    st.feed("</thi", strlen("</thi"));
     TEST_ASSERT(st.inside == true);
-    thinking_state_feed(&st, "nk>answer", strlen("nk>answer"));
+    st.feed("nk>answer", strlen("nk>answer"));
     TEST_ASSERT(st.inside == false);
-    thinking_state_feed(&st, "<thi", strlen("<thi"));
+    st.feed("<thi", strlen("<thi"));
     TEST_ASSERT(st.inside == false);
-    thinking_state_feed(&st, "nk>more", strlen("nk>more"));
+    st.feed("nk>more", strlen("nk>more"));
     TEST_ASSERT(st.inside == true);
     request_free(&r);
 
