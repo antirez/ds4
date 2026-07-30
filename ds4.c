@@ -848,6 +848,21 @@ typedef struct {
     uint16_t d;
 } block_q6_K;
 
+/* IQ4_XS: 4-bit non-linear codebook quant (llama.cpp layout).  256 elems in
+ * 8 sub-blocks of 32; per-sub-block 6-bit scale split across scales_l nibbles
+ * (low 4) and scales_h 2-bit pairs (high 2), applied as (scale - 32) times
+ * the shared f16 super scale; elements index the kvalues_iq4nl codebook. */
+typedef struct {
+    uint16_t d;                   /* f16 super-block scale */
+    uint16_t scales_h;            /* 8 x 2-bit high scale bits */
+    uint8_t  scales_l[QK_K / 64]; /* 8 x 4-bit low scale bits */
+    uint8_t  qs[QK_K / 2];        /* 4-bit codebook indices */
+} block_iq4_xs;
+
+static const int8_t kvalues_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+};
+
 typedef struct {
     float   d;
     int8_t  qs[QK_K];
@@ -2128,6 +2143,7 @@ enum {
     DS4_TENSOR_Q6_K     = 14,
     DS4_TENSOR_Q8_K     = 15,
     DS4_TENSOR_IQ2_XXS  = 16,
+    DS4_TENSOR_IQ4_XS   = 23,
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_BF16     = 30,
 };
@@ -3208,6 +3224,27 @@ static inline float f16_to_f32(uint16_t h) {
     memcpy(&f, &bits, sizeof(f));
     return f;
 #endif
+}
+
+/* Reference dequant for IQ4_XS rows (llama.cpp-compatible semantics). */
+static DS4_MAYBE_UNUSED void dequant_row_iq4_xs(
+        const block_iq4_xs *x, float *y, uint64_t n) {
+    const uint64_t nb = n / QK_K;
+    for (uint64_t i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d);
+        const uint8_t *qs = x[i].qs;
+        for (int ib = 0; ib < QK_K / 32; ib++) {
+            const int ls = ((x[i].scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) |
+                           (((x[i].scales_h >> (2 * ib)) & 3) << 4);
+            const float dl = d * (float)(ls - 32);
+            for (int j = 0; j < 16; j++) {
+                y[j +  0] = dl * (float)kvalues_iq4nl[qs[j] & 0xf];
+                y[j + 16] = dl * (float)kvalues_iq4nl[qs[j] >> 4];
+            }
+            y  += 32;
+            qs += 16;
+        }
+    }
 }
 
 static inline uint16_t f32_to_f16(float f) {
@@ -4523,6 +4560,7 @@ static void tensor_expect_f16_or_q8_0_layout(
 static bool tensor_is_routed_expert_type(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 ||
            type == DS4_TENSOR_IQ2_XXS ||
+           type == DS4_TENSOR_IQ4_XS ||
            type == DS4_TENSOR_Q2_K ||
            type == DS4_TENSOR_Q3_K ||
            type == DS4_TENSOR_Q4_K ||
@@ -4534,6 +4572,7 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     switch (type) {
     case DS4_TENSOR_Q8_0:    return 34;
     case DS4_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
+    case DS4_TENSOR_IQ4_XS:  return sizeof(block_iq4_xs);
     case DS4_TENSOR_Q2_K:    return sizeof(block_q2_K);
     case DS4_TENSOR_Q3_K:    return sizeof(block_q3_K);
     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
@@ -5123,13 +5162,17 @@ static void weights_validate_laguna_layout(
         ds4_die("cannot identify Laguna quantization layout");
     }
     const bool signal_q8 = layout_marker->type == DS4_TENSOR_Q8_0;
+    /* APEX recipe (community mixed-precision export): q6_k embedding and
+     * attention, q8_0 dense+shared experts, routed experts per-layer in
+     * {iq4_xs, q5_k, q6_k}. */
+    const bool apex_q6 = layout_marker->type == DS4_TENSOR_Q6_K;
     const bool legacy_layout =
         (w->token_embd && layout_marker->type == DS4_TENSOR_Q4_K) ||
         (!w->token_embd && layout_marker->type == DS4_TENSOR_F16);
-    if (!signal_q8 && !legacy_layout) {
+    if (!signal_q8 && !legacy_layout && !apex_q6) {
         fprintf(stderr,
                 "ds4: unsupported Laguna quantization layout marker %s; "
-                "expected legacy Q4_K/F16 or Q8_0 signal weights\n",
+                "expected legacy Q4_K/F16, Q8_0 signal, or Q6_K APEX weights\n",
                 tensor_type_name(layout_marker->type));
         exit(1);
     }
@@ -5137,7 +5180,8 @@ static void weights_validate_laguna_layout(
     if (require_token_embd && !w->token_embd) ds4_die("required token embedding tensor is missing");
     if (w->token_embd) {
         tensor_expect_layout(w->token_embd,
-                             signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q4_K,
+                             signal_q8 ? DS4_TENSOR_Q8_0 :
+                             apex_q6   ? DS4_TENSOR_Q6_K : DS4_TENSOR_Q4_K,
                              2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
 
@@ -5165,7 +5209,8 @@ static void weights_validate_laguna_layout(
         tensor_expect_layout(l->attn_norm, DS4_TENSOR_F32,
                              1, DS4_N_EMBD, 0, 0);
         const uint32_t attn_type =
-            signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_F16;
+            signal_q8 ? DS4_TENSOR_Q8_0 :
+            apex_q6   ? DS4_TENSOR_Q6_K : DS4_TENSOR_F16;
         tensor_expect_layout(l->attn_q, attn_type,
                              2, DS4_N_EMBD, q_dim, 0);
         tensor_expect_layout(l->attn_k, attn_type,
@@ -5184,14 +5229,15 @@ static void weights_validate_laguna_layout(
                              1, DS4_N_EMBD, 0, 0);
 
         if (il < DS4_N_LEADING_DENSE) {
+            const bool dense_q8 = signal_q8 || apex_q6;
             tensor_expect_layout(l->ffn_gate,
-                                 signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q4_K,
+                                 dense_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q4_K,
                                  2, DS4_N_EMBD, DS4_N_FF_DENSE, 0);
             tensor_expect_layout(l->ffn_up,
-                                 signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q4_K,
+                                 dense_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q4_K,
                                  2, DS4_N_EMBD, DS4_N_FF_DENSE, 0);
             tensor_expect_layout(l->ffn_down,
-                                 signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q6_K,
+                                 dense_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q6_K,
                                  2, DS4_N_FF_DENSE, DS4_N_EMBD, 0);
             continue;
         }
@@ -5203,9 +5249,14 @@ static void weights_validate_laguna_layout(
         /* Mixed files may spend more bits on selected layers, but all three
          * routed projections within one layer must use a coherent layout. */
         const uint32_t layer_routed_type = l->ffn_gate_exps->type;
-        if (layer_routed_type != DS4_TENSOR_Q4_K &&
-            layer_routed_type != DS4_TENSOR_Q3_K &&
-            layer_routed_type != DS4_TENSOR_Q2_K) {
+        const bool routed_type_ok =
+            layer_routed_type == DS4_TENSOR_Q4_K ||
+            layer_routed_type == DS4_TENSOR_Q3_K ||
+            layer_routed_type == DS4_TENSOR_Q2_K ||
+            (apex_q6 && (layer_routed_type == DS4_TENSOR_IQ4_XS ||
+                         layer_routed_type == DS4_TENSOR_Q5_K ||
+                         layer_routed_type == DS4_TENSOR_Q6_K));
+        if (!routed_type_ok) {
             fprintf(stderr,
                     "ds4: Laguna routed experts for layer %u have unsupported type %s\n",
                     il, tensor_type_name(layer_routed_type));
@@ -5231,15 +5282,16 @@ static void weights_validate_laguna_layout(
         }
         tensor_expect_layout(l->ffn_down_exps, l->ffn_down_exps->type,
                              3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+        const bool shexp_q8 = signal_q8 || apex_q6;
         tensor_expect_layout(l->ffn_gate_shexp,
-                             signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q4_K,
+                             shexp_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q4_K,
                              2, DS4_N_EMBD, DS4_N_FF_SHARED, 0);
         tensor_expect_layout(l->ffn_up_shexp,
-                             signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q4_K,
+                             shexp_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q4_K,
                              2, DS4_N_EMBD, DS4_N_FF_SHARED, 0);
         const uint32_t shared_down_type =
-            signal_q8 ? DS4_TENSOR_Q8_0 : l->ffn_down_shexp->type;
-        if (!signal_q8 &&
+            shexp_q8 ? DS4_TENSOR_Q8_0 : l->ffn_down_shexp->type;
+        if (!shexp_q8 &&
             shared_down_type != DS4_TENSOR_Q4_K &&
             shared_down_type != DS4_TENSOR_Q6_K) {
             fprintf(stderr,
@@ -6084,7 +6136,8 @@ static void config_validate_laguna_model(const ds4_model *m) {
     const uint32_t n_leading_dense = required_u32(m, "laguna.leading_dense_block_count");
 
     config_expect_u32("block_count", n_layer, DS4_N_LAYER);
-    config_expect_u64("context_length", n_ctx, DS4_CONTEXT_LENGTH);
+    /* context_length is export-dependent; validated against the rope config
+     * below and adopted into the runtime shape there. */
     config_expect_u32("embedding_length", n_embd, DS4_N_EMBD);
     config_expect_u32("vocab_size", n_vocab, DS4_N_VOCAB);
     config_expect_u32("feed_forward_length", n_ff_dense, DS4_N_FF_DENSE);
@@ -6142,12 +6195,32 @@ static void config_validate_laguna_model(const ds4_model *m) {
     config_expect_f32("rope.freq_base_swa",
                       required_f32(m, "laguna.rope.freq_base_swa"),
                       DS4_ROPE_FREQ_BASE_SWA);
-    config_expect_f32("rope.scaling.factor",
-                      required_f32(m, "laguna.rope.scaling.factor"),
-                      DS4_ROPE_SCALE_FACTOR);
-    config_expect_f32("rope.scaling.yarn_attn_factor",
-                      required_f32(m, "laguna.rope.scaling.yarn_attn_factor"),
-                      DS4_ROPE_YARN_ATTN_FACTOR);
+    /* context_length and the yarn scale/attn factors are export-dependent:
+     * the same Laguna weights ship as a conservative 256K export (factor 32,
+     * attn factor 1.0) and as the full 1M export (factor 128, attn ~1.485).
+     * Accept any coherent yarn config (orig_ctx * factor == context_length)
+     * and adopt it into the runtime shape instead of pinning one export. */
+    {
+        const float rope_scale_factor =
+            required_f32(m, "laguna.rope.scaling.factor");
+        const float rope_yarn_attn_factor =
+            required_f32(m, "laguna.rope.scaling.yarn_attn_factor");
+        if (rope_scale_factor < 1.0f || rope_scale_factor > 1024.0f ||
+            rope_yarn_attn_factor <= 0.0f || rope_yarn_attn_factor > 8.0f ||
+            (uint64_t)((double)DS4_ROPE_ORIG_CTX * (double)rope_scale_factor)
+                != n_ctx) {
+            fprintf(stderr,
+                    "ds4: incoherent Laguna yarn config: context_length=%" PRIu64
+                    " vs original_context_length=%" PRIu64 " * factor=%g "
+                    "(attn factor %g)\n",
+                    n_ctx, (uint64_t)DS4_ROPE_ORIG_CTX,
+                    (double)rope_scale_factor, (double)rope_yarn_attn_factor);
+            exit(1);
+        }
+        g_ds4_shape.context_length = n_ctx;
+        g_ds4_shape.rope_scale_factor = rope_scale_factor;
+        g_ds4_shape.rope_yarn_attn_factor = rope_yarn_attn_factor;
+    }
     config_expect_f32("rope.scaling.yarn_beta_fast",
                       required_f32(m, "laguna.rope.scaling.yarn_beta_fast"),
                       DS4_ROPE_YARN_BETA_FAST);
@@ -49121,6 +49194,17 @@ static bool laguna_graph_forward_token(
                         DS4_N_HEAD_KV * DS4_N_HEAD_DIM,
                         n_head,
                         g->attn_norm) != 0;
+            } else if (l->attn_q->type == DS4_TENSOR_Q6_K) {
+                /* APEX layout: q6_k attention projections via the generic
+                 * per-type matmul (no fused pair kernel for q6_k yet). */
+                ok = laguna_graph_matmul(g->q, model, l->attn_q,
+                                         g->attn_norm, 1) &&
+                     laguna_graph_matmul(g->k, model, l->attn_k,
+                                         g->attn_norm, 1) &&
+                     laguna_graph_matmul(g->v, model, l->attn_v,
+                                         g->attn_norm, 1) &&
+                     laguna_graph_matmul(g->gate, model, l->attn_gate,
+                                         g->attn_norm, 1);
             } else {
 #ifdef DS4_ROCM_BUILD
                 ok = ds4_gpu_matmul_q8_0_pair_decode_preq8_tensor(
