@@ -19,34 +19,26 @@ struct ds4_metal_args_laguna_norm_rope {
     uint32_t cache_row;   /* used only by the fused rope+store variant */
 };
 
-static inline void laguna_head_rms_norm_rope_neox(
+// Simdgroup-resident norm+rope for head_dim 128: each lane owns dims
+// {lane, lane+32, lane+64, lane+96}, so the square sum reduces with one
+// simd_sum (no barrier), every lane recomputes the cheap rsqrt, and both
+// elements of every NeoX rotary pair land in the same lane for both Laguna
+// rotary widths (64 and 128).  The head row is read and written exactly
+// once, in registers, with no threadgroup memory at all.
+static inline float4 laguna_head_rms_norm_rope_neox_simd(
         constant ds4_metal_args_laguna_norm_rope &args,
         device float       *row,
         device const float *weight,
-        threadgroup float  *scratch [[threadgroup(0)]],
-        uint tid,
-        uint nth,
+        ushort lane,
         uint token) {
-    float ss = 0.0f;
-    for (uint i = tid; i < args.head_dim; i += nth) {
-        const float v = row[i];
-        ss += v * v;
-    }
-    scratch[tid] = ss;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint step = nth >> 1u; step != 0u; step >>= 1u) {
-        if (tid < step) scratch[tid] += scratch[tid + step];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    const float inv = rsqrt(scratch[0] / (float)args.head_dim + args.eps);
-    for (uint i = tid; i < args.head_dim; i += nth) {
-        row[i] = row[i] * inv * weight[i];
-    }
-    threadgroup_barrier(mem_flags::mem_device);
-
-    const uint half_rot = args.n_rot >> 1u;
-    if (tid >= half_rot) return;
+    const uint d0 = lane;
+    const uint d1 = lane + 32u;
+    const uint d2 = lane + 64u;
+    const uint d3 = lane + 96u;
+    float4 v = float4(row[d0], row[d1], row[d2], row[d3]);
+    const float ss = simd_sum(v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w);
+    const float inv = rsqrt(ss / 128.0f + args.eps);
+    v *= inv * float4(weight[d0], weight[d1], weight[d2], weight[d3]);
 
     float corr_dims[2] = {0.0f, 0.0f};
     if (args.ext_factor != 0.0f) {
@@ -57,94 +49,111 @@ static inline void laguna_head_rms_norm_rope_neox(
                             args.beta_slow,
                             corr_dims);
     }
-    const int rel_i0 = (int)(tid * 2u);
     const float inv_ndims = -1.0f / (float)args.n_rot;
+    const float pos = (float)(args.pos0 + token);
 #ifdef DS4_METAL_ROPE_EXP2_LOG2
-    const float theta = (float)(args.pos0 + token) *
-        exp2(inv_ndims * (float)rel_i0 * log2(args.freq_base));
+    const float log2_base = log2(args.freq_base);
+#define DS4_LAGUNA_ROPE_THETA(rel) \
+        (pos * exp2(inv_ndims * (float)(rel) * log2_base))
 #else
-    const float theta = (float)(args.pos0 + token) *
-        pow(args.freq_base, inv_ndims * (float)rel_i0);
+#define DS4_LAGUNA_ROPE_THETA(rel) \
+        (pos * pow(args.freq_base, inv_ndims * (float)(rel)))
 #endif
-    float cos_theta;
-    float sin_theta;
-    rope_yarn(theta,
-              args.freq_scale,
-              corr_dims,
-              rel_i0,
-              args.ext_factor,
-              args.attn_factor,
-              &cos_theta,
-              &sin_theta);
-    const float x0 = row[tid];
-    const float x1 = row[tid + half_rot];
-    row[tid] = x0 * cos_theta - x1 * sin_theta;
-    row[tid + half_rot] = x0 * sin_theta + x1 * cos_theta;
+    if (args.n_rot == 128u) {
+        float cos_theta;
+        float sin_theta;
+        int rel_i0 = (int)(2u * lane);
+        rope_yarn(DS4_LAGUNA_ROPE_THETA(rel_i0),
+                  args.freq_scale, corr_dims, rel_i0,
+                  args.ext_factor, args.attn_factor,
+                  &cos_theta, &sin_theta);
+        const float x0 = v.x;
+        const float x1 = v.z;
+        v.x = x0 * cos_theta - x1 * sin_theta;
+        v.z = x0 * sin_theta + x1 * cos_theta;
+        rel_i0 = (int)(2u * (lane + 32u));
+        rope_yarn(DS4_LAGUNA_ROPE_THETA(rel_i0),
+                  args.freq_scale, corr_dims, rel_i0,
+                  args.ext_factor, args.attn_factor,
+                  &cos_theta, &sin_theta);
+        const float y0 = v.y;
+        const float y1 = v.w;
+        v.y = y0 * cos_theta - y1 * sin_theta;
+        v.w = y0 * sin_theta + y1 * cos_theta;
+    } else {
+        /* n_rot == 64: dims 64..127 stay unrotated. */
+        float cos_theta;
+        float sin_theta;
+        const int rel_i0 = (int)(2u * lane);
+        rope_yarn(DS4_LAGUNA_ROPE_THETA(rel_i0),
+                  args.freq_scale, corr_dims, rel_i0,
+                  args.ext_factor, args.attn_factor,
+                  &cos_theta, &sin_theta);
+        const float x0 = v.x;
+        const float x1 = v.y;
+        v.x = x0 * cos_theta - x1 * sin_theta;
+        v.y = x0 * sin_theta + x1 * cos_theta;
+    }
+#undef DS4_LAGUNA_ROPE_THETA
+    row[d0] = v.x;
+    row[d1] = v.y;
+    row[d2] = v.z;
+    row[d3] = v.w;
+    return v;
 }
 
-// Laguna uses Qwen-style per-head RMSNorm and NeoX rotary pairs. Rotary
-// dimensions occupy the prefix of each head; any remaining dimensions are
-// normalized but left unrotated.
-kernel void kernel_laguna_head_rms_norm_rope_neox(
+// Barrier-free variants for the Laguna head geometry (head_dim 128,
+// n_rot 64 or 128): four heads per threadgroup, one simdgroup each.
+kernel void kernel_laguna_head_rms_norm_rope_simd(
         constant ds4_metal_args_laguna_norm_rope &args,
         device float       *x,
         device const float *weight,
-        threadgroup float  *scratch [[threadgroup(0)]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort3 ntg_u [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
         uint3 tgpig [[threadgroup_position_in_grid]]) {
-    const uint head = tgpig.x;
+    const uint head = tgpig.x * 4u + sgitg;
     const uint token = tgpig.y;
     if (head >= args.n_head || token >= args.n_tokens ||
-        args.head_dim == 0u || args.n_rot > args.head_dim ||
-        (args.n_rot & 1u) != 0u) {
+        args.head_dim != 128u ||
+        (args.n_rot != 64u && args.n_rot != 128u)) {
         return;
     }
-
     device float *row = x +
         ((uint64_t)token * args.n_head + head) * args.head_dim;
-    laguna_head_rms_norm_rope_neox(
-        args, row, weight, scratch, tid, ntg_u.x, token);
+    laguna_head_rms_norm_rope_neox_simd(args, row, weight, lane, token);
 }
 
-// Decode uses the same norm/RoPE arithmetic for Q and K. Keeping both tensors
-// in one grid removes a small Metal dispatch without changing the per-head
-// reduction order.
-kernel void kernel_laguna_qk_head_rms_norm_rope_neox(
+kernel void kernel_laguna_qk_head_rms_norm_rope_simd(
         constant ds4_metal_args_laguna_norm_rope &args,
         device float       *q,
         device float       *k,
         device const float *q_weight,
         device const float *k_weight,
         constant uint      &n_q_head,
-        threadgroup float  *scratch [[threadgroup(0)]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort3 ntg_u [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
         uint3 tgpig [[threadgroup_position_in_grid]]) {
-    const uint combined_head = tgpig.x;
+    const uint combined_head = tgpig.x * 4u + sgitg;
     const uint token = tgpig.y;
     if (combined_head >= args.n_head || token >= args.n_tokens ||
-        n_q_head >= args.n_head || args.head_dim == 0u ||
-        args.n_rot > args.head_dim || (args.n_rot & 1u) != 0u) {
+        n_q_head >= args.n_head || args.head_dim != 128u ||
+        (args.n_rot != 64u && args.n_rot != 128u)) {
         return;
     }
-
     const bool is_q = combined_head < n_q_head;
     const uint tensor_head = is_q ? combined_head : combined_head - n_q_head;
     const uint tensor_n_head = is_q ? n_q_head : args.n_head - n_q_head;
     device float *row = (is_q ? q : k) +
         ((uint64_t)token * tensor_n_head + tensor_head) * args.head_dim;
-    device const float *weight = is_q ? q_weight : k_weight;
-    laguna_head_rms_norm_rope_neox(
-        args, row, weight, scratch, tid, ntg_u.x, token);
+    laguna_head_rms_norm_rope_neox_simd(
+        args, row, is_q ? q_weight : k_weight, lane, token);
 }
 
 // Decode-only twin of the Q/K kernel above that also commits the roped K row
 // and the untouched V row to the attention ring as f16, removing the separate
-// store dispatch from the per-token chain.  The norm and rotation arithmetic
-// is identical; the rope section is predicated instead of early-returning so
-// every thread reaches the store barrier.  Q-head threadgroups exit before
-// the store uniformly.
+// store dispatch from the per-token chain.  Four heads per threadgroup, one
+// barrier-free simdgroup each; K heads convert their freshly roped registers
+// straight to the cache row.
 kernel void kernel_laguna_qk_head_rms_norm_rope_store_neox(
         constant ds4_metal_args_laguna_norm_rope &args,
         device float       *q,
@@ -155,15 +164,13 @@ kernel void kernel_laguna_qk_head_rms_norm_rope_store_neox(
         device const float *v,
         device half        *key_cache,
         device half        *value_cache,
-        threadgroup float  *scratch [[threadgroup(0)]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort3 ntg_u [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
         uint3 tgpig [[threadgroup_position_in_grid]]) {
-    const uint combined_head = tgpig.x;
-    const uint nth = ntg_u.x;
+    const uint combined_head = tgpig.x * 4u + sgitg;
     if (combined_head >= args.n_head || args.n_tokens != 1u ||
-        n_q_head >= args.n_head || args.head_dim == 0u ||
-        args.n_rot > args.head_dim || (args.n_rot & 1u) != 0u) {
+        n_q_head >= args.n_head || args.head_dim != 128u ||
+        (args.n_rot != 64u && args.n_rot != 128u)) {
         return;
     }
 
@@ -172,73 +179,23 @@ kernel void kernel_laguna_qk_head_rms_norm_rope_store_neox(
     const uint tensor_n_head = is_q ? n_q_head : args.n_head - n_q_head;
     device float *row = (is_q ? q : k) +
         (uint64_t)tensor_head * args.head_dim;
-    device const float *weight = is_q ? q_weight : k_weight;
-
-    float ss = 0.0f;
-    for (uint i = tid; i < args.head_dim; i += nth) {
-        const float value = row[i];
-        ss += value * value;
-    }
-    scratch[tid] = ss;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint step = nth >> 1u; step != 0u; step >>= 1u) {
-        if (tid < step) scratch[tid] += scratch[tid + step];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    const float inv = rsqrt(scratch[0] / (float)args.head_dim + args.eps);
-    for (uint i = tid; i < args.head_dim; i += nth) {
-        row[i] = row[i] * inv * weight[i];
-    }
-    threadgroup_barrier(mem_flags::mem_device);
-
-    const uint half_rot = args.n_rot >> 1u;
-    if (tid < half_rot) {
-        float corr_dims[2] = {0.0f, 0.0f};
-        if (args.ext_factor != 0.0f) {
-            rope_yarn_corr_dims((int)args.n_rot,
-                                (int)args.n_ctx_orig,
-                                args.freq_base,
-                                args.beta_fast,
-                                args.beta_slow,
-                                corr_dims);
-        }
-        const int rel_i0 = (int)(tid * 2u);
-        const float inv_ndims = -1.0f / (float)args.n_rot;
-#ifdef DS4_METAL_ROPE_EXP2_LOG2
-        const float theta = (float)args.pos0 *
-            exp2(inv_ndims * (float)rel_i0 * log2(args.freq_base));
-#else
-        const float theta = (float)args.pos0 *
-            pow(args.freq_base, inv_ndims * (float)rel_i0);
-#endif
-        float cos_theta;
-        float sin_theta;
-        rope_yarn(theta,
-                  args.freq_scale,
-                  corr_dims,
-                  rel_i0,
-                  args.ext_factor,
-                  args.attn_factor,
-                  &cos_theta,
-                  &sin_theta);
-        const float x0 = row[tid];
-        const float x1 = row[tid + half_rot];
-        row[tid] = x0 * cos_theta - x1 * sin_theta;
-        row[tid + half_rot] = x0 * sin_theta + x1 * cos_theta;
-    }
+    const float4 roped = laguna_head_rms_norm_rope_neox_simd(
+        args, row, is_q ? q_weight : k_weight, lane, 0u);
     if (is_q) return;
 
-    threadgroup_barrier(mem_flags::mem_device);
     const uint width = tensor_n_head * args.head_dim;
     const uint64_t dst =
         (uint64_t)args.cache_row * width +
         (uint64_t)tensor_head * args.head_dim;
     device const float *v_row = v + (uint64_t)tensor_head * args.head_dim;
-    for (uint i = tid; i < args.head_dim; i += nth) {
-        key_cache[dst + i] = (half)row[i];
-        value_cache[dst + i] = (half)v_row[i];
-    }
+    key_cache[dst + lane]       = (half)roped.x;
+    key_cache[dst + lane + 32u] = (half)roped.y;
+    key_cache[dst + lane + 64u] = (half)roped.z;
+    key_cache[dst + lane + 96u] = (half)roped.w;
+    value_cache[dst + lane]       = (half)v_row[lane];
+    value_cache[dst + lane + 32u] = (half)v_row[lane + 32u];
+    value_cache[dst + lane + 64u] = (half)v_row[lane + 64u];
+    value_cache[dst + lane + 96u] = (half)v_row[lane + 96u];
 }
 
 struct ds4_metal_args_laguna_kv_store {

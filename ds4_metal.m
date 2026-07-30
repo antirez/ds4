@@ -233,9 +233,9 @@ static id<MTLComputePipelineState> g_glm_q6_k_down_f32_pipeline;
 static id<MTLComputePipelineState> g_laguna_routed_shared_pair_pipeline;
 static id<MTLComputePipelineState> g_laguna_routed_shared_q4_down_pipeline;
 static id<MTLComputePipelineState> g_laguna_routed_shared_q6_down_pipeline;
-static id<MTLComputePipelineState> g_laguna_head_norm_rope_pipeline;
-static id<MTLComputePipelineState> g_laguna_qk_head_norm_rope_pipeline;
 static id<MTLComputePipelineState> g_laguna_qk_head_norm_rope_store_pipeline;
+static id<MTLComputePipelineState> g_laguna_head_norm_rope_simd_pipeline;
+static id<MTLComputePipelineState> g_laguna_qk_head_norm_rope_simd_pipeline;
 static id<MTLComputePipelineState> g_laguna_store_kv_pipeline;
 static id<MTLComputePipelineState> g_laguna_attention_pipeline;
 static id<MTLComputePipelineState> g_laguna_stage_kv_pipeline;
@@ -7961,13 +7961,13 @@ int ds4_gpu_init(void) {
         g_laguna_routed_shared_q6_down_pipeline =
             ds4_gpu_get_pipeline(
                 "kernel_laguna_q6_K_routed_shared_down_f32");
-        g_laguna_head_norm_rope_pipeline =
-            ds4_gpu_get_pipeline("kernel_laguna_head_rms_norm_rope_neox");
-        g_laguna_qk_head_norm_rope_pipeline =
-            ds4_gpu_get_pipeline("kernel_laguna_qk_head_rms_norm_rope_neox");
         g_laguna_qk_head_norm_rope_store_pipeline =
             ds4_gpu_get_pipeline(
                 "kernel_laguna_qk_head_rms_norm_rope_store_neox");
+        g_laguna_head_norm_rope_simd_pipeline =
+            ds4_gpu_get_pipeline("kernel_laguna_head_rms_norm_rope_simd");
+        g_laguna_qk_head_norm_rope_simd_pipeline =
+            ds4_gpu_get_pipeline("kernel_laguna_qk_head_rms_norm_rope_simd");
         g_laguna_store_kv_pipeline =
             ds4_gpu_get_pipeline("kernel_laguna_store_kv_f16");
         g_laguna_attention_pipeline =
@@ -8056,8 +8056,8 @@ int ds4_gpu_init(void) {
             !g_laguna_routed_shared_pair_pipeline ||
             !g_laguna_routed_shared_q4_down_pipeline ||
             !g_laguna_routed_shared_q6_down_pipeline ||
-            !g_laguna_head_norm_rope_pipeline ||
-            !g_laguna_qk_head_norm_rope_pipeline ||
+            !g_laguna_head_norm_rope_simd_pipeline ||
+            !g_laguna_qk_head_norm_rope_simd_pipeline ||
             !g_laguna_store_kv_pipeline ||
             !g_laguna_attention_pipeline ||
             !g_laguna_stage_kv_pipeline ||
@@ -9456,9 +9456,9 @@ void ds4_gpu_cleanup(void) {
         g_laguna_routed_shared_pair_pipeline = nil;
         g_laguna_routed_shared_q4_down_pipeline = nil;
         g_laguna_routed_shared_q6_down_pipeline = nil;
-        g_laguna_head_norm_rope_pipeline = nil;
-        g_laguna_qk_head_norm_rope_pipeline = nil;
         g_laguna_qk_head_norm_rope_store_pipeline = nil;
+        g_laguna_head_norm_rope_simd_pipeline = nil;
+        g_laguna_qk_head_norm_rope_simd_pipeline = nil;
         g_laguna_store_kv_pipeline = nil;
         g_laguna_attention_pipeline = nil;
         g_laguna_stage_kv_pipeline = nil;
@@ -31360,8 +31360,7 @@ int ds4_gpu_laguna_head_rms_norm_rope_tensor(
         float           eps) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!x || !model_map || n_tokens == 0 || n_head == 0 ||
-        head_dim == 0 || head_dim > 128u || n_rot == 0 ||
-        n_rot > head_dim || (n_rot & 1u) != 0u ||
+        head_dim != 128u || (n_rot != 64u && n_rot != 128u) ||
         pos0 > UINT32_MAX - n_tokens ||
         !isfinite(freq_base) || freq_base <= 0.0f ||
         !isfinite(freq_scale) || freq_scale <= 0.0f ||
@@ -31389,8 +31388,8 @@ int ds4_gpu_laguna_head_rms_norm_rope_tensor(
                                                             weight_bytes,
                                                             &weight_inner);
         id<MTLComputePipelineState> pipeline = ds4_gpu_hot_pipeline(
-            g_laguna_head_norm_rope_pipeline,
-            "kernel_laguna_head_rms_norm_rope_neox");
+            g_laguna_head_norm_rope_simd_pipeline,
+            "kernel_laguna_head_rms_norm_rope_simd");
         if (!xbuf || !weightbuf || !pipeline) return 0;
 
         ds4_gpu_laguna_norm_rope_args args = {
@@ -31416,8 +31415,8 @@ int ds4_gpu_laguna_head_rms_norm_rope_tensor(
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
         [enc setBuffer:weightbuf offset:(NSUInteger)weight_inner atIndex:2];
-        [enc setThreadgroupMemoryLength:128u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(n_head, n_tokens, 1)
+        [enc dispatchThreadgroups:MTLSizeMake((n_head + 3u) / 4u,
+                                              n_tokens, 1)
              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned, "Laguna head norm/RoPE")) return 0;
@@ -31449,8 +31448,7 @@ int ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!q || !k || !model_map || n_tokens == 0 || n_q_head == 0 ||
         n_k_head == 0 || n_q_head > UINT32_MAX - n_k_head ||
-        head_dim == 0 || head_dim > 128u || n_rot == 0 ||
-        n_rot > head_dim || (n_rot & 1u) != 0u ||
+        head_dim != 128u || (n_rot != 64u && n_rot != 128u) ||
         pos0 > UINT32_MAX - n_tokens ||
         !isfinite(freq_base) || freq_base <= 0.0f ||
         !isfinite(freq_scale) || freq_scale <= 0.0f ||
@@ -31485,8 +31483,8 @@ int ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
             model_map, model_size, k_weight_offset, weight_bytes,
             &k_weight_inner);
         id<MTLComputePipelineState> pipeline = ds4_gpu_hot_pipeline(
-            g_laguna_qk_head_norm_rope_pipeline,
-            "kernel_laguna_qk_head_rms_norm_rope_neox");
+            g_laguna_qk_head_norm_rope_simd_pipeline,
+            "kernel_laguna_qk_head_rms_norm_rope_simd");
         if (!qbuf || !kbuf || !q_weightbuf || !k_weightbuf || !pipeline) {
             return 0;
         }
@@ -31517,8 +31515,8 @@ int ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
         [enc setBuffer:q_weightbuf offset:(NSUInteger)q_weight_inner atIndex:3];
         [enc setBuffer:k_weightbuf offset:(NSUInteger)k_weight_inner atIndex:4];
         [enc setBytes:&n_q_head length:sizeof(n_q_head) atIndex:5];
-        [enc setThreadgroupMemoryLength:128u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(n_q_head + n_k_head, n_tokens, 1)
+        [enc dispatchThreadgroups:MTLSizeMake(
+                (n_q_head + n_k_head + 3u) / 4u, n_tokens, 1)
              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(
@@ -31557,8 +31555,7 @@ int ds4_gpu_laguna_qk_head_rms_norm_rope_store_tensor(
     if (!q || !k || !v || !key_cache || !value_cache || !model_map ||
         n_q_head == 0 || n_k_head == 0 ||
         n_q_head > UINT32_MAX - n_k_head ||
-        head_dim == 0 || head_dim > 128u || n_rot == 0 ||
-        n_rot > head_dim || (n_rot & 1u) != 0u ||
+        head_dim != 128u || (n_rot != 64u && n_rot != 128u) ||
         cache_cap == 0 || pos0 == UINT32_MAX ||
         !isfinite(freq_base) || freq_base <= 0.0f ||
         !isfinite(freq_scale) || freq_scale <= 0.0f ||
@@ -31637,8 +31634,8 @@ int ds4_gpu_laguna_qk_head_rms_norm_rope_store_tensor(
         [enc setBuffer:vbuf offset:ds4_gpu_tensor_offset(v) atIndex:6];
         [enc setBuffer:keybuf offset:ds4_gpu_tensor_offset(key_cache) atIndex:7];
         [enc setBuffer:valuebuf offset:ds4_gpu_tensor_offset(value_cache) atIndex:8];
-        [enc setThreadgroupMemoryLength:128u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(n_q_head + n_k_head, 1, 1)
+        [enc dispatchThreadgroups:MTLSizeMake((n_q_head + n_k_head + 3u) / 4u,
+                                              1, 1)
              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(
